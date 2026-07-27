@@ -157,6 +157,8 @@ pub(crate) enum ParallelCallLayout {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct DeclarativeDialectSpec {
     pub(crate) generation_prompt_behavior: GenerationPromptBehavior,
+    /// Optional envelope around the complete collection of calls. Both strings
+    /// are empty when each call envelope stands on its own.
     pub(crate) output: ExactEnvelope,
     pub(crate) call: ExactEnvelope,
     pub(crate) payload_shape: DeclarativePayloadShape,
@@ -164,6 +166,8 @@ pub(crate) struct DeclarativeDialectSpec {
     pub(crate) arguments_field: &'static str,
     pub(crate) reasoning_channel: Option<DelimitedChannel>,
     pub(crate) text_channel: Option<DelimitedChannel>,
+    /// Whether un-delimited visible assistant text may precede tool calls.
+    pub(crate) raw_text_before_calls: bool,
     pub(crate) call_separator: &'static str,
     pub(crate) parallel_layout: ParallelCallLayout,
     pub(crate) auto_activation_trigger: Option<&'static str>,
@@ -185,8 +189,26 @@ impl DeclarativeDialectSpec {
         {
             return Err("declarative auto-activation trigger must be non-empty".into());
         }
-        if self.output.prefix.is_empty() || self.output.suffix.is_empty() {
-            return Err("declarative output requires non-empty exact delimiters".into());
+        if self.output.prefix.is_empty() != self.output.suffix.is_empty() {
+            return Err(
+                "declarative output delimiters must either both be empty or both be non-empty"
+                    .into(),
+            );
+        }
+        if self.output.prefix.is_empty()
+            && (self.payload_shape != DeclarativePayloadShape::JsonObject
+                || self.parallel_layout != ParallelCallLayout::RepeatedEnvelopes)
+        {
+            return Err(
+                "only repeated JSON-object call envelopes may omit an outer output envelope".into(),
+            );
+        }
+        if self.output.prefix.is_empty()
+            && (self.call.prefix.is_empty() || self.call.suffix.is_empty())
+        {
+            return Err(
+                "an unwrapped declarative output requires non-empty exact call delimiters".into(),
+            );
         }
         for (name, channel) in [
             ("reasoning", self.reasoning_channel),
@@ -242,6 +264,8 @@ impl DeclarativeDialectSpec {
         }
         if self.text_channel.is_some() {
             grammar.push_str("visible_text? ");
+        } else if self.raw_text_before_calls {
+            grammar.push_str("raw_text? ");
         }
         grammar.push_str("tool_output\n");
 
@@ -259,6 +283,10 @@ impl DeclarativeDialectSpec {
                 literal(channel.suffix)
             ));
         }
+        if self.raw_text_before_calls {
+            grammar.push_str("raw_text: RAW_TEXT_CHARACTER+\n");
+            grammar.push_str("RAW_TEXT_CHARACTER: /[^<]/\n");
+        }
         if self.reasoning_channel.is_some() || self.text_channel.is_some() {
             grammar.push_str("CHANNEL_TEXT: /(\\n|.)*/\n");
         }
@@ -266,12 +294,16 @@ impl DeclarativeDialectSpec {
         let calls = repeated_rule("call", &literal(self.call_separator), min_calls, max_calls);
         match self.payload_shape {
             DeclarativePayloadShape::JsonObject => {
-                grammar.push_str(&format!(
-                    "tool_output: {} {} {}\n",
-                    literal(self.output.prefix),
-                    calls,
-                    literal(self.output.suffix)
-                ));
+                if self.output.prefix.is_empty() {
+                    grammar.push_str(&format!("tool_output: {calls}\n"));
+                } else {
+                    grammar.push_str(&format!(
+                        "tool_output: {} {} {}\n",
+                        literal(self.output.prefix),
+                        calls,
+                        literal(self.output.suffix)
+                    ));
+                }
                 grammar.push_str(&format!(
                     "call: {} call_json {}\n",
                     literal(self.call.prefix),
@@ -431,7 +463,11 @@ impl DeclarativeParser {
         if let Some(channel) = self.spec.text_channel {
             delimiters.push(channel.prefix);
         }
-        delimiters.push(self.spec.output.prefix);
+        delimiters.push(if self.spec.output.prefix.is_empty() {
+            self.spec.call.prefix
+        } else {
+            self.spec.output.prefix
+        });
         delimiters
     }
 
@@ -461,7 +497,6 @@ impl DeclarativeParser {
         sink.tool_arguments(
             &serde_json::to_string(arguments).expect("parsed JSON values serialize"),
         );
-        sink.end_tool_call();
         Ok(())
     }
 
@@ -557,7 +592,11 @@ impl DeclarativeParser {
                             suffix: self.spec.text_channel.expect("text channel").suffix,
                         };
                     } else {
-                        self.state = DeclarativeParserState::ToolStart;
+                        self.state = if self.spec.output.prefix.is_empty() {
+                            DeclarativeParserState::Payload(JsonFragmentBuffer::default())
+                        } else {
+                            DeclarativeParserState::ToolStart
+                        };
                     }
                 }
                 DeclarativeParserState::Channel { kind, suffix } => {
@@ -632,6 +671,7 @@ impl DeclarativeParser {
                         if !self.consume_exact(self.spec.call.suffix)? {
                             return Ok(());
                         }
+                        sink.end_tool_call();
                         self.state = DeclarativeParserState::AfterEnvelope;
                     }
                     DeclarativePayloadShape::JsonList => {
@@ -639,9 +679,11 @@ impl DeclarativeParser {
                             return Ok(());
                         }
                         if self.pending.starts_with(']') {
+                            sink.end_tool_call();
                             self.pending.drain(..1);
                             self.state = DeclarativeParserState::ToolSuffix;
                         } else if self.consume_exact(self.spec.call_separator)? {
+                            sink.end_tool_call();
                             self.state = DeclarativeParserState::ListItemOrEnd;
                         } else {
                             return Ok(());
@@ -649,13 +691,16 @@ impl DeclarativeParser {
                     }
                 },
                 DeclarativeParserState::AfterEnvelope => {
-                    if self.pending.starts_with(self.spec.output.suffix) {
+                    if !self.spec.output.suffix.is_empty()
+                        && self.pending.starts_with(self.spec.output.suffix)
+                    {
                         self.pending.drain(..self.spec.output.suffix.len());
                         self.state = DeclarativeParserState::Outside;
                     } else if self.pending.starts_with(self.spec.call_separator) {
                         self.pending.drain(..self.spec.call_separator.len());
                         self.state = DeclarativeParserState::ToolStart;
-                    } else if self.spec.output.suffix.starts_with(&self.pending)
+                    } else if (!self.spec.output.suffix.is_empty()
+                        && self.spec.output.suffix.starts_with(&self.pending))
                         || self.spec.call_separator.starts_with(&self.pending)
                     {
                         return Ok(());
@@ -762,6 +807,7 @@ mod tests {
             prefix: "<text>",
             suffix: "</text>",
         }),
+        raw_text_before_calls: false,
         call_separator: "\n",
         parallel_layout: ParallelCallLayout::RepeatedEnvelopes,
         auto_activation_trigger: Some("<tools>"),
@@ -784,11 +830,38 @@ mod tests {
         arguments_field: "args",
         reasoning_channel: None,
         text_channel: None,
+        raw_text_before_calls: false,
         call_separator: ", ",
         parallel_layout: ParallelCallLayout::SingleEnvelope,
         auto_activation_trigger: Some("<batch>"),
         required_structural_tokens: &["<batch>"],
         stop_sequences: &["</batch>"],
+    };
+
+    const XML_WRAPPED_JSON_SPEC: DeclarativeDialectSpec = DeclarativeDialectSpec {
+        generation_prompt_behavior: GenerationPromptBehavior::HonorRequest,
+        output: ExactEnvelope {
+            prefix: "",
+            suffix: "",
+        },
+        call: ExactEnvelope {
+            prefix: "<tool_call>\n",
+            suffix: "\n</tool_call>",
+        },
+        payload_shape: DeclarativePayloadShape::JsonObject,
+        name_field: "name",
+        arguments_field: "arguments",
+        reasoning_channel: Some(DelimitedChannel {
+            prefix: "<think>\n",
+            suffix: "\n</think>",
+        }),
+        text_channel: None,
+        raw_text_before_calls: true,
+        call_separator: "\n",
+        parallel_layout: ParallelCallLayout::RepeatedEnvelopes,
+        auto_activation_trigger: Some("<tool_call>\n"),
+        required_structural_tokens: &["<|im_end|>"],
+        stop_sequences: &["<|im_end|>"],
     };
 
     fn tool(name: &str) -> Value {
@@ -837,6 +910,195 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    fn push_at_byte_split(
+        parser: &mut crate::streaming::ToolRuntimeParser,
+        output: &str,
+        split: usize,
+    ) {
+        let mut pending = Vec::new();
+        for chunk in [&output.as_bytes()[..split], &output.as_bytes()[split..]] {
+            pending.extend_from_slice(chunk);
+            loop {
+                match std::str::from_utf8(&pending) {
+                    Ok(text) => {
+                        parser.push(text).unwrap();
+                        pending.clear();
+                        break;
+                    }
+                    Err(error) if error.error_len().is_none() => {
+                        let valid_up_to = error.valid_up_to();
+                        if valid_up_to == 0 {
+                            break;
+                        }
+                        let text = std::str::from_utf8(&pending[..valid_up_to]).unwrap();
+                        parser.push(text).unwrap();
+                        pending.drain(..valid_up_to);
+                    }
+                    Err(error) => panic!("representative output is invalid UTF-8: {error}"),
+                }
+            }
+        }
+        assert!(pending.is_empty(), "split {split} left incomplete UTF-8");
+    }
+
+    #[test]
+    fn xml_wrapped_json_supports_text_reasoning_parallel_calls_and_every_byte_split() {
+        let parameters = DialectParameters::Declarative(&XML_WRAPPED_JSON_SPEC);
+        let plan = ConstraintCompiler::synthetic_for_tests()
+            .compile_tool_plan(
+                &DECLARATIVE_DIALECT,
+                parameters,
+                &[tool("weather"), tool("translate")],
+                ToolChoice::Required,
+                ParallelToolCallPolicy::Enabled {
+                    max_calls: std::num::NonZeroUsize::new(2),
+                },
+                vec![151_645],
+            )
+            .unwrap();
+        let output = concat!(
+            "<think>\nNeed Bogotá 🦀\n</think>\nA short note.\n",
+            r#"<tool_call>
+{"name":"weather","arguments":{"value":1}}
+</tool_call>"#,
+            "\n",
+            r#"<tool_call>
+{"name":"translate","arguments":{"value":2}}
+</tool_call>"#,
+        );
+        assert!(accepts(&plan, output));
+        assert!(!accepts(
+            &plan,
+            concat!(
+                r#"<tool_call>
+{"name":"unknown","arguments":{"value":1}}
+</tool_call>"#
+            )
+        ));
+        assert!(!accepts(
+            &plan,
+            concat!(
+                r#"<tool_call>
+{"name":"weather","arguments":{"value":"not-an-integer"}}
+</tool_call>"#
+            )
+        ));
+        assert!(!accepts(
+            &plan,
+            concat!(
+                r#"<tool_call>
+{"name":"weather","arguments":{"value":1}}
+</tool_call>
+<tool_call>
+{"name":"translate","arguments":{"value":2}}
+</tool_call>
+<tool_call>
+{"name":"weather","arguments":{"value":3}}
+</tool_call>"#
+            )
+        ));
+
+        for split in 0..=output.len() {
+            let mut parser = plan.create_parser().unwrap();
+            push_at_byte_split(&mut parser, output, split);
+            parser.finish(FinishReason::GrammarComplete).unwrap();
+            assert_eq!(
+                event_text(parser.events(), true),
+                "Need Bogotá 🦀",
+                "split {split}"
+            );
+            assert_eq!(
+                event_text(parser.events(), false),
+                "\nA short note.\n",
+                "split {split}"
+            );
+            assert_eq!(
+                arguments(parser.events()),
+                [r#"{"value":1}"#, r#"{"value":2}"#],
+                "split {split}"
+            );
+            assert_eq!(
+                parser
+                    .events()
+                    .iter()
+                    .filter(|event| matches!(event, SemanticEvent::ToolCallEnd))
+                    .count(),
+                2,
+                "split {split}"
+            );
+            assert!(
+                parser.events().iter().all(|event| !matches!(
+                    event,
+                    SemanticEvent::TextDelta(text)
+                        if text.contains("<tool_call>") || text.contains("</tool_call>")
+                )),
+                "protocol markers leaked at split {split}"
+            );
+        }
+    }
+
+    #[test]
+    fn xml_wrapped_json_auto_activation_incomplete_calls_and_overlapping_stops() {
+        let parameters = DialectParameters::Declarative(&XML_WRAPPED_JSON_SPEC);
+        let plan = ConstraintCompiler::synthetic_for_tests()
+            .compile_tool_plan(
+                &DECLARATIVE_DIALECT,
+                parameters,
+                &[tool("weather")],
+                ToolChoice::Auto,
+                ParallelToolCallPolicy::Disabled,
+                vec![151_645],
+            )
+            .unwrap();
+        assert_eq!(plan.auto_activation_trigger(), Some("<tool_call>\n"));
+        assert!(accepts(
+            &plan,
+            r#"<tool_call>
+{"name":"weather","arguments":{"value":1}}
+</tool_call>"#
+        ));
+
+        for input in [
+            "<tool_call>",
+            "<tool_call>\n{\"name\":\"weather",
+            "<tool_call>\n{\"name\":\"weather\",\"arguments\":{\"value\":1}}",
+            "<tool_call>\n{\"name\":\"weather\",\"arguments\":{\"value\":1}}\n</tool_",
+        ] {
+            for split in 0..=input.len() {
+                let mut parser = plan.create_parser().unwrap();
+                push_at_byte_split(&mut parser, input, split);
+                parser.finish(FinishReason::MaxTokens).unwrap();
+                assert!(
+                    !parser
+                        .events()
+                        .iter()
+                        .any(|event| matches!(event, SemanticEvent::ToolCallEnd)),
+                    "incomplete input {input:?}, split {split}"
+                );
+            }
+        }
+
+        let stopped = "préface<|im_end|>overlap";
+        for split in 0..=stopped.len() {
+            let mut parser = plan
+                .create_parser_with_stops(["<|im_end|>overlap"])
+                .unwrap();
+            push_at_byte_split(&mut parser, stopped, split);
+            assert_eq!(
+                event_text(parser.events(), false),
+                "préface",
+                "split {split}"
+            );
+            assert_eq!(
+                parser.events().last(),
+                Some(&SemanticEvent::Finished {
+                    reason: FinishReason::StopSequence
+                }),
+                "split {split}"
+            );
+        }
     }
 
     #[test]

@@ -1106,6 +1106,7 @@ mod tests {
         arguments_field: "arguments",
         reasoning_channel: None,
         text_channel: None,
+        raw_text_before_calls: false,
         call_separator: ",",
         parallel_layout: ParallelCallLayout::SingleEnvelope,
         auto_activation_trigger: Some(r#"{"calls":"#),

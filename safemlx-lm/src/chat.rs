@@ -15,10 +15,9 @@ use safemlx_lm_utils::tokenizer::Tokenizer as ChatTokenizer;
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 
-#[cfg(test)]
 use crate::format_dialect::{
-    DeclarativeDialectSpec, DeclarativePayloadShape, ExactEnvelope, ParallelCallLayout,
-    DECLARATIVE_DIALECT,
+    DeclarativeDialectSpec, DeclarativePayloadShape, DelimitedChannel, ExactEnvelope,
+    ParallelCallLayout, DECLARATIVE_DIALECT,
 };
 use crate::{
     format_dialect::{
@@ -333,6 +332,58 @@ const SYNTHETIC_TOOL_TEMPLATE_SIGNATURE: [u8; 32] = [
     0x2a, 0x4b, 0xf7, 0x9c, 0x15, 0x33, 0xd6, 0x8d, 0x04, 0x77, 0x90, 0x30, 0x3d, 0xd8, 0x59, 0xf4,
 ];
 
+const QWEN_XML_TOOL_SPEC: DeclarativeDialectSpec = DeclarativeDialectSpec {
+    generation_prompt_behavior: GenerationPromptBehavior::HonorRequest,
+    output: ExactEnvelope {
+        prefix: "",
+        suffix: "",
+    },
+    call: ExactEnvelope {
+        prefix: "<tool_call>\n",
+        suffix: "\n</tool_call>",
+    },
+    payload_shape: DeclarativePayloadShape::JsonObject,
+    name_field: "name",
+    arguments_field: "arguments",
+    reasoning_channel: None,
+    text_channel: None,
+    raw_text_before_calls: true,
+    call_separator: "\n",
+    parallel_layout: ParallelCallLayout::RepeatedEnvelopes,
+    auto_activation_trigger: Some("<tool_call>\n"),
+    required_structural_tokens: &["<|im_end|>"],
+    stop_sequences: &["<|im_end|>"],
+};
+
+const QWEN3_XML_TOOL_SPEC: DeclarativeDialectSpec = DeclarativeDialectSpec {
+    reasoning_channel: Some(DelimitedChannel {
+        prefix: "<think>\n",
+        suffix: "\n</think>",
+    }),
+    ..QWEN_XML_TOOL_SPEC
+};
+
+const QWEN25_TEMPLATE_SIGNATURE: [u8; 32] = [
+    0xcd, 0x8e, 0x94, 0x39, 0xf0, 0x57, 0x08, 0x56, 0xfd, 0x70, 0x47, 0x0b, 0xf8, 0x88, 0x9e, 0xbd,
+    0x8b, 0x5d, 0x11, 0x07, 0x20, 0x7f, 0x67, 0xa5, 0xef, 0xb4, 0x6e, 0x34, 0x23, 0x30, 0x52, 0x7f,
+];
+const QWEN3_TEMPLATE_16706FC5_SIGNATURE: [u8; 32] = [
+    0x87, 0xa2, 0x72, 0x8c, 0xb8, 0xdc, 0x9f, 0xe4, 0x24, 0xd6, 0x24, 0x54, 0x2f, 0x60, 0x60, 0xec,
+    0x05, 0xa1, 0xd2, 0x85, 0xeb, 0xbe, 0xc5, 0x78, 0xbb, 0x07, 0x89, 0x00, 0xe3, 0x33, 0x96, 0xb5,
+];
+const QWEN3_TEMPLATE_7E4AE267_SIGNATURE: [u8; 32] = [
+    0xa5, 0x5e, 0xe1, 0xb1, 0x66, 0x01, 0x28, 0xb7, 0x09, 0x87, 0x23, 0xe0, 0xab, 0xcd, 0x92, 0xca,
+    0xa0, 0x78, 0x80, 0x61, 0x05, 0x1c, 0x62, 0xd5, 0x1c, 0xbe, 0x87, 0xd9, 0xcf, 0x19, 0x74, 0xd8,
+];
+const QWEN3_VL_TEMPLATE_SIGNATURE: [u8; 32] = [
+    0x36, 0x36, 0xd0, 0xf0, 0xbd, 0x6b, 0xef, 0x02, 0x65, 0x4c, 0xdf, 0xfd, 0xc4, 0x47, 0xb7, 0x9c,
+    0xb2, 0xce, 0xf8, 0xab, 0x02, 0xcc, 0x75, 0x26, 0x73, 0x45, 0x94, 0x62, 0x91, 0xa4, 0x89, 0xe4,
+];
+const HERMES2_PRO_TOOL_USE_TEMPLATE_SIGNATURE: [u8; 32] = [
+    0x7c, 0xe0, 0x9d, 0x55, 0xd3, 0x69, 0x0e, 0x06, 0xc7, 0x0b, 0x5c, 0x07, 0x22, 0x8c, 0xc7, 0xe8,
+    0xc9, 0x9c, 0x43, 0xa2, 0x3c, 0xdc, 0x02, 0x77, 0x62, 0xbe, 0x40, 0x11, 0xef, 0xcd, 0xea, 0x6c,
+];
+
 #[cfg(test)]
 const SYNTHETIC_DECLARATIVE_SPEC: DeclarativeDialectSpec = DeclarativeDialectSpec {
     generation_prompt_behavior: GenerationPromptBehavior::HonorRequest,
@@ -349,6 +400,7 @@ const SYNTHETIC_DECLARATIVE_SPEC: DeclarativeDialectSpec = DeclarativeDialectSpe
     arguments_field: "arguments",
     reasoning_channel: None,
     text_channel: None,
+    raw_text_before_calls: false,
     call_separator: ",",
     parallel_layout: ParallelCallLayout::SingleEnvelope,
     auto_activation_trigger: Some(r#"{"calls":"#),
@@ -359,16 +411,45 @@ const SYNTHETIC_DECLARATIVE_SPEC: DeclarativeDialectSpec = DeclarativeDialectSpe
 #[cfg(test)]
 pub(crate) const SYNTHETIC_STRUCTURAL_TOKEN: &str = "<|safemlx_tool_frame|>";
 
-#[cfg(test)]
-const FORMAT_REGISTRY: &[FormatRegistryEntry] = &[FormatRegistryEntry {
-    identity: "safemlx.synthetic-tools.v1",
-    template_signature: SYNTHETIC_TOOL_TEMPLATE_SIGNATURE,
-    dialect: &DECLARATIVE_DIALECT,
-    parameters: DialectParameters::Declarative(&SYNTHETIC_DECLARATIVE_SPEC),
-}];
-
-#[cfg(not(test))]
-const FORMAT_REGISTRY: &[FormatRegistryEntry] = &[];
+const FORMAT_REGISTRY: &[FormatRegistryEntry] = &[
+    FormatRegistryEntry {
+        identity: "qwen.qwen2.5.xml-tools.acbd9653",
+        template_signature: QWEN25_TEMPLATE_SIGNATURE,
+        dialect: &DECLARATIVE_DIALECT,
+        parameters: DialectParameters::Declarative(&QWEN_XML_TOOL_SPEC),
+    },
+    FormatRegistryEntry {
+        identity: "qwen.qwen3.xml-tools.16706fc5",
+        template_signature: QWEN3_TEMPLATE_16706FC5_SIGNATURE,
+        dialect: &DECLARATIVE_DIALECT,
+        parameters: DialectParameters::Declarative(&QWEN3_XML_TOOL_SPEC),
+    },
+    FormatRegistryEntry {
+        identity: "qwen.qwen3.xml-tools.7e4ae267",
+        template_signature: QWEN3_TEMPLATE_7E4AE267_SIGNATURE,
+        dialect: &DECLARATIVE_DIALECT,
+        parameters: DialectParameters::Declarative(&QWEN3_XML_TOOL_SPEC),
+    },
+    FormatRegistryEntry {
+        identity: "qwen.qwen3-vl.xml-tools.89644892",
+        template_signature: QWEN3_VL_TEMPLATE_SIGNATURE,
+        dialect: &DECLARATIVE_DIALECT,
+        parameters: DialectParameters::Declarative(&QWEN_XML_TOOL_SPEC),
+    },
+    FormatRegistryEntry {
+        identity: "hermes.xml-tools.7ce09d55",
+        template_signature: HERMES2_PRO_TOOL_USE_TEMPLATE_SIGNATURE,
+        dialect: &DECLARATIVE_DIALECT,
+        parameters: DialectParameters::Declarative(&QWEN_XML_TOOL_SPEC),
+    },
+    #[cfg(test)]
+    FormatRegistryEntry {
+        identity: "safemlx.synthetic-tools.v1",
+        template_signature: SYNTHETIC_TOOL_TEMPLATE_SIGNATURE,
+        dialect: &DECLARATIVE_DIALECT,
+        parameters: DialectParameters::Declarative(&SYNTHETIC_DECLARATIVE_SPEC),
+    },
+];
 
 pub(crate) fn template_signature(template: &str) -> [u8; 32] {
     Sha256::digest(template.as_bytes()).into()
@@ -524,8 +605,23 @@ mod tests {
     use super::{
         prepare_format_profile, prepare_format_profile_with_registry, resolve_structural_tokens,
         template_signature, DialectParameters, FormatRegistryEntry, DECLARATIVE_DIALECT,
-        SYNTHETIC_DECLARATIVE_SPEC, SYNTHETIC_TOOL_TEMPLATE, SYNTHETIC_TOOL_TEMPLATE_SIGNATURE,
+        HERMES2_PRO_TOOL_USE_TEMPLATE_SIGNATURE, QWEN25_TEMPLATE_SIGNATURE,
+        QWEN3_TEMPLATE_16706FC5_SIGNATURE, QWEN3_TEMPLATE_7E4AE267_SIGNATURE,
+        QWEN3_VL_TEMPLATE_SIGNATURE, SYNTHETIC_DECLARATIVE_SPEC, SYNTHETIC_TOOL_TEMPLATE,
+        SYNTHETIC_TOOL_TEMPLATE_SIGNATURE,
     };
+
+    const QWEN25_FIXTURE: &str =
+        include_str!("../tests/fixtures/chat_templates/qwen2.5-7b-instruct-acbd9653.jinja");
+    const QWEN3_CURRENT_FIXTURE_WITH_TERMINATOR: &str =
+        include_str!("../tests/fixtures/chat_templates/qwen3-0.6b-7e4ae267.jinja");
+    const QWEN3_VL_FIXTURE: &str =
+        include_str!("../tests/fixtures/chat_templates/qwen3-vl-2b-instruct-89644892.jinja");
+    const HERMES2_PRO_TOOL_USE_FIXTURE: &str = include_str!(
+        "../tests/fixtures/chat_templates/hermes-2-pro-llama-3-8b-f798274b-tool-use.jinja"
+    );
+    const QWEN3_OLDER_TOKENIZER_CONFIG: &str =
+        include_str!("../../safemlx-lm-utils/tests/fixtures/qwen3/tokenizer_config.json");
 
     #[test]
     fn registry_does_not_guess_unknown_templates() {
@@ -582,6 +678,55 @@ mod tests {
         assert!(prepared.dialect.is_some());
         assert!(prepared.dialect_parameters.is_some());
         assert_eq!(prepared.native_tool_unavailable_reason, None);
+    }
+
+    #[test]
+    fn every_audited_production_template_revision_has_an_exact_registration() {
+        let qwen3_current = QWEN3_CURRENT_FIXTURE_WITH_TERMINATOR
+            .strip_suffix('\n')
+            .expect("the fixture-only file terminator is documented");
+        let qwen3_older: serde_json::Value =
+            serde_json::from_str(QWEN3_OLDER_TOKENIZER_CONFIG).unwrap();
+        let qwen3_older = qwen3_older["chat_template"].as_str().unwrap();
+        let fixtures = [
+            (
+                QWEN25_FIXTURE,
+                QWEN25_TEMPLATE_SIGNATURE,
+                "qwen.qwen2.5.xml-tools.acbd9653",
+            ),
+            (
+                qwen3_older,
+                QWEN3_TEMPLATE_16706FC5_SIGNATURE,
+                "qwen.qwen3.xml-tools.16706fc5",
+            ),
+            (
+                qwen3_current,
+                QWEN3_TEMPLATE_7E4AE267_SIGNATURE,
+                "qwen.qwen3.xml-tools.7e4ae267",
+            ),
+            (
+                QWEN3_VL_FIXTURE,
+                QWEN3_VL_TEMPLATE_SIGNATURE,
+                "qwen.qwen3-vl.xml-tools.89644892",
+            ),
+            (
+                HERMES2_PRO_TOOL_USE_FIXTURE,
+                HERMES2_PRO_TOOL_USE_TEMPLATE_SIGNATURE,
+                "hermes.xml-tools.7ce09d55",
+            ),
+        ];
+
+        for (template, signature, identity) in fixtures {
+            assert_eq!(template_signature(template), signature, "{identity}");
+            let prepared = prepare_format_profile(template);
+            assert_eq!(prepared.identity.as_deref(), Some(identity));
+            assert!(prepared.dialect.is_some(), "{identity}");
+            assert_eq!(prepared.required_structural_tokens, ["<|im_end|>"]);
+            assert_eq!(prepared.stop_sequences, ["<|im_end|>"]);
+        }
+
+        let modified = format!("{QWEN25_FIXTURE} ");
+        assert!(prepare_format_profile(&modified).dialect.is_none());
     }
 
     #[test]

@@ -4366,6 +4366,13 @@ mod tests {
     use tokenizers::{models::wordlevel::WordLevel, AddedToken, Tokenizer};
 
     static TEMP_DIR_COUNTER: AtomicUsize = AtomicUsize::new(0);
+    const QWEN3_CURRENT_FIXTURE_WITH_TERMINATOR: &str =
+        include_str!("../../tests/fixtures/chat_templates/qwen3-0.6b-7e4ae267.jinja");
+    const QWEN3_VL_FIXTURE: &str =
+        include_str!("../../tests/fixtures/chat_templates/qwen3-vl-2b-instruct-89644892.jinja");
+    const HERMES2_PRO_TOOL_USE_FIXTURE: &str = include_str!(
+        "../../tests/fixtures/chat_templates/hermes-2-pro-llama-3-8b-f798274b-tool-use.jinja"
+    );
 
     #[test]
     #[ignore = "requires MLX runtime execution and SAFEMLX_INSPECTION_MODEL_DIR"]
@@ -4445,6 +4452,48 @@ mod tests {
             1
         );
         ChatTokenizer::from_tokenizer(raw)
+    }
+
+    fn production_chat_tokenizer(preceding_tokens: usize) -> ChatTokenizer {
+        let mut raw = Tokenizer::new(WordLevel::default());
+        raw.add_tokens(
+            (0..preceding_tokens)
+                .map(|index| AddedToken::from(format!("ordinary_{index}"), false))
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        assert_eq!(
+            raw.add_special_tokens([AddedToken::from("<|im_end|>", true).normalized(false)])
+                .unwrap(),
+            1
+        );
+        let mut tokenizer = ChatTokenizer::from_tokenizer(raw);
+        tokenizer.set_template_kwargs(serde_json::Map::from_iter([
+            ("bos_token".into(), json!("<|begin_of_text|>")),
+            ("add_vision_id".into(), json!(false)),
+        ]));
+        tokenizer
+    }
+
+    fn production_tool(name: &str) -> serde_json::Value {
+        json!({
+            "type": "function",
+            "function": {
+                "name": name,
+                "description": "Look up one integer.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "value": {
+                            "type": "integer",
+                            "description": "The integer to look up."
+                        }
+                    },
+                    "required": ["value"],
+                    "additionalProperties": false
+                }
+            }
+        })
     }
 
     #[test]
@@ -4573,6 +4622,170 @@ mod tests {
             &ChatTemplateIdentity::Named("tool_use".into())
         );
         assert_eq!(prepared.format_profile_identity(), None);
+    }
+
+    #[test]
+    fn production_qwen_profile_renders_history_generation_prompt_and_dynamic_tokens() {
+        let template = QWEN3_CURRENT_FIXTURE_WITH_TERMINATOR
+            .strip_suffix('\n')
+            .unwrap();
+        let compiler = Ok(ConstraintCompiler::synthetic_for_tests());
+        let messages = vec![
+            json!({"role": "user", "content": "first"}),
+            json!({
+                "role": "assistant",
+                "content": "",
+                "reasoning_content": "inspect",
+                "tool_calls": [{
+                    "type": "function",
+                    "function": {"name": "lookup", "arguments": {"value": 1}}
+                }]
+            }),
+            json!({"role": "tool", "name": "lookup", "content": "{\"result\":1}"}),
+            json!({"role": "user", "content": "again"}),
+        ];
+
+        for (add_generation_prompt, expected_suffix) in [
+            (false, ""),
+            (true, "<|im_start|>assistant\n<think>\n\n</think>\n\n"),
+        ] {
+            let mut tokenizer = production_chat_tokenizer(9);
+            let prepared = prepare_chat_from_parts(
+                &mut tokenizer,
+                ModelChatTemplate::Single(template.into()),
+                "deliberately-not-a-qwen-model-type",
+                &[],
+                Some(&compiler),
+                ChatTemplateRequest {
+                    messages: messages.clone(),
+                    tools: vec![production_tool("lookup")],
+                    tool_choice: ToolChoice::Auto,
+                    parallel_tool_calls: ParallelToolCallPolicy::Enabled {
+                        max_calls: std::num::NonZeroUsize::new(2),
+                    },
+                    enable_thinking: Some(false),
+                    add_generation_prompt,
+                    ..ChatTemplateRequest::default()
+                },
+            )
+            .unwrap();
+
+            assert_eq!(
+                prepared.format_profile_identity(),
+                Some("qwen.qwen3.xml-tools.7e4ae267")
+            );
+            assert_eq!(
+                prepared.generation_prompt(),
+                "<|im_start|>assistant\n<think>\n\n</think>\n\n"
+            );
+            if add_generation_prompt {
+                assert!(prepared.rendered_prompt().ends_with(expected_suffix));
+            } else {
+                assert!(!prepared
+                    .rendered_prompt()
+                    .ends_with("<|im_start|>assistant\n<think>\n\n</think>\n\n"));
+            }
+            assert!(prepared.rendered_prompt().contains(
+                "<tool_call>\n{\"name\": \"lookup\", \"arguments\": {\"value\":1}}\n</tool_call>"
+            ));
+            assert!(prepared
+                .rendered_prompt()
+                .contains("<tool_response>\n{\"result\":1}\n</tool_response>"));
+            assert_eq!(prepared.preserved_structural_token_ids(), &[9]);
+            assert_eq!(prepared.profile_stop_sequences(), ["<|im_end|>"]);
+            let NativeToolSupport::Supported(plan) = prepared.native_tool_support() else {
+                panic!("registered Qwen profile must be supported");
+            };
+            assert_eq!(plan.auto_activation_trigger(), Some("<tool_call>\n"));
+        }
+    }
+
+    #[test]
+    fn production_qwen_vl_and_named_hermes_templates_prepare_without_architecture_keys() {
+        let compiler = Ok(ConstraintCompiler::synthetic_for_tests());
+        let mut qwen_vl_tokenizer = production_chat_tokenizer(3);
+        let qwen_vl = prepare_chat_from_parts(
+            &mut qwen_vl_tokenizer,
+            ModelChatTemplate::Single(QWEN3_VL_FIXTURE.into()),
+            "unrelated",
+            &[],
+            Some(&compiler),
+            ChatTemplateRequest {
+                messages: vec![json!({
+                    "role": "user",
+                    "content": [
+                        {"type": "image", "image": "fixture"},
+                        {"type": "text", "text": "describe"}
+                    ]
+                })],
+                tools: vec![production_tool("lookup")],
+                tool_choice: ToolChoice::Required,
+                add_generation_prompt: true,
+                ..ChatTemplateRequest::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            qwen_vl.format_profile_identity(),
+            Some("qwen.qwen3-vl.xml-tools.89644892")
+        );
+        assert_eq!(qwen_vl.generation_prompt(), "<|im_start|>assistant\n");
+        assert!(qwen_vl
+            .rendered_prompt()
+            .contains("<|vision_start|><|image_pad|><|vision_end|>describe"));
+        let NativeToolSupport::Supported(qwen_vl_plan) = qwen_vl.native_tool_support() else {
+            panic!("registered Qwen-VL profile must be supported");
+        };
+        assert_eq!(qwen_vl_plan.auto_activation_trigger(), None);
+
+        let mut hermes_tokenizer = production_chat_tokenizer(5);
+        let hermes = prepare_chat_from_parts(
+            &mut hermes_tokenizer,
+            ModelChatTemplate::Named(BTreeMap::from([
+                ("default".into(), "default template".into()),
+                ("tool_use".into(), HERMES2_PRO_TOOL_USE_FIXTURE.into()),
+            ])),
+            "qwen-would-be-a-misleading-model-type",
+            &[],
+            Some(&compiler),
+            ChatTemplateRequest {
+                messages: vec![
+                    json!({"role": "user", "content": "first"}),
+                    json!({
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": [{
+                            "function": {
+                                "name": "lookup",
+                                "arguments": "{\"value\":1}"
+                            }
+                        }]
+                    }),
+                    json!({"role": "tool", "content": "{\"result\":1}"}),
+                    json!({"role": "user", "content": "next"}),
+                ],
+                tools: vec![production_tool("lookup")],
+                tool_choice: ToolChoice::Required,
+                add_generation_prompt: true,
+                ..ChatTemplateRequest::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            hermes.template_identity(),
+            &ChatTemplateIdentity::Named("tool_use".into())
+        );
+        assert_eq!(
+            hermes.format_profile_identity(),
+            Some("hermes.xml-tools.7ce09d55")
+        );
+        assert_eq!(hermes.generation_prompt(), "<|im_start|>assistant\n");
+        assert!(hermes.rendered_prompt().contains(
+            "<tool_call>\n{\"name\": \"lookup\", \"arguments\": {\"value\":1}}\n</tool_call>"
+        ));
+        assert!(hermes
+            .rendered_prompt()
+            .contains("<tool_response>\n{\"result\":1}\n</tool_response>"));
     }
 
     #[test]
