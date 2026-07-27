@@ -26,7 +26,7 @@ use safemlx_lm::{
         input::{InputPart, ModelInput},
         LoadedModel, ModelLoadOptions, TextDecoder,
     },
-    mtp::{LoadedDrafter, MtpConfig, MtpExecutionStreams, MtpStats},
+    mtp::{LoadedDrafter, MtpConfig, MtpExecutionStreams, MtpSchedulerOptions, MtpStats},
     offload::{CacheEvictionPolicy, MemoryTier, OffloadConfig, TransferDirection},
     quantization::AffineQuantization,
     sampler::{DefaultSampler, GenerationSampler, MirostatV2Sampler, Sampler, SpeculativeSampler},
@@ -107,11 +107,11 @@ impl Sampler for CliSampler {
 }
 
 impl SpeculativeSampler for CliSampler {
-    fn supports_optimistic_lookahead(&self) -> bool {
+    fn supports_exact_optimistic_promotion(&self) -> bool {
         match self {
-            Self::Greedy(sampler) => sampler.supports_optimistic_lookahead(),
-            Self::Configured(sampler) => sampler.supports_optimistic_lookahead(),
-            Self::MirostatV2(sampler) => sampler.supports_optimistic_lookahead(),
+            Self::Greedy(sampler) => sampler.supports_exact_optimistic_promotion(),
+            Self::Configured(sampler) => sampler.supports_exact_optimistic_promotion(),
+            Self::MirostatV2(sampler) => sampler.supports_exact_optimistic_promotion(),
         }
     }
 
@@ -163,6 +163,14 @@ struct Cli {
     /// Maximum speculative tokens proposed before each target verification.
     #[arg(long, default_value_t = 3, value_name = "TOKENS")]
     mtp_draft_tokens: usize,
+
+    /// Disable same-request optimistic MTP lookahead for equivalent A/B runs.
+    #[arg(long)]
+    disable_mtp_lookahead: bool,
+
+    /// Keep MTP lookahead enabled even when retained work does not cover discards.
+    #[arg(long)]
+    disable_mtp_adaptive_lookahead: bool,
 
     /// Device used by an external MTP assistant.
     #[arg(long, value_enum, default_value_t = MtpDevice::Gpu)]
@@ -607,26 +615,38 @@ fn main() -> Result<()> {
             temperature: args.temperature,
             eos_token_ids: eos_token_ids.clone(),
         };
-        let (tokens, stats) = model.generate_mtp_input_with_sampler_callback_and_streams(
-            drafter,
-            &mut cache,
-            input,
-            &config,
-            prng_key,
-            &mut sampler,
-            MtpExecutionStreams::new(stream, draft_stream),
-            |token_id| {
-                if time_to_first_token.is_none() {
-                    time_to_first_token = Some(generation_started.elapsed());
-                }
-                if eos_token_ids.contains(&token_id) {
-                    Ok(())
-                } else {
-                    write_streamed_token(&mut decoder, &mut stdout, &mut streamed_text, token_id)
+        let scheduler_options = MtpSchedulerOptions {
+            adaptive_lookahead: !args.disable_mtp_adaptive_lookahead,
+            ..MtpSchedulerOptions::default()
+        }
+        .with_lookahead(!args.disable_mtp_lookahead);
+        let (tokens, stats) = model
+            .generate_mtp_input_with_sampler_callback_and_streams_and_options(
+                drafter,
+                &mut cache,
+                input,
+                &config,
+                prng_key,
+                &mut sampler,
+                MtpExecutionStreams::new(stream, draft_stream),
+                scheduler_options,
+                |token_id| {
+                    if time_to_first_token.is_none() {
+                        time_to_first_token = Some(generation_started.elapsed());
+                    }
+                    if eos_token_ids.contains(&token_id) {
+                        Ok(())
+                    } else {
+                        write_streamed_token(
+                            &mut decoder,
+                            &mut stdout,
+                            &mut streamed_text,
+                            token_id,
+                        )
                         .map_err(|error| Exception::custom(error.to_string()))
-                }
-            },
-        )?;
+                    }
+                },
+            )?;
         output_ids = tokens;
         mtp_stats = Some(stats);
     } else if embedded_mtp {
@@ -743,14 +763,21 @@ fn main() -> Result<()> {
         eprintln!("generation_time: {:.3} s", generation_elapsed.as_secs_f64());
         if let Some(stats) = &mtp_stats {
             eprintln!(
-                "mtp_rounds: {}, mtp_draft_tokens: {}, mtp_accepted_tokens: {}, mtp_accept_rate: {:.3}, mtp_optimistic_blocks: {}, mtp_reused_optimistic_blocks: {}, mtp_discarded_optimistic_blocks: {}, mtp_cross_request_draft_opportunities: {}",
+                "mtp_rounds: {}, mtp_draft_tokens: {}, mtp_accepted_tokens: {}, mtp_accept_rate: {:.3}, mtp_optimistic_blocks: {}, mtp_optimistic_bonus_tokens: {}, mtp_optimistic_bonus_matches: {}, mtp_optimistic_bonus_mismatches: {}, mtp_consumed_optimistic_tokens: {}, mtp_reused_optimistic_blocks: {}, mtp_reused_optimistic_tokens: {}, mtp_discarded_optimistic_blocks: {}, mtp_discarded_optimistic_tokens: {}, mtp_adaptive_lookahead_disabled: {}, mtp_cross_request_draft_opportunities: {}",
                 stats.rounds,
                 stats.draft_tokens,
                 stats.accepted_tokens,
                 stats.accept_rate(),
                 stats.optimistic_draft_blocks,
+                stats.optimistic_target_bonus_tokens,
+                stats.optimistic_bonus_matches,
+                stats.optimistic_bonus_mismatches,
+                stats.consumed_optimistic_tokens,
                 stats.reused_optimistic_blocks,
+                stats.reused_optimistic_tokens,
                 stats.discarded_optimistic_blocks,
+                stats.discarded_optimistic_tokens,
+                stats.adaptive_lookahead_disabled,
                 stats.cross_request_draft_opportunities,
             );
             eprintln!("mtp_accept_lens: {:?}", stats.accept_lens);
@@ -1405,7 +1432,7 @@ mod tests {
     use super::{
         format_bytes, select_cached_gguf_from_revisions, select_cached_gguf_path, select_revision,
         should_report_stop_reason, split_hf_model_spec, stop_reason, thinking_template_kwargs,
-        validate_args, CachedGgufRole, Cli, StopReason, ThinkingMode,
+        validate_args, CachedGgufRole, Cli, MtpSchedulerOptions, StopReason, ThinkingMode,
     };
 
     fn revision(hash: &str, refs: &[&str], modified: u64) -> CachedRevisionInfo {
@@ -1595,6 +1622,31 @@ mod tests {
         ])
         .unwrap();
         validate_args(&with_drafter).unwrap();
+    }
+
+    #[test]
+    fn parses_mtp_lookahead_controls() {
+        let args = Cli::try_parse_from([
+            "safemlx-lm",
+            "--model",
+            "model-id",
+            "--draft-model",
+            "draft-id",
+            "--disable-mtp-lookahead",
+            "--disable-mtp-adaptive-lookahead",
+            "prompt",
+        ])
+        .unwrap();
+
+        assert!(args.disable_mtp_lookahead);
+        assert!(args.disable_mtp_adaptive_lookahead);
+        let options = MtpSchedulerOptions {
+            adaptive_lookahead: !args.disable_mtp_adaptive_lookahead,
+            ..MtpSchedulerOptions::default()
+        }
+        .with_lookahead(!args.disable_mtp_lookahead);
+        assert_eq!(options.lookahead_blocks, 0);
+        assert!(!options.adaptive_lookahead);
     }
 
     #[test]

@@ -607,32 +607,56 @@ terminal phases. Verification submission leaves the lazy GPU graph unresolved.
 The scheduler then drafts one optimistic continuation block on the CPU, or
 gives a round-robin turn to another ready request, before reading target
 results. `MtpSchedulerOptions` bounds retained verifications and branches; both
-default to one.
+default to one. `MtpSchedulerOptions::with_lookahead(false)` disables all
+same-request branch work while leaving the canonical verification, sampler,
+and target-PRNG path intact for equivalent A/B runs.
 
 An optimistic Gemma branch shares immutable target shared-KV maps and MLX array
 handles while owning its small token delta, exact processed draft
-distributions, assistant progress, and draft PRNG snapshot. Full acceptance
-promotes that branch without recomputation; rejection, EOS, and cancellation
-drop it and commit only the verified prefix. Target acceptance and draft
-sampling use deterministic disjoint per-request PRNG substreams, so rejected
-lookahead cannot advance canonical target randomness. The pipelined path omits
-the usual all-accepted target bonus token: the next optimistic block is rooted
-at the last accepted proposal, avoiding reuse under a mismatched bonus while
-preserving lossless speculative decoding.
+distributions, exact assumed-prefix copy, and assistant progress. Full
+acceptance samples and emits the usual target bonus token. When it matches the
+first optimistic token, that token is consumed by the bonus and the remaining
+token/distribution pairs are promoted without recomputation. The shortened
+block is extended from its exact assistant frontier before verification so its
+boundary matches ordinary non-lookahead execution. A mismatch, rejection, EOS,
+or cancellation drops the branch and commits only canonical state.
+
+Target acceptance and draft sampling use disjoint per-request roots. Draft
+randomness is addressed by logical output position rather than scheduler
+operation order, so consuming a matching optimistic token, discarding a
+mismatch, changing request interleaving, or temporarily exhausting branch
+slots cannot move later draft draws. The target cache contains only evaluated
+inputs: an emitted bonus remains uncached and leads the next verification.
+Fully accepted bonus-emitting rounds commit their entire evaluated input block
+without truncating KV storage. Partial rollback moves only the logical frontier
+of chunked KV caches, preserving allocated backing capacity so the abandoned
+suffix can be overwritten in place.
+`MTP_OPTIMISTIC_LOOKAHEAD.md` gives the complete cache, assistant-state,
+sampler, RNG, match, mismatch, and terminal transition invariants.
 
 `generate_mtp_text_batch_with_cache_and_streams` submits every independent lane
 to the same starvation-free scheduler and returns results in input order.
 Single-request APIs are one-request scheduler wrappers. `MtpStats` reports
-optimistically drafted, reused, and discarded tokens/blocks plus scheduler
-turns and cross-request draft opportunities; `MtpBatchOutput::scheduler`
-reports aggregate turns and peak retained transactions.
+optimistically drafted, bonus-consumed, reused, and discarded tokens/blocks;
+optimistic target bonuses and their non-terminal matches/mismatches; plus
+scheduler turns, adaptive-lookahead status, and cross-request draft
+opportunities. After four resolved branches by default, deterministic adaptive
+accounting disables future branch work when no proposal has been reused or
+when reused proposal tokens fall below discarded proposal tokens. The consumed
+matching bonus token is excluded from both sides. This policy only suppresses
+optional drafting and cannot change canonical output.
+`MtpBatchOutput::scheduler` reports aggregate turns and peak retained
+transactions. A matched first token counts as consumed, not reused and not an
+ordinary proposal; only retained tokens promoted into the canonical proposal
+block contribute to `draft_tokens`.
 
 Optimistic continuation currently requires an external Gemma assistant,
-distinct target/draft streams, and a sampler whose draft processing depends
-only on explicit history. Mirostat V2 remains lossless and reproducible but
-does not look ahead because its next truncation depends on target-committed
-adaptive state. Embedded Qwen uses the same request scheduler and independent
-lane semantics without same-request lookahead.
+distinct target/draft streams, and a sampler whose cloned draft processing and
+sampling are exact functions of explicit history, immutable configuration, and
+the supplied position-addressed PRNG state. Mirostat V2 remains lossless and
+reproducible but does not look ahead because its next truncation depends on
+target-committed adaptive state. Embedded Qwen uses the same request scheduler
+and independent lane semantics without same-request lookahead.
 Qwen3-Next and Qwen3.5/3.6 safetensors checkpoints execute their native MTP
 head through `generate_embedded_mtp_input`; resident and bounded-layer loading
 are both supported, including dense, block-FP8, affine, and MXFP4 weights. Text

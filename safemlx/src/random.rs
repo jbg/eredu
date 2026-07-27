@@ -162,6 +162,27 @@ pub fn split(
     ))
 }
 
+/// Returns the deterministic subkey at `index` from one PRNG-key split.
+///
+/// This is useful for counter- or position-addressed random streams: callers
+/// can derive the key for one logical position without advancing mutable
+/// state. The same root key and index always produce the same subkey.
+pub fn split_key_at(
+    key: impl AsRef<Array>,
+    index: usize,
+    stream: impl AsRef<Stream>,
+) -> Result<Array> {
+    let stream = stream.as_ref();
+    let count = index
+        .checked_add(1)
+        .and_then(|count| i32::try_from(count).ok())
+        .ok_or_else(|| Exception::custom("random subkey index exceeds i32"))?;
+    let keys = Array::try_from_op(|res| unsafe {
+        safemlx_sys::mlx_random_split_num(res, key.as_ref().as_ptr(), count, stream.as_ptr())
+    })?;
+    keys.try_index_device(index as i32, stream)
+}
+
 /// Generate uniformly distributed random numbers.
 /// The values are sampled uniformly in the half-open interval `[lower, upper)`.
 /// The lower and upper bound can be scalars or arrays and must be broadcastable to `shape`.
@@ -600,6 +621,26 @@ mod tests {
         let (r1, r2) = split(&key, 2, stream).unwrap();
         assert!(crate::array::eval_equal_values(&r1, &k1));
         assert!(crate::array::eval_equal_values(&r2, &k2));
+    }
+
+    #[test]
+    fn test_split_key_at_is_position_addressed() {
+        let stream = crate::test_stream();
+        let root = key(0).unwrap();
+        let other_root = key(1).unwrap();
+        let first = split_key_at(&root, 0, stream).unwrap();
+        let second = split_key_at(&root, 1, stream).unwrap();
+        let repeated = split_key_at(&root, 7, stream).unwrap();
+
+        assert!(!crate::array::eval_equal_values(&first, &second));
+        assert!(crate::array::eval_equal_values(
+            &repeated,
+            &split_key_at(&root, 7, stream).unwrap()
+        ));
+        assert!(!crate::array::eval_equal_values(
+            &repeated,
+            &split_key_at(&other_root, 7, stream).unwrap()
+        ));
     }
 
     #[test]

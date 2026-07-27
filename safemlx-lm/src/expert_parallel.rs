@@ -1145,7 +1145,7 @@ struct ExpertParallelSpeculativeSampler<'a, S> {
 }
 
 impl<S: SpeculativeSampler> SpeculativeSampler for ExpertParallelSpeculativeSampler<'_, S> {
-    fn supports_optimistic_lookahead(&self) -> bool {
+    fn supports_exact_optimistic_promotion(&self) -> bool {
         false
     }
 

@@ -11,7 +11,10 @@ use crate::{
         gemma4_assistant::{Gemma4AssistantDraftModel, Gemma4AssistantDraftState},
         input::ModelInput as RuntimeInput,
     },
-    mtp::{self, MtpBackend, MtpCommit, MtpConfig, MtpExecutionStreams, MtpPrefill},
+    mtp::{
+        self, MtpBackend, MtpCommit, MtpConfig, MtpExecutionStreams, MtpPrefill,
+        MtpSchedulerOptions,
+    },
     sampler::SpeculativeSampler,
 };
 
@@ -202,7 +205,7 @@ impl<T: Gemma4MtpTarget> MtpBackend for Gemma4MtpBackend<'_, T> {
         self.assistant.block_size().saturating_sub(1)
     }
 
-    fn supports_optimistic_lookahead(&self) -> bool {
+    fn supports_exact_optimistic_promotion(&self) -> bool {
         true
     }
 
@@ -377,7 +380,7 @@ impl<T: Gemma4MtpTarget> MtpBackend for Gemma4MtpBackend<'_, T> {
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn generate_with_streams_and_callback<T, S, F>(
+pub(crate) fn generate_with_streams_and_callback_and_options<T, S, F>(
     target: &mut T,
     assistant: &mut Gemma4AssistantDraftModel,
     cache: &mut Cache,
@@ -386,6 +389,7 @@ pub(crate) fn generate_with_streams_and_callback<T, S, F>(
     prng_key: Option<Array>,
     sampler: &mut S,
     streams: MtpExecutionStreams<'_>,
+    options: MtpSchedulerOptions,
     on_token: F,
 ) -> Result<(Vec<u32>, mtp::MtpStats), Exception>
 where
@@ -394,7 +398,7 @@ where
     F: FnMut(u32) -> Result<(), Exception>,
 {
     let mut backend = Gemma4MtpBackend::new(target, assistant);
-    mtp::generate_with_streams_and_callback(
+    mtp::generate_with_streams_and_callback_and_options(
         &mut backend,
         cache,
         input,
@@ -402,6 +406,7 @@ where
         prng_key,
         sampler,
         streams,
+        options,
         on_token,
     )
 }

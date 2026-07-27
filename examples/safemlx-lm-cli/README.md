@@ -83,22 +83,40 @@ verification on the GPU while loading and executing the external assistant on
 the CPU. After submitting a lazy target-verification graph, the MTP scheduler
 continues one block ahead on the CPU under the assumption that every proposal
 will be accepted. It resolves the GPU result only after that eligible CPU work
-has been submitted. A fully accepted block reuses the continuation; rejection
-or EOS discards it without changing committed cache, sampler, PRNG, output, or
-statistics state. The default retains at most one target transaction and one
-lookahead block.
+has been submitted. A fully accepted block emits the conventional target bonus
+immediately. If the bonus matches the first optimistic token, that token is
+consumed and the remaining exact token/distribution pairs are reused; the
+shortened block is extended from its promoted assistant frontier before
+verification. A mismatch discards the whole branch and continues from the
+canonical bonus prefix. Rejection or EOS also discards continuation work
+without promoting branch cache, sampler, PRNG, history, output, callback, or
+canonical statistics state. The default retains at most one target transaction
+and one lookahead block. Use `--disable-mtp-lookahead` to remove same-request
+branch work entirely for an equivalent canonical A/B run. This does not disable
+ordinary MTP verification.
 
 Target acceptance and draft sampling use disjoint deterministic PRNG
-substreams. The pipelined path does not emit the conventional target bonus
-after an all-accepted block, because the optimistic continuation is rooted at
-the last proposal rather than an unknown bonus token. This remains lossless;
-the next block is verified normally.
+roots. Draft substreams are addressed by logical output position, making output
+reproducible for a fixed request seed across scheduler interleavings, branch
+promotion/discard, and temporary branch-slot unavailability. Target bonuses
+remain outside the target cache until they lead the next verification, matching
+the backend cache convention. Fully accepted bonus rounds do not truncate the
+target KV cache; partial rollback preserves chunked KV backing capacity.
+
+After four resolved branches, lookahead is disabled for that request when no
+proposal has been reused or reused proposal tokens fall below discarded
+proposal tokens. The rule is deterministic, excludes the consumed matching
+bonus token, and only suppresses future optional draft work. Use
+`--disable-mtp-adaptive-lookahead` to keep eligible lookahead enabled for
+benchmarking.
 
 Same-request lookahead currently requires an external Gemma assistant and a
-history-only draft processor. Mirostat V2 still uses scheduled, lossless MTP
-but waits for target resolution because its adaptive state depends on committed
-target probabilities. Embedded Qwen uses the scheduler without optimistic
-lookahead. `--mtp-device cpu` requires `--draft-model`.
+draft processor with exact clone/discard semantics derived only from explicit
+history, immutable configuration, and the supplied PRNG state. Mirostat V2
+still uses scheduled, lossless MTP but waits for target resolution because its
+adaptive state depends on committed target probabilities. Embedded Qwen uses
+the scheduler without optimistic lookahead. `--mtp-device cpu` requires
+`--draft-model`.
 
 The assistant may be a safetensors directory or a GGUF file with
 `general.architecture = "gemma4_assistant"` or the published
@@ -120,8 +138,11 @@ cargo run --release -p safemlx-lm-cli -- \
 Stochastic MTP uses lossless probability-ratio acceptance and supports the
 same top-k, top-p, min-p, and repetition/frequency/presence policies as normal
 generation. Under `--verbose`, the CLI reports proposal and acceptance counts
-together with optimistic drafted/reused/discarded blocks and cross-request
-draft opportunities.
+together with optimistic drafted/consumed/reused/discarded work, target bonus
+matches/mismatches, adaptive-disable status, and cross-request draft
+opportunities. The first
+optimistic token matched by a target bonus counts as consumed rather than
+reused or proposed.
 
 Qwen3-Next and Qwen3.5/3.6 safetensors checkpoints with native MTP weights use
 those embedded weights automatically; no `--draft-model` is needed. Their

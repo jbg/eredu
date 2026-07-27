@@ -19,13 +19,19 @@ use crate::{
 /// and history commitment.  A speculative decoder can therefore inspect the
 /// exact target and draft distributions without recording rejected tokens.
 pub trait SpeculativeSampler {
-    /// Returns whether processing draft logits depends only on the supplied
-    /// history and immutable sampler configuration.
+    /// Returns whether optimistic draft work is an exact, discardable fork.
     ///
-    /// Optimistic MTP lookahead runs before the current target block has been
-    /// committed. Stateful processors whose next draft distribution depends on
-    /// target-side commit data must keep the default `false`.
-    fn supports_optimistic_lookahead(&self) -> bool {
+    /// Returning `true` guarantees that draft-side [`Self::process_logits`] and
+    /// [`Self::sample_processed`] depend only on raw logits, the supplied
+    /// logical history, immutable configuration, and the supplied PRNG state.
+    /// Calling them on a clone must not mutate state that a later canonical
+    /// target commit observes. This permits a scheduler to compute processed
+    /// draft distributions before target resolution, then promote them after
+    /// proving that their entire assumed prefix is canonical.
+    ///
+    /// Adaptive processors whose next draft distribution depends on
+    /// target-committed state must keep the default `false`.
+    fn supports_exact_optimistic_promotion(&self) -> bool {
         false
     }
 
@@ -337,8 +343,8 @@ impl<S: Clone> ConstrainedSampler<S> {
 }
 
 impl<S: SpeculativeSampler + Clone> SpeculativeSampler for ConstrainedSampler<S> {
-    fn supports_optimistic_lookahead(&self) -> bool {
-        self.policy.supports_optimistic_lookahead()
+    fn supports_exact_optimistic_promotion(&self) -> bool {
+        self.policy.supports_exact_optimistic_promotion()
     }
 
     fn process_logits(
@@ -459,7 +465,7 @@ fn constraint_error(error: String) -> Exception {
 pub struct DefaultSampler;
 
 impl SpeculativeSampler for DefaultSampler {
-    fn supports_optimistic_lookahead(&self) -> bool {
+    fn supports_exact_optimistic_promotion(&self) -> bool {
         true
     }
 
@@ -992,7 +998,7 @@ impl GenerationSampler {
 }
 
 impl SpeculativeSampler for GenerationSampler {
-    fn supports_optimistic_lookahead(&self) -> bool {
+    fn supports_exact_optimistic_promotion(&self) -> bool {
         true
     }
 

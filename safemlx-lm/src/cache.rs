@@ -1855,6 +1855,22 @@ impl ConcatKeyValueCache {
 
     /// Truncates the cache to `len` tokens.
     pub fn truncate(&mut self, len: i32, stream: &Stream) -> Result<(), Exception> {
+        if len < 0 || len > self.length {
+            return Err(Exception::custom(format!(
+                "concatenating cache truncate length {len} is outside 0..{}",
+                self.length
+            )));
+        }
+        if self.step > 1 {
+            // Chunked caches treat the array shape as backing capacity and
+            // expose only `length` through logical_arrays. Rolling the logical
+            // frontier back is sufficient: the next update overwrites the
+            // abandoned speculative range in place without forcing capacity
+            // regrowth.
+            self.offset = len;
+            self.length = len;
+            return Ok(());
+        }
         if let Some(keys) = self.keys.take() {
             self.keys = Some(keys.try_index_device((.., .., ..len, ..), stream)?);
         }
@@ -2085,6 +2101,49 @@ mod tests {
                 saved.as_slice::<f32>().as_ptr()
             );
         }
+    }
+
+    #[test]
+    #[ignore = "requires MLX runtime execution"]
+    fn chunked_cache_truncate_preserves_backing_capacity_and_overwrites_rollback() {
+        let context = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        let stream = context.stream();
+        let mut cache = ConcatKeyValueCache::new_with_step(8);
+        let initial = Array::from_slice(&[1.0f32, 2.0, 3.0], &[1, 1, 3, 1]);
+        cache
+            .update_and_fetch(initial.clone(), initial, stream)
+            .unwrap();
+        eval(cache.arrays()).unwrap();
+        let pointers_before = cache
+            .arrays()
+            .map(|array| array.evaluated().unwrap().as_slice::<f32>().as_ptr())
+            .collect::<Vec<_>>();
+
+        cache.truncate(1, stream).unwrap();
+
+        assert_eq!(cache.length, 1);
+        assert_eq!(cache.capacity, 8);
+        assert!(cache.arrays().all(|array| array.dim(-2) == 8));
+        let pointers_after = cache
+            .arrays()
+            .map(|array| array.evaluated().unwrap().as_slice::<f32>().as_ptr())
+            .collect::<Vec<_>>();
+        assert_eq!(pointers_after, pointers_before);
+
+        let replacement = Array::from_slice(&[7.0f32, 8.0], &[1, 1, 2, 1]);
+        let (keys, values) = cache
+            .update_and_fetch(replacement.clone(), replacement, stream)
+            .unwrap();
+        eval([&keys, &values]).unwrap();
+        assert_eq!(
+            keys.evaluated().unwrap().as_slice::<f32>(),
+            &[1.0, 7.0, 8.0]
+        );
+        assert_eq!(
+            values.evaluated().unwrap().as_slice::<f32>(),
+            &[1.0, 7.0, 8.0]
+        );
+        assert_eq!(cache.capacity, 8);
     }
 
     #[test]

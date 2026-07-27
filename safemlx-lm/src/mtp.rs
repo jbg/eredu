@@ -223,10 +223,23 @@ pub struct MtpStats {
     pub reused_optimistic_tokens: usize,
     /// Optimistic continuation blocks promoted after full acceptance.
     pub reused_optimistic_blocks: usize,
+    /// First optimistic tokens consumed by matching target bonuses.
+    ///
+    /// These tokens are not proposals, so they do not count as reused or
+    /// contribute to `draft_tokens`.
+    pub consumed_optimistic_tokens: usize,
     /// Optimistically drafted tokens discarded after rejection, EOS, or completion.
     pub discarded_optimistic_tokens: usize,
     /// Optimistic continuation blocks discarded after rejection, EOS, or completion.
     pub discarded_optimistic_blocks: usize,
+    /// Target bonus tokens emitted while an optimistic branch existed.
+    pub optimistic_target_bonus_tokens: usize,
+    /// Non-terminal target bonuses matching the first optimistic token.
+    pub optimistic_bonus_matches: usize,
+    /// Non-terminal target bonuses differing from the first optimistic token.
+    pub optimistic_bonus_mismatches: usize,
+    /// Whether deterministic cost accounting disabled further optimistic branches.
+    pub adaptive_lookahead_disabled: bool,
     /// Scheduler operations performed for this request.
     pub scheduler_turns: usize,
     /// Times this request was drafted while another request had target work in flight.
@@ -309,12 +322,16 @@ pub trait MtpBackend {
         usize::MAX
     }
 
-    /// Returns whether a draft state can continue across a fully accepted
-    /// verification block without fresh target-to-draft state handoff.
+    /// Returns whether a cloned draft state is an exact, discardable frontier
+    /// that can be promoted after consuming a matching target bonus.
     ///
+    /// Returning `true` guarantees that cloning and advancing `DraftState`
+    /// cannot mutate canonical backend state, and that after drafting
+    /// `[bonus, retained...]`, removing the matching `bonus` token leaves the
+    /// state paired with `retained` at the exact autoregressive frontier.
     /// External Gemma assistants support this. Embedded Qwen paths deliberately
     /// return `false`: their target-owned MTP cache is advanced during commit.
-    fn supports_optimistic_lookahead(&self) -> bool {
+    fn supports_exact_optimistic_promotion(&self) -> bool {
         false
     }
 
@@ -417,6 +434,12 @@ pub struct MtpSchedulerOptions {
     /// The current scheduler supports zero or one. One is the default because
     /// it overlaps useful CPU work without multiplying speculative memory.
     pub lookahead_blocks: usize,
+    /// Disables future optimistic branches when retained proposal reuse no
+    /// longer covers discarded branch work.
+    pub adaptive_lookahead: bool,
+    /// Resolved optimistic branches observed before adaptive disabling may
+    /// take effect.
+    pub adaptive_lookahead_min_blocks: usize,
 }
 
 impl Default for MtpSchedulerOptions {
@@ -425,7 +448,24 @@ impl Default for MtpSchedulerOptions {
             max_in_flight_verifications: 1,
             max_optimistic_branches: 1,
             lookahead_blocks: 1,
+            adaptive_lookahead: true,
+            adaptive_lookahead_min_blocks: 4,
         }
+    }
+}
+
+impl MtpSchedulerOptions {
+    /// Enables or disables same-request optimistic lookahead.
+    ///
+    /// Disabling lookahead leaves the canonical speculative verification path,
+    /// target sampler, and target PRNG sequence unchanged, making this suitable
+    /// for equivalent A/B runs.
+    pub fn with_lookahead(mut self, enabled: bool) -> Self {
+        self.lookahead_blocks = usize::from(enabled);
+        if enabled {
+            self.max_optimistic_branches = self.max_optimistic_branches.max(1);
+        }
+        self
     }
 }
 
@@ -463,15 +503,32 @@ pub enum MtpRequestPhase {
     Cancelled,
 }
 
+struct DraftProposal {
+    token: u32,
+    distribution: Array,
+}
+
 struct DraftBlock<D> {
     state: D,
-    tokens: Vec<u32>,
-    distributions: Vec<Array>,
+    proposals: Vec<DraftProposal>,
 }
 
 struct OptimisticBranch<D> {
     block: DraftBlock<D>,
-    draft_prng: Option<RandomState>,
+    assumed_prefix: Vec<u32>,
+}
+
+#[derive(Clone)]
+struct PositionedDraftRng {
+    root: Array,
+}
+
+impl PositionedDraftRng {
+    fn state_at(&self, position: usize, stream: &Stream) -> Result<RandomState, Exception> {
+        Ok(RandomState::from_key(random::split_key_at(
+            &self.root, position, stream,
+        )?))
+    }
 }
 
 struct InFlight<B: MtpBackend> {
@@ -481,13 +538,28 @@ struct InFlight<B: MtpBackend> {
     optimistic: Option<OptimisticBranch<B::DraftState>>,
 }
 
+enum OptimisticBonusTransition<D> {
+    NotPresent,
+    MatchedRetained(DraftBlock<D>),
+    MatchedConsumed,
+    Mismatched,
+    TerminalEos,
+    TerminalMaxTokens,
+}
+
+#[derive(Clone, Copy)]
+enum BonusTerminal {
+    Eos,
+    MaxTokens,
+}
+
 struct ScheduledRequest<'a, B: MtpBackend, S> {
     id: MtpRequestId,
     cache: &'a mut B::Cache,
     config: MtpConfig,
     sampler: S,
     target_prng: Option<RandomState>,
-    draft_prng: Option<RandomState>,
+    draft_rng: Option<PositionedDraftRng>,
     output: Vec<u32>,
     stats: MtpStats,
     started: Instant,
@@ -563,6 +635,14 @@ where
                 "MTP lookahead requires at least one optimistic branch slot",
             ));
         }
+        if options.lookahead_blocks > 0
+            && options.adaptive_lookahead
+            && options.adaptive_lookahead_min_blocks == 0
+        {
+            return Err(Exception::custom(
+                "MTP adaptive_lookahead_min_blocks must be positive",
+            ));
+        }
         Ok(Self {
             backend,
             streams,
@@ -597,7 +677,7 @@ where
                 config,
                 sampler,
                 target_prng: None,
-                draft_prng: None,
+                draft_rng: None,
                 output: Vec::new(),
                 stats: MtpStats::default(),
                 started,
@@ -612,7 +692,7 @@ where
         }
 
         validate_input(input)?;
-        let (target_prng, draft_prng) =
+        let (target_prng, draft_rng) =
             split_random_states(prng_key, config.temperature, self.streams)?;
         self.requests.push(ScheduledRequest {
             id,
@@ -620,7 +700,7 @@ where
             config,
             sampler,
             target_prng,
-            draft_prng,
+            draft_rng,
             output: Vec::new(),
             stats: MtpStats::default(),
             started,
@@ -855,46 +935,74 @@ where
         self.record_turn(index);
         let backend_limit = self.backend.max_draft_tokens();
         let request = &mut self.requests[index];
-        let count = request.config.max_draft_tokens.min(backend_limit).min(
+        let target_count = request.config.max_draft_tokens.min(backend_limit).min(
             request
                 .config
                 .max_tokens
                 .saturating_sub(request.output.len()),
         );
-        if count == 0 {
+        if target_count == 0 {
             request.phase = MtpRequestPhase::Completed;
             request.stats.elapsed = request.started.elapsed();
             return Ok(());
         }
-        let last = *request.output.last().expect("prefill emitted a token");
-        let target_state = request
-            .target_state
-            .as_ref()
-            .expect("ready request has target state");
-        let mut state = self
-            .backend
-            .begin_draft_with_streams(target_state, last, self.streams)?;
-        let (tokens, distributions) = draft_block(
-            self.backend,
-            &mut state,
-            last,
-            count,
-            &request.output,
-            &request.config,
-            &request.sampler,
-            &mut request.draft_prng,
-            self.streams.draft(),
-        )?;
-        request.stats.draft_tokens += tokens.len();
-        if cross_request {
+
+        let mut block = if let Some(block) = request.block.take() {
+            block
+        } else {
+            let last = *request.output.last().expect("prefill emitted a token");
+            let target_state = request
+                .target_state
+                .as_ref()
+                .expect("ready request has target state");
+            DraftBlock {
+                state: self
+                    .backend
+                    .begin_draft_with_streams(target_state, last, self.streams)?,
+                proposals: Vec::new(),
+            }
+        };
+        if block.proposals.len() > target_count {
+            return Err(Exception::custom(
+                "promoted MTP block exceeds the canonical proposal capacity",
+            ));
+        }
+        let additional = if block
+            .proposals
+            .last()
+            .is_some_and(|proposal| request.config.eos_token_ids.contains(&proposal.token))
+        {
+            0
+        } else {
+            target_count - block.proposals.len()
+        };
+        if additional > 0 {
+            let mut history = Vec::with_capacity(request.output.len() + block.proposals.len());
+            history.extend_from_slice(&request.output);
+            history.extend(block.proposals.iter().map(|proposal| proposal.token));
+            let previous = block.proposals.last().map_or_else(
+                || *request.output.last().expect("prefill emitted a token"),
+                |proposal| proposal.token,
+            );
+            let proposals = draft_block(
+                self.backend,
+                &mut block.state,
+                previous,
+                additional,
+                &history,
+                &request.config,
+                &request.sampler,
+                request.draft_rng.as_ref(),
+                self.streams.draft(),
+            )?;
+            request.stats.draft_tokens += proposals.len();
+            block.proposals.extend(proposals);
+        }
+        if cross_request && additional > 0 {
             request.stats.cross_request_draft_opportunities += 1;
             self.stats.cross_request_draft_opportunities += 1;
         }
-        request.block = Some(DraftBlock {
-            state,
-            tokens,
-            distributions,
-        });
+        request.block = Some(block);
         request.phase = MtpRequestPhase::ReadyToSubmitVerification;
         Ok(())
     }
@@ -906,9 +1014,14 @@ where
             .block
             .take()
             .expect("verification-ready request has a draft block");
-        let mut verify_ids = Vec::with_capacity(block.tokens.len() + 1);
+        if block.proposals.is_empty() {
+            return Err(Exception::custom(
+                "cannot submit an empty MTP verification block",
+            ));
+        }
+        let mut verify_ids = Vec::with_capacity(block.proposals.len() + 1);
         verify_ids.push(*request.output.last().expect("prefill emitted a token"));
-        verify_ids.extend(block.tokens.iter().copied());
+        verify_ids.extend(block.proposals.iter().map(|proposal| proposal.token));
         let verify_input = Array::from_slice(&verify_ids, &[1, verify_ids.len() as i32]);
         let verify_input = if self.streams.is_split() {
             verify_input.copy(self.streams.target())?
@@ -940,15 +1053,21 @@ where
         let Some(flight) = request.in_flight.as_ref() else {
             return false;
         };
-        self.backend.supports_optimistic_lookahead()
-            && request.sampler.supports_optimistic_lookahead()
-            && !flight.block.tokens.is_empty()
+        let assumed_len = request.output.len() + flight.block.proposals.len();
+        self.backend.supports_exact_optimistic_promotion()
+            && request.sampler.supports_exact_optimistic_promotion()
+            && !request.stats.adaptive_lookahead_disabled
+            && !flight.block.proposals.is_empty()
             && !flight
                 .block
-                .tokens
+                .proposals
                 .last()
-                .is_some_and(|token| request.config.eos_token_ids.contains(token))
-            && request.output.len() + flight.block.tokens.len() < request.config.max_tokens
+                .is_some_and(|proposal| {
+                    request.config.eos_token_ids.contains(&proposal.token)
+                })
+            // One remaining output slot is reserved for the target bonus. With
+            // no slot after it, lookahead cannot retain useful continuation.
+            && request.config.max_tokens.saturating_sub(assumed_len) > 1
     }
 
     fn draft_optimistic(&mut self, index: usize) -> Result<(), Exception> {
@@ -960,23 +1079,23 @@ where
             .in_flight
             .as_mut()
             .expect("optimistic request has an in-flight verification");
-        let assumed_len = request.output.len() + flight.block.tokens.len();
+        let assumed_len = request.output.len() + flight.block.proposals.len();
         let count = request
             .config
             .max_draft_tokens
             .min(backend_limit)
             .min(request.config.max_tokens.saturating_sub(assumed_len));
         let mut state = flight.block.state.clone();
-        let last = *flight
+        let last = flight
             .block
-            .tokens
+            .proposals
             .last()
-            .expect("optimistic block has an assumed token");
+            .expect("optimistic block has an assumed token")
+            .token;
         let mut history = Vec::with_capacity(assumed_len);
         history.extend_from_slice(&request.output);
-        history.extend_from_slice(&flight.block.tokens);
-        let mut branch_prng = request.draft_prng.clone();
-        let (tokens, distributions) = draft_block(
+        history.extend(flight.block.proposals.iter().map(|proposal| proposal.token));
+        let proposals = draft_block(
             self.backend,
             &mut state,
             last,
@@ -984,18 +1103,14 @@ where
             &history,
             &request.config,
             &request.sampler,
-            &mut branch_prng,
+            request.draft_rng.as_ref(),
             self.streams.draft(),
         )?;
-        request.stats.optimistic_draft_tokens += tokens.len();
+        request.stats.optimistic_draft_tokens += proposals.len();
         request.stats.optimistic_draft_blocks += 1;
         flight.optimistic = Some(OptimisticBranch {
-            block: DraftBlock {
-                state,
-                tokens,
-                distributions,
-            },
-            draft_prng: branch_prng,
+            block: DraftBlock { state, proposals },
+            assumed_prefix: history,
         });
         request.phase = MtpRequestPhase::OptimisticDraftReady;
         self.stats.peak_optimistic_branches = self
@@ -1015,8 +1130,7 @@ where
             .expect("resolving request has an in-flight verification");
         let DraftBlock {
             state,
-            tokens: proposed,
-            distributions,
+            mut proposals,
         } = flight.block;
 
         if request.cancel_requested {
@@ -1035,21 +1149,19 @@ where
             return Ok(());
         }
 
-        let distributions = if request.config.temperature != 0.0 && self.streams.is_split() {
-            eval(distributions.iter())?;
+        if request.config.temperature != 0.0 && self.streams.is_split() {
+            eval(proposals.iter().map(|proposal| &proposal.distribution))?;
             self.streams.draft().synchronize()?;
-            distributions
-                .iter()
-                .map(|distribution| distribution.copy(self.streams.target()))
-                .collect::<Result<Vec<_>, _>>()?
-        } else {
-            distributions
-        };
+            for proposal in &mut proposals {
+                proposal.distribution = proposal.distribution.copy(self.streams.target())?;
+            }
+        }
         let target_raw = B::verification_logits(&flight.verification);
         let mut history = request.output.clone();
         let mut accepted = 0usize;
-        let mut replacement = None;
-        for (index, (&token, draft)) in proposed.iter().zip(&distributions).enumerate() {
+        let mut emitted_tail = None;
+        for (index, proposal) in proposals.iter().enumerate() {
+            let token = proposal.token;
             let raw = target_raw.try_index_device((.., index as i32, ..), self.streams.target())?;
             let target = request.sampler.process_logits(
                 &raw,
@@ -1073,12 +1185,12 @@ where
                 request
                     .sampler
                     .commit_token(&target, chosen, self.streams.target())?;
-                replacement = Some(chosen);
+                emitted_tail = Some(chosen);
                 break;
             }
 
             let p = probabilities(&target, self.streams.target())?;
-            let q = probabilities(draft, self.streams.target())?;
+            let q = probabilities(&proposal.distribution, self.streams.target())?;
             let p_token = probability_at(&p, token, self.streams.target())?;
             let q_token = probability_at(&q, token, self.streams.target())?;
             let acceptance = if q_token <= 0.0 {
@@ -1106,19 +1218,16 @@ where
             request
                 .sampler
                 .commit_token(&target, chosen, self.streams.target())?;
-            replacement = Some(chosen);
+            emitted_tail = Some(chosen);
             break;
         }
 
-        // A target bonus is safe only when no optimistic continuation was
-        // rooted at the last proposal. Pipelined rounds omit it so a promoted
-        // branch always matches the exact committed prefix.
-        if accepted == proposed.len()
-            && flight.optimistic.is_none()
+        let mut bonus_transition = OptimisticBonusTransition::NotPresent;
+        if accepted == proposals.len()
             && request.output.len() + accepted < request.config.max_tokens
-            && !proposed
+            && !proposals
                 .last()
-                .is_some_and(|token| request.config.eos_token_ids.contains(token))
+                .is_some_and(|proposal| request.config.eos_token_ids.contains(&proposal.token))
         {
             let raw =
                 target_raw.try_index_device((.., accepted as i32, ..), self.streams.target())?;
@@ -1140,7 +1249,24 @@ where
             request
                 .sampler
                 .commit_token(&target, chosen, self.streams.target())?;
-            replacement = Some(chosen);
+            emitted_tail = Some(chosen);
+
+            if let Some(branch) = flight.optimistic.take() {
+                let terminal = if request.config.eos_token_ids.contains(&chosen) {
+                    Some(BonusTerminal::Eos)
+                } else if request.output.len() + accepted + 1 == request.config.max_tokens {
+                    Some(BonusTerminal::MaxTokens)
+                } else {
+                    None
+                };
+                bonus_transition = resolve_optimistic_bonus(
+                    branch,
+                    &history,
+                    chosen,
+                    terminal,
+                    &mut request.stats,
+                )?;
+            }
         }
 
         request.stats.accepted_tokens += accepted;
@@ -1153,10 +1279,10 @@ where
         // token uncached. When full acceptance emits no bonus, however, the
         // last accepted proposal itself is the trailing emitted token and must
         // be excluded from the retained inputs.
-        let verified_inputs = if replacement.is_some() {
+        let verified_inputs = if emitted_tail.is_some() {
             1 + accepted
         } else {
-            debug_assert_eq!(accepted, proposed.len());
+            debug_assert_eq!(accepted, proposals.len());
             accepted
         };
         let commit = self.backend.commit_verification_with_streams(
@@ -1171,7 +1297,11 @@ where
         request.target_state = Some(commit.state);
 
         let mut stopped = false;
-        for token in proposed[..accepted].iter().copied().chain(replacement) {
+        for token in proposals[..accepted]
+            .iter()
+            .map(|proposal| proposal.token)
+            .chain(emitted_tail)
+        {
             if request.output.len() == request.config.max_tokens {
                 break;
             }
@@ -1190,30 +1320,110 @@ where
             discard_optimistic(&mut request.stats, flight.optimistic.take());
             request.phase = MtpRequestPhase::Completed;
             request.stats.elapsed = request.started.elapsed();
-        } else if accepted == proposed.len() {
-            if let Some(branch) = flight.optimistic.take() {
-                request.stats.draft_tokens += branch.block.tokens.len();
-                request.stats.reused_optimistic_tokens += branch.block.tokens.len();
-                request.stats.reused_optimistic_blocks += 1;
-                request.draft_prng = branch.draft_prng;
-                request.block = Some(branch.block);
-                request.phase = MtpRequestPhase::ReadyToSubmitVerification;
-            } else {
-                request.phase = MtpRequestPhase::ReadyToDraft;
+        } else if accepted == proposals.len() {
+            match bonus_transition {
+                OptimisticBonusTransition::MatchedRetained(block) => {
+                    request.stats.draft_tokens += block.proposals.len();
+                    request.stats.reused_optimistic_tokens += block.proposals.len();
+                    request.stats.reused_optimistic_blocks += 1;
+                    request.block = Some(block);
+                    // Refill the shortened block through the canonical draft
+                    // phase. This preserves ordinary verification boundaries
+                    // and target-RNG consumption without recomputing retained
+                    // tokens or distributions.
+                    request.phase = MtpRequestPhase::ReadyToDraft;
+                }
+                OptimisticBonusTransition::MatchedConsumed
+                | OptimisticBonusTransition::Mismatched
+                | OptimisticBonusTransition::NotPresent => {
+                    request.phase = MtpRequestPhase::ReadyToDraft;
+                }
+                OptimisticBonusTransition::TerminalEos
+                | OptimisticBonusTransition::TerminalMaxTokens => {
+                    return Err(Exception::custom(
+                        "terminal optimistic bonus did not complete its request",
+                    ));
+                }
             }
+            update_adaptive_lookahead(&mut request.stats, self.options);
         } else {
             discard_optimistic(&mut request.stats, flight.optimistic.take());
+            update_adaptive_lookahead(&mut request.stats, self.options);
             request.phase = MtpRequestPhase::ReadyToDraft;
         }
         Ok(())
     }
 }
 
+fn resolve_optimistic_bonus<D>(
+    branch: OptimisticBranch<D>,
+    canonical_prefix: &[u32],
+    bonus: u32,
+    terminal: Option<BonusTerminal>,
+    stats: &mut MtpStats,
+) -> Result<OptimisticBonusTransition<D>, Exception> {
+    if terminal.is_none() && branch.assumed_prefix != canonical_prefix {
+        return Err(Exception::custom(
+            "optimistic MTP branch prefix diverged from the canonical committed prefix",
+        ));
+    }
+    stats.optimistic_target_bonus_tokens += 1;
+    if let Some(terminal) = terminal {
+        discard_optimistic(stats, Some(branch));
+        return Ok(match terminal {
+            BonusTerminal::Eos => OptimisticBonusTransition::TerminalEos,
+            BonusTerminal::MaxTokens => OptimisticBonusTransition::TerminalMaxTokens,
+        });
+    }
+
+    let DraftBlock { state, proposals } = branch.block;
+    let drafted = proposals.len();
+    let mut proposals = proposals.into_iter();
+    let first = proposals.next().ok_or_else(|| {
+        Exception::custom("optimistic MTP branch unexpectedly contained no proposals")
+    })?;
+    if first.token != bonus {
+        stats.optimistic_bonus_mismatches += 1;
+        stats.discarded_optimistic_tokens += drafted;
+        stats.discarded_optimistic_blocks += 1;
+        return Ok(OptimisticBonusTransition::Mismatched);
+    }
+
+    stats.optimistic_bonus_matches += 1;
+    stats.consumed_optimistic_tokens += 1;
+    let proposals = proposals.collect::<Vec<_>>();
+    if proposals.is_empty() {
+        Ok(OptimisticBonusTransition::MatchedConsumed)
+    } else {
+        Ok(OptimisticBonusTransition::MatchedRetained(DraftBlock {
+            state,
+            proposals,
+        }))
+    }
+}
+
 fn discard_optimistic<D>(stats: &mut MtpStats, branch: Option<OptimisticBranch<D>>) {
     if let Some(branch) = branch {
-        stats.discarded_optimistic_tokens += branch.block.tokens.len();
+        stats.discarded_optimistic_tokens += branch.block.proposals.len();
         stats.discarded_optimistic_blocks += 1;
     }
+}
+
+fn update_adaptive_lookahead(stats: &mut MtpStats, options: MtpSchedulerOptions) {
+    if !options.adaptive_lookahead
+        || stats.adaptive_lookahead_disabled
+        || stats.optimistic_draft_blocks < options.adaptive_lookahead_min_blocks
+    {
+        return;
+    }
+
+    // Retained proposals are branch work canonical execution did not need to
+    // recompute. Discarded proposals bought no reuse. The matched leading token
+    // is excluded from both because it is consumed as a target bonus rather
+    // than reused as a proposal. Adaptive disabling affects only future,
+    // optional draft work.
+    stats.adaptive_lookahead_disabled = stats.reused_optimistic_tokens == 0
+        || stats.reused_optimistic_tokens < stats.discarded_optimistic_tokens;
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1225,9 +1435,9 @@ fn draft_block<B, S>(
     base_history: &[u32],
     config: &MtpConfig,
     sampler: &S,
-    prng: &mut Option<RandomState>,
+    draft_rng: Option<&PositionedDraftRng>,
     stream: &Stream,
-) -> Result<(Vec<u32>, Vec<Array>), Exception>
+) -> Result<Vec<DraftProposal>, Exception>
 where
     B: MtpBackend,
     S: SpeculativeSampler + Clone,
@@ -1235,29 +1445,35 @@ where
     let mut branch_sampler = sampler.clone();
     let mut history = Vec::with_capacity(base_history.len() + count);
     history.extend_from_slice(base_history);
-    let mut tokens = Vec::with_capacity(count);
-    let mut distributions = Vec::with_capacity(count);
-    for _ in 0..count {
-        let previous = tokens.last().copied().unwrap_or(first_previous);
+    let mut proposals = Vec::with_capacity(count);
+    for offset in 0..count {
+        let previous = proposals
+            .last()
+            .map_or(first_previous, |proposal: &DraftProposal| proposal.token);
         let raw = backend.draft_logits(state, previous, stream)?;
         let processed =
             branch_sampler.process_logits(&raw, config.temperature, &history, stream)?;
+        let mut position_state = draft_rng
+            .map(|rng| rng.state_at(base_history.len() + offset, stream))
+            .transpose()?;
         let token = branch_sampler.sample_processed(
             &processed,
             config.temperature,
-            prng.as_mut(),
+            position_state.as_mut(),
             stream,
         )?;
         eval([&token])?;
         let token = token.item::<u32>(stream);
-        tokens.push(token);
-        distributions.push(processed);
+        proposals.push(DraftProposal {
+            token,
+            distribution: processed,
+        });
         history.push(token);
         if config.eos_token_ids.contains(&token) {
             break;
         }
     }
-    Ok((tokens, distributions))
+    Ok(proposals)
 }
 
 fn validate_config<B: MtpBackend>(
@@ -1290,7 +1506,7 @@ fn split_random_states(
     prng_key: Option<Array>,
     temperature: f32,
     streams: MtpExecutionStreams<'_>,
-) -> Result<(Option<RandomState>, Option<RandomState>), Exception> {
+) -> Result<(Option<RandomState>, Option<PositionedDraftRng>), Exception> {
     if temperature == 0.0 {
         return Ok((None, None));
     }
@@ -1309,7 +1525,7 @@ fn split_random_states(
     };
     Ok((
         Some(RandomState::from_key(target_key)),
-        Some(RandomState::from_key(draft_key)),
+        Some(PositionedDraftRng { root: draft_key }),
     ))
 }
 
@@ -1410,11 +1626,43 @@ where
     S: SpeculativeSampler + Clone,
     F: FnMut(u32) -> Result<(), Exception>,
 {
+    generate_with_streams_and_callback_and_options(
+        backend,
+        cache,
+        input,
+        config,
+        prng_key,
+        sampler,
+        streams,
+        MtpSchedulerOptions::default(),
+        on_token,
+    )
+}
+
+/// Runs one scheduled request with explicit streams, scheduler options, and a
+/// commit callback.
+#[allow(clippy::too_many_arguments)]
+pub fn generate_with_streams_and_callback_and_options<B, S, F>(
+    backend: &mut B,
+    cache: &mut B::Cache,
+    input: ModelInput<'_>,
+    config: &MtpConfig,
+    prng_key: Option<Array>,
+    sampler: &mut S,
+    streams: MtpExecutionStreams<'_>,
+    options: MtpSchedulerOptions,
+    on_token: F,
+) -> Result<(Vec<u32>, MtpStats), Exception>
+where
+    B: MtpBackend,
+    S: SpeculativeSampler + Clone,
+    F: FnMut(u32) -> Result<(), Exception>,
+{
     let final_sampler;
     let token_ids;
     let stats;
     {
-        let mut scheduler = MtpScheduler::new(backend, streams, MtpSchedulerOptions::default())?;
+        let mut scheduler = MtpScheduler::new(backend, streams, options)?;
         scheduler.submit(
             cache,
             input,
@@ -1530,16 +1778,49 @@ mod tests {
     use super::*;
     use crate::{
         models::input::InputPart,
-        sampler::{DefaultSampler, MirostatV2Sampler},
+        sampler::{DefaultSampler, GenerationSampler, MirostatV2Sampler},
     };
 
     #[derive(Clone, Default)]
     struct CountingSampler {
         process_calls: usize,
+        histories: Vec<Vec<u32>>,
+        committed: Vec<u32>,
     }
 
     impl SpeculativeSampler for CountingSampler {
-        fn supports_optimistic_lookahead(&self) -> bool {
+        fn supports_exact_optimistic_promotion(&self) -> bool {
+            true
+        }
+
+        fn process_logits(
+            &mut self,
+            logits: &Array,
+            _temperature: f32,
+            history: &[u32],
+            _stream: &Stream,
+        ) -> Result<Array, Exception> {
+            self.process_calls += 1;
+            self.histories.push(history.to_vec());
+            Ok(logits.clone())
+        }
+
+        fn commit_token(
+            &mut self,
+            _processed_logits: &Array,
+            token: u32,
+            _stream: &Stream,
+        ) -> Result<(), Exception> {
+            self.committed.push(token);
+            Ok(())
+        }
+    }
+
+    #[derive(Clone, Copy, Default)]
+    struct UniformSampler;
+
+    impl SpeculativeSampler for UniformSampler {
+        fn supports_exact_optimistic_promotion(&self) -> bool {
             true
         }
 
@@ -1548,10 +1829,9 @@ mod tests {
             logits: &Array,
             _temperature: f32,
             _history: &[u32],
-            _stream: &Stream,
+            stream: &Stream,
         ) -> Result<Array, Exception> {
-            self.process_calls += 1;
-            Ok(logits.clone())
+            logits.multiply(Array::from_f32(0.0), stream)
         }
     }
 
@@ -1560,6 +1840,7 @@ mod tests {
         rejection_token: u32,
         reject_first: bool,
         accept_second: bool,
+        bonus_token: u32,
         routes: Vec<(&'static str, DeviceType)>,
         draft_storage: Vec<usize>,
     }
@@ -1589,7 +1870,7 @@ mod tests {
             2
         }
 
-        fn supports_optimistic_lookahead(&self) -> bool {
+        fn supports_exact_optimistic_promotion(&self) -> bool {
             true
         }
 
@@ -1646,10 +1927,10 @@ mod tests {
             self.record("draft", stream)?;
             self.draft_storage
                 .push(Arc::as_ptr(&state.storage) as usize);
-            let logits = if state.step == 0 {
-                Array::from_slice(&[0.0f32, 0.0, 10.0], &[1, 1, 3])
-            } else {
-                Array::from_slice(&[10.0f32, 0.0, 0.0], &[1, 1, 3])
+            let logits = match state.step {
+                0 => Array::from_slice(&[0.0f32, 0.0, 10.0], &[1, 1, 3]),
+                1 | 2 => Array::from_slice(&[10.0f32, 0.0, 0.0], &[1, 1, 3]),
+                _ => Array::from_slice(&[0.0f32, 10.0, 0.0], &[1, 1, 3]),
             };
             state.step += 1;
             Ok(logits)
@@ -1665,8 +1946,17 @@ mod tests {
             cache: &mut Self::Cache,
             stream: &Stream,
         ) -> Result<Self::Verification, Exception> {
+            let input_len = input_tokens.dim(1) as usize;
+            self.record(
+                match input_len {
+                    2 => "verify_input_2",
+                    3 => "verify_input_3",
+                    _ => "verify_input_other",
+                },
+                stream,
+            )?;
             self.record("verify", stream)?;
-            *cache += input_tokens.dim(1) as usize;
+            *cache += input_len;
             let first = if self.reject_first {
                 let mut logits = [0.0f32; 3];
                 logits[self.rejection_token as usize] = 10.0;
@@ -1679,9 +1969,12 @@ mod tests {
             } else {
                 [0.0f32, 10.0, 0.0]
             };
+            let mut bonus = [0.0f32; 3];
+            bonus[self.bonus_token as usize] = 10.0;
             Ok(Array::from_slice(
                 &[
-                    first[0], first[1], first[2], second[0], second[1], second[2], 10.0, 0.0, 0.0,
+                    first[0], first[1], first[2], second[0], second[1], second[2], bonus[0],
+                    bonus[1], bonus[2],
                 ],
                 &[1, 3, 3],
             ))
@@ -1693,13 +1986,16 @@ mod tests {
 
         fn commit_verification(
             &mut self,
-            _output: Self::Verification,
+            output: Self::Verification,
             _draft_state: Self::DraftState,
             cache: &mut Self::Cache,
             checkpoint: Self::CacheCheckpoint,
             verified_inputs: usize,
             stream: &Stream,
         ) -> Result<MtpCommit<Self::TargetState>, Exception> {
+            if verified_inputs != output.dim(1) as usize {
+                self.record("cache_truncate", stream)?;
+            }
             self.record("commit_target", stream)?;
             *cache = checkpoint + verified_inputs;
             Ok(MtpCommit {
@@ -1710,13 +2006,16 @@ mod tests {
 
         fn commit_verification_with_streams(
             &mut self,
-            _output: Self::Verification,
+            output: Self::Verification,
             _draft_state: Self::DraftState,
             cache: &mut Self::Cache,
             checkpoint: Self::CacheCheckpoint,
             verified_inputs: usize,
             streams: MtpExecutionStreams<'_>,
         ) -> Result<MtpCommit<Self::TargetState>, Exception> {
+            if verified_inputs != output.dim(1) as usize {
+                self.record("cache_truncate", streams.target())?;
+            }
             self.record("commit_target", streams.target())?;
             self.record("commit_draft", streams.draft())?;
             *cache = checkpoint + verified_inputs;
@@ -1749,6 +2048,7 @@ mod tests {
                 rejection_token: 1,
                 reject_first: false,
                 accept_second: false,
+                bonus_token: 0,
                 routes: Vec::new(),
                 draft_storage: Vec::new(),
             },
@@ -1791,6 +2091,7 @@ mod tests {
             rejection_token: 1,
             reject_first: false,
             accept_second: false,
+            bonus_token: 0,
             routes: Vec::new(),
             draft_storage: Vec::new(),
         };
@@ -1840,6 +2141,7 @@ mod tests {
             rejection_token: 1,
             reject_first: false,
             accept_second: true,
+            bonus_token: 0,
             routes: Vec::new(),
             draft_storage: Vec::new(),
         };
@@ -1887,6 +2189,7 @@ mod tests {
                 rejection_token: 1,
                 reject_first: false,
                 accept_second: true,
+                bonus_token: 0,
                 routes: Vec::new(),
                 draft_storage: Vec::new(),
             },
@@ -1930,6 +2233,7 @@ mod tests {
                 rejection_token: 1,
                 reject_first: true,
                 accept_second: false,
+                bonus_token: 0,
                 routes: Vec::new(),
                 draft_storage: Vec::new(),
             },
@@ -1961,6 +2265,7 @@ mod tests {
             rejection_token: 1,
             reject_first: false,
             accept_second: true,
+            bonus_token: 0,
             routes: Vec::new(),
             draft_storage: Vec::new(),
         };
@@ -1992,9 +2297,354 @@ mod tests {
 
         assert_eq!(stats.optimistic_draft_blocks, 1);
         assert_eq!(stats.reused_optimistic_blocks, 1);
-        assert_eq!(stats.reused_optimistic_tokens, 2);
+        assert_eq!(stats.reused_optimistic_tokens, 1);
+        assert_eq!(stats.consumed_optimistic_tokens, 1);
+        assert_eq!(stats.optimistic_target_bonus_tokens, 1);
+        assert_eq!(stats.optimistic_bonus_matches, 1);
         assert_eq!(output.scheduler.peak_optimistic_branches, 1);
         assert_eq!(backend.draft_storage[0], backend.draft_storage[2]);
+        let first_commit = backend
+            .routes
+            .iter()
+            .position(|(operation, _)| *operation == "commit_target")
+            .unwrap();
+        assert!(
+            backend.routes[..first_commit]
+                .iter()
+                .all(|(operation, _)| *operation != "cache_truncate"),
+            "a fully accepted bonus-emitting verification must not truncate"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires an MLX Metal device"]
+    fn matching_bonus_is_emitted_and_consumes_one_paired_proposal() {
+        let target = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
+        let draft = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        let prompt = Array::from_slice(&[7u32], &[1, 1]);
+        let parts = [InputPart::text_token_ids(&prompt)];
+        let mut backend = ScriptedBackend {
+            first_token: 1,
+            rejection_token: 1,
+            reject_first: false,
+            accept_second: true,
+            bonus_token: 0,
+            routes: Vec::new(),
+            draft_storage: Vec::new(),
+        };
+        let mut cache = 0;
+        let mut scheduler = MtpScheduler::new(
+            &mut backend,
+            MtpExecutionStreams::new(target.stream(), draft.stream()),
+            MtpSchedulerOptions::default(),
+        )
+        .unwrap();
+        let id = scheduler
+            .submit(
+                &mut cache,
+                ModelInput::new(&parts),
+                MtpConfig {
+                    max_tokens: 6,
+                    max_draft_tokens: 2,
+                    temperature: 0.0,
+                    eos_token_ids: Vec::new(),
+                },
+                None,
+                DefaultSampler,
+                |_| Ok(()),
+            )
+            .unwrap();
+
+        for _ in 0..4 {
+            scheduler.step().unwrap();
+        }
+
+        let request = &scheduler.requests[id.index()];
+        assert_eq!(request.output, vec![1, 2, 0, 0]);
+        assert_eq!(request.phase, MtpRequestPhase::ReadyToDraft);
+        let retained = request.block.as_ref().unwrap();
+        assert_eq!(retained.proposals.len(), 1);
+        assert_eq!(retained.proposals[0].token, 1);
+        assert_eq!(retained.state.step, 4);
+        assert_eq!(
+            retained.proposals[0]
+                .distribution
+                .try_index_device((0, 0, 1), draft.stream())
+                .unwrap()
+                .item::<f32>(draft.stream()),
+            10.0
+        );
+        assert_eq!(request.stats.consumed_optimistic_tokens, 1);
+        assert_eq!(request.stats.reused_optimistic_tokens, 1);
+        assert_eq!(request.stats.optimistic_bonus_matches, 1);
+        scheduler.step().unwrap();
+        assert_eq!(
+            scheduler.requests[id.index()]
+                .block
+                .as_ref()
+                .unwrap()
+                .proposals
+                .len(),
+            2,
+            "the consumed optimistic token must be topped back up before submission"
+        );
+        scheduler.step().unwrap();
+        assert_eq!(
+            scheduler
+                .backend
+                .routes
+                .iter()
+                .filter(|(operation, _)| *operation == "verify_input_3")
+                .count(),
+            2
+        );
+
+        scheduler.cancel(id).unwrap();
+        scheduler.run().unwrap();
+        let output = scheduler.finish().unwrap();
+        assert_eq!(output.requests[0].token_ids, vec![1, 2, 0, 0]);
+        assert_eq!(backend.draft_storage.len(), 5);
+    }
+
+    #[test]
+    #[ignore = "requires an MLX Metal device"]
+    fn mismatching_bonus_restores_exact_non_lookahead_state() {
+        #[allow(clippy::type_complexity)]
+        fn run(
+            options: MtpSchedulerOptions,
+        ) -> (Vec<u32>, Vec<u32>, usize, MtpStats, CountingSampler) {
+            let target = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
+            let draft = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+            let prompt = Array::from_slice(&[7u32], &[1, 1]);
+            let parts = [InputPart::text_token_ids(&prompt)];
+            let mut backend = ScriptedBackend {
+                first_token: 1,
+                rejection_token: 1,
+                reject_first: false,
+                accept_second: true,
+                bonus_token: 1,
+                routes: Vec::new(),
+                draft_storage: Vec::new(),
+            };
+            let mut cache = 0;
+            let mut callback_tokens = Vec::new();
+            let request;
+            {
+                let mut scheduler = MtpScheduler::new(
+                    &mut backend,
+                    MtpExecutionStreams::new(target.stream(), draft.stream()),
+                    options,
+                )
+                .unwrap();
+                scheduler
+                    .submit(
+                        &mut cache,
+                        ModelInput::new(&parts),
+                        MtpConfig {
+                            max_tokens: 7,
+                            max_draft_tokens: 2,
+                            temperature: 0.0,
+                            eos_token_ids: Vec::new(),
+                        },
+                        None,
+                        CountingSampler::default(),
+                        |token| {
+                            callback_tokens.push(token);
+                            Ok(())
+                        },
+                    )
+                    .unwrap();
+                scheduler.run().unwrap();
+                request = scheduler.finish().unwrap().requests.pop().unwrap();
+            }
+            (
+                request.token_ids,
+                callback_tokens,
+                cache,
+                request.stats,
+                request.sampler,
+            )
+        }
+
+        let without = run(MtpSchedulerOptions {
+            max_in_flight_verifications: 1,
+            max_optimistic_branches: 0,
+            lookahead_blocks: 0,
+            ..MtpSchedulerOptions::default()
+        });
+        let with = run(MtpSchedulerOptions::default());
+
+        assert_eq!(with.0, without.0);
+        assert_eq!(with.1, without.1);
+        assert_eq!(with.2, without.2);
+        assert_eq!(with.3.target_tokens, without.3.target_tokens);
+        assert_eq!(with.3.draft_tokens, without.3.draft_tokens);
+        assert_eq!(with.3.accepted_tokens, without.3.accepted_tokens);
+        assert_eq!(with.3.accept_lens, without.3.accept_lens);
+        assert_eq!(with.3.emitted_tokens, without.3.emitted_tokens);
+        assert_eq!(with.4.process_calls, without.4.process_calls);
+        assert_eq!(with.4.histories, without.4.histories);
+        assert_eq!(with.4.committed, without.4.committed);
+        assert!(with.3.optimistic_bonus_mismatches > 0);
+        assert!(with.3.discarded_optimistic_tokens > 0);
+        assert_eq!(with.3.consumed_optimistic_tokens, 0);
+    }
+
+    #[test]
+    #[ignore = "requires an MLX Metal device"]
+    fn history_derived_sampler_matches_non_lookahead_execution() {
+        fn run(options: MtpSchedulerOptions) -> (Vec<u32>, Vec<usize>) {
+            let target = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
+            let draft = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+            let prompt = Array::from_slice(&[7u32], &[1, 1]);
+            let parts = [InputPart::text_token_ids(&prompt)];
+            let mut backend = ScriptedBackend {
+                first_token: 1,
+                rejection_token: 1,
+                reject_first: false,
+                accept_second: true,
+                bonus_token: 1,
+                routes: Vec::new(),
+                draft_storage: Vec::new(),
+            };
+            let mut cache = 0;
+            let sampler = GenerationSampler::new()
+                .top_k(0)
+                .top_p(1.0)
+                .min_p(0.0)
+                .penalties(1.2, -1, 0.1, 0.1);
+            let mut scheduler = MtpScheduler::new(
+                &mut backend,
+                MtpExecutionStreams::new(target.stream(), draft.stream()),
+                options,
+            )
+            .unwrap();
+            scheduler
+                .submit(
+                    &mut cache,
+                    ModelInput::new(&parts),
+                    MtpConfig {
+                        max_tokens: 7,
+                        max_draft_tokens: 2,
+                        temperature: 0.0,
+                        eos_token_ids: Vec::new(),
+                    },
+                    None,
+                    sampler,
+                    |_| Ok(()),
+                )
+                .unwrap();
+            scheduler.run().unwrap();
+            let request = scheduler.finish().unwrap().requests.pop().unwrap();
+            (request.token_ids, request.stats.accept_lens)
+        }
+
+        let without = run(MtpSchedulerOptions {
+            max_in_flight_verifications: 1,
+            max_optimistic_branches: 0,
+            lookahead_blocks: 0,
+            ..MtpSchedulerOptions::default()
+        });
+        let with = run(MtpSchedulerOptions::default());
+        assert_eq!(with, without);
+    }
+
+    #[test]
+    #[ignore = "requires an MLX Metal device"]
+    fn stochastic_match_and_mismatch_ignore_interleaving_and_branch_slots() {
+        fn run(
+            seed: u64,
+            options: MtpSchedulerOptions,
+            with_peer: bool,
+        ) -> (Vec<u32>, Vec<usize>, MtpStats) {
+            let target = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
+            let draft = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+            let prompt_a = Array::from_slice(&[7u32], &[1, 1]);
+            let prompt_b = Array::from_slice(&[8u32], &[1, 1]);
+            let parts_a = [InputPart::text_token_ids(&prompt_a)];
+            let parts_b = [InputPart::text_token_ids(&prompt_b)];
+            let mut backend = ScriptedBackend {
+                first_token: 1,
+                rejection_token: 1,
+                reject_first: false,
+                accept_second: true,
+                bonus_token: 0,
+                routes: Vec::new(),
+                draft_storage: Vec::new(),
+            };
+            let mut cache_a = 0;
+            let mut cache_b = 0;
+            let mut scheduler = MtpScheduler::new(
+                &mut backend,
+                MtpExecutionStreams::new(target.stream(), draft.stream()),
+                options,
+            )
+            .unwrap();
+            let config = MtpConfig {
+                max_tokens: 8,
+                max_draft_tokens: 2,
+                temperature: 1.0,
+                eos_token_ids: Vec::new(),
+            };
+            scheduler
+                .submit(
+                    &mut cache_a,
+                    ModelInput::new(&parts_a),
+                    config.clone(),
+                    Some(safemlx::random::key(seed).unwrap()),
+                    UniformSampler,
+                    |_| Ok(()),
+                )
+                .unwrap();
+            if with_peer {
+                scheduler
+                    .submit(
+                        &mut cache_b,
+                        ModelInput::new(&parts_b),
+                        config,
+                        Some(safemlx::random::key(seed + 1000).unwrap()),
+                        UniformSampler,
+                        |_| Ok(()),
+                    )
+                    .unwrap();
+            }
+            scheduler.run().unwrap();
+            let request = scheduler.finish().unwrap().requests.remove(0);
+            (
+                request.token_ids,
+                request.stats.accept_lens.clone(),
+                request.stats,
+            )
+        }
+
+        let no_lookahead = MtpSchedulerOptions {
+            max_in_flight_verifications: 1,
+            max_optimistic_branches: 0,
+            lookahead_blocks: 0,
+            ..MtpSchedulerOptions::default()
+        };
+        let mut saw_match = false;
+        let mut saw_mismatch = false;
+        for seed in 0..64 {
+            let with = run(seed, MtpSchedulerOptions::default(), false);
+            if with.2.optimistic_bonus_matches == 0 && with.2.optimistic_bonus_mismatches == 0 {
+                continue;
+            }
+            let without = run(seed, no_lookahead, false);
+            let interleaved = run(seed, MtpSchedulerOptions::default(), true);
+            assert_eq!((&with.0, &with.1), (&without.0, &without.1));
+            assert_eq!((&with.0, &with.1), (&interleaved.0, &interleaved.1));
+            saw_match |= with.2.optimistic_bonus_matches > 0;
+            saw_mismatch |= with.2.optimistic_bonus_mismatches > 0;
+            if saw_match && saw_mismatch {
+                break;
+            }
+        }
+        assert!(saw_match, "scripted seeds did not exercise a bonus match");
+        assert!(
+            saw_mismatch,
+            "scripted seeds did not exercise a bonus mismatch"
+        );
     }
 
     #[test]
@@ -2009,6 +2659,7 @@ mod tests {
             rejection_token: 1,
             reject_first: false,
             accept_second: true,
+            bonus_token: 0,
             routes: Vec::new(),
             draft_storage: Vec::new(),
         };
@@ -2039,18 +2690,15 @@ mod tests {
         scheduler.step().unwrap();
         scheduler.step().unwrap();
         scheduler.step().unwrap();
-        assert_eq!(
-            scheduler.phase(id),
-            Some(MtpRequestPhase::ReadyToSubmitVerification)
-        );
+        assert_eq!(scheduler.phase(id), Some(MtpRequestPhase::ReadyToDraft));
         scheduler.cancel(id).unwrap();
         let output = scheduler.finish().unwrap();
 
-        assert_eq!(output.requests[0].token_ids, vec![1, 2, 0]);
+        assert_eq!(output.requests[0].token_ids, vec![1, 2, 0, 0]);
         // Prefill retained one token. The fully accepted verification evaluated
-        // `[first, proposal_1, proposal_2]`, but proposal_2 is the last emitted
-        // token and must remain outside the cache for the next round.
-        assert_eq!(cache, 3);
+        // `[first, proposal_1, proposal_2]`. The matching target bonus is
+        // emitted immediately but remains outside the target cache.
+        assert_eq!(cache, 4);
     }
 
     #[test]
@@ -2065,6 +2713,7 @@ mod tests {
             rejection_token: 1,
             reject_first: true,
             accept_second: false,
+            bonus_token: 0,
             routes: Vec::new(),
             draft_storage: Vec::new(),
         };
@@ -2123,6 +2772,7 @@ mod tests {
                 rejection_token: 1,
                 reject_first: true,
                 accept_second: false,
+                bonus_token: 0,
                 routes: Vec::new(),
                 draft_storage: Vec::new(),
             };
@@ -2158,6 +2808,7 @@ mod tests {
             max_in_flight_verifications: 1,
             max_optimistic_branches: 0,
             lookahead_blocks: 0,
+            ..MtpSchedulerOptions::default()
         });
         let with = run(MtpSchedulerOptions::default());
         assert_eq!(with.0, without.0);
@@ -2179,6 +2830,7 @@ mod tests {
             rejection_token: 0,
             reject_first: true,
             accept_second: false,
+            bonus_token: 0,
             routes: Vec::new(),
             draft_storage: Vec::new(),
         };
@@ -2214,6 +2866,225 @@ mod tests {
 
     #[test]
     #[ignore = "requires an MLX Metal device"]
+    fn bonus_eos_completes_only_its_request_and_discards_continuation() {
+        let target = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
+        let draft = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        let prompt_a = Array::from_slice(&[7u32], &[1, 1]);
+        let prompt_b = Array::from_slice(&[8u32], &[1, 1]);
+        let parts_a = [InputPart::text_token_ids(&prompt_a)];
+        let parts_b = [InputPart::text_token_ids(&prompt_b)];
+        let mut backend = ScriptedBackend {
+            first_token: 1,
+            rejection_token: 1,
+            reject_first: false,
+            accept_second: true,
+            bonus_token: 0,
+            routes: Vec::new(),
+            draft_storage: Vec::new(),
+        };
+        let mut cache_a = 0;
+        let mut cache_b = 0;
+        let mut callback_a = Vec::new();
+        let mut callback_b = Vec::new();
+        let output;
+        {
+            let mut scheduler = MtpScheduler::new(
+                &mut backend,
+                MtpExecutionStreams::new(target.stream(), draft.stream()),
+                MtpSchedulerOptions::default(),
+            )
+            .unwrap();
+            scheduler
+                .submit(
+                    &mut cache_a,
+                    ModelInput::new(&parts_a),
+                    MtpConfig {
+                        max_tokens: 6,
+                        max_draft_tokens: 1,
+                        temperature: 0.0,
+                        eos_token_ids: vec![0],
+                    },
+                    None,
+                    DefaultSampler,
+                    |token| {
+                        callback_a.push(token);
+                        Ok(())
+                    },
+                )
+                .unwrap();
+            scheduler
+                .submit(
+                    &mut cache_b,
+                    ModelInput::new(&parts_b),
+                    MtpConfig {
+                        max_tokens: 5,
+                        max_draft_tokens: 1,
+                        temperature: 0.0,
+                        eos_token_ids: Vec::new(),
+                    },
+                    None,
+                    DefaultSampler,
+                    |token| {
+                        callback_b.push(token);
+                        Ok(())
+                    },
+                )
+                .unwrap();
+            scheduler.run().unwrap();
+            output = scheduler.finish().unwrap();
+        }
+
+        assert_eq!(output.requests[0].token_ids, vec![1, 2, 0]);
+        assert_eq!(callback_a, output.requests[0].token_ids);
+        assert_eq!(output.requests[0].stats.optimistic_target_bonus_tokens, 1);
+        assert_eq!(output.requests[0].stats.optimistic_bonus_matches, 0);
+        assert_eq!(output.requests[0].stats.discarded_optimistic_tokens, 1);
+        assert_eq!(output.requests[1].token_ids.len(), 5);
+        assert_eq!(callback_b, output.requests[1].token_ids);
+        assert!(output.requests[1].stats.rounds > output.requests[0].stats.rounds);
+        assert!(output.scheduler.cross_request_draft_opportunities > 0);
+    }
+
+    #[test]
+    #[ignore = "requires an MLX Metal device"]
+    fn consumed_one_token_branch_never_submits_empty_verification() {
+        let target = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
+        let draft = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        let prompt = Array::from_slice(&[7u32], &[1, 1]);
+        let parts = [InputPart::text_token_ids(&prompt)];
+        let mut backend = ScriptedBackend {
+            first_token: 1,
+            rejection_token: 1,
+            reject_first: false,
+            accept_second: true,
+            bonus_token: 0,
+            routes: Vec::new(),
+            draft_storage: Vec::new(),
+        };
+        let mut cache = 0;
+        let mut scheduler = MtpScheduler::new(
+            &mut backend,
+            MtpExecutionStreams::new(target.stream(), draft.stream()),
+            MtpSchedulerOptions::default(),
+        )
+        .unwrap();
+        scheduler
+            .submit(
+                &mut cache,
+                ModelInput::new(&parts),
+                MtpConfig {
+                    max_tokens: 5,
+                    max_draft_tokens: 1,
+                    temperature: 0.0,
+                    eos_token_ids: Vec::new(),
+                },
+                None,
+                DefaultSampler,
+                |_| Ok(()),
+            )
+            .unwrap();
+        scheduler.run().unwrap();
+        let request = scheduler.finish().unwrap().requests.pop().unwrap();
+
+        assert_eq!(request.token_ids, vec![1, 2, 0, 2, 0]);
+        assert_eq!(request.stats.consumed_optimistic_tokens, 1);
+        assert_eq!(request.stats.reused_optimistic_tokens, 0);
+        assert_eq!(request.stats.reused_optimistic_blocks, 0);
+        assert_eq!(
+            backend
+                .routes
+                .iter()
+                .filter(|(operation, _)| *operation == "verify")
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    #[ignore = "requires an MLX Metal device"]
+    fn max_token_boundary_does_not_draft_unusable_lookahead() {
+        let target = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
+        let draft = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        let prompt = Array::from_slice(&[7u32], &[1, 1]);
+        let parts = [InputPart::text_token_ids(&prompt)];
+        let mut backend = ScriptedBackend {
+            first_token: 1,
+            rejection_token: 1,
+            reject_first: false,
+            accept_second: true,
+            bonus_token: 0,
+            routes: Vec::new(),
+            draft_storage: Vec::new(),
+        };
+        let mut cache = 0;
+        let mut scheduler = MtpScheduler::new(
+            &mut backend,
+            MtpExecutionStreams::new(target.stream(), draft.stream()),
+            MtpSchedulerOptions::default(),
+        )
+        .unwrap();
+        scheduler
+            .submit(
+                &mut cache,
+                ModelInput::new(&parts),
+                MtpConfig {
+                    max_tokens: 3,
+                    max_draft_tokens: 1,
+                    temperature: 0.0,
+                    eos_token_ids: Vec::new(),
+                },
+                None,
+                DefaultSampler,
+                |_| Ok(()),
+            )
+            .unwrap();
+        scheduler.run().unwrap();
+        let request = scheduler.finish().unwrap().requests.pop().unwrap();
+
+        assert_eq!(request.token_ids, vec![1, 2, 0]);
+        assert_eq!(request.stats.optimistic_draft_tokens, 0);
+        assert_eq!(request.stats.optimistic_draft_blocks, 0);
+        assert_eq!(backend.draft_storage.len(), 1);
+    }
+
+    #[test]
+    fn adaptive_sampler_does_not_claim_exact_optimistic_promotion() {
+        assert!(GenerationSampler::new().supports_exact_optimistic_promotion());
+        assert!(!MirostatV2Sampler::default().supports_exact_optimistic_promotion());
+    }
+
+    #[test]
+    fn stale_optimistic_prefix_is_an_error_not_a_fallback() {
+        let branch = OptimisticBranch {
+            block: DraftBlock {
+                state: ScriptedDraftState {
+                    step: 1,
+                    storage: Arc::new(()),
+                },
+                proposals: vec![DraftProposal {
+                    token: 0,
+                    distribution: Array::from_slice(&[1.0f32, 0.0, 0.0], &[1, 1, 3]),
+                }],
+            },
+            assumed_prefix: vec![1, 2],
+        };
+        let mut stats = MtpStats::default();
+        let error = resolve_optimistic_bonus(branch, &[1, 0], 0, None, &mut stats)
+            .err()
+            .unwrap();
+
+        assert!(error
+            .to_string()
+            .contains("diverged from the canonical committed prefix"));
+        assert_eq!(stats.optimistic_target_bonus_tokens, 0);
+        assert_eq!(stats.optimistic_bonus_matches, 0);
+        assert_eq!(stats.optimistic_bonus_mismatches, 0);
+        assert_eq!(stats.consumed_optimistic_tokens, 0);
+        assert_eq!(stats.discarded_optimistic_tokens, 0);
+    }
+
+    #[test]
+    #[ignore = "requires an MLX Metal device"]
     fn independent_requests_progress_fairly_and_preserve_output_order() {
         let target = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
         let draft = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
@@ -2226,6 +3097,7 @@ mod tests {
             rejection_token: 1,
             reject_first: false,
             accept_second: true,
+            bonus_token: 0,
             routes: Vec::new(),
             draft_storage: Vec::new(),
         };
@@ -2305,6 +3177,7 @@ mod tests {
             rejection_token: 1,
             reject_first: false,
             accept_second: true,
+            bonus_token: 0,
             routes: Vec::new(),
             draft_storage: Vec::new(),
         };
@@ -2317,6 +3190,7 @@ mod tests {
                 max_in_flight_verifications: 2,
                 max_optimistic_branches: 1,
                 lookahead_blocks: 1,
+                ..MtpSchedulerOptions::default()
             },
         )
         .unwrap();
@@ -2359,6 +3233,7 @@ mod tests {
                 rejection_token: 1,
                 reject_first: false,
                 accept_second: true,
+                bonus_token: 0,
                 routes: Vec::new(),
                 draft_storage: Vec::new(),
             };
@@ -2410,7 +3285,108 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires an MLX Metal device"]
+    fn adaptive_disabling_stops_unproductive_branches_without_changing_output() {
+        fn run(options: MtpSchedulerOptions) -> (Vec<u32>, usize, MtpStats) {
+            let target = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
+            let draft = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+            let prompt = Array::from_slice(&[7u32], &[1, 1]);
+            let parts = [InputPart::text_token_ids(&prompt)];
+            let mut backend = ScriptedBackend {
+                first_token: 1,
+                rejection_token: 1,
+                reject_first: true,
+                accept_second: false,
+                bonus_token: 0,
+                routes: Vec::new(),
+                draft_storage: Vec::new(),
+            };
+            let mut cache = 0;
+            let mut scheduler = MtpScheduler::new(
+                &mut backend,
+                MtpExecutionStreams::new(target.stream(), draft.stream()),
+                options,
+            )
+            .unwrap();
+            scheduler
+                .submit(
+                    &mut cache,
+                    ModelInput::new(&parts),
+                    MtpConfig {
+                        max_tokens: 10,
+                        max_draft_tokens: 2,
+                        temperature: 0.0,
+                        eos_token_ids: Vec::new(),
+                    },
+                    None,
+                    DefaultSampler,
+                    |_| Ok(()),
+                )
+                .unwrap();
+            scheduler.run().unwrap();
+            let request = scheduler.finish().unwrap().requests.pop().unwrap();
+            (request.token_ids, cache, request.stats)
+        }
+
+        let adaptive = run(MtpSchedulerOptions {
+            adaptive_lookahead_min_blocks: 2,
+            ..MtpSchedulerOptions::default()
+        });
+        let disabled = run(MtpSchedulerOptions::default().with_lookahead(false));
+
+        assert_eq!(adaptive.0, disabled.0);
+        assert_eq!(adaptive.1, disabled.1);
+        assert_eq!(adaptive.2.accept_lens, disabled.2.accept_lens);
+        assert_eq!(adaptive.2.optimistic_draft_blocks, 2);
+        assert!(adaptive.2.adaptive_lookahead_disabled);
+        assert_eq!(disabled.2.optimistic_draft_blocks, 0);
+    }
+
+    #[test]
     fn empty_stats_have_zero_acceptance_rate() {
         assert_eq!(MtpStats::default().accept_rate(), 0.0);
+    }
+
+    #[test]
+    fn adaptive_lookahead_uses_deterministic_reuse_accounting() {
+        let options = MtpSchedulerOptions {
+            adaptive_lookahead_min_blocks: 4,
+            ..MtpSchedulerOptions::default()
+        };
+        let mut profitable = MtpStats {
+            optimistic_draft_blocks: 4,
+            reused_optimistic_tokens: 3,
+            discarded_optimistic_tokens: 2,
+            ..MtpStats::default()
+        };
+        update_adaptive_lookahead(&mut profitable, options);
+        assert!(!profitable.adaptive_lookahead_disabled);
+
+        let mut unprofitable = MtpStats {
+            optimistic_draft_blocks: 4,
+            reused_optimistic_tokens: 1,
+            discarded_optimistic_tokens: 2,
+            ..MtpStats::default()
+        };
+        update_adaptive_lookahead(&mut unprofitable, options);
+        assert!(unprofitable.adaptive_lookahead_disabled);
+
+        let mut no_reuse = MtpStats {
+            optimistic_draft_blocks: 4,
+            ..MtpStats::default()
+        };
+        update_adaptive_lookahead(&mut no_reuse, options);
+        assert!(no_reuse.adaptive_lookahead_disabled);
+
+        let mut disabled_policy = unprofitable.clone();
+        disabled_policy.adaptive_lookahead_disabled = false;
+        update_adaptive_lookahead(
+            &mut disabled_policy,
+            MtpSchedulerOptions {
+                adaptive_lookahead: false,
+                ..options
+            },
+        );
+        assert!(!disabled_policy.adaptive_lookahead_disabled);
     }
 }
