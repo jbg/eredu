@@ -17,7 +17,7 @@ use sha2::{Digest, Sha256};
 
 use crate::format_dialect::{
     DeclarativeCallId, DeclarativeDialectSpec, DeclarativePayloadShape, DelimitedChannel,
-    ExactEnvelope, ParallelCallLayout, DECLARATIVE_DIALECT,
+    ExactEnvelope, ParallelCallLayout, StructuralObjectEncoding, DECLARATIVE_DIALECT,
 };
 use crate::{
     format_dialect::{
@@ -428,6 +428,52 @@ const MINISTRAL8_2410_TEMPLATE_SIGNATURE: [u8; 32] = [
     0xe4, 0x67, 0x6c, 0xb5, 0x6d, 0xff, 0xea, 0x77, 0x82, 0xfd, 0x3e, 0x2b, 0x57, 0x7c, 0xfa, 0xf1,
     0xe1, 0x23, 0x53, 0x7e, 0x6e, 0xf4, 0x9b, 0x3e, 0xc7, 0xca, 0xa6, 0xc0, 0x95, 0xc6, 0x22, 0x72,
 ];
+const GEMMA4_EDGE_TEMPLATE_SIGNATURE: [u8; 32] = [
+    0x0a, 0x2c, 0x80, 0x73, 0xc8, 0x78, 0xab, 0x1d, 0xa0, 0x04, 0xbe, 0xe9, 0x33, 0xa9, 0x98, 0x60,
+    0x65, 0x37, 0xbb, 0xb6, 0x20, 0x16, 0x31, 0x03, 0x52, 0xc7, 0x28, 0x5c, 0x3f, 0x01, 0xc5, 0xb5,
+];
+const GEMMA4_LARGE_TEMPLATE_SIGNATURE: [u8; 32] = [
+    0xae, 0x53, 0x46, 0x4b, 0xf3, 0xbe, 0x25, 0x80, 0x2b, 0x3a, 0x5b, 0x37, 0xde, 0xf7, 0xfd, 0x89,
+    0x66, 0x70, 0x67, 0xd7, 0x57, 0x70, 0x49, 0xb3, 0xb2, 0xd7, 0x4c, 0x4d, 0x8d, 0xe4, 0xc6, 0xd4,
+];
+
+const GEMMA4_STRUCTURAL_TOOL_SPEC: DeclarativeDialectSpec = DeclarativeDialectSpec {
+    generation_prompt_behavior: GenerationPromptBehavior::HonorRequest,
+    output: ExactEnvelope {
+        prefix: "",
+        suffix: "",
+    },
+    call: ExactEnvelope {
+        prefix: "<|tool_call>",
+        suffix: "<tool_call|>",
+    },
+    payload_shape: DeclarativePayloadShape::StructuralObject(StructuralObjectEncoding {
+        name_prefix: "call:",
+        string_delimiter: "<|\"|>",
+    }),
+    name_field: "",
+    arguments_field: "",
+    call_id: None,
+    reasoning_channel: Some(DelimitedChannel {
+        prefix: "<|channel>thought\n",
+        suffix: "<channel|>",
+    }),
+    text_channel: None,
+    raw_text_before_calls: true,
+    call_separator: "",
+    parallel_layout: ParallelCallLayout::RepeatedEnvelopes,
+    auto_activation_trigger: Some("<|tool_call>"),
+    required_structural_tokens: &[
+        "<|channel>",
+        "<channel|>",
+        "<|tool_call>",
+        "<tool_call|>",
+        "<|\"|>",
+        "<|tool_response>",
+        "<turn|>",
+    ],
+    stop_sequences: &["<|tool_response>", "<turn|>"],
+};
 
 #[cfg(test)]
 const SYNTHETIC_DECLARATIVE_SPEC: DeclarativeDialectSpec = DeclarativeDialectSpec {
@@ -499,6 +545,18 @@ const FORMAT_REGISTRY: &[FormatRegistryEntry] = &[
         template_signature: MINISTRAL8_2410_TEMPLATE_SIGNATURE,
         dialect: &DECLARATIVE_DIALECT,
         parameters: DialectParameters::Declarative(&MINISTRAL_JSON_LIST_TOOL_SPEC),
+    },
+    FormatRegistryEntry {
+        identity: "google.gemma4.edge.structural-tools.0a2c8073",
+        template_signature: GEMMA4_EDGE_TEMPLATE_SIGNATURE,
+        dialect: &DECLARATIVE_DIALECT,
+        parameters: DialectParameters::Declarative(&GEMMA4_STRUCTURAL_TOOL_SPEC),
+    },
+    FormatRegistryEntry {
+        identity: "google.gemma4.large.structural-tools.ae53464b",
+        template_signature: GEMMA4_LARGE_TEMPLATE_SIGNATURE,
+        dialect: &DECLARATIVE_DIALECT,
+        parameters: DialectParameters::Declarative(&GEMMA4_STRUCTURAL_TOOL_SPEC),
     },
     #[cfg(test)]
     FormatRegistryEntry {
@@ -663,6 +721,7 @@ mod tests {
     use super::{
         prepare_format_profile, prepare_format_profile_with_registry, resolve_structural_tokens,
         template_signature, DialectParameters, FormatRegistryEntry, DECLARATIVE_DIALECT,
+        GEMMA4_EDGE_TEMPLATE_SIGNATURE, GEMMA4_LARGE_TEMPLATE_SIGNATURE,
         HERMES2_PRO_TOOL_USE_TEMPLATE_SIGNATURE, MINISTRAL8_2410_TEMPLATE_SIGNATURE,
         MISTRAL7_V03_TEMPLATE_SIGNATURE, QWEN25_TEMPLATE_SIGNATURE,
         QWEN3_TEMPLATE_16706FC5_SIGNATURE, QWEN3_TEMPLATE_7E4AE267_SIGNATURE,
@@ -685,6 +744,10 @@ mod tests {
         include_str!("../tests/fixtures/chat_templates/ministral-8b-instruct-2410-2f494a19.jinja");
     const QWEN3_OLDER_TOKENIZER_CONFIG: &str =
         include_str!("../../safemlx-lm-utils/tests/fixtures/qwen3/tokenizer_config.json");
+    const GEMMA4_EDGE_FIXTURE: &str =
+        include_str!("../tests/fixtures/chat_templates/gemma-4-e2b-it-3e22461f.jinja");
+    const GEMMA4_LARGE_FIXTURE: &str =
+        include_str!("../tests/fixtures/chat_templates/gemma-4-26b-a4b-it-4d7ae498.jinja");
 
     #[test]
     fn registry_does_not_guess_unknown_templates() {
@@ -812,6 +875,40 @@ mod tests {
         }
 
         let modified = format!("{QWEN25_FIXTURE} ");
+        assert!(prepare_format_profile(&modified).dialect.is_none());
+
+        for (template, signature, identity) in [
+            (
+                GEMMA4_EDGE_FIXTURE,
+                GEMMA4_EDGE_TEMPLATE_SIGNATURE,
+                "google.gemma4.edge.structural-tools.0a2c8073",
+            ),
+            (
+                GEMMA4_LARGE_FIXTURE,
+                GEMMA4_LARGE_TEMPLATE_SIGNATURE,
+                "google.gemma4.large.structural-tools.ae53464b",
+            ),
+        ] {
+            assert_eq!(template_signature(template), signature, "{identity}");
+            let prepared = prepare_format_profile(template);
+            assert_eq!(prepared.identity.as_deref(), Some(identity));
+            assert!(prepared.dialect.is_some(), "{identity}");
+            assert_eq!(
+                prepared.required_structural_tokens,
+                [
+                    "<|channel>",
+                    "<channel|>",
+                    "<|tool_call>",
+                    "<tool_call|>",
+                    "<|\"|>",
+                    "<|tool_response>",
+                    "<turn|>",
+                ]
+            );
+            assert_eq!(prepared.stop_sequences, ["<|tool_response>", "<turn|>"]);
+        }
+
+        let modified = format!("{GEMMA4_EDGE_FIXTURE} ");
         assert!(prepare_format_profile(&modified).dialect.is_none());
     }
 

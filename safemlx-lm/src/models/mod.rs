@@ -4343,7 +4343,7 @@ mod tests {
         error::Error,
         inspection::ActivationRecorder,
         quantization::{AffineQuantization, CheckpointQuantizationOptions, WeightQuantization},
-        sampler::DefaultSampler,
+        sampler::{ConstrainedSampler, DefaultSampler},
         streaming::{FinishReason, SemanticEvent},
         tool_constraints::ConstraintCompiler,
     };
@@ -4378,6 +4378,10 @@ mod tests {
     const MINISTRAL8_2410_FIXTURE: &str = include_str!(
         "../../tests/fixtures/chat_templates/ministral-8b-instruct-2410-2f494a19.jinja"
     );
+    const GEMMA4_EDGE_FIXTURE: &str =
+        include_str!("../../tests/fixtures/chat_templates/gemma-4-e2b-it-3e22461f.jinja");
+    const GEMMA4_LARGE_FIXTURE: &str =
+        include_str!("../../tests/fixtures/chat_templates/gemma-4-26b-a4b-it-4d7ae498.jinja");
 
     #[test]
     #[ignore = "requires MLX runtime execution and SAFEMLX_INSPECTION_MODEL_DIR"]
@@ -4500,6 +4504,38 @@ mod tests {
         tokenizer.set_template_kwargs(serde_json::Map::from_iter([
             ("bos_token".into(), json!("<s>")),
             ("eos_token".into(), json!("</s>")),
+        ]));
+        tokenizer
+    }
+
+    fn gemma4_chat_tokenizer(preceding_tokens: usize) -> ChatTokenizer {
+        let mut raw = Tokenizer::new(WordLevel::default());
+        raw.add_tokens(
+            (0..preceding_tokens)
+                .map(|index| AddedToken::from(format!("ordinary_{index}"), false))
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        assert_eq!(
+            raw.add_special_tokens(
+                [
+                    "<|channel>",
+                    "<channel|>",
+                    "<|tool_call>",
+                    "<tool_call|>",
+                    "<|\"|>",
+                    "<|tool_response>",
+                    "<turn|>",
+                ]
+                .map(|token| AddedToken::from(token, true).normalized(false))
+            )
+            .unwrap(),
+            7
+        );
+        let mut tokenizer = ChatTokenizer::from_tokenizer(raw);
+        tokenizer.set_template_kwargs(serde_json::Map::from_iter([
+            ("bos_token".into(), json!("<bos>")),
+            ("eos_token".into(), json!("<eos>")),
         ]));
         tokenizer
     }
@@ -4921,6 +4957,345 @@ mod tests {
                 assert_eq!(plan.auto_activation_trigger(), expected_auto_trigger);
             }
         }
+    }
+
+    #[test]
+    fn production_gemma4_templates_render_exact_thinking_tool_history_and_prompts() {
+        let compiler = Ok(ConstraintCompiler::synthetic_for_tests());
+        let messages = vec![
+            json!({"role": "user", "content": "first"}),
+            json!({
+                "role": "assistant",
+                "content": "",
+                "reasoning_content": "inspect",
+                "tool_calls": [
+                    {
+                        "id": "call_a",
+                        "type": "function",
+                        "function": {"name": "lookup", "arguments": {"value": 1}}
+                    },
+                    {
+                        "id": "call_b",
+                        "type": "function",
+                        "function": {"name": "lookup", "arguments": {"value": 2}}
+                    }
+                ]
+            }),
+            json!({"role": "tool", "tool_call_id": "call_a", "content": "{\"result\":1}"}),
+            json!({"role": "tool", "tool_call_id": "call_b", "content": "{\"result\":2}"}),
+            json!({"role": "user", "content": "again"}),
+        ];
+        let tool_declaration = concat!(
+            "<|tool>declaration:lookup{description:<|\"|>Look up one integer.<|\"|>,",
+            "parameters:{properties:{value:{description:<|\"|>The integer to look up.<|\"|>,",
+            "type:<|\"|>INTEGER<|\"|>}},required:[<|\"|>value<|\"|>],",
+            "type:<|\"|>OBJECT<|\"|>}}<tool|>",
+        );
+        let history = concat!(
+            "<|turn>user\nfirst<turn|>\n",
+            "<|turn>model\n<|channel>thought\ninspect\n<channel|>",
+            "<|tool_call>call:lookup{value:1}<tool_call|>",
+            "<|tool_call>call:lookup{value:2}<tool_call|>",
+            "<|tool_response>response:lookup{value:<|\"|>{\"result\":1}<|\"|>}",
+            "<tool_response|><|tool_response>response:lookup{value:<|\"|>{\"result\":2}",
+            "<|\"|>}<tool_response|><turn|>\n",
+            "<|turn>user\nagain<turn|>\n",
+        );
+        for (template, identity, disabled_generation_prompt) in [
+            (
+                GEMMA4_EDGE_FIXTURE,
+                "google.gemma4.edge.structural-tools.0a2c8073",
+                "<|turn>model\n",
+            ),
+            (
+                GEMMA4_LARGE_FIXTURE,
+                "google.gemma4.large.structural-tools.ae53464b",
+                "<|turn>model\n<|channel>thought\n<channel|>",
+            ),
+        ] {
+            for enable_thinking in [false, true] {
+                for tools in [Vec::new(), vec![production_tool("lookup")]] {
+                    let tool_choice = if tools.is_empty() {
+                        ToolChoice::Auto
+                    } else {
+                        ToolChoice::Required
+                    };
+                    for add_generation_prompt in [false, true] {
+                        let mut tokenizer = gemma4_chat_tokenizer(10);
+                        let prepared = prepare_chat_from_parts(
+                            &mut tokenizer,
+                            ModelChatTemplate::Single(template.into()),
+                            "model-type-is-not-a-support-key",
+                            &[],
+                            Some(&compiler),
+                            ChatTemplateRequest {
+                                messages: messages.clone(),
+                                tools: tools.clone(),
+                                tool_choice,
+                                parallel_tool_calls: ParallelToolCallPolicy::Enabled {
+                                    max_calls: std::num::NonZeroUsize::new(2),
+                                },
+                                enable_thinking: Some(enable_thinking),
+                                add_generation_prompt,
+                                extra_template_kwargs: serde_json::Map::from_iter([(
+                                    "preserve_thinking".into(),
+                                    json!(true),
+                                )]),
+                            },
+                        )
+                        .unwrap();
+                        let system = if enable_thinking || !tools.is_empty() {
+                            format!(
+                                "<|turn>system\n{}{}<turn|>\n",
+                                if enable_thinking { "<|think|>\n" } else { "" },
+                                if tools.is_empty() {
+                                    ""
+                                } else {
+                                    tool_declaration
+                                },
+                            )
+                        } else {
+                            String::new()
+                        };
+                        let generation_prompt = if enable_thinking {
+                            "<|turn>model\n"
+                        } else {
+                            disabled_generation_prompt
+                        };
+                        let expected = format!(
+                            "<bos>{system}{history}{}",
+                            if add_generation_prompt {
+                                generation_prompt
+                            } else {
+                                ""
+                            }
+                        );
+
+                        assert_eq!(prepared.rendered_prompt(), expected, "{identity}");
+                        assert_eq!(prepared.generation_prompt(), generation_prompt);
+                        assert_eq!(prepared.format_profile_identity(), Some(identity));
+                        assert_eq!(
+                            prepared.preserved_structural_token_ids(),
+                            &[10, 11, 12, 13, 14, 15, 16]
+                        );
+                        assert_eq!(
+                            prepared.profile_stop_sequences(),
+                            ["<|tool_response>", "<turn|>"]
+                        );
+                        let NativeToolSupport::Supported(plan) = prepared.native_tool_support()
+                        else {
+                            panic!("registered Gemma 4 profile must be supported");
+                        };
+                        if tool_choice == ToolChoice::Auto {
+                            assert_eq!(plan.auto_activation_trigger(), Some("<|tool_call>"));
+                            assert!(!ConstrainedSampler::from_tool_plan(DefaultSampler, plan)
+                                .unwrap()
+                                .constraint_is_active());
+                        } else {
+                            assert_eq!(plan.auto_activation_trigger(), None);
+                            assert!(ConstrainedSampler::from_tool_plan(DefaultSampler, plan)
+                                .unwrap()
+                                .constraint_is_active());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn production_gemma4_semantic_events_survive_every_protocol_byte_split() {
+        fn push_at_every_side(
+            parser: &mut crate::streaming::ToolRuntimeParser,
+            output: &str,
+            split: usize,
+        ) {
+            let mut pending = Vec::new();
+            for chunk in [&output.as_bytes()[..split], &output.as_bytes()[split..]] {
+                pending.extend_from_slice(chunk);
+                loop {
+                    match std::str::from_utf8(&pending) {
+                        Ok(text) => {
+                            parser.push(text).unwrap();
+                            pending.clear();
+                            break;
+                        }
+                        Err(error) if error.error_len().is_none() => {
+                            let valid_up_to = error.valid_up_to();
+                            if valid_up_to == 0 {
+                                break;
+                            }
+                            parser
+                                .push(std::str::from_utf8(&pending[..valid_up_to]).unwrap())
+                                .unwrap();
+                            pending.drain(..valid_up_to);
+                        }
+                        Err(error) => panic!("golden output is invalid UTF-8: {error}"),
+                    }
+                }
+            }
+            assert!(pending.is_empty(), "split {split}");
+        }
+
+        let compiler = Ok(ConstraintCompiler::synthetic_for_tests());
+        let mut tokenizer = gemma4_chat_tokenizer(23);
+        let prepared = prepare_chat_from_parts(
+            &mut tokenizer,
+            ModelChatTemplate::Single(GEMMA4_EDGE_FIXTURE.into()),
+            "unrelated-architecture",
+            &[],
+            Some(&compiler),
+            ChatTemplateRequest {
+                messages: vec![json!({"role": "user", "content": "lookup"})],
+                tools: vec![production_tool("lookup")],
+                tool_choice: ToolChoice::Required,
+                parallel_tool_calls: ParallelToolCallPolicy::Disabled,
+                enable_thinking: Some(true),
+                add_generation_prompt: true,
+                ..ChatTemplateRequest::default()
+            },
+        )
+        .unwrap();
+        let NativeToolSupport::Supported(plan) = prepared.native_tool_support() else {
+            panic!("registered Gemma 4 profile must be supported");
+        };
+        let tool_output = concat!(
+            "<|channel>thought\nNeed 東京 🦀\n<channel|>",
+            "<|tool_call>call:lookup{value:7}<tool_call|><|tool_response>",
+        );
+        let text_output = "<|channel>thought\nDone 🦀\n<channel|>Visible Bogotá<turn|>";
+        let structural_spellings = [
+            "<|channel>",
+            "<channel|>",
+            "<|tool_call>",
+            "<tool_call|>",
+            "<|\"|>",
+            "<|tool_response>",
+            "<turn|>",
+        ];
+        let grammar_output = tool_output
+            .strip_suffix("<|tool_response>")
+            .expect("profile stop is outside the tool grammar");
+        let mut grammar = plan.generation_constraint().grammar_state();
+        let mut remaining = grammar_output;
+        while !remaining.is_empty() {
+            let next = structural_spellings
+                .iter()
+                .enumerate()
+                .filter_map(|(index, spelling)| {
+                    remaining
+                        .find(spelling)
+                        .map(|position| (position, index, *spelling))
+                })
+                .min_by_key(|(position, index, _)| (*position, *index));
+            let Some((position, structural_index, spelling)) = next else {
+                for byte in remaining.bytes() {
+                    grammar.commit(u32::from(byte)).unwrap();
+                }
+                break;
+            };
+            for byte in remaining[..position].bytes() {
+                grammar.commit(u32::from(byte)).unwrap();
+            }
+            grammar
+                .commit(23 + u32::try_from(structural_index).unwrap())
+                .unwrap();
+            remaining = &remaining[position + spelling.len()..];
+        }
+        assert!(grammar.is_complete().unwrap());
+
+        for split in 0..=tool_output.len() {
+            let mut parser = plan.create_parser().unwrap();
+            push_at_every_side(&mut parser, tool_output, split);
+            let reasoning = parser
+                .events()
+                .iter()
+                .filter_map(|event| match event {
+                    SemanticEvent::ReasoningDelta(text) => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect::<String>();
+            assert_eq!(reasoning, "Need 東京 🦀\n", "split {split}");
+            assert!(parser.events().contains(&SemanticEvent::ToolCallStart {
+                index: 0,
+                id: "call_0".into(),
+                name: "lookup".into(),
+            }));
+            assert!(parser
+                .events()
+                .contains(&SemanticEvent::ToolArgumentsDelta {
+                    index: 0,
+                    json_fragment: r#"{"value":7}"#.into(),
+                }));
+            assert_eq!(
+                parser
+                    .events()
+                    .iter()
+                    .filter(|event| matches!(event, SemanticEvent::ToolCallEnd))
+                    .count(),
+                1,
+                "split {split}"
+            );
+            assert_eq!(
+                parser.events().last(),
+                Some(&SemanticEvent::Finished {
+                    reason: FinishReason::StopSequence
+                }),
+                "split {split}"
+            );
+        }
+
+        for split in 0..=text_output.len() {
+            let mut parser = plan.create_parser().unwrap();
+            push_at_every_side(&mut parser, text_output, split);
+            let reasoning = parser
+                .events()
+                .iter()
+                .filter_map(|event| match event {
+                    SemanticEvent::ReasoningDelta(text) => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect::<String>();
+            let visible = parser
+                .events()
+                .iter()
+                .filter_map(|event| match event {
+                    SemanticEvent::TextDelta(text) => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect::<String>();
+            assert_eq!(reasoning, "Done 🦀\n", "split {split}");
+            assert_eq!(visible, "Visible Bogotá", "split {split}");
+            assert_eq!(
+                parser.events().last(),
+                Some(&SemanticEvent::Finished {
+                    reason: FinishReason::StopSequence
+                }),
+                "split {split}"
+            );
+        }
+    }
+
+    #[test]
+    fn gemma4_model_type_does_not_grant_unregistered_template_support() {
+        let raw = Tokenizer::new(WordLevel::default());
+        let mut tokenizer = ChatTokenizer::from_tokenizer(raw);
+        let prepared = prepare_chat_from_parts(
+            &mut tokenizer,
+            ModelChatTemplate::Single("unregistered Gemma 4 template".into()),
+            "gemma4",
+            &[],
+            None,
+            ChatTemplateRequest::default(),
+        )
+        .unwrap();
+
+        assert_eq!(prepared.format_profile_identity(), None);
+        assert!(matches!(
+            prepared.native_tool_support(),
+            NativeToolSupport::Unsupported { reason }
+                if reason.contains("no registered format profile")
+        ));
     }
 
     #[test]

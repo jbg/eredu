@@ -13,6 +13,8 @@ support key.
 | `hermes-2-pro-llama-3-8b-f798274b-tool-use.jinja` | `NousResearch/Hermes-2-Pro-Llama-3-8B` | `f798274b30e7d2d4797c369edcc0cc7473b6e6f2` | named `tool_use` template |
 | `mistral-7b-instruct-v0.3-c170c708.jinja` | `mistralai/Mistral-7B-Instruct-v0.3` | `c170c708c41dac9275d15a8fff4eca08d52bab71` | single `chat_template` |
 | `ministral-8b-instruct-2410-2f494a19.jinja` | `mistralai/Ministral-8B-Instruct-2410` | `2f494a194c5b980dfb9772cb92d26cbb671fce5a` | single `chat_template` |
+| `gemma-4-e2b-it-3e22461f.jinja` | `google/gemma-4-E2B-it` | `3e22461f65e89153144f8adb70e3b8c2cc9845a7` | `chat_template.jinja` |
+| `gemma-4-26b-a4b-it-4d7ae498.jinja` | `google/gemma-4-26B-A4B-it` | `4d7ae4984b7db7de8f8457170b3f1a419ee76d52` | `chat_template.jinja` |
 
 The Hermes fixture body is also byte-identical to the named `tool_use`
 template in `NousResearch/Hermes-3-Llama-3.1-8B` revision
@@ -30,3 +32,12 @@ fixtures carry one repository file terminator, which signature tests remove
 explicitly. The other upstream bodies end in a line feed and are stored
 unchanged. All other upstream whitespace, including trailing spaces, is
 preserved byte-for-byte.
+
+The Gemma 4 E2B fixture is byte-identical to `google/gemma-4-E4B-it`
+revision `ee0ef6023621cff504d758262d4e04895a5af4a2`. The 26B-A4B fixture is
+byte-identical to `google/gemma-4-12B-it` revision
+`707f0a3b8a3c7ad586ed01e27eafbad8a27dd0f7` and
+`google/gemma-4-31B-it` revision
+`842da3794eaa0b77d5f08bae87a17459d91ff475`. These two signatures capture
+the audited difference in disabled-thinking generation prompts without
+granting support from `model_type`.

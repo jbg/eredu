@@ -14,7 +14,7 @@ use serde_json::Value;
 use crate::{
     chat::{ParallelToolCallPolicy, ToolChoice},
     streaming::{JsonFragmentBuffer, ProtocolParser, SemanticEventSink},
-    tool_constraints::{tool_call_bounds, tool_call_schema},
+    tool_constraints::{parse_tools, tool_call_bounds, tool_call_schema},
 };
 
 /// How a dialect wants the checkpoint template's generation prompt handled.
@@ -139,6 +139,20 @@ pub(crate) enum DeclarativePayloadShape {
     JsonObject,
     /// One call envelope contains a JSON list of call objects.
     JsonList,
+    /// Every call envelope contains an exact name marker, a declared tool
+    /// name, and one structurally quoted JSON argument object.
+    StructuralObject(StructuralObjectEncoding),
+}
+
+/// Exact surface syntax for a JSON object whose strings use a structural
+/// delimiter and whose object keys are emitted without ordinary JSON quotes.
+///
+/// This remains JSON-valued: the incremental parser normalizes every accepted
+/// object to canonical JSON before emitting tool argument events.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct StructuralObjectEncoding {
+    pub(crate) name_prefix: &'static str,
+    pub(crate) string_delimiter: &'static str,
 }
 
 /// How parallel calls occupy call envelopes.
@@ -188,20 +202,38 @@ pub(crate) struct DeclarativeDialectSpec {
 
 impl DeclarativeDialectSpec {
     fn validate(&self) -> Result<(), String> {
-        if self.name_field.is_empty() || self.arguments_field.is_empty() {
-            return Err("declarative name and arguments fields must be non-empty".into());
-        }
-        if self.name_field == self.arguments_field {
-            return Err("declarative name and arguments fields must be distinct".into());
-        }
-        if let Some(call_id) = self.call_id {
-            if call_id.field.is_empty() {
-                return Err("declarative call ID field must be non-empty".into());
+        match self.payload_shape {
+            DeclarativePayloadShape::JsonObject | DeclarativePayloadShape::JsonList => {
+                if self.name_field.is_empty() || self.arguments_field.is_empty() {
+                    return Err("declarative name and arguments fields must be non-empty".into());
+                }
+                if self.name_field == self.arguments_field {
+                    return Err("declarative name and arguments fields must be distinct".into());
+                }
+                if let Some(call_id) = self.call_id {
+                    if call_id.field.is_empty() {
+                        return Err("declarative call ID field must be non-empty".into());
+                    }
+                    if call_id.field == self.name_field || call_id.field == self.arguments_field {
+                        return Err(
+                            "declarative call ID, name, and arguments fields must be distinct"
+                                .into(),
+                        );
+                    }
+                }
             }
-            if call_id.field == self.name_field || call_id.field == self.arguments_field {
-                return Err(
-                    "declarative call ID, name, and arguments fields must be distinct".into(),
-                );
+            DeclarativePayloadShape::StructuralObject(encoding) => {
+                if encoding.name_prefix.is_empty() || encoding.string_delimiter.is_empty() {
+                    return Err(
+                        "declarative structural objects require non-empty name and string markers"
+                            .into(),
+                    );
+                }
+                if self.call_id.is_some() {
+                    return Err(
+                        "declarative structural objects cannot carry a JSON call ID field".into(),
+                    );
+                }
             }
         }
         if self
@@ -226,11 +258,13 @@ impl DeclarativeDialectSpec {
             }
         }
         if self.output.prefix.is_empty()
-            && (self.payload_shape != DeclarativePayloadShape::JsonObject
-                || self.parallel_layout != ParallelCallLayout::RepeatedEnvelopes)
+            && (!matches!(
+                self.payload_shape,
+                DeclarativePayloadShape::JsonObject | DeclarativePayloadShape::StructuralObject(_)
+            ) || self.parallel_layout != ParallelCallLayout::RepeatedEnvelopes)
         {
             return Err(
-                "only repeated JSON-object call envelopes may omit an outer output envelope".into(),
+                "only repeated object call envelopes may omit an outer output envelope".into(),
             );
         }
         if self.output.prefix.is_empty()
@@ -253,11 +287,14 @@ impl DeclarativeDialectSpec {
         }
         match (self.payload_shape, self.parallel_layout) {
             (DeclarativePayloadShape::JsonObject, ParallelCallLayout::RepeatedEnvelopes)
+            | (
+                DeclarativePayloadShape::StructuralObject(_),
+                ParallelCallLayout::RepeatedEnvelopes,
+            )
             | (DeclarativePayloadShape::JsonList, ParallelCallLayout::SingleEnvelope) => {}
             _ => {
                 return Err(
-                    "JSON objects require repeated envelopes and JSON lists require one envelope"
-                        .into(),
+                    "JSON and structural objects require repeated envelopes and JSON lists require one envelope".into(),
                 )
             }
         }
@@ -293,14 +330,14 @@ impl DeclarativeDialectSpec {
                 resolved_structural_token_ids,
             )
         };
-        let schema = tool_call_schema(tools, self.name_field, self.arguments_field, self.call_id)?;
-        let schema = serde_json::to_string(&schema).expect("JSON schema values serialize");
         let (min_calls, max_calls) = tool_call_bounds(tool_choice, parallel_tool_calls, tools)?;
-        if max_calls.is_none() && self.call_separator.is_empty() {
-            return Err("unbounded declarative calls require a non-empty separator".into());
-        }
-        if max_calls.is_some_and(|maximum| maximum > 1) && self.call_separator.is_empty() {
-            return Err("parallel declarative calls require a non-empty separator".into());
+        if self.call_separator.is_empty()
+            && (max_calls.is_none() || max_calls.is_some_and(|maximum| maximum > 1))
+            && (self.call.prefix.is_empty() || self.call.suffix.is_empty())
+        {
+            return Err(
+                "adjacent declarative calls require non-empty exact call delimiters".into(),
+            );
         }
 
         let mut grammar = String::from("start: ");
@@ -316,14 +353,14 @@ impl DeclarativeDialectSpec {
 
         if let Some(channel) = self.reasoning_channel {
             grammar.push_str(&format!(
-                "reasoning[lazy]: {} CHANNEL_TEXT {}\n",
+                "reasoning: {} channel_text {}\n",
                 literal(channel.prefix)?,
                 literal(channel.suffix)?
             ));
         }
         if let Some(channel) = self.text_channel {
             grammar.push_str(&format!(
-                "visible_text[lazy]: {} CHANNEL_TEXT {}\n",
+                "visible_text: {} channel_text {}\n",
                 literal(channel.prefix)?,
                 literal(channel.suffix)?
             ));
@@ -333,12 +370,16 @@ impl DeclarativeDialectSpec {
             grammar.push_str("RAW_TEXT_CHARACTER: /[^<]/\n");
         }
         if self.reasoning_channel.is_some() || self.text_channel.is_some() {
-            grammar.push_str("CHANNEL_TEXT: /(\\n|.)*/\n");
+            grammar.push_str("channel_text: CHANNEL_TEXT_CHARACTER*\n");
+            grammar.push_str("CHANNEL_TEXT_CHARACTER: /[^<]/\n");
         }
 
         let calls = repeated_rule("call", &literal(self.call_separator)?, min_calls, max_calls);
         match self.payload_shape {
             DeclarativePayloadShape::JsonObject => {
+                let schema =
+                    tool_call_schema(tools, self.name_field, self.arguments_field, self.call_id)?;
+                let schema = serde_json::to_string(&schema).expect("JSON schema values serialize");
                 if self.output.prefix.is_empty() {
                     grammar.push_str(&format!("tool_output: {calls}\n"));
                 } else {
@@ -354,8 +395,12 @@ impl DeclarativeDialectSpec {
                     literal(self.call.prefix)?,
                     literal(self.call.suffix)?
                 ));
+                grammar.push_str(&format!("call_json: %json {schema}\n"));
             }
             DeclarativePayloadShape::JsonList => {
+                let schema =
+                    tool_call_schema(tools, self.name_field, self.arguments_field, self.call_id)?;
+                let schema = serde_json::to_string(&schema).expect("JSON schema values serialize");
                 grammar.push_str(&format!(
                     "tool_output: {} {} \"[\" {} \"]\" {} {}\n",
                     literal(self.output.prefix)?,
@@ -365,9 +410,32 @@ impl DeclarativeDialectSpec {
                     literal(self.output.suffix)?
                 ));
                 grammar.push_str("call: call_json\n");
+                grammar.push_str(&format!("call_json: %json {schema}\n"));
+            }
+            DeclarativePayloadShape::StructuralObject(encoding) => {
+                if self.output.prefix.is_empty() {
+                    grammar.push_str(&format!("tool_output: {calls}\n"));
+                } else {
+                    grammar.push_str(&format!(
+                        "tool_output: {} {} {}\n",
+                        literal(self.output.prefix)?,
+                        calls,
+                        literal(self.output.suffix)?
+                    ));
+                }
+                grammar.push_str(&format!(
+                    "call: {} structural_call {}\n",
+                    literal(self.call.prefix)?,
+                    literal(self.call.suffix)?
+                ));
+                grammar.push_str(&structural_object_grammar(
+                    tools,
+                    encoding,
+                    self.required_structural_tokens,
+                    resolved_structural_token_ids,
+                )?);
             }
         }
-        grammar.push_str(&format!("call_json: %json {schema}\n"));
         Ok(grammar)
     }
 }
@@ -412,15 +480,260 @@ fn repeated_rule(item: &str, separator: &str, minimum: usize, maximum: Option<us
     if maximum == Some(0) {
         return String::new();
     }
-    let tail = format!("({separator} {item})");
-    match (minimum, maximum) {
-        (0, Some(1)) => format!("{item}?"),
-        (0, Some(maximum)) => format!("({item} {tail}{{0,{}}})?", maximum - 1),
-        (0, None) => format!("({item} {tail}*)?"),
-        (1, Some(1)) => item.to_owned(),
-        (1, Some(maximum)) => format!("{item} {tail}{{0,{}}}", maximum - 1),
-        (1, None) => format!("{item} {tail}*"),
-        _ => unreachable!("tool call bounds only use minimum zero or one"),
+    let tail = if separator == literal("") {
+        format!("({item})")
+    } else {
+        format!("({separator} {item})")
+    };
+    if minimum == 0 {
+        return match maximum {
+            Some(1) => format!("{item}?"),
+            Some(maximum) => format!("({item} {tail}{{0,{}}})?", maximum - 1),
+            None => format!("({item} {tail}*)?"),
+        };
+    }
+
+    let required = std::iter::once(item.to_owned())
+        .chain(std::iter::repeat_n(tail.clone(), minimum - 1))
+        .collect::<Vec<_>>()
+        .join(" ");
+    match maximum {
+        Some(maximum) if maximum == minimum => required,
+        Some(maximum) => format!("{required} {tail}{{0,{}}}", maximum - minimum),
+        None => format!("{required} {tail}*"),
+    }
+}
+
+fn structural_object_grammar(
+    tools: &[Value],
+    encoding: StructuralObjectEncoding,
+    structural_tokens: &[&str],
+    resolved_structural_token_ids: &[u32],
+) -> Result<String, String> {
+    let tools = parse_tools(tools)?;
+    if tools.is_empty() {
+        return Ok("structural_call: \"__safemlx_unreachable_structural_tool_call__\"\n".into());
+    }
+
+    let resolver = StructuralLiteralResolver {
+        structural_tokens,
+        resolved_structural_token_ids,
+    };
+    let mut builder = StructuralGrammarBuilder::new(encoding, &resolver);
+    let alternatives = tools
+        .iter()
+        .map(|tool| {
+            let arguments = builder.schema_rule(&tool.parameters)?;
+            Ok(format!(
+                "{} {} {arguments}",
+                resolver.resolve(encoding.name_prefix)?,
+                resolver.resolve(&tool.name)?
+            ))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let mut grammar = format!("structural_call: {}\n", alternatives.join(" | "));
+    grammar.push_str(&builder.rules);
+    grammar.push_str("STRUCTURAL_INTEGER: /-?(0|[1-9][0-9]*)/\n");
+    grammar.push_str("STRUCTURAL_NUMBER: /-?(0|[1-9][0-9]*)(\\.[0-9]+)?([eE][+-]?[0-9]+)?/\n");
+    grammar.push_str("STRUCTURAL_STRING_CHARACTER: /[^<]/\n");
+    Ok(grammar)
+}
+
+struct StructuralLiteralResolver<'a> {
+    structural_tokens: &'a [&'a str],
+    resolved_structural_token_ids: &'a [u32],
+}
+
+impl StructuralLiteralResolver<'_> {
+    fn resolve(&self, text: &str) -> Result<String, String> {
+        structural_literal(
+            text,
+            self.structural_tokens,
+            self.resolved_structural_token_ids,
+        )
+    }
+}
+
+struct StructuralGrammarBuilder<'a> {
+    encoding: StructuralObjectEncoding,
+    literal: &'a StructuralLiteralResolver<'a>,
+    next_rule: usize,
+    rules: String,
+}
+
+impl<'a> StructuralGrammarBuilder<'a> {
+    fn new(encoding: StructuralObjectEncoding, literal: &'a StructuralLiteralResolver<'a>) -> Self {
+        Self {
+            encoding,
+            literal,
+            next_rule: 0,
+            rules: String::new(),
+        }
+    }
+
+    fn rule_name(&mut self, stem: &str) -> String {
+        let name = format!("{stem}_{}", self.next_rule);
+        self.next_rule += 1;
+        name
+    }
+
+    fn schema_rule(&mut self, schema: &Value) -> Result<String, String> {
+        if let Some(values) = schema.get("enum").and_then(Value::as_array) {
+            return values
+                .iter()
+                .map(|value| self.value_literal(value))
+                .collect::<Result<Vec<_>, _>>()
+                .map(|values| format!("({})", values.join(" | ")));
+        }
+        match schema.get("type").and_then(Value::as_str) {
+            Some("object") => self.object_rule(schema),
+            Some("array") => self.array_rule(schema),
+            Some("string") => {
+                let rule = self.rule_name("structural_string");
+                let text_rule = self.rule_name("structural_string_text");
+                self.rules.push_str(&format!(
+                    "{rule}: {} {text_rule} {}\n",
+                    self.literal.resolve(self.encoding.string_delimiter)?,
+                    self.literal.resolve(self.encoding.string_delimiter)?
+                ));
+                self.rules
+                    .push_str(&format!("{text_rule}: STRUCTURAL_STRING_CHARACTER*\n"));
+                Ok(rule)
+            }
+            Some("integer") => Ok("STRUCTURAL_INTEGER".into()),
+            Some("number") => Ok("STRUCTURAL_NUMBER".into()),
+            Some("boolean") => Ok("(\"true\" | \"false\")".into()),
+            Some("null") => Ok("\"null\"".into()),
+            other => Err(format!(
+                "structural-object grammar received unsupported schema type {other:?}"
+            )),
+        }
+    }
+
+    fn object_rule(&mut self, schema: &Value) -> Result<String, String> {
+        let object_rule = self.rule_name("structural_object");
+        let first_rule = self.rule_name("structural_first");
+        let properties = schema
+            .get("properties")
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        let required = schema
+            .get("required")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .collect::<std::collections::BTreeSet<_>>();
+        let fields = properties.into_iter().collect::<Vec<_>>();
+
+        if fields.is_empty() {
+            self.rules
+                .push_str(&format!("{object_rule}: \"{{\" \"}}\"\n"));
+            return Ok(object_rule);
+        }
+
+        let field_rules = fields
+            .iter()
+            .map(|(name, schema)| {
+                let value = self.schema_rule(schema)?;
+                Ok(format!("{} \":\" {value}", self.literal.resolve(name)?))
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        let suffix_rules = (0..fields.len())
+            .map(|_| self.rule_name("structural_suffix"))
+            .collect::<Vec<_>>();
+
+        let first = self.field_sequence(&fields, &field_rules, &suffix_rules, &required, 0, false);
+        self.rules.push_str(&format!("{first_rule}: {first}\n"));
+        for index in 0..fields.len() {
+            let suffix =
+                self.field_sequence(&fields, &field_rules, &suffix_rules, &required, index, true);
+            self.rules
+                .push_str(&format!("{}: {suffix}\n", suffix_rules[index]));
+        }
+        self.rules
+            .push_str(&format!("{object_rule}: \"{{\" {first_rule} \"}}\"\n"));
+        Ok(object_rule)
+    }
+
+    fn field_sequence(
+        &self,
+        fields: &[(String, Value)],
+        field_rules: &[String],
+        suffix_rules: &[String],
+        required: &std::collections::BTreeSet<&str>,
+        index: usize,
+        comma: bool,
+    ) -> String {
+        if index >= fields.len() {
+            return literal("");
+        }
+        let prefix = if comma { "\",\"" } else { "" };
+        let tail = suffix_rules
+            .get(index + 1)
+            .map(String::as_str)
+            .unwrap_or("");
+        let selected = format!("{prefix} {} {tail}", field_rules[index]);
+        if required.contains(fields[index].0.as_str()) {
+            selected
+        } else {
+            let skipped = self.field_sequence(
+                fields,
+                field_rules,
+                suffix_rules,
+                required,
+                index + 1,
+                comma,
+            );
+            format!("{selected} | {skipped}")
+        }
+    }
+
+    fn array_rule(&mut self, schema: &Value) -> Result<String, String> {
+        let rule = self.rule_name("structural_array");
+        let item = self.schema_rule(
+            schema
+                .get("items")
+                .expect("validated array schemas contain items"),
+        )?;
+        let minimum = schema.get("minItems").and_then(Value::as_u64).unwrap_or(0) as usize;
+        let maximum = schema
+            .get("maxItems")
+            .and_then(Value::as_u64)
+            .map(|value| value as usize);
+        let items = repeated_rule(&item, "\",\"", minimum, maximum);
+        self.rules
+            .push_str(&format!("{rule}: \"[\" {items} \"]\"\n"));
+        Ok(rule)
+    }
+
+    fn value_literal(&self, value: &Value) -> Result<String, String> {
+        match value {
+            Value::String(value) => Ok(format!(
+                "{} {} {}",
+                self.literal.resolve(self.encoding.string_delimiter)?,
+                self.literal.resolve(value)?,
+                self.literal.resolve(self.encoding.string_delimiter)?
+            )),
+            Value::Array(values) => values
+                .iter()
+                .map(|value| self.value_literal(value))
+                .collect::<Result<Vec<_>, _>>()
+                .map(|values| format!("\"[\" {} \"]\"", values.join(" \",\" "))),
+            Value::Object(values) => values
+                .iter()
+                .map(|(key, value)| {
+                    Ok(format!(
+                        "{} \":\" {}",
+                        self.literal.resolve(key)?,
+                        self.value_literal(value)?
+                    ))
+                })
+                .collect::<Result<Vec<_>, String>>()
+                .map(|values| format!("\"{{\" {} \"}}\"", values.join(" \",\" "))),
+            _ => Ok(literal(&value.to_string())),
+        }
     }
 }
 
@@ -515,6 +828,12 @@ enum DeclarativeParserState {
     },
     ToolStart,
     Payload(JsonFragmentBuffer),
+    StructuralName {
+        prefix_consumed: bool,
+    },
+    StructuralPayload {
+        scanner: StructuralObjectScanner,
+    },
     AfterPayload,
     AfterEnvelope,
     ListItemOrEnd {
@@ -555,7 +874,7 @@ impl DeclarativeParser {
         delimiters
     }
 
-    fn emit_call(&self, fragment: &str, sink: &mut SemanticEventSink) -> Result<(), String> {
+    fn emit_json_call(&self, fragment: &str, sink: &mut SemanticEventSink) -> Result<(), String> {
         let value: Value = serde_json::from_str(fragment.trim())
             .map_err(|error| format!("invalid declarative tool-call JSON: {error}"))?;
         let object = value
@@ -606,6 +925,19 @@ impl DeclarativeParser {
             &serde_json::to_string(arguments).expect("parsed JSON values serialize"),
         );
         Ok(())
+    }
+
+    fn start_payload_state(&self) -> DeclarativeParserState {
+        match self.spec.payload_shape {
+            DeclarativePayloadShape::JsonObject | DeclarativePayloadShape::JsonList => {
+                DeclarativeParserState::Payload(JsonFragmentBuffer::default())
+            }
+            DeclarativePayloadShape::StructuralObject(_) => {
+                DeclarativeParserState::StructuralName {
+                    prefix_consumed: false,
+                }
+            }
+        }
     }
 
     fn consume_exact(&mut self, expected: &str) -> Result<bool, String> {
@@ -701,7 +1033,7 @@ impl DeclarativeParser {
                         };
                     } else {
                         self.state = if self.spec.output.prefix.is_empty() {
-                            DeclarativeParserState::Payload(JsonFragmentBuffer::default())
+                            self.start_payload_state()
                         } else {
                             DeclarativeParserState::ToolStart
                         };
@@ -736,7 +1068,10 @@ impl DeclarativeParser {
                         }
                     }
                     let expected = match self.spec.payload_shape {
-                        DeclarativePayloadShape::JsonObject => self.spec.call.prefix.to_owned(),
+                        DeclarativePayloadShape::JsonObject
+                        | DeclarativePayloadShape::StructuralObject(_) => {
+                            self.spec.call.prefix.to_owned()
+                        }
                         DeclarativePayloadShape::JsonList => {
                             format!("{}[", self.spec.call.prefix)
                         }
@@ -747,7 +1082,7 @@ impl DeclarativeParser {
                     if self.spec.payload_shape == DeclarativePayloadShape::JsonList {
                         self.state = DeclarativeParserState::ListItemOrEnd { allow_end: true };
                     } else {
-                        self.state = DeclarativeParserState::Payload(JsonFragmentBuffer::default());
+                        self.state = self.start_payload_state();
                     }
                 }
                 DeclarativeParserState::ListItemOrEnd { allow_end } => {
@@ -778,16 +1113,80 @@ impl DeclarativeParser {
                         return Ok(());
                     }
                     let fragment = json.fragment().to_owned();
-                    self.emit_call(&fragment, sink)?;
+                    self.emit_json_call(&fragment, sink)?;
+                    self.state = DeclarativeParserState::AfterPayload;
+                }
+                DeclarativeParserState::StructuralName { prefix_consumed } => {
+                    let DeclarativePayloadShape::StructuralObject(encoding) =
+                        self.spec.payload_shape
+                    else {
+                        unreachable!("structural-name state requires structural-object encoding");
+                    };
+                    if !*prefix_consumed {
+                        let expected = encoding.name_prefix;
+                        let common = self
+                            .pending
+                            .bytes()
+                            .zip(expected.bytes())
+                            .take_while(|(actual, expected)| actual == expected)
+                            .count();
+                        if common < self.pending.len().min(expected.len()) {
+                            return Err(format!(
+                                "expected exact declarative delimiter {expected:?}"
+                            ));
+                        }
+                        if self.pending.len() < expected.len() {
+                            return Ok(());
+                        }
+                        self.pending.drain(..expected.len());
+                        *prefix_consumed = true;
+                    }
+                    let Some(position) = self.pending.find('{') else {
+                        return Ok(());
+                    };
+                    let name = self.pending[..position].to_owned();
+                    if name.is_empty() {
+                        return Err("declarative structural tool name must be non-empty".into());
+                    }
+                    self.pending.drain(..position);
+                    let id = format!("call_{}", sink.next_tool_index());
+                    sink.start_tool_call(id, name);
+                    self.state = DeclarativeParserState::StructuralPayload {
+                        scanner: StructuralObjectScanner::new(encoding.string_delimiter),
+                    };
+                }
+                DeclarativeParserState::StructuralPayload { scanner } => {
+                    let Some(consumed) = scanner.scan(&self.pending)? else {
+                        return Ok(());
+                    };
+                    let DeclarativePayloadShape::StructuralObject(encoding) =
+                        self.spec.payload_shape
+                    else {
+                        unreachable!("structural payload requires structural-object encoding");
+                    };
+                    let fragment = self.pending[..consumed].to_owned();
+                    let arguments = parse_structural_object(&fragment, encoding.string_delimiter)?;
+                    sink.tool_arguments(
+                        &serde_json::to_string(&arguments)
+                            .expect("structural JSON values serialize"),
+                    );
+                    self.pending.drain(..consumed);
                     self.state = DeclarativeParserState::AfterPayload;
                 }
                 DeclarativeParserState::AfterPayload => match self.spec.payload_shape {
-                    DeclarativePayloadShape::JsonObject => {
+                    DeclarativePayloadShape::JsonObject
+                    | DeclarativePayloadShape::StructuralObject(_) => {
                         if !self.consume_exact(self.spec.call.suffix)? {
                             return Ok(());
                         }
                         sink.end_tool_call();
-                        self.state = DeclarativeParserState::AfterEnvelope;
+                        self.state = if self.spec.output.prefix.is_empty()
+                            && self.spec.call_separator.is_empty()
+                        {
+                            DeclarativeParserState::Outside
+                        } else {
+                            DeclarativeParserState::AfterEnvelope
+                        };
                     }
                     DeclarativePayloadShape::JsonList => {
                         if self.pending.is_empty() {
@@ -832,6 +1231,227 @@ impl DeclarativeParser {
                 }
             }
         }
+    }
+}
+
+#[derive(Debug)]
+struct StructuralObjectScanner {
+    string_delimiter: &'static str,
+    scan_index: usize,
+    depth: usize,
+    in_string: bool,
+    started: bool,
+}
+
+impl StructuralObjectScanner {
+    fn new(string_delimiter: &'static str) -> Self {
+        Self {
+            string_delimiter,
+            scan_index: 0,
+            depth: 0,
+            in_string: false,
+            started: false,
+        }
+    }
+
+    fn scan(&mut self, input: &str) -> Result<Option<usize>, String> {
+        while self.scan_index < input.len() {
+            let remaining = &input[self.scan_index..];
+            if remaining.starts_with(self.string_delimiter) {
+                self.in_string = !self.in_string;
+                self.scan_index += self.string_delimiter.len();
+                continue;
+            }
+            if self.string_delimiter.starts_with(remaining) {
+                return Ok(None);
+            }
+            let character = remaining
+                .chars()
+                .next()
+                .expect("scan index is before input end");
+            let length = character.len_utf8();
+            if !self.started {
+                if character.is_whitespace() {
+                    self.scan_index += length;
+                    continue;
+                }
+                if character != '{' {
+                    return Err("declarative structural arguments must begin with an object".into());
+                }
+                self.started = true;
+                self.depth = 1;
+                self.scan_index += length;
+                continue;
+            }
+            if !self.in_string {
+                match character {
+                    '{' | '[' => self.depth += 1,
+                    '}' | ']' => {
+                        self.depth = self.depth.checked_sub(1).ok_or_else(|| {
+                            "declarative structural object has an unmatched closing delimiter"
+                                .to_owned()
+                        })?;
+                        self.scan_index += length;
+                        if self.depth == 0 {
+                            return Ok(Some(self.scan_index));
+                        }
+                        continue;
+                    }
+                    _ => {}
+                }
+            }
+            self.scan_index += length;
+        }
+        Ok(None)
+    }
+}
+
+fn parse_structural_object(input: &str, string_delimiter: &str) -> Result<Value, String> {
+    let mut parser = StructuralValueParser {
+        input,
+        position: 0,
+        string_delimiter,
+    };
+    let value = parser.parse_value()?;
+    parser.skip_whitespace();
+    if parser.position != input.len() {
+        return Err("declarative structural object contains trailing data".into());
+    }
+    if !value.is_object() {
+        return Err("declarative structural arguments must be an object".into());
+    }
+    Ok(value)
+}
+
+struct StructuralValueParser<'a> {
+    input: &'a str,
+    position: usize,
+    string_delimiter: &'a str,
+}
+
+impl StructuralValueParser<'_> {
+    fn remaining(&self) -> &str {
+        &self.input[self.position..]
+    }
+
+    fn skip_whitespace(&mut self) {
+        while let Some(character) = self.remaining().chars().next() {
+            if !character.is_whitespace() {
+                break;
+            }
+            self.position += character.len_utf8();
+        }
+    }
+
+    fn consume(&mut self, expected: &str) -> Result<(), String> {
+        self.skip_whitespace();
+        if !self.remaining().starts_with(expected) {
+            return Err(format!(
+                "expected structural JSON delimiter {expected:?} at byte {}",
+                self.position
+            ));
+        }
+        self.position += expected.len();
+        Ok(())
+    }
+
+    fn parse_value(&mut self) -> Result<Value, String> {
+        self.skip_whitespace();
+        if self.remaining().starts_with(self.string_delimiter) {
+            return self.parse_string().map(Value::String);
+        }
+        match self.remaining().chars().next() {
+            Some('{') => self.parse_object(),
+            Some('[') => self.parse_array(),
+            Some(_) => self.parse_scalar(),
+            None => Err("structural JSON value ended unexpectedly".into()),
+        }
+    }
+
+    fn parse_string(&mut self) -> Result<String, String> {
+        self.consume(self.string_delimiter)?;
+        let Some(length) = self.remaining().find(self.string_delimiter) else {
+            return Err("unterminated structural JSON string".into());
+        };
+        let value = self.remaining()[..length].to_owned();
+        self.position += length + self.string_delimiter.len();
+        Ok(value)
+    }
+
+    fn parse_object(&mut self) -> Result<Value, String> {
+        self.consume("{")?;
+        let mut object = serde_json::Map::new();
+        self.skip_whitespace();
+        if self.remaining().starts_with('}') {
+            self.position += 1;
+            return Ok(Value::Object(object));
+        }
+        loop {
+            self.skip_whitespace();
+            let Some(colon) = self.remaining().find(':') else {
+                return Err("structural JSON object key is missing a colon".into());
+            };
+            let key = self.remaining()[..colon].trim();
+            if key.is_empty()
+                || key
+                    .chars()
+                    .any(|character| matches!(character, '{' | '}' | '[' | ']' | ','))
+            {
+                return Err("structural JSON object key is invalid".into());
+            }
+            let key = key.to_owned();
+            self.position += colon + 1;
+            let value = self.parse_value()?;
+            if object.insert(key.clone(), value).is_some() {
+                return Err(format!(
+                    "structural JSON object contains duplicate key {key:?}"
+                ));
+            }
+            self.skip_whitespace();
+            if self.remaining().starts_with('}') {
+                self.position += 1;
+                return Ok(Value::Object(object));
+            }
+            self.consume(",")?;
+        }
+    }
+
+    fn parse_array(&mut self) -> Result<Value, String> {
+        self.consume("[")?;
+        let mut values = Vec::new();
+        self.skip_whitespace();
+        if self.remaining().starts_with(']') {
+            self.position += 1;
+            return Ok(Value::Array(values));
+        }
+        loop {
+            values.push(self.parse_value()?);
+            self.skip_whitespace();
+            if self.remaining().starts_with(']') {
+                self.position += 1;
+                return Ok(Value::Array(values));
+            }
+            self.consume(",")?;
+        }
+    }
+
+    fn parse_scalar(&mut self) -> Result<Value, String> {
+        self.skip_whitespace();
+        let length = self
+            .remaining()
+            .find([',', '}', ']'])
+            .unwrap_or(self.remaining().len());
+        let scalar = self.remaining()[..length].trim();
+        if scalar.is_empty() {
+            return Err("structural JSON scalar is empty".into());
+        }
+        let value: Value = serde_json::from_str(scalar)
+            .map_err(|error| format!("invalid structural JSON scalar {scalar:?}: {error}"))?;
+        if value.is_string() || value.is_array() || value.is_object() {
+            return Err("structural JSON scalar must be null, boolean, or numeric".into());
+        }
+        self.position += length;
+        Ok(value)
     }
 }
 
@@ -890,7 +1510,8 @@ mod tests {
     use super::{
         ConstraintConfiguration, DeclarativeCallId, DeclarativeDialectSpec,
         DeclarativePayloadShape, DelimitedChannel, DialectParameters, ExactEnvelope, FormatDialect,
-        FormatRegistryEntry, GenerationPromptBehavior, ParallelCallLayout, DECLARATIVE_DIALECT,
+        FormatRegistryEntry, GenerationPromptBehavior, ParallelCallLayout,
+        StructuralObjectEncoding, DECLARATIVE_DIALECT,
     };
     use crate::{
         chat::{
@@ -1018,6 +1639,36 @@ mod tests {
         required_structural_tokens: &["[SPECIAL_MARKER]"],
         stop_sequences: &[],
         ..MARKER_JSON_LIST_SPEC
+    };
+
+    const STRUCTURAL_CHANNEL_OBJECT_SPEC: DeclarativeDialectSpec = DeclarativeDialectSpec {
+        generation_prompt_behavior: GenerationPromptBehavior::HonorRequest,
+        output: ExactEnvelope {
+            prefix: "",
+            suffix: "",
+        },
+        call: ExactEnvelope {
+            prefix: "<|tool_call>",
+            suffix: "<tool_call|>",
+        },
+        payload_shape: DeclarativePayloadShape::StructuralObject(StructuralObjectEncoding {
+            name_prefix: "call:",
+            string_delimiter: "<|\"|>",
+        }),
+        name_field: "",
+        arguments_field: "",
+        call_id: None,
+        reasoning_channel: Some(DelimitedChannel {
+            prefix: "<|channel>thought\n",
+            suffix: "<channel|>",
+        }),
+        text_channel: None,
+        raw_text_before_calls: true,
+        call_separator: "",
+        parallel_layout: ParallelCallLayout::RepeatedEnvelopes,
+        auto_activation_trigger: Some("<|tool_call>"),
+        required_structural_tokens: &[],
+        stop_sequences: &["<|tool_response>", "<turn|>"],
     };
 
     fn tool(name: &str) -> Value {
@@ -1200,6 +1851,126 @@ mod tests {
                         if text.contains("<tool_call>") || text.contains("</tool_call>")
                 )),
                 "protocol markers leaked at split {split}"
+            );
+        }
+    }
+
+    #[test]
+    fn structural_channel_objects_are_generic_constrained_and_split_independent() {
+        let rich_tool = json!({
+            "type": "function",
+            "function": {
+                "name": "lookup-place",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "count": {"type": "integer"},
+                        "enabled": {"type": "boolean"},
+                        "place": {
+                            "type": "string",
+                            "enum": ["Bogotá", "東京"]
+                        },
+                        "tags": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "maxItems": 2
+                        }
+                    },
+                    "required": ["count", "enabled", "place"],
+                    "additionalProperties": false
+                }
+            }
+        });
+        let plan = ConstraintCompiler::synthetic_for_tests()
+            .compile_tool_plan(
+                &DECLARATIVE_DIALECT,
+                DialectParameters::Declarative(&STRUCTURAL_CHANNEL_OBJECT_SPEC),
+                &[rich_tool],
+                ToolChoice::Required,
+                ParallelToolCallPolicy::Enabled {
+                    max_calls: std::num::NonZeroUsize::new(2),
+                },
+                Vec::new(),
+            )
+            .unwrap();
+        let output = concat!(
+            "<|channel>thought\nNeed 🦀 context<channel|>",
+            "<|tool_call>call:lookup-place{count:2,enabled:true,place:<|\"|>Bogotá<|\"|>,",
+            "tags:[<|\"|>東京<|\"|>,<|\"|>quote: \" and slash \\\\<|\"|>]}<tool_call|>",
+            "<|tool_call>call:lookup-place{count:1,enabled:false,place:<|\"|>東京<|\"|>}",
+            "<tool_call|><|tool_response>",
+        );
+        let grammar_output = output
+            .strip_suffix("<|tool_response>")
+            .expect("profile stop is not part of the grammar");
+        if !accepts(&plan, grammar_output) {
+            let mut state = plan.generation_constraint().grammar_state();
+            for (index, byte) in grammar_output.bytes().enumerate() {
+                state
+                    .commit(byte as TokenId)
+                    .unwrap_or_else(|error| panic!("rejected byte {index}: {error}"));
+            }
+            panic!("structural grammar did not accept its completed output");
+        }
+        for invalid in [
+            "<|tool_call>call:unknown{count:1,enabled:true,place:<|\"|>東京<|\"|>}<tool_call|>",
+            "<|tool_call>call:lookup-place{count:<|\"|>one<|\"|>,enabled:true,place:<|\"|>東京<|\"|>}<tool_call|>",
+            concat!(
+                "<|tool_call>call:lookup-place{count:1,enabled:true,place:<|\"|>東京<|\"|>}",
+                "<tool_call|><|tool_call>call:lookup-place{count:2,enabled:true,place:<|\"|>東京<|\"|>}",
+                "<tool_call|><|tool_call>call:lookup-place{count:3,enabled:true,place:<|\"|>東京<|\"|>}<tool_call|>"
+            ),
+        ] {
+            assert!(!accepts(&plan, invalid), "{invalid}");
+        }
+        assert_eq!(plan.auto_activation_trigger(), None);
+
+        for split in 0..=output.len() {
+            let mut parser = plan.create_parser().unwrap();
+            push_at_byte_split(&mut parser, output, split);
+            assert_eq!(
+                event_text(parser.events(), true),
+                "Need 🦀 context",
+                "split {split}"
+            );
+            let protocol_events = parser
+                .events()
+                .iter()
+                .filter(|event| !matches!(event, SemanticEvent::ReasoningDelta(_)))
+                .cloned()
+                .collect::<Vec<_>>();
+            assert_eq!(
+                protocol_events,
+                [
+                    SemanticEvent::ToolCallStart {
+                        index: 0,
+                        id: "call_0".into(),
+                        name: "lookup-place".into(),
+                    },
+                    SemanticEvent::ToolArgumentsDelta {
+                        index: 0,
+                        json_fragment: concat!(
+                            r#"{"count":2,"enabled":true,"place":"Bogotá","tags":["東京","#,
+                            r#""quote: \" and slash \\\\"]}"#
+                        )
+                        .into(),
+                    },
+                    SemanticEvent::ToolCallEnd,
+                    SemanticEvent::ToolCallStart {
+                        index: 1,
+                        id: "call_1".into(),
+                        name: "lookup-place".into(),
+                    },
+                    SemanticEvent::ToolArgumentsDelta {
+                        index: 1,
+                        json_fragment: r#"{"count":1,"enabled":false,"place":"東京"}"#.into(),
+                    },
+                    SemanticEvent::ToolCallEnd,
+                    SemanticEvent::Finished {
+                        reason: FinishReason::StopSequence,
+                    },
+                ],
+                "split {split}"
             );
         }
     }

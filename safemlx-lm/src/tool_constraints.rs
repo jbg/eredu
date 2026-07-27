@@ -233,9 +233,9 @@ impl GenerationConstraint {
 }
 
 #[derive(Debug)]
-struct ToolDefinition {
-    name: String,
-    parameters: Value,
+pub(crate) struct ToolDefinition {
+    pub(crate) name: String,
+    pub(crate) parameters: Value,
 }
 
 pub(crate) fn tool_call_bounds(
@@ -322,7 +322,7 @@ pub(crate) fn tool_call_schema(
     Ok(item_schema)
 }
 
-fn parse_tools(tools: &[Value]) -> Result<Vec<ToolDefinition>, String> {
+pub(crate) fn parse_tools(tools: &[Value]) -> Result<Vec<ToolDefinition>, String> {
     let mut names = HashSet::new();
     tools
         .iter()
