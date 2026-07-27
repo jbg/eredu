@@ -22,6 +22,10 @@ support key.
 | `gpt-oss-harmony-a4c9919c.jinja` | `openai/gpt-oss-20b` | `6cee5e81ee83917806bbde320786a8fb61efebee` | `chat_template.jinja` |
 | `gpt-oss-harmony-b474759b.jinja` | `openai/gpt-oss-20b` | `10e9d713f8e4a9281c59c40be6c58537480635ea` | `chat_template.jinja` |
 | `gpt-oss-harmony-f8d92557.jinja` | `openai/gpt-oss-20b` | `ec854da5735f125fe36f080d8013482590f9ad7d` | `chat_template.jinja` |
+| `lfm2-classic-b3afba27.jinja` | `LiquidAI/LFM2-350M` | `b3afba27815ee83a64b76162cef4d8a4780d6ca7` | `chat_template.jinja` |
+| `lfm2-classic-compact-6d24c6b7.jinja` | `LiquidAI/LFM2-1.2B-Tool` | `6d24c6b7471fcbcec084935e377a5302f4b84389` | `chat_template.jinja` |
+| `lfm2.5-8b-a1b-5673e0de.jinja` | `LiquidAI/LFM2.5-8B-A1B` | `5673e0de372b64331504de73bbbc33b0dde71903` | `chat_template.jinja` |
+| `lfm2.5-vl-450m-fc6221ca.jinja` | `LiquidAI/LFM2.5-VL-450M` | `fc6221ca597f3315e4f82fc2df606783267b34ba` | `chat_template.jinja` |
 
 The Hermes fixture body is also byte-identical to the named `tool_use`
 template in `NousResearch/Hermes-3-Llama-3.1-8B` revision
@@ -70,3 +74,18 @@ the repository name participates in selection.
 The upstream GPT-OSS bodies do not end in a line feed, so these fixtures carry
 one repository file terminator that signature and rendering tests remove
 explicitly.
+
+The classic LFM2 body is byte-identical in the current official 350M, 700M,
+and 1.2B releases. The compact body is byte-identical in the current official
+1.2B-Tool, 2.6B, and 8B-A1B releases. The four upstream LFM2 bodies do not end
+in a line feed, so their fixtures carry one repository file terminator that
+signature and rendering tests remove explicitly.
+
+These released templates establish a Python-call list between
+`<|tool_call_start|>` and `<|tool_call_end|>`. The LFM2.5 render macros emit
+calls such as `name(argument='value')`; non-string values use Python spelling,
+while nested mappings are rendered through `tojson`. This is intentionally a
+custom dialect: the declarative dialects only admit JSON objects, JSON lists,
+or their fixed structural-object encoding and cannot safely describe Python
+identifiers, keyword arguments, single-quoted strings, `True`/`False`/`None`,
+or the released mixed Python/JSON nested value surface.

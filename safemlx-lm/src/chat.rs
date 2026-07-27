@@ -25,6 +25,7 @@ use crate::{
         DialectParameters, FormatDialect, FormatRegistryEntry, GenerationPromptBehavior,
     },
     harmony_format::{GPT_OSS_HARMONY_PARAMETERS, HARMONY_DIALECT},
+    lfm2_format::{LFM2_DIALECT, LFM2_PARAMETERS},
     streaming::ToolRuntimeParser,
     tool_constraints::ConstraintBlueprint,
 };
@@ -544,6 +545,22 @@ const GPT_OSS_HARMONY_INITIAL_TEMPLATE_SIGNATURE: [u8; 32] = [
     0xf8, 0xd9, 0x25, 0x57, 0x77, 0x61, 0x55, 0x91, 0xa7, 0xcc, 0x1a, 0x7c, 0x93, 0x2f, 0x5a, 0x69,
     0xe1, 0x81, 0x12, 0x89, 0x02, 0x29, 0x5e, 0x1b, 0x81, 0x22, 0x1d, 0x20, 0xd9, 0x83, 0xca, 0xc7,
 ];
+const LFM2_CLASSIC_TEMPLATE_SIGNATURE: [u8; 32] = [
+    0xce, 0xf1, 0x87, 0x40, 0x0d, 0x62, 0xa5, 0x95, 0x07, 0xaa, 0xb3, 0xa6, 0x42, 0xea, 0x9a, 0x8d,
+    0x2a, 0x2e, 0xf2, 0x63, 0x56, 0x2b, 0xc3, 0x43, 0x05, 0x60, 0xe1, 0x16, 0x94, 0x52, 0x73, 0xcf,
+];
+const LFM2_CLASSIC_COMPACT_TEMPLATE_SIGNATURE: [u8; 32] = [
+    0x89, 0xe7, 0x90, 0xf0, 0x27, 0x91, 0x6b, 0x5a, 0x2b, 0xca, 0x14, 0x5a, 0x6a, 0x84, 0x54, 0xe0,
+    0x6f, 0xfc, 0x7a, 0x50, 0x43, 0xbf, 0x3b, 0x6d, 0x97, 0x82, 0x9a, 0xff, 0x86, 0xbb, 0x54, 0x3f,
+];
+const LFM25_8B_TEMPLATE_SIGNATURE: [u8; 32] = [
+    0x6d, 0x65, 0xc8, 0x80, 0x48, 0x47, 0xad, 0x74, 0xee, 0xa9, 0x12, 0xdd, 0x7e, 0xca, 0x3d, 0xc1,
+    0xcf, 0x7a, 0x45, 0x7b, 0x53, 0xa7, 0x7f, 0x47, 0xd8, 0x41, 0xa1, 0x41, 0x21, 0x91, 0x09, 0x63,
+];
+const LFM25_VL_TEMPLATE_SIGNATURE: [u8; 32] = [
+    0x30, 0x9e, 0x58, 0x6e, 0x2e, 0xda, 0x3d, 0x7f, 0x2d, 0xb1, 0xe2, 0xa0, 0x45, 0xbf, 0xb0, 0x7f,
+    0x4c, 0x83, 0x79, 0x8b, 0x23, 0xf7, 0xac, 0x58, 0x79, 0x54, 0x42, 0x63, 0x02, 0xd5, 0x08, 0xe9,
+];
 
 const GEMMA4_STRUCTURAL_TOOL_SPEC: DeclarativeDialectSpec = DeclarativeDialectSpec {
     generation_prompt_behavior: GenerationPromptBehavior::HonorRequest,
@@ -706,6 +723,30 @@ const FORMAT_REGISTRY: &[FormatRegistryEntry] = &[
         template_signature: GPT_OSS_HARMONY_INITIAL_TEMPLATE_SIGNATURE,
         dialect: &HARMONY_DIALECT,
         parameters: DialectParameters::Custom(&GPT_OSS_HARMONY_PARAMETERS),
+    },
+    FormatRegistryEntry {
+        identity: "liquid.lfm2.python-tools.cef18740",
+        template_signature: LFM2_CLASSIC_TEMPLATE_SIGNATURE,
+        dialect: &LFM2_DIALECT,
+        parameters: DialectParameters::Custom(&LFM2_PARAMETERS),
+    },
+    FormatRegistryEntry {
+        identity: "liquid.lfm2.python-tools.89e790f0",
+        template_signature: LFM2_CLASSIC_COMPACT_TEMPLATE_SIGNATURE,
+        dialect: &LFM2_DIALECT,
+        parameters: DialectParameters::Custom(&LFM2_PARAMETERS),
+    },
+    FormatRegistryEntry {
+        identity: "liquid.lfm2.5.python-tools.6d65c880",
+        template_signature: LFM25_8B_TEMPLATE_SIGNATURE,
+        dialect: &LFM2_DIALECT,
+        parameters: DialectParameters::Custom(&LFM2_PARAMETERS),
+    },
+    FormatRegistryEntry {
+        identity: "liquid.lfm2.5-vl.python-tools.309e586e",
+        template_signature: LFM25_VL_TEMPLATE_SIGNATURE,
+        dialect: &LFM2_DIALECT,
+        parameters: DialectParameters::Custom(&LFM2_PARAMETERS),
     },
     #[cfg(test)]
     FormatRegistryEntry {
@@ -873,6 +914,8 @@ mod tests {
         GEMMA4_EDGE_TEMPLATE_SIGNATURE, GEMMA4_LARGE_TEMPLATE_SIGNATURE,
         GPT_OSS_HARMONY_CURRENT_TEMPLATE_SIGNATURE, GPT_OSS_HARMONY_ESCAPED_TEMPLATE_SIGNATURE,
         GPT_OSS_HARMONY_INITIAL_TEMPLATE_SIGNATURE, HERMES2_PRO_TOOL_USE_TEMPLATE_SIGNATURE,
+        LFM25_8B_TEMPLATE_SIGNATURE, LFM25_VL_TEMPLATE_SIGNATURE,
+        LFM2_CLASSIC_COMPACT_TEMPLATE_SIGNATURE, LFM2_CLASSIC_TEMPLATE_SIGNATURE,
         LLAMA31_33_TEMPLATE_SIGNATURE, LLAMA32_TEMPLATE_SIGNATURE, LLAMA4_TEMPLATE_SIGNATURE,
         MINISTRAL8_2410_TEMPLATE_SIGNATURE, MISTRAL7_V03_TEMPLATE_SIGNATURE,
         NEMOTRON_NANO_TEMPLATE_SIGNATURE, QWEN25_TEMPLATE_SIGNATURE,
@@ -915,6 +958,14 @@ mod tests {
         include_str!("../tests/fixtures/chat_templates/gpt-oss-harmony-b474759b.jinja");
     const GPT_OSS_HARMONY_INITIAL_FIXTURE_WITH_TERMINATOR: &str =
         include_str!("../tests/fixtures/chat_templates/gpt-oss-harmony-f8d92557.jinja");
+    const LFM2_CLASSIC_FIXTURE_WITH_TERMINATOR: &str =
+        include_str!("../tests/fixtures/chat_templates/lfm2-classic-b3afba27.jinja");
+    const LFM2_CLASSIC_COMPACT_FIXTURE_WITH_TERMINATOR: &str =
+        include_str!("../tests/fixtures/chat_templates/lfm2-classic-compact-6d24c6b7.jinja");
+    const LFM25_8B_FIXTURE_WITH_TERMINATOR: &str =
+        include_str!("../tests/fixtures/chat_templates/lfm2.5-8b-a1b-5673e0de.jinja");
+    const LFM25_VL_FIXTURE_WITH_TERMINATOR: &str =
+        include_str!("../tests/fixtures/chat_templates/lfm2.5-vl-450m-fc6221ca.jinja");
 
     #[test]
     fn registry_does_not_guess_unknown_templates() {
@@ -1179,6 +1230,56 @@ mod tests {
             .is_none());
         assert!(
             prepare_format_profile("{{ messages }} generic GPT-OSS architecture template")
+                .dialect
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn lfm2_released_templates_have_exact_custom_dialect_registrations() {
+        let fixtures = [
+            (
+                LFM2_CLASSIC_FIXTURE_WITH_TERMINATOR,
+                LFM2_CLASSIC_TEMPLATE_SIGNATURE,
+                "liquid.lfm2.python-tools.cef18740",
+            ),
+            (
+                LFM2_CLASSIC_COMPACT_FIXTURE_WITH_TERMINATOR,
+                LFM2_CLASSIC_COMPACT_TEMPLATE_SIGNATURE,
+                "liquid.lfm2.python-tools.89e790f0",
+            ),
+            (
+                LFM25_8B_FIXTURE_WITH_TERMINATOR,
+                LFM25_8B_TEMPLATE_SIGNATURE,
+                "liquid.lfm2.5.python-tools.6d65c880",
+            ),
+            (
+                LFM25_VL_FIXTURE_WITH_TERMINATOR,
+                LFM25_VL_TEMPLATE_SIGNATURE,
+                "liquid.lfm2.5-vl.python-tools.309e586e",
+            ),
+        ];
+
+        for (fixture, signature, identity) in fixtures {
+            let template = fixture
+                .strip_suffix('\n')
+                .expect("the fixture-only file terminator is documented");
+            assert_eq!(template_signature(template), signature, "{identity}");
+            let prepared = prepare_format_profile(template);
+            assert_eq!(prepared.identity.as_deref(), Some(identity));
+            assert!(prepared.dialect.is_some(), "{identity}");
+            assert_eq!(
+                prepared.required_structural_tokens,
+                ["<|tool_call_start|>", "<|tool_call_end|>", "<|im_end|>"]
+            );
+            assert_eq!(prepared.stop_sequences, ["<|tool_call_end|>", "<|im_end|>"]);
+            assert!(prepare_format_profile(&format!("{template} "))
+                .dialect
+                .is_none());
+        }
+
+        assert!(
+            prepare_format_profile("{{ messages }} generic LiquidAI LFM2 template")
                 .dialect
                 .is_none()
         );

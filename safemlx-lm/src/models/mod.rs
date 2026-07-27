@@ -4330,10 +4330,11 @@ const GEMMA4_TEXT_TEMPLATE: &str = r#"<bos>{% for message in messages %}{% set r
 mod tests {
     use super::{
         chat_template_kwargs, check_model_config, check_model_config_json, check_model_dir,
-        eos_token_ids_from_sidecar_dir, gguf_eos_token_ids, load_chat_template,
-        load_model_with_options, load_tokenizer, load_tokenizer_template_kwargs,
-        merge_eos_token_id_sources, prepare_chat_from_parts, validate_gguf_quantization_source,
-        with_prepared_chat_runtime, LoadedModel, ModelLoadOptions,
+        eos_token_ids_from_sidecar_dir, gguf_eos_token_ids, inspect_chat_template_kwargs,
+        load_chat_template, load_model_with_options, load_tokenizer,
+        load_tokenizer_template_kwargs, merge_eos_token_id_sources, prepare_chat_from_parts,
+        validate_gguf_quantization_source, with_prepared_chat_runtime, LoadedModel,
+        ModelLoadOptions,
     };
     use crate::{
         chat::{
@@ -4393,6 +4394,12 @@ mod tests {
         include_str!("../../tests/fixtures/chat_templates/gemma-4-26b-a4b-it-4d7ae498.jinja");
     const GPT_OSS_HARMONY_CURRENT_FIXTURE_WITH_TERMINATOR: &str =
         include_str!("../../tests/fixtures/chat_templates/gpt-oss-harmony-a4c9919c.jinja");
+    const LFM2_CLASSIC_FIXTURE_WITH_TERMINATOR: &str =
+        include_str!("../../tests/fixtures/chat_templates/lfm2-classic-b3afba27.jinja");
+    const LFM25_8B_FIXTURE_WITH_TERMINATOR: &str =
+        include_str!("../../tests/fixtures/chat_templates/lfm2.5-8b-a1b-5673e0de.jinja");
+    const LFM25_VL_FIXTURE_WITH_TERMINATOR: &str =
+        include_str!("../../tests/fixtures/chat_templates/lfm2.5-vl-450m-fc6221ca.jinja");
 
     #[test]
     #[ignore = "requires MLX runtime execution and SAFEMLX_INSPECTION_MODEL_DIR"]
@@ -4602,6 +4609,30 @@ mod tests {
             7
         );
         ChatTokenizer::from_tokenizer(raw)
+    }
+
+    fn lfm2_chat_tokenizer(preceding_tokens: usize) -> ChatTokenizer {
+        let mut raw = Tokenizer::new(WordLevel::default());
+        raw.add_tokens(
+            (0..preceding_tokens)
+                .map(|index| AddedToken::from(format!("ordinary_{index}"), false))
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        assert_eq!(
+            raw.add_special_tokens(
+                ["<|tool_call_start|>", "<|tool_call_end|>", "<|im_end|>"]
+                    .map(|token| AddedToken::from(token, true).normalized(false))
+            )
+            .unwrap(),
+            3
+        );
+        let mut tokenizer = ChatTokenizer::from_tokenizer(raw);
+        tokenizer.set_template_kwargs(serde_json::Map::from_iter([(
+            "bos_token".into(),
+            json!("<|startoftext|>"),
+        )]));
+        tokenizer
     }
 
     fn production_tool(name: &str) -> serde_json::Value {
@@ -5626,6 +5657,118 @@ mod tests {
             panic!("exact GPT-OSS template signature must prepare Harmony");
         };
         assert_eq!(plan.auto_activation_trigger(), None);
+    }
+
+    #[test]
+    fn production_lfm2_templates_render_tools_prior_calls_and_results() {
+        let compiler = Ok(ConstraintCompiler::synthetic_for_tests());
+        let tools = vec![production_tool("lookup")];
+
+        let mut current_tokenizer = lfm2_chat_tokenizer(41);
+        let current_template = LFM25_8B_FIXTURE_WITH_TERMINATOR
+            .strip_suffix('\n')
+            .expect("the fixture-only file terminator is documented");
+        inspect_chat_template_kwargs(current_template, "lfm2.5-8b").unwrap();
+        let vl_template = LFM25_VL_FIXTURE_WITH_TERMINATOR
+            .strip_suffix('\n')
+            .expect("the fixture-only file terminator is documented");
+        inspect_chat_template_kwargs(vl_template, "lfm2.5-vl").unwrap();
+        let current = prepare_chat_from_parts(
+            &mut current_tokenizer,
+            ModelChatTemplate::Single(current_template.into()),
+            "architecture-metadata-must-not-select-lfm2",
+            &[43],
+            Some(&compiler),
+            ChatTemplateRequest {
+                messages: vec![
+                    json!({"role": "system", "content": "Be exact."}),
+                    json!({"role": "user", "content": "Look it up."}),
+                    json!({
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": [{
+                            "type": "function",
+                            "function": {
+                                "name": "lookup",
+                                "arguments": {"value": 7}
+                            }
+                        }]
+                    }),
+                    json!({"role": "tool", "content": "{\"result\":\"Bogotá\"}"}),
+                ],
+                tools: tools.clone(),
+                tool_choice: ToolChoice::Required,
+                add_generation_prompt: true,
+                ..ChatTemplateRequest::default()
+            },
+        )
+        .unwrap();
+
+        assert!(current.rendered_prompt().contains("List of tools: ["));
+        assert!(current.rendered_prompt().contains("\"name\":\"lookup\""));
+        assert!(current.rendered_prompt().contains(concat!(
+            "<|im_start|>assistant\n",
+            "<|tool_call_start|>[lookup(value=7)]<|tool_call_end|>",
+            "<|im_end|>\n",
+            "<|im_start|>tool\n",
+            "{\"result\":\"Bogotá\"}<|im_end|>\n",
+            "<|im_start|>assistant\n"
+        )));
+        assert_eq!(
+            current.format_profile_identity(),
+            Some("liquid.lfm2.5.python-tools.6d65c880")
+        );
+        assert_eq!(current.preserved_structural_token_ids(), &[41, 42, 43]);
+        assert_eq!(
+            current.profile_stop_sequences(),
+            ["<|tool_call_end|>", "<|im_end|>"]
+        );
+        let NativeToolSupport::Supported(plan) = current.native_tool_support() else {
+            panic!("exact LFM2.5 template signature must prepare Python tools");
+        };
+        assert_eq!(plan.auto_activation_trigger(), None);
+
+        let mut classic_tokenizer = lfm2_chat_tokenizer(51);
+        let classic_template = LFM2_CLASSIC_FIXTURE_WITH_TERMINATOR
+            .strip_suffix('\n')
+            .expect("the fixture-only file terminator is documented");
+        let classic = prepare_chat_from_parts(
+            &mut classic_tokenizer,
+            ModelChatTemplate::Single(classic_template.into()),
+            "architecture-metadata-must-not-select-lfm2",
+            &[53],
+            Some(&compiler),
+            ChatTemplateRequest {
+                messages: vec![
+                    json!({"role": "user", "content": "Look it up."}),
+                    json!({
+                        "role": "assistant",
+                        "content": "<|tool_call_start|>[lookup(value=7)]<|tool_call_end|>"
+                    }),
+                    json!({"role": "tool", "content": "{\"result\":\"Bogotá\"}"}),
+                ],
+                tools,
+                tool_choice: ToolChoice::Auto,
+                add_generation_prompt: true,
+                ..ChatTemplateRequest::default()
+            },
+        )
+        .unwrap();
+        assert!(classic
+            .rendered_prompt()
+            .contains("List of tools: <|tool_list_start|>["));
+        assert!(classic.rendered_prompt().contains(concat!(
+            "<|im_start|>assistant\n",
+            "<|tool_call_start|>[lookup(value=7)]<|tool_call_end|><|im_end|>\n",
+            "<|im_start|>tool\n",
+            "<|tool_response_start|>{\"result\":\"Bogotá\"}<|tool_response_end|>",
+            "<|im_end|>\n",
+            "<|im_start|>assistant\n"
+        )));
+        let NativeToolSupport::Supported(plan) = classic.native_tool_support() else {
+            panic!("exact classic LFM2 template signature must prepare Python tools");
+        };
+        assert_eq!(plan.auto_activation_trigger(), Some("<|tool_call_start|>"));
     }
 
     #[test]

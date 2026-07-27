@@ -53,6 +53,7 @@ pub mod inspection;
 pub mod layerwise;
 /// Unified fully resident and bounded layer execution for LFM2/LFM2.5.
 pub mod lfm2;
+mod lfm2_format;
 /// Unified Llama/Mistral loading across weight-residency policies.
 pub mod llama;
 /// Canonical unloaded-module checkpoint binding and resident assignment helpers.

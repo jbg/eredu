@@ -473,7 +473,8 @@ pub fn chat_template_variables(
 ) -> Result<BTreeSet<String>, Error> {
     let mut env = Environment::new();
     env.set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);
-    env.add_template_owned(model_id.to_owned(), model_template.to_owned())?;
+    let compatible_template = normalize_generation_blocks(model_template);
+    env.add_template_owned(model_id.to_owned(), compatible_template)?;
     let template = env.get_template(model_id)?;
     Ok(template.undeclared_variables(false).into_iter().collect())
 }
@@ -489,7 +490,8 @@ pub fn chat_template_kwargs(
 ) -> Result<BTreeSet<String>, Error> {
     let mut env = Environment::new();
     env.set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);
-    env.add_template_owned(model_id.to_owned(), model_template.to_owned())?;
+    let compatible_template = normalize_generation_blocks(model_template);
+    env.add_template_owned(model_id.to_owned(), compatible_template)?;
     let template = env.get_template(model_id)?;
     let globals = env
         .globals()
@@ -800,10 +802,8 @@ where
             match env.get_template(&selected_template_id) {
                 Ok(template) => template,
                 Err(_) => {
-                    env.add_template_owned(
-                        selected_template_id.clone(),
-                        selected.template().to_owned(),
-                    )?;
+                    let compatible_template = normalize_generation_blocks(selected.template());
+                    env.add_template_owned(selected_template_id.clone(), compatible_template)?;
                     env.get_template(&selected_template_id)
                         .expect("Newly added template must be present")
                 }
@@ -825,6 +825,33 @@ where
             overrides: template_kwargs,
         },
     )
+}
+
+/// MiniJinja does not assign semantics to Transformers' assistant-token
+/// tracking block. Rendering without an assistant mask treats it as a
+/// transparent block while preserving the template's whitespace controls.
+fn normalize_generation_blocks(template: &str) -> String {
+    let mut output = String::with_capacity(template.len());
+    let mut remaining = template;
+    while let Some(start) = remaining.find("{%") {
+        output.push_str(&remaining[..start]);
+        let statement = &remaining[start..];
+        let Some(end) = statement.find("%}") else {
+            output.push_str(statement);
+            return output;
+        };
+        let end = end + 2;
+        let tag = &statement[..end];
+        let body = tag[2..tag.len() - 2].trim().trim_matches('-').trim();
+        match body {
+            "generation" => output.push_str(&tag.replacen("generation", "if true", 1)),
+            "endgeneration" => output.push_str(&tag.replacen("endgeneration", "endif", 1)),
+            _ => output.push_str(tag),
+        }
+        remaining = &statement[end..];
+    }
+    output.push_str(remaining);
+    output
 }
 
 // TODO: render with assistant indices
@@ -929,12 +956,12 @@ where
 #[cfg(test)]
 mod tests {
     use minijinja::Environment;
-    use std::path::PathBuf;
+    use std::{collections::BTreeSet, path::PathBuf};
 
     use crate::tokenizer::{
         apply_chat_template, apply_chat_template_json, load_model_chat_template_from_file,
-        load_model_chat_template_from_str, ApplyChatTemplateArgs, ChatTemplateIdentity,
-        Conversation, Role,
+        load_model_chat_template_from_str, normalize_generation_blocks, ApplyChatTemplateArgs,
+        ChatTemplateIdentity, Conversation, Role,
     };
 
     /// Returns the path to test fixtures. Uses TEST_MODEL_DIR env var if set,
@@ -945,6 +972,35 @@ mod tests {
             .unwrap_or_else(|_| {
                 PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/qwen3")
             })
+    }
+
+    #[test]
+    fn generation_blocks_become_transparent_minijinja_blocks() {
+        assert_eq!(
+            normalize_generation_blocks(
+                "before{%- generation -%}assistant{%- endgeneration -%}after"
+            ),
+            "before{%- if true -%}assistant{%- endif -%}after"
+        );
+        assert_eq!(
+            normalize_generation_blocks("{% generation %}{{ generation }}{% endgeneration %}"),
+            "{% if true %}{{ generation }}{% endif %}"
+        );
+    }
+
+    #[test]
+    fn generation_blocks_are_transparent_to_template_kwarg_analysis() {
+        let kwargs = super::chat_template_kwargs(
+            concat!(
+                "{% generation %}",
+                "{{ messages }}{{ custom_flag }}",
+                "{% endgeneration %}"
+            ),
+            "generation-block-template",
+        )
+        .unwrap();
+
+        assert_eq!(kwargs, BTreeSet::from(["custom_flag".to_owned()]));
     }
 
     #[test]
