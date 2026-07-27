@@ -45,6 +45,17 @@ pub trait SpeculativeSampler {
         Ok(false)
     }
 
+    /// Returns whether the generation grammar accepts `history` as a complete
+    /// logical prefix without committing it.
+    ///
+    /// Speculative schedulers use this query while drafting so a proposal block
+    /// stops at the same grammar boundary as canonical generation. The supplied
+    /// history always includes the sampler's committed prefix. Unconstrained
+    /// samplers keep the default `false`.
+    fn prefix_is_complete(&self, _history: &[u32]) -> Result<bool, Exception> {
+        Ok(false)
+    }
+
     /// Applies penalties, filters, and temperature using the supplied logical
     /// token history, returning canonical-vocabulary logits.
     fn process_logits(
@@ -350,11 +361,22 @@ impl<S: Clone> ConstrainedSampler<S> {
 
 impl<S: SpeculativeSampler + Clone> SpeculativeSampler for ConstrainedSampler<S> {
     fn supports_exact_optimistic_promotion(&self) -> bool {
+        // Constraint processing below reconstructs a private runtime from the
+        // durable prefix and supplied history. That fork is pure and
+        // discardable, so exact promotion is limited only by the wrapped
+        // policy's capability.
         self.policy.supports_exact_optimistic_promotion()
     }
 
     fn grammar_is_complete(&mut self) -> Result<bool, Exception> {
         ConstrainedSampler::grammar_is_complete(self)
+    }
+
+    fn prefix_is_complete(&self, history: &[u32]) -> Result<bool, Exception> {
+        match &mut self.runtime_at(history)? {
+            ConstraintRuntime::Active(grammar) => grammar.is_complete().map_err(constraint_error),
+            ConstraintRuntime::Disabled | ConstraintRuntime::Auto { .. } => Ok(false),
+        }
     }
 
     fn process_logits(
@@ -1094,7 +1116,8 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        ConstrainedSampler, GenerationSampler, MirostatV2Sampler, Sampler, SpeculativeSampler,
+        ConstrainedSampler, DefaultSampler, GenerationSampler, MirostatV2Sampler, Sampler,
+        SpeculativeSampler,
     };
     use crate::{
         chat::{ParallelToolCallPolicy, ToolChoice, ToolRuntimePlan},
@@ -1339,6 +1362,17 @@ mod tests {
     }
 
     #[test]
+    fn constrained_sampler_advertises_only_wrapped_exact_promotion() {
+        let plan = synthetic_plan(ToolChoice::Required);
+        let exact = ConstrainedSampler::from_tool_plan(DefaultSampler, &plan).unwrap();
+        let adaptive =
+            ConstrainedSampler::from_tool_plan(MirostatV2Sampler::default(), &plan).unwrap();
+
+        assert!(exact.supports_exact_optimistic_promotion());
+        assert!(!adaptive.supports_exact_optimistic_promotion());
+    }
+
+    #[test]
     fn none_disables_constraints_from_the_first_token() {
         let context = test_context();
         let stream = context.stream();
@@ -1408,6 +1442,29 @@ mod tests {
 
         assert_eq!(selected.item::<u32>(stream), u32::from(b'['));
         assert!(!sampler.constraint_is_active());
+        assert!(!sampler
+            .prefix_is_complete(
+                &COMPLETE_CALL[..COMPLETE_CALL.len() - 1]
+                    .iter()
+                    .copied()
+                    .map(u32::from)
+                    .collect::<Vec<_>>()
+            )
+            .unwrap());
+        assert!(sampler
+            .prefix_is_complete(
+                &COMPLETE_CALL
+                    .iter()
+                    .copied()
+                    .map(u32::from)
+                    .collect::<Vec<_>>()
+            )
+            .unwrap());
+        assert!(
+            !sampler.constraint_is_active(),
+            "history-relative queries must not activate canonical grammar state"
+        );
+        assert!(sampler.policy().generated_tokens().is_empty());
     }
 
     #[test]

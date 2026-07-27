@@ -663,14 +663,7 @@ enum OptimisticBonusTransition<D> {
     MatchedRetained(DraftBlock<D>),
     MatchedConsumed,
     Mismatched,
-    TerminalEos,
-    TerminalMaxTokens,
-}
-
-#[derive(Clone, Copy)]
-enum BonusTerminal {
-    Eos,
-    MaxTokens,
+    Terminal,
 }
 
 struct ScheduledRequest<'a, B: MtpBackend, S> {
@@ -814,11 +807,6 @@ where
     where
         F: FnMut(SemanticEvent) + 'a,
     {
-        if self.options.lookahead_blocks != 0 {
-            return Err(Exception::custom(
-                "semantic MTP generation requires optimistic lookahead to be disabled",
-            ));
-        }
         self.submit_runtime(
             cache,
             input,
@@ -1035,7 +1023,7 @@ where
                             .as_ref()
                             .is_some_and(|flight| flight.optimistic.is_none())
                 }) {
-                    if self.can_optimistically_draft(index) {
+                    if self.can_optimistically_draft(index)? {
                         self.draft_optimistic(index)?;
                         return Ok(true);
                     }
@@ -1276,19 +1264,26 @@ where
         Ok(())
     }
 
-    fn can_optimistically_draft(&self, index: usize) -> bool {
+    fn can_optimistically_draft(&self, index: usize) -> Result<bool, Exception> {
         let request = &self.requests[index];
         let Some(flight) = request.in_flight.as_ref() else {
-            return false;
+            return Ok(false);
         };
         let assumed_len = request.runtime.token_ids.len() + flight.block.proposals.len();
-        self.backend.supports_exact_optimistic_promotion()
+        let mut assumed_prefix = Vec::with_capacity(assumed_len);
+        assumed_prefix.extend_from_slice(&request.runtime.token_ids);
+        assumed_prefix.extend(flight.block.proposals.iter().map(|proposal| proposal.token));
+        Ok(self.backend.supports_exact_optimistic_promotion()
             && request
                 .runtime
                 .sampler
                 .supports_exact_optimistic_promotion()
             && !request.stats.adaptive_lookahead_disabled
             && !flight.block.proposals.is_empty()
+            && !request
+                .runtime
+                .sampler
+                .prefix_is_complete(&assumed_prefix)?
             && !flight
                 .block
                 .proposals
@@ -1298,7 +1293,7 @@ where
                 })
             // One remaining output slot is reserved for the target bonus. With
             // no slot after it, lookahead cannot retain useful continuation.
-            && request.config.max_tokens.saturating_sub(assumed_len) > 1
+            && request.config.max_tokens.saturating_sub(assumed_len) > 1)
     }
 
     fn draft_optimistic(&mut self, index: usize) -> Result<(), Exception> {
@@ -1527,24 +1522,13 @@ where
             )?;
 
             if let Some(branch) = flight.optimistic.take() {
-                let bonus_terminal = if terminal == Some(FinishReason::Eos) {
-                    Some(BonusTerminal::Eos)
-                } else if terminal == Some(FinishReason::MaxTokens) {
-                    Some(BonusTerminal::MaxTokens)
-                } else {
-                    None
-                };
-                if terminal.is_some() && bonus_terminal.is_none() {
-                    discard_optimistic(&mut tentative_stats, Some(branch));
-                } else {
-                    bonus_transition = resolve_optimistic_bonus(
-                        branch,
-                        &history,
-                        chosen,
-                        bonus_terminal,
-                        &mut tentative_stats,
-                    )?;
-                }
+                bonus_transition = resolve_optimistic_bonus(
+                    branch,
+                    &history,
+                    chosen,
+                    terminal.is_some(),
+                    &mut tentative_stats,
+                )?;
             }
         }
 
@@ -1604,8 +1588,7 @@ where
                 | OptimisticBonusTransition::NotPresent => {
                     request.phase = MtpRequestPhase::ReadyToDraft;
                 }
-                OptimisticBonusTransition::TerminalEos
-                | OptimisticBonusTransition::TerminalMaxTokens => {
+                OptimisticBonusTransition::Terminal => {
                     return Err(Exception::custom(
                         "terminal optimistic bonus did not complete its request",
                     ));
@@ -1654,21 +1637,18 @@ fn resolve_optimistic_bonus<D>(
     branch: OptimisticBranch<D>,
     canonical_prefix: &[u32],
     bonus: u32,
-    terminal: Option<BonusTerminal>,
+    terminal: bool,
     stats: &mut MtpStats,
 ) -> Result<OptimisticBonusTransition<D>, Exception> {
-    if terminal.is_none() && branch.assumed_prefix != canonical_prefix {
+    if branch.assumed_prefix != canonical_prefix {
         return Err(Exception::custom(
             "optimistic MTP branch prefix diverged from the canonical committed prefix",
         ));
     }
     stats.optimistic_target_bonus_tokens += 1;
-    if let Some(terminal) = terminal {
+    if terminal {
         discard_optimistic(stats, Some(branch));
-        return Ok(match terminal {
-            BonusTerminal::Eos => OptimisticBonusTransition::TerminalEos,
-            BonusTerminal::MaxTokens => OptimisticBonusTransition::TerminalMaxTokens,
-        });
+        return Ok(OptimisticBonusTransition::Terminal);
     }
 
     let DraftBlock { state, proposals } = branch.block;
@@ -1764,7 +1744,7 @@ where
             distribution: processed,
         });
         history.push(token);
-        if config.eos_token_ids.contains(&token) {
+        if config.eos_token_ids.contains(&token) || branch_sampler.prefix_is_complete(&history)? {
             break;
         }
     }
@@ -1981,7 +1961,7 @@ where
     Ok((token_ids, stats))
 }
 
-/// Runs one no-lookahead request with transactional semantic output.
+/// Runs one request with transactional semantic output.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn generate_with_semantics_and_options<B, S, F>(
     backend: &mut B,
@@ -2170,6 +2150,10 @@ mod tests {
     }
 
     impl SpeculativeSampler for GrammarCountingSampler {
+        fn supports_exact_optimistic_promotion(&self) -> bool {
+            true
+        }
+
         fn process_logits(
             &mut self,
             logits: &Array,
@@ -2192,6 +2176,10 @@ mod tests {
 
         fn grammar_is_complete(&mut self) -> Result<bool, Exception> {
             Ok(self.inner.committed.len() >= self.complete_after)
+        }
+
+        fn prefix_is_complete(&self, history: &[u32]) -> Result<bool, Exception> {
+            Ok(history.len() >= self.complete_after)
         }
     }
 
@@ -2521,10 +2509,10 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires an MLX Metal device"]
-    fn semantic_stop_spanning_tokens_truncates_an_accepted_block_transactionally() {
-        let context = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
-        let stream = context.stream();
+    fn optimistic_semantic_stop_truncates_an_accepted_block_transactionally() {
+        let target = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        let draft = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        let stream = target.stream();
         let prompt = Array::from_slice(&[7u32], &[1, 1]);
         let parts = [InputPart::text_token_ids(&prompt)];
         let mut cache = 0;
@@ -2533,8 +2521,8 @@ mod tests {
         let mut backend = scripted_backend();
         let mut scheduler = MtpScheduler::new(
             &mut backend,
-            MtpExecutionStreams::single(stream),
-            MtpSchedulerOptions::default().with_lookahead(false),
+            MtpExecutionStreams::new(stream, draft.stream()).unwrap(),
+            MtpSchedulerOptions::default(),
         )
         .unwrap();
         scheduler
@@ -2563,7 +2551,20 @@ mod tests {
         assert_eq!(request.finish_reason, Some(FinishReason::StopSequence));
         assert_eq!(request.stats.accept_lens, vec![1]);
         assert_eq!(request.sampler.process_calls, 2);
+        assert_eq!(request.stats.optimistic_draft_blocks, 1);
+        assert_eq!(request.stats.discarded_optimistic_blocks, 1);
         assert_eq!(cache, 2);
+        assert_eq!(
+            events.borrow().as_slice(),
+            [
+                SemanticEvent::TextDelta("1".into()),
+                SemanticEvent::TextDelta("2".into()),
+                SemanticEvent::Finished {
+                    reason: FinishReason::StopSequence
+                }
+            ],
+            "draft and optimistic tokens must never publish semantic events"
+        );
         assert_eq!(
             events.borrow().last(),
             Some(&SemanticEvent::Finished {
@@ -2573,9 +2574,8 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires an MLX Metal device"]
     fn grammar_completion_mid_block_matches_the_committed_prefix() {
-        let context = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
+        let context = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
         let stream = context.stream();
         let prompt = Array::from_slice(&[7u32], &[1, 1]);
         let parts = [InputPart::text_token_ids(&prompt)];
@@ -2613,6 +2613,12 @@ mod tests {
         assert_eq!(request.finish_reason, Some(FinishReason::GrammarComplete));
         assert_eq!(request.sampler.inner.process_calls, 2);
         assert_eq!(request.sampler.inner.committed, request.token_ids);
+        assert_eq!(request.stats.draft_tokens, 1);
+        assert_eq!(
+            backend.draft_storage.len(),
+            1,
+            "drafting must stop as soon as the logical prefix completes the grammar"
+        );
         assert_eq!(cache, 2);
 
         let mut ordinary = GrammarCountingSampler {
@@ -2641,13 +2647,146 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires an MLX Metal device"]
+    fn terminal_grammar_bonus_discards_matching_optimistic_work() {
+        let target = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        let draft = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        let prompt = Array::from_slice(&[7u32], &[1, 1]);
+        let parts = [InputPart::text_token_ids(&prompt)];
+        let mut cache = 0;
+        let mut backend = scripted_backend();
+        backend.bonus_token = 0;
+        let mut scheduler = MtpScheduler::new(
+            &mut backend,
+            MtpExecutionStreams::new(target.stream(), draft.stream()).unwrap(),
+            MtpSchedulerOptions::default(),
+        )
+        .unwrap();
+        scheduler
+            .submit_with_semantics(
+                &mut cache,
+                ModelInput::new(&parts),
+                MtpConfig {
+                    max_tokens: 8,
+                    max_draft_tokens: 2,
+                    temperature: 0.0,
+                    eos_token_ids: Vec::new(),
+                },
+                None,
+                GrammarCountingSampler {
+                    inner: CountingSampler::default(),
+                    complete_after: 4,
+                },
+                Box::new(TestSemanticState::default()),
+                |_| {},
+            )
+            .unwrap();
+        scheduler.run().unwrap();
+        let request = scheduler.finish().unwrap().requests.pop().unwrap();
+
+        assert_eq!(request.token_ids, vec![1, 2, 0, 0]);
+        assert_eq!(request.finish_reason, Some(FinishReason::GrammarComplete));
+        assert_eq!(request.stats.optimistic_target_bonus_tokens, 1);
+        assert_eq!(request.stats.discarded_optimistic_tokens, 1);
+        assert_eq!(request.stats.reused_optimistic_tokens, 0);
+        assert_eq!(request.stats.consumed_optimistic_tokens, 0);
+        assert_eq!(request.sampler.inner.committed, request.token_ids);
+    }
+
+    #[test]
+    fn cancellation_discards_only_the_affected_request_runtime() {
+        let target = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        let draft = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        let prompt_a = Array::from_slice(&[7u32], &[1, 1]);
+        let prompt_b = Array::from_slice(&[8u32], &[1, 1]);
+        let parts_a = [InputPart::text_token_ids(&prompt_a)];
+        let parts_b = [InputPart::text_token_ids(&prompt_b)];
+        let events_a = Rc::new(RefCell::new(Vec::new()));
+        let events_b = Rc::new(RefCell::new(Vec::new()));
+        let callback_a = Rc::clone(&events_a);
+        let callback_b = Rc::clone(&events_b);
+        let mut cache_a = 0;
+        let mut cache_b = 0;
+        let mut backend = scripted_backend();
+        let mut scheduler = MtpScheduler::new(
+            &mut backend,
+            MtpExecutionStreams::new(target.stream(), draft.stream()).unwrap(),
+            MtpSchedulerOptions::default(),
+        )
+        .unwrap();
+        let config = MtpConfig {
+            max_tokens: 5,
+            max_draft_tokens: 2,
+            temperature: 0.0,
+            eos_token_ids: Vec::new(),
+        };
+        let first = scheduler
+            .submit_with_semantics(
+                &mut cache_a,
+                ModelInput::new(&parts_a),
+                config.clone(),
+                None,
+                GrammarCountingSampler {
+                    inner: CountingSampler::default(),
+                    complete_after: usize::MAX,
+                },
+                Box::new(TestSemanticState::default()),
+                move |event| callback_a.borrow_mut().push(event),
+            )
+            .unwrap();
+        scheduler
+            .submit_with_semantics(
+                &mut cache_b,
+                ModelInput::new(&parts_b),
+                config,
+                None,
+                GrammarCountingSampler {
+                    inner: CountingSampler::default(),
+                    complete_after: 3,
+                },
+                Box::new(TestSemanticState::default()),
+                move |event| callback_b.borrow_mut().push(event),
+            )
+            .unwrap();
+
+        scheduler.step().unwrap();
+        scheduler.step().unwrap();
+        assert!(scheduler.requests[first.index()].in_flight.is_some());
+        scheduler.cancel(first).unwrap();
+        scheduler.run().unwrap();
+        let output = scheduler.finish().unwrap();
+
+        assert!(output.requests[0].cancelled);
+        assert_eq!(output.requests[0].token_ids, vec![1]);
+        assert_eq!(output.requests[0].sampler.inner.committed, vec![1]);
+        assert_eq!(
+            events_a.borrow().as_slice(),
+            &[SemanticEvent::TextDelta("1".into())]
+        );
+        assert!(!output.requests[1].cancelled);
+        assert_eq!(output.requests[1].token_ids, vec![1, 2, 0]);
+        assert_eq!(
+            output.requests[1].finish_reason,
+            Some(FinishReason::GrammarComplete)
+        );
+        assert_eq!(
+            output.requests[1].sampler.inner.committed,
+            output.requests[1].token_ids
+        );
+        assert_eq!(
+            events_b.borrow().last(),
+            Some(&SemanticEvent::Finished {
+                reason: FinishReason::GrammarComplete
+            })
+        );
+    }
+
+    #[test]
     fn no_lookahead_full_acceptance_bonus_eos_and_max_tokens_use_safe_boundaries() {
         fn run(
             max_tokens: usize,
             eos_token_ids: Vec<u32>,
         ) -> (Vec<u32>, FinishReason, MtpStats, usize) {
-            let context = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
+            let context = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
             let stream = context.stream();
             let prompt = Array::from_slice(&[7u32], &[1, 1]);
             let parts = [InputPart::text_token_ids(&prompt)];
@@ -2706,9 +2845,8 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires an MLX Metal device"]
     fn no_lookahead_residual_replacement_commits_only_the_replacement() {
-        let context = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
+        let context = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
         let stream = context.stream();
         let prompt = Array::from_slice(&[7u32], &[1, 1]);
         let parts = [InputPart::text_token_ids(&prompt)];
@@ -2748,9 +2886,8 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires an MLX Metal device"]
     fn commit_failure_does_not_publish_or_advance_canonical_output_state() {
-        let context = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
+        let context = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
         let stream = context.stream();
         let prompt = Array::from_slice(&[7u32], &[1, 1]);
         let parts = [InputPart::text_token_ids(&prompt)];
@@ -2793,9 +2930,8 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires an MLX Metal device"]
     fn greedy_engine_commits_only_the_accepted_prefix() {
-        let context = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
+        let context = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
         let stream = context.stream();
         let prompt = Array::from_slice(&[7u32], &[1, 1]);
         let parts = [InputPart::text_token_ids(&prompt)];
@@ -2932,9 +3068,8 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires an MLX Metal device"]
     fn mirostat_v2_mtp_commits_accepted_target_distributions() {
-        let context = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
+        let context = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
         let stream = context.stream();
         let prompt = Array::from_slice(&[7u32], &[1, 1]);
         let parts = [InputPart::text_token_ids(&prompt)];
@@ -2976,9 +3111,8 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires an MLX Metal device"]
     fn mirostat_v2_mtp_commits_replacement_not_rejected_draft() {
-        let context = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
+        let context = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
         let stream = context.stream();
         let prompt = Array::from_slice(&[7u32], &[1, 1]);
         let parts = [InputPart::text_token_ids(&prompt)];
@@ -3017,6 +3151,30 @@ mod tests {
         assert_eq!(stats.accepted_tokens, 0);
         assert_eq!(sampler.generated_tokens(), tokens);
         assert!((sampler.mu() - 11.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn execution_stream_topologies_classify_on_cpu_devices() {
+        let target = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        let second_stream = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        let second_device = ExecutionContext::new(Device::new(DeviceType::Cpu, 1));
+
+        assert_eq!(
+            MtpExecutionStreams::single(target.stream()).topology(),
+            MtpStreamTopology::Single
+        );
+        assert_eq!(
+            MtpExecutionStreams::new(target.stream(), second_stream.stream())
+                .unwrap()
+                .topology(),
+            MtpStreamTopology::SameDeviceSplit
+        );
+        assert_eq!(
+            MtpExecutionStreams::new(target.stream(), second_device.stream())
+                .unwrap()
+                .topology(),
+            MtpStreamTopology::CrossDeviceSplit
+        );
     }
 
     #[test]
@@ -3121,10 +3279,9 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires an MLX Metal device"]
-    fn same_gpu_distinct_streams_preserve_stochastic_lookahead() {
-        let target = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
-        let draft = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
+    fn same_device_split_preserves_stochastic_lookahead() {
+        let target = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        let draft = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
         let prompt = Array::from_slice(&[7u32], &[1, 1]);
         let parts = [InputPart::text_token_ids(&prompt)];
         let run = |lookahead| {
@@ -3177,9 +3334,8 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires an MLX Metal device"]
     fn full_acceptance_promotes_shared_optimistic_branch() {
-        let target = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
+        let target = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
         let draft = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
         let prompt = Array::from_slice(&[7u32], &[1, 1]);
         let parts = [InputPart::text_token_ids(&prompt)];
@@ -3240,9 +3396,8 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires an MLX Metal device"]
     fn matching_bonus_is_emitted_and_consumes_one_paired_proposal() {
-        let target = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
+        let target = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
         let draft = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
         let prompt = Array::from_slice(&[7u32], &[1, 1]);
         let parts = [InputPart::text_token_ids(&prompt)];
@@ -3330,13 +3485,12 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires an MLX Metal device"]
     fn mismatching_bonus_restores_exact_non_lookahead_state() {
         #[allow(clippy::type_complexity)]
         fn run(
             options: MtpSchedulerOptions,
         ) -> (Vec<u32>, Vec<u32>, usize, MtpStats, CountingSampler) {
-            let target = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
+            let target = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
             let draft = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
             let prompt = Array::from_slice(&[7u32], &[1, 1]);
             let parts = [InputPart::text_token_ids(&prompt)];
@@ -3414,10 +3568,9 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires an MLX Metal device"]
     fn history_derived_sampler_matches_non_lookahead_execution() {
         fn run(options: MtpSchedulerOptions) -> (Vec<u32>, Vec<usize>) {
-            let target = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
+            let target = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
             let draft = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
             let prompt = Array::from_slice(&[7u32], &[1, 1]);
             let parts = [InputPart::text_token_ids(&prompt)];
@@ -3473,14 +3626,13 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires an MLX Metal device"]
     fn stochastic_match_and_mismatch_ignore_interleaving_and_branch_slots() {
         fn run(
             seed: u64,
             options: MtpSchedulerOptions,
             with_peer: bool,
         ) -> (Vec<u32>, Vec<usize>, MtpStats) {
-            let target = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
+            let target = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
             let draft = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
             let prompt_a = Array::from_slice(&[7u32], &[1, 1]);
             let prompt_b = Array::from_slice(&[8u32], &[1, 1]);
@@ -3571,9 +3723,8 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires an MLX Metal device"]
     fn promoted_round_leaves_last_emitted_token_out_of_target_cache() {
-        let target = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
+        let target = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
         let draft = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
         let prompt = Array::from_slice(&[7u32], &[1, 1]);
         let parts = [InputPart::text_token_ids(&prompt)];
@@ -3625,9 +3776,8 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires an MLX Metal device"]
     fn rejection_discards_branch_sampler_prng_history_and_cache_state() {
-        let target = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
+        let target = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
         let draft = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
         let prompt = Array::from_slice(&[7u32], &[1, 1]);
         let parts = [InputPart::text_token_ids(&prompt)];
@@ -3683,10 +3833,9 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires an MLX Metal device"]
     fn rejection_matches_execution_with_lookahead_disabled() {
         fn run(options: MtpSchedulerOptions) -> (Vec<u32>, usize, MtpStats) {
-            let target = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
+            let target = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
             let draft = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
             let prompt = Array::from_slice(&[7u32], &[1, 1]);
             let parts = [InputPart::text_token_ids(&prompt)];
@@ -3742,9 +3891,8 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires an MLX Metal device"]
     fn target_eos_discards_in_flight_lookahead() {
-        let target = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
+        let target = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
         let draft = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
         let prompt = Array::from_slice(&[7u32], &[1, 1]);
         let parts = [InputPart::text_token_ids(&prompt)];
@@ -3788,9 +3936,8 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires an MLX Metal device"]
     fn bonus_eos_completes_only_its_request_and_discards_continuation() {
-        let target = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
+        let target = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
         let draft = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
         let prompt_a = Array::from_slice(&[7u32], &[1, 1]);
         let prompt_b = Array::from_slice(&[8u32], &[1, 1]);
@@ -3869,9 +4016,8 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires an MLX Metal device"]
     fn consumed_one_token_branch_never_submits_empty_verification() {
-        let target = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
+        let target = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
         let draft = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
         let prompt = Array::from_slice(&[7u32], &[1, 1]);
         let parts = [InputPart::text_token_ids(&prompt)];
@@ -3924,9 +4070,8 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires an MLX Metal device"]
     fn max_token_boundary_does_not_draft_unusable_lookahead() {
-        let target = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
+        let target = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
         let draft = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
         let prompt = Array::from_slice(&[7u32], &[1, 1]);
         let parts = [InputPart::text_token_ids(&prompt)];
@@ -3992,7 +4137,7 @@ mod tests {
             assumed_prefix: vec![1, 2],
         };
         let mut stats = MtpStats::default();
-        let error = resolve_optimistic_bonus(branch, &[1, 0], 0, None, &mut stats)
+        let error = resolve_optimistic_bonus(branch, &[1, 0], 0, false, &mut stats)
             .err()
             .unwrap();
 
@@ -4007,9 +4152,8 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires an MLX Metal device"]
     fn independent_requests_progress_fairly_and_preserve_output_order() {
-        let target = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
+        let target = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
         let draft = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
         let prompt_a = Array::from_slice(&[7u32], &[1, 1]);
         let prompt_b = Array::from_slice(&[8u32], &[1, 1]);
@@ -4087,9 +4231,8 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires an MLX Metal device"]
     fn scheduler_limits_bound_retained_transactions_and_branches() {
-        let target = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
+        let target = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
         let draft = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
         let prompt_a = Array::from_slice(&[7u32], &[1, 1]);
         let prompt_b = Array::from_slice(&[8u32], &[1, 1]);
@@ -4142,10 +4285,9 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires an MLX Metal device"]
     fn stochastic_request_is_reproducible_across_scheduler_interleavings() {
         fn run(with_peer: bool) -> (Vec<u32>, Vec<usize>) {
-            let target = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
+            let target = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
             let draft = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
             let prompt_a = Array::from_slice(&[7u32], &[1, 1]);
             let prompt_b = Array::from_slice(&[8u32], &[1, 1]);
@@ -4208,10 +4350,9 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires an MLX Metal device"]
     fn adaptive_disabling_stops_unproductive_branches_without_changing_output() {
         fn run(options: MtpSchedulerOptions) -> (Vec<u32>, usize, MtpStats) {
-            let target = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
+            let target = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
             let draft = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
             let prompt = Array::from_slice(&[7u32], &[1, 1]);
             let parts = [InputPart::text_token_ids(&prompt)];

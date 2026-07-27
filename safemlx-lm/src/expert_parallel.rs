@@ -1149,6 +1149,14 @@ impl<S: SpeculativeSampler> SpeculativeSampler for ExpertParallelSpeculativeSamp
         false
     }
 
+    fn grammar_is_complete(&mut self) -> Result<bool, Exception> {
+        self.sampler.grammar_is_complete()
+    }
+
+    fn prefix_is_complete(&self, history: &[u32]) -> Result<bool, Exception> {
+        self.sampler.prefix_is_complete(history)
+    }
+
     fn process_logits(
         &mut self,
         logits: &Array,

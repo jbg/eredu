@@ -134,10 +134,10 @@ lookahead disabled immediately after emitting `B`.
 
 ### Terminal bonus
 
-If `B` is EOS or reaches `max_tokens`, it is committed and emitted, and the
-whole continuation is dropped. No branch state is promoted. Optimistic work is
-not started when the current verified block leaves capacity only for the
-target bonus.
+If `B` reaches a decoded stop, grammar-complete, EOS, or `max_tokens`
+boundary, it is committed and emitted, and the whole continuation is dropped.
+No branch state is promoted. Optimistic work is not started when the current
+verified block leaves capacity only for the target bonus.
 
 ## RNG invariants
 
@@ -155,6 +155,31 @@ uses later position keys and preserves ordinary verification boundaries.
 Consequently scheduler interleaving, lookahead branch-slot availability,
 promotion, and discard cannot change the draft or target random stream assigned
 to canonical execution.
+
+## Constraint and semantic-prefix invariants
+
+Every request owns its executable constraint sampler and decoded semantic
+pipeline. The sampler's durable state, tokenizer decoder, protocol parser, stop
+matcher, callback, target cache, and target/draft random roots are never shared
+between requests.
+
+Both draft and target logits are masked at their exact logical token history.
+The speculative sampler contract includes a discardable
+`prefix_is_complete(history)` query. Drafting stops immediately when that
+history completes the active grammar, so neither a canonical proposal block nor
+an optimistic continuation crosses the tool boundary. The query does not
+commit or activate canonical constraint state.
+
+Target resolution forks the sampler and semantic pipeline from the durable
+prefix. Accepted proposals, rejection replacements, and bonuses advance only
+that transaction-local fork until the matching target cache boundary commits.
+Only then are sampler/parser state and events published. Rejection, bonus
+mismatch, cancellation, or a terminal token drops all remaining branch-only
+constraint and semantic state.
+
+A terminal accepted proposal or bonus includes decoded stop, grammar
+completion, EOS, and maximum-token boundaries. It completes only its own
+request and discards every remaining optimistic token/distribution pair.
 
 ## Disable and adaptive policy
 
@@ -193,8 +218,11 @@ Bonus-preserving promotion requires both:
   position-addressed PRNG state.
 
 External Gemma assistants and the default/history-derived samplers satisfy
-these contracts. Embedded Qwen does not, because commit advances target-owned
-MTP state. Mirostat V2 does not, because its processing depends on adaptive
+these contracts. A `ConstrainedSampler` advertises the capability only when its
+wrapped policy does; its grammar processing reconstructs a private,
+history-relative runtime and is therefore a pure discardable fork. Embedded
+Qwen does not qualify, because commit advances target-owned MTP state.
+Mirostat V2 does not qualify, because its processing depends on adaptive
 target-committed state. Both continue through the same scheduler without
 same-request optimistic lookahead.
 
