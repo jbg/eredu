@@ -368,6 +368,7 @@ const QWEN3_XML_TOOL_SPEC: DeclarativeDialectSpec = DeclarativeDialectSpec {
         prefix: "<think>\n",
         suffix: "\n</think>",
         required: false,
+        prefix_in_prompt: false,
     }),
     ..QWEN_XML_TOOL_SPEC
 };
@@ -452,6 +453,7 @@ const LLAMA4_JSON_TOOL_SPEC: DeclarativeDialectSpec = DeclarativeDialectSpec {
         prefix: "<|python_start|>",
         suffix: "<|python_end|>",
         required: true,
+        prefix_in_prompt: false,
     }),
     protocol_max_calls: None,
     required_structural_tokens: &["<|python_start|>", "<|python_end|>", "<|eot|>"],
@@ -484,6 +486,18 @@ const NEMOTRON_NANO_JSON_LIST_TOOL_SPEC: DeclarativeDialectSpec = DeclarativeDia
     auto_activation_trigger: Some("<TOOLCALL>["),
     required_structural_tokens: &["<|eot_id|>"],
     stop_sequences: &["<|eot_id|>"],
+};
+
+const NEMOTRON_NANO_V2_JSON_LIST_TOOL_SPEC: DeclarativeDialectSpec = DeclarativeDialectSpec {
+    reasoning_channel: Some(DelimitedChannel {
+        prefix: "<think>\n",
+        suffix: "\n</think>\n\n",
+        required: false,
+        prefix_in_prompt: true,
+    }),
+    required_structural_tokens: &["<SPECIAL_12>"],
+    stop_sequences: &["<SPECIAL_12>"],
+    ..NEMOTRON_NANO_JSON_LIST_TOOL_SPEC
 };
 
 const MINISTRAL_JSON_LIST_TOOL_SPEC: DeclarativeDialectSpec = DeclarativeDialectSpec {
@@ -591,6 +605,10 @@ const NEMOTRON_NANO_TEMPLATE_SIGNATURE: [u8; 32] = [
     0x07, 0x2b, 0x9a, 0xb4, 0x5c, 0xdd, 0xdd, 0xd1, 0xc8, 0x21, 0xb7, 0xcc, 0xb0, 0xd4, 0xbe, 0x2b,
     0x7a, 0x2b, 0x20, 0x70, 0xdd, 0x92, 0x7a, 0xb1, 0x4c, 0xe7, 0x31, 0xcf, 0x09, 0xa3, 0x43, 0x00,
 ];
+const NEMOTRON_NANO_V2_TEMPLATE_SIGNATURE: [u8; 32] = [
+    0xb7, 0xa3, 0xa5, 0x20, 0xa4, 0xbc, 0x1b, 0xea, 0xe6, 0xa2, 0x5d, 0x61, 0x5f, 0x92, 0x15, 0x58,
+    0x0d, 0xf8, 0xee, 0xa9, 0x26, 0xf4, 0x88, 0x25, 0x6c, 0x2b, 0xef, 0x74, 0x03, 0x94, 0x33, 0xc0,
+];
 const GEMMA4_EDGE_TEMPLATE_SIGNATURE: [u8; 32] = [
     0x0a, 0x2c, 0x80, 0x73, 0xc8, 0x78, 0xab, 0x1d, 0xa0, 0x04, 0xbe, 0xe9, 0x33, 0xa9, 0x98, 0x60,
     0x65, 0x37, 0xbb, 0xb6, 0x20, 0x16, 0x31, 0x03, 0x52, 0xc7, 0x28, 0x5c, 0x3f, 0x01, 0xc5, 0xb5,
@@ -657,6 +675,7 @@ const GEMMA4_STRUCTURAL_TOOL_SPEC: DeclarativeDialectSpec = DeclarativeDialectSp
         prefix: "<|channel>thought\n",
         suffix: "<channel|>",
         required: false,
+        prefix_in_prompt: false,
     }),
     text_channel: None,
     raw_text_before_calls: true,
@@ -773,6 +792,12 @@ const FORMAT_REGISTRY: &[FormatRegistryEntry] = &[
         template_signature: NEMOTRON_NANO_TEMPLATE_SIGNATURE,
         dialect: &DECLARATIVE_DIALECT,
         parameters: DialectParameters::Declarative(&NEMOTRON_NANO_JSON_LIST_TOOL_SPEC),
+    },
+    FormatRegistryEntry {
+        identity: "nvidia.nemotron-nano-v2.json-list-tools.b7a3a520",
+        template_signature: NEMOTRON_NANO_V2_TEMPLATE_SIGNATURE,
+        dialect: &DECLARATIVE_DIALECT,
+        parameters: DialectParameters::Declarative(&NEMOTRON_NANO_V2_JSON_LIST_TOOL_SPEC),
     },
     FormatRegistryEntry {
         identity: "google.gemma4.edge.structural-tools.0a2c8073",
@@ -1029,17 +1054,18 @@ mod tests {
     };
 
     use super::{
-        prepare_format_profile, prepare_format_profile_with_registry, resolve_structural_tokens,
-        template_signature, DialectParameters, FormatRegistryEntry, DECLARATIVE_DIALECT,
-        DEEPSEEK_V31_TOOL_TEMPLATE_SIGNATURE, DEEPSEEK_V3_TOOL_TEMPLATE_SIGNATURE,
-        GEMMA4_EDGE_TEMPLATE_SIGNATURE, GEMMA4_LARGE_TEMPLATE_SIGNATURE,
-        GPT_OSS_HARMONY_CURRENT_TEMPLATE_SIGNATURE, GPT_OSS_HARMONY_ESCAPED_TEMPLATE_SIGNATURE,
-        GPT_OSS_HARMONY_INITIAL_TEMPLATE_SIGNATURE, HERMES2_PRO_TOOL_USE_TEMPLATE_SIGNATURE,
-        LFM25_8B_TEMPLATE_SIGNATURE, LFM25_VL_TEMPLATE_SIGNATURE,
-        LFM2_CLASSIC_COMPACT_TEMPLATE_SIGNATURE, LFM2_CLASSIC_TEMPLATE_SIGNATURE,
-        LLAMA31_33_TEMPLATE_SIGNATURE, LLAMA32_TEMPLATE_SIGNATURE, LLAMA4_TEMPLATE_SIGNATURE,
-        MINISTRAL8_2410_TEMPLATE_SIGNATURE, MISTRAL7_V03_TEMPLATE_SIGNATURE,
-        NEMOTRON_NANO_TEMPLATE_SIGNATURE, QWEN25_TEMPLATE_SIGNATURE,
+        matching_registry_entries, prepare_format_profile, prepare_format_profile_with_registry,
+        resolve_structural_tokens, template_signature, DialectParameters, FormatRegistryEntry,
+        DECLARATIVE_DIALECT, DEEPSEEK_V31_TOOL_TEMPLATE_SIGNATURE,
+        DEEPSEEK_V3_TOOL_TEMPLATE_SIGNATURE, FORMAT_REGISTRY, GEMMA4_EDGE_TEMPLATE_SIGNATURE,
+        GEMMA4_LARGE_TEMPLATE_SIGNATURE, GPT_OSS_HARMONY_CURRENT_TEMPLATE_SIGNATURE,
+        GPT_OSS_HARMONY_ESCAPED_TEMPLATE_SIGNATURE, GPT_OSS_HARMONY_INITIAL_TEMPLATE_SIGNATURE,
+        HERMES2_PRO_TOOL_USE_TEMPLATE_SIGNATURE, LFM25_8B_TEMPLATE_SIGNATURE,
+        LFM25_VL_TEMPLATE_SIGNATURE, LFM2_CLASSIC_COMPACT_TEMPLATE_SIGNATURE,
+        LFM2_CLASSIC_TEMPLATE_SIGNATURE, LLAMA31_33_TEMPLATE_SIGNATURE, LLAMA32_TEMPLATE_SIGNATURE,
+        LLAMA4_TEMPLATE_SIGNATURE, MINISTRAL8_2410_TEMPLATE_SIGNATURE,
+        MISTRAL7_V03_TEMPLATE_SIGNATURE, NEMOTRON_NANO_TEMPLATE_SIGNATURE,
+        NEMOTRON_NANO_V2_TEMPLATE_SIGNATURE, QWEN25_TEMPLATE_SIGNATURE,
         QWEN3_TEMPLATE_16706FC5_SIGNATURE, QWEN3_TEMPLATE_7E4AE267_SIGNATURE,
         QWEN3_VL_TEMPLATE_SIGNATURE, SYNTHETIC_DECLARATIVE_SPEC, SYNTHETIC_TOOL_TEMPLATE,
         SYNTHETIC_TOOL_TEMPLATE_SIGNATURE,
@@ -1067,6 +1093,8 @@ mod tests {
     const NEMOTRON_NANO_FIXTURE_WITH_TERMINATOR: &str = include_str!(
         "../tests/fixtures/chat_templates/llama-3.1-nemotron-nano-8b-v1-072b9ab4.jinja"
     );
+    const NEMOTRON_NANO_V2_FIXTURE_WITH_TERMINATOR: &str =
+        include_str!("../tests/fixtures/chat_templates/nemotron-nano-v2-6533e8de.jinja");
     const QWEN3_OLDER_TOKENIZER_CONFIG: &str =
         include_str!("../../safemlx-lm-utils/tests/fixtures/qwen3/tokenizer_config.json");
     const GEMMA4_EDGE_FIXTURE: &str =
@@ -1150,6 +1178,190 @@ mod tests {
     }
 
     #[test]
+    fn production_registry_has_one_exact_expected_entry_per_fixture() {
+        let qwen3_current = QWEN3_CURRENT_FIXTURE_WITH_TERMINATOR
+            .strip_suffix('\n')
+            .expect("the fixture-only file terminator is documented");
+        let qwen3_older: serde_json::Value =
+            serde_json::from_str(QWEN3_OLDER_TOKENIZER_CONFIG).unwrap();
+        let qwen3_older = qwen3_older["chat_template"].as_str().unwrap();
+        let strip_fixture_terminator = |fixture: &'static str| {
+            fixture
+                .strip_suffix('\n')
+                .expect("the fixture-only file terminator is documented")
+        };
+        let fixtures = vec![
+            (
+                QWEN25_FIXTURE,
+                QWEN25_TEMPLATE_SIGNATURE,
+                "qwen.qwen2.5.xml-tools.acbd9653",
+            ),
+            (
+                qwen3_older,
+                QWEN3_TEMPLATE_16706FC5_SIGNATURE,
+                "qwen.qwen3.xml-tools.16706fc5",
+            ),
+            (
+                qwen3_current,
+                QWEN3_TEMPLATE_7E4AE267_SIGNATURE,
+                "qwen.qwen3.xml-tools.7e4ae267",
+            ),
+            (
+                QWEN3_VL_FIXTURE,
+                QWEN3_VL_TEMPLATE_SIGNATURE,
+                "qwen.qwen3-vl.xml-tools.89644892",
+            ),
+            (
+                HERMES2_PRO_TOOL_USE_FIXTURE,
+                HERMES2_PRO_TOOL_USE_TEMPLATE_SIGNATURE,
+                "hermes.xml-tools.7ce09d55",
+            ),
+            (
+                MISTRAL7_V03_FIXTURE,
+                MISTRAL7_V03_TEMPLATE_SIGNATURE,
+                "mistral.mistral-7b-v0.3.json-list-tools.e16746b4",
+            ),
+            (
+                MINISTRAL8_2410_FIXTURE,
+                MINISTRAL8_2410_TEMPLATE_SIGNATURE,
+                "mistral.ministral-8b-2410.json-list-tools.e4676cb5",
+            ),
+            (
+                LLAMA31_33_FIXTURE,
+                LLAMA31_33_TEMPLATE_SIGNATURE,
+                "meta.llama-3.1-3.3.json-tools.e10ca381",
+            ),
+            (
+                LLAMA32_FIXTURE,
+                LLAMA32_TEMPLATE_SIGNATURE,
+                "meta.llama-3.2.json-tools.5816fce1",
+            ),
+            (
+                LLAMA4_FIXTURE,
+                LLAMA4_TEMPLATE_SIGNATURE,
+                "meta.llama-4.json-tools.01a91bfb",
+            ),
+            (
+                strip_fixture_terminator(NEMOTRON_NANO_FIXTURE_WITH_TERMINATOR),
+                NEMOTRON_NANO_TEMPLATE_SIGNATURE,
+                "nvidia.llama-3.1-nemotron-nano.json-list-tools.072b9ab4",
+            ),
+            (
+                strip_fixture_terminator(NEMOTRON_NANO_V2_FIXTURE_WITH_TERMINATOR),
+                NEMOTRON_NANO_V2_TEMPLATE_SIGNATURE,
+                "nvidia.nemotron-nano-v2.json-list-tools.b7a3a520",
+            ),
+            (
+                GEMMA4_EDGE_FIXTURE,
+                GEMMA4_EDGE_TEMPLATE_SIGNATURE,
+                "google.gemma4.edge.structural-tools.0a2c8073",
+            ),
+            (
+                GEMMA4_LARGE_FIXTURE,
+                GEMMA4_LARGE_TEMPLATE_SIGNATURE,
+                "google.gemma4.large.structural-tools.ae53464b",
+            ),
+            (
+                strip_fixture_terminator(GPT_OSS_HARMONY_CURRENT_FIXTURE_WITH_TERMINATOR),
+                GPT_OSS_HARMONY_CURRENT_TEMPLATE_SIGNATURE,
+                "openai.gpt-oss.harmony.a4c9919c",
+            ),
+            (
+                strip_fixture_terminator(GPT_OSS_HARMONY_ESCAPED_FIXTURE_WITH_TERMINATOR),
+                GPT_OSS_HARMONY_ESCAPED_TEMPLATE_SIGNATURE,
+                "openai.gpt-oss.harmony.b474759b",
+            ),
+            (
+                strip_fixture_terminator(GPT_OSS_HARMONY_INITIAL_FIXTURE_WITH_TERMINATOR),
+                GPT_OSS_HARMONY_INITIAL_TEMPLATE_SIGNATURE,
+                "openai.gpt-oss.harmony.f8d92557",
+            ),
+            (
+                strip_fixture_terminator(LFM2_CLASSIC_FIXTURE_WITH_TERMINATOR),
+                LFM2_CLASSIC_TEMPLATE_SIGNATURE,
+                "liquid.lfm2.python-tools.cef18740",
+            ),
+            (
+                strip_fixture_terminator(LFM2_CLASSIC_COMPACT_FIXTURE_WITH_TERMINATOR),
+                LFM2_CLASSIC_COMPACT_TEMPLATE_SIGNATURE,
+                "liquid.lfm2.python-tools.89e790f0",
+            ),
+            (
+                strip_fixture_terminator(LFM25_8B_FIXTURE_WITH_TERMINATOR),
+                LFM25_8B_TEMPLATE_SIGNATURE,
+                "liquid.lfm2.5.python-tools.6d65c880",
+            ),
+            (
+                strip_fixture_terminator(LFM25_VL_FIXTURE_WITH_TERMINATOR),
+                LFM25_VL_TEMPLATE_SIGNATURE,
+                "liquid.lfm2.5-vl.python-tools.309e586e",
+            ),
+            (
+                DEEPSEEK_V3_TOOL_FIXTURE,
+                DEEPSEEK_V3_TOOL_TEMPLATE_SIGNATURE,
+                "deepseek.v3.structural-json-tools.a3b4449b",
+            ),
+            (
+                DEEPSEEK_V31_TOOL_FIXTURE,
+                DEEPSEEK_V31_TOOL_TEMPLATE_SIGNATURE,
+                "deepseek.v3.1.structural-json-tools.07b65954",
+            ),
+        ];
+
+        let production_entries = FORMAT_REGISTRY
+            .iter()
+            .filter(|entry| !entry.identity.starts_with("safemlx."))
+            .count();
+        assert_eq!(production_entries, fixtures.len());
+        for (template, expected_signature, expected_identity) in fixtures {
+            assert_eq!(
+                template_signature(template),
+                expected_signature,
+                "{expected_identity}"
+            );
+            let matches = matching_registry_entries(template, FORMAT_REGISTRY);
+            assert_eq!(matches.len(), 1, "{expected_identity}");
+            assert_eq!(matches[0].identity, expected_identity);
+        }
+    }
+
+    #[test]
+    fn compatible_cross_architecture_templates_share_dialect_implementations() {
+        let llama_nemotron = NEMOTRON_NANO_FIXTURE_WITH_TERMINATOR
+            .strip_suffix('\n')
+            .unwrap();
+        let nemotron_h = NEMOTRON_NANO_V2_FIXTURE_WITH_TERMINATOR
+            .strip_suffix('\n')
+            .unwrap();
+        let llama_entry = matching_registry_entries(llama_nemotron, FORMAT_REGISTRY)[0];
+        let nemotron_h_entry = matching_registry_entries(nemotron_h, FORMAT_REGISTRY)[0];
+        assert!(std::ptr::eq(llama_entry.dialect, nemotron_h_entry.dialect));
+        assert!(!llama_entry.parameters.ptr_eq(nemotron_h_entry.parameters));
+
+        let qwen_entry = matching_registry_entries(QWEN25_FIXTURE, FORMAT_REGISTRY)[0];
+        let llama_hermes_entry =
+            matching_registry_entries(HERMES2_PRO_TOOL_USE_FIXTURE, FORMAT_REGISTRY)[0];
+        assert!(std::ptr::eq(qwen_entry.dialect, llama_hermes_entry.dialect));
+        assert!(qwen_entry.parameters.ptr_eq(llama_hermes_entry.parameters));
+    }
+
+    #[test]
+    fn custom_inkling_templates_are_not_inferred_from_protocol_markers() {
+        let inkling_custom = concat!(
+            "{%- if tools -%}<|message_system|>tool_declare<|content_xml|>",
+            "{{ tools | tojson }}<|end_message|>{%- endif -%}",
+            "<|message_model|>name<|content_invoke_tool_json|>",
+        );
+        let prepared = prepare_format_profile(inkling_custom);
+        assert_eq!(prepared.identity, None);
+        assert!(prepared.dialect.is_none());
+        assert!(prepared
+            .native_tool_unavailable_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("no registered format profile")));
+    }
+
+    #[test]
     fn every_audited_production_template_revision_has_an_exact_registration() {
         let qwen3_current = QWEN3_CURRENT_FIXTURE_WITH_TERMINATOR
             .strip_suffix('\n')
@@ -1223,6 +1435,9 @@ mod tests {
         let nemotron = NEMOTRON_NANO_FIXTURE_WITH_TERMINATOR
             .strip_suffix('\n')
             .expect("the fixture-only file terminator is documented");
+        let nemotron_v2 = NEMOTRON_NANO_V2_FIXTURE_WITH_TERMINATOR
+            .strip_suffix('\n')
+            .expect("the fixture-only file terminator is documented");
         for (template, signature, identity, structural_tokens, stops) in [
             (
                 LLAMA31_33_FIXTURE,
@@ -1252,6 +1467,13 @@ mod tests {
                 &["<|eot_id|>"][..],
                 &["<|eot_id|>"][..],
             ),
+            (
+                nemotron_v2,
+                NEMOTRON_NANO_V2_TEMPLATE_SIGNATURE,
+                "nvidia.nemotron-nano-v2.json-list-tools.b7a3a520",
+                &["<SPECIAL_12>"][..],
+                &["<SPECIAL_12>"][..],
+            ),
         ] {
             assert_eq!(template_signature(template), signature, "{identity}");
             let prepared = prepare_format_profile(template);
@@ -1266,6 +1488,7 @@ mod tests {
             format!("{LLAMA32_FIXTURE} "),
             format!("{LLAMA4_FIXTURE} "),
             format!("{nemotron} "),
+            format!("{nemotron_v2} "),
             "{{ bos_token }} generic Llama template".to_owned(),
         ] {
             assert!(prepare_format_profile(&modified).dialect.is_none());

@@ -143,6 +143,8 @@ pub(crate) struct DelimitedChannel {
     pub(crate) suffix: &'static str,
     /// Whether the channel must occur before a tool-call collection.
     pub(crate) required: bool,
+    /// Whether the template's generation prompt has already emitted `prefix`.
+    pub(crate) prefix_in_prompt: bool,
 }
 
 /// Exact JSON syntax and semantic fields for one function call.
@@ -413,6 +415,11 @@ impl DeclarativeDialectSpec {
                     "declarative {name} channel requires non-empty delimiters"
                 ));
             }
+            if name == "text" && channel.is_some_and(|channel| channel.prefix_in_prompt) {
+                return Err(
+                    "only declarative reasoning channels may begin in the generation prompt".into(),
+                );
+            }
         }
         match (self.payload_shape, self.parallel_layout) {
             (DeclarativePayloadShape::JsonObject, ParallelCallLayout::RepeatedEnvelopes)
@@ -504,8 +511,11 @@ impl DeclarativeDialectSpec {
             );
         }
 
+        let constrained_reasoning_channel = self
+            .reasoning_channel
+            .filter(|channel| !(channel.prefix_in_prompt && tool_choice == ToolChoice::Auto));
         let mut grammar = String::from("start: ");
-        if let Some(channel) = self.reasoning_channel {
+        if let Some(channel) = constrained_reasoning_channel {
             grammar.push_str(if channel.required {
                 "reasoning "
             } else {
@@ -523,10 +533,14 @@ impl DeclarativeDialectSpec {
         }
         grammar.push_str("tool_output\n");
 
-        if let Some(channel) = self.reasoning_channel {
+        if let Some(channel) = constrained_reasoning_channel {
             grammar.push_str(&format!(
                 "reasoning: {} channel_text {}\n",
-                literal(channel.prefix)?,
+                literal(if channel.prefix_in_prompt {
+                    ""
+                } else {
+                    channel.prefix
+                })?,
                 literal(channel.suffix)?
             ));
         }
@@ -541,7 +555,7 @@ impl DeclarativeDialectSpec {
             grammar.push_str("raw_text: RAW_TEXT_CHARACTER+\n");
             grammar.push_str("RAW_TEXT_CHARACTER: /[^<]/\n");
         }
-        if self.reasoning_channel.is_some() || self.text_channel.is_some() {
+        if constrained_reasoning_channel.is_some() || self.text_channel.is_some() {
             grammar.push_str("channel_text: CHANNEL_TEXT_CHARACTER*\n");
             grammar.push_str("CHANNEL_TEXT_CHARACTER: /[^<]/\n");
         }
@@ -1062,6 +1076,10 @@ enum ChannelKind {
 
 #[derive(Debug)]
 enum DeclarativeParserState {
+    PrefilledChannelOrTool {
+        kind: ChannelKind,
+        suffix: &'static str,
+    },
     Outside,
     Channel {
         kind: ChannelKind,
@@ -1100,7 +1118,15 @@ impl DeclarativeParser {
     fn new(spec: &'static DeclarativeDialectSpec) -> Self {
         Self {
             spec,
-            state: DeclarativeParserState::Outside,
+            state: spec
+                .reasoning_channel
+                .filter(|channel| channel.prefix_in_prompt)
+                .map_or(DeclarativeParserState::Outside, |channel| {
+                    DeclarativeParserState::PrefilledChannelOrTool {
+                        kind: ChannelKind::Reasoning,
+                        suffix: channel.suffix,
+                    }
+                }),
             pending: String::new(),
         }
     }
@@ -1133,7 +1159,11 @@ impl DeclarativeParser {
 
     fn outside_delimiters(&self) -> Vec<&'static str> {
         let mut delimiters = Vec::new();
-        if let Some(channel) = self.spec.reasoning_channel {
+        if let Some(channel) = self
+            .spec
+            .reasoning_channel
+            .filter(|channel| !channel.prefix_in_prompt)
+        {
             delimiters.push(channel.prefix);
         }
         if let Some(channel) = self.spec.text_channel {
@@ -1298,7 +1328,24 @@ impl DeclarativeParser {
 
     fn process(&mut self, sink: &mut SemanticEventSink) -> Result<(), String> {
         loop {
+            let tool_start_delimiter = self.tool_start_delimiter();
             match &mut self.state {
+                DeclarativeParserState::PrefilledChannelOrTool { kind, suffix } => {
+                    if self.pending.is_empty() {
+                        return Ok(());
+                    }
+                    if self.pending.starts_with(tool_start_delimiter) {
+                        self.state = DeclarativeParserState::Outside;
+                        continue;
+                    }
+                    if tool_start_delimiter.starts_with(&self.pending) {
+                        return Ok(());
+                    }
+                    self.state = DeclarativeParserState::Channel {
+                        kind: *kind,
+                        suffix: *suffix,
+                    };
+                }
                 DeclarativeParserState::Outside => {
                     let delimiters = self.outside_delimiters();
                     let Some((position, index)) = self.earliest_delimiter(&delimiters) else {
@@ -1307,11 +1354,15 @@ impl DeclarativeParser {
                     };
                     sink.text(self.pending[..position].to_owned());
                     self.pending.drain(..position);
-                    let reasoning_index = self.spec.reasoning_channel.map(|_| 0);
+                    let generated_reasoning_channel = self
+                        .spec
+                        .reasoning_channel
+                        .filter(|channel| !channel.prefix_in_prompt);
+                    let reasoning_index = generated_reasoning_channel.map(|_| 0);
                     let text_index = self
                         .spec
                         .text_channel
-                        .map(|_| usize::from(self.spec.reasoning_channel.is_some()));
+                        .map(|_| usize::from(generated_reasoning_channel.is_some()));
                     if reasoning_index == Some(index) {
                         self.pending.drain(..delimiters[index].len());
                         self.state = DeclarativeParserState::Channel {
@@ -1877,6 +1928,14 @@ impl ProtocolParser for DeclarativeParser {
     fn finish(&mut self, sink: &mut SemanticEventSink) -> Result<(), Self::Error> {
         self.process(sink)?;
         match self.state {
+            DeclarativeParserState::PrefilledChannelOrTool {
+                kind: ChannelKind::Reasoning,
+                ..
+            } => sink.reasoning(std::mem::take(&mut self.pending)),
+            DeclarativeParserState::PrefilledChannelOrTool {
+                kind: ChannelKind::Text,
+                ..
+            } => sink.text(std::mem::take(&mut self.pending)),
             DeclarativeParserState::Outside => sink.text(std::mem::take(&mut self.pending)),
             DeclarativeParserState::Channel {
                 kind: ChannelKind::Reasoning,
@@ -1990,11 +2049,13 @@ mod tests {
             prefix: "<think>",
             suffix: "</think>",
             required: false,
+            prefix_in_prompt: false,
         }),
         text_channel: Some(DelimitedChannel {
             prefix: "<text>",
             suffix: "</text>",
             required: false,
+            prefix_in_prompt: false,
         }),
         raw_text_before_calls: false,
         call_separator: "\n",
@@ -2050,6 +2111,7 @@ mod tests {
             prefix: "<think>\n",
             suffix: "\n</think>",
             required: false,
+            prefix_in_prompt: false,
         }),
         text_channel: None,
         raw_text_before_calls: true,
@@ -2176,6 +2238,7 @@ mod tests {
             prefix: "<|channel>thought\n",
             suffix: "<channel|>",
             required: false,
+            prefix_in_prompt: false,
         }),
         text_channel: None,
         raw_text_before_calls: true,

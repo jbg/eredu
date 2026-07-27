@@ -4397,6 +4397,8 @@ mod tests {
     const NEMOTRON_NANO_FIXTURE_WITH_TERMINATOR: &str = include_str!(
         "../../tests/fixtures/chat_templates/llama-3.1-nemotron-nano-8b-v1-072b9ab4.jinja"
     );
+    const NEMOTRON_NANO_V2_FIXTURE_WITH_TERMINATOR: &str =
+        include_str!("../../tests/fixtures/chat_templates/nemotron-nano-v2-6533e8de.jinja");
     const GEMMA4_EDGE_FIXTURE: &str =
         include_str!("../../tests/fixtures/chat_templates/gemma-4-e2b-it-3e22461f.jinja");
     const GEMMA4_LARGE_FIXTURE: &str =
@@ -5552,6 +5554,217 @@ mod tests {
     }
 
     #[test]
+    fn production_nemotron_v2_covers_reasoning_constraints_and_streaming() {
+        let compiler = Ok(ConstraintCompiler::synthetic_for_tests());
+        let template = NEMOTRON_NANO_V2_FIXTURE_WITH_TERMINATOR
+            .strip_suffix('\n')
+            .expect("the fixture-only file terminator is documented");
+        let tool = json!({
+            "type": "function",
+            "function": {
+                "name": "lookup",
+                "description": "Look up text.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"query": {"type": "string"}},
+                    "required": ["query"],
+                    "additionalProperties": false
+                }
+            }
+        });
+        let messages = vec![
+            json!({"role": "system", "content": "Be brief. /think"}),
+            json!({"role": "user", "content": "first"}),
+            json!({
+                "role": "assistant",
+                "content": "<think>\nstale\n</think>\n\nworking",
+                "tool_calls": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "lookup",
+                            "arguments": {"query": "Bogotá"}
+                        }
+                    },
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "lookup",
+                            "arguments": r#"{"query":"a \"quote\""}"#
+                        }
+                    }
+                ]
+            }),
+            json!({"role": "tool", "content": "{\"result\":\"uno\"}"}),
+            json!({"role": "tool", "content": "{\"result\":\"dos\"}"}),
+            json!({"role": "user", "content": "again"}),
+        ];
+        let mut tokenizer = llama_chat_tokenizer(19, &["<SPECIAL_12>"]);
+        let required = prepare_chat_from_parts(
+            &mut tokenizer,
+            ModelChatTemplate::Single(template.into()),
+            "unrelated-architecture-name",
+            &[],
+            Some(&compiler),
+            ChatTemplateRequest {
+                messages,
+                tools: vec![tool.clone()],
+                tool_choice: ToolChoice::Required,
+                parallel_tool_calls: ParallelToolCallPolicy::Enabled {
+                    max_calls: std::num::NonZeroUsize::new(2),
+                },
+                add_generation_prompt: true,
+                ..ChatTemplateRequest::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            required.rendered_prompt(),
+            concat!(
+                "<SPECIAL_10>System\nBe brief.\n\n",
+                "You can use the following tools to assist the user if required:\n",
+                "<AVAILABLE_TOOLS>[",
+                r#"{"description":"Look up text.","name":"lookup","parameters":{"additionalProperties":false,"properties":{"query":{"type":"string"}},"required":["query"],"type":"object"}}"#,
+                "]</AVAILABLE_TOOLS>\n\n",
+                "If you decide to call any tool(s), use the following format:\n",
+                r#"<TOOLCALL>[{{"name": "tool_name1", "arguments": "tool_args1"}}, {{"name": "tool_name2", "arguments": "tool_args2"}}]</TOOLCALL>"#,
+                "\n\nThe user will execute tool-calls and return responses from tool(s) in this format:\n",
+                r#"<TOOL_RESPONSE>[{{"tool_response1"}}, {{"tool_response2"}}]</TOOL_RESPONSE>"#,
+                "\n\nBased on the tool responses, you can call additional tools if needed, ",
+                "correct tool calls if any errors are found, or just respond to the user.\n",
+                "<SPECIAL_11>User\nfirst\n",
+                "<SPECIAL_11>Assistant\nworking\n\n<TOOLCALL>[",
+                r#"{"name": "lookup", "arguments": {"query":"Bogotá"}}, "#,
+                r#"{"name": "lookup", "arguments": {"query":"a \"quote\""}}"#,
+                "]</TOOLCALL>\n<SPECIAL_12>\n",
+                "<SPECIAL_11>User\n<TOOL_RESPONSE>[",
+                r#"{"result":"uno"}, {"result":"dos"}"#,
+                "]</TOOL_RESPONSE>\n",
+                "<SPECIAL_11>User\nagain\n",
+                "<SPECIAL_11>Assistant\n<think>\n",
+            )
+        );
+        assert_eq!(
+            required.generation_prompt(),
+            "<SPECIAL_11>Assistant\n<think>\n"
+        );
+        assert_eq!(
+            required.format_profile_identity(),
+            Some("nvidia.nemotron-nano-v2.json-list-tools.b7a3a520")
+        );
+        assert_eq!(required.preserved_structural_token_ids(), &[19]);
+        assert_eq!(required.profile_stop_sequences(), ["<SPECIAL_12>"]);
+        let NativeToolSupport::Supported(required_plan) = required.native_tool_support() else {
+            panic!("registered Nemotron v2 profile must be supported");
+        };
+        assert_eq!(required_plan.auto_activation_trigger(), None);
+
+        let output = concat!(
+            "checking Bogotá 🦀\n</think>\n\n<TOOLCALL>[",
+            r#"{"name":"lookup","arguments":{"query":"Bogotá 🦀 \"quoted\" \\ path\n東京"}}, "#,
+            r#"{"name":"lookup","arguments":{"query":"second"}}"#,
+            "]</TOOLCALL>",
+        );
+        assert!(plan_accepts(required_plan, output));
+        assert!(!plan_accepts(
+            required_plan,
+            r#"<TOOLCALL>[{"name":"lookup","arguments":{"query":7}}]</TOOLCALL>"#
+        ));
+        assert!(!plan_accepts(
+            required_plan,
+            r#"<TOOLCALL>[{"name":"missing","arguments":{"query":"x"}}]</TOOLCALL>"#
+        ));
+
+        let mut parser = required_plan.create_parser().unwrap();
+        parser
+            .push(&format!("{output}<SPECIAL_12>ignored"))
+            .unwrap();
+        assert!(parser
+            .events()
+            .contains(&SemanticEvent::ReasoningDelta("checking Bogotá 🦀".into())));
+        assert_eq!(
+            tool_argument_events(parser.events()),
+            [
+                r#"{"query":"Bogotá 🦀 \"quoted\" \\ path\n東京"}"#,
+                r#"{"query":"second"}"#,
+            ]
+        );
+        assert_eq!(
+            parser.events().last(),
+            Some(&SemanticEvent::Finished {
+                reason: FinishReason::StopSequence,
+            })
+        );
+        for split in (0..=output.len()).filter(|index| output.is_char_boundary(*index)) {
+            let mut parser = required_plan.create_parser().unwrap();
+            parser.push(&output[..split]).unwrap();
+            parser
+                .push(&format!("{}<SPECIAL_12>", &output[split..]))
+                .unwrap();
+            assert_eq!(
+                tool_argument_events(parser.events()).len(),
+                2,
+                "split {split}"
+            );
+        }
+
+        let mut incomplete = required_plan.create_parser().unwrap();
+        incomplete
+            .push("reasoning\n</think>\n\n<TOOLCALL>[{\"name\":\"lookup\"")
+            .unwrap();
+        incomplete.finish(FinishReason::MaxTokens).unwrap();
+        assert!(!incomplete
+            .events()
+            .iter()
+            .any(|event| matches!(event, SemanticEvent::ToolCallEnd)));
+        let mut malformed = required_plan.create_parser().unwrap();
+        assert!(malformed
+            .push(
+                "reasoning\n</think>\n\n<TOOLCALL>[{\"name\":\"lookup\",\"arguments\":{\"query\":]}}"
+            )
+            .is_err());
+
+        let mut tokenizer = llama_chat_tokenizer(23, &["<SPECIAL_12>"]);
+        let auto = prepare_chat_from_parts(
+            &mut tokenizer,
+            ModelChatTemplate::Single(template.into()),
+            "nemotron_h",
+            &[],
+            Some(&compiler),
+            ChatTemplateRequest {
+                messages: vec![
+                    json!({"role": "system", "content": "/no_think"}),
+                    json!({"role": "user", "content": "lookup"}),
+                ],
+                tools: vec![tool],
+                tool_choice: ToolChoice::Auto,
+                parallel_tool_calls: ParallelToolCallPolicy::Disabled,
+                add_generation_prompt: true,
+                ..ChatTemplateRequest::default()
+            },
+        )
+        .unwrap();
+        assert!(auto
+            .rendered_prompt()
+            .ends_with("<SPECIAL_11>Assistant\n<think></think>"));
+        let NativeToolSupport::Supported(auto_plan) = auto.native_tool_support() else {
+            panic!("registered Nemotron v2 Auto profile must be supported");
+        };
+        assert_eq!(auto_plan.auto_activation_trigger(), Some("<TOOLCALL>["));
+        assert!(plan_accepts(
+            auto_plan,
+            r#"<TOOLCALL>[{"name":"lookup","arguments":{"query":"one"}}]</TOOLCALL>"#
+        ));
+        assert!(!plan_accepts(
+            auto_plan,
+            concat!(
+                r#"<TOOLCALL>[{"name":"lookup","arguments":{"query":"one"}}, "#,
+                r#"{"name":"lookup","arguments":{"query":"two"}}]</TOOLCALL>"#
+            )
+        ));
+    }
+
+    #[test]
     fn llama_auto_and_required_activation_are_exact_without_family_fallback() {
         let compiler = Ok(ConstraintCompiler::synthetic_for_tests());
         let nemotron = NEMOTRON_NANO_FIXTURE_WITH_TERMINATOR
@@ -6684,6 +6897,69 @@ mod tests {
     }
 
     #[test]
+    fn named_template_registry_selection_hashes_only_the_selected_body() {
+        let compiler = Ok(ConstraintCompiler::synthetic_for_tests());
+        let templates = ModelChatTemplate::Named(BTreeMap::from([
+            ("default".into(), "unregistered named default".into()),
+            ("tool_use".into(), HERMES2_PRO_TOOL_USE_FIXTURE.to_owned()),
+        ]));
+
+        let mut tokenizer = production_chat_tokenizer(31);
+        let default = prepare_chat_from_parts(
+            &mut tokenizer,
+            templates.clone(),
+            "named-selection",
+            &[],
+            Some(&compiler),
+            ChatTemplateRequest {
+                messages: vec![json!({"role": "user", "content": "hello"})],
+                tool_choice: ToolChoice::None,
+                add_generation_prompt: true,
+                ..ChatTemplateRequest::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            default.template_identity(),
+            &ChatTemplateIdentity::Named("default".into())
+        );
+        assert_eq!(default.format_profile_identity(), None);
+        assert!(matches!(
+            default.native_tool_support(),
+            NativeToolSupport::Unsupported { reason }
+                if reason.contains("no registered format profile")
+        ));
+
+        let selected_tool_use = prepare_chat_from_parts(
+            &mut tokenizer,
+            templates,
+            "named-selection",
+            &[],
+            Some(&compiler),
+            ChatTemplateRequest {
+                messages: vec![json!({"role": "user", "content": "call lookup"})],
+                tools: vec![production_tool("lookup")],
+                tool_choice: ToolChoice::Required,
+                add_generation_prompt: true,
+                ..ChatTemplateRequest::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            selected_tool_use.template_identity(),
+            &ChatTemplateIdentity::Named("tool_use".into())
+        );
+        assert_eq!(
+            selected_tool_use.format_profile_identity(),
+            Some("hermes.xml-tools.7ce09d55")
+        );
+        assert!(matches!(
+            selected_tool_use.native_tool_support(),
+            NativeToolSupport::Supported(_)
+        ));
+    }
+
+    #[test]
     fn synthetic_profile_compiles_request_tools_before_rendering() {
         let mut tokenizer = synthetic_chat_tokenizer(0);
         let compiler = Ok(ConstraintCompiler::synthetic_for_tests());
@@ -6847,6 +7123,34 @@ mod tests {
             Error::ToolConstraint(ref message)
                 if message.contains(SYNTHETIC_STRUCTURAL_TOKEN)
                     && message.contains("not registered as a special token")
+        ));
+    }
+
+    #[test]
+    fn grammar_compiler_failure_is_reported_before_prompt_rendering() {
+        let mut tokenizer = synthetic_chat_tokenizer(0);
+        let compiler = Err("failed to compile tool grammar: synthetic compiler failure".into());
+        let error = prepare_chat_from_parts(
+            &mut tokenizer,
+            ModelChatTemplate::Single(SYNTHETIC_TOOL_TEMPLATE.into()),
+            "synthetic-grammar-failure",
+            &[],
+            Some(&compiler),
+            ChatTemplateRequest {
+                tool_choice: ToolChoice::Required,
+                extra_template_kwargs: serde_json::Map::from_iter([(
+                    "fail_render".into(),
+                    json!(true),
+                )]),
+                ..ChatTemplateRequest::default()
+            },
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            Error::ToolConstraint(ref message)
+                if message == "failed to compile tool grammar: synthetic compiler failure"
         ));
     }
 

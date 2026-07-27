@@ -18,6 +18,7 @@ the selected body only; repository or model metadata is not a support key.
 | `llama-3.2-5816fce1.jinja` | `meta-llama/Llama-3.2-3B-Instruct` | `0cb88a4f764b7a12671c53f0838cd831a0843b95` | single `chat_template` |
 | `llama-4-01a91bfb.jinja` | `meta-llama/Llama-4-Scout-17B-16E-Instruct` | `92f3b1597a195b523d8d9e5700e57e4fbb8f20d3` | single `chat_template` |
 | `llama-3.1-nemotron-nano-8b-v1-072b9ab4.jinja` | `nvidia/Llama-3.1-Nemotron-Nano-8B-v1` | `54641c1611fcff44fa4865626462445e0a153fc7` | single `chat_template` |
+| `nemotron-nano-v2-6533e8de.jinja` | `nvidia/NVIDIA-Nemotron-Nano-9B-v2` | `6533e8de2c68e4536bf7c411d7a3ce5734111476` | single `chat_template` |
 | `gemma-4-e2b-it-3e22461f.jinja` | `google/gemma-4-E2B-it` | `3e22461f65e89153144f8adb70e3b8c2cc9845a7` | `chat_template.jinja` |
 | `gemma-4-26b-a4b-it-4d7ae498.jinja` | `google/gemma-4-26B-A4B-it` | `4d7ae4984b7db7de8f8457170b3f1a419ee76d52` | `chat_template.jinja` |
 | `gpt-oss-harmony-a4c9919c.jinja` | `openai/gpt-oss-20b` | `6cee5e81ee83917806bbde320786a8fb61efebee` | `chat_template.jinja` |
@@ -55,6 +56,17 @@ byte-identical to `meta-llama/Llama-4-Maverick-17B-128E-Instruct` revision
 share exact registrations; no family or repository metadata is inspected.
 The upstream Nemotron body does not end in a line feed, so its fixture carries
 one repository file terminator that signature tests remove explicitly.
+
+The Nemotron Nano v2 body is byte-identical in
+`nvidia/NVIDIA-Nemotron-Nano-12B-v2` revision
+`f428df0ec725fed457b89cfca54dc26500fb88c1`. Both Nemotron-H releases share
+one exact registration. Their JSON-list call envelope reuses the declarative
+Nemotron implementation also used by the Llama-based Nano v1 registration,
+with a separate parameter set for the `<SPECIAL_12>` stop and the reasoning
+channel whose `<think>` prefix is already present in the generation prompt.
+The upstream body does not end in a line feed, so its fixture carries one
+repository file terminator that signature and rendering tests remove
+explicitly.
 
 The Gemma 4 E2B fixture is byte-identical to `google/gemma-4-E4B-it`
 revision `ee0ef6023621cff504d758262d4e04895a5af4a2`. The 26B-A4B fixture is
