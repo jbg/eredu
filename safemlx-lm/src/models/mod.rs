@@ -2044,6 +2044,15 @@ fn prepare_chat_from_parts(
     let selected = template.select(Some(&request.tools))?;
     let template_identity = selected.identity().clone();
     let profile = prepare_format_profile(selected.template());
+    if request.enable_thinking == Some(true)
+        && !request.tools.is_empty()
+        && !profile.supports_tool_reasoning
+    {
+        return Err(Error::ToolConstraint(format!(
+            "format profile {:?} does not preserve reasoning semantics while native tools are active",
+            profile.identity.as_deref().unwrap_or("unregistered")
+        )));
+    }
     let (native_tool_support, preserved_structural_token_ids) =
         match (profile.dialect, profile.dialect_parameters) {
             (Some(dialect), Some(parameters)) => {
@@ -2102,7 +2111,7 @@ fn prepare_chat_from_parts(
 
     if let Some(enable_thinking) = enable_thinking {
         extra_template_kwargs.insert(
-            "enable_thinking".into(),
+            profile.reasoning_template_kwarg.into(),
             serde_json::Value::Bool(enable_thinking),
         );
     }
@@ -4400,6 +4409,10 @@ mod tests {
         include_str!("../../tests/fixtures/chat_templates/lfm2.5-8b-a1b-5673e0de.jinja");
     const LFM25_VL_FIXTURE_WITH_TERMINATOR: &str =
         include_str!("../../tests/fixtures/chat_templates/lfm2.5-vl-450m-fc6221ca.jinja");
+    const DEEPSEEK_V3_TOOL_FIXTURE: &str =
+        include_str!("../../tests/fixtures/chat_templates/deepseek-v3-tools-7e28c67d.jinja");
+    const DEEPSEEK_V31_TOOL_FIXTURE: &str =
+        include_str!("../../tests/fixtures/chat_templates/deepseek-v3.1-tools-ef1ab230.jinja");
 
     #[test]
     #[ignore = "requires MLX runtime execution and SAFEMLX_INSPECTION_MODEL_DIR"]
@@ -4631,6 +4644,37 @@ mod tests {
         tokenizer.set_template_kwargs(serde_json::Map::from_iter([(
             "bos_token".into(),
             json!("<|startoftext|>"),
+        )]));
+        tokenizer
+    }
+
+    fn deepseek_chat_tokenizer(preceding_tokens: usize) -> ChatTokenizer {
+        let mut raw = Tokenizer::new(WordLevel::default());
+        raw.add_tokens(
+            (0..preceding_tokens)
+                .map(|index| AddedToken::from(format!("ordinary_{index}"), false))
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        assert_eq!(
+            raw.add_special_tokens(
+                [
+                    "<｜tool▁calls▁begin｜>",
+                    "<｜tool▁calls▁end｜>",
+                    "<｜tool▁call▁begin｜>",
+                    "<｜tool▁call▁end｜>",
+                    "<｜tool▁sep｜>",
+                    "<｜end▁of▁sentence｜>",
+                ]
+                .map(|token| AddedToken::from(token, true).normalized(false))
+            )
+            .unwrap(),
+            6
+        );
+        let mut tokenizer = ChatTokenizer::from_tokenizer(raw);
+        tokenizer.set_template_kwargs(serde_json::Map::from_iter([(
+            "bos_token".into(),
+            json!("<｜begin▁of▁sentence｜>"),
         )]));
         tokenizer
     }
@@ -5769,6 +5813,512 @@ mod tests {
             panic!("exact classic LFM2 template signature must prepare Python tools");
         };
         assert_eq!(plan.auto_activation_trigger(), Some("<|tool_call_start|>"));
+    }
+
+    #[test]
+    fn production_deepseek_templates_render_tools_history_and_exact_generation_prompts() {
+        let compiler = Ok(ConstraintCompiler::synthetic_for_tests());
+        let tools = vec![production_tool("lookup")];
+        let messages = vec![
+            json!({"role": "system", "content": "Be exact."}),
+            json!({"role": "user", "content": "Look it up."}),
+            json!({
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "type": "function",
+                    "function": {"name": "lookup", "arguments": {"value": 7}}
+                }]
+            }),
+            json!({"role": "tool", "content": "{\"result\":\"Bogotá\"}"}),
+        ];
+
+        for (template, identity, preceding_tokens, golden_prompt_signature) in [
+            (
+                DEEPSEEK_V3_TOOL_FIXTURE,
+                "deepseek.v3.structural-json-tools.a3b4449b",
+                31,
+                [
+                    0xa0, 0x3b, 0xd6, 0x32, 0x50, 0xe4, 0xd0, 0x15, 0x32, 0x7d, 0xc8, 0x54, 0x68,
+                    0x6b, 0x34, 0x89, 0xcd, 0x1f, 0x3b, 0x38, 0x29, 0x57, 0xdd, 0x92, 0x99, 0xb7,
+                    0x7f, 0x00, 0xe7, 0xdd, 0x21, 0x3c,
+                ],
+            ),
+            (
+                DEEPSEEK_V31_TOOL_FIXTURE,
+                "deepseek.v3.1.structural-json-tools.07b65954",
+                41,
+                [
+                    0x76, 0x4c, 0x69, 0x2b, 0x69, 0x47, 0xc4, 0xcc, 0x9a, 0x15, 0xf8, 0x14, 0xc1,
+                    0xc9, 0x66, 0x18, 0xff, 0x91, 0x71, 0x29, 0xea, 0xdf, 0x7d, 0xf2, 0x2d, 0x95,
+                    0xc7, 0x40, 0x64, 0xee, 0xd5, 0x85,
+                ],
+            ),
+        ] {
+            let mut tokenizer = deepseek_chat_tokenizer(preceding_tokens);
+            let prepared = prepare_chat_from_parts(
+                &mut tokenizer,
+                ModelChatTemplate::Single(template.into()),
+                "deepseek architecture metadata is not a support key",
+                &[99],
+                Some(&compiler),
+                ChatTemplateRequest {
+                    messages: messages.clone(),
+                    tools: tools.clone(),
+                    tool_choice: ToolChoice::Required,
+                    enable_thinking: Some(false),
+                    add_generation_prompt: true,
+                    ..ChatTemplateRequest::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(
+                crate::chat::template_signature(prepared.rendered_prompt()),
+                golden_prompt_signature,
+                "exact rendered history golden for {identity}"
+            );
+            assert_eq!(prepared.format_profile_identity(), Some(identity));
+            assert_eq!(
+                prepared.preserved_structural_token_ids(),
+                &[
+                    preceding_tokens as u32,
+                    preceding_tokens as u32 + 1,
+                    preceding_tokens as u32 + 2,
+                    preceding_tokens as u32 + 3,
+                    preceding_tokens as u32 + 4,
+                    preceding_tokens as u32 + 5,
+                ]
+            );
+            assert_eq!(prepared.profile_stop_sequences(), ["<｜end▁of▁sentence｜>"]);
+            assert!(prepared.rendered_prompt().contains("lookup"));
+            assert!(prepared.rendered_prompt().contains("{\"value\":7}"));
+            assert!(prepared.rendered_prompt().contains("Bogotá"));
+        }
+
+        for (template, identity, expected_generation_prompt, golden_prompt_signature) in [
+            (
+                DEEPSEEK_V3_TOOL_FIXTURE,
+                "deepseek.v3.structural-json-tools.a3b4449b",
+                "",
+                [
+                    0x46, 0xf0, 0xed, 0x06, 0x01, 0x25, 0x07, 0x5c, 0x56, 0x06, 0x9a, 0x84, 0x3b,
+                    0x8b, 0xd7, 0x35, 0x8f, 0x6e, 0xb9, 0xa4, 0x45, 0x2f, 0xb3, 0x93, 0x98, 0x5d,
+                    0x4e, 0xad, 0xba, 0xab, 0xf9, 0x56,
+                ],
+            ),
+            (
+                DEEPSEEK_V31_TOOL_FIXTURE,
+                "deepseek.v3.1.structural-json-tools.07b65954",
+                "\n  <｜Assistant｜>\n    </think>\n",
+                [
+                    0x74, 0x80, 0x75, 0x7f, 0x81, 0xa5, 0x3b, 0xae, 0x1f, 0x51, 0x44, 0x51, 0xe3,
+                    0x90, 0xb1, 0x39, 0x72, 0xb8, 0x44, 0xa3, 0xb1, 0x68, 0xf3, 0xf8, 0x21, 0x1a,
+                    0xbf, 0x85, 0xc0, 0xe4, 0x75, 0xf8,
+                ],
+            ),
+        ] {
+            let mut tokenizer = deepseek_chat_tokenizer(51);
+            let prepared = prepare_chat_from_parts(
+                &mut tokenizer,
+                ModelChatTemplate::Single(template.into()),
+                "unrelated",
+                &[],
+                Some(&compiler),
+                ChatTemplateRequest {
+                    messages: vec![json!({"role": "user", "content": "Look it up."})],
+                    tools: tools.clone(),
+                    tool_choice: ToolChoice::Auto,
+                    enable_thinking: Some(false),
+                    add_generation_prompt: true,
+                    extra_template_kwargs: serde_json::Map::from_iter([
+                        ("enable_thinking".into(), json!(true)),
+                        ("thinking".into(), json!(true)),
+                    ]),
+                    ..ChatTemplateRequest::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(
+                crate::chat::template_signature(prepared.rendered_prompt()),
+                golden_prompt_signature,
+                "exact fresh prompt golden for {identity}"
+            );
+            assert_eq!(prepared.generation_prompt(), expected_generation_prompt);
+        }
+
+        for template in [DEEPSEEK_V3_TOOL_FIXTURE, DEEPSEEK_V31_TOOL_FIXTURE] {
+            let error = prepare_chat_from_parts(
+                &mut deepseek_chat_tokenizer(61),
+                ModelChatTemplate::Single(template.into()),
+                "unrelated",
+                &[],
+                Some(&compiler),
+                ChatTemplateRequest {
+                    messages: vec![json!({"role": "user", "content": "Look it up."})],
+                    tools: tools.clone(),
+                    tool_choice: ToolChoice::Required,
+                    enable_thinking: Some(true),
+                    add_generation_prompt: true,
+                    ..ChatTemplateRequest::default()
+                },
+            )
+            .unwrap_err();
+            assert!(matches!(error, Error::ToolConstraint(_)));
+        }
+    }
+
+    #[test]
+    fn production_deepseek_tool_boundaries_are_constrained_and_stream_incrementally() {
+        fn prepare(
+            template: &str,
+            tools: Vec<serde_json::Value>,
+            tool_choice: ToolChoice,
+            parallel_tool_calls: ParallelToolCallPolicy,
+            preceding_tokens: usize,
+        ) -> Result<PreparedChat, Error> {
+            prepare_chat_from_parts(
+                &mut deepseek_chat_tokenizer(preceding_tokens),
+                ModelChatTemplate::Single(template.into()),
+                "architecture-metadata-must-not-select-deepseek",
+                &[],
+                Some(&Ok(ConstraintCompiler::synthetic_for_tests())),
+                ChatTemplateRequest {
+                    messages: vec![json!({"role": "user", "content": "Use a tool."})],
+                    tools,
+                    tool_choice,
+                    parallel_tool_calls,
+                    enable_thinking: Some(false),
+                    add_generation_prompt: true,
+                    ..ChatTemplateRequest::default()
+                },
+            )
+        }
+
+        let one_v31 = concat!(
+            "<｜tool▁calls▁begin｜>",
+            "<｜tool▁call▁begin｜>lookup<｜tool▁sep｜>{\"value\":7}",
+            "<｜tool▁call▁end｜><｜tool▁calls▁end｜>",
+        );
+        let two_v31 = concat!(
+            "<｜tool▁calls▁begin｜>",
+            "<｜tool▁call▁begin｜>lookup<｜tool▁sep｜>{\"value\":7}<｜tool▁call▁end｜>",
+            "<｜tool▁call▁begin｜>lookup<｜tool▁sep｜>{\"value\":8}<｜tool▁call▁end｜>",
+            "<｜tool▁calls▁end｜>",
+        );
+        let three_v31 = concat!(
+            "<｜tool▁calls▁begin｜>",
+            "<｜tool▁call▁begin｜>lookup<｜tool▁sep｜>{\"value\":7}<｜tool▁call▁end｜>",
+            "<｜tool▁call▁begin｜>lookup<｜tool▁sep｜>{\"value\":8}<｜tool▁call▁end｜>",
+            "<｜tool▁call▁begin｜>lookup<｜tool▁sep｜>{\"value\":9}<｜tool▁call▁end｜>",
+            "<｜tool▁calls▁end｜>",
+        );
+        let one_v3 = concat!(
+            "<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>function<｜tool▁sep｜>lookup\n",
+            "```json\n{\"value\":7}\n```<｜tool▁call▁end｜><｜tool▁calls▁end｜>",
+        );
+
+        let required = prepare(
+            DEEPSEEK_V31_TOOL_FIXTURE,
+            vec![production_tool("lookup")],
+            ToolChoice::Required,
+            ParallelToolCallPolicy::Disabled,
+            71,
+        )
+        .unwrap();
+        let NativeToolSupport::Supported(required_plan) = required.native_tool_support() else {
+            panic!("registered DeepSeek V3.1 template must prepare native tools");
+        };
+        assert_eq!(required_plan.auto_activation_trigger(), None);
+        assert!(plan_accepts(required_plan, one_v31));
+        assert!(plan_accepts(
+            required_plan,
+            &format!("Need 東京 🦀{one_v31}")
+        ));
+        assert!(!plan_accepts(required_plan, two_v31));
+        assert!(
+            ConstrainedSampler::from_tool_plan(DefaultSampler, required_plan)
+                .unwrap()
+                .constraint_is_active()
+        );
+
+        let parallel = prepare(
+            DEEPSEEK_V31_TOOL_FIXTURE,
+            vec![production_tool("lookup")],
+            ToolChoice::Required,
+            ParallelToolCallPolicy::Enabled {
+                max_calls: std::num::NonZeroUsize::new(2),
+            },
+            81,
+        )
+        .unwrap();
+        let NativeToolSupport::Supported(parallel_plan) = parallel.native_tool_support() else {
+            panic!("registered DeepSeek V3.1 template must prepare parallel tools");
+        };
+        assert!(plan_accepts(parallel_plan, two_v31));
+        assert!(!plan_accepts(parallel_plan, three_v31));
+
+        let auto = prepare(
+            DEEPSEEK_V31_TOOL_FIXTURE,
+            vec![production_tool("lookup")],
+            ToolChoice::Auto,
+            ParallelToolCallPolicy::Disabled,
+            91,
+        )
+        .unwrap();
+        let NativeToolSupport::Supported(auto_plan) = auto.native_tool_support() else {
+            panic!("registered DeepSeek V3.1 template must prepare Auto tools");
+        };
+        assert_eq!(
+            auto_plan.auto_activation_trigger(),
+            Some("<｜tool▁calls▁begin｜>")
+        );
+        assert!(
+            !ConstrainedSampler::from_tool_plan(DefaultSampler, auto_plan)
+                .unwrap()
+                .constraint_is_active()
+        );
+        assert!(plan_accepts(auto_plan, one_v31));
+
+        let old_surface = prepare(
+            DEEPSEEK_V3_TOOL_FIXTURE,
+            vec![production_tool("lookup")],
+            ToolChoice::Required,
+            ParallelToolCallPolicy::Disabled,
+            101,
+        )
+        .unwrap();
+        let NativeToolSupport::Supported(old_plan) = old_surface.native_tool_support() else {
+            panic!("registered DeepSeek V3 template must prepare native tools");
+        };
+        assert!(plan_accepts(old_plan, one_v3));
+        assert!(!plan_accepts(old_plan, one_v31));
+
+        for malformed in [
+            "<｜tool▁calls▁begin｜>",
+            "<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>",
+            "<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>lookup:{\"value\":7}<｜tool▁call▁end｜><｜tool▁calls▁end｜>",
+            "<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>missing<｜tool▁sep｜>{\"value\":7}<｜tool▁call▁end｜><｜tool▁calls▁end｜>",
+            "<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>lookup<｜tool▁sep｜>{\"value\":\"seven\"}<｜tool▁call▁end｜><｜tool▁calls▁end｜>",
+            "<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>lookup<｜tool▁sep｜>[7]<｜tool▁call▁end｜><｜tool▁calls▁end｜>",
+            "<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>lookup<｜tool▁sep｜>{\"value\":7,}<｜tool▁call▁end｜><｜tool▁calls▁end｜>",
+            "<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>lookup<｜tool▁sep｜>{\"value\":7}<｜tool▁call▁end｜>",
+            "<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>lookup<｜tool▁sep｜>{\"value\":7}<｜tool▁call▁end｜> <｜tool▁calls▁end｜>",
+        ] {
+            assert!(!plan_accepts(parallel_plan, malformed), "{malformed:?}");
+        }
+
+        let city_tool = json!({
+            "type": "function",
+            "function": {
+                "name": "city_lookup",
+                "description": "Look up a city.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"city": {"type": "string"}},
+                    "required": ["city"],
+                    "additionalProperties": false
+                }
+            }
+        });
+        let unicode = prepare(
+            DEEPSEEK_V31_TOOL_FIXTURE,
+            vec![city_tool],
+            ToolChoice::Required,
+            ParallelToolCallPolicy::Disabled,
+            111,
+        )
+        .unwrap();
+        let NativeToolSupport::Supported(unicode_plan) = unicode.native_tool_support() else {
+            panic!("registered DeepSeek V3.1 template must prepare Unicode arguments");
+        };
+        assert!(plan_accepts(
+            unicode_plan,
+            concat!(
+                "<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>city_lookup<｜tool▁sep｜>",
+                "{\"city\":\"東京 🦀\"}<｜tool▁call▁end｜><｜tool▁calls▁end｜>",
+            )
+        ));
+
+        for invalid_name in [
+            "lookup.city".to_owned(),
+            "herramienta_ñ".to_owned(),
+            "x".repeat(65),
+        ] {
+            let error = prepare(
+                DEEPSEEK_V31_TOOL_FIXTURE,
+                vec![production_tool(&invalid_name)],
+                ToolChoice::Required,
+                ParallelToolCallPolicy::Disabled,
+                121,
+            )
+            .unwrap_err();
+            assert!(
+                matches!(error, Error::ToolConstraint(_)),
+                "{invalid_name:?}"
+            );
+        }
+        prepare(
+            DEEPSEEK_V31_TOOL_FIXTURE,
+            vec![production_tool(&"x".repeat(64))],
+            ToolChoice::Required,
+            ParallelToolCallPolicy::Disabled,
+            131,
+        )
+        .unwrap();
+        let too_many = (0..129)
+            .map(|index| production_tool(&format!("tool_{index}")))
+            .collect();
+        assert!(matches!(
+            prepare(
+                DEEPSEEK_V31_TOOL_FIXTURE,
+                too_many,
+                ToolChoice::Required,
+                ParallelToolCallPolicy::Disabled,
+                141,
+            ),
+            Err(Error::ToolConstraint(message)) if message.contains("at most 128 tools")
+        ));
+        assert!(matches!(
+            prepare(
+                DEEPSEEK_V31_TOOL_FIXTURE,
+                vec![json!({"type": "function", "function": {"name": "broken"}})],
+                ToolChoice::Required,
+                ParallelToolCallPolicy::Disabled,
+                151,
+            ),
+            Err(Error::ToolConstraint(_))
+        ));
+
+        let streamed = format!("Need 東京 🦀{two_v31}<｜end▁of▁sentence｜>ignored");
+        for split in (0..=streamed.len()).filter(|index| streamed.is_char_boundary(*index)) {
+            let mut parser = parallel_plan.create_parser().unwrap();
+            parser.push(&streamed[..split]).unwrap();
+            parser.push(&streamed[split..]).unwrap();
+            assert_eq!(
+                tool_argument_events(parser.events()).concat(),
+                "{\"value\":7}{\"value\":8}",
+                "split {split}"
+            );
+            let visible = parser
+                .events()
+                .iter()
+                .filter_map(|event| match event {
+                    SemanticEvent::TextDelta(text) => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect::<String>();
+            assert_eq!(visible, "Need 東京 🦀", "split {split}");
+            assert_eq!(
+                parser
+                    .events()
+                    .iter()
+                    .filter(|event| matches!(event, SemanticEvent::ToolCallEnd))
+                    .count(),
+                2,
+                "split {split}"
+            );
+            assert_eq!(
+                parser.events().last(),
+                Some(&SemanticEvent::Finished {
+                    reason: FinishReason::StopSequence,
+                }),
+                "split {split}"
+            );
+        }
+
+        let mut incremental = parallel_plan.create_parser().unwrap();
+        incremental
+            .push(concat!(
+                "<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>",
+                "lookup<｜tool▁sep｜>{"
+            ))
+            .unwrap();
+        assert!(incremental
+            .events()
+            .contains(&SemanticEvent::ToolCallStart {
+                index: 0,
+                id: "call_0".into(),
+                name: "lookup".into(),
+            }));
+        assert_eq!(tool_argument_events(incremental.events()), ["{"]);
+
+        let mut incomplete = parallel_plan.create_parser().unwrap();
+        incomplete
+            .push(concat!(
+                "<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>",
+                "lookup<｜tool▁sep｜>{\"value\":7}"
+            ))
+            .unwrap();
+        incomplete.finish(FinishReason::MaxTokens).unwrap();
+        assert!(!incomplete
+            .events()
+            .iter()
+            .any(|event| matches!(event, SemanticEvent::ToolCallEnd)));
+        assert_eq!(
+            incomplete.events().last(),
+            Some(&SemanticEvent::Finished {
+                reason: FinishReason::MaxTokens,
+            })
+        );
+
+        let mut malformed = parallel_plan.create_parser().unwrap();
+        assert!(malformed
+            .push(concat!(
+                "<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>",
+                "lookup<｜tool▁sep｜>{\"value\":]}"
+            ))
+            .is_err());
+
+        let mut caller_stop = parallel_plan
+            .create_parser_with_stops(["CALLER_STOP"])
+            .unwrap();
+        caller_stop.push("VisibleCALLER_STOPmust not leak").unwrap();
+        assert!(caller_stop
+            .events()
+            .contains(&SemanticEvent::TextDelta("Visible".into())));
+        assert_eq!(
+            caller_stop.events().last(),
+            Some(&SemanticEvent::Finished {
+                reason: FinishReason::StopSequence,
+            })
+        );
+
+        let mut raw = Tokenizer::new(WordLevel::default());
+        raw.add_special_tokens(
+            [
+                "<｜tool▁calls▁begin｜>",
+                "<｜tool▁calls▁end｜>",
+                "<｜tool▁call▁begin｜>",
+                "<｜tool▁call▁end｜>",
+                "<｜tool▁sep｜>",
+            ]
+            .map(|token| AddedToken::from(token, true).normalized(false)),
+        )
+        .unwrap();
+        let mut missing_structural = ChatTokenizer::from_tokenizer(raw);
+        missing_structural.set_template_kwargs(serde_json::Map::from_iter([(
+            "bos_token".into(),
+            json!("<｜begin▁of▁sentence｜>"),
+        )]));
+        let missing_error = prepare_chat_from_parts(
+            &mut missing_structural,
+            ModelChatTemplate::Single(DEEPSEEK_V31_TOOL_FIXTURE.into()),
+            "unrelated",
+            &[],
+            Some(&Ok(ConstraintCompiler::synthetic_for_tests())),
+            ChatTemplateRequest {
+                messages: vec![json!({"role": "user", "content": "Use a tool."})],
+                tools: vec![production_tool("lookup")],
+                tool_choice: ToolChoice::Required,
+                enable_thinking: Some(false),
+                add_generation_prompt: true,
+                ..ChatTemplateRequest::default()
+            },
+        )
+        .unwrap_err();
+        assert!(
+            matches!(missing_error, Error::ToolConstraint(message) if message.contains("<｜end▁of▁sentence｜>"))
+        );
     }
 
     #[test]

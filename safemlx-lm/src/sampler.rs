@@ -1104,6 +1104,8 @@ mod tests {
 
     const SYNTHETIC_SPEC: DeclarativeDialectSpec = DeclarativeDialectSpec {
         generation_prompt_behavior: GenerationPromptBehavior::HonorRequest,
+        reasoning_template_kwarg: "enable_thinking",
+        supports_tool_reasoning: true,
         output: ExactEnvelope {
             prefix: r#"{"calls":"#,
             suffix: "}",
@@ -1119,6 +1121,7 @@ mod tests {
         raw_text_before_calls: false,
         call_separator: ",",
         parallel_layout: ParallelCallLayout::SingleEnvelope,
+        protocol_max_tools: None,
         protocol_max_calls: None,
         auto_activation_trigger: Some(r#"{"calls":"#),
         required_structural_tokens: &[],

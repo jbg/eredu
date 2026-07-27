@@ -17,8 +17,8 @@ use sha2::{Digest, Sha256};
 
 use crate::format_dialect::{
     DeclarativeCallId, DeclarativeDialectSpec, DeclarativePayloadShape, DelimitedChannel,
-    ExactEnvelope, JsonFunctionEnvelope, ParallelCallLayout, StructuralObjectEncoding,
-    DECLARATIVE_DIALECT,
+    ExactEnvelope, JsonFunctionEnvelope, NamedJsonArgumentsEncoding, ParallelCallLayout,
+    StructuralObjectEncoding, ToolNameConstraint, DECLARATIVE_DIALECT,
 };
 use crate::{
     format_dialect::{
@@ -316,6 +316,8 @@ pub(crate) struct PreparedFormatProfile {
     pub(crate) dialect: Option<&'static dyn FormatDialect>,
     pub(crate) dialect_parameters: Option<DialectParameters>,
     pub(crate) generation_prompt_behavior: GenerationPromptBehavior,
+    pub(crate) reasoning_template_kwarg: &'static str,
+    pub(crate) supports_tool_reasoning: bool,
     pub(crate) native_tool_unavailable_reason: Option<String>,
     pub(crate) required_structural_tokens: Vec<String>,
     pub(crate) stop_sequences: Vec<String>,
@@ -337,6 +339,8 @@ const SYNTHETIC_TOOL_TEMPLATE_SIGNATURE: [u8; 32] = [
 
 const QWEN_XML_TOOL_SPEC: DeclarativeDialectSpec = DeclarativeDialectSpec {
     generation_prompt_behavior: GenerationPromptBehavior::HonorRequest,
+    reasoning_template_kwarg: "enable_thinking",
+    supports_tool_reasoning: true,
     output: ExactEnvelope {
         prefix: "",
         suffix: "",
@@ -352,6 +356,7 @@ const QWEN_XML_TOOL_SPEC: DeclarativeDialectSpec = DeclarativeDialectSpec {
     raw_text_before_calls: true,
     call_separator: "\n",
     parallel_layout: ParallelCallLayout::RepeatedEnvelopes,
+    protocol_max_tools: None,
     protocol_max_calls: None,
     auto_activation_trigger: Some("<tool_call>\n"),
     required_structural_tokens: &["<|im_end|>"],
@@ -369,6 +374,8 @@ const QWEN3_XML_TOOL_SPEC: DeclarativeDialectSpec = DeclarativeDialectSpec {
 
 const MISTRAL_JSON_LIST_TOOL_SPEC: DeclarativeDialectSpec = DeclarativeDialectSpec {
     generation_prompt_behavior: GenerationPromptBehavior::HonorRequest,
+    reasoning_template_kwarg: "enable_thinking",
+    supports_tool_reasoning: true,
     output: ExactEnvelope {
         prefix: "[TOOL_CALLS] ",
         suffix: "",
@@ -384,6 +391,7 @@ const MISTRAL_JSON_LIST_TOOL_SPEC: DeclarativeDialectSpec = DeclarativeDialectSp
     raw_text_before_calls: false,
     call_separator: ", ",
     parallel_layout: ParallelCallLayout::SingleEnvelope,
+    protocol_max_tools: None,
     protocol_max_calls: None,
     auto_activation_trigger: Some("[TOOL_CALLS] "),
     required_structural_tokens: &["[TOOL_CALLS]", "</s>"],
@@ -415,6 +423,8 @@ const MISTRAL_JSON_FUNCTION: JsonFunctionEnvelope = JsonFunctionEnvelope {
 
 const LLAMA3_JSON_TOOL_SPEC: DeclarativeDialectSpec = DeclarativeDialectSpec {
     generation_prompt_behavior: GenerationPromptBehavior::HonorRequest,
+    reasoning_template_kwarg: "enable_thinking",
+    supports_tool_reasoning: true,
     output: ExactEnvelope {
         prefix: "",
         suffix: "",
@@ -430,6 +440,7 @@ const LLAMA3_JSON_TOOL_SPEC: DeclarativeDialectSpec = DeclarativeDialectSpec {
     raw_text_before_calls: false,
     call_separator: "",
     parallel_layout: ParallelCallLayout::RepeatedEnvelopes,
+    protocol_max_tools: None,
     protocol_max_calls: Some(1),
     auto_activation_trigger: Some("{"),
     required_structural_tokens: &["<|eot_id|>"],
@@ -451,6 +462,8 @@ const LLAMA4_JSON_TOOL_SPEC: DeclarativeDialectSpec = DeclarativeDialectSpec {
 
 const NEMOTRON_NANO_JSON_LIST_TOOL_SPEC: DeclarativeDialectSpec = DeclarativeDialectSpec {
     generation_prompt_behavior: GenerationPromptBehavior::HonorRequest,
+    reasoning_template_kwarg: "enable_thinking",
+    supports_tool_reasoning: true,
     output: ExactEnvelope {
         prefix: "<TOOLCALL>",
         suffix: "</TOOLCALL>",
@@ -466,6 +479,7 @@ const NEMOTRON_NANO_JSON_LIST_TOOL_SPEC: DeclarativeDialectSpec = DeclarativeDia
     raw_text_before_calls: false,
     call_separator: ", ",
     parallel_layout: ParallelCallLayout::SingleEnvelope,
+    protocol_max_tools: None,
     protocol_max_calls: None,
     auto_activation_trigger: Some("<TOOLCALL>["),
     required_structural_tokens: &["<|eot_id|>"],
@@ -479,6 +493,58 @@ const MINISTRAL_JSON_LIST_TOOL_SPEC: DeclarativeDialectSpec = DeclarativeDialect
     },
     auto_activation_trigger: Some("[TOOL_CALLS]"),
     ..MISTRAL_JSON_LIST_TOOL_SPEC
+};
+
+const DEEPSEEK_STRUCTURAL_JSON_TOOL_SPEC: DeclarativeDialectSpec = DeclarativeDialectSpec {
+    generation_prompt_behavior: GenerationPromptBehavior::HonorRequest,
+    reasoning_template_kwarg: "enable_thinking",
+    supports_tool_reasoning: false,
+    output: ExactEnvelope {
+        prefix: "<｜tool▁calls▁begin｜>",
+        suffix: "<｜tool▁calls▁end｜>",
+    },
+    call: ExactEnvelope {
+        prefix: "<｜tool▁call▁begin｜>function<｜tool▁sep｜>",
+        suffix: "<｜tool▁call▁end｜>",
+    },
+    payload_shape: DeclarativePayloadShape::NamedJsonArguments(NamedJsonArgumentsEncoding {
+        name_suffix: "\n```json\n",
+        arguments_suffix: "\n```",
+        name_constraint: ToolNameConstraint::AsciiAlphanumericUnderscoreDash { max_length: 64 },
+    }),
+    json_function: None,
+    reasoning_channel: None,
+    text_channel: None,
+    raw_text_before_calls: true,
+    call_separator: "\n",
+    parallel_layout: ParallelCallLayout::RepeatedEnvelopes,
+    protocol_max_tools: Some(128),
+    protocol_max_calls: None,
+    auto_activation_trigger: Some("<｜tool▁calls▁begin｜>"),
+    required_structural_tokens: &[
+        "<｜tool▁calls▁begin｜>",
+        "<｜tool▁calls▁end｜>",
+        "<｜tool▁call▁begin｜>",
+        "<｜tool▁call▁end｜>",
+        "<｜tool▁sep｜>",
+        "<｜end▁of▁sentence｜>",
+    ],
+    stop_sequences: &["<｜end▁of▁sentence｜>"],
+};
+
+const DEEPSEEK31_STRUCTURAL_JSON_TOOL_SPEC: DeclarativeDialectSpec = DeclarativeDialectSpec {
+    reasoning_template_kwarg: "thinking",
+    call: ExactEnvelope {
+        prefix: "<｜tool▁call▁begin｜>",
+        suffix: "<｜tool▁call▁end｜>",
+    },
+    payload_shape: DeclarativePayloadShape::NamedJsonArguments(NamedJsonArgumentsEncoding {
+        name_suffix: "<｜tool▁sep｜>",
+        arguments_suffix: "",
+        name_constraint: ToolNameConstraint::AsciiAlphanumericUnderscoreDash { max_length: 64 },
+    }),
+    call_separator: "",
+    ..DEEPSEEK_STRUCTURAL_JSON_TOOL_SPEC
 };
 
 const QWEN25_TEMPLATE_SIGNATURE: [u8; 32] = [
@@ -561,9 +627,19 @@ const LFM25_VL_TEMPLATE_SIGNATURE: [u8; 32] = [
     0x30, 0x9e, 0x58, 0x6e, 0x2e, 0xda, 0x3d, 0x7f, 0x2d, 0xb1, 0xe2, 0xa0, 0x45, 0xbf, 0xb0, 0x7f,
     0x4c, 0x83, 0x79, 0x8b, 0x23, 0xf7, 0xac, 0x58, 0x79, 0x54, 0x42, 0x63, 0x02, 0xd5, 0x08, 0xe9,
 ];
+const DEEPSEEK_V3_TOOL_TEMPLATE_SIGNATURE: [u8; 32] = [
+    0xa3, 0xb4, 0x44, 0x9b, 0x9e, 0x31, 0xa7, 0xf3, 0x1b, 0x5e, 0x61, 0x3e, 0xfd, 0xeb, 0x6c, 0x45,
+    0xd9, 0xbe, 0xc7, 0xab, 0x75, 0xd2, 0x5c, 0xcc, 0xc9, 0x15, 0xe5, 0x6d, 0xd0, 0xbf, 0x97, 0x99,
+];
+const DEEPSEEK_V31_TOOL_TEMPLATE_SIGNATURE: [u8; 32] = [
+    0x07, 0xb6, 0x59, 0x54, 0xa3, 0xca, 0x1e, 0x27, 0x6e, 0x18, 0xc5, 0x3d, 0x68, 0x0d, 0xd1, 0x62,
+    0xce, 0x85, 0xdc, 0xf1, 0x46, 0x73, 0x0b, 0x69, 0x80, 0x99, 0x91, 0xca, 0xb6, 0x69, 0x63, 0x95,
+];
 
 const GEMMA4_STRUCTURAL_TOOL_SPEC: DeclarativeDialectSpec = DeclarativeDialectSpec {
     generation_prompt_behavior: GenerationPromptBehavior::HonorRequest,
+    reasoning_template_kwarg: "enable_thinking",
+    supports_tool_reasoning: true,
     output: ExactEnvelope {
         prefix: "",
         suffix: "",
@@ -586,6 +662,7 @@ const GEMMA4_STRUCTURAL_TOOL_SPEC: DeclarativeDialectSpec = DeclarativeDialectSp
     raw_text_before_calls: true,
     call_separator: "",
     parallel_layout: ParallelCallLayout::RepeatedEnvelopes,
+    protocol_max_tools: None,
     protocol_max_calls: None,
     auto_activation_trigger: Some("<|tool_call>"),
     required_structural_tokens: &[
@@ -603,6 +680,8 @@ const GEMMA4_STRUCTURAL_TOOL_SPEC: DeclarativeDialectSpec = DeclarativeDialectSp
 #[cfg(test)]
 const SYNTHETIC_DECLARATIVE_SPEC: DeclarativeDialectSpec = DeclarativeDialectSpec {
     generation_prompt_behavior: GenerationPromptBehavior::HonorRequest,
+    reasoning_template_kwarg: "enable_thinking",
+    supports_tool_reasoning: true,
     output: ExactEnvelope {
         prefix: r#"{"calls":"#,
         suffix: "}",
@@ -618,6 +697,7 @@ const SYNTHETIC_DECLARATIVE_SPEC: DeclarativeDialectSpec = DeclarativeDialectSpe
     raw_text_before_calls: false,
     call_separator: ",",
     parallel_layout: ParallelCallLayout::SingleEnvelope,
+    protocol_max_tools: None,
     protocol_max_calls: None,
     auto_activation_trigger: Some(r#"{"calls":"#),
     required_structural_tokens: &[SYNTHETIC_STRUCTURAL_TOKEN],
@@ -748,6 +828,18 @@ const FORMAT_REGISTRY: &[FormatRegistryEntry] = &[
         dialect: &LFM2_DIALECT,
         parameters: DialectParameters::Custom(&LFM2_PARAMETERS),
     },
+    FormatRegistryEntry {
+        identity: "deepseek.v3.structural-json-tools.a3b4449b",
+        template_signature: DEEPSEEK_V3_TOOL_TEMPLATE_SIGNATURE,
+        dialect: &DECLARATIVE_DIALECT,
+        parameters: DialectParameters::Declarative(&DEEPSEEK_STRUCTURAL_JSON_TOOL_SPEC),
+    },
+    FormatRegistryEntry {
+        identity: "deepseek.v3.1.structural-json-tools.07b65954",
+        template_signature: DEEPSEEK_V31_TOOL_TEMPLATE_SIGNATURE,
+        dialect: &DECLARATIVE_DIALECT,
+        parameters: DialectParameters::Declarative(&DEEPSEEK31_STRUCTURAL_JSON_TOOL_SPEC),
+    },
     #[cfg(test)]
     FormatRegistryEntry {
         identity: "safemlx.synthetic-tools.v1",
@@ -782,6 +874,8 @@ pub(crate) fn prepare_format_profile_with_registry(
             dialect: None,
             dialect_parameters: None,
             generation_prompt_behavior: GenerationPromptBehavior::HonorRequest,
+            reasoning_template_kwarg: "enable_thinking",
+            supports_tool_reasoning: true,
             native_tool_unavailable_reason: Some(
                 "no registered format profile matches the selected chat template".into(),
             ),
@@ -791,29 +885,51 @@ pub(crate) fn prepare_format_profile_with_registry(
         [entry] => {
             let generation_prompt_behavior =
                 entry.dialect.generation_prompt_behavior(entry.parameters);
+            let reasoning_template_kwarg = entry.dialect.reasoning_template_kwarg(entry.parameters);
+            let supports_tool_reasoning = entry.dialect.supports_tool_reasoning(entry.parameters);
             let structural_tokens = entry.dialect.required_structural_tokens(entry.parameters);
             let stops = entry.dialect.stop_sequences(entry.parameters);
-            match (generation_prompt_behavior, structural_tokens, stops) {
-                (Ok(generation_prompt_behavior), Ok(structural_tokens), Ok(stops)) => {
-                    PreparedFormatProfile {
-                        identity: Some(entry.identity.to_owned()),
-                        dialect: Some(entry.dialect),
-                        dialect_parameters: Some(entry.parameters),
-                        generation_prompt_behavior,
-                        native_tool_unavailable_reason: None,
-                        required_structural_tokens: structural_tokens
-                            .iter()
-                            .map(|token| (*token).to_owned())
-                            .collect(),
-                        stop_sequences: stops
-                            .iter()
-                            .map(|sequence| (*sequence).to_owned())
-                            .collect(),
-                    }
-                }
-                (generation, structural_tokens, stops) => {
+            match (
+                generation_prompt_behavior,
+                reasoning_template_kwarg,
+                supports_tool_reasoning,
+                structural_tokens,
+                stops,
+            ) {
+                (
+                    Ok(generation_prompt_behavior),
+                    Ok(reasoning_template_kwarg),
+                    Ok(supports_tool_reasoning),
+                    Ok(structural_tokens),
+                    Ok(stops),
+                ) => PreparedFormatProfile {
+                    identity: Some(entry.identity.to_owned()),
+                    dialect: Some(entry.dialect),
+                    dialect_parameters: Some(entry.parameters),
+                    generation_prompt_behavior,
+                    reasoning_template_kwarg,
+                    supports_tool_reasoning,
+                    native_tool_unavailable_reason: None,
+                    required_structural_tokens: structural_tokens
+                        .iter()
+                        .map(|token| (*token).to_owned())
+                        .collect(),
+                    stop_sequences: stops
+                        .iter()
+                        .map(|sequence| (*sequence).to_owned())
+                        .collect(),
+                },
+                (
+                    generation,
+                    reasoning_template_kwarg,
+                    supports_tool_reasoning,
+                    structural_tokens,
+                    stops,
+                ) => {
                     let reason = generation
                         .err()
+                        .or_else(|| reasoning_template_kwarg.err())
+                        .or_else(|| supports_tool_reasoning.err())
                         .or_else(|| structural_tokens.err())
                         .or_else(|| stops.err())
                         .expect("one dialect property failed");
@@ -822,6 +938,8 @@ pub(crate) fn prepare_format_profile_with_registry(
                         dialect: None,
                         dialect_parameters: None,
                         generation_prompt_behavior: GenerationPromptBehavior::HonorRequest,
+                        reasoning_template_kwarg: "enable_thinking",
+                        supports_tool_reasoning: true,
                         native_tool_unavailable_reason: Some(format!(
                             "format profile {:?} is invalid: {reason}",
                             entry.identity
@@ -837,6 +955,8 @@ pub(crate) fn prepare_format_profile_with_registry(
             dialect: None,
             dialect_parameters: None,
             generation_prompt_behavior: GenerationPromptBehavior::HonorRequest,
+            reasoning_template_kwarg: "enable_thinking",
+            supports_tool_reasoning: true,
             native_tool_unavailable_reason: Some(
                 "multiple registered format profiles match the selected chat template".into(),
             ),
@@ -911,6 +1031,7 @@ mod tests {
     use super::{
         prepare_format_profile, prepare_format_profile_with_registry, resolve_structural_tokens,
         template_signature, DialectParameters, FormatRegistryEntry, DECLARATIVE_DIALECT,
+        DEEPSEEK_V31_TOOL_TEMPLATE_SIGNATURE, DEEPSEEK_V3_TOOL_TEMPLATE_SIGNATURE,
         GEMMA4_EDGE_TEMPLATE_SIGNATURE, GEMMA4_LARGE_TEMPLATE_SIGNATURE,
         GPT_OSS_HARMONY_CURRENT_TEMPLATE_SIGNATURE, GPT_OSS_HARMONY_ESCAPED_TEMPLATE_SIGNATURE,
         GPT_OSS_HARMONY_INITIAL_TEMPLATE_SIGNATURE, HERMES2_PRO_TOOL_USE_TEMPLATE_SIGNATURE,
@@ -966,6 +1087,10 @@ mod tests {
         include_str!("../tests/fixtures/chat_templates/lfm2.5-8b-a1b-5673e0de.jinja");
     const LFM25_VL_FIXTURE_WITH_TERMINATOR: &str =
         include_str!("../tests/fixtures/chat_templates/lfm2.5-vl-450m-fc6221ca.jinja");
+    const DEEPSEEK_V3_TOOL_FIXTURE: &str =
+        include_str!("../tests/fixtures/chat_templates/deepseek-v3-tools-7e28c67d.jinja");
+    const DEEPSEEK_V31_TOOL_FIXTURE: &str =
+        include_str!("../tests/fixtures/chat_templates/deepseek-v3.1-tools-ef1ab230.jinja");
 
     #[test]
     fn registry_does_not_guess_unknown_templates() {
@@ -1179,6 +1304,50 @@ mod tests {
 
         let modified = format!("{GEMMA4_EDGE_FIXTURE} ");
         assert!(prepare_format_profile(&modified).dialect.is_none());
+
+        for (template, signature, identity, reasoning_kwarg) in [
+            (
+                DEEPSEEK_V3_TOOL_FIXTURE,
+                DEEPSEEK_V3_TOOL_TEMPLATE_SIGNATURE,
+                "deepseek.v3.structural-json-tools.a3b4449b",
+                "enable_thinking",
+            ),
+            (
+                DEEPSEEK_V31_TOOL_FIXTURE,
+                DEEPSEEK_V31_TOOL_TEMPLATE_SIGNATURE,
+                "deepseek.v3.1.structural-json-tools.07b65954",
+                "thinking",
+            ),
+        ] {
+            assert_eq!(template_signature(template), signature, "{identity}");
+            let prepared = prepare_format_profile(template);
+            assert_eq!(prepared.identity.as_deref(), Some(identity));
+            assert!(prepared.dialect.is_some(), "{identity}");
+            assert_eq!(
+                prepared.required_structural_tokens,
+                [
+                    "<｜tool▁calls▁begin｜>",
+                    "<｜tool▁calls▁end｜>",
+                    "<｜tool▁call▁begin｜>",
+                    "<｜tool▁call▁end｜>",
+                    "<｜tool▁sep｜>",
+                    "<｜end▁of▁sentence｜>",
+                ]
+            );
+            assert_eq!(prepared.stop_sequences, ["<｜end▁of▁sentence｜>"]);
+            assert_eq!(prepared.reasoning_template_kwarg, reasoning_kwarg);
+            assert!(!prepared.supports_tool_reasoning);
+        }
+        assert!(
+            prepare_format_profile(&format!("{DEEPSEEK_V3_TOOL_FIXTURE} "))
+                .dialect
+                .is_none()
+        );
+        assert!(
+            prepare_format_profile("{{ bos_token }} generic DeepSeek architecture template")
+                .dialect
+                .is_none()
+        );
 
         let gpt_oss_current = GPT_OSS_HARMONY_CURRENT_FIXTURE_WITH_TERMINATOR
             .strip_suffix('\n')

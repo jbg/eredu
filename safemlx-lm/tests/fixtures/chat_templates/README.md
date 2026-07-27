@@ -1,9 +1,10 @@
 # Audited production chat templates
 
-These files are byte-for-byte fixtures of the selected `chat_template` body
-from the named Hugging Face tokenizer configuration. The registry matches the
-SHA-256 of the selected body only; repository or model metadata is not a
-support key.
+These files are byte-for-byte fixtures of the selected chat-template body
+from the named source. Most are selected `chat_template` bodies from Hugging
+Face tokenizer configurations; the DeepSeek tool templates are the pinned
+deployment templates named in their rows. The registry matches the SHA-256 of
+the selected body only; repository or model metadata is not a support key.
 
 | Fixture | Source repository | Pinned revision | Selected template |
 | --- | --- | --- | --- |
@@ -26,6 +27,8 @@ support key.
 | `lfm2-classic-compact-6d24c6b7.jinja` | `LiquidAI/LFM2-1.2B-Tool` | `6d24c6b7471fcbcec084935e377a5302f4b84389` | `chat_template.jinja` |
 | `lfm2.5-8b-a1b-5673e0de.jinja` | `LiquidAI/LFM2.5-8B-A1B` | `5673e0de372b64331504de73bbbc33b0dde71903` | `chat_template.jinja` |
 | `lfm2.5-vl-450m-fc6221ca.jinja` | `LiquidAI/LFM2.5-VL-450M` | `fc6221ca597f3315e4f82fc2df606783267b34ba` | `chat_template.jinja` |
+| `deepseek-v3-tools-7e28c67d.jinja` | `sgl-project/sglang` | `7e28c67d19ddea8c74fca7b7e6dd2e3e3bec3c37` | `examples/chat_template/tool_chat_template_deepseekv3.jinja` |
+| `deepseek-v3.1-tools-ef1ab230.jinja` | `sgl-project/sglang` | `ef1ab2302ab25db09d3bd61da9bded1b71d0d3c8` | `examples/chat_template/tool_chat_template_deepseekv31.jinja` |
 
 The Hermes fixture body is also byte-identical to the named `tool_use`
 template in `NousResearch/Hermes-3-Llama-3.1-8B` revision
@@ -89,3 +92,34 @@ custom dialect: the declarative dialects only admit JSON objects, JSON lists,
 or their fixed structural-object encoding and cannot safely describe Python
 identifiers, keyword arguments, single-quoted strings, `True`/`False`/`None`,
 or the released mixed Python/JSON nested value surface.
+
+The DeepSeek V3 fixture is the exact tool template recommended by SGLang's
+DeepSeek V3 deployment documentation. The V3.1 fixture is the maintained
+successor for the revised direct `name<｜tool▁sep｜>{arguments}` call surface.
+Both bodies end in a line feed and are stored unchanged. Their registrations
+use the generic declarative named-JSON-arguments shape: V3 adds the literal
+`function` kind and a fenced JSON object, while V3.1 directly joins adjacent
+call envelopes. Tool names are restricted to the DeepSeek API's documented
+64-character ASCII letter, digit, underscore, and dash surface, and argument
+objects are constrained by each declared JSON Schema.
+
+V3.1's `thinking` template variable is wired to the caller's standard
+`enable_thinking` control. Thinking is rejected while tools are supplied for
+both registered profiles: these selected call surfaces permit free-form text
+before a call but do not delimit it sufficiently to preserve reasoning as
+reasoning events. Disabled thinking retains each template's exact generation
+prompt, including V3.1's prefilled `</think>`.
+
+DeepSeek's released tokenizer templates for V3, R1, and V3.1 preserve prior
+tool calls and results but do not render supplied tool definitions, so they
+are not native-tool registrations. The maintained SGLang R1 tool template is
+also intentionally excluded: its tool prompt indexes bare function
+definitions (`tool['name']`) instead of the OpenAI tool envelopes accepted by
+the renderer, and its free-form reasoning stream cannot be reported as
+reasoning events by this declarative profile. DeepSeek V3.2 is likewise not
+mapped to SGLang's older V3.2 Jinja template. The authoritative V3.2 release
+replaced that surface with the Python `encoding/encoding_dsv32.py` DSML
+encoder/parser, has no selected Jinja template body to sign, and uses
+parameter-level DSML rather than this JSON protocol. Registering either
+candidate would overstate safe support; neither architecture nor repository
+metadata is used as a fallback.

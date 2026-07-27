@@ -88,6 +88,17 @@ pub(crate) trait FormatDialect: fmt::Debug + Send + Sync {
         parameters: DialectParameters,
     ) -> Result<GenerationPromptBehavior, String>;
 
+    fn reasoning_template_kwarg(
+        &self,
+        _parameters: DialectParameters,
+    ) -> Result<&'static str, String> {
+        Ok("enable_thinking")
+    }
+
+    fn supports_tool_reasoning(&self, _parameters: DialectParameters) -> Result<bool, String> {
+        Ok(true)
+    }
+
     fn constraint_configuration(
         &self,
         parameters: DialectParameters,
@@ -155,9 +166,55 @@ pub(crate) enum DeclarativePayloadShape {
     JsonObject,
     /// One call envelope contains a JSON list of call objects.
     JsonList,
+    /// Every call envelope contains an exact tool name followed by one JSON
+    /// argument object.
+    NamedJsonArguments(NamedJsonArgumentsEncoding),
     /// Every call envelope contains an exact name marker, a declared tool
     /// name, and one structurally quoted JSON argument object.
     StructuralObject(StructuralObjectEncoding),
+}
+
+/// Exact syntax around a tool name followed by a JSON argument object.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct NamedJsonArgumentsEncoding {
+    /// Exact delimiter between the tool name and its JSON arguments.
+    pub(crate) name_suffix: &'static str,
+    /// Exact syntax between the JSON argument object and the call suffix.
+    pub(crate) arguments_suffix: &'static str,
+    /// Protocol-level restriction on names exposed to the model.
+    pub(crate) name_constraint: ToolNameConstraint,
+}
+
+/// Declarative restrictions imposed on tool names by an output protocol.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ToolNameConstraint {
+    /// Any non-empty tool name accepted by the shared tool-schema parser.
+    Any,
+    /// ASCII letters, digits, underscores, and dashes up to an exact maximum.
+    AsciiAlphanumericUnderscoreDash { max_length: usize },
+}
+
+impl ToolNameConstraint {
+    fn validate(self, name: &str) -> Result<(), String> {
+        match self {
+            Self::Any => Ok(()),
+            Self::AsciiAlphanumericUnderscoreDash { max_length } => {
+                if max_length == 0 {
+                    return Err("declarative tool-name limit must be positive".into());
+                }
+                if name.len() > max_length
+                    || !name
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+                {
+                    return Err(format!(
+                        "tool function name {name:?} must contain at most {max_length} ASCII letters, digits, underscores, or dashes"
+                    ));
+                }
+                Ok(())
+            }
+        }
+    }
 }
 
 /// Exact surface syntax for a JSON object whose strings use a structural
@@ -196,6 +253,10 @@ pub(crate) struct DeclarativeCallId {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct DeclarativeDialectSpec {
     pub(crate) generation_prompt_behavior: GenerationPromptBehavior,
+    /// Template variable controlled by [`crate::chat::ChatTemplateRequest::enable_thinking`].
+    pub(crate) reasoning_template_kwarg: &'static str,
+    /// Whether the dialect preserves reasoning semantics while native tools are active.
+    pub(crate) supports_tool_reasoning: bool,
     /// Optional exact prefix and suffix around the complete call collection.
     /// Both are empty when each call envelope stands on its own; either side
     /// may otherwise be empty for marker-only or terminal-only protocols.
@@ -209,6 +270,8 @@ pub(crate) struct DeclarativeDialectSpec {
     pub(crate) raw_text_before_calls: bool,
     pub(crate) call_separator: &'static str,
     pub(crate) parallel_layout: ParallelCallLayout,
+    /// Maximum number of function definitions exposed by the protocol.
+    pub(crate) protocol_max_tools: Option<usize>,
     /// Protocol-level cap applied in addition to the caller's parallel policy.
     pub(crate) protocol_max_calls: Option<usize>,
     pub(crate) auto_activation_trigger: Option<&'static str>,
@@ -218,6 +281,9 @@ pub(crate) struct DeclarativeDialectSpec {
 
 impl DeclarativeDialectSpec {
     fn validate(&self) -> Result<(), String> {
+        if self.reasoning_template_kwarg.is_empty() {
+            return Err("declarative reasoning template kwarg must be non-empty".into());
+        }
         match self.payload_shape {
             DeclarativePayloadShape::JsonObject | DeclarativePayloadShape::JsonList => {
                 let function = self.json_function.ok_or_else(|| {
@@ -241,6 +307,21 @@ impl DeclarativeDialectSpec {
                                 .into(),
                         );
                     }
+                }
+            }
+            DeclarativePayloadShape::NamedJsonArguments(encoding) => {
+                if encoding.name_suffix.is_empty() {
+                    return Err(
+                        "declarative named JSON arguments require a non-empty name delimiter"
+                            .into(),
+                    );
+                }
+                encoding.name_constraint.validate("valid_name")?;
+                if self.json_function.is_some() {
+                    return Err(
+                        "declarative named JSON arguments cannot carry a JSON function envelope"
+                            .into(),
+                    );
                 }
             }
             DeclarativePayloadShape::StructuralObject(encoding) => {
@@ -282,7 +363,9 @@ impl DeclarativeDialectSpec {
         if self.output.prefix.is_empty()
             && (!matches!(
                 self.payload_shape,
-                DeclarativePayloadShape::JsonObject | DeclarativePayloadShape::StructuralObject(_)
+                DeclarativePayloadShape::JsonObject
+                    | DeclarativePayloadShape::NamedJsonArguments(_)
+                    | DeclarativePayloadShape::StructuralObject(_)
             ) || self.parallel_layout != ParallelCallLayout::RepeatedEnvelopes)
         {
             return Err(
@@ -334,6 +417,10 @@ impl DeclarativeDialectSpec {
         match (self.payload_shape, self.parallel_layout) {
             (DeclarativePayloadShape::JsonObject, ParallelCallLayout::RepeatedEnvelopes)
             | (
+                DeclarativePayloadShape::NamedJsonArguments(_),
+                ParallelCallLayout::RepeatedEnvelopes,
+            )
+            | (
                 DeclarativePayloadShape::StructuralObject(_),
                 ParallelCallLayout::RepeatedEnvelopes,
             )
@@ -354,6 +441,9 @@ impl DeclarativeDialectSpec {
         if self.protocol_max_calls == Some(0) {
             return Err("declarative protocol call limit must be positive".into());
         }
+        if self.protocol_max_tools == Some(0) {
+            return Err("declarative protocol tool limit must be positive".into());
+        }
         Ok(())
     }
 
@@ -372,13 +462,23 @@ impl DeclarativeDialectSpec {
                 resolved_structural_token_ids.len()
             ));
         }
-        let literal = |text| {
+        let literal = |text: &str| {
             structural_literal(
                 text,
                 self.required_structural_tokens,
                 resolved_structural_token_ids,
             )
         };
+        if self
+            .protocol_max_tools
+            .is_some_and(|maximum| tools.len() > maximum)
+        {
+            return Err(format!(
+                "declarative protocol accepts at most {} tools, received {}",
+                self.protocol_max_tools.expect("checked maximum"),
+                tools.len()
+            ));
+        }
         let (mut min_calls, mut max_calls) =
             tool_call_bounds(tool_choice, parallel_tool_calls, tools)?;
         if tool_choice == ToolChoice::Auto {
@@ -503,6 +603,44 @@ impl DeclarativeDialectSpec {
                     literal(function.envelope.suffix)?
                 ));
                 grammar.push_str(&format!("call_json: %json {schema}\n"));
+            }
+            DeclarativePayloadShape::NamedJsonArguments(encoding) => {
+                let tools = parse_tools(tools)?;
+                let mut alternatives = Vec::with_capacity(tools.len());
+                let mut argument_rules = String::new();
+                for (index, tool) in tools.into_iter().enumerate() {
+                    encoding.name_constraint.validate(&tool.name)?;
+                    let schema = serde_json::to_string(&tool.parameters)
+                        .expect("JSON schema values serialize");
+                    alternatives.push(format!(
+                        "{} {} named_arguments_{index}",
+                        literal(&tool.name)?,
+                        literal(encoding.name_suffix)?,
+                    ));
+                    argument_rules.push_str(&format!("named_arguments_{index}: %json {schema}\n"));
+                }
+                if alternatives.is_empty() {
+                    alternatives
+                        .push("\"__safemlx_unreachable_named_json_tool_call__\"".to_owned());
+                }
+                if self.output.prefix.is_empty() {
+                    grammar.push_str(&format!("tool_output: {calls}\n"));
+                } else {
+                    grammar.push_str(&format!(
+                        "tool_output: {} {} {}\n",
+                        literal(self.output.prefix)?,
+                        calls,
+                        literal(self.output.suffix)?
+                    ));
+                }
+                grammar.push_str(&format!(
+                    "call: {} named_json_call {} {}\n",
+                    literal(self.call.prefix)?,
+                    literal(encoding.arguments_suffix)?,
+                    literal(self.call.suffix)?
+                ));
+                grammar.push_str(&format!("named_json_call: {}\n", alternatives.join(" | ")));
+                grammar.push_str(&argument_rules);
             }
             DeclarativePayloadShape::StructuralObject(encoding) => {
                 if self.output.prefix.is_empty() {
@@ -857,6 +995,17 @@ impl FormatDialect for DeclarativeDialect {
         Ok(Self::spec(parameters)?.generation_prompt_behavior)
     }
 
+    fn reasoning_template_kwarg(
+        &self,
+        parameters: DialectParameters,
+    ) -> Result<&'static str, String> {
+        Ok(Self::spec(parameters)?.reasoning_template_kwarg)
+    }
+
+    fn supports_tool_reasoning(&self, parameters: DialectParameters) -> Result<bool, String> {
+        Ok(Self::spec(parameters)?.supports_tool_reasoning)
+    }
+
     fn constraint_configuration(
         &self,
         parameters: DialectParameters,
@@ -921,6 +1070,11 @@ enum DeclarativeParserState {
     ToolStart,
     JsonEnvelopeStart,
     Payload(JsonFragmentBuffer),
+    NamedJsonName,
+    NamedJsonPayload {
+        json: JsonFragmentBuffer,
+        emitted: usize,
+    },
     StructuralName {
         prefix_consumed: bool,
     },
@@ -1051,6 +1205,7 @@ impl DeclarativeParser {
             DeclarativePayloadShape::JsonObject | DeclarativePayloadShape::JsonList => {
                 DeclarativeParserState::Payload(JsonFragmentBuffer::default())
             }
+            DeclarativePayloadShape::NamedJsonArguments(_) => DeclarativeParserState::NamedJsonName,
             DeclarativePayloadShape::StructuralObject(_) => {
                 DeclarativeParserState::StructuralName {
                     prefix_consumed: false,
@@ -1075,6 +1230,7 @@ impl DeclarativeParser {
                     DeclarativeParserState::JsonEnvelopeStart
                 }
             }
+            DeclarativePayloadShape::NamedJsonArguments(_) => self.start_payload_state(),
             DeclarativePayloadShape::StructuralObject(_) => self.start_payload_state(),
         }
     }
@@ -1219,6 +1375,7 @@ impl DeclarativeParser {
                     }
                     let expected = match self.spec.payload_shape {
                         DeclarativePayloadShape::JsonObject
+                        | DeclarativePayloadShape::NamedJsonArguments(_)
                         | DeclarativePayloadShape::StructuralObject(_) => {
                             self.spec.call.prefix.to_owned()
                         }
@@ -1276,6 +1433,55 @@ impl DeclarativeParser {
                     }
                     let fragment = json.fragment().to_owned();
                     self.emit_json_call(&fragment, sink)?;
+                    self.state = DeclarativeParserState::AfterPayload;
+                }
+                DeclarativeParserState::NamedJsonName => {
+                    let DeclarativePayloadShape::NamedJsonArguments(encoding) =
+                        self.spec.payload_shape
+                    else {
+                        unreachable!("named JSON state requires named JSON encoding");
+                    };
+                    let Some(position) = self.pending.find(encoding.name_suffix) else {
+                        return Ok(());
+                    };
+                    let name = self.pending[..position].to_owned();
+                    if name.is_empty() {
+                        return Err("declarative named JSON tool name must be non-empty".into());
+                    }
+                    encoding.name_constraint.validate(&name)?;
+                    self.pending.drain(..position + encoding.name_suffix.len());
+                    let id = format!("call_{}", sink.next_tool_index());
+                    sink.start_tool_call(id, name);
+                    self.state = DeclarativeParserState::NamedJsonPayload {
+                        json: JsonFragmentBuffer::default(),
+                        emitted: 0,
+                    };
+                }
+                DeclarativeParserState::NamedJsonPayload { json, emitted } => {
+                    if self.pending.is_empty() {
+                        return Ok(());
+                    }
+                    let (consumed, complete) = json
+                        .push(&self.pending)
+                        .map_err(|error| format!("invalid declarative JSON fragment: {error:?}"))?;
+                    self.pending.drain(..consumed);
+                    let fragment = json.fragment();
+                    if fragment.len() > *emitted {
+                        sink.tool_arguments(&fragment[*emitted..]);
+                        *emitted = fragment.len();
+                    }
+                    if !complete {
+                        return Ok(());
+                    }
+                    let arguments: Value =
+                        serde_json::from_str(fragment.trim()).map_err(|error| {
+                            format!("invalid declarative tool arguments JSON: {error}")
+                        })?;
+                    if !arguments.is_object() {
+                        return Err(
+                            "declarative named JSON tool arguments must be an object".into()
+                        );
+                    }
                     self.state = DeclarativeParserState::AfterPayload;
                 }
                 DeclarativeParserState::StructuralName { prefix_consumed } => {
@@ -1356,6 +1562,21 @@ impl DeclarativeParser {
                             DeclarativeParserState::AfterEnvelope
                         };
                     }
+                    DeclarativePayloadShape::NamedJsonArguments(encoding) => {
+                        let expected =
+                            format!("{}{}", encoding.arguments_suffix, self.spec.call.suffix);
+                        if !self.consume_exact(&expected)? {
+                            return Ok(());
+                        }
+                        sink.end_tool_call();
+                        self.state = if self.spec.output.prefix.is_empty()
+                            && self.spec.call_separator.is_empty()
+                        {
+                            DeclarativeParserState::Outside
+                        } else {
+                            DeclarativeParserState::AfterEnvelope
+                        };
+                    }
                     DeclarativePayloadShape::StructuralObject(_) => {
                         if !self.consume_exact(self.spec.call.suffix)? {
                             return Ok(());
@@ -1400,14 +1621,14 @@ impl DeclarativeParser {
                     {
                         self.pending.drain(..self.spec.output.suffix.len());
                         self.state = DeclarativeParserState::Outside;
-                    } else if self.pending.starts_with(self.spec.call_separator) {
-                        self.pending.drain(..self.spec.call_separator.len());
-                        self.state = DeclarativeParserState::ToolStart;
                     } else if (!self.spec.output.suffix.is_empty()
                         && self.spec.output.suffix.starts_with(&self.pending))
                         || self.spec.call_separator.starts_with(&self.pending)
                     {
                         return Ok(());
+                    } else if self.pending.starts_with(self.spec.call_separator) {
+                        self.pending.drain(..self.spec.call_separator.len());
+                        self.state = DeclarativeParserState::ToolStart;
                     } else {
                         return Err("expected declarative call separator or output suffix".into());
                     }
@@ -1700,8 +1921,9 @@ mod tests {
     use super::{
         ConstraintConfiguration, DeclarativeCallId, DeclarativeDialectSpec,
         DeclarativePayloadShape, DelimitedChannel, DialectParameters, ExactEnvelope, FormatDialect,
-        FormatRegistryEntry, GenerationPromptBehavior, JsonFunctionEnvelope, ParallelCallLayout,
-        StructuralObjectEncoding, DECLARATIVE_DIALECT,
+        FormatRegistryEntry, GenerationPromptBehavior, JsonFunctionEnvelope,
+        NamedJsonArgumentsEncoding, ParallelCallLayout, StructuralObjectEncoding,
+        ToolNameConstraint, DECLARATIVE_DIALECT,
     };
     use crate::{
         chat::{
@@ -1752,6 +1974,8 @@ mod tests {
 
     const DECLARATIVE_OBJECT_SPEC: DeclarativeDialectSpec = DeclarativeDialectSpec {
         generation_prompt_behavior: GenerationPromptBehavior::HonorRequest,
+        reasoning_template_kwarg: "enable_thinking",
+        supports_tool_reasoning: true,
         output: ExactEnvelope {
             prefix: "<tools>",
             suffix: "</tools>",
@@ -1775,6 +1999,7 @@ mod tests {
         raw_text_before_calls: false,
         call_separator: "\n",
         parallel_layout: ParallelCallLayout::RepeatedEnvelopes,
+        protocol_max_tools: None,
         protocol_max_calls: None,
         auto_activation_trigger: Some("<tools>"),
         required_structural_tokens: &[],
@@ -1783,6 +2008,8 @@ mod tests {
 
     const DECLARATIVE_LIST_SPEC: DeclarativeDialectSpec = DeclarativeDialectSpec {
         generation_prompt_behavior: GenerationPromptBehavior::Never,
+        reasoning_template_kwarg: "enable_thinking",
+        supports_tool_reasoning: true,
         output: ExactEnvelope {
             prefix: "<batch>",
             suffix: "</batch>",
@@ -1798,6 +2025,7 @@ mod tests {
         raw_text_before_calls: false,
         call_separator: ", ",
         parallel_layout: ParallelCallLayout::SingleEnvelope,
+        protocol_max_tools: None,
         protocol_max_calls: None,
         auto_activation_trigger: Some("<batch>"),
         required_structural_tokens: &[],
@@ -1806,6 +2034,8 @@ mod tests {
 
     const XML_WRAPPED_JSON_SPEC: DeclarativeDialectSpec = DeclarativeDialectSpec {
         generation_prompt_behavior: GenerationPromptBehavior::HonorRequest,
+        reasoning_template_kwarg: "enable_thinking",
+        supports_tool_reasoning: true,
         output: ExactEnvelope {
             prefix: "",
             suffix: "",
@@ -1825,6 +2055,7 @@ mod tests {
         raw_text_before_calls: true,
         call_separator: "\n",
         parallel_layout: ParallelCallLayout::RepeatedEnvelopes,
+        protocol_max_tools: None,
         protocol_max_calls: None,
         auto_activation_trigger: Some("<tool_call>\n"),
         required_structural_tokens: &["<|im_end|>"],
@@ -1833,6 +2064,8 @@ mod tests {
 
     const JSON_FUNCTION_WRAPPER_SPEC: DeclarativeDialectSpec = DeclarativeDialectSpec {
         generation_prompt_behavior: GenerationPromptBehavior::HonorRequest,
+        reasoning_template_kwarg: "enable_thinking",
+        supports_tool_reasoning: true,
         output: ExactEnvelope {
             prefix: "",
             suffix: "",
@@ -1848,14 +2081,47 @@ mod tests {
         raw_text_before_calls: false,
         call_separator: "\n",
         parallel_layout: ParallelCallLayout::RepeatedEnvelopes,
+        protocol_max_tools: None,
         protocol_max_calls: None,
         auto_activation_trigger: Some(r#"{"type":"function","function":"#),
         required_structural_tokens: &[],
         stop_sequences: &[],
     };
 
+    const NAMED_JSON_ARGUMENTS_SPEC: DeclarativeDialectSpec = DeclarativeDialectSpec {
+        generation_prompt_behavior: GenerationPromptBehavior::HonorRequest,
+        reasoning_template_kwarg: "synthetic_thinking",
+        supports_tool_reasoning: false,
+        output: ExactEnvelope {
+            prefix: "<calls>",
+            suffix: "</calls>",
+        },
+        call: ExactEnvelope {
+            prefix: "<call>",
+            suffix: "</call>",
+        },
+        payload_shape: DeclarativePayloadShape::NamedJsonArguments(NamedJsonArgumentsEncoding {
+            name_suffix: "::json\n",
+            arguments_suffix: "\n::end",
+            name_constraint: ToolNameConstraint::AsciiAlphanumericUnderscoreDash { max_length: 64 },
+        }),
+        json_function: None,
+        reasoning_channel: None,
+        text_channel: None,
+        raw_text_before_calls: true,
+        call_separator: "|",
+        parallel_layout: ParallelCallLayout::RepeatedEnvelopes,
+        protocol_max_tools: Some(2),
+        protocol_max_calls: None,
+        auto_activation_trigger: Some("<calls>"),
+        required_structural_tokens: &[],
+        stop_sequences: &["<stop>"],
+    };
+
     const MARKER_JSON_LIST_SPEC: DeclarativeDialectSpec = DeclarativeDialectSpec {
         generation_prompt_behavior: GenerationPromptBehavior::HonorRequest,
+        reasoning_template_kwarg: "enable_thinking",
+        supports_tool_reasoning: true,
         output: ExactEnvelope {
             prefix: "[TOOL_CALLS] ",
             suffix: "",
@@ -1871,6 +2137,7 @@ mod tests {
         raw_text_before_calls: false,
         call_separator: ", ",
         parallel_layout: ParallelCallLayout::SingleEnvelope,
+        protocol_max_tools: None,
         protocol_max_calls: None,
         auto_activation_trigger: Some("[TOOL_CALLS] "),
         required_structural_tokens: &[],
@@ -1890,6 +2157,8 @@ mod tests {
 
     const STRUCTURAL_CHANNEL_OBJECT_SPEC: DeclarativeDialectSpec = DeclarativeDialectSpec {
         generation_prompt_behavior: GenerationPromptBehavior::HonorRequest,
+        reasoning_template_kwarg: "enable_thinking",
+        supports_tool_reasoning: true,
         output: ExactEnvelope {
             prefix: "",
             suffix: "",
@@ -1912,6 +2181,7 @@ mod tests {
         raw_text_before_calls: true,
         call_separator: "",
         parallel_layout: ParallelCallLayout::RepeatedEnvelopes,
+        protocol_max_tools: None,
         protocol_max_calls: None,
         auto_activation_trigger: Some("<|tool_call>"),
         required_structural_tokens: &[],
@@ -2381,6 +2651,157 @@ mod tests {
                 "split {split}"
             );
         }
+    }
+
+    #[test]
+    fn named_json_arguments_are_declarative_constrained_and_incremental() {
+        let compiler = ConstraintCompiler::synthetic_for_tests();
+        let parameters = DialectParameters::Declarative(&NAMED_JSON_ARGUMENTS_SPEC);
+        let tools = [tool("first_tool"), tool("second-tool")];
+        assert_eq!(
+            DECLARATIVE_DIALECT
+                .reasoning_template_kwarg(parameters)
+                .unwrap(),
+            "synthetic_thinking"
+        );
+        assert!(!DECLARATIVE_DIALECT
+            .supports_tool_reasoning(parameters)
+            .unwrap());
+        let too_many = compiler
+            .compile_tool_plan(
+                &DECLARATIVE_DIALECT,
+                parameters,
+                &[tool("first"), tool("second"), tool("third")],
+                ToolChoice::Required,
+                ParallelToolCallPolicy::Disabled,
+                Vec::new(),
+            )
+            .unwrap_err();
+        assert!(too_many.contains("at most 2 tools"), "{too_many}");
+        let required = compiler
+            .compile_tool_plan(
+                &DECLARATIVE_DIALECT,
+                parameters,
+                &tools,
+                ToolChoice::Required,
+                ParallelToolCallPolicy::Enabled {
+                    max_calls: std::num::NonZeroUsize::new(2),
+                },
+                Vec::new(),
+            )
+            .unwrap();
+        let output = concat!(
+            "<calls><call>first_tool::json\n",
+            r#"{"value":1}"#,
+            "\n::end</call>|<call>second-tool::json\n",
+            r#"{"value":2}"#,
+            "\n::end</call></calls>",
+        );
+        assert!(accepts(&required, output));
+        for invalid in [
+            "<calls></calls>",
+            "<calls><call>missing::json\n{\"value\":1}\n::end</call></calls>",
+            "<calls><call>first_tool::json\n{\"value\":\"one\"}\n::end</call></calls>",
+            "<calls><call>first_tool::json\n[]\n::end</call></calls>",
+            "<calls><call>first_tool::{\"value\":1}\n::end</call></calls>",
+            "<calls><call>first_tool::json\n{\"value\":1}</call></calls>",
+            "<calls><call>first_tool::json\n{\"value\":1}\n::end</call>|</calls>",
+        ] {
+            assert!(!accepts(&required, invalid), "{invalid}");
+        }
+
+        let auto = compiler
+            .compile_tool_plan(
+                &DECLARATIVE_DIALECT,
+                parameters,
+                &tools,
+                ToolChoice::Auto,
+                ParallelToolCallPolicy::Disabled,
+                Vec::new(),
+            )
+            .unwrap();
+        assert_eq!(auto.auto_activation_trigger(), Some("<calls>"));
+        assert!(!accepts(&auto, output));
+        assert!(accepts(
+            &auto,
+            "<calls><call>first_tool::json\n{\"value\":1}\n::end</call></calls>"
+        ));
+
+        let mut parser = required.create_parser().unwrap();
+        parser
+            .push("<calls><call>first_tool::json\n{\"value\":")
+            .unwrap();
+        assert_eq!(
+            parser.events(),
+            &[
+                SemanticEvent::ToolCallStart {
+                    index: 0,
+                    id: "call_0".into(),
+                    name: "first_tool".into(),
+                },
+                SemanticEvent::ToolArgumentsDelta {
+                    index: 0,
+                    json_fragment: "{\"value\":".into(),
+                },
+            ]
+        );
+        parser.push("1}\n::end</call></calls><stop>").unwrap();
+        assert_eq!(
+            parser.events(),
+            &[
+                SemanticEvent::ToolCallStart {
+                    index: 0,
+                    id: "call_0".into(),
+                    name: "first_tool".into(),
+                },
+                SemanticEvent::ToolArgumentsDelta {
+                    index: 0,
+                    json_fragment: "{\"value\":".into(),
+                },
+                SemanticEvent::ToolArgumentsDelta {
+                    index: 0,
+                    json_fragment: "1}".into(),
+                },
+                SemanticEvent::ToolCallEnd,
+                SemanticEvent::Finished {
+                    reason: FinishReason::StopSequence,
+                },
+            ]
+        );
+
+        for invalid_name in [
+            "with.dot",
+            "東京",
+            "contains space",
+            "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789___",
+        ] {
+            let error = compiler
+                .compile_tool_plan(
+                    &DECLARATIVE_DIALECT,
+                    parameters,
+                    &[tool(invalid_name)],
+                    ToolChoice::Required,
+                    ParallelToolCallPolicy::Disabled,
+                    Vec::new(),
+                )
+                .unwrap_err();
+            assert!(error.contains("ASCII letters"), "{error}");
+        }
+
+        let mut incomplete = required.create_parser().unwrap();
+        incomplete
+            .push("<calls><call>first_tool::json\n{\"value\":1")
+            .unwrap();
+        incomplete.finish(FinishReason::MaxTokens).unwrap();
+        assert!(!incomplete
+            .events()
+            .iter()
+            .any(|event| matches!(event, SemanticEvent::ToolCallEnd)));
+
+        let mut malformed = required.create_parser().unwrap();
+        assert!(malformed
+            .push("<calls><call>first_tool::json\n{\"value\":]}")
+            .is_err());
     }
 
     #[test]
