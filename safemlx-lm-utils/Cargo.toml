@@ -23,6 +23,7 @@ fancy-regex = ["tokenizers/fancy-regex"]
 onig = ["tokenizers/onig"]
 
 [dependencies]
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 minijinja = { version = "2", features = ["json", "loader"] }
 minijinja-contrib = { version = "2", features = ["pycompat"] }
 serde = { version = "1", features = ["derive"] }

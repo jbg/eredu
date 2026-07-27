@@ -208,7 +208,7 @@ impl Utf8Buffer {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct StopMatch {
     visible: String,
-    matched: bool,
+    matched: Option<String>,
 }
 
 /// Incremental multi-pattern stop matcher with overlap-safe lookbehind.
@@ -249,19 +249,21 @@ impl StopMatcher {
         if self.matched {
             return StopMatch {
                 visible: String::new(),
-                matched: true,
+                matched: None,
             };
         }
 
         self.pending.extend_from_slice(text.as_bytes());
-        if let Some(position) = self.first_match_position() {
+        if let Some((position, stop_index)) = self.first_match() {
             let visible = String::from_utf8(self.pending[..position].to_vec())
                 .expect("stop matching preserves UTF-8 boundaries");
+            let matched = String::from_utf8(self.stops[stop_index].clone())
+                .expect("stop sequences are valid UTF-8");
             self.pending.clear();
             self.matched = true;
             return StopMatch {
                 visible,
-                matched: true,
+                matched: Some(matched),
             };
         }
 
@@ -272,7 +274,7 @@ impl StopMatcher {
         self.pending.drain(..visible_len);
         StopMatch {
             visible,
-            matched: false,
+            matched: None,
         }
     }
 
@@ -284,11 +286,12 @@ impl StopMatcher {
             .expect("stop matching preserves UTF-8 boundaries")
     }
 
-    fn first_match_position(&self) -> Option<usize> {
-        (0..self.pending.len()).find(|&position| {
+    fn first_match(&self) -> Option<(usize, usize)> {
+        (0..self.pending.len()).find_map(|position| {
             self.stops
                 .iter()
-                .any(|stop| self.pending[position..].starts_with(stop))
+                .position(|stop| self.pending[position..].starts_with(stop))
+                .map(|index| (position, index))
         })
     }
 
@@ -575,6 +578,14 @@ pub(crate) trait ProtocolParser: Send {
 
     fn push(&mut self, text: &str, sink: &mut SemanticEventSink) -> Result<(), Self::Error>;
 
+    /// Handles a stop sequence matched by the shared stream engine.
+    ///
+    /// Dialects whose terminal marker carries protocol meaning can override
+    /// this without taking ownership of stop matching.
+    fn stop(&mut self, _sequence: &str, sink: &mut SemanticEventSink) -> Result<(), Self::Error> {
+        self.finish(sink)
+    }
+
     fn finish(&mut self, sink: &mut SemanticEventSink) -> Result<(), Self::Error>;
 }
 
@@ -586,6 +597,10 @@ where
 
     fn push(&mut self, text: &str, sink: &mut SemanticEventSink) -> Result<(), Self::Error> {
         (**self).push(text, sink)
+    }
+
+    fn stop(&mut self, sequence: &str, sink: &mut SemanticEventSink) -> Result<(), Self::Error> {
+        (**self).stop(sequence, sink)
     }
 
     fn finish(&mut self, sink: &mut SemanticEventSink) -> Result<(), Self::Error> {
@@ -626,12 +641,12 @@ where
 
         let stop_match = self.stops.push(text);
         self.parser.push(&stop_match.visible, &mut self.sink)?;
-        if stop_match.matched {
-            self.parser.finish(&mut self.sink)?;
+        if let Some(sequence) = stop_match.matched {
+            self.parser.stop(&sequence, &mut self.sink)?;
             self.sink.finish(FinishReason::StopSequence);
             self.finished = true;
         }
-        Ok(stop_match.matched)
+        Ok(self.finished)
     }
 
     fn finish(&mut self, reason: FinishReason) -> Result<(), P::Error> {
@@ -1114,7 +1129,10 @@ mod tests {
             let second = matcher.push(&input[split..]);
             let visible = first.visible + &second.visible + &matcher.finish();
             assert_eq!(visible, "visible ", "split {split}");
-            assert!(first.matched || second.matched, "split {split}");
+            assert!(
+                first.matched.is_some() || second.matched.is_some(),
+                "split {split}"
+            );
             assert!(!visible.contains("aba"));
         }
     }
@@ -1142,7 +1160,7 @@ mod tests {
             let mut matcher = StopMatcher::new([], ["STOP"]);
             let first = matcher.push(&input[..split]);
             let second = matcher.push(&input[split..]);
-            assert!(!first.matched && !second.matched);
+            assert!(first.matched.is_none() && second.matched.is_none());
             assert_eq!(first.visible + &second.visible + &matcher.finish(), input);
         }
     }

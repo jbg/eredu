@@ -1,0 +1,6 @@
+<|channel|>analysis<|message|>{long chain of thought}<|end|><|start|>assistant<|channel|>commentary<|message|>**Action plan**:
+1. Generate an HTML file
+2. Generate a JavaScript for the Node.js server
+3. Start the server
+---
+Will start executing the plan step by step<|end|><|start|>assistant<|channel|>commentary to=functions.generate_file<|constrain|>json<|message|>{"template": "basic_html", "path": "index.html"}<|call|>

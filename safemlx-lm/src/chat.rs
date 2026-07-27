@@ -24,6 +24,7 @@ use crate::{
     format_dialect::{
         DialectParameters, FormatDialect, FormatRegistryEntry, GenerationPromptBehavior,
     },
+    harmony_format::{GPT_OSS_HARMONY_PARAMETERS, HARMONY_DIALECT},
     streaming::ToolRuntimeParser,
     tool_constraints::ConstraintBlueprint,
 };
@@ -531,6 +532,18 @@ const GEMMA4_LARGE_TEMPLATE_SIGNATURE: [u8; 32] = [
     0xae, 0x53, 0x46, 0x4b, 0xf3, 0xbe, 0x25, 0x80, 0x2b, 0x3a, 0x5b, 0x37, 0xde, 0xf7, 0xfd, 0x89,
     0x66, 0x70, 0x67, 0xd7, 0x57, 0x70, 0x49, 0xb3, 0xb2, 0xd7, 0x4c, 0x4d, 0x8d, 0xe4, 0xc6, 0xd4,
 ];
+const GPT_OSS_HARMONY_CURRENT_TEMPLATE_SIGNATURE: [u8; 32] = [
+    0xa4, 0xc9, 0x91, 0x9c, 0xbb, 0xd4, 0xac, 0xdd, 0x51, 0xcc, 0xff, 0xe2, 0x2d, 0xa0, 0x49, 0x26,
+    0x4b, 0x1b, 0x73, 0xe5, 0x90, 0x55, 0xfa, 0x58, 0x81, 0x1a, 0x99, 0xef, 0xbd, 0x7c, 0x81, 0x46,
+];
+const GPT_OSS_HARMONY_ESCAPED_TEMPLATE_SIGNATURE: [u8; 32] = [
+    0xb4, 0x74, 0x75, 0x9b, 0x33, 0xc2, 0x13, 0x42, 0xe7, 0x3a, 0xbc, 0xea, 0xe7, 0xfe, 0x37, 0x89,
+    0xf0, 0x62, 0xe2, 0x89, 0xf6, 0x97, 0x49, 0x80, 0x1f, 0x72, 0x2a, 0x50, 0x8f, 0x92, 0x18, 0x0a,
+];
+const GPT_OSS_HARMONY_INITIAL_TEMPLATE_SIGNATURE: [u8; 32] = [
+    0xf8, 0xd9, 0x25, 0x57, 0x77, 0x61, 0x55, 0x91, 0xa7, 0xcc, 0x1a, 0x7c, 0x93, 0x2f, 0x5a, 0x69,
+    0xe1, 0x81, 0x12, 0x89, 0x02, 0x29, 0x5e, 0x1b, 0x81, 0x22, 0x1d, 0x20, 0xd9, 0x83, 0xca, 0xc7,
+];
 
 const GEMMA4_STRUCTURAL_TOOL_SPEC: DeclarativeDialectSpec = DeclarativeDialectSpec {
     generation_prompt_behavior: GenerationPromptBehavior::HonorRequest,
@@ -675,6 +688,24 @@ const FORMAT_REGISTRY: &[FormatRegistryEntry] = &[
         template_signature: GEMMA4_LARGE_TEMPLATE_SIGNATURE,
         dialect: &DECLARATIVE_DIALECT,
         parameters: DialectParameters::Declarative(&GEMMA4_STRUCTURAL_TOOL_SPEC),
+    },
+    FormatRegistryEntry {
+        identity: "openai.gpt-oss.harmony.a4c9919c",
+        template_signature: GPT_OSS_HARMONY_CURRENT_TEMPLATE_SIGNATURE,
+        dialect: &HARMONY_DIALECT,
+        parameters: DialectParameters::Custom(&GPT_OSS_HARMONY_PARAMETERS),
+    },
+    FormatRegistryEntry {
+        identity: "openai.gpt-oss.harmony.b474759b",
+        template_signature: GPT_OSS_HARMONY_ESCAPED_TEMPLATE_SIGNATURE,
+        dialect: &HARMONY_DIALECT,
+        parameters: DialectParameters::Custom(&GPT_OSS_HARMONY_PARAMETERS),
+    },
+    FormatRegistryEntry {
+        identity: "openai.gpt-oss.harmony.f8d92557",
+        template_signature: GPT_OSS_HARMONY_INITIAL_TEMPLATE_SIGNATURE,
+        dialect: &HARMONY_DIALECT,
+        parameters: DialectParameters::Custom(&GPT_OSS_HARMONY_PARAMETERS),
     },
     #[cfg(test)]
     FormatRegistryEntry {
@@ -840,12 +871,14 @@ mod tests {
         prepare_format_profile, prepare_format_profile_with_registry, resolve_structural_tokens,
         template_signature, DialectParameters, FormatRegistryEntry, DECLARATIVE_DIALECT,
         GEMMA4_EDGE_TEMPLATE_SIGNATURE, GEMMA4_LARGE_TEMPLATE_SIGNATURE,
-        HERMES2_PRO_TOOL_USE_TEMPLATE_SIGNATURE, LLAMA31_33_TEMPLATE_SIGNATURE,
-        LLAMA32_TEMPLATE_SIGNATURE, LLAMA4_TEMPLATE_SIGNATURE, MINISTRAL8_2410_TEMPLATE_SIGNATURE,
-        MISTRAL7_V03_TEMPLATE_SIGNATURE, NEMOTRON_NANO_TEMPLATE_SIGNATURE,
-        QWEN25_TEMPLATE_SIGNATURE, QWEN3_TEMPLATE_16706FC5_SIGNATURE,
-        QWEN3_TEMPLATE_7E4AE267_SIGNATURE, QWEN3_VL_TEMPLATE_SIGNATURE, SYNTHETIC_DECLARATIVE_SPEC,
-        SYNTHETIC_TOOL_TEMPLATE, SYNTHETIC_TOOL_TEMPLATE_SIGNATURE,
+        GPT_OSS_HARMONY_CURRENT_TEMPLATE_SIGNATURE, GPT_OSS_HARMONY_ESCAPED_TEMPLATE_SIGNATURE,
+        GPT_OSS_HARMONY_INITIAL_TEMPLATE_SIGNATURE, HERMES2_PRO_TOOL_USE_TEMPLATE_SIGNATURE,
+        LLAMA31_33_TEMPLATE_SIGNATURE, LLAMA32_TEMPLATE_SIGNATURE, LLAMA4_TEMPLATE_SIGNATURE,
+        MINISTRAL8_2410_TEMPLATE_SIGNATURE, MISTRAL7_V03_TEMPLATE_SIGNATURE,
+        NEMOTRON_NANO_TEMPLATE_SIGNATURE, QWEN25_TEMPLATE_SIGNATURE,
+        QWEN3_TEMPLATE_16706FC5_SIGNATURE, QWEN3_TEMPLATE_7E4AE267_SIGNATURE,
+        QWEN3_VL_TEMPLATE_SIGNATURE, SYNTHETIC_DECLARATIVE_SPEC, SYNTHETIC_TOOL_TEMPLATE,
+        SYNTHETIC_TOOL_TEMPLATE_SIGNATURE,
     };
 
     const QWEN25_FIXTURE: &str =
@@ -876,6 +909,12 @@ mod tests {
         include_str!("../tests/fixtures/chat_templates/gemma-4-e2b-it-3e22461f.jinja");
     const GEMMA4_LARGE_FIXTURE: &str =
         include_str!("../tests/fixtures/chat_templates/gemma-4-26b-a4b-it-4d7ae498.jinja");
+    const GPT_OSS_HARMONY_CURRENT_FIXTURE_WITH_TERMINATOR: &str =
+        include_str!("../tests/fixtures/chat_templates/gpt-oss-harmony-a4c9919c.jinja");
+    const GPT_OSS_HARMONY_ESCAPED_FIXTURE_WITH_TERMINATOR: &str =
+        include_str!("../tests/fixtures/chat_templates/gpt-oss-harmony-b474759b.jinja");
+    const GPT_OSS_HARMONY_INITIAL_FIXTURE_WITH_TERMINATOR: &str =
+        include_str!("../tests/fixtures/chat_templates/gpt-oss-harmony-f8d92557.jinja");
 
     #[test]
     fn registry_does_not_guess_unknown_templates() {
@@ -1089,6 +1128,60 @@ mod tests {
 
         let modified = format!("{GEMMA4_EDGE_FIXTURE} ");
         assert!(prepare_format_profile(&modified).dialect.is_none());
+
+        let gpt_oss_current = GPT_OSS_HARMONY_CURRENT_FIXTURE_WITH_TERMINATOR
+            .strip_suffix('\n')
+            .expect("the fixture-only file terminator is documented");
+        let gpt_oss_escaped = GPT_OSS_HARMONY_ESCAPED_FIXTURE_WITH_TERMINATOR
+            .strip_suffix('\n')
+            .expect("the fixture-only file terminator is documented");
+        let gpt_oss_initial = GPT_OSS_HARMONY_INITIAL_FIXTURE_WITH_TERMINATOR
+            .strip_suffix('\n')
+            .expect("the fixture-only file terminator is documented");
+        for (template, signature, identity) in [
+            (
+                gpt_oss_current,
+                GPT_OSS_HARMONY_CURRENT_TEMPLATE_SIGNATURE,
+                "openai.gpt-oss.harmony.a4c9919c",
+            ),
+            (
+                gpt_oss_escaped,
+                GPT_OSS_HARMONY_ESCAPED_TEMPLATE_SIGNATURE,
+                "openai.gpt-oss.harmony.b474759b",
+            ),
+            (
+                gpt_oss_initial,
+                GPT_OSS_HARMONY_INITIAL_TEMPLATE_SIGNATURE,
+                "openai.gpt-oss.harmony.f8d92557",
+            ),
+        ] {
+            assert_eq!(template_signature(template), signature, "{identity}");
+            let prepared = prepare_format_profile(template);
+            assert_eq!(prepared.identity.as_deref(), Some(identity));
+            assert!(prepared.dialect.is_some(), "{identity}");
+            assert_eq!(
+                prepared.required_structural_tokens,
+                [
+                    "<|start|>",
+                    "<|end|>",
+                    "<|message|>",
+                    "<|channel|>",
+                    "<|constrain|>",
+                    "<|return|>",
+                    "<|call|>",
+                ]
+            );
+            assert_eq!(prepared.stop_sequences, ["<|return|>", "<|call|>"]);
+        }
+
+        assert!(prepare_format_profile(&format!("{gpt_oss_current} "))
+            .dialect
+            .is_none());
+        assert!(
+            prepare_format_profile("{{ messages }} generic GPT-OSS architecture template")
+                .dialect
+                .is_none()
+        );
     }
 
     #[test]

@@ -2762,6 +2762,7 @@ dependencies = [
 name = "safemlx-lm-utils"
 version = "0.1.4"
 dependencies = [
+ "chrono",
  "minijinja",
  "minijinja-contrib",
  "serde",

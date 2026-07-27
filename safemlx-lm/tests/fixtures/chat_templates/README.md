@@ -19,6 +19,9 @@ support key.
 | `llama-3.1-nemotron-nano-8b-v1-072b9ab4.jinja` | `nvidia/Llama-3.1-Nemotron-Nano-8B-v1` | `54641c1611fcff44fa4865626462445e0a153fc7` | single `chat_template` |
 | `gemma-4-e2b-it-3e22461f.jinja` | `google/gemma-4-E2B-it` | `3e22461f65e89153144f8adb70e3b8c2cc9845a7` | `chat_template.jinja` |
 | `gemma-4-26b-a4b-it-4d7ae498.jinja` | `google/gemma-4-26B-A4B-it` | `4d7ae4984b7db7de8f8457170b3f1a419ee76d52` | `chat_template.jinja` |
+| `gpt-oss-harmony-a4c9919c.jinja` | `openai/gpt-oss-20b` | `6cee5e81ee83917806bbde320786a8fb61efebee` | `chat_template.jinja` |
+| `gpt-oss-harmony-b474759b.jinja` | `openai/gpt-oss-20b` | `10e9d713f8e4a9281c59c40be6c58537480635ea` | `chat_template.jinja` |
+| `gpt-oss-harmony-f8d92557.jinja` | `openai/gpt-oss-20b` | `ec854da5735f125fe36f080d8013482590f9ad7d` | `chat_template.jinja` |
 
 The Hermes fixture body is also byte-identical to the named `tool_use`
 template in `NousResearch/Hermes-3-Llama-3.1-8B` revision
@@ -54,3 +57,16 @@ byte-identical to `google/gemma-4-12B-it` revision
 `842da3794eaa0b77d5f08bae87a17459d91ff475`. These two signatures capture
 the audited difference in disabled-thinking generation prompts without
 granting support from `model_type`.
+
+Each GPT-OSS fixture is byte-identical to the corresponding official
+`openai/gpt-oss-120b` body: revisions
+`b5c939de8f754692c1647ca79fbf85e8c1e70f8a`,
+`988e56b6fc3c723ad30aa7f18db742f54f921567`, and
+`f39accdb091b6c5710dbbf02674c27064e35019b`, respectively. The three
+signatures retain the official initial, escaped-newline, and current template
+bodies. They share one Harmony dialect because their output channel and
+function-call syntax is unchanged; neither GPT-OSS architecture metadata nor
+the repository name participates in selection.
+The upstream GPT-OSS bodies do not end in a line feed, so these fixtures carry
+one repository file terminator that signature and rendering tests remove
+explicitly.

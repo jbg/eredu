@@ -769,6 +769,10 @@ where
     R: Serialize + 'a,
     T: Serialize + 'a,
 {
+    env.add_function("strftime_now", |format: &str| {
+        chrono::Local::now().format(format).to_string()
+    });
+
     let ApplyChatTemplateArgs {
         conversations,
         tools,

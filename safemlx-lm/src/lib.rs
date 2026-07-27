@@ -44,6 +44,7 @@ mod gemma4_mtp;
 mod gguf_tokenizer;
 /// Unified fully resident and bounded layer execution for GPT-OSS.
 pub mod gpt_oss;
+mod harmony_format;
 /// Multimodal bounded layer execution for Thinking Machines Lab Inkling.
 pub mod inkling;
 /// Lightweight activation inspection hooks.

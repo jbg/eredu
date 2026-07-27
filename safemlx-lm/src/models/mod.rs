@@ -4391,6 +4391,8 @@ mod tests {
         include_str!("../../tests/fixtures/chat_templates/gemma-4-e2b-it-3e22461f.jinja");
     const GEMMA4_LARGE_FIXTURE: &str =
         include_str!("../../tests/fixtures/chat_templates/gemma-4-26b-a4b-it-4d7ae498.jinja");
+    const GPT_OSS_HARMONY_CURRENT_FIXTURE_WITH_TERMINATOR: &str =
+        include_str!("../../tests/fixtures/chat_templates/gpt-oss-harmony-a4c9919c.jinja");
 
     #[test]
     #[ignore = "requires MLX runtime execution and SAFEMLX_INSPECTION_MODEL_DIR"]
@@ -4573,6 +4575,33 @@ mod tests {
             ("eos_token".into(), json!("<eos>")),
         ]));
         tokenizer
+    }
+
+    fn harmony_chat_tokenizer(preceding_tokens: usize) -> ChatTokenizer {
+        let mut raw = Tokenizer::new(WordLevel::default());
+        raw.add_tokens(
+            (0..preceding_tokens)
+                .map(|index| AddedToken::from(format!("ordinary_{index}"), false))
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        assert_eq!(
+            raw.add_special_tokens(
+                [
+                    "<|start|>",
+                    "<|end|>",
+                    "<|message|>",
+                    "<|channel|>",
+                    "<|constrain|>",
+                    "<|return|>",
+                    "<|call|>",
+                ]
+                .map(|token| AddedToken::from(token, true).normalized(false))
+            )
+            .unwrap(),
+            7
+        );
+        ChatTokenizer::from_tokenizer(raw)
     }
 
     fn production_tool(name: &str) -> serde_json::Value {
@@ -5514,6 +5543,89 @@ mod tests {
             NativeToolSupport::Unsupported { reason }
                 if reason.contains("no registered format profile")
         ));
+    }
+
+    #[test]
+    fn production_gpt_oss_template_renders_harmony_history_and_runtime_profile() {
+        let compiler = Ok(ConstraintCompiler::synthetic_for_tests());
+        let mut tokenizer = harmony_chat_tokenizer(31);
+        let template = GPT_OSS_HARMONY_CURRENT_FIXTURE_WITH_TERMINATOR
+            .strip_suffix('\n')
+            .expect("the fixture-only file terminator is documented");
+        let messages = vec![
+            json!({"role": "system", "content": "Be exact."}),
+            json!({"role": "user", "content": "Look it up."}),
+            json!({
+                "role": "assistant",
+                "thinking": "Need the lookup result.",
+                "content": "",
+                "tool_calls": [{
+                    "type": "function",
+                    "function": {
+                        "name": "lookup",
+                        "arguments": {"value": 7}
+                    }
+                }]
+            }),
+            json!({"role": "tool", "content": "{\"result\":\"Bogotá\"}"}),
+            json!({"role": "user", "content": "Now summarize."}),
+        ];
+        let prepared = prepare_chat_from_parts(
+            &mut tokenizer,
+            ModelChatTemplate::Single(template.into()),
+            "architecture-metadata-must-not-select-harmony",
+            &[36],
+            Some(&compiler),
+            ChatTemplateRequest {
+                messages,
+                tools: vec![production_tool("lookup")],
+                tool_choice: ToolChoice::Required,
+                add_generation_prompt: true,
+                extra_template_kwargs: serde_json::Map::from_iter([
+                    ("model_identity".into(), json!("Fixture identity.")),
+                    ("reasoning_effort".into(), json!("low")),
+                ]),
+                ..ChatTemplateRequest::default()
+            },
+        )
+        .unwrap();
+
+        assert!(prepared.rendered_prompt().starts_with(
+            "<|start|>system<|message|>Fixture identity.\nKnowledge cutoff: 2024-06\nCurrent date: "
+        ));
+        assert!(prepared.rendered_prompt().contains(concat!(
+            "\n\nReasoning: low\n\n",
+            "# Valid channels: analysis, commentary, final. Channel must be included for every message.\n",
+            "Calls to these tools must go to the commentary channel: 'functions'.<|end|>",
+            "<|start|>developer<|message|># Instructions\n\nBe exact.\n\n# Tools\n\n"
+        )));
+        assert!(prepared.rendered_prompt().contains(concat!(
+            "<|start|>user<|message|>Look it up.<|end|>",
+            "<|start|>assistant<|channel|>analysis<|message|>Need the lookup result.<|end|>",
+            "<|start|>assistant to=functions.lookup<|channel|>commentary json",
+            "<|message|>{\"value\":7}<|call|>",
+            "<|start|>functions.lookup to=assistant<|channel|>commentary<|message|>",
+            "\"{\\\"result\\\":\\\"Bogotá\\\"}\"<|end|>",
+            "<|start|>user<|message|>Now summarize.<|end|>",
+            "<|start|>assistant"
+        )));
+        assert_eq!(prepared.generation_prompt(), "<|start|>assistant");
+        assert_eq!(
+            prepared.format_profile_identity(),
+            Some("openai.gpt-oss.harmony.a4c9919c")
+        );
+        assert_eq!(
+            prepared.preserved_structural_token_ids(),
+            &[31, 32, 33, 34, 35, 36, 37]
+        );
+        assert_eq!(
+            prepared.profile_stop_sequences(),
+            ["<|return|>", "<|call|>"]
+        );
+        let NativeToolSupport::Supported(plan) = prepared.native_tool_support() else {
+            panic!("exact GPT-OSS template signature must prepare Harmony");
+        };
+        assert_eq!(plan.auto_activation_trigger(), None);
     }
 
     #[test]
