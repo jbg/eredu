@@ -87,6 +87,10 @@ pub enum Error {
     #[error("native tool constraint error: {0}")]
     ToolConstraint(String),
 
+    /// An ordinary prepared-chat generation request or runtime failed.
+    #[error("prepared chat generation error: {0}")]
+    PreparedChatGeneration(String),
+
     /// Strict weight loading found missing parameters or unused checkpoint tensors.
     #[error("strict weight-load validation failed: {missing_count} missing parameters, {unused_count} unused weights\nmissing:\n{missing}\nunused:\n{unused}", missing_count = .missing.len(), unused_count = .unused.len(), missing = format_keys(.missing), unused = format_keys(.unused))]
     StrictLoadValidation {

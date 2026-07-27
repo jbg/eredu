@@ -2,16 +2,13 @@
 //!
 //! This module defines the events consumed by API adapters. The parsing
 //! machinery deliberately knows nothing about a model family: format profiles
-//! will eventually supply a parser, while generation will eventually supply
-//! decoded token bytes. Neither integration is part of this module yet.
+//! supply parsers and ordinary generation supplies committed tokenizer ids.
 
-// These internals intentionally precede their generation and format-profile
-// integrations so this commit can establish and exhaustively test the semantic
-// boundary without smuggling either integration into the public contract.
 #![allow(dead_code)]
 
 use std::collections::BTreeSet;
 use std::fmt;
+use std::num::NonZeroUsize;
 
 /// Why a semantic response stream finished.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -99,7 +96,7 @@ impl InProgressToolCall {
 /// Backends decide how ordinary tokenizer pieces become raw bytes. The
 /// `preserve_special` flag is true only for profile-designated structural token
 /// IDs; other special tokens can therefore remain skipped.
-trait TokenDecoderBackend {
+pub(crate) trait TokenDecoderBackend {
     type Error;
 
     fn decode_token(
@@ -107,6 +104,10 @@ trait TokenDecoderBackend {
         token_id: u32,
         preserve_special: bool,
     ) -> Result<Vec<u8>, Self::Error>;
+
+    fn finish(&mut self) -> Result<Vec<u8>, Self::Error> {
+        Ok(Vec::new())
+    }
 }
 
 /// A raw decoded token with its structural identity retained.
@@ -118,7 +119,7 @@ struct RawToken {
 }
 
 /// Decodes raw token pieces while retaining designated structural specials.
-struct RawTokenDecoder<D> {
+pub(crate) struct RawTokenDecoder<D> {
     backend: D,
     structural_token_ids: BTreeSet<u32>,
 }
@@ -127,7 +128,7 @@ impl<D> RawTokenDecoder<D>
 where
     D: TokenDecoderBackend,
 {
-    fn new(backend: D, structural_token_ids: impl IntoIterator<Item = u32>) -> Self {
+    pub(crate) fn new(backend: D, structural_token_ids: impl IntoIterator<Item = u32>) -> Self {
         Self {
             backend,
             structural_token_ids: structural_token_ids.into_iter().collect(),
@@ -142,6 +143,10 @@ where
             bytes,
             structural,
         })
+    }
+
+    fn finish(&mut self) -> Result<Vec<u8>, D::Error> {
+        self.backend.finish()
     }
 }
 
@@ -218,12 +223,17 @@ struct StopMatcher {
 }
 
 impl StopMatcher {
-    fn new<'a>(
+    fn new<'a, 'b>(
         profile_stops: impl IntoIterator<Item = &'a str>,
-        caller_stops: impl IntoIterator<Item = &'a str>,
+        caller_stops: impl IntoIterator<Item = &'b str>,
     ) -> Self {
         let mut stops = Vec::new();
-        for stop in profile_stops.into_iter().chain(caller_stops) {
+        for stop in profile_stops {
+            if !stop.is_empty() && !stops.iter().any(|existing| existing == stop.as_bytes()) {
+                stops.push(stop.as_bytes().to_vec());
+            }
+        }
+        for stop in caller_stops {
             if !stop.is_empty() && !stops.iter().any(|existing| existing == stop.as_bytes()) {
                 stops.push(stop.as_bytes().to_vec());
             }
@@ -595,10 +605,10 @@ impl<P> SemanticStream<P>
 where
     P: ProtocolParser,
 {
-    fn new<'a>(
+    fn new<'a, 'b>(
         parser: P,
         profile_stops: impl IntoIterator<Item = &'a str>,
-        caller_stops: impl IntoIterator<Item = &'a str>,
+        caller_stops: impl IntoIterator<Item = &'b str>,
     ) -> Self {
         Self {
             parser,
@@ -660,12 +670,13 @@ impl fmt::Debug for ToolRuntimeParser {
 }
 
 impl ToolRuntimeParser {
-    pub(crate) fn new<'a>(
+    pub(crate) fn new<'a, 'b>(
         parser: Box<dyn ProtocolParser<Error = String>>,
         profile_stops: impl IntoIterator<Item = &'a str>,
+        caller_stops: impl IntoIterator<Item = &'b str>,
     ) -> Self {
         Self {
-            stream: SemanticStream::new(parser, profile_stops, std::iter::empty()),
+            stream: SemanticStream::new(parser, profile_stops, caller_stops),
         }
     }
 
@@ -686,20 +697,159 @@ impl ToolRuntimeParser {
         self.stream.events()
     }
 
+    /// Removes and returns events emitted since the previous drain.
+    ///
+    /// Ordinary generation drains this queue after every committed token, so
+    /// callers observe deltas while decoding is still in progress rather than
+    /// after the complete response has been retained.
+    pub fn take_events(&mut self) -> Vec<SemanticEvent> {
+        std::mem::take(&mut self.stream.sink.events)
+    }
+
     /// Returns whether this parser has reached a terminal condition.
     pub fn is_finished(&self) -> bool {
         self.stream.finished
     }
 }
 
+/// Owns decoding, UTF-8 assembly, stop matching, protocol parsing, and event
+/// delivery for committed ordinary-generation tokens.
+pub(crate) struct CommittedTokenPipeline<D> {
+    decoder: RawTokenDecoder<D>,
+    utf8: Utf8Buffer,
+    parser: ToolRuntimeParser,
+}
+
+impl<D> CommittedTokenPipeline<D>
+where
+    D: TokenDecoderBackend,
+    D::Error: fmt::Display,
+{
+    pub(crate) fn new(decoder: RawTokenDecoder<D>, parser: ToolRuntimeParser) -> Self {
+        Self {
+            decoder,
+            utf8: Utf8Buffer::default(),
+            parser,
+        }
+    }
+
+    /// Commits one tokenizer id and reports whether a decoded stop matched.
+    pub(crate) fn push(
+        &mut self,
+        token_id: u32,
+        emit: &mut impl FnMut(SemanticEvent),
+    ) -> Result<bool, String> {
+        let raw = self
+            .decoder
+            .push(token_id)
+            .map_err(|error| format!("token decoding failed: {error}"))?;
+        let text = self
+            .utf8
+            .push(&raw.bytes)
+            .map_err(|error| format!("UTF-8 assembly failed: {error}"))?;
+        let matched = self.parser.push(&text)?;
+        self.drain_into(emit);
+        Ok(matched)
+    }
+
+    /// Finalizes parsing exactly once and immediately delivers buffered events.
+    pub(crate) fn finish(
+        &mut self,
+        reason: FinishReason,
+        emit: &mut impl FnMut(SemanticEvent),
+    ) -> Result<(), String> {
+        let trailing = self
+            .decoder
+            .finish()
+            .map_err(|error| format!("token decoding failed: {error}"))?;
+        let text = self
+            .utf8
+            .push(&trailing)
+            .map_err(|error| format!("UTF-8 assembly failed: {error}"))?;
+        self.parser.push(&text)?;
+        std::mem::take(&mut self.utf8)
+            .finish()
+            .map_err(|error| format!("UTF-8 assembly failed: {error}"))?;
+        self.parser.finish(reason)?;
+        self.drain_into(emit);
+        Ok(())
+    }
+
+    fn drain_into(&mut self, emit: &mut impl FnMut(SemanticEvent)) {
+        for event in self.parser.take_events() {
+            emit(event);
+        }
+    }
+}
+
+/// Architecture-independent source of sampled, grammar-committed token ids.
+pub(crate) trait CommittedTokenSource {
+    type Error: fmt::Display;
+
+    fn next_token(&mut self) -> Result<Option<u32>, Self::Error>;
+
+    fn grammar_is_complete(&mut self) -> Result<bool, Self::Error>;
+}
+
+/// Drives the production committed-token boundary without owning a second
+/// model loop. The source remains the architecture-dispatched iterator.
+pub(crate) fn drive_committed_generation<D, T>(
+    source: &mut T,
+    pipeline: &mut CommittedTokenPipeline<D>,
+    eos_token_ids: &[u32],
+    max_tokens: NonZeroUsize,
+    emit: &mut impl FnMut(SemanticEvent),
+) -> Result<(Vec<u32>, FinishReason), String>
+where
+    D: TokenDecoderBackend,
+    D::Error: fmt::Display,
+    T: CommittedTokenSource,
+{
+    let max_tokens = max_tokens.get();
+    let mut token_ids = Vec::with_capacity(max_tokens);
+    for index in 0..max_tokens {
+        let token_id = source
+            .next_token()
+            .map_err(|error| format!("model generation failed: {error}"))?
+            .ok_or_else(|| "architecture generation ended without a terminal token".to_owned())?;
+        token_ids.push(token_id);
+
+        let stop_matched = pipeline.push(token_id, emit)?;
+        let grammar_complete = if stop_matched {
+            false
+        } else {
+            source
+                .grammar_is_complete()
+                .map_err(|error| format!("grammar completion check failed: {error}"))?
+        };
+        let reason = stop_matched
+            .then_some(FinishReason::StopSequence)
+            .or_else(|| grammar_complete.then_some(FinishReason::GrammarComplete))
+            .or_else(|| {
+                eos_token_ids
+                    .contains(&token_id)
+                    .then_some(FinishReason::Eos)
+            })
+            .or_else(|| (index + 1 == max_tokens).then_some(FinishReason::MaxTokens));
+
+        if let Some(reason) = reason {
+            pipeline.finish(reason, emit)?;
+            return Ok((token_ids, reason));
+        }
+    }
+
+    unreachable!("a non-zero max token limit always terminates the generation loop")
+}
+
 #[cfg(test)]
 mod tests {
-    use std::convert::Infallible;
+    use std::{cell::Cell, collections::VecDeque, convert::Infallible, num::NonZeroUsize, rc::Rc};
 
     use super::{
-        FinishReason, JsonFragmentBuffer, PartialPatternBuffer, PatternKind, PatternPiece,
-        ProtocolParser, RawTokenDecoder, SemanticEvent, SemanticEventSink, SemanticStream,
-        StopMatcher, TokenDecoderBackend, Utf8Buffer, Utf8BufferError,
+        drive_committed_generation, CommittedTokenPipeline, CommittedTokenSource, FinishReason,
+        JsonFragmentBuffer, PartialPatternBuffer, PatternKind, PatternPiece, ProtocolParser,
+        RawTokenDecoder, SemanticEvent, SemanticEventSink, SemanticStream, StopMatcher,
+        TokenDecoderBackend, ToolRuntimeParser, Utf8Buffer, Utf8BufferError,
     };
 
     const REASONING_START: &str = "<r>";
@@ -1186,5 +1336,214 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[derive(Debug, Default)]
+    struct SyntheticCommittedDecoder;
+
+    impl TokenDecoderBackend for SyntheticCommittedDecoder {
+        type Error = Infallible;
+
+        fn decode_token(
+            &mut self,
+            token_id: u32,
+            preserve_special: bool,
+        ) -> Result<Vec<u8>, Self::Error> {
+            Ok(match (token_id, preserve_special) {
+                (1000, true) => REASONING_START.as_bytes().to_vec(),
+                (1001, true) => REASONING_END.as_bytes().to_vec(),
+                (1000 | 1001, false) => Vec::new(),
+                (id, _) => vec![u8::try_from(id).expect("synthetic ordinary token is one byte")],
+            })
+        }
+    }
+
+    struct SyntheticModel {
+        tokens: VecDeque<u32>,
+        grammar_after: Option<usize>,
+        next_calls: Rc<Cell<usize>>,
+    }
+
+    impl SyntheticModel {
+        fn new(
+            tokens: impl IntoIterator<Item = u32>,
+            grammar_after: Option<usize>,
+            next_calls: Rc<Cell<usize>>,
+        ) -> Self {
+            Self {
+                tokens: tokens.into_iter().collect(),
+                grammar_after,
+                next_calls,
+            }
+        }
+    }
+
+    impl CommittedTokenSource for SyntheticModel {
+        type Error = Infallible;
+
+        fn next_token(&mut self) -> Result<Option<u32>, Self::Error> {
+            self.next_calls.set(self.next_calls.get() + 1);
+            Ok(self.tokens.pop_front())
+        }
+
+        fn grammar_is_complete(&mut self) -> Result<bool, Self::Error> {
+            Ok(self
+                .grammar_after
+                .is_some_and(|count| self.next_calls.get() >= count))
+        }
+    }
+
+    fn synthetic_generation(
+        bytes: &[u8],
+        grammar_after: Option<usize>,
+        eos_token_ids: &[u32],
+        max_tokens: usize,
+        caller_stops: &[&str],
+    ) -> (Vec<u32>, FinishReason, Vec<SemanticEvent>, usize) {
+        let calls = Rc::new(Cell::new(0));
+        let mut source = SyntheticModel::new(
+            bytes.iter().copied().map(u32::from),
+            grammar_after,
+            calls.clone(),
+        );
+        let parser = ToolRuntimeParser::new(
+            Box::new(SyntheticParser::default()),
+            std::iter::empty(),
+            caller_stops.iter().copied(),
+        );
+        let decoder = RawTokenDecoder::new(SyntheticCommittedDecoder, []);
+        let mut pipeline = CommittedTokenPipeline::new(decoder, parser);
+        let mut events = Vec::new();
+        let (tokens, reason) = drive_committed_generation(
+            &mut source,
+            &mut pipeline,
+            eos_token_ids,
+            NonZeroUsize::new(max_tokens).unwrap(),
+            &mut |event| events.push(event),
+        )
+        .unwrap();
+        (tokens, reason, events, calls.get())
+    }
+
+    fn assert_exactly_one_finished(events: &[SemanticEvent], reason: FinishReason) {
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, SemanticEvent::Finished { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(events.last(), Some(&SemanticEvent::Finished { reason }));
+    }
+
+    #[test]
+    fn synthetic_model_stop_has_precedence_and_never_leaks() {
+        let input = b"safe STOP hidden";
+        let terminal_len = b"safe STOP".len();
+        let (tokens, reason, events, calls) = synthetic_generation(
+            input,
+            Some(terminal_len),
+            &[u32::from(b'P')],
+            terminal_len,
+            &["STOP"],
+        );
+
+        assert_eq!(reason, FinishReason::StopSequence);
+        assert_eq!(tokens.len(), terminal_len);
+        assert_eq!(calls, terminal_len);
+        assert_eq!(visible_text(&events), "safe ");
+        assert_exactly_one_finished(&events, reason);
+    }
+
+    #[test]
+    fn synthetic_model_grammar_completion_precedes_eos_and_max_without_resampling() {
+        let input = b"hello";
+        let (tokens, reason, events, calls) = synthetic_generation(
+            input,
+            Some(input.len()),
+            &[u32::from(b'o')],
+            input.len(),
+            &[],
+        );
+
+        assert_eq!(reason, FinishReason::GrammarComplete);
+        assert_eq!(tokens.len(), input.len());
+        assert_eq!(
+            calls,
+            input.len(),
+            "no token sampled after grammar completion"
+        );
+        assert_eq!(visible_text(&events), "hello");
+        assert_exactly_one_finished(&events, reason);
+    }
+
+    #[test]
+    fn synthetic_model_eos_precedes_max_tokens() {
+        let (tokens, reason, events, calls) =
+            synthetic_generation(b"hi", None, &[u32::from(b'i')], 2, &[]);
+
+        assert_eq!(reason, FinishReason::Eos);
+        assert_eq!(tokens, [u32::from(b'h'), u32::from(b'i')]);
+        assert_eq!(calls, 2);
+        assert_exactly_one_finished(&events, reason);
+    }
+
+    #[test]
+    fn synthetic_model_max_tokens_finalizes_once() {
+        let (tokens, reason, events, calls) = synthetic_generation(b"more", None, &[], 2, &[]);
+
+        assert_eq!(reason, FinishReason::MaxTokens);
+        assert_eq!(tokens, [u32::from(b'm'), u32::from(b'o')]);
+        assert_eq!(calls, 2);
+        assert_eq!(visible_text(&events), "mo");
+        assert_exactly_one_finished(&events, reason);
+    }
+
+    #[test]
+    fn synthetic_model_delivers_events_before_completion_and_preserves_only_structural_specials() {
+        let calls = Rc::new(Cell::new(0));
+        let tokens = [
+            u32::from(b'a'),
+            1000,
+            u32::from(b'x'),
+            1001,
+            u32::from(b'b'),
+        ];
+        let mut source = SyntheticModel::new(tokens, None, calls.clone());
+        let parser = ToolRuntimeParser::new(
+            Box::new(SyntheticParser::default()),
+            std::iter::empty(),
+            std::iter::empty(),
+        );
+        let decoder = RawTokenDecoder::new(SyntheticCommittedDecoder, [1000, 1001]);
+        let mut pipeline = CommittedTokenPipeline::new(decoder, parser);
+        let mut delivered = Vec::new();
+        let (committed, reason) = drive_committed_generation(
+            &mut source,
+            &mut pipeline,
+            &[],
+            NonZeroUsize::new(tokens.len()).unwrap(),
+            &mut |event| delivered.push((calls.get(), event)),
+        )
+        .unwrap();
+        let events = delivered
+            .iter()
+            .map(|(_, event)| event.clone())
+            .collect::<Vec<_>>();
+
+        assert_eq!(committed, tokens);
+        assert_eq!(reason, FinishReason::MaxTokens);
+        assert!(
+            delivered
+                .iter()
+                .any(|(at_call, event)| *at_call < tokens.len()
+                    && !matches!(event, SemanticEvent::Finished { .. })),
+            "at least one semantic delta must arrive while the model can still be sampled"
+        );
+        assert_eq!(visible_text(&events), "ab");
+        assert_eq!(reasoning_text(&events), "x");
+        assert!(!format!("{events:?}").contains(REASONING_START));
+        assert!(!format!("{events:?}").contains(REASONING_END));
+        assert_exactly_one_finished(&events, reason);
     }
 }

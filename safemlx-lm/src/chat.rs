@@ -170,17 +170,31 @@ impl ToolRuntimePlan {
         self.structural_tokens.iter().map(|token| token.token_id)
     }
 
+    pub(crate) fn structural_tokens(&self) -> impl Iterator<Item = (u32, &str)> + '_ {
+        self.structural_tokens
+            .iter()
+            .map(|token| (token.token_id, token.spelling.as_str()))
+    }
+
     /// Creates a fresh protocol parser with independent state for one generation.
     ///
     /// Profile-owned stop matching is applied before text reaches the protocol
     /// parser.
     pub fn create_parser(&self) -> Result<ToolRuntimeParser, String> {
+        self.create_parser_with_stops(std::iter::empty())
+    }
+
+    pub(crate) fn create_parser_with_stops<'a>(
+        &self,
+        caller_stops: impl IntoIterator<Item = &'a str>,
+    ) -> Result<ToolRuntimeParser, String> {
         let parser = self
             .dialect
             .incremental_parser_state(self.dialect_parameters)?;
         Ok(ToolRuntimeParser::new(
             parser,
             self.profile_stop_sequences.iter().map(String::as_str),
+            caller_stops,
         ))
     }
 }

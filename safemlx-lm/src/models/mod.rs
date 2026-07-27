@@ -5,7 +5,7 @@
 //! [`crate::models::load_model`] and [`crate::models::load_tokenizer`] when you
 //! want to manage those pieces separately.
 
-use std::path::Path;
+use std::{collections::HashMap, num::NonZeroUsize, path::Path};
 
 use safemlx::{
     error::Exception,
@@ -34,7 +34,11 @@ use crate::parallel::ParallelTopology;
 #[cfg(feature = "media-processing")]
 use crate::processor::{load_processor, ModelProcessor, PreparedModelInput, ProcessorInput};
 use crate::quantization::WeightQuantization;
-use crate::sampler::{DefaultSampler, Sampler, SpeculativeSampler};
+use crate::sampler::{ConstrainedSampler, DefaultSampler, Sampler, SpeculativeSampler};
+use crate::streaming::{
+    drive_committed_generation, CommittedTokenPipeline, CommittedTokenSource, FinishReason,
+    RawTokenDecoder, SemanticEvent, TokenDecoderBackend,
+};
 use crate::tool_constraints::ConstraintCompiler;
 use crate::{
     cache::{ConcatKeyValueCache, PagedKeyValueCache, SlidingKeyValueCache},
@@ -1771,6 +1775,43 @@ where
     Qwen3NextLayerwise(crate::qwen_hybrid::Generate<'a, S>),
 }
 
+impl<S> ModelGenerate<'_, S>
+where
+    S: Sampler,
+{
+    /// Returns the architecture iterator's sampler at its committed prefix.
+    pub fn sampler_mut(&mut self) -> &mut S {
+        match self {
+            Self::DeepSeekV3(generate) => generate.sampler_mut(),
+            Self::DeepSeekV3Layerwise(generate) => generate.sampler_mut(),
+            Self::Gemma4(generate) => generate.sampler_mut(),
+            Self::Gemma4Layerwise(generate) => generate.sampler_mut(),
+            Self::GptOss(generate) => generate.sampler_mut(),
+            Self::GptOssLayerwise(generate) => generate.sampler_mut(),
+            Self::Inkling(generate) => generate.sampler_mut(),
+            Self::InklingLayerwise(generate) => generate.sampler_mut(),
+            Self::Llama(generate) => generate.sampler_mut(),
+            Self::LlamaSliding(generate) => generate.sampler_mut(),
+            Self::LlamaPaged(generate) => generate.sampler_mut(),
+            Self::LlamaLayerwise(generate) => generate.sampler_mut(),
+            Self::Lfm2(generate) => generate.sampler_mut(),
+            Self::Lfm2Layerwise(generate) => generate.sampler_mut(),
+            Self::NemotronH(generate) => generate.sampler_mut(),
+            Self::NemotronHLayerwise(generate) => generate.sampler_mut(),
+            Self::Qwen3(generate) => generate.sampler_mut(),
+            Self::Qwen3Layerwise(generate) => generate.sampler_mut(),
+            Self::Qwen3Vl(generate) => generate.sampler_mut(),
+            Self::Qwen3VlLayerwise(generate) => generate.sampler_mut(),
+            Self::Qwen3VlMoe(generate) => generate.sampler_mut(),
+            Self::Qwen3VlMoeLayerwise(generate) => generate.sampler_mut(),
+            Self::Qwen35Moe(generate) => generate.sampler_mut(),
+            Self::Qwen35MoeLayerwise(generate) => generate.sampler_mut(),
+            Self::Qwen3Next(generate) => generate.sampler_mut(),
+            Self::Qwen3NextLayerwise(generate) => generate.sampler_mut(),
+        }
+    }
+}
+
 impl<S> Iterator for ModelGenerate<'_, S>
 where
     S: Sampler,
@@ -1833,6 +1874,162 @@ impl TextDecoder {
             &mut self.prefix_index,
         )
         .map_err(Into::into)
+    }
+}
+
+/// Model sampling and stopping settings for one prepared chat generation.
+pub struct PreparedChatGenerationSettings {
+    /// Sampling temperature passed to the selected policy.
+    pub temperature: f32,
+    /// Maximum number of committed generated tokens.
+    pub max_tokens: NonZeroUsize,
+    /// Optional MLX PRNG key required by stochastic policies.
+    pub prng_key: Option<Array>,
+}
+
+impl Default for PreparedChatGenerationSettings {
+    fn default() -> Self {
+        Self {
+            temperature: 0.0,
+            max_tokens: NonZeroUsize::new(256).expect("256 is non-zero"),
+            prng_key: None,
+        }
+    }
+}
+
+/// Cohesive request for ordinary structured generation from a [`PreparedChat`].
+///
+/// The cache and stream remain caller-owned and may be selected using the
+/// existing cache-residency and execution APIs. `sampling_policy` is wrapped in
+/// the prepared chat's constraint plan before any model execution.
+pub struct PreparedChatGenerationRequest<'a, S, F> {
+    /// Prepared prompt and embedded format/runtime plan.
+    pub prepared_chat: &'a PreparedChat,
+    /// Architecture-matched cache used for prompt prefill and decoding.
+    pub cache: &'a mut ModelCache,
+    /// Caller-selected base sampling policy.
+    pub sampling_policy: S,
+    /// Temperature, token limit, and optional random state.
+    pub settings: PreparedChatGenerationSettings,
+    /// Additional decoded text sequences that terminate generation.
+    pub caller_stop_sequences: &'a [String],
+    /// MLX execution stream used for prompt encoding transfer and model work.
+    pub stream: &'a Stream,
+    /// Called synchronously as each semantic event becomes available.
+    pub on_event: F,
+}
+
+/// Terminal metadata returned by ordinary prepared-chat generation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreparedChatGenerationOutput {
+    /// Every committed generated tokenizer id, including a terminal EOS id.
+    pub token_ids: Vec<u32>,
+    /// Deterministically selected terminal condition.
+    pub finish_reason: FinishReason,
+}
+
+struct PreparedChatTokenDecoder {
+    decoder: TextDecoder,
+    structural_tokens: HashMap<u32, String>,
+}
+
+impl TokenDecoderBackend for PreparedChatTokenDecoder {
+    type Error = Error;
+
+    fn decode_token(
+        &mut self,
+        token_id: u32,
+        preserve_special: bool,
+    ) -> Result<Vec<u8>, Self::Error> {
+        let decoded = self.decoder.step(token_id)?.unwrap_or_default();
+        if preserve_special {
+            let spelling = self.structural_tokens.get(&token_id).ok_or_else(|| {
+                Error::PreparedChatGeneration(format!(
+                    "structural token id {token_id} has no profile spelling"
+                ))
+            })?;
+            let mut bytes = decoded.into_bytes();
+            bytes.extend_from_slice(spelling.as_bytes());
+            Ok(bytes)
+        } else {
+            Ok(decoded.into_bytes())
+        }
+    }
+
+    fn finish(&mut self) -> Result<Vec<u8>, Self::Error> {
+        let decoded = self
+            .decoder
+            .tokenizer
+            .decode(&self.decoder.ids, self.decoder.skip_special_tokens)
+            .map_err(Error::from)?;
+        if decoded.len() > self.decoder.prefix.len() {
+            return Err(Error::PreparedChatGeneration(
+                "generated token stream ended with an incomplete tokenizer byte sequence".into(),
+            ));
+        }
+        Ok(Vec::new())
+    }
+}
+
+struct PreparedChatRuntime<S> {
+    sampler: ConstrainedSampler<S>,
+    parser: crate::streaming::ToolRuntimeParser,
+    structural_tokens: HashMap<u32, String>,
+}
+
+fn with_prepared_chat_runtime<S, R>(
+    prepared_chat: &PreparedChat,
+    sampling_policy: S,
+    caller_stop_sequences: &[String],
+    execute: impl FnOnce(PreparedChatRuntime<S>) -> Result<R, Error>,
+) -> Result<R, Error> {
+    let plan = match prepared_chat.native_tool_support() {
+        NativeToolSupport::Supported(plan) => plan,
+        NativeToolSupport::Unsupported { reason } => {
+            return Err(Error::PreparedChatGeneration(format!(
+                "prepared chat does not have an executable native tool plan: {reason}"
+            )));
+        }
+    };
+    let sampler = ConstrainedSampler::from_tool_plan(sampling_policy, plan)
+        .map_err(|error| Error::PreparedChatGeneration(error.to_string()))?;
+    let parser = plan
+        .create_parser_with_stops(caller_stop_sequences.iter().map(String::as_str))
+        .map_err(Error::PreparedChatGeneration)?;
+    let structural_tokens = plan
+        .structural_tokens()
+        .map(|(id, spelling)| (id, spelling.to_owned()))
+        .collect();
+    execute(PreparedChatRuntime {
+        sampler,
+        parser,
+        structural_tokens,
+    })
+}
+
+struct ModelGenerateTokenSource<'a, S>
+where
+    S: Sampler + Clone,
+{
+    generator: ModelGenerate<'a, ConstrainedSampler<S>>,
+    stream: &'a Stream,
+}
+
+impl<S> CommittedTokenSource for ModelGenerateTokenSource<'_, S>
+where
+    S: Sampler + Clone,
+{
+    type Error = Exception;
+
+    fn next_token(&mut self) -> Result<Option<u32>, Self::Error> {
+        self.generator
+            .next()
+            .transpose()
+            .map(|token| token.map(|token| token.item::<u32>(self.stream)))
+    }
+
+    fn grammar_is_complete(&mut self) -> Result<bool, Self::Error> {
+        self.generator.sampler_mut().grammar_is_complete()
     }
 }
 
@@ -2102,6 +2299,85 @@ impl LoadedModel {
             prefix: String::new(),
             prefix_index: 0,
         }
+    }
+
+    /// Generates one ordinary structured response from a prepared chat.
+    ///
+    /// This method validates native-tool support and constructs the constrained
+    /// sampler plus a fresh dialect parser before prompt prefill. It then uses
+    /// the existing architecture-dispatched token iterator, committing each
+    /// token through tokenizer-aware decoding, selective structural-special
+    /// preservation, UTF-8 assembly, combined profile/caller stop matching, and
+    /// immediate [`SemanticEvent`] delivery.
+    /// The rendered chat template is encoded without adding a second layer of
+    /// tokenizer special tokens.
+    ///
+    /// When terminal conditions coincide on one committed token, precedence is
+    /// decoded stop sequence, grammar completion, EOS, then max tokens. Grammar
+    /// completion is inspected before requesting the next token.
+    pub fn generate_prepared_chat<S, F>(
+        &mut self,
+        request: PreparedChatGenerationRequest<'_, S, F>,
+    ) -> Result<PreparedChatGenerationOutput, Error>
+    where
+        S: Sampler + Clone,
+        F: FnMut(SemanticEvent),
+    {
+        let PreparedChatGenerationRequest {
+            prepared_chat,
+            cache,
+            sampling_policy,
+            settings,
+            caller_stop_sequences,
+            stream,
+            mut on_event,
+        } = request;
+
+        with_prepared_chat_runtime(
+            prepared_chat,
+            sampling_policy,
+            caller_stop_sequences,
+            |runtime| {
+                // This closure is the execution boundary: unsupported plans
+                // and runtime-construction failures return before it is called.
+                let structural_token_ids = runtime
+                    .structural_tokens
+                    .keys()
+                    .copied()
+                    .collect::<Vec<_>>();
+                let decoder = PreparedChatTokenDecoder {
+                    decoder: self.text_decoder(true),
+                    structural_tokens: runtime.structural_tokens,
+                };
+                let raw_decoder = RawTokenDecoder::new(decoder, structural_token_ids);
+                let mut pipeline = CommittedTokenPipeline::new(raw_decoder, runtime.parser);
+                let prompt =
+                    self.encode_to_array(prepared_chat.rendered_prompt(), false, stream)?;
+                let parts = [input::InputPart::text_token_ids(&prompt)];
+                let input = input::ModelInput::new(&parts);
+                let generator = self.generate_input_with_cache_sampler(
+                    cache,
+                    settings.temperature,
+                    input,
+                    settings.prng_key,
+                    stream,
+                    runtime.sampler,
+                );
+                let mut source = ModelGenerateTokenSource { generator, stream };
+                let (token_ids, finish_reason) = drive_committed_generation(
+                    &mut source,
+                    &mut pipeline,
+                    prepared_chat.eos_token_ids(),
+                    settings.max_tokens,
+                    &mut on_event,
+                )
+                .map_err(Error::PreparedChatGeneration)?;
+                Ok(PreparedChatGenerationOutput {
+                    token_ids,
+                    finish_reason,
+                })
+            },
+        )
     }
 
     /// Reports whether and how this target can perform MTP generation.
@@ -4057,7 +4333,7 @@ mod tests {
         eos_token_ids_from_sidecar_dir, gguf_eos_token_ids, load_chat_template,
         load_model_with_options, load_tokenizer, load_tokenizer_template_kwargs,
         merge_eos_token_id_sources, prepare_chat_from_parts, validate_gguf_quantization_source,
-        LoadedModel, ModelLoadOptions,
+        with_prepared_chat_runtime, LoadedModel, ModelLoadOptions,
     };
     use crate::{
         chat::{
@@ -4067,6 +4343,7 @@ mod tests {
         error::Error,
         inspection::ActivationRecorder,
         quantization::{AffineQuantization, CheckpointQuantizationOptions, WeightQuantization},
+        sampler::DefaultSampler,
         streaming::{FinishReason, SemanticEvent},
         tool_constraints::ConstraintCompiler,
     };
@@ -4180,6 +4457,36 @@ mod tests {
         );
         let _: fn(&mut LoadedModel, ChatTemplateRequest) -> Result<PreparedChat, Error> =
             LoadedModel::prepare_chat;
+    }
+
+    #[test]
+    fn unsupported_prepared_chat_fails_before_execution_boundary() {
+        let prepared = PreparedChat {
+            rendered_prompt: "prompt must not be prefetched".into(),
+            generation_prompt: String::new(),
+            template_identity: ChatTemplateIdentity::Single,
+            format_profile_identity: None,
+            native_tool_support: NativeToolSupport::Unsupported {
+                reason: "synthetic unsupported profile".into(),
+            },
+            eos_token_ids: vec![2],
+            preserved_structural_token_ids: Vec::new(),
+            profile_stop_sequences: Vec::new(),
+        };
+        let execution_calls = AtomicUsize::new(0);
+
+        let error = with_prepared_chat_runtime(&prepared, DefaultSampler, &[], |_| {
+            execution_calls.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        })
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            Error::PreparedChatGeneration(message)
+                if message.contains("synthetic unsupported profile")
+        ));
+        assert_eq!(execution_calls.load(Ordering::Relaxed), 0);
     }
 
     #[test]

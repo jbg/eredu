@@ -140,6 +140,11 @@ where
             _cache: PhantomData,
         }
     }
+
+    /// Returns the sampler state associated with committed generated tokens.
+    pub fn sampler_mut(&mut self) -> &mut S {
+        &mut self.sampler
+    }
 }
 
 impl<M, C, S> Iterator for Generate<'_, M, C, S>
