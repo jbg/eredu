@@ -13,6 +13,10 @@ support key.
 | `hermes-2-pro-llama-3-8b-f798274b-tool-use.jinja` | `NousResearch/Hermes-2-Pro-Llama-3-8B` | `f798274b30e7d2d4797c369edcc0cc7473b6e6f2` | named `tool_use` template |
 | `mistral-7b-instruct-v0.3-c170c708.jinja` | `mistralai/Mistral-7B-Instruct-v0.3` | `c170c708c41dac9275d15a8fff4eca08d52bab71` | single `chat_template` |
 | `ministral-8b-instruct-2410-2f494a19.jinja` | `mistralai/Ministral-8B-Instruct-2410` | `2f494a194c5b980dfb9772cb92d26cbb671fce5a` | single `chat_template` |
+| `llama-3.1-3.3-e10ca381.jinja` | `meta-llama/Llama-3.1-8B-Instruct` | `0e9e39f249a16976918f6564b8830bc894c89659` | single `chat_template` |
+| `llama-3.2-5816fce1.jinja` | `meta-llama/Llama-3.2-3B-Instruct` | `0cb88a4f764b7a12671c53f0838cd831a0843b95` | single `chat_template` |
+| `llama-4-01a91bfb.jinja` | `meta-llama/Llama-4-Scout-17B-16E-Instruct` | `92f3b1597a195b523d8d9e5700e57e4fbb8f20d3` | single `chat_template` |
+| `llama-3.1-nemotron-nano-8b-v1-072b9ab4.jinja` | `nvidia/Llama-3.1-Nemotron-Nano-8B-v1` | `54641c1611fcff44fa4865626462445e0a153fc7` | single `chat_template` |
 | `gemma-4-e2b-it-3e22461f.jinja` | `google/gemma-4-E2B-it` | `3e22461f65e89153144f8adb70e3b8c2cc9845a7` | `chat_template.jinja` |
 | `gemma-4-26b-a4b-it-4d7ae498.jinja` | `google/gemma-4-26B-A4B-it` | `4d7ae4984b7db7de8f8457170b3f1a419ee76d52` | `chat_template.jinja` |
 
@@ -32,6 +36,15 @@ fixtures carry one repository file terminator, which signature tests remove
 explicitly. The other upstream bodies end in a line feed and are stored
 unchanged. All other upstream whitespace, including trailing spaces, is
 preserved byte-for-byte.
+
+The Llama 3.1 fixture is byte-identical to
+`meta-llama/Llama-3.3-70B-Instruct` revision
+`6f6073b423013f6a7d4d9f39144961bfbfbc386b`. The Llama 4 fixture is
+byte-identical to `meta-llama/Llama-4-Maverick-17B-128E-Instruct` revision
+`73d14711bcc77c16df3470856949c3764056b617`. Those shared bodies intentionally
+share exact registrations; no family or repository metadata is inspected.
+The upstream Nemotron body does not end in a line feed, so its fixture carries
+one repository file terminator that signature tests remove explicitly.
 
 The Gemma 4 E2B fixture is byte-identical to `google/gemma-4-E4B-it`
 revision `ee0ef6023621cff504d758262d4e04895a5af4a2`. The 26B-A4B fixture is

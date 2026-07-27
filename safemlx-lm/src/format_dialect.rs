@@ -130,6 +130,22 @@ pub(crate) struct ExactEnvelope {
 pub(crate) struct DelimitedChannel {
     pub(crate) prefix: &'static str,
     pub(crate) suffix: &'static str,
+    /// Whether the channel must occur before a tool-call collection.
+    pub(crate) required: bool,
+}
+
+/// Exact JSON syntax and semantic fields for one function call.
+///
+/// The JSON object validated against the selected function schema may be bare
+/// or surrounded by exact syntax such as an outer wrapper object. Protocol
+/// call markers remain in [`DeclarativeDialectSpec::call`], so XML, channel,
+/// collection, and stop handling stay shared.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct JsonFunctionEnvelope {
+    pub(crate) envelope: ExactEnvelope,
+    pub(crate) name_field: &'static str,
+    pub(crate) arguments_field: &'static str,
+    pub(crate) call_id: Option<DeclarativeCallId>,
 }
 
 /// JSON payload shape emitted by the dialect.
@@ -186,15 +202,15 @@ pub(crate) struct DeclarativeDialectSpec {
     pub(crate) output: ExactEnvelope,
     pub(crate) call: ExactEnvelope,
     pub(crate) payload_shape: DeclarativePayloadShape,
-    pub(crate) name_field: &'static str,
-    pub(crate) arguments_field: &'static str,
-    pub(crate) call_id: Option<DeclarativeCallId>,
+    pub(crate) json_function: Option<&'static JsonFunctionEnvelope>,
     pub(crate) reasoning_channel: Option<DelimitedChannel>,
     pub(crate) text_channel: Option<DelimitedChannel>,
     /// Whether un-delimited visible assistant text may precede tool calls.
     pub(crate) raw_text_before_calls: bool,
     pub(crate) call_separator: &'static str,
     pub(crate) parallel_layout: ParallelCallLayout,
+    /// Protocol-level cap applied in addition to the caller's parallel policy.
+    pub(crate) protocol_max_calls: Option<usize>,
     pub(crate) auto_activation_trigger: Option<&'static str>,
     pub(crate) required_structural_tokens: &'static [&'static str],
     pub(crate) stop_sequences: &'static [&'static str],
@@ -204,17 +220,22 @@ impl DeclarativeDialectSpec {
     fn validate(&self) -> Result<(), String> {
         match self.payload_shape {
             DeclarativePayloadShape::JsonObject | DeclarativePayloadShape::JsonList => {
-                if self.name_field.is_empty() || self.arguments_field.is_empty() {
+                let function = self.json_function.ok_or_else(|| {
+                    "declarative JSON payloads require a function envelope".to_owned()
+                })?;
+                if function.name_field.is_empty() || function.arguments_field.is_empty() {
                     return Err("declarative name and arguments fields must be non-empty".into());
                 }
-                if self.name_field == self.arguments_field {
+                if function.name_field == function.arguments_field {
                     return Err("declarative name and arguments fields must be distinct".into());
                 }
-                if let Some(call_id) = self.call_id {
+                if let Some(call_id) = function.call_id {
                     if call_id.field.is_empty() {
                         return Err("declarative call ID field must be non-empty".into());
                     }
-                    if call_id.field == self.name_field || call_id.field == self.arguments_field {
+                    if call_id.field == function.name_field
+                        || call_id.field == function.arguments_field
+                    {
                         return Err(
                             "declarative call ID, name, and arguments fields must be distinct"
                                 .into(),
@@ -229,9 +250,10 @@ impl DeclarativeDialectSpec {
                             .into(),
                     );
                 }
-                if self.call_id.is_some() {
+                if self.json_function.is_some() {
                     return Err(
-                        "declarative structural objects cannot carry a JSON call ID field".into(),
+                        "declarative structural objects cannot carry a JSON function envelope"
+                            .into(),
                     );
                 }
             }
@@ -267,12 +289,36 @@ impl DeclarativeDialectSpec {
                 "only repeated object call envelopes may omit an outer output envelope".into(),
             );
         }
+        let bare_json_object = self.payload_shape == DeclarativePayloadShape::JsonObject
+            && self.call.prefix.is_empty()
+            && self.call.suffix.is_empty()
+            && self
+                .json_function
+                .is_some_and(|function| function.envelope.prefix.is_empty());
+        let wrapped_json_object = self.payload_shape == DeclarativePayloadShape::JsonObject
+            && self.call.prefix.is_empty()
+            && self.call.suffix.is_empty()
+            && self.json_function.is_some_and(|function| {
+                !function.envelope.prefix.is_empty() && !function.envelope.suffix.is_empty()
+            });
         if self.output.prefix.is_empty()
+            && !bare_json_object
+            && !wrapped_json_object
             && (self.call.prefix.is_empty() || self.call.suffix.is_empty())
         {
             return Err(
                 "an unwrapped declarative output requires non-empty exact call delimiters".into(),
             );
+        }
+        let bare_json_activation = self
+            .reasoning_channel
+            .filter(|channel| channel.required)
+            .or_else(|| self.text_channel.filter(|channel| channel.required))
+            .map_or("{", |channel| channel.prefix);
+        if bare_json_object && self.auto_activation_trigger != Some(bare_json_activation) {
+            return Err(format!(
+                "a bare JSON object must use {bare_json_activation:?} as its exact activation trigger"
+            ));
         }
         for (name, channel) in [
             ("reasoning", self.reasoning_channel),
@@ -305,6 +351,9 @@ impl DeclarativeDialectSpec {
                 "a JSON-list call separator must be exactly one comma plus whitespace".into(),
             );
         }
+        if self.protocol_max_calls == Some(0) {
+            return Err("declarative protocol call limit must be positive".into());
+        }
         Ok(())
     }
 
@@ -330,10 +379,25 @@ impl DeclarativeDialectSpec {
                 resolved_structural_token_ids,
             )
         };
-        let (min_calls, max_calls) = tool_call_bounds(tool_choice, parallel_tool_calls, tools)?;
+        let (mut min_calls, mut max_calls) =
+            tool_call_bounds(tool_choice, parallel_tool_calls, tools)?;
+        if tool_choice == ToolChoice::Auto {
+            // The grammar is inactive until the exact protocol trigger has
+            // already been emitted. Once activated, Auto must complete a call.
+            min_calls = 1;
+        }
+        if let Some(protocol_maximum) = self.protocol_max_calls {
+            max_calls = Some(max_calls.map_or(protocol_maximum, |caller_maximum| {
+                caller_maximum.min(protocol_maximum)
+            }));
+        }
+        if max_calls.is_some_and(|maximum| maximum < min_calls) {
+            return Err("format protocol cannot satisfy the requested tool choice".into());
+        }
         if self.call_separator.is_empty()
             && (max_calls.is_none() || max_calls.is_some_and(|maximum| maximum > 1))
             && (self.call.prefix.is_empty() || self.call.suffix.is_empty())
+            && self.payload_shape != DeclarativePayloadShape::JsonObject
         {
             return Err(
                 "adjacent declarative calls require non-empty exact call delimiters".into(),
@@ -341,11 +405,19 @@ impl DeclarativeDialectSpec {
         }
 
         let mut grammar = String::from("start: ");
-        if self.reasoning_channel.is_some() {
-            grammar.push_str("reasoning? ");
+        if let Some(channel) = self.reasoning_channel {
+            grammar.push_str(if channel.required {
+                "reasoning "
+            } else {
+                "reasoning? "
+            });
         }
-        if self.text_channel.is_some() {
-            grammar.push_str("visible_text? ");
+        if let Some(channel) = self.text_channel {
+            grammar.push_str(if channel.required {
+                "visible_text "
+            } else {
+                "visible_text? "
+            });
         } else if self.raw_text_before_calls {
             grammar.push_str("raw_text? ");
         }
@@ -377,8 +449,15 @@ impl DeclarativeDialectSpec {
         let calls = repeated_rule("call", &literal(self.call_separator)?, min_calls, max_calls);
         match self.payload_shape {
             DeclarativePayloadShape::JsonObject => {
-                let schema =
-                    tool_call_schema(tools, self.name_field, self.arguments_field, self.call_id)?;
+                let function = self
+                    .json_function
+                    .expect("validated JSON payload has a function envelope");
+                let schema = tool_call_schema(
+                    tools,
+                    function.name_field,
+                    function.arguments_field,
+                    function.call_id,
+                )?;
                 let schema = serde_json::to_string(&schema).expect("JSON schema values serialize");
                 if self.output.prefix.is_empty() {
                     grammar.push_str(&format!("tool_output: {calls}\n"));
@@ -391,15 +470,24 @@ impl DeclarativeDialectSpec {
                     ));
                 }
                 grammar.push_str(&format!(
-                    "call: {} call_json {}\n",
+                    "call: {} {} call_json {} {}\n",
                     literal(self.call.prefix)?,
+                    literal(function.envelope.prefix)?,
+                    literal(function.envelope.suffix)?,
                     literal(self.call.suffix)?
                 ));
                 grammar.push_str(&format!("call_json: %json {schema}\n"));
             }
             DeclarativePayloadShape::JsonList => {
-                let schema =
-                    tool_call_schema(tools, self.name_field, self.arguments_field, self.call_id)?;
+                let function = self
+                    .json_function
+                    .expect("validated JSON payload has a function envelope");
+                let schema = tool_call_schema(
+                    tools,
+                    function.name_field,
+                    function.arguments_field,
+                    function.call_id,
+                )?;
                 let schema = serde_json::to_string(&schema).expect("JSON schema values serialize");
                 grammar.push_str(&format!(
                     "tool_output: {} {} \"[\" {} \"]\" {} {}\n",
@@ -409,7 +497,11 @@ impl DeclarativeDialectSpec {
                     literal(self.call.suffix)?,
                     literal(self.output.suffix)?
                 ));
-                grammar.push_str("call: call_json\n");
+                grammar.push_str(&format!(
+                    "call: {} call_json {}\n",
+                    literal(function.envelope.prefix)?,
+                    literal(function.envelope.suffix)?
+                ));
                 grammar.push_str(&format!("call_json: %json {schema}\n"));
             }
             DeclarativePayloadShape::StructuralObject(encoding) => {
@@ -827,6 +919,7 @@ enum DeclarativeParserState {
         suffix: &'static str,
     },
     ToolStart,
+    JsonEnvelopeStart,
     Payload(JsonFragmentBuffer),
     StructuralName {
         prefix_consumed: bool,
@@ -858,6 +951,32 @@ impl DeclarativeParser {
         }
     }
 
+    fn tool_start_delimiter(&self) -> &'static str {
+        if !self.spec.output.prefix.is_empty() {
+            self.spec.output.prefix
+        } else if !self.spec.call.prefix.is_empty() {
+            self.spec.call.prefix
+        } else if let Some(prefix) = self
+            .spec
+            .json_function
+            .map(|function| function.envelope.prefix)
+            .filter(|prefix| !prefix.is_empty())
+        {
+            prefix
+        } else {
+            "{"
+        }
+    }
+
+    fn tool_start_delimiter_is_json(&self) -> bool {
+        self.spec.output.prefix.is_empty()
+            && self.spec.call.prefix.is_empty()
+            && self
+                .spec
+                .json_function
+                .is_some_and(|function| function.envelope.prefix.is_empty())
+    }
+
     fn outside_delimiters(&self) -> Vec<&'static str> {
         let mut delimiters = Vec::new();
         if let Some(channel) = self.spec.reasoning_channel {
@@ -866,11 +985,7 @@ impl DeclarativeParser {
         if let Some(channel) = self.spec.text_channel {
             delimiters.push(channel.prefix);
         }
-        delimiters.push(if self.spec.output.prefix.is_empty() {
-            self.spec.call.prefix
-        } else {
-            self.spec.output.prefix
-        });
+        delimiters.push(self.tool_start_delimiter());
         delimiters
     }
 
@@ -880,22 +995,26 @@ impl DeclarativeParser {
         let object = value
             .as_object()
             .ok_or_else(|| "declarative tool call must be a JSON object".to_owned())?;
+        let function = self
+            .spec
+            .json_function
+            .expect("JSON payload parser has a function envelope");
         let name = object
-            .get(self.spec.name_field)
+            .get(function.name_field)
             .and_then(Value::as_str)
             .ok_or_else(|| {
                 format!(
                     "declarative tool call field {:?} must be a string",
-                    self.spec.name_field
+                    function.name_field
                 )
             })?;
-        let arguments = object.get(self.spec.arguments_field).ok_or_else(|| {
+        let arguments = object.get(function.arguments_field).ok_or_else(|| {
             format!(
                 "declarative tool call is missing field {:?}",
-                self.spec.arguments_field
+                function.arguments_field
             )
         })?;
-        let id = match self.spec.call_id {
+        let id = match function.call_id {
             Some(call_id) => {
                 let id = object
                     .get(call_id.field)
@@ -937,6 +1056,26 @@ impl DeclarativeParser {
                     prefix_consumed: false,
                 }
             }
+        }
+    }
+
+    fn start_call_payload_state(&self) -> DeclarativeParserState {
+        match self.spec.payload_shape {
+            DeclarativePayloadShape::JsonObject | DeclarativePayloadShape::JsonList => {
+                if self
+                    .spec
+                    .json_function
+                    .expect("JSON payload has a function envelope")
+                    .envelope
+                    .prefix
+                    .is_empty()
+                {
+                    self.start_payload_state()
+                } else {
+                    DeclarativeParserState::JsonEnvelopeStart
+                }
+            }
+            DeclarativePayloadShape::StructuralObject(_) => self.start_payload_state(),
         }
     }
 
@@ -1011,13 +1150,14 @@ impl DeclarativeParser {
                         return Ok(());
                     };
                     sink.text(self.pending[..position].to_owned());
-                    self.pending.drain(..position + delimiters[index].len());
+                    self.pending.drain(..position);
                     let reasoning_index = self.spec.reasoning_channel.map(|_| 0);
                     let text_index = self
                         .spec
                         .text_channel
                         .map(|_| usize::from(self.spec.reasoning_channel.is_some()));
                     if reasoning_index == Some(index) {
+                        self.pending.drain(..delimiters[index].len());
                         self.state = DeclarativeParserState::Channel {
                             kind: ChannelKind::Reasoning,
                             suffix: self
@@ -1027,15 +1167,25 @@ impl DeclarativeParser {
                                 .suffix,
                         };
                     } else if text_index == Some(index) {
+                        self.pending.drain(..delimiters[index].len());
                         self.state = DeclarativeParserState::Channel {
                             kind: ChannelKind::Text,
                             suffix: self.spec.text_channel.expect("text channel").suffix,
                         };
                     } else {
-                        self.state = if self.spec.output.prefix.is_empty() {
+                        let delimiter_is_json = self.tool_start_delimiter_is_json();
+                        if !delimiter_is_json {
+                            self.pending.drain(..delimiters[index].len());
+                        }
+                        self.state = if !self.spec.output.prefix.is_empty() {
+                            DeclarativeParserState::ToolStart
+                        } else if !self.spec.call.prefix.is_empty() {
+                            self.start_call_payload_state()
+                        } else if delimiter_is_json {
                             self.start_payload_state()
                         } else {
-                            DeclarativeParserState::ToolStart
+                            // The exact JSON wrapper prefix was the delimiter.
+                            self.start_payload_state()
                         };
                     }
                 }
@@ -1082,8 +1232,20 @@ impl DeclarativeParser {
                     if self.spec.payload_shape == DeclarativePayloadShape::JsonList {
                         self.state = DeclarativeParserState::ListItemOrEnd { allow_end: true };
                     } else {
-                        self.state = self.start_payload_state();
+                        self.state = self.start_call_payload_state();
                     }
+                }
+                DeclarativeParserState::JsonEnvelopeStart => {
+                    let expected = self
+                        .spec
+                        .json_function
+                        .expect("JSON envelope state requires JSON payload")
+                        .envelope
+                        .prefix;
+                    if !self.consume_exact(expected)? {
+                        return Ok(());
+                    }
+                    self.state = self.start_payload_state();
                 }
                 DeclarativeParserState::ListItemOrEnd { allow_end } => {
                     if self.pending.is_empty() {
@@ -1098,7 +1260,7 @@ impl DeclarativeParser {
                         self.pending.drain(..1);
                         self.state = DeclarativeParserState::ToolSuffix;
                     } else {
-                        self.state = DeclarativeParserState::Payload(JsonFragmentBuffer::default());
+                        self.state = self.start_call_payload_state();
                     }
                 }
                 DeclarativeParserState::Payload(json) => {
@@ -1174,8 +1336,27 @@ impl DeclarativeParser {
                     self.state = DeclarativeParserState::AfterPayload;
                 }
                 DeclarativeParserState::AfterPayload => match self.spec.payload_shape {
-                    DeclarativePayloadShape::JsonObject
-                    | DeclarativePayloadShape::StructuralObject(_) => {
+                    DeclarativePayloadShape::JsonObject => {
+                        let function_suffix = self
+                            .spec
+                            .json_function
+                            .expect("JSON object has a function envelope")
+                            .envelope
+                            .suffix;
+                        let expected = format!("{function_suffix}{}", self.spec.call.suffix);
+                        if !self.consume_exact(&expected)? {
+                            return Ok(());
+                        }
+                        sink.end_tool_call();
+                        self.state = if self.spec.output.prefix.is_empty()
+                            && self.spec.call_separator.is_empty()
+                        {
+                            DeclarativeParserState::Outside
+                        } else {
+                            DeclarativeParserState::AfterEnvelope
+                        };
+                    }
+                    DeclarativePayloadShape::StructuralObject(_) => {
                         if !self.consume_exact(self.spec.call.suffix)? {
                             return Ok(());
                         }
@@ -1189,6 +1370,15 @@ impl DeclarativeParser {
                         };
                     }
                     DeclarativePayloadShape::JsonList => {
+                        let function_suffix = self
+                            .spec
+                            .json_function
+                            .expect("JSON list has a function envelope")
+                            .envelope
+                            .suffix;
+                        if !self.consume_exact(function_suffix)? {
+                            return Ok(());
+                        }
                         if self.pending.is_empty() {
                             return Ok(());
                         }
@@ -1510,7 +1700,7 @@ mod tests {
     use super::{
         ConstraintConfiguration, DeclarativeCallId, DeclarativeDialectSpec,
         DeclarativePayloadShape, DelimitedChannel, DialectParameters, ExactEnvelope, FormatDialect,
-        FormatRegistryEntry, GenerationPromptBehavior, ParallelCallLayout,
+        FormatRegistryEntry, GenerationPromptBehavior, JsonFunctionEnvelope, ParallelCallLayout,
         StructuralObjectEncoding, DECLARATIVE_DIALECT,
     };
     use crate::{
@@ -1520,6 +1710,44 @@ mod tests {
         },
         streaming::{FinishReason, ProtocolParser, SemanticEvent, SemanticEventSink},
         tool_constraints::ConstraintCompiler,
+    };
+
+    const FUNCTION_INPUT_JSON: JsonFunctionEnvelope = JsonFunctionEnvelope {
+        envelope: ExactEnvelope {
+            prefix: "",
+            suffix: "",
+        },
+        name_field: "function",
+        arguments_field: "input",
+        call_id: None,
+    };
+
+    const OP_ARGS_JSON: JsonFunctionEnvelope = JsonFunctionEnvelope {
+        name_field: "op",
+        arguments_field: "args",
+        ..FUNCTION_INPUT_JSON
+    };
+
+    const NAME_ARGUMENTS_JSON: JsonFunctionEnvelope = JsonFunctionEnvelope {
+        name_field: "name",
+        arguments_field: "arguments",
+        ..FUNCTION_INPUT_JSON
+    };
+
+    const NAME_ARGUMENTS_WITH_ID_JSON: JsonFunctionEnvelope = JsonFunctionEnvelope {
+        call_id: Some(DeclarativeCallId {
+            field: "id",
+            length: Some(9),
+        }),
+        ..NAME_ARGUMENTS_JSON
+    };
+
+    const OPENAI_WRAPPED_JSON: JsonFunctionEnvelope = JsonFunctionEnvelope {
+        envelope: ExactEnvelope {
+            prefix: r#"{"type":"function","function":"#,
+            suffix: "}",
+        },
+        ..NAME_ARGUMENTS_JSON
     };
 
     const DECLARATIVE_OBJECT_SPEC: DeclarativeDialectSpec = DeclarativeDialectSpec {
@@ -1533,20 +1761,21 @@ mod tests {
             suffix: "</call>",
         },
         payload_shape: DeclarativePayloadShape::JsonObject,
-        name_field: "function",
-        arguments_field: "input",
-        call_id: None,
+        json_function: Some(&FUNCTION_INPUT_JSON),
         reasoning_channel: Some(DelimitedChannel {
             prefix: "<think>",
             suffix: "</think>",
+            required: false,
         }),
         text_channel: Some(DelimitedChannel {
             prefix: "<text>",
             suffix: "</text>",
+            required: false,
         }),
         raw_text_before_calls: false,
         call_separator: "\n",
         parallel_layout: ParallelCallLayout::RepeatedEnvelopes,
+        protocol_max_calls: None,
         auto_activation_trigger: Some("<tools>"),
         required_structural_tokens: &[],
         stop_sequences: &["<stop>"],
@@ -1563,14 +1792,13 @@ mod tests {
             suffix: "</json>",
         },
         payload_shape: DeclarativePayloadShape::JsonList,
-        name_field: "op",
-        arguments_field: "args",
-        call_id: None,
+        json_function: Some(&OP_ARGS_JSON),
         reasoning_channel: None,
         text_channel: None,
         raw_text_before_calls: false,
         call_separator: ", ",
         parallel_layout: ParallelCallLayout::SingleEnvelope,
+        protocol_max_calls: None,
         auto_activation_trigger: Some("<batch>"),
         required_structural_tokens: &[],
         stop_sequences: &["</batch>"],
@@ -1587,20 +1815,43 @@ mod tests {
             suffix: "\n</tool_call>",
         },
         payload_shape: DeclarativePayloadShape::JsonObject,
-        name_field: "name",
-        arguments_field: "arguments",
-        call_id: None,
+        json_function: Some(&NAME_ARGUMENTS_JSON),
         reasoning_channel: Some(DelimitedChannel {
             prefix: "<think>\n",
             suffix: "\n</think>",
+            required: false,
         }),
         text_channel: None,
         raw_text_before_calls: true,
         call_separator: "\n",
         parallel_layout: ParallelCallLayout::RepeatedEnvelopes,
+        protocol_max_calls: None,
         auto_activation_trigger: Some("<tool_call>\n"),
         required_structural_tokens: &["<|im_end|>"],
         stop_sequences: &["<|im_end|>"],
+    };
+
+    const JSON_FUNCTION_WRAPPER_SPEC: DeclarativeDialectSpec = DeclarativeDialectSpec {
+        generation_prompt_behavior: GenerationPromptBehavior::HonorRequest,
+        output: ExactEnvelope {
+            prefix: "",
+            suffix: "",
+        },
+        call: ExactEnvelope {
+            prefix: "",
+            suffix: "",
+        },
+        payload_shape: DeclarativePayloadShape::JsonObject,
+        json_function: Some(&OPENAI_WRAPPED_JSON),
+        reasoning_channel: None,
+        text_channel: None,
+        raw_text_before_calls: false,
+        call_separator: "\n",
+        parallel_layout: ParallelCallLayout::RepeatedEnvelopes,
+        protocol_max_calls: None,
+        auto_activation_trigger: Some(r#"{"type":"function","function":"#),
+        required_structural_tokens: &[],
+        stop_sequences: &[],
     };
 
     const MARKER_JSON_LIST_SPEC: DeclarativeDialectSpec = DeclarativeDialectSpec {
@@ -1614,17 +1865,13 @@ mod tests {
             suffix: "",
         },
         payload_shape: DeclarativePayloadShape::JsonList,
-        name_field: "name",
-        arguments_field: "arguments",
-        call_id: Some(DeclarativeCallId {
-            field: "id",
-            length: Some(9),
-        }),
+        json_function: Some(&NAME_ARGUMENTS_WITH_ID_JSON),
         reasoning_channel: None,
         text_channel: None,
         raw_text_before_calls: false,
         call_separator: ", ",
         parallel_layout: ParallelCallLayout::SingleEnvelope,
+        protocol_max_calls: None,
         auto_activation_trigger: Some("[TOOL_CALLS] "),
         required_structural_tokens: &[],
         stop_sequences: &["</s>"],
@@ -1655,17 +1902,17 @@ mod tests {
             name_prefix: "call:",
             string_delimiter: "<|\"|>",
         }),
-        name_field: "",
-        arguments_field: "",
-        call_id: None,
+        json_function: None,
         reasoning_channel: Some(DelimitedChannel {
             prefix: "<|channel>thought\n",
             suffix: "<channel|>",
+            required: false,
         }),
         text_channel: None,
         raw_text_before_calls: true,
         call_separator: "",
         parallel_layout: ParallelCallLayout::RepeatedEnvelopes,
+        protocol_max_calls: None,
         auto_activation_trigger: Some("<|tool_call>"),
         required_structural_tokens: &[],
         stop_sequences: &["<|tool_response>", "<turn|>"],
@@ -2092,6 +2339,51 @@ mod tests {
     }
 
     #[test]
+    fn exact_json_function_wrappers_are_configurable_parallel_and_split_independent() {
+        let plan = ConstraintCompiler::synthetic_for_tests()
+            .compile_tool_plan(
+                &DECLARATIVE_DIALECT,
+                DialectParameters::Declarative(&JSON_FUNCTION_WRAPPER_SPEC),
+                &[tool("first"), tool("second")],
+                ToolChoice::Auto,
+                ParallelToolCallPolicy::Enabled {
+                    max_calls: std::num::NonZeroUsize::new(2),
+                },
+                Vec::new(),
+            )
+            .unwrap();
+        let output = concat!(
+            r#"{"type":"function","function":{"name":"first","arguments":{"value":1}}}"#,
+            "\n",
+            r#"{"type":"function","function":{"name":"second","arguments":{"value":2}}}"#,
+        );
+        assert_eq!(
+            plan.auto_activation_trigger(),
+            Some(r#"{"type":"function","function":"#)
+        );
+        assert!(accepts(&plan, output));
+        for invalid in [
+            r#"{"type":"other","function":{"name":"first","arguments":{"value":1}}}"#,
+            r#"{"type":"function","function":{"name":"missing","arguments":{"value":1}}}"#,
+            r#"{"type":"function","function":{"name":"first","arguments":{"value":"one"}}}"#,
+            r#"{"type":"function","function":{"name":"first","arguments":{"value":1}}}{"type":"function","function":{"name":"second","arguments":{"value":2}}}"#,
+        ] {
+            assert!(!accepts(&plan, invalid), "{invalid}");
+        }
+
+        for split in 0..=output.len() {
+            let mut parser = plan.create_parser().unwrap();
+            push_at_byte_split(&mut parser, output, split);
+            parser.finish(FinishReason::GrammarComplete).unwrap();
+            assert_eq!(
+                arguments(parser.events()),
+                [r#"{"value":1}"#, r#"{"value":2}"#],
+                "split {split}"
+            );
+        }
+    }
+
+    #[test]
     fn runtime_plan_creates_independent_parser_instances() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<crate::chat::ToolRuntimePlan>();
@@ -2315,7 +2607,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(auto.auto_activation_trigger(), Some("[TOOL_CALLS] "));
-        assert!(accepts(&auto, "[TOOL_CALLS] []"));
+        assert!(!accepts(&auto, "[TOOL_CALLS] []"));
 
         let stopped_output = format!("{output}</s>");
         for split in 0..=stopped_output.len() {

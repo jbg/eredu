@@ -17,7 +17,8 @@ use sha2::{Digest, Sha256};
 
 use crate::format_dialect::{
     DeclarativeCallId, DeclarativeDialectSpec, DeclarativePayloadShape, DelimitedChannel,
-    ExactEnvelope, ParallelCallLayout, StructuralObjectEncoding, DECLARATIVE_DIALECT,
+    ExactEnvelope, JsonFunctionEnvelope, ParallelCallLayout, StructuralObjectEncoding,
+    DECLARATIVE_DIALECT,
 };
 use crate::{
     format_dialect::{
@@ -343,14 +344,13 @@ const QWEN_XML_TOOL_SPEC: DeclarativeDialectSpec = DeclarativeDialectSpec {
         suffix: "\n</tool_call>",
     },
     payload_shape: DeclarativePayloadShape::JsonObject,
-    name_field: "name",
-    arguments_field: "arguments",
-    call_id: None,
+    json_function: Some(&NAME_ARGUMENTS_JSON_FUNCTION),
     reasoning_channel: None,
     text_channel: None,
     raw_text_before_calls: true,
     call_separator: "\n",
     parallel_layout: ParallelCallLayout::RepeatedEnvelopes,
+    protocol_max_calls: None,
     auto_activation_trigger: Some("<tool_call>\n"),
     required_structural_tokens: &["<|im_end|>"],
     stop_sequences: &["<|im_end|>"],
@@ -360,6 +360,7 @@ const QWEN3_XML_TOOL_SPEC: DeclarativeDialectSpec = DeclarativeDialectSpec {
     reasoning_channel: Some(DelimitedChannel {
         prefix: "<think>\n",
         suffix: "\n</think>",
+        required: false,
     }),
     ..QWEN_XML_TOOL_SPEC
 };
@@ -375,20 +376,98 @@ const MISTRAL_JSON_LIST_TOOL_SPEC: DeclarativeDialectSpec = DeclarativeDialectSp
         suffix: "",
     },
     payload_shape: DeclarativePayloadShape::JsonList,
-    name_field: "name",
-    arguments_field: "arguments",
-    call_id: Some(DeclarativeCallId {
-        field: "id",
-        length: Some(9),
-    }),
+    json_function: Some(&MISTRAL_JSON_FUNCTION),
     reasoning_channel: None,
     text_channel: None,
     raw_text_before_calls: false,
     call_separator: ", ",
     parallel_layout: ParallelCallLayout::SingleEnvelope,
+    protocol_max_calls: None,
     auto_activation_trigger: Some("[TOOL_CALLS] "),
     required_structural_tokens: &["[TOOL_CALLS]", "</s>"],
     stop_sequences: &["</s>"],
+};
+
+const NAME_ARGUMENTS_JSON_FUNCTION: JsonFunctionEnvelope = JsonFunctionEnvelope {
+    envelope: ExactEnvelope {
+        prefix: "",
+        suffix: "",
+    },
+    name_field: "name",
+    arguments_field: "arguments",
+    call_id: None,
+};
+
+const NAME_PARAMETERS_JSON_FUNCTION: JsonFunctionEnvelope = JsonFunctionEnvelope {
+    arguments_field: "parameters",
+    ..NAME_ARGUMENTS_JSON_FUNCTION
+};
+
+const MISTRAL_JSON_FUNCTION: JsonFunctionEnvelope = JsonFunctionEnvelope {
+    call_id: Some(DeclarativeCallId {
+        field: "id",
+        length: Some(9),
+    }),
+    ..NAME_ARGUMENTS_JSON_FUNCTION
+};
+
+const LLAMA3_JSON_TOOL_SPEC: DeclarativeDialectSpec = DeclarativeDialectSpec {
+    generation_prompt_behavior: GenerationPromptBehavior::HonorRequest,
+    output: ExactEnvelope {
+        prefix: "",
+        suffix: "",
+    },
+    call: ExactEnvelope {
+        prefix: "",
+        suffix: "",
+    },
+    payload_shape: DeclarativePayloadShape::JsonObject,
+    json_function: Some(&NAME_PARAMETERS_JSON_FUNCTION),
+    reasoning_channel: None,
+    text_channel: None,
+    raw_text_before_calls: false,
+    call_separator: "",
+    parallel_layout: ParallelCallLayout::RepeatedEnvelopes,
+    protocol_max_calls: Some(1),
+    auto_activation_trigger: Some("{"),
+    required_structural_tokens: &["<|eot_id|>"],
+    stop_sequences: &["<|eot_id|>"],
+};
+
+const LLAMA4_JSON_TOOL_SPEC: DeclarativeDialectSpec = DeclarativeDialectSpec {
+    text_channel: Some(DelimitedChannel {
+        prefix: "<|python_start|>",
+        suffix: "<|python_end|>",
+        required: true,
+    }),
+    protocol_max_calls: None,
+    required_structural_tokens: &["<|python_start|>", "<|python_end|>", "<|eot|>"],
+    stop_sequences: &["<|eot|>"],
+    auto_activation_trigger: Some("<|python_start|>"),
+    ..LLAMA3_JSON_TOOL_SPEC
+};
+
+const NEMOTRON_NANO_JSON_LIST_TOOL_SPEC: DeclarativeDialectSpec = DeclarativeDialectSpec {
+    generation_prompt_behavior: GenerationPromptBehavior::HonorRequest,
+    output: ExactEnvelope {
+        prefix: "<TOOLCALL>",
+        suffix: "</TOOLCALL>",
+    },
+    call: ExactEnvelope {
+        prefix: "",
+        suffix: "",
+    },
+    payload_shape: DeclarativePayloadShape::JsonList,
+    json_function: Some(&NAME_ARGUMENTS_JSON_FUNCTION),
+    reasoning_channel: None,
+    text_channel: None,
+    raw_text_before_calls: false,
+    call_separator: ", ",
+    parallel_layout: ParallelCallLayout::SingleEnvelope,
+    protocol_max_calls: None,
+    auto_activation_trigger: Some("<TOOLCALL>["),
+    required_structural_tokens: &["<|eot_id|>"],
+    stop_sequences: &["<|eot_id|>"],
 };
 
 const MINISTRAL_JSON_LIST_TOOL_SPEC: DeclarativeDialectSpec = DeclarativeDialectSpec {
@@ -428,6 +507,22 @@ const MINISTRAL8_2410_TEMPLATE_SIGNATURE: [u8; 32] = [
     0xe4, 0x67, 0x6c, 0xb5, 0x6d, 0xff, 0xea, 0x77, 0x82, 0xfd, 0x3e, 0x2b, 0x57, 0x7c, 0xfa, 0xf1,
     0xe1, 0x23, 0x53, 0x7e, 0x6e, 0xf4, 0x9b, 0x3e, 0xc7, 0xca, 0xa6, 0xc0, 0x95, 0xc6, 0x22, 0x72,
 ];
+const LLAMA31_33_TEMPLATE_SIGNATURE: [u8; 32] = [
+    0xe1, 0x0c, 0xa3, 0x81, 0xb1, 0xcc, 0xc5, 0xcf, 0x9d, 0xb5, 0x2e, 0x37, 0x1f, 0x3b, 0x66, 0x51,
+    0x57, 0x6c, 0xae, 0xe0, 0xa6, 0x30, 0xb4, 0x52, 0xe2, 0x81, 0x6b, 0x2d, 0x40, 0x4d, 0x4b, 0x65,
+];
+const LLAMA32_TEMPLATE_SIGNATURE: [u8; 32] = [
+    0x58, 0x16, 0xfc, 0xe1, 0x04, 0x44, 0xe0, 0x3c, 0x2e, 0x9e, 0xe1, 0xef, 0x8a, 0x4a, 0x1e, 0xa6,
+    0x1a, 0xe7, 0xe6, 0x9e, 0x43, 0x86, 0x13, 0xf3, 0xb1, 0x7b, 0x69, 0xd0, 0x42, 0x62, 0x23, 0xa4,
+];
+const LLAMA4_TEMPLATE_SIGNATURE: [u8; 32] = [
+    0x01, 0xa9, 0x1b, 0xfb, 0x2e, 0x84, 0xc8, 0x05, 0x5b, 0xf7, 0xb6, 0x35, 0x89, 0x8f, 0xef, 0x3c,
+    0xae, 0x0b, 0x69, 0xe4, 0x2a, 0xc5, 0x63, 0x4c, 0x21, 0x2d, 0x30, 0x8e, 0x0e, 0x90, 0x91, 0xbd,
+];
+const NEMOTRON_NANO_TEMPLATE_SIGNATURE: [u8; 32] = [
+    0x07, 0x2b, 0x9a, 0xb4, 0x5c, 0xdd, 0xdd, 0xd1, 0xc8, 0x21, 0xb7, 0xcc, 0xb0, 0xd4, 0xbe, 0x2b,
+    0x7a, 0x2b, 0x20, 0x70, 0xdd, 0x92, 0x7a, 0xb1, 0x4c, 0xe7, 0x31, 0xcf, 0x09, 0xa3, 0x43, 0x00,
+];
 const GEMMA4_EDGE_TEMPLATE_SIGNATURE: [u8; 32] = [
     0x0a, 0x2c, 0x80, 0x73, 0xc8, 0x78, 0xab, 0x1d, 0xa0, 0x04, 0xbe, 0xe9, 0x33, 0xa9, 0x98, 0x60,
     0x65, 0x37, 0xbb, 0xb6, 0x20, 0x16, 0x31, 0x03, 0x52, 0xc7, 0x28, 0x5c, 0x3f, 0x01, 0xc5, 0xb5,
@@ -451,17 +546,17 @@ const GEMMA4_STRUCTURAL_TOOL_SPEC: DeclarativeDialectSpec = DeclarativeDialectSp
         name_prefix: "call:",
         string_delimiter: "<|\"|>",
     }),
-    name_field: "",
-    arguments_field: "",
-    call_id: None,
+    json_function: None,
     reasoning_channel: Some(DelimitedChannel {
         prefix: "<|channel>thought\n",
         suffix: "<channel|>",
+        required: false,
     }),
     text_channel: None,
     raw_text_before_calls: true,
     call_separator: "",
     parallel_layout: ParallelCallLayout::RepeatedEnvelopes,
+    protocol_max_calls: None,
     auto_activation_trigger: Some("<|tool_call>"),
     required_structural_tokens: &[
         "<|channel>",
@@ -487,14 +582,13 @@ const SYNTHETIC_DECLARATIVE_SPEC: DeclarativeDialectSpec = DeclarativeDialectSpe
         suffix: "",
     },
     payload_shape: DeclarativePayloadShape::JsonList,
-    name_field: "name",
-    arguments_field: "arguments",
-    call_id: None,
+    json_function: Some(&NAME_ARGUMENTS_JSON_FUNCTION),
     reasoning_channel: None,
     text_channel: None,
     raw_text_before_calls: false,
     call_separator: ",",
     parallel_layout: ParallelCallLayout::SingleEnvelope,
+    protocol_max_calls: None,
     auto_activation_trigger: Some(r#"{"calls":"#),
     required_structural_tokens: &[SYNTHETIC_STRUCTURAL_TOKEN],
     stop_sequences: &[],
@@ -545,6 +639,30 @@ const FORMAT_REGISTRY: &[FormatRegistryEntry] = &[
         template_signature: MINISTRAL8_2410_TEMPLATE_SIGNATURE,
         dialect: &DECLARATIVE_DIALECT,
         parameters: DialectParameters::Declarative(&MINISTRAL_JSON_LIST_TOOL_SPEC),
+    },
+    FormatRegistryEntry {
+        identity: "meta.llama-3.1-3.3.json-tools.e10ca381",
+        template_signature: LLAMA31_33_TEMPLATE_SIGNATURE,
+        dialect: &DECLARATIVE_DIALECT,
+        parameters: DialectParameters::Declarative(&LLAMA3_JSON_TOOL_SPEC),
+    },
+    FormatRegistryEntry {
+        identity: "meta.llama-3.2.json-tools.5816fce1",
+        template_signature: LLAMA32_TEMPLATE_SIGNATURE,
+        dialect: &DECLARATIVE_DIALECT,
+        parameters: DialectParameters::Declarative(&LLAMA3_JSON_TOOL_SPEC),
+    },
+    FormatRegistryEntry {
+        identity: "meta.llama-4.json-tools.01a91bfb",
+        template_signature: LLAMA4_TEMPLATE_SIGNATURE,
+        dialect: &DECLARATIVE_DIALECT,
+        parameters: DialectParameters::Declarative(&LLAMA4_JSON_TOOL_SPEC),
+    },
+    FormatRegistryEntry {
+        identity: "nvidia.llama-3.1-nemotron-nano.json-list-tools.072b9ab4",
+        template_signature: NEMOTRON_NANO_TEMPLATE_SIGNATURE,
+        dialect: &DECLARATIVE_DIALECT,
+        parameters: DialectParameters::Declarative(&NEMOTRON_NANO_JSON_LIST_TOOL_SPEC),
     },
     FormatRegistryEntry {
         identity: "google.gemma4.edge.structural-tools.0a2c8073",
@@ -722,11 +840,12 @@ mod tests {
         prepare_format_profile, prepare_format_profile_with_registry, resolve_structural_tokens,
         template_signature, DialectParameters, FormatRegistryEntry, DECLARATIVE_DIALECT,
         GEMMA4_EDGE_TEMPLATE_SIGNATURE, GEMMA4_LARGE_TEMPLATE_SIGNATURE,
-        HERMES2_PRO_TOOL_USE_TEMPLATE_SIGNATURE, MINISTRAL8_2410_TEMPLATE_SIGNATURE,
-        MISTRAL7_V03_TEMPLATE_SIGNATURE, QWEN25_TEMPLATE_SIGNATURE,
-        QWEN3_TEMPLATE_16706FC5_SIGNATURE, QWEN3_TEMPLATE_7E4AE267_SIGNATURE,
-        QWEN3_VL_TEMPLATE_SIGNATURE, SYNTHETIC_DECLARATIVE_SPEC, SYNTHETIC_TOOL_TEMPLATE,
-        SYNTHETIC_TOOL_TEMPLATE_SIGNATURE,
+        HERMES2_PRO_TOOL_USE_TEMPLATE_SIGNATURE, LLAMA31_33_TEMPLATE_SIGNATURE,
+        LLAMA32_TEMPLATE_SIGNATURE, LLAMA4_TEMPLATE_SIGNATURE, MINISTRAL8_2410_TEMPLATE_SIGNATURE,
+        MISTRAL7_V03_TEMPLATE_SIGNATURE, NEMOTRON_NANO_TEMPLATE_SIGNATURE,
+        QWEN25_TEMPLATE_SIGNATURE, QWEN3_TEMPLATE_16706FC5_SIGNATURE,
+        QWEN3_TEMPLATE_7E4AE267_SIGNATURE, QWEN3_VL_TEMPLATE_SIGNATURE, SYNTHETIC_DECLARATIVE_SPEC,
+        SYNTHETIC_TOOL_TEMPLATE, SYNTHETIC_TOOL_TEMPLATE_SIGNATURE,
     };
 
     const QWEN25_FIXTURE: &str =
@@ -742,6 +861,15 @@ mod tests {
         include_str!("../tests/fixtures/chat_templates/mistral-7b-instruct-v0.3-c170c708.jinja");
     const MINISTRAL8_2410_FIXTURE: &str =
         include_str!("../tests/fixtures/chat_templates/ministral-8b-instruct-2410-2f494a19.jinja");
+    const LLAMA31_33_FIXTURE: &str =
+        include_str!("../tests/fixtures/chat_templates/llama-3.1-3.3-e10ca381.jinja");
+    const LLAMA32_FIXTURE: &str =
+        include_str!("../tests/fixtures/chat_templates/llama-3.2-5816fce1.jinja");
+    const LLAMA4_FIXTURE: &str =
+        include_str!("../tests/fixtures/chat_templates/llama-4-01a91bfb.jinja");
+    const NEMOTRON_NANO_FIXTURE_WITH_TERMINATOR: &str = include_str!(
+        "../tests/fixtures/chat_templates/llama-3.1-nemotron-nano-8b-v1-072b9ab4.jinja"
+    );
     const QWEN3_OLDER_TOKENIZER_CONFIG: &str =
         include_str!("../../safemlx-lm-utils/tests/fixtures/qwen3/tokenizer_config.json");
     const GEMMA4_EDGE_FIXTURE: &str =
@@ -876,6 +1004,57 @@ mod tests {
 
         let modified = format!("{QWEN25_FIXTURE} ");
         assert!(prepare_format_profile(&modified).dialect.is_none());
+
+        let nemotron = NEMOTRON_NANO_FIXTURE_WITH_TERMINATOR
+            .strip_suffix('\n')
+            .expect("the fixture-only file terminator is documented");
+        for (template, signature, identity, structural_tokens, stops) in [
+            (
+                LLAMA31_33_FIXTURE,
+                LLAMA31_33_TEMPLATE_SIGNATURE,
+                "meta.llama-3.1-3.3.json-tools.e10ca381",
+                &["<|eot_id|>"][..],
+                &["<|eot_id|>"][..],
+            ),
+            (
+                LLAMA32_FIXTURE,
+                LLAMA32_TEMPLATE_SIGNATURE,
+                "meta.llama-3.2.json-tools.5816fce1",
+                &["<|eot_id|>"][..],
+                &["<|eot_id|>"][..],
+            ),
+            (
+                LLAMA4_FIXTURE,
+                LLAMA4_TEMPLATE_SIGNATURE,
+                "meta.llama-4.json-tools.01a91bfb",
+                &["<|python_start|>", "<|python_end|>", "<|eot|>"][..],
+                &["<|eot|>"][..],
+            ),
+            (
+                nemotron,
+                NEMOTRON_NANO_TEMPLATE_SIGNATURE,
+                "nvidia.llama-3.1-nemotron-nano.json-list-tools.072b9ab4",
+                &["<|eot_id|>"][..],
+                &["<|eot_id|>"][..],
+            ),
+        ] {
+            assert_eq!(template_signature(template), signature, "{identity}");
+            let prepared = prepare_format_profile(template);
+            assert_eq!(prepared.identity.as_deref(), Some(identity));
+            assert!(prepared.dialect.is_some(), "{identity}");
+            assert_eq!(prepared.required_structural_tokens, structural_tokens);
+            assert_eq!(prepared.stop_sequences, stops);
+        }
+
+        for modified in [
+            format!("{LLAMA31_33_FIXTURE} "),
+            format!("{LLAMA32_FIXTURE} "),
+            format!("{LLAMA4_FIXTURE} "),
+            format!("{nemotron} "),
+            "{{ bos_token }} generic Llama template".to_owned(),
+        ] {
+            assert!(prepare_format_profile(&modified).dialect.is_none());
+        }
 
         for (template, signature, identity) in [
             (

@@ -1086,9 +1086,20 @@ mod tests {
         chat::{ParallelToolCallPolicy, ToolChoice, ToolRuntimePlan},
         format_dialect::{
             DeclarativeDialectSpec, DeclarativePayloadShape, DialectParameters, ExactEnvelope,
-            GenerationPromptBehavior, ParallelCallLayout, DECLARATIVE_DIALECT,
+            GenerationPromptBehavior, JsonFunctionEnvelope, ParallelCallLayout,
+            DECLARATIVE_DIALECT,
         },
         tool_constraints::ConstraintCompiler,
+    };
+
+    const SYNTHETIC_JSON_FUNCTION: JsonFunctionEnvelope = JsonFunctionEnvelope {
+        envelope: ExactEnvelope {
+            prefix: "",
+            suffix: "",
+        },
+        name_field: "name",
+        arguments_field: "arguments",
+        call_id: None,
     };
 
     const SYNTHETIC_SPEC: DeclarativeDialectSpec = DeclarativeDialectSpec {
@@ -1102,14 +1113,13 @@ mod tests {
             suffix: "",
         },
         payload_shape: DeclarativePayloadShape::JsonList,
-        name_field: "name",
-        arguments_field: "arguments",
-        call_id: None,
+        json_function: Some(&SYNTHETIC_JSON_FUNCTION),
         reasoning_channel: None,
         text_channel: None,
         raw_text_before_calls: false,
         call_separator: ",",
         parallel_layout: ParallelCallLayout::SingleEnvelope,
+        protocol_max_calls: None,
         auto_activation_trigger: Some(r#"{"calls":"#),
         required_structural_tokens: &[],
         stop_sequences: &[],

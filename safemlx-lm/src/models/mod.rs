@@ -4378,6 +4378,15 @@ mod tests {
     const MINISTRAL8_2410_FIXTURE: &str = include_str!(
         "../../tests/fixtures/chat_templates/ministral-8b-instruct-2410-2f494a19.jinja"
     );
+    const LLAMA31_33_FIXTURE: &str =
+        include_str!("../../tests/fixtures/chat_templates/llama-3.1-3.3-e10ca381.jinja");
+    const LLAMA32_FIXTURE: &str =
+        include_str!("../../tests/fixtures/chat_templates/llama-3.2-5816fce1.jinja");
+    const LLAMA4_FIXTURE: &str =
+        include_str!("../../tests/fixtures/chat_templates/llama-4-01a91bfb.jinja");
+    const NEMOTRON_NANO_FIXTURE_WITH_TERMINATOR: &str = include_str!(
+        "../../tests/fixtures/chat_templates/llama-3.1-nemotron-nano-8b-v1-072b9ab4.jinja"
+    );
     const GEMMA4_EDGE_FIXTURE: &str =
         include_str!("../../tests/fixtures/chat_templates/gemma-4-e2b-it-3e22461f.jinja");
     const GEMMA4_LARGE_FIXTURE: &str =
@@ -4508,6 +4517,32 @@ mod tests {
         tokenizer
     }
 
+    fn llama_chat_tokenizer(preceding_tokens: usize, structural_tokens: &[&str]) -> ChatTokenizer {
+        let mut raw = Tokenizer::new(WordLevel::default());
+        raw.add_tokens(
+            (0..preceding_tokens)
+                .map(|index| AddedToken::from(format!("ordinary_{index}"), false))
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        assert_eq!(
+            raw.add_special_tokens(
+                structural_tokens
+                    .iter()
+                    .map(|token| AddedToken::from((*token).to_owned(), true).normalized(false))
+                    .collect::<Vec<_>>()
+            )
+            .unwrap(),
+            structural_tokens.len()
+        );
+        let mut tokenizer = ChatTokenizer::from_tokenizer(raw);
+        tokenizer.set_template_kwargs(serde_json::Map::from_iter([
+            ("bos_token".into(), json!("<|begin_of_text|>")),
+            ("eos_token".into(), json!("<|eot_id|>")),
+        ]));
+        tokenizer
+    }
+
     fn gemma4_chat_tokenizer(preceding_tokens: usize) -> ChatTokenizer {
         let mut raw = Tokenizer::new(WordLevel::default());
         raw.add_tokens(
@@ -4559,6 +4594,49 @@ mod tests {
                 }
             }
         })
+    }
+
+    fn plan_accepts(plan: &crate::chat::ToolRuntimePlan, output: &str) -> bool {
+        let mut grammar = plan.generation_constraint().grammar_state();
+        let structural_tokens = plan.structural_tokens().collect::<Vec<_>>();
+        let mut offset = 0;
+        while offset < output.len() {
+            if let Some((token_id, spelling)) = output
+                .is_char_boundary(offset)
+                .then(|| {
+                    structural_tokens
+                        .iter()
+                        .find(|(_, spelling)| output[offset..].starts_with(*spelling))
+                })
+                .flatten()
+            {
+                if grammar.commit(*token_id).is_err() {
+                    return false;
+                }
+                offset += spelling.len();
+                continue;
+            }
+            if grammar
+                .commit(u32::from(output.as_bytes()[offset]))
+                .is_err()
+            {
+                return false;
+            }
+            offset += 1;
+        }
+        grammar.is_complete().unwrap()
+    }
+
+    fn tool_argument_events(events: &[SemanticEvent]) -> Vec<String> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                SemanticEvent::ToolArgumentsDelta { json_fragment, .. } => {
+                    Some(json_fragment.clone())
+                }
+                _ => None,
+            })
+            .collect()
     }
 
     #[test]
@@ -4957,6 +5035,485 @@ mod tests {
                 assert_eq!(plan.auto_activation_trigger(), expected_auto_trigger);
             }
         }
+    }
+
+    #[test]
+    fn production_meta_llama_templates_render_golden_tool_history_and_prompts() {
+        let compiler = Ok(ConstraintCompiler::synthetic_for_tests());
+        let messages = vec![
+            json!({"role": "system", "content": "Be brief."}),
+            json!({"role": "user", "content": "first"}),
+            json!({
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "type": "function",
+                    "function": {"name": "lookup", "arguments": {"value": 1}}
+                }]
+            }),
+            json!({"role": "tool", "content": "{\"result\":\"Bogotá\"}"}),
+            json!({"role": "user", "content": "again"}),
+        ];
+        let available_tool = concat!(
+            "{\n",
+            "    \"function\": {\n",
+            "        \"description\": \"Look up one integer.\",\n",
+            "        \"name\": \"lookup\",\n",
+            "        \"parameters\": {\n",
+            "            \"additionalProperties\": false,\n",
+            "            \"properties\": {\n",
+            "                \"value\": {\n",
+            "                    \"description\": \"The integer to look up.\",\n",
+            "                    \"type\": \"integer\"\n",
+            "                }\n",
+            "            },\n",
+            "            \"required\": [\n",
+            "                \"value\"\n",
+            "            ],\n",
+            "            \"type\": \"object\"\n",
+            "        }\n",
+            "    },\n",
+            "    \"type\": \"function\"\n",
+            "}",
+        );
+        let llama3_golden = format!(
+            concat!(
+                "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\n",
+                "Environment: ipython\nCutting Knowledge Date: December 2023\n",
+                "Today Date: 27 Jul 2026\n\nBe brief.<|eot_id|>",
+                "<|start_header_id|>user<|end_header_id|>\n\n",
+                "Given the following functions, please respond with a JSON for a function call ",
+                "with its proper arguments that best answers the given prompt.\n\n",
+                "Respond in the format {{\"name\": function name, \"parameters\": dictionary of ",
+                "argument name and its value}}.Do not use variables.\n\n",
+                "{}\n\nfirst<|eot_id|>",
+                "<|start_header_id|>assistant<|end_header_id|>\n\n",
+                "{{\"name\": \"lookup\", \"parameters\": {{\"value\":1}}}}<|eot_id|>",
+                "<|start_header_id|>ipython<|end_header_id|>\n\n",
+                "\"{{\\\"result\\\":\\\"Bogotá\\\"}}\"<|eot_id|>",
+                "<|start_header_id|>user<|end_header_id|>\n\nagain<|eot_id|>",
+                "<|start_header_id|>assistant<|end_header_id|>\n\n"
+            ),
+            available_tool
+        );
+        for (template, identity) in [
+            (LLAMA31_33_FIXTURE, "meta.llama-3.1-3.3.json-tools.e10ca381"),
+            (LLAMA32_FIXTURE, "meta.llama-3.2.json-tools.5816fce1"),
+        ] {
+            let mut tokenizer = llama_chat_tokenizer(7, &["<|eot_id|>"]);
+            let prepared = prepare_chat_from_parts(
+                &mut tokenizer,
+                ModelChatTemplate::Single(template.into()),
+                "unrelated",
+                &[],
+                Some(&compiler),
+                ChatTemplateRequest {
+                    messages: messages.clone(),
+                    tools: vec![production_tool("lookup")],
+                    tool_choice: ToolChoice::Auto,
+                    parallel_tool_calls: ParallelToolCallPolicy::Enabled {
+                        max_calls: std::num::NonZeroUsize::new(2),
+                    },
+                    add_generation_prompt: true,
+                    extra_template_kwargs: serde_json::Map::from_iter([(
+                        "date_string".into(),
+                        json!("27 Jul 2026"),
+                    )]),
+                    ..ChatTemplateRequest::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(prepared.format_profile_identity(), Some(identity));
+            assert_eq!(prepared.rendered_prompt(), llama3_golden);
+            assert_eq!(
+                prepared.generation_prompt(),
+                "<|start_header_id|>assistant<|end_header_id|>\n\n"
+            );
+            assert_eq!(prepared.preserved_structural_token_ids(), &[7]);
+            assert_eq!(prepared.profile_stop_sequences(), ["<|eot_id|>"]);
+            let NativeToolSupport::Supported(plan) = prepared.native_tool_support() else {
+                panic!("registered Llama 3 profile must be supported");
+            };
+            assert_eq!(plan.auto_activation_trigger(), Some("{"));
+            let output = r#"{"name":"lookup","parameters":{"value":1}}"#;
+            assert!(plan_accepts(plan, output));
+            assert!(!plan_accepts(
+                plan,
+                concat!(
+                    r#"{"name":"lookup","parameters":{"value":1}}"#,
+                    r#"{"name":"lookup","parameters":{"value":2}}"#
+                )
+            ));
+            assert!(!plan_accepts(
+                plan,
+                r#"{"name":"missing","parameters":{"value":1}}"#
+            ));
+            assert!(!plan_accepts(
+                plan,
+                r#"{"name":"lookup","parameters":{"value":"one"}}"#
+            ));
+
+            let mut parser = plan.create_parser().unwrap();
+            parser.push(&format!("{output}<|eot_id|>ignored")).unwrap();
+            assert_eq!(tool_argument_events(parser.events()), [r#"{"value":1}"#]);
+            assert!(parser.events().contains(&SemanticEvent::ToolCallStart {
+                index: 0,
+                id: "call_0".into(),
+                name: "lookup".into(),
+            }));
+            assert_eq!(
+                parser.events().last(),
+                Some(&SemanticEvent::Finished {
+                    reason: FinishReason::StopSequence,
+                })
+            );
+            for split in 0..=output.len() {
+                let mut parser = plan.create_parser().unwrap();
+                parser.push(&output[..split]).unwrap();
+                parser
+                    .push(&format!("{}<|eot_id|>", &output[split..]))
+                    .unwrap();
+                assert_eq!(
+                    tool_argument_events(parser.events()),
+                    [r#"{"value":1}"#],
+                    "split {split}"
+                );
+            }
+            for incomplete in [
+                "{",
+                r#"{"name":"lookup""#,
+                r#"{"name":"lookup","parameters":{"value":1}"#,
+            ] {
+                let mut parser = plan.create_parser().unwrap();
+                parser.push(incomplete).unwrap();
+                parser.finish(FinishReason::MaxTokens).unwrap();
+                assert!(!parser
+                    .events()
+                    .iter()
+                    .any(|event| matches!(event, SemanticEvent::ToolCallEnd)));
+            }
+            let mut malformed = plan.create_parser().unwrap();
+            assert!(malformed
+                .push(r#"{"name":"lookup","parameters":{"value":]}}"#)
+                .is_err());
+        }
+
+        let mut tokenizer =
+            llama_chat_tokenizer(11, &["<|python_start|>", "<|python_end|>", "<|eot|>"]);
+        let prepared = prepare_chat_from_parts(
+            &mut tokenizer,
+            ModelChatTemplate::Single(LLAMA4_FIXTURE.into()),
+            "unrelated",
+            &[],
+            Some(&compiler),
+            ChatTemplateRequest {
+                messages: messages.clone(),
+                tools: vec![production_tool("lookup")],
+                tool_choice: ToolChoice::Auto,
+                parallel_tool_calls: ParallelToolCallPolicy::Enabled {
+                    max_calls: std::num::NonZeroUsize::new(2),
+                },
+                add_generation_prompt: true,
+                extra_template_kwargs: serde_json::Map::from_iter([(
+                    "date_string".into(),
+                    json!("27 Jul 2026"),
+                )]),
+                ..ChatTemplateRequest::default()
+            },
+        )
+        .unwrap();
+        let llama4_golden = format!(
+            concat!(
+                "<|begin_of_text|><|header_start|>system<|header_end|>\n\n",
+                "Environment: ipython\nBe brief.<|eot|>",
+                "<|header_start|>user<|header_end|>\n\n",
+                "Given the following functions, please respond with a JSON for a function call ",
+                "with its proper arguments that best answers the given prompt.\n\n",
+                "Respond in the format {{\"name\": function name, \"parameters\": dictionary of ",
+                "argument name and its value}}.Do not use variables.\n\n",
+                "{}\n\nfirst<|eot|>",
+                "<|header_start|>assistant<|header_end|>\n\n",
+                "<|python_start|><|python_end|>",
+                "{{\"name\": \"lookup\", \"parameters\": {{\"value\":1}}}}<|eot|>",
+                "<|header_start|>ipython<|header_end|>\n\n",
+                "\"{{\\\"result\\\":\\\"Bogotá\\\"}}\"<|eot|>",
+                "<|header_start|>user<|header_end|>\n\nagain<|eot|>",
+                "<|header_start|>assistant<|header_end|>\n\n"
+            ),
+            available_tool
+        );
+        assert_eq!(
+            prepared.format_profile_identity(),
+            Some("meta.llama-4.json-tools.01a91bfb")
+        );
+        assert_eq!(prepared.rendered_prompt(), llama4_golden);
+        assert_eq!(
+            prepared.generation_prompt(),
+            "<|header_start|>assistant<|header_end|>\n\n"
+        );
+        assert_eq!(prepared.preserved_structural_token_ids(), &[11, 12, 13]);
+        assert_eq!(prepared.profile_stop_sequences(), ["<|eot|>"]);
+        let NativeToolSupport::Supported(plan) = prepared.native_tool_support() else {
+            panic!("registered Llama 4 profile must be supported");
+        };
+        assert_eq!(plan.auto_activation_trigger(), Some("<|python_start|>"));
+        let output = concat!(
+            "<|python_start|>analysis 🦀<|python_end|>",
+            r#"{"name":"lookup","parameters":{"value":1}}"#,
+            r#"{"name":"lookup","parameters":{"value":2}}"#,
+        );
+        assert!(plan_accepts(plan, output));
+        assert!(!plan_accepts(
+            plan,
+            concat!(
+                "<|python_start|><|python_end|>",
+                r#"{"name":"missing","parameters":{"value":1}}"#
+            )
+        ));
+        let mut parser = plan.create_parser().unwrap();
+        parser.push(&format!("{output}<|eot|>ignored")).unwrap();
+        assert_eq!(
+            tool_argument_events(parser.events()),
+            [r#"{"value":1}"#, r#"{"value":2}"#]
+        );
+        assert!(parser
+            .events()
+            .contains(&SemanticEvent::TextDelta("analysis 🦀".into())));
+        assert!(parser.events().contains(&SemanticEvent::ToolCallStart {
+            index: 1,
+            id: "call_1".into(),
+            name: "lookup".into(),
+        }));
+        assert_eq!(
+            parser.events().last(),
+            Some(&SemanticEvent::Finished {
+                reason: FinishReason::StopSequence,
+            })
+        );
+        for split in (0..=output.len()).filter(|index| output.is_char_boundary(*index)) {
+            let mut parser = plan.create_parser().unwrap();
+            parser.push(&output[..split]).unwrap();
+            parser
+                .push(&format!("{}<|eot|>", &output[split..]))
+                .unwrap();
+            assert_eq!(
+                tool_argument_events(parser.events()),
+                [r#"{"value":1}"#, r#"{"value":2}"#],
+                "split {split}"
+            );
+        }
+        let mut incomplete = plan.create_parser().unwrap();
+        incomplete
+            .push("<|python_start|>analysis<|python_end|>{\"name\":\"lookup\"")
+            .unwrap();
+        incomplete.finish(FinishReason::MaxTokens).unwrap();
+        assert!(!incomplete
+            .events()
+            .iter()
+            .any(|event| matches!(event, SemanticEvent::ToolCallEnd)));
+    }
+
+    #[test]
+    fn production_nemotron_renders_golden_parallel_history_and_prompt() {
+        let compiler = Ok(ConstraintCompiler::synthetic_for_tests());
+        let template = NEMOTRON_NANO_FIXTURE_WITH_TERMINATOR
+            .strip_suffix('\n')
+            .unwrap();
+        let mut tokenizer = llama_chat_tokenizer(5, &["<|eot_id|>"]);
+        let prepared = prepare_chat_from_parts(
+            &mut tokenizer,
+            ModelChatTemplate::Single(template.into()),
+            "unrelated",
+            &[],
+            Some(&compiler),
+            ChatTemplateRequest {
+                messages: vec![
+                    json!({"role": "system", "content": "Be brief."}),
+                    json!({"role": "user", "content": "first"}),
+                    json!({
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": [
+                            {
+                                "type": "function",
+                                "function": {"name": "lookup", "arguments": {"value": 1}}
+                            },
+                            {
+                                "type": "function",
+                                "function": {"name": "lookup", "arguments": {"value": 2}}
+                            }
+                        ]
+                    }),
+                    json!({"role": "tool", "content": "{\"result\":\"Bogotá\"}"}),
+                ],
+                tools: vec![production_tool("lookup")],
+                tool_choice: ToolChoice::Required,
+                parallel_tool_calls: ParallelToolCallPolicy::Enabled {
+                    max_calls: std::num::NonZeroUsize::new(2),
+                },
+                add_generation_prompt: true,
+                ..ChatTemplateRequest::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            prepared.rendered_prompt(),
+            concat!(
+                "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\n",
+                "Be brief.\n\n<AVAILABLE_TOOLS>[",
+                r#"{"description":"Look up one integer.","name":"lookup","parameters":{"additionalProperties":false,"properties":{"value":{"description":"The integer to look up.","type":"integer"}},"required":["value"],"type":"object"}}"#,
+                "]</AVAILABLE_TOOLS><|eot_id|>",
+                "<|start_header_id|>user<|end_header_id|>\n\nfirst<|eot_id|>",
+                "<|start_header_id|>assistant<|end_header_id|>\n\n<TOOLCALL>[",
+                r#"{"name": "lookup", "arguments": {"value":1}}, {"name": "lookup", "arguments": {"value":2}}"#,
+                "]</TOOLCALL><|eot_id|>",
+                "<|start_header_id|>user<|end_header_id|>\n\n",
+                r#"<TOOL_RESPONSE>[{"result":"Bogotá"}]</TOOL_RESPONSE>"#,
+                "<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n",
+            )
+        );
+        assert_eq!(
+            prepared.generation_prompt(),
+            "<|start_header_id|>assistant<|end_header_id|>\n\n"
+        );
+        assert_eq!(
+            prepared.format_profile_identity(),
+            Some("nvidia.llama-3.1-nemotron-nano.json-list-tools.072b9ab4")
+        );
+        assert_eq!(prepared.preserved_structural_token_ids(), &[5]);
+        assert_eq!(prepared.profile_stop_sequences(), ["<|eot_id|>"]);
+        let NativeToolSupport::Supported(plan) = prepared.native_tool_support() else {
+            panic!("registered Nemotron profile must be supported");
+        };
+        assert_eq!(plan.auto_activation_trigger(), None);
+
+        let output = concat!(
+            "<TOOLCALL>[",
+            r#"{"name":"lookup","arguments":{"value":1}}, "#,
+            r#"{"name":"lookup","arguments":{"value":2}}"#,
+            "]</TOOLCALL>"
+        );
+        assert!(plan_accepts(plan, output));
+        assert!(!plan_accepts(
+            plan,
+            r#"<TOOLCALL>[{"name":"missing","arguments":{"value":1}}]</TOOLCALL>"#
+        ));
+        assert!(!plan_accepts(
+            plan,
+            r#"<TOOLCALL>[{"name":"lookup","arguments":{"value":"one"}}]</TOOLCALL>"#
+        ));
+
+        let mut parser = plan.create_parser().unwrap();
+        parser.push(&format!("{output}<|eot_id|>ignored")).unwrap();
+        assert_eq!(
+            tool_argument_events(parser.events()),
+            [r#"{"value":1}"#, r#"{"value":2}"#]
+        );
+        assert!(parser.events().contains(&SemanticEvent::ToolCallStart {
+            index: 1,
+            id: "call_1".into(),
+            name: "lookup".into(),
+        }));
+        assert_eq!(
+            parser.events().last(),
+            Some(&SemanticEvent::Finished {
+                reason: FinishReason::StopSequence,
+            })
+        );
+        for split in 0..=output.len() {
+            let mut parser = plan.create_parser().unwrap();
+            parser.push(&output[..split]).unwrap();
+            parser
+                .push(&format!("{}<|eot_id|>", &output[split..]))
+                .unwrap();
+            assert_eq!(
+                tool_argument_events(parser.events()),
+                [r#"{"value":1}"#, r#"{"value":2}"#],
+                "split {split}"
+            );
+        }
+        let mut incomplete = plan.create_parser().unwrap();
+        incomplete
+            .push(r#"<TOOLCALL>[{"name":"lookup","arguments":{"value":1}}"#)
+            .unwrap();
+        incomplete.finish(FinishReason::MaxTokens).unwrap();
+        assert!(!incomplete
+            .events()
+            .iter()
+            .any(|event| matches!(event, SemanticEvent::ToolCallEnd)));
+        let mut malformed = plan.create_parser().unwrap();
+        assert!(malformed
+            .push(r#"<TOOLCALL>[{"name":"lookup","arguments":{"value":]}}]</TOOLCALL>"#)
+            .is_err());
+    }
+
+    #[test]
+    fn llama_auto_and_required_activation_are_exact_without_family_fallback() {
+        let compiler = Ok(ConstraintCompiler::synthetic_for_tests());
+        let nemotron = NEMOTRON_NANO_FIXTURE_WITH_TERMINATOR
+            .strip_suffix('\n')
+            .unwrap();
+        for (template, structural_tokens, expected_auto_trigger) in [
+            (LLAMA31_33_FIXTURE, &["<|eot_id|>"][..], "{"),
+            (LLAMA32_FIXTURE, &["<|eot_id|>"][..], "{"),
+            (
+                LLAMA4_FIXTURE,
+                &["<|python_start|>", "<|python_end|>", "<|eot|>"][..],
+                "<|python_start|>",
+            ),
+            (nemotron, &["<|eot_id|>"][..], "<TOOLCALL>["),
+        ] {
+            for (tool_choice, expected_trigger) in [
+                (ToolChoice::Auto, Some(expected_auto_trigger)),
+                (ToolChoice::Required, None),
+            ] {
+                let mut tokenizer = llama_chat_tokenizer(17, structural_tokens);
+                let prepared = prepare_chat_from_parts(
+                    &mut tokenizer,
+                    ModelChatTemplate::Single(template.into()),
+                    "llama-model-family-must-not-select-a-profile",
+                    &[],
+                    Some(&compiler),
+                    ChatTemplateRequest {
+                        messages: vec![json!({"role": "user", "content": "call lookup"})],
+                        tools: vec![production_tool("lookup")],
+                        tool_choice,
+                        add_generation_prompt: true,
+                        ..ChatTemplateRequest::default()
+                    },
+                )
+                .unwrap();
+                let NativeToolSupport::Supported(plan) = prepared.native_tool_support() else {
+                    panic!("exact registered fixture must be supported");
+                };
+                assert_eq!(plan.auto_activation_trigger(), expected_trigger);
+            }
+        }
+
+        let mut tokenizer = llama_chat_tokenizer(2, &["<|eot_id|>"]);
+        let unsupported = prepare_chat_from_parts(
+            &mut tokenizer,
+            ModelChatTemplate::Single(
+                "{{ bos_token }} generic Llama template without a tool protocol".into(),
+            ),
+            "llama",
+            &[],
+            Some(&compiler),
+            ChatTemplateRequest {
+                messages: vec![json!({"role": "user", "content": "hello"})],
+                tools: vec![production_tool("lookup")],
+                tool_choice: ToolChoice::Required,
+                add_generation_prompt: true,
+                ..ChatTemplateRequest::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(unsupported.format_profile_identity(), None);
+        assert!(matches!(
+            unsupported.native_tool_support(),
+            NativeToolSupport::Unsupported { reason }
+                if reason.contains("no registered format profile")
+        ));
     }
 
     #[test]
