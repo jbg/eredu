@@ -170,6 +170,10 @@ impl<'a, T> Gemma4MtpBackend<'a, T> {
         )?;
         streams.target().synchronize()?;
 
+        if !streams.crosses_devices() {
+            return Ok(state.clone());
+        }
+
         let hidden = state.hidden.copy(streams.draft())?;
         let shared_kv = state
             .shared_kv
@@ -255,7 +259,7 @@ impl<T: Gemma4MtpTarget> MtpBackend for Gemma4MtpBackend<'_, T> {
             }
             self.draft_embedding = Some(
                 self.target
-                    .mtp_embedding_snapshot(streams.draft(), streams.is_split())?,
+                    .mtp_embedding_snapshot(streams.draft(), streams.crosses_devices())?,
             );
         }
         let offset = i32::try_from(state.cache_len)
@@ -439,7 +443,7 @@ mod tests {
 
         let copied = Gemma4MtpBackend::<Gemma4Model>::state_on_draft_stream(
             &state,
-            MtpExecutionStreams::new(target.stream(), draft.stream()),
+            MtpExecutionStreams::new(target.stream(), draft.stream()).unwrap(),
         )
         .unwrap();
 
@@ -451,5 +455,59 @@ mod tests {
         let (keys, values) = &copied.shared_kv[&LayerType::FullAttention];
         assert_eq!(keys.evaluated().unwrap().as_slice::<f32>(), &[3.0, 4.0]);
         assert_eq!(values.evaluated().unwrap().as_slice::<f32>(), &[5.0, 6.0]);
+    }
+
+    #[test]
+    #[ignore = "requires an MLX Metal device"]
+    fn target_state_shares_storage_between_streams_on_the_same_gpu() {
+        let target = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
+        let draft = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
+        let hidden = Array::from_slice(&[1.0f32, 2.0], &[1, 1, 2])
+            .copy(target.stream())
+            .unwrap();
+        let keys = Array::from_slice(&[3.0f32, 4.0], &[1, 1, 1, 2])
+            .copy(target.stream())
+            .unwrap();
+        let values = Array::from_slice(&[5.0f32, 6.0], &[1, 1, 1, 2])
+            .copy(target.stream())
+            .unwrap();
+        eval([&hidden, &keys, &values]).unwrap();
+        target.stream().synchronize().unwrap();
+        let hidden_ptr = hidden.evaluated().unwrap().as_slice::<f32>().as_ptr();
+        let keys_ptr = keys.evaluated().unwrap().as_slice::<f32>().as_ptr();
+        let values_ptr = values.evaluated().unwrap().as_slice::<f32>().as_ptr();
+        let shared_kv = Arc::new(HashMap::from([(LayerType::FullAttention, (keys, values))]));
+        let state = Gemma4TargetState {
+            hidden,
+            shared_kv: shared_kv.clone(),
+            cache_len: 9,
+        };
+
+        let shared = Gemma4MtpBackend::<Gemma4Model>::state_on_draft_stream(
+            &state,
+            MtpExecutionStreams::new(target.stream(), draft.stream()).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(shared.cache_len, 9);
+        assert!(Arc::ptr_eq(&shared.shared_kv, &shared_kv));
+        assert_eq!(
+            shared
+                .hidden
+                .evaluated()
+                .unwrap()
+                .as_slice::<f32>()
+                .as_ptr(),
+            hidden_ptr
+        );
+        let (keys, values) = &shared.shared_kv[&LayerType::FullAttention];
+        assert_eq!(
+            keys.evaluated().unwrap().as_slice::<f32>().as_ptr(),
+            keys_ptr
+        );
+        assert_eq!(
+            values.evaluated().unwrap().as_slice::<f32>().as_ptr(),
+            values_ptr
+        );
     }
 }

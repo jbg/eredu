@@ -599,17 +599,21 @@ bounded-layer targets accept typed multimodal prefill and an explicit
 safetensors or GGUF `LoadedDrafter`.
 Gemma assistant GGUF files may embed their JSON config in the
 `safemlx.mtp.config` metadata string or provide a sibling `config.json`.
-External Gemma assistants may execute on a separate CPU stream through
-`MtpExecutionStreams`; target prefill and verification remain on the target
-stream. `MtpScheduler` is the canonical engine: requests move through explicit
-prefill, draft, verification-submission, in-flight lookahead, resolution, and
-terminal phases. Verification submission leaves the lazy GPU graph unresolved.
-The scheduler then drafts one optimistic continuation block on the CPU, or
-gives a round-robin turn to another ready request, before reading target
-results. `MtpSchedulerOptions` bounds retained verifications and branches; both
-default to one. `MtpSchedulerOptions::with_lookahead(false)` disables all
-same-request branch work while leaving the canonical verification, sampler,
-and target-PRNG path intact for equivalent A/B runs.
+External Gemma assistants may execute through `MtpExecutionStreams` on the
+target stream, a second stream on the same GPU, or a stream on another device.
+The constructor classifies these as `Single`, `SameDeviceSplit`, or
+`CrossDeviceSplit`. Distinct same-device streams share immutable MLX array
+storage after explicit dependency synchronization; only cross-device topology
+performs physical array copies. `MtpScheduler` is the canonical engine:
+requests move through explicit prefill, draft, verification-submission,
+in-flight lookahead, resolution, and terminal phases. Verification submission
+leaves the lazy target graph unresolved. On a distinct stream the scheduler
+then drafts one optimistic continuation block, or gives a round-robin turn to
+another ready request, before reading target results.
+`MtpSchedulerOptions` bounds retained verifications and branches; both default
+to one. `MtpSchedulerOptions::with_lookahead(false)` disables all same-request
+branch work while leaving the canonical verification, sampler, and target-PRNG
+path intact for equivalent A/B runs.
 
 An optimistic Gemma branch shares immutable target shared-KV maps and MLX array
 handles while owning its small token delta, exact processed draft
@@ -640,11 +644,13 @@ Single-request APIs are one-request scheduler wrappers. `MtpStats` reports
 optimistically drafted, bonus-consumed, reused, and discarded tokens/blocks;
 optimistic target bonuses and their non-terminal matches/mismatches; plus
 scheduler turns, adaptive-lookahead status, and cross-request draft
-opportunities. After four resolved branches by default, deterministic adaptive
-accounting disables future branch work when no proposal has been reused or
-when reused proposal tokens fall below discarded proposal tokens. The consumed
-matching bonus token is excluded from both sides. This policy only suppresses
-optional drafting and cannot change canonical output.
+opportunities. It also reports optional branch wall time and total
+submission-to-resolution intervals for performance diagnosis. After four
+resolved branches by default, deterministic adaptive accounting disables
+future branch work when no proposal has been reused or when reused proposal
+tokens fall below discarded proposal tokens. The consumed matching bonus token
+is excluded from both sides. This policy only suppresses optional drafting and
+cannot change canonical output.
 `MtpBatchOutput::scheduler` reports aggregate turns and peak retained
 transactions. A matched first token counts as consumed, not reused and not an
 ordinary proposal; only retained tokens promoted into the canonical proposal
@@ -653,10 +659,16 @@ block contribute to `draft_tokens`.
 Optimistic continuation currently requires an external Gemma assistant,
 distinct target/draft streams, and a sampler whose cloned draft processing and
 sampling are exact functions of explicit history, immutable configuration, and
-the supplied position-addressed PRNG state. Mirostat V2 remains lossless and
-reproducible but does not look ahead because its next truncation depends on
-target-committed adaptive state. Embedded Qwen uses the same request scheduler
-and independent lane semantics without same-request lookahead.
+the supplied position-addressed PRNG state. Same-GPU split streams are
+deliberately opt-in: target and assistant kernels share one device and may
+contend for compute or memory bandwidth, so measured throughput can improve or
+regress. Cross-device execution can instead overlap otherwise independent
+devices but pays synchronization and transfer costs. `MtpStats::stream_topology`
+and `MtpBatchOutput::scheduler.stream_topology` report the active assignment.
+Mirostat V2 remains lossless and reproducible but does not look ahead because
+its next truncation depends on target-committed adaptive state. Embedded Qwen
+uses the same request scheduler and independent lane semantics without
+same-request lookahead.
 Qwen3-Next and Qwen3.5/3.6 safetensors checkpoints execute their native MTP
 head through `generate_embedded_mtp_input`; resident and bounded-layer loading
 are both supported, including dense, block-FP8, affine, and MXFP4 weights. Text

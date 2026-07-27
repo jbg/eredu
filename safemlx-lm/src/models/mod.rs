@@ -2440,9 +2440,10 @@ impl LoadedModel {
 
     /// Generates a fair scheduled text batch with explicit target/draft streams.
     ///
-    /// All lanes are submitted before decoding begins. With split GPU-target
-    /// and CPU-draft streams, a lane drafts optimistically or another ready
-    /// lane drafts before the scheduler resolves an in-flight verification.
+    /// All lanes are submitted before decoding begins. With distinct target
+    /// and draft streams on one device or across devices, a lane drafts
+    /// optimistically or another ready lane drafts before the scheduler
+    /// resolves an in-flight verification.
     #[allow(clippy::too_many_arguments)]
     pub fn generate_mtp_text_batch_with_cache_and_streams<S: SpeculativeSampler + Clone>(
         &mut self,

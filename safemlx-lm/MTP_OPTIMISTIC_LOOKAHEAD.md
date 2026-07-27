@@ -4,6 +4,34 @@ This note defines the state invariants used by the canonical MTP scheduler.
 They are part of the implementation contract: an optimistic branch may be
 promoted only when every invariant below holds.
 
+## Stream topology and dependency boundaries
+
+`MtpExecutionStreams` classifies execution as:
+
+- `Single`: target and draft operations use one ordered stream; same-request
+  lookahead is not submitted because it cannot overlap target work.
+- `SameDeviceSplit`: distinct streams use the same device. Target-produced
+  arrays are evaluated and the producing stream is synchronized at a true
+  dependency boundary, then draft execution reuses their MLX array handles and
+  physical storage. No `Array::copy` is performed.
+- `CrossDeviceSplit`: target and draft streams use different devices. The same
+  dependency synchronization is followed by the physical copies required to
+  move target state, draft distributions, and stochastic draft roots.
+
+For either split topology, target verification is submitted with `async_eval`
+before optional draft work. The scheduler is deliberately single-threaded:
+MLX operations are enqueued sequentially by the host onto distinct streams,
+while the device runtimes may execute independent command queues concurrently.
+The target stream is observed only during verification resolution. The draft
+stream is synchronized before its distributions are consumed by the target or
+its branch state is promoted.
+
+Two streams on one GPU do not imply a performance win. Target and assistant
+kernels contend for the same compute and memory bandwidth, so same-device
+lookahead is opt-in and should be compared with `with_lookahead(false)`.
+Correctness, RNG assignment, cache state, and output are independent of that
+performance result.
+
 ## Cache and state conventions
 
 The target cache contains only tokens that have been target inputs. It trails
@@ -181,4 +209,7 @@ branch token as discarded. `optimistic_target_bonus_tokens` counts target
 bonuses emitted while a branch exists; match and mismatch counters classify
 non-terminal comparison outcomes. `adaptive_lookahead_disabled` reports
 whether deterministic reuse-versus-discard accounting stopped future branch
-creation.
+creation. `optimistic_draft_time` records wall time spent producing optional
+branches. `verification_in_flight_time` records submission-to-resolution wall
+time, including scheduler work deliberately placed inside that interval. These
+timings are diagnostic rather than correctness or adaptive-policy inputs.

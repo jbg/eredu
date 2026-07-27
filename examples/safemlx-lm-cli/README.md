@@ -78,22 +78,47 @@ cargo run --release -p safemlx-lm-cli -- \
   "Explain speculative decoding."
 ```
 
-`--mtp-device gpu` is the default. `--mtp-device cpu` keeps target prefill and
-verification on the GPU while loading and executing the external assistant on
-the CPU. After submitting a lazy target-verification graph, the MTP scheduler
-continues one block ahead on the CPU under the assumption that every proposal
-will be accepted. It resolves the GPU result only after that eligible CPU work
-has been submitted. A fully accepted block emits the conventional target bonus
-immediately. If the bonus matches the first optimistic token, that token is
-consumed and the remaining exact token/distribution pairs are reused; the
-shortened block is extended from its promoted assistant frontier before
-verification. A mismatch discards the whole branch and continues from the
-canonical bonus prefix. Rejection or EOS also discards continuation work
-without promoting branch cache, sampler, PRNG, history, output, callback, or
-canonical statistics state. The default retains at most one target transaction
-and one lookahead block. Use `--disable-mtp-lookahead` to remove same-request
-branch work entirely for an equivalent canonical A/B run. This does not disable
-ordinary MTP verification.
+`--mtp-device gpu` is the default and runs target and assistant on one ordered
+GPU stream without lookahead. `--mtp-device gpu-pipelined` loads the assistant
+on a second stream on the same GPU and enables eligible optimistic lookahead.
+`--mtp-device cpu` keeps target prefill and verification on the GPU while
+loading and executing the external assistant on a CPU stream:
+
+```sh
+cargo run --release -p safemlx-lm-cli -- \
+  --model /path/to/gemma4 \
+  --draft-model /path/to/gemma4-assistant \
+  --mtp-device gpu-pipelined \
+  --mtp-draft-tokens 3 --verbose \
+  "Explain speculative decoding."
+```
+
+Same-GPU streams share model and state array storage; they do not physically
+copy arrays between streams. Cross-device CPU drafting copies only data that
+must change devices. In either split mode, after submitting a lazy
+target-verification graph, the MTP scheduler continues one block ahead under
+the assumption that every proposal will be accepted. It resolves the target
+result only after that eligible draft work has been submitted.
+
+A fully accepted block emits the conventional target bonus immediately. If the
+bonus matches the first optimistic token, that token is consumed and the
+remaining exact token/distribution pairs are reused; the shortened block is
+extended from its promoted assistant frontier before verification. A mismatch
+discards the whole branch and continues from the canonical bonus prefix.
+Rejection or EOS also discards continuation work without promoting branch
+cache, sampler, PRNG, history, output, callback, or canonical statistics state.
+The default retains at most one target transaction and one lookahead block.
+Use `--disable-mtp-lookahead` to remove same-request branch work entirely for
+an equivalent canonical A/B run on the selected stream topology. This does not
+disable ordinary MTP verification.
+
+Two streams on one GPU are an opt-in experiment, not an assumed optimization:
+target and assistant kernels can contend for the same compute and memory
+bandwidth. Compare `gpu-pipelined` with and without
+`--disable-mtp-lookahead`; adaptive lookahead disables future branches whose
+retained proposal reuse does not cover discarded work. Verbose diagnostics
+print `mtp_stream_topology` together with bonus match, reuse, and discard
+counters.
 
 Target acceptance and draft sampling use disjoint deterministic PRNG
 roots. Draft substreams are addressed by logical output position, making output
@@ -110,13 +135,13 @@ bonus token, and only suppresses future optional draft work. Use
 `--disable-mtp-adaptive-lookahead` to keep eligible lookahead enabled for
 benchmarking.
 
-Same-request lookahead currently requires an external Gemma assistant and a
-draft processor with exact clone/discard semantics derived only from explicit
-history, immutable configuration, and the supplied PRNG state. Mirostat V2
-still uses scheduled, lossless MTP but waits for target resolution because its
-adaptive state depends on committed target probabilities. Embedded Qwen uses
-the scheduler without optimistic lookahead. `--mtp-device cpu` requires
-`--draft-model`.
+Same-request lookahead currently requires an external Gemma assistant,
+distinct target/draft streams, and a draft processor with exact clone/discard
+semantics derived only from explicit history, immutable configuration, and the
+supplied PRNG state. Mirostat V2 still uses scheduled, lossless MTP but waits
+for target resolution because its adaptive state depends on committed target
+probabilities. Embedded Qwen uses the scheduler without optimistic lookahead.
+`--mtp-device cpu` and `--mtp-device gpu-pipelined` require `--draft-model`.
 
 The assistant may be a safetensors directory or a GGUF file with
 `general.architecture = "gemma4_assistant"` or the published

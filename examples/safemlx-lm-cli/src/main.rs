@@ -52,6 +52,8 @@ enum ThinkingMode {
 enum MtpDevice {
     /// Run the external assistant on the target GPU stream.
     Gpu,
+    /// Run the external assistant on a second stream on the target GPU.
+    GpuPipelined,
     /// Run the external assistant on a CPU stream and verify on the GPU.
     Cpu,
 }
@@ -402,8 +404,11 @@ fn main() -> Result<()> {
     let execution = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
     let weights = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
     let stream = execution.stream();
-    let draft_execution = (args.mtp_device == MtpDevice::Cpu)
-        .then(|| ExecutionContext::new(Device::new(DeviceType::Cpu, 0)));
+    let draft_execution = match args.mtp_device {
+        MtpDevice::Gpu => None,
+        MtpDevice::GpuPipelined => Some(ExecutionContext::new(Device::new(DeviceType::Gpu, 0))),
+        MtpDevice::Cpu => Some(ExecutionContext::new(Device::new(DeviceType::Cpu, 0))),
+    };
     let draft_stream = draft_execution
         .as_ref()
         .map_or(stream, ExecutionContext::stream);
@@ -620,6 +625,7 @@ fn main() -> Result<()> {
             ..MtpSchedulerOptions::default()
         }
         .with_lookahead(!args.disable_mtp_lookahead);
+        let mtp_streams = MtpExecutionStreams::new(stream, draft_stream)?;
         let (tokens, stats) = model
             .generate_mtp_input_with_sampler_callback_and_streams_and_options(
                 drafter,
@@ -628,7 +634,7 @@ fn main() -> Result<()> {
                 &config,
                 prng_key,
                 &mut sampler,
-                MtpExecutionStreams::new(stream, draft_stream),
+                mtp_streams,
                 scheduler_options,
                 |token_id| {
                     if time_to_first_token.is_none() {
@@ -762,6 +768,7 @@ fn main() -> Result<()> {
         eprintln!("load_time: {:.3} s", load_elapsed.as_secs_f64());
         eprintln!("generation_time: {:.3} s", generation_elapsed.as_secs_f64());
         if let Some(stats) = &mtp_stats {
+            eprintln!("mtp_stream_topology: {}", stats.stream_topology);
             eprintln!(
                 "mtp_rounds: {}, mtp_draft_tokens: {}, mtp_accepted_tokens: {}, mtp_accept_rate: {:.3}, mtp_optimistic_blocks: {}, mtp_optimistic_bonus_tokens: {}, mtp_optimistic_bonus_matches: {}, mtp_optimistic_bonus_mismatches: {}, mtp_consumed_optimistic_tokens: {}, mtp_reused_optimistic_blocks: {}, mtp_reused_optimistic_tokens: {}, mtp_discarded_optimistic_blocks: {}, mtp_discarded_optimistic_tokens: {}, mtp_adaptive_lookahead_disabled: {}, mtp_cross_request_draft_opportunities: {}",
                 stats.rounds,
@@ -779,6 +786,11 @@ fn main() -> Result<()> {
                 stats.discarded_optimistic_tokens,
                 stats.adaptive_lookahead_disabled,
                 stats.cross_request_draft_opportunities,
+            );
+            eprintln!(
+                "mtp_optimistic_draft_time: {:.3} s, mtp_verification_in_flight_time: {:.3} s",
+                stats.optimistic_draft_time.as_secs_f64(),
+                stats.verification_in_flight_time.as_secs_f64(),
             );
             eprintln!("mtp_accept_lens: {:?}", stats.accept_lens);
         }
@@ -1045,8 +1057,15 @@ fn validate_args(args: &Cli) -> Result<()> {
     if args.draft_model.is_some() && args.mtp_draft_tokens == 0 {
         bail!("--mtp-draft-tokens must be greater than zero when --draft-model is used");
     }
-    if args.mtp_device == MtpDevice::Cpu && args.draft_model.is_none() {
-        bail!("--mtp-device cpu currently requires an external --draft-model");
+    if args.mtp_device != MtpDevice::Gpu && args.draft_model.is_none() {
+        bail!(
+            "--mtp-device {} currently requires an external --draft-model",
+            match args.mtp_device {
+                MtpDevice::Gpu => unreachable!(),
+                MtpDevice::GpuPipelined => "gpu-pipelined",
+                MtpDevice::Cpu => "cpu",
+            }
+        );
     }
     if !args.temperature.is_finite() || args.temperature < 0.0 {
         bail!("--temperature must be a finite, non-negative number");
@@ -1595,33 +1614,35 @@ mod tests {
     }
 
     #[test]
-    fn cpu_mtp_device_requires_external_drafter() {
-        let without_drafter = Cli::try_parse_from([
-            "safemlx-lm",
-            "--model",
-            "model-id",
-            "--mtp-device",
-            "cpu",
-            "prompt",
-        ])
-        .unwrap();
-        assert!(validate_args(&without_drafter)
-            .unwrap_err()
-            .to_string()
-            .contains("requires an external --draft-model"));
+    fn split_mtp_devices_require_external_drafter() {
+        for device in ["cpu", "gpu-pipelined"] {
+            let without_drafter = Cli::try_parse_from([
+                "safemlx-lm",
+                "--model",
+                "model-id",
+                "--mtp-device",
+                device,
+                "prompt",
+            ])
+            .unwrap();
+            assert!(validate_args(&without_drafter)
+                .unwrap_err()
+                .to_string()
+                .contains("requires an external --draft-model"));
 
-        let with_drafter = Cli::try_parse_from([
-            "safemlx-lm",
-            "--model",
-            "model-id",
-            "--draft-model",
-            "draft-id",
-            "--mtp-device",
-            "cpu",
-            "prompt",
-        ])
-        .unwrap();
-        validate_args(&with_drafter).unwrap();
+            let with_drafter = Cli::try_parse_from([
+                "safemlx-lm",
+                "--model",
+                "model-id",
+                "--draft-model",
+                "draft-id",
+                "--mtp-device",
+                device,
+                "prompt",
+            ])
+            .unwrap();
+            validate_args(&with_drafter).unwrap();
+        }
     }
 
     #[test]

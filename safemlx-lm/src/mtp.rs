@@ -46,19 +46,54 @@ enum DrafterModel {
 pub struct MtpExecutionStreams<'a> {
     target: &'a Stream,
     draft: &'a Stream,
+    topology: MtpStreamTopology,
+}
+
+/// Relationship between the target and draft execution streams.
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
+pub enum MtpStreamTopology {
+    /// Target and draft operations are ordered on one stream.
+    #[default]
+    Single,
+    /// Distinct streams share one device and can overlap without array copies.
+    SameDeviceSplit,
+    /// Distinct streams use different devices and require physical transfers.
+    CrossDeviceSplit,
+}
+
+impl std::fmt::Display for MtpStreamTopology {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Single => "single",
+            Self::SameDeviceSplit => "same-device-split",
+            Self::CrossDeviceSplit => "cross-device-split",
+        })
+    }
 }
 
 impl<'a> MtpExecutionStreams<'a> {
-    /// Creates an execution assignment with explicit target and draft streams.
-    pub const fn new(target: &'a Stream, draft: &'a Stream) -> Self {
-        Self { target, draft }
+    /// Creates an execution assignment and classifies its device topology.
+    pub fn new(target: &'a Stream, draft: &'a Stream) -> Result<Self, Exception> {
+        let topology = if target == draft {
+            MtpStreamTopology::Single
+        } else if target.get_device()? == draft.get_device()? {
+            MtpStreamTopology::SameDeviceSplit
+        } else {
+            MtpStreamTopology::CrossDeviceSplit
+        };
+        Ok(Self {
+            target,
+            draft,
+            topology,
+        })
     }
 
-    /// Creates the legacy assignment in which all MTP work uses one stream.
+    /// Creates an assignment in which all MTP work uses one stream.
     pub const fn single(stream: &'a Stream) -> Self {
         Self {
             target: stream,
             draft: stream,
+            topology: MtpStreamTopology::Single,
         }
     }
 
@@ -72,9 +107,19 @@ impl<'a> MtpExecutionStreams<'a> {
         self.draft
     }
 
+    /// Returns the relationship between the target and draft streams.
+    pub const fn topology(self) -> MtpStreamTopology {
+        self.topology
+    }
+
     /// Returns whether target and draft work use different streams.
-    pub fn is_split(self) -> bool {
-        self.target != self.draft
+    pub const fn is_split(self) -> bool {
+        !matches!(self.topology, MtpStreamTopology::Single)
+    }
+
+    /// Returns whether arrays must be physically transferred between devices.
+    pub const fn crosses_devices(self) -> bool {
+        matches!(self.topology, MtpStreamTopology::CrossDeviceSplit)
     }
 }
 
@@ -203,6 +248,8 @@ impl Default for MtpConfig {
 /// Statistics collected from one speculative sequence.
 #[derive(Debug, Clone, Default)]
 pub struct MtpStats {
+    /// Relationship between the request's target and draft streams.
+    pub stream_topology: MtpStreamTopology,
     /// Target tokens evaluated during prefill and verification.
     pub target_tokens: usize,
     /// Assistant tokens proposed.
@@ -240,6 +287,12 @@ pub struct MtpStats {
     pub optimistic_bonus_mismatches: usize,
     /// Whether deterministic cost accounting disabled further optimistic branches.
     pub adaptive_lookahead_disabled: bool,
+    /// Host wall time spent producing optional same-request branches.
+    pub optimistic_draft_time: Duration,
+    /// Host wall time from target submission until verification resolution began.
+    ///
+    /// This interval includes any deliberately overlapped scheduler work.
+    pub verification_in_flight_time: Duration,
     /// Scheduler operations performed for this request.
     pub scheduler_turns: usize,
     /// Times this request was drafted while another request had target work in flight.
@@ -251,6 +304,8 @@ pub struct MtpStats {
 /// Aggregate bounded-scheduler telemetry.
 #[derive(Debug, Clone, Default)]
 pub struct MtpSchedulerStats {
+    /// Relationship between the scheduler's target and draft streams.
+    pub stream_topology: MtpStreamTopology,
     /// Total scheduler operations.
     pub turns: usize,
     /// Draft turns performed for a request while another request was being verified.
@@ -536,6 +591,7 @@ struct InFlight<B: MtpBackend> {
     checkpoint: B::CacheCheckpoint,
     block: DraftBlock<B::DraftState>,
     optimistic: Option<OptimisticBranch<B::DraftState>>,
+    submitted: Instant,
 }
 
 enum OptimisticBonusTransition<D> {
@@ -649,7 +705,10 @@ where
             options,
             requests: Vec::new(),
             cursor: 0,
-            stats: MtpSchedulerStats::default(),
+            stats: MtpSchedulerStats {
+                stream_topology: streams.topology(),
+                ..MtpSchedulerStats::default()
+            },
         })
     }
 
@@ -679,7 +738,10 @@ where
                 target_prng: None,
                 draft_rng: None,
                 output: Vec::new(),
-                stats: MtpStats::default(),
+                stats: MtpStats {
+                    stream_topology: self.streams.topology(),
+                    ..MtpStats::default()
+                },
                 started,
                 target_state: None,
                 block: None,
@@ -702,7 +764,10 @@ where
             target_prng,
             draft_rng,
             output: Vec::new(),
-            stats: MtpStats::default(),
+            stats: MtpStats {
+                stream_topology: self.streams.topology(),
+                ..MtpStats::default()
+            },
             started,
             target_state: None,
             block: None,
@@ -1023,7 +1088,7 @@ where
         verify_ids.push(*request.output.last().expect("prefill emitted a token"));
         verify_ids.extend(block.proposals.iter().map(|proposal| proposal.token));
         let verify_input = Array::from_slice(&verify_ids, &[1, verify_ids.len() as i32]);
-        let verify_input = if self.streams.is_split() {
+        let verify_input = if self.streams.crosses_devices() {
             verify_input.copy(self.streams.target())?
         } else {
             verify_input
@@ -1033,12 +1098,14 @@ where
             self.backend
                 .verify(&verify_input, request.cache, self.streams.target())?;
         async_eval([B::verification_logits(&verification)])?;
+        let submitted = Instant::now();
         request.stats.target_tokens += verify_ids.len();
         request.in_flight = Some(InFlight {
             verification,
             checkpoint,
             block,
             optimistic: None,
+            submitted,
         });
         request.phase = MtpRequestPhase::TargetVerificationInFlight;
         self.stats.peak_in_flight_verifications = self
@@ -1072,6 +1139,7 @@ where
 
     fn draft_optimistic(&mut self, index: usize) -> Result<(), Exception> {
         self.record_turn(index);
+        let started = Instant::now();
         let backend_limit = self.backend.max_draft_tokens();
         let request = &mut self.requests[index];
         request.phase = MtpRequestPhase::OptimisticDraftInProgress;
@@ -1108,6 +1176,7 @@ where
         )?;
         request.stats.optimistic_draft_tokens += proposals.len();
         request.stats.optimistic_draft_blocks += 1;
+        request.stats.optimistic_draft_time += started.elapsed();
         flight.optimistic = Some(OptimisticBranch {
             block: DraftBlock { state, proposals },
             assumed_prefix: history,
@@ -1128,6 +1197,7 @@ where
             .in_flight
             .take()
             .expect("resolving request has an in-flight verification");
+        request.stats.verification_in_flight_time += flight.submitted.elapsed();
         let DraftBlock {
             state,
             mut proposals,
@@ -1152,8 +1222,10 @@ where
         if request.config.temperature != 0.0 && self.streams.is_split() {
             eval(proposals.iter().map(|proposal| &proposal.distribution))?;
             self.streams.draft().synchronize()?;
-            for proposal in &mut proposals {
-                proposal.distribution = proposal.distribution.copy(self.streams.target())?;
+            if self.streams.crosses_devices() {
+                for proposal in &mut proposals {
+                    proposal.distribution = proposal.distribution.copy(self.streams.target())?;
+                }
             }
         }
         let target_raw = B::verification_logits(&flight.verification);
@@ -1516,10 +1588,14 @@ fn split_random_states(
     let draft_key = if streams.is_split() {
         eval([&draft_key])?;
         streams.target().synchronize()?;
-        let copied = draft_key.copy(streams.draft())?;
-        eval([&copied])?;
-        streams.draft().synchronize()?;
-        copied
+        if streams.crosses_devices() {
+            let copied = draft_key.copy(streams.draft())?;
+            eval([&copied])?;
+            streams.draft().synchronize()?;
+            copied
+        } else {
+            draft_key
+        }
     } else {
         draft_key
     };
@@ -2104,7 +2180,7 @@ mod tests {
             &config,
             None,
             &mut DefaultSampler,
-            MtpExecutionStreams::new(target.stream(), draft.stream()),
+            MtpExecutionStreams::new(target.stream(), draft.stream()).unwrap(),
         )
         .unwrap();
 
@@ -2156,7 +2232,7 @@ mod tests {
             &config,
             Some(key),
             &mut sampler,
-            MtpExecutionStreams::new(target.stream(), draft.stream()),
+            MtpExecutionStreams::new(target.stream(), draft.stream()).unwrap(),
         )
         .unwrap();
 
@@ -2255,6 +2331,163 @@ mod tests {
 
     #[test]
     #[ignore = "requires an MLX Metal device"]
+    fn execution_streams_classify_single_same_device_and_cross_device_topologies() {
+        let target = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
+        let second_gpu = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
+        let cpu = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+
+        let single = MtpExecutionStreams::single(target.stream());
+        let same_device = MtpExecutionStreams::new(target.stream(), second_gpu.stream()).unwrap();
+        let cross_device = MtpExecutionStreams::new(target.stream(), cpu.stream()).unwrap();
+
+        assert_eq!(single.topology(), MtpStreamTopology::Single);
+        assert!(!single.is_split());
+        assert!(!single.crosses_devices());
+        assert_eq!(same_device.topology(), MtpStreamTopology::SameDeviceSplit);
+        assert!(same_device.is_split());
+        assert!(!same_device.crosses_devices());
+        assert_eq!(cross_device.topology(), MtpStreamTopology::CrossDeviceSplit);
+        assert!(cross_device.is_split());
+        assert!(cross_device.crosses_devices());
+    }
+
+    #[test]
+    #[ignore = "requires an MLX Metal device"]
+    fn same_gpu_distinct_streams_run_exact_optimistic_lookahead() {
+        let target = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
+        let draft = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
+        assert_ne!(
+            target.stream().get_index().unwrap(),
+            draft.stream().get_index().unwrap()
+        );
+        let prompt = Array::from_slice(&[7u32], &[1, 1]);
+        let parts = [InputPart::text_token_ids(&prompt)];
+        let mut backend = ScriptedBackend {
+            first_token: 1,
+            rejection_token: 1,
+            reject_first: false,
+            accept_second: true,
+            bonus_token: 0,
+            routes: Vec::new(),
+            draft_storage: Vec::new(),
+        };
+        let mut cache = 0;
+        let mut scheduler = MtpScheduler::new(
+            &mut backend,
+            MtpExecutionStreams::new(target.stream(), draft.stream()).unwrap(),
+            MtpSchedulerOptions::default(),
+        )
+        .unwrap();
+        scheduler
+            .submit(
+                &mut cache,
+                ModelInput::new(&parts),
+                MtpConfig {
+                    max_tokens: 5,
+                    max_draft_tokens: 2,
+                    temperature: 0.0,
+                    eos_token_ids: Vec::new(),
+                },
+                None,
+                DefaultSampler,
+                |_| Ok(()),
+            )
+            .unwrap();
+        scheduler.run().unwrap();
+        let output = scheduler.finish().unwrap();
+        let stats = &output.requests[0].stats;
+
+        assert_eq!(
+            output.scheduler.stream_topology,
+            MtpStreamTopology::SameDeviceSplit
+        );
+        assert_eq!(stats.stream_topology, MtpStreamTopology::SameDeviceSplit);
+        assert!(stats.optimistic_draft_blocks > 0);
+        assert!(stats.optimistic_target_bonus_tokens > 0);
+        assert_eq!(
+            stats.optimistic_bonus_matches + stats.optimistic_bonus_mismatches,
+            stats.optimistic_target_bonus_tokens
+        );
+        assert!(backend
+            .routes
+            .iter()
+            .all(|(_, device)| *device == DeviceType::Gpu));
+        let verify = backend
+            .routes
+            .iter()
+            .position(|(operation, _)| *operation == "verify")
+            .unwrap();
+        let optimistic_draft = backend.routes[verify + 1..]
+            .iter()
+            .position(|(operation, _)| *operation == "draft")
+            .map(|offset| verify + 1 + offset)
+            .unwrap();
+        let resolve = backend
+            .routes
+            .iter()
+            .position(|(operation, _)| *operation == "commit_target")
+            .unwrap();
+        assert!(verify < optimistic_draft && optimistic_draft < resolve);
+    }
+
+    #[test]
+    #[ignore = "requires an MLX Metal device"]
+    fn same_gpu_distinct_streams_preserve_stochastic_lookahead() {
+        let target = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
+        let draft = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
+        let prompt = Array::from_slice(&[7u32], &[1, 1]);
+        let parts = [InputPart::text_token_ids(&prompt)];
+        let run = |lookahead| {
+            let mut backend = ScriptedBackend {
+                first_token: 1,
+                rejection_token: 1,
+                reject_first: false,
+                accept_second: true,
+                bonus_token: 0,
+                routes: Vec::new(),
+                draft_storage: Vec::new(),
+            };
+            let mut cache = 0;
+            let mut scheduler = MtpScheduler::new(
+                &mut backend,
+                MtpExecutionStreams::new(target.stream(), draft.stream()).unwrap(),
+                MtpSchedulerOptions::default().with_lookahead(lookahead),
+            )
+            .unwrap();
+            scheduler
+                .submit(
+                    &mut cache,
+                    ModelInput::new(&parts),
+                    MtpConfig {
+                        max_tokens: 8,
+                        max_draft_tokens: 2,
+                        temperature: 1.0,
+                        eos_token_ids: Vec::new(),
+                    },
+                    Some(safemlx::random::key(7).unwrap()),
+                    UniformSampler,
+                    |_| Ok(()),
+                )
+                .unwrap();
+            scheduler.run().unwrap();
+            scheduler.finish().unwrap().requests.pop().unwrap()
+        };
+        let request = run(true);
+        let canonical = run(false);
+
+        assert_eq!(
+            request.stats.stream_topology,
+            MtpStreamTopology::SameDeviceSplit
+        );
+        assert_eq!(request.token_ids, canonical.token_ids);
+        assert_eq!(request.token_ids.len(), 8);
+        assert_eq!(request.stats.emitted_tokens, 8);
+        assert!(request.stats.optimistic_draft_blocks > 0);
+        assert_eq!(canonical.stats.optimistic_draft_blocks, 0);
+    }
+
+    #[test]
+    #[ignore = "requires an MLX Metal device"]
     fn full_acceptance_promotes_shared_optimistic_branch() {
         let target = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
         let draft = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
@@ -2272,7 +2505,7 @@ mod tests {
         let mut cache = 0;
         let mut scheduler = MtpScheduler::new(
             &mut backend,
-            MtpExecutionStreams::new(target.stream(), draft.stream()),
+            MtpExecutionStreams::new(target.stream(), draft.stream()).unwrap(),
             MtpSchedulerOptions::default(),
         )
         .unwrap();
@@ -2335,7 +2568,7 @@ mod tests {
         let mut cache = 0;
         let mut scheduler = MtpScheduler::new(
             &mut backend,
-            MtpExecutionStreams::new(target.stream(), draft.stream()),
+            MtpExecutionStreams::new(target.stream(), draft.stream()).unwrap(),
             MtpSchedulerOptions::default(),
         )
         .unwrap();
@@ -2432,7 +2665,7 @@ mod tests {
             {
                 let mut scheduler = MtpScheduler::new(
                     &mut backend,
-                    MtpExecutionStreams::new(target.stream(), draft.stream()),
+                    MtpExecutionStreams::new(target.stream(), draft.stream()).unwrap(),
                     options,
                 )
                 .unwrap();
@@ -2515,7 +2748,7 @@ mod tests {
                 .penalties(1.2, -1, 0.1, 0.1);
             let mut scheduler = MtpScheduler::new(
                 &mut backend,
-                MtpExecutionStreams::new(target.stream(), draft.stream()),
+                MtpExecutionStreams::new(target.stream(), draft.stream()).unwrap(),
                 options,
             )
             .unwrap();
@@ -2576,7 +2809,7 @@ mod tests {
             let mut cache_b = 0;
             let mut scheduler = MtpScheduler::new(
                 &mut backend,
-                MtpExecutionStreams::new(target.stream(), draft.stream()),
+                MtpExecutionStreams::new(target.stream(), draft.stream()).unwrap(),
                 options,
             )
             .unwrap();
@@ -2666,7 +2899,7 @@ mod tests {
         let mut cache = 0;
         let mut scheduler = MtpScheduler::new(
             &mut backend,
-            MtpExecutionStreams::new(target.stream(), draft.stream()),
+            MtpExecutionStreams::new(target.stream(), draft.stream()).unwrap(),
             MtpSchedulerOptions::default(),
         )
         .unwrap();
@@ -2720,7 +2953,7 @@ mod tests {
         let mut cache = 0;
         let mut scheduler = MtpScheduler::new(
             &mut backend,
-            MtpExecutionStreams::new(target.stream(), draft.stream()),
+            MtpExecutionStreams::new(target.stream(), draft.stream()).unwrap(),
             MtpSchedulerOptions::default(),
         )
         .unwrap();
@@ -2779,7 +3012,7 @@ mod tests {
             let mut cache = 0;
             let mut scheduler = MtpScheduler::new(
                 &mut backend,
-                MtpExecutionStreams::new(target.stream(), draft.stream()),
+                MtpExecutionStreams::new(target.stream(), draft.stream()).unwrap(),
                 options,
             )
             .unwrap();
@@ -2837,7 +3070,7 @@ mod tests {
         let mut cache = 0;
         let mut scheduler = MtpScheduler::new(
             &mut backend,
-            MtpExecutionStreams::new(target.stream(), draft.stream()),
+            MtpExecutionStreams::new(target.stream(), draft.stream()).unwrap(),
             MtpSchedulerOptions::default(),
         )
         .unwrap();
@@ -2890,7 +3123,7 @@ mod tests {
         {
             let mut scheduler = MtpScheduler::new(
                 &mut backend,
-                MtpExecutionStreams::new(target.stream(), draft.stream()),
+                MtpExecutionStreams::new(target.stream(), draft.stream()).unwrap(),
                 MtpSchedulerOptions::default(),
             )
             .unwrap();
@@ -2964,7 +3197,7 @@ mod tests {
         let mut cache = 0;
         let mut scheduler = MtpScheduler::new(
             &mut backend,
-            MtpExecutionStreams::new(target.stream(), draft.stream()),
+            MtpExecutionStreams::new(target.stream(), draft.stream()).unwrap(),
             MtpSchedulerOptions::default(),
         )
         .unwrap();
@@ -3019,7 +3252,7 @@ mod tests {
         let mut cache = 0;
         let mut scheduler = MtpScheduler::new(
             &mut backend,
-            MtpExecutionStreams::new(target.stream(), draft.stream()),
+            MtpExecutionStreams::new(target.stream(), draft.stream()).unwrap(),
             MtpSchedulerOptions::default(),
         )
         .unwrap();
@@ -3105,7 +3338,7 @@ mod tests {
         let mut cache_b = 0;
         let mut scheduler = MtpScheduler::new(
             &mut backend,
-            MtpExecutionStreams::new(target.stream(), draft.stream()),
+            MtpExecutionStreams::new(target.stream(), draft.stream()).unwrap(),
             MtpSchedulerOptions::default(),
         )
         .unwrap();
@@ -3185,7 +3418,7 @@ mod tests {
         let mut cache_b = 0;
         let mut scheduler = MtpScheduler::new(
             &mut backend,
-            MtpExecutionStreams::new(target.stream(), draft.stream()),
+            MtpExecutionStreams::new(target.stream(), draft.stream()).unwrap(),
             MtpSchedulerOptions {
                 max_in_flight_verifications: 2,
                 max_optimistic_branches: 1,
@@ -3241,7 +3474,7 @@ mod tests {
             let mut cache_b = 0;
             let mut scheduler = MtpScheduler::new(
                 &mut backend,
-                MtpExecutionStreams::new(target.stream(), draft.stream()),
+                MtpExecutionStreams::new(target.stream(), draft.stream()).unwrap(),
                 MtpSchedulerOptions::default(),
             )
             .unwrap();
@@ -3304,7 +3537,7 @@ mod tests {
             let mut cache = 0;
             let mut scheduler = MtpScheduler::new(
                 &mut backend,
-                MtpExecutionStreams::new(target.stream(), draft.stream()),
+                MtpExecutionStreams::new(target.stream(), draft.stream()).unwrap(),
                 options,
             )
             .unwrap();
