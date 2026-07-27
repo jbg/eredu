@@ -1,7 +1,9 @@
 use std::{
     collections::HashSet,
+    fmt,
     io::{self, IsTerminal, Read, Write},
     path::{Path, PathBuf},
+    str::FromStr,
     time::Instant,
 };
 
@@ -48,14 +50,76 @@ enum ThinkingMode {
     Off,
 }
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq, ValueEnum)]
-enum MtpDevice {
-    /// Run the external assistant on the target GPU stream.
-    Gpu,
-    /// Run the external assistant on a second stream on the target GPU.
-    GpuPipelined,
-    /// Run the external assistant on a CPU stream and verify on the GPU.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum CliDevice {
     Cpu,
+    Gpu(i32),
+}
+
+impl CliDevice {
+    fn mlx(self) -> Device {
+        match self {
+            Self::Cpu => Device::new(DeviceType::Cpu, 0),
+            Self::Gpu(index) => Device::new(DeviceType::Gpu, index),
+        }
+    }
+}
+
+impl fmt::Display for CliDevice {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Cpu => formatter.write_str("cpu"),
+            Self::Gpu(index) => write!(formatter, "gpu:{index}"),
+        }
+    }
+}
+
+impl FromStr for CliDevice {
+    type Err = String;
+
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        if value == "cpu" {
+            return Ok(Self::Cpu);
+        }
+        let Some(index) = value.strip_prefix("gpu:") else {
+            return Err("expected `cpu` or `gpu:N`".into());
+        };
+        let index = index
+            .parse::<i32>()
+            .map_err(|_| "GPU index must be a non-negative integer".to_string())?;
+        if index < 0 {
+            return Err("GPU index must be a non-negative integer".into());
+        }
+        Ok(Self::Gpu(index))
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
+enum MtpDraftDevice {
+    #[default]
+    Target,
+    Device(CliDevice),
+}
+
+impl fmt::Display for MtpDraftDevice {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Target => formatter.write_str("target"),
+            Self::Device(device) => device.fmt(formatter),
+        }
+    }
+}
+
+impl FromStr for MtpDraftDevice {
+    type Err = String;
+
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        if value == "target" {
+            Ok(Self::Target)
+        } else {
+            value.parse().map(Self::Device)
+        }
+    }
 }
 
 impl ThinkingMode {
@@ -162,6 +226,10 @@ struct Cli {
     #[arg(long, value_name = "PATH_OR_ID")]
     draft_model: Option<String>,
 
+    /// Main model execution device: `cpu` or `gpu:N`.
+    #[arg(long, default_value = "gpu:0", value_name = "DEVICE")]
+    device: CliDevice,
+
     /// Maximum speculative tokens proposed before each target verification.
     #[arg(long, default_value_t = 3, value_name = "TOKENS")]
     mtp_draft_tokens: usize,
@@ -174,9 +242,12 @@ struct Cli {
     #[arg(long)]
     disable_mtp_adaptive_lookahead: bool,
 
-    /// Device used by an external MTP assistant.
-    #[arg(long, value_enum, default_value_t = MtpDevice::Gpu)]
-    mtp_device: MtpDevice,
+    /// External MTP assistant placement: `target`, `cpu`, or `gpu:N`.
+    ///
+    /// `target` reuses the main execution stream. An explicit device creates
+    /// a distinct draft stream even when it names the main physical device.
+    #[arg(long, default_value = "target", value_name = "PLACEMENT")]
+    mtp_draft_device: MtpDraftDevice,
 
     /// Prompt text. Reads the prompt from stdin when omitted and stdin is piped.
     #[arg(value_name = "PROMPT")]
@@ -377,6 +448,18 @@ fn write_streamed_token(
     Ok(())
 }
 
+fn execution_contexts(
+    device: CliDevice,
+    mtp_draft_device: MtpDraftDevice,
+) -> (ExecutionContext, Option<ExecutionContext>) {
+    let execution = ExecutionContext::new(device.mlx());
+    let draft = match mtp_draft_device {
+        MtpDraftDevice::Target => None,
+        MtpDraftDevice::Device(device) => Some(ExecutionContext::new(device.mlx())),
+    };
+    (execution, draft)
+}
+
 fn main() -> Result<()> {
     let total_started = Instant::now();
     let args = Cli::parse();
@@ -396,19 +479,16 @@ fn main() -> Result<()> {
     if args.verbose {
         eprintln!("--- safemlx diagnostics (stderr) ---");
         eprintln!("model: {}", model_path.display());
+        eprintln!("device: {}", args.device);
         if let Some(path) = &draft_model_path {
             eprintln!("draft_model: {}", path.display());
+            eprintln!("mtp_draft_device: {}", args.mtp_draft_device);
         }
     }
 
-    let execution = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
+    let (execution, draft_execution) = execution_contexts(args.device, args.mtp_draft_device);
     let weights = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
     let stream = execution.stream();
-    let draft_execution = match args.mtp_device {
-        MtpDevice::Gpu => None,
-        MtpDevice::GpuPipelined => Some(ExecutionContext::new(Device::new(DeviceType::Gpu, 0))),
-        MtpDevice::Cpu => Some(ExecutionContext::new(Device::new(DeviceType::Cpu, 0))),
-    };
     let draft_stream = draft_execution
         .as_ref()
         .map_or(stream, ExecutionContext::stream);
@@ -1057,14 +1137,10 @@ fn validate_args(args: &Cli) -> Result<()> {
     if args.draft_model.is_some() && args.mtp_draft_tokens == 0 {
         bail!("--mtp-draft-tokens must be greater than zero when --draft-model is used");
     }
-    if args.mtp_device != MtpDevice::Gpu && args.draft_model.is_none() {
+    if args.mtp_draft_device != MtpDraftDevice::Target && args.draft_model.is_none() {
         bail!(
-            "--mtp-device {} currently requires an external --draft-model",
-            match args.mtp_device {
-                MtpDevice::Gpu => unreachable!(),
-                MtpDevice::GpuPipelined => "gpu-pipelined",
-                MtpDevice::Cpu => "cpu",
-            }
+            "--mtp-draft-device {} requires an external --draft-model",
+            args.mtp_draft_device,
         );
     }
     if !args.temperature.is_finite() || args.temperature < 0.0 {
@@ -1449,9 +1525,11 @@ mod tests {
     use hf_hub::cache::{CachedFileInfo, CachedRevisionInfo};
 
     use super::{
-        format_bytes, select_cached_gguf_from_revisions, select_cached_gguf_path, select_revision,
-        should_report_stop_reason, split_hf_model_spec, stop_reason, thinking_template_kwargs,
-        validate_args, CachedGgufRole, Cli, MtpSchedulerOptions, StopReason, ThinkingMode,
+        eval, execution_contexts, format_bytes, select_cached_gguf_from_revisions,
+        select_cached_gguf_path, select_revision, should_report_stop_reason, split_hf_model_spec,
+        stop_reason, thinking_template_kwargs, validate_args, Array, CachedGgufRole, Cli,
+        CliDevice, DeviceType, MtpDraftDevice, MtpExecutionStreams, MtpSchedulerOptions,
+        StopReason, ThinkingMode,
     };
 
     fn revision(hash: &str, refs: &[&str], modified: u64) -> CachedRevisionInfo {
@@ -1614,13 +1692,53 @@ mod tests {
     }
 
     #[test]
-    fn split_mtp_devices_require_external_drafter() {
-        for device in ["cpu", "gpu-pipelined"] {
+    fn parses_main_and_draft_device_selectors() {
+        assert_eq!("cpu".parse::<CliDevice>().unwrap(), CliDevice::Cpu);
+        assert_eq!("gpu:0".parse::<CliDevice>().unwrap(), CliDevice::Gpu(0));
+        assert_eq!("gpu:12".parse::<CliDevice>().unwrap(), CliDevice::Gpu(12));
+        assert!("gpu".parse::<CliDevice>().is_err());
+        assert!("gpu:-1".parse::<CliDevice>().is_err());
+        assert!("gpu:one".parse::<CliDevice>().is_err());
+
+        assert_eq!(
+            "target".parse::<MtpDraftDevice>().unwrap(),
+            MtpDraftDevice::Target
+        );
+        assert_eq!(
+            "cpu".parse::<MtpDraftDevice>().unwrap(),
+            MtpDraftDevice::Device(CliDevice::Cpu)
+        );
+        assert_eq!(
+            "gpu:3".parse::<MtpDraftDevice>().unwrap(),
+            MtpDraftDevice::Device(CliDevice::Gpu(3))
+        );
+
+        let defaults =
+            Cli::try_parse_from(["safemlx-lm", "--model", "model-id", "prompt"]).unwrap();
+        assert_eq!(defaults.device, CliDevice::Gpu(0));
+        assert_eq!(defaults.mtp_draft_device, MtpDraftDevice::Target);
+
+        let cpu_target = Cli::try_parse_from([
+            "safemlx-lm",
+            "--model",
+            "model-id",
+            "--device",
+            "cpu",
+            "prompt",
+        ])
+        .unwrap();
+        assert_eq!(cpu_target.device, CliDevice::Cpu);
+        validate_args(&cpu_target).unwrap();
+    }
+
+    #[test]
+    fn explicit_mtp_draft_devices_require_external_drafter() {
+        for device in ["cpu", "gpu:0", "gpu:3"] {
             let without_drafter = Cli::try_parse_from([
                 "safemlx-lm",
                 "--model",
                 "model-id",
-                "--mtp-device",
+                "--mtp-draft-device",
                 device,
                 "prompt",
             ])
@@ -1636,13 +1754,68 @@ mod tests {
                 "model-id",
                 "--draft-model",
                 "draft-id",
-                "--mtp-device",
+                "--mtp-draft-device",
                 device,
                 "prompt",
             ])
             .unwrap();
             validate_args(&with_drafter).unwrap();
         }
+    }
+
+    #[test]
+    fn cpu_execution_device_runs_mlx_work() {
+        let (context, no_draft) = execution_contexts(CliDevice::Cpu, MtpDraftDevice::Target);
+        assert!(no_draft.is_none());
+        assert_eq!(context.device().get_type().unwrap(), DeviceType::Cpu);
+        let values = Array::from_slice(&[1.0f32, 2.0], &[2])
+            .copy(context.stream())
+            .unwrap();
+        eval([&values]).unwrap();
+        context.stream().synchronize().unwrap();
+        assert_eq!(values.evaluated().unwrap().as_slice::<f32>(), &[1.0, 2.0]);
+
+        let (target, draft) =
+            execution_contexts(CliDevice::Cpu, MtpDraftDevice::Device(CliDevice::Cpu));
+        let draft = draft.unwrap();
+        assert_ne!(target.stream(), draft.stream());
+        assert_eq!(
+            MtpExecutionStreams::new(target.stream(), draft.stream())
+                .unwrap()
+                .topology(),
+            safemlx_lm::mtp::MtpStreamTopology::SameDeviceSplit
+        );
+    }
+
+    #[test]
+    #[ignore = "requires an MLX Metal device"]
+    fn gpu_device_selectors_build_requested_mtp_topologies() {
+        let (target, draft) =
+            execution_contexts(CliDevice::Gpu(0), MtpDraftDevice::Device(CliDevice::Gpu(0)));
+        assert_eq!(
+            MtpExecutionStreams::new(target.stream(), draft.unwrap().stream())
+                .unwrap()
+                .topology(),
+            safemlx_lm::mtp::MtpStreamTopology::SameDeviceSplit
+        );
+
+        let (target, draft) =
+            execution_contexts(CliDevice::Gpu(0), MtpDraftDevice::Device(CliDevice::Cpu));
+        assert_eq!(
+            MtpExecutionStreams::new(target.stream(), draft.unwrap().stream())
+                .unwrap()
+                .topology(),
+            safemlx_lm::mtp::MtpStreamTopology::CrossDeviceSplit
+        );
+
+        let (target, draft) =
+            execution_contexts(CliDevice::Cpu, MtpDraftDevice::Device(CliDevice::Gpu(0)));
+        assert_eq!(
+            MtpExecutionStreams::new(target.stream(), draft.unwrap().stream())
+                .unwrap()
+                .topology(),
+            safemlx_lm::mtp::MtpStreamTopology::CrossDeviceSplit
+        );
     }
 
     #[test]

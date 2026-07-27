@@ -45,9 +45,16 @@ Local model paths use the same interface:
 ```sh
 cargo run --release -p safemlx-lm-cli -- \
   --model /path/to/model \
+  --device gpu:0 \
   --temperature 0.7 --top-p 0.9 --max-tokens 512 \
   "Tell me a short story."
 ```
+
+`--device` selects the main model execution device and accepts `cpu` or an
+explicit zero-based GPU index such as `gpu:0` or `gpu:1`. It defaults to
+`gpu:0`. CPU execution is substantially slower for most models. Some
+model-specific custom kernels may remain unavailable on CPU; those
+configurations return an error and are never silently moved to a GPU.
 
 Mirostat V2 adaptively targets a desired surprise instead of using fixed
 top-k, top-p, and min-p cutoffs. Set a nonzero temperature and optionally tune
@@ -73,29 +80,45 @@ assistant is loaded independently and remains fully resident:
 cargo run --release -p safemlx-lm-cli -- \
   --model /path/to/gemma4 \
   --draft-model /path/to/gemma4-assistant \
-  --mtp-device cpu \
+  --device gpu:0 --mtp-draft-device cpu \
   --mtp-draft-tokens 3 --temperature 0.7 \
   "Explain speculative decoding."
 ```
 
-`--mtp-device gpu` is the default and runs target and assistant on one ordered
-GPU stream without lookahead. `--mtp-device gpu-pipelined` loads the assistant
-on a second stream on the same GPU and enables eligible optimistic lookahead.
-`--mtp-device cpu` keeps target prefill and verification on the GPU while
-loading and executing the external assistant on a CPU stream:
+`--mtp-draft-device` accepts `target`, `cpu`, or `gpu:N` and defaults to
+`target`. `target` reuses the main model's existing stream and therefore does
+not perform same-request lookahead. An explicit device always creates a
+distinct draft stream, even when it names the same physical device as
+`--device`. For example, this runs target verification and drafting on
+different streams of GPU 0:
 
 ```sh
 cargo run --release -p safemlx-lm-cli -- \
   --model /path/to/gemma4 \
   --draft-model /path/to/gemma4-assistant \
-  --mtp-device gpu-pipelined \
+  --device gpu:0 --mtp-draft-device gpu:0 \
   --mtp-draft-tokens 3 --verbose \
   "Explain speculative decoding."
 ```
 
+To use two GPUs, select them independently:
+
+```sh
+cargo run --release -p safemlx-lm-cli -- \
+  --model /path/to/gemma4 \
+  --draft-model /path/to/gemma4-assistant \
+  --device gpu:0 --mtp-draft-device gpu:1 \
+  --mtp-draft-tokens 3 --verbose \
+  "Explain speculative decoding."
+```
+
+The main model may also run on CPU. `--device cpu --mtp-draft-device target`
+uses one CPU stream; an explicit `cpu` creates a second CPU stream, while
+`--device cpu --mtp-draft-device gpu:0` verifies on CPU and drafts on GPU 0.
+
 Same-GPU streams share model and state array storage; they do not physically
-copy arrays between streams. Cross-device CPU drafting copies only data that
-must change devices. In either split mode, after submitting a lazy
+copy arrays between streams. Any different-device pairing copies only data
+that must cross devices. In either split mode, after submitting a lazy
 target-verification graph, the MTP scheduler continues one block ahead under
 the assumption that every proposal will be accepted. It resolves the target
 result only after that eligible draft work has been submitted.
@@ -114,11 +137,11 @@ disable ordinary MTP verification.
 
 Two streams on one GPU are an opt-in experiment, not an assumed optimization:
 target and assistant kernels can contend for the same compute and memory
-bandwidth. Compare `gpu-pipelined` with and without
-`--disable-mtp-lookahead`; adaptive lookahead disables future branches whose
-retained proposal reuse does not cover discarded work. Verbose diagnostics
-print `mtp_stream_topology` together with bonus match, reuse, and discard
-counters.
+bandwidth. Compare an explicit same-GPU `--mtp-draft-device gpu:N` run with and
+without `--disable-mtp-lookahead`; adaptive lookahead disables future branches
+whose retained proposal reuse does not cover discarded work. Verbose
+diagnostics print the resolved main and draft placements plus
+`mtp_stream_topology`, bonus match, reuse, and discard counters.
 
 Target acceptance and draft sampling use disjoint deterministic PRNG
 roots. Draft substreams are addressed by logical output position, making output
@@ -141,7 +164,8 @@ semantics derived only from explicit history, immutable configuration, and the
 supplied PRNG state. Mirostat V2 still uses scheduled, lossless MTP but waits
 for target resolution because its adaptive state depends on committed target
 probabilities. Embedded Qwen uses the scheduler without optimistic lookahead.
-`--mtp-device cpu` and `--mtp-device gpu-pipelined` require `--draft-model`.
+Any explicit `--mtp-draft-device cpu|gpu:N` requires `--draft-model`; embedded
+MTP uses `--mtp-draft-device target`.
 
 The assistant may be a safetensors directory or a GGUF file with
 `general.architecture = "gemma4_assistant"` or the published
