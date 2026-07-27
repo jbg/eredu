@@ -22,10 +22,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use tokenizers::Tokenizer;
 
-use crate::chat::prepare_format_profile;
+use crate::chat::{prepare_format_profile, resolve_structural_tokens};
 pub use crate::chat::{
-    ChatTemplateIdentity, ChatTemplateRequest, GenerationConstraint, NativeToolSupport,
-    ParallelToolCallPolicy, PreparedChat, ToolChoice, ToolRuntimePlan,
+    ChatTemplateIdentity, ChatTemplateRequest, NativeToolSupport, ParallelToolCallPolicy,
+    PreparedChat, ToolChoice, ToolRuntimePlan,
 };
 use crate::gguf_tokenizer::{self, GgufTokenizer};
 use crate::inspection::ActivationObserver;
@@ -1836,31 +1836,6 @@ impl TextDecoder {
     }
 }
 
-fn prepare_rendered_chat(
-    template: &ModelChatTemplate,
-    tools: Option<&[serde_json::Value]>,
-    rendered_prompt: String,
-    generation_prompt: String,
-    eos_token_ids: &[u32],
-) -> Result<PreparedChat, Error> {
-    let selected = template.select(tools)?;
-    let profile = prepare_format_profile(selected.template());
-    Ok(PreparedChat {
-        rendered_prompt,
-        generation_prompt,
-        template_identity: selected.identity().clone(),
-        format_profile_identity: profile.identity,
-        native_tool_support: NativeToolSupport::Unsupported {
-            reason: profile.native_tool_unavailable_reason.unwrap_or_else(|| {
-                "native tool constraints require prepare_chat with an explicit request".into()
-            }),
-        },
-        eos_token_ids: eos_token_ids.to_vec(),
-        preserved_structural_token_ids: profile.preserved_structural_token_ids,
-        profile_stop_sequences: profile.stop_sequences,
-    })
-}
-
 fn prepare_chat_from_parts(
     tokenizer: &mut ChatTokenizer,
     template: ModelChatTemplate,
@@ -1872,35 +1847,48 @@ fn prepare_chat_from_parts(
     let selected = template.select(Some(&request.tools))?;
     let template_identity = selected.identity().clone();
     let profile = prepare_format_profile(selected.template());
-    let native_tool_support = match (profile.dialect, profile.dialect_parameters) {
-        (Some(dialect), Some(parameters)) => {
-            let compiler = constraint_compiler
-                .ok_or_else(|| {
-                    Error::ToolConstraint(
-                        "the loaded model does not have tokenizer constraint data".into(),
-                    )
-                })?
-                .as_ref()
-                .map_err(|error| Error::ToolConstraint(error.clone()))?;
-            NativeToolSupport::Supported(
-                compiler
+    let (native_tool_support, preserved_structural_token_ids) =
+        match (profile.dialect, profile.dialect_parameters) {
+            (Some(dialect), Some(parameters)) => {
+                let resolved_structural_token_ids =
+                    resolve_structural_tokens(tokenizer, &profile.required_structural_tokens)
+                        .map_err(Error::ToolConstraint)?;
+                let compiler = constraint_compiler
+                    .ok_or_else(|| {
+                        Error::ToolConstraint(
+                            "the loaded model does not have tokenizer constraint data".into(),
+                        )
+                    })?
+                    .as_ref()
+                    .map_err(|error| Error::ToolConstraint(error.clone()))?;
+                let plan = compiler
                     .compile_tool_plan(
                         dialect,
                         parameters,
                         &request.tools,
                         request.tool_choice,
                         request.parallel_tool_calls,
+                        resolved_structural_token_ids,
                     )
-                    .map_err(Error::ToolConstraint)?,
-            )
-        }
-        _ => NativeToolSupport::Unsupported {
-            reason: profile
-                .native_tool_unavailable_reason
-                .clone()
-                .unwrap_or_else(|| "format profile does not provide a native tool dialect".into()),
-        },
-    };
+                    .map_err(Error::ToolConstraint)?;
+                let preserved_structural_token_ids = plan.structural_token_ids().collect();
+                (
+                    NativeToolSupport::Supported(plan),
+                    preserved_structural_token_ids,
+                )
+            }
+            _ => (
+                NativeToolSupport::Unsupported {
+                    reason: profile
+                        .native_tool_unavailable_reason
+                        .clone()
+                        .unwrap_or_else(|| {
+                            "format profile does not provide a native tool dialect".into()
+                        }),
+                },
+                Vec::new(),
+            ),
+        };
 
     let ChatTemplateRequest {
         messages,
@@ -1963,7 +1951,7 @@ fn prepare_chat_from_parts(
         format_profile_identity: profile.identity,
         native_tool_support,
         eos_token_ids: eos_token_ids.to_vec(),
-        preserved_structural_token_ids: profile.preserved_structural_token_ids,
+        preserved_structural_token_ids,
         profile_stop_sequences: profile.stop_sequences,
     })
 }
@@ -2889,20 +2877,7 @@ impl LoadedModel {
                 template_kwargs,
             },
         )?;
-        rendered
-            .into_iter()
-            .next()
-            .map(|rendered_prompt| {
-                prepare_rendered_chat(
-                    &template,
-                    tools,
-                    rendered_prompt,
-                    String::new(),
-                    &self.eos_token_ids,
-                )
-                .map(|prepared| prepared.rendered_prompt)
-            })
-            .transpose()
+        Ok(rendered.into_iter().next())
     }
 
     /// Applies the loaded chat template to JSON-valued conversations.
@@ -2939,20 +2914,7 @@ impl LoadedModel {
             add_generation_prompt,
             template_kwargs,
         )?;
-        rendered
-            .into_iter()
-            .next()
-            .map(|rendered_prompt| {
-                prepare_rendered_chat(
-                    &template,
-                    tools,
-                    rendered_prompt,
-                    String::new(),
-                    &self.eos_token_ids,
-                )
-                .map(|prepared| prepared.rendered_prompt)
-            })
-            .transpose()
+        Ok(rendered.into_iter().next())
     }
 
     /// Encodes text to tokenizer ids.
@@ -4100,11 +4062,12 @@ mod tests {
     use crate::{
         chat::{
             ChatTemplateRequest, NativeToolSupport, ParallelToolCallPolicy, PreparedChat,
-            ToolChoice, SYNTHETIC_TOOL_TEMPLATE,
+            ToolChoice, SYNTHETIC_STRUCTURAL_TOKEN, SYNTHETIC_TOOL_TEMPLATE,
         },
         error::Error,
         inspection::ActivationRecorder,
         quantization::{AffineQuantization, CheckpointQuantizationOptions, WeightQuantization},
+        streaming::{FinishReason, SemanticEvent},
         tool_constraints::ConstraintCompiler,
     };
     use safemlx::{
@@ -4123,7 +4086,7 @@ mod tests {
         sync::atomic::{AtomicUsize, Ordering},
         time::{SystemTime, UNIX_EPOCH},
     };
-    use tokenizers::{models::wordlevel::WordLevel, Tokenizer};
+    use tokenizers::{models::wordlevel::WordLevel, AddedToken, Tokenizer};
 
     static TEMP_DIR_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
@@ -4189,6 +4152,22 @@ mod tests {
             .save(dir.join("tokenizer.json"), false)
             .unwrap();
         dir
+    }
+
+    fn synthetic_chat_tokenizer(preceding_tokens: usize) -> ChatTokenizer {
+        let mut raw = Tokenizer::new(WordLevel::default());
+        let ordinary = (0..preceding_tokens)
+            .map(|index| AddedToken::from(format!("ordinary_{index}"), false))
+            .collect::<Vec<_>>();
+        raw.add_tokens(ordinary).unwrap();
+        assert_eq!(
+            raw.add_special_tokens([
+                AddedToken::from(SYNTHETIC_STRUCTURAL_TOKEN, true).normalized(false)
+            ])
+            .unwrap(),
+            1
+        );
+        ChatTokenizer::from_tokenizer(raw)
     }
 
     #[test]
@@ -4291,8 +4270,7 @@ mod tests {
 
     #[test]
     fn synthetic_profile_compiles_request_tools_before_rendering() {
-        let raw = Tokenizer::new(WordLevel::default());
-        let mut tokenizer = ChatTokenizer::from_tokenizer(raw);
+        let mut tokenizer = synthetic_chat_tokenizer(0);
         let compiler = Ok(ConstraintCompiler::synthetic_for_tests());
         let template = ModelChatTemplate::Single(SYNTHETIC_TOOL_TEMPLATE.into());
         let valid = ChatTemplateRequest {
@@ -4325,10 +4303,18 @@ mod tests {
             prepared.format_profile_identity(),
             Some("safemlx.synthetic-tools.v1")
         );
-        assert!(matches!(
-            prepared.native_tool_support(),
-            NativeToolSupport::Supported(_)
-        ));
+        let NativeToolSupport::Supported(plan) = prepared.native_tool_support() else {
+            panic!("synthetic profile must prepare an executable runtime plan");
+        };
+        let mut parser = plan.create_parser().unwrap();
+        parser
+            .push(r#"{"calls":[{"name":"lookup","arguments":{"query":"weather"}}]}"#)
+            .unwrap();
+        parser.finish(FinishReason::GrammarComplete).unwrap();
+        assert!(parser.events().iter().any(|event| matches!(
+            event,
+            SemanticEvent::ToolCallStart { name, .. } if name == "lookup"
+        )));
 
         let invalid = ChatTemplateRequest {
             tools: vec![json!({
@@ -4364,6 +4350,88 @@ mod tests {
         assert!(matches!(
             error,
             Error::ToolConstraint(ref message) if message.contains("unsupported schema composition")
+        ));
+    }
+
+    #[test]
+    fn structural_tokens_resolve_against_each_preparation_tokenizer() {
+        let compiler = Ok(ConstraintCompiler::synthetic_for_tests());
+        let request = || ChatTemplateRequest {
+            tools: vec![json!({
+                "type": "function",
+                "function": {
+                    "name": "ping",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {},
+                        "additionalProperties": false
+                    }
+                }
+            })],
+            tool_choice: ToolChoice::Required,
+            ..ChatTemplateRequest::default()
+        };
+
+        let mut first_tokenizer = synthetic_chat_tokenizer(0);
+        let first = prepare_chat_from_parts(
+            &mut first_tokenizer,
+            ModelChatTemplate::Single(SYNTHETIC_TOOL_TEMPLATE.into()),
+            "synthetic-first",
+            &[],
+            Some(&compiler),
+            request(),
+        )
+        .unwrap();
+        let mut second_tokenizer = synthetic_chat_tokenizer(7);
+        let second = prepare_chat_from_parts(
+            &mut second_tokenizer,
+            ModelChatTemplate::Single(SYNTHETIC_TOOL_TEMPLATE.into()),
+            "synthetic-second",
+            &[],
+            Some(&compiler),
+            request(),
+        )
+        .unwrap();
+
+        assert_eq!(first.preserved_structural_token_ids(), &[0]);
+        assert_eq!(second.preserved_structural_token_ids(), &[7]);
+        let NativeToolSupport::Supported(first_plan) = first.native_tool_support() else {
+            panic!("synthetic profile must prepare a runtime plan");
+        };
+        let NativeToolSupport::Supported(second_plan) = second.native_tool_support() else {
+            panic!("synthetic profile must prepare a runtime plan");
+        };
+        assert_eq!(first_plan.structural_token_ids().collect::<Vec<_>>(), [0]);
+        assert_eq!(second_plan.structural_token_ids().collect::<Vec<_>>(), [7]);
+    }
+
+    #[test]
+    fn missing_structural_special_fails_before_prompt_rendering() {
+        let raw = Tokenizer::new(WordLevel::default());
+        let mut tokenizer = ChatTokenizer::from_tokenizer(raw);
+        let compiler = Ok(ConstraintCompiler::synthetic_for_tests());
+        let error = prepare_chat_from_parts(
+            &mut tokenizer,
+            ModelChatTemplate::Single(SYNTHETIC_TOOL_TEMPLATE.into()),
+            "synthetic-missing-structural-token",
+            &[],
+            Some(&compiler),
+            ChatTemplateRequest {
+                tool_choice: ToolChoice::None,
+                extra_template_kwargs: serde_json::Map::from_iter([(
+                    "fail_render".into(),
+                    json!(true),
+                )]),
+                ..ChatTemplateRequest::default()
+            },
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            Error::ToolConstraint(ref message)
+                if message.contains(SYNTHETIC_STRUCTURAL_TOKEN)
+                    && message.contains("not registered as a special token")
         ));
     }
 

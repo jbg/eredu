@@ -560,12 +560,27 @@ impl SemanticEventSink {
 }
 
 /// Incremental parser contract implemented by an exact format profile.
-pub(crate) trait ProtocolParser {
+pub(crate) trait ProtocolParser: Send {
     type Error;
 
     fn push(&mut self, text: &str, sink: &mut SemanticEventSink) -> Result<(), Self::Error>;
 
     fn finish(&mut self, sink: &mut SemanticEventSink) -> Result<(), Self::Error>;
+}
+
+impl<P> ProtocolParser for Box<P>
+where
+    P: ProtocolParser + ?Sized,
+{
+    type Error = P::Error;
+
+    fn push(&mut self, text: &str, sink: &mut SemanticEventSink) -> Result<(), Self::Error> {
+        (**self).push(text, sink)
+    }
+
+    fn finish(&mut self, sink: &mut SemanticEventSink) -> Result<(), Self::Error> {
+        (**self).finish(sink)
+    }
 }
 
 /// Applies stop matching before any bytes can reach a protocol parser.
@@ -623,6 +638,57 @@ where
 
     fn events(&self) -> &[SemanticEvent] {
         &self.sink.events
+    }
+}
+
+/// Opaque, independent protocol parsing state for one prepared tool generation.
+///
+/// Instances are created by [`crate::chat::ToolRuntimePlan::create_parser`].
+/// Each instance owns its parser, semantic event sink, and profile stop matcher.
+pub struct ToolRuntimeParser {
+    stream: SemanticStream<Box<dyn ProtocolParser<Error = String>>>,
+}
+
+impl fmt::Debug for ToolRuntimeParser {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ToolRuntimeParser")
+            .field("finished", &self.stream.finished)
+            .field("event_count", &self.stream.sink.events.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl ToolRuntimeParser {
+    pub(crate) fn new<'a>(
+        parser: Box<dyn ProtocolParser<Error = String>>,
+        profile_stops: impl IntoIterator<Item = &'a str>,
+    ) -> Self {
+        Self {
+            stream: SemanticStream::new(parser, profile_stops, std::iter::empty()),
+        }
+    }
+
+    /// Pushes decoded text and returns whether a profile stop sequence matched.
+    pub fn push(&mut self, text: &str) -> Result<bool, String> {
+        self.stream.push(text)
+    }
+
+    /// Finishes parsing with the generation's terminal reason.
+    ///
+    /// This is a no-op if a profile stop already finished the parser.
+    pub fn finish(&mut self, reason: FinishReason) -> Result<(), String> {
+        self.stream.finish(reason)
+    }
+
+    /// Returns all semantic events emitted by this parser instance.
+    pub fn events(&self) -> &[SemanticEvent] {
+        self.stream.events()
+    }
+
+    /// Returns whether this parser has reached a terminal condition.
+    pub fn is_finished(&self) -> bool {
+        self.stream.finished
     }
 }
 

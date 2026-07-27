@@ -178,13 +178,9 @@ impl<S: Clone> Clone for ConstrainedSampler<S> {
 
 impl<S> ConstrainedSampler<S> {
     /// Wraps `policy` with the constraint and activation semantics in `plan`.
-    pub fn from_tool_plan(
-        policy: S,
-        plan: &ToolRuntimePlan,
-        tool_choice: ToolChoice,
-    ) -> Result<Self, Exception> {
+    pub fn from_tool_plan(policy: S, plan: &ToolRuntimePlan) -> Result<Self, Exception> {
         let constraint = plan.generation_constraint().clone();
-        let runtime = match tool_choice {
+        let runtime = match plan.tool_choice() {
             ToolChoice::None => ConstraintRuntime::Disabled,
             ToolChoice::Auto => {
                 let trigger = plan.auto_activation_trigger().ok_or_else(|| {
@@ -1113,7 +1109,7 @@ mod tests {
         call_separator: ",",
         parallel_layout: ParallelCallLayout::SingleEnvelope,
         auto_activation_trigger: Some(r#"{"calls":"#),
-        required_structural_token_ids: &[],
+        required_structural_tokens: &[],
         stop_sequences: &[],
     };
     const SYNTHETIC_PARAMETERS: DialectParameters = DialectParameters::Declarative(&SYNTHETIC_SPEC);
@@ -1166,6 +1162,7 @@ mod tests {
                 })],
                 tool_choice,
                 ParallelToolCallPolicy::Disabled,
+                Vec::new(),
             )
             .unwrap()
     }
@@ -1215,8 +1212,7 @@ mod tests {
         let stream = context.stream();
         let plan = synthetic_plan(ToolChoice::Required);
         let policy = GenerationSampler::new().top_k(1).top_p(1.0).min_p(0.0);
-        let mut sampler =
-            ConstrainedSampler::from_tool_plan(policy, &plan, ToolChoice::Required).unwrap();
+        let mut sampler = ConstrainedSampler::from_tool_plan(policy, &plan).unwrap();
         let mut values = vec![-100.0f32; SYNTHETIC_VOCAB_SIZE];
         values[b'x' as usize] = 100.0;
         values[b'{' as usize] = 10.0;
@@ -1246,8 +1242,7 @@ mod tests {
         let logits = placeholder_logits();
 
         let mut partial =
-            ConstrainedSampler::from_tool_plan(CountingPolicy::default(), &plan, ToolChoice::Auto)
-                .unwrap();
+            ConstrainedSampler::from_tool_plan(CountingPolicy::default(), &plan).unwrap();
         commit_bytes(
             &mut partial,
             &AUTO_TRIGGER[..AUTO_TRIGGER.len() - 1],
@@ -1258,8 +1253,7 @@ mod tests {
         assert_eq!(partial.valid_token_ids().unwrap(), None);
 
         let mut near =
-            ConstrainedSampler::from_tool_plan(CountingPolicy::default(), &plan, ToolChoice::Auto)
-                .unwrap();
+            ConstrainedSampler::from_tool_plan(CountingPolicy::default(), &plan).unwrap();
         commit_bytes(&mut near, br#"{"callx":"#, &logits, stream);
         assert!(!near.constraint_is_active());
         assert_eq!(near.valid_token_ids().unwrap(), None);
@@ -1272,8 +1266,7 @@ mod tests {
         let plan = synthetic_plan(ToolChoice::Auto);
         let logits = placeholder_logits();
         let mut sampler =
-            ConstrainedSampler::from_tool_plan(CountingPolicy::default(), &plan, ToolChoice::Auto)
-                .unwrap();
+            ConstrainedSampler::from_tool_plan(CountingPolicy::default(), &plan).unwrap();
 
         for (index, &byte) in AUTO_TRIGGER.iter().enumerate() {
             sampler
@@ -1297,17 +1290,50 @@ mod tests {
     }
 
     #[test]
+    fn runtime_plan_creates_independent_sampler_instances() {
+        let context = test_context();
+        let stream = context.stream();
+        let plan = synthetic_plan(ToolChoice::Auto);
+        let logits = placeholder_logits();
+        let mut first =
+            ConstrainedSampler::from_tool_plan(CountingPolicy::default(), &plan).unwrap();
+        let mut second =
+            ConstrainedSampler::from_tool_plan(CountingPolicy::default(), &plan).unwrap();
+
+        commit_bytes(&mut first, AUTO_TRIGGER, &logits, stream);
+
+        assert!(first.constraint_is_active());
+        assert!(!second.constraint_is_active());
+        assert_eq!(second.valid_token_ids().unwrap(), None);
+        assert_eq!(first.policy().commits, AUTO_TRIGGER.len());
+        assert_eq!(second.policy().commits, 0);
+    }
+
+    #[test]
+    fn none_disables_constraints_from_the_first_token() {
+        let context = test_context();
+        let stream = context.stream();
+        let plan = synthetic_plan(ToolChoice::None);
+        let logits = placeholder_logits();
+        let mut sampler =
+            ConstrainedSampler::from_tool_plan(CountingPolicy::default(), &plan).unwrap();
+
+        assert!(!sampler.constraint_is_active());
+        assert_eq!(sampler.valid_token_ids().unwrap(), None);
+        sampler
+            .commit_token(&logits, u32::from(b'x'), stream)
+            .unwrap();
+        assert_eq!(sampler.policy().commits, 1);
+    }
+
+    #[test]
     fn required_is_immediate_and_rollback_restores_valid_tokens_and_policy() {
         let context = test_context();
         let stream = context.stream();
         let plan = synthetic_plan(ToolChoice::Required);
         let logits = placeholder_logits();
-        let mut sampler = ConstrainedSampler::from_tool_plan(
-            CountingPolicy::default(),
-            &plan,
-            ToolChoice::Required,
-        )
-        .unwrap();
+        let mut sampler =
+            ConstrainedSampler::from_tool_plan(CountingPolicy::default(), &plan).unwrap();
 
         assert!(sampler.constraint_is_active());
         let initial = sampler.valid_token_ids().unwrap().unwrap();
@@ -1334,8 +1360,7 @@ mod tests {
         let stream = context.stream();
         let plan = synthetic_plan(ToolChoice::Auto);
         let policy = GenerationSampler::new().top_k(1).top_p(1.0).min_p(0.0);
-        let mut sampler =
-            ConstrainedSampler::from_tool_plan(policy, &plan, ToolChoice::Auto).unwrap();
+        let mut sampler = ConstrainedSampler::from_tool_plan(policy, &plan).unwrap();
         let mut values = vec![-100.0f32; SYNTHETIC_VOCAB_SIZE];
         values[b'x' as usize] = 100.0;
         values[b'[' as usize] = 10.0;

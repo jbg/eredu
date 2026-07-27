@@ -18,7 +18,10 @@ use sha2::{Digest, Sha256};
 use toktrie_hf_tokenizers::ByteTokenizer;
 
 use crate::{
-    chat::{GenerationConstraint, ParallelToolCallPolicy, ToolChoice, ToolRuntimePlan},
+    chat::{
+        GenerationConstraint, ParallelToolCallPolicy, ToolChoice, ToolRuntimePlan,
+        ToolRuntimePlanParts,
+    },
     format_dialect::{DialectParameters, FormatDialect},
 };
 
@@ -87,7 +90,18 @@ impl ConstraintCompiler {
         tools: &[Value],
         tool_choice: ToolChoice,
         parallel_tool_calls: ParallelToolCallPolicy,
+        resolved_structural_token_ids: Vec<u32>,
     ) -> Result<ToolRuntimePlan, String> {
+        let structural_token_spellings = dialect.required_structural_tokens(parameters)?;
+        if structural_token_spellings.len() != resolved_structural_token_ids.len() {
+            return Err(format!(
+                "format dialect declares {} structural tokens but {} tokenizer IDs were resolved",
+                structural_token_spellings.len(),
+                resolved_structural_token_ids.len()
+            ));
+        }
+        let profile_stop_sequences = dialect.stop_sequences(parameters)?;
+        dialect.incremental_parser_state(parameters)?;
         let configuration = dialect.constraint_configuration(
             parameters,
             tools,
@@ -113,14 +127,31 @@ impl ConstraintCompiler {
                 warnings.join("; ")
             ));
         }
-        Ok(ToolRuntimePlan::from_constraint(
-            GenerationConstraint::new(fingerprint, ConstraintBlueprint { matcher }),
-            if tool_choice == ToolChoice::Auto {
-                dialect.auto_activation_trigger(parameters)?
+        Ok(ToolRuntimePlan::new(ToolRuntimePlanParts {
+            tool_choice,
+            generation_constraint: GenerationConstraint::new(
+                fingerprint,
+                ConstraintBlueprint { matcher },
+            ),
+            auto_activation_trigger: if tool_choice == ToolChoice::Auto {
+                dialect
+                    .auto_activation_trigger(parameters)?
+                    .map(str::to_owned)
             } else {
                 None
             },
-        ))
+            dialect,
+            dialect_parameters: parameters,
+            structural_token_spellings: structural_token_spellings
+                .iter()
+                .map(|spelling| (*spelling).to_owned())
+                .collect(),
+            resolved_structural_token_ids,
+            profile_stop_sequences: profile_stop_sequences
+                .iter()
+                .map(|sequence| (*sequence).to_owned())
+                .collect(),
+        }))
     }
 }
 
@@ -716,7 +747,7 @@ mod tests {
         call_separator: ",",
         parallel_layout: ParallelCallLayout::SingleEnvelope,
         auto_activation_trigger: Some(r#"{"calls":"#),
-        required_structural_token_ids: &[],
+        required_structural_tokens: &[],
         stop_sequences: &[],
     };
 
@@ -783,6 +814,7 @@ mod tests {
                 ],
                 ToolChoice::Required,
                 ParallelToolCallPolicy::Disabled,
+                Vec::new(),
             )
             .unwrap();
 
@@ -843,6 +875,7 @@ mod tests {
                 )],
                 ToolChoice::Required,
                 ParallelToolCallPolicy::Disabled,
+                Vec::new(),
             )
             .unwrap();
 
@@ -897,6 +930,7 @@ mod tests {
                     &[tool],
                     ToolChoice::Required,
                     ParallelToolCallPolicy::Disabled,
+                    Vec::new(),
                 )
                 .unwrap_err();
             assert!(
@@ -922,6 +956,7 @@ mod tests {
                 &tools,
                 ToolChoice::Required,
                 ParallelToolCallPolicy::Disabled,
+                Vec::new(),
             )
             .unwrap();
         let parallel = compiler
@@ -933,6 +968,7 @@ mod tests {
                 ParallelToolCallPolicy::Enabled {
                     max_calls: NonZeroUsize::new(2),
                 },
+                Vec::new(),
             )
             .unwrap();
         let two = json!({"calls": [
@@ -962,6 +998,7 @@ mod tests {
                 )],
                 ToolChoice::Required,
                 ParallelToolCallPolicy::Disabled,
+                Vec::new(),
             )
             .unwrap();
         let bytes =

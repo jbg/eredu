@@ -56,6 +56,14 @@ impl DialectParameters {
             }
         }
     }
+
+    pub(crate) fn ptr_eq(self, other: Self) -> bool {
+        match (self, other) {
+            (Self::Declarative(left), Self::Declarative(right)) => std::ptr::eq(left, right),
+            (Self::Custom(left), Self::Custom(right)) => std::ptr::eq(left, right),
+            _ => false,
+        }
+    }
 }
 
 impl fmt::Debug for DialectParameters {
@@ -93,10 +101,10 @@ pub(crate) trait FormatDialect: fmt::Debug + Send + Sync {
         parameters: DialectParameters,
     ) -> Result<Option<&'static str>, String>;
 
-    fn preserved_structural_token_ids(
+    fn required_structural_tokens(
         &self,
         parameters: DialectParameters,
-    ) -> Result<&'static [u32], String>;
+    ) -> Result<&'static [&'static str], String>;
 
     fn stop_sequences(
         &self,
@@ -159,7 +167,7 @@ pub(crate) struct DeclarativeDialectSpec {
     pub(crate) call_separator: &'static str,
     pub(crate) parallel_layout: ParallelCallLayout,
     pub(crate) auto_activation_trigger: Option<&'static str>,
-    pub(crate) required_structural_token_ids: &'static [u32],
+    pub(crate) required_structural_tokens: &'static [&'static str],
     pub(crate) stop_sequences: &'static [&'static str],
 }
 
@@ -356,11 +364,11 @@ impl FormatDialect for DeclarativeDialect {
         Ok(Self::spec(parameters)?.auto_activation_trigger)
     }
 
-    fn preserved_structural_token_ids(
+    fn required_structural_tokens(
         &self,
         parameters: DialectParameters,
-    ) -> Result<&'static [u32], String> {
-        Ok(Self::spec(parameters)?.required_structural_token_ids)
+    ) -> Result<&'static [&'static str], String> {
+        Ok(Self::spec(parameters)?.required_structural_tokens)
     }
 
     fn stop_sequences(
@@ -729,7 +737,7 @@ mod tests {
             prepare_format_profile_with_registry, template_signature, ParallelToolCallPolicy,
             ToolChoice,
         },
-        streaming::{ProtocolParser, SemanticEvent, SemanticEventSink},
+        streaming::{FinishReason, ProtocolParser, SemanticEvent, SemanticEventSink},
         tool_constraints::ConstraintCompiler,
     };
 
@@ -757,7 +765,7 @@ mod tests {
         call_separator: "\n",
         parallel_layout: ParallelCallLayout::RepeatedEnvelopes,
         auto_activation_trigger: Some("<tools>"),
-        required_structural_token_ids: &[41, 42],
+        required_structural_tokens: &["<tools>", "</tools>"],
         stop_sequences: &["<stop>"],
     };
 
@@ -779,7 +787,7 @@ mod tests {
         call_separator: ", ",
         parallel_layout: ParallelCallLayout::SingleEnvelope,
         auto_activation_trigger: Some("<batch>"),
-        required_structural_token_ids: &[51],
+        required_structural_tokens: &["<batch>"],
         stop_sequences: &["</batch>"],
     };
 
@@ -844,6 +852,7 @@ mod tests {
                 ParallelToolCallPolicy::Enabled {
                     max_calls: std::num::NonZeroUsize::new(2),
                 },
+                vec![41, 42],
             )
             .unwrap();
         let output = concat!(
@@ -861,22 +870,20 @@ mod tests {
         assert_eq!(plan.auto_activation_trigger(), None);
 
         for split in (0..=output.len()).filter(|index| output.is_char_boundary(*index)) {
-            let mut parser = DECLARATIVE_DIALECT
-                .incremental_parser_state(parameters)
-                .unwrap();
-            let mut sink = SemanticEventSink::default();
-            parser.push(&output[..split], &mut sink).unwrap();
-            parser.push(&output[split..], &mut sink).unwrap();
-            parser.finish(&mut sink).unwrap();
-            assert_eq!(event_text(sink.events(), true), "why 🦀", "split {split}");
-            assert_eq!(event_text(sink.events(), false), "hello", "split {split}");
+            let mut parser = plan.create_parser().unwrap();
+            parser.push(&output[..split]).unwrap();
+            parser.push(&output[split..]).unwrap();
+            parser.finish(FinishReason::GrammarComplete).unwrap();
+            assert_eq!(event_text(parser.events(), true), "why 🦀", "split {split}");
+            assert_eq!(event_text(parser.events(), false), "hello", "split {split}");
             assert_eq!(
-                arguments(sink.events()),
+                arguments(parser.events()),
                 [r#"{"value":1}"#, r#"{"value":2}"#],
                 "split {split}"
             );
             assert_eq!(
-                sink.events()
+                parser
+                    .events()
                     .iter()
                     .filter(|event| matches!(event, SemanticEvent::ToolCallStart { .. }))
                     .count(),
@@ -884,6 +891,39 @@ mod tests {
                 "split {split}"
             );
         }
+    }
+
+    #[test]
+    fn runtime_plan_creates_independent_parser_instances() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<crate::chat::ToolRuntimePlan>();
+
+        let parameters = DialectParameters::Declarative(&DECLARATIVE_OBJECT_SPEC);
+        let plan = ConstraintCompiler::synthetic_for_tests()
+            .compile_tool_plan(
+                &DECLARATIVE_DIALECT,
+                parameters,
+                &[tool("first"), tool("second")],
+                ToolChoice::Required,
+                ParallelToolCallPolicy::Disabled,
+                vec![41, 42],
+            )
+            .unwrap();
+        let first_output =
+            r#"<tools><call>{"function":"first","input":{"value":1}}</call></tools>"#;
+        let second_output =
+            r#"<tools><call>{"function":"second","input":{"value":2}}</call></tools>"#;
+        let mut first = plan.create_parser().unwrap();
+        let mut second = plan.create_parser().unwrap();
+
+        first.push(&first_output[..first_output.len() / 2]).unwrap();
+        second.push(second_output).unwrap();
+        second.finish(FinishReason::GrammarComplete).unwrap();
+        first.push(&first_output[first_output.len() / 2..]).unwrap();
+        first.finish(FinishReason::GrammarComplete).unwrap();
+
+        assert_eq!(arguments(first.events()), [r#"{"value":1}"#]);
+        assert_eq!(arguments(second.events()), [r#"{"value":2}"#]);
     }
 
     #[test]
@@ -899,6 +939,7 @@ mod tests {
                 ParallelToolCallPolicy::Enabled {
                     max_calls: std::num::NonZeroUsize::new(2),
                 },
+                vec![51],
             )
             .unwrap();
         let output = r#"<batch><json>[{"op":"one","args":{"value":1}}, {"op":"one","args":{"value":2}}]</json></batch>"#;
@@ -916,9 +957,9 @@ mod tests {
         );
         assert_eq!(
             DECLARATIVE_DIALECT
-                .preserved_structural_token_ids(parameters)
+                .required_structural_tokens(parameters)
                 .unwrap(),
-            &[51]
+            &["<batch>"]
         );
         assert_eq!(
             DECLARATIVE_DIALECT.stop_sequences(parameters).unwrap(),
@@ -939,6 +980,17 @@ mod tests {
             arguments(sink.events()),
             [r#"{"value":1}"#, r#"{"value":2}"#]
         );
+
+        let mut runtime_parser = plan.create_parser().unwrap();
+        assert!(runtime_parser.push(output).unwrap());
+        assert!(runtime_parser.is_finished());
+        assert_eq!(
+            arguments(runtime_parser.events()),
+            [r#"{"value":1}"#, r#"{"value":2}"#]
+        );
+        assert!(runtime_parser.events().contains(&SemanticEvent::Finished {
+            reason: FinishReason::StopSequence
+        }));
     }
 
     #[derive(Debug)]
@@ -999,12 +1051,12 @@ mod tests {
             Ok(Some(parameters.custom::<CustomParameters>()?.literal))
         }
 
-        fn preserved_structural_token_ids(
+        fn required_structural_tokens(
             &self,
             parameters: DialectParameters,
-        ) -> Result<&'static [u32], String> {
+        ) -> Result<&'static [&'static str], String> {
             parameters.custom::<CustomParameters>()?;
-            Ok(&[91])
+            Ok(&["<custom>"])
         }
 
         fn stop_sequences(
@@ -1041,7 +1093,7 @@ mod tests {
             prepared.generation_prompt_behavior,
             GenerationPromptBehavior::Always
         );
-        assert_eq!(prepared.preserved_structural_token_ids, [91]);
+        assert_eq!(prepared.required_structural_tokens, ["<custom>"]);
         assert_eq!(prepared.stop_sequences, ["CUSTOM_END"]);
 
         let compiler = ConstraintCompiler::synthetic_for_tests();
@@ -1052,6 +1104,7 @@ mod tests {
                 &[],
                 ToolChoice::Auto,
                 ParallelToolCallPolicy::Disabled,
+                vec![91],
             )
             .unwrap();
         assert!(accepts(&plan, "CUSTOM"));
