@@ -24,6 +24,7 @@ use crate::{
         ModelCache, ModelLoadOptions,
     },
     sampler::SpeculativeSampler,
+    streaming::{FinishReason, SemanticEvent},
 };
 
 /// Architecture-dispatched draft model loaded independently of a target.
@@ -594,6 +595,69 @@ struct InFlight<B: MtpBackend> {
     submitted: Instant,
 }
 
+/// Forkable decoded-output state used while resolving a target transaction.
+///
+/// Implementations must keep emitted events private until `take_events` is
+/// called after the scheduler has committed the matching backend boundary.
+pub(crate) trait MtpSemanticState {
+    fn fork_box(&self) -> Result<Box<dyn MtpSemanticState>, Exception>;
+    fn push_token(&mut self, token: u32) -> Result<bool, Exception>;
+    fn finish(&mut self, reason: FinishReason) -> Result<(), Exception>;
+    fn take_events(&mut self) -> Vec<SemanticEvent>;
+}
+
+struct CommittedOutputRuntime<'a, S> {
+    sampler: S,
+    token_ids: Vec<u32>,
+    semantic: Option<Box<dyn MtpSemanticState>>,
+    on_token: Box<dyn FnMut(u32) -> Result<(), Exception> + 'a>,
+    on_event: Option<Box<dyn FnMut(SemanticEvent) + 'a>>,
+    finish_reason: Option<FinishReason>,
+}
+
+impl<'a, S> CommittedOutputRuntime<'a, S> {
+    fn plain<F>(sampler: S, on_token: F) -> Self
+    where
+        F: FnMut(u32) -> Result<(), Exception> + 'a,
+    {
+        Self {
+            sampler,
+            token_ids: Vec::new(),
+            semantic: None,
+            on_token: Box::new(on_token),
+            on_event: None,
+            finish_reason: None,
+        }
+    }
+
+    fn semantic<F>(sampler: S, semantic: Box<dyn MtpSemanticState>, on_event: F) -> Self
+    where
+        F: FnMut(SemanticEvent) + 'a,
+    {
+        Self {
+            sampler,
+            token_ids: Vec::new(),
+            semantic: Some(semantic),
+            on_token: Box::new(|_| Ok(())),
+            on_event: Some(Box::new(on_event)),
+            finish_reason: None,
+        }
+    }
+
+    fn publish(&mut self, tokens: &[u32]) -> Result<(), Exception> {
+        self.token_ids.extend_from_slice(tokens);
+        for &token in tokens {
+            (self.on_token)(token)?;
+        }
+        if let (Some(semantic), Some(on_event)) = (&mut self.semantic, &mut self.on_event) {
+            for event in semantic.take_events() {
+                on_event(event);
+            }
+        }
+        Ok(())
+    }
+}
+
 enum OptimisticBonusTransition<D> {
     NotPresent,
     MatchedRetained(DraftBlock<D>),
@@ -613,10 +677,9 @@ struct ScheduledRequest<'a, B: MtpBackend, S> {
     id: MtpRequestId,
     cache: &'a mut B::Cache,
     config: MtpConfig,
-    sampler: S,
+    runtime: CommittedOutputRuntime<'a, S>,
     target_prng: Option<RandomState>,
     draft_rng: Option<PositionedDraftRng>,
-    output: Vec<u32>,
     stats: MtpStats,
     started: Instant,
     target_state: Option<B::TargetState>,
@@ -624,7 +687,6 @@ struct ScheduledRequest<'a, B: MtpBackend, S> {
     in_flight: Option<InFlight<B>>,
     phase: MtpRequestPhase,
     cancel_requested: bool,
-    on_token: Box<dyn FnMut(u32) -> Result<(), Exception> + 'a>,
 }
 
 /// One completed scheduled request.
@@ -637,6 +699,8 @@ pub struct MtpRequestOutput<S> {
     pub stats: MtpStats,
     /// Final canonical sampler state.
     pub sampler: S,
+    /// Terminal condition for a completed request, or `None` when cancelled.
+    pub finish_reason: Option<FinishReason>,
     /// Whether the request was cancelled.
     pub cancelled: bool,
 }
@@ -726,18 +790,64 @@ where
     where
         F: FnMut(u32) -> Result<(), Exception> + 'a,
     {
+        self.submit_runtime(
+            cache,
+            input,
+            config,
+            prng_key,
+            CommittedOutputRuntime::plain(sampler, on_token),
+        )
+    }
+
+    /// Submits one request with transactional decoded semantic output.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn submit_with_semantics<F>(
+        &mut self,
+        cache: &'a mut B::Cache,
+        input: ModelInput<'_>,
+        config: MtpConfig,
+        prng_key: Option<Array>,
+        sampler: S,
+        semantic: Box<dyn MtpSemanticState>,
+        on_event: F,
+    ) -> Result<MtpRequestId, Exception>
+    where
+        F: FnMut(SemanticEvent) + 'a,
+    {
+        if self.options.lookahead_blocks != 0 {
+            return Err(Exception::custom(
+                "semantic MTP generation requires optimistic lookahead to be disabled",
+            ));
+        }
+        self.submit_runtime(
+            cache,
+            input,
+            config,
+            prng_key,
+            CommittedOutputRuntime::semantic(sampler, semantic, on_event),
+        )
+    }
+
+    fn submit_runtime(
+        &mut self,
+        cache: &'a mut B::Cache,
+        input: ModelInput<'_>,
+        config: MtpConfig,
+        prng_key: Option<Array>,
+        mut runtime: CommittedOutputRuntime<'a, S>,
+    ) -> Result<MtpRequestId, Exception> {
         validate_config(self.backend, &config, prng_key.as_ref())?;
         let id = MtpRequestId(self.requests.len());
         let started = Instant::now();
         if config.max_tokens == 0 {
+            runtime.finish_reason = Some(FinishReason::MaxTokens);
             self.requests.push(ScheduledRequest {
                 id,
                 cache,
                 config,
-                sampler,
+                runtime,
                 target_prng: None,
                 draft_rng: None,
-                output: Vec::new(),
                 stats: MtpStats {
                     stream_topology: self.streams.topology(),
                     ..MtpStats::default()
@@ -748,7 +858,6 @@ where
                 in_flight: None,
                 phase: MtpRequestPhase::Completed,
                 cancel_requested: false,
-                on_token: Box::new(on_token),
             });
             return Ok(id);
         }
@@ -760,10 +869,9 @@ where
             id,
             cache,
             config,
-            sampler,
+            runtime,
             target_prng,
             draft_rng,
-            output: Vec::new(),
             stats: MtpStats {
                 stream_topology: self.streams.topology(),
                 ..MtpStats::default()
@@ -774,7 +882,6 @@ where
             in_flight: None,
             phase: MtpRequestPhase::Prefill,
             cancel_requested: false,
-            on_token: Box::new(on_token),
         });
 
         let prefill_result = {
@@ -785,30 +892,63 @@ where
                     .prefill(input, request.cache, self.streams.target())?;
                 request.stats.target_tokens = prefill.evaluated_tokens;
                 request.stats.scheduler_turns = 1;
-                let first_logits = request.sampler.process_logits(
+                let mut sampler = request.runtime.sampler.clone();
+                let mut semantic = request
+                    .runtime
+                    .semantic
+                    .as_ref()
+                    .map(|state| state.fork_box())
+                    .transpose()?;
+                let mut target_prng = request.target_prng.clone();
+                let first_logits = sampler.process_logits(
                     &prefill.logits,
                     request.config.temperature,
                     &[],
                     self.streams.target(),
                 )?;
-                let first = request.sampler.sample_processed(
+                let first = sampler.sample_processed(
                     &first_logits,
                     request.config.temperature,
-                    request.target_prng.as_mut(),
+                    target_prng.as_mut(),
                     self.streams.target(),
                 )?;
                 eval([&first])?;
                 let first = first.item::<u32>(self.streams.target());
-                request
-                    .sampler
-                    .commit_token(&first_logits, first, self.streams.target())?;
-                (request.on_token)(first)?;
-                request.output.push(first);
+                sampler.commit_token(&first_logits, first, self.streams.target())?;
+                let stop_matched = semantic
+                    .as_mut()
+                    .map(|state| state.push_token(first))
+                    .transpose()?
+                    .unwrap_or(false);
+                let grammar_complete = if stop_matched {
+                    false
+                } else {
+                    sampler.grammar_is_complete()?
+                };
+                let reason = stop_matched
+                    .then_some(FinishReason::StopSequence)
+                    .or_else(|| grammar_complete.then_some(FinishReason::GrammarComplete))
+                    .or_else(|| {
+                        request
+                            .config
+                            .eos_token_ids
+                            .contains(&first)
+                            .then_some(FinishReason::Eos)
+                    })
+                    .or_else(|| {
+                        (request.config.max_tokens == 1).then_some(FinishReason::MaxTokens)
+                    });
+                if let (Some(state), Some(reason)) = (&mut semantic, reason) {
+                    state.finish(reason)?;
+                }
+                request.runtime.sampler = sampler;
+                request.runtime.semantic = semantic;
+                request.runtime.finish_reason = reason;
+                request.target_prng = target_prng;
+                request.runtime.publish(&[first])?;
                 request.stats.emitted_tokens = 1;
                 request.target_state = Some(prefill.state);
-                let completed =
-                    request.config.eos_token_ids.contains(&first) || request.config.max_tokens == 1;
-                request.phase = if completed {
+                request.phase = if reason.is_some() {
                     request.stats.elapsed = request.started.elapsed();
                     MtpRequestPhase::Completed
                 } else {
@@ -948,12 +1088,16 @@ where
             requests: self
                 .requests
                 .into_iter()
-                .map(|request| MtpRequestOutput {
-                    id: request.id,
-                    token_ids: request.output,
-                    stats: request.stats,
-                    sampler: request.sampler,
-                    cancelled: request.phase == MtpRequestPhase::Cancelled,
+                .map(|request| {
+                    let runtime = request.runtime;
+                    MtpRequestOutput {
+                        id: request.id,
+                        token_ids: runtime.token_ids,
+                        stats: request.stats,
+                        sampler: runtime.sampler,
+                        finish_reason: runtime.finish_reason,
+                        cancelled: request.phase == MtpRequestPhase::Cancelled,
+                    }
                 })
                 .collect(),
             scheduler: self.stats,
@@ -1004,7 +1148,7 @@ where
             request
                 .config
                 .max_tokens
-                .saturating_sub(request.output.len()),
+                .saturating_sub(request.runtime.token_ids.len()),
         );
         if target_count == 0 {
             request.phase = MtpRequestPhase::Completed;
@@ -1015,7 +1159,11 @@ where
         let mut block = if let Some(block) = request.block.take() {
             block
         } else {
-            let last = *request.output.last().expect("prefill emitted a token");
+            let last = *request
+                .runtime
+                .token_ids
+                .last()
+                .expect("prefill emitted a token");
             let target_state = request
                 .target_state
                 .as_ref()
@@ -1042,11 +1190,18 @@ where
             target_count - block.proposals.len()
         };
         if additional > 0 {
-            let mut history = Vec::with_capacity(request.output.len() + block.proposals.len());
-            history.extend_from_slice(&request.output);
+            let mut history =
+                Vec::with_capacity(request.runtime.token_ids.len() + block.proposals.len());
+            history.extend_from_slice(&request.runtime.token_ids);
             history.extend(block.proposals.iter().map(|proposal| proposal.token));
             let previous = block.proposals.last().map_or_else(
-                || *request.output.last().expect("prefill emitted a token"),
+                || {
+                    *request
+                        .runtime
+                        .token_ids
+                        .last()
+                        .expect("prefill emitted a token")
+                },
                 |proposal| proposal.token,
             );
             let proposals = draft_block(
@@ -1056,7 +1211,7 @@ where
                 additional,
                 &history,
                 &request.config,
-                &request.sampler,
+                &request.runtime.sampler,
                 request.draft_rng.as_ref(),
                 self.streams.draft(),
             )?;
@@ -1085,7 +1240,13 @@ where
             ));
         }
         let mut verify_ids = Vec::with_capacity(block.proposals.len() + 1);
-        verify_ids.push(*request.output.last().expect("prefill emitted a token"));
+        verify_ids.push(
+            *request
+                .runtime
+                .token_ids
+                .last()
+                .expect("prefill emitted a token"),
+        );
         verify_ids.extend(block.proposals.iter().map(|proposal| proposal.token));
         let verify_input = Array::from_slice(&verify_ids, &[1, verify_ids.len() as i32]);
         let verify_input = if self.streams.crosses_devices() {
@@ -1120,9 +1281,12 @@ where
         let Some(flight) = request.in_flight.as_ref() else {
             return false;
         };
-        let assumed_len = request.output.len() + flight.block.proposals.len();
+        let assumed_len = request.runtime.token_ids.len() + flight.block.proposals.len();
         self.backend.supports_exact_optimistic_promotion()
-            && request.sampler.supports_exact_optimistic_promotion()
+            && request
+                .runtime
+                .sampler
+                .supports_exact_optimistic_promotion()
             && !request.stats.adaptive_lookahead_disabled
             && !flight.block.proposals.is_empty()
             && !flight
@@ -1147,7 +1311,7 @@ where
             .in_flight
             .as_mut()
             .expect("optimistic request has an in-flight verification");
-        let assumed_len = request.output.len() + flight.block.proposals.len();
+        let assumed_len = request.runtime.token_ids.len() + flight.block.proposals.len();
         let count = request
             .config
             .max_draft_tokens
@@ -1161,7 +1325,7 @@ where
             .expect("optimistic block has an assumed token")
             .token;
         let mut history = Vec::with_capacity(assumed_len);
-        history.extend_from_slice(&request.output);
+        history.extend_from_slice(&request.runtime.token_ids);
         history.extend(flight.block.proposals.iter().map(|proposal| proposal.token));
         let proposals = draft_block(
             self.backend,
@@ -1170,7 +1334,7 @@ where
             count,
             &history,
             &request.config,
-            &request.sampler,
+            &request.runtime.sampler,
             request.draft_rng.as_ref(),
             self.streams.draft(),
         )?;
@@ -1229,121 +1393,164 @@ where
             }
         }
         let target_raw = B::verification_logits(&flight.verification);
-        let mut history = request.output.clone();
+        let mut sampler = request.runtime.sampler.clone();
+        let mut target_prng = request.target_prng.clone();
+        let mut semantic = request
+            .runtime
+            .semantic
+            .as_ref()
+            .map(|state| state.fork_box())
+            .transpose()?;
+        let mut tentative_stats = request.stats.clone();
+        let mut history = request.runtime.token_ids.clone();
+        let committed_len = history.len();
+        let mut committed_tokens = Vec::new();
         let mut accepted = 0usize;
         let mut emitted_tail = None;
+        let mut terminal = None;
         for (index, proposal) in proposals.iter().enumerate() {
             let token = proposal.token;
             let raw = target_raw.try_index_device((.., index as i32, ..), self.streams.target())?;
-            let target = request.sampler.process_logits(
+            let target = sampler.process_logits(
                 &raw,
                 request.config.temperature,
                 &history,
                 self.streams.target(),
             )?;
-            if request.config.temperature == 0.0 {
-                let chosen = request
-                    .sampler
+            let accepted_proposal = if request.config.temperature == 0.0 {
+                let chosen = sampler
                     .sample_processed(&target, 0.0, None, self.streams.target())?
                     .item::<u32>(self.streams.target());
                 if chosen == token {
-                    request
-                        .sampler
-                        .commit_token(&target, token, self.streams.target())?;
-                    accepted += 1;
-                    history.push(token);
-                    continue;
+                    true
+                } else {
+                    sampler.commit_token(&target, chosen, self.streams.target())?;
+                    emitted_tail = Some(chosen);
+                    committed_tokens.push(chosen);
+                    terminal = terminal_after_token(
+                        &mut sampler,
+                        &mut semantic,
+                        chosen,
+                        &request.config.eos_token_ids,
+                        committed_len + committed_tokens.len(),
+                        request.config.max_tokens,
+                    )?;
+                    break;
                 }
-                request
-                    .sampler
-                    .commit_token(&target, chosen, self.streams.target())?;
-                emitted_tail = Some(chosen);
-                break;
-            }
-
-            let p = probabilities(&target, self.streams.target())?;
-            let q = probabilities(&proposal.distribution, self.streams.target())?;
-            let p_token = probability_at(&p, token, self.streams.target())?;
-            let q_token = probability_at(&q, token, self.streams.target())?;
-            let acceptance = if q_token <= 0.0 {
-                1.0
             } else {
-                (p_token / q_token).min(1.0)
+                let p = probabilities(&target, self.streams.target())?;
+                let q = probabilities(&proposal.distribution, self.streams.target())?;
+                let p_token = probability_at(&p, token, self.streams.target())?;
+                let q_token = probability_at(&q, token, self.streams.target())?;
+                let acceptance = if q_token <= 0.0 {
+                    1.0
+                } else {
+                    (p_token / q_token).min(1.0)
+                };
+                if uniform(target_prng.as_mut(), self.streams.target())? <= acceptance {
+                    true
+                } else {
+                    let chosen = sample_residual(
+                        &p,
+                        &q,
+                        &target,
+                        &mut sampler,
+                        request.config.temperature,
+                        target_prng.as_mut(),
+                        self.streams.target(),
+                    )?;
+                    sampler.commit_token(&target, chosen, self.streams.target())?;
+                    emitted_tail = Some(chosen);
+                    committed_tokens.push(chosen);
+                    terminal = terminal_after_token(
+                        &mut sampler,
+                        &mut semantic,
+                        chosen,
+                        &request.config.eos_token_ids,
+                        committed_len + committed_tokens.len(),
+                        request.config.max_tokens,
+                    )?;
+                    break;
+                }
             };
-            if uniform(request.target_prng.as_mut(), self.streams.target())? <= acceptance {
-                request
-                    .sampler
-                    .commit_token(&target, token, self.streams.target())?;
+
+            if accepted_proposal {
+                sampler.commit_token(&target, token, self.streams.target())?;
                 accepted += 1;
                 history.push(token);
-                continue;
+                committed_tokens.push(token);
+                terminal = terminal_after_token(
+                    &mut sampler,
+                    &mut semantic,
+                    token,
+                    &request.config.eos_token_ids,
+                    committed_len + committed_tokens.len(),
+                    request.config.max_tokens,
+                )?;
+                if terminal.is_some() {
+                    break;
+                }
             }
-            let chosen = sample_residual(
-                &p,
-                &q,
-                &target,
-                &mut request.sampler,
-                request.config.temperature,
-                request.target_prng.as_mut(),
-                self.streams.target(),
-            )?;
-            request
-                .sampler
-                .commit_token(&target, chosen, self.streams.target())?;
-            emitted_tail = Some(chosen);
-            break;
         }
 
         let mut bonus_transition = OptimisticBonusTransition::NotPresent;
         if accepted == proposals.len()
-            && request.output.len() + accepted < request.config.max_tokens
-            && !proposals
-                .last()
-                .is_some_and(|proposal| request.config.eos_token_ids.contains(&proposal.token))
+            && terminal.is_none()
+            && committed_len + committed_tokens.len() < request.config.max_tokens
         {
             let raw =
                 target_raw.try_index_device((.., accepted as i32, ..), self.streams.target())?;
-            let target = request.sampler.process_logits(
+            let target = sampler.process_logits(
                 &raw,
                 request.config.temperature,
                 &history,
                 self.streams.target(),
             )?;
-            let chosen = request
-                .sampler
+            let chosen = sampler
                 .sample_processed(
                     &target,
                     request.config.temperature,
-                    request.target_prng.as_mut(),
+                    target_prng.as_mut(),
                     self.streams.target(),
                 )?
                 .item::<u32>(self.streams.target());
-            request
-                .sampler
-                .commit_token(&target, chosen, self.streams.target())?;
+            sampler.commit_token(&target, chosen, self.streams.target())?;
             emitted_tail = Some(chosen);
+            committed_tokens.push(chosen);
+            terminal = terminal_after_token(
+                &mut sampler,
+                &mut semantic,
+                chosen,
+                &request.config.eos_token_ids,
+                committed_len + committed_tokens.len(),
+                request.config.max_tokens,
+            )?;
 
             if let Some(branch) = flight.optimistic.take() {
-                let terminal = if request.config.eos_token_ids.contains(&chosen) {
+                let bonus_terminal = if terminal == Some(FinishReason::Eos) {
                     Some(BonusTerminal::Eos)
-                } else if request.output.len() + accepted + 1 == request.config.max_tokens {
+                } else if terminal == Some(FinishReason::MaxTokens) {
                     Some(BonusTerminal::MaxTokens)
                 } else {
                     None
                 };
-                bonus_transition = resolve_optimistic_bonus(
-                    branch,
-                    &history,
-                    chosen,
-                    terminal,
-                    &mut request.stats,
-                )?;
+                if terminal.is_some() && bonus_terminal.is_none() {
+                    discard_optimistic(&mut tentative_stats, Some(branch));
+                } else {
+                    bonus_transition = resolve_optimistic_bonus(
+                        branch,
+                        &history,
+                        chosen,
+                        bonus_terminal,
+                        &mut tentative_stats,
+                    )?;
+                }
             }
         }
 
-        request.stats.accepted_tokens += accepted;
-        request.stats.accept_lens.push(accepted);
-        request.stats.rounds += 1;
+        tentative_stats.accepted_tokens += accepted;
+        tentative_stats.accept_lens.push(accepted);
+        tentative_stats.rounds += 1;
         // The target cache intentionally trails the emitted output by one
         // token: the next verification processes that token as its leading
         // input. A rejection replacement or target bonus is not part of the
@@ -1354,7 +1561,7 @@ where
         let verified_inputs = if emitted_tail.is_some() {
             1 + accepted
         } else {
-            debug_assert_eq!(accepted, proposals.len());
+            debug_assert!(terminal.is_some() || accepted == proposals.len());
             accepted
         };
         let commit = self.backend.commit_verification_with_streams(
@@ -1365,30 +1572,17 @@ where
             verified_inputs,
             self.streams,
         )?;
-        request.stats.target_tokens += commit.replayed_tokens;
+        tentative_stats.target_tokens += commit.replayed_tokens;
         request.target_state = Some(commit.state);
+        request.runtime.sampler = sampler;
+        request.runtime.semantic = semantic;
+        request.runtime.finish_reason = terminal;
+        request.target_prng = target_prng;
+        tentative_stats.emitted_tokens += committed_tokens.len();
+        request.stats = tentative_stats;
+        request.runtime.publish(&committed_tokens)?;
 
-        let mut stopped = false;
-        for token in proposals[..accepted]
-            .iter()
-            .map(|proposal| proposal.token)
-            .chain(emitted_tail)
-        {
-            if request.output.len() == request.config.max_tokens {
-                break;
-            }
-            request.output.push(token);
-            request.stats.emitted_tokens += 1;
-            (request.on_token)(token)?;
-            if request.config.eos_token_ids.contains(&token)
-                || request.output.len() == request.config.max_tokens
-            {
-                stopped = true;
-                break;
-            }
-        }
-
-        if stopped {
+        if terminal.is_some() {
             discard_optimistic(&mut request.stats, flight.optimistic.take());
             request.phase = MtpRequestPhase::Completed;
             request.stats.elapsed = request.started.elapsed();
@@ -1425,6 +1619,35 @@ where
         }
         Ok(())
     }
+}
+
+fn terminal_after_token<S: SpeculativeSampler>(
+    sampler: &mut S,
+    semantic: &mut Option<Box<dyn MtpSemanticState>>,
+    token: u32,
+    eos_token_ids: &[u32],
+    committed_count: usize,
+    max_tokens: usize,
+) -> Result<Option<FinishReason>, Exception> {
+    let stop_matched = semantic
+        .as_mut()
+        .map(|state| state.push_token(token))
+        .transpose()?
+        .unwrap_or(false);
+    let grammar_complete = if stop_matched {
+        false
+    } else {
+        sampler.grammar_is_complete()?
+    };
+    let reason = stop_matched
+        .then_some(FinishReason::StopSequence)
+        .or_else(|| grammar_complete.then_some(FinishReason::GrammarComplete))
+        .or_else(|| eos_token_ids.contains(&token).then_some(FinishReason::Eos))
+        .or_else(|| (committed_count == max_tokens).then_some(FinishReason::MaxTokens));
+    if let (Some(state), Some(reason)) = (semantic, reason) {
+        state.finish(reason)?;
+    }
+    Ok(reason)
 }
 
 fn resolve_optimistic_bonus<D>(
@@ -1758,6 +1981,54 @@ where
     Ok((token_ids, stats))
 }
 
+/// Runs one no-lookahead request with transactional semantic output.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn generate_with_semantics_and_options<B, S, F>(
+    backend: &mut B,
+    cache: &mut B::Cache,
+    input: ModelInput<'_>,
+    config: &MtpConfig,
+    prng_key: Option<Array>,
+    sampler: &mut S,
+    semantic: Box<dyn MtpSemanticState>,
+    streams: MtpExecutionStreams<'_>,
+    options: MtpSchedulerOptions,
+    on_event: F,
+) -> Result<(Vec<u32>, MtpStats, FinishReason), Exception>
+where
+    B: MtpBackend,
+    S: SpeculativeSampler + Clone,
+    F: FnMut(SemanticEvent),
+{
+    let final_sampler;
+    let token_ids;
+    let stats;
+    let finish_reason;
+    {
+        let mut scheduler = MtpScheduler::new(backend, streams, options)?;
+        scheduler.submit_with_semantics(
+            cache,
+            input,
+            config.clone(),
+            prng_key,
+            sampler.clone(),
+            semantic,
+            on_event,
+        )?;
+        scheduler.run()?;
+        let mut output = scheduler.finish()?.requests;
+        let request = output.pop().expect("one request was submitted");
+        final_sampler = request.sampler;
+        token_ids = request.token_ids;
+        stats = request.stats;
+        finish_reason = request.finish_reason.ok_or_else(|| {
+            Exception::custom("completed semantic MTP request has no finish reason")
+        })?;
+    }
+    *sampler = final_sampler;
+    Ok((token_ids, stats, finish_reason))
+}
+
 fn validate_input(input: ModelInput<'_>) -> Result<(), Exception> {
     if input.parts.is_empty() {
         return Err(Exception::custom(
@@ -1847,7 +2118,7 @@ fn sample_residual<S: SpeculativeSampler>(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{cell::RefCell, rc::Rc, sync::Arc};
 
     use safemlx::{Device, DeviceType, ExecutionContext};
 
@@ -1889,6 +2160,69 @@ mod tests {
         ) -> Result<(), Exception> {
             self.committed.push(token);
             Ok(())
+        }
+    }
+
+    #[derive(Clone)]
+    struct GrammarCountingSampler {
+        inner: CountingSampler,
+        complete_after: usize,
+    }
+
+    impl SpeculativeSampler for GrammarCountingSampler {
+        fn process_logits(
+            &mut self,
+            logits: &Array,
+            temperature: f32,
+            history: &[u32],
+            stream: &Stream,
+        ) -> Result<Array, Exception> {
+            self.inner
+                .process_logits(logits, temperature, history, stream)
+        }
+
+        fn commit_token(
+            &mut self,
+            processed_logits: &Array,
+            token: u32,
+            stream: &Stream,
+        ) -> Result<(), Exception> {
+            self.inner.commit_token(processed_logits, token, stream)
+        }
+
+        fn grammar_is_complete(&mut self) -> Result<bool, Exception> {
+            Ok(self.inner.committed.len() >= self.complete_after)
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct TestSemanticState {
+        tokens: Vec<u32>,
+        stop: Vec<u32>,
+        events: Vec<SemanticEvent>,
+    }
+
+    impl MtpSemanticState for TestSemanticState {
+        fn fork_box(&self) -> Result<Box<dyn MtpSemanticState>, Exception> {
+            let mut fork = self.clone();
+            fork.events.clear();
+            Ok(Box::new(fork))
+        }
+
+        fn push_token(&mut self, token: u32) -> Result<bool, Exception> {
+            self.tokens.push(token);
+            self.events
+                .push(SemanticEvent::TextDelta(token.to_string()));
+            Ok(!self.stop.is_empty() && self.tokens.ends_with(&self.stop))
+        }
+
+        fn finish(&mut self, reason: FinishReason) -> Result<(), Exception> {
+            self.events.push(SemanticEvent::Finished { reason });
+            Ok(())
+        }
+
+        fn take_events(&mut self) -> Vec<SemanticEvent> {
+            std::mem::take(&mut self.events)
         }
     }
 
@@ -2100,6 +2434,362 @@ mod tests {
                 replayed_tokens: 0,
             })
         }
+    }
+
+    struct CommitFailBackend {
+        inner: ScriptedBackend,
+    }
+
+    impl MtpBackend for CommitFailBackend {
+        type Cache = usize;
+        type TargetState = ();
+        type DraftState = ScriptedDraftState;
+        type CacheCheckpoint = usize;
+        type Verification = Array;
+
+        fn max_draft_tokens(&self) -> usize {
+            self.inner.max_draft_tokens()
+        }
+
+        fn prefill(
+            &mut self,
+            input: ModelInput<'_>,
+            cache: &mut Self::Cache,
+            stream: &Stream,
+        ) -> Result<MtpPrefill<Self::TargetState>, Exception> {
+            self.inner.prefill(input, cache, stream)
+        }
+
+        fn begin_draft(
+            &mut self,
+            state: &Self::TargetState,
+            last_token: u32,
+            stream: &Stream,
+        ) -> Result<Self::DraftState, Exception> {
+            self.inner.begin_draft(state, last_token, stream)
+        }
+
+        fn draft_logits(
+            &mut self,
+            state: &mut Self::DraftState,
+            last_token: u32,
+            stream: &Stream,
+        ) -> Result<Array, Exception> {
+            self.inner.draft_logits(state, last_token, stream)
+        }
+
+        fn checkpoint(cache: &Self::Cache) -> Self::CacheCheckpoint {
+            *cache
+        }
+
+        fn verify(
+            &mut self,
+            input_tokens: &Array,
+            cache: &mut Self::Cache,
+            stream: &Stream,
+        ) -> Result<Self::Verification, Exception> {
+            self.inner.verify(input_tokens, cache, stream)
+        }
+
+        fn verification_logits(output: &Self::Verification) -> &Array {
+            output
+        }
+
+        fn commit_verification(
+            &mut self,
+            _output: Self::Verification,
+            _draft_state: Self::DraftState,
+            _cache: &mut Self::Cache,
+            _checkpoint: Self::CacheCheckpoint,
+            _verified_inputs: usize,
+            _stream: &Stream,
+        ) -> Result<MtpCommit<Self::TargetState>, Exception> {
+            Err(Exception::custom("injected commit failure"))
+        }
+    }
+
+    fn scripted_backend() -> ScriptedBackend {
+        ScriptedBackend {
+            first_token: 1,
+            rejection_token: 1,
+            reject_first: false,
+            accept_second: true,
+            bonus_token: 1,
+            routes: Vec::new(),
+            draft_storage: Vec::new(),
+        }
+    }
+
+    #[test]
+    #[ignore = "requires an MLX Metal device"]
+    fn semantic_stop_spanning_tokens_truncates_an_accepted_block_transactionally() {
+        let context = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
+        let stream = context.stream();
+        let prompt = Array::from_slice(&[7u32], &[1, 1]);
+        let parts = [InputPart::text_token_ids(&prompt)];
+        let mut cache = 0;
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let callback_events = Rc::clone(&events);
+        let mut backend = scripted_backend();
+        let mut scheduler = MtpScheduler::new(
+            &mut backend,
+            MtpExecutionStreams::single(stream),
+            MtpSchedulerOptions::default().with_lookahead(false),
+        )
+        .unwrap();
+        scheduler
+            .submit_with_semantics(
+                &mut cache,
+                ModelInput::new(&parts),
+                MtpConfig {
+                    max_tokens: 6,
+                    max_draft_tokens: 2,
+                    temperature: 0.0,
+                    eos_token_ids: Vec::new(),
+                },
+                None,
+                CountingSampler::default(),
+                Box::new(TestSemanticState {
+                    stop: vec![1, 2],
+                    ..TestSemanticState::default()
+                }),
+                move |event| callback_events.borrow_mut().push(event),
+            )
+            .unwrap();
+        scheduler.run().unwrap();
+        let request = scheduler.finish().unwrap().requests.pop().unwrap();
+
+        assert_eq!(request.token_ids, vec![1, 2]);
+        assert_eq!(request.finish_reason, Some(FinishReason::StopSequence));
+        assert_eq!(request.stats.accept_lens, vec![1]);
+        assert_eq!(request.sampler.process_calls, 2);
+        assert_eq!(cache, 2);
+        assert_eq!(
+            events.borrow().last(),
+            Some(&SemanticEvent::Finished {
+                reason: FinishReason::StopSequence
+            })
+        );
+    }
+
+    #[test]
+    #[ignore = "requires an MLX Metal device"]
+    fn grammar_completion_mid_block_matches_the_committed_prefix() {
+        let context = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
+        let stream = context.stream();
+        let prompt = Array::from_slice(&[7u32], &[1, 1]);
+        let parts = [InputPart::text_token_ids(&prompt)];
+        let mut cache = 0;
+        let mut backend = scripted_backend();
+        let mut scheduler = MtpScheduler::new(
+            &mut backend,
+            MtpExecutionStreams::single(stream),
+            MtpSchedulerOptions::default().with_lookahead(false),
+        )
+        .unwrap();
+        scheduler
+            .submit_with_semantics(
+                &mut cache,
+                ModelInput::new(&parts),
+                MtpConfig {
+                    max_tokens: 6,
+                    max_draft_tokens: 2,
+                    temperature: 0.0,
+                    eos_token_ids: Vec::new(),
+                },
+                None,
+                GrammarCountingSampler {
+                    inner: CountingSampler::default(),
+                    complete_after: 2,
+                },
+                Box::new(TestSemanticState::default()),
+                |_| {},
+            )
+            .unwrap();
+        scheduler.run().unwrap();
+        let request = scheduler.finish().unwrap().requests.pop().unwrap();
+
+        assert_eq!(request.token_ids, vec![1, 2]);
+        assert_eq!(request.finish_reason, Some(FinishReason::GrammarComplete));
+        assert_eq!(request.sampler.inner.process_calls, 2);
+        assert_eq!(request.sampler.inner.committed, request.token_ids);
+        assert_eq!(cache, 2);
+
+        let mut ordinary = GrammarCountingSampler {
+            inner: CountingSampler::default(),
+            complete_after: 2,
+        };
+        let mut ordinary_tokens = Vec::new();
+        for expected in [1u32, 2, 0] {
+            let mut values = [0.0f32; 3];
+            values[expected as usize] = 10.0;
+            let logits = Array::from_slice(&values, &[1, 3]);
+            let processed = ordinary
+                .process_logits(&logits, 0.0, &ordinary_tokens, stream)
+                .unwrap();
+            let chosen = ordinary
+                .sample_processed(&processed, 0.0, None, stream)
+                .unwrap()
+                .item::<u32>(stream);
+            ordinary.commit_token(&processed, chosen, stream).unwrap();
+            ordinary_tokens.push(chosen);
+            if ordinary.grammar_is_complete().unwrap() {
+                break;
+            }
+        }
+        assert_eq!(request.token_ids, ordinary_tokens);
+    }
+
+    #[test]
+    #[ignore = "requires an MLX Metal device"]
+    fn no_lookahead_full_acceptance_bonus_eos_and_max_tokens_use_safe_boundaries() {
+        fn run(
+            max_tokens: usize,
+            eos_token_ids: Vec<u32>,
+        ) -> (Vec<u32>, FinishReason, MtpStats, usize) {
+            let context = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
+            let stream = context.stream();
+            let prompt = Array::from_slice(&[7u32], &[1, 1]);
+            let parts = [InputPart::text_token_ids(&prompt)];
+            let mut cache = 0;
+            let mut backend = scripted_backend();
+            let mut scheduler = MtpScheduler::new(
+                &mut backend,
+                MtpExecutionStreams::single(stream),
+                MtpSchedulerOptions::default().with_lookahead(false),
+            )
+            .unwrap();
+            scheduler
+                .submit_with_semantics(
+                    &mut cache,
+                    ModelInput::new(&parts),
+                    MtpConfig {
+                        max_tokens,
+                        max_draft_tokens: 2,
+                        temperature: 0.0,
+                        eos_token_ids,
+                    },
+                    None,
+                    CountingSampler::default(),
+                    Box::new(TestSemanticState::default()),
+                    |_| {},
+                )
+                .unwrap();
+            scheduler.run().unwrap();
+            let request = scheduler.finish().unwrap().requests.pop().unwrap();
+            (
+                request.token_ids,
+                request.finish_reason.unwrap(),
+                request.stats,
+                cache,
+            )
+        }
+
+        let eos = run(6, vec![2]);
+        assert_eq!(eos.0, vec![1, 2]);
+        assert_eq!(eos.1, FinishReason::Eos);
+        assert_eq!(eos.2.accept_lens, vec![1]);
+        assert_eq!(eos.3, 2);
+
+        let max = run(2, Vec::new());
+        assert_eq!(max.0, vec![1, 2]);
+        assert_eq!(max.1, FinishReason::MaxTokens);
+        assert_eq!(max.2.accept_lens, vec![1]);
+        assert_eq!(max.3, 2);
+
+        let bonus = run(4, Vec::new());
+        assert_eq!(bonus.0, vec![1, 2, 0, 1]);
+        assert_eq!(bonus.1, FinishReason::MaxTokens);
+        assert_eq!(bonus.2.accept_lens, vec![2]);
+        assert_eq!(bonus.2.accepted_tokens, 2);
+        assert_eq!(bonus.3, 4);
+    }
+
+    #[test]
+    #[ignore = "requires an MLX Metal device"]
+    fn no_lookahead_residual_replacement_commits_only_the_replacement() {
+        let context = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
+        let stream = context.stream();
+        let prompt = Array::from_slice(&[7u32], &[1, 1]);
+        let parts = [InputPart::text_token_ids(&prompt)];
+        let mut cache = 0;
+        let mut backend = scripted_backend();
+        backend.reject_first = true;
+        let mut scheduler = MtpScheduler::new(
+            &mut backend,
+            MtpExecutionStreams::single(stream),
+            MtpSchedulerOptions::default().with_lookahead(false),
+        )
+        .unwrap();
+        scheduler
+            .submit_with_semantics(
+                &mut cache,
+                ModelInput::new(&parts),
+                MtpConfig {
+                    max_tokens: 2,
+                    max_draft_tokens: 2,
+                    temperature: 1.0,
+                    eos_token_ids: Vec::new(),
+                },
+                Some(safemlx::random::key(11).unwrap()),
+                CountingSampler::default(),
+                Box::new(TestSemanticState::default()),
+                |_| {},
+            )
+            .unwrap();
+        scheduler.run().unwrap();
+        let request = scheduler.finish().unwrap().requests.pop().unwrap();
+
+        assert_eq!(request.token_ids, vec![1, 1]);
+        assert_eq!(request.finish_reason, Some(FinishReason::MaxTokens));
+        assert_eq!(request.stats.accept_lens, vec![0]);
+        assert_eq!(request.sampler.committed, request.token_ids);
+        assert_eq!(cache, 2);
+    }
+
+    #[test]
+    #[ignore = "requires an MLX Metal device"]
+    fn commit_failure_does_not_publish_or_advance_canonical_output_state() {
+        let context = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
+        let stream = context.stream();
+        let prompt = Array::from_slice(&[7u32], &[1, 1]);
+        let parts = [InputPart::text_token_ids(&prompt)];
+        let mut cache = 0;
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let callback_events = Rc::clone(&events);
+        let mut backend = CommitFailBackend {
+            inner: scripted_backend(),
+        };
+        let mut scheduler = MtpScheduler::new(
+            &mut backend,
+            MtpExecutionStreams::single(stream),
+            MtpSchedulerOptions::default().with_lookahead(false),
+        )
+        .unwrap();
+        let id = scheduler
+            .submit_with_semantics(
+                &mut cache,
+                ModelInput::new(&parts),
+                MtpConfig {
+                    max_tokens: 6,
+                    max_draft_tokens: 2,
+                    temperature: 0.0,
+                    eos_token_ids: Vec::new(),
+                },
+                None,
+                CountingSampler::default(),
+                Box::new(TestSemanticState::default()),
+                move |event| callback_events.borrow_mut().push(event),
+            )
+            .unwrap();
+        let published_after_prefill = events.borrow().len();
+        assert!(scheduler.run().is_err());
+        let request = &scheduler.requests[id.index()];
+
+        assert_eq!(events.borrow().len(), published_after_prefill);
+        assert_eq!(request.runtime.token_ids, vec![1]);
+        assert_eq!(request.runtime.sampler.committed, vec![1]);
+        assert_eq!(request.runtime.sampler.process_calls, 1);
     }
 
     #[test]
@@ -2593,7 +3283,7 @@ mod tests {
         }
 
         let request = &scheduler.requests[id.index()];
-        assert_eq!(request.output, vec![1, 2, 0, 0]);
+        assert_eq!(request.runtime.token_ids, vec![1, 2, 0, 0]);
         assert_eq!(request.phase, MtpRequestPhase::ReadyToDraft);
         let retained = request.block.as_ref().unwrap();
         assert_eq!(retained.proposals.len(), 1);

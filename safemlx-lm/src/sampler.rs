@@ -35,6 +35,16 @@ pub trait SpeculativeSampler {
         false
     }
 
+    /// Returns whether a committed generation grammar accepts the current
+    /// logical prefix.
+    ///
+    /// Unconstrained samplers keep the default `false`. Constraint-aware
+    /// wrappers override this so speculative schedulers can stop at the same
+    /// committed token as ordinary generation.
+    fn grammar_is_complete(&mut self) -> Result<bool, Exception> {
+        Ok(false)
+    }
+
     /// Applies penalties, filters, and temperature using the supplied logical
     /// token history, returning canonical-vocabulary logits.
     fn process_logits(
@@ -341,6 +351,10 @@ impl<S: Clone> ConstrainedSampler<S> {
 impl<S: SpeculativeSampler + Clone> SpeculativeSampler for ConstrainedSampler<S> {
     fn supports_exact_optimistic_promotion(&self) -> bool {
         self.policy.supports_exact_optimistic_promotion()
+    }
+
+    fn grammar_is_complete(&mut self) -> Result<bool, Exception> {
+        ConstrainedSampler::grammar_is_complete(self)
     }
 
     fn process_logits(

@@ -51,7 +51,7 @@ use crate::{
     layerwise::{LayerExecutionLoadOptions, WeightResidency},
     mtp::{
         LoadedDrafter, MtpBatchOutput, MtpCache, MtpCapability, MtpCheckpointKind, MtpConfig,
-        MtpExecutionStreams, MtpScheduler, MtpSchedulerOptions, MtpStats,
+        MtpExecutionStreams, MtpScheduler, MtpSchedulerOptions, MtpSemanticState, MtpStats,
     },
 };
 
@@ -722,6 +722,66 @@ impl Model {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn generate_mtp_input_with_semantics_and_options<S, F>(
+        &mut self,
+        drafter: &mut LoadedDrafter,
+        cache: &mut ModelCache,
+        input: input::ModelInput<'_>,
+        config: &MtpConfig,
+        prng_key: Option<Array>,
+        sampler: &mut S,
+        semantic: Box<dyn MtpSemanticState>,
+        streams: MtpExecutionStreams<'_>,
+        scheduler_options: MtpSchedulerOptions,
+        on_event: F,
+    ) -> Result<(Vec<u32>, MtpStats, FinishReason), Exception>
+    where
+        S: SpeculativeSampler + Clone,
+        F: FnMut(SemanticEvent),
+    {
+        let assistant = drafter.gemma4_mut();
+        match (self, cache) {
+            (Self::Gemma4(target), ModelCache::Gemma4(cache)) => {
+                validate_gemma4_drafter(&target.args, assistant)?;
+                crate::gemma4_mtp::generate_with_semantics_and_options(
+                    target,
+                    assistant,
+                    cache,
+                    input,
+                    config,
+                    prng_key,
+                    sampler,
+                    semantic,
+                    streams,
+                    scheduler_options,
+                    on_event,
+                )
+            }
+            (Self::Gemma4Layerwise(target), ModelCache::Gemma4(cache)) => {
+                validate_gemma4_drafter(target.args(), assistant)?;
+                crate::gemma4_mtp::generate_with_semantics_and_options(
+                    target,
+                    assistant,
+                    cache,
+                    input,
+                    config,
+                    prng_key,
+                    sampler,
+                    semantic,
+                    streams,
+                    scheduler_options,
+                    on_event,
+                )
+            }
+            (model, _) => Err(Exception::custom(format!(
+                "MTP runtime adapter is unavailable for model type {} ({:?})",
+                model.model_type(),
+                model.mtp_capability()
+            ))),
+        }
+    }
+
     /// Generates with MTP weights embedded in the target checkpoint.
     pub fn generate_embedded_mtp_input(
         &mut self,
@@ -789,6 +849,62 @@ impl Model {
             | (Self::Qwen35MoeLayerwise(target), ModelCache::Qwen35Moe(cache)) => {
                 crate::qwen_mtp::generate_with_callback(
                     target, cache, input, config, prng_key, sampler, stream, on_token,
+                )
+            }
+            (model, _) => Err(Exception::custom(format!(
+                "embedded MTP runtime adapter is unavailable for model type {} ({:?})",
+                model.model_type(),
+                model.mtp_capability()
+            ))),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn generate_embedded_mtp_input_with_semantics_and_options<S, F>(
+        &mut self,
+        cache: &mut ModelCache,
+        input: input::ModelInput<'_>,
+        config: &MtpConfig,
+        prng_key: Option<Array>,
+        sampler: &mut S,
+        semantic: Box<dyn MtpSemanticState>,
+        stream: &Stream,
+        scheduler_options: MtpSchedulerOptions,
+        on_event: F,
+    ) -> Result<(Vec<u32>, MtpStats, FinishReason), Exception>
+    where
+        S: SpeculativeSampler + Clone,
+        F: FnMut(SemanticEvent),
+    {
+        match (self, cache) {
+            (Self::Qwen3Next(target), ModelCache::Qwen3Next(cache))
+            | (Self::Qwen35Moe(target), ModelCache::Qwen35Moe(cache)) => {
+                crate::qwen_mtp::generate_with_semantics_and_options(
+                    target,
+                    cache,
+                    input,
+                    config,
+                    prng_key,
+                    sampler,
+                    semantic,
+                    stream,
+                    scheduler_options,
+                    on_event,
+                )
+            }
+            (Self::Qwen3NextLayerwise(target), ModelCache::Qwen3Next(cache))
+            | (Self::Qwen35MoeLayerwise(target), ModelCache::Qwen35Moe(cache)) => {
+                crate::qwen_mtp::generate_with_semantics_and_options(
+                    target,
+                    cache,
+                    input,
+                    config,
+                    prng_key,
+                    sampler,
+                    semantic,
+                    stream,
+                    scheduler_options,
+                    on_event,
                 )
             }
             (model, _) => Err(Exception::custom(format!(
@@ -1854,6 +1970,7 @@ where
 ///
 /// Unlike decoding each token independently, this preserves tokenizer context
 /// and buffers incomplete byte-fallback sequences until they form valid text.
+#[derive(Clone)]
 pub struct TextDecoder {
     tokenizer: Tokenizer,
     skip_special_tokens: bool,
@@ -1928,6 +2045,79 @@ pub struct PreparedChatGenerationOutput {
     pub finish_reason: FinishReason,
 }
 
+/// MTP-specific controls for one prepared-chat request.
+#[derive(Debug, Clone, Copy)]
+pub struct PreparedChatMtpGenerationOptions {
+    /// Maximum assistant proposals verified in one target block.
+    pub max_draft_tokens: NonZeroUsize,
+    /// Canonical scheduler controls. Semantic generation requires lookahead to
+    /// remain disabled.
+    pub scheduler: MtpSchedulerOptions,
+}
+
+impl Default for PreparedChatMtpGenerationOptions {
+    fn default() -> Self {
+        Self {
+            max_draft_tokens: NonZeroUsize::new(4).expect("4 is non-zero"),
+            scheduler: MtpSchedulerOptions::default().with_lookahead(false),
+        }
+    }
+}
+
+/// One external-assistant MTP response from a [`PreparedChat`].
+pub struct PreparedChatMtpGenerationRequest<'a, S, F> {
+    /// Prepared prompt and embedded format/runtime plan.
+    pub prepared_chat: &'a PreparedChat,
+    /// Separate target-compatible draft model.
+    pub drafter: &'a mut LoadedDrafter,
+    /// Architecture-matched target cache.
+    pub cache: &'a mut ModelCache,
+    /// Caller-selected base sampling policy.
+    pub sampling_policy: S,
+    /// Temperature, token limit, and optional random state.
+    pub settings: PreparedChatGenerationSettings,
+    /// Proposal-block and scheduler controls.
+    pub options: PreparedChatMtpGenerationOptions,
+    /// Additional decoded text sequences that terminate generation.
+    pub caller_stop_sequences: &'a [String],
+    /// Target and draft execution streams.
+    pub streams: MtpExecutionStreams<'a>,
+    /// Called synchronously for each event after its cache transaction commits.
+    pub on_event: F,
+}
+
+/// One embedded-head MTP response from a [`PreparedChat`].
+pub struct PreparedChatEmbeddedMtpGenerationRequest<'a, S, F> {
+    /// Prepared prompt and embedded format/runtime plan.
+    pub prepared_chat: &'a PreparedChat,
+    /// Architecture-matched target and embedded-MTP cache.
+    pub cache: &'a mut ModelCache,
+    /// Caller-selected base sampling policy.
+    pub sampling_policy: S,
+    /// Temperature, token limit, and optional random state.
+    pub settings: PreparedChatGenerationSettings,
+    /// Proposal-block and scheduler controls.
+    pub options: PreparedChatMtpGenerationOptions,
+    /// Additional decoded text sequences that terminate generation.
+    pub caller_stop_sequences: &'a [String],
+    /// MLX stream used for target and embedded-head work.
+    pub stream: &'a Stream,
+    /// Called synchronously for each event after its cache transaction commits.
+    pub on_event: F,
+}
+
+/// Terminal metadata and speculative statistics for prepared-chat MTP.
+#[derive(Debug, Clone)]
+pub struct PreparedChatMtpGenerationOutput {
+    /// Every committed generated tokenizer id, including a terminal EOS id.
+    pub token_ids: Vec<u32>,
+    /// Deterministically selected terminal condition.
+    pub finish_reason: FinishReason,
+    /// Per-request speculative decoding statistics.
+    pub stats: MtpStats,
+}
+
+#[derive(Clone)]
 struct PreparedChatTokenDecoder {
     decoder: TextDecoder,
     structural_tokens: HashMap<u32, String>,
@@ -1975,6 +2165,90 @@ struct PreparedChatRuntime<S> {
     sampler: ConstrainedSampler<S>,
     parser: crate::streaming::ToolRuntimeParser,
     structural_tokens: HashMap<u32, String>,
+}
+
+struct PreparedChatSemanticState {
+    initial_decoder: PreparedChatTokenDecoder,
+    plan: ToolRuntimePlan,
+    caller_stop_sequences: Vec<String>,
+    pipeline: CommittedTokenPipeline<PreparedChatTokenDecoder>,
+    token_ids: Vec<u32>,
+    events: Vec<SemanticEvent>,
+}
+
+impl PreparedChatSemanticState {
+    fn new(
+        initial_decoder: PreparedChatTokenDecoder,
+        plan: ToolRuntimePlan,
+        caller_stop_sequences: &[String],
+    ) -> Result<Self, Exception> {
+        let pipeline = Self::build_pipeline(initial_decoder.clone(), &plan, caller_stop_sequences)?;
+        Ok(Self {
+            initial_decoder,
+            plan,
+            caller_stop_sequences: caller_stop_sequences.to_vec(),
+            pipeline,
+            token_ids: Vec::new(),
+            events: Vec::new(),
+        })
+    }
+
+    fn build_pipeline(
+        decoder: PreparedChatTokenDecoder,
+        plan: &ToolRuntimePlan,
+        caller_stop_sequences: &[String],
+    ) -> Result<CommittedTokenPipeline<PreparedChatTokenDecoder>, Exception> {
+        let parser = plan
+            .create_parser_with_stops(caller_stop_sequences.iter().map(String::as_str))
+            .map_err(Exception::custom)?;
+        let structural_token_ids = plan.structural_token_ids().collect::<Vec<_>>();
+        Ok(CommittedTokenPipeline::new(
+            RawTokenDecoder::new(decoder, structural_token_ids),
+            parser,
+        ))
+    }
+}
+
+impl MtpSemanticState for PreparedChatSemanticState {
+    fn fork_box(&self) -> Result<Box<dyn MtpSemanticState>, Exception> {
+        let mut pipeline = Self::build_pipeline(
+            self.initial_decoder.clone(),
+            &self.plan,
+            &self.caller_stop_sequences,
+        )?;
+        for &token in &self.token_ids {
+            pipeline
+                .push(token, &mut |_| {})
+                .map_err(Exception::custom)?;
+        }
+        Ok(Box::new(Self {
+            initial_decoder: self.initial_decoder.clone(),
+            plan: self.plan.clone(),
+            caller_stop_sequences: self.caller_stop_sequences.clone(),
+            pipeline,
+            token_ids: self.token_ids.clone(),
+            events: Vec::new(),
+        }))
+    }
+
+    fn push_token(&mut self, token: u32) -> Result<bool, Exception> {
+        let matched = self
+            .pipeline
+            .push(token, &mut |event| self.events.push(event))
+            .map_err(Exception::custom)?;
+        self.token_ids.push(token);
+        Ok(matched)
+    }
+
+    fn finish(&mut self, reason: FinishReason) -> Result<(), Exception> {
+        self.pipeline
+            .finish(reason, &mut |event| self.events.push(event))
+            .map_err(Exception::custom)
+    }
+
+    fn take_events(&mut self) -> Vec<SemanticEvent> {
+        std::mem::take(&mut self.events)
+    }
 }
 
 fn with_prepared_chat_runtime<S, R>(
@@ -2384,6 +2658,167 @@ impl LoadedModel {
                 Ok(PreparedChatGenerationOutput {
                     token_ids,
                     finish_reason,
+                })
+            },
+        )
+    }
+
+    /// Generates one structured response with an external MTP assistant.
+    ///
+    /// Target verification, constrained-sampler state, decoded stop matching,
+    /// protocol parsing, and event publication share one committed prefix.
+    /// Optimistic same-request lookahead is intentionally rejected by this
+    /// correctness-first API.
+    pub fn generate_prepared_chat_mtp<S, F>(
+        &mut self,
+        request: PreparedChatMtpGenerationRequest<'_, S, F>,
+    ) -> Result<PreparedChatMtpGenerationOutput, Error>
+    where
+        S: SpeculativeSampler + Clone,
+        F: FnMut(SemanticEvent),
+    {
+        let PreparedChatMtpGenerationRequest {
+            prepared_chat,
+            drafter,
+            cache,
+            sampling_policy,
+            settings,
+            options,
+            caller_stop_sequences,
+            streams,
+            on_event,
+        } = request;
+        if options.scheduler.lookahead_blocks != 0 {
+            return Err(Error::PreparedChatGeneration(
+                "prepared-chat MTP requires optimistic lookahead to be disabled".into(),
+            ));
+        }
+        let plan = match prepared_chat.native_tool_support() {
+            NativeToolSupport::Supported(plan) => plan.clone(),
+            NativeToolSupport::Unsupported { reason } => {
+                return Err(Error::PreparedChatGeneration(format!(
+                    "prepared chat does not have an executable native tool plan: {reason}"
+                )));
+            }
+        };
+        with_prepared_chat_runtime(
+            prepared_chat,
+            sampling_policy,
+            caller_stop_sequences,
+            |runtime| {
+                let decoder = PreparedChatTokenDecoder {
+                    decoder: self.text_decoder(true),
+                    structural_tokens: runtime.structural_tokens,
+                };
+                let semantic = PreparedChatSemanticState::new(decoder, plan, caller_stop_sequences)
+                    .map_err(|error| Error::PreparedChatGeneration(error.to_string()))?;
+                let prompt =
+                    self.encode_to_array(prepared_chat.rendered_prompt(), false, streams.target())?;
+                let parts = [input::InputPart::text_token_ids(&prompt)];
+                let input = input::ModelInput::new(&parts);
+                let config = MtpConfig {
+                    max_tokens: settings.max_tokens.get(),
+                    max_draft_tokens: options.max_draft_tokens.get(),
+                    temperature: settings.temperature,
+                    eos_token_ids: prepared_chat.eos_token_ids().to_vec(),
+                };
+                let mut sampler = runtime.sampler;
+                let (token_ids, stats, finish_reason) = self
+                    .model
+                    .generate_mtp_input_with_semantics_and_options(
+                        drafter,
+                        cache,
+                        input,
+                        &config,
+                        settings.prng_key,
+                        &mut sampler,
+                        Box::new(semantic),
+                        streams,
+                        options.scheduler,
+                        on_event,
+                    )
+                    .map_err(|error| Error::PreparedChatGeneration(error.to_string()))?;
+                Ok(PreparedChatMtpGenerationOutput {
+                    token_ids,
+                    finish_reason,
+                    stats,
+                })
+            },
+        )
+    }
+
+    /// Generates one structured response with checkpoint-embedded MTP heads.
+    pub fn generate_prepared_chat_embedded_mtp<S, F>(
+        &mut self,
+        request: PreparedChatEmbeddedMtpGenerationRequest<'_, S, F>,
+    ) -> Result<PreparedChatMtpGenerationOutput, Error>
+    where
+        S: SpeculativeSampler + Clone,
+        F: FnMut(SemanticEvent),
+    {
+        let PreparedChatEmbeddedMtpGenerationRequest {
+            prepared_chat,
+            cache,
+            sampling_policy,
+            settings,
+            options,
+            caller_stop_sequences,
+            stream,
+            on_event,
+        } = request;
+        if options.scheduler.lookahead_blocks != 0 {
+            return Err(Error::PreparedChatGeneration(
+                "prepared-chat MTP requires optimistic lookahead to be disabled".into(),
+            ));
+        }
+        let plan = match prepared_chat.native_tool_support() {
+            NativeToolSupport::Supported(plan) => plan.clone(),
+            NativeToolSupport::Unsupported { reason } => {
+                return Err(Error::PreparedChatGeneration(format!(
+                    "prepared chat does not have an executable native tool plan: {reason}"
+                )));
+            }
+        };
+        with_prepared_chat_runtime(
+            prepared_chat,
+            sampling_policy,
+            caller_stop_sequences,
+            |runtime| {
+                let decoder = PreparedChatTokenDecoder {
+                    decoder: self.text_decoder(true),
+                    structural_tokens: runtime.structural_tokens,
+                };
+                let semantic = PreparedChatSemanticState::new(decoder, plan, caller_stop_sequences)
+                    .map_err(|error| Error::PreparedChatGeneration(error.to_string()))?;
+                let prompt =
+                    self.encode_to_array(prepared_chat.rendered_prompt(), false, stream)?;
+                let parts = [input::InputPart::text_token_ids(&prompt)];
+                let input = input::ModelInput::new(&parts);
+                let config = MtpConfig {
+                    max_tokens: settings.max_tokens.get(),
+                    max_draft_tokens: options.max_draft_tokens.get(),
+                    temperature: settings.temperature,
+                    eos_token_ids: prepared_chat.eos_token_ids().to_vec(),
+                };
+                let mut sampler = runtime.sampler;
+                let (token_ids, stats, finish_reason) = self
+                    .model
+                    .generate_embedded_mtp_input_with_semantics_and_options(
+                        cache,
+                        input,
+                        &config,
+                        settings.prng_key,
+                        &mut sampler,
+                        Box::new(semantic),
+                        stream,
+                        options.scheduler,
+                        on_event,
+                    )
+                    .map_err(|error| Error::PreparedChatGeneration(error.to_string()))?;
+                Ok(PreparedChatMtpGenerationOutput {
+                    token_ids,
+                    finish_reason,
+                    stats,
                 })
             },
         )

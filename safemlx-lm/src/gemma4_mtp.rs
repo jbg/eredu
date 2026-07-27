@@ -13,9 +13,10 @@ use crate::{
     },
     mtp::{
         self, MtpBackend, MtpCommit, MtpConfig, MtpExecutionStreams, MtpPrefill,
-        MtpSchedulerOptions,
+        MtpSchedulerOptions, MtpSemanticState,
     },
     sampler::SpeculativeSampler,
+    streaming::{FinishReason, SemanticEvent},
 };
 
 #[derive(Clone)]
@@ -412,6 +413,40 @@ where
         streams,
         options,
         on_token,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn generate_with_semantics_and_options<T, S, F>(
+    target: &mut T,
+    assistant: &mut Gemma4AssistantDraftModel,
+    cache: &mut Cache,
+    input: RuntimeInput<'_>,
+    config: &MtpConfig,
+    prng_key: Option<Array>,
+    sampler: &mut S,
+    semantic: Box<dyn MtpSemanticState>,
+    streams: MtpExecutionStreams<'_>,
+    options: MtpSchedulerOptions,
+    on_event: F,
+) -> Result<(Vec<u32>, mtp::MtpStats, FinishReason), Exception>
+where
+    T: Gemma4MtpTarget,
+    S: SpeculativeSampler + Clone,
+    F: FnMut(SemanticEvent),
+{
+    let mut backend = Gemma4MtpBackend::new(target, assistant);
+    mtp::generate_with_semantics_and_options(
+        &mut backend,
+        cache,
+        input,
+        config,
+        prng_key,
+        sampler,
+        semantic,
+        streams,
+        options,
+        on_event,
     )
 }
 
