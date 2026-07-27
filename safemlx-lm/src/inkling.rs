@@ -120,8 +120,14 @@ impl InklingLayerwiseModel {
         cache: &mut Cache,
         stream: &Stream,
     ) -> Result<Array, Error> {
-        self.execution
-            .forward(InklingInput::Decode(inputs), cache, stream)
+        self.execution.forward(
+            InklingExecutionInput {
+                input: InklingInput::Decode(inputs),
+                last_token_only: false,
+            },
+            cache,
+            stream,
+        )
     }
 
     /// Clears temporary vision and decoder blocks from the execution device.
@@ -138,9 +144,15 @@ impl CausalLm<Cache> for InklingLayerwiseModel {
         stream: &Stream,
     ) -> Result<Array, Exception> {
         self.execution
-            .forward(InklingInput::Prefill(input), cache, stream)
-            .map_err(|error| Exception::custom(error.to_string()))?
-            .try_index_device((.., -1, ..), stream)
+            .forward(
+                InklingExecutionInput {
+                    input: InklingInput::Prefill(input),
+                    last_token_only: true,
+                },
+                cache,
+                stream,
+            )
+            .map_err(|error| Exception::custom(error.to_string()))
     }
 
     fn decode_logits(
@@ -149,9 +161,16 @@ impl CausalLm<Cache> for InklingLayerwiseModel {
         cache: &mut Cache,
         stream: &Stream,
     ) -> Result<Array, Exception> {
-        self.forward(input_tokens, cache, stream)
-            .map_err(|error| Exception::custom(error.to_string()))?
-            .try_index_device((.., -1, ..), stream)
+        self.execution
+            .forward(
+                InklingExecutionInput {
+                    input: InklingInput::Decode(input_tokens),
+                    last_token_only: true,
+                },
+                cache,
+                stream,
+            )
+            .map_err(|error| Exception::custom(error.to_string()))
     }
 }
 
@@ -426,6 +445,11 @@ pub enum InklingInput<'a> {
     Decode(&'a Array),
 }
 
+struct InklingExecutionInput<'a> {
+    input: InklingInput<'a>,
+    last_token_only: bool,
+}
+
 enum PreparedPart {
     Ready { tokens: Array, embeddings: Array },
     Vision { tokens: Array, job: usize },
@@ -440,6 +464,7 @@ struct InklingForwardContext {
     parts: Vec<PreparedPart>,
     vision_jobs: Vec<VisionJob>,
     needs_assembly: bool,
+    last_token_only: bool,
 }
 
 /// One leased Inkling hMLP or decoder unit.
@@ -564,7 +589,7 @@ fn inkling_w13_recipe(
 }
 
 impl GeneralLayerwiseModelAdapter for InklingLayerwiseAdapter {
-    type Input<'a> = InklingInput<'a>;
+    type Input<'a> = InklingExecutionInput<'a>;
     type Cache = Cache;
     type Layer = InklingLayer;
     type ForwardContext = InklingForwardContext;
@@ -677,6 +702,10 @@ impl GeneralLayerwiseModelAdapter for InklingLayerwiseAdapter {
         _cache: &mut Self::Cache,
         stream: &Stream,
     ) -> Result<LayerwiseForwardState<Self::ForwardContext>, Error> {
+        let InklingExecutionInput {
+            input,
+            last_token_only,
+        } = input;
         if let InklingInput::Decode(tokens) = input {
             let hidden = self
                 .embed_norm
@@ -687,6 +716,7 @@ impl GeneralLayerwiseModelAdapter for InklingLayerwiseAdapter {
                     parts: Vec::new(),
                     vision_jobs: Vec::new(),
                     needs_assembly: false,
+                    last_token_only,
                 },
             });
         }
@@ -798,6 +828,7 @@ impl GeneralLayerwiseModelAdapter for InklingLayerwiseAdapter {
                     parts,
                     vision_jobs,
                     needs_assembly: false,
+                    last_token_only,
                 },
             });
         }
@@ -819,6 +850,7 @@ impl GeneralLayerwiseModelAdapter for InklingLayerwiseAdapter {
                 parts,
                 vision_jobs,
                 needs_assembly: true,
+                last_token_only,
             },
         })
     }
@@ -1114,17 +1146,29 @@ impl GeneralLayerwiseModelAdapter for InklingLayerwiseAdapter {
         &mut self,
         hidden: &Array,
         _cache: &mut Self::Cache,
-        _context: &Self::ForwardContext,
+        context: &Self::ForwardContext,
         stream: &Stream,
     ) -> Result<Array, Error> {
-        let hidden = self.norm.forward(hidden, stream)?.divide(
+        let mut hidden = self.norm.forward(hidden, stream)?;
+        if context.last_token_only {
+            hidden = hidden.try_index_device((.., -1, ..), stream)?;
+        }
+        let hidden = hidden.divide(
             Array::from_f32(self.args.text_config.logits_mup_width_multiplier),
             stream,
         )?;
         let logits = self.lm_head.forward(&hidden, stream)?;
         if let Some(size) = self.args.text_config.unpadded_vocab_size {
             if size < logits.dim(-1) {
-                return Ok(logits.try_index_device((.., .., ..size), stream)?);
+                return Ok(match logits.ndim() {
+                    2 => logits.try_index_device((.., ..size), stream)?,
+                    3 => logits.try_index_device((.., .., ..size), stream)?,
+                    rank => {
+                        return Err(Error::UnsupportedArchitecture(format!(
+                            "Inkling logits have unsupported rank {rank}"
+                        )));
+                    }
+                });
             }
         }
         Ok(logits)
@@ -1657,6 +1701,16 @@ mod tests {
             .unwrap();
         let actual = layerwise
             .prefill_input_logits(typed, &mut layerwise_cache, gpu.stream())
+            .unwrap();
+        assert_close(&actual, &expected);
+        assert_eq!(resident_cache.offset(), layerwise_cache.offset());
+
+        let next = runtime_input::token_ids_array(&[6], gpu.stream()).unwrap();
+        let expected = resident
+            .decode_logits(&next, &mut resident_cache, gpu.stream())
+            .unwrap();
+        let actual = layerwise
+            .decode_logits(&next, &mut layerwise_cache, gpu.stream())
             .unwrap();
         assert_close(&actual, &expected);
         assert_eq!(resident_cache.offset(), layerwise_cache.offset());
