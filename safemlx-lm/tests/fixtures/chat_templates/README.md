@@ -11,6 +11,8 @@ support key.
 | `qwen3-0.6b-7e4ae267.jinja` | `Qwen/Qwen3-0.6B` | `7e4ae267688d671ddfca3122e4528ee980cf3234` | single `chat_template` |
 | `qwen3-vl-2b-instruct-89644892.jinja` | `Qwen/Qwen3-VL-2B-Instruct` | `89644892e4d85e24eaac8bacfd4f463576704203` | single `chat_template` |
 | `hermes-2-pro-llama-3-8b-f798274b-tool-use.jinja` | `NousResearch/Hermes-2-Pro-Llama-3-8B` | `f798274b30e7d2d4797c369edcc0cc7473b6e6f2` | named `tool_use` template |
+| `mistral-7b-instruct-v0.3-c170c708.jinja` | `mistralai/Mistral-7B-Instruct-v0.3` | `c170c708c41dac9275d15a8fff4eca08d52bab71` | single `chat_template` |
+| `ministral-8b-instruct-2410-2f494a19.jinja` | `mistralai/Ministral-8B-Instruct-2410` | `2f494a194c5b980dfb9772cb92d26cbb671fce5a` | single `chat_template` |
 
 The Hermes fixture body is also byte-identical to the named `tool_use`
 template in `NousResearch/Hermes-3-Llama-3.1-8B` revision

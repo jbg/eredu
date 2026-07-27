@@ -94,6 +94,7 @@ pub(crate) trait FormatDialect: fmt::Debug + Send + Sync {
         tools: &[Value],
         tool_choice: ToolChoice,
         parallel_tool_calls: ParallelToolCallPolicy,
+        resolved_structural_token_ids: &[u32],
     ) -> Result<ConstraintConfiguration, String>;
 
     fn auto_activation_trigger(
@@ -149,6 +150,14 @@ pub(crate) enum ParallelCallLayout {
     SingleEnvelope,
 }
 
+/// A protocol-owned identifier carried by every JSON call object.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DeclarativeCallId {
+    pub(crate) field: &'static str,
+    /// Exact Unicode scalar-value length required by the protocol.
+    pub(crate) length: Option<usize>,
+}
+
 /// A deliberately bounded description of a native output dialect.
 ///
 /// This is not a parser language. It describes only exact framing, delimited
@@ -157,13 +166,15 @@ pub(crate) enum ParallelCallLayout {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct DeclarativeDialectSpec {
     pub(crate) generation_prompt_behavior: GenerationPromptBehavior,
-    /// Optional envelope around the complete collection of calls. Both strings
-    /// are empty when each call envelope stands on its own.
+    /// Optional exact prefix and suffix around the complete call collection.
+    /// Both are empty when each call envelope stands on its own; either side
+    /// may otherwise be empty for marker-only or terminal-only protocols.
     pub(crate) output: ExactEnvelope,
     pub(crate) call: ExactEnvelope,
     pub(crate) payload_shape: DeclarativePayloadShape,
     pub(crate) name_field: &'static str,
     pub(crate) arguments_field: &'static str,
+    pub(crate) call_id: Option<DeclarativeCallId>,
     pub(crate) reasoning_channel: Option<DelimitedChannel>,
     pub(crate) text_channel: Option<DelimitedChannel>,
     /// Whether un-delimited visible assistant text may precede tool calls.
@@ -183,17 +194,36 @@ impl DeclarativeDialectSpec {
         if self.name_field == self.arguments_field {
             return Err("declarative name and arguments fields must be distinct".into());
         }
+        if let Some(call_id) = self.call_id {
+            if call_id.field.is_empty() {
+                return Err("declarative call ID field must be non-empty".into());
+            }
+            if call_id.field == self.name_field || call_id.field == self.arguments_field {
+                return Err(
+                    "declarative call ID, name, and arguments fields must be distinct".into(),
+                );
+            }
+        }
         if self
             .auto_activation_trigger
             .is_some_and(|trigger| trigger.is_empty())
         {
             return Err("declarative auto-activation trigger must be non-empty".into());
         }
-        if self.output.prefix.is_empty() != self.output.suffix.is_empty() {
-            return Err(
-                "declarative output delimiters must either both be empty or both be non-empty"
-                    .into(),
-            );
+        for (index, token) in self.required_structural_tokens.iter().enumerate() {
+            if token.is_empty() {
+                return Err("declarative structural token spelling must be non-empty".into());
+            }
+            if self
+                .required_structural_tokens
+                .iter()
+                .take(index)
+                .any(|other| token.contains(other) || other.contains(token))
+            {
+                return Err(
+                    "declarative structural token spellings must not overlap each other".into(),
+                );
+            }
         }
         if self.output.prefix.is_empty()
             && (self.payload_shape != DeclarativePayloadShape::JsonObject
@@ -246,9 +276,24 @@ impl DeclarativeDialectSpec {
         tools: &[Value],
         tool_choice: ToolChoice,
         parallel_tool_calls: ParallelToolCallPolicy,
+        resolved_structural_token_ids: &[u32],
     ) -> Result<String, String> {
         self.validate()?;
-        let schema = tool_call_schema(tools, self.name_field, self.arguments_field)?;
+        if self.required_structural_tokens.len() != resolved_structural_token_ids.len() {
+            return Err(format!(
+                "declarative dialect declares {} structural tokens but {} tokenizer IDs were resolved",
+                self.required_structural_tokens.len(),
+                resolved_structural_token_ids.len()
+            ));
+        }
+        let literal = |text| {
+            structural_literal(
+                text,
+                self.required_structural_tokens,
+                resolved_structural_token_ids,
+            )
+        };
+        let schema = tool_call_schema(tools, self.name_field, self.arguments_field, self.call_id)?;
         let schema = serde_json::to_string(&schema).expect("JSON schema values serialize");
         let (min_calls, max_calls) = tool_call_bounds(tool_choice, parallel_tool_calls, tools)?;
         if max_calls.is_none() && self.call_separator.is_empty() {
@@ -272,15 +317,15 @@ impl DeclarativeDialectSpec {
         if let Some(channel) = self.reasoning_channel {
             grammar.push_str(&format!(
                 "reasoning[lazy]: {} CHANNEL_TEXT {}\n",
-                literal(channel.prefix),
-                literal(channel.suffix)
+                literal(channel.prefix)?,
+                literal(channel.suffix)?
             ));
         }
         if let Some(channel) = self.text_channel {
             grammar.push_str(&format!(
                 "visible_text[lazy]: {} CHANNEL_TEXT {}\n",
-                literal(channel.prefix),
-                literal(channel.suffix)
+                literal(channel.prefix)?,
+                literal(channel.suffix)?
             ));
         }
         if self.raw_text_before_calls {
@@ -291,7 +336,7 @@ impl DeclarativeDialectSpec {
             grammar.push_str("CHANNEL_TEXT: /(\\n|.)*/\n");
         }
 
-        let calls = repeated_rule("call", &literal(self.call_separator), min_calls, max_calls);
+        let calls = repeated_rule("call", &literal(self.call_separator)?, min_calls, max_calls);
         match self.payload_shape {
             DeclarativePayloadShape::JsonObject => {
                 if self.output.prefix.is_empty() {
@@ -299,25 +344,25 @@ impl DeclarativeDialectSpec {
                 } else {
                     grammar.push_str(&format!(
                         "tool_output: {} {} {}\n",
-                        literal(self.output.prefix),
+                        literal(self.output.prefix)?,
                         calls,
-                        literal(self.output.suffix)
+                        literal(self.output.suffix)?
                     ));
                 }
                 grammar.push_str(&format!(
                     "call: {} call_json {}\n",
-                    literal(self.call.prefix),
-                    literal(self.call.suffix)
+                    literal(self.call.prefix)?,
+                    literal(self.call.suffix)?
                 ));
             }
             DeclarativePayloadShape::JsonList => {
                 grammar.push_str(&format!(
                     "tool_output: {} {} \"[\" {} \"]\" {} {}\n",
-                    literal(self.output.prefix),
-                    literal(self.call.prefix),
+                    literal(self.output.prefix)?,
+                    literal(self.call.prefix)?,
                     calls,
-                    literal(self.call.suffix),
-                    literal(self.output.suffix)
+                    literal(self.call.suffix)?,
+                    literal(self.output.suffix)?
                 ));
                 grammar.push_str("call: call_json\n");
             }
@@ -329,6 +374,38 @@ impl DeclarativeDialectSpec {
 
 fn literal(text: &str) -> String {
     serde_json::to_string(text).expect("strings serialize as JSON/Lark literals")
+}
+
+fn structural_literal(
+    text: &str,
+    structural_tokens: &[&str],
+    resolved_structural_token_ids: &[u32],
+) -> Result<String, String> {
+    let mut sequence = Vec::new();
+    let mut remaining = text;
+    while !remaining.is_empty() {
+        let Some((position, structural_index)) = structural_tokens
+            .iter()
+            .enumerate()
+            .filter_map(|(index, token)| remaining.find(token).map(|position| (position, index)))
+            .min_by_key(|(position, index)| (*position, *index))
+        else {
+            sequence.push(literal(remaining));
+            break;
+        };
+        if position > 0 {
+            sequence.push(literal(&remaining[..position]));
+        }
+        sequence.push(format!(
+            "<[{}]>",
+            resolved_structural_token_ids[structural_index]
+        ));
+        remaining = &remaining[position + structural_tokens[structural_index].len()..];
+    }
+    if sequence.is_empty() {
+        sequence.push(literal(""));
+    }
+    Ok(sequence.join(" "))
 }
 
 fn repeated_rule(item: &str, separator: &str, minimum: usize, maximum: Option<usize>) -> String {
@@ -381,9 +458,14 @@ impl FormatDialect for DeclarativeDialect {
         tools: &[Value],
         tool_choice: ToolChoice,
         parallel_tool_calls: ParallelToolCallPolicy,
+        resolved_structural_token_ids: &[u32],
     ) -> Result<ConstraintConfiguration, String> {
-        let grammar =
-            Self::spec(parameters)?.lark_grammar(tools, tool_choice, parallel_tool_calls)?;
+        let grammar = Self::spec(parameters)?.lark_grammar(
+            tools,
+            tool_choice,
+            parallel_tool_calls,
+            resolved_structural_token_ids,
+        )?;
         Ok(ConstraintConfiguration {
             grammar: TopLevelGrammar::from_lark(grammar),
         })
@@ -435,7 +517,9 @@ enum DeclarativeParserState {
     Payload(JsonFragmentBuffer),
     AfterPayload,
     AfterEnvelope,
-    ListItemOrEnd,
+    ListItemOrEnd {
+        allow_end: bool,
+    },
     ToolSuffix,
 }
 
@@ -492,8 +576,32 @@ impl DeclarativeParser {
                 self.spec.arguments_field
             )
         })?;
-        let index = sink.next_tool_index();
-        sink.start_tool_call(format!("call_{index}"), name.to_owned());
+        let id = match self.spec.call_id {
+            Some(call_id) => {
+                let id = object
+                    .get(call_id.field)
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| {
+                        format!(
+                            "declarative tool call field {:?} must be a string",
+                            call_id.field
+                        )
+                    })?;
+                if call_id
+                    .length
+                    .is_some_and(|length| id.chars().count() != length)
+                {
+                    return Err(format!(
+                        "declarative tool call field {:?} must contain exactly {} characters",
+                        call_id.field,
+                        call_id.length.expect("checked exact call ID length")
+                    ));
+                }
+                id.to_owned()
+            }
+            None => format!("call_{}", sink.next_tool_index()),
+        };
+        sink.start_tool_call(id, name.to_owned());
         sink.tool_arguments(
             &serde_json::to_string(arguments).expect("parsed JSON values serialize"),
         );
@@ -615,7 +723,9 @@ impl DeclarativeParser {
                     self.state = DeclarativeParserState::Outside;
                 }
                 DeclarativeParserState::ToolStart => {
-                    if self.spec.payload_shape == DeclarativePayloadShape::JsonObject {
+                    if self.spec.payload_shape == DeclarativePayloadShape::JsonObject
+                        && !self.spec.output.suffix.is_empty()
+                    {
                         if self.pending.starts_with(self.spec.output.suffix) {
                             self.pending.drain(..self.spec.output.suffix.len());
                             self.state = DeclarativeParserState::Outside;
@@ -635,16 +745,21 @@ impl DeclarativeParser {
                         return Ok(());
                     }
                     if self.spec.payload_shape == DeclarativePayloadShape::JsonList {
-                        self.state = DeclarativeParserState::ListItemOrEnd;
+                        self.state = DeclarativeParserState::ListItemOrEnd { allow_end: true };
                     } else {
                         self.state = DeclarativeParserState::Payload(JsonFragmentBuffer::default());
                     }
                 }
-                DeclarativeParserState::ListItemOrEnd => {
+                DeclarativeParserState::ListItemOrEnd { allow_end } => {
                     if self.pending.is_empty() {
                         return Ok(());
                     }
                     if self.pending.starts_with(']') {
+                        if !*allow_end {
+                            return Err(
+                                "declarative JSON list cannot end after a call separator".into()
+                            );
+                        }
                         self.pending.drain(..1);
                         self.state = DeclarativeParserState::ToolSuffix;
                     } else {
@@ -684,7 +799,7 @@ impl DeclarativeParser {
                             self.state = DeclarativeParserState::ToolSuffix;
                         } else if self.consume_exact(self.spec.call_separator)? {
                             sink.end_tool_call();
-                            self.state = DeclarativeParserState::ListItemOrEnd;
+                            self.state = DeclarativeParserState::ListItemOrEnd { allow_end: false };
                         } else {
                             return Ok(());
                         }
@@ -773,9 +888,9 @@ mod tests {
     use serde_json::{json, Value};
 
     use super::{
-        ConstraintConfiguration, DeclarativeDialectSpec, DeclarativePayloadShape, DelimitedChannel,
-        DialectParameters, ExactEnvelope, FormatDialect, FormatRegistryEntry,
-        GenerationPromptBehavior, ParallelCallLayout, DECLARATIVE_DIALECT,
+        ConstraintConfiguration, DeclarativeCallId, DeclarativeDialectSpec,
+        DeclarativePayloadShape, DelimitedChannel, DialectParameters, ExactEnvelope, FormatDialect,
+        FormatRegistryEntry, GenerationPromptBehavior, ParallelCallLayout, DECLARATIVE_DIALECT,
     };
     use crate::{
         chat::{
@@ -799,6 +914,7 @@ mod tests {
         payload_shape: DeclarativePayloadShape::JsonObject,
         name_field: "function",
         arguments_field: "input",
+        call_id: None,
         reasoning_channel: Some(DelimitedChannel {
             prefix: "<think>",
             suffix: "</think>",
@@ -811,7 +927,7 @@ mod tests {
         call_separator: "\n",
         parallel_layout: ParallelCallLayout::RepeatedEnvelopes,
         auto_activation_trigger: Some("<tools>"),
-        required_structural_tokens: &["<tools>", "</tools>"],
+        required_structural_tokens: &[],
         stop_sequences: &["<stop>"],
     };
 
@@ -828,13 +944,14 @@ mod tests {
         payload_shape: DeclarativePayloadShape::JsonList,
         name_field: "op",
         arguments_field: "args",
+        call_id: None,
         reasoning_channel: None,
         text_channel: None,
         raw_text_before_calls: false,
         call_separator: ", ",
         parallel_layout: ParallelCallLayout::SingleEnvelope,
         auto_activation_trigger: Some("<batch>"),
-        required_structural_tokens: &["<batch>"],
+        required_structural_tokens: &[],
         stop_sequences: &["</batch>"],
     };
 
@@ -851,6 +968,7 @@ mod tests {
         payload_shape: DeclarativePayloadShape::JsonObject,
         name_field: "name",
         arguments_field: "arguments",
+        call_id: None,
         reasoning_channel: Some(DelimitedChannel {
             prefix: "<think>\n",
             suffix: "\n</think>",
@@ -862,6 +980,44 @@ mod tests {
         auto_activation_trigger: Some("<tool_call>\n"),
         required_structural_tokens: &["<|im_end|>"],
         stop_sequences: &["<|im_end|>"],
+    };
+
+    const MARKER_JSON_LIST_SPEC: DeclarativeDialectSpec = DeclarativeDialectSpec {
+        generation_prompt_behavior: GenerationPromptBehavior::HonorRequest,
+        output: ExactEnvelope {
+            prefix: "[TOOL_CALLS] ",
+            suffix: "",
+        },
+        call: ExactEnvelope {
+            prefix: "",
+            suffix: "",
+        },
+        payload_shape: DeclarativePayloadShape::JsonList,
+        name_field: "name",
+        arguments_field: "arguments",
+        call_id: Some(DeclarativeCallId {
+            field: "id",
+            length: Some(9),
+        }),
+        reasoning_channel: None,
+        text_channel: None,
+        raw_text_before_calls: false,
+        call_separator: ", ",
+        parallel_layout: ParallelCallLayout::SingleEnvelope,
+        auto_activation_trigger: Some("[TOOL_CALLS] "),
+        required_structural_tokens: &[],
+        stop_sequences: &["</s>"],
+    };
+
+    const STRUCTURAL_MARKER_SPEC: DeclarativeDialectSpec = DeclarativeDialectSpec {
+        output: ExactEnvelope {
+            prefix: "[SPECIAL_MARKER]",
+            suffix: "",
+        },
+        auto_activation_trigger: Some("[SPECIAL_MARKER]"),
+        required_structural_tokens: &["[SPECIAL_MARKER]"],
+        stop_sequences: &[],
+        ..MARKER_JSON_LIST_SPEC
     };
 
     fn tool(name: &str) -> Value {
@@ -917,13 +1073,21 @@ mod tests {
         output: &str,
         split: usize,
     ) {
+        try_push_at_byte_split(parser, output, split).unwrap();
+    }
+
+    fn try_push_at_byte_split(
+        parser: &mut crate::streaming::ToolRuntimeParser,
+        output: &str,
+        split: usize,
+    ) -> Result<(), String> {
         let mut pending = Vec::new();
         for chunk in [&output.as_bytes()[..split], &output.as_bytes()[split..]] {
             pending.extend_from_slice(chunk);
             loop {
                 match std::str::from_utf8(&pending) {
                     Ok(text) => {
-                        parser.push(text).unwrap();
+                        parser.push(text)?;
                         pending.clear();
                         break;
                     }
@@ -933,7 +1097,7 @@ mod tests {
                             break;
                         }
                         let text = std::str::from_utf8(&pending[..valid_up_to]).unwrap();
-                        parser.push(text).unwrap();
+                        parser.push(text)?;
                         pending.drain(..valid_up_to);
                     }
                     Err(error) => panic!("representative output is invalid UTF-8: {error}"),
@@ -941,6 +1105,7 @@ mod tests {
             }
         }
         assert!(pending.is_empty(), "split {split} left incomplete UTF-8");
+        Ok(())
     }
 
     #[test]
@@ -1114,7 +1279,7 @@ mod tests {
                 ParallelToolCallPolicy::Enabled {
                     max_calls: std::num::NonZeroUsize::new(2),
                 },
-                vec![41, 42],
+                Vec::new(),
             )
             .unwrap();
         let output = concat!(
@@ -1168,7 +1333,7 @@ mod tests {
                 &[tool("first"), tool("second")],
                 ToolChoice::Required,
                 ParallelToolCallPolicy::Disabled,
-                vec![41, 42],
+                Vec::new(),
             )
             .unwrap();
         let first_output =
@@ -1201,7 +1366,7 @@ mod tests {
                 ParallelToolCallPolicy::Enabled {
                     max_calls: std::num::NonZeroUsize::new(2),
                 },
-                vec![51],
+                Vec::new(),
             )
             .unwrap();
         let output = r#"<batch><json>[{"op":"one","args":{"value":1}}, {"op":"one","args":{"value":2}}]</json></batch>"#;
@@ -1217,12 +1382,10 @@ mod tests {
                 .unwrap(),
             GenerationPromptBehavior::Never
         );
-        assert_eq!(
-            DECLARATIVE_DIALECT
-                .required_structural_tokens(parameters)
-                .unwrap(),
-            &["<batch>"]
-        );
+        assert!(DECLARATIVE_DIALECT
+            .required_structural_tokens(parameters)
+            .unwrap()
+            .is_empty());
         assert_eq!(
             DECLARATIVE_DIALECT.stop_sequences(parameters).unwrap(),
             &["</batch>"]
@@ -1253,6 +1416,222 @@ mod tests {
         assert!(runtime_parser.events().contains(&SemanticEvent::Finished {
             reason: FinishReason::StopSequence
         }));
+    }
+
+    #[test]
+    fn declarative_grammar_uses_each_dynamically_resolved_structural_token_id() {
+        let plan = ConstraintCompiler::synthetic_for_tests()
+            .compile_tool_plan(
+                &DECLARATIVE_DIALECT,
+                DialectParameters::Declarative(&STRUCTURAL_MARKER_SPEC),
+                &[tool("lookup")],
+                ToolChoice::Required,
+                ParallelToolCallPolicy::Disabled,
+                vec![250],
+            )
+            .unwrap();
+        let mut literal_state = plan.generation_constraint().grammar_state();
+        assert!(literal_state.commit(u32::from(b'[')).is_err());
+        let mut state = plan.generation_constraint().grammar_state();
+        state.commit(250).unwrap();
+        for byte in br#"[{"name":"lookup","arguments":{"value":1},"id":"abc123456"}]"# {
+            state.commit(u32::from(*byte)).unwrap();
+        }
+        assert!(state.is_complete().unwrap());
+    }
+
+    #[test]
+    fn marker_json_list_constraints_and_events_cover_protocol_boundaries() {
+        let rich_tool = json!({
+            "type": "function",
+            "function": {
+                "name": "lookup",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "places": {
+                            "type": "array",
+                            "items": {
+                                "type": "string",
+                                "enum": ["Bogotá", "Zürich", "東京"]
+                            },
+                            "minItems": 1,
+                            "maxItems": 2
+                        },
+                        "options": {
+                            "type": "object",
+                            "properties": {
+                                "mode": {
+                                    "type": "string",
+                                    "enum": ["literal", "escaped"]
+                                },
+                                "note": {"type": "string"},
+                                "flags": {
+                                    "type": "array",
+                                    "items": {"type": "boolean"},
+                                    "maxItems": 2
+                                }
+                            },
+                            "required": ["mode", "note", "flags"],
+                            "additionalProperties": false
+                        }
+                    },
+                    "required": ["places", "options"],
+                    "additionalProperties": false
+                }
+            }
+        });
+        let parameters = DialectParameters::Declarative(&MARKER_JSON_LIST_SPEC);
+        let compiler = ConstraintCompiler::synthetic_for_tests();
+        let parallel = compiler
+            .compile_tool_plan(
+                &DECLARATIVE_DIALECT,
+                parameters,
+                &[rich_tool.clone()],
+                ToolChoice::Required,
+                ParallelToolCallPolicy::Enabled {
+                    max_calls: std::num::NonZeroUsize::new(2),
+                },
+                Vec::new(),
+            )
+            .unwrap();
+        let output = concat!(
+            "[TOOL_CALLS] [",
+            r#"{"name":"lookup","arguments":{"places":["Bogotá","東京"],"options":{"mode":"escaped","note":"quote: \" slash: \\","flags":[true,false]}},"id":"abc123456"}"#,
+            ", ",
+            r#"{"name":"lookup","arguments":{"places":["Zürich"],"options":{"mode":"literal","note":"🦀","flags":[]}},"id":"xyz987654"}"#,
+            "]",
+        );
+        assert!(accepts(&parallel, output));
+        for invalid in [
+            r#"[TOOL_CALLS] []"#,
+            r#"[TOOL_CALLS] [{"name":"missing","arguments":{"places":["Bogotá"],"options":{"mode":"literal","note":"","flags":[]}},"id":"abc123456"}]"#,
+            r#"[TOOL_CALLS] [{"name":"lookup","arguments":{"places":["invalid"],"options":{"mode":"literal","note":"","flags":[]}},"id":"abc123456"}]"#,
+            r#"[TOOL_CALLS] [{"name":"lookup","arguments":{"places":["Bogotá","Zürich","東京"],"options":{"mode":"literal","note":"","flags":[]}},"id":"abc123456"}]"#,
+            r#"[TOOL_CALLS] [{"name":"lookup","arguments":{"places":["Bogotá"],"options":{"mode":"invalid","note":"","flags":[]}},"id":"abc123456"}]"#,
+            r#"[TOOL_CALLS] [{"name":"lookup","arguments":{"places":["Bogotá"],"options":{"mode":"literal","note":"","flags":[]}},"id":"short"}]"#,
+            r#"[TOOL_CALLS] [{"name":"lookup","arguments":{"places":["Bogotá"],"options":{"mode":"literal","note":"","flags":[]}},"id":"abc123456"}, ]"#,
+            r#"[TOOL_CALLS] [{"name":"lookup","arguments":{"places":["Bogotá"],"options":{"mode":"literal","note":"","flags":[]}},"id":"abc123456"} {"name":"lookup","arguments":{"places":["Zürich"],"options":{"mode":"literal","note":"","flags":[]}},"id":"xyz987654"}]"#,
+            r#"[TOOL_CALLS] {"name":"lookup","arguments":{},"id":"abc123456"}"#,
+        ] {
+            assert!(!accepts(&parallel, invalid), "{invalid}");
+        }
+
+        let single = compiler
+            .compile_tool_plan(
+                &DECLARATIVE_DIALECT,
+                parameters,
+                &[rich_tool.clone()],
+                ToolChoice::Required,
+                ParallelToolCallPolicy::Disabled,
+                Vec::new(),
+            )
+            .unwrap();
+        assert!(!accepts(&single, output));
+        let one_call = r#"[TOOL_CALLS] [{"name":"lookup","arguments":{"places":["東京"],"options":{"mode":"literal","note":"","flags":[]}},"id":"one123456"}]"#;
+        assert!(accepts(&single, one_call));
+
+        let auto = compiler
+            .compile_tool_plan(
+                &DECLARATIVE_DIALECT,
+                parameters,
+                &[rich_tool],
+                ToolChoice::Auto,
+                ParallelToolCallPolicy::Enabled {
+                    max_calls: std::num::NonZeroUsize::new(2),
+                },
+                Vec::new(),
+            )
+            .unwrap();
+        assert_eq!(auto.auto_activation_trigger(), Some("[TOOL_CALLS] "));
+        assert!(accepts(&auto, "[TOOL_CALLS] []"));
+
+        let stopped_output = format!("{output}</s>");
+        for split in 0..=stopped_output.len() {
+            let mut parser = parallel.create_parser().unwrap();
+            push_at_byte_split(&mut parser, &stopped_output, split);
+            assert_eq!(
+                parser.events(),
+                &[
+                    SemanticEvent::ToolCallStart {
+                        index: 0,
+                        id: "abc123456".into(),
+                        name: "lookup".into(),
+                    },
+                    SemanticEvent::ToolArgumentsDelta {
+                        index: 0,
+                        json_fragment: r#"{"places":["Bogotá","東京"],"options":{"mode":"escaped","note":"quote: \" slash: \\","flags":[true,false]}}"#.into(),
+                    },
+                    SemanticEvent::ToolCallEnd,
+                    SemanticEvent::ToolCallStart {
+                        index: 1,
+                        id: "xyz987654".into(),
+                        name: "lookup".into(),
+                    },
+                    SemanticEvent::ToolArgumentsDelta {
+                        index: 1,
+                        json_fragment: r#"{"places":["Zürich"],"options":{"mode":"literal","note":"🦀","flags":[]}}"#.into(),
+                    },
+                    SemanticEvent::ToolCallEnd,
+                    SemanticEvent::Finished {
+                        reason: FinishReason::StopSequence,
+                    },
+                ],
+                "split {split}"
+            );
+            assert!(parser.events().iter().all(|event| !matches!(
+                event,
+                SemanticEvent::TextDelta(text)
+                    if text.contains("[TOOL_CALLS]") || text.contains("</s>")
+            )));
+        }
+
+        for incomplete in [
+            "[TOOL_CALLS]",
+            "[TOOL_CALLS] [",
+            r#"[TOOL_CALLS] [{"name":"lookup""#,
+            r#"[TOOL_CALLS] [{"name":"lookup","arguments":{"places":["Bogotá"],"options":{"mode":"literal","note":"","flags":[]}},"id":"abc123456"}"#,
+        ] {
+            for split in 0..=incomplete.len() {
+                let mut parser = parallel.create_parser().unwrap();
+                push_at_byte_split(&mut parser, incomplete, split);
+                parser.finish(FinishReason::MaxTokens).unwrap();
+                assert!(
+                    !parser
+                        .events()
+                        .iter()
+                        .any(|event| matches!(event, SemanticEvent::ToolCallEnd)),
+                    "{incomplete:?}, split {split}"
+                );
+            }
+        }
+
+        for malformed in [
+            r#"[TOOL_CALLS] [{"name":"lookup","arguments":{"note":"東京"},"id":"abc123456"}, ]</s>"#,
+            r#"[TOOL_CALLS] [{"name":"lookup","arguments":{"note":"🦀"},"id":"abc123456"} {"name":"lookup","arguments":{},"id":"xyz987654"}]</s>"#,
+        ] {
+            for split in 0..=malformed.len() {
+                let mut parser = parallel.create_parser().unwrap();
+                assert!(
+                    try_push_at_byte_split(&mut parser, malformed, split).is_err(),
+                    "{malformed}, split {split}"
+                );
+            }
+        }
+
+        let mut caller_stopped = auto.create_parser_with_stops(["<caller-stop>"]).unwrap();
+        caller_stopped
+            .push("ordinary answer<caller-stop>hidden")
+            .unwrap();
+        assert_eq!(
+            caller_stopped.events(),
+            &[
+                SemanticEvent::TextDelta("ordinary answer".into()),
+                SemanticEvent::Finished {
+                    reason: FinishReason::StopSequence,
+                },
+            ]
+        );
     }
 
     #[derive(Debug)]
@@ -1296,6 +1675,7 @@ mod tests {
             _tools: &[Value],
             _tool_choice: ToolChoice,
             _parallel_tool_calls: ParallelToolCallPolicy,
+            _resolved_structural_token_ids: &[u32],
         ) -> Result<ConstraintConfiguration, String> {
             let parameters = parameters.custom::<CustomParameters>()?;
             Ok(ConstraintConfiguration {

@@ -16,8 +16,8 @@ use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 
 use crate::format_dialect::{
-    DeclarativeDialectSpec, DeclarativePayloadShape, DelimitedChannel, ExactEnvelope,
-    ParallelCallLayout, DECLARATIVE_DIALECT,
+    DeclarativeCallId, DeclarativeDialectSpec, DeclarativePayloadShape, DelimitedChannel,
+    ExactEnvelope, ParallelCallLayout, DECLARATIVE_DIALECT,
 };
 use crate::{
     format_dialect::{
@@ -345,6 +345,7 @@ const QWEN_XML_TOOL_SPEC: DeclarativeDialectSpec = DeclarativeDialectSpec {
     payload_shape: DeclarativePayloadShape::JsonObject,
     name_field: "name",
     arguments_field: "arguments",
+    call_id: None,
     reasoning_channel: None,
     text_channel: None,
     raw_text_before_calls: true,
@@ -361,6 +362,42 @@ const QWEN3_XML_TOOL_SPEC: DeclarativeDialectSpec = DeclarativeDialectSpec {
         suffix: "\n</think>",
     }),
     ..QWEN_XML_TOOL_SPEC
+};
+
+const MISTRAL_JSON_LIST_TOOL_SPEC: DeclarativeDialectSpec = DeclarativeDialectSpec {
+    generation_prompt_behavior: GenerationPromptBehavior::HonorRequest,
+    output: ExactEnvelope {
+        prefix: "[TOOL_CALLS] ",
+        suffix: "",
+    },
+    call: ExactEnvelope {
+        prefix: "",
+        suffix: "",
+    },
+    payload_shape: DeclarativePayloadShape::JsonList,
+    name_field: "name",
+    arguments_field: "arguments",
+    call_id: Some(DeclarativeCallId {
+        field: "id",
+        length: Some(9),
+    }),
+    reasoning_channel: None,
+    text_channel: None,
+    raw_text_before_calls: false,
+    call_separator: ", ",
+    parallel_layout: ParallelCallLayout::SingleEnvelope,
+    auto_activation_trigger: Some("[TOOL_CALLS] "),
+    required_structural_tokens: &["[TOOL_CALLS]", "</s>"],
+    stop_sequences: &["</s>"],
+};
+
+const MINISTRAL_JSON_LIST_TOOL_SPEC: DeclarativeDialectSpec = DeclarativeDialectSpec {
+    output: ExactEnvelope {
+        prefix: "[TOOL_CALLS]",
+        suffix: "</s>",
+    },
+    auto_activation_trigger: Some("[TOOL_CALLS]"),
+    ..MISTRAL_JSON_LIST_TOOL_SPEC
 };
 
 const QWEN25_TEMPLATE_SIGNATURE: [u8; 32] = [
@@ -383,6 +420,14 @@ const HERMES2_PRO_TOOL_USE_TEMPLATE_SIGNATURE: [u8; 32] = [
     0x7c, 0xe0, 0x9d, 0x55, 0xd3, 0x69, 0x0e, 0x06, 0xc7, 0x0b, 0x5c, 0x07, 0x22, 0x8c, 0xc7, 0xe8,
     0xc9, 0x9c, 0x43, 0xa2, 0x3c, 0xdc, 0x02, 0x77, 0x62, 0xbe, 0x40, 0x11, 0xef, 0xcd, 0xea, 0x6c,
 ];
+const MISTRAL7_V03_TEMPLATE_SIGNATURE: [u8; 32] = [
+    0xe1, 0x67, 0x46, 0xb4, 0x03, 0x44, 0xd6, 0xc5, 0xb5, 0x26, 0x59, 0x88, 0xe0, 0x32, 0x8a, 0x0b,
+    0xf7, 0x27, 0x7b, 0xe8, 0x6f, 0x1c, 0x33, 0x51, 0x56, 0xea, 0xe0, 0x7e, 0x29, 0xc8, 0x28, 0x26,
+];
+const MINISTRAL8_2410_TEMPLATE_SIGNATURE: [u8; 32] = [
+    0xe4, 0x67, 0x6c, 0xb5, 0x6d, 0xff, 0xea, 0x77, 0x82, 0xfd, 0x3e, 0x2b, 0x57, 0x7c, 0xfa, 0xf1,
+    0xe1, 0x23, 0x53, 0x7e, 0x6e, 0xf4, 0x9b, 0x3e, 0xc7, 0xca, 0xa6, 0xc0, 0x95, 0xc6, 0x22, 0x72,
+];
 
 #[cfg(test)]
 const SYNTHETIC_DECLARATIVE_SPEC: DeclarativeDialectSpec = DeclarativeDialectSpec {
@@ -398,6 +443,7 @@ const SYNTHETIC_DECLARATIVE_SPEC: DeclarativeDialectSpec = DeclarativeDialectSpe
     payload_shape: DeclarativePayloadShape::JsonList,
     name_field: "name",
     arguments_field: "arguments",
+    call_id: None,
     reasoning_channel: None,
     text_channel: None,
     raw_text_before_calls: false,
@@ -441,6 +487,18 @@ const FORMAT_REGISTRY: &[FormatRegistryEntry] = &[
         template_signature: HERMES2_PRO_TOOL_USE_TEMPLATE_SIGNATURE,
         dialect: &DECLARATIVE_DIALECT,
         parameters: DialectParameters::Declarative(&QWEN_XML_TOOL_SPEC),
+    },
+    FormatRegistryEntry {
+        identity: "mistral.mistral-7b-v0.3.json-list-tools.e16746b4",
+        template_signature: MISTRAL7_V03_TEMPLATE_SIGNATURE,
+        dialect: &DECLARATIVE_DIALECT,
+        parameters: DialectParameters::Declarative(&MISTRAL_JSON_LIST_TOOL_SPEC),
+    },
+    FormatRegistryEntry {
+        identity: "mistral.ministral-8b-2410.json-list-tools.e4676cb5",
+        template_signature: MINISTRAL8_2410_TEMPLATE_SIGNATURE,
+        dialect: &DECLARATIVE_DIALECT,
+        parameters: DialectParameters::Declarative(&MINISTRAL_JSON_LIST_TOOL_SPEC),
     },
     #[cfg(test)]
     FormatRegistryEntry {
@@ -605,7 +663,8 @@ mod tests {
     use super::{
         prepare_format_profile, prepare_format_profile_with_registry, resolve_structural_tokens,
         template_signature, DialectParameters, FormatRegistryEntry, DECLARATIVE_DIALECT,
-        HERMES2_PRO_TOOL_USE_TEMPLATE_SIGNATURE, QWEN25_TEMPLATE_SIGNATURE,
+        HERMES2_PRO_TOOL_USE_TEMPLATE_SIGNATURE, MINISTRAL8_2410_TEMPLATE_SIGNATURE,
+        MISTRAL7_V03_TEMPLATE_SIGNATURE, QWEN25_TEMPLATE_SIGNATURE,
         QWEN3_TEMPLATE_16706FC5_SIGNATURE, QWEN3_TEMPLATE_7E4AE267_SIGNATURE,
         QWEN3_VL_TEMPLATE_SIGNATURE, SYNTHETIC_DECLARATIVE_SPEC, SYNTHETIC_TOOL_TEMPLATE,
         SYNTHETIC_TOOL_TEMPLATE_SIGNATURE,
@@ -620,6 +679,10 @@ mod tests {
     const HERMES2_PRO_TOOL_USE_FIXTURE: &str = include_str!(
         "../tests/fixtures/chat_templates/hermes-2-pro-llama-3-8b-f798274b-tool-use.jinja"
     );
+    const MISTRAL7_V03_FIXTURE: &str =
+        include_str!("../tests/fixtures/chat_templates/mistral-7b-instruct-v0.3-c170c708.jinja");
+    const MINISTRAL8_2410_FIXTURE: &str =
+        include_str!("../tests/fixtures/chat_templates/ministral-8b-instruct-2410-2f494a19.jinja");
     const QWEN3_OLDER_TOKENIZER_CONFIG: &str =
         include_str!("../../safemlx-lm-utils/tests/fixtures/qwen3/tokenizer_config.json");
 
@@ -723,6 +786,29 @@ mod tests {
             assert!(prepared.dialect.is_some(), "{identity}");
             assert_eq!(prepared.required_structural_tokens, ["<|im_end|>"]);
             assert_eq!(prepared.stop_sequences, ["<|im_end|>"]);
+        }
+
+        for (template, signature, identity) in [
+            (
+                MISTRAL7_V03_FIXTURE,
+                MISTRAL7_V03_TEMPLATE_SIGNATURE,
+                "mistral.mistral-7b-v0.3.json-list-tools.e16746b4",
+            ),
+            (
+                MINISTRAL8_2410_FIXTURE,
+                MINISTRAL8_2410_TEMPLATE_SIGNATURE,
+                "mistral.ministral-8b-2410.json-list-tools.e4676cb5",
+            ),
+        ] {
+            assert_eq!(template_signature(template), signature, "{identity}");
+            let prepared = prepare_format_profile(template);
+            assert_eq!(prepared.identity.as_deref(), Some(identity));
+            assert!(prepared.dialect.is_some(), "{identity}");
+            assert_eq!(
+                prepared.required_structural_tokens,
+                ["[TOOL_CALLS]", "</s>"]
+            );
+            assert_eq!(prepared.stop_sequences, ["</s>"]);
         }
 
         let modified = format!("{QWEN25_FIXTURE} ");

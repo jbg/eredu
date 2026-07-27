@@ -1104,6 +1104,7 @@ mod tests {
         payload_shape: DeclarativePayloadShape::JsonList,
         name_field: "name",
         arguments_field: "arguments",
+        call_id: None,
         reasoning_channel: None,
         text_channel: None,
         raw_text_before_calls: false,

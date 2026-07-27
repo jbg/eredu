@@ -4373,6 +4373,11 @@ mod tests {
     const HERMES2_PRO_TOOL_USE_FIXTURE: &str = include_str!(
         "../../tests/fixtures/chat_templates/hermes-2-pro-llama-3-8b-f798274b-tool-use.jinja"
     );
+    const MISTRAL7_V03_FIXTURE: &str =
+        include_str!("../../tests/fixtures/chat_templates/mistral-7b-instruct-v0.3-c170c708.jinja");
+    const MINISTRAL8_2410_FIXTURE: &str = include_str!(
+        "../../tests/fixtures/chat_templates/ministral-8b-instruct-2410-2f494a19.jinja"
+    );
 
     #[test]
     #[ignore = "requires MLX runtime execution and SAFEMLX_INSPECTION_MODEL_DIR"]
@@ -4471,6 +4476,30 @@ mod tests {
         tokenizer.set_template_kwargs(serde_json::Map::from_iter([
             ("bos_token".into(), json!("<|begin_of_text|>")),
             ("add_vision_id".into(), json!(false)),
+        ]));
+        tokenizer
+    }
+
+    fn mistral_chat_tokenizer(preceding_tokens: usize) -> ChatTokenizer {
+        let mut raw = Tokenizer::new(WordLevel::default());
+        raw.add_tokens(
+            (0..preceding_tokens)
+                .map(|index| AddedToken::from(format!("ordinary_{index}"), false))
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        assert_eq!(
+            raw.add_special_tokens([
+                AddedToken::from("[TOOL_CALLS]", true).normalized(false),
+                AddedToken::from("</s>", true).normalized(false),
+            ])
+            .unwrap(),
+            2
+        );
+        let mut tokenizer = ChatTokenizer::from_tokenizer(raw);
+        tokenizer.set_template_kwargs(serde_json::Map::from_iter([
+            ("bos_token".into(), json!("<s>")),
+            ("eos_token".into(), json!("</s>")),
         ]));
         tokenizer
     }
@@ -4786,6 +4815,135 @@ mod tests {
         assert!(hermes
             .rendered_prompt()
             .contains("<tool_response>\n{\"result\":1}\n</tool_response>"));
+    }
+
+    #[test]
+    fn production_mistral_json_list_templates_render_golden_tool_history_and_prompts() {
+        let compiler = Ok(ConstraintCompiler::synthetic_for_tests());
+        let messages = vec![
+            json!({"role": "system", "content": "Be brief."}),
+            json!({"role": "user", "content": "first"}),
+            json!({
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "id": "abc123456",
+                    "type": "function",
+                    "function": {"name": "lookup", "arguments": {"value": 1}}
+                }]
+            }),
+            json!({
+                "role": "tool",
+                "tool_call_id": "abc123456",
+                "content": "{\"result\":1}"
+            }),
+            json!({"role": "assistant", "content": "done"}),
+            json!({"role": "user", "content": "again"}),
+        ];
+        let available_tools = concat!(
+            r#"[{"type": "function", "function": {"description": "Look up one integer.", "#,
+            r#""name": "lookup", "parameters": {"additionalProperties":false,"properties":{"value":"#,
+            r#"{"description":"The integer to look up.","type":"integer"}},"required":["value"],"#,
+            r#""type":"object"}}}]"#,
+        );
+        let cases = [
+            (
+                MISTRAL7_V03_FIXTURE,
+                "mistral.mistral-7b-v0.3.json-list-tools.e16746b4",
+                concat!(
+                    "<s>[INST] first[/INST]",
+                    r#"[TOOL_CALLS] [{"arguments":{"value":1},"name":"lookup", "id": "abc123456"}]</s>"#,
+                    r#"[TOOL_RESULTS] {"content": {"result":1}, "call_id": "abc123456"}[/TOOL_RESULTS]"#,
+                    " done</s>",
+                    "[AVAILABLE_TOOLS] ",
+                ),
+                "[/AVAILABLE_TOOLS][INST] Be brief.\n\nagain[/INST]",
+                Some("[TOOL_CALLS] "),
+                ToolChoice::Auto,
+            ),
+            (
+                MINISTRAL8_2410_FIXTURE,
+                "mistral.ministral-8b-2410.json-list-tools.e4676cb5",
+                concat!(
+                    "<s>[INST]first[/INST]",
+                    r#"[TOOL_CALLS][{"arguments":{"value":1},"name":"lookup", "id": "abc123456"}]</s>"#,
+                    r#"[TOOL_RESULTS]{"content": {"result":1}, "call_id": "abc123456"}[/TOOL_RESULTS]"#,
+                    "done</s>",
+                    "[AVAILABLE_TOOLS]",
+                ),
+                "[/AVAILABLE_TOOLS][INST]Be brief.\n\nagain[/INST]",
+                None,
+                ToolChoice::Required,
+            ),
+        ];
+
+        for (
+            template,
+            identity,
+            expected_prefix,
+            expected_suffix,
+            expected_auto_trigger,
+            tool_choice,
+        ) in cases
+        {
+            for add_generation_prompt in [false, true] {
+                let mut tokenizer = mistral_chat_tokenizer(4);
+                let prepared = prepare_chat_from_parts(
+                    &mut tokenizer,
+                    ModelChatTemplate::Single(template.into()),
+                    "architecture-name-is-not-a-support-key",
+                    &[5],
+                    Some(&compiler),
+                    ChatTemplateRequest {
+                        messages: messages.clone(),
+                        tools: vec![production_tool("lookup")],
+                        tool_choice,
+                        parallel_tool_calls: ParallelToolCallPolicy::Enabled {
+                            max_calls: std::num::NonZeroUsize::new(2),
+                        },
+                        add_generation_prompt,
+                        ..ChatTemplateRequest::default()
+                    },
+                )
+                .unwrap();
+
+                assert_eq!(prepared.format_profile_identity(), Some(identity));
+                assert_eq!(prepared.generation_prompt(), "");
+                assert_eq!(
+                    prepared.rendered_prompt(),
+                    format!("{expected_prefix}{available_tools}{expected_suffix}")
+                );
+                assert_eq!(prepared.preserved_structural_token_ids(), &[4, 5]);
+                assert_eq!(prepared.profile_stop_sequences(), ["</s>"]);
+                let NativeToolSupport::Supported(plan) = prepared.native_tool_support() else {
+                    panic!("registered Mistral profile must be supported");
+                };
+                assert_eq!(plan.auto_activation_trigger(), expected_auto_trigger);
+            }
+        }
+    }
+
+    #[test]
+    fn mistral_architecture_name_does_not_grant_an_unregistered_template_support() {
+        let raw = Tokenizer::new(WordLevel::default());
+        let mut tokenizer = ChatTokenizer::from_tokenizer(raw);
+        let template = ModelChatTemplate::Single("unregistered mistral template".into());
+        let prepared = prepare_chat_from_parts(
+            &mut tokenizer,
+            template,
+            "MistralForCausalLM",
+            &[],
+            None,
+            ChatTemplateRequest::default(),
+        )
+        .unwrap();
+
+        assert_eq!(prepared.format_profile_identity(), None);
+        assert!(matches!(
+            prepared.native_tool_support(),
+            NativeToolSupport::Unsupported { reason }
+                if reason.contains("no registered format profile")
+        ));
     }
 
     #[test]

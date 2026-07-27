@@ -22,7 +22,7 @@ use crate::{
         GenerationConstraint, ParallelToolCallPolicy, ToolChoice, ToolRuntimePlan,
         ToolRuntimePlanParts,
     },
-    format_dialect::{DialectParameters, FormatDialect},
+    format_dialect::{DeclarativeCallId, DialectParameters, FormatDialect},
 };
 
 const MAX_SCHEMA_DEPTH: usize = 64;
@@ -107,6 +107,7 @@ impl ConstraintCompiler {
             tools,
             tool_choice,
             parallel_tool_calls,
+            &resolved_structural_token_ids,
         )?;
         let fingerprint: [u8; 32] = Sha256::digest(
             serde_json::to_vec(&configuration.grammar).expect("grammar configuration serializes"),
@@ -273,6 +274,7 @@ pub(crate) fn tool_call_schema(
     tools: &[Value],
     name_field: &str,
     arguments_field: &str,
+    call_id: Option<DeclarativeCallId>,
 ) -> Result<Value, String> {
     let tools = parse_tools(tools)?;
     let item_schema = if tools.is_empty() {
@@ -281,13 +283,31 @@ pub(crate) fn tool_call_schema(
         let alternatives = tools
             .into_iter()
             .map(|tool| {
+                let mut properties = Map::from_iter([
+                    (
+                        name_field.to_owned(),
+                        json!({"type": "string", "enum": [tool.name]}),
+                    ),
+                    (arguments_field.to_owned(), tool.parameters),
+                ]);
+                let mut required = vec![
+                    Value::String(name_field.to_owned()),
+                    Value::String(arguments_field.to_owned()),
+                ];
+                if let Some(call_id) = call_id {
+                    let mut id_schema =
+                        Map::from_iter([("type".to_owned(), Value::String("string".to_owned()))]);
+                    if let Some(length) = call_id.length {
+                        id_schema.insert("minLength".to_owned(), json!(length));
+                        id_schema.insert("maxLength".to_owned(), json!(length));
+                    }
+                    properties.insert(call_id.field.to_owned(), Value::Object(id_schema));
+                    required.push(Value::String(call_id.field.to_owned()));
+                }
                 json!({
                     "type": "object",
-                    "properties": {
-                        name_field: {"type": "string", "enum": [tool.name]},
-                        arguments_field: tool.parameters,
-                    },
-                    "required": [name_field, arguments_field],
+                    "properties": properties,
+                    "required": required,
                     "additionalProperties": false,
                 })
             })
@@ -742,6 +762,7 @@ mod tests {
         payload_shape: DeclarativePayloadShape::JsonList,
         name_field: "name",
         arguments_field: "arguments",
+        call_id: None,
         reasoning_channel: None,
         text_channel: None,
         raw_text_before_calls: false,
