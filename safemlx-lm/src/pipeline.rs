@@ -30,10 +30,6 @@ use crate::{
         common::{linear, linear::project_logits_maybe_quantized},
         deepseek_v3, llama, ModelKind, ModelLoadOptions,
     },
-    parallel::{
-        load_safetensors_partition_on_streams, ParallelTopology, PlacementPlan, RankPartition,
-        TensorPlacement,
-    },
     runtime::cache::residency::{
         open_prompt_cache, validate_prompt_cache_model_identity, CacheRankIdentity,
         CacheResidencyManager, CacheResidencyPolicy, CacheResidencyReport, PagedCacheOptions,
@@ -50,6 +46,10 @@ use crate::{
     runtime::checkpoint::load::StrictLoadConfig,
     runtime::checkpoint::quantization::{quantize_tensor, WeightQuantization},
     runtime::checkpoint::store::{SafetensorsWeightStore, WeightStore},
+    runtime::distributed::topology::{
+        load_safetensors_partition_on_streams, ParallelTopology, PlacementPlan, RankPartition,
+        TensorPlacement,
+    },
     runtime::execution::inspection::ActivationObserver,
     runtime::execution::layerwise::{
         DenseDiskStreamReport, DenseStreamController, GeneralLayerwiseModelAdapter, WeightResidency,
@@ -2341,7 +2341,7 @@ pub fn forward_stage_with_observer(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::parallel::DeviceAssignment;
+    use crate::runtime::distributed::topology::DeviceAssignment;
     use safemlx::{module::Param, ops::ones_dtype, Device, DeviceType, ExecutionContext};
     use std::fs;
 

@@ -35,10 +35,6 @@ use crate::{
         },
         deepseek_v3, llama, ModelKind, ModelLoadOptions,
     },
-    parallel::{
-        balanced_contiguous_range, load_safetensors_partition_on_streams, ParallelTopology,
-        PlacementPlan, RankPartition, TensorPlacement,
-    },
     pipeline::{assign_module, load_deepseek_experts, SynchronizedToken},
     runtime::cache::residency::{
         open_prompt_cache, validate_prompt_cache_model_identity, CacheRankIdentity,
@@ -52,6 +48,10 @@ use crate::{
     },
     runtime::checkpoint::load::StrictLoadConfig,
     runtime::checkpoint::quantization::{should_quantize_on_load, WeightQuantization},
+    runtime::distributed::topology::{
+        balanced_contiguous_range, load_safetensors_partition_on_streams, ParallelTopology,
+        PlacementPlan, RankPartition, TensorPlacement,
+    },
     sampler::Sampler,
     utils::create_causal_mask,
 };
@@ -1659,7 +1659,7 @@ fn forward_deepseek(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::parallel::DeviceAssignment;
+    use crate::runtime::distributed::topology::DeviceAssignment;
     use safemlx::DeviceType;
 
     fn topology(world: usize, rank: usize, tp: usize) -> ParallelTopology {

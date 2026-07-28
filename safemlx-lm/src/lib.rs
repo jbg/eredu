@@ -73,8 +73,8 @@ mod qwen_mtp;
 pub mod models;
 /// Architecture-independent multi-token prediction and speculative decoding.
 pub mod mtp;
-/// Runtime parallel topology, tensor placement plans, and selective checkpoint loading.
-pub mod parallel;
+/// Compatibility path for runtime topology and placement planning.
+pub use runtime::distributed::topology as parallel;
 /// Executable pure pipeline-parallel model loading and inference.
 pub mod pipeline;
 /// Model-agnostic media processing and prepared-input helpers.

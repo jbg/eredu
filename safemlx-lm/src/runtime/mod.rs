@@ -4,6 +4,8 @@
 pub mod cache;
 /// Checkpoint loading, storage, binding, and conversion.
 pub mod checkpoint;
+/// Distributed topology, placement, routing, and transport.
+pub mod distributed;
 /// Generic execution engines and observability hooks.
 pub mod execution;
 /// Weight-residency planning and execution.

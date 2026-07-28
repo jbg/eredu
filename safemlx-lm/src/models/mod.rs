@@ -28,11 +28,11 @@ pub use crate::chat::{
     PreparedChat, ToolChoice,
 };
 use crate::nn::generation::CausalLm;
-use crate::parallel::ParallelTopology;
 #[cfg(feature = "media-processing")]
 use crate::processor::{load_processor, ModelProcessor, PreparedModelInput, ProcessorInput};
 use crate::runtime::checkpoint::gguf::{self as gguf_tokenizer, GgufTokenizer};
 use crate::runtime::checkpoint::quantization::WeightQuantization;
+use crate::runtime::distributed::topology::ParallelTopology;
 use crate::runtime::execution::inspection::ActivationObserver;
 use crate::sampler::{ConstrainedSampler, DefaultSampler, Sampler, SpeculativeSampler};
 use crate::streaming::{
