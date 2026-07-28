@@ -732,8 +732,11 @@ mod tests {
             )
             .unwrap(),
         );
-        let entries =
-            crate::qwen_hybrid::qwen_hybrid_expert_catalog(&fp8_args(), store.as_ref()).unwrap();
+        let entries = crate::architectures::qwen::hybrid::layerwise::qwen_hybrid_expert_catalog(
+            &fp8_args(),
+            store.as_ref(),
+        )
+        .unwrap();
         let options = crate::runtime::residency::expert_cache::ExpertCacheLoadOptions::new(
             crate::runtime::execution::layerwise::LayerwiseLoadOptions::new(
                 crate::runtime::residency::policy::OffloadConfig::new(None, None, 1).unwrap(),

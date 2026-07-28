@@ -11,8 +11,8 @@ use safemlx::{
 };
 
 use crate::{
-    models::input,
-    sampler::{DefaultSampler, Sampler},
+    api::input,
+    runtime::generation::sampler::{DefaultSampler, Sampler},
 };
 
 /// Samples a token id from logits.

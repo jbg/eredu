@@ -18,13 +18,14 @@ use safemlx::{
 };
 
 use crate::{
-    error::Error,
-    models::{
+    api::{
         common::moe::PackedSwiGluExperts,
         common::{self, generation::CausalLm, linear::project_logits_maybe_quantized},
         input,
         lfm2::{self as resident, Cache, DecoderLayer, LayerCache, LayerType, ModelArgs},
     },
+    error::Error,
+    nn::tensor::{create_attention_mask, AttentionMask},
     runtime::cache::KeyValueCache,
     runtime::checkpoint::binding::{
         build_module_bindings, build_module_bindings_with_recipes, populate_module_from_lease,
@@ -42,7 +43,6 @@ use crate::{
         ExpertPass,
     },
     runtime::residency::manager::{OffloadUnit, ResidencyReport, ResidentUnitLease, WeightBinding},
-    utils::{create_attention_mask, AttentionMask},
 };
 
 const EMBEDDING_UNIT: &str = "lfm2.static.embedding";
@@ -993,7 +993,7 @@ pub(crate) fn lfm2_expert_catalog(
 }
 
 /// LFM2 token generation iterator using bounded layer execution.
-pub type Generate<'a, S = crate::sampler::DefaultSampler> =
+pub type Generate<'a, S = crate::runtime::generation::sampler::DefaultSampler> =
     common::generation::Generate<'a, Lfm2LayerwiseModel, Cache, S>;
 
 #[cfg(test)]
@@ -1008,7 +1008,7 @@ mod tests {
 
     use super::{load_lfm2_layerwise_model, load_lfm2_sparse_expert_cache_model};
     use crate::{
-        models::lfm2::{self as resident, Cache, LayerCache, Model, ModelArgs},
+        architectures::lfm2::model::{self as resident, Cache, LayerCache, Model, ModelArgs},
         runtime::execution::layerwise::{LayerExecutionLoadOptions, LayerwiseLoadOptions},
         runtime::residency::dense_stream::DenseDiskStreamLoadOptions,
         runtime::residency::expert_cache::ExpertCacheLoadOptions,
@@ -1269,10 +1269,10 @@ mod tests {
         assert_eq!(report.owned_experts, 4);
         assert!(report.prefill.requested_routes > 0);
         assert!(report.decode.requested_routes > 0);
-        crate::expert_parallel::assert_rank_owned_sparse_ep_load(
+        crate::architectures::distributed::expert::assert_rank_owned_sparse_ep_load(
             dir.path(),
             options,
-            crate::models::ModelKind::Lfm2,
+            crate::api::ModelKind::Lfm2,
             report.owned_experts / 2,
             gpu.stream(),
             cpu.stream(),

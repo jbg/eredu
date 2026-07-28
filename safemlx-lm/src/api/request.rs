@@ -252,7 +252,7 @@ impl TokenDecoderBackend for PreparedChatTokenDecoder {
 
 pub(super) struct PreparedChatRuntime<S> {
     pub(super) sampler: ConstrainedSampler<S>,
-    pub(super) parser: crate::streaming::ToolRuntimeParser,
+    pub(super) parser: crate::runtime::generation::streaming::ToolRuntimeParser,
     pub(super) structural_tokens: HashMap<u32, String>,
 }
 

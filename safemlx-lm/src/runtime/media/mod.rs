@@ -1,12 +1,15 @@
 //! Media preprocessing before typed model prefill.
 
+/// Typed runtime inputs for model prefill.
+pub mod input;
+
 use std::{fs, path::Path};
 
 use safemlx::Array;
 
 use crate::{
     error::Error,
-    models::input::{InputMetadata, InputPart, InputPayload, Modality, ModelInput},
+    runtime::media::input::{InputMetadata, InputPart, InputPayload, Modality, ModelInput},
 };
 
 /// Shared PCM waveform validation and spectral operations.

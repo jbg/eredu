@@ -15,10 +15,10 @@ use safemlx::{
 use serde::Deserialize;
 
 use crate::{
+    api::moshi,
     error::Error,
-    models::moshi,
     runtime::checkpoint::quantization::WeightQuantization,
-    sampler::{DefaultSampler, Sampler},
+    runtime::generation::sampler::{DefaultSampler, Sampler},
 };
 
 /// Hugging Face repository for the released PersonaPlex checkpoint.
@@ -116,7 +116,7 @@ impl PromptModel for Model {
     }
 }
 
-impl PromptModel for crate::moshi::MoshiLayerwiseModel {
+impl PromptModel for crate::architectures::moshi::layerwise::MoshiLayerwiseModel {
     fn depth_codebooks(&self) -> i32 {
         self.args().dep_q
     }
@@ -227,7 +227,7 @@ pub fn load_native_model(
 ) -> Result<Model, Error> {
     load_native_model_with_options(
         model_dir,
-        crate::models::ModelLoadOptions::default(),
+        crate::api::ModelLoadOptions::default(),
         stream,
         weights_stream,
     )
@@ -236,7 +236,7 @@ pub fn load_native_model(
 /// Loads a native-layout PersonaPlex checkpoint using shared model-load options.
 pub fn load_native_model_with_options(
     model_dir: impl AsRef<Path>,
-    options: crate::models::ModelLoadOptions,
+    options: crate::api::ModelLoadOptions,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<Model, Error> {
@@ -564,11 +564,11 @@ mod tests {
         model_args_7b_v1, validate_model_config_value, AUDIO_TOKENS_PER_STREAM, TEXT_PADDING_TOKEN,
     };
     use crate::{
-        realtime::{
+        api::realtime::{
             LoadedRealtimeModel, RealtimeModelKind, RealtimeSampling, RealtimeSpeechModel,
             RealtimeState, RealtimeStepInput,
         },
-        sampler::DefaultSampler,
+        runtime::generation::sampler::DefaultSampler,
     };
     use safemlx::{Array, Device, DeviceType, ExecutionContext};
 
@@ -613,9 +613,9 @@ mod tests {
             .expect("SAFEMLX_PERSONAPLEX_DIR must point to a PersonaPlex model directory");
         let gpu = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
         let cpu = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
-        let model = crate::realtime::load_model_with_options(
+        let model = crate::api::realtime::load_model_with_options(
             &model_dir,
-            crate::models::ModelLoadOptions::with_quantization(
+            crate::api::ModelLoadOptions::with_quantization(
                 crate::runtime::checkpoint::quantization::AffineQuantization::default(),
             ),
             gpu.stream(),
@@ -634,7 +634,7 @@ mod tests {
             .expect("SAFEMLX_PERSONAPLEX_DIR must point to a PersonaPlex model directory");
         let ctx = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
         let mut model =
-            crate::realtime::load_model(&model_dir, ctx.stream(), ctx.stream()).unwrap();
+            crate::api::realtime::load_model(&model_dir, ctx.stream(), ctx.stream()).unwrap();
         assert_eq!(model.kind(), RealtimeModelKind::PersonaPlex);
         let mut state = model.new_realtime_state();
         let stream = ctx.stream();

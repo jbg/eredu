@@ -12,14 +12,14 @@ use safemlx::{
 };
 
 use crate::{
-    error::Error,
-    models::{
+    api::{
         common::{self, generation::CausalLm, moe::PackedSwiGluExperts},
         inkling::{
             self as resident, AudioModel, Cache, DecoderLayer, ModelArgs, VisionLayer, VisionModel,
         },
         input,
     },
+    error::Error,
     runtime::cache::residency::{CacheResidencyPolicy, CacheResidencyReport},
     runtime::cache::KeyValueCache,
     runtime::checkpoint::binding::{
@@ -1274,7 +1274,7 @@ pub(crate) fn inkling_expert_catalog(
 }
 
 /// Inkling text token generation using bounded layer execution.
-pub type Generate<'a, S = crate::sampler::DefaultSampler> =
+pub type Generate<'a, S = crate::runtime::generation::sampler::DefaultSampler> =
     common::generation::Generate<'a, InklingLayerwiseModel, Cache, S>;
 
 #[cfg(test)]
@@ -1289,7 +1289,7 @@ mod tests {
 
     use super::{load_inkling_layerwise_model, load_inkling_sparse_expert_cache_model};
     use crate::{
-        models::{
+        api::{
             common::generation::CausalLm,
             inkling::{self as resident, Model, ModelArgs},
             input as runtime_input,
@@ -1639,10 +1639,10 @@ mod tests {
         assert_eq!(report.owned_experts, 4);
         assert!(report.prefill.requested_routes > 0);
         assert!(report.decode.requested_routes > 0);
-        crate::expert_parallel::assert_rank_owned_sparse_ep_load(
+        crate::architectures::distributed::expert::assert_rank_owned_sparse_ep_load(
             dir.path(),
             options,
-            crate::models::ModelKind::Inkling,
+            crate::api::ModelKind::Inkling,
             report.owned_experts / 2,
             gpu.stream(),
             cpu.stream(),

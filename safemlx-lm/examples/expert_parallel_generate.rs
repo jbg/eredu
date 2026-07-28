@@ -5,8 +5,10 @@ use safemlx::{
     DeviceType, Stream,
 };
 use safemlx_lm::{
-    expert_cache::ExpertCacheLoadOptions, expert_parallel::load_expert_parallel_model_with_options,
-    models::ModelLoadOptions, sampler::DefaultSampler, DeviceAssignment, ParallelTopology,
+    api::ModelLoadOptions,
+    architectures::distributed::expert::load_expert_parallel_model_with_options,
+    runtime::generation::sampler::DefaultSampler,
+    runtime::residency::expert_cache::ExpertCacheLoadOptions, DeviceAssignment, ParallelTopology,
     WeightResidency,
 };
 

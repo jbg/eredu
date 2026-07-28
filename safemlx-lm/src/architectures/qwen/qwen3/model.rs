@@ -21,8 +21,7 @@ use tokenizers::Tokenizer;
 pub use crate::nn::generation::sample;
 
 use crate::{
-    error::Error,
-    models::{
+    api::{
         common::{
             self,
             attention::{
@@ -37,6 +36,12 @@ use crate::{
         },
         input,
     },
+    error::Error,
+    nn::tensor::{
+        create_attention_mask,
+        rope::{initialize_rope, FloatOrString, RopeVariant},
+        AttentionMask,
+    },
     runtime::cache::KeyValueCache,
     runtime::checkpoint::load::{
         gguf_metadata, gguf_quantization_configs, load_gguf_strict, load_named_array_strict,
@@ -45,11 +50,6 @@ use crate::{
     },
     runtime::checkpoint::quantization::WeightQuantization,
     runtime::execution::inspection::{ActivationObserver, MoeRoutingObservation},
-    utils::{
-        create_attention_mask,
-        rope::{initialize_rope, FloatOrString, RopeVariant},
-        AttentionMask,
-    },
 };
 
 #[derive(Debug, Clone, Deserialize)]
@@ -505,16 +505,16 @@ impl SparseMoeBlock {
     pub(crate) fn forward_expert_parallel(
         &mut self,
         hidden_states: &Array,
-        assignment: &crate::expert_parallel::ExpertAssignment,
+        assignment: &crate::architectures::distributed::expert::ExpertAssignment,
         group: &safemlx::distributed::Group,
-        statistics: &mut crate::expert_parallel::RoutingStatistics,
+        statistics: &mut crate::architectures::distributed::expert::RoutingStatistics,
         prefix: &str,
         mut observer: Option<&mut dyn ActivationObserver>,
         stream: &Stream,
     ) -> Result<Array, Exception> {
         let shape = hidden_states.shape();
         let flat = hidden_states.reshape(&[-1, shape[2]], stream)?;
-        crate::expert_parallel::materialize_timing_phase([&flat])?;
+        crate::architectures::distributed::expert::materialize_timing_phase([&flat])?;
         let moe_started = std::time::Instant::now();
         let previous_moe_time = statistics.total_time;
         let router_started = std::time::Instant::now();
@@ -534,9 +534,9 @@ impl SparseMoeBlock {
         if let Some(scores) = selected_scores.as_ref() {
             router_outputs.push(scores);
         }
-        crate::expert_parallel::materialize_timing_phase(router_outputs)?;
+        crate::architectures::distributed::expert::materialize_timing_phase(router_outputs)?;
         statistics.router_time += router_started.elapsed();
-        let returned = crate::expert_parallel::dispatch_replicated(
+        let returned = crate::architectures::distributed::expert::dispatch_replicated(
             &flat,
             &indices,
             &weights,
@@ -572,7 +572,7 @@ impl SparseMoeBlock {
             })?;
         }
         let output = returned.reduced_output.reshape(shape, stream)?;
-        crate::expert_parallel::materialize_timing_phase([&output])?;
+        crate::architectures::distributed::expert::materialize_timing_phase([&output])?;
         statistics.total_time = previous_moe_time + moe_started.elapsed();
         Ok(output)
     }
@@ -659,9 +659,9 @@ impl FeedForward {
     pub(crate) fn forward_expert_parallel(
         &mut self,
         hidden_states: &Array,
-        assignment: &crate::expert_parallel::ExpertAssignment,
+        assignment: &crate::architectures::distributed::expert::ExpertAssignment,
         group: &safemlx::distributed::Group,
-        statistics: &mut crate::expert_parallel::RoutingStatistics,
+        statistics: &mut crate::architectures::distributed::expert::RoutingStatistics,
         prefix: &str,
         observer: Option<&mut dyn ActivationObserver>,
         stream: &Stream,
@@ -1001,9 +1001,9 @@ impl TransformerBlock {
     pub(crate) fn forward_expert_parallel<C>(
         &mut self,
         input: AttentionInput<'_, C>,
-        assignment: &crate::expert_parallel::ExpertAssignment,
+        assignment: &crate::architectures::distributed::expert::ExpertAssignment,
         group: &safemlx::distributed::Group,
-        statistics: &mut crate::expert_parallel::RoutingStatistics,
+        statistics: &mut crate::architectures::distributed::expert::RoutingStatistics,
         prefix: &str,
         observer: Option<&mut dyn ActivationObserver>,
         stream: &Stream,
@@ -1184,9 +1184,9 @@ impl Qwen3Model {
     pub(crate) fn forward_expert_parallel<C>(
         &mut self,
         input: ModelInput<'_, C>,
-        assignment: &crate::expert_parallel::ExpertAssignment,
+        assignment: &crate::architectures::distributed::expert::ExpertAssignment,
         group: &safemlx::distributed::Group,
-        statistics: &mut crate::expert_parallel::RoutingStatistics,
+        statistics: &mut crate::architectures::distributed::expert::RoutingStatistics,
         mut observer: Option<&mut dyn ActivationObserver>,
         stream: &Stream,
     ) -> Result<Array, Exception>
@@ -1370,9 +1370,9 @@ impl Model {
     pub(crate) fn forward_expert_parallel<C>(
         &mut self,
         input: ModelInput<'_, C>,
-        assignment: &crate::expert_parallel::ExpertAssignment,
+        assignment: &crate::architectures::distributed::expert::ExpertAssignment,
         group: &safemlx::distributed::Group,
-        statistics: &mut crate::expert_parallel::RoutingStatistics,
+        statistics: &mut crate::architectures::distributed::expert::RoutingStatistics,
         observer: Option<&mut dyn ActivationObserver>,
         stream: &Stream,
     ) -> Result<Array, Exception>
@@ -1633,7 +1633,7 @@ pub(crate) fn load_qwen3_gguf_checkpoint(
     }
     report.finish(&model, &config)?;
     model.copy_to_stream(stream)?;
-    let eos_token_ids = crate::models::gguf_eos_token_ids(&metadata)?;
+    let eos_token_ids = crate::api::gguf_eos_token_ids(&metadata)?;
     Ok(LoadedQwen3Gguf {
         model,
         eos_token_ids,
@@ -1667,7 +1667,7 @@ pub(crate) fn prepare_qwen3_gguf_checkpoint(
     args.quantized_weights = Some(configs.keys().cloned().collect());
     args.quantized_weight_configs = Some(configs);
     args.quantization = None;
-    let eos_token_ids = crate::models::gguf_eos_token_ids(metadata)?;
+    let eos_token_ids = crate::api::gguf_eos_token_ids(metadata)?;
     Ok((args, eos_token_ids))
 }
 
@@ -2037,7 +2037,7 @@ where
 }
 
 /// Qwen3 token generation iterator.
-pub type Generate<'a, C, S = crate::sampler::DefaultSampler> =
+pub type Generate<'a, C, S = crate::runtime::generation::sampler::DefaultSampler> =
     common::generation::Generate<'a, Model, Vec<Option<C>>, S>;
 
 #[cfg(test)]
@@ -2053,8 +2053,8 @@ mod tests {
     };
 
     use crate::{
-        models::common::generation::CausalLm,
-        models::qwen3::{load_qwen3_model, load_qwen3_tokenizer},
+        architectures::qwen::qwen3::model::{load_qwen3_model, load_qwen3_tokenizer},
+        nn::generation::CausalLm,
         runtime::cache::{ConcatKeyValueCache, KeyValueCache},
         runtime::checkpoint::quantization::AffineQuantization,
     };
@@ -2505,11 +2505,13 @@ mod tests {
         assert_eq!(model.args.num_experts_per_tok, 8);
 
         let tokens = Array::from_slice(&[1_u32, 2], &[1, 2]);
-        let parts = [crate::models::input::InputPart::text_token_ids(&tokens)];
+        let parts = [crate::runtime::media::input::InputPart::text_token_ids(
+            &tokens,
+        )];
         let mut cache: Vec<Option<ConcatKeyValueCache>> = Vec::new();
         let logits = CausalLm::prefill_input_logits(
             &mut model,
-            crate::models::input::ModelInput::new(&parts),
+            crate::runtime::media::input::ModelInput::new(&parts),
             &mut cache,
             stream,
         )
@@ -2547,11 +2549,13 @@ mod tests {
             .is_some_and(|configs| configs.values().any(|config| config.bits() == 4)));
 
         let tokens = Array::from_slice(&[1_u32, 2], &[1, 2]);
-        let parts = [crate::models::input::InputPart::text_token_ids(&tokens)];
+        let parts = [crate::runtime::media::input::InputPart::text_token_ids(
+            &tokens,
+        )];
         let mut cache: Vec<Option<ConcatKeyValueCache>> = Vec::new();
         let logits = CausalLm::prefill_input_logits(
             &mut model,
-            crate::models::input::ModelInput::new(&parts),
+            crate::runtime::media::input::ModelInput::new(&parts),
             &mut cache,
             stream,
         )
@@ -2581,11 +2585,13 @@ mod tests {
         // exercises the tiled group-16 prefill kernels in every projection.
         let token_ids = vec![1_u32; 64];
         let tokens = Array::from_slice(&token_ids, &[1, 64]);
-        let parts = [crate::models::input::InputPart::text_token_ids(&tokens)];
+        let parts = [crate::runtime::media::input::InputPart::text_token_ids(
+            &tokens,
+        )];
         let mut cache: Vec<Option<ConcatKeyValueCache>> = Vec::new();
         let logits = CausalLm::prefill_input_logits(
             &mut model,
-            crate::models::input::ModelInput::new(&parts),
+            crate::runtime::media::input::ModelInput::new(&parts),
             &mut cache,
             stream,
         )
@@ -2653,10 +2659,10 @@ mod tests {
         let mut cache = Vec::new();
 
         let mut tokens = Vec::new();
-        let input_parts = [crate::models::input::InputPart::text_token_ids(
+        let input_parts = [crate::runtime::media::input::InputPart::text_token_ids(
             &prompt_tokens,
         )];
-        let input = crate::models::input::ModelInput::new(&input_parts);
+        let input = crate::runtime::media::input::ModelInput::new(&input_parts);
         let generate = super::Generate::<ConcatKeyValueCache>::new(
             &mut model, &mut cache, 0.0, input, None, stream,
         );

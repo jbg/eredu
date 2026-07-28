@@ -3,16 +3,16 @@
 use safemlx::{error::Exception, ops::indexing::TryIndexOp, Array, Stream};
 
 use crate::{
-    models::{
+    api::{
         input::{self, ModelInput},
         qwen3_5_moe::{Cache, LayerCache, Model, QwenMtpStepOutput},
     },
-    mtp::{
-        self, MtpBackend, MtpCommit, MtpConfig, MtpExecutionStreams, MtpPrefill,
+    runtime::generation::sampler::SpeculativeSampler,
+    runtime::generation::speculative::{
+        self as mtp, MtpBackend, MtpCommit, MtpConfig, MtpExecutionStreams, MtpPrefill,
         MtpSchedulerOptions, MtpSemanticState,
     },
-    sampler::SpeculativeSampler,
-    streaming::{FinishReason, SemanticEvent},
+    runtime::generation::streaming::{FinishReason, SemanticEvent},
 };
 
 pub(crate) trait QwenMtpTarget {
@@ -72,7 +72,7 @@ impl QwenMtpTarget for Model {
     }
 }
 
-impl QwenMtpTarget for crate::qwen_hybrid::QwenHybridLayerwiseModel {
+impl QwenMtpTarget for crate::architectures::qwen::hybrid::layerwise::QwenHybridLayerwiseModel {
     fn prefill_mtp_target(
         &mut self,
         input: ModelInput<'_>,

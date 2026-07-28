@@ -13,8 +13,9 @@ use safemlx::{
     Device, DeviceType, Stream,
 };
 use safemlx_lm::{
-    parallel::load_safetensors_partition, weights::StrictLoadConfig, DeviceAssignment,
-    ParallelTopology, PlacementPlan, TensorPlacement,
+    runtime::checkpoint::load::StrictLoadConfig,
+    runtime::distributed::topology::load_safetensors_partition, DeviceAssignment, ParallelTopology,
+    PlacementPlan, TensorPlacement,
 };
 use safetensors::tensor::{serialize_to_file, Dtype, TensorView};
 

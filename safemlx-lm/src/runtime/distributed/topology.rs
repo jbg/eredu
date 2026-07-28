@@ -1136,14 +1136,14 @@ mod tests {
 
     #[test]
     fn model_load_options_preserve_singleton_behavior_and_reject_partial_models() {
-        let default = crate::models::ModelLoadOptions::default();
+        let default = crate::api::ModelLoadOptions::default();
         assert_eq!(default.quantization, None);
         assert_eq!(default.parallel, None);
-        crate::models::ensure_executable_load_options(default).unwrap();
+        crate::api::ensure_executable_load_options(default).unwrap();
 
-        let singleton = crate::models::ModelLoadOptions::with_parallel(topology(1, 0, 1, 1, 1));
-        crate::models::ensure_executable_load_options(singleton).unwrap();
-        let combined = crate::models::ModelLoadOptions::with_quantization(
+        let singleton = crate::api::ModelLoadOptions::with_parallel(topology(1, 0, 1, 1, 1));
+        crate::api::ensure_executable_load_options(singleton).unwrap();
+        let combined = crate::api::ModelLoadOptions::with_quantization(
             crate::runtime::checkpoint::quantization::WeightQuantization::MxFp4,
         )
         .with_parallel_topology(topology(1, 0, 1, 1, 1));
@@ -1153,9 +1153,9 @@ mod tests {
         );
         assert!(combined.parallel.unwrap().is_replicated());
 
-        let partitioned = crate::models::ModelLoadOptions::with_parallel(topology(2, 0, 2, 1, 1));
+        let partitioned = crate::api::ModelLoadOptions::with_parallel(topology(2, 0, 2, 1, 1));
         assert!(matches!(
-            crate::models::ensure_executable_load_options(partitioned),
+            crate::api::ensure_executable_load_options(partitioned),
             Err(Error::Parallel(_))
         ));
     }

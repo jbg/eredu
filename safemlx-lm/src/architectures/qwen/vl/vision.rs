@@ -14,7 +14,7 @@ use safemlx::{
 };
 use serde::Deserialize;
 
-use crate::{cache::ConcatKeyValueCache, models::common::layers::silu};
+use crate::{nn::layers::silu, runtime::cache::ConcatKeyValueCache};
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 /// Qwen VL vision encoder configuration.
@@ -371,7 +371,7 @@ impl QwenVisionAttention {
                 .try_index_device((start..end, .., ..), stream)?
                 .transpose_axes(&[1, 0, 2], stream)?
                 .try_index_device((NewAxis, .., .., ..), stream)?;
-            let out = crate::utils::scaled_dot_product_attention(
+            let out = crate::nn::tensor::scaled_dot_product_attention(
                 q,
                 k,
                 v,

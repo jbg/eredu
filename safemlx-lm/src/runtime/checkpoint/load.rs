@@ -1210,7 +1210,7 @@ mod tests {
     };
 
     use crate::{
-        models::common::linear::unloaded_maybe_quantized_linear,
+        nn::linear::unloaded_maybe_quantized_linear,
         runtime::checkpoint::quantization::{
             quantize_tensor, AffineQuantization, WeightQuantization,
         },

@@ -20,7 +20,7 @@ assistant drafting, expanded model dispatch, and related generation utilities.
 
 ## Persistent checkpoint storage
 
-The public `safemlx_lm::weight_store` module catalogs SafeTensors and GGUF
+The public `safemlx_lm::runtime::checkpoint::store` module catalogs SafeTensors and GGUF
 checkpoints without materializing tensor arrays. `SafetensorsWeightStore`
 accepts a direct payload file, a directory containing `model.safetensors`, or a
 Hugging Face-style sharded index. `GgufWeightStore` accepts one or more
@@ -54,9 +54,9 @@ a specific error and never silently falls back to fully resident execution.
 
 Distributed placement decides which tensors a rank owns. Residency is a
 separate concern that decides where an owned logical unit lives and for how
-long. The public `safemlx_lm::offload` module provides architecture-independent
+long. The public `safemlx_lm::runtime::residency::policy` module provides architecture-independent
 configuration, explicit deterministic plans, tier byte totals, and reusable
-telemetry. The public `safemlx_lm::residency` module executes those plans for
+telemetry. The public `safemlx_lm::runtime::residency::manager` module executes those plans for
 caller-defined logical units. Each `OffloadUnit` groups one or more named
 checkpoint selections, including companion tensors that must become visible
 atomically.
@@ -165,7 +165,8 @@ conservative stream synchronization until an event-backed API is available.
 
 ## Llama-compatible weight residency
 
-`llama::load_llama_model` returns one `LlamaModel` inference facade. Choose
+`architectures::llama::layerwise::load_llama_model` returns one `LlamaModel`
+inference facade. Choose
 `LlamaLoadOptions::fully_resident()` for the eager execution-device model or
 `LlamaLoadOptions::layerwise_host(...)` for the generic host-backed decoder
 engine. Both policies use the same `LlamaCache`, `forward`, `prefill`, `decode`,
@@ -174,7 +175,8 @@ Mistral safetensors are supported.
 
 ```rust
 use safemlx_lm::{
-    load_llama_model, LayerwiseLoadOptions, LlamaLoadOptions,
+    architectures::llama::layerwise::{load_llama_model, LlamaLoadOptions},
+    runtime::execution::layerwise::LayerwiseLoadOptions,
 };
 
 let eager = LlamaLoadOptions::fully_resident();
@@ -308,7 +310,7 @@ than the Metal-specialized paths.
 
 ## GGUF models
 
-The standard `models::load_model` and `models::LoadedModel::load` entry points
+The standard `api::load_model` and `api::LoadedModel::load` entry points
 accept Hugging Face-style model directories for Gemma 4, GPT-OSS, Inkling, Llama, dense Mistral,
 dense LFM2/LFM2.5 and LFM2-MoE, dense and sparse-MoE Nemotron-H, Qwen3,
 Qwen3-Next, Qwen3-VL, Qwen3-VL-MoE, and dense or MoE Qwen3.5. They also accept the
@@ -321,7 +323,7 @@ validated automatically. Put `tokenizer.json` next to a GGUF file when using
 `tokenizer_config.json` and `chat_template.jinja` files are used when present.
 
 ```rust,ignore
-use safemlx_lm::models::LoadedModel;
+use safemlx_lm::api::LoadedModel;
 
 let model = LoadedModel::load(
     "/path/to/model-00001-of-00004.gguf",
@@ -346,7 +348,7 @@ architectures, plus `qwen3next` and dense `qwen3vl` with its separate vision pro
 Qwen3-VL, put the llama.cpp-style dense F16/BF16/F32
 `mmproj-*.gguf` next to the language-model GGUF. The single-path loaders prefer
 the unique dense projector automatically; callers that need an explicit pair
-can use `models::qwen3_vl::load_qwen3_vl_gguf`.
+can use `architectures::qwen::vl::model::load_qwen3_vl_gguf`.
 Nemotron-H routed expert banks retain Q2_K/Q3_K/Q4_0/Q4_1/Q4_K/Q5_K/Q6_K/Q8_0 packed weights
 and execute through selected-expert quantized matrix multiplication. Qwen3 MoE
 uses the same packed expert-major execution with per-tensor mixed Q2/Q3/Q4/Q5/Q6/Q8
@@ -713,7 +715,7 @@ segments. Media is inserted where the segment appears; callers do not put
 image/video/audio media tokens in rendered prompt text:
 
 ```rust,ignore
-use safemlx_lm::processor::{MediaInput, ProcessorInput, RgbImageView};
+use safemlx_lm::runtime::media::{MediaInput, ProcessorInput, RgbImageView};
 
 let image = RgbImageView::packed(rgb_pixels, width, height)?;
 let prepared = model.prepare_input(
@@ -768,7 +770,7 @@ safemlx-lm = { version = "0.4", features = ["audio-processing"] }
 ```
 
 ```rust,ignore
-use safemlx_lm::processor::{MediaInput, ProcessorInput};
+use safemlx_lm::runtime::media::{MediaInput, ProcessorInput};
 
 let audio = MediaInput::audio_f32(mono_pcm, sample_rate)?;
 let prepared = model.prepare_input(&[
@@ -834,13 +836,13 @@ PersonaPlex system-prompt helpers accept either the fully resident model or
 `MoshiLayerwiseModel`, so forced voice/text prefill continues into ordinary
 realtime generation with the same delayed-stream and transformer caches.
 
-The `models::moshi` module implements Moshi's temporal and depth language
+The `architectures::moshi::model` module implements Moshi's temporal and depth language
 models over pre-tokenized Mimi streams. `GenerationState` accepts one
 input-side Mimi frame at a time and returns delay-aligned generated-side Mimi
 frames; `generate_encoded_greedy` is the offline sequence convenience API.
 Sequence tensors use Mimi's `[batch, codebooks, frames]` layout.
 
-`models::personaplex` exposes PersonaPlex's Moshi-family realtime token API,
+`architectures::moshi::personaplex` exposes PersonaPlex's Moshi-family realtime token API,
 published 7B v1 defaults, dual-stream codebook layout, and hybrid system-prompt
 helpers. It can load the released Hugging Face PyTorch-layout
 `model.safetensors` directly via the shared Moshi-family PyTorch importer.
@@ -891,12 +893,12 @@ unquantized F32, F16, and BF16 GGUF inputs through `ModelLoadOptions`. GGUF file
 packed quantized tensors are rejected rather than being implicitly dequantized and transcoded to
 affine or MXFP4 storage.
 
-Library callers can use `quantization::quantize_checkpoint` for conversion,
+Library callers can use `runtime::checkpoint::quantization::quantize_checkpoint` for conversion,
 the shared `ModelLoadOptions` APIs for architecture dispatch, or
-`weights::load_safetensors_dir_quantized_strict` to populate a model that
+`runtime::checkpoint::load::load_safetensors_dir_quantized_strict` to populate a model that
 exposes the standard packed parameter tree. Model-specific
 `load_*_model_quantized` helpers remain available. All modes call
-`quantization::quantize_tensor` with a caller-owned explicit stream, so saving
+`runtime::checkpoint::quantization::quantize_tensor` with a caller-owned explicit stream, so saving
 and direct loading use the same numerical transform.
 Direct loading materializes each packed weight/scale/bias triple before reading
 the next dense tensor. This prevents MLX's lazy graphs from retaining the whole

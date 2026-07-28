@@ -400,7 +400,8 @@ mod tests {
 
     use super::*;
     use crate::{
-        models::common::linear::unloaded_maybe_quantized_linear, quantization::AffineQuantization,
+        nn::linear::unloaded_maybe_quantized_linear,
+        runtime::checkpoint::quantization::AffineQuantization,
         runtime::checkpoint::store::SafetensorsWeightStore,
     };
 

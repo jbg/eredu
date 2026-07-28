@@ -5,18 +5,18 @@ use std::{collections::HashMap, sync::Arc};
 use safemlx::{error::Exception, ops::indexing::TryIndexOp, transforms::eval, Array, Stream};
 
 use crate::{
-    gemma4::Gemma4LayerwiseModel,
-    models::{
+    api::{
         gemma4::{Cache, Gemma4Embedding, Gemma4StepOutput, LayerType, Model as Gemma4Model},
         gemma4_assistant::{Gemma4AssistantDraftModel, Gemma4AssistantDraftState},
         input::ModelInput as RuntimeInput,
     },
-    mtp::{
-        self, MtpBackend, MtpCommit, MtpConfig, MtpExecutionStreams, MtpPrefill,
+    architectures::gemma4::layerwise::Gemma4LayerwiseModel,
+    runtime::generation::sampler::SpeculativeSampler,
+    runtime::generation::speculative::{
+        self as mtp, MtpBackend, MtpCommit, MtpConfig, MtpExecutionStreams, MtpPrefill,
         MtpSchedulerOptions, MtpSemanticState,
     },
-    sampler::SpeculativeSampler,
-    streaming::{FinishReason, SemanticEvent},
+    runtime::generation::streaming::{FinishReason, SemanticEvent},
 };
 
 #[derive(Clone)]

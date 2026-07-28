@@ -38,7 +38,7 @@ fn run_prepared_chat_mtp_batch<'a, B, S>(
     options: MtpSchedulerOptions,
 ) -> Result<PreparedChatMtpBatchOutput, Exception>
 where
-    B: crate::mtp::MtpBackend,
+    B: crate::runtime::generation::speculative::MtpBackend,
     S: SpeculativeSampler + Clone + 'a,
 {
     let mut scheduler = MtpScheduler::new(backend, streams, options)?;
@@ -110,7 +110,7 @@ fn run_external_mtp_batch<'a, B, S>(
     streams: MtpExecutionStreams<'a>,
 ) -> Result<MtpBatchOutput, Exception>
 where
-    B: crate::mtp::MtpBackend<Cache = gemma4::Cache>,
+    B: crate::runtime::generation::speculative::MtpBackend<Cache = gemma4::Cache>,
     S: SpeculativeSampler + Clone + 'a,
 {
     let mut batch_prng = prng_key.map(RandomState::from_key);
@@ -177,7 +177,7 @@ fn run_embedded_mtp_batch<'a, B, S>(
     stream: &'a Stream,
 ) -> Result<MtpBatchOutput, Exception>
 where
-    B: crate::mtp::MtpBackend<Cache = qwen3_5_moe::Cache>,
+    B: crate::runtime::generation::speculative::MtpBackend<Cache = qwen3_5_moe::Cache>,
     S: SpeculativeSampler + Clone + 'a,
 {
     let streams = MtpExecutionStreams::single(stream);
@@ -318,7 +318,8 @@ impl LoadedModel {
         match &mut self.model {
             Model::Gemma4(target) => {
                 validate_gemma4_drafter(&target.args, assistant)?;
-                let mut backend = crate::gemma4_mtp::Gemma4MtpBackend::new(target, assistant);
+                let mut backend =
+                    crate::architectures::gemma4::mtp::Gemma4MtpBackend::new(target, assistant);
                 run_prepared_chat_mtp_batch(
                     &mut backend,
                     prepared_lanes,
@@ -331,7 +332,8 @@ impl LoadedModel {
             }
             Model::Gemma4Layerwise(target) => {
                 validate_gemma4_drafter(target.args(), assistant)?;
-                let mut backend = crate::gemma4_mtp::Gemma4MtpBackend::new(target, assistant);
+                let mut backend =
+                    crate::architectures::gemma4::mtp::Gemma4MtpBackend::new(target, assistant);
                 run_prepared_chat_mtp_batch(
                     &mut backend,
                     prepared_lanes,
@@ -373,7 +375,7 @@ impl LoadedModel {
         let streams = MtpExecutionStreams::single(stream);
         match &mut self.model {
             Model::Qwen3Next(target) => {
-                let mut backend = crate::qwen_mtp::QwenMtpBackend::new(target);
+                let mut backend = crate::architectures::qwen::hybrid::mtp::QwenMtpBackend::new(target);
                 run_prepared_chat_mtp_batch(
                     &mut backend,
                     prepared_lanes,
@@ -385,7 +387,7 @@ impl LoadedModel {
                 .map_err(|error| Error::PreparedChatGeneration(error.to_string()))
             }
             Model::Qwen35Moe(target) => {
-                let mut backend = crate::qwen_mtp::QwenMtpBackend::new(target);
+                let mut backend = crate::architectures::qwen::hybrid::mtp::QwenMtpBackend::new(target);
                 run_prepared_chat_mtp_batch(
                     &mut backend,
                     prepared_lanes,
@@ -397,7 +399,7 @@ impl LoadedModel {
                 .map_err(|error| Error::PreparedChatGeneration(error.to_string()))
             }
             Model::Qwen3NextLayerwise(target) => {
-                let mut backend = crate::qwen_mtp::QwenMtpBackend::new(target);
+                let mut backend = crate::architectures::qwen::hybrid::mtp::QwenMtpBackend::new(target);
                 run_prepared_chat_mtp_batch(
                     &mut backend,
                     prepared_lanes,
@@ -409,7 +411,7 @@ impl LoadedModel {
                 .map_err(|error| Error::PreparedChatGeneration(error.to_string()))
             }
             Model::Qwen35MoeLayerwise(target) => {
-                let mut backend = crate::qwen_mtp::QwenMtpBackend::new(target);
+                let mut backend = crate::architectures::qwen::hybrid::mtp::QwenMtpBackend::new(target);
                 run_prepared_chat_mtp_batch(
                     &mut backend,
                     prepared_lanes,
@@ -1027,7 +1029,8 @@ impl LoadedModel {
         match &mut self.model {
             Model::Gemma4(target) => {
                 validate_gemma4_drafter(&target.args, assistant)?;
-                let mut backend = crate::gemma4_mtp::Gemma4MtpBackend::new(target, assistant);
+                let mut backend =
+                    crate::architectures::gemma4::mtp::Gemma4MtpBackend::new(target, assistant);
                 run_external_mtp_batch(
                     &mut backend,
                     &mut cache.lanes,
@@ -1040,7 +1043,8 @@ impl LoadedModel {
             }
             Model::Gemma4Layerwise(target) => {
                 validate_gemma4_drafter(target.args(), assistant)?;
-                let mut backend = crate::gemma4_mtp::Gemma4MtpBackend::new(target, assistant);
+                let mut backend =
+                    crate::architectures::gemma4::mtp::Gemma4MtpBackend::new(target, assistant);
                 run_external_mtp_batch(
                     &mut backend,
                     &mut cache.lanes,
@@ -1119,7 +1123,8 @@ impl LoadedModel {
         }
         match &mut self.model {
             Model::Qwen3Next(target) => {
-                let mut backend = crate::qwen_mtp::QwenMtpBackend::new(target);
+                let mut backend =
+                    crate::architectures::qwen::hybrid::mtp::QwenMtpBackend::new(target);
                 run_embedded_mtp_batch(
                     &mut backend,
                     &mut cache.lanes,
@@ -1132,7 +1137,8 @@ impl LoadedModel {
                 )
             }
             Model::Qwen35Moe(target) => {
-                let mut backend = crate::qwen_mtp::QwenMtpBackend::new(target);
+                let mut backend =
+                    crate::architectures::qwen::hybrid::mtp::QwenMtpBackend::new(target);
                 run_embedded_mtp_batch(
                     &mut backend,
                     &mut cache.lanes,
@@ -1145,7 +1151,8 @@ impl LoadedModel {
                 )
             }
             Model::Qwen3NextLayerwise(target) => {
-                let mut backend = crate::qwen_mtp::QwenMtpBackend::new(target);
+                let mut backend =
+                    crate::architectures::qwen::hybrid::mtp::QwenMtpBackend::new(target);
                 run_embedded_mtp_batch(
                     &mut backend,
                     &mut cache.lanes,
@@ -1158,7 +1165,8 @@ impl LoadedModel {
                 )
             }
             Model::Qwen35MoeLayerwise(target) => {
-                let mut backend = crate::qwen_mtp::QwenMtpBackend::new(target);
+                let mut backend =
+                    crate::architectures::qwen::hybrid::mtp::QwenMtpBackend::new(target);
                 run_embedded_mtp_batch(
                     &mut backend,
                     &mut cache.lanes,
@@ -1267,7 +1275,7 @@ impl LoadedModel {
         let model = match kind {
             ModelKind::PersonaPlex => {
                 return Err(Error::UnsupportedArchitecture(
-                    "PersonaPlex is a realtime speech-to-speech token model; use models::personaplex instead of LoadedModel".into(),
+                    "PersonaPlex is a realtime speech-to-speech token model; use architectures::moshi::personaplex instead of LoadedModel".into(),
                 ));
             }
             _ => load_model_for_kind(kind, model_dir, options, stream, weights_stream)?,
@@ -1709,7 +1717,7 @@ pub(super) fn load_gguf_model_data(
                 (Model::DeepSeekV3(loaded.model), loaded.eos_token_ids)
             } else {
                 let (loaded, eos_token_ids) =
-                    crate::deepseek_v3::load_deepseek_v3_gguf_layerwise_model(
+                    crate::architectures::deepseek_v3::layerwise::load_deepseek_v3_gguf_layerwise_model(
                         &checkpoint,
                         &metadata,
                         options.weight_residency,
@@ -1731,7 +1739,7 @@ pub(super) fn load_gguf_model_data(
                 (Model::Gemma4(loaded.model), loaded.eos_token_ids)
             } else {
                 let (loaded, eos_token_ids) =
-                    crate::gemma4::load_gemma4_gguf_layerwise_model(
+                    crate::architectures::gemma4::layerwise::load_gemma4_gguf_layerwise_model(
                         &checkpoint,
                         &metadata,
                         options.weight_residency,
@@ -1752,7 +1760,7 @@ pub(super) fn load_gguf_model_data(
                 )?;
                 (Model::Llama(loaded.model), loaded.eos_token_ids)
             } else {
-                let (loaded, eos_token_ids) = crate::llama::load_llama_gguf_model(
+                let (loaded, eos_token_ids) = crate::architectures::llama::layerwise::load_llama_gguf_model(
                     &checkpoint,
                     &metadata,
                     options.weight_residency,
@@ -1773,7 +1781,7 @@ pub(super) fn load_gguf_model_data(
                 )?;
                 (Model::Lfm2(loaded.model), loaded.eos_token_ids)
             } else {
-                let (loaded, eos_token_ids) = crate::lfm2::load_lfm2_gguf_layerwise_model(
+                let (loaded, eos_token_ids) = crate::architectures::lfm2::layerwise::load_lfm2_gguf_layerwise_model(
                     &checkpoint,
                     &metadata,
                     options.weight_residency,
@@ -1800,7 +1808,7 @@ pub(super) fn load_gguf_model_data(
                 (Model::NemotronH(loaded.model), loaded.eos_token_ids)
             } else {
                 let (loaded, eos_token_ids) =
-                    crate::nemotron_h::load_nemotron_h_gguf_layerwise_model(
+                    crate::architectures::nemotron_h::layerwise::load_nemotron_h_gguf_layerwise_model(
                         &checkpoint,
                         &metadata,
                         options.weight_residency,
@@ -1821,7 +1829,7 @@ pub(super) fn load_gguf_model_data(
                 )?;
                 (Model::Qwen3(loaded.model), loaded.eos_token_ids)
             } else {
-                let (loaded, eos_token_ids) = crate::qwen3::load_qwen3_gguf_layerwise_model(
+                let (loaded, eos_token_ids) = crate::architectures::qwen::qwen3::layerwise::load_qwen3_gguf_layerwise_model(
                     &checkpoint,
                     &metadata,
                     &architecture,
@@ -1849,7 +1857,7 @@ pub(super) fn load_gguf_model_data(
                 (Model::Qwen3Vl(loaded.model), loaded.eos_token_ids)
             } else {
                 let (loaded, eos_token_ids) =
-                    crate::qwen3_vl::load_qwen3_vl_gguf_layerwise_model(
+                    crate::architectures::qwen::vl::layerwise::load_qwen3_vl_gguf_layerwise_model(
                         &checkpoint,
                         &metadata,
                         &vision_checkpoint,
@@ -1878,7 +1886,7 @@ pub(super) fn load_gguf_model_data(
                 (model, loaded.eos_token_ids)
             } else {
                 let (loaded, eos_token_ids, is_next) =
-                    crate::qwen_hybrid::load_qwen_hybrid_gguf_layerwise_model(
+                    crate::architectures::qwen::hybrid::layerwise::load_qwen_hybrid_gguf_layerwise_model(
                         &checkpoint,
                         &metadata,
                         options.weight_residency,

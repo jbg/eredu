@@ -19,8 +19,7 @@ use safemlx::{
 };
 
 use crate::{
-    error::Error,
-    models::{
+    api::{
         common::{
             attention::AttentionInput,
             generation::CausalLm,
@@ -32,6 +31,8 @@ use crate::{
         input,
         qwen3::{self as resident, ModelArgs, TransformerBlock},
     },
+    error::Error,
+    nn::tensor::{create_attention_mask, AttentionMask},
     runtime::cache::{ConcatKeyValueCache, KeyValueCache},
     runtime::checkpoint::binding::{
         build_module_bindings, build_module_bindings_excluding, build_module_bindings_with_recipes,
@@ -48,7 +49,6 @@ use crate::{
         ExpertPass,
     },
     runtime::residency::manager::{OffloadUnit, ResidencyReport, ResidentUnitLease, WeightBinding},
-    utils::{create_attention_mask, AttentionMask},
 };
 
 const EMBEDDING_UNIT: &str = "qwen3.static.embedding";
@@ -892,7 +892,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        models::qwen3,
+        api::qwen3,
         runtime::execution::layerwise::LayerwiseLoadOptions,
         runtime::residency::policy::{MemoryTier, OffloadConfig, ResidencyPolicy},
     };

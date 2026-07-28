@@ -26,8 +26,7 @@ use serde_json::Value;
 use tokenizers::Tokenizer;
 
 use crate::{
-    error::Error,
-    models::{
+    api::{
         common::{
             self,
             attention::{batch_seq, finish_attention, reshape_attention_projection},
@@ -39,6 +38,8 @@ use crate::{
         },
         input,
     },
+    error::Error,
+    nn::tensor::{create_attention_mask, AttentionMask},
     runtime::cache::{ConcatKeyValueCache, KeyValueCache},
     runtime::checkpoint::load::{
         gguf_metadata, gguf_quantization_configs, load_gguf_strict,
@@ -46,7 +47,6 @@ use crate::{
         GgufTensorNames, StrictLoadConfig, StrictLoadReport,
     },
     runtime::checkpoint::quantization::{AffineQuantization, WeightQuantization},
-    utils::{create_attention_mask, AttentionMask},
 };
 
 /// Layer block kind encoded by `hybrid_override_pattern`.
@@ -2112,7 +2112,7 @@ impl CausalLm<Cache> for Model {
 }
 
 /// Nemotron-H token generation iterator.
-pub type Generate<'a, S = crate::sampler::DefaultSampler> =
+pub type Generate<'a, S = crate::runtime::generation::sampler::DefaultSampler> =
     common::generation::Generate<'a, Model, Cache, S>;
 
 pub(crate) struct LoadedNemotronHGguf {
@@ -2204,7 +2204,7 @@ pub(crate) fn load_nemotron_h_gguf_checkpoint(
     )?;
     report.finish(&model, &config)?;
     model.copy_to_stream(stream)?;
-    let eos_token_ids = crate::models::gguf_eos_token_ids(&metadata)?;
+    let eos_token_ids = crate::api::gguf_eos_token_ids(&metadata)?;
     Ok(LoadedNemotronHGguf {
         model,
         eos_token_ids,
@@ -2249,7 +2249,7 @@ pub(crate) fn prepare_nemotron_h_gguf_checkpoint(
     args.quantized_weights = Some(configs.keys().cloned().collect());
     args.quantized_weight_configs = Some(configs);
     args.quantization = None;
-    let eos_token_ids = crate::models::gguf_eos_token_ids(metadata)?;
+    let eos_token_ids = crate::api::gguf_eos_token_ids(metadata)?;
     Ok(PreparedNemotronHGguf {
         args,
         eos_token_ids,
@@ -2887,7 +2887,7 @@ mod tests {
     };
     use crate::runtime::checkpoint::load::{StrictLoadConfig, StrictLoadReport};
     use crate::{
-        models::common::{generation::CausalLm, moe::TopKRouterScoreFunction},
+        nn::{generation::CausalLm, moe::TopKRouterScoreFunction},
         runtime::checkpoint::quantization::AffineQuantization,
     };
     use safemlx::{module::ModuleParameters, ops::indexing::TryIndexOp, Array, ExecutionContext};
@@ -3248,8 +3248,10 @@ mod tests {
         let mut model = Model::new(tiny_full_args(), stream).unwrap();
         let mut cache = model.new_cache();
         let prompt = Array::from_slice(&[1_u32, 2, 3], &[1, 3]);
-        let input_parts = [crate::models::input::InputPart::text_token_ids(&prompt)];
-        let input = crate::models::input::ModelInput::new(&input_parts);
+        let input_parts = [crate::runtime::media::input::InputPart::text_token_ids(
+            &prompt,
+        )];
+        let input = crate::runtime::media::input::ModelInput::new(&input_parts);
         let logits = CausalLm::prefill_input_logits(&mut model, input, &mut cache, stream).unwrap();
         assert_eq!(logits.shape(), &[1, 16]);
         assert!(cache.offset() >= 3);
@@ -3382,11 +3384,13 @@ mod tests {
             .contains(&LayerBlockType::Moe));
 
         let tokens = Array::from_slice(&[1_u32, 2], &[1, 2]);
-        let parts = [crate::models::input::InputPart::text_token_ids(&tokens)];
+        let parts = [crate::runtime::media::input::InputPart::text_token_ids(
+            &tokens,
+        )];
         let mut cache = model.new_cache();
         let logits = CausalLm::prefill_input_logits(
             &mut model,
-            crate::models::input::ModelInput::new(&parts),
+            crate::runtime::media::input::ModelInput::new(&parts),
             &mut cache,
             stream,
         )

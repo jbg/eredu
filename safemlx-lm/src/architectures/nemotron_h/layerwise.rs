@@ -18,8 +18,7 @@ use safemlx::{
 };
 
 use crate::{
-    error::Error,
-    models::{
+    api::{
         common::{self, generation::CausalLm, linear::project_logits_maybe_quantized},
         input,
         nemotron_h::{
@@ -27,6 +26,8 @@ use crate::{
             TransformerBlock,
         },
     },
+    error::Error,
+    nn::tensor::{create_attention_mask, AttentionMask},
     runtime::cache::KeyValueCache,
     runtime::checkpoint::binding::{
         build_module_bindings_with_recipes, canonical_checkpoint_name, populate_module_from_lease,
@@ -44,7 +45,6 @@ use crate::{
         ExpertPass,
     },
     runtime::residency::manager::{OffloadUnit, ResidencyReport, ResidentUnitLease, WeightBinding},
-    utils::{create_attention_mask, AttentionMask},
 };
 
 const EMBEDDING_UNIT: &str = "nemotron_h.static.embedding";
@@ -962,7 +962,7 @@ fn nemotron_recipe_binding(
 }
 
 /// Nemotron-H token generation iterator using bounded layer execution.
-pub type Generate<'a, S = crate::sampler::DefaultSampler> =
+pub type Generate<'a, S = crate::runtime::generation::sampler::DefaultSampler> =
     common::generation::Generate<'a, NemotronHLayerwiseModel, Cache, S>;
 
 #[cfg(test)]
@@ -977,7 +977,9 @@ mod tests {
 
     use super::{load_nemotron_h_layerwise_model, load_nemotron_h_sparse_expert_cache_model};
     use crate::{
-        models::nemotron_h::{self as resident, Cache, LayerCache, Model, ModelArgs, ModelInput},
+        architectures::nemotron_h::model::{
+            self as resident, Cache, LayerCache, Model, ModelArgs, ModelInput,
+        },
         runtime::execution::layerwise::LayerwiseLoadOptions,
         runtime::residency::expert_cache::ExpertCacheLoadOptions,
         runtime::residency::policy::{OffloadConfig, ResidencyPolicy},
@@ -1041,10 +1043,10 @@ mod tests {
                 continue;
             };
             let field = match args.layer_block_type(index).unwrap() {
-                crate::models::nemotron_h::LayerBlockType::Mamba => "mamba",
-                crate::models::nemotron_h::LayerBlockType::Attention => "attention",
-                crate::models::nemotron_h::LayerBlockType::Mlp => "mlp",
-                crate::models::nemotron_h::LayerBlockType::Moe => "moe",
+                crate::architectures::nemotron_h::model::LayerBlockType::Mamba => "mamba",
+                crate::architectures::nemotron_h::model::LayerBlockType::Attention => "attention",
+                crate::architectures::nemotron_h::model::LayerBlockType::Mlp => "mlp",
+                crate::architectures::nemotron_h::model::LayerBlockType::Moe => "moe",
             };
             if let Some(mixer_rest) = rest.strip_prefix(&format!("{field}.")) {
                 return format!("backbone.layers.{index}.mixer.{mixer_rest}");
@@ -1229,10 +1231,10 @@ mod tests {
         assert_eq!(report.owned_experts, 2);
         assert!(report.prefill.requested_routes > 0);
         assert!(report.decode.requested_routes > 0);
-        crate::expert_parallel::assert_rank_owned_sparse_ep_load(
+        crate::architectures::distributed::expert::assert_rank_owned_sparse_ep_load(
             dir.path(),
             options,
-            crate::models::ModelKind::NemotronH,
+            crate::api::ModelKind::NemotronH,
             report.owned_experts / 2,
             gpu.stream(),
             cpu.stream(),

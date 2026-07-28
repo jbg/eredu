@@ -15,22 +15,20 @@ use safemlx::{
     Array, Device, DeviceType, Stream,
 };
 use safemlx_lm::{
-    error::Error,
-    expert_cache::{
-        ExpertCache, ExpertCacheLoadOptions, ExpertCatalogEntry, ExpertIdentity, ExpertPass,
-    },
-    expert_parallel::{
+    architectures::deepseek_v3::model::RoutedExperts,
+    architectures::distributed::expert::{
         all_to_all_v, dispatch_replicated_with, dispatch_sharded, profile_expert_parallel_timings,
         DispatchedRoutes, ExpertAssignment, LocalExpertBank, ShardedRouteBlocks,
     },
-    layerwise::LayerwiseLoadOptions,
-    models::{
-        common::moe::{PackedRelu2Experts, PackedSwiGluExperts},
-        deepseek_v3::RoutedExperts,
+    error::Error,
+    nn::moe::{PackedRelu2Experts, PackedSwiGluExperts},
+    runtime::checkpoint::store::{SafetensorsWeightStore, TensorSelection},
+    runtime::execution::layerwise::LayerwiseLoadOptions,
+    runtime::residency::expert_cache::{
+        ExpertCache, ExpertCacheLoadOptions, ExpertCatalogEntry, ExpertIdentity, ExpertPass,
     },
-    offload::OffloadConfig,
-    residency::{OffloadUnit, WeightBinding},
-    weight_store::{SafetensorsWeightStore, TensorSelection},
+    runtime::residency::manager::{OffloadUnit, WeightBinding},
+    runtime::residency::policy::OffloadConfig,
 };
 use safetensors::tensor::{serialize_to_file, Dtype as TensorDtype, TensorView};
 

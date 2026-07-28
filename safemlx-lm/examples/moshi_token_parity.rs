@@ -4,7 +4,7 @@ use safemlx::{
     module::ModuleParameters, ops::indexing::TryIndexOp, Array, Device, DeviceType,
     ExecutionContext,
 };
-use safemlx_lm::models::moshi;
+use safemlx_lm::architectures::moshi::model as moshi;
 
 fn main() -> anyhow::Result<()> {
     let args = std::env::args().skip(1).collect::<Vec<_>>();

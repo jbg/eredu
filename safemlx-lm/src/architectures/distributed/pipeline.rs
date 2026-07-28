@@ -25,11 +25,12 @@ use safemlx::{
 };
 
 use crate::{
-    error::Error,
-    models::{
+    api::{
         common::{linear, linear::project_logits_maybe_quantized},
         deepseek_v3, llama, ModelKind, ModelLoadOptions,
     },
+    error::Error,
+    nn::tensor::create_causal_mask,
     runtime::cache::residency::{
         open_prompt_cache, validate_prompt_cache_model_identity, CacheRankIdentity,
         CacheResidencyManager, CacheResidencyPolicy, CacheResidencyReport, PagedCacheOptions,
@@ -54,12 +55,11 @@ use crate::{
     runtime::execution::layerwise::{
         DenseDiskStreamReport, DenseStreamController, GeneralLayerwiseModelAdapter, WeightResidency,
     },
+    runtime::generation::sampler::Sampler,
     runtime::residency::manager::{OffloadUnit, ResidencyManager},
     runtime::residency::policy::{
         MemoryTier, OffloadConfig, OffloadPlan, OffloadUnitId, OffloadUnitSpec, ResidencyPolicy,
     },
-    sampler::Sampler,
-    utils::create_causal_mask,
 };
 
 /// Immutable, inspectable description of the local pipeline stage.
@@ -587,7 +587,9 @@ impl PipelineModel {
             ArchitectureStage::Llama(stage) => (
                 "llama".to_string(),
                 stage.args.model_type.clone(),
-                crate::models::llama::prompt_cache_architecture_fingerprint(&stage.args),
+                crate::architectures::llama::model::prompt_cache_architecture_fingerprint(
+                    &stage.args,
+                ),
                 usize::try_from(stage.args.num_hidden_layers)
                     .map_err(|_| Error::Parallel("invalid Llama layer count".into()))?,
                 stage.range.clone(),
@@ -596,7 +598,9 @@ impl PipelineModel {
             ArchitectureStage::DeepSeek(stage) => (
                 "deepseek_v3".to_string(),
                 stage.args.model_type.clone(),
-                crate::models::deepseek_v3::prompt_cache_architecture_fingerprint(&stage.args),
+                crate::architectures::deepseek_v3::model::prompt_cache_architecture_fingerprint(
+                    &stage.args,
+                ),
                 usize::try_from(stage.args.num_hidden_layers)
                     .map_err(|_| Error::Parallel("invalid DeepSeek layer count".into()))?,
                 stage.range.clone(),
@@ -1888,7 +1892,10 @@ fn load_deepseek_pipeline(
     )?;
     if let Some(dense_stream) = dense_stream {
         let binding_adapter =
-            crate::deepseek_v3::DeepSeekV3LayerwiseAdapter::new(source_args.clone(), stream)?;
+            crate::architectures::deepseek_v3::layerwise::DeepSeekV3LayerwiseAdapter::new(
+                source_args.clone(),
+                stream,
+            )?;
         stage.dense_layers = Some(build_pipeline_dense_layers(
             model_dir,
             stage.range.clone(),

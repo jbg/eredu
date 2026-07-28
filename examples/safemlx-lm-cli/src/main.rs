@@ -19,24 +19,30 @@ use safemlx::{
     Array, Device, DeviceType, ExecutionContext, Stream,
 };
 use safemlx_lm::{
-    chat::{ChatTemplateRequest, NativeToolSupport, ParallelToolCallPolicy, ToolChoice},
-    dense_stream::DenseDiskStreamLoadOptions,
-    expert_cache::{
-        ExpertCacheLoadOptions, ExpertPassStatistics, ExpertTierStatistics,
-        SparseExpertDenseStreamLoadOptions,
-    },
-    layerwise::{LayerwiseLoadOptions, WeightResidency},
-    models::{
-        input::{InputPart, ModelInput},
+    api::{
         LoadedModel, ModelLoadOptions, PreparedChatEmbeddedMtpGenerationRequest,
         PreparedChatGenerationRequest, PreparedChatGenerationSettings,
         PreparedChatMtpGenerationOptions, PreparedChatMtpGenerationRequest, TextDecoder,
     },
-    mtp::{LoadedDrafter, MtpConfig, MtpExecutionStreams, MtpSchedulerOptions, MtpStats},
-    offload::{CacheEvictionPolicy, MemoryTier, OffloadConfig, TransferDirection},
-    quantization::AffineQuantization,
-    sampler::{DefaultSampler, GenerationSampler, MirostatV2Sampler, Sampler, SpeculativeSampler},
-    streaming::{FinishReason, SemanticEvent},
+    runtime::chat::{ChatTemplateRequest, NativeToolSupport, ParallelToolCallPolicy, ToolChoice},
+    runtime::checkpoint::quantization::AffineQuantization,
+    runtime::execution::layerwise::{LayerwiseLoadOptions, WeightResidency},
+    runtime::generation::sampler::{
+        DefaultSampler, GenerationSampler, MirostatV2Sampler, Sampler, SpeculativeSampler,
+    },
+    runtime::generation::speculative::{
+        LoadedDrafter, MtpConfig, MtpExecutionStreams, MtpSchedulerOptions, MtpStats,
+    },
+    runtime::generation::streaming::{FinishReason, SemanticEvent},
+    runtime::media::input::{InputPart, ModelInput},
+    runtime::residency::dense_stream::DenseDiskStreamLoadOptions,
+    runtime::residency::expert_cache::{
+        ExpertCacheLoadOptions, ExpertPassStatistics, ExpertTierStatistics,
+        SparseExpertDenseStreamLoadOptions,
+    },
+    runtime::residency::policy::{
+        CacheEvictionPolicy, MemoryTier, OffloadConfig, TransferDirection,
+    },
 };
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -656,8 +662,9 @@ fn main() -> Result<()> {
     if draft_model_path.is_some()
         && !matches!(
             model.mtp_capability(),
-            safemlx_lm::mtp::MtpCapability::Ready {
-                checkpoint: safemlx_lm::mtp::MtpCheckpointKind::Separate
+            safemlx_lm::runtime::generation::speculative::MtpCapability::Ready {
+                checkpoint:
+                    safemlx_lm::runtime::generation::speculative::MtpCheckpointKind::Separate
             }
         )
     {
@@ -789,8 +796,8 @@ fn main() -> Result<()> {
     let mut output_ids = Vec::with_capacity(args.max_tokens);
     let profile_gemma4 = args.profile_components && model.model_type() == "gemma4";
     if profile_gemma4 {
-        safemlx_lm::models::gemma4::set_perf_profiling(true);
-        safemlx_lm::models::gemma4::reset_perf_stats();
+        safemlx_lm::architectures::gemma4::model::set_perf_profiling(true);
+        safemlx_lm::architectures::gemma4::model::reset_perf_stats();
     }
     let generation_started = Instant::now();
     let mut time_to_first_token = None;
@@ -807,8 +814,9 @@ fn main() -> Result<()> {
     let embedded_mtp = args.mtp_draft_tokens > 0
         && matches!(
             model.mtp_capability(),
-            safemlx_lm::mtp::MtpCapability::Ready {
-                checkpoint: safemlx_lm::mtp::MtpCheckpointKind::Embedded
+            safemlx_lm::runtime::generation::speculative::MtpCapability::Ready {
+                checkpoint:
+                    safemlx_lm::runtime::generation::speculative::MtpCheckpointKind::Embedded
             }
         );
     let scheduler_options = MtpSchedulerOptions {
@@ -1146,7 +1154,7 @@ fn main() -> Result<()> {
             );
         }
         if profile_gemma4 {
-            if let Some(stats) = safemlx_lm::models::gemma4::perf_stats() {
+            if let Some(stats) = safemlx_lm::architectures::gemma4::model::perf_stats() {
                 eprintln!(
                     "gemma4_components_s: embed={:.6}, per_layer_inputs={:.6}, attention={:.6}, mlp={:.6}, per_layer_residual={:.6}, final_norm={:.6}, lm_head={:.6}, total={:.6}",
                     stats.embed_s,
@@ -1159,7 +1167,7 @@ fn main() -> Result<()> {
                     stats.component_total_s(),
                 );
             }
-            safemlx_lm::models::gemma4::set_perf_profiling(false);
+            safemlx_lm::architectures::gemma4::model::set_perf_profiling(false);
         }
         if let Some(report) = model.residency_report()? {
             let offload = report.offload();
@@ -2087,7 +2095,7 @@ mod tests {
             MtpExecutionStreams::new(target.stream(), draft.stream())
                 .unwrap()
                 .topology(),
-            safemlx_lm::mtp::MtpStreamTopology::SameDeviceSplit
+            safemlx_lm::runtime::generation::speculative::MtpStreamTopology::SameDeviceSplit
         );
     }
 
@@ -2100,7 +2108,7 @@ mod tests {
             MtpExecutionStreams::new(target.stream(), draft.unwrap().stream())
                 .unwrap()
                 .topology(),
-            safemlx_lm::mtp::MtpStreamTopology::SameDeviceSplit
+            safemlx_lm::runtime::generation::speculative::MtpStreamTopology::SameDeviceSplit
         );
 
         let (target, draft) =
@@ -2109,7 +2117,7 @@ mod tests {
             MtpExecutionStreams::new(target.stream(), draft.unwrap().stream())
                 .unwrap()
                 .topology(),
-            safemlx_lm::mtp::MtpStreamTopology::CrossDeviceSplit
+            safemlx_lm::runtime::generation::speculative::MtpStreamTopology::CrossDeviceSplit
         );
 
         let (target, draft) =
@@ -2118,7 +2126,7 @@ mod tests {
             MtpExecutionStreams::new(target.stream(), draft.unwrap().stream())
                 .unwrap()
                 .topology(),
-            safemlx_lm::mtp::MtpStreamTopology::CrossDeviceSplit
+            safemlx_lm::runtime::generation::speculative::MtpStreamTopology::CrossDeviceSplit
         );
     }
 

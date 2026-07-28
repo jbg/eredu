@@ -13,8 +13,7 @@ use safemlx::{
 };
 
 use crate::{
-    error::Error,
-    models::{
+    api::{
         common::{
             generation::CausalLm,
             linear::{
@@ -25,6 +24,8 @@ use crate::{
         input,
         llama::{self as resident, AttentionInput, ModelArgs, TransformerBlock},
     },
+    error::Error,
+    nn::tensor::{create_attention_mask, create_sliding_attention_mask, AttentionMask},
     runtime::cache::residency::{
         open_prompt_cache, validate_prompt_cache_model_identity, CacheResidencyManager,
         CacheResidencyPolicy, CacheResidencyReport, PagedCacheOptions, PromptCacheDescriptor,
@@ -41,7 +42,6 @@ use crate::{
         LayerwiseModelMetadata, StaticUnitBindings, WeightResidency,
     },
     runtime::residency::manager::{ResidencyReport, ResidentUnitLease},
-    utils::{create_attention_mask, create_sliding_attention_mask, AttentionMask},
 };
 
 const EMBEDDING_UNIT: &str = "llama.static.embedding";
@@ -188,7 +188,7 @@ impl LlamaModel {
 
     /// Returns the canonical cache-relevant architecture identity.
     pub fn prompt_cache_architecture_fingerprint(&self) -> String {
-        crate::models::llama::prompt_cache_architecture_fingerprint(self.args())
+        crate::architectures::llama::model::prompt_cache_architecture_fingerprint(self.args())
     }
 
     /// Returns whether all parameters use the eager execution-device engine.
@@ -283,9 +283,8 @@ impl LlamaModel {
         let identity = PromptCacheModelIdentity {
             model_family: "llama".into(),
             effective_model_type: args.model_type.clone(),
-            architecture_fingerprint: crate::models::llama::prompt_cache_architecture_fingerprint(
-                args,
-            ),
+            architecture_fingerprint:
+                crate::architectures::llama::model::prompt_cache_architecture_fingerprint(args),
             layer_count,
             global_layer_start: 0,
             global_layer_end: layer_count,

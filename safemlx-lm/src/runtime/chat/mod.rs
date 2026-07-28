@@ -4,6 +4,9 @@
 //! selected only from registered signatures of the selected template body;
 //! model architecture metadata is deliberately not a fallback.
 
+pub(crate) mod constraints;
+pub(crate) mod dialect;
+
 use std::{
     collections::{HashMap, HashSet},
     fmt,
@@ -15,19 +18,21 @@ use safemlx_lm_utils::tokenizer::Tokenizer as ChatTokenizer;
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 
-use crate::format_dialect::{
+use crate::runtime::chat::dialect::{
     DeclarativeCallId, DeclarativeDialectSpec, DeclarativePayloadShape, DelimitedChannel,
     ExactEnvelope, JsonFunctionEnvelope, NamedJsonArgumentsEncoding, ParallelCallLayout,
     StructuralObjectEncoding, ToolNameConstraint, DECLARATIVE_DIALECT,
 };
 use crate::{
-    format_dialect::{
+    architectures::{
+        gpt_oss::format::{GPT_OSS_HARMONY_PARAMETERS, HARMONY_DIALECT},
+        lfm2::format::{LFM2_DIALECT, LFM2_PARAMETERS},
+    },
+    runtime::chat::constraints::ConstraintBlueprint,
+    runtime::chat::dialect::{
         DialectParameters, FormatDialect, FormatRegistryEntry, GenerationPromptBehavior,
     },
-    harmony_format::{GPT_OSS_HARMONY_PARAMETERS, HARMONY_DIALECT},
-    lfm2_format::{LFM2_DIALECT, LFM2_PARAMETERS},
-    streaming::ToolRuntimeParser,
-    tool_constraints::ConstraintBlueprint,
+    runtime::generation::streaming::ToolRuntimeParser,
 };
 
 pub use safemlx_lm_utils::tokenizer::ChatTemplateIdentity;
@@ -1105,56 +1110,60 @@ mod tests {
         QWEN3_VL_TEMPLATE_SIGNATURE, QWEN3_XML_TOOL_SPEC, QWEN_XML_TOOL_SPEC,
         SYNTHETIC_DECLARATIVE_SPEC, SYNTHETIC_TOOL_TEMPLATE, SYNTHETIC_TOOL_TEMPLATE_SIGNATURE,
     };
-    use crate::{harmony_format::GPT_OSS_HARMONY_PARAMETERS, lfm2_format::LFM2_PARAMETERS};
+    use crate::architectures::{
+        gpt_oss::format::GPT_OSS_HARMONY_PARAMETERS, lfm2::format::LFM2_PARAMETERS,
+    };
 
     const QWEN25_FIXTURE: &str =
-        include_str!("../tests/fixtures/chat_templates/qwen2.5-7b-instruct-acbd9653.jinja");
+        include_str!("../../../tests/fixtures/chat_templates/qwen2.5-7b-instruct-acbd9653.jinja");
     const QWEN3_CURRENT_FIXTURE_WITH_TERMINATOR: &str =
-        include_str!("../tests/fixtures/chat_templates/qwen3-0.6b-7e4ae267.jinja");
+        include_str!("../../../tests/fixtures/chat_templates/qwen3-0.6b-7e4ae267.jinja");
     const QWEN3_VL_FIXTURE: &str =
-        include_str!("../tests/fixtures/chat_templates/qwen3-vl-2b-instruct-89644892.jinja");
+        include_str!("../../../tests/fixtures/chat_templates/qwen3-vl-2b-instruct-89644892.jinja");
     const HERMES2_PRO_TOOL_USE_FIXTURE: &str = include_str!(
-        "../tests/fixtures/chat_templates/hermes-2-pro-llama-3-8b-f798274b-tool-use.jinja"
+        "../../../tests/fixtures/chat_templates/hermes-2-pro-llama-3-8b-f798274b-tool-use.jinja"
     );
-    const MISTRAL7_V03_FIXTURE: &str =
-        include_str!("../tests/fixtures/chat_templates/mistral-7b-instruct-v0.3-c170c708.jinja");
-    const MINISTRAL8_2410_FIXTURE: &str =
-        include_str!("../tests/fixtures/chat_templates/ministral-8b-instruct-2410-2f494a19.jinja");
+    const MISTRAL7_V03_FIXTURE: &str = include_str!(
+        "../../../tests/fixtures/chat_templates/mistral-7b-instruct-v0.3-c170c708.jinja"
+    );
+    const MINISTRAL8_2410_FIXTURE: &str = include_str!(
+        "../../../tests/fixtures/chat_templates/ministral-8b-instruct-2410-2f494a19.jinja"
+    );
     const LLAMA31_33_FIXTURE: &str =
-        include_str!("../tests/fixtures/chat_templates/llama-3.1-3.3-e10ca381.jinja");
+        include_str!("../../../tests/fixtures/chat_templates/llama-3.1-3.3-e10ca381.jinja");
     const LLAMA32_FIXTURE: &str =
-        include_str!("../tests/fixtures/chat_templates/llama-3.2-5816fce1.jinja");
+        include_str!("../../../tests/fixtures/chat_templates/llama-3.2-5816fce1.jinja");
     const LLAMA4_FIXTURE: &str =
-        include_str!("../tests/fixtures/chat_templates/llama-4-01a91bfb.jinja");
+        include_str!("../../../tests/fixtures/chat_templates/llama-4-01a91bfb.jinja");
     const NEMOTRON_NANO_FIXTURE_WITH_TERMINATOR: &str = include_str!(
-        "../tests/fixtures/chat_templates/llama-3.1-nemotron-nano-8b-v1-072b9ab4.jinja"
+        "../../../tests/fixtures/chat_templates/llama-3.1-nemotron-nano-8b-v1-072b9ab4.jinja"
     );
     const NEMOTRON_NANO_V2_FIXTURE_WITH_TERMINATOR: &str =
-        include_str!("../tests/fixtures/chat_templates/nemotron-nano-v2-6533e8de.jinja");
+        include_str!("../../../tests/fixtures/chat_templates/nemotron-nano-v2-6533e8de.jinja");
     const QWEN3_OLDER_TOKENIZER_CONFIG: &str =
-        include_str!("../../safemlx-lm-utils/tests/fixtures/qwen3/tokenizer_config.json");
+        include_str!("../../../../safemlx-lm-utils/tests/fixtures/qwen3/tokenizer_config.json");
     const GEMMA4_EDGE_FIXTURE: &str =
-        include_str!("../tests/fixtures/chat_templates/gemma-4-e2b-it-3e22461f.jinja");
+        include_str!("../../../tests/fixtures/chat_templates/gemma-4-e2b-it-3e22461f.jinja");
     const GEMMA4_LARGE_FIXTURE: &str =
-        include_str!("../tests/fixtures/chat_templates/gemma-4-26b-a4b-it-4d7ae498.jinja");
+        include_str!("../../../tests/fixtures/chat_templates/gemma-4-26b-a4b-it-4d7ae498.jinja");
     const GPT_OSS_HARMONY_CURRENT_FIXTURE_WITH_TERMINATOR: &str =
-        include_str!("../tests/fixtures/chat_templates/gpt-oss-harmony-a4c9919c.jinja");
+        include_str!("../../../tests/fixtures/chat_templates/gpt-oss-harmony-a4c9919c.jinja");
     const GPT_OSS_HARMONY_ESCAPED_FIXTURE_WITH_TERMINATOR: &str =
-        include_str!("../tests/fixtures/chat_templates/gpt-oss-harmony-b474759b.jinja");
+        include_str!("../../../tests/fixtures/chat_templates/gpt-oss-harmony-b474759b.jinja");
     const GPT_OSS_HARMONY_INITIAL_FIXTURE_WITH_TERMINATOR: &str =
-        include_str!("../tests/fixtures/chat_templates/gpt-oss-harmony-f8d92557.jinja");
+        include_str!("../../../tests/fixtures/chat_templates/gpt-oss-harmony-f8d92557.jinja");
     const LFM2_CLASSIC_FIXTURE_WITH_TERMINATOR: &str =
-        include_str!("../tests/fixtures/chat_templates/lfm2-classic-b3afba27.jinja");
+        include_str!("../../../tests/fixtures/chat_templates/lfm2-classic-b3afba27.jinja");
     const LFM2_CLASSIC_COMPACT_FIXTURE_WITH_TERMINATOR: &str =
-        include_str!("../tests/fixtures/chat_templates/lfm2-classic-compact-6d24c6b7.jinja");
+        include_str!("../../../tests/fixtures/chat_templates/lfm2-classic-compact-6d24c6b7.jinja");
     const LFM25_8B_FIXTURE_WITH_TERMINATOR: &str =
-        include_str!("../tests/fixtures/chat_templates/lfm2.5-8b-a1b-5673e0de.jinja");
+        include_str!("../../../tests/fixtures/chat_templates/lfm2.5-8b-a1b-5673e0de.jinja");
     const LFM25_VL_FIXTURE_WITH_TERMINATOR: &str =
-        include_str!("../tests/fixtures/chat_templates/lfm2.5-vl-450m-fc6221ca.jinja");
+        include_str!("../../../tests/fixtures/chat_templates/lfm2.5-vl-450m-fc6221ca.jinja");
     const DEEPSEEK_V3_TOOL_FIXTURE: &str =
-        include_str!("../tests/fixtures/chat_templates/deepseek-v3-tools-7e28c67d.jinja");
+        include_str!("../../../tests/fixtures/chat_templates/deepseek-v3-tools-7e28c67d.jinja");
     const DEEPSEEK_V31_TOOL_FIXTURE: &str =
-        include_str!("../tests/fixtures/chat_templates/deepseek-v3.1-tools-ef1ab230.jinja");
+        include_str!("../../../tests/fixtures/chat_templates/deepseek-v3.1-tools-ef1ab230.jinja");
 
     #[test]
     fn registry_does_not_guess_unknown_templates() {

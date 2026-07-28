@@ -12,9 +12,9 @@ use llguidance::api::TopLevelGrammar;
 use serde_json::Value;
 
 use crate::{
-    chat::{ParallelToolCallPolicy, ToolChoice},
-    streaming::{JsonFragmentBuffer, ProtocolParser, SemanticEventSink},
-    tool_constraints::{parse_tools, tool_call_bounds, tool_call_schema},
+    runtime::chat::constraints::{parse_tools, tool_call_bounds, tool_call_schema},
+    runtime::chat::{ParallelToolCallPolicy, ToolChoice},
+    runtime::generation::streaming::{JsonFragmentBuffer, ProtocolParser, SemanticEventSink},
 };
 
 /// How a dialect wants the checkpoint template's generation prompt handled.
@@ -255,7 +255,7 @@ pub(crate) struct DeclarativeCallId {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct DeclarativeDialectSpec {
     pub(crate) generation_prompt_behavior: GenerationPromptBehavior,
-    /// Template variable controlled by [`crate::chat::ChatTemplateRequest::enable_thinking`].
+    /// Template variable controlled by [`crate::runtime::chat::ChatTemplateRequest::enable_thinking`].
     pub(crate) reasoning_template_kwarg: &'static str,
     /// Whether the dialect preserves reasoning semantics while native tools are active.
     pub(crate) supports_tool_reasoning: bool,
@@ -2357,12 +2357,14 @@ mod tests {
         ToolNameConstraint, DECLARATIVE_DIALECT,
     };
     use crate::{
-        chat::{
+        runtime::chat::constraints::ConstraintCompiler,
+        runtime::chat::{
             prepare_format_profile_with_registry, template_signature, ParallelToolCallPolicy,
             ToolChoice,
         },
-        streaming::{FinishReason, ProtocolParser, SemanticEvent, SemanticEventSink},
-        tool_constraints::ConstraintCompiler,
+        runtime::generation::streaming::{
+            FinishReason, ProtocolParser, SemanticEvent, SemanticEventSink,
+        },
     };
 
     const FUNCTION_INPUT_JSON: JsonFunctionEnvelope = JsonFunctionEnvelope {
@@ -2638,7 +2640,7 @@ mod tests {
         })
     }
 
-    fn accepts(plan: &crate::chat::ToolRuntimePlan, text: &str) -> bool {
+    fn accepts(plan: &crate::runtime::chat::ToolRuntimePlan, text: &str) -> bool {
         let mut state = plan.generation_constraint().grammar_state();
         for byte in text.bytes() {
             if state.commit(byte as TokenId).is_err() {
@@ -2704,7 +2706,7 @@ mod tests {
     }
 
     fn push_at_byte_split(
-        parser: &mut crate::streaming::ToolRuntimeParser,
+        parser: &mut crate::runtime::generation::streaming::ToolRuntimeParser,
         output: &str,
         split: usize,
     ) {
@@ -2712,7 +2714,7 @@ mod tests {
     }
 
     fn try_push_at_byte_split(
-        parser: &mut crate::streaming::ToolRuntimeParser,
+        parser: &mut crate::runtime::generation::streaming::ToolRuntimeParser,
         output: &str,
         split: usize,
     ) -> Result<(), String> {
@@ -3376,7 +3378,7 @@ mod tests {
     #[test]
     fn runtime_plan_creates_independent_parser_instances() {
         fn assert_send_sync<T: Send + Sync>() {}
-        assert_send_sync::<crate::chat::ToolRuntimePlan>();
+        assert_send_sync::<crate::runtime::chat::ToolRuntimePlan>();
 
         let parameters = DialectParameters::Declarative(&DECLARATIVE_OBJECT_SPEC);
         let plan = ConstraintCompiler::synthetic_for_tests()

@@ -9,8 +9,8 @@ use safemlx::{
 };
 
 use crate::{
-    chat::{ToolChoice, ToolRuntimePlan},
-    tool_constraints::GrammarState,
+    runtime::chat::constraints::GrammarState,
+    runtime::chat::{ToolChoice, ToolRuntimePlan},
 };
 
 /// Sampling policy suitable for lossless speculative decoding.
@@ -1227,14 +1227,14 @@ mod tests {
         GenerationSampler, MirostatV2Sampler, Sampler, SpeculativeSampler,
     };
     use crate::{
-        chat::{ParallelToolCallPolicy, ToolChoice, ToolRuntimePlan},
-        format_dialect::{
+        runtime::chat::constraints::ConstraintCompiler,
+        runtime::chat::dialect::{
             DeclarativeDialectSpec, DeclarativePayloadShape, DialectParameters, ExactEnvelope,
             GenerationPromptBehavior, JsonFunctionEnvelope, ParallelCallLayout,
             DECLARATIVE_DIALECT,
         },
-        streaming::{FinishReason, SemanticEvent},
-        tool_constraints::ConstraintCompiler,
+        runtime::chat::{ParallelToolCallPolicy, ToolChoice, ToolRuntimePlan},
+        runtime::generation::streaming::{FinishReason, SemanticEvent},
     };
 
     const SYNTHETIC_JSON_FUNCTION: JsonFunctionEnvelope = JsonFunctionEnvelope {

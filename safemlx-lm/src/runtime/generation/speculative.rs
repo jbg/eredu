@@ -14,8 +14,7 @@ use safemlx::{
 };
 
 use crate::{
-    error::Error,
-    models::{
+    api::{
         gemma4_assistant::{
             load_gemma4_assistant_gguf_with_options, load_gemma4_assistant_model_with_options,
             Gemma4AssistantDraftModel,
@@ -23,8 +22,9 @@ use crate::{
         input::{InputPayload, Modality, ModelInput},
         ModelCache, ModelLoadOptions,
     },
-    sampler::SpeculativeSampler,
-    streaming::{FinishReason, SemanticEvent},
+    error::Error,
+    runtime::generation::sampler::SpeculativeSampler,
+    runtime::generation::streaming::{FinishReason, SemanticEvent},
 };
 
 /// Architecture-dispatched draft model loaded independently of a target.
@@ -2104,8 +2104,8 @@ mod tests {
 
     use super::*;
     use crate::{
-        models::input::InputPart,
-        sampler::{DefaultSampler, GenerationSampler, MirostatV2Sampler},
+        runtime::generation::sampler::{DefaultSampler, GenerationSampler, MirostatV2Sampler},
+        runtime::media::input::InputPart,
     };
 
     #[derive(Clone, Default)]

@@ -45,8 +45,8 @@ pub struct ModelLoadOptions {
     /// Optional validated runtime topology and process-local device assignment.
     ///
     /// Singleton topologies preserve normal model loading. Non-replicated
-    /// topologies must be loaded through the explicit [`crate::pipeline`],
-    /// [`crate::tensor_parallel`], or [`crate::expert_parallel`] APIs.
+    /// topologies must be loaded through the explicit [`crate::architectures::distributed::pipeline`],
+    /// [`crate::architectures::distributed::tensor`], or [`crate::architectures::distributed::expert`] APIs.
     pub parallel: Option<ParallelTopology>,
     /// Parameter placement and execution policy for safetensors checkpoints.
     pub weight_residency: WeightResidency,
@@ -90,19 +90,19 @@ pub(crate) fn ensure_executable_load_options(options: ModelLoadOptions) -> Resul
                 && topology.pipeline_parallel_size == 1
                 && topology.expert_parallel_size == 1
             {
-                "non-replicated pure tensor-parallel loading cannot return the complete Model type; use tensor_parallel::load_tensor_parallel_model_with_options"
+                "non-replicated pure tensor-parallel loading cannot return the complete Model type; use architectures::distributed::tensor::load_tensor_parallel_model_with_options"
                     .into()
             } else if topology.pipeline_parallel_size > 1
                 && topology.tensor_parallel_size == 1
                 && topology.expert_parallel_size == 1
             {
-                "non-replicated pure pipeline loading cannot return the complete Model type; use pipeline::load_pipeline_model_with_options"
+                "non-replicated pure pipeline loading cannot return the complete Model type; use architectures::distributed::pipeline::load_pipeline_model_with_options"
                     .into()
             } else if topology.expert_parallel_size > 1
                 && topology.tensor_parallel_size == 1
                 && topology.pipeline_parallel_size == 1
             {
-                "non-replicated pure expert-parallel loading cannot return the complete Model type; use expert_parallel::load_expert_parallel_model_with_options"
+                "non-replicated pure expert-parallel loading cannot return the complete Model type; use architectures::distributed::expert::load_expert_parallel_model_with_options"
                     .into()
             } else {
                 "hybrid TP+PP, TP+EP, and PP+EP model loading is unsupported; use a pure tensor-, pipeline-, or expert-parallel topology"

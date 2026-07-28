@@ -23,19 +23,19 @@ use serde_json::Value;
 pub use super::vision::{QwenVisionTransformer, VisionConfig};
 
 use crate::{
-    error::Error,
-    models::{
+    api::{
         common::{self, attention::AttentionInput, generation::CausalLm},
         input as runtime_input, qwen3,
         qwen_vl::grid_thw_from_array,
     },
+    error::Error,
+    nn::tensor::{create_attention_mask, AttentionMask},
     runtime::cache::{ConcatKeyValueCache, KeyValueCache},
     runtime::checkpoint::load::{
         gguf_metadata, load_named_array_strict, load_safetensors_dir_quantized_strict,
         load_safetensors_dir_strict, StrictLoadConfig, StrictLoadReport,
     },
     runtime::checkpoint::quantization::WeightQuantization,
-    utils::{create_attention_mask, AttentionMask},
 };
 
 #[derive(Debug, Clone)]
@@ -1260,7 +1260,7 @@ impl CausalLm<Cache> for Model {
 }
 
 /// Qwen3-VL generation iterator.
-pub type Generate<'a, S = crate::sampler::DefaultSampler> =
+pub type Generate<'a, S = crate::runtime::generation::sampler::DefaultSampler> =
     common::generation::Generate<'a, Model, Cache, S>;
 
 #[cfg(test)]
@@ -1274,7 +1274,7 @@ mod tests {
     };
     use serde_json::json;
 
-    use crate::models::{common::generation::CausalLm, input as runtime_input};
+    use crate::api::{common::generation::CausalLm, input as runtime_input};
 
     fn tiny_model(stream: &safemlx::Stream) -> super::Model {
         let text_config = crate::architectures::qwen::qwen3::model::ModelArgs {

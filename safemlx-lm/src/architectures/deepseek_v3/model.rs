@@ -31,7 +31,22 @@ use tokenizers::Tokenizer;
 
 use crate::nn as common;
 use crate::{
+    api::{
+        input as runtime_input,
+        qwen3_5_moe::{QwenLinear as Linear, QwenWeightFormat as WeightFormat},
+    },
+    nn::{
+        generation::CausalLm,
+        layers::silu,
+        moe::{weighted_route_sum, TopKRouter, TopKRouterConfig, TopKRouterScoreFunction},
+    },
+};
+use crate::{
     error::Error,
+    nn::tensor::{
+        create_causal_mask,
+        rope::{initialize_rope, FloatOrString, RopeVariant},
+    },
     runtime::cache::residency::{
         derive_prompt_cache_architecture_fingerprint, open_prompt_cache,
         validate_prompt_cache_model_identity, CacheBlockArrays, CacheRankIdentity,
@@ -48,21 +63,6 @@ use crate::{
     },
     runtime::checkpoint::quantization::{quantize_tensor, WeightQuantization},
     runtime::execution::inspection::{ActivationObserver, MoeRoutingObservation},
-    utils::{
-        create_causal_mask,
-        rope::{initialize_rope, FloatOrString, RopeVariant},
-    },
-};
-use crate::{
-    models::{
-        input as runtime_input,
-        qwen3_5_moe::{QwenLinear as Linear, QwenWeightFormat as WeightFormat},
-    },
-    nn::{
-        generation::CausalLm,
-        layers::silu,
-        moe::{weighted_route_sum, TopKRouter, TopKRouterConfig, TopKRouterScoreFunction},
-    },
 };
 
 type ObserverOption<'a> = Option<&'a mut dyn ActivationObserver>;
@@ -1976,9 +1976,9 @@ impl Moe {
     pub(crate) fn forward_expert_parallel(
         &mut self,
         x: &Array,
-        assignment: &crate::expert_parallel::ExpertAssignment,
+        assignment: &crate::architectures::distributed::expert::ExpertAssignment,
         group: &safemlx::distributed::Group,
-        statistics: &mut crate::expert_parallel::RoutingStatistics,
+        statistics: &mut crate::architectures::distributed::expert::RoutingStatistics,
         prefix: &str,
         mut observer: ObserverOption<'_>,
         stream: &Stream,
@@ -1986,7 +1986,7 @@ impl Moe {
         let shape = x.shape();
         let flat = x.reshape(&[-1, x.dim(-1)], stream)?;
         observe_activation(&mut observer, prefix, "input_flat", &flat)?;
-        crate::expert_parallel::materialize_timing_phase([&flat])?;
+        crate::architectures::distributed::expert::materialize_timing_phase([&flat])?;
         let moe_started = std::time::Instant::now();
         let previous_moe_time = statistics.total_time;
         let router_started = std::time::Instant::now();
@@ -2006,9 +2006,9 @@ impl Moe {
         if let Some(scores) = selected_scores.as_ref() {
             router_outputs.push(scores);
         }
-        crate::expert_parallel::materialize_timing_phase(router_outputs)?;
+        crate::architectures::distributed::expert::materialize_timing_phase(router_outputs)?;
         statistics.router_time += router_started.elapsed();
-        let returned = crate::expert_parallel::dispatch_replicated(
+        let returned = crate::architectures::distributed::expert::dispatch_replicated(
             &flat,
             &indices,
             &weights,
@@ -2040,7 +2040,7 @@ impl Moe {
             &activation_name(prefix, "shared_experts"),
             &mut observer,
         )?;
-        crate::expert_parallel::materialize_timing_phase([&shared])?;
+        crate::architectures::distributed::expert::materialize_timing_phase([&shared])?;
         statistics.shared_expert_time += shared_started.elapsed();
         observe_activation(&mut observer, prefix, "shared_expert_output", &shared)?;
         let combined = returned.reduced_output.add(&shared, stream)?;
@@ -2062,7 +2062,7 @@ impl Moe {
             })?;
         }
         let output = combined.reshape(shape, stream)?;
-        crate::expert_parallel::materialize_timing_phase([&output])?;
+        crate::architectures::distributed::expert::materialize_timing_phase([&output])?;
         statistics.total_time = previous_moe_time + moe_started.elapsed();
         Ok(output)
     }
@@ -2177,9 +2177,9 @@ impl FeedForward {
     pub(crate) fn forward_expert_parallel(
         &mut self,
         x: &Array,
-        assignment: &crate::expert_parallel::ExpertAssignment,
+        assignment: &crate::architectures::distributed::expert::ExpertAssignment,
         group: &safemlx::distributed::Group,
-        statistics: &mut crate::expert_parallel::RoutingStatistics,
+        statistics: &mut crate::architectures::distributed::expert::RoutingStatistics,
         prefix: &str,
         observer: ObserverOption<'_>,
         stream: &Stream,
@@ -2409,9 +2409,9 @@ impl DecoderLayer {
         x: &Array,
         mask: Option<&Array>,
         cache: Option<&mut CompressedLatentCache>,
-        assignment: &crate::expert_parallel::ExpertAssignment,
+        assignment: &crate::architectures::distributed::expert::ExpertAssignment,
         group: &safemlx::distributed::Group,
-        statistics: &mut crate::expert_parallel::RoutingStatistics,
+        statistics: &mut crate::architectures::distributed::expert::RoutingStatistics,
         prefix: &str,
         observer: ObserverOption<'_>,
         stream: &Stream,
@@ -2685,9 +2685,9 @@ impl Model {
         inputs: &Array,
         mask: Option<&Array>,
         cache: &mut Cache,
-        assignment: &crate::expert_parallel::ExpertAssignment,
+        assignment: &crate::architectures::distributed::expert::ExpertAssignment,
         group: &safemlx::distributed::Group,
-        statistics: &mut crate::expert_parallel::RoutingStatistics,
+        statistics: &mut crate::architectures::distributed::expert::RoutingStatistics,
         mut observer: ObserverOption<'_>,
         stream: &Stream,
     ) -> Result<Array, Exception> {
@@ -2840,7 +2840,7 @@ impl CausalLm<Cache> for Model {
 }
 
 /// DeepSeek token-generation iterator.
-pub type Generate<'a, S = crate::sampler::DefaultSampler> =
+pub type Generate<'a, S = crate::runtime::generation::sampler::DefaultSampler> =
     common::generation::Generate<'a, Model, Cache, S>;
 
 fn parse_config_value(value: Value) -> Result<ModelArgs, Error> {
@@ -3464,7 +3464,7 @@ pub(crate) fn prepare_gguf_checkpoint(
     }
     args.validate()?;
 
-    let eos_token_ids = crate::models::gguf_eos_token_ids(metadata)?;
+    let eos_token_ids = crate::api::gguf_eos_token_ids(metadata)?;
     Ok(PreparedDeepSeekGguf {
         args,
         eos_token_ids,
@@ -3736,8 +3736,8 @@ pub fn load_tokenizer(model_dir: impl AsRef<Path>) -> Result<Tokenizer, Error> {
 mod tests {
     use super::{load_model, parse_config_value, FeedForward, Model, ModelArgs, ModelInput};
     use crate::{
+        api::{LoadedModel, ModelKind},
         error::Error,
-        models::{LoadedModel, ModelKind},
         runtime::cache::residency::{CacheResidencyPolicy, PagedCacheOptions},
         runtime::cache::CompressedLatentCache,
         runtime::execution::inspection::{ActivationObserver, MoeRoutingObservation},
@@ -4202,8 +4202,8 @@ mod tests {
         assert_eq!(args.q_lora_rank, Some(1536));
         assert_eq!(args.num_nextn_predict_layers, 1);
         assert_eq!(
-            crate::models::check_model_config(&value),
-            crate::models::ModelConfigSupport::Supported(crate::models::SupportedModelConfig {
+            crate::api::check_model_config(&value),
+            crate::api::ModelConfigSupport::Supported(crate::api::SupportedModelConfig {
                 kind: ModelKind::DeepSeekV3,
                 model_type: "deepseek_v3".into(),
                 effective_model_type: "deepseek_v3".into(),
@@ -4261,7 +4261,7 @@ mod tests {
         let stream = context.stream();
         let mut plain = Model::new(tiny_args(Some(4)), stream).unwrap();
         initialize_dense_model(&mut plain, stream);
-        let mut observed = crate::models::Model::DeepSeekV3(plain.clone());
+        let mut observed = crate::api::Model::DeepSeekV3(plain.clone());
         let input = Array::from_slice(&[1i32, 2, 3], &[1, 3]);
         let mut plain_cache = plain.new_cache();
         let mut observed_cache = observed.new_cache();
@@ -4293,7 +4293,7 @@ mod tests {
             max_error < 1e-5,
             "observed forward changed logits by {max_error}"
         );
-        let crate::models::ModelCache::DeepSeekV3(observed_cache) = observed_cache else {
+        let crate::api::ModelCache::DeepSeekV3(observed_cache) = observed_cache else {
             panic!("DeepSeek model returned the wrong cache type")
         };
         assert_eq!(plain_cache.offset(), observed_cache.offset());

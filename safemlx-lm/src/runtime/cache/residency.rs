@@ -5029,12 +5029,16 @@ mod tests {
     #[test]
     fn model_reset_surfaces_propagate_paged_clear_failures() {
         use crate::{
-            expert_parallel::ExpertParallelCache,
-            llama::LlamaCache,
-            models::gpt_oss::{Cache as GptOssCache, LayerCache as GptOssLayerCache},
-            pipeline::{PipelineCache, PipelineLlamaLayerCache},
+            architectures::gpt_oss::model::{Cache as GptOssCache, LayerCache as GptOssLayerCache},
+            architectures::{
+                distributed::{
+                    expert::ExpertParallelCache,
+                    pipeline::{PipelineCache, PipelineLlamaLayerCache},
+                    tensor::{TensorParallelCache, TensorParallelLlamaLayerCache},
+                },
+                llama::layerwise::LlamaCache,
+            },
             runtime::cache::PagedKeyValueCache,
-            tensor_parallel::{TensorParallelCache, TensorParallelLlamaLayerCache},
         };
 
         let manager = manager_with_leased_block();

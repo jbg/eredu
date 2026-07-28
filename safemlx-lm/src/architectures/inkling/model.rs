@@ -26,8 +26,7 @@ use serde_json::Value;
 use tokenizers::Tokenizer;
 
 use crate::{
-    error::Error,
-    models::{
+    api::{
         common::{
             self,
             convolution::{causal_depthwise_conv1d, CausalConv1dCache, DepthwiseConv1d},
@@ -37,6 +36,7 @@ use crate::{
         },
         input,
     },
+    error::Error,
     runtime::cache::residency::{
         CacheRankIdentity, CacheResidencyManager, CacheResidencyReport, PagedCacheOptions,
     },
@@ -1819,7 +1819,7 @@ impl CausalLm<Cache> for Model {
 }
 
 /// Inkling token generation iterator.
-pub type Generate<'a, S = crate::sampler::DefaultSampler> =
+pub type Generate<'a, S = crate::runtime::generation::sampler::DefaultSampler> =
     common::generation::Generate<'a, Model, Cache, S>;
 
 pub fn load_tokenizer(model_dir: impl AsRef<Path>) -> Result<Tokenizer, Error> {
@@ -2123,11 +2123,11 @@ mod tests {
             }
         });
         super::validate_model_config_value(&config).unwrap();
-        let support = crate::models::check_model_config(&config);
-        let crate::models::ModelConfigSupport::Supported(support) = support else {
+        let support = crate::api::check_model_config(&config);
+        let crate::api::ModelConfigSupport::Supported(support) = support else {
             panic!("released Inkling metadata did not dispatch")
         };
-        assert_eq!(support.kind, crate::models::ModelKind::Inkling);
+        assert_eq!(support.kind, crate::api::ModelKind::Inkling);
         assert_eq!(support.effective_model_type, "inkling_mm_model");
     }
 

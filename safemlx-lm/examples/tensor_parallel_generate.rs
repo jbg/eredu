@@ -5,8 +5,8 @@ use safemlx::{
     DeviceType, Stream,
 };
 use safemlx_lm::{
-    sampler::DefaultSampler, tensor_parallel::load_tensor_parallel_model, DeviceAssignment,
-    ParallelTopology,
+    architectures::distributed::tensor::load_tensor_parallel_model,
+    runtime::generation::sampler::DefaultSampler, DeviceAssignment, ParallelTopology,
 };
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {

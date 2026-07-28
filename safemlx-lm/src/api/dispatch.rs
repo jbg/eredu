@@ -7,51 +7,51 @@ pub enum Model {
     /// DeepSeek-V3/R1 model.
     DeepSeekV3(deepseek_v3::Model),
     /// DeepSeek-V3/R1 model using bounded layer execution.
-    DeepSeekV3Layerwise(crate::deepseek_v3::DeepSeekV3LayerwiseModel),
+    DeepSeekV3Layerwise(crate::architectures::deepseek_v3::layerwise::DeepSeekV3LayerwiseModel),
     /// Gemma 4 text model.
     Gemma4(gemma4::Model),
     /// Gemma 4 multimodal model using bounded layer execution.
-    Gemma4Layerwise(crate::gemma4::Gemma4LayerwiseModel),
+    Gemma4Layerwise(crate::architectures::gemma4::layerwise::Gemma4LayerwiseModel),
     /// OpenAI GPT-OSS model.
     GptOss(gpt_oss::Model),
     /// OpenAI GPT-OSS model using bounded layer execution.
-    GptOssLayerwise(crate::gpt_oss::GptOssLayerwiseModel),
+    GptOssLayerwise(crate::architectures::gpt_oss::layerwise::GptOssLayerwiseModel),
     /// Thinking Machines Lab Inkling model.
     Inkling(inkling::Model),
     /// Inkling multimodal model using bounded layer execution.
-    InklingLayerwise(crate::inkling::InklingLayerwiseModel),
+    InklingLayerwise(crate::architectures::inkling::layerwise::InklingLayerwiseModel),
     /// Llama-compatible dense model.
     Llama(llama::ResidentModel),
     /// Llama-compatible model using the unified bounded layer API.
-    LlamaLayerwise(crate::llama::LlamaModel),
+    LlamaLayerwise(crate::architectures::llama::layerwise::LlamaModel),
     /// Liquid AI LFM2/LFM2.5 model.
     Lfm2(lfm2::Model),
     /// Liquid AI LFM2/LFM2.5 model using bounded layer execution.
-    Lfm2Layerwise(crate::lfm2::Lfm2LayerwiseModel),
+    Lfm2Layerwise(crate::architectures::lfm2::layerwise::Lfm2LayerwiseModel),
     /// Nemotron-H hybrid model.
     NemotronH(nemotron_h::Model),
     /// Nemotron-H hybrid model using bounded layer execution.
-    NemotronHLayerwise(crate::nemotron_h::NemotronHLayerwiseModel),
+    NemotronHLayerwise(crate::architectures::nemotron_h::layerwise::NemotronHLayerwiseModel),
     /// Qwen3 model.
     Qwen3(qwen3::Model),
     /// Qwen3 dense or sparse-MoE model using bounded layer execution.
-    Qwen3Layerwise(crate::qwen3::Qwen3LayerwiseModel),
+    Qwen3Layerwise(crate::architectures::qwen::qwen3::layerwise::Qwen3LayerwiseModel),
     /// Qwen3-Next model.
     Qwen3Next(qwen3_next::Model),
     /// Qwen3-Next model using shared hybrid bounded layer execution.
-    Qwen3NextLayerwise(crate::qwen_hybrid::QwenHybridLayerwiseModel),
+    Qwen3NextLayerwise(crate::architectures::qwen::hybrid::layerwise::QwenHybridLayerwiseModel),
     /// Qwen3-VL multimodal model.
     Qwen3Vl(qwen3_vl::Model),
     /// Qwen3-VL multimodal model using vision/text bounded layer execution.
-    Qwen3VlLayerwise(crate::qwen3_vl::Qwen3VlLayerwiseModel),
+    Qwen3VlLayerwise(crate::architectures::qwen::vl::layerwise::Qwen3VlLayerwiseModel),
     /// Qwen3-VL-MoE multimodal model.
     Qwen3VlMoe(qwen3_vl_moe::Model),
     /// Qwen3-VL-MoE multimodal model using vision/text bounded layer execution.
-    Qwen3VlMoeLayerwise(crate::qwen3_vl::Qwen3VlLayerwiseModel),
+    Qwen3VlMoeLayerwise(crate::architectures::qwen::vl::layerwise::Qwen3VlLayerwiseModel),
     /// Qwen3.5 dense or MoE model, optionally multimodal.
     Qwen35Moe(qwen3_5_moe::Model),
     /// Qwen3.5 model using shared vision/hybrid bounded layer execution.
-    Qwen35MoeLayerwise(crate::qwen_hybrid::QwenHybridLayerwiseModel),
+    Qwen35MoeLayerwise(crate::architectures::qwen::hybrid::layerwise::QwenHybridLayerwiseModel),
 }
 
 impl Model {
@@ -192,7 +192,7 @@ impl Model {
         match (self, cache) {
             (Self::Gemma4(target), ModelCache::Gemma4(cache)) => {
                 validate_gemma4_drafter(&target.args, assistant)?;
-                crate::gemma4_mtp::generate_with_streams_and_callback_and_options(
+                crate::architectures::gemma4::mtp::generate_with_streams_and_callback_and_options(
                     target,
                     assistant,
                     cache,
@@ -207,7 +207,7 @@ impl Model {
             }
             (Self::Gemma4Layerwise(target), ModelCache::Gemma4(cache)) => {
                 validate_gemma4_drafter(target.args(), assistant)?;
-                crate::gemma4_mtp::generate_with_streams_and_callback_and_options(
+                crate::architectures::gemma4::mtp::generate_with_streams_and_callback_and_options(
                     target,
                     assistant,
                     cache,
@@ -250,7 +250,7 @@ impl Model {
         match (self, cache) {
             (Self::Gemma4(target), ModelCache::Gemma4(cache)) => {
                 validate_gemma4_drafter(&target.args, assistant)?;
-                crate::gemma4_mtp::generate_with_semantics_and_options(
+                crate::architectures::gemma4::mtp::generate_with_semantics_and_options(
                     target,
                     assistant,
                     cache,
@@ -266,7 +266,7 @@ impl Model {
             }
             (Self::Gemma4Layerwise(target), ModelCache::Gemma4(cache)) => {
                 validate_gemma4_drafter(target.args(), assistant)?;
-                crate::gemma4_mtp::generate_with_semantics_and_options(
+                crate::architectures::gemma4::mtp::generate_with_semantics_and_options(
                     target,
                     assistant,
                     cache,
@@ -347,13 +347,13 @@ impl Model {
         match (self, cache) {
             (Self::Qwen3Next(target), ModelCache::Qwen3Next(cache))
             | (Self::Qwen35Moe(target), ModelCache::Qwen35Moe(cache)) => {
-                crate::qwen_mtp::generate_with_callback(
+                crate::architectures::qwen::hybrid::mtp::generate_with_callback(
                     target, cache, input, config, prng_key, sampler, stream, on_token,
                 )
             }
             (Self::Qwen3NextLayerwise(target), ModelCache::Qwen3Next(cache))
             | (Self::Qwen35MoeLayerwise(target), ModelCache::Qwen35Moe(cache)) => {
-                crate::qwen_mtp::generate_with_callback(
+                crate::architectures::qwen::hybrid::mtp::generate_with_callback(
                     target, cache, input, config, prng_key, sampler, stream, on_token,
                 )
             }
@@ -385,7 +385,7 @@ impl Model {
         match (self, cache) {
             (Self::Qwen3Next(target), ModelCache::Qwen3Next(cache))
             | (Self::Qwen35Moe(target), ModelCache::Qwen35Moe(cache)) => {
-                crate::qwen_mtp::generate_with_semantics_and_options(
+                crate::architectures::qwen::hybrid::mtp::generate_with_semantics_and_options(
                     target,
                     cache,
                     input,
@@ -400,7 +400,7 @@ impl Model {
             }
             (Self::Qwen3NextLayerwise(target), ModelCache::Qwen3Next(cache))
             | (Self::Qwen35MoeLayerwise(target), ModelCache::Qwen35Moe(cache)) => {
-                crate::qwen_mtp::generate_with_semantics_and_options(
+                crate::architectures::qwen::hybrid::mtp::generate_with_semantics_and_options(
                     target,
                     cache,
                     input,
@@ -1089,27 +1089,31 @@ impl Model {
                 ))
             }
             (Self::Gemma4Layerwise(model), ModelCache::Gemma4(cache)) => {
-                ModelGenerate::Gemma4Layerwise(crate::gemma4::Generate::with_sampler(
-                    model, cache, temp, input, prng_key, stream, sampler,
-                ))
+                ModelGenerate::Gemma4Layerwise(
+                    crate::architectures::gemma4::layerwise::Generate::with_sampler(
+                        model, cache, temp, input, prng_key, stream, sampler,
+                    ),
+                )
             }
             (Self::Lfm2(model), ModelCache::Lfm2(cache)) => ModelGenerate::Lfm2(
                 lfm2::Generate::with_sampler(model, cache, temp, input, prng_key, stream, sampler),
             ),
-            (Self::Lfm2Layerwise(model), ModelCache::Lfm2(cache)) => {
-                ModelGenerate::Lfm2Layerwise(crate::lfm2::Generate::with_sampler(
+            (Self::Lfm2Layerwise(model), ModelCache::Lfm2(cache)) => ModelGenerate::Lfm2Layerwise(
+                crate::architectures::lfm2::layerwise::Generate::with_sampler(
                     model, cache, temp, input, prng_key, stream, sampler,
-                ))
-            }
+                ),
+            ),
             (Self::GptOss(model), ModelCache::GptOss(cache)) => {
                 ModelGenerate::GptOss(gpt_oss::Generate::with_sampler(
                     model, cache, temp, input, prng_key, stream, sampler,
                 ))
             }
             (Self::GptOssLayerwise(model), ModelCache::GptOss(cache)) => {
-                ModelGenerate::GptOssLayerwise(crate::gpt_oss::Generate::with_sampler(
-                    model, cache, temp, input, prng_key, stream, sampler,
-                ))
+                ModelGenerate::GptOssLayerwise(
+                    crate::architectures::gpt_oss::layerwise::Generate::with_sampler(
+                        model, cache, temp, input, prng_key, stream, sampler,
+                    ),
+                )
             }
             (Self::Inkling(model), ModelCache::Inkling(cache)) => {
                 ModelGenerate::Inkling(inkling::Generate::with_sampler(
@@ -1117,9 +1121,11 @@ impl Model {
                 ))
             }
             (Self::InklingLayerwise(model), ModelCache::Inkling(cache)) => {
-                ModelGenerate::InklingLayerwise(crate::inkling::Generate::with_sampler(
-                    model, cache, temp, input, prng_key, stream, sampler,
-                ))
+                ModelGenerate::InklingLayerwise(
+                    crate::architectures::inkling::layerwise::Generate::with_sampler(
+                        model, cache, temp, input, prng_key, stream, sampler,
+                    ),
+                )
             }
             (Self::Llama(model), ModelCache::KeyValue(cache)) => ModelGenerate::Llama(
                 llama::Generate::with_sampler(model, cache, temp, input, prng_key, stream, sampler),
@@ -1151,9 +1157,11 @@ impl Model {
                 ))
             }
             (Self::Qwen3VlLayerwise(model), ModelCache::Qwen3Vl(cache)) => {
-                ModelGenerate::Qwen3VlLayerwise(crate::qwen3_vl::Generate::with_sampler(
-                    model, cache, temp, input, prng_key, stream, sampler,
-                ))
+                ModelGenerate::Qwen3VlLayerwise(
+                    crate::architectures::qwen::vl::layerwise::Generate::with_sampler(
+                        model, cache, temp, input, prng_key, stream, sampler,
+                    ),
+                )
             }
             (Self::Qwen3VlMoe(model), ModelCache::Qwen3VlMoe(cache)) => {
                 ModelGenerate::Qwen3VlMoe(qwen3_vl_moe::Generate::with_sampler(
@@ -1161,9 +1169,11 @@ impl Model {
                 ))
             }
             (Self::Qwen3VlMoeLayerwise(model), ModelCache::Qwen3VlMoe(cache)) => {
-                ModelGenerate::Qwen3VlMoeLayerwise(crate::qwen3_vl::Generate::with_sampler(
-                    model, cache, temp, input, prng_key, stream, sampler,
-                ))
+                ModelGenerate::Qwen3VlMoeLayerwise(
+                    crate::architectures::qwen::vl::layerwise::Generate::with_sampler(
+                        model, cache, temp, input, prng_key, stream, sampler,
+                    ),
+                )
             }
             (Self::NemotronH(model), ModelCache::NemotronH(cache)) => {
                 ModelGenerate::NemotronH(nemotron_h::Generate::with_sampler(
@@ -1171,9 +1181,11 @@ impl Model {
                 ))
             }
             (Self::NemotronHLayerwise(model), ModelCache::NemotronH(cache)) => {
-                ModelGenerate::NemotronHLayerwise(crate::nemotron_h::Generate::with_sampler(
-                    model, cache, temp, input, prng_key, stream, sampler,
-                ))
+                ModelGenerate::NemotronHLayerwise(
+                    crate::architectures::nemotron_h::layerwise::Generate::with_sampler(
+                        model, cache, temp, input, prng_key, stream, sampler,
+                    ),
+                )
             }
             (Self::Qwen35Moe(model), ModelCache::Qwen35Moe(cache)) => {
                 ModelGenerate::Qwen35Moe(qwen3_5_moe::Generate::with_sampler(
@@ -1181,9 +1193,11 @@ impl Model {
                 ))
             }
             (Self::Qwen35MoeLayerwise(model), ModelCache::Qwen35Moe(cache)) => {
-                ModelGenerate::Qwen35MoeLayerwise(crate::qwen_hybrid::Generate::with_sampler(
-                    model, cache, temp, input, prng_key, stream, sampler,
-                ))
+                ModelGenerate::Qwen35MoeLayerwise(
+                    crate::architectures::qwen::hybrid::layerwise::Generate::with_sampler(
+                        model, cache, temp, input, prng_key, stream, sampler,
+                    ),
+                )
             }
             (Self::Qwen3Next(model), ModelCache::Qwen3Next(cache)) => {
                 ModelGenerate::Qwen3Next(qwen3_next::Generate::with_sampler(
@@ -1191,9 +1205,11 @@ impl Model {
                 ))
             }
             (Self::Qwen3NextLayerwise(model), ModelCache::Qwen3Next(cache)) => {
-                ModelGenerate::Qwen3NextLayerwise(crate::qwen_hybrid::Generate::with_sampler(
-                    model, cache, temp, input, prng_key, stream, sampler,
-                ))
+                ModelGenerate::Qwen3NextLayerwise(
+                    crate::architectures::qwen::hybrid::layerwise::Generate::with_sampler(
+                        model, cache, temp, input, prng_key, stream, sampler,
+                    ),
+                )
             }
             (Self::DeepSeekV3(model), ModelCache::DeepSeekV3(cache)) => {
                 ModelGenerate::DeepSeekV3(deepseek_v3::Generate::with_sampler(
@@ -1201,9 +1217,11 @@ impl Model {
                 ))
             }
             (Self::DeepSeekV3Layerwise(model), ModelCache::DeepSeekV3(cache)) => {
-                ModelGenerate::DeepSeekV3Layerwise(crate::deepseek_v3::Generate::with_sampler(
-                    model, cache, temp, input, prng_key, stream, sampler,
-                ))
+                ModelGenerate::DeepSeekV3Layerwise(
+                    crate::architectures::deepseek_v3::layerwise::Generate::with_sampler(
+                        model, cache, temp, input, prng_key, stream, sampler,
+                    ),
+                )
             }
             _ => panic!("model cache type does not match model kind"),
         }
@@ -1224,7 +1242,7 @@ pub enum ModelCache {
     /// Homogeneous per-layer key/value cache.
     KeyValue(Vec<Option<ConcatKeyValueCache>>),
     /// Unified Llama cache used by bounded layer execution.
-    LlamaLayerwise(crate::llama::LlamaCache),
+    LlamaLayerwise(crate::architectures::llama::layerwise::LlamaCache),
     /// Qwen3-VL key/value cache and multimodal position state.
     Qwen3Vl(qwen3_vl::Cache),
     /// Qwen3-VL-MoE key/value cache and multimodal position state.
@@ -1339,19 +1357,19 @@ where
     /// DeepSeek-V3/R1 generation iterator.
     DeepSeekV3(deepseek_v3::Generate<'a, S>),
     /// DeepSeek-V3/R1 generation using bounded layer execution.
-    DeepSeekV3Layerwise(crate::deepseek_v3::Generate<'a, S>),
+    DeepSeekV3Layerwise(crate::architectures::deepseek_v3::layerwise::Generate<'a, S>),
     /// Gemma 4 generation iterator.
     Gemma4(gemma4::Generate<'a, S>),
     /// Gemma 4 multimodal-prefill generation using bounded layer execution.
-    Gemma4Layerwise(crate::gemma4::Generate<'a, S>),
+    Gemma4Layerwise(crate::architectures::gemma4::layerwise::Generate<'a, S>),
     /// GPT-OSS generation iterator.
     GptOss(gpt_oss::Generate<'a, S>),
     /// GPT-OSS generation using bounded layer execution.
-    GptOssLayerwise(crate::gpt_oss::Generate<'a, S>),
+    GptOssLayerwise(crate::architectures::gpt_oss::layerwise::Generate<'a, S>),
     /// Inkling generation iterator.
     Inkling(inkling::Generate<'a, S>),
     /// Inkling multimodal-prefill generation using bounded layer execution.
-    InklingLayerwise(crate::inkling::Generate<'a, S>),
+    InklingLayerwise(crate::architectures::inkling::layerwise::Generate<'a, S>),
     /// Llama generation iterator.
     Llama(llama::Generate<'a, ConcatKeyValueCache, S>),
     /// Llama-compatible generation with bounded sliding-window caches.
@@ -1360,7 +1378,12 @@ where
     LlamaPaged(llama::Generate<'a, PagedKeyValueCache, S>),
     /// Llama-compatible generation using bounded layer execution.
     LlamaLayerwise(
-        common::generation::Generate<'a, crate::llama::LlamaModel, crate::llama::LlamaCache, S>,
+        common::generation::Generate<
+            'a,
+            crate::architectures::llama::layerwise::LlamaModel,
+            crate::architectures::llama::layerwise::LlamaCache,
+            S,
+        >,
     ),
     /// Qwen3 generation iterator.
     Qwen3(qwen3::Generate<'a, ConcatKeyValueCache, S>),
@@ -1368,7 +1391,7 @@ where
     Qwen3Layerwise(
         common::generation::Generate<
             'a,
-            crate::qwen3::Qwen3LayerwiseModel,
+            crate::architectures::qwen::qwen3::layerwise::Qwen3LayerwiseModel,
             Vec<Option<ConcatKeyValueCache>>,
             S,
         >,
@@ -1376,27 +1399,27 @@ where
     /// Qwen3-VL generation iterator.
     Qwen3Vl(qwen3_vl::Generate<'a, S>),
     /// Qwen3-VL generation using vision/text bounded layer execution.
-    Qwen3VlLayerwise(crate::qwen3_vl::Generate<'a, S>),
+    Qwen3VlLayerwise(crate::architectures::qwen::vl::layerwise::Generate<'a, S>),
     /// Qwen3-VL-MoE generation iterator.
     Qwen3VlMoe(qwen3_vl_moe::Generate<'a, S>),
     /// Qwen3-VL-MoE generation using vision/text bounded layer execution.
-    Qwen3VlMoeLayerwise(crate::qwen3_vl::Generate<'a, S>),
+    Qwen3VlMoeLayerwise(crate::architectures::qwen::vl::layerwise::Generate<'a, S>),
     /// Nemotron-H generation iterator.
     NemotronH(nemotron_h::Generate<'a, S>),
     /// Nemotron-H generation using bounded layer execution.
-    NemotronHLayerwise(crate::nemotron_h::Generate<'a, S>),
+    NemotronHLayerwise(crate::architectures::nemotron_h::layerwise::Generate<'a, S>),
     /// LFM2 generation iterator.
     Lfm2(lfm2::Generate<'a, S>),
     /// LFM2 generation using bounded layer execution.
-    Lfm2Layerwise(crate::lfm2::Generate<'a, S>),
+    Lfm2Layerwise(crate::architectures::lfm2::layerwise::Generate<'a, S>),
     /// Qwen3.5 MoE generation iterator.
     Qwen35Moe(qwen3_5_moe::Generate<'a, S>),
     /// Qwen3.5 multimodal-prefill generation using shared bounded layer execution.
-    Qwen35MoeLayerwise(crate::qwen_hybrid::Generate<'a, S>),
+    Qwen35MoeLayerwise(crate::architectures::qwen::hybrid::layerwise::Generate<'a, S>),
     /// Qwen3-Next generation iterator.
     Qwen3Next(qwen3_next::Generate<'a, S>),
     /// Qwen3-Next generation using shared hybrid bounded layer execution.
-    Qwen3NextLayerwise(crate::qwen_hybrid::Generate<'a, S>),
+    Qwen3NextLayerwise(crate::architectures::qwen::hybrid::layerwise::Generate<'a, S>),
 }
 
 impl<S> ModelGenerate<'_, S>

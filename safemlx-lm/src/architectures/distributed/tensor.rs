@@ -23,8 +23,7 @@ use safemlx::{
 };
 
 use crate::{
-    error::Error,
-    models::{
+    api::{
         common::{
             attention::{
                 apply_rope_and_update_cache, batch_seq, finish_attention,
@@ -35,7 +34,11 @@ use crate::{
         },
         deepseek_v3, llama, ModelKind, ModelLoadOptions,
     },
-    pipeline::{assign_module, load_deepseek_experts, SynchronizedToken},
+    architectures::distributed::pipeline::{
+        assign_module, load_deepseek_experts, SynchronizedToken,
+    },
+    error::Error,
+    nn::tensor::create_causal_mask,
     runtime::cache::residency::{
         open_prompt_cache, validate_prompt_cache_model_identity, CacheRankIdentity,
         CacheResidencyManager, CacheResidencyPolicy, CacheResidencyReport, PagedCacheOptions,
@@ -52,8 +55,7 @@ use crate::{
         balanced_contiguous_range, load_safetensors_partition_on_streams, ParallelTopology,
         PlacementPlan, RankPartition, TensorPlacement,
     },
-    sampler::Sampler,
-    utils::create_causal_mask,
+    runtime::generation::sampler::Sampler,
 };
 
 /// Immutable description of one rank's tensor-parallel model state.
@@ -392,7 +394,9 @@ impl TensorParallelModel {
             TensorArchitecture::Llama(model) => (
                 "llama".to_string(),
                 model.global_args.model_type.clone(),
-                crate::models::llama::prompt_cache_architecture_fingerprint(&model.global_args),
+                crate::architectures::llama::model::prompt_cache_architecture_fingerprint(
+                    &model.global_args,
+                ),
                 usize::try_from(model.global_args.num_hidden_layers)
                     .map_err(|_| Error::Parallel("invalid Llama layer count".into()))?,
                 model.global_args.sliding_window,
@@ -400,7 +404,7 @@ impl TensorParallelModel {
             TensorArchitecture::DeepSeek(model) => (
                 "deepseek_v3".to_string(),
                 model.global_args.model_type.clone(),
-                crate::models::deepseek_v3::prompt_cache_architecture_fingerprint(
+                crate::architectures::deepseek_v3::model::prompt_cache_architecture_fingerprint(
                     &model.global_args,
                 ),
                 usize::try_from(model.global_args.num_hidden_layers)

@@ -8,6 +8,5 @@ pub mod layerwise;
 pub mod model;
 pub(crate) mod mtp;
 pub(crate) mod multimodal;
-#[cfg(feature = "media-processing")]
 pub(crate) mod processor;
 pub(crate) mod vision;

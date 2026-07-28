@@ -1,4 +1,3 @@
-
 use super::{
     chat_template_kwargs, check_model_config, check_model_config_json, check_model_dir,
     eos_token_ids_from_sidecar_dir, gguf_eos_token_ids, inspect_chat_template_kwargs,
@@ -8,19 +7,19 @@ use super::{
     PreparedChatGenerationSettings, PreparedChatMtpBatchLane,
 };
 use crate::{
-    chat::{
+    error::Error,
+    runtime::chat::constraints::ConstraintCompiler,
+    runtime::chat::{
         ChatTemplateRequest, NativeToolSupport, ParallelToolCallPolicy, PreparedChat, ToolChoice,
         SYNTHETIC_STRUCTURAL_TOKEN, SYNTHETIC_TOOL_TEMPLATE,
     },
-    error::Error,
-    mtp::{MtpSchedulerOptions, MtpStreamTopology},
     runtime::checkpoint::quantization::{
         AffineQuantization, CheckpointQuantizationOptions, WeightQuantization,
     },
     runtime::execution::inspection::ActivationRecorder,
-    sampler::{ConstrainedSampler, DefaultSampler},
-    streaming::{FinishReason, SemanticEvent},
-    tool_constraints::ConstraintCompiler,
+    runtime::generation::sampler::{ConstrainedSampler, DefaultSampler},
+    runtime::generation::speculative::{MtpSchedulerOptions, MtpStreamTopology},
+    runtime::generation::streaming::{FinishReason, SemanticEvent},
 };
 use safemlx::{
     argmax_axis,
@@ -366,7 +365,7 @@ fn production_tool(name: &str) -> serde_json::Value {
     })
 }
 
-fn plan_accepts(plan: &crate::chat::ToolRuntimePlan, output: &str) -> bool {
+fn plan_accepts(plan: &crate::runtime::chat::ToolRuntimePlan, output: &str) -> bool {
     let mut grammar = plan.generation_constraint().grammar_state();
     let structural_tokens = plan.structural_tokens().collect::<Vec<_>>();
     let mut offset = 0;
@@ -1877,7 +1876,7 @@ fn production_deepseek_templates_render_tools_history_and_exact_generation_promp
         )
         .unwrap();
         assert_eq!(
-            crate::chat::template_signature(prepared.rendered_prompt()),
+            crate::runtime::chat::template_signature(prepared.rendered_prompt()),
             golden_prompt_signature,
             "exact rendered history golden for {identity}"
         );
@@ -1943,7 +1942,7 @@ fn production_deepseek_templates_render_tools_history_and_exact_generation_promp
         )
         .unwrap();
         assert_eq!(
-            crate::chat::template_signature(prepared.rendered_prompt()),
+            crate::runtime::chat::template_signature(prepared.rendered_prompt()),
             golden_prompt_signature,
             "exact fresh prompt golden for {identity}"
         );
@@ -2471,7 +2470,7 @@ fn production_gemma4_templates_render_exact_thinking_tool_history_and_prompts() 
 #[test]
 fn production_gemma4_semantic_events_survive_every_protocol_byte_split() {
     fn push_at_every_side(
-        parser: &mut crate::streaming::ToolRuntimeParser,
+        parser: &mut crate::runtime::generation::streaming::ToolRuntimeParser,
         output: &str,
         split: usize,
     ) {

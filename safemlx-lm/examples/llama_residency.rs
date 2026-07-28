@@ -5,11 +5,13 @@ use std::{path::PathBuf, time::Instant};
 use clap::Parser;
 use safemlx::{Array, Device, DeviceType, ExecutionContext};
 use safemlx_lm::{
-    dense_stream::DenseDiskStreamLoadOptions,
-    layerwise::LayerwiseLoadOptions,
-    llama::{load_llama_model, LlamaLoadOptions},
-    models::llama,
-    offload::{MemoryTier, OffloadConfig, TransferDirection},
+    architectures::llama::{
+        layerwise::{load_llama_model, LlamaLoadOptions},
+        model as llama,
+    },
+    runtime::execution::layerwise::LayerwiseLoadOptions,
+    runtime::residency::dense_stream::DenseDiskStreamLoadOptions,
+    runtime::residency::policy::{MemoryTier, OffloadConfig, TransferDirection},
 };
 
 #[derive(Debug, Parser)]

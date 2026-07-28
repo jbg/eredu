@@ -15,15 +15,12 @@ use safemlx::{
     Array, Device, DeviceType, Stream,
 };
 use safemlx_lm::{
-    expert_parallel::{
+    api::{self, Model, ModelCache},
+    architectures::distributed::expert::{
         dispatch_sharded, load_expert_parallel_model, profile_expert_parallel_timings,
         ExpertAssignment, LocalExpertBank, RoutingStatistics, ShardedRouteBlocks,
     },
-    models::{
-        self,
-        input::{InputPart, ModelInput},
-        Model, ModelCache,
-    },
+    runtime::media::input::{InputPart, ModelInput},
     DeviceAssignment, ParallelTopology,
 };
 
@@ -127,7 +124,7 @@ fn main() -> anyhow::Result<()> {
     // following scalar collective before loading its local EP shard.
     let baseline = if group.rank() == 0 {
         safemlx::memory::reset_peak_memory()?;
-        let mut model = models::load_model(&args.model_dir, &stream, &weights_stream)?;
+        let mut model = api::load_model(&args.model_dir, &stream, &weights_stream)?;
         let results = benchmark_complete_model(
             &mut model,
             &prompt,
@@ -305,7 +302,7 @@ fn benchmark_complete_model(
 
 #[allow(clippy::too_many_arguments)]
 fn benchmark_replicated_ep(
-    model: &mut safemlx_lm::expert_parallel::ExpertParallelModel,
+    model: &mut safemlx_lm::architectures::distributed::expert::ExpertParallelModel,
     prompt: &Array,
     decode_token: &Array,
     warmup: usize,

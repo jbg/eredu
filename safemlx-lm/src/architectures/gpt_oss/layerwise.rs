@@ -13,12 +13,13 @@ use safemlx::{
 };
 
 use crate::{
-    error::Error,
-    models::{
+    api::{
         common::{self, generation::CausalLm},
         gpt_oss::{self as resident, Cache, Experts, LayerCache, ModelArgs, TransformerBlock},
         input,
     },
+    error::Error,
+    nn::tensor::create_causal_mask,
     runtime::cache::residency::{
         open_prompt_cache, validate_prompt_cache_model_identity, CacheResidencyManager,
         CacheResidencyPolicy, PagedCacheOptions, PromptCacheDescriptor, PromptCacheManifest,
@@ -39,7 +40,6 @@ use crate::{
         ExpertPass,
     },
     runtime::residency::manager::{OffloadUnit, ResidencyReport, ResidentUnitLease, WeightBinding},
-    utils::create_causal_mask,
 };
 
 const EMBEDDING_UNIT: &str = "gpt_oss.static.embedding";
@@ -688,7 +688,7 @@ pub(crate) fn gpt_oss_expert_catalog(
 }
 
 /// GPT-OSS token generation iterator using bounded layer execution.
-pub type Generate<'a, S = crate::sampler::DefaultSampler> =
+pub type Generate<'a, S = crate::runtime::generation::sampler::DefaultSampler> =
     common::generation::Generate<'a, GptOssLayerwiseModel, Cache, S>;
 
 #[cfg(test)]
@@ -703,7 +703,7 @@ mod tests {
 
     use super::{load_gpt_oss_layerwise_model, load_gpt_oss_sparse_expert_cache_model};
     use crate::{
-        models::gpt_oss::{self as resident, Cache, Model, ModelArgs, MxFp4Config},
+        architectures::gpt_oss::model::{self as resident, Cache, Model, ModelArgs, MxFp4Config},
         runtime::cache::KeyValueCache,
         runtime::execution::layerwise::{LayerExecutionLoadOptions, LayerwiseLoadOptions},
         runtime::residency::dense_stream::DenseDiskStreamLoadOptions,
@@ -921,10 +921,10 @@ mod tests {
         assert_eq!(report.owned_experts, 4);
         assert!(report.prefill.requested_routes > 0);
         assert!(report.decode.requested_routes > 0);
-        crate::expert_parallel::assert_rank_owned_sparse_ep_load(
+        crate::architectures::distributed::expert::assert_rank_owned_sparse_ep_load(
             dir.path(),
             options,
-            crate::models::ModelKind::GptOss,
+            crate::api::ModelKind::GptOss,
             report.owned_experts / 2,
             gpu.stream(),
             cpu.stream(),

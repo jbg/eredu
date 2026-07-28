@@ -19,21 +19,27 @@ use safemlx::{
     Array, Device, DeviceType, Dtype, ExecutionContext, Stream,
 };
 use safemlx_lm::{
-    cache::{ConcatKeyValueCache, SlidingKeyValueCache},
-    expert_cache::ExpertCacheLoadOptions,
-    expert_parallel::{
+    api::ModelLoadOptions,
+    architectures::distributed::expert::{
         load_expert_parallel_model_with_options,
         load_expert_parallel_model_with_options_and_assignment, profile_expert_parallel_timings,
         ExpertAssignment,
     },
-    inspection::{ActivationObserver, MoeRoutingObservation},
-    models::{
-        deepseek_v3, gpt_oss, inkling, input as runtime_input, lfm2, nemotron_h, qwen3,
-        qwen3_5_moe, qwen3_vl, ModelLoadOptions,
+    architectures::{
+        deepseek_v3::model as deepseek_v3,
+        gpt_oss::model as gpt_oss,
+        inkling::model as inkling,
+        lfm2::model as lfm2,
+        nemotron_h::model as nemotron_h,
+        qwen::{hybrid::qwen3_5 as qwen3_5_moe, qwen3::model as qwen3, vl::model as qwen3_vl},
     },
-    mtp::{MtpCapability, MtpCheckpointKind, MtpConfig},
-    quantization::{AffineQuantization, WeightQuantization},
-    sampler::DefaultSampler,
+    runtime::cache::{ConcatKeyValueCache, SlidingKeyValueCache},
+    runtime::checkpoint::quantization::{AffineQuantization, WeightQuantization},
+    runtime::execution::inspection::{ActivationObserver, MoeRoutingObservation},
+    runtime::generation::sampler::DefaultSampler,
+    runtime::generation::speculative::{MtpCapability, MtpCheckpointKind, MtpConfig},
+    runtime::media::input as runtime_input,
+    runtime::residency::expert_cache::ExpertCacheLoadOptions,
     CacheResidencyPolicy, DeviceAssignment, PagedCacheOptions, ParallelTopology,
     PromptCacheDescriptor, PromptCacheOptions, PromptCacheTopology, WeightResidency,
 };
@@ -1051,7 +1057,7 @@ fn save_zero_fixture(
         .into_iter()
         .map(|(name, value)| {
             (
-                safemlx_lm::module_binding::canonical_checkpoint_name(&name),
+                safemlx_lm::runtime::checkpoint::binding::canonical_checkpoint_name(&name),
                 value.clone(),
             )
         })

@@ -36,13 +36,18 @@ pub use crate::architectures::qwen::vl::vision::{
 pub use crate::nn::generation::sample;
 
 use crate::{
-    error::Error,
-    models::{
+    api::{
         common::{
             self, attention::attention_probabilities, generation::CausalLm, layers::silu,
             linear::project_logits_maybe_quantized, moe::TopKRouterScoreFunction,
         },
         input as runtime_input,
+    },
+    error::Error,
+    nn::tensor::{
+        create_attention_mask,
+        rope::{initialize_rope, FloatOrString, RopeVariant},
+        AttentionMask,
     },
     runtime::cache::{ConcatKeyValueCache, KeyValueCache},
     runtime::checkpoint::load::{
@@ -53,11 +58,6 @@ use crate::{
     },
     runtime::checkpoint::quantization::{AffineQuantization, WeightQuantization},
     runtime::execution::inspection::{ActivationObserver, MoeRoutingObservation},
-    utils::{
-        create_attention_mask,
-        rope::{initialize_rope, FloatOrString, RopeVariant},
-        AttentionMask,
-    },
 };
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -760,7 +760,7 @@ impl QwenLinear {
                 stream,
             )?
         } else if let Some(scale) = self.weight_scale_inv.as_ref() {
-            common::block_fp8::linear(input, self.weight.as_ref(), scale, stream)?
+            common::fp8::linear(input, self.weight.as_ref(), scale, stream)?
         } else {
             matmul(input, self.weight.as_ref().transpose(stream)?, stream)?
         };
@@ -781,7 +781,7 @@ impl QwenLinear {
                 first.weight_scale_inv.as_ref(),
                 second.weight_scale_inv.as_ref(),
             ) {
-                let (mut first_output, mut second_output) = common::block_fp8::linear_pair(
+                let (mut first_output, mut second_output) = common::fp8::linear_pair(
                     input,
                     first.weight.as_ref(),
                     first_scale,
@@ -827,7 +827,7 @@ impl QwenLinear {
                 stream,
             )
         } else if let Some(scale) = self.weight_scale_inv.as_ref() {
-            common::block_fp8::dequantize(self.weight.as_ref(), scale, stream)
+            common::fp8::dequantize(self.weight.as_ref(), scale, stream)
         } else {
             Ok(self.weight.as_ref().clone())
         }
@@ -1211,7 +1211,7 @@ impl Module<FullAttentionInput<'_>> for FullAttention {
             key = self.rope.forward(nn::RopeInput::new(&key), stream)?;
         }
 
-        let out = crate::utils::scaled_dot_product_attention(
+        let out = crate::nn::tensor::scaled_dot_product_attention(
             query, key, value, cache, self.scale, mask, stream,
         )?
         .transpose_axes(&[0, 2, 1, 3], stream)?
@@ -1298,7 +1298,7 @@ impl FullAttention {
         let attention_probs = attention_probabilities(&query, &key, self.scale, mask, stream)?;
         observer.observe(&format!("{prefix}.attention_probs"), &attention_probs)?;
 
-        let out = crate::utils::scaled_dot_product_attention(
+        let out = crate::nn::tensor::scaled_dot_product_attention(
             query, key, value, cache, self.scale, mask, stream,
         )?
         .transpose_axes(&[0, 2, 1, 3], stream)?
@@ -2553,7 +2553,7 @@ impl Experts {
                 stream,
             )?
         } else if let Some(scale) = self.gate_up_proj_scale_inv.as_ref() {
-            common::block_fp8::grouped_linear(
+            common::fp8::grouped_linear(
                 &hidden,
                 self.gate_up_proj.as_ref(),
                 scale,
@@ -2597,7 +2597,7 @@ impl Experts {
                 stream,
             )?
         } else if let Some(scale) = self.down_proj_scale_inv.as_ref() {
-            common::block_fp8::grouped_linear(
+            common::fp8::grouped_linear(
                 &current,
                 self.down_proj.as_ref(),
                 scale,
@@ -2660,7 +2660,7 @@ impl Experts {
                 stream,
             )?
         } else if let Some(scale) = self.gate_up_proj_scale_inv.as_ref() {
-            common::block_fp8::grouped_linear(
+            common::fp8::grouped_linear(
                 &hidden,
                 self.gate_up_proj.as_ref(),
                 scale,
@@ -2713,7 +2713,7 @@ impl Experts {
                 stream,
             )?
         } else if let Some(scale) = self.down_proj_scale_inv.as_ref() {
-            common::block_fp8::grouped_linear(
+            common::fp8::grouped_linear(
                 &current,
                 self.down_proj.as_ref(),
                 scale,
@@ -4403,7 +4403,7 @@ pub(crate) fn load_qwen3_5_moe_gguf_checkpoint(
     }
     report.finish(&model, &config)?;
     model.copy_to_stream(stream)?;
-    let eos_token_ids = crate::models::gguf_eos_token_ids(&metadata)?;
+    let eos_token_ids = crate::api::gguf_eos_token_ids(&metadata)?;
     Ok(LoadedQwen35Gguf {
         model,
         eos_token_ids,
@@ -4474,7 +4474,7 @@ pub(crate) fn prepare_qwen35_gguf_checkpoint(
         super::qwen3_next::split_fused_projection_configs(&mut configs)?;
     }
     args.quantized_weight_configs = Some(configs);
-    let eos_token_ids = crate::models::gguf_eos_token_ids(metadata)?;
+    let eos_token_ids = crate::api::gguf_eos_token_ids(metadata)?;
     Ok(PreparedQwen35Gguf {
         args,
         eos_token_ids,
@@ -5815,7 +5815,7 @@ impl CausalLm<Cache> for Model {
 }
 
 /// Qwen3.5 MoE token generation iterator.
-pub type Generate<'a, S = crate::sampler::DefaultSampler> =
+pub type Generate<'a, S = crate::runtime::generation::sampler::DefaultSampler> =
     common::generation::Generate<'a, Model, Cache, S>;
 
 #[cfg(test)]
@@ -5831,12 +5831,12 @@ mod tests {
         ModelArgs, SparseMoeBlock, VisionConfig,
     };
     #[cfg(feature = "image-processing")]
-    use crate::processor::{load_processor, MediaInput, ProcessorInput, RgbImageView};
+    use crate::runtime::media::{load_processor, MediaInput, ProcessorInput, RgbImageView};
     use crate::{
-        error::Error,
-        models::{
+        api::{
             common::generation::CausalLm, input as runtime_input, Model as AnyModel, ModelCache,
         },
+        error::Error,
         runtime::checkpoint::load::{load_safetensors_strict, StrictLoadReport},
         runtime::checkpoint::quantization::AffineQuantization,
         runtime::execution::inspection::ActivationRecorder,
@@ -6939,7 +6939,7 @@ mod tests {
         )
         .unwrap();
 
-        let model = crate::models::load_model(&dir, stream, weights_ctx.stream()).unwrap();
+        let model = crate::api::load_model(&dir, stream, weights_ctx.stream()).unwrap();
         let AnyModel::Qwen35Moe(mut model) = model else {
             panic!("qwen3_5 must dispatch to the Qwen3.5 loader");
         };
@@ -6960,20 +6960,20 @@ mod tests {
         .unwrap();
         assert_eq!(logits.shape(), &[1, 32]);
 
-        let mtp_config = crate::mtp::MtpConfig {
+        let mtp_config = crate::runtime::generation::speculative::MtpConfig {
             max_tokens: 3,
             max_draft_tokens: 1,
             temperature: 0.0,
             eos_token_ids: Vec::new(),
         };
         let mut mtp_cache = model.new_cache();
-        let (generated, stats) = crate::qwen_mtp::generate(
+        let (generated, stats) = crate::architectures::qwen::hybrid::mtp::generate(
             &mut model,
             &mut mtp_cache,
             runtime_input::ModelInput::new(&parts),
             &mtp_config,
             None,
-            &mut crate::sampler::DefaultSampler,
+            &mut crate::runtime::generation::sampler::DefaultSampler,
             stream,
         )
         .unwrap();
@@ -6981,9 +6981,9 @@ mod tests {
         assert_eq!(stats.rounds, 1);
         assert_eq!(stats.accepted_tokens, 1);
 
-        let quantized = crate::models::load_model_with_options(
+        let quantized = crate::api::load_model_with_options(
             &dir,
-            crate::models::ModelLoadOptions::with_quantization(
+            crate::api::ModelLoadOptions::with_quantization(
                 AffineQuantization::new(32, 4).unwrap(),
             ),
             stream,
@@ -7027,13 +7027,13 @@ mod tests {
         assert_eq!(logits.shape(), &[1, 32]);
 
         let mut mtp_cache = quantized.new_cache();
-        let (generated, stats) = crate::qwen_mtp::generate(
+        let (generated, stats) = crate::architectures::qwen::hybrid::mtp::generate(
             &mut quantized,
             &mut mtp_cache,
             runtime_input::ModelInput::new(&parts),
             &mtp_config,
             None,
-            &mut crate::sampler::DefaultSampler,
+            &mut crate::runtime::generation::sampler::DefaultSampler,
             stream,
         )
         .unwrap();
@@ -8096,10 +8096,10 @@ mod tests {
                 .unwrap();
             let mut cache = model.new_cache();
             let mut tokens = Vec::new();
-            let input_parts = [crate::models::input::InputPart::text_token_ids(
+            let input_parts = [crate::runtime::media::input::InputPart::text_token_ids(
                 &prompt_tokens,
             )];
-            let input = crate::models::input::ModelInput::new(&input_parts);
+            let input = crate::runtime::media::input::ModelInput::new(&input_parts);
             let generate = super::Generate::new(&mut model, &mut cache, 0.0, input, None, stream);
             for token in generate.take(expected_tokens.len()) {
                 let token = token.unwrap();

@@ -16,3 +16,5 @@ pub mod linear;
 pub mod moe;
 /// Rotary position-embedding variants and initialization.
 pub mod rope;
+/// Shared tensor and attention-mask helpers.
+pub mod tensor;

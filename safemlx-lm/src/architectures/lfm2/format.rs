@@ -10,14 +10,14 @@ use llguidance::api::TopLevelGrammar;
 use serde_json::Value;
 
 use crate::{
-    chat::{ParallelToolCallPolicy, ToolChoice},
-    format_dialect::{
+    runtime::chat::constraints::{parse_tools, tool_call_bounds},
+    runtime::chat::dialect::{
         ConstraintConfiguration, DialectParameters, FormatDialect, GenerationPromptBehavior,
     },
-    streaming::{
+    runtime::chat::{ParallelToolCallPolicy, ToolChoice},
+    runtime::generation::streaming::{
         PartialPatternBuffer, PatternKind, PatternPiece, ProtocolParser, SemanticEventSink,
     },
-    tool_constraints::{parse_tools, tool_call_bounds},
 };
 
 const TOOL_CALL_START: &str = "<|tool_call_start|>";
@@ -949,10 +949,10 @@ mod tests {
 
     use super::{LFM2_DIALECT, LFM2_PARAMETERS, STRUCTURAL_TOKENS, TOOL_CALL_END, TOOL_CALL_START};
     use crate::{
-        chat::{ParallelToolCallPolicy, ToolChoice},
-        format_dialect::DialectParameters,
-        streaming::{FinishReason, SemanticEvent},
-        tool_constraints::ConstraintCompiler,
+        runtime::chat::constraints::ConstraintCompiler,
+        runtime::chat::dialect::DialectParameters,
+        runtime::chat::{ParallelToolCallPolicy, ToolChoice},
+        runtime::generation::streaming::{FinishReason, SemanticEvent},
     };
 
     const AUTHORITATIVE_CALL: &str =
@@ -1018,7 +1018,7 @@ mod tests {
         tools: &[Value],
         choice: ToolChoice,
         parallel: ParallelToolCallPolicy,
-    ) -> crate::chat::ToolRuntimePlan {
+    ) -> crate::runtime::chat::ToolRuntimePlan {
         ConstraintCompiler::synthetic_for_tests()
             .compile_tool_plan(
                 &LFM2_DIALECT,
@@ -1031,7 +1031,7 @@ mod tests {
             .unwrap()
     }
 
-    fn accepts(plan: &crate::chat::ToolRuntimePlan, text: &str) -> bool {
+    fn accepts(plan: &crate::runtime::chat::ToolRuntimePlan, text: &str) -> bool {
         let mut grammar = plan.generation_constraint().grammar_state();
         let structural = plan.structural_tokens().collect::<Vec<_>>();
         let mut offset = 0;
@@ -1083,7 +1083,7 @@ mod tests {
     }
 
     fn push_at_byte_split(
-        parser: &mut crate::streaming::ToolRuntimeParser,
+        parser: &mut crate::runtime::generation::streaming::ToolRuntimeParser,
         text: &str,
         split: usize,
     ) -> Result<(), String> {

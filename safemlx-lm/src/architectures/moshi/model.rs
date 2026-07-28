@@ -30,10 +30,10 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use crate::{
-    error::Error,
-    realtime::{
+    api::realtime::{
         self, RealtimeSampling, RealtimeSpeechConfig, RealtimeSpeechModel, RealtimeStepInput,
     },
+    error::Error,
     runtime::cache::{ConcatKeyValueCache, KeyValueCache},
     runtime::checkpoint::load::{
         for_each_safetensor_array, load_array_quantized_strict, load_array_strict,
@@ -41,7 +41,7 @@ use crate::{
         StrictLoadConfig, StrictLoadReport,
     },
     runtime::checkpoint::quantization::WeightQuantization,
-    sampler::{DefaultSampler, Sampler},
+    runtime::generation::sampler::{DefaultSampler, Sampler},
 };
 
 const RMS_NORM_EPS: f32 = 1e-8;

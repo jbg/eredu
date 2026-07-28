@@ -2364,8 +2364,10 @@ mod tests {
 
     use super::*;
     use crate::{
-        llama::{load_llama_model, LlamaCache, LlamaLoadOptions, LlamaModel},
-        models::llama::{self, ModelArgs},
+        architectures::llama::layerwise::{
+            load_llama_model, LlamaCache, LlamaLoadOptions, LlamaModel,
+        },
+        architectures::llama::model::{self as llama, ModelArgs},
         runtime::cache::ConcatKeyValueCache,
         runtime::residency::manager::UnitResidencyReport,
         runtime::residency::policy::TransferDirection,
@@ -2783,9 +2785,11 @@ mod tests {
         drop(sizing);
 
         let options = DenseDiskStreamLoadOptions::new(device_budget, host_budget, 1, 1, 1).unwrap();
-        let adapter =
-            crate::llama::LlamaLayerwiseAdapter::new(args("llama", true, None), gpu.stream())
-                .unwrap();
+        let adapter = crate::architectures::llama::layerwise::LlamaLayerwiseAdapter::new(
+            args("llama", true, None),
+            gpu.stream(),
+        )
+        .unwrap();
         let mut streamed =
             load_layerwise_model(dir.path(), adapter, options, gpu.stream(), cpu.stream()).unwrap();
 

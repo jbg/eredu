@@ -20,8 +20,12 @@ use serde::Deserialize;
 use tokenizers::Tokenizer;
 
 use crate::{
+    api::{common, common::generation::CausalLm, input},
     error::Error,
-    models::{common, common::generation::CausalLm, input},
+    nn::tensor::{
+        create_causal_mask,
+        rope::{initialize_rope, FloatOrString, RopeVariant},
+    },
     runtime::cache::residency::{
         derive_prompt_cache_architecture_fingerprint, open_prompt_cache,
         validate_prompt_cache_model_identity, CacheRankIdentity, CacheResidencyManager,
@@ -36,10 +40,6 @@ use crate::{
         StrictLoadReport,
     },
     runtime::checkpoint::quantization::WeightQuantization,
-    utils::{
-        create_causal_mask,
-        rope::{initialize_rope, FloatOrString, RopeVariant},
-    },
 };
 
 fn default_head_dim() -> i32 {
@@ -1101,7 +1101,7 @@ impl CausalLm<Cache> for Model {
 }
 
 /// GPT-OSS token generation iterator.
-pub type Generate<'a, S = crate::sampler::DefaultSampler> =
+pub type Generate<'a, S = crate::runtime::generation::sampler::DefaultSampler> =
     common::generation::Generate<'a, Model, Cache, S>;
 
 /// Reads GPT-OSS model arguments from `config.json`.

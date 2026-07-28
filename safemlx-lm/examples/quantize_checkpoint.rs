@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use clap::{Parser, ValueEnum};
 use safemlx::{Device, DeviceType, ExecutionContext};
-use safemlx_lm::quantization::{
+use safemlx_lm::runtime::checkpoint::quantization::{
     AffineQuantization, CheckpointQuantizationOptions, WeightQuantization,
 };
 
@@ -70,8 +70,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         exclude: args.exclude,
         minimum_elements: args.minimum_elements,
     };
-    let report =
-        safemlx_lm::quantization::quantize_checkpoint(args.source, args.output, &options, stream)?;
+    let report = safemlx_lm::runtime::checkpoint::quantization::quantize_checkpoint(
+        args.source,
+        args.output,
+        &options,
+        stream,
+    )?;
     stream.synchronize()?;
     println!("quantized_tensors={}", report.quantized_tensors);
     println!("copied_tensors={}", report.copied_tensors);

@@ -17,8 +17,7 @@ use safemlx::{
 };
 
 use crate::{
-    error::Error,
-    models::{
+    api::{
         common::{self, generation::CausalLm, linear::project_logits_maybe_quantized},
         input,
         qwen3_5_moe::{
@@ -31,6 +30,8 @@ use crate::{
             QwenVisionLayerwiseStatic, QwenVisionTransformer, VisionConfig,
         },
     },
+    error::Error,
+    nn::tensor::{create_attention_mask, AttentionMask},
     runtime::cache::KeyValueCache,
     runtime::checkpoint::binding::{
         build_module_bindings_with_recipes, canonical_checkpoint_name, populate_module_from_lease,
@@ -50,7 +51,6 @@ use crate::{
         ExpertPass,
     },
     runtime::residency::manager::{OffloadUnit, ResidencyReport, ResidentUnitLease, WeightBinding},
-    utils::{create_attention_mask, AttentionMask},
 };
 
 const EMBEDDING_UNIT: &str = "qwen_hybrid.static.embedding";
@@ -2155,7 +2155,7 @@ impl GeneralLayerwiseModelAdapter for QwenHybridLayerwiseAdapter {
 }
 
 /// Shared Qwen hybrid token generation iterator using bounded layer execution.
-pub type Generate<'a, S = crate::sampler::DefaultSampler> =
+pub type Generate<'a, S = crate::runtime::generation::sampler::DefaultSampler> =
     common::generation::Generate<'a, QwenHybridLayerwiseModel, Cache, S>;
 
 #[cfg(test)]
@@ -2173,7 +2173,7 @@ mod tests {
         load_qwen3_next_layerwise_model, load_qwen3_next_sparse_expert_cache_model,
     };
     use crate::{
-        models::{
+        api::{
             common::generation::CausalLm,
             input as runtime_input,
             qwen3_5_moe::{self as resident, Cache, LayerCache, Model, ModelArgs, ModelInput},
@@ -2391,31 +2391,31 @@ mod tests {
 
         let prompt = Array::from_slice(&[1u32, 2], &[1, 2]);
         let parts = [runtime_input::InputPart::text_token_ids(&prompt)];
-        let mtp_config = crate::mtp::MtpConfig {
+        let mtp_config = crate::runtime::generation::speculative::MtpConfig {
             max_tokens: 3,
             max_draft_tokens: 1,
             temperature: 0.0,
             eos_token_ids: Vec::new(),
         };
         let mut resident_cache = resident.new_cache();
-        let (expected, expected_stats) = crate::qwen_mtp::generate(
+        let (expected, expected_stats) = crate::architectures::qwen::hybrid::mtp::generate(
             &mut resident,
             &mut resident_cache,
             runtime_input::ModelInput::new(&parts),
             &mtp_config,
             None,
-            &mut crate::sampler::DefaultSampler,
+            &mut crate::runtime::generation::sampler::DefaultSampler,
             gpu.stream(),
         )
         .unwrap();
         let mut layerwise_cache = layerwise.new_cache();
-        let (actual, actual_stats) = crate::qwen_mtp::generate(
+        let (actual, actual_stats) = crate::architectures::qwen::hybrid::mtp::generate(
             &mut layerwise,
             &mut layerwise_cache,
             runtime_input::ModelInput::new(&parts),
             &mtp_config,
             None,
-            &mut crate::sampler::DefaultSampler,
+            &mut crate::runtime::generation::sampler::DefaultSampler,
             gpu.stream(),
         )
         .unwrap();
@@ -2497,13 +2497,13 @@ mod tests {
         assert_eq!(report.owned_experts, 4);
         assert!(report.prefill.requested_routes > 0);
         assert!(report.decode.requested_routes > 0);
-        crate::expert_parallel::assert_rank_owned_sparse_ep_load(
+        crate::architectures::distributed::expert::assert_rank_owned_sparse_ep_load(
             dir.path(),
             options,
             if next {
-                crate::models::ModelKind::Qwen3Next
+                crate::api::ModelKind::Qwen3Next
             } else {
-                crate::models::ModelKind::Qwen35Moe
+                crate::api::ModelKind::Qwen35Moe
             },
             report.owned_experts / 2,
             gpu.stream(),

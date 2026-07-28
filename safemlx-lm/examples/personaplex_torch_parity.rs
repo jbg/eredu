@@ -5,9 +5,9 @@ use safemlx::{
     Array, Device, DeviceType, ExecutionContext, Stream,
 };
 use safemlx_lm::{
-    models::{moshi, personaplex},
-    realtime::{RealtimeSampling, RealtimeSpeechModel, RealtimeStepInput},
-    sampler::DefaultSampler,
+    api::realtime::{RealtimeSampling, RealtimeSpeechModel, RealtimeStepInput},
+    architectures::moshi::{model as moshi, personaplex},
+    runtime::generation::sampler::DefaultSampler,
 };
 
 fn main() -> anyhow::Result<()> {

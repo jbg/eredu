@@ -7,10 +7,10 @@ use std::num::NonZeroUsize;
 
 use safemlx::{Device, DeviceType, ExecutionContext};
 use safemlx_lm::{
-    chat::{ChatTemplateRequest, NativeToolSupport, ToolChoice},
-    models::{LoadedModel, PreparedChatGenerationRequest, PreparedChatGenerationSettings},
-    sampler::DefaultSampler,
-    streaming::{FinishReason, SemanticEvent},
+    api::{LoadedModel, PreparedChatGenerationRequest, PreparedChatGenerationSettings},
+    runtime::chat::{ChatTemplateRequest, NativeToolSupport, ToolChoice},
+    runtime::generation::sampler::DefaultSampler,
+    runtime::generation::streaming::{FinishReason, SemanticEvent},
 };
 use serde_json::json;
 

@@ -15,8 +15,8 @@ use safemlx::{
 };
 
 use crate::{
+    nn::tensor::{create_causal_mask, rope::RopeVariant, scaled_dot_product_attention},
     runtime::cache::KeyValueCache,
-    utils::{create_causal_mask, rope::RopeVariant, scaled_dot_product_attention},
 };
 
 /// Common attention-layer input.
@@ -313,7 +313,7 @@ mod tests {
         fast::ScaledDotProductAttentionMask, Array, Device, DeviceType, Dtype, ExecutionContext,
     };
 
-    use crate::utils::create_causal_mask;
+    use crate::nn::tensor::create_causal_mask;
 
     #[test]
     #[ignore = "requires MLX runtime execution"]

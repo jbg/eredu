@@ -22,8 +22,7 @@ use tokenizers::Tokenizer;
 pub use crate::nn::generation::sample;
 
 use crate::{
-    error::Error,
-    models::{
+    api::{
         common::{
             self,
             attention::{
@@ -36,6 +35,12 @@ use crate::{
         },
         input,
     },
+    error::Error,
+    nn::tensor::{
+        create_attention_mask, create_sliding_attention_mask,
+        rope::{initialize_rope, FloatOrString, RopeVariant},
+        AttentionMask,
+    },
     runtime::cache::residency::derive_prompt_cache_architecture_fingerprint,
     runtime::cache::{KeyValueCache, SlidingKeyValueCache},
     runtime::checkpoint::load::{
@@ -44,11 +49,6 @@ use crate::{
     },
     runtime::checkpoint::quantization::WeightQuantization,
     runtime::execution::inspection::ActivationObserver,
-    utils::{
-        create_attention_mask, create_sliding_attention_mask,
-        rope::{initialize_rope, FloatOrString, RopeVariant},
-        AttentionMask,
-    },
 };
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1155,7 +1155,7 @@ pub(crate) fn prepare_llama_gguf_checkpoint(
         args.quantized_weight_configs = Some(quantized_weight_configs);
     }
 
-    let eos_token_ids = crate::models::gguf_eos_token_ids(metadata)?;
+    let eos_token_ids = crate::api::gguf_eos_token_ids(metadata)?;
     Ok(PreparedLlamaGguf {
         args,
         eos_token_ids,
@@ -1473,7 +1473,7 @@ where
 }
 
 /// Llama token generation iterator.
-pub type Generate<'a, C, S = crate::sampler::DefaultSampler> =
+pub type Generate<'a, C, S = crate::runtime::generation::sampler::DefaultSampler> =
     common::generation::Generate<'a, ResidentModel, Vec<Option<C>>, S>;
 
 #[cfg(test)]
@@ -1494,7 +1494,7 @@ mod tests {
     };
 
     use crate::{
-        models::llama::{load_llama_tokenizer, load_resident_llama_model},
+        architectures::llama::model::{load_llama_tokenizer, load_resident_llama_model},
         runtime::cache::ConcatKeyValueCache,
         runtime::checkpoint::quantization::AffineQuantization,
     };
@@ -1932,10 +1932,10 @@ mod tests {
         let eot_token_id = 128009u32;
 
         let mut token_ids = Vec::new();
-        let input_parts = [crate::models::input::InputPart::text_token_ids(
+        let input_parts = [crate::runtime::media::input::InputPart::text_token_ids(
             &prompt_tokens,
         )];
-        let input = crate::models::input::ModelInput::new(&input_parts);
+        let input = crate::runtime::media::input::ModelInput::new(&input_parts);
         let generate = super::Generate::<ConcatKeyValueCache>::new(
             &mut model, &mut cache, 0.0, input, None, stream,
         );

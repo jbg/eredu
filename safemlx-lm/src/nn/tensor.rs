@@ -12,12 +12,8 @@ use safemlx::{
     Array, Dtype, Stream,
 };
 
+pub(crate) use crate::nn::rope;
 use crate::runtime::cache::KeyValueCache;
-
-/// Compatibility re-export for rotary position embeddings.
-pub use crate::nn::rope;
-/// Tokenizer-related re-exports and helpers.
-pub mod tokenizer;
 
 #[allow(unused_macros)]
 macro_rules! try_unwrap {

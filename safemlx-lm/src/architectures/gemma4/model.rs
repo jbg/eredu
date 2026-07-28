@@ -41,8 +41,7 @@ use super::{
 pub use crate::nn::generation::sample;
 
 use crate::{
-    error::Error,
-    models::{
+    api::{
         common::{
             self,
             attention::{
@@ -53,6 +52,11 @@ use crate::{
         },
         input,
     },
+    error::Error,
+    nn::tensor::{
+        create_causal_mask,
+        rope::{initialize_rope, FloatOrString, RopeVariant},
+    },
     runtime::cache::{ConcatKeyValueCache, KeyValueCache},
     runtime::checkpoint::load::{
         gguf_metadata, gguf_quantization_configs, load_named_array_strict,
@@ -61,10 +65,6 @@ use crate::{
     },
     runtime::checkpoint::quantization::{AffineQuantization, WeightQuantization},
     runtime::execution::inspection::ActivationObserver,
-    utils::{
-        create_causal_mask,
-        rope::{initialize_rope, FloatOrString, RopeVariant},
-    },
 };
 
 #[derive(Debug, Clone, Default)]
@@ -3322,7 +3322,7 @@ pub(crate) fn prepare_gemma4_gguf_checkpoint(
         }
     }
 
-    let eos_token_ids = crate::models::gguf_eos_token_ids(metadata)?;
+    let eos_token_ids = crate::api::gguf_eos_token_ids(metadata)?;
     Ok(PreparedGemma4Gguf {
         args,
         eos_token_ids,
@@ -4833,7 +4833,7 @@ impl CausalLm<Cache> for Model {
 }
 
 /// Gemma 4 token generation iterator.
-pub type Generate<'a, S = crate::sampler::DefaultSampler> =
+pub type Generate<'a, S = crate::runtime::generation::sampler::DefaultSampler> =
     common::generation::Generate<'a, Model, Cache, S>;
 
 #[cfg(test)]
@@ -4850,7 +4850,7 @@ mod tests {
         load_gemma4_model, needs_generated_sliding_mask, partial_rotary_dims, Attention, Cache,
         FloatOrString, LayerType, ModelArgs,
     };
-    use crate::models::{
+    use crate::api::{
         common::generation::CausalLm,
         input::{InputMetadata, InputPart, ModelInput},
     };

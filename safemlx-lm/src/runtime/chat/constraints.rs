@@ -20,11 +20,11 @@ use sha2::{Digest, Sha256};
 use toktrie_hf_tokenizers::ByteTokenizer;
 
 use crate::{
-    chat::{
+    runtime::chat::dialect::{DeclarativeCallId, DialectParameters, FormatDialect},
+    runtime::chat::{
         GenerationConstraint, ParallelToolCallPolicy, ToolChoice, ToolRuntimePlan,
         ToolRuntimePlanParts,
     },
-    format_dialect::{DeclarativeCallId, DialectParameters, FormatDialect},
 };
 
 const MAX_SCHEMA_DEPTH: usize = 64;
@@ -848,7 +848,7 @@ mod tests {
     use serde_json::json;
 
     use super::{ConstraintCompiler, ParallelToolCallPolicy, ToolChoice};
-    use crate::format_dialect::{
+    use crate::runtime::chat::dialect::{
         DeclarativeDialectSpec, DeclarativePayloadShape, DialectParameters, ExactEnvelope,
         GenerationPromptBehavior, JsonFunctionEnvelope, ParallelCallLayout, DECLARATIVE_DIALECT,
     };
@@ -902,7 +902,7 @@ mod tests {
         })
     }
 
-    fn accepts(plan: &crate::chat::ToolRuntimePlan, value: serde_json::Value) -> bool {
+    fn accepts(plan: &crate::runtime::chat::ToolRuntimePlan, value: serde_json::Value) -> bool {
         let bytes = serde_json::to_vec(&value).unwrap();
         let mut state = plan.generation_constraint().grammar_state();
         for byte in bytes {

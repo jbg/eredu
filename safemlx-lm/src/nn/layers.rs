@@ -11,7 +11,10 @@ use safemlx::{
     Array, Dtype, Stream,
 };
 
-use crate::{inspection::ActivationObserver, quantization::WeightQuantization};
+use crate::{
+    runtime::checkpoint::quantization::WeightQuantization,
+    runtime::execution::inspection::ActivationObserver,
+};
 
 use super::linear::unloaded_maybe_quantized_linear;
 

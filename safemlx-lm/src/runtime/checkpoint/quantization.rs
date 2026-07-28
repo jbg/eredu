@@ -20,7 +20,7 @@ use safemlx::{
 use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::{json, Value};
 
-use crate::{error::Error, weights};
+use crate::{error::Error, runtime::checkpoint::load as weights};
 
 /// MLX affine quantization settings stored in `config.json`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

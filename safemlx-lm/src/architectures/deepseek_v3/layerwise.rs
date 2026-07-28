@@ -18,12 +18,13 @@ use safemlx::{
 };
 
 use crate::{
-    error::Error,
-    models::{
+    api::{
         common::{self, generation::CausalLm},
         deepseek_v3::{self as resident, Cache, DecoderLayer, ModelArgs},
         input,
     },
+    error::Error,
+    nn::tensor::create_causal_mask,
     runtime::cache::residency::{
         validate_prompt_cache_model_identity, CacheResidencyPolicy, PagedCacheOptions,
         PromptCacheDescriptor, PromptCacheManifest, PromptCacheModelIdentity,
@@ -44,7 +45,6 @@ use crate::{
         ExpertPass,
     },
     runtime::residency::manager::{OffloadUnit, ResidencyReport, ResidentUnitLease, WeightBinding},
-    utils::create_causal_mask,
 };
 
 const EMBEDDING_UNIT: &str = "deepseek_v3.static.embedding";
@@ -944,7 +944,7 @@ fn deepseek_recipe_binding(
 }
 
 /// DeepSeek token generation using bounded layer execution.
-pub type Generate<'a, S = crate::sampler::DefaultSampler> =
+pub type Generate<'a, S = crate::runtime::generation::sampler::DefaultSampler> =
     common::generation::Generate<'a, DeepSeekV3LayerwiseModel, Cache, S>;
 
 #[cfg(test)]
@@ -959,7 +959,9 @@ mod tests {
 
     use super::{load_deepseek_v3_layerwise_model, load_deepseek_v3_sparse_expert_cache_model};
     use crate::{
-        models::deepseek_v3::{self as resident, FeedForward, Model, ModelArgs, ModelInput},
+        architectures::deepseek_v3::model::{
+            self as resident, FeedForward, Model, ModelArgs, ModelInput,
+        },
         runtime::checkpoint::binding::canonical_checkpoint_name,
         runtime::execution::layerwise::LayerwiseLoadOptions,
         runtime::residency::expert_cache::ExpertCacheLoadOptions,

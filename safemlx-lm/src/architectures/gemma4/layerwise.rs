@@ -14,8 +14,7 @@ use safemlx::{
 };
 
 use crate::{
-    error::Error,
-    models::{
+    api::{
         common::generation::CausalLm,
         gemma4::{
             self as resident, AttentionInput, Cache, Gemma4Embedding, Gemma4TextModel, LayerType,
@@ -31,6 +30,8 @@ use crate::{
         },
         input,
     },
+    error::Error,
+    nn::tensor::create_causal_mask,
     runtime::cache::KeyValueCache,
     runtime::checkpoint::binding::{
         build_module_bindings_with_recipes, canonical_checkpoint_name, populate_module_from_lease,
@@ -43,7 +44,6 @@ use crate::{
         LayerwiseForwardState, StaticUnitBindings, WeightResidency,
     },
     runtime::residency::manager::{ResidencyReport, ResidentUnitLease, WeightBinding},
-    utils::create_causal_mask,
 };
 
 const EMBEDDING_UNIT: &str = "gemma4.static.embedding";
@@ -1345,7 +1345,7 @@ impl GeneralLayerwiseModelAdapter for Gemma4LayerwiseAdapter {
 }
 
 /// Gemma 4 token generation using bounded text-layer execution.
-pub type Generate<'a, S = crate::sampler::DefaultSampler> =
+pub type Generate<'a, S = crate::runtime::generation::sampler::DefaultSampler> =
     crate::nn::generation::Generate<'a, Gemma4LayerwiseModel, Cache, S>;
 
 #[cfg(test)]
@@ -1359,7 +1359,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        models::{
+        api::{
             common::generation::CausalLm,
             gemma4::{self as resident, Model, ModelInput},
             gemma4_audio::Gemma4AudioConfig,

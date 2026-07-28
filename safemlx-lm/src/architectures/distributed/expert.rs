@@ -22,13 +22,14 @@ use safemlx::{
 };
 
 use crate::{
-    error::Error,
-    models::{
+    api::{
         deepseek_v3, gpt_oss, inkling, input as runtime_input, lfm2, nemotron_h, qwen3,
         qwen3_5_moe, qwen3_next, qwen3_vl, ModelKind, ModelLoadOptions,
     },
-    mtp::{MtpCapability, MtpCheckpointKind, MtpConfig, MtpStats},
-    pipeline::{assign_module, assign_module_excluding, load_deepseek_experts, SynchronizedToken},
+    architectures::distributed::pipeline::{
+        assign_module, assign_module_excluding, load_deepseek_experts, SynchronizedToken,
+    },
+    error::Error,
     runtime::cache::residency::{
         open_prompt_cache, validate_prompt_cache_model_identity, CacheRankIdentity,
         CacheResidencyManager, CacheResidencyPolicy, CacheResidencyReport, PagedCacheOptions,
@@ -46,17 +47,18 @@ use crate::{
         TensorPlacement,
     },
     runtime::execution::inspection::ActivationObserver,
+    runtime::generation::sampler::{DefaultSampler, Sampler, SpeculativeSampler},
+    runtime::generation::speculative::{MtpCapability, MtpCheckpointKind, MtpConfig, MtpStats},
     runtime::residency::expert_cache::{
         AcquiredExperts, ExpertCache, ExpertCacheLoadOptions, ExpertCacheReport,
         ExpertCatalogEntry, ExpertPass,
     },
-    sampler::{DefaultSampler, Sampler, SpeculativeSampler},
 };
 
 use crate::runtime::execution::layerwise::WeightResidency;
 
 use crate::{
-    models::deepseek_v3::RoutedExperts,
+    architectures::deepseek_v3::model::RoutedExperts,
     nn::moe::{quantize_expert_bank, PackedSwiGluExperts},
 };
 
@@ -291,7 +293,7 @@ impl std::fmt::Debug for ExpertParallelModel {
     }
 }
 
-impl crate::qwen_mtp::QwenMtpTarget for ExpertParallelQwenMtpTarget<'_> {
+impl crate::architectures::qwen::hybrid::mtp::QwenMtpTarget for ExpertParallelQwenMtpTarget<'_> {
     fn prefill_mtp_target(
         &mut self,
         input: runtime_input::ModelInput<'_>,
@@ -575,7 +577,9 @@ impl ExpertParallelModel {
                 ExpertArchitecture::DeepSeek(model) => (
                     "deepseek_v3".to_string(),
                     model.args.model_type.clone(),
-                    crate::models::deepseek_v3::prompt_cache_architecture_fingerprint(&model.args),
+                    crate::architectures::deepseek_v3::model::prompt_cache_architecture_fingerprint(
+                        &model.args,
+                    ),
                     usize::try_from(model.args.num_hidden_layers)
                         .map_err(|_| Error::Parallel("invalid DeepSeek layer count".into()))?,
                     None,
@@ -583,7 +587,9 @@ impl ExpertParallelModel {
                 ExpertArchitecture::GptOss(model) => (
                     "gpt_oss".to_string(),
                     model.args.model_type.clone(),
-                    crate::models::gpt_oss::prompt_cache_architecture_fingerprint(&model.args),
+                    crate::architectures::gpt_oss::model::prompt_cache_architecture_fingerprint(
+                        &model.args,
+                    ),
                     usize::try_from(model.args.num_hidden_layers)
                         .map_err(|_| Error::Parallel("invalid GPT-OSS layer count".into()))?,
                     Some(model.args.sliding_window),
@@ -1401,7 +1407,7 @@ impl ExpertParallelModel {
         };
         let emit_callbacks = group.rank() == sampling_rank;
         let mut target = ExpertParallelQwenMtpTarget { model: self, group };
-        let result = crate::qwen_mtp::generate_with_callback(
+        let result = crate::architectures::qwen::hybrid::mtp::generate_with_callback(
             &mut target,
             cache,
             input,
@@ -2630,7 +2636,10 @@ fn load_additional_cached_ep(
                 name.contains(".mlp.experts.")
             })?;
             ensure_no_unused_tensors(tensors)?;
-            let entries = crate::gpt_oss::gpt_oss_expert_catalog(&args, store.as_ref())?;
+            let entries = crate::architectures::gpt_oss::layerwise::gpt_oss_expert_catalog(
+                &args,
+                store.as_ref(),
+            )?;
             let (cache, owned) = rank_owned_expert_cache(
                 &store,
                 entries,
@@ -2673,7 +2682,10 @@ fn load_additional_cached_ep(
                 name.contains(".moe.experts.")
             })?;
             ensure_no_unused_tensors(tensors)?;
-            let entries = crate::inkling::inkling_expert_catalog(&args, store.as_ref())?;
+            let entries = crate::architectures::inkling::layerwise::inkling_expert_catalog(
+                &args,
+                store.as_ref(),
+            )?;
             let (cache, owned) = rank_owned_expert_cache(
                 &store,
                 entries,
@@ -2709,7 +2721,8 @@ fn load_additional_cached_ep(
                 name.contains(".feed_forward.experts.")
             })?;
             ensure_no_unused_tensors(tensors)?;
-            let entries = crate::lfm2::lfm2_expert_catalog(&args, store.as_ref())?;
+            let entries =
+                crate::architectures::lfm2::layerwise::lfm2_expert_catalog(&args, store.as_ref())?;
             let (cache, owned) = rank_owned_expert_cache(
                 &store,
                 entries,
@@ -2754,7 +2767,10 @@ fn load_additional_cached_ep(
                 name.contains(".moe.experts.")
             })?;
             ensure_no_unused_tensors(tensors)?;
-            let entries = crate::nemotron_h::nemotron_h_expert_catalog(&args, store.as_ref())?;
+            let entries = crate::architectures::nemotron_h::layerwise::nemotron_h_expert_catalog(
+                &args,
+                store.as_ref(),
+            )?;
             let (cache, owned) = rank_owned_expert_cache(
                 &store,
                 entries,
@@ -2825,7 +2841,11 @@ fn load_additional_cached_ep(
                 is_qwen_hybrid_decoder_expert_key(name)
             })?;
             ensure_no_unused_tensors(tensors)?;
-            let entries = crate::qwen_hybrid::qwen_hybrid_expert_catalog(&args, store.as_ref())?;
+            let entries =
+                crate::architectures::qwen::hybrid::layerwise::qwen_hybrid_expert_catalog(
+                    &args,
+                    store.as_ref(),
+                )?;
             let (cache, owned) = rank_owned_expert_cache(
                 &store,
                 entries,
@@ -2864,7 +2884,7 @@ fn load_additional_cached_ep(
                 name.contains(".mlp.experts.")
             })?;
             ensure_no_unused_tensors(tensors)?;
-            let entries = crate::qwen3::qwen3_expert_catalog_at(
+            let entries = crate::architectures::qwen::qwen3::layerwise::qwen3_expert_catalog_at(
                 &args.text_config,
                 store.as_ref(),
                 "model.language_model.layers",
@@ -2996,10 +3016,13 @@ fn load_deepseek_cached_ep(
             unused,
         });
     }
-    let entries = crate::deepseek_v3::deepseek_expert_catalog(&args, store.as_ref())?
-        .into_iter()
-        .filter(|entry| assignment.owner(entry.identity().global_expert) == Some(assignment.rank()))
-        .collect::<Vec<_>>();
+    let entries = crate::architectures::deepseek_v3::layerwise::deepseek_expert_catalog(
+        &args,
+        store.as_ref(),
+    )?
+    .into_iter()
+    .filter(|entry| assignment.owner(entry.identity().global_expert) == Some(assignment.rank()))
+    .collect::<Vec<_>>();
     let owned_expert_bytes_u64 = entries.iter().map(ExpertCatalogEntry::bytes).sum::<u64>();
     let owned_expert_bytes = usize::try_from(owned_expert_bytes_u64)
         .map_err(|_| Error::Parallel("owned expert bytes exceed usize".into()))?;
@@ -3082,10 +3105,13 @@ fn load_qwen3_cached_ep(
             unused,
         });
     }
-    let entries = crate::qwen3::qwen3_expert_catalog(&args, store.as_ref())?
-        .into_iter()
-        .filter(|entry| assignment.owner(entry.identity().global_expert) == Some(assignment.rank()))
-        .collect::<Vec<_>>();
+    let entries =
+        crate::architectures::qwen::qwen3::layerwise::qwen3_expert_catalog(&args, store.as_ref())?
+            .into_iter()
+            .filter(|entry| {
+                assignment.owner(entry.identity().global_expert) == Some(assignment.rank())
+            })
+            .collect::<Vec<_>>();
     let owned_expert_bytes_u64 = entries.iter().map(ExpertCatalogEntry::bytes).sum::<u64>();
     let owned_expert_bytes = usize::try_from(owned_expert_bytes_u64)
         .map_err(|_| Error::Parallel("owned expert bytes exceed usize".into()))?;

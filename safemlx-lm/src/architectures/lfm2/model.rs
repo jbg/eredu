@@ -19,8 +19,7 @@ use serde_json::Value;
 use tokenizers::Tokenizer;
 
 use crate::{
-    error::Error,
-    models::{
+    api::{
         common::{
             self,
             attention::{
@@ -35,6 +34,12 @@ use crate::{
         input,
         qwen3::{gguf_i32, gguf_string},
     },
+    error::Error,
+    nn::tensor::{
+        create_attention_mask,
+        rope::{initialize_rope, FloatOrString, RopeVariant},
+        AttentionMask,
+    },
     runtime::cache::{ConcatKeyValueCache, KeyValueCache},
     runtime::checkpoint::load::{
         gguf_metadata, gguf_quantization_configs, load_named_array_strict,
@@ -43,11 +48,6 @@ use crate::{
         StrictLoadReport,
     },
     runtime::checkpoint::quantization::WeightQuantization,
-    utils::{
-        create_attention_mask,
-        rope::{initialize_rope, FloatOrString, RopeVariant},
-        AttentionMask,
-    },
 };
 
 fn default_true() -> bool {
@@ -1179,7 +1179,7 @@ impl CausalLm<Cache> for Model {
 }
 
 /// LFM2 token generation iterator.
-pub type Generate<'a, S = crate::sampler::DefaultSampler> =
+pub type Generate<'a, S = crate::runtime::generation::sampler::DefaultSampler> =
     common::generation::Generate<'a, Model, Cache, S>;
 
 /// Reads and validates LFM2 model arguments.
@@ -1406,7 +1406,7 @@ pub(crate) fn load_gguf_checkpoint(
     }
     report.finish(&model, &config)?;
     model.copy_to_stream(stream)?;
-    let eos_token_ids = crate::models::gguf_eos_token_ids(&metadata)?;
+    let eos_token_ids = crate::api::gguf_eos_token_ids(&metadata)?;
     Ok(LoadedLfm2Gguf {
         model,
         eos_token_ids,
@@ -1444,7 +1444,7 @@ pub(crate) fn prepare_gguf_checkpoint(
     args.quantized_weights = Some(configs.keys().cloned().collect());
     args.quantized_weight_configs = Some(configs);
     validate_args(&args)?;
-    let eos_token_ids = crate::models::gguf_eos_token_ids(metadata)?;
+    let eos_token_ids = crate::api::gguf_eos_token_ids(metadata)?;
     Ok(PreparedLfm2Gguf {
         args,
         eos_token_ids,
@@ -1908,10 +1908,12 @@ mod tests {
             }
             let mut cache = model.new_cache();
             let prompt = safemlx::Array::from_slice(&[1_u32, 2, 3], &[1, 3]);
-            let parts = [crate::models::input::InputPart::text_token_ids(&prompt)];
+            let parts = [crate::runtime::media::input::InputPart::text_token_ids(
+                &prompt,
+            )];
             let logits = crate::nn::generation::CausalLm::prefill_input_logits(
                 &mut model,
-                crate::models::input::ModelInput::new(&parts),
+                crate::runtime::media::input::ModelInput::new(&parts),
                 &mut cache,
                 stream,
             )

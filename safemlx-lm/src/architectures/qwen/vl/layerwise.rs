@@ -22,8 +22,7 @@ use safemlx::{
 };
 
 use crate::{
-    error::Error,
-    models::{
+    api::{
         common::{self, attention::AttentionInput, generation::CausalLm},
         input,
         qwen3::{Experts as QwenExperts, Qwen3Model, TransformerBlock},
@@ -33,6 +32,8 @@ use crate::{
             QwenVisionLayerwiseStatic, QwenVisionTransformer,
         },
     },
+    error::Error,
+    nn::tensor::{create_attention_mask, AttentionMask},
     runtime::cache::KeyValueCache,
     runtime::checkpoint::binding::{
         build_module_bindings, build_module_bindings_with_recipes, populate_module_from_lease,
@@ -49,7 +50,6 @@ use crate::{
         ExpertCache, ExpertCacheLoadOptions, ExpertCacheReport, ExpertPass,
     },
     runtime::residency::manager::{ResidencyReport, ResidentUnitLease, WeightBinding},
-    utils::{create_attention_mask, AttentionMask},
 };
 
 const VISION_STATIC_UNIT: &str = "qwen3_vl.static.vision";
@@ -208,7 +208,8 @@ pub(crate) fn load_qwen3_vl_gguf_layerwise_model(
         GgufWeightStore::builder()
             .max_cached_readers(residency.max_mapped_shards())?
             .add_checkpoint(checkpoint.clone(), |name| {
-                let name = crate::models::qwen3::translate_gguf_weight_name(name);
+                let name =
+                    crate::architectures::qwen::qwen3::model::translate_gguf_weight_name(name);
                 name.strip_prefix("model.")
                     .map(|name| format!("model.language_model.{name}"))
                     .unwrap_or(name)
@@ -301,7 +302,7 @@ fn load_qwen3_vl_sparse_expert_cache_model_with_non_expert(
     let mut execution =
         load_general_layerwise_model(model_dir, adapter, non_expert, stream, weights_stream)?;
     let store = execution.weight_store_arc();
-    let entries = crate::qwen3::qwen3_expert_catalog_at(
+    let entries = crate::architectures::qwen::qwen3::layerwise::qwen3_expert_catalog_at(
         &args.text_config,
         store.as_ref(),
         "model.language_model.layers",
@@ -1038,7 +1039,7 @@ impl GeneralLayerwiseModelAdapter for Qwen3VlLayerwiseAdapter {
 }
 
 /// Qwen3-VL generation using shared vision/text bounded layer execution.
-pub type Generate<'a, S = crate::sampler::DefaultSampler> =
+pub type Generate<'a, S = crate::runtime::generation::sampler::DefaultSampler> =
     common::generation::Generate<'a, Qwen3VlLayerwiseModel, Cache, S>;
 
 #[cfg(test)]
@@ -1053,7 +1054,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        models::qwen3_vl as eager,
+        api::qwen3_vl as eager,
         runtime::execution::layerwise::{LayerExecutionLoadOptions, LayerwiseLoadOptions},
         runtime::residency::dense_stream::DenseDiskStreamLoadOptions,
         runtime::residency::expert_cache::ExpertCacheLoadOptions,
@@ -1354,10 +1355,10 @@ mod tests {
         assert_eq!(report.owned_experts, 8);
         assert!(report.prefill.requested_routes > 0);
         assert!(report.decode.requested_routes > 0);
-        crate::expert_parallel::assert_rank_owned_sparse_ep_load(
+        crate::architectures::distributed::expert::assert_rank_owned_sparse_ep_load(
             dir.path(),
             options,
-            crate::models::ModelKind::Qwen3VlMoe,
+            crate::api::ModelKind::Qwen3VlMoe,
             report.owned_experts / 2,
             gpu.stream(),
             cpu.stream(),

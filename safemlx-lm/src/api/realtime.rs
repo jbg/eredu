@@ -15,11 +15,11 @@ use serde::Deserialize;
 use std::path::Path;
 
 use crate::{
+    api::{ensure_executable_load_options, moshi, personaplex, ModelLoadOptions},
+    architectures::moshi::layerwise::MoshiLayerwiseModel,
     error::Error,
-    models::{ensure_executable_load_options, moshi, personaplex, ModelLoadOptions},
-    moshi::MoshiLayerwiseModel,
     runtime::execution::layerwise::{LayerExecutionLoadOptions, WeightResidency},
-    sampler::{DefaultSampler, Sampler},
+    runtime::generation::sampler::{DefaultSampler, Sampler},
 };
 
 /// Static token-stream metadata needed to pair a realtime model with a codec.
@@ -186,7 +186,7 @@ fn realtime_model_kind(model_dir: impl AsRef<Path>) -> Result<RealtimeModelKind,
 
 /// Loads a supported realtime speech-to-speech token model from a model directory.
 ///
-/// This is the high-level realtime counterpart to [`crate::models::LoadedModel`].
+/// This is the high-level realtime counterpart to [`crate::api::LoadedModel`].
 /// It does not load a text tokenizer or audio codec: callers bring tokenization,
 /// codec encode/decode, transport, and device I/O.
 pub fn load_model(
@@ -225,7 +225,7 @@ pub fn load_model_with_options(
         }
         return match kind {
             RealtimeModelKind::Moshi => Ok(LoadedRealtimeModel::MoshiLayerwise(
-                crate::moshi::load_moshi_layerwise_model(
+                crate::architectures::moshi::layerwise::load_moshi_layerwise_model(
                     model_dir,
                     layerwise,
                     stream,
@@ -233,7 +233,7 @@ pub fn load_model_with_options(
                 )?,
             )),
             RealtimeModelKind::PersonaPlex => Ok(LoadedRealtimeModel::PersonaPlexLayerwise(
-                crate::moshi::load_personaplex_layerwise_model(
+                crate::architectures::moshi::layerwise::load_personaplex_layerwise_model(
                     model_dir,
                     layerwise,
                     stream,

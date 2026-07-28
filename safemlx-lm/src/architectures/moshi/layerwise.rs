@@ -11,15 +11,15 @@ use safemlx::{
 };
 
 use crate::{
-    error::Error,
-    models::moshi::{
-        self as resident, DepFormerSlice, ModelArgs, MoshiCache, MoshiLayerwiseStatic,
-        MoshiTransformerLayer, SampleStepOutput, TokenStepOutput,
-    },
-    realtime::{
+    api::realtime::{
         RealtimeSampling, RealtimeSpeechConfig, RealtimeSpeechModel, RealtimeStepInput,
         RealtimeStepOutput,
     },
+    architectures::moshi::model::{
+        self as resident, DepFormerSlice, ModelArgs, MoshiCache, MoshiLayerwiseStatic,
+        MoshiTransformerLayer, SampleStepOutput, TokenStepOutput,
+    },
+    error::Error,
     runtime::cache::KeyValueCache,
     runtime::checkpoint::binding::{
         build_module_bindings, build_module_bindings_with_recipes, populate_module_from_lease,
@@ -30,10 +30,10 @@ use crate::{
         load_general_layerwise_model, GeneralLayerwiseModel, GeneralLayerwiseModelAdapter,
         LayerwiseForwardState, StaticUnitBindings,
     },
+    runtime::generation::sampler::Sampler,
     runtime::residency::manager::{
         ResidencyReport, ResidentLayerGroupReport, ResidentUnitLease, WeightBinding,
     },
-    sampler::Sampler,
 };
 
 const STATIC_UNIT: &str = "moshi.static";
@@ -272,9 +272,9 @@ impl MoshiLayerwiseModel {
         cache: &mut MoshiCache,
         stream: &Stream,
     ) -> Result<resident::GreedyStepOutput, Exception> {
-        let mut text_sampler = crate::sampler::DefaultSampler;
+        let mut text_sampler = crate::runtime::generation::sampler::DefaultSampler;
         let mut audio_samplers = (0..self.args().dep_q)
-            .map(|_| crate::sampler::DefaultSampler)
+            .map(|_| crate::runtime::generation::sampler::DefaultSampler)
             .collect::<Vec<_>>();
         self.sample_step(
             text_token,
@@ -815,8 +815,8 @@ pub fn load_personaplex_layerwise_model(
     weights_stream: &Stream,
 ) -> Result<MoshiLayerwiseModel, Error> {
     let model_dir = model_dir.as_ref();
-    let metadata = crate::models::personaplex::get_model_metadata(model_dir)?;
-    let mut args = crate::models::personaplex::model_args_7b_v1();
+    let metadata = crate::architectures::moshi::personaplex::get_model_metadata(model_dir)?;
+    let mut args = crate::architectures::moshi::personaplex::model_args_7b_v1();
     args.quantization = metadata.quantization;
     load_with_layout(
         model_dir,
@@ -1474,8 +1474,8 @@ mod tests {
 
     use super::*;
     use crate::{
-        models::moshi as eager,
-        realtime::{generate_encoded_greedy, RealtimeSpeechModel},
+        api::moshi as eager,
+        api::realtime::{generate_encoded_greedy, RealtimeSpeechModel},
         runtime::execution::layerwise::{LayerExecutionLoadOptions, LayerwiseLoadOptions},
         runtime::residency::dense_stream::DenseDiskStreamLoadOptions,
         runtime::residency::policy::{MemoryTier, OffloadConfig},
@@ -1708,13 +1708,13 @@ mod tests {
         let mut resident_state = resident.new_realtime_state();
         let mut layerwise_state = layerwise.new_realtime_state();
         let input = Array::from_slice(&[4i32, 5], &[1, 2]);
-        let mut resident_text = crate::sampler::DefaultSampler;
-        let mut layerwise_text = crate::sampler::DefaultSampler;
+        let mut resident_text = crate::runtime::generation::sampler::DefaultSampler;
+        let mut layerwise_text = crate::runtime::generation::sampler::DefaultSampler;
         let mut resident_audio = (0..2)
-            .map(|_| crate::sampler::DefaultSampler)
+            .map(|_| crate::runtime::generation::sampler::DefaultSampler)
             .collect::<Vec<_>>();
         let mut layerwise_audio = (0..2)
-            .map(|_| crate::sampler::DefaultSampler)
+            .map(|_| crate::runtime::generation::sampler::DefaultSampler)
             .collect::<Vec<_>>();
         for _ in 0..3 {
             let expected = resident
@@ -1772,9 +1772,9 @@ mod tests {
             "depth_codebook_slices"
         );
 
-        let loaded = crate::realtime::load_model_with_options(
+        let loaded = crate::api::realtime::load_model_with_options(
             dir.path(),
-            crate::models::ModelLoadOptions::default().with_weight_residency(
+            crate::api::ModelLoadOptions::default().with_weight_residency(
                 crate::runtime::execution::layerwise::WeightResidency::LayerwiseHost(
                     LayerwiseLoadOptions::new(OffloadConfig::new(None, None, 1).unwrap()),
                 ),
@@ -1785,7 +1785,7 @@ mod tests {
         .unwrap();
         assert!(matches!(
             &loaded,
-            crate::realtime::LoadedRealtimeModel::MoshiLayerwise(_)
+            crate::api::realtime::LoadedRealtimeModel::MoshiLayerwise(_)
         ));
         assert_eq!(loaded.execution_group_reports().unwrap().unwrap().len(), 2);
     }
@@ -1841,13 +1841,13 @@ mod tests {
         let mut resident_state = resident.new_realtime_state();
         let mut streamed_state = streamed.new_realtime_state();
         let input = Array::from_slice(&[4i32, 5], &[1, 2]);
-        let mut resident_text = crate::sampler::DefaultSampler;
-        let mut streamed_text = crate::sampler::DefaultSampler;
+        let mut resident_text = crate::runtime::generation::sampler::DefaultSampler;
+        let mut streamed_text = crate::runtime::generation::sampler::DefaultSampler;
         let mut resident_audio = (0..2)
-            .map(|_| crate::sampler::DefaultSampler)
+            .map(|_| crate::runtime::generation::sampler::DefaultSampler)
             .collect::<Vec<_>>();
         let mut streamed_audio = (0..2)
-            .map(|_| crate::sampler::DefaultSampler)
+            .map(|_| crate::runtime::generation::sampler::DefaultSampler)
             .collect::<Vec<_>>();
         for _ in 0..2 {
             let expected = resident
@@ -1885,9 +1885,9 @@ mod tests {
         let report = streamed.dense_stream_report().unwrap().unwrap();
         assert!(report.decode_forwards() >= 3);
 
-        let loaded = crate::realtime::load_model_with_options(
+        let loaded = crate::api::realtime::load_model_with_options(
             dir.path(),
-            crate::models::ModelLoadOptions::default().with_weight_residency(
+            crate::api::ModelLoadOptions::default().with_weight_residency(
                 crate::runtime::execution::layerwise::WeightResidency::DenseDiskStream(dense),
             ),
             gpu.stream(),
@@ -1896,7 +1896,7 @@ mod tests {
         .unwrap();
         assert!(matches!(
             &loaded,
-            crate::realtime::LoadedRealtimeModel::MoshiLayerwise(_)
+            crate::api::realtime::LoadedRealtimeModel::MoshiLayerwise(_)
         ));
         assert!(loaded.dense_stream_report().unwrap().is_some());
     }
@@ -1957,21 +1957,21 @@ mod tests {
         let user = Array::from_slice(&[3i32, 4], &[1, 2]);
         let agent = Array::from_slice(&[1i32, 2], &[1, 2]);
         let forced_text = Array::from_slice(&[5i32], &[1, 1]);
-        let mut resident_text = crate::sampler::DefaultSampler;
-        let mut layerwise_text = crate::sampler::DefaultSampler;
+        let mut resident_text = crate::runtime::generation::sampler::DefaultSampler;
+        let mut layerwise_text = crate::runtime::generation::sampler::DefaultSampler;
         let mut resident_audio = (0..4)
-            .map(|_| crate::sampler::DefaultSampler)
+            .map(|_| crate::runtime::generation::sampler::DefaultSampler)
             .collect::<Vec<_>>();
         let mut layerwise_audio = (0..4)
-            .map(|_| crate::sampler::DefaultSampler)
+            .map(|_| crate::runtime::generation::sampler::DefaultSampler)
             .collect::<Vec<_>>();
 
         for forced in [true, true, false] {
             let expected = if forced {
-                crate::models::personaplex::step_prompt_frame_greedy(
+                crate::architectures::moshi::personaplex::step_prompt_frame_greedy(
                     &mut resident,
                     &mut resident_state,
-                    crate::models::personaplex::PromptFrame {
+                    crate::architectures::moshi::personaplex::PromptFrame {
                         agent_audio_tokens: &agent,
                         user_audio_tokens: &user,
                         text_token: &forced_text,
@@ -1994,10 +1994,10 @@ mod tests {
                     .unwrap()
             };
             let actual = if forced {
-                crate::models::personaplex::step_prompt_frame_greedy(
+                crate::architectures::moshi::personaplex::step_prompt_frame_greedy(
                     &mut layerwise,
                     &mut layerwise_state,
-                    crate::models::personaplex::PromptFrame {
+                    crate::architectures::moshi::personaplex::PromptFrame {
                         agent_audio_tokens: &agent,
                         user_audio_tokens: &user,
                         text_token: &forced_text,

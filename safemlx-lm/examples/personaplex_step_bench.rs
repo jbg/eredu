@@ -2,11 +2,12 @@ use std::{path::PathBuf, time::Instant};
 
 use safemlx::{transforms::eval, Array, Device, DeviceType, Dtype, ExecutionContext, Stream};
 use safemlx_lm::{
+    api::realtime::{RealtimeSampling, RealtimeSpeechModel, RealtimeStepInput},
+    api::ModelLoadOptions,
+    architectures::moshi::personaplex,
     load_realtime_model, load_realtime_model_with_options,
-    models::{personaplex, ModelLoadOptions},
-    quantization::AffineQuantization,
-    realtime::{RealtimeSampling, RealtimeSpeechModel, RealtimeStepInput},
-    sampler::DefaultSampler,
+    runtime::checkpoint::quantization::AffineQuantization,
+    runtime::generation::sampler::DefaultSampler,
 };
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {

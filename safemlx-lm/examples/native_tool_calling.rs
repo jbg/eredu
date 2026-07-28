@@ -7,17 +7,17 @@ use std::{env, num::NonZeroUsize};
 
 use safemlx::{Device, DeviceType, ExecutionContext};
 use safemlx_lm::{
-    chat::{ChatTemplateRequest, NativeToolSupport, ParallelToolCallPolicy, ToolChoice},
-    models::{
+    api::{
         LoadedModel, PreparedChatEmbeddedMtpGenerationRequest, PreparedChatGenerationRequest,
         PreparedChatGenerationSettings, PreparedChatMtpGenerationOptions,
         PreparedChatMtpGenerationRequest,
     },
-    mtp::{
+    runtime::chat::{ChatTemplateRequest, NativeToolSupport, ParallelToolCallPolicy, ToolChoice},
+    runtime::generation::sampler::DefaultSampler,
+    runtime::generation::speculative::{
         LoadedDrafter, MtpCapability, MtpCheckpointKind, MtpExecutionStreams, MtpSchedulerOptions,
     },
-    sampler::DefaultSampler,
-    streaming::SemanticEvent,
+    runtime::generation::streaming::SemanticEvent,
 };
 use serde_json::json;
 

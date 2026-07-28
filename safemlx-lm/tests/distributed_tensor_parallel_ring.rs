@@ -14,8 +14,10 @@ use safemlx::{
     Array, Device, DeviceType, ExecutionContext, Stream,
 };
 use safemlx_lm::{
-    models::deepseek_v3, module_binding::canonical_checkpoint_name, sampler::DefaultSampler,
-    tensor_parallel::load_tensor_parallel_model, CacheResidencyPolicy, DeviceAssignment,
+    architectures::deepseek_v3::model as deepseek_v3,
+    architectures::distributed::tensor::load_tensor_parallel_model,
+    runtime::checkpoint::binding::canonical_checkpoint_name,
+    runtime::generation::sampler::DefaultSampler, CacheResidencyPolicy, DeviceAssignment,
     PagedCacheOptions, ParallelTopology, PromptCacheDescriptor, PromptCacheOptions,
     PromptCacheTopology,
 };

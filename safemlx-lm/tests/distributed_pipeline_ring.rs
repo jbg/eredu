@@ -14,10 +14,12 @@ use safemlx::{
     Array, Device, DeviceType, Dtype as MlxDtype, ExecutionContext, Stream,
 };
 use safemlx_lm::{
-    models::deepseek_v3,
-    module_binding::canonical_checkpoint_name,
-    pipeline::{load_pipeline_model, load_pipeline_model_with_options, PipelineStep},
-    sampler::DefaultSampler,
+    architectures::deepseek_v3::model as deepseek_v3,
+    architectures::distributed::pipeline::{
+        load_pipeline_model, load_pipeline_model_with_options, PipelineStep,
+    },
+    runtime::checkpoint::binding::canonical_checkpoint_name,
+    runtime::generation::sampler::DefaultSampler,
     CacheResidencyPolicy, DenseDiskStreamLoadOptions, DeviceAssignment, ModelLoadOptions,
     PagedCacheOptions, ParallelTopology, PromptCacheDescriptor, PromptCacheOptions,
     PromptCacheTopology, WeightResidency,

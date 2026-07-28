@@ -1,10 +1,8 @@
 use std::path::PathBuf;
 
 use safemlx::{Device, DeviceType, ExecutionContext};
-use safemlx_lm::models::{
-    input::{InputPart, ModelInput},
-    LoadedModel,
-};
+use safemlx_lm::api::LoadedModel;
+use safemlx_lm::runtime::media::input::{InputPart, ModelInput};
 
 fn main() -> anyhow::Result<()> {
     let args = std::env::args().skip(1).collect::<Vec<_>>();

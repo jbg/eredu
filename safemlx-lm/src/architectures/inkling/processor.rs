@@ -2,15 +2,20 @@
 
 use std::path::Path;
 
+#[cfg(any(feature = "image-processing", feature = "audio-processing"))]
 use safemlx::Array;
 use serde::Deserialize;
 
-use crate::{error::Error, models::input::Modality};
+use crate::error::Error;
+#[cfg(any(feature = "image-processing", feature = "audio-processing"))]
+use crate::runtime::media::input::Modality;
 
-use crate::processor::{
-    prepared_model_input, push_text_token_ids, MediaInput, MediaPayload, OwnedInputMetadata,
-    PreparedInputPart, PreparedModelInput, ProcessorInput,
+use crate::runtime::media::{
+    prepared_model_input, push_text_token_ids, MediaInput, PreparedInputPart, PreparedModelInput,
+    ProcessorInput,
 };
+#[cfg(any(feature = "image-processing", feature = "audio-processing"))]
+use crate::runtime::media::{MediaPayload, OwnedInputMetadata};
 
 #[derive(Debug, Clone)]
 pub(crate) struct InklingProcessor {
@@ -96,20 +101,20 @@ impl InklingProcessor {
 
     fn push_media(
         &self,
-        parts: &mut Vec<PreparedInputPart>,
+        _parts: &mut Vec<PreparedInputPart>,
         media: MediaInput<'_>,
     ) -> Result<(), Error> {
         match (media.modality, media.payload) {
             #[cfg(feature = "image-processing")]
             (Modality::Image, MediaPayload::Rgb8(image)) => {
-                push_text_token_ids(parts, &[self.image_bos_token_id]);
-                parts.push(process_image(image)?);
+                push_text_token_ids(_parts, &[self.image_bos_token_id]);
+                _parts.push(process_image(image)?);
                 Ok(())
             }
             #[cfg(feature = "audio-processing")]
             (Modality::Audio, MediaPayload::AudioF32(waveform)) => {
-                push_text_token_ids(parts, &[self.audio_bos_token_id]);
-                parts.push(self.process_audio(waveform)?);
+                push_text_token_ids(_parts, &[self.audio_bos_token_id]);
+                _parts.push(self.process_audio(waveform)?);
                 Ok(())
             }
             _ => Err(Error::Processor(format!(
@@ -122,7 +127,7 @@ impl InklingProcessor {
     #[cfg(feature = "audio-processing")]
     fn process_audio(
         &self,
-        waveform: crate::processor::audio::AudioWaveform<'_>,
+        waveform: crate::runtime::media::audio::AudioWaveform<'_>,
     ) -> Result<PreparedInputPart, Error> {
         let features = inkling_log_mel(waveform)?;
         let span = (self.dmel_max - self.dmel_min) as f64;
@@ -186,7 +191,7 @@ fn default_dmel_max() -> f32 {
 
 #[cfg(feature = "image-processing")]
 fn process_image(
-    image: crate::processor::image::RgbImageView<'_>,
+    image: crate::runtime::media::image::RgbImageView<'_>,
 ) -> Result<PreparedInputPart, Error> {
     const PATCH: usize = 40;
     const MEAN: [f32; 3] = [0.481_454_66, 0.457_827_5, 0.408_210_73];
@@ -235,7 +240,7 @@ fn image_patch_grid(height: usize, width: usize) -> (usize, usize) {
 
 #[cfg(feature = "audio-processing")]
 fn inkling_log_mel(
-    waveform: crate::processor::audio::AudioWaveform<'_>,
+    waveform: crate::runtime::media::audio::AudioWaveform<'_>,
 ) -> Result<Vec<f32>, Error> {
     use rustfft::{num_complex::Complex32, FftPlanner};
 
@@ -325,7 +330,7 @@ mod tests {
     #[test]
     fn dmel_frontend_uses_fifty_millisecond_frames() {
         let samples = vec![0.0f32; 801];
-        let waveform = crate::processor::AudioWaveform::new(&samples, 16_000).unwrap();
+        let waveform = crate::runtime::media::AudioWaveform::new(&samples, 16_000).unwrap();
         let features = super::inkling_log_mel(waveform).unwrap();
         assert_eq!(features.len(), 2 * 80);
         assert!(features.iter().all(|value| (*value + 10.0).abs() < 1e-6));

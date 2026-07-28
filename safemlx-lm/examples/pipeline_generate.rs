@@ -5,8 +5,8 @@ use safemlx::{
     DeviceType, Stream,
 };
 use safemlx_lm::{
-    pipeline::{load_pipeline_model, PipelineStep},
-    sampler::DefaultSampler,
+    architectures::distributed::pipeline::{load_pipeline_model, PipelineStep},
+    runtime::generation::sampler::DefaultSampler,
     DeviceAssignment, ParallelTopology,
 };
 

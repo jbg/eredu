@@ -20,18 +20,18 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use crate::{
-    error::Error,
-    models::{
+    api::{
         common,
         gemma4::{self, Gemma4Embedding, LayerType, ModelArgs, TransformerBlock},
         ModelLoadOptions,
     },
+    error::Error,
+    nn::tensor::rope::FloatOrString,
     runtime::checkpoint::load::{
         gguf_affine_configs, gguf_metadata, load_gguf_strict, load_safetensors_quantized_strict,
         load_safetensors_strict, GgufTensorNames, StrictLoadConfig, StrictLoadReport,
     },
     runtime::checkpoint::quantization::WeightQuantization,
-    utils::rope::FloatOrString,
 };
 
 #[derive(Debug, Clone, Deserialize)]
@@ -375,7 +375,7 @@ impl Gemma4AssistantDraftModel {
             let mut kv_map = HashMap::new();
             kv_map.insert(layer.layer_type, kv);
             h = layer.forward(
-                crate::models::gemma4::AttentionInput {
+                crate::architectures::gemma4::model::AttentionInput {
                     x: &h,
                     mask: mask.as_ref(),
                     cache: None::<&mut crate::runtime::cache::ConcatKeyValueCache>,
@@ -592,7 +592,7 @@ pub(crate) fn load_gemma4_assistant_gguf_with_options(
             serde_json::from_reader(std::fs::File::open(&config_file)?)?
         }
     };
-    crate::models::validate_gguf_quantization_source(&checkpoint, &metadata, options.quantization)?;
+    crate::api::validate_gguf_quantization_source(&checkpoint, &metadata, options.quantization)?;
     let packed = gguf_affine_configs(&checkpoint, translate_gguf_weight_name)?;
     if let Some(first) = packed.values().next().copied() {
         if packed.values().any(|config| *config != first) {
@@ -879,7 +879,7 @@ fn translate_gguf_weight_name(name: &str) -> String {
         }
     }
 
-    let target = crate::models::gemma4::translate_gguf_weight_name(name);
+    let target = crate::architectures::gemma4::model::translate_gguf_weight_name(name);
     target
         .strip_prefix("model.language_model.")
         .map_or(target.clone(), |parameter| format!("model.{parameter}"))
@@ -901,7 +901,7 @@ mod tests {
     };
 
     use crate::{
-        models::ModelLoadOptions,
+        api::ModelLoadOptions,
         runtime::checkpoint::quantization::{AffineQuantization, WeightQuantization},
     };
 

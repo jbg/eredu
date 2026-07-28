@@ -5,10 +5,8 @@ use std::path::PathBuf;
 use clap::Parser;
 use safemlx::{Array, Device, DeviceType, ExecutionContext};
 use safemlx_lm::{
-    models::{
-        input::{InputPart, ModelInput},
-        LoadedModel, ModelCache,
-    },
+    api::{LoadedModel, ModelCache},
+    runtime::media::input::{InputPart, ModelInput},
     CacheResidencyPolicy, PagedCacheOptions, PromptCacheDescriptor, PromptCacheOptions,
     PromptCacheTopology,
 };
