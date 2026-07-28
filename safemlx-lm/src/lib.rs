@@ -71,8 +71,10 @@ pub use runtime::execution::layerwise;
 /// Compatibility path for weight-residency policy and telemetry.
 pub use runtime::residency::policy as offload;
 // pub mod generate;
-/// Supported model implementations and model-directory loading helpers.
-pub mod models;
+/// High-level model loading, dispatch, and request APIs.
+pub mod api;
+/// Compatibility path for the former model facade.
+pub use api as models;
 /// Architecture-independent multi-token prediction and speculative decoding.
 pub mod mtp;
 /// Compatibility path for executable pipeline-parallel model adapters.
