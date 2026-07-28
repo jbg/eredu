@@ -2863,7 +2863,7 @@ where
         hash_fingerprint_component(&mut hasher, key.as_bytes());
         hash_fingerprint_component(&mut hasher, value.as_bytes());
     }
-    format!("sha256:{:x}", hasher.finalize())
+    format!("sha256:{}", sha256_hex(hasher.finalize()))
 }
 
 fn hash_fingerprint_component(hasher: &mut Sha256, value: &[u8]) {
@@ -3865,7 +3865,7 @@ fn hash_shard_payload(path: &Path) -> Result<String, CacheResidencyError> {
         }
         hasher.update(&buffer[..read]);
     }
-    Ok(format!("{:x}", hasher.finalize()))
+    Ok(sha256_hex(hasher.finalize()))
 }
 
 fn verify_disk_payload(location: &DiskLocation) -> Result<(), CacheResidencyError> {
@@ -3885,7 +3885,7 @@ fn verify_disk_payload(location: &DiskLocation) -> Result<(), CacheResidencyErro
                 .checked_add(header_len)
                 .filter(|start| *start <= mapped.len())
                 .ok_or_else(|| "safetensors header extends beyond the mapped shard".to_string())?;
-            format!("{:x}", Sha256::digest(&mapped[data_start..]))
+            sha256_hex(Sha256::digest(&mapped[data_start..]))
         } else {
             hash_shard_payload(&location.path).map_err(|error| error.to_string())?
         };
@@ -4013,7 +4013,19 @@ fn hash_token_ids(tokens: &[u32]) -> String {
     for token in tokens {
         hasher.update(token.to_le_bytes());
     }
-    format!("{:x}", hasher.finalize())
+    sha256_hex(hasher.finalize())
+}
+
+fn sha256_hex(digest: impl AsRef<[u8]>) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+
+    let digest = digest.as_ref();
+    let mut encoded = String::with_capacity(digest.len() * 2);
+    for &byte in digest {
+        encoded.push(HEX[usize::from(byte >> 4)] as char);
+        encoded.push(HEX[usize::from(byte & 0x0f)] as char);
+    }
+    encoded
 }
 
 fn is_sha256_hex(value: &str) -> bool {

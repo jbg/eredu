@@ -1,4 +1,3 @@
-use darling::FromMeta;
 use itertools::Itertools;
 use proc_macro::TokenStream;
 use quote::quote;
@@ -9,11 +8,41 @@ const CUSTOM_ATTRIBUTE_NAMED: &str = "named";
 
 const CUSTOM_ATTRIBUTES: &[&str] = &[CUSTOM_ATTRIBUTE_OPTIONAL, CUSTOM_ATTRIBUTE_NAMED];
 
-#[derive(Default, Debug, FromMeta)]
-#[darling(default)]
+#[derive(Default)]
 struct Customize {
     root: Option<syn::LitStr>,
     default_dtype: Option<syn::Path>,
+}
+
+impl Customize {
+    fn from_meta(meta: &Meta) -> syn::Result<Self> {
+        let list = match meta {
+            Meta::List(list) if list.path.is_ident("customize") => list,
+            _ => {
+                return Err(syn::Error::new_spanned(meta, "expected `customize(...)`"));
+            }
+        };
+
+        let mut customize = Self::default();
+        list.parse_nested_meta(|meta| {
+            if meta.path.is_ident("root") {
+                if customize.root.is_some() {
+                    return Err(meta.error("duplicate `root` option"));
+                }
+                customize.root = Some(meta.value()?.parse()?);
+                Ok(())
+            } else if meta.path.is_ident("default_dtype") {
+                if customize.default_dtype.is_some() {
+                    return Err(meta.error("duplicate `default_dtype` option"));
+                }
+                customize.default_dtype = Some(meta.value()?.parse()?);
+                Ok(())
+            } else {
+                Err(meta.error("unsupported `customize` option"))
+            }
+        })?;
+        Ok(customize)
+    }
 }
 
 fn arg_type(attrs: &[syn::Attribute]) -> ArgType {
@@ -41,7 +70,7 @@ pub fn expand_generate_macro(
     mut item: ItemFn, // The original function should be kept as is
 ) -> Result<TokenStream, syn::Error> {
     let customize = match attr {
-        Some(attr) => Customize::from_meta(&attr).map_err(|e| syn::Error::new_spanned(attr, e))?,
+        Some(attr) => Customize::from_meta(&attr)?,
         None => Customize::default(),
     };
 

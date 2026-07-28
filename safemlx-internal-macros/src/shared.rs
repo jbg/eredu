@@ -1,13 +1,10 @@
 use std::fmt::Display;
 
-use darling::{FromDeriveInput, FromField};
 use quote::{quote, ToTokens};
 use syn::{DeriveInput, Ident, ImplGenerics, TypeGenerics, WhereClause};
 
 pub(crate) type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
-#[derive(Debug, Clone, FromDeriveInput)]
-#[darling(attributes(builder))]
 pub(crate) struct BuilderStructProperty {
     pub ident: syn::Ident,
 
@@ -19,6 +16,72 @@ pub(crate) struct BuilderStructProperty {
 
     /// Whether building with the default parameters can fail
     pub default_infallible: Option<bool>,
+}
+
+impl BuilderStructProperty {
+    pub(crate) fn from_derive_input(input: &DeriveInput) -> syn::Result<Self> {
+        let mut build_with = None;
+        let mut root = None;
+        let mut err = None;
+        let mut default_infallible = None;
+
+        for attr in input
+            .attrs
+            .iter()
+            .filter(|attr| attr.path().is_ident("builder"))
+        {
+            if matches!(attr.meta, syn::Meta::Path(_)) {
+                continue;
+            }
+            attr.parse_nested_meta(|meta| {
+                if meta.path.is_ident("build_with") {
+                    set_once(&mut build_with, meta.value()?.parse()?, &meta, "build_with")
+                } else if meta.path.is_ident("root") {
+                    set_once(&mut root, meta.value()?.parse()?, &meta, "root")
+                } else if meta.path.is_ident("err") {
+                    set_once(&mut err, meta.value()?.parse()?, &meta, "err")
+                } else if meta.path.is_ident("default_infallible") {
+                    set_once(
+                        &mut default_infallible,
+                        parse_bool_option(&meta)?,
+                        &meta,
+                        "default_infallible",
+                    )
+                } else {
+                    Err(meta.error("unsupported `builder` option"))
+                }
+            })?;
+        }
+
+        Ok(Self {
+            ident: input.ident.clone(),
+            build_with,
+            root,
+            err,
+            default_infallible,
+        })
+    }
+}
+
+fn set_once<T>(
+    slot: &mut Option<T>,
+    value: T,
+    meta: &syn::meta::ParseNestedMeta<'_>,
+    name: &str,
+) -> syn::Result<()> {
+    if slot.is_some() {
+        return Err(meta.error(format!("duplicate `{name}` option")));
+    }
+    *slot = Some(value);
+    Ok(())
+}
+
+fn parse_bool_option(meta: &syn::meta::ParseNestedMeta<'_>) -> syn::Result<bool> {
+    if meta.input.peek(syn::Token![=]) {
+        Ok(meta.value()?.parse::<syn::LitBool>()?.value())
+    } else {
+        Ok(true)
+    }
 }
 
 pub(crate) struct BuilderStructAnalyzer<'a> {
@@ -235,27 +298,86 @@ impl BuilderStructAnalyzer<'_> {
     }
 }
 
-#[derive(Debug, darling::FromField, PartialEq)]
-#[darling(attributes(builder))]
 pub(crate) struct BuilderFieldProperty {
     pub ident: Option<syn::Ident>,
 
     pub ty: syn::Type,
 
-    #[darling(default)]
     pub optional: bool,
 
     pub default: Option<syn::Path>,
 
     pub rename: Option<String>,
 
-    #[darling(default)]
     pub ignore: bool,
 
     pub ty_override: Option<syn::Path>,
 
-    #[darling(default)]
     pub skip_setter: bool,
+}
+
+impl BuilderFieldProperty {
+    fn from_field(field: &syn::Field) -> syn::Result<Self> {
+        let mut optional = None;
+        let mut default = None;
+        let mut rename = None;
+        let mut ignore = None;
+        let mut ty_override = None;
+        let mut skip_setter = None;
+
+        for attr in field
+            .attrs
+            .iter()
+            .filter(|attr| attr.path().is_ident("builder"))
+        {
+            if matches!(attr.meta, syn::Meta::Path(_)) {
+                continue;
+            }
+            attr.parse_nested_meta(|meta| {
+                if meta.path.is_ident("optional") {
+                    set_once(&mut optional, parse_bool_option(&meta)?, &meta, "optional")
+                } else if meta.path.is_ident("default") {
+                    set_once(&mut default, meta.value()?.parse()?, &meta, "default")
+                } else if meta.path.is_ident("rename") {
+                    set_once(
+                        &mut rename,
+                        meta.value()?.parse::<syn::LitStr>()?.value(),
+                        &meta,
+                        "rename",
+                    )
+                } else if meta.path.is_ident("ignore") {
+                    set_once(&mut ignore, parse_bool_option(&meta)?, &meta, "ignore")
+                } else if meta.path.is_ident("ty_override") {
+                    set_once(
+                        &mut ty_override,
+                        meta.value()?.parse()?,
+                        &meta,
+                        "ty_override",
+                    )
+                } else if meta.path.is_ident("skip_setter") {
+                    set_once(
+                        &mut skip_setter,
+                        parse_bool_option(&meta)?,
+                        &meta,
+                        "skip_setter",
+                    )
+                } else {
+                    Err(meta.error("unsupported `builder` field option"))
+                }
+            })?;
+        }
+
+        Ok(Self {
+            ident: field.ident.clone(),
+            ty: field.ty.clone(),
+            optional: optional.unwrap_or(false),
+            default,
+            rename,
+            ignore: ignore.unwrap_or(false),
+            ty_override,
+            skip_setter: skip_setter.unwrap_or(false),
+        })
+    }
 }
 
 pub(crate) struct MandatoryField {
@@ -308,6 +430,7 @@ fn parse_fields(fields: &syn::Fields) -> Result<(Vec<MandatoryField>, Vec<Option
 
         let ty = match field_prop.ty_override {
             Some(ty_override) => syn::Type::Path(syn::TypePath {
+                attrs: Vec::new(),
                 qself: None,
                 path: ty_override,
             }),
@@ -338,7 +461,7 @@ fn parse_fields(fields: &syn::Fields) -> Result<(Vec<MandatoryField>, Vec<Option
     Ok((mandatory_fields, optional_fields))
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub(crate) enum PathOrIdent {
     Path(syn::Path),
     Ident(syn::Ident),

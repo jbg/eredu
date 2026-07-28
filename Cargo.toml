@@ -41,9 +41,8 @@ minijinja-contrib = { version = "2", features = ["pycompat"] }
 clap = { version = "4", features = ["derive"] }
 idna_adapter = "1"
 anyhow = "1"
-syn = { version = "2", features = ["full"] }
+syn = { version = "3", features = ["full"] }
 quote = "1"
-darling = "0.23"
 proc-macro2 = "1"
 itertools = "0.15"
 bindgen = "0.72"

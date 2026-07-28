@@ -1,24 +1,17 @@
-use darling::FromDeriveInput;
 use syn::{DeriveInput, Generics, Ident};
 
-use crate::util::{filter_fields_with_attr, FilteredFields};
-
-#[derive(Debug, Clone, FromDeriveInput)]
-#[darling(attributes(quantizable))]
-struct StructProperties {
-    root: Option<syn::Path>,
-}
+use crate::util::{filter_fields_with_attr, parse_root_attribute, FilteredFields};
 
 pub(crate) fn expand_quantizable(
     input: &DeriveInput,
 ) -> Result<proc_macro2::TokenStream, syn::Error> {
-    let prop = StructProperties::from_derive_input(input)?;
+    let root = parse_root_attribute(&input.attrs, "quantizable")?;
     let struct_ident = &input.ident;
     let generics = &input.generics;
 
     match &input.data {
         syn::Data::Struct(data) => {
-            expand_quantizable_module_for_struct(struct_ident, generics, data, prop.root)
+            expand_quantizable_module_for_struct(struct_ident, generics, data, root)
         }
         _ => Err(syn::Error::new_spanned(
             input,

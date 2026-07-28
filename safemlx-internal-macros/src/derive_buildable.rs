@@ -1,11 +1,8 @@
-use darling::FromDeriveInput;
 use quote::quote;
 use syn::DeriveInput;
 
 use crate::shared::{PathOrIdent, Result};
 
-#[derive(Debug, Clone, FromDeriveInput)]
-#[darling(attributes(buildable))]
 #[allow(dead_code)]
 pub(crate) struct StructProperty {
     pub ident: syn::Ident,
@@ -15,6 +12,43 @@ pub(crate) struct StructProperty {
 
     /// Rename `safemlx` if Some(_)
     pub root: Option<syn::Path>,
+}
+
+impl StructProperty {
+    pub(crate) fn from_derive_input(input: &DeriveInput) -> syn::Result<Self> {
+        let mut builder = None;
+        let mut root = None;
+
+        for attr in input
+            .attrs
+            .iter()
+            .filter(|attr| attr.path().is_ident("buildable"))
+        {
+            if matches!(attr.meta, syn::Meta::Path(_)) {
+                continue;
+            }
+            attr.parse_nested_meta(|meta| {
+                let slot = if meta.path.is_ident("builder") {
+                    &mut builder
+                } else if meta.path.is_ident("root") {
+                    &mut root
+                } else {
+                    return Err(meta.error("unsupported `buildable` option"));
+                };
+                if slot.is_some() {
+                    return Err(meta.error("duplicate `buildable` option"));
+                }
+                *slot = Some(meta.value()?.parse()?);
+                Ok(())
+            })?;
+        }
+
+        Ok(Self {
+            ident: input.ident.clone(),
+            builder,
+            root,
+        })
+    }
 }
 
 pub(crate) fn expand_derive_buildable(input: DeriveInput) -> Result<proc_macro2::TokenStream> {

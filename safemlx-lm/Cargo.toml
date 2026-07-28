@@ -44,7 +44,7 @@ serde_json = "1"
 minijinja = "2"
 safetensors = "0.8"
 memmap2 = "0.9"
-sha2 = "0.10"
+sha2 = "0.11"
 llguidance = { version = "=1.7.6", default-features = false, features = ["ahash", "lark"] }
 toktrie_hf_tokenizers = "=1.7.6"
 libc = "0.2"

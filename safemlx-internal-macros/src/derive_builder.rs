@@ -1,4 +1,3 @@
-use darling::FromDeriveInput;
 use quote::quote;
 use syn::{DeriveInput, Ident};
 

@@ -1,4 +1,3 @@
-use darling::FromDeriveInput;
 use proc_macro2::TokenTree;
 use quote::quote;
 use syn::DeriveInput;

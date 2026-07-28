@@ -38,3 +38,28 @@ pub(crate) fn filter_fields_with_attr<'a>(
         other_fields,
     })
 }
+
+pub(crate) fn parse_root_attribute(
+    attrs: &[syn::Attribute],
+    attr_name: &str,
+) -> Result<Option<syn::Path>, syn::Error> {
+    let mut root = None;
+
+    for attr in attrs.iter().filter(|attr| attr.path().is_ident(attr_name)) {
+        if matches!(attr.meta, syn::Meta::Path(_)) {
+            continue;
+        }
+        attr.parse_nested_meta(|meta| {
+            if !meta.path.is_ident("root") {
+                return Err(meta.error(format!("unsupported `{attr_name}` option")));
+            }
+            if root.is_some() {
+                return Err(meta.error("duplicate `root` option"));
+            }
+            root = Some(meta.value()?.parse()?);
+            Ok(())
+        })?;
+    }
+
+    Ok(root)
+}
