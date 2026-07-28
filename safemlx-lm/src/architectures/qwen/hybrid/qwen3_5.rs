@@ -25,10 +25,10 @@ use serde::{Deserialize, Deserializer};
 use serde_json::Value;
 use tokenizers::Tokenizer;
 
-use super::qwen_vl::grid_thw_from_array;
+use crate::architectures::qwen::vl::vision::grid_thw_from_array;
 #[cfg(test)]
-pub(crate) use super::qwen_vl::{reverse_permutation, vision_window_index};
-pub use super::qwen_vl::{
+pub(crate) use crate::architectures::qwen::vl::vision::{reverse_permutation, vision_window_index};
+pub use crate::architectures::qwen::vl::vision::{
     QwenVisionAttention, QwenVisionBlock, QwenVisionMlp, QwenVisionPatchEmbed,
     QwenVisionPatchMerger, QwenVisionPatchProjection, QwenVisionRmsNorm, QwenVisionTransformer,
     VisionConfig,
@@ -4403,7 +4403,7 @@ pub(crate) fn load_qwen3_5_moe_gguf_checkpoint(
     }
     report.finish(&model, &config)?;
     model.copy_to_stream(stream)?;
-    let eos_token_ids = super::gguf_eos_token_ids(&metadata)?;
+    let eos_token_ids = crate::models::gguf_eos_token_ids(&metadata)?;
     Ok(LoadedQwen35Gguf {
         model,
         eos_token_ids,
@@ -4474,7 +4474,7 @@ pub(crate) fn prepare_qwen35_gguf_checkpoint(
         super::qwen3_next::split_fused_projection_configs(&mut configs)?;
     }
     args.quantized_weight_configs = Some(configs);
-    let eos_token_ids = super::gguf_eos_token_ids(metadata)?;
+    let eos_token_ids = crate::models::gguf_eos_token_ids(metadata)?;
     Ok(PreparedQwen35Gguf {
         args,
         eos_token_ids,

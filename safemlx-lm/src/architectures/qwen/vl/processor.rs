@@ -3,11 +3,11 @@ use std::{fs, path::Path};
 use safemlx::Array;
 use serde::Deserialize;
 
-use super::video::{
+use crate::processor::video::{
     pad_frame_indices, sampled_frame_count, temporal_group_timestamps, uniform_sample_indices,
     validate_rgb_frames,
 };
-use super::{
+use crate::processor::{
     image::{rescale_and_normalize_rgb8, resize_rgb8_bicubic, NormalizedImage, RgbImageView},
     prepared_model_input, push_text_token_ids, MediaInput, MediaPayload, OwnedInputMetadata,
     PreparedInputPart, PreparedModelInput, ProcessorInput, VideoFrames, VideoSampling,
@@ -87,7 +87,7 @@ struct QwenTextConfig {
 }
 
 #[derive(Debug, Clone)]
-pub(super) struct QwenProcessor {
+pub(crate) struct QwenProcessor {
     image_config: Option<QwenVisualProcessorConfig>,
     video_config: Option<QwenVisualProcessorConfig>,
     vision_start_token_id: Option<u32>,
@@ -95,7 +95,7 @@ pub(super) struct QwenProcessor {
 }
 
 impl QwenProcessor {
-    pub(super) fn load(model_dir: &Path) -> Result<Option<Self>, Error> {
+    pub(crate) fn load(model_dir: &Path) -> Result<Option<Self>, Error> {
         let image_config = load_visual_config(&model_dir.join("preprocessor_config.json"))?;
         let video_config = load_visual_config(&model_dir.join("video_preprocessor_config.json"))?;
         if image_config.is_none() && video_config.is_none() {
@@ -116,7 +116,7 @@ impl QwenProcessor {
         }))
     }
 
-    pub(super) fn prepare_input(
+    pub(crate) fn prepare_input(
         &self,
         input: &[ProcessorInput<'_>],
         encode_text: &mut dyn FnMut(&str) -> Result<Vec<u32>, Error>,

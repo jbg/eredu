@@ -22,7 +22,7 @@ use crate::{
     runtime::checkpoint::quantization::{AffineQuantization, WeightQuantization},
 };
 
-pub use super::qwen3_5_moe::{
+pub use super::qwen3_5::{
     sample, Cache, Generate, LayerCache, LayerType, LinearAttentionCache, Model, ModelArgs,
     ModelInput,
 };
@@ -30,7 +30,7 @@ pub use super::qwen3_5_moe::{
 /// Reads and normalizes Qwen3-Next model arguments from `config.json`.
 pub fn get_qwen3_next_model_args(model_dir: impl AsRef<Path>) -> Result<ModelArgs, Error> {
     let (args, image_token_id, video_token_id, vision_config) =
-        super::qwen3_5_moe::get_qwen3_5_moe_model_args(model_dir)?;
+        super::qwen3_5::get_qwen3_5_moe_model_args(model_dir)?;
     if image_token_id.is_some() || video_token_id.is_some() || vision_config.is_some() {
         return Err(Error::UnsupportedArchitecture(
             "qwen3_next is a text-only architecture".into(),
@@ -41,7 +41,7 @@ pub fn get_qwen3_next_model_args(model_dir: impl AsRef<Path>) -> Result<ModelArg
 
 /// Loads `tokenizer.json` from a Qwen3-Next model directory.
 pub fn load_qwen3_next_tokenizer(model_dir: impl AsRef<Path>) -> Result<Tokenizer, Error> {
-    super::qwen3_5_moe::load_qwen3_5_moe_tokenizer(model_dir)
+    super::qwen3_5::load_qwen3_5_moe_tokenizer(model_dir)
 }
 
 /// Loads a Qwen3-Next safetensors checkpoint.
@@ -93,10 +93,10 @@ fn load_qwen3_next_model_with_quantization(
     }
     let mut model = Model::new(args, None, None, None, stream)?;
     let args = model.args.clone();
-    let config = super::qwen3_5_moe::qwen3_5_moe_strict_load_config(false);
+    let config = super::qwen3_5::qwen3_5_moe_strict_load_config(false);
     let mut report = StrictLoadReport::default();
     if args.uses_fp8() {
-        super::qwen3_5_moe::load_qwen_fp8_safetensors_dir_strict_with_transform(
+        super::qwen3_5::load_qwen_fp8_safetensors_dir_strict_with_transform(
             &mut model,
             model_dir,
             weights_stream,
@@ -399,7 +399,7 @@ pub(crate) fn validate_model_config_value(config: &serde_json::Value) -> Result<
             "qwen3_next is a text-only architecture".into(),
         ));
     }
-    super::qwen3_5_moe::validate_model_config_value(config)
+    super::qwen3_5::validate_model_config_value(config)
 }
 
 #[cfg(test)]
@@ -676,9 +676,9 @@ mod tests {
         )
         .unwrap();
 
-        let config = super::super::qwen3_5_moe::qwen3_5_moe_strict_load_config(false);
+        let config = super::super::qwen3_5::qwen3_5_moe_strict_load_config(false);
         let mut report = crate::runtime::checkpoint::load::StrictLoadReport::default();
-        super::super::qwen3_5_moe::load_qwen_fp8_safetensors_dir_strict_with_transform(
+        super::super::qwen3_5::load_qwen_fp8_safetensors_dir_strict_with_transform(
             &mut model,
             dir.path(),
             cpu.stream(),
@@ -805,9 +805,9 @@ mod tests {
         )
         .unwrap();
 
-        let config = super::super::qwen3_5_moe::qwen3_5_moe_strict_load_config(false);
+        let config = super::super::qwen3_5::qwen3_5_moe_strict_load_config(false);
         let mut report = crate::runtime::checkpoint::load::StrictLoadReport::default();
-        let error = super::super::qwen3_5_moe::load_qwen_fp8_safetensors_dir_strict_with_transform(
+        let error = super::super::qwen3_5::load_qwen_fp8_safetensors_dir_strict_with_transform(
             &mut model,
             dir.path(),
             cpu.stream(),

@@ -8,7 +8,7 @@ use safemlx::{
     Array, Dtype, Stream,
 };
 
-use super::gemma4::{maybe_quantized_linear_with_bias, rms_norm_without_scale};
+use super::model::{maybe_quantized_linear_with_bias, rms_norm_without_scale};
 use crate::runtime::checkpoint::quantization::WeightQuantization;
 
 #[derive(Debug, Clone, ModuleParameters)]

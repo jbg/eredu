@@ -20,7 +20,7 @@ use safemlx::{
 };
 use serde_json::Value;
 
-pub use super::qwen_vl::{QwenVisionTransformer, VisionConfig};
+pub use super::vision::{QwenVisionTransformer, VisionConfig};
 
 use crate::{
     error::Error,
@@ -1277,7 +1277,7 @@ mod tests {
     use crate::models::{common::generation::CausalLm, input as runtime_input};
 
     fn tiny_model(stream: &safemlx::Stream) -> super::Model {
-        let text_config = super::qwen3::ModelArgs {
+        let text_config = crate::architectures::qwen::qwen3::model::ModelArgs {
             model_type: "qwen3_vl_text".into(),
             hidden_size: 12,
             num_hidden_layers: 1,

@@ -7,13 +7,13 @@ use serde::Deserialize;
 
 use crate::{error::Error, models::input::Modality};
 
-use super::{
+use crate::processor::{
     prepared_model_input, push_text_token_ids, MediaInput, MediaPayload, OwnedInputMetadata,
     PreparedInputPart, PreparedModelInput, ProcessorInput,
 };
 
 #[derive(Debug, Clone)]
-pub(super) struct InklingProcessor {
+pub(crate) struct InklingProcessor {
     #[cfg(feature = "image-processing")]
     image_bos_token_id: u32,
     #[cfg(feature = "audio-processing")]
@@ -27,7 +27,7 @@ pub(super) struct InklingProcessor {
 }
 
 impl InklingProcessor {
-    pub(super) fn load(model_dir: &Path) -> Result<Option<Self>, Error> {
+    pub(crate) fn load(model_dir: &Path) -> Result<Option<Self>, Error> {
         #[derive(Deserialize)]
         struct Config {
             model_type: String,
@@ -76,7 +76,7 @@ impl InklingProcessor {
         }))
     }
 
-    pub(super) fn prepare_input(
+    pub(crate) fn prepare_input(
         &self,
         input: &[ProcessorInput<'_>],
         encode_text: &mut dyn FnMut(&str) -> Result<Vec<u32>, Error>,
@@ -122,7 +122,7 @@ impl InklingProcessor {
     #[cfg(feature = "audio-processing")]
     fn process_audio(
         &self,
-        waveform: super::audio::AudioWaveform<'_>,
+        waveform: crate::processor::audio::AudioWaveform<'_>,
     ) -> Result<PreparedInputPart, Error> {
         let features = inkling_log_mel(waveform)?;
         let span = (self.dmel_max - self.dmel_min) as f64;
@@ -185,7 +185,9 @@ fn default_dmel_max() -> f32 {
 }
 
 #[cfg(feature = "image-processing")]
-fn process_image(image: super::image::RgbImageView<'_>) -> Result<PreparedInputPart, Error> {
+fn process_image(
+    image: crate::processor::image::RgbImageView<'_>,
+) -> Result<PreparedInputPart, Error> {
     const PATCH: usize = 40;
     const MEAN: [f32; 3] = [0.481_454_66, 0.457_827_5, 0.408_210_73];
     const STD: [f32; 3] = [0.268_629_54, 0.261_302_6, 0.275_777_1];
@@ -232,7 +234,9 @@ fn image_patch_grid(height: usize, width: usize) -> (usize, usize) {
 }
 
 #[cfg(feature = "audio-processing")]
-fn inkling_log_mel(waveform: super::audio::AudioWaveform<'_>) -> Result<Vec<f32>, Error> {
+fn inkling_log_mel(
+    waveform: crate::processor::audio::AudioWaveform<'_>,
+) -> Result<Vec<f32>, Error> {
     use rustfft::{num_complex::Complex32, FftPlanner};
 
     const SAMPLE_RATE: u32 = 16_000;

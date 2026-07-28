@@ -4,26 +4,26 @@ use std::{fs, path::Path};
 use safemlx::Array;
 use serde::Deserialize;
 
+use crate::error::Error;
+#[cfg(any(feature = "image-processing", feature = "audio-processing"))]
+use crate::models::input::Modality;
 #[cfg(feature = "audio-processing")]
-use super::audio::{extract_log_mel, LogMelConfig};
+use crate::processor::audio::{extract_log_mel, LogMelConfig};
 #[cfg(feature = "image-processing")]
-use super::image::{rescale_and_normalize_rgb8, resize_rgb8_bicubic, NormalizedImage};
+use crate::processor::image::{rescale_and_normalize_rgb8, resize_rgb8_bicubic, NormalizedImage};
 #[cfg(feature = "image-processing")]
-use super::video::{
+use crate::processor::video::{
     format_mm_ss, frame_timestamps, sampled_frame_count, uniform_sample_indices,
     validate_rgb_frames,
 };
-use super::{
+use crate::processor::{
     prepared_model_input, push_text_token_ids, MediaInput, PreparedInputPart, PreparedModelInput,
     ProcessorInput,
 };
 #[cfg(any(feature = "image-processing", feature = "audio-processing"))]
-use super::{MediaPayload, OwnedInputMetadata};
+use crate::processor::{MediaPayload, OwnedInputMetadata};
 #[cfg(feature = "image-processing")]
-use super::{VideoFrames, VideoSampling};
-use crate::error::Error;
-#[cfg(any(feature = "image-processing", feature = "audio-processing"))]
-use crate::models::input::Modality;
+use crate::processor::{VideoFrames, VideoSampling};
 
 #[derive(Debug, Clone, Deserialize)]
 struct Gemma4ModelConfig {
@@ -115,7 +115,7 @@ fn default_video_frames() -> usize {
 }
 
 #[derive(Debug, Clone)]
-pub(super) struct Gemma4Processor {
+pub(crate) struct Gemma4Processor {
     #[cfg(feature = "image-processing")]
     patch_size: usize,
     #[cfg(feature = "image-processing")]
@@ -141,7 +141,7 @@ pub(super) struct Gemma4Processor {
 }
 
 impl Gemma4Processor {
-    pub(super) fn load(model_dir: &Path) -> Result<Option<Self>, Error> {
+    pub(crate) fn load(model_dir: &Path) -> Result<Option<Self>, Error> {
         let config: Gemma4ModelConfig =
             serde_json::from_slice(&fs::read(model_dir.join("config.json"))?)?;
         #[cfg(not(any(feature = "image-processing", feature = "audio-processing")))]
@@ -232,7 +232,7 @@ impl Gemma4Processor {
         }))
     }
 
-    pub(super) fn prepare_input(
+    pub(crate) fn prepare_input(
         &self,
         input: &[ProcessorInput<'_>],
         encode_text: &mut dyn FnMut(&str) -> Result<Vec<u32>, Error>,
@@ -314,7 +314,7 @@ impl Gemma4Processor {
     #[cfg(feature = "image-processing")]
     fn process_image(
         &self,
-        image: super::image::RgbImageView<'_>,
+        image: crate::processor::image::RgbImageView<'_>,
     ) -> Result<PreparedInputPart, Error> {
         let max_patches = self
             .max_soft_tokens
@@ -414,7 +414,7 @@ impl Gemma4Processor {
     #[cfg(feature = "audio-processing")]
     fn process_audio(
         &self,
-        waveform: super::audio::AudioWaveform<'_>,
+        waveform: crate::processor::audio::AudioWaveform<'_>,
     ) -> Result<PreparedInputPart, Error> {
         let features = extract_log_mel(
             waveform,

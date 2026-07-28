@@ -29,16 +29,7 @@ use serde::Deserialize;
 use serde_json::Value;
 use tokenizers::Tokenizer;
 
-use super::{
-    common::{
-        self,
-        generation::CausalLm,
-        layers::silu,
-        moe::{weighted_route_sum, TopKRouter, TopKRouterConfig, TopKRouterScoreFunction},
-    },
-    input as runtime_input,
-    qwen3_5_moe::{QwenLinear as Linear, QwenWeightFormat as WeightFormat},
-};
+use crate::nn as common;
 use crate::{
     error::Error,
     runtime::cache::residency::{
@@ -60,6 +51,17 @@ use crate::{
     utils::{
         create_causal_mask,
         rope::{initialize_rope, FloatOrString, RopeVariant},
+    },
+};
+use crate::{
+    models::{
+        input as runtime_input,
+        qwen3_5_moe::{QwenLinear as Linear, QwenWeightFormat as WeightFormat},
+    },
+    nn::{
+        generation::CausalLm,
+        layers::silu,
+        moe::{weighted_route_sum, TopKRouter, TopKRouterConfig, TopKRouterScoreFunction},
     },
 };
 
@@ -1324,7 +1326,7 @@ impl MultiHeadLatentAttention {
                     kv_b_proj.weight_scale_inv.as_ref().as_ref(),
                     fp8_group_ids.as_ref(),
                 ) {
-                    common::block_fp8::segmented_transposed_linear(
+                    common::fp8::segmented_transposed_linear(
                         &q_nope
                             .reshape(&[b * l * self.num_heads, self.qk_nope_head_dim], stream)?,
                         kv_b_proj.weight.as_ref(),
@@ -1377,7 +1379,7 @@ impl MultiHeadLatentAttention {
                     kv_b_proj.weight_scale_inv.as_ref().as_ref(),
                     fp8_group_ids.as_ref(),
                 ) {
-                    common::block_fp8::segmented_linear(
+                    common::fp8::segmented_linear(
                         &context.reshape(&[b * l * self.num_heads, self.kv_lora_rank], stream)?,
                         kv_b_proj.weight.as_ref(),
                         scale,
@@ -1747,7 +1749,7 @@ impl RoutedExperts {
                 stream,
             )
         } else if let Some(scale) = fp8_scale {
-            common::block_fp8::grouped_linear(input, weight, scale, group_ids, stream)
+            common::fp8::grouped_linear(input, weight, scale, group_ids, stream)
         } else {
             grouped_matmul(
                 input,
@@ -3462,7 +3464,7 @@ pub(crate) fn prepare_gguf_checkpoint(
     }
     args.validate()?;
 
-    let eos_token_ids = super::gguf_eos_token_ids(metadata)?;
+    let eos_token_ids = crate::models::gguf_eos_token_ids(metadata)?;
     Ok(PreparedDeepSeekGguf {
         args,
         eos_token_ids,

@@ -9,7 +9,7 @@ use safemlx::{
 };
 use serde::Deserialize;
 
-use super::{gemma4::rms_norm_without_scale, gemma4_multimodal::Gemma4ClippedLinear};
+use super::{model::rms_norm_without_scale, multimodal::Gemma4ClippedLinear};
 use crate::nn::rope::FloatOrString;
 
 #[derive(Debug, Clone, Deserialize)]

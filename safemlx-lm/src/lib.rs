@@ -21,6 +21,8 @@
 
 #![warn(missing_docs)]
 
+/// Model-family implementations and architecture-specific adapters.
+pub mod architectures;
 /// Architecture-neutral neural-network building blocks.
 pub mod nn;
 /// Architecture-independent model execution infrastructure.
@@ -31,63 +33,63 @@ pub use runtime::cache::kv as cache;
 pub use runtime::cache::residency as cache_residency;
 /// Chat-template preparation and native tool-runtime contracts.
 pub mod chat;
-/// Bounded layer execution for DeepSeek-V3 and DeepSeek-R1.
-pub mod deepseek_v3;
+/// Compatibility path for DeepSeek-V3 bounded execution.
+pub use architectures::deepseek_v3::layerwise as deepseek_v3;
 /// Compatibility path for bounded dense-layer checkpoint streaming.
 pub use runtime::residency::dense_stream;
 /// Error types returned by the language-model runtime.
 pub mod error;
+/// Compatibility path for executable expert-parallel model adapters.
+pub use architectures::distributed::expert as expert_parallel;
 /// Compatibility path for sparse routed-expert caching and telemetry.
 pub use runtime::residency::expert_cache;
-/// Reusable expert-parallel assignment, dispatch, exchange, and model metadata.
-pub mod expert_parallel;
 mod format_dialect;
-/// Multimodal bounded layer execution for Gemma 4.
-pub mod gemma4;
-mod gemma4_mtp;
-/// Unified fully resident and bounded layer execution for GPT-OSS.
-pub mod gpt_oss;
-mod harmony_format;
-/// Multimodal bounded layer execution for Thinking Machines Lab Inkling.
-pub mod inkling;
+/// Compatibility path for Gemma 4 bounded execution.
+pub use architectures::gemma4::layerwise as gemma4;
+pub(crate) use architectures::gemma4::mtp as gemma4_mtp;
+pub(crate) use architectures::gpt_oss::format as harmony_format;
+/// Compatibility path for GPT-OSS bounded execution.
+pub use architectures::gpt_oss::layerwise as gpt_oss;
+/// Compatibility path for Inkling bounded execution.
+pub use architectures::inkling::layerwise as inkling;
+pub(crate) use architectures::lfm2::format as lfm2_format;
+/// Compatibility path for LFM2 bounded execution.
+pub use architectures::lfm2::layerwise as lfm2;
+/// Compatibility path for Llama bounded execution.
+pub use architectures::llama::layerwise as llama;
+/// Compatibility path for Moshi bounded execution.
+pub use architectures::moshi::layerwise as moshi;
+/// Compatibility path for Nemotron-H bounded execution.
+pub use architectures::nemotron_h::layerwise as nemotron_h;
+pub(crate) use architectures::qwen::hybrid::mtp as qwen_mtp;
+/// Compatibility path for checkpoint binding and resident assignment.
+pub use runtime::checkpoint::binding as module_binding;
 /// Compatibility path for activation inspection hooks.
 pub use runtime::execution::inspection;
 /// Compatibility path for host-backed layerwise execution.
 pub use runtime::execution::layerwise;
-/// Unified fully resident and bounded layer execution for LFM2/LFM2.5.
-pub mod lfm2;
-mod lfm2_format;
-/// Unified Llama/Mistral loading across weight-residency policies.
-pub mod llama;
-/// Compatibility path for checkpoint binding and resident assignment.
-pub use runtime::checkpoint::binding as module_binding;
-/// Bounded layer execution for Moshi and PersonaPlex realtime token models.
-pub mod moshi;
-/// Unified fully resident and bounded layer execution for Nemotron-H.
-pub mod nemotron_h;
 /// Compatibility path for weight-residency policy and telemetry.
 pub use runtime::residency::policy as offload;
-mod qwen_mtp;
 // pub mod generate;
 /// Supported model implementations and model-directory loading helpers.
 pub mod models;
 /// Architecture-independent multi-token prediction and speculative decoding.
 pub mod mtp;
+/// Compatibility path for executable pipeline-parallel model adapters.
+pub use architectures::distributed::pipeline;
 /// Compatibility path for runtime topology and placement planning.
 pub use runtime::distributed::topology as parallel;
-/// Executable pure pipeline-parallel model loading and inference.
-pub mod pipeline;
 /// Model-agnostic media processing and prepared-input helpers.
 #[cfg(feature = "media-processing")]
 pub mod processor;
+/// Compatibility path for hybrid Qwen bounded execution.
+pub use architectures::qwen::hybrid::layerwise as qwen_hybrid;
+/// Compatibility path for Qwen3 bounded execution.
+pub use architectures::qwen::qwen3::layerwise as qwen3;
+/// Compatibility path for Qwen3-VL bounded execution.
+pub use architectures::qwen::vl::layerwise as qwen3_vl;
 /// Compatibility path for checkpoint quantization and conversion.
 pub use runtime::checkpoint::quantization;
-/// Unified dense and sparse-MoE Qwen3 bounded layer execution.
-pub mod qwen3;
-/// Shared multimodal bounded layer execution for dense and MoE Qwen3-VL.
-pub mod qwen3_vl;
-/// Shared bounded layer execution for Qwen3-Next and multimodal Qwen3.5 models.
-pub mod qwen_hybrid;
 /// Codec-free realtime speech-to-speech token APIs.
 pub mod realtime;
 /// Compatibility path for immutable-weight residency management.
@@ -96,8 +98,8 @@ pub use runtime::residency::manager as residency;
 pub mod sampler;
 /// Protocol-independent semantic streaming contracts and machinery.
 pub mod streaming;
-/// Executable pure tensor-parallel model loading and inference.
-pub mod tensor_parallel;
+/// Compatibility path for executable tensor-parallel model adapters.
+pub use architectures::distributed::tensor as tensor_parallel;
 #[cfg(test)]
 mod test_utils;
 mod tool_constraints;

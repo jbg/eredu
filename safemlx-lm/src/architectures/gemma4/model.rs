@@ -34,9 +34,9 @@ use serde_json::Value;
 use tokenizers::Tokenizer;
 
 use super::{
-    gemma4_audio::{Gemma4AudioConfig, Gemma4AudioTower},
-    gemma4_multimodal::Gemma4ModalityEmbedder,
-    gemma4_vision::{Gemma4VisionConfig, Gemma4VisionTower},
+    audio::{Gemma4AudioConfig, Gemma4AudioTower},
+    multimodal::Gemma4ModalityEmbedder,
+    vision::{Gemma4VisionConfig, Gemma4VisionTower},
 };
 pub use crate::nn::generation::sample;
 
@@ -3322,7 +3322,7 @@ pub(crate) fn prepare_gemma4_gguf_checkpoint(
         }
     }
 
-    let eos_token_ids = super::gguf_eos_token_ids(metadata)?;
+    let eos_token_ids = crate::models::gguf_eos_token_ids(metadata)?;
     Ok(PreparedGemma4Gguf {
         args,
         eos_token_ids,

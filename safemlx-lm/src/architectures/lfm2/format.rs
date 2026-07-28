@@ -956,7 +956,7 @@ mod tests {
     };
 
     const AUTHORITATIVE_CALL: &str =
-        include_str!("../tests/fixtures/lfm2/candidate-status-b3afba27.txt");
+        include_str!("../../../tests/fixtures/lfm2/candidate-status-b3afba27.txt");
 
     fn parameters() -> DialectParameters {
         DialectParameters::Custom(&LFM2_PARAMETERS)

@@ -59,47 +59,47 @@ use crate::{
 /// Shared building blocks used by multiple decoder-only model families.
 pub mod common;
 /// DeepSeek-V3 and DeepSeek-R1 decoder support.
-pub mod deepseek_v3;
+pub use crate::architectures::deepseek_v3::model as deepseek_v3;
+pub(crate) use crate::architectures::gemma4::assistant as gemma4_assistant;
+pub(crate) use crate::architectures::gemma4::audio as gemma4_audio;
 /// Gemma 4 text model support.
-pub mod gemma4;
-pub(crate) mod gemma4_assistant;
-pub(crate) mod gemma4_audio;
-pub(crate) mod gemma4_multimodal;
-pub(crate) mod gemma4_vision;
+pub use crate::architectures::gemma4::model as gemma4;
+pub(crate) use crate::architectures::gemma4::multimodal as gemma4_multimodal;
+pub(crate) use crate::architectures::gemma4::vision as gemma4_vision;
 /// OpenAI GPT-OSS sparse decoder architecture.
-pub mod gpt_oss;
+pub use crate::architectures::gpt_oss::model as gpt_oss;
 /// Thinking Machines Lab Inkling multimodal decoder support.
-pub mod inkling;
+pub use crate::architectures::inkling::model as inkling;
 /// Typed runtime input support.
 pub mod input;
 /// Liquid AI LFM2/LFM2.5 dense and MoE text model support.
-pub mod lfm2;
+pub use crate::architectures::lfm2::model as lfm2;
 /// Llama decoder-only model support.
-pub mod llama;
+pub use crate::architectures::llama::model as llama;
 /// Moshi token language-model support.
 ///
 /// This module operates on pre-tokenized Mimi streams. It intentionally does
 /// not implement audio encoding, decoding, or realtime device I/O.
-pub mod moshi;
-/// Nemotron-H hybrid Mamba2/attention/MoE config support.
-pub mod nemotron_h;
+pub use crate::architectures::moshi::model as moshi;
 /// PersonaPlex realtime speech-to-speech token model support.
 ///
 /// This module operates on pre-tokenized Mimi streams and hybrid prompt tokens.
 /// It intentionally does not implement audio encoding, decoding, or realtime
 /// device I/O.
-pub mod personaplex;
-/// Qwen3 decoder-only model support.
-pub mod qwen3;
+pub use crate::architectures::moshi::personaplex;
+/// Nemotron-H hybrid Mamba2/attention/MoE config support.
+pub use crate::architectures::nemotron_h::model as nemotron_h;
 /// Qwen3.5 MoE text model support.
-pub mod qwen3_5_moe;
+pub use crate::architectures::qwen::hybrid::qwen3_5 as qwen3_5_moe;
 /// Qwen3-Next hybrid attention/MoE text model support.
-pub mod qwen3_next;
+pub use crate::architectures::qwen::hybrid::qwen3_next;
+/// Qwen3 decoder-only model support.
+pub use crate::architectures::qwen::qwen3::model as qwen3;
 /// Qwen3-VL multimodal conditional-generation support.
-pub mod qwen3_vl;
+pub use crate::architectures::qwen::vl::model as qwen3_vl;
 /// Qwen3-VL-MoE multimodal conditional-generation support.
-pub mod qwen3_vl_moe;
-pub(crate) mod qwen_vl;
+pub use crate::architectures::qwen::vl::moe as qwen3_vl_moe;
+pub(crate) use crate::architectures::qwen::vl::vision as qwen_vl;
 
 #[derive(Debug, Clone, Deserialize)]
 struct ModelMetadata {
@@ -4411,7 +4411,9 @@ fn load_gguf_model_data(
     })
 }
 
-fn validate_gguf_quantization_source<S: crate::runtime::checkpoint::load::GgufTensorNames>(
+pub(crate) fn validate_gguf_quantization_source<
+    S: crate::runtime::checkpoint::load::GgufTensorNames,
+>(
     source: &S,
     metadata: &std::collections::HashMap<String, GgufMetadataValue>,
     quantization: Option<WeightQuantization>,

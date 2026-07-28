@@ -1155,7 +1155,7 @@ pub(crate) fn prepare_llama_gguf_checkpoint(
         args.quantized_weight_configs = Some(quantized_weight_configs);
     }
 
-    let eos_token_ids = super::gguf_eos_token_ids(metadata)?;
+    let eos_token_ids = crate::models::gguf_eos_token_ids(metadata)?;
     Ok(PreparedLlamaGguf {
         args,
         eos_token_ids,

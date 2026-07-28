@@ -12,13 +12,13 @@ use crate::{
 /// Shared PCM waveform validation and spectral operations.
 #[cfg(feature = "audio-processing")]
 pub mod audio;
-mod gemma4;
+use crate::architectures::gemma4::processor as gemma4;
 /// Shared decoded-image operations.
 #[cfg(feature = "image-processing")]
 pub mod image;
-mod inkling;
+use crate::architectures::inkling::processor as inkling;
 #[cfg(feature = "image-processing")]
-mod qwen;
+use crate::architectures::qwen::vl::processor as qwen;
 /// Shared decoded-video validation, sampling, and timing operations.
 #[cfg(feature = "image-processing")]
 pub mod video;
@@ -143,7 +143,7 @@ enum OwnedInputPayload {
 }
 
 #[derive(Debug, Default)]
-enum OwnedInputMetadata {
+pub(crate) enum OwnedInputMetadata {
     #[default]
     None,
     #[cfg(feature = "image-processing")]
@@ -163,7 +163,7 @@ pub struct PreparedInputPart {
 }
 
 impl PreparedInputPart {
-    fn text_token_ids(ids: &[u32]) -> Self {
+    pub(crate) fn text_token_ids(ids: &[u32]) -> Self {
         Self {
             modality: Modality::Text,
             payload: OwnedInputPayload::TokenIds(Array::from_slice(ids, &[1, ids.len() as i32])),
@@ -172,7 +172,11 @@ impl PreparedInputPart {
     }
 
     #[cfg(any(feature = "image-processing", feature = "audio-processing"))]
-    fn media_tensor(modality: Modality, tensor: Array, metadata: OwnedInputMetadata) -> Self {
+    pub(crate) fn media_tensor(
+        modality: Modality,
+        tensor: Array,
+        metadata: OwnedInputMetadata,
+    ) -> Self {
         Self {
             modality,
             payload: OwnedInputPayload::Tensor(tensor),
@@ -349,7 +353,9 @@ pub fn load_processor(model_dir: impl AsRef<Path>) -> Result<Option<ModelProcess
     }
 }
 
-fn prepared_model_input(parts: Vec<PreparedInputPart>) -> Result<PreparedModelInput, Error> {
+pub(crate) fn prepared_model_input(
+    parts: Vec<PreparedInputPart>,
+) -> Result<PreparedModelInput, Error> {
     if parts.is_empty() {
         return Err(Error::Processor(
             "prepared model input must not be empty".to_string(),
@@ -358,7 +364,7 @@ fn prepared_model_input(parts: Vec<PreparedInputPart>) -> Result<PreparedModelIn
     Ok(PreparedModelInput::new(parts))
 }
 
-fn push_text_token_ids(parts: &mut Vec<PreparedInputPart>, token_ids: &[u32]) {
+pub(crate) fn push_text_token_ids(parts: &mut Vec<PreparedInputPart>, token_ids: &[u32]) {
     if !token_ids.is_empty() {
         parts.push(PreparedInputPart::text_token_ids(token_ids));
     }

@@ -12,7 +12,7 @@ use safemlx::{
 };
 use serde::Deserialize;
 
-use super::gemma4_multimodal::Gemma4ClippedLinear;
+use super::multimodal::Gemma4ClippedLinear;
 
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) struct Gemma4AudioConfig {

@@ -570,11 +570,11 @@ mod tests {
     };
 
     const REASONING_CALL_FIXTURE: &str =
-        include_str!("../tests/fixtures/harmony/reasoning-function-call-abd677f7.txt");
+        include_str!("../../../tests/fixtures/harmony/reasoning-function-call-abd677f7.txt");
     const PREAMBLE_CALL_FIXTURE: &str =
-        include_str!("../tests/fixtures/harmony/preamble-function-call-abd677f7.txt");
+        include_str!("../../../tests/fixtures/harmony/preamble-function-call-abd677f7.txt");
     const PRIOR_CALL_RESULT_FIXTURE: &str =
-        include_str!("../tests/fixtures/harmony/prior-call-result-abd677f7.txt");
+        include_str!("../../../tests/fixtures/harmony/prior-call-result-abd677f7.txt");
 
     fn parameters() -> DialectParameters {
         DialectParameters::Custom(&GPT_OSS_HARMONY_PARAMETERS)
