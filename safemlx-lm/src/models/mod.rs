@@ -2122,6 +2122,7 @@ pub struct PreparedChatMtpGenerationOutput {
 /// Every lane owns its cache, sampling policy, random root, stop configuration,
 /// and callback. The runtime constructs a fresh constrained sampler and
 /// decoder/parser pipeline from `prepared_chat` before submitting the lane.
+/// Lanes are shared by the external-assistant and embedded-head batch APIs.
 pub struct PreparedChatMtpBatchLane<'a, S> {
     /// Prepared prompt and embedded format/runtime plan.
     pub prepared_chat: &'a PreparedChat,
@@ -2147,6 +2148,16 @@ pub struct PreparedChatMtpBatchRequest<'a, S> {
     pub lanes: Vec<PreparedChatMtpBatchLane<'a, S>>,
     /// Target and draft execution streams shared by scheduler submissions.
     pub streams: MtpExecutionStreams<'a>,
+    /// Bounded scheduler and optimistic-lookahead controls.
+    pub scheduler: MtpSchedulerOptions,
+}
+
+/// Cohesive fair-scheduler request for embedded-head prepared-chat MTP lanes.
+pub struct PreparedChatEmbeddedMtpBatchRequest<'a, S> {
+    /// Independently executable prepared-chat lanes.
+    pub lanes: Vec<PreparedChatMtpBatchLane<'a, S>>,
+    /// MLX stream shared by target and embedded-head scheduler submissions.
+    pub stream: &'a Stream,
     /// Bounded scheduler and optimistic-lookahead controls.
     pub scheduler: MtpSchedulerOptions,
 }
@@ -2520,11 +2531,13 @@ struct PreparedChatMtpLaneRuntime<'a, S> {
 fn run_prepared_chat_mtp_batch<'a, B, S>(
     backend: &'a mut B,
     lanes: Vec<PreparedChatMtpLaneRuntime<'a, S>>,
+    cache_for_lane: fn(&mut ModelCache) -> Option<&mut B::Cache>,
+    cache_kind: &str,
     streams: MtpExecutionStreams<'a>,
     options: MtpSchedulerOptions,
 ) -> Result<PreparedChatMtpBatchOutput, Exception>
 where
-    B: crate::mtp::MtpBackend<Cache = gemma4::Cache>,
+    B: crate::mtp::MtpBackend,
     S: SpeculativeSampler + Clone + 'a,
 {
     let mut scheduler = MtpScheduler::new(backend, streams, options)?;
@@ -2538,11 +2551,11 @@ where
             semantic,
             on_event,
         } = lane;
-        let ModelCache::Gemma4(cache) = cache else {
-            return Err(Exception::custom(format!(
-                "prepared-chat Gemma 4 MTP cache type mismatch at lane {lane_index}"
-            )));
-        };
+        let cache = cache_for_lane(cache).ok_or_else(|| {
+            Exception::custom(format!(
+                "prepared-chat {cache_kind} MTP cache type mismatch at lane {lane_index}"
+            ))
+        })?;
         let parts = [input::InputPart::text_token_ids(&prompt)];
         scheduler.submit_with_semantics(
             cache,
@@ -2577,6 +2590,13 @@ where
         requests,
         scheduler: output.scheduler,
     })
+}
+
+fn gemma4_mtp_cache(cache: &mut ModelCache) -> Option<&mut gemma4::Cache> {
+    match cache {
+        ModelCache::Gemma4(cache) => Some(cache),
+        _ => None,
+    }
 }
 
 fn run_external_mtp_batch<'a, B, S>(
@@ -2699,37 +2719,14 @@ where
 }
 
 impl LoadedModel {
-    /// Creates an independent stateful decoder for streaming generated tokens.
-    pub fn text_decoder(&self, skip_special_tokens: bool) -> TextDecoder {
-        TextDecoder {
-            tokenizer: (*self.tokenizer).clone(),
-            skip_special_tokens,
-            ids: Vec::new(),
-            prefix: String::new(),
-            prefix_index: 0,
-        }
-    }
-
-    /// Generates multiple independent prepared chats through one fair MTP
-    /// scheduler using an external assistant.
-    ///
-    /// Model parameters and execution streams are shared. Every submitted lane
-    /// receives a fresh executable constraint/parser runtime, cache, callback,
-    /// and target/draft PRNG roots. Events are published only after the
-    /// corresponding target cache transaction commits.
-    pub fn generate_prepared_chat_mtp_batch<S>(
-        &mut self,
-        request: PreparedChatMtpBatchRequest<'_, S>,
-    ) -> Result<PreparedChatMtpBatchOutput, Error>
+    fn prepare_chat_mtp_batch_lanes<'a, S>(
+        &self,
+        lanes: Vec<PreparedChatMtpBatchLane<'a, S>>,
+        stream: &Stream,
+    ) -> Result<Vec<PreparedChatMtpLaneRuntime<'a, S>>, Error>
     where
         S: SpeculativeSampler + Clone,
     {
-        let PreparedChatMtpBatchRequest {
-            drafter,
-            lanes,
-            streams,
-            scheduler,
-        } = request;
         let mut prepared_lanes = Vec::with_capacity(lanes.len());
         for (lane_index, lane) in lanes.into_iter().enumerate() {
             let PreparedChatMtpBatchLane {
@@ -2764,8 +2761,7 @@ impl LoadedModel {
             };
             let semantic = PreparedChatSemanticState::new(decoder, plan, caller_stop_sequences)
                 .map_err(|error| Error::PreparedChatGeneration(error.to_string()))?;
-            let prompt =
-                self.encode_to_array(prepared_chat.rendered_prompt(), false, streams.target())?;
+            let prompt = self.encode_to_array(prepared_chat.rendered_prompt(), false, stream)?;
             prepared_lanes.push(PreparedChatMtpLaneRuntime {
                 prompt,
                 cache,
@@ -2781,23 +2777,150 @@ impl LoadedModel {
                 on_event,
             });
         }
+        Ok(prepared_lanes)
+    }
+
+    /// Creates an independent stateful decoder for streaming generated tokens.
+    pub fn text_decoder(&self, skip_special_tokens: bool) -> TextDecoder {
+        TextDecoder {
+            tokenizer: (*self.tokenizer).clone(),
+            skip_special_tokens,
+            ids: Vec::new(),
+            prefix: String::new(),
+            prefix_index: 0,
+        }
+    }
+
+    /// Generates multiple independent prepared chats through one fair MTP
+    /// scheduler using an external assistant.
+    ///
+    /// Model parameters and execution streams are shared. Every submitted lane
+    /// receives a fresh executable constraint/parser runtime, cache, callback,
+    /// and target/draft PRNG roots. Events are published only after the
+    /// corresponding target cache transaction commits.
+    pub fn generate_prepared_chat_mtp_batch<S>(
+        &mut self,
+        request: PreparedChatMtpBatchRequest<'_, S>,
+    ) -> Result<PreparedChatMtpBatchOutput, Error>
+    where
+        S: SpeculativeSampler + Clone,
+    {
+        let PreparedChatMtpBatchRequest {
+            drafter,
+            lanes,
+            streams,
+            scheduler,
+        } = request;
+        let prepared_lanes = self.prepare_chat_mtp_batch_lanes(lanes, streams.target())?;
 
         let assistant = drafter.gemma4_mut();
         match &mut self.model {
             Model::Gemma4(target) => {
                 validate_gemma4_drafter(&target.args, assistant)?;
                 let mut backend = crate::gemma4_mtp::Gemma4MtpBackend::new(target, assistant);
-                run_prepared_chat_mtp_batch(&mut backend, prepared_lanes, streams, scheduler)
-                    .map_err(|error| Error::PreparedChatGeneration(error.to_string()))
+                run_prepared_chat_mtp_batch(
+                    &mut backend,
+                    prepared_lanes,
+                    gemma4_mtp_cache,
+                    "Gemma 4",
+                    streams,
+                    scheduler,
+                )
+                .map_err(|error| Error::PreparedChatGeneration(error.to_string()))
             }
             Model::Gemma4Layerwise(target) => {
                 validate_gemma4_drafter(target.args(), assistant)?;
                 let mut backend = crate::gemma4_mtp::Gemma4MtpBackend::new(target, assistant);
-                run_prepared_chat_mtp_batch(&mut backend, prepared_lanes, streams, scheduler)
-                    .map_err(|error| Error::PreparedChatGeneration(error.to_string()))
+                run_prepared_chat_mtp_batch(
+                    &mut backend,
+                    prepared_lanes,
+                    gemma4_mtp_cache,
+                    "Gemma 4",
+                    streams,
+                    scheduler,
+                )
+                .map_err(|error| Error::PreparedChatGeneration(error.to_string()))
             }
             model => Err(Error::PreparedChatGeneration(format!(
                 "MTP runtime adapter is unavailable for model type {} ({:?})",
+                model.model_type(),
+                model.mtp_capability()
+            ))),
+        }
+    }
+
+    /// Generates multiple independent prepared chats through one fair scheduler
+    /// using checkpoint-embedded Qwen MTP heads.
+    ///
+    /// Model parameters and the execution stream are shared. Every submitted
+    /// lane receives a fresh executable constraint/parser runtime, cache,
+    /// callback, and PRNG root. Events are published only after the
+    /// corresponding target cache transaction commits.
+    pub fn generate_prepared_chat_embedded_mtp_batch<S>(
+        &mut self,
+        request: PreparedChatEmbeddedMtpBatchRequest<'_, S>,
+    ) -> Result<PreparedChatMtpBatchOutput, Error>
+    where
+        S: SpeculativeSampler + Clone,
+    {
+        let PreparedChatEmbeddedMtpBatchRequest {
+            lanes,
+            stream,
+            scheduler,
+        } = request;
+        let prepared_lanes = self.prepare_chat_mtp_batch_lanes(lanes, stream)?;
+        let streams = MtpExecutionStreams::single(stream);
+        match &mut self.model {
+            Model::Qwen3Next(target) => {
+                let mut backend = crate::qwen_mtp::QwenMtpBackend::new(target);
+                run_prepared_chat_mtp_batch(
+                    &mut backend,
+                    prepared_lanes,
+                    qwen_next_mtp_cache,
+                    "Qwen3-Next embedded",
+                    streams,
+                    scheduler,
+                )
+                .map_err(|error| Error::PreparedChatGeneration(error.to_string()))
+            }
+            Model::Qwen35Moe(target) => {
+                let mut backend = crate::qwen_mtp::QwenMtpBackend::new(target);
+                run_prepared_chat_mtp_batch(
+                    &mut backend,
+                    prepared_lanes,
+                    qwen35_mtp_cache,
+                    "Qwen3.5 embedded",
+                    streams,
+                    scheduler,
+                )
+                .map_err(|error| Error::PreparedChatGeneration(error.to_string()))
+            }
+            Model::Qwen3NextLayerwise(target) => {
+                let mut backend = crate::qwen_mtp::QwenMtpBackend::new(target);
+                run_prepared_chat_mtp_batch(
+                    &mut backend,
+                    prepared_lanes,
+                    qwen_next_mtp_cache,
+                    "Qwen3-Next embedded",
+                    streams,
+                    scheduler,
+                )
+                .map_err(|error| Error::PreparedChatGeneration(error.to_string()))
+            }
+            Model::Qwen35MoeLayerwise(target) => {
+                let mut backend = crate::qwen_mtp::QwenMtpBackend::new(target);
+                run_prepared_chat_mtp_batch(
+                    &mut backend,
+                    prepared_lanes,
+                    qwen35_mtp_cache,
+                    "Qwen3.5 embedded",
+                    streams,
+                    scheduler,
+                )
+                .map_err(|error| Error::PreparedChatGeneration(error.to_string()))
+            }
+            model => Err(Error::PreparedChatGeneration(format!(
+                "scheduled prepared-chat embedded MTP batch is unavailable for model type {} ({:?})",
                 model.model_type(),
                 model.mtp_capability()
             ))),
@@ -4992,7 +5115,8 @@ mod tests {
         load_chat_template, load_model_with_options, load_tokenizer,
         load_tokenizer_template_kwargs, merge_eos_token_id_sources, prepare_chat_from_parts,
         validate_gguf_quantization_source, with_prepared_chat_runtime, LoadedModel,
-        ModelLoadOptions,
+        ModelLoadOptions, PreparedChatEmbeddedMtpBatchRequest, PreparedChatGenerationSettings,
+        PreparedChatMtpBatchLane,
     };
     use crate::{
         chat::{
@@ -5001,6 +5125,7 @@ mod tests {
         },
         error::Error,
         inspection::ActivationRecorder,
+        mtp::{MtpSchedulerOptions, MtpStreamTopology},
         quantization::{AffineQuantization, CheckpointQuantizationOptions, WeightQuantization},
         sampler::{ConstrainedSampler, DefaultSampler},
         streaming::{FinishReason, SemanticEvent},
@@ -5441,6 +5566,95 @@ mod tests {
                 if message.contains("synthetic unsupported profile")
         ));
         assert_eq!(execution_calls.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn prepared_chat_embedded_mtp_batch_dispatches_qwen_without_a_drafter() {
+        let context = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        let stream = context.stream();
+        let compiler = Ok(ConstraintCompiler::synthetic_for_tests());
+        let mut tokenizer = gemma4_chat_tokenizer(23);
+        let mut prepared = prepare_chat_from_parts(
+            &mut tokenizer,
+            ModelChatTemplate::Single(GEMMA4_EDGE_FIXTURE.into()),
+            "prepared-embedded-batch-test",
+            &[2],
+            Some(&compiler),
+            ChatTemplateRequest {
+                messages: vec![json!({"role": "user", "content": "lookup"})],
+                tools: vec![production_tool("lookup")],
+                tool_choice: ToolChoice::Required,
+                add_generation_prompt: true,
+                ..ChatTemplateRequest::default()
+            },
+        )
+        .unwrap();
+        prepared.rendered_prompt.clear();
+        let args = serde_json::from_value(json!({
+            "model_type": "qwen3_5_moe",
+            "vocab_size": 8,
+            "hidden_size": 8,
+            "num_hidden_layers": 0,
+            "mtp_num_hidden_layers": 1,
+            "num_attention_heads": 1,
+            "num_key_value_heads": 1,
+            "head_dim": 8,
+            "max_position_embeddings": 16,
+            "intermediate_size": 16,
+            "num_experts": 0,
+            "tie_word_embeddings": true
+        }))
+        .unwrap();
+        let qwen = super::qwen3_5_moe::Model::new(args, None, None, None, stream).unwrap();
+        let mut model = LoadedModel {
+            model: super::Model::Qwen35Moe(qwen),
+            #[cfg(feature = "media-processing")]
+            processor: None,
+            tokenizer,
+            chat_template: None,
+            model_id: "prepared-embedded-batch-test".into(),
+            eos_token_ids: vec![2],
+            constraint_compiler: compiler,
+        };
+
+        let output = model
+            .generate_prepared_chat_embedded_mtp_batch::<DefaultSampler>(
+                PreparedChatEmbeddedMtpBatchRequest {
+                    lanes: Vec::new(),
+                    stream,
+                    scheduler: MtpSchedulerOptions::default(),
+                },
+            )
+            .unwrap();
+
+        assert!(output.requests.is_empty());
+        assert_eq!(output.scheduler.stream_topology, MtpStreamTopology::Single);
+        assert_eq!(output.scheduler.turns, 0);
+
+        let mut wrong_cache = super::ModelCache::KeyValue(Vec::new());
+        let error = model
+            .generate_prepared_chat_embedded_mtp_batch(PreparedChatEmbeddedMtpBatchRequest {
+                lanes: vec![PreparedChatMtpBatchLane {
+                    prepared_chat: &prepared,
+                    cache: &mut wrong_cache,
+                    sampling_policy: DefaultSampler,
+                    settings: PreparedChatGenerationSettings::default(),
+                    max_draft_tokens: std::num::NonZeroUsize::new(2).unwrap(),
+                    caller_stop_sequences: &[],
+                    on_event: Box::new(|_| {}),
+                }],
+                stream,
+                scheduler: MtpSchedulerOptions::default(),
+            })
+            .unwrap_err();
+        assert!(
+            matches!(
+                &error,
+                Error::PreparedChatGeneration(message)
+                    if message.contains("prepared-chat Qwen3.5 embedded MTP cache type mismatch at lane 0")
+            ),
+            "unexpected error: {error:?}"
+        );
     }
 
     #[test]
