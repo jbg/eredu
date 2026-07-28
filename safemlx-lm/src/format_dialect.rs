@@ -6,7 +6,7 @@
 
 #![allow(dead_code)]
 
-use std::{any::Any, fmt};
+use std::{any::Any, collections::BTreeSet, fmt};
 
 use llguidance::api::TopLevelGrammar;
 use serde_json::Value;
@@ -1087,7 +1087,7 @@ enum DeclarativeParserState {
     },
     ToolStart,
     JsonEnvelopeStart,
-    Payload(JsonFragmentBuffer),
+    JsonPayload(IncrementalJsonCall),
     NamedJsonName,
     NamedJsonPayload {
         json: JsonFragmentBuffer,
@@ -1097,7 +1097,7 @@ enum DeclarativeParserState {
         prefix_consumed: bool,
     },
     StructuralPayload {
-        scanner: StructuralObjectScanner,
+        normalizer: StructuralObjectNormalizer,
     },
     AfterPayload,
     AfterEnvelope,
@@ -1173,67 +1173,10 @@ impl DeclarativeParser {
         delimiters
     }
 
-    fn emit_json_call(&self, fragment: &str, sink: &mut SemanticEventSink) -> Result<(), String> {
-        let value: Value = serde_json::from_str(fragment.trim())
-            .map_err(|error| format!("invalid declarative tool-call JSON: {error}"))?;
-        let object = value
-            .as_object()
-            .ok_or_else(|| "declarative tool call must be a JSON object".to_owned())?;
-        let function = self
-            .spec
-            .json_function
-            .expect("JSON payload parser has a function envelope");
-        let name = object
-            .get(function.name_field)
-            .and_then(Value::as_str)
-            .ok_or_else(|| {
-                format!(
-                    "declarative tool call field {:?} must be a string",
-                    function.name_field
-                )
-            })?;
-        let arguments = object.get(function.arguments_field).ok_or_else(|| {
-            format!(
-                "declarative tool call is missing field {:?}",
-                function.arguments_field
-            )
-        })?;
-        let id = match function.call_id {
-            Some(call_id) => {
-                let id = object
-                    .get(call_id.field)
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| {
-                        format!(
-                            "declarative tool call field {:?} must be a string",
-                            call_id.field
-                        )
-                    })?;
-                if call_id
-                    .length
-                    .is_some_and(|length| id.chars().count() != length)
-                {
-                    return Err(format!(
-                        "declarative tool call field {:?} must contain exactly {} characters",
-                        call_id.field,
-                        call_id.length.expect("checked exact call ID length")
-                    ));
-                }
-                id.to_owned()
-            }
-            None => format!("call_{}", sink.next_tool_index()),
-        };
-        sink.start_tool_call(id, name.to_owned());
-        sink.tool_arguments(
-            &serde_json::to_string(arguments).expect("parsed JSON values serialize"),
-        );
-        Ok(())
-    }
-
     fn start_payload_state(&self) -> DeclarativeParserState {
         match self.spec.payload_shape {
             DeclarativePayloadShape::JsonObject | DeclarativePayloadShape::JsonList => {
-                DeclarativeParserState::Payload(JsonFragmentBuffer::default())
+                DeclarativeParserState::JsonPayload(IncrementalJsonCall::default())
             }
             DeclarativePayloadShape::NamedJsonArguments(_) => DeclarativeParserState::NamedJsonName,
             DeclarativePayloadShape::StructuralObject(_) => {
@@ -1471,19 +1414,19 @@ impl DeclarativeParser {
                         self.state = self.start_call_payload_state();
                     }
                 }
-                DeclarativeParserState::Payload(json) => {
+                DeclarativeParserState::JsonPayload(json) => {
                     if self.pending.is_empty() {
                         return Ok(());
                     }
-                    let (consumed, complete) = json
-                        .push(&self.pending)
-                        .map_err(|error| format!("invalid declarative JSON fragment: {error:?}"))?;
+                    let function = self
+                        .spec
+                        .json_function
+                        .expect("JSON payload parser has a function envelope");
+                    let (consumed, complete) = json.push(&self.pending, function, sink)?;
                     self.pending.drain(..consumed);
                     if !complete {
                         return Ok(());
                     }
-                    let fragment = json.fragment().to_owned();
-                    self.emit_json_call(&fragment, sink)?;
                     self.state = DeclarativeParserState::AfterPayload;
                 }
                 DeclarativeParserState::NamedJsonName => {
@@ -1571,25 +1514,16 @@ impl DeclarativeParser {
                     let id = format!("call_{}", sink.next_tool_index());
                     sink.start_tool_call(id, name);
                     self.state = DeclarativeParserState::StructuralPayload {
-                        scanner: StructuralObjectScanner::new(encoding.string_delimiter),
+                        normalizer: StructuralObjectNormalizer::new(encoding.string_delimiter),
                     };
                 }
-                DeclarativeParserState::StructuralPayload { scanner } => {
-                    let Some(consumed) = scanner.scan(&self.pending)? else {
-                        return Ok(());
-                    };
-                    let DeclarativePayloadShape::StructuralObject(encoding) =
-                        self.spec.payload_shape
-                    else {
-                        unreachable!("structural payload requires structural-object encoding");
-                    };
-                    let fragment = self.pending[..consumed].to_owned();
-                    let arguments = parse_structural_object(&fragment, encoding.string_delimiter)?;
-                    sink.tool_arguments(
-                        &serde_json::to_string(&arguments)
-                            .expect("structural JSON values serialize"),
-                    );
+                DeclarativeParserState::StructuralPayload { normalizer } => {
+                    let (consumed, complete) = normalizer.push(&self.pending)?;
                     self.pending.drain(..consumed);
+                    sink.tool_arguments(&normalizer.take_delta());
+                    if !complete {
+                        return Ok(());
+                    }
                     self.state = DeclarativeParserState::AfterPayload;
                 }
                 DeclarativeParserState::AfterPayload => match self.spec.payload_shape {
@@ -1696,225 +1630,663 @@ impl DeclarativeParser {
     }
 }
 
-#[derive(Debug)]
-struct StructuralObjectScanner {
-    string_delimiter: &'static str,
-    scan_index: usize,
-    depth: usize,
-    in_string: bool,
+/// Incrementally recognizes the semantic fields of one declarative JSON call.
+///
+/// Argument bytes remain in their original JSON spelling so they can be
+/// forwarded as soon as the name and optional protocol call ID are known.
+#[derive(Debug, Default)]
+struct IncrementalJsonCall {
+    phase: JsonCallPhase,
+    fragment: String,
+    fields: BTreeSet<String>,
+    name: Option<String>,
+    id: Option<String>,
+    arguments: String,
+    arguments_seen: bool,
+    arguments_emitted: usize,
     started: bool,
+    complete: bool,
 }
 
-impl StructuralObjectScanner {
-    fn new(string_delimiter: &'static str) -> Self {
-        Self {
-            string_delimiter,
-            scan_index: 0,
-            depth: 0,
-            in_string: false,
-            started: false,
-        }
+#[derive(Debug, Default)]
+enum JsonCallPhase {
+    #[default]
+    Start,
+    KeyOrEnd {
+        allow_end: bool,
+    },
+    Key {
+        raw: String,
+        escaped: bool,
+    },
+    Colon {
+        key: String,
+    },
+    ValueStart {
+        key: String,
+    },
+    Value {
+        key: String,
+        value: JsonValueAccumulator,
+    },
+    AfterValue,
+}
+
+#[derive(Debug)]
+struct JsonValueAccumulator {
+    raw: String,
+    kind: JsonValueKind,
+}
+
+#[derive(Debug)]
+enum JsonValueKind {
+    Container {
+        depth: usize,
+        in_string: bool,
+        escaped: bool,
+    },
+    String {
+        escaped: bool,
+    },
+    Scalar,
+}
+
+enum JsonValuePush {
+    Consumed { complete: bool },
+    Boundary,
+}
+
+impl JsonValueAccumulator {
+    fn new(character: char) -> Result<Self, String> {
+        let kind = match character {
+            '{' | '[' => JsonValueKind::Container {
+                depth: 1,
+                in_string: false,
+                escaped: false,
+            },
+            '"' => JsonValueKind::String { escaped: false },
+            ',' | '}' | ']' => {
+                return Err("declarative JSON field is missing a value".into());
+            }
+            _ => JsonValueKind::Scalar,
+        };
+        Ok(Self {
+            raw: character.to_string(),
+            kind,
+        })
     }
 
-    fn scan(&mut self, input: &str) -> Result<Option<usize>, String> {
-        while self.scan_index < input.len() {
-            let remaining = &input[self.scan_index..];
-            if remaining.starts_with(self.string_delimiter) {
-                self.in_string = !self.in_string;
-                self.scan_index += self.string_delimiter.len();
-                continue;
+    fn push(&mut self, character: char) -> JsonValuePush {
+        match &mut self.kind {
+            JsonValueKind::Container {
+                depth,
+                in_string,
+                escaped,
+            } => {
+                self.raw.push(character);
+                if *in_string {
+                    if *escaped {
+                        *escaped = false;
+                    } else if character == '\\' {
+                        *escaped = true;
+                    } else if character == '"' {
+                        *in_string = false;
+                    }
+                } else {
+                    match character {
+                        '"' => *in_string = true,
+                        '{' | '[' => *depth += 1,
+                        '}' | ']' => *depth -= 1,
+                        _ => {}
+                    }
+                }
+                JsonValuePush::Consumed {
+                    complete: *depth == 0,
+                }
             }
-            if self.string_delimiter.starts_with(remaining) {
-                return Ok(None);
+            JsonValueKind::String { escaped } => {
+                self.raw.push(character);
+                let complete = if *escaped {
+                    *escaped = false;
+                    false
+                } else if character == '\\' {
+                    *escaped = true;
+                    false
+                } else {
+                    character == '"'
+                };
+                JsonValuePush::Consumed { complete }
             }
-            let character = remaining
+            JsonValueKind::Scalar => {
+                if character.is_whitespace() || matches!(character, ',' | '}' | ']') {
+                    JsonValuePush::Boundary
+                } else {
+                    self.raw.push(character);
+                    JsonValuePush::Consumed { complete: false }
+                }
+            }
+        }
+    }
+}
+
+impl IncrementalJsonCall {
+    fn push(
+        &mut self,
+        input: &str,
+        function: &JsonFunctionEnvelope,
+        sink: &mut SemanticEventSink,
+    ) -> Result<(usize, bool), String> {
+        let mut consumed = 0;
+        while consumed < input.len() && !self.complete {
+            let character = input[consumed..]
                 .chars()
                 .next()
-                .expect("scan index is before input end");
+                .expect("consumed index is before input end");
             let length = character.len_utf8();
-            if !self.started {
-                if character.is_whitespace() {
-                    self.scan_index += length;
-                    continue;
-                }
-                if character != '{' {
-                    return Err("declarative structural arguments must begin with an object".into());
-                }
-                self.started = true;
-                self.depth = 1;
-                self.scan_index += length;
-                continue;
-            }
-            if !self.in_string {
-                match character {
-                    '{' | '[' => self.depth += 1,
-                    '}' | ']' => {
-                        self.depth = self.depth.checked_sub(1).ok_or_else(|| {
-                            "declarative structural object has an unmatched closing delimiter"
-                                .to_owned()
-                        })?;
-                        self.scan_index += length;
-                        if self.depth == 0 {
-                            return Ok(Some(self.scan_index));
-                        }
-                        continue;
+            match &mut self.phase {
+                JsonCallPhase::Start => {
+                    if !character.is_whitespace() && character != '{' {
+                        return Err("declarative tool call must be a JSON object".into());
                     }
-                    _ => {}
+                    self.fragment.push(character);
+                    consumed += length;
+                    if character == '{' {
+                        self.phase = JsonCallPhase::KeyOrEnd { allow_end: true };
+                    }
+                }
+                JsonCallPhase::KeyOrEnd { allow_end } => {
+                    if character.is_whitespace() {
+                        self.fragment.push(character);
+                        consumed += length;
+                    } else if character == '"' {
+                        self.fragment.push(character);
+                        consumed += length;
+                        self.phase = JsonCallPhase::Key {
+                            raw: "\"".into(),
+                            escaped: false,
+                        };
+                    } else if character == '}' && *allow_end {
+                        self.fragment.push(character);
+                        consumed += length;
+                        self.complete = true;
+                    } else {
+                        return Err("declarative tool-call JSON expected an object field".into());
+                    }
+                }
+                JsonCallPhase::Key { raw, escaped } => {
+                    self.fragment.push(character);
+                    raw.push(character);
+                    consumed += length;
+                    if *escaped {
+                        *escaped = false;
+                    } else if character == '\\' {
+                        *escaped = true;
+                    } else if character == '"' {
+                        let key: String = serde_json::from_str(raw).map_err(|error| {
+                            format!("invalid declarative tool-call field name: {error}")
+                        })?;
+                        if !self.fields.insert(key.clone()) {
+                            return Err(format!(
+                                "declarative tool call contains duplicate field {key:?}"
+                            ));
+                        }
+                        self.phase = JsonCallPhase::Colon { key };
+                    }
+                }
+                JsonCallPhase::Colon { key } => {
+                    if character.is_whitespace() {
+                        self.fragment.push(character);
+                        consumed += length;
+                    } else if character == ':' {
+                        self.fragment.push(character);
+                        consumed += length;
+                        self.phase = JsonCallPhase::ValueStart {
+                            key: std::mem::take(key),
+                        };
+                    } else {
+                        return Err("declarative tool-call JSON expected ':' after a field".into());
+                    }
+                }
+                JsonCallPhase::ValueStart { key } => {
+                    if character.is_whitespace() {
+                        self.fragment.push(character);
+                        consumed += length;
+                    } else {
+                        let value = JsonValueAccumulator::new(character)?;
+                        self.fragment.push(character);
+                        consumed += length;
+                        self.phase = JsonCallPhase::Value {
+                            key: std::mem::take(key),
+                            value,
+                        };
+                    }
+                }
+                JsonCallPhase::Value { .. } => {
+                    let result = {
+                        let JsonCallPhase::Value { value, .. } = &mut self.phase else {
+                            unreachable!()
+                        };
+                        value.push(character)
+                    };
+                    match result {
+                        JsonValuePush::Consumed { complete } => {
+                            self.fragment.push(character);
+                            consumed += length;
+                            if complete {
+                                self.finish_field(function)?;
+                            }
+                        }
+                        JsonValuePush::Boundary => self.finish_field(function)?,
+                    }
+                }
+                JsonCallPhase::AfterValue => {
+                    if character.is_whitespace() {
+                        self.fragment.push(character);
+                        consumed += length;
+                    } else if character == ',' {
+                        self.fragment.push(character);
+                        consumed += length;
+                        self.phase = JsonCallPhase::KeyOrEnd { allow_end: false };
+                    } else if character == '}' {
+                        self.fragment.push(character);
+                        consumed += length;
+                        self.complete = true;
+                    } else {
+                        return Err(
+                            "declarative tool-call JSON expected ',' or '}' after a field".into(),
+                        );
+                    }
                 }
             }
-            self.scan_index += length;
         }
-        Ok(None)
-    }
-}
 
-fn parse_structural_object(input: &str, string_delimiter: &str) -> Result<Value, String> {
-    let mut parser = StructuralValueParser {
-        input,
-        position: 0,
-        string_delimiter,
-    };
-    let value = parser.parse_value()?;
-    parser.skip_whitespace();
-    if parser.position != input.len() {
-        return Err("declarative structural object contains trailing data".into());
-    }
-    if !value.is_object() {
-        return Err("declarative structural arguments must be an object".into());
-    }
-    Ok(value)
-}
-
-struct StructuralValueParser<'a> {
-    input: &'a str,
-    position: usize,
-    string_delimiter: &'a str,
-}
-
-impl StructuralValueParser<'_> {
-    fn remaining(&self) -> &str {
-        &self.input[self.position..]
-    }
-
-    fn skip_whitespace(&mut self) {
-        while let Some(character) = self.remaining().chars().next() {
-            if !character.is_whitespace() {
-                break;
+        self.maybe_start(function, sink)?;
+        if self.started {
+            let visible_arguments = match &self.phase {
+                JsonCallPhase::Value { key, value } if key == function.arguments_field => {
+                    value.raw.as_str()
+                }
+                _ => self.arguments.as_str(),
+            };
+            if visible_arguments.len() > self.arguments_emitted {
+                sink.tool_arguments(&visible_arguments[self.arguments_emitted..]);
+                self.arguments_emitted = visible_arguments.len();
             }
-            self.position += character.len_utf8();
         }
+        if self.complete {
+            self.validate_complete(function)?;
+        }
+        Ok((consumed, self.complete))
     }
 
-    fn consume(&mut self, expected: &str) -> Result<(), String> {
-        self.skip_whitespace();
-        if !self.remaining().starts_with(expected) {
-            return Err(format!(
-                "expected structural JSON delimiter {expected:?} at byte {}",
-                self.position
-            ));
+    fn finish_field(&mut self, function: &JsonFunctionEnvelope) -> Result<(), String> {
+        let phase = std::mem::replace(&mut self.phase, JsonCallPhase::AfterValue);
+        let JsonCallPhase::Value { key, value } = phase else {
+            unreachable!("only a JSON value can finish a field");
+        };
+        let parsed: Value = serde_json::from_str(&value.raw).map_err(|error| {
+            format!("invalid declarative tool-call JSON field {key:?}: {error}")
+        })?;
+        if key == function.name_field {
+            self.name = Some(parsed.as_str().map(str::to_owned).ok_or_else(|| {
+                format!(
+                    "declarative tool call field {:?} must be a string",
+                    function.name_field
+                )
+            })?);
+        } else if key == function.arguments_field {
+            if !parsed.is_object() {
+                return Err(format!(
+                    "declarative tool call field {:?} must be an object",
+                    function.arguments_field
+                ));
+            }
+            self.arguments = value.raw;
+            self.arguments_seen = true;
+        } else if function.call_id.is_some_and(|call_id| key == call_id.field) {
+            let call_id = function.call_id.expect("checked call ID field");
+            let id = parsed.as_str().ok_or_else(|| {
+                format!(
+                    "declarative tool call field {:?} must be a string",
+                    call_id.field
+                )
+            })?;
+            if call_id
+                .length
+                .is_some_and(|length| id.chars().count() != length)
+            {
+                return Err(format!(
+                    "declarative tool call field {:?} must contain exactly {} characters",
+                    call_id.field,
+                    call_id.length.expect("checked exact call ID length")
+                ));
+            }
+            self.id = Some(id.to_owned());
         }
-        self.position += expected.len();
         Ok(())
     }
 
-    fn parse_value(&mut self) -> Result<Value, String> {
-        self.skip_whitespace();
-        if self.remaining().starts_with(self.string_delimiter) {
-            return self.parse_string().map(Value::String);
+    fn maybe_start(
+        &mut self,
+        function: &JsonFunctionEnvelope,
+        sink: &mut SemanticEventSink,
+    ) -> Result<(), String> {
+        if self.started {
+            return Ok(());
         }
-        match self.remaining().chars().next() {
-            Some('{') => self.parse_object(),
-            Some('[') => self.parse_array(),
-            Some(_) => self.parse_scalar(),
-            None => Err("structural JSON value ended unexpectedly".into()),
-        }
-    }
-
-    fn parse_string(&mut self) -> Result<String, String> {
-        self.consume(self.string_delimiter)?;
-        let Some(length) = self.remaining().find(self.string_delimiter) else {
-            return Err("unterminated structural JSON string".into());
+        let Some(name) = self.name.clone() else {
+            return Ok(());
         };
-        let value = self.remaining()[..length].to_owned();
-        self.position += length + self.string_delimiter.len();
-        Ok(value)
+        let id = if function.call_id.is_some() {
+            let Some(id) = self.id.clone() else {
+                return Ok(());
+            };
+            id
+        } else {
+            format!("call_{}", sink.next_tool_index())
+        };
+        sink.start_tool_call(id, name);
+        self.started = true;
+        Ok(())
     }
 
-    fn parse_object(&mut self) -> Result<Value, String> {
-        self.consume("{")?;
-        let mut object = serde_json::Map::new();
-        self.skip_whitespace();
-        if self.remaining().starts_with('}') {
-            self.position += 1;
-            return Ok(Value::Object(object));
+    fn validate_complete(&self, function: &JsonFunctionEnvelope) -> Result<(), String> {
+        let value: Value = serde_json::from_str(self.fragment.trim())
+            .map_err(|error| format!("invalid declarative tool-call JSON: {error}"))?;
+        if !value.is_object() {
+            return Err("declarative tool call must be a JSON object".into());
         }
-        loop {
-            self.skip_whitespace();
-            let Some(colon) = self.remaining().find(':') else {
-                return Err("structural JSON object key is missing a colon".into());
-            };
-            let key = self.remaining()[..colon].trim();
-            if key.is_empty()
-                || key
-                    .chars()
-                    .any(|character| matches!(character, '{' | '}' | '[' | ']' | ','))
-            {
-                return Err("structural JSON object key is invalid".into());
-            }
-            let key = key.to_owned();
-            self.position += colon + 1;
-            let value = self.parse_value()?;
-            if object.insert(key.clone(), value).is_some() {
+        if self.name.is_none() {
+            return Err(format!(
+                "declarative tool call field {:?} must be a string",
+                function.name_field
+            ));
+        }
+        if !self.arguments_seen {
+            return Err(format!(
+                "declarative tool call is missing field {:?}",
+                function.arguments_field
+            ));
+        }
+        if let Some(call_id) = function.call_id {
+            if self.id.is_none() {
                 return Err(format!(
-                    "structural JSON object contains duplicate key {key:?}"
+                    "declarative tool call field {:?} must be a string",
+                    call_id.field
                 ));
             }
-            self.skip_whitespace();
-            if self.remaining().starts_with('}') {
-                self.position += 1;
-                return Ok(Value::Object(object));
-            }
-            self.consume(",")?;
+        }
+        Ok(())
+    }
+}
+
+/// Converts the structural-object surface syntax to JSON as it is consumed.
+#[derive(Debug)]
+struct StructuralObjectNormalizer {
+    string_delimiter: &'static str,
+    phase: StructuralPhase,
+    containers: Vec<StructuralContainer>,
+    normalized: String,
+    emitted: usize,
+    complete: bool,
+}
+
+#[derive(Debug)]
+enum StructuralPhase {
+    Start,
+    ObjectKey { key: String, allow_end: bool },
+    Value { allow_array_end: bool },
+    String,
+    Scalar { raw: String },
+    AfterValue,
+}
+
+#[derive(Debug)]
+enum StructuralContainer {
+    Object { keys: BTreeSet<String> },
+    Array,
+}
+
+impl StructuralObjectNormalizer {
+    fn new(string_delimiter: &'static str) -> Self {
+        debug_assert!(!string_delimiter.is_empty());
+        Self {
+            string_delimiter,
+            phase: StructuralPhase::Start,
+            containers: Vec::new(),
+            normalized: String::new(),
+            emitted: 0,
+            complete: false,
         }
     }
 
-    fn parse_array(&mut self) -> Result<Value, String> {
-        self.consume("[")?;
-        let mut values = Vec::new();
-        self.skip_whitespace();
-        if self.remaining().starts_with(']') {
-            self.position += 1;
-            return Ok(Value::Array(values));
-        }
-        loop {
-            values.push(self.parse_value()?);
-            self.skip_whitespace();
-            if self.remaining().starts_with(']') {
-                self.position += 1;
-                return Ok(Value::Array(values));
+    fn push(&mut self, input: &str) -> Result<(usize, bool), String> {
+        let mut consumed = 0;
+        while consumed < input.len() && !self.complete {
+            let remaining = &input[consumed..];
+            let character = remaining
+                .chars()
+                .next()
+                .expect("consumed index is before input end");
+            let length = character.len_utf8();
+            match &mut self.phase {
+                StructuralPhase::Start => {
+                    if character.is_whitespace() {
+                        consumed += length;
+                    } else if character == '{' {
+                        consumed += length;
+                        self.normalized.push('{');
+                        self.containers.push(StructuralContainer::Object {
+                            keys: BTreeSet::new(),
+                        });
+                        self.phase = StructuralPhase::ObjectKey {
+                            key: String::new(),
+                            allow_end: true,
+                        };
+                    } else {
+                        return Err(
+                            "declarative structural arguments must begin with an object".into()
+                        );
+                    }
+                }
+                StructuralPhase::ObjectKey { key, allow_end } => {
+                    if character == '}' && key.trim().is_empty() && *allow_end {
+                        consumed += length;
+                        self.normalized.push('}');
+                        self.close_container(StructuralContainerKind::Object)?;
+                    } else if character == '}' {
+                        return Err(
+                            "structural JSON object cannot end after a field separator".into()
+                        );
+                    } else if character == ':' {
+                        let key_name = key.trim();
+                        if key_name.is_empty()
+                            || key_name
+                                .chars()
+                                .any(|character| matches!(character, '{' | '}' | '[' | ']' | ','))
+                        {
+                            return Err("structural JSON object key is invalid".into());
+                        }
+                        let key_name = key_name.to_owned();
+                        let Some(StructuralContainer::Object { keys }) = self.containers.last_mut()
+                        else {
+                            return Err("structural JSON key appeared outside an object".into());
+                        };
+                        if !keys.insert(key_name.clone()) {
+                            return Err(format!(
+                                "structural JSON object contains duplicate key {key_name:?}"
+                            ));
+                        }
+                        self.normalized.push_str(
+                            &serde_json::to_string(&key_name)
+                                .expect("structural object keys serialize"),
+                        );
+                        self.normalized.push(':');
+                        consumed += length;
+                        self.phase = StructuralPhase::Value {
+                            allow_array_end: false,
+                        };
+                    } else {
+                        key.push(character);
+                        consumed += length;
+                    }
+                }
+                StructuralPhase::Value { allow_array_end } => {
+                    if character.is_whitespace() {
+                        consumed += length;
+                    } else if character == ']' && *allow_array_end {
+                        consumed += length;
+                        self.normalized.push(']');
+                        self.close_container(StructuralContainerKind::Array)?;
+                    } else if character == '{' {
+                        consumed += length;
+                        self.normalized.push('{');
+                        self.containers.push(StructuralContainer::Object {
+                            keys: BTreeSet::new(),
+                        });
+                        self.phase = StructuralPhase::ObjectKey {
+                            key: String::new(),
+                            allow_end: true,
+                        };
+                    } else if character == '[' {
+                        consumed += length;
+                        self.normalized.push('[');
+                        self.containers.push(StructuralContainer::Array);
+                        self.phase = StructuralPhase::Value {
+                            allow_array_end: true,
+                        };
+                    } else if remaining.starts_with(self.string_delimiter) {
+                        consumed += self.string_delimiter.len();
+                        self.normalized.push('"');
+                        self.phase = StructuralPhase::String;
+                    } else if self.string_delimiter.starts_with(remaining) {
+                        break;
+                    } else if matches!(character, ',' | '}' | ']') {
+                        return Err("structural JSON value is missing".into());
+                    } else {
+                        consumed += length;
+                        self.normalized.push(character);
+                        self.phase = StructuralPhase::Scalar {
+                            raw: character.to_string(),
+                        };
+                    }
+                }
+                StructuralPhase::String => {
+                    if remaining.starts_with(self.string_delimiter) {
+                        consumed += self.string_delimiter.len();
+                        self.normalized.push('"');
+                        self.phase = StructuralPhase::AfterValue;
+                    } else if self.string_delimiter.starts_with(remaining) {
+                        break;
+                    } else {
+                        consumed += length;
+                        let encoded = serde_json::to_string(&character.to_string())
+                            .expect("one Unicode scalar serializes");
+                        self.normalized.push_str(&encoded[1..encoded.len() - 1]);
+                    }
+                }
+                StructuralPhase::Scalar { raw } => {
+                    if character.is_whitespace() || matches!(character, ',' | '}' | ']') {
+                        let value: Value = serde_json::from_str(raw).map_err(|error| {
+                            format!("invalid structural JSON scalar {raw:?}: {error}")
+                        })?;
+                        if value.is_string() || value.is_array() || value.is_object() {
+                            return Err(
+                                "structural JSON scalar must be null, boolean, or numeric".into()
+                            );
+                        }
+                        self.phase = StructuralPhase::AfterValue;
+                    } else {
+                        consumed += length;
+                        raw.push(character);
+                        self.normalized.push(character);
+                    }
+                }
+                StructuralPhase::AfterValue => {
+                    if character.is_whitespace() {
+                        consumed += length;
+                        continue;
+                    }
+                    match self.containers.last() {
+                        Some(StructuralContainer::Object { .. }) if character == ',' => {
+                            consumed += length;
+                            self.normalized.push(',');
+                            self.phase = StructuralPhase::ObjectKey {
+                                key: String::new(),
+                                allow_end: false,
+                            };
+                        }
+                        Some(StructuralContainer::Object { .. }) if character == '}' => {
+                            consumed += length;
+                            self.normalized.push('}');
+                            self.close_container(StructuralContainerKind::Object)?;
+                        }
+                        Some(StructuralContainer::Array) if character == ',' => {
+                            consumed += length;
+                            self.normalized.push(',');
+                            self.phase = StructuralPhase::Value {
+                                allow_array_end: false,
+                            };
+                        }
+                        Some(StructuralContainer::Array) if character == ']' => {
+                            consumed += length;
+                            self.normalized.push(']');
+                            self.close_container(StructuralContainerKind::Array)?;
+                        }
+                        Some(StructuralContainer::Object { .. }) => {
+                            return Err("structural JSON object expected ',' or '}'".into());
+                        }
+                        Some(StructuralContainer::Array) => {
+                            return Err("structural JSON array expected ',' or ']'".into());
+                        }
+                        None => {
+                            return Err("structural JSON contains trailing data".into());
+                        }
+                    }
+                }
             }
-            self.consume(",")?;
         }
+        if self.complete {
+            let value: Value = serde_json::from_str(&self.normalized)
+                .map_err(|error| format!("invalid normalized structural JSON: {error}"))?;
+            if !value.is_object() {
+                return Err("declarative structural arguments must be an object".into());
+            }
+        }
+        Ok((consumed, self.complete))
     }
 
-    fn parse_scalar(&mut self) -> Result<Value, String> {
-        self.skip_whitespace();
-        let length = self
-            .remaining()
-            .find([',', '}', ']'])
-            .unwrap_or(self.remaining().len());
-        let scalar = self.remaining()[..length].trim();
-        if scalar.is_empty() {
-            return Err("structural JSON scalar is empty".into());
+    fn close_container(&mut self, expected: StructuralContainerKind) -> Result<(), String> {
+        let container = self
+            .containers
+            .pop()
+            .ok_or_else(|| "structural JSON has an unmatched closing delimiter".to_owned())?;
+        let actual = match container {
+            StructuralContainer::Object { .. } => StructuralContainerKind::Object,
+            StructuralContainer::Array => StructuralContainerKind::Array,
+        };
+        if actual != expected {
+            return Err("structural JSON has a mismatched closing delimiter".into());
         }
-        let value: Value = serde_json::from_str(scalar)
-            .map_err(|error| format!("invalid structural JSON scalar {scalar:?}: {error}"))?;
-        if value.is_string() || value.is_array() || value.is_object() {
-            return Err("structural JSON scalar must be null, boolean, or numeric".into());
+        if self.containers.is_empty() {
+            self.complete = true;
+        } else {
+            self.phase = StructuralPhase::AfterValue;
         }
-        self.position += length;
-        Ok(value)
+        Ok(())
     }
+
+    fn take_delta(&mut self) -> String {
+        let delta = self.normalized[self.emitted..].to_owned();
+        self.emitted = self.normalized.len();
+        delta
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StructuralContainerKind {
+    Object,
+    Array,
 }
 
 impl ProtocolParser for DeclarativeParser {
@@ -2288,15 +2660,47 @@ mod tests {
     }
 
     fn arguments(events: &[SemanticEvent]) -> Vec<String> {
-        events
-            .iter()
-            .filter_map(|event| match event {
-                SemanticEvent::ToolArgumentsDelta { json_fragment, .. } => {
-                    Some(json_fragment.clone())
+        let mut arguments = Vec::<String>::new();
+        for event in events {
+            match event {
+                SemanticEvent::ToolCallStart { index, .. } => {
+                    assert_eq!(*index, arguments.len());
+                    arguments.push(String::new());
                 }
-                _ => None,
-            })
-            .collect()
+                SemanticEvent::ToolArgumentsDelta {
+                    index,
+                    json_fragment,
+                } => arguments[*index].push_str(json_fragment),
+                _ => {}
+            }
+        }
+        arguments
+    }
+
+    fn coalesce_argument_deltas(
+        events: impl IntoIterator<Item = SemanticEvent>,
+    ) -> Vec<SemanticEvent> {
+        let mut coalesced = Vec::new();
+        for event in events {
+            if let SemanticEvent::ToolArgumentsDelta {
+                index,
+                json_fragment,
+            } = &event
+            {
+                if let Some(SemanticEvent::ToolArgumentsDelta {
+                    index: previous_index,
+                    json_fragment: previous_fragment,
+                }) = coalesced.last_mut()
+                {
+                    if previous_index == index {
+                        previous_fragment.push_str(json_fragment);
+                        continue;
+                    }
+                }
+            }
+            coalesced.push(event);
+        }
+        coalesced
     }
 
     fn push_at_byte_split(
@@ -2507,12 +2911,13 @@ mod tests {
                 "Need 🦀 context",
                 "split {split}"
             );
-            let protocol_events = parser
-                .events()
-                .iter()
-                .filter(|event| !matches!(event, SemanticEvent::ReasoningDelta(_)))
-                .cloned()
-                .collect::<Vec<_>>();
+            let protocol_events = coalesce_argument_deltas(
+                parser
+                    .events()
+                    .iter()
+                    .filter(|event| !matches!(event, SemanticEvent::ReasoningDelta(_)))
+                    .cloned(),
+            );
             assert_eq!(
                 protocol_events,
                 [
@@ -2663,6 +3068,110 @@ mod tests {
                 "split {split}"
             );
         }
+    }
+
+    #[test]
+    fn declarative_json_objects_emit_start_and_argument_prefix_before_call_end() {
+        let mut parser = DECLARATIVE_DIALECT
+            .incremental_parser_state(DialectParameters::Declarative(&DECLARATIVE_OBJECT_SPEC))
+            .unwrap();
+        let mut sink = SemanticEventSink::default();
+
+        parser
+            .push(
+                r#"<tools><call>{"function":"first","input":{"value":"#,
+                &mut sink,
+            )
+            .unwrap();
+        assert_eq!(
+            sink.events(),
+            &[
+                SemanticEvent::ToolCallStart {
+                    index: 0,
+                    id: "call_0".into(),
+                    name: "first".into(),
+                },
+                SemanticEvent::ToolArgumentsDelta {
+                    index: 0,
+                    json_fragment: r#"{"value":"#.into(),
+                },
+            ]
+        );
+
+        parser.push(r#"7}}</call></tools>"#, &mut sink).unwrap();
+        assert_eq!(arguments(sink.events()), [r#"{"value":7}"#]);
+        assert!(sink.events().contains(&SemanticEvent::ToolCallEnd));
+    }
+
+    #[test]
+    fn declarative_json_lists_stream_when_call_id_precedes_arguments() {
+        let mut parser = DECLARATIVE_DIALECT
+            .incremental_parser_state(DialectParameters::Declarative(&MARKER_JSON_LIST_SPEC))
+            .unwrap();
+        let mut sink = SemanticEventSink::default();
+
+        parser
+            .push(
+                r#"[TOOL_CALLS] [{"name":"lookup","id":"abc123456","arguments":{"value":"#,
+                &mut sink,
+            )
+            .unwrap();
+        assert_eq!(
+            sink.events(),
+            &[
+                SemanticEvent::ToolCallStart {
+                    index: 0,
+                    id: "abc123456".into(),
+                    name: "lookup".into(),
+                },
+                SemanticEvent::ToolArgumentsDelta {
+                    index: 0,
+                    json_fragment: r#"{"value":"#.into(),
+                },
+            ]
+        );
+
+        parser.push("7}}]", &mut sink).unwrap();
+        assert_eq!(arguments(sink.events()), [r#"{"value":7}"#]);
+        assert!(sink.events().contains(&SemanticEvent::ToolCallEnd));
+    }
+
+    #[test]
+    fn structural_objects_normalize_and_stream_before_call_end() {
+        let mut parser = DECLARATIVE_DIALECT
+            .incremental_parser_state(DialectParameters::Declarative(
+                &STRUCTURAL_CHANNEL_OBJECT_SPEC,
+            ))
+            .unwrap();
+        let mut sink = SemanticEventSink::default();
+
+        parser
+            .push(
+                "<|tool_call>call:lookup-place{count:2,place:<|\"|>Bog",
+                &mut sink,
+            )
+            .unwrap();
+        assert_eq!(
+            sink.events(),
+            &[
+                SemanticEvent::ToolCallStart {
+                    index: 0,
+                    id: "call_0".into(),
+                    name: "lookup-place".into(),
+                },
+                SemanticEvent::ToolArgumentsDelta {
+                    index: 0,
+                    json_fragment: r#"{"count":2,"place":"Bog"#.into(),
+                },
+            ]
+        );
+
+        parser.push("otá<|\"|>}<tool_call|>", &mut sink).unwrap();
+        assert_eq!(
+            arguments(sink.events()),
+            [r#"{"count":2,"place":"Bogotá"}"#]
+        );
+        assert!(sink.events().contains(&SemanticEvent::ToolCallEnd));
     }
 
     #[test]

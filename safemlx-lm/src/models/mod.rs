@@ -5383,15 +5383,21 @@ mod tests {
     }
 
     fn tool_argument_events(events: &[SemanticEvent]) -> Vec<String> {
-        events
-            .iter()
-            .filter_map(|event| match event {
-                SemanticEvent::ToolArgumentsDelta { json_fragment, .. } => {
-                    Some(json_fragment.clone())
+        let mut arguments = Vec::<String>::new();
+        for event in events {
+            match event {
+                SemanticEvent::ToolCallStart { index, .. } => {
+                    assert_eq!(*index, arguments.len());
+                    arguments.push(String::new());
                 }
-                _ => None,
-            })
-            .collect()
+                SemanticEvent::ToolArgumentsDelta {
+                    index,
+                    json_fragment,
+                } => arguments[*index].push_str(json_fragment),
+                _ => {}
+            }
+        }
+        arguments
     }
 
     #[test]
@@ -7478,12 +7484,7 @@ mod tests {
                 id: "call_0".into(),
                 name: "lookup".into(),
             }));
-            assert!(parser
-                .events()
-                .contains(&SemanticEvent::ToolArgumentsDelta {
-                    index: 0,
-                    json_fragment: r#"{"value":7}"#.into(),
-                }));
+            assert_eq!(tool_argument_events(parser.events()), [r#"{"value":7}"#]);
             assert_eq!(
                 parser
                     .events()
