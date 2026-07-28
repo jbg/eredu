@@ -26,7 +26,6 @@ use serde_json::Value;
 use tokenizers::Tokenizer;
 
 use crate::{
-    cache::{ConcatKeyValueCache, KeyValueCache},
     error::Error,
     models::{
         common::{
@@ -40,13 +39,14 @@ use crate::{
         },
         input,
     },
-    quantization::{AffineQuantization, WeightQuantization},
-    utils::{create_attention_mask, AttentionMask},
-    weights::{
+    runtime::cache::{ConcatKeyValueCache, KeyValueCache},
+    runtime::checkpoint::load::{
         gguf_metadata, gguf_quantization_configs, load_gguf_strict,
         load_safetensors_dir_strict_with_split_relu2_experts, transform_split_relu2_experts,
         GgufTensorNames, StrictLoadConfig, StrictLoadReport,
     },
+    runtime::checkpoint::quantization::{AffineQuantization, WeightQuantization},
+    utils::{create_attention_mask, AttentionMask},
 };
 
 /// Layer block kind encoded by `hybrid_override_pattern`.
@@ -2442,7 +2442,11 @@ fn gguf_affine_quantization(
     scales_shape: &[i32],
     weight_name: &str,
 ) -> Result<AffineQuantization, Error> {
-    crate::quantization::gguf_affine_quantization(weight_shape, scales_shape, weight_name)
+    crate::runtime::checkpoint::quantization::gguf_affine_quantization(
+        weight_shape,
+        scales_shape,
+        weight_name,
+    )
 }
 
 fn expand_layer_values(
@@ -2881,10 +2885,10 @@ mod tests {
         rewrite_nemotron_h_weight_key, translate_gguf_weight_name, unique_nonzero_layer_value,
         validate_model_config_value, LayerBlockType, Model, ModelArgs, SparseMoeBlock,
     };
-    use crate::weights::{StrictLoadConfig, StrictLoadReport};
+    use crate::runtime::checkpoint::load::{StrictLoadConfig, StrictLoadReport};
     use crate::{
         models::common::{generation::CausalLm, moe::TopKRouterScoreFunction},
-        quantization::AffineQuantization,
+        runtime::checkpoint::quantization::AffineQuantization,
     };
     use safemlx::{module::ModuleParameters, ops::indexing::TryIndexOp, Array, ExecutionContext};
     use serde_json::json;

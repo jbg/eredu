@@ -26,12 +26,12 @@ use crate::{
         gemma4::{self, Gemma4Embedding, LayerType, ModelArgs, TransformerBlock},
         ModelLoadOptions,
     },
-    quantization::WeightQuantization,
-    utils::rope::FloatOrString,
-    weights::{
+    runtime::checkpoint::load::{
         gguf_affine_configs, gguf_metadata, load_gguf_strict, load_safetensors_quantized_strict,
         load_safetensors_strict, GgufTensorNames, StrictLoadConfig, StrictLoadReport,
     },
+    runtime::checkpoint::quantization::WeightQuantization,
+    utils::rope::FloatOrString,
 };
 
 #[derive(Debug, Clone, Deserialize)]
@@ -378,7 +378,7 @@ impl Gemma4AssistantDraftModel {
                 crate::models::gemma4::AttentionInput {
                     x: &h,
                     mask: mask.as_ref(),
-                    cache: None::<&mut crate::cache::ConcatKeyValueCache>,
+                    cache: None::<&mut crate::runtime::cache::ConcatKeyValueCache>,
                     position_offset: query_offset,
                     per_layer_input: None,
                     shared_kv: Some(&mut kv_map),
@@ -461,7 +461,7 @@ pub(crate) fn load_gemma4_assistant_model_with_options(
                 "Gemma 4 assistant affine quantization does not support ordered masked embeddings because that head indexes raw dense embedding rows".into(),
             ));
         }
-        let quantize = crate::quantization::should_quantize_on_load(
+        let quantize = crate::runtime::checkpoint::quantization::should_quantize_on_load(
             "Gemma 4 assistant",
             config.quantization,
             quantization,
@@ -543,7 +543,7 @@ pub(crate) fn load_gemma4_assistant_gguf_with_options(
 ) -> Result<Gemma4AssistantDraftModel, Error> {
     if !matches!(
         options.weight_residency,
-        crate::layerwise::WeightResidency::FullyResident
+        crate::runtime::execution::layerwise::WeightResidency::FullyResident
     ) {
         return Err(Error::UnsupportedArchitecture(
             "Gemma 4 assistant GGUF loading supports fully resident weights only".into(),
@@ -902,7 +902,7 @@ mod tests {
 
     use crate::{
         models::ModelLoadOptions,
-        quantization::{AffineQuantization, WeightQuantization},
+        runtime::checkpoint::quantization::{AffineQuantization, WeightQuantization},
     };
 
     const CONFIG: &str = r#"{

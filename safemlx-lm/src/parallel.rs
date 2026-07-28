@@ -18,8 +18,8 @@ use safemlx::{
 
 use crate::{
     error::Error,
-    weight_store::{SafetensorsWeightStore, TensorSelection, WeightStore},
-    weights::StrictLoadConfig,
+    runtime::checkpoint::load::StrictLoadConfig,
+    runtime::checkpoint::store::{SafetensorsWeightStore, TensorSelection, WeightStore},
 };
 
 /// Explicit process-local execution-device assignment.
@@ -1144,12 +1144,12 @@ mod tests {
         let singleton = crate::models::ModelLoadOptions::with_parallel(topology(1, 0, 1, 1, 1));
         crate::models::ensure_executable_load_options(singleton).unwrap();
         let combined = crate::models::ModelLoadOptions::with_quantization(
-            crate::quantization::WeightQuantization::MxFp4,
+            crate::runtime::checkpoint::quantization::WeightQuantization::MxFp4,
         )
         .with_parallel_topology(topology(1, 0, 1, 1, 1));
         assert_eq!(
             combined.quantization,
-            Some(crate::quantization::WeightQuantization::MxFp4)
+            Some(crate::runtime::checkpoint::quantization::WeightQuantization::MxFp4)
         );
         assert!(combined.parallel.unwrap().is_replicated());
 

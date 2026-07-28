@@ -18,17 +18,7 @@ use safemlx::{
 };
 
 use crate::{
-    cache::KeyValueCache,
     error::Error,
-    expert_cache::{
-        ExpertCache, ExpertCacheLoadOptions, ExpertCacheReport, ExpertCatalogEntry, ExpertIdentity,
-        ExpertPass,
-    },
-    layerwise::{
-        load_general_layerwise_model, load_general_layerwise_model_with_store,
-        GeneralLayerwiseModel, GeneralLayerwiseModelAdapter, LayerExecutionLoadOptions,
-        LayerwiseForwardState, StaticUnitBindings, WeightResidency,
-    },
     models::{
         common::{self, generation::CausalLm, linear::project_logits_maybe_quantized},
         input,
@@ -37,14 +27,24 @@ use crate::{
             TransformerBlock,
         },
     },
-    module_binding::{
+    runtime::cache::KeyValueCache,
+    runtime::checkpoint::binding::{
         build_module_bindings_with_recipes, canonical_checkpoint_name, populate_module_from_lease,
         populate_module_from_lease_excluding,
     },
-    residency::{OffloadUnit, ResidencyReport, ResidentUnitLease, WeightBinding},
+    runtime::checkpoint::recipe::DerivedWeightRecipe,
+    runtime::checkpoint::store::{GgufWeightStore, TensorSelection, WeightStore},
+    runtime::execution::layerwise::{
+        load_general_layerwise_model, load_general_layerwise_model_with_store,
+        GeneralLayerwiseModel, GeneralLayerwiseModelAdapter, LayerExecutionLoadOptions,
+        LayerwiseForwardState, StaticUnitBindings, WeightResidency,
+    },
+    runtime::residency::expert_cache::{
+        ExpertCache, ExpertCacheLoadOptions, ExpertCacheReport, ExpertCatalogEntry, ExpertIdentity,
+        ExpertPass,
+    },
+    runtime::residency::manager::{OffloadUnit, ResidencyReport, ResidentUnitLease, WeightBinding},
     utils::{create_attention_mask, AttentionMask},
-    weight_recipe::DerivedWeightRecipe,
-    weight_store::{GgufWeightStore, TensorSelection, WeightStore},
 };
 
 const EMBEDDING_UNIT: &str = "nemotron_h.static.embedding";
@@ -74,7 +74,7 @@ impl NemotronHLayerwiseModel {
     /// Returns dense-stream observations when that policy is active.
     pub fn dense_stream_report(
         &self,
-    ) -> Result<Option<crate::layerwise::DenseDiskStreamReport>, Error> {
+    ) -> Result<Option<crate::runtime::execution::layerwise::DenseDiskStreamReport>, Error> {
         self.execution.dense_stream_report()
     }
 
@@ -284,7 +284,7 @@ pub fn load_nemotron_h_sparse_expert_cache_model(
 pub fn load_nemotron_h_sparse_expert_cache_model_with_dense_layers(
     model_dir: impl AsRef<Path>,
     options: ExpertCacheLoadOptions,
-    non_expert: crate::dense_stream::DenseDiskStreamLoadOptions,
+    non_expert: crate::runtime::residency::dense_stream::DenseDiskStreamLoadOptions,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<NemotronHLayerwiseModel, Error> {
@@ -977,10 +977,10 @@ mod tests {
 
     use super::{load_nemotron_h_layerwise_model, load_nemotron_h_sparse_expert_cache_model};
     use crate::{
-        expert_cache::ExpertCacheLoadOptions,
-        layerwise::LayerwiseLoadOptions,
         models::nemotron_h::{self as resident, Cache, LayerCache, Model, ModelArgs, ModelInput},
-        offload::{OffloadConfig, ResidencyPolicy},
+        runtime::execution::layerwise::LayerwiseLoadOptions,
+        runtime::residency::expert_cache::ExpertCacheLoadOptions,
+        runtime::residency::policy::{OffloadConfig, ResidencyPolicy},
     };
 
     fn config() -> serde_json::Value {
@@ -1058,7 +1058,7 @@ mod tests {
         let params = model.parameters().flatten();
         let mut arrays = Vec::<(String, Array)>::new();
         for (name, value) in params {
-            let runtime = crate::module_binding::canonical_checkpoint_name(&name);
+            let runtime = crate::runtime::checkpoint::binding::canonical_checkpoint_name(&name);
             if runtime.ends_with("moe.experts.up_proj") {
                 let prefix = public_name(runtime.trim_end_matches(".up_proj"), &model.args);
                 for expert in 0..model.args.n_routed_experts {
@@ -1145,14 +1145,14 @@ mod tests {
                 let expected_offset = match expected {
                     LayerCache::Mamba(cache) => Some(cache.offset),
                     LayerCache::Attention(cache) => {
-                        Some(crate::cache::KeyValueCache::offset(cache))
+                        Some(crate::runtime::cache::KeyValueCache::offset(cache))
                     }
                     LayerCache::Mlp | LayerCache::Moe => None,
                 };
                 let actual_offset = match actual {
                     LayerCache::Mamba(cache) => Some(cache.offset),
                     LayerCache::Attention(cache) => {
-                        Some(crate::cache::KeyValueCache::offset(cache))
+                        Some(crate::runtime::cache::KeyValueCache::offset(cache))
                     }
                     LayerCache::Mlp | LayerCache::Moe => None,
                 };

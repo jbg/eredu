@@ -23,16 +23,6 @@ use safemlx::{
 };
 
 use crate::{
-    cache::{
-        CompressedLatentCache, ConcatKeyValueCache, KeyValueCache, PagedKeyValueCache,
-        SlidingKeyValueCache,
-    },
-    cache_residency::{
-        open_prompt_cache, validate_prompt_cache_model_identity, CacheRankIdentity,
-        CacheResidencyManager, CacheResidencyPolicy, CacheResidencyReport, PagedCacheOptions,
-        PromptCacheDescriptor, PromptCacheManifest, PromptCacheModelIdentity, PromptCacheOptions,
-        PromptCacheTopology,
-    },
     error::Error,
     models::{
         common::{
@@ -50,10 +40,20 @@ use crate::{
         PlacementPlan, RankPartition, TensorPlacement,
     },
     pipeline::{assign_module, load_deepseek_experts, SynchronizedToken},
-    quantization::{should_quantize_on_load, WeightQuantization},
+    runtime::cache::residency::{
+        open_prompt_cache, validate_prompt_cache_model_identity, CacheRankIdentity,
+        CacheResidencyManager, CacheResidencyPolicy, CacheResidencyReport, PagedCacheOptions,
+        PromptCacheDescriptor, PromptCacheManifest, PromptCacheModelIdentity, PromptCacheOptions,
+        PromptCacheTopology,
+    },
+    runtime::cache::{
+        CompressedLatentCache, ConcatKeyValueCache, KeyValueCache, PagedKeyValueCache,
+        SlidingKeyValueCache,
+    },
+    runtime::checkpoint::load::StrictLoadConfig,
+    runtime::checkpoint::quantization::{should_quantize_on_load, WeightQuantization},
     sampler::Sampler,
     utils::create_causal_mask,
-    weights::StrictLoadConfig,
 };
 
 /// Immutable description of one rank's tensor-parallel model state.

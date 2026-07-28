@@ -27,13 +27,13 @@ pub use crate::chat::{
     ChatTemplateIdentity, ChatTemplateRequest, NativeToolSupport, ParallelToolCallPolicy,
     PreparedChat, ToolChoice,
 };
-use crate::gguf_tokenizer::{self, GgufTokenizer};
-use crate::inspection::ActivationObserver;
-use crate::models::common::generation::CausalLm;
+use crate::nn::generation::CausalLm;
 use crate::parallel::ParallelTopology;
 #[cfg(feature = "media-processing")]
 use crate::processor::{load_processor, ModelProcessor, PreparedModelInput, ProcessorInput};
-use crate::quantization::WeightQuantization;
+use crate::runtime::checkpoint::gguf::{self as gguf_tokenizer, GgufTokenizer};
+use crate::runtime::checkpoint::quantization::WeightQuantization;
+use crate::runtime::execution::inspection::ActivationObserver;
 use crate::sampler::{ConstrainedSampler, DefaultSampler, Sampler, SpeculativeSampler};
 use crate::streaming::{
     drive_committed_generation, CommittedTokenPipeline, CommittedTokenSource, FinishReason,
@@ -41,19 +41,19 @@ use crate::streaming::{
 };
 use crate::tool_constraints::ConstraintCompiler;
 use crate::{
-    cache::{ConcatKeyValueCache, PagedKeyValueCache, SlidingKeyValueCache},
-    cache_residency::{
-        open_prompt_cache, validate_prompt_cache_model_identity, CacheResidencyManager,
-        CacheResidencyPolicy, CacheResidencyReport, PagedCacheOptions, PromptCacheDescriptor,
-        PromptCacheManifest, PromptCacheModelIdentity, PromptCacheOptions,
-    },
     error::Error,
-    layerwise::{LayerExecutionLoadOptions, WeightResidency},
     mtp::{
         LoadedDrafter, MtpBatchOutput, MtpCache, MtpCapability, MtpCheckpointKind, MtpConfig,
         MtpExecutionStreams, MtpScheduler, MtpSchedulerOptions, MtpSchedulerStats,
         MtpSemanticState, MtpStats,
     },
+    runtime::cache::residency::{
+        open_prompt_cache, validate_prompt_cache_model_identity, CacheResidencyManager,
+        CacheResidencyPolicy, CacheResidencyReport, PagedCacheOptions, PromptCacheDescriptor,
+        PromptCacheManifest, PromptCacheModelIdentity, PromptCacheOptions,
+    },
+    runtime::cache::{ConcatKeyValueCache, PagedKeyValueCache, SlidingKeyValueCache},
+    runtime::execution::layerwise::{LayerExecutionLoadOptions, WeightResidency},
 };
 
 /// Shared building blocks used by multiple decoder-only model families.
@@ -917,7 +917,9 @@ impl Model {
     }
 
     /// Returns residency telemetry when this model uses bounded layer execution.
-    pub fn residency_report(&self) -> Result<Option<crate::residency::ResidencyReport>, Error> {
+    pub fn residency_report(
+        &self,
+    ) -> Result<Option<crate::runtime::residency::manager::ResidencyReport>, Error> {
         match self {
             Self::DeepSeekV3Layerwise(model) => Ok(Some(model.residency_report()?)),
             Self::Gemma4Layerwise(model) => Ok(Some(model.residency_report()?)),
@@ -940,7 +942,7 @@ impl Model {
     /// Returns experimental dense-stream telemetry when enabled.
     pub fn dense_stream_report(
         &self,
-    ) -> Result<Option<crate::layerwise::DenseDiskStreamReport>, Error> {
+    ) -> Result<Option<crate::runtime::execution::layerwise::DenseDiskStreamReport>, Error> {
         match self {
             Self::DeepSeekV3Layerwise(model) => model.dense_stream_report(),
             Self::Gemma4Layerwise(model) => model.dense_stream_report(),
@@ -963,7 +965,7 @@ impl Model {
     /// Returns sparse routed-expert cache telemetry when enabled.
     pub fn expert_cache_report(
         &self,
-    ) -> Result<Option<crate::expert_cache::ExpertCacheReport>, Error> {
+    ) -> Result<Option<crate::runtime::residency::expert_cache::ExpertCacheReport>, Error> {
         match self {
             Self::DeepSeekV3Layerwise(model) => model.expert_cache_report(),
             Self::GptOssLayerwise(model) => model.expert_cache_report(),
@@ -3678,21 +3680,23 @@ impl LoadedModel {
     }
 
     /// Returns residency telemetry when bounded layer execution was selected.
-    pub fn residency_report(&self) -> Result<Option<crate::residency::ResidencyReport>, Error> {
+    pub fn residency_report(
+        &self,
+    ) -> Result<Option<crate::runtime::residency::manager::ResidencyReport>, Error> {
         self.model.residency_report()
     }
 
     /// Returns experimental dense-stream telemetry when enabled.
     pub fn dense_stream_report(
         &self,
-    ) -> Result<Option<crate::layerwise::DenseDiskStreamReport>, Error> {
+    ) -> Result<Option<crate::runtime::execution::layerwise::DenseDiskStreamReport>, Error> {
         self.model.dense_stream_report()
     }
 
     /// Returns sparse routed-expert cache telemetry when enabled.
     pub fn expert_cache_report(
         &self,
-    ) -> Result<Option<crate::expert_cache::ExpertCacheReport>, Error> {
+    ) -> Result<Option<crate::runtime::residency::expert_cache::ExpertCacheReport>, Error> {
         self.model.expert_cache_report()
     }
 
@@ -4153,7 +4157,7 @@ fn load_gguf_model_data(
     weights_stream: &Stream,
 ) -> Result<LoadedGgufModel, Error> {
     let checkpoint = GgufCheckpoint::open(gguf_file)?;
-    let metadata = crate::weights::gguf_metadata(&checkpoint);
+    let metadata = crate::runtime::checkpoint::load::gguf_metadata(&checkpoint);
     let sidecar_eos_token_ids = eos_token_ids_from_sidecar_dir(gguf_sidecar_dir(gguf_file))?;
     let gguf_eos_token_ids = gguf_eos_token_ids(&metadata)?;
     let architecture = match metadata.get("general.architecture") {
@@ -4332,7 +4336,7 @@ fn load_gguf_model_data(
         "qwen3vl" => {
             let mmproj_file = qwen3_vl::find_qwen3_vl_mmproj(gguf_file)?;
             let vision_checkpoint = GgufCheckpoint::open(mmproj_file)?;
-            let vision_metadata = crate::weights::gguf_metadata(&vision_checkpoint);
+            let vision_metadata = crate::runtime::checkpoint::load::gguf_metadata(&vision_checkpoint);
             if matches!(options.weight_residency, WeightResidency::FullyResident) {
                 let loaded = qwen3_vl::load_qwen3_vl_gguf_checkpoint(
                     &checkpoint,
@@ -4407,7 +4411,7 @@ fn load_gguf_model_data(
     })
 }
 
-fn validate_gguf_quantization_source<S: crate::weights::GgufTensorNames>(
+fn validate_gguf_quantization_source<S: crate::runtime::checkpoint::load::GgufTensorNames>(
     source: &S,
     metadata: &std::collections::HashMap<String, GgufMetadataValue>,
     quantization: Option<WeightQuantization>,
@@ -5124,9 +5128,11 @@ mod tests {
             ToolChoice, SYNTHETIC_STRUCTURAL_TOKEN, SYNTHETIC_TOOL_TEMPLATE,
         },
         error::Error,
-        inspection::ActivationRecorder,
         mtp::{MtpSchedulerOptions, MtpStreamTopology},
-        quantization::{AffineQuantization, CheckpointQuantizationOptions, WeightQuantization},
+        runtime::checkpoint::quantization::{
+            AffineQuantization, CheckpointQuantizationOptions, WeightQuantization,
+        },
+        runtime::execution::inspection::ActivationRecorder,
         sampler::{ConstrainedSampler, DefaultSampler},
         streaming::{FinishReason, SemanticEvent},
         tool_constraints::ConstraintCompiler,
@@ -8521,7 +8527,7 @@ mod tests {
                     "q4"
                 };
                 let saved_dir = dir.with_extension(suffix);
-                crate::quantization::quantize_checkpoint(
+                crate::runtime::checkpoint::quantization::quantize_checkpoint(
                     &dir,
                     &saved_dir,
                     &CheckpointQuantizationOptions {
@@ -8690,7 +8696,7 @@ mod tests {
         assert_eq!(logits.shape(), &[1, 32]);
 
         let saved_dir = dir.with_extension("mxfp4");
-        crate::quantization::quantize_checkpoint(
+        crate::runtime::checkpoint::quantization::quantize_checkpoint(
             &dir,
             &saved_dir,
             &CheckpointQuantizationOptions {

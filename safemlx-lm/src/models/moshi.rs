@@ -1,7 +1,7 @@
 //! Moshi temporal/depth language model for pre-tokenized Mimi streams.
 //!
 //! Moshi is not a single-stream causal LM, so it deliberately does not
-//! implement [`super::common::generation::CausalLm`]. The input to one temporal step is a
+//! implement [`crate::nn::generation::CausalLm`]. The input to one temporal step is a
 //! text token plus one token from every delayed audio codebook. The temporal
 //! output predicts text; the depth transformer then predicts generated audio
 //! codebooks autoregressively within the same frame.
@@ -30,18 +30,18 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use crate::{
-    cache::{ConcatKeyValueCache, KeyValueCache},
     error::Error,
-    quantization::WeightQuantization,
     realtime::{
         self, RealtimeSampling, RealtimeSpeechConfig, RealtimeSpeechModel, RealtimeStepInput,
     },
-    sampler::{DefaultSampler, Sampler},
-    weights::{
+    runtime::cache::{ConcatKeyValueCache, KeyValueCache},
+    runtime::checkpoint::load::{
         for_each_safetensor_array, load_array_quantized_strict, load_array_strict,
         load_safetensors_dir_strict, load_safetensors_quantized_strict, load_safetensors_strict,
         StrictLoadConfig, StrictLoadReport,
     },
+    runtime::checkpoint::quantization::WeightQuantization,
+    sampler::{DefaultSampler, Sampler},
 };
 
 const RMS_NORM_EPS: f32 = 1e-8;
@@ -2422,7 +2422,7 @@ pub fn load_model(
 /// Loads a dense Moshi checkpoint while quantizing each matrix as it is read.
 ///
 /// This is the experimental, no-conversion counterpart to
-/// [`crate::quantization::quantize_checkpoint`]. Both paths call the same
+/// [`crate::runtime::checkpoint::quantization::quantize_checkpoint`]. Both paths call the same
 /// affine tensor transform and produce the same in-memory parameter layout.
 pub fn load_model_quantized(
     model_dir: impl AsRef<Path>,
@@ -2432,7 +2432,11 @@ pub fn load_model_quantized(
 ) -> Result<Model, Error> {
     let model_dir = model_dir.as_ref();
     let mut args = get_model_args(model_dir)?;
-    if !crate::quantization::should_quantize_on_load("Moshi", args.quantization, quantization)? {
+    if !crate::runtime::checkpoint::quantization::should_quantize_on_load(
+        "Moshi",
+        args.quantization,
+        quantization,
+    )? {
         return load_model(model_dir, stream, weights_stream);
     }
     args.quantization = Some(quantization);
@@ -2446,7 +2450,7 @@ pub fn load_model_quantized(
     if weights_name == "model.safetensors"
         && model_dir.join("model.safetensors.index.json").exists()
     {
-        for file in crate::weights::safetensors_files(model_dir)? {
+        for file in crate::runtime::checkpoint::load::safetensors_files(model_dir)? {
             load_safetensors_quantized_strict(
                 &mut model,
                 file,
@@ -2736,7 +2740,7 @@ mod tests {
     use super::{
         parse_depformer_attention_weight, parse_depformer_gating_weight, Model, ModelArgs,
     };
-    use crate::quantization::WeightQuantization;
+    use crate::runtime::checkpoint::quantization::WeightQuantization;
     use safemlx::{module::ModuleParameters, Device, DeviceType, ExecutionContext};
 
     fn minimal_config() -> &'static str {

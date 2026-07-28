@@ -4,7 +4,7 @@ use safemlx_lm_utils::tokenizer::Tokenizer;
 use safemlx::{error::Exception, module::Module, Array};
 
 use crate::{
-    cache::{ConcatKeyValueCache, KeyValueCache},
+    runtime::cache::{ConcatKeyValueCache, KeyValueCache},
     error::Error,
     generate::generate_token::{GenerateToken, Stage},
     sampler::{DefaultSampler, Sampler},

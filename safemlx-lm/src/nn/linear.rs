@@ -5,7 +5,7 @@ use safemlx::{
     Dtype, Stream,
 };
 
-use crate::quantization::WeightQuantization;
+use crate::runtime::checkpoint::quantization::WeightQuantization;
 
 /// Builds an initialized untied language-model head.
 pub fn build_lm_head(hidden_size: i32, vocab_size: i32) -> Result<nn::Linear, Exception> {

@@ -575,37 +575,41 @@ fn quantize_checkpoint_inner(
     let mut total_size = 0;
 
     for file in weight_files {
-        weights::for_each_safetensor_array(file, stream, |name, tensor| {
-            let arrays = if options.selects(&name, &tensor) {
-                quantized_tensors += 1;
-                let weight_name = canonical_weight_name(&name).expect("selected weight name");
-                quantize_tensor(&tensor, options.quantization, stream)?
-                    .into_named_arrays(&weight_name)?
-            } else {
-                copied_tensors += 1;
-                vec![(name, tensor)]
-            };
+        crate::runtime::checkpoint::load::for_each_safetensor_array(
+            file,
+            stream,
+            |name, tensor| {
+                let arrays = if options.selects(&name, &tensor) {
+                    quantized_tensors += 1;
+                    let weight_name = canonical_weight_name(&name).expect("selected weight name");
+                    quantize_tensor(&tensor, options.quantization, stream)?
+                        .into_named_arrays(&weight_name)?
+                } else {
+                    copied_tensors += 1;
+                    vec![(name, tensor)]
+                };
 
-            let incoming_bytes = arrays
-                .iter()
-                .map(|(_, array)| array.nbytes())
-                .sum::<usize>();
-            if !pending.arrays.is_empty()
-                && pending.bytes.saturating_add(incoming_bytes) > options.shard_size_bytes
-            {
-                flush_temporary_shard(
-                    output_dir,
-                    &mut pending,
-                    &mut temporary_shards,
-                    &mut locations,
-                )?;
-            }
-            for (name, array) in arrays {
-                total_size += array.nbytes();
-                pending.insert(name, array);
-            }
-            Ok(())
-        })?;
+                let incoming_bytes = arrays
+                    .iter()
+                    .map(|(_, array)| array.nbytes())
+                    .sum::<usize>();
+                if !pending.arrays.is_empty()
+                    && pending.bytes.saturating_add(incoming_bytes) > options.shard_size_bytes
+                {
+                    flush_temporary_shard(
+                        output_dir,
+                        &mut pending,
+                        &mut temporary_shards,
+                        &mut locations,
+                    )?;
+                }
+                for (name, array) in arrays {
+                    total_size += array.nbytes();
+                    pending.insert(name, array);
+                }
+                Ok(())
+            },
+        )?;
     }
     if !pending.arrays.is_empty() {
         flush_temporary_shard(

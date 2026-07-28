@@ -18,31 +18,31 @@ use safemlx::{
 };
 
 use crate::{
-    cache::KeyValueCache,
     error::Error,
-    expert_cache::{
-        ExpertCache, ExpertCacheLoadOptions, ExpertCacheReport, ExpertCatalogEntry, ExpertIdentity,
-        ExpertPass,
-    },
-    layerwise::{
-        load_general_layerwise_model, load_general_layerwise_model_with_store,
-        GeneralLayerwiseModel, GeneralLayerwiseModelAdapter, LayerExecutionLoadOptions,
-        LayerwiseForwardState, StaticUnitBindings, WeightResidency,
-    },
     models::{
         common::moe::PackedSwiGluExperts,
         common::{self, generation::CausalLm, linear::project_logits_maybe_quantized},
         input,
         lfm2::{self as resident, Cache, DecoderLayer, LayerCache, LayerType, ModelArgs},
     },
-    module_binding::{
+    runtime::cache::KeyValueCache,
+    runtime::checkpoint::binding::{
         build_module_bindings, build_module_bindings_with_recipes, populate_module_from_lease,
         populate_module_from_lease_excluding,
     },
-    residency::{OffloadUnit, ResidencyReport, ResidentUnitLease, WeightBinding},
+    runtime::checkpoint::recipe::DerivedWeightRecipe,
+    runtime::checkpoint::store::{GgufWeightStore, TensorSelection, WeightStore},
+    runtime::execution::layerwise::{
+        load_general_layerwise_model, load_general_layerwise_model_with_store,
+        GeneralLayerwiseModel, GeneralLayerwiseModelAdapter, LayerExecutionLoadOptions,
+        LayerwiseForwardState, StaticUnitBindings, WeightResidency,
+    },
+    runtime::residency::expert_cache::{
+        ExpertCache, ExpertCacheLoadOptions, ExpertCacheReport, ExpertCatalogEntry, ExpertIdentity,
+        ExpertPass,
+    },
+    runtime::residency::manager::{OffloadUnit, ResidencyReport, ResidentUnitLease, WeightBinding},
     utils::{create_attention_mask, AttentionMask},
-    weight_recipe::DerivedWeightRecipe,
-    weight_store::{GgufWeightStore, TensorSelection, WeightStore},
 };
 
 const EMBEDDING_UNIT: &str = "lfm2.static.embedding";
@@ -72,7 +72,7 @@ impl Lfm2LayerwiseModel {
     /// Returns dense-stream observations when that policy is active.
     pub fn dense_stream_report(
         &self,
-    ) -> Result<Option<crate::layerwise::DenseDiskStreamReport>, Error> {
+    ) -> Result<Option<crate::runtime::execution::layerwise::DenseDiskStreamReport>, Error> {
         self.execution.dense_stream_report()
     }
 
@@ -279,7 +279,7 @@ pub fn load_lfm2_sparse_expert_cache_model(
 pub fn load_lfm2_sparse_expert_cache_model_with_dense_layers(
     model_dir: impl AsRef<Path>,
     options: ExpertCacheLoadOptions,
-    non_expert: crate::dense_stream::DenseDiskStreamLoadOptions,
+    non_expert: crate::runtime::residency::dense_stream::DenseDiskStreamLoadOptions,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<Lfm2LayerwiseModel, Error> {
@@ -1008,11 +1008,11 @@ mod tests {
 
     use super::{load_lfm2_layerwise_model, load_lfm2_sparse_expert_cache_model};
     use crate::{
-        dense_stream::DenseDiskStreamLoadOptions,
-        expert_cache::ExpertCacheLoadOptions,
-        layerwise::{LayerExecutionLoadOptions, LayerwiseLoadOptions},
         models::lfm2::{self as resident, Cache, LayerCache, Model, ModelArgs},
-        offload::{MemoryTier, OffloadConfig, ResidencyPolicy},
+        runtime::execution::layerwise::{LayerExecutionLoadOptions, LayerwiseLoadOptions},
+        runtime::residency::dense_stream::DenseDiskStreamLoadOptions,
+        runtime::residency::expert_cache::ExpertCacheLoadOptions,
+        runtime::residency::policy::{MemoryTier, OffloadConfig, ResidencyPolicy},
     };
 
     fn args(moe: bool) -> ModelArgs {
@@ -1057,7 +1057,7 @@ mod tests {
         let params = model.parameters().flatten();
         let mut arrays = Vec::<(String, Array)>::new();
         for (name, value) in params {
-            let name = crate::module_binding::canonical_checkpoint_name(&name);
+            let name = crate::runtime::checkpoint::binding::canonical_checkpoint_name(&name);
             if name.ends_with("feed_forward.experts.gate_up_proj") {
                 let prefix = name.trim_end_matches(".gate_up_proj");
                 for expert in 0..model.args.num_experts {
@@ -1186,11 +1186,15 @@ mod tests {
             assert_close(&actual, &expected);
             for (expected, actual) in resident_cache.layers.iter().zip(&layerwise_cache.layers) {
                 let expected_offset = match expected {
-                    LayerCache::Attention(cache) => crate::cache::KeyValueCache::offset(cache),
+                    LayerCache::Attention(cache) => {
+                        crate::runtime::cache::KeyValueCache::offset(cache)
+                    }
                     LayerCache::Conv(cache) => cache.offset,
                 };
                 let actual_offset = match actual {
-                    LayerCache::Attention(cache) => crate::cache::KeyValueCache::offset(cache),
+                    LayerCache::Attention(cache) => {
+                        crate::runtime::cache::KeyValueCache::offset(cache)
+                    }
                     LayerCache::Conv(cache) => cache.offset,
                 };
                 assert_eq!(expected_offset, actual_offset);

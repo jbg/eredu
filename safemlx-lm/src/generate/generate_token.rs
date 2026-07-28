@@ -3,7 +3,7 @@ use std::marker::PhantomData;
 use safemlx::{error::Exception, module::Module, random::RandomState, Array, Stream};
 
 use crate::{
-    cache::KeyValueCache, sampler::Sampler, utils::try_unwrap, ModelInput, ModelInputBuilder,
+    runtime::cache::KeyValueCache, sampler::Sampler, utils::try_unwrap, ModelInput, ModelInputBuilder,
     ModelOutput,
 };
 

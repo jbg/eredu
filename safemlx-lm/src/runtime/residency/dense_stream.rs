@@ -14,8 +14,8 @@ use std::{
 };
 
 use crate::{
-    offload::{CacheEvictionPolicy, MemoryTier, OffloadUnitId},
-    residency::{ResidencyManager, ResidentUnitLease},
+    runtime::residency::manager::{ResidencyManager, ResidentUnitLease},
+    runtime::residency::policy::{CacheEvictionPolicy, MemoryTier, OffloadUnitId},
 };
 
 /// Public controls for experimental dense disk streaming.
@@ -59,7 +59,7 @@ impl DenseDiskStreamLoadOptions {
             device_lookahead,
             background_queue_capacity,
             eviction_policy: CacheEvictionPolicy::LeastRecentlyUsed,
-            max_mapped_shards: crate::weight_store::DEFAULT_MAX_MAPPED_SHARDS,
+            max_mapped_shards: crate::runtime::checkpoint::store::DEFAULT_MAX_MAPPED_SHARDS,
             strict_loading: true,
             sample_mlx_memory: false,
             sample_process_memory: false,
@@ -479,7 +479,7 @@ pub enum DenseStreamError {
     },
     /// A residency transition failed.
     #[error(transparent)]
-    Residency(#[from] crate::residency::ResidencyError),
+    Residency(#[from] crate::runtime::residency::manager::ResidencyError),
     /// Worker creation failed.
     #[error(transparent)]
     Io(#[from] std::io::Error),
@@ -489,9 +489,11 @@ pub enum DenseStreamError {
 mod tests {
     use super::*;
     use crate::{
-        offload::{OffloadConfig, OffloadPlan, OffloadUnitSpec, ResidencyPolicy},
-        residency::{OffloadUnit, WeightBinding},
-        weight_store::{SafetensorsWeightStore, TensorSelection},
+        runtime::checkpoint::store::{SafetensorsWeightStore, TensorSelection},
+        runtime::residency::manager::{OffloadUnit, WeightBinding},
+        runtime::residency::policy::{
+            OffloadConfig, OffloadPlan, OffloadUnitSpec, ResidencyPolicy,
+        },
     };
     use safemlx::{Device, DeviceType, Stream};
     use safetensors::tensor::{serialize_to_file, Dtype, TensorView};

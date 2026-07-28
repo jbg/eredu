@@ -1,6 +1,6 @@
 //! Persistent, lazy checkpoint tensor storage.
 //!
-//! A [`crate::weight_store::WeightLease`] pins the bytes backing a safetensors
+//! A [`crate::runtime::checkpoint::store::WeightLease`] pins the bytes backing a safetensors
 //! view. Materialization
 //! never exposes that view as an MLX array: selection, copying, evaluation, and
 //! conservative stream synchronization all finish before an owned array is

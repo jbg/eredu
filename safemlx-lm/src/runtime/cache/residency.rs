@@ -24,7 +24,7 @@ use safemlx::{transforms::eval, Array, Device, DeviceType, Dtype, Stream};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::offload::CacheEvictionPolicy;
+use crate::runtime::residency::policy::CacheEvictionPolicy;
 
 const PROMPT_CACHE_SCHEMA_VERSION: u32 = 2;
 const MAX_PROMPT_CACHE_SHARD_HEADER_BYTES: u64 = 1024 * 1024;
@@ -5029,11 +5029,11 @@ mod tests {
     #[test]
     fn model_reset_surfaces_propagate_paged_clear_failures() {
         use crate::{
-            cache::PagedKeyValueCache,
             expert_parallel::ExpertParallelCache,
             llama::LlamaCache,
             models::gpt_oss::{Cache as GptOssCache, LayerCache as GptOssLayerCache},
             pipeline::{PipelineCache, PipelineLlamaLayerCache},
+            runtime::cache::PagedKeyValueCache,
             tensor_parallel::{TensorParallelCache, TensorParallelLlamaLayerCache},
         };
 

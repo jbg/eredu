@@ -13,33 +13,33 @@ use safemlx::{
 };
 
 use crate::{
-    cache::{KeyValueCache, PagedKeyValueCache},
-    cache_residency::{
-        open_prompt_cache, validate_prompt_cache_model_identity, CacheResidencyManager,
-        CacheResidencyPolicy, PagedCacheOptions, PromptCacheDescriptor, PromptCacheManifest,
-        PromptCacheModelIdentity,
-    },
     error::Error,
-    expert_cache::{
-        ExpertCache, ExpertCacheLoadOptions, ExpertCacheReport, ExpertCatalogEntry, ExpertIdentity,
-        ExpertPass,
-    },
-    layerwise::{
-        load_general_layerwise_model, GeneralLayerwiseModel, GeneralLayerwiseModelAdapter,
-        LayerExecutionLoadOptions, LayerwiseForwardState, StaticUnitBindings,
-    },
     models::{
         common::{self, generation::CausalLm},
         gpt_oss::{self as resident, Cache, Experts, LayerCache, ModelArgs, TransformerBlock},
         input,
     },
-    module_binding::{
+    runtime::cache::residency::{
+        open_prompt_cache, validate_prompt_cache_model_identity, CacheResidencyManager,
+        CacheResidencyPolicy, PagedCacheOptions, PromptCacheDescriptor, PromptCacheManifest,
+        PromptCacheModelIdentity,
+    },
+    runtime::cache::{KeyValueCache, PagedKeyValueCache},
+    runtime::checkpoint::binding::{
         build_module_bindings, populate_module_from_lease, populate_module_from_lease_excluding,
     },
-    residency::{OffloadUnit, ResidencyReport, ResidentUnitLease, WeightBinding},
+    runtime::checkpoint::recipe::DerivedWeightRecipe,
+    runtime::checkpoint::store::{TensorSelection, WeightStore},
+    runtime::execution::layerwise::{
+        load_general_layerwise_model, GeneralLayerwiseModel, GeneralLayerwiseModelAdapter,
+        LayerExecutionLoadOptions, LayerwiseForwardState, StaticUnitBindings,
+    },
+    runtime::residency::expert_cache::{
+        ExpertCache, ExpertCacheLoadOptions, ExpertCacheReport, ExpertCatalogEntry, ExpertIdentity,
+        ExpertPass,
+    },
+    runtime::residency::manager::{OffloadUnit, ResidencyReport, ResidentUnitLease, WeightBinding},
     utils::create_causal_mask,
-    weight_recipe::DerivedWeightRecipe,
-    weight_store::{TensorSelection, WeightStore},
 };
 
 const EMBEDDING_UNIT: &str = "gpt_oss.static.embedding";
@@ -143,7 +143,7 @@ impl GptOssLayerwiseModel {
     /// Returns dense-stream observations when that policy is active.
     pub fn dense_stream_report(
         &self,
-    ) -> Result<Option<crate::layerwise::DenseDiskStreamReport>, Error> {
+    ) -> Result<Option<crate::runtime::execution::layerwise::DenseDiskStreamReport>, Error> {
         self.execution.dense_stream_report()
     }
 
@@ -250,7 +250,7 @@ pub fn load_gpt_oss_sparse_expert_cache_model(
 pub fn load_gpt_oss_sparse_expert_cache_model_with_dense_layers(
     model_dir: impl AsRef<Path>,
     options: ExpertCacheLoadOptions,
-    non_expert: crate::dense_stream::DenseDiskStreamLoadOptions,
+    non_expert: crate::runtime::residency::dense_stream::DenseDiskStreamLoadOptions,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<GptOssLayerwiseModel, Error> {
@@ -342,11 +342,11 @@ impl GptOssLayerwiseAdapter {
                 .iter()
                 .map(|kind| {
                     if kind == "sliding_attention" {
-                        LayerCache::Sliding(crate::cache::SlidingKeyValueCache::new(
+                        LayerCache::Sliding(crate::runtime::cache::SlidingKeyValueCache::new(
                             self.args.sliding_window,
                         ))
                     } else {
-                        LayerCache::Full(crate::cache::ConcatKeyValueCache::new())
+                        LayerCache::Full(crate::runtime::cache::ConcatKeyValueCache::new())
                     }
                 })
                 .collect(),
@@ -703,12 +703,12 @@ mod tests {
 
     use super::{load_gpt_oss_layerwise_model, load_gpt_oss_sparse_expert_cache_model};
     use crate::{
-        cache::KeyValueCache,
-        dense_stream::DenseDiskStreamLoadOptions,
-        expert_cache::ExpertCacheLoadOptions,
-        layerwise::{LayerExecutionLoadOptions, LayerwiseLoadOptions},
         models::gpt_oss::{self as resident, Cache, Model, ModelArgs, MxFp4Config},
-        offload::{MemoryTier, OffloadConfig, ResidencyPolicy},
+        runtime::cache::KeyValueCache,
+        runtime::execution::layerwise::{LayerExecutionLoadOptions, LayerwiseLoadOptions},
+        runtime::residency::dense_stream::DenseDiskStreamLoadOptions,
+        runtime::residency::expert_cache::ExpertCacheLoadOptions,
+        runtime::residency::policy::{MemoryTier, OffloadConfig, ResidencyPolicy},
     };
 
     fn tiny_args() -> ModelArgs {
@@ -757,7 +757,7 @@ mod tests {
             .iter()
             .map(|(name, value)| {
                 (
-                    crate::module_binding::canonical_checkpoint_name(name),
+                    crate::runtime::checkpoint::binding::canonical_checkpoint_name(name),
                     *value,
                 )
             })

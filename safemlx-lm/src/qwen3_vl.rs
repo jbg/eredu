@@ -22,14 +22,7 @@ use safemlx::{
 };
 
 use crate::{
-    cache::KeyValueCache,
     error::Error,
-    expert_cache::{ExpertCache, ExpertCacheLoadOptions, ExpertCacheReport, ExpertPass},
-    layerwise::{
-        load_general_layerwise_model, load_general_layerwise_model_with_store,
-        GeneralLayerwiseModel, GeneralLayerwiseModelAdapter, LayerExecutionLoadOptions,
-        LayerwiseForwardState, StaticUnitBindings, WeightResidency,
-    },
     models::{
         common::{self, attention::AttentionInput, generation::CausalLm},
         input,
@@ -40,14 +33,23 @@ use crate::{
             QwenVisionLayerwiseStatic, QwenVisionTransformer,
         },
     },
-    module_binding::{
+    runtime::cache::KeyValueCache,
+    runtime::checkpoint::binding::{
         build_module_bindings, build_module_bindings_with_recipes, populate_module_from_lease,
         populate_module_from_lease_excluding,
     },
-    residency::{ResidencyReport, ResidentUnitLease, WeightBinding},
+    runtime::checkpoint::recipe::DerivedWeightRecipe,
+    runtime::checkpoint::store::{GgufWeightStore, TensorSelection, WeightStore},
+    runtime::execution::layerwise::{
+        load_general_layerwise_model, load_general_layerwise_model_with_store,
+        GeneralLayerwiseModel, GeneralLayerwiseModelAdapter, LayerExecutionLoadOptions,
+        LayerwiseForwardState, StaticUnitBindings, WeightResidency,
+    },
+    runtime::residency::expert_cache::{
+        ExpertCache, ExpertCacheLoadOptions, ExpertCacheReport, ExpertPass,
+    },
+    runtime::residency::manager::{ResidencyReport, ResidentUnitLease, WeightBinding},
     utils::{create_attention_mask, AttentionMask},
-    weight_recipe::DerivedWeightRecipe,
-    weight_store::{GgufWeightStore, TensorSelection, WeightStore},
 };
 
 const VISION_STATIC_UNIT: &str = "qwen3_vl.static.vision";
@@ -98,7 +100,7 @@ impl Qwen3VlLayerwiseModel {
     /// Returns dense-stream observations when that policy is active.
     pub fn dense_stream_report(
         &self,
-    ) -> Result<Option<crate::layerwise::DenseDiskStreamReport>, Error> {
+    ) -> Result<Option<crate::runtime::execution::layerwise::DenseDiskStreamReport>, Error> {
         self.execution.dense_stream_report()
     }
 
@@ -267,7 +269,7 @@ pub fn load_qwen3_vl_sparse_expert_cache_model(
 pub fn load_qwen3_vl_sparse_expert_cache_model_with_dense_layers(
     model_dir: impl AsRef<Path>,
     options: ExpertCacheLoadOptions,
-    non_expert: crate::dense_stream::DenseDiskStreamLoadOptions,
+    non_expert: crate::runtime::residency::dense_stream::DenseDiskStreamLoadOptions,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<Qwen3VlLayerwiseModel, Error> {
@@ -1051,11 +1053,11 @@ mod tests {
 
     use super::*;
     use crate::{
-        dense_stream::DenseDiskStreamLoadOptions,
-        expert_cache::ExpertCacheLoadOptions,
-        layerwise::{LayerExecutionLoadOptions, LayerwiseLoadOptions},
         models::qwen3_vl as eager,
-        offload::{MemoryTier, OffloadConfig},
+        runtime::execution::layerwise::{LayerExecutionLoadOptions, LayerwiseLoadOptions},
+        runtime::residency::dense_stream::DenseDiskStreamLoadOptions,
+        runtime::residency::expert_cache::ExpertCacheLoadOptions,
+        runtime::residency::policy::{MemoryTier, OffloadConfig},
     };
 
     fn config(moe: bool) -> serde_json::Value {
@@ -1140,7 +1142,7 @@ mod tests {
             .iter()
             .map(|(name, value)| {
                 (
-                    crate::module_binding::canonical_checkpoint_name(name),
+                    crate::runtime::checkpoint::binding::canonical_checkpoint_name(name),
                     *value,
                 )
             })

@@ -23,19 +23,19 @@ use serde_json::Value;
 pub use super::qwen_vl::{QwenVisionTransformer, VisionConfig};
 
 use crate::{
-    cache::{ConcatKeyValueCache, KeyValueCache},
     error::Error,
     models::{
         common::{self, attention::AttentionInput, generation::CausalLm},
         input as runtime_input, qwen3,
         qwen_vl::grid_thw_from_array,
     },
-    quantization::WeightQuantization,
-    utils::{create_attention_mask, AttentionMask},
-    weights::{
+    runtime::cache::{ConcatKeyValueCache, KeyValueCache},
+    runtime::checkpoint::load::{
         gguf_metadata, load_named_array_strict, load_safetensors_dir_quantized_strict,
         load_safetensors_dir_strict, StrictLoadConfig, StrictLoadReport,
     },
+    runtime::checkpoint::quantization::WeightQuantization,
+    utils::{create_attention_mask, AttentionMask},
 };
 
 #[derive(Debug, Clone)]
@@ -660,7 +660,11 @@ pub fn load_qwen3_vl_model_quantized(
         .text_config
         .quantization
         .or(args.text_config.quantization_config);
-    if !crate::quantization::should_quantize_on_load("Qwen3-VL", existing, quantization)? {
+    if !crate::runtime::checkpoint::quantization::should_quantize_on_load(
+        "Qwen3-VL",
+        existing,
+        quantization,
+    )? {
         return load_qwen3_vl_model(model_dir, stream, weights_stream);
     }
     args.text_config.quantization = Some(quantization);
@@ -1242,7 +1246,7 @@ impl CausalLm<Cache> for Model {
             .kv
             .first()
             .and_then(Option::as_ref)
-            .map(crate::cache::KeyValueCache::offset)
+            .map(crate::runtime::cache::KeyValueCache::offset)
             .unwrap_or(0)
             + cache.rope_delta;
         let positions = [
@@ -1354,7 +1358,7 @@ mod tests {
         let args = super::parse_model_args_value(config).unwrap();
         assert_eq!(
             args.text_config.quantization,
-            Some(crate::quantization::AffineQuantization::default().into())
+            Some(crate::runtime::checkpoint::quantization::AffineQuantization::default().into())
         );
     }
 
@@ -1676,7 +1680,7 @@ mod tests {
         assert_eq!(
             cache.kv[0]
                 .as_ref()
-                .map(crate::cache::KeyValueCache::offset),
+                .map(crate::runtime::cache::KeyValueCache::offset),
             Some(3)
         );
     }

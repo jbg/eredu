@@ -19,13 +19,10 @@ use serde::Deserialize;
 use serde_json::Value;
 use tokenizers::Tokenizer;
 
-pub use super::common::generation::sample;
+pub use crate::nn::generation::sample;
 
 use crate::{
-    cache::{KeyValueCache, SlidingKeyValueCache},
-    cache_residency::derive_prompt_cache_architecture_fingerprint,
     error::Error,
-    inspection::ActivationObserver,
     models::{
         common::{
             self,
@@ -39,15 +36,18 @@ use crate::{
         },
         input,
     },
-    quantization::WeightQuantization,
+    runtime::cache::residency::derive_prompt_cache_architecture_fingerprint,
+    runtime::cache::{KeyValueCache, SlidingKeyValueCache},
+    runtime::checkpoint::load::{
+        gguf_metadata, gguf_quantization_configs, load_gguf_strict, load_safetensors_dir_lenient,
+        load_safetensors_dir_quantized_strict, GgufTensorNames, StrictLoadConfig, StrictLoadReport,
+    },
+    runtime::checkpoint::quantization::WeightQuantization,
+    runtime::execution::inspection::ActivationObserver,
     utils::{
         create_attention_mask, create_sliding_attention_mask,
         rope::{initialize_rope, FloatOrString, RopeVariant},
         AttentionMask,
-    },
-    weights::{
-        gguf_metadata, gguf_quantization_configs, load_gguf_strict, load_safetensors_dir_lenient,
-        load_safetensors_dir_quantized_strict, GgufTensorNames, StrictLoadConfig, StrictLoadReport,
     },
 };
 
@@ -1407,7 +1407,7 @@ pub fn load_resident_llama_model_quantized(
 ) -> Result<ResidentModel, Error> {
     let model_dir = model_dir.as_ref();
     let mut model_args = get_llama_model_args(model_dir)?;
-    if !crate::quantization::should_quantize_on_load(
+    if !crate::runtime::checkpoint::quantization::should_quantize_on_load(
         "Llama",
         model_args.weight_quantization(),
         quantization,
@@ -1494,9 +1494,9 @@ mod tests {
     };
 
     use crate::{
-        cache::ConcatKeyValueCache,
         models::llama::{load_llama_tokenizer, load_resident_llama_model},
-        quantization::AffineQuantization,
+        runtime::cache::ConcatKeyValueCache,
+        runtime::checkpoint::quantization::AffineQuantization,
     };
 
     #[test]
@@ -1720,7 +1720,7 @@ mod tests {
         let checkpoint = safemlx::ops::GgufCheckpoint::open(mixed_fixture.path()).unwrap();
         let mut mixed = super::load_llama_gguf_checkpoint(
             &checkpoint,
-            crate::weights::gguf_metadata(&checkpoint),
+            crate::runtime::checkpoint::load::gguf_metadata(&checkpoint),
             None,
             stream,
             stream,
@@ -1752,11 +1752,11 @@ mod tests {
 
         let gpu = safemlx::ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
         let checkpoint = safemlx::ops::GgufCheckpoint::open(fixture.path()).unwrap();
-        let metadata = crate::weights::gguf_metadata(&checkpoint);
+        let metadata = crate::runtime::checkpoint::load::gguf_metadata(&checkpoint);
         let quantized = super::load_llama_gguf_checkpoint(
             &checkpoint,
             metadata,
-            Some(crate::quantization::WeightQuantization::MxFp4),
+            Some(crate::runtime::checkpoint::quantization::WeightQuantization::MxFp4),
             gpu.stream(),
             stream,
         )

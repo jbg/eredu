@@ -11,27 +11,29 @@ use safemlx::{
 };
 
 use crate::{
-    cache::KeyValueCache,
     error::Error,
-    layerwise::{
-        load_general_layerwise_model, GeneralLayerwiseModel, GeneralLayerwiseModelAdapter,
-        LayerwiseForwardState, StaticUnitBindings,
-    },
     models::moshi::{
         self as resident, DepFormerSlice, ModelArgs, MoshiCache, MoshiLayerwiseStatic,
         MoshiTransformerLayer, SampleStepOutput, TokenStepOutput,
-    },
-    module_binding::{
-        build_module_bindings, build_module_bindings_with_recipes, populate_module_from_lease,
     },
     realtime::{
         RealtimeSampling, RealtimeSpeechConfig, RealtimeSpeechModel, RealtimeStepInput,
         RealtimeStepOutput,
     },
-    residency::{ResidencyReport, ResidentLayerGroupReport, ResidentUnitLease, WeightBinding},
+    runtime::cache::KeyValueCache,
+    runtime::checkpoint::binding::{
+        build_module_bindings, build_module_bindings_with_recipes, populate_module_from_lease,
+    },
+    runtime::checkpoint::recipe::DerivedWeightRecipe,
+    runtime::checkpoint::store::{TensorSelection, WeightStore},
+    runtime::execution::layerwise::{
+        load_general_layerwise_model, GeneralLayerwiseModel, GeneralLayerwiseModelAdapter,
+        LayerwiseForwardState, StaticUnitBindings,
+    },
+    runtime::residency::manager::{
+        ResidencyReport, ResidentLayerGroupReport, ResidentUnitLease, WeightBinding,
+    },
     sampler::Sampler,
-    weight_recipe::DerivedWeightRecipe,
-    weight_store::{TensorSelection, WeightStore},
 };
 
 const STATIC_UNIT: &str = "moshi.static";
@@ -66,7 +68,7 @@ impl MoshiLayerwiseModel {
     /// Returns dense-stream observations when that policy is active.
     pub fn dense_stream_report(
         &self,
-    ) -> Result<Option<crate::layerwise::DenseDiskStreamReport>, Error> {
+    ) -> Result<Option<crate::runtime::execution::layerwise::DenseDiskStreamReport>, Error> {
         self.execution.dense_stream_report()
     }
 
@@ -778,7 +780,7 @@ fn token_position(
 /// Loads a native MLX-layout Moshi checkpoint through bounded layer residency.
 pub fn load_moshi_layerwise_model(
     model_dir: impl AsRef<Path>,
-    options: impl Into<crate::layerwise::LayerExecutionLoadOptions>,
+    options: impl Into<crate::runtime::execution::layerwise::LayerExecutionLoadOptions>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<MoshiLayerwiseModel, Error> {
@@ -808,7 +810,7 @@ pub fn load_moshi_layerwise_model(
 /// Loads the released PersonaPlex PyTorch checkpoint through bounded layer residency.
 pub fn load_personaplex_layerwise_model(
     model_dir: impl AsRef<Path>,
-    options: impl Into<crate::layerwise::LayerExecutionLoadOptions>,
+    options: impl Into<crate::runtime::execution::layerwise::LayerExecutionLoadOptions>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<MoshiLayerwiseModel, Error> {
@@ -830,7 +832,7 @@ fn load_with_layout(
     source: impl AsRef<Path>,
     args: ModelArgs,
     layout: CheckpointLayout,
-    options: impl Into<crate::layerwise::LayerExecutionLoadOptions>,
+    options: impl Into<crate::runtime::execution::layerwise::LayerExecutionLoadOptions>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<MoshiLayerwiseModel, Error> {
@@ -1267,13 +1269,16 @@ impl GeneralLayerwiseModelAdapter for MoshiLayerwiseAdapter {
 fn new_cache(args: &ModelArgs) -> MoshiCache {
     MoshiCache {
         temporal: vec![
-            crate::cache::ConcatKeyValueCache::new_with_max_size_and_step(
+            crate::runtime::cache::ConcatKeyValueCache::new_with_max_size_and_step(
                 args.context + 1,
                 256
             );
             args.num_layers as usize
         ],
-        depth: vec![crate::cache::ConcatKeyValueCache::new(); args.depformer_num_layers as usize],
+        depth: vec![
+            crate::runtime::cache::ConcatKeyValueCache::new();
+            args.depformer_num_layers as usize
+        ],
     }
 }
 
@@ -1469,11 +1474,11 @@ mod tests {
 
     use super::*;
     use crate::{
-        dense_stream::DenseDiskStreamLoadOptions,
-        layerwise::{LayerExecutionLoadOptions, LayerwiseLoadOptions},
         models::moshi as eager,
-        offload::{MemoryTier, OffloadConfig},
         realtime::{generate_encoded_greedy, RealtimeSpeechModel},
+        runtime::execution::layerwise::{LayerExecutionLoadOptions, LayerwiseLoadOptions},
+        runtime::residency::dense_stream::DenseDiskStreamLoadOptions,
+        runtime::residency::policy::{MemoryTier, OffloadConfig},
     };
 
     fn config() -> &'static str {
@@ -1770,9 +1775,9 @@ mod tests {
         let loaded = crate::realtime::load_model_with_options(
             dir.path(),
             crate::models::ModelLoadOptions::default().with_weight_residency(
-                crate::layerwise::WeightResidency::LayerwiseHost(LayerwiseLoadOptions::new(
-                    OffloadConfig::new(None, None, 1).unwrap(),
-                )),
+                crate::runtime::execution::layerwise::WeightResidency::LayerwiseHost(
+                    LayerwiseLoadOptions::new(OffloadConfig::new(None, None, 1).unwrap()),
+                ),
             ),
             gpu.stream(),
             cpu.stream(),
@@ -1882,8 +1887,9 @@ mod tests {
 
         let loaded = crate::realtime::load_model_with_options(
             dir.path(),
-            crate::models::ModelLoadOptions::default()
-                .with_weight_residency(crate::layerwise::WeightResidency::DenseDiskStream(dense)),
+            crate::models::ModelLoadOptions::default().with_weight_residency(
+                crate::runtime::execution::layerwise::WeightResidency::DenseDiskStream(dense),
+            ),
             gpu.stream(),
             cpu.stream(),
         )

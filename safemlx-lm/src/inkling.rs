@@ -12,17 +12,7 @@ use safemlx::{
 };
 
 use crate::{
-    cache::KeyValueCache,
-    cache_residency::{CacheResidencyPolicy, CacheResidencyReport},
     error::Error,
-    expert_cache::{
-        ExpertCache, ExpertCacheLoadOptions, ExpertCacheReport, ExpertCatalogEntry, ExpertIdentity,
-        ExpertPass,
-    },
-    layerwise::{
-        load_general_layerwise_model, GeneralLayerwiseModel, GeneralLayerwiseModelAdapter,
-        LayerExecutionLoadOptions, LayerwiseForwardState, StaticUnitBindings,
-    },
     models::{
         common::{self, generation::CausalLm, moe::PackedSwiGluExperts},
         inkling::{
@@ -30,13 +20,23 @@ use crate::{
         },
         input,
     },
-    module_binding::{
+    runtime::cache::residency::{CacheResidencyPolicy, CacheResidencyReport},
+    runtime::cache::KeyValueCache,
+    runtime::checkpoint::binding::{
         build_module_bindings_with_recipes, populate_module_from_lease,
         populate_module_from_lease_excluding,
     },
-    residency::{OffloadUnit, ResidencyReport, ResidentUnitLease, WeightBinding},
-    weight_recipe::DerivedWeightRecipe,
-    weight_store::{TensorSelection, WeightStore},
+    runtime::checkpoint::recipe::DerivedWeightRecipe,
+    runtime::checkpoint::store::{TensorSelection, WeightStore},
+    runtime::execution::layerwise::{
+        load_general_layerwise_model, GeneralLayerwiseModel, GeneralLayerwiseModelAdapter,
+        LayerExecutionLoadOptions, LayerwiseForwardState, StaticUnitBindings,
+    },
+    runtime::residency::expert_cache::{
+        ExpertCache, ExpertCacheLoadOptions, ExpertCacheReport, ExpertCatalogEntry, ExpertIdentity,
+        ExpertPass,
+    },
+    runtime::residency::manager::{OffloadUnit, ResidencyReport, ResidentUnitLease, WeightBinding},
 };
 
 const EMBEDDING_UNIT: &str = "inkling.static.embedding";
@@ -88,7 +88,7 @@ impl InklingLayerwiseModel {
     /// Returns dense-stream observations when that policy is active.
     pub fn dense_stream_report(
         &self,
-    ) -> Result<Option<crate::layerwise::DenseDiskStreamReport>, Error> {
+    ) -> Result<Option<crate::runtime::execution::layerwise::DenseDiskStreamReport>, Error> {
         self.execution.dense_stream_report()
     }
 
@@ -215,7 +215,7 @@ pub fn load_inkling_sparse_expert_cache_model(
 pub fn load_inkling_sparse_expert_cache_model_with_dense_layers(
     model_dir: impl AsRef<Path>,
     options: ExpertCacheLoadOptions,
-    non_expert: crate::dense_stream::DenseDiskStreamLoadOptions,
+    non_expert: crate::runtime::residency::dense_stream::DenseDiskStreamLoadOptions,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<InklingLayerwiseModel, Error> {
@@ -1289,15 +1289,15 @@ mod tests {
 
     use super::{load_inkling_layerwise_model, load_inkling_sparse_expert_cache_model};
     use crate::{
-        cache::KeyValueCache,
-        expert_cache::ExpertCacheLoadOptions,
-        layerwise::LayerwiseLoadOptions,
         models::{
             common::generation::CausalLm,
             inkling::{self as resident, Model, ModelArgs},
             input as runtime_input,
         },
-        offload::{OffloadConfig, ResidencyPolicy},
+        runtime::cache::KeyValueCache,
+        runtime::execution::layerwise::LayerwiseLoadOptions,
+        runtime::residency::expert_cache::ExpertCacheLoadOptions,
+        runtime::residency::policy::{OffloadConfig, ResidencyPolicy},
         PagedCacheOptions,
     };
 

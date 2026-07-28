@@ -1,13 +1,16 @@
-//! Components shared by decoder-only causal language models.
-//!
-//! The implementation is organized by domain so model architectures can import
-//! only the component groups they use.
+//! Compatibility paths for architecture-neutral neural-network components.
 
-pub mod attention;
-/// Block-scaled E4M3 projections shared by native FP8 model families.
-pub mod block_fp8;
-pub mod convolution;
-pub mod generation;
-pub mod layers;
-pub mod linear;
-pub mod moe;
+/// Compatibility re-export for shared attention components.
+pub use crate::nn::attention;
+/// Compatibility re-export for causal convolution layers.
+pub use crate::nn::convolution;
+/// Compatibility re-export for block-scaled FP8 projections.
+pub use crate::nn::fp8 as block_fp8;
+/// Compatibility re-export for causal generation traits.
+pub use crate::nn::generation;
+/// Compatibility re-export for activations and feed-forward layers.
+pub use crate::nn::layers;
+/// Compatibility re-export for linear layers and embeddings.
+pub use crate::nn::linear;
+/// Compatibility re-export for mixture-of-experts components.
+pub use crate::nn::moe;

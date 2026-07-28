@@ -18,12 +18,10 @@ use serde::Deserialize;
 use serde_json::Value;
 use tokenizers::Tokenizer;
 
-pub use super::common::generation::sample;
+pub use crate::nn::generation::sample;
 
 use crate::{
-    cache::KeyValueCache,
     error::Error,
-    inspection::{ActivationObserver, MoeRoutingObservation},
     models::{
         common::{
             self,
@@ -39,16 +37,18 @@ use crate::{
         },
         input,
     },
-    quantization::WeightQuantization,
+    runtime::cache::KeyValueCache,
+    runtime::checkpoint::load::{
+        gguf_metadata, gguf_quantization_configs, load_gguf_strict, load_named_array_strict,
+        load_safetensors_dir_lenient, load_safetensors_dir_quantized_strict, GgufTensorNames,
+        StrictLoadConfig, StrictLoadReport,
+    },
+    runtime::checkpoint::quantization::WeightQuantization,
+    runtime::execution::inspection::{ActivationObserver, MoeRoutingObservation},
     utils::{
         create_attention_mask,
         rope::{initialize_rope, FloatOrString, RopeVariant},
         AttentionMask,
-    },
-    weights::{
-        gguf_metadata, gguf_quantization_configs, load_gguf_strict, load_named_array_strict,
-        load_safetensors_dir_lenient, load_safetensors_dir_quantized_strict, GgufTensorNames,
-        StrictLoadConfig, StrictLoadReport,
     },
 };
 
@@ -1971,7 +1971,7 @@ pub fn load_qwen3_model_quantized(
 ) -> Result<Model, Error> {
     let model_dir = model_dir.as_ref();
     let mut model_args = get_qwen3_model_args(model_dir)?;
-    if !crate::quantization::should_quantize_on_load(
+    if !crate::runtime::checkpoint::quantization::should_quantize_on_load(
         "Qwen3",
         model_args.weight_quantization(),
         quantization,
@@ -2053,10 +2053,10 @@ mod tests {
     };
 
     use crate::{
-        cache::{ConcatKeyValueCache, KeyValueCache},
         models::common::generation::CausalLm,
         models::qwen3::{load_qwen3_model, load_qwen3_tokenizer},
-        quantization::AffineQuantization,
+        runtime::cache::{ConcatKeyValueCache, KeyValueCache},
+        runtime::checkpoint::quantization::AffineQuantization,
     };
 
     const CACHED_TEST_MODEL_DIR: &str = "../cache/Qwen3-4B-bf16";
@@ -2122,33 +2122,57 @@ mod tests {
             "model.layers.3.mlp.experts.down_proj"
         );
         assert_eq!(
-            crate::quantization::gguf_affine_quantization(&[4096, 256], &[4096, 64], "q_proj",)
-                .unwrap(),
+            crate::runtime::checkpoint::quantization::gguf_affine_quantization(
+                &[4096, 256],
+                &[4096, 64],
+                "q_proj",
+            )
+            .unwrap(),
             AffineQuantization::new(32, 4).unwrap()
         );
         assert_eq!(
-            crate::quantization::gguf_affine_quantization(&[512, 512], &[512, 64], "k_proj",)
-                .unwrap(),
+            crate::runtime::checkpoint::quantization::gguf_affine_quantization(
+                &[512, 512],
+                &[512, 64],
+                "k_proj",
+            )
+            .unwrap(),
             AffineQuantization::new(32, 8).unwrap()
         );
         assert_eq!(
-            crate::quantization::gguf_affine_quantization(&[4096, 320], &[4096, 64], "v_proj",)
-                .unwrap(),
+            crate::runtime::checkpoint::quantization::gguf_affine_quantization(
+                &[4096, 320],
+                &[4096, 64],
+                "v_proj",
+            )
+            .unwrap(),
             AffineQuantization::new(32, 5).unwrap()
         );
         assert_eq!(
-            crate::quantization::gguf_affine_quantization(&[1024, 192], &[1024, 64], "down_proj",)
-                .unwrap(),
+            crate::runtime::checkpoint::quantization::gguf_affine_quantization(
+                &[1024, 192],
+                &[1024, 64],
+                "down_proj",
+            )
+            .unwrap(),
             AffineQuantization::new(16, 6).unwrap()
         );
         assert_eq!(
-            crate::quantization::gguf_affine_quantization(&[1024, 64], &[1024, 64], "q2_proj",)
-                .unwrap(),
+            crate::runtime::checkpoint::quantization::gguf_affine_quantization(
+                &[1024, 64],
+                &[1024, 64],
+                "q2_proj",
+            )
+            .unwrap(),
             AffineQuantization::new(16, 2).unwrap()
         );
         assert_eq!(
-            crate::quantization::gguf_affine_quantization(&[1024, 96], &[1024, 64], "q3_proj",)
-                .unwrap(),
+            crate::runtime::checkpoint::quantization::gguf_affine_quantization(
+                &[1024, 96],
+                &[1024, 64],
+                "q3_proj",
+            )
+            .unwrap(),
             AffineQuantization::new(16, 3).unwrap()
         );
     }

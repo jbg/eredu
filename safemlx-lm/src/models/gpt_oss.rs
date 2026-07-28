@@ -20,23 +20,25 @@ use serde::Deserialize;
 use tokenizers::Tokenizer;
 
 use crate::{
-    cache::{ConcatKeyValueCache, KeyValueCache, PagedKeyValueCache, SlidingKeyValueCache},
-    cache_residency::{
+    error::Error,
+    models::{common, common::generation::CausalLm, input},
+    runtime::cache::residency::{
         derive_prompt_cache_architecture_fingerprint, open_prompt_cache,
         validate_prompt_cache_model_identity, CacheRankIdentity, CacheResidencyManager,
         CacheResidencyPolicy, CacheResidencyReport, PagedCacheOptions, PromptCacheDescriptor,
         PromptCacheManifest, PromptCacheModelIdentity,
     },
-    error::Error,
-    models::{common, common::generation::CausalLm, input},
-    quantization::WeightQuantization,
+    runtime::cache::{
+        ConcatKeyValueCache, KeyValueCache, PagedKeyValueCache, SlidingKeyValueCache,
+    },
+    runtime::checkpoint::load::{
+        load_safetensors_dir_quantized_strict, load_safetensors_dir_strict, StrictLoadConfig,
+        StrictLoadReport,
+    },
+    runtime::checkpoint::quantization::WeightQuantization,
     utils::{
         create_causal_mask,
         rope::{initialize_rope, FloatOrString, RopeVariant},
-    },
-    weights::{
-        load_safetensors_dir_quantized_strict, load_safetensors_dir_strict, StrictLoadConfig,
-        StrictLoadReport,
     },
 };
 
@@ -777,10 +779,10 @@ impl Cache {
     pub fn save_prompt_cache(
         &mut self,
         destination: impl AsRef<Path>,
-        descriptor: crate::cache_residency::PromptCacheDescriptor,
+        descriptor: crate::runtime::cache::residency::PromptCacheDescriptor,
         prefix_token_ids: &[u32],
-        options: &crate::cache_residency::PromptCacheOptions,
-    ) -> Result<crate::cache_residency::PromptCacheManifest, Exception> {
+        options: &crate::runtime::cache::residency::PromptCacheOptions,
+    ) -> Result<crate::runtime::cache::residency::PromptCacheManifest, Exception> {
         let mut manager = None;
         for layer in &mut self.layers {
             if let LayerCache::Paged(cache) = layer {
@@ -1145,7 +1147,7 @@ pub fn load_model_quantized(
     }
     let model_dir = model_dir.as_ref();
     let mut args = get_model_args(model_dir)?;
-    if !crate::quantization::should_quantize_on_load(
+    if !crate::runtime::checkpoint::quantization::should_quantize_on_load(
         "GPT-OSS dense matrices",
         args.quantization,
         quantization,
@@ -1186,7 +1188,7 @@ mod tests {
     };
 
     use super::{Cache, Model, ModelArgs, MxFp4Config};
-    use crate::utils::rope::FloatOrString;
+    use crate::nn::rope::FloatOrString;
 
     fn tiny_args() -> ModelArgs {
         ModelArgs {

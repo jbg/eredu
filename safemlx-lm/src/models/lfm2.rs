@@ -19,7 +19,6 @@ use serde_json::Value;
 use tokenizers::Tokenizer;
 
 use crate::{
-    cache::{ConcatKeyValueCache, KeyValueCache},
     error::Error,
     models::{
         common::{
@@ -36,17 +35,18 @@ use crate::{
         input,
         qwen3::{gguf_i32, gguf_string},
     },
-    quantization::WeightQuantization,
-    utils::{
-        create_attention_mask,
-        rope::{initialize_rope, FloatOrString, RopeVariant},
-        AttentionMask,
-    },
-    weights::{
+    runtime::cache::{ConcatKeyValueCache, KeyValueCache},
+    runtime::checkpoint::load::{
         gguf_metadata, gguf_quantization_configs, load_named_array_strict,
         load_safetensors_dir_quantized_strict, load_safetensors_dir_strict,
         load_safetensors_dir_strict_with_split_swiglu_experts, GgufTensorNames, StrictLoadConfig,
         StrictLoadReport,
+    },
+    runtime::checkpoint::quantization::WeightQuantization,
+    utils::{
+        create_attention_mask,
+        rope::{initialize_rope, FloatOrString, RopeVariant},
+        AttentionMask,
     },
 };
 
@@ -1229,7 +1229,7 @@ pub fn load_model_quantized(
 ) -> Result<Model, Error> {
     let model_dir = model_dir.as_ref();
     let mut args = get_model_args(model_dir)?;
-    if !crate::quantization::should_quantize_on_load(
+    if !crate::runtime::checkpoint::quantization::should_quantize_on_load(
         "LFM2",
         args.weight_quantization(),
         quantization,
@@ -1909,7 +1909,7 @@ mod tests {
             let mut cache = model.new_cache();
             let prompt = safemlx::Array::from_slice(&[1_u32, 2, 3], &[1, 3]);
             let parts = [crate::models::input::InputPart::text_token_ids(&prompt)];
-            let logits = crate::models::common::generation::CausalLm::prefill_input_logits(
+            let logits = crate::nn::generation::CausalLm::prefill_input_logits(
                 &mut model,
                 crate::models::input::ModelInput::new(&parts),
                 &mut cache,
@@ -1921,7 +1921,7 @@ mod tests {
             assert_eq!(logits.max(None, stream).unwrap().item::<f32>(stream), 0.0);
 
             let next = safemlx::Array::from_slice(&[4_u32], &[1, 1]);
-            let logits = crate::models::common::generation::CausalLm::decode_logits(
+            let logits = crate::nn::generation::CausalLm::decode_logits(
                 &mut model, &next, &mut cache, stream,
             )
             .unwrap();

@@ -21,49 +21,52 @@
 
 #![warn(missing_docs)]
 
-/// Attention key/value cache implementations.
-pub mod cache;
-/// Block-addressable attention-cache residency and prompt-cache persistence.
-pub mod cache_residency;
+/// Architecture-neutral neural-network building blocks.
+pub mod nn;
+/// Architecture-independent model execution infrastructure.
+pub mod runtime;
+/// Compatibility path for attention key/value cache implementations.
+pub use runtime::cache::kv as cache;
+/// Compatibility path for attention-cache residency and persistence.
+pub use runtime::cache::residency as cache_residency;
 /// Chat-template preparation and native tool-runtime contracts.
 pub mod chat;
 /// Bounded layer execution for DeepSeek-V3 and DeepSeek-R1.
 pub mod deepseek_v3;
-/// Experimental bounded dense-layer streaming from safetensors checkpoints.
-pub mod dense_stream;
+/// Compatibility path for bounded dense-layer checkpoint streaming.
+pub use runtime::residency::dense_stream;
 /// Error types returned by the language-model runtime.
 pub mod error;
-/// Architecture-independent sparse routed-expert caching and telemetry.
-pub mod expert_cache;
+/// Compatibility path for sparse routed-expert caching and telemetry.
+pub use runtime::residency::expert_cache;
 /// Reusable expert-parallel assignment, dispatch, exchange, and model metadata.
 pub mod expert_parallel;
 mod format_dialect;
 /// Multimodal bounded layer execution for Gemma 4.
 pub mod gemma4;
 mod gemma4_mtp;
-mod gguf_tokenizer;
 /// Unified fully resident and bounded layer execution for GPT-OSS.
 pub mod gpt_oss;
 mod harmony_format;
 /// Multimodal bounded layer execution for Thinking Machines Lab Inkling.
 pub mod inkling;
-/// Lightweight activation inspection hooks.
-pub mod inspection;
-/// Generic model-family adapters and host-backed layerwise execution.
-pub mod layerwise;
+/// Compatibility path for activation inspection hooks.
+pub use runtime::execution::inspection;
+/// Compatibility path for host-backed layerwise execution.
+pub use runtime::execution::layerwise;
 /// Unified fully resident and bounded layer execution for LFM2/LFM2.5.
 pub mod lfm2;
 mod lfm2_format;
 /// Unified Llama/Mistral loading across weight-residency policies.
 pub mod llama;
-/// Canonical unloaded-module checkpoint binding and resident assignment helpers.
-pub mod module_binding;
+/// Compatibility path for checkpoint binding and resident assignment.
+pub use runtime::checkpoint::binding as module_binding;
 /// Bounded layer execution for Moshi and PersonaPlex realtime token models.
 pub mod moshi;
 /// Unified fully resident and bounded layer execution for Nemotron-H.
 pub mod nemotron_h;
-/// Planning contracts and telemetry for weight residency management.
-pub mod offload;
+/// Compatibility path for weight-residency policy and telemetry.
+pub use runtime::residency::policy as offload;
 mod qwen_mtp;
 // pub mod generate;
 /// Supported model implementations and model-directory loading helpers.
@@ -77,8 +80,8 @@ pub mod pipeline;
 /// Model-agnostic media processing and prepared-input helpers.
 #[cfg(feature = "media-processing")]
 pub mod processor;
-/// Generic affine checkpoint quantization and conversion utilities.
-pub mod quantization;
+/// Compatibility path for checkpoint quantization and conversion.
+pub use runtime::checkpoint::quantization;
 /// Unified dense and sparse-MoE Qwen3 bounded layer execution.
 pub mod qwen3;
 /// Shared multimodal bounded layer execution for dense and MoE Qwen3-VL.
@@ -87,8 +90,8 @@ pub mod qwen3_vl;
 pub mod qwen_hybrid;
 /// Codec-free realtime speech-to-speech token APIs.
 pub mod realtime;
-/// Budgeted host and device residency for logical immutable weight units.
-pub mod residency;
+/// Compatibility path for immutable-weight residency management.
+pub use runtime::residency::manager as residency;
 /// Token sampling strategies.
 pub mod sampler;
 /// Protocol-independent semantic streaming contracts and machinery.
@@ -100,12 +103,12 @@ mod test_utils;
 mod tool_constraints;
 /// Shared tensor, RoPE, attention, and tokenizer utilities.
 pub mod utils;
-/// Composable metadata-validated checkpoint-derived weight recipes.
-pub mod weight_recipe;
-/// Persistent checkpoint catalogs, leases, and bounded safetensors mappings.
-pub mod weight_store;
-/// Strict safetensors loading and validation utilities.
-pub mod weights;
+/// Compatibility path for strict checkpoint loading and validation.
+pub use runtime::checkpoint::load as weights;
+/// Compatibility path for checkpoint-derived weight recipes.
+pub use runtime::checkpoint::recipe as weight_recipe;
+/// Compatibility path for persistent lazy checkpoint storage.
+pub use runtime::checkpoint::store as weight_store;
 
 pub use cache::PagedKeyValueCache;
 pub use cache_residency::{

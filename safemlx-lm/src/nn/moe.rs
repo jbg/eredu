@@ -17,8 +17,8 @@ use safemlx::{
 
 use crate::{
     error::Error,
-    inspection::ActivationObserver,
-    quantization::{quantize_tensor, QuantizedTensor, WeightQuantization},
+    runtime::checkpoint::quantization::{quantize_tensor, QuantizedTensor, WeightQuantization},
+    runtime::execution::inspection::ActivationObserver,
 };
 
 use super::layers::{relu2, silu};

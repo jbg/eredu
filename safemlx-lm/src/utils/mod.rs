@@ -12,10 +12,10 @@ use safemlx::{
     Array, Dtype, Stream,
 };
 
-use crate::cache::KeyValueCache;
+use crate::runtime::cache::KeyValueCache;
 
-/// Rotary position-embedding variants and initialization.
-pub mod rope;
+/// Compatibility re-export for rotary position embeddings.
+pub use crate::nn::rope;
 /// Tokenizer-related re-exports and helpers.
 pub mod tokenizer;
 
@@ -408,7 +408,7 @@ where
 mod tests {
     use safemlx::{ops::indexing::TryIndexOp, Array, Device, DeviceType, ExecutionContext};
 
-    use crate::cache::{KeyValueCache, SlidingKeyValueCache};
+    use crate::runtime::cache::{KeyValueCache, SlidingKeyValueCache};
 
     #[test]
     #[ignore = "requires MLX runtime execution"]

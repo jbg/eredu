@@ -4,7 +4,7 @@
 //! describe a separate residency decision: the tier in which an owned logical
 //! unit is intended to reside and its lifetime policy. This module validates
 //! explicit plans and records observations. The architecture-independent
-//! executor lives in [`crate::residency`].
+//! executor lives in [`crate::runtime::residency::manager`].
 //!
 //! The vendored MLX C API does not expose stream events or fences. Residency
 //! execution therefore uses conservative

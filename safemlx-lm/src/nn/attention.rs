@@ -15,7 +15,7 @@ use safemlx::{
 };
 
 use crate::{
-    cache::KeyValueCache,
+    runtime::cache::KeyValueCache,
     utils::{create_causal_mask, rope::RopeVariant, scaled_dot_product_attention},
 };
 

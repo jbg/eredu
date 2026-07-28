@@ -40,24 +40,26 @@ use super::{
     qwen3_5_moe::{QwenLinear as Linear, QwenWeightFormat as WeightFormat},
 };
 use crate::{
-    cache::{BlockwiseAttentionAccumulator, CompressedLatentCache, KeyValueAttentionBlock},
-    cache_residency::{
+    error::Error,
+    runtime::cache::residency::{
         derive_prompt_cache_architecture_fingerprint, open_prompt_cache,
         validate_prompt_cache_model_identity, CacheBlockArrays, CacheRankIdentity,
         CacheResidencyManager, CacheResidencyPolicy, CacheResidencyReport, PagedCacheOptions,
         PromptCacheDescriptor, PromptCacheManifest, PromptCacheModelIdentity, PromptCacheOptions,
     },
-    error::Error,
-    inspection::{ActivationObserver, MoeRoutingObservation},
-    quantization::{quantize_tensor, WeightQuantization},
-    utils::{
-        create_causal_mask,
-        rope::{initialize_rope, FloatOrString, RopeVariant},
+    runtime::cache::{
+        BlockwiseAttentionAccumulator, CompressedLatentCache, KeyValueAttentionBlock,
     },
-    weights::{
+    runtime::checkpoint::load::{
         for_each_safetensor_array, gguf_metadata, gguf_quantization_configs,
         load_array_quantized_strict, load_array_strict, safetensors_files, GgufTensorNames,
         StrictLoadConfig, StrictLoadReport,
+    },
+    runtime::checkpoint::quantization::{quantize_tensor, WeightQuantization},
+    runtime::execution::inspection::{ActivationObserver, MoeRoutingObservation},
+    utils::{
+        create_causal_mask,
+        rope::{initialize_rope, FloatOrString, RopeVariant},
     },
 };
 
@@ -3321,7 +3323,7 @@ pub fn load_model_quantized(
                 .into(),
         ));
     }
-    if !crate::quantization::should_quantize_on_load(
+    if !crate::runtime::checkpoint::quantization::should_quantize_on_load(
         "DeepSeek-V3",
         args.affine_quantization()?,
         quantization,
@@ -3732,11 +3734,11 @@ pub fn load_tokenizer(model_dir: impl AsRef<Path>) -> Result<Tokenizer, Error> {
 mod tests {
     use super::{load_model, parse_config_value, FeedForward, Model, ModelArgs, ModelInput};
     use crate::{
-        cache::CompressedLatentCache,
-        cache_residency::{CacheResidencyPolicy, PagedCacheOptions},
         error::Error,
-        inspection::{ActivationObserver, MoeRoutingObservation},
         models::{LoadedModel, ModelKind},
+        runtime::cache::residency::{CacheResidencyPolicy, PagedCacheOptions},
+        runtime::cache::CompressedLatentCache,
+        runtime::execution::inspection::{ActivationObserver, MoeRoutingObservation},
     };
     use safemlx::{
         error::Exception,
@@ -4209,7 +4211,7 @@ mod tests {
 
     #[test]
     fn parses_converter_affine_metadata_from_both_config_keys() {
-        use crate::quantization::{AffineQuantization, WeightQuantization};
+        use crate::runtime::checkpoint::quantization::{AffineQuantization, WeightQuantization};
         let quantization = WeightQuantization::Affine(AffineQuantization::new(32, 4).unwrap());
         let metadata = serde_json::to_value(quantization).unwrap();
         let mut value = affine_config_value();
@@ -4675,7 +4677,7 @@ mod tests {
 
     #[test]
     fn noaux_grouped_router_uses_bias_only_for_selection() {
-        use crate::models::common::moe::{TopKRouter, TopKRouterConfig, TopKRouterScoreFunction};
+        use crate::nn::moe::{TopKRouter, TopKRouterConfig, TopKRouterScoreFunction};
         let context = test_context();
         let stream = context.stream();
         let mut router = TopKRouter::new(
@@ -4771,7 +4773,7 @@ mod tests {
 
     #[test]
     fn affine_and_mxfp4_on_load_and_prequantized_expert_banks_run() {
-        use crate::quantization::{AffineQuantization, WeightQuantization};
+        use crate::runtime::checkpoint::quantization::{AffineQuantization, WeightQuantization};
         let context = test_context();
         let stream = context.stream();
         let mut source =
@@ -4853,7 +4855,7 @@ mod tests {
 
     #[test]
     fn loads_dense_and_mixed_affine_deepseek2_gguf_checkpoints() {
-        use crate::quantization::AffineQuantization;
+        use crate::runtime::checkpoint::quantization::AffineQuantization;
         use safemlx_gguf::GgmlType;
         let context = test_context();
         let stream = context.stream();
@@ -4889,7 +4891,7 @@ mod tests {
         let checkpoint = safemlx::ops::GgufCheckpoint::open(dense_fixture.path()).unwrap();
         let mut on_load = super::load_gguf_checkpoint(
             &checkpoint,
-            crate::weights::gguf_metadata(&checkpoint),
+            crate::runtime::checkpoint::load::gguf_metadata(&checkpoint),
             Some(q4.into()),
             stream,
             stream,
@@ -4948,7 +4950,7 @@ mod tests {
 
     #[test]
     fn native_fp8_on_load_transcoding_is_rejected() {
-        use crate::quantization::{AffineQuantization, WeightQuantization};
+        use crate::runtime::checkpoint::quantization::{AffineQuantization, WeightQuantization};
         let context = test_context();
         let stream = context.stream();
         let mut source = Model::new(tiny_fp8_args(), stream).unwrap();

@@ -17,15 +17,15 @@ use safemlx::{
 };
 
 use crate::{
-    dense_stream::DenseDiskStreamLoadOptions,
-    layerwise::LayerwiseLoadOptions,
-    offload::{
-        MemoryTier, OffloadConfig, OffloadPlan, OffloadUnitId, OffloadUnitSpec, ResidencyPolicy,
-    },
-    residency::{
+    runtime::checkpoint::store::WeightStore,
+    runtime::execution::layerwise::LayerwiseLoadOptions,
+    runtime::residency::dense_stream::DenseDiskStreamLoadOptions,
+    runtime::residency::manager::{
         OffloadUnit, ResidencyError, ResidencyManager, ResidencyReport, ResidentUnitLease,
     },
-    weight_store::WeightStore,
+    runtime::residency::policy::{
+        MemoryTier, OffloadConfig, OffloadPlan, OffloadUnitId, OffloadUnitSpec, ResidencyPolicy,
+    },
 };
 
 /// Stable architecture-neutral identity for one layer-local global expert.
@@ -918,7 +918,7 @@ pub enum ExpertCacheError {
     },
     /// Invalid offload plan configuration.
     #[error(transparent)]
-    Offload(#[from] crate::offload::OffloadError),
+    Offload(#[from] crate::runtime::residency::policy::OffloadError),
     /// Residency validation or materialization failed.
     #[error(transparent)]
     Residency(#[from] ResidencyError),
@@ -936,9 +936,9 @@ mod tests {
 
     use super::*;
     use crate::{
-        offload::CacheEvictionPolicy,
-        residency::WeightBinding,
-        weight_store::{SafetensorsWeightStore, TensorSelection},
+        runtime::checkpoint::store::{SafetensorsWeightStore, TensorSelection},
+        runtime::residency::manager::WeightBinding,
+        runtime::residency::policy::CacheEvictionPolicy,
     };
 
     fn stream() -> Stream {

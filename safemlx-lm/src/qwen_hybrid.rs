@@ -17,17 +17,7 @@ use safemlx::{
 };
 
 use crate::{
-    cache::KeyValueCache,
     error::Error,
-    expert_cache::{
-        ExpertCache, ExpertCacheLoadOptions, ExpertCacheReport, ExpertCatalogEntry, ExpertIdentity,
-        ExpertPass,
-    },
-    layerwise::{
-        load_general_layerwise_model, load_general_layerwise_model_with_store,
-        GeneralLayerwiseModel, GeneralLayerwiseModelAdapter, LayerExecutionLoadOptions,
-        LayerwiseForwardState, StaticUnitBindings, WeightResidency,
-    },
     models::{
         common::{self, generation::CausalLm, linear::project_logits_maybe_quantized},
         input,
@@ -41,14 +31,26 @@ use crate::{
             QwenVisionLayerwiseStatic, QwenVisionTransformer, VisionConfig,
         },
     },
-    module_binding::{
+    runtime::cache::KeyValueCache,
+    runtime::checkpoint::binding::{
         build_module_bindings_with_recipes, canonical_checkpoint_name, populate_module_from_lease,
         populate_module_from_lease_excluding,
     },
-    residency::{OffloadUnit, ResidencyReport, ResidentUnitLease, WeightBinding},
+    runtime::checkpoint::recipe::DerivedWeightRecipe,
+    runtime::checkpoint::store::{
+        GgufWeightStore, TensorSelection, WeightStore, WeightStoreBackend,
+    },
+    runtime::execution::layerwise::{
+        load_general_layerwise_model, load_general_layerwise_model_with_store,
+        GeneralLayerwiseModel, GeneralLayerwiseModelAdapter, LayerExecutionLoadOptions,
+        LayerwiseForwardState, StaticUnitBindings, WeightResidency,
+    },
+    runtime::residency::expert_cache::{
+        ExpertCache, ExpertCacheLoadOptions, ExpertCacheReport, ExpertCatalogEntry, ExpertIdentity,
+        ExpertPass,
+    },
+    runtime::residency::manager::{OffloadUnit, ResidencyReport, ResidentUnitLease, WeightBinding},
     utils::{create_attention_mask, AttentionMask},
-    weight_recipe::DerivedWeightRecipe,
-    weight_store::{GgufWeightStore, TensorSelection, WeightStore, WeightStoreBackend},
 };
 
 const EMBEDDING_UNIT: &str = "qwen_hybrid.static.embedding";
@@ -86,7 +88,7 @@ impl QwenHybridLayerwiseModel {
     /// Returns dense-stream observations when that policy is active.
     pub fn dense_stream_report(
         &self,
-    ) -> Result<Option<crate::layerwise::DenseDiskStreamReport>, Error> {
+    ) -> Result<Option<crate::runtime::execution::layerwise::DenseDiskStreamReport>, Error> {
         self.execution.dense_stream_report()
     }
 
@@ -403,7 +405,7 @@ pub fn load_qwen3_next_sparse_expert_cache_model(
 pub fn load_qwen3_next_sparse_expert_cache_model_with_dense_layers(
     model_dir: impl AsRef<Path>,
     options: ExpertCacheLoadOptions,
-    non_expert: crate::dense_stream::DenseDiskStreamLoadOptions,
+    non_expert: crate::runtime::residency::dense_stream::DenseDiskStreamLoadOptions,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<QwenHybridLayerwiseModel, Error> {
@@ -464,7 +466,7 @@ pub fn load_qwen35_sparse_expert_cache_model(
 pub fn load_qwen35_sparse_expert_cache_model_with_dense_layers(
     model_dir: impl AsRef<Path>,
     options: ExpertCacheLoadOptions,
-    non_expert: crate::dense_stream::DenseDiskStreamLoadOptions,
+    non_expert: crate::runtime::residency::dense_stream::DenseDiskStreamLoadOptions,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<QwenHybridLayerwiseModel, Error> {
@@ -2171,8 +2173,6 @@ mod tests {
         load_qwen3_next_layerwise_model, load_qwen3_next_sparse_expert_cache_model,
     };
     use crate::{
-        expert_cache::ExpertCacheLoadOptions,
-        layerwise::LayerwiseLoadOptions,
         models::{
             common::generation::CausalLm,
             input as runtime_input,
@@ -2180,7 +2180,9 @@ mod tests {
             qwen3_next,
             qwen_vl::VisionConfig,
         },
-        offload::{OffloadConfig, ResidencyPolicy},
+        runtime::execution::layerwise::LayerwiseLoadOptions,
+        runtime::residency::expert_cache::ExpertCacheLoadOptions,
+        runtime::residency::policy::{OffloadConfig, ResidencyPolicy},
     };
 
     fn config(next: bool, moe: bool) -> serde_json::Value {
@@ -2225,7 +2227,7 @@ mod tests {
         let params = model.parameters().flatten();
         let mut arrays = Vec::<(String, Array)>::new();
         for (name, value) in params {
-            let name = crate::module_binding::canonical_checkpoint_name(&name);
+            let name = crate::runtime::checkpoint::binding::canonical_checkpoint_name(&name);
             if next && name.ends_with("mlp.experts.gate_up_proj") {
                 let prefix = name.trim_end_matches(".gate_up_proj");
                 for expert in 0..model.args.num_experts {
@@ -2359,11 +2361,15 @@ mod tests {
             assert_close(&actual, &expected);
             for (expected, actual) in resident_cache.layers.iter().zip(&layerwise_cache.layers) {
                 let expected_offset = match expected {
-                    LayerCache::FullAttention(cache) => crate::cache::KeyValueCache::offset(cache),
+                    LayerCache::FullAttention(cache) => {
+                        crate::runtime::cache::KeyValueCache::offset(cache)
+                    }
                     LayerCache::LinearAttention(cache) => cache.offset,
                 };
                 let actual_offset = match actual {
-                    LayerCache::FullAttention(cache) => crate::cache::KeyValueCache::offset(cache),
+                    LayerCache::FullAttention(cache) => {
+                        crate::runtime::cache::KeyValueCache::offset(cache)
+                    }
                     LayerCache::LinearAttention(cache) => cache.offset,
                 };
                 assert_eq!(expected_offset, actual_offset);
@@ -2547,7 +2553,7 @@ mod tests {
             .iter()
             .map(|(name, value)| {
                 (
-                    crate::module_binding::canonical_checkpoint_name(name),
+                    crate::runtime::checkpoint::binding::canonical_checkpoint_name(name),
                     (*value).clone(),
                 )
             })

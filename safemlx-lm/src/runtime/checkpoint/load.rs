@@ -15,7 +15,9 @@ use safetensors::SafeTensors;
 use serde::Deserialize;
 
 use crate::error::Error;
-use crate::quantization::{quantize_tensor, AffineQuantization, WeightQuantization};
+use crate::runtime::checkpoint::quantization::{
+    quantize_tensor, AffineQuantization, WeightQuantization,
+};
 
 pub(crate) fn gguf_metadata(checkpoint: &GgufCheckpoint) -> HashMap<String, GgufMetadataValue> {
     checkpoint
@@ -1209,7 +1211,9 @@ mod tests {
 
     use crate::{
         models::common::linear::unloaded_maybe_quantized_linear,
-        quantization::{quantize_tensor, AffineQuantization, WeightQuantization},
+        runtime::checkpoint::quantization::{
+            quantize_tensor, AffineQuantization, WeightQuantization,
+        },
     };
 
     use super::{

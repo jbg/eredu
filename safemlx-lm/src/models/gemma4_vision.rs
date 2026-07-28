@@ -10,7 +10,7 @@ use safemlx::{
 use serde::Deserialize;
 
 use super::{gemma4::rms_norm_without_scale, gemma4_multimodal::Gemma4ClippedLinear};
-use crate::utils::rope::FloatOrString;
+use crate::nn::rope::FloatOrString;
 
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) struct Gemma4VisionConfig {

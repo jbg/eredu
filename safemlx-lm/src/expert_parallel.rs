@@ -23,19 +23,7 @@ use safemlx::{
 };
 
 use crate::{
-    cache::{ConcatKeyValueCache, KeyValueCache, PagedKeyValueCache, SlidingKeyValueCache},
-    cache_residency::{
-        open_prompt_cache, validate_prompt_cache_model_identity, CacheRankIdentity,
-        CacheResidencyManager, CacheResidencyPolicy, CacheResidencyReport, PagedCacheOptions,
-        PromptCacheDescriptor, PromptCacheManifest, PromptCacheModelIdentity, PromptCacheOptions,
-        PromptCacheTopology,
-    },
     error::Error,
-    expert_cache::{
-        AcquiredExperts, ExpertCache, ExpertCacheLoadOptions, ExpertCacheReport,
-        ExpertCatalogEntry, ExpertPass,
-    },
-    inspection::ActivationObserver,
     models::{
         deepseek_v3, gpt_oss, inkling, input as runtime_input, lfm2, nemotron_h, qwen3,
         qwen3_5_moe, qwen3_next, qwen3_vl, ModelKind, ModelLoadOptions,
@@ -46,13 +34,27 @@ use crate::{
         TensorPlacement,
     },
     pipeline::{assign_module, assign_module_excluding, load_deepseek_experts, SynchronizedToken},
-    quantization::{should_quantize_on_load, WeightQuantization},
+    runtime::cache::residency::{
+        open_prompt_cache, validate_prompt_cache_model_identity, CacheRankIdentity,
+        CacheResidencyManager, CacheResidencyPolicy, CacheResidencyReport, PagedCacheOptions,
+        PromptCacheDescriptor, PromptCacheManifest, PromptCacheModelIdentity, PromptCacheOptions,
+        PromptCacheTopology,
+    },
+    runtime::cache::{
+        ConcatKeyValueCache, KeyValueCache, PagedKeyValueCache, SlidingKeyValueCache,
+    },
+    runtime::checkpoint::load::{transform_split_swiglu_experts, StrictLoadConfig},
+    runtime::checkpoint::quantization::{should_quantize_on_load, WeightQuantization},
+    runtime::checkpoint::store::{SafetensorsWeightStore, WeightStore},
+    runtime::execution::inspection::ActivationObserver,
+    runtime::residency::expert_cache::{
+        AcquiredExperts, ExpertCache, ExpertCacheLoadOptions, ExpertCacheReport,
+        ExpertCatalogEntry, ExpertPass,
+    },
     sampler::{DefaultSampler, Sampler, SpeculativeSampler},
-    weight_store::{SafetensorsWeightStore, WeightStore},
-    weights::{transform_split_swiglu_experts, StrictLoadConfig},
 };
 
-use crate::layerwise::WeightResidency;
+use crate::runtime::execution::layerwise::WeightResidency;
 
 use crate::models::{
     common::moe::{quantize_expert_bank, PackedRelu2Experts, PackedSwiGluExperts},
@@ -4248,10 +4250,11 @@ mod tests {
         );
 
         let expert_options = ExpertCacheLoadOptions::new(
-            crate::layerwise::LayerwiseLoadOptions::new(
-                crate::offload::OffloadConfig::new(None, None, 1).unwrap(),
+            crate::runtime::execution::layerwise::LayerwiseLoadOptions::new(
+                crate::runtime::residency::policy::OffloadConfig::new(None, None, 1).unwrap(),
             ),
-            crate::offload::OffloadConfig::new(Some(1 << 20), Some(0), 1).unwrap(),
+            crate::runtime::residency::policy::OffloadConfig::new(Some(1 << 20), Some(0), 1)
+                .unwrap(),
             1 << 20,
         )
         .unwrap();

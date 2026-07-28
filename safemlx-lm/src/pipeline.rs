@@ -25,39 +25,41 @@ use safemlx::{
 };
 
 use crate::{
-    cache::{
-        CompressedLatentCache, ConcatKeyValueCache, KeyValueCache, PagedKeyValueCache,
-        SlidingKeyValueCache,
-    },
-    cache_residency::{
-        open_prompt_cache, validate_prompt_cache_model_identity, CacheRankIdentity,
-        CacheResidencyManager, CacheResidencyPolicy, CacheResidencyReport, PagedCacheOptions,
-        PromptCacheDescriptor, PromptCacheManifest, PromptCacheModelIdentity, PromptCacheOptions,
-        PromptCacheTopology,
-    },
     error::Error,
-    inspection::ActivationObserver,
-    layerwise::{
-        DenseDiskStreamReport, DenseStreamController, GeneralLayerwiseModelAdapter, WeightResidency,
-    },
     models::{
         common::{linear, linear::project_logits_maybe_quantized},
         deepseek_v3, llama, ModelKind, ModelLoadOptions,
-    },
-    module_binding::{binding_bytes, build_module_bindings, populate_module_from_lease},
-    offload::{
-        MemoryTier, OffloadConfig, OffloadPlan, OffloadUnitId, OffloadUnitSpec, ResidencyPolicy,
     },
     parallel::{
         load_safetensors_partition_on_streams, ParallelTopology, PlacementPlan, RankPartition,
         TensorPlacement,
     },
-    quantization::{quantize_tensor, WeightQuantization},
-    residency::{OffloadUnit, ResidencyManager},
+    runtime::cache::residency::{
+        open_prompt_cache, validate_prompt_cache_model_identity, CacheRankIdentity,
+        CacheResidencyManager, CacheResidencyPolicy, CacheResidencyReport, PagedCacheOptions,
+        PromptCacheDescriptor, PromptCacheManifest, PromptCacheModelIdentity, PromptCacheOptions,
+        PromptCacheTopology,
+    },
+    runtime::cache::{
+        CompressedLatentCache, ConcatKeyValueCache, KeyValueCache, PagedKeyValueCache,
+        SlidingKeyValueCache,
+    },
+    runtime::checkpoint::binding::{
+        binding_bytes, build_module_bindings, populate_module_from_lease,
+    },
+    runtime::checkpoint::load::StrictLoadConfig,
+    runtime::checkpoint::quantization::{quantize_tensor, WeightQuantization},
+    runtime::checkpoint::store::{SafetensorsWeightStore, WeightStore},
+    runtime::execution::inspection::ActivationObserver,
+    runtime::execution::layerwise::{
+        DenseDiskStreamReport, DenseStreamController, GeneralLayerwiseModelAdapter, WeightResidency,
+    },
+    runtime::residency::manager::{OffloadUnit, ResidencyManager},
+    runtime::residency::policy::{
+        MemoryTier, OffloadConfig, OffloadPlan, OffloadUnitId, OffloadUnitSpec, ResidencyPolicy,
+    },
     sampler::Sampler,
     utils::create_causal_mask,
-    weight_store::{SafetensorsWeightStore, WeightStore},
-    weights::StrictLoadConfig,
 };
 
 /// Immutable, inspectable description of the local pipeline stage.
@@ -274,8 +276,8 @@ impl PipelineDenseLayers {
         prefill: bool,
     ) -> Result<
         (
-            Option<crate::residency::ResidentUnitLease>,
-            crate::residency::ResidentUnitLease,
+            Option<crate::runtime::residency::manager::ResidentUnitLease>,
+            crate::runtime::residency::manager::ResidentUnitLease,
         ),
         Error,
     > {
@@ -946,7 +948,7 @@ fn full_parameter_names(module: &impl ModuleParameters, prefix: &str) -> Vec<Str
 }
 
 fn checkpoint_name(parameter_name: &str) -> String {
-    crate::module_binding::canonical_checkpoint_name(parameter_name)
+    crate::runtime::checkpoint::binding::canonical_checkpoint_name(parameter_name)
 }
 
 fn infer_activation_dtype(partition: &RankPartition) -> Dtype {
@@ -1095,7 +1097,7 @@ fn load_partition(
 }
 
 fn pipeline_load_config(
-    dense_stream: Option<crate::dense_stream::DenseDiskStreamLoadOptions>,
+    dense_stream: Option<crate::runtime::residency::dense_stream::DenseDiskStreamLoadOptions>,
     config: StrictLoadConfig,
 ) -> StrictLoadConfig {
     if dense_stream.is_some_and(|options| !options.strict_loading) {
@@ -1109,7 +1111,7 @@ fn pipeline_load_config(
 fn build_pipeline_dense_layers<L, F, B>(
     model_dir: &Path,
     range: Range<usize>,
-    options: crate::dense_stream::DenseDiskStreamLoadOptions,
+    options: crate::runtime::residency::dense_stream::DenseDiskStreamLoadOptions,
     static_device_bytes: u64,
     stream: &Stream,
     weights_stream: &Stream,
@@ -1119,7 +1121,11 @@ fn build_pipeline_dense_layers<L, F, B>(
 where
     L: ModuleParameters,
     F: FnMut(usize, &Stream) -> Result<L, Error>,
-    B: FnMut(usize, &L, &dyn WeightStore) -> Result<Vec<crate::residency::WeightBinding>, Error>,
+    B: FnMut(
+        usize,
+        &L,
+        &dyn WeightStore,
+    ) -> Result<Vec<crate::runtime::residency::manager::WeightBinding>, Error>,
 {
     options.validate()?;
     let layer_count = range.len();
@@ -1313,7 +1319,7 @@ fn load_llama_pipeline(
     model_dir: &Path,
     topology: ParallelTopology,
     requested_quantization: Option<WeightQuantization>,
-    dense_stream: Option<crate::dense_stream::DenseDiskStreamLoadOptions>,
+    dense_stream: Option<crate::runtime::residency::dense_stream::DenseDiskStreamLoadOptions>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<PipelineModel, Error> {
@@ -1326,7 +1332,7 @@ fn load_llama_pipeline(
     let source_args = llama::get_llama_model_args(model_dir)?;
     let quantize_on_load = requested_quantization
         .map(|requested| {
-            crate::quantization::should_quantize_on_load(
+            crate::runtime::checkpoint::quantization::should_quantize_on_load(
                 "Llama pipeline",
                 source_args.weight_quantization(),
                 requested,
@@ -1772,7 +1778,7 @@ fn load_deepseek_pipeline(
     model_dir: &Path,
     topology: ParallelTopology,
     requested_quantization: Option<WeightQuantization>,
-    dense_stream: Option<crate::dense_stream::DenseDiskStreamLoadOptions>,
+    dense_stream: Option<crate::runtime::residency::dense_stream::DenseDiskStreamLoadOptions>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<PipelineModel, Error> {
@@ -1790,7 +1796,7 @@ fn load_deepseek_pipeline(
     }
     let quantize_on_load = requested_quantization
         .map(|requested| {
-            crate::quantization::should_quantize_on_load(
+            crate::runtime::checkpoint::quantization::should_quantize_on_load(
                 "DeepSeek pipeline",
                 source_args.affine_quantization()?,
                 requested,
@@ -2248,8 +2254,7 @@ pub(crate) fn load_deepseek_experts(
             }
         }
         let weight = if let Some(quantization) = quantization {
-            let quantized =
-                crate::models::common::moe::quantize_expert_bank(&weight, quantization, stream)?;
+            let quantized = crate::nn::moe::quantize_expert_bank(&weight, quantization, stream)?;
             scales = Some(quantized.scales);
             biases = quantized.biases;
             quantized.weight
@@ -2483,7 +2488,7 @@ mod tests {
             .iter()
             .map(|(name, value)| {
                 (
-                    crate::module_binding::canonical_checkpoint_name(name),
+                    crate::runtime::checkpoint::binding::canonical_checkpoint_name(name),
                     (*value).clone(),
                 )
             })
@@ -2534,7 +2539,7 @@ mod tests {
             model_dir,
             ModelLoadOptions::with_parallel(topology).with_weight_residency(
                 WeightResidency::DenseDiskStream(
-                    crate::dense_stream::DenseDiskStreamLoadOptions::new(
+                    crate::runtime::residency::dense_stream::DenseDiskStreamLoadOptions::new(
                         u64::MAX,
                         u64::MAX,
                         1,
@@ -2558,8 +2563,8 @@ mod tests {
     fn sampled_dense_options(
         device_budget_bytes: u64,
         host_budget_bytes: u64,
-    ) -> crate::dense_stream::DenseDiskStreamLoadOptions {
-        let mut options = crate::dense_stream::DenseDiskStreamLoadOptions::new(
+    ) -> crate::runtime::residency::dense_stream::DenseDiskStreamLoadOptions {
+        let mut options = crate::runtime::residency::dense_stream::DenseDiskStreamLoadOptions::new(
             device_budget_bytes,
             host_budget_bytes,
             1,
@@ -2582,9 +2587,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         write_llama_fixture(dir.path(), &reference, true);
 
-        let mut dense =
-            crate::dense_stream::DenseDiskStreamLoadOptions::new(u64::MAX, u64::MAX, 1, 1, 1)
-                .unwrap();
+        let mut dense = crate::runtime::residency::dense_stream::DenseDiskStreamLoadOptions::new(
+            u64::MAX,
+            u64::MAX,
+            1,
+            1,
+            1,
+        )
+        .unwrap();
         let strict_error = load_pipeline_model_with_options(
             dir.path(),
             ModelLoadOptions::with_parallel(gpu_topology(0))
@@ -2614,7 +2624,8 @@ mod tests {
     #[test]
     fn non_strict_pipeline_config_preserves_architecture_allowances() {
         let mut dense =
-            crate::dense_stream::DenseDiskStreamLoadOptions::new(8, 0, 0, 1, 0).unwrap();
+            crate::runtime::residency::dense_stream::DenseDiskStreamLoadOptions::new(8, 0, 0, 1, 0)
+                .unwrap();
         let architecture = StrictLoadConfig::default().allow_unused_prefix("model.mtp.");
         let strict = pipeline_load_config(Some(dense), architecture.clone());
         assert!(strict.is_unused_allowed("model.mtp.weight"));
@@ -2981,7 +2992,7 @@ mod tests {
     fn write_deepseek_fixture(dir: &Path, model: &deepseek_v3::Model, stream: &Stream) {
         let mut arrays = Vec::<(String, Array)>::new();
         for (name, value) in model.parameters().flatten() {
-            let name = crate::module_binding::canonical_checkpoint_name(&name);
+            let name = crate::runtime::checkpoint::binding::canonical_checkpoint_name(&name);
             let packed_projection = ["gate_proj", "up_proj", "down_proj"]
                 .into_iter()
                 .find(|projection| name.ends_with(&format!(".mlp.experts.{projection}")));
@@ -3050,9 +3061,14 @@ mod tests {
         let mut reference = initialized_deepseek(stream);
         let dir = tempfile::tempdir().unwrap();
         write_deepseek_fixture(dir.path(), &reference, stream);
-        let dense =
-            crate::dense_stream::DenseDiskStreamLoadOptions::new(u64::MAX, u64::MAX, 1, 1, 1)
-                .unwrap();
+        let dense = crate::runtime::residency::dense_stream::DenseDiskStreamLoadOptions::new(
+            u64::MAX,
+            u64::MAX,
+            1,
+            1,
+            1,
+        )
+        .unwrap();
         let mut first = load_pipeline_model_with_options(
             dir.path(),
             ModelLoadOptions::with_parallel(gpu_topology(0))

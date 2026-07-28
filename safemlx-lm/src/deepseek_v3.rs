@@ -18,33 +18,33 @@ use safemlx::{
 };
 
 use crate::{
-    cache_residency::{
-        validate_prompt_cache_model_identity, CacheResidencyPolicy, PagedCacheOptions,
-        PromptCacheDescriptor, PromptCacheManifest, PromptCacheModelIdentity,
-    },
     error::Error,
-    expert_cache::{
-        ExpertCache, ExpertCacheLoadOptions, ExpertCacheReport, ExpertCatalogEntry, ExpertIdentity,
-        ExpertPass,
-    },
-    layerwise::{
-        load_general_layerwise_model, load_general_layerwise_model_with_store,
-        GeneralLayerwiseModel, GeneralLayerwiseModelAdapter, LayerExecutionLoadOptions,
-        LayerwiseForwardState, StaticUnitBindings, WeightResidency,
-    },
     models::{
         common::{self, generation::CausalLm},
         deepseek_v3::{self as resident, Cache, DecoderLayer, ModelArgs},
         input,
     },
-    module_binding::{
+    runtime::cache::residency::{
+        validate_prompt_cache_model_identity, CacheResidencyPolicy, PagedCacheOptions,
+        PromptCacheDescriptor, PromptCacheManifest, PromptCacheModelIdentity,
+    },
+    runtime::checkpoint::binding::{
         build_module_bindings_with_recipes, canonical_checkpoint_name, populate_module_from_lease,
         populate_module_from_lease_excluding,
     },
-    residency::{OffloadUnit, ResidencyReport, ResidentUnitLease, WeightBinding},
+    runtime::checkpoint::recipe::DerivedWeightRecipe,
+    runtime::checkpoint::store::{GgufWeightStore, TensorSelection, WeightStore},
+    runtime::execution::layerwise::{
+        load_general_layerwise_model, load_general_layerwise_model_with_store,
+        GeneralLayerwiseModel, GeneralLayerwiseModelAdapter, LayerExecutionLoadOptions,
+        LayerwiseForwardState, StaticUnitBindings, WeightResidency,
+    },
+    runtime::residency::expert_cache::{
+        ExpertCache, ExpertCacheLoadOptions, ExpertCacheReport, ExpertCatalogEntry, ExpertIdentity,
+        ExpertPass,
+    },
+    runtime::residency::manager::{OffloadUnit, ResidencyReport, ResidentUnitLease, WeightBinding},
     utils::create_causal_mask,
-    weight_recipe::DerivedWeightRecipe,
-    weight_store::{GgufWeightStore, TensorSelection, WeightStore},
 };
 
 const EMBEDDING_UNIT: &str = "deepseek_v3.static.embedding";
@@ -124,7 +124,7 @@ impl DeepSeekV3LayerwiseModel {
     /// Returns dense-stream observations when that policy is active.
     pub fn dense_stream_report(
         &self,
-    ) -> Result<Option<crate::layerwise::DenseDiskStreamReport>, Error> {
+    ) -> Result<Option<crate::runtime::execution::layerwise::DenseDiskStreamReport>, Error> {
         self.execution.dense_stream_report()
     }
 
@@ -328,7 +328,7 @@ pub fn load_deepseek_v3_sparse_expert_cache_model(
 pub fn load_deepseek_v3_sparse_expert_cache_model_with_dense_layers(
     model_dir: impl AsRef<Path>,
     options: ExpertCacheLoadOptions,
-    non_expert: crate::dense_stream::DenseDiskStreamLoadOptions,
+    non_expert: crate::runtime::residency::dense_stream::DenseDiskStreamLoadOptions,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<DeepSeekV3LayerwiseModel, Error> {
@@ -959,11 +959,11 @@ mod tests {
 
     use super::{load_deepseek_v3_layerwise_model, load_deepseek_v3_sparse_expert_cache_model};
     use crate::{
-        expert_cache::ExpertCacheLoadOptions,
-        layerwise::LayerwiseLoadOptions,
         models::deepseek_v3::{self as resident, FeedForward, Model, ModelArgs, ModelInput},
-        module_binding::canonical_checkpoint_name,
-        offload::{OffloadConfig, ResidencyPolicy},
+        runtime::checkpoint::binding::canonical_checkpoint_name,
+        runtime::execution::layerwise::LayerwiseLoadOptions,
+        runtime::residency::expert_cache::ExpertCacheLoadOptions,
+        runtime::residency::policy::{OffloadConfig, ResidencyPolicy},
     };
 
     fn config(fp8: bool) -> serde_json::Value {

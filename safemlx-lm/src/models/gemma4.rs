@@ -33,17 +33,15 @@ use serde::{Deserialize, Deserializer};
 use serde_json::Value;
 use tokenizers::Tokenizer;
 
-pub use super::common::generation::sample;
 use super::{
     gemma4_audio::{Gemma4AudioConfig, Gemma4AudioTower},
     gemma4_multimodal::Gemma4ModalityEmbedder,
     gemma4_vision::{Gemma4VisionConfig, Gemma4VisionTower},
 };
+pub use crate::nn::generation::sample;
 
 use crate::{
-    cache::{ConcatKeyValueCache, KeyValueCache},
     error::Error,
-    inspection::ActivationObserver,
     models::{
         common::{
             self,
@@ -55,15 +53,17 @@ use crate::{
         },
         input,
     },
-    quantization::{AffineQuantization, WeightQuantization},
-    utils::{
-        create_causal_mask,
-        rope::{initialize_rope, FloatOrString, RopeVariant},
-    },
-    weights::{
+    runtime::cache::{ConcatKeyValueCache, KeyValueCache},
+    runtime::checkpoint::load::{
         gguf_metadata, gguf_quantization_configs, load_named_array_strict,
         load_safetensors_quantized_strict, load_safetensors_strict, GgufTensorNames,
         StrictLoadConfig, StrictLoadReport,
+    },
+    runtime::checkpoint::quantization::{AffineQuantization, WeightQuantization},
+    runtime::execution::inspection::ActivationObserver,
+    utils::{
+        create_causal_mask,
+        rope::{initialize_rope, FloatOrString, RopeVariant},
     },
 };
 
@@ -4323,7 +4323,7 @@ pub fn load_gemma4_model_quantized(
         audio_config,
         audio_token_id,
     ) = get_gemma4_model_config(model_dir)?;
-    if !crate::quantization::should_quantize_on_load(
+    if !crate::runtime::checkpoint::quantization::should_quantize_on_load(
         "Gemma 4",
         model_args.weight_quantization(),
         quantization,
@@ -4854,7 +4854,9 @@ mod tests {
         common::generation::CausalLm,
         input::{InputMetadata, InputPart, ModelInput},
     };
-    use crate::weights::{load_arrays_strict, StrictLoadConfig, StrictLoadReport};
+    use crate::runtime::checkpoint::load::{
+        load_arrays_strict, StrictLoadConfig, StrictLoadReport,
+    };
 
     fn test_stream() -> Stream {
         Stream::new_with_device(&Device::new(DeviceType::Cpu, 0))

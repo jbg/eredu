@@ -1,7 +1,7 @@
 //! Budgeted, architecture-independent residency for immutable weight units.
 //!
-//! A [`crate::residency::ResidencyManager`] moves caller-defined groups of
-//! checkpoint selections from a [`crate::weight_store::WeightStore`] into
+//! A [`crate::runtime::residency::manager::ResidencyManager`] moves caller-defined groups of
+//! checkpoint selections from a [`crate::runtime::checkpoint::store::WeightStore`] into
 //! evaluated host or execution-stream arrays. The
 //! manager accounts for logical host and device copies independently, even on
 //! unified-memory systems. Missing units can be reserved and evaluated as one
@@ -17,14 +17,14 @@ use std::{
 use safemlx::{transforms::eval, Array, DeviceType, Stream};
 
 use crate::{
-    offload::{
-        CacheEvictionPolicy, MemoryTier, OffloadPlan, OffloadReport, OffloadTelemetry,
-        OffloadUnitId, OffloadUnitSpec, PrefetchOutcome, ResidencyPolicy, TransferDirection,
-    },
-    weight_recipe::{DerivedWeightRecipe, WeightRecipeError},
-    weight_store::{
+    runtime::checkpoint::recipe::{DerivedWeightRecipe, WeightRecipeError},
+    runtime::checkpoint::store::{
         PendingWeightMaterialization, TensorSelection, WeightStore, WeightStoreDiagnostics,
         WeightStoreError,
+    },
+    runtime::residency::policy::{
+        CacheEvictionPolicy, MemoryTier, OffloadPlan, OffloadReport, OffloadTelemetry,
+        OffloadUnitId, OffloadUnitSpec, PrefetchOutcome, ResidencyPolicy, TransferDirection,
     },
 };
 
@@ -2151,8 +2151,8 @@ mod tests {
 
     use super::*;
     use crate::{
-        offload::{OffloadConfig, OffloadUnitSpec},
-        weight_store::SafetensorsWeightStore,
+        runtime::checkpoint::store::SafetensorsWeightStore,
+        runtime::residency::policy::{OffloadConfig, OffloadUnitSpec},
     };
 
     fn cpu_stream() -> Stream {

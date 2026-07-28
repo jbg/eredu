@@ -14,13 +14,7 @@ use safemlx::{
 };
 
 use crate::{
-    cache::KeyValueCache,
     error::Error,
-    layerwise::{
-        load_general_layerwise_model, load_general_layerwise_model_with_store,
-        GeneralLayerwiseModel, GeneralLayerwiseModelAdapter, LayerExecutionLoadOptions,
-        LayerwiseForwardState, StaticUnitBindings, WeightResidency,
-    },
     models::{
         common::generation::CausalLm,
         gemma4::{
@@ -37,13 +31,19 @@ use crate::{
         },
         input,
     },
-    module_binding::{
+    runtime::cache::KeyValueCache,
+    runtime::checkpoint::binding::{
         build_module_bindings_with_recipes, canonical_checkpoint_name, populate_module_from_lease,
     },
-    residency::{ResidencyReport, ResidentUnitLease, WeightBinding},
+    runtime::checkpoint::recipe::DerivedWeightRecipe,
+    runtime::checkpoint::store::{GgufWeightStore, TensorSelection, WeightStore},
+    runtime::execution::layerwise::{
+        load_general_layerwise_model, load_general_layerwise_model_with_store,
+        GeneralLayerwiseModel, GeneralLayerwiseModelAdapter, LayerExecutionLoadOptions,
+        LayerwiseForwardState, StaticUnitBindings, WeightResidency,
+    },
+    runtime::residency::manager::{ResidencyReport, ResidentUnitLease, WeightBinding},
     utils::create_causal_mask,
-    weight_recipe::DerivedWeightRecipe,
-    weight_store::{GgufWeightStore, TensorSelection, WeightStore},
 };
 
 const EMBEDDING_UNIT: &str = "gemma4.static.embedding";
@@ -80,7 +80,7 @@ impl Gemma4LayerwiseModel {
     /// Returns dense-stream observations when that policy is active.
     pub fn dense_stream_report(
         &self,
-    ) -> Result<Option<crate::layerwise::DenseDiskStreamReport>, Error> {
+    ) -> Result<Option<crate::runtime::execution::layerwise::DenseDiskStreamReport>, Error> {
         self.execution.dense_stream_report()
     }
 
@@ -295,12 +295,14 @@ impl Gemma4LayerwiseAdapter {
         let lm_head = if args.tie_word_embeddings {
             None
         } else {
-            Some(crate::models::common::linear::build_unloaded_maybe_quantized_lm_head_with_quantization(
-                args.hidden_size,
-                args.vocab_size,
-                args.quantization_for("lm_head.weight"),
-                stream,
-            )?)
+            Some(
+                crate::nn::linear::build_unloaded_maybe_quantized_lm_head_with_quantization(
+                    args.hidden_size,
+                    args.vocab_size,
+                    args.quantization_for("lm_head.weight"),
+                    stream,
+                )?,
+            )
         };
         let vision_tower = vision_config
             .clone()
@@ -1344,7 +1346,7 @@ impl GeneralLayerwiseModelAdapter for Gemma4LayerwiseAdapter {
 
 /// Gemma 4 token generation using bounded text-layer execution.
 pub type Generate<'a, S = crate::sampler::DefaultSampler> =
-    crate::models::common::generation::Generate<'a, Gemma4LayerwiseModel, Cache, S>;
+    crate::nn::generation::Generate<'a, Gemma4LayerwiseModel, Cache, S>;
 
 #[cfg(test)]
 mod tests {
@@ -1357,8 +1359,6 @@ mod tests {
 
     use super::*;
     use crate::{
-        cache::ConcatKeyValueCache,
-        layerwise::LayerwiseLoadOptions,
         models::{
             common::generation::CausalLm,
             gemma4::{self as resident, Model, ModelInput},
@@ -1366,7 +1366,9 @@ mod tests {
             gemma4_vision::Gemma4VisionConfig,
             input as runtime_input,
         },
-        offload::OffloadConfig,
+        runtime::cache::ConcatKeyValueCache,
+        runtime::execution::layerwise::LayerwiseLoadOptions,
+        runtime::residency::policy::OffloadConfig,
     };
 
     fn config() -> serde_json::Value {
@@ -1427,11 +1429,8 @@ mod tests {
             .flatten()
             .iter()
             .map(|(name, value)| {
-                let name = crate::module_binding::canonical_checkpoint_name(name).replacen(
-                    "model.language_model.",
-                    "language_model.model.",
-                    1,
-                );
+                let name = crate::runtime::checkpoint::binding::canonical_checkpoint_name(name)
+                    .replacen("model.language_model.", "language_model.model.", 1);
                 (name, *value)
             })
             .collect::<Vec<_>>();

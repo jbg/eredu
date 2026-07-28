@@ -25,7 +25,6 @@ use serde::{Deserialize, Deserializer};
 use serde_json::Value;
 use tokenizers::Tokenizer;
 
-pub use super::common::generation::sample;
 use super::qwen_vl::grid_thw_from_array;
 #[cfg(test)]
 pub(crate) use super::qwen_vl::{reverse_permutation, vision_window_index};
@@ -34,11 +33,10 @@ pub use super::qwen_vl::{
     QwenVisionPatchMerger, QwenVisionPatchProjection, QwenVisionRmsNorm, QwenVisionTransformer,
     VisionConfig,
 };
+pub use crate::nn::generation::sample;
 
 use crate::{
-    cache::{ConcatKeyValueCache, KeyValueCache},
     error::Error,
-    inspection::{ActivationObserver, MoeRoutingObservation},
     models::{
         common::{
             self, attention::attention_probabilities, generation::CausalLm, layers::silu,
@@ -46,17 +44,19 @@ use crate::{
         },
         input as runtime_input,
     },
-    quantization::{AffineQuantization, WeightQuantization},
-    utils::{
-        create_attention_mask,
-        rope::{initialize_rope, FloatOrString, RopeVariant},
-        AttentionMask,
-    },
-    weights::{
+    runtime::cache::{ConcatKeyValueCache, KeyValueCache},
+    runtime::checkpoint::load::{
         for_each_safetensor_array, gguf_metadata, gguf_quantization_configs, load_array_strict,
         load_named_array_strict, load_safetensors_dir_strict_with_split_swiglu_experts,
         load_safetensors_strict, safetensors_files, GgufTensorNames, StrictLoadConfig,
         StrictLoadReport,
+    },
+    runtime::checkpoint::quantization::{AffineQuantization, WeightQuantization},
+    runtime::execution::inspection::{ActivationObserver, MoeRoutingObservation},
+    utils::{
+        create_attention_mask,
+        rope::{initialize_rope, FloatOrString, RopeVariant},
+        AttentionMask,
     },
 };
 
@@ -4904,7 +4904,11 @@ fn qwen35_gguf_affine_quantization(
     scales_shape: &[i32],
     weight_name: &str,
 ) -> Result<AffineQuantization, Error> {
-    crate::quantization::gguf_affine_quantization(weight_shape, scales_shape, weight_name)
+    crate::runtime::checkpoint::quantization::gguf_affine_quantization(
+        weight_shape,
+        scales_shape,
+        weight_name,
+    )
 }
 
 fn qwen35_gguf_string(
@@ -5198,7 +5202,7 @@ pub fn load_qwen3_5_moe_model_quantized(
             "Qwen3.5/3.6 on-load quantization requires floating-point weights; native FP8 checkpoints cannot be implicitly transcoded".into(),
         ));
     }
-    if !crate::quantization::should_quantize_on_load(
+    if !crate::runtime::checkpoint::quantization::should_quantize_on_load(
         "Qwen3.5/3.6",
         args.quantization,
         quantization,
@@ -5237,7 +5241,7 @@ fn quantize_packed_expert_tensor(
     value: &Array,
     quantization: WeightQuantization,
     stream: &Stream,
-) -> Result<crate::quantization::QuantizedTensor, Error> {
+) -> Result<crate::runtime::checkpoint::quantization::QuantizedTensor, Error> {
     common::moe::quantize_expert_bank(value, quantization, stream)
 }
 
@@ -5830,12 +5834,12 @@ mod tests {
     use crate::processor::{load_processor, MediaInput, ProcessorInput, RgbImageView};
     use crate::{
         error::Error,
-        inspection::ActivationRecorder,
         models::{
             common::generation::CausalLm, input as runtime_input, Model as AnyModel, ModelCache,
         },
-        quantization::AffineQuantization,
-        weights::{load_safetensors_strict, StrictLoadReport},
+        runtime::checkpoint::load::{load_safetensors_strict, StrictLoadReport},
+        runtime::checkpoint::quantization::AffineQuantization,
+        runtime::execution::inspection::ActivationRecorder,
     };
     use safemlx::{
         module::{Module, ModuleParameters, Param},
@@ -6181,7 +6185,8 @@ mod tests {
         args.num_key_value_heads = 2;
         args.moe_intermediate_size = 32;
         args.shared_expert_intermediate_size = 32;
-        let quantization = crate::quantization::AffineQuantization::new(32, 4).unwrap();
+        let quantization =
+            crate::runtime::checkpoint::quantization::AffineQuantization::new(32, 4).unwrap();
 
         let gate_up_values = (0..(4 * 64 * 32))
             .map(|index| ((index % 97) as f32 - 48.0) / 64.0)
@@ -6453,7 +6458,9 @@ mod tests {
             .map(|index| ((index % 37) as f32 - 18.0) / 19.0)
             .collect::<Vec<_>>();
         let dense = Array::from_slice(&values, &[16, 128]);
-        let quantized = crate::quantization::quantize_tensor(&dense, affine, stream).unwrap();
+        let quantized =
+            crate::runtime::checkpoint::quantization::quantize_tensor(&dense, affine, stream)
+                .unwrap();
         let scales = quantized.scales.as_dtype(Dtype::Float16, stream).unwrap();
         let biases = quantized
             .biases
@@ -7109,7 +7116,7 @@ mod tests {
         let cpu = ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
         let error = super::load_qwen3_5_moe_model_quantized(
             &dir,
-            crate::quantization::AffineQuantization::default().into(),
+            crate::runtime::checkpoint::quantization::AffineQuantization::default().into(),
             cpu.stream(),
             cpu.stream(),
         )

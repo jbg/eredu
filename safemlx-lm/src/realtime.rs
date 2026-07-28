@@ -16,9 +16,9 @@ use std::path::Path;
 
 use crate::{
     error::Error,
-    layerwise::{LayerExecutionLoadOptions, WeightResidency},
     models::{ensure_executable_load_options, moshi, personaplex, ModelLoadOptions},
     moshi::MoshiLayerwiseModel,
+    runtime::execution::layerwise::{LayerExecutionLoadOptions, WeightResidency},
     sampler::{DefaultSampler, Sampler},
 };
 
@@ -343,7 +343,9 @@ impl LoadedRealtimeModel {
     }
 
     /// Returns current layerwise residency telemetry, or `None` for fully resident models.
-    pub fn residency_report(&self) -> Result<Option<crate::residency::ResidencyReport>, Error> {
+    pub fn residency_report(
+        &self,
+    ) -> Result<Option<crate::runtime::residency::manager::ResidencyReport>, Error> {
         match self {
             Self::Moshi(_) | Self::PersonaPlex(_) => Ok(None),
             Self::MoshiLayerwise(model) | Self::PersonaPlexLayerwise(model) => {
@@ -355,7 +357,7 @@ impl LoadedRealtimeModel {
     /// Returns dense-stream observations when that policy is active.
     pub fn dense_stream_report(
         &self,
-    ) -> Result<Option<crate::layerwise::DenseDiskStreamReport>, Error> {
+    ) -> Result<Option<crate::runtime::execution::layerwise::DenseDiskStreamReport>, Error> {
         match self {
             Self::MoshiLayerwise(model) | Self::PersonaPlexLayerwise(model) => {
                 model.dense_stream_report()
@@ -367,7 +369,8 @@ impl LoadedRealtimeModel {
     /// Returns per-group residency for layerwise models, or `None` when fully resident.
     pub fn execution_group_reports(
         &self,
-    ) -> Result<Option<Vec<crate::residency::ResidentLayerGroupReport>>, Error> {
+    ) -> Result<Option<Vec<crate::runtime::residency::manager::ResidentLayerGroupReport>>, Error>
+    {
         match self {
             Self::Moshi(_) | Self::PersonaPlex(_) => Ok(None),
             Self::MoshiLayerwise(model) | Self::PersonaPlexLayerwise(model) => {

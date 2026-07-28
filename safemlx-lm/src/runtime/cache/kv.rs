@@ -8,7 +8,7 @@ use safemlx::{
     Array, Dtype, Stream,
 };
 
-use crate::cache_residency::{
+use crate::runtime::cache::residency::{
     CacheBlockArrays, CacheBlockId, CacheRankIdentity, CacheRepresentation, CacheResidencyManager,
     CacheResidencyReport, PagedCacheOptions,
 };
@@ -2068,7 +2068,7 @@ mod tests {
         BlockwiseAttentionAccumulator, CompressedLatentCache, ConcatKeyValueCache,
         KeyValueAttentionBlock, KeyValueCache, PagedKeyValueCache, SlidingKeyValueCache,
     };
-    use crate::cache_residency::{
+    use crate::runtime::cache::residency::{
         inspect_prompt_cache, open_prompt_cache, CacheBlockArrays, CacheRankIdentity,
         CacheRepresentation, CacheResidencyManager, PagedCacheOptions, PromptCacheDescriptor,
         PromptCacheModelIdentity, PromptCacheOptions, PromptCacheTopology,

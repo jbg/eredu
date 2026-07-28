@@ -8,9 +8,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use safemlx::module::ModuleParameters;
 
 use crate::{
-    residency::{ResidentUnitLease, WeightBinding},
-    weight_recipe::{DerivedWeightRecipe, RecipeDtype},
-    weight_store::{TensorSelection, WeightStore},
+    runtime::checkpoint::recipe::{DerivedWeightRecipe, RecipeDtype},
+    runtime::checkpoint::store::{TensorSelection, WeightStore},
+    runtime::residency::manager::{ResidentUnitLease, WeightBinding},
 };
 
 /// Converts a module parameter name to its canonical checkpoint spelling.
@@ -383,13 +383,13 @@ pub enum ModuleBindingError {
     },
     /// Persistent checkpoint inspection failed.
     #[error(transparent)]
-    WeightStore(#[from] crate::weight_store::WeightStoreError),
+    WeightStore(#[from] crate::runtime::checkpoint::store::WeightStoreError),
     /// Derived-weight metadata validation failed.
     #[error(transparent)]
-    WeightRecipe(#[from] crate::weight_recipe::WeightRecipeError),
+    WeightRecipe(#[from] crate::runtime::checkpoint::recipe::WeightRecipeError),
     /// Residency binding or lookup failed.
     #[error(transparent)]
-    Residency(#[from] crate::residency::ResidencyError),
+    Residency(#[from] crate::runtime::residency::manager::ResidencyError),
 }
 
 #[cfg(test)]
@@ -401,7 +401,7 @@ mod tests {
     use super::*;
     use crate::{
         models::common::linear::unloaded_maybe_quantized_linear, quantization::AffineQuantization,
-        weight_store::SafetensorsWeightStore,
+        runtime::checkpoint::store::SafetensorsWeightStore,
     };
 
     fn cpu() -> ExecutionContext {

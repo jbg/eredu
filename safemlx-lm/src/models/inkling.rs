@@ -26,13 +26,6 @@ use serde_json::Value;
 use tokenizers::Tokenizer;
 
 use crate::{
-    cache::{
-        BlockwiseAttentionAccumulator, ConcatKeyValueCache, KeyValueCache, PagedKeyValueCache,
-        SlidingKeyValueCache,
-    },
-    cache_residency::{
-        CacheRankIdentity, CacheResidencyManager, CacheResidencyReport, PagedCacheOptions,
-    },
     error::Error,
     models::{
         common::{
@@ -44,7 +37,14 @@ use crate::{
         },
         input,
     },
-    weights::{
+    runtime::cache::residency::{
+        CacheRankIdentity, CacheResidencyManager, CacheResidencyReport, PagedCacheOptions,
+    },
+    runtime::cache::{
+        BlockwiseAttentionAccumulator, ConcatKeyValueCache, KeyValueCache, PagedKeyValueCache,
+        SlidingKeyValueCache,
+    },
+    runtime::checkpoint::load::{
         for_each_safetensor_array, load_array_strict, safetensors_files, StrictLoadConfig,
         StrictLoadReport,
     },

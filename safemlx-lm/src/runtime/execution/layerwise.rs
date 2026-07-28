@@ -13,21 +13,23 @@ use std::{
 use safemlx::{module::ModuleParameters, transforms::eval, Array, Stream};
 
 use crate::{
-    cache::KeyValueCache,
-    dense_stream::{BackgroundLayerPrefetch, BackgroundPrefetchReport, DenseDiskStreamLoadOptions},
     error::Error,
-    module_binding::{
+    runtime::cache::KeyValueCache,
+    runtime::checkpoint::binding::{
         binding_bytes, build_module_bindings, populate_module_from_lease, ModuleBindingError,
     },
-    offload::{
-        MemoryTier, OffloadConfig, OffloadPlan, OffloadReport, OffloadUnitId, OffloadUnitSpec,
-        ResidencyPolicy, TransferDirection,
+    runtime::checkpoint::store::{SafetensorsWeightStore, WeightStore},
+    runtime::residency::dense_stream::{
+        BackgroundLayerPrefetch, BackgroundPrefetchReport, DenseDiskStreamLoadOptions,
     },
-    residency::{
+    runtime::residency::manager::{
         OffloadUnit, ResidencyError, ResidencyManager, ResidencyReport, ResidentLayerGroup,
         ResidentUnitLease,
     },
-    weight_store::{SafetensorsWeightStore, WeightStore},
+    runtime::residency::policy::{
+        MemoryTier, OffloadConfig, OffloadPlan, OffloadReport, OffloadUnitId, OffloadUnitSpec,
+        ResidencyPolicy, TransferDirection,
+    },
 };
 
 pub(crate) type SharedWeightStore = Arc<dyn WeightStore + Send + Sync>;
@@ -61,7 +63,7 @@ impl Default for LayerwiseLoadOptions {
     fn default() -> Self {
         Self {
             offload: OffloadConfig::default(),
-            max_mapped_shards: crate::weight_store::DEFAULT_MAX_MAPPED_SHARDS,
+            max_mapped_shards: crate::runtime::checkpoint::store::DEFAULT_MAX_MAPPED_SHARDS,
             strict_loading: true,
             sample_mlx_memory: false,
             sample_process_memory: false,
@@ -80,16 +82,18 @@ pub enum WeightResidency {
     /// Experimentally stream ordinary execution layers through finite host and device caches.
     DenseDiskStream(DenseDiskStreamLoadOptions),
     /// Keep non-expert decoder weights layerwise while caching routed experts independently.
-    SparseExpertCache(crate::expert_cache::ExpertCacheLoadOptions),
+    SparseExpertCache(crate::runtime::residency::expert_cache::ExpertCacheLoadOptions),
     /// Cache experts independently while disk-streaming non-expert execution units.
-    SparseExpertCacheWithDenseLayers(crate::expert_cache::SparseExpertDenseStreamLoadOptions),
+    SparseExpertCacheWithDenseLayers(
+        crate::runtime::residency::expert_cache::SparseExpertDenseStreamLoadOptions,
+    ),
 }
 
 impl WeightResidency {
     /// Returns the backend shard/reader cache bound carried by this policy.
     pub(crate) const fn max_mapped_shards(self) -> usize {
         match self {
-            Self::FullyResident => crate::weight_store::DEFAULT_MAX_MAPPED_SHARDS,
+            Self::FullyResident => crate::runtime::checkpoint::store::DEFAULT_MAX_MAPPED_SHARDS,
             Self::LayerwiseHost(options) => options.max_mapped_shards,
             Self::DenseDiskStream(options) => options.max_mapped_shards,
             Self::SparseExpertCache(options) => options.non_expert.max_mapped_shards,
@@ -695,10 +699,9 @@ impl DenseStreamController {
             .filter(|unit| unit.device_resident())
             .map(|unit| unit.expected_bytes())
             .sum();
-        let mut activity = self
-            .group_activity
-            .lock()
-            .map_err(|_| crate::dense_stream::DenseStreamError::StatePoisoned)?;
+        let mut activity = self.group_activity.lock().map_err(|_| {
+            crate::runtime::residency::dense_stream::DenseStreamError::StatePoisoned
+        })?;
         let state = activity
             .get_mut(group)
             .ok_or_else(|| LayerwiseModelError::UnknownExecutionGroup(group.to_string()))?;
@@ -735,18 +738,17 @@ impl DenseStreamController {
             .filter(|unit| unit.device_resident())
             .map(|unit| unit.expected_bytes())
             .sum();
-        let mut pass = self
-            .pass
-            .lock()
-            .map_err(|_| crate::dense_stream::DenseStreamError::StatePoisoned)?;
+        let mut pass = self.pass.lock().map_err(|_| {
+            crate::runtime::residency::dense_stream::DenseStreamError::StatePoisoned
+        })?;
         let active = pass.active.as_mut().ok_or(
-            crate::dense_stream::DenseStreamError::InvalidForwardTelemetry(
+            crate::runtime::residency::dense_stream::DenseStreamError::InvalidForwardTelemetry(
                 "residency was observed without an active forward",
             ),
         )?;
         if active.prefill != prefill {
             return Err(
-                crate::dense_stream::DenseStreamError::InvalidForwardTelemetry(
+                crate::runtime::residency::dense_stream::DenseStreamError::InvalidForwardTelemetry(
                     "residency observation changed pass category",
                 )
                 .into(),
@@ -760,10 +762,9 @@ impl DenseStreamController {
     }
 
     fn record_group_execution(&self, group: &str) -> Result<(), Error> {
-        let mut activity = self
-            .group_activity
-            .lock()
-            .map_err(|_| crate::dense_stream::DenseStreamError::StatePoisoned)?;
+        let mut activity = self.group_activity.lock().map_err(|_| {
+            crate::runtime::residency::dense_stream::DenseStreamError::StatePoisoned
+        })?;
         let state = activity
             .get_mut(group)
             .ok_or_else(|| LayerwiseModelError::UnknownExecutionGroup(group.to_string()))?;
@@ -786,13 +787,12 @@ impl DenseStreamController {
         manager: &'a ResidencyManager,
     ) -> Result<DenseStreamForwardGuard<'a>, Error> {
         let (_, offload, _, _) = manager.telemetry_snapshot()?;
-        let mut state = self
-            .pass
-            .lock()
-            .map_err(|_| crate::dense_stream::DenseStreamError::StatePoisoned)?;
+        let mut state = self.pass.lock().map_err(|_| {
+            crate::runtime::residency::dense_stream::DenseStreamError::StatePoisoned
+        })?;
         if state.active.is_some() {
             return Err(
-                crate::dense_stream::DenseStreamError::InvalidForwardTelemetry(
+                crate::runtime::residency::dense_stream::DenseStreamError::InvalidForwardTelemetry(
                     "a forward is already active",
                 )
                 .into(),
@@ -819,12 +819,11 @@ impl DenseStreamController {
         }
         let (_, offload, _, _) = manager.telemetry_snapshot()?;
         let current = DenseCounterSnapshot::from_report(&offload);
-        let mut state = self
-            .pass
-            .lock()
-            .map_err(|_| crate::dense_stream::DenseStreamError::StatePoisoned)?;
+        let mut state = self.pass.lock().map_err(|_| {
+            crate::runtime::residency::dense_stream::DenseStreamError::StatePoisoned
+        })?;
         let active = state.active.take().ok_or(
-            crate::dense_stream::DenseStreamError::InvalidForwardTelemetry(
+            crate::runtime::residency::dense_stream::DenseStreamError::InvalidForwardTelemetry(
                 "a forward was committed without being started",
             ),
         )?;
@@ -918,10 +917,9 @@ impl DenseStreamController {
                 cache: DenseCacheMetrics::from_report(residency.offload(), tier),
             }
         };
-        let activity = self
-            .group_activity
-            .lock()
-            .map_err(|_| crate::dense_stream::DenseStreamError::StatePoisoned)?;
+        let activity = self.group_activity.lock().map_err(|_| {
+            crate::runtime::residency::dense_stream::DenseStreamError::StatePoisoned
+        })?;
         let groups = self
             .groups
             .iter()
@@ -962,10 +960,9 @@ impl DenseStreamController {
                 }
             })
             .collect();
-        let pass = self
-            .pass
-            .lock()
-            .map_err(|_| crate::dense_stream::DenseStreamError::StatePoisoned)?;
+        let pass = self.pass.lock().map_err(|_| {
+            crate::runtime::residency::dense_stream::DenseStreamError::StatePoisoned
+        })?;
         Ok(DenseDiskStreamReport {
             planned_layer_count: self.planned_layer_count,
             planned_layer_bytes: self.planned_layer_bytes,
@@ -1040,7 +1037,7 @@ impl Drop for DenseStreamGroupGuard<'_> {
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct LayerwiseModelMetadata {
     model_type: String,
-    quantization: Option<crate::quantization::WeightQuantization>,
+    quantization: Option<crate::runtime::checkpoint::quantization::WeightQuantization>,
     layer_count: usize,
     static_device_bytes: u64,
     host_layer_bytes: u64,
@@ -1054,7 +1051,9 @@ impl LayerwiseModelMetadata {
         &self.model_type
     }
     /// Returns checkpoint-native packed quantization metadata, if present.
-    pub const fn quantization(&self) -> Option<crate::quantization::WeightQuantization> {
+    pub const fn quantization(
+        &self,
+    ) -> Option<crate::runtime::checkpoint::quantization::WeightQuantization> {
         self.quantization
     }
     /// Returns the decoder layer count.
@@ -1085,14 +1084,14 @@ impl LayerwiseModelMetadata {
 /// One pinned static module and its checkpoint bindings.
 pub struct StaticUnitBindings {
     id: OffloadUnitId,
-    bindings: Vec<crate::residency::WeightBinding>,
+    bindings: Vec<crate::runtime::residency::manager::WeightBinding>,
 }
 
 impl StaticUnitBindings {
     /// Creates a pinned static unit definition.
     pub fn new(
         id: impl Into<String>,
-        bindings: Vec<crate::residency::WeightBinding>,
+        bindings: Vec<crate::runtime::residency::manager::WeightBinding>,
     ) -> Result<Self, Error> {
         Ok(Self {
             id: OffloadUnitId::new(id.into())?,
@@ -1111,7 +1110,7 @@ pub trait LayerwiseModelAdapter: Sized {
     /// Returns the checkpoint model type.
     fn model_type(&self) -> &str;
     /// Returns checkpoint-native packed quantization metadata, if present.
-    fn quantization(&self) -> Option<crate::quantization::WeightQuantization>;
+    fn quantization(&self) -> Option<crate::runtime::checkpoint::quantization::WeightQuantization>;
     /// Returns the number of decoder blocks.
     fn layer_count(&self) -> Result<usize, Error>;
     /// Builds bindings for modules that remain pinned on the execution device.
@@ -1138,7 +1137,7 @@ pub trait LayerwiseModelAdapter: Sized {
         index: usize,
         layer: &Self::Layer,
         store: &dyn WeightStore,
-    ) -> Result<Vec<crate::residency::WeightBinding>, Error> {
+    ) -> Result<Vec<crate::runtime::residency::manager::WeightBinding>, Error> {
         Ok(build_module_bindings(
             layer,
             &self.layer_checkpoint_prefix(index),
@@ -1259,7 +1258,7 @@ pub trait GeneralLayerwiseModelAdapter: Sized {
         index: usize,
         layer: &Self::Layer,
         store: &dyn WeightStore,
-    ) -> Result<Vec<crate::residency::WeightBinding>, Error> {
+    ) -> Result<Vec<crate::runtime::residency::manager::WeightBinding>, Error> {
         Ok(build_module_bindings(
             layer,
             &self.layer_checkpoint_prefix(group, index),
@@ -2136,7 +2135,7 @@ fn add_unit(
     specs: &mut Vec<OffloadUnitSpec>,
     consumed: &mut BTreeSet<String>,
     id: OffloadUnitId,
-    bindings: Vec<crate::residency::WeightBinding>,
+    bindings: Vec<crate::runtime::residency::manager::WeightBinding>,
     policy: ResidencyPolicy,
     tier: MemoryTier,
     byte_total: &mut u64,
@@ -2365,11 +2364,11 @@ mod tests {
 
     use super::*;
     use crate::{
-        cache::ConcatKeyValueCache,
         llama::{load_llama_model, LlamaCache, LlamaLoadOptions, LlamaModel},
         models::llama::{self, ModelArgs},
-        offload::TransferDirection,
-        residency::UnitResidencyReport,
+        runtime::cache::ConcatKeyValueCache,
+        runtime::residency::manager::UnitResidencyReport,
+        runtime::residency::policy::TransferDirection,
     };
 
     fn load_layerwise_llama(
@@ -2442,7 +2441,7 @@ mod tests {
             .iter()
             .map(|(name, value)| {
                 (
-                    crate::module_binding::canonical_checkpoint_name(name),
+                    crate::runtime::checkpoint::binding::canonical_checkpoint_name(name),
                     *value,
                 )
             })
@@ -2917,14 +2916,19 @@ mod tests {
 
         let converted_root = tempfile::tempdir().unwrap();
         let converted = converted_root.path().join("affine");
-        let options = crate::quantization::CheckpointQuantizationOptions {
-            quantization: crate::quantization::AffineQuantization::new(32, 4)
+        let options = crate::runtime::checkpoint::quantization::CheckpointQuantizationOptions {
+            quantization: crate::runtime::checkpoint::quantization::AffineQuantization::new(32, 4)
                 .unwrap()
                 .into(),
             ..Default::default()
         };
-        crate::quantization::quantize_checkpoint(source.path(), &converted, &options, gpu.stream())
-            .unwrap();
+        crate::runtime::checkpoint::quantization::quantize_checkpoint(
+            source.path(),
+            &converted,
+            &options,
+            gpu.stream(),
+        )
+        .unwrap();
 
         let mut resident = load_llama_model(
             &converted,

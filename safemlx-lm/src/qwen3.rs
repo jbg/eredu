@@ -19,16 +19,7 @@ use safemlx::{
 };
 
 use crate::{
-    cache::{ConcatKeyValueCache, KeyValueCache},
     error::Error,
-    expert_cache::{
-        ExpertCache, ExpertCacheLoadOptions, ExpertCacheReport, ExpertCatalogEntry, ExpertIdentity,
-        ExpertPass,
-    },
-    layerwise::{
-        load_layerwise_model, load_layerwise_model_with_store, LayerExecutionLoadOptions,
-        LayerwiseInput, LayerwiseModel, LayerwiseModelAdapter, StaticUnitBindings, WeightResidency,
-    },
     models::{
         common::{
             attention::AttentionInput,
@@ -41,14 +32,23 @@ use crate::{
         input,
         qwen3::{self as resident, ModelArgs, TransformerBlock},
     },
-    module_binding::{
+    runtime::cache::{ConcatKeyValueCache, KeyValueCache},
+    runtime::checkpoint::binding::{
         build_module_bindings, build_module_bindings_excluding, build_module_bindings_with_recipes,
         populate_module_from_lease, populate_module_from_lease_excluding,
     },
-    residency::{OffloadUnit, ResidencyReport, ResidentUnitLease, WeightBinding},
+    runtime::checkpoint::recipe::DerivedWeightRecipe,
+    runtime::checkpoint::store::{GgufWeightStore, TensorSelection, WeightStore},
+    runtime::execution::layerwise::{
+        load_layerwise_model, load_layerwise_model_with_store, LayerExecutionLoadOptions,
+        LayerwiseInput, LayerwiseModel, LayerwiseModelAdapter, StaticUnitBindings, WeightResidency,
+    },
+    runtime::residency::expert_cache::{
+        ExpertCache, ExpertCacheLoadOptions, ExpertCacheReport, ExpertCatalogEntry, ExpertIdentity,
+        ExpertPass,
+    },
+    runtime::residency::manager::{OffloadUnit, ResidencyReport, ResidentUnitLease, WeightBinding},
     utils::{create_attention_mask, AttentionMask},
-    weight_recipe::DerivedWeightRecipe,
-    weight_store::{GgufWeightStore, TensorSelection, WeightStore},
 };
 
 const EMBEDDING_UNIT: &str = "qwen3.static.embedding";
@@ -80,7 +80,7 @@ impl Qwen3LayerwiseModel {
     /// Returns dense-stream observations when that policy is active.
     pub fn dense_stream_report(
         &self,
-    ) -> Result<Option<crate::layerwise::DenseDiskStreamReport>, Error> {
+    ) -> Result<Option<crate::runtime::execution::layerwise::DenseDiskStreamReport>, Error> {
         self.execution.dense_stream_report()
     }
 
@@ -284,7 +284,7 @@ pub fn load_qwen3_sparse_expert_cache_model(
 pub fn load_qwen3_sparse_expert_cache_model_with_dense_layers(
     model_dir: impl AsRef<Path>,
     options: ExpertCacheLoadOptions,
-    non_expert: crate::dense_stream::DenseDiskStreamLoadOptions,
+    non_expert: crate::runtime::residency::dense_stream::DenseDiskStreamLoadOptions,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<Qwen3LayerwiseModel, Error> {
@@ -393,7 +393,7 @@ impl LayerwiseModelAdapter for Qwen3LayerwiseAdapter {
         &self.args.model_type
     }
 
-    fn quantization(&self) -> Option<crate::quantization::WeightQuantization> {
+    fn quantization(&self) -> Option<crate::runtime::checkpoint::quantization::WeightQuantization> {
         self.args.quantization.or(self.args.quantization_config)
     }
 
@@ -892,9 +892,9 @@ mod tests {
 
     use super::*;
     use crate::{
-        layerwise::LayerwiseLoadOptions,
         models::qwen3,
-        offload::{MemoryTier, OffloadConfig, ResidencyPolicy},
+        runtime::execution::layerwise::LayerwiseLoadOptions,
+        runtime::residency::policy::{MemoryTier, OffloadConfig, ResidencyPolicy},
     };
 
     fn args(moe: bool) -> ModelArgs {
@@ -951,7 +951,7 @@ mod tests {
         let params = model.parameters().flatten();
         let mut arrays = Vec::<(String, Array)>::new();
         for (name, value) in params {
-            let name = crate::module_binding::canonical_checkpoint_name(&name);
+            let name = crate::runtime::checkpoint::binding::canonical_checkpoint_name(&name);
             if split_experts {
                 if let Some(prefix) = name.strip_suffix(".mlp.experts.gate_up_proj") {
                     for expert in 0..model.args.num_experts {
@@ -1111,9 +1111,14 @@ mod tests {
             1 << 20,
         )
         .unwrap();
-        let dense =
-            crate::dense_stream::DenseDiskStreamLoadOptions::new(u64::MAX, u64::MAX, 1, 1, 1)
-                .unwrap();
+        let dense = crate::runtime::residency::dense_stream::DenseDiskStreamLoadOptions::new(
+            u64::MAX,
+            u64::MAX,
+            1,
+            1,
+            1,
+        )
+        .unwrap();
         let mut cached = load_qwen3_sparse_expert_cache_model_with_dense_layers(
             dir.path(),
             expert_options,

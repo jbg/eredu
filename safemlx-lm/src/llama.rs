@@ -13,18 +13,7 @@ use safemlx::{
 };
 
 use crate::{
-    cache::{ConcatKeyValueCache, KeyValueCache, PagedKeyValueCache, SlidingKeyValueCache},
-    cache_residency::{
-        open_prompt_cache, validate_prompt_cache_model_identity, CacheResidencyManager,
-        CacheResidencyPolicy, CacheResidencyReport, PagedCacheOptions, PromptCacheDescriptor,
-        PromptCacheManifest, PromptCacheModelIdentity, PromptCacheOptions,
-    },
     error::Error,
-    layerwise::{
-        load_layerwise_model, load_layerwise_model_with_store, DenseDiskStreamReport,
-        LayerwiseInput, LayerwiseLoadOptions, LayerwiseModel, LayerwiseModelAdapter,
-        LayerwiseModelMetadata, StaticUnitBindings, WeightResidency,
-    },
     models::{
         common::{
             generation::CausalLm,
@@ -36,10 +25,23 @@ use crate::{
         input,
         llama::{self as resident, AttentionInput, ModelArgs, TransformerBlock},
     },
-    module_binding::{build_module_bindings, populate_module_from_lease},
-    residency::{ResidencyReport, ResidentUnitLease},
+    runtime::cache::residency::{
+        open_prompt_cache, validate_prompt_cache_model_identity, CacheResidencyManager,
+        CacheResidencyPolicy, CacheResidencyReport, PagedCacheOptions, PromptCacheDescriptor,
+        PromptCacheManifest, PromptCacheModelIdentity, PromptCacheOptions,
+    },
+    runtime::cache::{
+        ConcatKeyValueCache, KeyValueCache, PagedKeyValueCache, SlidingKeyValueCache,
+    },
+    runtime::checkpoint::binding::{build_module_bindings, populate_module_from_lease},
+    runtime::checkpoint::store::{GgufWeightStore, WeightStore},
+    runtime::execution::layerwise::{
+        load_layerwise_model, load_layerwise_model_with_store, DenseDiskStreamReport,
+        LayerwiseInput, LayerwiseLoadOptions, LayerwiseModel, LayerwiseModelAdapter,
+        LayerwiseModelMetadata, StaticUnitBindings, WeightResidency,
+    },
+    runtime::residency::manager::{ResidencyReport, ResidentUnitLease},
     utils::{create_attention_mask, create_sliding_attention_mask, AttentionMask},
-    weight_store::{GgufWeightStore, WeightStore},
 };
 
 const EMBEDDING_UNIT: &str = "llama.static.embedding";
@@ -70,7 +72,7 @@ impl LlamaLoadOptions {
 
     /// Selects experimental dense disk streaming with finite tier budgets.
     pub const fn dense_disk_stream(
-        options: crate::dense_stream::DenseDiskStreamLoadOptions,
+        options: crate::runtime::residency::dense_stream::DenseDiskStreamLoadOptions,
     ) -> Self {
         Self {
             weight_residency: WeightResidency::DenseDiskStream(options),
@@ -636,7 +638,7 @@ impl LayerwiseModelAdapter for LlamaLayerwiseAdapter {
         &self.args.model_type
     }
 
-    fn quantization(&self) -> Option<crate::quantization::WeightQuantization> {
+    fn quantization(&self) -> Option<crate::runtime::checkpoint::quantization::WeightQuantization> {
         self.args.weight_quantization()
     }
 

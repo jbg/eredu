@@ -9,7 +9,7 @@ use safemlx::{
 };
 
 use super::gemma4::{maybe_quantized_linear_with_bias, rms_norm_without_scale};
-use crate::quantization::WeightQuantization;
+use crate::runtime::checkpoint::quantization::WeightQuantization;
 
 #[derive(Debug, Clone, ModuleParameters)]
 pub(crate) struct Gemma4ClippedLinear {
