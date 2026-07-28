@@ -88,7 +88,7 @@ Before committing, run:
 CARGO_BUILD_BUILD_DIR="$HOME/Library/Caches/cargo-build/mlx-lm" cargo fmt --all -- --check
 CARGO_BUILD_BUILD_DIR="$HOME/Library/Caches/cargo-build/mlx-lm" cargo clippy --locked -p safemlx-lm --all-targets -- -D warnings
 CARGO_BUILD_BUILD_DIR="$HOME/Library/Caches/cargo-build/mlx-lm" cargo test --locked -p safemlx-lm --lib
-CARGO_BUILD_BUILD_DIR="$HOME/Library/Caches/cargo-build/mlx-lm" cargo +1.88.0 check --locked -p safemlx-lm --all-targets -p safemlx-lm-cli
+CARGO_BUILD_BUILD_DIR="$HOME/Library/Caches/cargo-build/mlx-lm" cargo +1.89.0 check --locked -p safemlx-lm --all-targets -p safemlx-lm-cli
 ```
 
 Metal-dependent ignored tests must run on a Metal host outside a restricted

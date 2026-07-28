@@ -10,7 +10,7 @@ use std::{
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, ValueEnum};
-use hf_hub::Cache;
+use hf_hub::{cache::CachedRevisionInfo, HFClientSync};
 use safemlx::{
     error::Exception,
     ops::indexing::TryIndexOp,
@@ -446,21 +446,6 @@ enum StopReason {
     GrammarComplete,
     MaxTokens,
     GeneratorExhausted,
-}
-
-#[derive(Clone, Debug)]
-struct CachedFileInfo {
-    file_path: PathBuf,
-    blob_path: PathBuf,
-}
-
-#[derive(Clone, Debug)]
-struct CachedRevisionInfo {
-    commit_hash: String,
-    snapshot_path: PathBuf,
-    files: Vec<CachedFileInfo>,
-    refs: Vec<String>,
-    last_modified: std::time::SystemTime,
 }
 
 impl StopReason {
@@ -1539,12 +1524,25 @@ fn resolve_model(
 
     let (repo_id, quantization) = split_hf_model_spec(spec)?;
 
-    let cache = Cache::from_env();
-    let revisions = scan_cached_model(cache.path(), repo_id)?;
+    let client = HFClientSync::new().context("failed to initialize the Hugging Face cache")?;
+    let cache = client
+        .scan_cache()
+        .send()
+        .context("failed to scan the Hugging Face cache")?;
+    let repo = cache
+        .repos
+        .iter()
+        .find(|repo| repo.repo_type == "model" && repo.repo_id == repo_id)
+        .with_context(|| {
+            format!(
+                "{repo_id:?} is not an existing path or a model in the local Hugging Face cache at {}",
+                cache.cache_dir.display()
+            )
+        })?;
     match quantization {
         Some(quantization) => {
             select_cached_gguf_from_revisions(
-                &revisions,
+                &repo.revisions,
                 requested_revision,
                 quantization,
                 gguf_role,
@@ -1556,98 +1554,15 @@ fn resolve_model(
             })
         }
         None => {
-            let revision = select_revision(&revisions, requested_revision).with_context(|| {
-                format!("could not select a cached revision for Hugging Face model {repo_id:?}")
-            })?;
+            let revision =
+                select_revision(&repo.revisions, requested_revision).with_context(|| {
+                    format!(
+                        "could not select a cached revision for Hugging Face model {repo_id:?}"
+                    )
+                })?;
             Ok(revision.snapshot_path.clone())
         }
     }
-}
-
-fn scan_cached_model(cache_dir: &Path, repo_id: &str) -> Result<Vec<CachedRevisionInfo>> {
-    let repository = cache_dir.join(format!("models--{}", repo_id.replace('/', "--")));
-    let snapshots = repository.join("snapshots");
-    let entries = std::fs::read_dir(&snapshots).with_context(|| {
-        format!(
-            "{repo_id:?} is not an existing path or a model in the local Hugging Face cache at {}",
-            cache_dir.display()
-        )
-    })?;
-
-    let mut refs = Vec::new();
-    scan_cached_refs(
-        &repository.join("refs"),
-        &repository.join("refs"),
-        &mut refs,
-    )?;
-    let mut revisions = Vec::new();
-    for entry in entries {
-        let entry = entry.with_context(|| {
-            format!(
-                "failed to inspect cached snapshots for model {repo_id:?} at {}",
-                snapshots.display()
-            )
-        })?;
-        let snapshot_path = entry.path();
-        if !entry.file_type()?.is_dir() {
-            continue;
-        }
-        let commit_hash = entry.file_name().to_string_lossy().into_owned();
-        let mut files = Vec::new();
-        scan_cached_files(&snapshot_path, &mut files)?;
-        let last_modified = std::fs::metadata(&snapshot_path)?
-            .modified()
-            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-        revisions.push(CachedRevisionInfo {
-            refs: refs
-                .iter()
-                .filter_map(|(name, target)| (target == &commit_hash).then_some(name.clone()))
-                .collect(),
-            commit_hash,
-            snapshot_path,
-            files,
-            last_modified,
-        });
-    }
-    Ok(revisions)
-}
-
-fn scan_cached_refs(root: &Path, directory: &Path, refs: &mut Vec<(String, String)>) -> Result<()> {
-    let entries = match std::fs::read_dir(directory) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(error.into()),
-    };
-    for entry in entries {
-        let entry = entry?;
-        let path = entry.path();
-        if entry.file_type()?.is_dir() {
-            scan_cached_refs(root, &path, refs)?;
-        } else {
-            let name = path
-                .strip_prefix(root)?
-                .to_string_lossy()
-                .replace(std::path::MAIN_SEPARATOR, "/");
-            refs.push((name, std::fs::read_to_string(path)?.trim().to_owned()));
-        }
-    }
-    Ok(())
-}
-
-fn scan_cached_files(directory: &Path, files: &mut Vec<CachedFileInfo>) -> Result<()> {
-    for entry in std::fs::read_dir(directory)? {
-        let entry = entry?;
-        let path = entry.path();
-        if entry.file_type()?.is_dir() {
-            scan_cached_files(&path, files)?;
-        } else if let Ok(blob_path) = path.canonicalize() {
-            files.push(CachedFileInfo {
-                file_path: path,
-                blob_path,
-            });
-        }
-    }
-    Ok(())
 }
 
 fn split_hf_model_spec(spec: &str) -> Result<(&str, Option<&str>)> {
@@ -1865,20 +1780,23 @@ mod tests {
         time::{Duration, SystemTime},
     };
 
+    use clap::{CommandFactory, Parser};
+    use hf_hub::cache::{CachedFileInfo, CachedRevisionInfo};
+
     use super::{
         eval, execution_contexts, format_bytes, select_cached_gguf_from_revisions,
         select_cached_gguf_path, select_revision, should_report_stop_reason, split_hf_model_spec,
-        stop_reason, thinking_template_kwargs, validate_args, Array, CachedFileInfo,
-        CachedGgufRole, CachedRevisionInfo, Cli, CliDevice, CliToolChoice, DeviceType,
-        MtpDraftDevice, MtpExecutionStreams, MtpSchedulerOptions, StopReason, ThinkingMode,
+        stop_reason, thinking_template_kwargs, validate_args, Array, CachedGgufRole, Cli,
+        CliDevice, CliToolChoice, DeviceType, MtpDraftDevice, MtpExecutionStreams,
+        MtpSchedulerOptions, StopReason, ThinkingMode,
     };
-    use clap::{CommandFactory, Parser};
 
     fn revision(hash: &str, refs: &[&str], modified: u64) -> CachedRevisionInfo {
         CachedRevisionInfo {
             commit_hash: hash.to_owned(),
             snapshot_path: hash.into(),
             files: Vec::new(),
+            size_on_disk: 0,
             refs: refs.iter().map(|value| (*value).to_owned()).collect(),
             last_modified: SystemTime::UNIX_EPOCH + Duration::from_secs(modified),
         }
@@ -1886,8 +1804,12 @@ mod tests {
 
     fn cached_file(file_path: &str, blob_path: &str) -> CachedFileInfo {
         CachedFileInfo {
+            file_name: file_path.to_owned(),
             file_path: file_path.into(),
             blob_path: blob_path.into(),
+            size_on_disk: 0,
+            blob_last_accessed: SystemTime::UNIX_EPOCH,
+            blob_last_modified: SystemTime::UNIX_EPOCH,
         }
     }
 

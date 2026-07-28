@@ -102,7 +102,7 @@ crates.io release is `0.1.0`.
 
 ## MSRV
 
-The minimum supported Rust version is 1.85.0.
+The minimum supported Rust version is 1.89.0.
 
 Each published crate declares its MSRV in `Cargo.toml`.
 

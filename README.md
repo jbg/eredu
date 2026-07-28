@@ -46,7 +46,7 @@ which parts of the workspace were derived.
 
 ## Getting started
 
-The minimum supported Rust version is 1.88. Add the core crate to a project:
+The minimum supported Rust version is 1.89. Add the core crate to a project:
 
 ```toml
 [dependencies]
@@ -101,11 +101,11 @@ rustup update stable
 
 The committed lockfile makes CI and local compatibility checks reproducible.
 To verify the language-model crates and their default features against the
-minimum supported Rust version, install Rust 1.88.0 and run:
+minimum supported Rust version, install Rust 1.89.0 and run:
 
 ```sh
-rustup toolchain install 1.88.0
-cargo +1.88.0 check --locked -p safemlx-lm-utils -p safemlx-lm
+rustup toolchain install 1.89.0
+cargo +1.89.0 check --locked -p safemlx-lm-utils -p safemlx-lm
 ```
 
 The macOS CI suite runs the workspace tests as follows, keeping tests that
