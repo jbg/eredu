@@ -22,10 +22,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use tokenizers::Tokenizer;
 
-use crate::chat::{prepare_format_profile, resolve_structural_tokens};
+use crate::chat::{prepare_format_profile, resolve_structural_tokens, ToolRuntimePlan};
 pub use crate::chat::{
     ChatTemplateIdentity, ChatTemplateRequest, NativeToolSupport, ParallelToolCallPolicy,
-    PreparedChat, ToolChoice, ToolRuntimePlan,
+    PreparedChat, ToolChoice,
 };
 use crate::gguf_tokenizer::{self, GgufTokenizer};
 use crate::inspection::ActivationObserver;
@@ -2301,7 +2301,9 @@ fn with_prepared_chat_runtime<S, R>(
     execute: impl FnOnce(PreparedChatRuntime<S>) -> Result<R, Error>,
 ) -> Result<R, Error> {
     let plan = match prepared_chat.native_tool_support() {
-        NativeToolSupport::Supported(plan) => plan,
+        NativeToolSupport::Supported => prepared_chat
+            .tool_runtime_plan()
+            .expect("supported prepared chats carry a runtime plan"),
         NativeToolSupport::Unsupported { reason } => {
             return Err(Error::PreparedChatGeneration(format!(
                 "prepared chat does not have an executable native tool plan: {reason}"
@@ -2370,7 +2372,7 @@ fn prepare_chat_from_parts(
             profile.identity.as_deref().unwrap_or("unregistered")
         )));
     }
-    let (native_tool_support, preserved_structural_token_ids) =
+    let (native_tool_support, tool_runtime_plan, preserved_structural_token_ids) =
         match (profile.dialect, profile.dialect_parameters) {
             (Some(dialect), Some(parameters)) => {
                 let resolved_structural_token_ids =
@@ -2396,7 +2398,8 @@ fn prepare_chat_from_parts(
                     .map_err(Error::ToolConstraint)?;
                 let preserved_structural_token_ids = plan.structural_token_ids().collect();
                 (
-                    NativeToolSupport::Supported(plan),
+                    NativeToolSupport::Supported,
+                    Some(plan),
                     preserved_structural_token_ids,
                 )
             }
@@ -2409,6 +2412,7 @@ fn prepare_chat_from_parts(
                             "format profile does not provide a native tool dialect".into()
                         }),
                 },
+                None,
                 Vec::new(),
             ),
         };
@@ -2473,6 +2477,7 @@ fn prepare_chat_from_parts(
         template_identity,
         format_profile_identity: profile.identity,
         native_tool_support,
+        tool_runtime_plan,
         eos_token_ids: eos_token_ids.to_vec(),
         preserved_structural_token_ids,
         profile_stop_sequences: profile.stop_sequences,
@@ -2731,7 +2736,10 @@ impl LoadedModel {
                 on_event,
             } = lane;
             let plan = match prepared_chat.native_tool_support() {
-                NativeToolSupport::Supported(plan) => plan.clone(),
+                NativeToolSupport::Supported => prepared_chat
+                    .tool_runtime_plan()
+                    .expect("supported prepared chats carry a runtime plan")
+                    .clone(),
                 NativeToolSupport::Unsupported { reason } => {
                     return Err(Error::PreparedChatGeneration(format!(
                         "prepared chat lane {lane_index} does not have an executable native tool plan: {reason}"
@@ -2893,7 +2901,10 @@ impl LoadedModel {
             on_event,
         } = request;
         let plan = match prepared_chat.native_tool_support() {
-            NativeToolSupport::Supported(plan) => plan.clone(),
+            NativeToolSupport::Supported => prepared_chat
+                .tool_runtime_plan()
+                .expect("supported prepared chats carry a runtime plan")
+                .clone(),
             NativeToolSupport::Unsupported { reason } => {
                 return Err(Error::PreparedChatGeneration(format!(
                     "prepared chat does not have an executable native tool plan: {reason}"
@@ -2966,7 +2977,10 @@ impl LoadedModel {
             on_event,
         } = request;
         let plan = match prepared_chat.native_tool_support() {
-            NativeToolSupport::Supported(plan) => plan.clone(),
+            NativeToolSupport::Supported => prepared_chat
+                .tool_runtime_plan()
+                .expect("supported prepared chats carry a runtime plan")
+                .clone(),
             NativeToolSupport::Unsupported { reason } => {
                 return Err(Error::PreparedChatGeneration(format!(
                     "prepared chat does not have an executable native tool plan: {reason}"
@@ -5396,6 +5410,7 @@ mod tests {
             native_tool_support: NativeToolSupport::Unsupported {
                 reason: "synthetic unsupported profile".into(),
             },
+            tool_runtime_plan: None,
             eos_token_ids: vec![2],
             preserved_structural_token_ids: Vec::new(),
             profile_stop_sequences: Vec::new(),
@@ -5571,9 +5586,9 @@ mod tests {
                 .contains("<tool_response>\n{\"result\":1}\n</tool_response>"));
             assert_eq!(prepared.preserved_structural_token_ids(), &[9]);
             assert_eq!(prepared.profile_stop_sequences(), ["<|im_end|>"]);
-            let NativeToolSupport::Supported(plan) = prepared.native_tool_support() else {
-                panic!("registered Qwen profile must be supported");
-            };
+            let plan = prepared
+                .tool_runtime_plan()
+                .unwrap_or_else(|| panic!("registered Qwen profile must be supported"));
             assert_eq!(plan.auto_activation_trigger(), Some("<tool_call>\n"));
         }
     }
@@ -5611,9 +5626,9 @@ mod tests {
         assert!(qwen_vl
             .rendered_prompt()
             .contains("<|vision_start|><|image_pad|><|vision_end|>describe"));
-        let NativeToolSupport::Supported(qwen_vl_plan) = qwen_vl.native_tool_support() else {
-            panic!("registered Qwen-VL profile must be supported");
-        };
+        let qwen_vl_plan = qwen_vl
+            .tool_runtime_plan()
+            .unwrap_or_else(|| panic!("registered Qwen-VL profile must be supported"));
         assert_eq!(qwen_vl_plan.auto_activation_trigger(), None);
 
         let mut hermes_tokenizer = production_chat_tokenizer(5);
@@ -5764,9 +5779,9 @@ mod tests {
                 );
                 assert_eq!(prepared.preserved_structural_token_ids(), &[4, 5]);
                 assert_eq!(prepared.profile_stop_sequences(), ["</s>"]);
-                let NativeToolSupport::Supported(plan) = prepared.native_tool_support() else {
-                    panic!("registered Mistral profile must be supported");
-                };
+                let plan = prepared
+                    .tool_runtime_plan()
+                    .unwrap_or_else(|| panic!("registered Mistral profile must be supported"));
                 assert_eq!(plan.auto_activation_trigger(), expected_auto_trigger);
             }
         }
@@ -5866,9 +5881,9 @@ mod tests {
             );
             assert_eq!(prepared.preserved_structural_token_ids(), &[7]);
             assert_eq!(prepared.profile_stop_sequences(), ["<|eot_id|>"]);
-            let NativeToolSupport::Supported(plan) = prepared.native_tool_support() else {
-                panic!("registered Llama 3 profile must be supported");
-            };
+            let plan = prepared
+                .tool_runtime_plan()
+                .unwrap_or_else(|| panic!("registered Llama 3 profile must be supported"));
             assert_eq!(plan.auto_activation_trigger(), Some("{"));
             let output = r#"{"name":"lookup","parameters":{"value":1}}"#;
             assert!(plan_accepts(plan, output));
@@ -5988,9 +6003,9 @@ mod tests {
         );
         assert_eq!(prepared.preserved_structural_token_ids(), &[11, 12, 13]);
         assert_eq!(prepared.profile_stop_sequences(), ["<|eot|>"]);
-        let NativeToolSupport::Supported(plan) = prepared.native_tool_support() else {
-            panic!("registered Llama 4 profile must be supported");
-        };
+        let plan = prepared
+            .tool_runtime_plan()
+            .unwrap_or_else(|| panic!("registered Llama 4 profile must be supported"));
         assert_eq!(plan.auto_activation_trigger(), Some("<|python_start|>"));
         let output = concat!(
             "<|python_start|>analysis 🦀<|python_end|>",
@@ -6117,9 +6132,9 @@ mod tests {
         );
         assert_eq!(prepared.preserved_structural_token_ids(), &[5]);
         assert_eq!(prepared.profile_stop_sequences(), ["<|eot_id|>"]);
-        let NativeToolSupport::Supported(plan) = prepared.native_tool_support() else {
-            panic!("registered Nemotron profile must be supported");
-        };
+        let plan = prepared
+            .tool_runtime_plan()
+            .unwrap_or_else(|| panic!("registered Nemotron profile must be supported"));
         assert_eq!(plan.auto_activation_trigger(), None);
 
         let output = concat!(
@@ -6283,9 +6298,9 @@ mod tests {
         );
         assert_eq!(required.preserved_structural_token_ids(), &[19]);
         assert_eq!(required.profile_stop_sequences(), ["<SPECIAL_12>"]);
-        let NativeToolSupport::Supported(required_plan) = required.native_tool_support() else {
-            panic!("registered Nemotron v2 profile must be supported");
-        };
+        let required_plan = required
+            .tool_runtime_plan()
+            .unwrap_or_else(|| panic!("registered Nemotron v2 profile must be supported"));
         assert_eq!(required_plan.auto_activation_trigger(), None);
 
         let output = concat!(
@@ -6376,9 +6391,9 @@ mod tests {
         assert!(auto
             .rendered_prompt()
             .ends_with("<SPECIAL_11>Assistant\n<think></think>"));
-        let NativeToolSupport::Supported(auto_plan) = auto.native_tool_support() else {
-            panic!("registered Nemotron v2 Auto profile must be supported");
-        };
+        let auto_plan = auto
+            .tool_runtime_plan()
+            .unwrap_or_else(|| panic!("registered Nemotron v2 Auto profile must be supported"));
         assert_eq!(auto_plan.auto_activation_trigger(), Some("<TOOLCALL>["));
         assert!(plan_accepts(
             auto_plan,
@@ -6429,9 +6444,9 @@ mod tests {
                     },
                 )
                 .unwrap();
-                let NativeToolSupport::Supported(plan) = prepared.native_tool_support() else {
-                    panic!("exact registered fixture must be supported");
-                };
+                let plan = prepared
+                    .tool_runtime_plan()
+                    .unwrap_or_else(|| panic!("exact registered fixture must be supported"));
                 assert_eq!(plan.auto_activation_trigger(), expected_trigger);
             }
         }
@@ -6539,9 +6554,9 @@ mod tests {
             prepared.profile_stop_sequences(),
             ["<|return|>", "<|call|>"]
         );
-        let NativeToolSupport::Supported(plan) = prepared.native_tool_support() else {
-            panic!("exact GPT-OSS template signature must prepare Harmony");
-        };
+        let plan = prepared
+            .tool_runtime_plan()
+            .unwrap_or_else(|| panic!("exact GPT-OSS template signature must prepare Harmony"));
         assert_eq!(plan.auto_activation_trigger(), None);
     }
 
@@ -6609,9 +6624,9 @@ mod tests {
             current.profile_stop_sequences(),
             ["<|tool_call_end|>", "<|im_end|>"]
         );
-        let NativeToolSupport::Supported(plan) = current.native_tool_support() else {
-            panic!("exact LFM2.5 template signature must prepare Python tools");
-        };
+        let plan = current
+            .tool_runtime_plan()
+            .unwrap_or_else(|| panic!("exact LFM2.5 template signature must prepare Python tools"));
         assert_eq!(plan.auto_activation_trigger(), None);
 
         let mut classic_tokenizer = lfm2_chat_tokenizer(51);
@@ -6651,9 +6666,9 @@ mod tests {
             "<|im_end|>\n",
             "<|im_start|>assistant\n"
         )));
-        let NativeToolSupport::Supported(plan) = classic.native_tool_support() else {
-            panic!("exact classic LFM2 template signature must prepare Python tools");
-        };
+        let plan = classic.tool_runtime_plan().unwrap_or_else(|| {
+            panic!("exact classic LFM2 template signature must prepare Python tools")
+        });
         assert_eq!(plan.auto_activation_trigger(), Some("<|tool_call_start|>"));
     }
 
@@ -6867,9 +6882,9 @@ mod tests {
             71,
         )
         .unwrap();
-        let NativeToolSupport::Supported(required_plan) = required.native_tool_support() else {
-            panic!("registered DeepSeek V3.1 template must prepare native tools");
-        };
+        let required_plan = required.tool_runtime_plan().unwrap_or_else(|| {
+            panic!("registered DeepSeek V3.1 template must prepare native tools")
+        });
         assert_eq!(required_plan.auto_activation_trigger(), None);
         assert!(plan_accepts(required_plan, one_v31));
         assert!(plan_accepts(
@@ -6893,9 +6908,9 @@ mod tests {
             81,
         )
         .unwrap();
-        let NativeToolSupport::Supported(parallel_plan) = parallel.native_tool_support() else {
-            panic!("registered DeepSeek V3.1 template must prepare parallel tools");
-        };
+        let parallel_plan = parallel.tool_runtime_plan().unwrap_or_else(|| {
+            panic!("registered DeepSeek V3.1 template must prepare parallel tools")
+        });
         assert!(plan_accepts(parallel_plan, two_v31));
         assert!(!plan_accepts(parallel_plan, three_v31));
 
@@ -6907,9 +6922,9 @@ mod tests {
             91,
         )
         .unwrap();
-        let NativeToolSupport::Supported(auto_plan) = auto.native_tool_support() else {
-            panic!("registered DeepSeek V3.1 template must prepare Auto tools");
-        };
+        let auto_plan = auto
+            .tool_runtime_plan()
+            .unwrap_or_else(|| panic!("registered DeepSeek V3.1 template must prepare Auto tools"));
         assert_eq!(
             auto_plan.auto_activation_trigger(),
             Some("<｜tool▁calls▁begin｜>")
@@ -6929,9 +6944,9 @@ mod tests {
             101,
         )
         .unwrap();
-        let NativeToolSupport::Supported(old_plan) = old_surface.native_tool_support() else {
-            panic!("registered DeepSeek V3 template must prepare native tools");
-        };
+        let old_plan = old_surface
+            .tool_runtime_plan()
+            .unwrap_or_else(|| panic!("registered DeepSeek V3 template must prepare native tools"));
         assert!(plan_accepts(old_plan, one_v3));
         assert!(!plan_accepts(old_plan, one_v31));
 
@@ -6970,9 +6985,9 @@ mod tests {
             111,
         )
         .unwrap();
-        let NativeToolSupport::Supported(unicode_plan) = unicode.native_tool_support() else {
-            panic!("registered DeepSeek V3.1 template must prepare Unicode arguments");
-        };
+        let unicode_plan = unicode.tool_runtime_plan().unwrap_or_else(|| {
+            panic!("registered DeepSeek V3.1 template must prepare Unicode arguments")
+        });
         assert!(plan_accepts(
             unicode_plan,
             concat!(
@@ -7286,10 +7301,9 @@ mod tests {
                             prepared.profile_stop_sequences(),
                             ["<|tool_response>", "<turn|>"]
                         );
-                        let NativeToolSupport::Supported(plan) = prepared.native_tool_support()
-                        else {
-                            panic!("registered Gemma 4 profile must be supported");
-                        };
+                        let plan = prepared
+                            .tool_runtime_plan()
+                            .expect("registered Gemma 4 profile must be supported");
                         if tool_choice == ToolChoice::Auto {
                             assert_eq!(plan.auto_activation_trigger(), Some("<|tool_call>"));
                             assert!(!ConstrainedSampler::from_tool_plan(DefaultSampler, plan)
@@ -7360,9 +7374,9 @@ mod tests {
             },
         )
         .unwrap();
-        let NativeToolSupport::Supported(plan) = prepared.native_tool_support() else {
-            panic!("registered Gemma 4 profile must be supported");
-        };
+        let plan = prepared
+            .tool_runtime_plan()
+            .unwrap_or_else(|| panic!("registered Gemma 4 profile must be supported"));
         let tool_output = concat!(
             "<|channel>thought\nNeed 東京 🦀\n<channel|>",
             "<|tool_call>call:lookup{value:7}<tool_call|><|tool_response>",
@@ -7584,7 +7598,7 @@ mod tests {
         );
         assert!(matches!(
             selected_tool_use.native_tool_support(),
-            NativeToolSupport::Supported(_)
+            NativeToolSupport::Supported
         ));
     }
 
@@ -7623,9 +7637,9 @@ mod tests {
             prepared.format_profile_identity(),
             Some("safemlx.synthetic-tools.v1")
         );
-        let NativeToolSupport::Supported(plan) = prepared.native_tool_support() else {
-            panic!("synthetic profile must prepare an executable runtime plan");
-        };
+        let plan = prepared
+            .tool_runtime_plan()
+            .unwrap_or_else(|| panic!("synthetic profile must prepare an executable runtime plan"));
         let mut parser = plan.create_parser().unwrap();
         parser
             .push(r#"{"calls":[{"name":"lookup","arguments":{"query":"weather"}}]}"#)
@@ -7715,14 +7729,65 @@ mod tests {
 
         assert_eq!(first.preserved_structural_token_ids(), &[0]);
         assert_eq!(second.preserved_structural_token_ids(), &[7]);
-        let NativeToolSupport::Supported(first_plan) = first.native_tool_support() else {
-            panic!("synthetic profile must prepare a runtime plan");
-        };
-        let NativeToolSupport::Supported(second_plan) = second.native_tool_support() else {
-            panic!("synthetic profile must prepare a runtime plan");
-        };
+        let first_plan = first
+            .tool_runtime_plan()
+            .unwrap_or_else(|| panic!("synthetic profile must prepare a runtime plan"));
+        let second_plan = second
+            .tool_runtime_plan()
+            .unwrap_or_else(|| panic!("synthetic profile must prepare a runtime plan"));
         assert_eq!(first_plan.structural_token_ids().collect::<Vec<_>>(), [0]);
         assert_eq!(second_plan.structural_token_ids().collect::<Vec<_>>(), [7]);
+    }
+
+    #[test]
+    fn tokenizer_analysis_is_model_scoped_while_schemas_compile_per_prepare_chat() {
+        let compiler = Ok(ConstraintCompiler::synthetic_for_tests());
+        assert_eq!(compiler.as_ref().unwrap().cache_analysis_counts(), (1, 0));
+        let mut tokenizer = synthetic_chat_tokenizer(0);
+
+        let prepare = |tokenizer: &mut ChatTokenizer, property: &str| {
+            prepare_chat_from_parts(
+                tokenizer,
+                ModelChatTemplate::Single(SYNTHETIC_TOOL_TEMPLATE.into()),
+                "one-loaded-model",
+                &[],
+                Some(&compiler),
+                ChatTemplateRequest {
+                    tools: vec![json!({
+                        "type": "function",
+                        "function": {
+                            "name": "lookup",
+                            "parameters": {
+                                "type": "object",
+                                "properties": {(property): {"type": "string"}},
+                                "required": [property],
+                                "additionalProperties": false
+                            }
+                        }
+                    })],
+                    tool_choice: ToolChoice::Required,
+                    ..ChatTemplateRequest::default()
+                },
+            )
+            .unwrap()
+        };
+
+        let first = prepare(&mut tokenizer, "city");
+        let second = prepare(&mut tokenizer, "country");
+        assert_eq!(compiler.as_ref().unwrap().cache_analysis_counts(), (1, 2));
+        assert_ne!(
+            first
+                .tool_runtime_plan()
+                .unwrap()
+                .generation_constraint()
+                .fingerprint,
+            second
+                .tool_runtime_plan()
+                .unwrap()
+                .generation_constraint()
+                .fingerprint,
+            "request schemas must compile into independent grammars"
+        );
     }
 
     #[test]

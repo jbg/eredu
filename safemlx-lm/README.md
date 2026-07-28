@@ -1,5 +1,10 @@
 # safemlx-lm
 
+Native tool calling is documented in
+[`NATIVE_TOOL_CALLING.md`](NATIVE_TOOL_CALLING.md), with extension and fixture
+guidance in
+[`NATIVE_TOOL_CONTRIBUTING.md`](NATIVE_TOOL_CONTRIBUTING.md).
+
 `safemlx-lm` is a Rust runtime for MLX language models.
 
 The crate is derived from the `mlx-lm` crate in

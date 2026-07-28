@@ -320,3 +320,25 @@ unchanged. An explicit mode fails with a clear error when the template does not
 support the switch. Pass `--raw` to tokenize the prompt directly; raw prompts
 cannot use an explicit thinking mode. Run with `--help` for all sampling and
 repetition-penalty options.
+
+Native tool calling accepts a JSON array of OpenAI-shaped function definitions.
+It uses exact template-signature capability gating and the `PreparedChat`
+runtime; unsupported or changed templates fail instead of falling back to
+unconstrained text:
+
+```sh
+cargo run --release -p safemlx-lm-cli -- \
+  --model /path/to/model \
+  --tools tools.json --tool-choice required \
+  --max-parallel-tool-calls 2 \
+  --stop '<caller-stop>' \
+  "Look up the weather in Bogotá."
+```
+
+Visible text and canonical tool events are streamed to stdout. Reasoning deltas
+are shown on stderr with `--verbose`, and every prepared-tool request reports
+`stop_reason` (`grammar_complete`, `stop_sequence`, `eos`, or `max_tokens`).
+External and embedded MTP automatically use the same semantic runtime and the
+existing draft-placement and scheduler-lookahead options. `--tools` conflicts
+with `--raw`; raw/unconstrained generation remains available intentionally for
+plain completions.

@@ -2509,6 +2509,67 @@ mod tests {
     }
 
     #[test]
+    fn ordinary_canonical_mtp_and_lookahead_mtp_have_identical_semantics() {
+        fn run_mtp(lookahead: bool) -> (Vec<u32>, Vec<SemanticEvent>, FinishReason) {
+            let target = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+            let draft = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+            let prompt = Array::from_slice(&[7u32], &[1, 1]);
+            let parts = [InputPart::text_token_ids(&prompt)];
+            let events = Rc::new(RefCell::new(Vec::new()));
+            let callback = Rc::clone(&events);
+            let mut cache = 0;
+            let mut backend = scripted_backend();
+            let mut scheduler = MtpScheduler::new(
+                &mut backend,
+                MtpExecutionStreams::new(target.stream(), draft.stream()).unwrap(),
+                MtpSchedulerOptions::default().with_lookahead(lookahead),
+            )
+            .unwrap();
+            scheduler
+                .submit_with_semantics(
+                    &mut cache,
+                    ModelInput::new(&parts),
+                    MtpConfig {
+                        max_tokens: 5,
+                        max_draft_tokens: 2,
+                        temperature: 0.0,
+                        eos_token_ids: Vec::new(),
+                    },
+                    None,
+                    CountingSampler::default(),
+                    Box::new(TestSemanticState::default()),
+                    move |event| callback.borrow_mut().push(event),
+                )
+                .unwrap();
+            scheduler.run().unwrap();
+            let request = scheduler.finish().unwrap().requests.pop().unwrap();
+            let finish_reason = request.finish_reason.unwrap();
+            let events = events.borrow().clone();
+            (request.token_ids, events, finish_reason)
+        }
+
+        let canonical = run_mtp(false);
+        let lookahead = run_mtp(true);
+        assert_eq!(lookahead, canonical);
+
+        let mut ordinary = TestSemanticState::default();
+        let mut ordinary_events = Vec::new();
+        for &token in &canonical.0 {
+            assert!(!ordinary.push_token(token).unwrap());
+            ordinary_events.extend(ordinary.take_events());
+        }
+        ordinary.finish(canonical.2).unwrap();
+        ordinary_events.extend(ordinary.take_events());
+        assert_eq!(ordinary_events, canonical.1);
+        assert_eq!(
+            canonical.1.last(),
+            Some(&SemanticEvent::Finished {
+                reason: FinishReason::MaxTokens
+            })
+        );
+    }
+
+    #[test]
     fn optimistic_semantic_stop_truncates_an_accepted_block_transactionally() {
         let target = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
         let draft = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
@@ -2976,7 +3037,7 @@ mod tests {
 
     #[test]
     #[ignore = "requires an MLX Metal device"]
-    fn split_stream_engine_routes_draft_and_target_work() {
+    fn cpu_draft_gpu_target_split_stream_routes_and_commits() {
         let target = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
         let draft = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
         let prompt = Array::from_slice(&[7u32], &[1, 1]);
@@ -3201,7 +3262,7 @@ mod tests {
 
     #[test]
     #[ignore = "requires an MLX Metal device"]
-    fn same_gpu_distinct_streams_run_exact_optimistic_lookahead() {
+    fn same_gpu_split_stream_runs_exact_optimistic_lookahead() {
         let target = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
         let draft = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
         assert_ne!(
@@ -4286,7 +4347,14 @@ mod tests {
 
     #[test]
     fn stochastic_request_is_reproducible_across_scheduler_interleavings() {
-        fn run(with_peer: bool) -> (Vec<u32>, Vec<usize>) {
+        fn run(
+            with_peer: bool,
+        ) -> (
+            Vec<u32>,
+            Vec<usize>,
+            Vec<SemanticEvent>,
+            Option<FinishReason>,
+        ) {
             let target = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
             let draft = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
             let prompt_a = Array::from_slice(&[7u32], &[1, 1]);
@@ -4304,6 +4372,8 @@ mod tests {
             };
             let mut cache_a = 0;
             let mut cache_b = 0;
+            let events = Rc::new(RefCell::new(Vec::new()));
+            let callback = Rc::clone(&events);
             let mut scheduler = MtpScheduler::new(
                 &mut backend,
                 MtpExecutionStreams::new(target.stream(), draft.stream()).unwrap(),
@@ -4317,13 +4387,14 @@ mod tests {
                 eos_token_ids: Vec::new(),
             };
             scheduler
-                .submit(
+                .submit_with_semantics(
                     &mut cache_a,
                     ModelInput::new(&parts_a),
                     config.clone(),
                     Some(safemlx::random::key(7).unwrap()),
                     MirostatV2Sampler::default(),
-                    |_| Ok(()),
+                    Box::new(TestSemanticState::default()),
+                    move |event| callback.borrow_mut().push(event),
                 )
                 .unwrap();
             if with_peer {
@@ -4340,9 +4411,12 @@ mod tests {
             }
             scheduler.run().unwrap();
             let output = scheduler.finish().unwrap();
+            let events = events.borrow().clone();
             (
                 output.requests[0].token_ids.clone(),
                 output.requests[0].stats.accept_lens.clone(),
+                events,
+                output.requests[0].finish_reason,
             )
         }
 

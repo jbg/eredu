@@ -2,6 +2,7 @@ use std::{
     collections::HashSet,
     fmt,
     io::{self, IsTerminal, Read, Write},
+    num::NonZeroUsize,
     path::{Path, PathBuf},
     str::FromStr,
     time::Instant,
@@ -9,7 +10,7 @@ use std::{
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, ValueEnum};
-use hf_hub::{cache::CachedRevisionInfo, HFClientSync};
+use hf_hub::Cache;
 use safemlx::{
     error::Exception,
     ops::indexing::TryIndexOp,
@@ -18,6 +19,7 @@ use safemlx::{
     Array, Device, DeviceType, ExecutionContext, Stream,
 };
 use safemlx_lm::{
+    chat::{ChatTemplateRequest, NativeToolSupport, ParallelToolCallPolicy, ToolChoice},
     dense_stream::DenseDiskStreamLoadOptions,
     expert_cache::{
         ExpertCacheLoadOptions, ExpertPassStatistics, ExpertTierStatistics,
@@ -26,12 +28,15 @@ use safemlx_lm::{
     layerwise::{LayerwiseLoadOptions, WeightResidency},
     models::{
         input::{InputPart, ModelInput},
-        LoadedModel, ModelLoadOptions, TextDecoder,
+        LoadedModel, ModelLoadOptions, PreparedChatEmbeddedMtpGenerationRequest,
+        PreparedChatGenerationRequest, PreparedChatGenerationSettings,
+        PreparedChatMtpGenerationOptions, PreparedChatMtpGenerationRequest, TextDecoder,
     },
     mtp::{LoadedDrafter, MtpConfig, MtpExecutionStreams, MtpSchedulerOptions, MtpStats},
     offload::{CacheEvictionPolicy, MemoryTier, OffloadConfig, TransferDirection},
     quantization::AffineQuantization,
     sampler::{DefaultSampler, GenerationSampler, MirostatV2Sampler, Sampler, SpeculativeSampler},
+    streaming::{FinishReason, SemanticEvent},
 };
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -48,6 +53,24 @@ enum ThinkingMode {
     On,
     /// Ask a compatible chat template to disable thinking/reasoning.
     Off,
+}
+
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq, ValueEnum)]
+enum CliToolChoice {
+    None,
+    #[default]
+    Auto,
+    Required,
+}
+
+impl From<CliToolChoice> for ToolChoice {
+    fn from(value: CliToolChoice) -> Self {
+        match value {
+            CliToolChoice::None => Self::None,
+            CliToolChoice::Auto => Self::Auto,
+            CliToolChoice::Required => Self::Required,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -381,6 +404,22 @@ struct Cli {
     #[arg(long)]
     raw: bool,
 
+    /// JSON file containing an array of OpenAI-shaped function tools.
+    #[arg(long, value_name = "PATH")]
+    tools: Option<PathBuf>,
+
+    /// Native tool selection policy used with `--tools`.
+    #[arg(long, value_enum, default_value_t = CliToolChoice::Auto)]
+    tool_choice: CliToolChoice,
+
+    /// Enable parallel native calls, optionally bounded to this many calls.
+    #[arg(long, value_name = "CALLS")]
+    max_parallel_tool_calls: Option<NonZeroUsize>,
+
+    /// Additional decoded stop sequence for prepared native-tool generation.
+    #[arg(long = "stop", value_name = "TEXT")]
+    stop_sequences: Vec<String>,
+
     /// Control thinking/reasoning in chat templates that support `enable_thinking`.
     ///
     /// `auto` preserves the model's default. Explicit `on` or `off` fails when
@@ -403,16 +442,46 @@ struct Cli {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum StopReason {
     Eos,
+    StopSequence,
+    GrammarComplete,
     MaxTokens,
     GeneratorExhausted,
+}
+
+#[derive(Clone, Debug)]
+struct CachedFileInfo {
+    file_path: PathBuf,
+    blob_path: PathBuf,
+}
+
+#[derive(Clone, Debug)]
+struct CachedRevisionInfo {
+    commit_hash: String,
+    snapshot_path: PathBuf,
+    files: Vec<CachedFileInfo>,
+    refs: Vec<String>,
+    last_modified: std::time::SystemTime,
 }
 
 impl StopReason {
     const fn label(self) -> &'static str {
         match self {
             Self::Eos => "eos",
+            Self::StopSequence => "stop_sequence",
+            Self::GrammarComplete => "grammar_complete",
             Self::MaxTokens => "max_tokens",
             Self::GeneratorExhausted => "generator_exhausted",
+        }
+    }
+}
+
+impl From<FinishReason> for StopReason {
+    fn from(value: FinishReason) -> Self {
+        match value {
+            FinishReason::Eos => Self::Eos,
+            FinishReason::StopSequence => Self::StopSequence,
+            FinishReason::GrammarComplete => Self::GrammarComplete,
+            FinishReason::MaxTokens => Self::MaxTokens,
         }
     }
 }
@@ -444,6 +513,37 @@ fn write_streamed_token(
         stdout.write_all(text.as_bytes())?;
         stdout.flush()?;
         streamed_text.push_str(&text);
+    }
+    Ok(())
+}
+
+fn write_semantic_event(
+    event: &SemanticEvent,
+    stdout: &mut impl Write,
+    streamed_text: &mut String,
+    verbose: bool,
+) -> Result<()> {
+    let visible = match event {
+        SemanticEvent::TextDelta(text) => Some(text.clone()),
+        SemanticEvent::ToolCallStart { index, id, name } => Some(format!(
+            "\n{{\"tool_call\":{{\"index\":{index},\"id\":{},\"name\":{},\"arguments\":",
+            serde_json::to_string(id)?,
+            serde_json::to_string(name)?,
+        )),
+        SemanticEvent::ToolArgumentsDelta { json_fragment, .. } => Some(json_fragment.clone()),
+        SemanticEvent::ToolCallEnd => Some("}}\n".into()),
+        SemanticEvent::ReasoningDelta(text) => {
+            if verbose {
+                eprintln!("reasoning_delta: {text:?}");
+            }
+            None
+        }
+        SemanticEvent::Finished { .. } => None,
+    };
+    if let Some(visible) = visible {
+        stdout.write_all(visible.as_bytes())?;
+        stdout.flush()?;
+        streamed_text.push_str(&visible);
     }
     Ok(())
 }
@@ -601,7 +701,42 @@ fn main() -> Result<()> {
     }
     let load_elapsed = load_started.elapsed();
 
-    let (rendered_prompt, add_special_tokens) = if args.raw {
+    let prepared_chat = if let Some(path) = args.tools.as_deref() {
+        let tools = read_tools(path)?;
+        let prepared = model.prepare_chat(ChatTemplateRequest {
+            messages: vec![serde_json::json!({
+                "role": "user",
+                "content": prompt,
+            })],
+            tools,
+            tool_choice: args.tool_choice.into(),
+            parallel_tool_calls: match args.max_parallel_tool_calls {
+                Some(max_calls) => ParallelToolCallPolicy::Enabled {
+                    max_calls: Some(max_calls),
+                },
+                None => ParallelToolCallPolicy::Disabled,
+            },
+            enable_thinking: args.thinking.enabled(),
+            add_generation_prompt: true,
+            ..ChatTemplateRequest::default()
+        })?;
+        if let NativeToolSupport::Unsupported { reason } = prepared.native_tool_support() {
+            bail!("native tool calling is unavailable: {reason}");
+        }
+        if args.verbose {
+            eprintln!(
+                "native_tool_profile: {}",
+                prepared.format_profile_identity().unwrap_or("unregistered")
+            );
+        }
+        Some(prepared)
+    } else {
+        None
+    };
+
+    let (rendered_prompt, add_special_tokens) = if let Some(prepared) = &prepared_chat {
+        (prepared.rendered_prompt().to_owned(), false)
+    } else if args.raw {
         (prompt, true)
     } else {
         let thinking_template_kwargs = if args.thinking == ThinkingMode::Auto {
@@ -691,7 +826,120 @@ fn main() -> Result<()> {
                 checkpoint: safemlx_lm::mtp::MtpCheckpointKind::Embedded
             }
         );
-    if let Some(drafter) = drafter.as_mut() {
+    let scheduler_options = MtpSchedulerOptions {
+        adaptive_lookahead: !args.disable_mtp_adaptive_lookahead,
+        ..MtpSchedulerOptions::default()
+    }
+    .with_lookahead(!args.disable_mtp_lookahead);
+    let mut prepared_finish_reason = None;
+    if let Some(prepared) = &prepared_chat {
+        let settings = PreparedChatGenerationSettings {
+            temperature: args.temperature,
+            max_tokens: NonZeroUsize::new(args.max_tokens).expect("validated non-zero max tokens"),
+            prng_key,
+        };
+        let mut semantic_error = None;
+        if let Some(drafter) = drafter.as_mut() {
+            let output = model.generate_prepared_chat_mtp(PreparedChatMtpGenerationRequest {
+                prepared_chat: prepared,
+                drafter,
+                cache: &mut cache,
+                sampling_policy: sampler,
+                settings,
+                options: PreparedChatMtpGenerationOptions {
+                    max_draft_tokens: NonZeroUsize::new(args.mtp_draft_tokens)
+                        .expect("external MTP validates non-zero draft tokens"),
+                    scheduler: scheduler_options,
+                },
+                caller_stop_sequences: &args.stop_sequences,
+                streams: MtpExecutionStreams::new(stream, draft_stream)?,
+                on_event: |event| {
+                    if time_to_first_token.is_none()
+                        && !matches!(event, SemanticEvent::Finished { .. })
+                    {
+                        time_to_first_token = Some(generation_started.elapsed());
+                    }
+                    if semantic_error.is_none() {
+                        semantic_error = write_semantic_event(
+                            &event,
+                            &mut stdout,
+                            &mut streamed_text,
+                            args.verbose,
+                        )
+                        .err();
+                    }
+                },
+            })?;
+            output_ids = output.token_ids;
+            mtp_stats = Some(output.stats);
+            prepared_finish_reason = Some(output.finish_reason);
+        } else if embedded_mtp {
+            let output = model.generate_prepared_chat_embedded_mtp(
+                PreparedChatEmbeddedMtpGenerationRequest {
+                    prepared_chat: prepared,
+                    cache: &mut cache,
+                    sampling_policy: sampler,
+                    settings,
+                    options: PreparedChatMtpGenerationOptions {
+                        max_draft_tokens: NonZeroUsize::new(args.mtp_draft_tokens)
+                            .expect("embedded MTP validates non-zero draft tokens"),
+                        scheduler: scheduler_options,
+                    },
+                    caller_stop_sequences: &args.stop_sequences,
+                    stream,
+                    on_event: |event| {
+                        if time_to_first_token.is_none()
+                            && !matches!(event, SemanticEvent::Finished { .. })
+                        {
+                            time_to_first_token = Some(generation_started.elapsed());
+                        }
+                        if semantic_error.is_none() {
+                            semantic_error = write_semantic_event(
+                                &event,
+                                &mut stdout,
+                                &mut streamed_text,
+                                args.verbose,
+                            )
+                            .err();
+                        }
+                    },
+                },
+            )?;
+            output_ids = output.token_ids;
+            mtp_stats = Some(output.stats);
+            prepared_finish_reason = Some(output.finish_reason);
+        } else {
+            let output = model.generate_prepared_chat(PreparedChatGenerationRequest {
+                prepared_chat: prepared,
+                cache: &mut cache,
+                sampling_policy: sampler,
+                settings,
+                caller_stop_sequences: &args.stop_sequences,
+                stream,
+                on_event: |event| {
+                    if time_to_first_token.is_none()
+                        && !matches!(event, SemanticEvent::Finished { .. })
+                    {
+                        time_to_first_token = Some(generation_started.elapsed());
+                    }
+                    if semantic_error.is_none() {
+                        semantic_error = write_semantic_event(
+                            &event,
+                            &mut stdout,
+                            &mut streamed_text,
+                            args.verbose,
+                        )
+                        .err();
+                    }
+                },
+            })?;
+            output_ids = output.token_ids;
+            prepared_finish_reason = Some(output.finish_reason);
+        }
+        if let Some(error) = semantic_error {
+            return Err(error);
+        }
+    } else if let Some(drafter) = drafter.as_mut() {
         let parts = [InputPart::text_token_ids(&tokens)];
         let input = ModelInput::new(&parts);
         let config = MtpConfig {
@@ -700,11 +948,6 @@ fn main() -> Result<()> {
             temperature: args.temperature,
             eos_token_ids: eos_token_ids.clone(),
         };
-        let scheduler_options = MtpSchedulerOptions {
-            adaptive_lookahead: !args.disable_mtp_adaptive_lookahead,
-            ..MtpSchedulerOptions::default()
-        }
-        .with_lookahead(!args.disable_mtp_lookahead);
         let mtp_streams = MtpExecutionStreams::new(stream, draft_stream)?;
         let (tokens, stats) = model
             .generate_mtp_input_with_sampler_callback_and_streams_and_options(
@@ -806,17 +1049,23 @@ fn main() -> Result<()> {
         }
     }
     let generation_elapsed = generation_started.elapsed();
-    let stop_reason = stop_reason(&output_ids, &eos_token_ids, args.max_tokens);
-    if stop_reason == StopReason::Eos {
+    let stop_reason = prepared_finish_reason
+        .map(StopReason::from)
+        .unwrap_or_else(|| stop_reason(&output_ids, &eos_token_ids, args.max_tokens));
+    if prepared_chat.is_none() && stop_reason == StopReason::Eos {
         output_ids.pop();
     }
 
-    let output = model.decode(&output_ids, true)?;
-    let remaining = output
-        .strip_prefix(&streamed_text)
-        .with_context(|| "incremental tokenizer output did not match the final decoded response")?;
-    stdout.write_all(remaining.as_bytes())?;
-    if !output.ends_with('\n') {
+    if prepared_chat.is_none() {
+        let output = model.decode(&output_ids, true)?;
+        let remaining = output.strip_prefix(&streamed_text).with_context(|| {
+            "incremental tokenizer output did not match the final decoded response"
+        })?;
+        stdout.write_all(remaining.as_bytes())?;
+        if !output.ends_with('\n') {
+            writeln!(stdout)?;
+        }
+    } else if !streamed_text.ends_with('\n') {
         writeln!(stdout)?;
     }
     stdout.flush()?;
@@ -824,7 +1073,7 @@ fn main() -> Result<()> {
     if args.verbose {
         eprintln!("--- safemlx diagnostics (stderr) ---");
     }
-    if should_report_stop_reason(stop_reason, args.verbose) {
+    if prepared_chat.is_some() || should_report_stop_reason(stop_reason, args.verbose) {
         eprintln!("stop_reason: {}", stop_reason.label());
     }
 
@@ -976,7 +1225,7 @@ fn main() -> Result<()> {
                 StopReason::GeneratorExhausted => {
                     eprintln!("warning: the token generator ended before EOS");
                 }
-                StopReason::Eos => {}
+                StopReason::Eos | StopReason::StopSequence | StopReason::GrammarComplete => {}
             }
         }
     }
@@ -1209,6 +1458,20 @@ fn validate_args(args: &Cli) -> Result<()> {
     if args.raw && args.thinking != ThinkingMode::Auto {
         bail!("--thinking on/off cannot be used with --raw because raw prompts bypass the chat template");
     }
+    if args.raw && args.tools.is_some() {
+        bail!(
+            "--tools cannot be used with --raw because raw prompts bypass native tool preparation"
+        );
+    }
+    if args.tools.is_none() && args.tool_choice != CliToolChoice::Auto {
+        bail!("--tool-choice requires --tools");
+    }
+    if args.tools.is_none() && args.max_parallel_tool_calls.is_some() {
+        bail!("--max-parallel-tool-calls requires --tools");
+    }
+    if args.tools.is_none() && !args.stop_sequences.is_empty() {
+        bail!("--stop requires --tools");
+    }
     Ok(())
 }
 
@@ -1251,6 +1514,17 @@ fn read_prompt(argument: Option<&str>) -> Result<String> {
     Ok(prompt)
 }
 
+fn read_tools(path: &Path) -> Result<Vec<serde_json::Value>> {
+    let file = std::fs::File::open(path)
+        .with_context(|| format!("failed to open tool definitions {}", path.display()))?;
+    let tools: serde_json::Value = serde_json::from_reader(file)
+        .with_context(|| format!("failed to parse tool definitions {}", path.display()))?;
+    tools
+        .as_array()
+        .cloned()
+        .with_context(|| format!("tool definitions {} must be a JSON array", path.display()))
+}
+
 fn resolve_model(
     spec: &str,
     requested_revision: Option<&str>,
@@ -1265,25 +1539,12 @@ fn resolve_model(
 
     let (repo_id, quantization) = split_hf_model_spec(spec)?;
 
-    let client = HFClientSync::new().context("failed to initialize the Hugging Face cache")?;
-    let cache = client
-        .scan_cache()
-        .send()
-        .context("failed to scan the Hugging Face cache")?;
-    let repo = cache
-        .repos
-        .iter()
-        .find(|repo| repo.repo_type == "model" && repo.repo_id == repo_id)
-        .with_context(|| {
-            format!(
-                "{repo_id:?} is not an existing path or a model in the local Hugging Face cache at {}",
-                cache.cache_dir.display()
-            )
-        })?;
+    let cache = Cache::from_env();
+    let revisions = scan_cached_model(cache.path(), repo_id)?;
     match quantization {
         Some(quantization) => {
             select_cached_gguf_from_revisions(
-                &repo.revisions,
+                &revisions,
                 requested_revision,
                 quantization,
                 gguf_role,
@@ -1295,15 +1556,98 @@ fn resolve_model(
             })
         }
         None => {
-            let revision =
-                select_revision(&repo.revisions, requested_revision).with_context(|| {
-                    format!(
-                        "could not select a cached revision for Hugging Face model {repo_id:?}"
-                    )
-                })?;
+            let revision = select_revision(&revisions, requested_revision).with_context(|| {
+                format!("could not select a cached revision for Hugging Face model {repo_id:?}")
+            })?;
             Ok(revision.snapshot_path.clone())
         }
     }
+}
+
+fn scan_cached_model(cache_dir: &Path, repo_id: &str) -> Result<Vec<CachedRevisionInfo>> {
+    let repository = cache_dir.join(format!("models--{}", repo_id.replace('/', "--")));
+    let snapshots = repository.join("snapshots");
+    let entries = std::fs::read_dir(&snapshots).with_context(|| {
+        format!(
+            "{repo_id:?} is not an existing path or a model in the local Hugging Face cache at {}",
+            cache_dir.display()
+        )
+    })?;
+
+    let mut refs = Vec::new();
+    scan_cached_refs(
+        &repository.join("refs"),
+        &repository.join("refs"),
+        &mut refs,
+    )?;
+    let mut revisions = Vec::new();
+    for entry in entries {
+        let entry = entry.with_context(|| {
+            format!(
+                "failed to inspect cached snapshots for model {repo_id:?} at {}",
+                snapshots.display()
+            )
+        })?;
+        let snapshot_path = entry.path();
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let commit_hash = entry.file_name().to_string_lossy().into_owned();
+        let mut files = Vec::new();
+        scan_cached_files(&snapshot_path, &mut files)?;
+        let last_modified = std::fs::metadata(&snapshot_path)?
+            .modified()
+            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+        revisions.push(CachedRevisionInfo {
+            refs: refs
+                .iter()
+                .filter_map(|(name, target)| (target == &commit_hash).then_some(name.clone()))
+                .collect(),
+            commit_hash,
+            snapshot_path,
+            files,
+            last_modified,
+        });
+    }
+    Ok(revisions)
+}
+
+fn scan_cached_refs(root: &Path, directory: &Path, refs: &mut Vec<(String, String)>) -> Result<()> {
+    let entries = match std::fs::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    for entry in entries {
+        let entry = entry?;
+        let path = entry.path();
+        if entry.file_type()?.is_dir() {
+            scan_cached_refs(root, &path, refs)?;
+        } else {
+            let name = path
+                .strip_prefix(root)?
+                .to_string_lossy()
+                .replace(std::path::MAIN_SEPARATOR, "/");
+            refs.push((name, std::fs::read_to_string(path)?.trim().to_owned()));
+        }
+    }
+    Ok(())
+}
+
+fn scan_cached_files(directory: &Path, files: &mut Vec<CachedFileInfo>) -> Result<()> {
+    for entry in std::fs::read_dir(directory)? {
+        let entry = entry?;
+        let path = entry.path();
+        if entry.file_type()?.is_dir() {
+            scan_cached_files(&path, files)?;
+        } else if let Ok(blob_path) = path.canonicalize() {
+            files.push(CachedFileInfo {
+                file_path: path,
+                blob_path,
+            });
+        }
+    }
+    Ok(())
 }
 
 fn split_hf_model_spec(spec: &str) -> Result<(&str, Option<&str>)> {
@@ -1521,23 +1865,20 @@ mod tests {
         time::{Duration, SystemTime},
     };
 
-    use clap::{CommandFactory, Parser};
-    use hf_hub::cache::{CachedFileInfo, CachedRevisionInfo};
-
     use super::{
         eval, execution_contexts, format_bytes, select_cached_gguf_from_revisions,
         select_cached_gguf_path, select_revision, should_report_stop_reason, split_hf_model_spec,
-        stop_reason, thinking_template_kwargs, validate_args, Array, CachedGgufRole, Cli,
-        CliDevice, DeviceType, MtpDraftDevice, MtpExecutionStreams, MtpSchedulerOptions,
-        StopReason, ThinkingMode,
+        stop_reason, thinking_template_kwargs, validate_args, Array, CachedFileInfo,
+        CachedGgufRole, CachedRevisionInfo, Cli, CliDevice, CliToolChoice, DeviceType,
+        MtpDraftDevice, MtpExecutionStreams, MtpSchedulerOptions, StopReason, ThinkingMode,
     };
+    use clap::{CommandFactory, Parser};
 
     fn revision(hash: &str, refs: &[&str], modified: u64) -> CachedRevisionInfo {
         CachedRevisionInfo {
             commit_hash: hash.to_owned(),
             snapshot_path: hash.into(),
             files: Vec::new(),
-            size_on_disk: 0,
             refs: refs.iter().map(|value| (*value).to_owned()).collect(),
             last_modified: SystemTime::UNIX_EPOCH + Duration::from_secs(modified),
         }
@@ -1545,12 +1886,8 @@ mod tests {
 
     fn cached_file(file_path: &str, blob_path: &str) -> CachedFileInfo {
         CachedFileInfo {
-            file_name: file_path.to_owned(),
             file_path: file_path.into(),
             blob_path: blob_path.into(),
-            size_on_disk: 0,
-            blob_last_accessed: SystemTime::UNIX_EPOCH,
-            blob_last_modified: SystemTime::UNIX_EPOCH,
         }
     }
 
@@ -1601,6 +1938,51 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("raw prompts bypass the chat template"));
+    }
+
+    #[test]
+    fn parses_native_tool_options_and_keeps_raw_generation_explicit() {
+        let tools = Cli::try_parse_from([
+            "safemlx-lm",
+            "--model",
+            "model-id",
+            "--tools",
+            "tools.json",
+            "--tool-choice",
+            "required",
+            "--max-parallel-tool-calls",
+            "2",
+            "--stop",
+            "<done>",
+            "prompt",
+        ])
+        .unwrap();
+        assert_eq!(tools.tool_choice, CliToolChoice::Required);
+        assert_eq!(tools.max_parallel_tool_calls.unwrap().get(), 2);
+        assert_eq!(tools.stop_sequences, ["<done>"]);
+        validate_args(&tools).unwrap();
+
+        let raw_tools = Cli::try_parse_from([
+            "safemlx-lm",
+            "--model",
+            "model-id",
+            "--raw",
+            "--tools",
+            "tools.json",
+            "prompt",
+        ])
+        .unwrap();
+        assert!(validate_args(&raw_tools)
+            .unwrap_err()
+            .to_string()
+            .contains("--tools cannot be used with --raw"));
+
+        let raw =
+            Cli::try_parse_from(["safemlx-lm", "--model", "model-id", "--raw", "prompt"]).unwrap();
+        assert!(
+            validate_args(&raw).is_ok(),
+            "raw unconstrained generation remains intentionally supported"
+        );
     }
 
     #[test]

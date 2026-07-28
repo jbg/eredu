@@ -1343,7 +1343,7 @@ impl DeclarativeParser {
                     }
                     self.state = DeclarativeParserState::Channel {
                         kind: *kind,
-                        suffix: *suffix,
+                        suffix,
                     };
                 }
                 DeclarativeParserState::Outside => {
@@ -2367,24 +2367,19 @@ mod tests {
         assert!(accepts(&plan, output));
         assert!(!accepts(
             &plan,
-            concat!(
-                r#"<tool_call>
+            r#"<tool_call>
 {"name":"unknown","arguments":{"value":1}}
 </tool_call>"#
-            )
         ));
         assert!(!accepts(
             &plan,
-            concat!(
-                r#"<tool_call>
+            r#"<tool_call>
 {"name":"weather","arguments":{"value":"not-an-integer"}}
 </tool_call>"#
-            )
         ));
         assert!(!accepts(
             &plan,
-            concat!(
-                r#"<tool_call>
+            r#"<tool_call>
 {"name":"weather","arguments":{"value":1}}
 </tool_call>
 <tool_call>
@@ -2393,7 +2388,6 @@ mod tests {
 <tool_call>
 {"name":"weather","arguments":{"value":3}}
 </tool_call>"#
-            )
         ));
 
         for split in 0..=output.len() {
@@ -2848,7 +2842,10 @@ mod tests {
                     Vec::new(),
                 )
                 .unwrap_err();
-            assert!(error.contains("ASCII letters"), "{error}");
+            assert!(
+                error.contains("ASCII letters") || error.contains("at most 64 bytes"),
+                "{error}"
+            );
         }
 
         let mut incomplete = required.create_parser().unwrap();
@@ -3034,7 +3031,7 @@ mod tests {
             .compile_tool_plan(
                 &DECLARATIVE_DIALECT,
                 parameters,
-                &[rich_tool.clone()],
+                std::slice::from_ref(&rich_tool),
                 ToolChoice::Required,
                 ParallelToolCallPolicy::Enabled {
                     max_calls: std::num::NonZeroUsize::new(2),
@@ -3068,7 +3065,7 @@ mod tests {
             .compile_tool_plan(
                 &DECLARATIVE_DIALECT,
                 parameters,
-                &[rich_tool.clone()],
+                std::slice::from_ref(&rich_tool),
                 ToolChoice::Required,
                 ParallelToolCallPolicy::Disabled,
                 Vec::new(),

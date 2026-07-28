@@ -107,13 +107,12 @@ impl PartialEq for GenerationConstraint {
 
 impl Eq for GenerationConstraint {}
 
-/// An opaque, format-profile-specific plan for native tool generation.
+/// A format-profile-specific plan for native tool generation.
 ///
-/// Plans can be inspected only by this crate's generation runtime. Callers
-/// should treat a value as a capability token carried by
-/// [`NativeToolSupport::Supported`].
+/// Callers use [`PreparedChat`] with the high-level generation APIs; the
+/// executable constraint and wire parser remain private implementation state.
 #[derive(Clone)]
-pub struct ToolRuntimePlan {
+pub(crate) struct ToolRuntimePlan {
     tool_choice: ToolChoice,
     generation_constraint: GenerationConstraint,
     auto_activation_trigger: Option<String>,
@@ -182,7 +181,8 @@ impl ToolRuntimePlan {
     ///
     /// Profile-owned stop matching is applied before text reaches the protocol
     /// parser.
-    pub fn create_parser(&self) -> Result<ToolRuntimeParser, String> {
+    #[cfg(test)]
+    pub(crate) fn create_parser(&self) -> Result<ToolRuntimeParser, String> {
         self.create_parser_with_stops(std::iter::empty())
     }
 
@@ -236,7 +236,7 @@ struct ResolvedStructuralToken {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NativeToolSupport {
     /// The selected format profile produced a native tool runtime plan.
-    Supported(ToolRuntimePlan),
+    Supported,
     /// No safe native tool runtime plan could be selected.
     Unsupported {
         /// Human-readable explanation suitable for diagnostics.
@@ -244,28 +244,45 @@ pub enum NativeToolSupport {
     },
 }
 
+impl NativeToolSupport {
+    /// Returns whether the selected template has an executable native-tool
+    /// profile for this request.
+    pub const fn is_supported(&self) -> bool {
+        matches!(self, Self::Supported)
+    }
+
+    /// Returns the diagnostic for an unsupported template, if any.
+    pub fn unsupported_reason(&self) -> Option<&str> {
+        match self {
+            Self::Supported => None,
+            Self::Unsupported { reason } => Some(reason),
+        }
+    }
+}
+
 /// A rendered chat prompt together with generation and parsing metadata.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PreparedChat {
     /// The rendered prompt, honoring the request's generation-prompt toggle.
-    pub rendered_prompt: String,
+    pub(crate) rendered_prompt: String,
     /// The suffix contributed when `add_generation_prompt` is enabled.
     ///
     /// This is empty when the template adds no suffix or when its two render
     /// modes cannot be represented as a simple appended contribution.
-    pub generation_prompt: String,
+    pub(crate) generation_prompt: String,
     /// Stable identity of the selected checkpoint chat template.
-    pub template_identity: ChatTemplateIdentity,
+    pub(crate) template_identity: ChatTemplateIdentity,
     /// Registered format-profile identity, when one exact profile matched.
-    pub format_profile_identity: Option<String>,
+    pub(crate) format_profile_identity: Option<String>,
     /// Native tool capability for the selected template and profile.
-    pub native_tool_support: NativeToolSupport,
+    pub(crate) native_tool_support: NativeToolSupport,
+    pub(crate) tool_runtime_plan: Option<ToolRuntimePlan>,
     /// Checkpoint EOS token IDs used to stop generation.
-    pub eos_token_ids: Vec<u32>,
+    pub(crate) eos_token_ids: Vec<u32>,
     /// Profile-owned structural token IDs that decoding must preserve.
-    pub preserved_structural_token_ids: Vec<u32>,
+    pub(crate) preserved_structural_token_ids: Vec<u32>,
     /// Profile-owned text sequences that stop generation.
-    pub profile_stop_sequences: Vec<String>,
+    pub(crate) profile_stop_sequences: Vec<String>,
 }
 
 impl PreparedChat {
@@ -292,6 +309,10 @@ impl PreparedChat {
     /// Returns native tool capability for the selected template.
     pub fn native_tool_support(&self) -> &NativeToolSupport {
         &self.native_tool_support
+    }
+
+    pub(crate) fn tool_runtime_plan(&self) -> Option<&ToolRuntimePlan> {
+        self.tool_runtime_plan.as_ref()
     }
 
     /// Returns checkpoint EOS token IDs.
@@ -1056,20 +1077,25 @@ mod tests {
     use super::{
         matching_registry_entries, prepare_format_profile, prepare_format_profile_with_registry,
         resolve_structural_tokens, template_signature, DialectParameters, FormatRegistryEntry,
-        DECLARATIVE_DIALECT, DEEPSEEK_V31_TOOL_TEMPLATE_SIGNATURE,
+        DECLARATIVE_DIALECT, DEEPSEEK31_STRUCTURAL_JSON_TOOL_SPEC,
+        DEEPSEEK_STRUCTURAL_JSON_TOOL_SPEC, DEEPSEEK_V31_TOOL_TEMPLATE_SIGNATURE,
         DEEPSEEK_V3_TOOL_TEMPLATE_SIGNATURE, FORMAT_REGISTRY, GEMMA4_EDGE_TEMPLATE_SIGNATURE,
-        GEMMA4_LARGE_TEMPLATE_SIGNATURE, GPT_OSS_HARMONY_CURRENT_TEMPLATE_SIGNATURE,
-        GPT_OSS_HARMONY_ESCAPED_TEMPLATE_SIGNATURE, GPT_OSS_HARMONY_INITIAL_TEMPLATE_SIGNATURE,
-        HERMES2_PRO_TOOL_USE_TEMPLATE_SIGNATURE, LFM25_8B_TEMPLATE_SIGNATURE,
-        LFM25_VL_TEMPLATE_SIGNATURE, LFM2_CLASSIC_COMPACT_TEMPLATE_SIGNATURE,
-        LFM2_CLASSIC_TEMPLATE_SIGNATURE, LLAMA31_33_TEMPLATE_SIGNATURE, LLAMA32_TEMPLATE_SIGNATURE,
-        LLAMA4_TEMPLATE_SIGNATURE, MINISTRAL8_2410_TEMPLATE_SIGNATURE,
-        MISTRAL7_V03_TEMPLATE_SIGNATURE, NEMOTRON_NANO_TEMPLATE_SIGNATURE,
+        GEMMA4_LARGE_TEMPLATE_SIGNATURE, GEMMA4_STRUCTURAL_TOOL_SPEC,
+        GPT_OSS_HARMONY_CURRENT_TEMPLATE_SIGNATURE, GPT_OSS_HARMONY_ESCAPED_TEMPLATE_SIGNATURE,
+        GPT_OSS_HARMONY_INITIAL_TEMPLATE_SIGNATURE, HERMES2_PRO_TOOL_USE_TEMPLATE_SIGNATURE,
+        LFM25_8B_TEMPLATE_SIGNATURE, LFM25_VL_TEMPLATE_SIGNATURE,
+        LFM2_CLASSIC_COMPACT_TEMPLATE_SIGNATURE, LFM2_CLASSIC_TEMPLATE_SIGNATURE,
+        LLAMA31_33_TEMPLATE_SIGNATURE, LLAMA32_TEMPLATE_SIGNATURE, LLAMA3_JSON_TOOL_SPEC,
+        LLAMA4_JSON_TOOL_SPEC, LLAMA4_TEMPLATE_SIGNATURE, MINISTRAL8_2410_TEMPLATE_SIGNATURE,
+        MINISTRAL_JSON_LIST_TOOL_SPEC, MISTRAL7_V03_TEMPLATE_SIGNATURE,
+        MISTRAL_JSON_LIST_TOOL_SPEC, NEMOTRON_NANO_JSON_LIST_TOOL_SPEC,
+        NEMOTRON_NANO_TEMPLATE_SIGNATURE, NEMOTRON_NANO_V2_JSON_LIST_TOOL_SPEC,
         NEMOTRON_NANO_V2_TEMPLATE_SIGNATURE, QWEN25_TEMPLATE_SIGNATURE,
         QWEN3_TEMPLATE_16706FC5_SIGNATURE, QWEN3_TEMPLATE_7E4AE267_SIGNATURE,
-        QWEN3_VL_TEMPLATE_SIGNATURE, SYNTHETIC_DECLARATIVE_SPEC, SYNTHETIC_TOOL_TEMPLATE,
-        SYNTHETIC_TOOL_TEMPLATE_SIGNATURE,
+        QWEN3_VL_TEMPLATE_SIGNATURE, QWEN3_XML_TOOL_SPEC, QWEN_XML_TOOL_SPEC,
+        SYNTHETIC_DECLARATIVE_SPEC, SYNTHETIC_TOOL_TEMPLATE, SYNTHETIC_TOOL_TEMPLATE_SIGNATURE,
     };
+    use crate::{harmony_format::GPT_OSS_HARMONY_PARAMETERS, lfm2_format::LFM2_PARAMETERS};
 
     const QWEN25_FIXTURE: &str =
         include_str!("../tests/fixtures/chat_templates/qwen2.5-7b-instruct-acbd9653.jinja");
@@ -1322,6 +1348,44 @@ mod tests {
             let matches = matching_registry_entries(template, FORMAT_REGISTRY);
             assert_eq!(matches.len(), 1, "{expected_identity}");
             assert_eq!(matches[0].identity, expected_identity);
+        }
+    }
+
+    #[test]
+    fn every_registered_response_format_has_cross_dialect_golden_and_boundary_coverage() {
+        let covered = [
+            DialectParameters::Declarative(&QWEN_XML_TOOL_SPEC),
+            DialectParameters::Declarative(&QWEN3_XML_TOOL_SPEC),
+            DialectParameters::Declarative(&MISTRAL_JSON_LIST_TOOL_SPEC),
+            DialectParameters::Declarative(&MINISTRAL_JSON_LIST_TOOL_SPEC),
+            DialectParameters::Declarative(&LLAMA3_JSON_TOOL_SPEC),
+            DialectParameters::Declarative(&LLAMA4_JSON_TOOL_SPEC),
+            DialectParameters::Declarative(&NEMOTRON_NANO_JSON_LIST_TOOL_SPEC),
+            DialectParameters::Declarative(&NEMOTRON_NANO_V2_JSON_LIST_TOOL_SPEC),
+            DialectParameters::Declarative(&GEMMA4_STRUCTURAL_TOOL_SPEC),
+            DialectParameters::Custom(&GPT_OSS_HARMONY_PARAMETERS),
+            DialectParameters::Custom(&LFM2_PARAMETERS),
+            DialectParameters::Declarative(&DEEPSEEK_STRUCTURAL_JSON_TOOL_SPEC),
+            DialectParameters::Declarative(&DEEPSEEK31_STRUCTURAL_JSON_TOOL_SPEC),
+            DialectParameters::Declarative(&SYNTHETIC_DECLARATIVE_SPEC),
+        ];
+
+        for entry in FORMAT_REGISTRY {
+            assert!(
+                covered
+                    .iter()
+                    .any(|parameters| parameters.ptr_eq(entry.parameters)),
+                "{} lacks cross-dialect prompt, semantic-event, and exhaustive split-boundary coverage",
+                entry.identity
+            );
+        }
+        for parameters in covered {
+            assert!(
+                FORMAT_REGISTRY
+                    .iter()
+                    .any(|entry| parameters.ptr_eq(entry.parameters)),
+                "the boundary coverage manifest contains a stale response format"
+            );
         }
     }
 

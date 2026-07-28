@@ -666,11 +666,8 @@ where
     }
 }
 
-/// Opaque, independent protocol parsing state for one prepared tool generation.
-///
-/// Instances are created by [`crate::chat::ToolRuntimePlan::create_parser`].
-/// Each instance owns its parser, semantic event sink, and profile stop matcher.
-pub struct ToolRuntimeParser {
+/// Independent protocol parsing state for one prepared tool generation.
+pub(crate) struct ToolRuntimeParser {
     stream: SemanticStream<Box<dyn ProtocolParser<Error = String>>>,
 }
 
@@ -696,19 +693,19 @@ impl ToolRuntimeParser {
     }
 
     /// Pushes decoded text and returns whether a profile stop sequence matched.
-    pub fn push(&mut self, text: &str) -> Result<bool, String> {
+    pub(crate) fn push(&mut self, text: &str) -> Result<bool, String> {
         self.stream.push(text)
     }
 
     /// Finishes parsing with the generation's terminal reason.
     ///
     /// This is a no-op if a profile stop already finished the parser.
-    pub fn finish(&mut self, reason: FinishReason) -> Result<(), String> {
+    pub(crate) fn finish(&mut self, reason: FinishReason) -> Result<(), String> {
         self.stream.finish(reason)
     }
 
     /// Returns all semantic events emitted by this parser instance.
-    pub fn events(&self) -> &[SemanticEvent] {
+    pub(crate) fn events(&self) -> &[SemanticEvent] {
         self.stream.events()
     }
 
@@ -717,12 +714,12 @@ impl ToolRuntimeParser {
     /// Ordinary generation drains this queue after every committed token, so
     /// callers observe deltas while decoding is still in progress rather than
     /// after the complete response has been retained.
-    pub fn take_events(&mut self) -> Vec<SemanticEvent> {
+    pub(crate) fn take_events(&mut self) -> Vec<SemanticEvent> {
         std::mem::take(&mut self.stream.sink.events)
     }
 
     /// Returns whether this parser has reached a terminal condition.
-    pub fn is_finished(&self) -> bool {
+    pub(crate) fn is_finished(&self) -> bool {
         self.stream.finished
     }
 }

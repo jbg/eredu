@@ -31,8 +31,8 @@ jobs:
           sudo apt-get install -y libblas-dev liblapack-dev liblapacke-dev
           python3 -m pip install --user "cmake>=3.25"
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-      - name: Check language-model crates with default features
-        run: cargo check --locked -p safemlx-lm-utils -p safemlx-lm
+      - name: Check language-model crates, examples, and CLI with the locked MSRV
+        run: cargo check --locked -p safemlx-lm-utils -p safemlx-lm --all-targets -p safemlx-lm-cli
 
   cpu:
     runs-on: ubuntu-22.04
@@ -49,6 +49,8 @@ jobs:
         run: cargo test -p safemlx --lib --no-run
       - name: Check the Linux workspace
         run: cargo check --workspace
+      - name: Test native tool calling and language-model runtime
+        run: cargo test --locked -p safemlx-lm --lib
 
   cuda-build:
     runs-on: ubuntu-22.04

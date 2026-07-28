@@ -125,14 +125,12 @@ pub trait Sampler {
 /// [`ToolChoice::Auto`], masking starts only after the plan's exact activation
 /// trigger has been committed; [`ToolChoice::Required`] masks the first token.
 ///
-/// The standard policies in this module implement [`Clone`], which lets this
-/// wrapper checkpoint delegated adaptive state together with grammar state for
-/// [`ConstrainedSampler::fork`] and [`ConstrainedSampler::rollback`].
-pub struct ConstrainedSampler<S> {
+/// The standard policies in this module implement [`Clone`], which lets the
+/// MTP scheduler fork delegated adaptive state together with grammar state.
+pub(crate) struct ConstrainedSampler<S> {
     policy: S,
     runtime: ConstraintRuntime,
     committed_tokens: Vec<u32>,
-    checkpoints: Vec<ConstraintCheckpoint<S>>,
 }
 
 struct ConstraintCheckpoint<S> {
@@ -184,22 +182,13 @@ impl<S: Clone> Clone for ConstrainedSampler<S> {
             policy: self.policy.clone(),
             runtime: self.runtime.clone(),
             committed_tokens: self.committed_tokens.clone(),
-            checkpoints: self
-                .checkpoints
-                .iter()
-                .map(|checkpoint| ConstraintCheckpoint {
-                    policy: checkpoint.policy.clone(),
-                    runtime: checkpoint.runtime.clone(),
-                    committed_len: checkpoint.committed_len,
-                })
-                .collect(),
         }
     }
 }
 
 impl<S> ConstrainedSampler<S> {
     /// Wraps `policy` with the constraint and activation semantics in `plan`.
-    pub fn from_tool_plan(policy: S, plan: &ToolRuntimePlan) -> Result<Self, Exception> {
+    pub(crate) fn from_tool_plan(policy: S, plan: &ToolRuntimePlan) -> Result<Self, Exception> {
         let constraint = plan.generation_constraint().clone();
         let runtime = match plan.tool_choice() {
             ToolChoice::None => ConstraintRuntime::Disabled,
@@ -227,27 +216,18 @@ impl<S> ConstrainedSampler<S> {
             policy,
             runtime,
             committed_tokens: Vec::new(),
-            checkpoints: Vec::new(),
         })
     }
 
     /// Returns the wrapped sampling policy.
-    pub fn policy(&self) -> &S {
+    #[cfg(test)]
+    pub(crate) fn policy(&self) -> &S {
         &self.policy
     }
 
-    /// Returns the wrapped sampling policy mutably.
-    pub fn policy_mut(&mut self) -> &mut S {
-        &mut self.policy
-    }
-
-    /// Consumes the wrapper and returns the sampling policy.
-    pub fn into_policy(self) -> S {
-        self.policy
-    }
-
     /// Returns whether grammar masking is currently active.
-    pub fn constraint_is_active(&self) -> bool {
+    #[cfg(test)]
+    pub(crate) fn constraint_is_active(&self) -> bool {
         matches!(self.runtime, ConstraintRuntime::Active(_))
     }
 
@@ -265,7 +245,8 @@ impl<S> ConstrainedSampler<S> {
     /// Returns the valid token IDs at the durable logical prefix.
     ///
     /// `None` means grammar masking is not active.
-    pub fn valid_token_ids(&mut self) -> Result<Option<Vec<u32>>, Exception> {
+    #[cfg(test)]
+    pub(crate) fn valid_token_ids(&mut self) -> Result<Option<Vec<u32>>, Exception> {
         match &mut self.runtime {
             ConstraintRuntime::Active(grammar) => grammar
                 .allowed_tokens()
@@ -325,31 +306,6 @@ impl<S> ConstrainedSampler<S> {
 }
 
 impl<S: Clone> ConstrainedSampler<S> {
-    /// Returns an independent sampler fork at the current logical prefix.
-    pub fn fork(&self) -> Self {
-        self.clone()
-    }
-
-    /// Rolls back committed tokens and restores grammar and delegated state.
-    pub fn rollback(&mut self, token_count: usize) -> Result<(), Exception> {
-        if token_count > self.checkpoints.len() {
-            return Err(Exception::custom(format!(
-                "cannot roll back {token_count} constrained tokens after {} commits",
-                self.checkpoints.len()
-            )));
-        }
-        if token_count == 0 {
-            return Ok(());
-        }
-        let checkpoint_index = self.checkpoints.len() - token_count;
-        let checkpoint = self.checkpoints.remove(checkpoint_index);
-        self.checkpoints.truncate(checkpoint_index);
-        self.policy = checkpoint.policy;
-        self.runtime = checkpoint.runtime;
-        self.committed_tokens.truncate(checkpoint.committed_len);
-        Ok(())
-    }
-
     fn checkpoint(&self) -> ConstraintCheckpoint<S> {
         ConstraintCheckpoint {
             policy: self.policy.clone(),
@@ -420,7 +376,6 @@ impl<S: SpeculativeSampler + Clone> SpeculativeSampler for ConstrainedSampler<S>
             self.committed_tokens.truncate(checkpoint.committed_len);
             return Err(error);
         }
-        self.checkpoints.push(checkpoint);
         Ok(())
     }
 }
@@ -444,7 +399,6 @@ impl<S: Sampler + Clone> Sampler for ConstrainedSampler<S> {
             self.committed_tokens.truncate(checkpoint.committed_len);
             return Err(error);
         }
-        self.checkpoints.push(checkpoint);
         Ok(token)
     }
 }
@@ -1390,7 +1344,7 @@ mod tests {
     }
 
     #[test]
-    fn required_is_immediate_and_rollback_restores_valid_tokens_and_policy() {
+    fn required_is_immediate_and_sampler_clones_are_independent() {
         let context = test_context();
         let stream = context.stream();
         let plan = synthetic_plan(ToolChoice::Required);
@@ -1405,16 +1359,16 @@ mod tests {
             .commit_token(&logits, u32::from(b'{'), stream)
             .unwrap();
         let after_open = sampler.valid_token_ids().unwrap().unwrap();
-        let mut fork = sampler.fork();
+        let mut fork = sampler.clone();
         assert_eq!(fork.valid_token_ids().unwrap().unwrap(), after_open);
 
         sampler
             .commit_token(&logits, u32::from(b'"'), stream)
             .unwrap();
-        sampler.rollback(1).unwrap();
 
-        assert_eq!(sampler.valid_token_ids().unwrap().unwrap(), after_open);
-        assert_eq!(sampler.policy().commits, 1);
+        assert_eq!(fork.valid_token_ids().unwrap().unwrap(), after_open);
+        assert_eq!(fork.policy().commits, 1);
+        assert_eq!(sampler.policy().commits, 2);
     }
 
     #[test]

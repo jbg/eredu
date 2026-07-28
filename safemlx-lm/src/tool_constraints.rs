@@ -2,6 +2,8 @@
 
 #![allow(dead_code)]
 
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::{
     collections::{BTreeSet, HashSet},
     num::NonZeroUsize,
@@ -31,6 +33,10 @@ const MAX_SCHEMA_DEPTH: usize = 64;
 /// every request grammar shares it.
 pub(crate) struct ConstraintCompiler {
     factory: Arc<ParserFactory>,
+    #[cfg(test)]
+    tokenizer_analysis_runs: usize,
+    #[cfg(test)]
+    schema_compilation_runs: AtomicUsize,
 }
 
 #[allow(dead_code)]
@@ -74,6 +80,10 @@ impl ConstraintCompiler {
         factory.quiet();
         Ok(Self {
             factory: Arc::new(factory),
+            #[cfg(test)]
+            tokenizer_analysis_runs: 1,
+            #[cfg(test)]
+            schema_compilation_runs: AtomicUsize::new(0),
         })
     }
 
@@ -92,6 +102,9 @@ impl ConstraintCompiler {
         parallel_tool_calls: ParallelToolCallPolicy,
         resolved_structural_token_ids: Vec<u32>,
     ) -> Result<ToolRuntimePlan, String> {
+        #[cfg(test)]
+        self.schema_compilation_runs.fetch_add(1, Ordering::Relaxed);
+
         let structural_token_spellings = dialect.required_structural_tokens(parameters)?;
         if structural_token_spellings.len() != resolved_structural_token_ids.len() {
             return Err(format!(
@@ -153,6 +166,14 @@ impl ConstraintCompiler {
                 .map(|sequence| (*sequence).to_owned())
                 .collect(),
         }))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn cache_analysis_counts(&self) -> (usize, usize) {
+        (
+            self.tokenizer_analysis_runs,
+            self.schema_compilation_runs.load(Ordering::Relaxed),
+        )
     }
 }
 
@@ -349,8 +370,9 @@ pub(crate) fn parse_tools(tools: &[Value]) -> Result<Vec<ToolDefinition>, String
                 .get("name")
                 .and_then(Value::as_str)
                 .filter(|name| !name.is_empty())
-                .ok_or_else(|| format!("{path}.function.name must be a non-empty string"))?
-                .to_owned();
+                .ok_or_else(|| format!("{path}.function.name must be a non-empty string"))?;
+            validate_function_name(name, &format!("{path}.function.name"))?;
+            let name = name.to_owned();
             if !names.insert(name.clone()) {
                 return Err(format!("duplicate tool function name {name:?}"));
             }
@@ -373,6 +395,21 @@ pub(crate) fn parse_tools(tools: &[Value]) -> Result<Vec<ToolDefinition>, String
             Ok(ToolDefinition { name, parameters })
         })
         .collect()
+}
+
+fn validate_function_name(name: &str, path: &str) -> Result<(), String> {
+    if name.len() > 64 {
+        return Err(format!("{path} must be at most 64 bytes"));
+    }
+    if !name
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+    {
+        return Err(format!(
+            "{path} must contain only ASCII letters, digits, underscores, or hyphens"
+        ));
+    }
+    Ok(())
 }
 
 fn reject_unknown_keys(
@@ -932,6 +969,67 @@ mod tests {
                 "items": [], "mode": "slow", "ratio": 1, "enabled": true, "nothing": null
             }}]})
         ));
+    }
+
+    #[test]
+    fn rejects_invalid_tool_envelopes_functions_and_names() {
+        let valid_parameters =
+            || json!({"type": "object", "properties": {}, "additionalProperties": false});
+        let invalid = [
+            json!(null),
+            json!({}),
+            json!({"type": "command", "function": {}}),
+            json!({"type": "function", "function": "lookup"}),
+            json!({"type": "function", "function": {
+                "name": "lookup", "parameters": valid_parameters(), "unknown": true
+            }}),
+            json!({"type": "function", "function": {
+                "name": "", "parameters": valid_parameters()
+            }}),
+            json!({"type": "function", "function": {
+                "name": "contains space", "parameters": valid_parameters()
+            }}),
+            json!({"type": "function", "function": {
+                "name": "slash/name", "parameters": valid_parameters()
+            }}),
+            json!({"type": "function", "function": {
+                "name": "x".repeat(65), "parameters": valid_parameters()
+            }}),
+            json!({"type": "function", "function": {
+                "name": "lookup", "description": 7, "parameters": valid_parameters()
+            }}),
+            json!({"type": "function", "function": {"name": "lookup"}}),
+        ];
+
+        for tool in invalid {
+            let error = compiler()
+                .compile_tool_plan(
+                    &DECLARATIVE_DIALECT,
+                    SYNTHETIC_PARAMETERS,
+                    std::slice::from_ref(&tool),
+                    ToolChoice::Required,
+                    ParallelToolCallPolicy::Disabled,
+                    Vec::new(),
+                )
+                .unwrap_err();
+            assert!(
+                error.contains("tools[0]"),
+                "invalid tool {tool} produced an unscoped diagnostic: {error}"
+            );
+        }
+
+        let duplicate = tool("lookup", valid_parameters());
+        let error = compiler()
+            .compile_tool_plan(
+                &DECLARATIVE_DIALECT,
+                SYNTHETIC_PARAMETERS,
+                &[duplicate.clone(), duplicate],
+                ToolChoice::Required,
+                ParallelToolCallPolicy::Disabled,
+                Vec::new(),
+            )
+            .unwrap_err();
+        assert!(error.contains("duplicate tool function name"));
     }
 
     #[test]
