@@ -93,6 +93,37 @@ impl ConstraintCompiler {
             .expect("single-byte tokenizer must support llguidance")
     }
 
+    #[cfg(test)]
+    pub(crate) fn synthetic_with_tokens_for_tests(extra_tokens: &[&[u8]]) -> Self {
+        use llguidance::toktrie::{ApproximateTokEnv, TokRxInfo, TokTrie};
+
+        let mut words = (0..=255).map(|byte| vec![byte]).collect::<Vec<_>>();
+        words.extend(
+            [
+                b"\xFF<|tool|>".as_slice(),
+                b"\xFF<|/tool|>",
+                b"\xFF<|user|>",
+                b"\xFF<|system|>",
+                b"\xFF<|assistant|>",
+                b"\xFF<|end|>",
+            ]
+            .into_iter()
+            .map(<[u8]>::to_vec),
+        );
+        let eos = words.len() as u32 - 1;
+        words.extend(extra_tokens.iter().map(|token| token.to_vec()));
+        let info = TokRxInfo {
+            vocab_size: words.len() as u32,
+            tok_eos: eos,
+            tok_bos: None,
+            tok_pad: None,
+            tok_unk: None,
+            tok_end_of_turn: None,
+        };
+        let environment = Arc::new(ApproximateTokEnv::new(TokTrie::from(&info, &words)));
+        Self::from_tok_env(environment).expect("synthetic tokenizer must support llguidance")
+    }
+
     pub(crate) fn compile_tool_plan(
         &self,
         dialect: &'static dyn FormatDialect,
@@ -201,14 +232,39 @@ impl GrammarState {
     }
 
     pub(crate) fn commit(&mut self, token: TokenId) -> Result<(), String> {
+        if !self.try_commit(token)? {
+            return Err(format!("token {token} is not allowed by the tool grammar"));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn try_commit(&mut self, token: TokenId) -> Result<bool, String> {
         let consumed = self
             .matcher
             .try_consume_tokens(&[token])
             .map_err(|error| format!("failed to commit grammar token: {error}"))?;
-        if consumed != 1 {
-            return Err(format!("token {token} is not allowed by the tool grammar"));
+        Ok(consumed == 1)
+    }
+
+    pub(crate) fn try_commit_bytes(&mut self, bytes: &[u8]) -> Result<bool, String> {
+        let token_env = self
+            .matcher
+            .tok_env()
+            .map_err(|error| format!("failed to inspect grammar tokenizer: {error}"))?;
+        let tokens = token_env.tokenize_bytes(bytes);
+        let trie = token_env.tok_trie();
+        let round_trip = tokens
+            .iter()
+            .flat_map(|&token| trie.token(token).iter().copied())
+            .collect::<Vec<_>>();
+        if round_trip != bytes {
+            return Err("grammar tokenizer could not represent activation bytes exactly".into());
         }
-        Ok(())
+        let consumed = self
+            .matcher
+            .try_consume_tokens(&tokens)
+            .map_err(|error| format!("failed to commit grammar bytes: {error}"))?;
+        Ok(consumed == tokens.len())
     }
 
     pub(crate) fn is_complete(&mut self) -> Result<bool, String> {
