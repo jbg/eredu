@@ -115,7 +115,7 @@ impl Eq for GenerationConstraint {}
 pub(crate) struct ToolRuntimePlan {
     tool_choice: ToolChoice,
     generation_constraint: GenerationConstraint,
-    auto_activation_trigger: Option<String>,
+    tool_call_trigger: Option<String>,
     dialect: &'static dyn FormatDialect,
     dialect_parameters: DialectParameters,
     structural_tokens: Vec<ResolvedStructuralToken>,
@@ -125,7 +125,7 @@ pub(crate) struct ToolRuntimePlan {
 pub(crate) struct ToolRuntimePlanParts {
     pub(crate) tool_choice: ToolChoice,
     pub(crate) generation_constraint: GenerationConstraint,
-    pub(crate) auto_activation_trigger: Option<String>,
+    pub(crate) tool_call_trigger: Option<String>,
     pub(crate) dialect: &'static dyn FormatDialect,
     pub(crate) dialect_parameters: DialectParameters,
     pub(crate) structural_token_spellings: Vec<String>,
@@ -142,7 +142,7 @@ impl ToolRuntimePlan {
         Self {
             tool_choice: parts.tool_choice,
             generation_constraint: parts.generation_constraint,
-            auto_activation_trigger: parts.auto_activation_trigger,
+            tool_call_trigger: parts.tool_call_trigger,
             dialect: parts.dialect,
             dialect_parameters: parts.dialect_parameters,
             structural_tokens: parts
@@ -160,7 +160,13 @@ impl ToolRuntimePlan {
     }
 
     pub(crate) fn auto_activation_trigger(&self) -> Option<&str> {
-        self.auto_activation_trigger.as_deref()
+        (self.tool_choice == ToolChoice::Auto)
+            .then(|| self.tool_call_trigger.as_deref())
+            .flatten()
+    }
+
+    pub(crate) fn tool_call_trigger(&self) -> Option<&str> {
+        self.tool_call_trigger.as_deref()
     }
 
     pub(crate) fn tool_choice(&self) -> ToolChoice {
@@ -193,11 +199,15 @@ impl ToolRuntimePlan {
         let parser = self
             .dialect
             .incremental_parser_state(self.dialect_parameters)?;
-        Ok(ToolRuntimeParser::new(
+        let mut parser = ToolRuntimeParser::new(
             parser,
             self.profile_stop_sequences.iter().map(String::as_str),
             caller_stops,
-        ))
+        );
+        if self.tool_choice == ToolChoice::None {
+            parser.disable_tool_calls();
+        }
+        Ok(parser)
     }
 }
 
@@ -216,7 +226,7 @@ impl PartialEq for ToolRuntimePlan {
     fn eq(&self, other: &Self) -> bool {
         self.tool_choice == other.tool_choice
             && self.generation_constraint == other.generation_constraint
-            && self.auto_activation_trigger == other.auto_activation_trigger
+            && self.tool_call_trigger == other.tool_call_trigger
             && std::ptr::eq(self.dialect, other.dialect)
             && self.dialect_parameters.ptr_eq(other.dialect_parameters)
             && self.structural_tokens == other.structural_tokens

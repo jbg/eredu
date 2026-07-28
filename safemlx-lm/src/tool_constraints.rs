@@ -147,7 +147,7 @@ impl ConstraintCompiler {
                 fingerprint,
                 ConstraintBlueprint { matcher },
             ),
-            auto_activation_trigger: if tool_choice == ToolChoice::Auto {
+            tool_call_trigger: if matches!(tool_choice, ToolChoice::None | ToolChoice::Auto) {
                 dialect
                     .auto_activation_trigger(parameters)?
                     .map(str::to_owned)
@@ -236,6 +236,17 @@ impl GrammarState {
             ));
         }
         Ok(trie.token(token).to_vec())
+    }
+
+    pub(crate) fn token_vocabulary(&self) -> Result<Vec<Vec<u8>>, String> {
+        let token_env = self
+            .matcher
+            .tok_env()
+            .map_err(|error| format!("failed to inspect grammar tokenizer: {error}"))?;
+        let trie = token_env.tok_trie();
+        Ok((0..trie.vocab_size() as TokenId)
+            .map(|token| trie.token(token).to_vec())
+            .collect())
     }
 }
 

@@ -511,11 +511,23 @@ impl JsonFragmentBuffer {
 
 /// Sink offered to protocol parsers so semantic state and emitted events stay
 /// synchronized.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(crate) struct SemanticEventSink {
     events: Vec<SemanticEvent>,
     active_tool_call: Option<InProgressToolCall>,
     next_tool_index: usize,
+    tool_calls_enabled: bool,
+}
+
+impl Default for SemanticEventSink {
+    fn default() -> Self {
+        Self {
+            events: Vec::new(),
+            active_tool_call: None,
+            next_tool_index: 0,
+            tool_calls_enabled: true,
+        }
+    }
 }
 
 impl SemanticEventSink {
@@ -545,12 +557,15 @@ impl SemanticEventSink {
         debug_assert!(self.active_tool_call.is_none());
         let call = InProgressToolCall::new(self.next_tool_index, id, name);
         self.next_tool_index += 1;
+        if !self.tool_calls_enabled {
+            return;
+        }
         self.events.push(call.start_event());
         self.active_tool_call = Some(call);
     }
 
     pub(crate) fn tool_arguments(&mut self, fragment: &str) {
-        if fragment.is_empty() {
+        if !self.tool_calls_enabled || fragment.is_empty() {
             return;
         }
         let event = self
@@ -562,6 +577,9 @@ impl SemanticEventSink {
     }
 
     pub(crate) fn end_tool_call(&mut self) {
+        if !self.tool_calls_enabled {
+            return;
+        }
         debug_assert!(self.active_tool_call.is_some());
         self.active_tool_call = None;
         self.events.push(SemanticEvent::ToolCallEnd);
@@ -690,6 +708,10 @@ impl ToolRuntimeParser {
         Self {
             stream: SemanticStream::new(parser, profile_stops, caller_stops),
         }
+    }
+
+    pub(crate) fn disable_tool_calls(&mut self) {
+        self.stream.sink.tool_calls_enabled = false;
     }
 
     /// Pushes decoded text and returns whether a profile stop sequence matched.

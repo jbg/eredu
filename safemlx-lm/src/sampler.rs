@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::{collections::VecDeque, sync::Arc};
 
 use safemlx::{
     argmax_axis, array,
@@ -123,7 +123,8 @@ pub trait Sampler {
 /// filtering, temperature scaling, and token selection to the wrapped policy.
 /// Grammar state advances only when a selected token is committed. For
 /// [`ToolChoice::Auto`], masking starts only after the plan's exact activation
-/// trigger has been committed; [`ToolChoice::Required`] masks the first token.
+/// trigger has been committed; [`ToolChoice::None`] masks that trigger from
+/// otherwise unconstrained output; [`ToolChoice::Required`] masks the first token.
 ///
 /// The standard policies in this module implement [`Clone`], which lets the
 /// MTP scheduler fork delegated adaptive state together with grammar state.
@@ -140,7 +141,11 @@ struct ConstraintCheckpoint<S> {
 }
 
 enum ConstraintRuntime {
-    Disabled,
+    Forbidden {
+        vocabulary: Arc<Vec<Vec<u8>>>,
+        trigger: Vec<u8>,
+        pending: Vec<u8>,
+    },
     Auto {
         grammar: GrammarState,
         trigger: Vec<u8>,
@@ -159,7 +164,15 @@ struct PendingToken {
 impl Clone for ConstraintRuntime {
     fn clone(&self) -> Self {
         match self {
-            Self::Disabled => Self::Disabled,
+            Self::Forbidden {
+                vocabulary,
+                trigger,
+                pending,
+            } => Self::Forbidden {
+                vocabulary: Arc::clone(vocabulary),
+                trigger: trigger.clone(),
+                pending: pending.clone(),
+            },
             Self::Auto {
                 grammar,
                 trigger,
@@ -191,21 +204,24 @@ impl<S> ConstrainedSampler<S> {
     pub(crate) fn from_tool_plan(policy: S, plan: &ToolRuntimePlan) -> Result<Self, Exception> {
         let constraint = plan.generation_constraint().clone();
         let runtime = match plan.tool_choice() {
-            ToolChoice::None => ConstraintRuntime::Disabled,
-            ToolChoice::Auto => {
-                let trigger = plan.auto_activation_trigger().ok_or_else(|| {
-                    Exception::custom(
-                        "automatic constrained sampling requires an exact activation trigger",
-                    )
-                })?;
-                if trigger.is_empty() {
-                    return Err(Exception::custom(
-                        "automatic constrained sampling requires a non-empty activation trigger",
-                    ));
+            ToolChoice::None => {
+                let trigger = required_tool_call_trigger(plan.tool_call_trigger(), "forbidden")?;
+                let vocabulary = constraint
+                    .grammar_state()
+                    .token_vocabulary()
+                    .map_err(constraint_error)?;
+                ConstraintRuntime::Forbidden {
+                    vocabulary: Arc::new(vocabulary),
+                    trigger,
+                    pending: Vec::new(),
                 }
+            }
+            ToolChoice::Auto => {
+                let trigger =
+                    required_tool_call_trigger(plan.auto_activation_trigger(), "automatic")?;
                 ConstraintRuntime::Auto {
                     grammar: constraint.grammar_state(),
-                    trigger: trigger.as_bytes().to_vec(),
+                    trigger,
                     pending: VecDeque::new(),
                     pending_len: 0,
                 }
@@ -233,12 +249,12 @@ impl<S> ConstrainedSampler<S> {
 
     /// Returns whether the active grammar can complete at the current prefix.
     ///
-    /// An inactive automatic constraint and a disabled constraint both report
-    /// `false`.
+    /// An inactive automatic constraint and a forbidden tool-call trigger both
+    /// report `false`.
     pub fn grammar_is_complete(&mut self) -> Result<bool, Exception> {
         match &mut self.runtime {
             ConstraintRuntime::Active(grammar) => grammar.is_complete().map_err(constraint_error),
-            ConstraintRuntime::Disabled | ConstraintRuntime::Auto { .. } => Ok(false),
+            ConstraintRuntime::Forbidden { .. } | ConstraintRuntime::Auto { .. } => Ok(false),
         }
     }
 
@@ -252,7 +268,7 @@ impl<S> ConstrainedSampler<S> {
                 .allowed_tokens()
                 .map(|mask| Some(mask.iter().collect()))
                 .map_err(constraint_error),
-            ConstraintRuntime::Disabled | ConstraintRuntime::Auto { .. } => Ok(None),
+            ConstraintRuntime::Forbidden { .. } | ConstraintRuntime::Auto { .. } => Ok(None),
         }
     }
 
@@ -274,25 +290,48 @@ impl<S> ConstrainedSampler<S> {
         runtime: &mut ConstraintRuntime,
         stream: &Stream,
     ) -> Result<Array, Exception> {
-        let ConstraintRuntime::Active(grammar) = runtime else {
-            return Ok(logits.clone());
-        };
-        let allowed = grammar.allowed_tokens().map_err(constraint_error)?;
         let vocab_size = logits.dim(-1) as usize;
         if vocab_size == 0 {
             return Err(Exception::custom(
                 "cannot apply a grammar mask to an empty logits vocabulary",
             ));
         }
-        if allowed.len() != vocab_size {
-            return Err(Exception::custom(format!(
-                "grammar vocabulary size {} does not match logits vocabulary size {vocab_size}",
-                allowed.len()
-            )));
-        }
+        let invalid_row = match runtime {
+            ConstraintRuntime::Active(grammar) => {
+                let allowed = grammar.allowed_tokens().map_err(constraint_error)?;
+                if allowed.len() != vocab_size {
+                    return Err(Exception::custom(format!(
+                        "grammar vocabulary size {} does not match logits vocabulary size {vocab_size}",
+                        allowed.len()
+                    )));
+                }
+                (0..vocab_size)
+                    .map(|token| !allowed.is_allowed(token as u32))
+                    .collect::<Vec<_>>()
+            }
+            ConstraintRuntime::Forbidden {
+                vocabulary,
+                trigger,
+                pending,
+            } => {
+                if vocabulary.len() != vocab_size {
+                    return Err(Exception::custom(format!(
+                        "constraint vocabulary size {} does not match logits vocabulary size {vocab_size}",
+                        vocabulary.len()
+                    )));
+                }
+                vocabulary
+                    .iter()
+                    .map(|bytes| completes_trigger(pending, bytes, trigger))
+                    .collect()
+            }
+            ConstraintRuntime::Auto { .. } => {
+                return Ok(logits.clone());
+            }
+        };
         let row_count = logits.size() / vocab_size;
         let invalid = (0..row_count)
-            .flat_map(|_| (0..vocab_size).map(|token| !allowed.is_allowed(token as u32)))
+            .flat_map(|_| invalid_row.iter().copied())
             .collect::<Vec<_>>();
         let invalid = Array::from_slice(&invalid, logits.shape());
         mask_logits(invalid, logits.clone(), stream)
@@ -331,7 +370,7 @@ impl<S: SpeculativeSampler + Clone> SpeculativeSampler for ConstrainedSampler<S>
     fn prefix_is_complete(&self, history: &[u32]) -> Result<bool, Exception> {
         match &mut self.runtime_at(history)? {
             ConstraintRuntime::Active(grammar) => grammar.is_complete().map_err(constraint_error),
-            ConstraintRuntime::Disabled | ConstraintRuntime::Auto { .. } => Ok(false),
+            ConstraintRuntime::Forbidden { .. } | ConstraintRuntime::Auto { .. } => Ok(false),
         }
     }
 
@@ -405,7 +444,25 @@ impl<S: Sampler + Clone> Sampler for ConstrainedSampler<S> {
 
 fn commit_runtime_token(runtime: &mut ConstraintRuntime, token: u32) -> Result<(), Exception> {
     match runtime {
-        ConstraintRuntime::Disabled => Ok(()),
+        ConstraintRuntime::Forbidden {
+            vocabulary,
+            trigger,
+            pending,
+        } => {
+            let bytes = vocabulary.get(token as usize).ok_or_else(|| {
+                Exception::custom(format!(
+                    "token {token} is outside constraint vocabulary {}",
+                    vocabulary.len()
+                ))
+            })?;
+            if completes_trigger(pending, bytes, trigger) {
+                return Err(Exception::custom(
+                    "token would emit a tool-call activation trigger while tool_choice is None",
+                ));
+            }
+            advance_trigger_prefix(pending, &bytes, trigger);
+            Ok(())
+        }
         ConstraintRuntime::Active(grammar) => grammar.commit(token).map_err(constraint_error),
         ConstraintRuntime::Auto {
             grammar,
@@ -437,6 +494,37 @@ fn commit_runtime_token(runtime: &mut ConstraintRuntime, token: u32) -> Result<(
             Ok(())
         }
     }
+}
+
+fn required_tool_call_trigger(trigger: Option<&str>, mode: &str) -> Result<Vec<u8>, Exception> {
+    let trigger = trigger.ok_or_else(|| {
+        Exception::custom(format!(
+            "{mode} tool-call sampling requires an exact activation trigger"
+        ))
+    })?;
+    if trigger.is_empty() {
+        return Err(Exception::custom(format!(
+            "{mode} tool-call sampling requires a non-empty activation trigger"
+        )));
+    }
+    Ok(trigger.as_bytes().to_vec())
+}
+
+fn completes_trigger(pending: &[u8], bytes: &[u8], trigger: &[u8]) -> bool {
+    bytes.windows(trigger.len()).any(|window| window == trigger)
+        || (1..=pending.len().min(trigger.len().saturating_sub(1))).any(|prefix_len| {
+            pending.ends_with(&trigger[..prefix_len]) && bytes.starts_with(&trigger[prefix_len..])
+        })
+}
+
+fn advance_trigger_prefix(pending: &mut Vec<u8>, bytes: &[u8], trigger: &[u8]) {
+    pending.extend_from_slice(bytes);
+    let keep = (0..=pending.len().min(trigger.len().saturating_sub(1)))
+        .rev()
+        .find(|&length| pending.ends_with(&trigger[..length]))
+        .unwrap_or(0);
+    let discard = pending.len() - keep;
+    pending.drain(..discard);
 }
 
 fn constraint_error(error: String) -> Exception {
@@ -1070,8 +1158,8 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        ConstrainedSampler, DefaultSampler, GenerationSampler, MirostatV2Sampler, Sampler,
-        SpeculativeSampler,
+        advance_trigger_prefix, completes_trigger, ConstrainedSampler, DefaultSampler,
+        GenerationSampler, MirostatV2Sampler, Sampler, SpeculativeSampler,
     };
     use crate::{
         chat::{ParallelToolCallPolicy, ToolChoice, ToolRuntimePlan},
@@ -1080,6 +1168,7 @@ mod tests {
             GenerationPromptBehavior, JsonFunctionEnvelope, ParallelCallLayout,
             DECLARATIVE_DIALECT,
         },
+        streaming::{FinishReason, SemanticEvent},
         tool_constraints::ConstraintCompiler,
     };
 
@@ -1327,20 +1416,104 @@ mod tests {
     }
 
     #[test]
-    fn none_disables_constraints_from_the_first_token() {
+    fn none_masks_and_rejects_the_tool_call_trigger() {
         let context = test_context();
         let stream = context.stream();
         let plan = synthetic_plan(ToolChoice::None);
         let logits = placeholder_logits();
-        let mut sampler =
-            ConstrainedSampler::from_tool_plan(CountingPolicy::default(), &plan).unwrap();
+        let policy = GenerationSampler::new().top_k(1).top_p(1.0).min_p(0.0);
+        let mut sampler = ConstrainedSampler::from_tool_plan(policy, &plan).unwrap();
 
         assert!(!sampler.constraint_is_active());
         assert_eq!(sampler.valid_token_ids().unwrap(), None);
-        sampler
-            .commit_token(&logits, u32::from(b'x'), stream)
+        commit_bytes(
+            &mut sampler,
+            &AUTO_TRIGGER[..AUTO_TRIGGER.len() - 1],
+            &logits,
+            stream,
+        );
+
+        let final_trigger_byte = *AUTO_TRIGGER.last().unwrap();
+        let mut values = vec![-100.0f32; SYNTHETIC_VOCAB_SIZE];
+        values[final_trigger_byte as usize] = 100.0;
+        values[b'x' as usize] = 10.0;
+        let raw = Array::from_slice(&values, &[1, SYNTHETIC_VOCAB_SIZE as i32]);
+        let selected = Sampler::sample(&mut sampler, &raw, 0.0, None, stream).unwrap();
+        eval([&selected]).unwrap();
+        assert_eq!(selected.item::<u32>(stream), u32::from(b'x'));
+
+        let mut rejecting =
+            ConstrainedSampler::from_tool_plan(CountingPolicy::default(), &plan).unwrap();
+        commit_bytes(
+            &mut rejecting,
+            &AUTO_TRIGGER[..AUTO_TRIGGER.len() - 1],
+            &logits,
+            stream,
+        );
+        let error = rejecting
+            .commit_token(&logits, u32::from(final_trigger_byte), stream)
+            .unwrap_err();
+        assert!(error.to_string().contains("tool_choice is None"), "{error}");
+        assert_eq!(
+            rejecting.policy().commits,
+            AUTO_TRIGGER.len() - 1,
+            "a rejected trigger token must roll back the wrapped policy"
+        );
+    }
+
+    #[test]
+    fn none_masks_trigger_completion_in_speculative_history() {
+        let context = test_context();
+        let stream = context.stream();
+        let plan = synthetic_plan(ToolChoice::None);
+        let policy = GenerationSampler::new().top_k(1).top_p(1.0).min_p(0.0);
+        let mut sampler = ConstrainedSampler::from_tool_plan(policy, &plan).unwrap();
+        let final_trigger_byte = *AUTO_TRIGGER.last().unwrap();
+        let mut values = vec![-100.0f32; SYNTHETIC_VOCAB_SIZE];
+        values[final_trigger_byte as usize] = 100.0;
+        values[b'x' as usize] = 10.0;
+        let raw = Array::from_slice(&values, &[1, SYNTHETIC_VOCAB_SIZE as i32]);
+        let history = AUTO_TRIGGER[..AUTO_TRIGGER.len() - 1]
+            .iter()
+            .copied()
+            .map(u32::from)
+            .collect::<Vec<_>>();
+
+        let processed = sampler.process_logits(&raw, 0.0, &history, stream).unwrap();
+        let selected = sampler
+            .sample_processed(&processed, 0.0, None, stream)
             .unwrap();
-        assert_eq!(sampler.policy().commits, 1);
+        eval([&selected]).unwrap();
+        assert_eq!(selected.item::<u32>(stream), u32::from(b'x'));
+    }
+
+    #[test]
+    fn none_parser_never_emits_tool_events() {
+        let plan = synthetic_plan(ToolChoice::None);
+        let mut parser = plan.create_parser().unwrap();
+
+        parser.push(str::from_utf8(COMPLETE_CALL).unwrap()).unwrap();
+        parser.finish(FinishReason::MaxTokens).unwrap();
+
+        assert!(parser.events().iter().all(|event| !matches!(
+            event,
+            SemanticEvent::ToolCallStart { .. }
+                | SemanticEvent::ToolArgumentsDelta { .. }
+                | SemanticEvent::ToolCallEnd
+        )));
+    }
+
+    #[test]
+    fn forbidden_trigger_matching_handles_whole_tokens_and_overlaps() {
+        assert!(completes_trigger(b"", b"xxababyy", b"abab"));
+        assert!(completes_trigger(b"ab", b"ab", b"abab"));
+        assert!(!completes_trigger(b"ab", b"ax", b"abab"));
+
+        let mut pending = Vec::new();
+        advance_trigger_prefix(&mut pending, b"aba", b"abab");
+        assert_eq!(pending, b"aba");
+        advance_trigger_prefix(&mut pending, b"a", b"abab");
+        assert_eq!(pending, b"a");
     }
 
     #[test]

@@ -2363,7 +2363,8 @@ fn prepare_chat_from_parts(
     let selected = template.select(Some(&request.tools))?;
     let template_identity = selected.identity().clone();
     let profile = prepare_format_profile(selected.template());
-    if request.enable_thinking == Some(true)
+    if request.tool_choice != ToolChoice::None
+        && request.enable_thinking == Some(true)
         && !request.tools.is_empty()
         && !profile.supports_tool_reasoning
     {
@@ -2420,12 +2421,17 @@ fn prepare_chat_from_parts(
     let ChatTemplateRequest {
         messages,
         tools,
-        tool_choice: _,
+        tool_choice,
         parallel_tool_calls: _,
         enable_thinking,
         add_generation_prompt,
         mut extra_template_kwargs,
     } = request;
+    let template_tools = if tool_choice == ToolChoice::None {
+        Vec::new()
+    } else {
+        tools
+    };
     let add_generation_prompt = profile
         .generation_prompt_behavior
         .resolve(add_generation_prompt);
@@ -2441,7 +2447,7 @@ fn prepare_chat_from_parts(
         .apply_chat_template_json(
             template.clone(),
             [messages.clone()],
-            Some(&tools),
+            Some(&template_tools),
             model_id,
             false,
             Some(&extra_template_kwargs),
@@ -2453,7 +2459,7 @@ fn prepare_chat_from_parts(
         .apply_chat_template_json(
             template.clone(),
             [messages],
-            Some(&tools),
+            Some(&template_tools),
             model_id,
             true,
             Some(&extra_template_kwargs),
@@ -5485,6 +5491,39 @@ mod tests {
             NativeToolSupport::Unsupported { reason }
                 if reason.contains("no registered format profile")
         ));
+    }
+
+    #[test]
+    fn tool_choice_none_does_not_render_tool_definitions() {
+        let raw = Tokenizer::new(WordLevel::default());
+        let mut tokenizer = ChatTokenizer::from_tokenizer(raw);
+        let template = ModelChatTemplate::Single(
+            "tools={{ tools|length }}{% for tool in tools %}:{{ tool.function.name }}{% endfor %}"
+                .into(),
+        );
+
+        let prepared = prepare_chat_from_parts(
+            &mut tokenizer,
+            template,
+            "none-hides-tools",
+            &[],
+            None,
+            ChatTemplateRequest {
+                tools: vec![json!({
+                    "type": "function",
+                    "function": {
+                        "name": "must_not_be_rendered",
+                        "parameters": {"type": "object"}
+                    }
+                })],
+                tool_choice: ToolChoice::None,
+                ..ChatTemplateRequest::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(prepared.rendered_prompt(), "tools=0");
+        assert!(!prepared.rendered_prompt().contains("must_not_be_rendered"));
     }
 
     #[test]
