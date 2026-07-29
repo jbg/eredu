@@ -1,35 +1,35 @@
 # Contributing native tool formats
 
-Native tool support is fail-closed and fixture-driven. A model family name or
-recognizable marker is not sufficient evidence for a registration.
+Native tool support is fail-closed and protocol-driven. A model family name,
+repository, converter, or template hash is not sufficient evidence. Recognition
+combines atomic structural-token facts with bounded rendered behavior probes.
 
 ## Add an audited fixture
 
 1. Pin the authoritative repository and immutable revision.
-2. Copy the selected template body byte for byte into
-   `tests/fixtures/chat_templates/`. Preserve upstream whitespace. If the
-   repository file needs a terminator that is not part of the template body,
-   document and remove that terminator in the signature test.
+2. Copy the selected template body into `tests/fixtures/chat_templates/`.
+   Preserve upstream whitespace so its provenance hash remains auditable.
 3. Add its source, revision, selected-template name, whitespace notes, and any
    shared-body evidence to `tests/fixtures/chat_templates/README.md`.
 4. Add a golden rendering test containing tools, prior calls and results,
    parallel calls where supported, reasoning controls, and both generation
    prompt modes.
 
-Do not silently update a fixture in place. A changed body is a new audited
-signature and should retain old registration only while that exact released
-body remains intentionally supported.
+Do not silently update a fixture in place. A changed body is a new provenance
+artifact, but equivalent behavior should recognize as the same stable protocol.
 
-## Add a registration
+## Add a protocol recognizer
 
-Add one exact signature constant and one registry entry in `src/chat.rs`.
-Registration identity should name the wire format and include a short revision
-or signature suffix. Extend the registry uniqueness test and the
-cross-dialect golden matrix. Tests must prove that a one-byte modification is
-unsupported and that duplicate matching signatures are ambiguous.
+Add or extend a recognizer whose identity names the stable wire protocol, such
+as `gemma.channels.v1`. Require every structural delimiter to be a distinct,
+atomic special token that round-trips through its tokenizer ID. Add synthetic
+render probes for reasoning, visible content, thinking-on/off generation
+prompts, tool calls, tool responses, and each supported argument shape.
 
-Architecture metadata, model IDs, repository names, template markers, and
-regex guesses must not participate in profile selection.
+Tests must prove that comments, whitespace-only Jinja refactoring, and
+unrelated branches preserve recognition while changed semantic envelopes fail.
+Architecture metadata, model IDs, repository names, whole-template hashes, and
+source-text regex guesses must not participate in runtime selection.
 
 ## Prefer declarative features
 
@@ -66,9 +66,10 @@ cannot be represented declaratively. The implementation must provide:
   `SemanticEvent`s.
 
 Add exhaustive split-boundary tests, malformed transitions, incomplete calls,
-parallel indexing, Unicode, nested values, and stop overlap. Then register the
-custom implementation by exact template signature. Never expose the dialect,
-parser, constraint engine, structural regex, or llguidance types publicly.
+parallel indexing, Unicode, nested values, and stop overlap. Then bind the
+implementation to independently verified tokenizer and rendered protocol
+evidence. Never expose the dialect, parser, constraint engine, structural
+regex, or llguidance types publicly.
 
 ## Runtime and checkpoint validation
 

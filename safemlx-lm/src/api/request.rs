@@ -264,7 +264,6 @@ pub struct PreparedChatMtpBatchOutput {
 #[derive(Clone)]
 pub(super) struct PreparedChatTokenDecoder {
     pub(super) decoder: TextDecoder,
-    pub(super) structural_tokens: HashMap<u32, String>,
 }
 
 impl TokenDecoderBackend for PreparedChatTokenDecoder {
@@ -273,21 +272,10 @@ impl TokenDecoderBackend for PreparedChatTokenDecoder {
     fn decode_token(
         &mut self,
         token_id: u32,
-        preserve_special: bool,
+        _preserve_special: bool,
     ) -> Result<Vec<u8>, Self::Error> {
         let decoded = self.decoder.step(token_id)?.unwrap_or_default();
-        if preserve_special {
-            let spelling = self.structural_tokens.get(&token_id).ok_or_else(|| {
-                Error::PreparedChatGeneration(format!(
-                    "structural token id {token_id} has no profile spelling"
-                ))
-            })?;
-            let mut bytes = decoded.into_bytes();
-            bytes.extend_from_slice(spelling.as_bytes());
-            Ok(bytes)
-        } else {
-            Ok(decoded.into_bytes())
-        }
+        Ok(decoded.into_bytes())
     }
 
     fn finish(&mut self) -> Result<Vec<u8>, Self::Error> {
@@ -313,7 +301,7 @@ pub(super) struct PreparedChatRuntime<S> {
 
 pub(super) struct PreparedChatSemanticState {
     initial_decoder: PreparedChatTokenDecoder,
-    plan: ToolRuntimePlan,
+    plan: SemanticRuntimePlan,
     caller_stop_sequences: Vec<String>,
     pipeline: CommittedTokenPipeline<PreparedChatTokenDecoder>,
     token_ids: Vec<u32>,
@@ -323,7 +311,7 @@ pub(super) struct PreparedChatSemanticState {
 impl PreparedChatSemanticState {
     pub(super) fn new(
         initial_decoder: PreparedChatTokenDecoder,
-        plan: ToolRuntimePlan,
+        plan: SemanticRuntimePlan,
         caller_stop_sequences: &[String],
     ) -> Result<Self, Exception> {
         let pipeline = Self::build_pipeline(initial_decoder.clone(), &plan, caller_stop_sequences)?;
@@ -339,15 +327,18 @@ impl PreparedChatSemanticState {
 
     fn build_pipeline(
         decoder: PreparedChatTokenDecoder,
-        plan: &ToolRuntimePlan,
+        plan: &SemanticRuntimePlan,
         caller_stop_sequences: &[String],
     ) -> Result<CommittedTokenPipeline<PreparedChatTokenDecoder>, Exception> {
         let parser = plan
             .create_parser_with_stops(caller_stop_sequences.iter().map(String::as_str))
             .map_err(Exception::custom)?;
-        let structural_token_ids = plan.structural_token_ids().collect::<Vec<_>>();
         Ok(CommittedTokenPipeline::new(
-            RawTokenDecoder::new(decoder, structural_token_ids),
+            RawTokenDecoder::with_structural_tokens(
+                decoder,
+                plan.structural_tokens()
+                    .map(|(id, spelling)| (id, spelling.to_owned())),
+            ),
             parser,
         ))
     }
@@ -401,22 +392,25 @@ pub(super) fn with_prepared_chat_runtime<S, R>(
     caller_stop_sequences: &[String],
     execute: impl FnOnce(PreparedChatRuntime<S>) -> Result<R, Error>,
 ) -> Result<R, Error> {
-    let plan = match prepared_chat.native_tool_support() {
-        NativeToolSupport::Supported => prepared_chat
-            .tool_runtime_plan()
-            .expect("supported prepared chats carry a runtime plan"),
-        NativeToolSupport::Unsupported { reason } => {
+    let semantic_plan = match prepared_chat.semantic_support() {
+        SemanticSupport::Supported => prepared_chat
+            .semantic_runtime_plan()
+            .expect("supported prepared chats carry a semantic runtime plan"),
+        SemanticSupport::Unsupported { reason } => {
             return Err(Error::PreparedChatGeneration(format!(
-                "prepared chat does not have an executable native tool plan: {reason}"
+                "prepared chat does not have an executable semantic plan: {reason}"
             )));
         }
     };
-    let sampler = ConstrainedSampler::from_tool_plan(sampling_policy, plan)
-        .map_err(|error| Error::PreparedChatGeneration(error.to_string()))?;
-    let parser = plan
+    let sampler = match prepared_chat.tool_runtime_plan() {
+        Some(plan) => ConstrainedSampler::from_tool_plan(sampling_policy, plan)
+            .map_err(|error| Error::PreparedChatGeneration(error.to_string()))?,
+        None => ConstrainedSampler::unconstrained(sampling_policy),
+    };
+    let parser = semantic_plan
         .create_parser_with_stops(caller_stop_sequences.iter().map(String::as_str))
         .map_err(Error::PreparedChatGeneration)?;
-    let structural_tokens = plan
+    let structural_tokens = semantic_plan
         .structural_tokens()
         .map(|(id, spelling)| (id, spelling.to_owned()))
         .collect();
@@ -453,6 +447,233 @@ where
     }
 }
 
+fn capability(condition: bool, reason: impl Into<String>) -> CapabilitySupport {
+    if condition {
+        CapabilitySupport::Supported
+    } else {
+        CapabilitySupport::Unsupported {
+            reason: reason.into(),
+        }
+    }
+}
+
+fn recognize_gemma_protocol(
+    tokenizer: &mut ChatTokenizer,
+    selected_template: &ModelChatTemplate,
+    model_id: &str,
+) -> Option<crate::runtime::chat::PreparedFormatProfile> {
+    use crate::runtime::chat::{
+        dialect::{DialectParameters, GenerationPromptBehavior},
+        gemma::{
+            self, CHANNEL_CLOSE, CHANNEL_OPEN, STRING_DELIMITER, TOOL_CALL_CLOSE, TOOL_CALL_OPEN,
+            TOOL_RESPONSE_OPEN, TURN_CLOSE,
+        },
+        GEMMA4_STRUCTURAL_TOOL_SPEC,
+    };
+
+    let channel_tokens = [CHANNEL_OPEN.to_owned(), CHANNEL_CLOSE.to_owned()];
+    let channel_ids = match resolve_structural_tokens(tokenizer, &channel_tokens) {
+        Ok(ids) => ids,
+        Err(_) => return None,
+    };
+    let tools = vec![serde_json::json!({
+        "type": "function",
+        "function": {
+            "name": "safemlx_probe",
+            "description": "protocol probe",
+            "parameters": {
+                "type": "object",
+                "properties": {"value": {"type": "string"}},
+                "required": ["value"]
+            }
+        }
+    })];
+    let reasoning_sentinel = "__safemlx_reasoning_probe_7c91__";
+    let visible_sentinel = "__safemlx_visible_probe_28ad__";
+    let probe_messages = vec![
+        serde_json::json!({"role": "user", "content": "__safemlx_user_probe__"}),
+        serde_json::json!({
+            "role": "assistant",
+            "reasoning_content": reasoning_sentinel,
+            "content": visible_sentinel,
+            "tool_calls": [{
+                "id": "reasoning-probe-call",
+                "type": "function",
+                "function": {
+                    "name": "safemlx_probe",
+                    "arguments": {"value": "reasoning-probe"}
+                }
+            }]
+        }),
+    ];
+    let rendered = match tokenizer.apply_chat_template_json(
+        selected_template.clone(),
+        [probe_messages],
+        Some(&tools),
+        model_id,
+        false,
+        None,
+    ) {
+        Ok(rendered) => rendered.into_iter().next()?,
+        Err(_) => return None,
+    };
+    let reasoning_frame = format!("{CHANNEL_OPEN}thought\n{reasoning_sentinel}\n{CHANNEL_CLOSE}");
+    if !rendered.contains(&reasoning_frame) || !rendered.contains(visible_sentinel) {
+        return None;
+    }
+    debug_assert_eq!(channel_ids.len(), 2);
+
+    let mut thinking_on = serde_json::Map::new();
+    thinking_on.insert("enable_thinking".into(), serde_json::Value::Bool(true));
+    let mut thinking_off = serde_json::Map::new();
+    thinking_off.insert("enable_thinking".into(), serde_json::Value::Bool(false));
+    let generation_messages =
+        vec![serde_json::json!({"role": "user", "content": "__safemlx_prompt_probe__"})];
+    for kwargs in [&thinking_on, &thinking_off] {
+        let with_prompt = match tokenizer.apply_chat_template_json(
+            selected_template.clone(),
+            [generation_messages.clone()],
+            Some(&[]),
+            model_id,
+            true,
+            Some(kwargs),
+        ) {
+            Ok(rendered) => rendered.into_iter().next()?,
+            Err(_) => return None,
+        };
+        if !with_prompt.contains("<|turn>model\n") {
+            return None;
+        }
+    }
+
+    let mut semantic_tokens = channel_tokens.to_vec();
+    let mut semantic_stops = Vec::new();
+    for spelling in [TOOL_RESPONSE_OPEN, TURN_CLOSE] {
+        if resolve_structural_tokens(tokenizer, &[spelling.to_owned()]).is_ok() {
+            semantic_tokens.push(spelling.to_owned());
+            semantic_stops.push(spelling.to_owned());
+        }
+    }
+
+    let full_tool_tokens = [
+        CHANNEL_OPEN,
+        CHANNEL_CLOSE,
+        TOOL_CALL_OPEN,
+        TOOL_CALL_CLOSE,
+        STRING_DELIMITER,
+        TOOL_RESPONSE_OPEN,
+        TURN_CLOSE,
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect::<Vec<_>>();
+    let tool_tokens_valid = resolve_structural_tokens(tokenizer, &full_tool_tokens).is_ok();
+    let mapping_tool_messages = vec![
+        serde_json::json!({"role": "user", "content": "probe"}),
+        serde_json::json!({
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{
+                "id": "probe-call",
+                "type": "function",
+                "function": {
+                    "name": "safemlx_probe",
+                    "arguments": {"value": "probe-value"}
+                }
+            }]
+        }),
+        serde_json::json!({
+            "role": "tool",
+            "tool_call_id": "probe-call",
+            "content": "probe-response"
+        }),
+    ];
+    let mapping_tool_arguments = tool_tokens_valid
+        && tokenizer
+            .apply_chat_template_json(
+                selected_template.clone(),
+                [mapping_tool_messages],
+                Some(&tools),
+                model_id,
+                true,
+                Some(&thinking_on),
+            )
+            .ok()
+            .and_then(|rendered| rendered.into_iter().next())
+            .is_some_and(|rendered| {
+                rendered.contains(&format!("{TOOL_CALL_OPEN}call:safemlx_probe{{"))
+                    && rendered.contains(TOOL_CALL_CLOSE)
+                    && rendered.contains(TOOL_RESPONSE_OPEN)
+                    && rendered.contains("probe-response")
+            });
+    let string_tool_messages = vec![
+        serde_json::json!({"role": "user", "content": "probe"}),
+        serde_json::json!({
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{
+                "id": "probe-call",
+                "type": "function",
+                "function": {
+                    "name": "safemlx_probe",
+                    "arguments": "{\"value\":\"probe-value\"}"
+                }
+            }]
+        }),
+        serde_json::json!({
+            "role": "tool",
+            "tool_call_id": "probe-call",
+            "content": "probe-response"
+        }),
+    ];
+    let string_tool_arguments = tool_tokens_valid
+        && tokenizer
+            .apply_chat_template_json(
+                selected_template.clone(),
+                [string_tool_messages],
+                Some(&tools),
+                model_id,
+                true,
+                Some(&thinking_on),
+            )
+            .ok()
+            .and_then(|rendered| rendered.into_iter().next())
+            .is_some_and(|rendered| {
+                rendered.contains(&format!("{TOOL_CALL_OPEN}call:safemlx_probe{{"))
+                    && rendered.contains(TOOL_CALL_CLOSE)
+                    && rendered.contains(TOOL_RESPONSE_OPEN)
+                    && rendered.contains("probe-response")
+            });
+    let tool_output_protocol = mapping_tool_arguments || string_tool_arguments;
+    let tool_input_rendering = tool_output_protocol;
+
+    Some(crate::runtime::chat::PreparedFormatProfile {
+        identity: Some("gemma.channels.v1".into()),
+        dialect: Some(&gemma::GEMMA_CHANNEL_DIALECT),
+        dialect_parameters: Some(gemma::parameters()),
+        tool_dialect: tool_output_protocol.then_some(&gemma::GEMMA_TOOL_DIALECT),
+        tool_dialect_parameters: tool_output_protocol
+            .then_some(DialectParameters::Declarative(&GEMMA4_STRUCTURAL_TOOL_SPEC)),
+        generation_prompt_behavior: GenerationPromptBehavior::HonorRequest,
+        reasoning_template_kwarg: "enable_thinking",
+        supports_reasoning_parsing: true,
+        supports_tool_reasoning: true,
+        supports_tool_input_rendering: tool_input_rendering,
+        supports_mapping_tool_arguments: mapping_tool_arguments,
+        supports_string_tool_arguments: string_tool_arguments,
+        native_tool_unavailable_reason: (!tool_input_rendering).then(|| {
+            "Gemma reasoning channels were recognized, but tool rendering probes failed".into()
+        }),
+        required_structural_tokens: semantic_tokens,
+        tool_required_structural_tokens: if tool_output_protocol {
+            full_tool_tokens
+        } else {
+            Vec::new()
+        },
+        stop_sequences: semantic_stops,
+    })
+}
+
 pub(super) fn prepare_chat_from_parts(
     tokenizer: &mut ChatTokenizer,
     template: ModelChatTemplate,
@@ -463,7 +684,14 @@ pub(super) fn prepare_chat_from_parts(
 ) -> Result<PreparedChat, Error> {
     let selected = template.select(Some(&request.tools))?;
     let template_identity = selected.identity().clone();
-    let profile = prepare_format_profile(selected.template());
+    let selected_template = ModelChatTemplate::Single(selected.template().to_owned());
+    let mut profile = prepare_format_profile(selected.template());
+    if profile.dialect.is_none() {
+        if let Some(recognized) = recognize_gemma_protocol(tokenizer, &selected_template, model_id)
+        {
+            profile = recognized;
+        }
+    }
     if request.tool_choice != ToolChoice::None
         && request.enable_thinking == Some(true)
         && !request.tools.is_empty()
@@ -474,50 +702,135 @@ pub(super) fn prepare_chat_from_parts(
             profile.identity.as_deref().unwrap_or("unregistered")
         )));
     }
-    let (native_tool_support, tool_runtime_plan, preserved_structural_token_ids) =
+    let semantic_failure = profile
+        .native_tool_unavailable_reason
+        .clone()
+        .unwrap_or_else(|| "no semantic protocol was recognized".into());
+    let (mut semantic_runtime_plan, mut preserved_structural_token_ids) =
         match (profile.dialect, profile.dialect_parameters) {
             (Some(dialect), Some(parameters)) => {
-                let resolved_structural_token_ids =
-                    resolve_structural_tokens(tokenizer, &profile.required_structural_tokens)
-                        .map_err(Error::ToolConstraint)?;
-                let compiler = constraint_compiler
-                    .ok_or_else(|| {
-                        Error::ToolConstraint(
-                            "the loaded model does not have tokenizer constraint data".into(),
+                match resolve_structural_tokens(tokenizer, &profile.required_structural_tokens) {
+                    Ok(resolved_ids) => {
+                        let preserved = resolved_ids.clone();
+                        (
+                            Some(SemanticRuntimePlan::new(
+                                dialect,
+                                parameters,
+                                profile.required_structural_tokens.clone(),
+                                resolved_ids,
+                                profile.stop_sequences.clone(),
+                            )),
+                            preserved,
                         )
-                    })?
-                    .as_ref()
-                    .map_err(|error| Error::ToolConstraint(error.clone()))?;
-                let plan = compiler
-                    .compile_tool_plan(
-                        dialect,
-                        parameters,
-                        &request.tools,
-                        request.tool_choice,
-                        request.parallel_tool_calls,
-                        resolved_structural_token_ids,
+                    }
+                    Err(reason) => {
+                        return Err(Error::ToolConstraint(reason));
+                    }
+                }
+            }
+            _ => (None, Vec::new()),
+        };
+    let semantic_support = if semantic_runtime_plan.is_some() {
+        SemanticSupport::Supported
+    } else {
+        SemanticSupport::Unsupported {
+            reason: semantic_failure.clone(),
+        }
+    };
+    if request.enable_thinking == Some(true)
+        && (semantic_runtime_plan.is_none() || !profile.supports_reasoning_parsing)
+        && !request.allow_unparsed_reasoning
+    {
+        return Err(Error::ToolConstraint(format!(
+            "thinking was explicitly enabled, but no semantic reasoning protocol was recognized: {semantic_failure}; set allow_unparsed_reasoning to opt into raw output"
+        )));
+    }
+
+    let tool_surface_requested =
+        !request.tools.is_empty() || request.tool_choice == ToolChoice::Required;
+    let (native_tool_support, tool_runtime_plan) =
+        match (profile.tool_dialect, profile.tool_dialect_parameters) {
+            (Some(dialect), Some(parameters))
+                if semantic_runtime_plan.is_some() && profile.supports_tool_input_rendering =>
+            {
+                if tool_surface_requested {
+                    let tool_structural_token_ids = resolve_structural_tokens(
+                        tokenizer,
+                        &profile.tool_required_structural_tokens,
                     )
                     .map_err(Error::ToolConstraint)?;
-                let preserved_structural_token_ids = plan.structural_token_ids().collect();
-                (
-                    NativeToolSupport::Supported,
-                    Some(plan),
-                    preserved_structural_token_ids,
-                )
+                    let compiler = constraint_compiler
+                        .ok_or_else(|| {
+                            Error::ToolConstraint(
+                                "the loaded model does not have tokenizer constraint data".into(),
+                            )
+                        })?
+                        .as_ref()
+                        .map_err(|error| Error::ToolConstraint(error.clone()))?;
+                    let plan = compiler
+                        .compile_tool_plan(
+                            dialect,
+                            parameters,
+                            &request.tools,
+                            request.tool_choice,
+                            request.parallel_tool_calls,
+                            tool_structural_token_ids,
+                        )
+                        .map_err(Error::ToolConstraint)?;
+                    semantic_runtime_plan = Some(plan.semantic_plan().clone());
+                    preserved_structural_token_ids = plan
+                        .semantic_plan()
+                        .structural_tokens()
+                        .map(|(id, _)| id)
+                        .collect();
+                    (NativeToolSupport::Supported, Some(plan))
+                } else {
+                    (NativeToolSupport::Supported, None)
+                }
             }
             _ => (
                 NativeToolSupport::Unsupported {
                     reason: profile
                         .native_tool_unavailable_reason
                         .clone()
-                        .unwrap_or_else(|| {
-                            "format profile does not provide a native tool dialect".into()
-                        }),
+                        .unwrap_or(semantic_failure),
                 },
                 None,
-                Vec::new(),
             ),
         };
+
+    let capabilities = ChatCapabilities {
+        reasoning_parser: capability(
+            semantic_runtime_plan.is_some() && profile.supports_reasoning_parsing,
+            "the selected protocol does not provide a recognized reasoning channel",
+        ),
+        visible_text_parser: capability(
+            semantic_runtime_plan.is_some(),
+            "no semantic visible-text parser was recognized",
+        ),
+        tool_output_parser: capability(
+            profile.tool_dialect.is_some(),
+            "generated tool-call envelopes were not recognized",
+        ),
+        tool_input_rendering: capability(
+            profile.supports_tool_input_rendering,
+            "tool-call and tool-response rendering probes did not establish support",
+        ),
+        mapping_tool_arguments: capability(
+            profile.supports_mapping_tool_arguments,
+            "tool-call history with mapping arguments was not established",
+        ),
+        string_tool_arguments: capability(
+            profile.supports_string_tool_arguments,
+            "tool-call history with serialized string arguments was not established",
+        ),
+        constrained_tool_generation: capability(
+            profile.tool_dialect.is_some()
+                && profile.supports_tool_input_rendering
+                && constraint_compiler.is_some_and(Result::is_ok),
+            "no compatible tokenizer constraint compiler is available",
+        ),
+    };
 
     let ChatTemplateRequest {
         messages,
@@ -525,6 +838,7 @@ pub(super) fn prepare_chat_from_parts(
         tool_choice,
         parallel_tool_calls: _,
         enable_thinking,
+        allow_unparsed_reasoning: _,
         add_generation_prompt,
         mut extra_template_kwargs,
     } = request;
@@ -546,7 +860,7 @@ pub(super) fn prepare_chat_from_parts(
 
     let without_generation_prompt = tokenizer
         .apply_chat_template_json(
-            template.clone(),
+            selected_template.clone(),
             [messages.clone()],
             Some(&template_tools),
             model_id,
@@ -558,7 +872,7 @@ pub(super) fn prepare_chat_from_parts(
         .expect("one input conversation must produce one rendered prompt");
     let with_generation_prompt = tokenizer
         .apply_chat_template_json(
-            template.clone(),
+            selected_template,
             [messages],
             Some(&template_tools),
             model_id,
@@ -584,6 +898,9 @@ pub(super) fn prepare_chat_from_parts(
         template_identity,
         format_profile_identity: profile.identity,
         native_tool_support,
+        semantic_support,
+        capabilities,
+        semantic_runtime_plan,
         tool_runtime_plan,
         eos_token_ids: eos_token_ids.to_vec(),
         preserved_structural_token_ids,

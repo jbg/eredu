@@ -25,10 +25,12 @@ use tokenizers::Tokenizer;
 pub(crate) use crate::nn as common;
 use crate::nn::generation::CausalLm;
 use crate::runtime::chat::constraints::ConstraintCompiler;
-use crate::runtime::chat::{prepare_format_profile, resolve_structural_tokens, ToolRuntimePlan};
+use crate::runtime::chat::{
+    prepare_format_profile, resolve_structural_tokens, SemanticRuntimePlan,
+};
 pub use crate::runtime::chat::{
-    ChatTemplateIdentity, ChatTemplateRequest, NativeToolSupport, ParallelToolCallPolicy,
-    PreparedChat, ToolChoice,
+    CapabilitySupport, ChatCapabilities, ChatTemplateIdentity, ChatTemplateRequest,
+    NativeToolSupport, ParallelToolCallPolicy, PreparedChat, SemanticSupport, ToolChoice,
 };
 use crate::runtime::checkpoint::gguf::{self as gguf_tokenizer, GgufTokenizer};
 use crate::runtime::checkpoint::quantization::WeightQuantization;

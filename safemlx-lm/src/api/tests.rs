@@ -66,6 +66,8 @@ const GEMMA4_EDGE_FIXTURE: &str =
     include_str!("../../tests/fixtures/chat_templates/gemma-4-e2b-it-3e22461f.jinja");
 const GEMMA4_LARGE_FIXTURE: &str =
     include_str!("../../tests/fixtures/chat_templates/gemma-4-26b-a4b-it-4d7ae498.jinja");
+const UNSLOTH_GEMMA4_FIXTURE_WITH_TERMINATOR: &str =
+    include_str!("../../tests/fixtures/chat_templates/unsloth-gemma-4-26b-a4b-it-94899c0f.jinja");
 const GPT_OSS_HARMONY_CURRENT_FIXTURE_WITH_TERMINATOR: &str =
     include_str!("../../tests/fixtures/chat_templates/gpt-oss-harmony-a4c9919c.jinja");
 const LFM2_CLASSIC_FIXTURE_WITH_TERMINATOR: &str =
@@ -262,6 +264,30 @@ fn gemma4_chat_tokenizer(preceding_tokens: usize) -> ChatTokenizer {
     tokenizer
 }
 
+fn gemma4_reasoning_tokenizer(preceding_tokens: usize) -> ChatTokenizer {
+    let mut raw = Tokenizer::new(WordLevel::default());
+    raw.add_tokens(
+        (0..preceding_tokens)
+            .map(|index| AddedToken::from(format!("ordinary_{index}"), false))
+            .collect::<Vec<_>>(),
+    )
+    .unwrap();
+    assert_eq!(
+        raw.add_special_tokens(
+            ["<|channel>", "<channel|>", "<|tool_response>", "<turn|>"]
+                .map(|token| AddedToken::from(token, true).normalized(false))
+        )
+        .unwrap(),
+        4
+    );
+    let mut tokenizer = ChatTokenizer::from_tokenizer(raw);
+    tokenizer.set_template_kwargs(serde_json::Map::from_iter([
+        ("bos_token".into(), json!("<bos>")),
+        ("eos_token".into(), json!("<eos>")),
+    ]));
+    tokenizer
+}
+
 fn harmony_chat_tokenizer(preceding_tokens: usize) -> ChatTokenizer {
     let mut raw = Tokenizer::new(WordLevel::default());
     raw.add_tokens(
@@ -436,6 +462,33 @@ fn unsupported_prepared_chat_fails_before_execution_boundary() {
         native_tool_support: NativeToolSupport::Unsupported {
             reason: "synthetic unsupported profile".into(),
         },
+        semantic_support: crate::runtime::chat::SemanticSupport::Unsupported {
+            reason: "synthetic unsupported profile".into(),
+        },
+        capabilities: crate::runtime::chat::ChatCapabilities {
+            reasoning_parser: crate::runtime::chat::CapabilitySupport::Unsupported {
+                reason: "synthetic unsupported profile".into(),
+            },
+            visible_text_parser: crate::runtime::chat::CapabilitySupport::Unsupported {
+                reason: "synthetic unsupported profile".into(),
+            },
+            tool_output_parser: crate::runtime::chat::CapabilitySupport::Unsupported {
+                reason: "synthetic unsupported profile".into(),
+            },
+            tool_input_rendering: crate::runtime::chat::CapabilitySupport::Unsupported {
+                reason: "synthetic unsupported profile".into(),
+            },
+            mapping_tool_arguments: crate::runtime::chat::CapabilitySupport::Unsupported {
+                reason: "synthetic unsupported profile".into(),
+            },
+            string_tool_arguments: crate::runtime::chat::CapabilitySupport::Unsupported {
+                reason: "synthetic unsupported profile".into(),
+            },
+            constrained_tool_generation: crate::runtime::chat::CapabilitySupport::Unsupported {
+                reason: "synthetic unsupported profile".into(),
+            },
+        },
+        semantic_runtime_plan: None,
         tool_runtime_plan: None,
         eos_token_ids: vec![2],
         preserved_structural_token_ids: Vec::new(),
@@ -581,6 +634,7 @@ fn prepares_prompt_and_generation_contribution_separately() {
             max_calls: std::num::NonZeroUsize::new(2),
         },
         enable_thinking: Some(false),
+        allow_unparsed_reasoning: false,
         add_generation_prompt: false,
         extra_template_kwargs: serde_json::Map::from_iter([("tone".into(), json!("brief"))]),
     };
@@ -2377,14 +2431,10 @@ fn production_gemma4_templates_render_exact_thinking_tool_history_and_prompts() 
         "<|turn>user\nagain<turn|>\n",
     );
     for (template, identity, disabled_generation_prompt) in [
-        (
-            GEMMA4_EDGE_FIXTURE,
-            "google.gemma4.edge.structural-tools.0a2c8073",
-            "<|turn>model\n",
-        ),
+        (GEMMA4_EDGE_FIXTURE, "gemma.channels.v1", "<|turn>model\n"),
         (
             GEMMA4_LARGE_FIXTURE,
-            "google.gemma4.large.structural-tools.ae53464b",
+            "gemma.channels.v1",
             "<|turn>model\n<|channel>thought\n<channel|>",
         ),
     ] {
@@ -2411,6 +2461,7 @@ fn production_gemma4_templates_render_exact_thinking_tool_history_and_prompts() 
                                 max_calls: std::num::NonZeroUsize::new(2),
                             },
                             enable_thinking: Some(enable_thinking),
+                            allow_unparsed_reasoning: false,
                             add_generation_prompt,
                             extra_template_kwargs: serde_json::Map::from_iter([(
                                 "preserve_thinking".into(),
@@ -2451,21 +2502,26 @@ fn production_gemma4_templates_render_exact_thinking_tool_history_and_prompts() 
                     assert_eq!(prepared.format_profile_identity(), Some(identity));
                     assert_eq!(
                         prepared.preserved_structural_token_ids(),
-                        &[10, 11, 12, 13, 14, 15, 16]
+                        if tools.is_empty() {
+                            &[10, 11, 15, 16][..]
+                        } else {
+                            &[10, 11, 12, 13, 14, 15, 16][..]
+                        }
                     );
                     assert_eq!(
                         prepared.profile_stop_sequences(),
                         ["<|tool_response>", "<turn|>"]
                     );
-                    let plan = prepared
-                        .tool_runtime_plan()
-                        .expect("registered Gemma 4 profile must be supported");
-                    if tool_choice == ToolChoice::Auto {
-                        assert_eq!(plan.auto_activation_trigger(), Some("<|tool_call>"));
-                        assert!(!ConstrainedSampler::from_tool_plan(DefaultSampler, plan)
-                            .unwrap()
-                            .constraint_is_active());
+                    if tools.is_empty() {
+                        assert!(prepared.tool_runtime_plan().is_none());
+                        assert!(matches!(
+                            prepared.semantic_support(),
+                            crate::runtime::chat::SemanticSupport::Supported
+                        ));
                     } else {
+                        let plan = prepared
+                            .tool_runtime_plan()
+                            .expect("recognized Gemma tool protocol must be supported");
                         assert_eq!(plan.auto_activation_trigger(), None);
                         assert!(ConstrainedSampler::from_tool_plan(DefaultSampler, plan)
                             .unwrap()
@@ -2478,14 +2534,149 @@ fn production_gemma4_templates_render_exact_thinking_tool_history_and_prompts() 
 }
 
 #[test]
+fn gemma_recognition_accepts_source_refactors_and_splits_tool_capabilities() {
+    let compiler = Ok(ConstraintCompiler::synthetic_for_tests());
+    let mut tokenizer = gemma4_chat_tokenizer(50);
+    let refactored = format!("{GEMMA4_EDGE_FIXTURE}\n{{# converter-only comment #}}");
+    let prepared = prepare_chat_from_parts(
+        &mut tokenizer,
+        ModelChatTemplate::Single(refactored),
+        "converter-variant",
+        &[],
+        Some(&compiler),
+        ChatTemplateRequest {
+            messages: vec![json!({"role": "user", "content": "hello"})],
+            enable_thinking: Some(true),
+            add_generation_prompt: true,
+            ..ChatTemplateRequest::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        prepared.format_profile_identity(),
+        Some("gemma.channels.v1")
+    );
+    assert!(prepared.capabilities().reasoning_parser.is_supported());
+    assert!(prepared.capabilities().visible_text_parser.is_supported());
+    assert!(prepared.capabilities().tool_output_parser.is_supported());
+    assert!(prepared.capabilities().tool_input_rendering.is_supported());
+    assert!(prepared
+        .capabilities()
+        .mapping_tool_arguments
+        .is_supported());
+    assert!(prepared
+        .capabilities()
+        .constrained_tool_generation
+        .is_supported());
+
+    let mut reasoning_tokenizer = gemma4_reasoning_tokenizer(60);
+    let reasoning_only = prepare_chat_from_parts(
+        &mut reasoning_tokenizer,
+        ModelChatTemplate::Single(GEMMA4_EDGE_FIXTURE.into()),
+        "converter-variant",
+        &[],
+        Some(&compiler),
+        ChatTemplateRequest {
+            messages: vec![json!({"role": "user", "content": "hello"})],
+            enable_thinking: Some(true),
+            add_generation_prompt: true,
+            ..ChatTemplateRequest::default()
+        },
+    )
+    .unwrap();
+    assert!(reasoning_only
+        .capabilities()
+        .reasoning_parser
+        .is_supported());
+    assert!(!reasoning_only
+        .capabilities()
+        .tool_output_parser
+        .is_supported());
+    assert!(!reasoning_only
+        .capabilities()
+        .tool_input_rendering
+        .is_supported());
+    assert!(reasoning_only.tool_runtime_plan().is_none());
+}
+
+#[test]
+fn unsloth_gemma_variant_is_recognized_behaviorally_and_accepts_both_argument_forms() {
+    let compiler = Ok(ConstraintCompiler::synthetic_for_tests());
+    let template = UNSLOTH_GEMMA4_FIXTURE_WITH_TERMINATOR
+        .strip_suffix('\n')
+        .expect("the fixture-only file terminator is documented");
+    for arguments in [
+        json!({"value": "mapping"}),
+        json!("{\"value\":\"serialized\"}"),
+    ] {
+        let mut tokenizer = gemma4_chat_tokenizer(70);
+        let prepared = prepare_chat_from_parts(
+            &mut tokenizer,
+            ModelChatTemplate::Single(template.into()),
+            "converter-and-model-id-are-not-support-keys",
+            &[],
+            Some(&compiler),
+            ChatTemplateRequest {
+                messages: vec![
+                    json!({"role": "user", "content": "first"}),
+                    json!({
+                        "role": "assistant",
+                        "content": "",
+                        "reasoning_content": "inspect",
+                        "tool_calls": [{
+                            "id": "call_a",
+                            "type": "function",
+                            "function": {"name": "lookup", "arguments": arguments}
+                        }]
+                    }),
+                    json!({
+                        "role": "tool",
+                        "tool_call_id": "call_a",
+                        "content": "{\"result\":1}"
+                    }),
+                ],
+                tools: vec![production_tool("lookup")],
+                tool_choice: ToolChoice::Required,
+                enable_thinking: Some(true),
+                add_generation_prompt: true,
+                ..ChatTemplateRequest::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            prepared.format_profile_identity(),
+            Some("gemma.channels.v1")
+        );
+        assert!(prepared
+            .rendered_prompt()
+            .contains("<|channel>thought\ninspect\n<channel|>"));
+        assert!(prepared.capabilities().reasoning_parser.is_supported());
+        assert!(prepared.capabilities().tool_output_parser.is_supported());
+        assert!(prepared.capabilities().tool_input_rendering.is_supported());
+        assert!(prepared
+            .capabilities()
+            .mapping_tool_arguments
+            .is_supported());
+        assert!(prepared.capabilities().string_tool_arguments.is_supported());
+        assert!(prepared.tool_runtime_plan().is_some());
+    }
+}
+
+#[test]
 fn production_gemma4_semantic_events_survive_every_protocol_byte_split() {
-    fn push_at_every_side(
+    fn push_split_text(
         parser: &mut crate::runtime::generation::streaming::ToolRuntimeParser,
-        output: &str,
+        text: &str,
+        start: usize,
         split: usize,
     ) {
+        let local_split = split.saturating_sub(start).min(text.len());
         let mut pending = Vec::new();
-        for chunk in [&output.as_bytes()[..split], &output.as_bytes()[split..]] {
+        for chunk in [
+            &text.as_bytes()[..local_split],
+            &text.as_bytes()[local_split..],
+        ] {
             pending.extend_from_slice(chunk);
             loop {
                 match std::str::from_utf8(&pending) {
@@ -2509,6 +2700,35 @@ fn production_gemma4_semantic_events_survive_every_protocol_byte_split() {
             }
         }
         assert!(pending.is_empty(), "split {split}");
+    }
+
+    fn push_structural_output(
+        parser: &mut crate::runtime::generation::streaming::ToolRuntimeParser,
+        output: &str,
+        split: usize,
+        structural_spellings: &[&str],
+    ) {
+        let mut cursor = 0;
+        while cursor < output.len() {
+            let next = structural_spellings
+                .iter()
+                .enumerate()
+                .filter_map(|(index, spelling)| {
+                    output[cursor..]
+                        .find(spelling)
+                        .map(|offset| (cursor + offset, index, *spelling))
+                })
+                .min_by_key(|(position, index, _)| (*position, *index));
+            let Some((position, structural_index, spelling)) = next else {
+                push_split_text(parser, &output[cursor..], cursor, split);
+                break;
+            };
+            push_split_text(parser, &output[cursor..position], cursor, split);
+            parser
+                .push_structural(23 + u32::try_from(structural_index).unwrap(), spelling)
+                .unwrap();
+            cursor = position + spelling.len();
+        }
     }
 
     let compiler = Ok(ConstraintCompiler::synthetic_for_tests());
@@ -2579,8 +2799,13 @@ fn production_gemma4_semantic_events_survive_every_protocol_byte_split() {
     assert!(grammar.is_complete().unwrap());
 
     for split in 0..=tool_output.len() {
-        let mut parser = plan.create_parser().unwrap();
-        push_at_every_side(&mut parser, tool_output, split);
+        let mut parser = plan.create_parser_with_stops(std::iter::empty()).unwrap();
+        let visible_output = tool_output
+            .strip_suffix("<|tool_response>")
+            .expect("tool response is the structural stop");
+        let split = split.min(visible_output.len());
+        push_structural_output(&mut parser, visible_output, split, &structural_spellings);
+        parser.push_structural(28, "<|tool_response>").unwrap();
         let reasoning = parser
             .events()
             .iter()
@@ -2615,8 +2840,13 @@ fn production_gemma4_semantic_events_survive_every_protocol_byte_split() {
     }
 
     for split in 0..=text_output.len() {
-        let mut parser = plan.create_parser().unwrap();
-        push_at_every_side(&mut parser, text_output, split);
+        let mut parser = plan.create_parser_with_stops(std::iter::empty()).unwrap();
+        let visible_output = text_output
+            .strip_suffix("<turn|>")
+            .expect("turn close is the structural stop");
+        let split = split.min(visible_output.len());
+        push_structural_output(&mut parser, visible_output, split, &structural_spellings);
+        parser.push_structural(29, "<turn|>").unwrap();
         let reasoning = parser
             .events()
             .iter()
@@ -2664,6 +2894,51 @@ fn gemma4_model_type_does_not_grant_unregistered_template_support() {
         prepared.native_tool_support(),
         NativeToolSupport::Unsupported { reason }
             if reason.contains("no registered format profile")
+    ));
+}
+
+#[test]
+fn explicit_thinking_requires_a_recognized_semantic_protocol_unless_opted_out() {
+    let raw = Tokenizer::new(WordLevel::default());
+    let mut tokenizer = ChatTokenizer::from_tokenizer(raw);
+    let template = ModelChatTemplate::Single(
+        "{% for message in messages %}{{ message.content }}{% endfor %}".into(),
+    );
+    let request = ChatTemplateRequest {
+        messages: vec![json!({"role": "user", "content": "hello"})],
+        enable_thinking: Some(true),
+        ..ChatTemplateRequest::default()
+    };
+    let error = prepare_chat_from_parts(
+        &mut tokenizer,
+        template.clone(),
+        "unknown",
+        &[],
+        None,
+        request,
+    )
+    .unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("no semantic reasoning protocol was recognized"));
+
+    let prepared = prepare_chat_from_parts(
+        &mut tokenizer,
+        template,
+        "unknown",
+        &[],
+        None,
+        ChatTemplateRequest {
+            messages: vec![json!({"role": "user", "content": "hello"})],
+            enable_thinking: Some(true),
+            allow_unparsed_reasoning: true,
+            ..ChatTemplateRequest::default()
+        },
+    )
+    .unwrap();
+    assert!(matches!(
+        prepared.semantic_support(),
+        crate::runtime::chat::SemanticSupport::Unsupported { .. }
     ));
 }
 

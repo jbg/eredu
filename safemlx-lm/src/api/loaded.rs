@@ -298,29 +298,28 @@ impl LoadedModel {
                 on_event,
             } = lane;
             let prepared_chat = input.prepared_chat();
-            let plan = match prepared_chat.native_tool_support() {
-                NativeToolSupport::Supported => prepared_chat
-                    .tool_runtime_plan()
-                    .expect("supported prepared chats carry a runtime plan")
+            let semantic_plan = match prepared_chat.semantic_support() {
+                SemanticSupport::Supported => prepared_chat
+                    .semantic_runtime_plan()
+                    .expect("supported prepared chats carry a semantic runtime plan")
                     .clone(),
-                NativeToolSupport::Unsupported { reason } => {
+                SemanticSupport::Unsupported { reason } => {
                     return Err(Error::PreparedChatGeneration(format!(
-                        "prepared chat lane {lane_index} does not have an executable native tool plan: {reason}"
+                        "prepared chat lane {lane_index} does not have an executable semantic plan: {reason}"
                     )));
                 }
             };
-            let sampler = ConstrainedSampler::from_tool_plan(sampling_policy, &plan)
-                .map_err(|error| Error::PreparedChatGeneration(error.to_string()))?;
-            let structural_tokens = plan
-                .structural_tokens()
-                .map(|(id, spelling)| (id, spelling.to_owned()))
-                .collect();
+            let sampler = match prepared_chat.tool_runtime_plan() {
+                Some(plan) => ConstrainedSampler::from_tool_plan(sampling_policy, plan)
+                    .map_err(|error| Error::PreparedChatGeneration(error.to_string()))?,
+                None => ConstrainedSampler::unconstrained(sampling_policy),
+            };
             let decoder = PreparedChatTokenDecoder {
                 decoder: self.text_decoder(true),
-                structural_tokens,
             };
-            let semantic = PreparedChatSemanticState::new(decoder, plan, caller_stop_sequences)
-                .map_err(|error| Error::PreparedChatGeneration(error.to_string()))?;
+            let semantic =
+                PreparedChatSemanticState::new(decoder, semantic_plan, caller_stop_sequences)
+                    .map_err(|error| Error::PreparedChatGeneration(error.to_string()))?;
             let input = self.prepare_chat_model_input(input, stream)?;
             prepared_lanes.push(PreparedChatMtpLaneRuntime {
                 input,
@@ -529,16 +528,11 @@ impl LoadedModel {
             |runtime| {
                 // This closure is the execution boundary: unsupported plans
                 // and runtime-construction failures return before it is called.
-                let structural_token_ids = runtime
-                    .structural_tokens
-                    .keys()
-                    .copied()
-                    .collect::<Vec<_>>();
                 let decoder = PreparedChatTokenDecoder {
                     decoder: self.text_decoder(true),
-                    structural_tokens: runtime.structural_tokens,
                 };
-                let raw_decoder = RawTokenDecoder::new(decoder, structural_token_ids);
+                let raw_decoder =
+                    RawTokenDecoder::with_structural_tokens(decoder, runtime.structural_tokens);
                 let mut pipeline = CommittedTokenPipeline::new(raw_decoder, runtime.parser);
                 let model_input = self.prepare_chat_model_input(input, stream)?;
                 model_input.with_model_input(|model_input| {
@@ -592,14 +586,14 @@ impl LoadedModel {
             on_event,
         } = request;
         let prepared_chat = input.prepared_chat();
-        let plan = match prepared_chat.native_tool_support() {
-            NativeToolSupport::Supported => prepared_chat
-                .tool_runtime_plan()
-                .expect("supported prepared chats carry a runtime plan")
+        let semantic_plan = match prepared_chat.semantic_support() {
+            SemanticSupport::Supported => prepared_chat
+                .semantic_runtime_plan()
+                .expect("supported prepared chats carry a semantic runtime plan")
                 .clone(),
-            NativeToolSupport::Unsupported { reason } => {
+            SemanticSupport::Unsupported { reason } => {
                 return Err(Error::PreparedChatGeneration(format!(
-                    "prepared chat does not have an executable native tool plan: {reason}"
+                    "prepared chat does not have an executable semantic plan: {reason}"
                 )));
             }
         };
@@ -610,10 +604,10 @@ impl LoadedModel {
             |runtime| {
                 let decoder = PreparedChatTokenDecoder {
                     decoder: self.text_decoder(true),
-                    structural_tokens: runtime.structural_tokens,
                 };
-                let semantic = PreparedChatSemanticState::new(decoder, plan, caller_stop_sequences)
-                    .map_err(|error| Error::PreparedChatGeneration(error.to_string()))?;
+                let semantic =
+                    PreparedChatSemanticState::new(decoder, semantic_plan, caller_stop_sequences)
+                        .map_err(|error| Error::PreparedChatGeneration(error.to_string()))?;
                 let config = MtpConfig {
                     max_tokens: settings.max_tokens.get(),
                     max_draft_tokens: options.max_draft_tokens.get(),
@@ -668,14 +662,14 @@ impl LoadedModel {
             on_event,
         } = request;
         let prepared_chat = input.prepared_chat();
-        let plan = match prepared_chat.native_tool_support() {
-            NativeToolSupport::Supported => prepared_chat
-                .tool_runtime_plan()
-                .expect("supported prepared chats carry a runtime plan")
+        let semantic_plan = match prepared_chat.semantic_support() {
+            SemanticSupport::Supported => prepared_chat
+                .semantic_runtime_plan()
+                .expect("supported prepared chats carry a semantic runtime plan")
                 .clone(),
-            NativeToolSupport::Unsupported { reason } => {
+            SemanticSupport::Unsupported { reason } => {
                 return Err(Error::PreparedChatGeneration(format!(
-                    "prepared chat does not have an executable native tool plan: {reason}"
+                    "prepared chat does not have an executable semantic plan: {reason}"
                 )));
             }
         };
@@ -686,10 +680,10 @@ impl LoadedModel {
             |runtime| {
                 let decoder = PreparedChatTokenDecoder {
                     decoder: self.text_decoder(true),
-                    structural_tokens: runtime.structural_tokens,
                 };
-                let semantic = PreparedChatSemanticState::new(decoder, plan, caller_stop_sequences)
-                    .map_err(|error| Error::PreparedChatGeneration(error.to_string()))?;
+                let semantic =
+                    PreparedChatSemanticState::new(decoder, semantic_plan, caller_stop_sequences)
+                        .map_err(|error| Error::PreparedChatGeneration(error.to_string()))?;
                 let config = MtpConfig {
                     max_tokens: settings.max_tokens.get(),
                     max_draft_tokens: options.max_draft_tokens.get(),

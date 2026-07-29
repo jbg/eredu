@@ -6,7 +6,7 @@
 
 #![allow(dead_code)]
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::fmt;
 use std::num::NonZeroUsize;
 
@@ -116,12 +116,14 @@ struct RawToken {
     token_id: u32,
     bytes: Vec<u8>,
     structural: bool,
+    structural_spelling: Option<String>,
 }
 
 /// Decodes raw token pieces while retaining designated structural specials.
 pub(crate) struct RawTokenDecoder<D> {
     backend: D,
     structural_token_ids: BTreeSet<u32>,
+    structural_token_spellings: HashMap<u32, String>,
 }
 
 impl<D> RawTokenDecoder<D>
@@ -132,6 +134,19 @@ where
         Self {
             backend,
             structural_token_ids: structural_token_ids.into_iter().collect(),
+            structural_token_spellings: HashMap::new(),
+        }
+    }
+
+    pub(crate) fn with_structural_tokens(
+        backend: D,
+        structural_tokens: impl IntoIterator<Item = (u32, String)>,
+    ) -> Self {
+        let structural_token_spellings = structural_tokens.into_iter().collect::<HashMap<_, _>>();
+        Self {
+            backend,
+            structural_token_ids: structural_token_spellings.keys().copied().collect(),
+            structural_token_spellings,
         }
     }
 
@@ -142,6 +157,7 @@ where
             token_id,
             bytes,
             structural,
+            structural_spelling: self.structural_token_spellings.get(&token_id).cloned(),
         })
     }
 
@@ -596,6 +612,21 @@ pub(crate) trait ProtocolParser: Send {
 
     fn push(&mut self, text: &str, sink: &mut SemanticEventSink) -> Result<(), Self::Error>;
 
+    /// Handles one tokenizer-confirmed structural special token.
+    ///
+    /// Text-oriented protocols retain their existing behavior through this
+    /// default implementation. Structural protocols override this method and
+    /// branch on `token_id`, so ordinary decoded text that resembles a marker
+    /// cannot change parser state.
+    fn structural(
+        &mut self,
+        _token_id: u32,
+        spelling: &str,
+        sink: &mut SemanticEventSink,
+    ) -> Result<(), Self::Error> {
+        self.push(spelling, sink)
+    }
+
     /// Handles a stop sequence matched by the shared stream engine.
     ///
     /// Dialects whose terminal marker carries protocol meaning can override
@@ -617,6 +648,15 @@ where
         (**self).push(text, sink)
     }
 
+    fn structural(
+        &mut self,
+        token_id: u32,
+        spelling: &str,
+        sink: &mut SemanticEventSink,
+    ) -> Result<(), Self::Error> {
+        (**self).structural(token_id, spelling, sink)
+    }
+
     fn stop(&mut self, sequence: &str, sink: &mut SemanticEventSink) -> Result<(), Self::Error> {
         (**self).stop(sequence, sink)
     }
@@ -630,6 +670,7 @@ where
 struct SemanticStream<P> {
     parser: P,
     stops: StopMatcher,
+    structural_stops: BTreeSet<String>,
     sink: SemanticEventSink,
     finished: bool,
 }
@@ -642,10 +683,21 @@ where
         parser: P,
         profile_stops: impl IntoIterator<Item = &'a str>,
         caller_stops: impl IntoIterator<Item = &'b str>,
+        structural_stop_spellings: impl IntoIterator<Item = &'a str>,
     ) -> Self {
+        let structural_stops = structural_stop_spellings
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<BTreeSet<_>>();
         Self {
             parser,
-            stops: StopMatcher::new(profile_stops, caller_stops),
+            stops: StopMatcher::new(
+                profile_stops
+                    .into_iter()
+                    .filter(|stop| !structural_stops.contains(*stop)),
+                caller_stops,
+            ),
+            structural_stops,
             sink: SemanticEventSink::default(),
             finished: false,
         }
@@ -663,6 +715,23 @@ where
             self.parser.stop(&sequence, &mut self.sink)?;
             self.sink.finish(FinishReason::StopSequence);
             self.finished = true;
+        }
+        Ok(self.finished)
+    }
+
+    fn structural(&mut self, token_id: u32, spelling: &str) -> Result<bool, P::Error> {
+        if self.finished {
+            return Ok(true);
+        }
+
+        let visible = self.stops.finish();
+        self.parser.push(&visible, &mut self.sink)?;
+        if self.structural_stops.contains(spelling) {
+            self.parser.stop(spelling, &mut self.sink)?;
+            self.sink.finish(FinishReason::StopSequence);
+            self.finished = true;
+        } else {
+            self.parser.structural(token_id, spelling, &mut self.sink)?;
         }
         Ok(self.finished)
     }
@@ -705,8 +774,22 @@ impl ToolRuntimeParser {
         profile_stops: impl IntoIterator<Item = &'a str>,
         caller_stops: impl IntoIterator<Item = &'b str>,
     ) -> Self {
+        Self::new_with_structural_stops(parser, profile_stops, caller_stops, std::iter::empty())
+    }
+
+    pub(crate) fn new_with_structural_stops<'a, 'b>(
+        parser: Box<dyn ProtocolParser<Error = String>>,
+        profile_stops: impl IntoIterator<Item = &'a str>,
+        caller_stops: impl IntoIterator<Item = &'b str>,
+        structural_stop_spellings: impl IntoIterator<Item = &'a str>,
+    ) -> Self {
         Self {
-            stream: SemanticStream::new(parser, profile_stops, caller_stops),
+            stream: SemanticStream::new(
+                parser,
+                profile_stops,
+                caller_stops,
+                structural_stop_spellings,
+            ),
         }
     }
 
@@ -717,6 +800,14 @@ impl ToolRuntimeParser {
     /// Pushes decoded text and returns whether a profile stop sequence matched.
     pub(crate) fn push(&mut self, text: &str) -> Result<bool, String> {
         self.stream.push(text)
+    }
+
+    pub(crate) fn push_structural(
+        &mut self,
+        token_id: u32,
+        spelling: &str,
+    ) -> Result<bool, String> {
+        self.stream.structural(token_id, spelling)
     }
 
     /// Finishes parsing with the generation's terminal reason.
@@ -781,7 +872,12 @@ where
             .utf8
             .push(&raw.bytes)
             .map_err(|error| format!("UTF-8 assembly failed: {error}"))?;
-        let matched = self.parser.push(&text)?;
+        let mut matched = self.parser.push(&text)?;
+        if raw.structural {
+            if let Some(spelling) = raw.structural_spelling.as_deref() {
+                matched = self.parser.push_structural(raw.token_id, spelling)?;
+            }
+        }
         self.drain_into(emit);
         Ok(matched)
     }
@@ -1276,7 +1372,7 @@ mod tests {
     fn synthetic_parser_is_split_independent() {
         let input = r#"<r>why 🦀</r>Hello <call:id-7:weather>{"city":"Bogotá"}</call> done"#;
         for split in split_points(input) {
-            let mut stream = SemanticStream::new(SyntheticParser::default(), [], []);
+            let mut stream = SemanticStream::new(SyntheticParser::default(), [], [], []);
             assert!(!stream.push(&input[..split]).unwrap());
             assert!(!stream.push(&input[split..]).unwrap());
             stream.finish(FinishReason::Eos).unwrap();
@@ -1311,7 +1407,8 @@ mod tests {
     fn matched_stop_never_reaches_visible_output() {
         let input = "safe STOP must remain hidden";
         for split in split_points(input) {
-            let mut stream = SemanticStream::new(SyntheticParser::default(), ["</s>"], ["STOP"]);
+            let mut stream =
+                SemanticStream::new(SyntheticParser::default(), ["</s>"], ["STOP"], []);
             let first_matched = stream.push(&input[..split]).unwrap();
             let second_matched = stream.push(&input[split..]).unwrap();
             assert!(first_matched || second_matched);
@@ -1329,7 +1426,7 @@ mod tests {
     fn partial_stop_at_eof_is_parsed_before_finished() {
         let input = "safe STO";
         for split in split_points(input) {
-            let mut stream = SemanticStream::new(SyntheticParser::default(), [], ["STOP"]);
+            let mut stream = SemanticStream::new(SyntheticParser::default(), [], ["STOP"], []);
             stream.push(&input[..split]).unwrap();
             stream.push(&input[split..]).unwrap();
             stream.finish(FinishReason::MaxTokens).unwrap();
@@ -1351,7 +1448,7 @@ mod tests {
             r#"<call:id:name>{"complete":true}</ca"#,
         ] {
             for split in split_points(input) {
-                let mut stream = SemanticStream::new(SyntheticParser::default(), [], []);
+                let mut stream = SemanticStream::new(SyntheticParser::default(), [], [], []);
                 stream.push(&input[..split]).unwrap();
                 stream.push(&input[split..]).unwrap();
                 stream.finish(FinishReason::Eos).unwrap();

@@ -23,6 +23,8 @@ The Hugging Face form never downloads files. It scans the cache selected by
 the cached `main` revision by default. GGUF selectors prefer `main`, then search
 other cached snapshots when `main` does not contain the requested
 quantization. Use `--revision` to limit selection to a cached ref or commit.
+When target and draft artifacts come from the same repository, their owning
+commit must match. `--allow-mixed-revisions` is the explicit escape hatch.
 
 For a cached repository containing multiple GGUF files, append a
 case-insensitive quantization selector to the model identifier. The full
@@ -321,8 +323,11 @@ support the switch. Pass `--raw` to tokenize the prompt directly; raw prompts
 cannot use an explicit thinking mode. Run with `--help` for all sampling and
 repetition-penalty options.
 
-For an exactly registered chat-template profile, ordinary chat uses the same
-semantic runtime as native tool calling even when no tools are supplied.
+`--thinking on` also requires a recognized reasoning parser. Use
+`--allow-unparsed-reasoning` only when raw reasoning wire content is acceptable.
+
+For a structurally recognized chat protocol, ordinary chat uses semantic
+parsing independently of native tool generation.
 Reasoning channels are emitted as reasoning events rather than leaking their
 wire-format markers into stdout; visible response text is streamed normally.
 With `--verbose`, reasoning deltas are shown on stderr. An unregistered
@@ -330,8 +335,8 @@ template remains usable without tools through a templated text fallback, while
 `--raw` remains the explicit no-template path.
 
 Native tool calling accepts a JSON array of OpenAI-shaped function definitions.
-It uses exact template-signature capability gating and the `PreparedChat`
-runtime; unsupported or changed templates fail instead of falling back to
+It requires independently recognized tool rendering, output parsing, and
+constraint capabilities; unsupported protocols fail instead of falling back to
 unconstrained text:
 
 ```sh

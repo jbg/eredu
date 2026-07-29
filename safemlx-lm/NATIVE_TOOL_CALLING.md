@@ -14,17 +14,16 @@ scheduler options, event accumulation, and finish reasons.
 
 ## Capability gating
 
-Support is granted by the SHA-256 signature of the exact selected chat-template
-body. For a named template collection, SafeMLX first lets the tokenizer select
-the body (for example, a `tool_use` template), then signs only that selected
-body. Architecture, repository name, model ID, and protocol-looking substrings
-are never fallback keys.
+Stable protocol recognizers verify tokenizer structure and render bounded
+synthetic conversations after named-template selection. Reasoning,
+visible-text, tool-output parsing, tool-input rendering, and constrained tool
+generation are independent capabilities. Architecture, repository name, model
+ID, converter, whole-template hash, and protocol-looking source substrings are
+never fallback keys.
 
-An exact signature must map to exactly one registered profile. No match is
-unsupported; two matches are ambiguous and therefore unsupported. Even a
-one-byte template change is a different, unsupported signature until it has
-been audited and registered. This makes capability detection fail closed when
-checkpoint authors revise prompt or response syntax.
+Recognition fails closed when required tokens are not distinct atomic specials
+or when rendered behavior changes. Comments, Jinja refactoring, and unrelated
+branches do not affect support when the observed protocol remains equivalent.
 
 ```rust
 let prepared = model.prepare_chat(request)?;
@@ -138,11 +137,13 @@ leak into visible text.
 
 ## Reusable wire formats
 
-Registrations bind templates to reusable wire-format implementations rather
-than model architectures:
+Runtime profiles bind recognized protocols to reusable wire-format
+implementations rather than model architectures or template artifacts:
 
 - Declarative JSON objects, JSON lists, XML-wrapped JSON, fixed JSON
   envelopes, named JSON arguments, and structural-token JSON objects.
+- Gemma structural channels and tool envelopes, selected from tokenizer and
+  rendered behavior evidence.
 - OpenAI Harmony channels and function recipients for GPT-OSS.
 - LFM2/LFM2.5 Python-call lists with canonical JSON argument events.
 

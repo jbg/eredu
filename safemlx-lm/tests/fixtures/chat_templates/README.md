@@ -3,8 +3,9 @@
 These files are byte-for-byte fixtures of the selected chat-template body
 from the named source. Most are selected `chat_template` bodies from Hugging
 Face tokenizer configurations; the DeepSeek tool templates are the pinned
-deployment templates named in their rows. The registry matches the SHA-256 of
-the selected body only; repository or model metadata is not a support key.
+deployment templates named in their rows. SHA-256 values are audit provenance
+only. Runtime support is selected from tokenizer facts and rendered protocol
+behavior; repository or model metadata is not a support key.
 
 | Fixture | Source repository | Pinned revision | Selected template |
 | --- | --- | --- | --- |
@@ -21,6 +22,7 @@ the selected body only; repository or model metadata is not a support key.
 | `nemotron-nano-v2-6533e8de.jinja` | `nvidia/NVIDIA-Nemotron-Nano-9B-v2` | `6533e8de2c68e4536bf7c411d7a3ce5734111476` | single `chat_template` |
 | `gemma-4-e2b-it-3e22461f.jinja` | `google/gemma-4-E2B-it` | `3e22461f65e89153144f8adb70e3b8c2cc9845a7` | `chat_template.jinja` |
 | `gemma-4-26b-a4b-it-4d7ae498.jinja` | `google/gemma-4-26B-A4B-it` | `4d7ae4984b7db7de8f8457170b3f1a419ee76d52` | `chat_template.jinja` |
+| `unsloth-gemma-4-26b-a4b-it-94899c0f.jinja` | `unsloth/gemma-4-26B-A4B-it-GGUF` | `3bb10d594514ef4edb7f3a65d41a7e4eb8c5767a` | GGUF `tokenizer.chat_template` metadata |
 | `gpt-oss-harmony-a4c9919c.jinja` | `openai/gpt-oss-20b` | `6cee5e81ee83917806bbde320786a8fb61efebee` | `chat_template.jinja` |
 | `gpt-oss-harmony-b474759b.jinja` | `openai/gpt-oss-20b` | `10e9d713f8e4a9281c59c40be6c58537480635ea` | `chat_template.jinja` |
 | `gpt-oss-harmony-f8d92557.jinja` | `openai/gpt-oss-20b` | `ec854da5735f125fe36f080d8013482590f9ad7d` | `chat_template.jinja` |
@@ -74,8 +76,14 @@ byte-identical to `google/gemma-4-12B-it` revision
 `707f0a3b8a3c7ad586ed01e27eafbad8a27dd0f7` and
 `google/gemma-4-31B-it` revision
 `842da3794eaa0b77d5f08bae87a17459d91ff475`. These two signatures capture
-the audited difference in disabled-thinking generation prompts without
-granting support from `model_type`.
+the audited difference in disabled-thinking generation prompts. The Unsloth
+fixture carries one repository file terminator; after removing it, the exact
+GGUF metadata string has SHA-256
+`94899c0f917d93f6fe81c95744d1e8ddab2d21d39228d2e4aec1fb2a25bff413`.
+It renders saved reasoning only when the assistant message also contains a
+tool call and accepts both mapping and serialized-string tool arguments.
+All three fixtures are behavioral recognition tests: their hashes and
+`model_type` values do not grant runtime support.
 
 Each GPT-OSS fixture is byte-identical to the corresponding official
 `openai/gpt-oss-120b` body: revisions

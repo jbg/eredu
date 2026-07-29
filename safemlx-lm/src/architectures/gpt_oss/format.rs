@@ -169,6 +169,10 @@ impl HarmonyDialect {
 }
 
 impl FormatDialect for HarmonyDialect {
+    fn supports_reasoning_parsing(&self, parameters: DialectParameters) -> bool {
+        Self::parameters(parameters).is_ok()
+    }
+
     fn generation_prompt_behavior(
         &self,
         parameters: DialectParameters,

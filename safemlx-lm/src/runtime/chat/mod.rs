@@ -6,6 +6,7 @@
 
 pub(crate) mod constraints;
 pub(crate) mod dialect;
+pub(crate) mod gemma;
 
 use std::{
     collections::{HashMap, HashSet},
@@ -75,6 +76,11 @@ pub struct ChatTemplateRequest {
     pub parallel_tool_calls: ParallelToolCallPolicy,
     /// Explicit thinking/reasoning toggle, or `None` to preserve the template default.
     pub enable_thinking: Option<bool>,
+    /// Permit explicit thinking when no semantic reasoning parser is recognized.
+    ///
+    /// The default is fail-closed because raw fallback may expose reasoning
+    /// wire markers and content as visible text.
+    pub allow_unparsed_reasoning: bool,
     /// Whether the returned prompt includes the template's generation prompt.
     pub add_generation_prompt: bool,
     /// Additional variables exposed to the checkpoint chat template.
@@ -112,19 +118,102 @@ impl PartialEq for GenerationConstraint {
 
 impl Eq for GenerationConstraint {}
 
-/// A format-profile-specific plan for native tool generation.
+/// A format-protocol-specific semantic parsing plan.
 ///
-/// Callers use [`PreparedChat`] with the high-level generation APIs; the
-/// executable constraint and wire parser remain private implementation state.
+/// This plan deliberately contains no generation constraint. It can therefore
+/// preserve reasoning and visible-text semantics even when tool rendering or
+/// constrained tool generation is unavailable.
+#[derive(Clone)]
+pub(crate) struct SemanticRuntimePlan {
+    dialect: &'static dyn FormatDialect,
+    dialect_parameters: DialectParameters,
+    structural_tokens: Vec<ResolvedStructuralToken>,
+    profile_stop_sequences: Vec<String>,
+}
+
+impl SemanticRuntimePlan {
+    pub(crate) fn new(
+        dialect: &'static dyn FormatDialect,
+        dialect_parameters: DialectParameters,
+        structural_token_spellings: Vec<String>,
+        resolved_structural_token_ids: Vec<u32>,
+        profile_stop_sequences: Vec<String>,
+    ) -> Self {
+        debug_assert_eq!(
+            structural_token_spellings.len(),
+            resolved_structural_token_ids.len()
+        );
+        Self {
+            dialect,
+            dialect_parameters,
+            structural_tokens: structural_token_spellings
+                .into_iter()
+                .zip(resolved_structural_token_ids)
+                .map(|(spelling, token_id)| ResolvedStructuralToken { spelling, token_id })
+                .collect(),
+            profile_stop_sequences,
+        }
+    }
+
+    pub(crate) fn structural_tokens(&self) -> impl Iterator<Item = (u32, &str)> + '_ {
+        self.structural_tokens
+            .iter()
+            .map(|token| (token.token_id, token.spelling.as_str()))
+    }
+
+    pub(crate) fn create_parser_with_stops<'a>(
+        &self,
+        caller_stops: impl IntoIterator<Item = &'a str>,
+    ) -> Result<ToolRuntimeParser, String> {
+        let parser = self
+            .dialect
+            .incremental_parser_state(self.dialect_parameters)?;
+        Ok(ToolRuntimeParser::new_with_structural_stops(
+            parser,
+            self.profile_stop_sequences.iter().map(String::as_str),
+            caller_stops,
+            self.profile_stop_sequences
+                .iter()
+                .filter(|stop| {
+                    self.structural_tokens
+                        .iter()
+                        .any(|token| token.spelling == stop.as_str())
+                })
+                .map(String::as_str),
+        ))
+    }
+}
+
+impl fmt::Debug for SemanticRuntimePlan {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SemanticRuntimePlan")
+            .field("structural_token_count", &self.structural_tokens.len())
+            .field("profile_stop_count", &self.profile_stop_sequences.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl PartialEq for SemanticRuntimePlan {
+    fn eq(&self, other: &Self) -> bool {
+        std::ptr::eq(self.dialect, other.dialect)
+            && self.dialect_parameters.ptr_eq(other.dialect_parameters)
+            && self.structural_tokens == other.structural_tokens
+            && self.profile_stop_sequences == other.profile_stop_sequences
+    }
+}
+
+impl Eq for SemanticRuntimePlan {}
+
+/// A format-protocol-specific plan for constrained native tool generation.
+///
+/// The semantic parser is composed rather than implied by the constraint.
 #[derive(Clone)]
 pub(crate) struct ToolRuntimePlan {
     tool_choice: ToolChoice,
     generation_constraint: GenerationConstraint,
     tool_call_trigger: Option<String>,
-    dialect: &'static dyn FormatDialect,
-    dialect_parameters: DialectParameters,
-    structural_tokens: Vec<ResolvedStructuralToken>,
-    profile_stop_sequences: Vec<String>,
+    semantic: SemanticRuntimePlan,
 }
 
 pub(crate) struct ToolRuntimePlanParts {
@@ -144,20 +233,23 @@ impl ToolRuntimePlan {
             parts.structural_token_spellings.len(),
             parts.resolved_structural_token_ids.len()
         );
+        let semantic = SemanticRuntimePlan::new(
+            parts.dialect,
+            parts.dialect_parameters,
+            parts.structural_token_spellings,
+            parts.resolved_structural_token_ids,
+            parts.profile_stop_sequences,
+        );
         Self {
             tool_choice: parts.tool_choice,
             generation_constraint: parts.generation_constraint,
             tool_call_trigger: parts.tool_call_trigger,
-            dialect: parts.dialect,
-            dialect_parameters: parts.dialect_parameters,
-            structural_tokens: parts
-                .structural_token_spellings
-                .into_iter()
-                .zip(parts.resolved_structural_token_ids)
-                .map(|(spelling, token_id)| ResolvedStructuralToken { spelling, token_id })
-                .collect(),
-            profile_stop_sequences: parts.profile_stop_sequences,
+            semantic,
         }
+    }
+
+    pub(crate) fn semantic_plan(&self) -> &SemanticRuntimePlan {
+        &self.semantic
     }
 
     pub(crate) fn generation_constraint(&self) -> &GenerationConstraint {
@@ -166,7 +258,7 @@ impl ToolRuntimePlan {
 
     pub(crate) fn auto_activation_trigger(&self) -> Option<&str> {
         (self.tool_choice == ToolChoice::Auto)
-            .then(|| self.tool_call_trigger.as_deref())
+            .then_some(self.tool_call_trigger.as_deref())
             .flatten()
     }
 
@@ -178,14 +270,17 @@ impl ToolRuntimePlan {
         self.tool_choice
     }
 
+    #[cfg(test)]
     pub(crate) fn structural_token_ids(&self) -> impl Iterator<Item = u32> + '_ {
-        self.structural_tokens.iter().map(|token| token.token_id)
+        self.semantic
+            .structural_tokens
+            .iter()
+            .map(|token| token.token_id)
     }
 
+    #[cfg(test)]
     pub(crate) fn structural_tokens(&self) -> impl Iterator<Item = (u32, &str)> + '_ {
-        self.structural_tokens
-            .iter()
-            .map(|token| (token.token_id, token.spelling.as_str()))
+        self.semantic.structural_tokens()
     }
 
     /// Creates a fresh protocol parser with independent state for one generation.
@@ -194,21 +289,30 @@ impl ToolRuntimePlan {
     /// parser.
     #[cfg(test)]
     pub(crate) fn create_parser(&self) -> Result<ToolRuntimeParser, String> {
-        self.create_parser_with_stops(std::iter::empty())
+        let parser = self
+            .semantic
+            .dialect
+            .incremental_parser_state(self.semantic.dialect_parameters)?;
+        let mut parser = ToolRuntimeParser::new(
+            parser,
+            self.semantic
+                .profile_stop_sequences
+                .iter()
+                .map(String::as_str),
+            std::iter::empty(),
+        );
+        if self.tool_choice == ToolChoice::None {
+            parser.disable_tool_calls();
+        }
+        Ok(parser)
     }
 
+    #[cfg(test)]
     pub(crate) fn create_parser_with_stops<'a>(
         &self,
         caller_stops: impl IntoIterator<Item = &'a str>,
     ) -> Result<ToolRuntimeParser, String> {
-        let parser = self
-            .dialect
-            .incremental_parser_state(self.dialect_parameters)?;
-        let mut parser = ToolRuntimeParser::new(
-            parser,
-            self.profile_stop_sequences.iter().map(String::as_str),
-            caller_stops,
-        );
+        let mut parser = self.semantic.create_parser_with_stops(caller_stops)?;
         if self.tool_choice == ToolChoice::None {
             parser.disable_tool_calls();
         }
@@ -221,8 +325,7 @@ impl fmt::Debug for ToolRuntimePlan {
         formatter
             .debug_struct("ToolRuntimePlan")
             .field("tool_choice", &self.tool_choice)
-            .field("structural_token_count", &self.structural_tokens.len())
-            .field("profile_stop_count", &self.profile_stop_sequences.len())
+            .field("semantic", &self.semantic)
             .finish_non_exhaustive()
     }
 }
@@ -232,10 +335,7 @@ impl PartialEq for ToolRuntimePlan {
         self.tool_choice == other.tool_choice
             && self.generation_constraint == other.generation_constraint
             && self.tool_call_trigger == other.tool_call_trigger
-            && std::ptr::eq(self.dialect, other.dialect)
-            && self.dialect_parameters.ptr_eq(other.dialect_parameters)
-            && self.structural_tokens == other.structural_tokens
-            && self.profile_stop_sequences == other.profile_stop_sequences
+            && self.semantic == other.semantic
     }
 }
 
@@ -275,6 +375,75 @@ impl NativeToolSupport {
     }
 }
 
+/// Whether generated responses can be decoded into protocol-neutral semantic
+/// events for the selected checkpoint protocol.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SemanticSupport {
+    /// A structural response parser was recognized and prepared.
+    Supported,
+    /// No safe semantic parser could be recognized.
+    Unsupported {
+        /// Human-readable explanation suitable for diagnostics.
+        reason: String,
+    },
+}
+
+impl SemanticSupport {
+    /// Returns the diagnostic reason when semantic parsing is unavailable.
+    pub fn unsupported_reason(&self) -> Option<&str> {
+        match self {
+            Self::Supported => None,
+            Self::Unsupported { reason } => Some(reason),
+        }
+    }
+}
+
+/// Support status for one independently gated chat capability.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CapabilitySupport {
+    /// The capability was established from protocol evidence.
+    Supported,
+    /// The capability was not established.
+    Unsupported {
+        /// Human-readable explanation suitable for diagnostics.
+        reason: String,
+    },
+}
+
+impl CapabilitySupport {
+    /// Returns whether this capability is supported.
+    pub fn is_supported(&self) -> bool {
+        matches!(self, Self::Supported)
+    }
+
+    /// Returns the diagnostic reason when unsupported.
+    pub fn unsupported_reason(&self) -> Option<&str> {
+        match self {
+            Self::Supported => None,
+            Self::Unsupported { reason } => Some(reason),
+        }
+    }
+}
+
+/// Independently recognized chat protocol capabilities.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChatCapabilities {
+    /// Structural reasoning-channel parsing.
+    pub reasoning_parser: CapabilitySupport,
+    /// Visible assistant-text parsing.
+    pub visible_text_parser: CapabilitySupport,
+    /// Generated tool-call envelope parsing.
+    pub tool_output_parser: CapabilitySupport,
+    /// Tool-call and tool-response history rendering.
+    pub tool_input_rendering: CapabilitySupport,
+    /// Rendering tool-call history whose arguments are JSON mappings.
+    pub mapping_tool_arguments: CapabilitySupport,
+    /// Rendering tool-call history whose arguments are serialized JSON strings.
+    pub string_tool_arguments: CapabilitySupport,
+    /// Schema-constrained native tool generation.
+    pub constrained_tool_generation: CapabilitySupport,
+}
+
 /// A rendered chat prompt together with generation and parsing metadata.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PreparedChat {
@@ -291,6 +460,10 @@ pub struct PreparedChat {
     pub(crate) format_profile_identity: Option<String>,
     /// Native tool capability for the selected template and profile.
     pub(crate) native_tool_support: NativeToolSupport,
+    /// Semantic response parsing capability, independent of tool constraints.
+    pub(crate) semantic_support: SemanticSupport,
+    pub(crate) capabilities: ChatCapabilities,
+    pub(crate) semantic_runtime_plan: Option<SemanticRuntimePlan>,
     pub(crate) tool_runtime_plan: Option<ToolRuntimePlan>,
     /// Checkpoint EOS token IDs used to stop generation.
     pub(crate) eos_token_ids: Vec<u32>,
@@ -326,6 +499,20 @@ impl PreparedChat {
         &self.native_tool_support
     }
 
+    /// Returns semantic response parsing capability for the selected protocol.
+    pub fn semantic_support(&self) -> &SemanticSupport {
+        &self.semantic_support
+    }
+
+    /// Returns independently gated protocol capabilities.
+    pub fn capabilities(&self) -> &ChatCapabilities {
+        &self.capabilities
+    }
+
+    pub(crate) fn semantic_runtime_plan(&self) -> Option<&SemanticRuntimePlan> {
+        self.semantic_runtime_plan.as_ref()
+    }
+
     pub(crate) fn tool_runtime_plan(&self) -> Option<&ToolRuntimePlan> {
         self.tool_runtime_plan.as_ref()
     }
@@ -351,11 +538,18 @@ pub(crate) struct PreparedFormatProfile {
     pub(crate) identity: Option<String>,
     pub(crate) dialect: Option<&'static dyn FormatDialect>,
     pub(crate) dialect_parameters: Option<DialectParameters>,
+    pub(crate) tool_dialect: Option<&'static dyn FormatDialect>,
+    pub(crate) tool_dialect_parameters: Option<DialectParameters>,
     pub(crate) generation_prompt_behavior: GenerationPromptBehavior,
     pub(crate) reasoning_template_kwarg: &'static str,
+    pub(crate) supports_reasoning_parsing: bool,
     pub(crate) supports_tool_reasoning: bool,
+    pub(crate) supports_tool_input_rendering: bool,
+    pub(crate) supports_mapping_tool_arguments: bool,
+    pub(crate) supports_string_tool_arguments: bool,
     pub(crate) native_tool_unavailable_reason: Option<String>,
     pub(crate) required_structural_tokens: Vec<String>,
+    pub(crate) tool_required_structural_tokens: Vec<String>,
     pub(crate) stop_sequences: Vec<String>,
 }
 
@@ -645,10 +839,12 @@ const NEMOTRON_NANO_V2_TEMPLATE_SIGNATURE: [u8; 32] = [
     0xb7, 0xa3, 0xa5, 0x20, 0xa4, 0xbc, 0x1b, 0xea, 0xe6, 0xa2, 0x5d, 0x61, 0x5f, 0x92, 0x15, 0x58,
     0x0d, 0xf8, 0xee, 0xa9, 0x26, 0xf4, 0x88, 0x25, 0x6c, 0x2b, 0xef, 0x74, 0x03, 0x94, 0x33, 0xc0,
 ];
+#[cfg(test)]
 const GEMMA4_EDGE_TEMPLATE_SIGNATURE: [u8; 32] = [
     0x0a, 0x2c, 0x80, 0x73, 0xc8, 0x78, 0xab, 0x1d, 0xa0, 0x04, 0xbe, 0xe9, 0x33, 0xa9, 0x98, 0x60,
     0x65, 0x37, 0xbb, 0xb6, 0x20, 0x16, 0x31, 0x03, 0x52, 0xc7, 0x28, 0x5c, 0x3f, 0x01, 0xc5, 0xb5,
 ];
+#[cfg(test)]
 const GEMMA4_LARGE_TEMPLATE_SIGNATURE: [u8; 32] = [
     0xae, 0x53, 0x46, 0x4b, 0xf3, 0xbe, 0x25, 0x80, 0x2b, 0x3a, 0x5b, 0x37, 0xde, 0xf7, 0xfd, 0x89,
     0x66, 0x70, 0x67, 0xd7, 0x57, 0x70, 0x49, 0xb3, 0xb2, 0xd7, 0x4c, 0x4d, 0x8d, 0xe4, 0xc6, 0xd4,
@@ -690,7 +886,13 @@ const DEEPSEEK_V31_TOOL_TEMPLATE_SIGNATURE: [u8; 32] = [
     0xce, 0x85, 0xdc, 0xf1, 0x46, 0x73, 0x0b, 0x69, 0x80, 0x99, 0x91, 0xca, 0xb6, 0x69, 0x63, 0x95,
 ];
 
-const GEMMA4_STRUCTURAL_TOOL_SPEC: DeclarativeDialectSpec = DeclarativeDialectSpec {
+#[cfg(test)]
+const UNSLOTH_GEMMA4_TEMPLATE_SIGNATURE: [u8; 32] = [
+    0x94, 0x89, 0x9c, 0x0f, 0x91, 0x7d, 0x93, 0xf6, 0xfe, 0x81, 0xc9, 0x57, 0x44, 0xd1, 0xe8, 0xdd,
+    0xab, 0x2d, 0x21, 0xd3, 0x92, 0x28, 0xd2, 0xe4, 0xae, 0xc1, 0xfb, 0x2a, 0x25, 0xbf, 0xf4, 0x13,
+];
+
+pub(crate) const GEMMA4_STRUCTURAL_TOOL_SPEC: DeclarativeDialectSpec = DeclarativeDialectSpec {
     generation_prompt_behavior: GenerationPromptBehavior::HonorRequest,
     reasoning_template_kwarg: "enable_thinking",
     supports_tool_reasoning: true,
@@ -836,18 +1038,6 @@ const FORMAT_REGISTRY: &[FormatRegistryEntry] = &[
         parameters: DialectParameters::Declarative(&NEMOTRON_NANO_V2_JSON_LIST_TOOL_SPEC),
     },
     FormatRegistryEntry {
-        identity: "google.gemma4.edge.structural-tools.0a2c8073",
-        template_signature: GEMMA4_EDGE_TEMPLATE_SIGNATURE,
-        dialect: &DECLARATIVE_DIALECT,
-        parameters: DialectParameters::Declarative(&GEMMA4_STRUCTURAL_TOOL_SPEC),
-    },
-    FormatRegistryEntry {
-        identity: "google.gemma4.large.structural-tools.ae53464b",
-        template_signature: GEMMA4_LARGE_TEMPLATE_SIGNATURE,
-        dialect: &DECLARATIVE_DIALECT,
-        parameters: DialectParameters::Declarative(&GEMMA4_STRUCTURAL_TOOL_SPEC),
-    },
-    FormatRegistryEntry {
         identity: "openai.gpt-oss.harmony.a4c9919c",
         template_signature: GPT_OSS_HARMONY_CURRENT_TEMPLATE_SIGNATURE,
         dialect: &HARMONY_DIALECT,
@@ -934,13 +1124,20 @@ pub(crate) fn prepare_format_profile_with_registry(
             identity: None,
             dialect: None,
             dialect_parameters: None,
+            tool_dialect: None,
+            tool_dialect_parameters: None,
             generation_prompt_behavior: GenerationPromptBehavior::HonorRequest,
             reasoning_template_kwarg: "enable_thinking",
+            supports_reasoning_parsing: false,
             supports_tool_reasoning: true,
+            supports_tool_input_rendering: false,
+            supports_mapping_tool_arguments: false,
+            supports_string_tool_arguments: false,
             native_tool_unavailable_reason: Some(
                 "no registered format profile matches the selected chat template".into(),
             ),
             required_structural_tokens: Vec::new(),
+            tool_required_structural_tokens: Vec::new(),
             stop_sequences: Vec::new(),
         },
         [entry] => {
@@ -967,11 +1164,23 @@ pub(crate) fn prepare_format_profile_with_registry(
                     identity: Some(entry.identity.to_owned()),
                     dialect: Some(entry.dialect),
                     dialect_parameters: Some(entry.parameters),
+                    tool_dialect: Some(entry.dialect),
+                    tool_dialect_parameters: Some(entry.parameters),
                     generation_prompt_behavior,
                     reasoning_template_kwarg,
+                    supports_reasoning_parsing: entry
+                        .dialect
+                        .supports_reasoning_parsing(entry.parameters),
                     supports_tool_reasoning,
+                    supports_tool_input_rendering: true,
+                    supports_mapping_tool_arguments: true,
+                    supports_string_tool_arguments: false,
                     native_tool_unavailable_reason: None,
                     required_structural_tokens: structural_tokens
+                        .iter()
+                        .map(|token| (*token).to_owned())
+                        .collect(),
+                    tool_required_structural_tokens: structural_tokens
                         .iter()
                         .map(|token| (*token).to_owned())
                         .collect(),
@@ -998,14 +1207,21 @@ pub(crate) fn prepare_format_profile_with_registry(
                         identity: Some(entry.identity.to_owned()),
                         dialect: None,
                         dialect_parameters: None,
+                        tool_dialect: None,
+                        tool_dialect_parameters: None,
                         generation_prompt_behavior: GenerationPromptBehavior::HonorRequest,
                         reasoning_template_kwarg: "enable_thinking",
+                        supports_reasoning_parsing: false,
                         supports_tool_reasoning: true,
+                        supports_tool_input_rendering: false,
+                        supports_mapping_tool_arguments: false,
+                        supports_string_tool_arguments: false,
                         native_tool_unavailable_reason: Some(format!(
                             "format profile {:?} is invalid: {reason}",
                             entry.identity
                         )),
                         required_structural_tokens: Vec::new(),
+                        tool_required_structural_tokens: Vec::new(),
                         stop_sequences: Vec::new(),
                     }
                 }
@@ -1015,13 +1231,20 @@ pub(crate) fn prepare_format_profile_with_registry(
             identity: None,
             dialect: None,
             dialect_parameters: None,
+            tool_dialect: None,
+            tool_dialect_parameters: None,
             generation_prompt_behavior: GenerationPromptBehavior::HonorRequest,
             reasoning_template_kwarg: "enable_thinking",
+            supports_reasoning_parsing: false,
             supports_tool_reasoning: true,
+            supports_tool_input_rendering: false,
+            supports_mapping_tool_arguments: false,
+            supports_string_tool_arguments: false,
             native_tool_unavailable_reason: Some(
                 "multiple registered format profiles match the selected chat template".into(),
             ),
             required_structural_tokens: Vec::new(),
+            tool_required_structural_tokens: Vec::new(),
             stop_sequences: Vec::new(),
         },
     }
@@ -1095,20 +1318,20 @@ mod tests {
         DECLARATIVE_DIALECT, DEEPSEEK31_STRUCTURAL_JSON_TOOL_SPEC,
         DEEPSEEK_STRUCTURAL_JSON_TOOL_SPEC, DEEPSEEK_V31_TOOL_TEMPLATE_SIGNATURE,
         DEEPSEEK_V3_TOOL_TEMPLATE_SIGNATURE, FORMAT_REGISTRY, GEMMA4_EDGE_TEMPLATE_SIGNATURE,
-        GEMMA4_LARGE_TEMPLATE_SIGNATURE, GEMMA4_STRUCTURAL_TOOL_SPEC,
-        GPT_OSS_HARMONY_CURRENT_TEMPLATE_SIGNATURE, GPT_OSS_HARMONY_ESCAPED_TEMPLATE_SIGNATURE,
-        GPT_OSS_HARMONY_INITIAL_TEMPLATE_SIGNATURE, HERMES2_PRO_TOOL_USE_TEMPLATE_SIGNATURE,
-        LFM25_8B_TEMPLATE_SIGNATURE, LFM25_VL_TEMPLATE_SIGNATURE,
-        LFM2_CLASSIC_COMPACT_TEMPLATE_SIGNATURE, LFM2_CLASSIC_TEMPLATE_SIGNATURE,
-        LLAMA31_33_TEMPLATE_SIGNATURE, LLAMA32_TEMPLATE_SIGNATURE, LLAMA3_JSON_TOOL_SPEC,
-        LLAMA4_JSON_TOOL_SPEC, LLAMA4_TEMPLATE_SIGNATURE, MINISTRAL8_2410_TEMPLATE_SIGNATURE,
-        MINISTRAL_JSON_LIST_TOOL_SPEC, MISTRAL7_V03_TEMPLATE_SIGNATURE,
-        MISTRAL_JSON_LIST_TOOL_SPEC, NEMOTRON_NANO_JSON_LIST_TOOL_SPEC,
-        NEMOTRON_NANO_TEMPLATE_SIGNATURE, NEMOTRON_NANO_V2_JSON_LIST_TOOL_SPEC,
-        NEMOTRON_NANO_V2_TEMPLATE_SIGNATURE, QWEN25_TEMPLATE_SIGNATURE,
-        QWEN3_TEMPLATE_16706FC5_SIGNATURE, QWEN3_TEMPLATE_7E4AE267_SIGNATURE,
-        QWEN3_VL_TEMPLATE_SIGNATURE, QWEN3_XML_TOOL_SPEC, QWEN_XML_TOOL_SPEC,
-        SYNTHETIC_DECLARATIVE_SPEC, SYNTHETIC_TOOL_TEMPLATE, SYNTHETIC_TOOL_TEMPLATE_SIGNATURE,
+        GEMMA4_LARGE_TEMPLATE_SIGNATURE, GPT_OSS_HARMONY_CURRENT_TEMPLATE_SIGNATURE,
+        GPT_OSS_HARMONY_ESCAPED_TEMPLATE_SIGNATURE, GPT_OSS_HARMONY_INITIAL_TEMPLATE_SIGNATURE,
+        HERMES2_PRO_TOOL_USE_TEMPLATE_SIGNATURE, LFM25_8B_TEMPLATE_SIGNATURE,
+        LFM25_VL_TEMPLATE_SIGNATURE, LFM2_CLASSIC_COMPACT_TEMPLATE_SIGNATURE,
+        LFM2_CLASSIC_TEMPLATE_SIGNATURE, LLAMA31_33_TEMPLATE_SIGNATURE, LLAMA32_TEMPLATE_SIGNATURE,
+        LLAMA3_JSON_TOOL_SPEC, LLAMA4_JSON_TOOL_SPEC, LLAMA4_TEMPLATE_SIGNATURE,
+        MINISTRAL8_2410_TEMPLATE_SIGNATURE, MINISTRAL_JSON_LIST_TOOL_SPEC,
+        MISTRAL7_V03_TEMPLATE_SIGNATURE, MISTRAL_JSON_LIST_TOOL_SPEC,
+        NEMOTRON_NANO_JSON_LIST_TOOL_SPEC, NEMOTRON_NANO_TEMPLATE_SIGNATURE,
+        NEMOTRON_NANO_V2_JSON_LIST_TOOL_SPEC, NEMOTRON_NANO_V2_TEMPLATE_SIGNATURE,
+        QWEN25_TEMPLATE_SIGNATURE, QWEN3_TEMPLATE_16706FC5_SIGNATURE,
+        QWEN3_TEMPLATE_7E4AE267_SIGNATURE, QWEN3_VL_TEMPLATE_SIGNATURE, QWEN3_XML_TOOL_SPEC,
+        QWEN_XML_TOOL_SPEC, SYNTHETIC_DECLARATIVE_SPEC, SYNTHETIC_TOOL_TEMPLATE,
+        SYNTHETIC_TOOL_TEMPLATE_SIGNATURE, UNSLOTH_GEMMA4_TEMPLATE_SIGNATURE,
     };
     use crate::architectures::{
         gpt_oss::format::GPT_OSS_HARMONY_PARAMETERS, lfm2::format::LFM2_PARAMETERS,
@@ -1146,6 +1369,9 @@ mod tests {
         include_str!("../../../tests/fixtures/chat_templates/gemma-4-e2b-it-3e22461f.jinja");
     const GEMMA4_LARGE_FIXTURE: &str =
         include_str!("../../../tests/fixtures/chat_templates/gemma-4-26b-a4b-it-4d7ae498.jinja");
+    const UNSLOTH_GEMMA4_FIXTURE_WITH_TERMINATOR: &str = include_str!(
+        "../../../tests/fixtures/chat_templates/unsloth-gemma-4-26b-a4b-it-94899c0f.jinja"
+    );
     const GPT_OSS_HARMONY_CURRENT_FIXTURE_WITH_TERMINATOR: &str =
         include_str!("../../../tests/fixtures/chat_templates/gpt-oss-harmony-a4c9919c.jinja");
     const GPT_OSS_HARMONY_ESCAPED_FIXTURE_WITH_TERMINATOR: &str =
@@ -1297,16 +1523,6 @@ mod tests {
                 "nvidia.nemotron-nano-v2.json-list-tools.b7a3a520",
             ),
             (
-                GEMMA4_EDGE_FIXTURE,
-                GEMMA4_EDGE_TEMPLATE_SIGNATURE,
-                "google.gemma4.edge.structural-tools.0a2c8073",
-            ),
-            (
-                GEMMA4_LARGE_FIXTURE,
-                GEMMA4_LARGE_TEMPLATE_SIGNATURE,
-                "google.gemma4.large.structural-tools.ae53464b",
-            ),
-            (
                 strip_fixture_terminator(GPT_OSS_HARMONY_CURRENT_FIXTURE_WITH_TERMINATOR),
                 GPT_OSS_HARMONY_CURRENT_TEMPLATE_SIGNATURE,
                 "openai.gpt-oss.harmony.a4c9919c",
@@ -1371,6 +1587,27 @@ mod tests {
     }
 
     #[test]
+    fn gemma_template_hashes_are_audit_provenance_not_runtime_keys() {
+        for (template, expected_signature) in [
+            (GEMMA4_EDGE_FIXTURE, GEMMA4_EDGE_TEMPLATE_SIGNATURE),
+            (GEMMA4_LARGE_FIXTURE, GEMMA4_LARGE_TEMPLATE_SIGNATURE),
+        ] {
+            assert_eq!(template_signature(template), expected_signature);
+            assert!(matching_registry_entries(template, FORMAT_REGISTRY).is_empty());
+            assert!(prepare_format_profile(template).dialect.is_none());
+        }
+        let unsloth = UNSLOTH_GEMMA4_FIXTURE_WITH_TERMINATOR
+            .strip_suffix('\n')
+            .expect("the fixture-only file terminator is documented");
+        assert_eq!(
+            template_signature(unsloth),
+            UNSLOTH_GEMMA4_TEMPLATE_SIGNATURE
+        );
+        assert!(matching_registry_entries(unsloth, FORMAT_REGISTRY).is_empty());
+        assert!(prepare_format_profile(unsloth).dialect.is_none());
+    }
+
+    #[test]
     fn every_registered_response_format_has_cross_dialect_golden_and_boundary_coverage() {
         let covered = [
             DialectParameters::Declarative(&QWEN_XML_TOOL_SPEC),
@@ -1381,7 +1618,6 @@ mod tests {
             DialectParameters::Declarative(&LLAMA4_JSON_TOOL_SPEC),
             DialectParameters::Declarative(&NEMOTRON_NANO_JSON_LIST_TOOL_SPEC),
             DialectParameters::Declarative(&NEMOTRON_NANO_V2_JSON_LIST_TOOL_SPEC),
-            DialectParameters::Declarative(&GEMMA4_STRUCTURAL_TOOL_SPEC),
             DialectParameters::Custom(&GPT_OSS_HARMONY_PARAMETERS),
             DialectParameters::Custom(&LFM2_PARAMETERS),
             DialectParameters::Declarative(&DEEPSEEK_STRUCTURAL_JSON_TOOL_SPEC),
@@ -1576,40 +1812,6 @@ mod tests {
         ] {
             assert!(prepare_format_profile(&modified).dialect.is_none());
         }
-
-        for (template, signature, identity) in [
-            (
-                GEMMA4_EDGE_FIXTURE,
-                GEMMA4_EDGE_TEMPLATE_SIGNATURE,
-                "google.gemma4.edge.structural-tools.0a2c8073",
-            ),
-            (
-                GEMMA4_LARGE_FIXTURE,
-                GEMMA4_LARGE_TEMPLATE_SIGNATURE,
-                "google.gemma4.large.structural-tools.ae53464b",
-            ),
-        ] {
-            assert_eq!(template_signature(template), signature, "{identity}");
-            let prepared = prepare_format_profile(template);
-            assert_eq!(prepared.identity.as_deref(), Some(identity));
-            assert!(prepared.dialect.is_some(), "{identity}");
-            assert_eq!(
-                prepared.required_structural_tokens,
-                [
-                    "<|channel>",
-                    "<channel|>",
-                    "<|tool_call>",
-                    "<tool_call|>",
-                    "<|\"|>",
-                    "<|tool_response>",
-                    "<turn|>",
-                ]
-            );
-            assert_eq!(prepared.stop_sequences, ["<|tool_response>", "<turn|>"]);
-        }
-
-        let modified = format!("{GEMMA4_EDGE_FIXTURE} ");
-        assert!(prepare_format_profile(&modified).dialect.is_none());
 
         for (template, signature, identity, reasoning_kwarg) in [
             (

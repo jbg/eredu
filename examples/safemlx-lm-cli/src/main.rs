@@ -25,7 +25,9 @@ use safemlx_lm::{
         PreparedChatMtpGenerationOptions, PreparedChatMtpGenerationRequest, TextDecoder,
     },
     error::Error as LmError,
-    runtime::chat::{ChatTemplateRequest, NativeToolSupport, ParallelToolCallPolicy, ToolChoice},
+    runtime::chat::{
+        ChatTemplateRequest, NativeToolSupport, ParallelToolCallPolicy, SemanticSupport, ToolChoice,
+    },
     runtime::checkpoint::quantization::AffineQuantization,
     runtime::execution::layerwise::{LayerwiseLoadOptions, WeightResidency},
     runtime::generation::sampler::{
@@ -287,6 +289,10 @@ struct Cli {
     #[arg(long, value_name = "REVISION")]
     revision: Option<String>,
 
+    /// Explicitly permit target and draft GGUFs from different cached commits.
+    #[arg(long)]
+    allow_mixed_revisions: bool,
+
     /// Maximum number of tokens to generate. Generation stops earlier at EOS.
     #[arg(short = 'n', long, default_value_t = 256, value_name = "TOKENS")]
     max_tokens: usize,
@@ -434,6 +440,10 @@ struct Cli {
     #[arg(long, value_enum, default_value_t = ThinkingMode::Auto)]
     thinking: ThinkingMode,
 
+    /// Allow `--thinking on` to fall back to unparsed raw response text.
+    #[arg(long)]
+    allow_unparsed_reasoning: bool,
+
     /// Print model resolution and generation statistics to stderr.
     #[arg(short, long)]
     verbose: bool,
@@ -540,13 +550,22 @@ fn write_semantic_event(
     Ok(())
 }
 
-fn use_semantic_generation(support: &NativeToolSupport, tools_requested: bool) -> Result<bool> {
-    match support {
-        NativeToolSupport::Supported => Ok(true),
-        NativeToolSupport::Unsupported { reason } if tools_requested => {
-            bail!("native tool calling is unavailable: {reason}")
-        }
-        NativeToolSupport::Unsupported { .. } => Ok(false),
+fn use_semantic_generation(
+    semantic_support: &SemanticSupport,
+    tool_support: &NativeToolSupport,
+    tools_requested: bool,
+) -> Result<bool> {
+    if tools_requested {
+        return match tool_support {
+            NativeToolSupport::Supported => Ok(true),
+            NativeToolSupport::Unsupported { reason } => {
+                bail!("native tool calling is unavailable: {reason}")
+            }
+        };
+    }
+    match semantic_support {
+        SemanticSupport::Supported => Ok(true),
+        SemanticSupport::Unsupported { .. } => Ok(false),
     }
 }
 
@@ -567,16 +586,21 @@ fn main() -> Result<()> {
     let args = Cli::parse();
     validate_args(&args)?;
     let prompt = read_prompt(args.prompt.as_deref())?;
-    let model_path = resolve_model(
+    let resolved_model = resolve_model(
         &args.model,
         args.revision.as_deref(),
         CachedGgufRole::Target,
     )?;
-    let draft_model_path = args
+    let resolved_draft = args
         .draft_model
         .as_deref()
         .map(|source| resolve_model(source, args.revision.as_deref(), CachedGgufRole::MtpDraft))
         .transpose()?;
+    if let Some(draft) = &resolved_draft {
+        validate_artifact_pair(&resolved_model, draft, args.allow_mixed_revisions)?;
+    }
+    let model_path = resolved_model.path;
+    let draft_model_path = resolved_draft.map(|artifact| artifact.path);
 
     if args.verbose {
         eprintln!("--- safemlx diagnostics (stderr) ---");
@@ -738,13 +762,17 @@ fn main() -> Result<()> {
                 None => ParallelToolCallPolicy::Disabled,
             },
             enable_thinking: args.thinking.enabled(),
+            allow_unparsed_reasoning: args.allow_unparsed_reasoning,
             add_generation_prompt: true,
             ..ChatTemplateRequest::default()
         };
         match model.prepare_chat(request) {
             Ok(prepared) => {
-                let semantic =
-                    use_semantic_generation(prepared.native_tool_support(), tools_requested)?;
+                let semantic = use_semantic_generation(
+                    prepared.semantic_support(),
+                    prepared.native_tool_support(),
+                    tools_requested,
+                )?;
                 let rendered_prompt = prepared.rendered_prompt().to_owned();
                 if semantic {
                     if args.verbose {
@@ -1478,6 +1506,9 @@ fn validate_args(args: &Cli) -> Result<()> {
     if args.raw && args.thinking != ThinkingMode::Auto {
         bail!("--thinking on/off cannot be used with --raw because raw prompts bypass the chat template");
     }
+    if args.allow_unparsed_reasoning && args.thinking != ThinkingMode::On {
+        bail!("--allow-unparsed-reasoning requires --thinking on");
+    }
     if args.raw && args.tools.is_some() {
         bail!(
             "--tools cannot be used with --raw because raw prompts bypass native tool preparation"
@@ -1549,12 +1580,16 @@ fn resolve_model(
     spec: &str,
     requested_revision: Option<&str>,
     gguf_role: CachedGgufRole,
-) -> Result<PathBuf> {
+) -> Result<ResolvedModel> {
     let path = Path::new(spec);
     if path.exists() {
-        return path
-            .canonicalize()
-            .with_context(|| format!("failed to resolve model path {}", path.display()));
+        return Ok(ResolvedModel {
+            path: path
+                .canonicalize()
+                .with_context(|| format!("failed to resolve model path {}", path.display()))?,
+            repository: None,
+            commit_hash: None,
+        });
     }
 
     let (repo_id, quantization) = split_hf_model_spec(spec)?;
@@ -1576,7 +1611,7 @@ fn resolve_model(
         })?;
     match quantization {
         Some(quantization) => {
-            select_cached_gguf_from_revisions(
+            let path = select_cached_gguf_from_revisions(
                 &repo.revisions,
                 requested_revision,
                 quantization,
@@ -1586,18 +1621,65 @@ fn resolve_model(
                 format!(
                     "could not select GGUF quantization {quantization:?} for Hugging Face model {repo_id:?}"
                 )
+            })?;
+            let commit_hash = repo
+                .revisions
+                .iter()
+                .find(|revision| revision.files.iter().any(|file| file.file_path == path))
+                .map(|revision| revision.commit_hash.clone())
+                .with_context(|| {
+                    format!(
+                        "selected cached artifact {} has no owning revision",
+                        path.display()
+                    )
+                })?;
+            Ok(ResolvedModel {
+                path,
+                repository: Some(repo_id.to_owned()),
+                commit_hash: Some(commit_hash),
             })
         }
         None => {
             let revision =
                 select_revision(&repo.revisions, requested_revision).with_context(|| {
-                    format!(
-                        "could not select a cached revision for Hugging Face model {repo_id:?}"
-                    )
+                    format!("could not select a cached revision for Hugging Face model {repo_id:?}")
                 })?;
-            Ok(revision.snapshot_path.clone())
+            Ok(ResolvedModel {
+                path: revision.snapshot_path.clone(),
+                repository: Some(repo_id.to_owned()),
+                commit_hash: Some(revision.commit_hash.clone()),
+            })
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ResolvedModel {
+    path: PathBuf,
+    repository: Option<String>,
+    commit_hash: Option<String>,
+}
+
+fn validate_artifact_pair(
+    target: &ResolvedModel,
+    draft: &ResolvedModel,
+    allow_mixed_revisions: bool,
+) -> Result<()> {
+    let same_repository = target.repository.is_some() && target.repository == draft.repository;
+    let mixed_commits = target.commit_hash.is_some()
+        && draft.commit_hash.is_some()
+        && target.commit_hash != draft.commit_hash;
+    if same_repository && mixed_commits && !allow_mixed_revisions {
+        bail!(
+            "target artifact {} resolves to cached commit {}, but draft artifact {} resolves to commit {}; refusing to mix revisions from repository {:?} (use --allow-mixed-revisions to override)",
+            target.path.display(),
+            target.commit_hash.as_deref().unwrap_or("unknown"),
+            draft.path.display(),
+            draft.commit_hash.as_deref().unwrap_or("unknown"),
+            target.repository.as_deref().unwrap_or("unknown"),
+        );
+    }
+    Ok(())
 }
 
 fn split_hf_model_spec(spec: &str) -> Result<(&str, Option<&str>)> {
@@ -1822,9 +1904,9 @@ mod tests {
         eval, execution_contexts, format_bytes, select_cached_gguf_from_revisions,
         select_cached_gguf_path, select_revision, should_report_stop_reason, split_hf_model_spec,
         stop_reason, thinking_template_kwargs, use_semantic_generation, validate_args,
-        write_semantic_event, Array, CachedGgufRole, Cli, CliDevice, CliToolChoice, DeviceType,
-        MtpDraftDevice, MtpExecutionStreams, MtpSchedulerOptions, NativeToolSupport, SemanticEvent,
-        StopReason, ThinkingMode,
+        validate_artifact_pair, write_semantic_event, Array, CachedGgufRole, Cli, CliDevice,
+        CliToolChoice, DeviceType, MtpDraftDevice, MtpExecutionStreams, MtpSchedulerOptions,
+        NativeToolSupport, ResolvedModel, SemanticEvent, SemanticSupport, StopReason, ThinkingMode,
     };
 
     fn revision(hash: &str, refs: &[&str], modified: u64) -> CachedRevisionInfo {
@@ -1945,17 +2027,32 @@ mod tests {
 
     #[test]
     fn registered_profiles_use_semantic_generation_without_tools() {
-        assert!(use_semantic_generation(&NativeToolSupport::Supported, false).unwrap());
-        assert!(use_semantic_generation(&NativeToolSupport::Supported, true).unwrap());
+        assert!(use_semantic_generation(
+            &SemanticSupport::Supported,
+            &NativeToolSupport::Supported,
+            false
+        )
+        .unwrap());
+        assert!(use_semantic_generation(
+            &SemanticSupport::Supported,
+            &NativeToolSupport::Supported,
+            true
+        )
+        .unwrap());
 
         let unsupported = NativeToolSupport::Unsupported {
             reason: "unregistered template".into(),
         };
-        assert!(!use_semantic_generation(&unsupported, false).unwrap());
-        assert!(use_semantic_generation(&unsupported, true)
-            .unwrap_err()
-            .to_string()
-            .contains("native tool calling is unavailable"));
+        let semantic_unsupported = SemanticSupport::Unsupported {
+            reason: "unregistered template".into(),
+        };
+        assert!(!use_semantic_generation(&semantic_unsupported, &unsupported, false).unwrap());
+        assert!(
+            use_semantic_generation(&SemanticSupport::Supported, &unsupported, true)
+                .unwrap_err()
+                .to_string()
+                .contains("native tool calling is unavailable")
+        );
     }
 
     #[test]
@@ -2378,6 +2475,28 @@ mod tests {
             CachedGgufRole::Target,
         )
         .is_err());
+    }
+
+    #[test]
+    fn rejects_mixed_target_and_draft_commits_from_one_repository() {
+        let target = ResolvedModel {
+            path: "target.gguf".into(),
+            repository: Some("owner/model".into()),
+            commit_hash: Some("target-commit".into()),
+        };
+        let draft = ResolvedModel {
+            path: "draft.gguf".into(),
+            repository: Some("owner/model".into()),
+            commit_hash: Some("draft-commit".into()),
+        };
+
+        let error = validate_artifact_pair(&target, &draft, false).unwrap_err();
+        assert!(error.to_string().contains("refusing to mix revisions"));
+        validate_artifact_pair(&target, &draft, true).unwrap();
+
+        let mut other_repository = draft;
+        other_repository.repository = Some("owner/assistant".into());
+        validate_artifact_pair(&target, &other_repository, false).unwrap();
     }
 
     #[test]

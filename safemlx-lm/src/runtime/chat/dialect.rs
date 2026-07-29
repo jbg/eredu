@@ -95,6 +95,10 @@ pub(crate) trait FormatDialect: fmt::Debug + Send + Sync {
         Ok("enable_thinking")
     }
 
+    fn supports_reasoning_parsing(&self, _parameters: DialectParameters) -> bool {
+        false
+    }
+
     fn supports_tool_reasoning(&self, _parameters: DialectParameters) -> Result<bool, String> {
         Ok(true)
     }
@@ -1014,6 +1018,12 @@ impl FormatDialect for DeclarativeDialect {
         parameters: DialectParameters,
     ) -> Result<&'static str, String> {
         Ok(Self::spec(parameters)?.reasoning_template_kwarg)
+    }
+
+    fn supports_reasoning_parsing(&self, parameters: DialectParameters) -> bool {
+        Self::spec(parameters)
+            .ok()
+            .is_some_and(|spec| spec.reasoning_channel.is_some())
     }
 
     fn supports_tool_reasoning(&self, parameters: DialectParameters) -> Result<bool, String> {
