@@ -49,8 +49,11 @@ jobs:
         run: cargo test -p safemlx --lib --no-run
       - name: Check the Linux workspace
         run: cargo check --workspace
-      - name: Test native tool calling and language-model runtime
-        run: cargo test --locked -p safemlx-lm --lib
+      - name: Test CPU-safe native tool calling
+        run: |
+          cargo test --locked -p safemlx-lm --lib api::tests::production_
+          cargo test --locked -p safemlx-lm --lib runtime::chat::
+          cargo test --locked -p safemlx-lm --lib runtime::generation::streaming::tests::
 
   cuda-build:
     runs-on: ubuntu-22.04
