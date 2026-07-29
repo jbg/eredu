@@ -9,9 +9,9 @@ use std::{
 use safemlx::{random::RandomState, Array, Device, DeviceType, Dtype, ExecutionContext, Stream};
 use safemlx_codec::mimi::Mimi;
 use safemlx_lm::{
-    models::{moshi, personaplex},
-    realtime::RealtimeSpeechModel,
-    sampler::{DefaultSampler, GenerationSampler},
+    api::realtime::RealtimeSpeechModel,
+    architectures::moshi::{model as moshi, personaplex},
+    runtime::generation::sampler::{DefaultSampler, GenerationSampler},
 };
 use sentencepiece_rs::SentencePieceProcessor;
 use serde::Serialize;
