@@ -40,8 +40,12 @@ use std::{
 use tokenizers::{models::wordlevel::WordLevel, AddedToken, Tokenizer};
 
 static TEMP_DIR_COUNTER: AtomicUsize = AtomicUsize::new(0);
+const QWEN25_FIXTURE: &str =
+    include_str!("../../tests/fixtures/chat_templates/qwen2.5-7b-instruct-acbd9653.jinja");
 const QWEN3_CURRENT_FIXTURE_WITH_TERMINATOR: &str =
     include_str!("../../tests/fixtures/chat_templates/qwen3-0.6b-7e4ae267.jinja");
+const QWEN3_OLDER_TOKENIZER_CONFIG: &str =
+    include_str!("../../../safemlx-lm-utils/tests/fixtures/qwen3/tokenizer_config.json");
 const QWEN3_VL_FIXTURE: &str =
     include_str!("../../tests/fixtures/chat_templates/qwen3-vl-2b-instruct-89644892.jinja");
 const HERMES2_PRO_TOOL_USE_FIXTURE: &str = include_str!(
@@ -70,6 +74,10 @@ const UNSLOTH_GEMMA4_FIXTURE_WITH_TERMINATOR: &str =
     include_str!("../../tests/fixtures/chat_templates/unsloth-gemma-4-26b-a4b-it-94899c0f.jinja");
 const GPT_OSS_HARMONY_CURRENT_FIXTURE_WITH_TERMINATOR: &str =
     include_str!("../../tests/fixtures/chat_templates/gpt-oss-harmony-a4c9919c.jinja");
+const GPT_OSS_HARMONY_ESCAPED_FIXTURE_WITH_TERMINATOR: &str =
+    include_str!("../../tests/fixtures/chat_templates/gpt-oss-harmony-b474759b.jinja");
+const GPT_OSS_HARMONY_INITIAL_FIXTURE_WITH_TERMINATOR: &str =
+    include_str!("../../tests/fixtures/chat_templates/gpt-oss-harmony-f8d92557.jinja");
 const LFM2_CLASSIC_FIXTURE_WITH_TERMINATOR: &str =
     include_str!("../../tests/fixtures/chat_templates/lfm2-classic-b3afba27.jinja");
 const LFM25_8B_FIXTURE_WITH_TERMINATOR: &str =
@@ -662,7 +670,7 @@ fn prepares_prompt_and_generation_contribution_separately() {
     assert!(matches!(
         prepared.native_tool_support(),
         NativeToolSupport::Unsupported { reason }
-            if reason.contains("no registered format profile")
+            if reason.contains("no behavioral format recognizer")
     ));
 }
 
@@ -777,7 +785,7 @@ fn production_qwen_profile_renders_history_generation_prompt_and_dynamic_tokens(
 
         assert_eq!(
             prepared.format_profile_identity(),
-            Some("qwen.qwen3.xml-tools.7e4ae267")
+            Some("qwen.xml-tools.reasoning.v1")
         );
         assert_eq!(
             prepared.generation_prompt(),
@@ -830,10 +838,7 @@ fn production_qwen_vl_and_named_hermes_templates_prepare_without_architecture_ke
         },
     )
     .unwrap();
-    assert_eq!(
-        qwen_vl.format_profile_identity(),
-        Some("qwen.qwen3-vl.xml-tools.89644892")
-    );
+    assert_eq!(qwen_vl.format_profile_identity(), Some("xml-tools.v1"));
     assert_eq!(qwen_vl.generation_prompt(), "<|im_start|>assistant\n");
     assert!(qwen_vl
         .rendered_prompt()
@@ -880,10 +885,7 @@ fn production_qwen_vl_and_named_hermes_templates_prepare_without_architecture_ke
         hermes.template_identity(),
         &ChatTemplateIdentity::Named("tool_use".into())
     );
-    assert_eq!(
-        hermes.format_profile_identity(),
-        Some("hermes.xml-tools.7ce09d55")
-    );
+    assert_eq!(hermes.format_profile_identity(), Some("xml-tools.v1"));
     assert_eq!(hermes.generation_prompt(), "<|im_start|>assistant\n");
     assert!(hermes.rendered_prompt().contains(
         "<tool_call>\n{\"name\": \"lookup\", \"arguments\": {\"value\":1}}\n</tool_call>"
@@ -891,6 +893,165 @@ fn production_qwen_vl_and_named_hermes_templates_prepare_without_architecture_ke
     assert!(hermes
         .rendered_prompt()
         .contains("<tool_response>\n{\"result\":1}\n</tool_response>"));
+}
+
+#[test]
+fn behavioral_recognition_survives_nonsemantic_template_refactors() {
+    fn prepare(tokenizer: &mut ChatTokenizer, template: String, expected_identity: &str) {
+        let compiler = Ok(ConstraintCompiler::synthetic_for_tests());
+        let prepared = prepare_chat_from_parts(
+            tokenizer,
+            ModelChatTemplate::Single(template),
+            "architecture-metadata-is-not-a-recognition-key",
+            &[],
+            Some(&compiler),
+            ChatTemplateRequest {
+                messages: vec![json!({"role": "user", "content": "Use a tool."})],
+                tools: vec![production_tool("lookup")],
+                tool_choice: ToolChoice::Auto,
+                add_generation_prompt: true,
+                ..ChatTemplateRequest::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(prepared.format_profile_identity(), Some(expected_identity));
+        assert!(prepared.tool_runtime_plan().is_some());
+    }
+
+    let qwen3_current = QWEN3_CURRENT_FIXTURE_WITH_TERMINATOR
+        .strip_suffix('\n')
+        .unwrap();
+    let qwen3_older_config: serde_json::Value =
+        serde_json::from_str(QWEN3_OLDER_TOKENIZER_CONFIG).unwrap();
+    let qwen3_older = qwen3_older_config["chat_template"].as_str().unwrap();
+    for (template, identity) in [
+        (QWEN25_FIXTURE, "xml-tools.v1"),
+        (qwen3_older, "qwen.xml-tools.reasoning.v1"),
+        (qwen3_current, "qwen.xml-tools.reasoning.v1"),
+        (QWEN3_VL_FIXTURE, "xml-tools.v1"),
+        (HERMES2_PRO_TOOL_USE_FIXTURE, "xml-tools.v1"),
+    ] {
+        prepare(
+            &mut production_chat_tokenizer(7),
+            format!("{template}\n{{# nonsemantic converter refactor #}}"),
+            identity,
+        );
+    }
+
+    for fixture in [
+        GPT_OSS_HARMONY_CURRENT_FIXTURE_WITH_TERMINATOR,
+        GPT_OSS_HARMONY_ESCAPED_FIXTURE_WITH_TERMINATOR,
+        GPT_OSS_HARMONY_INITIAL_FIXTURE_WITH_TERMINATOR,
+    ] {
+        let template = fixture.strip_suffix('\n').unwrap();
+        prepare(
+            &mut harmony_chat_tokenizer(11),
+            format!("{template}\n{{# nonsemantic converter refactor #}}"),
+            "harmony.channels.v1",
+        );
+    }
+
+    for fixture in [
+        LFM25_8B_FIXTURE_WITH_TERMINATOR,
+        LFM25_VL_FIXTURE_WITH_TERMINATOR,
+    ] {
+        let template = fixture.strip_suffix('\n').unwrap();
+        prepare(
+            &mut lfm2_chat_tokenizer(13),
+            format!("{template}\n{{# nonsemantic converter refactor #}}"),
+            "lfm2.python-tools.v1",
+        );
+    }
+
+    for (template, identity) in [
+        (MISTRAL7_V03_FIXTURE, "mistral.json-list-tools.v1"),
+        (
+            MINISTRAL8_2410_FIXTURE,
+            "mistral.json-list-tools.compact.v1",
+        ),
+    ] {
+        prepare(
+            &mut mistral_chat_tokenizer(17),
+            format!("{template}\n{{# nonsemantic converter refactor #}}"),
+            identity,
+        );
+    }
+
+    for (template, structural_tokens, identity) in [
+        (
+            LLAMA31_33_FIXTURE,
+            &["<|eot_id|>"][..],
+            "llama.json-tools.v1",
+        ),
+        (LLAMA32_FIXTURE, &["<|eot_id|>"][..], "llama.json-tools.v1"),
+        (
+            LLAMA4_FIXTURE,
+            &["<|python_start|>", "<|python_end|>", "<|eot|>"][..],
+            "llama.python-channel-tools.v1",
+        ),
+    ] {
+        prepare(
+            &mut llama_chat_tokenizer(19, structural_tokens),
+            format!("{template}\n{{# nonsemantic converter refactor #}}"),
+            identity,
+        );
+    }
+
+    let nemotron = NEMOTRON_NANO_FIXTURE_WITH_TERMINATOR
+        .strip_suffix('\n')
+        .unwrap();
+    prepare(
+        &mut llama_chat_tokenizer(23, &["<|eot_id|>"]),
+        format!("{nemotron}\n{{# nonsemantic converter refactor #}}"),
+        "nemotron.json-list-tools.v1",
+    );
+    let nemotron_v2 = NEMOTRON_NANO_V2_FIXTURE_WITH_TERMINATOR
+        .strip_suffix('\n')
+        .unwrap();
+    prepare(
+        &mut llama_chat_tokenizer(29, &["<SPECIAL_12>"]),
+        format!("{nemotron_v2}\n{{# nonsemantic converter refactor #}}"),
+        "nemotron.json-list-tools.reasoning.v1",
+    );
+
+    for (template, identity) in [
+        (
+            DEEPSEEK_V3_TOOL_FIXTURE,
+            "deepseek.structural-json-tools.v1",
+        ),
+        (
+            DEEPSEEK_V31_TOOL_FIXTURE,
+            "deepseek.structural-json-tools.v2",
+        ),
+    ] {
+        prepare(
+            &mut deepseek_chat_tokenizer(31),
+            format!("{template}\n{{# nonsemantic converter refactor #}}"),
+            identity,
+        );
+    }
+}
+
+#[test]
+fn behavioral_recognition_rejects_changed_wire_envelopes() {
+    let changed = QWEN25_FIXTURE.replace("<tool_call>", "<tool_invoke>");
+    let prepared = prepare_chat_from_parts(
+        &mut production_chat_tokenizer(5),
+        ModelChatTemplate::Single(changed),
+        "qwen",
+        &[],
+        Some(&Ok(ConstraintCompiler::synthetic_for_tests())),
+        ChatTemplateRequest {
+            messages: vec![json!({"role": "user", "content": "Use a tool."})],
+            tools: vec![production_tool("lookup")],
+            tool_choice: ToolChoice::Auto,
+            add_generation_prompt: true,
+            ..ChatTemplateRequest::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(prepared.format_profile_identity(), None);
+    assert!(prepared.tool_runtime_plan().is_none());
 }
 
 #[test]
@@ -925,7 +1086,7 @@ fn production_mistral_json_list_templates_render_golden_tool_history_and_prompts
     let cases = [
         (
             MISTRAL7_V03_FIXTURE,
-            "mistral.mistral-7b-v0.3.json-list-tools.e16746b4",
+            "mistral.json-list-tools.v1",
             concat!(
                 "<s>[INST] first[/INST]",
                 r#"[TOOL_CALLS] [{"arguments":{"value":1},"name":"lookup", "id": "abc123456"}]</s>"#,
@@ -939,7 +1100,7 @@ fn production_mistral_json_list_templates_render_golden_tool_history_and_prompts
         ),
         (
             MINISTRAL8_2410_FIXTURE,
-            "mistral.ministral-8b-2410.json-list-tools.e4676cb5",
+            "mistral.json-list-tools.compact.v1",
             concat!(
                 "<s>[INST]first[/INST]",
                 r#"[TOOL_CALLS][{"arguments":{"value":1},"name":"lookup", "id": "abc123456"}]</s>"#,
@@ -1059,8 +1220,8 @@ fn production_meta_llama_templates_render_golden_tool_history_and_prompts() {
         available_tool
     );
     for (template, identity) in [
-        (LLAMA31_33_FIXTURE, "meta.llama-3.1-3.3.json-tools.e10ca381"),
-        (LLAMA32_FIXTURE, "meta.llama-3.2.json-tools.5816fce1"),
+        (LLAMA31_33_FIXTURE, "llama.json-tools.v1"),
+        (LLAMA32_FIXTURE, "llama.json-tools.v1"),
     ] {
         let mut tokenizer = llama_chat_tokenizer(7, &["<|eot_id|>"]);
         let prepared = prepare_chat_from_parts(
@@ -1206,7 +1367,7 @@ fn production_meta_llama_templates_render_golden_tool_history_and_prompts() {
     );
     assert_eq!(
         prepared.format_profile_identity(),
-        Some("meta.llama-4.json-tools.01a91bfb")
+        Some("llama.python-channel-tools.v1")
     );
     assert_eq!(prepared.rendered_prompt(), llama4_golden);
     assert_eq!(
@@ -1340,7 +1501,7 @@ fn production_nemotron_renders_golden_parallel_history_and_prompt() {
     );
     assert_eq!(
         prepared.format_profile_identity(),
-        Some("nvidia.llama-3.1-nemotron-nano.json-list-tools.072b9ab4")
+        Some("nemotron.json-list-tools.v1")
     );
     assert_eq!(prepared.preserved_structural_token_ids(), &[5]);
     assert_eq!(prepared.profile_stop_sequences(), ["<|eot_id|>"]);
@@ -1506,7 +1667,7 @@ fn production_nemotron_v2_covers_reasoning_constraints_and_streaming() {
     );
     assert_eq!(
         required.format_profile_identity(),
-        Some("nvidia.nemotron-nano-v2.json-list-tools.b7a3a520")
+        Some("nemotron.json-list-tools.reasoning.v1")
     );
     assert_eq!(required.preserved_structural_token_ids(), &[19]);
     assert_eq!(required.profile_stop_sequences(), ["<SPECIAL_12>"]);
@@ -1683,7 +1844,7 @@ fn llama_auto_and_required_activation_are_exact_without_family_fallback() {
     assert!(matches!(
         unsupported.native_tool_support(),
         NativeToolSupport::Unsupported { reason }
-            if reason.contains("no registered format profile")
+            if reason.contains("no behavioral format recognizer")
     ));
 }
 
@@ -1754,7 +1915,7 @@ fn production_gpt_oss_template_renders_harmony_history_and_runtime_profile() {
     assert_eq!(prepared.generation_prompt(), "<|start|>assistant");
     assert_eq!(
         prepared.format_profile_identity(),
-        Some("openai.gpt-oss.harmony.a4c9919c")
+        Some("harmony.channels.v1")
     );
     assert_eq!(
         prepared.preserved_structural_token_ids(),
@@ -1766,7 +1927,7 @@ fn production_gpt_oss_template_renders_harmony_history_and_runtime_profile() {
     );
     let plan = prepared
         .tool_runtime_plan()
-        .unwrap_or_else(|| panic!("exact GPT-OSS template signature must prepare Harmony"));
+        .unwrap_or_else(|| panic!("recognized Harmony protocol must prepare Harmony"));
     assert_eq!(plan.auto_activation_trigger(), None);
 }
 
@@ -1827,7 +1988,7 @@ fn production_lfm2_templates_render_tools_prior_calls_and_results() {
     )));
     assert_eq!(
         current.format_profile_identity(),
-        Some("liquid.lfm2.5.python-tools.6d65c880")
+        Some("lfm2.python-tools.v1")
     );
     assert_eq!(current.preserved_structural_token_ids(), &[41, 42, 43]);
     assert_eq!(
@@ -1836,7 +1997,7 @@ fn production_lfm2_templates_render_tools_prior_calls_and_results() {
     );
     let plan = current
         .tool_runtime_plan()
-        .unwrap_or_else(|| panic!("exact LFM2.5 template signature must prepare Python tools"));
+        .unwrap_or_else(|| panic!("recognized LFM2 protocol must prepare Python tools"));
     assert_eq!(plan.auto_activation_trigger(), None);
 
     let mut classic_tokenizer = lfm2_chat_tokenizer(51);
@@ -1876,10 +2037,12 @@ fn production_lfm2_templates_render_tools_prior_calls_and_results() {
         "<|im_end|>\n",
         "<|im_start|>assistant\n"
     )));
-    let plan = classic.tool_runtime_plan().unwrap_or_else(|| {
-        panic!("exact classic LFM2 template signature must prepare Python tools")
-    });
-    assert_eq!(plan.auto_activation_trigger(), Some("<|tool_call_start|>"));
+    assert_eq!(classic.format_profile_identity(), None);
+    assert!(classic.tool_runtime_plan().is_none());
+    assert!(matches!(
+        classic.native_tool_support(),
+        NativeToolSupport::Unsupported { .. }
+    ));
 }
 
 #[test]
@@ -1903,7 +2066,7 @@ fn production_deepseek_templates_render_tools_history_and_exact_generation_promp
     for (template, identity, preceding_tokens, golden_prompt_signature) in [
         (
             DEEPSEEK_V3_TOOL_FIXTURE,
-            "deepseek.v3.structural-json-tools.a3b4449b",
+            "deepseek.structural-json-tools.v1",
             31,
             [
                 0xa0, 0x3b, 0xd6, 0x32, 0x50, 0xe4, 0xd0, 0x15, 0x32, 0x7d, 0xc8, 0x54, 0x68, 0x6b,
@@ -1913,7 +2076,7 @@ fn production_deepseek_templates_render_tools_history_and_exact_generation_promp
         ),
         (
             DEEPSEEK_V31_TOOL_FIXTURE,
-            "deepseek.v3.1.structural-json-tools.07b65954",
+            "deepseek.structural-json-tools.v2",
             41,
             [
                 0x76, 0x4c, 0x69, 0x2b, 0x69, 0x47, 0xc4, 0xcc, 0x9a, 0x15, 0xf8, 0x14, 0xc1, 0xc9,
@@ -1965,7 +2128,7 @@ fn production_deepseek_templates_render_tools_history_and_exact_generation_promp
     for (template, identity, expected_generation_prompt, golden_prompt_signature) in [
         (
             DEEPSEEK_V3_TOOL_FIXTURE,
-            "deepseek.v3.structural-json-tools.a3b4449b",
+            "deepseek.structural-json-tools.v1",
             "",
             [
                 0x46, 0xf0, 0xed, 0x06, 0x01, 0x25, 0x07, 0x5c, 0x56, 0x06, 0x9a, 0x84, 0x3b, 0x8b,
@@ -1975,7 +2138,7 @@ fn production_deepseek_templates_render_tools_history_and_exact_generation_promp
         ),
         (
             DEEPSEEK_V31_TOOL_FIXTURE,
-            "deepseek.v3.1.structural-json-tools.07b65954",
+            "deepseek.structural-json-tools.v2",
             "\n  <｜Assistant｜>\n    </think>\n",
             [
                 0x74, 0x80, 0x75, 0x7f, 0x81, 0xa5, 0x3b, 0xae, 0x1f, 0x51, 0x44, 0x51, 0xe3, 0x90,
@@ -2367,7 +2530,7 @@ fn production_deepseek_tool_boundaries_are_constrained_and_stream_incrementally(
         "bos_token".into(),
         json!("<｜begin▁of▁sentence｜>"),
     )]));
-    let missing_error = prepare_chat_from_parts(
+    let missing = prepare_chat_from_parts(
         &mut missing_structural,
         ModelChatTemplate::Single(DEEPSEEK_V31_TOOL_FIXTURE.into()),
         "unrelated",
@@ -2382,10 +2545,13 @@ fn production_deepseek_tool_boundaries_are_constrained_and_stream_incrementally(
             ..ChatTemplateRequest::default()
         },
     )
-    .unwrap_err();
-    assert!(
-        matches!(missing_error, Error::ToolConstraint(message) if message.contains("<｜end▁of▁sentence｜>"))
-    );
+    .unwrap();
+    assert_eq!(missing.format_profile_identity(), None);
+    assert!(missing.tool_runtime_plan().is_none());
+    assert!(matches!(
+        missing.native_tool_support(),
+        NativeToolSupport::Unsupported { .. }
+    ));
 }
 
 #[test]
@@ -2893,7 +3059,7 @@ fn gemma4_model_type_does_not_grant_unregistered_template_support() {
     assert!(matches!(
         prepared.native_tool_support(),
         NativeToolSupport::Unsupported { reason }
-            if reason.contains("no registered format profile")
+            if reason.contains("no behavioral format recognizer")
     ));
 }
 
@@ -2961,12 +3127,12 @@ fn mistral_architecture_name_does_not_grant_an_unregistered_template_support() {
     assert!(matches!(
         prepared.native_tool_support(),
         NativeToolSupport::Unsupported { reason }
-            if reason.contains("no registered format profile")
+            if reason.contains("no behavioral format recognizer")
     ));
 }
 
 #[test]
-fn named_template_registry_selection_hashes_only_the_selected_body() {
+fn named_template_behavioral_recognition_uses_only_the_selected_body() {
     let compiler = Ok(ConstraintCompiler::synthetic_for_tests());
     let templates = ModelChatTemplate::Named(BTreeMap::from([
         ("default".into(), "unregistered named default".into()),
@@ -2996,7 +3162,7 @@ fn named_template_registry_selection_hashes_only_the_selected_body() {
     assert!(matches!(
         default.native_tool_support(),
         NativeToolSupport::Unsupported { reason }
-            if reason.contains("no registered format profile")
+            if reason.contains("no behavioral format recognizer")
     ));
 
     let selected_tool_use = prepare_chat_from_parts(
@@ -3020,7 +3186,7 @@ fn named_template_registry_selection_hashes_only_the_selected_body() {
     );
     assert_eq!(
         selected_tool_use.format_profile_identity(),
-        Some("hermes.xml-tools.7ce09d55")
+        Some("xml-tools.v1")
     );
     assert!(matches!(
         selected_tool_use.native_tool_support(),

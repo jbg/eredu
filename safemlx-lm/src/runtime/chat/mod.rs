@@ -17,22 +17,19 @@ use std::{
 
 use safemlx_lm_utils::tokenizer::Tokenizer as ChatTokenizer;
 use serde_json::{Map, Value};
+#[cfg(test)]
 use sha2::{Digest, Sha256};
 
+#[cfg(test)]
+use crate::runtime::chat::dialect::DECLARATIVE_DIALECT;
 use crate::runtime::chat::dialect::{
     DeclarativeCallId, DeclarativeDialectSpec, DeclarativePayloadShape, DelimitedChannel,
     ExactEnvelope, JsonFunctionEnvelope, NamedJsonArgumentsEncoding, ParallelCallLayout,
-    StructuralObjectEncoding, ToolNameConstraint, DECLARATIVE_DIALECT,
+    StructuralObjectEncoding, ToolNameConstraint,
 };
 use crate::{
-    architectures::{
-        gpt_oss::format::{GPT_OSS_HARMONY_PARAMETERS, HARMONY_DIALECT},
-        lfm2::format::{LFM2_DIALECT, LFM2_PARAMETERS},
-    },
     runtime::chat::constraints::ConstraintBlueprint,
-    runtime::chat::dialect::{
-        DialectParameters, FormatDialect, FormatRegistryEntry, GenerationPromptBehavior,
-    },
+    runtime::chat::dialect::{DialectParameters, FormatDialect, GenerationPromptBehavior},
     runtime::generation::streaming::ToolRuntimeParser,
 };
 
@@ -456,7 +453,7 @@ pub struct PreparedChat {
     pub(crate) generation_prompt: String,
     /// Stable identity of the selected checkpoint chat template.
     pub(crate) template_identity: ChatTemplateIdentity,
-    /// Registered format-profile identity, when one exact profile matched.
+    /// Stable format-protocol identity, when behavior was recognized.
     pub(crate) format_profile_identity: Option<String>,
     /// Native tool capability for the selected template and profile.
     pub(crate) native_tool_support: NativeToolSupport,
@@ -489,7 +486,7 @@ impl PreparedChat {
         &self.template_identity
     }
 
-    /// Returns the registered format-profile identity, if one matched.
+    /// Returns the recognized stable format-protocol identity.
     pub fn format_profile_identity(&self) -> Option<&str> {
         self.format_profile_identity.as_deref()
     }
@@ -567,7 +564,7 @@ const SYNTHETIC_TOOL_TEMPLATE_SIGNATURE: [u8; 32] = [
     0x2a, 0x4b, 0xf7, 0x9c, 0x15, 0x33, 0xd6, 0x8d, 0x04, 0x77, 0x90, 0x30, 0x3d, 0xd8, 0x59, 0xf4,
 ];
 
-const QWEN_XML_TOOL_SPEC: DeclarativeDialectSpec = DeclarativeDialectSpec {
+pub(crate) const QWEN_XML_TOOL_SPEC: DeclarativeDialectSpec = DeclarativeDialectSpec {
     generation_prompt_behavior: GenerationPromptBehavior::HonorRequest,
     reasoning_template_kwarg: "enable_thinking",
     supports_tool_reasoning: true,
@@ -593,7 +590,7 @@ const QWEN_XML_TOOL_SPEC: DeclarativeDialectSpec = DeclarativeDialectSpec {
     stop_sequences: &["<|im_end|>"],
 };
 
-const QWEN3_XML_TOOL_SPEC: DeclarativeDialectSpec = DeclarativeDialectSpec {
+pub(crate) const QWEN3_XML_TOOL_SPEC: DeclarativeDialectSpec = DeclarativeDialectSpec {
     reasoning_channel: Some(DelimitedChannel {
         prefix: "<think>\n",
         suffix: "\n</think>",
@@ -603,7 +600,7 @@ const QWEN3_XML_TOOL_SPEC: DeclarativeDialectSpec = DeclarativeDialectSpec {
     ..QWEN_XML_TOOL_SPEC
 };
 
-const MISTRAL_JSON_LIST_TOOL_SPEC: DeclarativeDialectSpec = DeclarativeDialectSpec {
+pub(crate) const MISTRAL_JSON_LIST_TOOL_SPEC: DeclarativeDialectSpec = DeclarativeDialectSpec {
     generation_prompt_behavior: GenerationPromptBehavior::HonorRequest,
     reasoning_template_kwarg: "enable_thinking",
     supports_tool_reasoning: true,
@@ -652,7 +649,7 @@ const MISTRAL_JSON_FUNCTION: JsonFunctionEnvelope = JsonFunctionEnvelope {
     ..NAME_ARGUMENTS_JSON_FUNCTION
 };
 
-const LLAMA3_JSON_TOOL_SPEC: DeclarativeDialectSpec = DeclarativeDialectSpec {
+pub(crate) const LLAMA3_JSON_TOOL_SPEC: DeclarativeDialectSpec = DeclarativeDialectSpec {
     generation_prompt_behavior: GenerationPromptBehavior::HonorRequest,
     reasoning_template_kwarg: "enable_thinking",
     supports_tool_reasoning: true,
@@ -678,7 +675,7 @@ const LLAMA3_JSON_TOOL_SPEC: DeclarativeDialectSpec = DeclarativeDialectSpec {
     stop_sequences: &["<|eot_id|>"],
 };
 
-const LLAMA4_JSON_TOOL_SPEC: DeclarativeDialectSpec = DeclarativeDialectSpec {
+pub(crate) const LLAMA4_JSON_TOOL_SPEC: DeclarativeDialectSpec = DeclarativeDialectSpec {
     text_channel: Some(DelimitedChannel {
         prefix: "<|python_start|>",
         suffix: "<|python_end|>",
@@ -692,45 +689,47 @@ const LLAMA4_JSON_TOOL_SPEC: DeclarativeDialectSpec = DeclarativeDialectSpec {
     ..LLAMA3_JSON_TOOL_SPEC
 };
 
-const NEMOTRON_NANO_JSON_LIST_TOOL_SPEC: DeclarativeDialectSpec = DeclarativeDialectSpec {
-    generation_prompt_behavior: GenerationPromptBehavior::HonorRequest,
-    reasoning_template_kwarg: "enable_thinking",
-    supports_tool_reasoning: true,
-    output: ExactEnvelope {
-        prefix: "<TOOLCALL>",
-        suffix: "</TOOLCALL>",
-    },
-    call: ExactEnvelope {
-        prefix: "",
-        suffix: "",
-    },
-    payload_shape: DeclarativePayloadShape::JsonList,
-    json_function: Some(&NAME_ARGUMENTS_JSON_FUNCTION),
-    reasoning_channel: None,
-    text_channel: None,
-    raw_text_before_calls: false,
-    call_separator: ", ",
-    parallel_layout: ParallelCallLayout::SingleEnvelope,
-    protocol_max_tools: None,
-    protocol_max_calls: None,
-    auto_activation_trigger: Some("<TOOLCALL>["),
-    required_structural_tokens: &["<|eot_id|>"],
-    stop_sequences: &["<|eot_id|>"],
-};
+pub(crate) const NEMOTRON_NANO_JSON_LIST_TOOL_SPEC: DeclarativeDialectSpec =
+    DeclarativeDialectSpec {
+        generation_prompt_behavior: GenerationPromptBehavior::HonorRequest,
+        reasoning_template_kwarg: "enable_thinking",
+        supports_tool_reasoning: true,
+        output: ExactEnvelope {
+            prefix: "<TOOLCALL>",
+            suffix: "</TOOLCALL>",
+        },
+        call: ExactEnvelope {
+            prefix: "",
+            suffix: "",
+        },
+        payload_shape: DeclarativePayloadShape::JsonList,
+        json_function: Some(&NAME_ARGUMENTS_JSON_FUNCTION),
+        reasoning_channel: None,
+        text_channel: None,
+        raw_text_before_calls: false,
+        call_separator: ", ",
+        parallel_layout: ParallelCallLayout::SingleEnvelope,
+        protocol_max_tools: None,
+        protocol_max_calls: None,
+        auto_activation_trigger: Some("<TOOLCALL>["),
+        required_structural_tokens: &["<|eot_id|>"],
+        stop_sequences: &["<|eot_id|>"],
+    };
 
-const NEMOTRON_NANO_V2_JSON_LIST_TOOL_SPEC: DeclarativeDialectSpec = DeclarativeDialectSpec {
-    reasoning_channel: Some(DelimitedChannel {
-        prefix: "<think>\n",
-        suffix: "\n</think>\n\n",
-        required: false,
-        prefix_in_prompt: true,
-    }),
-    required_structural_tokens: &["<SPECIAL_12>"],
-    stop_sequences: &["<SPECIAL_12>"],
-    ..NEMOTRON_NANO_JSON_LIST_TOOL_SPEC
-};
+pub(crate) const NEMOTRON_NANO_V2_JSON_LIST_TOOL_SPEC: DeclarativeDialectSpec =
+    DeclarativeDialectSpec {
+        reasoning_channel: Some(DelimitedChannel {
+            prefix: "<think>\n",
+            suffix: "\n</think>\n\n",
+            required: false,
+            prefix_in_prompt: true,
+        }),
+        required_structural_tokens: &["<SPECIAL_12>"],
+        stop_sequences: &["<SPECIAL_12>"],
+        ..NEMOTRON_NANO_JSON_LIST_TOOL_SPEC
+    };
 
-const MINISTRAL_JSON_LIST_TOOL_SPEC: DeclarativeDialectSpec = DeclarativeDialectSpec {
+pub(crate) const MINISTRAL_JSON_LIST_TOOL_SPEC: DeclarativeDialectSpec = DeclarativeDialectSpec {
     output: ExactEnvelope {
         prefix: "[TOOL_CALLS]",
         suffix: "</s>",
@@ -739,106 +738,60 @@ const MINISTRAL_JSON_LIST_TOOL_SPEC: DeclarativeDialectSpec = DeclarativeDialect
     ..MISTRAL_JSON_LIST_TOOL_SPEC
 };
 
-const DEEPSEEK_STRUCTURAL_JSON_TOOL_SPEC: DeclarativeDialectSpec = DeclarativeDialectSpec {
-    generation_prompt_behavior: GenerationPromptBehavior::HonorRequest,
-    reasoning_template_kwarg: "enable_thinking",
-    supports_tool_reasoning: false,
-    output: ExactEnvelope {
-        prefix: "<｜tool▁calls▁begin｜>",
-        suffix: "<｜tool▁calls▁end｜>",
-    },
-    call: ExactEnvelope {
-        prefix: "<｜tool▁call▁begin｜>function<｜tool▁sep｜>",
-        suffix: "<｜tool▁call▁end｜>",
-    },
-    payload_shape: DeclarativePayloadShape::NamedJsonArguments(NamedJsonArgumentsEncoding {
-        name_suffix: "\n```json\n",
-        arguments_suffix: "\n```",
-        name_constraint: ToolNameConstraint::AsciiAlphanumericUnderscoreDash { max_length: 64 },
-    }),
-    json_function: None,
-    reasoning_channel: None,
-    text_channel: None,
-    raw_text_before_calls: true,
-    call_separator: "\n",
-    parallel_layout: ParallelCallLayout::RepeatedEnvelopes,
-    protocol_max_tools: Some(128),
-    protocol_max_calls: None,
-    auto_activation_trigger: Some("<｜tool▁calls▁begin｜>"),
-    required_structural_tokens: &[
-        "<｜tool▁calls▁begin｜>",
-        "<｜tool▁calls▁end｜>",
-        "<｜tool▁call▁begin｜>",
-        "<｜tool▁call▁end｜>",
-        "<｜tool▁sep｜>",
-        "<｜end▁of▁sentence｜>",
-    ],
-    stop_sequences: &["<｜end▁of▁sentence｜>"],
-};
+pub(crate) const DEEPSEEK_STRUCTURAL_JSON_TOOL_SPEC: DeclarativeDialectSpec =
+    DeclarativeDialectSpec {
+        generation_prompt_behavior: GenerationPromptBehavior::HonorRequest,
+        reasoning_template_kwarg: "enable_thinking",
+        supports_tool_reasoning: false,
+        output: ExactEnvelope {
+            prefix: "<｜tool▁calls▁begin｜>",
+            suffix: "<｜tool▁calls▁end｜>",
+        },
+        call: ExactEnvelope {
+            prefix: "<｜tool▁call▁begin｜>function<｜tool▁sep｜>",
+            suffix: "<｜tool▁call▁end｜>",
+        },
+        payload_shape: DeclarativePayloadShape::NamedJsonArguments(NamedJsonArgumentsEncoding {
+            name_suffix: "\n```json\n",
+            arguments_suffix: "\n```",
+            name_constraint: ToolNameConstraint::AsciiAlphanumericUnderscoreDash { max_length: 64 },
+        }),
+        json_function: None,
+        reasoning_channel: None,
+        text_channel: None,
+        raw_text_before_calls: true,
+        call_separator: "\n",
+        parallel_layout: ParallelCallLayout::RepeatedEnvelopes,
+        protocol_max_tools: Some(128),
+        protocol_max_calls: None,
+        auto_activation_trigger: Some("<｜tool▁calls▁begin｜>"),
+        required_structural_tokens: &[
+            "<｜tool▁calls▁begin｜>",
+            "<｜tool▁calls▁end｜>",
+            "<｜tool▁call▁begin｜>",
+            "<｜tool▁call▁end｜>",
+            "<｜tool▁sep｜>",
+            "<｜end▁of▁sentence｜>",
+        ],
+        stop_sequences: &["<｜end▁of▁sentence｜>"],
+    };
 
-const DEEPSEEK31_STRUCTURAL_JSON_TOOL_SPEC: DeclarativeDialectSpec = DeclarativeDialectSpec {
-    reasoning_template_kwarg: "thinking",
-    call: ExactEnvelope {
-        prefix: "<｜tool▁call▁begin｜>",
-        suffix: "<｜tool▁call▁end｜>",
-    },
-    payload_shape: DeclarativePayloadShape::NamedJsonArguments(NamedJsonArgumentsEncoding {
-        name_suffix: "<｜tool▁sep｜>",
-        arguments_suffix: "",
-        name_constraint: ToolNameConstraint::AsciiAlphanumericUnderscoreDash { max_length: 64 },
-    }),
-    call_separator: "",
-    ..DEEPSEEK_STRUCTURAL_JSON_TOOL_SPEC
-};
+pub(crate) const DEEPSEEK31_STRUCTURAL_JSON_TOOL_SPEC: DeclarativeDialectSpec =
+    DeclarativeDialectSpec {
+        reasoning_template_kwarg: "thinking",
+        call: ExactEnvelope {
+            prefix: "<｜tool▁call▁begin｜>",
+            suffix: "<｜tool▁call▁end｜>",
+        },
+        payload_shape: DeclarativePayloadShape::NamedJsonArguments(NamedJsonArgumentsEncoding {
+            name_suffix: "<｜tool▁sep｜>",
+            arguments_suffix: "",
+            name_constraint: ToolNameConstraint::AsciiAlphanumericUnderscoreDash { max_length: 64 },
+        }),
+        call_separator: "",
+        ..DEEPSEEK_STRUCTURAL_JSON_TOOL_SPEC
+    };
 
-const QWEN25_TEMPLATE_SIGNATURE: [u8; 32] = [
-    0xcd, 0x8e, 0x94, 0x39, 0xf0, 0x57, 0x08, 0x56, 0xfd, 0x70, 0x47, 0x0b, 0xf8, 0x88, 0x9e, 0xbd,
-    0x8b, 0x5d, 0x11, 0x07, 0x20, 0x7f, 0x67, 0xa5, 0xef, 0xb4, 0x6e, 0x34, 0x23, 0x30, 0x52, 0x7f,
-];
-const QWEN3_TEMPLATE_16706FC5_SIGNATURE: [u8; 32] = [
-    0x87, 0xa2, 0x72, 0x8c, 0xb8, 0xdc, 0x9f, 0xe4, 0x24, 0xd6, 0x24, 0x54, 0x2f, 0x60, 0x60, 0xec,
-    0x05, 0xa1, 0xd2, 0x85, 0xeb, 0xbe, 0xc5, 0x78, 0xbb, 0x07, 0x89, 0x00, 0xe3, 0x33, 0x96, 0xb5,
-];
-const QWEN3_TEMPLATE_7E4AE267_SIGNATURE: [u8; 32] = [
-    0xa5, 0x5e, 0xe1, 0xb1, 0x66, 0x01, 0x28, 0xb7, 0x09, 0x87, 0x23, 0xe0, 0xab, 0xcd, 0x92, 0xca,
-    0xa0, 0x78, 0x80, 0x61, 0x05, 0x1c, 0x62, 0xd5, 0x1c, 0xbe, 0x87, 0xd9, 0xcf, 0x19, 0x74, 0xd8,
-];
-const QWEN3_VL_TEMPLATE_SIGNATURE: [u8; 32] = [
-    0x36, 0x36, 0xd0, 0xf0, 0xbd, 0x6b, 0xef, 0x02, 0x65, 0x4c, 0xdf, 0xfd, 0xc4, 0x47, 0xb7, 0x9c,
-    0xb2, 0xce, 0xf8, 0xab, 0x02, 0xcc, 0x75, 0x26, 0x73, 0x45, 0x94, 0x62, 0x91, 0xa4, 0x89, 0xe4,
-];
-const HERMES2_PRO_TOOL_USE_TEMPLATE_SIGNATURE: [u8; 32] = [
-    0x7c, 0xe0, 0x9d, 0x55, 0xd3, 0x69, 0x0e, 0x06, 0xc7, 0x0b, 0x5c, 0x07, 0x22, 0x8c, 0xc7, 0xe8,
-    0xc9, 0x9c, 0x43, 0xa2, 0x3c, 0xdc, 0x02, 0x77, 0x62, 0xbe, 0x40, 0x11, 0xef, 0xcd, 0xea, 0x6c,
-];
-const MISTRAL7_V03_TEMPLATE_SIGNATURE: [u8; 32] = [
-    0xe1, 0x67, 0x46, 0xb4, 0x03, 0x44, 0xd6, 0xc5, 0xb5, 0x26, 0x59, 0x88, 0xe0, 0x32, 0x8a, 0x0b,
-    0xf7, 0x27, 0x7b, 0xe8, 0x6f, 0x1c, 0x33, 0x51, 0x56, 0xea, 0xe0, 0x7e, 0x29, 0xc8, 0x28, 0x26,
-];
-const MINISTRAL8_2410_TEMPLATE_SIGNATURE: [u8; 32] = [
-    0xe4, 0x67, 0x6c, 0xb5, 0x6d, 0xff, 0xea, 0x77, 0x82, 0xfd, 0x3e, 0x2b, 0x57, 0x7c, 0xfa, 0xf1,
-    0xe1, 0x23, 0x53, 0x7e, 0x6e, 0xf4, 0x9b, 0x3e, 0xc7, 0xca, 0xa6, 0xc0, 0x95, 0xc6, 0x22, 0x72,
-];
-const LLAMA31_33_TEMPLATE_SIGNATURE: [u8; 32] = [
-    0xe1, 0x0c, 0xa3, 0x81, 0xb1, 0xcc, 0xc5, 0xcf, 0x9d, 0xb5, 0x2e, 0x37, 0x1f, 0x3b, 0x66, 0x51,
-    0x57, 0x6c, 0xae, 0xe0, 0xa6, 0x30, 0xb4, 0x52, 0xe2, 0x81, 0x6b, 0x2d, 0x40, 0x4d, 0x4b, 0x65,
-];
-const LLAMA32_TEMPLATE_SIGNATURE: [u8; 32] = [
-    0x58, 0x16, 0xfc, 0xe1, 0x04, 0x44, 0xe0, 0x3c, 0x2e, 0x9e, 0xe1, 0xef, 0x8a, 0x4a, 0x1e, 0xa6,
-    0x1a, 0xe7, 0xe6, 0x9e, 0x43, 0x86, 0x13, 0xf3, 0xb1, 0x7b, 0x69, 0xd0, 0x42, 0x62, 0x23, 0xa4,
-];
-const LLAMA4_TEMPLATE_SIGNATURE: [u8; 32] = [
-    0x01, 0xa9, 0x1b, 0xfb, 0x2e, 0x84, 0xc8, 0x05, 0x5b, 0xf7, 0xb6, 0x35, 0x89, 0x8f, 0xef, 0x3c,
-    0xae, 0x0b, 0x69, 0xe4, 0x2a, 0xc5, 0x63, 0x4c, 0x21, 0x2d, 0x30, 0x8e, 0x0e, 0x90, 0x91, 0xbd,
-];
-const NEMOTRON_NANO_TEMPLATE_SIGNATURE: [u8; 32] = [
-    0x07, 0x2b, 0x9a, 0xb4, 0x5c, 0xdd, 0xdd, 0xd1, 0xc8, 0x21, 0xb7, 0xcc, 0xb0, 0xd4, 0xbe, 0x2b,
-    0x7a, 0x2b, 0x20, 0x70, 0xdd, 0x92, 0x7a, 0xb1, 0x4c, 0xe7, 0x31, 0xcf, 0x09, 0xa3, 0x43, 0x00,
-];
-const NEMOTRON_NANO_V2_TEMPLATE_SIGNATURE: [u8; 32] = [
-    0xb7, 0xa3, 0xa5, 0x20, 0xa4, 0xbc, 0x1b, 0xea, 0xe6, 0xa2, 0x5d, 0x61, 0x5f, 0x92, 0x15, 0x58,
-    0x0d, 0xf8, 0xee, 0xa9, 0x26, 0xf4, 0x88, 0x25, 0x6c, 0x2b, 0xef, 0x74, 0x03, 0x94, 0x33, 0xc0,
-];
 #[cfg(test)]
 const GEMMA4_EDGE_TEMPLATE_SIGNATURE: [u8; 32] = [
     0x0a, 0x2c, 0x80, 0x73, 0xc8, 0x78, 0xab, 0x1d, 0xa0, 0x04, 0xbe, 0xe9, 0x33, 0xa9, 0x98, 0x60,
@@ -848,42 +801,6 @@ const GEMMA4_EDGE_TEMPLATE_SIGNATURE: [u8; 32] = [
 const GEMMA4_LARGE_TEMPLATE_SIGNATURE: [u8; 32] = [
     0xae, 0x53, 0x46, 0x4b, 0xf3, 0xbe, 0x25, 0x80, 0x2b, 0x3a, 0x5b, 0x37, 0xde, 0xf7, 0xfd, 0x89,
     0x66, 0x70, 0x67, 0xd7, 0x57, 0x70, 0x49, 0xb3, 0xb2, 0xd7, 0x4c, 0x4d, 0x8d, 0xe4, 0xc6, 0xd4,
-];
-const GPT_OSS_HARMONY_CURRENT_TEMPLATE_SIGNATURE: [u8; 32] = [
-    0xa4, 0xc9, 0x91, 0x9c, 0xbb, 0xd4, 0xac, 0xdd, 0x51, 0xcc, 0xff, 0xe2, 0x2d, 0xa0, 0x49, 0x26,
-    0x4b, 0x1b, 0x73, 0xe5, 0x90, 0x55, 0xfa, 0x58, 0x81, 0x1a, 0x99, 0xef, 0xbd, 0x7c, 0x81, 0x46,
-];
-const GPT_OSS_HARMONY_ESCAPED_TEMPLATE_SIGNATURE: [u8; 32] = [
-    0xb4, 0x74, 0x75, 0x9b, 0x33, 0xc2, 0x13, 0x42, 0xe7, 0x3a, 0xbc, 0xea, 0xe7, 0xfe, 0x37, 0x89,
-    0xf0, 0x62, 0xe2, 0x89, 0xf6, 0x97, 0x49, 0x80, 0x1f, 0x72, 0x2a, 0x50, 0x8f, 0x92, 0x18, 0x0a,
-];
-const GPT_OSS_HARMONY_INITIAL_TEMPLATE_SIGNATURE: [u8; 32] = [
-    0xf8, 0xd9, 0x25, 0x57, 0x77, 0x61, 0x55, 0x91, 0xa7, 0xcc, 0x1a, 0x7c, 0x93, 0x2f, 0x5a, 0x69,
-    0xe1, 0x81, 0x12, 0x89, 0x02, 0x29, 0x5e, 0x1b, 0x81, 0x22, 0x1d, 0x20, 0xd9, 0x83, 0xca, 0xc7,
-];
-const LFM2_CLASSIC_TEMPLATE_SIGNATURE: [u8; 32] = [
-    0xce, 0xf1, 0x87, 0x40, 0x0d, 0x62, 0xa5, 0x95, 0x07, 0xaa, 0xb3, 0xa6, 0x42, 0xea, 0x9a, 0x8d,
-    0x2a, 0x2e, 0xf2, 0x63, 0x56, 0x2b, 0xc3, 0x43, 0x05, 0x60, 0xe1, 0x16, 0x94, 0x52, 0x73, 0xcf,
-];
-const LFM2_CLASSIC_COMPACT_TEMPLATE_SIGNATURE: [u8; 32] = [
-    0x89, 0xe7, 0x90, 0xf0, 0x27, 0x91, 0x6b, 0x5a, 0x2b, 0xca, 0x14, 0x5a, 0x6a, 0x84, 0x54, 0xe0,
-    0x6f, 0xfc, 0x7a, 0x50, 0x43, 0xbf, 0x3b, 0x6d, 0x97, 0x82, 0x9a, 0xff, 0x86, 0xbb, 0x54, 0x3f,
-];
-const LFM25_8B_TEMPLATE_SIGNATURE: [u8; 32] = [
-    0x6d, 0x65, 0xc8, 0x80, 0x48, 0x47, 0xad, 0x74, 0xee, 0xa9, 0x12, 0xdd, 0x7e, 0xca, 0x3d, 0xc1,
-    0xcf, 0x7a, 0x45, 0x7b, 0x53, 0xa7, 0x7f, 0x47, 0xd8, 0x41, 0xa1, 0x41, 0x21, 0x91, 0x09, 0x63,
-];
-const LFM25_VL_TEMPLATE_SIGNATURE: [u8; 32] = [
-    0x30, 0x9e, 0x58, 0x6e, 0x2e, 0xda, 0x3d, 0x7f, 0x2d, 0xb1, 0xe2, 0xa0, 0x45, 0xbf, 0xb0, 0x7f,
-    0x4c, 0x83, 0x79, 0x8b, 0x23, 0xf7, 0xac, 0x58, 0x79, 0x54, 0x42, 0x63, 0x02, 0xd5, 0x08, 0xe9,
-];
-const DEEPSEEK_V3_TOOL_TEMPLATE_SIGNATURE: [u8; 32] = [
-    0xa3, 0xb4, 0x44, 0x9b, 0x9e, 0x31, 0xa7, 0xf3, 0x1b, 0x5e, 0x61, 0x3e, 0xfd, 0xeb, 0x6c, 0x45,
-    0xd9, 0xbe, 0xc7, 0xab, 0x75, 0xd2, 0x5c, 0xcc, 0xc9, 0x15, 0xe5, 0x6d, 0xd0, 0xbf, 0x97, 0x99,
-];
-const DEEPSEEK_V31_TOOL_TEMPLATE_SIGNATURE: [u8; 32] = [
-    0x07, 0xb6, 0x59, 0x54, 0xa3, 0xca, 0x1e, 0x27, 0x6e, 0x18, 0xc5, 0x3d, 0x68, 0x0d, 0xd1, 0x62,
-    0xce, 0x85, 0xdc, 0xf1, 0x46, 0x73, 0x0b, 0x69, 0x80, 0x99, 0x91, 0xca, 0xb6, 0x69, 0x63, 0x95,
 ];
 
 #[cfg(test)]
@@ -964,290 +881,9 @@ const SYNTHETIC_DECLARATIVE_SPEC: DeclarativeDialectSpec = DeclarativeDialectSpe
 #[cfg(test)]
 pub(crate) const SYNTHETIC_STRUCTURAL_TOKEN: &str = "<|safemlx_tool_frame|>";
 
-const FORMAT_REGISTRY: &[FormatRegistryEntry] = &[
-    FormatRegistryEntry {
-        identity: "qwen.qwen2.5.xml-tools.acbd9653",
-        template_signature: QWEN25_TEMPLATE_SIGNATURE,
-        dialect: &DECLARATIVE_DIALECT,
-        parameters: DialectParameters::Declarative(&QWEN_XML_TOOL_SPEC),
-    },
-    FormatRegistryEntry {
-        identity: "qwen.qwen3.xml-tools.16706fc5",
-        template_signature: QWEN3_TEMPLATE_16706FC5_SIGNATURE,
-        dialect: &DECLARATIVE_DIALECT,
-        parameters: DialectParameters::Declarative(&QWEN3_XML_TOOL_SPEC),
-    },
-    FormatRegistryEntry {
-        identity: "qwen.qwen3.xml-tools.7e4ae267",
-        template_signature: QWEN3_TEMPLATE_7E4AE267_SIGNATURE,
-        dialect: &DECLARATIVE_DIALECT,
-        parameters: DialectParameters::Declarative(&QWEN3_XML_TOOL_SPEC),
-    },
-    FormatRegistryEntry {
-        identity: "qwen.qwen3-vl.xml-tools.89644892",
-        template_signature: QWEN3_VL_TEMPLATE_SIGNATURE,
-        dialect: &DECLARATIVE_DIALECT,
-        parameters: DialectParameters::Declarative(&QWEN_XML_TOOL_SPEC),
-    },
-    FormatRegistryEntry {
-        identity: "hermes.xml-tools.7ce09d55",
-        template_signature: HERMES2_PRO_TOOL_USE_TEMPLATE_SIGNATURE,
-        dialect: &DECLARATIVE_DIALECT,
-        parameters: DialectParameters::Declarative(&QWEN_XML_TOOL_SPEC),
-    },
-    FormatRegistryEntry {
-        identity: "mistral.mistral-7b-v0.3.json-list-tools.e16746b4",
-        template_signature: MISTRAL7_V03_TEMPLATE_SIGNATURE,
-        dialect: &DECLARATIVE_DIALECT,
-        parameters: DialectParameters::Declarative(&MISTRAL_JSON_LIST_TOOL_SPEC),
-    },
-    FormatRegistryEntry {
-        identity: "mistral.ministral-8b-2410.json-list-tools.e4676cb5",
-        template_signature: MINISTRAL8_2410_TEMPLATE_SIGNATURE,
-        dialect: &DECLARATIVE_DIALECT,
-        parameters: DialectParameters::Declarative(&MINISTRAL_JSON_LIST_TOOL_SPEC),
-    },
-    FormatRegistryEntry {
-        identity: "meta.llama-3.1-3.3.json-tools.e10ca381",
-        template_signature: LLAMA31_33_TEMPLATE_SIGNATURE,
-        dialect: &DECLARATIVE_DIALECT,
-        parameters: DialectParameters::Declarative(&LLAMA3_JSON_TOOL_SPEC),
-    },
-    FormatRegistryEntry {
-        identity: "meta.llama-3.2.json-tools.5816fce1",
-        template_signature: LLAMA32_TEMPLATE_SIGNATURE,
-        dialect: &DECLARATIVE_DIALECT,
-        parameters: DialectParameters::Declarative(&LLAMA3_JSON_TOOL_SPEC),
-    },
-    FormatRegistryEntry {
-        identity: "meta.llama-4.json-tools.01a91bfb",
-        template_signature: LLAMA4_TEMPLATE_SIGNATURE,
-        dialect: &DECLARATIVE_DIALECT,
-        parameters: DialectParameters::Declarative(&LLAMA4_JSON_TOOL_SPEC),
-    },
-    FormatRegistryEntry {
-        identity: "nvidia.llama-3.1-nemotron-nano.json-list-tools.072b9ab4",
-        template_signature: NEMOTRON_NANO_TEMPLATE_SIGNATURE,
-        dialect: &DECLARATIVE_DIALECT,
-        parameters: DialectParameters::Declarative(&NEMOTRON_NANO_JSON_LIST_TOOL_SPEC),
-    },
-    FormatRegistryEntry {
-        identity: "nvidia.nemotron-nano-v2.json-list-tools.b7a3a520",
-        template_signature: NEMOTRON_NANO_V2_TEMPLATE_SIGNATURE,
-        dialect: &DECLARATIVE_DIALECT,
-        parameters: DialectParameters::Declarative(&NEMOTRON_NANO_V2_JSON_LIST_TOOL_SPEC),
-    },
-    FormatRegistryEntry {
-        identity: "openai.gpt-oss.harmony.a4c9919c",
-        template_signature: GPT_OSS_HARMONY_CURRENT_TEMPLATE_SIGNATURE,
-        dialect: &HARMONY_DIALECT,
-        parameters: DialectParameters::Custom(&GPT_OSS_HARMONY_PARAMETERS),
-    },
-    FormatRegistryEntry {
-        identity: "openai.gpt-oss.harmony.b474759b",
-        template_signature: GPT_OSS_HARMONY_ESCAPED_TEMPLATE_SIGNATURE,
-        dialect: &HARMONY_DIALECT,
-        parameters: DialectParameters::Custom(&GPT_OSS_HARMONY_PARAMETERS),
-    },
-    FormatRegistryEntry {
-        identity: "openai.gpt-oss.harmony.f8d92557",
-        template_signature: GPT_OSS_HARMONY_INITIAL_TEMPLATE_SIGNATURE,
-        dialect: &HARMONY_DIALECT,
-        parameters: DialectParameters::Custom(&GPT_OSS_HARMONY_PARAMETERS),
-    },
-    FormatRegistryEntry {
-        identity: "liquid.lfm2.python-tools.cef18740",
-        template_signature: LFM2_CLASSIC_TEMPLATE_SIGNATURE,
-        dialect: &LFM2_DIALECT,
-        parameters: DialectParameters::Custom(&LFM2_PARAMETERS),
-    },
-    FormatRegistryEntry {
-        identity: "liquid.lfm2.python-tools.89e790f0",
-        template_signature: LFM2_CLASSIC_COMPACT_TEMPLATE_SIGNATURE,
-        dialect: &LFM2_DIALECT,
-        parameters: DialectParameters::Custom(&LFM2_PARAMETERS),
-    },
-    FormatRegistryEntry {
-        identity: "liquid.lfm2.5.python-tools.6d65c880",
-        template_signature: LFM25_8B_TEMPLATE_SIGNATURE,
-        dialect: &LFM2_DIALECT,
-        parameters: DialectParameters::Custom(&LFM2_PARAMETERS),
-    },
-    FormatRegistryEntry {
-        identity: "liquid.lfm2.5-vl.python-tools.309e586e",
-        template_signature: LFM25_VL_TEMPLATE_SIGNATURE,
-        dialect: &LFM2_DIALECT,
-        parameters: DialectParameters::Custom(&LFM2_PARAMETERS),
-    },
-    FormatRegistryEntry {
-        identity: "deepseek.v3.structural-json-tools.a3b4449b",
-        template_signature: DEEPSEEK_V3_TOOL_TEMPLATE_SIGNATURE,
-        dialect: &DECLARATIVE_DIALECT,
-        parameters: DialectParameters::Declarative(&DEEPSEEK_STRUCTURAL_JSON_TOOL_SPEC),
-    },
-    FormatRegistryEntry {
-        identity: "deepseek.v3.1.structural-json-tools.07b65954",
-        template_signature: DEEPSEEK_V31_TOOL_TEMPLATE_SIGNATURE,
-        dialect: &DECLARATIVE_DIALECT,
-        parameters: DialectParameters::Declarative(&DEEPSEEK31_STRUCTURAL_JSON_TOOL_SPEC),
-    },
-    #[cfg(test)]
-    FormatRegistryEntry {
-        identity: "safemlx.synthetic-tools.v1",
-        template_signature: SYNTHETIC_TOOL_TEMPLATE_SIGNATURE,
-        dialect: &DECLARATIVE_DIALECT,
-        parameters: DialectParameters::Declarative(&SYNTHETIC_DECLARATIVE_SPEC),
-    },
-];
-
+#[cfg(test)]
 pub(crate) fn template_signature(template: &str) -> [u8; 32] {
     Sha256::digest(template.as_bytes()).into()
-}
-
-fn matching_registry_entries<'a>(
-    template: &str,
-    registry: &'a [FormatRegistryEntry],
-) -> Vec<&'a FormatRegistryEntry> {
-    let signature = template_signature(template);
-    registry
-        .iter()
-        .filter(|entry| entry.template_signature == signature)
-        .collect()
-}
-
-pub(crate) fn prepare_format_profile_with_registry(
-    template: &str,
-    registry: &[FormatRegistryEntry],
-) -> PreparedFormatProfile {
-    match matching_registry_entries(template, registry).as_slice() {
-        [] => PreparedFormatProfile {
-            identity: None,
-            dialect: None,
-            dialect_parameters: None,
-            tool_dialect: None,
-            tool_dialect_parameters: None,
-            generation_prompt_behavior: GenerationPromptBehavior::HonorRequest,
-            reasoning_template_kwarg: "enable_thinking",
-            supports_reasoning_parsing: false,
-            supports_tool_reasoning: true,
-            supports_tool_input_rendering: false,
-            supports_mapping_tool_arguments: false,
-            supports_string_tool_arguments: false,
-            native_tool_unavailable_reason: Some(
-                "no registered format profile matches the selected chat template".into(),
-            ),
-            required_structural_tokens: Vec::new(),
-            tool_required_structural_tokens: Vec::new(),
-            stop_sequences: Vec::new(),
-        },
-        [entry] => {
-            let generation_prompt_behavior =
-                entry.dialect.generation_prompt_behavior(entry.parameters);
-            let reasoning_template_kwarg = entry.dialect.reasoning_template_kwarg(entry.parameters);
-            let supports_tool_reasoning = entry.dialect.supports_tool_reasoning(entry.parameters);
-            let structural_tokens = entry.dialect.required_structural_tokens(entry.parameters);
-            let stops = entry.dialect.stop_sequences(entry.parameters);
-            match (
-                generation_prompt_behavior,
-                reasoning_template_kwarg,
-                supports_tool_reasoning,
-                structural_tokens,
-                stops,
-            ) {
-                (
-                    Ok(generation_prompt_behavior),
-                    Ok(reasoning_template_kwarg),
-                    Ok(supports_tool_reasoning),
-                    Ok(structural_tokens),
-                    Ok(stops),
-                ) => PreparedFormatProfile {
-                    identity: Some(entry.identity.to_owned()),
-                    dialect: Some(entry.dialect),
-                    dialect_parameters: Some(entry.parameters),
-                    tool_dialect: Some(entry.dialect),
-                    tool_dialect_parameters: Some(entry.parameters),
-                    generation_prompt_behavior,
-                    reasoning_template_kwarg,
-                    supports_reasoning_parsing: entry
-                        .dialect
-                        .supports_reasoning_parsing(entry.parameters),
-                    supports_tool_reasoning,
-                    supports_tool_input_rendering: true,
-                    supports_mapping_tool_arguments: true,
-                    supports_string_tool_arguments: false,
-                    native_tool_unavailable_reason: None,
-                    required_structural_tokens: structural_tokens
-                        .iter()
-                        .map(|token| (*token).to_owned())
-                        .collect(),
-                    tool_required_structural_tokens: structural_tokens
-                        .iter()
-                        .map(|token| (*token).to_owned())
-                        .collect(),
-                    stop_sequences: stops
-                        .iter()
-                        .map(|sequence| (*sequence).to_owned())
-                        .collect(),
-                },
-                (
-                    generation,
-                    reasoning_template_kwarg,
-                    supports_tool_reasoning,
-                    structural_tokens,
-                    stops,
-                ) => {
-                    let reason = generation
-                        .err()
-                        .or_else(|| reasoning_template_kwarg.err())
-                        .or_else(|| supports_tool_reasoning.err())
-                        .or_else(|| structural_tokens.err())
-                        .or_else(|| stops.err())
-                        .expect("one dialect property failed");
-                    PreparedFormatProfile {
-                        identity: Some(entry.identity.to_owned()),
-                        dialect: None,
-                        dialect_parameters: None,
-                        tool_dialect: None,
-                        tool_dialect_parameters: None,
-                        generation_prompt_behavior: GenerationPromptBehavior::HonorRequest,
-                        reasoning_template_kwarg: "enable_thinking",
-                        supports_reasoning_parsing: false,
-                        supports_tool_reasoning: true,
-                        supports_tool_input_rendering: false,
-                        supports_mapping_tool_arguments: false,
-                        supports_string_tool_arguments: false,
-                        native_tool_unavailable_reason: Some(format!(
-                            "format profile {:?} is invalid: {reason}",
-                            entry.identity
-                        )),
-                        required_structural_tokens: Vec::new(),
-                        tool_required_structural_tokens: Vec::new(),
-                        stop_sequences: Vec::new(),
-                    }
-                }
-            }
-        }
-        _ => PreparedFormatProfile {
-            identity: None,
-            dialect: None,
-            dialect_parameters: None,
-            tool_dialect: None,
-            tool_dialect_parameters: None,
-            generation_prompt_behavior: GenerationPromptBehavior::HonorRequest,
-            reasoning_template_kwarg: "enable_thinking",
-            supports_reasoning_parsing: false,
-            supports_tool_reasoning: true,
-            supports_tool_input_rendering: false,
-            supports_mapping_tool_arguments: false,
-            supports_string_tool_arguments: false,
-            native_tool_unavailable_reason: Some(
-                "multiple registered format profiles match the selected chat template".into(),
-            ),
-            required_structural_tokens: Vec::new(),
-            tool_required_structural_tokens: Vec::new(),
-            stop_sequences: Vec::new(),
-        },
-    }
 }
 
 pub(crate) fn resolve_structural_tokens(
@@ -1301,8 +937,50 @@ pub(crate) fn resolve_structural_tokens(
     Ok(resolved)
 }
 
-pub(crate) fn prepare_format_profile(template: &str) -> PreparedFormatProfile {
-    prepare_format_profile_with_registry(template, FORMAT_REGISTRY)
+pub(crate) fn prepare_format_profile(_template: &str) -> PreparedFormatProfile {
+    #[cfg(test)]
+    if _template == SYNTHETIC_TOOL_TEMPLATE {
+        let parameters = DialectParameters::Declarative(&SYNTHETIC_DECLARATIVE_SPEC);
+        return PreparedFormatProfile {
+            identity: Some("safemlx.synthetic-tools.v1".into()),
+            dialect: Some(&DECLARATIVE_DIALECT),
+            dialect_parameters: Some(parameters),
+            tool_dialect: Some(&DECLARATIVE_DIALECT),
+            tool_dialect_parameters: Some(parameters),
+            generation_prompt_behavior: GenerationPromptBehavior::HonorRequest,
+            reasoning_template_kwarg: "enable_thinking",
+            supports_reasoning_parsing: false,
+            supports_tool_reasoning: true,
+            supports_tool_input_rendering: true,
+            supports_mapping_tool_arguments: true,
+            supports_string_tool_arguments: false,
+            native_tool_unavailable_reason: None,
+            required_structural_tokens: vec![SYNTHETIC_STRUCTURAL_TOKEN.into()],
+            tool_required_structural_tokens: vec![SYNTHETIC_STRUCTURAL_TOKEN.into()],
+            stop_sequences: Vec::new(),
+        };
+    }
+
+    PreparedFormatProfile {
+        identity: None,
+        dialect: None,
+        dialect_parameters: None,
+        tool_dialect: None,
+        tool_dialect_parameters: None,
+        generation_prompt_behavior: GenerationPromptBehavior::HonorRequest,
+        reasoning_template_kwarg: "enable_thinking",
+        supports_reasoning_parsing: false,
+        supports_tool_reasoning: true,
+        supports_tool_input_rendering: false,
+        supports_mapping_tool_arguments: false,
+        supports_string_tool_arguments: false,
+        native_tool_unavailable_reason: Some(
+            "no behavioral format recognizer matched the selected chat template".into(),
+        ),
+        required_structural_tokens: Vec::new(),
+        tool_required_structural_tokens: Vec::new(),
+        stop_sequences: Vec::new(),
+    }
 }
 
 #[cfg(test)]
@@ -1313,58 +991,11 @@ mod tests {
     };
 
     use super::{
-        matching_registry_entries, prepare_format_profile, prepare_format_profile_with_registry,
-        resolve_structural_tokens, template_signature, DialectParameters, FormatRegistryEntry,
-        DECLARATIVE_DIALECT, DEEPSEEK31_STRUCTURAL_JSON_TOOL_SPEC,
-        DEEPSEEK_STRUCTURAL_JSON_TOOL_SPEC, DEEPSEEK_V31_TOOL_TEMPLATE_SIGNATURE,
-        DEEPSEEK_V3_TOOL_TEMPLATE_SIGNATURE, FORMAT_REGISTRY, GEMMA4_EDGE_TEMPLATE_SIGNATURE,
-        GEMMA4_LARGE_TEMPLATE_SIGNATURE, GPT_OSS_HARMONY_CURRENT_TEMPLATE_SIGNATURE,
-        GPT_OSS_HARMONY_ESCAPED_TEMPLATE_SIGNATURE, GPT_OSS_HARMONY_INITIAL_TEMPLATE_SIGNATURE,
-        HERMES2_PRO_TOOL_USE_TEMPLATE_SIGNATURE, LFM25_8B_TEMPLATE_SIGNATURE,
-        LFM25_VL_TEMPLATE_SIGNATURE, LFM2_CLASSIC_COMPACT_TEMPLATE_SIGNATURE,
-        LFM2_CLASSIC_TEMPLATE_SIGNATURE, LLAMA31_33_TEMPLATE_SIGNATURE, LLAMA32_TEMPLATE_SIGNATURE,
-        LLAMA3_JSON_TOOL_SPEC, LLAMA4_JSON_TOOL_SPEC, LLAMA4_TEMPLATE_SIGNATURE,
-        MINISTRAL8_2410_TEMPLATE_SIGNATURE, MINISTRAL_JSON_LIST_TOOL_SPEC,
-        MISTRAL7_V03_TEMPLATE_SIGNATURE, MISTRAL_JSON_LIST_TOOL_SPEC,
-        NEMOTRON_NANO_JSON_LIST_TOOL_SPEC, NEMOTRON_NANO_TEMPLATE_SIGNATURE,
-        NEMOTRON_NANO_V2_JSON_LIST_TOOL_SPEC, NEMOTRON_NANO_V2_TEMPLATE_SIGNATURE,
-        QWEN25_TEMPLATE_SIGNATURE, QWEN3_TEMPLATE_16706FC5_SIGNATURE,
-        QWEN3_TEMPLATE_7E4AE267_SIGNATURE, QWEN3_VL_TEMPLATE_SIGNATURE, QWEN3_XML_TOOL_SPEC,
-        QWEN_XML_TOOL_SPEC, SYNTHETIC_DECLARATIVE_SPEC, SYNTHETIC_TOOL_TEMPLATE,
+        prepare_format_profile, resolve_structural_tokens, template_signature,
+        GEMMA4_EDGE_TEMPLATE_SIGNATURE, GEMMA4_LARGE_TEMPLATE_SIGNATURE, SYNTHETIC_TOOL_TEMPLATE,
         SYNTHETIC_TOOL_TEMPLATE_SIGNATURE, UNSLOTH_GEMMA4_TEMPLATE_SIGNATURE,
     };
-    use crate::architectures::{
-        gpt_oss::format::GPT_OSS_HARMONY_PARAMETERS, lfm2::format::LFM2_PARAMETERS,
-    };
 
-    const QWEN25_FIXTURE: &str =
-        include_str!("../../../tests/fixtures/chat_templates/qwen2.5-7b-instruct-acbd9653.jinja");
-    const QWEN3_CURRENT_FIXTURE_WITH_TERMINATOR: &str =
-        include_str!("../../../tests/fixtures/chat_templates/qwen3-0.6b-7e4ae267.jinja");
-    const QWEN3_VL_FIXTURE: &str =
-        include_str!("../../../tests/fixtures/chat_templates/qwen3-vl-2b-instruct-89644892.jinja");
-    const HERMES2_PRO_TOOL_USE_FIXTURE: &str = include_str!(
-        "../../../tests/fixtures/chat_templates/hermes-2-pro-llama-3-8b-f798274b-tool-use.jinja"
-    );
-    const MISTRAL7_V03_FIXTURE: &str = include_str!(
-        "../../../tests/fixtures/chat_templates/mistral-7b-instruct-v0.3-c170c708.jinja"
-    );
-    const MINISTRAL8_2410_FIXTURE: &str = include_str!(
-        "../../../tests/fixtures/chat_templates/ministral-8b-instruct-2410-2f494a19.jinja"
-    );
-    const LLAMA31_33_FIXTURE: &str =
-        include_str!("../../../tests/fixtures/chat_templates/llama-3.1-3.3-e10ca381.jinja");
-    const LLAMA32_FIXTURE: &str =
-        include_str!("../../../tests/fixtures/chat_templates/llama-3.2-5816fce1.jinja");
-    const LLAMA4_FIXTURE: &str =
-        include_str!("../../../tests/fixtures/chat_templates/llama-4-01a91bfb.jinja");
-    const NEMOTRON_NANO_FIXTURE_WITH_TERMINATOR: &str = include_str!(
-        "../../../tests/fixtures/chat_templates/llama-3.1-nemotron-nano-8b-v1-072b9ab4.jinja"
-    );
-    const NEMOTRON_NANO_V2_FIXTURE_WITH_TERMINATOR: &str =
-        include_str!("../../../tests/fixtures/chat_templates/nemotron-nano-v2-6533e8de.jinja");
-    const QWEN3_OLDER_TOKENIZER_CONFIG: &str =
-        include_str!("../../../../safemlx-lm-utils/tests/fixtures/qwen3/tokenizer_config.json");
     const GEMMA4_EDGE_FIXTURE: &str =
         include_str!("../../../tests/fixtures/chat_templates/gemma-4-e2b-it-3e22461f.jinja");
     const GEMMA4_LARGE_FIXTURE: &str =
@@ -1372,25 +1003,6 @@ mod tests {
     const UNSLOTH_GEMMA4_FIXTURE_WITH_TERMINATOR: &str = include_str!(
         "../../../tests/fixtures/chat_templates/unsloth-gemma-4-26b-a4b-it-94899c0f.jinja"
     );
-    const GPT_OSS_HARMONY_CURRENT_FIXTURE_WITH_TERMINATOR: &str =
-        include_str!("../../../tests/fixtures/chat_templates/gpt-oss-harmony-a4c9919c.jinja");
-    const GPT_OSS_HARMONY_ESCAPED_FIXTURE_WITH_TERMINATOR: &str =
-        include_str!("../../../tests/fixtures/chat_templates/gpt-oss-harmony-b474759b.jinja");
-    const GPT_OSS_HARMONY_INITIAL_FIXTURE_WITH_TERMINATOR: &str =
-        include_str!("../../../tests/fixtures/chat_templates/gpt-oss-harmony-f8d92557.jinja");
-    const LFM2_CLASSIC_FIXTURE_WITH_TERMINATOR: &str =
-        include_str!("../../../tests/fixtures/chat_templates/lfm2-classic-b3afba27.jinja");
-    const LFM2_CLASSIC_COMPACT_FIXTURE_WITH_TERMINATOR: &str =
-        include_str!("../../../tests/fixtures/chat_templates/lfm2-classic-compact-6d24c6b7.jinja");
-    const LFM25_8B_FIXTURE_WITH_TERMINATOR: &str =
-        include_str!("../../../tests/fixtures/chat_templates/lfm2.5-8b-a1b-5673e0de.jinja");
-    const LFM25_VL_FIXTURE_WITH_TERMINATOR: &str =
-        include_str!("../../../tests/fixtures/chat_templates/lfm2.5-vl-450m-fc6221ca.jinja");
-    const DEEPSEEK_V3_TOOL_FIXTURE: &str =
-        include_str!("../../../tests/fixtures/chat_templates/deepseek-v3-tools-7e28c67d.jinja");
-    const DEEPSEEK_V31_TOOL_FIXTURE: &str =
-        include_str!("../../../tests/fixtures/chat_templates/deepseek-v3.1-tools-ef1ab230.jinja");
-
     #[test]
     fn registry_does_not_guess_unknown_templates() {
         let prepared = prepare_format_profile("unknown template");
@@ -1400,36 +1012,9 @@ mod tests {
         assert!(prepared
             .native_tool_unavailable_reason
             .as_deref()
-            .is_some_and(|reason| reason.contains("no registered format profile")));
+            .is_some_and(|reason| reason.contains("no behavioral format recognizer")));
         assert!(prepared.required_structural_tokens.is_empty());
         assert!(prepared.stop_sequences.is_empty());
-    }
-
-    #[test]
-    fn registry_treats_duplicate_signatures_as_ambiguous() {
-        let signature = template_signature("same template");
-        let registry = [
-            FormatRegistryEntry {
-                identity: "first",
-                template_signature: signature,
-                dialect: &DECLARATIVE_DIALECT,
-                parameters: DialectParameters::Declarative(&SYNTHETIC_DECLARATIVE_SPEC),
-            },
-            FormatRegistryEntry {
-                identity: "second",
-                template_signature: signature,
-                dialect: &DECLARATIVE_DIALECT,
-                parameters: DialectParameters::Declarative(&SYNTHETIC_DECLARATIVE_SPEC),
-            },
-        ];
-
-        let prepared = prepare_format_profile_with_registry("same template", &registry);
-        assert_eq!(prepared.identity, None);
-        assert!(prepared.dialect.is_none());
-        assert!(prepared
-            .native_tool_unavailable_reason
-            .as_deref()
-            .is_some_and(|reason| reason.contains("multiple registered format profiles")));
     }
 
     #[test]
@@ -1449,151 +1034,12 @@ mod tests {
     }
 
     #[test]
-    fn production_registry_has_one_exact_expected_entry_per_fixture() {
-        let qwen3_current = QWEN3_CURRENT_FIXTURE_WITH_TERMINATOR
-            .strip_suffix('\n')
-            .expect("the fixture-only file terminator is documented");
-        let qwen3_older: serde_json::Value =
-            serde_json::from_str(QWEN3_OLDER_TOKENIZER_CONFIG).unwrap();
-        let qwen3_older = qwen3_older["chat_template"].as_str().unwrap();
-        let strip_fixture_terminator = |fixture: &'static str| {
-            fixture
-                .strip_suffix('\n')
-                .expect("the fixture-only file terminator is documented")
-        };
-        let fixtures = vec![
-            (
-                QWEN25_FIXTURE,
-                QWEN25_TEMPLATE_SIGNATURE,
-                "qwen.qwen2.5.xml-tools.acbd9653",
-            ),
-            (
-                qwen3_older,
-                QWEN3_TEMPLATE_16706FC5_SIGNATURE,
-                "qwen.qwen3.xml-tools.16706fc5",
-            ),
-            (
-                qwen3_current,
-                QWEN3_TEMPLATE_7E4AE267_SIGNATURE,
-                "qwen.qwen3.xml-tools.7e4ae267",
-            ),
-            (
-                QWEN3_VL_FIXTURE,
-                QWEN3_VL_TEMPLATE_SIGNATURE,
-                "qwen.qwen3-vl.xml-tools.89644892",
-            ),
-            (
-                HERMES2_PRO_TOOL_USE_FIXTURE,
-                HERMES2_PRO_TOOL_USE_TEMPLATE_SIGNATURE,
-                "hermes.xml-tools.7ce09d55",
-            ),
-            (
-                MISTRAL7_V03_FIXTURE,
-                MISTRAL7_V03_TEMPLATE_SIGNATURE,
-                "mistral.mistral-7b-v0.3.json-list-tools.e16746b4",
-            ),
-            (
-                MINISTRAL8_2410_FIXTURE,
-                MINISTRAL8_2410_TEMPLATE_SIGNATURE,
-                "mistral.ministral-8b-2410.json-list-tools.e4676cb5",
-            ),
-            (
-                LLAMA31_33_FIXTURE,
-                LLAMA31_33_TEMPLATE_SIGNATURE,
-                "meta.llama-3.1-3.3.json-tools.e10ca381",
-            ),
-            (
-                LLAMA32_FIXTURE,
-                LLAMA32_TEMPLATE_SIGNATURE,
-                "meta.llama-3.2.json-tools.5816fce1",
-            ),
-            (
-                LLAMA4_FIXTURE,
-                LLAMA4_TEMPLATE_SIGNATURE,
-                "meta.llama-4.json-tools.01a91bfb",
-            ),
-            (
-                strip_fixture_terminator(NEMOTRON_NANO_FIXTURE_WITH_TERMINATOR),
-                NEMOTRON_NANO_TEMPLATE_SIGNATURE,
-                "nvidia.llama-3.1-nemotron-nano.json-list-tools.072b9ab4",
-            ),
-            (
-                strip_fixture_terminator(NEMOTRON_NANO_V2_FIXTURE_WITH_TERMINATOR),
-                NEMOTRON_NANO_V2_TEMPLATE_SIGNATURE,
-                "nvidia.nemotron-nano-v2.json-list-tools.b7a3a520",
-            ),
-            (
-                strip_fixture_terminator(GPT_OSS_HARMONY_CURRENT_FIXTURE_WITH_TERMINATOR),
-                GPT_OSS_HARMONY_CURRENT_TEMPLATE_SIGNATURE,
-                "openai.gpt-oss.harmony.a4c9919c",
-            ),
-            (
-                strip_fixture_terminator(GPT_OSS_HARMONY_ESCAPED_FIXTURE_WITH_TERMINATOR),
-                GPT_OSS_HARMONY_ESCAPED_TEMPLATE_SIGNATURE,
-                "openai.gpt-oss.harmony.b474759b",
-            ),
-            (
-                strip_fixture_terminator(GPT_OSS_HARMONY_INITIAL_FIXTURE_WITH_TERMINATOR),
-                GPT_OSS_HARMONY_INITIAL_TEMPLATE_SIGNATURE,
-                "openai.gpt-oss.harmony.f8d92557",
-            ),
-            (
-                strip_fixture_terminator(LFM2_CLASSIC_FIXTURE_WITH_TERMINATOR),
-                LFM2_CLASSIC_TEMPLATE_SIGNATURE,
-                "liquid.lfm2.python-tools.cef18740",
-            ),
-            (
-                strip_fixture_terminator(LFM2_CLASSIC_COMPACT_FIXTURE_WITH_TERMINATOR),
-                LFM2_CLASSIC_COMPACT_TEMPLATE_SIGNATURE,
-                "liquid.lfm2.python-tools.89e790f0",
-            ),
-            (
-                strip_fixture_terminator(LFM25_8B_FIXTURE_WITH_TERMINATOR),
-                LFM25_8B_TEMPLATE_SIGNATURE,
-                "liquid.lfm2.5.python-tools.6d65c880",
-            ),
-            (
-                strip_fixture_terminator(LFM25_VL_FIXTURE_WITH_TERMINATOR),
-                LFM25_VL_TEMPLATE_SIGNATURE,
-                "liquid.lfm2.5-vl.python-tools.309e586e",
-            ),
-            (
-                DEEPSEEK_V3_TOOL_FIXTURE,
-                DEEPSEEK_V3_TOOL_TEMPLATE_SIGNATURE,
-                "deepseek.v3.structural-json-tools.a3b4449b",
-            ),
-            (
-                DEEPSEEK_V31_TOOL_FIXTURE,
-                DEEPSEEK_V31_TOOL_TEMPLATE_SIGNATURE,
-                "deepseek.v3.1.structural-json-tools.07b65954",
-            ),
-        ];
-
-        let production_entries = FORMAT_REGISTRY
-            .iter()
-            .filter(|entry| !entry.identity.starts_with("safemlx."))
-            .count();
-        assert_eq!(production_entries, fixtures.len());
-        for (template, expected_signature, expected_identity) in fixtures {
-            assert_eq!(
-                template_signature(template),
-                expected_signature,
-                "{expected_identity}"
-            );
-            let matches = matching_registry_entries(template, FORMAT_REGISTRY);
-            assert_eq!(matches.len(), 1, "{expected_identity}");
-            assert_eq!(matches[0].identity, expected_identity);
-        }
-    }
-
-    #[test]
     fn gemma_template_hashes_are_audit_provenance_not_runtime_keys() {
         for (template, expected_signature) in [
             (GEMMA4_EDGE_FIXTURE, GEMMA4_EDGE_TEMPLATE_SIGNATURE),
             (GEMMA4_LARGE_FIXTURE, GEMMA4_LARGE_TEMPLATE_SIGNATURE),
         ] {
             assert_eq!(template_signature(template), expected_signature);
-            assert!(matching_registry_entries(template, FORMAT_REGISTRY).is_empty());
             assert!(prepare_format_profile(template).dialect.is_none());
         }
         let unsloth = UNSLOTH_GEMMA4_FIXTURE_WITH_TERMINATOR
@@ -1603,65 +1049,7 @@ mod tests {
             template_signature(unsloth),
             UNSLOTH_GEMMA4_TEMPLATE_SIGNATURE
         );
-        assert!(matching_registry_entries(unsloth, FORMAT_REGISTRY).is_empty());
         assert!(prepare_format_profile(unsloth).dialect.is_none());
-    }
-
-    #[test]
-    fn every_registered_response_format_has_cross_dialect_golden_and_boundary_coverage() {
-        let covered = [
-            DialectParameters::Declarative(&QWEN_XML_TOOL_SPEC),
-            DialectParameters::Declarative(&QWEN3_XML_TOOL_SPEC),
-            DialectParameters::Declarative(&MISTRAL_JSON_LIST_TOOL_SPEC),
-            DialectParameters::Declarative(&MINISTRAL_JSON_LIST_TOOL_SPEC),
-            DialectParameters::Declarative(&LLAMA3_JSON_TOOL_SPEC),
-            DialectParameters::Declarative(&LLAMA4_JSON_TOOL_SPEC),
-            DialectParameters::Declarative(&NEMOTRON_NANO_JSON_LIST_TOOL_SPEC),
-            DialectParameters::Declarative(&NEMOTRON_NANO_V2_JSON_LIST_TOOL_SPEC),
-            DialectParameters::Custom(&GPT_OSS_HARMONY_PARAMETERS),
-            DialectParameters::Custom(&LFM2_PARAMETERS),
-            DialectParameters::Declarative(&DEEPSEEK_STRUCTURAL_JSON_TOOL_SPEC),
-            DialectParameters::Declarative(&DEEPSEEK31_STRUCTURAL_JSON_TOOL_SPEC),
-            DialectParameters::Declarative(&SYNTHETIC_DECLARATIVE_SPEC),
-        ];
-
-        for entry in FORMAT_REGISTRY {
-            assert!(
-                covered
-                    .iter()
-                    .any(|parameters| parameters.ptr_eq(entry.parameters)),
-                "{} lacks cross-dialect prompt, semantic-event, and exhaustive split-boundary coverage",
-                entry.identity
-            );
-        }
-        for parameters in covered {
-            assert!(
-                FORMAT_REGISTRY
-                    .iter()
-                    .any(|entry| parameters.ptr_eq(entry.parameters)),
-                "the boundary coverage manifest contains a stale response format"
-            );
-        }
-    }
-
-    #[test]
-    fn compatible_cross_architecture_templates_share_dialect_implementations() {
-        let llama_nemotron = NEMOTRON_NANO_FIXTURE_WITH_TERMINATOR
-            .strip_suffix('\n')
-            .unwrap();
-        let nemotron_h = NEMOTRON_NANO_V2_FIXTURE_WITH_TERMINATOR
-            .strip_suffix('\n')
-            .unwrap();
-        let llama_entry = matching_registry_entries(llama_nemotron, FORMAT_REGISTRY)[0];
-        let nemotron_h_entry = matching_registry_entries(nemotron_h, FORMAT_REGISTRY)[0];
-        assert!(std::ptr::eq(llama_entry.dialect, nemotron_h_entry.dialect));
-        assert!(!llama_entry.parameters.ptr_eq(nemotron_h_entry.parameters));
-
-        let qwen_entry = matching_registry_entries(QWEN25_FIXTURE, FORMAT_REGISTRY)[0];
-        let llama_hermes_entry =
-            matching_registry_entries(HERMES2_PRO_TOOL_USE_FIXTURE, FORMAT_REGISTRY)[0];
-        assert!(std::ptr::eq(qwen_entry.dialect, llama_hermes_entry.dialect));
-        assert!(qwen_entry.parameters.ptr_eq(llama_hermes_entry.parameters));
     }
 
     #[test]
@@ -1677,289 +1065,7 @@ mod tests {
         assert!(prepared
             .native_tool_unavailable_reason
             .as_deref()
-            .is_some_and(|reason| reason.contains("no registered format profile")));
-    }
-
-    #[test]
-    fn every_audited_production_template_revision_has_an_exact_registration() {
-        let qwen3_current = QWEN3_CURRENT_FIXTURE_WITH_TERMINATOR
-            .strip_suffix('\n')
-            .expect("the fixture-only file terminator is documented");
-        let qwen3_older: serde_json::Value =
-            serde_json::from_str(QWEN3_OLDER_TOKENIZER_CONFIG).unwrap();
-        let qwen3_older = qwen3_older["chat_template"].as_str().unwrap();
-        let fixtures = [
-            (
-                QWEN25_FIXTURE,
-                QWEN25_TEMPLATE_SIGNATURE,
-                "qwen.qwen2.5.xml-tools.acbd9653",
-            ),
-            (
-                qwen3_older,
-                QWEN3_TEMPLATE_16706FC5_SIGNATURE,
-                "qwen.qwen3.xml-tools.16706fc5",
-            ),
-            (
-                qwen3_current,
-                QWEN3_TEMPLATE_7E4AE267_SIGNATURE,
-                "qwen.qwen3.xml-tools.7e4ae267",
-            ),
-            (
-                QWEN3_VL_FIXTURE,
-                QWEN3_VL_TEMPLATE_SIGNATURE,
-                "qwen.qwen3-vl.xml-tools.89644892",
-            ),
-            (
-                HERMES2_PRO_TOOL_USE_FIXTURE,
-                HERMES2_PRO_TOOL_USE_TEMPLATE_SIGNATURE,
-                "hermes.xml-tools.7ce09d55",
-            ),
-        ];
-
-        for (template, signature, identity) in fixtures {
-            assert_eq!(template_signature(template), signature, "{identity}");
-            let prepared = prepare_format_profile(template);
-            assert_eq!(prepared.identity.as_deref(), Some(identity));
-            assert!(prepared.dialect.is_some(), "{identity}");
-            assert_eq!(prepared.required_structural_tokens, ["<|im_end|>"]);
-            assert_eq!(prepared.stop_sequences, ["<|im_end|>"]);
-        }
-
-        for (template, signature, identity) in [
-            (
-                MISTRAL7_V03_FIXTURE,
-                MISTRAL7_V03_TEMPLATE_SIGNATURE,
-                "mistral.mistral-7b-v0.3.json-list-tools.e16746b4",
-            ),
-            (
-                MINISTRAL8_2410_FIXTURE,
-                MINISTRAL8_2410_TEMPLATE_SIGNATURE,
-                "mistral.ministral-8b-2410.json-list-tools.e4676cb5",
-            ),
-        ] {
-            assert_eq!(template_signature(template), signature, "{identity}");
-            let prepared = prepare_format_profile(template);
-            assert_eq!(prepared.identity.as_deref(), Some(identity));
-            assert!(prepared.dialect.is_some(), "{identity}");
-            assert_eq!(
-                prepared.required_structural_tokens,
-                ["[TOOL_CALLS]", "</s>"]
-            );
-            assert_eq!(prepared.stop_sequences, ["</s>"]);
-        }
-
-        let modified = format!("{QWEN25_FIXTURE} ");
-        assert!(prepare_format_profile(&modified).dialect.is_none());
-
-        let nemotron = NEMOTRON_NANO_FIXTURE_WITH_TERMINATOR
-            .strip_suffix('\n')
-            .expect("the fixture-only file terminator is documented");
-        let nemotron_v2 = NEMOTRON_NANO_V2_FIXTURE_WITH_TERMINATOR
-            .strip_suffix('\n')
-            .expect("the fixture-only file terminator is documented");
-        for (template, signature, identity, structural_tokens, stops) in [
-            (
-                LLAMA31_33_FIXTURE,
-                LLAMA31_33_TEMPLATE_SIGNATURE,
-                "meta.llama-3.1-3.3.json-tools.e10ca381",
-                &["<|eot_id|>"][..],
-                &["<|eot_id|>"][..],
-            ),
-            (
-                LLAMA32_FIXTURE,
-                LLAMA32_TEMPLATE_SIGNATURE,
-                "meta.llama-3.2.json-tools.5816fce1",
-                &["<|eot_id|>"][..],
-                &["<|eot_id|>"][..],
-            ),
-            (
-                LLAMA4_FIXTURE,
-                LLAMA4_TEMPLATE_SIGNATURE,
-                "meta.llama-4.json-tools.01a91bfb",
-                &["<|python_start|>", "<|python_end|>", "<|eot|>"][..],
-                &["<|eot|>"][..],
-            ),
-            (
-                nemotron,
-                NEMOTRON_NANO_TEMPLATE_SIGNATURE,
-                "nvidia.llama-3.1-nemotron-nano.json-list-tools.072b9ab4",
-                &["<|eot_id|>"][..],
-                &["<|eot_id|>"][..],
-            ),
-            (
-                nemotron_v2,
-                NEMOTRON_NANO_V2_TEMPLATE_SIGNATURE,
-                "nvidia.nemotron-nano-v2.json-list-tools.b7a3a520",
-                &["<SPECIAL_12>"][..],
-                &["<SPECIAL_12>"][..],
-            ),
-        ] {
-            assert_eq!(template_signature(template), signature, "{identity}");
-            let prepared = prepare_format_profile(template);
-            assert_eq!(prepared.identity.as_deref(), Some(identity));
-            assert!(prepared.dialect.is_some(), "{identity}");
-            assert_eq!(prepared.required_structural_tokens, structural_tokens);
-            assert_eq!(prepared.stop_sequences, stops);
-        }
-
-        for modified in [
-            format!("{LLAMA31_33_FIXTURE} "),
-            format!("{LLAMA32_FIXTURE} "),
-            format!("{LLAMA4_FIXTURE} "),
-            format!("{nemotron} "),
-            format!("{nemotron_v2} "),
-            "{{ bos_token }} generic Llama template".to_owned(),
-        ] {
-            assert!(prepare_format_profile(&modified).dialect.is_none());
-        }
-
-        for (template, signature, identity, reasoning_kwarg) in [
-            (
-                DEEPSEEK_V3_TOOL_FIXTURE,
-                DEEPSEEK_V3_TOOL_TEMPLATE_SIGNATURE,
-                "deepseek.v3.structural-json-tools.a3b4449b",
-                "enable_thinking",
-            ),
-            (
-                DEEPSEEK_V31_TOOL_FIXTURE,
-                DEEPSEEK_V31_TOOL_TEMPLATE_SIGNATURE,
-                "deepseek.v3.1.structural-json-tools.07b65954",
-                "thinking",
-            ),
-        ] {
-            assert_eq!(template_signature(template), signature, "{identity}");
-            let prepared = prepare_format_profile(template);
-            assert_eq!(prepared.identity.as_deref(), Some(identity));
-            assert!(prepared.dialect.is_some(), "{identity}");
-            assert_eq!(
-                prepared.required_structural_tokens,
-                [
-                    "<｜tool▁calls▁begin｜>",
-                    "<｜tool▁calls▁end｜>",
-                    "<｜tool▁call▁begin｜>",
-                    "<｜tool▁call▁end｜>",
-                    "<｜tool▁sep｜>",
-                    "<｜end▁of▁sentence｜>",
-                ]
-            );
-            assert_eq!(prepared.stop_sequences, ["<｜end▁of▁sentence｜>"]);
-            assert_eq!(prepared.reasoning_template_kwarg, reasoning_kwarg);
-            assert!(!prepared.supports_tool_reasoning);
-        }
-        assert!(
-            prepare_format_profile(&format!("{DEEPSEEK_V3_TOOL_FIXTURE} "))
-                .dialect
-                .is_none()
-        );
-        assert!(
-            prepare_format_profile("{{ bos_token }} generic DeepSeek architecture template")
-                .dialect
-                .is_none()
-        );
-
-        let gpt_oss_current = GPT_OSS_HARMONY_CURRENT_FIXTURE_WITH_TERMINATOR
-            .strip_suffix('\n')
-            .expect("the fixture-only file terminator is documented");
-        let gpt_oss_escaped = GPT_OSS_HARMONY_ESCAPED_FIXTURE_WITH_TERMINATOR
-            .strip_suffix('\n')
-            .expect("the fixture-only file terminator is documented");
-        let gpt_oss_initial = GPT_OSS_HARMONY_INITIAL_FIXTURE_WITH_TERMINATOR
-            .strip_suffix('\n')
-            .expect("the fixture-only file terminator is documented");
-        for (template, signature, identity) in [
-            (
-                gpt_oss_current,
-                GPT_OSS_HARMONY_CURRENT_TEMPLATE_SIGNATURE,
-                "openai.gpt-oss.harmony.a4c9919c",
-            ),
-            (
-                gpt_oss_escaped,
-                GPT_OSS_HARMONY_ESCAPED_TEMPLATE_SIGNATURE,
-                "openai.gpt-oss.harmony.b474759b",
-            ),
-            (
-                gpt_oss_initial,
-                GPT_OSS_HARMONY_INITIAL_TEMPLATE_SIGNATURE,
-                "openai.gpt-oss.harmony.f8d92557",
-            ),
-        ] {
-            assert_eq!(template_signature(template), signature, "{identity}");
-            let prepared = prepare_format_profile(template);
-            assert_eq!(prepared.identity.as_deref(), Some(identity));
-            assert!(prepared.dialect.is_some(), "{identity}");
-            assert_eq!(
-                prepared.required_structural_tokens,
-                [
-                    "<|start|>",
-                    "<|end|>",
-                    "<|message|>",
-                    "<|channel|>",
-                    "<|constrain|>",
-                    "<|return|>",
-                    "<|call|>",
-                ]
-            );
-            assert_eq!(prepared.stop_sequences, ["<|return|>", "<|call|>"]);
-        }
-
-        assert!(prepare_format_profile(&format!("{gpt_oss_current} "))
-            .dialect
-            .is_none());
-        assert!(
-            prepare_format_profile("{{ messages }} generic GPT-OSS architecture template")
-                .dialect
-                .is_none()
-        );
-    }
-
-    #[test]
-    fn lfm2_released_templates_have_exact_custom_dialect_registrations() {
-        let fixtures = [
-            (
-                LFM2_CLASSIC_FIXTURE_WITH_TERMINATOR,
-                LFM2_CLASSIC_TEMPLATE_SIGNATURE,
-                "liquid.lfm2.python-tools.cef18740",
-            ),
-            (
-                LFM2_CLASSIC_COMPACT_FIXTURE_WITH_TERMINATOR,
-                LFM2_CLASSIC_COMPACT_TEMPLATE_SIGNATURE,
-                "liquid.lfm2.python-tools.89e790f0",
-            ),
-            (
-                LFM25_8B_FIXTURE_WITH_TERMINATOR,
-                LFM25_8B_TEMPLATE_SIGNATURE,
-                "liquid.lfm2.5.python-tools.6d65c880",
-            ),
-            (
-                LFM25_VL_FIXTURE_WITH_TERMINATOR,
-                LFM25_VL_TEMPLATE_SIGNATURE,
-                "liquid.lfm2.5-vl.python-tools.309e586e",
-            ),
-        ];
-
-        for (fixture, signature, identity) in fixtures {
-            let template = fixture
-                .strip_suffix('\n')
-                .expect("the fixture-only file terminator is documented");
-            assert_eq!(template_signature(template), signature, "{identity}");
-            let prepared = prepare_format_profile(template);
-            assert_eq!(prepared.identity.as_deref(), Some(identity));
-            assert!(prepared.dialect.is_some(), "{identity}");
-            assert_eq!(
-                prepared.required_structural_tokens,
-                ["<|tool_call_start|>", "<|tool_call_end|>", "<|im_end|>"]
-            );
-            assert_eq!(prepared.stop_sequences, ["<|tool_call_end|>", "<|im_end|>"]);
-            assert!(prepare_format_profile(&format!("{template} "))
-                .dialect
-                .is_none());
-        }
-
-        assert!(
-            prepare_format_profile("{{ messages }} generic LiquidAI LFM2 template")
-                .dialect
-                .is_none()
-        );
+            .is_some_and(|reason| reason.contains("no behavioral format recognizer")));
     }
 
     #[test]

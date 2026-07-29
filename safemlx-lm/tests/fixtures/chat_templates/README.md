@@ -35,8 +35,8 @@ behavior; repository or model metadata is not a support key.
 
 The Hermes fixture body is also byte-identical to the named `tool_use`
 template in `NousResearch/Hermes-3-Llama-3.1-8B` revision
-`896ea440e5a9e6070e3d8a2774daf2b481ab425b`. The shared signature therefore
-selects one generic Hermes profile without inspecting either model's
+`896ea440e5a9e6070e3d8a2774daf2b481ab425b`. Both bodies satisfy the same
+generic XML-tool protocol probes without inspecting either model's
 architecture metadata.
 
 The earlier Qwen3 revision is retained in
@@ -55,15 +55,15 @@ The Llama 3.1 fixture is byte-identical to
 `6f6073b423013f6a7d4d9f39144961bfbfbc386b`. The Llama 4 fixture is
 byte-identical to `meta-llama/Llama-4-Maverick-17B-128E-Instruct` revision
 `73d14711bcc77c16df3470856949c3764056b617`. Those shared bodies intentionally
-share exact registrations; no family or repository metadata is inspected.
+share protocol behavior; no family or repository metadata is inspected.
 The upstream Nemotron body does not end in a line feed, so its fixture carries
 one repository file terminator that signature tests remove explicitly.
 
 The Nemotron Nano v2 body is byte-identical in
 `nvidia/NVIDIA-Nemotron-Nano-12B-v2` revision
 `f428df0ec725fed457b89cfca54dc26500fb88c1`. Both Nemotron-H releases share
-one exact registration. Their JSON-list call envelope reuses the declarative
-Nemotron implementation also used by the Llama-based Nano v1 registration,
+one recognized protocol. Their JSON-list call envelope reuses the declarative
+Nemotron implementation also used by the Llama-based Nano v1 protocol,
 with a separate parameter set for the `<SPECIAL_12>` stop and the reasoning
 channel whose `<think>` prefix is already present in the generation prompt.
 The upstream body does not end in a line feed, so its fixture carries one
@@ -100,24 +100,25 @@ explicitly.
 
 The classic LFM2 body is byte-identical in the current official 350M, 700M,
 and 1.2B releases. The compact body is byte-identical in the current official
-1.2B-Tool, 2.6B, and 8B-A1B releases. The four upstream LFM2 bodies do not end
-in a line feed, so their fixtures carry one repository file terminator that
-signature and rendering tests remove explicitly.
+1.2B-Tool, 2.6B, and 8B-A1B releases. Those classic templates render tool
+definitions and opaque message content, but do not render structured
+`tool_calls` into a verifiable output envelope. They therefore remain
+provenance fixtures and are not recognized for native tool generation.
 
-These released templates establish a Python-call list between
-`<|tool_call_start|>` and `<|tool_call_end|>`. The LFM2.5 render macros emit
-calls such as `name(argument='value')`; non-string values use Python spelling,
-while nested mappings are rendered through `tojson`. This is intentionally a
-custom dialect: the declarative dialects only admit JSON objects, JSON lists,
-or their fixed structural-object encoding and cannot safely describe Python
+The LFM2.5 templates establish a Python-call list between
+`<|tool_call_start|>` and `<|tool_call_end|>`. Their render macros emit calls
+such as `name(argument='value')`; non-string values use Python spelling, while
+nested mappings are rendered through `tojson`. This is intentionally a custom
+dialect: the declarative dialects only admit JSON objects, JSON lists, or their
+fixed structural-object encoding and cannot safely describe Python
 identifiers, keyword arguments, single-quoted strings, `True`/`False`/`None`,
 or the released mixed Python/JSON nested value surface.
 
 The DeepSeek V3 fixture is the exact tool template recommended by SGLang's
 DeepSeek V3 deployment documentation. The V3.1 fixture is the maintained
 successor for the revised direct `name<｜tool▁sep｜>{arguments}` call surface.
-Both bodies end in a line feed and are stored unchanged. Their registrations
-use the generic declarative named-JSON-arguments shape: V3 adds the literal
+Both bodies end in a line feed and are stored unchanged. Recognition binds
+them to the generic declarative named-JSON-arguments shape: V3 adds the literal
 `function` kind and a fenced JSON object, while V3.1 directly joins adjacent
 call envelopes. Tool names are restricted to the DeepSeek API's documented
 64-character ASCII letter, digit, underscore, and dash surface, and argument
@@ -125,21 +126,21 @@ objects are constrained by each declared JSON Schema.
 
 V3.1's `thinking` template variable is wired to the caller's standard
 `enable_thinking` control. Thinking is rejected while tools are supplied for
-both registered profiles: these selected call surfaces permit free-form text
+both recognized profiles: these selected call surfaces permit free-form text
 before a call but do not delimit it sufficiently to preserve reasoning as
 reasoning events. Disabled thinking retains each template's exact generation
 prompt, including V3.1's prefilled `</think>`.
 
 DeepSeek's released tokenizer templates for V3, R1, and V3.1 preserve prior
 tool calls and results but do not render supplied tool definitions, so they
-are not native-tool registrations. The maintained SGLang R1 tool template is
-also intentionally excluded: its tool prompt indexes bare function
+are not recognized native-tool protocols. The maintained SGLang R1 tool
+template is also intentionally excluded: its tool prompt indexes bare function
 definitions (`tool['name']`) instead of the OpenAI tool envelopes accepted by
 the renderer, and its free-form reasoning stream cannot be reported as
 reasoning events by this declarative profile. DeepSeek V3.2 is likewise not
 mapped to SGLang's older V3.2 Jinja template. The authoritative V3.2 release
 replaced that surface with the Python `encoding/encoding_dsv32.py` DSML
 encoder/parser, has no selected Jinja template body to sign, and uses
-parameter-level DSML rather than this JSON protocol. Registering either
+parameter-level DSML rather than this JSON protocol. Recognizing either
 candidate would overstate safe support; neither architecture nor repository
 metadata is used as a fallback.

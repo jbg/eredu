@@ -1,8 +1,4 @@
-//! Internal format-dialect implementations and exact template registry.
-//!
-//! Template matching, output syntax, and registry selection are deliberately
-//! separate here. A registry entry contains only an audited template signature,
-//! a dialect implementation, and the parameters for that implementation.
+//! Internal format-dialect implementations.
 
 #![allow(dead_code)]
 
@@ -2333,27 +2329,6 @@ impl ProtocolParser for DeclarativeParser {
     }
 }
 
-/// One exact template-signature mapping.
-#[derive(Clone, Copy)]
-pub(crate) struct FormatRegistryEntry {
-    pub(crate) identity: &'static str,
-    pub(crate) template_signature: [u8; 32],
-    pub(crate) dialect: &'static dyn FormatDialect,
-    pub(crate) parameters: DialectParameters,
-}
-
-impl fmt::Debug for FormatRegistryEntry {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("FormatRegistryEntry")
-            .field("identity", &self.identity)
-            .field("template_signature", &self.template_signature)
-            .field("dialect", &self.dialect)
-            .field("parameters", &self.parameters)
-            .finish()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use llguidance::{api::TopLevelGrammar, toktrie::TokenId};
@@ -2362,16 +2337,12 @@ mod tests {
     use super::{
         ConstraintConfiguration, DeclarativeCallId, DeclarativeDialectSpec,
         DeclarativePayloadShape, DelimitedChannel, DialectParameters, ExactEnvelope, FormatDialect,
-        FormatRegistryEntry, GenerationPromptBehavior, JsonFunctionEnvelope,
-        NamedJsonArgumentsEncoding, ParallelCallLayout, StructuralObjectEncoding,
-        ToolNameConstraint, DECLARATIVE_DIALECT,
+        GenerationPromptBehavior, JsonFunctionEnvelope, NamedJsonArgumentsEncoding,
+        ParallelCallLayout, StructuralObjectEncoding, ToolNameConstraint, DECLARATIVE_DIALECT,
     };
     use crate::{
         runtime::chat::constraints::ConstraintCompiler,
-        runtime::chat::{
-            prepare_format_profile_with_registry, template_signature, ParallelToolCallPolicy,
-            ToolChoice,
-        },
+        runtime::chat::{ParallelToolCallPolicy, ToolChoice},
         runtime::generation::streaming::{
             FinishReason, ProtocolParser, SemanticEvent, SemanticEventSink,
         },
@@ -3786,22 +3757,24 @@ mod tests {
     static CUSTOM_DIALECT: CustomDialect = CustomDialect;
 
     #[test]
-    fn custom_dialect_uses_the_same_interface_and_registry_binding() {
+    fn custom_dialect_uses_the_shared_interface() {
         let parameters = DialectParameters::Custom(&CUSTOM_PARAMETERS);
-        let registry = [FormatRegistryEntry {
-            identity: "synthetic.custom.v1",
-            template_signature: template_signature("custom template"),
-            dialect: &CUSTOM_DIALECT,
-            parameters,
-        }];
-        let prepared = prepare_format_profile_with_registry("custom template", &registry);
-        assert_eq!(prepared.identity.as_deref(), Some("synthetic.custom.v1"));
         assert_eq!(
-            prepared.generation_prompt_behavior,
+            CUSTOM_DIALECT
+                .generation_prompt_behavior(parameters)
+                .unwrap(),
             GenerationPromptBehavior::Always
         );
-        assert_eq!(prepared.required_structural_tokens, ["<custom>"]);
-        assert_eq!(prepared.stop_sequences, ["CUSTOM_END"]);
+        assert_eq!(
+            CUSTOM_DIALECT
+                .required_structural_tokens(parameters)
+                .unwrap(),
+            ["<custom>"]
+        );
+        assert_eq!(
+            CUSTOM_DIALECT.stop_sequences(parameters).unwrap(),
+            ["CUSTOM_END"]
+        );
 
         let compiler = ConstraintCompiler::synthetic_for_tests();
         let plan = compiler

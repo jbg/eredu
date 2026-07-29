@@ -80,8 +80,8 @@ same-GPU split streams.
 
 Add an ignored real-checkpoint smoke test keyed by a documented environment
 variable. It must load the checkpoint, prepare one valid tool request, assert
-the expected registered profile prefix, and fail clearly when the checkpoint
-path is missing. Never download checkpoints from a test.
+the expected recognized protocol identity, and fail clearly when the
+checkpoint path is missing. Never download checkpoints from a test.
 
 Before committing, run:
 

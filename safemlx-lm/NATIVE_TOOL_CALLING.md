@@ -147,6 +147,15 @@ implementations rather than model architectures or template artifacts:
 - OpenAI Harmony channels and function recipients for GPT-OSS.
 - LFM2/LFM2.5 Python-call lists with canonical JSON argument events.
 
+Recognized identities are stable protocol versions:
+`xml-tools.v1`, `qwen.xml-tools.reasoning.v1`,
+`mistral.json-list-tools.v1`, `mistral.json-list-tools.compact.v1`,
+`llama.json-tools.v1`, `llama.python-channel-tools.v1`,
+`nemotron.json-list-tools.v1`, `nemotron.json-list-tools.reasoning.v1`,
+`gemma.channels.v1`, `harmony.channels.v1`, `lfm2.python-tools.v1`,
+`deepseek.structural-json-tools.v1`, and
+`deepseek.structural-json-tools.v2`.
+
 Several unrelated architectures intentionally share one declarative
 implementation when their byte-level response protocol is identical. A custom
 dialect is reserved for a surface that cannot be expressed declaratively, such

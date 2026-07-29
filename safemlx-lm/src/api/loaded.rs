@@ -1454,9 +1454,9 @@ impl LoadedModel {
     ///
     /// The selected checkpoint template is rendered with and without its
     /// generation prompt so the appended contribution is available
-    /// independently. Native tool support is reported only when the exact
-    /// selected template signature has one unambiguous registered format
-    /// profile.
+    /// independently. Native tool support is reported only when atomic
+    /// structural-token facts and bounded render probes establish one
+    /// unambiguous wire protocol.
     pub fn prepare_chat(&mut self, request: ChatTemplateRequest) -> Result<PreparedChat, Error> {
         let template = self
             .chat_template

@@ -674,6 +674,385 @@ fn recognize_gemma_protocol(
     })
 }
 
+fn render_protocol_probe(
+    tokenizer: &mut ChatTokenizer,
+    selected_template: &ModelChatTemplate,
+    model_id: &str,
+    arguments: serde_json::Value,
+) -> Option<String> {
+    let tools = vec![serde_json::json!({
+        "type": "function",
+        "function": {
+            "name": "safemlx_probe_7c91",
+            "description": "protocol recognition probe",
+            "parameters": {
+                "type": "object",
+                "properties": {"value": {"type": "string"}},
+                "required": ["value"],
+                "additionalProperties": false
+            }
+        }
+    })];
+    let messages = vec![
+        serde_json::json!({"role": "user", "content": "__safemlx_user_probe__"}),
+        serde_json::json!({
+            "role": "assistant",
+            "content": "",
+            "reasoning_content": "__safemlx_reasoning_probe__",
+            "thinking": "__safemlx_reasoning_probe__",
+            "tool_calls": [{
+                "id": "abc123456",
+                "type": "function",
+                "function": {
+                    "name": "safemlx_probe_7c91",
+                    "arguments": arguments
+                }
+            }]
+        }),
+        serde_json::json!({
+            "role": "tool",
+            "name": "safemlx_probe_7c91",
+            "tool_call_id": "abc123456",
+            "content": "\"__safemlx_tool_result_probe__\""
+        }),
+        serde_json::json!({
+            "role": "assistant",
+            "content": "__safemlx_intermediate_assistant_probe__"
+        }),
+        serde_json::json!({"role": "user", "content": "__safemlx_followup_probe__"}),
+    ];
+    tokenizer
+        .apply_chat_template_json(
+            selected_template.clone(),
+            [messages],
+            Some(&tools),
+            model_id,
+            true,
+            None,
+        )
+        .ok()?
+        .into_iter()
+        .next()
+}
+
+fn render_reasoning_protocol_probe(
+    tokenizer: &mut ChatTokenizer,
+    selected_template: &ModelChatTemplate,
+    model_id: &str,
+) -> Option<String> {
+    tokenizer
+        .apply_chat_template_json(
+            selected_template.clone(),
+            [vec![
+                serde_json::json!({"role": "user", "content": "__safemlx_user_probe__"}),
+                serde_json::json!({
+                    "role": "assistant",
+                    "reasoning_content": "__safemlx_reasoning_probe__",
+                    "content": "__safemlx_visible_probe__"
+                }),
+            ]],
+            Some(&[]),
+            model_id,
+            false,
+            None,
+        )
+        .ok()?
+        .into_iter()
+        .next()
+}
+
+fn recognized_dialect_profile(
+    tokenizer: &ChatTokenizer,
+    identity: &'static str,
+    dialect: &'static dyn crate::runtime::chat::dialect::FormatDialect,
+    parameters: crate::runtime::chat::dialect::DialectParameters,
+    mapping_tool_arguments: bool,
+    string_tool_arguments: bool,
+) -> Option<crate::runtime::chat::PreparedFormatProfile> {
+    let generation_prompt_behavior = dialect.generation_prompt_behavior(parameters).ok()?;
+    let reasoning_template_kwarg = dialect.reasoning_template_kwarg(parameters).ok()?;
+    let supports_tool_reasoning = dialect.supports_tool_reasoning(parameters).ok()?;
+    let required_structural_tokens = dialect
+        .required_structural_tokens(parameters)
+        .ok()?
+        .iter()
+        .map(|token| (*token).to_owned())
+        .collect::<Vec<_>>();
+    let stop_sequences = dialect
+        .stop_sequences(parameters)
+        .ok()?
+        .iter()
+        .map(|stop| (*stop).to_owned())
+        .collect::<Vec<_>>();
+    resolve_structural_tokens(tokenizer, &required_structural_tokens).ok()?;
+    let supports_tool_input_rendering = mapping_tool_arguments || string_tool_arguments;
+
+    Some(crate::runtime::chat::PreparedFormatProfile {
+        identity: Some(identity.into()),
+        dialect: Some(dialect),
+        dialect_parameters: Some(parameters),
+        tool_dialect: Some(dialect),
+        tool_dialect_parameters: Some(parameters),
+        generation_prompt_behavior,
+        reasoning_template_kwarg,
+        supports_reasoning_parsing: dialect.supports_reasoning_parsing(parameters),
+        supports_tool_reasoning,
+        supports_tool_input_rendering,
+        supports_mapping_tool_arguments: mapping_tool_arguments,
+        supports_string_tool_arguments: string_tool_arguments,
+        native_tool_unavailable_reason: (!supports_tool_input_rendering).then(|| {
+            format!(
+                "{identity} output was recognized, but structured tool-history rendering probes failed"
+            )
+        }),
+        required_structural_tokens: required_structural_tokens.clone(),
+        tool_required_structural_tokens: required_structural_tokens,
+        stop_sequences,
+    })
+}
+
+fn recognize_remaining_protocols(
+    tokenizer: &mut ChatTokenizer,
+    selected_template: &ModelChatTemplate,
+    model_id: &str,
+) -> Option<crate::runtime::chat::PreparedFormatProfile> {
+    use crate::{
+        architectures::{
+            gpt_oss::format::{GPT_OSS_HARMONY_PARAMETERS, HARMONY_DIALECT},
+            lfm2::format::{LFM2_DIALECT, LFM2_PARAMETERS},
+        },
+        runtime::chat::{
+            dialect::{DialectParameters, DECLARATIVE_DIALECT},
+            DEEPSEEK31_STRUCTURAL_JSON_TOOL_SPEC, DEEPSEEK_STRUCTURAL_JSON_TOOL_SPEC,
+            LLAMA3_JSON_TOOL_SPEC, LLAMA4_JSON_TOOL_SPEC, MINISTRAL_JSON_LIST_TOOL_SPEC,
+            MISTRAL_JSON_LIST_TOOL_SPEC, NEMOTRON_NANO_JSON_LIST_TOOL_SPEC,
+            NEMOTRON_NANO_V2_JSON_LIST_TOOL_SPEC, QWEN3_XML_TOOL_SPEC, QWEN_XML_TOOL_SPEC,
+        },
+    };
+
+    let mapping = render_protocol_probe(
+        tokenizer,
+        selected_template,
+        model_id,
+        serde_json::json!({"value": "__safemlx_mapping_argument_probe__"}),
+    );
+    let string = render_protocol_probe(
+        tokenizer,
+        selected_template,
+        model_id,
+        serde_json::Value::String(r#"{"value":"__safemlx_string_argument_probe__"}"#.into()),
+    );
+    let supports = |rendered: &Option<String>, required: &[&str]| {
+        rendered
+            .as_deref()
+            .is_some_and(|rendered| required.iter().all(|part| rendered.contains(part)))
+    };
+
+    let harmony_markers = [
+        "assistant to=functions.safemlx_probe_7c91",
+        "<|message|>",
+        "<|call|>",
+        "functions.safemlx_probe_7c91 to=assistant",
+        "__safemlx_tool_result_probe__",
+    ];
+    let harmony_mapping = supports(&mapping, &harmony_markers);
+    let harmony_string = supports(&string, &harmony_markers);
+    if harmony_mapping || harmony_string {
+        return recognized_dialect_profile(
+            tokenizer,
+            "harmony.channels.v1",
+            &HARMONY_DIALECT,
+            DialectParameters::Custom(&GPT_OSS_HARMONY_PARAMETERS),
+            harmony_mapping,
+            harmony_string,
+        );
+    }
+
+    let deepseek_common = [
+        "<｜tool▁calls▁begin｜>",
+        "<｜tool▁call▁begin｜>",
+        "<｜tool▁sep｜>",
+        "safemlx_probe_7c91",
+        "<｜tool▁call▁end｜>",
+        "<｜tool▁calls▁end｜>",
+        "__safemlx_tool_result_probe__",
+    ];
+    let deepseek_mapping = supports(&mapping, &deepseek_common);
+    let deepseek_string = supports(&string, &deepseek_common);
+    if deepseek_mapping || deepseek_string {
+        let rendered = mapping.as_deref().or(string.as_deref())?;
+        let (identity, spec) = if rendered
+            .contains("<｜tool▁call▁begin｜>function<｜tool▁sep｜>safemlx_probe_7c91\n```json\n")
+        {
+            (
+                "deepseek.structural-json-tools.v1",
+                &DEEPSEEK_STRUCTURAL_JSON_TOOL_SPEC,
+            )
+        } else if rendered.contains("<｜tool▁call▁begin｜>safemlx_probe_7c91<｜tool▁sep｜>")
+        {
+            (
+                "deepseek.structural-json-tools.v2",
+                &DEEPSEEK31_STRUCTURAL_JSON_TOOL_SPEC,
+            )
+        } else {
+            return None;
+        };
+        return recognized_dialect_profile(
+            tokenizer,
+            identity,
+            &DECLARATIVE_DIALECT,
+            DialectParameters::Declarative(spec),
+            deepseek_mapping,
+            deepseek_string,
+        );
+    }
+
+    let lfm2_markers = [
+        "<|tool_call_start|>",
+        "safemlx_probe_7c91(",
+        "<|tool_call_end|>",
+        "__safemlx_tool_result_probe__",
+    ];
+    let lfm2_mapping = supports(&mapping, &lfm2_markers);
+    let lfm2_string = supports(&string, &lfm2_markers);
+    if lfm2_mapping || lfm2_string {
+        return recognized_dialect_profile(
+            tokenizer,
+            "lfm2.python-tools.v1",
+            &LFM2_DIALECT,
+            DialectParameters::Custom(&LFM2_PARAMETERS),
+            lfm2_mapping,
+            lfm2_string,
+        );
+    }
+
+    let qwen_markers = [
+        "<tool_call>",
+        "safemlx_probe_7c91",
+        "<tool_response>",
+        "__safemlx_tool_result_probe__",
+    ];
+    let qwen_mapping = supports(&mapping, &qwen_markers);
+    let qwen_string = supports(&string, &qwen_markers);
+    if qwen_mapping || qwen_string {
+        let reasoning = render_reasoning_protocol_probe(tokenizer, selected_template, model_id)
+            .is_some_and(|rendered| {
+                rendered.contains(
+                    "<think>\n__safemlx_reasoning_probe__\n</think>\n\n__safemlx_visible_probe__",
+                )
+            });
+        let (identity, spec) = if reasoning {
+            ("qwen.xml-tools.reasoning.v1", &QWEN3_XML_TOOL_SPEC)
+        } else {
+            ("xml-tools.v1", &QWEN_XML_TOOL_SPEC)
+        };
+        return recognized_dialect_profile(
+            tokenizer,
+            identity,
+            &DECLARATIVE_DIALECT,
+            DialectParameters::Declarative(spec),
+            qwen_mapping,
+            qwen_string,
+        );
+    }
+
+    let mistral_markers = [
+        "[TOOL_CALLS]",
+        "safemlx_probe_7c91",
+        "abc123456",
+        "[TOOL_RESULTS]",
+        "__safemlx_tool_result_probe__",
+    ];
+    let mistral_mapping = supports(&mapping, &mistral_markers);
+    let mistral_string = supports(&string, &mistral_markers);
+    if mistral_mapping || mistral_string {
+        let rendered = mapping.as_deref().or(string.as_deref())?;
+        let (identity, spec) = if rendered.contains("[TOOL_CALLS] [") {
+            ("mistral.json-list-tools.v1", &MISTRAL_JSON_LIST_TOOL_SPEC)
+        } else if rendered.contains("[TOOL_CALLS][") {
+            (
+                "mistral.json-list-tools.compact.v1",
+                &MINISTRAL_JSON_LIST_TOOL_SPEC,
+            )
+        } else {
+            return None;
+        };
+        return recognized_dialect_profile(
+            tokenizer,
+            identity,
+            &DECLARATIVE_DIALECT,
+            DialectParameters::Declarative(spec),
+            mistral_mapping,
+            mistral_string,
+        );
+    }
+
+    let nemotron_markers = [
+        "<TOOLCALL>[",
+        "safemlx_probe_7c91",
+        "<TOOL_RESPONSE>[",
+        "__safemlx_tool_result_probe__",
+    ];
+    let nemotron_mapping = supports(&mapping, &nemotron_markers);
+    let nemotron_string = supports(&string, &nemotron_markers);
+    if nemotron_mapping || nemotron_string {
+        let v2 = resolve_structural_tokens(tokenizer, &["<SPECIAL_12>".into()]).is_ok();
+        let (identity, spec) = if v2 {
+            (
+                "nemotron.json-list-tools.reasoning.v1",
+                &NEMOTRON_NANO_V2_JSON_LIST_TOOL_SPEC,
+            )
+        } else {
+            (
+                "nemotron.json-list-tools.v1",
+                &NEMOTRON_NANO_JSON_LIST_TOOL_SPEC,
+            )
+        };
+        return recognized_dialect_profile(
+            tokenizer,
+            identity,
+            &DECLARATIVE_DIALECT,
+            DialectParameters::Declarative(spec),
+            nemotron_mapping,
+            nemotron_string,
+        );
+    }
+
+    let llama_markers = [
+        "safemlx_probe_7c91",
+        "\"parameters\"",
+        "__safemlx_tool_result_probe__",
+    ];
+    let llama_mapping = supports(&mapping, &llama_markers);
+    let llama_string = supports(&string, &llama_markers);
+    if llama_mapping || llama_string {
+        let llama4 = resolve_structural_tokens(
+            tokenizer,
+            &[
+                "<|python_start|>".into(),
+                "<|python_end|>".into(),
+                "<|eot|>".into(),
+            ],
+        )
+        .is_ok();
+        let (identity, spec) = if llama4 {
+            ("llama.python-channel-tools.v1", &LLAMA4_JSON_TOOL_SPEC)
+        } else {
+            ("llama.json-tools.v1", &LLAMA3_JSON_TOOL_SPEC)
+        };
+        return recognized_dialect_profile(
+            tokenizer,
+            identity,
+            &DECLARATIVE_DIALECT,
+            DialectParameters::Declarative(spec),
+            llama_mapping,
+            llama_string,
+        );
+    }
+
+    None
+}
+
 pub(super) fn prepare_chat_from_parts(
     tokenizer: &mut ChatTokenizer,
     template: ModelChatTemplate,
@@ -684,10 +1063,16 @@ pub(super) fn prepare_chat_from_parts(
 ) -> Result<PreparedChat, Error> {
     let selected = template.select(Some(&request.tools))?;
     let template_identity = selected.identity().clone();
-    let selected_template = ModelChatTemplate::Single(selected.template().to_owned());
+    let selected_template = match &template_identity {
+        ChatTemplateIdentity::Single => ModelChatTemplate::Single(selected.template().to_owned()),
+        ChatTemplateIdentity::Named(name) => ModelChatTemplate::Named(
+            std::collections::BTreeMap::from([(name.clone(), selected.template().to_owned())]),
+        ),
+    };
     let mut profile = prepare_format_profile(selected.template());
     if profile.dialect.is_none() {
         if let Some(recognized) = recognize_gemma_protocol(tokenizer, &selected_template, model_id)
+            .or_else(|| recognize_remaining_protocols(tokenizer, &selected_template, model_id))
         {
             profile = recognized;
         }
@@ -750,9 +1135,7 @@ pub(super) fn prepare_chat_from_parts(
         !request.tools.is_empty() || request.tool_choice == ToolChoice::Required;
     let (native_tool_support, tool_runtime_plan) =
         match (profile.tool_dialect, profile.tool_dialect_parameters) {
-            (Some(dialect), Some(parameters))
-                if semantic_runtime_plan.is_some() && profile.supports_tool_input_rendering =>
-            {
+            (Some(dialect), Some(parameters)) if semantic_runtime_plan.is_some() => {
                 if tool_surface_requested {
                     let tool_structural_token_ids = resolve_structural_tokens(
                         tokenizer,
@@ -825,9 +1208,7 @@ pub(super) fn prepare_chat_from_parts(
             "tool-call history with serialized string arguments was not established",
         ),
         constrained_tool_generation: capability(
-            profile.tool_dialect.is_some()
-                && profile.supports_tool_input_rendering
-                && constraint_compiler.is_some_and(Result::is_ok),
+            profile.tool_dialect.is_some() && constraint_compiler.is_some_and(Result::is_ok),
             "no compatible tokenizer constraint compiler is available",
         ),
     };
