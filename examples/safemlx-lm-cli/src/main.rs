@@ -24,6 +24,7 @@ use safemlx_lm::{
         PreparedChatGenerationRequest, PreparedChatGenerationSettings,
         PreparedChatMtpGenerationOptions, PreparedChatMtpGenerationRequest, TextDecoder,
     },
+    error::Error as LmError,
     runtime::chat::{ChatTemplateRequest, NativeToolSupport, ParallelToolCallPolicy, ToolChoice},
     runtime::checkpoint::quantization::AffineQuantization,
     runtime::execution::layerwise::{LayerwiseLoadOptions, WeightResidency},
@@ -539,6 +540,16 @@ fn write_semantic_event(
     Ok(())
 }
 
+fn use_semantic_generation(support: &NativeToolSupport, tools_requested: bool) -> Result<bool> {
+    match support {
+        NativeToolSupport::Supported => Ok(true),
+        NativeToolSupport::Unsupported { reason } if tools_requested => {
+            bail!("native tool calling is unavailable: {reason}")
+        }
+        NativeToolSupport::Unsupported { .. } => Ok(false),
+    }
+}
+
 fn execution_contexts(
     device: CliDevice,
     mtp_draft_device: MtpDraftDevice,
@@ -693,15 +704,33 @@ fn main() -> Result<()> {
     }
     let load_elapsed = load_started.elapsed();
 
-    let prepared_chat = if let Some(path) = args.tools.as_deref() {
-        let tools = read_tools(path)?;
-        let prepared = model.prepare_chat(ChatTemplateRequest {
+    let tools_requested = args.tools.is_some();
+    let tools = args
+        .tools
+        .as_deref()
+        .map(read_tools)
+        .transpose()?
+        .unwrap_or_default();
+    let (prepared_chat, rendered_prompt, add_special_tokens) = if args.raw {
+        (None, prompt, true)
+    } else {
+        // Preserve the existing explicit-thinking validation for ordinary chat.
+        // Tool templates may select a different template body and are validated
+        // by prepare_chat itself.
+        if !tools_requested && args.thinking != ThinkingMode::Auto {
+            thinking_template_kwargs(args.thinking, &model.chat_template_kwargs()?)?;
+        }
+        let request = ChatTemplateRequest {
             messages: vec![serde_json::json!({
                 "role": "user",
-                "content": prompt,
+                "content": prompt.clone(),
             })],
             tools,
-            tool_choice: args.tool_choice.into(),
+            tool_choice: if tools_requested {
+                args.tool_choice.into()
+            } else {
+                ToolChoice::None
+            },
             parallel_tool_calls: match args.max_parallel_tool_calls {
                 Some(max_calls) => ParallelToolCallPolicy::Enabled {
                     max_calls: Some(max_calls),
@@ -711,42 +740,40 @@ fn main() -> Result<()> {
             enable_thinking: args.thinking.enabled(),
             add_generation_prompt: true,
             ..ChatTemplateRequest::default()
-        })?;
-        if let NativeToolSupport::Unsupported { reason } = prepared.native_tool_support() {
-            bail!("native tool calling is unavailable: {reason}");
-        }
-        if args.verbose {
-            eprintln!(
-                "native_tool_profile: {}",
-                prepared.format_profile_identity().unwrap_or("unregistered")
-            );
-        }
-        Some(prepared)
-    } else {
-        None
-    };
-
-    let (rendered_prompt, add_special_tokens) = if let Some(prepared) = &prepared_chat {
-        (prepared.rendered_prompt().to_owned(), false)
-    } else if args.raw {
-        (prompt, true)
-    } else {
-        let thinking_template_kwargs = if args.thinking == ThinkingMode::Auto {
-            None
-        } else {
-            thinking_template_kwargs(args.thinking, &model.chat_template_kwargs()?)?
         };
-        match model.apply_chat_template_json_with_kwargs(
-            vec![vec![serde_json::json!({
-                "role": "user",
-                "content": prompt,
-            })]],
-            None,
-            true,
-            thinking_template_kwargs.as_ref(),
-        )? {
-            Some(rendered) => (rendered, false),
-            None => (prompt, true),
+        match model.prepare_chat(request) {
+            Ok(prepared) => {
+                let semantic =
+                    use_semantic_generation(prepared.native_tool_support(), tools_requested)?;
+                let rendered_prompt = prepared.rendered_prompt().to_owned();
+                if semantic {
+                    if args.verbose {
+                        let label = if tools_requested {
+                            "native_tool_profile"
+                        } else {
+                            "semantic_profile"
+                        };
+                        eprintln!(
+                            "{label}: {}",
+                            prepared.format_profile_identity().unwrap_or("unregistered")
+                        );
+                    }
+                    (Some(prepared), rendered_prompt, false)
+                } else {
+                    if args.verbose {
+                        eprintln!(
+                            "semantic_profile: unavailable ({}); using templated text fallback",
+                            prepared
+                                .native_tool_support()
+                                .unsupported_reason()
+                                .unwrap_or("unknown reason")
+                        );
+                    }
+                    (None, rendered_prompt, false)
+                }
+            }
+            Err(LmError::MissingChatTemplate) if !tools_requested => (None, prompt, true),
+            Err(error) => return Err(error.into()),
         }
     };
 
@@ -1066,7 +1093,7 @@ fn main() -> Result<()> {
     if args.verbose {
         eprintln!("--- safemlx diagnostics (stderr) ---");
     }
-    if prepared_chat.is_some() || should_report_stop_reason(stop_reason, args.verbose) {
+    if tools_requested || should_report_stop_reason(stop_reason, args.verbose) {
         eprintln!("stop_reason: {}", stop_reason.label());
     }
 
@@ -1794,9 +1821,10 @@ mod tests {
     use super::{
         eval, execution_contexts, format_bytes, select_cached_gguf_from_revisions,
         select_cached_gguf_path, select_revision, should_report_stop_reason, split_hf_model_spec,
-        stop_reason, thinking_template_kwargs, validate_args, Array, CachedGgufRole, Cli,
-        CliDevice, CliToolChoice, DeviceType, MtpDraftDevice, MtpExecutionStreams,
-        MtpSchedulerOptions, StopReason, ThinkingMode,
+        stop_reason, thinking_template_kwargs, use_semantic_generation, validate_args,
+        write_semantic_event, Array, CachedGgufRole, Cli, CliDevice, CliToolChoice, DeviceType,
+        MtpDraftDevice, MtpExecutionStreams, MtpSchedulerOptions, NativeToolSupport, SemanticEvent,
+        StopReason, ThinkingMode,
     };
 
     fn revision(hash: &str, refs: &[&str], modified: u64) -> CachedRevisionInfo {
@@ -1913,6 +1941,44 @@ mod tests {
             validate_args(&raw).is_ok(),
             "raw unconstrained generation remains intentionally supported"
         );
+    }
+
+    #[test]
+    fn registered_profiles_use_semantic_generation_without_tools() {
+        assert!(use_semantic_generation(&NativeToolSupport::Supported, false).unwrap());
+        assert!(use_semantic_generation(&NativeToolSupport::Supported, true).unwrap());
+
+        let unsupported = NativeToolSupport::Unsupported {
+            reason: "unregistered template".into(),
+        };
+        assert!(!use_semantic_generation(&unsupported, false).unwrap());
+        assert!(use_semantic_generation(&unsupported, true)
+            .unwrap_err()
+            .to_string()
+            .contains("native tool calling is unavailable"));
+    }
+
+    #[test]
+    fn semantic_output_hides_reasoning_and_writes_visible_text() {
+        let mut stdout = Vec::new();
+        let mut streamed_text = String::new();
+        write_semantic_event(
+            &SemanticEvent::ReasoningDelta("private thought".into()),
+            &mut stdout,
+            &mut streamed_text,
+            false,
+        )
+        .unwrap();
+        write_semantic_event(
+            &SemanticEvent::TextDelta("visible answer".into()),
+            &mut stdout,
+            &mut streamed_text,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(stdout, b"visible answer");
+        assert_eq!(streamed_text, "visible answer");
     }
 
     #[test]

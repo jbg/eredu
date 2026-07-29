@@ -321,6 +321,14 @@ support the switch. Pass `--raw` to tokenize the prompt directly; raw prompts
 cannot use an explicit thinking mode. Run with `--help` for all sampling and
 repetition-penalty options.
 
+For an exactly registered chat-template profile, ordinary chat uses the same
+semantic runtime as native tool calling even when no tools are supplied.
+Reasoning channels are emitted as reasoning events rather than leaking their
+wire-format markers into stdout; visible response text is streamed normally.
+With `--verbose`, reasoning deltas are shown on stderr. An unregistered
+template remains usable without tools through a templated text fallback, while
+`--raw` remains the explicit no-template path.
+
 Native tool calling accepts a JSON array of OpenAI-shaped function definitions.
 It uses exact template-signature capability gating and the `PreparedChat`
 runtime; unsupported or changed templates fail instead of falling back to
