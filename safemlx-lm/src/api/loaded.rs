@@ -20,13 +20,60 @@ pub struct LoadedModel {
 }
 
 struct PreparedChatMtpLaneRuntime<'a, S> {
-    prompt: Array,
+    input: PreparedChatModelInput<'a>,
     cache: &'a mut ModelCache,
     config: MtpConfig,
     prng_key: Option<Array>,
     sampler: ConstrainedSampler<S>,
     semantic: Box<dyn MtpSemanticState>,
     on_event: Box<dyn FnMut(SemanticEvent) + 'a>,
+}
+
+enum PreparedChatModelInput<'a> {
+    RenderedPrompt(Array),
+    Prepared(&'a PreparedModelInput),
+}
+
+impl PreparedChatModelInput<'_> {
+    fn with_model_input<T>(&self, function: impl FnOnce(input::ModelInput<'_>) -> T) -> T {
+        match self {
+            Self::RenderedPrompt(prompt) => {
+                let parts = [input::InputPart::text_token_ids(prompt)];
+                function(input::ModelInput::new(&parts))
+            }
+            Self::Prepared(input) => input.with_model_input(function),
+        }
+    }
+}
+
+#[cfg(all(test, feature = "image-processing"))]
+mod prepared_chat_model_input_tests {
+    use super::PreparedChatModelInput;
+    use crate::runtime::media::{
+        input::Modality, prepared_model_input, OwnedInputMetadata, PreparedInputPart,
+    };
+    use safemlx::Array;
+
+    #[test]
+    fn prepared_chat_model_input_preserves_multimodal_parts() {
+        let prepared = prepared_model_input(vec![
+            PreparedInputPart::text_token_ids(&[7]),
+            PreparedInputPart::media_tensor(
+                Modality::Image,
+                Array::from_slice(&[1.0_f32; 4], &[1, 2, 2]),
+                OwnedInputMetadata::default(),
+            ),
+            PreparedInputPart::text_token_ids(&[8]),
+        ])
+        .unwrap();
+
+        PreparedChatModelInput::Prepared(&prepared).with_model_input(|input| {
+            assert_eq!(input.parts.len(), 3);
+            assert_eq!(input.parts[0].modality, Modality::Text);
+            assert_eq!(input.parts[1].modality, Modality::Image);
+            assert_eq!(input.parts[2].modality, Modality::Text);
+        });
+    }
 }
 
 fn run_prepared_chat_mtp_batch<'a, B, S>(
@@ -44,7 +91,7 @@ where
     let mut scheduler = MtpScheduler::new(backend, streams, options)?;
     for (lane_index, lane) in lanes.into_iter().enumerate() {
         let PreparedChatMtpLaneRuntime {
-            prompt,
+            input,
             cache,
             config,
             prng_key,
@@ -57,16 +104,10 @@ where
                 "prepared-chat {cache_kind} MTP cache type mismatch at lane {lane_index}"
             ))
         })?;
-        let parts = [input::InputPart::text_token_ids(&prompt)];
-        scheduler.submit_with_semantics(
-            cache,
-            input::ModelInput::new(&parts),
-            config,
-            prng_key,
-            sampler,
-            semantic,
-            on_event,
-        )?;
+        input.with_model_input(|input| {
+            scheduler
+                .submit_with_semantics(cache, input, config, prng_key, sampler, semantic, on_event)
+        })?;
     }
     scheduler.run()?;
     let output = scheduler.finish()?;
@@ -220,6 +261,23 @@ where
 }
 
 impl LoadedModel {
+    fn prepare_chat_model_input<'a>(
+        &self,
+        input: PreparedChatInput<'a>,
+        stream: &Stream,
+    ) -> Result<PreparedChatModelInput<'a>, Error> {
+        match input {
+            PreparedChatInput::RenderedPrompt(prepared_chat) => {
+                Ok(PreparedChatModelInput::RenderedPrompt(
+                    self.encode_to_array(prepared_chat.rendered_prompt(), false, stream)?,
+                ))
+            }
+            PreparedChatInput::PreparedModelInput { model_input, .. } => {
+                Ok(PreparedChatModelInput::Prepared(model_input))
+            }
+        }
+    }
+
     fn prepare_chat_mtp_batch_lanes<'a, S>(
         &self,
         lanes: Vec<PreparedChatMtpBatchLane<'a, S>>,
@@ -231,7 +289,7 @@ impl LoadedModel {
         let mut prepared_lanes = Vec::with_capacity(lanes.len());
         for (lane_index, lane) in lanes.into_iter().enumerate() {
             let PreparedChatMtpBatchLane {
-                prepared_chat,
+                input,
                 cache,
                 sampling_policy,
                 settings,
@@ -239,6 +297,7 @@ impl LoadedModel {
                 caller_stop_sequences,
                 on_event,
             } = lane;
+            let prepared_chat = input.prepared_chat();
             let plan = match prepared_chat.native_tool_support() {
                 NativeToolSupport::Supported => prepared_chat
                     .tool_runtime_plan()
@@ -262,9 +321,9 @@ impl LoadedModel {
             };
             let semantic = PreparedChatSemanticState::new(decoder, plan, caller_stop_sequences)
                 .map_err(|error| Error::PreparedChatGeneration(error.to_string()))?;
-            let prompt = self.encode_to_array(prepared_chat.rendered_prompt(), false, stream)?;
+            let input = self.prepare_chat_model_input(input, stream)?;
             prepared_lanes.push(PreparedChatMtpLaneRuntime {
-                prompt,
+                input,
                 cache,
                 config: MtpConfig {
                     max_tokens: settings.max_tokens.get(),
@@ -453,7 +512,7 @@ impl LoadedModel {
         F: FnMut(SemanticEvent),
     {
         let PreparedChatGenerationRequest {
-            prepared_chat,
+            input,
             cache,
             sampling_policy,
             settings,
@@ -461,6 +520,7 @@ impl LoadedModel {
             stream,
             mut on_event,
         } = request;
+        let prepared_chat = input.prepared_chat();
 
         with_prepared_chat_runtime(
             prepared_chat,
@@ -480,30 +540,29 @@ impl LoadedModel {
                 };
                 let raw_decoder = RawTokenDecoder::new(decoder, structural_token_ids);
                 let mut pipeline = CommittedTokenPipeline::new(raw_decoder, runtime.parser);
-                let prompt =
-                    self.encode_to_array(prepared_chat.rendered_prompt(), false, stream)?;
-                let parts = [input::InputPart::text_token_ids(&prompt)];
-                let input = input::ModelInput::new(&parts);
-                let generator = self.generate_input_with_cache_sampler(
-                    cache,
-                    settings.temperature,
-                    input,
-                    settings.prng_key,
-                    stream,
-                    runtime.sampler,
-                );
-                let mut source = ModelGenerateTokenSource { generator, stream };
-                let (token_ids, finish_reason) = drive_committed_generation(
-                    &mut source,
-                    &mut pipeline,
-                    prepared_chat.eos_token_ids(),
-                    settings.max_tokens,
-                    &mut on_event,
-                )
-                .map_err(Error::PreparedChatGeneration)?;
-                Ok(PreparedChatGenerationOutput {
-                    token_ids,
-                    finish_reason,
+                let model_input = self.prepare_chat_model_input(input, stream)?;
+                model_input.with_model_input(|model_input| {
+                    let generator = self.generate_input_with_cache_sampler(
+                        cache,
+                        settings.temperature,
+                        model_input,
+                        settings.prng_key,
+                        stream,
+                        runtime.sampler,
+                    );
+                    let mut source = ModelGenerateTokenSource { generator, stream };
+                    let (token_ids, finish_reason) = drive_committed_generation(
+                        &mut source,
+                        &mut pipeline,
+                        prepared_chat.eos_token_ids(),
+                        settings.max_tokens,
+                        &mut on_event,
+                    )
+                    .map_err(Error::PreparedChatGeneration)?;
+                    Ok(PreparedChatGenerationOutput {
+                        token_ids,
+                        finish_reason,
+                    })
                 })
             },
         )
@@ -522,7 +581,7 @@ impl LoadedModel {
         F: FnMut(SemanticEvent),
     {
         let PreparedChatMtpGenerationRequest {
-            prepared_chat,
+            input,
             drafter,
             cache,
             sampling_policy,
@@ -532,6 +591,7 @@ impl LoadedModel {
             streams,
             on_event,
         } = request;
+        let prepared_chat = input.prepared_chat();
         let plan = match prepared_chat.native_tool_support() {
             NativeToolSupport::Supported => prepared_chat
                 .tool_runtime_plan()
@@ -554,10 +614,6 @@ impl LoadedModel {
                 };
                 let semantic = PreparedChatSemanticState::new(decoder, plan, caller_stop_sequences)
                     .map_err(|error| Error::PreparedChatGeneration(error.to_string()))?;
-                let prompt =
-                    self.encode_to_array(prepared_chat.rendered_prompt(), false, streams.target())?;
-                let parts = [input::InputPart::text_token_ids(&prompt)];
-                let input = input::ModelInput::new(&parts);
                 let config = MtpConfig {
                     max_tokens: settings.max_tokens.get(),
                     max_draft_tokens: options.max_draft_tokens.get(),
@@ -565,25 +621,28 @@ impl LoadedModel {
                     eos_token_ids: prepared_chat.eos_token_ids().to_vec(),
                 };
                 let mut sampler = runtime.sampler;
-                let (token_ids, stats, finish_reason) = self
-                    .model
-                    .generate_mtp_input_with_semantics_and_options(
-                        drafter,
-                        cache,
-                        input,
-                        &config,
-                        settings.prng_key,
-                        &mut sampler,
-                        Box::new(semantic),
-                        streams,
-                        options.scheduler,
-                        on_event,
-                    )
-                    .map_err(|error| Error::PreparedChatGeneration(error.to_string()))?;
-                Ok(PreparedChatMtpGenerationOutput {
-                    token_ids,
-                    finish_reason,
-                    stats,
+                let model_input = self.prepare_chat_model_input(input, streams.target())?;
+                model_input.with_model_input(|model_input| {
+                    let (token_ids, stats, finish_reason) = self
+                        .model
+                        .generate_mtp_input_with_semantics_and_options(
+                            drafter,
+                            cache,
+                            model_input,
+                            &config,
+                            settings.prng_key,
+                            &mut sampler,
+                            Box::new(semantic),
+                            streams,
+                            options.scheduler,
+                            on_event,
+                        )
+                        .map_err(|error| Error::PreparedChatGeneration(error.to_string()))?;
+                    Ok(PreparedChatMtpGenerationOutput {
+                        token_ids,
+                        finish_reason,
+                        stats,
+                    })
                 })
             },
         )
@@ -599,7 +658,7 @@ impl LoadedModel {
         F: FnMut(SemanticEvent),
     {
         let PreparedChatEmbeddedMtpGenerationRequest {
-            prepared_chat,
+            input,
             cache,
             sampling_policy,
             settings,
@@ -608,6 +667,7 @@ impl LoadedModel {
             stream,
             on_event,
         } = request;
+        let prepared_chat = input.prepared_chat();
         let plan = match prepared_chat.native_tool_support() {
             NativeToolSupport::Supported => prepared_chat
                 .tool_runtime_plan()
@@ -630,10 +690,6 @@ impl LoadedModel {
                 };
                 let semantic = PreparedChatSemanticState::new(decoder, plan, caller_stop_sequences)
                     .map_err(|error| Error::PreparedChatGeneration(error.to_string()))?;
-                let prompt =
-                    self.encode_to_array(prepared_chat.rendered_prompt(), false, stream)?;
-                let parts = [input::InputPart::text_token_ids(&prompt)];
-                let input = input::ModelInput::new(&parts);
                 let config = MtpConfig {
                     max_tokens: settings.max_tokens.get(),
                     max_draft_tokens: options.max_draft_tokens.get(),
@@ -641,24 +697,27 @@ impl LoadedModel {
                     eos_token_ids: prepared_chat.eos_token_ids().to_vec(),
                 };
                 let mut sampler = runtime.sampler;
-                let (token_ids, stats, finish_reason) = self
-                    .model
-                    .generate_embedded_mtp_input_with_semantics_and_options(
-                        cache,
-                        input,
-                        &config,
-                        settings.prng_key,
-                        &mut sampler,
-                        Box::new(semantic),
-                        stream,
-                        options.scheduler,
-                        on_event,
-                    )
-                    .map_err(|error| Error::PreparedChatGeneration(error.to_string()))?;
-                Ok(PreparedChatMtpGenerationOutput {
-                    token_ids,
-                    finish_reason,
-                    stats,
+                let model_input = self.prepare_chat_model_input(input, stream)?;
+                model_input.with_model_input(|model_input| {
+                    let (token_ids, stats, finish_reason) = self
+                        .model
+                        .generate_embedded_mtp_input_with_semantics_and_options(
+                            cache,
+                            model_input,
+                            &config,
+                            settings.prng_key,
+                            &mut sampler,
+                            Box::new(semantic),
+                            stream,
+                            options.scheduler,
+                            on_event,
+                        )
+                        .map_err(|error| Error::PreparedChatGeneration(error.to_string()))?;
+                    Ok(PreparedChatMtpGenerationOutput {
+                        token_ids,
+                        finish_reason,
+                        stats,
+                    })
                 })
             },
         )
@@ -1354,6 +1413,29 @@ impl LoadedModel {
             ))
         })?;
         processor.prepare_input(input, &mut |text| self.encode(text, false))
+    }
+
+    /// Composes a prepared chat with decoded media at checked placeholders.
+    ///
+    /// Each binding removes one complete placeholder spelling from
+    /// [`PreparedChat::rendered_prompt`] and inserts processor-owned media
+    /// boundary tokens and tensors at that exact position. Occurrence counts
+    /// and binding order are validated before preprocessing begins.
+    #[cfg(feature = "media-processing")]
+    pub fn prepare_chat_input(
+        &self,
+        prepared_chat: &PreparedChat,
+        bindings: &[ChatMediaBinding<'_>],
+    ) -> Result<PreparedModelInput, Error> {
+        let processor = self.processor.as_ref().ok_or_else(|| {
+            Error::Processor(format!(
+                "model type '{}' does not have a loaded media processor",
+                self.model_type()
+            ))
+        })?;
+        processor.prepare_chat_input(prepared_chat.rendered_prompt(), bindings, &mut |text| {
+            self.encode(text, false)
+        })
     }
 
     /// Returns likely user-provided kwargs referenced by the loaded chat template.

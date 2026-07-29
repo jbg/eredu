@@ -50,14 +50,69 @@ impl Default for PreparedChatGenerationSettings {
     }
 }
 
+/// Explicit prompt source for structured generation from a [`PreparedChat`].
+///
+/// The prepared chat always owns the checkpoint-native generation semantics.
+/// The selected variant determines only how the model prompt is prefetched.
+#[derive(Debug, Clone, Copy)]
+pub enum PreparedChatInput<'a> {
+    /// Tokenize and prefill the rendered prompt stored in the prepared chat.
+    RenderedPrompt(&'a PreparedChat),
+    /// Prefill an already-tokenized and preprocessed model input.
+    ///
+    /// The caller must ensure that `model_input` represents the same rendered
+    /// conversation as `prepared_chat`. This variant supports ordered image,
+    /// audio, and video parts without discarding the chat's tool runtime plan.
+    PreparedModelInput {
+        /// Prepared chat that supplies generation and semantic-streaming state.
+        prepared_chat: &'a PreparedChat,
+        /// Architecture-processed prompt supplied directly to model prefill.
+        model_input: &'a PreparedModelInput,
+    },
+}
+
+impl<'a> PreparedChatInput<'a> {
+    /// Creates a text-only input from the prepared chat's rendered prompt.
+    pub const fn rendered_prompt(prepared_chat: &'a PreparedChat) -> Self {
+        Self::RenderedPrompt(prepared_chat)
+    }
+
+    /// Binds an architecture-processed prompt to prepared-chat semantics.
+    pub const fn prepared_model_input(
+        prepared_chat: &'a PreparedChat,
+        model_input: &'a PreparedModelInput,
+    ) -> Self {
+        Self::PreparedModelInput {
+            prepared_chat,
+            model_input,
+        }
+    }
+
+    /// Returns the prepared chat that owns generation semantics.
+    pub const fn prepared_chat(self) -> &'a PreparedChat {
+        match self {
+            Self::RenderedPrompt(prepared_chat)
+            | Self::PreparedModelInput { prepared_chat, .. } => prepared_chat,
+        }
+    }
+
+    /// Returns the explicitly prepared model input, when present.
+    pub const fn model_input(self) -> Option<&'a PreparedModelInput> {
+        match self {
+            Self::RenderedPrompt(_) => None,
+            Self::PreparedModelInput { model_input, .. } => Some(model_input),
+        }
+    }
+}
+
 /// Cohesive request for ordinary structured generation from a [`PreparedChat`].
 ///
 /// The cache and stream remain caller-owned and may be selected using the
 /// existing cache-residency and execution APIs. `sampling_policy` is wrapped in
 /// the prepared chat's constraint plan before any model execution.
 pub struct PreparedChatGenerationRequest<'a, S, F> {
-    /// Prepared prompt and embedded format/runtime plan.
-    pub prepared_chat: &'a PreparedChat,
+    /// Explicit prompt source and embedded format/runtime plan.
+    pub input: PreparedChatInput<'a>,
     /// Architecture-matched cache used for prompt prefill and decoding.
     pub cache: &'a mut ModelCache,
     /// Caller-selected base sampling policy.
@@ -101,8 +156,8 @@ impl Default for PreparedChatMtpGenerationOptions {
 
 /// One external-assistant MTP response from a [`PreparedChat`].
 pub struct PreparedChatMtpGenerationRequest<'a, S, F> {
-    /// Prepared prompt and embedded format/runtime plan.
-    pub prepared_chat: &'a PreparedChat,
+    /// Explicit prompt source and embedded format/runtime plan.
+    pub input: PreparedChatInput<'a>,
     /// Separate target-compatible draft model.
     pub drafter: &'a mut LoadedDrafter,
     /// Architecture-matched target cache.
@@ -123,8 +178,8 @@ pub struct PreparedChatMtpGenerationRequest<'a, S, F> {
 
 /// One embedded-head MTP response from a [`PreparedChat`].
 pub struct PreparedChatEmbeddedMtpGenerationRequest<'a, S, F> {
-    /// Prepared prompt and embedded format/runtime plan.
-    pub prepared_chat: &'a PreparedChat,
+    /// Explicit prompt source and embedded format/runtime plan.
+    pub input: PreparedChatInput<'a>,
     /// Architecture-matched target and embedded-MTP cache.
     pub cache: &'a mut ModelCache,
     /// Caller-selected base sampling policy.
@@ -156,11 +211,11 @@ pub struct PreparedChatMtpGenerationOutput {
 ///
 /// Every lane owns its cache, sampling policy, random root, stop configuration,
 /// and callback. The runtime constructs a fresh constrained sampler and
-/// decoder/parser pipeline from `prepared_chat` before submitting the lane.
+/// decoder/parser pipeline from `input` before submitting the lane.
 /// Lanes are shared by the external-assistant and embedded-head batch APIs.
 pub struct PreparedChatMtpBatchLane<'a, S> {
-    /// Prepared prompt and embedded format/runtime plan.
-    pub prepared_chat: &'a PreparedChat,
+    /// Explicit prompt source and embedded format/runtime plan.
+    pub input: PreparedChatInput<'a>,
     /// Architecture-matched target cache used only by this lane.
     pub cache: &'a mut ModelCache,
     /// Caller-selected base sampling policy used only by this lane.

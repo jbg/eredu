@@ -4,7 +4,7 @@ use super::{
     load_chat_template, load_model_with_options, load_tokenizer, load_tokenizer_template_kwargs,
     merge_eos_token_id_sources, prepare_chat_from_parts, validate_gguf_quantization_source,
     with_prepared_chat_runtime, LoadedModel, ModelLoadOptions, PreparedChatEmbeddedMtpBatchRequest,
-    PreparedChatGenerationSettings, PreparedChatMtpBatchLane,
+    PreparedChatGenerationSettings, PreparedChatInput, PreparedChatMtpBatchLane,
 };
 use crate::{
     error::Error,
@@ -442,6 +442,16 @@ fn unsupported_prepared_chat_fails_before_execution_boundary() {
         profile_stop_sequences: Vec::new(),
     };
     let execution_calls = AtomicUsize::new(0);
+    let input = PreparedChatInput::rendered_prompt(&prepared);
+    assert!(std::ptr::eq(input.prepared_chat(), &prepared));
+    assert!(input.model_input().is_none());
+    let model_input = crate::runtime::media::prepared_model_input(vec![
+        crate::runtime::media::PreparedInputPart::text_token_ids(&[7]),
+    ])
+    .unwrap();
+    let input = PreparedChatInput::prepared_model_input(&prepared, &model_input);
+    assert!(std::ptr::eq(input.prepared_chat(), &prepared));
+    assert!(std::ptr::eq(input.model_input().unwrap(), &model_input));
 
     let error = with_prepared_chat_runtime(&prepared, DefaultSampler, &[], |_| {
         execution_calls.fetch_add(1, Ordering::Relaxed);
@@ -524,7 +534,7 @@ fn prepared_chat_embedded_mtp_batch_dispatches_qwen_without_a_drafter() {
     let error = model
         .generate_prepared_chat_embedded_mtp_batch(PreparedChatEmbeddedMtpBatchRequest {
             lanes: vec![PreparedChatMtpBatchLane {
-                prepared_chat: &prepared,
+                input: PreparedChatInput::rendered_prompt(&prepared),
                 cache: &mut wrong_cache,
                 sampling_policy: DefaultSampler,
                 settings: PreparedChatGenerationSettings::default(),

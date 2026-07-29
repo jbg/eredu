@@ -90,7 +90,7 @@ fragments by `index`; do not assume one fragment per call.
 ```rust
 let mut events = Vec::new();
 let output = model.generate_prepared_chat(PreparedChatGenerationRequest {
-    prepared_chat: &prepared,
+    input: PreparedChatInput::rendered_prompt(&prepared),
     cache: &mut cache,
     sampling_policy: DefaultSampler,
     settings: PreparedChatGenerationSettings::default(),
@@ -105,6 +105,29 @@ assert_eq!(
     })
 );
 ```
+
+Every prepared-chat generator takes an explicit `PreparedChatInput`. Use
+`rendered_prompt` for text-only chat. For multimodal chat, replace the complete
+checkpoint-rendered media placeholder with processed media and bind that input
+to the same prepared chat:
+
+```rust,ignore
+let multimodal = model.prepare_chat_input(
+    &prepared,
+    &[ChatMediaBinding::new(
+        "<|vision_start|><|image_pad|><|vision_end|>",
+        MediaInput::image_rgb8(image),
+    )],
+)?;
+let output = model.generate_prepared_chat(PreparedChatGenerationRequest {
+    input: PreparedChatInput::prepared_model_input(&prepared, &multimodal),
+    // cache, sampling_policy, settings, caller_stop_sequences, stream, on_event
+})?;
+```
+
+The placeholder must be the complete envelope emitted by the selected
+checkpoint template. SafeMLX validates placeholder count and order, then lets
+the architecture processor insert its own boundary tokens and media tensor.
 
 Terminal precedence on one committed token is decoded stop sequence, grammar
 completion, checkpoint EOS, then maximum tokens. The corresponding

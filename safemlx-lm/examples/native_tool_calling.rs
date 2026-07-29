@@ -9,7 +9,7 @@ use safemlx::{Device, DeviceType, ExecutionContext};
 use safemlx_lm::{
     api::{
         LoadedModel, PreparedChatEmbeddedMtpGenerationRequest, PreparedChatGenerationRequest,
-        PreparedChatGenerationSettings, PreparedChatMtpGenerationOptions,
+        PreparedChatGenerationSettings, PreparedChatInput, PreparedChatMtpGenerationOptions,
         PreparedChatMtpGenerationRequest,
     },
     runtime::chat::{ChatTemplateRequest, NativeToolSupport, ParallelToolCallPolicy, ToolChoice},
@@ -86,7 +86,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut cache = model.new_cache();
         model
             .generate_prepared_chat_mtp(PreparedChatMtpGenerationRequest {
-                prepared_chat: &prepared,
+                input: PreparedChatInput::rendered_prompt(&prepared),
                 drafter: &mut drafter,
                 cache: &mut cache,
                 sampling_policy: DefaultSampler,
@@ -109,7 +109,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut cache = model.new_cache();
         model
             .generate_prepared_chat_embedded_mtp(PreparedChatEmbeddedMtpGenerationRequest {
-                prepared_chat: &prepared,
+                input: PreparedChatInput::rendered_prompt(&prepared),
                 cache: &mut cache,
                 sampling_policy: DefaultSampler,
                 settings,
@@ -126,7 +126,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut cache = model.new_cache();
         model
             .generate_prepared_chat(PreparedChatGenerationRequest {
-                prepared_chat: &prepared,
+                input: PreparedChatInput::rendered_prompt(&prepared),
                 cache: &mut cache,
                 sampling_policy: DefaultSampler,
                 settings,

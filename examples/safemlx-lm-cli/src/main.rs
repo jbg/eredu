@@ -21,7 +21,7 @@ use safemlx::{
 use safemlx_lm::{
     api::{
         LoadedModel, ModelLoadOptions, PreparedChatEmbeddedMtpGenerationRequest,
-        PreparedChatGenerationRequest, PreparedChatGenerationSettings,
+        PreparedChatGenerationRequest, PreparedChatGenerationSettings, PreparedChatInput,
         PreparedChatMtpGenerationOptions, PreparedChatMtpGenerationRequest, TextDecoder,
     },
     error::Error as LmError,
@@ -861,7 +861,7 @@ fn main() -> Result<()> {
         let mut semantic_error = None;
         if let Some(drafter) = drafter.as_mut() {
             let output = model.generate_prepared_chat_mtp(PreparedChatMtpGenerationRequest {
-                prepared_chat: prepared,
+                input: PreparedChatInput::rendered_prompt(prepared),
                 drafter,
                 cache: &mut cache,
                 sampling_policy: sampler,
@@ -896,7 +896,7 @@ fn main() -> Result<()> {
         } else if embedded_mtp {
             let output = model.generate_prepared_chat_embedded_mtp(
                 PreparedChatEmbeddedMtpGenerationRequest {
-                    prepared_chat: prepared,
+                    input: PreparedChatInput::rendered_prompt(prepared),
                     cache: &mut cache,
                     sampling_policy: sampler,
                     settings,
@@ -930,7 +930,7 @@ fn main() -> Result<()> {
             prepared_finish_reason = Some(output.finish_reason);
         } else {
             let output = model.generate_prepared_chat(PreparedChatGenerationRequest {
-                prepared_chat: prepared,
+                input: PreparedChatInput::rendered_prompt(prepared),
                 cache: &mut cache,
                 sampling_policy: sampler,
                 settings,

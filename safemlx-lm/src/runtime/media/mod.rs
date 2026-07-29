@@ -83,6 +83,27 @@ impl<'a> MediaInput<'a> {
     }
 }
 
+/// One exact rendered-prompt placeholder bound to decoded media.
+///
+/// Chat templates remain checkpoint-owned, so callers identify the complete
+/// placeholder spelling emitted by the selected template. The chat composer
+/// validates occurrence counts and ordering before replacing each placeholder
+/// with architecture-native processed media.
+#[derive(Debug, Clone, Copy)]
+pub struct ChatMediaBinding<'a> {
+    /// Complete placeholder text to replace in the rendered chat prompt.
+    pub placeholder: &'a str,
+    /// Decoded media inserted at the placeholder's exact position.
+    pub media: MediaInput<'a>,
+}
+
+impl<'a> ChatMediaBinding<'a> {
+    /// Creates one rendered-placeholder media binding.
+    pub const fn new(placeholder: &'a str, media: MediaInput<'a>) -> Self {
+        Self { placeholder, media }
+    }
+}
+
 /// One ordered input segment supplied to a model processor.
 #[derive(Debug, Clone, Copy)]
 pub enum ProcessorInput<'a> {
@@ -311,6 +332,123 @@ impl ModelProcessor {
             #[cfg(feature = "image-processing")]
             ProcessorKind::Qwen(processor) => processor.prepare_input(input, encode_text),
         }
+    }
+
+    /// Replaces checked rendered-chat placeholders with processed media.
+    pub fn prepare_chat_input<'a>(
+        &self,
+        rendered_prompt: &'a str,
+        bindings: &[ChatMediaBinding<'a>],
+        encode_text: &mut dyn FnMut(&str) -> Result<Vec<u32>, Error>,
+    ) -> Result<PreparedModelInput, Error> {
+        let segments = chat_processor_segments(rendered_prompt, bindings)?;
+        self.prepare_input(&segments, encode_text)
+    }
+}
+
+fn chat_processor_segments<'a>(
+    rendered_prompt: &'a str,
+    bindings: &[ChatMediaBinding<'a>],
+) -> Result<Vec<ProcessorInput<'a>>, Error> {
+    for (index, binding) in bindings.iter().enumerate() {
+        if binding.placeholder.is_empty() {
+            return Err(Error::Processor(format!(
+                "chat media binding {index} has an empty placeholder"
+            )));
+        }
+        if bindings[..index]
+            .iter()
+            .any(|earlier| earlier.placeholder == binding.placeholder)
+        {
+            continue;
+        }
+        let expected = bindings
+            .iter()
+            .filter(|candidate| candidate.placeholder == binding.placeholder)
+            .count();
+        let actual = rendered_prompt.matches(binding.placeholder).count();
+        if actual != expected {
+            let placeholder = binding.placeholder;
+            return Err(Error::Processor(format!(
+                "rendered chat contains {actual} occurrence(s) of media placeholder \
+                 {placeholder:?}, but {expected} binding(s) were supplied"
+            )));
+        }
+    }
+
+    let mut segments = Vec::with_capacity(bindings.len().saturating_mul(2) + 1);
+    let mut cursor = 0;
+    for (index, binding) in bindings.iter().enumerate() {
+        let remainder = &rendered_prompt[cursor..];
+        let relative = remainder.find(binding.placeholder).ok_or_else(|| {
+            Error::Processor(format!(
+                "chat media binding {index} placeholder {:?} does not occur after the preceding binding",
+                binding.placeholder
+            ))
+        })?;
+        let start = cursor + relative;
+        if start > cursor {
+            segments.push(ProcessorInput::Text(&rendered_prompt[cursor..start]));
+        }
+        segments.push(ProcessorInput::Media(binding.media));
+        cursor = start + binding.placeholder.len();
+    }
+    if cursor < rendered_prompt.len() {
+        segments.push(ProcessorInput::Text(&rendered_prompt[cursor..]));
+    }
+    if segments.is_empty() {
+        segments.push(ProcessorInput::Text(rendered_prompt));
+    }
+    Ok(segments)
+}
+
+#[cfg(all(test, feature = "image-processing"))]
+mod chat_input_tests {
+    use super::{
+        chat_processor_segments, ChatMediaBinding, MediaInput, ProcessorInput, RgbImageView,
+    };
+
+    fn image<'a>(pixels: &'a [u8]) -> MediaInput<'a> {
+        MediaInput::image_rgb8(RgbImageView::packed(pixels, 1, 1).unwrap())
+    }
+
+    #[test]
+    fn chat_composer_replaces_repeated_placeholders_in_order() {
+        let pixels = [0_u8; 3];
+        let bindings = [
+            ChatMediaBinding::new("<image>", image(&pixels)),
+            ChatMediaBinding::new("<image>", image(&pixels)),
+        ];
+        let segments =
+            chat_processor_segments("before<image>middle<image>after", &bindings).unwrap();
+
+        assert_eq!(segments.len(), 5);
+        assert!(matches!(segments[0], ProcessorInput::Text("before")));
+        assert!(matches!(segments[1], ProcessorInput::Media(_)));
+        assert!(matches!(segments[2], ProcessorInput::Text("middle")));
+        assert!(matches!(segments[3], ProcessorInput::Media(_)));
+        assert!(matches!(segments[4], ProcessorInput::Text("after")));
+    }
+
+    #[test]
+    fn chat_composer_rejects_count_and_order_mismatches() {
+        let pixels = [0_u8; 3];
+        let count_error = chat_processor_segments(
+            "before<image><image>after",
+            &[ChatMediaBinding::new("<image>", image(&pixels))],
+        )
+        .unwrap_err();
+        assert!(count_error.to_string().contains("2 occurrence"));
+
+        let order_error = chat_processor_segments(
+            "<second><first>",
+            &[
+                ChatMediaBinding::new("<first>", image(&pixels)),
+                ChatMediaBinding::new("<second>", image(&pixels)),
+            ],
+        )
+        .unwrap_err();
+        assert!(order_error.to_string().contains("does not occur after"));
     }
 }
 

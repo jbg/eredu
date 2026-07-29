@@ -732,6 +732,34 @@ let logits = model.prefill_prepared_input_with_cache(
 )?;
 ```
 
+Structured multimodal chat uses the same prepared model input without losing
+checkpoint-native tools or semantic streaming:
+
+```rust,ignore
+use safemlx_lm::{
+    api::{PreparedChatGenerationRequest, PreparedChatInput},
+    runtime::media::{ChatMediaBinding, MediaInput},
+};
+
+let prepared_chat = model.prepare_chat(chat_request)?;
+let prepared_input = model.prepare_chat_input(
+    &prepared_chat,
+    &[ChatMediaBinding::new(
+        checkpoint_image_placeholder,
+        MediaInput::image_rgb8(image),
+    )],
+)?;
+let output = model.generate_prepared_chat(PreparedChatGenerationRequest {
+    input: PreparedChatInput::prepared_model_input(&prepared_chat, &prepared_input),
+    // cache, sampling_policy, settings, caller_stop_sequences, stream, on_event
+})?;
+```
+
+The composer verifies exact placeholder counts and ordering before the
+architecture processor inserts media boundary tokens and tensors. Use
+`PreparedChatInput::rendered_prompt(&prepared_chat)` for text-only structured
+generation.
+
 Decoded videos use the same processor with an ordered frame sequence and source
 frame rate. Container decoding remains with the caller:
 

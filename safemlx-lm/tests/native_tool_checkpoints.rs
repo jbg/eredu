@@ -7,7 +7,10 @@ use std::num::NonZeroUsize;
 
 use safemlx::{Device, DeviceType, ExecutionContext};
 use safemlx_lm::{
-    api::{LoadedModel, PreparedChatGenerationRequest, PreparedChatGenerationSettings},
+    api::{
+        LoadedModel, PreparedChatGenerationRequest, PreparedChatGenerationSettings,
+        PreparedChatInput,
+    },
     runtime::chat::{ChatTemplateRequest, NativeToolSupport, ToolChoice},
     runtime::generation::sampler::DefaultSampler,
     runtime::generation::streaming::{FinishReason, SemanticEvent},
@@ -82,7 +85,7 @@ fn smoke(environment: &str, expected_profile_prefix: &str) {
     let mut events = Vec::new();
     let output = model
         .generate_prepared_chat(PreparedChatGenerationRequest {
-            prepared_chat: &prepared,
+            input: PreparedChatInput::rendered_prompt(&prepared),
             cache: &mut cache,
             sampling_policy: DefaultSampler,
             settings: PreparedChatGenerationSettings {

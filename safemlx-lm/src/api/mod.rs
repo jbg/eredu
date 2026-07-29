@@ -42,8 +42,9 @@ use crate::runtime::generation::streaming::{
     RawTokenDecoder, SemanticEvent, TokenDecoderBackend,
 };
 pub(crate) use crate::runtime::media::input;
+use crate::runtime::media::PreparedModelInput;
 #[cfg(feature = "media-processing")]
-use crate::runtime::media::{load_processor, ModelProcessor, PreparedModelInput, ProcessorInput};
+use crate::runtime::media::{load_processor, ChatMediaBinding, ModelProcessor, ProcessorInput};
 use crate::{
     error::Error,
     runtime::cache::residency::{
@@ -248,8 +249,8 @@ use request::{
 pub use request::{
     PreparedChatEmbeddedMtpBatchRequest, PreparedChatEmbeddedMtpGenerationRequest,
     PreparedChatGenerationOutput, PreparedChatGenerationRequest, PreparedChatGenerationSettings,
-    PreparedChatMtpBatchLane, PreparedChatMtpBatchOutput, PreparedChatMtpBatchRequest,
-    PreparedChatMtpGenerationOptions, PreparedChatMtpGenerationOutput,
+    PreparedChatInput, PreparedChatMtpBatchLane, PreparedChatMtpBatchOutput,
+    PreparedChatMtpBatchRequest, PreparedChatMtpGenerationOptions, PreparedChatMtpGenerationOutput,
     PreparedChatMtpGenerationRequest, TextDecoder,
 };
 /// Codec-free realtime speech-to-speech token APIs.
