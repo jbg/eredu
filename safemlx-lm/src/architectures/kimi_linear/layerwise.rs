@@ -27,6 +27,7 @@ use crate::{
         checkpoint::{
             binding::{
                 build_module_bindings_with_recipes, canonical_checkpoint_name,
+                materialize_module_bindings, populate_module_from_arrays_excluding,
                 populate_module_from_lease, populate_module_from_lease_excluding,
             },
             recipe::DerivedWeightRecipe,
@@ -221,6 +222,63 @@ pub(crate) fn load_kimi_linear_gguf_layerwise_model(
         KimiLinearLayerwiseModel { execution },
         prepared.eos_token_ids,
     ))
+}
+
+/// Loads only the replicated Kimi Linear GGUF parameters needed by sparse
+/// expert-parallel execution and returns the shared lazy checkpoint store.
+pub(crate) fn load_kimi_linear_gguf_sparse_ep_base(
+    checkpoint: &GgufCheckpoint,
+    metadata: &std::collections::HashMap<String, GgufMetadataValue>,
+    max_mapped_shards: usize,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<(resident::Model, Arc<dyn WeightStore + Send + Sync>), Error> {
+    let prepared = resident::prepare_gguf_checkpoint(checkpoint, metadata, None, weights_stream)?;
+    let args = prepared.args;
+    let store: Arc<dyn WeightStore + Send + Sync> =
+        Arc::new(GgufWeightStore::new_with_max_mapped_shards(
+            checkpoint.clone(),
+            resident::translate_gguf_weight_name,
+            max_mapped_shards,
+        )?);
+    let adapter = KimiLinearLayerwiseAdapter::new_sparse(args.clone(), stream)?;
+    let mut model = resident::Model::new(args, stream)?;
+
+    let bindings = build_module_bindings_with_recipes(
+        &model.model.embed_tokens,
+        "model.embed_tokens",
+        store.as_ref(),
+        BTreeMap::new(),
+    )?;
+    let arrays = materialize_module_bindings(store.as_ref(), &bindings, weights_stream, stream)?;
+    populate_module_from_arrays_excluding(&mut model.model.embed_tokens, &arrays, |_| false)?;
+
+    let bindings = build_module_bindings_with_recipes(
+        &model.model.norm,
+        "model.norm",
+        store.as_ref(),
+        BTreeMap::new(),
+    )?;
+    let arrays = materialize_module_bindings(store.as_ref(), &bindings, weights_stream, stream)?;
+    populate_module_from_arrays_excluding(&mut model.model.norm, &arrays, |_| false)?;
+
+    if let Some(head) = &mut model.lm_head {
+        let bindings =
+            build_module_bindings_with_recipes(head, "lm_head", store.as_ref(), BTreeMap::new())?;
+        let arrays =
+            materialize_module_bindings(store.as_ref(), &bindings, weights_stream, stream)?;
+        populate_module_from_arrays_excluding(head, &arrays, |_| false)?;
+    }
+
+    for (index, layer) in model.model.layers.iter_mut().enumerate() {
+        let bindings = adapter.layer_bindings(0, index, layer, store.as_ref())?;
+        let arrays =
+            materialize_module_bindings(store.as_ref(), &bindings, weights_stream, stream)?;
+        populate_module_from_arrays_excluding(layer, &arrays, |name| {
+            name.starts_with("mlp.experts.")
+        })?;
+    }
+    Ok((model, store))
 }
 
 /// Loads Kimi Linear with independently cached routed experts.

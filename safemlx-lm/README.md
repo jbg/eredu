@@ -1097,10 +1097,10 @@ other hybrid or multimodal families require
 their fully resident EP loaders, as does Kimi Linear. The model API requires
 `EP > 1`, `TP = 1`,
 and `PP = 1`; hybrid EP+TP and EP+PP are rejected before checkpoint payloads
-are opened. Dense models and GGUF architectures without a registered resident
-EP adapter are also rejected. Kimi Linear, DeepSeek2, and Qwen3-MoE currently
-provide resident GGUF EP adapters. Checkpoint `ep_size` describes a stored
-layout and is not the runtime EP degree.
+are opened. Dense models and GGUF architectures without a registered EP
+adapter are also rejected. Kimi Linear, DeepSeek2, and Qwen3-MoE provide both
+resident and sparse-cache GGUF EP adapters. Checkpoint `ep_size` describes a
+stored layout and is not the runtime EP degree.
 
 `ExpertAssignment` supports balanced-contiguous (the model default),
 round-robin, and explicit owner maps. Pass a non-default assignment to
@@ -1165,10 +1165,12 @@ Kimi Linear replicates KDA/MLA, dense MLP, router, shared-expert, embedding,
 normalization, and output parameters. Only routed expert banks are
 partitioned; their contribution is all-summed before the shared expert is
 added once. Sparse-cache EP materializes only rank-owned expert payloads.
-Fully resident Kimi GGUF checkpoints use the same partitioning and execution
-path for dense, affine, IQ, and MXFP4-MoE expert banks; sparse-cache GGUF EP is
-not yet available. The surrounding GGUF EP dispatcher is architecture-neutral
-and also serves the registered DeepSeek2 and Qwen3-MoE adapters.
+Kimi GGUF checkpoints use the same partitioning and execution path for dense,
+affine, IQ, and MXFP4-MoE expert banks in resident or sparse-cache mode. Sparse
+mode materializes replicated nonexpert bindings at startup, keeps every owned
+expert cold until routed, and never adds remote experts to the cache catalog.
+The architecture-neutral GGUF EP dispatcher and type-erased expert cache also
+serve the registered DeepSeek2 and Qwen3-MoE adapters.
 
 Run a two-process Ring generation probe with the usual MLX Ring host file and
 rank environment:

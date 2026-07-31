@@ -36,6 +36,7 @@ use crate::{
     runtime::cache::{ConcatKeyValueCache, KeyValueCache},
     runtime::checkpoint::binding::{
         build_module_bindings, build_module_bindings_excluding, build_module_bindings_with_recipes,
+        materialize_module_bindings, populate_module_from_arrays_excluding,
         populate_module_from_lease, populate_module_from_lease_excluding,
     },
     runtime::checkpoint::recipe::DerivedWeightRecipe,
@@ -234,6 +235,66 @@ pub(crate) fn load_qwen3_gguf_layerwise_model(
         }
     };
     Ok((Qwen3LayerwiseModel { execution }, eos_token_ids))
+}
+
+/// Loads replicated Qwen3-MoE GGUF parameters for sparse expert-parallel
+/// execution without materializing routed experts.
+pub(crate) fn load_qwen3_gguf_sparse_ep_base(
+    checkpoint: &GgufCheckpoint,
+    metadata: &HashMap<String, GgufMetadataValue>,
+    max_mapped_shards: usize,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<(resident::Model, Arc<dyn WeightStore + Send + Sync>), Error> {
+    let (args, _) = resident::prepare_qwen3_gguf_checkpoint(
+        checkpoint,
+        metadata,
+        "qwen3moe",
+        true,
+        weights_stream,
+    )?;
+    if !args.is_moe() {
+        return Err(Error::UnsupportedArchitecture(
+            "sparse GGUF expert parallelism requires a Qwen3 MoE checkpoint".into(),
+        ));
+    }
+    let store: Arc<dyn WeightStore + Send + Sync> =
+        Arc::new(GgufWeightStore::new_with_max_mapped_shards(
+            checkpoint.clone(),
+            |name| resident::translate_qwen3_gguf_weight_name(name, true),
+            max_mapped_shards,
+        )?);
+    let adapter = Qwen3LayerwiseAdapter::new_sparse(args.clone(), stream)?;
+    let mut model = resident::Model::new(args, stream)?;
+
+    let bindings = build_module_bindings(
+        &model.model.embed_tokens,
+        "model.embed_tokens",
+        store.as_ref(),
+    )?;
+    let arrays = materialize_module_bindings(store.as_ref(), &bindings, weights_stream, stream)?;
+    populate_module_from_arrays_excluding(&mut model.model.embed_tokens, &arrays, |_| false)?;
+
+    let bindings = build_module_bindings(&model.model.norm, "model.norm", store.as_ref())?;
+    let arrays = materialize_module_bindings(store.as_ref(), &bindings, weights_stream, stream)?;
+    populate_module_from_arrays_excluding(&mut model.model.norm, &arrays, |_| false)?;
+
+    if let Some(head) = &mut model.lm_head {
+        let bindings = build_module_bindings(head, "lm_head", store.as_ref())?;
+        let arrays =
+            materialize_module_bindings(store.as_ref(), &bindings, weights_stream, stream)?;
+        populate_module_from_arrays_excluding(head, &arrays, |_| false)?;
+    }
+
+    for (index, layer) in model.model.layers.iter_mut().enumerate() {
+        let bindings = adapter.layer_bindings(index, layer, store.as_ref())?;
+        let arrays =
+            materialize_module_bindings(store.as_ref(), &bindings, weights_stream, stream)?;
+        populate_module_from_arrays_excluding(layer, &arrays, |name| {
+            name.starts_with("mlp.experts.")
+        })?;
+    }
+    Ok((model, store))
 }
 
 fn load_qwen3_gguf_sparse_with_store(

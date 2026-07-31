@@ -5,7 +5,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use safemlx::module::ModuleParameters;
+use safemlx::{module::ModuleParameters, transforms::eval, Array, Stream};
 
 use crate::{
     runtime::checkpoint::recipe::{DerivedWeightRecipe, RecipeDtype},
@@ -80,6 +80,95 @@ pub fn build_module_bindings_with_recipes(
     recipes: BTreeMap<String, DerivedWeightRecipe>,
 ) -> Result<Vec<WeightBinding>, ModuleBindingError> {
     build_module_bindings_with_recipes_excluding(module, prefix, store, recipes, |_| false)
+}
+
+/// Materializes a set of direct or derived bindings without constructing a
+/// residency manager.
+///
+/// This is useful for loaders that keep one parameter class resident while a
+/// separate cache owns another class from the same type-erased checkpoint
+/// store. Recipe outputs are evaluated before their source mappings are
+/// released, and copied to the execution stream when the streams differ.
+pub(crate) fn materialize_module_bindings(
+    store: &dyn WeightStore,
+    bindings: &[WeightBinding],
+    source_stream: &Stream,
+    execution_stream: &Stream,
+) -> Result<BTreeMap<String, Array>, ModuleBindingError> {
+    let mut arrays = BTreeMap::new();
+    for binding in bindings {
+        let value = if let Some(recipe) = binding.recipe() {
+            let source = recipe.materialize(store, source_stream)?;
+            if source_stream == execution_stream {
+                source
+            } else {
+                let value = source
+                    .copy(execution_stream)
+                    .map_err(crate::runtime::checkpoint::recipe::WeightRecipeError::from)?;
+                eval([&value])
+                    .map_err(crate::runtime::checkpoint::recipe::WeightRecipeError::from)?;
+                value
+            }
+        } else {
+            store
+                .acquire(binding.checkpoint_key(), binding.selection().clone())?
+                .materialize(source_stream, execution_stream)?
+        };
+        if arrays.insert(binding.name().to_string(), value).is_some() {
+            return Err(ModuleBindingError::DuplicateCheckpointBinding {
+                checkpoint_key: binding.checkpoint_key().to_string(),
+                first: binding.name().to_string(),
+                second: binding.name().to_string(),
+            });
+        }
+    }
+    Ok(arrays)
+}
+
+/// Populates an unloaded module from materialized local-name bindings while
+/// permitting an independently managed parameter class to remain unloaded.
+pub(crate) fn populate_module_from_arrays_excluding<F>(
+    module: &mut impl ModuleParameters,
+    arrays: &BTreeMap<String, Array>,
+    excluded: F,
+) -> Result<(), ModuleBindingError>
+where
+    F: Fn(&str) -> bool,
+{
+    let mut params = module.parameters_mut().flatten();
+    let expected = params
+        .keys()
+        .filter(|name| !excluded(name))
+        .map(|name| name.to_string())
+        .collect::<BTreeSet<_>>();
+    let actual = arrays.keys().cloned().collect::<BTreeSet<_>>();
+    let missing = expected.difference(&actual).cloned().collect::<Vec<_>>();
+    let unexpected = actual.difference(&expected).cloned().collect::<Vec<_>>();
+    if !missing.is_empty() || !unexpected.is_empty() {
+        return Err(ModuleBindingError::LeaseContents {
+            unit: "materialized checkpoint bindings".into(),
+            missing,
+            unexpected,
+        });
+    }
+    for (name, parameter) in &mut params {
+        if excluded(name) {
+            continue;
+        }
+        let value = arrays
+            .get(name.as_ref())
+            .expect("validated materialized binding must exist");
+        if parameter.shape() != value.shape() {
+            return Err(ModuleBindingError::ResidentShapeMismatch {
+                unit: "materialized checkpoint bindings".into(),
+                parameter: name.to_string(),
+                expected: parameter.shape().to_vec(),
+                actual: value.shape().to_vec(),
+            });
+        }
+        **parameter = value.clone();
+    }
+    Ok(())
 }
 
 fn build_module_bindings_with_recipes_excluding<F>(

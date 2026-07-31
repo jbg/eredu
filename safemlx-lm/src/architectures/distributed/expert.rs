@@ -1569,7 +1569,8 @@ fn validate_pure_expert(topology: ParallelTopology) -> Result<(), Error> {
 /// Loads an executable pure expert-parallel MoE model.
 ///
 /// SafeTensors uses the architecture's resident or sparse-cache adapter.
-/// Registered GGUF architectures use fully resident expert partitioning.
+/// Registered GGUF architectures support resident partitioning and
+/// rank-filtered sparse expert caching.
 pub fn load_expert_parallel_model(
     model_dir: impl AsRef<Path>,
     topology: ParallelTopology,
@@ -1658,7 +1659,7 @@ fn load_expert_parallel_model_impl(
                 ))
             }
         };
-        return load_resident_gguf_ep(
+        return load_gguf_ep(
             &architecture,
             &checkpoint,
             metadata,
@@ -2375,7 +2376,7 @@ fn load_kimi_linear_ep(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn load_resident_gguf_ep(
+fn load_gguf_ep(
     architecture: &str,
     checkpoint: &GgufCheckpoint,
     metadata: std::collections::HashMap<String, GgufMetadataValue>,
@@ -2385,13 +2386,31 @@ fn load_resident_gguf_ep(
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<ExpertParallelModel, Error> {
+    crate::api::validate_gguf_quantization_source(checkpoint, &metadata, options.quantization)?;
+    if let WeightResidency::SparseExpertCache(expert_options) = options.weight_residency {
+        if options.quantization.is_some() {
+            return Err(Error::Quantization(
+                "load-time quantization is unsupported with sparse expert-cached GGUF expert parallelism; use checkpoint-native weights"
+                    .into(),
+            ));
+        }
+        return load_sparse_gguf_ep(
+            architecture,
+            checkpoint,
+            &metadata,
+            topology,
+            assignment,
+            expert_options,
+            stream,
+            weights_stream,
+        );
+    }
     if !matches!(options.weight_residency, WeightResidency::FullyResident) {
         return Err(Error::Parallel(
-            "GGUF expert-parallel loading currently requires fully resident weight residency"
+            "GGUF expert-parallel loading requires fully resident or sparse-expert-cache weight residency"
                 .into(),
         ));
     }
-    crate::api::validate_gguf_quantization_source(checkpoint, &metadata, options.quantization)?;
     let opened_checkpoint_shards = checkpoint
         .catalog()
         .shards()
@@ -2500,6 +2519,162 @@ fn load_resident_gguf_ep(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn load_sparse_gguf_ep(
+    architecture: &str,
+    checkpoint: &GgufCheckpoint,
+    metadata: &std::collections::HashMap<String, GgufMetadataValue>,
+    topology: ParallelTopology,
+    assignment: Option<ExpertAssignment>,
+    expert_options: ExpertCacheLoadOptions,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<ExpertParallelModel, Error> {
+    match architecture {
+        "kimi-linear" => {
+            let (model, store) =
+                crate::architectures::kimi_linear::layerwise::
+                    load_kimi_linear_gguf_sparse_ep_base(
+                        checkpoint,
+                        metadata,
+                        expert_options.non_expert.max_mapped_shards,
+                        stream,
+                        weights_stream,
+                    )?;
+            if model.args.num_experts <= 0 {
+                return Err(Error::Parallel(
+                    "Kimi Linear GGUF config has no routed experts".into(),
+                ));
+            }
+            let assignment =
+                resolve_model_assignment(assignment, model.args.num_experts as usize, topology)?;
+            let entries =
+                crate::architectures::kimi_linear::layerwise::kimi_expert_catalog(
+                    &model.args,
+                    store.as_ref(),
+                )?;
+            let replicated_parameter_bytes =
+                parameter_bytes_excluding(&model, ".mlp.experts.");
+            finish_sparse_gguf_ep(
+                topology,
+                ModelKind::KimiLinear,
+                assignment,
+                ExpertArchitecture::KimiLinear(Box::new(model)),
+                store,
+                entries,
+                expert_options,
+                replicated_parameter_bytes,
+                stream,
+                weights_stream,
+            )
+        }
+        "deepseek2" => {
+            let (model, store) =
+                crate::architectures::deepseek_v3::layerwise::
+                    load_deepseek_v3_gguf_sparse_ep_base(
+                        checkpoint,
+                        metadata,
+                        expert_options.non_expert.max_mapped_shards,
+                        stream,
+                        weights_stream,
+                    )?;
+            let assignment = resolve_model_assignment(
+                assignment,
+                model.args.n_routed_experts as usize,
+                topology,
+            )?;
+            let entries =
+                crate::architectures::deepseek_v3::layerwise::deepseek_expert_catalog(
+                    &model.args,
+                    store.as_ref(),
+                )?;
+            let replicated_parameter_bytes =
+                parameter_bytes_excluding(&model, ".mlp.experts.");
+            finish_sparse_gguf_ep(
+                topology,
+                ModelKind::DeepSeekV3,
+                assignment,
+                ExpertArchitecture::DeepSeek(Box::new(model)),
+                store,
+                entries,
+                expert_options,
+                replicated_parameter_bytes,
+                stream,
+                weights_stream,
+            )
+        }
+        "qwen3moe" => {
+            let (model, store) =
+                crate::architectures::qwen::qwen3::layerwise::
+                    load_qwen3_gguf_sparse_ep_base(
+                        checkpoint,
+                        metadata,
+                        expert_options.non_expert.max_mapped_shards,
+                        stream,
+                        weights_stream,
+                    )?;
+            let assignment =
+                resolve_model_assignment(assignment, model.args.num_experts as usize, topology)?;
+            let entries =
+                crate::architectures::qwen::qwen3::layerwise::qwen3_expert_catalog(
+                    &model.args,
+                    store.as_ref(),
+                )?;
+            let replicated_parameter_bytes =
+                parameter_bytes_excluding(&model, ".mlp.experts.");
+            finish_sparse_gguf_ep(
+                topology,
+                ModelKind::Qwen3,
+                assignment,
+                ExpertArchitecture::Qwen3(Box::new(model)),
+                store,
+                entries,
+                expert_options,
+                replicated_parameter_bytes,
+                stream,
+                weights_stream,
+            )
+        }
+        other => Err(Error::Parallel(format!(
+            "sparse expert-parallel GGUF architecture {other} is unsupported; registered sparse GGUF EP architectures are kimi-linear, deepseek2, and qwen3moe"
+        ))),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn finish_sparse_gguf_ep(
+    topology: ParallelTopology,
+    kind: ModelKind,
+    assignment: ExpertAssignment,
+    architecture: ExpertArchitecture,
+    store: std::sync::Arc<dyn WeightStore + Send + Sync>,
+    entries: Vec<ExpertCatalogEntry>,
+    expert_options: ExpertCacheLoadOptions,
+    replicated_parameter_bytes: usize,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<ExpertParallelModel, Error> {
+    let opened_checkpoint_shards = store.diagnostics()?.touched_shard_paths;
+    let (expert_cache, owned_expert_bytes) = rank_owned_expert_cache(
+        store,
+        entries,
+        &assignment,
+        expert_options,
+        stream,
+        weights_stream,
+    )?;
+    Ok(finish_additional_cached_ep(
+        topology,
+        kind,
+        assignment,
+        architecture,
+        expert_cache,
+        owned_expert_bytes,
+        replicated_parameter_bytes,
+        opened_checkpoint_shards,
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
 fn finish_resident_gguf_ep(
     topology: ParallelTopology,
     model_kind: ModelKind,
@@ -2593,7 +2768,7 @@ fn load_kimi_linear_cached_ep(
     let entries =
         crate::architectures::kimi_linear::layerwise::kimi_expert_catalog(&args, store.as_ref())?;
     let (expert_cache, owned_expert_bytes) = rank_owned_expert_cache(
-        &store,
+        store.clone(),
         entries,
         &assignment,
         expert_options,
@@ -2948,7 +3123,7 @@ fn is_auxiliary_checkpoint_key(kind: ModelKind, key: &str) -> bool {
 }
 
 fn rank_owned_expert_cache(
-    store: &std::sync::Arc<SafetensorsWeightStore>,
+    store: std::sync::Arc<dyn WeightStore + Send + Sync>,
     entries: Vec<ExpertCatalogEntry>,
     assignment: &ExpertAssignment,
     options: ExpertCacheLoadOptions,
@@ -2962,8 +3137,8 @@ fn rank_owned_expert_cache(
     let owned_expert_bytes =
         usize::try_from(entries.iter().map(ExpertCatalogEntry::bytes).sum::<u64>())
             .map_err(|_| Error::Parallel("owned expert bytes exceed usize".into()))?;
-    let cache = ExpertCache::new(
-        std::sync::Arc::clone(store),
+    let cache = ExpertCache::new_shared(
+        store,
         entries,
         options,
         weights_stream.clone(),
@@ -3082,7 +3257,7 @@ fn load_additional_cached_ep(
                 store.as_ref(),
             )?;
             let (cache, owned) = rank_owned_expert_cache(
-                &store,
+                store.clone(),
                 entries,
                 &assignment,
                 expert_options,
@@ -3128,7 +3303,7 @@ fn load_additional_cached_ep(
                 store.as_ref(),
             )?;
             let (cache, owned) = rank_owned_expert_cache(
-                &store,
+                store.clone(),
                 entries,
                 &assignment,
                 expert_options,
@@ -3165,7 +3340,7 @@ fn load_additional_cached_ep(
             let entries =
                 crate::architectures::lfm2::layerwise::lfm2_expert_catalog(&args, store.as_ref())?;
             let (cache, owned) = rank_owned_expert_cache(
-                &store,
+                store.clone(),
                 entries,
                 &assignment,
                 expert_options,
@@ -3213,7 +3388,7 @@ fn load_additional_cached_ep(
                 store.as_ref(),
             )?;
             let (cache, owned) = rank_owned_expert_cache(
-                &store,
+                store.clone(),
                 entries,
                 &assignment,
                 expert_options,
@@ -3288,7 +3463,7 @@ fn load_additional_cached_ep(
                     store.as_ref(),
                 )?;
             let (cache, owned) = rank_owned_expert_cache(
-                &store,
+                store.clone(),
                 entries,
                 &assignment,
                 expert_options,
@@ -3331,7 +3506,7 @@ fn load_additional_cached_ep(
                 "model.language_model.layers",
             )?;
             let (cache, owned) = rank_owned_expert_cache(
-                &store,
+                store.clone(),
                 entries,
                 &assignment,
                 expert_options,
@@ -3980,6 +4155,47 @@ mod tests {
             &[2, 64, 1]
         );
         assert!(parameters.contains_key("model.layers.1.mlp.shared_experts.gate_proj.weight"));
+    }
+
+    #[test]
+    fn kimi_mxfp4_gguf_sparse_ep_keeps_owned_experts_cold() {
+        let context = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
+        let weights_context = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        let fixture = synthetic_kimi_gguf(context.stream());
+        let loaded = load_expert_parallel_model_with_options(
+            fixture.path(),
+            ModelLoadOptions {
+                quantization: None,
+                parallel: Some(rank_one_topology()),
+                weight_residency: WeightResidency::SparseExpertCache(
+                    ExpertCacheLoadOptions::default(),
+                ),
+            },
+            context.stream(),
+            weights_context.stream(),
+        )
+        .unwrap();
+
+        assert_eq!(loaded.info.model_kind, ModelKind::KimiLinear);
+        assert_eq!(loaded.info.assignment.local_global_expert_ids(), &[2, 3]);
+        assert_eq!(loaded.info.routed_expert_bytes, 0);
+        assert!(loaded.info.owned_expert_bytes > 0);
+        assert!(loaded.info.replicated_parameter_bytes > 0);
+        let report = loaded.expert_cache_report().unwrap().unwrap();
+        assert_eq!(report.owned_experts, 2);
+        assert_eq!(report.host_resident_experts, 0);
+        assert_eq!(report.device_resident_experts, 0);
+        assert_eq!(loaded.info.opened_checkpoint_shards, [fixture.path()]);
+
+        let reads_before = report.residency.weight_store().physical_reads;
+        let cache = loaded.expert_cache.as_ref().unwrap();
+        let acquired = cache
+            .acquire_route_slice(1, &[2], &[1, 1], ExpertPass::Decode, context.stream())
+            .unwrap();
+        let hot = cache.report().unwrap();
+        assert_eq!(hot.device_resident_experts, 1);
+        assert!(hot.residency.weight_store().physical_reads > reads_before);
+        drop(acquired);
     }
 
     #[test]

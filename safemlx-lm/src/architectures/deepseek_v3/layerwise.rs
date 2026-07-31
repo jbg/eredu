@@ -30,7 +30,8 @@ use crate::{
         PromptCacheDescriptor, PromptCacheManifest, PromptCacheModelIdentity,
     },
     runtime::checkpoint::binding::{
-        build_module_bindings_with_recipes, canonical_checkpoint_name, populate_module_from_lease,
+        build_module_bindings_with_recipes, canonical_checkpoint_name, materialize_module_bindings,
+        populate_module_from_arrays_excluding, populate_module_from_lease,
         populate_module_from_lease_excluding,
     },
     runtime::checkpoint::recipe::DerivedWeightRecipe,
@@ -278,6 +279,64 @@ pub(crate) fn load_deepseek_v3_gguf_layerwise_model(
         DeepSeekV3LayerwiseModel { execution },
         prepared.eos_token_ids,
     ))
+}
+
+/// Loads replicated DeepSeek GGUF parameters for sparse expert-parallel
+/// execution without materializing any routed-expert bank.
+pub(crate) fn load_deepseek_v3_gguf_sparse_ep_base(
+    checkpoint: &GgufCheckpoint,
+    metadata: &HashMap<String, GgufMetadataValue>,
+    max_mapped_shards: usize,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<(resident::Model, Arc<dyn WeightStore + Send + Sync>), Error> {
+    let prepared = resident::prepare_gguf_checkpoint(checkpoint, metadata, None, weights_stream)?;
+    let args = prepared.args;
+    let store: Arc<dyn WeightStore + Send + Sync> =
+        Arc::new(GgufWeightStore::new_with_max_mapped_shards(
+            checkpoint.clone(),
+            resident::translate_gguf_weight_name,
+            max_mapped_shards,
+        )?);
+    let adapter = DeepSeekV3LayerwiseAdapter::new_sparse(args.clone(), stream)?;
+    let mut model = resident::Model::new(args, stream)?;
+
+    let bindings = build_module_bindings_with_recipes(
+        &model.model.embed_tokens,
+        "model.embed_tokens",
+        store.as_ref(),
+        BTreeMap::new(),
+    )?;
+    let arrays = materialize_module_bindings(store.as_ref(), &bindings, weights_stream, stream)?;
+    populate_module_from_arrays_excluding(&mut model.model.embed_tokens, &arrays, |_| false)?;
+
+    let bindings = build_module_bindings_with_recipes(
+        &model.model.norm,
+        "model.norm",
+        store.as_ref(),
+        BTreeMap::new(),
+    )?;
+    let arrays = materialize_module_bindings(store.as_ref(), &bindings, weights_stream, stream)?;
+    populate_module_from_arrays_excluding(&mut model.model.norm, &arrays, |_| false)?;
+
+    let bindings = build_module_bindings_with_recipes(
+        &model.lm_head,
+        "lm_head",
+        store.as_ref(),
+        BTreeMap::new(),
+    )?;
+    let arrays = materialize_module_bindings(store.as_ref(), &bindings, weights_stream, stream)?;
+    populate_module_from_arrays_excluding(&mut model.lm_head, &arrays, |_| false)?;
+
+    for (index, layer) in model.model.layers.iter_mut().enumerate() {
+        let bindings = adapter.layer_bindings(0, index, layer, store.as_ref())?;
+        let arrays =
+            materialize_module_bindings(store.as_ref(), &bindings, weights_stream, stream)?;
+        populate_module_from_arrays_excluding(layer, &arrays, |name| {
+            name.starts_with("mlp.experts.")
+        })?;
+    }
+    Ok((model, store))
 }
 
 fn load_deepseek_gguf_sparse_with_store(

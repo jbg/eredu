@@ -2435,7 +2435,7 @@ mod tests {
 
         let convolution = normalize_gguf_weight(
             "model.layers.0.self_attn.q_conv1d.weight",
-            Array::from_slice(&vec![0.0f32; 2 * 4 * 2], &[1, 8, 1, 2]),
+            Array::from_slice(&[0.0f32; 2 * 4 * 2], &[1, 8, 1, 2]),
             &args,
             stream,
         )
