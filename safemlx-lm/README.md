@@ -1092,15 +1092,19 @@ with MLX 0.31.2.
 safetensors MoE families supported by sparse expert caching: DeepSeek-V3/R1,
 GPT-OSS, Inkling, Kimi Linear, LFM2,
 Nemotron-H, Qwen3, Qwen3-Next, Qwen3-VL-MoE, and Qwen3.5-MoE. GPT-OSS and the
-other hybrid or multimodal families require
-`WeightResidency::SparseExpertCache`; DeepSeek and Qwen3 additionally retain
-their fully resident EP loaders, as does Kimi Linear. The model API requires
+other hybrid or multimodal families require a sparse expert policy; every
+listed SafeTensors family accepts either `SparseExpertCache` or
+`SparseExpertCacheWithDenseLayers`. The latter streams replicated decoder
+units through the common bounded layer engine while keeping only rank-owned
+routed experts in the independent cache. DeepSeek, Qwen3, and Kimi Linear
+additionally retain their fully resident EP loaders. The model API requires
 `EP > 1`, `TP = 1`,
 and `PP = 1`; hybrid EP+TP and EP+PP are rejected before checkpoint payloads
 are opened. Dense models and GGUF architectures without a registered EP
-adapter are also rejected. Kimi Linear, DeepSeek2, and Qwen3-MoE provide both
-resident and sparse-cache GGUF EP adapters. Checkpoint `ep_size` describes a
-stored layout and is not the runtime EP degree.
+adapter are also rejected. Kimi Linear, DeepSeek2, and Qwen3-MoE provide
+resident GGUF EP; their streamed sparse-cache adapters are joined by
+LFM2-MoE, Nemotron-H-MoE, Qwen3-Next, and Qwen3.5-MoE. Checkpoint `ep_size`
+describes a stored layout and is not the runtime EP degree.
 
 `ExpertAssignment` supports balanced-contiguous (the model default),
 round-robin, and explicit owner maps. Pass a non-default assignment to
@@ -1152,7 +1156,10 @@ standard growing cache with `new_cache()` or a bounded cache with
 shared paged residency manager and both retain the same EP routing semantics.
 
 Every supported packed or split expert layout is selected by placement before
-payload materialization; remote-only indexed shards are not opened. Dense,
+payload materialization. The ordinary sparse-cache loader avoids opening
+remote-only indexed payload shards. Dense streaming catalogs all logical units
+up front, so it may touch remote shard metadata, but only rank-owned expert
+arrays can enter the expert cache and concurrent readers remain bounded. Dense,
 affine/MXFP4, FP8, and ReLU2/SwiGLU banks retain their architecture-specific
 physical kernels behind the common replicated dispatch. With sparse caching,
 `routed_expert_bytes` is zero and `owned_expert_bytes` describes the rank's
@@ -1166,11 +1173,12 @@ normalization, and output parameters. Only routed expert banks are
 partitioned; their contribution is all-summed before the shared expert is
 added once. Sparse-cache EP materializes only rank-owned expert payloads.
 Kimi GGUF checkpoints use the same partitioning and execution path for dense,
-affine, IQ, and MXFP4-MoE expert banks in resident or sparse-cache mode. Sparse
-mode materializes replicated nonexpert bindings at startup, keeps every owned
-expert cold until routed, and never adds remote experts to the cache catalog.
-The architecture-neutral GGUF EP dispatcher and type-erased expert cache also
-serve the registered DeepSeek2 and Qwen3-MoE adapters.
+affine, IQ, and MXFP4-MoE expert banks in resident or either sparse-cache mode.
+The combined streamed policy keeps replicated nonexpert layers cold, keeps
+every owned expert cold until routed, and never adds remote experts to the
+rank-local cache. The architecture-neutral GGUF EP dispatcher and type-erased
+expert cache also serve the registered DeepSeek2, Qwen3-MoE, LFM2-MoE,
+Nemotron-H-MoE, Qwen3-Next, and Qwen3.5-MoE streamed adapters.
 
 Run a two-process Ring generation probe with the usual MLX Ring host file and
 rank environment:
@@ -1228,6 +1236,10 @@ dense and affine-packed Qwen3/DeepSeek banks, native DeepSeek block-FP8, and
 sparse expert-cache EP for every supported MoE family.
 It also runs packed Qwen with round-robin placement and split DeepSeek with an
 explicit non-contiguous owner map.
+The separate
+`ring_two_process_streamed_dense_sparse_expert_cache_parity` case runs
+prefill and cached decode with replicated decoder layers streamed and routed
+experts cached independently across the supported text/runtime fixture set.
 Its DeepSeek fixture crosses a dense-to-MoE layer boundary, uses two router
 groups, and deliberately gives one rank zero routes to exercise imbalance and
 empty-local-work behavior. GPU FP8 keeps the packed Metal kernels; CPU Ring

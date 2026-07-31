@@ -1,6 +1,6 @@
 //! Unified fully resident and bounded layer execution for GPT-OSS.
 
-use std::{path::Path, time::Instant};
+use std::{path::Path, sync::Arc, time::Instant};
 
 use safemlx::{
     error::Exception,
@@ -32,8 +32,9 @@ use crate::{
     runtime::checkpoint::recipe::DerivedWeightRecipe,
     runtime::checkpoint::store::{TensorSelection, WeightStore},
     runtime::execution::layerwise::{
-        load_general_layerwise_model, GeneralLayerwiseModel, GeneralLayerwiseModelAdapter,
-        LayerExecutionLoadOptions, LayerwiseForwardState, StaticUnitBindings,
+        load_general_layerwise_model, load_general_layerwise_model_with_store,
+        GeneralLayerwiseModel, GeneralLayerwiseModelAdapter, LayerExecutionLoadOptions,
+        LayerwiseForwardState, StaticUnitBindings,
     },
     runtime::residency::expert_cache::{
         ExpertCache, ExpertCacheLoadOptions, ExpertCacheReport, ExpertCatalogEntry, ExpertIdentity,
@@ -178,6 +179,49 @@ impl GptOssLayerwiseModel {
         self.execution.forward(inputs, cache, stream)
     }
 
+    /// Runs streamed layers while delegating routed experts to a caller.
+    pub(crate) fn forward_with_expert_executor<F>(
+        &mut self,
+        inputs: &Array,
+        cache: &mut Cache,
+        mut execute: F,
+        stream: &Stream,
+    ) -> Result<Array, Error>
+    where
+        F: FnMut(usize, &Array, &Array, &Array, &Stream) -> Result<Array, Exception>,
+    {
+        self.execution.forward_with_layer_executor(
+            inputs,
+            cache,
+            stream,
+            |_adapter, _group, index, layer, hidden, cache, context, stream| {
+                let layer_cache = &mut cache.layers[index];
+                let offset = layer_cache.offset();
+                let window = layer_cache.max_size();
+                let needs_mask =
+                    context.sequence_length > 1 || window.is_some_and(|size| offset >= size);
+                let mask = needs_mask
+                    .then(|| {
+                        create_causal_mask(
+                            context.sequence_length,
+                            Some(offset.min(window.unwrap_or(offset))),
+                            window.map(|size| size - 1),
+                            None,
+                            stream,
+                        )
+                    })
+                    .transpose()?;
+                Ok(layer.forward_with_expert_executor(
+                    hidden,
+                    mask.as_ref(),
+                    layer_cache,
+                    stream,
+                    |hidden, ids, weights, stream| execute(index, hidden, ids, weights, stream),
+                )?)
+            },
+        )
+    }
+
     /// Clears temporary decoder copies from the execution device.
     pub fn clear_device_layer_window(&self) -> Result<(), Error> {
         self.execution.clear_device_group("text_decoder")
@@ -285,6 +329,26 @@ fn load_gpt_oss_sparse_expert_cache_model_with_non_expert(
         weights_stream.clone(),
         stream.clone(),
     )?);
+    Ok(GptOssLayerwiseModel { execution })
+}
+
+/// Builds the streamed nonexpert GPT-OSS execution base used by distributed EP.
+pub(crate) fn load_gpt_oss_sparse_ep_base_with_store(
+    store: Arc<dyn WeightStore + Send + Sync>,
+    args: ModelArgs,
+    non_expert: crate::runtime::residency::dense_stream::DenseDiskStreamLoadOptions,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<GptOssLayerwiseModel, Error> {
+    let mut adapter = GptOssLayerwiseAdapter::new(args, stream)?;
+    adapter.sparse_expert_cache = true;
+    let execution = load_general_layerwise_model_with_store(
+        store,
+        adapter,
+        non_expert,
+        stream,
+        weights_stream,
+    )?;
     Ok(GptOssLayerwiseModel { execution })
 }
 

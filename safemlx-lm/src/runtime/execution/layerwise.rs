@@ -1449,8 +1449,72 @@ impl<A: GeneralLayerwiseModelAdapter> GeneralLayerwiseModel<A> {
         cache: &mut A::Cache,
         stream: &Stream,
     ) -> Result<Array, Error> {
-        self.forward_with_context_hook(input, cache, stream, |_, _, _| Ok(()))
+        self.forward_with_hooks(
+            input,
+            cache,
+            stream,
+            |adapter, group, index, layer, hidden, cache, context, stream| {
+                adapter.forward_layer(group, index, layer, hidden, cache, context, stream)
+            },
+            |_, _, _| Ok(()),
+        )
+        .map(|(output, _)| output)
+    }
+
+    /// Runs a generalized forward pass while allowing the caller to replace
+    /// execution of each populated layer.
+    ///
+    /// Residency, prefetch, lease lifetime, retained-array evaluation, and
+    /// telemetry remain owned by this engine. Distributed execution uses this
+    /// hook to replace only routed-expert evaluation while reusing the same
+    /// architecture adapter and checkpoint bindings.
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn forward_with_layer_executor<'a, F>(
+        &mut self,
+        input: A::Input<'a>,
+        cache: &mut A::Cache,
+        stream: &Stream,
+        executor: F,
+    ) -> Result<Array, Error>
+    where
+        F: FnMut(
+            &mut A,
+            usize,
+            usize,
+            &mut A::Layer,
+            &Array,
+            &mut A::Cache,
+            &mut A::ForwardContext,
+            &Stream,
+        ) -> Result<Array, Error>,
+    {
+        self.forward_with_hooks(input, cache, stream, executor, |_, _, _| Ok(()))
             .map(|(output, _)| output)
+    }
+
+    /// Runs a generalized pass with caller-provided populated-layer execution
+    /// and returns the architecture context retained by that pass.
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn forward_with_layer_executor_and_context<'a, F>(
+        &mut self,
+        input: A::Input<'a>,
+        cache: &mut A::Cache,
+        stream: &Stream,
+        executor: F,
+    ) -> Result<(Array, A::ForwardContext), Error>
+    where
+        F: FnMut(
+            &mut A,
+            usize,
+            usize,
+            &mut A::Layer,
+            &Array,
+            &mut A::Cache,
+            &mut A::ForwardContext,
+            &Stream,
+        ) -> Result<Array, Error>,
+    {
+        self.forward_with_hooks(input, cache, stream, executor, |_, _, _| Ok(()))
     }
 
     /// Runs a generalized forward pass and invokes `hook` after each execution unit.
@@ -1463,10 +1527,43 @@ impl<A: GeneralLayerwiseModelAdapter> GeneralLayerwiseModel<A> {
         input: A::Input<'a>,
         cache: &mut A::Cache,
         stream: &Stream,
-        mut hook: F,
+        hook: F,
     ) -> Result<(Array, A::ForwardContext), Error>
     where
         F: FnMut(usize, usize, &mut A::ForwardContext) -> Result<(), Error>,
+    {
+        self.forward_with_hooks(
+            input,
+            cache,
+            stream,
+            |adapter, group, index, layer, hidden, cache, context, stream| {
+                adapter.forward_layer(group, index, layer, hidden, cache, context, stream)
+            },
+            hook,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments, clippy::type_complexity)]
+    fn forward_with_hooks<'a, F, H>(
+        &mut self,
+        input: A::Input<'a>,
+        cache: &mut A::Cache,
+        stream: &Stream,
+        mut executor: F,
+        mut hook: H,
+    ) -> Result<(Array, A::ForwardContext), Error>
+    where
+        F: FnMut(
+            &mut A,
+            usize,
+            usize,
+            &mut A::Layer,
+            &Array,
+            &mut A::Cache,
+            &mut A::ForwardContext,
+            &Stream,
+        ) -> Result<Array, Error>,
+        H: FnMut(usize, usize, &mut A::ForwardContext) -> Result<(), Error>,
     {
         self.adapter.validate_cache(cache)?;
         let LayerwiseForwardState {
@@ -1506,7 +1603,8 @@ impl<A: GeneralLayerwiseModelAdapter> GeneralLayerwiseModel<A> {
                         let mut layer = self.adapter.new_layer(group_index, index, stream)?;
                         self.adapter
                             .populate_layer(group_index, index, &mut layer, &lease)?;
-                        hidden = self.adapter.forward_layer(
+                        hidden = executor(
+                            &mut self.adapter,
                             group_index,
                             index,
                             &mut layer,
@@ -1847,6 +1945,36 @@ impl<A: LayerwiseModelAdapter> LayerwiseModel<A> {
     where
         C: KeyValueCache + Default,
     {
+        self.forward_with_layer_executor(
+            input,
+            stream,
+            |adapter, index, layer, hidden, cache, context, stream| {
+                adapter.forward_layer(index, layer, hidden, cache, context, stream)
+            },
+        )
+    }
+
+    /// Runs a homogeneous layerwise model while allowing the caller to replace
+    /// execution of each populated decoder layer.
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn forward_with_layer_executor<C, F>(
+        &mut self,
+        input: LayerwiseInput<'_, C>,
+        stream: &Stream,
+        mut executor: F,
+    ) -> Result<Array, Error>
+    where
+        C: KeyValueCache + Default,
+        F: FnMut(
+            &mut A,
+            usize,
+            &mut A::Layer,
+            &Array,
+            &mut C,
+            &A::ForwardContext,
+            &Stream,
+        ) -> Result<Array, Error>,
+    {
         let LayerwiseInput {
             inputs,
             mask,
@@ -1887,7 +2015,8 @@ impl<A: LayerwiseModelAdapter> LayerwiseModel<A> {
                 let layer_cache = layer_cache
                     .as_mut()
                     .ok_or(LayerwiseModelError::MissingLayerCache { index })?;
-                h = self.adapter.forward_layer(
+                h = executor(
+                    &mut self.adapter,
                     index,
                     &mut layer,
                     &h,

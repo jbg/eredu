@@ -109,6 +109,35 @@ impl NemotronHLayerwiseModel {
         self.execution.forward(inputs, cache, stream)
     }
 
+    /// Runs streamed layers while delegating routed experts to a caller.
+    pub(crate) fn forward_with_expert_executor<F>(
+        &mut self,
+        inputs: &Array,
+        cache: &mut Cache,
+        mut execute: F,
+        stream: &Stream,
+    ) -> Result<Array, Error>
+    where
+        F: FnMut(usize, &Array, &Array, &Array, &Stream) -> Result<Array, Exception>,
+    {
+        self.execution.forward_with_layer_executor(
+            inputs,
+            cache,
+            stream,
+            |_adapter, _group, index, layer, hidden, cache, context, stream| {
+                Ok(layer.forward_sparse_experts(
+                    BlockInput {
+                        x: hidden,
+                        mask: context.mask.as_ref(),
+                        cache: Some(&mut cache.layers[index]),
+                    },
+                    stream,
+                    |hidden, ids, weights, stream| execute(index, hidden, ids, weights, stream),
+                )?)
+            },
+        )
+    }
+
     /// Clears temporary hybrid blocks from the execution device.
     pub fn clear_device_layer_window(&self) -> Result<(), Error> {
         self.execution.clear_device_group("text_decoder")
@@ -261,6 +290,26 @@ fn load_nemotron_h_gguf_sparse_with_store(
         weights_stream.clone(),
         stream.clone(),
     )?);
+    Ok(NemotronHLayerwiseModel { execution })
+}
+
+/// Builds the streamed nonexpert Nemotron-H execution base used by distributed EP.
+pub(crate) fn load_nemotron_h_sparse_ep_base_with_store(
+    store: Arc<dyn WeightStore + Send + Sync>,
+    args: ModelArgs,
+    non_expert: crate::runtime::residency::dense_stream::DenseDiskStreamLoadOptions,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<NemotronHLayerwiseModel, Error> {
+    let mut adapter = NemotronHLayerwiseAdapter::new(args, stream)?;
+    adapter.sparse_expert_cache = true;
+    let execution = load_general_layerwise_model_with_store(
+        store,
+        adapter,
+        non_expert,
+        stream,
+        weights_stream,
+    )?;
     Ok(NemotronHLayerwiseModel { execution })
 }
 

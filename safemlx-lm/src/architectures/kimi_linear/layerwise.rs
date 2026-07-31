@@ -103,6 +103,34 @@ impl KimiLinearLayerwiseModel {
         self.execution.forward(inputs, cache, stream)
     }
 
+    /// Runs streamed layers while delegating routed experts to a caller.
+    pub(crate) fn forward_with_expert_executor<F>(
+        &mut self,
+        inputs: &Array,
+        mask: Option<&Array>,
+        cache: &mut Cache,
+        mut execute: F,
+        stream: &Stream,
+    ) -> Result<Array, Error>
+    where
+        F: FnMut(usize, &Array, &Array, &Array, &Stream) -> Result<Array, Exception>,
+    {
+        self.execution.forward_with_layer_executor(
+            inputs,
+            cache,
+            stream,
+            |_adapter, _group, index, layer, hidden, cache, context, stream| {
+                Ok(layer.forward_sparse_experts(
+                    hidden,
+                    mask.or(context.mask.as_ref()),
+                    Some(&mut cache.layers[index]),
+                    stream,
+                    |hidden, ids, weights, stream| execute(index, hidden, ids, weights, stream),
+                )?)
+            },
+        )
+    }
+
     /// Evicts temporary decoder layers from the execution device.
     pub fn clear_device_layer_window(&self) -> Result<(), Error> {
         self.execution.clear_device_group("text_decoder")
@@ -363,6 +391,26 @@ fn load_kimi_linear_sparse_with_store(
         weights_stream.clone(),
         stream.clone(),
     )?);
+    Ok(KimiLinearLayerwiseModel { execution })
+}
+
+/// Builds the streamed nonexpert Kimi execution base used by distributed EP.
+pub(crate) fn load_kimi_linear_sparse_ep_base_with_store(
+    store: Arc<dyn WeightStore + Send + Sync>,
+    args: ModelArgs,
+    non_expert: crate::runtime::residency::dense_stream::DenseDiskStreamLoadOptions,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<KimiLinearLayerwiseModel, Error> {
+    args.validate()?;
+    let adapter = KimiLinearLayerwiseAdapter::new_sparse(args, stream)?;
+    let execution = load_general_layerwise_model_with_store(
+        store,
+        adapter,
+        non_expert,
+        stream,
+        weights_stream,
+    )?;
     Ok(KimiLinearLayerwiseModel { execution })
 }
 

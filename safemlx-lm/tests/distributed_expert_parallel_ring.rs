@@ -39,7 +39,10 @@ use safemlx_lm::{
     runtime::generation::sampler::DefaultSampler,
     runtime::generation::speculative::{MtpCapability, MtpCheckpointKind, MtpConfig},
     runtime::media::input as runtime_input,
-    runtime::residency::expert_cache::ExpertCacheLoadOptions,
+    runtime::residency::{
+        dense_stream::DenseDiskStreamLoadOptions,
+        expert_cache::{ExpertCacheLoadOptions, SparseExpertDenseStreamLoadOptions},
+    },
     CacheResidencyPolicy, DeviceAssignment, PagedCacheOptions, ParallelTopology,
     PromptCacheDescriptor, PromptCacheOptions, PromptCacheTopology, WeightResidency,
 };
@@ -125,6 +128,7 @@ fn expert_parallel_model_ring_worker() {
     let encoding = std::env::var(ENCODING).unwrap_or_else(|_| "dense".into());
     let assignment_kind = std::env::var(ASSIGNMENT).unwrap_or_else(|_| "balanced".into());
     let residency = std::env::var(RESIDENCY).unwrap_or_else(|_| "resident".into());
+    let sparse_cached = matches!(residency.as_str(), "sparse-cache" | "streamed-cache");
     let config: serde_json::Value =
         serde_json::from_slice(&std::fs::read(checkpoint.join("config.json")).unwrap()).unwrap();
     let hidden_size = config["hidden_size"].as_i64().unwrap() as i32;
@@ -155,9 +159,18 @@ fn expert_parallel_model_ring_worker() {
     if encoding == "affine" {
         options.quantization = Some(quantization);
     }
-    if residency == "sparse-cache" {
-        options.weight_residency =
-            WeightResidency::SparseExpertCache(ExpertCacheLoadOptions::default());
+    if sparse_cached {
+        let experts = ExpertCacheLoadOptions::default();
+        options.weight_residency = if residency == "streamed-cache" {
+            WeightResidency::SparseExpertCacheWithDenseLayers(
+                SparseExpertDenseStreamLoadOptions::new(
+                    experts,
+                    DenseDiskStreamLoadOptions::new(u64::MAX, u64::MAX, 1, 1, 1).unwrap(),
+                ),
+            )
+        } else {
+            WeightResidency::SparseExpertCache(experts)
+        };
     }
     let assignment = match assignment_kind.as_str() {
         "balanced" => None,
@@ -190,7 +203,7 @@ fn expert_parallel_model_ring_worker() {
     };
     assert_eq!(info.assignment.local_global_expert_ids(), expected_experts);
     let dense_routed_bytes = 2 * moe_layers * 3 * moe_intermediate_size * hidden_size as usize * 4;
-    if residency == "sparse-cache" {
+    if sparse_cached {
         assert_eq!(info.routed_expert_bytes, 0);
         assert!(info.owned_expert_bytes > 0);
     } else if encoding == "dense" {
@@ -206,6 +219,15 @@ fn expert_parallel_model_ring_worker() {
         info.local_parameter_bytes,
         info.replicated_parameter_bytes + info.routed_expert_bytes
     );
+    if residency == "streamed-cache" {
+        let dense = model.dense_stream_report().unwrap().unwrap();
+        assert!(dense.planned_layer_count() > 0);
+        assert_eq!(dense.device_layers().current_layer_count(), 0);
+        assert_eq!(
+            model.expert_cache_report().unwrap().unwrap().owned_experts,
+            2 * moe_layers
+        );
+    }
     let opened = info
         .opened_checkpoint_shards
         .iter()
@@ -214,7 +236,12 @@ fn expert_parallel_model_ring_worker() {
     if checkpoint.join("replicated.safetensors").exists() {
         assert!(opened.contains(&"replicated.safetensors".to_string()));
         for expert in 0..4 {
-            let expected_open = residency != "sparse-cache" && expected_experts.contains(&expert);
+            // Dense streaming catalogs every execution/expert unit up front,
+            // so shard metadata may be touched even though only rank-owned
+            // expert arrays can enter the cache. The mapped-reader bound still
+            // limits concurrent mappings.
+            let expected_open = residency == "streamed-cache"
+                || (!sparse_cached && expected_experts.contains(&expert));
             assert_eq!(
                 opened.contains(&format!("expert-{expert}.safetensors")),
                 expected_open,
@@ -252,7 +279,7 @@ fn expert_parallel_model_ring_worker() {
     );
     if architecture == "DeepSeekV3" && assignment_kind == "balanced" && expected_rank == 0 {
         assert_eq!(model.latest_routing_statistics().local_routes, 0);
-    } else if assignment_kind == "balanced" && residency != "sparse-cache" {
+    } else if assignment_kind == "balanced" && !sparse_cached {
         assert!(model.latest_routing_statistics().local_routes > 0);
     }
 
@@ -332,7 +359,7 @@ fn expert_parallel_model_ring_worker() {
     );
     if architecture == "DeepSeekV3" && assignment_kind == "balanced" && expected_rank == 0 {
         assert_eq!(model.latest_routing_statistics().local_routes, 0);
-    } else if assignment_kind == "balanced" && residency != "sparse-cache" {
+    } else if assignment_kind == "balanced" && !sparse_cached {
         assert!(model.latest_routing_statistics().local_routes > 0);
     }
     assert_eq!(cache.offset(), 4);
@@ -354,7 +381,7 @@ fn expert_parallel_model_ring_worker() {
     );
     if architecture == "DeepSeekV3" && assignment_kind == "balanced" && expected_rank == 0 {
         assert_eq!(model.latest_routing_statistics().local_routes, 0);
-    } else if assignment_kind == "balanced" && residency != "sparse-cache" {
+    } else if assignment_kind == "balanced" && !sparse_cached {
         assert!(model.latest_routing_statistics().local_routes > 0);
     }
     let third = model
@@ -375,7 +402,7 @@ fn expert_parallel_model_ring_worker() {
     );
     assert_eq!(cache.offset(), 5);
 
-    if residency != "sparse-cache" {
+    if !sparse_cached {
         let mut observed_cache = model.new_cache();
         let mut observer = EpObserver {
             names: Vec::new(),
@@ -411,7 +438,7 @@ fn expert_parallel_model_ring_worker() {
     assert!(timings.expert_time > Duration::ZERO);
     assert!(timings.reduction_time > Duration::ZERO);
     assert_eq!(timings.exchange_time, Duration::ZERO);
-    if residency != "sparse-cache" {
+    if !sparse_cached {
         assert!(timings.router_time > Duration::ZERO);
         assert_eq!(
             timings.shared_expert_time > Duration::ZERO,
@@ -1467,6 +1494,53 @@ fn ring_two_process_model_parity() {
             "dense",
             "balanced",
             "sparse-cache",
+            &checkpoint,
+            "expected.safetensors",
+        );
+    }
+}
+
+/// Verifies the combined policy end-to-end: replicated decoder units stream
+/// through bounded dense residency while only rank-owned routed experts enter
+/// the independent expert cache.
+#[test]
+#[ignore = "spawns local Ring workers and opens loopback sockets"]
+fn ring_two_process_streamed_dense_sparse_expert_cache_parity() {
+    assert!(distributed::is_available(Backend::Ring));
+    let fixture = tempfile::tempdir().unwrap();
+    let qwen = fixture.path().join("qwen3-moe-streamed");
+    let qwen_packed = fixture.path().join("qwen3-moe-streamed-packed");
+    let deepseek = fixture.path().join("deepseek-v3-streamed");
+    std::fs::create_dir_all(&qwen).unwrap();
+    std::fs::create_dir_all(&qwen_packed).unwrap();
+    std::fs::create_dir_all(&deepseek).unwrap();
+    write_qwen_fixture(&qwen, &qwen_packed);
+    write_deepseek_fixture(&deepseek);
+    run_ring_fixture(
+        "Qwen3 streamed dense sparse expert cache",
+        "Qwen3",
+        "dense",
+        "balanced",
+        "streamed-cache",
+        &qwen,
+        "expected.safetensors",
+    );
+    run_ring_fixture(
+        "DeepSeekV3 streamed dense sparse expert cache",
+        "DeepSeekV3",
+        "dense",
+        "balanced",
+        "streamed-cache",
+        &deepseek,
+        "expected.safetensors",
+    );
+    for (label, architecture, checkpoint) in write_additional_sparse_fixtures(fixture.path()) {
+        run_ring_fixture(
+            &format!("{label} with streamed dense layers"),
+            architecture,
+            "dense",
+            "balanced",
+            "streamed-cache",
             &checkpoint,
             "expected.safetensors",
         );

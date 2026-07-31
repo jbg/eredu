@@ -136,6 +136,70 @@ impl Qwen3VlLayerwiseModel {
             .forward(Qwen3VlInput::Decode(tokens), cache, stream)
     }
 
+    /// Runs streamed text layers while delegating routed experts to a caller.
+    pub(crate) fn decode_with_expert_executor<F>(
+        &mut self,
+        tokens: &Array,
+        cache: &mut Cache,
+        mut execute: F,
+        stream: &Stream,
+    ) -> Result<Array, Error>
+    where
+        F: FnMut(usize, &Array, &Array, &Array, &Stream) -> Result<Array, Exception>,
+    {
+        self.execution.forward_with_layer_executor(
+            Qwen3VlInput::Decode(tokens),
+            cache,
+            stream,
+            |adapter, group, index, layer, hidden, cache, context, stream| match (group, layer) {
+                (0, Qwen3VlLayer::Vision(block)) => {
+                    let Some(state) = context.vision.as_mut() else {
+                        return Ok(hidden.clone());
+                    };
+                    let output = adapter.vision.forward_block(
+                        block,
+                        index,
+                        hidden.clone(),
+                        state,
+                        stream,
+                    )?;
+                    adapter
+                        .vision
+                        .capture_deepstack(index, &output, state, stream)?;
+                    Ok(output)
+                }
+                (1, Qwen3VlLayer::Text(block)) => {
+                    let mut output = block.forward_sparse_experts_with_rotary(
+                        AttentionInput {
+                            x: hidden,
+                            mask: context.mask.as_ref(),
+                            cache: cache.kv[index].as_mut(),
+                        },
+                        &context.cos,
+                        &context.sin,
+                        stream,
+                        |hidden, ids, weights, stream| execute(index, hidden, ids, weights, stream),
+                    )?;
+                    if let Some(features) = context.deepstack_features.get(index) {
+                        let base = zeros_dtype(output.shape(), output.dtype(), stream)?;
+                        let features = features.try_index_device((0, .., ..), stream)?;
+                        let aligned = masked_scatter(
+                            &base,
+                            context.visual_mask.as_ref().expect("DeepStack visual mask"),
+                            features,
+                            stream,
+                        )?;
+                        output = output.add(aligned, stream)?;
+                    }
+                    Ok(output)
+                }
+                _ => Err(Error::UnsupportedArchitecture(format!(
+                    "Qwen3-VL execution unit does not match group {group}"
+                ))),
+            },
+        )
+    }
+
     /// Clears temporary copies for one execution group.
     pub fn clear_device_group(&self, group: &str) -> Result<(), Error> {
         self.execution.clear_device_group(group)
@@ -314,6 +378,31 @@ fn load_qwen3_vl_sparse_expert_cache_model_with_non_expert(
         weights_stream.clone(),
         stream.clone(),
     )?);
+    Ok(Qwen3VlLayerwiseModel { execution })
+}
+
+/// Builds the streamed nonexpert Qwen3-VL execution base used by distributed EP.
+pub(crate) fn load_qwen3_vl_sparse_ep_base_with_store(
+    store: Arc<dyn WeightStore + Send + Sync>,
+    args: ModelArgs,
+    non_expert: crate::runtime::residency::dense_stream::DenseDiskStreamLoadOptions,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<Qwen3VlLayerwiseModel, Error> {
+    if !args.text_config.is_moe() {
+        return Err(Error::UnsupportedArchitecture(
+            "streamed sparse expert parallelism requires Qwen3-VL-MoE".into(),
+        ));
+    }
+    let mut adapter = Qwen3VlLayerwiseAdapter::new(args, stream)?;
+    adapter.sparse_expert_cache = true;
+    let execution = load_general_layerwise_model_with_store(
+        store,
+        adapter,
+        non_expert,
+        stream,
+        weights_stream,
+    )?;
     Ok(Qwen3VlLayerwiseModel { execution })
 }
 

@@ -124,6 +124,40 @@ impl Qwen3LayerwiseModel {
         )
     }
 
+    /// Runs streamed layers while delegating routed experts to a caller.
+    pub(crate) fn forward_with_expert_executor<C, F>(
+        &mut self,
+        inputs: &Array,
+        mask: Option<&Array>,
+        cache: &mut Vec<Option<C>>,
+        mut execute: F,
+        stream: &Stream,
+    ) -> Result<Array, Error>
+    where
+        C: KeyValueCache + Default,
+        F: FnMut(usize, &Array, &Array, &Array, &Stream) -> Result<Array, Exception>,
+    {
+        self.execution.forward_with_layer_executor(
+            LayerwiseInput {
+                inputs,
+                mask,
+                cache,
+            },
+            stream,
+            |_adapter, index, layer, hidden, cache, context, stream| {
+                Ok(layer.forward_sparse_experts(
+                    AttentionInput {
+                        x: hidden,
+                        mask: context.mask.as_ref(),
+                        cache: Some(cache),
+                    },
+                    stream,
+                    |hidden, ids, weights, stream| execute(index, hidden, ids, weights, stream),
+                )?)
+            },
+        )
+    }
+
     /// Clears temporary device decoder copies.
     pub fn clear_device_layer_window(&self) -> Result<(), Error> {
         self.execution.clear_device_layer_window()
@@ -322,6 +356,25 @@ fn load_qwen3_gguf_sparse_with_store(
         weights_stream.clone(),
         stream.clone(),
     )?);
+    Ok(Qwen3LayerwiseModel { execution })
+}
+
+/// Builds the streamed nonexpert Qwen3 execution base used by distributed EP.
+pub(crate) fn load_qwen3_sparse_ep_base_with_store(
+    store: Arc<dyn WeightStore + Send + Sync>,
+    args: ModelArgs,
+    non_expert: crate::runtime::residency::dense_stream::DenseDiskStreamLoadOptions,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<Qwen3LayerwiseModel, Error> {
+    if !args.is_moe() {
+        return Err(Error::UnsupportedArchitecture(
+            "streamed sparse expert parallelism requires Qwen3 MoE".into(),
+        ));
+    }
+    let adapter = Qwen3LayerwiseAdapter::new_sparse(args, stream)?;
+    let execution =
+        load_layerwise_model_with_store(store, adapter, non_expert, stream, weights_stream)?;
     Ok(Qwen3LayerwiseModel { execution })
 }
 

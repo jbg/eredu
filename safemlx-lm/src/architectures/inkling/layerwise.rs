@@ -1,6 +1,6 @@
 //! Text-decoder bounded layer execution for Thinking Machines Lab Inkling.
 
-use std::{collections::BTreeMap, path::Path, time::Instant};
+use std::{collections::BTreeMap, path::Path, sync::Arc, time::Instant};
 
 use safemlx::{
     error::Exception,
@@ -29,8 +29,9 @@ use crate::{
     runtime::checkpoint::recipe::DerivedWeightRecipe,
     runtime::checkpoint::store::{TensorSelection, WeightStore},
     runtime::execution::layerwise::{
-        load_general_layerwise_model, GeneralLayerwiseModel, GeneralLayerwiseModelAdapter,
-        LayerExecutionLoadOptions, LayerwiseForwardState, StaticUnitBindings,
+        load_general_layerwise_model, load_general_layerwise_model_with_store,
+        GeneralLayerwiseModel, GeneralLayerwiseModelAdapter, LayerExecutionLoadOptions,
+        LayerwiseForwardState, StaticUnitBindings,
     },
     runtime::residency::expert_cache::{
         ExpertCache, ExpertCacheLoadOptions, ExpertCacheReport, ExpertCatalogEntry, ExpertIdentity,
@@ -127,6 +128,41 @@ impl InklingLayerwiseModel {
             },
             cache,
             stream,
+        )
+    }
+
+    /// Runs streamed text layers while delegating routed experts to a caller.
+    pub(crate) fn forward_with_expert_executor<F>(
+        &mut self,
+        inputs: &Array,
+        cache: &mut Cache,
+        mut execute: F,
+        stream: &Stream,
+    ) -> Result<Array, Error>
+    where
+        F: FnMut(usize, &Array, &Array, &Array, &Stream) -> Result<Array, Exception>,
+    {
+        self.execution.forward_with_layer_executor(
+            InklingExecutionInput {
+                input: InklingInput::Decode(inputs),
+                last_token_only: false,
+            },
+            cache,
+            stream,
+            |_adapter, _group, index, layer, hidden, cache, context, stream| match layer {
+                InklingLayer::Vision(layer) => {
+                    for job in &mut context.vision_jobs {
+                        job.hidden = layer.forward(&job.hidden, stream)?;
+                    }
+                    Ok(context.vision_jobs[0].hidden.clone())
+                }
+                InklingLayer::Text(layer) => Ok(layer.forward_with_expert_executor(
+                    hidden,
+                    Some(&mut cache.layers[index]),
+                    stream,
+                    |hidden, ids, weights, stream| execute(index, hidden, ids, weights, stream),
+                )?),
+            },
         )
     }
 
@@ -257,6 +293,26 @@ fn load_inkling_sparse_expert_cache_model_with_non_expert(
         weights_stream.clone(),
         stream.clone(),
     )?);
+    Ok(InklingLayerwiseModel { execution })
+}
+
+/// Builds the streamed nonexpert Inkling execution base used by distributed EP.
+pub(crate) fn load_inkling_sparse_ep_base_with_store(
+    store: Arc<dyn WeightStore + Send + Sync>,
+    args: ModelArgs,
+    non_expert: crate::runtime::residency::dense_stream::DenseDiskStreamLoadOptions,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<InklingLayerwiseModel, Error> {
+    let mut adapter = InklingLayerwiseAdapter::new(args, stream)?;
+    adapter.sparse_expert_cache = true;
+    let execution = load_general_layerwise_model_with_store(
+        store,
+        adapter,
+        non_expert,
+        stream,
+        weights_stream,
+    )?;
     Ok(InklingLayerwiseModel { execution })
 }
 

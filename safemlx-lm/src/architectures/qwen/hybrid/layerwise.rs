@@ -138,6 +138,98 @@ impl QwenHybridLayerwiseModel {
             .forward(QwenHybridInput::Decode(inputs), cache, stream)
     }
 
+    /// Runs streamed text layers while delegating routed experts to a caller.
+    pub(crate) fn forward_with_expert_executor<F>(
+        &mut self,
+        inputs: &Array,
+        cache: &mut Cache,
+        mut execute: F,
+        stream: &Stream,
+    ) -> Result<Array, Error>
+    where
+        F: FnMut(usize, &Array, &Array, &Array, &Stream) -> Result<Array, Exception>,
+    {
+        self.execution.forward_with_layer_executor(
+            QwenHybridInput::Decode(inputs),
+            cache,
+            stream,
+            |adapter, _group, index, layer, hidden, cache, context, stream| match layer {
+                QwenHybridLayer::Vision(block) => {
+                    let vision = adapter.vision.as_mut().expect("vision group");
+                    for job in &mut context.vision_jobs {
+                        job.hidden = vision.forward_block(
+                            block,
+                            index,
+                            job.hidden.clone(),
+                            &job.state,
+                            stream,
+                        )?;
+                        vision.capture_deepstack(index, &job.hidden, &mut job.state, stream)?;
+                    }
+                    Ok(context.vision_jobs[0].hidden.clone())
+                }
+                QwenHybridLayer::Text(block) => Ok(block.forward_sparse_experts(
+                    BlockInput {
+                        x: hidden,
+                        mask: context.mask.as_ref(),
+                        cache: Some(&mut cache.layers[index]),
+                    },
+                    stream,
+                    |hidden, ids, weights, stream| execute(index, hidden, ids, weights, stream),
+                )?),
+            },
+        )
+    }
+
+    pub(crate) fn forward_mtp_with_expert_executor<F>(
+        &mut self,
+        inputs: &Array,
+        cache: &mut Cache,
+        mut execute: F,
+        stream: &Stream,
+    ) -> Result<QwenMtpStepOutput, Exception>
+    where
+        F: FnMut(usize, &Array, &Array, &Array, &Stream) -> Result<Array, Exception>,
+    {
+        let (logits, context) = self
+            .execution
+            .forward_with_layer_executor_and_context(
+                QwenHybridInput::Decode(inputs),
+                cache,
+                stream,
+                |adapter, _group, index, layer, hidden, cache, context, stream| match layer {
+                    QwenHybridLayer::Vision(block) => {
+                        let vision = adapter.vision.as_mut().expect("vision group");
+                        for job in &mut context.vision_jobs {
+                            job.hidden = vision.forward_block(
+                                block,
+                                index,
+                                job.hidden.clone(),
+                                &job.state,
+                                stream,
+                            )?;
+                            vision.capture_deepstack(index, &job.hidden, &mut job.state, stream)?;
+                        }
+                        Ok(context.vision_jobs[0].hidden.clone())
+                    }
+                    QwenHybridLayer::Text(block) => Ok(block.forward_sparse_experts(
+                        BlockInput {
+                            x: hidden,
+                            mask: context.mask.as_ref(),
+                            cache: Some(&mut cache.layers[index]),
+                        },
+                        stream,
+                        |hidden, ids, weights, stream| execute(index, hidden, ids, weights, stream),
+                    )?),
+                },
+            )
+            .map_err(|error| Exception::custom(error.to_string()))?;
+        let hidden = context.draft_hidden.ok_or_else(|| {
+            Exception::custom("Qwen layerwise pass did not retain MTP hidden state")
+        })?;
+        Ok(QwenMtpStepOutput { logits, hidden })
+    }
+
     pub(crate) fn prefill_mtp(
         &mut self,
         input: input::ModelInput<'_>,
@@ -539,6 +631,32 @@ fn load_qwen_hybrid_sparse_model(
         weights_stream.clone(),
         stream.clone(),
     )?);
+    Ok(QwenHybridLayerwiseModel { execution })
+}
+
+/// Builds the streamed nonexpert Qwen hybrid execution base used by distributed EP.
+pub(crate) fn load_qwen_hybrid_sparse_ep_base_with_store(
+    store: Arc<dyn WeightStore + Send + Sync>,
+    args: ModelArgs,
+    is_qwen3_next: bool,
+    non_expert: crate::runtime::residency::dense_stream::DenseDiskStreamLoadOptions,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<QwenHybridLayerwiseModel, Error> {
+    let family = if is_qwen3_next {
+        QwenHybridFamily::Qwen3Next
+    } else {
+        QwenHybridFamily::Qwen35
+    };
+    let mut adapter = QwenHybridLayerwiseAdapter::new(args, family, None, None, None, stream)?;
+    adapter.sparse_expert_cache = true;
+    let execution = load_general_layerwise_model_with_store(
+        store,
+        adapter,
+        non_expert,
+        stream,
+        weights_stream,
+    )?;
     Ok(QwenHybridLayerwiseModel { execution })
 }
 
