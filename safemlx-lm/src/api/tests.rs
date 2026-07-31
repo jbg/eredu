@@ -432,13 +432,14 @@ fn inkling_chat_tokenizer(preceding_tokens: usize) -> ChatTokenizer {
                 "<|message_model|>",
                 "<|content_text|>",
                 "<|content_thinking|>",
+                "<|content_invoke_tool_json|>",
                 "<|end_message|>",
                 "<|content_model_end_sampling|>",
             ]
             .map(|token| AddedToken::from(token, true).normalized(false))
         )
         .unwrap(),
-        5
+        6
     );
     ChatTokenizer::from_tokenizer(raw)
 }
@@ -2734,10 +2735,10 @@ fn inkling_template_recognition_routes_reasoning_and_visible_text() {
     ));
     assert!(prepared.capabilities().reasoning_parser.is_supported());
     assert!(prepared.capabilities().visible_text_parser.is_supported());
-    assert!(!prepared.capabilities().tool_output_parser.is_supported());
+    assert!(prepared.capabilities().tool_output_parser.is_supported());
     assert!(matches!(
         prepared.native_tool_support(),
-        NativeToolSupport::Unsupported { .. }
+        NativeToolSupport::Supported
     ));
     assert_eq!(prepared.generation_prompt(), "<|message_model|>");
     assert!(prepared.rendered_prompt().contains(concat!(
@@ -2845,7 +2846,7 @@ fn inkling_reasoning_toggle_maps_to_named_effort() {
 }
 
 #[test]
-fn inkling_recognition_is_behavioral_and_keeps_native_tools_fail_closed() {
+fn inkling_recognition_is_behavioral_and_exposes_native_tools() {
     let compiler = Ok(ConstraintCompiler::synthetic_for_tests());
     let refactored = format!("{{# source-only refactor #}}{INKLING_SMALL_FIXTURE}");
     let mut tokenizer = inkling_chat_tokenizer(11);
@@ -2868,8 +2869,7 @@ fn inkling_recognition_is_behavioral_and_keeps_native_tools_fail_closed() {
     );
     assert!(matches!(
         prepared.native_tool_support(),
-        NativeToolSupport::Unsupported { reason }
-            if reason.contains("constrained native tool generation")
+        NativeToolSupport::Supported
     ));
     assert!(prepared.tool_runtime_plan().is_none());
 
@@ -2896,6 +2896,170 @@ fn inkling_recognition_is_behavioral_and_keeps_native_tools_fail_closed() {
     assert!(matches!(
         unsupported.semantic_support(),
         crate::runtime::chat::SemanticSupport::Unsupported { .. }
+    ));
+}
+
+#[test]
+fn inkling_native_tools_render_constrain_and_parse_protocol() {
+    let compiler = Ok(ConstraintCompiler::synthetic_for_tests());
+    let tool = production_tool("lookup");
+    let messages = vec![
+        json!({"role": "user", "content": "Look up the first value."}),
+        json!({
+            "role": "assistant",
+            "content": "",
+            "reasoning_content": "inspect",
+            "tool_calls": [{
+                "id": "call_previous",
+                "type": "function",
+                "function": {"name": "lookup", "arguments": {"value": 3}}
+            }]
+        }),
+        json!({
+            "role": "tool",
+            "name": "lookup",
+            "tool_call_id": "call_previous",
+            "content": "{\"result\":3}"
+        }),
+        json!({"role": "user", "content": "Now look up two more."}),
+    ];
+    let mut tokenizer = inkling_chat_tokenizer(29);
+    let required = prepare_chat_from_parts(
+        &mut tokenizer,
+        ModelChatTemplate::Single(INKLING_SMALL_FIXTURE.into()),
+        "unrelated-model-id",
+        &[],
+        Some(&compiler),
+        ChatTemplateRequest {
+            messages,
+            tools: vec![tool.clone()],
+            tool_choice: ToolChoice::Required,
+            parallel_tool_calls: ParallelToolCallPolicy::Enabled {
+                max_calls: std::num::NonZeroUsize::new(2),
+            },
+            enable_thinking: Some(true),
+            add_generation_prompt: true,
+            ..ChatTemplateRequest::default()
+        },
+    )
+    .unwrap();
+
+    assert!(required.rendered_prompt().contains(concat!(
+        "<|message_system|>tool_declare<|content_xml|>",
+        "[{\"description\":\"Look up one integer.\",\"name\":\"lookup\",\"parameters\":"
+    )));
+    assert!(required.rendered_prompt().contains(concat!(
+        "<|message_model|>lookup<|content_invoke_tool_json|>",
+        "{\"name\":\"lookup\",\"args\":{\"value\":3}}<|end_message|>"
+    )));
+    assert!(required.rendered_prompt().contains(concat!(
+        "<|message_tool|>lookup<|content_text|>",
+        "{\"result\":3}<|end_message|>"
+    )));
+    assert!(required.rendered_prompt().ends_with("<|message_model|>"));
+    assert_eq!(required.preserved_structural_token_ids().len(), 6);
+
+    let required_plan = required
+        .tool_runtime_plan()
+        .expect("recognized Inkling tools must compile a runtime plan");
+    assert_eq!(required_plan.auto_activation_trigger(), None);
+    let call = |value| {
+        format!(
+            "lookup<|content_invoke_tool_json|>{{\"name\":\"lookup\",\"args\":{{\"value\":{value}}}}}<|end_message|>"
+        )
+    };
+    let output = format!(
+        "<|content_thinking|>check both<|end_message|><|message_model|>\
+         <|content_text|>I'll look.<|end_message|><|message_model|>{}{}{}",
+        call(7),
+        "<|message_model|>",
+        call(11),
+    );
+    assert!(plan_accepts(required_plan, &output));
+    assert!(!plan_accepts(
+        required_plan,
+        &format!("{}<|message_model|>{}", output, call(13))
+    ));
+    assert!(!plan_accepts(
+        required_plan,
+        "missing<|content_invoke_tool_json|>{\"name\":\"missing\",\"args\":{\"value\":7}}<|end_message|>"
+    ));
+    assert!(!plan_accepts(
+        required_plan,
+        "lookup<|content_invoke_tool_json|>{\"name\":\"lookup\",\"args\":{\"value\":\"seven\"}}<|end_message|>"
+    ));
+
+    let mut parser = required_plan
+        .create_parser_with_stops(std::iter::empty())
+        .unwrap();
+    let structural = required_plan.structural_tokens().collect::<Vec<_>>();
+    let framed_output = format!("{output}<|content_model_end_sampling|>");
+    let mut offset = 0;
+    while offset < framed_output.len() {
+        if let Some((token_id, spelling)) = structural
+            .iter()
+            .find(|(_, spelling)| framed_output[offset..].starts_with(*spelling))
+        {
+            parser.push_structural(*token_id, spelling).unwrap();
+            offset += spelling.len();
+        } else {
+            let next = structural
+                .iter()
+                .filter_map(|(_, spelling)| framed_output[offset..].find(*spelling))
+                .min()
+                .map_or(framed_output.len(), |position| offset + position);
+            parser.push(&framed_output[offset..next]).unwrap();
+            offset = next;
+        }
+    }
+    assert_eq!(
+        tool_argument_events(parser.events()),
+        ["{\"value\":7}", "{\"value\":11}"]
+    );
+    assert_eq!(
+        parser
+            .events()
+            .iter()
+            .filter(|event| matches!(event, SemanticEvent::ToolCallEnd))
+            .count(),
+        2
+    );
+    assert_eq!(
+        parser.events().last(),
+        Some(&SemanticEvent::Finished {
+            reason: FinishReason::StopSequence,
+        })
+    );
+
+    let mut tokenizer = inkling_chat_tokenizer(37);
+    let auto = prepare_chat_from_parts(
+        &mut tokenizer,
+        ModelChatTemplate::Single(INKLING_SMALL_FIXTURE.into()),
+        "unrelated-model-id",
+        &[],
+        Some(&compiler),
+        ChatTemplateRequest {
+            messages: vec![json!({"role": "user", "content": "Maybe use a tool."})],
+            tools: vec![tool],
+            tool_choice: ToolChoice::Auto,
+            parallel_tool_calls: ParallelToolCallPolicy::Disabled,
+            add_generation_prompt: true,
+            ..ChatTemplateRequest::default()
+        },
+    )
+    .unwrap();
+    let auto_plan = auto.tool_runtime_plan().unwrap();
+    assert_eq!(
+        auto_plan.auto_activation_trigger(),
+        Some("<|content_invoke_tool_json|>")
+    );
+    assert!(plan_accepts(
+        auto_plan,
+        "<|content_invoke_tool_json|>{\"name\":\"lookup\",\"args\":{\"value\":17}}<|end_message|>"
+    ));
+    assert!(!plan_accepts(
+        auto_plan,
+        "<|content_invoke_tool_json|>{\"name\":\"lookup\",\"args\":{\"value\":17}}<|end_message|><|message_model|>lookup<|content_invoke_tool_json|>{\"name\":\"lookup\",\"args\":{\"value\":19}}<|end_message|>"
     ));
 }
 

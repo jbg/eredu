@@ -287,15 +287,16 @@ impl Tokenizer {
     }
 }
 
-/// Hugging Face templates commonly pass Jinja's `separators=(",", ":")`
-/// compatibility argument. MiniJinja already emits compact JSON with those
-/// separators, but its built-in filter rejects the otherwise redundant kwarg.
+/// Hugging Face templates commonly pass Python `json.dumps` compatibility
+/// arguments. MiniJinja already emits compact JSON with deterministic object
+/// ordering, but its built-in filter rejects those otherwise redundant kwargs.
 fn hugging_face_tojson(
     value: &Value,
     indent: Option<Value>,
     kwargs: Kwargs,
 ) -> Result<Value, minijinja::Error> {
     let _: Option<Value> = kwargs.get("separators")?;
+    let _: Option<bool> = kwargs.get("sort_keys")?;
     minijinja::filters::tojson(value, indent, kwargs)
 }
 
@@ -1197,6 +1198,26 @@ mod tests {
         )
         .unwrap();
         assert_eq!(rendered, vec!["tool_use"]);
+    }
+
+    #[test]
+    fn tokenizer_tojson_accepts_hugging_face_sort_and_separator_kwargs() {
+        let raw = tokenizers::Tokenizer::new(tokenizers::models::wordlevel::WordLevel::default());
+        let mut tokenizer = super::Tokenizer::from_tokenizer(raw);
+        let tools = [serde_json::json!({"zeta": 2, "alpha": 1})];
+
+        let rendered = tokenizer
+            .apply_chat_template_json(
+                "{{ tools[0] | tojson(sort_keys=true, separators=(\",\", \":\")) }}",
+                [Vec::new()],
+                Some(&tools),
+                "tojson-kwargs-test",
+                false,
+                None,
+            )
+            .unwrap();
+
+        assert_eq!(rendered, [r#"{"alpha":1,"zeta":2}"#]);
     }
 
     #[test]

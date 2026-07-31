@@ -696,7 +696,10 @@ fn recognize_inkling_protocol(
 ) -> Option<crate::runtime::chat::PreparedFormatProfile> {
     use crate::runtime::chat::{
         dialect::GenerationPromptBehavior,
-        inkling::{self, CONTENT_TEXT, CONTENT_THINKING, END_MESSAGE, END_SAMPLING, MESSAGE_MODEL},
+        inkling::{
+            self, CONTENT_INVOKE_TOOL_JSON, CONTENT_TEXT, CONTENT_THINKING, END_MESSAGE,
+            END_SAMPLING, MESSAGE_MODEL,
+        },
         ReasoningTemplateControl,
     };
 
@@ -766,12 +769,57 @@ fn recognize_inkling_protocol(
         }
     }
 
+    let tool_structural_tokens = [
+        MESSAGE_MODEL,
+        CONTENT_TEXT,
+        CONTENT_THINKING,
+        CONTENT_INVOKE_TOOL_JSON,
+        END_MESSAGE,
+        END_SAMPLING,
+    ]
+    .map(str::to_owned)
+    .to_vec();
+    let tool_tokens_valid = resolve_structural_tokens(tokenizer, &tool_structural_tokens).is_ok();
+    let mapping_tool_arguments = tool_tokens_valid
+        && render_protocol_probe(
+            tokenizer,
+            selected_template,
+            model_id,
+            serde_json::json!({"value": "probe-value"}),
+        )
+        .is_some_and(|rendered| {
+            rendered.contains(concat!(
+                "<|message_system|>tool_declare<|content_xml|>",
+                "[{\"description\":\"protocol recognition probe\",\"name\":",
+                "\"safemlx_probe_7c91\",\"parameters\":"
+            )) && rendered.contains(concat!(
+                "<|message_model|>safemlx_probe_7c91<|content_invoke_tool_json|>",
+                "{\"name\":\"safemlx_probe_7c91\",\"args\":{\"value\":\"probe-value\"}}",
+                "<|end_message|>"
+            )) && rendered.contains(concat!(
+                "<|message_tool|>safemlx_probe_7c91<|content_text|>",
+                "\"__safemlx_tool_result_probe__\"<|end_message|>"
+            ))
+        });
+    let string_tool_arguments = tool_tokens_valid
+        && render_protocol_probe(
+            tokenizer,
+            selected_template,
+            model_id,
+            serde_json::Value::String("{\"value\":\"probe-value\"}".into()),
+        )
+        .is_some_and(|rendered| {
+            rendered.contains(CONTENT_INVOKE_TOOL_JSON)
+                && rendered.contains("__safemlx_tool_result_probe__")
+        });
+    let tool_output_protocol = mapping_tool_arguments || string_tool_arguments;
+
     Some(crate::runtime::chat::PreparedFormatProfile {
         identity: Some("inkling.messages.v1".into()),
         dialect: Some(&inkling::INKLING_MESSAGE_DIALECT),
         dialect_parameters: Some(inkling::parameters()),
-        tool_dialect: None,
-        tool_dialect_parameters: None,
+        tool_dialect: tool_output_protocol.then_some(&inkling::INKLING_TOOL_DIALECT),
+        tool_dialect_parameters: tool_output_protocol.then_some(inkling::parameters()),
         generation_prompt_behavior: GenerationPromptBehavior::HonorRequest,
         reasoning_template_control: ReasoningTemplateControl::NamedEffort {
             kwarg: "reasoning_effort",
@@ -780,15 +828,19 @@ fn recognize_inkling_protocol(
         },
         supports_reasoning_parsing: true,
         supports_tool_reasoning: true,
-        supports_tool_input_rendering: false,
-        supports_mapping_tool_arguments: false,
-        supports_string_tool_arguments: false,
-        native_tool_unavailable_reason: Some(
-            "Inkling reasoning and visible-text frames were recognized, but constrained native tool generation is not implemented"
-                .into(),
-        ),
+        supports_tool_input_rendering: tool_output_protocol,
+        supports_mapping_tool_arguments: mapping_tool_arguments,
+        supports_string_tool_arguments: string_tool_arguments,
+        native_tool_unavailable_reason: (!tool_output_protocol).then(|| {
+            "Inkling reasoning and visible-text frames were recognized, but tool rendering probes failed"
+                .into()
+        }),
         required_structural_tokens: structural_tokens,
-        tool_required_structural_tokens: Vec::new(),
+        tool_required_structural_tokens: if tool_output_protocol {
+            tool_structural_tokens
+        } else {
+            Vec::new()
+        },
         stop_sequences: vec![END_SAMPLING.into()],
     })
 }
