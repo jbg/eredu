@@ -348,6 +348,22 @@ impl VisionArgs {
             .as_ref()
             .and_then(|configs| configs.get(name).copied())
     }
+
+    pub(crate) fn layer_specs(&self) -> [(i32, i32, i32, i32); 4] {
+        // Inkling-Small narrows the second hMLP stage while retaining the
+        // released fold schedule and the 4,800-wide penultimate stage.
+        let second_stage_width = if self.text_hidden_size == 4096 {
+            320
+        } else {
+            512
+        };
+        [
+            (75, 128, 1, 5),
+            (512, second_stage_width, 1, 2),
+            (second_stage_width * 16, 4800, 1, 4),
+            (9600, self.text_hidden_size, 2, 1),
+        ]
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1674,12 +1690,7 @@ impl VisionModel {
         }
         // `plan_out_scales` for the released tower selects reduction scales
         // [1, 25, 100, 1600, 3200].
-        let specs = [
-            (75, 128, 1, 5),
-            (512, 512, 1, 2),
-            (8192, 4800, 1, 4),
-            (9600, args.text_hidden_size, 2, 1),
-        ];
+        let specs = args.layer_specs();
         let mut layers = Vec::with_capacity(specs.len());
         for (index, (input_dim, output_dim, t_fold, hw_fold)) in specs.into_iter().enumerate() {
             layers.push(VisionLayer::new(
@@ -3323,6 +3334,38 @@ mod tests {
         };
         assert_eq!(support.kind, crate::api::ModelKind::Inkling);
         assert_eq!(support.effective_model_type, "inkling_mm_model");
+    }
+
+    #[test]
+    fn vision_specs_match_released_small_and_large_towers() {
+        let mut args: super::VisionArgs = serde_json::from_value(json!({
+            "decoder_dmodel": 4096,
+            "patch_size": 40,
+            "temporal_patch_size": 2,
+            "n_channels": 3,
+            "n_layers": 4
+        }))
+        .unwrap();
+        assert_eq!(
+            args.layer_specs(),
+            [
+                (75, 128, 1, 5),
+                (512, 320, 1, 2),
+                (5120, 4800, 1, 4),
+                (9600, 4096, 2, 1),
+            ]
+        );
+
+        args.text_hidden_size = 6144;
+        assert_eq!(
+            args.layer_specs(),
+            [
+                (75, 128, 1, 5),
+                (512, 512, 1, 2),
+                (8192, 4800, 1, 4),
+                (9600, 6144, 2, 1),
+            ]
+        );
     }
 
     #[test]

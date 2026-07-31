@@ -1159,12 +1159,7 @@ impl GeneralLayerwiseModelAdapter for InklingLayerwiseAdapter {
                 .vision_config
                 .as_ref()
                 .expect("vision group config");
-            let specs = [
-                (75, 128, 1, 5),
-                (512, 512, 1, 2),
-                (8192, 4800, 1, 4),
-                (9600, args.text_hidden_size, 2, 1),
-            ];
+            let specs = args.layer_specs();
             let (input_dim, output_dim, t_fold, hw_fold) = specs[index];
             Ok(InklingLayer::Vision(VisionLayer::new(
                 (input_dim, output_dim, t_fold, hw_fold),
