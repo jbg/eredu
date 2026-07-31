@@ -668,7 +668,9 @@ fn recognize_gemma_protocol(
         tool_dialect_parameters: tool_output_protocol
             .then_some(DialectParameters::Declarative(&GEMMA4_STRUCTURAL_TOOL_SPEC)),
         generation_prompt_behavior: GenerationPromptBehavior::HonorRequest,
-        reasoning_template_kwarg: "enable_thinking",
+        reasoning_template_control: crate::runtime::chat::ReasoningTemplateControl::Boolean(
+            "enable_thinking",
+        ),
         supports_reasoning_parsing: true,
         supports_tool_reasoning: true,
         supports_tool_input_rendering: tool_input_rendering,
@@ -684,6 +686,110 @@ fn recognize_gemma_protocol(
             Vec::new()
         },
         stop_sequences: semantic_stops,
+    })
+}
+
+fn recognize_inkling_protocol(
+    tokenizer: &mut ChatTokenizer,
+    selected_template: &ModelChatTemplate,
+    model_id: &str,
+) -> Option<crate::runtime::chat::PreparedFormatProfile> {
+    use crate::runtime::chat::{
+        dialect::GenerationPromptBehavior,
+        inkling::{self, CONTENT_TEXT, CONTENT_THINKING, END_MESSAGE, END_SAMPLING, MESSAGE_MODEL},
+        ReasoningTemplateControl,
+    };
+
+    let structural_tokens = [
+        MESSAGE_MODEL,
+        CONTENT_TEXT,
+        CONTENT_THINKING,
+        END_MESSAGE,
+        END_SAMPLING,
+    ]
+    .map(str::to_owned)
+    .to_vec();
+    resolve_structural_tokens(tokenizer, &structural_tokens).ok()?;
+
+    let reasoning_sentinel = "__safemlx_inkling_reasoning_probe_7c91__";
+    let visible_sentinel = "__safemlx_inkling_visible_probe_28ad__";
+    let rendered = tokenizer
+        .apply_chat_template_json(
+            selected_template.clone(),
+            [vec![
+                serde_json::json!({"role": "user", "content": "__safemlx_inkling_user_probe__"}),
+                serde_json::json!({
+                    "role": "assistant",
+                    "reasoning_content": reasoning_sentinel,
+                    "content": visible_sentinel,
+                }),
+            ]],
+            Some(&[]),
+            model_id,
+            false,
+            None,
+        )
+        .ok()?
+        .into_iter()
+        .next()?;
+    let assistant_frames = format!(
+        "{MESSAGE_MODEL}{CONTENT_THINKING}{reasoning_sentinel}{END_MESSAGE}{MESSAGE_MODEL}{CONTENT_TEXT}{visible_sentinel}{END_MESSAGE}{END_SAMPLING}"
+    );
+    if !rendered.contains(&assistant_frames) {
+        return None;
+    }
+
+    let generation_messages =
+        vec![serde_json::json!({"role": "user", "content": "__safemlx_inkling_prompt_probe__"})];
+    for (effort, expected) in [("none", "0"), ("high", "0.9")] {
+        let kwargs = serde_json::Map::from_iter([(
+            "reasoning_effort".into(),
+            serde_json::Value::String(effort.into()),
+        )]);
+        let with_prompt = tokenizer
+            .apply_chat_template_json(
+                selected_template.clone(),
+                [generation_messages.clone()],
+                Some(&[]),
+                model_id,
+                true,
+                Some(&kwargs),
+            )
+            .ok()?
+            .into_iter()
+            .next()?;
+        let effort_frame = format!(
+            "<|message_system|>{CONTENT_TEXT}Thinking effort level: {expected}{END_MESSAGE}"
+        );
+        if !with_prompt.contains(&effort_frame) || !with_prompt.ends_with(MESSAGE_MODEL) {
+            return None;
+        }
+    }
+
+    Some(crate::runtime::chat::PreparedFormatProfile {
+        identity: Some("inkling.messages.v1".into()),
+        dialect: Some(&inkling::INKLING_MESSAGE_DIALECT),
+        dialect_parameters: Some(inkling::parameters()),
+        tool_dialect: None,
+        tool_dialect_parameters: None,
+        generation_prompt_behavior: GenerationPromptBehavior::HonorRequest,
+        reasoning_template_control: ReasoningTemplateControl::NamedEffort {
+            kwarg: "reasoning_effort",
+            enabled: "high",
+            disabled: "none",
+        },
+        supports_reasoning_parsing: true,
+        supports_tool_reasoning: true,
+        supports_tool_input_rendering: false,
+        supports_mapping_tool_arguments: false,
+        supports_string_tool_arguments: false,
+        native_tool_unavailable_reason: Some(
+            "Inkling reasoning and visible-text frames were recognized, but constrained native tool generation is not implemented"
+                .into(),
+        ),
+        required_structural_tokens: structural_tokens,
+        tool_required_structural_tokens: Vec::new(),
+        stop_sequences: vec![END_SAMPLING.into()],
     })
 }
 
@@ -807,7 +913,8 @@ fn recognized_dialect_profile(
         tool_dialect: Some(dialect),
         tool_dialect_parameters: Some(parameters),
         generation_prompt_behavior,
-        reasoning_template_kwarg,
+        reasoning_template_control:
+            crate::runtime::chat::ReasoningTemplateControl::Boolean(reasoning_template_kwarg),
         supports_reasoning_parsing: dialect.supports_reasoning_parsing(parameters),
         supports_tool_reasoning,
         supports_tool_input_rendering,
@@ -1108,6 +1215,7 @@ pub(super) fn prepare_chat_from_parts(
     let mut profile = prepare_format_profile(selected.template());
     if profile.dialect.is_none() {
         if let Some(recognized) = recognize_gemma_protocol(tokenizer, &selected_template, model_id)
+            .or_else(|| recognize_inkling_protocol(tokenizer, &selected_template, model_id))
             .or_else(|| recognize_remaining_protocols(tokenizer, &selected_template, model_id))
         {
             profile = recognized;
@@ -1269,10 +1377,10 @@ pub(super) fn prepare_chat_from_parts(
         .resolve(add_generation_prompt);
 
     if let Some(enable_thinking) = enable_thinking {
-        extra_template_kwargs.insert(
-            profile.reasoning_template_kwarg.into(),
-            serde_json::Value::Bool(enable_thinking),
-        );
+        let (kwarg, value) = profile
+            .reasoning_template_control
+            .template_entry(enable_thinking);
+        extra_template_kwargs.insert(kwarg.into(), value);
     }
 
     let without_generation_prompt = tokenizer

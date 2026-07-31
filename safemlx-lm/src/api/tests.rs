@@ -90,6 +90,8 @@ const DEEPSEEK_V3_TOOL_FIXTURE: &str =
     include_str!("../../tests/fixtures/chat_templates/deepseek-v3-tools-7e28c67d.jinja");
 const DEEPSEEK_V31_TOOL_FIXTURE: &str =
     include_str!("../../tests/fixtures/chat_templates/deepseek-v3.1-tools-ef1ab230.jinja");
+const INKLING_SMALL_FIXTURE: &str =
+    include_str!("../../tests/fixtures/chat_templates/inkling-small-8cc5877b.jinja");
 
 #[test]
 #[ignore = "requires MLX runtime execution and SAFEMLX_INSPECTION_MODEL_DIR"]
@@ -414,6 +416,31 @@ fn deepseek_chat_tokenizer(preceding_tokens: usize) -> ChatTokenizer {
         json!("<｜begin▁of▁sentence｜>"),
     )]));
     tokenizer
+}
+
+fn inkling_chat_tokenizer(preceding_tokens: usize) -> ChatTokenizer {
+    let mut raw = Tokenizer::new(WordLevel::default());
+    raw.add_tokens(
+        (0..preceding_tokens)
+            .map(|index| AddedToken::from(format!("ordinary_{index}"), false))
+            .collect::<Vec<_>>(),
+    )
+    .unwrap();
+    assert_eq!(
+        raw.add_special_tokens(
+            [
+                "<|message_model|>",
+                "<|content_text|>",
+                "<|content_thinking|>",
+                "<|end_message|>",
+                "<|content_model_end_sampling|>",
+            ]
+            .map(|token| AddedToken::from(token, true).normalized(false))
+        )
+        .unwrap(),
+        5
+    );
+    ChatTokenizer::from_tokenizer(raw)
 }
 
 fn production_tool(name: &str) -> serde_json::Value {
@@ -2676,6 +2703,233 @@ fn production_deepseek_tool_boundaries_are_constrained_and_stream_incrementally(
         missing.native_tool_support(),
         NativeToolSupport::Unsupported { .. }
     ));
+}
+
+#[test]
+fn inkling_template_recognition_routes_reasoning_and_visible_text() {
+    let compiler = Ok(ConstraintCompiler::synthetic_for_tests());
+    let mut tokenizer = inkling_chat_tokenizer(41);
+    let prepared = prepare_chat_from_parts(
+        &mut tokenizer,
+        ModelChatTemplate::Single(INKLING_SMALL_FIXTURE.into()),
+        "architecture-and-repository-are-not-support-keys",
+        &[],
+        Some(&compiler),
+        ChatTemplateRequest {
+            messages: vec![json!({"role": "user", "content": "Why is the sky blue?"})],
+            enable_thinking: Some(true),
+            add_generation_prompt: true,
+            ..ChatTemplateRequest::default()
+        },
+    )
+    .unwrap();
+
+    assert_eq!(
+        prepared.format_profile_identity(),
+        Some("inkling.messages.v1")
+    );
+    assert!(matches!(
+        prepared.semantic_support(),
+        crate::runtime::chat::SemanticSupport::Supported
+    ));
+    assert!(prepared.capabilities().reasoning_parser.is_supported());
+    assert!(prepared.capabilities().visible_text_parser.is_supported());
+    assert!(!prepared.capabilities().tool_output_parser.is_supported());
+    assert!(matches!(
+        prepared.native_tool_support(),
+        NativeToolSupport::Unsupported { .. }
+    ));
+    assert_eq!(prepared.generation_prompt(), "<|message_model|>");
+    assert!(prepared.rendered_prompt().contains(concat!(
+        "<|message_system|><|content_text|>",
+        "Thinking effort level: 0.9<|end_message|>"
+    )));
+    assert_eq!(
+        prepared.profile_stop_sequences(),
+        ["<|content_model_end_sampling|>"]
+    );
+
+    let plan = prepared
+        .semantic_runtime_plan()
+        .expect("recognized Inkling template must prepare a semantic parser");
+    let structural = plan.structural_tokens().collect::<Vec<_>>();
+    let token_id = |spelling: &str| {
+        structural
+            .iter()
+            .find_map(|(token_id, candidate)| (*candidate == spelling).then_some(*token_id))
+            .unwrap_or_else(|| panic!("missing Inkling structural token {spelling}"))
+    };
+    let reasoning = "private 東京 🦀 thought";
+    let visible = "The sky is blue because of Rayleigh scattering.";
+    for reasoning_split in (0..=reasoning.len()).filter(|index| reasoning.is_char_boundary(*index))
+    {
+        for visible_split in (0..=visible.len()).filter(|index| visible.is_char_boundary(*index)) {
+            let mut parser = plan.create_parser_with_stops(std::iter::empty()).unwrap();
+            parser
+                .push_structural(token_id("<|content_thinking|>"), "<|content_thinking|>")
+                .unwrap();
+            parser.push(&reasoning[..reasoning_split]).unwrap();
+            parser.push(&reasoning[reasoning_split..]).unwrap();
+            parser
+                .push_structural(token_id("<|end_message|>"), "<|end_message|>")
+                .unwrap();
+            parser
+                .push_structural(token_id("<|message_model|>"), "<|message_model|>")
+                .unwrap();
+            parser
+                .push_structural(token_id("<|content_text|>"), "<|content_text|>")
+                .unwrap();
+            parser.push(&visible[..visible_split]).unwrap();
+            parser.push(&visible[visible_split..]).unwrap();
+            parser
+                .push_structural(token_id("<|end_message|>"), "<|end_message|>")
+                .unwrap();
+            assert!(parser
+                .push_structural(
+                    token_id("<|content_model_end_sampling|>"),
+                    "<|content_model_end_sampling|>",
+                )
+                .unwrap());
+
+            let parsed_reasoning = parser
+                .events()
+                .iter()
+                .filter_map(|event| match event {
+                    SemanticEvent::ReasoningDelta(text) => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect::<String>();
+            let parsed_visible = parser
+                .events()
+                .iter()
+                .filter_map(|event| match event {
+                    SemanticEvent::TextDelta(text) => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect::<String>();
+            assert_eq!(parsed_reasoning, reasoning);
+            assert_eq!(parsed_visible, visible);
+            assert_eq!(
+                parser.events().last(),
+                Some(&SemanticEvent::Finished {
+                    reason: FinishReason::StopSequence,
+                })
+            );
+        }
+    }
+}
+
+#[test]
+fn inkling_reasoning_toggle_maps_to_named_effort() {
+    let compiler = Ok(ConstraintCompiler::synthetic_for_tests());
+    for (enabled, expected) in [(false, "0"), (true, "0.9")] {
+        let mut tokenizer = inkling_chat_tokenizer(7);
+        let prepared = prepare_chat_from_parts(
+            &mut tokenizer,
+            ModelChatTemplate::Single(INKLING_SMALL_FIXTURE.into()),
+            "unrelated-model-id",
+            &[],
+            Some(&compiler),
+            ChatTemplateRequest {
+                messages: vec![json!({"role": "user", "content": "hello"})],
+                enable_thinking: Some(enabled),
+                add_generation_prompt: true,
+                ..ChatTemplateRequest::default()
+            },
+        )
+        .unwrap();
+        assert!(prepared.rendered_prompt().contains(&format!(
+            "<|content_text|>Thinking effort level: {expected}<|end_message|>"
+        )));
+    }
+}
+
+#[test]
+fn inkling_recognition_is_behavioral_and_keeps_native_tools_fail_closed() {
+    let compiler = Ok(ConstraintCompiler::synthetic_for_tests());
+    let refactored = format!("{{# source-only refactor #}}{INKLING_SMALL_FIXTURE}");
+    let mut tokenizer = inkling_chat_tokenizer(11);
+    let prepared = prepare_chat_from_parts(
+        &mut tokenizer,
+        ModelChatTemplate::Single(refactored),
+        "unrelated-model-id",
+        &[],
+        Some(&compiler),
+        ChatTemplateRequest {
+            messages: vec![json!({"role": "user", "content": "hello"})],
+            add_generation_prompt: true,
+            ..ChatTemplateRequest::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        prepared.format_profile_identity(),
+        Some("inkling.messages.v1")
+    );
+    assert!(matches!(
+        prepared.native_tool_support(),
+        NativeToolSupport::Unsupported { reason }
+            if reason.contains("constrained native tool generation")
+    ));
+    assert!(prepared.tool_runtime_plan().is_none());
+
+    let marker_soup = concat!(
+        "<|message_model|><|content_text|>",
+        "{{ messages[0]['content'] }}<|end_message|>",
+        "<|content_thinking|><|content_model_end_sampling|>"
+    );
+    let mut tokenizer = inkling_chat_tokenizer(17);
+    let unsupported = prepare_chat_from_parts(
+        &mut tokenizer,
+        ModelChatTemplate::Single(marker_soup.into()),
+        "inkling_mm_model",
+        &[],
+        Some(&compiler),
+        ChatTemplateRequest {
+            messages: vec![json!({"role": "user", "content": "hello"})],
+            add_generation_prompt: true,
+            ..ChatTemplateRequest::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(unsupported.format_profile_identity(), None);
+    assert!(matches!(
+        unsupported.semantic_support(),
+        crate::runtime::chat::SemanticSupport::Unsupported { .. }
+    ));
+}
+
+#[test]
+#[ignore = "requires SAFEMLX_INKLING_MODEL_DIR pointing to a local Inkling checkpoint"]
+fn inkling_real_checkpoint_template_is_recognized() {
+    let model_dir = std::path::PathBuf::from(
+        std::env::var("SAFEMLX_INKLING_MODEL_DIR")
+            .expect("set SAFEMLX_INKLING_MODEL_DIR to a local Inkling snapshot"),
+    );
+    let template = load_chat_template(&model_dir)
+        .unwrap()
+        .expect("Inkling checkpoint must provide a chat template");
+    let mut tokenizer = ChatTokenizer::from_tokenizer(load_tokenizer(&model_dir).unwrap());
+    tokenizer.set_template_kwargs(load_tokenizer_template_kwargs(&model_dir).unwrap());
+    let prepared = prepare_chat_from_parts(
+        &mut tokenizer,
+        template,
+        "real-inkling-checkpoint",
+        &[],
+        None,
+        ChatTemplateRequest {
+            messages: vec![json!({"role": "user", "content": "hello"})],
+            add_generation_prompt: true,
+            ..ChatTemplateRequest::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        prepared.format_profile_identity(),
+        Some("inkling.messages.v1")
+    );
+    assert!(prepared.capabilities().reasoning_parser.is_supported());
+    assert_eq!(prepared.generation_prompt(), "<|message_model|>");
 }
 
 #[test]

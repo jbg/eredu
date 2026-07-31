@@ -33,6 +33,7 @@ behavior; repository or model metadata is not a support key.
 | `lfm2.5-vl-450m-fc6221ca.jinja` | `LiquidAI/LFM2.5-VL-450M` | `fc6221ca597f3315e4f82fc2df606783267b34ba` | `chat_template.jinja` |
 | `deepseek-v3-tools-7e28c67d.jinja` | `sgl-project/sglang` | `7e28c67d19ddea8c74fca7b7e6dd2e3e3bec3c37` | `examples/chat_template/tool_chat_template_deepseekv3.jinja` |
 | `deepseek-v3.1-tools-ef1ab230.jinja` | `sgl-project/sglang` | `ef1ab2302ab25db09d3bd61da9bded1b71d0d3c8` | `examples/chat_template/tool_chat_template_deepseekv31.jinja` |
+| `inkling-small-8cc5877b.jinja` | `thinkingmachines/Inkling-Small` | `8cc5877b44d343f88b92086aa1fb72897950f06a` | `chat_template.jinja` |
 
 The Hermes fixture body is also byte-identical to the named `tool_use`
 template in `NousResearch/Hermes-3-Llama-3.1-8B` revision
@@ -54,6 +55,15 @@ preserved byte-for-byte.
 The upstream Kimi Linear template also has no final line feed. Its fixture
 carries one repository file terminator, which the rendering test removes
 before use.
+
+The Inkling template frames private reasoning and visible assistant text as
+separate model messages using atomic `<|content_thinking|>` and
+`<|content_text|>` tokens. Its generation prompt ends after
+`<|message_model|>`, while `<|content_model_end_sampling|>` terminates the
+assistant turn. Runtime recognition verifies those rendered behaviors and the
+template's `reasoning_effort` control; neither the repository nor model type is
+a support key. Native tool constraints remain fail-closed even though the
+fixture retains the released tool-history rendering surface.
 
 The Llama 3.1 fixture is byte-identical to
 `meta-llama/Llama-3.3-70B-Instruct` revision

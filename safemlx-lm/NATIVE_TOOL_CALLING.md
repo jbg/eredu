@@ -185,6 +185,8 @@ implementations rather than model architectures or template artifacts:
   envelopes, named JSON arguments, and structural-token JSON objects.
 - Gemma structural channels and tool envelopes, selected from tokenizer and
   rendered behavior evidence.
+- Inkling message frames with separate reasoning and visible-text channels;
+  its native tool-constraint surface remains fail-closed.
 - OpenAI Harmony channels and function recipients for GPT-OSS.
 - LFM2/LFM2.5 Python-call lists with canonical JSON argument events.
 
@@ -193,7 +195,8 @@ Recognized identities are stable protocol versions:
 `mistral.json-list-tools.v1`, `mistral.json-list-tools.compact.v1`,
 `llama.json-tools.v1`, `llama.python-channel-tools.v1`,
 `nemotron.json-list-tools.v1`, `nemotron.json-list-tools.reasoning.v1`,
-`gemma.channels.v1`, `harmony.channels.v1`, `lfm2.python-tools.v1`,
+`gemma.channels.v1`, `inkling.messages.v1`, `harmony.channels.v1`,
+`lfm2.python-tools.v1`,
 `deepseek.structural-json-tools.v1`, and
 `deepseek.structural-json-tools.v2`.
 

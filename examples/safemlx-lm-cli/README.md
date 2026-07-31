@@ -330,6 +330,10 @@ support the switch. Pass `--raw` to tokenize the prompt directly; raw prompts
 cannot use an explicit thinking mode. Run with `--help` for all sampling and
 repetition-penalty options.
 
+For recognized Inkling templates, `--thinking on` selects the released
+`reasoning_effort=high` behavior and `--thinking off` selects
+`reasoning_effort=none`.
+
 `--thinking on` also requires a recognized reasoning parser. Use
 `--allow-unparsed-reasoning` only when raw reasoning wire content is acceptable.
 

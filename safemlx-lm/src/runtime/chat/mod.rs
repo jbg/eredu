@@ -7,6 +7,7 @@
 pub(crate) mod constraints;
 pub(crate) mod dialect;
 pub(crate) mod gemma;
+pub(crate) mod inkling;
 
 use std::{
     collections::{HashMap, HashSet},
@@ -538,7 +539,7 @@ pub(crate) struct PreparedFormatProfile {
     pub(crate) tool_dialect: Option<&'static dyn FormatDialect>,
     pub(crate) tool_dialect_parameters: Option<DialectParameters>,
     pub(crate) generation_prompt_behavior: GenerationPromptBehavior,
-    pub(crate) reasoning_template_kwarg: &'static str,
+    pub(crate) reasoning_template_control: ReasoningTemplateControl,
     pub(crate) supports_reasoning_parsing: bool,
     pub(crate) supports_tool_reasoning: bool,
     pub(crate) supports_tool_input_rendering: bool,
@@ -548,6 +549,32 @@ pub(crate) struct PreparedFormatProfile {
     pub(crate) required_structural_tokens: Vec<String>,
     pub(crate) tool_required_structural_tokens: Vec<String>,
     pub(crate) stop_sequences: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReasoningTemplateControl {
+    Boolean(&'static str),
+    NamedEffort {
+        kwarg: &'static str,
+        enabled: &'static str,
+        disabled: &'static str,
+    },
+}
+
+impl ReasoningTemplateControl {
+    pub(crate) fn template_entry(self, enabled: bool) -> (&'static str, Value) {
+        match self {
+            Self::Boolean(kwarg) => (kwarg, Value::Bool(enabled)),
+            Self::NamedEffort {
+                kwarg,
+                enabled: enabled_value,
+                disabled,
+            } => (
+                kwarg,
+                Value::String(if enabled { enabled_value } else { disabled }.into()),
+            ),
+        }
+    }
 }
 
 /// Test-only protocol surface used to exercise constrained tool generation
@@ -999,7 +1026,7 @@ pub(crate) fn prepare_format_profile(_template: &str) -> PreparedFormatProfile {
             tool_dialect: Some(&DECLARATIVE_DIALECT),
             tool_dialect_parameters: Some(parameters),
             generation_prompt_behavior: GenerationPromptBehavior::HonorRequest,
-            reasoning_template_kwarg: "enable_thinking",
+            reasoning_template_control: ReasoningTemplateControl::Boolean("enable_thinking"),
             supports_reasoning_parsing: false,
             supports_tool_reasoning: true,
             supports_tool_input_rendering: true,
@@ -1019,7 +1046,7 @@ pub(crate) fn prepare_format_profile(_template: &str) -> PreparedFormatProfile {
         tool_dialect: None,
         tool_dialect_parameters: None,
         generation_prompt_behavior: GenerationPromptBehavior::HonorRequest,
-        reasoning_template_kwarg: "enable_thinking",
+        reasoning_template_control: ReasoningTemplateControl::Boolean("enable_thinking"),
         supports_reasoning_parsing: false,
         supports_tool_reasoning: true,
         supports_tool_input_rendering: false,
