@@ -9,6 +9,37 @@
 use std::collections::{BTreeSet, HashMap};
 use std::fmt;
 use std::num::NonZeroUsize;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
+
+/// A cheap, thread-safe cooperative-cancellation token for prepared-chat generation.
+///
+/// Tokens are one-shot: once any clone calls [`Self::cancel`], every clone
+/// remains cancelled. Generation observes cancellation at committed output
+/// boundaries rather than interrupting an active model/cache transaction.
+#[derive(Debug, Clone, Default)]
+pub struct GenerationCancellationToken {
+    cancelled: Arc<AtomicBool>,
+}
+
+impl GenerationCancellationToken {
+    /// Creates a token in the active (not cancelled) state.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Requests cooperative cancellation for the associated generation.
+    pub fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+    }
+
+    /// Returns whether cancellation has been requested through any clone.
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire)
+    }
+}
 
 /// Why a semantic response stream finished.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -21,6 +52,8 @@ pub enum FinishReason {
     GrammarComplete,
     /// The caller's generation token limit was reached.
     MaxTokens,
+    /// The caller cooperatively cancelled generation.
+    Cancelled,
 }
 
 /// A protocol-neutral incremental response event.
@@ -756,6 +789,16 @@ where
         Ok(())
     }
 
+    /// Cancels without flushing lookbehind or asking the protocol parser to
+    /// close incomplete structures.
+    fn cancel(&mut self) {
+        if self.finished {
+            return;
+        }
+        self.sink.finish(FinishReason::Cancelled);
+        self.finished = true;
+    }
+
     fn events(&self) -> &[SemanticEvent] {
         &self.sink.events
     }
@@ -825,6 +868,12 @@ impl ToolRuntimeParser {
         self.stream.finish(reason)
     }
 
+    /// Marks the stream cancelled without exposing buffered protocol fragments
+    /// or manufacturing closure events for incomplete tool calls.
+    pub(crate) fn cancel(&mut self) {
+        self.stream.cancel();
+    }
+
     /// Returns all semantic events emitted by this parser instance.
     pub(crate) fn events(&self) -> &[SemanticEvent] {
         self.stream.events()
@@ -890,6 +939,40 @@ where
         Ok(matched)
     }
 
+    /// Commits one tokenizer id and stops synchronous delivery immediately
+    /// after a callback requests cancellation.
+    fn push_cancellable(
+        &mut self,
+        token_id: u32,
+        cancellation: &GenerationCancellationToken,
+        emit: &mut impl FnMut(SemanticEvent),
+    ) -> Result<(bool, bool), String> {
+        let raw = self
+            .decoder
+            .push(token_id)
+            .map_err(|error| format!("token decoding failed: {error}"))?;
+        let text = self
+            .utf8
+            .push(&raw.bytes)
+            .map_err(|error| format!("UTF-8 assembly failed: {error}"))?;
+        let mut matched = self.parser.push(&text)?;
+        if raw.structural {
+            if let Some(spelling) = raw.structural_spelling.as_deref() {
+                matched = self.parser.push_structural(raw.token_id, spelling)?;
+            }
+        }
+        let cancelled = if matched {
+            // A decoded stop is already terminal before callbacks observe its
+            // events. Preserve that normal terminal event even if a callback
+            // concurrently requests cancellation.
+            self.drain_into(emit);
+            cancellation.is_cancelled()
+        } else {
+            self.drain_until_cancelled(cancellation, emit)
+        };
+        Ok((matched, cancelled))
+    }
+
     /// Finalizes parsing exactly once and immediately delivers buffered events.
     pub(crate) fn finish(
         &mut self,
@@ -913,10 +996,31 @@ where
         Ok(())
     }
 
+    /// Publishes only the cancelled terminal event. Decoder, stop-matcher, and
+    /// protocol-parser buffers are deliberately not flushed.
+    pub(crate) fn cancel(&mut self, emit: &mut impl FnMut(SemanticEvent)) {
+        self.parser.cancel();
+        self.drain_into(emit);
+    }
+
     fn drain_into(&mut self, emit: &mut impl FnMut(SemanticEvent)) {
         for event in self.parser.take_events() {
             emit(event);
         }
+    }
+
+    fn drain_until_cancelled(
+        &mut self,
+        cancellation: &GenerationCancellationToken,
+        emit: &mut impl FnMut(SemanticEvent),
+    ) -> bool {
+        for event in self.parser.take_events() {
+            emit(event);
+            if cancellation.is_cancelled() {
+                return true;
+            }
+        }
+        cancellation.is_cancelled()
     }
 }
 
@@ -943,16 +1047,50 @@ where
     D::Error: fmt::Display,
     T: CommittedTokenSource,
 {
+    drive_committed_generation_cancellable(
+        source,
+        pipeline,
+        eos_token_ids,
+        max_tokens,
+        &GenerationCancellationToken::new(),
+        emit,
+    )
+}
+
+/// Cancellation-aware committed-token driver used by high-level prepared chat.
+pub(crate) fn drive_committed_generation_cancellable<D, T>(
+    source: &mut T,
+    pipeline: &mut CommittedTokenPipeline<D>,
+    eos_token_ids: &[u32],
+    max_tokens: NonZeroUsize,
+    cancellation: &GenerationCancellationToken,
+    emit: &mut impl FnMut(SemanticEvent),
+) -> Result<(Vec<u32>, FinishReason), String>
+where
+    D: TokenDecoderBackend,
+    D::Error: fmt::Display,
+    T: CommittedTokenSource,
+{
     let max_tokens = max_tokens.get();
     let mut token_ids = Vec::with_capacity(max_tokens);
     for index in 0..max_tokens {
+        if cancellation.is_cancelled() {
+            pipeline.cancel(emit);
+            return Ok((token_ids, FinishReason::Cancelled));
+        }
+
         let token_id = source
             .next_token()
             .map_err(|error| format!("model generation failed: {error}"))?
             .ok_or_else(|| "architecture generation ended without a terminal token".to_owned())?;
         token_ids.push(token_id);
 
-        let stop_matched = pipeline.push(token_id, emit)?;
+        let (stop_matched, cancelled_during_delivery) =
+            pipeline.push_cancellable(token_id, cancellation, emit)?;
+        if cancelled_during_delivery && !stop_matched {
+            pipeline.cancel(emit);
+            return Ok((token_ids, FinishReason::Cancelled));
+        }
         let grammar_complete = if stop_matched {
             false
         } else {
@@ -984,10 +1122,11 @@ mod tests {
     use std::{cell::Cell, collections::VecDeque, convert::Infallible, num::NonZeroUsize, rc::Rc};
 
     use super::{
-        drive_committed_generation, CommittedTokenPipeline, CommittedTokenSource, FinishReason,
-        JsonFragmentBuffer, PartialPatternBuffer, PatternKind, PatternPiece, ProtocolParser,
-        RawTokenDecoder, SemanticEvent, SemanticEventSink, SemanticStream, StopMatcher,
-        TokenDecoderBackend, ToolRuntimeParser, Utf8Buffer, Utf8BufferError,
+        drive_committed_generation, drive_committed_generation_cancellable, CommittedTokenPipeline,
+        CommittedTokenSource, FinishReason, GenerationCancellationToken, JsonFragmentBuffer,
+        PartialPatternBuffer, PatternKind, PatternPiece, ProtocolParser, RawTokenDecoder,
+        SemanticEvent, SemanticEventSink, SemanticStream, StopMatcher, TokenDecoderBackend,
+        ToolRuntimeParser, Utf8Buffer, Utf8BufferError,
     };
 
     const REASONING_START: &str = "<r>";
@@ -1576,6 +1715,172 @@ mod tests {
             1
         );
         assert_eq!(events.last(), Some(&SemanticEvent::Finished { reason }));
+    }
+
+    fn cancellable_synthetic_generation(
+        bytes: &[u8],
+        cancellation: &GenerationCancellationToken,
+        caller_stops: &[&str],
+        mut on_event: impl FnMut(&SemanticEvent),
+    ) -> (Vec<u32>, FinishReason, Vec<SemanticEvent>, usize) {
+        let calls = Rc::new(Cell::new(0));
+        let mut source =
+            SyntheticModel::new(bytes.iter().copied().map(u32::from), None, calls.clone());
+        let parser = ToolRuntimeParser::new(
+            Box::new(SyntheticParser::default()),
+            std::iter::empty(),
+            caller_stops.iter().copied(),
+        );
+        let decoder = RawTokenDecoder::new(SyntheticCommittedDecoder, []);
+        let mut pipeline = CommittedTokenPipeline::new(decoder, parser);
+        let mut events = Vec::new();
+        let (tokens, reason) = drive_committed_generation_cancellable(
+            &mut source,
+            &mut pipeline,
+            &[],
+            NonZeroUsize::new(bytes.len().max(1)).unwrap(),
+            cancellation,
+            &mut |event| {
+                on_event(&event);
+                events.push(event);
+            },
+        )
+        .unwrap();
+        (tokens, reason, events, calls.get())
+    }
+
+    #[test]
+    fn pre_cancelled_generation_requests_no_model_tokens() {
+        let cancellation = GenerationCancellationToken::new();
+        cancellation.cancel();
+
+        let (tokens, reason, events, calls) =
+            cancellable_synthetic_generation(b"output", &cancellation, &[], |_| {});
+
+        assert!(tokens.is_empty());
+        assert_eq!(calls, 0);
+        assert_eq!(reason, FinishReason::Cancelled);
+        assert_eq!(
+            events,
+            vec![SemanticEvent::Finished {
+                reason: FinishReason::Cancelled
+            }]
+        );
+    }
+
+    #[test]
+    fn cancellation_token_can_be_triggered_from_another_thread() {
+        let cancellation = GenerationCancellationToken::new();
+        let worker_token = cancellation.clone();
+        std::thread::spawn(move || worker_token.cancel())
+            .join()
+            .unwrap();
+        assert!(cancellation.is_cancelled());
+    }
+
+    #[test]
+    fn callback_cancellation_stops_before_another_model_token() {
+        let cancellation = GenerationCancellationToken::new();
+        let callback_token = cancellation.clone();
+
+        let (tokens, reason, events, calls) =
+            cancellable_synthetic_generation(b"abc", &cancellation, &[], move |event| {
+                if matches!(event, SemanticEvent::TextDelta(_)) {
+                    callback_token.cancel();
+                }
+            });
+
+        assert_eq!(tokens, vec![u32::from(b'a')]);
+        assert_eq!(calls, 1);
+        assert_eq!(reason, FinishReason::Cancelled);
+        assert_eq!(events[0], SemanticEvent::TextDelta("a".into()));
+        assert_exactly_one_finished(&events, FinishReason::Cancelled);
+        assert!(!events.iter().any(|event| {
+            matches!(
+                event,
+                SemanticEvent::Finished {
+                    reason: FinishReason::Eos
+                        | FinishReason::StopSequence
+                        | FinishReason::GrammarComplete
+                        | FinishReason::MaxTokens
+                }
+            )
+        }));
+    }
+
+    #[test]
+    fn cancellation_does_not_close_an_incomplete_tool_call() {
+        let cancellation = GenerationCancellationToken::new();
+        let callback_token = cancellation.clone();
+        let input = br#"<call:id:name>{\"partial\":"#;
+
+        let (tokens, reason, events, calls) =
+            cancellable_synthetic_generation(input, &cancellation, &[], move |event| {
+                if matches!(event, SemanticEvent::ToolCallStart { .. }) {
+                    callback_token.cancel();
+                }
+            });
+
+        assert_eq!(reason, FinishReason::Cancelled);
+        assert_eq!(tokens.len(), calls);
+        assert!(tokens.len() < input.len());
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, SemanticEvent::ToolCallStart { .. })));
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event, SemanticEvent::ToolCallEnd)));
+        assert_exactly_one_finished(&events, FinishReason::Cancelled);
+    }
+
+    #[test]
+    fn an_already_matched_stop_keeps_its_normal_terminal_event() {
+        struct WholeStopDecoder;
+
+        impl TokenDecoderBackend for WholeStopDecoder {
+            type Error = Infallible;
+
+            fn decode_token(
+                &mut self,
+                _token_id: u32,
+                _preserve_special: bool,
+            ) -> Result<Vec<u8>, Self::Error> {
+                Ok(b"safe STOP".to_vec())
+            }
+        }
+
+        let cancellation = GenerationCancellationToken::new();
+        let callback_token = cancellation.clone();
+        let calls = Rc::new(Cell::new(0));
+        let mut source = SyntheticModel::new([1], None, calls.clone());
+        let parser = ToolRuntimeParser::new(
+            Box::new(SyntheticParser::default()),
+            std::iter::empty(),
+            ["STOP"],
+        );
+        let decoder = RawTokenDecoder::new(WholeStopDecoder, []);
+        let mut pipeline = CommittedTokenPipeline::new(decoder, parser);
+        let mut events = Vec::new();
+        let (tokens, reason) = drive_committed_generation_cancellable(
+            &mut source,
+            &mut pipeline,
+            &[],
+            NonZeroUsize::new(2).unwrap(),
+            &cancellation,
+            &mut |event| {
+                if matches!(event, SemanticEvent::TextDelta(_)) {
+                    callback_token.cancel();
+                }
+                events.push(event);
+            },
+        )
+        .unwrap();
+
+        assert_eq!(tokens, vec![1]);
+        assert_eq!(calls.get(), 1);
+        assert_eq!(reason, FinishReason::StopSequence);
+        assert_eq!(visible_text(&events), "safe ");
+        assert_exactly_one_finished(&events, FinishReason::StopSequence);
     }
 
     #[test]

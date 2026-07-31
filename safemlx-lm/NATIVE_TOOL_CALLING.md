@@ -66,6 +66,8 @@ Use one of these cohesive calls:
 - `generate_prepared_chat_embedded_mtp` for checkpoint-embedded MTP heads.
 - `generate_prepared_chat_mtp_batch` for independent requests interleaved by
   one fair external-assistant scheduler.
+- `generate_prepared_chat_embedded_mtp_batch` for independent requests using
+  checkpoint-embedded MTP heads.
 
 All paths commit through the same constraint, tokenizer-aware byte decoder,
 stop matcher, and semantic event pipeline. Canonical MTP, optimistic lookahead
@@ -95,6 +97,7 @@ let output = model.generate_prepared_chat(PreparedChatGenerationRequest {
     settings: PreparedChatGenerationSettings::default(),
     caller_stop_sequences: &[],
     stream,
+    cancellation: GenerationCancellationToken::new(),
     on_event: |event| events.push(event),
 })?;
 assert_eq!(
@@ -120,7 +123,8 @@ let multimodal = model.prepare_chat_input(
 )?;
 let output = model.generate_prepared_chat(PreparedChatGenerationRequest {
     input: PreparedChatInput::prepared_model_input(&prepared, &multimodal),
-    // cache, sampling_policy, settings, caller_stop_sequences, stream, on_event
+    // cache, sampling_policy, settings, caller_stop_sequences, stream,
+    // cancellation, on_event
 })?;
 ```
 
@@ -128,9 +132,46 @@ The placeholder must be the complete envelope emitted by the selected
 checkpoint template. SafeMLX validates placeholder count and order, then lets
 the architecture processor insert its own boundary tokens and media tensor.
 
+## Cooperative cancellation and backpressure
+
+Every prepared-chat request takes a cloneable `GenerationCancellationToken`;
+every MTP batch lane takes its own token. Event callbacks remain synchronous,
+so blocking on a bounded channel still pauses generation. A downstream closure
+can cancel directly from the callback:
+
+```rust,ignore
+let cancellation = GenerationCancellationToken::new();
+let cancel_on_close = cancellation.clone();
+let output = model.generate_prepared_chat(PreparedChatGenerationRequest {
+    input: PreparedChatInput::rendered_prompt(&prepared),
+    cache: &mut cache,
+    sampling_policy: DefaultSampler,
+    settings: PreparedChatGenerationSettings::default(),
+    caller_stop_sequences: &[],
+    stream,
+    cancellation,
+    on_event: move |event| {
+        // SyncSender::send blocks when the bounded channel is full.
+        if event_sender.send(event).is_err() {
+            cancel_on_close.cancel();
+        }
+    },
+})?;
+```
+
+Cancellation produces `FinishReason::Cancelled` and a final
+`SemanticEvent::Finished { reason: Cancelled }`. Returned IDs are exactly the
+committed prefix. Cancellation does not flush stop-sequence lookbehind or
+protocol-parser buffers and does not synthesize `ToolCallEnd` for an incomplete
+call. For MTP, a request with target verification already in flight first
+resolves that transaction to the scheduler's safe cache boundary; cancellation
+of one lane does not cancel another lane.
+
 Terminal precedence on one committed token is decoded stop sequence, grammar
 completion, checkpoint EOS, then maximum tokens. The corresponding
-`FinishReason` is `StopSequence`, `GrammarComplete`, `Eos`, or `MaxTokens`.
+`FinishReason` is `StopSequence`, `GrammarComplete`, `Eos`, `MaxTokens`, or
+`Cancelled` when cooperative cancellation wins before a normal terminal
+condition.
 Incomplete calls never emit `ToolCallEnd`; malformed protocol returns an error.
 Profile and caller stop sequences share one overlap-aware matcher and never
 leak into visible text.

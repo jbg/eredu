@@ -27,6 +27,7 @@ struct PreparedChatMtpLaneRuntime<'a, S> {
     prng_key: Option<Array>,
     sampler: ConstrainedSampler<S>,
     semantic: Box<dyn MtpSemanticState>,
+    cancellation: GenerationCancellationToken,
     on_event: Box<dyn FnMut(SemanticEvent) + 'a>,
 }
 
@@ -98,6 +99,7 @@ where
             prng_key,
             sampler,
             semantic,
+            cancellation,
             on_event,
         } = lane;
         let cache = cache_for_lane(cache).ok_or_else(|| {
@@ -106,8 +108,16 @@ where
             ))
         })?;
         input.with_model_input(|input| {
-            scheduler
-                .submit_with_semantics(cache, input, config, prng_key, sampler, semantic, on_event)
+            scheduler.submit_with_semantics_cancellable(
+                cache,
+                input,
+                config,
+                prng_key,
+                sampler,
+                semantic,
+                cancellation,
+                on_event,
+            )
         })?;
     }
     scheduler.run()?;
@@ -326,6 +336,7 @@ impl LoadedModel {
                 settings,
                 max_draft_tokens,
                 caller_stop_sequences,
+                cancellation,
                 on_event,
             } = lane;
             let prepared_chat = input.prepared_chat();
@@ -364,6 +375,7 @@ impl LoadedModel {
                 prng_key: settings.prng_key,
                 sampler,
                 semantic: Box::new(semantic),
+                cancellation,
                 on_event,
             });
         }
@@ -387,7 +399,8 @@ impl LoadedModel {
     /// Model parameters and execution streams are shared. Every submitted lane
     /// receives a fresh executable constraint/parser runtime, cache, callback,
     /// and target/draft PRNG roots. Events are published only after the
-    /// corresponding target cache transaction commits.
+    /// corresponding target cache transaction commits. Each lane's cancellation
+    /// token is observed independently.
     pub fn generate_prepared_chat_mtp_batch<S>(
         &mut self,
         request: PreparedChatMtpBatchRequest<'_, S>,
@@ -448,7 +461,8 @@ impl LoadedModel {
     /// Model parameters and the execution stream are shared. Every submitted
     /// lane receives a fresh executable constraint/parser runtime, cache,
     /// callback, and PRNG root. Events are published only after the
-    /// corresponding target cache transaction commits.
+    /// corresponding target cache transaction commits. Each lane's cancellation
+    /// token is observed independently.
     pub fn generate_prepared_chat_embedded_mtp_batch<S>(
         &mut self,
         request: PreparedChatEmbeddedMtpBatchRequest<'_, S>,
@@ -533,7 +547,10 @@ impl LoadedModel {
     ///
     /// When terminal conditions coincide on one committed token, precedence is
     /// decoded stop sequence, grammar completion, EOS, then max tokens. Grammar
-    /// completion is inspected before requesting the next token.
+    /// completion is inspected before requesting the next token. Cancellation
+    /// is checked before model work, after each synchronous event callback, and
+    /// before requesting another token. It emits only `Finished(Cancelled)` as
+    /// finalization and does not close incomplete protocol structures.
     pub fn generate_prepared_chat<S, F>(
         &mut self,
         request: PreparedChatGenerationRequest<'_, S, F>,
@@ -549,8 +566,18 @@ impl LoadedModel {
             settings,
             caller_stop_sequences,
             stream,
+            cancellation,
             mut on_event,
         } = request;
+        if cancellation.is_cancelled() {
+            on_event(SemanticEvent::Finished {
+                reason: FinishReason::Cancelled,
+            });
+            return Ok(PreparedChatGenerationOutput {
+                token_ids: Vec::new(),
+                finish_reason: FinishReason::Cancelled,
+            });
+        }
         let prepared_chat = input.prepared_chat();
 
         with_prepared_chat_runtime(
@@ -577,11 +604,12 @@ impl LoadedModel {
                         runtime.sampler,
                     );
                     let mut source = ModelGenerateTokenSource { generator, stream };
-                    let (token_ids, finish_reason) = drive_committed_generation(
+                    let (token_ids, finish_reason) = drive_committed_generation_cancellable(
                         &mut source,
                         &mut pipeline,
                         prepared_chat.eos_token_ids(),
                         settings.max_tokens,
+                        &cancellation,
                         &mut on_event,
                     )
                     .map_err(Error::PreparedChatGeneration)?;
@@ -598,6 +626,8 @@ impl LoadedModel {
     ///
     /// Target verification, constrained-sampler state, decoded stop matching,
     /// protocol parsing, and event publication share one committed prefix.
+    /// Cancellation waits for any in-flight verification to reach its safe
+    /// cache boundary before publishing `Finished(Cancelled)`.
     pub fn generate_prepared_chat_mtp<S, F>(
         &mut self,
         request: PreparedChatMtpGenerationRequest<'_, S, F>,
@@ -615,6 +645,7 @@ impl LoadedModel {
             options,
             caller_stop_sequences,
             streams,
+            cancellation,
             on_event,
         } = request;
         self.validate_drafter_compatibility(drafter)?;
@@ -660,6 +691,7 @@ impl LoadedModel {
                             settings.prng_key,
                             &mut sampler,
                             Box::new(semantic),
+                            cancellation,
                             streams,
                             options.scheduler,
                             on_event,
@@ -676,6 +708,8 @@ impl LoadedModel {
     }
 
     /// Generates one structured response with checkpoint-embedded MTP heads.
+    /// Cancellation waits for any in-flight verification to reach its safe
+    /// cache boundary before publishing `Finished(Cancelled)`.
     pub fn generate_prepared_chat_embedded_mtp<S, F>(
         &mut self,
         request: PreparedChatEmbeddedMtpGenerationRequest<'_, S, F>,
@@ -692,6 +726,7 @@ impl LoadedModel {
             options,
             caller_stop_sequences,
             stream,
+            cancellation,
             on_event,
         } = request;
         let prepared_chat = input.prepared_chat();
@@ -735,6 +770,7 @@ impl LoadedModel {
                             settings.prng_key,
                             &mut sampler,
                             Box::new(semantic),
+                            cancellation,
                             stream,
                             options.scheduler,
                             on_event,

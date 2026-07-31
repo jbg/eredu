@@ -95,6 +95,7 @@ fn smoke(environment: &str, expected_profile_prefix: &str) {
             },
             caller_stop_sequences: &[],
             stream,
+            cancellation: safemlx_lm::api::GenerationCancellationToken::new(),
             on_event: |event| events.push(event),
         })
         .unwrap_or_else(|error| {

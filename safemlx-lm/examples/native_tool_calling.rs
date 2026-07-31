@@ -97,6 +97,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 },
                 caller_stop_sequences: &[],
                 streams: MtpExecutionStreams::new(target.stream(), draft.stream())?,
+                cancellation: safemlx_lm::api::GenerationCancellationToken::new(),
                 on_event: |event| events.push(event),
             })?
             .finish_reason
@@ -119,6 +120,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 },
                 caller_stop_sequences: &[],
                 stream: target.stream(),
+                cancellation: safemlx_lm::api::GenerationCancellationToken::new(),
                 on_event: |event| events.push(event),
             })?
             .finish_reason
@@ -132,6 +134,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 settings,
                 caller_stop_sequences: &[],
                 stream: target.stream(),
+                cancellation: safemlx_lm::api::GenerationCancellationToken::new(),
                 on_event: |event| events.push(event),
             })?
             .finish_reason

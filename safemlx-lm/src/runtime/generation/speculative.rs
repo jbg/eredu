@@ -24,7 +24,7 @@ use crate::{
     },
     error::Error,
     runtime::generation::sampler::SpeculativeSampler,
-    runtime::generation::streaming::{FinishReason, SemanticEvent},
+    runtime::generation::streaming::{FinishReason, GenerationCancellationToken, SemanticEvent},
 };
 
 /// Architecture-dispatched draft model loaded independently of a target.
@@ -635,6 +635,7 @@ pub(crate) trait MtpSemanticState {
     fn fork_box(&self) -> Result<Box<dyn MtpSemanticState>, Exception>;
     fn push_token(&mut self, token: u32) -> Result<bool, Exception>;
     fn finish(&mut self, reason: FinishReason) -> Result<(), Exception>;
+    fn cancel(&mut self) -> Result<(), Exception>;
     fn take_events(&mut self) -> Vec<SemanticEvent>;
 }
 
@@ -645,6 +646,7 @@ struct CommittedOutputRuntime<'a, S> {
     on_token: Box<dyn FnMut(u32) -> Result<(), Exception> + 'a>,
     on_event: Option<Box<dyn FnMut(SemanticEvent) + 'a>>,
     finish_reason: Option<FinishReason>,
+    cancellation: GenerationCancellationToken,
 }
 
 impl<'a, S> CommittedOutputRuntime<'a, S> {
@@ -659,10 +661,16 @@ impl<'a, S> CommittedOutputRuntime<'a, S> {
             on_token: Box::new(on_token),
             on_event: None,
             finish_reason: None,
+            cancellation: GenerationCancellationToken::new(),
         }
     }
 
-    fn semantic<F>(sampler: S, semantic: Box<dyn MtpSemanticState>, on_event: F) -> Self
+    fn semantic_cancellable<F>(
+        sampler: S,
+        semantic: Box<dyn MtpSemanticState>,
+        cancellation: GenerationCancellationToken,
+        on_event: F,
+    ) -> Self
     where
         F: FnMut(SemanticEvent) + 'a,
     {
@@ -673,19 +681,43 @@ impl<'a, S> CommittedOutputRuntime<'a, S> {
             on_token: Box::new(|_| Ok(())),
             on_event: Some(Box::new(on_event)),
             finish_reason: None,
+            cancellation,
         }
     }
 
-    fn publish(&mut self, tokens: &[u32]) -> Result<(), Exception> {
+    fn publish(&mut self, tokens: &[u32]) -> Result<bool, Exception> {
         self.token_ids.extend_from_slice(tokens);
         for &token in tokens {
             (self.on_token)(token)?;
         }
+        let mut cancellation_won = false;
         if let (Some(semantic), Some(on_event)) = (&mut self.semantic, &mut self.on_event) {
+            for event in semantic.take_events() {
+                on_event(event);
+                if self.cancellation.is_cancelled() && self.finish_reason.is_none() {
+                    cancellation_won = true;
+                    break;
+                }
+            }
+        }
+        cancellation_won |= self.cancellation.is_cancelled() && self.finish_reason.is_none();
+        if cancellation_won {
+            self.cancel()?;
+        }
+        Ok(cancellation_won)
+    }
+
+    fn cancel(&mut self) -> Result<(), Exception> {
+        if self.finish_reason.is_some() {
+            return Ok(());
+        }
+        if let (Some(semantic), Some(on_event)) = (&mut self.semantic, &mut self.on_event) {
+            semantic.cancel()?;
             for event in semantic.take_events() {
                 on_event(event);
             }
         }
+        self.finish_reason = Some(FinishReason::Cancelled);
         Ok(())
     }
 }
@@ -724,7 +756,7 @@ pub struct MtpRequestOutput<S> {
     pub stats: MtpStats,
     /// Final canonical sampler state.
     pub sampler: S,
-    /// Terminal condition for a completed request, or `None` when cancelled.
+    /// Terminal condition, including [`FinishReason::Cancelled`] for cancellation.
     pub finish_reason: Option<FinishReason>,
     /// Whether the request was cancelled.
     pub cancelled: bool,
@@ -825,6 +857,7 @@ where
     }
 
     /// Submits one request with transactional decoded semantic output.
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn submit_with_semantics<F>(
         &mut self,
@@ -839,12 +872,40 @@ where
     where
         F: FnMut(SemanticEvent) + 'a,
     {
+        self.submit_with_semantics_cancellable(
+            cache,
+            input,
+            config,
+            prng_key,
+            sampler,
+            semantic,
+            GenerationCancellationToken::new(),
+            on_event,
+        )
+    }
+
+    /// Submits one semantic request controlled by a public cancellation token.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn submit_with_semantics_cancellable<F>(
+        &mut self,
+        cache: &'a mut B::Cache,
+        input: ModelInput<'_>,
+        config: MtpConfig,
+        prng_key: Option<Array>,
+        sampler: S,
+        semantic: Box<dyn MtpSemanticState>,
+        cancellation: GenerationCancellationToken,
+        on_event: F,
+    ) -> Result<MtpRequestId, Exception>
+    where
+        F: FnMut(SemanticEvent) + 'a,
+    {
         self.submit_runtime(
             cache,
             input,
             config,
             prng_key,
-            CommittedOutputRuntime::semantic(sampler, semantic, on_event),
+            CommittedOutputRuntime::semantic_cancellable(sampler, semantic, cancellation, on_event),
         )
     }
 
@@ -859,6 +920,28 @@ where
         validate_config(self.backend, &config, prng_key.as_ref())?;
         let id = MtpRequestId(self.requests.len());
         let started = Instant::now();
+        if runtime.cancellation.is_cancelled() {
+            runtime.cancel()?;
+            self.requests.push(ScheduledRequest {
+                id,
+                cache,
+                config,
+                runtime,
+                target_prng: None,
+                draft_rng: None,
+                stats: MtpStats {
+                    stream_topology: self.streams.topology(),
+                    ..MtpStats::default()
+                },
+                started,
+                target_state: None,
+                block: None,
+                in_flight: None,
+                phase: MtpRequestPhase::Cancelled,
+                cancel_requested: true,
+            });
+            return Ok(id);
+        }
         if config.max_tokens == 0 {
             runtime.finish_reason = Some(FinishReason::MaxTokens);
             self.requests.push(ScheduledRequest {
@@ -965,10 +1048,13 @@ where
                 request.runtime.semantic = semantic;
                 request.runtime.finish_reason = reason;
                 request.target_prng = target_prng;
-                request.runtime.publish(&[first])?;
+                let cancelled = request.runtime.publish(&[first])?;
                 request.stats.emitted_tokens = 1;
                 request.target_state = Some(prefill.state);
-                request.phase = if reason.is_some() {
+                request.phase = if cancelled {
+                    request.stats.elapsed = request.started.elapsed();
+                    MtpRequestPhase::Cancelled
+                } else if reason.is_some() {
                     request.stats.elapsed = request.started.elapsed();
                     MtpRequestPhase::Completed
                 } else {
@@ -1009,6 +1095,7 @@ where
             request.cancel_requested = true;
         } else {
             request.block = None;
+            request.runtime.cancel()?;
             request.phase = MtpRequestPhase::Cancelled;
             request.stats.elapsed = request.started.elapsed();
         }
@@ -1029,6 +1116,21 @@ where
     ///
     /// Returns `false` when every request is terminal.
     pub fn step(&mut self) -> Result<bool, Exception> {
+        let cancelled = self
+            .requests
+            .iter()
+            .filter(|request| {
+                request.runtime.cancellation.is_cancelled()
+                    && !matches!(
+                        request.phase,
+                        MtpRequestPhase::Completed | MtpRequestPhase::Cancelled
+                    )
+            })
+            .map(|request| request.id)
+            .collect::<Vec<_>>();
+        for id in cancelled {
+            self.cancel(id)?;
+        }
         if self.is_finished() {
             return Ok(false);
         }
@@ -1394,7 +1496,7 @@ where
             mut proposals,
         } = flight.block;
 
-        if request.cancel_requested {
+        if request.cancel_requested || request.runtime.cancellation.is_cancelled() {
             discard_optimistic(&mut request.stats, flight.optimistic.take());
             let commit = self.backend.commit_verification_with_streams(
                 flight.verification,
@@ -1405,6 +1507,7 @@ where
                 self.streams,
             )?;
             request.stats.target_tokens += commit.replayed_tokens;
+            request.runtime.cancel()?;
             request.phase = MtpRequestPhase::Cancelled;
             request.stats.elapsed = request.started.elapsed();
             return Ok(());
@@ -1596,7 +1699,14 @@ where
         request.target_prng = target_prng;
         tentative_stats.emitted_tokens += committed_tokens.len();
         request.stats = tentative_stats;
-        request.runtime.publish(&committed_tokens)?;
+        let cancelled = request.runtime.publish(&committed_tokens)?;
+
+        if cancelled {
+            discard_optimistic(&mut request.stats, flight.optimistic.take());
+            request.phase = MtpRequestPhase::Cancelled;
+            request.stats.elapsed = request.started.elapsed();
+            return Ok(());
+        }
 
         if terminal.is_some() {
             discard_optimistic(&mut request.stats, flight.optimistic.take());
@@ -2003,6 +2113,7 @@ pub(crate) fn generate_with_semantics_and_options<B, S, F>(
     prng_key: Option<Array>,
     sampler: &mut S,
     semantic: Box<dyn MtpSemanticState>,
+    cancellation: GenerationCancellationToken,
     streams: MtpExecutionStreams<'_>,
     options: MtpSchedulerOptions,
     on_event: F,
@@ -2018,13 +2129,14 @@ where
     let finish_reason;
     {
         let mut scheduler = MtpScheduler::new(backend, streams, options)?;
-        scheduler.submit_with_semantics(
+        scheduler.submit_with_semantics_cancellable(
             cache,
             input,
             config.clone(),
             prng_key,
             sampler.clone(),
             semantic,
+            cancellation,
             on_event,
         )?;
         scheduler.run()?;
@@ -2238,6 +2350,13 @@ mod tests {
 
         fn finish(&mut self, reason: FinishReason) -> Result<(), Exception> {
             self.events.push(SemanticEvent::Finished { reason });
+            Ok(())
+        }
+
+        fn cancel(&mut self) -> Result<(), Exception> {
+            self.events.push(SemanticEvent::Finished {
+                reason: FinishReason::Cancelled,
+            });
             Ok(())
         }
 
@@ -2797,6 +2916,8 @@ mod tests {
         let events_b = Rc::new(RefCell::new(Vec::new()));
         let callback_a = Rc::clone(&events_a);
         let callback_b = Rc::clone(&events_b);
+        let cancellation_a = GenerationCancellationToken::new();
+        let cancellation_b = GenerationCancellationToken::new();
         let mut cache_a = 0;
         let mut cache_b = 0;
         let mut backend = scripted_backend();
@@ -2813,7 +2934,7 @@ mod tests {
             eos_token_ids: Vec::new(),
         };
         let first = scheduler
-            .submit_with_semantics(
+            .submit_with_semantics_cancellable(
                 &mut cache_a,
                 ModelInput::new(&parts_a),
                 config.clone(),
@@ -2823,11 +2944,12 @@ mod tests {
                     complete_after: usize::MAX,
                 },
                 Box::new(TestSemanticState::default()),
+                cancellation_a.clone(),
                 move |event| callback_a.borrow_mut().push(event),
             )
             .unwrap();
         scheduler
-            .submit_with_semantics(
+            .submit_with_semantics_cancellable(
                 &mut cache_b,
                 ModelInput::new(&parts_b),
                 config,
@@ -2837,6 +2959,7 @@ mod tests {
                     complete_after: 3,
                 },
                 Box::new(TestSemanticState::default()),
+                cancellation_b.clone(),
                 move |event| callback_b.borrow_mut().push(event),
             )
             .unwrap();
@@ -2844,16 +2967,26 @@ mod tests {
         scheduler.step().unwrap();
         scheduler.step().unwrap();
         assert!(scheduler.requests[first.index()].in_flight.is_some());
-        scheduler.cancel(first).unwrap();
+        cancellation_a.cancel();
+        assert!(!cancellation_b.is_cancelled());
         scheduler.run().unwrap();
         let output = scheduler.finish().unwrap();
 
         assert!(output.requests[0].cancelled);
         assert_eq!(output.requests[0].token_ids, vec![1]);
+        assert_eq!(
+            output.requests[0].finish_reason,
+            Some(FinishReason::Cancelled)
+        );
         assert_eq!(output.requests[0].sampler.inner.committed, vec![1]);
         assert_eq!(
             events_a.borrow().as_slice(),
-            &[SemanticEvent::TextDelta("1".into())]
+            &[
+                SemanticEvent::TextDelta("1".into()),
+                SemanticEvent::Finished {
+                    reason: FinishReason::Cancelled
+                }
+            ]
         );
         assert!(!output.requests[1].cancelled);
         assert_eq!(output.requests[1].token_ids, vec![1, 2, 0]);
@@ -2870,6 +3003,71 @@ mod tests {
             Some(&SemanticEvent::Finished {
                 reason: FinishReason::GrammarComplete
             })
+        );
+    }
+
+    #[test]
+    fn semantic_callback_token_cancels_at_the_committed_prefill_boundary() {
+        let context = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        let prompt = Array::from_slice(&[7u32], &[1, 1]);
+        let parts = [InputPart::text_token_ids(&prompt)];
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let callback_events = Rc::clone(&events);
+        let cancellation = GenerationCancellationToken::new();
+        let callback_cancellation = cancellation.clone();
+        let mut cache = 0;
+        let mut backend = scripted_backend();
+        let mut scheduler = MtpScheduler::new(
+            &mut backend,
+            MtpExecutionStreams::single(context.stream()),
+            MtpSchedulerOptions::default(),
+        )
+        .unwrap();
+
+        scheduler
+            .submit_with_semantics_cancellable(
+                &mut cache,
+                ModelInput::new(&parts),
+                MtpConfig {
+                    max_tokens: 5,
+                    max_draft_tokens: 2,
+                    temperature: 0.0,
+                    eos_token_ids: Vec::new(),
+                },
+                None,
+                GrammarCountingSampler {
+                    inner: CountingSampler::default(),
+                    complete_after: usize::MAX,
+                },
+                Box::new(TestSemanticState::default()),
+                cancellation,
+                move |event| {
+                    callback_events.borrow_mut().push(event.clone());
+                    if matches!(event, SemanticEvent::TextDelta(_)) {
+                        callback_cancellation.cancel();
+                    }
+                },
+            )
+            .unwrap();
+
+        assert!(scheduler.is_finished());
+        scheduler.run().unwrap();
+        let output = scheduler.finish().unwrap();
+        let request = &output.requests[0];
+        assert!(request.cancelled);
+        assert_eq!(request.token_ids, vec![1]);
+        assert_eq!(request.sampler.inner.committed, request.token_ids);
+        assert_eq!(request.finish_reason, Some(FinishReason::Cancelled));
+        assert_eq!(cache, 1);
+        assert!(backend.draft_storage.is_empty());
+        assert_eq!(
+            events.borrow().as_slice(),
+            &[
+                SemanticEvent::TextDelta("1".into()),
+                SemanticEvent::Finished {
+                    reason: FinishReason::Cancelled
+                }
+            ]
         );
     }
 

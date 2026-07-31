@@ -40,8 +40,11 @@ use crate::runtime::generation::sampler::{
     ConstrainedSampler, DefaultSampler, Sampler, SpeculativeSampler,
 };
 use crate::runtime::generation::streaming::{
-    drive_committed_generation, CommittedTokenPipeline, CommittedTokenSource, FinishReason,
-    RawTokenDecoder, SemanticEvent, TokenDecoderBackend,
+    drive_committed_generation_cancellable, CommittedTokenPipeline, CommittedTokenSource,
+    RawTokenDecoder, TokenDecoderBackend,
+};
+pub use crate::runtime::generation::streaming::{
+    FinishReason, GenerationCancellationToken, SemanticEvent,
 };
 pub(crate) use crate::runtime::media::input;
 use crate::runtime::media::PreparedModelInput;

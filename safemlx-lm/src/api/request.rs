@@ -123,6 +123,8 @@ pub struct PreparedChatGenerationRequest<'a, S, F> {
     pub caller_stop_sequences: &'a [String],
     /// MLX execution stream used for prompt encoding transfer and model work.
     pub stream: &'a Stream,
+    /// One-shot cooperative-cancellation token for this request.
+    pub cancellation: GenerationCancellationToken,
     /// Called synchronously as each semantic event becomes available.
     pub on_event: F,
 }
@@ -130,7 +132,7 @@ pub struct PreparedChatGenerationRequest<'a, S, F> {
 /// Terminal metadata returned by ordinary prepared-chat generation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PreparedChatGenerationOutput {
-    /// Every committed generated tokenizer id, including a terminal EOS id.
+    /// Every committed generated tokenizer id; cancellation returns only its prefix.
     pub token_ids: Vec<u32>,
     /// Deterministically selected terminal condition.
     pub finish_reason: FinishReason,
@@ -172,6 +174,8 @@ pub struct PreparedChatMtpGenerationRequest<'a, S, F> {
     pub caller_stop_sequences: &'a [String],
     /// Target and draft execution streams.
     pub streams: MtpExecutionStreams<'a>,
+    /// One-shot cooperative-cancellation token for this request.
+    pub cancellation: GenerationCancellationToken,
     /// Called synchronously for each event after its cache transaction commits.
     pub on_event: F,
 }
@@ -192,6 +196,8 @@ pub struct PreparedChatEmbeddedMtpGenerationRequest<'a, S, F> {
     pub caller_stop_sequences: &'a [String],
     /// MLX stream used for target and embedded-head work.
     pub stream: &'a Stream,
+    /// One-shot cooperative-cancellation token for this request.
+    pub cancellation: GenerationCancellationToken,
     /// Called synchronously for each event after its cache transaction commits.
     pub on_event: F,
 }
@@ -199,7 +205,7 @@ pub struct PreparedChatEmbeddedMtpGenerationRequest<'a, S, F> {
 /// Terminal metadata and speculative statistics for prepared-chat MTP.
 #[derive(Debug, Clone)]
 pub struct PreparedChatMtpGenerationOutput {
-    /// Every committed generated tokenizer id, including a terminal EOS id.
+    /// Every committed generated tokenizer id; cancellation returns only its prefix.
     pub token_ids: Vec<u32>,
     /// Deterministically selected terminal condition.
     pub finish_reason: FinishReason,
@@ -226,6 +232,8 @@ pub struct PreparedChatMtpBatchLane<'a, S> {
     pub max_draft_tokens: NonZeroUsize,
     /// Additional decoded text sequences that terminate only this lane.
     pub caller_stop_sequences: &'a [String],
+    /// One-shot cooperative-cancellation token owned only by this lane.
+    pub cancellation: GenerationCancellationToken,
     /// Called synchronously for canonical events from only this lane.
     pub on_event: Box<dyn FnMut(SemanticEvent) + 'a>,
 }
@@ -379,6 +387,11 @@ impl MtpSemanticState for PreparedChatSemanticState {
         self.pipeline
             .finish(reason, &mut |event| self.events.push(event))
             .map_err(Exception::custom)
+    }
+
+    fn cancel(&mut self) -> Result<(), Exception> {
+        self.pipeline.cancel(&mut |event| self.events.push(event));
+        Ok(())
     }
 
     fn take_events(&mut self) -> Vec<SemanticEvent> {

@@ -19,7 +19,7 @@ use crate::{
     runtime::execution::inspection::ActivationRecorder,
     runtime::generation::sampler::{ConstrainedSampler, DefaultSampler},
     runtime::generation::speculative::{MtpSchedulerOptions, MtpStreamTopology},
-    runtime::generation::streaming::{FinishReason, SemanticEvent},
+    runtime::generation::streaming::{FinishReason, GenerationCancellationToken, SemanticEvent},
 };
 use safemlx::{
     argmax_axis,
@@ -724,6 +724,7 @@ fn prepared_chat_embedded_mtp_batch_dispatches_qwen_without_a_drafter() {
                 settings: PreparedChatGenerationSettings::default(),
                 max_draft_tokens: std::num::NonZeroUsize::new(2).unwrap(),
                 caller_stop_sequences: &[],
+                cancellation: GenerationCancellationToken::new(),
                 on_event: Box::new(|_| {}),
             }],
             stream,

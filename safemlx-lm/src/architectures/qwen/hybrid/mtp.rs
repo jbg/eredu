@@ -12,7 +12,7 @@ use crate::{
         self as mtp, MtpBackend, MtpCommit, MtpConfig, MtpExecutionStreams, MtpPrefill,
         MtpSchedulerOptions, MtpSemanticState,
     },
-    runtime::generation::streaming::{FinishReason, SemanticEvent},
+    runtime::generation::streaming::{FinishReason, GenerationCancellationToken, SemanticEvent},
 };
 
 pub(crate) trait QwenMtpTarget {
@@ -370,6 +370,7 @@ pub(crate) fn generate_with_semantics_and_options<T, S, F>(
     prng_key: Option<Array>,
     sampler: &mut S,
     semantic: Box<dyn MtpSemanticState>,
+    cancellation: GenerationCancellationToken,
     stream: &Stream,
     options: MtpSchedulerOptions,
     on_event: F,
@@ -388,6 +389,7 @@ where
         prng_key,
         sampler,
         semantic,
+        cancellation,
         MtpExecutionStreams::single(stream),
         options,
         on_event,

@@ -20,9 +20,10 @@ use safemlx::{
 };
 use safemlx_lm::{
     api::{
-        LoadedModel, ModelLoadOptions, PreparedChatEmbeddedMtpGenerationRequest,
-        PreparedChatGenerationRequest, PreparedChatGenerationSettings, PreparedChatInput,
-        PreparedChatMtpGenerationOptions, PreparedChatMtpGenerationRequest, TextDecoder,
+        GenerationCancellationToken, LoadedModel, ModelLoadOptions,
+        PreparedChatEmbeddedMtpGenerationRequest, PreparedChatGenerationRequest,
+        PreparedChatGenerationSettings, PreparedChatInput, PreparedChatMtpGenerationOptions,
+        PreparedChatMtpGenerationRequest, TextDecoder,
     },
     error::Error as LmError,
     runtime::chat::{
@@ -461,6 +462,7 @@ enum StopReason {
     StopSequence,
     GrammarComplete,
     MaxTokens,
+    Cancelled,
     GeneratorExhausted,
 }
 
@@ -471,6 +473,7 @@ impl StopReason {
             Self::StopSequence => "stop_sequence",
             Self::GrammarComplete => "grammar_complete",
             Self::MaxTokens => "max_tokens",
+            Self::Cancelled => "cancelled",
             Self::GeneratorExhausted => "generator_exhausted",
         }
     }
@@ -483,6 +486,7 @@ impl From<FinishReason> for StopReason {
             FinishReason::StopSequence => Self::StopSequence,
             FinishReason::GrammarComplete => Self::GrammarComplete,
             FinishReason::MaxTokens => Self::MaxTokens,
+            FinishReason::Cancelled => Self::Cancelled,
         }
     }
 }
@@ -948,6 +952,8 @@ fn main() -> Result<()> {
         };
         let mut semantic_error = None;
         if let Some(drafter) = drafter.as_mut() {
+            let cancellation = GenerationCancellationToken::new();
+            let cancel_on_error = cancellation.clone();
             let output = model.generate_prepared_chat_mtp(PreparedChatMtpGenerationRequest {
                 input: PreparedChatInput::rendered_prompt(prepared),
                 drafter,
@@ -961,6 +967,7 @@ fn main() -> Result<()> {
                 },
                 caller_stop_sequences: &args.stop_sequences,
                 streams: MtpExecutionStreams::new(stream, draft_stream)?,
+                cancellation,
                 on_event: |event| {
                     if time_to_first_token.is_none()
                         && !matches!(event, SemanticEvent::Finished { .. })
@@ -977,6 +984,9 @@ fn main() -> Result<()> {
                             args.verbose,
                         )
                         .err();
+                        if semantic_error.is_some() {
+                            cancel_on_error.cancel();
+                        }
                     }
                 },
             })?;
@@ -984,6 +994,8 @@ fn main() -> Result<()> {
             mtp_stats = Some(output.stats);
             prepared_finish_reason = Some(output.finish_reason);
         } else if embedded_mtp {
+            let cancellation = GenerationCancellationToken::new();
+            let cancel_on_error = cancellation.clone();
             let output = model.generate_prepared_chat_embedded_mtp(
                 PreparedChatEmbeddedMtpGenerationRequest {
                     input: PreparedChatInput::rendered_prompt(prepared),
@@ -997,6 +1009,7 @@ fn main() -> Result<()> {
                     },
                     caller_stop_sequences: &args.stop_sequences,
                     stream,
+                    cancellation,
                     on_event: |event| {
                         if time_to_first_token.is_none()
                             && !matches!(event, SemanticEvent::Finished { .. })
@@ -1013,6 +1026,9 @@ fn main() -> Result<()> {
                                 args.verbose,
                             )
                             .err();
+                            if semantic_error.is_some() {
+                                cancel_on_error.cancel();
+                            }
                         }
                     },
                 },
@@ -1021,6 +1037,8 @@ fn main() -> Result<()> {
             mtp_stats = Some(output.stats);
             prepared_finish_reason = Some(output.finish_reason);
         } else {
+            let cancellation = GenerationCancellationToken::new();
+            let cancel_on_error = cancellation.clone();
             let output = model.generate_prepared_chat(PreparedChatGenerationRequest {
                 input: PreparedChatInput::rendered_prompt(prepared),
                 cache: &mut cache,
@@ -1028,6 +1046,7 @@ fn main() -> Result<()> {
                 settings,
                 caller_stop_sequences: &args.stop_sequences,
                 stream,
+                cancellation,
                 on_event: |event| {
                     if time_to_first_token.is_none()
                         && !matches!(event, SemanticEvent::Finished { .. })
@@ -1044,6 +1063,9 @@ fn main() -> Result<()> {
                             args.verbose,
                         )
                         .err();
+                        if semantic_error.is_some() {
+                            cancel_on_error.cancel();
+                        }
                     }
                 },
             })?;
@@ -1344,7 +1366,10 @@ fn main() -> Result<()> {
                 StopReason::GeneratorExhausted => {
                     eprintln!("warning: the token generator ended before EOS");
                 }
-                StopReason::Eos | StopReason::StopSequence | StopReason::GrammarComplete => {}
+                StopReason::Eos
+                | StopReason::StopSequence
+                | StopReason::GrammarComplete
+                | StopReason::Cancelled => {}
             }
         }
     }
