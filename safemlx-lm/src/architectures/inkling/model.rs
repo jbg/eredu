@@ -100,6 +100,9 @@ fn default_audio_token_id() -> u32 {
 #[derive(Debug, Clone, Deserialize)]
 /// Decoder fields from Inkling's nested `text_config`.
 pub struct TextArgs {
+    /// Dense checkpoint dtype used by the released safetensors model.
+    #[serde(default)]
+    pub torch_dtype: Option<String>,
     pub hidden_size: i32,
     pub num_hidden_layers: i32,
     pub vocab_size: i32,
@@ -200,6 +203,15 @@ fn default_vision_encoder_type() -> String {
 }
 
 impl TextArgs {
+    pub(crate) fn weight_dtype(&self) -> Dtype {
+        match self.torch_dtype.as_deref() {
+            Some("bfloat16" | "bf16") => Dtype::Bfloat16,
+            Some("float16") => Dtype::Float16,
+            Some("float32") | None => Dtype::Float32,
+            Some(_) => unreachable!("Inkling torch_dtype is validated before model construction"),
+        }
+    }
+
     pub(crate) fn weight_quantization_for(&self, name: &str) -> Option<WeightQuantization> {
         self.quantized_weight_configs
             .as_ref()
@@ -571,44 +583,63 @@ impl InklingAttention {
             sliding_window: args.sliding_window_size,
             log_scaling_n_floor: args.log_scaling_n_floor,
             log_scaling_alpha: args.log_scaling_alpha,
-            q_proj: common::linear::unloaded_maybe_quantized_linear(
+            q_proj: common::linear::unloaded_maybe_quantized_linear_with_dtype(
                 args.hidden_size,
                 n_heads * head_dim,
                 false,
                 args.weight_quantization_for(&format!("{prefix}.q_proj.weight")),
+                args.weight_dtype(),
                 stream,
             )?,
-            k_proj: common::linear::unloaded_maybe_quantized_linear(
+            k_proj: common::linear::unloaded_maybe_quantized_linear_with_dtype(
                 args.hidden_size,
                 n_kv_heads * head_dim,
                 false,
                 args.weight_quantization_for(&format!("{prefix}.k_proj.weight")),
+                args.weight_dtype(),
                 stream,
             )?,
-            v_proj: common::linear::unloaded_maybe_quantized_linear(
+            v_proj: common::linear::unloaded_maybe_quantized_linear_with_dtype(
                 args.hidden_size,
                 n_kv_heads * head_dim,
                 false,
                 args.weight_quantization_for(&format!("{prefix}.v_proj.weight")),
+                args.weight_dtype(),
                 stream,
             )?,
-            r_proj: common::linear::unloaded_maybe_quantized_linear(
+            r_proj: common::linear::unloaded_maybe_quantized_linear_with_dtype(
                 args.hidden_size,
                 n_heads * args.d_rel,
                 false,
                 args.weight_quantization_for(&format!("{prefix}.r_proj.weight")),
+                args.weight_dtype(),
                 stream,
             )?,
-            o_proj: common::linear::unloaded_maybe_quantized_linear(
+            o_proj: common::linear::unloaded_maybe_quantized_linear_with_dtype(
                 n_heads * head_dim,
                 args.hidden_size,
                 false,
                 args.weight_quantization_for(&format!("{prefix}.o_proj.weight")),
+                args.weight_dtype(),
                 stream,
             )?,
-            q_norm: nn::RmsNorm::unloaded(head_dim, args.rms_norm_eps, Dtype::Float32, stream)?,
-            k_norm: nn::RmsNorm::unloaded(head_dim, args.rms_norm_eps, Dtype::Float32, stream)?,
-            rel_proj: Param::<Array>::unloaded(&[args.d_rel, rel_extent], Dtype::Float32, stream)?,
+            q_norm: nn::RmsNorm::unloaded(
+                head_dim,
+                args.rms_norm_eps,
+                args.weight_dtype(),
+                stream,
+            )?,
+            k_norm: nn::RmsNorm::unloaded(
+                head_dim,
+                args.rms_norm_eps,
+                args.weight_dtype(),
+                stream,
+            )?,
+            rel_proj: Param::<Array>::unloaded(
+                &[args.d_rel, rel_extent],
+                args.weight_dtype(),
+                stream,
+            )?,
             k_sconv: DepthwiseConv1d::new(
                 n_kv_heads * head_dim,
                 args.sconv_kernel_size,
@@ -1015,7 +1046,7 @@ impl InklingRouter {
                     args.n_routed_experts + args.n_shared_experts,
                     args.hidden_size,
                 ],
-                Dtype::Float32,
+                args.weight_dtype(),
                 stream,
             )?,
             bias: Param::<Array>::unloaded(&[args.n_routed_experts], Dtype::Float32, stream)?,
@@ -1058,20 +1089,22 @@ impl InklingMoe {
         let prefix = format!("model.layers.{layer}.moe");
         Ok(Self {
             router: InklingRouter::new(args, stream)?,
-            experts: PackedSwiGluExperts::new(
+            experts: PackedSwiGluExperts::new_with_dtype(
                 args.n_routed_experts,
                 args.hidden_size,
                 intermediate,
                 args.weight_quantization_for(&format!("{prefix}.experts.gate_up_proj")),
                 args.weight_quantization_for(&format!("{prefix}.experts.down_proj")),
+                args.weight_dtype(),
                 stream,
             )?,
-            shared_experts: PackedSwiGluExperts::new(
+            shared_experts: PackedSwiGluExperts::new_with_dtype(
                 args.n_shared_experts,
                 args.hidden_size,
                 intermediate,
                 args.weight_quantization_for(&format!("{prefix}.shared_experts.gate_up_proj")),
                 args.weight_quantization_for(&format!("{prefix}.shared_experts.down_proj")),
+                args.weight_dtype(),
                 stream,
             )?,
         })
@@ -1149,7 +1182,7 @@ impl DecoderLayer {
             input_layernorm: nn::RmsNorm::unloaded(
                 args.hidden_size,
                 args.rms_norm_eps,
-                Dtype::Float32,
+                args.weight_dtype(),
                 stream,
             )?,
             self_attn: InklingAttention::new(args, layer, stream)?,
@@ -1162,31 +1195,34 @@ impl DecoderLayer {
             post_attention_layernorm: nn::RmsNorm::unloaded(
                 args.hidden_size,
                 args.rms_norm_eps,
-                Dtype::Float32,
+                args.weight_dtype(),
                 stream,
             )?,
             dense: if dense {
                 let prefix = format!("model.layers.{layer}.dense");
                 Some(SwiGluMlp {
-                    gate_proj: common::linear::unloaded_maybe_quantized_linear(
+                    gate_proj: common::linear::unloaded_maybe_quantized_linear_with_dtype(
                         args.hidden_size,
                         args.dense_intermediate_size(),
                         false,
                         args.weight_quantization_for(&format!("{prefix}.gate_proj.weight")),
+                        args.weight_dtype(),
                         stream,
                     )?,
-                    down_proj: common::linear::unloaded_maybe_quantized_linear(
+                    down_proj: common::linear::unloaded_maybe_quantized_linear_with_dtype(
                         args.dense_intermediate_size(),
                         args.hidden_size,
                         false,
                         args.weight_quantization_for(&format!("{prefix}.down_proj.weight")),
+                        args.weight_dtype(),
                         stream,
                     )?,
-                    up_proj: common::linear::unloaded_maybe_quantized_linear(
+                    up_proj: common::linear::unloaded_maybe_quantized_linear_with_dtype(
                         args.hidden_size,
                         args.dense_intermediate_size(),
                         false,
                         args.weight_quantization_for(&format!("{prefix}.up_proj.weight")),
+                        args.weight_dtype(),
                         stream,
                     )?,
                 })
@@ -1348,16 +1384,17 @@ struct TextModel {
 impl TextModel {
     fn new(args: &TextArgs, stream: &Stream) -> Result<Self, Exception> {
         Ok(Self {
-            embed_tokens: common::linear::unloaded_maybe_quantized_embedding(
+            embed_tokens: common::linear::unloaded_maybe_quantized_embedding_with_dtype(
                 args.vocab_size,
                 args.hidden_size,
                 args.weight_quantization_for("model.embed_tokens.weight"),
+                args.weight_dtype(),
                 stream,
             )?,
             embed_norm: nn::RmsNorm::unloaded(
                 args.hidden_size,
                 args.rms_norm_eps,
-                Dtype::Float32,
+                args.weight_dtype(),
                 stream,
             )?,
             layers: (0..args.num_hidden_layers)
@@ -1366,7 +1403,7 @@ impl TextModel {
             norm: nn::RmsNorm::unloaded(
                 args.hidden_size,
                 args.rms_norm_eps,
-                Dtype::Float32,
+                args.weight_dtype(),
                 stream,
             )?,
         })
@@ -1443,20 +1480,25 @@ pub(crate) struct AudioModel {
 }
 
 impl AudioModel {
-    pub(crate) fn new(args: &AudioArgs, stream: &Stream) -> Result<Self, Exception> {
+    pub(crate) fn new(
+        args: &AudioArgs,
+        dense_dtype: Dtype,
+        stream: &Stream,
+    ) -> Result<Self, Exception> {
         Ok(Self {
             num_codebooks: args.num_codebooks,
             codebook_size: args.codebook_size,
-            encoder: common::linear::unloaded_maybe_quantized_embedding(
+            encoder: common::linear::unloaded_maybe_quantized_embedding_with_dtype(
                 args.num_codebooks * args.codebook_size,
                 args.text_hidden_size,
                 args.weight_quantization_for("audio.encoder.weight"),
+                dense_dtype,
                 stream,
             )?,
             final_norm: nn::RmsNorm::unloaded(
                 args.text_hidden_size,
                 args.rms_norm_eps,
-                Dtype::Float32,
+                dense_dtype,
                 stream,
             )?,
         })
@@ -1530,21 +1572,23 @@ impl VisionLayer {
         add_norm: bool,
         eps: f32,
         quantization: Option<WeightQuantization>,
+        dense_dtype: Dtype,
         stream: &Stream,
     ) -> Result<Self, Exception> {
         let (input_dim, output_dim, t_fold, hw_fold) = spec;
         Ok(Self {
             t_fold,
             hw_fold,
-            projection: common::linear::unloaded_maybe_quantized_linear(
+            projection: common::linear::unloaded_maybe_quantized_linear_with_dtype(
                 input_dim,
                 output_dim,
                 false,
                 quantization,
+                dense_dtype,
                 stream,
             )?,
             layer_norm: add_norm
-                .then(|| nn::RmsNorm::unloaded(output_dim, eps, Dtype::Float32, stream))
+                .then(|| nn::RmsNorm::unloaded(output_dim, eps, dense_dtype, stream))
                 .transpose()?,
         })
     }
@@ -1611,7 +1655,11 @@ pub(crate) struct VisionModel {
 }
 
 impl VisionModel {
-    pub(crate) fn new(args: &VisionArgs, stream: &Stream) -> Result<Self, Error> {
+    pub(crate) fn new(
+        args: &VisionArgs,
+        dense_dtype: Dtype,
+        stream: &Stream,
+    ) -> Result<Self, Error> {
         if (
             args.temporal_patch_size,
             args.patch_size,
@@ -1639,6 +1687,7 @@ impl VisionModel {
                 index + 1 != specs.len(),
                 args.rms_norm_eps,
                 args.weight_quantization_for(&format!("visual.layers.{index}.projection.weight")),
+                dense_dtype,
                 stream,
             )?);
         }
@@ -1648,7 +1697,7 @@ impl VisionModel {
             final_norm: nn::RmsNorm::unloaded(
                 args.text_hidden_size,
                 args.rms_norm_eps,
-                Dtype::Float32,
+                dense_dtype,
                 stream,
             )?,
         })
@@ -1694,18 +1743,19 @@ impl Model {
             audio: args
                 .audio_config
                 .as_ref()
-                .map(|config| AudioModel::new(config, stream))
+                .map(|config| AudioModel::new(config, args.text_config.weight_dtype(), stream))
                 .transpose()?,
             visual: args
                 .vision_config
                 .as_ref()
-                .map(|config| VisionModel::new(config, stream))
+                .map(|config| VisionModel::new(config, args.text_config.weight_dtype(), stream))
                 .transpose()?,
-            lm_head: common::linear::unloaded_maybe_quantized_linear(
+            lm_head: common::linear::unloaded_maybe_quantized_linear_with_dtype(
                 args.text_config.hidden_size,
                 args.text_config.vocab_size,
                 false,
                 args.text_config.weight_quantization_for("lm_head.weight"),
+                args.text_config.weight_dtype(),
                 stream,
             )?,
             args,
@@ -2320,6 +2370,7 @@ fn args_from_gguf(
     Ok(ModelArgs {
         model_type: "inkling_mm_model".into(),
         text_config: TextArgs {
+            torch_dtype: None,
             hidden_size,
             num_hidden_layers: layers,
             vocab_size,
@@ -2575,6 +2626,16 @@ fn validate_args(args: &ModelArgs) -> Result<(), Error> {
             "expected Inkling model_type inkling_mm_model, got {:?}",
             args.model_type
         )));
+    }
+    if let Some(torch_dtype) = &text.torch_dtype {
+        if !matches!(
+            torch_dtype.as_str(),
+            "bfloat16" | "bf16" | "float16" | "float32"
+        ) {
+            return Err(Error::UnsupportedArchitecture(format!(
+                "unsupported Inkling torch_dtype {torch_dtype:?}"
+            )));
+        }
     }
     for (name, value) in [
         ("hidden_size", text.hidden_size),
@@ -2835,7 +2896,7 @@ mod tests {
     use safemlx::{
         module::ModuleParameters,
         ops::{GgufCheckpoint, GgufMetadataArray, GgufMetadataValue},
-        Device, DeviceType, ExecutionContext,
+        Device, DeviceType, Dtype, ExecutionContext,
     };
     use serde_json::json;
 
@@ -3084,12 +3145,13 @@ mod tests {
             .and_then(|configs| configs.get("visual.layers.0.projection.weight"))
             .copied()
             .unwrap();
-        let mut audio_model = super::AudioModel::new(&audio, stream).unwrap();
+        let mut audio_model = super::AudioModel::new(&audio, Dtype::Float32, stream).unwrap();
         let mut vision_layer = super::VisionLayer::new(
             (32, 32, 1, 1),
             true,
             1e-6,
             Some(vision_quantization),
+            Dtype::Float32,
             stream,
         )
         .unwrap();

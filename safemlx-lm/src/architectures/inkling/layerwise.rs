@@ -457,41 +457,43 @@ impl InklingLayerwiseAdapter {
         let audio = args
             .audio_config
             .as_ref()
-            .map(|config| AudioModel::new(config, stream))
+            .map(|config| AudioModel::new(config, text.weight_dtype(), stream))
             .transpose()?;
         let vision = args
             .vision_config
             .as_ref()
-            .map(|config| VisionModel::new(config, stream))
+            .map(|config| VisionModel::new(config, text.weight_dtype(), stream))
             .transpose()?;
         let (vision_norm, vision_depth) = match vision {
             Some(vision) => (Some(vision.final_norm), vision.layers.len()),
             None => (None, 0),
         };
         Ok(Self {
-            embedding: common::linear::unloaded_maybe_quantized_embedding(
+            embedding: common::linear::unloaded_maybe_quantized_embedding_with_dtype(
                 text.vocab_size,
                 text.hidden_size,
                 text.weight_quantization_for("model.embed_tokens.weight"),
+                text.weight_dtype(),
                 stream,
             )?,
             embed_norm: nn::RmsNorm::unloaded(
                 text.hidden_size,
                 text.rms_norm_eps,
-                Dtype::Float32,
+                text.weight_dtype(),
                 stream,
             )?,
             norm: nn::RmsNorm::unloaded(
                 text.hidden_size,
                 text.rms_norm_eps,
-                Dtype::Float32,
+                text.weight_dtype(),
                 stream,
             )?,
-            lm_head: common::linear::unloaded_maybe_quantized_linear(
+            lm_head: common::linear::unloaded_maybe_quantized_linear_with_dtype(
                 text.hidden_size,
                 text.vocab_size,
                 false,
                 text.weight_quantization_for("lm_head.weight"),
+                text.weight_dtype(),
                 stream,
             )?,
             audio,
@@ -1169,6 +1171,7 @@ impl GeneralLayerwiseModelAdapter for InklingLayerwiseAdapter {
                 index + 1 != specs.len(),
                 args.rms_norm_eps,
                 args.weight_quantization_for(&format!("visual.layers.{index}.projection.weight")),
+                self.args.text_config.weight_dtype(),
                 stream,
             )?))
         } else {
@@ -1296,12 +1299,13 @@ impl GeneralLayerwiseModelAdapter for InklingLayerwiseAdapter {
                                 text.weight_quantization_for(&format!("{prefix}.gate_up_proj"));
                             let down_format =
                                 text.weight_quantization_for(&format!("{prefix}.down_proj"));
-                            let mut bank = PackedSwiGluExperts::new(
+                            let mut bank = PackedSwiGluExperts::new_with_dtype(
                                 acquired.identities().len() as i32,
                                 text.hidden_size,
                                 text.moe_intermediate_size(),
                                 gate_format,
                                 down_format,
+                                text.weight_dtype(),
                                 stream,
                             )?;
                             bank.gate_up_proj = Param::new(
@@ -1687,6 +1691,7 @@ mod tests {
             "model_type": "inkling_mm_model",
             "eos_token_id": 1,
             "text_config": {
+                "torch_dtype": "bfloat16",
                 "hidden_size": 16,
                 "num_hidden_layers": 3,
                 "vocab_size": 32,
@@ -1739,7 +1744,10 @@ mod tests {
             {
                 ones_dtype(&shape, parameter.dtype(), stream).unwrap()
             } else {
-                Array::full::<f32>(&shape, Array::from_f32(0.01), stream).unwrap()
+                Array::full::<f32>(&shape, Array::from_f32(0.01), stream)
+                    .unwrap()
+                    .as_dtype(parameter.dtype(), stream)
+                    .unwrap()
             };
         }
     }
@@ -1863,9 +1871,11 @@ mod tests {
         .unwrap();
     }
 
-    fn assert_close(left: &Array, right: &Array) {
-        let left = left.evaluated().unwrap();
-        let right = right.evaluated().unwrap();
+    fn assert_close(left: &Array, right: &Array, stream: &Stream) {
+        let left_f32 = left.as_dtype(Dtype::Float32, stream).unwrap();
+        let right_f32 = right.as_dtype(Dtype::Float32, stream).unwrap();
+        let left = left_f32.evaluated().unwrap();
+        let right = right_f32.evaluated().unwrap();
         assert_eq!(left.as_array().shape(), right.as_array().shape());
         for (left, right) in left.as_slice::<f32>().iter().zip(right.as_slice::<f32>()) {
             assert!((left - right).abs() <= 5e-5, "{left} != {right}");
@@ -1904,7 +1914,7 @@ mod tests {
             let actual = layerwise
                 .forward(&tokens, &mut layerwise_cache, gpu.stream())
                 .unwrap();
-            assert_close(&actual, &expected);
+            assert_close(&actual, &expected, gpu.stream());
             assert_eq!(resident_cache.offset(), layerwise_cache.offset());
             for (expected, actual) in resident_cache.layers.iter().zip(&layerwise_cache.layers) {
                 assert_eq!(expected.kv.offset(), actual.kv.offset());
@@ -1968,7 +1978,7 @@ mod tests {
             let actual = paged_model
                 .forward_logits(&tokens, None, Some(&mut paged_cache), false, gpu.stream())
                 .unwrap();
-            assert_close(&actual, &expected);
+            assert_close(&actual, &expected, gpu.stream());
             assert_eq!(paged_cache.offset(), expected_cache.offset());
         }
 
@@ -2014,7 +2024,7 @@ mod tests {
             let actual = cached
                 .forward(&tokens, &mut cached_cache, gpu.stream())
                 .unwrap();
-            assert_close(&actual, &expected);
+            assert_close(&actual, &expected, gpu.stream());
         }
         let report = cached.expert_cache_report().unwrap().unwrap();
         assert_eq!(report.owned_experts, 4);
@@ -2083,7 +2093,7 @@ mod tests {
         let actual = layerwise
             .prefill_input_logits(typed, &mut layerwise_cache, gpu.stream())
             .unwrap();
-        assert_close(&actual, &expected);
+        assert_close(&actual, &expected, gpu.stream());
         assert_eq!(resident_cache.offset(), layerwise_cache.offset());
 
         let next = runtime_input::token_ids_array(&[6], gpu.stream()).unwrap();
@@ -2093,7 +2103,7 @@ mod tests {
         let actual = layerwise
             .decode_logits(&next, &mut layerwise_cache, gpu.stream())
             .unwrap();
-        assert_close(&actual, &expected);
+        assert_close(&actual, &expected, gpu.stream());
         assert_eq!(resident_cache.offset(), layerwise_cache.offset());
     }
 }

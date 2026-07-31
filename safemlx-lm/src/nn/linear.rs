@@ -51,6 +51,25 @@ pub fn unloaded_maybe_quantized_linear(
     quantization: Option<WeightQuantization>,
     stream: &Stream,
 ) -> Result<MaybeQuantized<nn::Linear>, Exception> {
+    unloaded_maybe_quantized_linear_with_dtype(
+        input_dims,
+        output_dims,
+        bias,
+        quantization,
+        Dtype::Float32,
+        stream,
+    )
+}
+
+/// Creates an unloaded linear using the requested dense dtype or a quantized parameter tree.
+pub fn unloaded_maybe_quantized_linear_with_dtype(
+    input_dims: i32,
+    output_dims: i32,
+    bias: bool,
+    quantization: Option<WeightQuantization>,
+    dense_dtype: Dtype,
+    stream: &Stream,
+) -> Result<MaybeQuantized<nn::Linear>, Exception> {
     match quantization {
         Some(WeightQuantization::GgufIQuant { ggml_type, endian }) => {
             Ok(MaybeQuantized::Quantized(nn::QuantizedLinear::unloaded_iq(
@@ -77,7 +96,7 @@ pub fn unloaded_maybe_quantized_linear(
             input_dims,
             output_dims,
             bias,
-            Dtype::Float32,
+            dense_dtype,
             stream,
         )?)),
     }
@@ -88,6 +107,23 @@ pub fn unloaded_maybe_quantized_embedding(
     embedding_count: i32,
     dimensions: i32,
     quantization: Option<WeightQuantization>,
+    stream: &Stream,
+) -> Result<MaybeQuantized<nn::Embedding>, Exception> {
+    unloaded_maybe_quantized_embedding_with_dtype(
+        embedding_count,
+        dimensions,
+        quantization,
+        Dtype::Float32,
+        stream,
+    )
+}
+
+/// Creates an unloaded embedding using the requested dense dtype or a quantized parameter tree.
+pub fn unloaded_maybe_quantized_embedding_with_dtype(
+    embedding_count: i32,
+    dimensions: i32,
+    quantization: Option<WeightQuantization>,
+    dense_dtype: Dtype,
     stream: &Stream,
 ) -> Result<MaybeQuantized<nn::Embedding>, Exception> {
     match quantization {
@@ -113,7 +149,7 @@ pub fn unloaded_maybe_quantized_embedding(
         None => Ok(MaybeQuantized::Original(nn::Embedding::unloaded(
             embedding_count,
             dimensions,
-            Dtype::Float32,
+            dense_dtype,
             stream,
         )?)),
     }

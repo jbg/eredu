@@ -757,6 +757,27 @@ impl PackedSwiGluExperts {
         down_affine: Option<WeightQuantization>,
         stream: &Stream,
     ) -> Result<Self, Exception> {
+        Self::new_with_dtype(
+            num_experts,
+            hidden_dim,
+            intermediate_dim,
+            gate_up_affine,
+            down_affine,
+            Dtype::Float32,
+            stream,
+        )
+    }
+
+    /// Creates an unloaded packed expert bank with an explicit dense weight dtype.
+    pub fn new_with_dtype(
+        num_experts: i32,
+        hidden_dim: i32,
+        intermediate_dim: i32,
+        gate_up_affine: Option<WeightQuantization>,
+        down_affine: Option<WeightQuantization>,
+        dense_dtype: Dtype,
+        stream: &Stream,
+    ) -> Result<Self, Exception> {
         let (gate_up_affine, gate_up_iquant) = match gate_up_affine {
             Some(iq @ WeightQuantization::GgufIQuant { .. }) => (None, Some(iq)),
             affine => (affine, None),
@@ -830,7 +851,7 @@ impl PackedSwiGluExperts {
                 Ok((
                     Param::<Array>::unloaded(
                         &[num_experts, out_features, in_features],
-                        Dtype::Float32,
+                        dense_dtype,
                         stream,
                     )?,
                     Param::new(None),
