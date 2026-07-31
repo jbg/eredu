@@ -16,7 +16,7 @@ use safemlx::{
     distributed::{self, Group},
     error::Exception,
     module::{ModuleParameters, Param},
-    ops::{indexing::TryIndexOp, zeros_dtype},
+    ops::{indexing::TryIndexOp, zeros_dtype, GgufCheckpoint, GgufMetadataValue},
     transforms::eval,
     Array, Stream,
 };
@@ -1566,7 +1566,10 @@ fn validate_pure_expert(topology: ParallelTopology) -> Result<(), Error> {
     Ok(())
 }
 
-/// Loads an executable pure expert-parallel safetensors MoE model.
+/// Loads an executable pure expert-parallel MoE model.
+///
+/// SafeTensors uses the architecture's resident or sparse-cache adapter.
+/// Registered GGUF architectures use fully resident expert partitioning.
 pub fn load_expert_parallel_model(
     model_dir: impl AsRef<Path>,
     topology: ParallelTopology,
@@ -1640,7 +1643,31 @@ fn load_expert_parallel_model_impl(
         .extension()
         .is_some_and(|extension| extension == "gguf")
     {
-        return Err(Error::Parallel("expert-parallel GGUF loading is unsupported because bounded local-expert selection is unavailable; use safetensors".into()));
+        let checkpoint = GgufCheckpoint::open(model_dir)?;
+        let metadata = crate::runtime::checkpoint::load::gguf_metadata(&checkpoint);
+        let architecture = match metadata.get("general.architecture") {
+            Some(GgufMetadataValue::String(architecture)) => architecture.clone(),
+            Some(_) => {
+                return Err(Error::UnsupportedArchitecture(
+                    "GGUF general.architecture metadata has the wrong type".into(),
+                ))
+            }
+            None => {
+                return Err(Error::UnsupportedArchitecture(
+                    "GGUF is missing general.architecture metadata".into(),
+                ))
+            }
+        };
+        return load_resident_gguf_ep(
+            &architecture,
+            &checkpoint,
+            metadata,
+            topology,
+            options,
+            assignment,
+            stream,
+            weights_stream,
+        );
     }
     let config: serde_json::Value =
         serde_json::from_reader(std::fs::File::open(model_dir.join("config.json"))?)?;
@@ -2345,6 +2372,163 @@ fn load_kimi_linear_ep(
         latest_statistics: Default::default(),
         cumulative_statistics: Default::default(),
     })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn load_resident_gguf_ep(
+    architecture: &str,
+    checkpoint: &GgufCheckpoint,
+    metadata: std::collections::HashMap<String, GgufMetadataValue>,
+    topology: ParallelTopology,
+    options: ModelLoadOptions,
+    assignment: Option<ExpertAssignment>,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<ExpertParallelModel, Error> {
+    if !matches!(options.weight_residency, WeightResidency::FullyResident) {
+        return Err(Error::Parallel(
+            "GGUF expert-parallel loading currently requires fully resident weight residency"
+                .into(),
+        ));
+    }
+    crate::api::validate_gguf_quantization_source(checkpoint, &metadata, options.quantization)?;
+    let opened_checkpoint_shards = checkpoint
+        .catalog()
+        .shards()
+        .iter()
+        .map(|shard| shard.path().to_path_buf())
+        .collect::<Vec<_>>();
+    match architecture {
+        "kimi-linear" => {
+            let loaded = kimi_linear::load_gguf_checkpoint(
+                checkpoint,
+                metadata,
+                options.quantization,
+                stream,
+                weights_stream,
+            )?;
+            let mut model = loaded.model;
+            if model.args.num_experts <= 0 {
+                return Err(Error::Parallel(
+                    "Kimi Linear GGUF config has no routed experts".into(),
+                ));
+            }
+            let assignment =
+                resolve_model_assignment(assignment, model.args.num_experts as usize, topology)?;
+            let routed_expert_bytes = model.partition_routed_experts(&assignment, stream)?;
+            let local_parameter_bytes = parameter_bytes(&model);
+            Ok(finish_resident_gguf_ep(
+                topology,
+                ModelKind::KimiLinear,
+                assignment,
+                ExpertArchitecture::KimiLinear(Box::new(model)),
+                local_parameter_bytes,
+                routed_expert_bytes,
+                opened_checkpoint_shards,
+            ))
+        }
+        "deepseek2" => {
+            let loaded = deepseek_v3::load_gguf_checkpoint(
+                checkpoint,
+                metadata,
+                options.quantization,
+                stream,
+                weights_stream,
+            )?;
+            let mut model = loaded.model;
+            if model.args.n_routed_experts <= 0 {
+                return Err(Error::Parallel(
+                    "DeepSeek GGUF config has no routed experts".into(),
+                ));
+            }
+            let assignment = resolve_model_assignment(
+                assignment,
+                model.args.n_routed_experts as usize,
+                topology,
+            )?;
+            let mut routed_expert_bytes = 0;
+            for layer in &mut model.model.layers {
+                if let Some(moe) = layer.mlp.moe_mut() {
+                    routed_expert_bytes +=
+                        finalize_deepseek_expert_bank(&mut moe.experts, &assignment, stream)?;
+                }
+            }
+            let local_parameter_bytes = parameter_bytes(&model);
+            Ok(finish_resident_gguf_ep(
+                topology,
+                ModelKind::DeepSeekV3,
+                assignment,
+                ExpertArchitecture::DeepSeek(Box::new(model)),
+                local_parameter_bytes,
+                routed_expert_bytes,
+                opened_checkpoint_shards,
+            ))
+        }
+        "qwen3moe" => {
+            let loaded = qwen3::load_qwen3_gguf_checkpoint(
+                checkpoint,
+                metadata,
+                options.quantization,
+                stream,
+                weights_stream,
+            )?;
+            let mut model = loaded.model;
+            let assignment =
+                resolve_model_assignment(assignment, model.args.num_experts as usize, topology)?;
+            let mut routed_expert_bytes = 0;
+            for layer in &mut model.model.layers {
+                if let qwen3::FeedForward::Moe(moe) = &mut layer.mlp {
+                    routed_expert_bytes +=
+                        finalize_qwen3_expert_bank(&mut moe.experts, &assignment, stream)?;
+                }
+            }
+            let local_parameter_bytes = parameter_bytes(&model);
+            Ok(finish_resident_gguf_ep(
+                topology,
+                ModelKind::Qwen3,
+                assignment,
+                ExpertArchitecture::Qwen3(Box::new(model)),
+                local_parameter_bytes,
+                routed_expert_bytes,
+                opened_checkpoint_shards,
+            ))
+        }
+        other => Err(Error::Parallel(format!(
+            "expert-parallel GGUF architecture {other} is unsupported; registered resident GGUF EP architectures are kimi-linear, deepseek2, and qwen3moe"
+        ))),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn finish_resident_gguf_ep(
+    topology: ParallelTopology,
+    model_kind: ModelKind,
+    assignment: ExpertAssignment,
+    architecture: ExpertArchitecture,
+    local_parameter_bytes: usize,
+    routed_expert_bytes: usize,
+    opened_checkpoint_shards: Vec<PathBuf>,
+) -> ExpertParallelModel {
+    ExpertParallelModel {
+        topology,
+        info: ExpertParallelInfo {
+            global_rank: topology.global_rank,
+            expert_parallel_rank: topology.expert_parallel_rank,
+            expert_parallel_size: topology.expert_parallel_size,
+            model_kind,
+            assignment,
+            local_parameter_bytes,
+            routed_expert_bytes,
+            owned_expert_bytes: routed_expert_bytes,
+            replicated_parameter_bytes: local_parameter_bytes - routed_expert_bytes,
+            opened_checkpoint_shards,
+            exchange_strategy: ExpertExchangeStrategy::ReplicatedInputAllSum,
+        },
+        architecture,
+        expert_cache: None,
+        latest_statistics: Default::default(),
+        cumulative_statistics: Default::default(),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3407,8 +3591,10 @@ mod tests {
     use super::*;
     use crate::runtime::distributed::topology::DeviceAssignment;
     use safemlx::{
-        distributed::Backend, module::ModuleParameters, ops::zeros_dtype, Device, DeviceType,
-        Dtype, ExecutionContext,
+        distributed::Backend,
+        module::ModuleParameters,
+        ops::{indexing::TryIndexOp, zeros_dtype, GgufMetadataArray},
+        Device, DeviceType, Dtype, ExecutionContext,
     };
 
     fn stream() -> Stream {
@@ -3488,6 +3674,208 @@ mod tests {
             .unwrap()
     }
 
+    fn kimi_test_args() -> kimi_linear::ModelArgs {
+        kimi_linear::parse_config_value(serde_json::json!({
+            "model_type": "kimi_linear",
+            "vocab_size": 32,
+            "hidden_size": 32,
+            "num_hidden_layers": 2,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 1,
+            "intermediate_size": 64,
+            "head_dim": 8,
+            "model_max_length": 128,
+            "rms_norm_eps": 0.00001,
+            "linear_attn_config": {
+                "kda_layers": [1],
+                "full_attn_layers": [2],
+                "num_heads": 4,
+                "head_dim": 8,
+                "short_conv_kernel_size": 2
+            },
+            "num_experts": 4,
+            "moe_intermediate_size": 32,
+            "kv_lora_rank": 8,
+            "q_lora_rank": null,
+            "qk_nope_head_dim": 4,
+            "qk_rope_head_dim": 4,
+            "v_head_dim": 4,
+            "mla_use_nope": true,
+            "num_experts_per_token": 2,
+            "num_shared_experts": 1,
+            "moe_router_activation_func": "sigmoid",
+            "moe_renormalize": true,
+            "routed_scaling_factor": 1.0,
+            "first_k_dense_replace": 1,
+            "moe_layer_freq": 1,
+            "use_grouped_topk": true,
+            "num_expert_group": 1,
+            "topk_group": 1,
+            "tie_word_embeddings": false,
+            "num_nextn_predict_layers": 0
+        }))
+        .unwrap()
+    }
+
+    fn kimi_runtime_to_gguf_name(name: &str) -> String {
+        for (runtime, gguf) in [
+            ("model.embed_tokens.weight", "token_embd.weight"),
+            ("model.norm.weight", "output_norm.weight"),
+            ("lm_head.weight", "output.weight"),
+        ] {
+            if name == runtime {
+                return gguf.into();
+            }
+        }
+        let rest = name
+            .strip_prefix("model.layers.")
+            .unwrap_or_else(|| panic!("unexpected Kimi parameter {name}"));
+        let (layer, parameter) = rest
+            .split_once('.')
+            .unwrap_or_else(|| panic!("unexpected Kimi parameter {name}"));
+        let parameter = match parameter {
+            "self_attn.q_proj.weight" => "attn_q.weight",
+            "self_attn.k_proj.weight" => "attn_k.weight",
+            "self_attn.v_proj.weight" => "attn_v.weight",
+            "self_attn.q_conv1d.weight" => "ssm_conv1d_q.weight",
+            "self_attn.k_conv1d.weight" => "ssm_conv1d_k.weight",
+            "self_attn.v_conv1d.weight" => "ssm_conv1d_v.weight",
+            "self_attn.A_log" => "ssm_a.weight",
+            "self_attn.dt_bias" => "ssm_dt.bias",
+            "self_attn.f_a_proj.weight" => "ssm_f_a.weight",
+            "self_attn.f_b_proj.weight" => "ssm_f_b.weight",
+            "self_attn.b_proj.weight" => "ssm_beta.weight",
+            "self_attn.g_a_proj.weight" => "ssm_g_a.weight",
+            "self_attn.g_b_proj.weight" => "ssm_g_b.weight",
+            "self_attn.o_norm.weight" => "ssm_norm.weight",
+            "self_attn.kv_a_proj_with_mqa.weight" => "attn_kv_a_mqa.weight",
+            "self_attn.kv_a_layernorm.weight" => "attn_kv_a_norm.weight",
+            "self_attn.kv_b_proj.weight" => "attn_kv_b.weight",
+            "self_attn.o_proj.weight" => "attn_output.weight",
+            "input_layernorm.weight" => "attn_norm.weight",
+            "post_attention_layernorm.weight" => "ffn_norm.weight",
+            "mlp.gate_proj.weight" => "ffn_gate.weight",
+            "mlp.up_proj.weight" => "ffn_up.weight",
+            "mlp.down_proj.weight" => "ffn_down.weight",
+            "mlp.shared_experts.gate_proj.weight" => "ffn_gate_shexp.weight",
+            "mlp.shared_experts.up_proj.weight" => "ffn_up_shexp.weight",
+            "mlp.shared_experts.down_proj.weight" => "ffn_down_shexp.weight",
+            "mlp.gate.weight" => "ffn_gate_inp.weight",
+            "mlp.gate.e_score_correction_bias" => "exp_probs_b.bias",
+            _ => panic!("unexpected Kimi parameter {name}"),
+        };
+        format!("blk.{layer}.{parameter}")
+    }
+
+    fn synthetic_kimi_gguf(stream: &Stream) -> crate::test_utils::SyntheticGguf {
+        let args = kimi_test_args();
+        let source = kimi_linear::Model::new(args.clone(), stream).unwrap();
+        let mut arrays = std::collections::HashMap::new();
+        for (name, parameter) in source.parameters().flatten() {
+            let value = if name.as_ref().ends_with(".A_log") {
+                Array::full::<f32>(parameter.shape(), Array::from_f32(-1.0), stream).unwrap()
+            } else {
+                Array::zeros::<f32>(parameter.shape(), stream).unwrap()
+            };
+            if name.as_ref() == "model.layers.1.mlp.experts.gate_up_proj" {
+                arrays.insert(
+                    "blk.1.ffn_gate_exps.weight".into(),
+                    value
+                        .try_index_device((.., ..args.moe_intermediate_size, ..), stream)
+                        .unwrap(),
+                );
+                arrays.insert(
+                    "blk.1.ffn_up_exps.weight".into(),
+                    value
+                        .try_index_device((.., args.moe_intermediate_size.., ..), stream)
+                        .unwrap(),
+                );
+            } else if name.as_ref() == "model.layers.1.mlp.experts.down_proj" {
+                arrays.insert("blk.1.ffn_down_exps.weight".into(), value);
+            } else {
+                arrays.insert(kimi_runtime_to_gguf_name(name.as_ref()), value);
+            }
+        }
+        let metadata = std::collections::HashMap::from([
+            (
+                "general.architecture".into(),
+                GgufMetadataValue::String("kimi-linear".into()),
+            ),
+            (
+                "kimi-linear.embedding_length".into(),
+                GgufMetadataValue::Uint32(args.hidden_size as u32),
+            ),
+            (
+                "kimi-linear.block_count".into(),
+                GgufMetadataValue::Uint32(args.num_hidden_layers as u32),
+            ),
+            (
+                "kimi-linear.feed_forward_length".into(),
+                GgufMetadataValue::Uint32(args.intermediate_size as u32),
+            ),
+            (
+                "kimi-linear.attention.head_count".into(),
+                GgufMetadataValue::Uint32(args.num_attention_heads as u32),
+            ),
+            (
+                "kimi-linear.attention.head_count_kv".into(),
+                GgufMetadataValue::Array(GgufMetadataArray::Uint32(vec![0, 1])),
+            ),
+            (
+                "kimi-linear.rope.dimension_count".into(),
+                GgufMetadataValue::Uint32(args.qk_rope_head_dim as u32),
+            ),
+            (
+                "kimi-linear.attention.key_length_mla".into(),
+                GgufMetadataValue::Uint32((args.qk_nope_head_dim + args.qk_rope_head_dim) as u32),
+            ),
+            (
+                "kimi-linear.attention.value_length_mla".into(),
+                GgufMetadataValue::Uint32(args.v_head_dim as u32),
+            ),
+            (
+                "kimi-linear.attention.kv_lora_rank".into(),
+                GgufMetadataValue::Uint32(args.kv_lora_rank as u32),
+            ),
+            (
+                "kimi-linear.attention.layer_norm_rms_epsilon".into(),
+                GgufMetadataValue::Float32(args.rms_norm_eps),
+            ),
+            (
+                "kimi-linear.context_length".into(),
+                GgufMetadataValue::Uint32(args.model_max_length as u32),
+            ),
+            (
+                "kimi-linear.kda.head_dim".into(),
+                GgufMetadataValue::Uint32(args.linear_attn_config.head_dim as u32),
+            ),
+            (
+                "kimi-linear.ssm.conv_kernel".into(),
+                GgufMetadataValue::Uint32(args.linear_attn_config.short_conv_kernel_size as u32),
+            ),
+            (
+                "kimi-linear.expert_count".into(),
+                GgufMetadataValue::Uint32(args.num_experts as u32),
+            ),
+            (
+                "kimi-linear.expert_feed_forward_length".into(),
+                GgufMetadataValue::Uint32(args.moe_intermediate_size as u32),
+            ),
+            (
+                "kimi-linear.expert_used_count".into(),
+                GgufMetadataValue::Uint32(args.num_experts_per_token as u32),
+            ),
+            (
+                "kimi-linear.vocab_size".into(),
+                GgufMetadataValue::Uint32(args.vocab_size as u32),
+            ),
+        ]);
+        crate::test_utils::SyntheticGguf::with_packed_tensors(&arrays, &metadata, |name, _| {
+            (name.contains("ffn_") && name.contains("_exps.weight"))
+                .then_some(safemlx_gguf::GgmlType::MxFp4)
+        })
+    }
+
     struct IdentityBank;
 
     impl LocalExpertBank for IdentityBank {
@@ -3551,6 +3939,47 @@ mod tests {
         assert_eq!(bank.num_experts, 2);
         assert_eq!(bank.gate_up_proj.shape(), gate_up_shape);
         assert_eq!(bank.down_proj.shape(), down_shape);
+    }
+
+    #[test]
+    fn kimi_mxfp4_gguf_loads_through_expert_parallel_api() {
+        let context = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
+        let weights_context = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        let fixture = synthetic_kimi_gguf(context.stream());
+        let loaded = load_expert_parallel_model_with_options(
+            fixture.path(),
+            ModelLoadOptions::with_parallel(rank_one_topology()),
+            context.stream(),
+            weights_context.stream(),
+        )
+        .unwrap();
+
+        assert_eq!(loaded.info.model_kind, ModelKind::KimiLinear);
+        assert_eq!(loaded.info.assignment.local_global_expert_ids(), &[2, 3]);
+        assert_eq!(loaded.info.opened_checkpoint_shards, [fixture.path()]);
+        assert!(loaded.info.routed_expert_bytes > 0);
+        assert!(loaded.info.replicated_parameter_bytes > 0);
+        let ExpertArchitecture::KimiLinear(model) = &loaded.architecture else {
+            panic!("expected Kimi Linear");
+        };
+        let parameters = model.parameters().flatten();
+        let gate_up = parameters
+            .get("model.layers.1.mlp.experts.gate_up_proj")
+            .unwrap();
+        let down = parameters
+            .get("model.layers.1.mlp.experts.down_proj")
+            .unwrap();
+        assert_eq!(gate_up.shape(), &[2, 64, 4]);
+        assert_eq!(down.shape(), &[2, 32, 4]);
+        assert_eq!(gate_up.dtype(), Dtype::Uint32);
+        assert_eq!(
+            parameters
+                .get("model.layers.1.mlp.experts.gate_up_proj_scales")
+                .unwrap()
+                .shape(),
+            &[2, 64, 1]
+        );
+        assert!(parameters.contains_key("model.layers.1.mlp.shared_experts.gate_proj.weight"));
     }
 
     #[test]

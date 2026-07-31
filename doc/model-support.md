@@ -167,5 +167,7 @@ Kimi Linear supports pure fully resident and sparse-expert-cache expert
 parallelism for SafeTensors: dense/nonexpert weights and the shared expert are
 replicated, routed experts are partitioned or loaded through rank-owned sparse
 caches, and the shared expert is added once after routed reduction. Tensor
-parallelism, pipeline parallelism, and GGUF expert parallelism return
-capability errors.
+parallelism and pipeline parallelism return capability errors. Fully resident
+GGUF expert parallelism is supported for Kimi Linear, DeepSeek2, and
+Qwen3-MoE through the shared resident-GGUF dispatcher; sparse-cache GGUF EP
+remains unavailable.
