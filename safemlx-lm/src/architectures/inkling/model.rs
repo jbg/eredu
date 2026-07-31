@@ -296,6 +296,17 @@ pub struct AudioArgs {
     pub audio_mode: String,
     #[serde(default = "default_rms_norm_eps")]
     pub rms_norm_eps: f32,
+    /// Exact per-weight formats for a mixed GGUF projector.
+    #[serde(skip)]
+    pub quantized_weight_configs: Option<HashMap<String, WeightQuantization>>,
+}
+
+impl AudioArgs {
+    fn weight_quantization_for(&self, name: &str) -> Option<WeightQuantization> {
+        self.quantized_weight_configs
+            .as_ref()
+            .and_then(|configs| configs.get(name).copied())
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -314,6 +325,17 @@ pub struct VisionArgs {
     pub use_vision_norm: bool,
     #[serde(default = "default_rms_norm_eps")]
     pub rms_norm_eps: f32,
+    /// Exact per-weight formats for a mixed GGUF projector.
+    #[serde(skip)]
+    pub quantized_weight_configs: Option<HashMap<String, WeightQuantization>>,
+}
+
+impl VisionArgs {
+    pub(crate) fn weight_quantization_for(&self, name: &str) -> Option<WeightQuantization> {
+        self.quantized_weight_configs
+            .as_ref()
+            .and_then(|configs| configs.get(name).copied())
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1415,7 +1437,7 @@ pub(crate) struct AudioModel {
     num_codebooks: i32,
     codebook_size: i32,
     #[param]
-    encoder: nn::Embedding,
+    encoder: MaybeQuantized<nn::Embedding>,
     #[param]
     final_norm: nn::RmsNorm,
 }
@@ -1425,10 +1447,10 @@ impl AudioModel {
         Ok(Self {
             num_codebooks: args.num_codebooks,
             codebook_size: args.codebook_size,
-            encoder: nn::Embedding::unloaded(
+            encoder: common::linear::unloaded_maybe_quantized_embedding(
                 args.num_codebooks * args.codebook_size,
                 args.text_hidden_size,
-                Dtype::Float32,
+                args.weight_quantization_for("audio.encoder.weight"),
                 stream,
             )?,
             final_norm: nn::RmsNorm::unloaded(
@@ -1497,25 +1519,30 @@ pub(crate) struct VisionLayer {
     t_fold: i32,
     hw_fold: i32,
     #[param]
-    projection: nn::Linear,
+    projection: MaybeQuantized<nn::Linear>,
     #[param]
     layer_norm: Option<nn::RmsNorm>,
 }
 
 impl VisionLayer {
     pub(crate) fn new(
-        input_dim: i32,
-        output_dim: i32,
-        t_fold: i32,
-        hw_fold: i32,
+        spec: (i32, i32, i32, i32),
         add_norm: bool,
         eps: f32,
+        quantization: Option<WeightQuantization>,
         stream: &Stream,
     ) -> Result<Self, Exception> {
+        let (input_dim, output_dim, t_fold, hw_fold) = spec;
         Ok(Self {
             t_fold,
             hw_fold,
-            projection: nn::Linear::unloaded(input_dim, output_dim, false, Dtype::Float32, stream)?,
+            projection: common::linear::unloaded_maybe_quantized_linear(
+                input_dim,
+                output_dim,
+                false,
+                quantization,
+                stream,
+            )?,
             layer_norm: add_norm
                 .then(|| nn::RmsNorm::unloaded(output_dim, eps, Dtype::Float32, stream))
                 .transpose()?,
@@ -1608,12 +1635,10 @@ impl VisionModel {
         let mut layers = Vec::with_capacity(specs.len());
         for (index, (input_dim, output_dim, t_fold, hw_fold)) in specs.into_iter().enumerate() {
             layers.push(VisionLayer::new(
-                input_dim,
-                output_dim,
-                t_fold,
-                hw_fold,
+                (input_dim, output_dim, t_fold, hw_fold),
                 index + 1 != specs.len(),
                 args.rms_norm_eps,
+                args.weight_quantization_for(&format!("visual.layers.{index}.projection.weight")),
                 stream,
             )?);
         }
@@ -1863,24 +1888,80 @@ pub(crate) struct PreparedInklingGguf {
     pub(crate) eos_token_ids: Vec<u32>,
 }
 
-/// Loads the text decoder from an `inkling` GGUF checkpoint.
+/// Optional sibling GGUF containing Inkling's hMLP and dMel towers.
+pub(crate) struct InklingMmprojGguf {
+    pub(crate) checkpoint: GgufCheckpoint,
+    pub(crate) metadata: HashMap<String, GgufMetadataValue>,
+}
+
+pub(crate) fn open_sibling_mmproj(gguf_file: &Path) -> Result<Option<InklingMmprojGguf>, Error> {
+    let Some(path) = crate::runtime::checkpoint::gguf::find_sibling_mmproj(gguf_file, "inkling")?
+    else {
+        return Ok(None);
+    };
+    let checkpoint = GgufCheckpoint::open(path)?;
+    let metadata = gguf_metadata(&checkpoint);
+    validate_mmproj_metadata(&metadata)?;
+    Ok(Some(InklingMmprojGguf {
+        checkpoint,
+        metadata,
+    }))
+}
+
+/// Loads an `inkling` GGUF and its optional sibling multimodal projector.
 pub fn load_gguf(
     gguf_file: impl AsRef<Path>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<Model, Error> {
+    let gguf_file = gguf_file.as_ref();
     let checkpoint = GgufCheckpoint::open(gguf_file)?;
     let metadata = gguf_metadata(&checkpoint);
-    Ok(load_gguf_checkpoint(&checkpoint, metadata, stream, weights_stream)?.model)
+    let mmproj = open_sibling_mmproj(gguf_file)?;
+    Ok(load_gguf_checkpoint_with_mmproj(
+        &checkpoint,
+        metadata,
+        mmproj.as_ref(),
+        stream,
+        weights_stream,
+    )?
+    .model)
 }
 
-pub(crate) fn load_gguf_checkpoint(
+/// Loads an Inkling text GGUF with an explicit combined audio/vision mmproj.
+pub fn load_gguf_with_mmproj(
+    gguf_file: impl AsRef<Path>,
+    mmproj_file: impl AsRef<Path>,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<Model, Error> {
+    let checkpoint = GgufCheckpoint::open(gguf_file)?;
+    let metadata = gguf_metadata(&checkpoint);
+    let mmproj_checkpoint = GgufCheckpoint::open(mmproj_file)?;
+    let mmproj = InklingMmprojGguf {
+        metadata: gguf_metadata(&mmproj_checkpoint),
+        checkpoint: mmproj_checkpoint,
+    };
+    validate_mmproj_metadata(&mmproj.metadata)?;
+    Ok(load_gguf_checkpoint_with_mmproj(
+        &checkpoint,
+        metadata,
+        Some(&mmproj),
+        stream,
+        weights_stream,
+    )?
+    .model)
+}
+
+pub(crate) fn load_gguf_checkpoint_with_mmproj(
     checkpoint: &GgufCheckpoint,
     metadata: HashMap<String, GgufMetadataValue>,
+    mmproj: Option<&InklingMmprojGguf>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<LoadedInklingGguf, Error> {
-    let prepared = prepare_gguf_checkpoint(checkpoint, &metadata, weights_stream)?;
+    let prepared =
+        prepare_gguf_checkpoint_with_mmproj(checkpoint, &metadata, mmproj, weights_stream)?;
     let mut model = Model::new(prepared.args, stream)?;
     let config = StrictLoadConfig::default();
     let mut report = StrictLoadReport::default();
@@ -1961,6 +2042,22 @@ pub(crate) fn load_gguf_checkpoint(
             }
         }
     }
+    if let Some(mmproj) = mmproj {
+        let mut materializer = mmproj.checkpoint.materializer();
+        for tensor in mmproj.checkpoint.catalog().tensors() {
+            let physical = &tensor.descriptor().name;
+            for (name, value) in materializer.converted_tensor(physical)?.into_arrays() {
+                load_named_array_strict(
+                    &mut model,
+                    translate_mmproj_weight_name(&name),
+                    value,
+                    None,
+                    &config,
+                    &mut report,
+                )?;
+            }
+        }
+    }
     report.finish(&model, &config)?;
     model.copy_to_stream(stream)?;
     Ok(LoadedInklingGguf {
@@ -1969,9 +2066,10 @@ pub(crate) fn load_gguf_checkpoint(
     })
 }
 
-pub(crate) fn prepare_gguf_checkpoint(
+pub(crate) fn prepare_gguf_checkpoint_with_mmproj(
     checkpoint: &GgufCheckpoint,
     metadata: &HashMap<String, GgufMetadataValue>,
+    mmproj: Option<&InklingMmprojGguf>,
     stream: &Stream,
 ) -> Result<PreparedInklingGguf, Error> {
     let architecture = gguf_string(metadata, "general.architecture")?;
@@ -2007,11 +2105,178 @@ pub(crate) fn prepare_gguf_checkpoint(
         }
     }
     args.text_config.quantized_weight_configs = Some(configs);
+    if let Some(mmproj) = mmproj {
+        apply_mmproj_args(&mut args, metadata, mmproj, stream)?;
+    }
     validate_args(&args)?;
     Ok(PreparedInklingGguf {
         args,
         eos_token_ids: crate::api::gguf_eos_token_ids(metadata)?,
     })
+}
+
+pub(crate) fn validate_mmproj_metadata(
+    metadata: &HashMap<String, GgufMetadataValue>,
+) -> Result<(), Error> {
+    let architecture = gguf_string(metadata, "general.architecture")?;
+    let vision_projector = gguf_string(metadata, "clip.vision.projector_type")?;
+    let audio_projector = gguf_string(metadata, "clip.audio.projector_type")?;
+    for (key, description) in [
+        ("clip.has_vision_encoder", "vision encoder"),
+        ("clip.has_audio_encoder", "audio encoder"),
+    ] {
+        match metadata.get(key) {
+            Some(GgufMetadataValue::Bool(true)) => {}
+            Some(GgufMetadataValue::Bool(false)) => {
+                return Err(Error::UnsupportedArchitecture(format!(
+                    "Inkling mmproj does not contain its {description}"
+                )))
+            }
+            Some(_) => {
+                return Err(Error::UnsupportedArchitecture(format!(
+                    "Inkling mmproj metadata key {key:?} must be boolean"
+                )))
+            }
+            None => {
+                return Err(Error::UnsupportedArchitecture(format!(
+                    "Inkling mmproj is missing metadata key {key:?}"
+                )))
+            }
+        }
+    }
+    if architecture != "clip" || vision_projector != "inkling" || audio_projector != "inkling" {
+        return Err(Error::UnsupportedArchitecture(format!(
+            "expected an Inkling audio/vision mmproj, got architecture {architecture:?}, vision projector {vision_projector:?}, and audio projector {audio_projector:?}"
+        )));
+    }
+    Ok(())
+}
+
+fn apply_mmproj_args(
+    args: &mut ModelArgs,
+    model_metadata: &HashMap<String, GgufMetadataValue>,
+    mmproj: &InklingMmprojGguf,
+    stream: &Stream,
+) -> Result<(), Error> {
+    validate_mmproj_metadata(&mmproj.metadata)?;
+    mmproj
+        .checkpoint
+        .catalog()
+        .translated_outputs(translate_mmproj_weight_name)
+        .map_err(safemlx::error::IoError::from)?;
+    let configs = gguf_quantization_configs(&mmproj.checkpoint, translate_mmproj_weight_name)?;
+    let audio_configs = configs
+        .iter()
+        .filter(|(name, _)| name.starts_with("audio."))
+        .map(|(name, config)| (name.clone(), *config))
+        .collect();
+    let vision_configs = configs
+        .iter()
+        .filter(|(name, _)| name.starts_with("visual."))
+        .map(|(name, config)| (name.clone(), *config))
+        .collect();
+    if configs
+        .keys()
+        .any(|name| !name.starts_with("audio.") && !name.starts_with("visual."))
+    {
+        return Err(Error::UnsupportedArchitecture(
+            "Inkling mmproj contains a quantized tensor outside its audio and vision towers".into(),
+        ));
+    }
+
+    let vision_hidden = gguf_i32(&mmproj.metadata, "clip.vision.projection_dim", stream)?;
+    let audio_hidden = gguf_i32(&mmproj.metadata, "clip.audio.projection_dim", stream)?;
+    let audio_embedding = gguf_i32(&mmproj.metadata, "clip.audio.embedding_length", stream)?;
+    if vision_hidden != args.text_config.hidden_size
+        || audio_hidden != args.text_config.hidden_size
+        || audio_embedding != args.text_config.hidden_size
+    {
+        return Err(Error::UnsupportedArchitecture(format!(
+            "Inkling mmproj output widths ({vision_hidden}, {audio_hidden}, {audio_embedding}) do not match decoder width {}",
+            args.text_config.hidden_size
+        )));
+    }
+    let patch_size = gguf_i32(&mmproj.metadata, "clip.vision.patch_size", stream)?;
+    let image_size = gguf_i32(&mmproj.metadata, "clip.vision.image_size", stream)?;
+    if image_size != patch_size {
+        return Err(Error::UnsupportedArchitecture(format!(
+            "Inkling mmproj image_size {image_size} does not match patch_size {patch_size}"
+        )));
+    }
+    let vision_eps =
+        gguf_optional_f32(&mmproj.metadata, "clip.vision.attention.layer_norm_epsilon")?
+            .unwrap_or(default_rms_norm_eps());
+    let audio_eps = gguf_optional_f32(&mmproj.metadata, "clip.audio.attention.layer_norm_epsilon")?
+        .unwrap_or(default_rms_norm_eps());
+    args.vision_config = Some(VisionArgs {
+        vision_encoder_type: "hmlp".into(),
+        text_hidden_size: vision_hidden,
+        patch_size,
+        temporal_patch_size: 2,
+        num_channels: gguf_i32(&mmproj.metadata, "clip.vision.embedding_length", stream)?,
+        num_hidden_layers: gguf_i32(&mmproj.metadata, "clip.vision.block_count", stream)?,
+        use_vision_norm: true,
+        rms_norm_eps: vision_eps,
+        quantized_weight_configs: Some(vision_configs),
+    });
+    args.audio_config = Some(AudioArgs {
+        text_hidden_size: audio_hidden,
+        num_codebooks: gguf_i32(&mmproj.metadata, "clip.audio.num_mel_bins", stream)?,
+        codebook_size: 16,
+        bias: false,
+        use_audio_norm: true,
+        audio_mode: "dmel".into(),
+        rms_norm_eps: audio_eps,
+        quantized_weight_configs: Some(audio_configs),
+    });
+    // The released GGUF contract does not carry dedicated placeholder IDs;
+    // they are reserved padded-vocabulary slots in the text checkpoint.
+    if let Some(id) = gguf_optional_i32(model_metadata, "inkling.audio_token_id")? {
+        args.audio_token_id = u32::try_from(id).map_err(|_| {
+            Error::UnsupportedArchitecture("Inkling audio placeholder id is negative".into())
+        })?;
+    }
+    if let Some(id) = gguf_optional_i32(model_metadata, "inkling.image_token_id")? {
+        args.image_token_id = u32::try_from(id).map_err(|_| {
+            Error::UnsupportedArchitecture("Inkling image placeholder id is negative".into())
+        })?;
+    }
+    let vocab_size = args.text_config.vocab_size;
+    for (name, id) in [
+        ("audio", args.audio_token_id),
+        ("image", args.image_token_id),
+    ] {
+        if id >= vocab_size as u32 {
+            return Err(Error::UnsupportedArchitecture(format!(
+                "Inkling {name} placeholder id {id} exceeds GGUF vocabulary size {vocab_size}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn translate_mmproj_weight_name(name: &str) -> String {
+    for (source, target) in [
+        ("a.dmel.embedding", "audio.encoder"),
+        ("a.dmel.final_norm", "audio.final_norm"),
+        ("v.hmlp.final_norm", "visual.final_norm"),
+    ] {
+        if name == source || name.starts_with(&format!("{source}.")) {
+            return name.replacen(source, target, 1);
+        }
+    }
+    if let Some(rest) = name.strip_prefix("v.hmlp.") {
+        if let Some((layer, parameter)) = rest.split_once('.') {
+            if layer.parse::<usize>().is_ok() {
+                let parameter =
+                    parameter
+                        .replacen("linear", "projection", 1)
+                        .replacen("norm", "layer_norm", 1);
+                return format!("visual.layers.{layer}.{parameter}");
+            }
+        }
+    }
+    name.to_string()
 }
 
 fn args_from_gguf(
@@ -2568,7 +2833,8 @@ mod tests {
     use std::collections::HashMap;
 
     use safemlx::{
-        ops::{GgufMetadataArray, GgufMetadataValue},
+        module::ModuleParameters,
+        ops::{GgufCheckpoint, GgufMetadataArray, GgufMetadataValue},
         Device, DeviceType, ExecutionContext,
     };
     use serde_json::json;
@@ -2587,6 +2853,308 @@ mod tests {
             super::translate_gguf_weight_name("blk.4.ffn_gscale"),
             "model.layers.4.global_scale"
         );
+    }
+
+    #[test]
+    fn mmproj_names_translate_to_native_media_towers() {
+        for (source, expected) in [
+            ("a.dmel.embedding.weight", "audio.encoder.weight"),
+            ("a.dmel.embedding.scales", "audio.encoder.scales"),
+            ("a.dmel.final_norm.weight", "audio.final_norm.weight"),
+            (
+                "v.hmlp.2.linear.weight",
+                "visual.layers.2.projection.weight",
+            ),
+            ("v.hmlp.2.norm.weight", "visual.layers.2.layer_norm.weight"),
+            ("v.hmlp.final_norm.weight", "visual.final_norm.weight"),
+        ] {
+            assert_eq!(super::translate_mmproj_weight_name(source), expected);
+        }
+    }
+
+    fn tiny_gguf_metadata() -> HashMap<String, GgufMetadataValue> {
+        HashMap::from([
+            (
+                "general.architecture".into(),
+                GgufMetadataValue::String("inkling".into()),
+            ),
+            ("inkling.block_count".into(), GgufMetadataValue::Uint32(2)),
+            (
+                "inkling.embedding_length".into(),
+                GgufMetadataValue::Uint32(32),
+            ),
+            (
+                "inkling.feed_forward_length".into(),
+                GgufMetadataValue::Uint32(64),
+            ),
+            (
+                "inkling.expert_feed_forward_length".into(),
+                GgufMetadataValue::Uint32(32),
+            ),
+            (
+                "inkling.attention.head_count".into(),
+                GgufMetadataValue::Uint32(4),
+            ),
+            (
+                "inkling.attention.head_count_kv".into(),
+                GgufMetadataValue::Array(GgufMetadataArray::Uint32(vec![2, 1])),
+            ),
+            (
+                "inkling.attention.key_length".into(),
+                GgufMetadataValue::Uint32(8),
+            ),
+            (
+                "inkling.attention.sliding_window".into(),
+                GgufMetadataValue::Uint32(8),
+            ),
+            (
+                "inkling.attention.sliding_window_pattern".into(),
+                GgufMetadataValue::Array(GgufMetadataArray::Bool(vec![true, false])),
+            ),
+            (
+                "inkling.attention.layer_norm_rms_epsilon".into(),
+                GgufMetadataValue::Float32(1e-6),
+            ),
+            (
+                "inkling.context_length".into(),
+                GgufMetadataValue::Uint32(128),
+            ),
+            ("inkling.vocab_size".into(), GgufMetadataValue::Uint32(64)),
+            ("inkling.d_rel".into(), GgufMetadataValue::Uint32(4)),
+            ("inkling.rel_extent".into(), GgufMetadataValue::Uint32(16)),
+            (
+                "inkling.shortconv_kernel".into(),
+                GgufMetadataValue::Uint32(4),
+            ),
+            (
+                "inkling.dense_block_count".into(),
+                GgufMetadataValue::Uint32(1),
+            ),
+            ("inkling.expert_count".into(), GgufMetadataValue::Uint32(4)),
+            (
+                "inkling.expert_used_count".into(),
+                GgufMetadataValue::Uint32(2),
+            ),
+            (
+                "inkling.expert_shared_count".into(),
+                GgufMetadataValue::Uint32(1),
+            ),
+            (
+                "inkling.audio_token_id".into(),
+                GgufMetadataValue::Uint32(62),
+            ),
+            (
+                "inkling.image_token_id".into(),
+                GgufMetadataValue::Uint32(63),
+            ),
+        ])
+    }
+
+    fn tiny_mmproj_metadata() -> HashMap<String, GgufMetadataValue> {
+        HashMap::from([
+            (
+                "general.architecture".into(),
+                GgufMetadataValue::String("clip".into()),
+            ),
+            (
+                "clip.has_vision_encoder".into(),
+                GgufMetadataValue::Bool(true),
+            ),
+            (
+                "clip.has_audio_encoder".into(),
+                GgufMetadataValue::Bool(true),
+            ),
+            (
+                "clip.vision.projector_type".into(),
+                GgufMetadataValue::String("inkling".into()),
+            ),
+            (
+                "clip.audio.projector_type".into(),
+                GgufMetadataValue::String("inkling".into()),
+            ),
+            (
+                "clip.vision.projection_dim".into(),
+                GgufMetadataValue::Uint32(32),
+            ),
+            (
+                "clip.vision.image_size".into(),
+                GgufMetadataValue::Uint32(40),
+            ),
+            (
+                "clip.vision.patch_size".into(),
+                GgufMetadataValue::Uint32(40),
+            ),
+            (
+                "clip.vision.embedding_length".into(),
+                GgufMetadataValue::Uint32(3),
+            ),
+            (
+                "clip.vision.block_count".into(),
+                GgufMetadataValue::Uint32(4),
+            ),
+            (
+                "clip.vision.attention.layer_norm_epsilon".into(),
+                GgufMetadataValue::Float32(1e-6),
+            ),
+            (
+                "clip.audio.projection_dim".into(),
+                GgufMetadataValue::Uint32(32),
+            ),
+            (
+                "clip.audio.embedding_length".into(),
+                GgufMetadataValue::Uint32(32),
+            ),
+            (
+                "clip.audio.num_mel_bins".into(),
+                GgufMetadataValue::Uint32(80),
+            ),
+            (
+                "clip.audio.attention.layer_norm_epsilon".into(),
+                GgufMetadataValue::Float32(1e-6),
+            ),
+        ])
+    }
+
+    #[test]
+    fn mmproj_metadata_and_quantization_build_native_tower_args() {
+        let context = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        let stream = context.stream();
+        let main_arrays = HashMap::from([(
+            "token_embd.weight".into(),
+            safemlx::Array::zeros::<f32>(&[64, 32], stream).unwrap(),
+        )]);
+        let mmproj_arrays = HashMap::from([
+            (
+                "a.dmel.embedding.weight".into(),
+                safemlx::Array::zeros::<f32>(&[1280, 32], stream).unwrap(),
+            ),
+            (
+                "a.dmel.final_norm.weight".into(),
+                safemlx::Array::ones::<f32>(&[32], stream).unwrap(),
+            ),
+            (
+                "v.hmlp.0.linear.weight".into(),
+                safemlx::Array::zeros::<f32>(&[32, 32], stream).unwrap(),
+            ),
+            (
+                "v.hmlp.0.norm.weight".into(),
+                safemlx::Array::ones::<f32>(&[32], stream).unwrap(),
+            ),
+        ]);
+        let main_fixture =
+            crate::test_utils::SyntheticGguf::dense(&main_arrays, &tiny_gguf_metadata());
+        let mmproj_fixture = crate::test_utils::SyntheticGguf::with_packed_tensors(
+            &mmproj_arrays,
+            &tiny_mmproj_metadata(),
+            |name, _| {
+                matches!(name, "a.dmel.embedding.weight" | "v.hmlp.0.linear.weight")
+                    .then_some(safemlx_gguf::GgmlType::Q4_0)
+            },
+        );
+        let checkpoint = GgufCheckpoint::open(main_fixture.path()).unwrap();
+        let mmproj_checkpoint = GgufCheckpoint::open(mmproj_fixture.path()).unwrap();
+        let mmproj = super::InklingMmprojGguf {
+            metadata: tiny_mmproj_metadata(),
+            checkpoint: mmproj_checkpoint,
+        };
+        let prepared = super::prepare_gguf_checkpoint_with_mmproj(
+            &checkpoint,
+            &tiny_gguf_metadata(),
+            Some(&mmproj),
+            stream,
+        )
+        .unwrap();
+        let audio = prepared.args.audio_config.unwrap();
+        let vision = prepared.args.vision_config.unwrap();
+        assert_eq!(audio.num_codebooks, 80);
+        assert_eq!(audio.codebook_size, 16);
+        assert_eq!(vision.patch_size, 40);
+        assert_eq!(vision.temporal_patch_size, 2);
+        assert_eq!(prepared.args.audio_token_id, 62);
+        assert_eq!(prepared.args.image_token_id, 63);
+        let audio_quantization = audio
+            .quantized_weight_configs
+            .as_ref()
+            .and_then(|configs| configs.get("audio.encoder.weight"))
+            .copied()
+            .unwrap();
+        let vision_quantization = vision
+            .quantized_weight_configs
+            .as_ref()
+            .and_then(|configs| configs.get("visual.layers.0.projection.weight"))
+            .copied()
+            .unwrap();
+        let mut audio_model = super::AudioModel::new(&audio, stream).unwrap();
+        let mut vision_layer = super::VisionLayer::new(
+            (32, 32, 1, 1),
+            true,
+            1e-6,
+            Some(vision_quantization),
+            stream,
+        )
+        .unwrap();
+        let audio_parameters = audio_model.parameters().flatten();
+        let vision_parameters = vision_layer.parameters().flatten();
+        assert!(audio_parameters.contains_key("encoder.inner.weight"));
+        assert!(audio_parameters.contains_key("encoder.scales"));
+        assert!(vision_parameters.contains_key("projection.inner.weight"));
+        assert!(vision_parameters.contains_key("projection.scales"));
+        assert_eq!(
+            audio.weight_quantization_for("audio.encoder.weight"),
+            Some(audio_quantization)
+        );
+        let config = crate::runtime::checkpoint::load::StrictLoadConfig::default();
+        let mut audio_report = crate::runtime::checkpoint::load::StrictLoadReport::default();
+        let mut vision_report = crate::runtime::checkpoint::load::StrictLoadReport::default();
+        let mut materializer = mmproj.checkpoint.materializer();
+        for tensor in mmproj.checkpoint.catalog().tensors() {
+            let physical = &tensor.descriptor().name;
+            for (name, value) in materializer
+                .converted_tensor(physical)
+                .unwrap()
+                .into_arrays()
+            {
+                let translated = super::translate_mmproj_weight_name(&name);
+                if let Some(name) = translated.strip_prefix("audio.") {
+                    crate::runtime::checkpoint::load::load_named_array_strict(
+                        &mut audio_model,
+                        name.into(),
+                        value,
+                        None,
+                        &config,
+                        &mut audio_report,
+                    )
+                    .unwrap();
+                } else if let Some(name) = translated.strip_prefix("visual.layers.0.") {
+                    crate::runtime::checkpoint::load::load_named_array_strict(
+                        &mut vision_layer,
+                        name.into(),
+                        value,
+                        None,
+                        &config,
+                        &mut vision_report,
+                    )
+                    .unwrap();
+                }
+            }
+        }
+        audio_report.finish(&audio_model, &config).unwrap();
+        vision_report.finish(&vision_layer, &config).unwrap();
+
+        let store = crate::architectures::inkling::layerwise::inkling_gguf_store(
+            &checkpoint,
+            Some(&mmproj),
+            2,
+        )
+        .unwrap();
+        let keys = store.keys();
+        for expected in [
+            "model.embed_tokens.weight",
+            "audio.encoder.weight",
+            "visual.layers.0.projection.weight",
+        ] {
+            assert!(keys.iter().any(|key| key == expected), "missing {expected}");
+        }
     }
 
     #[test]

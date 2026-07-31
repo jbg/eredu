@@ -2264,6 +2264,7 @@ fn load_expert_parallel_model_impl(
         };
         return load_gguf_ep(
             &architecture,
+            model_dir,
             &checkpoint,
             metadata,
             topology,
@@ -2992,6 +2993,7 @@ fn load_kimi_linear_ep(
 #[allow(clippy::too_many_arguments)]
 fn load_gguf_ep(
     architecture: &str,
+    gguf_file: &Path,
     checkpoint: &GgufCheckpoint,
     metadata: std::collections::HashMap<String, GgufMetadataValue>,
     topology: ParallelTopology,
@@ -3001,6 +3003,11 @@ fn load_gguf_ep(
     weights_stream: &Stream,
 ) -> Result<ExpertParallelModel, Error> {
     crate::api::validate_gguf_quantization_source(checkpoint, &metadata, options.quantization)?;
+    let inkling_mmproj = if architecture == "inkling" {
+        inkling::open_sibling_mmproj(gguf_file)?
+    } else {
+        None
+    };
     if let WeightResidency::SparseExpertCache(expert_options) = options.weight_residency {
         if options.quantization.is_some() {
             return Err(Error::Quantization(
@@ -3012,6 +3019,7 @@ fn load_gguf_ep(
             architecture,
             checkpoint,
             &metadata,
+            inkling_mmproj.as_ref(),
             topology,
             assignment,
             expert_options,
@@ -3025,6 +3033,7 @@ fn load_gguf_ep(
             architecture,
             checkpoint,
             &metadata,
+            inkling_mmproj.as_ref(),
             topology,
             assignment,
             streamed,
@@ -3150,6 +3159,7 @@ fn load_streamed_gguf_ep(
     architecture: &str,
     checkpoint: &GgufCheckpoint,
     metadata: &std::collections::HashMap<String, GgufMetadataValue>,
+    inkling_mmproj: Option<&inkling::InklingMmprojGguf>,
     topology: ParallelTopology,
     assignment: Option<ExpertAssignment>,
     streamed: crate::runtime::residency::expert_cache::SparseExpertDenseStreamLoadOptions,
@@ -3342,20 +3352,23 @@ fn load_streamed_gguf_ep(
             )
         }
         "inkling" => {
-            let prepared =
-                inkling::prepare_gguf_checkpoint(checkpoint, metadata, weights_stream)?;
+            let prepared = inkling::prepare_gguf_checkpoint_with_mmproj(
+                checkpoint,
+                metadata,
+                inkling_mmproj,
+                weights_stream,
+            )?;
             let args = prepared.args;
             let assignment = resolve_model_assignment(
                 assignment,
                 args.text_config.n_routed_experts as usize,
                 topology,
             )?;
-            let store: std::sync::Arc<dyn WeightStore + Send + Sync> =
-                std::sync::Arc::new(GgufWeightStore::new_with_max_mapped_shards(
-                    checkpoint.clone(),
-                    inkling::translate_gguf_weight_name,
-                    max_mapped_shards,
-                )?);
+            let store = crate::architectures::inkling::layerwise::inkling_gguf_store(
+                checkpoint,
+                inkling_mmproj,
+                max_mapped_shards,
+            )?;
             let model = crate::architectures::inkling::layerwise::
                 load_inkling_sparse_ep_base_with_store(
                     store.clone(),
@@ -3522,6 +3535,7 @@ fn load_sparse_gguf_ep(
     architecture: &str,
     checkpoint: &GgufCheckpoint,
     metadata: &std::collections::HashMap<String, GgufMetadataValue>,
+    inkling_mmproj: Option<&inkling::InklingMmprojGguf>,
     topology: ParallelTopology,
     assignment: Option<ExpertAssignment>,
     expert_options: ExpertCacheLoadOptions,
@@ -3567,20 +3581,23 @@ fn load_sparse_gguf_ep(
             )
         }
         "inkling" => {
-            let prepared =
-                inkling::prepare_gguf_checkpoint(checkpoint, metadata, weights_stream)?;
+            let prepared = inkling::prepare_gguf_checkpoint_with_mmproj(
+                checkpoint,
+                metadata,
+                inkling_mmproj,
+                weights_stream,
+            )?;
             let args = prepared.args;
             let assignment = resolve_model_assignment(
                 assignment,
                 args.text_config.n_routed_experts as usize,
                 topology,
             )?;
-            let store: std::sync::Arc<dyn WeightStore + Send + Sync> =
-                std::sync::Arc::new(GgufWeightStore::new_with_max_mapped_shards(
-                    checkpoint.clone(),
-                    inkling::translate_gguf_weight_name,
-                    expert_options.non_expert.max_mapped_shards,
-                )?);
+            let store = crate::architectures::inkling::layerwise::inkling_gguf_store(
+                checkpoint,
+                inkling_mmproj,
+                expert_options.non_expert.max_mapped_shards,
+            )?;
             let model = crate::architectures::inkling::layerwise::
                 load_inkling_sparse_ep_base_with_store(
                     store.clone(),

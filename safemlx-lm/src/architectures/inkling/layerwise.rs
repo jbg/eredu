@@ -243,17 +243,18 @@ pub fn load_inkling_layerwise_model(
 pub(crate) fn load_inkling_gguf_layerwise_model(
     checkpoint: &GgufCheckpoint,
     metadata: &HashMap<String, GgufMetadataValue>,
+    mmproj: Option<&resident::InklingMmprojGguf>,
     residency: WeightResidency,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<(InklingLayerwiseModel, Vec<u32>), Error> {
-    let prepared = resident::prepare_gguf_checkpoint(checkpoint, metadata, weights_stream)?;
-    let store: Arc<dyn WeightStore + Send + Sync> =
-        Arc::new(GgufWeightStore::new_with_max_mapped_shards(
-            checkpoint.clone(),
-            resident::translate_gguf_weight_name,
-            residency.max_mapped_shards(),
-        )?);
+    let prepared = resident::prepare_gguf_checkpoint_with_mmproj(
+        checkpoint,
+        metadata,
+        mmproj,
+        weights_stream,
+    )?;
+    let store = inkling_gguf_store(checkpoint, mmproj, residency.max_mapped_shards())?;
     let args = prepared.args;
     let execution = match residency {
         WeightResidency::LayerwiseHost(options) => load_general_layerwise_model_with_store(
@@ -303,6 +304,23 @@ pub(crate) fn load_inkling_gguf_layerwise_model(
         }
     };
     Ok((InklingLayerwiseModel { execution }, prepared.eos_token_ids))
+}
+
+pub(crate) fn inkling_gguf_store(
+    checkpoint: &GgufCheckpoint,
+    mmproj: Option<&resident::InklingMmprojGguf>,
+    max_mapped_shards: usize,
+) -> Result<Arc<dyn WeightStore + Send + Sync>, Error> {
+    let mut builder = GgufWeightStore::builder()
+        .max_cached_readers(max_mapped_shards)?
+        .add_checkpoint(checkpoint.clone(), resident::translate_gguf_weight_name)?;
+    if let Some(mmproj) = mmproj {
+        builder = builder.add_checkpoint(
+            mmproj.checkpoint.clone(),
+            resident::translate_mmproj_weight_name,
+        )?;
+    }
+    Ok(Arc::new(builder.build()?))
 }
 
 fn load_inkling_gguf_sparse_with_store(
@@ -506,6 +524,16 @@ impl InklingLayerwiseAdapter {
         let parameters = module.parameters().flatten();
         for (local_name, parameter) in &parameters {
             let destination = format!("{prefix}.{local_name}");
+            if let Some(inner) = destination.strip_suffix(".inner.weight") {
+                let checkpoint_name = format!("{inner}.weight");
+                if direct.contains(&checkpoint_name) {
+                    recipes.insert(
+                        local_name.to_string(),
+                        DerivedWeightRecipe::source(checkpoint_name, TensorSelection::Full),
+                    );
+                    continue;
+                }
+            }
             if direct.contains(&destination) {
                 if destination.contains("_sconv.weight")
                     && store.metadata(&destination)?.shape.len() == 2
@@ -1137,12 +1165,10 @@ impl GeneralLayerwiseModelAdapter for InklingLayerwiseAdapter {
             ];
             let (input_dim, output_dim, t_fold, hw_fold) = specs[index];
             Ok(InklingLayer::Vision(VisionLayer::new(
-                input_dim,
-                output_dim,
-                t_fold,
-                hw_fold,
+                (input_dim, output_dim, t_fold, hw_fold),
                 index + 1 != specs.len(),
                 args.rms_norm_eps,
+                args.weight_quantization_for(&format!("visual.layers.{index}.projection.weight")),
                 stream,
             )?))
         } else {

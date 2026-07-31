@@ -1182,41 +1182,12 @@ pub(crate) fn translate_qwen3_vl_mmproj_name(name: &str, deepstack_layers: &[i32
 
 /// Finds the dense sibling mmproj used by the single-path model loader.
 pub(crate) fn find_qwen3_vl_mmproj(gguf_file: &Path) -> Result<PathBuf, Error> {
-    let parent = gguf_file.parent().unwrap_or_else(|| Path::new("."));
-    let mut candidates = std::fs::read_dir(parent)?
-        .filter_map(Result::ok)
-        .map(|entry| entry.path())
-        .filter(|path| {
-            let name = path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or_default()
-                .to_ascii_lowercase();
-            name.starts_with("mmproj") && name.ends_with(".gguf")
-        })
-        .collect::<Vec<_>>();
-    candidates.sort();
-    let dense = candidates
-        .iter()
-        .filter(|path| {
-            let name = path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or_default()
-                .to_ascii_lowercase();
-            name.contains("f16") || name.contains("bf16") || name.contains("f32")
-        })
-        .cloned()
-        .collect::<Vec<_>>();
-    match (dense.as_slice(), candidates.as_slice()) {
-        ([path], _) => Ok(path.clone()),
-        ([], [path]) => Ok(path.clone()),
-        _ => Err(Error::UnsupportedArchitecture(format!(
-            "qwen3vl GGUF requires one dense sibling mmproj file; found {} candidates in {}",
-            candidates.len(),
-            parent.display()
-        ))),
-    }
+    crate::runtime::checkpoint::gguf::find_sibling_mmproj(gguf_file, "qwen3vl")?.ok_or_else(|| {
+        Error::UnsupportedArchitecture(format!(
+            "qwen3vl GGUF requires a nearby mmproj file relative to {}",
+            gguf_file.display()
+        ))
+    })
 }
 
 impl CausalLm<Cache> for Model {
@@ -1462,6 +1433,11 @@ mod tests {
         std::fs::File::create(&dense).unwrap();
         std::fs::File::create(&quantized).unwrap();
         assert_eq!(super::find_qwen3_vl_mmproj(&model).unwrap(), dense);
+        let quantization_dir = dir.join("Q4_K_M");
+        std::fs::create_dir(&quantization_dir).unwrap();
+        let sharded_model = quantization_dir.join("model-00001-of-00002.gguf");
+        std::fs::File::create(&sharded_model).unwrap();
+        assert_eq!(super::find_qwen3_vl_mmproj(&sharded_model).unwrap(), dense);
         std::fs::remove_dir_all(dir).unwrap();
     }
 

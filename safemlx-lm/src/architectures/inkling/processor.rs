@@ -2,8 +2,11 @@
 
 use std::path::Path;
 
+#[cfg(feature = "media-processing")]
+use std::collections::HashMap;
+
 #[cfg(any(feature = "image-processing", feature = "audio-processing"))]
-use safemlx::Array;
+use safemlx::{ops::GgufMetadataValue, Array};
 use serde::Deserialize;
 
 use crate::error::Error;
@@ -79,6 +82,30 @@ impl InklingProcessor {
             #[cfg(feature = "audio-processing")]
             dmel_max: audio.dmel_max_value,
         }))
+    }
+
+    #[cfg(feature = "media-processing")]
+    pub(crate) fn from_gguf(
+        metadata: &HashMap<String, safemlx::ops::GgufMetadataValue>,
+    ) -> Result<Self, Error> {
+        #[cfg(not(any(feature = "image-processing", feature = "audio-processing")))]
+        let _ = metadata;
+        Ok(Self {
+            #[cfg(feature = "image-processing")]
+            image_bos_token_id: gguf_token_id(metadata, "<|content_image|>", default_image_bos())?,
+            #[cfg(feature = "audio-processing")]
+            audio_bos_token_id: gguf_token_id(
+                metadata,
+                "<|content_audio_input|>",
+                default_audio_bos(),
+            )?,
+            #[cfg(feature = "audio-processing")]
+            dmel_bins: default_dmel_bins(),
+            #[cfg(feature = "audio-processing")]
+            dmel_min: default_dmel_min(),
+            #[cfg(feature = "audio-processing")]
+            dmel_max: default_dmel_max(),
+        })
     }
 
     pub(crate) fn prepare_input(
@@ -162,6 +189,26 @@ impl InklingProcessor {
             OwnedInputMetadata::AudioMask(mask),
         ))
     }
+}
+
+#[cfg(any(feature = "image-processing", feature = "audio-processing"))]
+fn gguf_token_id(
+    metadata: &HashMap<String, GgufMetadataValue>,
+    token: &str,
+    fallback: u32,
+) -> Result<u32, Error> {
+    let Some(tokens) = metadata
+        .get("tokenizer.ggml.tokens")
+        .and_then(GgufMetadataValue::as_strings)
+    else {
+        return Ok(fallback);
+    };
+    let Some(index) = tokens.iter().position(|candidate| candidate == token) else {
+        return Err(Error::Processor(format!(
+            "Inkling GGUF tokenizer is missing media marker {token:?}"
+        )));
+    };
+    u32::try_from(index).map_err(|_| Error::Processor("Inkling media token id exceeds u32".into()))
 }
 
 #[cfg(feature = "image-processing")]
@@ -319,6 +366,27 @@ fn slaney_mel_filters(fft: usize, sample_rate: usize, mel_bins: usize) -> Vec<f3
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "media-processing")]
+    #[test]
+    fn gguf_processor_resolves_media_markers_from_embedded_tokenizer() {
+        use std::collections::HashMap;
+
+        use safemlx::ops::{GgufMetadataArray, GgufMetadataValue};
+
+        let metadata = HashMap::from([(
+            "tokenizer.ggml.tokens".into(),
+            GgufMetadataValue::Array(GgufMetadataArray::String(vec![
+                "<|content_audio_input|>".into(),
+                "<|content_image|>".into(),
+            ])),
+        )]);
+        let processor = super::InklingProcessor::from_gguf(&metadata).unwrap();
+        #[cfg(feature = "image-processing")]
+        assert_eq!(processor.image_bos_token_id, 1);
+        #[cfg(feature = "audio-processing")]
+        assert_eq!(processor.audio_bos_token_id, 0);
+    }
+
     #[cfg(feature = "image-processing")]
     #[test]
     fn exact_patch_width_keeps_reference_extra_column() {

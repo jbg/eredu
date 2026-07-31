@@ -1331,6 +1331,8 @@ impl LoadedModel {
                 eos_token_ids,
                 chat_template,
                 tokenizer,
+                #[cfg(feature = "media-processing")]
+                processor,
             } = load_gguf_model_data(model_dir, true, options, stream, weights_stream)?;
             let GgufTokenizer {
                 tokenizer,
@@ -1345,7 +1347,7 @@ impl LoadedModel {
             return Ok(Self {
                 model,
                 #[cfg(feature = "media-processing")]
-                processor: None,
+                processor,
                 tokenizer,
                 tokenizer_fingerprint,
                 chat_template,
@@ -1768,6 +1770,8 @@ pub(super) fn final_token_logits(logits: &Array, stream: &Stream) -> Result<Arra
 
 pub(super) struct LoadedGgufModel {
     pub(super) model: Model,
+    #[cfg(feature = "media-processing")]
+    processor: Option<ModelProcessor>,
     eos_token_ids: Vec<u32>,
     chat_template: Option<ModelChatTemplate>,
     tokenizer: Option<GgufTokenizer>,
@@ -1820,6 +1824,9 @@ pub(super) fn load_gguf_model_data(
                 .into(),
         ));
     }
+
+    #[cfg(feature = "media-processing")]
+    let mut processor = None;
 
     let (model, architecture_eos_token_ids) = match architecture.as_str() {
         "kimi-linear" => {
@@ -1894,10 +1901,16 @@ pub(super) fn load_gguf_model_data(
                         .into(),
                 ));
             }
+            let mmproj = inkling::open_sibling_mmproj(gguf_file)?;
+            #[cfg(feature = "media-processing")]
+            if mmproj.is_some() {
+                processor = Some(ModelProcessor::load_inkling_gguf(&metadata)?);
+            }
             if matches!(options.weight_residency, WeightResidency::FullyResident) {
-                let loaded = inkling::load_gguf_checkpoint(
+                let loaded = inkling::load_gguf_checkpoint_with_mmproj(
                     &checkpoint,
                     metadata,
+                    mmproj.as_ref(),
                     stream,
                     weights_stream,
                 )?;
@@ -1906,6 +1919,7 @@ pub(super) fn load_gguf_model_data(
                 let (loaded, eos_token_ids) = crate::architectures::inkling::layerwise::load_inkling_gguf_layerwise_model(
                     &checkpoint,
                     &metadata,
+                    mmproj.as_ref(),
                     options.weight_residency,
                     stream,
                     weights_stream,
@@ -2098,6 +2112,8 @@ pub(super) fn load_gguf_model_data(
     ]);
     Ok(LoadedGgufModel {
         model,
+        #[cfg(feature = "media-processing")]
+        processor,
         eos_token_ids,
         chat_template,
         tokenizer,

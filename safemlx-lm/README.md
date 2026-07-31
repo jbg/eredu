@@ -440,9 +440,9 @@ without expanding matrix weights to float16.
 Q5_0 and Q5_1 tensors are losslessly repacked into MLX's five-bit affine
 layout; unsupported GGUF tensor types return an error. Model dispatch uses
 `general.architecture`; the current GGUF adapters support text-only `deepseek2`,
-`gemma4`, `gpt-oss`, `inkling`, `kimi-linear`, `llama`, `mistral`, `lfm2`, `lfm2moe`, `nemotron_h`,
+`gemma4`, `gpt-oss`, `kimi-linear`, `llama`, `mistral`, `lfm2`, `lfm2moe`, `nemotron_h`,
 `nemotron_h_moe`, `qwen3`, `qwen3moe`, dense `qwen35`, and `qwen35moe`
-architectures, plus `qwen3next` and dense `qwen3vl` with its separate vision projector. For
+architectures, plus multimodal `inkling`, `qwen3next`, and dense `qwen3vl` with separate projectors. For
 Qwen3-VL, put the llama.cpp-style dense F16/BF16/F32
 `mmproj-*.gguf` next to the language-model GGUF. The single-path loaders prefer
 the unique dense projector automatically; callers that need an explicit pair
@@ -476,8 +476,12 @@ interleaved expert layout without dequantizing; dense projections retain their
 per-tensor GGUF formats. Inkling GGUF follows the draft llama.cpp `inkling`
 text contract, including relative-position attention, four short-convolution
 streams, split dense/routed/shared SwiGLU tensors, padded-vocabulary masking,
-and the `inkling` o200k-family tokenizer pre-type. Its audio and vision towers
-remain in the separate multimodal projector rather than the text GGUF.
+and the `inkling` o200k-family tokenizer pre-type. A sibling llama.cpp-style
+`mmproj-*.gguf` supplies the combined hMLP vision and dMel audio towers. It is
+discovered automatically or can be passed explicitly to
+`architectures::inkling::model::load_gguf_with_mmproj`; dense and supported
+checkpoint-native packed projector matrices work with resident, bounded,
+sparse-expert-cache, streamed-dense, and streamed expert-parallel execution.
 
 GGUF IQ tensors are also model-loadable: IQ2_XXS, IQ2_XS, IQ3_XXS, IQ1_S,
 IQ4_NL, IQ3_S, IQ2_S, IQ4_XS, and IQ1_M. Their nonlinear codebooks cannot be
@@ -814,7 +818,7 @@ weights.
 | Gemma 4 dense / MoE | yes | MLX affine/MXFP4 and packed GGUF affine | yes / yes | `LoadedModel` | Dense plus routed gated-GELU branches share resident, layerwise, and external-MTP execution; specialized vision/audio components remain dense |
 | Gemma 4 assistant | yes | MLX affine/MXFP4 and uniform packed GGUF affine | yes / yes | `LoadedDrafter` with `ModelLoadOptions` | Transformer/projection/head targets; ordered masked-embedding heads return a capability error |
 | GPT-OSS | dense attention, MXFP4 experts | checkpoint-native MXFP4 experts plus `gpt-oss` GGUF | no / yes | `LoadedModel` | Canonical GGUF type-39 experts stay packed; mixed dense projections use their exact GGUF formats |
-| Inkling | yes | packed GGUF affine/IQ/MXFP4 | GGUF requantization unavailable | `LoadedModel` | `inkling` GGUF is text-only; safetensors retains native hMLP/dMel towers, while both paths use local/global relative-bias attention and routed plus shared experts |
+| Inkling | yes | packed GGUF affine/IQ/MXFP4 | GGUF requantization unavailable | `LoadedModel` | `inkling` text GGUF plus sibling combined hMLP/dMel mmproj; local/global relative-bias attention and routed plus shared experts work across resident and streamed policies |
 | Nemotron-H | yes | no | capability error | `LoadedModel` (dense) | Packed rank-3 routed experts require an affine grouped-matmul kernel |
 | Qwen3.5/3.6-MoE | yes | block FP8, MLX affine/MXFP4 | yes / yes, from dense checkpoints | `LoadedModel` | Rank-3 expert banks are quantized row-wise and executed with routed `gather_qmm`; native FP8 checkpoints are never implicitly transcoded |
 | Qwen3-Next | yes | native block FP8, MLX affine/MXFP4 | yes / yes, from dense checkpoints | `LoadedModel` | Official dynamic E4M3 128 x 128 checkpoints work with resident, layerwise, sparse expert-cache, and expert-parallel policies; fused weights/scales are split while streaming and native FP8 is never implicitly transcoded |

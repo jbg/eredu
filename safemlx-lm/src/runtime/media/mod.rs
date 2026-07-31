@@ -309,6 +309,15 @@ impl ModelProcessor {
         })
     }
 
+    #[cfg(feature = "media-processing")]
+    pub(crate) fn load_inkling_gguf(
+        metadata: &std::collections::HashMap<String, safemlx::ops::GgufMetadataValue>,
+    ) -> Result<Self, Error> {
+        Ok(Self {
+            kind: ProcessorKind::Inkling(inkling::InklingProcessor::from_gguf(metadata)?),
+        })
+    }
+
     #[cfg(feature = "image-processing")]
     pub(crate) fn load_qwen(model_dir: &Path) -> Result<Option<Self>, Error> {
         qwen::QwenProcessor::load(model_dir).map(|processor| {
