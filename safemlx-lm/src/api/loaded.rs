@@ -13,6 +13,7 @@ pub struct LoadedModel {
     #[cfg(feature = "media-processing")]
     pub(super) processor: Option<ModelProcessor>,
     pub(super) tokenizer: ChatTokenizer,
+    pub(super) tokenizer_fingerprint: [u8; 32],
     pub(super) chat_template: Option<ModelChatTemplate>,
     pub(super) model_id: String,
     pub(super) eos_token_ids: Vec<u32>,
@@ -261,6 +262,36 @@ where
 }
 
 impl LoadedModel {
+    /// Validates the observable target/assistant contract used by external MTP.
+    ///
+    /// Repository names and revisions are deliberately not compatibility keys.
+    /// The validation covers the target architecture, shared tensor geometry,
+    /// and the token-id vocabulary mapping when the drafter carries tokenizer
+    /// metadata.
+    pub fn validate_drafter_compatibility(&self, drafter: &LoadedDrafter) -> Result<(), Error> {
+        let assistant = drafter.gemma4();
+        match &self.model {
+            Model::Gemma4(target) => validate_gemma4_drafter(&target.args, assistant)?,
+            Model::Gemma4Layerwise(target) => validate_gemma4_drafter(target.args(), assistant)?,
+            model => {
+                return Err(Error::UnsupportedArchitecture(format!(
+                    "external MTP is unavailable for model type {} ({:?})",
+                    model.model_type(),
+                    model.mtp_capability()
+                )))
+            }
+        }
+        if let Some(draft_fingerprint) = drafter.tokenizer_fingerprint() {
+            if draft_fingerprint != self.tokenizer_fingerprint {
+                return Err(Error::UnsupportedArchitecture(
+                    "Gemma 4 assistant token-id vocabulary mapping does not match the target"
+                        .into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
     fn prepare_chat_model_input<'a>(
         &self,
         input: PreparedChatInput<'a>,
@@ -370,6 +401,7 @@ impl LoadedModel {
             streams,
             scheduler,
         } = request;
+        self.validate_drafter_compatibility(drafter)?;
         let prepared_lanes = self.prepare_chat_mtp_batch_lanes(lanes, streams.target())?;
 
         let assistant = drafter.gemma4_mut();
@@ -585,6 +617,7 @@ impl LoadedModel {
             streams,
             on_event,
         } = request;
+        self.validate_drafter_compatibility(drafter)?;
         let prepared_chat = input.prepared_chat();
         let semantic_plan = match prepared_chat.semantic_support() {
             SemanticSupport::Supported => prepared_chat
@@ -874,6 +907,8 @@ impl LoadedModel {
         S: SpeculativeSampler + Clone,
         F: FnMut(u32) -> Result<(), Exception>,
     {
+        self.validate_drafter_compatibility(drafter)
+            .map_err(|error| Exception::custom(error.to_string()))?;
         let mut config = config.clone();
         if config.eos_token_ids.is_empty() {
             config.eos_token_ids.clone_from(&self.eos_token_ids);
@@ -1056,6 +1091,8 @@ impl LoadedModel {
         sampler: &S,
         streams: MtpExecutionStreams<'_>,
     ) -> Result<MtpBatchOutput, Exception> {
+        self.validate_drafter_compatibility(drafter)
+            .map_err(|error| Exception::custom(error.to_string()))?;
         if prompt_tokens.ndim() != 2 || prompt_tokens.dim(1) == 0 {
             return Err(Exception::custom(format!(
                 "MTP text batch must be shaped [batch, nonzero sequence], got {:?}",
@@ -1301,6 +1338,7 @@ impl LoadedModel {
             } = tokenizer.expect("GGUF tokenizer requested by the combined loader");
             let mut tokenizer = ChatTokenizer::from_tokenizer(tokenizer);
             tokenizer.set_template_kwargs(template_kwargs);
+            let tokenizer_fingerprint = crate::api::tokenizer_vocabulary_fingerprint(&tokenizer);
             let chat_template = chat_template.or(load_chat_template(sidecar_dir)?);
             let constraint_compiler =
                 ConstraintCompiler::from_tokenizer(&tokenizer, &eos_token_ids);
@@ -1309,6 +1347,7 @@ impl LoadedModel {
                 #[cfg(feature = "media-processing")]
                 processor: None,
                 tokenizer,
+                tokenizer_fingerprint,
                 chat_template,
                 model_id: model_dir.display().to_string(),
                 eos_token_ids,
@@ -1321,6 +1360,7 @@ impl LoadedModel {
         let kind = ModelKind::from_model_type(&model_type)?;
         let mut tokenizer = ChatTokenizer::from_tokenizer(load_tokenizer(model_dir)?);
         tokenizer.set_template_kwargs(load_tokenizer_template_kwargs(model_dir)?);
+        let tokenizer_fingerprint = crate::api::tokenizer_vocabulary_fingerprint(&tokenizer);
         let constraint_compiler = ConstraintCompiler::from_tokenizer(&tokenizer, &eos_token_ids);
         let chat_template = load_chat_template(model_dir)?;
         #[cfg(feature = "media-processing")]
@@ -1339,6 +1379,7 @@ impl LoadedModel {
             #[cfg(feature = "media-processing")]
             processor,
             tokenizer,
+            tokenizer_fingerprint,
             chat_template,
             model_id: model_type,
             eos_token_ids,

@@ -566,11 +566,13 @@ fn prepared_chat_embedded_mtp_batch_dispatches_qwen_without_a_drafter() {
     }))
     .unwrap();
     let qwen = super::qwen3_5_moe::Model::new(args, None, None, None, stream).unwrap();
+    let tokenizer_fingerprint = super::tokenizer_vocabulary_fingerprint(&tokenizer);
     let mut model = LoadedModel {
         model: super::Model::Qwen35Moe(qwen),
         #[cfg(feature = "media-processing")]
         processor: None,
         tokenizer,
+        tokenizer_fingerprint,
         chat_template: None,
         model_id: "prepared-embedded-batch-test".into(),
         eos_token_ids: vec![2],

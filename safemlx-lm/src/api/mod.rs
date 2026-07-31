@@ -731,6 +731,7 @@ fn load_model_for_kind(
 }
 
 mod tokenizer;
+pub(crate) use tokenizer::tokenizer_vocabulary_fingerprint;
 pub use tokenizer::{chat_template_kwargs, load_tokenizer};
 use tokenizer::{
     effective_model_type, gguf_sidecar_dir, is_gguf_file, load_chat_template,

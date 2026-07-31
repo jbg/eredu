@@ -30,6 +30,7 @@ use crate::{
 /// Architecture-dispatched draft model loaded independently of a target.
 pub struct LoadedDrafter {
     model: DrafterModel,
+    tokenizer_fingerprint: Option<[u8; 32]>,
 }
 
 enum DrafterModel {
@@ -163,6 +164,25 @@ impl LoadedDrafter {
         weights_stream: &Stream,
     ) -> Result<Self, Error> {
         let source = source.as_ref();
+        let tokenizer_fingerprint = if source
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("gguf"))
+        {
+            Some(crate::api::tokenizer_vocabulary_fingerprint(
+                &crate::api::load_tokenizer(source)?,
+            ))
+        } else {
+            let tokenizer_path = source.join("tokenizer.json");
+            tokenizer_path
+                .exists()
+                .then(|| {
+                    tokenizers::Tokenizer::from_file(tokenizer_path)
+                        .map(safemlx_lm_utils::tokenizer::Tokenizer::from_tokenizer)
+                        .map(|tokenizer| crate::api::tokenizer_vocabulary_fingerprint(&tokenizer))
+                })
+                .transpose()?
+        };
         if source
             .extension()
             .and_then(|extension| extension.to_str())
@@ -175,6 +195,7 @@ impl LoadedDrafter {
                     stream,
                     weights_stream,
                 )?),
+                tokenizer_fingerprint,
             });
         }
         Ok(Self {
@@ -184,13 +205,24 @@ impl LoadedDrafter {
                 stream,
                 weights_stream,
             )?),
+            tokenizer_fingerprint,
         })
+    }
+
+    pub(crate) fn gemma4(&self) -> &Gemma4AssistantDraftModel {
+        match &self.model {
+            DrafterModel::Gemma4(model) => model,
+        }
     }
 
     pub(crate) fn gemma4_mut(&mut self) -> &mut Gemma4AssistantDraftModel {
         match &mut self.model {
             DrafterModel::Gemma4(model) => model,
         }
+    }
+
+    pub(crate) fn tokenizer_fingerprint(&self) -> Option<[u8; 32]> {
+        self.tokenizer_fingerprint
     }
 }
 

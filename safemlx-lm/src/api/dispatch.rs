@@ -1283,6 +1283,77 @@ pub(super) fn validate_gemma4_drafter(
             assistant.config.text_config.vocab_size, target.vocab_size
         )));
     }
+    let draft = &assistant.config.text_config;
+    for layer_type in [
+        gemma4::LayerType::SlidingAttention,
+        gemma4::LayerType::FullAttention,
+    ] {
+        let draft_uses_layer = (0..draft.num_hidden_layers.max(0) as usize)
+            .any(|index| draft.layer_type(index) == layer_type);
+        if !draft_uses_layer {
+            continue;
+        }
+        let target_uses_layer = (0..target.num_hidden_layers.max(0) as usize)
+            .any(|index| target.layer_type(index) == layer_type);
+        if !target_uses_layer {
+            return Err(Exception::custom(format!(
+                "Gemma 4 assistant requires {layer_type:?} shared KV state, but the target has no such attention layer"
+            )));
+        }
+
+        let target_kv_heads = if layer_type == gemma4::LayerType::FullAttention {
+            target
+                .num_global_key_value_heads
+                .unwrap_or(target.num_key_value_heads)
+        } else {
+            target.num_key_value_heads
+        };
+        let draft_kv_heads = if layer_type == gemma4::LayerType::FullAttention {
+            draft
+                .num_global_key_value_heads
+                .unwrap_or(draft.num_key_value_heads)
+        } else {
+            draft.num_key_value_heads
+        };
+        if draft_kv_heads != target_kv_heads {
+            return Err(Exception::custom(format!(
+                "Gemma 4 assistant {layer_type:?} KV-head count {draft_kv_heads} does not match target count {target_kv_heads}"
+            )));
+        }
+
+        let target_head_dim = if layer_type == gemma4::LayerType::FullAttention {
+            target.global_head_dim.unwrap_or(target.head_dim)
+        } else {
+            target.head_dim
+        };
+        let draft_head_dim = if layer_type == gemma4::LayerType::FullAttention {
+            draft.global_head_dim.unwrap_or(draft.head_dim)
+        } else {
+            draft.head_dim
+        };
+        if draft_head_dim != target_head_dim {
+            return Err(Exception::custom(format!(
+                "Gemma 4 assistant {layer_type:?} head dimension {draft_head_dim} does not match target dimension {target_head_dim}"
+            )));
+        }
+
+        let target_rope_theta = target.rope_theta_for_layer(layer_type);
+        let draft_rope_theta = draft.rope_theta_for_layer(layer_type);
+        if draft_rope_theta.to_bits() != target_rope_theta.to_bits() {
+            return Err(Exception::custom(format!(
+                "Gemma 4 assistant {layer_type:?} RoPE base {draft_rope_theta} does not match target base {target_rope_theta}"
+            )));
+        }
+    }
+    if (0..draft.num_hidden_layers.max(0) as usize)
+        .any(|index| draft.layer_type(index) == gemma4::LayerType::SlidingAttention)
+        && draft.sliding_window != target.sliding_window
+    {
+        return Err(Exception::custom(format!(
+            "Gemma 4 assistant sliding-window configuration {:?} does not match target configuration {:?}",
+            draft.sliding_window, target.sliding_window
+        )));
+    }
     if assistant.block_size() <= 1 {
         return Err(Exception::custom(
             "Gemma 4 assistant block_size must permit at least one draft token",
@@ -1494,5 +1565,76 @@ where
             Self::Qwen3Next(generate) => generate.next(),
             Self::Qwen3NextLayerwise(generate) => generate.next(),
         }
+    }
+}
+
+#[cfg(test)]
+mod gemma4_drafter_compatibility_tests {
+    use safemlx::{Device, DeviceType, Stream};
+
+    use super::validate_gemma4_drafter;
+    use crate::architectures::gemma4::{
+        assistant::{Gemma4AssistantConfig, Gemma4AssistantDraftModel},
+        model::{LayerType, ModelArgs},
+    };
+
+    fn target_args() -> ModelArgs {
+        serde_json::from_value(serde_json::json!({
+            "model_type": "gemma4",
+            "hidden_size": 8,
+            "num_hidden_layers": 2,
+            "intermediate_size": 16,
+            "num_attention_heads": 2,
+            "rms_norm_eps": 0.00001,
+            "vocab_size": 32,
+            "num_key_value_heads": 1,
+            "num_global_key_value_heads": 1,
+            "max_position_embeddings": 128,
+            "rope_theta": 10000.0,
+            "head_dim": 4,
+            "global_head_dim": 4,
+            "tie_word_embeddings": true,
+            "num_kv_shared_layers": 2,
+            "layer_types": ["sliding_attention", "full_attention"],
+            "sliding_window": 64
+        }))
+        .unwrap()
+    }
+
+    fn assistant(target: &ModelArgs) -> Gemma4AssistantDraftModel {
+        let config = Gemma4AssistantConfig {
+            model_type: "gemma4_assistant".into(),
+            backbone_hidden_size: target.hidden_size,
+            use_ordered_embeddings: false,
+            num_centroids: 2048,
+            centroid_intermediate_top_k: 32,
+            tie_word_embeddings: true,
+            block_size: 4,
+            text_config: target.clone(),
+            quantization: None,
+        };
+        let stream = Stream::new_with_device(&Device::new(DeviceType::Cpu, 0));
+        Gemma4AssistantDraftModel::new(config, &stream).unwrap()
+    }
+
+    #[test]
+    fn validates_shared_kv_geometry_instead_of_provenance() {
+        let target = target_args();
+        let mut assistant = assistant(&target);
+        validate_gemma4_drafter(&target, &assistant).unwrap();
+
+        assistant.config.text_config.num_global_key_value_heads = Some(2);
+        let error = validate_gemma4_drafter(&target, &assistant)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("FullAttention KV-head count"));
+
+        assistant.config.text_config.num_global_key_value_heads = Some(1);
+        assistant.config.text_config.layer_types = vec![LayerType::SlidingAttention];
+        assistant.config.text_config.sliding_window = Some(32);
+        let error = validate_gemma4_drafter(&target, &assistant)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("sliding-window configuration"));
     }
 }

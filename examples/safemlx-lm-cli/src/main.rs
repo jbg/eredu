@@ -289,9 +289,16 @@ struct Cli {
     #[arg(long, value_name = "REVISION")]
     revision: Option<String>,
 
-    /// Explicitly permit target and draft GGUFs from different cached commits.
+    /// Acknowledge target and draft GGUFs from different cached commits.
+    ///
+    /// Mixed revisions are permitted by default after runtime compatibility
+    /// validation; this flag suppresses the provenance warning.
     #[arg(long)]
     allow_mixed_revisions: bool,
+
+    /// Require target and draft GGUFs from one cached repository commit.
+    #[arg(long, conflicts_with = "allow_mixed_revisions")]
+    require_same_revision: bool,
 
     /// Maximum number of tokens to generate. Generation stops earlier at EOS.
     #[arg(short = 'n', long, default_value_t = 256, value_name = "TOKENS")]
@@ -586,18 +593,20 @@ fn main() -> Result<()> {
     let args = Cli::parse();
     validate_args(&args)?;
     let prompt = read_prompt(args.prompt.as_deref())?;
-    let resolved_model = resolve_model(
+    let (resolved_model, resolved_draft) = resolve_model_pair(
         &args.model,
+        args.draft_model.as_deref(),
         args.revision.as_deref(),
-        CachedGgufRole::Target,
     )?;
-    let resolved_draft = args
-        .draft_model
-        .as_deref()
-        .map(|source| resolve_model(source, args.revision.as_deref(), CachedGgufRole::MtpDraft))
-        .transpose()?;
     if let Some(draft) = &resolved_draft {
-        validate_artifact_pair(&resolved_model, draft, args.allow_mixed_revisions)?;
+        let mixed_revisions =
+            validate_artifact_pair(&resolved_model, draft, args.require_same_revision)?;
+        if mixed_revisions && !args.allow_mixed_revisions {
+            eprintln!(
+                "warning: target and draft artifacts come from different cached commits of {:?}; repository revision is provenance, not an MTP compatibility key (use --require-same-revision to enforce provenance equality or --allow-mixed-revisions to suppress this warning)",
+                resolved_model.repository.as_deref().unwrap_or("unknown"),
+            );
+        }
     }
     let model_path = resolved_model.path;
     let draft_model_path = resolved_draft.map(|artifact| artifact.path);
@@ -722,6 +731,11 @@ fn main() -> Result<()> {
                 .with_context(|| format!("failed to load draft model from {}", path.display()))
         })
         .transpose()?;
+    if let Some(drafter) = &drafter {
+        model
+            .validate_drafter_compatibility(drafter)
+            .context("target and draft models are not MTP-compatible")?;
+    }
     stream.synchronize()?;
     if draft_stream != stream {
         draft_stream.synchronize()?;
@@ -1653,6 +1667,86 @@ fn resolve_model(
     }
 }
 
+fn resolve_model_pair(
+    target_spec: &str,
+    draft_spec: Option<&str>,
+    requested_revision: Option<&str>,
+) -> Result<(ResolvedModel, Option<ResolvedModel>)> {
+    let Some(draft_spec) = draft_spec else {
+        return Ok((
+            resolve_model(target_spec, requested_revision, CachedGgufRole::Target)?,
+            None,
+        ));
+    };
+
+    if requested_revision.is_none() {
+        if let Some(pair) = resolve_common_cached_gguf_pair(target_spec, draft_spec)? {
+            return Ok((pair.0, Some(pair.1)));
+        }
+    }
+
+    Ok((
+        resolve_model(target_spec, requested_revision, CachedGgufRole::Target)?,
+        Some(resolve_model(
+            draft_spec,
+            requested_revision,
+            CachedGgufRole::MtpDraft,
+        )?),
+    ))
+}
+
+fn resolve_common_cached_gguf_pair(
+    target_spec: &str,
+    draft_spec: &str,
+) -> Result<Option<(ResolvedModel, ResolvedModel)>> {
+    if Path::new(target_spec).exists() || Path::new(draft_spec).exists() {
+        return Ok(None);
+    }
+    let (target_repo, Some(target_quantization)) = split_hf_model_spec(target_spec)? else {
+        return Ok(None);
+    };
+    let (draft_repo, Some(draft_quantization)) = split_hf_model_spec(draft_spec)? else {
+        return Ok(None);
+    };
+    if target_repo != draft_repo {
+        return Ok(None);
+    }
+
+    let client = HFClientSync::new().context("failed to initialize the Hugging Face cache")?;
+    let cache = client
+        .scan_cache()
+        .send()
+        .context("failed to scan the Hugging Face cache")?;
+    let Some(repo) = cache
+        .repos
+        .iter()
+        .find(|repo| repo.repo_type == "model" && repo.repo_id == target_repo)
+    else {
+        return Ok(None);
+    };
+    let Some((revision, target_path, draft_path)) = select_cached_gguf_pair_from_revisions(
+        &repo.revisions,
+        target_quantization,
+        draft_quantization,
+    ) else {
+        return Ok(None);
+    };
+    let repository = Some(target_repo.to_owned());
+    let commit_hash = Some(revision.commit_hash.clone());
+    Ok(Some((
+        ResolvedModel {
+            path: target_path,
+            repository: repository.clone(),
+            commit_hash: commit_hash.clone(),
+        },
+        ResolvedModel {
+            path: draft_path,
+            repository,
+            commit_hash,
+        },
+    )))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ResolvedModel {
     path: PathBuf,
@@ -1663,15 +1757,16 @@ struct ResolvedModel {
 fn validate_artifact_pair(
     target: &ResolvedModel,
     draft: &ResolvedModel,
-    allow_mixed_revisions: bool,
-) -> Result<()> {
+    require_same_revision: bool,
+) -> Result<bool> {
     let same_repository = target.repository.is_some() && target.repository == draft.repository;
     let mixed_commits = target.commit_hash.is_some()
         && draft.commit_hash.is_some()
         && target.commit_hash != draft.commit_hash;
-    if same_repository && mixed_commits && !allow_mixed_revisions {
+    let mixed_revisions = same_repository && mixed_commits;
+    if mixed_revisions && require_same_revision {
         bail!(
-            "target artifact {} resolves to cached commit {}, but draft artifact {} resolves to commit {}; refusing to mix revisions from repository {:?} (use --allow-mixed-revisions to override)",
+            "target artifact {} resolves to cached commit {}, but draft artifact {} resolves to commit {}; --require-same-revision forbids mixing revisions from repository {:?}",
             target.path.display(),
             target.commit_hash.as_deref().unwrap_or("unknown"),
             draft.path.display(),
@@ -1679,7 +1774,7 @@ fn validate_artifact_pair(
             target.repository.as_deref().unwrap_or("unknown"),
         );
     }
-    Ok(())
+    Ok(mixed_revisions)
 }
 
 fn split_hf_model_spec(spec: &str) -> Result<(&str, Option<&str>)> {
@@ -1746,6 +1841,28 @@ fn select_cached_gguf_from_revisions(
         .map(|file| file.file_path.as_path())
         .collect::<Vec<_>>();
     select_cached_gguf_path(&files, quantization, role)
+}
+
+fn select_cached_gguf_pair_from_revisions<'a>(
+    revisions: &'a [CachedRevisionInfo],
+    target_quantization: &str,
+    draft_quantization: &str,
+) -> Option<(&'a CachedRevisionInfo, PathBuf, PathBuf)> {
+    let mut ordered = revisions.iter().collect::<Vec<_>>();
+    ordered.sort_unstable_by(|left, right| {
+        let left_is_main = left.refs.iter().any(|name| name == "main");
+        let right_is_main = right.refs.iter().any(|name| name == "main");
+        right_is_main
+            .cmp(&left_is_main)
+            .then_with(|| right.last_modified.cmp(&left.last_modified))
+    });
+    ordered.into_iter().find_map(|revision| {
+        let target =
+            select_cached_gguf(revision, target_quantization, CachedGgufRole::Target).ok()?;
+        let draft =
+            select_cached_gguf(revision, draft_quantization, CachedGgufRole::MtpDraft).ok()?;
+        Some((revision, target, draft))
+    })
 }
 
 fn select_cached_gguf_path(
@@ -1902,11 +2019,12 @@ mod tests {
 
     use super::{
         eval, execution_contexts, format_bytes, select_cached_gguf_from_revisions,
-        select_cached_gguf_path, select_revision, should_report_stop_reason, split_hf_model_spec,
-        stop_reason, thinking_template_kwargs, use_semantic_generation, validate_args,
-        validate_artifact_pair, write_semantic_event, Array, CachedGgufRole, Cli, CliDevice,
-        CliToolChoice, DeviceType, MtpDraftDevice, MtpExecutionStreams, MtpSchedulerOptions,
-        NativeToolSupport, ResolvedModel, SemanticEvent, SemanticSupport, StopReason, ThinkingMode,
+        select_cached_gguf_pair_from_revisions, select_cached_gguf_path, select_revision,
+        should_report_stop_reason, split_hf_model_spec, stop_reason, thinking_template_kwargs,
+        use_semantic_generation, validate_args, validate_artifact_pair, write_semantic_event,
+        Array, CachedGgufRole, Cli, CliDevice, CliToolChoice, DeviceType, MtpDraftDevice,
+        MtpExecutionStreams, MtpSchedulerOptions, NativeToolSupport, ResolvedModel, SemanticEvent,
+        SemanticSupport, StopReason, ThinkingMode,
     };
 
     fn revision(hash: &str, refs: &[&str], modified: u64) -> CachedRevisionInfo {
@@ -2478,7 +2596,28 @@ mod tests {
     }
 
     #[test]
-    fn rejects_mixed_target_and_draft_commits_from_one_repository() {
+    fn prefers_a_complete_target_and_draft_snapshot() {
+        let mut complete = revision("complete", &[], 1);
+        complete.files = vec![
+            cached_file("complete/model-UD-Q4_K_M.gguf", "blobs/complete-q4"),
+            cached_file(
+                "complete/MTP/mtp-model-Q8_0.gguf",
+                "blobs/complete-draft-q8",
+            ),
+        ];
+        let mut main = revision("main", &["main"], 2);
+        main.files = vec![cached_file("main/model-UD-Q4_K_M.gguf", "blobs/main-q4")];
+        let revisions = [complete, main];
+
+        let (revision, target, draft) =
+            select_cached_gguf_pair_from_revisions(&revisions, "Q4_K_M", "Q8_0").unwrap();
+        assert_eq!(revision.commit_hash, "complete");
+        assert_eq!(target, Path::new("complete/model-UD-Q4_K_M.gguf"));
+        assert_eq!(draft, Path::new("complete/MTP/mtp-model-Q8_0.gguf"));
+    }
+
+    #[test]
+    fn mixed_repository_revisions_are_advisory_unless_strictly_required() {
         let target = ResolvedModel {
             path: "target.gguf".into(),
             repository: Some("owner/model".into()),
@@ -2490,13 +2629,13 @@ mod tests {
             commit_hash: Some("draft-commit".into()),
         };
 
-        let error = validate_artifact_pair(&target, &draft, false).unwrap_err();
-        assert!(error.to_string().contains("refusing to mix revisions"));
-        validate_artifact_pair(&target, &draft, true).unwrap();
+        assert!(validate_artifact_pair(&target, &draft, false).unwrap());
+        let error = validate_artifact_pair(&target, &draft, true).unwrap_err();
+        assert!(error.to_string().contains("--require-same-revision"));
 
         let mut other_repository = draft;
         other_repository.repository = Some("owner/assistant".into());
-        validate_artifact_pair(&target, &other_repository, false).unwrap();
+        assert!(!validate_artifact_pair(&target, &other_repository, false).unwrap());
     }
 
     #[test]

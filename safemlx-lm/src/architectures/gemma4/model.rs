@@ -479,7 +479,7 @@ impl ModelArgs {
             .unwrap_or(LayerType::FullAttention)
     }
 
-    fn rope_theta_for_layer(&self, layer_type: LayerType) -> f32 {
+    pub(crate) fn rope_theta_for_layer(&self, layer_type: LayerType) -> f32 {
         let key = match layer_type {
             LayerType::SlidingAttention => "sliding_attention",
             LayerType::FullAttention => "full_attention",

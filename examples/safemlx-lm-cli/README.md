@@ -23,8 +23,11 @@ The Hugging Face form never downloads files. It scans the cache selected by
 the cached `main` revision by default. GGUF selectors prefer `main`, then search
 other cached snapshots when `main` does not contain the requested
 quantization. Use `--revision` to limit selection to a cached ref or commit.
-When target and draft artifacts come from the same repository, their owning
-commit must match. `--allow-mixed-revisions` is the explicit escape hatch.
+Target/draft resolution prefers a cached snapshot containing both artifacts.
+Different owning commits produce a provenance warning, while loaded model
+metadata and token-id vocabularies determine MTP compatibility.
+`--require-same-revision` makes repository commit equality mandatory;
+`--allow-mixed-revisions` acknowledges and suppresses the warning.
 
 For a cached repository containing multiple GGUF files, append a
 case-insensitive quantization selector to the model identifier. The full

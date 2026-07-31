@@ -1,6 +1,25 @@
 //! Tokenizer, chat-template, and GGUF metadata loading.
 
 use super::*;
+use sha2::{Digest, Sha256};
+
+pub(crate) fn tokenizer_vocabulary_fingerprint(tokenizer: &Tokenizer) -> [u8; 32] {
+    let vocabulary_size = tokenizer.get_vocab_size(true);
+    let mut hasher = Sha256::new();
+    hasher.update(b"safemlx-token-id-vocabulary-v1");
+    hasher.update((vocabulary_size as u64).to_le_bytes());
+    for token_id in 0..vocabulary_size {
+        hasher.update((token_id as u64).to_le_bytes());
+        match tokenizer.id_to_token(token_id as u32) {
+            Some(token) => {
+                hasher.update((token.len() as u64).to_le_bytes());
+                hasher.update(token.as_bytes());
+            }
+            None => hasher.update(u64::MAX.to_le_bytes()),
+        }
+    }
+    hasher.finalize().into()
+}
 
 /// Loads only the tokenizer from a supported model directory or GGUF file.
 ///
@@ -199,3 +218,40 @@ const GEMMA4_TEXT_TEMPLATE: &str = r#"<bos>{% for message in messages %}{% set r
 {% if message['content'] is string %}{{ message['content'] }}{% else %}{% for content in message['content'] %}{% if content['type'] == 'text' %}{{ content['text'] }}{% elif content['type'] == 'image' %}<|image>{% elif content['type'] == 'audio' %}<|audio>{% endif %}{% endfor %}{% endif %}<turn|>
 {% endfor %}{% if add_generation_prompt %}<|turn>model
 {% endif %}"#;
+
+#[cfg(test)]
+mod vocabulary_fingerprint_tests {
+    use tokenizers::models::wordlevel::WordLevel;
+    use tokenizers::AddedToken;
+
+    use super::{tokenizer_vocabulary_fingerprint, Tokenizer};
+
+    fn tokenizer(tokens: &[&str]) -> Tokenizer {
+        let mut tokenizer = Tokenizer::new(WordLevel::default());
+        tokenizer
+            .add_tokens(
+                tokens
+                    .iter()
+                    .map(|token| AddedToken::from((*token).to_owned(), false))
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
+        tokenizer
+    }
+
+    #[test]
+    fn fingerprint_tracks_token_id_mapping() {
+        let first = tokenizer(&["<unk>", "alpha", "beta"]);
+        let identical = tokenizer(&["<unk>", "alpha", "beta"]);
+        let remapped = tokenizer(&["<unk>", "beta", "alpha"]);
+
+        assert_eq!(
+            tokenizer_vocabulary_fingerprint(&first),
+            tokenizer_vocabulary_fingerprint(&identical)
+        );
+        assert_ne!(
+            tokenizer_vocabulary_fingerprint(&first),
+            tokenizer_vocabulary_fingerprint(&remapped)
+        );
+    }
+}
