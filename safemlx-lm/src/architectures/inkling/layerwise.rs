@@ -1730,6 +1730,25 @@ mod tests {
         serde_json::from_value(config()).unwrap()
     }
 
+    #[test]
+    fn released_mixed_dtype_policy_keeps_only_router_scalars_in_f32() {
+        let context = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        let model = Model::new(args(), context.stream()).unwrap();
+        let parameters = model.parameters().flatten();
+        assert_eq!(
+            parameters["model.layers.0.dense_global_scale"].dtype(),
+            Dtype::Bfloat16
+        );
+        assert_eq!(
+            parameters["model.layers.1.moe.router.bias"].dtype(),
+            Dtype::Float32
+        );
+        assert_eq!(
+            parameters["model.layers.1.moe.router.global_scale"].dtype(),
+            Dtype::Float32
+        );
+    }
+
     fn initialize(model: &mut Model, stream: &Stream) {
         for (name, parameter) in model.parameters_mut().flatten() {
             let shape = parameter.shape().to_vec();

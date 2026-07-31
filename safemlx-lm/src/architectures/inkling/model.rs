@@ -1246,7 +1246,7 @@ impl DecoderLayer {
                 None
             },
             dense_global_scale: if dense {
-                Param::<Option<Array>>::unloaded_some(&[1], Dtype::Float32, stream)?
+                Param::<Option<Array>>::unloaded_some(&[1], args.weight_dtype(), stream)?
             } else {
                 Param::new(None)
             },
