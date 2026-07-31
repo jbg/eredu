@@ -55,6 +55,7 @@ const NORM_UNIT: &str = "inkling.static.norm";
 const HEAD_UNIT: &str = "inkling.static.output";
 const AUDIO_UNIT: &str = "inkling.static.audio";
 const VISION_NORM_UNIT: &str = "inkling.static.vision_norm";
+const PREFILL_EXPERT_BANK_TARGET_BYTES: u64 = 1 << 30;
 
 /// Inkling multimodal model using bounded residency for hMLP and decoder blocks.
 pub struct InklingLayerwiseModel {
@@ -512,6 +513,85 @@ impl InklingLayerwiseAdapter {
 
     fn new_cache(&self) -> Cache {
         Cache::new(&self.args.text_config)
+    }
+
+    fn forward_cached_expert_chunk(
+        &self,
+        layer: usize,
+        flat: &Array,
+        indices: &Array,
+        weights: &Array,
+        pass: ExpertPass,
+        stream: &Stream,
+    ) -> Result<Array, Exception> {
+        let expert_cache = self
+            .expert_cache
+            .as_ref()
+            .ok_or_else(|| Exception::custom("Inkling sparse expert cache was not initialized"))?;
+        let acquired = expert_cache
+            .acquire_routes(layer, indices, pass, stream)
+            .map_err(|error| Exception::custom(error.to_string()))?;
+        let started = Instant::now();
+        let text = &self.args.text_config;
+        let prefix = format!("model.layers.{layer}.moe.experts");
+        let gate_format = text.weight_quantization_for(&format!("{prefix}.gate_up_proj"));
+        let down_format = text.weight_quantization_for(&format!("{prefix}.down_proj"));
+        let mut bank = PackedSwiGluExperts::new_with_dtype(
+            acquired.identities().len() as i32,
+            text.hidden_size,
+            text.moe_intermediate_size(),
+            gate_format,
+            down_format,
+            text.weight_dtype(),
+            stream,
+        )?;
+        bank.gate_up_proj = Param::new(
+            acquired
+                .compact_binding("gate_up_proj", stream)
+                .map_err(|error| Exception::custom(error.to_string()))?,
+        );
+        bank.down_proj = Param::new(
+            acquired
+                .compact_binding("down_proj", stream)
+                .map_err(|error| Exception::custom(error.to_string()))?,
+        );
+        if gate_format.is_some_and(|format| format.gguf_iquant().is_none()) {
+            bank.gate_up_proj_scales = Param::new(Some(
+                acquired
+                    .compact_binding("gate_up_proj_scales", stream)
+                    .map_err(|error| Exception::custom(error.to_string()))?,
+            ));
+        }
+        if gate_format.is_some_and(|format| format.has_biases()) {
+            bank.gate_up_proj_biases = Param::new(Some(
+                acquired
+                    .compact_binding("gate_up_proj_biases", stream)
+                    .map_err(|error| Exception::custom(error.to_string()))?,
+            ));
+        }
+        if down_format.is_some_and(|format| format.gguf_iquant().is_none()) {
+            bank.down_proj_scales = Param::new(Some(
+                acquired
+                    .compact_binding("down_proj_scales", stream)
+                    .map_err(|error| Exception::custom(error.to_string()))?,
+            ));
+        }
+        if down_format.is_some_and(|format| format.has_biases()) {
+            bank.down_proj_biases = Param::new(Some(
+                acquired
+                    .compact_binding("down_proj_biases", stream)
+                    .map_err(|error| Exception::custom(error.to_string()))?,
+            ));
+        }
+        expert_cache
+            .record_compact_bank(pass, acquired.scratch_bytes(), started.elapsed())
+            .map_err(|error| Exception::custom(error.to_string()))?;
+        let output = bank.forward(flat, acquired.compact_routes(), weights, stream)?;
+        eval([&output])?;
+        acquired
+            .complete_pending()
+            .map_err(|error| Exception::custom(error.to_string()))?;
+        Ok(output)
     }
 
     fn recipes_for_module(
@@ -1284,77 +1364,39 @@ impl GeneralLayerwiseModelAdapter for InklingLayerwiseAdapter {
                         Some(&mut cache.layers[index]),
                         stream,
                         |flat, indices, weights, stream| {
-                            let acquired = expert_cache
-                                .acquire_routes(index, indices, pass, stream)
-                                .map_err(|error| Exception::custom(error.to_string()))?;
-                            let started = Instant::now();
-                            let text = &self.args.text_config;
-                            let prefix = format!("model.layers.{index}.moe.experts");
-                            let gate_format =
-                                text.weight_quantization_for(&format!("{prefix}.gate_up_proj"));
-                            let down_format =
-                                text.weight_quantization_for(&format!("{prefix}.down_proj"));
-                            let mut bank = PackedSwiGluExperts::new_with_dtype(
-                                acquired.identities().len() as i32,
-                                text.hidden_size,
-                                text.moe_intermediate_size(),
-                                gate_format,
-                                down_format,
-                                text.weight_dtype(),
-                                stream,
-                            )?;
-                            bank.gate_up_proj = Param::new(
-                                acquired
-                                    .compact_binding("gate_up_proj", stream)
-                                    .map_err(|error| Exception::custom(error.to_string()))?,
-                            );
-                            bank.down_proj = Param::new(
-                                acquired
-                                    .compact_binding("down_proj", stream)
-                                    .map_err(|error| Exception::custom(error.to_string()))?,
-                            );
-                            if gate_format.is_some_and(|format| format.gguf_iquant().is_none()) {
-                                bank.gate_up_proj_scales = Param::new(Some(
-                                    acquired
-                                        .compact_binding("gate_up_proj_scales", stream)
-                                        .map_err(|error| Exception::custom(error.to_string()))?,
-                                ));
+                            let token_count = flat.dim(0);
+                            let chunk_tokens = if pass == ExpertPass::Prefill {
+                                let routes_per_token =
+                                    usize::try_from(indices.dim(-1)).map_err(|_| {
+                                        Exception::custom("invalid Inkling route shape")
+                                    })?;
+                                i32::try_from(expert_cache.route_chunk_tokens(
+                                    routes_per_token,
+                                    PREFILL_EXPERT_BANK_TARGET_BYTES,
+                                ))
+                                .unwrap_or(i32::MAX)
+                            } else {
+                                token_count
+                            };
+                            if token_count <= chunk_tokens {
+                                return self.forward_cached_expert_chunk(
+                                    index, flat, indices, weights, pass, stream,
+                                );
                             }
-                            if gate_format.is_some_and(|format| format.has_biases()) {
-                                bank.gate_up_proj_biases = Param::new(Some(
-                                    acquired
-                                        .compact_binding("gate_up_proj_biases", stream)
-                                        .map_err(|error| Exception::custom(error.to_string()))?,
-                                ));
+
+                            let mut outputs = Vec::new();
+                            let mut start = 0;
+                            while start < token_count {
+                                let end = (start + chunk_tokens).min(token_count);
+                                let flat = flat.try_index_device((start..end, ..), stream)?;
+                                let indices = indices.try_index_device((start..end, ..), stream)?;
+                                let weights = weights.try_index_device((start..end, ..), stream)?;
+                                outputs.push(self.forward_cached_expert_chunk(
+                                    index, &flat, &indices, &weights, pass, stream,
+                                )?);
+                                start = end;
                             }
-                            if down_format.is_some_and(|format| format.gguf_iquant().is_none()) {
-                                bank.down_proj_scales = Param::new(Some(
-                                    acquired
-                                        .compact_binding("down_proj_scales", stream)
-                                        .map_err(|error| Exception::custom(error.to_string()))?,
-                                ));
-                            }
-                            if down_format.is_some_and(|format| format.has_biases()) {
-                                bank.down_proj_biases = Param::new(Some(
-                                    acquired
-                                        .compact_binding("down_proj_biases", stream)
-                                        .map_err(|error| Exception::custom(error.to_string()))?,
-                                ));
-                            }
-                            expert_cache
-                                .record_compact_bank(
-                                    pass,
-                                    acquired.scratch_bytes(),
-                                    started.elapsed(),
-                                )
-                                .map_err(|error| Exception::custom(error.to_string()))?;
-                            let output =
-                                bank.forward(flat, acquired.compact_routes(), weights, stream)?;
-                            eval([&output])?;
-                            acquired
-                                .complete_pending()
-                                .map_err(|error| Exception::custom(error.to_string()))?;
-                            Ok(output)
+                            concatenate_axis(&outputs, 0, stream)
                         },
                     )?);
                 }
@@ -2014,7 +2056,7 @@ mod tests {
         let options = ExpertCacheLoadOptions::new(
             LayerwiseLoadOptions::new(OffloadConfig::new(None, None, 1).unwrap()),
             OffloadConfig::new(None, None, 1).unwrap(),
-            1 << 20,
+            768,
         )
         .unwrap();
         let mut cached =
@@ -2042,6 +2084,7 @@ mod tests {
         }
         let report = cached.expert_cache_report().unwrap().unwrap();
         assert_eq!(report.owned_experts, 4);
+        assert_eq!(report.prefill.compact_banks, 6);
         assert!(report.prefill.requested_routes > 0);
         assert!(report.decode.requested_routes > 0);
         crate::architectures::distributed::expert::assert_rank_owned_sparse_ep_load(

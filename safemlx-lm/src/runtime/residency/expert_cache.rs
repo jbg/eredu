@@ -340,6 +340,20 @@ impl ExpertCache {
         &self.manager
     }
 
+    /// Returns a conservative token count whose worst-case distinct routes fit
+    /// both the configured scratch limit and a caller-selected bank target.
+    pub(crate) fn route_chunk_tokens(&self, routes_per_token: usize, target_bytes: u64) -> usize {
+        if routes_per_token == 0 {
+            return 1;
+        }
+        let max_expert_bytes = self.catalog.values().copied().max().unwrap_or(1);
+        let bytes_per_token =
+            max_expert_bytes.saturating_mul(u64::try_from(routes_per_token).unwrap_or(u64::MAX));
+        let budget = self.scratch_limit.min(target_bytes).max(1);
+        let tokens = budget.checked_div(bytes_per_token).unwrap_or(0).max(1);
+        usize::try_from(tokens).unwrap_or(usize::MAX)
+    }
+
     /// Discovers, validates, coalesces, and acquires routed experts.
     ///
     /// A device-side demand histogram bounds host readback by the layer's
@@ -1052,6 +1066,15 @@ mod tests {
         assert_eq!(report.decode.device.hits, 2);
         assert_eq!(report.owned_experts, 3);
         assert_eq!(report.owned_bytes, 48);
+    }
+
+    #[test]
+    fn route_chunk_size_respects_scratch_target_and_worst_case_expert_bytes() {
+        let (_dir, store) = fixture();
+        let cache = cache(store, 48, 0, 128, CacheEvictionPolicy::LeastRecentlyUsed);
+        assert_eq!(cache.route_chunk_tokens(2, 64), 2);
+        assert_eq!(cache.route_chunk_tokens(2, 16), 1);
+        assert_eq!(cache.route_chunk_tokens(0, 64), 1);
     }
 
     #[test]

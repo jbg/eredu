@@ -255,6 +255,10 @@ struct Cli {
     #[arg(long, default_value = "gpu:0", value_name = "DEVICE")]
     device: CliDevice,
 
+    /// Process-global MLX allocator-cache limit in bytes; zero disables caching.
+    #[arg(long, value_name = "BYTES")]
+    mlx_cache_limit_bytes: Option<u64>,
+
     /// Maximum speculative tokens proposed before each target verification.
     #[arg(long, default_value_t = 3, value_name = "TOKENS")]
     mtp_draft_tokens: usize,
@@ -645,6 +649,11 @@ fn main() -> Result<()> {
     let total_started = Instant::now();
     let args = Cli::parse();
     validate_args(&args)?;
+    if let Some(bytes) = args.mlx_cache_limit_bytes {
+        let bytes = usize::try_from(bytes).context("--mlx-cache-limit-bytes exceeds usize")?;
+        safemlx::memory::set_cache_limit(bytes)
+            .context("failed to set the MLX allocator-cache limit")?;
+    }
     let prompt = read_prompt(args.prompt.as_deref())?;
     let (resolved_model, resolved_draft) = resolve_model_pair(
         &args.model,
@@ -668,6 +677,9 @@ fn main() -> Result<()> {
         eprintln!("--- safemlx diagnostics (stderr) ---");
         eprintln!("model: {}", model_path.display());
         eprintln!("device: {}", args.device);
+        if let Some(bytes) = args.mlx_cache_limit_bytes {
+            eprintln!("mlx_cache_limit: {}", format_bytes(bytes as usize));
+        }
         if let Some(path) = &draft_model_path {
             eprintln!("draft_model: {}", path.display());
             eprintln!("mtp_draft_device: {}", args.mtp_draft_device);
@@ -2528,6 +2540,22 @@ mod tests {
         .with_lookahead(!args.disable_mtp_lookahead);
         assert_eq!(options.lookahead_blocks, 0);
         assert!(!options.adaptive_lookahead);
+    }
+
+    #[test]
+    fn parses_mlx_allocator_cache_limit() {
+        let args = Cli::try_parse_from([
+            "safemlx-lm",
+            "--model",
+            "model-id",
+            "--mlx-cache-limit-bytes",
+            "17179869184",
+            "prompt",
+        ])
+        .unwrap();
+
+        assert_eq!(args.mlx_cache_limit_bytes, Some(17_179_869_184));
+        validate_args(&args).unwrap();
     }
 
     #[test]
