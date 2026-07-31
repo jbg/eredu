@@ -52,6 +52,36 @@ pub struct GgufAffineTensor {
     biases: GgufArray,
 }
 
+/// Atomic MLX representation of one GGML type-39 MXFP4 tensor.
+#[derive(Debug)]
+pub struct GgufMxFp4Tensor {
+    physical_name: String,
+    weight: GgufArray,
+    scales: GgufArray,
+}
+
+impl GgufMxFp4Tensor {
+    /// Name of the physical tensor in the GGUF file.
+    pub fn physical_name(&self) -> &str {
+        &self.physical_name
+    }
+
+    /// Packed E2M1 values in the layout consumed by MLX MXFP4 kernels.
+    pub fn weight(&self) -> &GgufArray {
+        &self.weight
+    }
+
+    /// One E8M0 scale byte per 32 logical values.
+    pub fn scales(&self) -> &GgufArray {
+        &self.scales
+    }
+
+    /// Consume the group into its packed weights and scale arrays.
+    pub fn into_arrays(self) -> [GgufArray; 2] {
+        [self.weight, self.scales]
+    }
+}
+
 impl GgufAffineTensor {
     /// Name of the physical tensor in the GGUF file.
     pub fn physical_name(&self) -> &str {
@@ -134,6 +164,8 @@ pub enum GgufTensor {
     IQuant(GgufIQuantTensor),
     /// A packed tensor represented by one atomic affine triple.
     Affine(GgufAffineTensor),
+    /// A GGML type-39 tensor represented as MLX MXFP4 weights and scales.
+    MxFp4(GgufMxFp4Tensor),
 }
 
 impl GgufTensor {
@@ -143,6 +175,7 @@ impl GgufTensor {
             Self::Dense(tensor) => tensor.name(),
             Self::IQuant(tensor) => tensor.physical_name(),
             Self::Affine(tensor) => tensor.physical_name(),
+            Self::MxFp4(tensor) => tensor.physical_name(),
         }
     }
 
@@ -152,6 +185,11 @@ impl GgufTensor {
             Self::Dense(tensor) => vec![tensor.into_parts()],
             Self::IQuant(tensor) => vec![tensor.into_packed().into_parts()],
             Self::Affine(tensor) => tensor
+                .into_arrays()
+                .into_iter()
+                .map(GgufArray::into_parts)
+                .collect(),
+            Self::MxFp4(tensor) => tensor
                 .into_arrays()
                 .into_iter()
                 .map(GgufArray::into_parts)
@@ -396,6 +434,37 @@ fn convert_tensor(tensor: safemlx_gguf::ConvertedCheckpointTensor) -> Result<Ggu
                 biases: GgufArray {
                     name: format!("{prefix}.biases"),
                     array: biases,
+                },
+            }))
+        }
+        safemlx_gguf::ConvertedTensor::MxFp4(mxfp4) => {
+            let weight_shape = mlx_shape_i32(&descriptor.name, &mxfp4.weight_shape)?;
+            let scale_shape = mlx_shape_i32(&descriptor.name, &mxfp4.scale_shape)?;
+            let weight = unsafe {
+                Array::from_raw_data(mxfp4.weights.as_ptr().cast(), &weight_shape, Dtype::Uint32)
+            };
+            let scales = unsafe {
+                Array::from_raw_data(mxfp4.scales.as_ptr().cast(), &scale_shape, Dtype::Uint8)
+            };
+            let prefix = descriptor
+                .name
+                .strip_suffix(".weight")
+                .ok_or_else(|| {
+                    IoError::InvalidGguf(format!(
+                        "MXFP4 tensor {:?} must end in .weight",
+                        descriptor.name
+                    ))
+                })?
+                .to_owned();
+            Ok(GgufTensor::MxFp4(GgufMxFp4Tensor {
+                physical_name: descriptor.name.clone(),
+                weight: GgufArray {
+                    name: descriptor.name,
+                    array: weight,
+                },
+                scales: GgufArray {
+                    name: format!("{prefix}.scales"),
+                    array: scales,
                 },
             }))
         }

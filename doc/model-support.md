@@ -19,6 +19,7 @@ checkpoint. The current architecture dispatch covers:
 - Gemma 4 dense and MoE text and multimodal models
 - GPT-OSS
 - Thinking Machines Lab Inkling
+- Kimi Linear
 - Llama and Mistral
 - LFM2 and LFM2.5, including MoE variants
 - Nemotron-H
@@ -74,6 +75,14 @@ System admission signals cover Apple unified memory through
 CUDA-specific free-device-memory remains unavailable; host and device capacity
 are not combined.
 
+Kimi Linear directories may omit `tokenizer.json`: the loader imports the
+official `tiktoken.model`, registers the full reserved-token range, and uses
+the checkpoint's distinct BOS, tokenizer-EOS, generation-EOS, unknown, and
+padding IDs. Ordinary and tool-enabled chat use the official template.
+Streaming native-tool events preserve
+`functions.<declared_name>:<nonnegative_index>` identifiers and support
+repeated or parallel calls.
+
 ## GGUF
 
 The high-level loader accepts a GGUF file for these `general.architecture`
@@ -81,6 +90,7 @@ values:
 
 - `deepseek2`
 - `gemma4`
+- `kimi-linear`
 - `llama` and `mistral`
 - `lfm2` and `lfm2moe`
 - `nemotron_h` and `nemotron_h_moe`
@@ -102,11 +112,18 @@ tensor encodings are listed in the
 
 Fully resident loading is the default. SafeTensors and registered GGUF families
 can also use host-backed layer windows or experimental dense disk streaming.
-GGUF bounded loading covers DeepSeek2, Gemma 4, Llama/Mistral, LFM2,
+GGUF bounded loading covers Kimi Linear, DeepSeek2, Gemma 4, Llama/Mistral, LFM2,
 Nemotron-H, Qwen3, dense Qwen3-VL with its mmproj, Qwen3.5, and Qwen3-Next.
 Supported MoE families can cache routed experts independently; for GGUF these
-are DeepSeek2, LFM2-MoE, Nemotron-H-MoE, Qwen3-MoE, Qwen3.5-MoE, and MoE
-Qwen3-Next.
+are Kimi Linear, DeepSeek2, LFM2-MoE, Nemotron-H-MoE, Qwen3-MoE,
+Qwen3.5-MoE, and MoE Qwen3-Next.
+
+Kimi Linear SafeTensors supports fully resident, layerwise-host, dense
+disk-streamed, sparse-expert-cache, and sparse-expert-with-dense-layers
+loading for both SafeTensors and GGUF. Its KDA recurrent state remains bounded
+while no-RoPE MLA caches grow with context. The GGUF loader accepts modern
+split or legacy unsplit MLA KV-B projections, singleton convolution layouts,
+dense/K/IQ tensors, and MXFP4-MoE type 39.
 
 Qwen3-Next supports the official native fine-grained E4M3 checkpoint format
 (`fp8`, dynamic activations, 128 x 128 weight blocks) with fully resident,
@@ -128,6 +145,8 @@ Important boundaries:
   the same physical unified memory. They do not create additional capacity.
 - Parameter budgets do not include activations, KV or recurrent state, kernels,
   allocator caches, checkpoint mappings, or every temporary buffer.
+- Kimi Linear paged and persisted prompt caches are unavailable because its
+  hybrid KDA recurrent state is not represented by the paged KV cache format.
 - SafeTensors mapping and logical-transfer counters cannot report exact
   physical disk I/O. GGUF additionally reports physical payload read requests
   and bytes issued by its selected-read backend;
@@ -143,3 +162,10 @@ expert parallelism. A non-replicated topology must be loaded through the
 matching API; the ordinary complete-model loader rejects it. Hybrid tensor +
 pipeline, tensor + expert, and pipeline + expert topologies are not currently
 supported.
+
+Kimi Linear supports pure fully resident and sparse-expert-cache expert
+parallelism for SafeTensors: dense/nonexpert weights and the shared expert are
+replicated, routed experts are partitioned or loaded through rank-owned sparse
+caches, and the shared expert is added once after routed reduction. Tensor
+parallelism, pipeline parallelism, and GGUF expert parallelism return
+capability errors.

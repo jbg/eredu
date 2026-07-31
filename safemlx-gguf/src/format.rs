@@ -260,6 +260,8 @@ pub enum GgmlType {
     RemovedIQ4NL4_4,
     RemovedIQ4NL4_8,
     RemovedIQ4NL8_8,
+    /// GGML MXFP4 block: one E8M0 scale byte and 32 packed E2M1 values.
+    MxFp4,
     Unknown(u32),
 }
 
@@ -296,6 +298,7 @@ impl GgmlType {
             36 => Self::RemovedIQ4NL4_4,
             37 => Self::RemovedIQ4NL4_8,
             38 => Self::RemovedIQ4NL8_8,
+            39 => Self::MxFp4,
             other => Self::Unknown(other),
         }
     }
@@ -331,6 +334,7 @@ impl GgmlType {
             Self::RemovedIQ4NL4_4 => 36,
             Self::RemovedIQ4NL4_8 => 37,
             Self::RemovedIQ4NL8_8 => 38,
+            Self::MxFp4 => 39,
             Self::Unknown(v) => v,
         }
     }
@@ -360,6 +364,7 @@ impl GgmlType {
             Self::IQ2S => Ok((256, 82)),
             Self::IQ4XS => Ok((256, 136)),
             Self::IQ1M => Ok((256, 56)),
+            Self::MxFp4 => Ok((32, 17)),
             Self::RemovedIQ4NL4_4 | Self::RemovedIQ4NL4_8 | Self::RemovedIQ4NL8_8 => {
                 Err(Error::UnsupportedTensorType(self.code()))
             }

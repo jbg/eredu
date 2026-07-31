@@ -116,6 +116,9 @@ fn matches_patched_mlx_v032_oracle_byte_for_byte() {
             ConvertedTensor::IQuant(_) => {
                 panic!("legacy affine oracle does not contain IQ tensors")
             }
+            ConvertedTensor::MxFp4(_) => {
+                panic!("legacy affine oracle does not contain MXFP4 tensors")
+            }
         }
     }
 }

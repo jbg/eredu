@@ -104,7 +104,16 @@ fn build_gpt(
         .get("general.architecture")
         .and_then(GgufMetadataValue::as_str)
         .unwrap_or_default();
-    if pre_tokenizer == "lfm2" || matches!(architecture, "lfm2" | "lfm2moe") {
+    if pre_tokenizer == "kimi-k2" || architecture == "kimi-linear" {
+        tokenizer.with_pre_tokenizer(Some(PreTokenizerSequence::new(vec![
+            PreTokenizerWrapper::Split(Split::new(
+                SplitPattern::Regex(super::tiktoken::KIMI_K2_PATTERN.into()),
+                SplitDelimiterBehavior::Isolated,
+                false,
+            )?),
+            PreTokenizerWrapper::ByteLevel(ByteLevel::new(false, false, false)),
+        ])));
+    } else if pre_tokenizer == "lfm2" || matches!(architecture, "lfm2" | "lfm2moe") {
         const LFM2_PATTERN: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
         tokenizer.with_pre_tokenizer(Some(PreTokenizerSequence::new(vec![
             PreTokenizerWrapper::Split(Split::new(

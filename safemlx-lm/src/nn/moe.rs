@@ -330,7 +330,11 @@ impl TopKRouter {
                         config.num_experts,
                         config.hidden_size / quantization.group_size(),
                     ],
-                    Dtype::Float16,
+                    if quantization == WeightQuantization::MxFp4 {
+                        Dtype::Uint8
+                    } else {
+                        Dtype::Float16
+                    },
                     stream,
                 )?
             } else {
@@ -450,7 +454,24 @@ impl TopKRouter {
         observer: &mut dyn ActivationObserver,
     ) -> Result<TopKRouterOutput, Exception> {
         let flat = hidden_states.reshape(&[-1, hidden_states.dim(-1)], stream)?;
-        let logits = if self.score_function == TopKRouterScoreFunction::Sigmoid {
+        let logits = if let Some(scales) = self.scales.as_ref() {
+            let input = if self.score_function == TopKRouterScoreFunction::Sigmoid {
+                flat.as_dtype(Dtype::Float32, stream)?
+            } else {
+                flat
+            };
+            quantized_matmul_with_mode(
+                &input,
+                self.weight.as_ref(),
+                scales,
+                self.biases.as_ref().as_ref(),
+                true,
+                self.group_size,
+                self.bits,
+                self.mode,
+                stream,
+            )?
+        } else if self.score_function == TopKRouterScoreFunction::Sigmoid {
             matmul(
                 &flat.as_dtype(Dtype::Float32, stream)?,
                 &self

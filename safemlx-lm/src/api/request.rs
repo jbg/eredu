@@ -824,9 +824,10 @@ fn recognize_remaining_protocols(
         runtime::chat::{
             dialect::{DialectParameters, DECLARATIVE_DIALECT},
             DEEPSEEK31_STRUCTURAL_JSON_TOOL_SPEC, DEEPSEEK_STRUCTURAL_JSON_TOOL_SPEC,
-            LLAMA3_JSON_TOOL_SPEC, LLAMA4_JSON_TOOL_SPEC, MINISTRAL_JSON_LIST_TOOL_SPEC,
-            MISTRAL_JSON_LIST_TOOL_SPEC, NEMOTRON_NANO_JSON_LIST_TOOL_SPEC,
-            NEMOTRON_NANO_V2_JSON_LIST_TOOL_SPEC, QWEN3_XML_TOOL_SPEC, QWEN_XML_TOOL_SPEC,
+            KIMI_K2_NATIVE_TOOL_SPEC, LLAMA3_JSON_TOOL_SPEC, LLAMA4_JSON_TOOL_SPEC,
+            MINISTRAL_JSON_LIST_TOOL_SPEC, MISTRAL_JSON_LIST_TOOL_SPEC,
+            NEMOTRON_NANO_JSON_LIST_TOOL_SPEC, NEMOTRON_NANO_V2_JSON_LIST_TOOL_SPEC,
+            QWEN3_XML_TOOL_SPEC, QWEN_XML_TOOL_SPEC,
         },
     };
 
@@ -847,6 +848,28 @@ fn recognize_remaining_protocols(
             .as_deref()
             .is_some_and(|rendered| required.iter().all(|part| rendered.contains(part)))
     };
+
+    let kimi_markers = [
+        "<|tool_calls_section_begin|>",
+        "<|tool_call_begin|>",
+        "<|tool_call_argument_begin|>",
+        "<|tool_call_end|>",
+        "<|tool_calls_section_end|>",
+        "## Return of abc123456",
+        "__safemlx_tool_result_probe__",
+    ];
+    let kimi_mapping = supports(&mapping, &kimi_markers);
+    let kimi_string = supports(&string, &kimi_markers);
+    if kimi_mapping || kimi_string {
+        return recognized_dialect_profile(
+            tokenizer,
+            "kimi-k2.native-tools.v1",
+            &DECLARATIVE_DIALECT,
+            DialectParameters::Declarative(&KIMI_K2_NATIVE_TOOL_SPEC),
+            kimi_mapping,
+            kimi_string,
+        );
+    }
 
     let harmony_markers = [
         "assistant to=functions.safemlx_probe_7c91",

@@ -4,7 +4,7 @@ use safemlx::{
     error::Exception,
     macros::ModuleParameters,
     module::Param,
-    ops::{concatenate_axis, conv1d, indexing::TryIndexOp, zeros},
+    ops::{concatenate_axis, conv1d, indexing::TryIndexOp, zeros_dtype},
     Array, Dtype, Stream,
 };
 
@@ -86,7 +86,11 @@ pub fn causal_depthwise_conv1d(
     let state = cache
         .as_ref()
         .and_then(|cache| cache.state.clone())
-        .unwrap_or(zeros::<f32>(&[batch, state_len, channels], stream)?);
+        .unwrap_or(zeros_dtype(
+            &[batch, state_len, channels],
+            input.dtype(),
+            stream,
+        )?);
     let padded = concatenate_axis(&[state, input.clone()], 1, stream)?;
     if let Some(cache) = cache {
         cache.state = Some(padded.try_index_device((.., seq_len.., ..), stream)?);

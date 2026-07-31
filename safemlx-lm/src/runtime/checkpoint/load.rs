@@ -126,6 +126,18 @@ where
     for shard in checkpoint.catalog().shards() {
         for tensor in shard.tensors() {
             let descriptor = tensor.descriptor();
+            if tensor.is_mxfp4() {
+                let weight_name = translate(&descriptor.name);
+                if configs
+                    .insert(weight_name.clone(), WeightQuantization::MxFp4)
+                    .is_some()
+                {
+                    return Err(Error::UnsupportedArchitecture(format!(
+                        "GGUF tensors collide after translating {weight_name:?}"
+                    )));
+                }
+                continue;
+            }
             if !descriptor.ggml_type.is_iq() {
                 continue;
             }

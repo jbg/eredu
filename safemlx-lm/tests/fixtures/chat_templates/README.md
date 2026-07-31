@@ -26,6 +26,7 @@ behavior; repository or model metadata is not a support key.
 | `gpt-oss-harmony-a4c9919c.jinja` | `openai/gpt-oss-20b` | `6cee5e81ee83917806bbde320786a8fb61efebee` | `chat_template.jinja` |
 | `gpt-oss-harmony-b474759b.jinja` | `openai/gpt-oss-20b` | `10e9d713f8e4a9281c59c40be6c58537480635ea` | `chat_template.jinja` |
 | `gpt-oss-harmony-f8d92557.jinja` | `openai/gpt-oss-20b` | `ec854da5735f125fe36f080d8013482590f9ad7d` | `chat_template.jinja` |
+| `kimi-linear-48b-a3b-instruct.jinja` | `moonshotai/Kimi-Linear-48B-A3B-Instruct` | `5eaec587113df30a2cd5821b3fa4be7ee8e8aa37` | `chat_template.jinja` |
 | `lfm2-classic-b3afba27.jinja` | `LiquidAI/LFM2-350M` | `b3afba27815ee83a64b76162cef4d8a4780d6ca7` | `chat_template.jinja` |
 | `lfm2-classic-compact-6d24c6b7.jinja` | `LiquidAI/LFM2-1.2B-Tool` | `6d24c6b7471fcbcec084935e377a5302f4b84389` | `chat_template.jinja` |
 | `lfm2.5-8b-a1b-5673e0de.jinja` | `LiquidAI/LFM2.5-8B-A1B` | `5673e0de372b64331504de73bbbc33b0dde71903` | `chat_template.jinja` |
@@ -49,6 +50,10 @@ fixtures carry one repository file terminator, which signature tests remove
 explicitly. The other upstream bodies end in a line feed and are stored
 unchanged. All other upstream whitespace, including trailing spaces, is
 preserved byte-for-byte.
+
+The upstream Kimi Linear template also has no final line feed. Its fixture
+carries one repository file terminator, which the rendering test removes
+before use.
 
 The Llama 3.1 fixture is byte-identical to
 `meta-llama/Llama-3.3-70B-Instruct` revision

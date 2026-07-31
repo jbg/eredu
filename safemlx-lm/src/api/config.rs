@@ -13,6 +13,8 @@ pub enum ModelKind {
     GptOss,
     /// Thinking Machines Lab Inkling multimodal architecture.
     Inkling,
+    /// Moonshot Kimi Linear hybrid KDA/MLA sparse decoder architecture.
+    KimiLinear,
     /// Llama-compatible dense decoder architecture, including Mistral.
     Llama,
     /// Liquid AI LFM2/LFM2.5 dense or MoE architecture.
@@ -122,6 +124,7 @@ impl ModelKind {
             Self::Gemma4 => "gemma4",
             Self::GptOss => "gpt_oss",
             Self::Inkling => "inkling_mm_model",
+            Self::KimiLinear => "kimi_linear",
             Self::Llama => "llama/mistral",
             Self::Lfm2 => "lfm2/lfm2_moe",
             Self::NemotronH => "nemotron_h",
@@ -140,6 +143,7 @@ impl ModelKind {
             "gemma4" | "gemma4_text" | "gemma4_unified" | "gemma4_unified_text" => Ok(Self::Gemma4),
             "gpt_oss" => Ok(Self::GptOss),
             "inkling_mm_model" => Ok(Self::Inkling),
+            "kimi_linear" => Ok(Self::KimiLinear),
             "llama" | "mistral" => Ok(Self::Llama),
             "lfm2" | "lfm2_moe" => Ok(Self::Lfm2),
             "nemotron_h" => Ok(Self::NemotronH),
@@ -253,6 +257,7 @@ fn validate_model_config(kind: ModelKind, config: &Value) -> Result<(), Error> {
         ModelKind::Gemma4 => gemma4::validate_model_config_value(config),
         ModelKind::GptOss => gpt_oss::validate_model_config_value(config),
         ModelKind::Inkling => inkling::validate_model_config_value(config),
+        ModelKind::KimiLinear => kimi_linear::validate_model_config_value(config),
         ModelKind::Llama => llama::validate_model_config_value(config),
         ModelKind::Lfm2 => lfm2::validate_model_config_value(config),
         ModelKind::NemotronH => nemotron_h::validate_model_config_value(config),

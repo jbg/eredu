@@ -26,8 +26,8 @@ pub use cumulative::*;
 pub use factory::*;
 pub use gguf::{
     GgufAffineTensor, GgufArray, GgufCheckpoint, GgufEndian, GgufLogicalDtype, GgufMaterializer,
-    GgufMetadata, GgufMetadataArray, GgufMetadataValue, GgufOuterSelection, GgufRawTensor,
-    GgufTensor, GgufTensorIter, GgufType,
+    GgufMetadata, GgufMetadataArray, GgufMetadataValue, GgufMxFp4Tensor, GgufOuterSelection,
+    GgufRawTensor, GgufTensor, GgufTensorIter, GgufType,
 };
 pub use logical::*;
 pub use moe::*;

@@ -58,6 +58,15 @@ pub struct AffineTensor {
     pub biases: Vec<u16>,
 }
 
+/// Logical MLX MXFP4 representation reconstructed from GGML type 39 blocks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MxFp4Tensor {
+    pub weight_shape: Vec<u64>,
+    pub scale_shape: Vec<u64>,
+    pub weights: Vec<u32>,
+    pub scales: Vec<u8>,
+}
+
 impl AffineTensor {
     /// Dequantize the affine representation using f16-rounded scales/biases.
     pub fn dequantize(&self) -> Vec<f32> {
@@ -86,6 +95,7 @@ pub enum ConvertedTensor {
     Dense(DenseTensor),
     IQuant(IQuantTensor),
     Affine(AffineTensor),
+    MxFp4(MxFp4Tensor),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -93,6 +103,8 @@ pub(crate) enum ConversionKind {
     Dense(DenseDtype),
     /// Nonlinear IQ codebook blocks retained without conversion.
     IQuant,
+    /// MXFP4 weights plus one E8M0 byte per 32-value group.
+    MxFp4,
     Affine {
         bits: u8,
         group_size: u32,
@@ -105,6 +117,9 @@ pub(crate) fn conversion_kind(ty: GgmlType) -> Result<ConversionKind> {
     }
     if ty.is_iq() {
         return Ok(ConversionKind::IQuant);
+    }
+    if ty == GgmlType::MxFp4 {
+        return Ok(ConversionKind::MxFp4);
     }
     let (bits, group_size) = match ty {
         GgmlType::Q2K => (2, 16),
@@ -161,6 +176,23 @@ pub(crate) fn iquant_packed_shape(shape: &[u64], ty: GgmlType) -> Result<Vec<u64
     Ok(packed)
 }
 
+pub(crate) fn mxfp4_shapes(desc: &TensorDescriptor) -> Result<(Vec<u64>, Vec<u64>)> {
+    let mut weight_shape = desc.mlx_shape();
+    let columns = weight_shape
+        .last_mut()
+        .ok_or_else(|| Error::tensor(&desc.name, "MXFP4 scalar is invalid"))?;
+    if *columns % 32 != 0 {
+        return Err(Error::tensor(
+            &desc.name,
+            "MXFP4 row width is not divisible by 32",
+        ));
+    }
+    *columns /= 8;
+    let mut scale_shape = desc.mlx_shape();
+    *scale_shape.last_mut().unwrap() /= 32;
+    Ok((weight_shape, scale_shape))
+}
+
 pub(crate) fn convert(
     desc: &TensorDescriptor,
     raw: &[u8],
@@ -188,9 +220,42 @@ pub(crate) fn convert(
                 data: raw.to_vec(),
             }));
         }
+        ConversionKind::MxFp4 => return mxfp4(desc, raw).map(ConvertedTensor::MxFp4),
         ConversionKind::Affine { .. } => {}
     }
     affine(desc, raw, endian).map(ConvertedTensor::Affine)
+}
+
+fn mxfp4(desc: &TensorDescriptor, raw: &[u8]) -> Result<MxFp4Tensor> {
+    let (weight_shape, scale_shape) = mxfp4_shapes(desc)?;
+    let blocks = raw.len() / 17;
+    let mut weights = Vec::with_capacity(blocks * 4);
+    let mut scales = Vec::with_capacity(blocks);
+    for block in raw.chunks_exact(17) {
+        scales.push(block[0]);
+        let quants = &block[1..];
+        let mut values = [0u8; 32];
+        for index in 0..16 {
+            values[index] = quants[index] & 0x0f;
+            values[index + 16] = quants[index] >> 4;
+        }
+        for group in values.chunks_exact(8) {
+            weights.push(
+                group
+                    .iter()
+                    .enumerate()
+                    .fold(0u32, |packed, (index, value)| {
+                        packed | (u32::from(*value) << (index * 4))
+                    }),
+            );
+        }
+    }
+    Ok(MxFp4Tensor {
+        weight_shape,
+        scale_shape,
+        weights,
+        scales,
+    })
 }
 
 fn dense_dtype(ty: GgmlType) -> Option<DenseDtype> {
@@ -231,7 +296,7 @@ fn affine(desc: &TensorDescriptor, raw: &[u8], endian: Endian) -> Result<AffineT
     let ConversionKind::Affine { bits, group_size } = conversion_kind(desc.ggml_type)? else {
         return Err(Error::tensor(
             &desc.name,
-            "dense or IQ tensor was sent to affine conversion",
+            "dense, IQ, or MXFP4 tensor was sent to affine conversion",
         ));
     };
     let (weight_shape, scale_shape) = affine_shapes(desc, bits, group_size)?;

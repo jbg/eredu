@@ -6,6 +6,8 @@ pub mod attention;
 pub mod convolution;
 /// Architecture-neutral block-scaled FP8 projections.
 pub mod fp8;
+/// Gated-delta recurrent scans shared by linear-attention architectures.
+pub mod gated_delta;
 /// Causal language-model generation traits used by architecture implementations.
 pub mod generation;
 /// Activation functions and feed-forward layers.

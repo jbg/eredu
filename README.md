@@ -71,6 +71,9 @@ assert_eq!(sum.as_slice::<f32>(), &[5.0, 7.0, 9.0]);
 More examples are in the [`safemlx` crate README](safemlx/README.md). To try
 local text generation with a supported model directory or GGUF file, use the
 [`safemlx-lm` CLI example](examples/safemlx-lm-cli/README.md).
+The architecture-dispatched language-model loader includes Kimi Linear
+SafeTensors and `kimi-linear` GGUF checkpoints, including the official
+`moonshotai/Kimi-Linear-48B-A3B-Instruct` tokenizer and chat/tool protocol.
 
 ## Platforms
 

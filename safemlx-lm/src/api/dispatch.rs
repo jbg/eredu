@@ -18,6 +18,10 @@ pub enum Model {
     GptOssLayerwise(crate::architectures::gpt_oss::layerwise::GptOssLayerwiseModel),
     /// Thinking Machines Lab Inkling model.
     Inkling(inkling::Model),
+    /// Moonshot Kimi Linear hybrid KDA/MLA sparse decoder.
+    KimiLinear(kimi_linear::Model),
+    /// Kimi Linear model using bounded layer execution.
+    KimiLinearLayerwise(crate::architectures::kimi_linear::layerwise::KimiLinearLayerwiseModel),
     /// Inkling multimodal model using bounded layer execution.
     InklingLayerwise(crate::architectures::inkling::layerwise::InklingLayerwiseModel),
     /// Llama-compatible dense model.
@@ -429,6 +433,7 @@ impl Model {
             Self::DeepSeekV3Layerwise(model) => Ok(Some(model.residency_report()?)),
             Self::Gemma4Layerwise(model) => Ok(Some(model.residency_report()?)),
             Self::InklingLayerwise(model) => Ok(Some(model.residency_report()?)),
+            Self::KimiLinearLayerwise(model) => Ok(Some(model.residency_report()?)),
             Self::LlamaLayerwise(model) => model.residency_report(),
             Self::GptOssLayerwise(model) => Ok(Some(model.residency_report()?)),
             Self::Lfm2Layerwise(model) => Ok(Some(model.residency_report()?)),
@@ -452,6 +457,7 @@ impl Model {
             Self::DeepSeekV3Layerwise(model) => model.dense_stream_report(),
             Self::Gemma4Layerwise(model) => model.dense_stream_report(),
             Self::InklingLayerwise(model) => model.dense_stream_report(),
+            Self::KimiLinearLayerwise(model) => model.dense_stream_report(),
             Self::LlamaLayerwise(model) => model.dense_stream_report(),
             Self::GptOssLayerwise(model) => model.dense_stream_report(),
             Self::Lfm2Layerwise(model) => model.dense_stream_report(),
@@ -473,6 +479,7 @@ impl Model {
     ) -> Result<Option<crate::runtime::residency::expert_cache::ExpertCacheReport>, Error> {
         match self {
             Self::DeepSeekV3Layerwise(model) => model.expert_cache_report(),
+            Self::KimiLinearLayerwise(model) => model.expert_cache_report(),
             Self::GptOssLayerwise(model) => model.expert_cache_report(),
             Self::InklingLayerwise(model) => model.expert_cache_report(),
             Self::Lfm2Layerwise(model) => model.expert_cache_report(),
@@ -497,6 +504,8 @@ impl Model {
             Self::GptOssLayerwise(model) => &model.args().model_type,
             Self::Inkling(model) => model.model_type(),
             Self::InklingLayerwise(model) => &model.args().model_type,
+            Self::KimiLinear(model) => model.model_type(),
+            Self::KimiLinearLayerwise(model) => &model.args().model_type,
             Self::Llama(model) => model.model_type(),
             Self::LlamaLayerwise(model) => &model.args().model_type,
             Self::Lfm2(model) => model.model_type(),
@@ -552,9 +561,9 @@ impl Model {
 
     /// Runs a detailed instrumented forward pass for supported model families.
     ///
-    /// DeepSeek-V3/R1, Llama, Qwen3, Qwen3.5 MoE, and Gemma4 currently report
-    /// detailed layer activations. Other families return an error until their
-    /// family-specific inspection paths are wired.
+    /// DeepSeek-V3/R1, Kimi Linear, Llama, Qwen3, Qwen3.5 MoE, and Gemma4
+    /// currently report detailed layer activations. Other families return an
+    /// error until their family-specific inspection paths are wired.
     pub fn forward_with_observer(
         &mut self,
         input_tokens: &Array,
@@ -577,6 +586,21 @@ impl Model {
             (Self::DeepSeekV3Layerwise(_), ModelCache::DeepSeekV3(_)) => Err(Exception::custom(
                 "detailed activation inspection is unavailable for bounded-layer DeepSeek-V3 execution",
             )),
+            (Self::KimiLinear(model), ModelCache::KimiLinear(cache)) => model
+                .forward_with_observer(
+                    kimi_linear::ModelInput {
+                        inputs: input_tokens,
+                        mask,
+                        cache: Some(cache),
+                    },
+                    stream,
+                    observer,
+                ),
+            (Self::KimiLinearLayerwise(_), ModelCache::KimiLinear(_)) => Err(
+                Exception::custom(
+                    "detailed activation inspection is unavailable for bounded-layer Kimi Linear execution",
+                ),
+            ),
             (Self::Llama(model), ModelCache::KeyValue(cache)) => model.forward_with_observer(
                 llama::ModelInput {
                     inputs: input_tokens,
@@ -707,6 +731,24 @@ impl Model {
                 )?;
                 final_token_logits(&logits, stream)
             }
+            (Self::KimiLinear(model), ModelCache::KimiLinear(cache)) => {
+                let prompt_tokens = input::text_token_ids(input, stream)?;
+                let logits = model.forward_with_observer(
+                    kimi_linear::ModelInput {
+                        inputs: &prompt_tokens,
+                        mask: None,
+                        cache: Some(cache),
+                    },
+                    stream,
+                    observer,
+                )?;
+                final_token_logits(&logits, stream)
+            }
+            (Self::KimiLinearLayerwise(_), ModelCache::KimiLinear(_)) => Err(
+                Exception::custom(
+                    "detailed activation inspection is unavailable for bounded-layer Kimi Linear execution",
+                ),
+            ),
             (Self::Gemma4(model), ModelCache::Gemma4(cache)) => {
                 model.prefill_typed_with_observer(input, cache, stream, observer)
             }
@@ -805,6 +847,8 @@ impl Model {
             Self::GptOssLayerwise(model) => ModelCache::GptOss(model.new_cache()),
             Self::Inkling(model) => ModelCache::Inkling(model.new_cache()),
             Self::InklingLayerwise(model) => ModelCache::Inkling(model.new_cache()),
+            Self::KimiLinear(model) => ModelCache::KimiLinear(model.new_cache()),
+            Self::KimiLinearLayerwise(model) => ModelCache::KimiLinear(model.new_cache()),
             Self::Llama(model) => match model.sliding_window() {
                 Some(_) => ModelCache::SlidingKeyValue(model.new_sliding_cache()),
                 None => ModelCache::KeyValue(Vec::new()),
@@ -1051,6 +1095,12 @@ impl Model {
             (Self::DeepSeekV3Layerwise(model), ModelCache::DeepSeekV3(cache)) => {
                 model.prefill_input_logits(input, cache, stream)
             }
+            (Self::KimiLinear(model), ModelCache::KimiLinear(cache)) => {
+                model.prefill_input_logits(input, cache, stream)
+            }
+            (Self::KimiLinearLayerwise(model), ModelCache::KimiLinear(cache)) => {
+                model.prefill_input_logits(input, cache, stream)
+            }
             _ => Err(Exception::custom(
                 "model cache type does not match model kind",
             )),
@@ -1223,6 +1273,18 @@ impl Model {
                     ),
                 )
             }
+            (Self::KimiLinear(model), ModelCache::KimiLinear(cache)) => {
+                ModelGenerate::KimiLinear(kimi_linear::Generate::with_sampler(
+                    model, cache, temp, input, prng_key, stream, sampler,
+                ))
+            }
+            (Self::KimiLinearLayerwise(model), ModelCache::KimiLinear(cache)) => {
+                ModelGenerate::KimiLinearLayerwise(
+                    crate::architectures::kimi_linear::layerwise::Generate::with_sampler(
+                        model, cache, temp, input, prng_key, stream, sampler,
+                    ),
+                )
+            }
             _ => panic!("model cache type does not match model kind"),
         }
     }
@@ -1255,6 +1317,8 @@ pub enum ModelCache {
     NemotronH(nemotron_h::Cache),
     /// Heterogeneous LFM2 attention/convolution cache.
     Lfm2(lfm2::Cache),
+    /// Heterogeneous Kimi Linear KDA/MLA cache.
+    KimiLinear(kimi_linear::Cache),
     /// Heterogeneous Qwen3.5 MoE cache.
     Qwen35Moe(qwen3_5_moe::Cache),
     /// Heterogeneous Qwen3-Next cache.
@@ -1441,6 +1505,10 @@ where
     Inkling(inkling::Generate<'a, S>),
     /// Inkling multimodal-prefill generation using bounded layer execution.
     InklingLayerwise(crate::architectures::inkling::layerwise::Generate<'a, S>),
+    /// Kimi Linear generation iterator.
+    KimiLinear(kimi_linear::Generate<'a, S>),
+    /// Kimi Linear generation using bounded layer execution.
+    KimiLinearLayerwise(crate::architectures::kimi_linear::layerwise::Generate<'a, S>),
     /// Llama generation iterator.
     Llama(llama::Generate<'a, ConcatKeyValueCache, S>),
     /// Llama-compatible generation with bounded sliding-window caches.
@@ -1508,6 +1576,8 @@ where
             Self::GptOssLayerwise(generate) => generate.sampler_mut(),
             Self::Inkling(generate) => generate.sampler_mut(),
             Self::InklingLayerwise(generate) => generate.sampler_mut(),
+            Self::KimiLinear(generate) => generate.sampler_mut(),
+            Self::KimiLinearLayerwise(generate) => generate.sampler_mut(),
             Self::Llama(generate) => generate.sampler_mut(),
             Self::LlamaSliding(generate) => generate.sampler_mut(),
             Self::LlamaPaged(generate) => generate.sampler_mut(),
@@ -1546,6 +1616,8 @@ where
             Self::GptOssLayerwise(generate) => generate.next(),
             Self::Inkling(generate) => generate.next(),
             Self::InklingLayerwise(generate) => generate.next(),
+            Self::KimiLinear(generate) => generate.next(),
+            Self::KimiLinearLayerwise(generate) => generate.next(),
             Self::Llama(generate) => generate.next(),
             Self::LlamaSliding(generate) => generate.next(),
             Self::LlamaPaged(generate) => generate.next(),

@@ -399,6 +399,13 @@ impl DerivedWeightRecipe {
             }
             Self::NegLog { input } => {
                 let array = input.materialize_inner(store, stream, sources)?;
+                let all_negative = array
+                    .lt(Array::from_f32(0.0), stream)?
+                    .all(false, stream)?
+                    .item::<bool>(stream);
+                if !all_negative {
+                    return Err(WeightRecipeError::NonNegativeNegLogInput);
+                }
                 Ok(array.multiply(Array::from_f32(-1.0), stream)?.log(stream)?)
             }
             Self::SubtractOne { input } => {
@@ -702,6 +709,9 @@ pub enum WeightRecipeError {
     /// Checked shape or byte arithmetic overflowed.
     #[error("derived-weight arithmetic overflow: {0}")]
     ArithmeticOverflow(&'static str),
+    /// A transition-rate normalization contained zero or a positive value.
+    #[error("log(-x) derived-weight input must contain only negative values")]
+    NonNegativeNegLogInput,
     /// Checkpoint storage failed.
     #[error(transparent)]
     WeightStore(#[from] crate::runtime::checkpoint::store::WeightStoreError),
@@ -915,6 +925,48 @@ mod tests {
         assert!(matches!(
             transpose.infer(store.as_ref()),
             Err(WeightRecipeError::InvalidPermutation { .. })
+        ));
+    }
+
+    #[test]
+    fn neg_log_materializes_negative_rates_and_rejects_nonnegative_values() {
+        let dir = tempfile::tempdir().unwrap();
+        let negative = [-1.0f32, -4.0]
+            .into_iter()
+            .flat_map(f32::to_le_bytes)
+            .collect::<Vec<_>>();
+        let invalid = [-1.0f32, 0.0]
+            .into_iter()
+            .flat_map(f32::to_le_bytes)
+            .collect::<Vec<_>>();
+        serialize_to_file(
+            [
+                (
+                    "negative",
+                    TensorView::new(SafeDtype::F32, vec![2], &negative).unwrap(),
+                ),
+                (
+                    "invalid",
+                    TensorView::new(SafeDtype::F32, vec![2], &invalid).unwrap(),
+                ),
+            ],
+            None,
+            &dir.path().join("model.safetensors"),
+        )
+        .unwrap();
+        let store = SafetensorsWeightStore::open(dir.path()).unwrap();
+        let stream = Stream::new_with_device(&Device::new(DeviceType::Cpu, 0));
+        let recipe = |key| DerivedWeightRecipe::NegLog {
+            input: Box::new(source(key)),
+        };
+
+        let output = recipe("negative").materialize(&store, &stream).unwrap();
+        let output = output.evaluated().unwrap();
+        assert_eq!(output.as_slice::<f32>()[0], 0.0);
+        assert!((output.as_slice::<f32>()[1] - 4.0f32.ln()).abs() < 1e-6);
+        assert!(matches!(
+            recipe("invalid").materialize(&store, &stream),
+            Err(WeightRecipeError::NonNegativeNegLogInput)
         ));
     }
 }

@@ -51,6 +51,12 @@ IQ-aware runtimes can execute those bytes directly; the canonical scalar
 decoder remains available for differential testing and non-accelerated
 fallbacks. Raw reads and writes retain the original payload bytes exactly.
 
+MXFP4-MoE tensor type 39 is supported as 32-value, 17-byte blocks. Conversion
+returns the logical packed `uint32` nibble weights and `uint8` E8M0 scales used
+by the MLX MXFP4 kernels. The writer preserves canonical raw type-39 blocks
+byte-for-byte; MXFP4 remains distinct from the affine
+weights/scales/biases accessor.
+
 `IQ2_M`, `IQ3_M`, Unsloth `UD-*`, and similar names are mixed-precision file
 recipes, not additional GGML tensor encodings. Such files are compatible when
 their individual tensors use the encodings listed above (and the existing dense

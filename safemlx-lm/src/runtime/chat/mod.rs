@@ -24,8 +24,8 @@ use sha2::{Digest, Sha256};
 use crate::runtime::chat::dialect::DECLARATIVE_DIALECT;
 use crate::runtime::chat::dialect::{
     DeclarativeCallId, DeclarativeDialectSpec, DeclarativePayloadShape, DelimitedChannel,
-    ExactEnvelope, JsonFunctionEnvelope, NamedJsonArgumentsEncoding, ParallelCallLayout,
-    StructuralObjectEncoding, ToolNameConstraint,
+    ExactEnvelope, JsonFunctionEnvelope, NamedCallIdEncoding, NamedJsonArgumentsEncoding,
+    ParallelCallLayout, StructuralObjectEncoding, ToolNameConstraint,
 };
 use crate::{
     runtime::chat::constraints::ConstraintBlueprint,
@@ -755,6 +755,7 @@ pub(crate) const DEEPSEEK_STRUCTURAL_JSON_TOOL_SPEC: DeclarativeDialectSpec =
             name_suffix: "\n```json\n",
             arguments_suffix: "\n```",
             name_constraint: ToolNameConstraint::AsciiAlphanumericUnderscoreDash { max_length: 64 },
+            call_id: None,
         }),
         json_function: None,
         reasoning_channel: None,
@@ -787,10 +788,53 @@ pub(crate) const DEEPSEEK31_STRUCTURAL_JSON_TOOL_SPEC: DeclarativeDialectSpec =
             name_suffix: "<｜tool▁sep｜>",
             arguments_suffix: "",
             name_constraint: ToolNameConstraint::AsciiAlphanumericUnderscoreDash { max_length: 64 },
+            call_id: None,
         }),
         call_separator: "",
         ..DEEPSEEK_STRUCTURAL_JSON_TOOL_SPEC
     };
+
+/// Kimi/K2 native tool envelopes with protocol-owned `functions.<name>:<index>` IDs.
+pub(crate) const KIMI_K2_NATIVE_TOOL_SPEC: DeclarativeDialectSpec = DeclarativeDialectSpec {
+    generation_prompt_behavior: GenerationPromptBehavior::HonorRequest,
+    reasoning_template_kwarg: "enable_thinking",
+    supports_tool_reasoning: true,
+    output: ExactEnvelope {
+        prefix: "<|tool_calls_section_begin|>",
+        suffix: "<|tool_calls_section_end|>",
+    },
+    call: ExactEnvelope {
+        prefix: "<|tool_call_begin|>",
+        suffix: "<|tool_call_end|>",
+    },
+    payload_shape: DeclarativePayloadShape::NamedJsonArguments(NamedJsonArgumentsEncoding {
+        name_suffix: "<|tool_call_argument_begin|>",
+        arguments_suffix: "",
+        name_constraint: ToolNameConstraint::Any,
+        call_id: Some(NamedCallIdEncoding {
+            prefix: "functions.",
+            index_separator: ":",
+        }),
+    }),
+    json_function: None,
+    reasoning_channel: None,
+    text_channel: None,
+    raw_text_before_calls: true,
+    call_separator: "",
+    parallel_layout: ParallelCallLayout::RepeatedEnvelopes,
+    protocol_max_tools: None,
+    protocol_max_calls: None,
+    auto_activation_trigger: Some("<|tool_calls_section_begin|>"),
+    required_structural_tokens: &[
+        "<|tool_calls_section_begin|>",
+        "<|tool_calls_section_end|>",
+        "<|tool_call_begin|>",
+        "<|tool_call_argument_begin|>",
+        "<|tool_call_end|>",
+        "<|im_end|>",
+    ],
+    stop_sequences: &["<|im_end|>"],
+};
 
 #[cfg(test)]
 const GEMMA4_EDGE_TEMPLATE_SIGNATURE: [u8; 32] = [

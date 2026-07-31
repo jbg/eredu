@@ -48,6 +48,8 @@ const QWEN3_OLDER_TOKENIZER_CONFIG: &str =
     include_str!("../../../safemlx-lm-utils/tests/fixtures/qwen3/tokenizer_config.json");
 const QWEN3_VL_FIXTURE: &str =
     include_str!("../../tests/fixtures/chat_templates/qwen3-vl-2b-instruct-89644892.jinja");
+const KIMI_LINEAR_FIXTURE: &str =
+    include_str!("../../tests/fixtures/chat_templates/kimi-linear-48b-a3b-instruct.jinja");
 const HERMES2_PRO_TOOL_USE_FIXTURE: &str = include_str!(
     "../../tests/fixtures/chat_templates/hermes-2-pro-llama-3-8b-f798274b-tool-use.jinja"
 );
@@ -435,6 +437,89 @@ fn production_tool(name: &str) -> serde_json::Value {
     })
 }
 
+#[test]
+fn production_kimi_template_renders_parallel_tools_and_selects_native_dialect() {
+    let mut raw = Tokenizer::new(WordLevel::default());
+    raw.add_special_tokens(
+        [
+            "<|tool_calls_section_begin|>",
+            "<|tool_calls_section_end|>",
+            "<|tool_call_begin|>",
+            "<|tool_call_argument_begin|>",
+            "<|tool_call_end|>",
+            "<|im_end|>",
+            "<|im_system|>",
+            "<|im_user|>",
+            "<|im_assistant|>",
+            "<|im_middle|>",
+        ]
+        .map(|token| AddedToken::from(token, true).normalized(false)),
+    )
+    .unwrap();
+    let mut tokenizer = ChatTokenizer::from_tokenizer(raw);
+    let compiler = Ok(ConstraintCompiler::synthetic_for_tests());
+    let prepared = prepare_chat_from_parts(
+        &mut tokenizer,
+        ModelChatTemplate::Single(KIMI_LINEAR_FIXTURE.into()),
+        "moonshotai/Kimi-Linear-48B-A3B-Instruct",
+        &[163586],
+        Some(&compiler),
+        ChatTemplateRequest {
+            messages: vec![
+                json!({"role": "user", "content": "Look up two values."}),
+                json!({
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": "functions.lookup:0",
+                            "type": "function",
+                            "function": {"name": "lookup", "arguments": {"value": 1}}
+                        },
+                        {
+                            "id": "functions.lookup:1",
+                            "type": "function",
+                            "function": {"name": "lookup", "arguments": "{\"value\":2}"}
+                        }
+                    ]
+                }),
+                json!({
+                    "role": "tool",
+                    "tool_call_id": "functions.lookup:0",
+                    "content": "{\"result\":1}"
+                }),
+            ],
+            tools: vec![production_tool("lookup")],
+            tool_choice: ToolChoice::Required,
+            add_generation_prompt: true,
+            ..ChatTemplateRequest::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        prepared.format_profile_identity(),
+        Some("kimi-k2.native-tools.v1")
+    );
+    assert!(matches!(
+        prepared.native_tool_support(),
+        NativeToolSupport::Supported
+    ));
+    assert!(prepared.rendered_prompt().contains(concat!(
+        "<|tool_call_begin|>functions.lookup:0",
+        "<|tool_call_argument_begin|>{\"value\":1}<|tool_call_end|>"
+    )));
+    assert!(prepared.rendered_prompt().contains(
+        "<|tool_call_begin|>functions.lookup:1<|tool_call_argument_begin|>{\"value\":2}"
+    ));
+    assert!(prepared
+        .rendered_prompt()
+        .contains("## Return of functions.lookup:0\n{\"result\":1}"));
+    assert_eq!(
+        prepared.generation_prompt(),
+        "<|im_assistant|>assistant<|im_middle|>"
+    );
+}
+
 fn plan_accepts(plan: &crate::runtime::chat::ToolRuntimePlan, output: &str) -> bool {
     let mut grammar = plan.generation_constraint().grammar_state();
     let structural_tokens = plan.structural_tokens().collect::<Vec<_>>();
@@ -593,7 +678,7 @@ fn prepared_chat_embedded_mtp_batch_dispatches_qwen_without_a_drafter() {
         "num_hidden_layers": 0,
         "mtp_num_hidden_layers": 1,
         "num_attention_heads": 1,
-        "num_key_value_heads": 1,
+        "num_key_value_heads": 32,
         "head_dim": 8,
         "max_position_embeddings": 16,
         "intermediate_size": 16,
@@ -4375,6 +4460,59 @@ fn check_model_config_reports_supported_llama() {
     }));
 
     assert!(support.is_supported(), "{support:?}");
+}
+
+#[test]
+fn check_model_config_reports_supported_kimi_linear() {
+    let support = check_model_config(&json!({
+        "model_type": "kimi_linear",
+        "vocab_size": 163840,
+        "hidden_size": 2304,
+        "num_hidden_layers": 27,
+        "num_attention_heads": 32,
+        "num_key_value_heads": 1,
+        "intermediate_size": 9216,
+        "head_dim": 72,
+        "model_max_length": 1048576,
+        "rms_norm_eps": 0.00001,
+        "rope_theta": 10000.0,
+        "linear_attn_config": {
+            "kda_layers": [1, 2, 3, 5, 6, 7, 9, 10, 11, 13, 14, 15, 17, 18, 19, 21, 22, 23, 25, 26],
+            "full_attn_layers": [4, 8, 12, 16, 20, 24, 27],
+            "num_heads": 32,
+            "head_dim": 128,
+            "short_conv_kernel_size": 4
+        },
+        "num_experts": 256,
+        "moe_intermediate_size": 1024,
+        "kv_lora_rank": 512,
+        "q_lora_rank": null,
+        "qk_nope_head_dim": 128,
+        "qk_rope_head_dim": 64,
+        "v_head_dim": 128,
+        "mla_use_nope": true,
+        "num_experts_per_token": 8,
+        "num_shared_experts": 1,
+        "moe_router_activation_func": "sigmoid",
+        "moe_renormalize": true,
+        "routed_scaling_factor": 2.446,
+        "first_k_dense_replace": 1,
+        "moe_layer_freq": 1,
+        "use_grouped_topk": true,
+        "num_expert_group": 1,
+        "topk_group": 1,
+        "tie_word_embeddings": false,
+        "num_nextn_predict_layers": 0
+    }));
+
+    assert_eq!(
+        support,
+        super::ModelConfigSupport::Supported(super::SupportedModelConfig {
+            kind: super::ModelKind::KimiLinear,
+            model_type: "kimi_linear".into(),
+            effective_model_type: "kimi_linear".into(),
+        })
+    );
 }
 
 #[test]

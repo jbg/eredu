@@ -37,6 +37,7 @@ pub fn load_tokenizer(model_dir: impl AsRef<Path>) -> Result<Tokenizer, Error> {
         ModelKind::Gemma4 => gemma4::load_gemma4_tokenizer(model_dir),
         ModelKind::GptOss => gpt_oss::load_tokenizer(model_dir),
         ModelKind::Inkling => inkling::load_tokenizer(model_dir),
+        ModelKind::KimiLinear => kimi_linear::load_tokenizer(model_dir),
         ModelKind::Llama => llama::load_llama_tokenizer(model_dir),
         ModelKind::Lfm2 => lfm2::load_tokenizer(model_dir),
         ModelKind::NemotronH => nemotron_h::load_nemotron_h_tokenizer(model_dir),

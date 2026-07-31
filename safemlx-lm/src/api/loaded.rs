@@ -1822,6 +1822,28 @@ pub(super) fn load_gguf_model_data(
     }
 
     let (model, architecture_eos_token_ids) = match architecture.as_str() {
+        "kimi-linear" => {
+            if matches!(options.weight_residency, WeightResidency::FullyResident) {
+                let loaded = kimi_linear::load_gguf_checkpoint(
+                    &checkpoint,
+                    metadata,
+                    options.quantization,
+                    stream,
+                    weights_stream,
+                )?;
+                (Model::KimiLinear(loaded.model), loaded.eos_token_ids)
+            } else {
+                let (loaded, eos_token_ids) =
+                    crate::architectures::kimi_linear::layerwise::load_kimi_linear_gguf_layerwise_model(
+                        &checkpoint,
+                        &metadata,
+                        options.weight_residency,
+                        stream,
+                        weights_stream,
+                    )?;
+                (Model::KimiLinearLayerwise(loaded), eos_token_ids)
+            }
+        }
         "deepseek2" => {
             if matches!(options.weight_residency, WeightResidency::FullyResident) {
                 let loaded = deepseek_v3::load_gguf_checkpoint(
@@ -2019,7 +2041,7 @@ pub(super) fn load_gguf_model_data(
             }
         }
         other => return Err(Error::UnsupportedArchitecture(format!(
-            "GGUF architecture {other:?}; supported GGUF architectures are deepseek2, gemma4, llama, mistral, lfm2, lfm2moe, nemotron_h, nemotron_h_moe, qwen3, qwen3moe, qwen3vl, qwen35, qwen35moe, and qwen3next"
+            "GGUF architecture {other:?}; supported GGUF architectures are kimi-linear, deepseek2, gemma4, llama, mistral, lfm2, lfm2moe, nemotron_h, nemotron_h_moe, qwen3, qwen3moe, qwen3vl, qwen35, qwen35moe, and qwen3next"
         ))),
     };
     let eos_token_ids = merge_eos_token_id_sources([

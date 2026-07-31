@@ -49,6 +49,11 @@ multimodal transient state are not mapped onto this block representation.
 High-level paged constructors reject those representations instead of changing
 their semantics. Inkling is supported because its attention KV can be paged
 independently while the convolution state remains resident.
+Kimi Linear likewise uses a heterogeneous cache: KDA layers retain three
+bounded convolution histories plus an F32 recurrent state, while MLA layers
+retain compressed no-RoPE latents. That cache supports resident and
+weight-layerwise execution, but paged and persisted prompt-cache construction
+is deliberately rejected.
 
 ## Sliding and full attention
 

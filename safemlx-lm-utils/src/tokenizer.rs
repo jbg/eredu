@@ -73,7 +73,10 @@ use std::{
     str::FromStr,
 };
 
-use minijinja::{Environment, Template};
+use minijinja::{
+    value::{Kwargs, Value},
+    Environment, Template,
+};
 use serde::Serialize;
 use tokenizers::Encoding;
 
@@ -185,6 +188,7 @@ impl Tokenizer {
     pub fn from_tokenizer(tokenizer: tokenizers::Tokenizer) -> Self {
         let mut env = Environment::new();
         env.set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);
+        env.add_filter("tojson", hugging_face_tojson);
         Self {
             inner: tokenizer,
             env,
@@ -281,6 +285,18 @@ impl Tokenizer {
             },
         )
     }
+}
+
+/// Hugging Face templates commonly pass Jinja's `separators=(",", ":")`
+/// compatibility argument. MiniJinja already emits compact JSON with those
+/// separators, but its built-in filter rejects the otherwise redundant kwarg.
+fn hugging_face_tojson(
+    value: &Value,
+    indent: Option<Value>,
+    kwargs: Kwargs,
+) -> Result<Value, minijinja::Error> {
+    let _: Option<Value> = kwargs.get("separators")?;
+    minijinja::filters::tojson(value, indent, kwargs)
 }
 
 impl Deref for Tokenizer {

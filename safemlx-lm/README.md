@@ -15,8 +15,9 @@ commit `7c667cb7`.
 The original implementation and authorship belong to the `oxideai/mlx-rs`
 contributors.
 
-This fork adds model/runtime support including Gemma 4 loading, Gemma 4
-assistant drafting, expanded model dispatch, and related generation utilities.
+This fork adds model/runtime support including Gemma 4 loading, Kimi Linear
+hybrid KDA/MLA inference, Gemma 4 assistant drafting, expanded model dispatch,
+and related generation utilities.
 
 ## Persistent checkpoint storage
 
@@ -43,7 +44,7 @@ faults are not reported as known physical disk transfers because logical
 materialization and storage I/O are different measurements.
 
 `ModelLoadOptions` selects either existing eager execution or the generic
-layerwise engine. DeepSeek-V3/R1, Gemma 4, Inkling, Llama,
+layerwise engine. DeepSeek-V3/R1, Gemma 4, Inkling, Kimi Linear, Llama,
 Mistral, GPT-OSS, LFM2/LFM2.5, Nemotron-H, Qwen3, Qwen3-Next, Qwen3-VL,
 Qwen3-VL-MoE, and Qwen3.5 safetensors have registered adapters,
 including dense and MoE variants. Moshi and PersonaPlex use the same engine with
@@ -288,6 +289,7 @@ never replaced by eager loading.
 | GPT-OSS | yes | yes | alternating full/sliding KV | embedding, norm, head | sparse decoder block | native MXFP4 experts | both attention modes and multi-step decode |
 | LFM2/LFM2.5 dense / MoE | yes | yes | growing KV or convolution state | embedding, norm, tied/untied head | hybrid decoder block | split SwiGLU experts packed per layer; packed form accepted | dense and split-MoE hybrid prefill/decode |
 | DeepSeek-V3/R1 | yes | yes | compressed MLA latent and rotary-key state | embedding, norm, head | MLA decoder block with dense or routed/shared experts | official split experts stacked per layer; direct dense/affine and native block-FP8 banks | dense-to-MoE prefill/decode at two depths; native block-FP8 prefill/decode |
+| Kimi Linear | yes | yes | bounded Q/K/V convolution and F32 KDA recurrent state, or growing compressed no-RoPE MLA state | embedding, norm, head | hybrid KDA/MLA block with dense or routed/shared experts | official split experts packed per layer; convolution and transition-state reshaping | prefill/decode primitive, cache, loader, and real-checkpoint smoke coverage |
 | Gemma 4 multimodal | yes | yes | alternating KV plus transient shared-KV and media state | patch embedding/pooling, audio subsampling/output, modality projections, token/per-layer embeddings, norm, head | independent vision, audio, and sliding/full text groups | public prefix rewrite; direct affine/MXFP4 text and modality projections | vision/audio/text typed prefill parity; per-layer inputs, shared KV, prefill/decode at two depths |
 | Inkling multimodal | yes | yes | global/local KV, four convolution states per layer, transient hMLP activations | dMel embedding/norm, hMLP final norm, text embedding/norm/head | independent hMLP and local/global dense-or-MoE text groups | released-name rewrite, convolution cast, dense/routed/shared w13 deinterleave | audio/text typed prefill parity; local/global and dense/MoE prefill/decode at two depths |
 | Nemotron-H | yes | yes | attention KV and Mamba convolution/SSM state | embedding, norm, tied/untied head | hybrid block | public key rewrite and split ReLU2 expert packing | all four block kinds, split MoE, prefill/decode |
@@ -303,15 +305,16 @@ Enable the `cuda` feature to propagate MLX CUDA support through this crate:
 safemlx-lm = { version = "0.4", features = ["cuda"] }
 ```
 
-Most model code uses backend-neutral MLX operations. Qwen3.5 MoE's custom
-Metal FP8 and recurrent kernels use portable MLX operation fallbacks on CUDA;
+Most model code uses backend-neutral MLX operations. Qwen3.5 MoE's and Kimi
+Linear's custom Metal recurrent kernels use portable MLX operation fallbacks on CUDA;
 these prioritize correctness and can be slower or use more temporary memory
 than the Metal-specialized paths.
 
 ## GGUF models
 
 The standard `api::load_model` and `api::LoadedModel::load` entry points
-accept Hugging Face-style model directories for Gemma 4, GPT-OSS, Inkling, Llama, dense Mistral,
+accept Hugging Face-style model directories for Gemma 4, GPT-OSS, Inkling,
+Kimi Linear, Llama, dense Mistral,
 dense LFM2/LFM2.5 and LFM2-MoE, dense and sparse-MoE Nemotron-H, Qwen3,
 Qwen3-Next, Qwen3-VL, Qwen3-VL-MoE, and dense or MoE Qwen3.5. They also accept the
 GGUF architectures listed below. Canonically named sharded GGUF checkpoints
@@ -437,7 +440,7 @@ without expanding matrix weights to float16.
 Q5_0 and Q5_1 tensors are losslessly repacked into MLX's five-bit affine
 layout; unsupported GGUF tensor types return an error. Model dispatch uses
 `general.architecture`; the current GGUF adapters support text-only `deepseek2`,
-`gemma4`, `llama`, `mistral`, `lfm2`, `lfm2moe`, `nemotron_h`,
+`gemma4`, `kimi-linear`, `llama`, `mistral`, `lfm2`, `lfm2moe`, `nemotron_h`,
 `nemotron_h_moe`, `qwen3`, `qwen3moe`, dense `qwen35`, and `qwen35moe`
 architectures, plus `qwen3next` and dense `qwen3vl` with its separate vision projector. For
 Qwen3-VL, put the llama.cpp-style dense F16/BF16/F32
@@ -457,6 +460,15 @@ Omni/multimodal checkpoints remain separate formats. Quantized Qwen3-VL language
 GGUFs retain their supported packed affine weights while the vision projector
 remains dense; quantized Qwen3-VL projectors and Qwen3.5-VL GGUF files are not
 currently handled.
+
+Kimi Linear GGUF accepts modern split `attn_k_b`/`attn_v_b` and legacy
+unsplit `attn_kv_b`, modern and singleton-ranked convolution tensors, dense
+and supported K/IQ formats, and type-39 MXFP4-MoE expert banks. GGUF
+`ssm_a = -exp(A_log)` is validated and converted back to canonical `A_log`.
+Fully resident, bounded-layer, dense-streamed, and sparse-expert residency
+policies share this conversion path.
+Embedded `tokenizer.ggml.pre = kimi-k2` uses the official Han-aware
+pre-tokenization expression.
 
 GGUF IQ tensors are also model-loadable: IQ2_XXS, IQ2_XS, IQ3_XXS, IQ1_S,
 IQ4_NL, IQ3_S, IQ2_S, IQ4_XS, and IQ1_M. Their nonlinear codebooks cannot be
@@ -786,6 +798,7 @@ weights.
 | Llama | yes | MLX affine/MXFP4 | yes / yes | `LoadedModel` | Linear, embedding, tied/untied head targets |
 | Mistral | yes | MLX affine/MXFP4 | yes / yes | `LoadedModel` | Reuses the Llama-compatible dense decoder; configured sliding attention uses bounded KV caches |
 | LFM2/LFM2.5 and LFM2-MoE | yes | MLX affine/MXFP4 and packed GGUF affine | yes / yes | `LoadedModel` | Alternating short-convolution/attention cache; MoE uses sigmoid top-k routing and packed expert-major SwiGLU execution |
+| Kimi Linear | yes | MLX affine/MXFP4 and packed GGUF affine/IQ/MXFP4-MoE | yes / yes | `LoadedModel` | Hybrid KDA/no-RoPE MLA cache; packed routed experts and one shared expert; norms, transition parameters, biases, and convolution weights remain dense |
 | Qwen3 | yes | MLX affine/MXFP4 | yes / yes | `LoadedModel` | Linear, embedding, tied/untied head targets |
 | Qwen3-VL | yes | MLX affine/MXFP4 | yes / yes | `LoadedModel` | Language-model targets are quantized; the vision tower remains dense |
 | Qwen3-VL-MoE | yes | MLX affine/MXFP4 | yes / yes | `LoadedModel` | Reuses Qwen3-VL DeepStack/MRoPE and Qwen3 packed expert-major SwiGLU execution; the vision tower remains dense |
@@ -1077,10 +1090,12 @@ with MLX 0.31.2.
 
 `expert_parallel` provides executable pure expert parallelism for the
 safetensors MoE families supported by sparse expert caching: DeepSeek-V3/R1,
-GPT-OSS, Inkling, LFM2, Nemotron-H, Qwen3, Qwen3-Next, Qwen3-VL-MoE, and
-Qwen3.5-MoE. GPT-OSS and the hybrid or multimodal families require
+GPT-OSS, Inkling, Kimi Linear, LFM2,
+Nemotron-H, Qwen3, Qwen3-Next, Qwen3-VL-MoE, and Qwen3.5-MoE. GPT-OSS and the
+other hybrid or multimodal families require
 `WeightResidency::SparseExpertCache`; DeepSeek and Qwen3 additionally retain
-their fully resident EP loaders. The model API requires `EP > 1`, `TP = 1`,
+their fully resident EP loaders, as does Kimi Linear. The model API requires
+`EP > 1`, `TP = 1`,
 and `PP = 1`; hybrid EP+TP and EP+PP are rejected before checkpoint payloads
 are opened. Dense models and GGUF are also rejected. Checkpoint `ep_size`
 describes a stored layout and is not the runtime EP degree.
@@ -1124,7 +1139,7 @@ for measurement only: the inserted synchronization changes scheduling and can
 reduce production throughput. Use MLX device profiling when kernel-only timing
 is required.
 
-For fully resident DeepSeek and Qwen3,
+For fully resident DeepSeek, Kimi Linear, and Qwen3,
 `ExpertParallelModel::forward_with_observer` preserves global router ids and
 weights while exposing the rank-local routed contribution, globally reduced
 routed contribution, replicated shared-expert contribution, and final combined
@@ -1143,6 +1158,12 @@ cold, warm, or hot catalog; with fully resident DeepSeek/Qwen3 it scales
 approximately with `1 / EP`. `replicated_parameter_bytes` remains constant.
 Load-time conversion is rejected for sparse-cache EP because it would require
 eager expert materialization.
+
+Kimi Linear replicates KDA/MLA, dense MLP, router, shared-expert, embedding,
+normalization, and output parameters. Only routed expert banks are
+partitioned; their contribution is all-summed before the shared expert is
+added once. Sparse-cache EP materializes only rank-owned expert payloads. GGUF
+Kimi expert parallelism remains rejected explicitly.
 
 Run a two-process Ring generation probe with the usual MLX Ring host file and
 rank environment:

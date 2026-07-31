@@ -41,6 +41,13 @@ The pure-Rust conversion code in `safemlx-gguf` is a translation of Apple MLX
 v0.32.0's `mlx/io/gguf_quants.cpp` together with earlier SafeMLX K-quant
 patches. Differential fixtures and their sources are documented in
 [`safemlx-gguf/tests/fixtures/README.md`](../safemlx-gguf/tests/fixtures/README.md).
+MXFP4-MoE type-39 block geometry and Kimi Linear tensor/metadata mapping follow
+llama.cpp's `ggml` format definitions and `conversion/kimi_linear.py`.
+
+Kimi Linear configuration, tensor names, KDA/MLA equations, tokenizer split
+expression, and chat template follow the
+`moonshotai/Kimi-Linear-48B-A3B-Instruct` release. The native tool envelope is
+compatible with the vLLM Kimi K2 parser contract.
 
 ## Licensing
 

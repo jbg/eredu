@@ -10,6 +10,8 @@ pub mod gemma4;
 pub mod gpt_oss;
 /// Inkling multimodal implementations.
 pub mod inkling;
+/// Moonshot Kimi Linear hybrid KDA/MLA implementations.
+pub mod kimi_linear;
 /// LFM2 and LFM2.5 implementations.
 pub mod lfm2;
 /// Llama and Mistral-compatible implementations.

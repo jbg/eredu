@@ -1,4 +1,6 @@
-use crate::convert::{affine_shapes, conversion_kind, iquant_packed_shape, ConversionKind};
+use crate::convert::{
+    affine_shapes, conversion_kind, iquant_packed_shape, mxfp4_shapes, ConversionKind,
+};
 use crate::{
     ConvertedTensor, DenseDtype, Endian, Error, Limits, MetadataValue, OuterSelection, Reader,
     Result, TensorDescriptor,
@@ -70,6 +72,11 @@ impl CatalogTensor {
     /// Packed affine `(bits, group_size)`, or `None` for dense and IQ outputs.
     pub fn affine(&self) -> Option<(u8, u32)> {
         self.affine
+    }
+
+    /// Whether this physical tensor expands into MLX MXFP4 weight and scale arrays.
+    pub fn is_mxfp4(&self) -> bool {
+        self.descriptor.ggml_type == crate::GgmlType::MxFp4
     }
 }
 
@@ -759,9 +766,31 @@ fn catalog_tensor(descriptor: &TensorDescriptor) -> Result<CatalogTensor> {
             affine: None,
         });
     }
+    if let ConversionKind::MxFp4 = kind {
+        let prefix = descriptor.name.strip_suffix(".weight").ok_or_else(|| {
+            Error::tensor(&descriptor.name, "MXFP4 tensor name must end in .weight")
+        })?;
+        let (weight_shape, scale_shape) = mxfp4_shapes(descriptor)?;
+        return Ok(CatalogTensor {
+            descriptor: descriptor.clone(),
+            outputs: vec![
+                LogicalTensorLayout {
+                    name: descriptor.name.clone(),
+                    shape: weight_shape,
+                    dtype: LogicalDtype::U32,
+                },
+                LogicalTensorLayout {
+                    name: format!("{prefix}.scales"),
+                    shape: scale_shape,
+                    dtype: LogicalDtype::U8,
+                },
+            ],
+            affine: None,
+        });
+    }
 
     let ConversionKind::Affine { bits, group_size } = kind else {
-        unreachable!("dense and IQ conversions returned above");
+        unreachable!("dense, IQ, and MXFP4 conversions returned above");
     };
     let prefix = descriptor.name.strip_suffix(".weight").ok_or_else(|| {
         Error::tensor(

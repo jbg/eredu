@@ -75,6 +75,8 @@ pub(crate) use crate::architectures::gemma4::vision as gemma4_vision;
 pub(crate) use crate::architectures::gpt_oss::model as gpt_oss;
 /// Thinking Machines Lab Inkling multimodal decoder support.
 pub(crate) use crate::architectures::inkling::model as inkling;
+/// Moonshot Kimi Linear hybrid KDA/MLA sparse decoder support.
+pub(crate) use crate::architectures::kimi_linear::model as kimi_linear;
 /// Liquid AI LFM2/LFM2.5 dense and MoE text model support.
 pub(crate) use crate::architectures::lfm2::model as lfm2;
 /// Llama decoder-only model support.
@@ -325,6 +327,11 @@ fn load_model_for_kind(
         let expert_cache = combined.expert_cache;
         let non_expert = combined.non_expert;
         return match kind {
+            ModelKind::KimiLinear => Ok(Model::KimiLinearLayerwise(
+                crate::architectures::kimi_linear::layerwise::load_kimi_linear_sparse_expert_cache_model_with_dense_layers(
+                    model_dir, expert_cache, non_expert, stream, weights_stream,
+                )?,
+            )),
             ModelKind::DeepSeekV3 => Ok(Model::DeepSeekV3Layerwise(
                 crate::architectures::deepseek_v3::layerwise::load_deepseek_v3_sparse_expert_cache_model_with_dense_layers(
                     model_dir, expert_cache, non_expert, stream, weights_stream,
@@ -384,6 +391,11 @@ fn load_model_for_kind(
             )));
         }
         return match kind {
+            ModelKind::KimiLinear => Ok(Model::KimiLinearLayerwise(
+                crate::architectures::kimi_linear::layerwise::load_kimi_linear_sparse_expert_cache_model(
+                    model_dir, expert_cache, stream, weights_stream,
+                )?,
+            )),
             ModelKind::DeepSeekV3 => Ok(Model::DeepSeekV3Layerwise(
                 crate::architectures::deepseek_v3::layerwise::load_deepseek_v3_sparse_expert_cache_model(
                     model_dir,
@@ -493,6 +505,14 @@ fn load_model_for_kind(
             )),
             ModelKind::Inkling => Ok(Model::InklingLayerwise(
                 crate::architectures::inkling::layerwise::load_inkling_layerwise_model(
+                    model_dir,
+                    layerwise,
+                    stream,
+                    weights_stream,
+                )?,
+            )),
+            ModelKind::KimiLinear => Ok(Model::KimiLinearLayerwise(
+                crate::architectures::kimi_linear::layerwise::load_kimi_linear_layerwise_model(
                     model_dir,
                     layerwise,
                     stream,
@@ -612,6 +632,12 @@ fn load_model_for_kind(
             ModelKind::Inkling => Err(Error::Quantization(
                 "Inkling affine/MXFP4 on-load quantization is unavailable because its routed experts use packed rank-3 grouped-matmul weights without a matching quantized grouped-matmul implementation".into(),
             )),
+            ModelKind::KimiLinear => Ok(Model::KimiLinear(kimi_linear::load_model_quantized(
+                model_dir,
+                quantization,
+                stream,
+                weights_stream,
+            )?)),
             ModelKind::Llama => Ok(Model::Llama(llama::load_resident_llama_model_quantized(
                 model_dir,
                 quantization,
@@ -688,6 +714,11 @@ fn load_model_for_kind(
             weights_stream,
         )?)),
         ModelKind::Inkling => Ok(Model::Inkling(inkling::load_model(
+            model_dir,
+            stream,
+            weights_stream,
+        )?)),
+        ModelKind::KimiLinear => Ok(Model::KimiLinear(kimi_linear::load_model(
             model_dir,
             stream,
             weights_stream,

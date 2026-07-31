@@ -104,7 +104,7 @@ impl SwiGluMlp {
         input: &Array,
         stream: &Stream,
         prefix: &str,
-        observer: &mut impl ActivationObserver,
+        observer: &mut (impl ActivationObserver + ?Sized),
     ) -> Result<Array, Exception> {
         let gate = self.gate_proj.forward(input, stream)?;
         observer.observe(&format!("{prefix}.gate_proj"), &gate)?;

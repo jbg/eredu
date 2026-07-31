@@ -185,6 +185,17 @@ pub(crate) struct NamedJsonArgumentsEncoding {
     pub(crate) arguments_suffix: &'static str,
     /// Protocol-level restriction on names exposed to the model.
     pub(crate) name_constraint: ToolNameConstraint,
+    /// Optional protocol-native identifier surrounding the selected tool name.
+    pub(crate) call_id: Option<NamedCallIdEncoding>,
+}
+
+/// Syntax for a protocol identifier such as `functions.get_weather:0`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct NamedCallIdEncoding {
+    /// Exact prefix before the declared function name.
+    pub(crate) prefix: &'static str,
+    /// Exact delimiter before a nonnegative decimal call index.
+    pub(crate) index_separator: &'static str,
 }
 
 /// Declarative restrictions imposed on tool names by an output protocol.
@@ -319,6 +330,14 @@ impl DeclarativeDialectSpec {
                     );
                 }
                 encoding.name_constraint.validate("valid_name")?;
+                if encoding.call_id.is_some_and(|call_id| {
+                    call_id.prefix.is_empty() || call_id.index_separator.is_empty()
+                }) {
+                    return Err(
+                        "declarative named call IDs require non-empty prefix and index delimiter"
+                            .into(),
+                    );
+                }
                 if self.json_function.is_some() {
                     return Err(
                         "declarative named JSON arguments cannot carry a JSON function envelope"
@@ -626,11 +645,21 @@ impl DeclarativeDialectSpec {
                     encoding.name_constraint.validate(&tool.name)?;
                     let schema = serde_json::to_string(&tool.parameters)
                         .expect("JSON schema values serialize");
-                    alternatives.push(format!(
-                        "{} {} named_arguments_{index}",
-                        literal(&tool.name)?,
-                        literal(encoding.name_suffix)?,
-                    ));
+                    alternatives.push(if let Some(call_id) = encoding.call_id {
+                        format!(
+                            "{} {} {} /[0-9]+/ {} named_arguments_{index}",
+                            literal(call_id.prefix)?,
+                            literal(&tool.name)?,
+                            literal(call_id.index_separator)?,
+                            literal(encoding.name_suffix)?,
+                        )
+                    } else {
+                        format!(
+                            "{} {} named_arguments_{index}",
+                            literal(&tool.name)?,
+                            literal(encoding.name_suffix)?,
+                        )
+                    });
                     argument_rules.push_str(&format!("named_arguments_{index}: %json {schema}\n"));
                 }
                 if alternatives.is_empty() {
@@ -1444,13 +1473,36 @@ impl DeclarativeParser {
                     let Some(position) = self.pending.find(encoding.name_suffix) else {
                         return Ok(());
                     };
-                    let name = self.pending[..position].to_owned();
+                    let raw_name = self.pending[..position].to_owned();
+                    let (id, name) = if let Some(call_id) = encoding.call_id {
+                        let header = raw_name.strip_prefix(call_id.prefix).ok_or_else(|| {
+                            format!(
+                                "declarative named call ID must begin with {:?}",
+                                call_id.prefix
+                            )
+                        })?;
+                        let (name, index) =
+                            header.rsplit_once(call_id.index_separator).ok_or_else(|| {
+                                format!(
+                                    "declarative named call ID must contain {:?}",
+                                    call_id.index_separator
+                                )
+                            })?;
+                        if index.is_empty() || !index.bytes().all(|byte| byte.is_ascii_digit()) {
+                            return Err(
+                                "declarative named call index must be a nonnegative decimal integer"
+                                    .into(),
+                            );
+                        }
+                        (raw_name.clone(), name.to_owned())
+                    } else {
+                        (format!("call_{}", sink.next_tool_index()), raw_name.clone())
+                    };
                     if name.is_empty() {
                         return Err("declarative named JSON tool name must be non-empty".into());
                     }
                     encoding.name_constraint.validate(&name)?;
                     self.pending.drain(..position + encoding.name_suffix.len());
-                    let id = format!("call_{}", sink.next_tool_index());
                     sink.start_tool_call(id, name);
                     self.state = DeclarativeParserState::NamedJsonPayload {
                         json: JsonFragmentBuffer::default(),
@@ -2521,6 +2573,7 @@ mod tests {
             name_suffix: "::json\n",
             arguments_suffix: "\n::end",
             name_constraint: ToolNameConstraint::AsciiAlphanumericUnderscoreDash { max_length: 64 },
+            call_id: None,
         }),
         json_function: None,
         reasoning_channel: None,
@@ -3353,6 +3406,54 @@ mod tests {
         let mut malformed = required.create_parser().unwrap();
         assert!(malformed
             .push("<calls><call>first_tool::json\n{\"value\":]}")
+            .is_err());
+    }
+
+    #[test]
+    fn kimi_named_call_ids_preserve_parallel_raw_identifiers() {
+        let parameters =
+            DialectParameters::Declarative(&crate::runtime::chat::KIMI_K2_NATIVE_TOOL_SPEC);
+        let output = concat!(
+            "<|tool_calls_section_begin|>",
+            "<|tool_call_begin|>functions.weather:0",
+            "<|tool_call_argument_begin|>{\"city\":\"Tokyo\"}<|tool_call_end|>",
+            "<|tool_call_begin|>functions.news_feed:17",
+            "<|tool_call_argument_begin|>{\"topic\":\"ML\"}<|tool_call_end|>",
+            "<|tool_calls_section_end|>",
+        );
+        for split in 0..=output.len() {
+            let mut parser = DECLARATIVE_DIALECT
+                .incremental_parser_state(parameters)
+                .unwrap();
+            let mut sink = SemanticEventSink::default();
+            parser.push(&output[..split], &mut sink).unwrap();
+            parser.push(&output[split..], &mut sink).unwrap();
+            parser.finish(&mut sink).unwrap();
+            assert!(sink.events().contains(&SemanticEvent::ToolCallStart {
+                index: 0,
+                id: "functions.weather:0".into(),
+                name: "weather".into(),
+            }));
+            assert!(sink.events().contains(&SemanticEvent::ToolCallStart {
+                index: 1,
+                id: "functions.news_feed:17".into(),
+                name: "news_feed".into(),
+            }));
+            assert_eq!(
+                arguments(sink.events()),
+                [r#"{"city":"Tokyo"}"#, r#"{"topic":"ML"}"#]
+            );
+        }
+
+        let mut parser = DECLARATIVE_DIALECT
+            .incremental_parser_state(parameters)
+            .unwrap();
+        let mut sink = SemanticEventSink::default();
+        assert!(parser
+            .push(
+                "<|tool_calls_section_begin|><|tool_call_begin|>functions.weather:-1<|tool_call_argument_begin|>{}",
+                &mut sink,
+            )
             .is_err());
     }
 

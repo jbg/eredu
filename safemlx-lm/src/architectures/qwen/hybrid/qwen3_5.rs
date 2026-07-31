@@ -1,9 +1,5 @@
 //! Dense and MoE Qwen3.5 text model implementation and loader.
 
-use std::{cell::RefCell, collections::HashMap, path::Path, time::Instant};
-
-#[cfg(not(feature = "cuda"))]
-use safemlx::fast::{MetalKernelConfig, RecurrentScanKernel, StatefulMetalKernel};
 use safemlx::{
     builder::Builder,
     error::Exception,
@@ -23,6 +19,7 @@ use safemlx::{
 };
 use serde::{Deserialize, Deserializer};
 use serde_json::Value;
+use std::{cell::RefCell, collections::HashMap, path::Path, time::Instant};
 use tokenizers::Tokenizer;
 
 use crate::architectures::qwen::vl::vision::grid_thw_from_array;
@@ -84,19 +81,8 @@ impl<'de> Deserialize<'de> for LayerType {
     }
 }
 
-#[cfg(not(feature = "cuda"))]
-thread_local! {
-    static RECURRENT_DELTA_KERNELS: RefCell<Option<RecurrentScanKernel>> = const { RefCell::new(None) };
-}
-
 const ROUTED_EXPERT_CHUNK_THRESHOLD: i32 = 64;
 const ROUTED_EXPERT_CHUNK_TOKENS: i32 = 32;
-#[cfg(not(feature = "cuda"))]
-const RECURRENT_PREFILL_SHORT_SCAN_TOKENS: i32 = 64;
-#[cfg(not(feature = "cuda"))]
-const RECURRENT_PREFILL_MEDIUM_SCAN_TOKENS: i32 = 16;
-#[cfg(not(feature = "cuda"))]
-const RECURRENT_PREFILL_LONG_SCAN_TOKENS: i32 = 32;
 
 #[derive(Debug, Clone, Default)]
 /// Profiling counters accumulated by Qwen3.5 MoE when profiling is enabled.
@@ -1526,269 +1512,6 @@ impl LinearAttention {
         x.multiply(safemlx::ops::rsqrt(denom, stream)?, stream)
     }
 
-    #[cfg(not(feature = "cuda"))]
-    fn recurrent_delta_kernels() -> Result<RecurrentScanKernel, Exception> {
-        Ok(RecurrentScanKernel::new(
-            StatefulMetalKernel::new(
-                "qwen35_moe_recurrent_decode",
-                ["state", "query", "key", "value", "g", "beta"],
-                ["out", "state_out"],
-                concat!(
-                    "uint elem = thread_position_in_grid.x;",
-                    "uint vd = elem % VD;",
-                    "uint group = elem / VD;",
-                    "uint state_base = group * KD * VD;",
-                    "uint vec_base = group * KD;",
-                    "uint value_base = group * VD;",
-                    "float gate = metal::exp(g[group]);",
-                    "float kv_mem = 0.0f;",
-                    "for (uint kd = 0; kd < KD; ++kd) {",
-                    "  uint state_idx = state_base + kd * VD + vd;",
-                    "  kv_mem += float(state[state_idx]) * gate * float(key[vec_base + kd]);",
-                    "}",
-                    "float delta = (float(value[value_base + vd]) - kv_mem) * float(beta[group]);",
-                    "float acc = 0.0f;",
-                    "for (uint kd = 0; kd < KD; ++kd) {",
-                    "  uint state_idx = state_base + kd * VD + vd;",
-                    "  float updated = float(state[state_idx]) * gate + float(key[vec_base + kd]) * delta;",
-                    "  state_out[state_idx] = updated;",
-                    "  acc += updated * float(query[vec_base + kd]);",
-                    "}",
-                    "out[value_base + vd] = acc;"
-                ),
-                "",
-                true,
-                false,
-            )?,
-            StatefulMetalKernel::new(
-                "qwen35_moe_recurrent_prefill",
-                ["state", "query", "key", "value", "g", "beta"],
-                ["out", "state_out"],
-                concat!(
-                    "uint elem = thread_position_in_grid.x;",
-                    "uint vd = elem % VD;",
-                    "uint group = elem / VD;",
-                    "uint h = group % H;",
-                    "uint b = group / H;",
-                    "uint state_base = group * KD * VD;",
-                    "for (uint t = 0; t < L; ++t) {",
-                    "  uint gh_idx = (b * L + t) * H + h;",
-                    "  uint vec_base = gh_idx * KD;",
-                    "  uint value_base = gh_idx * VD;",
-                    "  float gate = metal::exp(g[gh_idx]);",
-                    "  float kv_mem = 0.0f;",
-                    "  for (uint kd = 0; kd < KD; ++kd) {",
-                    "    uint state_idx = state_base + kd * VD + vd;",
-                    "    float prev = (t == 0) ? float(state[state_idx]) : float(state_out[state_idx]);",
-                    "    kv_mem += prev * gate * float(key[vec_base + kd]);",
-                    "  }",
-                    "  float delta = (float(value[value_base + vd]) - kv_mem) * float(beta[gh_idx]);",
-                    "  float acc = 0.0f;",
-                    "  for (uint kd = 0; kd < KD; ++kd) {",
-                    "    uint state_idx = state_base + kd * VD + vd;",
-                    "    float prev = (t == 0) ? float(state[state_idx]) : float(state_out[state_idx]);",
-                    "    float updated = prev * gate + float(key[vec_base + kd]) * delta;",
-                    "    state_out[state_idx] = updated;",
-                    "    acc += updated * float(query[vec_base + kd]);",
-                    "  }",
-                    "  out[value_base + vd] = acc;",
-                    "}"
-                ),
-                "",
-                true,
-                false,
-            )?,
-        ))
-    }
-
-    #[cfg(not(feature = "cuda"))]
-    fn recurrent_delta_decode_kernel(
-        state: &Array,
-        query: &Array,
-        key: &Array,
-        value: &Array,
-        g: &Array,
-        beta: &Array,
-        stream: &Stream,
-    ) -> Result<(Array, Array), Exception> {
-        let shape = state.shape();
-        let b = shape[0];
-        let h = shape[1];
-        let kd = shape[2];
-        let vd = shape[3];
-        let state = state.as_dtype(Dtype::Float32, stream)?;
-        let query = query.as_dtype(Dtype::Float32, stream)?;
-        let key = key.as_dtype(Dtype::Float32, stream)?;
-        let value = value.as_dtype(Dtype::Float32, stream)?;
-        let g = g.as_dtype(Dtype::Float32, stream)?;
-        let beta = beta.as_dtype(Dtype::Float32, stream)?;
-
-        let output = RECURRENT_DELTA_KERNELS.with(|cell| -> Result<_, Exception> {
-            if cell.borrow().is_none() {
-                *cell.borrow_mut() = Some(Self::recurrent_delta_kernels()?);
-            }
-            let config = MetalKernelConfig::new()
-                .with_template_arg_int("KD", kd)
-                .with_template_arg_int("VD", vd)
-                .with_grid([b * h * vd, 1, 1])
-                .with_thread_group([256, 1, 1])
-                .with_output_arg([b, 1, h, vd], Dtype::Float32)
-                .with_output_arg([b, h, kd, vd], Dtype::Float32);
-            cell.borrow()
-                .as_ref()
-                .expect("recurrent delta kernels initialized")
-                .decode_device([&state, &query, &key, &value, &g, &beta], &config, stream)
-        })?;
-
-        let (out, state) = output.into_tuple();
-        Ok((state, out))
-    }
-
-    #[cfg(not(feature = "cuda"))]
-    fn recurrent_delta_prefill_kernel(
-        state: &Array,
-        query: &Array,
-        key: &Array,
-        value: &Array,
-        g: &Array,
-        beta: &Array,
-        stream: &Stream,
-    ) -> Result<(Array, Array), Exception> {
-        let shape = query.shape();
-        let b = shape[0];
-        let l = shape[1];
-        let h = shape[2];
-        let kd = shape[3];
-        let vd = value.shape()[3];
-        let state = state.as_dtype(Dtype::Float32, stream)?;
-        let query = query.as_dtype(Dtype::Float32, stream)?;
-        let key = key.as_dtype(Dtype::Float32, stream)?;
-        let value = value.as_dtype(Dtype::Float32, stream)?;
-        let g = g.as_dtype(Dtype::Float32, stream)?;
-        let beta = beta.as_dtype(Dtype::Float32, stream)?;
-
-        let output = RECURRENT_DELTA_KERNELS.with(|cell| -> Result<_, Exception> {
-            if cell.borrow().is_none() {
-                *cell.borrow_mut() = Some(Self::recurrent_delta_kernels()?);
-            }
-            let config = MetalKernelConfig::new()
-                .with_template_arg_int("L", l)
-                .with_template_arg_int("H", h)
-                .with_template_arg_int("KD", kd)
-                .with_template_arg_int("VD", vd)
-                .with_grid([b * h * vd, 1, 1])
-                .with_thread_group([256, 1, 1])
-                .with_output_arg([b, l, h, vd], Dtype::Float32)
-                .with_output_arg([b, h, kd, vd], Dtype::Float32);
-            cell.borrow()
-                .as_ref()
-                .expect("recurrent delta kernels initialized")
-                .prefill_device([&state, &query, &key, &value, &g, &beta], &config, stream)
-        })?;
-
-        let (out, state) = output.into_tuple();
-        Ok((state, out))
-    }
-
-    #[cfg(not(feature = "cuda"))]
-    fn recurrent_delta_prefill_scan_chunked(
-        mut state: Array,
-        query: &Array,
-        key: &Array,
-        value: &Array,
-        g: &Array,
-        beta: &Array,
-        stream: &Stream,
-    ) -> Result<(Array, Array), Exception> {
-        let l = query.shape()[1];
-        let chunk_tokens = if l <= RECURRENT_PREFILL_SHORT_SCAN_TOKENS {
-            RECURRENT_PREFILL_SHORT_SCAN_TOKENS
-        } else if l <= 256 {
-            RECURRENT_PREFILL_MEDIUM_SCAN_TOKENS
-        } else {
-            RECURRENT_PREFILL_LONG_SCAN_TOKENS
-        };
-        let mut outs = Vec::with_capacity(((l + chunk_tokens - 1) / chunk_tokens) as usize);
-        let mut start = 0;
-        while start < l {
-            let end = (start + chunk_tokens).min(l);
-            let query_chunk = query.try_index_device((.., start..end, .., ..), stream)?;
-            let key_chunk = key.try_index_device((.., start..end, .., ..), stream)?;
-            let value_chunk = value.try_index_device((.., start..end, .., ..), stream)?;
-            let g_chunk = g.try_index_device((.., start..end, ..), stream)?;
-            let beta_chunk = beta.try_index_device((.., start..end, ..), stream)?;
-            let (new_state, out) = Self::recurrent_delta_prefill_kernel(
-                &state,
-                &query_chunk,
-                &key_chunk,
-                &value_chunk,
-                &g_chunk,
-                &beta_chunk,
-                stream,
-            )?;
-            state = new_state;
-            outs.push(out);
-            start = end;
-        }
-
-        Ok((state, concatenate_axis(&outs, 1, stream)?))
-    }
-
-    #[cfg(feature = "cuda")]
-    fn recurrent_delta_step_portable(
-        state: &Array,
-        query: &Array,
-        key: &Array,
-        value: &Array,
-        g: &Array,
-        beta: &Array,
-        stream: &Stream,
-    ) -> Result<(Array, Array), Exception> {
-        let gate = exp(g, stream)?.try_index_device((.., .., NewAxis, NewAxis), stream)?;
-        let gated_state = state.multiply(gate, stream)?;
-        let key_column = key.try_index_device((.., .., .., NewAxis), stream)?;
-        let kv_memory = sum_axis(
-            gated_state.multiply(&key_column, stream)?,
-            -2,
-            false,
-            stream,
-        )?;
-        let beta = beta.try_index_device((.., .., NewAxis), stream)?;
-        let delta = value.subtract(kv_memory, stream)?.multiply(beta, stream)?;
-        let delta = delta.try_index_device((.., .., NewAxis, ..), stream)?;
-        let new_state = gated_state.add(key_column.multiply(delta, stream)?, stream)?;
-        let query = query.try_index_device((.., .., .., NewAxis), stream)?;
-        let output = sum_axis(new_state.multiply(query, stream)?, -2, false, stream)?;
-        Ok((new_state, output))
-    }
-
-    #[cfg(feature = "cuda")]
-    fn recurrent_delta_portable(
-        mut state: Array,
-        query: &Array,
-        key: &Array,
-        value: &Array,
-        g: &Array,
-        beta: &Array,
-        stream: &Stream,
-    ) -> Result<(Array, Array), Exception> {
-        let length = query.shape()[1];
-        let mut outputs = Vec::with_capacity(length as usize);
-        for index in 0..length {
-            let query = query.try_index_device((.., index, .., ..), stream)?;
-            let key = key.try_index_device((.., index, .., ..), stream)?;
-            let value = value.try_index_device((.., index, .., ..), stream)?;
-            let gate = g.try_index_device((.., index, ..), stream)?;
-            let beta = beta.try_index_device((.., index, ..), stream)?;
-            let (new_state, output) = Self::recurrent_delta_step_portable(
-                &state, &query, &key, &value, &gate, &beta, stream,
-            )?;
-            state = new_state;
-            outputs.push(output.try_index_device((.., NewAxis, .., ..), stream)?);
-        }
-        Ok((state, concatenate_axis(&outputs, 1, stream)?))
-    }
-
     #[allow(non_snake_case, clippy::too_many_arguments)]
     fn recurrent_delta_rule(
         &self,
@@ -1802,8 +1525,6 @@ impl LinearAttention {
     ) -> Result<Array, Exception> {
         let shape = query.shape();
         let B = shape[0];
-        #[cfg(not(feature = "cuda"))]
-        let L = shape[1];
         let H = shape[2];
         let KD = shape[3];
         let VD = value.shape()[3];
@@ -1813,42 +1534,18 @@ impl LinearAttention {
             .as_ref()
             .and_then(|cache| cache.recurrent_state.clone())
             .unwrap_or(zeros::<f32>(&[B, H, KD, VD], stream)?);
-
-        #[cfg(feature = "cuda")]
-        {
-            let (new_state, output) =
-                Self::recurrent_delta_portable(state, &query, &key, &value, &g, &beta, stream)?;
-            if let Some(cache) = cache {
-                cache.recurrent_state = Some(new_state);
-            }
-            return Ok(output);
-        }
-
-        #[cfg(not(feature = "cuda"))]
-        if L == 1 {
-            let q_t = query.try_index_device((.., 0, .., ..), stream)?;
-            let k_t = key.try_index_device((.., 0, .., ..), stream)?;
-            let v_t = value.try_index_device((.., 0, .., ..), stream)?;
-            let g_t = g.try_index_device((.., 0, ..), stream)?;
-            let beta_t = beta.try_index_device((.., 0, ..), stream)?;
-            let (new_state, out_t) = Self::recurrent_delta_decode_kernel(
-                &state, &q_t, &k_t, &v_t, &g_t, &beta_t, stream,
-            )?;
-            if let Some(cache) = cache {
-                cache.recurrent_state = Some(new_state);
-            }
-            return Ok(out_t);
-        }
-
-        #[cfg(not(feature = "cuda"))]
-        let (new_state, out) = Self::recurrent_delta_prefill_scan_chunked(
-            state, &query, &key, &value, &g, &beta, stream,
+        let (new_state, out) = crate::nn::gated_delta::gated_delta_scan(
+            &query,
+            &key,
+            &value,
+            &g,
+            &beta,
+            Some(state),
+            stream,
         )?;
-        #[cfg(not(feature = "cuda"))]
         if let Some(cache) = cache {
             cache.recurrent_state = Some(new_state);
         }
-        #[cfg(not(feature = "cuda"))]
         Ok(out)
     }
 }
@@ -4332,6 +4029,7 @@ pub(crate) fn load_qwen3_5_moe_gguf_checkpoint(
             )?),
             GgufTensor::Dense(_) => None,
             GgufTensor::IQuant(_) => None,
+            GgufTensor::MxFp4(_) => None,
         };
         for (name, value) in group.into_arrays() {
             let (name, value) =

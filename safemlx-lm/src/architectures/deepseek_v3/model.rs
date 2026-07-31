@@ -728,7 +728,11 @@ impl PackedHeadProjection {
                         output_dims,
                         input_dims / quantization.group_size(),
                     ],
-                    Dtype::Float32,
+                    if quantization == WeightQuantization::MxFp4 {
+                        Dtype::Uint8
+                    } else {
+                        Dtype::Float32
+                    },
                     stream,
                 )?
             } else {
@@ -804,6 +808,8 @@ pub struct MultiHeadLatentAttention {
     pub kv_lora_rank: i32,
     /// Attention score scale.
     pub softmax_scale: f32,
+    /// Whether to leave the nominal positional subspace unrotated.
+    pub use_nope: bool,
     #[param]
     /// Direct query projection for compatible no-query-LoRA checkpoints.
     pub q_proj: Option<Linear>,
@@ -840,7 +846,17 @@ pub struct MultiHeadLatentAttention {
 }
 
 impl MultiHeadLatentAttention {
-    fn new(args: &ModelArgs, layer: i32, stream: &Stream) -> Result<Self, Exception> {
+    pub(crate) fn new(args: &ModelArgs, layer: i32, stream: &Stream) -> Result<Self, Exception> {
+        Self::new_with_nope(args, layer, false, stream)
+    }
+
+    /// Creates MLA with an optional identity positional-subspace policy.
+    pub(crate) fn new_with_nope(
+        args: &ModelArgs,
+        layer: i32,
+        use_nope: bool,
+        stream: &Stream,
+    ) -> Result<Self, Exception> {
         let prefix = format!("model.layers.{layer}.self_attn");
         let format =
             |projection: &str| args.weight_format_for(&format!("{prefix}.{projection}.weight"));
@@ -895,6 +911,7 @@ impl MultiHeadLatentAttention {
             v_head_dim: args.v_head_dim,
             kv_lora_rank: args.kv_lora_rank,
             softmax_scale: scale,
+            use_nope,
             q_proj,
             q_a_proj,
             q_a_layernorm,
@@ -1102,15 +1119,23 @@ impl MultiHeadLatentAttention {
         observe_activation(observer, prefix, "keys_rope_input", &k_pe)?;
 
         let offset = cache.as_ref().map_or(0, |cache| cache.offset());
-        let q_pe = self.rope.forward(
-            nn::RopeInputBuilder::new(&q_pe).offset(offset).build()?,
-            stream,
-        )?;
+        let q_pe = if self.use_nope {
+            q_pe
+        } else {
+            self.rope.forward(
+                nn::RopeInputBuilder::new(&q_pe).offset(offset).build()?,
+                stream,
+            )?
+        };
         observe_activation(observer, prefix, "queries_rope", &q_pe)?;
-        let k_pe = self.rope.forward(
-            nn::RopeInputBuilder::new(&k_pe).offset(offset).build()?,
-            stream,
-        )?;
+        let k_pe = if self.use_nope {
+            k_pe
+        } else {
+            self.rope.forward(
+                nn::RopeInputBuilder::new(&k_pe).offset(offset).build()?,
+                stream,
+            )?
+        };
         observe_activation(observer, prefix, "keys_rope", &k_pe)?;
         let new_k_pe = k_pe.try_index_device((.., 0, .., ..), stream)?;
 
@@ -1403,6 +1428,19 @@ impl MultiHeadLatentAttention {
         let output = self.o_proj.forward(&attended, stream)?;
         observe_activation(observer, prefix, "o_proj", &output)?;
         Ok(output)
+    }
+
+    /// Runs shared MLA with optional activation observation.
+    pub(crate) fn forward_shared(
+        &mut self,
+        x: &Array,
+        mask: Option<&Array>,
+        cache: Option<&mut CompressedLatentCache>,
+        stream: &Stream,
+        prefix: &str,
+        observer: &mut Option<&mut dyn ActivationObserver>,
+    ) -> Result<Array, Exception> {
+        self.forward_impl(x, mask, cache, stream, prefix, observer)
     }
 }
 

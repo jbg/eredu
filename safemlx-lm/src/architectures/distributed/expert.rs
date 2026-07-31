@@ -23,8 +23,8 @@ use safemlx::{
 
 use crate::{
     api::{
-        deepseek_v3, gpt_oss, inkling, input as runtime_input, lfm2, nemotron_h, qwen3,
-        qwen3_5_moe, qwen3_next, qwen3_vl, ModelKind, ModelLoadOptions,
+        deepseek_v3, gpt_oss, inkling, input as runtime_input, kimi_linear, lfm2, nemotron_h,
+        qwen3, qwen3_5_moe, qwen3_next, qwen3_vl, ModelKind, ModelLoadOptions,
     },
     architectures::distributed::pipeline::{
         assign_module, assign_module_excluding, load_deepseek_experts, SynchronizedToken,
@@ -109,6 +109,8 @@ pub struct ExpertParallelInfo {
 pub enum ExpertParallelCache {
     /// DeepSeek compressed-latent attention cache.
     DeepSeek(deepseek_v3::Cache),
+    /// Kimi Linear heterogeneous KDA/MLA cache.
+    KimiLinear(kimi_linear::Cache),
     /// Qwen3 standard key/value cache.
     Qwen3(Vec<Option<ConcatKeyValueCache>>),
     /// Qwen3 bounded sliding-window key/value cache.
@@ -138,6 +140,7 @@ impl ExpertParallelCache {
                     cache.clear()?;
                 }
             }
+            Self::KimiLinear(cache) => cache.reset()?,
             Self::Qwen3(cache) => cache
                 .iter_mut()
                 .flatten()
@@ -171,6 +174,7 @@ impl ExpertParallelCache {
     pub fn offset(&self) -> i32 {
         match self {
             Self::DeepSeek(cache) => cache.offset(),
+            Self::KimiLinear(cache) => cache.offset(),
             Self::Qwen3(cache) => cache
                 .first()
                 .and_then(Option::as_ref)
@@ -199,6 +203,7 @@ impl ExpertParallelCache {
 
 enum ExpertArchitecture {
     DeepSeek(Box<deepseek_v3::Model>),
+    KimiLinear(Box<kimi_linear::Model>),
     Qwen3(Box<qwen3::Model>),
     GptOss(Box<gpt_oss::Model>),
     Inkling(Box<inkling::Model>),
@@ -372,6 +377,9 @@ impl ExpertParallelModel {
     pub fn new_cache(&self) -> ExpertParallelCache {
         match &self.architecture {
             ExpertArchitecture::DeepSeek(model) => ExpertParallelCache::DeepSeek(model.new_cache()),
+            ExpertArchitecture::KimiLinear(model) => {
+                ExpertParallelCache::KimiLinear(model.new_cache())
+            }
             ExpertArchitecture::Qwen3(_) => ExpertParallelCache::Qwen3(Vec::new()),
             ExpertArchitecture::GptOss(model) => ExpertParallelCache::GptOss(model.new_cache()),
             ExpertArchitecture::Inkling(model) => ExpertParallelCache::Inkling(model.new_cache()),
@@ -784,6 +792,44 @@ impl ExpertParallelModel {
                         stream,
                     )?
                 }
+                (ExpertArchitecture::KimiLinear(model), ExpertParallelCache::KimiLinear(cache)) => {
+                    let args = model.args.clone();
+                    model.forward_cached_expert_parallel(
+                        tokens,
+                        mask,
+                        cache,
+                        |layer, hidden, ids, weights, stream| {
+                            let returned = dispatch_replicated_with(
+                                hidden,
+                                ids,
+                                weights,
+                                assignment,
+                                group,
+                                stream,
+                                |routes, stream| {
+                                    let acquired = expert_cache.acquire_routes(
+                                        layer,
+                                        &routes.global_expert_ids,
+                                        pass,
+                                        stream,
+                                    )?;
+                                    execute_cached_kimi_linear(
+                                        &args,
+                                        layer,
+                                        &routes.hidden,
+                                        &acquired,
+                                        expert_cache,
+                                        stream,
+                                    )
+                                },
+                            )
+                            .map_err(|error| Exception::custom(error.to_string()))?;
+                            statistics.accumulate(&returned.statistics);
+                            Ok(returned.reduced_output)
+                        },
+                        stream,
+                    )?
+                }
                 (ExpertArchitecture::Qwen3(model), ExpertParallelCache::Qwen3(cache)) => {
                     let args = model.args.clone();
                     model.forward_cached_expert_parallel(
@@ -1134,6 +1180,18 @@ impl ExpertParallelModel {
         } else {
             match (&mut self.architecture, cache) {
                 (ExpertArchitecture::DeepSeek(model), ExpertParallelCache::DeepSeek(cache)) => {
+                    model.forward_expert_parallel(
+                        tokens,
+                        mask,
+                        cache,
+                        &self.info.assignment,
+                        group,
+                        &mut statistics,
+                        observer,
+                        stream,
+                    )?
+                }
+                (ExpertArchitecture::KimiLinear(model), ExpertParallelCache::KimiLinear(cache)) => {
                     model.forward_expert_parallel(
                         tokens,
                         mask,
@@ -1595,6 +1653,14 @@ fn load_expert_parallel_model_impl(
             stream,
             weights_stream,
         ),
+        Some("kimi_linear") => load_kimi_linear_ep(
+            model_dir,
+            topology,
+            options,
+            assignment,
+            stream,
+            weights_stream,
+        ),
         Some("qwen3" | "qwen3_moe") => {
             load_qwen3_ep(
                 model_dir,
@@ -1797,6 +1863,42 @@ fn execute_cached_qwen3(
     stream: &Stream,
 ) -> Result<Array, Error> {
     execute_cached_qwen3_at(args, layer, "model.layers", hidden, acquired, cache, stream)
+}
+
+fn execute_cached_kimi_linear(
+    args: &kimi_linear::ModelArgs,
+    layer: usize,
+    hidden: &Array,
+    acquired: &AcquiredExperts,
+    cache: &ExpertCache,
+    stream: &Stream,
+) -> Result<Array, Error> {
+    let started = Instant::now();
+    let prefix = format!("model.layers.{layer}.mlp.experts");
+    let mut bank = PackedSwiGluExperts::new(
+        acquired.identities().len() as i32,
+        args.hidden_size,
+        args.moe_intermediate_size,
+        args.weight_quantization_for(&format!("{prefix}.gate_up_proj")),
+        args.weight_quantization_for(&format!("{prefix}.down_proj")),
+        stream,
+    )?;
+    bank.gate_up_proj = Param::new(acquired.compact_binding("gate_up_proj", stream)?);
+    bank.gate_up_proj_scales =
+        Param::new(acquired.optional_compact_binding("gate_up_proj_scales", stream)?);
+    bank.gate_up_proj_biases =
+        Param::new(acquired.optional_compact_binding("gate_up_proj_biases", stream)?);
+    bank.down_proj = Param::new(acquired.compact_binding("down_proj", stream)?);
+    bank.down_proj_scales =
+        Param::new(acquired.optional_compact_binding("down_proj_scales", stream)?);
+    bank.down_proj_biases =
+        Param::new(acquired.optional_compact_binding("down_proj_biases", stream)?);
+    cache.record_compact_bank(acquired.pass(), acquired.scratch_bytes(), started.elapsed())?;
+    let weights = unit_route_weights(hidden.dim(0), hidden.dtype(), stream)?;
+    let output = bank.forward(hidden, acquired.compact_routes(), &weights, stream)?;
+    eval([&output])?;
+    acquired.complete_pending()?;
+    Ok(output)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2175,6 +2277,158 @@ fn quantize_qwen3_local_experts(
     Ok(())
 }
 
+fn load_kimi_linear_ep(
+    model_dir: &Path,
+    topology: ParallelTopology,
+    options: ModelLoadOptions,
+    assignment: Option<ExpertAssignment>,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<ExpertParallelModel, Error> {
+    if let WeightResidency::SparseExpertCache(expert_options) = options.weight_residency {
+        return load_kimi_linear_cached_ep(
+            model_dir,
+            topology,
+            options,
+            expert_options,
+            assignment,
+            stream,
+            weights_stream,
+        );
+    }
+    if !matches!(options.weight_residency, WeightResidency::FullyResident) {
+        return Err(Error::Parallel(
+            "Kimi Linear expert-parallel loading requires fully resident or sparse-expert-cache residency"
+                .into(),
+        ));
+    }
+    let args = kimi_linear::get_model_args(model_dir)?;
+    if args.num_experts <= 0 {
+        return Err(Error::Parallel(
+            "Kimi Linear config has no routed experts".into(),
+        ));
+    }
+    let assignment = resolve_model_assignment(assignment, args.num_experts as usize, topology)?;
+    let mut model = if let Some(quantization) = options.quantization {
+        kimi_linear::load_model_quantized(model_dir, quantization, stream, weights_stream)?
+    } else {
+        kimi_linear::load_model(model_dir, stream, weights_stream)?
+    };
+    let routed_expert_bytes = model.partition_routed_experts(&assignment, stream)?;
+    let local_parameter_bytes = parameter_bytes(&model);
+    let mut opened_checkpoint_shards = std::fs::read_dir(model_dir)?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "safetensors")
+        })
+        .collect::<Vec<_>>();
+    opened_checkpoint_shards.sort();
+    Ok(ExpertParallelModel {
+        topology,
+        info: ExpertParallelInfo {
+            global_rank: topology.global_rank,
+            expert_parallel_rank: topology.expert_parallel_rank,
+            expert_parallel_size: topology.expert_parallel_size,
+            model_kind: ModelKind::KimiLinear,
+            assignment,
+            local_parameter_bytes,
+            routed_expert_bytes,
+            owned_expert_bytes: routed_expert_bytes,
+            replicated_parameter_bytes: local_parameter_bytes - routed_expert_bytes,
+            opened_checkpoint_shards,
+            exchange_strategy: ExpertExchangeStrategy::ReplicatedInputAllSum,
+        },
+        architecture: ExpertArchitecture::KimiLinear(Box::new(model)),
+        expert_cache: None,
+        latest_statistics: Default::default(),
+        cumulative_statistics: Default::default(),
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn load_kimi_linear_cached_ep(
+    model_dir: &Path,
+    topology: ParallelTopology,
+    options: ModelLoadOptions,
+    expert_options: ExpertCacheLoadOptions,
+    assignment: Option<ExpertAssignment>,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<ExpertParallelModel, Error> {
+    if options.quantization.is_some() {
+        return Err(Error::Quantization(
+            "load-time quantization is unsupported with sparse expert-cached Kimi Linear expert parallelism; use checkpoint-native weights"
+                .into(),
+        ));
+    }
+    let args = kimi_linear::get_model_args(model_dir)?;
+    args.validate()?;
+    if args.num_experts <= 0 {
+        return Err(Error::Parallel(
+            "Kimi Linear config has no routed experts".into(),
+        ));
+    }
+    let assignment = resolve_model_assignment(assignment, args.num_experts as usize, topology)?;
+    let store = std::sync::Arc::new(SafetensorsWeightStore::open_with_max_mapped_shards(
+        model_dir,
+        expert_options.non_expert.max_mapped_shards,
+    )?);
+    let plan = expert_cache_base_plan(store.as_ref(), topology, ModelKind::KimiLinear);
+    let partition = load_safetensors_partition_from_store_on_streams(
+        store.as_ref(),
+        &plan,
+        weights_stream,
+        stream,
+        &StrictLoadConfig::default(),
+    )?;
+    let opened_checkpoint_shards = partition.opened_shards().to_vec();
+    let heads = args.linear_attn_config.num_heads;
+    let conv_width = heads * args.linear_attn_config.head_dim;
+    let kernel = args.linear_attn_config.short_conv_kernel_size;
+    let mut tensors = transform_partition_tensors(partition.into_tensors(), |key, value| {
+        let key = key.replace(".block_sparse_moe.", ".mlp.");
+        let value = if key.ends_with(".q_conv1d.weight")
+            || key.ends_with(".k_conv1d.weight")
+            || key.ends_with(".v_conv1d.weight")
+        {
+            value.reshape(&[conv_width, 1, kernel], weights_stream)?
+        } else if key.ends_with(".A_log") {
+            value.reshape(&[1, 1, heads, 1], weights_stream)?
+        } else {
+            value
+        };
+        Ok(vec![(key, value)])
+    })?;
+    let mut model = kimi_linear::Model::new(args.clone(), stream)?;
+    assign_module_excluding(&mut model, "", &mut tensors, None, stream, |name| {
+        name.contains(".mlp.experts.")
+    })?;
+    ensure_no_unused_tensors(tensors)?;
+    let entries =
+        crate::architectures::kimi_linear::layerwise::kimi_expert_catalog(&args, store.as_ref())?;
+    let (expert_cache, owned_expert_bytes) = rank_owned_expert_cache(
+        &store,
+        entries,
+        &assignment,
+        expert_options,
+        stream,
+        weights_stream,
+    )?;
+    let replicated_parameter_bytes = parameter_bytes_excluding(&model, ".mlp.experts.");
+    Ok(finish_additional_cached_ep(
+        topology,
+        ModelKind::KimiLinear,
+        assignment,
+        ExpertArchitecture::KimiLinear(Box::new(model)),
+        expert_cache,
+        owned_expert_bytes,
+        replicated_parameter_bytes,
+        opened_checkpoint_shards,
+    ))
+}
+
 fn load_deepseek_ep(
     model_dir: &Path,
     topology: ParallelTopology,
@@ -2486,6 +2740,9 @@ fn expert_cache_base_plan(
 
 fn is_routed_expert_key(kind: ModelKind, key: &str) -> bool {
     match kind {
+        ModelKind::KimiLinear => {
+            key.contains(".mlp.experts.") || key.contains(".block_sparse_moe.experts.")
+        }
         ModelKind::Lfm2 => key.contains(".feed_forward.experts."),
         ModelKind::NemotronH => key.contains(".experts.") && !key.contains(".shared_experts."),
         ModelKind::Inkling => key.contains(".mlp.experts.") || key.contains(".moe.experts."),

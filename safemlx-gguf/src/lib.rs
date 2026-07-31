@@ -23,7 +23,9 @@ pub use catalog::{
     LogicalDtype, LogicalTensorLayout, RawCheckpointTensor, TensorMaterializer,
     TranslatedTensorLayout,
 };
-pub use convert::{AffineTensor, ConvertedTensor, DenseDtype, DenseTensor, IQuantTensor};
+pub use convert::{
+    AffineTensor, ConvertedTensor, DenseDtype, DenseTensor, IQuantTensor, MxFp4Tensor,
+};
 pub use error::{Error, Result};
 pub use format::{
     Endian, GgmlType, MetadataArray, MetadataValue, TensorDescriptor, DEFAULT_ALIGNMENT,
