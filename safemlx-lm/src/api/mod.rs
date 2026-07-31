@@ -238,10 +238,12 @@ pub(crate) fn gguf_eos_token_ids(
 }
 
 mod config;
-pub(crate) use config::ensure_executable_load_options;
 pub use config::{
     check_model_config, check_model_config_json, check_model_dir, ModelConfigSupport, ModelKind,
     ModelLoadOptions, SupportedModelConfig,
+};
+pub(crate) use config::{
+    ensure_executable_load_options, validate_load_policy, ArtifactLoadKind, GgufArchitecture,
 };
 
 mod capability;
@@ -275,6 +277,13 @@ mod loaded;
 pub(crate) use loaded::validate_gguf_quantization_source;
 pub use loaded::LoadedModel;
 use loaded::{final_token_logits, load_gguf_model_data};
+
+mod inspection;
+pub use inspection::{
+    inspect_model, ArtifactKind, ArtifactModality, ArtifactTensorEncoding, InspectionIssue,
+    InspectionIssueCode, InspectionReadiness, InspectionRequirement, InspectionSeverity,
+    ModelInspectionOptions, ModelInspectionReport,
+};
 
 /// Loads only the model weights and architecture from a model directory.
 pub fn load_model(
@@ -319,7 +328,7 @@ fn load_model_for_kind(
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<Model, Error> {
-    ensure_executable_load_options(options)?;
+    validate_load_policy(kind, ArtifactLoadKind::Safetensors, options)?;
     if let WeightResidency::SparseExpertCacheWithDenseLayers(combined) = options.weight_residency {
         if options.quantization.is_some() {
             return Err(Error::Quantization(format!(

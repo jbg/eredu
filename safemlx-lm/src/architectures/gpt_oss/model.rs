@@ -1300,26 +1300,7 @@ pub(crate) fn prepare_gguf_checkpoint(
             "GGUF architecture {architecture:?}; this loader supports gpt-oss"
         )));
     }
-    for layer in 0..gguf_i32(metadata, "gpt-oss.block_count", stream)? {
-        for projection in ["gate", "up", "down"] {
-            let name = format!("blk.{layer}.ffn_{projection}_exps.weight");
-            let tensor = checkpoint
-                .catalog()
-                .tensors()
-                .find(|tensor| tensor.descriptor().name == name)
-                .ok_or_else(|| {
-                    Error::UnsupportedArchitecture(format!(
-                        "GPT-OSS GGUF is missing routed expert tensor {name:?}"
-                    ))
-                })?;
-            if !tensor.is_mxfp4() {
-                return Err(Error::UnsupportedArchitecture(format!(
-                    "GPT-OSS GGUF routed tensor {name:?} uses {:?}; the current GPT-OSS kernel requires canonical MXFP4 type 39 experts",
-                    tensor.descriptor().ggml_type
-                )));
-            }
-        }
-    }
+    crate::api::GgufArchitecture::GptOss.validate_catalog(checkpoint, metadata)?;
     checkpoint
         .catalog()
         .translated_outputs(translate_gguf_weight_name)

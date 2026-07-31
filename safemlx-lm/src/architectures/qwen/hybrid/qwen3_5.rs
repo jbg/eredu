@@ -3947,13 +3947,9 @@ pub(crate) fn load_qwen3_5_moe_gguf_checkpoint(
             "GGUF architecture {architecture:?}; this loader supports qwen35, qwen35moe, and qwen3next"
         )));
     }
+    crate::api::GgufArchitecture::resolve(&architecture)?
+        .validate_catalog(checkpoint, &metadata)?;
     let is_moe = matches!(architecture.as_str(), "qwen35moe" | "qwen3next");
-    if checkpoint.any_gguf_tensor(|name| name.starts_with("v.") || name.starts_with("mm.")) {
-        return Err(Error::UnsupportedArchitecture(
-            "multimodal Qwen3-Next/Qwen3.5 GGUF checkpoints are not supported; load a text-only qwen3next, qwen35, or qwen35moe checkpoint"
-                .into(),
-        ));
-    }
     let key = |suffix: &str| format!("{architecture}.{suffix}");
     let block_count = qwen35_gguf_i32(&metadata, &key("block_count"), weights_stream)?;
     let nextn_layers =
@@ -4119,11 +4115,7 @@ pub(crate) fn prepare_qwen35_gguf_checkpoint(
             "GGUF architecture {architecture:?}; this loader supports qwen35, qwen35moe, and qwen3next"
         )));
     }
-    if checkpoint.any_gguf_tensor(|name| name.starts_with("v.") || name.starts_with("mm.")) {
-        return Err(Error::UnsupportedArchitecture(
-            "multimodal Qwen3-Next/Qwen3.5 GGUF checkpoints are not supported".into(),
-        ));
-    }
+    crate::api::GgufArchitecture::resolve(&architecture)?.validate_catalog(checkpoint, metadata)?;
     let key = |suffix: &str| format!("{architecture}.{suffix}");
     let block_count = qwen35_gguf_i32(metadata, &key("block_count"), weights_stream)?;
     let nextn_layers =

@@ -5,9 +5,37 @@ API details and the full layerwise-residency matrix, see the
 [`safemlx-lm` README](../safemlx-lm/README.md).
 
 Support is determined from checkpoint metadata and validated configuration,
-not from a model's display name. Applications can inspect a SafeTensors model
-directory before loading it with `check_model_dir`, `check_model_config`, or
-`check_model_config_json`.
+not from a model's display name. Applications can inspect either artifact
+format before loading with `inspect_model`. The compatibility-preserving
+`check_model_dir`, `check_model_config`, and `check_model_config_json` helpers
+remain available for config-only SafeTensors checks.
+
+```rust,no_run
+use safemlx_lm::{inspect_model, InspectionSeverity, ModelInspectionOptions};
+
+let report = inspect_model("model-or-checkpoint", ModelInspectionOptions::default())?;
+if !report.is_loadable() {
+    for issue in report
+        .issues
+        .iter()
+        .filter(|issue| issue.severity == InspectionSeverity::Error)
+    {
+        eprintln!("{:?}: {}", issue.code, issue.detail);
+    }
+    // Route to a fallback engine or return the structured diagnostics.
+}
+# Ok::<(), safemlx_lm::error::Error>(())
+```
+
+Inspection parses configuration, every SafeTensors index and shard header, or
+every GGUF shard header and tensor catalog. It validates the same architecture,
+quantization, parallel-topology, and residency preflight used by the loader;
+reconstructs embedded or sidecar tokenizers; locates chat templates and media
+companions; and can behaviorally probe semantic/tool protocols without loading
+weights or creating an MLX stream. Supplying a concrete `chat_request` in
+`ModelInspectionOptions` validates that request. Without one, native-tool
+readiness is based on a bounded synthetic behavior probe and the report marks
+real schemas, kwargs, and policies as request-specific.
 
 ## SafeTensors model directories
 
@@ -92,6 +120,8 @@ values:
 
 - `deepseek2`
 - `gemma4`
+- `gpt-oss`
+- `inkling` (with an optional sibling audio/vision `mmproj` for multimodal input)
 - `kimi-linear`
 - `llama` and `mistral`
 - `lfm2` and `lfm2moe`
@@ -103,7 +133,9 @@ values:
 
 The tokenizer and chat template are reconstructed from GGUF metadata when
 possible. A sibling `tokenizer.json` can supply a tokenizer that is absent from
-the file or uses an unsupported embedded tokenizer model.
+the file or uses an unsupported embedded tokenizer model. `qwen3vl` requires a
+validated sibling vision projector; Inkling remains text-loadable without its
+combined audio/vision projector and reports multimodal readiness separately.
 
 `safemlx-gguf` parses GGUF v1-v3 in either byte order and validates all shard
 headers before payload materialization. Its supported dense and quantized

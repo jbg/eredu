@@ -7,6 +7,12 @@ guidance in
 
 `safemlx-lm` is a Rust runtime for MLX language models.
 
+Use `inspect_model(path, ModelInspectionOptions)` to preflight a local
+SafeTensors directory or GGUF checkpoint before allocating model weights. The
+structured `ModelInspectionReport` separates container and requested-load
+compatibility from tokenizer, chat, semantic/tool, and multimodal readiness;
+see [`doc/model-support.md`](../doc/model-support.md) for an example.
+
 The crate is derived from the `mlx-lm` crate in
 [`oxideai/mlx-rs`](https://github.com/oxideai/mlx-rs), introduced upstream in
 [`oxideai/mlx-rs#281`](https://github.com/oxideai/mlx-rs/pull/281), merged as

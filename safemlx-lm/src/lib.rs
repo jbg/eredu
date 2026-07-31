@@ -25,8 +25,10 @@ pub use api::realtime::{
     LoadedRealtimeModel, RealtimeModelKind, RealtimeState,
 };
 pub use api::{
-    check_model_config, check_model_config_json, check_model_dir, ModelConfigSupport,
-    ModelLoadOptions, SupportedModelConfig,
+    check_model_config, check_model_config_json, check_model_dir, inspect_model, ArtifactKind,
+    ArtifactModality, ArtifactTensorEncoding, InspectionIssue, InspectionIssueCode,
+    InspectionReadiness, InspectionRequirement, InspectionSeverity, ModelConfigSupport,
+    ModelInspectionOptions, ModelInspectionReport, ModelLoadOptions, SupportedModelConfig,
 };
 pub use architectures::llama::layerwise::{
     load_llama_model, LlamaCache, LlamaLoadOptions, LlamaModel,

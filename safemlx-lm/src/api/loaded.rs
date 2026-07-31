@@ -1837,6 +1837,9 @@ pub(super) fn load_gguf_model_data(
             ));
         }
     };
+    let gguf_architecture = GgufArchitecture::resolve(&architecture)?;
+    gguf_architecture.validate_catalog(&checkpoint, &metadata)?;
+    gguf_architecture.validate_load_policy(options)?;
     let chat_template = match metadata.get("tokenizer.chat_template") {
         Some(GgufMetadataValue::String(template)) => {
             Some(ModelChatTemplate::Single(template.clone()))
@@ -1852,20 +1855,11 @@ pub(super) fn load_gguf_model_data(
         .then(|| load_gguf_tokenizer_from_metadata(gguf_file, &metadata))
         .transpose()?;
     validate_gguf_quantization_source(&checkpoint, &metadata, options.quantization)?;
-    if !matches!(options.weight_residency, WeightResidency::FullyResident)
-        && options.quantization.is_some()
-    {
-        return Err(Error::Quantization(
-            "load-time quantization is incompatible with nonresident GGUF policies; use checkpoint-native GGUF quantization"
-                .into(),
-        ));
-    }
-
     #[cfg(feature = "media-processing")]
     let mut processor = None;
 
-    let (model, architecture_eos_token_ids) = match architecture.as_str() {
-        "kimi-linear" => {
+    let (model, architecture_eos_token_ids) = match gguf_architecture {
+        GgufArchitecture::KimiLinear => {
             if matches!(options.weight_residency, WeightResidency::FullyResident) {
                 let loaded = kimi_linear::load_gguf_checkpoint(
                     &checkpoint,
@@ -1887,7 +1881,7 @@ pub(super) fn load_gguf_model_data(
                 (Model::KimiLinearLayerwise(loaded), eos_token_ids)
             }
         }
-        "deepseek2" => {
+        GgufArchitecture::DeepSeek2 => {
             if matches!(options.weight_residency, WeightResidency::FullyResident) {
                 let loaded = deepseek_v3::load_gguf_checkpoint(
                     &checkpoint,
@@ -1909,7 +1903,7 @@ pub(super) fn load_gguf_model_data(
                 (Model::DeepSeekV3Layerwise(loaded), eos_token_ids)
             }
         }
-        "gpt-oss" => {
+        GgufArchitecture::GptOss => {
             if matches!(options.weight_residency, WeightResidency::FullyResident) {
                 let loaded = gpt_oss::load_gguf_checkpoint(
                     &checkpoint,
@@ -1920,23 +1914,18 @@ pub(super) fn load_gguf_model_data(
                 )?;
                 (Model::GptOss(loaded.model), loaded.eos_token_ids)
             } else {
-                let (loaded, eos_token_ids) = crate::architectures::gpt_oss::layerwise::load_gpt_oss_gguf_layerwise_model(
-                    &checkpoint,
-                    &metadata,
-                    options.weight_residency,
-                    stream,
-                    weights_stream,
-                )?;
+                let (loaded, eos_token_ids) =
+                    crate::architectures::gpt_oss::layerwise::load_gpt_oss_gguf_layerwise_model(
+                        &checkpoint,
+                        &metadata,
+                        options.weight_residency,
+                        stream,
+                        weights_stream,
+                    )?;
                 (Model::GptOssLayerwise(loaded), eos_token_ids)
             }
         }
-        "inkling" => {
-            if options.quantization.is_some() {
-                return Err(Error::Quantization(
-                    "Inkling GGUF load-time requantization is unsupported; use checkpoint-native GGUF quantization"
-                        .into(),
-                ));
-            }
+        GgufArchitecture::Inkling => {
             let mmproj = inkling::open_sibling_mmproj(gguf_file)?;
             #[cfg(feature = "media-processing")]
             if mmproj.is_some() {
@@ -1952,18 +1941,19 @@ pub(super) fn load_gguf_model_data(
                 )?;
                 (Model::Inkling(loaded.model), loaded.eos_token_ids)
             } else {
-                let (loaded, eos_token_ids) = crate::architectures::inkling::layerwise::load_inkling_gguf_layerwise_model(
-                    &checkpoint,
-                    &metadata,
-                    mmproj.as_ref(),
-                    options.weight_residency,
-                    stream,
-                    weights_stream,
-                )?;
+                let (loaded, eos_token_ids) =
+                    crate::architectures::inkling::layerwise::load_inkling_gguf_layerwise_model(
+                        &checkpoint,
+                        &metadata,
+                        mmproj.as_ref(),
+                        options.weight_residency,
+                        stream,
+                        weights_stream,
+                    )?;
                 (Model::InklingLayerwise(loaded), eos_token_ids)
             }
         }
-        "gemma4" => {
+        GgufArchitecture::Gemma4 => {
             if matches!(options.weight_residency, WeightResidency::FullyResident) {
                 let loaded = gemma4::load_gemma4_gguf_checkpoint(
                     &checkpoint,
@@ -1985,7 +1975,7 @@ pub(super) fn load_gguf_model_data(
                 (Model::Gemma4Layerwise(loaded), eos_token_ids)
             }
         }
-        "llama" | "mistral" => {
+        GgufArchitecture::Llama | GgufArchitecture::Mistral => {
             if matches!(options.weight_residency, WeightResidency::FullyResident) {
                 let loaded = llama::load_llama_gguf_checkpoint(
                     &checkpoint,
@@ -1996,17 +1986,18 @@ pub(super) fn load_gguf_model_data(
                 )?;
                 (Model::Llama(loaded.model), loaded.eos_token_ids)
             } else {
-                let (loaded, eos_token_ids) = crate::architectures::llama::layerwise::load_llama_gguf_model(
-                    &checkpoint,
-                    &metadata,
-                    options.weight_residency,
-                    stream,
-                    weights_stream,
-                )?;
+                let (loaded, eos_token_ids) =
+                    crate::architectures::llama::layerwise::load_llama_gguf_model(
+                        &checkpoint,
+                        &metadata,
+                        options.weight_residency,
+                        stream,
+                        weights_stream,
+                    )?;
                 (Model::LlamaLayerwise(loaded), eos_token_ids)
             }
         }
-        "lfm2" | "lfm2moe" => {
+        GgufArchitecture::Lfm2 | GgufArchitecture::Lfm2Moe => {
             if matches!(options.weight_residency, WeightResidency::FullyResident) {
                 let loaded = lfm2::load_gguf_checkpoint(
                     &checkpoint,
@@ -2017,23 +2008,18 @@ pub(super) fn load_gguf_model_data(
                 )?;
                 (Model::Lfm2(loaded.model), loaded.eos_token_ids)
             } else {
-                let (loaded, eos_token_ids) = crate::architectures::lfm2::layerwise::load_lfm2_gguf_layerwise_model(
-                    &checkpoint,
-                    &metadata,
-                    options.weight_residency,
-                    stream,
-                    weights_stream,
-                )?;
+                let (loaded, eos_token_ids) =
+                    crate::architectures::lfm2::layerwise::load_lfm2_gguf_layerwise_model(
+                        &checkpoint,
+                        &metadata,
+                        options.weight_residency,
+                        stream,
+                        weights_stream,
+                    )?;
                 (Model::Lfm2Layerwise(loaded), eos_token_ids)
             }
         }
-        "nemotron_h" | "nemotron_h_moe" => {
-            if options.quantization.is_some() {
-                return Err(Error::Quantization(
-                    "Nemotron-H load-time quantization is unavailable for dense safetensors and GGUF inputs"
-                        .into(),
-                ));
-            }
+        GgufArchitecture::NemotronH | GgufArchitecture::NemotronHMoe => {
             if matches!(options.weight_residency, WeightResidency::FullyResident) {
                 let loaded = nemotron_h::load_nemotron_h_gguf_checkpoint(
                     &checkpoint,
@@ -2054,7 +2040,7 @@ pub(super) fn load_gguf_model_data(
                 (Model::NemotronHLayerwise(loaded), eos_token_ids)
             }
         }
-        "qwen3" | "qwen3moe" => {
+        GgufArchitecture::Qwen3 | GgufArchitecture::Qwen3Moe => {
             if matches!(options.weight_residency, WeightResidency::FullyResident) {
                 let loaded = qwen3::load_qwen3_gguf_checkpoint(
                     &checkpoint,
@@ -2065,21 +2051,23 @@ pub(super) fn load_gguf_model_data(
                 )?;
                 (Model::Qwen3(loaded.model), loaded.eos_token_ids)
             } else {
-                let (loaded, eos_token_ids) = crate::architectures::qwen::qwen3::layerwise::load_qwen3_gguf_layerwise_model(
-                    &checkpoint,
-                    &metadata,
-                    &architecture,
-                    options.weight_residency,
-                    stream,
-                    weights_stream,
-                )?;
+                let (loaded, eos_token_ids) =
+                    crate::architectures::qwen::qwen3::layerwise::load_qwen3_gguf_layerwise_model(
+                        &checkpoint,
+                        &metadata,
+                        &architecture,
+                        options.weight_residency,
+                        stream,
+                        weights_stream,
+                    )?;
                 (Model::Qwen3Layerwise(loaded), eos_token_ids)
             }
         }
-        "qwen3vl" => {
+        GgufArchitecture::Qwen3Vl => {
             let mmproj_file = qwen3_vl::find_qwen3_vl_mmproj(gguf_file)?;
             let vision_checkpoint = GgufCheckpoint::open(mmproj_file)?;
-            let vision_metadata = crate::runtime::checkpoint::load::gguf_metadata(&vision_checkpoint);
+            let vision_metadata =
+                crate::runtime::checkpoint::load::gguf_metadata(&vision_checkpoint);
             if matches!(options.weight_residency, WeightResidency::FullyResident) {
                 let loaded = qwen3_vl::load_qwen3_vl_gguf_checkpoint(
                     &checkpoint,
@@ -2105,7 +2093,7 @@ pub(super) fn load_gguf_model_data(
                 (Model::Qwen3VlLayerwise(loaded), eos_token_ids)
             }
         }
-        "qwen35" | "qwen35moe" | "qwen3next" => {
+        GgufArchitecture::Qwen35 | GgufArchitecture::Qwen35Moe | GgufArchitecture::Qwen3Next => {
             if matches!(options.weight_residency, WeightResidency::FullyResident) {
                 let loaded = qwen3_5_moe::load_qwen3_5_moe_gguf_checkpoint(
                     &checkpoint,
@@ -2114,7 +2102,7 @@ pub(super) fn load_gguf_model_data(
                     stream,
                     weights_stream,
                 )?;
-                let model = if architecture == "qwen3next" {
+                let model = if gguf_architecture == GgufArchitecture::Qwen3Next {
                     Model::Qwen3Next(loaded.model)
                 } else {
                     Model::Qwen35Moe(loaded.model)
@@ -2137,9 +2125,6 @@ pub(super) fn load_gguf_model_data(
                 (model, eos_token_ids)
             }
         }
-        other => return Err(Error::UnsupportedArchitecture(format!(
-            "GGUF architecture {other:?}; supported GGUF architectures are kimi-linear, deepseek2, gpt-oss, inkling, gemma4, llama, mistral, lfm2, lfm2moe, nemotron_h, nemotron_h_moe, qwen3, qwen3moe, qwen3vl, qwen35, qwen35moe, and qwen3next"
-        ))),
     };
     let eos_token_ids = merge_eos_token_id_sources([
         sidecar_eos_token_ids,
