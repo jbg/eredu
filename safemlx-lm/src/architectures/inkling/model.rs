@@ -7,7 +7,7 @@
 
 #![allow(missing_docs)]
 
-use std::path::Path;
+use std::{collections::HashMap, path::Path};
 
 use safemlx::{
     error::Exception,
@@ -17,8 +17,9 @@ use safemlx::{
     ops::{
         arange, argpartition_axis, broadcast_to, clip, concatenate_axis,
         indexing::{take_along_axis, NewAxis, TryIndexOp},
-        matmul, r#where, sigmoid, softmax_axis, sum_axis,
+        matmul, r#where, sigmoid, softmax_axis, sum_axis, GgufCheckpoint, GgufMetadataValue,
     },
+    quantization::MaybeQuantized,
     Array, Dtype, Stream,
 };
 use serde::Deserialize;
@@ -35,6 +36,7 @@ use crate::{
             moe::PackedSwiGluExperts,
         },
         input,
+        qwen3::{gguf_i32, gguf_string},
     },
     error::Error,
     runtime::cache::residency::{
@@ -45,9 +47,10 @@ use crate::{
         SlidingKeyValueCache,
     },
     runtime::checkpoint::load::{
-        for_each_safetensor_array, load_array_strict, safetensors_files, StrictLoadConfig,
-        StrictLoadReport,
+        for_each_safetensor_array, gguf_metadata, gguf_quantization_configs, load_array_strict,
+        load_named_array_strict, safetensors_files, StrictLoadConfig, StrictLoadReport,
     },
+    runtime::checkpoint::quantization::WeightQuantization,
 };
 
 fn default_model_type() -> String {
@@ -175,6 +178,9 @@ pub struct TextArgs {
     pub o_bias: bool,
     #[serde(default)]
     pub model_max_length: Option<i32>,
+    /// Exact per-weight formats for mixed GGUF checkpoints.
+    #[serde(skip)]
+    pub quantized_weight_configs: Option<HashMap<String, WeightQuantization>>,
 }
 
 fn default_gate_activation() -> String {
@@ -194,6 +200,11 @@ fn default_vision_encoder_type() -> String {
 }
 
 impl TextArgs {
+    pub(crate) fn weight_quantization_for(&self, name: &str) -> Option<WeightQuantization> {
+        self.quantized_weight_configs
+            .as_ref()
+            .and_then(|configs| configs.get(name).copied())
+    }
     fn dense_intermediate_size(&self) -> i32 {
         self.dense_intermediate_size
             .unwrap_or(self.intermediate_size)
@@ -495,15 +506,15 @@ struct InklingAttention {
     log_scaling_n_floor: Option<i32>,
     log_scaling_alpha: f32,
     #[param]
-    q_proj: nn::Linear,
+    q_proj: MaybeQuantized<nn::Linear>,
     #[param]
-    k_proj: nn::Linear,
+    k_proj: MaybeQuantized<nn::Linear>,
     #[param]
-    v_proj: nn::Linear,
+    v_proj: MaybeQuantized<nn::Linear>,
     #[param]
-    r_proj: nn::Linear,
+    r_proj: MaybeQuantized<nn::Linear>,
     #[param]
-    o_proj: nn::Linear,
+    o_proj: MaybeQuantized<nn::Linear>,
     #[param]
     q_norm: nn::RmsNorm,
     #[param]
@@ -527,6 +538,7 @@ impl InklingAttention {
         } else {
             args.rel_extent
         };
+        let prefix = format!("model.layers.{layer}.self_attn");
         Ok(Self {
             n_heads,
             n_kv_heads,
@@ -537,39 +549,39 @@ impl InklingAttention {
             sliding_window: args.sliding_window_size,
             log_scaling_n_floor: args.log_scaling_n_floor,
             log_scaling_alpha: args.log_scaling_alpha,
-            q_proj: nn::Linear::unloaded(
+            q_proj: common::linear::unloaded_maybe_quantized_linear(
                 args.hidden_size,
                 n_heads * head_dim,
                 false,
-                Dtype::Float32,
+                args.weight_quantization_for(&format!("{prefix}.q_proj.weight")),
                 stream,
             )?,
-            k_proj: nn::Linear::unloaded(
+            k_proj: common::linear::unloaded_maybe_quantized_linear(
                 args.hidden_size,
                 n_kv_heads * head_dim,
                 false,
-                Dtype::Float32,
+                args.weight_quantization_for(&format!("{prefix}.k_proj.weight")),
                 stream,
             )?,
-            v_proj: nn::Linear::unloaded(
+            v_proj: common::linear::unloaded_maybe_quantized_linear(
                 args.hidden_size,
                 n_kv_heads * head_dim,
                 false,
-                Dtype::Float32,
+                args.weight_quantization_for(&format!("{prefix}.v_proj.weight")),
                 stream,
             )?,
-            r_proj: nn::Linear::unloaded(
+            r_proj: common::linear::unloaded_maybe_quantized_linear(
                 args.hidden_size,
                 n_heads * args.d_rel,
                 false,
-                Dtype::Float32,
+                args.weight_quantization_for(&format!("{prefix}.r_proj.weight")),
                 stream,
             )?,
-            o_proj: nn::Linear::unloaded(
+            o_proj: common::linear::unloaded_maybe_quantized_linear(
                 n_heads * head_dim,
                 args.hidden_size,
                 false,
-                Dtype::Float32,
+                args.weight_quantization_for(&format!("{prefix}.o_proj.weight")),
                 stream,
             )?,
             q_norm: nn::RmsNorm::unloaded(head_dim, args.rms_norm_eps, Dtype::Float32, stream)?,
@@ -1019,24 +1031,25 @@ struct InklingMoe {
 }
 
 impl InklingMoe {
-    fn new(args: &TextArgs, stream: &Stream) -> Result<Self, Exception> {
+    fn new(args: &TextArgs, layer: i32, stream: &Stream) -> Result<Self, Exception> {
         let intermediate = args.moe_intermediate_size();
+        let prefix = format!("model.layers.{layer}.moe");
         Ok(Self {
             router: InklingRouter::new(args, stream)?,
             experts: PackedSwiGluExperts::new(
                 args.n_routed_experts,
                 args.hidden_size,
                 intermediate,
-                None,
-                None,
+                args.weight_quantization_for(&format!("{prefix}.experts.gate_up_proj")),
+                args.weight_quantization_for(&format!("{prefix}.experts.down_proj")),
                 stream,
             )?,
             shared_experts: PackedSwiGluExperts::new(
                 args.n_shared_experts,
                 args.hidden_size,
                 intermediate,
-                None,
-                None,
+                args.weight_quantization_for(&format!("{prefix}.shared_experts.gate_up_proj")),
+                args.weight_quantization_for(&format!("{prefix}.shared_experts.down_proj")),
                 stream,
             )?,
         })
@@ -1131,12 +1144,30 @@ impl DecoderLayer {
                 stream,
             )?,
             dense: if dense {
-                Some(SwiGluMlp::unloaded(
-                    args.hidden_size,
-                    args.dense_intermediate_size(),
-                    false,
-                    stream,
-                )?)
+                let prefix = format!("model.layers.{layer}.dense");
+                Some(SwiGluMlp {
+                    gate_proj: common::linear::unloaded_maybe_quantized_linear(
+                        args.hidden_size,
+                        args.dense_intermediate_size(),
+                        false,
+                        args.weight_quantization_for(&format!("{prefix}.gate_proj.weight")),
+                        stream,
+                    )?,
+                    down_proj: common::linear::unloaded_maybe_quantized_linear(
+                        args.dense_intermediate_size(),
+                        args.hidden_size,
+                        false,
+                        args.weight_quantization_for(&format!("{prefix}.down_proj.weight")),
+                        stream,
+                    )?,
+                    up_proj: common::linear::unloaded_maybe_quantized_linear(
+                        args.hidden_size,
+                        args.dense_intermediate_size(),
+                        false,
+                        args.weight_quantization_for(&format!("{prefix}.up_proj.weight")),
+                        stream,
+                    )?,
+                })
             } else {
                 None
             },
@@ -1148,7 +1179,7 @@ impl DecoderLayer {
             moe: if dense {
                 None
             } else {
-                Some(InklingMoe::new(args, stream)?)
+                Some(InklingMoe::new(args, layer, stream)?)
             },
             mlp_sconv: DepthwiseConv1d::new(
                 args.hidden_size,
@@ -1283,7 +1314,7 @@ impl DecoderLayer {
 #[derive(Debug, Clone, ModuleParameters)]
 struct TextModel {
     #[param]
-    embed_tokens: nn::Embedding,
+    embed_tokens: MaybeQuantized<nn::Embedding>,
     #[param]
     embed_norm: nn::RmsNorm,
     #[param]
@@ -1295,10 +1326,10 @@ struct TextModel {
 impl TextModel {
     fn new(args: &TextArgs, stream: &Stream) -> Result<Self, Exception> {
         Ok(Self {
-            embed_tokens: nn::Embedding::unloaded(
+            embed_tokens: common::linear::unloaded_maybe_quantized_embedding(
                 args.vocab_size,
                 args.hidden_size,
-                Dtype::Float32,
+                args.weight_quantization_for("model.embed_tokens.weight"),
                 stream,
             )?,
             embed_norm: nn::RmsNorm::unloaded(
@@ -1627,7 +1658,7 @@ pub struct Model {
     #[param]
     visual: Option<VisionModel>,
     #[param]
-    lm_head: nn::Linear,
+    lm_head: MaybeQuantized<nn::Linear>,
 }
 
 impl Model {
@@ -1645,11 +1676,11 @@ impl Model {
                 .as_ref()
                 .map(|config| VisionModel::new(config, stream))
                 .transpose()?,
-            lm_head: nn::Linear::unloaded(
+            lm_head: common::linear::unloaded_maybe_quantized_linear(
                 args.text_config.hidden_size,
                 args.text_config.vocab_size,
                 false,
-                Dtype::Float32,
+                args.text_config.weight_quantization_for("lm_head.weight"),
                 stream,
             )?,
             args,
@@ -1821,6 +1852,438 @@ impl CausalLm<Cache> for Model {
 /// Inkling token generation iterator.
 pub type Generate<'a, S = crate::runtime::generation::sampler::DefaultSampler> =
     common::generation::Generate<'a, Model, Cache, S>;
+
+pub(crate) struct LoadedInklingGguf {
+    pub(crate) model: Model,
+    pub(crate) eos_token_ids: Vec<u32>,
+}
+
+pub(crate) struct PreparedInklingGguf {
+    pub(crate) args: ModelArgs,
+    pub(crate) eos_token_ids: Vec<u32>,
+}
+
+/// Loads the text decoder from an `inkling` GGUF checkpoint.
+pub fn load_gguf(
+    gguf_file: impl AsRef<Path>,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<Model, Error> {
+    let checkpoint = GgufCheckpoint::open(gguf_file)?;
+    let metadata = gguf_metadata(&checkpoint);
+    Ok(load_gguf_checkpoint(&checkpoint, metadata, stream, weights_stream)?.model)
+}
+
+pub(crate) fn load_gguf_checkpoint(
+    checkpoint: &GgufCheckpoint,
+    metadata: HashMap<String, GgufMetadataValue>,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<LoadedInklingGguf, Error> {
+    let prepared = prepare_gguf_checkpoint(checkpoint, &metadata, weights_stream)?;
+    let mut model = Model::new(prepared.args, stream)?;
+    let config = StrictLoadConfig::default();
+    let mut report = StrictLoadReport::default();
+    let mut materializer = checkpoint.materializer();
+    for tensor in checkpoint.catalog().tensors() {
+        let physical = &tensor.descriptor().name;
+        if physical.contains("ffn_gate_exps")
+            || physical.contains("ffn_up_exps")
+            || physical.contains("ffn_gate_shexp")
+            || physical.contains("ffn_up_shexp")
+        {
+            continue;
+        }
+        for (name, mut value) in materializer.converted_tensor(physical)?.into_arrays() {
+            let mut translated = translate_gguf_weight_name(&name);
+            if let Some(prefix) = translated.strip_suffix(".global_scale") {
+                let layer = prefix
+                    .strip_prefix("model.layers.")
+                    .and_then(|value| value.parse::<i32>().ok())
+                    .ok_or_else(|| {
+                        Error::UnsupportedArchitecture(format!(
+                            "invalid Inkling GGUF global-scale name {translated:?}"
+                        ))
+                    })?;
+                translated = if model.args.text_config.is_dense(layer) {
+                    format!("model.layers.{layer}.dense_global_scale")
+                } else {
+                    format!("model.layers.{layer}.moe.router.global_scale")
+                };
+            }
+            if translated.contains("_sconv.weight") && value.ndim() == 2 {
+                value = value.reshape(&[value.dim(0), 1, value.dim(1)], weights_stream)?;
+            }
+            load_named_array_strict(&mut model, translated, value, None, &config, &mut report)?;
+        }
+    }
+    for layer in model.args.text_config.dense_mlp_idx..model.args.text_config.num_hidden_layers {
+        let source = format!("blk.{layer}");
+        for (source_gate, source_up, target) in [
+            ("ffn_gate_exps", "ffn_up_exps", "moe.experts.gate_up_proj"),
+            (
+                "ffn_gate_shexp",
+                "ffn_up_shexp",
+                "moe.shared_experts.gate_up_proj",
+            ),
+        ] {
+            let gate = materializer
+                .converted_tensor(&format!("{source}.{source_gate}.weight"))?
+                .into_arrays()
+                .into_iter()
+                .collect::<HashMap<_, _>>();
+            let up = materializer
+                .converted_tensor(&format!("{source}.{source_up}.weight"))?
+                .into_arrays()
+                .into_iter()
+                .collect::<HashMap<_, _>>();
+            for (source_suffix, target_suffix) in
+                [("weight", ""), ("scales", "_scales"), ("biases", "_biases")]
+            {
+                let gate_name = format!("{source}.{source_gate}.{source_suffix}");
+                let up_name = format!("{source}.{source_up}.{source_suffix}");
+                match (gate.get(&gate_name), up.get(&up_name)) {
+                    (Some(gate), Some(up)) => load_named_array_strict(
+                        &mut model,
+                        format!("model.layers.{layer}.{target}{target_suffix}"),
+                        concatenate_axis(&[gate.clone(), up.clone()], 1, weights_stream)?,
+                        None,
+                        &config,
+                        &mut report,
+                    )?,
+                    (None, None) if source_suffix == "biases" => {}
+                    _ => {
+                        return Err(Error::UnsupportedArchitecture(format!(
+                            "Inkling GGUF has incomplete gate/up tensors under {source}"
+                        )))
+                    }
+                }
+            }
+        }
+    }
+    report.finish(&model, &config)?;
+    model.copy_to_stream(stream)?;
+    Ok(LoadedInklingGguf {
+        model,
+        eos_token_ids: prepared.eos_token_ids,
+    })
+}
+
+pub(crate) fn prepare_gguf_checkpoint(
+    checkpoint: &GgufCheckpoint,
+    metadata: &HashMap<String, GgufMetadataValue>,
+    stream: &Stream,
+) -> Result<PreparedInklingGguf, Error> {
+    let architecture = gguf_string(metadata, "general.architecture")?;
+    if architecture != "inkling" {
+        return Err(Error::UnsupportedArchitecture(format!(
+            "GGUF architecture {architecture:?}; this loader supports inkling"
+        )));
+    }
+    checkpoint
+        .catalog()
+        .translated_outputs(translate_gguf_weight_name)
+        .map_err(safemlx::error::IoError::from)?;
+    let mut configs = gguf_quantization_configs(checkpoint, translate_gguf_weight_name)?;
+    let mut args = args_from_gguf(metadata, stream)?;
+    for layer in args.text_config.dense_mlp_idx..args.text_config.num_hidden_layers {
+        for prefix in [
+            format!("model.layers.{layer}.moe.experts"),
+            format!("model.layers.{layer}.moe.shared_experts"),
+        ] {
+            let gate = format!("{prefix}.gate_proj");
+            let up = format!("{prefix}.up_proj");
+            match (configs.remove(&gate), configs.remove(&up)) {
+                (Some(gate), Some(up)) if gate == up => {
+                    configs.insert(format!("{prefix}.gate_up_proj"), gate);
+                }
+                (None, None) => {}
+                (gate, up) => {
+                    return Err(Error::UnsupportedArchitecture(format!(
+                        "Inkling GGUF gate/up formats differ under {prefix}: {gate:?} vs {up:?}"
+                    )))
+                }
+            }
+        }
+    }
+    args.text_config.quantized_weight_configs = Some(configs);
+    validate_args(&args)?;
+    Ok(PreparedInklingGguf {
+        args,
+        eos_token_ids: crate::api::gguf_eos_token_ids(metadata)?,
+    })
+}
+
+fn args_from_gguf(
+    metadata: &HashMap<String, GgufMetadataValue>,
+    stream: &Stream,
+) -> Result<ModelArgs, Error> {
+    let key = |suffix: &str| format!("inkling.{suffix}");
+    let layers = gguf_i32(metadata, &key("block_count"), stream)?;
+    let pattern = gguf_bool_pattern(metadata, &key("attention.sliding_window_pattern"), layers)?;
+    let kv_values = metadata
+        .get(&key("attention.head_count_kv"))
+        .and_then(GgufMetadataValue::to_i64_vec)
+        .ok_or_else(|| {
+            Error::UnsupportedArchitecture("Inkling GGUF is missing attention.head_count_kv".into())
+        })?;
+    let kv_values = if kv_values.len() == 1 {
+        vec![kv_values[0]; layers as usize]
+    } else {
+        kv_values
+    };
+    if kv_values.len() != layers as usize {
+        return Err(Error::UnsupportedArchitecture(
+            "Inkling GGUF attention.head_count_kv length does not match block_count".into(),
+        ));
+    }
+    let global_kv = kv_values
+        .iter()
+        .zip(&pattern)
+        .find_map(|(value, local)| (!local).then_some(*value))
+        .unwrap_or(kv_values[0]);
+    let local_kv = kv_values
+        .iter()
+        .zip(&pattern)
+        .find_map(|(value, local)| local.then_some(*value))
+        .unwrap_or(global_kv);
+    let hidden_size = gguf_i32(metadata, &key("embedding_length"), stream)?;
+    let heads = gguf_i32(metadata, &key("attention.head_count"), stream)?;
+    let head_dim =
+        gguf_optional_i32(metadata, &key("attention.key_length"))?.unwrap_or(hidden_size / heads);
+    let vocab_size = gguf_vocab_size(metadata, &key("vocab_size"), stream)?;
+    Ok(ModelArgs {
+        model_type: "inkling_mm_model".into(),
+        text_config: TextArgs {
+            hidden_size,
+            num_hidden_layers: layers,
+            vocab_size,
+            num_attention_heads: heads,
+            num_key_value_heads: i32::try_from(global_kv).map_err(|_| {
+                Error::UnsupportedArchitecture("Inkling global KV heads exceed i32".into())
+            })?,
+            head_dim,
+            swa_num_attention_heads: Some(heads),
+            swa_num_key_value_heads: Some(i32::try_from(local_kv).map_err(|_| {
+                Error::UnsupportedArchitecture("Inkling local KV heads exceed i32".into())
+            })?),
+            swa_head_dim: Some(head_dim),
+            sliding_window_size: gguf_i32(metadata, &key("attention.sliding_window"), stream)?,
+            local_layer_ids: Some(
+                pattern
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(layer, local)| local.then_some(layer as i32))
+                    .collect(),
+            ),
+            layer_types: None,
+            dense_mlp_idx: gguf_i32(metadata, &key("dense_block_count"), stream)?,
+            mlp_layer_types: None,
+            sconv_kernel_size: gguf_i32(metadata, &key("shortconv_kernel"), stream)?,
+            use_sconv: true,
+            rel_extent: gguf_i32(metadata, &key("rel_extent"), stream)?,
+            d_rel: gguf_i32(metadata, &key("d_rel"), stream)?,
+            log_scaling_n_floor: gguf_optional_i32(metadata, &key("log_scaling_n_floor"))?
+                .filter(|value| *value > 0),
+            log_scaling_alpha: gguf_optional_f32(metadata, &key("log_scaling_alpha"))?
+                .unwrap_or(0.0),
+            rms_norm_eps: gguf_f32(metadata, &key("attention.layer_norm_rms_epsilon"))?,
+            use_embed_norm: true,
+            unpadded_vocab_size: gguf_optional_i32(metadata, &key("unpadded_vocab_size"))?,
+            logits_mup_width_multiplier: gguf_optional_f32(metadata, &key("logit_scale_denom"))?
+                .unwrap_or(1.0),
+            final_logit_softcapping: None,
+            intermediate_size: gguf_i32(metadata, &key("expert_feed_forward_length"), stream)?,
+            dense_intermediate_size: Some(gguf_i32(metadata, &key("feed_forward_length"), stream)?),
+            moe_intermediate_size: None,
+            n_routed_experts: gguf_i32(metadata, &key("expert_count"), stream)?,
+            num_experts_per_tok: gguf_i32(metadata, &key("expert_used_count"), stream)?,
+            n_shared_experts: gguf_i32(metadata, &key("expert_shared_count"), stream)?,
+            route_scale: gguf_optional_f32(metadata, &key("expert_weights_scale"))?.unwrap_or(1.0),
+            shared_expert_sink: true,
+            use_gate_bias: true,
+            norm_after_topk: true,
+            use_global_scale: true,
+            gate_activation: "sigmoid".into(),
+            hidden_act: "silu".into(),
+            attention_dropout: 0.0,
+            q_bias: false,
+            o_bias: false,
+            model_max_length: Some(gguf_i32(metadata, &key("context_length"), stream)?),
+            quantized_weight_configs: None,
+        },
+        audio_config: None,
+        vision_config: None,
+        image_token_id: default_image_token_id(),
+        audio_token_id: default_audio_token_id(),
+        eos_token_id: crate::api::gguf_eos_token_ids(metadata)?.first().copied(),
+    })
+}
+
+fn gguf_bool_pattern(
+    metadata: &HashMap<String, GgufMetadataValue>,
+    key: &str,
+    layers: i32,
+) -> Result<Vec<bool>, Error> {
+    let values = match metadata.get(key) {
+        Some(GgufMetadataValue::Array(safemlx::ops::GgufMetadataArray::Bool(values))) => {
+            values.clone()
+        }
+        Some(value) => value
+            .to_i64_vec()
+            .map(|values| values.into_iter().map(|value| value != 0).collect())
+            .ok_or_else(|| {
+                Error::UnsupportedArchitecture(format!(
+                    "Inkling GGUF metadata key {key:?} must be a bool array"
+                ))
+            })?,
+        None => (0..layers).map(|layer| (layer + 1) % 6 != 0).collect(),
+    };
+    if values.len() != layers as usize {
+        return Err(Error::UnsupportedArchitecture(format!(
+            "Inkling GGUF {key:?} has {} values for {layers} layers",
+            values.len()
+        )));
+    }
+    Ok(values)
+}
+
+fn gguf_vocab_size(
+    metadata: &HashMap<String, GgufMetadataValue>,
+    fallback: &str,
+    stream: &Stream,
+) -> Result<i32, Error> {
+    match metadata
+        .get("tokenizer.ggml.tokens")
+        .and_then(GgufMetadataValue::as_strings)
+    {
+        Some(tokens) => i32::try_from(tokens.len()).map_err(|_| {
+            Error::UnsupportedArchitecture("GGUF tokenizer vocabulary exceeds i32".into())
+        }),
+        None if metadata.contains_key("tokenizer.ggml.tokens") => {
+            Err(Error::UnsupportedArchitecture(
+                "GGUF tokenizer.ggml.tokens metadata has the wrong type".into(),
+            ))
+        }
+        None => gguf_i32(metadata, fallback, stream),
+    }
+}
+
+fn gguf_optional_i32(
+    metadata: &HashMap<String, GgufMetadataValue>,
+    key: &str,
+) -> Result<Option<i32>, Error> {
+    metadata
+        .get(key)
+        .map(|value| {
+            value
+                .as_i64()
+                .and_then(|value| i32::try_from(value).ok())
+                .ok_or_else(|| {
+                    Error::UnsupportedArchitecture(format!(
+                        "GGUF metadata key {key:?} must be an i32 scalar"
+                    ))
+                })
+        })
+        .transpose()
+}
+
+fn gguf_f32(metadata: &HashMap<String, GgufMetadataValue>, key: &str) -> Result<f32, Error> {
+    gguf_optional_f32(metadata, key)?.ok_or_else(|| {
+        Error::UnsupportedArchitecture(format!("GGUF metadata is missing required key {key:?}"))
+    })
+}
+
+fn gguf_optional_f32(
+    metadata: &HashMap<String, GgufMetadataValue>,
+    key: &str,
+) -> Result<Option<f32>, Error> {
+    metadata
+        .get(key)
+        .map(|value| {
+            value.as_f32().ok_or_else(|| {
+                Error::UnsupportedArchitecture(format!(
+                    "GGUF metadata key {key:?} must be a numeric scalar"
+                ))
+            })
+        })
+        .transpose()
+}
+
+pub(crate) fn translate_gguf_weight_name(name: &str) -> String {
+    for (source, target) in [
+        ("token_embd", "model.embed_tokens"),
+        ("token_embd_norm", "model.embed_norm"),
+        ("output_norm", "model.norm"),
+        ("output", "lm_head"),
+    ] {
+        if name == source || name.starts_with(&format!("{source}.")) {
+            return name.replacen(source, target, 1);
+        }
+    }
+    let Some(rest) = name.strip_prefix("blk.") else {
+        return name.to_string();
+    };
+    let Some((layer, parameter)) = rest.split_once('.') else {
+        return name.to_string();
+    };
+    for (source, target) in [
+        ("ffn_gate_exps", "moe.experts.gate_proj"),
+        ("ffn_up_exps", "moe.experts.up_proj"),
+        ("ffn_down_exps", "moe.experts.down_proj"),
+        ("ffn_gate_shexp", "moe.shared_experts.gate_proj"),
+        ("ffn_up_shexp", "moe.shared_experts.up_proj"),
+        ("ffn_down_shexp", "moe.shared_experts.down_proj"),
+    ] {
+        if parameter == source || parameter.starts_with(&format!("{source}.")) {
+            let suffix = parameter.strip_prefix(source).unwrap_or_default();
+            let suffix = match suffix {
+                ".weight" => "",
+                ".scales" => "_scales",
+                ".biases" => "_biases",
+                other => other,
+            };
+            return format!("model.layers.{layer}.{target}{suffix}");
+        }
+    }
+    for (source, target) in [
+        ("attn_norm", "input_layernorm"),
+        ("attn_q", "self_attn.q_proj"),
+        ("attn_k", "self_attn.k_proj"),
+        ("attn_v", "self_attn.v_proj"),
+        ("attn_r", "self_attn.r_proj"),
+        ("attn_output", "self_attn.o_proj"),
+        ("attn_q_norm", "self_attn.q_norm"),
+        ("attn_k_norm", "self_attn.k_norm"),
+        ("shortconv_k", "self_attn.k_sconv"),
+        ("shortconv_v", "self_attn.v_sconv"),
+        ("shortconv_attn", "attn_sconv"),
+        ("shortconv_mlp", "mlp_sconv"),
+        ("ffn_norm", "post_attention_layernorm"),
+        ("ffn_gate", "dense.gate_proj"),
+        ("ffn_up", "dense.up_proj"),
+        ("ffn_down", "dense.down_proj"),
+        ("ffn_gate_inp", "moe.router.weight"),
+    ] {
+        if parameter == source || parameter.starts_with(&format!("{source}.")) {
+            let mut translated = parameter.replacen(source, target, 1);
+            if source == "ffn_gate_inp" && translated.ends_with(".weight") {
+                translated.truncate(translated.len() - ".weight".len());
+            }
+            return format!("model.layers.{layer}.{translated}");
+        }
+    }
+    if parameter == "attn_rel_proj.weight" || parameter == "attn_rel_proj" {
+        return format!("model.layers.{layer}.self_attn.rel_proj");
+    }
+    if parameter == "ffn_gscale" || parameter == "ffn_gscale.weight" {
+        return format!("model.layers.{layer}.global_scale");
+    }
+    if parameter == "ffn_exp_probs_b.bias" || parameter == "ffn_exp_probs_b" {
+        return format!("model.layers.{layer}.moe.router.bias");
+    }
+    name.to_string()
+}
 
 pub fn load_tokenizer(model_dir: impl AsRef<Path>) -> Result<Tokenizer, Error> {
     Tokenizer::from_file(model_dir.as_ref().join("tokenizer.json")).map_err(Into::into)
@@ -2102,7 +2565,108 @@ fn deinterleave_w13(value: Array, stream: &Stream) -> Result<(Array, Array), Err
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
+    use safemlx::{
+        ops::{GgufMetadataArray, GgufMetadataValue},
+        Device, DeviceType, ExecutionContext,
+    };
     use serde_json::json;
+
+    #[test]
+    fn gguf_names_translate_to_text_parameter_tree() {
+        assert_eq!(
+            super::translate_gguf_weight_name("blk.4.attn_rel_proj.weight"),
+            "model.layers.4.self_attn.rel_proj"
+        );
+        assert_eq!(
+            super::translate_gguf_weight_name("blk.4.ffn_gate_exps.scales"),
+            "model.layers.4.moe.experts.gate_proj_scales"
+        );
+        assert_eq!(
+            super::translate_gguf_weight_name("blk.4.ffn_gscale"),
+            "model.layers.4.global_scale"
+        );
+    }
+
+    #[test]
+    fn draft_gguf_metadata_builds_text_config() {
+        let metadata = HashMap::from([
+            (
+                "general.architecture".into(),
+                GgufMetadataValue::String("inkling".into()),
+            ),
+            ("inkling.block_count".into(), GgufMetadataValue::Uint32(2)),
+            (
+                "inkling.embedding_length".into(),
+                GgufMetadataValue::Uint32(32),
+            ),
+            (
+                "inkling.feed_forward_length".into(),
+                GgufMetadataValue::Uint32(64),
+            ),
+            (
+                "inkling.expert_feed_forward_length".into(),
+                GgufMetadataValue::Uint32(32),
+            ),
+            (
+                "inkling.attention.head_count".into(),
+                GgufMetadataValue::Uint32(4),
+            ),
+            (
+                "inkling.attention.head_count_kv".into(),
+                GgufMetadataValue::Array(GgufMetadataArray::Uint32(vec![2, 1])),
+            ),
+            (
+                "inkling.attention.key_length".into(),
+                GgufMetadataValue::Uint32(8),
+            ),
+            (
+                "inkling.attention.sliding_window".into(),
+                GgufMetadataValue::Uint32(8),
+            ),
+            (
+                "inkling.attention.sliding_window_pattern".into(),
+                GgufMetadataValue::Array(GgufMetadataArray::Bool(vec![true, false])),
+            ),
+            (
+                "inkling.attention.layer_norm_rms_epsilon".into(),
+                GgufMetadataValue::Float32(1e-6),
+            ),
+            (
+                "inkling.context_length".into(),
+                GgufMetadataValue::Uint32(128),
+            ),
+            ("inkling.vocab_size".into(), GgufMetadataValue::Uint32(64)),
+            ("inkling.d_rel".into(), GgufMetadataValue::Uint32(4)),
+            ("inkling.rel_extent".into(), GgufMetadataValue::Uint32(16)),
+            (
+                "inkling.shortconv_kernel".into(),
+                GgufMetadataValue::Uint32(4),
+            ),
+            (
+                "inkling.dense_block_count".into(),
+                GgufMetadataValue::Uint32(1),
+            ),
+            ("inkling.expert_count".into(), GgufMetadataValue::Uint32(4)),
+            (
+                "inkling.expert_used_count".into(),
+                GgufMetadataValue::Uint32(2),
+            ),
+            (
+                "inkling.expert_shared_count".into(),
+                GgufMetadataValue::Uint32(1),
+            ),
+        ]);
+        let context = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        let args = super::args_from_gguf(&metadata, context.stream()).unwrap();
+        super::validate_args(&args).unwrap();
+        assert_eq!(args.text_config.local_layer_ids, Some(vec![0]));
+        assert_eq!(args.text_config.swa_num_key_value_heads, Some(2));
+        assert_eq!(args.text_config.num_key_value_heads, 1);
+        assert!(args.audio_config.is_none());
+        assert!(args.vision_config.is_none());
+    }
 
     #[test]
     fn released_config_shape_is_accepted() {

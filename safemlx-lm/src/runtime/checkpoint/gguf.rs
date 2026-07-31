@@ -104,10 +104,22 @@ fn build_gpt(
         .get("general.architecture")
         .and_then(GgufMetadataValue::as_str)
         .unwrap_or_default();
+    const GPT4O_PATTERN: &str = r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+";
     if pre_tokenizer == "kimi-k2" || architecture == "kimi-linear" {
         tokenizer.with_pre_tokenizer(Some(PreTokenizerSequence::new(vec![
             PreTokenizerWrapper::Split(Split::new(
                 SplitPattern::Regex(super::tiktoken::KIMI_K2_PATTERN.into()),
+                SplitDelimiterBehavior::Isolated,
+                false,
+            )?),
+            PreTokenizerWrapper::ByteLevel(ByteLevel::new(false, false, false)),
+        ])));
+    } else if matches!(pre_tokenizer, "gpt-4o" | "inkling")
+        || matches!(architecture, "gpt-oss" | "inkling")
+    {
+        tokenizer.with_pre_tokenizer(Some(PreTokenizerSequence::new(vec![
+            PreTokenizerWrapper::Split(Split::new(
+                SplitPattern::Regex(GPT4O_PATTERN.into()),
                 SplitDelimiterBehavior::Isolated,
                 false,
             )?),
@@ -659,6 +671,39 @@ mod tests {
         assert!(serialized.contains(r"\\p{N}{1,3}"));
         assert!(serialized.contains("ByteLevel"));
         assert!(tokenizer.get_normalizer().is_none());
+    }
+
+    #[test]
+    fn uses_gpt4o_family_pretokenizers_for_gpt_oss_and_inkling() {
+        for (architecture, pre) in [("gpt-oss", "gpt-4o"), ("inkling", "inkling")] {
+            let metadata = HashMap::from([
+                (
+                    "general.architecture".into(),
+                    GgufMetadataValue::String(architecture.into()),
+                ),
+                (
+                    "tokenizer.ggml.model".into(),
+                    GgufMetadataValue::String("gpt2".into()),
+                ),
+                (
+                    "tokenizer.ggml.pre".into(),
+                    GgufMetadataValue::String(pre.into()),
+                ),
+                (
+                    "tokenizer.ggml.tokens".into(),
+                    GgufMetadataValue::Array(GgufMetadataArray::String(vec!["a".into()])),
+                ),
+                (
+                    "tokenizer.ggml.merges".into(),
+                    GgufMetadataValue::Array(GgufMetadataArray::String(vec![])),
+                ),
+            ]);
+            let tokenizer = from_metadata(&metadata).unwrap().unwrap().tokenizer;
+            let serialized = tokenizer.to_string(false).unwrap();
+            assert!(serialized.contains(r"\\p{M}"));
+            assert!(serialized.contains(r"\\p{N}{1,3}"));
+            assert!(serialized.contains("ByteLevel"));
+        }
     }
 
     #[test]

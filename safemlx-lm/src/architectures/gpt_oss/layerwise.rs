@@ -1,12 +1,17 @@
 //! Unified fully resident and bounded layer execution for GPT-OSS.
 
-use std::{path::Path, sync::Arc, time::Instant};
+use std::{
+    collections::{BTreeMap, HashMap},
+    path::Path,
+    sync::Arc,
+    time::Instant,
+};
 
 use safemlx::{
     error::Exception,
     module::{Module, Param},
     nn,
-    ops::indexing::TryIndexOp,
+    ops::{indexing::TryIndexOp, GgufCheckpoint, GgufMetadataValue},
     quantization::MaybeQuantized,
     transforms::eval,
     Array, Dtype, Stream,
@@ -27,14 +32,15 @@ use crate::{
     },
     runtime::cache::{KeyValueCache, PagedKeyValueCache},
     runtime::checkpoint::binding::{
-        build_module_bindings, populate_module_from_lease, populate_module_from_lease_excluding,
+        build_module_bindings, build_module_bindings_with_recipes, populate_module_from_lease,
+        populate_module_from_lease_excluding,
     },
     runtime::checkpoint::recipe::DerivedWeightRecipe,
-    runtime::checkpoint::store::{TensorSelection, WeightStore},
+    runtime::checkpoint::store::{GgufWeightStore, TensorSelection, WeightStore},
     runtime::execution::layerwise::{
         load_general_layerwise_model, load_general_layerwise_model_with_store,
         GeneralLayerwiseModel, GeneralLayerwiseModelAdapter, LayerExecutionLoadOptions,
-        LayerwiseForwardState, StaticUnitBindings,
+        LayerwiseForwardState, StaticUnitBindings, WeightResidency,
     },
     runtime::residency::expert_cache::{
         ExpertCache, ExpertCacheLoadOptions, ExpertCacheReport, ExpertCatalogEntry, ExpertIdentity,
@@ -274,6 +280,100 @@ pub fn load_gpt_oss_layerwise_model(
     })
 }
 
+pub(crate) fn load_gpt_oss_gguf_layerwise_model(
+    checkpoint: &GgufCheckpoint,
+    metadata: &HashMap<String, GgufMetadataValue>,
+    residency: WeightResidency,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<(GptOssLayerwiseModel, Vec<u32>), Error> {
+    let prepared = resident::prepare_gguf_checkpoint(checkpoint, metadata, weights_stream)?;
+    let store: Arc<dyn WeightStore + Send + Sync> =
+        Arc::new(GgufWeightStore::new_with_max_mapped_shards(
+            checkpoint.clone(),
+            resident::translate_gguf_weight_name,
+            residency.max_mapped_shards(),
+        )?);
+    let args = prepared.args;
+    let execution = match residency {
+        WeightResidency::LayerwiseHost(options) => load_general_layerwise_model_with_store(
+            store,
+            GptOssLayerwiseAdapter::new(args, stream)?,
+            options,
+            stream,
+            weights_stream,
+        )?,
+        WeightResidency::DenseDiskStream(options) => load_general_layerwise_model_with_store(
+            store,
+            GptOssLayerwiseAdapter::new(args, stream)?,
+            options,
+            stream,
+            weights_stream,
+        )?,
+        WeightResidency::SparseExpertCache(options) => {
+            return Ok((
+                load_gpt_oss_gguf_sparse_with_store(
+                    store,
+                    args,
+                    options,
+                    options.non_expert,
+                    stream,
+                    weights_stream,
+                )?,
+                prepared.eos_token_ids,
+            ));
+        }
+        WeightResidency::SparseExpertCacheWithDenseLayers(options) => {
+            return Ok((
+                load_gpt_oss_gguf_sparse_with_store(
+                    store,
+                    args,
+                    options.expert_cache,
+                    options.non_expert,
+                    stream,
+                    weights_stream,
+                )?,
+                prepared.eos_token_ids,
+            ));
+        }
+        WeightResidency::FullyResident => {
+            return Err(Error::UnsupportedArchitecture(
+                "the bounded GPT-OSS GGUF loader does not accept fully resident policy".into(),
+            ));
+        }
+    };
+    Ok((GptOssLayerwiseModel { execution }, prepared.eos_token_ids))
+}
+
+fn load_gpt_oss_gguf_sparse_with_store(
+    store: Arc<dyn WeightStore + Send + Sync>,
+    args: ModelArgs,
+    options: ExpertCacheLoadOptions,
+    non_expert: impl Into<LayerExecutionLoadOptions>,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<GptOssLayerwiseModel, Error> {
+    let mut adapter = GptOssLayerwiseAdapter::new(args.clone(), stream)?;
+    adapter.sparse_expert_cache = true;
+    let mut execution = load_general_layerwise_model_with_store(
+        store,
+        adapter,
+        non_expert,
+        stream,
+        weights_stream,
+    )?;
+    let checkpoint_store = execution.weight_store_arc();
+    let entries = gpt_oss_expert_catalog(&args, checkpoint_store.as_ref())?;
+    execution.adapter_mut().expert_cache = Some(ExpertCache::new_shared(
+        checkpoint_store,
+        entries,
+        options,
+        weights_stream.clone(),
+        stream.clone(),
+    )?);
+    Ok(GptOssLayerwiseModel { execution })
+}
+
 /// Loads GPT-OSS with expert-granular sparse caching.
 pub fn load_gpt_oss_sparse_expert_cache_model(
     model_dir: impl AsRef<Path>,
@@ -336,7 +436,7 @@ fn load_gpt_oss_sparse_expert_cache_model_with_non_expert(
 pub(crate) fn load_gpt_oss_sparse_ep_base_with_store(
     store: Arc<dyn WeightStore + Send + Sync>,
     args: ModelArgs,
-    non_expert: crate::runtime::residency::dense_stream::DenseDiskStreamLoadOptions,
+    non_expert: impl Into<LayerExecutionLoadOptions>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<GptOssLayerwiseModel, Error> {
@@ -371,7 +471,7 @@ impl GptOssLayerwiseAdapter {
         let embedding = common::linear::unloaded_maybe_quantized_embedding(
             args.vocab_size,
             args.hidden_size,
-            args.quantization,
+            args.weight_quantization_for("model.embed_tokens.weight"),
             stream,
         )?;
         let norm =
@@ -380,7 +480,7 @@ impl GptOssLayerwiseAdapter {
             args.hidden_size,
             args.vocab_size,
             false,
-            args.quantization,
+            args.weight_quantization_for("lm_head.weight"),
             stream,
         )?;
         Ok(Self {
@@ -415,6 +515,78 @@ impl GptOssLayerwiseAdapter {
                 })
                 .collect(),
         }
+    }
+
+    fn layer_recipes(
+        &self,
+        index: usize,
+        store: &dyn WeightStore,
+    ) -> Result<BTreeMap<String, DerivedWeightRecipe>, Error> {
+        let prefix = format!("model.layers.{index}.mlp.experts");
+        if !store.keys().contains(&format!("{prefix}.gate_proj.weight")) {
+            return Ok(BTreeMap::new());
+        }
+        let experts = self.args.num_local_experts as usize;
+        let hidden = self.args.hidden_size as usize;
+        let intermediate = self.args.intermediate_size as usize;
+        let source = |name: &str| {
+            DerivedWeightRecipe::source(format!("{prefix}.{name}"), TensorSelection::Full)
+        };
+        let stack_reshape =
+            |gate: &str, up: &str, shape: Vec<usize>| DerivedWeightRecipe::Reshape {
+                input: Box::new(DerivedWeightRecipe::Stack {
+                    axis: 2,
+                    inputs: vec![source(gate), source(up)],
+                }),
+                shape,
+            };
+        let gate_up_u32 = stack_reshape(
+            "gate_proj.weight",
+            "up_proj.weight",
+            vec![experts, 2 * intermediate, hidden / 8],
+        );
+        Ok(BTreeMap::from([
+            (
+                "mlp.experts.gate_up_proj_blocks".into(),
+                DerivedWeightRecipe::View {
+                    input: Box::new(gate_up_u32),
+                    dtype: Dtype::Uint8,
+                    shape: vec![experts, 2 * intermediate, hidden / 32, 16],
+                },
+            ),
+            (
+                "mlp.experts.gate_up_proj_scales".into(),
+                stack_reshape(
+                    "gate_proj.scales",
+                    "up_proj.scales",
+                    vec![experts, 2 * intermediate, hidden / 32],
+                ),
+            ),
+            (
+                "mlp.experts.gate_up_proj_bias".into(),
+                stack_reshape(
+                    "gate_proj.bias",
+                    "up_proj.bias",
+                    vec![experts, 2 * intermediate],
+                ),
+            ),
+            (
+                "mlp.experts.down_proj_blocks".into(),
+                DerivedWeightRecipe::View {
+                    input: Box::new(source("down_proj.weight")),
+                    dtype: Dtype::Uint8,
+                    shape: vec![experts, hidden, intermediate / 32, 16],
+                },
+            ),
+            (
+                "mlp.experts.down_proj_scales".into(),
+                source("down_proj.scales"),
+            ),
+            (
+                "mlp.experts.down_proj_bias".into(),
+                source("down_proj.bias"),
+            ),
+        ]))
     }
 }
 
@@ -525,14 +697,9 @@ impl GeneralLayerwiseModelAdapter for GptOssLayerwiseAdapter {
         }
     }
 
-    fn new_layer(
-        &self,
-        group: usize,
-        _index: usize,
-        stream: &Stream,
-    ) -> Result<Self::Layer, Error> {
+    fn new_layer(&self, group: usize, index: usize, stream: &Stream) -> Result<Self::Layer, Error> {
         self.layer_count(group)?;
-        Ok(TransformerBlock::new(&self.args, stream)?)
+        Ok(TransformerBlock::new(&self.args, index, stream)?)
     }
 
     fn layer_checkpoint_prefix(&self, _group: usize, index: usize) -> String {
@@ -564,7 +731,13 @@ impl GeneralLayerwiseModelAdapter for GptOssLayerwiseAdapter {
         layer: &Self::Layer,
         store: &dyn WeightStore,
     ) -> Result<Vec<WeightBinding>, Error> {
-        let bindings = build_module_bindings(layer, &format!("model.layers.{index}"), store)?;
+        let prefix = format!("model.layers.{index}");
+        let bindings = build_module_bindings_with_recipes(
+            layer,
+            &prefix,
+            store,
+            self.layer_recipes(index, store)?,
+        )?;
         Ok(if self.sparse_expert_cache {
             bindings
                 .into_iter()
@@ -714,25 +887,81 @@ pub(crate) fn gpt_oss_expert_catalog(
     let mut entries = Vec::new();
     for layer in 0..args.num_hidden_layers as usize {
         let prefix = format!("model.layers.{layer}.mlp.experts");
+        let gguf = store.keys().contains(&format!("{prefix}.gate_proj.weight"));
         for expert in 0..args.num_local_experts as usize {
             let identity = ExpertIdentity::new(layer, expert);
             let mut bindings = Vec::new();
-            for name in [
-                "gate_up_proj_blocks",
-                "gate_up_proj_scales",
-                "gate_up_proj_bias",
-                "down_proj_blocks",
-                "down_proj_scales",
-                "down_proj_bias",
-            ] {
-                let recipe = DerivedWeightRecipe::source(
+            let selected = |name: &str| {
+                DerivedWeightRecipe::source(
                     format!("{prefix}.{name}"),
                     TensorSelection::Range {
                         axis: 0,
                         start: expert,
                         end: expert + 1,
                     },
-                );
+                )
+            };
+            let recipes = if gguf {
+                let hidden = args.hidden_size as usize;
+                let intermediate = args.intermediate_size as usize;
+                let stack_reshape =
+                    |gate: &str, up: &str, shape: Vec<usize>| DerivedWeightRecipe::Reshape {
+                        input: Box::new(DerivedWeightRecipe::Stack {
+                            axis: 2,
+                            inputs: vec![selected(gate), selected(up)],
+                        }),
+                        shape,
+                    };
+                vec![
+                    (
+                        "gate_up_proj_blocks",
+                        DerivedWeightRecipe::View {
+                            input: Box::new(stack_reshape(
+                                "gate_proj.weight",
+                                "up_proj.weight",
+                                vec![1, 2 * intermediate, hidden / 8],
+                            )),
+                            dtype: Dtype::Uint8,
+                            shape: vec![1, 2 * intermediate, hidden / 32, 16],
+                        },
+                    ),
+                    (
+                        "gate_up_proj_scales",
+                        stack_reshape(
+                            "gate_proj.scales",
+                            "up_proj.scales",
+                            vec![1, 2 * intermediate, hidden / 32],
+                        ),
+                    ),
+                    (
+                        "gate_up_proj_bias",
+                        stack_reshape("gate_proj.bias", "up_proj.bias", vec![1, 2 * intermediate]),
+                    ),
+                    (
+                        "down_proj_blocks",
+                        DerivedWeightRecipe::View {
+                            input: Box::new(selected("down_proj.weight")),
+                            dtype: Dtype::Uint8,
+                            shape: vec![1, hidden, intermediate / 32, 16],
+                        },
+                    ),
+                    ("down_proj_scales", selected("down_proj.scales")),
+                    ("down_proj_bias", selected("down_proj.bias")),
+                ]
+            } else {
+                [
+                    "gate_up_proj_blocks",
+                    "gate_up_proj_scales",
+                    "gate_up_proj_bias",
+                    "down_proj_blocks",
+                    "down_proj_scales",
+                    "down_proj_bias",
+                ]
+                .into_iter()
+                .map(|name| (name, selected(name)))
+                .collect()
+            };
+            for (name, recipe) in recipes {
                 let bytes = recipe.infer(store)?.byte_len();
                 bindings.push(WeightBinding::from_recipe(name, recipe, bytes)?);
             }
@@ -797,6 +1026,7 @@ mod tests {
                 quant_method: "mxfp4".into(),
             },
             quantization: None,
+            quantized_weight_configs: None,
             swiglu_limit: 7.0,
         }
     }

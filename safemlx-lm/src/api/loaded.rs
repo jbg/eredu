@@ -1866,6 +1866,53 @@ pub(super) fn load_gguf_model_data(
                 (Model::DeepSeekV3Layerwise(loaded), eos_token_ids)
             }
         }
+        "gpt-oss" => {
+            if matches!(options.weight_residency, WeightResidency::FullyResident) {
+                let loaded = gpt_oss::load_gguf_checkpoint(
+                    &checkpoint,
+                    metadata,
+                    options.quantization,
+                    stream,
+                    weights_stream,
+                )?;
+                (Model::GptOss(loaded.model), loaded.eos_token_ids)
+            } else {
+                let (loaded, eos_token_ids) = crate::architectures::gpt_oss::layerwise::load_gpt_oss_gguf_layerwise_model(
+                    &checkpoint,
+                    &metadata,
+                    options.weight_residency,
+                    stream,
+                    weights_stream,
+                )?;
+                (Model::GptOssLayerwise(loaded), eos_token_ids)
+            }
+        }
+        "inkling" => {
+            if options.quantization.is_some() {
+                return Err(Error::Quantization(
+                    "Inkling GGUF load-time requantization is unsupported; use checkpoint-native GGUF quantization"
+                        .into(),
+                ));
+            }
+            if matches!(options.weight_residency, WeightResidency::FullyResident) {
+                let loaded = inkling::load_gguf_checkpoint(
+                    &checkpoint,
+                    metadata,
+                    stream,
+                    weights_stream,
+                )?;
+                (Model::Inkling(loaded.model), loaded.eos_token_ids)
+            } else {
+                let (loaded, eos_token_ids) = crate::architectures::inkling::layerwise::load_inkling_gguf_layerwise_model(
+                    &checkpoint,
+                    &metadata,
+                    options.weight_residency,
+                    stream,
+                    weights_stream,
+                )?;
+                (Model::InklingLayerwise(loaded), eos_token_ids)
+            }
+        }
         "gemma4" => {
             if matches!(options.weight_residency, WeightResidency::FullyResident) {
                 let loaded = gemma4::load_gemma4_gguf_checkpoint(
@@ -2041,7 +2088,7 @@ pub(super) fn load_gguf_model_data(
             }
         }
         other => return Err(Error::UnsupportedArchitecture(format!(
-            "GGUF architecture {other:?}; supported GGUF architectures are kimi-linear, deepseek2, gemma4, llama, mistral, lfm2, lfm2moe, nemotron_h, nemotron_h_moe, qwen3, qwen3moe, qwen3vl, qwen35, qwen35moe, and qwen3next"
+            "GGUF architecture {other:?}; supported GGUF architectures are kimi-linear, deepseek2, gpt-oss, inkling, gemma4, llama, mistral, lfm2, lfm2moe, nemotron_h, nemotron_h_moe, qwen3, qwen3moe, qwen3vl, qwen35, qwen35moe, and qwen3next"
         ))),
     };
     let eos_token_ids = merge_eos_token_id_sources([

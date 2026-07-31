@@ -3299,6 +3299,90 @@ fn load_streamed_gguf_ep(
                 weights_stream,
             )
         }
+        "gpt-oss" => {
+            let prepared =
+                gpt_oss::prepare_gguf_checkpoint(checkpoint, metadata, weights_stream)?;
+            let args = prepared.args;
+            let assignment = resolve_model_assignment(
+                assignment,
+                args.num_local_experts as usize,
+                topology,
+            )?;
+            let store: std::sync::Arc<dyn WeightStore + Send + Sync> =
+                std::sync::Arc::new(GgufWeightStore::new_with_max_mapped_shards(
+                    checkpoint.clone(),
+                    gpt_oss::translate_gguf_weight_name,
+                    max_mapped_shards,
+                )?);
+            let model = crate::architectures::gpt_oss::layerwise::
+                load_gpt_oss_sparse_ep_base_with_store(
+                    store.clone(),
+                    args.clone(),
+                    streamed.non_expert,
+                    stream,
+                    weights_stream,
+                )?;
+            let entries = crate::architectures::gpt_oss::layerwise::gpt_oss_expert_catalog(
+                &args,
+                store.as_ref(),
+            )?;
+            let replicated_parameter_bytes =
+                planned_replicated_bytes(&model.residency_report()?)?;
+            finish_streamed_ep(
+                topology,
+                ModelKind::GptOss,
+                assignment,
+                ExpertArchitecture::GptOssLayerwise(Box::new(model)),
+                store,
+                entries,
+                streamed.expert_cache,
+                replicated_parameter_bytes,
+                stream,
+                weights_stream,
+            )
+        }
+        "inkling" => {
+            let prepared =
+                inkling::prepare_gguf_checkpoint(checkpoint, metadata, weights_stream)?;
+            let args = prepared.args;
+            let assignment = resolve_model_assignment(
+                assignment,
+                args.text_config.n_routed_experts as usize,
+                topology,
+            )?;
+            let store: std::sync::Arc<dyn WeightStore + Send + Sync> =
+                std::sync::Arc::new(GgufWeightStore::new_with_max_mapped_shards(
+                    checkpoint.clone(),
+                    inkling::translate_gguf_weight_name,
+                    max_mapped_shards,
+                )?);
+            let model = crate::architectures::inkling::layerwise::
+                load_inkling_sparse_ep_base_with_store(
+                    store.clone(),
+                    args.clone(),
+                    streamed.non_expert,
+                    stream,
+                    weights_stream,
+                )?;
+            let entries = crate::architectures::inkling::layerwise::inkling_expert_catalog(
+                &args,
+                store.as_ref(),
+            )?;
+            let replicated_parameter_bytes =
+                planned_replicated_bytes(&model.residency_report()?)?;
+            finish_streamed_ep(
+                topology,
+                ModelKind::Inkling,
+                assignment,
+                ExpertArchitecture::InklingLayerwise(Box::new(model)),
+                store,
+                entries,
+                streamed.expert_cache,
+                replicated_parameter_bytes,
+                stream,
+                weights_stream,
+            )
+        }
         "lfm2moe" => {
             let prepared = lfm2::prepare_gguf_checkpoint(checkpoint, metadata, weights_stream)?;
             let args = prepared.args;
@@ -3428,7 +3512,7 @@ fn load_streamed_gguf_ep(
             )
         }
         other => Err(Error::Parallel(format!(
-            "streamed sparse expert-parallel GGUF architecture {other} is unsupported; registered streamed GGUF EP architectures are kimi-linear, deepseek2, qwen3moe, lfm2moe, nemotron_h_moe, qwen35moe, and qwen3next"
+            "streamed sparse expert-parallel GGUF architecture {other} is unsupported; registered streamed GGUF EP architectures are kimi-linear, deepseek2, gpt-oss, inkling, qwen3moe, lfm2moe, nemotron_h_moe, qwen35moe, and qwen3next"
         ))),
     }
 }
@@ -3474,6 +3558,48 @@ fn load_sparse_gguf_ep(
                 ModelKind::KimiLinear,
                 assignment,
                 ExpertArchitecture::KimiLinear(Box::new(model)),
+                store,
+                entries,
+                expert_options,
+                replicated_parameter_bytes,
+                stream,
+                weights_stream,
+            )
+        }
+        "inkling" => {
+            let prepared =
+                inkling::prepare_gguf_checkpoint(checkpoint, metadata, weights_stream)?;
+            let args = prepared.args;
+            let assignment = resolve_model_assignment(
+                assignment,
+                args.text_config.n_routed_experts as usize,
+                topology,
+            )?;
+            let store: std::sync::Arc<dyn WeightStore + Send + Sync> =
+                std::sync::Arc::new(GgufWeightStore::new_with_max_mapped_shards(
+                    checkpoint.clone(),
+                    inkling::translate_gguf_weight_name,
+                    expert_options.non_expert.max_mapped_shards,
+                )?);
+            let model = crate::architectures::inkling::layerwise::
+                load_inkling_sparse_ep_base_with_store(
+                    store.clone(),
+                    args.clone(),
+                    expert_options.non_expert,
+                    stream,
+                    weights_stream,
+                )?;
+            let entries = crate::architectures::inkling::layerwise::inkling_expert_catalog(
+                &args,
+                store.as_ref(),
+            )?;
+            let replicated_parameter_bytes =
+                planned_replicated_bytes(&model.residency_report()?)?;
+            finish_sparse_gguf_ep(
+                topology,
+                ModelKind::Inkling,
+                assignment,
+                ExpertArchitecture::InklingLayerwise(Box::new(model)),
                 store,
                 entries,
                 expert_options,
@@ -3549,8 +3675,50 @@ fn load_sparse_gguf_ep(
                 weights_stream,
             )
         }
+        "gpt-oss" => {
+            let prepared =
+                gpt_oss::prepare_gguf_checkpoint(checkpoint, metadata, weights_stream)?;
+            let args = prepared.args;
+            let assignment = resolve_model_assignment(
+                assignment,
+                args.num_local_experts as usize,
+                topology,
+            )?;
+            let store: std::sync::Arc<dyn WeightStore + Send + Sync> =
+                std::sync::Arc::new(GgufWeightStore::new_with_max_mapped_shards(
+                    checkpoint.clone(),
+                    gpt_oss::translate_gguf_weight_name,
+                    expert_options.non_expert.max_mapped_shards,
+                )?);
+            let model = crate::architectures::gpt_oss::layerwise::
+                load_gpt_oss_sparse_ep_base_with_store(
+                    store.clone(),
+                    args.clone(),
+                    expert_options.non_expert,
+                    stream,
+                    weights_stream,
+                )?;
+            let entries = crate::architectures::gpt_oss::layerwise::gpt_oss_expert_catalog(
+                &args,
+                store.as_ref(),
+            )?;
+            let replicated_parameter_bytes =
+                planned_replicated_bytes(&model.residency_report()?)?;
+            finish_sparse_gguf_ep(
+                topology,
+                ModelKind::GptOss,
+                assignment,
+                ExpertArchitecture::GptOssLayerwise(Box::new(model)),
+                store,
+                entries,
+                expert_options,
+                replicated_parameter_bytes,
+                stream,
+                weights_stream,
+            )
+        }
         other => Err(Error::Parallel(format!(
-            "sparse expert-parallel GGUF architecture {other} is unsupported; registered sparse GGUF EP architectures are kimi-linear, deepseek2, and qwen3moe"
+            "sparse expert-parallel GGUF architecture {other} is unsupported; registered sparse GGUF EP architectures are kimi-linear, deepseek2, gpt-oss, inkling, and qwen3moe"
         ))),
     }
 }

@@ -440,7 +440,7 @@ without expanding matrix weights to float16.
 Q5_0 and Q5_1 tensors are losslessly repacked into MLX's five-bit affine
 layout; unsupported GGUF tensor types return an error. Model dispatch uses
 `general.architecture`; the current GGUF adapters support text-only `deepseek2`,
-`gemma4`, `kimi-linear`, `llama`, `mistral`, `lfm2`, `lfm2moe`, `nemotron_h`,
+`gemma4`, `gpt-oss`, `inkling`, `kimi-linear`, `llama`, `mistral`, `lfm2`, `lfm2moe`, `nemotron_h`,
 `nemotron_h_moe`, `qwen3`, `qwen3moe`, dense `qwen35`, and `qwen35moe`
 architectures, plus `qwen3next` and dense `qwen3vl` with its separate vision projector. For
 Qwen3-VL, put the llama.cpp-style dense F16/BF16/F32
@@ -469,6 +469,15 @@ Fully resident, bounded-layer, dense-streamed, and sparse-expert residency
 policies share this conversion path.
 Embedded `tokenizer.ggml.pre = kimi-k2` uses the official Han-aware
 pre-tokenization expression.
+
+GPT-OSS GGUF uses llama.cpp's canonical `gpt-oss` metadata and type-39 MXFP4
+routed experts. Split gate/up tensors are reassembled into the checkpoint-native
+interleaved expert layout without dequantizing; dense projections retain their
+per-tensor GGUF formats. Inkling GGUF follows the draft llama.cpp `inkling`
+text contract, including relative-position attention, four short-convolution
+streams, split dense/routed/shared SwiGLU tensors, padded-vocabulary masking,
+and the `inkling` o200k-family tokenizer pre-type. Its audio and vision towers
+remain in the separate multimodal projector rather than the text GGUF.
 
 GGUF IQ tensors are also model-loadable: IQ2_XXS, IQ2_XS, IQ3_XXS, IQ1_S,
 IQ4_NL, IQ3_S, IQ2_S, IQ4_XS, and IQ1_M. Their nonlinear codebooks cannot be
@@ -804,8 +813,8 @@ weights.
 | Qwen3-VL-MoE | yes | MLX affine/MXFP4 | yes / yes | `LoadedModel` | Reuses Qwen3-VL DeepStack/MRoPE and Qwen3 packed expert-major SwiGLU execution; the vision tower remains dense |
 | Gemma 4 dense / MoE | yes | MLX affine/MXFP4 and packed GGUF affine | yes / yes | `LoadedModel` | Dense plus routed gated-GELU branches share resident, layerwise, and external-MTP execution; specialized vision/audio components remain dense |
 | Gemma 4 assistant | yes | MLX affine/MXFP4 and uniform packed GGUF affine | yes / yes | `LoadedDrafter` with `ModelLoadOptions` | Transformer/projection/head targets; ordered masked-embedding heads return a capability error |
-| GPT-OSS | dense attention, MXFP4 experts | checkpoint-native MXFP4 experts | no / yes | `LoadedModel` | Native experts stay unchanged; attention projections, embeddings, and LM head can be MXFP4, while the router stays dense |
-| Inkling | yes | no | capability error | `LoadedModel` | Alternating local/global relative-bias attention, four short-convolution states per layer, routed plus shared experts, and native hMLP/dMel towers; MTP draft layers are skipped |
+| GPT-OSS | dense attention, MXFP4 experts | checkpoint-native MXFP4 experts plus `gpt-oss` GGUF | no / yes | `LoadedModel` | Canonical GGUF type-39 experts stay packed; mixed dense projections use their exact GGUF formats |
+| Inkling | yes | packed GGUF affine/IQ/MXFP4 | GGUF requantization unavailable | `LoadedModel` | `inkling` GGUF is text-only; safetensors retains native hMLP/dMel towers, while both paths use local/global relative-bias attention and routed plus shared experts |
 | Nemotron-H | yes | no | capability error | `LoadedModel` (dense) | Packed rank-3 routed experts require an affine grouped-matmul kernel |
 | Qwen3.5/3.6-MoE | yes | block FP8, MLX affine/MXFP4 | yes / yes, from dense checkpoints | `LoadedModel` | Rank-3 expert banks are quantized row-wise and executed with routed `gather_qmm`; native FP8 checkpoints are never implicitly transcoded |
 | Qwen3-Next | yes | native block FP8, MLX affine/MXFP4 | yes / yes, from dense checkpoints | `LoadedModel` | Official dynamic E4M3 128 x 128 checkpoints work with resident, layerwise, sparse expert-cache, and expert-parallel policies; fused weights/scales are split while streaming and native FP8 is never implicitly transcoded |
@@ -1102,8 +1111,9 @@ additionally retain their fully resident EP loaders. The model API requires
 and `PP = 1`; hybrid EP+TP and EP+PP are rejected before checkpoint payloads
 are opened. Dense models and GGUF architectures without a registered EP
 adapter are also rejected. Kimi Linear, DeepSeek2, and Qwen3-MoE provide
-resident GGUF EP; their streamed sparse-cache adapters are joined by
-LFM2-MoE, Nemotron-H-MoE, Qwen3-Next, and Qwen3.5-MoE. Checkpoint `ep_size`
+resident GGUF EP; sparse-cache and streamed GGUF EP additionally cover
+GPT-OSS, Inkling, LFM2-MoE, Nemotron-H-MoE, Qwen3-Next, and Qwen3.5-MoE.
+Checkpoint `ep_size`
 describes a stored layout and is not the runtime EP degree.
 
 `ExpertAssignment` supports balanced-contiguous (the model default),

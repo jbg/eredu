@@ -1,12 +1,21 @@
 //! Text-decoder bounded layer execution for Thinking Machines Lab Inkling.
 
-use std::{collections::BTreeMap, path::Path, sync::Arc, time::Instant};
+use std::{
+    collections::{BTreeMap, HashMap},
+    path::Path,
+    sync::Arc,
+    time::Instant,
+};
 
 use safemlx::{
     error::Exception,
     module::{Module, ModuleParameters, Param},
     nn,
-    ops::{concatenate_axis, indexing::NewAxis, indexing::TryIndexOp},
+    ops::{
+        concatenate_axis, indexing::NewAxis, indexing::TryIndexOp, GgufCheckpoint,
+        GgufMetadataValue,
+    },
+    quantization::MaybeQuantized,
     transforms::eval,
     Array, Dtype, Stream,
 };
@@ -27,11 +36,11 @@ use crate::{
         populate_module_from_lease_excluding,
     },
     runtime::checkpoint::recipe::DerivedWeightRecipe,
-    runtime::checkpoint::store::{TensorSelection, WeightStore},
+    runtime::checkpoint::store::{GgufWeightStore, TensorSelection, WeightStore},
     runtime::execution::layerwise::{
         load_general_layerwise_model, load_general_layerwise_model_with_store,
         GeneralLayerwiseModel, GeneralLayerwiseModelAdapter, LayerExecutionLoadOptions,
-        LayerwiseForwardState, StaticUnitBindings,
+        LayerwiseForwardState, StaticUnitBindings, WeightResidency,
     },
     runtime::residency::expert_cache::{
         ExpertCache, ExpertCacheLoadOptions, ExpertCacheReport, ExpertCatalogEntry, ExpertIdentity,
@@ -231,6 +240,100 @@ pub fn load_inkling_layerwise_model(
     })
 }
 
+pub(crate) fn load_inkling_gguf_layerwise_model(
+    checkpoint: &GgufCheckpoint,
+    metadata: &HashMap<String, GgufMetadataValue>,
+    residency: WeightResidency,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<(InklingLayerwiseModel, Vec<u32>), Error> {
+    let prepared = resident::prepare_gguf_checkpoint(checkpoint, metadata, weights_stream)?;
+    let store: Arc<dyn WeightStore + Send + Sync> =
+        Arc::new(GgufWeightStore::new_with_max_mapped_shards(
+            checkpoint.clone(),
+            resident::translate_gguf_weight_name,
+            residency.max_mapped_shards(),
+        )?);
+    let args = prepared.args;
+    let execution = match residency {
+        WeightResidency::LayerwiseHost(options) => load_general_layerwise_model_with_store(
+            store,
+            InklingLayerwiseAdapter::new(args, stream)?,
+            options,
+            stream,
+            weights_stream,
+        )?,
+        WeightResidency::DenseDiskStream(options) => load_general_layerwise_model_with_store(
+            store,
+            InklingLayerwiseAdapter::new(args, stream)?,
+            options,
+            stream,
+            weights_stream,
+        )?,
+        WeightResidency::SparseExpertCache(options) => {
+            return Ok((
+                load_inkling_gguf_sparse_with_store(
+                    store,
+                    args,
+                    options,
+                    options.non_expert,
+                    stream,
+                    weights_stream,
+                )?,
+                prepared.eos_token_ids,
+            ));
+        }
+        WeightResidency::SparseExpertCacheWithDenseLayers(options) => {
+            return Ok((
+                load_inkling_gguf_sparse_with_store(
+                    store,
+                    args,
+                    options.expert_cache,
+                    options.non_expert,
+                    stream,
+                    weights_stream,
+                )?,
+                prepared.eos_token_ids,
+            ));
+        }
+        WeightResidency::FullyResident => {
+            return Err(Error::UnsupportedArchitecture(
+                "the bounded Inkling GGUF loader does not accept fully resident policy".into(),
+            ));
+        }
+    };
+    Ok((InklingLayerwiseModel { execution }, prepared.eos_token_ids))
+}
+
+fn load_inkling_gguf_sparse_with_store(
+    store: Arc<dyn WeightStore + Send + Sync>,
+    args: ModelArgs,
+    options: ExpertCacheLoadOptions,
+    non_expert: impl Into<LayerExecutionLoadOptions>,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<InklingLayerwiseModel, Error> {
+    let mut adapter = InklingLayerwiseAdapter::new(args.clone(), stream)?;
+    adapter.sparse_expert_cache = true;
+    let mut execution = load_general_layerwise_model_with_store(
+        store,
+        adapter,
+        non_expert,
+        stream,
+        weights_stream,
+    )?;
+    let checkpoint_store = execution.weight_store_arc();
+    let entries = inkling_expert_catalog(&args, checkpoint_store.as_ref())?;
+    execution.adapter_mut().expert_cache = Some(ExpertCache::new_shared(
+        checkpoint_store,
+        entries,
+        options,
+        weights_stream.clone(),
+        stream.clone(),
+    )?);
+    Ok(InklingLayerwiseModel { execution })
+}
+
 /// Loads Inkling with expert-granular sparse caching for routed text experts.
 pub fn load_inkling_sparse_expert_cache_model(
     model_dir: impl AsRef<Path>,
@@ -300,7 +403,7 @@ fn load_inkling_sparse_expert_cache_model_with_non_expert(
 pub(crate) fn load_inkling_sparse_ep_base_with_store(
     store: Arc<dyn WeightStore + Send + Sync>,
     args: ModelArgs,
-    non_expert: crate::runtime::residency::dense_stream::DenseDiskStreamLoadOptions,
+    non_expert: impl Into<LayerExecutionLoadOptions>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<InklingLayerwiseModel, Error> {
@@ -319,10 +422,10 @@ pub(crate) fn load_inkling_sparse_ep_base_with_store(
 /// Adapter for Inkling local/global attention and dense/MoE text blocks.
 struct InklingLayerwiseAdapter {
     args: ModelArgs,
-    embedding: nn::Embedding,
+    embedding: MaybeQuantized<nn::Embedding>,
     embed_norm: nn::RmsNorm,
     norm: nn::RmsNorm,
-    lm_head: nn::Linear,
+    lm_head: MaybeQuantized<nn::Linear>,
     audio: Option<AudioModel>,
     vision_norm: Option<nn::RmsNorm>,
     vision_depth: usize,
@@ -348,10 +451,10 @@ impl InklingLayerwiseAdapter {
             None => (None, 0),
         };
         Ok(Self {
-            embedding: nn::Embedding::unloaded(
+            embedding: common::linear::unloaded_maybe_quantized_embedding(
                 text.vocab_size,
                 text.hidden_size,
-                Dtype::Float32,
+                text.weight_quantization_for("model.embed_tokens.weight"),
                 stream,
             )?,
             embed_norm: nn::RmsNorm::unloaded(
@@ -366,11 +469,11 @@ impl InklingLayerwiseAdapter {
                 Dtype::Float32,
                 stream,
             )?,
-            lm_head: nn::Linear::unloaded(
+            lm_head: common::linear::unloaded_maybe_quantized_linear(
                 text.hidden_size,
                 text.vocab_size,
                 false,
-                Dtype::Float32,
+                text.weight_quantization_for("lm_head.weight"),
                 stream,
             )?,
             audio,
@@ -400,10 +503,50 @@ impl InklingLayerwiseAdapter {
         let normalized = normalized_checkpoint_keys(store);
         let direct = store.keys();
         let mut recipes = BTreeMap::new();
-        for local_name in module.parameters().flatten().keys() {
+        let parameters = module.parameters().flatten();
+        for (local_name, parameter) in &parameters {
             let destination = format!("{prefix}.{local_name}");
             if direct.contains(&destination) {
+                if destination.contains("_sconv.weight")
+                    && store.metadata(&destination)?.shape.len() == 2
+                {
+                    recipes.insert(
+                        local_name.to_string(),
+                        DerivedWeightRecipe::Reshape {
+                            input: Box::new(DerivedWeightRecipe::source(
+                                destination,
+                                TensorSelection::Full,
+                            )),
+                            shape: parameter
+                                .shape()
+                                .iter()
+                                .map(|value| *value as usize)
+                                .collect(),
+                        },
+                    );
+                }
                 continue;
+            }
+            if destination.ends_with(".dense_global_scale")
+                || destination.ends_with(".moe.router.global_scale")
+            {
+                let layer_prefix = destination
+                    .split_once(".dense_global_scale")
+                    .map(|(prefix, _)| prefix)
+                    .or_else(|| {
+                        destination
+                            .split_once(".moe.router.global_scale")
+                            .map(|(prefix, _)| prefix)
+                    })
+                    .expect("global-scale suffix matched");
+                let raw = format!("{layer_prefix}.global_scale");
+                if direct.contains(&raw) {
+                    recipes.insert(
+                        local_name.to_string(),
+                        DerivedWeightRecipe::source(raw, TensorSelection::Full),
+                    );
+                    continue;
+                }
             }
             if let Some(recipe) = inkling_w13_recipe(&destination, &normalized, store)? {
                 recipes.insert(local_name.to_string(), recipe);
@@ -417,7 +560,16 @@ impl InklingLayerwiseAdapter {
             let source = DerivedWeightRecipe::source(raw.clone(), TensorSelection::Full);
             recipes.insert(
                 local_name.to_string(),
-                if raw.ends_with("_sconv.weight") {
+                if raw.contains("_sconv.weight") && store.metadata(raw)?.shape.len() == 2 {
+                    DerivedWeightRecipe::Reshape {
+                        input: Box::new(source),
+                        shape: parameter
+                            .shape()
+                            .iter()
+                            .map(|value| *value as usize)
+                            .collect(),
+                    }
+                } else if raw.ends_with("_sconv.weight") {
                     DerivedWeightRecipe::Cast {
                         input: Box::new(source),
                         dtype: Dtype::Float32,
@@ -594,6 +746,37 @@ fn inkling_w13_recipe(
     normalized: &BTreeMap<String, String>,
     store: &dyn WeightStore,
 ) -> Result<Option<DerivedWeightRecipe>, Error> {
+    for bank in ["moe.experts", "moe.shared_experts"] {
+        if let Some(prefix) = destination.strip_suffix(&format!(".{bank}.gate_up_proj")) {
+            let gate = format!("{prefix}.{bank}.gate_proj");
+            let up = format!("{prefix}.{bank}.up_proj");
+            if let (Some(gate), Some(up)) = (normalized.get(&gate), normalized.get(&up)) {
+                return Ok(Some(DerivedWeightRecipe::Concatenate {
+                    axis: 1,
+                    inputs: vec![
+                        DerivedWeightRecipe::source(gate.clone(), TensorSelection::Full),
+                        DerivedWeightRecipe::source(up.clone(), TensorSelection::Full),
+                    ],
+                }));
+            }
+        }
+        for suffix in ["_scales", "_biases"] {
+            if let Some(prefix) = destination.strip_suffix(&format!(".{bank}.gate_up_proj{suffix}"))
+            {
+                let gate = format!("{prefix}.{bank}.gate_proj{suffix}");
+                let up = format!("{prefix}.{bank}.up_proj{suffix}");
+                if let (Some(gate), Some(up)) = (normalized.get(&gate), normalized.get(&up)) {
+                    return Ok(Some(DerivedWeightRecipe::Concatenate {
+                        axis: 1,
+                        inputs: vec![
+                            DerivedWeightRecipe::source(gate.clone(), TensorSelection::Full),
+                            DerivedWeightRecipe::source(up.clone(), TensorSelection::Full),
+                        ],
+                    }));
+                }
+            }
+        }
+    }
     let (source_runtime, axis, parity, concatenate) =
         if let Some(prefix) = destination.strip_suffix(".dense.gate_proj.weight") {
             (format!("{prefix}.mlp.w13_dn.weight"), 0, 0, false)
@@ -1082,12 +1265,17 @@ impl GeneralLayerwiseModelAdapter for InklingLayerwiseAdapter {
                                 .map_err(|error| Exception::custom(error.to_string()))?;
                             let started = Instant::now();
                             let text = &self.args.text_config;
+                            let prefix = format!("model.layers.{index}.moe.experts");
+                            let gate_format =
+                                text.weight_quantization_for(&format!("{prefix}.gate_up_proj"));
+                            let down_format =
+                                text.weight_quantization_for(&format!("{prefix}.down_proj"));
                             let mut bank = PackedSwiGluExperts::new(
                                 acquired.identities().len() as i32,
                                 text.hidden_size,
                                 text.moe_intermediate_size(),
-                                None,
-                                None,
+                                gate_format,
+                                down_format,
                                 stream,
                             )?;
                             bank.gate_up_proj = Param::new(
@@ -1100,6 +1288,34 @@ impl GeneralLayerwiseModelAdapter for InklingLayerwiseAdapter {
                                     .compact_binding("down_proj", stream)
                                     .map_err(|error| Exception::custom(error.to_string()))?,
                             );
+                            if gate_format.is_some_and(|format| format.gguf_iquant().is_none()) {
+                                bank.gate_up_proj_scales = Param::new(Some(
+                                    acquired
+                                        .compact_binding("gate_up_proj_scales", stream)
+                                        .map_err(|error| Exception::custom(error.to_string()))?,
+                                ));
+                            }
+                            if gate_format.is_some_and(|format| format.has_biases()) {
+                                bank.gate_up_proj_biases = Param::new(Some(
+                                    acquired
+                                        .compact_binding("gate_up_proj_biases", stream)
+                                        .map_err(|error| Exception::custom(error.to_string()))?,
+                                ));
+                            }
+                            if down_format.is_some_and(|format| format.gguf_iquant().is_none()) {
+                                bank.down_proj_scales = Param::new(Some(
+                                    acquired
+                                        .compact_binding("down_proj_scales", stream)
+                                        .map_err(|error| Exception::custom(error.to_string()))?,
+                                ));
+                            }
+                            if down_format.is_some_and(|format| format.has_biases()) {
+                                bank.down_proj_biases = Param::new(Some(
+                                    acquired
+                                        .compact_binding("down_proj_biases", stream)
+                                        .map_err(|error| Exception::custom(error.to_string()))?,
+                                ));
+                            }
                             expert_cache
                                 .record_compact_bank(
                                     pass,
@@ -1249,68 +1465,151 @@ pub(crate) fn inkling_expert_catalog(
         let runtime_prefix = format!("model.layers.{layer}");
         let gate_up_runtime = format!("{runtime_prefix}.moe.experts.gate_up_proj");
         let down_runtime = format!("{runtime_prefix}.moe.experts.down_proj");
-        let gate_up_raw = normalized
-            .get(&gate_up_runtime)
-            .cloned()
-            .or_else(|| {
-                normalized
-                    .get(&format!("{runtime_prefix}.mlp.experts.w13_weight"))
-                    .cloned()
-            })
-            .ok_or_else(|| {
-                Error::UnsupportedArchitecture(format!(
-                    "Inkling checkpoint is missing routed gate/up bank for layer {layer}"
-                ))
-            })?;
+        let gate_up_raw = normalized.get(&gate_up_runtime).cloned().or_else(|| {
+            normalized
+                .get(&format!("{runtime_prefix}.mlp.experts.w13_weight"))
+                .cloned()
+        });
+        let split_gate = normalized
+            .get(&format!("{runtime_prefix}.moe.experts.gate_proj"))
+            .cloned();
+        let split_up = normalized
+            .get(&format!("{runtime_prefix}.moe.experts.up_proj"))
+            .cloned();
+        if gate_up_raw.is_none() && (split_gate.is_none() || split_up.is_none()) {
+            return Err(Error::UnsupportedArchitecture(format!(
+                "Inkling checkpoint is missing routed gate/up bank for layer {layer}"
+            )));
+        }
         let down_raw = normalized.get(&down_runtime).cloned().ok_or_else(|| {
             Error::UnsupportedArchitecture(format!(
                 "Inkling checkpoint is missing routed down bank for layer {layer}"
             ))
         })?;
-        let gate_metadata = store.metadata(&gate_up_raw)?;
-        let interleaved = gate_metadata.shape.get(1).copied().ok_or_else(|| {
-            Error::UnsupportedArchitecture("Inkling routed gate/up rank is invalid".into())
-        })?;
-        if !normalized.contains_key(&gate_up_runtime) && interleaved % 2 != 0 {
+        let interleaved = gate_up_raw
+            .as_ref()
+            .map(|raw| store.metadata(raw))
+            .transpose()?
+            .and_then(|metadata| metadata.shape.get(1).copied());
+        if gate_up_raw.is_some()
+            && !normalized.contains_key(&gate_up_runtime)
+            && interleaved.is_none_or(|width| width % 2 != 0)
+        {
             return Err(Error::UnsupportedArchitecture(format!(
-                "Inkling routed w13 bank for layer {layer} has odd interleaved width {interleaved}"
+                "Inkling routed w13 bank for layer {layer} has invalid interleaved width"
             )));
         }
+        let gate_format = text.weight_quantization_for(&gate_up_runtime);
+        let down_format = text.weight_quantization_for(&down_runtime);
         for expert in 0..text.n_routed_experts as usize {
             let identity = ExpertIdentity::new(layer, expert);
-            let selected_expert = DerivedWeightRecipe::source(
-                gate_up_raw.clone(),
-                TensorSelection::Range {
-                    axis: 0,
-                    start: expert,
-                    end: expert + 1,
-                },
-            );
-            let gate_up = if normalized.contains_key(&gate_up_runtime) {
-                selected_expert
-            } else {
-                let select = |parity| DerivedWeightRecipe::Select {
-                    input: Box::new(selected_expert.clone()),
-                    selection: TensorSelection::Indices {
-                        axis: 1,
-                        indices: (parity..interleaved).step_by(2).collect(),
+            let selected = |raw: String| {
+                DerivedWeightRecipe::source(
+                    raw,
+                    TensorSelection::Range {
+                        axis: 0,
+                        start: expert,
+                        end: expert + 1,
                     },
-                };
+                )
+            };
+            let gate_up = if let (Some(gate), Some(up)) = (&split_gate, &split_up) {
                 DerivedWeightRecipe::Concatenate {
                     axis: 1,
-                    inputs: vec![select(0), select(1)],
+                    inputs: vec![selected(gate.clone()), selected(up.clone())],
+                }
+            } else {
+                let gate_up_raw = gate_up_raw.clone().expect("validated gate/up source");
+                let selected_expert = selected(gate_up_raw);
+                if normalized.contains_key(&gate_up_runtime) {
+                    selected_expert
+                } else {
+                    let width = interleaved.expect("validated interleaved width");
+                    let select = |parity| DerivedWeightRecipe::Select {
+                        input: Box::new(selected_expert.clone()),
+                        selection: TensorSelection::Indices {
+                            axis: 1,
+                            indices: (parity..width).step_by(2).collect(),
+                        },
+                    };
+                    DerivedWeightRecipe::Concatenate {
+                        axis: 1,
+                        inputs: vec![select(0), select(1)],
+                    }
                 }
             };
-            let down = DerivedWeightRecipe::source(
-                down_raw.clone(),
-                TensorSelection::Range {
-                    axis: 0,
-                    start: expert,
-                    end: expert + 1,
-                },
-            );
+            let down = selected(down_raw.clone());
+            let mut recipes = vec![("gate_up_proj", gate_up), ("down_proj", down)];
+            if gate_format.is_some_and(|format| format.gguf_iquant().is_none()) {
+                let gate = normalized
+                    .get(&format!("{runtime_prefix}.moe.experts.gate_proj_scales"))
+                    .cloned()
+                    .ok_or_else(|| {
+                        Error::UnsupportedArchitecture(
+                            "Inkling GGUF gate scales are missing".into(),
+                        )
+                    })?;
+                let up = normalized
+                    .get(&format!("{runtime_prefix}.moe.experts.up_proj_scales"))
+                    .cloned()
+                    .ok_or_else(|| {
+                        Error::UnsupportedArchitecture("Inkling GGUF up scales are missing".into())
+                    })?;
+                recipes.push((
+                    "gate_up_proj_scales",
+                    DerivedWeightRecipe::Concatenate {
+                        axis: 1,
+                        inputs: vec![selected(gate), selected(up)],
+                    },
+                ));
+            }
+            if gate_format.is_some_and(|format| format.has_biases()) {
+                let gate = normalized
+                    .get(&format!("{runtime_prefix}.moe.experts.gate_proj_biases"))
+                    .cloned()
+                    .ok_or_else(|| {
+                        Error::UnsupportedArchitecture(
+                            "Inkling GGUF gate biases are missing".into(),
+                        )
+                    })?;
+                let up = normalized
+                    .get(&format!("{runtime_prefix}.moe.experts.up_proj_biases"))
+                    .cloned()
+                    .ok_or_else(|| {
+                        Error::UnsupportedArchitecture("Inkling GGUF up biases are missing".into())
+                    })?;
+                recipes.push((
+                    "gate_up_proj_biases",
+                    DerivedWeightRecipe::Concatenate {
+                        axis: 1,
+                        inputs: vec![selected(gate), selected(up)],
+                    },
+                ));
+            }
+            if down_format.is_some_and(|format| format.gguf_iquant().is_none()) {
+                let raw = normalized
+                    .get(&format!("{down_runtime}_scales"))
+                    .cloned()
+                    .ok_or_else(|| {
+                        Error::UnsupportedArchitecture(
+                            "Inkling GGUF down scales are missing".into(),
+                        )
+                    })?;
+                recipes.push(("down_proj_scales", selected(raw)));
+            }
+            if down_format.is_some_and(|format| format.has_biases()) {
+                let raw = normalized
+                    .get(&format!("{down_runtime}_biases"))
+                    .cloned()
+                    .ok_or_else(|| {
+                        Error::UnsupportedArchitecture(
+                            "Inkling GGUF down biases are missing".into(),
+                        )
+                    })?;
+                recipes.push(("down_proj_biases", selected(raw)));
+            }
             let mut bindings = Vec::new();
-            for (name, recipe) in [("gate_up_proj", gate_up), ("down_proj", down)] {
+            for (name, recipe) in recipes {
                 let bytes = recipe.infer(store)?.byte_len();
                 bindings.push(WeightBinding::from_recipe(name, recipe, bytes)?);
             }

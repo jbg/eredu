@@ -192,6 +192,19 @@ pub enum DerivedWeightRecipe {
         /// Output execution dtype.
         dtype: Dtype,
     },
+    /// Reinterprets the backing bytes as another scalar dtype and exact shape.
+    ///
+    /// Unlike [`Self::Cast`], this does not numerically convert values. It is
+    /// intended for checkpoint formats whose packed byte representation is
+    /// already the representation consumed by the runtime kernel.
+    View {
+        /// Child recipe.
+        input: Box<Self>,
+        /// Output execution dtype.
+        dtype: Dtype,
+        /// Exact output shape.
+        shape: Vec<usize>,
+    },
     /// Applies `log(-x)` elementwise.
     NegLog {
         /// Child recipe.
@@ -234,6 +247,7 @@ impl DerivedWeightRecipe {
             | Self::Reshape { input, .. }
             | Self::Transpose { input, .. }
             | Self::Cast { input, .. }
+            | Self::View { input, .. }
             | Self::NegLog { input }
             | Self::SubtractOne { input } => input.collect_source_keys(keys),
         }
@@ -286,6 +300,21 @@ impl DerivedWeightRecipe {
             Self::Cast { input, dtype } => {
                 let metadata = input.infer(store)?;
                 metadata_for(metadata.shape, (*dtype).into())
+            }
+            Self::View {
+                input,
+                dtype,
+                shape,
+            } => {
+                let input = input.infer(store)?;
+                let output = metadata_for(shape.clone(), (*dtype).into())?;
+                if input.byte_len != output.byte_len {
+                    return Err(WeightRecipeError::ByteCountMismatch {
+                        input: input.byte_len,
+                        output: output.byte_len,
+                    });
+                }
+                Ok(output)
             }
             Self::NegLog { input } => input.infer(store),
             Self::SubtractOne { input } => input.infer(store),
@@ -396,6 +425,18 @@ impl DerivedWeightRecipe {
             Self::Cast { input, dtype } => {
                 let array = input.materialize_inner(store, stream, sources)?;
                 Ok(array.as_dtype(*dtype, stream)?)
+            }
+            Self::View {
+                input,
+                dtype,
+                shape,
+            } => {
+                let array = input.materialize_inner(store, stream, sources)?;
+                let shape = shape
+                    .iter()
+                    .map(|dimension| usize_to_i32(*dimension, "view dimension"))
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(array.view_dtype(*dtype, stream)?.reshape(&shape, stream)?)
             }
             Self::NegLog { input } => {
                 let array = input.materialize_inner(store, stream, sources)?;
@@ -689,6 +730,14 @@ pub enum WeightRecipeError {
         /// Requested output element count.
         output: u64,
     },
+    /// A bitwise view changed the number of represented bytes.
+    #[error("bitwise view changes byte count from {input} to {output}")]
+    ByteCountMismatch {
+        /// Input byte count.
+        input: u64,
+        /// Requested output byte count.
+        output: u64,
+    },
     /// A transpose was not a rank-sized permutation.
     #[error("axes {axes:?} are not a permutation of rank {rank}")]
     InvalidPermutation {
@@ -757,6 +806,28 @@ mod tests {
         .unwrap();
         let store = Arc::new(SafetensorsWeightStore::open(dir.path()).unwrap());
         (dir, store)
+    }
+
+    #[test]
+    fn bitwise_view_preserves_checkpoint_bytes() {
+        let (_dir, store) = fixture();
+        let context =
+            safemlx::ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
+        let recipe = DerivedWeightRecipe::View {
+            input: Box::new(DerivedWeightRecipe::source("left", TensorSelection::Full)),
+            dtype: Dtype::Uint8,
+            shape: vec![2, 8],
+        };
+        let metadata = recipe.infer(store.as_ref()).unwrap();
+        assert_eq!(metadata.shape(), &[2, 8]);
+        assert_eq!(metadata.dtype(), &RecipeDtype::U8);
+        let output = recipe
+            .materialize(store.as_ref(), context.stream())
+            .unwrap();
+        assert_eq!(
+            output.evaluated().unwrap().as_slice::<u8>(),
+            &[1, 0, 0, 0, 2, 0, 0, 0, 3, 0, 0, 0, 4, 0, 0, 0]
+        );
     }
 
     fn one_mapping_cross_shard_fixture() -> (tempfile::TempDir, Arc<SafetensorsWeightStore>) {

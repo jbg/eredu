@@ -11,7 +11,7 @@ use safemlx::{
     ops::{
         arange, clip, gather_grouped_rows, gather_qmm_with_mode,
         indexing::{IntoStrideBy, TryIndexOp},
-        sigmoid, topk_route_plan, QuantizationMode,
+        sigmoid, stack_axis, topk_route_plan, GgufCheckpoint, GgufMetadataValue, QuantizationMode,
     },
     quantization::MaybeQuantized,
     Array, Dtype, Stream,
@@ -20,7 +20,12 @@ use serde::Deserialize;
 use tokenizers::Tokenizer;
 
 use crate::{
-    api::{common, common::generation::CausalLm, input},
+    api::{
+        common,
+        common::generation::CausalLm,
+        input,
+        qwen3::{gguf_i32, gguf_string},
+    },
     error::Error,
     nn::tensor::{
         create_causal_mask,
@@ -36,8 +41,9 @@ use crate::{
         ConcatKeyValueCache, KeyValueCache, PagedKeyValueCache, SlidingKeyValueCache,
     },
     runtime::checkpoint::load::{
-        load_safetensors_dir_quantized_strict, load_safetensors_dir_strict, StrictLoadConfig,
-        StrictLoadReport,
+        gguf_metadata, gguf_quantization_configs, load_named_array_strict,
+        load_safetensors_dir_quantized_strict, load_safetensors_dir_strict, GgufTensorNames,
+        StrictLoadConfig, StrictLoadReport,
     },
     runtime::checkpoint::quantization::WeightQuantization,
 };
@@ -109,12 +115,27 @@ pub struct ModelArgs {
     /// Optional encoding used by remaining standard dense matrices.
     #[serde(default)]
     pub quantization: Option<WeightQuantization>,
+    /// Exact per-weight formats for mixed GGUF checkpoints.
+    #[serde(skip)]
+    pub quantized_weight_configs: Option<HashMap<String, WeightQuantization>>,
     /// GPT-OSS clipped SwiGLU limit.
     #[serde(default = "default_swiglu_limit")]
     pub swiglu_limit: f32,
 }
 
 impl ModelArgs {
+    pub(crate) fn weight_quantization_for(&self, name: &str) -> Option<WeightQuantization> {
+        self.quantized_weight_configs
+            .as_ref()
+            .and_then(|configs| configs.get(name).copied())
+            .or(self.quantization)
+    }
+
+    fn checkpoint_weight_quantization_for(&self, name: &str) -> Option<WeightQuantization> {
+        self.quantized_weight_configs
+            .as_ref()
+            .and_then(|configs| configs.get(name).copied())
+    }
     pub(crate) fn validate(&self) -> Result<(), Error> {
         if self.model_type != "gpt_oss" {
             return Err(Error::UnsupportedArchitecture(format!(
@@ -275,7 +296,8 @@ pub struct Attention {
 }
 
 impl Attention {
-    fn new(args: &ModelArgs, stream: &Stream) -> Result<Self, Exception> {
+    fn new(args: &ModelArgs, layer: usize, stream: &Stream) -> Result<Self, Exception> {
+        let prefix = format!("model.layers.{layer}.self_attn");
         Ok(Self {
             n_heads: args.num_attention_heads,
             n_kv_heads: args.num_key_value_heads,
@@ -286,28 +308,28 @@ impl Attention {
                 args.hidden_size,
                 args.num_attention_heads * args.head_dim,
                 true,
-                args.quantization,
+                args.weight_quantization_for(&format!("{prefix}.q_proj.weight")),
                 stream,
             )?,
             k_proj: common::linear::unloaded_maybe_quantized_linear(
                 args.hidden_size,
                 args.num_key_value_heads * args.head_dim,
                 true,
-                args.quantization,
+                args.weight_quantization_for(&format!("{prefix}.k_proj.weight")),
                 stream,
             )?,
             v_proj: common::linear::unloaded_maybe_quantized_linear(
                 args.hidden_size,
                 args.num_key_value_heads * args.head_dim,
                 true,
-                args.quantization,
+                args.weight_quantization_for(&format!("{prefix}.v_proj.weight")),
                 stream,
             )?,
             o_proj: common::linear::unloaded_maybe_quantized_linear(
                 args.num_attention_heads * args.head_dim,
                 args.hidden_size,
                 true,
-                args.quantization,
+                args.weight_quantization_for(&format!("{prefix}.o_proj.weight")),
                 stream,
             )?,
             rope: initialize_rope(
@@ -531,21 +553,25 @@ pub struct Mlp {
     top_k: i32,
     #[param]
     /// Biased expert router, matching the checkpoint's `mlp.router` tree.
-    pub router: nn::Linear,
+    pub router: MaybeQuantized<nn::Linear>,
     #[param]
     /// Checkpoint-native routed expert bank.
     pub experts: Experts,
 }
 
 impl Mlp {
-    fn new(args: &ModelArgs, stream: &Stream) -> Result<Self, Exception> {
+    fn new(args: &ModelArgs, layer: usize, stream: &Stream) -> Result<Self, Exception> {
         Ok(Self {
             top_k: args.num_experts_per_tok,
-            router: nn::Linear::unloaded(
+            router: common::linear::unloaded_maybe_quantized_linear(
                 args.hidden_size,
                 args.num_local_experts,
                 true,
-                Dtype::Float32,
+                // Preserve the established load-time policy: routers remain dense.
+                // Checkpoint-native GGUF quantization is still honored exactly.
+                args.checkpoint_weight_quantization_for(&format!(
+                    "model.layers.{layer}.mlp.router.weight"
+                )),
                 stream,
             )?,
             experts: Experts::new(args, stream)?,
@@ -597,10 +623,10 @@ pub struct TransformerBlock {
 }
 
 impl TransformerBlock {
-    pub(crate) fn new(args: &ModelArgs, stream: &Stream) -> Result<Self, Exception> {
+    pub(crate) fn new(args: &ModelArgs, layer: usize, stream: &Stream) -> Result<Self, Exception> {
         Ok(Self {
-            self_attn: Attention::new(args, stream)?,
-            mlp: Mlp::new(args, stream)?,
+            self_attn: Attention::new(args, layer, stream)?,
+            mlp: Mlp::new(args, layer, stream)?,
             input_layernorm: nn::RmsNorm::unloaded(
                 args.hidden_size,
                 args.rms_norm_eps,
@@ -825,11 +851,11 @@ impl GptOssModel {
             embed_tokens: common::linear::unloaded_maybe_quantized_embedding(
                 args.vocab_size,
                 args.hidden_size,
-                args.quantization,
+                args.weight_quantization_for("model.embed_tokens.weight"),
                 stream,
             )?,
             layers: (0..args.num_hidden_layers)
-                .map(|_| TransformerBlock::new(args, stream))
+                .map(|layer| TransformerBlock::new(args, layer as usize, stream))
                 .collect::<Result<_, _>>()?,
             norm: nn::RmsNorm::unloaded(
                 args.hidden_size,
@@ -986,7 +1012,7 @@ impl Model {
                 args.hidden_size,
                 args.vocab_size,
                 false,
-                args.quantization,
+                args.weight_quantization_for("lm_head.weight"),
                 stream,
             )?,
             args,
@@ -1104,6 +1130,409 @@ impl CausalLm<Cache> for Model {
 pub type Generate<'a, S = crate::runtime::generation::sampler::DefaultSampler> =
     common::generation::Generate<'a, Model, Cache, S>;
 
+pub(crate) struct LoadedGptOssGguf {
+    pub(crate) model: Model,
+    pub(crate) eos_token_ids: Vec<u32>,
+}
+
+pub(crate) struct PreparedGptOssGguf {
+    pub(crate) args: ModelArgs,
+    pub(crate) eos_token_ids: Vec<u32>,
+}
+
+/// Loads a canonical llama.cpp `gpt-oss` GGUF checkpoint.
+pub fn load_gguf(
+    gguf_file: impl AsRef<Path>,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<Model, Error> {
+    let checkpoint = GgufCheckpoint::open(gguf_file)?;
+    let metadata = gguf_metadata(&checkpoint);
+    Ok(load_gguf_checkpoint(&checkpoint, metadata, None, stream, weights_stream)?.model)
+}
+
+pub(crate) fn load_gguf_checkpoint(
+    checkpoint: &GgufCheckpoint,
+    metadata: HashMap<String, GgufMetadataValue>,
+    quantization: Option<WeightQuantization>,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<LoadedGptOssGguf, Error> {
+    let mut prepared = prepare_gguf_checkpoint(checkpoint, &metadata, weights_stream)?;
+    if let Some(quantization) = quantization {
+        if quantization != WeightQuantization::MxFp4 {
+            return Err(Error::Quantization(
+                "GPT-OSS GGUF load-time quantization only supports MXFP4 dense projections".into(),
+            ));
+        }
+        prepared.args.quantization = Some(quantization);
+        prepared.args.quantized_weight_configs = None;
+    }
+    let mut model = Model::new(prepared.args, stream)?;
+    let config = StrictLoadConfig::default();
+    let mut report = StrictLoadReport::default();
+    let mut materializer = checkpoint.materializer();
+
+    for tensor in checkpoint.catalog().tensors() {
+        let physical = &tensor.descriptor().name;
+        if physical.contains("ffn_gate_exps")
+            || physical.contains("ffn_up_exps")
+            || physical.contains("ffn_down_exps")
+        {
+            continue;
+        }
+        for (name, value) in materializer.converted_tensor(physical)?.into_arrays() {
+            load_named_array_strict(
+                &mut model,
+                translate_gguf_weight_name(&name),
+                value,
+                quantization.map(|value| (value, stream)),
+                &config,
+                &mut report,
+            )?;
+        }
+    }
+
+    for layer in 0..model.args.num_hidden_layers as usize {
+        let source = format!("blk.{layer}");
+        let target = format!("model.layers.{layer}.mlp.experts");
+        let converted = |materializer: &mut safemlx::ops::GgufMaterializer,
+                         physical: String|
+         -> Result<HashMap<String, Array>, Error> {
+            Ok(materializer
+                .converted_tensor(&physical)?
+                .into_arrays()
+                .into_iter()
+                .collect())
+        };
+        let gate_physical = format!("{source}.ffn_gate_exps.weight");
+        let up_physical = format!("{source}.ffn_up_exps.weight");
+        let down_physical = format!("{source}.ffn_down_exps.weight");
+        let gate = converted(&mut materializer, gate_physical.clone())?;
+        let up = converted(&mut materializer, up_physical.clone())?;
+        let down = converted(&mut materializer, down_physical.clone())?;
+        let get = |arrays: &HashMap<String, Array>, name: String| {
+            arrays.get(&name).cloned().ok_or_else(|| {
+                Error::UnsupportedArchitecture(format!(
+                    "GPT-OSS GGUF is missing converted tensor {name:?}"
+                ))
+            })
+        };
+        let gate_weight = get(&gate, gate_physical.clone())?;
+        let up_weight = get(&up, up_physical.clone())?;
+        let gate_scales = get(&gate, gate_physical.replace(".weight", ".scales"))?;
+        let up_scales = get(&up, up_physical.replace(".weight", ".scales"))?;
+        let experts = model.args.num_local_experts;
+        let intermediate = model.args.intermediate_size;
+        let hidden = model.args.hidden_size;
+        let gate_up_weight = stack_axis(&[gate_weight, up_weight], 2, weights_stream)?
+            .reshape(&[experts, 2 * intermediate, hidden / 8], weights_stream)?
+            .view::<u8>(weights_stream)?
+            .reshape(
+                &[experts, 2 * intermediate, hidden / 32, 16],
+                weights_stream,
+            )?;
+        let gate_up_scales = stack_axis(&[gate_scales, up_scales], 2, weights_stream)?
+            .reshape(&[experts, 2 * intermediate, hidden / 32], weights_stream)?;
+        let down_weight = get(&down, down_physical.clone())?
+            .view::<u8>(weights_stream)?
+            .reshape(&[experts, hidden, intermediate / 32, 16], weights_stream)?;
+        let down_scales = get(&down, down_physical.replace(".weight", ".scales"))?;
+
+        for (name, value) in [
+            (format!("{target}.gate_up_proj_blocks"), gate_up_weight),
+            (format!("{target}.gate_up_proj_scales"), gate_up_scales),
+            (format!("{target}.down_proj_blocks"), down_weight),
+            (format!("{target}.down_proj_scales"), down_scales),
+        ] {
+            load_named_array_strict(&mut model, name, value, None, &config, &mut report)?;
+        }
+
+        let gate_bias_name = format!("{source}.ffn_gate_exps.bias");
+        let up_bias_name = format!("{source}.ffn_up_exps.bias");
+        let down_bias_name = format!("{source}.ffn_down_exps.bias");
+        let gate_bias = materializer
+            .converted_tensor(&gate_bias_name)?
+            .into_arrays()
+            .into_iter()
+            .next()
+            .map(|(_, value)| value)
+            .ok_or_else(|| Error::UnsupportedArchitecture("empty GPT-OSS gate bias".into()))?;
+        let up_bias = materializer
+            .converted_tensor(&up_bias_name)?
+            .into_arrays()
+            .into_iter()
+            .next()
+            .map(|(_, value)| value)
+            .ok_or_else(|| Error::UnsupportedArchitecture("empty GPT-OSS up bias".into()))?;
+        let gate_up_bias = stack_axis(&[gate_bias, up_bias], 2, weights_stream)?
+            .reshape(&[experts, 2 * intermediate], weights_stream)?;
+        let down_bias = materializer
+            .converted_tensor(&down_bias_name)?
+            .into_arrays()
+            .into_iter()
+            .next()
+            .map(|(_, value)| value)
+            .ok_or_else(|| Error::UnsupportedArchitecture("empty GPT-OSS down bias".into()))?;
+        for (name, value) in [
+            (format!("{target}.gate_up_proj_bias"), gate_up_bias),
+            (format!("{target}.down_proj_bias"), down_bias),
+        ] {
+            load_named_array_strict(&mut model, name, value, None, &config, &mut report)?;
+        }
+    }
+    report.finish(&model, &config)?;
+    model.copy_to_stream(stream)?;
+    Ok(LoadedGptOssGguf {
+        model,
+        eos_token_ids: prepared.eos_token_ids,
+    })
+}
+
+pub(crate) fn prepare_gguf_checkpoint(
+    checkpoint: &GgufCheckpoint,
+    metadata: &HashMap<String, GgufMetadataValue>,
+    stream: &Stream,
+) -> Result<PreparedGptOssGguf, Error> {
+    let architecture = gguf_string(metadata, "general.architecture")?;
+    if architecture != "gpt-oss" {
+        return Err(Error::UnsupportedArchitecture(format!(
+            "GGUF architecture {architecture:?}; this loader supports gpt-oss"
+        )));
+    }
+    for layer in 0..gguf_i32(metadata, "gpt-oss.block_count", stream)? {
+        for projection in ["gate", "up", "down"] {
+            let name = format!("blk.{layer}.ffn_{projection}_exps.weight");
+            let tensor = checkpoint
+                .catalog()
+                .tensors()
+                .find(|tensor| tensor.descriptor().name == name)
+                .ok_or_else(|| {
+                    Error::UnsupportedArchitecture(format!(
+                        "GPT-OSS GGUF is missing routed expert tensor {name:?}"
+                    ))
+                })?;
+            if !tensor.is_mxfp4() {
+                return Err(Error::UnsupportedArchitecture(format!(
+                    "GPT-OSS GGUF routed tensor {name:?} uses {:?}; the current GPT-OSS kernel requires canonical MXFP4 type 39 experts",
+                    tensor.descriptor().ggml_type
+                )));
+            }
+        }
+    }
+    checkpoint
+        .catalog()
+        .translated_outputs(translate_gguf_weight_name)
+        .map_err(safemlx::error::IoError::from)?;
+    let mut configs = gguf_quantization_configs(checkpoint, translate_gguf_weight_name)?;
+    configs.retain(|name, _| !name.contains(".mlp.experts."));
+    let mut args = args_from_gguf(checkpoint, metadata, stream)?;
+    args.quantized_weight_configs = Some(configs);
+    args.validate()?;
+    Ok(PreparedGptOssGguf {
+        args,
+        eos_token_ids: crate::api::gguf_eos_token_ids(metadata)?,
+    })
+}
+
+fn args_from_gguf(
+    _arrays: &impl GgufTensorNames,
+    metadata: &HashMap<String, GgufMetadataValue>,
+    stream: &Stream,
+) -> Result<ModelArgs, Error> {
+    let key = |suffix: &str| format!("gpt-oss.{suffix}");
+    let hidden_size = gguf_i32(metadata, &key("embedding_length"), stream)?;
+    let num_attention_heads = gguf_i32(metadata, &key("attention.head_count"), stream)?;
+    let head_dim = gguf_optional_i32(metadata, &key("attention.key_length"))?
+        .unwrap_or(hidden_size / num_attention_heads);
+    let vocab_size = gguf_vocab_size(metadata, &key("vocab_size"), stream)?;
+    let rope_scaling = gguf_rope_scaling(metadata, "gpt-oss")?;
+    Ok(ModelArgs {
+        model_type: "gpt_oss".into(),
+        hidden_size,
+        intermediate_size: gguf_i32(metadata, &key("expert_feed_forward_length"), stream)?,
+        num_hidden_layers: gguf_i32(metadata, &key("block_count"), stream)?,
+        num_attention_heads,
+        num_key_value_heads: gguf_i32(metadata, &key("attention.head_count_kv"), stream)?,
+        head_dim,
+        vocab_size,
+        num_local_experts: gguf_i32(metadata, &key("expert_count"), stream)?,
+        num_experts_per_tok: gguf_i32(metadata, &key("expert_used_count"), stream)?,
+        rms_norm_eps: gguf_f32(metadata, &key("attention.layer_norm_rms_epsilon"))?,
+        sliding_window: gguf_i32(metadata, &key("attention.sliding_window"), stream)?,
+        max_position_embeddings: gguf_i32(metadata, &key("context_length"), stream)?,
+        rope_theta: gguf_optional_f32(metadata, &key("rope.freq_base"))?
+            .unwrap_or_else(default_rope_theta),
+        rope_scaling,
+        layer_types: Vec::new(),
+        quantization_config: MxFp4Config {
+            quant_method: "mxfp4".into(),
+        },
+        quantization: None,
+        quantized_weight_configs: None,
+        swiglu_limit: gguf_optional_f32(metadata, &key("swiglu_clamp_exp"))?
+            .unwrap_or_else(default_swiglu_limit),
+    })
+}
+
+fn gguf_vocab_size(
+    metadata: &HashMap<String, GgufMetadataValue>,
+    fallback: &str,
+    stream: &Stream,
+) -> Result<i32, Error> {
+    match metadata
+        .get("tokenizer.ggml.tokens")
+        .and_then(GgufMetadataValue::as_strings)
+    {
+        Some(tokens) => i32::try_from(tokens.len()).map_err(|_| {
+            Error::UnsupportedArchitecture("GGUF tokenizer vocabulary exceeds i32".into())
+        }),
+        None if metadata.contains_key("tokenizer.ggml.tokens") => {
+            Err(Error::UnsupportedArchitecture(
+                "GGUF tokenizer.ggml.tokens metadata has the wrong type".into(),
+            ))
+        }
+        None => gguf_i32(metadata, fallback, stream),
+    }
+}
+
+fn gguf_optional_i32(
+    metadata: &HashMap<String, GgufMetadataValue>,
+    key: &str,
+) -> Result<Option<i32>, Error> {
+    metadata
+        .get(key)
+        .map(|value| {
+            value
+                .as_i64()
+                .and_then(|value| i32::try_from(value).ok())
+                .ok_or_else(|| {
+                    Error::UnsupportedArchitecture(format!(
+                        "GGUF metadata key {key:?} must be an i32 scalar"
+                    ))
+                })
+        })
+        .transpose()
+}
+
+fn gguf_f32(metadata: &HashMap<String, GgufMetadataValue>, key: &str) -> Result<f32, Error> {
+    gguf_optional_f32(metadata, key)?.ok_or_else(|| {
+        Error::UnsupportedArchitecture(format!("GGUF metadata is missing required key {key:?}"))
+    })
+}
+
+fn gguf_optional_f32(
+    metadata: &HashMap<String, GgufMetadataValue>,
+    key: &str,
+) -> Result<Option<f32>, Error> {
+    metadata
+        .get(key)
+        .map(|value| {
+            value.as_f32().ok_or_else(|| {
+                Error::UnsupportedArchitecture(format!(
+                    "GGUF metadata key {key:?} must be a numeric scalar"
+                ))
+            })
+        })
+        .transpose()
+}
+
+fn gguf_optional_string(
+    metadata: &HashMap<String, GgufMetadataValue>,
+    key: &str,
+) -> Result<Option<String>, Error> {
+    match metadata.get(key) {
+        Some(GgufMetadataValue::String(value)) => Ok(Some(value.clone())),
+        Some(_) => Err(Error::UnsupportedArchitecture(format!(
+            "GGUF metadata key {key:?} must be a string"
+        ))),
+        None => Ok(None),
+    }
+}
+
+fn gguf_rope_scaling(
+    metadata: &HashMap<String, GgufMetadataValue>,
+    architecture: &str,
+) -> Result<Option<HashMap<String, FloatOrString>>, Error> {
+    let key = |suffix: &str| format!("{architecture}.rope.scaling.{suffix}");
+    let Some(kind) = gguf_optional_string(metadata, &key("type"))? else {
+        return Ok(None);
+    };
+    if matches!(kind.as_str(), "none" | "default") {
+        return Ok(None);
+    }
+    if kind != "yarn" {
+        return Err(Error::UnsupportedArchitecture(format!(
+            "GPT-OSS GGUF RoPE scaling type {kind:?} is unsupported"
+        )));
+    }
+    Ok(Some(HashMap::from([
+        ("rope_type".into(), FloatOrString::String("yarn".into())),
+        (
+            "factor".into(),
+            FloatOrString::Float(gguf_f32(metadata, &key("factor"))?),
+        ),
+        (
+            "original_max_position_embeddings".into(),
+            FloatOrString::Float(gguf_f32(metadata, &key("original_context_length"))?),
+        ),
+        (
+            "beta_fast".into(),
+            FloatOrString::Float(
+                gguf_optional_f32(metadata, &key("yarn_beta_fast"))?.unwrap_or(32.0),
+            ),
+        ),
+        (
+            "beta_slow".into(),
+            FloatOrString::Float(
+                gguf_optional_f32(metadata, &key("yarn_beta_slow"))?.unwrap_or(1.0),
+            ),
+        ),
+        ("truncate".into(), FloatOrString::Bool(false)),
+    ])))
+}
+
+pub(crate) fn translate_gguf_weight_name(name: &str) -> String {
+    for (source, target) in [
+        ("token_embd", "model.embed_tokens"),
+        ("output_norm", "model.norm"),
+        ("output", "lm_head"),
+    ] {
+        if name == source || name.starts_with(&format!("{source}.")) {
+            return name.replacen(source, target, 1);
+        }
+    }
+    let Some(rest) = name.strip_prefix("blk.") else {
+        return name.to_string();
+    };
+    let Some((layer, parameter)) = rest.split_once('.') else {
+        return name.to_string();
+    };
+    for (source, target) in [
+        ("attn_norm", "input_layernorm"),
+        ("attn_post_norm", "post_attention_layernorm"),
+        ("attn_q", "self_attn.q_proj"),
+        ("attn_k", "self_attn.k_proj"),
+        ("attn_v", "self_attn.v_proj"),
+        ("attn_output", "self_attn.o_proj"),
+        ("ffn_gate_inp", "mlp.router"),
+        ("ffn_gate_exps", "mlp.experts.gate_proj"),
+        ("ffn_up_exps", "mlp.experts.up_proj"),
+        ("ffn_down_exps", "mlp.experts.down_proj"),
+    ] {
+        if parameter == source || parameter.starts_with(&format!("{source}.")) {
+            return format!(
+                "model.layers.{layer}.{}",
+                parameter.replacen(source, target, 1)
+            );
+        }
+    }
+    if parameter == "attn_sinks.weight" || parameter == "attn_sinks" {
+        return format!("model.layers.{layer}.self_attn.sinks");
+    }
+    name.to_string()
+}
+
 /// Reads GPT-OSS model arguments from `config.json`.
 pub fn get_model_args(model_dir: impl AsRef<Path>) -> Result<ModelArgs, Error> {
     let file = std::fs::File::open(model_dir.as_ref().join("config.json"))?;
@@ -1183,7 +1612,7 @@ mod tests {
 
     use safemlx::{
         module::ModuleParameters,
-        ops::{ones_dtype, zeros_dtype},
+        ops::{ones_dtype, zeros_dtype, GgufMetadataValue},
         Array, Device, DeviceType, ExecutionContext,
     };
 
@@ -1222,8 +1651,170 @@ mod tests {
                 quant_method: "mxfp4".into(),
             },
             quantization: None,
+            quantized_weight_configs: None,
             swiglu_limit: 7.0,
         }
+    }
+
+    #[test]
+    fn gguf_names_translate_to_native_parameter_tree() {
+        assert_eq!(
+            super::translate_gguf_weight_name("blk.3.attn_sinks.weight"),
+            "model.layers.3.self_attn.sinks"
+        );
+        assert_eq!(
+            super::translate_gguf_weight_name("blk.3.ffn_gate_inp.bias"),
+            "model.layers.3.mlp.router.bias"
+        );
+        assert_eq!(
+            super::translate_gguf_weight_name("blk.3.ffn_gate_exps.scales"),
+            "model.layers.3.mlp.experts.gate_proj.scales"
+        );
+    }
+
+    #[test]
+    fn canonical_mxfp4_gguf_loads() {
+        let context = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        let stream = context.stream();
+        let args = tiny_args();
+        let mut arrays = HashMap::new();
+        let mut insert = |name: &str, shape: &[i32]| {
+            arrays.insert(
+                name.to_string(),
+                Array::zeros::<f32>(shape, stream).unwrap(),
+            );
+        };
+        insert("token_embd.weight", &[args.vocab_size, args.hidden_size]);
+        insert("output_norm.weight", &[args.hidden_size]);
+        insert("output.weight", &[args.vocab_size, args.hidden_size]);
+        for layer in 0..args.num_hidden_layers {
+            let prefix = format!("blk.{layer}");
+            insert(&format!("{prefix}.attn_norm.weight"), &[args.hidden_size]);
+            insert(
+                &format!("{prefix}.attn_post_norm.weight"),
+                &[args.hidden_size],
+            );
+            for (name, output) in [
+                ("attn_q", args.num_attention_heads * args.head_dim),
+                ("attn_k", args.num_key_value_heads * args.head_dim),
+                ("attn_v", args.num_key_value_heads * args.head_dim),
+            ] {
+                insert(
+                    &format!("{prefix}.{name}.weight"),
+                    &[output, args.hidden_size],
+                );
+                insert(&format!("{prefix}.{name}.bias"), &[output]);
+            }
+            insert(
+                &format!("{prefix}.attn_output.weight"),
+                &[args.hidden_size, args.num_attention_heads * args.head_dim],
+            );
+            insert(&format!("{prefix}.attn_output.bias"), &[args.hidden_size]);
+            insert(
+                &format!("{prefix}.attn_sinks.weight"),
+                &[args.num_attention_heads],
+            );
+            insert(
+                &format!("{prefix}.ffn_gate_inp.weight"),
+                &[args.num_local_experts, args.hidden_size],
+            );
+            insert(
+                &format!("{prefix}.ffn_gate_inp.bias"),
+                &[args.num_local_experts],
+            );
+            for name in ["gate", "up"] {
+                insert(
+                    &format!("{prefix}.ffn_{name}_exps.weight"),
+                    &[
+                        args.num_local_experts,
+                        args.intermediate_size,
+                        args.hidden_size,
+                    ],
+                );
+                insert(
+                    &format!("{prefix}.ffn_{name}_exps.bias"),
+                    &[args.num_local_experts, args.intermediate_size],
+                );
+            }
+            insert(
+                &format!("{prefix}.ffn_down_exps.weight"),
+                &[
+                    args.num_local_experts,
+                    args.hidden_size,
+                    args.intermediate_size,
+                ],
+            );
+            insert(
+                &format!("{prefix}.ffn_down_exps.bias"),
+                &[args.num_local_experts, args.hidden_size],
+            );
+        }
+        let metadata = HashMap::from([
+            (
+                "general.architecture".into(),
+                GgufMetadataValue::String("gpt-oss".into()),
+            ),
+            (
+                "gpt-oss.embedding_length".into(),
+                GgufMetadataValue::Uint32(args.hidden_size as u32),
+            ),
+            (
+                "gpt-oss.block_count".into(),
+                GgufMetadataValue::Uint32(args.num_hidden_layers as u32),
+            ),
+            (
+                "gpt-oss.expert_feed_forward_length".into(),
+                GgufMetadataValue::Uint32(args.intermediate_size as u32),
+            ),
+            (
+                "gpt-oss.attention.head_count".into(),
+                GgufMetadataValue::Uint32(args.num_attention_heads as u32),
+            ),
+            (
+                "gpt-oss.attention.head_count_kv".into(),
+                GgufMetadataValue::Uint32(args.num_key_value_heads as u32),
+            ),
+            (
+                "gpt-oss.attention.key_length".into(),
+                GgufMetadataValue::Uint32(args.head_dim as u32),
+            ),
+            (
+                "gpt-oss.attention.layer_norm_rms_epsilon".into(),
+                GgufMetadataValue::Float32(args.rms_norm_eps),
+            ),
+            (
+                "gpt-oss.attention.sliding_window".into(),
+                GgufMetadataValue::Uint32(args.sliding_window as u32),
+            ),
+            (
+                "gpt-oss.context_length".into(),
+                GgufMetadataValue::Uint32(args.max_position_embeddings as u32),
+            ),
+            (
+                "gpt-oss.rope.freq_base".into(),
+                GgufMetadataValue::Float32(args.rope_theta),
+            ),
+            (
+                "gpt-oss.expert_count".into(),
+                GgufMetadataValue::Uint32(args.num_local_experts as u32),
+            ),
+            (
+                "gpt-oss.expert_used_count".into(),
+                GgufMetadataValue::Uint32(args.num_experts_per_tok as u32),
+            ),
+            (
+                "gpt-oss.vocab_size".into(),
+                GgufMetadataValue::Uint32(args.vocab_size as u32),
+            ),
+        ]);
+        let fixture =
+            crate::test_utils::SyntheticGguf::with_packed_tensors(&arrays, &metadata, |name, _| {
+                name.contains("_exps.weight")
+                    .then_some(safemlx_gguf::GgmlType::MxFp4)
+            });
+        let loaded = super::load_gguf(fixture.path(), stream, stream).unwrap();
+        assert_eq!(loaded.args.num_hidden_layers, args.num_hidden_layers);
+        assert_eq!(loaded.args.num_local_experts, args.num_local_experts);
     }
 
     #[test]
