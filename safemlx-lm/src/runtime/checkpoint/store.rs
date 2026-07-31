@@ -1254,6 +1254,73 @@ impl WeightLease {
                     path: shard.path.clone(),
                     message: format!("tensor {:?} payload is outside the mapped shard", self.key),
                 })?;
+
+        // Axis-zero ranges are contiguous in safetensors storage. Slice the
+        // mmap bytes before constructing an MLX array: `Array::try_from` copies
+        // its complete `TensorView`, so selecting afterwards would transiently
+        // materialize an entire packed expert bank for every requested expert.
+        if let TensorSelection::Range {
+            axis: 0,
+            start,
+            end,
+        } = &self.selection
+        {
+            let outer = info.shape[0];
+            let row_bytes = data
+                .len()
+                .checked_div(outer)
+                .filter(|_| data.len() % outer == 0)
+                .ok_or_else(|| WeightStoreError::MalformedSafetensors {
+                    path: shard.path.clone(),
+                    message: format!(
+                        "tensor {:?} payload is not divisible by its outer dimension",
+                        self.key
+                    ),
+                })?;
+            let selected_start =
+                start
+                    .checked_mul(row_bytes)
+                    .ok_or_else(|| WeightStoreError::Overflow {
+                        context: format!("axis-zero byte start for tensor {:?}", self.key),
+                    })?;
+            let selected_end =
+                end.checked_mul(row_bytes)
+                    .ok_or_else(|| WeightStoreError::Overflow {
+                        context: format!("axis-zero byte end for tensor {:?}", self.key),
+                    })?;
+            let selected_data = data.get(selected_start..selected_end).ok_or_else(|| {
+                WeightStoreError::MalformedSafetensors {
+                    path: shard.path.clone(),
+                    message: format!(
+                        "axis-zero selection for tensor {:?} is outside its payload",
+                        self.key
+                    ),
+                }
+            })?;
+            let view = TensorView::new(info.dtype, self.output_shape.clone(), selected_data)
+                .map_err(|error| WeightStoreError::MalformedSafetensors {
+                    path: shard.path.clone(),
+                    message: format!("tensor {:?}: {error}", self.key),
+                })?;
+            let source_value =
+                Array::try_from(view).map_err(|source| WeightStoreError::MlxConversion {
+                    key: self.key.clone(),
+                    source,
+                })?;
+            let materialized = source_value
+                .copy(execution_stream)
+                .map_err(|source| self.mlx_error("copy", source))?;
+            return Ok(PendingWeightMaterialization {
+                output: materialized,
+                _source: source_value,
+                _gguf_group: None,
+                lease: Some(self),
+                source_stream: source_stream.clone(),
+                execution_stream: execution_stream.clone(),
+                completed: false,
+            });
+        }
+
         let view = TensorView::new(info.dtype, info.shape.clone(), data).map_err(|error| {
             WeightStoreError::MalformedSafetensors {
                 path: shard.path.clone(),
@@ -2319,6 +2386,39 @@ mod tests {
         assert_eq!(
             indexed.evaluated().unwrap().as_slice::<i32>(),
             &[8, 9, 10, 11, 0, 1, 2, 3]
+        );
+    }
+
+    #[test]
+    fn axis_zero_range_constructs_only_the_selected_safetensors_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("model.safetensors");
+        write_i32(&path, "bank", &(0..12).collect::<Vec<_>>(), vec![3, 4]);
+        let store = SafetensorsWeightStore::open(&path).unwrap();
+        let stream = cpu_stream();
+        let pending = store
+            .acquire(
+                "bank",
+                TensorSelection::Range {
+                    axis: 0,
+                    start: 1,
+                    end: 2,
+                },
+            )
+            .unwrap()
+            .prepare_materialization(&stream, &stream)
+            .unwrap();
+
+        assert_eq!(pending._source.shape(), [1, 4]);
+        assert_eq!(pending.output().shape(), [1, 4]);
+        assert_eq!(
+            pending
+                .finish()
+                .unwrap()
+                .evaluated()
+                .unwrap()
+                .as_slice::<i32>(),
+            &[4, 5, 6, 7]
         );
     }
 
