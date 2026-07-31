@@ -272,6 +272,42 @@ fn gemma4_chat_tokenizer(preceding_tokens: usize) -> ChatTokenizer {
     tokenizer
 }
 
+fn gemma4_gguf_chat_tokenizer(preceding_tokens: usize) -> ChatTokenizer {
+    let mut raw = Tokenizer::new(WordLevel::default());
+    raw.add_tokens(
+        (0..preceding_tokens)
+            .map(|index| AddedToken::from(format!("ordinary_{index}"), false))
+            .collect::<Vec<_>>(),
+    )
+    .unwrap();
+    assert_eq!(
+        raw.add_tokens(
+            [
+                "<|channel>",
+                "<channel|>",
+                "<|tool_call>",
+                "<tool_call|>",
+                "<|\"|>",
+                "<|tool_response>",
+            ]
+            .map(|token| AddedToken::from(token, false).normalized(false))
+        )
+        .unwrap(),
+        6
+    );
+    assert_eq!(
+        raw.add_special_tokens([AddedToken::from("<turn|>", true).normalized(false)])
+            .unwrap(),
+        1
+    );
+    let mut tokenizer = ChatTokenizer::from_tokenizer(raw);
+    tokenizer.set_template_kwargs(serde_json::Map::from_iter([
+        ("bos_token".into(), json!("<bos>")),
+        ("eos_token".into(), json!("<eos>")),
+    ]));
+    tokenizer
+}
+
 fn gemma4_reasoning_tokenizer(preceding_tokens: usize) -> ChatTokenizer {
     let mut raw = Tokenizer::new(WordLevel::default());
     raw.add_tokens(
@@ -2768,6 +2804,37 @@ fn gemma_recognition_accepts_source_refactors_and_splits_tool_capabilities() {
 }
 
 #[test]
+fn gemma_recognition_accepts_self_defaulting_kwargs_and_gguf_added_tokens() {
+    let compiler = Ok(ConstraintCompiler::synthetic_for_tests());
+    let template = format!(
+        "{{%- set enable_thinking = enable_thinking | default(false) -%}}{}",
+        GEMMA4_EDGE_FIXTURE
+    );
+    let mut tokenizer = gemma4_gguf_chat_tokenizer(50);
+    let prepared = prepare_chat_from_parts(
+        &mut tokenizer,
+        ModelChatTemplate::Single(template),
+        "converter-variant",
+        &[],
+        Some(&compiler),
+        ChatTemplateRequest {
+            messages: vec![json!({"role": "user", "content": "hello"})],
+            enable_thinking: Some(true),
+            add_generation_prompt: true,
+            ..ChatTemplateRequest::default()
+        },
+    )
+    .unwrap();
+
+    assert_eq!(
+        prepared.format_profile_identity(),
+        Some("gemma.channels.v1")
+    );
+    assert!(prepared.capabilities().reasoning_parser.is_supported());
+    assert!(prepared.rendered_prompt().contains("<|think|>"));
+}
+
+#[test]
 fn unsloth_gemma_variant_is_recognized_behaviorally_and_accepts_both_argument_forms() {
     let compiler = Ok(ConstraintCompiler::synthetic_for_tests());
     let template = UNSLOTH_GEMMA4_FIXTURE_WITH_TERMINATOR
@@ -3382,7 +3449,7 @@ fn tokenizer_analysis_is_model_scoped_while_schemas_compile_per_prepare_chat() {
 }
 
 #[test]
-fn missing_structural_special_fails_before_prompt_rendering() {
+fn missing_structural_added_token_fails_before_prompt_rendering() {
     let raw = Tokenizer::new(WordLevel::default());
     let mut tokenizer = ChatTokenizer::from_tokenizer(raw);
     let compiler = Ok(ConstraintCompiler::synthetic_for_tests());
@@ -3407,7 +3474,7 @@ fn missing_structural_special_fails_before_prompt_rendering() {
         error,
         Error::ToolConstraint(ref message)
             if message.contains(SYNTHETIC_STRUCTURAL_TOKEN)
-                && message.contains("not registered as a special token")
+                && message.contains("not registered as an added token")
     ));
 }
 

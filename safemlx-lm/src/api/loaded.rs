@@ -525,7 +525,7 @@ impl LoadedModel {
     /// This method validates native-tool support and constructs the constrained
     /// sampler plus a fresh dialect parser before prompt prefill. It then uses
     /// the existing architecture-dispatched token iterator, committing each
-    /// token through tokenizer-aware decoding, selective structural-special
+    /// token through tokenizer-aware decoding, selective structural-token
     /// preservation, UTF-8 assembly, combined profile/caller stop matching, and
     /// immediate [`SemanticEvent`] delivery.
     /// The rendered chat template is encoded without adding a second layer of

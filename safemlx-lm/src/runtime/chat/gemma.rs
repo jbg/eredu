@@ -235,7 +235,7 @@ impl ProtocolParser for GemmaToolParser {
                 .any(|marker| text.contains(marker))
                 {
                     return Err(
-                        "Gemma tool payload contains a structural marker without its special-token identity"
+                        "Gemma tool payload contains a structural marker without its added-token identity"
                             .into(),
                     );
                 }
@@ -436,7 +436,8 @@ mod tests {
                 1 => b"literal <|channel>".to_vec(),
                 2 => b"thought\nprivate".to_vec(),
                 3 => b"visible".to_vec(),
-                10 | 11 => Vec::new(),
+                10 => CHANNEL_OPEN.as_bytes().to_vec(),
+                11 => CHANNEL_CLOSE.as_bytes().to_vec(),
                 _ => unreachable!(),
             })
         }

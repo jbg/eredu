@@ -162,14 +162,6 @@ impl ThinkingMode {
             Self::Off => Some(false),
         }
     }
-
-    const fn label(self) -> &'static str {
-        match self {
-            Self::Auto => "auto",
-            Self::On => "on",
-            Self::Off => "off",
-        }
-    }
 }
 
 impl From<ExpertCacheEviction> for CacheEvictionPolicy {
@@ -752,12 +744,6 @@ fn main() -> Result<()> {
     let (prepared_chat, rendered_prompt, add_special_tokens) = if args.raw {
         (None, prompt, true)
     } else {
-        // Preserve the existing explicit-thinking validation for ordinary chat.
-        // Tool templates may select a different template body and are validated
-        // by prepare_chat itself.
-        if !tools_requested && args.thinking != ThinkingMode::Auto {
-            thinking_template_kwargs(args.thinking, &model.chat_template_kwargs()?)?;
-        }
         let request = ChatTemplateRequest {
             messages: vec![serde_json::json!({
                 "role": "user",
@@ -1540,27 +1526,6 @@ fn validate_args(args: &Cli) -> Result<()> {
     Ok(())
 }
 
-fn thinking_template_kwargs(
-    mode: ThinkingMode,
-    available_kwargs: &[String],
-) -> Result<Option<serde_json::Map<String, serde_json::Value>>> {
-    let Some(enabled) = mode.enabled() else {
-        return Ok(None);
-    };
-    const KWARG: &str = "enable_thinking";
-    if !available_kwargs.iter().any(|name| name == KWARG) {
-        bail!(
-            "--thinking {} is not supported by this model's chat template (it does not expose {KWARG:?})",
-            mode.label(),
-        );
-    }
-
-    Ok(Some(serde_json::Map::from_iter([(
-        KWARG.to_owned(),
-        serde_json::Value::Bool(enabled),
-    )])))
-}
-
 fn read_prompt(argument: Option<&str>) -> Result<String> {
     if let Some(prompt) = argument {
         return Ok(prompt.to_owned());
@@ -2020,11 +1985,11 @@ mod tests {
     use super::{
         eval, execution_contexts, format_bytes, select_cached_gguf_from_revisions,
         select_cached_gguf_pair_from_revisions, select_cached_gguf_path, select_revision,
-        should_report_stop_reason, split_hf_model_spec, stop_reason, thinking_template_kwargs,
-        use_semantic_generation, validate_args, validate_artifact_pair, write_semantic_event,
-        Array, CachedGgufRole, Cli, CliDevice, CliToolChoice, DeviceType, MtpDraftDevice,
-        MtpExecutionStreams, MtpSchedulerOptions, NativeToolSupport, ResolvedModel, SemanticEvent,
-        SemanticSupport, StopReason, ThinkingMode,
+        should_report_stop_reason, split_hf_model_spec, stop_reason, use_semantic_generation,
+        validate_args, validate_artifact_pair, write_semantic_event, Array, CachedGgufRole, Cli,
+        CliDevice, CliToolChoice, DeviceType, MtpDraftDevice, MtpExecutionStreams,
+        MtpSchedulerOptions, NativeToolSupport, ResolvedModel, SemanticEvent, SemanticSupport,
+        StopReason,
     };
 
     fn revision(hash: &str, refs: &[&str], modified: u64) -> CachedRevisionInfo {
@@ -2055,33 +2020,7 @@ mod tests {
     }
 
     #[test]
-    fn configures_supported_thinking_templates() {
-        let available = vec!["enable_thinking".to_owned()];
-        assert_eq!(
-            thinking_template_kwargs(ThinkingMode::Auto, &available).unwrap(),
-            None
-        );
-        assert_eq!(
-            thinking_template_kwargs(ThinkingMode::On, &available)
-                .unwrap()
-                .unwrap()["enable_thinking"],
-            serde_json::Value::Bool(true)
-        );
-        assert_eq!(
-            thinking_template_kwargs(ThinkingMode::Off, &available)
-                .unwrap()
-                .unwrap()["enable_thinking"],
-            serde_json::Value::Bool(false)
-        );
-    }
-
-    #[test]
-    fn rejects_unsupported_or_raw_thinking_modes() {
-        let error = thinking_template_kwargs(ThinkingMode::Off, &[])
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("does not expose \"enable_thinking\""));
-
+    fn rejects_raw_thinking_modes() {
         let raw = Cli::try_parse_from([
             "safemlx-lm",
             "--model",

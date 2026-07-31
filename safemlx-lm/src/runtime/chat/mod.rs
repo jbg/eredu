@@ -903,14 +903,21 @@ pub(crate) fn resolve_structural_tokens(
                 "required structural token {spelling:?} is declared more than once"
             ));
         }
-        if !tokenizer.get_added_vocabulary().is_special_token(spelling) {
+        let token_id = tokenizer
+            .get_added_vocabulary()
+            .get_vocab()
+            .get(spelling)
+            .copied()
+            .ok_or_else(|| {
+                format!(
+                    "required structural token {spelling:?} is not registered as an added token"
+                )
+            })?;
+        if tokenizer.token_to_id(spelling) != Some(token_id) {
             return Err(format!(
-                "required structural token {spelling:?} is not registered as a special token"
+                "required structural token {spelling:?} does not resolve to its added-token ID {token_id}"
             ));
         }
-        let token_id = tokenizer.token_to_id(spelling).ok_or_else(|| {
-            format!("required structural special token {spelling:?} is missing from the tokenizer")
-        })?;
         if tokenizer.id_to_token(token_id).as_deref() != Some(spelling.as_str()) {
             return Err(format!(
                 "required structural token {spelling:?} does not round-trip through tokenizer ID {token_id}"
@@ -1086,5 +1093,18 @@ mod tests {
 
         assert!(error.contains("not atomic"), "{error}");
         assert!(error.contains("[0, 1]"), "{error}");
+    }
+
+    #[test]
+    fn structural_resolution_accepts_atomic_non_special_added_tokens() {
+        let mut raw = Tokenizer::new(WordLevel::default());
+        raw.add_tokens([AddedToken::from("<frame>", false).normalized(false)])
+            .unwrap();
+        let tokenizer = ChatTokenizer::from_tokenizer(raw);
+
+        assert_eq!(
+            resolve_structural_tokens(&tokenizer, &["<frame>".to_owned()]).unwrap(),
+            [0]
+        );
     }
 }

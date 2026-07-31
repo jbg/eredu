@@ -95,7 +95,8 @@ impl InProgressToolCall {
 ///
 /// Backends decide how ordinary tokenizer pieces become raw bytes. The
 /// `preserve_special` flag is true only for profile-designated structural token
-/// IDs; other special tokens can therefore remain skipped.
+/// IDs, including atomic user-defined tokens; unrelated tokenizer specials can
+/// therefore remain skipped.
 pub(crate) trait TokenDecoderBackend {
     type Error;
 
@@ -119,7 +120,7 @@ struct RawToken {
     structural_spelling: Option<String>,
 }
 
-/// Decodes raw token pieces while retaining designated structural specials.
+/// Decodes raw token pieces while retaining designated structural identities.
 pub(crate) struct RawTokenDecoder<D> {
     backend: D,
     structural_token_ids: BTreeSet<u32>,
@@ -152,12 +153,19 @@ where
 
     fn push(&mut self, token_id: u32) -> Result<RawToken, D::Error> {
         let structural = self.structural_token_ids.contains(&token_id);
-        let bytes = self.backend.decode_token(token_id, structural)?;
+        let structural_spelling = self.structural_token_spellings.get(&token_id).cloned();
+        let mut bytes = self.backend.decode_token(token_id, structural)?;
+        // Explicit structural spellings are delivered through `structural`,
+        // not as ordinary decoded text. This matters for added tokens which
+        // are atomic protocol delimiters but are not tokenizer "specials".
+        if structural_spelling.is_some() {
+            bytes.clear();
+        }
         Ok(RawToken {
             token_id,
             bytes,
             structural,
-            structural_spelling: self.structural_token_spellings.get(&token_id).cloned(),
+            structural_spelling,
         })
     }
 
@@ -612,7 +620,7 @@ pub(crate) trait ProtocolParser: Send {
 
     fn push(&mut self, text: &str, sink: &mut SemanticEventSink) -> Result<(), Self::Error>;
 
-    /// Handles one tokenizer-confirmed structural special token.
+    /// Handles one tokenizer-confirmed atomic added token.
     ///
     /// Text-oriented protocols retain their existing behavior through this
     /// default implementation. Structural protocols override this method and
