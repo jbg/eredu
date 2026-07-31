@@ -246,7 +246,7 @@ cargo run --release -p safemlx-lm-cli -- \
 ```
 
 Supported MoE models can cache routed experts separately. This
-includes DeepSeek-V3/R1, GPT-OSS, Inkling, LFM2, Nemotron-H, Qwen3,
+includes DeepSeek-V3/R1, GPT-OSS, Inkling, Kimi Linear, LFM2, Nemotron-H, Qwen3,
 Qwen3-Next, Qwen3-VL-MoE, and Qwen3.5-MoE:
 
 ```sh
@@ -256,6 +256,7 @@ cargo run --release -p safemlx-lm-cli -- \
   --expert-cache-device-budget-bytes 8000000000 \
   --expert-cache-host-budget-bytes 16000000000 \
   --expert-cache-scratch-bytes 2000000000 \
+  --expert-cache-prefill-bank-bytes 1000000000 \
   --expert-cache-eviction lfu \
   "Explain sparse expert residency."
 ```
@@ -270,6 +271,9 @@ budget promotes misses directly from checkpoint storage. The scratch limit is
 checked against each temporary compact bank and is separate from the device
 cache budget. `--verbose` reports prefill and decode requests, hits, misses,
 evictions, compact-bank bytes, and current expert occupancy separately.
+Multi-token prefill is split before acquisition so each compact bank targets
+`--expert-cache-prefill-bank-bytes` without exceeding the hard
+`--expert-cache-scratch-bytes` limit. Decode remains a single routed bank.
 Combine `--expert-cache` with `--dense-disk-stream` to stream non-expert units
 while keeping expert-granular reuse.
 

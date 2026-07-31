@@ -50,7 +50,7 @@ use crate::{
     runtime::generation::sampler::{DefaultSampler, Sampler, SpeculativeSampler},
     runtime::generation::speculative::{MtpCapability, MtpCheckpointKind, MtpConfig, MtpStats},
     runtime::residency::expert_cache::{
-        AcquiredExperts, ExpertCache, ExpertCacheLoadOptions, ExpertCacheReport,
+        AcquiredExperts, ExpertCache, ExpertCacheError, ExpertCacheLoadOptions, ExpertCacheReport,
         ExpertCatalogEntry, ExpertPass,
     },
 };
@@ -897,17 +897,11 @@ impl ExpertParallelModel {
                                 group,
                                 stream,
                                 |routes, stream| {
-                                    let acquired = expert_cache.acquire_routes(
-                                        layer,
-                                        &routes.global_expert_ids,
-                                        pass,
-                                        stream,
-                                    )?;
                                     execute_cached_deepseek(
                                         &args,
                                         layer,
-                                        &routes.hidden,
-                                        &acquired,
+                                        routes,
+                                        pass,
                                         expert_cache,
                                         stream,
                                     )
@@ -938,17 +932,11 @@ impl ExpertParallelModel {
                                 group,
                                 stream,
                                 |routes, stream| {
-                                    let acquired = expert_cache.acquire_routes(
-                                        layer,
-                                        &routes.global_expert_ids,
-                                        pass,
-                                        stream,
-                                    )?;
                                     execute_cached_deepseek(
                                         &args,
                                         layer,
-                                        &routes.hidden,
-                                        &acquired,
+                                        routes,
+                                        pass,
                                         expert_cache,
                                         stream,
                                     )
@@ -976,17 +964,11 @@ impl ExpertParallelModel {
                                 group,
                                 stream,
                                 |routes, stream| {
-                                    let acquired = expert_cache.acquire_routes(
-                                        layer,
-                                        &routes.global_expert_ids,
-                                        pass,
-                                        stream,
-                                    )?;
                                     execute_cached_kimi_linear(
                                         &args,
                                         layer,
-                                        &routes.hidden,
-                                        &acquired,
+                                        routes,
+                                        pass,
                                         expert_cache,
                                         stream,
                                     )
@@ -1017,17 +999,11 @@ impl ExpertParallelModel {
                                 group,
                                 stream,
                                 |routes, stream| {
-                                    let acquired = expert_cache.acquire_routes(
-                                        layer,
-                                        &routes.global_expert_ids,
-                                        pass,
-                                        stream,
-                                    )?;
                                     execute_cached_kimi_linear(
                                         &args,
                                         layer,
-                                        &routes.hidden,
-                                        &acquired,
+                                        routes,
+                                        pass,
                                         expert_cache,
                                         stream,
                                     )
@@ -1057,17 +1033,11 @@ impl ExpertParallelModel {
                                 group,
                                 stream,
                                 |routes, stream| {
-                                    let acquired = expert_cache.acquire_routes(
-                                        layer,
-                                        &routes.global_expert_ids,
-                                        pass,
-                                        stream,
-                                    )?;
                                     execute_cached_qwen3(
                                         &args,
                                         layer,
-                                        &routes.hidden,
-                                        &acquired,
+                                        routes,
+                                        pass,
                                         expert_cache,
                                         stream,
                                     )
@@ -1095,17 +1065,11 @@ impl ExpertParallelModel {
                                 group,
                                 stream,
                                 |routes, stream| {
-                                    let acquired = expert_cache.acquire_routes(
-                                        layer,
-                                        &routes.global_expert_ids,
-                                        pass,
-                                        stream,
-                                    )?;
                                     execute_cached_qwen3(
                                         &args,
                                         layer,
-                                        &routes.hidden,
-                                        &acquired,
+                                        routes,
+                                        pass,
                                         expert_cache,
                                         stream,
                                     )
@@ -1136,17 +1100,11 @@ impl ExpertParallelModel {
                                 group,
                                 stream,
                                 |routes, stream| {
-                                    let acquired = expert_cache.acquire_routes(
-                                        layer,
-                                        &routes.global_expert_ids,
-                                        pass,
-                                        stream,
-                                    )?;
                                     execute_cached_qwen3(
                                         &args,
                                         layer,
-                                        &routes.hidden,
-                                        &acquired,
+                                        routes,
+                                        pass,
                                         expert_cache,
                                         stream,
                                     )
@@ -1177,17 +1135,11 @@ impl ExpertParallelModel {
                                 group,
                                 stream,
                                 |routes, stream| {
-                                    let acquired = expert_cache.acquire_routes(
-                                        layer,
-                                        &routes.global_expert_ids,
-                                        pass,
-                                        stream,
-                                    )?;
                                     execute_cached_qwen3(
                                         &args,
                                         layer,
-                                        &routes.hidden,
-                                        &acquired,
+                                        routes,
+                                        pass,
                                         expert_cache,
                                         stream,
                                     )
@@ -1217,17 +1169,11 @@ impl ExpertParallelModel {
                                 group,
                                 stream,
                                 |routes, stream| {
-                                    let acquired = expert_cache.acquire_routes(
-                                        layer,
-                                        &routes.global_expert_ids,
-                                        pass,
-                                        stream,
-                                    )?;
                                     execute_cached_qwen3(
                                         &args,
                                         layer,
-                                        &routes.hidden,
-                                        &acquired,
+                                        routes,
+                                        pass,
                                         expert_cache,
                                         stream,
                                     )
@@ -1257,17 +1203,11 @@ impl ExpertParallelModel {
                                 group,
                                 stream,
                                 |routes, stream| {
-                                    let acquired = expert_cache.acquire_routes(
-                                        layer,
-                                        &routes.global_expert_ids,
-                                        pass,
-                                        stream,
-                                    )?;
                                     execute_cached_qwen3(
                                         &args,
                                         layer,
-                                        &routes.hidden,
-                                        &acquired,
+                                        routes,
+                                        pass,
                                         expert_cache,
                                         stream,
                                     )
@@ -1294,16 +1234,11 @@ impl ExpertParallelModel {
                                 group,
                                 stream,
                                 |routes, stream| {
-                                    let acquired = expert_cache.acquire_routes(
-                                        layer,
-                                        &routes.global_expert_ids,
-                                        pass,
-                                        stream,
-                                    )?;
                                     execute_cached_gpt_oss(
                                         &args,
-                                        &routes.hidden,
-                                        &acquired,
+                                        layer,
+                                        routes,
+                                        pass,
                                         expert_cache,
                                         stream,
                                     )
@@ -1333,16 +1268,11 @@ impl ExpertParallelModel {
                                 group,
                                 stream,
                                 |routes, stream| {
-                                    let acquired = expert_cache.acquire_routes(
-                                        layer,
-                                        &routes.global_expert_ids,
-                                        pass,
-                                        stream,
-                                    )?;
                                     execute_cached_gpt_oss(
                                         &args,
-                                        &routes.hidden,
-                                        &acquired,
+                                        layer,
+                                        routes,
+                                        pass,
                                         expert_cache,
                                         stream,
                                     )
@@ -1369,16 +1299,11 @@ impl ExpertParallelModel {
                                 group,
                                 stream,
                                 |routes, stream| {
-                                    let acquired = expert_cache.acquire_routes(
-                                        layer,
-                                        &routes.global_expert_ids,
-                                        pass,
-                                        stream,
-                                    )?;
                                     execute_cached_inkling(
                                         &args,
-                                        &routes.hidden,
-                                        &acquired,
+                                        layer,
+                                        routes,
+                                        pass,
                                         expert_cache,
                                         stream,
                                     )
@@ -1408,16 +1333,11 @@ impl ExpertParallelModel {
                                 group,
                                 stream,
                                 |routes, stream| {
-                                    let acquired = expert_cache.acquire_routes(
-                                        layer,
-                                        &routes.global_expert_ids,
-                                        pass,
-                                        stream,
-                                    )?;
                                     execute_cached_inkling(
                                         &args,
-                                        &routes.hidden,
-                                        &acquired,
+                                        layer,
+                                        routes,
+                                        pass,
                                         expert_cache,
                                         stream,
                                     )
@@ -1444,17 +1364,11 @@ impl ExpertParallelModel {
                                 group,
                                 stream,
                                 |routes, stream| {
-                                    let acquired = expert_cache.acquire_routes(
-                                        layer,
-                                        &routes.global_expert_ids,
-                                        pass,
-                                        stream,
-                                    )?;
                                     execute_cached_lfm2(
                                         &args,
                                         layer,
-                                        &routes.hidden,
-                                        &acquired,
+                                        routes,
+                                        pass,
                                         expert_cache,
                                         stream,
                                     )
@@ -1481,17 +1395,11 @@ impl ExpertParallelModel {
                                 group,
                                 stream,
                                 |routes, stream| {
-                                    let acquired = expert_cache.acquire_routes(
-                                        layer,
-                                        &routes.global_expert_ids,
-                                        pass,
-                                        stream,
-                                    )?;
                                     execute_cached_lfm2(
                                         &args,
                                         layer,
-                                        &routes.hidden,
-                                        &acquired,
+                                        routes,
+                                        pass,
                                         expert_cache,
                                         stream,
                                     )
@@ -1518,17 +1426,11 @@ impl ExpertParallelModel {
                                 group,
                                 stream,
                                 |routes, stream| {
-                                    let acquired = expert_cache.acquire_routes(
-                                        layer,
-                                        &routes.global_expert_ids,
-                                        pass,
-                                        stream,
-                                    )?;
                                     execute_cached_nemotron_h(
                                         &args,
                                         layer,
-                                        &routes.hidden,
-                                        &acquired,
+                                        routes,
+                                        pass,
                                         expert_cache,
                                         stream,
                                     )
@@ -1558,17 +1460,11 @@ impl ExpertParallelModel {
                                 group,
                                 stream,
                                 |routes, stream| {
-                                    let acquired = expert_cache.acquire_routes(
-                                        layer,
-                                        &routes.global_expert_ids,
-                                        pass,
-                                        stream,
-                                    )?;
                                     execute_cached_nemotron_h(
                                         &args,
                                         layer,
-                                        &routes.hidden,
-                                        &acquired,
+                                        routes,
+                                        pass,
                                         expert_cache,
                                         stream,
                                     )
@@ -1595,17 +1491,11 @@ impl ExpertParallelModel {
                                 group,
                                 stream,
                                 |routes, stream| {
-                                    let acquired = expert_cache.acquire_routes(
-                                        layer,
-                                        &routes.global_expert_ids,
-                                        pass,
-                                        stream,
-                                    )?;
                                     execute_cached_qwen_hybrid(
                                         &args,
                                         layer,
-                                        &routes.hidden,
-                                        &acquired,
+                                        routes,
+                                        pass,
                                         expert_cache,
                                         stream,
                                     )
@@ -1635,17 +1525,11 @@ impl ExpertParallelModel {
                                 group,
                                 stream,
                                 |routes, stream| {
-                                    let acquired = expert_cache.acquire_routes(
-                                        layer,
-                                        &routes.global_expert_ids,
-                                        pass,
-                                        stream,
-                                    )?;
                                     execute_cached_qwen_hybrid(
                                         &args,
                                         layer,
-                                        &routes.hidden,
-                                        &acquired,
+                                        routes,
+                                        pass,
                                         expert_cache,
                                         stream,
                                     )
@@ -1672,18 +1556,12 @@ impl ExpertParallelModel {
                                 group,
                                 stream,
                                 |routes, stream| {
-                                    let acquired = expert_cache.acquire_routes(
-                                        layer,
-                                        &routes.global_expert_ids,
-                                        pass,
-                                        stream,
-                                    )?;
                                     execute_cached_qwen3_at(
                                         &args,
                                         layer,
                                         "model.language_model.layers",
-                                        &routes.hidden,
-                                        &acquired,
+                                        routes,
+                                        pass,
                                         expert_cache,
                                         stream,
                                     )
@@ -1713,18 +1591,12 @@ impl ExpertParallelModel {
                                 group,
                                 stream,
                                 |routes, stream| {
-                                    let acquired = expert_cache.acquire_routes(
-                                        layer,
-                                        &routes.global_expert_ids,
-                                        pass,
-                                        stream,
-                                    )?;
                                     execute_cached_qwen3_at(
                                         &args,
                                         layer,
                                         "model.language_model.layers",
-                                        &routes.hidden,
-                                        &acquired,
+                                        routes,
+                                        pass,
                                         expert_cache,
                                         stream,
                                     )
@@ -1867,17 +1739,11 @@ impl ExpertParallelModel {
                             group,
                             stream,
                             |routes, stream| {
-                                let acquired = expert_cache.acquire_routes(
-                                    layer,
-                                    &routes.global_expert_ids,
-                                    pass,
-                                    stream,
-                                )?;
                                 execute_cached_qwen_hybrid(
                                     &args,
                                     layer,
-                                    &routes.hidden,
-                                    &acquired,
+                                    routes,
+                                    pass,
                                     expert_cache,
                                     stream,
                                 )
@@ -1904,17 +1770,11 @@ impl ExpertParallelModel {
                             group,
                             stream,
                             |routes, stream| {
-                                let acquired = expert_cache.acquire_routes(
-                                    layer,
-                                    &routes.global_expert_ids,
-                                    pass,
-                                    stream,
-                                )?;
                                 execute_cached_qwen_hybrid(
                                     &args,
                                     layer,
-                                    &routes.hidden,
-                                    &acquired,
+                                    routes,
+                                    pass,
                                     expert_cache,
                                     stream,
                                 )
@@ -2444,93 +2304,115 @@ fn qwen_hybrid_replicated_parameter_bytes(module: &impl ModuleParameters) -> usi
 fn execute_cached_deepseek(
     args: &deepseek_v3::ModelArgs,
     layer: usize,
-    hidden: &Array,
-    acquired: &AcquiredExperts,
+    routes: &DispatchedRoutes,
+    pass: ExpertPass,
     cache: &ExpertCache,
     stream: &Stream,
 ) -> Result<Array, Error> {
-    let started = Instant::now();
-    let mut bank = RoutedExperts::new_compact(
-        args,
-        layer as i32,
-        acquired.identities().len() as i32,
+    Ok(cache.execute_routes_bounded(
+        layer,
+        &routes.hidden,
+        &routes.global_expert_ids,
+        &routes.weights,
+        pass,
         stream,
-    )?;
-    macro_rules! required {
-        ($field:ident, $name:literal) => {
-            bank.$field = Param::new(Some(acquired.compact_binding($name, stream)?));
-        };
-    }
-    macro_rules! optional {
-        ($field:ident, $name:literal) => {
-            bank.$field = Param::new(acquired.optional_compact_binding($name, stream)?);
-        };
-    }
-    required!(gate_proj, "gate_proj");
-    optional!(gate_proj_scale_inv, "gate_proj_scale_inv");
-    optional!(gate_proj_scales, "gate_proj_scales");
-    optional!(gate_proj_biases, "gate_proj_biases");
-    required!(up_proj, "up_proj");
-    optional!(up_proj_scale_inv, "up_proj_scale_inv");
-    optional!(up_proj_scales, "up_proj_scales");
-    optional!(up_proj_biases, "up_proj_biases");
-    required!(down_proj, "down_proj");
-    optional!(down_proj_scale_inv, "down_proj_scale_inv");
-    optional!(down_proj_scales, "down_proj_scales");
-    optional!(down_proj_biases, "down_proj_biases");
-    cache.record_compact_bank(acquired.pass(), acquired.scratch_bytes(), started.elapsed())?;
-    let weights = unit_route_weights(hidden.dim(0), hidden.dtype(), stream)?;
-    let output = bank.forward_local(hidden, acquired.compact_routes(), &weights, stream)?;
-    eval([&output])?;
-    acquired.complete_pending()?;
-    Ok(output)
+        |hidden, acquired, _weights, stream| {
+            let started = Instant::now();
+            let mut bank = RoutedExperts::new_compact(
+                args,
+                layer as i32,
+                acquired.identities().len() as i32,
+                stream,
+            )?;
+            macro_rules! required {
+                ($field:ident, $name:literal) => {
+                    bank.$field = Param::new(Some(acquired.compact_binding($name, stream)?));
+                };
+            }
+            macro_rules! optional {
+                ($field:ident, $name:literal) => {
+                    bank.$field = Param::new(acquired.optional_compact_binding($name, stream)?);
+                };
+            }
+            required!(gate_proj, "gate_proj");
+            optional!(gate_proj_scale_inv, "gate_proj_scale_inv");
+            optional!(gate_proj_scales, "gate_proj_scales");
+            optional!(gate_proj_biases, "gate_proj_biases");
+            required!(up_proj, "up_proj");
+            optional!(up_proj_scale_inv, "up_proj_scale_inv");
+            optional!(up_proj_scales, "up_proj_scales");
+            optional!(up_proj_biases, "up_proj_biases");
+            required!(down_proj, "down_proj");
+            optional!(down_proj_scale_inv, "down_proj_scale_inv");
+            optional!(down_proj_scales, "down_proj_scales");
+            optional!(down_proj_biases, "down_proj_biases");
+            cache.record_compact_bank(
+                acquired.pass(),
+                acquired.scratch_bytes(),
+                started.elapsed(),
+            )?;
+            let weights = safemlx::ops::ones_dtype(&[hidden.dim(0), 1], hidden.dtype(), stream)?;
+            Ok(bank.forward_local(hidden, acquired.compact_routes(), &weights, stream)?)
+        },
+    )?)
 }
 
 fn execute_cached_qwen3(
     args: &qwen3::ModelArgs,
     layer: usize,
-    hidden: &Array,
-    acquired: &AcquiredExperts,
+    routes: &DispatchedRoutes,
+    pass: ExpertPass,
     cache: &ExpertCache,
     stream: &Stream,
 ) -> Result<Array, Error> {
-    execute_cached_qwen3_at(args, layer, "model.layers", hidden, acquired, cache, stream)
+    execute_cached_qwen3_at(args, layer, "model.layers", routes, pass, cache, stream)
 }
 
 fn execute_cached_kimi_linear(
     args: &kimi_linear::ModelArgs,
     layer: usize,
-    hidden: &Array,
-    acquired: &AcquiredExperts,
+    routes: &DispatchedRoutes,
+    pass: ExpertPass,
     cache: &ExpertCache,
     stream: &Stream,
 ) -> Result<Array, Error> {
-    let started = Instant::now();
-    let prefix = format!("model.layers.{layer}.mlp.experts");
-    let mut bank = PackedSwiGluExperts::new(
-        acquired.identities().len() as i32,
-        args.hidden_size,
-        args.moe_intermediate_size,
-        args.weight_quantization_for(&format!("{prefix}.gate_up_proj")),
-        args.weight_quantization_for(&format!("{prefix}.down_proj")),
+    Ok(cache.execute_routes_bounded(
+        layer,
+        &routes.hidden,
+        &routes.global_expert_ids,
+        &routes.weights,
+        pass,
         stream,
-    )?;
-    bank.gate_up_proj = Param::new(acquired.compact_binding("gate_up_proj", stream)?);
-    bank.gate_up_proj_scales =
-        Param::new(acquired.optional_compact_binding("gate_up_proj_scales", stream)?);
-    bank.gate_up_proj_biases =
-        Param::new(acquired.optional_compact_binding("gate_up_proj_biases", stream)?);
-    bank.down_proj = Param::new(acquired.compact_binding("down_proj", stream)?);
-    bank.down_proj_scales =
-        Param::new(acquired.optional_compact_binding("down_proj_scales", stream)?);
-    bank.down_proj_biases =
-        Param::new(acquired.optional_compact_binding("down_proj_biases", stream)?);
-    cache.record_compact_bank(acquired.pass(), acquired.scratch_bytes(), started.elapsed())?;
-    let weights = unit_route_weights(hidden.dim(0), hidden.dtype(), stream)?;
-    let output = bank.forward(hidden, acquired.compact_routes(), &weights, stream)?;
-    eval([&output])?;
-    acquired.complete_pending()?;
-    Ok(output)
+        |hidden, acquired, _weights, stream| {
+            let started = Instant::now();
+            let prefix = format!("model.layers.{layer}.mlp.experts");
+            let mut bank = PackedSwiGluExperts::new(
+                acquired.identities().len() as i32,
+                args.hidden_size,
+                args.moe_intermediate_size,
+                args.weight_quantization_for(&format!("{prefix}.gate_up_proj")),
+                args.weight_quantization_for(&format!("{prefix}.down_proj")),
+                stream,
+            )?;
+            bank.gate_up_proj = Param::new(acquired.compact_binding("gate_up_proj", stream)?);
+            bank.gate_up_proj_scales =
+                Param::new(acquired.optional_compact_binding("gate_up_proj_scales", stream)?);
+            bank.gate_up_proj_biases =
+                Param::new(acquired.optional_compact_binding("gate_up_proj_biases", stream)?);
+            bank.down_proj = Param::new(acquired.compact_binding("down_proj", stream)?);
+            bank.down_proj_scales =
+                Param::new(acquired.optional_compact_binding("down_proj_scales", stream)?);
+            bank.down_proj_biases =
+                Param::new(acquired.optional_compact_binding("down_proj_biases", stream)?);
+            cache.record_compact_bank(
+                acquired.pass(),
+                acquired.scratch_bytes(),
+                started.elapsed(),
+            )?;
+            let weights = safemlx::ops::ones_dtype(&[hidden.dim(0), 1], hidden.dtype(), stream)?;
+            Ok(bank.forward(hidden, acquired.compact_routes(), &weights, stream)?)
+        },
+    )?)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2538,194 +2420,269 @@ fn execute_cached_qwen3_at(
     args: &qwen3::ModelArgs,
     layer: usize,
     layer_root: &str,
-    hidden: &Array,
-    acquired: &AcquiredExperts,
+    routes: &DispatchedRoutes,
+    pass: ExpertPass,
     cache: &ExpertCache,
     stream: &Stream,
 ) -> Result<Array, Error> {
-    let started = Instant::now();
-    let prefix = format!("{layer_root}.{layer}.mlp.experts");
-    let mut bank = PackedSwiGluExperts::new(
-        acquired.identities().len() as i32,
-        args.hidden_size,
-        args.moe_intermediate_size,
-        args.weight_quantization_for(&format!("{prefix}.gate_up_proj")),
-        args.weight_quantization_for(&format!("{prefix}.down_proj")),
+    Ok(cache.execute_routes_bounded(
+        layer,
+        &routes.hidden,
+        &routes.global_expert_ids,
+        &routes.weights,
+        pass,
         stream,
-    )?;
-    bank.gate_up_proj = Param::new(acquired.compact_binding("gate_up_proj", stream)?);
-    bank.gate_up_proj_scales =
-        Param::new(acquired.optional_compact_binding("gate_up_proj_scales", stream)?);
-    bank.gate_up_proj_biases =
-        Param::new(acquired.optional_compact_binding("gate_up_proj_biases", stream)?);
-    bank.down_proj = Param::new(acquired.compact_binding("down_proj", stream)?);
-    bank.down_proj_scales =
-        Param::new(acquired.optional_compact_binding("down_proj_scales", stream)?);
-    bank.down_proj_biases =
-        Param::new(acquired.optional_compact_binding("down_proj_biases", stream)?);
-    cache.record_compact_bank(acquired.pass(), acquired.scratch_bytes(), started.elapsed())?;
-    let weights = unit_route_weights(hidden.dim(0), hidden.dtype(), stream)?;
-    let output = bank.forward(hidden, acquired.compact_routes(), &weights, stream)?;
-    eval([&output])?;
-    acquired.complete_pending()?;
-    Ok(output)
+        |hidden, acquired, _weights, stream| {
+            let started = Instant::now();
+            let prefix = format!("{layer_root}.{layer}.mlp.experts");
+            let mut bank = PackedSwiGluExperts::new(
+                acquired.identities().len() as i32,
+                args.hidden_size,
+                args.moe_intermediate_size,
+                args.weight_quantization_for(&format!("{prefix}.gate_up_proj")),
+                args.weight_quantization_for(&format!("{prefix}.down_proj")),
+                stream,
+            )?;
+            bank.gate_up_proj = Param::new(acquired.compact_binding("gate_up_proj", stream)?);
+            bank.gate_up_proj_scales =
+                Param::new(acquired.optional_compact_binding("gate_up_proj_scales", stream)?);
+            bank.gate_up_proj_biases =
+                Param::new(acquired.optional_compact_binding("gate_up_proj_biases", stream)?);
+            bank.down_proj = Param::new(acquired.compact_binding("down_proj", stream)?);
+            bank.down_proj_scales =
+                Param::new(acquired.optional_compact_binding("down_proj_scales", stream)?);
+            bank.down_proj_biases =
+                Param::new(acquired.optional_compact_binding("down_proj_biases", stream)?);
+            cache.record_compact_bank(
+                acquired.pass(),
+                acquired.scratch_bytes(),
+                started.elapsed(),
+            )?;
+            let weights = safemlx::ops::ones_dtype(&[hidden.dim(0), 1], hidden.dtype(), stream)?;
+            Ok(bank.forward(hidden, acquired.compact_routes(), &weights, stream)?)
+        },
+    )?)
 }
 
 fn execute_cached_gpt_oss(
     args: &gpt_oss::ModelArgs,
-    hidden: &Array,
-    acquired: &AcquiredExperts,
+    layer: usize,
+    routes: &DispatchedRoutes,
+    pass: ExpertPass,
     cache: &ExpertCache,
     stream: &Stream,
 ) -> Result<Array, Error> {
-    let started = Instant::now();
-    let mut compact_args = args.clone();
-    compact_args.num_local_experts = acquired.identities().len() as i32;
-    let mut bank = gpt_oss::Experts::new(&compact_args, stream)?;
-    bank.gate_up_proj_blocks = Param::new(acquired.compact_binding("gate_up_proj_blocks", stream)?);
-    bank.gate_up_proj_scales = Param::new(acquired.compact_binding("gate_up_proj_scales", stream)?);
-    bank.gate_up_proj_bias = Param::new(acquired.compact_binding("gate_up_proj_bias", stream)?);
-    bank.down_proj_blocks = Param::new(acquired.compact_binding("down_proj_blocks", stream)?);
-    bank.down_proj_scales = Param::new(acquired.compact_binding("down_proj_scales", stream)?);
-    bank.down_proj_bias = Param::new(acquired.compact_binding("down_proj_bias", stream)?);
-    cache.record_compact_bank(acquired.pass(), acquired.scratch_bytes(), started.elapsed())?;
-    let weights = unit_route_weights(hidden.dim(0), hidden.dtype(), stream)?;
-    let output = bank.forward(hidden, acquired.compact_routes(), &weights, stream)?;
-    eval([&output])?;
-    acquired.complete_pending()?;
-    Ok(output)
+    Ok(cache.execute_routes_bounded(
+        layer,
+        &routes.hidden,
+        &routes.global_expert_ids,
+        &routes.weights,
+        pass,
+        stream,
+        |hidden, acquired, _weights, stream| {
+            let started = Instant::now();
+            let mut compact_args = args.clone();
+            compact_args.num_local_experts = acquired.identities().len() as i32;
+            let mut bank = gpt_oss::Experts::new(&compact_args, stream)?;
+            bank.gate_up_proj_blocks =
+                Param::new(acquired.compact_binding("gate_up_proj_blocks", stream)?);
+            bank.gate_up_proj_scales =
+                Param::new(acquired.compact_binding("gate_up_proj_scales", stream)?);
+            bank.gate_up_proj_bias =
+                Param::new(acquired.compact_binding("gate_up_proj_bias", stream)?);
+            bank.down_proj_blocks =
+                Param::new(acquired.compact_binding("down_proj_blocks", stream)?);
+            bank.down_proj_scales =
+                Param::new(acquired.compact_binding("down_proj_scales", stream)?);
+            bank.down_proj_bias = Param::new(acquired.compact_binding("down_proj_bias", stream)?);
+            cache.record_compact_bank(
+                acquired.pass(),
+                acquired.scratch_bytes(),
+                started.elapsed(),
+            )?;
+            let weights = safemlx::ops::ones_dtype(&[hidden.dim(0), 1], hidden.dtype(), stream)?;
+            Ok(bank.forward(hidden, acquired.compact_routes(), &weights, stream)?)
+        },
+    )?)
 }
 
 fn execute_cached_inkling(
     args: &inkling::ModelArgs,
-    hidden: &Array,
-    acquired: &AcquiredExperts,
+    layer: usize,
+    routes: &DispatchedRoutes,
+    pass: ExpertPass,
     cache: &ExpertCache,
     stream: &Stream,
 ) -> Result<Array, Error> {
-    let started = Instant::now();
-    let text = &args.text_config;
-    let mut bank = PackedSwiGluExperts::new(
-        acquired.identities().len() as i32,
-        text.hidden_size,
-        text.moe_intermediate_size(),
-        None,
-        None,
+    Ok(cache.execute_routes_bounded(
+        layer,
+        &routes.hidden,
+        &routes.global_expert_ids,
+        &routes.weights,
+        pass,
         stream,
-    )?;
-    bank.gate_up_proj = Param::new(acquired.compact_binding("gate_up_proj", stream)?);
-    bank.down_proj = Param::new(acquired.compact_binding("down_proj", stream)?);
-    cache.record_compact_bank(acquired.pass(), acquired.scratch_bytes(), started.elapsed())?;
-    let weights = unit_route_weights(hidden.dim(0), hidden.dtype(), stream)?;
-    let output = bank.forward(hidden, acquired.compact_routes(), &weights, stream)?;
-    eval([&output])?;
-    acquired.complete_pending()?;
-    Ok(output)
+        |hidden, acquired, _weights, stream| {
+            let started = Instant::now();
+            let text = &args.text_config;
+            let mut bank = PackedSwiGluExperts::new(
+                acquired.identities().len() as i32,
+                text.hidden_size,
+                text.moe_intermediate_size(),
+                None,
+                None,
+                stream,
+            )?;
+            bank.gate_up_proj = Param::new(acquired.compact_binding("gate_up_proj", stream)?);
+            bank.down_proj = Param::new(acquired.compact_binding("down_proj", stream)?);
+            cache.record_compact_bank(
+                acquired.pass(),
+                acquired.scratch_bytes(),
+                started.elapsed(),
+            )?;
+            let weights = safemlx::ops::ones_dtype(&[hidden.dim(0), 1], hidden.dtype(), stream)?;
+            Ok(bank.forward(hidden, acquired.compact_routes(), &weights, stream)?)
+        },
+    )?)
 }
 
 fn execute_cached_lfm2(
     args: &lfm2::ModelArgs,
     layer: usize,
-    hidden: &Array,
-    acquired: &AcquiredExperts,
+    routes: &DispatchedRoutes,
+    pass: ExpertPass,
     cache: &ExpertCache,
     stream: &Stream,
 ) -> Result<Array, Error> {
-    let started = Instant::now();
-    let prefix = format!("model.layers.{layer}.feed_forward.experts");
-    let mut bank = PackedSwiGluExperts::new(
-        acquired.identities().len() as i32,
-        args.hidden_size,
-        args.moe_intermediate_size,
-        args.weight_quantization_for(&format!("{prefix}.gate_up_proj")),
-        args.weight_quantization_for(&format!("{prefix}.down_proj")),
+    Ok(cache.execute_routes_bounded(
+        layer,
+        &routes.hidden,
+        &routes.global_expert_ids,
+        &routes.weights,
+        pass,
         stream,
-    )?;
-    populate_swiglu_bank(&mut bank, acquired, stream)?;
-    cache.record_compact_bank(acquired.pass(), acquired.scratch_bytes(), started.elapsed())?;
-    let weights = unit_route_weights(hidden.dim(0), hidden.dtype(), stream)?;
-    let output = bank.forward(hidden, acquired.compact_routes(), &weights, stream)?;
-    eval([&output])?;
-    acquired.complete_pending()?;
-    Ok(output)
+        |hidden, acquired, _weights, stream| {
+            let started = Instant::now();
+            let prefix = format!("model.layers.{layer}.feed_forward.experts");
+            let mut bank = PackedSwiGluExperts::new(
+                acquired.identities().len() as i32,
+                args.hidden_size,
+                args.moe_intermediate_size,
+                args.weight_quantization_for(&format!("{prefix}.gate_up_proj")),
+                args.weight_quantization_for(&format!("{prefix}.down_proj")),
+                stream,
+            )?;
+            populate_swiglu_bank(&mut bank, acquired, stream)?;
+            cache.record_compact_bank(
+                acquired.pass(),
+                acquired.scratch_bytes(),
+                started.elapsed(),
+            )?;
+            let weights = safemlx::ops::ones_dtype(&[hidden.dim(0), 1], hidden.dtype(), stream)?;
+            Ok(bank.forward(hidden, acquired.compact_routes(), &weights, stream)?)
+        },
+    )?)
 }
 
 fn execute_cached_nemotron_h(
     args: &nemotron_h::ModelArgs,
     layer: usize,
-    hidden: &Array,
-    acquired: &AcquiredExperts,
+    routes: &DispatchedRoutes,
+    pass: ExpertPass,
     cache: &ExpertCache,
     stream: &Stream,
 ) -> Result<Array, Error> {
-    let started = Instant::now();
-    let prefix = format!("model.layers.{layer}.moe.experts");
-    let mut bank = nemotron_h::Experts::new(
-        acquired.identities().len() as i32,
-        args.hidden_size,
-        args.moe_intermediate_size,
-        [
-            args.weight_quantization_for(&format!("{prefix}.up_proj")),
-            args.weight_quantization_for(&format!("{prefix}.down_proj")),
-        ],
+    Ok(cache.execute_routes_bounded(
+        layer,
+        &routes.hidden,
+        &routes.global_expert_ids,
+        &routes.weights,
+        pass,
         stream,
-    )?;
-    bank.up_proj = Param::new(acquired.compact_binding("up_proj", stream)?);
-    bank.up_proj_scales = Param::new(acquired.optional_compact_binding("up_proj_scales", stream)?);
-    bank.up_proj_biases = Param::new(acquired.optional_compact_binding("up_proj_biases", stream)?);
-    bank.down_proj = Param::new(acquired.compact_binding("down_proj", stream)?);
-    bank.down_proj_scales =
-        Param::new(acquired.optional_compact_binding("down_proj_scales", stream)?);
-    bank.down_proj_biases =
-        Param::new(acquired.optional_compact_binding("down_proj_biases", stream)?);
-    cache.record_compact_bank(acquired.pass(), acquired.scratch_bytes(), started.elapsed())?;
-    let weights = unit_route_weights(hidden.dim(0), hidden.dtype(), stream)?;
-    let output = bank.forward(hidden, acquired.compact_routes(), &weights, stream)?;
-    eval([&output])?;
-    acquired.complete_pending()?;
-    Ok(output)
+        |hidden, acquired, _weights, stream| {
+            let started = Instant::now();
+            let prefix = format!("model.layers.{layer}.moe.experts");
+            let mut bank = nemotron_h::Experts::new(
+                acquired.identities().len() as i32,
+                args.hidden_size,
+                args.moe_intermediate_size,
+                [
+                    args.weight_quantization_for(&format!("{prefix}.up_proj")),
+                    args.weight_quantization_for(&format!("{prefix}.down_proj")),
+                ],
+                stream,
+            )?;
+            bank.up_proj = Param::new(acquired.compact_binding("up_proj", stream)?);
+            bank.up_proj_scales =
+                Param::new(acquired.optional_compact_binding("up_proj_scales", stream)?);
+            bank.up_proj_biases =
+                Param::new(acquired.optional_compact_binding("up_proj_biases", stream)?);
+            bank.down_proj = Param::new(acquired.compact_binding("down_proj", stream)?);
+            bank.down_proj_scales =
+                Param::new(acquired.optional_compact_binding("down_proj_scales", stream)?);
+            bank.down_proj_biases =
+                Param::new(acquired.optional_compact_binding("down_proj_biases", stream)?);
+            cache.record_compact_bank(
+                acquired.pass(),
+                acquired.scratch_bytes(),
+                started.elapsed(),
+            )?;
+            let weights = safemlx::ops::ones_dtype(&[hidden.dim(0), 1], hidden.dtype(), stream)?;
+            Ok(bank.forward(hidden, acquired.compact_routes(), &weights, stream)?)
+        },
+    )?)
 }
 
 fn execute_cached_qwen_hybrid(
     args: &qwen3_5_moe::ModelArgs,
     layer: usize,
-    hidden: &Array,
-    acquired: &AcquiredExperts,
+    routes: &DispatchedRoutes,
+    pass: ExpertPass,
     cache: &ExpertCache,
     stream: &Stream,
 ) -> Result<Array, Error> {
-    let started = Instant::now();
-    let mut compact_args = args.clone();
-    compact_args.num_experts = acquired.identities().len() as i32;
-    let mut bank = qwen3_5_moe::Experts::new(&compact_args, layer, stream)?;
-    bank.gate_up_proj = Param::new(acquired.compact_binding("gate_up_proj", stream)?);
-    bank.gate_up_proj_scale_inv =
-        Param::new(acquired.optional_compact_binding("gate_up_proj_scale_inv", stream)?);
-    bank.gate_up_proj_scales =
-        Param::new(acquired.optional_compact_binding("gate_up_proj_scales", stream)?);
-    bank.gate_up_proj_biases =
-        Param::new(acquired.optional_compact_binding("gate_up_proj_biases", stream)?);
-    bank.down_proj = Param::new(acquired.compact_binding("down_proj", stream)?);
-    bank.down_proj_scale_inv =
-        Param::new(acquired.optional_compact_binding("down_proj_scale_inv", stream)?);
-    bank.down_proj_scales =
-        Param::new(acquired.optional_compact_binding("down_proj_scales", stream)?);
-    bank.down_proj_biases =
-        Param::new(acquired.optional_compact_binding("down_proj_biases", stream)?);
-    cache.record_compact_bank(acquired.pass(), acquired.scratch_bytes(), started.elapsed())?;
-    let routes = acquired.compact_routes().reshape(&[-1, 1], stream)?;
-    let weights = unit_route_weights(hidden.dim(0), hidden.dtype(), stream)?;
-    let output = bank.forward_chunked(hidden, &routes, &weights, stream)?;
-    eval([&output])?;
-    acquired.complete_pending()?;
-    Ok(output)
+    Ok(cache.execute_routes_bounded(
+        layer,
+        &routes.hidden,
+        &routes.global_expert_ids,
+        &routes.weights,
+        pass,
+        stream,
+        |hidden, acquired, _weights, stream| {
+            let started = Instant::now();
+            let mut compact_args = args.clone();
+            compact_args.num_experts = acquired.identities().len() as i32;
+            let mut bank = qwen3_5_moe::Experts::new(&compact_args, layer, stream)?;
+            bank.gate_up_proj = Param::new(acquired.compact_binding("gate_up_proj", stream)?);
+            bank.gate_up_proj_scale_inv =
+                Param::new(acquired.optional_compact_binding("gate_up_proj_scale_inv", stream)?);
+            bank.gate_up_proj_scales =
+                Param::new(acquired.optional_compact_binding("gate_up_proj_scales", stream)?);
+            bank.gate_up_proj_biases =
+                Param::new(acquired.optional_compact_binding("gate_up_proj_biases", stream)?);
+            bank.down_proj = Param::new(acquired.compact_binding("down_proj", stream)?);
+            bank.down_proj_scale_inv =
+                Param::new(acquired.optional_compact_binding("down_proj_scale_inv", stream)?);
+            bank.down_proj_scales =
+                Param::new(acquired.optional_compact_binding("down_proj_scales", stream)?);
+            bank.down_proj_biases =
+                Param::new(acquired.optional_compact_binding("down_proj_biases", stream)?);
+            cache.record_compact_bank(
+                acquired.pass(),
+                acquired.scratch_bytes(),
+                started.elapsed(),
+            )?;
+            let routes = acquired.compact_routes().reshape(&[-1, 1], stream)?;
+            let weights = safemlx::ops::ones_dtype(&[hidden.dim(0), 1], hidden.dtype(), stream)?;
+            Ok(bank.forward_chunked(hidden, &routes, &weights, stream)?)
+        },
+    )?)
 }
 
 fn populate_swiglu_bank(
     bank: &mut PackedSwiGluExperts,
     acquired: &AcquiredExperts,
     stream: &Stream,
-) -> Result<(), Error> {
+) -> Result<(), ExpertCacheError> {
     bank.gate_up_proj = Param::new(acquired.compact_binding("gate_up_proj", stream)?);
     bank.gate_up_proj_scales =
         Param::new(acquired.optional_compact_binding("gate_up_proj_scales", stream)?);
@@ -5909,6 +5866,7 @@ mod tests {
             ),
             crate::runtime::residency::policy::OffloadConfig::new(Some(1 << 20), Some(0), 1)
                 .unwrap(),
+            1 << 20,
             1 << 20,
         )
         .unwrap();

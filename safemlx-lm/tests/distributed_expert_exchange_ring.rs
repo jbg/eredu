@@ -18,7 +18,7 @@ use safemlx_lm::{
     architectures::deepseek_v3::model::RoutedExperts,
     architectures::distributed::expert::{
         all_to_all_v, dispatch_replicated_with, dispatch_sharded, profile_expert_parallel_timings,
-        DispatchedRoutes, ExpertAssignment, LocalExpertBank, ShardedRouteBlocks,
+        DispatchedRoutes, ExpertAssignment, ShardedRouteBlocks,
     },
     error::Error,
     nn::moe::{PackedRelu2Experts, PackedSwiGluExperts},
@@ -148,31 +148,37 @@ fn execute_cached_qwen_routes(
     pass: ExpertPass,
     stream: &Stream,
 ) -> Result<Array, Error> {
-    let acquired = cache.acquire_routes(0, &routes.global_expert_ids, pass, stream)?;
-    let started = Instant::now();
-    let gate_up = acquired.compact_binding("gate_up_proj", stream)?;
-    let down = acquired.compact_binding("down_proj", stream)?;
-    eval([&gate_up, &down])?;
-    let mut bank = PackedSwiGluExperts {
-        num_experts: acquired.identities().len() as i32,
-        hidden_dim: 1,
-        intermediate_dim: 1,
-        gate_up_affine: None,
-        down_affine: None,
-        gate_up_iquant: None,
-        down_iquant: None,
-        gate_up_proj: Param::new(gate_up),
-        gate_up_proj_scales: Param::new(None),
-        gate_up_proj_biases: Param::new(None),
-        down_proj: Param::new(down),
-        down_proj_scales: Param::new(None),
-        down_proj_biases: Param::new(None),
-    };
-    cache.record_compact_bank(pass, acquired.scratch_bytes(), started.elapsed())?;
-    let output = bank.execute_local_routes(&routes.hidden, acquired.compact_routes(), stream)?;
-    eval([&output])?;
-    stream.synchronize()?;
-    Ok(output)
+    Ok(cache.execute_routes_bounded(
+        0,
+        &routes.hidden,
+        &routes.global_expert_ids,
+        &routes.weights,
+        pass,
+        stream,
+        |hidden, acquired, _weights, stream| {
+            let started = Instant::now();
+            let mut bank = PackedSwiGluExperts {
+                num_experts: acquired.identities().len() as i32,
+                hidden_dim: 1,
+                intermediate_dim: 1,
+                gate_up_affine: None,
+                down_affine: None,
+                gate_up_iquant: None,
+                down_iquant: None,
+                gate_up_proj: Param::new(acquired.compact_binding("gate_up_proj", stream)?),
+                gate_up_proj_scales: Param::new(None),
+                gate_up_proj_biases: Param::new(None),
+                down_proj: Param::new(acquired.compact_binding("down_proj", stream)?),
+                down_proj_scales: Param::new(None),
+                down_proj_biases: Param::new(None),
+            };
+            cache.record_compact_bank(pass, acquired.scratch_bytes(), started.elapsed())?;
+            let compact_routes = acquired.compact_routes().reshape(&[-1, 1], stream)?;
+            let unit_weights =
+                safemlx::ops::ones_dtype(&[hidden.dim(0), 1], hidden.dtype(), stream)?;
+            Ok(bank.forward(hidden, &compact_routes, &unit_weights, stream)?)
+        },
+    )?)
 }
 
 #[test]
@@ -359,6 +365,7 @@ fn expert_exchange_ring_worker() {
         ExpertCacheLoadOptions::new(
             LayerwiseLoadOptions::default(),
             OffloadConfig::new(Some(24), Some(24), 1).unwrap(),
+            24,
             24,
         )
         .unwrap(),

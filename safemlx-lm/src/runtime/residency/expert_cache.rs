@@ -11,7 +11,7 @@ use std::{
 };
 
 use safemlx::{
-    ops::{concatenate_axis, r#where, segment_sum},
+    ops::{concatenate_axis, indexing::TryIndexOp, r#where, segment_sum},
     transforms::eval,
     Array, Dtype, Stream,
 };
@@ -85,8 +85,10 @@ pub struct ExpertCacheLoadOptions {
     pub non_expert: LayerwiseLoadOptions,
     /// Independent host/device budgets and eviction policy for expert units.
     pub experts: OffloadConfig,
-    /// Maximum materialized temporary compact-bank bytes for one routed block.
+    /// Hard maximum bytes for one materialized temporary compact bank.
     pub compact_bank_scratch_bytes: u64,
+    /// Soft compact-bank target used to split multi-token prefill routing.
+    pub prefill_compact_bank_target_bytes: u64,
 }
 
 impl ExpertCacheLoadOptions {
@@ -95,14 +97,25 @@ impl ExpertCacheLoadOptions {
         non_expert: LayerwiseLoadOptions,
         experts: OffloadConfig,
         compact_bank_scratch_bytes: u64,
+        prefill_compact_bank_target_bytes: u64,
     ) -> Result<Self, ExpertCacheError> {
         if compact_bank_scratch_bytes == 0 {
             return Err(ExpertCacheError::ZeroScratchLimit);
+        }
+        if prefill_compact_bank_target_bytes == 0 {
+            return Err(ExpertCacheError::ZeroPrefillBankTarget);
+        }
+        if prefill_compact_bank_target_bytes > compact_bank_scratch_bytes {
+            return Err(ExpertCacheError::PrefillBankTargetExceedsScratch {
+                target_bytes: prefill_compact_bank_target_bytes,
+                scratch_bytes: compact_bank_scratch_bytes,
+            });
         }
         Ok(Self {
             non_expert,
             experts,
             compact_bank_scratch_bytes,
+            prefill_compact_bank_target_bytes,
         })
     }
 }
@@ -113,6 +126,7 @@ impl Default for ExpertCacheLoadOptions {
             non_expert: LayerwiseLoadOptions::default(),
             experts: OffloadConfig::default(),
             compact_bank_scratch_bytes: u64::MAX,
+            prefill_compact_bank_target_bytes: 1 << 30,
         }
     }
 }
@@ -257,10 +271,12 @@ impl ExpertStatistics {
 pub struct ExpertCache {
     manager: ResidencyManager,
     catalog: BTreeMap<ExpertIdentity, u64>,
+    #[cfg(test)]
     layer_expert_counts: BTreeMap<usize, usize>,
     layer_global_spans: BTreeMap<usize, usize>,
     host_budget: Option<u64>,
     scratch_limit: u64,
+    prefill_bank_target: u64,
     statistics: Mutex<ExpertStatistics>,
 }
 
@@ -291,9 +307,19 @@ impl ExpertCache {
         if options.compact_bank_scratch_bytes == 0 {
             return Err(ExpertCacheError::ZeroScratchLimit);
         }
+        if options.prefill_compact_bank_target_bytes == 0 {
+            return Err(ExpertCacheError::ZeroPrefillBankTarget);
+        }
+        if options.prefill_compact_bank_target_bytes > options.compact_bank_scratch_bytes {
+            return Err(ExpertCacheError::PrefillBankTargetExceedsScratch {
+                target_bytes: options.prefill_compact_bank_target_bytes,
+                scratch_bytes: options.compact_bank_scratch_bytes,
+            });
+        }
         let mut catalog = BTreeMap::new();
         let mut definitions = Vec::new();
         let mut specs = Vec::new();
+        #[cfg(test)]
         let mut layer_expert_counts = BTreeMap::new();
         let mut layer_global_spans = BTreeMap::new();
         for entry in entries {
@@ -302,7 +328,10 @@ impl ExpertCache {
                     identity: entry.identity,
                 });
             }
-            *layer_expert_counts.entry(entry.identity.layer).or_insert(0) += 1;
+            #[cfg(test)]
+            {
+                *layer_expert_counts.entry(entry.identity.layer).or_insert(0) += 1;
+            }
             layer_global_spans
                 .entry(entry.identity.layer)
                 .and_modify(|span: &mut usize| {
@@ -327,10 +356,12 @@ impl ExpertCache {
         Ok(Self {
             manager,
             catalog,
+            #[cfg(test)]
             layer_expert_counts,
             layer_global_spans,
             host_budget: options.experts.host_budget_bytes(),
             scratch_limit: options.compact_bank_scratch_bytes,
+            prefill_bank_target: options.prefill_compact_bank_target_bytes,
             statistics: Mutex::new(ExpertStatistics::default()),
         })
     }
@@ -340,18 +371,100 @@ impl ExpertCache {
         &self.manager
     }
 
-    /// Returns a conservative token count whose worst-case distinct routes fit
-    /// both the configured scratch limit and a caller-selected bank target.
-    pub(crate) fn route_chunk_tokens(&self, routes_per_token: usize, target_bytes: u64) -> usize {
-        if routes_per_token == 0 {
+    /// Returns a conservative row count whose worst-case distinct routes fit
+    /// the configured prefill compact-bank target.
+    fn route_chunk_rows(&self, routes_per_row: usize) -> usize {
+        if routes_per_row == 0 {
             return 1;
         }
         let max_expert_bytes = self.catalog.values().copied().max().unwrap_or(1);
-        let bytes_per_token =
-            max_expert_bytes.saturating_mul(u64::try_from(routes_per_token).unwrap_or(u64::MAX));
-        let budget = self.scratch_limit.min(target_bytes).max(1);
-        let tokens = budget.checked_div(bytes_per_token).unwrap_or(0).max(1);
-        usize::try_from(tokens).unwrap_or(usize::MAX)
+        let bytes_per_row =
+            max_expert_bytes.saturating_mul(u64::try_from(routes_per_row).unwrap_or(u64::MAX));
+        let budget = self.scratch_limit.min(self.prefill_bank_target).max(1);
+        let rows = budget.checked_div(bytes_per_row).unwrap_or(0).max(1);
+        usize::try_from(rows).unwrap_or(usize::MAX)
+    }
+
+    /// Executes routed experts through bounded compact banks.
+    ///
+    /// Prefill rows are split conservatively from the catalog's largest expert
+    /// and the configured target. Decode remains a single bank. The callback
+    /// constructs and executes one architecture-specific compact bank; this
+    /// method owns acquisition, output evaluation, lease completion, and
+    /// concatenation in original row order.
+    pub fn execute_routes_bounded<F>(
+        &self,
+        layer: usize,
+        routed_hidden: &Array,
+        routed_ids: &Array,
+        route_weights: &Array,
+        pass: ExpertPass,
+        stream: &Stream,
+        mut execute_bank: F,
+    ) -> Result<Array, ExpertCacheError>
+    where
+        F: FnMut(&Array, &AcquiredExperts, &Array, &Stream) -> Result<Array, ExpertCacheError>,
+    {
+        if routed_hidden.ndim() == 0
+            || routed_ids.ndim() == 0
+            || route_weights.ndim() == 0
+            || routed_hidden.dim(0) != routed_ids.dim(0)
+            || routed_hidden.dim(0) != route_weights.dim(0)
+        {
+            return Err(ExpertCacheError::RoutedBatchShapeMismatch {
+                hidden: routed_hidden.shape().to_vec(),
+                routes: routed_ids.shape().to_vec(),
+                weights: route_weights.shape().to_vec(),
+            });
+        }
+        let routes_per_row = routed_ids.shape()[1..]
+            .iter()
+            .try_fold(1usize, |total, dimension| {
+                usize::try_from(*dimension)
+                    .ok()
+                    .and_then(|dimension| total.checked_mul(dimension))
+            })
+            .ok_or_else(|| ExpertCacheError::InvalidRouteShape(routed_ids.shape().to_vec()))?;
+        let row_count = routed_hidden.dim(0);
+        let chunk_rows = if pass == ExpertPass::Prefill {
+            i32::try_from(self.route_chunk_rows(routes_per_row)).unwrap_or(i32::MAX)
+        } else {
+            row_count.max(1)
+        };
+        let mut outputs = Vec::new();
+        let mut start = 0;
+        while start < row_count {
+            let end = (start + chunk_rows).min(row_count);
+            let hidden = routed_hidden.try_index_device(start..end, stream)?;
+            let routes = routed_ids.try_index_device(start..end, stream)?;
+            let weights = route_weights.try_index_device(start..end, stream)?;
+            let acquired = self.acquire_routes(layer, &routes, pass, stream)?;
+            let output = execute_bank(&hidden, &acquired, &weights, stream)?;
+            if output.ndim() == 0 || output.dim(0) != end - start {
+                return Err(ExpertCacheError::CompactBankOutputShapeMismatch {
+                    expected_rows: end - start,
+                    actual: output.shape().to_vec(),
+                });
+            }
+            eval([&output])?;
+            acquired.complete_pending()?;
+            outputs.push(output);
+            start = end;
+        }
+        if outputs.is_empty() {
+            let acquired = self.acquire_routes(layer, routed_ids, pass, stream)?;
+            let output = execute_bank(routed_hidden, &acquired, route_weights, stream)?;
+            if output.ndim() == 0 || output.dim(0) != row_count {
+                return Err(ExpertCacheError::CompactBankOutputShapeMismatch {
+                    expected_rows: row_count,
+                    actual: output.shape().to_vec(),
+                });
+            }
+            eval([&output])?;
+            acquired.complete_pending()?;
+            return Ok(output);
+        }
+        Ok(concatenate_axis(&outputs, 0, stream)?)
     }
 
     /// Discovers, validates, coalesces, and acquires routed experts.
@@ -359,7 +472,7 @@ impl ExpertCache {
     /// A device-side demand histogram bounds host readback by the layer's
     /// global expert count. Original routes remain on-device and are rewritten
     /// through a compact-id lookup table after validation.
-    pub fn acquire_routes(
+    fn acquire_routes(
         &self,
         layer: usize,
         routed_ids: &Array,
@@ -443,7 +556,8 @@ impl ExpertCache {
     }
 
     /// Acquires a caller-provided route table while preserving its exact shape and order.
-    pub fn acquire_route_slice(
+    #[cfg(test)]
+    pub(crate) fn acquire_route_slice(
         &self,
         layer: usize,
         routed_ids: &[i32],
@@ -820,9 +934,32 @@ pub enum ExpertCacheError {
     /// No expert definitions were supplied.
     #[error("sparse expert cache requires at least one owned expert")]
     EmptyCatalog,
+    /// An architecture attempted cached execution without an initialized cache.
+    #[error("{architecture} sparse expert cache was not initialized")]
+    CacheUnavailable {
+        /// Model family reporting the missing cache.
+        architecture: &'static str,
+    },
+    /// A non-empty routed block selected no experts.
+    #[error("{architecture} router selected no experts for a non-empty routed block")]
+    EmptyRoutedBank {
+        /// Model family reporting the invalid router output.
+        architecture: &'static str,
+    },
     /// Compact-bank scratch accounting was disabled with a zero limit.
     #[error("sparse expert compact-bank scratch limit must be nonzero")]
     ZeroScratchLimit,
+    /// Prefill compact-bank chunking was disabled with a zero target.
+    #[error("sparse expert prefill compact-bank target must be nonzero")]
+    ZeroPrefillBankTarget,
+    /// The soft prefill target exceeded the hard scratch limit.
+    #[error("sparse expert prefill compact-bank target {target_bytes} exceeds scratch limit {scratch_bytes}")]
+    PrefillBankTargetExceedsScratch {
+        /// Requested soft prefill target.
+        target_bytes: u64,
+        /// Configured hard scratch limit.
+        scratch_bytes: u64,
+    },
     /// One logical expert declared no materialized bytes.
     #[error("expert {identity:?} must contain at least one byte")]
     ZeroSizedExpert {
@@ -901,6 +1038,24 @@ pub enum ExpertCacheError {
         shape: Vec<i32>,
         /// Supplied host value count.
         elements: usize,
+    },
+    /// Hidden rows, route rows, and route-weight rows did not align.
+    #[error("routed expert batch shapes do not align: hidden {hidden:?}, routes {routes:?}, weights {weights:?}")]
+    RoutedBatchShapeMismatch {
+        /// Routed hidden-state shape.
+        hidden: Vec<i32>,
+        /// Routed expert-id shape.
+        routes: Vec<i32>,
+        /// Routed expert-weight shape.
+        weights: Vec<i32>,
+    },
+    /// An architecture-specific compact bank returned the wrong row count.
+    #[error("compact expert bank returned shape {actual:?}, expected {expected_rows} rows")]
+    CompactBankOutputShapeMismatch {
+        /// Required output rows.
+        expected_rows: i32,
+        /// Returned output shape.
+        actual: Vec<i32>,
     },
     /// Selected experts exceed the configured temporary compact-bank allowance.
     #[error("compact expert bank for {distinct_experts} experts requires {required_bytes} bytes, exceeding the {limit_bytes}-byte scratch limit")]
@@ -1018,13 +1173,30 @@ mod tests {
         scratch: u64,
         eviction: CacheEvictionPolicy,
     ) -> ExpertCache {
+        cache_with_target(store, device, host, scratch, scratch, eviction)
+    }
+
+    fn cache_with_target(
+        store: Arc<SafetensorsWeightStore>,
+        device: u64,
+        host: u64,
+        scratch: u64,
+        prefill_target: u64,
+        eviction: CacheEvictionPolicy,
+    ) -> ExpertCache {
         let experts = OffloadConfig::new(Some(device), Some(host), 1)
             .unwrap()
             .with_eviction_policy(eviction);
         ExpertCache::new(
             store,
             entries(),
-            ExpertCacheLoadOptions::new(LayerwiseLoadOptions::default(), experts, scratch).unwrap(),
+            ExpertCacheLoadOptions::new(
+                LayerwiseLoadOptions::default(),
+                experts,
+                scratch,
+                prefill_target,
+            )
+            .unwrap(),
             stream(),
             stream(),
         )
@@ -1071,10 +1243,96 @@ mod tests {
     #[test]
     fn route_chunk_size_respects_scratch_target_and_worst_case_expert_bytes() {
         let (_dir, store) = fixture();
-        let cache = cache(store, 48, 0, 128, CacheEvictionPolicy::LeastRecentlyUsed);
-        assert_eq!(cache.route_chunk_tokens(2, 64), 2);
-        assert_eq!(cache.route_chunk_tokens(2, 16), 1);
-        assert_eq!(cache.route_chunk_tokens(0, 64), 1);
+        let bounded = cache(
+            Arc::clone(&store),
+            48,
+            0,
+            64,
+            CacheEvictionPolicy::LeastRecentlyUsed,
+        );
+        assert_eq!(bounded.route_chunk_rows(2), 2);
+        assert_eq!(bounded.route_chunk_rows(0), 1);
+        let small = cache(store, 48, 0, 16, CacheEvictionPolicy::LeastRecentlyUsed);
+        assert_eq!(small.route_chunk_rows(2), 1);
+    }
+
+    #[test]
+    fn prefill_target_is_required_and_cannot_exceed_scratch() {
+        let experts = OffloadConfig::new(Some(48), Some(0), 1).unwrap();
+        assert!(matches!(
+            ExpertCacheLoadOptions::new(LayerwiseLoadOptions::default(), experts, 64, 0),
+            Err(ExpertCacheError::ZeroPrefillBankTarget)
+        ));
+        assert!(matches!(
+            ExpertCacheLoadOptions::new(LayerwiseLoadOptions::default(), experts, 64, 65),
+            Err(ExpertCacheError::PrefillBankTargetExceedsScratch { .. })
+        ));
+    }
+
+    #[test]
+    fn bounded_execution_chunks_prefill_but_not_decode_and_preserves_row_order() {
+        let (_dir, store) = fixture();
+        let cache = cache_with_target(store, 48, 0, 48, 32, CacheEvictionPolicy::LeastRecentlyUsed);
+        let execution = stream();
+        let hidden = Array::from_slice(&[1f32, 2., 3., 4., 5., 6.], &[3, 2]);
+        let routes = Array::from_slice(&[0i32, 1, 1, 2, 2, 0], &[3, 2]);
+        let weights = Array::from_slice(&[0.5f32; 6], &[3, 2]);
+        let mut prefill_banks = 0;
+        let output = cache
+            .execute_routes_bounded(
+                2,
+                &hidden,
+                &routes,
+                &weights,
+                ExpertPass::Prefill,
+                &execution,
+                |hidden, _acquired, _weights, _stream| {
+                    prefill_banks += 1;
+                    Ok(hidden.clone())
+                },
+            )
+            .unwrap();
+        assert_eq!(prefill_banks, 3);
+        assert_eq!(
+            output.evaluated().unwrap().as_slice::<f32>(),
+            hidden.evaluated().unwrap().as_slice::<f32>()
+        );
+
+        let mut decode_banks = 0;
+        cache
+            .execute_routes_bounded(
+                2,
+                &hidden,
+                &routes,
+                &weights,
+                ExpertPass::Decode,
+                &execution,
+                |hidden, _acquired, _weights, _stream| {
+                    decode_banks += 1;
+                    Ok(hidden.clone())
+                },
+            )
+            .unwrap();
+        assert_eq!(decode_banks, 1);
+
+        let distributed_routes = Array::from_slice(&[0i32, 1, 2], &[3]);
+        let distributed_weights = Array::from_slice(&[1f32; 3], &[3]);
+        let mut distributed_banks = 0;
+        cache
+            .execute_routes_bounded(
+                2,
+                &hidden,
+                &distributed_routes,
+                &distributed_weights,
+                ExpertPass::Prefill,
+                &execution,
+                |hidden, _acquired, _weights, _stream| {
+                    distributed_banks += 1;
+                    Ok(hidden.clone())
+                },
+            )
+            .unwrap();
+        assert_eq!(distributed_banks, 2);
     }
 
     #[test]

@@ -12,7 +12,6 @@ use safemlx::{
     module::{Module, ModuleParameters, Param},
     ops::{concatenate_axis, indexing::TryIndexOp, GgufCheckpoint, GgufMetadataValue},
     quantization::MaybeQuantized,
-    transforms::eval,
     Array, Stream,
 };
 
@@ -2111,63 +2110,88 @@ impl GeneralLayerwiseModelAdapter for QwenHybridLayerwiseAdapter {
                     },
                     stream,
                     |flat, indices, weights, stream| {
-                        let acquired = expert_cache
-                            .acquire_routes(index, indices, pass, stream)
-                            .map_err(|error| Exception::custom(error.to_string()))?;
-                        let started = Instant::now();
-                        let mut compact_args = self.args.clone();
-                        compact_args.num_experts = acquired.identities().len() as i32;
-                        let mut bank = Experts::new(&compact_args, index, stream)?;
-                        bank.gate_up_proj = Param::new(
-                            acquired
-                                .compact_binding("gate_up_proj", stream)
-                                .map_err(|error| Exception::custom(error.to_string()))?,
-                        );
-                        bank.gate_up_proj_scale_inv = Param::new(
-                            acquired
-                                .optional_compact_binding("gate_up_proj_scale_inv", stream)
-                                .map_err(|error| Exception::custom(error.to_string()))?,
-                        );
-                        bank.gate_up_proj_scales = Param::new(
-                            acquired
-                                .optional_compact_binding("gate_up_proj_scales", stream)
-                                .map_err(|error| Exception::custom(error.to_string()))?,
-                        );
-                        bank.gate_up_proj_biases = Param::new(
-                            acquired
-                                .optional_compact_binding("gate_up_proj_biases", stream)
-                                .map_err(|error| Exception::custom(error.to_string()))?,
-                        );
-                        bank.down_proj = Param::new(
-                            acquired
-                                .compact_binding("down_proj", stream)
-                                .map_err(|error| Exception::custom(error.to_string()))?,
-                        );
-                        bank.down_proj_scale_inv = Param::new(
-                            acquired
-                                .optional_compact_binding("down_proj_scale_inv", stream)
-                                .map_err(|error| Exception::custom(error.to_string()))?,
-                        );
-                        bank.down_proj_scales = Param::new(
-                            acquired
-                                .optional_compact_binding("down_proj_scales", stream)
-                                .map_err(|error| Exception::custom(error.to_string()))?,
-                        );
-                        bank.down_proj_biases = Param::new(
-                            acquired
-                                .optional_compact_binding("down_proj_biases", stream)
-                                .map_err(|error| Exception::custom(error.to_string()))?,
-                        );
                         expert_cache
-                            .record_compact_bank(pass, acquired.scratch_bytes(), started.elapsed())
-                            .map_err(|error| Exception::custom(error.to_string()))?;
-                        let output =
-                            bank.forward_chunked(flat, acquired.compact_routes(), weights, stream)?;
-                        eval([&output])?;
-                        acquired
-                            .complete_pending()
-                            .map_err(|error| Exception::custom(error.to_string()))?;
-                        Ok(output)
+                            .execute_routes_bounded(
+                                index,
+                                flat,
+                                indices,
+                                weights,
+                                pass,
+                                stream,
+                                |flat, acquired, weights, stream| {
+                                    let started = Instant::now();
+                                    let mut compact_args = self.args.clone();
+                                    compact_args.num_experts = acquired.identities().len() as i32;
+                                    let mut bank = Experts::new(&compact_args, index, stream)?;
+                                    bank.gate_up_proj = Param::new(
+                                        acquired.compact_binding("gate_up_proj", stream).map_err(
+                                            |error| Exception::custom(error.to_string()),
+                                        )?,
+                                    );
+                                    bank.gate_up_proj_scale_inv = Param::new(
+                                        acquired
+                                            .optional_compact_binding(
+                                                "gate_up_proj_scale_inv",
+                                                stream,
+                                            )
+                                            .map_err(|error| {
+                                                Exception::custom(error.to_string())
+                                            })?,
+                                    );
+                                    bank.gate_up_proj_scales = Param::new(
+                                        acquired
+                                            .optional_compact_binding("gate_up_proj_scales", stream)
+                                            .map_err(|error| {
+                                                Exception::custom(error.to_string())
+                                            })?,
+                                    );
+                                    bank.gate_up_proj_biases = Param::new(
+                                        acquired
+                                            .optional_compact_binding("gate_up_proj_biases", stream)
+                                            .map_err(|error| {
+                                                Exception::custom(error.to_string())
+                                            })?,
+                                    );
+                                    bank.down_proj = Param::new(
+                                        acquired.compact_binding("down_proj", stream).map_err(
+                                            |error| Exception::custom(error.to_string()),
+                                        )?,
+                                    );
+                                    bank.down_proj_scale_inv = Param::new(
+                                        acquired
+                                            .optional_compact_binding("down_proj_scale_inv", stream)
+                                            .map_err(|error| {
+                                                Exception::custom(error.to_string())
+                                            })?,
+                                    );
+                                    bank.down_proj_scales = Param::new(
+                                        acquired
+                                            .optional_compact_binding("down_proj_scales", stream)
+                                            .map_err(|error| {
+                                                Exception::custom(error.to_string())
+                                            })?,
+                                    );
+                                    bank.down_proj_biases = Param::new(
+                                        acquired
+                                            .optional_compact_binding("down_proj_biases", stream)
+                                            .map_err(|error| {
+                                                Exception::custom(error.to_string())
+                                            })?,
+                                    );
+                                    expert_cache.record_compact_bank(
+                                        pass,
+                                        acquired.scratch_bytes(),
+                                        started.elapsed(),
+                                    )?;
+                                    Ok(bank.forward_chunked(
+                                        flat,
+                                        acquired.compact_routes(),
+                                        weights,
+                                        stream,
+                                    )?)
+                                },
+                            )
+                            .map_err(|error| Exception::custom(error.to_string()))
                     },
                 )?)
             }
@@ -2585,6 +2609,7 @@ mod tests {
             LayerwiseLoadOptions::new(OffloadConfig::new(None, None, 1).unwrap()),
             OffloadConfig::new(None, None, 1).unwrap(),
             1 << 20,
+            1,
         )
         .unwrap();
         let mut cached = if next {
@@ -2629,6 +2654,7 @@ mod tests {
         assert_eq!(report.owned_experts, 4);
         assert!(report.prefill.requested_routes > 0);
         assert!(report.decode.requested_routes > 0);
+        assert!(report.prefill.compact_banks > 1);
         crate::architectures::distributed::expert::assert_rank_owned_sparse_ep_load(
             dir.path(),
             options,

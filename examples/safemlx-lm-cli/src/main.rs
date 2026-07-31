@@ -401,9 +401,13 @@ struct Cli {
     #[arg(long, value_name = "BYTES")]
     expert_cache_host_budget_bytes: Option<u64>,
 
-    /// Maximum temporary compact expert-bank allocation per routed block.
+    /// Hard maximum bytes for one temporary compact expert bank.
     #[arg(long, default_value_t = 1_073_741_824, value_name = "BYTES")]
     expert_cache_scratch_bytes: u64,
+
+    /// Soft compact expert-bank target used to split multi-token prefill routing.
+    #[arg(long, default_value_t = 1_073_741_824, value_name = "BYTES")]
+    expert_cache_prefill_bank_bytes: u64,
 
     /// Deterministic expert cache eviction ordering.
     #[arg(long, value_enum, default_value_t = ExpertCacheEviction::Lru)]
@@ -737,8 +741,12 @@ fn main() -> Result<()> {
             1,
         )?
         .with_eviction_policy(args.expert_cache_eviction.into());
-        let expert_options =
-            ExpertCacheLoadOptions::new(non_expert, experts, args.expert_cache_scratch_bytes)?;
+        let expert_options = ExpertCacheLoadOptions::new(
+            non_expert,
+            experts,
+            args.expert_cache_scratch_bytes,
+            args.expert_cache_prefill_bank_bytes,
+        )?;
         load_options = if args.dense_disk_stream {
             load_options.with_weight_residency(WeightResidency::SparseExpertCacheWithDenseLayers(
                 SparseExpertDenseStreamLoadOptions::new(expert_options, dense_options()?),
@@ -1601,6 +1609,12 @@ fn validate_args(args: &Cli) -> Result<()> {
     }
     if args.expert_cache_scratch_bytes == 0 {
         bail!("--expert-cache-scratch-bytes must be greater than zero");
+    }
+    if args.expert_cache_prefill_bank_bytes == 0 {
+        bail!("--expert-cache-prefill-bank-bytes must be greater than zero");
+    }
+    if args.expert_cache_prefill_bank_bytes > args.expert_cache_scratch_bytes {
+        bail!("--expert-cache-prefill-bank-bytes cannot exceed --expert-cache-scratch-bytes");
     }
     if args.device_layer_window == 0 {
         bail!("--device-layer-window must be greater than zero");
@@ -2556,6 +2570,31 @@ mod tests {
 
         assert_eq!(args.mlx_cache_limit_bytes, Some(17_179_869_184));
         validate_args(&args).unwrap();
+    }
+
+    #[test]
+    fn parses_and_validates_expert_cache_prefill_bank_target() {
+        let args = Cli::try_parse_from([
+            "safemlx-lm",
+            "--model",
+            "model-id",
+            "--expert-cache",
+            "--expert-cache-scratch-bytes",
+            "4096",
+            "--expert-cache-prefill-bank-bytes",
+            "1024",
+            "prompt",
+        ])
+        .unwrap();
+        assert_eq!(args.expert_cache_scratch_bytes, 4096);
+        assert_eq!(args.expert_cache_prefill_bank_bytes, 1024);
+        validate_args(&args).unwrap();
+
+        let invalid = Cli {
+            expert_cache_prefill_bank_bytes: 4097,
+            ..args
+        };
+        assert!(validate_args(&invalid).is_err());
     }
 
     #[test]

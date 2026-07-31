@@ -743,6 +743,7 @@ mod tests {
             ),
             crate::runtime::residency::policy::OffloadConfig::new(None, None, 1).unwrap(),
             u64::MAX,
+            1 << 30,
         )
         .unwrap();
         let cache = crate::runtime::residency::expert_cache::ExpertCache::new(
