@@ -332,6 +332,101 @@ let model = LoadedModel::load(
 )?;
 ```
 
+## Capability and admission checks
+
+`LoadedModel` exposes validated architecture facts without downcasting
+`Model`. `capabilities()` reports the configured native/effective context,
+input modalities, and cache/state strategy. `count_text`,
+`count_prepared_chat`, and `count_prepared_input` distinguish tokenizer IDs
+from decoder positions; prepared media positions come from the processor's
+patch grids, pooling geometry, or valid-frame masks.
+
+`estimate_runtime_state` models persistent KV, sliding KV, compressed MLA, and
+hybrid recurrent state with checked arithmetic. Its result states the assumed
+four-byte cache dtype, batch size, sliding bounds, cache growth granularity,
+fixed state, context-growing state, and coverage. Standard Llama/Mistral,
+Qwen3, GPT-OSS, DeepSeek MLA, LFM2, Nemotron-H, text-only Qwen hybrid, and
+Gemma 4 estimates cover persistent state completely. Gemma's shared-KV layers
+and full-context backing for sliding-attention layers are accounted separately.
+Multimodal models additionally count persistent media embeddings, decoder
+positions, and a conservative media-tower execution workspace derived from the
+actual prepared tensors. Qwen uses its prepared `grid_thw`, full/window
+attention schedule, merger, and DeepStack outputs; Gemma 4 uses padded and
+valid patch/audio geometry plus its loaded vision/audio tower configuration;
+Inkling uses the released hMLP fold shapes and dMel codebook/mask geometry.
+These requests report `Conservative`: decoder state remains exact under the
+stated assumptions, while the tower workspace is a complete safe upper bound
+for architecture-visible tensors and fused-operation inputs/outputs.
+
+The estimate intentionally remains separate from process-wide MLX allocator
+cache, driver allocations, and unrelated application memory. Applications
+should retain a safety reserve for those backend and process effects; the MLX
+active/cache counters are observational signals, not a request-memory total.
+
+`static_memory()` keeps logical checkpoint/residency accounting separate from
+the process-global MLX active and allocator-cache counters. On Apple silicon,
+host and device residency are logical tiers over one unified physical
+capacity. `available_memory()` uses `hw.memsize` and
+`os_proc_available_memory` on macOS, and `MemTotal`/`MemAvailable` on Linux;
+Windows uses `GlobalMemoryStatusEx`. Unsupported values are reported as
+`Unavailable`, never zero. SafeMLX does not currently expose a trustworthy
+CUDA device-free-memory query, so callers on discrete accelerators should pass
+an application budget rather than treating host availability as device
+capacity.
+
+The admission policy is caller-configurable and does not allocate a model
+cache:
+
+```rust,ignore
+use safemlx::{Device, DeviceType, ExecutionContext};
+use safemlx_lm::api::{
+    available_memory, AdmissionRequest, AdmissionResult, ChatTemplateRequest,
+    LoadedModel,
+};
+use serde_json::json;
+
+let execution = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
+let mut model = LoadedModel::load(model_dir, execution.stream(), execution.stream())?;
+
+let capabilities = model.capabilities()?;
+println!("{capabilities:#?}");
+
+let prepared = model.prepare_chat(ChatTemplateRequest {
+    messages: vec![json!({"role": "user", "content": "Summarize this file."})],
+    add_generation_prompt: true,
+    ..ChatTemplateRequest::default()
+})?;
+let input = model.count_prepared_chat(&prepared)?;
+println!(
+    "prompt={} positions, media workspace={} bytes ({:?})",
+    input.model_positions,
+    input.media_execution_workspace_bytes(),
+    input.media_execution_workspace_kind(),
+);
+let memory = available_memory()?;
+
+let decision = model.admit(
+    AdmissionRequest {
+        input,
+        max_output_tokens: 512,
+        batch_size: 1,
+        safety_reserve_bytes: 512 * 1024 * 1024,
+        application_memory_budget_bytes: None,
+        require_complete_estimate: true,
+    },
+    Some(&memory),
+)?;
+
+match decision {
+    AdmissionResult::Admitted(estimate) => {
+        println!("admitted: {} incremental bytes", estimate.incremental_required_bytes);
+    }
+    AdmissionResult::Rejected(reason) => {
+        eprintln!("rejected before generation: {reason:?}");
+    }
+}
+```
+
 Dense GGUF tensors are loaded directly. MLX-native packed loading is enabled
 for Q2_K, Q3_K, Q4_0, Q4_1, Q4_K, Q5_K, Q6_K, and Q8_0, including checkpoints
 that mix packed and dense matrices. Q4_K and Q5_K are losslessly repacked to

@@ -68,6 +68,25 @@ impl Gemma4LayerwiseModel {
         self.execution.adapter().args()
     }
 
+    pub(crate) fn media_accounting(
+        &self,
+    ) -> (
+        Option<&Gemma4VisionConfig>,
+        Option<&Gemma4AudioConfig>,
+        bool,
+        bool,
+        bool,
+    ) {
+        let adapter = self.execution.adapter();
+        (
+            adapter.vision.as_ref().map(|vision| &vision.config),
+            adapter.audio_config.as_ref(),
+            adapter.image_token_id.is_some(),
+            adapter.audio_token_id.is_some(),
+            adapter.video_token_id.is_some(),
+        )
+    }
+
     /// Creates an empty Gemma 4 generation cache.
     pub fn new_cache(&self) -> Cache {
         Cache::new(self.args())

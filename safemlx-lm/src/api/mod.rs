@@ -239,6 +239,14 @@ pub use config::{
     ModelLoadOptions, SupportedModelConfig,
 };
 
+mod capability;
+pub use capability::{
+    available_memory, Admission, AdmissionRejection, AdmissionRequest, AdmissionResult,
+    AvailableMemory, CacheStateStrategy, CapabilityError, CapabilityValue, EstimationCompleteness,
+    InputModalities, InputTokenCount, MeasurementKind, ModelCapabilities, PhysicalMemorySemantics,
+    RuntimeStateEstimate, StateMemoryAssumptions, StaticMemoryReport,
+};
+
 mod dispatch;
 use dispatch::validate_gemma4_drafter;
 pub use dispatch::{Model, ModelCache, ModelGenerate};

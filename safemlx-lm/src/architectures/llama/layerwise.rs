@@ -4,7 +4,7 @@ use std::{collections::HashMap, path::Path, sync::Arc};
 
 use safemlx::{
     error::Exception,
-    module::Module,
+    module::{Module, ModuleParameters},
     nn,
     ops::indexing::TryIndexOp,
     ops::{GgufCheckpoint, GgufMetadataValue},
@@ -201,6 +201,25 @@ impl LlamaModel {
         match &self.execution {
             LlamaExecution::FullyResident(_) => None,
             LlamaExecution::LayerwiseHost(model) => Some(model.metadata()),
+        }
+    }
+
+    pub(crate) fn resident_parameter_bytes(&self) -> Option<Result<u64, &'static str>> {
+        match &self.execution {
+            LlamaExecution::FullyResident(model) => Some(
+                model
+                    .parameters()
+                    .flatten()
+                    .values()
+                    .try_fold(0u64, |total, parameter| {
+                        let bytes = u64::try_from(parameter.nbytes())
+                            .map_err(|_| "Llama parameter byte count does not fit u64")?;
+                        total
+                            .checked_add(bytes)
+                            .ok_or("Llama parameter byte total overflowed u64")
+                    }),
+            ),
+            LlamaExecution::LayerwiseHost(_) => None,
         }
     }
 

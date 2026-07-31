@@ -76,6 +76,20 @@ impl QwenHybridLayerwiseModel {
         self.execution.adapter().args()
     }
 
+    pub(crate) fn vision_spatial_merge_size(&self) -> Option<i32> {
+        self.vision_config().map(|vision| vision.spatial_merge_size)
+    }
+
+    pub(crate) fn vision_config(
+        &self,
+    ) -> Option<&crate::architectures::qwen::vl::vision::VisionConfig> {
+        self.execution
+            .adapter()
+            .vision
+            .as_ref()
+            .map(|vision| &vision.config)
+    }
+
     /// Creates heterogeneous recurrent/full-attention cache state.
     pub fn new_cache(&self) -> Cache {
         self.execution.adapter().new_cache()

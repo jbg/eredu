@@ -36,6 +36,44 @@ Image preprocessing requires the `safemlx-lm/image-processing` feature. Audio
 preprocessing requires `safemlx-lm/audio-processing`. These features are not
 enabled by default.
 
+## Capability and request-state estimation
+
+Every high-level `LoadedModel` has an architecture-independent
+`capabilities()` report and checked `estimate_runtime_state()`/`admit()` path.
+The dispatch is exhaustive over the public `Model` enum, so a new model variant
+must explicitly define its context, modalities, and state layout.
+
+- Llama/Mistral, Qwen3, and Qwen3-VL use KV-head-aware GQA accounting.
+- GPT-OSS and Gemma 4 account for full versus sliding attention separately.
+- DeepSeek-V3/R1 accounts for compressed MLA latent plus rotary-key state.
+- LFM2 and Nemotron-H separate bounded convolution/Mamba state from
+  context-growing attention state.
+- Qwen3-Next and Qwen3.5 separate recurrent linear-attention state from
+  full-attention KV.
+- Inkling accounts for global/sliding KV and bounded convolution state.
+- Prepared Gemma 4, Inkling, Qwen3-VL, and multimodal Qwen3.5 inputs derive
+  model positions from processor output geometry or masks, not a
+  tokens-per-image constant.
+
+Persistent-state formulas are exact under their stated float32-cache and batch
+assumptions, including backing-allocation growth units and Gemma 4 shared-KV
+layers. Gemma's sliding attention is reported separately from its full-context
+KV backing. Prepared multimodal requests report `Conservative`: they add a
+checked, architecture-specific media-tower workspace bound to exact decoder
+state and media-embedding accounting. Qwen derives it from prepared grids,
+full/window attention chunks, mergers, and DeepStack outputs; Gemma 4 derives
+it from padded/valid patch and audio-mask geometry plus the loaded tower
+configuration; Inkling derives it from the released hMLP folds and dMel
+codebooks. `require_complete_estimate` accepts this complete conservative bound.
+Callers should still supply a reserve for process-wide allocator cache, driver
+allocations, and other memory that is not owned by the request.
+
+System admission signals cover Apple unified memory through
+`hw.memsize`/`os_proc_available_memory`, Linux host memory through
+`/proc/meminfo`, and Windows host memory through `GlobalMemoryStatusEx`.
+CUDA-specific free-device-memory remains unavailable; host and device capacity
+are not combined.
+
 ## GGUF
 
 The high-level loader accepts a GGUF file for these `general.architecture`

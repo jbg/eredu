@@ -580,6 +580,7 @@ impl Gemma4AudioLayerwiseStatic {
 
 #[derive(Debug, Clone, ModuleParameters)]
 pub(crate) struct Gemma4AudioTower {
+    pub(crate) config: Gemma4AudioConfig,
     #[param]
     pub subsample_conv_projection: AudioSubsampleConvProjection,
     #[param]
@@ -591,6 +592,7 @@ pub(crate) struct Gemma4AudioTower {
 impl Gemma4AudioTower {
     pub(crate) fn new(config: &Gemma4AudioConfig, stream: &Stream) -> Result<Self, Exception> {
         Ok(Self {
+            config: config.clone(),
             subsample_conv_projection: AudioSubsampleConvProjection::new(config, stream)?,
             layers: (0..config.num_hidden_layers)
                 .map(|_| AudioLayer::new(config, stream))
