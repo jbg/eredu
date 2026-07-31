@@ -62,7 +62,7 @@ pub(crate) fn from_metadata(
         .unwrap_or_default();
 
     let mut tokenizer = match (architecture, model_type) {
-        ("gemma4", _) => build_gemma(tokens, metadata)?,
+        ("gemma4" | "gemma4_assistant" | "gemma4-assistant", _) => build_gemma(tokens, metadata)?,
         ("llama", _) => build_llama(tokens, metadata)?,
         (_, "llama") => build_llama(tokens, metadata)?,
         (_, "gpt2") => build_gpt(tokens, metadata)?,
@@ -674,6 +674,21 @@ mod tests {
             loaded.tokenizer.decode(encoding.get_ids(), false).unwrap(),
             "hi"
         );
+    }
+
+    #[test]
+    fn builds_gemma_assistant_unigram_tokenizers() {
+        for architecture in ["gemma4_assistant", "gemma4-assistant"] {
+            let metadata = sentencepiece_metadata(architecture);
+            let loaded = from_metadata(&metadata).unwrap().unwrap();
+            let encoding = loaded.tokenizer.encode("hi", false).unwrap();
+            assert_eq!(encoding.get_ids(), &[5], "{architecture}");
+            assert_eq!(
+                loaded.tokenizer.decode(encoding.get_ids(), false).unwrap(),
+                "hi",
+                "{architecture}"
+            );
+        }
     }
 
     #[test]
