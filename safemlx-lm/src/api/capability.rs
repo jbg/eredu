@@ -5,7 +5,8 @@ use std::num::NonZeroU8;
 use safemlx::{module::ModuleParameters, Array, Stream};
 
 use super::{
-    deepseek_v3, gemma4, gpt_oss, inkling, lfm2, nemotron_h, qwen3_5_moe, Model, PreparedModelInput,
+    deepseek_v3, gemma4, gpt_oss, inkling, kimi_linear, lfm2, nemotron_h, qwen3_5_moe, Model,
+    PreparedModelInput,
 };
 use crate::{
     architectures::qwen::hybrid::qwen3_5::LayerType as QwenHybridLayerType,
@@ -623,6 +624,8 @@ impl Model {
             }
             Self::Inkling(model) => inkling_spec(&model.args)?,
             Self::InklingLayerwise(model) => inkling_spec(model.args())?,
+            Self::KimiLinear(model) => kimi_linear_spec(&model.args)?,
+            Self::KimiLinearLayerwise(model) => kimi_linear_spec(model.args())?,
             Self::Lfm2(model) => lfm2_spec(&model.args)?,
             Self::Lfm2Layerwise(model) => lfm2_spec(model.args())?,
             Self::NemotronH(model) => nemotron_spec(&model.args)?,
@@ -778,6 +781,68 @@ fn deepseek_spec(args: &deepseek_v3::ModelArgs) -> Result<Spec, CapabilityError>
             growing: vec![GrowingState {
                 layers,
                 scalars_per_position: width,
+                window: None,
+            }],
+            hidden_size: positive(args.hidden_size, "hidden_size")?,
+            allocation_granularity: 256,
+            completeness: EstimationCompleteness::Complete,
+        },
+    ))
+}
+
+fn kimi_linear_spec(args: &kimi_linear::ModelArgs) -> Result<Spec, CapabilityError> {
+    let context = plain_context(args.model_max_length)?;
+    let attention = args.linear_attn_config.full_attn_layers.len() as u64;
+    let recurrent = args.linear_attn_config.kda_layers.len() as u64;
+    let heads = positive(
+        args.linear_attn_config.num_heads,
+        "linear_attn_config.num_heads",
+    )?;
+    let head_dim = positive(
+        args.linear_attn_config.head_dim,
+        "linear_attn_config.head_dim",
+    )?;
+    let projection = checked_mul(heads, head_dim, "KDA projected width")?;
+    let conv_state = checked_mul(
+        checked_mul(
+            positive(
+                args.linear_attn_config.short_conv_kernel_size - 1,
+                "linear_attn_config.short_conv_kernel_size",
+            )?,
+            projection,
+            "KDA convolution history width",
+        )?,
+        3,
+        "KDA Q/K/V convolution states",
+    )?;
+    let recurrent_state = checked_mul(
+        checked_mul(heads, head_dim, "KDA recurrent heads times key width")?,
+        head_dim,
+        "KDA recurrent state",
+    )?;
+    let fixed = checked_mul(
+        recurrent,
+        checked_add(conv_state, recurrent_state, "KDA fixed layer state")?,
+        "all KDA fixed state",
+    )?;
+    let mla_width = checked_add(
+        positive(args.kv_lora_rank, "kv_lora_rank")?,
+        positive(args.qk_rope_head_dim, "qk_rope_head_dim")?,
+        "Kimi MLA latent plus identity positional width",
+    )?;
+    Ok((
+        context.0,
+        context.1,
+        CacheStateStrategy::HybridRecurrent {
+            attention_layers: attention,
+            recurrent_layers: recurrent,
+        },
+        text_modalities(),
+        ArchitectureEstimate {
+            fixed_scalars_per_batch: fixed,
+            growing: vec![GrowingState {
+                layers: attention,
+                scalars_per_position: mla_width,
                 window: None,
             }],
             hidden_size: positive(args.hidden_size, "hidden_size")?,
@@ -1262,6 +1327,7 @@ impl Model {
             Self::Gemma4(model) => Some(parameter_bytes(model)?),
             Self::GptOss(model) => Some(parameter_bytes(model)?),
             Self::Inkling(model) => Some(parameter_bytes(model)?),
+            Self::KimiLinear(model) => Some(parameter_bytes(model)?),
             Self::Llama(model) => Some(parameter_bytes(model)?),
             Self::Lfm2(model) => Some(parameter_bytes(model)?),
             Self::NemotronH(model) => Some(parameter_bytes(model)?),
@@ -1278,6 +1344,7 @@ impl Model {
             | Self::Gemma4Layerwise(_)
             | Self::GptOssLayerwise(_)
             | Self::InklingLayerwise(_)
+            | Self::KimiLinearLayerwise(_)
             | Self::Lfm2Layerwise(_)
             | Self::NemotronHLayerwise(_)
             | Self::Qwen3Layerwise(_)
@@ -2201,6 +2268,8 @@ impl Model {
             | Self::DeepSeekV3Layerwise(_)
             | Self::GptOss(_)
             | Self::GptOssLayerwise(_)
+            | Self::KimiLinear(_)
+            | Self::KimiLinearLayerwise(_)
             | Self::Llama(_)
             | Self::LlamaLayerwise(_)
             | Self::Lfm2(_)
@@ -2711,13 +2780,11 @@ fn apply_admission_memory_policy(
 
 #[cfg(target_os = "macos")]
 fn macos_memory() -> Result<AvailableMemory, CapabilityError> {
-    use std::ffi::CStr;
-
     unsafe extern "C" {
         fn os_proc_available_memory() -> usize;
     }
 
-    let name = CStr::from_bytes_with_nul(b"hw.memsize\0").expect("static C string");
+    let name = c"hw.memsize";
     let mut total = 0u64;
     let mut size = std::mem::size_of::<u64>();
     let status = unsafe {
@@ -2865,15 +2932,15 @@ fn windows_memory() -> Result<AvailableMemory, CapabilityError> {
 pub fn available_memory() -> Result<AvailableMemory, CapabilityError> {
     #[cfg(target_os = "macos")]
     {
-        return macos_memory();
+        macos_memory()
     }
     #[cfg(target_os = "linux")]
     {
-        return linux_memory();
+        linux_memory()
     }
     #[cfg(target_os = "windows")]
     {
-        return windows_memory();
+        windows_memory()
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     {
@@ -3042,6 +3109,57 @@ mod tests {
         )
         .unwrap();
         assert_eq!(estimate.requested_state_bytes, 3 * 16 * 5 * 2 * 4);
+    }
+
+    #[test]
+    fn kimi_linear_accounts_for_bounded_kda_and_growing_mla_state() {
+        let args = kimi_linear::parse_config_value(json!({
+            "model_type": "kimi_linear",
+            "vocab_size": 64,
+            "hidden_size": 8,
+            "num_hidden_layers": 2,
+            "num_attention_heads": 2,
+            "num_key_value_heads": 2,
+            "intermediate_size": 16,
+            "head_dim": 4,
+            "model_max_length": 128,
+            "linear_attn_config": {
+                "kda_layers": [1],
+                "full_attn_layers": [2],
+                "num_heads": 2,
+                "head_dim": 4,
+                "short_conv_kernel_size": 2
+            },
+            "num_experts": 4,
+            "moe_intermediate_size": 8,
+            "kv_lora_rank": 4,
+            "qk_nope_head_dim": 2,
+            "qk_rope_head_dim": 2,
+            "v_head_dim": 2,
+            "mla_use_nope": true,
+            "num_experts_per_token": 2,
+            "routed_scaling_factor": 1.0,
+            "first_k_dense_replace": 1,
+            "num_expert_group": 1,
+            "topk_group": 1
+        }))
+        .unwrap();
+        let (native, effective, strategy, modalities, estimate) = kimi_linear_spec(&args).unwrap();
+        assert_eq!(native.value(), Some(&128));
+        assert_eq!(effective.value(), Some(&128));
+        assert_eq!(
+            strategy,
+            CacheStateStrategy::HybridRecurrent {
+                attention_layers: 1,
+                recurrent_layers: 1,
+            }
+        );
+        assert_eq!(modalities, InputModalities::TEXT);
+        assert_eq!(estimate.fixed_scalars_per_batch, 56);
+        assert_eq!(estimate.growing.len(), 1);
+        assert_eq!(estimate.growing[0].layers, 1);
+        assert_eq!(estimate.growing[0].scalars_per_position, 6);
+        assert_eq!(estimate.allocation_granularity, 256);
     }
 
     #[test]

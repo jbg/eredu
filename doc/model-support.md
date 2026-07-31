@@ -47,6 +47,8 @@ must explicitly define its context, modalities, and state layout.
 - Llama/Mistral, Qwen3, and Qwen3-VL use KV-head-aware GQA accounting.
 - GPT-OSS and Gemma 4 account for full versus sliding attention separately.
 - DeepSeek-V3/R1 accounts for compressed MLA latent plus rotary-key state.
+- Kimi Linear separates bounded KDA convolution/recurrent state from
+  context-growing compressed no-RoPE MLA state.
 - LFM2 and Nemotron-H separate bounded convolution/Mamba state from
   context-growing attention state.
 - Qwen3-Next and Qwen3.5 separate recurrent linear-attention state from
