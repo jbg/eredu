@@ -9,9 +9,7 @@ use std::time::{Duration, Instant};
 use half::f16;
 use safemlx::{
     memory,
-    native_quantization::{
-        native_selected_down_reduce, native_selected_gate_up, NativeQuantizedTensor,
-    },
+    native_quantization::NativeQuantizedTensor,
     ops::{quantized_matmul_with_mode, QuantizationMode},
     transforms::eval,
     Array, Device, DeviceType, Dtype, Stream,
@@ -36,24 +34,6 @@ fn q4k_matrix(rows: i32, columns: i32) -> Vec<u8> {
     let mut raw = Vec::with_capacity(blocks * 144);
     for block in 0..blocks {
         raw.extend(q4k_block(block));
-    }
-    raw
-}
-
-fn q5_1_matrix(matrices: i32, rows: i32, columns: i32) -> Vec<u8> {
-    let blocks = (matrices * rows * columns / 32) as usize;
-    let mut raw = Vec::with_capacity(blocks * 24);
-    for seed in 0..blocks {
-        raw.extend(f16::from_f32(0.015625).to_bits().to_le_bytes());
-        raw.extend(f16::from_f32(-0.125).to_bits().to_le_bytes());
-        for index in 0..20 {
-            raw.push(
-                (seed as u8)
-                    .wrapping_mul(31)
-                    .wrapping_add((index as u8).wrapping_mul(17))
-                    .wrapping_add(7),
-            );
-        }
     }
     raw
 }
@@ -209,71 +189,6 @@ fn benchmark_shape(rows: i32, columns: i32, batch: i32, iterations: usize, strea
     );
 }
 
-fn benchmark_selected_gate_up(stream: &Stream) {
-    let experts = 128;
-    let intermediate = 704;
-    let hidden = 2816;
-    let top_k = 8;
-    let raw = q4k_matrix(experts * 2 * intermediate, hidden);
-    let native =
-        NativeQuantizedTensor::from_q4k_bytes(&raw, &[experts, 2 * intermediate, hidden], stream)
-            .unwrap();
-    let input = Array::from_slice(
-        &(0..hidden)
-            .map(|index| (index as f32 % 41.0 - 20.0) / 21.0)
-            .collect::<Vec<_>>(),
-        &[1, hidden],
-    )
-    .copy(stream)
-    .unwrap();
-    let ids = Array::from_slice(&[127i32, 3, 88, 3, 41, 9, 76, 1], &[top_k])
-        .copy(stream)
-        .unwrap();
-    let elapsed = time_average(20, stream, || {
-        native_selected_gate_up(&input, &native, &ids, intermediate, stream).unwrap()
-    });
-    let selected_bytes = raw.len() / experts as usize * top_k as usize;
-    println!(
-        "selected gate/up experts={experts} top_k={top_k} hidden={hidden} intermediate={intermediate}: {:.3} ms, {:.1} GB/s, selected_bytes={selected_bytes}",
-        elapsed.as_secs_f64() * 1e3,
-        selected_bytes as f64 / elapsed.as_secs_f64() / 1e9,
-    );
-}
-
-fn benchmark_selected_down_reduce(stream: &Stream) {
-    let experts = 8;
-    let intermediate = 704;
-    let hidden = 2816;
-    let top_k = 8;
-    let raw = q5_1_matrix(experts, hidden, intermediate);
-    let native =
-        NativeQuantizedTensor::from_q5_1_bytes(&raw, &[experts, hidden, intermediate], stream)
-            .unwrap();
-    let activated = Array::from_slice(
-        &(0..top_k * intermediate)
-            .map(|index| (index as f32 % 41.0 - 20.0) / 210.0)
-            .collect::<Vec<_>>(),
-        &[top_k, intermediate],
-    )
-    .copy(stream)
-    .unwrap();
-    let ids = Array::from_slice(&[7i32, 3, 6, 3, 4, 0, 5, 1], &[top_k])
-        .copy(stream)
-        .unwrap();
-    let weights = Array::from_slice(&[0.2f32, 0.1, 0.15, 0.05, 0.1, 0.1, 0.2, 0.1], &[top_k])
-        .copy(stream)
-        .unwrap();
-    let elapsed = time_average(30, stream, || {
-        native_selected_down_reduce(&activated, &native, &ids, &weights, stream).unwrap()
-    });
-    let selected_bytes = raw.len();
-    println!(
-        "selected Q5_1 down/reduce experts={experts} top_k={top_k} hidden={hidden} intermediate={intermediate}: {:.3} ms, {:.1} GB/s, selected_bytes={selected_bytes}",
-        elapsed.as_secs_f64() * 1e3,
-        selected_bytes as f64 / elapsed.as_secs_f64() / 1e9,
-    );
-}
-
 fn main() {
     let stream = Stream::new_with_device(&Device::new(DeviceType::Gpu, 0));
     memory::clear_cache().unwrap();
@@ -289,8 +204,6 @@ fn main() {
     ] {
         benchmark_shape(rows, columns, batch, iterations, &stream);
     }
-    benchmark_selected_gate_up(&stream);
-    benchmark_selected_down_reduce(&stream);
     stream.synchronize().unwrap();
     println!(
         "mlx_active_bytes={} mlx_peak_bytes={}",

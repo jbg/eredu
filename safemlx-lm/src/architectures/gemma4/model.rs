@@ -14,16 +14,15 @@ use safemlx::{
     macros::{ModuleParameters, Quantizable},
     module::{Module, ModuleParametersExt, Param},
     native_quantization::{
-        native_grouped_linear, native_selected_down_reduce, native_selected_gate_up,
-        NativeQuantizationFormat, NativeQuantizationStats, NativeQuantizedTensor,
+        native_grouped_linear, NativeQuantizationFormat, NativeQuantizationStats,
+        NativeQuantizedTensor,
     },
     nn,
     ops::{
         concatenate_axis, dequantize_with_mode, gather_grouped_rows, grouped_matmul,
         indexing::{NewAxis, TryIndexOp},
-        mean_axis, quantized_matmul_with_mode, quantized_packed_dimension, r#where, rsqrt,
-        sum_axis, tanh, topk_route_plan, GgufCheckpoint, GgufEndian, GgufMetadataValue, GgufType,
-        QuantizationMode,
+        mean_axis, quantized_matmul_with_mode, quantized_packed_dimension, r#where, rsqrt, tanh,
+        topk_route_plan, GgufCheckpoint, GgufEndian, GgufMetadataValue, GgufType, QuantizationMode,
     },
     quantization::MaybeQuantized,
     transforms::eval,
@@ -1473,8 +1472,6 @@ pub struct GemmaExperts {
     pub num_experts: i32,
     /// Model hidden dimension.
     pub hidden_dim: i32,
-    /// Optional physical fused gate/up native bank.
-    pub native_gate_up: Option<NativeQuantizedTensor>,
     #[param]
     /// SwitchGLU projection bank.
     pub switch_glu: SwitchGluExperts,
@@ -1492,7 +1489,6 @@ impl GemmaExperts {
         Ok(Self {
             num_experts,
             hidden_dim: args.hidden_size,
-            native_gate_up: None,
             switch_glu: SwitchGluExperts {
                 gate_proj: ExpertProjection::new(
                     num_experts,
@@ -1527,41 +1523,7 @@ impl GemmaExperts {
         stream: &Stream,
     ) -> Result<Array, Exception> {
         let num_tokens = hidden_states.dim(0);
-        if num_tokens == 1 {
-            if let Some(fused_gate_up) = &self.native_gate_up {
-                let expert_ids = top_k_index.reshape(&[-1], stream)?;
-                let route_weights = top_k_weights.reshape(&[-1], stream)?;
-                let intermediate = fused_gate_up.rows() / 2;
-                let activated = native_selected_gate_up(
-                    hidden_states,
-                    fused_gate_up,
-                    &expert_ids,
-                    intermediate,
-                    stream,
-                )?;
-                if let Some(native_down) = &self.switch_glu.down_proj.native {
-                    return native_selected_down_reduce(
-                        &activated,
-                        native_down,
-                        &expert_ids,
-                        &route_weights,
-                        stream,
-                    );
-                }
-                let output = self.switch_glu.down_proj.forward_with_sorted(
-                    &activated,
-                    &expert_ids,
-                    false,
-                    stream,
-                )?;
-                return sum_axis(
-                    output.multiply(route_weights.reshape(&[-1, 1], stream)?, stream)?,
-                    0,
-                    true,
-                    stream,
-                );
-            }
-        }
+        // Use the same grouped expert path for decode and block verification.
         let plan = topk_route_plan(top_k_index, self.num_experts, stream)?;
         let hidden = gather_grouped_rows(hidden_states, &plan, stream)?;
         let gate = self
@@ -3480,7 +3442,6 @@ fn load_gemma4_gguf_weights(
                 experts.switch_glu.gate_proj.native = Some(native.row_view(0, intermediate)?);
                 experts.switch_glu.up_proj.native =
                     Some(native.row_view(intermediate, intermediate)?);
-                experts.native_gate_up = Some(native);
                 model
                     .native_quantization_stats
                     .promote_native(NativeQuantizationFormat::GgufQ4K, raw.data().len() as u64);
