@@ -443,7 +443,7 @@ struct Cli {
     #[arg(long)]
     allow_unparsed_reasoning: bool,
 
-    /// Print model resolution and generation statistics to stderr.
+    /// Print reasoning content, model resolution, and generation statistics to stderr.
     #[arg(short, long)]
     verbose: bool,
 
@@ -521,7 +521,9 @@ fn write_streamed_token(
 fn write_semantic_event(
     event: &SemanticEvent,
     stdout: &mut impl Write,
+    stderr: &mut impl Write,
     streamed_text: &mut String,
+    reasoning_stream: &mut ReasoningStream,
     verbose: bool,
 ) -> Result<()> {
     let visible = match event {
@@ -535,18 +537,73 @@ fn write_semantic_event(
         SemanticEvent::ToolCallEnd => Some("}}\n".into()),
         SemanticEvent::ReasoningDelta(text) => {
             if verbose {
-                eprintln!("reasoning_delta: {text:?}");
+                reasoning_stream.write_delta(stderr, text)?;
             }
             None
         }
-        SemanticEvent::Finished { .. } => None,
+        SemanticEvent::Finished { .. } => {
+            if verbose {
+                reasoning_stream.close(stderr)?;
+            }
+            None
+        }
     };
     if let Some(visible) = visible {
+        if verbose {
+            reasoning_stream.close(stderr)?;
+            reasoning_stream.announce_visible(stderr)?;
+        }
         stdout.write_all(visible.as_bytes())?;
         stdout.flush()?;
         streamed_text.push_str(&visible);
     }
     Ok(())
+}
+
+#[derive(Default)]
+struct ReasoningStream {
+    open: bool,
+    ends_with_newline: bool,
+    visible_announced: bool,
+}
+
+impl ReasoningStream {
+    fn write_delta(&mut self, stderr: &mut impl Write, text: &str) -> Result<()> {
+        if text.is_empty() {
+            return Ok(());
+        }
+        if !self.open {
+            writeln!(stderr, "--- reasoning content (stderr) ---")?;
+            self.open = true;
+        }
+        stderr.write_all(text.as_bytes())?;
+        self.ends_with_newline = text.ends_with('\n');
+        stderr.flush()?;
+        Ok(())
+    }
+
+    fn close(&mut self, stderr: &mut impl Write) -> Result<()> {
+        if !self.open {
+            return Ok(());
+        }
+        if !self.ends_with_newline {
+            writeln!(stderr)?;
+        }
+        writeln!(stderr, "--- end reasoning content (stderr) ---")?;
+        stderr.flush()?;
+        self.open = false;
+        self.ends_with_newline = false;
+        Ok(())
+    }
+
+    fn announce_visible(&mut self, stderr: &mut impl Write) -> Result<()> {
+        if !self.visible_announced {
+            writeln!(stderr, "--- generated content (stdout) ---")?;
+            stderr.flush()?;
+            self.visible_announced = true;
+        }
+        Ok(())
+    }
 }
 
 fn use_semantic_generation(
@@ -859,12 +916,15 @@ fn main() -> Result<()> {
     let mut mtp_stats: Option<MtpStats> = None;
     let mut decoder = model.text_decoder(true);
     let mut streamed_text = String::new();
+    let mut reasoning_stream = ReasoningStream::default();
     let stdout = io::stdout();
     let mut stdout = stdout.lock();
 
-    if args.verbose {
+    if args.verbose && prepared_chat.is_none() {
         eprintln!("--- generated content (stdout) ---");
     }
+    let stderr = io::stderr();
+    let mut stderr = stderr.lock();
 
     let embedded_mtp = args.mtp_draft_tokens > 0
         && matches!(
@@ -911,7 +971,9 @@ fn main() -> Result<()> {
                         semantic_error = write_semantic_event(
                             &event,
                             &mut stdout,
+                            &mut stderr,
                             &mut streamed_text,
+                            &mut reasoning_stream,
                             args.verbose,
                         )
                         .err();
@@ -945,7 +1007,9 @@ fn main() -> Result<()> {
                             semantic_error = write_semantic_event(
                                 &event,
                                 &mut stdout,
+                                &mut stderr,
                                 &mut streamed_text,
+                                &mut reasoning_stream,
                                 args.verbose,
                             )
                             .err();
@@ -974,7 +1038,9 @@ fn main() -> Result<()> {
                         semantic_error = write_semantic_event(
                             &event,
                             &mut stdout,
+                            &mut stderr,
                             &mut streamed_text,
+                            &mut reasoning_stream,
                             args.verbose,
                         )
                         .err();
@@ -1096,6 +1162,11 @@ fn main() -> Result<()> {
             current = next.transpose()?;
         }
     }
+    if args.verbose {
+        reasoning_stream.close(&mut stderr)?;
+    }
+    drop(stderr);
+
     let generation_elapsed = generation_started.elapsed();
     let stop_reason = prepared_finish_reason
         .map(StopReason::from)
@@ -1988,8 +2059,8 @@ mod tests {
         should_report_stop_reason, split_hf_model_spec, stop_reason, use_semantic_generation,
         validate_args, validate_artifact_pair, write_semantic_event, Array, CachedGgufRole, Cli,
         CliDevice, CliToolChoice, DeviceType, MtpDraftDevice, MtpExecutionStreams,
-        MtpSchedulerOptions, NativeToolSupport, ResolvedModel, SemanticEvent, SemanticSupport,
-        StopReason,
+        MtpSchedulerOptions, NativeToolSupport, ReasoningStream, ResolvedModel, SemanticEvent,
+        SemanticSupport, StopReason,
     };
 
     fn revision(hash: &str, refs: &[&str], modified: u64) -> CachedRevisionInfo {
@@ -2115,24 +2186,83 @@ mod tests {
     #[test]
     fn semantic_output_hides_reasoning_and_writes_visible_text() {
         let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
         let mut streamed_text = String::new();
+        let mut reasoning_stream = ReasoningStream::default();
         write_semantic_event(
             &SemanticEvent::ReasoningDelta("private thought".into()),
             &mut stdout,
+            &mut stderr,
             &mut streamed_text,
+            &mut reasoning_stream,
             false,
         )
         .unwrap();
         write_semantic_event(
             &SemanticEvent::TextDelta("visible answer".into()),
             &mut stdout,
+            &mut stderr,
             &mut streamed_text,
+            &mut reasoning_stream,
             false,
         )
         .unwrap();
 
         assert_eq!(stdout, b"visible answer");
+        assert!(stderr.is_empty());
         assert_eq!(streamed_text, "visible answer");
+    }
+
+    #[test]
+    fn verbose_semantic_output_streams_reasoning_in_event_order() {
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let mut streamed_text = String::new();
+        let mut reasoning_stream = ReasoningStream::default();
+
+        write_semantic_event(
+            &SemanticEvent::ReasoningDelta("private ".into()),
+            &mut stdout,
+            &mut stderr,
+            &mut streamed_text,
+            &mut reasoning_stream,
+            true,
+        )
+        .unwrap();
+        assert!(stdout.is_empty());
+        assert_eq!(stderr, b"--- reasoning content (stderr) ---\nprivate ");
+
+        write_semantic_event(
+            &SemanticEvent::ReasoningDelta("thought\nsecond line".into()),
+            &mut stdout,
+            &mut stderr,
+            &mut streamed_text,
+            &mut reasoning_stream,
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            stderr,
+            b"--- reasoning content (stderr) ---\nprivate thought\nsecond line"
+        );
+
+        write_semantic_event(
+            &SemanticEvent::TextDelta("visible answer".into()),
+            &mut stdout,
+            &mut stderr,
+            &mut streamed_text,
+            &mut reasoning_stream,
+            true,
+        )
+        .unwrap();
+        assert_eq!(stdout, b"visible answer");
+        assert_eq!(streamed_text, "visible answer");
+        assert_eq!(
+            stderr,
+            b"--- reasoning content (stderr) ---\nprivate thought\nsecond line\n\
+              --- end reasoning content (stderr) ---\n\
+              --- generated content (stdout) ---\n"
+        );
     }
 
     #[test]

@@ -333,9 +333,12 @@ For a structurally recognized chat protocol, ordinary chat uses semantic
 parsing independently of native tool generation.
 Reasoning channels are emitted as reasoning events rather than leaking their
 wire-format markers into stdout; visible response text is streamed normally.
-With `--verbose`, reasoning deltas are shown on stderr. An unregistered
-template remains usable without tools through a templated text fallback, while
-`--raw` remains the explicit no-template path.
+With `--verbose`, reasoning content streams immediately in a delimited stderr
+section. The section closes before visible response text resumes on stdout, so
+the two channels remain distinct and appear in model-production order without
+exposing event chunk boundaries. An unregistered template remains usable
+without tools through a templated text fallback, while `--raw` remains the
+explicit no-template path.
 
 Native tool calling accepts a JSON array of OpenAI-shaped function definitions.
 It requires independently recognized tool rendering, output parsing, and
@@ -351,9 +354,10 @@ cargo run --release -p safemlx-lm-cli -- \
   "Look up the weather in Bogotá."
 ```
 
-Visible text and canonical tool events are streamed to stdout. Reasoning deltas
-are shown on stderr with `--verbose`, and every prepared-tool request reports
-`stop_reason` (`grammar_complete`, `stop_sequence`, `eos`, or `max_tokens`).
+Visible text and canonical tool events are streamed to stdout. With `--verbose`,
+reasoning content streams in event order in a delimited stderr section, and
+every prepared-tool request reports `stop_reason` (`grammar_complete`,
+`stop_sequence`, `eos`, or `max_tokens`).
 External and embedded MTP automatically use the same semantic runtime and the
 existing draft-placement and scheduler-lookahead options. `--tools` conflicts
 with `--raw`; raw/unconstrained generation remains available intentionally for
