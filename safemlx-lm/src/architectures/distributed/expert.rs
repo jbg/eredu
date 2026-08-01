@@ -3227,7 +3227,6 @@ fn load_streamed_gguf_ep(
                 metadata,
                 architecture,
                 true,
-                weights_stream,
             )?;
             let assignment =
                 resolve_model_assignment(assignment, args.num_experts as usize, topology)?;
@@ -3313,7 +3312,6 @@ fn load_streamed_gguf_ep(
                 checkpoint,
                 metadata,
                 inkling_mmproj,
-                weights_stream,
             )?;
             let args = prepared.args;
             let assignment = resolve_model_assignment(
@@ -3542,7 +3540,6 @@ fn load_sparse_gguf_ep(
                 checkpoint,
                 metadata,
                 inkling_mmproj,
-                weights_stream,
             )?;
             let args = prepared.args;
             let assignment = resolve_model_assignment(

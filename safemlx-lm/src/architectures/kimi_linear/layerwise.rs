@@ -169,6 +169,20 @@ pub fn load_kimi_linear_layerwise_model(
     weights_stream: &Stream,
 ) -> Result<KimiLinearLayerwiseModel, Error> {
     let model_dir = model_dir.as_ref();
+    let options = options.into();
+    let residency = match options {
+        LayerExecutionLoadOptions::LayerwiseHost(options) => {
+            WeightResidency::LayerwiseHost(options)
+        }
+        LayerExecutionLoadOptions::DenseDiskStream(options) => {
+            WeightResidency::DenseDiskStream(options)
+        }
+    };
+    crate::api::structural::validate_safetensors_load_path(
+        crate::api::ModelKind::KimiLinear,
+        model_dir,
+        crate::api::ModelLoadOptions::default().with_weight_residency(residency),
+    )?;
     let args = resident::get_model_args(model_dir)?;
     args.validate()?;
     let adapter = KimiLinearLayerwiseAdapter::new(args, stream)?;
@@ -349,6 +363,11 @@ fn load_kimi_linear_sparse_expert_cache_model_with_non_expert(
     weights_stream: &Stream,
 ) -> Result<KimiLinearLayerwiseModel, Error> {
     let model_dir = model_dir.as_ref();
+    crate::api::structural::validate_safetensors_load_path(
+        crate::api::ModelKind::KimiLinear,
+        model_dir,
+        crate::api::ModelLoadOptions::default(),
+    )?;
     let args = resident::get_model_args(model_dir)?;
     args.validate()?;
     let adapter = KimiLinearLayerwiseAdapter::new_sparse(args.clone(), stream)?;

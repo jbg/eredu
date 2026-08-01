@@ -323,6 +323,20 @@ pub fn load_qwen3_next_layerwise_model(
     weights_stream: &Stream,
 ) -> Result<QwenHybridLayerwiseModel, Error> {
     let model_dir = model_dir.as_ref();
+    let options = options.into();
+    let residency = match options {
+        LayerExecutionLoadOptions::LayerwiseHost(options) => {
+            WeightResidency::LayerwiseHost(options)
+        }
+        LayerExecutionLoadOptions::DenseDiskStream(options) => {
+            WeightResidency::DenseDiskStream(options)
+        }
+    };
+    crate::api::structural::validate_safetensors_load_path(
+        crate::api::ModelKind::Qwen3Next,
+        model_dir,
+        crate::api::ModelLoadOptions::default().with_weight_residency(residency),
+    )?;
     let args = qwen3_next::get_qwen3_next_model_args(model_dir)?;
     if let Some(config) = &args.quantization_config {
         config.validate_supported()?;
@@ -345,6 +359,20 @@ pub fn load_qwen35_layerwise_model(
     weights_stream: &Stream,
 ) -> Result<QwenHybridLayerwiseModel, Error> {
     let model_dir = model_dir.as_ref();
+    let options = options.into();
+    let residency = match options {
+        LayerExecutionLoadOptions::LayerwiseHost(options) => {
+            WeightResidency::LayerwiseHost(options)
+        }
+        LayerExecutionLoadOptions::DenseDiskStream(options) => {
+            WeightResidency::DenseDiskStream(options)
+        }
+    };
+    crate::api::structural::validate_safetensors_load_path(
+        crate::api::ModelKind::Qwen35Moe,
+        model_dir,
+        crate::api::ModelLoadOptions::default().with_weight_residency(residency),
+    )?;
     let (args, image_token_id, video_token_id, vision) =
         resident::get_qwen3_5_moe_model_args(model_dir)?;
     load_qwen_hybrid_layerwise_model_with_vision(
@@ -368,6 +396,14 @@ pub(crate) fn load_qwen_hybrid_gguf_layerwise_model(
     weights_stream: &Stream,
 ) -> Result<(QwenHybridLayerwiseModel, Vec<u32>, bool), Error> {
     let prepared = resident::prepare_qwen35_gguf_checkpoint(checkpoint, metadata, weights_stream)?;
+    let architecture = crate::api::GgufArchitecture::resolve(&prepared.architecture)?;
+    crate::api::structural::validate_gguf(
+        architecture,
+        checkpoint,
+        metadata,
+        crate::api::ModelLoadOptions::default().with_weight_residency(residency),
+    )
+    .into_loader_result()?;
     let args = prepared.args;
     let is_next = prepared.architecture == "qwen3next";
     let family = if is_next {
@@ -483,6 +519,12 @@ pub fn load_qwen3_next_sparse_expert_cache_model(
     weights_stream: &Stream,
 ) -> Result<QwenHybridLayerwiseModel, Error> {
     let model_dir = model_dir.as_ref();
+    crate::api::structural::validate_safetensors_load_path(
+        crate::api::ModelKind::Qwen3Next,
+        model_dir,
+        crate::api::ModelLoadOptions::default()
+            .with_weight_residency(WeightResidency::SparseExpertCache(options)),
+    )?;
     let args = qwen3_next::get_qwen3_next_model_args(model_dir)?;
     if let Some(config) = &args.quantization_config {
         config.validate_supported()?;
@@ -515,6 +557,12 @@ pub fn load_qwen3_next_sparse_expert_cache_model_with_dense_layers(
     weights_stream: &Stream,
 ) -> Result<QwenHybridLayerwiseModel, Error> {
     let model_dir = model_dir.as_ref();
+    crate::api::structural::validate_safetensors_load_path(
+        crate::api::ModelKind::Qwen3Next,
+        model_dir,
+        crate::api::ModelLoadOptions::default()
+            .with_weight_residency(WeightResidency::SparseExpertCache(options)),
+    )?;
     let args = qwen3_next::get_qwen3_next_model_args(model_dir)?;
     if let Some(config) = &args.quantization_config {
         config.validate_supported()?;
@@ -546,6 +594,12 @@ pub fn load_qwen35_sparse_expert_cache_model(
     weights_stream: &Stream,
 ) -> Result<QwenHybridLayerwiseModel, Error> {
     let model_dir = model_dir.as_ref();
+    crate::api::structural::validate_safetensors_load_path(
+        crate::api::ModelKind::Qwen35Moe,
+        model_dir,
+        crate::api::ModelLoadOptions::default()
+            .with_weight_residency(WeightResidency::SparseExpertCache(options)),
+    )?;
     let (args, image_token_id, video_token_id, vision) =
         resident::get_qwen3_5_moe_model_args(model_dir)?;
     if !args.is_moe() {
@@ -576,6 +630,12 @@ pub fn load_qwen35_sparse_expert_cache_model_with_dense_layers(
     weights_stream: &Stream,
 ) -> Result<QwenHybridLayerwiseModel, Error> {
     let model_dir = model_dir.as_ref();
+    crate::api::structural::validate_safetensors_load_path(
+        crate::api::ModelKind::Qwen35Moe,
+        model_dir,
+        crate::api::ModelLoadOptions::default()
+            .with_weight_residency(WeightResidency::SparseExpertCache(options)),
+    )?;
     let (args, image_token_id, video_token_id, vision) =
         resident::get_qwen3_5_moe_model_args(model_dir)?;
     if !args.is_moe() {

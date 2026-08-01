@@ -815,6 +815,11 @@ pub fn load_personaplex_layerwise_model(
     weights_stream: &Stream,
 ) -> Result<MoshiLayerwiseModel, Error> {
     let model_dir = model_dir.as_ref();
+    crate::api::structural::validate_safetensors_load_path(
+        crate::api::ModelKind::PersonaPlex,
+        model_dir,
+        crate::api::ModelLoadOptions::default(),
+    )?;
     let metadata = crate::architectures::moshi::personaplex::get_model_metadata(model_dir)?;
     let mut args = crate::architectures::moshi::personaplex::model_args_7b_v1();
     args.quantization = metadata.quantization;

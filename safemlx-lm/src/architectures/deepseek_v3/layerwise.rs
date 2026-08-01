@@ -226,6 +226,20 @@ pub fn load_deepseek_v3_layerwise_model(
     weights_stream: &Stream,
 ) -> Result<DeepSeekV3LayerwiseModel, Error> {
     let model_dir = model_dir.as_ref();
+    let options = options.into();
+    let residency = match options {
+        LayerExecutionLoadOptions::LayerwiseHost(options) => {
+            WeightResidency::LayerwiseHost(options)
+        }
+        LayerExecutionLoadOptions::DenseDiskStream(options) => {
+            WeightResidency::DenseDiskStream(options)
+        }
+    };
+    crate::api::structural::validate_safetensors_load_path(
+        crate::api::ModelKind::DeepSeekV3,
+        model_dir,
+        crate::api::ModelLoadOptions::default().with_weight_residency(residency),
+    )?;
     let args = resident::get_model_args(model_dir)?;
     args.validate()?;
     let adapter = DeepSeekV3LayerwiseAdapter::new(args, stream)?;
@@ -247,6 +261,13 @@ pub(crate) fn load_deepseek_v3_gguf_layerwise_model(
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<(DeepSeekV3LayerwiseModel, Vec<u32>), Error> {
+    crate::api::structural::validate_gguf(
+        crate::api::GgufArchitecture::DeepSeek2,
+        checkpoint,
+        metadata,
+        crate::api::ModelLoadOptions::default().with_weight_residency(residency),
+    )
+    .into_loader_result()?;
     let prepared = resident::prepare_gguf_checkpoint(checkpoint, metadata, None, weights_stream)?;
     let args = prepared.args;
     let store: Arc<dyn WeightStore + Send + Sync> =
@@ -455,6 +476,12 @@ fn load_deepseek_v3_sparse_expert_cache_model_with_non_expert(
     weights_stream: &Stream,
 ) -> Result<DeepSeekV3LayerwiseModel, Error> {
     let model_dir = model_dir.as_ref();
+    crate::api::structural::validate_safetensors_load_path(
+        crate::api::ModelKind::DeepSeekV3,
+        model_dir,
+        crate::api::ModelLoadOptions::default()
+            .with_weight_residency(WeightResidency::SparseExpertCache(options)),
+    )?;
     let args = resident::get_model_args(model_dir)?;
     args.validate()?;
     let adapter = DeepSeekV3LayerwiseAdapter::new_sparse(args.clone(), stream)?;

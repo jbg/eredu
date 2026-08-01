@@ -1732,6 +1732,15 @@ fn load_model_impl(
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<Model, Error> {
+    let inspection_options = quantization.map_or_else(
+        crate::api::ModelLoadOptions::default,
+        crate::api::ModelLoadOptions::with_quantization,
+    );
+    crate::api::structural::validate_safetensors_load_path(
+        crate::api::ModelKind::KimiLinear,
+        model_dir,
+        inspection_options,
+    )?;
     let mut args = get_model_args(model_dir)?;
     if let Some(quantization) = quantization {
         quantization.validate()?;
@@ -1803,6 +1812,17 @@ pub(crate) fn load_gguf_checkpoint(
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<LoadedKimiLinearGguf, Error> {
+    let options = quantization.map_or_else(
+        crate::api::ModelLoadOptions::default,
+        crate::api::ModelLoadOptions::with_quantization,
+    );
+    crate::api::structural::validate_gguf(
+        crate::api::GgufArchitecture::KimiLinear,
+        checkpoint,
+        &metadata,
+        options,
+    )
+    .into_loader_result()?;
     let prepared = prepare_gguf_checkpoint(checkpoint, &metadata, quantization, weights_stream)?;
     let args = prepared.args;
     let mut model = Model::new(args.clone(), stream)?;
@@ -1883,7 +1903,7 @@ pub(crate) fn prepare_gguf_checkpoint(
     checkpoint: &GgufCheckpoint,
     metadata: &HashMap<String, GgufMetadataValue>,
     quantization: Option<WeightQuantization>,
-    weights_stream: &Stream,
+    _weights_stream: &Stream,
 ) -> Result<PreparedKimiLinearGguf, Error> {
     let architecture = gguf_string(metadata, "general.architecture")?;
     if architecture != "kimi-linear" {
@@ -1895,7 +1915,7 @@ pub(crate) fn prepare_gguf_checkpoint(
         .catalog()
         .translated_outputs(translate_gguf_weight_name)
         .map_err(safemlx::error::IoError::from)?;
-    let mut args = args_from_gguf(checkpoint, metadata, weights_stream)?;
+    let mut args = model_args_from_gguf_catalog(checkpoint, metadata)?;
     let mut formats = gguf_quantization_configs(checkpoint, translate_gguf_weight_name)?;
     combine_expert_gate_up_formats(&mut formats, &args)?;
     if let Some(quantization) = quantization {
@@ -2066,10 +2086,10 @@ pub(crate) fn translate_gguf_weight_name(name: &str) -> String {
     name.to_owned()
 }
 
-fn args_from_gguf(
+/// Parses and validates Kimi Linear geometry using GGUF metadata and catalog names only.
+pub(crate) fn model_args_from_gguf_catalog(
     checkpoint: &GgufCheckpoint,
     metadata: &HashMap<String, GgufMetadataValue>,
-    _stream: &Stream,
 ) -> Result<ModelArgs, Error> {
     let architecture = "kimi-linear";
     let key = |suffix: &str| format!("{architecture}.{suffix}");

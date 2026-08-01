@@ -36,7 +36,7 @@ use crate::{
             moe::PackedSwiGluExperts,
         },
         input,
-        qwen3::{gguf_i32, gguf_string},
+        qwen3::{gguf_i32_catalog, gguf_string},
     },
     error::Error,
     runtime::cache::residency::{
@@ -217,7 +217,7 @@ impl TextArgs {
             .as_ref()
             .and_then(|configs| configs.get(name).copied())
     }
-    fn dense_intermediate_size(&self) -> i32 {
+    pub(crate) fn dense_intermediate_size(&self) -> i32 {
         self.dense_intermediate_size
             .unwrap_or(self.intermediate_size)
     }
@@ -226,7 +226,7 @@ impl TextArgs {
         self.moe_intermediate_size.unwrap_or(self.intermediate_size)
     }
 
-    fn is_local(&self, layer: i32) -> bool {
+    pub(crate) fn is_local(&self, layer: i32) -> bool {
         if let Some(ids) = &self.local_layer_ids {
             return ids.contains(&layer);
         }
@@ -247,7 +247,7 @@ impl TextArgs {
         layer < self.dense_mlp_idx
     }
 
-    fn q_heads(&self, local: bool) -> i32 {
+    pub(crate) fn q_heads(&self, local: bool) -> i32 {
         if local {
             self.swa_num_attention_heads
                 .unwrap_or(self.num_attention_heads)
@@ -256,7 +256,7 @@ impl TextArgs {
         }
     }
 
-    fn kv_heads(&self, local: bool) -> i32 {
+    pub(crate) fn kv_heads(&self, local: bool) -> i32 {
         if local {
             self.swa_num_key_value_heads
                 .unwrap_or(self.num_key_value_heads)
@@ -265,7 +265,7 @@ impl TextArgs {
         }
     }
 
-    fn attention_head_dim(&self, local: bool) -> i32 {
+    pub(crate) fn attention_head_dim(&self, local: bool) -> i32 {
         if local {
             self.swa_head_dim.unwrap_or(self.head_dim)
         } else {
@@ -2021,8 +2021,7 @@ pub(crate) fn load_gguf_checkpoint_with_mmproj(
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<LoadedInklingGguf, Error> {
-    let prepared =
-        prepare_gguf_checkpoint_with_mmproj(checkpoint, &metadata, mmproj, weights_stream)?;
+    let prepared = prepare_gguf_checkpoint_with_mmproj(checkpoint, &metadata, mmproj)?;
     let mut model = Model::new(prepared.args, stream)?;
     let config = StrictLoadConfig::default();
     let mut report = StrictLoadReport::default();
@@ -2131,7 +2130,6 @@ pub(crate) fn prepare_gguf_checkpoint_with_mmproj(
     checkpoint: &GgufCheckpoint,
     metadata: &HashMap<String, GgufMetadataValue>,
     mmproj: Option<&InklingMmprojGguf>,
-    stream: &Stream,
 ) -> Result<PreparedInklingGguf, Error> {
     let architecture = gguf_string(metadata, "general.architecture")?;
     if architecture != "inkling" {
@@ -2143,8 +2141,19 @@ pub(crate) fn prepare_gguf_checkpoint_with_mmproj(
         .catalog()
         .translated_outputs(translate_gguf_weight_name)
         .map_err(safemlx::error::IoError::from)?;
+    crate::api::structural::validate_gguf(
+        crate::api::GgufArchitecture::Inkling,
+        checkpoint,
+        metadata,
+        crate::api::ModelLoadOptions::default(),
+    )
+    .into_loader_result()?;
+    if let Some(mmproj) = mmproj {
+        crate::api::structural::validate_inkling_mmproj_gguf(metadata, mmproj)
+            .into_loader_result()?;
+    }
     let mut configs = gguf_quantization_configs(checkpoint, translate_gguf_weight_name)?;
-    let mut args = args_from_gguf(metadata, stream)?;
+    let mut args = args_from_gguf_catalog(metadata)?;
     for layer in args.text_config.dense_mlp_idx..args.text_config.num_hidden_layers {
         for prefix in [
             format!("model.layers.{layer}.moe.experts"),
@@ -2167,7 +2176,7 @@ pub(crate) fn prepare_gguf_checkpoint_with_mmproj(
     }
     args.text_config.quantized_weight_configs = Some(configs);
     if let Some(mmproj) = mmproj {
-        apply_mmproj_args(&mut args, metadata, mmproj, stream)?;
+        apply_mmproj_args(&mut args, metadata, mmproj)?;
     }
     validate_args(&args)?;
     Ok(PreparedInklingGguf {
@@ -2213,11 +2222,10 @@ pub(crate) fn validate_mmproj_metadata(
     Ok(())
 }
 
-fn apply_mmproj_args(
+pub(crate) fn apply_mmproj_args(
     args: &mut ModelArgs,
     model_metadata: &HashMap<String, GgufMetadataValue>,
     mmproj: &InklingMmprojGguf,
-    stream: &Stream,
 ) -> Result<(), Error> {
     validate_mmproj_metadata(&mmproj.metadata)?;
     mmproj
@@ -2245,9 +2253,9 @@ fn apply_mmproj_args(
         ));
     }
 
-    let vision_hidden = gguf_i32(&mmproj.metadata, "clip.vision.projection_dim", stream)?;
-    let audio_hidden = gguf_i32(&mmproj.metadata, "clip.audio.projection_dim", stream)?;
-    let audio_embedding = gguf_i32(&mmproj.metadata, "clip.audio.embedding_length", stream)?;
+    let vision_hidden = gguf_i32_catalog(&mmproj.metadata, "clip.vision.projection_dim")?;
+    let audio_hidden = gguf_i32_catalog(&mmproj.metadata, "clip.audio.projection_dim")?;
+    let audio_embedding = gguf_i32_catalog(&mmproj.metadata, "clip.audio.embedding_length")?;
     if vision_hidden != args.text_config.hidden_size
         || audio_hidden != args.text_config.hidden_size
         || audio_embedding != args.text_config.hidden_size
@@ -2257,8 +2265,8 @@ fn apply_mmproj_args(
             args.text_config.hidden_size
         )));
     }
-    let patch_size = gguf_i32(&mmproj.metadata, "clip.vision.patch_size", stream)?;
-    let image_size = gguf_i32(&mmproj.metadata, "clip.vision.image_size", stream)?;
+    let patch_size = gguf_i32_catalog(&mmproj.metadata, "clip.vision.patch_size")?;
+    let image_size = gguf_i32_catalog(&mmproj.metadata, "clip.vision.image_size")?;
     if image_size != patch_size {
         return Err(Error::UnsupportedArchitecture(format!(
             "Inkling mmproj image_size {image_size} does not match patch_size {patch_size}"
@@ -2274,15 +2282,15 @@ fn apply_mmproj_args(
         text_hidden_size: vision_hidden,
         patch_size,
         temporal_patch_size: 2,
-        num_channels: gguf_i32(&mmproj.metadata, "clip.vision.embedding_length", stream)?,
-        num_hidden_layers: gguf_i32(&mmproj.metadata, "clip.vision.block_count", stream)?,
+        num_channels: gguf_i32_catalog(&mmproj.metadata, "clip.vision.embedding_length")?,
+        num_hidden_layers: gguf_i32_catalog(&mmproj.metadata, "clip.vision.block_count")?,
         use_vision_norm: true,
         rms_norm_eps: vision_eps,
         quantized_weight_configs: Some(vision_configs),
     });
     args.audio_config = Some(AudioArgs {
         text_hidden_size: audio_hidden,
-        num_codebooks: gguf_i32(&mmproj.metadata, "clip.audio.num_mel_bins", stream)?,
+        num_codebooks: gguf_i32_catalog(&mmproj.metadata, "clip.audio.num_mel_bins")?,
         codebook_size: 16,
         bias: false,
         use_audio_norm: true,
@@ -2313,6 +2321,7 @@ fn apply_mmproj_args(
             )));
         }
     }
+    validate_args(args)?;
     Ok(())
 }
 
@@ -2340,12 +2349,16 @@ pub(crate) fn translate_mmproj_weight_name(name: &str) -> String {
     name.to_string()
 }
 
-fn args_from_gguf(
+pub(crate) fn args_from_gguf_catalog(
     metadata: &HashMap<String, GgufMetadataValue>,
-    stream: &Stream,
 ) -> Result<ModelArgs, Error> {
     let key = |suffix: &str| format!("inkling.{suffix}");
-    let layers = gguf_i32(metadata, &key("block_count"), stream)?;
+    let layers = gguf_i32_catalog(metadata, &key("block_count"))?;
+    if layers <= 0 {
+        return Err(Error::UnsupportedArchitecture(format!(
+            "Inkling block_count must be positive, got {layers}"
+        )));
+    }
     let pattern = gguf_bool_pattern(metadata, &key("attention.sliding_window_pattern"), layers)?;
     let kv_values = metadata
         .get(&key("attention.head_count_kv"))
@@ -2363,6 +2376,11 @@ fn args_from_gguf(
             "Inkling GGUF attention.head_count_kv length does not match block_count".into(),
         ));
     }
+    if kv_values.iter().any(|value| *value <= 0) {
+        return Err(Error::UnsupportedArchitecture(
+            "Inkling GGUF attention.head_count_kv values must be positive".into(),
+        ));
+    }
     let global_kv = kv_values
         .iter()
         .zip(&pattern)
@@ -2373,12 +2391,17 @@ fn args_from_gguf(
         .zip(&pattern)
         .find_map(|(value, local)| local.then_some(*value))
         .unwrap_or(global_kv);
-    let hidden_size = gguf_i32(metadata, &key("embedding_length"), stream)?;
-    let heads = gguf_i32(metadata, &key("attention.head_count"), stream)?;
+    let hidden_size = gguf_i32_catalog(metadata, &key("embedding_length"))?;
+    let heads = gguf_i32_catalog(metadata, &key("attention.head_count"))?;
+    if hidden_size <= 0 || heads <= 0 {
+        return Err(Error::UnsupportedArchitecture(
+            "Inkling GGUF embedding length and attention head count must be positive".into(),
+        ));
+    }
     let head_dim =
         gguf_optional_i32(metadata, &key("attention.key_length"))?.unwrap_or(hidden_size / heads);
-    let vocab_size = gguf_vocab_size(metadata, &key("vocab_size"), stream)?;
-    Ok(ModelArgs {
+    let vocab_size = gguf_vocab_size(metadata, &key("vocab_size"))?;
+    let args = ModelArgs {
         model_type: "inkling_mm_model".into(),
         text_config: TextArgs {
             torch_dtype: None,
@@ -2395,7 +2418,7 @@ fn args_from_gguf(
                 Error::UnsupportedArchitecture("Inkling local KV heads exceed i32".into())
             })?),
             swa_head_dim: Some(head_dim),
-            sliding_window_size: gguf_i32(metadata, &key("attention.sliding_window"), stream)?,
+            sliding_window_size: gguf_i32_catalog(metadata, &key("attention.sliding_window"))?,
             local_layer_ids: Some(
                 pattern
                     .iter()
@@ -2404,12 +2427,12 @@ fn args_from_gguf(
                     .collect(),
             ),
             layer_types: None,
-            dense_mlp_idx: gguf_i32(metadata, &key("dense_block_count"), stream)?,
+            dense_mlp_idx: gguf_i32_catalog(metadata, &key("dense_block_count"))?,
             mlp_layer_types: None,
-            sconv_kernel_size: gguf_i32(metadata, &key("shortconv_kernel"), stream)?,
+            sconv_kernel_size: gguf_i32_catalog(metadata, &key("shortconv_kernel"))?,
             use_sconv: true,
-            rel_extent: gguf_i32(metadata, &key("rel_extent"), stream)?,
-            d_rel: gguf_i32(metadata, &key("d_rel"), stream)?,
+            rel_extent: gguf_i32_catalog(metadata, &key("rel_extent"))?,
+            d_rel: gguf_i32_catalog(metadata, &key("d_rel"))?,
             log_scaling_n_floor: gguf_optional_i32(metadata, &key("log_scaling_n_floor"))?
                 .filter(|value| *value > 0),
             log_scaling_alpha: gguf_optional_f32(metadata, &key("log_scaling_alpha"))?
@@ -2420,12 +2443,12 @@ fn args_from_gguf(
             logits_mup_width_multiplier: gguf_optional_f32(metadata, &key("logit_scale_denom"))?
                 .unwrap_or(1.0),
             final_logit_softcapping: None,
-            intermediate_size: gguf_i32(metadata, &key("expert_feed_forward_length"), stream)?,
-            dense_intermediate_size: Some(gguf_i32(metadata, &key("feed_forward_length"), stream)?),
+            intermediate_size: gguf_i32_catalog(metadata, &key("expert_feed_forward_length"))?,
+            dense_intermediate_size: Some(gguf_i32_catalog(metadata, &key("feed_forward_length"))?),
             moe_intermediate_size: None,
-            n_routed_experts: gguf_i32(metadata, &key("expert_count"), stream)?,
-            num_experts_per_tok: gguf_i32(metadata, &key("expert_used_count"), stream)?,
-            n_shared_experts: gguf_i32(metadata, &key("expert_shared_count"), stream)?,
+            n_routed_experts: gguf_i32_catalog(metadata, &key("expert_count"))?,
+            num_experts_per_tok: gguf_i32_catalog(metadata, &key("expert_used_count"))?,
+            n_shared_experts: gguf_i32_catalog(metadata, &key("expert_shared_count"))?,
             route_scale: gguf_optional_f32(metadata, &key("expert_weights_scale"))?.unwrap_or(1.0),
             shared_expert_sink: true,
             use_gate_bias: true,
@@ -2436,7 +2459,7 @@ fn args_from_gguf(
             attention_dropout: 0.0,
             q_bias: false,
             o_bias: false,
-            model_max_length: Some(gguf_i32(metadata, &key("context_length"), stream)?),
+            model_max_length: Some(gguf_i32_catalog(metadata, &key("context_length"))?),
             quantized_weight_configs: None,
         },
         audio_config: None,
@@ -2444,7 +2467,9 @@ fn args_from_gguf(
         image_token_id: default_image_token_id(),
         audio_token_id: default_audio_token_id(),
         eos_token_id: crate::api::gguf_eos_token_ids(metadata)?.first().copied(),
-    })
+    };
+    validate_args(&args)?;
+    Ok(args)
 }
 
 fn gguf_bool_pattern(
@@ -2478,7 +2503,6 @@ fn gguf_bool_pattern(
 fn gguf_vocab_size(
     metadata: &HashMap<String, GgufMetadataValue>,
     fallback: &str,
-    stream: &Stream,
 ) -> Result<i32, Error> {
     match metadata
         .get("tokenizer.ggml.tokens")
@@ -2492,7 +2516,7 @@ fn gguf_vocab_size(
                 "GGUF tokenizer.ggml.tokens metadata has the wrong type".into(),
             ))
         }
-        None => gguf_i32(metadata, fallback, stream),
+        None => gguf_i32_catalog(metadata, fallback),
     }
 }
 
@@ -2619,15 +2643,21 @@ pub fn load_tokenizer(model_dir: impl AsRef<Path>) -> Result<Tokenizer, Error> {
 pub fn get_model_args(model_dir: impl AsRef<Path>) -> Result<ModelArgs, Error> {
     let value: Value =
         serde_json::from_reader(std::fs::File::open(model_dir.as_ref().join("config.json"))?)?;
-    validate_model_config_value(&value)?;
-    Ok(serde_json::from_value(value)?)
+    model_args_from_config_value(&value)
 }
 
-pub fn validate_model_config_value(value: &Value) -> Result<(), Error> {
+/// Parses the same validated configuration used by loading without creating
+/// Inkling's text or media module trees.
+pub(crate) fn model_args_from_config_value(value: &Value) -> Result<ModelArgs, Error> {
     let args: ModelArgs = serde_json::from_value(value.clone()).map_err(|error| {
         Error::UnsupportedArchitecture(format!("invalid Inkling config: {error}"))
     })?;
-    validate_args(&args)
+    validate_args(&args)?;
+    Ok(args)
+}
+
+pub fn validate_model_config_value(value: &Value) -> Result<(), Error> {
+    model_args_from_config_value(value).map(|_| ())
 }
 
 fn validate_args(args: &ModelArgs) -> Result<(), Error> {
@@ -2689,17 +2719,37 @@ fn validate_args(args: &ModelArgs) -> Result<(), Error> {
                 .into(),
         ));
     }
-    if text.num_attention_heads % text.num_key_value_heads != 0
-        || text.q_heads(true) % text.kv_heads(true) != 0
-        || text.attention_head_dim(true) != text.head_dim
-    {
-        return Err(Error::UnsupportedArchitecture(
-            "Inkling attention head configuration is inconsistent".into(),
-        ));
+    for local in [false, true] {
+        let query_heads = text.q_heads(local);
+        let kv_heads = text.kv_heads(local);
+        let head_dim = text.attention_head_dim(local);
+        if query_heads <= 0
+            || kv_heads <= 0
+            || head_dim <= 0
+            || query_heads % kv_heads != 0
+            || (local && head_dim != text.head_dim)
+            || query_heads.checked_mul(head_dim).is_none()
+            || kv_heads.checked_mul(head_dim).is_none()
+            || query_heads.checked_mul(text.d_rel).is_none()
+        {
+            return Err(Error::UnsupportedArchitecture(
+                "Inkling attention head configuration is inconsistent or overflows i32".into(),
+            ));
+        }
     }
     if text.dense_intermediate_size() <= 0 || text.moe_intermediate_size() <= 0 {
         return Err(Error::UnsupportedArchitecture(
             "Inkling dense and MoE intermediate sizes must be positive".into(),
+        ));
+    }
+    if text
+        .n_routed_experts
+        .checked_add(text.n_shared_experts)
+        .is_none()
+        || text.moe_intermediate_size().checked_mul(2).is_none()
+    {
+        return Err(Error::UnsupportedArchitecture(
+            "Inkling expert geometry overflows i32".into(),
         ));
     }
     if text.num_experts_per_tok > text.n_routed_experts
@@ -2728,6 +2778,10 @@ fn validate_args(args: &ModelArgs) -> Result<(), Error> {
             || audio.bias
             || !audio.use_audio_norm
             || audio.audio_mode != "dmel"
+            || audio
+                .num_codebooks
+                .checked_mul(audio.codebook_size)
+                .is_none()
         {
             return Err(Error::UnsupportedArchitecture(
                 "Inkling audio configuration is inconsistent with the text decoder".into(),
@@ -2765,6 +2819,11 @@ pub fn load_model(
     weights_stream: &Stream,
 ) -> Result<Model, Error> {
     let model_dir = model_dir.as_ref();
+    crate::api::structural::validate_safetensors_load_path(
+        crate::api::ModelKind::Inkling,
+        model_dir,
+        crate::api::ModelLoadOptions::default(),
+    )?;
     let args = get_model_args(model_dir)?;
     let mut model = Model::new(args, stream)?;
     let config = StrictLoadConfig::default().allow_unused_prefix("model.mtp.");
@@ -3113,8 +3172,6 @@ mod tests {
                 safemlx::Array::ones::<f32>(&[32], stream).unwrap(),
             ),
         ]);
-        let main_fixture =
-            crate::test_utils::SyntheticGguf::dense(&main_arrays, &tiny_gguf_metadata());
         let mmproj_fixture = crate::test_utils::SyntheticGguf::with_packed_tensors(
             &mmproj_arrays,
             &tiny_mmproj_metadata(),
@@ -3123,27 +3180,24 @@ mod tests {
                     .then_some(safemlx_gguf::GgmlType::Q4_0)
             },
         );
+        let main_fixture =
+            crate::test_utils::SyntheticGguf::dense(&main_arrays, &tiny_gguf_metadata());
         let checkpoint = GgufCheckpoint::open(main_fixture.path()).unwrap();
         let mmproj_checkpoint = GgufCheckpoint::open(mmproj_fixture.path()).unwrap();
         let mmproj = super::InklingMmprojGguf {
             metadata: tiny_mmproj_metadata(),
             checkpoint: mmproj_checkpoint,
         };
-        let prepared = super::prepare_gguf_checkpoint_with_mmproj(
-            &checkpoint,
-            &tiny_gguf_metadata(),
-            Some(&mmproj),
-            stream,
-        )
-        .unwrap();
-        let audio = prepared.args.audio_config.unwrap();
-        let vision = prepared.args.vision_config.unwrap();
+        let mut args = super::args_from_gguf_catalog(&tiny_gguf_metadata()).unwrap();
+        super::apply_mmproj_args(&mut args, &tiny_gguf_metadata(), &mmproj).unwrap();
+        assert_eq!(args.audio_token_id, 62);
+        assert_eq!(args.image_token_id, 63);
+        let audio = args.audio_config.unwrap();
+        let vision = args.vision_config.unwrap();
         assert_eq!(audio.num_codebooks, 80);
         assert_eq!(audio.codebook_size, 16);
         assert_eq!(vision.patch_size, 40);
         assert_eq!(vision.temporal_patch_size, 2);
-        assert_eq!(prepared.args.audio_token_id, 62);
-        assert_eq!(prepared.args.image_token_id, 63);
         let audio_quantization = audio
             .quantized_weight_configs
             .as_ref()
@@ -3299,8 +3353,7 @@ mod tests {
                 GgufMetadataValue::Uint32(1),
             ),
         ]);
-        let context = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
-        let args = super::args_from_gguf(&metadata, context.stream()).unwrap();
+        let args = super::args_from_gguf_catalog(&metadata).unwrap();
         super::validate_args(&args).unwrap();
         assert_eq!(args.text_config.local_layer_ids, Some(vec![0]));
         assert_eq!(args.text_config.swa_num_key_value_heads, Some(2));

@@ -32,7 +32,7 @@ use crate::{
             moe::{PackedSwiGluExperts, TopKRouterScoreFunction},
         },
         input,
-        qwen3::{gguf_i32, gguf_string},
+        qwen3::gguf_string,
     },
     error::Error,
     nn::tensor::{
@@ -205,7 +205,7 @@ impl ModelArgs {
             .and_then(|value| LayerType::parse(value))
     }
 
-    fn dense_intermediate_size(&self) -> i32 {
+    pub(crate) fn dense_intermediate_size(&self) -> i32 {
         let mut size = self.block_ff_dim.unwrap_or(self.intermediate_size);
         if self.block_auto_adjust_ff_dim {
             size = 2 * size / 3;
@@ -228,7 +228,7 @@ impl ModelArgs {
         }
     }
 
-    fn weight_quantization(&self) -> Option<WeightQuantization> {
+    pub(crate) fn weight_quantization(&self) -> Option<WeightQuantization> {
         self.quantization.or(self.quantization_config)
     }
 
@@ -250,9 +250,15 @@ impl ModelArgs {
 
 /// Validates a parsed LFM2 configuration.
 pub(crate) fn validate_model_config_value(config: &Value) -> Result<(), Error> {
+    model_args_from_config_value(config).map(|_| ())
+}
+
+/// Parses and validates arguments shared by inspection and model loading.
+pub(crate) fn model_args_from_config_value(config: &Value) -> Result<ModelArgs, Error> {
     let args: ModelArgs = serde_json::from_value(config.clone())
         .map_err(|error| Error::UnsupportedArchitecture(format!("invalid LFM2 config: {error}")))?;
-    validate_args(&args)
+    validate_args(&args)?;
+    Ok(args)
 }
 
 fn validate_args(args: &ModelArgs) -> Result<(), Error> {
@@ -1186,8 +1192,7 @@ pub type Generate<'a, S = crate::runtime::generation::sampler::DefaultSampler> =
 pub fn get_model_args(model_dir: impl AsRef<Path>) -> Result<ModelArgs, Error> {
     let value: Value =
         serde_json::from_reader(std::fs::File::open(model_dir.as_ref().join("config.json"))?)?;
-    validate_model_config_value(&value)?;
-    Ok(serde_json::from_value(value)?)
+    model_args_from_config_value(&value)
 }
 
 /// Loads an LFM2 safetensors checkpoint.
@@ -1197,6 +1202,11 @@ pub fn load_model(
     weights_stream: &Stream,
 ) -> Result<Model, Error> {
     let model_dir = model_dir.as_ref();
+    crate::api::structural::validate_safetensors_load_path(
+        crate::api::ModelKind::Lfm2,
+        model_dir,
+        crate::api::ModelLoadOptions::default(),
+    )?;
     let args = get_model_args(model_dir)?;
     let mut model = Model::new(args.clone(), stream)?;
     let config = StrictLoadConfig::default();
@@ -1228,6 +1238,11 @@ pub fn load_model_quantized(
     weights_stream: &Stream,
 ) -> Result<Model, Error> {
     let model_dir = model_dir.as_ref();
+    crate::api::structural::validate_safetensors_load_path(
+        crate::api::ModelKind::Lfm2,
+        model_dir,
+        crate::api::ModelLoadOptions::with_quantization(quantization),
+    )?;
     let mut args = get_model_args(model_dir)?;
     if !crate::runtime::checkpoint::quantization::should_quantize_on_load(
         "LFM2",
@@ -1310,7 +1325,15 @@ pub(crate) fn load_gguf_checkpoint(
         )));
     }
     let is_moe = architecture == "lfm2moe";
-    let mut args = args_from_gguf(checkpoint, &metadata, &architecture, is_moe, weights_stream)?;
+    let gguf_architecture = crate::api::GgufArchitecture::resolve(&architecture)?;
+    crate::api::structural::validate_gguf(
+        gguf_architecture,
+        checkpoint,
+        &metadata,
+        crate::api::ModelLoadOptions::default(),
+    )
+    .into_loader_result()?;
+    let mut args = args_from_gguf_catalog(checkpoint, &metadata, &architecture, is_moe)?;
     let translate = |name: &str| translate_gguf_weight_name(name, is_moe);
     checkpoint
         .catalog()
@@ -1416,7 +1439,7 @@ pub(crate) fn load_gguf_checkpoint(
 pub(crate) fn prepare_gguf_checkpoint(
     checkpoint: &GgufCheckpoint,
     metadata: &HashMap<String, GgufMetadataValue>,
-    weights_stream: &Stream,
+    _weights_stream: &Stream,
 ) -> Result<PreparedLfm2Gguf, Error> {
     let architecture = gguf_string(metadata, "general.architecture")?;
     if !matches!(architecture.as_str(), "lfm2" | "lfm2moe") {
@@ -1425,7 +1448,15 @@ pub(crate) fn prepare_gguf_checkpoint(
         )));
     }
     let is_moe = architecture == "lfm2moe";
-    let mut args = args_from_gguf(checkpoint, metadata, &architecture, is_moe, weights_stream)?;
+    let gguf_architecture = crate::api::GgufArchitecture::resolve(&architecture)?;
+    crate::api::structural::validate_gguf(
+        gguf_architecture,
+        checkpoint,
+        metadata,
+        crate::api::ModelLoadOptions::default(),
+    )
+    .into_loader_result()?;
+    let mut args = args_from_gguf_catalog(checkpoint, metadata, &architecture, is_moe)?;
     let translate = |name: &str| translate_gguf_weight_name(name, is_moe);
     checkpoint
         .catalog()
@@ -1452,15 +1483,20 @@ pub(crate) fn prepare_gguf_checkpoint(
     })
 }
 
-fn args_from_gguf(
+/// Parses GGUF arguments without creating an MLX stream.
+pub(crate) fn args_from_gguf_catalog(
     arrays: &impl GgufTensorNames,
     metadata: &HashMap<String, GgufMetadataValue>,
     architecture: &str,
     is_moe: bool,
-    stream: &Stream,
 ) -> Result<ModelArgs, Error> {
     let key = |suffix: &str| format!("{architecture}.{suffix}");
-    let num_hidden_layers = gguf_i32(metadata, &key("block_count"), stream)?;
+    let num_hidden_layers = gguf_i32_catalog(metadata, &key("block_count"))?;
+    if num_hidden_layers <= 0 {
+        return Err(Error::UnsupportedArchitecture(format!(
+            "LFM2 GGUF block count must be positive, got {num_hidden_layers}"
+        )));
+    }
     let kv_heads = expand_layer_values(
         &key("attention.head_count_kv"),
         gguf_i64_values(metadata, &key("attention.head_count_kv"))?,
@@ -1489,22 +1525,22 @@ fn args_from_gguf(
                 "GGUF tokenizer.ggml.tokens metadata has the wrong type".into(),
             ));
         }
-        None => gguf_i32(metadata, &key("vocab_size"), stream)?,
+        None => gguf_i32_catalog(metadata, &key("vocab_size"))?,
     };
     let expert_bias_name =
         |name: &str| name.contains("ffn_exp_probs_b") || name.contains("exp_probs_b");
-    Ok(ModelArgs {
+    let args = ModelArgs {
         model_type: if is_moe { "lfm2_moe" } else { "lfm2" }.into(),
         vocab_size,
-        hidden_size: gguf_i32(metadata, &key("embedding_length"), stream)?,
-        intermediate_size: gguf_i32(metadata, &key("feed_forward_length"), stream)?,
+        hidden_size: gguf_i32_catalog(metadata, &key("embedding_length"))?,
+        intermediate_size: gguf_i32_catalog(metadata, &key("feed_forward_length"))?,
         num_hidden_layers,
-        num_attention_heads: gguf_i32(metadata, &key("attention.head_count"), stream)?,
+        num_attention_heads: gguf_i32_catalog(metadata, &key("attention.head_count"))?,
         num_key_value_heads,
-        max_position_embeddings: gguf_i32(metadata, &key("context_length"), stream)?,
+        max_position_embeddings: gguf_i32_catalog(metadata, &key("context_length"))?,
         norm_eps: gguf_f32(metadata, &key("attention.layer_norm_rms_epsilon"))?,
         layer_types,
-        conv_l_cache: gguf_i32(metadata, &key("shortconv.l_cache"), stream)?,
+        conv_l_cache: gguf_i32_catalog(metadata, &key("shortconv.l_cache"))?,
         conv_bias: arrays
             .any_gguf_tensor(|name| name.contains("shortconv") && name.ends_with(".bias")),
         block_multiple_of: 1,
@@ -1517,22 +1553,22 @@ fn args_from_gguf(
             .unwrap_or_else(default_rope_theta),
         rope_parameters: None,
         moe_intermediate_size: if is_moe {
-            gguf_i32(metadata, &key("expert_feed_forward_length"), stream)?
+            gguf_i32_catalog(metadata, &key("expert_feed_forward_length"))?
         } else {
             0
         },
         num_dense_layers: if is_moe {
-            gguf_i32(metadata, &key("leading_dense_block_count"), stream)?
+            gguf_i32_catalog(metadata, &key("leading_dense_block_count"))?
         } else {
             0
         },
         num_experts: if is_moe {
-            gguf_i32(metadata, &key("expert_count"), stream)?
+            gguf_i32_catalog(metadata, &key("expert_count"))?
         } else {
             0
         },
         num_experts_per_tok: if is_moe {
-            gguf_i32(metadata, &key("expert_used_count"), stream)?
+            gguf_i32_catalog(metadata, &key("expert_used_count"))?
         } else {
             0
         },
@@ -1548,7 +1584,9 @@ fn args_from_gguf(
         quantization_config: None,
         quantized_weights: None,
         quantized_weight_configs: None,
-    })
+    };
+    validate_args(&args)?;
+    Ok(args)
 }
 
 pub(crate) fn translate_gguf_weight_name(name: &str, is_moe: bool) -> String {
@@ -1630,6 +1668,18 @@ fn gguf_i64_values(
         .ok_or_else(|| {
             Error::UnsupportedArchitecture(format!("GGUF metadata is missing numeric key {key:?}"))
         })
+}
+
+fn gguf_i32_catalog(
+    metadata: &HashMap<String, GgufMetadataValue>,
+    key: &str,
+) -> Result<i32, Error> {
+    let value = gguf_optional_i64(metadata, key)?.ok_or_else(|| {
+        Error::UnsupportedArchitecture(format!("GGUF metadata is missing required key {key:?}"))
+    })?;
+    i32::try_from(value).map_err(|_| {
+        Error::UnsupportedArchitecture(format!("GGUF metadata value {key:?} exceeds i32"))
+    })
 }
 
 fn gguf_optional_i64(

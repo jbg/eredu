@@ -226,6 +226,20 @@ pub fn load_inkling_layerwise_model(
     weights_stream: &Stream,
 ) -> Result<InklingLayerwiseModel, Error> {
     let model_dir = model_dir.as_ref();
+    let options = options.into();
+    let residency = match options {
+        LayerExecutionLoadOptions::LayerwiseHost(options) => {
+            WeightResidency::LayerwiseHost(options)
+        }
+        LayerExecutionLoadOptions::DenseDiskStream(options) => {
+            WeightResidency::DenseDiskStream(options)
+        }
+    };
+    crate::api::structural::validate_safetensors_load_path(
+        crate::api::ModelKind::Inkling,
+        model_dir,
+        crate::api::ModelLoadOptions::default().with_weight_residency(residency),
+    )?;
     let args = resident::get_model_args(model_dir)?;
     let adapter = InklingLayerwiseAdapter::new(args, stream)?;
     Ok(InklingLayerwiseModel {
@@ -247,12 +261,14 @@ pub(crate) fn load_inkling_gguf_layerwise_model(
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<(InklingLayerwiseModel, Vec<u32>), Error> {
-    let prepared = resident::prepare_gguf_checkpoint_with_mmproj(
+    crate::api::structural::validate_gguf(
+        crate::api::GgufArchitecture::Inkling,
         checkpoint,
         metadata,
-        mmproj,
-        weights_stream,
-    )?;
+        crate::api::ModelLoadOptions::default().with_weight_residency(residency),
+    )
+    .into_loader_result()?;
+    let prepared = resident::prepare_gguf_checkpoint_with_mmproj(checkpoint, metadata, mmproj)?;
     let store = inkling_gguf_store(checkpoint, mmproj, residency.max_mapped_shards())?;
     let args = prepared.args;
     let execution = match residency {
@@ -392,6 +408,12 @@ fn load_inkling_sparse_expert_cache_model_with_non_expert(
     weights_stream: &Stream,
 ) -> Result<InklingLayerwiseModel, Error> {
     let model_dir = model_dir.as_ref();
+    crate::api::structural::validate_safetensors_load_path(
+        crate::api::ModelKind::Inkling,
+        model_dir,
+        crate::api::ModelLoadOptions::default()
+            .with_weight_residency(WeightResidency::SparseExpertCache(options)),
+    )?;
     let args = resident::get_model_args(model_dir)?;
     if args.text_config.n_routed_experts <= 0
         || !(0..args.text_config.num_hidden_layers).any(|layer| !args.text_config.is_dense(layer))

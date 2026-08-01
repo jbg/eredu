@@ -279,6 +279,7 @@ pub use loaded::LoadedModel;
 use loaded::{final_token_logits, load_gguf_model_data};
 
 mod inspection;
+pub(crate) mod structural;
 pub use inspection::{
     inspect_model, ArtifactKind, ArtifactModality, ArtifactTensorEncoding, InspectionIssue,
     InspectionIssueCode, InspectionReadiness, InspectionRequirement, InspectionSeverity,
@@ -329,6 +330,7 @@ fn load_model_for_kind(
     weights_stream: &Stream,
 ) -> Result<Model, Error> {
     validate_load_policy(kind, ArtifactLoadKind::Safetensors, options)?;
+    structural::validate_safetensors_load_path(kind, model_dir, options)?;
     if let WeightResidency::SparseExpertCacheWithDenseLayers(combined) = options.weight_residency {
         if options.quantization.is_some() {
             return Err(Error::Quantization(format!(

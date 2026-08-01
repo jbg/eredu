@@ -10,7 +10,9 @@ guidance in
 Use `inspect_model(path, ModelInspectionOptions)` to preflight a local
 SafeTensors directory or GGUF checkpoint before allocating model weights. The
 structured `ModelInspectionReport` separates container and requested-load
-compatibility from tokenizer, chat, semantic/tool, and multimodal readiness;
+compatibility from architecture support, exact structural binding, tokenizer,
+chat, semantic/tool, and multimodal readiness. `is_loadable()` is fail-closed:
+it is true only when the selected loader has an exact header/catalog validator;
 see [`doc/model-support.md`](../doc/model-support.md) for an example.
 
 The crate is derived from the `mlx-lm` crate in

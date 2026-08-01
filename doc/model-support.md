@@ -37,6 +37,116 @@ weights or creating an MLX stream. Supplying a concrete `chat_request` in
 readiness is based on a bounded synthetic behavior probe and the report marks
 real schemas, kwargs, and policies as request-specific.
 
+`is_loadable()` is an authoritative, fail-closed admission result. Container
+validity, architecture support, requested load-policy compatibility, and exact
+structural binding are reported separately. DeepSeek-V3/R1, Gemma 4 text and multimodal,
+GPT-OSS, Inkling, Kimi Linear, Llama/Mistral, Nemotron-H, Qwen3/Qwen3-MoE,
+Qwen3-Next, Qwen3-VL/Qwen3-VL-MoE, Qwen3.5 text and multimodal, PersonaPlex,
+and LFM2/LFM2-MoE
+SafeTensors, plus DeepSeek2,
+Gemma 4, GPT-OSS, Inkling, Llama/Mistral, Qwen3/Qwen3-MoE,
+Qwen3.5/Qwen3.5-MoE, Qwen3-Next, Qwen3-VL, Kimi Linear,
+Nemotron-H/Nemotron-H-MoE, and LFM2/LFM2-MoE GGUF currently
+have exact header-only tensor-name, shape, dtype/encoding, tied-head,
+hybrid-layer, and quantization-companion validation. Qwen3-MoE validation follows the selected
+residency route: fully resident loading requires packed expert banks, while
+bounded loading also accepts split or separately packed expert projections.
+LFM2-MoE accepts the official split-expert layout on its resident route because
+the loader packs it through the same shared plan. Checkpoint-native affine
+Qwen3-MoE and LFM2-MoE catalogs validate packed weights and their scale/bias
+companions; floating source catalogs requested for on-load quantization use the
+same per-operation plan. GPT-OSS additionally validates its native
+SafeTensors MXFP4 block/scale/bias catalog and requires canonical type-39 expert
+matrices in GGUF. Kimi Linear validates both official split and packed
+SafeTensors expert catalogs, its KDA reshape geometry, and its MLA projections.
+DeepSeek-V3 validation covers the dense-to-MoE schedule, MLA query variants,
+shared experts, official split routed experts, and packed banks on bounded
+routes. Native E4M3 block-FP8 weights and inverse-scale companions and native
+affine weights/scales/biases are validated per operation. DeepSeek2 GGUF validation shares the loader's parsed geometry
+and validates fused or split MLA projections, dense-to-MoE routing, shared and
+packed routed experts, and operation-specific GGML encodings.
+SafeMLX-written affine checkpoints may use the quantized module's
+`.inner.weight` serialization alias, and native FP8 checkpoints may store E4M3
+bits either with the SafeTensors E4M3 dtype or the loader's raw-byte `U8`
+representation; inspection accepts both exact loader-supported forms while
+still requiring the matching scale/bias or inverse-scale companions.
+Inkling SafeTensors validation covers the released interleaved dense and expert
+weights, canonical loader aliases, local/global attention geometry, short
+convolutions, and configured dMel audio and hMLP vision towers.
+Inkling GGUF validation shares its loader's pure metadata parser, name
+translation, and dense-to-MoE plan. It validates local/global relative
+attention, accepted short-convolution layouts, routed and shared expert banks,
+paired expert encodings, and the complete optional dMel/hMLP projector catalog.
+An absent projector remains text-loadable, while an invalid projector that the
+loader would automatically consume blocks admission.
+Nemotron-H SafeTensors validation covers its Mamba/attention/dense/MoE pattern,
+released and canonical names, both public split and packed ReLU2 experts, and
+checkpoint-native affine matrix companions while keeping recurrent state,
+convolution, norm, and router operations dense.
+Nemotron-H and Nemotron-H-MoE GGUF validation uses the loader's stream-free
+metadata parser and name translation. It validates the per-layer
+Mamba/attention/dense-or-MoE pattern, recurrent transform tensors, shared and
+packed ReLU2 experts, operation-specific GGML encodings, and requested dense or
+sparse residency route before payload materialization.
+Gemma 4 validation covers released and canonical prefixes, shared-KV layer
+omissions, per-layer inputs, dense and SwitchGLU MoE blocks, tied heads, and
+route-specific fused expert banks. Multimodal validation additionally covers
+every vision and audio tower tensor, clipped-linear bounds, convolutional
+geometry, optional standardization, and the modality projections; only the
+text-facing modality projections follow checkpoint affine metadata.
+Gemma 4 GGUF validation shares the loader's stream-free metadata parser and
+name translation. It validates per-layer feed-forward and attention geometry,
+sliding/full attention head dimensions, shared-KV omissions, dense and
+SwitchGLU MoE catalogs, fused or split expert banks, and operation-specific
+GGML encodings before payload materialization.
+Qwen3-Next SafeTensors validation covers fused or split Gated DeltaNet input
+projections, full-attention layers, shared and routed experts, embedded MTP
+layers, checkpoint aliases, and packed or public split expert layouts. Native
+FP8 inverse-scale and affine scale/bias catalogs use the same fused-projection
+and expert transforms as the loader, including the dense FP8 BA exception.
+Qwen3-VL and Qwen3-VL-MoE SafeTensors validation combines the prefixed Qwen3
+text plan with the complete dense vision tower. It validates Conv3D patch and
+position embeddings, every vision block, merger and DeepStack parameters,
+text/vision geometry, dense-only vision dtypes, tied or untied text heads, and
+route-specific packed or split MoE experts. Checkpoint-native affine text and
+expert catalogs are validated without quantizing the vision tower.
+Qwen3.5 SafeTensors validation covers dense and MoE hybrid decoders,
+split Gated DeltaNet projections, full-attention and MTP layers, public
+checkpoint aliases, and packed or split routed experts across resident,
+layerwise, and sparse-cache routes. It also validates every configured vision
+tower tensor and accepted prefix/merger alias, plus native FP8 inverse scales
+and affine companions per text operation.
+Qwen3.5 and Qwen3.5-MoE GGUF validation shares the loader's pure metadata
+geometry and name-translation plan. It validates split recurrent projections,
+full-attention layers, dense or routed/shared experts, paired expert encodings,
+operation-specific dense recurrent state tensors, and grouped value-head
+quantization alignment.
+Qwen3-Next GGUF validation uses the same metadata and decoder plan while
+requiring its fused QKVZ/BA recurrent projection catalog and validating affine
+input-group alignment before the loader splits those tensors.
+Qwen3-VL GGUF validation combines the exact dense Qwen3 text plan with its
+required sibling projector catalog. It validates multimodal RoPE sections and
+placeholder tokens, vision-block geometry, both physical patch-convolution
+halves, the merger and DeepStack tensors, projector/text hidden-size agreement,
+and dense-only projector operation encodings. Inspection and the resident and
+bounded loaders consume the same stream-free argument and structural plans.
+Kimi Linear GGUF validates pure metadata geometry, translated names, KDA/MLA
+catalogs, convolution and transition tensor element counts, paired expert
+encodings, and per-operation GGML support. The loader's requirement that KDA
+transition payload values be negative remains a post-inspection payload-value
+failure class.
+PersonaPlex 7B-v1 SafeTensors validation covers the released PyTorch catalog:
+temporal and depth transformers, packed per-codebook depth attention, norm
+reshape aliases, embeddings and projections, and checkpoint-native affine
+companions. The resident, quantize-on-load, and bounded realtime loaders call
+the same pure catalog validator before model creation. Generic language-model
+inspection still reports its requested load route as unsupported because
+PersonaPlex must use the realtime API, so `is_loadable()` remains false even
+when its separate structural binding is `Ready`. Every currently supported
+SafeTensors `ModelKind` and GGUF architecture now has an exact structural
+policy; future variants must be added exhaustively and may be marked
+`Unverified` only as a fail-closed temporary state.
+
 ## SafeTensors model directories
 
 The standard loader accepts Hugging Face-style directories containing

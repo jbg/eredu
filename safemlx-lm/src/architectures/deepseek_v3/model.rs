@@ -2944,14 +2944,20 @@ fn parse_config_value(value: Value) -> Result<ModelArgs, Error> {
     Ok(args)
 }
 
+/// Parses the same validated architecture arguments used by loading without
+/// opening a model directory or constructing an MLX module tree.
+pub(crate) fn model_args_from_config_value(config: &Value) -> Result<ModelArgs, Error> {
+    parse_config_value(config.clone())
+}
+
 /// Parses and validates `config.json` from a model directory.
 pub fn get_model_args(model_dir: impl AsRef<Path>) -> Result<ModelArgs, Error> {
     let file = std::fs::File::open(model_dir.as_ref().join("config.json"))?;
-    parse_config_value(serde_json::from_reader(file)?)
+    model_args_from_config_value(&serde_json::from_reader(file)?)
 }
 
 pub(crate) fn validate_model_config_value(config: &Value) -> Result<(), Error> {
-    parse_config_value(config.clone()).map(|_| ())
+    model_args_from_config_value(config).map(|_| ())
 }
 
 #[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
@@ -3219,6 +3225,15 @@ fn load_model_impl(
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<Model, Error> {
+    let options = quantize_on_load.map_or_else(
+        crate::api::ModelLoadOptions::default,
+        crate::api::ModelLoadOptions::with_quantization,
+    );
+    crate::api::structural::validate_safetensors_load_path(
+        crate::api::ModelKind::DeepSeekV3,
+        model_dir,
+        options,
+    )?;
     let mut model = Model::new(args.clone(), stream)?;
     let config = strict_load_config(&args);
     let mut report = StrictLoadReport::default();
@@ -3403,6 +3418,17 @@ pub(crate) fn load_gguf_checkpoint(
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<LoadedDeepSeekGguf, Error> {
+    let options = quantization.map_or_else(
+        crate::api::ModelLoadOptions::default,
+        crate::api::ModelLoadOptions::with_quantization,
+    );
+    crate::api::structural::validate_gguf(
+        crate::api::GgufArchitecture::DeepSeek2,
+        checkpoint,
+        &metadata,
+        options,
+    )
+    .into_loader_result()?;
     let prepared = prepare_gguf_checkpoint(checkpoint, &metadata, quantization, weights_stream)?;
     let mut model = Model::new(prepared.args, stream)?;
     let config = StrictLoadConfig::default().allow_unused_prefix("rope_freqs.");
@@ -3478,19 +3504,9 @@ pub(crate) fn prepare_gguf_checkpoint(
     checkpoint: &GgufCheckpoint,
     metadata: &HashMap<String, GgufMetadataValue>,
     quantization: Option<WeightQuantization>,
-    weights_stream: &Stream,
+    _weights_stream: &Stream,
 ) -> Result<PreparedDeepSeekGguf, Error> {
-    let architecture = gguf_string(metadata, "general.architecture")?;
-    if architecture != "deepseek2" {
-        return Err(Error::UnsupportedArchitecture(format!(
-            "GGUF architecture {architecture:?}; the DeepSeek-V3 loader supports deepseek2"
-        )));
-    }
-    checkpoint
-        .catalog()
-        .translated_outputs(translate_gguf_weight_name)
-        .map_err(safemlx::error::IoError::from)?;
-    let mut args = args_from_gguf(checkpoint, metadata, weights_stream)?;
+    let mut args = model_args_from_gguf_catalog(checkpoint, metadata)?;
     args.quantized_weight_configs = Some(gguf_quantization_configs(
         checkpoint,
         translate_gguf_weight_name,
@@ -3509,15 +3525,35 @@ pub(crate) fn prepare_gguf_checkpoint(
     })
 }
 
+/// Parses the same pure GGUF catalog geometry used by loading, without
+/// converting tensor payloads or constructing an MLX stream.
+pub(crate) fn model_args_from_gguf_catalog(
+    checkpoint: &GgufCheckpoint,
+    metadata: &HashMap<String, GgufMetadataValue>,
+) -> Result<ModelArgs, Error> {
+    let architecture = gguf_string(metadata, "general.architecture")?;
+    if architecture != "deepseek2" {
+        return Err(Error::UnsupportedArchitecture(format!(
+            "GGUF architecture {architecture:?}; the DeepSeek-V3 loader supports deepseek2"
+        )));
+    }
+    checkpoint
+        .catalog()
+        .translated_outputs(translate_gguf_weight_name)
+        .map_err(safemlx::error::IoError::from)?;
+    let args = args_from_gguf(checkpoint, metadata)?;
+    args.validate()?;
+    Ok(args)
+}
+
 fn args_from_gguf(
     arrays: &impl GgufTensorNames,
     metadata: &HashMap<String, GgufMetadataValue>,
-    stream: &Stream,
 ) -> Result<ModelArgs, Error> {
     let architecture = "deepseek2";
     let key = |suffix: &str| format!("{architecture}.{suffix}");
-    let qk_rope_head_dim = gguf_i32(metadata, &key("rope.dimension_count"), stream)?;
-    let qk_head_dim = gguf_i32(metadata, &key("attention.key_length_mla"), stream)?;
+    let qk_rope_head_dim = gguf_i32(metadata, &key("rope.dimension_count"))?;
+    let qk_head_dim = gguf_i32(metadata, &key("attention.key_length_mla"))?;
     let qk_nope_head_dim = qk_head_dim.checked_sub(qk_rope_head_dim).ok_or_else(|| {
         Error::UnsupportedArchitecture(format!(
             "DeepSeek GGUF MLA key length {qk_head_dim} is smaller than rotary length {qk_rope_head_dim}"
@@ -3537,7 +3573,6 @@ fn args_from_gguf(
             original_max_position_embeddings: gguf_i32(
                 metadata,
                 &key("rope.scaling.original_context_length"),
-                stream,
             )?,
             beta_fast: gguf_optional_f32(metadata, &key("rope.scaling.yarn_beta_fast"))?
                 .unwrap_or_else(default_beta_fast),
@@ -3566,13 +3601,8 @@ fn args_from_gguf(
                 "GGUF tokenizer.ggml.tokens metadata has the wrong type".into(),
             ))
         }
-        None => gguf_i32(metadata, &key("vocab_size"), stream)?,
+        None => gguf_i32(metadata, &key("vocab_size"))?,
     };
-    if !arrays.contains_gguf_tensor("output.weight") {
-        return Err(Error::UnsupportedArchitecture(
-            "DeepSeek GGUF is missing the untied output.weight tensor".into(),
-        ));
-    }
     let gating = gguf_optional_i64(metadata, &key("expert_gating_func"))?.unwrap_or(2);
     if gating != 2 {
         return Err(Error::UnsupportedArchitecture(format!(
@@ -3581,25 +3611,25 @@ fn args_from_gguf(
     }
     Ok(ModelArgs {
         model_type: "deepseek_v3".into(),
-        hidden_size: gguf_i32(metadata, &key("embedding_length"), stream)?,
-        intermediate_size: gguf_i32(metadata, &key("feed_forward_length"), stream)?,
-        moe_intermediate_size: gguf_i32(metadata, &key("expert_feed_forward_length"), stream)?,
-        num_hidden_layers: gguf_i32(metadata, &key("block_count"), stream)?,
-        num_attention_heads: gguf_i32(metadata, &key("attention.head_count"), stream)?,
+        hidden_size: gguf_i32(metadata, &key("embedding_length"))?,
+        intermediate_size: gguf_i32(metadata, &key("feed_forward_length"))?,
+        moe_intermediate_size: gguf_i32(metadata, &key("expert_feed_forward_length"))?,
+        num_hidden_layers: gguf_i32(metadata, &key("block_count"))?,
+        num_attention_heads: gguf_i32(metadata, &key("attention.head_count"))?,
         vocab_size,
         rms_norm_eps: gguf_f32(metadata, &key("attention.layer_norm_rms_epsilon"))?,
-        max_position_embeddings: gguf_i32(metadata, &key("context_length"), stream)?,
+        max_position_embeddings: gguf_i32(metadata, &key("context_length"))?,
         rope_theta: gguf_optional_f32(metadata, &key("rope.freq_base"))?
             .unwrap_or_else(default_rope_theta),
         rope_scaling,
         q_lora_rank,
-        kv_lora_rank: gguf_i32(metadata, &key("attention.kv_lora_rank"), stream)?,
+        kv_lora_rank: gguf_i32(metadata, &key("attention.kv_lora_rank"))?,
         qk_nope_head_dim,
         qk_rope_head_dim,
-        v_head_dim: gguf_i32(metadata, &key("attention.value_length_mla"), stream)?,
-        first_k_dense_replace: gguf_i32(metadata, &key("leading_dense_block_count"), stream)?,
+        v_head_dim: gguf_i32(metadata, &key("attention.value_length_mla"))?,
+        first_k_dense_replace: gguf_i32(metadata, &key("leading_dense_block_count"))?,
         moe_layer_freq: 1,
-        n_routed_experts: gguf_i32(metadata, &key("expert_count"), stream)?,
+        n_routed_experts: gguf_i32(metadata, &key("expert_count"))?,
         n_shared_experts: gguf_optional_i64(metadata, &key("expert_shared_count"))?
             .map(i32::try_from)
             .transpose()
@@ -3607,9 +3637,9 @@ fn args_from_gguf(
                 Error::UnsupportedArchitecture("GGUF shared expert count exceeds i32".into())
             })?
             .unwrap_or(1),
-        num_experts_per_tok: gguf_i32(metadata, &key("expert_used_count"), stream)?,
-        n_group: gguf_i32(metadata, &key("expert_group_count"), stream)?,
-        topk_group: gguf_i32(metadata, &key("expert_group_used_count"), stream)?,
+        num_experts_per_tok: gguf_i32(metadata, &key("expert_used_count"))?,
+        n_group: gguf_i32(metadata, &key("expert_group_count"))?,
+        topk_group: gguf_i32(metadata, &key("expert_group_used_count"))?,
         topk_method: "noaux_tc".into(),
         scoring_func: "sigmoid".into(),
         norm_topk_prob: gguf_optional_bool(metadata, &key("expert_weights_norm"))?.unwrap_or(true),
@@ -3709,11 +3739,7 @@ fn gguf_optional_string(
     }
 }
 
-fn gguf_i32(
-    metadata: &HashMap<String, GgufMetadataValue>,
-    key: &str,
-    _stream: &Stream,
-) -> Result<i32, Error> {
+fn gguf_i32(metadata: &HashMap<String, GgufMetadataValue>, key: &str) -> Result<i32, Error> {
     let value = gguf_optional_i64(metadata, key)?.ok_or_else(|| {
         Error::UnsupportedArchitecture(format!("GGUF metadata is missing required key {key:?}"))
     })?;

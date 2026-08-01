@@ -266,6 +266,20 @@ pub fn load_gpt_oss_layerwise_model(
     weights_stream: &Stream,
 ) -> Result<GptOssLayerwiseModel, Error> {
     let model_dir = model_dir.as_ref();
+    let options = options.into();
+    let residency = match options {
+        LayerExecutionLoadOptions::LayerwiseHost(options) => {
+            WeightResidency::LayerwiseHost(options)
+        }
+        LayerExecutionLoadOptions::DenseDiskStream(options) => {
+            WeightResidency::DenseDiskStream(options)
+        }
+    };
+    crate::api::structural::validate_safetensors_load_path(
+        crate::api::ModelKind::GptOss,
+        model_dir,
+        crate::api::ModelLoadOptions::default().with_weight_residency(residency),
+    )?;
     let args = resident::get_model_args(model_dir)?;
     let adapter = GptOssLayerwiseAdapter::new(args, stream)?;
     Ok(GptOssLayerwiseModel {
@@ -414,6 +428,11 @@ fn load_gpt_oss_sparse_expert_cache_model_with_non_expert(
     weights_stream: &Stream,
 ) -> Result<GptOssLayerwiseModel, Error> {
     let model_dir = model_dir.as_ref();
+    crate::api::structural::validate_safetensors_load_path(
+        crate::api::ModelKind::GptOss,
+        model_dir,
+        crate::api::ModelLoadOptions::default(),
+    )?;
     let args = resident::get_model_args(model_dir)?;
     let mut adapter = GptOssLayerwiseAdapter::new(args.clone(), stream)?;
     adapter.sparse_expert_cache = true;

@@ -522,12 +522,17 @@ pub fn load_llama_model(
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<LlamaModel, Error> {
+    let model_dir = model_dir.as_ref();
+    crate::api::structural::validate_safetensors_load_path(
+        crate::api::ModelKind::Llama,
+        model_dir,
+        crate::api::ModelLoadOptions::default().with_weight_residency(options.weight_residency),
+    )?;
     let execution = match options.weight_residency {
         WeightResidency::FullyResident => LlamaExecution::FullyResident(Box::new(
             resident::load_resident_llama_model(model_dir, stream, weights_stream)?,
         )),
         WeightResidency::LayerwiseHost(options) => {
-            let model_dir = model_dir.as_ref();
             let args = resident::get_llama_model_args(model_dir)?;
             let adapter = LlamaLayerwiseAdapter::new(args, stream)?;
             LlamaExecution::LayerwiseHost(Box::new(load_layerwise_model(
@@ -539,7 +544,6 @@ pub fn load_llama_model(
             )?))
         }
         WeightResidency::DenseDiskStream(options) => {
-            let model_dir = model_dir.as_ref();
             let args = resident::get_llama_model_args(model_dir)?;
             let adapter = LlamaLayerwiseAdapter::new(args, stream)?;
             LlamaExecution::LayerwiseHost(Box::new(load_layerwise_model(

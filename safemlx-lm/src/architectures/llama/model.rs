@@ -1045,6 +1045,17 @@ fn validate_model_args(model_args: &ModelArgs) -> Result<(), Error> {
             model_args.num_attention_heads, model_args.num_key_value_heads
         )));
     }
+    for (name, heads) in [
+        ("query projection", model_args.num_attention_heads),
+        ("key/value projection", model_args.num_key_value_heads),
+    ] {
+        heads.checked_mul(model_args.head_dim).ok_or_else(|| {
+            Error::UnsupportedArchitecture(format!(
+                "{name} width overflows i32: {heads} heads x head_dim {}",
+                model_args.head_dim
+            ))
+        })?;
+    }
     if let Some(window_size) = model_args.sliding_window {
         if window_size <= 0 {
             return Err(Error::UnsupportedArchitecture(format!(
@@ -1056,10 +1067,15 @@ fn validate_model_args(model_args: &ModelArgs) -> Result<(), Error> {
 }
 
 pub(crate) fn validate_model_config_value(config: &Value) -> Result<(), Error> {
+    model_args_from_config_value(config).map(|_| ())
+}
+
+/// Parses the normalized arguments shared by structural preflight and loading.
+pub(crate) fn model_args_from_config_value(config: &Value) -> Result<ModelArgs, Error> {
     let args = serde_json::from_value::<ModelArgs>(config.clone()).map_err(|error| {
         Error::UnsupportedArchitecture(format!("invalid Llama-compatible config: {error}"))
     })?;
-    normalize_model_args(args).map(|_| ())
+    normalize_model_args(args)
 }
 
 pub(crate) struct LoadedLlamaGguf {
@@ -1129,7 +1145,7 @@ pub(crate) fn prepare_llama_gguf_checkpoint(
     checkpoint: &GgufCheckpoint,
     metadata: &HashMap<String, GgufMetadataValue>,
     quantization: Option<WeightQuantization>,
-    weights_stream: &Stream,
+    _weights_stream: &Stream,
 ) -> Result<PreparedLlamaGguf, Error> {
     let architecture = gguf_string(metadata, "general.architecture")?;
     if !matches!(architecture.as_str(), "llama" | "mistral") {
@@ -1137,12 +1153,20 @@ pub(crate) fn prepare_llama_gguf_checkpoint(
             "GGUF architecture {architecture:?}; this loader supports llama and mistral"
         )));
     }
+    let gguf_architecture = crate::api::GgufArchitecture::resolve(&architecture)?;
+    crate::api::structural::validate_gguf(
+        gguf_architecture,
+        checkpoint,
+        metadata,
+        crate::api::ModelLoadOptions::default(),
+    )
+    .into_loader_result()?;
 
     checkpoint
         .catalog()
         .translated_outputs(translate_gguf_weight_name)
         .map_err(safemlx::error::IoError::from)?;
-    let mut args = llama_args_from_gguf(checkpoint, metadata, &architecture, weights_stream)?;
+    let mut args = model_args_from_gguf_catalog(checkpoint, metadata)?;
     let quantized_weight_configs =
         gguf_quantization_configs(checkpoint, translate_gguf_weight_name)?;
     if let Some(quantization) = quantization {
@@ -1162,31 +1186,36 @@ pub(crate) fn prepare_llama_gguf_checkpoint(
     })
 }
 
-fn llama_args_from_gguf(
+/// Parses the GGUF arguments shared by structural preflight and loading.
+pub(crate) fn model_args_from_gguf_catalog(
     arrays: &impl GgufTensorNames,
     metadata: &HashMap<String, GgufMetadataValue>,
-    architecture: &str,
-    stream: &Stream,
 ) -> Result<ModelArgs, Error> {
+    let architecture = gguf_string(metadata, "general.architecture")?;
     let key = |suffix: &str| format!("{architecture}.{suffix}");
-    let hidden_size = gguf_i32(metadata, &key("embedding_length"), stream)?;
-    let num_attention_heads = gguf_i32(metadata, &key("attention.head_count"), stream)?;
-    let num_key_value_heads = gguf_optional_i64(metadata, &key("attention.head_count_kv"), stream)?
+    let hidden_size = gguf_i32(metadata, &key("embedding_length"))?;
+    let num_attention_heads = gguf_i32(metadata, &key("attention.head_count"))?;
+    if num_attention_heads <= 0 {
+        return Err(Error::UnsupportedArchitecture(format!(
+            "GGUF attention head count must be positive, got {num_attention_heads}"
+        )));
+    }
+    let num_key_value_heads = gguf_optional_i64(metadata, &key("attention.head_count_kv"))?
         .map(i32::try_from)
         .transpose()
         .map_err(|_| Error::UnsupportedArchitecture("GGUF KV-head count exceeds i32".into()))?
         .unwrap_or(num_attention_heads);
-    let head_dim = gguf_optional_i64(metadata, &key("attention.key_length"), stream)?
+    let head_dim = gguf_optional_i64(metadata, &key("attention.key_length"))?
         .map(i32::try_from)
         .transpose()
         .map_err(|_| {
             Error::UnsupportedArchitecture("GGUF attention key length exceeds i32".into())
         })?
         .unwrap_or(hidden_size / num_attention_heads);
-    let rope_theta = gguf_optional_f32(metadata, &key("rope.freq_base"), stream)?
-        .unwrap_or_else(default_rope_theta);
-    let rope_scaling = gguf_rope_scaling(metadata, architecture, stream)?;
-    let sliding_window = gguf_optional_i64(metadata, &key("attention.sliding_window"), stream)?
+    let rope_theta =
+        gguf_optional_f32(metadata, &key("rope.freq_base"))?.unwrap_or_else(default_rope_theta);
+    let rope_scaling = gguf_rope_scaling(metadata, &architecture)?;
+    let sliding_window = gguf_optional_i64(metadata, &key("attention.sliding_window"))?
         .map(i32::try_from)
         .transpose()
         .map_err(|_| Error::UnsupportedArchitecture("GGUF sliding-window size exceeds i32".into()))?
@@ -1203,19 +1232,19 @@ fn llama_args_from_gguf(
                 "GGUF tokenizer.ggml.tokens metadata has the wrong type".into(),
             ));
         }
-        None => gguf_i32(metadata, &key("vocab_size"), stream)?,
+        None => gguf_i32(metadata, &key("vocab_size"))?,
     };
 
-    Ok(ModelArgs {
-        model_type: architecture.to_string(),
+    let args = ModelArgs {
+        model_type: architecture.clone(),
         hidden_size,
-        num_hidden_layers: gguf_i32(metadata, &key("block_count"), stream)?,
-        intermediate_size: gguf_i32(metadata, &key("feed_forward_length"), stream)?,
+        num_hidden_layers: gguf_i32(metadata, &key("block_count"))?,
+        intermediate_size: gguf_i32(metadata, &key("feed_forward_length"))?,
         num_attention_heads,
-        rms_norm_eps: gguf_f32(metadata, &key("attention.layer_norm_rms_epsilon"), stream)?,
+        rms_norm_eps: gguf_f32(metadata, &key("attention.layer_norm_rms_epsilon"))?,
         vocab_size,
         num_key_value_heads,
-        max_position_embeddings: gguf_i32(metadata, &key("context_length"), stream)?,
+        max_position_embeddings: gguf_i32(metadata, &key("context_length"))?,
         rope_theta,
         rope_traditional: true,
         head_dim,
@@ -1245,13 +1274,14 @@ fn llama_args_from_gguf(
         quantization_config: None,
         quantized_weights: None,
         quantized_weight_configs: None,
-    })
+    };
+    validate_model_args(&args)?;
+    Ok(args)
 }
 
 fn gguf_rope_scaling(
     metadata: &HashMap<String, GgufMetadataValue>,
     architecture: &str,
-    stream: &Stream,
 ) -> Result<Option<HashMap<String, FloatOrString>>, Error> {
     let scaling_type_key = format!("{architecture}.rope.scaling.type");
     let Some(scaling_type) = gguf_optional_string(metadata, &scaling_type_key)? else {
@@ -1261,12 +1291,11 @@ fn gguf_rope_scaling(
         "none" | "default" => Ok(None),
         "linear" => {
             let scaling_factor_key = format!("{architecture}.rope.scaling.factor");
-            let factor =
-                gguf_optional_f32(metadata, &scaling_factor_key, stream)?.ok_or_else(|| {
-                    Error::UnsupportedArchitecture(format!(
-                        "linear GGUF RoPE scaling is missing {scaling_factor_key}"
-                    ))
-                })?;
+            let factor = gguf_optional_f32(metadata, &scaling_factor_key)?.ok_or_else(|| {
+                Error::UnsupportedArchitecture(format!(
+                    "linear GGUF RoPE scaling is missing {scaling_factor_key}"
+                ))
+            })?;
             Ok(Some(HashMap::from([
                 (
                     "rope_type".to_string(),
@@ -1316,23 +1345,15 @@ fn gguf_optional_string(
     }
 }
 
-fn gguf_i32(
-    metadata: &HashMap<String, GgufMetadataValue>,
-    key: &str,
-    stream: &Stream,
-) -> Result<i32, Error> {
-    let value = gguf_i64(metadata, key, stream)?;
+fn gguf_i32(metadata: &HashMap<String, GgufMetadataValue>, key: &str) -> Result<i32, Error> {
+    let value = gguf_i64(metadata, key)?;
     i32::try_from(value).map_err(|_| {
         Error::UnsupportedArchitecture(format!("GGUF metadata value {key:?} exceeds i32"))
     })
 }
 
-fn gguf_i64(
-    metadata: &HashMap<String, GgufMetadataValue>,
-    key: &str,
-    stream: &Stream,
-) -> Result<i64, Error> {
-    gguf_optional_i64(metadata, key, stream)?.ok_or_else(|| {
+fn gguf_i64(metadata: &HashMap<String, GgufMetadataValue>, key: &str) -> Result<i64, Error> {
+    gguf_optional_i64(metadata, key)?.ok_or_else(|| {
         Error::UnsupportedArchitecture(format!("GGUF metadata is missing required key {key:?}"))
     })
 }
@@ -1340,7 +1361,6 @@ fn gguf_i64(
 fn gguf_optional_i64(
     metadata: &HashMap<String, GgufMetadataValue>,
     key: &str,
-    _stream: &Stream,
 ) -> Result<Option<i64>, Error> {
     match metadata.get(key) {
         Some(value) => value.as_i64().map(Some).ok_or_else(|| {
@@ -1350,12 +1370,8 @@ fn gguf_optional_i64(
     }
 }
 
-fn gguf_f32(
-    metadata: &HashMap<String, GgufMetadataValue>,
-    key: &str,
-    stream: &Stream,
-) -> Result<f32, Error> {
-    gguf_optional_f32(metadata, key, stream)?.ok_or_else(|| {
+fn gguf_f32(metadata: &HashMap<String, GgufMetadataValue>, key: &str) -> Result<f32, Error> {
+    gguf_optional_f32(metadata, key)?.ok_or_else(|| {
         Error::UnsupportedArchitecture(format!("GGUF metadata is missing required key {key:?}"))
     })
 }
@@ -1363,7 +1379,6 @@ fn gguf_f32(
 fn gguf_optional_f32(
     metadata: &HashMap<String, GgufMetadataValue>,
     key: &str,
-    _stream: &Stream,
 ) -> Result<Option<f32>, Error> {
     match metadata.get(key) {
         Some(value) => value.as_f32().map(Some).ok_or_else(|| {
@@ -1389,6 +1404,11 @@ pub fn load_resident_llama_model(
     weights_stream: &Stream,
 ) -> Result<ResidentModel, Error> {
     let model_dir = model_dir.as_ref();
+    crate::api::structural::validate_safetensors_load_path(
+        crate::api::ModelKind::Llama,
+        model_dir,
+        crate::api::ModelLoadOptions::default(),
+    )?;
     let model_args = get_llama_model_args(model_dir)?;
     let mut model = ResidentModel::new(model_args, stream)?;
 
@@ -1406,6 +1426,11 @@ pub fn load_resident_llama_model_quantized(
     weights_stream: &Stream,
 ) -> Result<ResidentModel, Error> {
     let model_dir = model_dir.as_ref();
+    crate::api::structural::validate_safetensors_load_path(
+        crate::api::ModelKind::Llama,
+        model_dir,
+        crate::api::ModelLoadOptions::with_quantization(quantization),
+    )?;
     let mut model_args = get_llama_model_args(model_dir)?;
     if !crate::runtime::checkpoint::quantization::should_quantize_on_load(
         "Llama",

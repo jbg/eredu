@@ -238,6 +238,25 @@ pub fn load_qwen3_vl_layerwise_model(
 ) -> Result<Qwen3VlLayerwiseModel, Error> {
     let model_dir = model_dir.as_ref();
     let args = resident::get_qwen3_vl_model_args(model_dir)?;
+    let options = options.into();
+    let residency = match options {
+        LayerExecutionLoadOptions::LayerwiseHost(options) => {
+            WeightResidency::LayerwiseHost(options)
+        }
+        LayerExecutionLoadOptions::DenseDiskStream(options) => {
+            WeightResidency::DenseDiskStream(options)
+        }
+    };
+    let kind = if args.text_config.is_moe() {
+        crate::api::ModelKind::Qwen3VlMoe
+    } else {
+        crate::api::ModelKind::Qwen3Vl
+    };
+    crate::api::structural::validate_safetensors_load_path(
+        kind,
+        model_dir,
+        crate::api::ModelLoadOptions::default().with_weight_residency(residency),
+    )?;
     let adapter = Qwen3VlLayerwiseAdapter::new(args, stream)?;
     Ok(Qwen3VlLayerwiseModel {
         execution: load_general_layerwise_model(
@@ -264,7 +283,6 @@ pub(crate) fn load_qwen3_vl_gguf_layerwise_model(
         metadata,
         vision_checkpoint,
         vision_metadata,
-        weights_stream,
     )?;
     let deepstack = prepared.args.vision_config.deepstack_visual_indexes.clone();
     let store: Arc<dyn WeightStore + Send + Sync> = Arc::new(
@@ -354,6 +372,12 @@ fn load_qwen3_vl_sparse_expert_cache_model_with_non_expert(
     weights_stream: &Stream,
 ) -> Result<Qwen3VlLayerwiseModel, Error> {
     let model_dir = model_dir.as_ref();
+    crate::api::structural::validate_safetensors_load_path(
+        crate::api::ModelKind::Qwen3VlMoe,
+        model_dir,
+        crate::api::ModelLoadOptions::default()
+            .with_weight_residency(WeightResidency::SparseExpertCache(options)),
+    )?;
     let args = resident::get_qwen3_vl_model_args(model_dir)?;
     if !args.text_config.is_moe() {
         return Err(Error::UnsupportedArchitecture(

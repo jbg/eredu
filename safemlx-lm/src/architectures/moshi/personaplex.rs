@@ -195,6 +195,9 @@ pub fn get_model_metadata(model_dir: impl AsRef<Path>) -> Result<ModelMetadata, 
 
 /// Validates parsed PersonaPlex metadata.
 pub fn validate_metadata(metadata: &ModelMetadata) -> Result<(), Error> {
+    if let Some(quantization) = metadata.quantization {
+        quantization.validate()?;
+    }
     if metadata.model_type != "personaplex" {
         return Err(Error::UnsupportedModelType(metadata.model_type.clone()));
     }
@@ -208,10 +211,18 @@ pub fn validate_metadata(metadata: &ModelMetadata) -> Result<(), Error> {
 
 /// Validates a `personaplex` config value.
 pub fn validate_model_config_value(config: &serde_json::Value) -> Result<(), Error> {
+    model_metadata_from_config_value(config).map(|_| ())
+}
+
+/// Parses validated PersonaPlex metadata for shared load and inspection planning.
+pub(crate) fn model_metadata_from_config_value(
+    config: &serde_json::Value,
+) -> Result<ModelMetadata, Error> {
     let metadata: ModelMetadata = serde_json::from_value(config.clone()).map_err(|error| {
         Error::UnsupportedArchitecture(format!("invalid PersonaPlex config: {error}"))
     })?;
-    validate_metadata(&metadata)
+    validate_metadata(&metadata)?;
+    Ok(metadata)
 }
 
 /// Creates an unloaded PersonaPlex language model from the published defaults.
@@ -313,6 +324,11 @@ pub fn load_model(
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<Model, Error> {
+    crate::api::structural::validate_safetensors_load_path(
+        crate::api::ModelKind::PersonaPlex,
+        model_dir.as_ref(),
+        crate::api::ModelLoadOptions::default(),
+    )?;
     let metadata = get_model_metadata(&model_dir)?;
     let mut args = model_args_7b_v1();
     args.quantization = metadata.quantization;
@@ -344,6 +360,11 @@ pub fn load_model_quantized(
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<Model, Error> {
+    crate::api::structural::validate_safetensors_load_path(
+        crate::api::ModelKind::PersonaPlex,
+        model_dir.as_ref(),
+        crate::api::ModelLoadOptions::with_quantization(quantization),
+    )?;
     let metadata = get_model_metadata(&model_dir)?;
     if !crate::runtime::checkpoint::quantization::should_quantize_on_load(
         "PersonaPlex",

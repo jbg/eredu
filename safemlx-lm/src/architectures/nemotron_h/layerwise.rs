@@ -176,6 +176,20 @@ pub fn load_nemotron_h_layerwise_model(
     weights_stream: &Stream,
 ) -> Result<NemotronHLayerwiseModel, Error> {
     let model_dir = model_dir.as_ref();
+    let options = options.into();
+    let residency = match options {
+        LayerExecutionLoadOptions::LayerwiseHost(options) => {
+            WeightResidency::LayerwiseHost(options)
+        }
+        LayerExecutionLoadOptions::DenseDiskStream(options) => {
+            WeightResidency::DenseDiskStream(options)
+        }
+    };
+    crate::api::structural::validate_safetensors_load_path(
+        crate::api::ModelKind::NemotronH,
+        model_dir,
+        crate::api::ModelLoadOptions::default().with_weight_residency(residency),
+    )?;
     let args = resident::get_nemotron_h_model_args(model_dir)?;
     let adapter = NemotronHLayerwiseAdapter::new(args, stream)?;
     Ok(NemotronHLayerwiseModel {
@@ -196,6 +210,36 @@ pub(crate) fn load_nemotron_h_gguf_layerwise_model(
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<(NemotronHLayerwiseModel, Vec<u32>), Error> {
+    let architecture = match metadata.get("general.architecture") {
+        Some(GgufMetadataValue::String(name)) if name == "nemotron_h" => {
+            crate::api::GgufArchitecture::NemotronH
+        }
+        Some(GgufMetadataValue::String(name)) if name == "nemotron_h_moe" => {
+            crate::api::GgufArchitecture::NemotronHMoe
+        }
+        Some(GgufMetadataValue::String(name)) => {
+            return Err(Error::UnsupportedArchitecture(format!(
+                "GGUF architecture {name:?}; this loader supports nemotron_h and nemotron_h_moe"
+            )));
+        }
+        Some(_) => {
+            return Err(Error::UnsupportedArchitecture(
+                "GGUF metadata key \"general.architecture\" has the wrong type".into(),
+            ));
+        }
+        None => {
+            return Err(Error::UnsupportedArchitecture(
+                "GGUF metadata is missing required key \"general.architecture\"".into(),
+            ));
+        }
+    };
+    crate::api::structural::validate_gguf(
+        architecture,
+        checkpoint,
+        metadata,
+        crate::api::ModelLoadOptions::default().with_weight_residency(residency),
+    )
+    .into_loader_result()?;
     let prepared =
         resident::prepare_nemotron_h_gguf_checkpoint(checkpoint, metadata, weights_stream)?;
     let args = prepared.args;
@@ -353,6 +397,12 @@ fn load_nemotron_h_sparse_expert_cache_model_with_non_expert(
     weights_stream: &Stream,
 ) -> Result<NemotronHLayerwiseModel, Error> {
     let model_dir = model_dir.as_ref();
+    crate::api::structural::validate_safetensors_load_path(
+        crate::api::ModelKind::NemotronH,
+        model_dir,
+        crate::api::ModelLoadOptions::default()
+            .with_weight_residency(WeightResidency::SparseExpertCache(options)),
+    )?;
     let args = resident::get_nemotron_h_model_args(model_dir)?;
     if !args.layer_block_types()?.contains(&LayerBlockType::Moe) {
         return Err(Error::UnsupportedArchitecture(

@@ -29,13 +29,21 @@ pub use super::qwen3_5::{
 
 /// Reads and normalizes Qwen3-Next model arguments from `config.json`.
 pub fn get_qwen3_next_model_args(model_dir: impl AsRef<Path>) -> Result<ModelArgs, Error> {
+    let config: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(model_dir.as_ref().join("config.json"))?)?;
+    model_args_from_config_value(&config)
+}
+
+pub(crate) fn model_args_from_config_value(config: &serde_json::Value) -> Result<ModelArgs, Error> {
     let (args, image_token_id, video_token_id, vision_config) =
-        super::qwen3_5::get_qwen3_5_moe_model_args(model_dir)?;
+        super::qwen3_5::parse_qwen3_5_config_value(config.clone())?;
     if image_token_id.is_some() || video_token_id.is_some() || vision_config.is_some() {
         return Err(Error::UnsupportedArchitecture(
             "qwen3_next is a text-only architecture".into(),
         ));
     }
+    super::qwen3_5::validate_text_model_args(&args, "Qwen3-Next")?;
+    fused_projection_widths(&args)?;
     Ok(args)
 }
 
@@ -84,6 +92,14 @@ fn load_qwen3_next_model_with_quantization(
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<Model, Error> {
+    crate::api::structural::validate_safetensors_load_path(
+        crate::api::ModelKind::Qwen3Next,
+        model_dir,
+        crate::api::ModelLoadOptions {
+            quantization,
+            ..Default::default()
+        },
+    )?;
     let mut args = get_qwen3_next_model_args(model_dir)?;
     if let Some(config) = &args.quantization_config {
         config.validate_supported()?;
@@ -391,15 +407,7 @@ fn split_grouped_rows(
 }
 
 pub(crate) fn validate_model_config_value(config: &serde_json::Value) -> Result<(), Error> {
-    if config
-        .get("vision_config")
-        .is_some_and(|vision| !vision.is_null())
-    {
-        return Err(Error::UnsupportedArchitecture(
-            "qwen3_next is a text-only architecture".into(),
-        ));
-    }
-    super::qwen3_5::validate_model_config_value(config)
+    model_args_from_config_value(config).map(|_| ())
 }
 
 #[cfg(test)]

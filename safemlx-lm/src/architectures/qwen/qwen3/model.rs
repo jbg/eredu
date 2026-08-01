@@ -111,7 +111,7 @@ pub struct ModelArgs {
 }
 
 impl ModelArgs {
-    fn weight_quantization(&self) -> Option<WeightQuantization> {
+    pub(crate) fn weight_quantization(&self) -> Option<WeightQuantization> {
         self.quantization.or(self.quantization_config)
     }
 
@@ -1487,9 +1487,80 @@ pub fn load_qwen3_tokenizer(model_dir: impl AsRef<Path>) -> Result<Tokenizer, Er
 pub fn get_qwen3_model_args(model_dir: impl AsRef<Path>) -> Result<ModelArgs, Error> {
     let model_args_filename = model_dir.as_ref().join("config.json");
     let file = std::fs::File::open(model_args_filename)?;
-    let model_args: ModelArgs = serde_json::from_reader(file)?;
+    let config: Value = serde_json::from_reader(file)?;
+    model_args_from_config_value(&config)
+}
 
-    Ok(model_args)
+/// Parses and validates the arguments shared by structural preflight and loading.
+pub(crate) fn model_args_from_config_value(config: &Value) -> Result<ModelArgs, Error> {
+    let args = serde_json::from_value::<ModelArgs>(config.clone()).map_err(|error| {
+        Error::UnsupportedArchitecture(format!("invalid Qwen3 config: {error}"))
+    })?;
+    validate_model_args(&args)?;
+    Ok(args)
+}
+
+fn validate_model_args(args: &ModelArgs) -> Result<(), Error> {
+    if !matches!(args.model_type.as_str(), "qwen3" | "qwen3_moe") {
+        return Err(Error::UnsupportedModelType(args.model_type.clone()));
+    }
+    for (name, value) in [
+        ("hidden_size", args.hidden_size),
+        ("num_hidden_layers", args.num_hidden_layers),
+        ("num_attention_heads", args.num_attention_heads),
+        ("num_key_value_heads", args.num_key_value_heads),
+        ("vocab_size", args.vocab_size),
+        ("max_position_embeddings", args.max_position_embeddings),
+        ("head_dim", args.head_dim),
+    ] {
+        if value <= 0 {
+            return Err(Error::UnsupportedArchitecture(format!(
+                "{name} must be positive, got {value}"
+            )));
+        }
+    }
+    if args.num_attention_heads % args.num_key_value_heads != 0 {
+        return Err(Error::UnsupportedArchitecture(format!(
+            "num_attention_heads ({}) must be divisible by num_key_value_heads ({})",
+            args.num_attention_heads, args.num_key_value_heads
+        )));
+    }
+    for (name, heads) in [
+        ("query projection", args.num_attention_heads),
+        ("key/value projection", args.num_key_value_heads),
+    ] {
+        heads.checked_mul(args.head_dim).ok_or_else(|| {
+            Error::UnsupportedArchitecture(format!(
+                "{name} width overflows i32: {heads} heads x head_dim {}",
+                args.head_dim
+            ))
+        })?;
+    }
+    if args.is_moe() {
+        for (name, value) in [
+            ("moe_intermediate_size", args.moe_intermediate_size),
+            ("num_experts", args.num_experts),
+            ("num_experts_per_tok", args.num_experts_per_tok),
+        ] {
+            if value <= 0 {
+                return Err(Error::UnsupportedArchitecture(format!(
+                    "{name} must be positive for Qwen3 MoE, got {value}"
+                )));
+            }
+        }
+        if args.num_experts_per_tok > args.num_experts {
+            return Err(Error::UnsupportedArchitecture(format!(
+                "num_experts_per_tok ({}) exceeds num_experts ({})",
+                args.num_experts_per_tok, args.num_experts
+            )));
+        }
+    } else if args.intermediate_size <= 0 {
+        return Err(Error::UnsupportedArchitecture(format!(
+            "intermediate_size must be positive for dense Qwen3, got {}",
+            args.intermediate_size
+        )));
+    }
+    Ok(())
 }
 
 pub(crate) struct LoadedQwen3Gguf {
@@ -1534,13 +1605,20 @@ pub(crate) fn load_qwen3_gguf_checkpoint(
         )));
     }
     let is_moe = architecture == "qwen3moe";
+    let gguf_architecture = crate::api::GgufArchitecture::resolve(&architecture)?;
+    crate::api::structural::validate_gguf(
+        gguf_architecture,
+        checkpoint,
+        &metadata,
+        crate::api::ModelLoadOptions::default(),
+    )
+    .into_loader_result()?;
     let translate = |name: &str| translate_qwen3_gguf_weight_name(name, is_moe);
     checkpoint
         .catalog()
         .translated_outputs(translate)
         .map_err(safemlx::error::IoError::from)?;
-    let mut args =
-        qwen3_args_from_gguf(checkpoint, &metadata, &architecture, is_moe, weights_stream)?;
+    let mut args = qwen3_args_from_gguf_catalog(checkpoint, &metadata, &architecture, is_moe)?;
     let mut configs = gguf_quantization_configs(checkpoint, translate)?;
     if is_moe {
         for layer in 0..args.num_hidden_layers {
@@ -1645,15 +1723,21 @@ pub(crate) fn prepare_qwen3_gguf_checkpoint(
     metadata: &HashMap<String, GgufMetadataValue>,
     architecture: &str,
     is_moe: bool,
-    weights_stream: &Stream,
 ) -> Result<(ModelArgs, Vec<u32>), Error> {
+    let gguf_architecture = crate::api::GgufArchitecture::resolve(architecture)?;
+    crate::api::structural::validate_gguf(
+        gguf_architecture,
+        checkpoint,
+        metadata,
+        crate::api::ModelLoadOptions::default(),
+    )
+    .into_loader_result()?;
     let translate = |name: &str| translate_qwen3_gguf_weight_name(name, is_moe);
     checkpoint
         .catalog()
         .translated_outputs(translate)
         .map_err(safemlx::error::IoError::from)?;
-    let mut args =
-        qwen3_args_from_gguf(checkpoint, metadata, architecture, is_moe, weights_stream)?;
+    let mut args = qwen3_args_from_gguf_catalog(checkpoint, metadata, architecture, is_moe)?;
     let mut configs = gguf_quantization_configs(checkpoint, translate)?;
     if is_moe {
         for layer in 0..args.num_hidden_layers {
@@ -1671,22 +1755,27 @@ pub(crate) fn prepare_qwen3_gguf_checkpoint(
     Ok((args, eos_token_ids))
 }
 
-fn qwen3_args_from_gguf(
+/// Parses the GGUF arguments shared by structural preflight and loading.
+pub(crate) fn qwen3_args_from_gguf_catalog(
     arrays: &impl GgufTensorNames,
     metadata: &HashMap<String, GgufMetadataValue>,
     architecture: &str,
     is_moe: bool,
-    stream: &Stream,
 ) -> Result<ModelArgs, Error> {
     let key = |suffix: &str| format!("{architecture}.{suffix}");
-    let hidden_size = gguf_i32(metadata, &key("embedding_length"), stream)?;
-    let num_attention_heads = gguf_i32(metadata, &key("attention.head_count"), stream)?;
-    let num_key_value_heads = gguf_optional_i64(metadata, &key("attention.head_count_kv"), stream)?
+    let hidden_size = gguf_i32_catalog(metadata, &key("embedding_length"))?;
+    let num_attention_heads = gguf_i32_catalog(metadata, &key("attention.head_count"))?;
+    if num_attention_heads <= 0 {
+        return Err(Error::UnsupportedArchitecture(format!(
+            "GGUF attention head count must be positive, got {num_attention_heads}"
+        )));
+    }
+    let num_key_value_heads = gguf_optional_i64(metadata, &key("attention.head_count_kv"))?
         .map(i32::try_from)
         .transpose()
         .map_err(|_| Error::UnsupportedArchitecture("GGUF KV-head count exceeds i32".into()))?
         .unwrap_or(num_attention_heads);
-    let head_dim = gguf_optional_i64(metadata, &key("attention.key_length"), stream)?
+    let head_dim = gguf_optional_i64(metadata, &key("attention.key_length"))?
         .map(i32::try_from)
         .transpose()
         .map_err(|_| {
@@ -1705,15 +1794,15 @@ fn qwen3_args_from_gguf(
                 "GGUF tokenizer.ggml.tokens metadata has the wrong type".into(),
             ));
         }
-        None => gguf_i32(metadata, &key("vocab_size"), stream)?,
+        None => gguf_i32_catalog(metadata, &key("vocab_size"))?,
     };
 
-    Ok(ModelArgs {
+    let args = ModelArgs {
         model_type: if is_moe { "qwen3_moe" } else { "qwen3" }.to_string(),
         hidden_size,
-        num_hidden_layers: gguf_i32(metadata, &key("block_count"), stream)?,
+        num_hidden_layers: gguf_i32_catalog(metadata, &key("block_count"))?,
         intermediate_size: if is_moe {
-            gguf_optional_i64(metadata, &key("feed_forward_length"), stream)?
+            gguf_optional_i64(metadata, &key("feed_forward_length"))?
                 .map(i32::try_from)
                 .transpose()
                 .map_err(|_| {
@@ -1721,45 +1810,45 @@ fn qwen3_args_from_gguf(
                 })?
                 .unwrap_or(0)
         } else {
-            gguf_i32(metadata, &key("feed_forward_length"), stream)?
+            gguf_i32_catalog(metadata, &key("feed_forward_length"))?
         },
         num_attention_heads,
-        rms_norm_eps: gguf_f32(metadata, &key("attention.layer_norm_rms_epsilon"), stream)?,
+        rms_norm_eps: gguf_f32(metadata, &key("attention.layer_norm_rms_epsilon"))?,
         vocab_size,
         num_key_value_heads,
-        max_position_embeddings: gguf_i32(metadata, &key("context_length"), stream)?,
-        rope_theta: gguf_optional_f32(metadata, &key("rope.freq_base"), stream)?
-            .unwrap_or(1_000_000.0),
+        max_position_embeddings: gguf_i32_catalog(metadata, &key("context_length"))?,
+        rope_theta: gguf_optional_f32(metadata, &key("rope.freq_base"))?.unwrap_or(1_000_000.0),
         head_dim,
         tie_word_embeddings: !arrays.contains_gguf_tensor("output.weight"),
-        rope_scaling: gguf_rope_scaling(metadata, architecture, stream)?,
+        rope_scaling: gguf_rope_scaling(metadata, architecture)?,
         quantization: None,
         quantization_config: None,
         quantized_weights: None,
         moe_intermediate_size: if is_moe {
-            gguf_i32(metadata, &key("expert_feed_forward_length"), stream)?
+            gguf_i32_catalog(metadata, &key("expert_feed_forward_length"))?
         } else {
             0
         },
         num_experts: if is_moe {
-            gguf_i32(metadata, &key("expert_count"), stream)?
+            gguf_i32_catalog(metadata, &key("expert_count"))?
         } else {
             0
         },
         num_experts_per_tok: if is_moe {
-            gguf_i32(metadata, &key("expert_used_count"), stream)?
+            gguf_i32_catalog(metadata, &key("expert_used_count"))?
         } else {
             0
         },
         norm_topk_prob: is_moe,
         quantized_weight_configs: None,
-    })
+    };
+    validate_model_args(&args)?;
+    Ok(args)
 }
 
 fn gguf_rope_scaling(
     metadata: &HashMap<String, GgufMetadataValue>,
     architecture: &str,
-    stream: &Stream,
 ) -> Result<Option<HashMap<String, FloatOrString>>, Error> {
     let scaling_type_key = format!("{architecture}.rope.scaling.type");
     let Some(scaling_type) = gguf_optional_string(metadata, &scaling_type_key)? else {
@@ -1769,7 +1858,7 @@ fn gguf_rope_scaling(
         "none" | "default" => Ok(None),
         "linear" => {
             let factor_key = format!("{architecture}.rope.scaling.factor");
-            let factor = gguf_optional_f32(metadata, &factor_key, stream)?.ok_or_else(|| {
+            let factor = gguf_optional_f32(metadata, &factor_key)?.ok_or_else(|| {
                 Error::UnsupportedArchitecture(
                     "linear GGUF RoPE scaling is missing qwen3.rope.scaling.factor".into(),
                 )
@@ -1880,23 +1969,18 @@ fn gguf_optional_string(
     }
 }
 
-pub(crate) fn gguf_i32(
+pub(crate) fn gguf_i32_catalog(
     metadata: &HashMap<String, GgufMetadataValue>,
     key: &str,
-    stream: &Stream,
 ) -> Result<i32, Error> {
-    let value = gguf_i64(metadata, key, stream)?;
+    let value = gguf_i64(metadata, key)?;
     i32::try_from(value).map_err(|_| {
         Error::UnsupportedArchitecture(format!("GGUF metadata value {key:?} exceeds i32"))
     })
 }
 
-fn gguf_i64(
-    metadata: &HashMap<String, GgufMetadataValue>,
-    key: &str,
-    stream: &Stream,
-) -> Result<i64, Error> {
-    gguf_optional_i64(metadata, key, stream)?.ok_or_else(|| {
+fn gguf_i64(metadata: &HashMap<String, GgufMetadataValue>, key: &str) -> Result<i64, Error> {
+    gguf_optional_i64(metadata, key)?.ok_or_else(|| {
         Error::UnsupportedArchitecture(format!("GGUF metadata is missing required key {key:?}"))
     })
 }
@@ -1904,7 +1988,6 @@ fn gguf_i64(
 fn gguf_optional_i64(
     metadata: &HashMap<String, GgufMetadataValue>,
     key: &str,
-    _stream: &Stream,
 ) -> Result<Option<i64>, Error> {
     match metadata.get(key) {
         Some(value) => value.as_i64().map(Some).ok_or_else(|| {
@@ -1914,12 +1997,8 @@ fn gguf_optional_i64(
     }
 }
 
-fn gguf_f32(
-    metadata: &HashMap<String, GgufMetadataValue>,
-    key: &str,
-    stream: &Stream,
-) -> Result<f32, Error> {
-    gguf_optional_f32(metadata, key, stream)?.ok_or_else(|| {
+fn gguf_f32(metadata: &HashMap<String, GgufMetadataValue>, key: &str) -> Result<f32, Error> {
+    gguf_optional_f32(metadata, key)?.ok_or_else(|| {
         Error::UnsupportedArchitecture(format!("GGUF metadata is missing required key {key:?}"))
     })
 }
@@ -1927,7 +2006,6 @@ fn gguf_f32(
 fn gguf_optional_f32(
     metadata: &HashMap<String, GgufMetadataValue>,
     key: &str,
-    _stream: &Stream,
 ) -> Result<Option<f32>, Error> {
     match metadata.get(key) {
         Some(value) => value.as_f32().map(Some).ok_or_else(|| {
@@ -1953,6 +2031,11 @@ pub fn load_qwen3_model(
     weights_stream: &Stream,
 ) -> Result<Model, Error> {
     let model_dir = model_dir.as_ref();
+    crate::api::structural::validate_safetensors_load_path(
+        crate::api::ModelKind::Qwen3,
+        model_dir,
+        crate::api::ModelLoadOptions::default(),
+    )?;
     let model_args = get_qwen3_model_args(model_dir)?;
     let mut model = Model::new(model_args, stream)?;
 
@@ -1970,6 +2053,11 @@ pub fn load_qwen3_model_quantized(
     weights_stream: &Stream,
 ) -> Result<Model, Error> {
     let model_dir = model_dir.as_ref();
+    crate::api::structural::validate_safetensors_load_path(
+        crate::api::ModelKind::Qwen3,
+        model_dir,
+        crate::api::ModelLoadOptions::with_quantization(quantization),
+    )?;
     let mut model_args = get_qwen3_model_args(model_dir)?;
     if !crate::runtime::checkpoint::quantization::should_quantize_on_load(
         "Qwen3",
@@ -2230,8 +2318,6 @@ mod tests {
 
     #[test]
     fn parses_qwen3_gguf_metadata_with_explicit_head_dim() {
-        let ctx = safemlx::ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
-        let stream = ctx.stream();
         let metadata = HashMap::from([
             (
                 "qwen3.embedding_length".into(),
@@ -2275,7 +2361,7 @@ mod tests {
                 ])),
             ),
         ]);
-        let args = super::qwen3_args_from_gguf(&HashMap::new(), &metadata, "qwen3", false, stream)
+        let args = super::qwen3_args_from_gguf_catalog(&HashMap::new(), &metadata, "qwen3", false)
             .unwrap();
 
         assert_eq!(args.head_dim, 128);

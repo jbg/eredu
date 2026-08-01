@@ -1840,6 +1840,8 @@ pub(super) fn load_gguf_model_data(
     let gguf_architecture = GgufArchitecture::resolve(&architecture)?;
     gguf_architecture.validate_catalog(&checkpoint, &metadata)?;
     gguf_architecture.validate_load_policy(options)?;
+    super::structural::validate_gguf(gguf_architecture, &checkpoint, &metadata, options)
+        .into_loader_result()?;
     let chat_template = match metadata.get("tokenizer.chat_template") {
         Some(GgufMetadataValue::String(template)) => {
             Some(ModelChatTemplate::Single(template.clone()))

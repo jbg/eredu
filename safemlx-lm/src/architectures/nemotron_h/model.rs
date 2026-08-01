@@ -2156,35 +2156,24 @@ pub(crate) fn load_nemotron_h_gguf_checkpoint(
             "GGUF architecture {architecture:?}; this loader supports nemotron_h and nemotron_h_moe"
         )));
     }
-    let is_moe = architecture == "nemotron_h_moe";
-    let expert_count_key = format!("{architecture}.expert_count");
-    let has_experts = gguf_optional_i64(&metadata, &expert_count_key, weights_stream)?.unwrap_or(0)
-        > 0
-        || checkpoint.any_gguf_tensor(|name| name.contains("_exps"));
-    if !is_moe && has_experts {
-        return Err(Error::UnsupportedArchitecture(
-            "dense nemotron_h GGUF metadata contains MoE expert tensors".into(),
-        ));
-    }
-    if is_moe && !has_experts {
-        return Err(Error::UnsupportedArchitecture(
-            "nemotron_h_moe GGUF metadata does not contain routed experts".into(),
-        ));
-    }
-    let latent_size_key = format!("{architecture}.moe_latent_size");
-    if gguf_optional_i64(&metadata, &latent_size_key, weights_stream)?.unwrap_or(0) > 0
-        || checkpoint.any_gguf_tensor(|name| name.contains("ffn_latent_"))
-    {
-        return Err(Error::UnsupportedArchitecture(
-            "Nemotron-H latent-space MoE GGUF checkpoints are not supported".into(),
-        ));
-    }
     checkpoint
         .catalog()
         .translated_outputs(translate_gguf_weight_name)
         .map_err(safemlx::error::IoError::from)?;
 
-    let mut args = nemotron_h_args_from_gguf(checkpoint, &metadata, &architecture, weights_stream)?;
+    let gguf_architecture = if architecture == "nemotron_h_moe" {
+        crate::api::GgufArchitecture::NemotronHMoe
+    } else {
+        crate::api::GgufArchitecture::NemotronH
+    };
+    crate::api::structural::validate_gguf(
+        gguf_architecture,
+        checkpoint,
+        &metadata,
+        crate::api::ModelLoadOptions::default(),
+    )
+    .into_loader_result()?;
+    let mut args = model_args_from_gguf_catalog(checkpoint, &metadata, &architecture)?;
     let quantized_weight_configs =
         gguf_quantization_configs(checkpoint, translate_gguf_weight_name)?;
     args.quantized_weights = Some(quantized_weight_configs.keys().cloned().collect());
@@ -2214,7 +2203,7 @@ pub(crate) fn load_nemotron_h_gguf_checkpoint(
 pub(crate) fn prepare_nemotron_h_gguf_checkpoint(
     checkpoint: &GgufCheckpoint,
     metadata: &HashMap<String, GgufMetadataValue>,
-    weights_stream: &Stream,
+    _weights_stream: &Stream,
 ) -> Result<PreparedNemotronHGguf, Error> {
     let architecture = gguf_string(metadata, "general.architecture")?;
     if !matches!(architecture.as_str(), "nemotron_h" | "nemotron_h_moe") {
@@ -2222,29 +2211,23 @@ pub(crate) fn prepare_nemotron_h_gguf_checkpoint(
             "GGUF architecture {architecture:?}; this loader supports nemotron_h and nemotron_h_moe"
         )));
     }
-    let is_moe = architecture == "nemotron_h_moe";
-    let expert_count_key = format!("{architecture}.expert_count");
-    let has_experts = gguf_optional_i64(metadata, &expert_count_key, weights_stream)?.unwrap_or(0)
-        > 0
-        || checkpoint.any_gguf_tensor(|name| name.contains("_exps"));
-    if is_moe != has_experts {
-        return Err(Error::UnsupportedArchitecture(
-            "Nemotron-H GGUF architecture and expert tensors disagree".into(),
-        ));
-    }
-    let latent_size_key = format!("{architecture}.moe_latent_size");
-    if gguf_optional_i64(metadata, &latent_size_key, weights_stream)?.unwrap_or(0) > 0
-        || checkpoint.any_gguf_tensor(|name| name.contains("ffn_latent_"))
-    {
-        return Err(Error::UnsupportedArchitecture(
-            "Nemotron-H latent-space MoE GGUF checkpoints are not supported".into(),
-        ));
-    }
     checkpoint
         .catalog()
         .translated_outputs(translate_gguf_weight_name)
         .map_err(safemlx::error::IoError::from)?;
-    let mut args = nemotron_h_args_from_gguf(checkpoint, metadata, &architecture, weights_stream)?;
+    let gguf_architecture = if architecture == "nemotron_h_moe" {
+        crate::api::GgufArchitecture::NemotronHMoe
+    } else {
+        crate::api::GgufArchitecture::NemotronH
+    };
+    crate::api::structural::validate_gguf(
+        gguf_architecture,
+        checkpoint,
+        metadata,
+        crate::api::ModelLoadOptions::default(),
+    )
+    .into_loader_result()?;
+    let mut args = model_args_from_gguf_catalog(checkpoint, metadata, &architecture)?;
     let configs = gguf_quantization_configs(checkpoint, translate_gguf_weight_name)?;
     args.quantized_weights = Some(configs.keys().cloned().collect());
     args.quantized_weight_configs = Some(configs);
@@ -2256,23 +2239,45 @@ pub(crate) fn prepare_nemotron_h_gguf_checkpoint(
     })
 }
 
-fn nemotron_h_args_from_gguf(
+pub(crate) fn model_args_from_gguf_catalog(
     arrays: &impl GgufTensorNames,
     metadata: &HashMap<String, GgufMetadataValue>,
     architecture: &str,
-    stream: &Stream,
 ) -> Result<ModelArgs, Error> {
+    if !matches!(architecture, "nemotron_h" | "nemotron_h_moe") {
+        return Err(Error::UnsupportedArchitecture(format!(
+            "GGUF architecture {architecture:?}; this loader supports nemotron_h and nemotron_h_moe"
+        )));
+    }
     let key = |suffix: &str| format!("{architecture}.{suffix}");
     let is_moe = architecture == "nemotron_h_moe";
-    let num_hidden_layers = gguf_i32(metadata, &key("block_count"), stream)?;
+    let expert_count_key = key("expert_count");
+    let has_experts = gguf_optional_i64(metadata, &expert_count_key)?.unwrap_or(0) > 0
+        || arrays.any_gguf_tensor(|name| name.contains("_exps"));
+    if is_moe != has_experts {
+        return Err(Error::UnsupportedArchitecture(
+            "Nemotron-H GGUF architecture and expert tensors disagree".into(),
+        ));
+    }
+    let latent_size_key = key("moe_latent_size");
+    if gguf_optional_i64(metadata, &latent_size_key)?.unwrap_or(0) > 0
+        || arrays.any_gguf_tensor(|name| name.contains("ffn_latent_"))
+    {
+        return Err(Error::UnsupportedArchitecture(
+            "Nemotron-H latent-space MoE GGUF checkpoints are not supported".into(),
+        ));
+    }
+
+    let num_hidden_layers = gguf_i32(metadata, &key("block_count"))?;
+    ensure_positive("block_count", num_hidden_layers)?;
     let feed_forward_lengths = expand_layer_values(
         &key("feed_forward_length"),
-        gguf_i64_values(metadata, &key("feed_forward_length"), stream)?,
+        gguf_i64_values(metadata, &key("feed_forward_length"))?,
         num_hidden_layers,
     )?;
     let kv_head_counts = expand_layer_values(
         &key("attention.head_count_kv"),
-        gguf_i64_values(metadata, &key("attention.head_count_kv"), stream)?,
+        gguf_i64_values(metadata, &key("attention.head_count_kv"))?,
         num_hidden_layers,
     )?;
     let hybrid_override_pattern =
@@ -2282,21 +2287,25 @@ fn nemotron_h_args_from_gguf(
     let num_key_value_heads =
         unique_nonzero_layer_value(&key("attention.head_count_kv"), &kv_head_counts)?;
 
-    let inner_size = gguf_i32(metadata, &key("ssm.inner_size"), stream)?;
-    let mamba_num_heads = gguf_i32(metadata, &key("ssm.time_step_rank"), stream)?;
+    let inner_size = gguf_i32(metadata, &key("ssm.inner_size"))?;
+    let mamba_num_heads = gguf_i32(metadata, &key("ssm.time_step_rank"))?;
+    ensure_positive("ssm.inner_size", inner_size)?;
+    ensure_positive("ssm.time_step_rank", mamba_num_heads)?;
     if inner_size % mamba_num_heads != 0 {
         return Err(Error::UnsupportedArchitecture(format!(
             "Nemotron-H SSM inner size {inner_size} is not divisible by {mamba_num_heads} heads"
         )));
     }
-    let hidden_size = gguf_i32(metadata, &key("embedding_length"), stream)?;
-    let num_attention_heads = gguf_i32(metadata, &key("attention.head_count"), stream)?;
-    let head_dim = gguf_optional_i64(metadata, &key("attention.key_length"), stream)?
+    let hidden_size = gguf_i32(metadata, &key("embedding_length"))?;
+    let num_attention_heads = gguf_i32(metadata, &key("attention.head_count"))?;
+    ensure_positive("embedding_length", hidden_size)?;
+    ensure_positive("attention.head_count", num_attention_heads)?;
+    let head_dim = gguf_optional_i64(metadata, &key("attention.key_length"))?
         .map(i32::try_from)
         .transpose()
         .map_err(|_| Error::UnsupportedArchitecture("Nemotron-H head size exceeds i32".into()))?
         .unwrap_or(hidden_size / num_attention_heads);
-    let norm_eps = gguf_f32(metadata, &key("attention.layer_norm_rms_epsilon"), stream)?;
+    let norm_eps = gguf_f32(metadata, &key("attention.layer_norm_rms_epsilon"))?;
     let vocab_size = match metadata
         .get("tokenizer.ggml.tokens")
         .and_then(GgufMetadataValue::as_strings)
@@ -2309,16 +2318,16 @@ fn nemotron_h_args_from_gguf(
                 "GGUF tokenizer.ggml.tokens metadata has the wrong type".into(),
             ));
         }
-        None => gguf_i32(metadata, &key("vocab_size"), stream)?,
+        None => gguf_i32(metadata, &key("vocab_size"))?,
     };
 
     let n_routed_experts = if is_moe {
-        gguf_i32(metadata, &key("expert_count"), stream)?
+        gguf_i32(metadata, &key("expert_count"))?
     } else {
         default_n_routed_experts()
     };
     let n_shared_experts = if is_moe {
-        gguf_optional_i64(metadata, &key("expert_shared_count"), stream)?
+        gguf_optional_i64(metadata, &key("expert_shared_count"))?
             .unwrap_or(1)
             .try_into()
             .map_err(|_| Error::UnsupportedArchitecture("expert_shared_count exceeds i32".into()))?
@@ -2326,22 +2335,22 @@ fn nemotron_h_args_from_gguf(
         default_n_shared_experts()
     };
     let moe_intermediate_size = if is_moe {
-        gguf_i32(metadata, &key("expert_feed_forward_length"), stream)?
+        gguf_i32(metadata, &key("expert_feed_forward_length"))?
     } else {
         default_moe_intermediate_size()
     };
     let moe_shared_expert_intermediate_size = if is_moe {
-        gguf_i32(metadata, &key("expert_shared_feed_forward_length"), stream)?
+        gguf_i32(metadata, &key("expert_shared_feed_forward_length"))?
     } else {
         default_moe_shared_expert_intermediate_size()
     };
     let num_experts_per_tok = if is_moe {
-        gguf_i32(metadata, &key("expert_used_count"), stream)?
+        gguf_i32(metadata, &key("expert_used_count"))?
     } else {
         default_num_experts_per_tok()
     };
 
-    Ok(ModelArgs {
+    let args = ModelArgs {
         model_type: "nemotron_h".into(),
         vocab_size,
         tie_word_embeddings: !arrays.contains_gguf_tensor("output.weight"),
@@ -2352,9 +2361,9 @@ fn nemotron_h_args_from_gguf(
         num_attention_heads,
         head_dim,
         num_key_value_heads,
-        rope_theta: gguf_optional_f32(metadata, &key("rope.freq_base"), stream)?
+        rope_theta: gguf_optional_f32(metadata, &key("rope.freq_base"))?
             .unwrap_or_else(default_rope_theta),
-        max_position_embeddings: gguf_i32(metadata, &key("context_length"), stream)?,
+        max_position_embeddings: gguf_i32(metadata, &key("context_length"))?,
         attention_bias: arrays.any_gguf_tensor(|name| {
             name.ends_with("attn_q.bias")
                 || name.ends_with("attn_k.bias")
@@ -2371,17 +2380,17 @@ fn nemotron_h_args_from_gguf(
         norm_eps,
         residual_in_fp32: false,
         num_logits_to_keep: 1,
-        sliding_window: gguf_optional_i64(metadata, &key("attention.sliding_window"), stream)?
+        sliding_window: gguf_optional_i64(metadata, &key("attention.sliding_window"))?
             .map(i32::try_from)
             .transpose()
             .map_err(|_| {
                 Error::UnsupportedArchitecture("Nemotron-H sliding window exceeds i32".into())
             })?,
-        ssm_state_size: gguf_i32(metadata, &key("ssm.state_size"), stream)?,
+        ssm_state_size: gguf_i32(metadata, &key("ssm.state_size"))?,
         mamba_num_heads,
-        n_groups: gguf_i32(metadata, &key("ssm.group_count"), stream)?,
+        n_groups: gguf_i32(metadata, &key("ssm.group_count"))?,
         mamba_head_dim: inner_size / mamba_num_heads,
-        conv_kernel: gguf_i32(metadata, &key("ssm.conv_kernel"), stream)?,
+        conv_kernel: gguf_i32(metadata, &key("ssm.conv_kernel"))?,
         expand: 2,
         mamba_hidden_act: "silu".into(),
         time_step_min: default_time_step_min(),
@@ -2400,12 +2409,12 @@ fn nemotron_h_args_from_gguf(
         moe_shared_expert_intermediate_size,
         num_experts_per_tok,
         routed_scaling_factor: if is_moe {
-            gguf_optional_f32(metadata, &key("expert_weights_scale"), stream)?.unwrap_or(1.0)
+            gguf_optional_f32(metadata, &key("expert_weights_scale"))?.unwrap_or(1.0)
         } else {
             default_routed_scaling_factor()
         },
         n_group: if is_moe {
-            gguf_optional_i64(metadata, &key("expert_group_count"), stream)?
+            gguf_optional_i64(metadata, &key("expert_group_count"))?
                 .unwrap_or(1)
                 .try_into()
                 .map_err(|_| {
@@ -2415,7 +2424,7 @@ fn nemotron_h_args_from_gguf(
             default_n_group()
         },
         topk_group: if is_moe {
-            gguf_optional_i64(metadata, &key("expert_group_used_count"), stream)?
+            gguf_optional_i64(metadata, &key("expert_group_used_count"))?
                 .unwrap_or(1)
                 .try_into()
                 .map_err(|_| {
@@ -2425,7 +2434,7 @@ fn nemotron_h_args_from_gguf(
             default_topk_group()
         },
         norm_topk_prob: if is_moe {
-            gguf_optional_i64(metadata, &key("expert_weights_norm"), stream)?.unwrap_or(1) != 0
+            gguf_optional_i64(metadata, &key("expert_weights_norm"))?.unwrap_or(1) != 0
         } else {
             true
         },
@@ -2433,7 +2442,9 @@ fn nemotron_h_args_from_gguf(
         quantization: None,
         quantized_weights: None,
         quantized_weight_configs: None,
-    })
+    };
+    validate_model_args(&args)?;
+    Ok(args)
 }
 
 #[cfg(test)]
@@ -2621,22 +2632,14 @@ fn gguf_string(metadata: &HashMap<String, GgufMetadataValue>, key: &str) -> Resu
     }
 }
 
-fn gguf_i32(
-    metadata: &HashMap<String, GgufMetadataValue>,
-    key: &str,
-    stream: &Stream,
-) -> Result<i32, Error> {
-    i32::try_from(gguf_i64(metadata, key, stream)?).map_err(|_| {
+fn gguf_i32(metadata: &HashMap<String, GgufMetadataValue>, key: &str) -> Result<i32, Error> {
+    i32::try_from(gguf_i64(metadata, key)?).map_err(|_| {
         Error::UnsupportedArchitecture(format!("GGUF metadata value {key:?} exceeds i32"))
     })
 }
 
-fn gguf_i64(
-    metadata: &HashMap<String, GgufMetadataValue>,
-    key: &str,
-    stream: &Stream,
-) -> Result<i64, Error> {
-    gguf_optional_i64(metadata, key, stream)?.ok_or_else(|| {
+fn gguf_i64(metadata: &HashMap<String, GgufMetadataValue>, key: &str) -> Result<i64, Error> {
+    gguf_optional_i64(metadata, key)?.ok_or_else(|| {
         Error::UnsupportedArchitecture(format!("GGUF metadata is missing required key {key:?}"))
     })
 }
@@ -2644,9 +2647,8 @@ fn gguf_i64(
 fn gguf_optional_i64(
     metadata: &HashMap<String, GgufMetadataValue>,
     key: &str,
-    stream: &Stream,
 ) -> Result<Option<i64>, Error> {
-    let Some(values) = gguf_optional_i64_values(metadata, key, stream)? else {
+    let Some(values) = gguf_optional_i64_values(metadata, key)? else {
         return Ok(None);
     };
     if values.len() != 1 {
@@ -2660,9 +2662,8 @@ fn gguf_optional_i64(
 fn gguf_i64_values(
     metadata: &HashMap<String, GgufMetadataValue>,
     key: &str,
-    stream: &Stream,
 ) -> Result<Vec<i64>, Error> {
-    gguf_optional_i64_values(metadata, key, stream)?.ok_or_else(|| {
+    gguf_optional_i64_values(metadata, key)?.ok_or_else(|| {
         Error::UnsupportedArchitecture(format!("GGUF metadata is missing required key {key:?}"))
     })
 }
@@ -2670,7 +2671,6 @@ fn gguf_i64_values(
 fn gguf_optional_i64_values(
     metadata: &HashMap<String, GgufMetadataValue>,
     key: &str,
-    _stream: &Stream,
 ) -> Result<Option<Vec<i64>>, Error> {
     match metadata.get(key) {
         Some(value) => value.to_i64_vec().map(Some).ok_or_else(|| {
@@ -2680,12 +2680,8 @@ fn gguf_optional_i64_values(
     }
 }
 
-fn gguf_f32(
-    metadata: &HashMap<String, GgufMetadataValue>,
-    key: &str,
-    stream: &Stream,
-) -> Result<f32, Error> {
-    gguf_optional_f32(metadata, key, stream)?.ok_or_else(|| {
+fn gguf_f32(metadata: &HashMap<String, GgufMetadataValue>, key: &str) -> Result<f32, Error> {
+    gguf_optional_f32(metadata, key)?.ok_or_else(|| {
         Error::UnsupportedArchitecture(format!("GGUF metadata is missing required key {key:?}"))
     })
 }
@@ -2693,7 +2689,6 @@ fn gguf_f32(
 fn gguf_optional_f32(
     metadata: &HashMap<String, GgufMetadataValue>,
     key: &str,
-    _stream: &Stream,
 ) -> Result<Option<f32>, Error> {
     match metadata.get(key) {
         Some(value) => value.as_f32().map(Some).ok_or_else(|| {
@@ -2714,9 +2709,7 @@ pub fn load_nemotron_h_tokenizer(model_dir: impl AsRef<Path>) -> Result<Tokenize
 /// Reads Nemotron-H model arguments from `config.json`.
 pub fn get_nemotron_h_model_args(model_dir: impl AsRef<Path>) -> Result<ModelArgs, Error> {
     let file = std::fs::File::open(model_dir.as_ref().join("config.json"))?;
-    let args: ModelArgs = serde_json::from_reader(file)?;
-    validate_model_args(&args)?;
-    Ok(args)
+    model_args_from_config_value(&serde_json::from_reader(file)?)
 }
 
 /// Loads a Nemotron-H model and safetensors weights from a model directory.
@@ -2726,6 +2719,11 @@ pub fn load_nemotron_h_model(
     weights_stream: &Stream,
 ) -> Result<Model, Error> {
     let model_dir = model_dir.as_ref();
+    crate::api::structural::validate_safetensors_load_path(
+        crate::api::ModelKind::NemotronH,
+        model_dir,
+        crate::api::ModelLoadOptions::default(),
+    )?;
     let args = get_nemotron_h_model_args(model_dir)?;
     let mut model = Model::new(args.clone(), stream)?;
     let config = nemotron_h_strict_load_config();
@@ -2808,11 +2806,17 @@ pub fn load_nemotron_h_safetensors_strict<M: safemlx::module::ModuleParameters>(
 }
 
 /// Validates a parsed Nemotron-H config value.
-pub(crate) fn validate_model_config_value(config: &Value) -> Result<(), Error> {
+pub(crate) fn model_args_from_config_value(config: &Value) -> Result<ModelArgs, Error> {
     let args: ModelArgs = serde_json::from_value(config.clone()).map_err(|error| {
         Error::UnsupportedArchitecture(format!("invalid nemotron_h config: {error}"))
     })?;
-    validate_model_args(&args)
+    validate_model_args(&args)?;
+    Ok(args)
+}
+
+/// Validates a parsed Nemotron-H config value.
+pub(crate) fn validate_model_config_value(config: &Value) -> Result<(), Error> {
+    model_args_from_config_value(config).map(|_| ())
 }
 
 fn validate_model_args(args: &ModelArgs) -> Result<(), Error> {
@@ -2835,6 +2839,7 @@ fn validate_model_args(args: &ModelArgs) -> Result<(), Error> {
     ensure_positive("num_attention_heads", args.num_attention_heads)?;
     ensure_positive("num_key_value_heads", args.num_key_value_heads)?;
     ensure_positive("head_dim", args.head_dim)?;
+    ensure_positive("max_position_embeddings", args.max_position_embeddings)?;
     ensure_positive("ssm_state_size", args.ssm_state_size)?;
     ensure_positive("mamba_num_heads", args.mamba_num_heads)?;
     ensure_positive("n_groups", args.n_groups)?;
@@ -2844,6 +2849,77 @@ fn validate_model_args(args: &ModelArgs) -> Result<(), Error> {
     ensure_positive("n_routed_experts", args.n_routed_experts)?;
     ensure_positive("n_shared_experts", args.n_shared_experts)?;
     ensure_positive("num_experts_per_tok", args.num_experts_per_tok)?;
+
+    if layers.contains(&LayerBlockType::Attention)
+        && args.num_attention_heads % args.num_key_value_heads != 0
+    {
+        return Err(Error::UnsupportedArchitecture(format!(
+            "Nemotron-H num_attention_heads ({}) must be divisible by num_key_value_heads ({})",
+            args.num_attention_heads, args.num_key_value_heads
+        )));
+    }
+    if layers.contains(&LayerBlockType::Mamba) {
+        if args.mamba_num_heads % args.n_groups != 0 {
+            return Err(Error::UnsupportedArchitecture(format!(
+                "Nemotron-H mamba_num_heads ({}) must be divisible by n_groups ({})",
+                args.mamba_num_heads, args.n_groups
+            )));
+        }
+        let intermediate = args
+            .mamba_num_heads
+            .checked_mul(args.mamba_head_dim)
+            .ok_or_else(|| {
+                Error::UnsupportedArchitecture(
+                    "Nemotron-H Mamba intermediate size overflows i32".into(),
+                )
+            })?;
+        let grouped_state = args
+            .n_groups
+            .checked_mul(args.ssm_state_size)
+            .and_then(|value| value.checked_mul(2))
+            .ok_or_else(|| {
+                Error::UnsupportedArchitecture("Nemotron-H Mamba state width overflows i32".into())
+            })?;
+        intermediate
+            .checked_add(grouped_state)
+            .and_then(|conv| conv.checked_add(intermediate))
+            .and_then(|projection| projection.checked_add(args.mamba_num_heads))
+            .ok_or_else(|| {
+                Error::UnsupportedArchitecture(
+                    "Nemotron-H Mamba projection size overflows i32".into(),
+                )
+            })?;
+    }
+    if layers.contains(&LayerBlockType::Mlp) {
+        ensure_positive("intermediate_size", args.intermediate_size)?;
+    }
+    if layers.contains(&LayerBlockType::Moe) {
+        ensure_positive("moe_intermediate_size", args.moe_intermediate_size)?;
+        ensure_positive(
+            "moe_shared_expert_intermediate_size",
+            args.moe_shared_expert_intermediate_size,
+        )?;
+        ensure_positive("n_group", args.n_group)?;
+        ensure_positive("topk_group", args.topk_group)?;
+        if args.n_shared_experts != 1 {
+            return Err(Error::UnsupportedArchitecture(format!(
+                "Nemotron-H loader requires exactly one shared expert, got {}",
+                args.n_shared_experts
+            )));
+        }
+        let grouped_capacity = args
+            .topk_group
+            .checked_mul(args.n_routed_experts / args.n_group);
+        if args.n_routed_experts % args.n_group != 0
+            || args.topk_group > args.n_group
+            || grouped_capacity.is_none_or(|capacity| args.num_experts_per_tok > capacity)
+        {
+            return Err(Error::UnsupportedArchitecture(format!(
+                "invalid Nemotron-H grouped expert routing: experts={}, groups={}, topk_group={}, experts_per_token={}",
+                args.n_routed_experts, args.n_group, args.topk_group, args.num_experts_per_tok
+            )));
+        }
+    }
 
     if args.num_experts_per_tok > args.n_routed_experts {
         return Err(Error::UnsupportedArchitecture(format!(
@@ -3446,5 +3522,22 @@ mod tests {
             error.to_string(),
             "unsupported model architecture: Nemotron-H hybrid_override_pattern has 2 layers, expected 52"
         );
+    }
+
+    #[test]
+    fn rejects_incompatible_mamba_and_grouped_expert_geometry() {
+        let mut config = nemotron_nano_config();
+        config["n_groups"] = json!(3);
+        let error = validate_model_config_value(&config).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("mamba_num_heads (64) must be divisible by n_groups (3)"));
+
+        let mut config = nemotron_nano_config();
+        config["n_group"] = json!(3);
+        let error = validate_model_config_value(&config).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("invalid Nemotron-H grouped expert routing"));
     }
 }

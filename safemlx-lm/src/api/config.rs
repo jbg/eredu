@@ -283,7 +283,7 @@ impl GgufArchitecture {
         Ok(())
     }
 
-    const fn metadata_name(self) -> &'static str {
+    pub(crate) const fn metadata_name(self) -> &'static str {
         match self {
             Self::KimiLinear => "kimi-linear",
             Self::DeepSeek2 => "deepseek2",
@@ -346,33 +346,6 @@ impl GgufArchitecture {
             return Err(Error::UnsupportedArchitecture(
                 "GGUF model checkpoint is missing required tensor \"token_embd.weight\"".into(),
             ));
-        }
-        if self == Self::GptOss {
-            let block_count = metadata
-                .get("gpt-oss.block_count")
-                .and_then(GgufMetadataValue::as_i64)
-                .and_then(|value| usize::try_from(value).ok())
-                .expect("validated positive integer above");
-            for layer in 0..block_count {
-                for projection in ["gate", "up", "down"] {
-                    let name = format!("blk.{layer}.ffn_{projection}_exps.weight");
-                    let tensor = checkpoint
-                        .catalog()
-                        .tensors()
-                        .find(|tensor| tensor.descriptor().name == name)
-                        .ok_or_else(|| {
-                            Error::UnsupportedArchitecture(format!(
-                                "GPT-OSS GGUF is missing routed expert tensor {name:?}"
-                            ))
-                        })?;
-                    if !tensor.is_mxfp4() {
-                        return Err(Error::UnsupportedArchitecture(format!(
-                            "GPT-OSS GGUF routed tensor {name:?} uses {:?}; the current kernel requires canonical MXFP4 type 39 experts",
-                            tensor.descriptor().ggml_type
-                        )));
-                    }
-                }
-            }
         }
         if matches!(self, Self::Qwen35 | Self::Qwen35Moe | Self::Qwen3Next)
             && checkpoint.catalog().tensors().any(|tensor| {
@@ -564,12 +537,7 @@ fn validate_model_config(kind: ModelKind, config: &Value) -> Result<(), Error> {
         ModelKind::Lfm2 => lfm2::validate_model_config_value(config),
         ModelKind::NemotronH => nemotron_h::validate_model_config_value(config),
         ModelKind::PersonaPlex => personaplex::validate_model_config_value(config),
-        ModelKind::Qwen3 => {
-            serde_json::from_value::<qwen3::ModelArgs>(config.clone()).map_err(|error| {
-                Error::UnsupportedArchitecture(format!("invalid qwen3 config: {error}"))
-            })?;
-            Ok(())
-        }
+        ModelKind::Qwen3 => qwen3::model_args_from_config_value(config).map(|_| ()),
         ModelKind::Qwen3Next => qwen3_next::validate_model_config_value(config),
         ModelKind::Qwen3Vl => qwen3_vl::validate_model_config_value(config),
         ModelKind::Qwen3VlMoe => qwen3_vl_moe::validate_model_config_value(config),

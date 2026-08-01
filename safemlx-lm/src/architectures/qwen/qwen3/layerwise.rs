@@ -196,6 +196,20 @@ pub fn load_qwen3_layerwise_model(
     weights_stream: &Stream,
 ) -> Result<Qwen3LayerwiseModel, Error> {
     let model_dir = model_dir.as_ref();
+    let options = options.into();
+    let residency = match options {
+        LayerExecutionLoadOptions::LayerwiseHost(options) => {
+            WeightResidency::LayerwiseHost(options)
+        }
+        LayerExecutionLoadOptions::DenseDiskStream(options) => {
+            WeightResidency::DenseDiskStream(options)
+        }
+    };
+    crate::api::structural::validate_safetensors_load_path(
+        crate::api::ModelKind::Qwen3,
+        model_dir,
+        crate::api::ModelLoadOptions::default().with_weight_residency(residency),
+    )?;
     let args = resident::get_qwen3_model_args(model_dir)?;
     let adapter = Qwen3LayerwiseAdapter::new(args, stream)?;
     Ok(Qwen3LayerwiseModel {
@@ -212,13 +226,8 @@ pub(crate) fn load_qwen3_gguf_layerwise_model(
     weights_stream: &Stream,
 ) -> Result<(Qwen3LayerwiseModel, Vec<u32>), Error> {
     let is_moe = architecture == "qwen3moe";
-    let (args, eos_token_ids) = resident::prepare_qwen3_gguf_checkpoint(
-        checkpoint,
-        metadata,
-        architecture,
-        is_moe,
-        weights_stream,
-    )?;
+    let (args, eos_token_ids) =
+        resident::prepare_qwen3_gguf_checkpoint(checkpoint, metadata, architecture, is_moe)?;
     let store: Arc<dyn WeightStore + Send + Sync> =
         Arc::new(GgufWeightStore::new_with_max_mapped_shards(
             checkpoint.clone(),
@@ -279,13 +288,8 @@ pub(crate) fn load_qwen3_gguf_sparse_ep_base(
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<(resident::Model, Arc<dyn WeightStore + Send + Sync>), Error> {
-    let (args, _) = resident::prepare_qwen3_gguf_checkpoint(
-        checkpoint,
-        metadata,
-        "qwen3moe",
-        true,
-        weights_stream,
-    )?;
+    let (args, _) =
+        resident::prepare_qwen3_gguf_checkpoint(checkpoint, metadata, "qwen3moe", true)?;
     if !args.is_moe() {
         return Err(Error::UnsupportedArchitecture(
             "sparse GGUF expert parallelism requires a Qwen3 MoE checkpoint".into(),
@@ -1297,7 +1301,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         write_fixture(dir.path(), &fixture, split_experts, gpu.stream());
 
-        let mut resident = qwen3::load_qwen3_model(dir.path(), gpu.stream(), cpu.stream()).unwrap();
+        let resident_dir = tempfile::tempdir().unwrap();
+        write_fixture(resident_dir.path(), &fixture, false, gpu.stream());
+
+        let mut resident =
+            qwen3::load_qwen3_model(resident_dir.path(), gpu.stream(), cpu.stream()).unwrap();
         let non_expert = LayerwiseLoadOptions::new(OffloadConfig::new(None, None, 1).unwrap());
         let expert_options = ExpertCacheLoadOptions::new(
             non_expert,

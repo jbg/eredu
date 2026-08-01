@@ -3947,8 +3947,18 @@ pub(crate) fn load_qwen3_5_moe_gguf_checkpoint(
             "GGUF architecture {architecture:?}; this loader supports qwen35, qwen35moe, and qwen3next"
         )));
     }
-    crate::api::GgufArchitecture::resolve(&architecture)?
-        .validate_catalog(checkpoint, &metadata)?;
+    let resolved = crate::api::GgufArchitecture::resolve(&architecture)?;
+    resolved.validate_catalog(checkpoint, &metadata)?;
+    crate::api::structural::validate_gguf(
+        resolved,
+        checkpoint,
+        &metadata,
+        crate::api::ModelLoadOptions {
+            quantization,
+            ..Default::default()
+        },
+    )
+    .into_loader_result()?;
     let is_moe = matches!(architecture.as_str(), "qwen35moe" | "qwen3next");
     let key = |suffix: &str| format!("{architecture}.{suffix}");
     let block_count = qwen35_gguf_i32(&metadata, &key("block_count"), weights_stream)?;
@@ -3966,13 +3976,8 @@ pub(crate) fn load_qwen3_5_moe_gguf_checkpoint(
         )));
     }
     let num_hidden_layers = block_count - nextn_layers;
-    let mut args = qwen35_args_from_gguf(
-        checkpoint,
-        &metadata,
-        &architecture,
-        num_hidden_layers,
-        weights_stream,
-    )?;
+    let mut args = qwen35_args_from_gguf_catalog(checkpoint, &metadata, &architecture)?;
+    debug_assert_eq!(args.num_hidden_layers, num_hidden_layers);
     let mut configs = gguf_quantization_configs(checkpoint, qwen35_translate_gguf_weight_name)?;
     if is_moe {
         for layer in 0..num_hidden_layers {
@@ -4132,13 +4137,8 @@ pub(crate) fn prepare_qwen35_gguf_checkpoint(
         )));
     }
     let num_hidden_layers = block_count - nextn_layers;
-    let mut args = qwen35_args_from_gguf(
-        checkpoint,
-        metadata,
-        &architecture,
-        num_hidden_layers,
-        weights_stream,
-    )?;
+    let mut args = qwen35_args_from_gguf_catalog(checkpoint, metadata, &architecture)?;
+    debug_assert_eq!(args.num_hidden_layers, num_hidden_layers);
     let mut configs = gguf_quantization_configs(checkpoint, qwen35_translate_gguf_weight_name)?;
     if matches!(architecture.as_str(), "qwen35moe" | "qwen3next") {
         for layer in 0..num_hidden_layers {
@@ -4172,30 +4172,57 @@ pub(crate) fn prepare_qwen35_gguf_checkpoint(
     })
 }
 
-fn qwen35_args_from_gguf(
+pub(crate) fn qwen35_args_from_gguf_catalog(
+    arrays: &impl GgufTensorNames,
+    metadata: &HashMap<String, GgufMetadataValue>,
+    architecture: &str,
+) -> Result<ModelArgs, Error> {
+    let key = |suffix: &str| format!("{architecture}.{suffix}");
+    let block_count = qwen35_gguf_catalog_i32(metadata, &key("block_count"))?;
+    let nextn_layers =
+        qwen35_gguf_catalog_optional_i64(metadata, &key("nextn_predict_layers"))?.unwrap_or(0);
+    let nextn_layers = i32::try_from(nextn_layers).map_err(|_| {
+        Error::UnsupportedArchitecture(
+            "Qwen3.5 next-token prediction layer count exceeds i32".into(),
+        )
+    })?;
+    if nextn_layers < 0 || nextn_layers >= block_count {
+        return Err(Error::UnsupportedArchitecture(format!(
+            "Qwen3.5 GGUF has invalid block_count {block_count} and nextn_predict_layers {nextn_layers}"
+        )));
+    }
+    let args =
+        qwen35_args_from_gguf_geometry(arrays, metadata, architecture, block_count - nextn_layers)?;
+    validate_text_model_args(&args, "Qwen3.5 GGUF")?;
+    if architecture == "qwen3next" {
+        super::qwen3_next::fused_projection_widths(&args)?;
+    }
+    Ok(args)
+}
+
+fn qwen35_args_from_gguf_geometry(
     arrays: &impl GgufTensorNames,
     metadata: &HashMap<String, GgufMetadataValue>,
     architecture: &str,
     num_hidden_layers: i32,
-    stream: &Stream,
 ) -> Result<ModelArgs, Error> {
     let key = |suffix: &str| format!("{architecture}.{suffix}");
     let is_moe = matches!(architecture, "qwen35moe" | "qwen3next");
-    let hidden_size = qwen35_gguf_i32(metadata, &key("embedding_length"), stream)?;
-    let num_attention_heads = qwen35_gguf_i32(metadata, &key("attention.head_count"), stream)?;
-    let num_key_value_heads = qwen35_gguf_i32(metadata, &key("attention.head_count_kv"), stream)?;
-    let head_dim = qwen35_gguf_optional_i64(metadata, &key("attention.key_length"), stream)?
+    let hidden_size = qwen35_gguf_catalog_i32(metadata, &key("embedding_length"))?;
+    let num_attention_heads = qwen35_gguf_catalog_i32(metadata, &key("attention.head_count"))?;
+    let num_key_value_heads = qwen35_gguf_catalog_i32(metadata, &key("attention.head_count_kv"))?;
+    let head_dim = qwen35_gguf_catalog_optional_i64(metadata, &key("attention.key_length"))?
         .map(i32::try_from)
         .transpose()
         .map_err(|_| Error::UnsupportedArchitecture("Qwen3.5 head size exceeds i32".into()))?
         .unwrap_or(hidden_size / num_attention_heads);
-    let rope_dims = qwen35_gguf_optional_i64(metadata, &key("rope.dimension_count"), stream)?
+    let rope_dims = qwen35_gguf_catalog_optional_i64(metadata, &key("rope.dimension_count"))?
         .map(i32::try_from)
         .transpose()
         .map_err(|_| Error::UnsupportedArchitecture("Qwen3.5 RoPE dimension exceeds i32".into()))?
         .unwrap_or(head_dim / 4);
     let full_attention_interval =
-        qwen35_gguf_optional_i64(metadata, &key("full_attention_interval"), stream)?.unwrap_or(4);
+        qwen35_gguf_catalog_optional_i64(metadata, &key("full_attention_interval"))?.unwrap_or(4);
     let full_attention_interval = usize::try_from(full_attention_interval).map_err(|_| {
         Error::UnsupportedArchitecture("Qwen3.5 full attention interval must be positive".into())
     })?;
@@ -4216,10 +4243,10 @@ fn qwen35_args_from_gguf(
                 "GGUF tokenizer.ggml.tokens metadata has the wrong type".into(),
             ));
         }
-        None => qwen35_gguf_i32(metadata, &key("vocab_size"), stream)?,
+        None => qwen35_gguf_catalog_i32(metadata, &key("vocab_size"))?,
     };
     let rope_theta =
-        qwen35_gguf_optional_f32(metadata, &key("rope.freq_base"), stream)?.unwrap_or(10_000_000.0);
+        qwen35_gguf_catalog_optional_f32(metadata, &key("rope.freq_base"))?.unwrap_or(10_000_000.0);
     let mut rope_parameters = HashMap::new();
     rope_parameters.insert("rope_theta".into(), serde_json::json!(rope_theta));
     rope_parameters.insert(
@@ -4242,8 +4269,8 @@ fn qwen35_args_from_gguf(
         num_attention_heads,
         num_key_value_heads,
         head_dim,
-        max_position_embeddings: qwen35_gguf_i32(metadata, &key("context_length"), stream)?,
-        rms_norm_eps: qwen35_gguf_f32(metadata, &key("attention.layer_norm_rms_epsilon"), stream)?,
+        max_position_embeddings: qwen35_gguf_catalog_i32(metadata, &key("context_length"))?,
+        rms_norm_eps: qwen35_gguf_catalog_f32(metadata, &key("attention.layer_norm_rms_epsilon"))?,
         tie_word_embeddings: !arrays.contains_gguf_tensor("output.weight"),
         attention_bias: arrays.any_gguf_tensor(|name| {
             name.ends_with("attn_q.bias")
@@ -4252,33 +4279,33 @@ fn qwen35_args_from_gguf(
                 || name.ends_with("attn_output.bias")
         }),
         hidden_act: "silu".into(),
-        linear_conv_kernel_dim: qwen35_gguf_i32(metadata, &key("ssm.conv_kernel"), stream)?,
-        linear_key_head_dim: qwen35_gguf_i32(metadata, &key("ssm.state_size"), stream)?,
-        linear_value_head_dim: qwen35_gguf_i32(metadata, &key("ssm.state_size"), stream)?,
-        linear_num_key_heads: qwen35_gguf_i32(metadata, &key("ssm.group_count"), stream)?,
-        linear_num_value_heads: qwen35_gguf_i32(metadata, &key("ssm.time_step_rank"), stream)?,
+        linear_conv_kernel_dim: qwen35_gguf_catalog_i32(metadata, &key("ssm.conv_kernel"))?,
+        linear_key_head_dim: qwen35_gguf_catalog_i32(metadata, &key("ssm.state_size"))?,
+        linear_value_head_dim: qwen35_gguf_catalog_i32(metadata, &key("ssm.state_size"))?,
+        linear_num_key_heads: qwen35_gguf_catalog_i32(metadata, &key("ssm.group_count"))?,
+        linear_num_value_heads: qwen35_gguf_catalog_i32(metadata, &key("ssm.time_step_rank"))?,
         intermediate_size: if is_moe {
             0
         } else {
-            qwen35_gguf_i32(metadata, &key("feed_forward_length"), stream)?
+            qwen35_gguf_catalog_i32(metadata, &key("feed_forward_length"))?
         },
         moe_intermediate_size: if is_moe {
-            qwen35_gguf_i32(metadata, &key("expert_feed_forward_length"), stream)?
+            qwen35_gguf_catalog_i32(metadata, &key("expert_feed_forward_length"))?
         } else {
             0
         },
         shared_expert_intermediate_size: if is_moe {
-            qwen35_gguf_i32(metadata, &key("expert_shared_feed_forward_length"), stream)?
+            qwen35_gguf_catalog_i32(metadata, &key("expert_shared_feed_forward_length"))?
         } else {
             0
         },
         num_experts_per_tok: if is_moe {
-            qwen35_gguf_i32(metadata, &key("expert_used_count"), stream)?
+            qwen35_gguf_catalog_i32(metadata, &key("expert_used_count"))?
         } else {
             0
         },
         num_experts: if is_moe {
-            qwen35_gguf_i32(metadata, &key("expert_count"), stream)?
+            qwen35_gguf_catalog_i32(metadata, &key("expert_count"))?
         } else {
             0
         },
@@ -4619,19 +4646,25 @@ fn qwen35_gguf_string(
 fn qwen35_gguf_i32(
     metadata: &HashMap<String, GgufMetadataValue>,
     key: &str,
-    stream: &Stream,
+    _stream: &Stream,
 ) -> Result<i32, Error> {
-    i32::try_from(qwen35_gguf_i64(metadata, key, stream)?).map_err(|_| {
+    qwen35_gguf_catalog_i32(metadata, key)
+}
+
+fn qwen35_gguf_catalog_i32(
+    metadata: &HashMap<String, GgufMetadataValue>,
+    key: &str,
+) -> Result<i32, Error> {
+    i32::try_from(qwen35_gguf_catalog_i64(metadata, key)?).map_err(|_| {
         Error::UnsupportedArchitecture(format!("GGUF metadata value {key:?} exceeds i32"))
     })
 }
 
-fn qwen35_gguf_i64(
+fn qwen35_gguf_catalog_i64(
     metadata: &HashMap<String, GgufMetadataValue>,
     key: &str,
-    stream: &Stream,
 ) -> Result<i64, Error> {
-    qwen35_gguf_optional_i64(metadata, key, stream)?.ok_or_else(|| {
+    qwen35_gguf_catalog_optional_i64(metadata, key)?.ok_or_else(|| {
         Error::UnsupportedArchitecture(format!("GGUF metadata is missing required key {key:?}"))
     })
 }
@@ -4640,6 +4673,13 @@ fn qwen35_gguf_optional_i64(
     metadata: &HashMap<String, GgufMetadataValue>,
     key: &str,
     _stream: &Stream,
+) -> Result<Option<i64>, Error> {
+    qwen35_gguf_catalog_optional_i64(metadata, key)
+}
+
+fn qwen35_gguf_catalog_optional_i64(
+    metadata: &HashMap<String, GgufMetadataValue>,
+    key: &str,
 ) -> Result<Option<i64>, Error> {
     match metadata.get(key) {
         Some(value) => value.as_i64().map(Some).ok_or_else(|| {
@@ -4651,20 +4691,18 @@ fn qwen35_gguf_optional_i64(
     }
 }
 
-fn qwen35_gguf_f32(
+fn qwen35_gguf_catalog_f32(
     metadata: &HashMap<String, GgufMetadataValue>,
     key: &str,
-    stream: &Stream,
 ) -> Result<f32, Error> {
-    qwen35_gguf_optional_f32(metadata, key, stream)?.ok_or_else(|| {
+    qwen35_gguf_catalog_optional_f32(metadata, key)?.ok_or_else(|| {
         Error::UnsupportedArchitecture(format!("GGUF metadata is missing required key {key:?}"))
     })
 }
 
-fn qwen35_gguf_optional_f32(
+fn qwen35_gguf_catalog_optional_f32(
     metadata: &HashMap<String, GgufMetadataValue>,
     key: &str,
-    _stream: &Stream,
 ) -> Result<Option<f32>, Error> {
     match metadata.get(key) {
         Some(value) => value.as_f32().map(Some).ok_or_else(|| {
@@ -4689,7 +4727,7 @@ enum Qwen35Variant {
     Qwen3Next,
 }
 
-type ParsedQwen35Config = (ModelArgs, Option<i32>, Option<i32>, Option<VisionConfig>);
+pub(crate) type ParsedQwen35Config = (ModelArgs, Option<i32>, Option<i32>, Option<VisionConfig>);
 
 impl Qwen35Variant {
     fn text_model_type(self) -> &'static str {
@@ -4701,7 +4739,7 @@ impl Qwen35Variant {
     }
 }
 
-fn parse_qwen3_5_config_value(value: Value) -> Result<ParsedQwen35Config, Error> {
+pub(crate) fn parse_qwen3_5_config_value(value: Value) -> Result<ParsedQwen35Config, Error> {
     let mut config: TopLevelConfig = serde_json::from_value(value.clone()).map_err(|error| {
         Error::UnsupportedArchitecture(format!("invalid Qwen3.5 config: {error}"))
     })?;
@@ -4807,15 +4845,102 @@ pub fn get_qwen3_5_moe_model_args(
 ) -> Result<ParsedQwen35Config, Error> {
     let file = std::fs::File::open(model_dir.as_ref().join("config.json"))?;
     let value = serde_json::from_reader(file)?;
-    parse_qwen3_5_config_value(value)
+    model_config_from_value(&value)
 }
 
-pub(crate) fn validate_model_config_value(config: &Value) -> Result<(), Error> {
-    let (args, _, _, _) = parse_qwen3_5_config_value(config.clone())?;
+pub(crate) fn model_config_from_value(config: &Value) -> Result<ParsedQwen35Config, Error> {
+    let parsed = parse_qwen3_5_config_value(config.clone())?;
+    validate_text_model_args(&parsed.0, "Qwen3.5")?;
+    Ok(parsed)
+}
+
+pub(crate) fn validate_text_model_args(args: &ModelArgs, architecture: &str) -> Result<(), Error> {
+    for (name, value) in [
+        ("vocab_size", args.vocab_size),
+        ("hidden_size", args.hidden_size),
+        ("num_hidden_layers", args.num_hidden_layers),
+        ("num_attention_heads", args.num_attention_heads),
+        ("num_key_value_heads", args.num_key_value_heads),
+        ("head_dim", args.head_dim),
+        ("max_position_embeddings", args.max_position_embeddings),
+        ("linear_conv_kernel_dim", args.linear_conv_kernel_dim),
+        ("linear_key_head_dim", args.linear_key_head_dim),
+        ("linear_value_head_dim", args.linear_value_head_dim),
+        ("linear_num_key_heads", args.linear_num_key_heads),
+        ("linear_num_value_heads", args.linear_num_value_heads),
+    ] {
+        if value <= 0 {
+            return Err(Error::UnsupportedArchitecture(format!(
+                "{architecture} {name} must be positive, got {value}"
+            )));
+        }
+    }
+    if args.mtp_num_hidden_layers < 0 {
+        return Err(Error::UnsupportedArchitecture(format!(
+            "{architecture} mtp_num_hidden_layers must be non-negative"
+        )));
+    }
+    if args.hidden_size.checked_mul(2).is_none()
+        || args
+            .num_attention_heads
+            .checked_mul(args.head_dim)
+            .and_then(|value| value.checked_mul(2))
+            .is_none()
+        || args
+            .num_key_value_heads
+            .checked_mul(args.head_dim)
+            .is_none()
+        || args
+            .linear_num_key_heads
+            .checked_mul(args.linear_key_head_dim)
+            .and_then(|key| {
+                args.linear_num_value_heads
+                    .checked_mul(args.linear_value_head_dim)
+                    .and_then(|value| key.checked_mul(2)?.checked_add(value))
+            })
+            .is_none()
+    {
+        return Err(Error::UnsupportedArchitecture(format!(
+            "{architecture} projection geometry exceeds i32"
+        )));
+    }
+    if args.linear_num_value_heads % args.linear_num_key_heads != 0 {
+        return Err(Error::UnsupportedArchitecture(format!(
+            "{architecture} linear value-head count must be divisible by the key-head count"
+        )));
+    }
+    if args.hidden_act != "silu" {
+        return Err(Error::UnsupportedArchitecture(format!(
+            "unsupported {architecture} activation {:?}",
+            args.hidden_act
+        )));
+    }
+    if args.is_moe() {
+        if args.moe_intermediate_size <= 0
+            || args.shared_expert_intermediate_size <= 0
+            || args.num_experts_per_tok <= 0
+            || args.num_experts_per_tok > args.num_experts
+        {
+            return Err(Error::UnsupportedArchitecture(format!(
+                "{architecture} MoE requires positive expert widths and top-k no greater than the expert count"
+            )));
+        }
+    } else if args.intermediate_size <= 0 {
+        return Err(Error::UnsupportedArchitecture(format!(
+            "dense {architecture} intermediate_size must be positive"
+        )));
+    }
     if let Some(quantization_config) = &args.quantization_config {
         quantization_config.validate_supported()?;
     }
+    if let Some(quantization) = args.quantization {
+        quantization.validate()?;
+    }
     Ok(())
+}
+
+pub(crate) fn validate_model_config_value(config: &Value) -> Result<(), Error> {
+    model_config_from_value(config).map(|_| ())
 }
 
 /// Loads a dense or MoE Qwen3.5 model and safetensors weights from a model directory.
@@ -4825,6 +4950,11 @@ pub fn load_qwen3_5_moe_model(
     weights_stream: &Stream,
 ) -> Result<Model, Error> {
     let model_dir = model_dir.as_ref();
+    crate::api::structural::validate_safetensors_load_path(
+        crate::api::ModelKind::Qwen35Moe,
+        model_dir,
+        crate::api::ModelLoadOptions::default(),
+    )?;
     let (args, image_token_id, video_token_id, vision_config) =
         get_qwen3_5_moe_model_args(model_dir)?;
     if let Some(quantization_config) = &args.quantization_config {
@@ -4899,6 +5029,11 @@ pub fn load_qwen3_5_moe_model_quantized(
     )? {
         return load_qwen3_5_moe_model(model_dir, stream, weights_stream);
     }
+    crate::api::structural::validate_safetensors_load_path(
+        crate::api::ModelKind::Qwen35Moe,
+        model_dir,
+        crate::api::ModelLoadOptions::with_quantization(quantization),
+    )?;
     let load_visual = vision_config.is_some();
     let mut model = Model::new_with_affine(
         args,

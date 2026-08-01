@@ -20,12 +20,7 @@ use serde::Deserialize;
 use tokenizers::Tokenizer;
 
 use crate::{
-    api::{
-        common,
-        common::generation::CausalLm,
-        input,
-        qwen3::{gguf_i32, gguf_string},
-    },
+    api::{common, common::generation::CausalLm, input, qwen3::gguf_string},
     error::Error,
     nn::tensor::{
         create_causal_mask,
@@ -149,12 +144,34 @@ impl ModelArgs {
                 self.quantization_config.quant_method
             )));
         }
+        if self.hidden_size <= 0
+            || self.intermediate_size <= 0
+            || self.num_hidden_layers <= 0
+            || self.num_attention_heads <= 0
+            || self.num_key_value_heads <= 0
+            || self.head_dim <= 0
+            || self.vocab_size <= 0
+            || self.num_local_experts <= 0
+            || self.sliding_window <= 0
+            || self.max_position_embeddings <= 0
+        {
+            return Err(Error::UnsupportedArchitecture(
+                "GPT-OSS dimensions, layer counts, and cache geometry must be positive".into(),
+            ));
+        }
         if self.hidden_size % 32 != 0 || self.intermediate_size % 32 != 0 {
             return Err(Error::UnsupportedArchitecture(
                 "GPT-OSS MXFP4 projection dimensions must be divisible by 32".into(),
             ));
         }
-        if self.num_attention_heads * self.head_dim <= 0
+        if self
+            .num_attention_heads
+            .checked_mul(self.head_dim)
+            .is_none()
+            || self
+                .num_key_value_heads
+                .checked_mul(self.head_dim)
+                .is_none()
             || self.num_attention_heads % self.num_key_value_heads != 0
         {
             return Err(Error::UnsupportedArchitecture(
@@ -263,10 +280,15 @@ pub(crate) fn prompt_cache_architecture_fingerprint(args: &ModelArgs) -> String 
 
 /// Validates a parsed GPT-OSS configuration.
 pub fn validate_model_config_value(config: &serde_json::Value) -> Result<(), Error> {
+    model_args_from_config_value(config).map(|_| ())
+}
+
+pub(crate) fn model_args_from_config_value(config: &serde_json::Value) -> Result<ModelArgs, Error> {
     let args: ModelArgs = serde_json::from_value(config.clone()).map_err(|error| {
         Error::UnsupportedArchitecture(format!("invalid gpt_oss config: {error}"))
     })?;
-    args.validate()
+    args.validate()?;
+    Ok(args)
 }
 
 /// One attention layer with learned sink logits.
@@ -1292,7 +1314,7 @@ pub(crate) fn load_gguf_checkpoint(
 pub(crate) fn prepare_gguf_checkpoint(
     checkpoint: &GgufCheckpoint,
     metadata: &HashMap<String, GgufMetadataValue>,
-    stream: &Stream,
+    _stream: &Stream,
 ) -> Result<PreparedGptOssGguf, Error> {
     let architecture = gguf_string(metadata, "general.architecture")?;
     if architecture != "gpt-oss" {
@@ -1300,14 +1322,20 @@ pub(crate) fn prepare_gguf_checkpoint(
             "GGUF architecture {architecture:?}; this loader supports gpt-oss"
         )));
     }
-    crate::api::GgufArchitecture::GptOss.validate_catalog(checkpoint, metadata)?;
+    crate::api::structural::validate_gguf(
+        crate::api::GgufArchitecture::GptOss,
+        checkpoint,
+        metadata,
+        crate::api::ModelLoadOptions::default(),
+    )
+    .into_loader_result()?;
     checkpoint
         .catalog()
         .translated_outputs(translate_gguf_weight_name)
         .map_err(safemlx::error::IoError::from)?;
     let mut configs = gguf_quantization_configs(checkpoint, translate_gguf_weight_name)?;
     configs.retain(|name, _| !name.contains(".mlp.experts."));
-    let mut args = args_from_gguf(checkpoint, metadata, stream)?;
+    let mut args = args_from_gguf_catalog(checkpoint, metadata)?;
     args.quantized_weight_configs = Some(configs);
     args.validate()?;
     Ok(PreparedGptOssGguf {
@@ -1316,32 +1344,36 @@ pub(crate) fn prepare_gguf_checkpoint(
     })
 }
 
-fn args_from_gguf(
+pub(crate) fn args_from_gguf_catalog(
     _arrays: &impl GgufTensorNames,
     metadata: &HashMap<String, GgufMetadataValue>,
-    stream: &Stream,
 ) -> Result<ModelArgs, Error> {
     let key = |suffix: &str| format!("gpt-oss.{suffix}");
-    let hidden_size = gguf_i32(metadata, &key("embedding_length"), stream)?;
-    let num_attention_heads = gguf_i32(metadata, &key("attention.head_count"), stream)?;
+    let hidden_size = gguf_required_i32(metadata, &key("embedding_length"))?;
+    let num_attention_heads = gguf_required_i32(metadata, &key("attention.head_count"))?;
+    if num_attention_heads <= 0 {
+        return Err(Error::UnsupportedArchitecture(
+            "GPT-OSS GGUF attention head count must be positive".into(),
+        ));
+    }
     let head_dim = gguf_optional_i32(metadata, &key("attention.key_length"))?
         .unwrap_or(hidden_size / num_attention_heads);
-    let vocab_size = gguf_vocab_size(metadata, &key("vocab_size"), stream)?;
+    let vocab_size = gguf_vocab_size(metadata, &key("vocab_size"))?;
     let rope_scaling = gguf_rope_scaling(metadata, "gpt-oss")?;
-    Ok(ModelArgs {
+    let args = ModelArgs {
         model_type: "gpt_oss".into(),
         hidden_size,
-        intermediate_size: gguf_i32(metadata, &key("expert_feed_forward_length"), stream)?,
-        num_hidden_layers: gguf_i32(metadata, &key("block_count"), stream)?,
+        intermediate_size: gguf_required_i32(metadata, &key("expert_feed_forward_length"))?,
+        num_hidden_layers: gguf_required_i32(metadata, &key("block_count"))?,
         num_attention_heads,
-        num_key_value_heads: gguf_i32(metadata, &key("attention.head_count_kv"), stream)?,
+        num_key_value_heads: gguf_required_i32(metadata, &key("attention.head_count_kv"))?,
         head_dim,
         vocab_size,
-        num_local_experts: gguf_i32(metadata, &key("expert_count"), stream)?,
-        num_experts_per_tok: gguf_i32(metadata, &key("expert_used_count"), stream)?,
+        num_local_experts: gguf_required_i32(metadata, &key("expert_count"))?,
+        num_experts_per_tok: gguf_required_i32(metadata, &key("expert_used_count"))?,
         rms_norm_eps: gguf_f32(metadata, &key("attention.layer_norm_rms_epsilon"))?,
-        sliding_window: gguf_i32(metadata, &key("attention.sliding_window"), stream)?,
-        max_position_embeddings: gguf_i32(metadata, &key("context_length"), stream)?,
+        sliding_window: gguf_required_i32(metadata, &key("attention.sliding_window"))?,
+        max_position_embeddings: gguf_required_i32(metadata, &key("context_length"))?,
         rope_theta: gguf_optional_f32(metadata, &key("rope.freq_base"))?
             .unwrap_or_else(default_rope_theta),
         rope_scaling,
@@ -1353,13 +1385,14 @@ fn args_from_gguf(
         quantized_weight_configs: None,
         swiglu_limit: gguf_optional_f32(metadata, &key("swiglu_clamp_exp"))?
             .unwrap_or_else(default_swiglu_limit),
-    })
+    };
+    args.validate()?;
+    Ok(args)
 }
 
 fn gguf_vocab_size(
     metadata: &HashMap<String, GgufMetadataValue>,
     fallback: &str,
-    stream: &Stream,
 ) -> Result<i32, Error> {
     match metadata
         .get("tokenizer.ggml.tokens")
@@ -1373,8 +1406,17 @@ fn gguf_vocab_size(
                 "GGUF tokenizer.ggml.tokens metadata has the wrong type".into(),
             ))
         }
-        None => gguf_i32(metadata, fallback, stream),
+        None => gguf_required_i32(metadata, fallback),
     }
+}
+
+fn gguf_required_i32(
+    metadata: &HashMap<String, GgufMetadataValue>,
+    key: &str,
+) -> Result<i32, Error> {
+    gguf_optional_i32(metadata, key)?.ok_or_else(|| {
+        Error::UnsupportedArchitecture(format!("GGUF metadata is missing required key {key:?}"))
+    })
 }
 
 fn gguf_optional_i32(
@@ -1516,10 +1558,9 @@ pub(crate) fn translate_gguf_weight_name(name: &str) -> String {
 
 /// Reads GPT-OSS model arguments from `config.json`.
 pub fn get_model_args(model_dir: impl AsRef<Path>) -> Result<ModelArgs, Error> {
-    let file = std::fs::File::open(model_dir.as_ref().join("config.json"))?;
-    let args: ModelArgs = serde_json::from_reader(file)?;
-    args.validate()?;
-    Ok(args)
+    let config =
+        serde_json::from_reader(std::fs::File::open(model_dir.as_ref().join("config.json"))?)?;
+    model_args_from_config_value(&config)
 }
 
 /// Loads a GPT-OSS safetensors checkpoint strictly, without rewriting keys.
@@ -1529,6 +1570,11 @@ pub fn load_model(
     weights_stream: &Stream,
 ) -> Result<Model, Error> {
     let model_dir = model_dir.as_ref();
+    crate::api::structural::validate_safetensors_load_path(
+        crate::api::ModelKind::GptOss,
+        model_dir,
+        crate::api::ModelLoadOptions::default(),
+    )?;
     let mut model = Model::new(get_model_args(model_dir)?, stream)?;
     let config = StrictLoadConfig::default();
     let mut report = StrictLoadReport::default();
@@ -1556,6 +1602,11 @@ pub fn load_model_quantized(
         ));
     }
     let model_dir = model_dir.as_ref();
+    crate::api::structural::validate_safetensors_load_path(
+        crate::api::ModelKind::GptOss,
+        model_dir,
+        crate::api::ModelLoadOptions::with_quantization(quantization),
+    )?;
     let mut args = get_model_args(model_dir)?;
     if !crate::runtime::checkpoint::quantization::should_quantize_on_load(
         "GPT-OSS dense matrices",

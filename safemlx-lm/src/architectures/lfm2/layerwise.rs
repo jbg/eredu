@@ -172,6 +172,20 @@ pub fn load_lfm2_layerwise_model(
     weights_stream: &Stream,
 ) -> Result<Lfm2LayerwiseModel, Error> {
     let model_dir = model_dir.as_ref();
+    let options = options.into();
+    let residency = match options {
+        LayerExecutionLoadOptions::LayerwiseHost(options) => {
+            WeightResidency::LayerwiseHost(options)
+        }
+        LayerExecutionLoadOptions::DenseDiskStream(options) => {
+            WeightResidency::DenseDiskStream(options)
+        }
+    };
+    crate::api::structural::validate_safetensors_load_path(
+        crate::api::ModelKind::Lfm2,
+        model_dir,
+        crate::api::ModelLoadOptions::default().with_weight_residency(residency),
+    )?;
     let args = resident::get_model_args(model_dir)?;
     let adapter = Lfm2LayerwiseAdapter::new(args, stream)?;
     Ok(Lfm2LayerwiseModel {

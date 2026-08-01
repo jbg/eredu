@@ -211,6 +211,20 @@ pub fn load_gemma4_layerwise_model(
     weights_stream: &Stream,
 ) -> Result<Gemma4LayerwiseModel, Error> {
     let model_dir = model_dir.as_ref();
+    let options = options.into();
+    let residency = match options {
+        LayerExecutionLoadOptions::LayerwiseHost(options) => {
+            WeightResidency::LayerwiseHost(options)
+        }
+        LayerExecutionLoadOptions::DenseDiskStream(options) => {
+            WeightResidency::DenseDiskStream(options)
+        }
+    };
+    crate::api::structural::validate_safetensors_load_path(
+        crate::api::ModelKind::Gemma4,
+        model_dir,
+        crate::api::ModelLoadOptions::default().with_weight_residency(residency),
+    )?;
     let (args, vision, image_token_id, video_token_id, audio, audio_token_id) =
         resident::get_gemma4_model_config(model_dir)?;
     let adapter = Gemma4LayerwiseAdapter::new(
@@ -240,8 +254,14 @@ pub(crate) fn load_gemma4_gguf_layerwise_model(
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<(Gemma4LayerwiseModel, Vec<u32>), Error> {
-    let prepared =
-        resident::prepare_gemma4_gguf_checkpoint(checkpoint, metadata, None, weights_stream)?;
+    crate::api::structural::validate_gguf(
+        crate::api::GgufArchitecture::Gemma4,
+        checkpoint,
+        metadata,
+        crate::api::ModelLoadOptions::default().with_weight_residency(residency),
+    )
+    .into_loader_result()?;
+    let prepared = resident::prepare_gemma4_gguf_checkpoint(checkpoint, metadata, None)?;
     let adapter = Gemma4LayerwiseAdapter::new(prepared.args, None, None, None, None, None, stream)?;
     let store: Arc<dyn WeightStore + Send + Sync> =
         Arc::new(GgufWeightStore::new_with_max_mapped_shards(
