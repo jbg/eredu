@@ -2083,22 +2083,23 @@ pub(crate) fn load_gguf_checkpoint_with_mmproj(
             {
                 let gate_name = format!("{source}.{source_gate}.{source_suffix}");
                 let up_name = format!("{source}.{source_up}.{source_suffix}");
-                match (gate.get(&gate_name), up.get(&up_name)) {
-                    (Some(gate), Some(up)) => load_named_array_strict(
-                        &mut model,
-                        format!("model.layers.{layer}.{target}{target_suffix}"),
-                        concatenate_axis(&[gate.clone(), up.clone()], 1, weights_stream)?,
-                        None,
-                        &config,
-                        &mut report,
-                    )?,
-                    (None, None) if source_suffix == "biases" => {}
-                    _ => {
-                        return Err(Error::UnsupportedArchitecture(format!(
-                            "Inkling GGUF has incomplete gate/up tensors under {source}"
-                        )))
-                    }
-                }
+                let Some((gate, up)) = paired_inkling_gguf_component(
+                    gate.get(&gate_name),
+                    up.get(&up_name),
+                    source_suffix == "weight",
+                    &source,
+                )?
+                else {
+                    continue;
+                };
+                load_named_array_strict(
+                    &mut model,
+                    format!("model.layers.{layer}.{target}{target_suffix}"),
+                    concatenate_axis(&[gate.clone(), up.clone()], 1, weights_stream)?,
+                    None,
+                    &config,
+                    &mut report,
+                )?;
             }
         }
     }
@@ -2124,6 +2125,21 @@ pub(crate) fn load_gguf_checkpoint_with_mmproj(
         model,
         eos_token_ids: prepared.eos_token_ids,
     })
+}
+
+fn paired_inkling_gguf_component<'a, T>(
+    gate: Option<&'a T>,
+    up: Option<&'a T>,
+    required: bool,
+    source: &str,
+) -> Result<Option<(&'a T, &'a T)>, Error> {
+    match (gate, up) {
+        (Some(gate), Some(up)) => Ok(Some((gate, up))),
+        (None, None) if !required => Ok(None),
+        _ => Err(Error::UnsupportedArchitecture(format!(
+            "Inkling GGUF has incomplete gate/up tensors under {source}"
+        ))),
+    }
 }
 
 pub(crate) fn prepare_gguf_checkpoint_with_mmproj(
@@ -2997,6 +3013,24 @@ mod tests {
                 "model.layers.4.moe.router.bias"
             );
         }
+    }
+
+    #[test]
+    fn packed_gguf_expert_pairs_may_omit_affine_companions() {
+        let gate = 1u8;
+        let up = 2u8;
+        assert!(
+            super::paired_inkling_gguf_component(Some(&gate), Some(&up), true, "blk.2")
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            super::paired_inkling_gguf_component::<u8>(None, None, false, "blk.2")
+                .unwrap()
+                .is_none()
+        );
+        assert!(super::paired_inkling_gguf_component::<u8>(None, None, true, "blk.2").is_err());
+        assert!(super::paired_inkling_gguf_component(Some(&gate), None, false, "blk.2").is_err());
     }
 
     #[test]
