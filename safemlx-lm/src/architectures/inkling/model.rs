@@ -2630,7 +2630,10 @@ pub(crate) fn translate_gguf_weight_name(name: &str) -> String {
     if parameter == "ffn_gscale" || parameter == "ffn_gscale.weight" {
         return format!("model.layers.{layer}.global_scale");
     }
-    if parameter == "ffn_exp_probs_b.bias" || parameter == "ffn_exp_probs_b" {
+    if matches!(
+        parameter,
+        "exp_probs_b.bias" | "ffn_exp_probs_b.bias" | "ffn_exp_probs_b"
+    ) {
         return format!("model.layers.{layer}.moe.router.bias");
     }
     name.to_string()
@@ -2984,6 +2987,16 @@ mod tests {
             super::translate_gguf_weight_name("blk.4.ffn_gscale"),
             "model.layers.4.global_scale"
         );
+        for source in [
+            "blk.4.exp_probs_b.bias",
+            "blk.4.ffn_exp_probs_b.bias",
+            "blk.4.ffn_exp_probs_b",
+        ] {
+            assert_eq!(
+                super::translate_gguf_weight_name(source),
+                "model.layers.4.moe.router.bias"
+            );
+        }
     }
 
     #[test]

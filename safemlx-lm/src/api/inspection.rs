@@ -7580,7 +7580,13 @@ mod tests {
             &path,
             &inkling_gguf_metadata(),
             inkling_gguf_specs(),
-            |_| {},
+            |specs| {
+                specs
+                    .iter_mut()
+                    .find(|(name, _, _)| name == "blk.1.ffn_exp_probs_b.bias")
+                    .unwrap()
+                    .0 = "blk.1.exp_probs_b.bias".into();
+            },
         );
         let report = inspect_model(&path, ModelInspectionOptions::default()).unwrap();
         assert_eq!(report.structural_binding, InspectionReadiness::Ready);

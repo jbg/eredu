@@ -5902,6 +5902,7 @@ fn inkling_gguf_expected(
             let bias = inkling_gguf_alias(
                 checkpoint,
                 &[
+                    format!("{prefix}.exp_probs_b.bias"),
                     format!("{prefix}.ffn_exp_probs_b.bias"),
                     format!("{prefix}.ffn_exp_probs_b"),
                 ],
