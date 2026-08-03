@@ -184,8 +184,11 @@ The dispatch is exhaustive over the public `Model` enum, so a new model variant
 must explicitly define its context, modalities, and state layout.
 
 - Llama/Mistral, Qwen2/Qwen2.5, Qwen3, and Qwen3-VL use KV-head-aware GQA accounting.
-- Qwen2 reports full and sliding layers separately; cache estimates use the actual KV-head count,
-  derived or explicit head dimension, configured window, and unbounded backing growth for full layers.
+- Qwen2 reports full layers and sliding layers grouped by every distinct window;
+  cache estimates use the actual KV-head count, derived or explicit head
+  dimension, bounded retention for each sliding group, and context-growing
+  backing for full layers. `StateMemoryAssumptions::sliding_window_bounds`
+  exposes the sorted distinct bounds.
 - GPT-OSS and Gemma 4 account for full versus sliding attention separately.
 - DeepSeek-V3/R1 accounts for compressed MLA latent plus rotary-key state.
 - Kimi Linear separates bounded KDA convolution/recurrent state from
@@ -282,15 +285,59 @@ load-time affine/MXFP4 quantization. Qwen2 applies the checkpoint-required Q/K/V
 biases and layer-selective sliding attention exactly. Qwen2-VL, Qwen2.5-VL,
 Qwen2 MoE, and older custom-code Qwen model types are rejected.
 
+All dense-Qwen execution consumes one architecture-neutral
+`LayerSchedule<AttentionPolicy>`, an ordered list of `AttentionPolicy::Full` or
+`AttentionPolicy::Sliding { window }`. `LayerSchedule<P>` supplies generic
+layer-count validation and fallback-free borrowed access so hybrid decoders can
+adopt architecture-specific policy enums without changing the schedule
+container. Hugging Face Qwen2 fields normalize to all-full when
+`use_sliding_window` is false; when true,
+`max_window_layers` counts the leading full layers and all remaining layers use
+the required positive `sliding_window`. Qwen3 remains all-full. GGUF uses
+`qwen2.attention.sliding_window_pattern` exactly as an ordered Boolean list,
+where `true` means sliding. Arbitrary exact-length patterns, including
+alternating and discontiguous patterns, are supported. A GGUF window without a
+pattern applies to every layer. Missing windows for enabled layers, invalid or
+overflowing windows, wrong encodings, and pattern-length mismatches fail in the
+shared inspection/load parser before weights are materialized.
+
 The public architecture-erased variants are `Model::DenseQwen` and
 `Model::DenseQwenLayerwise`; the former Qwen3-specific variants and
-`architectures::qwen::qwen3` module were removed. Direct users now load through
+`architectures::qwen::qwen3` module were removed. The dense-Qwen scalar fields
+`use_sliding_window`, `sliding_window`, and `max_window_layers`, plus
+`sliding_window_for_layer`, were also removed in favor of the canonical
+`attention_schedule`. Direct users now load through
 `architectures::qwen::dense::{load_safetensors, load_safetensors_quantized,
-load_gguf}` and its `layerwise` module. Full-attention resident models support
-normal, paged, and persisted prompt caches. Mixed full/sliding Qwen2 supports
-normal and paged caches but rejects persisted prompt-cache loading because the
-current manifest cannot express a per-layer window schedule. Tensor and
-pipeline parallel Qwen2 are also rejected during topology preflight.
+load_gguf}` and its `layerwise` module. Every schedule supports resident,
+layerwise-host, dense-streamed, ordinary-cache, and paged-cache execution. The
+complete ordered schedule participates in architecture and prompt-cache
+fingerprints. Persisted prompt caches support uniform all-full or all-sliding
+schedules; non-uniform schedules fail closed because schema v2 cannot serialize
+a per-layer window schedule. Tensor and pipeline parallel Qwen2 are also
+rejected during topology preflight.
+
+LFM2 and LFM2-MoE normalize Hugging Face `layer_types` and GGUF per-layer
+KV-head metadata into
+`LayerSchedule<architectures::lfm2::model::LayerPolicy>`. Full-attention layers
+carry `AttentionPolicy::Full`; short-convolution layers carry
+`LayerPolicy::CausalConvolution`. This canonical hybrid schedule drives
+resident and bounded execution, cache construction and validation, structural
+admission, and runtime-state accounting. Public normalized `ModelArgs` exposes
+only `layer_schedule`; JSON callers use
+`architectures::lfm2::model::model_args_from_config_value`.
+
+Qwen3.5 and Qwen3-Next normalize Hugging Face `layer_types`, the Qwen3-Next
+`full_attention_interval` fallback, and GGUF full-attention intervals into
+`LayerSchedule<architectures::qwen::hybrid::qwen3_5::LayerPolicy>`. The ordered
+entries distinguish recurrent `LinearAttention` from
+`SelfAttention(AttentionPolicy::Full)` and drive resident and bounded execution,
+cache construction and validation, structural admission, and exact recurrent/KV
+state accounting. Explicit layer lists must match the decoder depth; invalid or
+zero interval values fail during normalization. The removed `LayerType`, raw
+`ModelArgs.layer_types`, and fallback-returning `ModelArgs::layer_type` APIs are
+not retained as compatibility paths. JSON callers use the architecture module's
+`model_args_from_config_value` function. `TransformerBlock::layer_type` is now
+`layer_policy`, and `Cache::new` returns a validation result.
 
 Kimi Linear SafeTensors supports fully resident, layerwise-host, dense
 disk-streamed, sparse-expert-cache, and sparse-expert-with-dense-layers

@@ -228,9 +228,35 @@ the tied or untied output projection stay pinned. Each complete transformer
 block, including its routed expert bank, is one `text_decoder` execution unit.
 Qwen2 Q/K/V biases are materialized as required tensors. Full-attention layers
 grow their GQA KV cache with context; configured Qwen2 sliding layers retain
-exactly their declared window. Standard KV caches remain device resident. Matching checkpoint-native affine
-and MXFP4 parameter trees load directly; load-time conversion in the layerwise
-path is rejected.
+exactly their declared window. The generic `LayerSchedule<P>` validates an
+architecture-defined policy for every decoder layer and provides borrowed,
+fallback-free indexed access. Dense Qwen uses
+`LayerSchedule<AttentionPolicy>` as its sole normalized decoder geometry after
+metadata parsing: each ordered `AttentionPolicy` is either `Full` or
+`Sliding { window: NonZeroU32 }`. The schedule accepts arbitrary ordering and
+internally supports different windows per layer. Standard KV caches remain
+device resident. Matching checkpoint-native affine and MXFP4 parameter trees
+load directly; load-time conversion in the layerwise path is rejected.
+
+Hugging Face Qwen2 normalization follows the upstream threshold semantics:
+`use_sliding_window=false` produces an all-full schedule; when it is `true`,
+`sliding_window` must be positive and `max_window_layers` is the number of
+leading full-attention layers, with every remaining layer sliding. Qwen3 remains
+all-full. GGUF `qwen2.attention.sliding_window_pattern` is an exact Boolean list
+in decoder-layer order (`true` means sliding). Every exact-length pattern is
+supported, including alternating and discontiguous patterns. A GGUF window with
+no pattern applies to every layer; no window and no enabled pattern means all
+full. Enabled layers without a window, invalid windows, length mismatches, and
+non-Boolean encodings fail during the shared inspection/load parser.
+
+This intentionally replaces the public dense-Qwen `use_sliding_window`,
+`sliding_window`, and `max_window_layers` fields and removes
+`sliding_window_for_layer`. Callers construct or query `attention_schedule`
+directly. Ordered policies are included in architecture and prompt-cache
+fingerprints. Normal and paged caches support every schedule; persisted prompt
+caches support uniform all-full or all-sliding schedules, while non-uniform
+schedules fail closed because prompt-cache schema v2 has only one model-wide
+window. Qwen2 tensor and pipeline parallelism remain unsupported.
 
 The former public `architectures::qwen::qwen3` module was removed. Dense Qwen
 callers use `architectures::qwen::dense`; architecture identity comes from
@@ -250,6 +276,15 @@ short-convolution layers. KV arrays and bounded convolution state are evaluated
 before a block lease is released. Public per-expert `w1`/`w2`/`w3` tensors are
 concatenated and stacked into runtime expert banks one layer at a time on the
 host; already-packed checkpoint representations load directly.
+
+LFM2 uses the generic `LayerSchedule<P>` runtime geometry. Hugging Face
+`layer_types` and GGUF per-layer KV-head metadata
+normalize once into `LayerSchedule<architectures::lfm2::model::LayerPolicy>`, whose entries are
+`SelfAttention(AttentionPolicy::Full)` or `CausalConvolution`. Resident,
+layerwise, structural-admission, cache-validation, and state-accounting paths
+consume that schedule directly. Normalized `ModelArgs` no longer implements
+`Deserialize` or exposes raw `layer_types`; callers with a JSON value use
+`architectures::lfm2::model::model_args_from_config_value`.
 
 ## DeepSeek-V3/R1 weight residency
 
@@ -282,7 +317,20 @@ rewrite used by eager loading, and split ReLU2 experts are stacked per layer.
 ## Qwen hybrid weight residency
 
 Qwen3-Next and Qwen3.5 share one adapter for recurrent linear attention
-and full attention. Qwen3-Next fused QKVZ/BA tensors are selected into runtime
+and full attention. Hugging Face `layer_types`, the Qwen3-Next
+`full_attention_interval` fallback, and GGUF interval metadata normalize once
+into
+`LayerSchedule<architectures::qwen::hybrid::qwen3_5::LayerPolicy>`. Entries are
+`LinearAttention` or `SelfAttention(AttentionPolicy::Full)`; resident,
+layerwise, structural-admission, cache-validation, and state-accounting paths
+consume only this schedule. The old `LayerType`, `ModelArgs.layer_types`, and
+fallback-returning `ModelArgs::layer_type` APIs are removed. Normalized
+`ModelArgs` is no longer directly deserializable; JSON callers use
+`model_args_from_config_value` from the Qwen3.5 or Qwen3-Next module.
+`TransformerBlock::layer_type` is now `layer_policy`, and `Cache::new` returns a
+validation result.
+
+Qwen3-Next fused QKVZ/BA tensors are selected into runtime
 projections without materializing the complete checkpoint, including 128-row
 block-space selection for native FP8 QKVZ inverse scales, and public split
 SwiGLU experts are packed per layer. The official dynamic E4M3 128 x 128 format
@@ -362,7 +410,7 @@ patch grids, pooling geometry, or valid-frame masks.
 
 `estimate_runtime_state` models persistent KV, sliding KV, compressed MLA, and
 hybrid recurrent state with checked arithmetic. Its result states the assumed
-four-byte cache dtype, batch size, sliding bounds, cache growth granularity,
+four-byte cache dtype, batch size, every distinct sliding bound, cache growth granularity,
 fixed state, context-growing state, and coverage. Standard Llama/Mistral,
 Qwen3, GPT-OSS, DeepSeek MLA, LFM2, Nemotron-H, text-only Qwen hybrid, and
 Gemma 4 estimates cover persistent state completely. Gemma's shared-KV layers
@@ -478,14 +526,15 @@ remains dense; quantized Qwen3-VL projectors and Qwen3.5-VL GGUF files are not
 currently handled. Qwen2-VL, Qwen2.5-VL, Qwen2 MoE, and older custom-code Qwen
 architectures are intentionally unsupported.
 
-Qwen2 GGUF follows GGUF's absence-means-full-attention rule. When a file
-declares `qwen2.attention.sliding_window`, SafeMLX also requires an exact
-full-prefix/sliding-suffix `qwen2.attention.sliding_window_pattern` when the
-window is not global. Unsupported patterns and attention-affecting YaRN
-metadata are rejected during catalog inspection. Fully resident dense-Qwen
-models support normal and paged caches; persisted prompt caches are supported
-for full-attention Qwen2/Qwen2.5. Mixed full/sliding prompt-cache persistence,
-tensor parallelism, and pipeline parallelism are rejected explicitly.
+Qwen2 GGUF follows GGUF's absence-means-full-attention rule and consumes an
+optional Boolean `qwen2.attention.sliding_window_pattern` exactly in layer
+order. Alternating and discontiguous patterns are supported. A declared window
+without a pattern applies globally. Pattern/type/window conflicts and
+attention-affecting unsupported YaRN metadata are rejected during the same
+catalog inspection used by loading. Fully resident dense-Qwen models support
+normal and paged caches. Uniform schedules also support persisted prompt
+caches; non-uniform schedules, tensor parallelism, and pipeline parallelism are
+rejected explicitly.
 
 Kimi Linear GGUF accepts modern split `attn_k_b`/`attn_v_b` and legacy
 unsplit `attn_kv_b`, modern and singleton-ranked convolution tensors, dense

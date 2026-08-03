@@ -74,8 +74,13 @@ local text generation with a supported model directory or GGUF file, use the
 The architecture-dispatched language-model loader includes Qwen2/Qwen2.5 text
 SafeTensors and `qwen2` GGUF checkpoints, plus Kimi Linear SafeTensors and
 `kimi-linear` GGUF checkpoints. Qwen2 support includes biased GQA, configured
-sliding attention, standard tokenizer/chat sidecars, and resident or bounded
-weight residency; vision-language and MoE Qwen2 variants are rejected.
+per-layer full/sliding attention with arbitrary GGUF Boolean layer patterns,
+standard tokenizer/chat sidecars, and resident or bounded weight residency;
+vision-language and MoE Qwen2 variants are rejected.
+LFM2/LFM2-MoE hybrid convolution/attention layouts use the same generic
+validated `LayerSchedule<P>` container with an LFM2-specific layer policy.
+Qwen3.5/Qwen3-Next likewise normalize full self-attention and recurrent linear
+attention into an ordered Qwen hybrid layer schedule before execution.
 
 ## Platforms
 
