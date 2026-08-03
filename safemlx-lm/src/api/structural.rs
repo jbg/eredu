@@ -1037,8 +1037,12 @@ fn lfm2_expected(args: &lfm2::ModelArgs) -> Result<Vec<ExpectedTensor>, Error> {
                 hidden,
             ),
         ]);
-        match args.layer_type(layer)? {
-            lfm2::LayerType::Conv => {
+        match args.layer_schedule.get(layer).ok_or_else(|| {
+            Error::UnsupportedArchitecture(format!(
+                "LFM2 layer schedule has no policy for layer {layer}"
+            ))
+        })? {
+            lfm2::LayerPolicy::CausalConvolution => {
                 tensors.extend([
                     expected_dense_with_gguf_shape(
                         format!("{model}.conv.conv.weight"),
@@ -1077,7 +1081,7 @@ fn lfm2_expected(args: &lfm2::ModelArgs) -> Result<Vec<ExpectedTensor>, Error> {
                     ]);
                 }
             }
-            lfm2::LayerType::FullAttention => tensors.extend([
+            lfm2::LayerPolicy::SelfAttention(crate::AttentionPolicy::Full) => tensors.extend([
                 expected(
                     format!("{model}.self_attn.q_proj.weight"),
                     format!("{gguf}.attn_q.weight"),
@@ -1109,6 +1113,11 @@ fn lfm2_expected(args: &lfm2::ModelArgs) -> Result<Vec<ExpectedTensor>, Error> {
                     head,
                 ),
             ]),
+            lfm2::LayerPolicy::SelfAttention(crate::AttentionPolicy::Sliding { .. }) => {
+                return Err(Error::UnsupportedArchitecture(
+                    "LFM2 structural admission does not support sliding attention".into(),
+                ));
+            }
         }
         if args.is_moe() && layer >= args.num_dense_layers as usize {
             let experts = args.num_experts as usize;

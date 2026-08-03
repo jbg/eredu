@@ -1113,14 +1113,14 @@ fn inkling_spec(args: &inkling::ModelArgs) -> Result<Spec, CapabilityError> {
 fn lfm2_spec(args: &lfm2::ModelArgs) -> Result<Spec, CapabilityError> {
     let context = plain_context(args.max_position_embeddings)?;
     let attention = args
-        .layer_types
+        .layer_schedule
         .iter()
-        .filter(|kind| kind.as_str() == "full_attention")
+        .filter(|policy| matches!(policy, lfm2::LayerPolicy::SelfAttention(_)))
         .count() as u64;
     let conv = args
-        .layer_types
+        .layer_schedule
         .iter()
-        .filter(|kind| kind.as_str() == "conv")
+        .filter(|policy| matches!(policy, lfm2::LayerPolicy::CausalConvolution))
         .count() as u64;
     let head_dim = args.hidden_size / args.num_attention_heads;
     let fixed = checked_mul(

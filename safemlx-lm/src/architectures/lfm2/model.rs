@@ -40,6 +40,7 @@ use crate::{
         rope::{initialize_rope, FloatOrString, RopeVariant},
         AttentionMask,
     },
+    runtime::attention::{AttentionPolicy, LayerSchedule},
     runtime::cache::{ConcatKeyValueCache, KeyValueCache},
     runtime::checkpoint::load::{
         gguf_metadata, gguf_quantization_configs, load_named_array_strict,
@@ -78,20 +79,20 @@ fn default_routed_scaling_factor() -> f32 {
     1.0
 }
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
 /// Stateful operator used by an LFM2 decoder layer.
-pub enum LayerType {
+pub enum LayerPolicy {
     /// Gated causal depthwise convolution.
-    Conv,
-    /// Full grouped-query self-attention.
-    FullAttention,
+    CausalConvolution,
+    /// Grouped-query self-attention with its exact cache-retention policy.
+    SelfAttention(AttentionPolicy),
 }
 
-impl LayerType {
+impl LayerPolicy {
     fn parse(value: &str) -> Result<Self, Error> {
         match value {
-            "conv" => Ok(Self::Conv),
-            "full_attention" => Ok(Self::FullAttention),
+            "conv" => Ok(Self::CausalConvolution),
+            "full_attention" => Ok(Self::SelfAttention(AttentionPolicy::Full)),
             other => Err(Error::UnsupportedArchitecture(format!(
                 "LFM2 layer type {other:?} is unsupported"
             ))),
@@ -99,8 +100,8 @@ impl LayerType {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
-/// Deserialized LFM2/LFM2.5 configuration.
+#[derive(Debug, Clone)]
+/// Validated LFM2/LFM2.5 decoder configuration.
 pub struct ModelArgs {
     /// Hugging Face model type (`lfm2` or `lfm2_moe`).
     pub model_type: String,
@@ -119,90 +120,161 @@ pub struct ModelArgs {
     /// Maximum configured context length.
     pub max_position_embeddings: i32,
     /// RMSNorm epsilon.
-    #[serde(default = "default_norm_eps")]
     pub norm_eps: f32,
-    /// Per-layer operator schedule.
-    pub layer_types: Vec<String>,
+    /// Authoritative stateful operator policy in decoder-layer order.
+    pub layer_schedule: LayerSchedule<LayerPolicy>,
     /// Causal convolution kernel width.
-    #[serde(default = "default_conv_l_cache", rename = "conv_L_cache")]
     pub conv_l_cache: i32,
     /// Whether convolution projections and kernels include biases.
-    #[serde(default)]
     pub conv_bias: bool,
     /// Dense FFN rounding multiple.
-    #[serde(default = "default_block_multiple_of")]
     pub block_multiple_of: i32,
     /// Dense FFN multiplier after the LFM two-thirds adjustment.
-    #[serde(default = "default_block_ffn_dim_multiplier")]
     pub block_ffn_dim_multiplier: f32,
     /// Whether the configured dense FFN size receives LFM's two-thirds adjustment.
-    #[serde(default = "default_true")]
     pub block_auto_adjust_ff_dim: bool,
     /// Legacy dense hidden-size alias.
-    #[serde(default)]
     pub block_dim: Option<i32>,
     /// Legacy dense FFN-size alias.
-    #[serde(default)]
     pub block_ff_dim: Option<i32>,
     /// Whether logits use tied input embeddings.
-    #[serde(default = "default_true", alias = "tie_embedding")]
     pub tie_word_embeddings: bool,
     /// Legacy top-level RoPE base.
-    #[serde(default = "default_rope_theta")]
     pub rope_theta: f32,
     /// Hugging Face v5 RoPE configuration.
-    #[serde(default)]
     pub rope_parameters: Option<HashMap<String, FloatOrString>>,
     /// Per-expert intermediate size for MoE checkpoints.
-    #[serde(default)]
     pub moe_intermediate_size: i32,
     /// Number of leading dense feed-forward layers in MoE checkpoints.
-    #[serde(default)]
     pub num_dense_layers: i32,
     /// Number of routed experts.
-    #[serde(default)]
     pub num_experts: i32,
     /// Experts selected per token.
-    #[serde(default)]
     pub num_experts_per_tok: i32,
     /// Whether selected route weights are normalized.
-    #[serde(default)]
     pub norm_topk_prob: bool,
     /// Router output scale.
-    #[serde(default = "default_routed_scaling_factor")]
     pub routed_scaling_factor: f32,
     /// Whether MoE selection uses the checkpoint expert bias.
-    #[serde(default)]
     pub use_expert_bias: bool,
     /// Preferred MLX quantization metadata.
-    #[serde(default)]
     pub quantization: Option<WeightQuantization>,
     /// Hugging Face-compatible quantization metadata alias.
-    #[serde(default)]
     pub quantization_config: Option<WeightQuantization>,
     /// Exact mixed-quantization weight names populated by GGUF loading.
-    #[serde(skip)]
     pub quantized_weights: Option<HashSet<String>>,
     /// Per-weight affine layouts populated by GGUF loading.
-    #[serde(skip)]
     pub quantized_weight_configs: Option<HashMap<String, WeightQuantization>>,
+}
+
+#[derive(Deserialize)]
+struct ModelArgsSource {
+    model_type: String,
+    vocab_size: i32,
+    hidden_size: i32,
+    intermediate_size: i32,
+    num_hidden_layers: i32,
+    num_attention_heads: i32,
+    num_key_value_heads: i32,
+    max_position_embeddings: i32,
+    #[serde(default = "default_norm_eps")]
+    norm_eps: f32,
+    layer_types: Vec<String>,
+    #[serde(default = "default_conv_l_cache", rename = "conv_L_cache")]
+    conv_l_cache: i32,
+    #[serde(default)]
+    conv_bias: bool,
+    #[serde(default = "default_block_multiple_of")]
+    block_multiple_of: i32,
+    #[serde(default = "default_block_ffn_dim_multiplier")]
+    block_ffn_dim_multiplier: f32,
+    #[serde(default = "default_true")]
+    block_auto_adjust_ff_dim: bool,
+    #[serde(default)]
+    block_dim: Option<i32>,
+    #[serde(default)]
+    block_ff_dim: Option<i32>,
+    #[serde(default = "default_true", alias = "tie_embedding")]
+    tie_word_embeddings: bool,
+    #[serde(default = "default_rope_theta")]
+    rope_theta: f32,
+    #[serde(default)]
+    rope_parameters: Option<HashMap<String, FloatOrString>>,
+    #[serde(default)]
+    moe_intermediate_size: i32,
+    #[serde(default)]
+    num_dense_layers: i32,
+    #[serde(default)]
+    num_experts: i32,
+    #[serde(default)]
+    num_experts_per_tok: i32,
+    #[serde(default)]
+    norm_topk_prob: bool,
+    #[serde(default = "default_routed_scaling_factor")]
+    routed_scaling_factor: f32,
+    #[serde(default)]
+    use_expert_bias: bool,
+    #[serde(default)]
+    quantization: Option<WeightQuantization>,
+    #[serde(default)]
+    quantization_config: Option<WeightQuantization>,
+}
+
+impl ModelArgsSource {
+    fn into_args(self) -> Result<ModelArgs, Error> {
+        let layer_count = usize::try_from(self.num_hidden_layers).map_err(|_| {
+            Error::UnsupportedArchitecture(format!(
+                "LFM2 num_hidden_layers must be positive, got {}",
+                self.num_hidden_layers
+            ))
+        })?;
+        let policies = self
+            .layer_types
+            .iter()
+            .map(|value| LayerPolicy::parse(value))
+            .collect::<Result<Vec<_>, _>>()?;
+        let layer_schedule = LayerSchedule::new(layer_count, policies)
+            .map_err(|error| Error::UnsupportedArchitecture(format!("LFM2 {error}")))?;
+        Ok(ModelArgs {
+            model_type: self.model_type,
+            vocab_size: self.vocab_size,
+            hidden_size: self.hidden_size,
+            intermediate_size: self.intermediate_size,
+            num_hidden_layers: self.num_hidden_layers,
+            num_attention_heads: self.num_attention_heads,
+            num_key_value_heads: self.num_key_value_heads,
+            max_position_embeddings: self.max_position_embeddings,
+            norm_eps: self.norm_eps,
+            layer_schedule,
+            conv_l_cache: self.conv_l_cache,
+            conv_bias: self.conv_bias,
+            block_multiple_of: self.block_multiple_of,
+            block_ffn_dim_multiplier: self.block_ffn_dim_multiplier,
+            block_auto_adjust_ff_dim: self.block_auto_adjust_ff_dim,
+            block_dim: self.block_dim,
+            block_ff_dim: self.block_ff_dim,
+            tie_word_embeddings: self.tie_word_embeddings,
+            rope_theta: self.rope_theta,
+            rope_parameters: self.rope_parameters,
+            moe_intermediate_size: self.moe_intermediate_size,
+            num_dense_layers: self.num_dense_layers,
+            num_experts: self.num_experts,
+            num_experts_per_tok: self.num_experts_per_tok,
+            norm_topk_prob: self.norm_topk_prob,
+            routed_scaling_factor: self.routed_scaling_factor,
+            use_expert_bias: self.use_expert_bias,
+            quantization: self.quantization,
+            quantization_config: self.quantization_config,
+            quantized_weights: None,
+            quantized_weight_configs: None,
+        })
+    }
 }
 
 impl ModelArgs {
     /// Returns whether this is an MoE checkpoint.
     pub fn is_moe(&self) -> bool {
         self.model_type == "lfm2_moe"
-    }
-
-    pub(crate) fn layer_type(&self, index: usize) -> Result<LayerType, Error> {
-        self.layer_types
-            .get(index)
-            .ok_or_else(|| {
-                Error::UnsupportedArchitecture(format!(
-                    "LFM2 layer index {index} is outside layer_types"
-                ))
-            })
-            .and_then(|value| LayerType::parse(value))
     }
 
     pub(crate) fn dense_intermediate_size(&self) -> i32 {
@@ -253,10 +325,11 @@ pub(crate) fn validate_model_config_value(config: &Value) -> Result<(), Error> {
     model_args_from_config_value(config).map(|_| ())
 }
 
-/// Parses and validates arguments shared by inspection and model loading.
-pub(crate) fn model_args_from_config_value(config: &Value) -> Result<ModelArgs, Error> {
-    let args: ModelArgs = serde_json::from_value(config.clone())
+/// Normalizes and validates Hugging Face configuration into executable model arguments.
+pub fn model_args_from_config_value(config: &Value) -> Result<ModelArgs, Error> {
+    let source: ModelArgsSource = serde_json::from_value(config.clone())
         .map_err(|error| Error::UnsupportedArchitecture(format!("invalid LFM2 config: {error}")))?;
+    let args = source.into_args()?;
     validate_args(&args)?;
     Ok(args)
 }
@@ -283,15 +356,22 @@ fn validate_args(args: &ModelArgs) -> Result<(), Error> {
             )));
         }
     }
-    if args.layer_types.len() != args.num_hidden_layers as usize {
+    if args.layer_schedule.len() != args.num_hidden_layers as usize {
         return Err(Error::UnsupportedArchitecture(format!(
-            "LFM2 layer_types has {} entries, expected {}",
-            args.layer_types.len(),
+            "LFM2 layer schedule has {} entries, expected {}",
+            args.layer_schedule.len(),
             args.num_hidden_layers
         )));
     }
-    for layer_type in &args.layer_types {
-        LayerType::parse(layer_type)?;
+    if args.layer_schedule.iter().any(|policy| {
+        matches!(
+            policy,
+            LayerPolicy::SelfAttention(AttentionPolicy::Sliding { .. })
+        )
+    }) {
+        return Err(Error::UnsupportedArchitecture(
+            "LFM2 supports only full self-attention policies".into(),
+        ));
     }
     if args.hidden_size % args.num_attention_heads != 0
         || args.num_attention_heads % args.num_key_value_heads != 0
@@ -707,12 +787,17 @@ pub enum LayerCache {
 }
 
 impl LayerCache {
-    pub(crate) fn new(layer_type: LayerType) -> Self {
-        match layer_type {
-            LayerType::Conv => Self::Conv(CausalConv1dCache::default()),
+    pub(crate) fn new(policy: LayerPolicy) -> Self {
+        match policy {
+            LayerPolicy::CausalConvolution => Self::Conv(CausalConv1dCache::default()),
             // Match mlx-lm's KVCache growth policy. Chunked backing arrays
             // avoid concatenating the complete cache for every decode token.
-            LayerType::FullAttention => Self::Attention(ConcatKeyValueCache::new_with_step(256)),
+            LayerPolicy::SelfAttention(AttentionPolicy::Full) => {
+                Self::Attention(ConcatKeyValueCache::new_with_step(256))
+            }
+            LayerPolicy::SelfAttention(AttentionPolicy::Sliding { .. }) => {
+                unreachable!("validated LFM2 schedules contain only full self-attention")
+            }
         }
     }
 
@@ -741,9 +826,12 @@ pub struct Cache {
 impl Cache {
     pub(crate) fn new(args: &ModelArgs) -> Result<Self, Error> {
         Ok(Self {
-            layers: (0..args.num_hidden_layers)
-                .map(|index| args.layer_type(index as usize).map(LayerCache::new))
-                .collect::<Result<Vec<_>, _>>()?,
+            layers: args
+                .layer_schedule
+                .iter()
+                .copied()
+                .map(LayerCache::new)
+                .collect(),
         })
     }
 
@@ -766,7 +854,7 @@ impl Cache {
 /// One LFM2 decoder layer.
 pub struct DecoderLayer {
     /// Operator kind.
-    pub layer_type: LayerType,
+    pub layer_policy: LayerPolicy,
     #[quantizable]
     #[param]
     /// Full attention operator.
@@ -789,15 +877,23 @@ pub struct DecoderLayer {
 
 impl DecoderLayer {
     pub(crate) fn new(args: &ModelArgs, index: i32, stream: &Stream) -> Result<Self, Error> {
-        let layer_type = args.layer_type(index as usize)?;
+        let layer_policy = args
+            .layer_schedule
+            .get(index as usize)
+            .copied()
+            .ok_or_else(|| {
+                Error::UnsupportedArchitecture(format!(
+                    "LFM2 layer schedule has no policy for layer {index}"
+                ))
+            })?;
         Ok(Self {
-            layer_type,
-            self_attn: if layer_type == LayerType::FullAttention {
+            layer_policy,
+            self_attn: if matches!(layer_policy, LayerPolicy::SelfAttention(_)) {
                 Some(Attention::new(args, index, stream)?)
             } else {
                 None
             },
-            conv: if layer_type == LayerType::Conv {
+            conv: if layer_policy == LayerPolicy::CausalConvolution {
                 Some(ShortConv::new(args, index, stream)?)
             } else {
                 None
@@ -839,8 +935,8 @@ impl DecoderLayer {
         stream: &Stream,
     ) -> Result<Array, Exception> {
         let normalized = self.operator_norm.forward(x, stream)?;
-        let operator = match (self.layer_type, cache) {
-            (LayerType::FullAttention, Some(LayerCache::Attention(cache))) => {
+        let operator = match (self.layer_policy, cache) {
+            (LayerPolicy::SelfAttention(_), Some(LayerCache::Attention(cache))) => {
                 self.self_attn.as_mut().expect("attention layer").forward(
                     AttentionInput {
                         x: &normalized,
@@ -850,7 +946,7 @@ impl DecoderLayer {
                     stream,
                 )?
             }
-            (LayerType::FullAttention, _) => {
+            (LayerPolicy::SelfAttention(_), None) => {
                 self.self_attn.as_mut().expect("attention layer").forward(
                     AttentionInput {
                         x: &normalized,
@@ -860,16 +956,20 @@ impl DecoderLayer {
                     stream,
                 )?
             }
-            (LayerType::Conv, Some(LayerCache::Conv(cache))) => self
+            (LayerPolicy::CausalConvolution, Some(LayerCache::Conv(cache))) => self
                 .conv
                 .as_mut()
                 .expect("conv layer")
                 .forward(&normalized, Some(cache), stream)?,
-            (LayerType::Conv, _) => {
-                self.conv
-                    .as_mut()
-                    .expect("conv layer")
-                    .forward(&normalized, None, stream)?
+            (LayerPolicy::CausalConvolution, None) => self
+                .conv
+                .as_mut()
+                .expect("conv layer")
+                .forward(&normalized, None, stream)?,
+            (policy, Some(_)) => {
+                return Err(Exception::custom(format!(
+                    "LFM2 cache kind does not match layer policy {policy:?}"
+                )))
             }
         };
         let h = x.add(operator, stream)?;
@@ -891,8 +991,8 @@ impl DecoderLayer {
         F: FnOnce(&Array, &Array, &Array, &Stream) -> Result<Array, Exception>,
     {
         let normalized = self.operator_norm.forward(x, stream)?;
-        let operator = match (self.layer_type, cache) {
-            (LayerType::FullAttention, Some(LayerCache::Attention(cache))) => {
+        let operator = match (self.layer_policy, cache) {
+            (LayerPolicy::SelfAttention(_), Some(LayerCache::Attention(cache))) => {
                 self.self_attn.as_mut().expect("attention layer").forward(
                     AttentionInput {
                         x: &normalized,
@@ -902,7 +1002,7 @@ impl DecoderLayer {
                     stream,
                 )?
             }
-            (LayerType::FullAttention, _) => {
+            (LayerPolicy::SelfAttention(_), None) => {
                 self.self_attn.as_mut().expect("attention layer").forward(
                     AttentionInput {
                         x: &normalized,
@@ -912,16 +1012,20 @@ impl DecoderLayer {
                     stream,
                 )?
             }
-            (LayerType::Conv, Some(LayerCache::Conv(cache))) => self
+            (LayerPolicy::CausalConvolution, Some(LayerCache::Conv(cache))) => self
                 .conv
                 .as_mut()
                 .expect("conv layer")
                 .forward(&normalized, Some(cache), stream)?,
-            (LayerType::Conv, _) => {
-                self.conv
-                    .as_mut()
-                    .expect("conv layer")
-                    .forward(&normalized, None, stream)?
+            (LayerPolicy::CausalConvolution, None) => self
+                .conv
+                .as_mut()
+                .expect("conv layer")
+                .forward(&normalized, None, stream)?,
+            (policy, Some(_)) => {
+                return Err(Exception::custom(format!(
+                    "LFM2 cache kind does not match layer policy {policy:?}"
+                )))
             }
         };
         let h = x.add(operator, stream)?;
@@ -1091,6 +1195,7 @@ pub struct Model {
 impl Model {
     /// Creates an unloaded LFM2 model.
     pub fn new(args: ModelArgs, stream: &Stream) -> Result<Self, Error> {
+        validate_args(&args)?;
         let model = Lfm2Model::new(&args, stream)?;
         let lm_head = if args.tie_word_embeddings {
             None
@@ -1503,16 +1608,20 @@ pub(crate) fn args_from_gguf_catalog(
         num_hidden_layers,
     )?;
     let num_key_value_heads = unique_nonzero(&key("attention.head_count_kv"), &kv_heads)?;
-    let layer_types = kv_heads
-        .iter()
-        .map(|heads| {
-            if *heads == 0 {
-                "conv".to_string()
-            } else {
-                "full_attention".to_string()
-            }
-        })
-        .collect();
+    let layer_schedule = LayerSchedule::new(
+        num_hidden_layers as usize,
+        kv_heads
+            .iter()
+            .map(|heads| {
+                if *heads == 0 {
+                    LayerPolicy::CausalConvolution
+                } else {
+                    LayerPolicy::SelfAttention(AttentionPolicy::Full)
+                }
+            })
+            .collect(),
+    )
+    .map_err(|error| Error::UnsupportedArchitecture(format!("LFM2 GGUF {error}")))?;
     let vocab_size = match metadata
         .get("tokenizer.ggml.tokens")
         .and_then(GgufMetadataValue::as_strings)
@@ -1539,7 +1648,7 @@ pub(crate) fn args_from_gguf_catalog(
         num_key_value_heads,
         max_position_embeddings: gguf_i32_catalog(metadata, &key("context_length"))?,
         norm_eps: gguf_f32(metadata, &key("attention.layer_norm_rms_epsilon"))?,
-        layer_types,
+        layer_schedule,
         conv_l_cache: gguf_i32_catalog(metadata, &key("shortconv.l_cache"))?,
         conv_bias: arrays
             .any_gguf_tensor(|name| name.contains("shortconv") && name.ends_with(".bias")),
@@ -1755,7 +1864,10 @@ fn unique_nonzero(key: &str, values: &[i32]) -> Result<i32, Error> {
 mod tests {
     use safemlx::{module::ModuleParameters, Device, DeviceType, ExecutionContext};
 
-    use super::{translate_gguf_weight_name, validate_model_config_value, LayerType, ModelArgs};
+    use super::{
+        model_args_from_config_value, translate_gguf_weight_name, validate_model_config_value,
+        LayerPolicy,
+    };
     use serde_json::json;
 
     fn dense_config() -> serde_json::Value {
@@ -1780,11 +1892,22 @@ mod tests {
 
     #[test]
     fn parses_dense_schedule_and_adjusts_ffn() {
-        let args: ModelArgs = serde_json::from_value(dense_config()).unwrap();
-        assert_eq!(args.layer_type(0).unwrap(), LayerType::Conv);
-        assert_eq!(args.layer_type(1).unwrap(), LayerType::FullAttention);
+        let config = dense_config();
+        let args = model_args_from_config_value(&config).unwrap();
+        assert_eq!(
+            args.layer_schedule.get(0),
+            Some(&LayerPolicy::CausalConvolution)
+        );
+        assert_eq!(
+            args.layer_schedule.get(1),
+            Some(&LayerPolicy::SelfAttention(crate::AttentionPolicy::Full))
+        );
         assert_eq!(args.dense_intermediate_size(), 16);
-        validate_model_config_value(&dense_config()).unwrap();
+        let cache = super::Cache::new(&args).unwrap();
+        assert!(matches!(cache.layers[0], super::LayerCache::Conv(_)));
+        assert!(matches!(cache.layers[1], super::LayerCache::Attention(_)));
+        assert!(matches!(cache.layers[2], super::LayerCache::Conv(_)));
+        validate_model_config_value(&config).unwrap();
     }
 
     #[test]
@@ -1792,6 +1915,16 @@ mod tests {
         let mut config = dense_config();
         config["layer_types"] = json!(["conv"]);
         assert!(validate_model_config_value(&config).is_err());
+    }
+
+    #[test]
+    fn rejects_unknown_layer_policy_during_normalization() {
+        let mut config = dense_config();
+        config["layer_types"][1] = json!("linear_attention");
+        let error = model_args_from_config_value(&config)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("layer type \"linear_attention\" is unsupported"));
     }
 
     #[test]
@@ -1803,7 +1936,7 @@ mod tests {
             "rope_type": "default"
         });
         validate_model_config_value(&config).unwrap();
-        let args: ModelArgs = serde_json::from_value(config).unwrap();
+        let args = model_args_from_config_value(&config).unwrap();
         assert!(args.tie_word_embeddings);
         assert_eq!(args.rope_theta(), 1_000_000.0);
     }
@@ -1860,7 +1993,7 @@ mod tests {
     #[ignore = "requires MLX runtime execution"]
     fn dense_parameter_tree_and_cache_match_public_checkpoint_layout() {
         let context = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
-        let args: ModelArgs = serde_json::from_value(dense_config()).unwrap();
+        let args = model_args_from_config_value(&dense_config()).unwrap();
         let model = super::Model::new(args, context.stream()).unwrap();
         let params = model.parameters().flatten();
         assert_eq!(
@@ -1902,7 +2035,7 @@ mod tests {
             "norm_topk_prob": true,
             "use_expert_bias": true
         });
-        let args: ModelArgs = serde_json::from_value(config).unwrap();
+        let args = model_args_from_config_value(&config).unwrap();
         let model = super::Model::new(args, context.stream()).unwrap();
         let params = model.parameters().flatten();
         assert!(params.contains_key("model.layers.0.feed_forward.w1.weight"));
@@ -1927,8 +2060,8 @@ mod tests {
     fn dense_and_moe_prefill_decode_smoke() {
         let context = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
         let stream = context.stream();
-        let dense: ModelArgs = serde_json::from_value(dense_config()).unwrap();
-        let moe: ModelArgs = serde_json::from_value(json!({
+        let dense = model_args_from_config_value(&dense_config()).unwrap();
+        let moe_config = json!({
             "model_type": "lfm2_moe",
             "vocab_size": 32,
             "hidden_size": 16,
@@ -1946,8 +2079,8 @@ mod tests {
             "num_experts_per_tok": 2,
             "norm_topk_prob": true,
             "use_expert_bias": true
-        }))
-        .unwrap();
+        });
+        let moe = model_args_from_config_value(&moe_config).unwrap();
 
         for args in [dense, moe] {
             let mut model = super::Model::new(args, stream).unwrap();

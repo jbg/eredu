@@ -21,7 +21,7 @@ use crate::{
         common::moe::PackedSwiGluExperts,
         common::{self, generation::CausalLm, linear::project_logits_maybe_quantized},
         input,
-        lfm2::{self as resident, Cache, DecoderLayer, LayerCache, LayerType, ModelArgs},
+        lfm2::{self as resident, Cache, DecoderLayer, LayerCache, LayerPolicy, ModelArgs},
     },
     error::Error,
     nn::tensor::{create_attention_mask, AttentionMask},
@@ -613,14 +613,19 @@ impl GeneralLayerwiseModelAdapter for Lfm2LayerwiseAdapter {
             )));
         }
         for (index, layer_cache) in cache.layers.iter().enumerate() {
+            let policy = self.args.layer_schedule.get(index).ok_or_else(|| {
+                Error::UnsupportedArchitecture(format!(
+                    "LFM2 layer schedule has no policy for layer {index}"
+                ))
+            })?;
             let matches = matches!(
-                (self.args.layer_type(index)?, layer_cache),
-                (LayerType::Conv, LayerCache::Conv(_))
-                    | (LayerType::FullAttention, LayerCache::Attention(_))
+                (policy, layer_cache),
+                (LayerPolicy::CausalConvolution, LayerCache::Conv(_))
+                    | (LayerPolicy::SelfAttention(_), LayerCache::Attention(_))
             );
             if !matches {
                 return Err(Error::UnsupportedArchitecture(format!(
-                    "LFM2 cache kind does not match layer_types at layer {index}"
+                    "LFM2 cache kind does not match the layer schedule at layer {index}"
                 )));
             }
         }
@@ -1087,7 +1092,7 @@ mod tests {
     };
 
     fn args(moe: bool) -> ModelArgs {
-        serde_json::from_value(serde_json::json!({
+        resident::model_args_from_config_value(&serde_json::json!({
             "model_type": if moe { "lfm2_moe" } else { "lfm2" },
             "vocab_size": 32,
             "hidden_size": 16,
@@ -1181,7 +1186,11 @@ mod tests {
                 "num_key_value_heads": model.args.num_key_value_heads,
                 "max_position_embeddings": model.args.max_position_embeddings,
                 "norm_eps": model.args.norm_eps,
-                "layer_types": model.args.layer_types,
+                "layer_types": model.args.layer_schedule.iter().map(|policy| match policy {
+                    resident::LayerPolicy::CausalConvolution => "conv",
+                    resident::LayerPolicy::SelfAttention(crate::AttentionPolicy::Full) => "full_attention",
+                    resident::LayerPolicy::SelfAttention(crate::AttentionPolicy::Sliding { .. }) => unreachable!("validated LFM2 test schedule"),
+                }).collect::<Vec<_>>(),
                 "conv_L_cache": model.args.conv_l_cache,
                 "conv_bias": model.args.conv_bias,
                 "block_auto_adjust_ff_dim": false,

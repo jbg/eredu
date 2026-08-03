@@ -1153,7 +1153,7 @@ fn write_additional_sparse_fixtures(root: &Path) -> Vec<(&'static str, &'static 
     let directory = root.join("lfm2-sparse");
     std::fs::create_dir_all(&directory).unwrap();
     let mut model =
-        lfm2::Model::new(serde_json::from_value(config.clone()).unwrap(), stream).unwrap();
+        lfm2::Model::new(lfm2::model_args_from_config_value(&config).unwrap(), stream).unwrap();
     save_zero_fixture(&mut model, &config, &directory, stream, 32);
     fixtures.push(("LFM2 sparse expert cache", "Lfm2", directory));
 
