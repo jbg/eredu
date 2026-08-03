@@ -193,8 +193,10 @@ must explicitly define its context, modalities, and state layout.
 - DeepSeek-V3/R1 accounts for compressed MLA latent plus rotary-key state.
 - Kimi Linear separates bounded KDA convolution/recurrent state from
   context-growing compressed no-RoPE MLA state.
-- LFM2 and Nemotron-H separate bounded convolution/Mamba state from
-  context-growing attention state.
+- LFM2 and Nemotron-H separate bounded convolution/Mamba state from attention
+  KV state. Nemotron-H attention groups are context-growing or window-bounded
+  according to each scheduled attention policy; dense MLP and MoE layers add
+  no persistent decoder state.
 - Qwen3-Next and Qwen3.5 separate recurrent linear-attention state from
   full-attention KV.
 - Inkling accounts for global/sliding KV and bounded convolution state.
@@ -325,6 +327,29 @@ resident and bounded execution, cache construction and validation, structural
 admission, and runtime-state accounting. Public normalized `ModelArgs` exposes
 only `layer_schedule`; JSON callers use
 `architectures::lfm2::model::model_args_from_config_value`.
+
+Nemotron-H normalizes the Hugging Face `hybrid_override_pattern` and GGUF
+per-layer feed-forward/KV-head metadata into
+`LayerSchedule<architectures::nemotron_h::model::LayerPolicy>`. Entries are
+`Mamba`, `SelfAttention(AttentionPolicy)`, `DenseMlp`, or `SparseMoe`; the
+optional positive `sliding_window` becomes the exact policy of every attention
+entry, while its absence means full attention. The ordered schedule is the sole
+execution geometry for resident, layerwise, dense-streamed, structural,
+expert-parallel, cache-validation, fingerprint, and runtime-state paths.
+Mamba caches hold bounded convolution/SSM state, attention caches select
+context-growing or window-bounded KV storage, and MLP/MoE cache entries are
+stateless markers. Invalid markers, layer-count mismatches, and zero, negative,
+or overflowing windows fail during normalization before model allocation.
+Normalized `ModelArgs` no longer implements `Deserialize` or exposes
+`hybrid_override_pattern`/`sliding_window`; JSON callers use
+`architectures::nemotron_h::model::model_args_from_config_value`. Persisted
+Nemotron-H prompt caches remain unsupported because the persistence schema does
+not represent mixed recurrent and KV state, but the complete ordered schedule
+is available in the architecture fingerprint.
+`CacheStateStrategy::HybridRecurrent` now reports `full_attention_layers`,
+`sliding_attention`, and `recurrent_layers`; the former undifferentiated
+`attention_layers` field was removed so hybrid state reports cannot hide
+bounded attention groups.
 
 Qwen3.5 and Qwen3-Next normalize Hugging Face `layer_types`, the Qwen3-Next
 `full_attention_interval` fallback, and GGUF full-attention intervals into

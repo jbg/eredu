@@ -313,6 +313,23 @@ One hybrid adapter handles Mamba2, attention, dense MLP, and sparse MoE blocks.
 Mamba convolution and SSM arrays plus attention KV arrays are evaluated before
 lease release. Public `backbone`/`mixer` names are resolved through the same key
 rewrite used by eager loading, and split ReLU2 experts are stacked per layer.
+Hugging Face `hybrid_override_pattern` and GGUF per-layer operator metadata
+normalize once into
+`LayerSchedule<architectures::nemotron_h::model::LayerPolicy>`. Its four entry
+kinds are `Mamba`, `SelfAttention(AttentionPolicy)`, `DenseMlp`, and
+`SparseMoe`; the optional positive `sliding_window` is embedded in every
+attention entry. Resident, bounded, structural, expert-parallel, cache,
+fingerprint, and memory-accounting paths consume only this schedule. Full
+attention uses growing KV state, sliding attention retains its exact window,
+Mamba uses bounded convolution/SSM state, and MLP/MoE entries are stateless.
+The old `LayerBlockType`, raw normalized `hybrid_override_pattern` and
+`sliding_window` fields, and reparsing query methods were removed. JSON callers
+use `nemotron_h::model_args_from_config_value`. Persisted Nemotron-H prompt
+caches remain unsupported because mixed recurrent/KV state is not represented
+by the persistence schema.
+The public `CacheStateStrategy::HybridRecurrent` report now separates
+`full_attention_layers` from exact `sliding_attention` window groups alongside
+`recurrent_layers`; its old aggregate `attention_layers` field was removed.
 
 ## Qwen hybrid weight residency
 

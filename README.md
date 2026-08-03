@@ -81,6 +81,10 @@ LFM2/LFM2-MoE hybrid convolution/attention layouts use the same generic
 validated `LayerSchedule<P>` container with an LFM2-specific layer policy.
 Qwen3.5/Qwen3-Next likewise normalize full self-attention and recurrent linear
 attention into an ordered Qwen hybrid layer schedule before execution.
+Nemotron-H completes the four-operator pilot with an ordered schedule covering
+Mamba, full or sliding self-attention, dense MLP, and sparse MoE layers; the
+same schedule drives cache identity, bounded recurrent/KV state, and stateless
+feed-forward entries.
 
 ## Platforms
 
