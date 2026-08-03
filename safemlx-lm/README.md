@@ -220,6 +220,37 @@ compute overlap are not supported by this policy. The opt-in
 latency, throughput, logical residency, transfer telemetry, allocator samples,
 and mapped-shard diagnostics.
 
+## Llama/Mistral attention schedules
+
+Llama and Mistral normalize checkpoint attention metadata into the shared
+`LayerSchedule<AttentionPolicy>` geometry. Hugging Face configurations with an
+absent or `null` `sliding_window` become all-full; a positive value becomes an
+all-sliding schedule with that exact window on every decoder layer. Zero,
+negative, and overflowing Hugging Face windows fail during the parser shared by
+inspection and loading. GGUF absence or the format-defined zero value means
+all-full, while a positive `<architecture>.attention.sliding_window` means
+all-sliding. Wrong GGUF types and invalid values fail before weights are
+materialized.
+
+After normalization, resident, layerwise-host, dense-streamed, ordinary-cache,
+paged-cache, generation, tensor-parallel, pipeline-parallel, fingerprint, and
+runtime-state paths query only the ordered schedule. Internally constructed
+schedules may freely mix full and sliding layers and may use distinct windows;
+ordinary and paged caches are configured independently for each layer. A window
+of `N` includes the current token, so a device cache retains at most `N - 1`
+past states between calls. Runtime-state estimates count full layers as
+context-growing and group bounded layers by exact window.
+
+This is an intentional breaking API change. Normalized `ModelArgs` no longer
+implements `Deserialize` or exposes `sliding_window`; JSON callers use
+`model_args_from_config_value` and execution callers inspect
+`attention_schedule`. `ResidentModel::sliding_window`, `new_sliding_cache`, the
+`LlamaCache::Standard`/`Sliding` split, and architecture-erased
+`ModelCache::SlidingKeyValue`/`ModelGenerate::LlamaSliding` routes were removed.
+Persisted prompt caches remain limited to uniform all-full or all-sliding
+schedules because schema v2 stores one model-wide window; non-uniform schedules
+fail closed, while their complete order is still included in cache identity.
+
 ## Dense Qwen2/Qwen2.5/Qwen3 weight residency
 
 Qwen2/Qwen2.5 text and dense or sparse-MoE Qwen3 use one

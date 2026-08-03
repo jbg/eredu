@@ -291,6 +291,35 @@ load-time affine/MXFP4 quantization. Qwen2 applies the checkpoint-required Q/K/V
 biases and layer-selective sliding attention exactly. Qwen2-VL, Qwen2.5-VL,
 Qwen2 MoE, and older custom-code Qwen model types are rejected.
 
+Llama and Mistral now use the same architecture-neutral
+`LayerSchedule<AttentionPolicy>` as their sole normalized attention geometry.
+Hugging Face absence or `null` produces an all-full schedule; a positive
+`sliding_window` applies that exact window to every layer. GGUF absence or zero
+means all-full according to the format, while a positive
+`llama.attention.sliding_window` or `mistral.attention.sliding_window` means
+all-sliding. Invalid types, zero/negative Hugging Face values, negative GGUF
+values, and overflowing values fail in the normalization shared by inspection
+and loading.
+
+Resident, bounded-weight, dense-stream, ordinary-cache, paged-cache,
+tensor-parallel, pipeline-parallel, fingerprint, and state-estimation paths all
+query the ordered schedule. Internally supplied schedules can use arbitrary
+full/sliding order and distinct positive windows. Each ordinary or paged cache
+receives its layer's exact policy; an `N`-position sliding window includes the
+current token and retains at most `N - 1` past positions between calls. Memory
+reports count context-growing full layers and group bounded layers by exact
+window. Prompt-cache fingerprints contain the complete order, but persistence
+fails closed for non-uniform schedules because schema v2 stores only one
+model-wide window.
+
+The migration intentionally removes normalized `ModelArgs.sliding_window`,
+direct `ModelArgs` deserialization, `ResidentModel::sliding_window`,
+`new_sliding_cache`, the standard/sliding `LlamaCache` split, and the separate
+architecture-erased sliding dispatch variants. JSON callers use
+`architectures::llama::model::model_args_from_config_value`; execution callers
+use `attention_schedule` and the single per-layer-configured device-cache
+route.
+
 All dense-Qwen execution consumes one architecture-neutral
 `LayerSchedule<AttentionPolicy>`, an ordered list of `AttentionPolicy::Full` or
 `AttentionPolicy::Sliding { window }`. `LayerSchedule<P>` supplies generic

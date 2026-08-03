@@ -101,6 +101,13 @@ layer pattern into `LayerSchedule<AttentionPolicy>` as well. The schedule drives
 resident and bounded execution, multimodal masks, shared-KV routing, assistant
 drafting, structural admission, architecture identity, and memory reporting;
 arbitrary Boolean GGUF patterns and internally distinct windows are supported.
+Llama and Mistral have also removed their normalized global-window field and
+separate sliding-cache dispatch. Hugging Face and GGUF scalar metadata normalize
+once into `LayerSchedule<AttentionPolicy>`; resident, bounded, paged, tensor,
+pipeline, cache-identity, and memory paths then use the exact policy at each
+layer. Internally mixed and distinct-window schedules are supported, while
+prompt-cache persistence remains fail-closed for non-uniform schedules under
+schema v2.
 
 ## Platforms
 
