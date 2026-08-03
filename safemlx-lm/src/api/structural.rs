@@ -5697,9 +5697,20 @@ fn validate_kimi_linear_gguf(
                 "Kimi Linear GGUF",
             ));
         }
+        let canonical = format!("blk.{layer}.ssm_a");
+        let weight_alias = format!("{canonical}.weight");
+        let name = if checkpoint
+            .catalog()
+            .tensors()
+            .any(|tensor| tensor.descriptor().name == weight_alias)
+        {
+            weight_alias
+        } else {
+            canonical
+        };
         issues.extend(validate_gguf_element_count(
             checkpoint,
-            &format!("blk.{layer}.ssm_a"),
+            &name,
             args.linear_attn_config.num_heads as usize,
             TensorOperation::Vector,
             "Kimi Linear GGUF",
