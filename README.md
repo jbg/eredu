@@ -85,6 +85,11 @@ Nemotron-H completes the four-operator pilot with an ordered schedule covering
 Mamba, full or sliding self-attention, dense MLP, and sparse MoE layers; the
 same schedule drives cache identity, bounded recurrent/KV state, and stateless
 feed-forward entries.
+GPT-OSS also uses `LayerSchedule<AttentionPolicy>` as its sole normalized
+attention geometry. Explicit Hugging Face full/sliding layer lists and the
+published alternating fallback normalize once, then drive resident, bounded,
+paged, expert-parallel, fingerprint, and state-accounting paths without a raw
+configuration fallback.
 
 ## Platforms
 

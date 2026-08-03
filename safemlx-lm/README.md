@@ -266,8 +266,25 @@ validated checkpoint metadata rather than the module selected by the caller.
 
 GPT-OSS keeps embeddings, final norm, and the output head pinned while complete
 sparse decoder blocks move through the `text_decoder` window. The adapter owns
-the alternating full/sliding cache schedule, sink-token mask behavior, and RoPE
-state. Checkpoint-native MXFP4 expert blocks and scales remain packed.
+one `LayerSchedule<AttentionPolicy>` containing the exact full/sliding policy
+for every layer, plus sink-token mask behavior and RoPE state. Hugging Face
+`layer_types` normalizes exactly; when omitted, the published default alternates
+sliding and full attention beginning at layer zero. GGUF's required
+`gpt-oss.attention.sliding_window` uses that fixed alternating meaning. Invalid
+layer entries, length mismatches, and nonpositive or overflowing windows fail
+before weight materialization. Checkpoint-native MXFP4 expert blocks and scales
+remain packed.
+
+Resident, layerwise-host, dense-streamed, ordinary-cache, paged-cache,
+generation, structural, expert-parallel, fingerprint, and runtime-state paths
+all consume the canonical schedule. Arbitrary ordering and internally distinct
+windows are supported; state reports group sliding layers by exact window and
+full layers grow with context. Prompt-cache identity includes the complete
+ordered schedule. Persistence accepts arbitrary patterns with one shared
+sliding window and rejects distinct-window schedules because schema v2 has one
+model-wide window. The normalized `ModelArgs` removed raw `layer_types` and
+`sliding_window` and no longer implements `Deserialize`; JSON callers use
+`model_args_from_config_value`.
 
 ## LFM2/LFM2.5 weight residency
 
@@ -367,7 +384,7 @@ never replaced by eager loading.
 | Llama / Mistral | yes | yes | growing or sliding KV | embedding, norm, head | decoder block | direct affine/MXFP4 | prefill and multi-step decode |
 | Qwen2 / Qwen2.5 text | yes | yes | GQA KV, split into full-context and configured sliding layers | embedding, norm, tied/untied head | decoder block | exact Q/K/V biases; direct affine/MXFP4 | full/sliding resident-to-layerwise prefill and decode |
 | Qwen3 dense / MoE | yes | yes | growing KV | embedding, norm, head | decoder block with local experts | direct affine/MXFP4 | dense and MoE prefill/decode |
-| GPT-OSS | yes | yes | alternating full/sliding KV | embedding, norm, head | sparse decoder block | native MXFP4 experts | both attention modes and multi-step decode |
+| GPT-OSS | yes | yes | scheduled full/sliding KV | embedding, norm, head | sparse decoder block | native MXFP4 experts | arbitrary schedule, ordinary/paged caches, and multi-step decode |
 | LFM2/LFM2.5 dense / MoE | yes | yes | growing KV or convolution state | embedding, norm, tied/untied head | hybrid decoder block | split SwiGLU experts packed per layer; packed form accepted | dense and split-MoE hybrid prefill/decode |
 | DeepSeek-V3/R1 | yes | yes | compressed MLA latent and rotary-key state | embedding, norm, head | MLA decoder block with dense or routed/shared experts | official split experts stacked per layer; direct dense/affine and native block-FP8 banks | dense-to-MoE prefill/decode at two depths; native block-FP8 prefill/decode |
 | Kimi Linear | yes | yes | bounded Q/K/V convolution and F32 KDA recurrent state, or growing compressed no-RoPE MLA state | embedding, norm, head | hybrid KDA/MLA block with dense or routed/shared experts | official split experts packed per layer; convolution and transition-state reshaping | prefill/decode primitive, cache, loader, and real-checkpoint smoke coverage |

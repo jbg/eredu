@@ -189,7 +189,9 @@ must explicitly define its context, modalities, and state layout.
   dimension, bounded retention for each sliding group, and context-growing
   backing for full layers. `StateMemoryAssumptions::sliding_window_bounds`
   exposes the sorted distinct bounds.
-- GPT-OSS and Gemma 4 account for full versus sliding attention separately.
+- GPT-OSS reports full layers and sliding layers grouped by each exact window
+  from its normalized attention schedule. Gemma 4 accounts for full versus
+  sliding attention separately.
 - DeepSeek-V3/R1 accounts for compressed MLA latent plus rotary-key state.
 - Kimi Linear separates bounded KDA convolution/recurrent state from
   context-growing compressed no-RoPE MLA state.
@@ -317,6 +319,28 @@ fingerprints. Persisted prompt caches support uniform all-full or all-sliding
 schedules; non-uniform schedules fail closed because schema v2 cannot serialize
 a per-layer window schedule. Tensor and pipeline parallel Qwen2 are also
 rejected during topology preflight.
+
+GPT-OSS uses the same architecture-neutral
+`LayerSchedule<AttentionPolicy>` representation. Hugging Face `layer_types`
+entries normalize in decoder order from `full_attention` and
+`sliding_attention`; when the field is omitted, the published GPT-OSS default
+alternates sliding and full attention beginning with sliding at layer zero.
+The positive `sliding_window` supplies the exact window for every declared
+sliding layer. GGUF's single `gpt-oss.attention.sliding_window` follows the
+format's fixed alternating layer meaning. Invalid entries, count mismatches,
+and zero, negative, or overflowing windows fail in the shared inspection/load
+parser before weights are materialized.
+
+The schedule is the sole source for resident, layerwise-host, dense-streamed,
+ordinary-cache, paged-cache, generation, structural, expert-parallel,
+fingerprint, and runtime-state paths. Internally constructed schedules may use
+arbitrary ordering and distinct windows. Prompt-cache fingerprints include the
+complete ordered schedule. Persistence supports arbitrary ordering when every
+sliding layer has the same window; schedules with distinct sliding windows fail
+closed because prompt-cache schema v2 stores only one model-wide window.
+Normalized `ModelArgs` no longer implements `Deserialize` or exposes raw
+`layer_types`/`sliding_window`; JSON callers use
+`architectures::gpt_oss::model::model_args_from_config_value`.
 
 LFM2 and LFM2-MoE normalize Hugging Face `layer_types` and GGUF per-layer
 KV-head metadata into
