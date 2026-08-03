@@ -68,10 +68,15 @@ impl LayerwiseDecoder {
 
     /// Creates one standard device-resident KV cache per decoder block.
     pub fn new_cache(&self) -> Vec<Option<ConcatKeyValueCache>> {
-        (0..self.args().num_hidden_layers)
-            .map(|layer| {
-                Some(match self.args().sliding_window_for_layer(layer) {
-                    Some(window) => ConcatKeyValueCache::new_for_sliding_attention(window),
+        self.args()
+            .attention_schedule
+            .iter()
+            .map(|policy| {
+                Some(match policy.window() {
+                    Some(window) => ConcatKeyValueCache::new_for_sliding_attention(
+                        i32::try_from(window.get())
+                            .expect("validated dense-Qwen attention window fits i32"),
+                    ),
                     None => ConcatKeyValueCache::new(),
                 })
             })
@@ -1044,9 +1049,7 @@ mod tests {
             attention_dropout: 0.0,
             attention_bias: Some(false),
             mlp_bias: Some(false),
-            use_sliding_window: false,
-            sliding_window: None,
-            max_window_layers: None,
+            attention_schedule: crate::runtime::attention::LayerSchedule::all_full(3).unwrap(),
             quantization: None,
             quantization_config: None,
             quantized_weights: None,
@@ -1125,6 +1128,16 @@ mod tests {
             dir.join("model.safetensors"),
         )
         .unwrap();
+        let policies = model.args.attention_schedule.iter().collect::<Vec<_>>();
+        let candidate_first = policies.iter().position(|policy| policy.window().is_some());
+        let sliding_window = candidate_first.and_then(|first| {
+            let window = policies[first].window().unwrap().get();
+            policies[first..]
+                .iter()
+                .all(|policy| policy.window().is_some_and(|value| value.get() == window))
+                .then_some(window)
+        });
+        let first_sliding = sliding_window.and(candidate_first);
         fs::write(
             dir.join("config.json"),
             serde_json::to_vec(&serde_json::json!({
@@ -1141,9 +1154,9 @@ mod tests {
                 "head_dim": model.args.head_dim,
                 "tie_word_embeddings": model.args.tie_word_embeddings,
                 "attention_bias": model.args.attention_bias,
-                "use_sliding_window": model.args.use_sliding_window,
-                "sliding_window": model.args.sliding_window,
-                "max_window_layers": model.args.max_window_layers,
+                "use_sliding_window": first_sliding.is_some(),
+                "sliding_window": sliding_window,
+                "max_window_layers": first_sliding,
                 "moe_intermediate_size": model.args.moe_intermediate_size,
                 "num_experts": model.args.num_experts,
                 "num_experts_per_tok": model.args.num_experts_per_tok,
@@ -1233,10 +1246,71 @@ mod tests {
         let mut model_args = args(false);
         model_args.model_type = "qwen2".into();
         model_args.attention_bias = Some(true);
-        model_args.use_sliding_window = true;
-        model_args.sliding_window = Some(2);
-        model_args.max_window_layers = Some(1);
+        model_args.attention_schedule =
+            crate::runtime::attention::LayerSchedule::from_sliding_pattern(
+                3,
+                &[false, true, true],
+                Some(2),
+            )
+            .unwrap();
         parity_with_args(model_args, 1);
+    }
+
+    #[test]
+    fn qwen2_resident_and_layerwise_arbitrary_pattern_parity() {
+        use crate::runtime::checkpoint::store::SafetensorsWeightStore;
+
+        let gpu = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        let cpu = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        let mut model_args = args(false);
+        model_args.model_type = "qwen2".into();
+        model_args.attention_bias = Some(true);
+        model_args.attention_schedule =
+            crate::runtime::attention::LayerSchedule::from_sliding_pattern(
+                3,
+                &[true, false, true],
+                Some(2),
+            )
+            .unwrap();
+        let mut resident = dense_qwen::Model::new(model_args.clone(), gpu.stream()).unwrap();
+        initialize(&mut resident, gpu.stream());
+        let dir = tempfile::tempdir().unwrap();
+        write_fixture(dir.path(), &resident, false, gpu.stream());
+
+        let store: Arc<dyn WeightStore + Send + Sync> =
+            Arc::new(SafetensorsWeightStore::open(dir.path()).unwrap());
+        let adapter = DenseQwenLayerwiseAdapter::new(model_args, gpu.stream()).unwrap();
+        let execution = load_layerwise_model_with_store(
+            store,
+            adapter,
+            LayerwiseLoadOptions::new(OffloadConfig::new(None, None, 1).unwrap()),
+            gpu.stream(),
+            cpu.stream(),
+        )
+        .unwrap();
+        let mut layerwise = LayerwiseDecoder { execution };
+        let mut resident_cache = resident.new_cache();
+        let mut layerwise_cache = layerwise.new_cache();
+        for tokens in [
+            Array::from_slice(&[1u32, 2, 3], &[1, 3]),
+            Array::from_slice(&[4u32], &[1, 1]),
+            Array::from_slice(&[5u32], &[1, 1]),
+        ] {
+            let expected = resident
+                .forward(
+                    dense_qwen::ModelInput {
+                        inputs: &tokens,
+                        mask: None,
+                        cache: &mut resident_cache,
+                    },
+                    gpu.stream(),
+                )
+                .unwrap();
+            let actual = layerwise
+                .forward(&tokens, None, &mut layerwise_cache, gpu.stream())
+                .unwrap();
+            assert_close(&actual, &expected);
+        }
     }
 
     #[test]

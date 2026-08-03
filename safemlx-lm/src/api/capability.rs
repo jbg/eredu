@@ -100,10 +100,8 @@ pub enum CacheStateStrategy {
     MixedKv {
         /// Number of full-context layers.
         full_layers: u64,
-        /// Number of bounded layers.
-        sliding_layers: u64,
-        /// Maximum retained positions in bounded layers.
-        window: u64,
+        /// Bounded layer counts grouped by exact retained window.
+        sliding: Vec<SlidingWindowLayerCount>,
     },
     /// Full-context KV backing with some layers using sliding attention masks
     /// and later layers reusing earlier K/V state.
@@ -138,6 +136,15 @@ pub enum CacheStateStrategy {
         /// Media embeddings consume persistent decoder positions.
         media_consumes_decoder_positions: bool,
     },
+}
+
+/// Sliding-attention layer count sharing one exact retained window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SlidingWindowLayerCount {
+    /// Exact positive retained positions, including the current token.
+    pub window: u64,
+    /// Number of layers using this window.
+    pub layers: u64,
 }
 
 /// Whether an estimator covers all persistent and transient runtime state.
@@ -225,7 +232,7 @@ impl InputTokenCount {
 }
 
 /// Dtype and request assumptions used by state estimation.
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[derive(Debug, Clone, Eq, PartialEq)]
 pub struct StateMemoryAssumptions {
     /// Bytes per retained cache/state scalar.
     pub state_dtype_bytes: NonZeroU8,
@@ -233,8 +240,8 @@ pub struct StateMemoryAssumptions {
     pub batch_size: u64,
     /// Total requested model positions, including output allowance.
     pub requested_positions: u64,
-    /// Largest sliding-window bound applied by the estimator.
-    pub sliding_window_bound: Option<u64>,
+    /// Distinct sliding-window bounds applied by the estimator, in ascending order.
+    pub sliding_window_bounds: Vec<u64>,
     /// Backing-array growth granularity used for unbounded caches.
     pub allocation_granularity: u64,
 }
@@ -744,37 +751,40 @@ fn dense_qwen_spec(
         },
         multimodal,
     )?;
-    if args.use_sliding_window {
-        let full_layers = positive(
-            args.max_window_layers.unwrap_or(args.num_hidden_layers),
-            "max_window_layers",
-        )?;
-        let total_layers = positive(args.num_hidden_layers, "num_hidden_layers")?;
-        let sliding_layers = total_layers.checked_sub(full_layers).ok_or_else(|| {
-            CapabilityError::InvalidConfiguration {
-                field: "max_window_layers",
-                detail: "exceeds num_hidden_layers".into(),
-            }
-        })?;
-        let window = positive(args.sliding_window.unwrap_or_default(), "sliding_window")?;
+    let full_layers = args.attention_schedule.full_layer_count() as u64;
+    let sliding = args
+        .attention_schedule
+        .sliding_windows()
+        .into_iter()
+        .map(|(window, layers)| SlidingWindowLayerCount {
+            window: u64::from(window.get()),
+            layers: layers as u64,
+        })
+        .collect::<Vec<_>>();
+    if !sliding.is_empty() {
         let scalars = kv_scalars(args.num_key_value_heads, args.head_dim)?;
-        spec.2 = CacheStateStrategy::MixedKv {
-            full_layers,
-            sliding_layers,
-            window,
+        spec.2 = if full_layers == 0 && sliding.len() == 1 {
+            CacheStateStrategy::SlidingKv {
+                window: sliding[0].window,
+            }
+        } else {
+            CacheStateStrategy::MixedKv {
+                full_layers,
+                sliding: sliding.clone(),
+            }
         };
-        spec.4.growing = vec![
-            GrowingState {
-                layers: full_layers,
-                scalars_per_position: scalars,
-                window: None,
-            },
-            GrowingState {
-                layers: sliding_layers,
-                scalars_per_position: scalars,
-                window: Some(window),
-            },
-        ];
+        spec.4.growing = std::iter::once(GrowingState {
+            layers: full_layers,
+            scalars_per_position: scalars,
+            window: None,
+        })
+        .filter(|state| state.layers > 0)
+        .chain(sliding.into_iter().map(|group| GrowingState {
+            layers: group.layers,
+            scalars_per_position: scalars,
+            window: Some(group.window),
+        }))
+        .collect();
     }
     Ok(spec)
 }
@@ -908,8 +918,10 @@ fn gpt_oss_spec(args: &gpt_oss::ModelArgs) -> Result<Spec, CapabilityError> {
         context.1,
         CacheStateStrategy::MixedKv {
             full_layers: full,
-            sliding_layers: sliding,
-            window,
+            sliding: vec![SlidingWindowLayerCount {
+                layers: sliding,
+                window,
+            }],
         },
         text_modalities(),
         ArchitectureEstimate {
@@ -1069,8 +1081,10 @@ fn inkling_spec(args: &inkling::ModelArgs) -> Result<Spec, CapabilityError> {
         CacheStateStrategy::Multimodal {
             decoder: Box::new(CacheStateStrategy::MixedKv {
                 full_layers: global,
-                sliding_layers: local,
-                window,
+                sliding: vec![SlidingWindowLayerCount {
+                    layers: local,
+                    window,
+                }],
             }),
             media_consumes_decoder_positions: true,
         },
@@ -2351,7 +2365,7 @@ fn estimate_architecture_state(
     )?;
     let mut context_state_bytes = 0u64;
     let mut unbounded_per_position = 0u64;
-    let mut maximum_window = None;
+    let mut sliding_window_bounds = Vec::new();
     for component in &estimate.growing {
         let per_position = checked_mul(
             component.layers,
@@ -2384,7 +2398,7 @@ fn estimate_architecture_state(
             )?;
         }
         if let Some(window) = component.window {
-            maximum_window = Some(maximum_window.map_or(window, |old: u64| old.max(window)));
+            sliding_window_bounds.push(window);
         }
     }
     let multimodal_embedding_bytes = checked_mul(
@@ -2439,7 +2453,11 @@ fn estimate_architecture_state(
             state_dtype_bytes: dtype,
             batch_size,
             requested_positions,
-            sliding_window_bound: maximum_window,
+            sliding_window_bounds: {
+                sliding_window_bounds.sort_unstable();
+                sliding_window_bounds.dedup();
+                sliding_window_bounds
+            },
             allocation_granularity: estimate.allocation_granularity,
         },
         completeness,
@@ -3016,8 +3034,10 @@ mod tests {
             strategy,
             CacheStateStrategy::MixedKv {
                 full_layers: 4,
-                sliding_layers: 2,
-                window: 8,
+                sliding: vec![SlidingWindowLayerCount {
+                    layers: 2,
+                    window: 8,
+                }],
             }
         );
         assert_eq!(estimate.growing.len(), 2);
@@ -3442,7 +3462,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(estimate.assumptions.allocation_granularity, 256);
-        assert_eq!(estimate.assumptions.sliding_window_bound, None);
+        assert!(estimate.assumptions.sliding_window_bounds.is_empty());
         assert_eq!(estimate.context_state_bytes, 3 * 2 * 2 * 4 * 256 * 4);
         assert_eq!(estimate.multimodal_embedding_bytes, 3 * 8 * 2 * 4);
         assert_eq!(estimate.media_execution_workspace_bytes, 2_048);

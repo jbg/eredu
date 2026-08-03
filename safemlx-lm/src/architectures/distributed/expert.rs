@@ -515,12 +515,20 @@ impl ExpertParallelModel {
                         tensor_parallel_rank: None,
                         expert_parallel_rank: Some(self.topology.expert_parallel_rank),
                     });
-                    let caches = (0..model.model.layers.len())
-                        .map(|layer| {
+                    let caches = model
+                        .args
+                        .attention_schedule
+                        .iter()
+                        .enumerate()
+                        .map(|(layer, policy)| {
                             PagedKeyValueCache::new_with_layout(
                                 manager.clone(),
                                 layer,
-                                None,
+                                policy.window().map(|window| {
+                                    i32::try_from(window.get()).expect(
+                                        "validated dense-Qwen attention window fits i32",
+                                    )
+                                }),
                                 0,
                                 rank,
                             )
@@ -538,14 +546,20 @@ impl ExpertParallelModel {
                         tensor_parallel_rank: None,
                         expert_parallel_rank: Some(self.topology.expert_parallel_rank),
                     });
-                    let layer_count = usize::try_from(model.args().num_hidden_layers)
-                        .map_err(|_| Error::Parallel("invalid dense-Qwen layer count".into()))?;
-                    let caches = (0..layer_count)
-                        .map(|layer| {
+                    let caches = model
+                        .args()
+                        .attention_schedule
+                        .iter()
+                        .enumerate()
+                        .map(|(layer, policy)| {
                             PagedKeyValueCache::new_with_layout(
                                 manager.clone(),
                                 layer,
-                                None,
+                                policy.window().map(|window| {
+                                    i32::try_from(window.get()).expect(
+                                        "validated dense-Qwen attention window fits i32",
+                                    )
+                                }),
                                 0,
                                 rank,
                             )

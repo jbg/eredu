@@ -1,5 +1,7 @@
 //! Architecture-independent model execution infrastructure.
 
+/// Validated decoder-layer schedules and attention geometry.
+pub mod attention;
 /// Attention-cache storage and residency.
 pub mod cache;
 /// Chat preparation, output dialects, and constrained decoding.

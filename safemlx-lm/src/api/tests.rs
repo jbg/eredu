@@ -4982,7 +4982,17 @@ fn check_model_config_validates_qwen2_sliding_window() {
     assert!(check_model_config(&missing_window)
         .unsupported_reason()
         .unwrap()
-        .contains("requires a sliding_window"));
+        .contains("sliding_window must be a positive integer"));
+
+    for invalid_window in [json!(0), json!(-1), json!(u64::MAX)] {
+        let mut invalid = config.clone();
+        invalid["sliding_window"] = invalid_window;
+        assert_eq!(
+            check_model_config(&invalid).is_supported(),
+            crate::architectures::qwen::dense::config_from_hf_value(&invalid).is_ok(),
+            "inspection and load normalization diverged for {invalid}"
+        );
+    }
 }
 
 #[test]

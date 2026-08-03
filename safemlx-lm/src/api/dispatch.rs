@@ -561,6 +561,9 @@ impl Model {
             Self::DenseQwen(model) => Ok(dense_qwen::prompt_cache_architecture_fingerprint(
                 &model.args,
             )),
+            Self::DenseQwenLayerwise(model) => Ok(
+                dense_qwen::prompt_cache_architecture_fingerprint(model.args()),
+            ),
             _ => Err(Exception::custom(format!(
                 "prompt-cache architecture identity is unsupported for model type {}",
                 self.model_type()
@@ -934,14 +937,19 @@ impl Model {
                 Self::DenseQwen(model) => {
                     let manager = CacheResidencyManager::new(options)
                         .map_err(|error| Exception::custom(error.to_string()))?;
-                    let layer_count = usize::try_from(model.args.num_hidden_layers)
-                        .map_err(|_| Exception::custom("invalid dense-Qwen cache layer count"))?;
-                    let caches = (0..layer_count)
-                        .map(|layer| {
+                    let caches = model
+                        .args
+                        .attention_schedule
+                        .iter()
+                        .enumerate()
+                        .map(|(layer, policy)| {
                             PagedKeyValueCache::new(
                                 manager.clone(),
                                 layer,
-                                model.args.sliding_window_for_layer(layer as i32),
+                                policy.window().map(|window| {
+                                    i32::try_from(window.get())
+                                        .expect("validated dense-Qwen attention window fits i32")
+                                }),
                             )
                             .map(Some)
                         })
@@ -1035,9 +1043,13 @@ impl Model {
                 .load_prompt_cache(directory, expected, prefix_token_ids, options)
                 .map(|(cache, manifest)| (ModelCache::GptOss(cache), manifest))
                 .map_err(|error| Exception::custom(error.to_string())),
-            Self::DenseQwen(model) if !model.args.use_sliding_window => {
+            Self::DenseQwen(model)
+                if dense_qwen::uniform_attention_window(&model.args).is_some() =>
+            {
                 let layer_count = usize::try_from(model.args.num_hidden_layers)
                     .map_err(|_| Exception::custom("invalid dense-Qwen cache layer count"))?;
+                let sliding_window = dense_qwen::uniform_attention_window(&model.args)
+                    .expect("guarded uniform dense-Qwen attention schedule");
                 let identity = PromptCacheModelIdentity {
                     model_family: "dense_qwen".into(),
                     effective_model_type: model.args.model_type.clone(),
@@ -1047,7 +1059,7 @@ impl Model {
                     layer_count,
                     global_layer_start: 0,
                     global_layer_end: layer_count,
-                    sliding_window: None,
+                    sliding_window,
                     sink_tokens: 0,
                     topology: Default::default(),
                     layer_layouts: PromptCacheModelIdentity::key_value_layouts(
@@ -1067,12 +1079,14 @@ impl Model {
                 )
                 .map_err(|error| Exception::custom(error.to_string()))?;
                 let caches = (0..layer_count)
-                    .map(|layer| PagedKeyValueCache::new(manager.clone(), layer, None).map(Some))
+                    .map(|layer| {
+                        PagedKeyValueCache::new(manager.clone(), layer, sliding_window).map(Some)
+                    })
                     .collect::<Result<Vec<_>, _>>()?;
                 Ok((ModelCache::PagedKeyValue(caches), manifest))
             }
             Self::DenseQwen(_) => Err(Exception::custom(
-                "persisted prompt caches for mixed full/sliding Qwen2 layers are unsupported because the manifest has no per-layer window identity",
+                "persisted prompt caches for non-uniform dense-Qwen attention schedules are unsupported because prompt-cache schema v2 stores only one model-wide sliding window; the ordered schedule is still included in the architecture fingerprint",
             )),
             _ => Err(Exception::custom(
                 "prompt-cache loading is unsupported for this model cache representation; multimodal and recurrent prefixes require additional identity state",
@@ -1537,6 +1551,12 @@ impl ModelCache {
     ) -> Result<PromptCacheManifest, Exception> {
         match self {
             Self::PagedKeyValue(caches) => {
+                persistable_attention_window(
+                    caches
+                        .iter()
+                        .flatten()
+                        .map(PagedKeyValueCache::attention_window),
+                )?;
                 for cache in caches.iter_mut().flatten() {
                     cache.finalize()?;
                 }
@@ -1563,6 +1583,20 @@ impl ModelCache {
             )),
         }
     }
+}
+
+fn persistable_attention_window(
+    mut windows: impl Iterator<Item = Option<i32>>,
+) -> Result<Option<i32>, Exception> {
+    let first = windows
+        .next()
+        .ok_or_else(|| Exception::custom("cannot persist an empty paged cache"))?;
+    if windows.any(|window| window != first) {
+        return Err(Exception::custom(
+            "persisted prompt caches for non-uniform per-layer attention schedules are unsupported because prompt-cache schema v2 stores only one model-wide sliding window",
+        ));
+    }
+    Ok(first)
 }
 
 /// Token iterator for any supported model variant.
@@ -1793,5 +1827,26 @@ mod gemma4_drafter_compatibility_tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("sliding-window configuration"));
+    }
+}
+
+#[cfg(test)]
+mod prompt_cache_attention_schedule_tests {
+    use super::persistable_attention_window;
+
+    #[test]
+    fn persistence_rejects_non_uniform_per_layer_windows() {
+        assert_eq!(
+            persistable_attention_window([Some(8), Some(8)].into_iter()).unwrap(),
+            Some(8)
+        );
+        assert_eq!(
+            persistable_attention_window([None, None].into_iter()).unwrap(),
+            None
+        );
+        let error = persistable_attention_window([Some(8), None, Some(8)].into_iter())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("non-uniform per-layer attention schedules"));
     }
 }

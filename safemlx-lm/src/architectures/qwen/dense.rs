@@ -46,6 +46,7 @@ use crate::{
         rope::{initialize_rope, FloatOrString, RopeVariant},
         AttentionMask,
     },
+    runtime::attention::{AttentionPolicy, LayerSchedule},
     runtime::cache::KeyValueCache,
     runtime::checkpoint::load::{
         gguf_metadata, gguf_quantization_configs, load_gguf_strict, load_named_array_strict,
@@ -65,8 +66,8 @@ pub enum Architecture {
     Qwen3,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-/// Deserialized dense-Qwen `config.json` fields used by this loader.
+#[derive(Debug, Clone)]
+/// Validated dense-Qwen decoder geometry normalized from checkpoint metadata.
 pub struct DecoderConfig {
     /// Model type from the configuration.
     pub model_type: String,
@@ -89,64 +90,124 @@ pub struct DecoderConfig {
     /// RoPE base frequency.
     pub rope_theta: f32,
     /// Per-head attention dimension. Zero is normalized from hidden/head geometry.
-    #[serde(default)]
     pub head_dim: i32,
     /// Whether logits use tied input embeddings.
     pub tie_word_embeddings: bool,
     /// Optional RoPE scaling configuration.
     pub rope_scaling: Option<HashMap<String, FloatOrString>>,
     /// Attention activation. Dense Qwen text checkpoints use SiLU.
-    #[serde(default = "default_hidden_act")]
     pub hidden_act: String,
     /// Inference checkpoints must not request attention dropout.
-    #[serde(default)]
     pub attention_dropout: f32,
     /// Optional config declaration for attention projection bias.
-    #[serde(default)]
     pub attention_bias: Option<bool>,
     /// Optional declaration for MLP projection biases; dense Qwen requires none.
-    #[serde(default)]
     pub mlp_bias: Option<bool>,
-    /// Enables Qwen2's layer-selective sliding-window attention.
-    #[serde(default)]
-    pub use_sliding_window: bool,
-    /// Retained attention window when sliding attention is enabled.
-    #[serde(default)]
-    pub sliding_window: Option<i32>,
-    /// First layer index that uses sliding attention.
-    #[serde(default)]
-    pub max_window_layers: Option<i32>,
+    /// Authoritative attention behavior in decoder-layer order.
+    pub attention_schedule: LayerSchedule<AttentionPolicy>,
     /// Preferred MLX-LM affine quantization metadata.
-    #[serde(default)]
     pub quantization: Option<WeightQuantization>,
     /// Hugging Face-compatible alias emitted by MLX-LM converters.
-    #[serde(default)]
     pub quantization_config: Option<WeightQuantization>,
     /// Optional exact weight names that use affine quantization.
     ///
     /// `None` preserves MLX-LM's model-wide quantization behavior. GGUF
     /// loading uses `Some` for checkpoints mixing packed and dense matrices.
-    #[serde(skip)]
     pub quantized_weights: Option<HashSet<String>>,
     /// Routed-expert intermediate size for Qwen3 MoE checkpoints.
-    #[serde(default)]
     pub moe_intermediate_size: i32,
     /// Number of routed experts. Zero for dense Qwen3 checkpoints.
-    #[serde(default)]
     pub num_experts: i32,
     /// Number of experts selected per token.
-    #[serde(default)]
     pub num_experts_per_tok: i32,
     /// Whether selected routing probabilities are normalized.
-    #[serde(default)]
     pub norm_topk_prob: bool,
     /// Per-weight affine settings for mixed GGUF Q2/Q3/Q4/Q5/Q6/Q8 tensors.
-    #[serde(skip)]
     pub quantized_weight_configs: Option<HashMap<String, WeightQuantization>>,
 }
 
 fn default_hidden_act() -> String {
     "silu".into()
+}
+
+#[derive(Deserialize)]
+struct DecoderConfigSource {
+    model_type: String,
+    hidden_size: i32,
+    num_hidden_layers: i32,
+    intermediate_size: i32,
+    num_attention_heads: i32,
+    rms_norm_eps: f32,
+    vocab_size: i32,
+    num_key_value_heads: i32,
+    max_position_embeddings: i32,
+    rope_theta: f32,
+    #[serde(default)]
+    head_dim: i32,
+    tie_word_embeddings: bool,
+    rope_scaling: Option<HashMap<String, FloatOrString>>,
+    #[serde(default = "default_hidden_act")]
+    hidden_act: String,
+    #[serde(default)]
+    attention_dropout: f32,
+    #[serde(default)]
+    attention_bias: Option<bool>,
+    #[serde(default)]
+    mlp_bias: Option<bool>,
+    #[serde(default)]
+    quantization: Option<WeightQuantization>,
+    #[serde(default)]
+    quantization_config: Option<WeightQuantization>,
+    #[serde(default)]
+    moe_intermediate_size: i32,
+    #[serde(default)]
+    num_experts: i32,
+    #[serde(default)]
+    num_experts_per_tok: i32,
+    #[serde(default)]
+    norm_topk_prob: bool,
+}
+
+impl DecoderConfigSource {
+    fn normalize_head_dim(&mut self) {
+        if self.head_dim == 0
+            && self.num_attention_heads > 0
+            && self.hidden_size % self.num_attention_heads == 0
+        {
+            self.head_dim = self.hidden_size / self.num_attention_heads;
+        }
+    }
+
+    fn into_config(self, attention_schedule: LayerSchedule<AttentionPolicy>) -> DecoderConfig {
+        DecoderConfig {
+            model_type: self.model_type,
+            hidden_size: self.hidden_size,
+            num_hidden_layers: self.num_hidden_layers,
+            intermediate_size: self.intermediate_size,
+            num_attention_heads: self.num_attention_heads,
+            rms_norm_eps: self.rms_norm_eps,
+            vocab_size: self.vocab_size,
+            num_key_value_heads: self.num_key_value_heads,
+            max_position_embeddings: self.max_position_embeddings,
+            rope_theta: self.rope_theta,
+            head_dim: self.head_dim,
+            tie_word_embeddings: self.tie_word_embeddings,
+            rope_scaling: self.rope_scaling,
+            hidden_act: self.hidden_act,
+            attention_dropout: self.attention_dropout,
+            attention_bias: self.attention_bias,
+            mlp_bias: self.mlp_bias,
+            attention_schedule,
+            quantization: self.quantization,
+            quantization_config: self.quantization_config,
+            quantized_weights: None,
+            moe_intermediate_size: self.moe_intermediate_size,
+            num_experts: self.num_experts,
+            num_experts_per_tok: self.num_experts_per_tok,
+            norm_topk_prob: self.norm_topk_prob,
+            quantized_weight_configs: None,
+        }
+    }
 }
 
 impl DecoderConfig {
@@ -174,14 +235,6 @@ impl DecoderConfig {
     /// Whether this architecture applies per-head Q/K RMS normalization.
     pub fn qk_norm(&self) -> bool {
         self.architecture() == Architecture::Qwen3
-    }
-
-    /// Returns the configured window for one layer, or full attention.
-    pub fn sliding_window_for_layer(&self, layer: i32) -> Option<i32> {
-        self.use_sliding_window
-            .then_some(())
-            .and(self.sliding_window)
-            .filter(|_| layer >= self.max_window_layers.unwrap_or(self.num_hidden_layers))
     }
 
     pub(crate) fn weight_quantization(&self) -> Option<WeightQuantization> {
@@ -228,7 +281,7 @@ pub(crate) fn prompt_cache_architecture_fingerprint(args: &DecoderConfig) -> Str
         .unwrap_or_default();
     rope.sort_unstable();
     format!(
-        "dense-qwen-v1:type={}:hidden={}:layers={}:q_heads={}:kv_heads={}:head_dim={}:context={}:rope_theta={:08x}:rope={}:sliding={:?}:first_sliding={:?}",
+        "dense-qwen-v2:type={}:hidden={}:layers={}:q_heads={}:kv_heads={}:head_dim={}:context={}:rope_theta={:08x}:rope={}:attention={}",
         args.model_type,
         args.hidden_size,
         args.num_hidden_layers,
@@ -238,9 +291,18 @@ pub(crate) fn prompt_cache_architecture_fingerprint(args: &DecoderConfig) -> Str
         args.max_position_embeddings,
         args.rope_theta.to_bits(),
         rope.join(";"),
-        args.sliding_window.filter(|_| args.use_sliding_window),
-        args.max_window_layers.filter(|_| args.use_sliding_window),
+        args.attention_schedule.fingerprint_component(),
     )
+}
+
+pub(crate) fn uniform_attention_window(args: &DecoderConfig) -> Option<Option<i32>> {
+    let mut policies = args.attention_schedule.iter();
+    let first = policies.next()?;
+    policies.all(|policy| policy == first).then(|| {
+        first.window().map(|window| {
+            i32::try_from(window.get()).expect("validated dense-Qwen attention window fits i32")
+        })
+    })
 }
 
 fn quantization_for(
@@ -294,26 +356,30 @@ pub struct Attention {
 }
 
 impl Attention {
-    /// Creates an unloaded attention layer from model arguments.
-    pub fn new(args: &DecoderConfig, stream: &Stream) -> Result<Self, Exception> {
-        Self::new_with_prefix(args, None, stream)
-    }
-
     pub(crate) fn new_for_layer(
         args: &DecoderConfig,
         layer_index: i32,
         stream: &Stream,
     ) -> Result<Self, Exception> {
+        let layer = usize::try_from(layer_index)
+            .map_err(|_| Exception::custom(format!("invalid Qwen layer index {layer_index}")))?;
+        let policy = args.attention_schedule.get(layer).ok_or_else(|| {
+            Exception::custom(format!(
+                "Qwen attention schedule has no policy for layer {layer_index}"
+            ))
+        })?;
         Self::new_with_prefix(
             args,
-            Some(format!("model.layers.{layer_index}.self_attn")),
+            &format!("model.layers.{layer_index}.self_attn"),
+            *policy,
             stream,
         )
     }
 
     fn new_with_prefix(
         args: &DecoderConfig,
-        prefix: Option<String>,
+        prefix: &str,
+        policy: AttentionPolicy,
         stream: &Stream,
     ) -> Result<Self, Exception> {
         let dim = args.hidden_size;
@@ -327,28 +393,28 @@ impl Attention {
             dim,
             n_heads * head_dim,
             args.qkv_bias(),
-            quantization_for(args, prefix.as_deref(), "q_proj"),
+            quantization_for(args, Some(prefix), "q_proj"),
             stream,
         )?;
         let k_proj = common::linear::unloaded_maybe_quantized_linear(
             dim,
             n_kv_heads * head_dim,
             args.qkv_bias(),
-            quantization_for(args, prefix.as_deref(), "k_proj"),
+            quantization_for(args, Some(prefix), "k_proj"),
             stream,
         )?;
         let v_proj = common::linear::unloaded_maybe_quantized_linear(
             dim,
             n_kv_heads * head_dim,
             args.qkv_bias(),
-            quantization_for(args, prefix.as_deref(), "v_proj"),
+            quantization_for(args, Some(prefix), "v_proj"),
             stream,
         )?;
         let o_proj = common::linear::unloaded_maybe_quantized_linear(
             n_heads * head_dim,
             dim,
             false,
-            quantization_for(args, prefix.as_deref(), "o_proj"),
+            quantization_for(args, Some(prefix), "o_proj"),
             stream,
         )?;
 
@@ -381,11 +447,11 @@ impl Attention {
             q_norm,
             k_norm,
             rope,
-            sliding_window: prefix
-                .as_deref()
-                .and_then(|prefix| prefix.split('.').nth(2))
-                .and_then(|layer| layer.parse().ok())
-                .and_then(|layer| args.sliding_window_for_layer(layer)),
+            sliding_window: policy
+                .window()
+                .map(|window| i32::try_from(window.get()))
+                .transpose()
+                .map_err(|_| Exception::custom("sliding attention window exceeds i32"))?,
         })
     }
 
@@ -1277,6 +1343,7 @@ impl Decoder {
     /// Creates an unloaded dense-Qwen transformer body.
     pub fn new(args: &DecoderConfig, stream: &Stream) -> Result<Self, Exception> {
         assert!(args.vocab_size.is_positive());
+        validate_attention_schedule(args).map_err(|error| Exception::custom(error.to_string()))?;
 
         let vocab_size = args.vocab_size;
         let num_hidden_layers = args.num_hidden_layers;
@@ -1524,12 +1591,15 @@ impl Model {
 
     /// Creates architecture-correct per-layer KV caches, including Qwen2 SWA layers.
     pub fn new_cache(&self) -> Vec<Option<crate::runtime::cache::ConcatKeyValueCache>> {
-        (0..self.args.num_hidden_layers)
-            .map(|layer| {
-                Some(match self.args.sliding_window_for_layer(layer) {
+        self.args
+            .attention_schedule
+            .iter()
+            .map(|policy| {
+                Some(match policy.window() {
                     Some(window) => {
                         crate::runtime::cache::ConcatKeyValueCache::new_for_sliding_attention(
-                            window,
+                            i32::try_from(window.get())
+                                .expect("validated dense-Qwen attention window fits i32"),
                         )
                     }
                     None => crate::runtime::cache::ConcatKeyValueCache::new(),
@@ -1690,17 +1760,146 @@ pub(crate) fn config_from_hf_value(config: &Value) -> Result<DecoderConfig, Erro
         validate_declared_architectures(config, model_type)?;
     }
     validate_execution_fields(config)?;
-    let mut args = serde_json::from_value::<DecoderConfig>(config.clone()).map_err(|error| {
-        Error::UnsupportedArchitecture(format!("invalid dense-Qwen config: {error}"))
-    })?;
-    if args.head_dim == 0
-        && args.num_attention_heads > 0
-        && args.hidden_size % args.num_attention_heads == 0
-    {
-        args.head_dim = args.hidden_size / args.num_attention_heads;
-    }
+    let mut source =
+        serde_json::from_value::<DecoderConfigSource>(config.clone()).map_err(|error| {
+            Error::UnsupportedArchitecture(format!("invalid dense-Qwen config: {error}"))
+        })?;
+    source.normalize_head_dim();
+    let attention_schedule =
+        qwen_hf_attention_schedule(config, &source.model_type, source.num_hidden_layers)?;
+    let args = source.into_config(attention_schedule);
     validate_model_args(&args)?;
     Ok(args)
+}
+
+pub(crate) fn qwen3_text_config_from_hf_value(
+    config: &Value,
+    model_type: &str,
+) -> Result<DecoderConfig, Error> {
+    let mut source =
+        serde_json::from_value::<DecoderConfigSource>(config.clone()).map_err(|error| {
+            Error::UnsupportedArchitecture(format!("invalid {model_type} text_config: {error}"))
+        })?;
+    source.model_type = model_type.into();
+    source.normalize_head_dim();
+    let layers = usize::try_from(source.num_hidden_layers).map_err(|_| {
+        Error::UnsupportedArchitecture(format!(
+            "{model_type} num_hidden_layers must be positive, got {}",
+            source.num_hidden_layers
+        ))
+    })?;
+    let schedule = LayerSchedule::all_full(layers)
+        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+    Ok(source.into_config(schedule))
+}
+
+fn qwen_hf_attention_schedule(
+    config: &Value,
+    model_type: &str,
+    num_hidden_layers: i32,
+) -> Result<LayerSchedule<AttentionPolicy>, Error> {
+    let layers = usize::try_from(num_hidden_layers).map_err(|_| {
+        Error::UnsupportedArchitecture(format!(
+            "num_hidden_layers must be positive, got {}",
+            num_hidden_layers
+        ))
+    })?;
+    if layers == 0 {
+        return Err(Error::UnsupportedArchitecture(
+            "num_hidden_layers must be positive, got 0".into(),
+        ));
+    }
+    let enabled = match config.get("use_sliding_window") {
+        None => false,
+        Some(value) => value.as_bool().ok_or_else(|| {
+            Error::UnsupportedArchitecture("use_sliding_window must be boolean".into())
+        })?,
+    };
+    if matches!(
+        model_type,
+        "qwen3" | "qwen3_moe" | "qwen3_vl_text" | "qwen3_vl_moe_text"
+    ) {
+        if enabled {
+            return Err(Error::UnsupportedArchitecture(
+                "Qwen3 dense/MoE does not use Qwen2 sliding-window configuration".into(),
+            ));
+        }
+        return LayerSchedule::all_full(layers)
+            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()));
+    }
+    if model_type != "qwen2" {
+        return Err(Error::UnsupportedModelType(model_type.into()));
+    }
+    if !enabled {
+        return LayerSchedule::all_full(layers)
+            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()));
+    }
+
+    let window = required_positive_hf_u32(config, "sliding_window", "use_sliding_window=true")?;
+    if window > i32::MAX as u32 {
+        return Err(Error::UnsupportedArchitecture(format!(
+            "sliding_window exceeds the executable i32 range: {window}"
+        )));
+    }
+    let first =
+        required_nonnegative_hf_usize(config, "max_window_layers", "use_sliding_window=true")?;
+    if first >= layers {
+        return Err(Error::UnsupportedArchitecture(format!(
+            "max_window_layers must select at least one configured layer, got {first} for {layers} layers"
+        )));
+    }
+    let sliding = AttentionPolicy::sliding(window)
+        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+    LayerSchedule::new(
+        layers,
+        (0..layers)
+            .map(|layer| {
+                if layer < first {
+                    AttentionPolicy::Full
+                } else {
+                    sliding
+                }
+            })
+            .collect(),
+    )
+    .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
+}
+
+fn required_positive_hf_u32(
+    config: &Value,
+    field: &'static str,
+    context: &str,
+) -> Result<u32, Error> {
+    let value = config.get(field).ok_or_else(|| {
+        Error::UnsupportedArchitecture(format!("{context} requires a {field} value"))
+    })?;
+    let value = value.as_i64().ok_or_else(|| {
+        Error::UnsupportedArchitecture(format!("{field} must be a positive integer"))
+    })?;
+    if value <= 0 {
+        return Err(Error::UnsupportedArchitecture(format!(
+            "{field} must be positive, got {value}"
+        )));
+    }
+    u32::try_from(value).map_err(|_| {
+        Error::UnsupportedArchitecture(format!("{field} exceeds the u32 range: {value}"))
+    })
+}
+
+fn required_nonnegative_hf_usize(
+    config: &Value,
+    field: &'static str,
+    context: &str,
+) -> Result<usize, Error> {
+    let value = config
+        .get(field)
+        .ok_or_else(|| Error::UnsupportedArchitecture(format!("{context} requires {field}")))?;
+    let value = value.as_i64().ok_or_else(|| {
+        Error::UnsupportedArchitecture(format!("{field} must be a non-negative integer"))
+    })?;
+    usize::try_from(value).map_err(|_| {
+        Error::UnsupportedArchitecture(format!("{field} must be non-negative, got {value}"))
+    })
 }
 
 fn validate_execution_fields(config: &Value) -> Result<(), Error> {
@@ -1782,7 +1981,10 @@ fn validate_declared_architectures(config: &Value, model_type: &str) -> Result<(
 }
 
 fn validate_model_args(args: &DecoderConfig) -> Result<(), Error> {
-    if !matches!(args.model_type.as_str(), "qwen2" | "qwen3" | "qwen3_moe") {
+    if !matches!(
+        args.model_type.as_str(),
+        "qwen2" | "qwen3" | "qwen3_moe" | "qwen3_vl_text" | "qwen3_vl_moe_text"
+    ) {
         return Err(Error::UnsupportedModelType(args.model_type.clone()));
     }
     if args.model_type == "qwen2" && args.is_moe() {
@@ -1876,38 +2078,7 @@ fn validate_model_args(args: &DecoderConfig) -> Result<(), Error> {
             "dense Qwen does not support biased SwiGLU projections".into(),
         ));
     }
-    match args.architecture() {
-        Architecture::Qwen2 if args.use_sliding_window => {
-            let window = args.sliding_window.ok_or_else(|| {
-                Error::UnsupportedArchitecture(
-                    "use_sliding_window=true requires a sliding_window value".into(),
-                )
-            })?;
-            let first = args.max_window_layers.ok_or_else(|| {
-                Error::UnsupportedArchitecture(
-                    "use_sliding_window=true requires max_window_layers".into(),
-                )
-            })?;
-            if window <= 0 {
-                return Err(Error::UnsupportedArchitecture(format!(
-                    "sliding_window must be positive, got {window}"
-                )));
-            }
-            if !(0..args.num_hidden_layers).contains(&first) {
-                return Err(Error::UnsupportedArchitecture(format!(
-                    "max_window_layers must select at least one configured layer, got {first} for {} layers",
-                    args.num_hidden_layers
-                )));
-            }
-        }
-        Architecture::Qwen2 => {}
-        Architecture::Qwen3 if args.use_sliding_window => {
-            return Err(Error::UnsupportedArchitecture(
-                "Qwen3 dense/MoE does not use Qwen2 sliding-window configuration".into(),
-            ));
-        }
-        Architecture::Qwen3 => {}
-    }
+    validate_attention_schedule(args)?;
     validate_rope_scaling(args)?;
     if args.is_moe() {
         for (name, value) in [
@@ -1932,6 +2103,40 @@ fn validate_model_args(args: &DecoderConfig) -> Result<(), Error> {
             "intermediate_size must be positive for dense Qwen3, got {}",
             args.intermediate_size
         )));
+    }
+    Ok(())
+}
+
+fn validate_attention_schedule(args: &DecoderConfig) -> Result<(), Error> {
+    if args.attention_schedule.len() != args.num_hidden_layers as usize {
+        return Err(Error::UnsupportedArchitecture(format!(
+            "attention schedule has {} entries for {} decoder layers",
+            args.attention_schedule.len(),
+            args.num_hidden_layers
+        )));
+    }
+    if args.architecture() == Architecture::Qwen3
+        && args
+            .attention_schedule
+            .iter()
+            .any(|policy| *policy != AttentionPolicy::Full)
+    {
+        return Err(Error::UnsupportedArchitecture(
+            "Qwen3 dense/MoE requires full attention in every decoder layer".into(),
+        ));
+    }
+    for window in args
+        .attention_schedule
+        .iter()
+        .copied()
+        .filter_map(AttentionPolicy::window)
+    {
+        if window.get() > i32::MAX as u32 {
+            return Err(Error::UnsupportedArchitecture(format!(
+                "sliding attention window exceeds the executable i32 range: {}",
+                window.get()
+            )));
+        }
     }
     Ok(())
 }
@@ -2273,10 +2478,11 @@ pub(crate) fn config_from_gguf_catalog(
         None => gguf_i32_catalog(metadata, &key("vocab_size"))?,
     };
 
-    let (use_sliding_window, sliding_window, max_window_layers) = if architecture == "qwen2" {
+    let attention_schedule = if architecture == "qwen2" {
         qwen2_gguf_sliding_config(metadata, architecture, num_hidden_layers)?
     } else {
-        (false, None, None)
+        LayerSchedule::all_full(num_hidden_layers as usize)
+            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?
     };
     let args = DecoderConfig {
         model_type: if architecture == "qwen2" {
@@ -2313,9 +2519,7 @@ pub(crate) fn config_from_gguf_catalog(
         attention_dropout: 0.0,
         attention_bias: (architecture == "qwen2").then_some(true),
         mlp_bias: Some(false),
-        use_sliding_window,
-        sliding_window,
-        max_window_layers,
+        attention_schedule,
         quantization: None,
         quantization_config: None,
         quantized_weights: None,
@@ -2345,14 +2549,19 @@ fn qwen2_gguf_sliding_config(
     metadata: &HashMap<String, GgufMetadataValue>,
     architecture: &str,
     layers: i32,
-) -> Result<(bool, Option<i32>, Option<i32>), Error> {
+) -> Result<LayerSchedule<AttentionPolicy>, Error> {
+    let layers = usize::try_from(layers).map_err(|_| {
+        Error::UnsupportedArchitecture(format!(
+            "Qwen2 GGUF decoder layer count must be positive, got {layers}"
+        ))
+    })?;
+    if layers == 0 {
+        return Err(Error::UnsupportedArchitecture(
+            "Qwen2 GGUF decoder layer count must be positive, got 0".into(),
+        ));
+    }
     let window_key = format!("{architecture}.attention.sliding_window");
-    let window = gguf_optional_i64(metadata, &window_key)?
-        .map(i32::try_from)
-        .transpose()
-        .map_err(|_| {
-            Error::UnsupportedArchitecture("Qwen2 GGUF sliding window exceeds i32".into())
-        })?;
+    let window = gguf_optional_i64(metadata, &window_key)?;
     let pattern_key = format!("{architecture}.attention.sliding_window_pattern");
     let pattern = match metadata.get(&pattern_key) {
         None => None,
@@ -2365,42 +2574,48 @@ fn qwen2_gguf_sliding_config(
             )));
         }
     };
+    if let Some(pattern) = pattern {
+        if pattern.len() != layers {
+            return Err(Error::UnsupportedArchitecture(format!(
+                "Qwen2 GGUF sliding-window pattern has {} entries for {layers} layers",
+                pattern.len()
+            )));
+        }
+    }
+    let window = match window {
+        Some(window) if window <= 0 => {
+            return Err(Error::UnsupportedArchitecture(format!(
+                "Qwen2 GGUF sliding window must be positive, got {window}"
+            )))
+        }
+        Some(window) => Some(u32::try_from(window).map_err(|_| {
+            Error::UnsupportedArchitecture(format!(
+                "Qwen2 GGUF sliding window exceeds the u32 range: {window}"
+            ))
+        })?),
+        None => None,
+    };
+    if window.is_some_and(|window| window > i32::MAX as u32) {
+        return Err(Error::UnsupportedArchitecture(format!(
+            "Qwen2 GGUF sliding window exceeds the executable i32 range: {}",
+            window.expect("checked present window")
+        )));
+    }
     let Some(window) = window else {
         if pattern.is_some_and(|pattern| pattern.iter().any(|value| *value)) {
             return Err(Error::UnsupportedArchitecture(format!(
                 "GGUF metadata {pattern_key:?} enables sliding layers without {window_key:?}"
             )));
         }
-        return Ok((false, None, None));
+        return LayerSchedule::all_full(layers)
+            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()));
     };
-    if window <= 0 {
-        return Err(Error::UnsupportedArchitecture(format!(
-            "Qwen2 GGUF sliding window must be positive, got {window}"
-        )));
-    }
-    let first = match pattern {
-        None => 0,
-        Some(pattern) => {
-            if pattern.len() != layers as usize {
-                return Err(Error::UnsupportedArchitecture(format!(
-                    "Qwen2 GGUF sliding-window pattern has {} entries for {layers} layers",
-                    pattern.len()
-                )));
-            }
-            let Some(first) = pattern.iter().position(|value| *value) else {
-                return Ok((false, None, None));
-            };
-            if pattern[first..].iter().any(|value| !*value) {
-                return Err(Error::UnsupportedArchitecture(
-                    "Qwen2 GGUF sliding-window pattern must be a full-attention prefix followed by a sliding-attention suffix".into(),
-                ));
-            }
-            i32::try_from(first).map_err(|_| {
-                Error::UnsupportedArchitecture("Qwen2 GGUF layer index exceeds i32".into())
-            })?
-        }
+    let pattern = match pattern {
+        None => vec![true; layers],
+        Some(pattern) => pattern.to_vec(),
     };
-    Ok((true, Some(window), Some(first)))
+    LayerSchedule::from_sliding_pattern(layers, &pattern, Some(window))
+        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
 }
 
 fn gguf_rope_scaling(
@@ -2748,12 +2963,13 @@ mod tests {
         ops::indexing::{NewAxis, TryIndexOp},
         ops::GgufMetadataValue,
         transforms::eval,
-        Array,
+        Array, Stream,
     };
 
     use crate::{
         architectures::qwen::dense::{load_safetensors, load_tokenizer},
         nn::generation::CausalLm,
+        runtime::attention::{AttentionPolicy, LayerSchedule},
         runtime::cache::{ConcatKeyValueCache, KeyValueCache},
         runtime::checkpoint::quantization::AffineQuantization,
     };
@@ -2779,9 +2995,7 @@ mod tests {
             attention_dropout: 0.0,
             attention_bias: Some(false),
             mlp_bias: Some(false),
-            use_sliding_window: false,
-            sliding_window: None,
-            max_window_layers: None,
+            attention_schedule: LayerSchedule::all_full(1).unwrap(),
             quantization: None,
             quantization_config: None,
             quantized_weights: None,
@@ -2803,6 +3017,7 @@ mod tests {
         args.num_key_value_heads = 2;
         args.head_dim = 2;
         args.attention_bias = None;
+        args.attention_schedule = LayerSchedule::all_full(4).unwrap();
         args
     }
 
@@ -2821,6 +3036,34 @@ mod tests {
             "rope_theta": 10000.0,
             "tie_word_embeddings": false
         })
+    }
+
+    fn initialize_model(module: &mut impl ModuleParameters, stream: &Stream) {
+        let mut names = module
+            .parameters()
+            .flatten()
+            .keys()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+        names.sort();
+        let mut parameters = module.parameters_mut().flatten();
+        for (index, name) in names.iter().enumerate() {
+            let parameter = parameters.get_mut(name.as_str()).unwrap();
+            let shape = parameter.shape().to_vec();
+            let dtype = parameter.dtype();
+            **parameter =
+                Array::full::<f32>(&shape, Array::from_f32(0.001 * (index + 1) as f32), stream)
+                    .unwrap()
+                    .as_dtype(dtype, stream)
+                    .unwrap();
+        }
+    }
+
+    fn assert_close(left: &Array, right: &Array, stream: &Stream) {
+        assert!(left
+            .all_close(right, Some(3e-5), Some(3e-5), None, stream)
+            .unwrap()
+            .item::<bool>(stream));
     }
 
     #[test]
@@ -2847,6 +3090,33 @@ mod tests {
         assert_eq!(args.head_dim, 128);
         assert!(args.qkv_bias());
         assert!(!args.qk_norm());
+        assert_eq!(args.attention_schedule.full_layer_count(), 28);
+        assert_eq!(args.attention_schedule.sliding_layer_count(), 0);
+    }
+
+    #[test]
+    fn qwen2_hf_normalizes_prefix_suffix_and_rejects_invalid_windows() {
+        let mut config = tiny_qwen2_config();
+        config["use_sliding_window"] = serde_json::json!(true);
+        config["sliding_window"] = serde_json::json!(8);
+        config["max_window_layers"] = serde_json::json!(1);
+        let args = super::config_from_hf_value(&config).unwrap();
+        assert_eq!(args.attention_schedule.fingerprint_component(), "f,s8");
+
+        for invalid in [
+            serde_json::json!(0),
+            serde_json::json!(-1),
+            serde_json::json!(u64::MAX),
+        ] {
+            config["sliding_window"] = invalid;
+            assert!(super::config_from_hf_value(&config).is_err());
+        }
+
+        config["sliding_window"] = serde_json::Value::Null;
+        assert!(super::config_from_hf_value(&config)
+            .unwrap_err()
+            .to_string()
+            .contains("sliding_window must be a positive integer"));
     }
 
     #[test]
@@ -2909,7 +3179,7 @@ mod tests {
     fn qwen2_query_bias_matches_independent_affine_reference() {
         let ctx = safemlx::ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
         let stream = ctx.stream();
-        let mut attention = super::Attention::new(&tiny_qwen2_args(), stream).unwrap();
+        let mut attention = super::Attention::new_for_layer(&tiny_qwen2_args(), 0, stream).unwrap();
         let bias = [0.25_f32, -0.5, 1.5, 2.0, -1.0, 0.75, 3.0, -2.5];
         {
             let mut parameters = attention.parameters_mut().flatten();
@@ -2931,29 +3201,168 @@ mod tests {
     fn qwen2_cache_layout_preserves_full_and_bounds_sliding_layers() {
         let ctx = safemlx::ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
         let mut args = tiny_qwen2_args();
-        args.use_sliding_window = true;
-        args.sliding_window = Some(7);
-        args.max_window_layers = Some(2);
+        args.attention_schedule = LayerSchedule::new(
+            4,
+            vec![
+                AttentionPolicy::Full,
+                AttentionPolicy::sliding(7).unwrap(),
+                AttentionPolicy::Full,
+                AttentionPolicy::sliding(3).unwrap(),
+            ],
+        )
+        .unwrap();
         let model = super::Model::new(args, ctx.stream()).unwrap();
         let mut cache = model.new_cache();
         assert_eq!(cache.len(), 4);
         assert_eq!(cache[0].as_ref().unwrap().max_size(), None);
-        assert_eq!(cache[1].as_ref().unwrap().max_size(), None);
-        assert_eq!(cache[2].as_ref().unwrap().max_size(), Some(7));
-        assert_eq!(cache[3].as_ref().unwrap().max_size(), Some(7));
+        assert_eq!(cache[1].as_ref().unwrap().max_size(), Some(7));
+        assert_eq!(cache[2].as_ref().unwrap().max_size(), None);
+        assert_eq!(cache[3].as_ref().unwrap().max_size(), Some(3));
 
-        let sliding = cache[2].as_mut().unwrap();
         let first = Array::from_slice(&[0.0_f32; 6], &[1, 1, 3, 2]);
-        sliding
-            .update_and_fetch(first.clone(), first, ctx.stream())
-            .unwrap();
         let second = Array::from_slice(&[0.0_f32; 12], &[1, 1, 6, 2]);
-        let (visible, _) = sliding
-            .update_and_fetch(second.clone(), second, ctx.stream())
+        for layer in &mut cache {
+            let layer = layer.as_mut().unwrap();
+            layer
+                .update_and_fetch(first.clone(), first.clone(), ctx.stream())
+                .unwrap();
+            layer
+                .update_and_fetch(second.clone(), second.clone(), ctx.stream())
+                .unwrap();
+            assert_eq!(layer.offset(), 9);
+        }
+        assert_eq!(cache[0].as_ref().unwrap().retained_arrays()[0].dim(-2), 9);
+        // Sliding caches retain window - 1 past positions after serving the current step.
+        assert_eq!(cache[1].as_ref().unwrap().retained_arrays()[0].dim(-2), 6);
+        assert_eq!(cache[2].as_ref().unwrap().retained_arrays()[0].dim(-2), 9);
+        assert_eq!(cache[3].as_ref().unwrap().retained_arrays()[0].dim(-2), 2);
+    }
+
+    #[test]
+    fn ordered_attention_pattern_changes_cache_architecture_fingerprint() {
+        let mut first = tiny_qwen2_args();
+        first.attention_schedule =
+            LayerSchedule::from_sliding_pattern(4, &[true, false, true, false], Some(8)).unwrap();
+        let mut second = first.clone();
+        second.attention_schedule =
+            LayerSchedule::from_sliding_pattern(4, &[false, true, false, true], Some(8)).unwrap();
+        assert_ne!(
+            super::prompt_cache_architecture_fingerprint(&first),
+            super::prompt_cache_architecture_fingerprint(&second)
+        );
+    }
+
+    #[test]
+    fn arbitrary_schedule_prefill_matches_token_by_token_decode() {
+        let ctx = safemlx::ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
+        let stream = ctx.stream();
+        let mut args = tiny_qwen2_args();
+        args.attention_schedule =
+            LayerSchedule::from_sliding_pattern(4, &[true, false, true, false], Some(3)).unwrap();
+        let mut prefill = super::Model::new(args, stream).unwrap();
+        initialize_model(&mut prefill, stream);
+        let mut decode = prefill.clone();
+        let tokens = [1u32, 2, 3, 4, 5];
+        let mut prefill_cache = prefill.new_cache();
+        let all = Array::from_slice(&tokens, &[1, tokens.len() as i32]);
+        let prefill_logits = prefill
+            .forward(
+                super::ModelInput {
+                    inputs: &all,
+                    mask: None,
+                    cache: &mut prefill_cache,
+                },
+                stream,
+            )
+            .unwrap()
+            .try_index_device((.., -1, ..), stream)
             .unwrap();
-        assert_eq!(visible.dim(-2), 9);
-        assert_eq!(sliding.offset(), 9);
-        assert_eq!(sliding.retained_arrays()[0].dim(-2), 6);
+
+        let mut decode_cache = decode.new_cache();
+        let mut decoded = None;
+        for token in tokens {
+            decoded = Some(
+                decode
+                    .forward(
+                        super::ModelInput {
+                            inputs: &Array::from_slice(&[token], &[1, 1]),
+                            mask: None,
+                            cache: &mut decode_cache,
+                        },
+                        stream,
+                    )
+                    .unwrap()
+                    .try_index_device((.., -1, ..), stream)
+                    .unwrap(),
+            );
+        }
+        assert_close(&prefill_logits, decoded.as_ref().unwrap(), stream);
+    }
+
+    #[test]
+    fn arbitrary_schedule_ordinary_and_paged_caches_match() {
+        use crate::runtime::cache::{
+            residency::{CacheResidencyManager, PagedCacheOptions},
+            PagedKeyValueCache,
+        };
+
+        let ctx = safemlx::ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
+        let stream = ctx.stream();
+        let mut args = tiny_qwen2_args();
+        args.attention_schedule =
+            LayerSchedule::from_sliding_pattern(4, &[false, true, false, true], Some(3)).unwrap();
+        let mut ordinary = super::Model::new(args, stream).unwrap();
+        initialize_model(&mut ordinary, stream);
+        let mut paged = ordinary.clone();
+        let mut ordinary_cache = ordinary.new_cache();
+        let manager = CacheResidencyManager::new(
+            PagedCacheOptions::new(2, 1 << 20, 1 << 20, 1)
+                .unwrap()
+                .with_full_attention(true),
+        )
+        .unwrap();
+        let mut paged_cache = paged
+            .args
+            .attention_schedule
+            .iter()
+            .enumerate()
+            .map(|(layer, policy)| {
+                PagedKeyValueCache::new(
+                    manager.clone(),
+                    layer,
+                    policy.window().map(|window| window.get() as i32),
+                )
+                .map(Some)
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        for tokens in [
+            Array::from_slice(&[1u32, 2, 3], &[1, 3]),
+            Array::from_slice(&[4u32, 5], &[1, 2]),
+            Array::from_slice(&[6u32], &[1, 1]),
+        ] {
+            let expected = ordinary
+                .forward(
+                    super::ModelInput {
+                        inputs: &tokens,
+                        mask: None,
+                        cache: &mut ordinary_cache,
+                    },
+                    stream,
+                )
+                .unwrap();
+            let actual = paged
+                .forward(
+                    super::ModelInput {
+                        inputs: &tokens,
+                        mask: None,
+                        cache: &mut paged_cache,
+                    },
+                    stream,
+                )
+                .unwrap();
+            assert_close(&expected, &actual, stream);
+        }
     }
 
     #[test]
@@ -3168,7 +3577,7 @@ mod tests {
                 "qwen2.embedding_length".into(),
                 GgufMetadataValue::Uint32(16),
             ),
-            ("qwen2.block_count".into(), GgufMetadataValue::Uint32(2)),
+            ("qwen2.block_count".into(), GgufMetadataValue::Uint32(4)),
             (
                 "qwen2.feed_forward_length".into(),
                 GgufMetadataValue::Uint32(32),
@@ -3224,7 +3633,9 @@ mod tests {
             ),
             (
                 "qwen2.attention.sliding_window_pattern".into(),
-                GgufMetadataValue::Array(safemlx::ops::GgufMetadataArray::Bool(vec![false, true])),
+                GgufMetadataValue::Array(safemlx::ops::GgufMetadataArray::Bool(vec![
+                    true, false, true, false,
+                ])),
             ),
         ]);
         let args =
@@ -3234,8 +3645,58 @@ mod tests {
         assert!(args.qkv_bias());
         assert!(!args.qk_norm());
         assert_eq!(args.num_key_value_heads, 2);
-        assert_eq!(args.sliding_window_for_layer(0), None);
-        assert_eq!(args.sliding_window_for_layer(1), Some(8));
+        assert_eq!(
+            args.attention_schedule.get(0),
+            Some(&AttentionPolicy::sliding(8).unwrap())
+        );
+        assert_eq!(args.attention_schedule.get(1), Some(&AttentionPolicy::Full));
+        assert_eq!(args.attention_schedule.fingerprint_component(), "s8,f,s8,f");
+
+        let mut discontiguous = metadata.clone();
+        discontiguous.insert(
+            "qwen2.attention.sliding_window_pattern".into(),
+            GgufMetadataValue::Array(safemlx::ops::GgufMetadataArray::Bool(vec![
+                false, true, true, false,
+            ])),
+        );
+        let args = super::config_from_gguf_catalog(&HashMap::new(), &discontiguous, "qwen2", false)
+            .unwrap();
+        assert_eq!(args.attention_schedule.fingerprint_component(), "f,s8,s8,f");
+
+        for (value, expected) in [
+            (
+                GgufMetadataValue::Array(safemlx::ops::GgufMetadataArray::Bool(vec![true])),
+                "pattern has 1 entries for 4 layers",
+            ),
+            (GgufMetadataValue::Uint32(1), "must be a boolean array"),
+        ] {
+            let mut invalid = metadata.clone();
+            invalid.insert("qwen2.attention.sliding_window_pattern".into(), value);
+            let error = super::config_from_gguf_catalog(&HashMap::new(), &invalid, "qwen2", false)
+                .unwrap_err();
+            assert!(error.to_string().contains(expected), "{error}");
+        }
+
+        let mut missing_window = metadata.clone();
+        missing_window.remove("qwen2.attention.sliding_window");
+        assert!(
+            super::config_from_gguf_catalog(&HashMap::new(), &missing_window, "qwen2", false)
+                .unwrap_err()
+                .to_string()
+                .contains("enables sliding layers without")
+        );
+
+        for invalid_window in [
+            GgufMetadataValue::Int64(0),
+            GgufMetadataValue::Int64(-1),
+            GgufMetadataValue::Uint64(u64::from(i32::MAX as u32) + 1),
+        ] {
+            let mut invalid = metadata.clone();
+            invalid.insert("qwen2.attention.sliding_window".into(), invalid_window);
+            assert!(
+                super::config_from_gguf_catalog(&HashMap::new(), &invalid, "qwen2", false).is_err()
+            );
+        }
 
         for (key, value) in [
             ("qwen2.attention.value_length", GgufMetadataValue::Uint32(8)),

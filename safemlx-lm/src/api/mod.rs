@@ -251,7 +251,7 @@ pub use capability::{
     available_memory, Admission, AdmissionRejection, AdmissionRequest, AdmissionResult,
     AvailableMemory, CacheStateStrategy, CapabilityError, CapabilityValue, EstimationCompleteness,
     InputModalities, InputTokenCount, MeasurementKind, ModelCapabilities, PhysicalMemorySemantics,
-    RuntimeStateEstimate, StateMemoryAssumptions, StaticMemoryReport,
+    RuntimeStateEstimate, SlidingWindowLayerCount, StateMemoryAssumptions, StaticMemoryReport,
 };
 
 mod dispatch;

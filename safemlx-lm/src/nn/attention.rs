@@ -383,4 +383,51 @@ mod tests {
             .unwrap()
             .item::<bool>(stream));
     }
+
+    #[test]
+    #[ignore = "requires MLX runtime execution"]
+    fn sliding_prefill_matches_independent_scalar_softmax_reference() {
+        let ctx = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        let stream = ctx.stream();
+        let query_values = [1.0f32, 2.0, 3.0, 4.0];
+        let key_values = [0.5f32, 1.0, 1.5, 2.0];
+        let value_values = [10.0f32, 20.0, 30.0, 40.0];
+        let actual = sliding_window_prefill_attention(
+            Array::from_slice(&query_values, &[1, 1, 4, 1]),
+            Array::from_slice(&key_values, &[1, 1, 4, 1]),
+            Array::from_slice(&value_values, &[1, 1, 4, 1]),
+            1.0,
+            2,
+            0,
+            1,
+            4,
+            stream,
+        )
+        .unwrap();
+        let actual = actual.evaluated().unwrap();
+
+        let expected = (0..query_values.len())
+            .map(|query| {
+                let first = query.saturating_sub(1);
+                let logits = (first..=query)
+                    .map(|key| query_values[query] * key_values[key])
+                    .collect::<Vec<_>>();
+                let maximum = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                let weights = logits
+                    .iter()
+                    .map(|logit| (logit - maximum).exp())
+                    .collect::<Vec<_>>();
+                let denominator = weights.iter().sum::<f32>();
+                weights
+                    .iter()
+                    .zip(&value_values[first..=query])
+                    .map(|(weight, value)| weight * value)
+                    .sum::<f32>()
+                    / denominator
+            })
+            .collect::<Vec<_>>();
+        for (actual, expected) in actual.as_slice::<f32>().iter().zip(expected) {
+            assert!((actual - expected).abs() < 1e-5, "{actual} != {expected}");
+        }
+    }
 }

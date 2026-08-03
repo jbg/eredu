@@ -33,6 +33,7 @@ pub use api::{
 pub use architectures::llama::layerwise::{
     load_llama_model, LlamaCache, LlamaLoadOptions, LlamaModel,
 };
+pub use runtime::attention::{AttentionPolicy, LayerSchedule, LayerScheduleError};
 pub use runtime::cache::residency::{
     inspect_prompt_cache, CacheBlockId, CacheBlockLifecycle, CacheLayerResidencyReport,
     CacheLayerResidencyStats, CacheRankIdentity, CacheRepresentation, CacheResidencyError,

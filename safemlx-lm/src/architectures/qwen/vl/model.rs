@@ -121,16 +121,13 @@ fn parse_model_args_value(mut value: Value) -> Result<ModelArgs, Error> {
         rope.remove("mrope_section");
         rope.remove("mrope_interleaved");
     }
-    let mut text_config: dense_qwen::DecoderConfig =
-        serde_json::from_value(text_value).map_err(|error| {
-            Error::UnsupportedArchitecture(format!("invalid {model_type} text_config: {error}"))
-        })?;
-    text_config.model_type = if model_type == "qwen3_vl_moe" {
+    let normalized_text_model_type = if model_type == "qwen3_vl_moe" {
         "qwen3_vl_moe_text"
     } else {
         "qwen3_vl_text"
-    }
-    .into();
+    };
+    let text_config =
+        dense_qwen::qwen3_text_config_from_hf_value(&text_value, normalized_text_model_type)?;
     if model_type == "qwen3_vl_moe" && text_config.num_experts <= 0 {
         return Err(Error::UnsupportedArchitecture(
             "qwen3_vl_moe text_config must define routed experts".into(),
@@ -1276,9 +1273,7 @@ mod tests {
             attention_dropout: 0.0,
             attention_bias: Some(false),
             mlp_bias: Some(false),
-            use_sliding_window: false,
-            sliding_window: None,
-            max_window_layers: None,
+            attention_schedule: crate::runtime::attention::LayerSchedule::all_full(1).unwrap(),
             quantization: None,
             quantization_config: None,
             quantized_weights: None,

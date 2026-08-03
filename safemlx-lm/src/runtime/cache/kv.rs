@@ -765,6 +765,11 @@ impl PagedKeyValueCache {
         self.global_layer
     }
 
+    /// Returns the exact visible attention window, or `None` for full attention.
+    pub const fn attention_window(&self) -> Option<i32> {
+        self.sliding_window
+    }
+
     /// Returns a current aggregate manager report.
     pub fn report(&self) -> Result<CacheResidencyReport, Exception> {
         self.manager.report().map_err(cache_residency_exception)
