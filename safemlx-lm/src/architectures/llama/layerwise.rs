@@ -25,15 +25,13 @@ use crate::{
         llama::{self as resident, AttentionInput, ModelArgs, TransformerBlock},
     },
     error::Error,
-    nn::tensor::{create_attention_mask, create_sliding_attention_mask, AttentionMask},
+    nn::tensor::{create_attention_mask, AttentionMask},
     runtime::cache::residency::{
         open_prompt_cache, validate_prompt_cache_model_identity, CacheResidencyManager,
         CacheResidencyPolicy, CacheResidencyReport, PagedCacheOptions, PromptCacheDescriptor,
         PromptCacheManifest, PromptCacheModelIdentity, PromptCacheOptions,
     },
-    runtime::cache::{
-        ConcatKeyValueCache, KeyValueCache, PagedKeyValueCache, SlidingKeyValueCache,
-    },
+    runtime::cache::{ConcatKeyValueCache, KeyValueCache, PagedKeyValueCache},
     runtime::checkpoint::binding::{build_module_bindings, populate_module_from_lease},
     runtime::checkpoint::store::{GgufWeightStore, WeightStore},
     runtime::execution::layerwise::{
@@ -80,13 +78,11 @@ impl LlamaLoadOptions {
     }
 }
 
-/// Standard or sliding per-layer KV cache selected from Llama configuration.
+/// Per-layer Llama/Mistral KV state selected from the canonical schedule.
 #[derive(Debug, Clone)]
 pub enum LlamaCache {
-    /// Unbounded concatenating caches for ordinary causal attention.
-    Standard(Vec<Option<ConcatKeyValueCache>>),
-    /// Bounded caches for Mistral-style sliding-window attention.
-    Sliding(Vec<Option<SlidingKeyValueCache>>),
+    /// Device caches, independently full or bounded for each layer.
+    Device(Vec<Option<ConcatKeyValueCache>>),
     /// Block-addressable caches sharing one model-wide residency manager.
     Paged(Vec<Option<PagedKeyValueCache>>),
 }
@@ -95,11 +91,7 @@ impl LlamaCache {
     /// Returns the common absolute token offset, or zero for an empty cache.
     pub fn offset(&self) -> i32 {
         match self {
-            Self::Standard(caches) => caches
-                .first()
-                .and_then(Option::as_ref)
-                .map_or(0, KeyValueCache::offset),
-            Self::Sliding(caches) => caches
+            Self::Device(caches) => caches
                 .first()
                 .and_then(Option::as_ref)
                 .map_or(0, KeyValueCache::offset),
@@ -113,8 +105,7 @@ impl LlamaCache {
     /// Clears retained arrays without changing cache type or window size.
     pub fn clear(&mut self) -> Result<(), Error> {
         match self {
-            Self::Standard(caches) => caches.iter_mut().flatten().for_each(|cache| cache.clear()),
-            Self::Sliding(caches) => caches.iter_mut().flatten().for_each(|cache| cache.clear()),
+            Self::Device(caches) => caches.iter_mut().flatten().for_each(|cache| cache.clear()),
             Self::Paged(caches) => {
                 for cache in caches.iter_mut().flatten() {
                     cache.clear()?;
@@ -133,7 +124,7 @@ impl LlamaCache {
                 .next()
                 .map(|cache| cache.report().map_err(Into::into))
                 .transpose(),
-            Self::Standard(_) | Self::Sliding(_) => Ok(None),
+            Self::Device(_) => Ok(None),
         }
     }
 
@@ -263,18 +254,20 @@ impl LlamaModel {
     /// Creates the cache representation required by the model configuration.
     pub fn new_cache(&self) -> LlamaCache {
         let args = self.args();
-        match args.sliding_window {
-            Some(window) => LlamaCache::Sliding(
-                (0..args.num_hidden_layers)
-                    .map(|_| Some(SlidingKeyValueCache::new(window)))
-                    .collect(),
-            ),
-            None => LlamaCache::Standard(
-                (0..args.num_hidden_layers)
-                    .map(|_| Some(ConcatKeyValueCache::new()))
-                    .collect(),
-            ),
-        }
+        LlamaCache::Device(
+            args.attention_schedule
+                .iter()
+                .map(|policy| {
+                    Some(match policy.window() {
+                        Some(window) => ConcatKeyValueCache::new_for_sliding_attention(
+                            i32::try_from(window.get())
+                                .expect("validated Llama attention window fits i32"),
+                        ),
+                        None => ConcatKeyValueCache::new(),
+                    })
+                })
+                .collect(),
+        )
     }
 
     /// Creates a device-resident or explicitly bounded paged model cache.
@@ -307,7 +300,9 @@ impl LlamaModel {
             layer_count,
             global_layer_start: 0,
             global_layer_end: layer_count,
-            sliding_window: args.sliding_window,
+            sliding_window: resident::uniform_attention_window(args).ok_or_else(|| {
+                Exception::custom("persisted prompt caches for non-uniform Llama/Mistral attention schedules are unsupported because prompt-cache schema v2 stores only one model-wide sliding window; the ordered schedule remains part of the architecture fingerprint")
+            })?,
             sink_tokens: 0,
             topology: Default::default(),
             layer_layouts: PromptCacheModelIdentity::key_value_layouts(
@@ -343,14 +338,15 @@ impl LlamaModel {
         manager: CacheResidencyManager,
     ) -> Result<LlamaCache, Error> {
         let args = self.args();
-        let layer_count = usize::try_from(args.num_hidden_layers).map_err(|_| {
-            LlamaModelError::InvalidLayerCount {
-                count: args.num_hidden_layers,
-            }
-        })?;
-        let caches = (0..layer_count)
-            .map(|layer| {
-                PagedKeyValueCache::new(manager.clone(), layer, args.sliding_window).map(Some)
+        let caches = args
+            .attention_schedule
+            .iter()
+            .enumerate()
+            .map(|(layer, policy)| {
+                let window = policy.window().map(|window| {
+                    i32::try_from(window.get()).expect("validated Llama attention window fits i32")
+                });
+                PagedKeyValueCache::new(manager.clone(), layer, window).map(Some)
             })
             .collect::<Result<Vec<_>, _>>()?;
         Ok(LlamaCache::Paged(caches))
@@ -365,7 +361,7 @@ impl LlamaModel {
     ) -> Result<Array, Error> {
         self.validate_cache(cache)?;
         match (&mut self.execution, cache) {
-            (LlamaExecution::FullyResident(model), LlamaCache::Standard(caches)) => Ok(model
+            (LlamaExecution::FullyResident(model), LlamaCache::Device(caches)) => Ok(model
                 .forward(
                     resident::ModelInput {
                         inputs,
@@ -374,25 +370,7 @@ impl LlamaModel {
                     },
                     stream,
                 )?),
-            (LlamaExecution::FullyResident(model), LlamaCache::Sliding(caches)) => Ok(model
-                .forward(
-                    resident::ModelInput {
-                        inputs,
-                        mask: None,
-                        cache: caches,
-                    },
-                    stream,
-                )?),
-            (LlamaExecution::LayerwiseHost(model), LlamaCache::Standard(caches)) => model
-                .forward_with_cache(
-                    LayerwiseInput {
-                        inputs,
-                        mask: None,
-                        cache: caches,
-                    },
-                    stream,
-                ),
-            (LlamaExecution::LayerwiseHost(model), LlamaCache::Sliding(caches)) => model
+            (LlamaExecution::LayerwiseHost(model), LlamaCache::Device(caches)) => model
                 .forward_with_cache(
                     LayerwiseInput {
                         inputs,
@@ -464,23 +442,10 @@ impl LlamaModel {
                 count: self.args().num_hidden_layers,
             }
         })?;
-        let (kind, actual_layers) = match cache {
-            LlamaCache::Standard(caches) => ("standard", caches.len()),
-            LlamaCache::Sliding(caches) => ("sliding", caches.len()),
-            LlamaCache::Paged(caches) => ("paged", caches.len()),
+        let actual_layers = match cache {
+            LlamaCache::Device(caches) => caches.len(),
+            LlamaCache::Paged(caches) => caches.len(),
         };
-        let expected_kind = if self.args().sliding_window.is_some() {
-            "sliding"
-        } else {
-            "standard"
-        };
-        if kind != "paged" && kind != expected_kind {
-            return Err(LlamaModelError::CacheTypeMismatch {
-                expected: expected_kind,
-                actual: kind,
-            }
-            .into());
-        }
         if actual_layers != expected_layers {
             return Err(LlamaModelError::CacheLengthMismatch {
                 expected: expected_layers,
@@ -488,8 +453,38 @@ impl LlamaModel {
             }
             .into());
         }
+        match cache {
+            LlamaCache::Device(caches) => {
+                validate_cache_policies(caches, &self.args().attention_schedule)?
+            }
+            LlamaCache::Paged(caches) => {
+                validate_cache_policies(caches, &self.args().attention_schedule)?
+            }
+        }
         Ok(())
     }
+}
+
+fn validate_cache_policies<C: KeyValueCache>(
+    caches: &[Option<C>],
+    schedule: &crate::runtime::attention::LayerSchedule<crate::runtime::attention::AttentionPolicy>,
+) -> Result<(), Error> {
+    for (layer, (cache, policy)) in caches.iter().zip(schedule.iter()).enumerate() {
+        let cache = cache
+            .as_ref()
+            .ok_or_else(|| Exception::custom(format!("Llama cache is missing layer {layer}")))?;
+        let expected = policy.window().map(|window| {
+            i32::try_from(window.get()).expect("validated Llama attention window fits i32")
+        });
+        if cache.max_size() != expected {
+            return Err(Exception::custom(format!(
+                "Llama cache policy mismatch at layer {layer}: expected {policy:?}, cache window is {:?}",
+                cache.max_size()
+            ))
+            .into());
+        }
+    }
+    Ok(())
 }
 
 impl CausalLm<LlamaCache> for LlamaModel {
@@ -649,7 +644,7 @@ impl LlamaLayerwiseAdapter {
 /// Llama mask state shared by every temporary decoder block.
 pub struct LlamaForwardContext {
     mask: Option<Array>,
-    generated_sliding_window: Option<i32>,
+    allow_sliding_prefill: bool,
 }
 
 impl LayerwiseModelAdapter for LlamaLayerwiseAdapter {
@@ -735,19 +730,14 @@ impl LayerwiseModelAdapter for LlamaLayerwiseAdapter {
         cache: &[Option<C>],
         stream: &Stream,
     ) -> Result<Self::ForwardContext, Error> {
-        let (mask, generated_sliding_window) = match mask {
-            Some(mask) => (Some(mask.clone()), None),
-            None if self.args.sliding_window.is_some() && hidden.shape()[1] > 1 => {
-                (None, self.args.sliding_window)
-            }
-            None => (
-                llama_attention_mask(hidden, cache, self.args.sliding_window, stream)?,
-                None,
-            ),
+        let allow_sliding_prefill = mask.is_none();
+        let mask = match mask {
+            Some(mask) => Some(mask.clone()),
+            None => llama_attention_mask(hidden, cache, stream)?,
         };
         Ok(LlamaForwardContext {
             mask,
-            generated_sliding_window,
+            allow_sliding_prefill,
         })
     }
 
@@ -765,7 +755,7 @@ impl LayerwiseModelAdapter for LlamaLayerwiseAdapter {
                 x: hidden,
                 mask: context.mask.as_ref(),
                 cache: Some(cache),
-                generated_sliding_window: context.generated_sliding_window,
+                allow_sliding_prefill: context.allow_sliding_prefill,
             },
             stream,
         )?)
@@ -789,14 +779,8 @@ impl LayerwiseModelAdapter for LlamaLayerwiseAdapter {
 fn llama_attention_mask<C: KeyValueCache>(
     hidden: &Array,
     cache: &[Option<C>],
-    sliding_window: Option<i32>,
     stream: &Stream,
 ) -> Result<Option<Array>, Error> {
-    if let Some(window) = sliding_window {
-        return Ok(create_sliding_attention_mask(
-            hidden, cache, window, stream,
-        )?);
-    }
     match create_attention_mask(hidden, cache, Some(true), stream)? {
         Some(AttentionMask::Array(mask)) => Ok(Some(mask)),
         Some(AttentionMask::Causal) => Err(Exception::custom(
@@ -829,13 +813,5 @@ pub enum LlamaModelError {
         expected: usize,
         /// Supplied cache count.
         actual: usize,
-    },
-    /// The cache implementation did not match the model attention mode.
-    #[error("cache type mismatch: model requires {expected}, supplied {actual}")]
-    CacheTypeMismatch {
-        /// Required cache kind.
-        expected: &'static str,
-        /// Supplied cache kind.
-        actual: &'static str,
     },
 }

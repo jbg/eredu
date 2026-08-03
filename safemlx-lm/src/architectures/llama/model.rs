@@ -37,22 +37,25 @@ use crate::{
     },
     error::Error,
     nn::tensor::{
-        create_attention_mask, create_sliding_attention_mask,
+        create_attention_mask,
         rope::{initialize_rope, FloatOrString, RopeVariant},
         AttentionMask,
     },
-    runtime::cache::residency::derive_prompt_cache_architecture_fingerprint,
-    runtime::cache::{KeyValueCache, SlidingKeyValueCache},
     runtime::checkpoint::load::{
         gguf_metadata, gguf_quantization_configs, load_gguf_strict, load_safetensors_dir_lenient,
         load_safetensors_dir_quantized_strict, GgufTensorNames, StrictLoadConfig, StrictLoadReport,
     },
     runtime::checkpoint::quantization::WeightQuantization,
     runtime::execution::inspection::ActivationObserver,
+    runtime::{
+        attention::{AttentionPolicy, LayerSchedule},
+        cache::residency::derive_prompt_cache_architecture_fingerprint,
+        cache::{ConcatKeyValueCache, KeyValueCache},
+    },
 };
 
-#[derive(Debug, Clone, Deserialize)]
-/// Deserialized Llama `config.json` fields used by this loader.
+#[derive(Debug, Clone)]
+/// Normalized Llama/Mistral decoder geometry used by every execution path.
 pub struct ModelArgs {
     /// Model type from the configuration.
     pub model_type: String,
@@ -68,51 +71,72 @@ pub struct ModelArgs {
     pub rms_norm_eps: f32,
     /// Token vocabulary size.
     pub vocab_size: i32,
-    #[serde(default)]
     /// Number of key/value heads.
     pub num_key_value_heads: i32,
-    #[serde(default)]
     /// Maximum configured sequence length.
     pub max_position_embeddings: i32,
-    #[serde(default = "default_rope_theta")]
     /// RoPE base frequency.
     pub rope_theta: f32,
-    #[serde(default)]
     /// Whether RoPE uses adjacent-pair ordering instead of split-half ordering.
     pub rope_traditional: bool,
-    #[serde(default)]
     /// Per-head attention dimension.
     pub head_dim: i32,
-    #[serde(default = "default_true")]
     /// Whether logits use tied input embeddings.
     pub tie_word_embeddings: bool,
-    #[serde(default)]
     /// Whether attention projection layers include bias terms.
     pub attention_bias: bool,
-    #[serde(default)]
     /// Whether MLP projection layers include bias terms.
     pub mlp_bias: bool,
     /// Optional RoPE scaling configuration.
     pub rope_scaling: Option<HashMap<String, FloatOrString>>,
-    /// Optional total causal attention window, including the current token.
-    #[serde(default)]
-    pub sliding_window: Option<i32>,
+    /// Exact ordered attention behavior for every decoder layer.
+    pub attention_schedule: LayerSchedule<AttentionPolicy>,
     /// Preferred MLX-LM affine quantization metadata.
-    #[serde(default)]
     pub quantization: Option<WeightQuantization>,
     /// Hugging Face-compatible alias emitted by MLX-LM converters.
-    #[serde(default)]
     pub quantization_config: Option<WeightQuantization>,
     /// Optional exact weight names that use affine quantization.
     ///
     /// `None` preserves MLX-LM's model-wide quantization behavior. GGUF
     /// loading uses `Some` to represent files containing a mixture of packed
     /// and dense matrices.
-    #[serde(skip)]
     pub quantized_weights: Option<HashSet<String>>,
     /// Exact affine settings for mixed GGUF tensors.
-    #[serde(skip)]
     pub quantized_weight_configs: Option<HashMap<String, WeightQuantization>>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ModelArgsSource {
+    model_type: String,
+    hidden_size: i32,
+    num_hidden_layers: i32,
+    intermediate_size: i32,
+    num_attention_heads: i32,
+    rms_norm_eps: f32,
+    vocab_size: i32,
+    #[serde(default)]
+    num_key_value_heads: i32,
+    #[serde(default)]
+    max_position_embeddings: i32,
+    #[serde(default = "default_rope_theta")]
+    rope_theta: f32,
+    #[serde(default)]
+    rope_traditional: bool,
+    #[serde(default)]
+    head_dim: i32,
+    #[serde(default = "default_true")]
+    tie_word_embeddings: bool,
+    #[serde(default)]
+    attention_bias: bool,
+    #[serde(default)]
+    mlp_bias: bool,
+    rope_scaling: Option<HashMap<String, FloatOrString>>,
+    #[serde(default)]
+    sliding_window: Option<Value>,
+    #[serde(default)]
+    quantization: Option<WeightQuantization>,
+    #[serde(default)]
+    quantization_config: Option<WeightQuantization>,
 }
 
 impl ModelArgs {
@@ -195,7 +219,10 @@ pub(crate) fn prompt_cache_architecture_fingerprint(args: &ModelArgs) -> String 
             ("rope_theta", format!("{:08x}", args.rope_theta.to_bits())),
             ("rope_traditional", args.rope_traditional.to_string()),
             ("rope_scaling", rope_scaling),
-            ("sliding_window", format!("{:?}", args.sliding_window)),
+            (
+                "attention_schedule",
+                args.attention_schedule.fingerprint_component(),
+            ),
             ("tie_word_embeddings", args.tie_word_embeddings.to_string()),
             ("attention_bias", args.attention_bias.to_string()),
             ("mlp_bias", args.mlp_bias.to_string()),
@@ -207,6 +234,16 @@ pub(crate) fn prompt_cache_architecture_fingerprint(args: &ModelArgs) -> String 
             ),
         ],
     )
+}
+
+pub(crate) fn uniform_attention_window(args: &ModelArgs) -> Option<Option<i32>> {
+    let mut policies = args.attention_schedule.iter();
+    let first = policies.next()?;
+    policies.all(|policy| policy == first).then(|| {
+        first.window().map(|window| {
+            i32::try_from(window.get()).expect("validated Llama attention window fits i32")
+        })
+    })
 }
 
 fn default_true() -> bool {
@@ -225,8 +262,8 @@ pub struct AttentionInput<'a, C> {
     pub mask: Option<&'a Array>,
     /// Optional mutable key/value cache.
     pub cache: Option<&'a mut C>,
-    /// Generated total sliding-window size eligible for chunked prefill.
-    pub generated_sliding_window: Option<i32>,
+    /// Whether a layer may generate its canonical sliding-prefill mask.
+    pub allow_sliding_prefill: bool,
 }
 
 #[derive(Debug, Clone, ModuleParameters, Quantizable)]
@@ -258,12 +295,17 @@ pub struct Attention {
     #[param]
     /// Rotary position embedding module.
     pub rope: RopeVariant,
+    /// Layer-local attention window; absent for full causal attention.
+    pub sliding_window: Option<i32>,
 }
 
 impl Attention {
     /// Creates an unloaded attention layer from model arguments.
     pub fn new(args: &ModelArgs, stream: &Stream) -> Result<Self, Exception> {
-        Self::new_with_prefix(args, None, stream)
+        let policy = args.attention_schedule.get(0).ok_or_else(|| {
+            Exception::custom("Llama attention schedule has no policy for layer 0")
+        })?;
+        Self::new_with_prefix(args, None, *policy, stream)
     }
 
     fn new_for_layer(
@@ -271,9 +313,17 @@ impl Attention {
         layer_index: i32,
         stream: &Stream,
     ) -> Result<Self, Exception> {
+        let layer = usize::try_from(layer_index)
+            .map_err(|_| Exception::custom(format!("invalid Llama layer index {layer_index}")))?;
+        let policy = args.attention_schedule.get(layer).ok_or_else(|| {
+            Exception::custom(format!(
+                "Llama attention schedule has no policy for layer {layer_index}"
+            ))
+        })?;
         Self::new_with_prefix(
             args,
             Some(format!("model.layers.{layer_index}.self_attn")),
+            *policy,
             stream,
         )
     }
@@ -281,6 +331,7 @@ impl Attention {
     fn new_with_prefix(
         args: &ModelArgs,
         prefix: Option<String>,
+        policy: AttentionPolicy,
         stream: &Stream,
     ) -> Result<Self, Exception> {
         let dim = args.hidden_size;
@@ -369,6 +420,11 @@ impl Attention {
             v_proj,
             o_proj,
             rope,
+            sliding_window: policy
+                .window()
+                .map(|window| i32::try_from(window.get()))
+                .transpose()
+                .map_err(|_| Exception::custom("Llama sliding window exceeds i32"))?,
         })
     }
 
@@ -384,7 +440,10 @@ impl Attention {
         C: KeyValueCache,
     {
         let AttentionInput {
-            x, mask, mut cache, ..
+            x,
+            mask,
+            mut cache,
+            allow_sliding_prefill,
         } = input;
 
         let (batch, seq_len) = batch_seq(x);
@@ -403,17 +462,35 @@ impl Attention {
         let values = reshape_attention_projection(values, batch, seq_len, self.n_kv_heads, stream)?;
         observer.observe(&format!("{prefix}.values"), &values)?;
 
+        let position_offset = cache.as_ref().map_or(0, |cache| cache.offset());
         let (queries, keys, values) =
             apply_rope_and_update_cache(&mut self.rope, queries, keys, values, &mut cache, stream)?;
         observer.observe(&format!("{prefix}.queries_rope"), &queries)?;
         observer.observe(&format!("{prefix}.keys_rope"), &keys)?;
         observer.observe(&format!("{prefix}.values_cache"), &values)?;
-        let attention_probs = attention_probabilities(&queries, &keys, self.scale, mask, stream)?;
-        observer.observe(&format!("{prefix}.attention_probs"), &attention_probs)?;
-
-        let output = finish_attention(
-            queries, keys, values, cache, self.scale, mask, batch, seq_len, stream,
-        )?;
+        let output = if let Some(window) = self
+            .sliding_window
+            .filter(|_| allow_sliding_prefill && seq_len > 1)
+        {
+            common::attention::sliding_window_prefill_attention(
+                queries,
+                keys,
+                values,
+                self.scale,
+                window,
+                position_offset,
+                batch,
+                seq_len,
+                stream,
+            )?
+        } else {
+            let attention_probs =
+                attention_probabilities(&queries, &keys, self.scale, mask, stream)?;
+            observer.observe(&format!("{prefix}.attention_probs"), &attention_probs)?;
+            finish_attention(
+                queries, keys, values, cache, self.scale, mask, batch, seq_len, stream,
+            )?
+        };
         observer.observe(&format!("{prefix}.attention"), &output)?;
 
         let output = self.o_proj.forward(&output, stream)?;
@@ -440,7 +517,7 @@ where
             x,
             mask,
             mut cache,
-            generated_sliding_window,
+            allow_sliding_prefill,
         } = input;
 
         let (B, L) = batch_seq(x);
@@ -455,7 +532,10 @@ where
         let position_offset = cache.as_ref().map_or(0, |cache| cache.offset());
         let (queries, keys, values) =
             apply_rope_and_update_cache(&mut self.rope, queries, keys, values, &mut cache, stream)?;
-        let output = if let Some(window_size) = generated_sliding_window.filter(|_| L > 1) {
+        let output = if let Some(window_size) = self
+            .sliding_window
+            .filter(|_| allow_sliding_prefill && L > 1)
+        {
             common::attention::sliding_window_prefill_attention(
                 queries,
                 keys,
@@ -582,7 +662,7 @@ impl TransformerBlock {
             x,
             mask,
             cache,
-            generated_sliding_window,
+            allow_sliding_prefill,
         } = input;
 
         observer.observe(&format!("{prefix}.input"), x)?;
@@ -594,7 +674,7 @@ impl TransformerBlock {
             x: &normed,
             mask,
             cache,
-            generated_sliding_window,
+            allow_sliding_prefill,
         };
         let r = self.self_attn.forward_with_observer(
             self_attn_input,
@@ -646,7 +726,7 @@ where
             x,
             mask,
             cache,
-            generated_sliding_window,
+            allow_sliding_prefill,
         } = input;
 
         let normed = self.input_layernorm.forward(x, stream)?;
@@ -654,7 +734,7 @@ where
             x: &normed,
             mask,
             cache,
-            generated_sliding_window,
+            allow_sliding_prefill,
         };
         let r = self.self_attn.forward(self_attn_input, stream)?;
         let h = x.add(r, stream)?;
@@ -679,9 +759,6 @@ pub struct ResidentDecoder {
     pub vocab_size: i32,
     /// Number of decoder layers.
     pub num_hidden_layers: i32,
-    /// Optional total causal attention window.
-    pub sliding_window: Option<i32>,
-
     #[quantizable]
     #[param]
     /// Token embedding table.
@@ -720,7 +797,6 @@ impl ResidentDecoder {
         Ok(Self {
             vocab_size,
             num_hidden_layers,
-            sliding_window: args.sliding_window,
             embed_tokens,
             layers,
             norm,
@@ -736,10 +812,6 @@ impl ResidentDecoder {
     where
         C: KeyValueCache,
     {
-        if let Some(window_size) = self.sliding_window {
-            return create_sliding_attention_mask(h, cache, window_size, stream);
-        }
-
         match create_attention_mask(h, cache, Some(true), stream)? {
             Some(AttentionMask::Array(mask)) => Ok(Some(mask)),
             Some(AttentionMask::Causal) => Err(Exception::custom(
@@ -757,7 +829,7 @@ impl ResidentDecoder {
         observer: &mut impl ActivationObserver,
     ) -> Result<Array, Exception>
     where
-        C: KeyValueCache + Default,
+        C: KeyValueCache,
     {
         let ModelInput {
             inputs,
@@ -768,6 +840,7 @@ impl ResidentDecoder {
         let mut h = self.embed_tokens.forward(inputs, stream)?;
         observer.observe("model.embed_tokens", &h)?;
 
+        let allow_sliding_prefill = mask.is_none();
         let mask = match mask {
             Some(mask) => Some(mask.clone()),
             None => self.attention_mask(&h, cache, stream)?,
@@ -776,16 +849,12 @@ impl ResidentDecoder {
             observer.observe("model.attention_mask", mask)?;
         }
 
-        if cache.is_empty() {
-            *cache = (0..self.layers.len()).map(|_| Some(C::default())).collect();
-        }
-
         for (i, (layer, c)) in self.layers.iter_mut().zip(cache.iter_mut()).enumerate() {
             let layer_input = AttentionInput {
                 x: &h,
                 mask: mask.as_ref(),
                 cache: c.as_mut(),
-                generated_sliding_window: None,
+                allow_sliding_prefill,
             };
             h = layer.forward_with_observer(
                 layer_input,
@@ -813,7 +882,7 @@ pub struct ModelInput<'a, C> {
 
 impl<C> Module<ModelInput<'_, C>> for ResidentDecoder
 where
-    C: KeyValueCache + Default,
+    C: KeyValueCache,
 {
     type Output = Array;
 
@@ -832,24 +901,18 @@ where
 
         let mut h = self.embed_tokens.forward(inputs, stream)?;
 
-        let (mask, generated_sliding_window) = match mask {
-            Some(mask) => (Some(mask.clone()), None),
-            None if self.sliding_window.is_some() && h.shape()[1] > 1 => {
-                (None, self.sliding_window)
-            }
-            None => (self.attention_mask(&h, cache, stream)?, None),
+        let allow_sliding_prefill = mask.is_none();
+        let mask = match mask {
+            Some(mask) => Some(mask.clone()),
+            None => self.attention_mask(&h, cache, stream)?,
         };
-
-        if cache.is_empty() {
-            *cache = (0..self.layers.len()).map(|_| Some(C::default())).collect();
-        }
 
         for (layer, c) in self.layers.iter_mut().zip(cache.iter_mut()) {
             let layer_input = AttentionInput {
                 x: &h,
                 mask: mask.as_ref(),
                 cache: c.as_mut(),
-                generated_sliding_window,
+                allow_sliding_prefill,
             };
             h = layer.forward(layer_input, stream)?;
         }
@@ -912,20 +975,50 @@ impl ResidentModel {
         &self.args.model_type
     }
 
-    /// Returns the configured total sliding-window size, if any.
-    pub fn sliding_window(&self) -> Option<i32> {
-        self.args.sliding_window
+    /// Creates one architecture-correct device cache per decoder layer.
+    pub fn new_cache(&self) -> Vec<Option<ConcatKeyValueCache>> {
+        self.args
+            .attention_schedule
+            .iter()
+            .map(|policy| {
+                Some(match policy.window() {
+                    Some(window) => ConcatKeyValueCache::new_for_sliding_attention(
+                        i32::try_from(window.get())
+                            .expect("validated Llama attention window fits i32"),
+                    ),
+                    None => ConcatKeyValueCache::new(),
+                })
+            })
+            .collect()
     }
 
-    /// Creates bounded per-layer caches for a sliding-window configuration.
-    pub fn new_sliding_cache(&self) -> Vec<Option<SlidingKeyValueCache>> {
-        let window_size = self
-            .args
-            .sliding_window
-            .expect("new_sliding_cache requires a sliding-window model");
-        (0..self.args.num_hidden_layers)
-            .map(|_| Some(SlidingKeyValueCache::new(window_size)))
-            .collect()
+    fn validate_cache<C: KeyValueCache>(&self, cache: &[Option<C>]) -> Result<(), Exception> {
+        if cache.len() != self.args.attention_schedule.len() {
+            return Err(Exception::custom(format!(
+                "Llama cache has {} layers, expected {}",
+                cache.len(),
+                self.args.attention_schedule.len()
+            )));
+        }
+        for (layer, (cache, policy)) in cache
+            .iter()
+            .zip(self.args.attention_schedule.iter())
+            .enumerate()
+        {
+            let cache = cache.as_ref().ok_or_else(|| {
+                Exception::custom(format!("Llama cache is missing layer {layer}"))
+            })?;
+            let expected = policy.window().map(|window| {
+                i32::try_from(window.get()).expect("validated Llama attention window fits i32")
+            });
+            if cache.max_size() != expected {
+                return Err(Exception::custom(format!(
+                    "Llama cache policy mismatch at layer {layer}: expected {policy:?}, cache window is {:?}",
+                    cache.max_size()
+                )));
+            }
+        }
+        Ok(())
     }
 
     /// Forward pass that reports activations to an observer.
@@ -936,8 +1029,9 @@ impl ResidentModel {
         observer: &mut impl ActivationObserver,
     ) -> Result<Array, Exception>
     where
-        C: KeyValueCache + Default,
+        C: KeyValueCache,
     {
+        self.validate_cache(input.cache)?;
         let out = self.model.forward_with_observer(input, stream, observer)?;
         observer.observe("model.output", &out)?;
         let logits = project_logits_maybe_quantized(
@@ -953,7 +1047,7 @@ impl ResidentModel {
 
 impl<C> Module<ModelInput<'_, C>> for ResidentModel
 where
-    C: KeyValueCache + Default,
+    C: KeyValueCache,
 {
     type Output = Array;
 
@@ -964,6 +1058,7 @@ where
         input: ModelInput<'_, C>,
         stream: &Stream,
     ) -> Result<Self::Output, Self::Error> {
+        self.validate_cache(input.cache)?;
         let out = self.model.forward(input, stream)?;
         project_logits_maybe_quantized(
             &mut self.lm_head,
@@ -991,29 +1086,92 @@ pub fn load_llama_tokenizer(model_dir: impl AsRef<Path>) -> Result<Tokenizer, Er
 pub fn get_llama_model_args(model_dir: impl AsRef<Path>) -> Result<ModelArgs, Error> {
     let model_args_filename = model_dir.as_ref().join("config.json");
     let file = std::fs::File::open(model_args_filename)?;
-    let model_args: ModelArgs = serde_json::from_reader(file)?;
-    normalize_model_args(model_args)
+    let source: ModelArgsSource = serde_json::from_reader(file)?;
+    normalize_model_args(source)
 }
 
-fn normalize_model_args(mut model_args: ModelArgs) -> Result<ModelArgs, Error> {
-    if model_args.num_key_value_heads == 0 {
-        model_args.num_key_value_heads = model_args.num_attention_heads;
+fn normalize_model_args(mut source: ModelArgsSource) -> Result<ModelArgs, Error> {
+    if source.num_key_value_heads == 0 {
+        source.num_key_value_heads = source.num_attention_heads;
     }
-    if model_args.head_dim == 0 {
-        if model_args.num_attention_heads <= 0 {
+    if source.head_dim == 0 {
+        if source.num_attention_heads <= 0 {
             return Err(Error::UnsupportedArchitecture(format!(
                 "num_attention_heads must be positive, got {}",
-                model_args.num_attention_heads
+                source.num_attention_heads
             )));
         }
-        model_args.head_dim = model_args.hidden_size / model_args.num_attention_heads;
+        source.head_dim = source.hidden_size / source.num_attention_heads;
     }
-    if model_args.max_position_embeddings == 0 {
-        model_args.max_position_embeddings = 2048;
+    if source.max_position_embeddings == 0 {
+        source.max_position_embeddings = 2048;
     }
-
+    let layer_count = usize::try_from(source.num_hidden_layers).map_err(|_| {
+        Error::UnsupportedArchitecture(format!(
+            "num_hidden_layers must be positive, got {}",
+            source.num_hidden_layers
+        ))
+    })?;
+    let attention_schedule = match normalize_hf_sliding_window(source.sliding_window)? {
+        None => LayerSchedule::all_full(layer_count),
+        Some(window) => LayerSchedule::all_sliding(layer_count, window),
+    }
+    .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+    let model_args = ModelArgs {
+        model_type: source.model_type,
+        hidden_size: source.hidden_size,
+        num_hidden_layers: source.num_hidden_layers,
+        intermediate_size: source.intermediate_size,
+        num_attention_heads: source.num_attention_heads,
+        rms_norm_eps: source.rms_norm_eps,
+        vocab_size: source.vocab_size,
+        num_key_value_heads: source.num_key_value_heads,
+        max_position_embeddings: source.max_position_embeddings,
+        rope_theta: source.rope_theta,
+        rope_traditional: source.rope_traditional,
+        head_dim: source.head_dim,
+        tie_word_embeddings: source.tie_word_embeddings,
+        attention_bias: source.attention_bias,
+        mlp_bias: source.mlp_bias,
+        rope_scaling: source.rope_scaling,
+        attention_schedule,
+        quantization: source.quantization,
+        quantization_config: source.quantization_config,
+        quantized_weights: None,
+        quantized_weight_configs: None,
+    };
     validate_model_args(&model_args)?;
     Ok(model_args)
+}
+
+fn normalize_hf_sliding_window(value: Option<Value>) -> Result<Option<u32>, Error> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let Value::Number(number) = value else {
+        return Err(Error::UnsupportedArchitecture(format!(
+            "sliding_window must be a positive integer or null, got {value}"
+        )));
+    };
+    if let Some(window) = number.as_u64() {
+        let window = u32::try_from(window).map_err(|_| {
+            Error::UnsupportedArchitecture(format!("sliding_window exceeds u32: {window}"))
+        })?;
+        if window == 0 {
+            return Err(Error::UnsupportedArchitecture(
+                "sliding_window must be positive, got 0".into(),
+            ));
+        }
+        return Ok(Some(window));
+    }
+    if let Some(window) = number.as_i64() {
+        return Err(Error::UnsupportedArchitecture(format!(
+            "sliding_window must be positive, got {window}"
+        )));
+    }
+    Err(Error::UnsupportedArchitecture(format!(
+        "sliding_window must use an integer encoding, got {number}"
+    )))
 }
 
 fn validate_model_args(model_args: &ModelArgs) -> Result<(), Error> {
@@ -1056,10 +1214,18 @@ fn validate_model_args(model_args: &ModelArgs) -> Result<(), Error> {
             ))
         })?;
     }
-    if let Some(window_size) = model_args.sliding_window {
-        if window_size <= 0 {
+    if model_args.attention_schedule.len() != model_args.num_hidden_layers as usize {
+        return Err(Error::UnsupportedArchitecture(format!(
+            "Llama attention schedule has {} layers, expected {}",
+            model_args.attention_schedule.len(),
+            model_args.num_hidden_layers
+        )));
+    }
+    for window in model_args.attention_schedule.sliding_windows().keys() {
+        if i32::try_from(window.get()).is_err() {
             return Err(Error::UnsupportedArchitecture(format!(
-                "sliding_window must be positive, got {window_size}"
+                "Llama sliding attention window {} exceeds i32",
+                window.get()
             )));
         }
     }
@@ -1070,9 +1236,12 @@ pub(crate) fn validate_model_config_value(config: &Value) -> Result<(), Error> {
     model_args_from_config_value(config).map(|_| ())
 }
 
-/// Parses the normalized arguments shared by structural preflight and loading.
-pub(crate) fn model_args_from_config_value(config: &Value) -> Result<ModelArgs, Error> {
-    let args = serde_json::from_value::<ModelArgs>(config.clone()).map_err(|error| {
+/// Parses and normalizes a Hugging Face Llama/Mistral configuration value.
+///
+/// Raw `sliding_window` metadata is consumed once and replaced by the exact
+/// per-layer [`LayerSchedule<AttentionPolicy>`] stored in [`ModelArgs`].
+pub fn model_args_from_config_value(config: &Value) -> Result<ModelArgs, Error> {
+    let args = serde_json::from_value::<ModelArgsSource>(config.clone()).map_err(|error| {
         Error::UnsupportedArchitecture(format!("invalid Llama-compatible config: {error}"))
     })?;
     normalize_model_args(args)
@@ -1215,11 +1384,7 @@ pub(crate) fn model_args_from_gguf_catalog(
     let rope_theta =
         gguf_optional_f32(metadata, &key("rope.freq_base"))?.unwrap_or_else(default_rope_theta);
     let rope_scaling = gguf_rope_scaling(metadata, &architecture)?;
-    let sliding_window = gguf_optional_i64(metadata, &key("attention.sliding_window"))?
-        .map(i32::try_from)
-        .transpose()
-        .map_err(|_| Error::UnsupportedArchitecture("GGUF sliding-window size exceeds i32".into()))?
-        .filter(|window| *window != 0);
+    let sliding_window = gguf_optional_i64(metadata, &key("attention.sliding_window"))?;
     let vocab_size = match metadata
         .get("tokenizer.ggml.tokens")
         .and_then(GgufMetadataValue::as_strings)
@@ -1235,10 +1400,30 @@ pub(crate) fn model_args_from_gguf_catalog(
         None => gguf_i32(metadata, &key("vocab_size"))?,
     };
 
+    let num_hidden_layers = gguf_i32(metadata, &key("block_count"))?;
+    let layer_count = usize::try_from(num_hidden_layers).map_err(|_| {
+        Error::UnsupportedArchitecture(format!(
+            "GGUF block count must be positive, got {num_hidden_layers}"
+        ))
+    })?;
+    // GGUF defines zero as disabled for this scalar; positive values enable the
+    // same exact window on every decoder layer.
+    let attention_schedule = match sliding_window {
+        None | Some(0) => LayerSchedule::all_full(layer_count),
+        Some(window) => {
+            let window = u32::try_from(window).map_err(|_| {
+                Error::UnsupportedArchitecture(format!(
+                    "GGUF sliding-window size must be positive and fit u32, got {window}"
+                ))
+            })?;
+            LayerSchedule::all_sliding(layer_count, window)
+        }
+    }
+    .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
     let args = ModelArgs {
         model_type: architecture.clone(),
         hidden_size,
-        num_hidden_layers: gguf_i32(metadata, &key("block_count"))?,
+        num_hidden_layers,
         intermediate_size: gguf_i32(metadata, &key("feed_forward_length"))?,
         num_attention_heads,
         rms_norm_eps: gguf_f32(metadata, &key("attention.layer_norm_rms_epsilon"))?,
@@ -1269,7 +1454,7 @@ pub(crate) fn model_args_from_gguf_catalog(
                 )
         }),
         rope_scaling,
-        sliding_window,
+        attention_schedule,
         quantization: None,
         quantization_config: None,
         quantized_weights: None,
@@ -1459,7 +1644,7 @@ pub fn load_resident_llama_model_quantized(
 
 impl<C> CausalLm<Vec<Option<C>>> for ResidentModel
 where
-    C: KeyValueCache + Default,
+    C: KeyValueCache,
 {
     fn prefill_input_logits(
         &mut self,
@@ -1511,7 +1696,7 @@ mod tests {
 
     use lazy_static::lazy_static;
     use safemlx::{
-        module::Module,
+        module::{Module, ModuleParameters},
         ops::indexing::{NewAxis, TryIndexOp},
         ops::{GgufMetadataArray, GgufMetadataValue},
         transforms::eval,
@@ -1520,13 +1705,13 @@ mod tests {
 
     use crate::{
         architectures::llama::model::{load_llama_tokenizer, load_resident_llama_model},
-        runtime::cache::ConcatKeyValueCache,
+        runtime::cache::{ConcatKeyValueCache, KeyValueCache},
         runtime::checkpoint::quantization::AffineQuantization,
     };
 
     #[test]
     fn normalizes_hermes_mistral_config() {
-        let args: super::ModelArgs = serde_json::from_value(serde_json::json!({
+        let args = super::model_args_from_config_value(&serde_json::json!({
             "model_type": "mistral",
             "hidden_size": 4096,
             "num_hidden_layers": 32,
@@ -1541,17 +1726,249 @@ mod tests {
             "tie_word_embeddings": false
         }))
         .unwrap();
-        let args = super::normalize_model_args(args).unwrap();
 
         assert_eq!(args.model_type, "mistral");
         assert_eq!(args.head_dim, 128);
         assert_eq!(args.num_key_value_heads, 8);
-        assert_eq!(args.sliding_window, Some(4096));
+        assert_eq!(args.attention_schedule.sliding_layer_count(), 32);
+        assert_eq!(
+            args.attention_schedule
+                .get(0)
+                .unwrap()
+                .window()
+                .unwrap()
+                .get(),
+            4096
+        );
+    }
+
+    fn tiny_config(sliding_window: Option<serde_json::Value>) -> serde_json::Value {
+        let mut config = serde_json::json!({
+            "model_type": "mistral",
+            "hidden_size": 32,
+            "num_hidden_layers": 4,
+            "intermediate_size": 64,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 2,
+            "rms_norm_eps": 0.00001,
+            "vocab_size": 64,
+            "max_position_embeddings": 128
+        });
+        if let Some(window) = sliding_window {
+            config["sliding_window"] = window;
+        }
+        config
+    }
+
+    #[test]
+    fn hf_llama_and_mistral_normalize_to_exact_attention_schedules() {
+        let full = super::model_args_from_config_value(&tiny_config(None)).unwrap();
+        assert_eq!(full.attention_schedule.full_layer_count(), 4);
+        assert_eq!(full.attention_schedule.sliding_layer_count(), 0);
+
+        let sliding = super::model_args_from_config_value(&tiny_config(Some(7.into()))).unwrap();
+        assert_eq!(sliding.attention_schedule.full_layer_count(), 0);
+        assert_eq!(sliding.attention_schedule.sliding_layer_count(), 4);
+        assert!(sliding
+            .attention_schedule
+            .iter()
+            .all(|policy| policy.window().unwrap().get() == 7));
+    }
+
+    #[test]
+    fn hf_mistral_rejects_invalid_and_overflowing_windows() {
+        for invalid in [
+            serde_json::json!(0),
+            serde_json::json!(-1),
+            serde_json::json!(4_294_967_296u64),
+        ] {
+            let error = super::model_args_from_config_value(&tiny_config(Some(invalid)))
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("sliding_window") || error.contains("window"));
+        }
+    }
+
+    #[test]
+    fn fingerprint_and_cache_geometry_include_ordered_attention_schedule() {
+        use crate::runtime::attention::{AttentionPolicy, LayerSchedule};
+        use crate::runtime::cache::KeyValueCache;
+
+        let mut first = super::model_args_from_config_value(&tiny_config(None)).unwrap();
+        first.attention_schedule = LayerSchedule::new(
+            4,
+            vec![
+                AttentionPolicy::sliding(3).unwrap(),
+                AttentionPolicy::Full,
+                AttentionPolicy::sliding(5).unwrap(),
+                AttentionPolicy::Full,
+            ],
+        )
+        .unwrap();
+        let mut second = first.clone();
+        second.attention_schedule = LayerSchedule::new(
+            4,
+            vec![
+                AttentionPolicy::Full,
+                AttentionPolicy::sliding(3).unwrap(),
+                AttentionPolicy::sliding(5).unwrap(),
+                AttentionPolicy::Full,
+            ],
+        )
+        .unwrap();
+        assert_ne!(
+            super::prompt_cache_architecture_fingerprint(&first),
+            super::prompt_cache_architecture_fingerprint(&second)
+        );
+
+        let context =
+            safemlx::ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
+        let model = super::ResidentModel::new(first, context.stream()).unwrap();
+        let cache = model.new_cache();
+        assert_eq!(
+            cache
+                .iter()
+                .map(|cache| cache.as_ref().unwrap().max_size())
+                .collect::<Vec<_>>(),
+            vec![Some(3), None, Some(5), None]
+        );
+    }
+
+    fn initialize_model(module: &mut impl ModuleParameters, stream: &safemlx::Stream) {
+        let mut names = module
+            .parameters()
+            .flatten()
+            .keys()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+        names.sort();
+        let mut parameters = module.parameters_mut().flatten();
+        for (index, name) in names.iter().enumerate() {
+            let parameter = parameters.get_mut(name.as_str()).unwrap();
+            let shape = parameter.shape().to_vec();
+            let dtype = parameter.dtype();
+            **parameter =
+                Array::full::<f32>(&shape, Array::from_f32(0.001 * (index + 1) as f32), stream)
+                    .unwrap()
+                    .as_dtype(dtype, stream)
+                    .unwrap();
+        }
+    }
+
+    fn assert_close(left: &Array, right: &Array, stream: &safemlx::Stream) {
+        assert!(left
+            .all_close(right, Some(3e-5), Some(3e-5), None, stream)
+            .unwrap()
+            .item::<bool>(stream));
+    }
+
+    #[test]
+    fn arbitrary_schedule_prefill_decode_and_paged_cache_parity() {
+        use crate::runtime::{
+            attention::{AttentionPolicy, LayerSchedule},
+            cache::{
+                residency::{CacheResidencyManager, PagedCacheOptions},
+                PagedKeyValueCache,
+            },
+        };
+
+        let context =
+            safemlx::ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
+        let stream = context.stream();
+        let mut args = super::model_args_from_config_value(&tiny_config(None)).unwrap();
+        args.attention_schedule = LayerSchedule::new(
+            4,
+            vec![
+                AttentionPolicy::sliding(3).unwrap(),
+                AttentionPolicy::Full,
+                AttentionPolicy::sliding(5).unwrap(),
+                AttentionPolicy::Full,
+            ],
+        )
+        .unwrap();
+        let mut ordinary = super::ResidentModel::new(args, stream).unwrap();
+        initialize_model(&mut ordinary, stream);
+        let mut paged = ordinary.clone();
+        let mut tokenwise = ordinary.clone();
+        let mut ordinary_cache = ordinary.new_cache();
+        let mut tokenwise_cache = tokenwise.new_cache();
+        let manager = CacheResidencyManager::new(
+            PagedCacheOptions::new(2, 1 << 20, 1 << 20, 1)
+                .unwrap()
+                .with_full_attention(true),
+        )
+        .unwrap();
+        let mut paged_cache = paged
+            .args
+            .attention_schedule
+            .iter()
+            .enumerate()
+            .map(|(layer, policy)| {
+                PagedKeyValueCache::new(
+                    manager.clone(),
+                    layer,
+                    policy.window().map(|window| window.get() as i32),
+                )
+                .map(Some)
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let prompt = Array::from_slice(&[1u32, 2, 3, 4], &[1, 4]);
+        let expected = ordinary
+            .forward(
+                super::ModelInput {
+                    inputs: &prompt,
+                    mask: None,
+                    cache: &mut ordinary_cache,
+                },
+                stream,
+            )
+            .unwrap();
+        let actual = paged
+            .forward(
+                super::ModelInput {
+                    inputs: &prompt,
+                    mask: None,
+                    cache: &mut paged_cache,
+                },
+                stream,
+            )
+            .unwrap();
+        assert_close(&expected, &actual, stream);
+
+        let mut decoded = None;
+        for token in [1u32, 2, 3, 4] {
+            decoded = Some(
+                tokenwise
+                    .forward(
+                        super::ModelInput {
+                            inputs: &Array::from_slice(&[token], &[1, 1]),
+                            mask: None,
+                            cache: &mut tokenwise_cache,
+                        },
+                        stream,
+                    )
+                    .unwrap(),
+            );
+        }
+        let expected_last = expected.try_index_device((.., -1, ..), stream).unwrap();
+        let decoded_last = decoded
+            .unwrap()
+            .try_index_device((.., -1, ..), stream)
+            .unwrap();
+        assert_close(&expected_last, &decoded_last, stream);
+        assert_eq!(
+            ordinary_cache
+                .iter()
+                .map(|cache| cache.as_ref().unwrap().retained_arrays()[0].dim(-2))
+                .collect::<Vec<_>>(),
+            vec![2, 4, 4, 4]
+        );
     }
 
     #[test]
     fn prompt_cache_architecture_fingerprint_is_derived_from_rope_configuration() {
-        let mut args: super::ModelArgs = serde_json::from_value(serde_json::json!({
+        let mut args = super::model_args_from_config_value(&serde_json::json!({
             "model_type": "llama",
             "hidden_size": 64,
             "num_hidden_layers": 2,
@@ -1575,7 +1992,7 @@ mod tests {
 
     #[test]
     fn preserves_mistral_small_explicit_head_dimension() {
-        let args: super::ModelArgs = serde_json::from_value(serde_json::json!({
+        let args = super::model_args_from_config_value(&serde_json::json!({
             "model_type": "mistral",
             "hidden_size": 5120,
             "num_hidden_layers": 40,
@@ -1591,11 +2008,10 @@ mod tests {
             "tie_word_embeddings": false
         }))
         .unwrap();
-        let args = super::normalize_model_args(args).unwrap();
 
         assert_eq!(args.head_dim, 128);
         assert_eq!(args.hidden_size, 5120);
-        assert_eq!(args.sliding_window, None);
+        assert_eq!(args.attention_schedule.full_layer_count(), 40);
     }
 
     #[test]
@@ -1642,7 +2058,8 @@ mod tests {
                 attention_bias: false,
                 mlp_bias: false,
                 rope_scaling: None,
-                sliding_window: Some(16),
+                attention_schedule: crate::runtime::attention::LayerSchedule::all_sliding(1, 16)
+                    .unwrap(),
                 quantization: None,
                 quantization_config: None,
                 quantized_weights: None,
@@ -1728,8 +2145,49 @@ mod tests {
         let loaded = super::load_llama_gguf_with_metadata(fixture.path(), stream, stream).unwrap();
 
         assert_eq!(loaded.model.model_type(), "mistral");
-        assert_eq!(loaded.model.sliding_window(), Some(16));
+        assert_eq!(
+            loaded
+                .model
+                .args
+                .attention_schedule
+                .get(0)
+                .unwrap()
+                .window()
+                .unwrap()
+                .get(),
+            16
+        );
         assert_eq!(loaded.eos_token_ids, vec![2]);
+
+        let mut zero_window = metadata.clone();
+        zero_window.insert(
+            "mistral.attention.sliding_window".into(),
+            GgufMetadataValue::Uint32(0),
+        );
+        let zero_args = super::model_args_from_gguf_catalog(&arrays, &zero_window).unwrap();
+        assert_eq!(zero_args.attention_schedule.full_layer_count(), 1);
+
+        let mut negative_window = metadata.clone();
+        negative_window.insert(
+            "mistral.attention.sliding_window".into(),
+            GgufMetadataValue::Int32(-1),
+        );
+        assert!(
+            super::model_args_from_gguf_catalog(&arrays, &negative_window)
+                .unwrap_err()
+                .to_string()
+                .contains("sliding-window")
+        );
+
+        let mut wrong_window = metadata.clone();
+        wrong_window.insert(
+            "mistral.attention.sliding_window".into(),
+            GgufMetadataValue::String("16".into()),
+        );
+        assert!(super::model_args_from_gguf_catalog(&arrays, &wrong_window)
+            .unwrap_err()
+            .to_string()
+            .contains("wrong type"));
 
         // A model-loader smoke fixture mixing ordinary dense tensors, one
         // affine K-quant, and one nonlinear IQ tensor. Q2_K uses MLX's packed
@@ -1816,7 +2274,7 @@ mod tests {
             attention_bias: false,
             mlp_bias: false,
             rope_scaling: None,
-            sliding_window: None,
+            attention_schedule: crate::runtime::attention::LayerSchedule::all_full(1).unwrap(),
             quantization: Some(AffineQuantization::new(32, 4).unwrap().into()),
             quantization_config: None,
             quantized_weights: Some(selected),
@@ -1951,7 +2409,7 @@ mod tests {
         let prompt_tokens = Array::from(encoding.get_ids())
             .try_index_device(NewAxis, stream)
             .unwrap();
-        let mut cache = Vec::new();
+        let mut cache = model.new_cache();
 
         let eos_token_id = 128001u32;
         let eot_token_id = 128009u32;

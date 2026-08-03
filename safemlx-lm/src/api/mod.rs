@@ -57,7 +57,7 @@ use crate::{
         CacheResidencyPolicy, CacheResidencyReport, PagedCacheOptions, PromptCacheDescriptor,
         PromptCacheManifest, PromptCacheModelIdentity, PromptCacheOptions,
     },
-    runtime::cache::{ConcatKeyValueCache, PagedKeyValueCache, SlidingKeyValueCache},
+    runtime::cache::{ConcatKeyValueCache, PagedKeyValueCache},
     runtime::execution::layerwise::{LayerExecutionLoadOptions, WeightResidency},
     runtime::generation::speculative::{
         LoadedDrafter, MtpBatchOutput, MtpCache, MtpCapability, MtpCheckpointKind, MtpConfig,

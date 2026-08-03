@@ -680,13 +680,34 @@ fn llama_spec(args: &super::llama::ModelArgs, multimodal: bool) -> Result<Spec, 
     let context = context_from_rope(args.max_position_embeddings, args.rope_scaling.as_ref())?;
     let layers = positive(args.num_hidden_layers, "num_hidden_layers")?;
     let scalars = kv_scalars(args.num_key_value_heads, args.head_dim)?;
-    let window = args
-        .sliding_window
-        .map(|value| positive(value, "sliding_window"))
-        .transpose()?;
-    let base = match window {
-        Some(window) => CacheStateStrategy::SlidingKv { window },
-        None => CacheStateStrategy::FullKv,
+    if args.attention_schedule.len() != layers as usize {
+        return Err(CapabilityError::InvalidConfiguration {
+            field: "attention_schedule",
+            detail: format!(
+                "has {} layers, expected {layers}",
+                args.attention_schedule.len()
+            ),
+        });
+    }
+    let full = args.attention_schedule.full_layer_count() as u64;
+    let sliding = args
+        .attention_schedule
+        .sliding_windows()
+        .into_iter()
+        .map(|(window, layers)| SlidingWindowLayerCount {
+            layers: layers as u64,
+            window: u64::from(window.get()),
+        })
+        .collect::<Vec<_>>();
+    let base = match (full, sliding.as_slice()) {
+        (_, []) => CacheStateStrategy::FullKv,
+        (0, [only]) => CacheStateStrategy::SlidingKv {
+            window: only.window,
+        },
+        _ => CacheStateStrategy::MixedKv {
+            full_layers: full,
+            sliding: sliding.clone(),
+        },
     };
     let strategy = if multimodal {
         CacheStateStrategy::Multimodal {
@@ -713,11 +734,18 @@ fn llama_spec(args: &super::llama::ModelArgs, multimodal: bool) -> Result<Spec, 
         },
         ArchitectureEstimate {
             fixed_scalars_per_batch: 0,
-            growing: vec![GrowingState {
-                layers,
+            growing: std::iter::once(GrowingState {
+                layers: full,
                 scalars_per_position: scalars,
-                window,
-            }],
+                window: None,
+            })
+            .filter(|state| state.layers > 0)
+            .chain(sliding.into_iter().map(|group| GrowingState {
+                layers: group.layers,
+                scalars_per_position: scalars,
+                window: Some(group.window),
+            }))
+            .collect(),
             hidden_size: positive(args.hidden_size, "hidden_size")?,
             allocation_granularity: 1,
             completeness,
@@ -747,7 +775,7 @@ fn dense_qwen_spec(
             attention_bias: args.qkv_bias(),
             mlp_bias: false,
             rope_scaling: args.rope_scaling.clone(),
-            sliding_window: None,
+            attention_schedule: args.attention_schedule.clone(),
             quantization: None,
             quantization_config: None,
             quantized_weights: None,
@@ -3307,7 +3335,14 @@ mod tests {
             attention_bias: false,
             mlp_bias: false,
             rope_scaling: None,
-            sliding_window,
+            attention_schedule: match sliding_window {
+                Some(window) => crate::runtime::attention::LayerSchedule::all_sliding(
+                    2,
+                    u32::try_from(window).unwrap(),
+                )
+                .unwrap(),
+                None => crate::runtime::attention::LayerSchedule::all_full(2).unwrap(),
+            },
             quantization: None,
             quantization_config: None,
             quantized_weights: None,
@@ -3397,6 +3432,33 @@ mod tests {
         let gqa =
             estimate_architecture_state(&gqa_layout, InputTokenCount::text(10), 0, 1).unwrap();
         assert_eq!(gqa.requested_state_bytes, llama.requested_state_bytes / 4);
+    }
+
+    #[test]
+    fn llama_runtime_state_groups_exact_per_layer_windows() {
+        use crate::runtime::attention::{AttentionPolicy, LayerSchedule};
+
+        let mut args = tiny_llama(2, None);
+        args.attention_schedule = LayerSchedule::new(
+            2,
+            vec![AttentionPolicy::Full, AttentionPolicy::sliding(3).unwrap()],
+        )
+        .unwrap();
+        let (_, _, strategy, _, layout) = llama_spec(&args, false).unwrap();
+        assert_eq!(
+            strategy,
+            CacheStateStrategy::MixedKv {
+                full_layers: 1,
+                sliding: vec![SlidingWindowLayerCount {
+                    layers: 1,
+                    window: 3,
+                }],
+            }
+        );
+        let estimate =
+            estimate_architecture_state(&layout, InputTokenCount::text(10), 0, 2).unwrap();
+        assert_eq!(estimate.context_state_bytes, (10 + 3) * 2 * 8 * 2 * 2 * 4);
+        assert_eq!(estimate.assumptions.sliding_window_bounds, vec![3]);
     }
 
     #[test]

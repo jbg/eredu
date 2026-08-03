@@ -39,7 +39,6 @@ use crate::{
     },
     runtime::cache::{
         CompressedLatentCache, ConcatKeyValueCache, KeyValueCache, PagedKeyValueCache,
-        SlidingKeyValueCache,
     },
     runtime::checkpoint::binding::{
         binding_bytes, build_module_bindings, populate_module_from_lease,
@@ -165,13 +164,6 @@ pub enum PipelineLlamaLayerCache {
         /// Layer-local cache state.
         cache: ConcatKeyValueCache,
     },
-    /// Bounded sliding-window KV cache.
-    Sliding {
-        /// Global decoder-layer index.
-        global_layer: usize,
-        /// Layer-local cache state.
-        cache: SlidingKeyValueCache,
-    },
     /// Block-addressable full or sliding state.
     Paged {
         /// Global decoder-layer index.
@@ -207,7 +199,6 @@ impl PipelineCache {
                 .iter()
                 .map(|layer| match layer {
                     PipelineLlamaLayerCache::Standard { global_layer, .. }
-                    | PipelineLlamaLayerCache::Sliding { global_layer, .. }
                     | PipelineLlamaLayerCache::Paged { global_layer, .. } => *global_layer,
                 })
                 .collect(),
@@ -222,7 +213,6 @@ impl PipelineCache {
                 for layer in layers {
                     match layer {
                         PipelineLlamaLayerCache::Standard { cache, .. } => cache.clear(),
-                        PipelineLlamaLayerCache::Sliding { cache, .. } => cache.clear(),
                         PipelineLlamaLayerCache::Paged { cache, .. } => cache.clear()?,
                     }
                 }
@@ -340,15 +330,23 @@ impl PipelineModel {
                 stage
                     .range
                     .clone()
-                    .map(|global_layer| match stage.args.sliding_window {
-                        Some(window) => PipelineLlamaLayerCache::Sliding {
+                    .map(|global_layer| {
+                        let policy = stage
+                            .args
+                            .attention_schedule
+                            .get(global_layer)
+                            .expect("validated Llama pipeline layer range");
+                        let cache = match policy.window() {
+                            Some(window) => ConcatKeyValueCache::new_for_sliding_attention(
+                                i32::try_from(window.get())
+                                    .expect("validated Llama attention window fits i32"),
+                            ),
+                            None => ConcatKeyValueCache::new(),
+                        };
+                        PipelineLlamaLayerCache::Standard {
                             global_layer,
-                            cache: SlidingKeyValueCache::new(window),
-                        },
-                        None => PipelineLlamaLayerCache::Standard {
-                            global_layer,
-                            cache: ConcatKeyValueCache::new(),
-                        },
+                            cache,
+                        }
                     })
                     .collect(),
             ),
@@ -391,7 +389,16 @@ impl PipelineModel {
                                 PagedKeyValueCache::new_with_layout(
                                     manager.clone(),
                                     global_layer,
-                                    stage.args.sliding_window,
+                                    stage
+                                        .args
+                                        .attention_schedule
+                                        .get(global_layer)
+                                        .expect("validated Llama pipeline layer range")
+                                        .window()
+                                        .map(|window| {
+                                            i32::try_from(window.get())
+                                                .expect("validated Llama attention window fits i32")
+                                        }),
                                     0,
                                     rank,
                                 )
@@ -436,8 +443,7 @@ impl PipelineModel {
         let manager = match cache {
             PipelineCache::Llama(layers) => layers.iter().find_map(|layer| match layer {
                 PipelineLlamaLayerCache::Paged { cache, .. } => Some(cache.manager()),
-                PipelineLlamaLayerCache::Standard { .. }
-                | PipelineLlamaLayerCache::Sliding { .. } => None,
+                PipelineLlamaLayerCache::Standard { .. } => None,
             }),
             PipelineCache::DeepSeek(layers) => layers
                 .iter()
@@ -537,7 +543,16 @@ impl PipelineModel {
                         PagedKeyValueCache::new_with_layout(
                             manager.clone(),
                             global_layer,
-                            stage.args.sliding_window,
+                            stage
+                                .args
+                                .attention_schedule
+                                .get(global_layer)
+                                .expect("validated Llama pipeline layer range")
+                                .window()
+                                .map(|window| {
+                                    i32::try_from(window.get())
+                                        .expect("validated Llama attention window fits i32")
+                                }),
                             0,
                             rank,
                         )
@@ -593,7 +608,8 @@ impl PipelineModel {
                 usize::try_from(stage.args.num_hidden_layers)
                     .map_err(|_| Error::Parallel("invalid Llama layer count".into()))?,
                 stage.range.clone(),
-                stage.args.sliding_window,
+                crate::architectures::llama::model::uniform_attention_window(&stage.args)
+                    .ok_or_else(|| Error::Parallel("persisted prompt caches for non-uniform Llama/Mistral attention schedules are unsupported because prompt-cache schema v2 stores only one model-wide sliding window".into()))?,
             ),
             ArchitectureStage::DeepSeek(stage) => (
                 "deepseek_v3".to_string(),
@@ -1578,6 +1594,32 @@ impl LlamaStage {
                 self.layers.len()
             )));
         }
+        for (global_layer, cache) in self.range.clone().zip(caches.iter()) {
+            let expected = self
+                .args
+                .attention_schedule
+                .get(global_layer)
+                .expect("validated Llama pipeline layer range")
+                .window()
+                .map(|window| {
+                    i32::try_from(window.get()).expect("validated Llama attention window fits i32")
+                });
+            let (cached_layer, actual) = match cache {
+                PipelineLlamaLayerCache::Standard {
+                    global_layer,
+                    cache,
+                } => (*global_layer, cache.max_size()),
+                PipelineLlamaLayerCache::Paged {
+                    global_layer,
+                    cache,
+                } => (*global_layer, cache.max_size()),
+            };
+            if cached_layer != global_layer || actual != expected {
+                return Err(Error::Parallel(format!(
+                    "Llama pipeline cache policy mismatch at global layer {global_layer}: cached layer {cached_layer}, expected window {expected:?}, got {actual:?}"
+                )));
+            }
+        }
         let mut hidden = match input {
             PipelineStageInput::Tokens(tokens) => self
                 .embedding
@@ -1588,28 +1630,11 @@ impl LlamaStage {
         };
         let offset = caches.first().map_or(0, |cache| match cache {
             PipelineLlamaLayerCache::Standard { cache, .. } => cache.offset(),
-            PipelineLlamaLayerCache::Sliding { cache, .. } => cache.offset(),
             PipelineLlamaLayerCache::Paged { cache, .. } => cache.offset(),
         });
-        let generated_sliding_window = (explicit_mask.is_none() && step.sequence_length > 1)
-            .then_some(self.args.sliding_window)
-            .flatten();
-        let generated_mask = if explicit_mask.is_some() || generated_sliding_window.is_some() {
+        let allow_sliding_prefill = explicit_mask.is_none();
+        let generated_mask = if explicit_mask.is_some() {
             None
-        } else if let Some(window) = self.args.sliding_window {
-            let retained = offset.min(window);
-            let keys = retained + step.sequence_length;
-            ((step.sequence_length > 1 || keys > window) && keys > 1)
-                .then(|| {
-                    create_causal_mask(
-                        step.sequence_length,
-                        Some(retained),
-                        Some(window - 1),
-                        None,
-                        stream,
-                    )
-                })
-                .transpose()?
         } else {
             (step.sequence_length > 1)
                 .then(|| create_causal_mask(step.sequence_length, Some(offset), None, None, stream))
@@ -1650,22 +1675,7 @@ impl LlamaStage {
                                 x: &hidden,
                                 mask,
                                 cache: Some(cache),
-                                generated_sliding_window,
-                            },
-                            stream,
-                        )?;
-                        eval(std::iter::once(&hidden).chain(cache.retained_arrays()))?;
-                    }
-                    PipelineLlamaLayerCache::Sliding {
-                        global_layer: cached_layer,
-                        cache,
-                    } if *cached_layer == global_layer => {
-                        hidden = layer.forward(
-                            llama::AttentionInput {
-                                x: &hidden,
-                                mask,
-                                cache: Some(cache),
-                                generated_sliding_window,
+                                allow_sliding_prefill,
                             },
                             stream,
                         )?;
@@ -1680,7 +1690,7 @@ impl LlamaStage {
                                 x: &hidden,
                                 mask,
                                 cache: Some(cache),
-                                generated_sliding_window,
+                                allow_sliding_prefill,
                             },
                             stream,
                         )?;
@@ -1712,21 +1722,7 @@ impl LlamaStage {
                                 x: &hidden,
                                 mask,
                                 cache: Some(cache),
-                                generated_sliding_window,
-                            },
-                            stream,
-                        )?;
-                    }
-                    PipelineLlamaLayerCache::Sliding {
-                        global_layer: cached_layer,
-                        cache,
-                    } if *cached_layer == global_layer => {
-                        hidden = layer.forward(
-                            llama::AttentionInput {
-                                x: &hidden,
-                                mask,
-                                cache: Some(cache),
-                                generated_sliding_window,
+                                allow_sliding_prefill,
                             },
                             stream,
                         )?;
@@ -1740,7 +1736,7 @@ impl LlamaStage {
                                 x: &hidden,
                                 mask,
                                 cache: Some(cache),
-                                generated_sliding_window,
+                                allow_sliding_prefill,
                             },
                             stream,
                         )?;
@@ -2477,7 +2473,7 @@ mod tests {
             attention_bias: false,
             mlp_bias: false,
             rope_scaling: None,
-            sliding_window: None,
+            attention_schedule: crate::runtime::attention::LayerSchedule::all_full(4).unwrap(),
             quantization: None,
             quantization_config: None,
             quantized_weights: None,
@@ -2696,7 +2692,7 @@ mod tests {
             assert!(!report.residency().offload().process_sampled());
         }
 
-        let mut reference_cache: Vec<Option<ConcatKeyValueCache>> = Vec::new();
+        let mut reference_cache = reference.new_cache();
         let mut first_cache = first.new_cache();
         let mut last_cache = last.new_cache();
         for tokens in [
@@ -2877,7 +2873,7 @@ mod tests {
             let mut reference = llama::ResidentModel::new(llama_args(tied), stream).unwrap();
             initialize_parameters(&mut reference, stream);
             let (mut first, mut last) = llama_pipeline_stages(&reference, stream);
-            let mut reference_cache: Vec<Option<ConcatKeyValueCache>> = Vec::new();
+            let mut reference_cache = reference.new_cache();
             let mut first_cache = first.new_cache();
             let mut last_cache = last.new_cache();
             let prompt = Array::from_slice(&[1u32, 2], &[1, 2]);

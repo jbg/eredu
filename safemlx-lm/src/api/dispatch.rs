@@ -636,16 +636,6 @@ impl Model {
                 stream,
                 observer,
             ),
-            (Self::Llama(model), ModelCache::SlidingKeyValue(cache)) => model
-                .forward_with_observer(
-                    llama::ModelInput {
-                        inputs: input_tokens,
-                        mask,
-                        cache,
-                    },
-                    stream,
-                    observer,
-                ),
             (Self::Llama(_), ModelCache::PagedKeyValue(_)) => Err(Exception::custom(
                 "detailed attention inspection is unavailable for paged key/value caches",
             )),
@@ -797,19 +787,6 @@ impl Model {
                 )?;
                 final_token_logits(&logits, stream)
             }
-            (Self::Llama(model), ModelCache::SlidingKeyValue(cache)) => {
-                let prompt_tokens = input::text_token_ids(input, stream)?;
-                let logits = model.forward_with_observer(
-                    llama::ModelInput {
-                        inputs: &prompt_tokens,
-                        mask: None,
-                        cache,
-                    },
-                    stream,
-                    observer,
-                )?;
-                final_token_logits(&logits, stream)
-            }
             (Self::Llama(_), ModelCache::PagedKeyValue(_)) => Err(Exception::custom(
                 "detailed attention inspection is unavailable for paged key/value caches",
             )),
@@ -881,10 +858,7 @@ impl Model {
             Self::InklingLayerwise(model) => ModelCache::Inkling(model.new_cache()),
             Self::KimiLinear(model) => ModelCache::KimiLinear(model.new_cache()),
             Self::KimiLinearLayerwise(model) => ModelCache::KimiLinear(model.new_cache()),
-            Self::Llama(model) => match model.sliding_window() {
-                Some(_) => ModelCache::SlidingKeyValue(model.new_sliding_cache()),
-                None => ModelCache::KeyValue(Vec::new()),
-            },
+            Self::Llama(model) => ModelCache::KeyValue(model.new_cache()),
             Self::LlamaLayerwise(model) => ModelCache::LlamaLayerwise(model.new_cache()),
             Self::Lfm2(model) => ModelCache::Lfm2(model.new_cache()),
             Self::Lfm2Layerwise(model) => ModelCache::Lfm2(model.new_cache()),
@@ -920,12 +894,17 @@ impl Model {
                 Self::Llama(model) => {
                     let manager = CacheResidencyManager::new(options)
                         .map_err(|error| Exception::custom(error.to_string()))?;
-                    let layer_count = usize::try_from(model.args.num_hidden_layers)
-                        .map_err(|_| Exception::custom("invalid Llama cache layer count"))?;
-                    let caches = (0..layer_count)
-                        .map(|layer| {
-                            PagedKeyValueCache::new(manager.clone(), layer, model.sliding_window())
-                                .map(Some)
+                    let caches = model
+                        .args
+                        .attention_schedule
+                        .iter()
+                        .enumerate()
+                        .map(|(layer, policy)| {
+                            let window = policy.window().map(|window| {
+                                i32::try_from(window.get())
+                                    .expect("validated Llama attention window fits i32")
+                            });
+                            PagedKeyValueCache::new(manager.clone(), layer, window).map(Some)
                         })
                         .collect::<Result<Vec<_>, _>>()?;
                     Ok(ModelCache::PagedKeyValue(caches))
@@ -993,6 +972,12 @@ impl Model {
     ) -> Result<(ModelCache, PromptCacheManifest), Exception> {
         match self {
             Self::Llama(model) => {
+                let Some(sliding_window) = llama::uniform_attention_window(&model.args)
+                else {
+                    return Err(Exception::custom(
+                        "persisted prompt caches for non-uniform Llama/Mistral attention schedules are unsupported because prompt-cache schema v2 stores only one model-wide sliding window; the ordered schedule remains part of the architecture fingerprint",
+                    ));
+                };
                 let layer_count = usize::try_from(model.args.num_hidden_layers)
                     .map_err(|_| Exception::custom("invalid Llama cache layer count"))?;
                 let identity = PromptCacheModelIdentity {
@@ -1003,7 +988,7 @@ impl Model {
                         layer_count,
                         global_layer_start: 0,
                         global_layer_end: layer_count,
-                        sliding_window: model.sliding_window(),
+                        sliding_window,
                         sink_tokens: 0,
                         topology: Default::default(),
                         layer_layouts: PromptCacheModelIdentity::key_value_layouts(
@@ -1022,14 +1007,17 @@ impl Model {
                     options,
                 )
                 .map_err(|error| Exception::custom(error.to_string()))?;
-                let caches = (0..layer_count)
-                    .map(|layer| {
-                        PagedKeyValueCache::new(
-                            manager.clone(),
-                            layer,
-                            model.sliding_window(),
-                        )
-                        .map(Some)
+                let caches = model
+                    .args
+                    .attention_schedule
+                    .iter()
+                    .enumerate()
+                    .map(|(layer, policy)| {
+                        let window = policy.window().map(|window| {
+                            i32::try_from(window.get())
+                                .expect("validated Llama attention window fits i32")
+                        });
+                        PagedKeyValueCache::new(manager.clone(), layer, window).map(Some)
                     })
                     .collect::<Result<Vec<_>, _>>()?;
                 Ok((ModelCache::PagedKeyValue(caches), manifest))
@@ -1135,9 +1123,6 @@ impl Model {
                 model.prefill_input_logits(input, cache, stream)
             }
             (Self::Llama(model), ModelCache::KeyValue(cache)) => {
-                model.prefill_input_logits(input, cache, stream)
-            }
-            (Self::Llama(model), ModelCache::SlidingKeyValue(cache)) => {
                 model.prefill_input_logits(input, cache, stream)
             }
             (Self::Llama(model), ModelCache::PagedKeyValue(cache)) => {
@@ -1282,11 +1267,6 @@ impl Model {
             (Self::Llama(model), ModelCache::KeyValue(cache)) => ModelGenerate::Llama(
                 llama::Generate::with_sampler(model, cache, temp, input, prng_key, stream, sampler),
             ),
-            (Self::Llama(model), ModelCache::SlidingKeyValue(cache)) => {
-                ModelGenerate::LlamaSliding(llama::Generate::with_sampler(
-                    model, cache, temp, input, prng_key, stream, sampler,
-                ))
-            }
             (Self::Llama(model), ModelCache::PagedKeyValue(cache)) => ModelGenerate::LlamaPaged(
                 llama::Generate::with_sampler(model, cache, temp, input, prng_key, stream, sampler),
             ),
@@ -1410,7 +1390,7 @@ pub enum ModelCache {
     GptOss(gpt_oss::Cache),
     /// Alternating global/local attention and short-convolution Inkling cache.
     Inkling(inkling::Cache),
-    /// Homogeneous per-layer key/value cache.
+    /// Per-layer key/value caches whose bounds follow the model schedule.
     KeyValue(Vec<Option<ConcatKeyValueCache>>),
     /// Unified Llama cache used by bounded layer execution.
     LlamaLayerwise(crate::architectures::llama::layerwise::LlamaCache),
@@ -1418,8 +1398,6 @@ pub enum ModelCache {
     Qwen3Vl(qwen3_vl::Cache),
     /// Qwen3-VL-MoE key/value cache and multimodal position state.
     Qwen3VlMoe(qwen3_vl_moe::Cache),
-    /// Homogeneous bounded cache for sliding-window attention.
-    SlidingKeyValue(Vec<Option<SlidingKeyValueCache>>),
     /// Homogeneous block-addressable key/value cache under one global budget.
     PagedKeyValue(Vec<Option<PagedKeyValueCache>>),
     /// Heterogeneous Nemotron-H cache.
@@ -1628,8 +1606,6 @@ where
     KimiLinearLayerwise(crate::architectures::kimi_linear::layerwise::Generate<'a, S>),
     /// Llama generation iterator.
     Llama(llama::Generate<'a, ConcatKeyValueCache, S>),
-    /// Llama-compatible generation with bounded sliding-window caches.
-    LlamaSliding(llama::Generate<'a, SlidingKeyValueCache, S>),
     /// Llama-compatible generation with block-addressable cache residency.
     LlamaPaged(llama::Generate<'a, PagedKeyValueCache, S>),
     /// Llama-compatible generation using bounded layer execution.
@@ -1698,7 +1674,6 @@ where
             Self::KimiLinear(generate) => generate.sampler_mut(),
             Self::KimiLinearLayerwise(generate) => generate.sampler_mut(),
             Self::Llama(generate) => generate.sampler_mut(),
-            Self::LlamaSliding(generate) => generate.sampler_mut(),
             Self::LlamaPaged(generate) => generate.sampler_mut(),
             Self::LlamaLayerwise(generate) => generate.sampler_mut(),
             Self::Lfm2(generate) => generate.sampler_mut(),
@@ -1739,7 +1714,6 @@ where
             Self::KimiLinear(generate) => generate.next(),
             Self::KimiLinearLayerwise(generate) => generate.next(),
             Self::Llama(generate) => generate.next(),
-            Self::LlamaSliding(generate) => generate.next(),
             Self::LlamaPaged(generate) => generate.next(),
             Self::LlamaLayerwise(generate) => generate.next(),
             Self::Lfm2(generate) => generate.next(),

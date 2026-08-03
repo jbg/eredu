@@ -2488,13 +2488,15 @@ mod tests {
     use std::fs;
 
     use safemlx::{
-        module::ModuleParameters, ops::ones_dtype, Device, DeviceType, ExecutionContext,
+        module::{Module, ModuleParameters},
+        ops::ones_dtype,
+        Device, DeviceType, ExecutionContext,
     };
 
     use super::*;
     use crate::{
         architectures::llama::layerwise::{
-            load_llama_model, LlamaCache, LlamaLoadOptions, LlamaModel,
+            load_llama_model, LlamaCache, LlamaLayerwiseAdapter, LlamaLoadOptions, LlamaModel,
         },
         architectures::llama::model::{self as llama, ModelArgs},
         runtime::cache::ConcatKeyValueCache,
@@ -2534,7 +2536,14 @@ mod tests {
             attention_bias: true,
             mlp_bias: true,
             rope_scaling: None,
-            sliding_window,
+            attention_schedule: match sliding_window {
+                Some(window) => crate::runtime::attention::LayerSchedule::all_sliding(
+                    3,
+                    u32::try_from(window).unwrap(),
+                )
+                .unwrap(),
+                None => crate::runtime::attention::LayerSchedule::all_full(3).unwrap(),
+            },
             quantization: None,
             quantization_config: None,
             quantized_weights: None,
@@ -2600,8 +2609,13 @@ mod tests {
             "attention_bias": model.args.attention_bias,
             "mlp_bias": model.args.mlp_bias
         });
-        if let Some(window) = model.args.sliding_window {
-            config["sliding_window"] = window.into();
+        if let Some(window) = model
+            .args
+            .attention_schedule
+            .get(0)
+            .and_then(|policy| policy.window())
+        {
+            config["sliding_window"] = window.get().into();
         }
         fs::write(
             dir.join("config.json"),
@@ -2712,6 +2726,68 @@ mod tests {
         run_parity("llama", true, None, 1);
         run_parity("llama", false, None, 2);
         run_parity("mistral", false, Some(4), 2);
+    }
+
+    #[test]
+    fn arbitrary_llama_schedule_resident_layerwise_parity() {
+        use crate::runtime::attention::{AttentionPolicy, LayerSchedule};
+
+        let gpu = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
+        let cpu = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        let stream = gpu.stream();
+        let mut model_args = args("mistral", false, None);
+        model_args.attention_schedule = LayerSchedule::new(
+            3,
+            vec![
+                AttentionPolicy::sliding(3).unwrap(),
+                AttentionPolicy::Full,
+                AttentionPolicy::sliding(5).unwrap(),
+            ],
+        )
+        .unwrap();
+        let mut resident = llama::ResidentModel::new(model_args.clone(), stream).unwrap();
+        initialize(&mut resident, stream);
+        let mut resident_cache = resident.new_cache();
+        let mut layerwise_cache = resident.new_cache();
+        let dir = tempfile::tempdir().unwrap();
+        write_fixture(dir.path(), &resident);
+        let adapter = LlamaLayerwiseAdapter::new(model_args, stream).unwrap();
+        let mut layerwise = load_layerwise_model(
+            dir.path(),
+            adapter,
+            LayerwiseLoadOptions::new(OffloadConfig::new(None, None, 2).unwrap()),
+            stream,
+            cpu.stream(),
+        )
+        .unwrap();
+
+        for tokens in [
+            Array::from_slice(&[1u32, 2, 3], &[1, 3]),
+            Array::from_slice(&[4u32, 5], &[1, 2]),
+            Array::from_slice(&[6u32], &[1, 1]),
+        ] {
+            let expected = resident
+                .forward(
+                    llama::ModelInput {
+                        inputs: &tokens,
+                        mask: None,
+                        cache: &mut resident_cache,
+                    },
+                    stream,
+                )
+                .unwrap();
+            let actual = layerwise
+                .forward_with_cache(
+                    LayerwiseInput {
+                        inputs: &tokens,
+                        mask: None,
+                        cache: &mut layerwise_cache,
+                    },
+                    stream,
+                )
+                .unwrap();
+            assert_close(&actual, &expected);
+        }
     }
 
     #[test]
@@ -3019,7 +3095,7 @@ mod tests {
             cpu.stream(),
         )
         .unwrap();
-        let mut bad_cache = LlamaCache::Standard(vec![None]);
+        let mut bad_cache = LlamaCache::Device(vec![None]);
         let error = model
             .forward(
                 &Array::from_slice(&[1u32], &[1, 1]),

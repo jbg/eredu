@@ -47,7 +47,6 @@ use crate::{
     },
     runtime::cache::{
         CompressedLatentCache, ConcatKeyValueCache, KeyValueCache, PagedKeyValueCache,
-        SlidingKeyValueCache,
     },
     runtime::checkpoint::load::StrictLoadConfig,
     runtime::checkpoint::quantization::{should_quantize_on_load, WeightQuantization},
@@ -92,8 +91,6 @@ pub struct TensorParallelInfo {
 pub enum TensorParallelLlamaLayerCache {
     /// Unbounded concatenating cache.
     Standard(ConcatKeyValueCache),
-    /// Bounded sliding-window cache.
-    Sliding(SlidingKeyValueCache),
     /// Block-addressable local-head state.
     Paged(PagedKeyValueCache),
 }
@@ -115,7 +112,6 @@ impl TensorParallelCache {
                 for cache in caches {
                     match cache {
                         TensorParallelLlamaLayerCache::Standard(cache) => cache.clear(),
-                        TensorParallelLlamaLayerCache::Sliding(cache) => cache.clear(),
                         TensorParallelLlamaLayerCache::Paged(cache) => cache.clear()?,
                     }
                 }
@@ -134,7 +130,6 @@ impl TensorParallelCache {
         match self {
             Self::Llama(caches) => caches.first().map_or(0, |cache| match cache {
                 TensorParallelLlamaLayerCache::Standard(cache) => cache.offset(),
-                TensorParallelLlamaLayerCache::Sliding(cache) => cache.offset(),
                 TensorParallelLlamaLayerCache::Paged(cache) => cache.offset(),
             }),
             Self::DeepSeek(caches) => caches.first().map_or(0, CompressedLatentCache::offset),
@@ -190,11 +185,20 @@ impl TensorParallelModel {
         match &self.architecture {
             TensorArchitecture::Llama(model) => TensorParallelCache::Llama(
                 (0..model.layers.len())
-                    .map(|_| match model.global_args.sliding_window {
-                        Some(window) => TensorParallelLlamaLayerCache::Sliding(
-                            SlidingKeyValueCache::new(window),
-                        ),
-                        None => TensorParallelLlamaLayerCache::Standard(ConcatKeyValueCache::new()),
+                    .enumerate()
+                    .map(|(layer, _)| {
+                        let policy = model
+                            .global_args
+                            .attention_schedule
+                            .get(layer)
+                            .expect("validated Llama tensor-parallel layer range");
+                        TensorParallelLlamaLayerCache::Standard(match policy.window() {
+                            Some(window) => ConcatKeyValueCache::new_for_sliding_attention(
+                                i32::try_from(window.get())
+                                    .expect("validated Llama attention window fits i32"),
+                            ),
+                            None => ConcatKeyValueCache::new(),
+                        })
                     })
                     .collect(),
             ),
@@ -230,7 +234,16 @@ impl TensorParallelModel {
                                 PagedKeyValueCache::new_with_layout(
                                     manager.clone(),
                                     layer,
-                                    model.global_args.sliding_window,
+                                    model
+                                        .global_args
+                                        .attention_schedule
+                                        .get(layer)
+                                        .expect("validated Llama tensor-parallel layer range")
+                                        .window()
+                                        .map(|window| {
+                                            i32::try_from(window.get())
+                                                .expect("validated Llama attention window fits i32")
+                                        }),
                                     0,
                                     rank,
                                 )
@@ -258,8 +271,7 @@ impl TensorParallelModel {
         let manager = match cache {
             TensorParallelCache::Llama(caches) => caches.iter().find_map(|cache| match cache {
                 TensorParallelLlamaLayerCache::Paged(cache) => Some(cache.manager()),
-                TensorParallelLlamaLayerCache::Standard(_)
-                | TensorParallelLlamaLayerCache::Sliding(_) => None,
+                TensorParallelLlamaLayerCache::Standard(_) => None,
             }),
             TensorParallelCache::DeepSeek(caches) => caches
                 .iter()
@@ -357,7 +369,16 @@ impl TensorParallelModel {
                         PagedKeyValueCache::new_with_layout(
                             manager.clone(),
                             layer,
-                            model.global_args.sliding_window,
+                            model
+                                .global_args
+                                .attention_schedule
+                                .get(layer)
+                                .expect("validated Llama tensor-parallel layer range")
+                                .window()
+                                .map(|window| {
+                                    i32::try_from(window.get())
+                                        .expect("validated Llama attention window fits i32")
+                                }),
                             0,
                             rank,
                         )
@@ -399,7 +420,10 @@ impl TensorParallelModel {
                 ),
                 usize::try_from(model.global_args.num_hidden_layers)
                     .map_err(|_| Error::Parallel("invalid Llama layer count".into()))?,
-                model.global_args.sliding_window,
+                crate::architectures::llama::model::uniform_attention_window(
+                    &model.global_args,
+                )
+                .ok_or_else(|| Error::Parallel("persisted prompt caches for non-uniform Llama/Mistral attention schedules are unsupported because prompt-cache schema v2 stores only one model-wide sliding window".into()))?,
             ),
             TensorArchitecture::DeepSeek(model) => (
                 "deepseek_v3".to_string(),
@@ -1465,7 +1489,7 @@ fn llama_attention<C: KeyValueCache>(
     x: &Array,
     mask: Option<&Array>,
     cache: Option<&mut C>,
-    generated_sliding_window: Option<i32>,
+    allow_sliding_prefill: bool,
     group: &Group,
     stream: &Stream,
 ) -> Result<Array, Error> {
@@ -1488,7 +1512,10 @@ fn llama_attention<C: KeyValueCache>(
         &mut cache,
         stream,
     )?;
-    let attended = if let Some(window) = generated_sliding_window.filter(|_| sequence > 1) {
+    let attended = if let Some(window) = attention
+        .sliding_window
+        .filter(|_| allow_sliding_prefill && sequence > 1)
+    {
         sliding_window_prefill_attention(
             queries,
             keys,
@@ -1548,6 +1575,26 @@ fn forward_llama(
             model.layers.len()
         )));
     }
+    for (layer, cache) in caches.iter().enumerate() {
+        let expected = model
+            .global_args
+            .attention_schedule
+            .get(layer)
+            .expect("validated Llama tensor-parallel layer range")
+            .window()
+            .map(|window| {
+                i32::try_from(window.get()).expect("validated Llama attention window fits i32")
+            });
+        let actual = match cache {
+            TensorParallelLlamaLayerCache::Standard(cache) => cache.max_size(),
+            TensorParallelLlamaLayerCache::Paged(cache) => cache.max_size(),
+        };
+        if actual != expected {
+            return Err(Error::Parallel(format!(
+                "Llama tensor-parallel cache policy mismatch at layer {layer}: expected window {expected:?}, got {actual:?}"
+            )));
+        }
+    }
     let mut hidden = vocabulary_embedding(
         &mut model.embedding,
         tokens,
@@ -1558,20 +1605,11 @@ fn forward_llama(
     let sequence = tokens.dim(1);
     let offset = caches.first().map_or(0, |cache| match cache {
         TensorParallelLlamaLayerCache::Standard(cache) => cache.offset(),
-        TensorParallelLlamaLayerCache::Sliding(cache) => cache.offset(),
         TensorParallelLlamaLayerCache::Paged(cache) => cache.offset(),
     });
-    let generated_sliding_window = (explicit_mask.is_none() && sequence > 1)
-        .then_some(model.global_args.sliding_window)
-        .flatten();
-    let generated_mask = if explicit_mask.is_some() || generated_sliding_window.is_some() {
+    let allow_sliding_prefill = explicit_mask.is_none();
+    let generated_mask = if explicit_mask.is_some() {
         None
-    } else if let Some(window) = model.global_args.sliding_window {
-        let retained = offset.min(window);
-        let keys = retained + sequence;
-        ((sequence > 1 || keys > window) && keys > 1)
-            .then(|| create_causal_mask(sequence, Some(retained), Some(window - 1), None, stream))
-            .transpose()?
     } else {
         (sequence > 1)
             .then(|| create_causal_mask(sequence, Some(offset), None, None, stream))
@@ -1586,16 +1624,7 @@ fn forward_llama(
                 &normalized,
                 mask,
                 Some(cache),
-                generated_sliding_window,
-                group,
-                stream,
-            )?,
-            TensorParallelLlamaLayerCache::Sliding(cache) => llama_attention(
-                &mut layer.self_attn,
-                &normalized,
-                mask,
-                Some(cache),
-                generated_sliding_window,
+                allow_sliding_prefill,
                 group,
                 stream,
             )?,
@@ -1604,7 +1633,7 @@ fn forward_llama(
                 &normalized,
                 mask,
                 Some(cache),
-                generated_sliding_window,
+                allow_sliding_prefill,
                 group,
                 stream,
             )?,
