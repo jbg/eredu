@@ -512,7 +512,7 @@ fn deepseek_v3_expected(args: &deepseek_v3::ModelArgs) -> Vec<ExpectedTensor> {
         expected_vector("model.norm.weight", "output_norm.weight", hidden),
         expected("lm_head.weight", "output.weight", [vocab, hidden]),
     ];
-    for layer in 0..args.num_hidden_layers {
+    for (layer, policy) in args.layer_schedule.iter().enumerate() {
         let prefix = format!("model.layers.{layer}");
         tensors.extend([
             expected_vector(format!("{prefix}.input_layernorm.weight"), "", hidden),
@@ -572,7 +572,7 @@ fn deepseek_v3_expected(args: &deepseek_v3::ModelArgs) -> Vec<ExpectedTensor> {
                 [hidden, heads * args.v_head_dim as usize],
             ),
         ]);
-        if args.is_moe_layer(layer) {
+        if *policy == deepseek_v3::LayerPolicy::SparseMoe {
             let experts = args.n_routed_experts as usize;
             let shared = (args.moe_intermediate_size * args.n_shared_experts) as usize;
             tensors.extend([
@@ -803,7 +803,7 @@ fn kimi_linear_expected(args: &kimi_linear::ModelArgs) -> Vec<ExpectedTensor> {
     if !args.tie_word_embeddings {
         tensors.push(expected("lm_head.weight", "output.weight", [vocab, hidden]));
     }
-    for layer in 0..args.num_hidden_layers as usize {
+    for (layer, policy) in args.layer_schedule.iter().enumerate() {
         let prefix = format!("model.layers.{layer}");
         tensors.extend([
             expected_vector(
@@ -817,9 +817,9 @@ fn kimi_linear_expected(args: &kimi_linear::ModelArgs) -> Vec<ExpectedTensor> {
                 hidden,
             ),
         ]);
-        if args.is_kda_layer(layer) {
-            let heads = args.linear_attn_config.num_heads as usize;
-            let head = args.linear_attn_config.head_dim as usize;
+        if policy.attention == kimi_linear::AttentionKind::Kda {
+            let heads = args.kda_config.num_heads as usize;
+            let head = args.kda_config.head_dim as usize;
             let projection = heads * head;
             tensors.extend([
                 expected(
@@ -950,7 +950,7 @@ fn kimi_linear_expected(args: &kimi_linear::ModelArgs) -> Vec<ExpectedTensor> {
                 ));
             }
         }
-        if args.is_moe_layer(layer) {
+        if policy.feed_forward == kimi_linear::FeedForwardPolicy::SparseMoe {
             let experts = args.num_experts as usize;
             let intermediate = args.moe_intermediate_size as usize;
             tensors.extend([
@@ -3047,8 +3047,8 @@ fn validate_deepseek_v3_safetensors(
         &mut issues,
     );
     let allow_packed = !matches!(options.weight_residency, WeightResidency::FullyResident);
-    for layer in 0..args.num_hidden_layers {
-        if !args.is_moe_layer(layer) {
+    for (layer, policy) in args.layer_schedule.iter().enumerate() {
+        if *policy != deepseek_v3::LayerPolicy::SparseMoe {
             continue;
         }
         validate_deepseek_experts(
@@ -3318,7 +3318,7 @@ fn validate_kimi_linear_safetensors(
     config: &Value,
     store: &SafetensorsWeightStore,
 ) -> StructuralValidation {
-    let args = match kimi_linear::parse_config_value(config.clone()) {
+    let args = match kimi_linear::model_args_from_config_value(config) {
         Ok(args) => args,
         Err(error) => return invalid_geometry(error.to_string()),
     };
@@ -3383,12 +3383,11 @@ fn validate_kimi_linear_safetensors(
         &mut issues,
     );
 
-    for layer in 0..args.num_hidden_layers as usize {
-        if args.is_kda_layer(layer) {
+    for (layer, policy) in args.layer_schedule.iter().enumerate() {
+        if policy.attention == kimi_linear::AttentionKind::Kda {
             let prefix = format!("model.layers.{layer}.self_attn");
-            let projection =
-                (args.linear_attn_config.num_heads * args.linear_attn_config.head_dim) as usize;
-            let kernel = args.linear_attn_config.short_conv_kernel_size as usize;
+            let projection = (args.kda_config.num_heads * args.kda_config.head_dim) as usize;
+            let kernel = args.kda_config.short_conv_kernel_size as usize;
             for name in ["q_conv1d.weight", "k_conv1d.weight", "v_conv1d.weight"] {
                 let canonical = format!("{prefix}.{name}");
                 let raw = normalized.get(&canonical).unwrap_or(&canonical);
@@ -3401,11 +3400,11 @@ fn validate_kimi_linear_safetensors(
             validate_float_element_count(
                 store,
                 raw,
-                args.linear_attn_config.num_heads as usize,
+                args.kda_config.num_heads as usize,
                 &mut issues,
             );
         }
-        if !args.is_moe_layer(layer) {
+        if policy.feed_forward != kimi_linear::FeedForwardPolicy::SparseMoe {
             continue;
         }
         let prefix = format!("model.layers.{layer}.mlp.experts");
@@ -5617,7 +5616,7 @@ fn validate_deepseek2_gguf(
                 .safetensors_name
                 .ends_with(".self_attn.kv_b_proj.weight")
         });
-        for layer in 0..args.num_hidden_layers as usize {
+        for layer in 0..args.layer_schedule.len() {
             expected.extend([
                 expected_rank3(
                     "",
@@ -5640,8 +5639,8 @@ fn validate_deepseek2_gguf(
             ]);
         }
     }
-    for layer in 0..args.num_hidden_layers {
-        if !args.is_moe_layer(layer) {
+    for (layer, policy) in args.layer_schedule.iter().enumerate() {
+        if *policy != deepseek_v3::LayerPolicy::SparseMoe {
             continue;
         }
         let experts = args.n_routed_experts as usize;
@@ -5704,13 +5703,12 @@ fn validate_kimi_linear_gguf(
         0..args.num_hidden_layers as usize,
         "Kimi Linear GGUF",
     ));
-    for layer in 0..args.num_hidden_layers as usize {
-        if !args.is_kda_layer(layer) {
+    for (layer, policy) in args.layer_schedule.iter().enumerate() {
+        if policy.attention != kimi_linear::AttentionKind::Kda {
             continue;
         }
-        let projection =
-            (args.linear_attn_config.num_heads * args.linear_attn_config.head_dim) as usize;
-        let kernel = args.linear_attn_config.short_conv_kernel_size as usize;
+        let projection = (args.kda_config.num_heads * args.kda_config.head_dim) as usize;
+        let kernel = args.kda_config.short_conv_kernel_size as usize;
         for suffix in [
             "ssm_conv1d_q.weight",
             "ssm_conv1d_k.weight",
@@ -5738,7 +5736,7 @@ fn validate_kimi_linear_gguf(
         issues.extend(validate_gguf_element_count(
             checkpoint,
             &name,
-            args.linear_attn_config.num_heads as usize,
+            args.kda_config.num_heads as usize,
             TensorOperation::Vector,
             "Kimi Linear GGUF",
         ));

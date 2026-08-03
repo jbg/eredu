@@ -24,7 +24,8 @@ use crate::{
         qwen3_5_moe::{QwenLinear, QwenWeightFormat},
     },
     architectures::deepseek_v3::model::{
-        DeepSeekQuantizationConfig, ModelArgs as DeepSeekArgs, MultiHeadLatentAttention,
+        DeepSeekQuantizationConfig, LayerPolicy as DeepSeekLayerPolicy, ModelArgs as DeepSeekArgs,
+        MultiHeadLatentAttention,
     },
     error::Error,
     nn::{
@@ -40,7 +41,8 @@ use crate::{
         tensor::create_causal_mask,
     },
     runtime::{
-        cache::CompressedLatentCache,
+        attention::LayerSchedule,
+        cache::{residency::derive_prompt_cache_architecture_fingerprint, CompressedLatentCache},
         checkpoint::{
             load::{
                 gguf_metadata, gguf_quantization_configs, load_named_array_strict,
@@ -81,9 +83,47 @@ fn default_router_activation() -> String {
     "sigmoid".into()
 }
 
-/// KDA/full-attention layer layout and recurrent dimensions.
+/// KDA recurrent geometry shared by every KDA layer.
+#[derive(Debug, Clone)]
+pub struct KdaConfig {
+    /// KDA head count.
+    pub num_heads: i32,
+    /// KDA key/value dimension per head.
+    pub head_dim: i32,
+    /// Causal convolution kernel width.
+    pub short_conv_kernel_size: i32,
+}
+
+/// Stateful attention operator used by one Kimi Linear decoder layer.
+#[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
+pub enum AttentionKind {
+    /// Kimi Delta Attention with bounded convolution and recurrent state.
+    Kda,
+    /// No-RoPE Multi-head Latent Attention with context-growing compressed state.
+    Mla,
+}
+
+/// Feed-forward operator used by one Kimi Linear decoder layer.
+#[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
+pub enum FeedForwardPolicy {
+    /// Dense SwiGLU feed-forward block.
+    Dense,
+    /// Routed and shared sparse mixture-of-experts block.
+    SparseMoe,
+}
+
+/// Complete execution policy for one Kimi Linear decoder layer.
+#[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
+pub struct LayerPolicy {
+    /// Stateful attention operator.
+    pub attention: AttentionKind,
+    /// Feed-forward operator.
+    pub feed_forward: FeedForwardPolicy,
+}
+
+/// Raw Hugging Face KDA/MLA layout and recurrent dimensions.
 #[derive(Debug, Clone, Deserialize)]
-pub struct LinearAttentionConfig {
+struct LinearAttentionConfigSource {
     /// One-based KDA layer indices.
     pub kda_layers: Vec<i32>,
     /// One-based MLA layer indices.
@@ -101,9 +141,9 @@ fn default_conv_kernel() -> i32 {
     4
 }
 
-/// Deserialized Kimi Linear text configuration.
+/// Raw Hugging Face Kimi Linear text configuration.
 #[derive(Debug, Clone, Deserialize)]
-pub struct ModelArgs {
+struct ModelArgsSource {
     /// Hugging Face model type.
     #[serde(default = "default_model_type")]
     pub model_type: String,
@@ -131,7 +171,7 @@ pub struct ModelArgs {
     #[serde(default = "default_rope_theta")]
     pub rope_theta: f32,
     /// Hybrid KDA/MLA layout.
-    pub linear_attn_config: LinearAttentionConfig,
+    pub linear_attn_config: LinearAttentionConfigSource,
     /// Routed expert count.
     #[serde(alias = "n_routed_experts")]
     pub num_experts: i32,
@@ -195,19 +235,228 @@ pub struct ModelArgs {
     pub split_kv_b: bool,
 }
 
-impl ModelArgs {
-    /// Returns the layer's configured attention kind.
-    pub fn is_kda_layer(&self, layer: usize) -> bool {
-        self.linear_attn_config
-            .kda_layers
-            .contains(&(layer as i32 + 1))
+/// Validated Kimi Linear text configuration.
+#[derive(Debug, Clone)]
+pub struct ModelArgs {
+    /// Effective model type.
+    pub model_type: String,
+    /// Vocabulary size.
+    pub vocab_size: i32,
+    /// Transformer hidden width.
+    pub hidden_size: i32,
+    /// Decoder layer count.
+    pub num_hidden_layers: i32,
+    /// MLA query head count.
+    pub num_attention_heads: i32,
+    /// MLA key/value head count from source metadata.
+    pub num_key_value_heads: i32,
+    /// Dense SwiGLU width.
+    pub intermediate_size: i32,
+    /// Conventional head width metadata.
+    pub head_dim: i32,
+    /// Maximum context length.
+    pub model_max_length: i32,
+    /// RMSNorm epsilon.
+    pub rms_norm_eps: f32,
+    /// RoPE base retained for compatible MLA construction.
+    pub rope_theta: f32,
+    /// Authoritative operator policy in decoder-layer order.
+    pub layer_schedule: LayerSchedule<LayerPolicy>,
+    /// KDA recurrent geometry.
+    pub kda_config: KdaConfig,
+    /// Routed expert count.
+    pub num_experts: i32,
+    /// Per-expert SwiGLU width.
+    pub moe_intermediate_size: i32,
+    /// MLA compressed latent width.
+    pub kv_lora_rank: i32,
+    /// Optional query LoRA width.
+    pub q_lora_rank: Option<i32>,
+    /// MLA non-positional width per head.
+    pub qk_nope_head_dim: i32,
+    /// MLA nominal positional width per head.
+    pub qk_rope_head_dim: i32,
+    /// MLA value width per head.
+    pub v_head_dim: i32,
+    /// Kimi MLA leaves its nominal positional subspace unrotated.
+    pub mla_use_nope: bool,
+    /// Experts selected per token.
+    pub num_experts_per_token: i32,
+    /// Shared expert count.
+    pub num_shared_experts: i32,
+    /// Router score transform.
+    pub moe_router_activation_func: String,
+    /// Whether selected expert weights are renormalized.
+    pub moe_renormalize: bool,
+    /// Routed expert output multiplier.
+    pub routed_scaling_factor: f32,
+    /// Whether grouped top-k routing is enabled.
+    pub use_grouped_topk: bool,
+    /// Router group count.
+    pub num_expert_group: i32,
+    /// Selected router group count.
+    pub topk_group: i32,
+    /// Whether embeddings and output projection are tied.
+    pub tie_word_embeddings: bool,
+    /// Embedded MTP layer count; released checkpoints set this to zero.
+    pub num_nextn_predict_layers: i32,
+    /// Optional MLX affine/MXFP4 checkpoint metadata.
+    pub quantization: Option<WeightQuantization>,
+    /// Per-weight formats populated by GGUF preparation.
+    pub quantized_weight_configs: Option<HashMap<String, WeightQuantization>>,
+    /// Whether MLA KV-B is stored as split per-head projections.
+    pub split_kv_b: bool,
+}
+
+impl ModelArgsSource {
+    fn normalize(self) -> Result<ModelArgs, Error> {
+        let layer_schedule = kimi_layer_schedule(&self)?;
+        let args = ModelArgs {
+            model_type: self.model_type,
+            vocab_size: self.vocab_size,
+            hidden_size: self.hidden_size,
+            num_hidden_layers: self.num_hidden_layers,
+            num_attention_heads: self.num_attention_heads,
+            num_key_value_heads: self.num_key_value_heads,
+            intermediate_size: self.intermediate_size,
+            head_dim: self.head_dim,
+            model_max_length: self.model_max_length,
+            rms_norm_eps: self.rms_norm_eps,
+            rope_theta: self.rope_theta,
+            layer_schedule,
+            kda_config: KdaConfig {
+                num_heads: self.linear_attn_config.num_heads,
+                head_dim: self.linear_attn_config.head_dim,
+                short_conv_kernel_size: self.linear_attn_config.short_conv_kernel_size,
+            },
+            num_experts: self.num_experts,
+            moe_intermediate_size: self.moe_intermediate_size,
+            kv_lora_rank: self.kv_lora_rank,
+            q_lora_rank: self.q_lora_rank,
+            qk_nope_head_dim: self.qk_nope_head_dim,
+            qk_rope_head_dim: self.qk_rope_head_dim,
+            v_head_dim: self.v_head_dim,
+            mla_use_nope: self.mla_use_nope,
+            num_experts_per_token: self.num_experts_per_token,
+            num_shared_experts: self.num_shared_experts,
+            moe_router_activation_func: self.moe_router_activation_func,
+            moe_renormalize: self.moe_renormalize,
+            routed_scaling_factor: self.routed_scaling_factor,
+            use_grouped_topk: self.use_grouped_topk,
+            num_expert_group: self.num_expert_group,
+            topk_group: self.topk_group,
+            tie_word_embeddings: self.tie_word_embeddings,
+            num_nextn_predict_layers: self.num_nextn_predict_layers,
+            quantization: self.quantization,
+            quantized_weight_configs: self.quantized_weight_configs,
+            split_kv_b: self.split_kv_b,
+        };
+        args.validate()?;
+        Ok(args)
+    }
+}
+
+fn kimi_layer_schedule(source: &ModelArgsSource) -> Result<LayerSchedule<LayerPolicy>, Error> {
+    let layers = usize::try_from(source.num_hidden_layers).map_err(|_| {
+        Error::UnsupportedArchitecture(format!(
+            "Kimi Linear num_hidden_layers must be positive, got {}",
+            source.num_hidden_layers
+        ))
+    })?;
+    if layers == 0 {
+        return Err(Error::UnsupportedArchitecture(
+            "Kimi Linear num_hidden_layers must be positive, got 0".into(),
+        ));
+    }
+    if source.first_k_dense_replace < 0 || source.first_k_dense_replace > source.num_hidden_layers {
+        return Err(Error::UnsupportedArchitecture(format!(
+            "Kimi Linear first_k_dense_replace must be between zero and num_hidden_layers, got {}",
+            source.first_k_dense_replace
+        )));
+    }
+    if source.moe_layer_freq <= 0 {
+        return Err(Error::UnsupportedArchitecture(format!(
+            "Kimi Linear moe_layer_freq must be positive, got {}",
+            source.moe_layer_freq
+        )));
     }
 
-    /// Returns whether this layer uses routed experts.
-    pub fn is_moe_layer(&self, layer: usize) -> bool {
-        self.num_experts > 0
-            && layer as i32 >= self.first_k_dense_replace
-            && layer as i32 % self.moe_layer_freq == 0
+    let mut attention = vec![None; layers];
+    for (name, indexes, kind) in [
+        (
+            "KDA",
+            &source.linear_attn_config.kda_layers,
+            AttentionKind::Kda,
+        ),
+        (
+            "MLA",
+            &source.linear_attn_config.full_attn_layers,
+            AttentionKind::Mla,
+        ),
+    ] {
+        for &one_based in indexes {
+            if one_based <= 0 || one_based > source.num_hidden_layers {
+                return Err(Error::UnsupportedArchitecture(format!(
+                    "Kimi Linear {name} layer index {one_based} is outside 1..={}",
+                    source.num_hidden_layers
+                )));
+            }
+            let slot = &mut attention[one_based as usize - 1];
+            if slot.replace(kind).is_some() {
+                return Err(Error::UnsupportedArchitecture(format!(
+                    "Kimi Linear layer {one_based} occurs more than once"
+                )));
+            }
+        }
+    }
+    if let Some(layer) = attention.iter().position(Option::is_none) {
+        return Err(Error::UnsupportedArchitecture(format!(
+            "Kimi Linear KDA and MLA layer lists do not define decoder layer {}",
+            layer + 1
+        )));
+    }
+    let policies = attention
+        .into_iter()
+        .enumerate()
+        .map(|(layer, attention)| LayerPolicy {
+            attention: attention.expect("validated complete Kimi attention layout"),
+            feed_forward: if source.num_experts > 0
+                && layer as i32 >= source.first_k_dense_replace
+                && layer as i32 % source.moe_layer_freq == 0
+            {
+                FeedForwardPolicy::SparseMoe
+            } else {
+                FeedForwardPolicy::Dense
+            },
+        })
+        .collect();
+    LayerSchedule::new(layers, policies)
+        .map_err(|error| Error::UnsupportedArchitecture(format!("Kimi Linear {error}")))
+}
+
+impl ModelArgs {
+    /// Returns one validated layer policy without an out-of-range fallback.
+    pub fn layer_policy(&self, layer: usize) -> Option<&LayerPolicy> {
+        self.layer_schedule.get(layer)
+    }
+
+    /// Returns a stable ordered representation of the complete layer schedule.
+    pub fn layer_schedule_fingerprint(&self) -> String {
+        self.layer_schedule
+            .iter()
+            .map(|policy| {
+                let attention = match policy.attention {
+                    AttentionKind::Kda => "k",
+                    AttentionKind::Mla => "m",
+                };
+                let feed_forward = match policy.feed_forward {
+                    FeedForwardPolicy::Dense => "d",
+                    FeedForwardPolicy::SparseMoe => "e",
+                };
+                format!("{attention}{feed_forward}")
+            })
+            .collect::<Vec<_>>()
+            .join(",")
     }
 
     pub(crate) fn weight_quantization_for(&self, name: &str) -> Option<WeightQuantization> {
@@ -277,11 +526,11 @@ impl ModelArgs {
             ("num_experts_per_token", self.num_experts_per_token),
             ("num_expert_group", self.num_expert_group),
             ("topk_group", self.topk_group),
-            ("kda.num_heads", self.linear_attn_config.num_heads),
-            ("kda.head_dim", self.linear_attn_config.head_dim),
+            ("kda.num_heads", self.kda_config.num_heads),
+            ("kda.head_dim", self.kda_config.head_dim),
             (
                 "kda.short_conv_kernel_size",
-                self.linear_attn_config.short_conv_kernel_size,
+                self.kda_config.short_conv_kernel_size,
             ),
         ] {
             if value <= 0 {
@@ -299,9 +548,6 @@ impl ModelArgs {
             || self.rms_norm_eps <= 0.0
             || self.rope_theta <= 0.0
             || self.routed_scaling_factor <= 0.0
-            || self.first_k_dense_replace < 0
-            || self.first_k_dense_replace > self.num_hidden_layers
-            || self.moe_layer_freq <= 0
             || self.num_experts_per_token > self.num_experts
             || self.num_experts % self.num_expert_group != 0
             || self.topk_group > self.num_expert_group
@@ -329,30 +575,9 @@ impl ModelArgs {
                 "Kimi Linear MTP layers are not implemented".into(),
             ));
         }
-        let mut seen = vec![false; self.num_hidden_layers as usize];
-        for (kind, layers) in [
-            ("KDA", &self.linear_attn_config.kda_layers),
-            ("MLA", &self.linear_attn_config.full_attn_layers),
-        ] {
-            for &layer in layers {
-                if layer <= 0 || layer > self.num_hidden_layers {
-                    return Err(Error::UnsupportedArchitecture(format!(
-                        "Kimi Linear {kind} layer index {layer} is outside 1..={}",
-                        self.num_hidden_layers
-                    )));
-                }
-                let slot = &mut seen[layer as usize - 1];
-                if *slot {
-                    return Err(Error::UnsupportedArchitecture(format!(
-                        "Kimi Linear layer {layer} occurs more than once"
-                    )));
-                }
-                *slot = true;
-            }
-        }
-        if seen.iter().any(|present| !present) {
+        if self.layer_schedule.len() != self.num_hidden_layers as usize {
             return Err(Error::UnsupportedArchitecture(
-                "Kimi Linear KDA and MLA layer lists must cover every decoder layer".into(),
+                "Kimi Linear layer schedule does not match num_hidden_layers".into(),
             ));
         }
         if let Some(quantization) = self.quantization {
@@ -379,8 +604,17 @@ impl ModelArgs {
             qk_nope_head_dim: self.qk_nope_head_dim,
             qk_rope_head_dim: self.qk_rope_head_dim,
             v_head_dim: self.v_head_dim,
-            first_k_dense_replace: self.first_k_dense_replace,
-            moe_layer_freq: self.moe_layer_freq,
+            layer_schedule: LayerSchedule::new(
+                self.layer_schedule.len(),
+                self.layer_schedule
+                    .iter()
+                    .map(|policy| match policy.feed_forward {
+                        FeedForwardPolicy::Dense => DeepSeekLayerPolicy::DenseMlp,
+                        FeedForwardPolicy::SparseMoe => DeepSeekLayerPolicy::SparseMoe,
+                    })
+                    .collect(),
+            )
+            .expect("validated Kimi layer schedule"),
             n_routed_experts: self.num_experts,
             n_shared_experts: self.num_shared_experts,
             num_experts_per_tok: self.num_experts_per_token,
@@ -402,21 +636,45 @@ impl ModelArgs {
 
 /// Validates a parsed Kimi Linear configuration.
 pub(crate) fn validate_model_config_value(value: &Value) -> Result<(), Error> {
-    parse_config_value(value.clone()).map(|_| ())
+    model_args_from_config_value(value).map(|_| ())
 }
 
-pub(crate) fn parse_config_value(value: Value) -> Result<ModelArgs, Error> {
-    let args: ModelArgs = serde_json::from_value(value).map_err(|error| {
+/// Normalizes a Hugging Face configuration into authoritative Kimi layer geometry.
+pub fn model_args_from_config_value(value: &Value) -> Result<ModelArgs, Error> {
+    let source: ModelArgsSource = serde_json::from_value(value.clone()).map_err(|error| {
         Error::UnsupportedArchitecture(format!("invalid Kimi Linear config: {error}"))
     })?;
-    args.validate()?;
-    Ok(args)
+    source.normalize()
 }
 
 /// Loads and validates `config.json`.
 pub fn get_model_args(model_dir: impl AsRef<Path>) -> Result<ModelArgs, Error> {
     let file = std::fs::File::open(model_dir.as_ref().join("config.json"))?;
-    parse_config_value(serde_json::from_reader(file)?)
+    model_args_from_config_value(&serde_json::from_reader(file)?)
+}
+
+/// Returns a deterministic cache identity including the complete ordered Kimi layer schedule.
+pub(crate) fn prompt_cache_architecture_fingerprint(args: &ModelArgs) -> String {
+    derive_prompt_cache_architecture_fingerprint(
+        "kimi-linear",
+        [
+            ("model_type", args.model_type.clone()),
+            ("hidden_size", args.hidden_size.to_string()),
+            ("num_hidden_layers", args.num_hidden_layers.to_string()),
+            ("num_attention_heads", args.num_attention_heads.to_string()),
+            ("kv_lora_rank", args.kv_lora_rank.to_string()),
+            ("qk_nope_head_dim", args.qk_nope_head_dim.to_string()),
+            ("qk_rope_head_dim", args.qk_rope_head_dim.to_string()),
+            ("v_head_dim", args.v_head_dim.to_string()),
+            ("kda_num_heads", args.kda_config.num_heads.to_string()),
+            ("kda_head_dim", args.kda_config.head_dim.to_string()),
+            (
+                "kda_conv_kernel",
+                args.kda_config.short_conv_kernel_size.to_string(),
+            ),
+            ("layer_schedule", args.layer_schedule_fingerprint()),
+        ],
+    )
 }
 
 #[derive(Debug, Clone, Default)]
@@ -479,9 +737,11 @@ impl Cache {
     /// Creates an empty cache matching the configured hybrid layout.
     pub fn new(args: &ModelArgs) -> Self {
         Self {
-            layers: (0..args.num_hidden_layers as usize)
-                .map(|layer| {
-                    if args.is_kda_layer(layer) {
+            layers: args
+                .layer_schedule
+                .iter()
+                .map(|policy| {
+                    if policy.attention == AttentionKind::Kda {
                         LayerCache::Kda(KdaCache::default())
                     } else {
                         LayerCache::Mla(CompressedLatentCache::new())
@@ -513,6 +773,29 @@ impl Cache {
             .iter()
             .flat_map(LayerCache::retained_arrays)
             .collect()
+    }
+
+    pub(crate) fn validate(&self, schedule: &LayerSchedule<LayerPolicy>) -> Result<(), Error> {
+        if self.layers.len() != schedule.len() {
+            return Err(Error::UnsupportedArchitecture(format!(
+                "Kimi Linear cache has {} layers, expected {}",
+                self.layers.len(),
+                schedule.len()
+            )));
+        }
+        for (layer, (cache, policy)) in self.layers.iter().zip(schedule.iter()).enumerate() {
+            let matches = matches!(
+                (cache, policy.attention),
+                (LayerCache::Kda(_), AttentionKind::Kda) | (LayerCache::Mla(_), AttentionKind::Mla)
+            );
+            if !matches {
+                return Err(Error::UnsupportedArchitecture(format!(
+                    "Kimi Linear cache policy mismatch at layer {layer}: expected {:?}",
+                    policy.attention
+                )));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -573,8 +856,8 @@ pub struct KimiDeltaAttention {
 
 impl KimiDeltaAttention {
     pub(super) fn new(args: &ModelArgs, layer: usize, stream: &Stream) -> Result<Self, Exception> {
-        let heads = args.linear_attn_config.num_heads;
-        let head_dim = args.linear_attn_config.head_dim;
+        let heads = args.kda_config.num_heads;
+        let head_dim = args.kda_config.head_dim;
         let projection = heads * head_dim;
         let prefix = format!("model.layers.{layer}.self_attn");
         let linear = |name: &str, input, output| {
@@ -594,19 +877,19 @@ impl KimiDeltaAttention {
             v_proj: linear("v_proj", args.hidden_size, projection)?,
             q_conv1d: DepthwiseConv1d::new(
                 projection,
-                args.linear_attn_config.short_conv_kernel_size,
+                args.kda_config.short_conv_kernel_size,
                 false,
                 stream,
             )?,
             k_conv1d: DepthwiseConv1d::new(
                 projection,
-                args.linear_attn_config.short_conv_kernel_size,
+                args.kda_config.short_conv_kernel_size,
                 false,
                 stream,
             )?,
             v_conv1d: DepthwiseConv1d::new(
                 projection,
-                args.linear_attn_config.short_conv_kernel_size,
+                args.kda_config.short_conv_kernel_size,
                 false,
                 stream,
             )?,
@@ -1058,25 +1341,36 @@ pub struct DecoderLayer {
 
 impl DecoderLayer {
     pub(super) fn new(args: &ModelArgs, layer: usize, stream: &Stream) -> Result<Self, Exception> {
-        let attention = if args.is_kda_layer(layer) {
-            Attention::Kda(Box::new(KimiDeltaAttention::new(args, layer, stream)?))
-        } else {
-            Attention::Mla(Box::new(MultiHeadLatentAttention::new_with_nope(
-                &args.deepseek_mla_args(),
-                layer as i32,
-                true,
-                stream,
-            )?))
+        let policy = args.layer_policy(layer).copied().ok_or_else(|| {
+            Exception::custom(format!(
+                "Kimi Linear layer schedule has no policy for layer {layer}"
+            ))
+        })?;
+        let attention = match policy.attention {
+            AttentionKind::Kda => {
+                Attention::Kda(Box::new(KimiDeltaAttention::new(args, layer, stream)?))
+            }
+            AttentionKind::Mla => {
+                Attention::Mla(Box::new(MultiHeadLatentAttention::new_with_nope(
+                    &args.deepseek_mla_args(),
+                    layer as i32,
+                    true,
+                    stream,
+                )?))
+            }
         };
-        let mlp = if args.is_moe_layer(layer) {
-            FeedForward::Moe(Box::new(SparseMoe::new(args, layer, stream)?))
-        } else {
-            let prefix = format!("model.layers.{layer}.mlp");
-            FeedForward::Dense(Box::new(args.unloaded_swiglu(
-                &prefix,
-                args.intermediate_size,
-                stream,
-            )?))
+        let mlp = match policy.feed_forward {
+            FeedForwardPolicy::SparseMoe => {
+                FeedForward::Moe(Box::new(SparseMoe::new(args, layer, stream)?))
+            }
+            FeedForwardPolicy::Dense => {
+                let prefix = format!("model.layers.{layer}.mlp");
+                FeedForward::Dense(Box::new(args.unloaded_swiglu(
+                    &prefix,
+                    args.intermediate_size,
+                    stream,
+                )?))
+            }
         };
         Ok(Self {
             self_attn: attention,
@@ -1287,8 +1581,11 @@ impl TextModel {
                 args.weight_quantization_for("model.embed_tokens.weight"),
                 stream,
             )?,
-            layers: (0..args.num_hidden_layers as usize)
-                .map(|layer| DecoderLayer::new(args, layer, stream))
+            layers: args
+                .layer_schedule
+                .iter()
+                .enumerate()
+                .map(|(layer, _)| DecoderLayer::new(args, layer, stream))
                 .collect::<Result<_, _>>()?,
             norm: nn::RmsNorm::unloaded(
                 args.hidden_size,
@@ -1379,11 +1676,9 @@ impl Model {
         };
         let mask = input.mask.or(generated_mask.as_ref());
         if let Some(cache) = input.cache {
-            if cache.layers.len() != self.model.layers.len() {
-                return Err(Exception::custom(
-                    "Kimi Linear cache layer count does not match model",
-                ));
-            }
+            cache
+                .validate(&self.args.layer_schedule)
+                .map_err(|error| Exception::custom(error.to_string()))?;
             for (index, (layer, cache)) in self
                 .model
                 .layers
@@ -1475,11 +1770,9 @@ impl Model {
             None
         };
         let mask = mask.or(generated_mask.as_ref());
-        if cache.layers.len() != self.model.layers.len() {
-            return Err(Exception::custom(
-                "Kimi Linear expert-parallel cache layer count mismatch",
-            ));
-        }
+        cache
+            .validate(&self.args.layer_schedule)
+            .map_err(|error| Exception::custom(error.to_string()))?;
         for (index, (layer, layer_cache)) in self
             .model
             .layers
@@ -1534,11 +1827,9 @@ impl Model {
             None
         };
         let mask = mask.or(generated_mask.as_ref());
-        if cache.layers.len() != self.model.layers.len() {
-            return Err(Exception::custom(
-                "Kimi Linear sparse expert-parallel cache layer count mismatch",
-            ));
-        }
+        cache
+            .validate(&self.args.layer_schedule)
+            .map_err(|error| Exception::custom(error.to_string()))?;
         for (index, (layer, layer_cache)) in self
             .model
             .layers
@@ -1687,8 +1978,8 @@ fn transform_safetensors_weight(
         || key.ends_with(".k_conv1d.weight")
         || key.ends_with(".v_conv1d.weight")
     {
-        let projection = args.linear_attn_config.num_heads * args.linear_attn_config.head_dim;
-        let kernel = args.linear_attn_config.short_conv_kernel_size;
+        let projection = args.kda_config.num_heads * args.kda_config.head_dim;
+        let kernel = args.kda_config.short_conv_kernel_size;
         if value.size() as i32 != projection * kernel {
             return Err(Error::UnsupportedArchitecture(format!(
                 "Kimi Linear convolution tensor {key} has shape {:?}, expected {projection}x{kernel}",
@@ -1701,7 +1992,7 @@ fn transform_safetensors_weight(
         )]);
     }
     if key.ends_with(".A_log") {
-        let heads = args.linear_attn_config.num_heads;
+        let heads = args.kda_config.num_heads;
         if value.size() != heads as usize {
             return Err(Error::UnsupportedArchitecture(format!(
                 "Kimi Linear transition tensor {key} has shape {:?}, expected {heads} values",
@@ -1848,8 +2139,8 @@ pub(crate) fn load_gguf_checkpoint(
             )?;
         }
     }
-    for layer in 0..args.num_hidden_layers {
-        if !args.is_moe_layer(layer as usize) {
+    for (layer, policy) in args.layer_schedule.iter().enumerate() {
+        if policy.feed_forward != FeedForwardPolicy::SparseMoe {
             continue;
         }
         let source_prefix = format!("blk.{layer}");
@@ -1935,8 +2226,8 @@ fn combine_expert_gate_up_formats(
     formats: &mut HashMap<String, WeightQuantization>,
     args: &ModelArgs,
 ) -> Result<(), Error> {
-    for layer in 0..args.num_hidden_layers {
-        if !args.is_moe_layer(layer as usize) {
+    for (layer, policy) in args.layer_schedule.iter().enumerate() {
+        if policy.feed_forward != FeedForwardPolicy::SparseMoe {
             continue;
         }
         let prefix = format!("model.layers.{layer}.mlp.experts");
@@ -1967,8 +2258,8 @@ fn normalize_gguf_weight(
         || name.ends_with(".k_conv1d.weight")
         || name.ends_with(".v_conv1d.weight")
     {
-        let expected = args.linear_attn_config.num_heads * args.linear_attn_config.head_dim;
-        let kernel = args.linear_attn_config.short_conv_kernel_size;
+        let expected = args.kda_config.num_heads * args.kda_config.head_dim;
+        let kernel = args.kda_config.short_conv_kernel_size;
         if value.size() != (expected * kernel) as usize {
             return Err(Error::UnsupportedArchitecture(format!(
                 "Kimi Linear convolution {name:?} has shape {:?}, expected {expected}x{kernel}",
@@ -1978,7 +2269,7 @@ fn normalize_gguf_weight(
         return Ok(value.reshape(&[expected, 1, kernel], stream)?);
     }
     if name.ends_with(".A_log") {
-        let heads = args.linear_attn_config.num_heads;
+        let heads = args.kda_config.num_heads;
         if value.size() != heads as usize {
             return Err(Error::UnsupportedArchitecture(format!(
                 "Kimi Linear GGUF ssm_a {name:?} has shape {:?}, expected {heads} values",
@@ -2126,7 +2417,7 @@ pub(crate) fn model_args_from_gguf_catalog(
         )));
     }
     let hidden_size = gguf_i32(metadata, &key("embedding_length"))?;
-    Ok(ModelArgs {
+    ModelArgsSource {
         model_type: "kimi_linear".into(),
         vocab_size,
         hidden_size,
@@ -2138,7 +2429,7 @@ pub(crate) fn model_args_from_gguf_catalog(
         model_max_length: gguf_i32(metadata, &key("context_length"))?,
         rms_norm_eps: gguf_f32(metadata, &key("attention.layer_norm_rms_epsilon"))?,
         rope_theta: gguf_optional_f32(metadata, &key("rope.freq_base"))?.unwrap_or(10_000.0),
-        linear_attn_config: LinearAttentionConfig {
+        linear_attn_config: LinearAttentionConfigSource {
             full_attn_layers: full_attention_layers,
             kda_layers,
             num_heads: num_attention_heads,
@@ -2187,7 +2478,8 @@ pub(crate) fn model_args_from_gguf_catalog(
         quantization: None,
         quantized_weight_configs: None,
         split_kv_b: checkpoint.any_gguf_tensor(|name| name.contains(".attn_k_b.")),
-    })
+    }
+    .normalize()
 }
 
 fn gguf_attention_layers(
@@ -2309,9 +2601,11 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        load_gguf, load_model, load_tokenizer, normalize_gguf_weight, parse_config_value,
-        translate_gguf_weight_name, Model, ModelInput,
+        load_gguf, load_model, load_tokenizer, model_args_from_config_value, normalize_gguf_weight,
+        prompt_cache_architecture_fingerprint, translate_gguf_weight_name, AttentionKind, Cache,
+        FeedForwardPolicy, LayerCache, LayerPolicy, Model, ModelInput,
     };
+    use crate::runtime::attention::LayerSchedule;
 
     fn config() -> serde_json::Value {
         json!({
@@ -2358,18 +2652,122 @@ mod tests {
 
     #[test]
     fn validates_hybrid_layer_partition() {
-        let args = parse_config_value(config()).unwrap();
-        assert!(args.is_kda_layer(0));
-        assert!(!args.is_kda_layer(1));
+        let args = model_args_from_config_value(&config()).unwrap();
+        assert_eq!(
+            args.layer_schedule.iter().copied().collect::<Vec<_>>(),
+            vec![
+                LayerPolicy {
+                    attention: AttentionKind::Kda,
+                    feed_forward: FeedForwardPolicy::Dense,
+                },
+                LayerPolicy {
+                    attention: AttentionKind::Mla,
+                    feed_forward: FeedForwardPolicy::SparseMoe,
+                },
+            ]
+        );
 
         let mut duplicate = config();
         duplicate["linear_attn_config"]["full_attn_layers"] = json!([1]);
-        assert!(parse_config_value(duplicate).is_err());
+        assert!(model_args_from_config_value(&duplicate).is_err());
+    }
+
+    #[test]
+    fn normalization_preserves_arbitrary_attention_and_sparse_frequency() {
+        let mut value = config();
+        value["num_hidden_layers"] = json!(4);
+        value["linear_attn_config"]["kda_layers"] = json!([1, 3]);
+        value["linear_attn_config"]["full_attn_layers"] = json!([2, 4]);
+        value["first_k_dense_replace"] = json!(1);
+        value["moe_layer_freq"] = json!(2);
+        let args = model_args_from_config_value(&value).unwrap();
+        assert_eq!(
+            args.layer_schedule.iter().copied().collect::<Vec<_>>(),
+            vec![
+                LayerPolicy {
+                    attention: AttentionKind::Kda,
+                    feed_forward: FeedForwardPolicy::Dense,
+                },
+                LayerPolicy {
+                    attention: AttentionKind::Mla,
+                    feed_forward: FeedForwardPolicy::Dense,
+                },
+                LayerPolicy {
+                    attention: AttentionKind::Kda,
+                    feed_forward: FeedForwardPolicy::SparseMoe,
+                },
+                LayerPolicy {
+                    attention: AttentionKind::Mla,
+                    feed_forward: FeedForwardPolicy::Dense,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn schedule_drives_cache_layout_and_identity() {
+        let mut first = model_args_from_config_value(&config()).unwrap();
+        let mut second = first.clone();
+        second.layer_schedule = LayerSchedule::new(
+            2,
+            vec![
+                LayerPolicy {
+                    attention: AttentionKind::Mla,
+                    feed_forward: FeedForwardPolicy::Dense,
+                },
+                LayerPolicy {
+                    attention: AttentionKind::Kda,
+                    feed_forward: FeedForwardPolicy::SparseMoe,
+                },
+            ],
+        )
+        .unwrap();
+        let first_cache = Cache::new(&first);
+        let second_cache = Cache::new(&second);
+        assert!(matches!(first_cache.layers[0], LayerCache::Kda(_)));
+        assert!(matches!(first_cache.layers[1], LayerCache::Mla(_)));
+        assert!(matches!(second_cache.layers[0], LayerCache::Mla(_)));
+        assert!(matches!(second_cache.layers[1], LayerCache::Kda(_)));
+        assert!(first_cache.validate(&first.layer_schedule).is_ok());
+        assert!(first_cache.validate(&second.layer_schedule).is_err());
+        assert_ne!(
+            prompt_cache_architecture_fingerprint(&first),
+            prompt_cache_architecture_fingerprint(&second)
+        );
+
+        first.layer_schedule = second.layer_schedule.clone();
+        assert_eq!(
+            prompt_cache_architecture_fingerprint(&first),
+            prompt_cache_architecture_fingerprint(&second)
+        );
+    }
+
+    #[test]
+    fn schedule_normalization_rejects_missing_layers_and_invalid_sparse_geometry() {
+        let mut missing = config();
+        missing["linear_attn_config"]["full_attn_layers"] = json!([]);
+        assert!(model_args_from_config_value(&missing)
+            .unwrap_err()
+            .to_string()
+            .contains("do not define decoder layer 2"));
+
+        for (field, value, message) in [
+            ("first_k_dense_replace", json!(-1), "must be between zero"),
+            ("first_k_dense_replace", json!(3), "must be between zero"),
+            ("moe_layer_freq", json!(0), "must be positive"),
+        ] {
+            let mut invalid = config();
+            invalid[field] = value;
+            assert!(model_args_from_config_value(&invalid)
+                .unwrap_err()
+                .to_string()
+                .contains(message));
+        }
     }
 
     #[test]
     fn tiny_parameter_tree_contains_kda_mla_dense_and_sparse_contracts() {
-        let args = parse_config_value(config()).unwrap();
+        let args = model_args_from_config_value(&config()).unwrap();
         let context = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
         let model = Model::new(args, context.stream()).unwrap();
         let parameters = model.parameters().flatten();
@@ -2430,7 +2828,7 @@ mod tests {
 
     #[test]
     fn normalizes_gguf_transition_rates_and_convolution_rank() {
-        let args = parse_config_value(config()).unwrap();
+        let args = model_args_from_config_value(&config()).unwrap();
         let context = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
         let stream = context.stream();
         let transition = normalize_gguf_weight(

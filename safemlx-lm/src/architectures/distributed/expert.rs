@@ -686,6 +686,23 @@ impl ExpertParallelModel {
 
     /// Returns the canonical cache-relevant architecture identity for this rank.
     pub fn prompt_cache_architecture_fingerprint(&self) -> Result<String, Error> {
+        match &self.architecture {
+            ExpertArchitecture::KimiLinear(model) => {
+                return Ok(
+                    crate::architectures::kimi_linear::model::prompt_cache_architecture_fingerprint(
+                        &model.args,
+                    ),
+                );
+            }
+            ExpertArchitecture::KimiLinearLayerwise(model) => {
+                return Ok(
+                    crate::architectures::kimi_linear::model::prompt_cache_architecture_fingerprint(
+                        model.args(),
+                    ),
+                );
+            }
+            _ => {}
+        }
         Ok(self.prompt_cache_model_identity()?.architecture_fingerprint)
     }
 
@@ -704,8 +721,7 @@ impl ExpertParallelModel {
                     crate::architectures::deepseek_v3::model::prompt_cache_architecture_fingerprint(
                         &model.args,
                     ),
-                    usize::try_from(model.args.num_hidden_layers)
-                        .map_err(|_| Error::Parallel("invalid DeepSeek layer count".into()))?,
+                    model.args.layer_schedule.len(),
                     None,
                 ),
                 ExpertArchitecture::GptOss(model) => (
@@ -4024,9 +4040,9 @@ fn load_kimi_linear_cached_ep(
         &StrictLoadConfig::default(),
     )?;
     let opened_checkpoint_shards = partition.opened_shards().to_vec();
-    let heads = args.linear_attn_config.num_heads;
-    let conv_width = heads * args.linear_attn_config.head_dim;
-    let kernel = args.linear_attn_config.short_conv_kernel_size;
+    let heads = args.kda_config.num_heads;
+    let conv_width = heads * args.kda_config.head_dim;
+    let kernel = args.kda_config.short_conv_kernel_size;
     let mut tensors = transform_partition_tensors(partition.into_tensors(), |key, value| {
         let key = key.replace(".block_sparse_moe.", ".mlp.");
         let value = if key.ends_with(".q_conv1d.weight")
@@ -4158,7 +4174,7 @@ fn load_deepseek_ep(
     let mut tensors = partition.into_tensors();
     let mut model = deepseek_v3::Model::new(target_args, stream)?;
     assign_module(&mut model, "", &mut tensors, quantize_on_load, stream)?;
-    for layer_index in 0..source_args.num_hidden_layers as usize {
+    for layer_index in 0..source_args.layer_schedule.len() {
         let Some(moe) = model.model.layers[layer_index].mlp.moe_mut() else {
             continue;
         };
@@ -5439,7 +5455,7 @@ mod tests {
     }
 
     fn kimi_test_args() -> kimi_linear::ModelArgs {
-        kimi_linear::parse_config_value(serde_json::json!({
+        kimi_linear::model_args_from_config_value(&serde_json::json!({
             "model_type": "kimi_linear",
             "vocab_size": 32,
             "hidden_size": 32,
@@ -5611,11 +5627,11 @@ mod tests {
             ),
             (
                 "kimi-linear.kda.head_dim".into(),
-                GgufMetadataValue::Uint32(args.linear_attn_config.head_dim as u32),
+                GgufMetadataValue::Uint32(args.kda_config.head_dim as u32),
             ),
             (
                 "kimi-linear.ssm.conv_kernel".into(),
-                GgufMetadataValue::Uint32(args.linear_attn_config.short_conv_kernel_size as u32),
+                GgufMetadataValue::Uint32(args.kda_config.short_conv_kernel_size as u32),
             ),
             (
                 "kimi-linear.expert_count".into(),

@@ -566,6 +566,12 @@ impl Model {
             Self::InklingLayerwise(model) => {
                 Ok(inkling::prompt_cache_architecture_fingerprint(model.args()))
             }
+            Self::KimiLinear(model) => Ok(kimi_linear::prompt_cache_architecture_fingerprint(
+                &model.args,
+            )),
+            Self::KimiLinearLayerwise(model) => Ok(
+                kimi_linear::prompt_cache_architecture_fingerprint(model.args()),
+            ),
             Self::DenseQwen(model) => Ok(dense_qwen::prompt_cache_architecture_fingerprint(
                 &model.args,
             )),

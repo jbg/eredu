@@ -617,8 +617,7 @@ impl PipelineModel {
                 crate::architectures::deepseek_v3::model::prompt_cache_architecture_fingerprint(
                     &stage.args,
                 ),
-                usize::try_from(stage.args.num_hidden_layers)
-                    .map_err(|_| Error::Parallel("invalid DeepSeek layer count".into()))?,
+                stage.args.layer_schedule.len(),
                 stage.range.clone(),
                 None,
             ),
@@ -1366,7 +1365,7 @@ fn load_llama_pipeline(
         target_args.quantization = Some(quantization);
         target_args.quantization_config = None;
     }
-    let range = topology.layer_range(source_args.num_hidden_layers as usize)?;
+    let range = topology.layer_range(source_args.attention_schedule.len())?;
     let mut info = base_info(
         topology,
         range.clone(),
@@ -1388,7 +1387,7 @@ fn load_llama_pipeline(
         "model.embed_tokens",
         owns_embedding_weight(&info, source_args.tie_word_embeddings),
     );
-    for global_layer in 0..source_args.num_hidden_layers as usize {
+    for global_layer in 0..source_args.attention_schedule.len() {
         let layer =
             llama::TransformerBlock::new_for_layer(&source_args, global_layer as i32, stream)?;
         insert_module_plan(
@@ -1810,7 +1809,7 @@ fn load_deepseek_pipeline(
         target_args.quantization_config = None;
         target_args.quantization = Some(quantization);
     }
-    let range = topology.layer_range(source_args.num_hidden_layers as usize)?;
+    let range = topology.layer_range(source_args.layer_schedule.len())?;
     let mut info = base_info(
         topology,
         range.clone(),
@@ -1825,7 +1824,7 @@ fn load_deepseek_pipeline(
         stream,
     )?;
     insert_module_plan(&mut plan, &embedding, "model.embed_tokens", info.is_first);
-    for global_layer in 0..source_args.num_hidden_layers as usize {
+    for global_layer in 0..source_args.layer_schedule.len() {
         let layer = deepseek_v3::DecoderLayer::new(&source_args, global_layer as i32, stream)?;
         let local = range.contains(&global_layer) && dense_stream.is_none();
         insert_module_plan(
@@ -1834,7 +1833,7 @@ fn load_deepseek_pipeline(
             &format!("model.layers.{global_layer}"),
             local,
         );
-        if source_args.is_moe_layer(global_layer as i32) {
+        if source_args.layer_policy(global_layer) == Some(&deepseek_v3::LayerPolicy::SparseMoe) {
             insert_deepseek_expert_plan(
                 &mut plan,
                 &source_args,
@@ -2942,8 +2941,14 @@ mod tests {
             qk_nope_head_dim: 2,
             qk_rope_head_dim: 2,
             v_head_dim: 2,
-            first_k_dense_replace: 1,
-            moe_layer_freq: 1,
+            layer_schedule: crate::runtime::attention::LayerSchedule::new(
+                2,
+                vec![
+                    deepseek_v3::LayerPolicy::DenseMlp,
+                    deepseek_v3::LayerPolicy::SparseMoe,
+                ],
+            )
+            .unwrap(),
             n_routed_experts: 4,
             n_shared_experts: 1,
             num_experts_per_tok: 2,

@@ -431,8 +431,7 @@ impl TensorParallelModel {
                 crate::architectures::deepseek_v3::model::prompt_cache_architecture_fingerprint(
                     &model.global_args,
                 ),
-                usize::try_from(model.global_args.num_hidden_layers)
-                    .map_err(|_| Error::Parallel("invalid DeepSeek layer count".into()))?,
+                model.global_args.layer_schedule.len(),
                 None,
             ),
         };
@@ -796,7 +795,7 @@ fn insert_deepseek_layer_plan(
             projection_tensor_placement(&source, projection, plan.topology()),
         );
     }
-    if args.is_moe_layer(index as i32) {
+    if args.layer_policy(index) == Some(&deepseek_v3::LayerPolicy::SparseMoe) {
         insert_deepseek_expert_plan(plan, args, index, dense_source)?;
     }
     Ok(())
@@ -1054,7 +1053,7 @@ fn load_llama(
         "model.embed_tokens",
         &vocabulary,
     );
-    for index in 0..source_args.num_hidden_layers as usize {
+    for index in 0..source_args.attention_schedule.len() {
         let layer = llama::TransformerBlock::new_for_layer(&source_args, index as i32, stream)
             .map_err(|error| {
                 Error::Parallel(format!(
@@ -1276,7 +1275,7 @@ fn load_deepseek(
         "model.embed_tokens",
         &vocabulary,
     );
-    for index in 0..source_args.num_hidden_layers as usize {
+    for index in 0..source_args.layer_schedule.len() {
         let layer = deepseek_v3::DecoderLayer::new(&source_args, index as i32, stream)?;
         insert_deepseek_layer_plan(
             &mut plan,
@@ -1338,8 +1337,11 @@ fn load_deepseek(
         target_args.weight_quantization_for("model.embed_tokens.weight"),
         stream,
     )?;
-    let mut layers = (0..target_args.num_hidden_layers)
-        .map(|index| deepseek_v3::DecoderLayer::new(&target_args, index, stream))
+    let mut layers = target_args
+        .layer_schedule
+        .iter()
+        .enumerate()
+        .map(|(index, _)| deepseek_v3::DecoderLayer::new(&target_args, index as i32, stream))
         .collect::<Result<Vec<_>, _>>()?;
     let mut norm = nn::RmsNorm::unloaded(
         target_args.hidden_size,

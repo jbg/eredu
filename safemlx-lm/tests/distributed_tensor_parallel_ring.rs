@@ -248,7 +248,7 @@ fn write_deepseek_fixture(directory: &Path, layers: i32) {
     });
     let context = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
     let stream = context.stream();
-    let args: deepseek_v3::ModelArgs = serde_json::from_value(config.clone()).unwrap();
+    let args = deepseek_v3::model_args_from_config_value(&config).unwrap();
     let mut model = deepseek_v3::Model::new(args, stream).unwrap();
     for (name, parameter) in model.parameters_mut().flatten() {
         let shape = parameter.shape().to_vec();

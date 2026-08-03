@@ -19,7 +19,7 @@ use safemlx::{
 use crate::{
     api::{
         common::{self, generation::CausalLm},
-        deepseek_v3::{self as resident, Cache, DecoderLayer, ModelArgs},
+        deepseek_v3::{self as resident, Cache, DecoderLayer, LayerPolicy, ModelArgs},
         input,
     },
     error::Error,
@@ -74,7 +74,7 @@ impl DeepSeekV3LayerwiseModel {
 
     /// Creates ordinary or paged compressed attention state independently of weight residency.
     pub fn new_cache_with_options(&self, policy: CacheResidencyPolicy) -> Result<Cache, Error> {
-        Cache::new_with_options(self.args().num_hidden_layers, policy).map_err(Into::into)
+        Cache::new_with_options(&self.args().layer_schedule, policy).map_err(Into::into)
     }
 
     /// Lazily catalogs a compatible persisted compressed prefix.
@@ -86,8 +86,7 @@ impl DeepSeekV3LayerwiseModel {
         options: PagedCacheOptions,
     ) -> Result<(Cache, PromptCacheManifest), Error> {
         let args = self.args();
-        let layer_count = usize::try_from(args.num_hidden_layers)
-            .map_err(|_| Exception::custom("invalid DeepSeek cache layer count"))?;
+        let layer_count = args.layer_schedule.len();
         let identity = PromptCacheModelIdentity {
             model_family: "deepseek_v3".into(),
             effective_model_type: args.model_type.clone(),
@@ -107,7 +106,7 @@ impl DeepSeekV3LayerwiseModel {
         validate_prompt_cache_model_identity(expected, &identity)
             .map_err(|error| Exception::custom(error.to_string()))?;
         Cache::load_prompt_cache(
-            self.args().num_hidden_layers,
+            &self.args().layer_schedule,
             directory,
             expected,
             &identity,
@@ -550,7 +549,7 @@ impl DeepSeekV3LayerwiseAdapter {
     }
 
     fn new_cache(&self) -> Cache {
-        Cache::new(self.args.num_hidden_layers)
+        Cache::new(&self.args.layer_schedule)
     }
 
     fn recipes_for_layer(
@@ -693,11 +692,11 @@ impl GeneralLayerwiseModelAdapter for DeepSeekV3LayerwiseAdapter {
         if cache.layers.is_empty() {
             *cache = self.new_cache();
         }
-        if cache.layers.len() != self.args.num_hidden_layers as usize {
+        if cache.layers.len() != self.args.layer_schedule.len() {
             return Err(Error::UnsupportedArchitecture(format!(
                 "DeepSeek-V3 cache has {} layers, expected {}",
                 cache.layers.len(),
-                self.args.num_hidden_layers
+                self.args.layer_schedule.len()
             )));
         }
         Ok(())
@@ -744,7 +743,7 @@ impl GeneralLayerwiseModelAdapter for DeepSeekV3LayerwiseAdapter {
 
     fn layer_count(&self, group: usize) -> Result<usize, Error> {
         if group == 0 {
-            Ok(self.args.num_hidden_layers as usize)
+            Ok(self.args.layer_schedule.len())
         } else {
             Err(Error::UnsupportedArchitecture(format!(
                 "DeepSeek-V3 decoder has no execution group {group}"
@@ -834,7 +833,9 @@ impl GeneralLayerwiseModelAdapter for DeepSeekV3LayerwiseAdapter {
         stream: &Stream,
     ) -> Result<Array, Error> {
         self.layer_count(group)?;
-        if self.sparse_expert_cache && self.args.is_moe_layer(index as i32) {
+        if self.sparse_expert_cache
+            && self.args.layer_policy(index) == Some(&LayerPolicy::SparseMoe)
+        {
             let expert_cache = self.expert_cache.as_ref().ok_or_else(|| {
                 Error::UnsupportedArchitecture(
                     "DeepSeek-V3 sparse expert cache was not initialized".into(),
@@ -997,10 +998,8 @@ pub(crate) fn deepseek_expert_catalog(
 ) -> Result<Vec<ExpertCatalogEntry>, Error> {
     let normalized = normalized_checkpoint_keys(store);
     let mut entries = Vec::new();
-    for layer in 0..usize::try_from(args.num_hidden_layers)
-        .map_err(|_| Error::UnsupportedArchitecture("DeepSeek-V3 layer count is negative".into()))?
-    {
-        if !args.is_moe_layer(layer as i32) {
+    for (layer, policy) in args.layer_schedule.iter().enumerate() {
+        if *policy != LayerPolicy::SparseMoe {
             continue;
         }
         let prefix = format!("model.layers.{layer}.mlp.experts");
@@ -1100,13 +1099,17 @@ mod tests {
         Array, Device, DeviceType, Dtype, ExecutionContext, Stream,
     };
 
-    use super::{load_deepseek_v3_layerwise_model, load_deepseek_v3_sparse_expert_cache_model};
+    use super::{
+        load_deepseek_v3_layerwise_model, load_deepseek_v3_sparse_expert_cache_model,
+        DeepSeekV3LayerwiseAdapter, DeepSeekV3LayerwiseModel,
+    };
     use crate::{
         architectures::deepseek_v3::model::{
-            self as resident, FeedForward, Model, ModelArgs, ModelInput,
+            self as resident, FeedForward, LayerPolicy, Model, ModelArgs, ModelInput,
         },
+        runtime::attention::LayerSchedule,
         runtime::checkpoint::binding::canonical_checkpoint_name,
-        runtime::execution::layerwise::LayerwiseLoadOptions,
+        runtime::execution::layerwise::{load_general_layerwise_model, LayerwiseLoadOptions},
         runtime::residency::expert_cache::ExpertCacheLoadOptions,
         runtime::residency::policy::{OffloadConfig, ResidencyPolicy},
     };
@@ -1163,7 +1166,7 @@ mod tests {
     }
 
     fn args(fp8: bool) -> ModelArgs {
-        serde_json::from_value(config(fp8)).unwrap()
+        resident::model_args_from_config_value(&config(fp8)).unwrap()
     }
 
     fn initialize(model: &mut Model, stream: &Stream) {
@@ -1325,6 +1328,64 @@ mod tests {
                 .filter(|unit| unit.device_resident() && !layers.contains(unit))
                 .all(|unit| unit.policy() == ResidencyPolicy::Pinned));
         }
+    }
+
+    #[test]
+    fn arbitrary_moe_dense_order_matches_resident_execution() {
+        let gpu = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
+        let cpu = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        let mut custom_args = args(false);
+        custom_args.layer_schedule =
+            LayerSchedule::new(2, vec![LayerPolicy::SparseMoe, LayerPolicy::DenseMlp]).unwrap();
+        custom_args.validate().unwrap();
+        let mut resident = Model::new(custom_args.clone(), gpu.stream()).unwrap();
+        initialize(&mut resident, gpu.stream());
+        let directory = tempfile::tempdir().unwrap();
+        write_fixture(directory.path(), &resident, false, true, gpu.stream());
+
+        let options = LayerwiseLoadOptions::new(OffloadConfig::new(None, None, 1).unwrap());
+        let adapter = DeepSeekV3LayerwiseAdapter::new(custom_args, gpu.stream()).unwrap();
+        let execution = load_general_layerwise_model(
+            directory.path(),
+            adapter,
+            options,
+            gpu.stream(),
+            cpu.stream(),
+        )
+        .unwrap();
+        let mut layerwise = DeepSeekV3LayerwiseModel { execution };
+        let mut resident_cache = resident.new_cache();
+        let mut layerwise_cache = resident::Cache { layers: Vec::new() };
+        for tokens in [
+            Array::from_slice(&[1u32, 2], &[1, 2]),
+            Array::from_slice(&[3u32], &[1, 1]),
+        ] {
+            let expected = resident
+                .forward_logits(
+                    ModelInput {
+                        inputs: &tokens,
+                        mask: None,
+                        cache: Some(&mut resident_cache),
+                    },
+                    false,
+                    gpu.stream(),
+                )
+                .unwrap();
+            let actual = layerwise
+                .forward(&tokens, &mut layerwise_cache, gpu.stream())
+                .unwrap();
+            assert_close(&actual, &expected, 3e-5);
+        }
+        assert_eq!(resident_cache.offset(), 3);
+        assert_eq!(layerwise_cache.offset(), 3);
+        assert!(resident_cache
+            .layers
+            .iter()
+            .all(|cache| cache.offset() == 3));
+        assert!(layerwise_cache
+            .layers
+            .iter()
+            .all(|cache| cache.offset() == 3));
     }
 
     #[test]

@@ -47,6 +47,7 @@ use crate::{
         create_causal_mask,
         rope::{initialize_rope, FloatOrString, RopeVariant},
     },
+    runtime::attention::LayerSchedule,
     runtime::cache::residency::{
         derive_prompt_cache_architecture_fingerprint, open_prompt_cache,
         validate_prompt_cache_model_identity, CacheBlockArrays, CacheRankIdentity,
@@ -237,9 +238,18 @@ pub enum DeepSeekQuantizationConfig {
     Affine(WeightQuantization),
 }
 
-/// Deserialized DeepSeek-V3/R1 text configuration.
+/// Feed-forward operator used by one DeepSeek-V3/R1 decoder layer.
+#[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
+pub enum LayerPolicy {
+    /// Dense SwiGLU feed-forward block.
+    DenseMlp,
+    /// Routed and shared expert feed-forward block.
+    SparseMoe,
+}
+
+/// Source-format DeepSeek-V3/R1 text configuration.
 #[derive(Debug, Clone, Deserialize)]
-pub struct ModelArgs {
+struct ModelArgsSource {
     /// Hugging Face model type.
     #[serde(default = "default_model_type")]
     pub model_type: String,
@@ -277,11 +287,9 @@ pub struct ModelArgs {
     pub qk_rope_head_dim: i32,
     /// Value width per head.
     pub v_head_dim: i32,
-    /// Number of initial dense layers.
-    pub first_k_dense_replace: i32,
-    /// Sparse layer frequency after the dense prefix.
+    first_k_dense_replace: i32,
     #[serde(default = "default_moe_layer_freq")]
-    pub moe_layer_freq: i32,
+    moe_layer_freq: i32,
     /// Routed expert count.
     pub n_routed_experts: i32,
     /// Shared expert count.
@@ -325,6 +333,161 @@ pub struct ModelArgs {
     pub tie_word_embeddings: bool,
 }
 
+/// Validated DeepSeek-V3/R1 text configuration.
+#[derive(Debug, Clone)]
+pub struct ModelArgs {
+    /// Hugging Face model type.
+    pub model_type: String,
+    /// Model width.
+    pub hidden_size: i32,
+    /// Dense SwiGLU width.
+    pub intermediate_size: i32,
+    /// Routed-expert SwiGLU width.
+    pub moe_intermediate_size: i32,
+    /// Decoder layer count, excluding MTP layers.
+    pub num_hidden_layers: i32,
+    /// MLA query head count.
+    pub num_attention_heads: i32,
+    /// Token vocabulary size.
+    pub vocab_size: i32,
+    /// RMS normalization epsilon.
+    pub rms_norm_eps: f32,
+    /// Maximum configured context length.
+    pub max_position_embeddings: i32,
+    /// RoPE base.
+    pub rope_theta: f32,
+    /// Optional YaRN extension settings.
+    pub rope_scaling: Option<YarnConfig>,
+    /// Query LoRA rank; `None` selects the direct `q_proj` form.
+    pub q_lora_rank: Option<i32>,
+    /// Compressed KV latent width.
+    pub kv_lora_rank: i32,
+    /// Non-positional query/key width per head.
+    pub qk_nope_head_dim: i32,
+    /// Rotary query/key width per head.
+    pub qk_rope_head_dim: i32,
+    /// Value width per head.
+    pub v_head_dim: i32,
+    /// Authoritative feed-forward policy in decoder-layer order.
+    pub layer_schedule: LayerSchedule<LayerPolicy>,
+    /// Routed expert count.
+    pub n_routed_experts: i32,
+    /// Shared expert count.
+    pub n_shared_experts: i32,
+    /// Selected experts per token.
+    pub num_experts_per_tok: i32,
+    /// Expert routing group count.
+    pub n_group: i32,
+    /// Selected routing group count.
+    pub topk_group: i32,
+    /// Grouped top-k method.
+    pub topk_method: String,
+    /// Router score transform.
+    pub scoring_func: String,
+    /// Normalize selected scores.
+    pub norm_topk_prob: bool,
+    /// Final routed contribution multiplier.
+    pub routed_scaling_factor: f32,
+    /// Appended multi-token-prediction layer count.
+    pub num_nextn_predict_layers: i32,
+    /// Native FP8 metadata.
+    pub quantization_config: Option<DeepSeekQuantizationConfig>,
+    /// Optional MLX affine checkpoint metadata.
+    pub quantization: Option<WeightQuantization>,
+    /// Per-weight affine settings for mixed-quantization GGUF tensors.
+    pub quantized_weight_configs: Option<HashMap<String, WeightQuantization>>,
+    /// Whether the checkpoint stores per-head MLA K/V reconstruction separately.
+    pub split_kv_b: bool,
+    /// Whether embedding and LM-head weights are tied.
+    pub tie_word_embeddings: bool,
+}
+
+impl ModelArgsSource {
+    fn normalize(self) -> Result<ModelArgs, Error> {
+        let layer_schedule = deepseek_layer_schedule(
+            self.num_hidden_layers,
+            self.first_k_dense_replace,
+            self.moe_layer_freq,
+        )?;
+        let args = ModelArgs {
+            model_type: self.model_type,
+            hidden_size: self.hidden_size,
+            intermediate_size: self.intermediate_size,
+            moe_intermediate_size: self.moe_intermediate_size,
+            num_hidden_layers: self.num_hidden_layers,
+            num_attention_heads: self.num_attention_heads,
+            vocab_size: self.vocab_size,
+            rms_norm_eps: self.rms_norm_eps,
+            max_position_embeddings: self.max_position_embeddings,
+            rope_theta: self.rope_theta,
+            rope_scaling: self.rope_scaling,
+            q_lora_rank: self.q_lora_rank,
+            kv_lora_rank: self.kv_lora_rank,
+            qk_nope_head_dim: self.qk_nope_head_dim,
+            qk_rope_head_dim: self.qk_rope_head_dim,
+            v_head_dim: self.v_head_dim,
+            layer_schedule,
+            n_routed_experts: self.n_routed_experts,
+            n_shared_experts: self.n_shared_experts,
+            num_experts_per_tok: self.num_experts_per_tok,
+            n_group: self.n_group,
+            topk_group: self.topk_group,
+            topk_method: self.topk_method,
+            scoring_func: self.scoring_func,
+            norm_topk_prob: self.norm_topk_prob,
+            routed_scaling_factor: self.routed_scaling_factor,
+            num_nextn_predict_layers: self.num_nextn_predict_layers,
+            quantization_config: self.quantization_config,
+            quantization: self.quantization,
+            quantized_weight_configs: self.quantized_weight_configs,
+            split_kv_b: self.split_kv_b,
+            tie_word_embeddings: self.tie_word_embeddings,
+        };
+        args.validate()?;
+        Ok(args)
+    }
+}
+
+fn deepseek_layer_schedule(
+    num_hidden_layers: i32,
+    first_k_dense_replace: i32,
+    moe_layer_freq: i32,
+) -> Result<LayerSchedule<LayerPolicy>, Error> {
+    let layer_count = usize::try_from(num_hidden_layers).map_err(|_| {
+        Error::UnsupportedArchitecture(format!(
+            "DeepSeek-V3 num_hidden_layers must be positive, got {num_hidden_layers}"
+        ))
+    })?;
+    if layer_count == 0 {
+        return Err(Error::UnsupportedArchitecture(
+            "DeepSeek-V3 num_hidden_layers must be positive, got 0".into(),
+        ));
+    }
+    if first_k_dense_replace < 0 || first_k_dense_replace > num_hidden_layers {
+        return Err(Error::UnsupportedArchitecture(format!(
+            "DeepSeek-V3 first_k_dense_replace must be between zero and num_hidden_layers, got {first_k_dense_replace}"
+        )));
+    }
+    if moe_layer_freq <= 0 {
+        return Err(Error::UnsupportedArchitecture(format!(
+            "DeepSeek-V3 moe_layer_freq must be positive, got {moe_layer_freq}"
+        )));
+    }
+    LayerSchedule::new(
+        layer_count,
+        (0..layer_count)
+            .map(|layer| {
+                if layer as i32 >= first_k_dense_replace && layer as i32 % moe_layer_freq == 0 {
+                    LayerPolicy::SparseMoe
+                } else {
+                    LayerPolicy::DenseMlp
+                }
+            })
+            .collect(),
+    )
+    .map_err(|error| Error::UnsupportedArchitecture(format!("DeepSeek-V3 {error}")))
+}
+
 impl ModelArgs {
     pub(crate) fn validate(&self) -> Result<(), Error> {
         if self.model_type != "deepseek_v3" {
@@ -365,10 +528,14 @@ impl ModelArgs {
                 "DeepSeek-V3 q_lora_rank must be positive or null".into(),
             ));
         }
-        if self.moe_layer_freq <= 0
-            || self.first_k_dense_replace < 0
-            || self.first_k_dense_replace > self.num_hidden_layers
-            || self.n_routed_experts <= 0
+        if self.layer_schedule.len() != self.num_hidden_layers as usize {
+            return Err(Error::UnsupportedArchitecture(format!(
+                "DeepSeek-V3 layer schedule has {} entries for {} decoder layers",
+                self.layer_schedule.len(),
+                self.num_hidden_layers
+            )));
+        }
+        if self.n_routed_experts <= 0
             || self.n_shared_experts <= 0
             || self.num_experts_per_tok <= 0
             || self.num_experts_per_tok > self.n_routed_experts
@@ -425,8 +592,21 @@ impl ModelArgs {
         Ok(())
     }
 
-    pub(crate) fn is_moe_layer(&self, layer: i32) -> bool {
-        layer >= self.first_k_dense_replace && layer % self.moe_layer_freq == 0
+    /// Returns one validated layer policy without an out-of-range fallback.
+    pub fn layer_policy(&self, layer: usize) -> Option<&LayerPolicy> {
+        self.layer_schedule.get(layer)
+    }
+
+    /// Returns a stable ordered representation of the complete layer schedule.
+    pub fn layer_schedule_fingerprint(&self) -> String {
+        self.layer_schedule
+            .iter()
+            .map(|policy| match policy {
+                LayerPolicy::DenseMlp => "d",
+                LayerPolicy::SparseMoe => "e",
+            })
+            .collect::<Vec<_>>()
+            .join(",")
     }
 
     pub(crate) fn native_fp8_config(&self) -> Option<&Fp8QuantizationConfig> {
@@ -541,11 +721,7 @@ pub(crate) fn prompt_cache_architecture_fingerprint(args: &ModelArgs) -> String 
             ("qk_nope_head_dim", args.qk_nope_head_dim.to_string()),
             ("qk_rope_head_dim", args.qk_rope_head_dim.to_string()),
             ("v_head_dim", args.v_head_dim.to_string()),
-            (
-                "first_k_dense_replace",
-                args.first_k_dense_replace.to_string(),
-            ),
-            ("moe_layer_freq", args.moe_layer_freq.to_string()),
+            ("layer_schedule", args.layer_schedule_fingerprint()),
             ("n_routed_experts", args.n_routed_experts.to_string()),
             ("n_shared_experts", args.n_shared_experts.to_string()),
             ("num_experts_per_tok", args.num_experts_per_tok.to_string()),
@@ -585,36 +761,35 @@ pub struct Cache {
 }
 
 impl Cache {
-    pub(crate) fn new(num_layers: i32) -> Self {
+    pub(crate) fn new(layer_schedule: &LayerSchedule<LayerPolicy>) -> Self {
         Self {
-            layers: (0..num_layers)
+            layers: layer_schedule
+                .iter()
                 .map(|_| CompressedLatentCache::new())
                 .collect(),
         }
     }
 
     pub(crate) fn new_with_options(
-        num_layers: i32,
+        layer_schedule: &LayerSchedule<LayerPolicy>,
         policy: CacheResidencyPolicy,
     ) -> Result<Self, Exception> {
         match policy {
-            CacheResidencyPolicy::Device => Ok(Self::new(num_layers)),
+            CacheResidencyPolicy::Device => Ok(Self::new(layer_schedule)),
             CacheResidencyPolicy::Paged(options) => {
                 let manager = CacheResidencyManager::new(options)
                     .map_err(|error| Exception::custom(error.to_string()))?;
-                Self::new_with_manager(num_layers, manager, None)
+                Self::new_with_manager(layer_schedule, manager, None)
             }
         }
     }
 
     fn new_with_manager(
-        num_layers: i32,
+        layer_schedule: &LayerSchedule<LayerPolicy>,
         manager: CacheResidencyManager,
         rank: Option<CacheRankIdentity>,
     ) -> Result<Self, Exception> {
-        let layer_count = usize::try_from(num_layers)
-            .map_err(|_| Exception::custom("invalid DeepSeek cache layer count"))?;
-        let layers = (0..layer_count)
+        let layers = (0..layer_schedule.len())
             .map(|layer| CompressedLatentCache::new_paged(manager.clone(), layer, rank))
             .collect::<Result<Vec<_>, _>>()?;
         Ok(Self { layers })
@@ -665,7 +840,7 @@ impl Cache {
 
     /// Catalogs compatible compressed prefix blocks without eager array loading.
     pub(crate) fn load_prompt_cache(
-        num_layers: i32,
+        layer_schedule: &LayerSchedule<LayerPolicy>,
         directory: impl AsRef<Path>,
         expected: &PromptCacheDescriptor,
         model: &PromptCacheModelIdentity,
@@ -675,7 +850,10 @@ impl Cache {
         let (manager, manifest) =
             open_prompt_cache(directory, expected, model, prefix_token_ids, options)
                 .map_err(|error| Exception::custom(error.to_string()))?;
-        Ok((Self::new_with_manager(num_layers, manager, None)?, manifest))
+        Ok((
+            Self::new_with_manager(layer_schedule, manager, None)?,
+            manifest,
+        ))
     }
 }
 
@@ -2175,15 +2353,18 @@ impl ModuleParameters for FeedForward {
 
 impl FeedForward {
     fn new(args: &ModelArgs, layer: i32, stream: &Stream) -> Result<Self, Exception> {
-        if args.is_moe_layer(layer) {
-            Ok(Self::Moe(Box::new(Moe::new(args, layer, stream)?)))
-        } else {
-            Ok(Self::Dense(Box::new(Mlp::new(
+        let index = usize::try_from(layer)
+            .ok()
+            .and_then(|index| args.layer_policy(index))
+            .ok_or_else(|| Exception::custom("DeepSeek-V3 decoder layer is out of range"))?;
+        match index {
+            LayerPolicy::SparseMoe => Ok(Self::Moe(Box::new(Moe::new(args, layer, stream)?))),
+            LayerPolicy::DenseMlp => Ok(Self::Dense(Box::new(Mlp::new(
                 args,
                 &format!("model.layers.{layer}.mlp"),
                 args.intermediate_size,
                 stream,
-            )?)))
+            )?))),
         }
     }
 
@@ -2502,8 +2683,11 @@ impl TextModel {
                 args.weight_quantization_for("model.embed_tokens.weight"),
                 stream,
             )?,
-            layers: (0..args.num_hidden_layers)
-                .map(|layer| DecoderLayer::new(args, layer, stream))
+            layers: args
+                .layer_schedule
+                .iter()
+                .enumerate()
+                .map(|(layer, _)| DecoderLayer::new(args, layer as i32, stream))
                 .collect::<Result<_, _>>()?,
             norm: nn::RmsNorm::unloaded(
                 args.hidden_size,
@@ -2604,6 +2788,8 @@ pub struct Model {
 impl Model {
     /// Creates an unloaded model.
     pub fn new(args: ModelArgs, stream: &Stream) -> Result<Self, Exception> {
+        args.validate()
+            .map_err(|error| Exception::custom(error.to_string()))?;
         Ok(Self {
             model: TextModel::new(&args, stream)?,
             lm_head: common::linear::unloaded_maybe_quantized_linear(
@@ -2619,12 +2805,12 @@ impl Model {
 
     /// Returns an empty compressed cache.
     pub fn new_cache(&self) -> Cache {
-        Cache::new(self.args.num_hidden_layers)
+        Cache::new(&self.args.layer_schedule)
     }
 
     /// Creates a device-resident or explicitly bounded paged compressed cache.
     pub fn new_cache_with_options(&self, policy: CacheResidencyPolicy) -> Result<Cache, Exception> {
-        Cache::new_with_options(self.args.num_hidden_layers, policy)
+        Cache::new_with_options(&self.args.layer_schedule, policy)
     }
 
     pub(crate) fn new_cache_with_manager(
@@ -2632,7 +2818,7 @@ impl Model {
         manager: CacheResidencyManager,
         rank: Option<CacheRankIdentity>,
     ) -> Result<Cache, Exception> {
-        Cache::new_with_manager(self.args.num_hidden_layers, manager, rank)
+        Cache::new_with_manager(&self.args.layer_schedule, manager, rank)
     }
 
     /// Lazily catalogs a compatible persisted compressed prefix.
@@ -2643,8 +2829,7 @@ impl Model {
         prefix_token_ids: &[u32],
         options: PagedCacheOptions,
     ) -> Result<(Cache, PromptCacheManifest), Exception> {
-        let layer_count = usize::try_from(self.args.num_hidden_layers)
-            .map_err(|_| Exception::custom("invalid DeepSeek cache layer count"))?;
+        let layer_count = self.args.layer_schedule.len();
         let identity = PromptCacheModelIdentity {
             model_family: "deepseek_v3".into(),
             effective_model_type: self.args.model_type.clone(),
@@ -2664,7 +2849,7 @@ impl Model {
         validate_prompt_cache_model_identity(expected, &identity)
             .map_err(|error| Exception::custom(error.to_string()))?;
         Cache::load_prompt_cache(
-            self.args.num_hidden_layers,
+            &self.args.layer_schedule,
             directory,
             expected,
             &identity,
@@ -2882,10 +3067,10 @@ pub type Generate<'a, S = crate::runtime::generation::sampler::DefaultSampler> =
     common::generation::Generate<'a, Model, Cache, S>;
 
 fn parse_config_value(value: Value) -> Result<ModelArgs, Error> {
-    let args: ModelArgs = serde_json::from_value(value.clone()).map_err(|error| {
+    let source: ModelArgsSource = serde_json::from_value(value.clone()).map_err(|error| {
         Error::UnsupportedArchitecture(format!("invalid DeepSeek-V3 config: {error}"))
     })?;
-    args.validate()?;
+    let args = source.normalize()?;
     if value
         .get("architectures")
         .and_then(Value::as_array)
@@ -2946,7 +3131,7 @@ fn parse_config_value(value: Value) -> Result<ModelArgs, Error> {
 
 /// Parses the same validated architecture arguments used by loading without
 /// opening a model directory or constructing an MLX module tree.
-pub(crate) fn model_args_from_config_value(config: &Value) -> Result<ModelArgs, Error> {
+pub fn model_args_from_config_value(config: &Value) -> Result<ModelArgs, Error> {
     parse_config_value(config.clone())
 }
 
@@ -3133,8 +3318,8 @@ fn expert_affine_quantization(
 
 fn expected_expert_banks(args: &ModelArgs) -> Vec<ExpertBankKey> {
     let mut expected = Vec::new();
-    for layer in 0..args.num_hidden_layers {
-        if !args.is_moe_layer(layer) {
+    for (layer, policy) in args.layer_schedule.iter().enumerate() {
+        if *policy != LayerPolicy::SparseMoe {
             continue;
         }
         for projection in [
@@ -3143,21 +3328,19 @@ fn expected_expert_banks(args: &ModelArgs) -> Vec<ExpertBankKey> {
             ExpertProjection::Down,
         ] {
             expected.push(ExpertBankKey {
-                layer: layer as usize,
+                layer,
                 projection,
                 component: ExpertComponent::Weight,
             });
             if args.native_fp8_config().is_some() {
                 expected.push(ExpertBankKey {
-                    layer: layer as usize,
+                    layer,
                     projection,
                     component: ExpertComponent::Fp8Scale,
                 });
-            } else if let Some(affine) =
-                expert_affine_quantization(args, layer as usize, projection)
-            {
+            } else if let Some(affine) = expert_affine_quantization(args, layer, projection) {
                 expected.push(ExpertBankKey {
-                    layer: layer as usize,
+                    layer,
                     projection,
                     component: ExpertComponent::AffineScales,
                 });
@@ -3243,7 +3426,7 @@ fn load_model_impl(
     for file in safetensors_files(model_dir)? {
         for_each_safetensor_array(file, weights_stream, |key, value| {
             if let Some((bank, expert)) = parse_expert_key(&key) {
-                if bank.layer >= args.num_hidden_layers as usize {
+                if bank.layer >= args.layer_schedule.len() {
                     report.record_unused(key);
                     return Ok(());
                 }
@@ -3609,7 +3792,7 @@ fn args_from_gguf(
             "DeepSeek GGUF expert_gating_func {gating} is unsupported; expected sigmoid (2)"
         )));
     }
-    Ok(ModelArgs {
+    ModelArgsSource {
         model_type: "deepseek_v3".into(),
         hidden_size: gguf_i32(metadata, &key("embedding_length"))?,
         intermediate_size: gguf_i32(metadata, &key("feed_forward_length"))?,
@@ -3651,7 +3834,8 @@ fn args_from_gguf(
         quantized_weight_configs: None,
         split_kv_b: arrays.any_gguf_tensor(|name| name.contains(".attn_k_b.")),
         tie_word_embeddings: false,
-    })
+    }
+    .normalize()
 }
 
 pub(crate) fn translate_gguf_weight_name(name: &str) -> String {
@@ -3798,7 +3982,11 @@ pub fn load_tokenizer(model_dir: impl AsRef<Path>) -> Result<Tokenizer, Error> {
 
 #[cfg(test)]
 mod tests {
-    use super::{load_model, parse_config_value, FeedForward, Model, ModelArgs, ModelInput};
+    use super::{
+        deepseek_layer_schedule, load_model, parse_config_value,
+        prompt_cache_architecture_fingerprint, Cache, FeedForward, LayerPolicy, Model, ModelArgs,
+        ModelInput,
+    };
     use crate::{
         api::{LoadedModel, ModelKind},
         error::Error,
@@ -4266,6 +4454,12 @@ mod tests {
         assert_eq!(args.q_lora_rank, Some(1536));
         assert_eq!(args.num_nextn_predict_layers, 1);
         assert_eq!(
+            args.layer_schedule.iter().copied().collect::<Vec<_>>(),
+            std::iter::repeat_n(LayerPolicy::DenseMlp, 3)
+                .chain(std::iter::repeat_n(LayerPolicy::SparseMoe, 58))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
             crate::api::check_model_config(&value),
             crate::api::ModelConfigSupport::Supported(crate::api::SupportedModelConfig {
                 kind: ModelKind::DeepSeekV3,
@@ -4273,6 +4467,91 @@ mod tests {
                 effective_model_type: "deepseek_v3".into(),
             })
         );
+    }
+
+    #[test]
+    fn hf_dense_prefix_and_frequency_normalize_once_into_ordered_policy() {
+        let schedule = deepseek_layer_schedule(6, 1, 2).unwrap();
+        assert_eq!(
+            schedule.iter().copied().collect::<Vec<_>>(),
+            vec![
+                LayerPolicy::DenseMlp,
+                LayerPolicy::DenseMlp,
+                LayerPolicy::SparseMoe,
+                LayerPolicy::DenseMlp,
+                LayerPolicy::SparseMoe,
+                LayerPolicy::DenseMlp,
+            ]
+        );
+        assert!(deepseek_layer_schedule(0, 0, 1).is_err());
+        assert!(deepseek_layer_schedule(2, -1, 1).is_err());
+        assert!(deepseek_layer_schedule(2, 3, 1).is_err());
+        assert!(deepseek_layer_schedule(2, 1, 0).is_err());
+    }
+
+    #[test]
+    fn arbitrary_internal_schedule_drives_layers_cache_and_identity_exactly() {
+        let mut first = tiny_args(Some(4));
+        first.num_hidden_layers = 4;
+        first.layer_schedule = crate::runtime::attention::LayerSchedule::new(
+            4,
+            vec![
+                LayerPolicy::SparseMoe,
+                LayerPolicy::DenseMlp,
+                LayerPolicy::SparseMoe,
+                LayerPolicy::DenseMlp,
+            ],
+        )
+        .unwrap();
+        first.validate().unwrap();
+        let mut second = first.clone();
+        second.layer_schedule = crate::runtime::attention::LayerSchedule::new(
+            4,
+            vec![
+                LayerPolicy::DenseMlp,
+                LayerPolicy::SparseMoe,
+                LayerPolicy::SparseMoe,
+                LayerPolicy::DenseMlp,
+            ],
+        )
+        .unwrap();
+        second.validate().unwrap();
+
+        assert_eq!(first.layer_schedule_fingerprint(), "e,d,e,d");
+        assert_ne!(
+            prompt_cache_architecture_fingerprint(&first),
+            prompt_cache_architecture_fingerprint(&second)
+        );
+        assert_eq!(Cache::new(&first.layer_schedule).layers.len(), 4);
+    }
+
+    #[test]
+    fn inspection_and_loading_reject_invalid_hf_schedule_with_the_same_diagnostic() {
+        let mut value = tiny_config_value(Some(4));
+        value["moe_layer_freq"] = json!(0);
+        let loading = parse_config_value(value.clone()).unwrap_err().to_string();
+        let inspection = crate::api::check_model_config(&value)
+            .unsupported_reason()
+            .unwrap()
+            .to_string();
+        assert_eq!(inspection, loading);
+        assert!(loading.contains("moe_layer_freq must be positive"));
+    }
+
+    #[test]
+    fn arbitrary_internal_schedule_constructs_the_declared_feed_forward_operators() {
+        let context = test_context();
+        let stream = context.stream();
+        let mut args = tiny_args(Some(4));
+        args.layer_schedule = crate::runtime::attention::LayerSchedule::new(
+            2,
+            vec![LayerPolicy::SparseMoe, LayerPolicy::DenseMlp],
+        )
+        .unwrap();
+        args.validate().unwrap();
+        let model = Model::new(args, stream).unwrap();
+        assert!(matches!(model.model.layers[0].mlp, FeedForward::Moe(_)));
+        assert!(matches!(model.model.layers[1].mlp, FeedForward::Dense(_)));
     }
 
     #[test]
@@ -4941,6 +5220,15 @@ mod tests {
         let metadata = gguf_metadata();
         let dense_fixture = crate::test_utils::SyntheticGguf::dense(&arrays, &metadata);
         let mut dense = super::load_gguf(dense_fixture.path(), stream, stream).unwrap();
+        assert_eq!(
+            dense
+                .args
+                .layer_schedule
+                .iter()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![LayerPolicy::DenseMlp, LayerPolicy::SparseMoe]
+        );
         let logits = dense
             .forward(
                 ModelInput {

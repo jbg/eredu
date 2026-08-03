@@ -47,7 +47,7 @@ use crate::{
     },
 };
 
-use super::model::{self as resident, Cache, DecoderLayer, ModelArgs};
+use super::model::{self as resident, Cache, DecoderLayer, FeedForwardPolicy, ModelArgs};
 
 const EMBEDDING_UNIT: &str = "kimi_linear.static.embedding";
 const NORM_UNIT: &str = "kimi_linear.static.norm";
@@ -510,17 +510,16 @@ impl KimiLinearLayerwiseAdapter {
                     recipe = DerivedWeightRecipe::Reshape {
                         input: Box::new(recipe),
                         shape: vec![
-                            (self.args.linear_attn_config.num_heads
-                                * self.args.linear_attn_config.head_dim)
+                            (self.args.kda_config.num_heads * self.args.kda_config.head_dim)
                                 as usize,
                             1,
-                            self.args.linear_attn_config.short_conv_kernel_size as usize,
+                            self.args.kda_config.short_conv_kernel_size as usize,
                         ],
                     };
                 } else if local_name.ends_with("A_log") {
                     recipe = DerivedWeightRecipe::Reshape {
                         input: Box::new(recipe),
-                        shape: vec![1, 1, self.args.linear_attn_config.num_heads as usize, 1],
+                        shape: vec![1, 1, self.args.kda_config.num_heads as usize, 1],
                     };
                     if gguf {
                         recipe = DerivedWeightRecipe::NegLog {
@@ -693,14 +692,7 @@ impl GeneralLayerwiseModelAdapter for KimiLinearLayerwiseAdapter {
         if cache.layers.is_empty() {
             *cache = Cache::new(&self.args);
         }
-        if cache.layers.len() != self.args.num_hidden_layers as usize {
-            return Err(Error::UnsupportedArchitecture(format!(
-                "Kimi Linear cache has {} layers, expected {}",
-                cache.layers.len(),
-                self.args.num_hidden_layers
-            )));
-        }
-        Ok(())
+        cache.validate(&self.args.layer_schedule)
     }
 
     fn begin_forward<'a>(
@@ -742,7 +734,7 @@ impl GeneralLayerwiseModelAdapter for KimiLinearLayerwiseAdapter {
 
     fn layer_count(&self, group: usize) -> Result<usize, Error> {
         if group == 0 {
-            Ok(self.args.num_hidden_layers as usize)
+            Ok(self.args.layer_schedule.len())
         } else {
             Err(Error::UnsupportedArchitecture(format!(
                 "Kimi Linear decoder has no execution group {group}"
@@ -829,7 +821,12 @@ impl GeneralLayerwiseModelAdapter for KimiLinearLayerwiseAdapter {
         stream: &Stream,
     ) -> Result<Array, Error> {
         self.layer_count(group)?;
-        if self.sparse_expert_cache && self.args.is_moe_layer(index) {
+        let policy = self.args.layer_policy(index).ok_or_else(|| {
+            Error::UnsupportedArchitecture(format!(
+                "Kimi Linear layer schedule has no policy for layer {index}"
+            ))
+        })?;
+        if self.sparse_expert_cache && policy.feed_forward == FeedForwardPolicy::SparseMoe {
             let expert_cache = self.expert_cache.as_ref().ok_or_else(|| {
                 Error::UnsupportedArchitecture(
                     "Kimi Linear sparse expert cache was not initialized".into(),
@@ -964,8 +961,8 @@ pub(crate) fn kimi_expert_catalog(
 ) -> Result<Vec<ExpertCatalogEntry>, Error> {
     let normalized = normalized_checkpoint_keys(store);
     let mut entries = Vec::new();
-    for layer in 0..args.num_hidden_layers as usize {
-        if !args.is_moe_layer(layer) {
+    for (layer, policy) in args.layer_schedule.iter().enumerate() {
+        if policy.feed_forward != FeedForwardPolicy::SparseMoe {
             continue;
         }
         let prefix = format!("model.layers.{layer}.mlp.experts");
@@ -1154,7 +1151,9 @@ mod tests {
     };
     use crate::{
         api::ModelKind,
-        architectures::kimi_linear::model::{load_model, parse_config_value, Model, ModelInput},
+        architectures::kimi_linear::model::{
+            load_model, model_args_from_config_value, Model, ModelInput,
+        },
         runtime::{
             checkpoint::store::{SafetensorsWeightStore, WeightStore},
             execution::layerwise::LayerwiseLoadOptions,
@@ -1250,9 +1249,8 @@ mod tests {
                 value
                     .reshape(
                         &[
-                            model.args.linear_attn_config.num_heads
-                                * model.args.linear_attn_config.head_dim,
-                            model.args.linear_attn_config.short_conv_kernel_size,
+                            model.args.kda_config.num_heads * model.args.kda_config.head_dim,
+                            model.args.kda_config.short_conv_kernel_size,
                         ],
                         stream,
                     )
@@ -1340,7 +1338,11 @@ mod tests {
     fn sparse_cache_and_rank_owned_ep_load_official_split_experts() {
         let gpu = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
         let cpu = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
-        let fixture = Model::new(parse_config_value(tiny_config()).unwrap(), gpu.stream()).unwrap();
+        let fixture = Model::new(
+            model_args_from_config_value(&tiny_config()).unwrap(),
+            gpu.stream(),
+        )
+        .unwrap();
         let directory = tempfile::tempdir().unwrap();
         write_official_style_fixture(directory.path(), &fixture, gpu.stream());
 

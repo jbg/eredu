@@ -834,7 +834,12 @@ fn deepseek_spec(args: &deepseek_v3::ModelArgs) -> Result<Spec, CapabilityError>
         })
         .transpose()?
         .unwrap_or(effective);
-    let layers = positive(args.num_hidden_layers, "num_hidden_layers")?;
+    let layers = u64::try_from(args.layer_schedule.len()).map_err(|_| {
+        CapabilityError::InvalidConfiguration {
+            field: "layer_schedule",
+            detail: "decoder layer count exceeds runtime-state accounting range".into(),
+        }
+    })?;
     let latent = positive(args.kv_lora_rank, "kv_lora_rank")?;
     let rotary = positive(args.qk_rope_head_dim, "qk_rope_head_dim")?;
     let width = checked_add(latent, rotary, "MLA latent plus rotary width")?;
@@ -870,22 +875,20 @@ fn deepseek_spec(args: &deepseek_v3::ModelArgs) -> Result<Spec, CapabilityError>
 
 fn kimi_linear_spec(args: &kimi_linear::ModelArgs) -> Result<Spec, CapabilityError> {
     let context = plain_context(args.model_max_length)?;
-    let attention = args.linear_attn_config.full_attn_layers.len() as u64;
-    let recurrent = args.linear_attn_config.kda_layers.len() as u64;
-    let heads = positive(
-        args.linear_attn_config.num_heads,
-        "linear_attn_config.num_heads",
-    )?;
-    let head_dim = positive(
-        args.linear_attn_config.head_dim,
-        "linear_attn_config.head_dim",
-    )?;
+    let attention = args
+        .layer_schedule
+        .iter()
+        .filter(|policy| policy.attention == kimi_linear::AttentionKind::Mla)
+        .count() as u64;
+    let recurrent = args.layer_schedule.len() as u64 - attention;
+    let heads = positive(args.kda_config.num_heads, "kda_config.num_heads")?;
+    let head_dim = positive(args.kda_config.head_dim, "kda_config.head_dim")?;
     let projection = checked_mul(heads, head_dim, "KDA projected width")?;
     let conv_state = checked_mul(
         checked_mul(
             positive(
-                args.linear_attn_config.short_conv_kernel_size - 1,
-                "linear_attn_config.short_conv_kernel_size",
+                args.kda_config.short_conv_kernel_size - 1,
+                "kda_config.short_conv_kernel_size",
             )?,
             projection,
             "KDA convolution history width",
@@ -3503,19 +3506,19 @@ mod tests {
 
     #[test]
     fn kimi_linear_accounts_for_bounded_kda_and_growing_mla_state() {
-        let args = kimi_linear::parse_config_value(json!({
+        let args = kimi_linear::model_args_from_config_value(&json!({
             "model_type": "kimi_linear",
             "vocab_size": 64,
             "hidden_size": 8,
-            "num_hidden_layers": 2,
+            "num_hidden_layers": 4,
             "num_attention_heads": 2,
             "num_key_value_heads": 2,
             "intermediate_size": 16,
             "head_dim": 4,
             "model_max_length": 128,
             "linear_attn_config": {
-                "kda_layers": [1],
-                "full_attn_layers": [2],
+                "kda_layers": [1, 3],
+                "full_attn_layers": [2, 4],
                 "num_heads": 2,
                 "head_dim": 4,
                 "short_conv_kernel_size": 2
@@ -3540,15 +3543,15 @@ mod tests {
         assert_eq!(
             strategy,
             CacheStateStrategy::HybridRecurrent {
-                full_attention_layers: 1,
+                full_attention_layers: 2,
                 sliding_attention: Vec::new(),
-                recurrent_layers: 1,
+                recurrent_layers: 2,
             }
         );
         assert_eq!(modalities, InputModalities::TEXT);
-        assert_eq!(estimate.fixed_scalars_per_batch, 56);
+        assert_eq!(estimate.fixed_scalars_per_batch, 112);
         assert_eq!(estimate.growing.len(), 1);
-        assert_eq!(estimate.growing[0].layers, 1);
+        assert_eq!(estimate.growing[0].layers, 2);
         assert_eq!(estimate.growing[0].scalars_per_position, 6);
         assert_eq!(estimate.allocation_granularity, 256);
     }

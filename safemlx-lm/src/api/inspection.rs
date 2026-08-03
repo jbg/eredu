@@ -6306,6 +6306,38 @@ mod tests {
     }
 
     #[test]
+    fn kimi_schedule_rejections_match_inspection_and_load_preflight() {
+        for mutate in [
+            |config: &mut Value| config["linear_attn_config"]["full_attn_layers"] = json!([]),
+            |config: &mut Value| config["linear_attn_config"]["full_attn_layers"] = json!([1]),
+            |config: &mut Value| config["linear_attn_config"]["kda_layers"] = json!("invalid"),
+            |config: &mut Value| config["first_k_dense_replace"] = json!(-1),
+            |config: &mut Value| config["first_k_dense_replace"] = json!(3),
+            |config: &mut Value| config["moe_layer_freq"] = json!(0),
+        ] {
+            let directory = write_complete_kimi_linear_safetensors_dir(false, |_| {});
+            let mut config = kimi_linear_config();
+            mutate(&mut config);
+            std::fs::write(
+                directory.path().join("config.json"),
+                serde_json::to_vec(&config).unwrap(),
+            )
+            .unwrap();
+
+            let report =
+                inspect_model(directory.path(), ModelInspectionOptions::default()).unwrap();
+            assert_eq!(report.model_loadability, InspectionReadiness::Invalid);
+            assert!(!report.is_loadable());
+            assert!(structural::validate_safetensors_load_path(
+                ModelKind::KimiLinear,
+                directory.path(),
+                ModelLoadOptions::default(),
+            )
+            .is_err());
+        }
+    }
+
+    #[test]
     fn complete_poisoned_kimi_linear_gguf_catalog_is_exact_without_reading_transition_values() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("kimi-linear.gguf");
@@ -7589,6 +7621,35 @@ mod tests {
         assert_eq!(report.structural_binding, InspectionReadiness::Ready);
         assert_eq!(report.model_loadability, InspectionReadiness::Ready);
         assert!(report.is_loadable());
+    }
+
+    #[test]
+    fn deepseek_schedule_rejections_match_inspection_and_load_preflight() {
+        for mutate in [
+            |config: &mut Value| config["first_k_dense_replace"] = json!(-1),
+            |config: &mut Value| config["first_k_dense_replace"] = json!(3),
+            |config: &mut Value| config["moe_layer_freq"] = json!(0),
+        ] {
+            let directory = write_complete_deepseek_v3_safetensors_dir(false, |_| {});
+            let mut config = deepseek_v3_config(false);
+            mutate(&mut config);
+            std::fs::write(
+                directory.path().join("config.json"),
+                serde_json::to_vec(&config).unwrap(),
+            )
+            .unwrap();
+
+            let report =
+                inspect_model(directory.path(), ModelInspectionOptions::default()).unwrap();
+            assert_eq!(report.model_loadability, InspectionReadiness::Invalid);
+            assert!(!report.is_loadable());
+            assert!(structural::validate_safetensors_load_path(
+                ModelKind::DeepSeekV3,
+                directory.path(),
+                ModelLoadOptions::default(),
+            )
+            .is_err());
+        }
     }
 
     #[test]
