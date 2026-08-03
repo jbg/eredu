@@ -315,14 +315,43 @@ ignored just as they are by the eager text-model loader.
 
 ## Inkling weight residency
 
-Inkling local and global attention blocks share one text-decoder window. Global
-and sliding KV arrays plus all four short-convolution states per block are
-evaluated before lease release. Released `model.llm` names are rewritten, short
-convolution weights are cast to the runtime dtype, and interleaved dense, routed,
-and shared `w13` tensors are selected into runtime gate/up order on the host.
-The dMel encoder is a pinned static unit, while the four released hMLP
+Inkling normalizes its orthogonal attention and feed-forward choices into
+`LayerSchedule<inkling::model::LayerPolicy>`. Every ordered entry contains an
+exact `AttentionPolicy` plus `FeedForwardPolicy::{Dense, SparseMoe}`. Hugging
+Face `local_layer_ids` and exact `layer_types` are accepted as equivalent
+attention sources and must agree when both occur; absent either form, the
+released five-sliding/one-full cadence applies. `mlp_layer_types` and
+`dense_mlp_idx` similarly normalize the feed-forward topology and must agree
+when both occur. GGUF consumes the exact Boolean
+`inkling.attention.sliding_window_pattern`, its positive shared window, and
+`inkling.dense_block_count`; a missing pattern uses the same released cadence.
+Arbitrary Boolean ordering is supported; malformed patterns, invalid indices or
+entries, conflicts, and invalid windows fail in inspection and load preflight.
+
+Resident, layerwise, dense-streamed, ordinary-cache, paged-cache,
+expert-parallel, structural, fingerprint, and memory-accounting paths consume
+only the normalized schedule. Internally constructed schedules may use
+distinct windows even though current Inkling checkpoint metadata supplies one.
+A window of `N` includes the current token: ordinary caches retain `N - 1` past
+positions and paged caches enforce the same bound over their backing allocation.
+Global and sliding KV arrays plus all four short-convolution states per block
+are evaluated before lease release. Released `model.llm` names are rewritten,
+short-convolution weights are cast to the runtime dtype, and interleaved dense,
+routed, and shared `w13` tensors are selected into runtime gate/up order on the
+host. The dMel encoder is a pinned static unit, while the four released hMLP
 projection/fold layers use an independent vision window. Typed prompts may
-interleave text, discrete audio, precomputed media embeddings, and image patches.
+interleave text, discrete audio, precomputed media embeddings, and image
+patches.
+
+Normalized Inkling `ModelArgs`/`TextArgs` are no longer directly deserializable
+and no longer expose raw layer lists, thresholds, or the model-wide window.
+JSON callers use `inkling::model::model_args_from_config_value` and query
+`TextArgs::layer_policy` or `layer_schedule`; the old `is_local` and `is_dense`
+queries were removed. The complete ordered schedule participates in
+architecture identity. Persisted Inkling prompt caches remain unsupported
+because the schema does not encode its multimodal prefix and short-convolution
+state. Tensor and pipeline parallel Inkling remain unsupported; supported
+expert parallelism derives sparse layers and cache policies from the schedule.
 
 ## Nemotron-H weight residency
 

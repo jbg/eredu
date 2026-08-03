@@ -90,6 +90,12 @@ attention geometry. Explicit Hugging Face full/sliding layer lists and the
 published alternating fallback normalize once, then drive resident, bounded,
 paged, expert-parallel, fingerprint, and state-accounting paths without a raw
 configuration fallback.
+Inkling uses `LayerSchedule<architectures::inkling::model::LayerPolicy>` for
+its two independent per-layer choices: exact full/sliding attention and
+dense/sparse-MoE feed-forward execution. Hugging Face layer lists or indices
+and GGUF Boolean attention patterns normalize once into that ordered schedule;
+resident, bounded, paged-cache, structural, expert-parallel, fingerprint, and
+memory-accounting paths all consume it without threshold-based fallbacks.
 
 ## Platforms
 

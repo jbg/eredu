@@ -201,7 +201,9 @@ must explicitly define its context, modalities, and state layout.
   no persistent decoder state.
 - Qwen3-Next and Qwen3.5 separate recurrent linear-attention state from
   full-attention KV.
-- Inkling accounts for global/sliding KV and bounded convolution state.
+- Inkling groups full-context and every distinct scheduled sliding window using
+  their respective KV-head geometry, then adds four bounded convolution states
+  per decoder layer.
 - Prepared Gemma 4, Inkling, Qwen3-VL, and multimodal Qwen3.5 inputs derive
   model positions from processor output geometry or masks, not a
   tokens-per-image constant.
@@ -341,6 +343,49 @@ closed because prompt-cache schema v2 stores only one model-wide window.
 Normalized `ModelArgs` no longer implements `Deserialize` or exposes raw
 `layer_types`/`sliding_window`; JSON callers use
 `architectures::gpt_oss::model::model_args_from_config_value`.
+
+Inkling normalizes both decoder choices into
+`LayerSchedule<architectures::inkling::model::LayerPolicy>`. Each ordered entry
+contains an `AttentionPolicy` and a `FeedForwardPolicy::{Dense, SparseMoe}`.
+For Hugging Face configuration, `local_layer_ids` and exact-length
+`layer_types` (`sliding_attention` or `full_attention`) are equivalent sources;
+if both are present they must agree. When neither is present, the released
+five-sliding/one-full cadence is used. Likewise, exact-length
+`mlp_layer_types` (`dense` or `moe`) and `dense_mlp_idx` must agree when both
+are present; otherwise the supplied form, or the released all-MoE default, is
+normalized once. Invalid indices, duplicates, entries, counts, conflicts, and
+non-positive or overflowing windows fail before weight materialization.
+
+GGUF's `inkling.attention.sliding_window_pattern` is read as an exact Boolean
+array in decoder order and combined with its one positive window;
+`inkling.dense_block_count` supplies the dense feed-forward prefix. Arbitrary
+attention ordering is supported. When the pattern is absent, the same released
+five-sliding/one-full cadence is used. Wrong pattern encodings, length
+mismatches, inconsistent per-policy KV-head geometry, invalid windows, and
+impossible dense counts fail closed. The
+checkpoint formats currently provide one shared sliding window, but internal
+schedules and cache tests support distinct windows.
+
+Resident, layerwise-host, dense-streamed, ordinary-cache, paged-cache,
+generation, structural, expert-parallel, fingerprint, and runtime-state paths
+consume only this schedule. A sliding window of `N` includes the current token,
+so ordinary caches retain at most `N - 1` past positions while paged caches use
+the same attention bound over their backing allocation. Runtime reporting
+groups every distinct window and accounts separately for full-context KV,
+bounded sliding KV, batch/context growth, and four bounded short-convolution
+states per layer. The complete ordered attention/feed-forward schedule is in
+the architecture fingerprint. Persisted Inkling prompt caches remain
+unsupported because the persistence schema does not represent its multimodal
+prefix and short-convolution state. Tensor and pipeline parallel Inkling remain
+unsupported; expert-parallel preflight and cache creation use the exact
+schedule.
+
+This is a breaking API migration: normalized `ModelArgs` and `TextArgs` no
+longer implement `Deserialize` or expose `local_layer_ids`, `layer_types`,
+`sliding_window_size`, `dense_mlp_idx`, or `mlp_layer_types`. The fallback
+queries `is_local` and `is_dense` were removed. JSON callers use
+`architectures::inkling::model::model_args_from_config_value`, then query
+`TextArgs::layer_policy` or `TextArgs::layer_schedule`.
 
 LFM2 and LFM2-MoE normalize Hugging Face `layer_types` and GGUF per-layer
 KV-head metadata into
