@@ -96,6 +96,20 @@ dense/sparse-MoE feed-forward execution. Hugging Face layer lists or indices
 and GGUF Boolean attention patterns normalize once into that ordered schedule;
 resident, bounded, paged-cache, structural, expert-parallel, fingerprint, and
 memory-accounting paths all consume it without threshold-based fallbacks.
+Kimi Linear now uses the same generic schedule container with a Kimi-specific
+policy carrying both `AttentionKind::{Kda, Mla}` and
+`FeedForwardPolicy::{Dense, SparseMoe}`. Hugging Face layer lists and
+dense/MoE prefix-frequency metadata, plus GGUF per-layer attention metadata,
+normalize once before execution; resident, bounded, sparse-expert, structural,
+cache, fingerprint, and memory-accounting paths consume only the ordered
+schedule.
+DeepSeek-V3/R1 now normalizes its dense-versus-routed-MoE topology into
+`LayerSchedule<architectures::deepseek_v3::model::LayerPolicy>`. Hugging Face
+prefix/frequency fields and GGUF leading-dense metadata are source-only inputs;
+resident, bounded, structural, tensor/pipeline/expert-parallel, cache-identity,
+and fingerprint paths consume the ordered schedule. Internally supplied
+schedules may use arbitrary dense/MoE ordering, while every layer continues to
+use the model-wide compressed MLA cache geometry.
 Gemma 4 text and assistant checkpoints now normalize their exact full/sliding
 layer pattern into `LayerSchedule<AttentionPolicy>` as well. The schedule drives
 resident and bounded execution, multimodal masks, shared-KV routing, assistant

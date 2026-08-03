@@ -370,10 +370,64 @@ consume that schedule directly. Normalized `ModelArgs` no longer implements
 DeepSeek keeps embeddings, final normalization, and the output head pinned while
 complete MLA blocks move through the `text_decoder` window. Compressed latent and
 rotary-key cache arrays are evaluated before each block lease is released. The
-dense prefix and routed-plus-shared MoE suffix use the same adapter; official
+dense and routed-plus-shared MoE layers use the same adapter; official
 per-expert tensors are stacked per layer for dense, affine, and native 128-by-128
 block-FP8 checkpoints. Appended multi-token-prediction weights remain explicitly
 ignored just as they are by the eager text-model loader.
+
+Dense/MoE topology is represented only by
+`LayerSchedule<architectures::deepseek_v3::model::LayerPolicy>`, whose entries
+are `DenseMlp` or `SparseMoe`. Hugging Face `first_k_dense_replace` and the
+positive `moe_layer_freq` follow the checkpoint's zero-based rule: an index is
+sparse exactly when it is at or after the dense threshold and divisible by the
+frequency. DeepSeek2 GGUF `leading_dense_block_count` normalizes to that same
+schedule with every later layer sparse. Invalid counts, negative thresholds,
+thresholds beyond decoder depth, and non-positive frequencies fail in the parser
+shared by inspection and loading.
+
+Normalized `ModelArgs` no longer implements `Deserialize` or exposes the raw
+threshold fields or `is_moe_layer`; JSON callers use
+`deepseek_v3::model_args_from_config_value`, then query `layer_schedule` or
+`layer_policy`. Resident, layerwise-host, dense-stream, structural-admission,
+sparse-expert, tensor/pipeline/expert-parallel, and cache-identity paths use the
+ordered policy. Arbitrary internal dense/MoE orders are supported. MLA state
+geometry is still model-wide, so ordinary, paged, and persisted caches keep one
+compressed latent/rotary entry per scheduled layer; the complete ordered
+feed-forward schedule is included in architecture and prompt-cache fingerprints.
+
+## Kimi Linear layer schedules
+
+Kimi Linear normalizes its two independent decoder choices into
+`LayerSchedule<architectures::kimi_linear::model::LayerPolicy>`. Every entry
+contains `AttentionKind::{Kda, Mla}` and
+`FeedForwardPolicy::{Dense, SparseMoe}`. The normalized `ModelArgs` exposes the
+ordered `layer_schedule` and shared `kda_config`; it no longer implements
+`Deserialize` or exposes raw KDA/MLA index lists, `first_k_dense_replace`,
+`moe_layer_freq`, or the fallback queries `is_kda_layer` and `is_moe_layer`.
+JSON callers use
+`architectures::kimi_linear::model::model_args_from_config_value` and query
+`ModelArgs::layer_policy` or `layer_schedule`.
+
+Hugging Face `linear_attn_config.kda_layers` and `full_attn_layers` are
+one-based, must be disjoint, and together must cover every decoder layer.
+Feed-forward policy follows the checkpoint's zero-based rule: after
+`first_k_dense_replace`, layers whose index is divisible by the positive
+`moe_layer_freq` use sparse MoE. GGUF per-layer KV-head metadata, when present,
+selects MLA for positive entries and KDA otherwise; its leading dense-block
+count is normalized into the same combined policy. Invalid counts, duplicate or
+missing indices, out-of-range indices, and invalid prefix/frequency values fail
+before weights are materialized.
+
+Resident, layerwise-host, dense-streamed, sparse-expert-cache,
+expert-parallel, structural-admission, cache-validation, fingerprint, and
+runtime-state paths consume only this schedule. Cache construction selects
+bounded KDA recurrent state or context-growing compressed MLA state per exact
+entry, and the complete ordered attention/feed-forward policy participates in
+architecture identity. Internally constructed schedules may use arbitrary
+KDA/MLA and dense/MoE combinations even though current checkpoint formats have
+more constrained feed-forward metadata. Paged and persisted prompt caches
+remain unsupported because the persistence schema does not represent KDA
+convolution/recurrent state mixed with compressed MLA state.
 
 ## Inkling weight residency
 

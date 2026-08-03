@@ -497,12 +497,55 @@ not retained as compatibility paths. JSON callers use the architecture module's
 `model_args_from_config_value` function. `TransformerBlock::layer_type` is now
 `layer_policy`, and `Cache::new` returns a validation result.
 
-Kimi Linear SafeTensors supports fully resident, layerwise-host, dense
-disk-streamed, sparse-expert-cache, and sparse-expert-with-dense-layers
-loading for both SafeTensors and GGUF. Its KDA recurrent state remains bounded
-while no-RoPE MLA caches grow with context. The GGUF loader accepts modern
-split or legacy unsplit MLA KV-B projections, singleton convolution layouts,
-dense/K/IQ tensors, and MXFP4-MoE type 39.
+Kimi Linear normalizes its orthogonal attention and feed-forward choices into
+`LayerSchedule<architectures::kimi_linear::model::LayerPolicy>`. Each entry
+contains `AttentionKind::{Kda, Mla}` and
+`FeedForwardPolicy::{Dense, SparseMoe}`. Hugging Face's one-based `kda_layers`
+and `full_attn_layers` must be disjoint and cover the exact decoder depth;
+`first_k_dense_replace` and positive `moe_layer_freq` are converted once using
+the checkpoint's zero-based sparse-layer rule. GGUF per-layer KV-head metadata
+selects MLA for positive entries and KDA otherwise, while the leading dense
+block count supplies feed-forward policy. Invalid, duplicate, missing, or
+out-of-range layer entries and invalid dense/MoE geometry fail in the shared
+inspection/load parser before materialization.
+
+Resident, layerwise-host, dense disk-streamed, sparse-expert-cache,
+sparse-expert-with-dense-layers, expert-parallel, cache, structural,
+fingerprint, and runtime-state paths consume only the normalized schedule. Its
+KDA recurrent state remains bounded while no-RoPE MLA caches grow with context;
+cache validation rejects a per-layer state kind that differs from the schedule.
+The complete ordered attention/feed-forward policy participates in architecture
+identity. The old normalized `linear_attn_config` layer lists,
+`first_k_dense_replace`, `moe_layer_freq`, `is_kda_layer`, and `is_moe_layer`
+APIs were removed; callers use `model_args_from_config_value`, `layer_schedule`,
+and `layer_policy`. The GGUF loader accepts modern split or legacy unsplit MLA KV-B
+projections, singleton convolution layouts, dense/K/IQ tensors, and MXFP4-MoE
+type 39. Paged and persisted prompt caches remain unsupported because their
+schema cannot represent mixed KDA convolution/recurrent and compressed-MLA
+state.
+
+DeepSeek-V3/R1 uses
+`LayerSchedule<architectures::deepseek_v3::model::LayerPolicy>` as its sole
+normalized dense/MoE topology. Each ordered entry is `DenseMlp` or `SparseMoe`.
+Hugging Face `first_k_dense_replace` and positive `moe_layer_freq` normalize
+with the published zero-based rule: a layer is sparse only when its index is at
+or beyond the threshold and divisible by the frequency. DeepSeek2 GGUF
+`leading_dense_block_count` supplies the dense prefix and all remaining layers
+are sparse. Invalid decoder counts, negative or oversized thresholds, and
+non-positive frequencies fail through the same parser used by inspection and
+loading.
+
+Resident, layerwise-host, dense-stream, sparse-expert-cache, structural,
+tensor-parallel, pipeline-parallel, expert-parallel, and fingerprint paths
+consume the schedule directly. Internally constructed schedules may use any
+dense/MoE order. Attention remains uniform MLA, so cache and runtime-state
+accounting allocate one context-growing compressed latent-plus-rotary entry for
+every scheduled layer; ordinary, paged, and persisted cache routes remain
+supported. The complete ordered feed-forward schedule participates in cache
+identity even though it does not alter MLA state shape. The breaking migration
+removes normalized `first_k_dense_replace`, `moe_layer_freq`, direct
+`ModelArgs` deserialization, and `is_moe_layer`; JSON callers use
+`model_args_from_config_value`, `layer_schedule`, and `layer_policy`.
 
 Qwen3-Next supports the official native fine-grained E4M3 checkpoint format
 (`fp8`, dynamic activations, 128 x 128 weight blocks) with fully resident,
