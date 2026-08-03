@@ -33,22 +33,23 @@ use crate::{
         CacheResidencyPolicy, CacheResidencyReport, PagedCacheOptions, PromptCacheDescriptor,
         PromptCacheManifest, PromptCacheModelIdentity,
     },
-    runtime::cache::{
-        ConcatKeyValueCache, KeyValueCache, PagedKeyValueCache, SlidingKeyValueCache,
-    },
     runtime::checkpoint::load::{
         gguf_metadata, gguf_quantization_configs, load_named_array_strict,
         load_safetensors_dir_quantized_strict, load_safetensors_dir_strict, GgufTensorNames,
         StrictLoadConfig, StrictLoadReport,
     },
     runtime::checkpoint::quantization::WeightQuantization,
+    runtime::{
+        attention::{AttentionPolicy, LayerSchedule},
+        cache::{ConcatKeyValueCache, KeyValueCache, PagedKeyValueCache},
+    },
 };
 
 fn default_head_dim() -> i32 {
     64
 }
 
-fn default_sliding_window() -> i32 {
+fn default_sliding_window() -> i64 {
     128
 }
 
@@ -67,8 +68,37 @@ pub struct MxFp4Config {
     pub quant_method: String,
 }
 
-/// Deserialized GPT-OSS `config.json` fields used by this loader.
 #[derive(Debug, Clone, Deserialize)]
+struct ModelArgsSource {
+    model_type: String,
+    hidden_size: i32,
+    intermediate_size: i32,
+    num_hidden_layers: i32,
+    num_attention_heads: i32,
+    num_key_value_heads: i32,
+    #[serde(default = "default_head_dim")]
+    head_dim: i32,
+    vocab_size: i32,
+    num_local_experts: i32,
+    num_experts_per_tok: i32,
+    rms_norm_eps: f32,
+    #[serde(default = "default_sliding_window")]
+    sliding_window: i64,
+    max_position_embeddings: i32,
+    #[serde(default = "default_rope_theta")]
+    rope_theta: f32,
+    rope_scaling: Option<HashMap<String, FloatOrString>>,
+    #[serde(default)]
+    layer_types: Vec<String>,
+    quantization_config: MxFp4Config,
+    #[serde(default)]
+    quantization: Option<WeightQuantization>,
+    #[serde(default = "default_swiglu_limit")]
+    swiglu_limit: f32,
+}
+
+/// Validated GPT-OSS decoder geometry normalized from checkpoint metadata.
+#[derive(Debug, Clone)]
 pub struct ModelArgs {
     /// Architecture identifier.
     pub model_type: String,
@@ -83,7 +113,6 @@ pub struct ModelArgs {
     /// Key/value attention heads.
     pub num_key_value_heads: i32,
     /// Attention head width.
-    #[serde(default = "default_head_dim")]
     pub head_dim: i32,
     /// Vocabulary size.
     pub vocab_size: i32,
@@ -93,29 +122,21 @@ pub struct ModelArgs {
     pub num_experts_per_tok: i32,
     /// RMSNorm epsilon.
     pub rms_norm_eps: f32,
-    /// Sliding attention cache width.
-    #[serde(default = "default_sliding_window")]
-    pub sliding_window: i32,
     /// Maximum configured context length.
     pub max_position_embeddings: i32,
     /// RoPE base.
-    #[serde(default = "default_rope_theta")]
     pub rope_theta: f32,
     /// YaRN scaling configuration.
     pub rope_scaling: Option<HashMap<String, FloatOrString>>,
-    /// Per-layer `sliding_attention` or `full_attention` selection.
-    #[serde(default)]
-    pub layer_types: Vec<String>,
+    /// Authoritative attention behavior in decoder-layer order.
+    pub attention_schedule: LayerSchedule<AttentionPolicy>,
     /// Published checkpoint MXFP4 metadata.
     pub quantization_config: MxFp4Config,
     /// Optional encoding used by remaining standard dense matrices.
-    #[serde(default)]
     pub quantization: Option<WeightQuantization>,
     /// Exact per-weight formats for mixed GGUF checkpoints.
-    #[serde(skip)]
     pub quantized_weight_configs: Option<HashMap<String, WeightQuantization>>,
     /// GPT-OSS clipped SwiGLU limit.
-    #[serde(default = "default_swiglu_limit")]
     pub swiglu_limit: f32,
 }
 
@@ -153,7 +174,6 @@ impl ModelArgs {
             || self.head_dim <= 0
             || self.vocab_size <= 0
             || self.num_local_experts <= 0
-            || self.sliding_window <= 0
             || self.max_position_embeddings <= 0
         {
             return Err(Error::UnsupportedArchitecture(
@@ -184,41 +204,120 @@ impl ModelArgs {
                 "GPT-OSS expert routing configuration is invalid".into(),
             ));
         }
-        if !self.layer_types.is_empty() && self.layer_types.len() != self.num_hidden_layers as usize
-        {
+        if self.attention_schedule.len() != self.num_hidden_layers as usize {
             return Err(Error::UnsupportedArchitecture(format!(
-                "GPT-OSS layer_types has {} entries for {} layers",
-                self.layer_types.len(),
+                "GPT-OSS attention schedule has {} entries for {} layers",
+                self.attention_schedule.len(),
                 self.num_hidden_layers
             )));
         }
-        if self
-            .effective_layer_types()
-            .iter()
-            .any(|kind| !matches!(kind.as_str(), "sliding_attention" | "full_attention"))
-        {
-            return Err(Error::UnsupportedArchitecture(
-                "GPT-OSS layer_types entries must be sliding_attention or full_attention".into(),
-            ));
+        for window in self.attention_schedule.sliding_windows().keys() {
+            if window.get() > i32::MAX as u32 {
+                return Err(Error::UnsupportedArchitecture(format!(
+                    "GPT-OSS sliding attention window exceeds the executable i32 range: {}",
+                    window.get()
+                )));
+            }
         }
         Ok(())
     }
 
-    pub(crate) fn effective_layer_types(&self) -> Vec<String> {
-        if !self.layer_types.is_empty() {
-            return self.layer_types.clone();
+    pub(crate) fn prompt_cache_sliding_window(&self) -> Result<Option<i32>, Error> {
+        let windows = self.attention_schedule.sliding_windows();
+        if windows.len() > 1 {
+            return Err(Error::UnsupportedArchitecture(
+                "GPT-OSS prompt-cache persistence requires one shared sliding window across all sliding-attention layers".into(),
+            ));
         }
-        (0..self.num_hidden_layers)
+        windows
+            .keys()
+            .next()
+            .map(|window| {
+                i32::try_from(window.get()).map_err(|_| {
+                    Error::UnsupportedArchitecture(
+                        "GPT-OSS sliding attention window exceeds the executable i32 range".into(),
+                    )
+                })
+            })
+            .transpose()
+    }
+}
+
+fn alternating_attention_schedule(
+    layer_count: usize,
+    window: u32,
+) -> Result<LayerSchedule<AttentionPolicy>, Error> {
+    let sliding = AttentionPolicy::sliding(window)
+        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+    LayerSchedule::new(
+        layer_count,
+        (0..layer_count)
             .map(|index| {
                 if index % 2 == 0 {
-                    "sliding_attention"
+                    sliding
                 } else {
-                    "full_attention"
+                    AttentionPolicy::Full
                 }
-                .to_string()
             })
-            .collect()
+            .collect(),
+    )
+    .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
+}
+
+fn normalize_hf_attention_schedule(
+    layer_count: i32,
+    window: i64,
+    layer_types: &[String],
+) -> Result<LayerSchedule<AttentionPolicy>, Error> {
+    let layers = usize::try_from(layer_count).map_err(|_| {
+        Error::UnsupportedArchitecture(format!(
+            "GPT-OSS num_hidden_layers must be positive, got {layer_count}"
+        ))
+    })?;
+    if layers == 0 {
+        return Err(Error::UnsupportedArchitecture(
+            "GPT-OSS num_hidden_layers must be positive, got 0".into(),
+        ));
     }
+    if window <= 0 {
+        return Err(Error::UnsupportedArchitecture(format!(
+            "GPT-OSS sliding_window must be positive, got {window}"
+        )));
+    }
+    let window = u32::try_from(window).map_err(|_| {
+        Error::UnsupportedArchitecture(format!(
+            "GPT-OSS sliding_window exceeds the executable u32 range: {window}"
+        ))
+    })?;
+    if window > i32::MAX as u32 {
+        return Err(Error::UnsupportedArchitecture(format!(
+            "GPT-OSS sliding_window exceeds the executable i32 range: {window}"
+        )));
+    }
+    if layer_types.is_empty() {
+        return alternating_attention_schedule(layers, window);
+    }
+    if layer_types.len() != layers {
+        return Err(Error::UnsupportedArchitecture(format!(
+            "GPT-OSS layer_types has {} entries for {layers} layers",
+            layer_types.len()
+        )));
+    }
+    let sliding = AttentionPolicy::sliding(window)
+        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+    let policies = layer_types
+        .iter()
+        .enumerate()
+        .map(|(index, kind)| match kind.as_str() {
+            "sliding_attention" => Ok(sliding),
+            "full_attention" => Ok(AttentionPolicy::Full),
+            _ => Err(Error::UnsupportedArchitecture(format!(
+                "GPT-OSS layer_types[{index}] must be sliding_attention or full_attention, got {kind:?}"
+            ))),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    LayerSchedule::new(layers, policies)
+        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
 }
 
 pub(crate) fn prompt_cache_architecture_fingerprint(args: &ModelArgs) -> String {
@@ -258,14 +357,16 @@ pub(crate) fn prompt_cache_architecture_fingerprint(args: &ModelArgs) -> String 
                 "rms_norm_eps",
                 format!("{:08x}", args.rms_norm_eps.to_bits()),
             ),
-            ("sliding_window", args.sliding_window.to_string()),
+            (
+                "attention_schedule",
+                args.attention_schedule.fingerprint_component(),
+            ),
             (
                 "max_position_embeddings",
                 args.max_position_embeddings.to_string(),
             ),
             ("rope_theta", format!("{:08x}", args.rope_theta.to_bits())),
             ("rope_scaling", rope_scaling),
-            ("layer_types", args.layer_types.join(";")),
             (
                 "quantization_config",
                 args.quantization_config.quant_method.clone(),
@@ -284,10 +385,41 @@ pub fn validate_model_config_value(config: &serde_json::Value) -> Result<(), Err
     model_args_from_config_value(config).map(|_| ())
 }
 
-pub(crate) fn model_args_from_config_value(config: &serde_json::Value) -> Result<ModelArgs, Error> {
-    let args: ModelArgs = serde_json::from_value(config.clone()).map_err(|error| {
+/// Parses and normalizes a Hugging Face GPT-OSS configuration.
+///
+/// Explicit `layer_types` entries become the authoritative ordered attention
+/// schedule. When the published field is omitted, GPT-OSS alternates sliding
+/// and full attention beginning with sliding attention at layer zero.
+pub fn model_args_from_config_value(config: &serde_json::Value) -> Result<ModelArgs, Error> {
+    let source: ModelArgsSource = serde_json::from_value(config.clone()).map_err(|error| {
         Error::UnsupportedArchitecture(format!("invalid gpt_oss config: {error}"))
     })?;
+    let attention_schedule = normalize_hf_attention_schedule(
+        source.num_hidden_layers,
+        source.sliding_window,
+        &source.layer_types,
+    )?;
+    let args = ModelArgs {
+        model_type: source.model_type,
+        hidden_size: source.hidden_size,
+        intermediate_size: source.intermediate_size,
+        num_hidden_layers: source.num_hidden_layers,
+        num_attention_heads: source.num_attention_heads,
+        num_key_value_heads: source.num_key_value_heads,
+        head_dim: source.head_dim,
+        vocab_size: source.vocab_size,
+        num_local_experts: source.num_local_experts,
+        num_experts_per_tok: source.num_experts_per_tok,
+        rms_norm_eps: source.rms_norm_eps,
+        max_position_embeddings: source.max_position_embeddings,
+        rope_theta: source.rope_theta,
+        rope_scaling: source.rope_scaling,
+        attention_schedule,
+        quantization_config: source.quantization_config,
+        quantization: source.quantization,
+        quantized_weight_configs: None,
+        swiglu_limit: source.swiglu_limit,
+    };
     args.validate()?;
     Ok(args)
 }
@@ -706,15 +838,39 @@ impl TransformerBlock {
     }
 }
 
-/// Per-layer cache matching alternating full and sliding attention.
+/// Per-layer cache matching the canonical attention schedule.
 #[derive(Debug, Clone)]
 pub enum LayerCache {
     /// Unbounded full-attention cache.
     Full(ConcatKeyValueCache),
     /// Bounded sliding-attention cache.
-    Sliding(SlidingKeyValueCache),
+    Sliding(ConcatKeyValueCache),
     /// Block-addressable full or sliding state.
     Paged(PagedKeyValueCache),
+}
+
+impl LayerCache {
+    pub(crate) fn attention_policy(&self) -> Result<AttentionPolicy, Exception> {
+        fn sliding(window: i32) -> Result<AttentionPolicy, Exception> {
+            let window = u32::try_from(window).map_err(|_| {
+                Exception::custom(format!("GPT-OSS cache has invalid sliding window {window}"))
+            })?;
+            AttentionPolicy::sliding(window).map_err(|error| Exception::custom(error.to_string()))
+        }
+        match self {
+            Self::Full(_) => Ok(AttentionPolicy::Full),
+            Self::Sliding(cache) => match cache.max_size() {
+                Some(window) => sliding(window),
+                None => Err(Exception::custom(
+                    "GPT-OSS sliding cache is missing its attention window",
+                )),
+            },
+            Self::Paged(cache) => match cache.max_size() {
+                Some(window) => sliding(window),
+                None => Ok(AttentionPolicy::Full),
+            },
+        }
+    }
 }
 
 impl KeyValueCache for LayerCache {
@@ -853,8 +1009,7 @@ impl Cache {
 /// GPT-OSS transformer body.
 #[derive(Debug, Clone, ModuleParameters)]
 pub struct GptOssModel {
-    layer_types: Vec<String>,
-    sliding_window: i32,
+    attention_schedule: LayerSchedule<AttentionPolicy>,
     #[param]
     /// Token embedding table.
     pub embed_tokens: MaybeQuantized<nn::Embedding>,
@@ -869,8 +1024,7 @@ pub struct GptOssModel {
 impl GptOssModel {
     fn new(args: &ModelArgs, stream: &Stream) -> Result<Self, Exception> {
         Ok(Self {
-            layer_types: args.effective_layer_types(),
-            sliding_window: args.sliding_window,
+            attention_schedule: args.attention_schedule.clone(),
             embed_tokens: common::linear::unloaded_maybe_quantized_embedding(
                 args.vocab_size,
                 args.hidden_size,
@@ -892,14 +1046,16 @@ impl GptOssModel {
     fn new_cache(&self) -> Cache {
         Cache {
             layers: self
-                .layer_types
+                .attention_schedule
                 .iter()
-                .map(|kind| {
-                    if kind == "sliding_attention" {
-                        LayerCache::Sliding(SlidingKeyValueCache::new(self.sliding_window))
-                    } else {
-                        LayerCache::Full(ConcatKeyValueCache::new())
+                .map(|policy| match policy.window() {
+                    Some(window) => {
+                        LayerCache::Sliding(ConcatKeyValueCache::new_for_sliding_attention(
+                            i32::try_from(window.get())
+                                .expect("validated GPT-OSS sliding window fits i32"),
+                        ))
                     }
+                    None => LayerCache::Full(ConcatKeyValueCache::new()),
                 })
                 .collect(),
         }
@@ -922,11 +1078,13 @@ impl GptOssModel {
         rank: Option<CacheRankIdentity>,
     ) -> Result<Cache, Exception> {
         let layers = self
-            .layer_types
+            .attention_schedule
             .iter()
             .enumerate()
-            .map(|(layer, kind)| {
-                let window = (kind == "sliding_attention").then_some(self.sliding_window);
+            .map(|(layer, policy)| {
+                let window = policy.window().map(|window| {
+                    i32::try_from(window.get()).expect("validated GPT-OSS sliding window fits i32")
+                });
                 PagedKeyValueCache::new_with_layout(manager.clone(), layer, window, 0, rank)
                     .map(LayerCache::Paged)
             })
@@ -943,18 +1101,23 @@ impl GptOssModel {
         if cache.layers.is_empty() {
             *cache = self.new_cache();
         }
+        self.validate_cache(cache)?;
         let mut hidden = self.embed_tokens.forward(inputs, stream)?;
         let length = hidden.dim(1);
-        for (layer, layer_cache) in self.layers.iter_mut().zip(cache.layers.iter_mut()) {
+        for ((layer, layer_cache), policy) in self
+            .layers
+            .iter_mut()
+            .zip(cache.layers.iter_mut())
+            .zip(self.attention_schedule.iter())
+        {
             let offset = layer_cache.offset();
-            let window = layer_cache.max_size();
-            let needs_mask = length > 1 || window.is_some_and(|size| offset >= size);
-            let mask = needs_mask
+            let window = policy.window().map(|window| window.get() as i32);
+            let mask = (length > 1)
                 .then(|| {
                     let max_past = window.map(|size| size - 1);
                     create_causal_mask(
                         length,
-                        Some(offset.min(window.unwrap_or(offset))),
+                        Some(offset.min(max_past.unwrap_or(offset))),
                         max_past,
                         None,
                         stream,
@@ -979,23 +1142,25 @@ impl GptOssModel {
         if cache.layers.is_empty() {
             *cache = self.new_cache();
         }
+        self.validate_cache(cache)?;
         let mut hidden = self.embed_tokens.forward(inputs, stream)?;
         let length = hidden.dim(1);
-        for (index, (layer, layer_cache)) in self
+        for (index, ((layer, layer_cache), policy)) in self
             .layers
             .iter_mut()
             .zip(cache.layers.iter_mut())
+            .zip(self.attention_schedule.iter())
             .enumerate()
         {
             let offset = layer_cache.offset();
-            let window = layer_cache.max_size();
-            let needs_mask = length > 1 || window.is_some_and(|size| offset >= size);
-            let mask = needs_mask
+            let window = policy.window().map(|window| window.get() as i32);
+            let mask = (length > 1)
                 .then(|| {
+                    let max_past = window.map(|size| size - 1);
                     create_causal_mask(
                         length,
-                        Some(offset.min(window.unwrap_or(offset))),
-                        window.map(|size| size - 1),
+                        Some(offset.min(max_past.unwrap_or(offset))),
+                        max_past,
                         None,
                         stream,
                     )
@@ -1010,6 +1175,30 @@ impl GptOssModel {
             )?;
         }
         self.norm.forward(&hidden, stream)
+    }
+
+    fn validate_cache(&self, cache: &Cache) -> Result<(), Exception> {
+        if cache.layers.len() != self.attention_schedule.len() {
+            return Err(Exception::custom(format!(
+                "GPT-OSS cache has {} layers, expected {}",
+                cache.layers.len(),
+                self.attention_schedule.len()
+            )));
+        }
+        for (index, (cache, policy)) in cache
+            .layers
+            .iter()
+            .zip(self.attention_schedule.iter())
+            .enumerate()
+        {
+            let actual = cache.attention_policy()?;
+            if actual != *policy {
+                return Err(Exception::custom(format!(
+                    "GPT-OSS cache policy mismatch at layer {index}: expected {policy:?}, got {actual:?}"
+                )));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -1047,12 +1236,12 @@ impl Model {
         &self.args.model_type
     }
 
-    /// Creates alternating full/sliding caches.
+    /// Creates caches matching the canonical per-layer attention schedule.
     pub fn new_cache(&self) -> Cache {
         self.model.new_cache()
     }
 
-    /// Creates alternating attention caches under an explicit cache policy.
+    /// Creates scheduled attention caches under an explicit cache policy.
     pub fn new_cache_with_options(&self, policy: CacheResidencyPolicy) -> Result<Cache, Exception> {
         self.model.new_cache_with_options(policy)
     }
@@ -1065,7 +1254,7 @@ impl Model {
         self.model.new_cache_with_manager(manager, rank)
     }
 
-    /// Lazily catalogs a compatible persisted alternating-attention prefix.
+    /// Lazily catalogs a compatible persisted scheduled-attention prefix.
     pub fn load_prompt_cache(
         &self,
         directory: impl AsRef<Path>,
@@ -1082,7 +1271,10 @@ impl Model {
             layer_count,
             global_layer_start: 0,
             global_layer_end: layer_count,
-            sliding_window: Some(self.args.sliding_window),
+            sliding_window: self
+                .args
+                .prompt_cache_sliding_window()
+                .map_err(|error| Exception::custom(error.to_string()))?,
             sink_tokens: 0,
             topology: Default::default(),
             layer_layouts: PromptCacheModelIdentity::key_value_layouts(
@@ -1361,11 +1553,23 @@ pub(crate) fn args_from_gguf_catalog(
         .unwrap_or(hidden_size / num_attention_heads);
     let vocab_size = gguf_vocab_size(metadata, &key("vocab_size"))?;
     let rope_scaling = gguf_rope_scaling(metadata, "gpt-oss")?;
+    let num_hidden_layers = gguf_required_i32(metadata, &key("block_count"))?;
+    let sliding_window = gguf_required_i32(metadata, &key("attention.sliding_window"))?;
+    let layers = usize::try_from(num_hidden_layers).map_err(|_| {
+        Error::UnsupportedArchitecture(format!(
+            "GPT-OSS GGUF block count must be positive, got {num_hidden_layers}"
+        ))
+    })?;
+    if sliding_window <= 0 {
+        return Err(Error::UnsupportedArchitecture(format!(
+            "GPT-OSS GGUF sliding window must be positive, got {sliding_window}"
+        )));
+    }
     let args = ModelArgs {
         model_type: "gpt_oss".into(),
         hidden_size,
         intermediate_size: gguf_required_i32(metadata, &key("expert_feed_forward_length"))?,
-        num_hidden_layers: gguf_required_i32(metadata, &key("block_count"))?,
+        num_hidden_layers,
         num_attention_heads,
         num_key_value_heads: gguf_required_i32(metadata, &key("attention.head_count_kv"))?,
         head_dim,
@@ -1373,12 +1577,11 @@ pub(crate) fn args_from_gguf_catalog(
         num_local_experts: gguf_required_i32(metadata, &key("expert_count"))?,
         num_experts_per_tok: gguf_required_i32(metadata, &key("expert_used_count"))?,
         rms_norm_eps: gguf_f32(metadata, &key("attention.layer_norm_rms_epsilon"))?,
-        sliding_window: gguf_required_i32(metadata, &key("attention.sliding_window"))?,
         max_position_embeddings: gguf_required_i32(metadata, &key("context_length"))?,
         rope_theta: gguf_optional_f32(metadata, &key("rope.freq_base"))?
             .unwrap_or_else(default_rope_theta),
         rope_scaling,
-        layer_types: Vec::new(),
+        attention_schedule: alternating_attention_schedule(layers, sliding_window as u32)?,
         quantization_config: MxFp4Config {
             quant_method: "mxfp4".into(),
         },
@@ -1650,7 +1853,13 @@ mod tests {
     };
 
     use super::{Cache, Model, ModelArgs, MxFp4Config};
-    use crate::nn::rope::FloatOrString;
+    use crate::{
+        nn::rope::FloatOrString,
+        runtime::{
+            attention::{AttentionPolicy, LayerSchedule},
+            cache::KeyValueCache,
+        },
+    };
 
     fn tiny_args() -> ModelArgs {
         ModelArgs {
@@ -1665,7 +1874,6 @@ mod tests {
             num_local_experts: 2,
             num_experts_per_tok: 1,
             rms_norm_eps: 1e-5,
-            sliding_window: 8,
             max_position_embeddings: 128,
             rope_theta: 150_000.0,
             rope_scaling: Some(HashMap::from([
@@ -1679,13 +1887,31 @@ mod tests {
                 ("beta_slow".into(), FloatOrString::Float(1.0)),
                 ("truncate".into(), FloatOrString::Bool(false)),
             ])),
-            layer_types: vec!["sliding_attention".into(), "full_attention".into()],
+            attention_schedule: LayerSchedule::new(
+                2,
+                vec![AttentionPolicy::sliding(8).unwrap(), AttentionPolicy::Full],
+            )
+            .unwrap(),
             quantization_config: MxFp4Config {
                 quant_method: "mxfp4".into(),
             },
             quantization: None,
             quantized_weight_configs: None,
             swiglu_limit: 7.0,
+        }
+    }
+
+    fn initialize_zero_model(model: &mut Model, stream: &safemlx::Stream) {
+        for (name, parameter) in model.parameters_mut().flatten() {
+            let shape = parameter.shape().to_vec();
+            let dtype = parameter.dtype();
+            *parameter = if name.ends_with("_scales") {
+                Array::full::<u8>(&shape, Array::from_slice(&[127u8], &[]), stream).unwrap()
+            } else if name.ends_with("layernorm.weight") || name.as_ref() == "model.norm.weight" {
+                ones_dtype(&shape, dtype, stream).unwrap()
+            } else {
+                zeros_dtype(&shape, dtype, stream).unwrap()
+            };
         }
     }
 
@@ -1817,7 +2043,13 @@ mod tests {
             ),
             (
                 "gpt-oss.attention.sliding_window".into(),
-                GgufMetadataValue::Uint32(args.sliding_window as u32),
+                GgufMetadataValue::Uint32(
+                    args.attention_schedule
+                        .get(0)
+                        .and_then(|policy| policy.window())
+                        .unwrap()
+                        .get(),
+                ),
             ),
             (
                 "gpt-oss.context_length".into(),
@@ -1848,6 +2080,10 @@ mod tests {
         let loaded = super::load_gguf(fixture.path(), stream, stream).unwrap();
         assert_eq!(loaded.args.num_hidden_layers, args.num_hidden_layers);
         assert_eq!(loaded.args.num_local_experts, args.num_local_experts);
+        assert_eq!(
+            loaded.args.attention_schedule.fingerprint_component(),
+            "s8,f"
+        );
     }
 
     #[test]
@@ -1875,9 +2111,135 @@ mod tests {
             "layer_types": std::iter::repeat_n(["sliding_attention", "full_attention"], 12).flatten().collect::<Vec<_>>(),
             "quantization_config": {"quant_method": "mxfp4"}
         });
-        let args: ModelArgs = serde_json::from_value(value).unwrap();
-        args.validate().unwrap();
-        assert_eq!(args.effective_layer_types().len(), 24);
+        let args = super::model_args_from_config_value(&value).unwrap();
+        assert_eq!(args.attention_schedule.len(), 24);
+        assert_eq!(args.attention_schedule.full_layer_count(), 12);
+        assert_eq!(args.attention_schedule.sliding_layer_count(), 12);
+    }
+
+    fn schedule_config(layer_types: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "model_type": "gpt_oss",
+            "hidden_size": 32,
+            "intermediate_size": 32,
+            "num_hidden_layers": 4,
+            "num_attention_heads": 1,
+            "num_key_value_heads": 1,
+            "head_dim": 32,
+            "vocab_size": 32,
+            "num_local_experts": 2,
+            "num_experts_per_tok": 1,
+            "rms_norm_eps": 1e-5,
+            "sliding_window": 8,
+            "max_position_embeddings": 128,
+            "rope_theta": 150000,
+            "rope_scaling": null,
+            "layer_types": layer_types,
+            "quantization_config": {"quant_method": "mxfp4"}
+        })
+    }
+
+    #[test]
+    fn hf_schedule_normalization_preserves_fallback_and_arbitrary_order() {
+        let mut fallback = schedule_config(serde_json::json!([]));
+        fallback.as_object_mut().unwrap().remove("layer_types");
+        let fallback = super::model_args_from_config_value(&fallback).unwrap();
+        assert_eq!(
+            fallback.attention_schedule.fingerprint_component(),
+            "s8,f,s8,f"
+        );
+
+        let explicit = super::model_args_from_config_value(&schedule_config(serde_json::json!([
+            "full_attention",
+            "sliding_attention",
+            "sliding_attention",
+            "full_attention"
+        ])))
+        .unwrap();
+        assert_eq!(
+            explicit.attention_schedule.fingerprint_component(),
+            "f,s8,s8,f"
+        );
+    }
+
+    #[test]
+    fn hf_schedule_normalization_rejects_invalid_metadata_exactly() {
+        let invalid = [
+            schedule_config(serde_json::json!(["full_attention"])),
+            schedule_config(serde_json::json!([
+                "full_attention",
+                "invalid_attention",
+                "full_attention",
+                "full_attention"
+            ])),
+        ];
+        for config in invalid {
+            assert!(super::model_args_from_config_value(&config).is_err());
+        }
+        for window in [
+            serde_json::json!(0),
+            serde_json::json!(-1),
+            serde_json::json!(i64::from(i32::MAX) + 1),
+        ] {
+            let mut config = schedule_config(serde_json::json!([
+                "full_attention",
+                "sliding_attention",
+                "full_attention",
+                "full_attention"
+            ]));
+            config["sliding_window"] = window;
+            assert!(super::model_args_from_config_value(&config).is_err());
+        }
+    }
+
+    #[test]
+    fn fingerprint_includes_the_complete_ordered_attention_schedule() {
+        let first = super::model_args_from_config_value(&schedule_config(serde_json::json!([
+            "sliding_attention",
+            "full_attention",
+            "sliding_attention",
+            "full_attention"
+        ])))
+        .unwrap();
+        let second = super::model_args_from_config_value(&schedule_config(serde_json::json!([
+            "full_attention",
+            "sliding_attention",
+            "full_attention",
+            "sliding_attention"
+        ])))
+        .unwrap();
+        assert_ne!(
+            super::prompt_cache_architecture_fingerprint(&first),
+            super::prompt_cache_architecture_fingerprint(&second)
+        );
+    }
+
+    #[test]
+    fn cache_geometry_supports_arbitrary_order_and_distinct_windows() {
+        let ctx = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
+        let mut args = tiny_args();
+        args.num_hidden_layers = 4;
+        args.attention_schedule = LayerSchedule::new(
+            4,
+            vec![
+                AttentionPolicy::Full,
+                AttentionPolicy::sliding(3).unwrap(),
+                AttentionPolicy::sliding(5).unwrap(),
+                AttentionPolicy::Full,
+            ],
+        )
+        .unwrap();
+        let model = Model::new(args, ctx.stream()).unwrap();
+        let cache = model.new_cache();
+        assert_eq!(
+            cache
+                .layers
+                .iter()
+                .map(KeyValueCache::max_size)
+                .collect::<Vec<_>>(),
+            vec![None, Some(3), Some(5), None]
+        );
+        assert!(model.args.prompt_cache_sliding_window().is_err());
     }
 
     #[test]
@@ -1912,22 +2274,71 @@ mod tests {
         let ctx = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
         let stream = ctx.stream();
         let mut model = Model::new(tiny_args(), stream).unwrap();
-        for (name, parameter) in model.parameters_mut().flatten() {
-            let shape = parameter.shape().to_vec();
-            let dtype = parameter.dtype();
-            *parameter = if name.ends_with("_scales") {
-                Array::full::<u8>(&shape, Array::from_slice(&[127u8], &[]), stream).unwrap()
-            } else if name.ends_with("layernorm.weight") || name.as_ref() == "model.norm.weight" {
-                ones_dtype(&shape, dtype, stream).unwrap()
-            } else {
-                zeros_dtype(&shape, dtype, stream).unwrap()
-            };
-        }
+        initialize_zero_model(&mut model, stream);
         let tokens = Array::from_slice(&[1i32, 2, 3], &[1, 3]);
         let logits = model
             .forward(&tokens, &mut Cache::default(), stream)
             .unwrap();
         assert_eq!(logits.shape(), &[1, 3, 32]);
         assert_eq!(logits.max(None, stream).unwrap().item::<f32>(stream), 0.0);
+    }
+
+    #[test]
+    fn arbitrary_schedule_ordinary_and_paged_caches_match_and_retain_exactly() {
+        use crate::runtime::cache::residency::{CacheResidencyPolicy, PagedCacheOptions};
+
+        let ctx = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
+        let stream = ctx.stream();
+        let mut args = tiny_args();
+        args.num_hidden_layers = 4;
+        args.attention_schedule = LayerSchedule::new(
+            4,
+            vec![
+                AttentionPolicy::Full,
+                AttentionPolicy::sliding(4).unwrap(),
+                AttentionPolicy::Full,
+                AttentionPolicy::sliding(2).unwrap(),
+            ],
+        )
+        .unwrap();
+        let mut ordinary = Model::new(args, stream).unwrap();
+        initialize_zero_model(&mut ordinary, stream);
+        let mut paged = ordinary.clone();
+        let mut ordinary_cache = ordinary.new_cache();
+        let options = PagedCacheOptions::new(2, 1 << 20, 1 << 20, 1)
+            .unwrap()
+            .with_full_attention(true);
+        let mut paged_cache = paged
+            .new_cache_with_options(CacheResidencyPolicy::Paged(options))
+            .unwrap();
+        for tokens in [
+            Array::from_slice(&[1u32, 2, 3], &[1, 3]),
+            Array::from_slice(&[4u32, 5], &[1, 2]),
+            Array::from_slice(&[6u32], &[1, 1]),
+        ] {
+            let expected = ordinary
+                .forward(&tokens, &mut ordinary_cache, stream)
+                .unwrap();
+            let actual = paged.forward(&tokens, &mut paged_cache, stream).unwrap();
+            assert_eq!(expected.shape(), actual.shape());
+            assert_eq!(
+                expected.max(None, stream).unwrap().item::<f32>(stream),
+                actual.max(None, stream).unwrap().item::<f32>(stream)
+            );
+        }
+        assert_eq!(
+            ordinary_cache
+                .layers
+                .iter()
+                .map(|cache| {
+                    cache
+                        .retained_arrays()
+                        .first()
+                        .map(|array| array.dim(-2))
+                        .unwrap_or(0)
+                })
+                .collect::<Vec<_>>(),
+            vec![6, 3, 6, 1]
+        );
     }
 }

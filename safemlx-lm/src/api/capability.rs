@@ -902,46 +902,49 @@ fn kimi_linear_spec(args: &kimi_linear::ModelArgs) -> Result<Spec, CapabilityErr
     ))
 }
 
-fn layer_kind_counts(values: &[String], layers: u64, sliding_name: &str) -> (u64, u64) {
-    let sliding = values
-        .iter()
-        .take(layers as usize)
-        .filter(|value| value.as_str() == sliding_name)
-        .count() as u64;
-    (layers.saturating_sub(sliding), sliding)
-}
-
 fn gpt_oss_spec(args: &gpt_oss::ModelArgs) -> Result<Spec, CapabilityError> {
     let context = context_from_rope(args.max_position_embeddings, args.rope_scaling.as_ref())?;
-    let layers = positive(args.num_hidden_layers, "num_hidden_layers")?;
-    let (full, sliding) = layer_kind_counts(&args.layer_types, layers, "sliding_attention");
-    let window = positive(args.sliding_window, "sliding_window")?;
+    positive(args.num_hidden_layers, "num_hidden_layers")?;
+    let full = args.attention_schedule.full_layer_count() as u64;
+    let sliding = args
+        .attention_schedule
+        .sliding_windows()
+        .into_iter()
+        .map(|(window, layers)| SlidingWindowLayerCount {
+            layers: layers as u64,
+            window: u64::from(window.get()),
+        })
+        .collect::<Vec<_>>();
     let scalars = kv_scalars(args.num_key_value_heads, args.head_dim)?;
+    let state_strategy = match (full, sliding.as_slice()) {
+        (_, []) => CacheStateStrategy::FullKv,
+        (0, [only]) => CacheStateStrategy::SlidingKv {
+            window: only.window,
+        },
+        _ => CacheStateStrategy::MixedKv {
+            full_layers: full,
+            sliding: sliding.clone(),
+        },
+    };
     Ok((
         context.0,
         context.1,
-        CacheStateStrategy::MixedKv {
-            full_layers: full,
-            sliding: vec![SlidingWindowLayerCount {
-                layers: sliding,
-                window,
-            }],
-        },
+        state_strategy,
         text_modalities(),
         ArchitectureEstimate {
             fixed_scalars_per_batch: 0,
-            growing: vec![
-                GrowingState {
-                    layers: full,
-                    scalars_per_position: scalars,
-                    window: None,
-                },
-                GrowingState {
-                    layers: sliding,
-                    scalars_per_position: scalars,
-                    window: Some(window),
-                },
-            ],
+            growing: std::iter::once(GrowingState {
+                layers: full,
+                scalars_per_position: scalars,
+                window: None,
+            })
+            .filter(|state| state.layers > 0)
+            .chain(sliding.into_iter().map(|group| GrowingState {
+                layers: group.layers,
+                scalars_per_position: scalars,
+                window: Some(group.window),
+            }))
+            .collect(),
             hidden_size: positive(args.hidden_size, "hidden_size")?,
             allocation_granularity: 1,
             completeness: EstimationCompleteness::Complete,
@@ -3143,6 +3146,57 @@ mod tests {
         assert_eq!(estimate.growing[0].layers, 1);
         assert_eq!(estimate.growing[0].scalars_per_position, 16);
         assert_eq!(estimate.growing[0].window, None);
+    }
+
+    #[test]
+    fn gpt_oss_runtime_state_uses_exact_schedule_and_distinct_windows() {
+        use crate::runtime::attention::{AttentionPolicy, LayerSchedule};
+
+        let mut args = gpt_oss::model_args_from_config_value(&json!({
+            "model_type": "gpt_oss", "hidden_size": 32,
+            "intermediate_size": 32, "num_hidden_layers": 4,
+            "num_attention_heads": 2, "num_key_value_heads": 1,
+            "head_dim": 16, "vocab_size": 32, "num_local_experts": 2,
+            "num_experts_per_tok": 1, "rms_norm_eps": 1e-5,
+            "sliding_window": 5, "max_position_embeddings": 128,
+            "layer_types": [
+                "sliding_attention", "full_attention",
+                "sliding_attention", "full_attention"
+            ],
+            "quantization_config": {"quant_method": "mxfp4"}
+        }))
+        .unwrap();
+        args.attention_schedule = LayerSchedule::new(
+            4,
+            vec![
+                AttentionPolicy::sliding(3).unwrap(),
+                AttentionPolicy::Full,
+                AttentionPolicy::sliding(5).unwrap(),
+                AttentionPolicy::Full,
+            ],
+        )
+        .unwrap();
+        let (_, _, strategy, _, estimate) = gpt_oss_spec(&args).unwrap();
+        assert_eq!(
+            strategy,
+            CacheStateStrategy::MixedKv {
+                full_layers: 2,
+                sliding: vec![
+                    SlidingWindowLayerCount {
+                        layers: 1,
+                        window: 3,
+                    },
+                    SlidingWindowLayerCount {
+                        layers: 1,
+                        window: 5,
+                    },
+                ],
+            }
+        );
+        assert_eq!(estimate.growing.len(), 3);
+        assert_eq!(estimate.growing[0].window, None);
+        assert_eq!(estimate.growing[1].window, Some(3));
+        assert_eq!(estimate.growing[2].window, Some(5));
     }
 
     #[test]

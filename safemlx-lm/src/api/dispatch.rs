@@ -1398,7 +1398,7 @@ pub enum ModelCache {
     DeepSeekV3(deepseek_v3::Cache),
     /// Gemma 4 generation cache.
     Gemma4(gemma4::Cache),
-    /// Alternating full/sliding GPT-OSS cache.
+    /// GPT-OSS cache following its canonical per-layer attention schedule.
     GptOss(gpt_oss::Cache),
     /// Alternating global/local attention and short-convolution Inkling cache.
     Inkling(inkling::Cache),

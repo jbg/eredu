@@ -29,7 +29,6 @@ use crate::{
         CacheResidencyPolicy, PagedCacheOptions, PromptCacheDescriptor, PromptCacheManifest,
         PromptCacheModelIdentity,
     },
-    runtime::cache::{KeyValueCache, PagedKeyValueCache},
     runtime::checkpoint::binding::{
         build_module_bindings, build_module_bindings_with_recipes, populate_module_from_lease,
         populate_module_from_lease_excluding,
@@ -46,6 +45,10 @@ use crate::{
         ExpertPass,
     },
     runtime::residency::manager::{OffloadUnit, ResidencyReport, ResidentUnitLease, WeightBinding},
+    runtime::{
+        attention::{AttentionPolicy, LayerSchedule},
+        cache::{ConcatKeyValueCache, KeyValueCache, PagedKeyValueCache},
+    },
 };
 
 const EMBEDDING_UNIT: &str = "gpt_oss.static.embedding";
@@ -68,12 +71,12 @@ impl GptOssLayerwiseModel {
         resident::prompt_cache_architecture_fingerprint(self.args())
     }
 
-    /// Creates the architecture's alternating sliding/full attention cache.
+    /// Creates caches matching the canonical per-layer attention schedule.
     pub fn new_cache(&self) -> Cache {
         self.execution.adapter().new_cache()
     }
 
-    /// Creates alternating attention caches independently of weight residency.
+    /// Creates scheduled attention caches independently of weight residency.
     pub fn new_cache_with_options(&self, policy: CacheResidencyPolicy) -> Result<Cache, Error> {
         match policy {
             CacheResidencyPolicy::Device => Ok(self.new_cache()),
@@ -82,12 +85,14 @@ impl GptOssLayerwiseModel {
                 let manager = CacheResidencyManager::new(options)
                     .map_err(|error| Exception::custom(error.to_string()))?;
                 let layers = adapter
-                    .layer_types
+                    .attention_schedule
                     .iter()
                     .enumerate()
-                    .map(|(layer, kind)| {
-                        let window =
-                            (kind == "sliding_attention").then_some(adapter.args.sliding_window);
+                    .map(|(layer, policy)| {
+                        let window = policy.window().map(|window| {
+                            i32::try_from(window.get())
+                                .expect("validated GPT-OSS sliding window fits i32")
+                        });
                         PagedKeyValueCache::new(manager.clone(), layer, window)
                             .map(LayerCache::Paged)
                     })
@@ -97,7 +102,7 @@ impl GptOssLayerwiseModel {
         }
     }
 
-    /// Lazily catalogs a compatible persisted alternating-attention prefix.
+    /// Lazily catalogs a compatible persisted scheduled-attention prefix.
     pub fn load_prompt_cache(
         &self,
         directory: impl AsRef<Path>,
@@ -115,7 +120,9 @@ impl GptOssLayerwiseModel {
             layer_count,
             global_layer_start: 0,
             global_layer_end: layer_count,
-            sliding_window: Some(args.sliding_window),
+            sliding_window: args
+                .prompt_cache_sliding_window()
+                .map_err(|error| Exception::custom(error.to_string()))?,
             sink_tokens: 0,
             topology: Default::default(),
             layer_layouts: PromptCacheModelIdentity::key_value_layouts(
@@ -131,11 +138,13 @@ impl GptOssLayerwiseModel {
                 .map_err(|error| Exception::custom(error.to_string()))?;
         let adapter = self.execution.adapter();
         let layers = adapter
-            .layer_types
+            .attention_schedule
             .iter()
             .enumerate()
-            .map(|(layer, kind)| {
-                let window = (kind == "sliding_attention").then_some(adapter.args.sliding_window);
+            .map(|(layer, policy)| {
+                let window = policy.window().map(|window| {
+                    i32::try_from(window.get()).expect("validated GPT-OSS sliding window fits i32")
+                });
                 PagedKeyValueCache::new(manager.clone(), layer, window).map(LayerCache::Paged)
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -473,7 +482,7 @@ pub(crate) fn load_gpt_oss_sparse_ep_base_with_store(
 /// Generalized adapter for GPT-OSS native MXFP4 sparse decoder blocks.
 pub struct GptOssLayerwiseAdapter {
     args: ModelArgs,
-    layer_types: Vec<String>,
+    attention_schedule: LayerSchedule<AttentionPolicy>,
     embedding: MaybeQuantized<nn::Embedding>,
     norm: nn::RmsNorm,
     lm_head: MaybeQuantized<nn::Linear>,
@@ -485,7 +494,7 @@ impl GptOssLayerwiseAdapter {
     /// Creates metadata-only pinned modules for a validated configuration.
     pub fn new(args: ModelArgs, stream: &Stream) -> Result<Self, Error> {
         args.validate()?;
-        let layer_types = args.effective_layer_types();
+        let attention_schedule = args.attention_schedule.clone();
         let embedding = common::linear::unloaded_maybe_quantized_embedding(
             args.vocab_size,
             args.hidden_size,
@@ -503,7 +512,7 @@ impl GptOssLayerwiseAdapter {
         )?;
         Ok(Self {
             args,
-            layer_types,
+            attention_schedule,
             embedding,
             norm,
             lm_head,
@@ -520,16 +529,16 @@ impl GptOssLayerwiseAdapter {
     fn new_cache(&self) -> Cache {
         Cache {
             layers: self
-                .layer_types
+                .attention_schedule
                 .iter()
-                .map(|kind| {
-                    if kind == "sliding_attention" {
-                        LayerCache::Sliding(crate::runtime::cache::SlidingKeyValueCache::new(
-                            self.args.sliding_window,
+                .map(|policy| match policy.window() {
+                    Some(window) => {
+                        LayerCache::Sliding(ConcatKeyValueCache::new_for_sliding_attention(
+                            i32::try_from(window.get())
+                                .expect("validated GPT-OSS sliding window fits i32"),
                         ))
-                    } else {
-                        LayerCache::Full(crate::runtime::cache::ConcatKeyValueCache::new())
                     }
+                    None => LayerCache::Full(ConcatKeyValueCache::new()),
                 })
                 .collect(),
         }
@@ -654,22 +663,25 @@ impl GeneralLayerwiseModelAdapter for GptOssLayerwiseAdapter {
             *cache = self.new_cache();
             return Ok(());
         }
-        if cache.layers.len() != self.layer_types.len() {
+        if cache.layers.len() != self.attention_schedule.len() {
             return Err(Error::UnsupportedArchitecture(format!(
                 "GPT-OSS cache has {} layers, expected {}",
                 cache.layers.len(),
-                self.layer_types.len()
+                self.attention_schedule.len()
             )));
         }
-        for (index, (cache, kind)) in cache.layers.iter().zip(&self.layer_types).enumerate() {
-            let matches = matches!(
-                (cache, kind.as_str()),
-                (LayerCache::Sliding(_), "sliding_attention")
-                    | (LayerCache::Full(_), "full_attention")
-            );
-            if !matches {
+        for (index, (cache, policy)) in cache
+            .layers
+            .iter()
+            .zip(self.attention_schedule.iter())
+            .enumerate()
+        {
+            let actual = cache
+                .attention_policy()
+                .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+            if actual != *policy {
                 return Err(Error::UnsupportedArchitecture(format!(
-                    "GPT-OSS cache kind does not match layer_types at layer {index}"
+                    "GPT-OSS cache policy mismatch at layer {index}: expected {policy:?}, got {actual:?}"
                 )));
             }
         }
@@ -707,7 +719,7 @@ impl GeneralLayerwiseModelAdapter for GptOssLayerwiseAdapter {
 
     fn layer_count(&self, group: usize) -> Result<usize, Error> {
         if group == 0 {
-            Ok(self.layer_types.len())
+            Ok(self.attention_schedule.len())
         } else {
             Err(Error::UnsupportedArchitecture(format!(
                 "GPT-OSS has no execution group {group}"
@@ -795,14 +807,19 @@ impl GeneralLayerwiseModelAdapter for GptOssLayerwiseAdapter {
         self.layer_count(group)?;
         let layer_cache = &mut cache.layers[index];
         let offset = layer_cache.offset();
-        let window = layer_cache.max_size();
-        let needs_mask = context.sequence_length > 1 || window.is_some_and(|size| offset >= size);
-        let mask = needs_mask
+        let window = self
+            .attention_schedule
+            .get(index)
+            .expect("validated GPT-OSS layer index")
+            .window()
+            .map(|window| window.get() as i32);
+        let mask = (context.sequence_length > 1)
             .then(|| {
+                let max_past = window.map(|size| size - 1);
                 create_causal_mask(
                     context.sequence_length,
-                    Some(offset.min(window.unwrap_or(offset))),
-                    window.map(|size| size - 1),
+                    Some(offset.min(max_past.unwrap_or(offset))),
+                    max_past,
                     None,
                     stream,
                 )
@@ -1026,11 +1043,14 @@ mod tests {
     use super::{load_gpt_oss_layerwise_model, load_gpt_oss_sparse_expert_cache_model};
     use crate::{
         architectures::gpt_oss::model::{self as resident, Cache, Model, ModelArgs, MxFp4Config},
-        runtime::cache::KeyValueCache,
         runtime::execution::layerwise::{LayerExecutionLoadOptions, LayerwiseLoadOptions},
         runtime::residency::dense_stream::DenseDiskStreamLoadOptions,
         runtime::residency::expert_cache::ExpertCacheLoadOptions,
         runtime::residency::policy::{MemoryTier, OffloadConfig, ResidencyPolicy},
+        runtime::{
+            attention::{AttentionPolicy, LayerSchedule},
+            cache::KeyValueCache,
+        },
     };
 
     fn tiny_args() -> ModelArgs {
@@ -1038,7 +1058,7 @@ mod tests {
             model_type: "gpt_oss".into(),
             hidden_size: 32,
             intermediate_size: 32,
-            num_hidden_layers: 2,
+            num_hidden_layers: 4,
             num_attention_heads: 1,
             num_key_value_heads: 1,
             head_dim: 32,
@@ -1046,11 +1066,19 @@ mod tests {
             num_local_experts: 2,
             num_experts_per_tok: 1,
             rms_norm_eps: 1e-5,
-            sliding_window: 4,
             max_position_embeddings: 64,
             rope_theta: 150_000.0,
             rope_scaling: None,
-            layer_types: vec!["sliding_attention".into(), "full_attention".into()],
+            attention_schedule: LayerSchedule::new(
+                4,
+                vec![
+                    AttentionPolicy::Full,
+                    AttentionPolicy::sliding(4).unwrap(),
+                    AttentionPolicy::Full,
+                    AttentionPolicy::sliding(4).unwrap(),
+                ],
+            )
+            .unwrap(),
             quantization_config: MxFp4Config {
                 quant_method: "mxfp4".into(),
             },
@@ -1091,6 +1119,23 @@ mod tests {
             dir.join("model.safetensors"),
         )
         .unwrap();
+        let layer_types = model
+            .args
+            .attention_schedule
+            .iter()
+            .map(|policy| match policy {
+                AttentionPolicy::Full => "full_attention",
+                AttentionPolicy::Sliding { .. } => "sliding_attention",
+            })
+            .collect::<Vec<_>>();
+        let sliding_window = model
+            .args
+            .attention_schedule
+            .sliding_windows()
+            .keys()
+            .next()
+            .expect("test schedule has sliding attention")
+            .get();
         fs::write(
             dir.join("config.json"),
             serde_json::to_vec(&serde_json::json!({
@@ -1105,10 +1150,10 @@ mod tests {
                 "num_local_experts": model.args.num_local_experts,
                 "num_experts_per_tok": model.args.num_experts_per_tok,
                 "rms_norm_eps": model.args.rms_norm_eps,
-                "sliding_window": model.args.sliding_window,
+                "sliding_window": sliding_window,
                 "max_position_embeddings": model.args.max_position_embeddings,
                 "rope_theta": model.args.rope_theta,
-                "layer_types": model.args.layer_types,
+                "layer_types": layer_types,
                 "quantization_config": {"quant_method": "mxfp4"},
                 "swiglu_limit": model.args.swiglu_limit
             }))
@@ -1242,7 +1287,7 @@ mod tests {
             assert_close(&actual, &expected);
         }
         let report = cached.expert_cache_report().unwrap().unwrap();
-        assert_eq!(report.owned_experts, 4);
+        assert_eq!(report.owned_experts, 8);
         assert!(report.prefill.requested_routes > 0);
         assert!(report.decode.requested_routes > 0);
         assert!(report.prefill.compact_banks > 1);

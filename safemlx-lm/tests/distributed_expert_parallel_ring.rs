@@ -1135,8 +1135,11 @@ fn write_additional_sparse_fixtures(root: &Path) -> Vec<(&'static str, &'static 
     });
     let directory = root.join("gpt-oss-sparse");
     std::fs::create_dir_all(&directory).unwrap();
-    let mut model =
-        gpt_oss::Model::new(serde_json::from_value(config.clone()).unwrap(), stream).unwrap();
+    let mut model = gpt_oss::Model::new(
+        gpt_oss::model_args_from_config_value(&config).unwrap(),
+        stream,
+    )
+    .unwrap();
     save_zero_fixture(&mut model, &config, &directory, stream, 32);
     fixtures.push(("GPT-OSS sparse expert cache", "GptOss", directory));
 

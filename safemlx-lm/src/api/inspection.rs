@@ -6213,6 +6213,39 @@ mod tests {
     }
 
     #[test]
+    fn gpt_oss_schedule_inspection_and_loader_preflight_reject_identically() {
+        for mutate in [
+            |config: &mut Value| {
+                config["layer_types"] = json!(["sliding_attention", "full_attention"])
+            },
+            |config: &mut Value| config["layer_types"] = json!(["unsupported_attention"]),
+            |config: &mut Value| config["sliding_window"] = json!(0),
+            |config: &mut Value| config["sliding_window"] = json!(-1),
+            |config: &mut Value| config["sliding_window"] = json!(i64::from(i32::MAX) + 1),
+        ] {
+            let directory = write_complete_gpt_oss_safetensors_dir(|_| {});
+            let mut config = gpt_oss_config();
+            mutate(&mut config);
+            std::fs::write(
+                directory.path().join("config.json"),
+                serde_json::to_vec(&config).unwrap(),
+            )
+            .unwrap();
+
+            let report =
+                inspect_model(directory.path(), ModelInspectionOptions::default()).unwrap();
+            assert_eq!(report.model_loadability, InspectionReadiness::Invalid);
+            assert!(!report.is_loadable());
+            assert!(structural::validate_safetensors_load_path(
+                ModelKind::GptOss,
+                directory.path(),
+                ModelLoadOptions::default(),
+            )
+            .is_err());
+        }
+    }
+
+    #[test]
     fn gpt_oss_missing_native_mxfp4_companion_is_structured() {
         let directory = write_complete_gpt_oss_safetensors_dir(|specs| {
             specs.retain(|(name, _, _)| name != "model.layers.0.mlp.experts.gate_up_proj_scales");

@@ -117,7 +117,7 @@ pub enum ExpertParallelCache {
     DenseQwenSliding(Vec<Option<SlidingKeyValueCache>>),
     /// Dense-Qwen globally budgeted paged key/value cache.
     DenseQwenPaged(Vec<Option<PagedKeyValueCache>>),
-    /// GPT-OSS alternating full/sliding attention cache.
+    /// GPT-OSS cache following its canonical per-layer attention schedule.
     GptOss(gpt_oss::Cache),
     /// Inkling attention and convolution cache.
     Inkling(inkling::Cache),
@@ -464,7 +464,7 @@ impl ExpertParallelModel {
 
     /// Allocates replicated attention state under an explicit cache policy.
     ///
-    /// DeepSeek compressed attention, GPT-OSS alternating attention, Qwen3 KV,
+    /// DeepSeek compressed attention, GPT-OSS scheduled attention, Qwen3 KV,
     /// and Inkling relative-position attention are supported. Inkling's
     /// convolution state remains resident; recurrent and multimodal state is
     /// rejected because it is not represented by paged KV blocks.
@@ -716,7 +716,10 @@ impl ExpertParallelModel {
                     ),
                     usize::try_from(model.args.num_hidden_layers)
                         .map_err(|_| Error::Parallel("invalid GPT-OSS layer count".into()))?,
-                    Some(model.args.sliding_window),
+                    model
+                        .args
+                        .prompt_cache_sliding_window()
+                        .map_err(|error| Error::Parallel(error.to_string()))?,
                 ),
                 _ => return Err(Error::Parallel(
                     "prompt-cache persistence is unsupported for this expert-parallel architecture"
