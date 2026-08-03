@@ -416,7 +416,11 @@ fn load_inkling_sparse_expert_cache_model_with_non_expert(
     )?;
     let args = resident::get_model_args(model_dir)?;
     if args.text_config.n_routed_experts <= 0
-        || !(0..args.text_config.num_hidden_layers).any(|layer| !args.text_config.is_dense(layer))
+        || !args
+            .text_config
+            .layer_schedule
+            .iter()
+            .any(|policy| policy.feed_forward == resident::FeedForwardPolicy::SparseMoe)
     {
         return Err(Error::UnsupportedArchitecture(
             "sparse expert caching requires an Inkling checkpoint with routed MoE layers".into(),
@@ -1032,14 +1036,7 @@ impl GeneralLayerwiseModelAdapter for InklingLayerwiseAdapter {
         if cache.layers.is_empty() {
             *cache = self.new_cache();
         }
-        if cache.layers.len() != self.args.text_config.num_hidden_layers as usize {
-            return Err(Error::UnsupportedArchitecture(format!(
-                "Inkling cache has {} layers, expected {}",
-                cache.layers.len(),
-                self.args.text_config.num_hidden_layers
-            )));
-        }
-        Ok(())
+        cache.validate(&self.args.text_config.layer_schedule)
     }
 
     fn begin_forward<'a>(
@@ -1345,7 +1342,14 @@ impl GeneralLayerwiseModelAdapter for InklingLayerwiseAdapter {
                 Ok(context.vision_jobs[0].hidden.clone())
             }
             ("text_decoder", InklingLayer::Text(layer)) => {
-                if self.sparse_expert_cache && !self.args.text_config.is_dense(index as i32) {
+                let policy = self.args.text_config.layer_policy(index).ok_or_else(|| {
+                    Error::UnsupportedArchitecture(format!(
+                        "Inkling layer schedule has no layer {index}"
+                    ))
+                })?;
+                if self.sparse_expert_cache
+                    && policy.feed_forward == resident::FeedForwardPolicy::SparseMoe
+                {
                     let expert_cache = self.expert_cache.as_ref().ok_or_else(|| {
                         Error::UnsupportedArchitecture(
                             "Inkling sparse expert cache was not initialized".into(),
@@ -1505,7 +1509,10 @@ pub(crate) fn inkling_expert_catalog(
     let text = &args.text_config;
     let mut entries = Vec::new();
     for layer in 0..text.num_hidden_layers as usize {
-        if text.is_dense(layer as i32) {
+        let policy = text.layer_policy(layer).ok_or_else(|| {
+            Error::UnsupportedArchitecture(format!("Inkling layer schedule has no layer {layer}"))
+        })?;
+        if policy.feed_forward == resident::FeedForwardPolicy::Dense {
             continue;
         }
         let runtime_prefix = format!("model.layers.{layer}");
@@ -1718,7 +1725,7 @@ mod tests {
                 "swa_num_key_value_heads": 1,
                 "swa_head_dim": 8,
                 "sliding_window_size": 4,
-                "local_layer_ids": [0, 1],
+                "layer_types": ["full_attention", "sliding_attention", "full_attention"],
                 "dense_mlp_idx": 1,
                 "sconv_kernel_size": 3,
                 "d_rel": 4,
@@ -1748,7 +1755,7 @@ mod tests {
     }
 
     fn args() -> ModelArgs {
-        serde_json::from_value(config()).unwrap()
+        resident::model_args_from_config_value(&config()).unwrap()
     }
 
     #[test]
@@ -1986,8 +1993,27 @@ mod tests {
     #[test]
     fn inkling_global_and_sliding_attention_paged_parity() {
         let gpu = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
-        let mut expected_model = Model::new(args(), gpu.stream()).unwrap();
-        let mut paged_model = Model::new(args(), gpu.stream()).unwrap();
+        let mut args = args();
+        args.text_config.layer_schedule = crate::runtime::attention::LayerSchedule::new(
+            3,
+            vec![
+                resident::LayerPolicy {
+                    attention: crate::runtime::attention::AttentionPolicy::Full,
+                    feed_forward: resident::FeedForwardPolicy::Dense,
+                },
+                resident::LayerPolicy {
+                    attention: crate::runtime::attention::AttentionPolicy::sliding(4).unwrap(),
+                    feed_forward: resident::FeedForwardPolicy::SparseMoe,
+                },
+                resident::LayerPolicy {
+                    attention: crate::runtime::attention::AttentionPolicy::sliding(2).unwrap(),
+                    feed_forward: resident::FeedForwardPolicy::SparseMoe,
+                },
+            ],
+        )
+        .unwrap();
+        let mut expected_model = Model::new(args.clone(), gpu.stream()).unwrap();
+        let mut paged_model = Model::new(args, gpu.stream()).unwrap();
         initialize(&mut expected_model, gpu.stream());
         initialize(&mut paged_model, gpu.stream());
         let mut expected_cache = expected_model.new_cache();
@@ -2021,6 +2047,21 @@ mod tests {
         assert!(report.key_value_blocks > 0);
         assert!(report.prefill_full_attention_blocks > 0);
         assert!(report.decode_full_attention_blocks > 0);
+        assert_eq!(
+            expected_cache
+                .layers
+                .iter()
+                .map(|layer| {
+                    layer
+                        .kv
+                        .retained_arrays()
+                        .first()
+                        .map(|array| array.dim(-2))
+                        .unwrap_or(0)
+                })
+                .collect::<Vec<_>>(),
+            vec![7, 3, 1]
+        );
     }
 
     #[test]
@@ -2092,8 +2133,11 @@ mod tests {
             "rms_norm_eps": 1e-6,
         });
         value["audio_token_id"] = serde_json::json!(20);
-        let mut fixture =
-            Model::new(serde_json::from_value(value.clone()).unwrap(), gpu.stream()).unwrap();
+        let mut fixture = Model::new(
+            resident::model_args_from_config_value(&value).unwrap(),
+            gpu.stream(),
+        )
+        .unwrap();
         initialize(&mut fixture, gpu.stream());
         let dir = tempfile::tempdir().unwrap();
         write_fixture(dir.path(), &fixture, gpu.stream());

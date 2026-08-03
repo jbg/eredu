@@ -1201,8 +1201,11 @@ fn write_additional_sparse_fixtures(root: &Path) -> Vec<(&'static str, &'static 
     });
     let directory = root.join("inkling-sparse");
     std::fs::create_dir_all(&directory).unwrap();
-    let mut model =
-        inkling::Model::new(serde_json::from_value(config.clone()).unwrap(), stream).unwrap();
+    let mut model = inkling::Model::new(
+        inkling::model_args_from_config_value(&config).unwrap(),
+        stream,
+    )
+    .unwrap();
     save_zero_fixture(&mut model, &config, &directory, stream, 32);
     fixtures.push(("Inkling sparse expert cache", "Inkling", directory));
 

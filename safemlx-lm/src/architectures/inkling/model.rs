@@ -39,12 +39,13 @@ use crate::{
     },
     architectures::qwen::dense::{gguf_i32_catalog, gguf_string},
     error::Error,
+    runtime::attention::{AttentionPolicy, LayerSchedule},
     runtime::cache::residency::{
-        CacheRankIdentity, CacheResidencyManager, CacheResidencyReport, PagedCacheOptions,
+        derive_prompt_cache_architecture_fingerprint, CacheRankIdentity, CacheResidencyManager,
+        CacheResidencyReport, PagedCacheOptions,
     },
     runtime::cache::{
         BlockwiseAttentionAccumulator, ConcatKeyValueCache, KeyValueCache, PagedKeyValueCache,
-        SlidingKeyValueCache,
     },
     runtime::checkpoint::load::{
         for_each_safetensor_array, gguf_metadata, gguf_quantization_configs, load_array_strict,
@@ -77,7 +78,7 @@ fn default_rel_extent() -> i32 {
     1024
 }
 
-fn default_sliding_window() -> i32 {
+fn default_sliding_window() -> i64 {
     512
 }
 
@@ -97,92 +98,153 @@ fn default_audio_token_id() -> u32 {
     200_053
 }
 
+#[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
+/// Feed-forward implementation selected for one Inkling decoder layer.
+pub enum FeedForwardPolicy {
+    /// Dense SwiGLU feed-forward block.
+    Dense,
+    /// Routed and shared sparse-MoE feed-forward block.
+    SparseMoe,
+}
+
+#[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
+/// Complete execution policy for one Inkling decoder layer.
+pub struct LayerPolicy {
+    /// Full or exact-window sliding self-attention.
+    pub attention: AttentionPolicy,
+    /// Dense or sparse-MoE feed-forward topology.
+    pub feed_forward: FeedForwardPolicy,
+}
+
 #[derive(Debug, Clone, Deserialize)]
-/// Decoder fields from Inkling's nested `text_config`.
-pub struct TextArgs {
+struct TextArgsSource {
     /// Dense checkpoint dtype used by the released safetensors model.
     #[serde(default)]
+    torch_dtype: Option<String>,
+    hidden_size: i32,
+    num_hidden_layers: i32,
+    vocab_size: i32,
+    num_attention_heads: i32,
+    num_key_value_heads: i32,
+    #[serde(default = "default_head_dim")]
+    head_dim: i32,
+    #[serde(default)]
+    swa_num_attention_heads: Option<i32>,
+    #[serde(default)]
+    swa_num_key_value_heads: Option<i32>,
+    #[serde(default)]
+    swa_head_dim: Option<i32>,
+    #[serde(default = "default_sliding_window", alias = "sliding_window")]
+    sliding_window_size: i64,
+    #[serde(default)]
+    local_layer_ids: Option<Vec<i64>>,
+    #[serde(default)]
+    layer_types: Option<Vec<String>>,
+    #[serde(default)]
+    dense_mlp_idx: Option<i64>,
+    #[serde(default)]
+    mlp_layer_types: Option<Vec<String>>,
+    #[serde(default = "default_sconv_kernel_size", alias = "conv_kernel_size")]
+    sconv_kernel_size: i32,
+    #[serde(default = "default_true")]
+    use_sconv: bool,
+    #[serde(default = "default_rel_extent")]
+    rel_extent: i32,
+    d_rel: i32,
+    #[serde(default)]
+    log_scaling_n_floor: Option<i32>,
+    #[serde(default)]
+    log_scaling_alpha: f32,
+    #[serde(default = "default_rms_norm_eps")]
+    rms_norm_eps: f32,
+    #[serde(default = "default_true")]
+    use_embed_norm: bool,
+    #[serde(default)]
+    unpadded_vocab_size: Option<i32>,
+    #[serde(default = "default_logit_scale")]
+    logits_mup_width_multiplier: f32,
+    #[serde(default)]
+    final_logit_softcapping: Option<f32>,
+    #[serde(default)]
+    intermediate_size: i32,
+    #[serde(default)]
+    dense_intermediate_size: Option<i32>,
+    #[serde(default)]
+    moe_intermediate_size: Option<i32>,
+    #[serde(default, alias = "num_experts")]
+    n_routed_experts: i32,
+    #[serde(default)]
+    num_experts_per_tok: i32,
+    #[serde(default)]
+    n_shared_experts: i32,
+    #[serde(default = "default_route_scale")]
+    route_scale: f32,
+    #[serde(default = "default_true")]
+    shared_expert_sink: bool,
+    #[serde(default = "default_true")]
+    use_gate_bias: bool,
+    #[serde(default = "default_true")]
+    norm_after_topk: bool,
+    #[serde(default = "default_true")]
+    use_global_scale: bool,
+    #[serde(default = "default_gate_activation")]
+    gate_activation: String,
+    #[serde(default = "default_hidden_activation")]
+    hidden_act: String,
+    #[serde(default)]
+    attention_dropout: f32,
+    #[serde(default)]
+    q_bias: bool,
+    #[serde(default)]
+    o_bias: bool,
+    #[serde(default)]
+    model_max_length: Option<i32>,
+}
+
+#[derive(Debug, Clone)]
+/// Validated Inkling text-decoder geometry normalized from checkpoint metadata.
+pub struct TextArgs {
     pub torch_dtype: Option<String>,
     pub hidden_size: i32,
     pub num_hidden_layers: i32,
     pub vocab_size: i32,
     pub num_attention_heads: i32,
     pub num_key_value_heads: i32,
-    #[serde(default = "default_head_dim")]
     pub head_dim: i32,
-    #[serde(default)]
     pub swa_num_attention_heads: Option<i32>,
-    #[serde(default)]
     pub swa_num_key_value_heads: Option<i32>,
-    #[serde(default)]
     pub swa_head_dim: Option<i32>,
-    #[serde(default = "default_sliding_window", alias = "sliding_window")]
-    pub sliding_window_size: i32,
-    #[serde(default)]
-    pub local_layer_ids: Option<Vec<i32>>,
-    #[serde(default)]
-    pub layer_types: Option<Vec<String>>,
-    #[serde(default)]
-    pub dense_mlp_idx: i32,
-    #[serde(default)]
-    pub mlp_layer_types: Option<Vec<String>>,
-    #[serde(default = "default_sconv_kernel_size", alias = "conv_kernel_size")]
+    /// Authoritative attention and feed-forward policy in decoder-layer order.
+    pub layer_schedule: LayerSchedule<LayerPolicy>,
     pub sconv_kernel_size: i32,
-    #[serde(default = "default_true")]
     pub use_sconv: bool,
-    #[serde(default = "default_rel_extent")]
     pub rel_extent: i32,
     pub d_rel: i32,
-    #[serde(default)]
     pub log_scaling_n_floor: Option<i32>,
-    #[serde(default)]
     pub log_scaling_alpha: f32,
-    #[serde(default = "default_rms_norm_eps")]
     pub rms_norm_eps: f32,
-    #[serde(default = "default_true")]
     pub use_embed_norm: bool,
-    #[serde(default)]
     pub unpadded_vocab_size: Option<i32>,
-    #[serde(default = "default_logit_scale")]
     pub logits_mup_width_multiplier: f32,
-    #[serde(default)]
     pub final_logit_softcapping: Option<f32>,
-    #[serde(default)]
     pub intermediate_size: i32,
-    #[serde(default)]
     pub dense_intermediate_size: Option<i32>,
-    #[serde(default)]
     pub moe_intermediate_size: Option<i32>,
-    #[serde(default, alias = "num_experts")]
     pub n_routed_experts: i32,
-    #[serde(default)]
     pub num_experts_per_tok: i32,
-    #[serde(default)]
     pub n_shared_experts: i32,
-    #[serde(default = "default_route_scale")]
     pub route_scale: f32,
-    #[serde(default = "default_true")]
     pub shared_expert_sink: bool,
-    #[serde(default = "default_true")]
     pub use_gate_bias: bool,
-    #[serde(default = "default_true")]
     pub norm_after_topk: bool,
-    #[serde(default = "default_true")]
     pub use_global_scale: bool,
-    #[serde(default = "default_gate_activation")]
     pub gate_activation: String,
-    #[serde(default = "default_hidden_activation")]
     pub hidden_act: String,
-    #[serde(default)]
     pub attention_dropout: f32,
-    #[serde(default)]
     pub q_bias: bool,
-    #[serde(default)]
     pub o_bias: bool,
-    #[serde(default)]
     pub model_max_length: Option<i32>,
     /// Exact per-weight formats for mixed GGUF checkpoints.
-    #[serde(skip)]
     pub quantized_weight_configs: Option<HashMap<String, WeightQuantization>>,
 }
 
@@ -226,25 +288,9 @@ impl TextArgs {
         self.moe_intermediate_size.unwrap_or(self.intermediate_size)
     }
 
-    pub(crate) fn is_local(&self, layer: i32) -> bool {
-        if let Some(ids) = &self.local_layer_ids {
-            return ids.contains(&layer);
-        }
-        if let Some(types) = &self.layer_types {
-            return types
-                .get(layer as usize)
-                .is_some_and(|kind| kind.contains("sliding"));
-        }
-        (layer + 1) % 6 != 0
-    }
-
-    pub(crate) fn is_dense(&self, layer: i32) -> bool {
-        if let Some(types) = &self.mlp_layer_types {
-            return types
-                .get(layer as usize)
-                .is_some_and(|kind| kind == "dense");
-        }
-        layer < self.dense_mlp_idx
+    /// Returns one validated layer policy without a fallback.
+    pub fn layer_policy(&self, layer: usize) -> Option<&LayerPolicy> {
+        self.layer_schedule.get(layer)
     }
 
     pub(crate) fn q_heads(&self, local: bool) -> i32 {
@@ -275,20 +321,31 @@ impl TextArgs {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+struct ModelArgsSource {
+    #[serde(default = "default_model_type")]
+    model_type: String,
+    text_config: TextArgsSource,
+    #[serde(default)]
+    audio_config: Option<AudioArgs>,
+    #[serde(default)]
+    vision_config: Option<VisionArgs>,
+    #[serde(default = "default_image_token_id")]
+    image_token_id: u32,
+    #[serde(default = "default_audio_token_id")]
+    audio_token_id: u32,
+    #[serde(default)]
+    eos_token_id: Option<u32>,
+}
+
+#[derive(Debug, Clone)]
 /// Released top-level Inkling configuration.
 pub struct ModelArgs {
-    #[serde(default = "default_model_type")]
     pub model_type: String,
     pub text_config: TextArgs,
-    #[serde(default)]
     pub audio_config: Option<AudioArgs>,
-    #[serde(default)]
     pub vision_config: Option<VisionArgs>,
-    #[serde(default = "default_image_token_id")]
     pub image_token_id: u32,
-    #[serde(default = "default_audio_token_id")]
     pub audio_token_id: u32,
-    #[serde(default)]
     pub eos_token_id: Option<u32>,
 }
 
@@ -370,7 +427,7 @@ impl VisionArgs {
 /// Global or bounded KV state selected per decoder layer.
 pub enum InklingKvCache {
     Global(ConcatKeyValueCache),
-    Sliding(SlidingKeyValueCache),
+    Sliding(ConcatKeyValueCache),
     Paged(PagedKeyValueCache),
 }
 
@@ -438,12 +495,16 @@ pub struct LayerCache {
 }
 
 impl LayerCache {
-    fn new(local: bool, window: i32) -> Self {
+    fn new(policy: AttentionPolicy) -> Self {
         Self {
-            kv: if local {
-                InklingKvCache::Sliding(SlidingKeyValueCache::new(window))
-            } else {
-                InklingKvCache::Global(ConcatKeyValueCache::new())
+            kv: match policy.window() {
+                Some(window) => {
+                    InklingKvCache::Sliding(ConcatKeyValueCache::new_for_sliding_attention(
+                        i32::try_from(window.get())
+                            .expect("validated Inkling sliding window fits i32"),
+                    ))
+                }
+                None => InklingKvCache::Global(ConcatKeyValueCache::new()),
             },
             convolutions: std::array::from_fn(|_| CausalConv1dCache::default()),
         }
@@ -455,12 +516,14 @@ impl LayerCache {
         manager: CacheResidencyManager,
         rank: Option<CacheRankIdentity>,
     ) -> Result<Self, Exception> {
-        let local = args.is_local(layer as i32);
+        let policy = args
+            .layer_policy(layer)
+            .ok_or_else(|| Exception::custom(format!("Inkling has no policy for layer {layer}")))?;
         Ok(Self {
             kv: InklingKvCache::Paged(PagedKeyValueCache::new_with_layout(
                 manager,
                 layer,
-                local.then_some(args.sliding_window_size),
+                policy.attention.window().map(|window| window.get() as i32),
                 0,
                 rank,
             )?),
@@ -478,8 +541,10 @@ pub struct Cache {
 impl Cache {
     pub(crate) fn new(args: &TextArgs) -> Self {
         Self {
-            layers: (0..args.num_hidden_layers)
-                .map(|layer| LayerCache::new(args.is_local(layer), args.sliding_window_size))
+            layers: args
+                .layer_schedule
+                .iter()
+                .map(|policy| LayerCache::new(policy.attention))
                 .collect(),
         }
     }
@@ -542,6 +607,34 @@ impl Cache {
         }
         Ok(())
     }
+
+    pub(crate) fn validate(&self, schedule: &LayerSchedule<LayerPolicy>) -> Result<(), Error> {
+        if self.layers.len() != schedule.len() {
+            return Err(Error::UnsupportedArchitecture(format!(
+                "Inkling cache has {} layers, expected {}",
+                self.layers.len(),
+                schedule.len()
+            )));
+        }
+        for (layer, (cache, policy)) in self.layers.iter().zip(schedule.iter()).enumerate() {
+            let actual = match cache.kv.max_size() {
+                Some(window) => AttentionPolicy::sliding(u32::try_from(window).map_err(|_| {
+                    Error::UnsupportedArchitecture(format!(
+                        "Inkling cache layer {layer} has invalid window {window}"
+                    ))
+                })?)
+                .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?,
+                None => AttentionPolicy::Full,
+            };
+            if actual != policy.attention {
+                return Err(Error::UnsupportedArchitecture(format!(
+                    "Inkling cache policy mismatch at layer {layer}: expected {:?}, got {actual:?}",
+                    policy.attention
+                )));
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, ModuleParameters)]
@@ -551,8 +644,7 @@ struct InklingAttention {
     head_dim: i32,
     d_rel: i32,
     rel_extent: i32,
-    local: bool,
-    sliding_window: i32,
+    policy: AttentionPolicy,
     log_scaling_n_floor: Option<i32>,
     log_scaling_alpha: f32,
     #[param]
@@ -578,16 +670,24 @@ struct InklingAttention {
 }
 
 impl InklingAttention {
-    fn new(args: &TextArgs, layer: i32, stream: &Stream) -> Result<Self, Exception> {
-        let local = args.is_local(layer);
+    fn sliding_window(&self) -> Option<i32> {
+        self.policy.window().map(|window| window.get() as i32)
+    }
+
+    fn new(
+        args: &TextArgs,
+        layer: i32,
+        policy: AttentionPolicy,
+        stream: &Stream,
+    ) -> Result<Self, Exception> {
+        let local = policy.window().is_some();
         let n_heads = args.q_heads(local);
         let n_kv_heads = args.kv_heads(local);
         let head_dim = args.attention_head_dim(local);
-        let rel_extent = if local {
-            args.sliding_window_size
-        } else {
-            args.rel_extent
-        };
+        let rel_extent = policy
+            .window()
+            .map(|window| window.get() as i32)
+            .unwrap_or(args.rel_extent);
         let prefix = format!("model.layers.{layer}.self_attn");
         Ok(Self {
             n_heads,
@@ -595,8 +695,7 @@ impl InklingAttention {
             head_dim,
             d_rel: args.d_rel,
             rel_extent,
-            local,
-            sliding_window: args.sliding_window_size,
+            policy,
             log_scaling_n_floor: args.log_scaling_n_floor,
             log_scaling_alpha: args.log_scaling_alpha,
             q_proj: common::linear::unloaded_maybe_quantized_linear_with_dtype(
@@ -775,7 +874,8 @@ impl InklingAttention {
         // discard keys outside the earliest query's window for each chunk.
         const TARGET_SCORE_ELEMENTS: i32 = 16 * 1024 * 1024;
         let total_key_len = k.dim(2).max(1);
-        let chunk_size = if self.local {
+        let window = self.sliding_window();
+        let chunk_size = if window.is_some() {
             256
         } else {
             (TARGET_SCORE_ELEMENTS / (self.n_heads * total_key_len)).clamp(1, 256)
@@ -787,8 +887,8 @@ impl InklingAttention {
             let end = (start + chunk_size).min(query_len);
             let query_abs_start = query_offset + start;
             let query_abs_end = query_offset + end;
-            let chunk_key_start = if self.local {
-                (query_abs_start - self.sliding_window + 1).max(key_offset)
+            let chunk_key_start = if let Some(window) = window {
+                (query_abs_start - window + 1).max(key_offset)
             } else {
                 key_offset
             };
@@ -840,7 +940,8 @@ impl InklingAttention {
         stream: &Stream,
     ) -> Result<Array, Exception> {
         const TARGET_SCORE_ELEMENTS: i32 = 16 * 1024 * 1024;
-        let chunk_size = if self.local {
+        let window = self.sliding_window();
+        let chunk_size = if window.is_some() {
             256
         } else {
             (TARGET_SCORE_ELEMENTS / (self.n_heads * cache.offset().max(1))).clamp(1, 256)
@@ -863,14 +964,14 @@ impl InklingAttention {
                 1.0 / self.head_dim as f32,
                 None,
                 query_abs_start as i64,
-                self.local.then_some(self.sliding_window),
+                window,
                 0,
                 None,
                 cache.offset() as i64,
                 stream,
             )?;
-            let visible_start = if self.local {
-                (query_abs_start - self.sliding_window + 1).max(0) as i64
+            let visible_start = if let Some(window) = window {
+                (query_abs_start - window + 1).max(0) as i64
             } else {
                 0
             };
@@ -925,7 +1026,7 @@ impl InklingAttention {
         query_len: i32,
         stream: &Stream,
     ) -> Result<Option<Array>, Exception> {
-        if self.local {
+        if self.sliding_window().is_some() {
             return Ok(None);
         }
         let Some(floor) = self.log_scaling_n_floor else {
@@ -965,11 +1066,8 @@ impl InklingAttention {
             .try_index_device((NewAxis, ..), stream)?;
         let distances = q_positions.subtract(k_positions, stream)?;
         let mut valid = distances.ge(Array::from_int(0), stream)?;
-        if self.local {
-            valid = valid.logical_and(
-                &distances.lt(Array::from_int(self.sliding_window), stream)?,
-                stream,
-            )?;
+        if let Some(window) = self.sliding_window() {
+            valid = valid.logical_and(&distances.lt(Array::from_int(window), stream)?, stream)?;
         }
         let gather = clip(&distances, (0, self.rel_extent - 1), stream)?
             .as_dtype(Dtype::Int32, stream)?
@@ -981,7 +1079,7 @@ impl InklingAttention {
             stream,
         )?;
         bias = r#where(&relative_valid, bias, Array::from_f32(0.0), stream)?;
-        let tau = if !self.local {
+        let tau = if self.sliding_window().is_none() {
             if let Some(tau) = self.global_query_scale(query_offset, query_len, stream)? {
                 bias = bias.multiply(&tau, stream)?;
                 Some(tau)
@@ -1193,7 +1291,10 @@ pub(crate) struct DecoderLayer {
 
 impl DecoderLayer {
     pub(crate) fn new(args: &TextArgs, layer: i32, stream: &Stream) -> Result<Self, Exception> {
-        let dense = args.is_dense(layer);
+        let policy = *args
+            .layer_policy(layer as usize)
+            .ok_or_else(|| Exception::custom(format!("Inkling has no policy for layer {layer}")))?;
+        let dense = policy.feed_forward == FeedForwardPolicy::Dense;
         Ok(Self {
             input_layernorm: nn::RmsNorm::unloaded(
                 args.hidden_size,
@@ -1201,7 +1302,7 @@ impl DecoderLayer {
                 args.weight_dtype(),
                 stream,
             )?,
-            self_attn: InklingAttention::new(args, layer, stream)?,
+            self_attn: InklingAttention::new(args, layer, policy.attention, stream)?,
             attn_sconv: DepthwiseConv1d::new(
                 args.hidden_size,
                 args.sconv_kernel_size,
@@ -1801,6 +1902,11 @@ impl Model {
         last_token_only: bool,
         stream: &Stream,
     ) -> Result<Array, Exception> {
+        if let Some(cache) = cache.as_ref() {
+            cache
+                .validate(&self.args.text_config.layer_schedule)
+                .map_err(|error| Exception::custom(error.to_string()))?;
+        }
         let mut hidden = self.model.forward(tokens, inputs_embeds, cache, stream)?;
         if last_token_only {
             hidden = hidden.try_index_device((.., -1, ..), stream)?;
@@ -2046,7 +2152,16 @@ pub(crate) fn load_gguf_checkpoint_with_mmproj(
                             "invalid Inkling GGUF global-scale name {translated:?}"
                         ))
                     })?;
-                translated = if model.args.text_config.is_dense(layer) {
+                let policy = model
+                    .args
+                    .text_config
+                    .layer_policy(layer as usize)
+                    .ok_or_else(|| {
+                        Error::UnsupportedArchitecture(format!(
+                            "Inkling layer schedule has no layer {layer}"
+                        ))
+                    })?;
+                translated = if policy.feed_forward == FeedForwardPolicy::Dense {
                     format!("model.layers.{layer}.dense_global_scale")
                 } else {
                     format!("model.layers.{layer}.moe.router.global_scale")
@@ -2058,7 +2173,17 @@ pub(crate) fn load_gguf_checkpoint_with_mmproj(
             load_named_array_strict(&mut model, translated, value, None, &config, &mut report)?;
         }
     }
-    for layer in model.args.text_config.dense_mlp_idx..model.args.text_config.num_hidden_layers {
+    let sparse_layers = model
+        .args
+        .text_config
+        .layer_schedule
+        .iter()
+        .enumerate()
+        .filter_map(|(layer, policy)| {
+            (policy.feed_forward == FeedForwardPolicy::SparseMoe).then_some(layer)
+        })
+        .collect::<Vec<_>>();
+    for layer in sparse_layers {
         let source = format!("blk.{layer}");
         for (source_gate, source_up, target) in [
             ("ffn_gate_exps", "ffn_up_exps", "moe.experts.gate_up_proj"),
@@ -2170,7 +2295,15 @@ pub(crate) fn prepare_gguf_checkpoint_with_mmproj(
     }
     let mut configs = gguf_quantization_configs(checkpoint, translate_gguf_weight_name)?;
     let mut args = args_from_gguf_catalog(metadata)?;
-    for layer in args.text_config.dense_mlp_idx..args.text_config.num_hidden_layers {
+    for layer in args
+        .text_config
+        .layer_schedule
+        .iter()
+        .enumerate()
+        .filter_map(|(layer, policy)| {
+            (policy.feed_forward == FeedForwardPolicy::SparseMoe).then_some(layer)
+        })
+    {
         for prefix in [
             format!("model.layers.{layer}.moe.experts"),
             format!("model.layers.{layer}.moe.shared_experts"),
@@ -2407,6 +2540,16 @@ pub(crate) fn args_from_gguf_catalog(
         .zip(&pattern)
         .find_map(|(value, local)| local.then_some(*value))
         .unwrap_or(global_kv);
+    if kv_values
+        .iter()
+        .zip(&pattern)
+        .any(|(value, local)| *value != if *local { local_kv } else { global_kv })
+    {
+        return Err(Error::UnsupportedArchitecture(
+            "Inkling GGUF attention.head_count_kv must be uniform within each attention policy"
+                .into(),
+        ));
+    }
     let hidden_size = gguf_i32_catalog(metadata, &key("embedding_length"))?;
     let heads = gguf_i32_catalog(metadata, &key("attention.head_count"))?;
     if hidden_size <= 0 || heads <= 0 {
@@ -2417,6 +2560,40 @@ pub(crate) fn args_from_gguf_catalog(
     let head_dim =
         gguf_optional_i32(metadata, &key("attention.key_length"))?.unwrap_or(hidden_size / heads);
     let vocab_size = gguf_vocab_size(metadata, &key("vocab_size"))?;
+    let sliding_window = gguf_i32_catalog(metadata, &key("attention.sliding_window"))?;
+    if sliding_window <= 0 {
+        return Err(Error::UnsupportedArchitecture(format!(
+            "Inkling GGUF sliding window must be positive, got {sliding_window}"
+        )));
+    }
+    let sliding = AttentionPolicy::sliding(sliding_window as u32)
+        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+    let dense_layers = gguf_i32_catalog(metadata, &key("dense_block_count"))?;
+    if !(0..=layers).contains(&dense_layers) {
+        return Err(Error::UnsupportedArchitecture(format!(
+            "Inkling GGUF dense block count {dense_layers} is outside 0..={layers}"
+        )));
+    }
+    let layer_schedule = LayerSchedule::new(
+        layers as usize,
+        pattern
+            .iter()
+            .enumerate()
+            .map(|(layer, local)| LayerPolicy {
+                attention: if *local {
+                    sliding
+                } else {
+                    AttentionPolicy::Full
+                },
+                feed_forward: if layer < dense_layers as usize {
+                    FeedForwardPolicy::Dense
+                } else {
+                    FeedForwardPolicy::SparseMoe
+                },
+            })
+            .collect(),
+    )
+    .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
     let args = ModelArgs {
         model_type: "inkling_mm_model".into(),
         text_config: TextArgs {
@@ -2434,17 +2611,7 @@ pub(crate) fn args_from_gguf_catalog(
                 Error::UnsupportedArchitecture("Inkling local KV heads exceed i32".into())
             })?),
             swa_head_dim: Some(head_dim),
-            sliding_window_size: gguf_i32_catalog(metadata, &key("attention.sliding_window"))?,
-            local_layer_ids: Some(
-                pattern
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(layer, local)| local.then_some(layer as i32))
-                    .collect(),
-            ),
-            layer_types: None,
-            dense_mlp_idx: gguf_i32_catalog(metadata, &key("dense_block_count"))?,
-            mlp_layer_types: None,
+            layer_schedule,
             sconv_kernel_size: gguf_i32_catalog(metadata, &key("shortconv_kernel"))?,
             use_sconv: true,
             rel_extent: gguf_i32_catalog(metadata, &key("rel_extent"))?,
@@ -2497,14 +2664,11 @@ fn gguf_bool_pattern(
         Some(GgufMetadataValue::Array(safemlx::ops::GgufMetadataArray::Bool(values))) => {
             values.clone()
         }
-        Some(value) => value
-            .to_i64_vec()
-            .map(|values| values.into_iter().map(|value| value != 0).collect())
-            .ok_or_else(|| {
-                Error::UnsupportedArchitecture(format!(
-                    "Inkling GGUF metadata key {key:?} must be a bool array"
-                ))
-            })?,
+        Some(_) => {
+            return Err(Error::UnsupportedArchitecture(format!(
+                "Inkling GGUF metadata key {key:?} must be a bool array"
+            )))
+        }
         None => (0..layers).map(|layer| (layer + 1) % 6 != 0).collect(),
     };
     if values.len() != layers as usize {
@@ -2665,12 +2829,286 @@ pub fn get_model_args(model_dir: impl AsRef<Path>) -> Result<ModelArgs, Error> {
     model_args_from_config_value(&value)
 }
 
+/// Returns a deterministic cache-relevant identity including the complete
+/// ordered Inkling layer schedule.
+pub(crate) fn prompt_cache_architecture_fingerprint(args: &ModelArgs) -> String {
+    let text = &args.text_config;
+    let schedule = text
+        .layer_schedule
+        .iter()
+        .map(|policy| {
+            let attention = match policy.attention {
+                AttentionPolicy::Full => "f".to_string(),
+                AttentionPolicy::Sliding { window } => format!("s{}", window.get()),
+            };
+            let feed_forward = match policy.feed_forward {
+                FeedForwardPolicy::Dense => "d",
+                FeedForwardPolicy::SparseMoe => "m",
+            };
+            format!("{attention}{feed_forward}")
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    derive_prompt_cache_architecture_fingerprint(
+        "inkling",
+        [
+            ("model_type", args.model_type.clone()),
+            ("hidden_size", text.hidden_size.to_string()),
+            ("num_hidden_layers", text.num_hidden_layers.to_string()),
+            ("num_attention_heads", text.num_attention_heads.to_string()),
+            ("num_key_value_heads", text.num_key_value_heads.to_string()),
+            ("head_dim", text.head_dim.to_string()),
+            (
+                "swa_num_attention_heads",
+                format!("{:?}", text.swa_num_attention_heads),
+            ),
+            (
+                "swa_num_key_value_heads",
+                format!("{:?}", text.swa_num_key_value_heads),
+            ),
+            ("swa_head_dim", format!("{:?}", text.swa_head_dim)),
+            ("layer_schedule", schedule),
+            ("sconv_kernel_size", text.sconv_kernel_size.to_string()),
+            ("d_rel", text.d_rel.to_string()),
+            ("rel_extent", text.rel_extent.to_string()),
+            ("n_routed_experts", text.n_routed_experts.to_string()),
+            ("n_shared_experts", text.n_shared_experts.to_string()),
+            ("num_experts_per_tok", text.num_experts_per_tok.to_string()),
+            ("image_token_id", args.image_token_id.to_string()),
+            ("audio_token_id", args.audio_token_id.to_string()),
+        ],
+    )
+}
+
+fn inkling_layer_schedule(source: &TextArgsSource) -> Result<LayerSchedule<LayerPolicy>, Error> {
+    let layers = usize::try_from(source.num_hidden_layers).map_err(|_| {
+        Error::UnsupportedArchitecture(format!(
+            "Inkling num_hidden_layers must be positive, got {}",
+            source.num_hidden_layers
+        ))
+    })?;
+    if layers == 0 {
+        return Err(Error::UnsupportedArchitecture(
+            "Inkling num_hidden_layers must be positive, got 0".into(),
+        ));
+    }
+    if source.sliding_window_size <= 0 {
+        return Err(Error::UnsupportedArchitecture(format!(
+            "Inkling sliding_window_size must be positive, got {}",
+            source.sliding_window_size
+        )));
+    }
+    let window = u32::try_from(source.sliding_window_size).map_err(|_| {
+        Error::UnsupportedArchitecture(format!(
+            "Inkling sliding_window_size exceeds the executable u32 range: {}",
+            source.sliding_window_size
+        ))
+    })?;
+    if window > i32::MAX as u32 {
+        return Err(Error::UnsupportedArchitecture(format!(
+            "Inkling sliding_window_size exceeds the executable i32 range: {window}"
+        )));
+    }
+    let sliding = AttentionPolicy::sliding(window)
+        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+
+    let from_ids = source
+        .local_layer_ids
+        .as_ref()
+        .map(|ids| {
+            let mut pattern = vec![false; layers];
+            for id in ids {
+                let layer = usize::try_from(*id).map_err(|_| {
+                    Error::UnsupportedArchitecture(format!(
+                        "Inkling local_layer_ids contains negative layer {id}"
+                    ))
+                })?;
+                if layer >= layers {
+                    return Err(Error::UnsupportedArchitecture(format!(
+                        "Inkling local_layer_ids contains layer {layer} for {layers} layers"
+                    )));
+                }
+                if std::mem::replace(&mut pattern[layer], true) {
+                    return Err(Error::UnsupportedArchitecture(format!(
+                        "Inkling local_layer_ids contains duplicate layer {layer}"
+                    )));
+                }
+            }
+            Ok(pattern)
+        })
+        .transpose()?;
+    let from_types = source
+        .layer_types
+        .as_ref()
+        .map(|types| {
+            if types.len() != layers {
+                return Err(Error::UnsupportedArchitecture(format!(
+                    "Inkling layer_types has {} entries for {layers} layers",
+                    types.len()
+                )));
+            }
+            types
+                .iter()
+                .enumerate()
+                .map(|(layer, kind)| match kind.as_str() {
+                    "sliding_attention" => Ok(true),
+                    "full_attention" => Ok(false),
+                    _ => Err(Error::UnsupportedArchitecture(format!(
+                        "Inkling layer_types[{layer}] must be sliding_attention or full_attention, got {kind:?}"
+                    ))),
+                })
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .transpose()?;
+    if let (Some(ids), Some(types)) = (&from_ids, &from_types) {
+        if ids != types {
+            return Err(Error::UnsupportedArchitecture(
+                "Inkling local_layer_ids conflicts with layer_types".into(),
+            ));
+        }
+    }
+    let attention = from_ids
+        .or(from_types)
+        .unwrap_or_else(|| (0..layers).map(|layer| (layer + 1) % 6 != 0).collect());
+
+    let from_types = source
+        .mlp_layer_types
+        .as_ref()
+        .map(|types| {
+            if types.len() != layers {
+                return Err(Error::UnsupportedArchitecture(format!(
+                    "Inkling mlp_layer_types has {} entries for {layers} layers",
+                    types.len()
+                )));
+            }
+            types
+                .iter()
+                .enumerate()
+                .map(|(layer, kind)| match kind.as_str() {
+                    "dense" => Ok(FeedForwardPolicy::Dense),
+                    "moe" => Ok(FeedForwardPolicy::SparseMoe),
+                    _ => Err(Error::UnsupportedArchitecture(format!(
+                        "Inkling mlp_layer_types[{layer}] must be dense or moe, got {kind:?}"
+                    ))),
+                })
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .transpose()?;
+    let from_threshold = source
+        .dense_mlp_idx
+        .map(|threshold| {
+            let threshold = usize::try_from(threshold).map_err(|_| {
+                Error::UnsupportedArchitecture(format!(
+                    "Inkling dense_mlp_idx must be nonnegative, got {threshold}"
+                ))
+            })?;
+            if threshold > layers {
+                return Err(Error::UnsupportedArchitecture(format!(
+                    "Inkling dense_mlp_idx {threshold} exceeds {layers} layers"
+                )));
+            }
+            Ok((0..layers)
+                .map(|layer| {
+                    if layer < threshold {
+                        FeedForwardPolicy::Dense
+                    } else {
+                        FeedForwardPolicy::SparseMoe
+                    }
+                })
+                .collect::<Vec<_>>())
+        })
+        .transpose()?;
+    if let (Some(types), Some(threshold)) = (&from_types, &from_threshold) {
+        if types != threshold {
+            return Err(Error::UnsupportedArchitecture(
+                "Inkling dense_mlp_idx conflicts with mlp_layer_types".into(),
+            ));
+        }
+    }
+    let feed_forward = from_types
+        .or(from_threshold)
+        .unwrap_or_else(|| vec![FeedForwardPolicy::SparseMoe; layers]);
+    LayerSchedule::new(
+        layers,
+        attention
+            .into_iter()
+            .zip(feed_forward)
+            .map(|(local, feed_forward)| LayerPolicy {
+                attention: if local {
+                    sliding
+                } else {
+                    AttentionPolicy::Full
+                },
+                feed_forward,
+            })
+            .collect(),
+    )
+    .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
+}
+
+impl TextArgsSource {
+    fn into_args(self, layer_schedule: LayerSchedule<LayerPolicy>) -> TextArgs {
+        TextArgs {
+            torch_dtype: self.torch_dtype,
+            hidden_size: self.hidden_size,
+            num_hidden_layers: self.num_hidden_layers,
+            vocab_size: self.vocab_size,
+            num_attention_heads: self.num_attention_heads,
+            num_key_value_heads: self.num_key_value_heads,
+            head_dim: self.head_dim,
+            swa_num_attention_heads: self.swa_num_attention_heads,
+            swa_num_key_value_heads: self.swa_num_key_value_heads,
+            swa_head_dim: self.swa_head_dim,
+            layer_schedule,
+            sconv_kernel_size: self.sconv_kernel_size,
+            use_sconv: self.use_sconv,
+            rel_extent: self.rel_extent,
+            d_rel: self.d_rel,
+            log_scaling_n_floor: self.log_scaling_n_floor,
+            log_scaling_alpha: self.log_scaling_alpha,
+            rms_norm_eps: self.rms_norm_eps,
+            use_embed_norm: self.use_embed_norm,
+            unpadded_vocab_size: self.unpadded_vocab_size,
+            logits_mup_width_multiplier: self.logits_mup_width_multiplier,
+            final_logit_softcapping: self.final_logit_softcapping,
+            intermediate_size: self.intermediate_size,
+            dense_intermediate_size: self.dense_intermediate_size,
+            moe_intermediate_size: self.moe_intermediate_size,
+            n_routed_experts: self.n_routed_experts,
+            num_experts_per_tok: self.num_experts_per_tok,
+            n_shared_experts: self.n_shared_experts,
+            route_scale: self.route_scale,
+            shared_expert_sink: self.shared_expert_sink,
+            use_gate_bias: self.use_gate_bias,
+            norm_after_topk: self.norm_after_topk,
+            use_global_scale: self.use_global_scale,
+            gate_activation: self.gate_activation,
+            hidden_act: self.hidden_act,
+            attention_dropout: self.attention_dropout,
+            q_bias: self.q_bias,
+            o_bias: self.o_bias,
+            model_max_length: self.model_max_length,
+            quantized_weight_configs: None,
+        }
+    }
+}
+
 /// Parses the same validated configuration used by loading without creating
 /// Inkling's text or media module trees.
-pub(crate) fn model_args_from_config_value(value: &Value) -> Result<ModelArgs, Error> {
-    let args: ModelArgs = serde_json::from_value(value.clone()).map_err(|error| {
+pub fn model_args_from_config_value(value: &Value) -> Result<ModelArgs, Error> {
+    let source: ModelArgsSource = serde_json::from_value(value.clone()).map_err(|error| {
         Error::UnsupportedArchitecture(format!("invalid Inkling config: {error}"))
     })?;
+    let layer_schedule = inkling_layer_schedule(&source.text_config)?;
+    let args = ModelArgs {
+        model_type: source.model_type,
+        text_config: source.text_config.into_args(layer_schedule),
+        audio_config: source.audio_config,
+        vision_config: source.vision_config,
+        image_token_id: source.image_token_id,
+        audio_token_id: source.audio_token_id,
+        eos_token_id: source.eos_token_id,
+    };
     validate_args(&args)?;
     Ok(args)
 }
@@ -2706,7 +3144,6 @@ fn validate_args(args: &ModelArgs) -> Result<(), Error> {
         ("head_dim", text.head_dim),
         ("d_rel", text.d_rel),
         ("rel_extent", text.rel_extent),
-        ("sliding_window_size", text.sliding_window_size),
         ("sconv_kernel_size", text.sconv_kernel_size),
         ("n_routed_experts", text.n_routed_experts),
         ("num_experts_per_tok", text.num_experts_per_tok),
@@ -2772,23 +3209,23 @@ fn validate_args(args: &ModelArgs) -> Result<(), Error> {
         ));
     }
     if text.num_experts_per_tok > text.n_routed_experts
-        || !(0..=text.num_hidden_layers).contains(&text.dense_mlp_idx)
-        || text.local_layer_ids.as_ref().is_some_and(|ids| {
-            ids.iter()
-                .any(|layer| !(0..text.num_hidden_layers).contains(layer))
-        })
-        || text
-            .layer_types
-            .as_ref()
-            .is_some_and(|types| types.len() != text.num_hidden_layers as usize)
-        || text
-            .mlp_layer_types
-            .as_ref()
-            .is_some_and(|types| types.len() != text.num_hidden_layers as usize)
+        || text.layer_schedule.len() != text.num_hidden_layers as usize
     {
         return Err(Error::UnsupportedArchitecture(
             "Inkling layer schedule or expert top-k configuration is inconsistent".into(),
         ));
+    }
+    for window in text
+        .layer_schedule
+        .iter()
+        .filter_map(|policy| policy.attention.window())
+    {
+        if window.get() > i32::MAX as u32 {
+            return Err(Error::UnsupportedArchitecture(format!(
+                "Inkling sliding attention window exceeds the executable i32 range: {}",
+                window.get()
+            )));
+        }
     }
     if let Some(audio) = &args.audio_config {
         if audio.text_hidden_size != text.hidden_size
@@ -3402,11 +3839,221 @@ mod tests {
         ]);
         let args = super::args_from_gguf_catalog(&metadata).unwrap();
         super::validate_args(&args).unwrap();
-        assert_eq!(args.text_config.local_layer_ids, Some(vec![0]));
+        assert_eq!(
+            args.text_config
+                .layer_schedule
+                .iter()
+                .map(|policy| policy.attention.window().is_some())
+                .collect::<Vec<_>>(),
+            vec![true, false]
+        );
         assert_eq!(args.text_config.swa_num_key_value_heads, Some(2));
         assert_eq!(args.text_config.num_key_value_heads, 1);
+        assert_eq!(
+            args.text_config
+                .layer_schedule
+                .iter()
+                .map(|policy| policy.feed_forward)
+                .collect::<Vec<_>>(),
+            vec![
+                super::FeedForwardPolicy::Dense,
+                super::FeedForwardPolicy::SparseMoe
+            ]
+        );
         assert!(args.audio_config.is_none());
         assert!(args.vision_config.is_none());
+    }
+
+    #[test]
+    fn gguf_layer_schedule_rejects_invalid_pattern_and_geometry_metadata() {
+        let mut length = tiny_gguf_metadata();
+        length.insert(
+            "inkling.attention.sliding_window_pattern".into(),
+            GgufMetadataValue::Array(GgufMetadataArray::Bool(vec![true])),
+        );
+        assert!(super::args_from_gguf_catalog(&length).is_err());
+
+        let mut encoding = tiny_gguf_metadata();
+        encoding.insert(
+            "inkling.attention.sliding_window_pattern".into(),
+            GgufMetadataValue::Array(GgufMetadataArray::Uint32(vec![1, 0])),
+        );
+        assert!(super::args_from_gguf_catalog(&encoding).is_err());
+
+        for window in [0, i32::MAX as u32 + 1] {
+            let mut metadata = tiny_gguf_metadata();
+            metadata.insert(
+                "inkling.attention.sliding_window".into(),
+                GgufMetadataValue::Uint32(window),
+            );
+            assert!(super::args_from_gguf_catalog(&metadata).is_err());
+        }
+
+        let mut dense = tiny_gguf_metadata();
+        dense.insert(
+            "inkling.dense_block_count".into(),
+            GgufMetadataValue::Uint32(3),
+        );
+        assert!(super::args_from_gguf_catalog(&dense).is_err());
+
+        let mut kv_geometry = tiny_gguf_metadata();
+        kv_geometry.insert("inkling.block_count".into(), GgufMetadataValue::Uint32(3));
+        kv_geometry.insert(
+            "inkling.attention.sliding_window_pattern".into(),
+            GgufMetadataValue::Array(GgufMetadataArray::Bool(vec![true, true, false])),
+        );
+        kv_geometry.insert(
+            "inkling.attention.head_count_kv".into(),
+            GgufMetadataValue::Array(GgufMetadataArray::Uint32(vec![2, 3, 1])),
+        );
+        assert!(super::args_from_gguf_catalog(&kv_geometry).is_err());
+    }
+
+    fn schedule_config() -> serde_json::Value {
+        json!({
+            "model_type":"inkling_mm_model",
+            "text_config":{
+                "hidden_size":32,"num_hidden_layers":4,"vocab_size":64,
+                "num_attention_heads":4,"num_key_value_heads":2,"head_dim":8,
+                "swa_num_attention_heads":4,"swa_num_key_value_heads":1,"swa_head_dim":8,
+                "sliding_window_size":8,
+                "sconv_kernel_size":4,"d_rel":4,"rel_extent":16,
+                "intermediate_size":24,"dense_intermediate_size":48,
+                "n_routed_experts":4,"num_experts_per_tok":2,"n_shared_experts":1,
+                "route_scale":8.0,"use_sconv":true,"use_embed_norm":true,
+                "shared_expert_sink":true,"use_gate_bias":true,"norm_after_topk":true,
+                "use_global_scale":true,"gate_activation":"sigmoid"
+            }
+        })
+    }
+
+    #[test]
+    fn hf_layer_schedule_normalizes_arbitrary_attention_and_feed_forward_order() {
+        let mut config = schedule_config();
+        config["text_config"]["layer_types"] = json!([
+            "sliding_attention",
+            "full_attention",
+            "sliding_attention",
+            "full_attention"
+        ]);
+        config["text_config"]["mlp_layer_types"] = json!(["dense", "moe", "dense", "moe"]);
+        let args = super::model_args_from_config_value(&config).unwrap();
+        assert_eq!(
+            args.text_config
+                .layer_schedule
+                .iter()
+                .map(|policy| (policy.attention.window().is_some(), policy.feed_forward))
+                .collect::<Vec<_>>(),
+            vec![
+                (true, super::FeedForwardPolicy::Dense),
+                (false, super::FeedForwardPolicy::SparseMoe),
+                (true, super::FeedForwardPolicy::Dense),
+                (false, super::FeedForwardPolicy::SparseMoe),
+            ]
+        );
+    }
+
+    #[test]
+    fn hf_layer_schedule_accepts_all_full_and_all_sliding_attention() {
+        for (kind, sliding) in [("full_attention", false), ("sliding_attention", true)] {
+            let mut config = schedule_config();
+            config["text_config"]["layer_types"] = json!([kind, kind, kind, kind]);
+            let args = super::model_args_from_config_value(&config).unwrap();
+            assert!(
+                args.text_config.layer_schedule.iter().all(|policy| policy
+                    .attention
+                    .window()
+                    .is_some()
+                    == sliding),
+                "{kind}"
+            );
+        }
+    }
+
+    #[test]
+    fn hf_layer_schedule_preserves_published_fallbacks_and_rejects_conflicts() {
+        let mut fallback = schedule_config();
+        fallback["text_config"]["num_hidden_layers"] = json!(6);
+        let args = super::model_args_from_config_value(&fallback).unwrap();
+        assert_eq!(
+            args.text_config
+                .layer_schedule
+                .iter()
+                .map(|policy| policy.attention.window().is_some())
+                .collect::<Vec<_>>(),
+            vec![true, true, true, true, true, false]
+        );
+        assert!(args
+            .text_config
+            .layer_schedule
+            .iter()
+            .all(|policy| policy.feed_forward == super::FeedForwardPolicy::SparseMoe));
+
+        let mut attention_conflict = schedule_config();
+        attention_conflict["text_config"]["local_layer_ids"] = json!([0]);
+        attention_conflict["text_config"]["layer_types"] = json!([
+            "full_attention",
+            "full_attention",
+            "full_attention",
+            "full_attention"
+        ]);
+        assert!(super::model_args_from_config_value(&attention_conflict).is_err());
+
+        let mut feed_forward_conflict = schedule_config();
+        feed_forward_conflict["text_config"]["dense_mlp_idx"] = json!(1);
+        feed_forward_conflict["text_config"]["mlp_layer_types"] =
+            json!(["moe", "moe", "moe", "moe"]);
+        assert!(super::model_args_from_config_value(&feed_forward_conflict).is_err());
+    }
+
+    #[test]
+    fn hf_layer_schedule_rejects_invalid_lengths_entries_and_windows() {
+        let mut length = schedule_config();
+        length["text_config"]["layer_types"] = json!(["full_attention"]);
+        assert!(super::model_args_from_config_value(&length).is_err());
+
+        let mut entry = schedule_config();
+        entry["text_config"]["mlp_layer_types"] = json!(["dense", "unsupported", "moe", "moe"]);
+        assert!(super::model_args_from_config_value(&entry).is_err());
+
+        for window in [json!(0), json!(-1), json!(i64::from(i32::MAX) + 1)] {
+            let mut config = schedule_config();
+            config["text_config"]["sliding_window_size"] = window;
+            assert!(super::model_args_from_config_value(&config).is_err());
+        }
+    }
+
+    #[test]
+    fn fingerprint_changes_when_only_the_ordered_inkling_schedule_changes() {
+        let mut first = schedule_config();
+        first["text_config"]["layer_types"] = json!([
+            "sliding_attention",
+            "full_attention",
+            "sliding_attention",
+            "full_attention"
+        ]);
+        let mut second = schedule_config();
+        second["text_config"]["layer_types"] = json!([
+            "full_attention",
+            "sliding_attention",
+            "full_attention",
+            "sliding_attention"
+        ]);
+        let mut different_feed_forward = first.clone();
+        different_feed_forward["text_config"]["mlp_layer_types"] =
+            json!(["dense", "moe", "dense", "moe"]);
+        let first = super::model_args_from_config_value(&first).unwrap();
+        let second = super::model_args_from_config_value(&second).unwrap();
+        let different_feed_forward =
+            super::model_args_from_config_value(&different_feed_forward).unwrap();
+        assert_ne!(
+            super::prompt_cache_architecture_fingerprint(&first),
+            super::prompt_cache_architecture_fingerprint(&second)
+        );
+        assert_ne!(
+            super::prompt_cache_architecture_fingerprint(&first),
+            super::prompt_cache_architecture_fingerprint(&different_feed_forward)
+        );
     }
 
     #[test]
@@ -3494,8 +4141,7 @@ mod tests {
                 "n_channels":3,"n_layers":4
             }
         });
-        let args: super::ModelArgs = serde_json::from_value(config).unwrap();
-        super::validate_args(&args).unwrap();
+        let args = super::model_args_from_config_value(&config).unwrap();
         let cache = super::Cache::new(&args.text_config);
         assert_eq!(cache.layers.len(), 3);
         assert!(matches!(

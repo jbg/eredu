@@ -4558,8 +4558,10 @@ fn load_additional_streamed_ep(
             let global_experts = usize::try_from(args.text_config.n_routed_experts)
                 .map_err(|_| Error::Parallel("Inkling routed expert count is negative".into()))?;
             if global_experts == 0
-                || !(0..args.text_config.num_hidden_layers)
-                    .any(|layer| !args.text_config.is_dense(layer))
+                || !args.text_config.layer_schedule.iter().any(|policy| {
+                    policy.feed_forward
+                        == crate::architectures::inkling::model::FeedForwardPolicy::SparseMoe
+                })
             {
                 return Err(Error::UnsupportedArchitecture(
                     "expert parallelism requires an Inkling checkpoint with routed MoE layers"
@@ -4833,8 +4835,10 @@ fn load_additional_cached_ep(
             let global_experts = usize::try_from(args.text_config.n_routed_experts)
                 .map_err(|_| Error::Parallel("Inkling routed expert count is negative".into()))?;
             if global_experts == 0
-                || !(0..args.text_config.num_hidden_layers)
-                    .any(|layer| !args.text_config.is_dense(layer))
+                || !args.text_config.layer_schedule.iter().any(|policy| {
+                    policy.feed_forward
+                        == crate::architectures::inkling::model::FeedForwardPolicy::SparseMoe
+                })
             {
                 return Err(Error::UnsupportedArchitecture(
                     "expert parallelism requires an Inkling checkpoint with routed MoE layers"

@@ -1316,15 +1316,18 @@ fn validate_inkling_safetensors(
     for layer in 0..text.num_hidden_layers {
         let official = format!("model.llm.layers.{layer}");
         let canonical = format!("model.layers.{layer}");
-        let local = text.is_local(layer);
+        let policy = *text
+            .layer_policy(layer as usize)
+            .expect("validated Inkling layer schedule");
+        let local = policy.attention.window().is_some();
         let query_heads = text.q_heads(local) as usize;
         let key_value_heads = text.kv_heads(local) as usize;
         let head = text.attention_head_dim(local) as usize;
-        let relative = if local {
-            text.sliding_window_size as usize
-        } else {
-            text.rel_extent as usize
-        };
+        let relative = policy
+            .attention
+            .window()
+            .map(|window| window.get() as usize)
+            .unwrap_or(text.rel_extent as usize);
         for (source, target, shape) in [
             (
                 format!("{official}.attn_norm.weight"),
@@ -1408,7 +1411,7 @@ fn validate_inkling_safetensors(
             );
         }
 
-        if text.is_dense(layer) {
+        if policy.feed_forward == inkling::FeedForwardPolicy::Dense {
             let intermediate = text.dense_intermediate_size() as usize;
             validate_inkling_dense_w13(
                 store,
@@ -5875,15 +5878,18 @@ fn inkling_gguf_expected(
     ];
     for layer in 0..text.num_hidden_layers {
         let prefix = format!("blk.{layer}");
-        let local = text.is_local(layer);
+        let policy = *text
+            .layer_policy(layer as usize)
+            .expect("validated Inkling layer schedule");
+        let local = policy.attention.window().is_some();
         let query_heads = text.q_heads(local) as usize;
         let kv_heads = text.kv_heads(local) as usize;
         let head = text.attention_head_dim(local) as usize;
-        let relative = if local {
-            text.sliding_window_size as usize
-        } else {
-            text.rel_extent as usize
-        };
+        let relative = policy
+            .attention
+            .window()
+            .map(|window| window.get() as usize)
+            .unwrap_or(text.rel_extent as usize);
         tensors.extend([
             expected_vector_shape(format!("{prefix}.attn_norm.weight"), vec![hidden]),
             expected_vector_shape(format!("{prefix}.ffn_norm.weight"), vec![hidden]),
@@ -5944,7 +5950,7 @@ fn inkling_gguf_expected(
             ));
         }
 
-        if text.is_dense(layer) {
+        if policy.feed_forward == inkling::FeedForwardPolicy::Dense {
             let intermediate = text.dense_intermediate_size() as usize;
             tensors.extend([
                 expected(
@@ -6079,7 +6085,15 @@ fn validate_inkling_gguf(
             checkpoint, &name, &shapes, operation, "Inkling",
         ));
     }
-    for layer in args.text_config.dense_mlp_idx..args.text_config.num_hidden_layers {
+    for layer in args
+        .text_config
+        .layer_schedule
+        .iter()
+        .enumerate()
+        .filter_map(|(layer, policy)| {
+            (policy.feed_forward == inkling::FeedForwardPolicy::SparseMoe).then_some(layer)
+        })
+    {
         for (gate, up) in [
             (
                 format!("blk.{layer}.ffn_gate_exps.weight"),

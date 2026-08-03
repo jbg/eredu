@@ -6391,6 +6391,104 @@ mod tests {
     }
 
     #[test]
+    fn inkling_schedule_rejections_match_inspection_and_load_preflight() {
+        let cases = [
+            (
+                "attention length",
+                json!(["full_attention"]),
+                None,
+                None,
+                None,
+            ),
+            (
+                "attention conflict",
+                json!(["full_attention", "full_attention"]),
+                None,
+                None,
+                None,
+            ),
+            (
+                "feed-forward conflict",
+                Value::Null,
+                Some(json!(["moe", "moe"])),
+                None,
+                None,
+            ),
+            (
+                "invalid attention kind",
+                json!(["sliding", "full_attention"]),
+                None,
+                None,
+                None,
+            ),
+            ("zero window", Value::Null, None, Some(json!(0)), None),
+            ("negative window", Value::Null, None, Some(json!(-1)), None),
+            (
+                "overflowing window",
+                Value::Null,
+                None,
+                Some(json!(i64::from(i32::MAX) + 1)),
+                None,
+            ),
+            (
+                "duplicate local layer",
+                Value::Null,
+                None,
+                None,
+                Some(json!([0, 0])),
+            ),
+        ];
+
+        for (name, layer_types, mlp_layer_types, window, local_layer_ids) in cases {
+            let directory = write_complete_inkling_safetensors_dir(|_| {});
+            let mut config = inkling_config();
+            if !layer_types.is_null() {
+                config["text_config"]["layer_types"] = layer_types;
+            }
+            if let Some(types) = mlp_layer_types {
+                config["text_config"]["mlp_layer_types"] = types;
+            }
+            if let Some(window) = window {
+                config["text_config"]["sliding_window_size"] = window;
+            }
+            if let Some(ids) = local_layer_ids {
+                config["text_config"]["local_layer_ids"] = ids;
+            }
+            std::fs::write(
+                directory.path().join("config.json"),
+                serde_json::to_vec(&config).unwrap(),
+            )
+            .unwrap();
+
+            let report =
+                inspect_model(directory.path(), ModelInspectionOptions::default()).unwrap();
+            assert_eq!(
+                report.model_loadability,
+                InspectionReadiness::Invalid,
+                "{name}: {:#?}",
+                report.issues
+            );
+            assert!(
+                report
+                    .issues
+                    .iter()
+                    .any(|issue| issue.code == InspectionIssueCode::InvalidConfiguration),
+                "{name}: {:#?}",
+                report.issues
+            );
+            assert!(
+                structural::validate_safetensors_load_path(
+                    ModelKind::Inkling,
+                    directory.path(),
+                    ModelLoadOptions::default(),
+                )
+                .is_err(),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
     fn inkling_missing_layer_tensor_and_wrong_w13_shape_are_structured() {
         let missing = write_complete_inkling_safetensors_dir(|specs| {
             specs.retain(|(name, _)| name != "model.llm.layers.1.attn.wq_du.weight");
@@ -7844,6 +7942,79 @@ mod tests {
             None,
         )
         .unwrap();
+    }
+
+    #[test]
+    fn inkling_gguf_schedule_rejections_match_inspection_and_load_preflight() {
+        let cases = [
+            (
+                "pattern length",
+                "inkling.attention.sliding_window_pattern",
+                MetadataValue::Array(MetadataArray::Bool(vec![true])),
+            ),
+            (
+                "pattern encoding",
+                "inkling.attention.sliding_window_pattern",
+                MetadataValue::Array(MetadataArray::Uint32(vec![1, 0])),
+            ),
+            (
+                "zero window",
+                "inkling.attention.sliding_window",
+                MetadataValue::Uint32(0),
+            ),
+            (
+                "overflowing window",
+                "inkling.attention.sliding_window",
+                MetadataValue::Uint32(i32::MAX as u32 + 1),
+            ),
+            (
+                "dense layer overflow",
+                "inkling.dense_block_count",
+                MetadataValue::Uint32(3),
+            ),
+        ];
+        let directory = tempfile::tempdir().unwrap();
+
+        for (index, (name, key, value)) in cases.into_iter().enumerate() {
+            let path = directory
+                .path()
+                .join(format!("invalid-schedule-{index}.gguf"));
+            let mut metadata = inkling_gguf_metadata();
+            metadata.insert(key.into(), value);
+            write_inkling_gguf(&path, &metadata, inkling_gguf_specs(), |_| {});
+
+            let report = inspect_model(&path, ModelInspectionOptions::default()).unwrap();
+            assert_eq!(
+                report.model_loadability,
+                InspectionReadiness::Invalid,
+                "{name}: {:#?}",
+                report.issues
+            );
+            assert!(
+                report.issues.iter().any(|issue| matches!(
+                    issue.code,
+                    InspectionIssueCode::InvalidConfiguration
+                        | InspectionIssueCode::InvalidLayerOrExpertCount
+                )),
+                "{name}: {:#?}",
+                report.issues
+            );
+
+            let checkpoint = GgufCheckpoint::open(&path).unwrap();
+            let loaded_metadata = crate::runtime::checkpoint::load::gguf_metadata(&checkpoint);
+            assert!(
+                matches!(
+                    structural::validate_gguf(
+                        GgufArchitecture::Inkling,
+                        &checkpoint,
+                        &loaded_metadata,
+                        ModelLoadOptions::default(),
+                    ),
+                    structural::StructuralValidation::Invalid(_)
+                ),
+                "{name}"
+            );
+        }
     }
 
     #[test]

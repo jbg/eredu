@@ -1047,21 +1047,28 @@ fn inkling_spec(args: &inkling::ModelArgs) -> Result<Spec, CapabilityError> {
         ),
     };
     let layers = positive(text.num_hidden_layers, "num_hidden_layers")?;
-    let local = if let Some(ids) = &text.local_layer_ids {
-        ids.len() as u64
-    } else if let Some(types) = &text.layer_types {
-        types.iter().filter(|kind| kind.contains("sliding")).count() as u64
-    } else {
-        layers - layers / 6
-    };
-    let global = layers.saturating_sub(local);
+    let global = text
+        .layer_schedule
+        .iter()
+        .filter(|policy| policy.attention == AttentionPolicy::Full)
+        .count() as u64;
+    let sliding = text
+        .layer_schedule
+        .iter()
+        .filter_map(|policy| policy.attention.window())
+        .fold(BTreeMap::<u64, u64>::new(), |mut groups, window| {
+            *groups.entry(u64::from(window.get())).or_default() += 1;
+            groups
+        })
+        .into_iter()
+        .map(|(window, layers)| SlidingWindowLayerCount { layers, window })
+        .collect::<Vec<_>>();
     let local_kv = kv_scalars(
         text.swa_num_key_value_heads
             .unwrap_or(text.num_key_value_heads),
         text.swa_head_dim.unwrap_or(text.head_dim),
     )?;
     let global_kv = kv_scalars(text.num_key_value_heads, text.head_dim)?;
-    let window = positive(text.sliding_window_size, "sliding_window_size")?;
     let conv_width = checked_mul(
         positive(text.hidden_size, "hidden_size")?,
         4,
@@ -1082,34 +1089,38 @@ fn inkling_spec(args: &inkling::ModelArgs) -> Result<Spec, CapabilityError> {
         audio: args.audio_config.is_some(),
         video: false,
     };
+    let decoder = match (global, sliding.as_slice()) {
+        (_, []) => CacheStateStrategy::FullKv,
+        (0, [only]) => CacheStateStrategy::SlidingKv {
+            window: only.window,
+        },
+        _ => CacheStateStrategy::MixedKv {
+            full_layers: global,
+            sliding: sliding.clone(),
+        },
+    };
     Ok((
         context.0,
         context.1,
         CacheStateStrategy::Multimodal {
-            decoder: Box::new(CacheStateStrategy::MixedKv {
-                full_layers: global,
-                sliding: vec![SlidingWindowLayerCount {
-                    layers: local,
-                    window,
-                }],
-            }),
+            decoder: Box::new(decoder),
             media_consumes_decoder_positions: true,
         },
         modalities,
         ArchitectureEstimate {
             fixed_scalars_per_batch: fixed,
-            growing: vec![
-                GrowingState {
-                    layers: global,
-                    scalars_per_position: global_kv,
-                    window: None,
-                },
-                GrowingState {
-                    layers: local,
-                    scalars_per_position: local_kv,
-                    window: Some(window),
-                },
-            ],
+            growing: std::iter::once(GrowingState {
+                layers: global,
+                scalars_per_position: global_kv,
+                window: None,
+            })
+            .filter(|state| state.layers > 0)
+            .chain(sliding.into_iter().map(|group| GrowingState {
+                layers: group.layers,
+                scalars_per_position: local_kv,
+                window: Some(group.window),
+            }))
+            .collect(),
             hidden_size: positive(text.hidden_size, "hidden_size")?,
             allocation_granularity: 1,
             completeness: EstimationCompleteness::Complete,
@@ -3603,7 +3614,7 @@ mod tests {
     }
 
     fn tiny_inkling() -> inkling::ModelArgs {
-        serde_json::from_value(json!({
+        inkling::model_args_from_config_value(&json!({
             "model_type":"inkling_mm_model",
             "text_config":{
                 "hidden_size":32,"num_hidden_layers":3,"vocab_size":64,
@@ -3626,6 +3637,60 @@ mod tests {
             }
         }))
         .unwrap()
+    }
+
+    #[test]
+    fn inkling_runtime_state_groups_the_exact_ordered_schedule() {
+        use crate::architectures::inkling::model::{FeedForwardPolicy, LayerPolicy};
+        use crate::runtime::attention::LayerSchedule;
+
+        let mut args = tiny_inkling();
+        args.text_config.num_key_value_heads = 1;
+        args.text_config.swa_num_key_value_heads = Some(2);
+        args.text_config.layer_schedule = LayerSchedule::new(
+            3,
+            vec![
+                LayerPolicy {
+                    attention: AttentionPolicy::Full,
+                    feed_forward: FeedForwardPolicy::Dense,
+                },
+                LayerPolicy {
+                    attention: AttentionPolicy::sliding(3).unwrap(),
+                    feed_forward: FeedForwardPolicy::SparseMoe,
+                },
+                LayerPolicy {
+                    attention: AttentionPolicy::sliding(5).unwrap(),
+                    feed_forward: FeedForwardPolicy::SparseMoe,
+                },
+            ],
+        )
+        .unwrap();
+
+        let (_, _, strategy, _, layout) = inkling_spec(&args).unwrap();
+        assert_eq!(
+            strategy,
+            CacheStateStrategy::Multimodal {
+                decoder: Box::new(CacheStateStrategy::MixedKv {
+                    full_layers: 1,
+                    sliding: vec![
+                        SlidingWindowLayerCount {
+                            layers: 1,
+                            window: 3,
+                        },
+                        SlidingWindowLayerCount {
+                            layers: 1,
+                            window: 5,
+                        },
+                    ],
+                }),
+                media_consumes_decoder_positions: true,
+            }
+        );
+        let state = estimate_architecture_state(&layout, InputTokenCount::text(10), 0, 2).unwrap();
+        assert_eq!(state.assumptions.sliding_window_bounds, vec![3, 5]);
+        // Full KV: 1 x 10 x (1 head x 8 x K/V). Sliding KV: (3 + 5) x
+        // (2 heads x 8 x K/V), all for two batches of f32 state.
+        assert_eq!(state.context_state_bytes, (10 * 16 + (3 + 5) * 32) * 2 * 4);
     }
 
     #[test]
