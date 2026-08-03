@@ -3057,6 +3057,104 @@ mod tests {
         assert_eq!(estimate.growing[1].scalars_per_position, 16);
     }
 
+    #[test]
+    fn qwen2_runtime_state_groups_arbitrary_distinct_windows_exactly() {
+        let mut args = crate::api::dense_qwen::config_from_hf_value(&json!({
+            "model_type": "qwen2", "hidden_size": 16, "num_hidden_layers": 4,
+            "intermediate_size": 32, "num_attention_heads": 4,
+            "num_key_value_heads": 2, "rms_norm_eps": 1e-6, "vocab_size": 64,
+            "max_position_embeddings": 128, "rope_theta": 10000.0,
+            "tie_word_embeddings": false
+        }))
+        .unwrap();
+        args.attention_schedule = crate::runtime::attention::LayerSchedule::new(
+            4,
+            vec![
+                crate::runtime::attention::AttentionPolicy::sliding(4).unwrap(),
+                crate::runtime::attention::AttentionPolicy::Full,
+                crate::runtime::attention::AttentionPolicy::sliding(8).unwrap(),
+                crate::runtime::attention::AttentionPolicy::sliding(4).unwrap(),
+            ],
+        )
+        .unwrap();
+        let (_, _, strategy, _, layout) = dense_qwen_spec(&args, false).unwrap();
+        assert_eq!(
+            strategy,
+            CacheStateStrategy::MixedKv {
+                full_layers: 1,
+                sliding: vec![
+                    SlidingWindowLayerCount {
+                        layers: 2,
+                        window: 4,
+                    },
+                    SlidingWindowLayerCount {
+                        layers: 1,
+                        window: 8,
+                    },
+                ],
+            }
+        );
+        let state = estimate_architecture_state(&layout, InputTokenCount::text(10), 0, 2).unwrap();
+        assert_eq!(state.assumptions.sliding_window_bounds, vec![4, 8]);
+        assert_eq!(state.context_state_bytes, (10 + 2 * 4 + 8) * 16 * 2 * 4);
+    }
+
+    #[test]
+    fn lfm2_runtime_state_uses_the_normalized_hybrid_schedule() {
+        let args = lfm2::model_args_from_config_value(&json!({
+            "model_type": "lfm2", "vocab_size": 32, "hidden_size": 16,
+            "intermediate_size": 24, "num_hidden_layers": 3,
+            "num_attention_heads": 4, "num_key_value_heads": 2,
+            "max_position_embeddings": 128, "norm_eps": 1e-5,
+            "conv_L_cache": 3, "block_auto_adjust_ff_dim": false,
+            "layer_types": ["conv", "full_attention", "conv"]
+        }))
+        .unwrap();
+        let (_, _, strategy, _, estimate) = lfm2_spec(&args).unwrap();
+        assert_eq!(
+            strategy,
+            CacheStateStrategy::HybridRecurrent {
+                attention_layers: 1,
+                recurrent_layers: 2,
+            }
+        );
+        assert_eq!(estimate.fixed_scalars_per_batch, 64);
+        assert_eq!(estimate.growing.len(), 1);
+        assert_eq!(estimate.growing[0].layers, 1);
+        assert_eq!(estimate.growing[0].scalars_per_position, 16);
+        assert_eq!(estimate.growing[0].window, None);
+    }
+
+    #[test]
+    fn qwen_hybrid_runtime_state_uses_the_normalized_schedule() {
+        let args = qwen3_5_moe::model_args_from_config_value(&json!({
+            "model_type": "qwen3_next", "vocab_size": 32, "hidden_size": 16,
+            "num_hidden_layers": 4, "num_attention_heads": 2,
+            "num_key_value_heads": 1, "head_dim": 8,
+            "max_position_embeddings": 128, "intermediate_size": 32,
+            "num_experts": 0, "linear_conv_kernel_dim": 3,
+            "linear_key_head_dim": 4, "linear_value_head_dim": 4,
+            "linear_num_key_heads": 2, "linear_num_value_heads": 2,
+            "layer_types": [
+                "full_attention", "linear_attention",
+                "linear_attention", "full_attention"
+            ]
+        }))
+        .unwrap();
+        let (_, _, strategy, _, estimate) = qwen_hybrid_spec(&args, false).unwrap();
+        assert_eq!(
+            strategy,
+            CacheStateStrategy::HybridRecurrent {
+                attention_layers: 2,
+                recurrent_layers: 2,
+            }
+        );
+        assert_eq!(estimate.fixed_scalars_per_batch, 160);
+        assert_eq!(estimate.growing.len(), 1);
+        assert_eq!(estimate.growing[0].layers, 2);
+        assert_eq!(estimate.growing[0].scalars_per_position, 16);
+    }
+
     fn tiny_llama(kv_heads: i32, sliding_window: Option<i32>) -> llama::ModelArgs {
         llama::ModelArgs {
             model_type: "mistral".into(),
