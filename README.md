@@ -96,6 +96,11 @@ dense/sparse-MoE feed-forward execution. Hugging Face layer lists or indices
 and GGUF Boolean attention patterns normalize once into that ordered schedule;
 resident, bounded, paged-cache, structural, expert-parallel, fingerprint, and
 memory-accounting paths all consume it without threshold-based fallbacks.
+Gemma 4 text and assistant checkpoints now normalize their exact full/sliding
+layer pattern into `LayerSchedule<AttentionPolicy>` as well. The schedule drives
+resident and bounded execution, multimodal masks, shared-KV routing, assistant
+drafting, structural admission, architecture identity, and memory reporting;
+arbitrary Boolean GGUF patterns and internally distinct windows are supported.
 
 ## Platforms
 

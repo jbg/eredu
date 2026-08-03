@@ -344,6 +344,41 @@ Normalized `ModelArgs` no longer implements `Deserialize` or exposes raw
 `layer_types`/`sliding_window`; JSON callers use
 `architectures::gpt_oss::model::model_args_from_config_value`.
 
+Gemma 4 text and assistant models also use
+`LayerSchedule<AttentionPolicy>` as their authoritative attention geometry.
+Hugging Face `layer_types` is an exact decoder-order list of
+`full_attention`/`sliding_attention`; an omitted or empty list means all full.
+Any enabled sliding entry requires the one positive, executable
+`sliding_window`. GGUF reads
+`gemma4.attention.sliding_window_pattern` (or the assistant-prefixed equivalent)
+as an exact Boolean array; absent pattern metadata means all full, even when an
+otherwise valid unused window is present. Arbitrary patterns, including
+alternating and discontiguous layouts, are accepted. Wrong encodings, length
+mismatches, unknown entries, missing windows, and zero, negative, or overflowing
+windows fail in the same normalization used by inspection and loading.
+
+Resident, layerwise-host, multimodal prefill/decode, generation, shared-KV
+routing, and Gemma 4 assistant drafting query only the normalized schedule.
+Multimodal masks are keyed by exact policy, so internally constructed schedules
+may use different windows. Gemma sliding layers apply a bounded attention mask
+but deliberately retain full KV backing; shared layers reuse state by exact
+policy. Capability reports total full/sliding policy counts and groups sliding
+layers by each window, while memory estimates separately account for cached
+versus shared layers and context-growing backing.
+Architecture fingerprints include the complete ordered schedule. Persisted
+Gemma prompt caches, paged Gemma KV caches, and tensor/pipeline parallel Gemma
+execution remain unsupported.
+
+This is a breaking API migration: public `LayerType`, raw normalized
+`ModelArgs.layer_types`/`sliding_window`, and fallback-returning `layer_type`
+were removed. `ModelArgs` and `Gemma4AssistantConfig` are no longer directly
+deserializable; JSON callers use `model_args_from_config_value` and
+`gemma4_assistant_config_from_value`. `TransformerBlock::layer_policy` and
+`ModelInput::sliding_masks` replace the old scalar/type fields. The public
+`CacheStateStrategy::SharedFullKv` now reports `full_attention_layers` plus
+`sliding_attention` exact window/count groups instead of one optional global
+window.
+
 Inkling normalizes both decoder choices into
 `LayerSchedule<architectures::inkling::model::LayerPolicy>`. Each ordered entry
 contains an `AttentionPolicy` and a `FeedForwardPolicy::{Dense, SparseMoe}`.

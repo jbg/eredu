@@ -286,6 +286,37 @@ model-wide window. The normalized `ModelArgs` removed raw `layer_types` and
 `sliding_window` and no longer implements `Deserialize`; JSON callers use
 `model_args_from_config_value`.
 
+## Gemma 4 and assistant weight residency
+
+Gemma 4 normalizes Hugging Face `layer_types` plus `sliding_window`, or GGUF's
+exact Boolean `gemma4.attention.sliding_window_pattern`, into one
+`LayerSchedule<AttentionPolicy>`. An omitted or empty pattern is all-full;
+enabled sliding layers require a positive executable window. Arbitrary Boolean
+ordering is supported, including alternating and discontiguous patterns.
+Malformed entries, wrong GGUF encodings, count mismatches, missing windows, and
+zero, negative, or overflowing values fail before weights are materialized.
+Assistant-prefixed GGUF metadata and assistant JSON use the same normalization.
+
+Resident and layerwise execution, multimodal masks, generation, structural
+admission, shared-KV routing, MTP target/assistant handoff, architecture
+fingerprints, and runtime-state accounting consume only that schedule.
+Multimodal mask maps and shared-KV state are keyed by exact policy, allowing
+internally distinct windows. Sliding layers use the exact `N`-position mask
+convention while retaining full context-growing KV backing; final shared layers
+reuse earlier K/V produced by the same exact policy. Capability reporting gives
+the total full-layer count, groups all sliding layers by exact window, and
+identifies that backing as unbounded.
+
+The migration removes public `LayerType`, normalized `layer_types` and
+`sliding_window` fields, and fallback `layer_type` queries. `ModelArgs` and
+`Gemma4AssistantConfig` are no longer directly deserializable; use
+`model_args_from_config_value` or `gemma4_assistant_config_from_value`.
+`TransformerBlock::layer_policy`, `ModelInput::sliding_masks`, and
+`CacheStateStrategy::SharedFullKv::sliding_attention` are the replacement APIs.
+The complete ordered policy list participates in architecture identity.
+Persisted and paged Gemma prompt/KV caches remain unsupported, as do Gemma
+tensor and pipeline parallelism.
+
 ## LFM2/LFM2.5 weight residency
 
 Dense and MoE LFM2 variants share one hybrid adapter for full-attention and
@@ -417,7 +448,7 @@ never replaced by eager loading.
 | LFM2/LFM2.5 dense / MoE | yes | yes | growing KV or convolution state | embedding, norm, tied/untied head | hybrid decoder block | split SwiGLU experts packed per layer; packed form accepted | dense and split-MoE hybrid prefill/decode |
 | DeepSeek-V3/R1 | yes | yes | compressed MLA latent and rotary-key state | embedding, norm, head | MLA decoder block with dense or routed/shared experts | official split experts stacked per layer; direct dense/affine and native block-FP8 banks | dense-to-MoE prefill/decode at two depths; native block-FP8 prefill/decode |
 | Kimi Linear | yes | yes | bounded Q/K/V convolution and F32 KDA recurrent state, or growing compressed no-RoPE MLA state | embedding, norm, head | hybrid KDA/MLA block with dense or routed/shared experts | official split experts packed per layer; convolution and transition-state reshaping | prefill/decode primitive, cache, loader, and real-checkpoint smoke coverage |
-| Gemma 4 multimodal | yes | yes | alternating KV plus transient shared-KV and media state | patch embedding/pooling, audio subsampling/output, modality projections, token/per-layer embeddings, norm, head | independent vision, audio, and sliding/full text groups | public prefix rewrite; direct affine/MXFP4 text and modality projections | vision/audio/text typed prefill parity; per-layer inputs, shared KV, prefill/decode at two depths |
+| Gemma 4 multimodal | yes | yes | scheduled full/sliding KV plus transient shared-KV and media state | patch embedding/pooling, audio subsampling/output, modality projections, token/per-layer embeddings, norm, head | independent vision, audio, and exact-policy text groups | public prefix rewrite; direct affine/MXFP4 text and modality projections | vision/audio/text typed prefill parity; arbitrary-pattern per-layer inputs, shared KV, prefill/decode at two depths |
 | Inkling multimodal | yes | yes | global/local KV, four convolution states per layer, transient hMLP activations | dMel embedding/norm, hMLP final norm, text embedding/norm/head | independent hMLP and local/global dense-or-MoE text groups | released-name rewrite, convolution cast, dense/routed/shared w13 deinterleave | audio/text typed prefill parity; local/global and dense/MoE prefill/decode at two depths |
 | Nemotron-H | yes | yes | attention KV and Mamba convolution/SSM state | embedding, norm, tied/untied head | hybrid block | public key rewrite and split ReLU2 expert packing | all four block kinds, split MoE, prefill/decode |
 | Qwen3-Next / Qwen3.5 | yes | yes | full-attention KV, recurrent linear-attention state, transient vision state | Qwen vision patch/position/merger modules, embedding, norm, tied/untied head | optional vision group plus shared hybrid text group | fused QKVZ/BA selection; split SwiGLU and FP8 expert recipes | Qwen3.5 image/text prefill parity; Qwen3-Next dense/split-MoE and Qwen3.5 dense/MoE prefill/decode |
