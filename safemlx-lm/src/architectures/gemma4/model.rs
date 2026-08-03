@@ -56,6 +56,8 @@ use crate::{
         create_causal_mask,
         rope::{initialize_rope, FloatOrString, RopeVariant},
     },
+    runtime::attention::{AttentionPolicy, LayerSchedule},
+    runtime::cache::residency::derive_prompt_cache_architecture_fingerprint,
     runtime::cache::{ConcatKeyValueCache, KeyValueCache},
     runtime::checkpoint::load::{
         gguf_metadata, gguf_quantization_configs, load_named_array_strict,
@@ -194,7 +196,7 @@ fn sliding_window_prefill_attention(
         ));
     }
 
-    if position_offset + seq_len <= sliding_window + 1 {
+    if position_offset + seq_len <= sliding_window {
         return safemlx::fast::scaled_dot_product_attention(
             queries,
             keys,
@@ -214,7 +216,7 @@ fn sliding_window_prefill_attention(
     while start < seq_len {
         let end = (start + chunk_size).min(seq_len);
         let query_abs_start = position_offset + start;
-        let key_start = (query_abs_start - sliding_window).max(0);
+        let key_start = (query_abs_start - sliding_window + 1).max(0);
         let key_end = position_offset + end;
         let relative_offset = query_abs_start - key_start;
         let query_chunk = queries.try_index_device((.., .., start..end, ..), stream)?;
@@ -223,7 +225,7 @@ fn sliding_window_prefill_attention(
         let mask = create_causal_mask(
             end - start,
             Some(relative_offset),
-            Some(sliding_window),
+            Some(sliding_window - 1),
             None,
             stream,
         )?;
@@ -247,8 +249,7 @@ fn sliding_window_prefill_attention(
 }
 
 #[derive(Debug, Clone, Deserialize)]
-/// Deserialized Gemma 4 text configuration used by this loader.
-pub struct ModelArgs {
+pub(super) struct ModelArgsSource {
     #[serde(default = "default_model_type")]
     /// Effective text model type.
     pub model_type: String,
@@ -326,10 +327,10 @@ pub struct ModelArgs {
     pub num_kv_shared_layers: i32,
     #[serde(default)]
     /// Layer attention pattern.
-    pub layer_types: Vec<LayerType>,
+    pub layer_types: Vec<AttentionKindSource>,
     #[serde(default)]
     /// Sliding-window size for sliding-attention layers.
-    pub sliding_window: Option<i32>,
+    pub sliding_window: Option<i64>,
     #[serde(default)]
     /// Optional final-logit soft cap.
     pub final_logit_softcapping: Option<f32>,
@@ -353,6 +354,83 @@ pub struct ModelArgs {
     pub rope_parameters: Option<HashMap<String, HashMap<String, FloatOrString>>>,
 }
 
+#[derive(Debug, Clone)]
+/// Validated Gemma 4 text geometry normalized from checkpoint metadata.
+pub struct ModelArgs {
+    /// Effective text model type.
+    pub model_type: String,
+    /// Transformer hidden size.
+    pub hidden_size: i32,
+    /// Number of decoder layers.
+    pub num_hidden_layers: i32,
+    /// Dense MLP intermediate size.
+    pub intermediate_size: i32,
+    /// Whether final shared-KV layers use twice the base MLP width.
+    pub use_double_wide_mlp: bool,
+    /// Optional GGUF-provided per-layer MLP widths.
+    pub feed_forward_lengths: Option<Vec<i32>>,
+    /// Number of query attention heads.
+    pub num_attention_heads: i32,
+    /// RMSNorm epsilon.
+    pub rms_norm_eps: f32,
+    /// Token vocabulary size.
+    pub vocab_size: i32,
+    /// Padding token used for media positions in per-layer embeddings.
+    pub pad_token_id: i32,
+    /// Number of key/value heads for sliding attention.
+    pub num_key_value_heads: i32,
+    /// Optional number of key/value heads for full attention.
+    pub num_global_key_value_heads: Option<i32>,
+    /// Maximum configured sequence length.
+    pub max_position_embeddings: i32,
+    /// Default RoPE base frequency.
+    pub rope_theta: f32,
+    /// Per-head dimension for sliding attention.
+    pub head_dim: i32,
+    /// Optional per-head dimension for full attention.
+    pub global_head_dim: Option<i32>,
+    /// Whether logits use tied input embeddings.
+    pub tie_word_embeddings: bool,
+    /// Whether attention projections include bias terms.
+    pub attention_bias: bool,
+    /// Whether full-attention keys are reused as values.
+    pub attention_k_eq_v: bool,
+    /// Whether Gemma-specific quantized tensors are expected.
+    pub quantized: bool,
+    /// Model-wide SafeTensors quantization encoding.
+    pub weight_quantization: Option<WeightQuantization>,
+    /// Parameter names that are quantized in a mixed checkpoint.
+    pub quantized_weights: Option<HashSet<String>>,
+    /// Exact affine settings for mixed GGUF tensors.
+    pub quantized_weight_configs: Option<HashMap<String, WeightQuantization>>,
+    /// Quantization group size for quantized weights.
+    pub quantization_group_size: i32,
+    /// Quantization bit width for quantized weights.
+    pub quantization_bits: i32,
+    /// Hidden size for per-layer input embeddings.
+    pub hidden_size_per_layer_input: i32,
+    /// Optional vocabulary size for per-layer input embeddings.
+    pub vocab_size_per_layer_input: Option<i32>,
+    /// Number of final layers that consume shared key/value states.
+    pub num_kv_shared_layers: i32,
+    /// Authoritative full/sliding policy in decoder-layer order.
+    pub attention_schedule: LayerSchedule<AttentionPolicy>,
+    /// Optional final-logit soft cap.
+    pub final_logit_softcapping: Option<f32>,
+    /// Whether the config requests a Gemma MoE block.
+    pub enable_moe_block: bool,
+    /// Number of experts when MoE is present.
+    pub num_experts: Option<i32>,
+    /// Number of selected experts when MoE is present.
+    pub top_k_experts: Option<i32>,
+    /// MoE intermediate size when MoE is present.
+    pub moe_intermediate_size: Option<i32>,
+    /// Default RoPE scaling configuration.
+    pub rope_scaling: Option<HashMap<String, FloatOrString>>,
+    /// Per-attention-kind RoPE parameter overrides.
+    pub rope_parameters: Option<HashMap<String, HashMap<String, FloatOrString>>>,
+}
+
 fn default_model_type() -> String {
     "gemma4".to_string()
 }
@@ -366,15 +444,12 @@ fn default_true() -> bool {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-/// Gemma 4 attention-layer kind.
-pub enum LayerType {
-    /// Sliding-window attention layer.
+pub(super) enum AttentionKindSource {
     SlidingAttention,
-    /// Full-context attention layer.
     FullAttention,
 }
 
-impl<'de> Deserialize<'de> for LayerType {
+impl<'de> Deserialize<'de> for AttentionKindSource {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: Deserializer<'de>,
@@ -391,8 +466,8 @@ impl<'de> Deserialize<'de> for LayerType {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-struct Gemma4Config {
-    text_config: ModelArgs,
+struct Gemma4ConfigSource {
+    text_config: ModelArgsSource,
     #[serde(default)]
     vision_config: Option<Gemma4VisionConfig>,
     #[serde(default)]
@@ -407,6 +482,133 @@ struct Gemma4Config {
     tie_word_embeddings: bool,
     #[serde(default)]
     quantization: Option<Value>,
+}
+
+fn attention_schedule_from_source(
+    source: &ModelArgsSource,
+) -> Result<LayerSchedule<AttentionPolicy>, Error> {
+    if !source.layer_types.is_empty()
+        && source.layer_types.len() != source.num_hidden_layers.max(0) as usize
+    {
+        return Err(Error::UnsupportedArchitecture(format!(
+            "Gemma 4 layer_types has {} entries for {} layers",
+            source.layer_types.len(),
+            source.num_hidden_layers
+        )));
+    }
+    let pattern = if source.layer_types.is_empty() {
+        vec![false; source.num_hidden_layers.max(0) as usize]
+    } else {
+        source
+            .layer_types
+            .iter()
+            .map(|kind| *kind == AttentionKindSource::SlidingAttention)
+            .collect()
+    };
+    attention_schedule_from_pattern(
+        source.num_hidden_layers,
+        pattern,
+        source.sliding_window,
+        "Gemma 4",
+    )
+}
+
+pub(super) fn attention_schedule_from_pattern(
+    layers: i32,
+    pattern: Vec<bool>,
+    sliding_window: Option<i64>,
+    source: &str,
+) -> Result<LayerSchedule<AttentionPolicy>, Error> {
+    let layer_count = usize::try_from(layers).map_err(|_| {
+        Error::UnsupportedArchitecture(format!(
+            "{source} layer count must be positive, got {layers}"
+        ))
+    })?;
+    if layer_count == 0 {
+        return Err(Error::UnsupportedArchitecture(format!(
+            "{source} layer count must be positive, got 0"
+        )));
+    }
+    if pattern.len() != layer_count {
+        return Err(Error::UnsupportedArchitecture(format!(
+            "{source} attention pattern has {} entries for {layers} layers",
+            pattern.len()
+        )));
+    }
+    let window = sliding_window
+        .map(|window| {
+            let window = u32::try_from(window).map_err(|_| {
+                Error::UnsupportedArchitecture(format!(
+                    "{source} sliding window must be positive and fit u32, got {window}"
+                ))
+            })?;
+            if window > i32::MAX as u32 {
+                return Err(Error::UnsupportedArchitecture(format!(
+                    "{source} sliding window exceeds the executable i32 range: {window}"
+                )));
+            }
+            AttentionPolicy::sliding(window)
+                .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
+        })
+        .transpose()?;
+    let policies = pattern
+        .into_iter()
+        .map(|sliding| {
+            if sliding {
+                window.ok_or_else(|| {
+                    Error::UnsupportedArchitecture(format!(
+                        "{source} has sliding-attention layers but no sliding window"
+                    ))
+                })
+            } else {
+                Ok(AttentionPolicy::Full)
+            }
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    LayerSchedule::new(layer_count, policies)
+        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
+}
+
+pub(super) fn model_args_from_source(source: ModelArgsSource) -> Result<ModelArgs, Error> {
+    let attention_schedule = attention_schedule_from_source(&source)?;
+    Ok(ModelArgs {
+        model_type: source.model_type,
+        hidden_size: source.hidden_size,
+        num_hidden_layers: source.num_hidden_layers,
+        intermediate_size: source.intermediate_size,
+        use_double_wide_mlp: source.use_double_wide_mlp,
+        feed_forward_lengths: source.feed_forward_lengths,
+        num_attention_heads: source.num_attention_heads,
+        rms_norm_eps: source.rms_norm_eps,
+        vocab_size: source.vocab_size,
+        pad_token_id: source.pad_token_id,
+        num_key_value_heads: source.num_key_value_heads,
+        num_global_key_value_heads: source.num_global_key_value_heads,
+        max_position_embeddings: source.max_position_embeddings,
+        rope_theta: source.rope_theta,
+        head_dim: source.head_dim,
+        global_head_dim: source.global_head_dim,
+        tie_word_embeddings: source.tie_word_embeddings,
+        attention_bias: source.attention_bias,
+        attention_k_eq_v: source.attention_k_eq_v,
+        quantized: source.quantized,
+        weight_quantization: source.weight_quantization,
+        quantized_weights: source.quantized_weights,
+        quantized_weight_configs: source.quantized_weight_configs,
+        quantization_group_size: source.quantization_group_size,
+        quantization_bits: source.quantization_bits,
+        hidden_size_per_layer_input: source.hidden_size_per_layer_input,
+        vocab_size_per_layer_input: source.vocab_size_per_layer_input,
+        num_kv_shared_layers: source.num_kv_shared_layers,
+        attention_schedule,
+        final_logit_softcapping: source.final_logit_softcapping,
+        enable_moe_block: source.enable_moe_block,
+        num_experts: source.num_experts,
+        top_k_experts: source.top_k_experts,
+        moe_intermediate_size: source.moe_intermediate_size,
+        rope_scaling: source.rope_scaling,
+        rope_parameters: source.rope_parameters,
+    })
 }
 
 impl ModelArgs {
@@ -456,9 +658,9 @@ impl ModelArgs {
         }
     }
 
-    fn for_layer(&self, layer_type: LayerType) -> Self {
+    fn for_layer(&self, policy: AttentionPolicy) -> Self {
         let mut args = self.clone();
-        if layer_type == LayerType::FullAttention {
+        if policy == AttentionPolicy::Full {
             if let Some(global_head_dim) = self.global_head_dim {
                 args.head_dim = global_head_dim;
             }
@@ -466,22 +668,20 @@ impl ModelArgs {
                 args.num_key_value_heads = global_kv_heads;
             }
         }
-        args.rope_theta = self.rope_theta_for_layer(layer_type);
-        args.rope_scaling = self.rope_scaling_for_layer(layer_type);
+        args.rope_theta = self.rope_theta_for_layer(policy);
+        args.rope_scaling = self.rope_scaling_for_layer(policy);
         args
     }
 
-    pub(crate) fn layer_type(&self, index: usize) -> LayerType {
-        self.layer_types
-            .get(index)
-            .copied()
-            .unwrap_or(LayerType::FullAttention)
+    /// Returns one validated layer policy without a fallback.
+    pub fn attention_policy(&self, index: usize) -> Option<&AttentionPolicy> {
+        self.attention_schedule.get(index)
     }
 
-    pub(crate) fn rope_theta_for_layer(&self, layer_type: LayerType) -> f32 {
-        let key = match layer_type {
-            LayerType::SlidingAttention => "sliding_attention",
-            LayerType::FullAttention => "full_attention",
+    pub(crate) fn rope_theta_for_layer(&self, policy: AttentionPolicy) -> f32 {
+        let key = match policy {
+            AttentionPolicy::Sliding { .. } => "sliding_attention",
+            AttentionPolicy::Full => "full_attention",
         };
         self.rope_parameters
             .as_ref()
@@ -497,16 +697,70 @@ impl ModelArgs {
 
     fn rope_scaling_for_layer(
         &self,
-        layer_type: LayerType,
+        policy: AttentionPolicy,
     ) -> Option<HashMap<String, FloatOrString>> {
-        let key = match layer_type {
-            LayerType::SlidingAttention => "sliding_attention",
-            LayerType::FullAttention => "full_attention",
+        let key = match policy {
+            AttentionPolicy::Sliding { .. } => "sliding_attention",
+            AttentionPolicy::Full => "full_attention",
         };
         self.rope_parameters
             .as_ref()
             .and_then(|params| params.get(key).cloned())
     }
+}
+
+pub(crate) fn prompt_cache_architecture_fingerprint(args: &ModelArgs) -> String {
+    let layer_rope = args
+        .attention_schedule
+        .iter()
+        .copied()
+        .map(|policy| {
+            let mut scaling = args
+                .rope_scaling_for_layer(policy)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(key, value)| format!("{key}={value:?}"))
+                .collect::<Vec<_>>();
+            scaling.sort_unstable();
+            format!(
+                "{:?}:{:08x}:{}",
+                policy,
+                args.rope_theta_for_layer(policy).to_bits(),
+                scaling.join(";")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    derive_prompt_cache_architecture_fingerprint(
+        "gemma4",
+        [
+            ("model_type", args.model_type.clone()),
+            ("hidden_size", args.hidden_size.to_string()),
+            ("num_hidden_layers", args.num_hidden_layers.to_string()),
+            ("num_attention_heads", args.num_attention_heads.to_string()),
+            ("num_key_value_heads", args.num_key_value_heads.to_string()),
+            (
+                "num_global_key_value_heads",
+                format!("{:?}", args.num_global_key_value_heads),
+            ),
+            ("head_dim", args.head_dim.to_string()),
+            ("global_head_dim", format!("{:?}", args.global_head_dim)),
+            (
+                "max_position_embeddings",
+                args.max_position_embeddings.to_string(),
+            ),
+            (
+                "num_kv_shared_layers",
+                args.num_kv_shared_layers.to_string(),
+            ),
+            ("attention_k_eq_v", args.attention_k_eq_v.to_string()),
+            (
+                "attention_schedule",
+                args.attention_schedule.fingerprint_component(),
+            ),
+            ("layer_rope", layer_rope),
+        ],
+    )
 }
 
 fn partial_rotary_dims(head_dim: i32, scaling: &Option<HashMap<String, FloatOrString>>) -> i32 {
@@ -640,8 +894,8 @@ pub struct Attention {
     pub scale: f32,
     /// Whether key projections are reused as value projections.
     pub attention_k_eq_v: bool,
-    /// Layer attention pattern.
-    pub layer_type: LayerType,
+    /// Exact full/sliding attention policy.
+    pub policy: AttentionPolicy,
     /// Whether this layer reads shared key/value states from another layer.
     pub is_kv_shared_layer: bool,
     /// Whether this layer stores full-length key/value states for sharing.
@@ -678,7 +932,7 @@ impl Attention {
     /// Creates an unloaded Gemma 4 attention layer.
     pub fn new(
         args: &ModelArgs,
-        layer_type: LayerType,
+        policy: AttentionPolicy,
         layer_idx: usize,
         stream: &Stream,
     ) -> Result<Self, Exception> {
@@ -687,7 +941,7 @@ impl Attention {
         let n_kv_heads = args.num_key_value_heads;
         let head_dim = args.head_dim;
         let scale = 1.0;
-        let attention_k_eq_v = args.attention_k_eq_v && layer_type == LayerType::FullAttention;
+        let attention_k_eq_v = args.attention_k_eq_v && policy == AttentionPolicy::Full;
         let first_kv_shared_layer_idx = args.num_hidden_layers - args.num_kv_shared_layers;
         let is_kv_shared_layer =
             args.num_kv_shared_layers > 0 && layer_idx as i32 >= first_kv_shared_layer_idx;
@@ -695,7 +949,7 @@ impl Attention {
             let first_kv_shared_layer_idx = first_kv_shared_layer_idx.max(0) as usize;
             (0..first_kv_shared_layer_idx)
                 .rev()
-                .find(|index| args.layer_type(*index) == layer_type)
+                .find(|index| args.attention_policy(*index) == Some(&policy))
                 .is_some_and(|index| index == layer_idx)
         } else {
             false
@@ -762,7 +1016,7 @@ impl Attention {
             n_kv_heads,
             scale,
             attention_k_eq_v,
-            layer_type,
+            policy,
             is_kv_shared_layer,
             store_full_length_kv,
             q_proj,
@@ -789,7 +1043,7 @@ pub struct AttentionInput<'a, C> {
     /// Optional per-layer input embedding slice.
     pub per_layer_input: Option<&'a Array>,
     /// Shared key/value states keyed by layer type.
-    pub shared_kv: Option<&'a mut HashMap<LayerType, (Array, Array)>>,
+    pub shared_kv: Option<&'a mut HashMap<AttentionPolicy, (Array, Array)>>,
     /// Whether generated sliding-window masks should be suppressed.
     pub disable_generated_mask: bool,
     /// Sliding-window size when the mask was generated by this block.
@@ -803,7 +1057,7 @@ pub struct Gemma4TextOutput {
     /// Hidden states before final normalization.
     pub pre_norm_hidden: Array,
     /// Shared key/value states captured during the pass.
-    pub shared_kv_states: HashMap<LayerType, (Array, Array)>,
+    pub shared_kv_states: HashMap<AttentionPolicy, (Array, Array)>,
 }
 
 impl<C> Module<AttentionInput<'_, C>> for Attention
@@ -845,7 +1099,7 @@ where
         let (keys, values) = if self.is_kv_shared_layer {
             shared_kv
                 .as_ref()
-                .and_then(|shared_kv| shared_kv.get(&self.layer_type))
+                .and_then(|shared_kv| shared_kv.get(&self.policy))
                 .cloned()
                 .ok_or_else(|| Exception::custom("missing shared Gemma 4 KV states"))?
         } else {
@@ -884,7 +1138,7 @@ where
                 (keys, values) = cache.update_and_fetch(keys, values, stream)?;
             }
             if let Some(shared_kv) = shared_kv.as_mut() {
-                shared_kv.insert(self.layer_type, (keys.clone(), values.clone()));
+                shared_kv.insert(self.policy, (keys.clone(), values.clone()));
             }
             (keys, values)
         };
@@ -898,9 +1152,9 @@ where
             attention_cache.is_none()
                 && mask.is_some()
                 && L > 1
-                && self.layer_type == LayerType::SlidingAttention
+                && self.policy.window().is_some()
                 && keys.shape()[2] == position_offset + L
-                && (position_offset + L <= *sliding_window + 1 || L >= 1024)
+                && (position_offset + L <= *sliding_window || L >= 1024)
         });
         let output = if let Some(generated_sliding_window) = generated_sliding_window {
             sliding_window_prefill_attention(
@@ -990,7 +1244,7 @@ impl Attention {
         let (keys, values) = if self.is_kv_shared_layer {
             let (keys, values) = shared_kv
                 .as_ref()
-                .and_then(|shared_kv| shared_kv.get(&self.layer_type))
+                .and_then(|shared_kv| shared_kv.get(&self.policy))
                 .cloned()
                 .ok_or_else(|| Exception::custom("missing shared Gemma 4 KV states"))?;
             observer.observe(&format!("{prefix}.keys_shared"), &keys)?;
@@ -1043,7 +1297,7 @@ impl Attention {
             observer.observe(&format!("{prefix}.keys_cache"), &keys)?;
             observer.observe(&format!("{prefix}.values_cache"), &values)?;
             if let Some(shared_kv) = shared_kv.as_mut() {
-                shared_kv.insert(self.layer_type, (keys.clone(), values.clone()));
+                shared_kv.insert(self.policy, (keys.clone(), values.clone()));
                 observer.observe(&format!("{prefix}.shared_keys_stored"), &keys)?;
                 observer.observe(&format!("{prefix}.shared_values_stored"), &values)?;
             }
@@ -1062,9 +1316,9 @@ impl Attention {
             attention_cache.is_none()
                 && mask.is_some()
                 && seq_len > 1
-                && self.layer_type == LayerType::SlidingAttention
+                && self.policy.window().is_some()
                 && keys.shape()[2] == position_offset + seq_len
-                && (position_offset + seq_len <= *sliding_window + 1 || seq_len >= 1024)
+                && (position_offset + seq_len <= *sliding_window || seq_len >= 1024)
         });
         let output = if let Some(generated_sliding_window) = generated_sliding_window {
             sliding_window_prefill_attention(
@@ -1800,10 +2054,8 @@ pub struct TransformerBlock {
     pub num_attention_heads: i32,
     /// Transformer hidden size.
     pub hidden_size: i32,
-    /// Layer attention pattern.
-    pub layer_type: LayerType,
-    /// Sliding-window size, if any.
-    pub sliding_window: Option<i32>,
+    /// Exact full/sliding attention policy.
+    pub layer_policy: AttentionPolicy,
 
     #[quantizable]
     #[param]
@@ -1861,12 +2113,12 @@ impl TransformerBlock {
     /// Creates an unloaded transformer block.
     pub fn new(
         args: &ModelArgs,
-        layer_type: LayerType,
+        layer_policy: AttentionPolicy,
         layer_idx: usize,
         stream: &Stream,
     ) -> Result<Self, Exception> {
-        let layer_args = args.for_layer(layer_type);
-        let self_attn = Attention::new(&layer_args, layer_type, layer_idx, stream)?;
+        let layer_args = args.for_layer(layer_policy);
+        let self_attn = Attention::new(&layer_args, layer_policy, layer_idx, stream)?;
         let prefix = format!("model.language_model.layers.{layer_idx}");
         let mlp = Mlp::new_selective(
             args.hidden_size,
@@ -1945,8 +2197,7 @@ impl TransformerBlock {
         Ok(Self {
             num_attention_heads: layer_args.num_attention_heads,
             hidden_size: layer_args.hidden_size,
-            layer_type,
-            sliding_window: args.sliding_window,
+            layer_policy,
             layer_scalar: Param::new(Array::from_slice(&[1.0f32], &[1])),
             self_attn,
             mlp,
@@ -1967,6 +2218,10 @@ impl TransformerBlock {
 }
 
 impl TransformerBlock {
+    fn sliding_window(&self) -> Option<i32> {
+        self.layer_policy.window().map(|window| window.get() as i32)
+    }
+
     fn apply_layer_scalar(&self, x: Array, stream: &Stream) -> Result<Array, Exception> {
         x.multiply(&*self.layer_scalar, stream)
     }
@@ -1994,13 +2249,14 @@ impl TransformerBlock {
         } = input;
         let generated_mask = if disable_generated_mask {
             None
-        } else if self.layer_type == LayerType::SlidingAttention {
+        } else if self.layer_policy.window().is_some() {
+            let sliding_window = self.sliding_window();
             let seq_len = x.shape()[1];
-            if needs_generated_sliding_mask(seq_len, position_offset, self.sliding_window) {
+            if needs_generated_sliding_mask(seq_len, position_offset, sliding_window) {
                 Some(create_causal_mask(
                     seq_len,
                     Some(position_offset),
-                    self.sliding_window,
+                    sliding_window.map(|window| window - 1),
                     None,
                     stream,
                 )?)
@@ -2010,7 +2266,7 @@ impl TransformerBlock {
         } else {
             None
         };
-        let generated_sliding_window = generated_mask.as_ref().and(self.sliding_window);
+        let generated_sliding_window = generated_mask.as_ref().and(self.sliding_window());
         if let Some(mask) = generated_mask.as_ref().or(mask) {
             observer.observe(&format!("{prefix}.attention_mask"), mask)?;
         }
@@ -2152,13 +2408,14 @@ where
         } = input;
         let generated_mask = if disable_generated_mask {
             None
-        } else if self.layer_type == LayerType::SlidingAttention {
+        } else if self.layer_policy.window().is_some() {
+            let sliding_window = self.sliding_window();
             let seq_len = x.shape()[1];
-            if needs_generated_sliding_mask(seq_len, position_offset, self.sliding_window) {
+            if needs_generated_sliding_mask(seq_len, position_offset, sliding_window) {
                 Some(create_causal_mask(
                     seq_len,
                     Some(position_offset),
-                    self.sliding_window,
+                    sliding_window.map(|window| window - 1),
                     None,
                     stream,
                 )?)
@@ -2168,7 +2425,7 @@ where
         } else {
             None
         };
-        let generated_sliding_window = generated_mask.as_ref().and(self.sliding_window);
+        let generated_sliding_window = generated_mask.as_ref().and(self.sliding_window());
         let normed = self.input_layernorm.forward(x, stream)?;
         let self_attn_input = AttentionInput {
             x: &normed,
@@ -2341,12 +2598,10 @@ impl Gemma4TextModel {
         };
         let layers = (0..args.num_hidden_layers)
             .map(|index| {
-                TransformerBlock::new(
-                    args,
-                    args.layer_type(index as usize),
-                    index as usize,
-                    stream,
-                )
+                let policy = *args.attention_policy(index as usize).ok_or_else(|| {
+                    Exception::custom(format!("Gemma 4 has no policy for layer {index}"))
+                })?;
+                TransformerBlock::new(args, policy, index as usize, stream)
             })
             .collect::<Result<Vec<_>, _>>()?;
         let norm =
@@ -2482,8 +2737,8 @@ pub struct ModelInput<'a, C> {
     pub per_layer_input_ids: Option<&'a Array>,
     /// Optional attention mask.
     pub mask: Option<&'a Array>,
-    /// Optional sliding-layer mask when it differs from the full-attention mask.
-    pub sliding_mask: Option<&'a Array>,
+    /// Optional sliding-layer masks keyed by their exact attention policy.
+    pub sliding_masks: Option<&'a HashMap<AttentionPolicy, Array>>,
     /// Mutable per-layer key/value cache.
     pub cache: &'a mut Vec<Option<C>>,
 }
@@ -2503,7 +2758,7 @@ impl Gemma4TextModel {
             inputs_embeds,
             per_layer_input_ids,
             mask,
-            sliding_mask,
+            sliding_masks,
             cache,
         } = input;
         let mut h = match inputs_embeds {
@@ -2546,8 +2801,10 @@ impl Gemma4TextModel {
                 .as_ref()
                 .map(|inputs| inputs.try_index_device((.., .., index as i32, ..), stream))
                 .transpose()?;
-            let layer_mask = if layer.layer_type == LayerType::SlidingAttention {
-                sliding_mask.or(mask.as_ref())
+            let layer_mask = if layer.layer_policy.window().is_some() {
+                sliding_masks
+                    .and_then(|masks| masks.get(&layer.layer_policy))
+                    .or(mask.as_ref())
             } else {
                 mask.as_ref()
             };
@@ -2558,7 +2815,7 @@ impl Gemma4TextModel {
                 position_offset,
                 per_layer_input: layer_ple.as_ref(),
                 shared_kv: Some(&mut shared_kv),
-                disable_generated_mask: sliding_mask.is_some(),
+                disable_generated_mask: sliding_masks.is_some(),
                 generated_sliding_window: None,
             };
             h = layer.forward(layer_input, stream)?;
@@ -2588,7 +2845,7 @@ impl Gemma4TextModel {
             inputs_embeds,
             per_layer_input_ids,
             mask,
-            sliding_mask,
+            sliding_masks,
             cache,
         } = input;
         let mut h = match inputs_embeds {
@@ -2640,8 +2897,10 @@ impl Gemma4TextModel {
                 .as_ref()
                 .map(|inputs| inputs.try_index_device((.., .., index as i32, ..), stream))
                 .transpose()?;
-            let layer_mask = if layer.layer_type == LayerType::SlidingAttention {
-                sliding_mask.or(mask.as_ref())
+            let layer_mask = if layer.layer_policy.window().is_some() {
+                sliding_masks
+                    .and_then(|masks| masks.get(&layer.layer_policy))
+                    .or(mask.as_ref())
             } else {
                 mask.as_ref()
             };
@@ -2652,7 +2911,7 @@ impl Gemma4TextModel {
                 position_offset,
                 per_layer_input: layer_ple.as_ref(),
                 shared_kv: Some(&mut shared_kv),
-                disable_generated_mask: sliding_mask.is_some(),
+                disable_generated_mask: sliding_masks.is_some(),
                 generated_sliding_window: None,
             };
             h = layer.forward_with_observer(
@@ -2843,7 +3102,7 @@ impl Model {
                         inputs_embeds: None,
                         per_layer_input_ids: None,
                         mask: None,
-                        sliding_mask: None,
+                        sliding_masks: None,
                         cache: &mut cache.kv,
                     },
                     stream,
@@ -2860,7 +3119,7 @@ impl Model {
                     &cache.token_ids,
                     self.image_token_id.map(|id| id as u32),
                     self.video_token_id.map(|id| id as u32),
-                    self.args.sliding_window,
+                    &self.args.attention_schedule,
                 );
                 self.forward_with_observer(
                     ModelInput {
@@ -2868,7 +3127,7 @@ impl Model {
                         inputs_embeds: Some(&embeddings),
                         per_layer_input_ids: Some(&per_layer_ids),
                         mask: Some(&masks.full),
-                        sliding_mask: Some(&masks.sliding),
+                        sliding_masks: Some(&masks.sliding),
                         cache: &mut cache.kv,
                     },
                     stream,
@@ -3752,16 +4011,16 @@ pub(crate) fn gemma4_args_from_gguf_catalog(
             layer_pattern.len()
         )));
     }
-    let layer_types = layer_pattern
-        .into_iter()
-        .map(|is_sliding| {
-            if is_sliding != 0 {
-                LayerType::SlidingAttention
-            } else {
-                LayerType::FullAttention
-            }
-        })
-        .collect::<Vec<_>>();
+    let sliding_window = gguf_optional_i64(metadata, "gemma4.attention.sliding_window")?;
+    let attention_schedule = attention_schedule_from_pattern(
+        num_hidden_layers,
+        layer_pattern
+            .into_iter()
+            .map(|is_sliding| is_sliding != 0)
+            .collect(),
+        sliding_window,
+        "Gemma 4 GGUF",
+    )?;
 
     let feed_forward_values = gguf_i64_values(metadata, "gemma4.feed_forward_length")?;
     let feed_forward_lengths = expand_layer_values(
@@ -3777,18 +4036,18 @@ pub(crate) fn gemma4_args_from_gguf_catalog(
         kv_head_values,
         num_hidden_layers,
     )?;
-    let sliding_kv_heads = layer_types
+    let sliding_kv_heads = attention_schedule
         .iter()
         .zip(&kv_head_values)
-        .find_map(|(kind, value)| (*kind == LayerType::SlidingAttention).then_some(*value))
+        .find_map(|(policy, value)| policy.window().is_some().then_some(*value))
         .unwrap_or(kv_head_values[0]);
-    let full_kv_heads = layer_types
+    let full_kv_heads = attention_schedule
         .iter()
         .zip(&kv_head_values)
-        .find_map(|(kind, value)| (*kind == LayerType::FullAttention).then_some(*value))
+        .find_map(|(policy, value)| (*policy == AttentionPolicy::Full).then_some(*value))
         .unwrap_or(sliding_kv_heads);
-    for (kind, value) in layer_types.iter().zip(&kv_head_values) {
-        let expected = if *kind == LayerType::FullAttention {
+    for (policy, value) in attention_schedule.iter().zip(&kv_head_values) {
+        let expected = if *policy == AttentionPolicy::Full {
             full_kv_heads
         } else {
             sliding_kv_heads
@@ -3869,11 +4128,11 @@ pub(crate) fn gemma4_args_from_gguf_catalog(
     ]));
 
     let first_shared_layer = num_hidden_layers - num_kv_shared_layers;
-    let attention_k_eq_v = layer_types
+    let attention_k_eq_v = attention_schedule
         .iter()
         .enumerate()
-        .find(|(index, kind)| {
-            **kind == LayerType::FullAttention && *index < first_shared_layer.max(0) as usize
+        .find(|(index, policy)| {
+            **policy == AttentionPolicy::Full && *index < first_shared_layer.max(0) as usize
         })
         .is_some_and(|(index, _)| {
             arrays.contains_gguf_tensor(&format!("blk.{index}.attn_k.weight"))
@@ -3916,13 +4175,7 @@ pub(crate) fn gemma4_args_from_gguf_catalog(
         hidden_size_per_layer_input,
         vocab_size_per_layer_input: (hidden_size_per_layer_input > 0).then_some(vocab_size),
         num_kv_shared_layers,
-        layer_types,
-        sliding_window: gguf_optional_i64(metadata, "gemma4.attention.sliding_window")?
-            .map(i32::try_from)
-            .transpose()
-            .map_err(|_| {
-                Error::UnsupportedArchitecture("Gemma 4 sliding window exceeds i32".into())
-            })?,
+        attention_schedule,
         final_logit_softcapping: gguf_optional_f32(metadata, "gemma4.final_logit_softcapping")?,
         enable_moe_block,
         num_experts,
@@ -4117,7 +4370,10 @@ pub(super) fn gguf_optional_sliding_window_pattern(
         Some(GgufMetadataValue::Array(safemlx::ops::GgufMetadataArray::Bool(values))) => {
             Ok(Some(values.iter().map(|&value| i64::from(value)).collect()))
         }
-        _ => gguf_optional_i64_values(metadata, key),
+        Some(_) => Err(Error::UnsupportedArchitecture(format!(
+            "GGUF metadata key {key:?} must be a Boolean array"
+        ))),
+        None => Ok(None),
     }
 }
 
@@ -4158,6 +4414,19 @@ pub fn get_gemma4_model_args(model_dir: impl AsRef<Path>) -> Result<ModelArgs, E
     Ok(get_gemma4_model_config(model_dir.as_ref())?.0)
 }
 
+/// Parses and validates a Gemma 4 text configuration without loading weights.
+///
+/// Raw `layer_types` and `sliding_window` checkpoint fields are normalized once
+/// into [`ModelArgs::attention_schedule`].
+pub fn model_args_from_config_value(config: &Value) -> Result<ModelArgs, Error> {
+    let source: ModelArgsSource = serde_json::from_value(config.clone()).map_err(|error| {
+        Error::UnsupportedArchitecture(format!("invalid Gemma 4 text config: {error}"))
+    })?;
+    let args = model_args_from_source(source)?;
+    validate_model_args(&args)?;
+    Ok(args)
+}
+
 pub(crate) type Gemma4ModelConfigParts = (
     ModelArgs,
     Option<Gemma4VisionConfig>,
@@ -4173,23 +4442,23 @@ pub(crate) fn get_gemma4_model_config(model_dir: &Path) -> Result<Gemma4ModelCon
 }
 
 pub(crate) fn model_config_from_value(config: &Value) -> Result<Gemma4ModelConfigParts, Error> {
-    let mut config: Gemma4Config = serde_json::from_value(config.clone()).map_err(|error| {
+    let config: Gemma4ConfigSource = serde_json::from_value(config.clone()).map_err(|error| {
         Error::UnsupportedArchitecture(format!("invalid Gemma 4 config: {error}"))
     })?;
-    config.text_config.model_type = "gemma4".to_string();
-    config.text_config.quantized = config.quantization.is_some();
-    config.text_config.weight_quantization = config
+    let mut text_config = model_args_from_source(config.text_config)?;
+    text_config.model_type = "gemma4".to_string();
+    text_config.quantized = config.quantization.is_some();
+    text_config.weight_quantization = config
         .quantization
         .clone()
         .map(serde_json::from_value)
         .transpose()?;
-    config.text_config.quantization_group_size =
-        quantization_i32(&config.quantization, "group_size", 64);
-    config.text_config.quantization_bits = quantization_i32(&config.quantization, "bits", 4);
-    config.text_config.tie_word_embeddings = config.tie_word_embeddings;
-    validate_model_args(&config.text_config)?;
+    text_config.quantization_group_size = quantization_i32(&config.quantization, "group_size", 64);
+    text_config.quantization_bits = quantization_i32(&config.quantization, "bits", 4);
+    text_config.tie_word_embeddings = config.tie_word_embeddings;
+    validate_model_args(&text_config)?;
     Ok((
-        config.text_config,
+        text_config,
         config.vision_config,
         config.image_token_id,
         config.video_token_id,
@@ -4202,7 +4471,7 @@ pub(crate) fn validate_model_config_value(config: &Value) -> Result<(), Error> {
     model_config_from_value(config).map(|_| ())
 }
 
-fn validate_model_args(args: &ModelArgs) -> Result<(), Error> {
+pub(super) fn validate_model_args(args: &ModelArgs) -> Result<(), Error> {
     for (name, value) in [
         ("hidden_size", args.hidden_size),
         ("num_hidden_layers", args.num_hidden_layers),
@@ -4253,11 +4522,6 @@ fn validate_model_args(args: &ModelArgs) -> Result<(), Error> {
             "Gemma 4 vocab_size_per_layer_input must be positive when configured".into(),
         ));
     }
-    if args.sliding_window.is_some_and(|value| value <= 0) {
-        return Err(Error::UnsupportedArchitecture(
-            "Gemma 4 sliding_window must be positive when configured".into(),
-        ));
-    }
     if args.use_double_wide_mlp && args.intermediate_size.checked_mul(2).is_none() {
         return Err(Error::UnsupportedArchitecture(
             "Gemma 4 doubled MLP width exceeds i32".into(),
@@ -4277,15 +4541,23 @@ fn validate_model_args(args: &ModelArgs) -> Result<(), Error> {
             )));
         }
     }
-    if !args.layer_types.is_empty() && args.layer_types.len() != args.num_hidden_layers as usize {
+    if args.attention_schedule.len() != args.num_hidden_layers as usize {
         return Err(Error::UnsupportedArchitecture(format!(
-            "Gemma 4 layer_types has {} entries for {} layers",
-            args.layer_types.len(),
+            "Gemma 4 attention schedule has {} entries for {} layers",
+            args.attention_schedule.len(),
             args.num_hidden_layers
         )));
     }
-    for (layer, layer_type) in args.layer_types.iter().copied().enumerate() {
-        let layer_args = args.for_layer(layer_type);
+    for (layer, policy) in args.attention_schedule.iter().copied().enumerate() {
+        if policy
+            .window()
+            .is_some_and(|window| window.get() > i32::MAX as u32)
+        {
+            return Err(Error::UnsupportedArchitecture(format!(
+                "Gemma 4 layer {layer} sliding window exceeds the executable i32 range"
+            )));
+        }
+        let layer_args = args.for_layer(policy);
         if layer_args.num_attention_heads % layer_args.num_key_value_heads != 0 {
             return Err(Error::UnsupportedArchitecture(format!(
                 "Gemma 4 layer {layer} query heads ({}) must be divisible by KV heads ({})",
@@ -4526,7 +4798,7 @@ impl Model {
                         inputs_embeds: None,
                         per_layer_input_ids: None,
                         mask: None,
-                        sliding_mask: None,
+                        sliding_masks: None,
                         cache: &mut cache.kv,
                     },
                     stream,
@@ -4542,7 +4814,7 @@ impl Model {
                     &cache.token_ids,
                     self.image_token_id.map(|id| id as u32),
                     self.video_token_id.map(|id| id as u32),
-                    self.args.sliding_window,
+                    &self.args.attention_schedule,
                 );
                 self.forward_with_state(
                     ModelInput {
@@ -4550,7 +4822,7 @@ impl Model {
                         inputs_embeds: Some(&embeddings),
                         per_layer_input_ids: Some(&per_layer_ids),
                         mask: Some(&masks.full),
-                        sliding_mask: Some(&masks.sliding),
+                        sliding_masks: Some(&masks.sliding),
                         cache: &mut cache.kv,
                     },
                     stream,
@@ -4575,7 +4847,7 @@ impl Model {
                 inputs_embeds: None,
                 per_layer_input_ids: None,
                 mask: None,
-                sliding_mask: None,
+                sliding_masks: None,
                 cache: &mut cache.kv,
             },
             stream,
@@ -4609,7 +4881,7 @@ pub(crate) struct Gemma4StepOutput {
     /// Pre-final-normalization hidden states.
     pub hidden: Array,
     /// Shared key/value states for assistant drafting.
-    pub shared_kv_states: HashMap<LayerType, (Array, Array)>,
+    pub shared_kv_states: HashMap<AttentionPolicy, (Array, Array)>,
 }
 
 impl<C> CausalLm<Vec<Option<C>>> for Model
@@ -4629,7 +4901,7 @@ where
                 inputs_embeds: None,
                 per_layer_input_ids: None,
                 mask: None,
-                sliding_mask: None,
+                sliding_masks: None,
                 cache,
             },
             true,
@@ -4649,7 +4921,7 @@ where
                 inputs_embeds: None,
                 per_layer_input_ids: None,
                 mask: None,
-                sliding_mask: None,
+                sliding_masks: None,
                 cache,
             },
             true,
@@ -4738,14 +5010,14 @@ fn array_from_token_ids(token_ids: &[u32], stream: &Stream) -> Result<Array, Exc
 
 pub(crate) struct Gemma4AttentionMasks {
     pub(crate) full: Array,
-    pub(crate) sliding: Array,
+    pub(crate) sliding: HashMap<AttentionPolicy, Array>,
 }
 
 pub(crate) fn multimodal_attention_masks(
     token_ids: &[u32],
     image_token_id: Option<u32>,
     video_token_id: Option<u32>,
-    sliding_window: Option<i32>,
+    schedule: &LayerSchedule<AttentionPolicy>,
 ) -> Gemma4AttentionMasks {
     let sequence = token_ids.len();
     let mut groups = vec![-1i32; sequence];
@@ -4761,26 +5033,41 @@ pub(crate) fn multimodal_attention_masks(
         }
         previous_visual_token = is_visual.then_some(*token_id);
     }
-    let window = sliding_window.unwrap_or(sequence as i32);
     let mut full = Vec::with_capacity(sequence * sequence);
-    let mut sliding = Vec::with_capacity(sequence * sequence);
     for query in 0..sequence {
         for key in 0..sequence {
             let causal = key <= query;
             full.push(if causal { 0.0 } else { -1.0e9 });
-            let same_image_group = groups[query] >= 0 && groups[query] == groups[key];
-            let in_window = key as i32 > query as i32 - window;
-            sliding.push(if in_window && (causal || same_image_group) {
-                0.0
-            } else {
-                -1.0e9
-            });
         }
     }
     let shape = [1, 1, sequence as i32, sequence as i32];
+    let sliding = schedule
+        .sliding_windows()
+        .into_keys()
+        .map(|window| {
+            let window_i32 = window.get() as i32;
+            let mut mask = Vec::with_capacity(sequence * sequence);
+            for query in 0..sequence {
+                for key in 0..sequence {
+                    let causal = key <= query;
+                    let same_image_group = groups[query] >= 0 && groups[query] == groups[key];
+                    let in_window = key as i32 > query as i32 - window_i32;
+                    mask.push(if in_window && (causal || same_image_group) {
+                        0.0
+                    } else {
+                        -1.0e9
+                    });
+                }
+            }
+            (
+                AttentionPolicy::Sliding { window },
+                Array::from_slice(&mask, &shape),
+            )
+        })
+        .collect();
     Gemma4AttentionMasks {
         full: Array::from_slice(&full, &shape),
-        sliding: Array::from_slice(&sliding, &shape),
+        sliding,
     }
 }
 
@@ -4803,7 +5090,7 @@ impl CausalLm<Cache> for Model {
                         inputs_embeds: None,
                         per_layer_input_ids: None,
                         mask: None,
-                        sliding_mask: None,
+                        sliding_masks: None,
                         cache: &mut cache.kv,
                     },
                     true,
@@ -4820,7 +5107,7 @@ impl CausalLm<Cache> for Model {
                     &cache.token_ids,
                     self.image_token_id.map(|id| id as u32),
                     self.video_token_id.map(|id| id as u32),
-                    self.args.sliding_window,
+                    &self.args.attention_schedule,
                 );
                 self.forward_logits(
                     ModelInput {
@@ -4828,7 +5115,7 @@ impl CausalLm<Cache> for Model {
                         inputs_embeds: Some(&embeddings),
                         per_layer_input_ids: Some(&per_layer_ids),
                         mask: Some(&masks.full),
-                        sliding_mask: Some(&masks.sliding),
+                        sliding_masks: Some(&masks.sliding),
                         cache: &mut cache.kv,
                     },
                     true,
@@ -4854,7 +5141,7 @@ impl CausalLm<Cache> for Model {
                     inputs_embeds: None,
                     per_layer_input_ids: None,
                     mask: None,
-                    sliding_mask: None,
+                    sliding_masks: None,
                     cache: &mut cache.kv,
                 },
                 true,
@@ -4893,7 +5180,7 @@ impl CausalLm<Cache> for Model {
                 &cache.token_ids,
                 self.image_token_id.map(|id| id as u32),
                 self.video_token_id.map(|id| id as u32),
-                self.args.sliding_window,
+                &self.args.attention_schedule,
             )
         });
         self.forward_logits(
@@ -4902,7 +5189,7 @@ impl CausalLm<Cache> for Model {
                 inputs_embeds: generated_embeddings.as_ref(),
                 per_layer_input_ids: per_layer_ids.as_ref(),
                 mask: masks.as_ref().map(|masks| &masks.full),
-                sliding_mask: masks.as_ref().map(|masks| &masks.sliding),
+                sliding_masks: masks.as_ref().map(|masks| &masks.sliding),
                 cache: &mut cache.kv,
             },
             true,
@@ -4927,12 +5214,13 @@ mod tests {
 
     use super::{
         load_gemma4_model, needs_generated_sliding_mask, partial_rotary_dims, Attention, Cache,
-        FloatOrString, LayerType, ModelArgs,
+        FloatOrString, ModelArgs,
     };
     use crate::api::{
         common::generation::CausalLm,
         input::{InputMetadata, InputPart, ModelInput},
     };
+    use crate::runtime::attention::{AttentionPolicy, LayerSchedule};
     use crate::runtime::checkpoint::load::{
         load_arrays_strict, StrictLoadConfig, StrictLoadReport,
     };
@@ -4971,8 +5259,7 @@ mod tests {
             hidden_size_per_layer_input: 0,
             vocab_size_per_layer_input: None,
             num_kv_shared_layers: 0,
-            layer_types: vec![LayerType::FullAttention],
-            sliding_window: None,
+            attention_schedule: LayerSchedule::all_full(1).unwrap(),
             final_logit_softcapping: None,
             enable_moe_block: false,
             num_experts: None,
@@ -4981,6 +5268,146 @@ mod tests {
             rope_scaling: None,
             rope_parameters: None,
         }
+    }
+
+    fn text_config(layer_types: serde_json::Value, window: Option<i64>) -> serde_json::Value {
+        let mut config = serde_json::json!({
+            "model_type": "gemma4",
+            "hidden_size": 8,
+            "num_hidden_layers": 4,
+            "intermediate_size": 16,
+            "num_attention_heads": 2,
+            "rms_norm_eps": 0.00001,
+            "vocab_size": 32,
+            "num_key_value_heads": 1,
+            "max_position_embeddings": 128,
+            "head_dim": 4,
+            "layer_types": layer_types
+        });
+        if let Some(window) = window {
+            config["sliding_window"] = window.into();
+        }
+        config
+    }
+
+    #[test]
+    fn normalizes_arbitrary_attention_patterns_once() {
+        let args = super::model_args_from_config_value(&text_config(
+            serde_json::json!([
+                "sliding_attention",
+                "full_attention",
+                "sliding_attention",
+                "full_attention"
+            ]),
+            Some(17),
+        ))
+        .unwrap();
+        assert_eq!(
+            args.attention_schedule.iter().copied().collect::<Vec<_>>(),
+            vec![
+                AttentionPolicy::sliding(17).unwrap(),
+                AttentionPolicy::Full,
+                AttentionPolicy::sliding(17).unwrap(),
+                AttentionPolicy::Full,
+            ]
+        );
+        assert_eq!(args.attention_policy(4), None);
+
+        let full =
+            super::model_args_from_config_value(&text_config(serde_json::json!([]), None)).unwrap();
+        assert_eq!(full.attention_schedule.full_layer_count(), 4);
+    }
+
+    #[test]
+    fn rejects_invalid_attention_source_fields_before_loading_weights() {
+        let missing_window = text_config(
+            serde_json::json!([
+                "full_attention",
+                "sliding_attention",
+                "full_attention",
+                "sliding_attention"
+            ]),
+            None,
+        );
+        assert!(super::model_args_from_config_value(&missing_window)
+            .unwrap_err()
+            .to_string()
+            .contains("no sliding window"));
+
+        let wrong_length = text_config(
+            serde_json::json!(["full_attention", "sliding_attention"]),
+            Some(8),
+        );
+        assert!(super::model_args_from_config_value(&wrong_length)
+            .unwrap_err()
+            .to_string()
+            .contains("2 entries for 4 layers"));
+
+        for window in [0, -1, i64::from(i32::MAX) + 1] {
+            let invalid = text_config(
+                serde_json::json!([
+                    "sliding_attention",
+                    "full_attention",
+                    "full_attention",
+                    "full_attention"
+                ]),
+                Some(window),
+            );
+            assert!(super::model_args_from_config_value(&invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn architecture_fingerprint_tracks_ordered_policy_and_exact_windows() {
+        let mut first = model_args(false);
+        first.num_hidden_layers = 3;
+        first.attention_schedule = LayerSchedule::new(
+            3,
+            vec![
+                AttentionPolicy::sliding(4).unwrap(),
+                AttentionPolicy::Full,
+                AttentionPolicy::sliding(8).unwrap(),
+            ],
+        )
+        .unwrap();
+        let mut reordered = first.clone();
+        reordered.attention_schedule = LayerSchedule::new(
+            3,
+            vec![
+                AttentionPolicy::Full,
+                AttentionPolicy::sliding(4).unwrap(),
+                AttentionPolicy::sliding(8).unwrap(),
+            ],
+        )
+        .unwrap();
+        assert_ne!(
+            super::prompt_cache_architecture_fingerprint(&first),
+            super::prompt_cache_architecture_fingerprint(&reordered)
+        );
+    }
+
+    #[test]
+    fn multimodal_masks_apply_each_exact_window_with_current_token_included() {
+        let schedule = LayerSchedule::new(
+            2,
+            vec![
+                AttentionPolicy::sliding(2).unwrap(),
+                AttentionPolicy::sliding(3).unwrap(),
+            ],
+        )
+        .unwrap();
+        let masks = super::multimodal_attention_masks(&[1, 2, 3], None, None, &schedule);
+        let narrow = masks.sliding[&AttentionPolicy::sliding(2).unwrap()]
+            .evaluated()
+            .unwrap();
+        let wide = masks.sliding[&AttentionPolicy::sliding(3).unwrap()]
+            .evaluated()
+            .unwrap();
+        // Query position 2 can see positions 1..=2 with window 2, and 0..=2
+        // with window 3. This reference is independent of decoder execution.
+        assert!(narrow.as_slice::<f32>()[6] < -1.0e8);
+        assert_eq!(narrow.as_slice::<f32>()[7], 0.0);
+        assert_eq!(wide.as_slice::<f32>()[6], 0.0);
     }
 
     #[test]
@@ -5202,9 +5629,7 @@ mod tests {
         let state = model
             .prefill_mtp(ModelInput::new(&parts), &mut mtp_cache, stream)
             .unwrap();
-        assert!(state
-            .shared_kv_states
-            .contains_key(&LayerType::FullAttention));
+        assert!(state.shared_kv_states.contains_key(&AttentionPolicy::Full));
     }
 
     #[test]
@@ -5280,11 +5705,11 @@ mod tests {
                 "gemma4.embedding_length".into(),
                 GgufMetadataValue::Uint32(1536),
             ),
-            ("gemma4.block_count".into(), GgufMetadataValue::Uint32(2)),
+            ("gemma4.block_count".into(), GgufMetadataValue::Uint32(4)),
             (
                 "gemma4.feed_forward_length".into(),
                 GgufMetadataValue::Array(safemlx::ops::GgufMetadataArray::Uint32(vec![
-                    6144, 12288,
+                    6144, 12288, 6144, 12288,
                 ])),
             ),
             (
@@ -5293,7 +5718,7 @@ mod tests {
             ),
             (
                 "gemma4.attention.head_count_kv".into(),
-                GgufMetadataValue::Array(safemlx::ops::GgufMetadataArray::Uint32(vec![1, 2])),
+                GgufMetadataValue::Array(safemlx::ops::GgufMetadataArray::Uint32(vec![1, 2, 1, 2])),
             ),
             (
                 "gemma4.attention.key_length".into(),
@@ -5305,7 +5730,13 @@ mod tests {
             ),
             (
                 "gemma4.attention.sliding_window_pattern".into(),
-                GgufMetadataValue::Array(safemlx::ops::GgufMetadataArray::Bool(vec![true, false])),
+                GgufMetadataValue::Array(safemlx::ops::GgufMetadataArray::Bool(vec![
+                    true, false, true, false,
+                ])),
+            ),
+            (
+                "gemma4.attention.sliding_window".into(),
+                GgufMetadataValue::Uint32(4096),
             ),
             (
                 "gemma4.attention.shared_kv_layers".into(),
@@ -5338,10 +5769,18 @@ mod tests {
         ]);
 
         let args = super::gemma4_args_from_gguf_catalog(&HashMap::new(), &metadata).unwrap();
-        assert_eq!(args.feed_forward_lengths, Some(vec![6144, 12288]));
         assert_eq!(
-            args.layer_types,
-            vec![LayerType::SlidingAttention, LayerType::FullAttention]
+            args.feed_forward_lengths,
+            Some(vec![6144, 12288, 6144, 12288])
+        );
+        assert_eq!(
+            args.attention_schedule.iter().copied().collect::<Vec<_>>(),
+            vec![
+                AttentionPolicy::sliding(4096).unwrap(),
+                AttentionPolicy::Full,
+                AttentionPolicy::sliding(4096).unwrap(),
+                AttentionPolicy::Full,
+            ]
         );
         assert_eq!(args.head_dim, 256);
         assert_eq!(args.global_head_dim, Some(512));
@@ -5349,6 +5788,21 @@ mod tests {
         assert_eq!(args.num_global_key_value_heads, Some(2));
         assert_eq!(args.num_kv_shared_layers, 1);
         assert_eq!(args.vocab_size, 32);
+    }
+
+    #[test]
+    fn gguf_attention_pattern_requires_boolean_metadata() {
+        let metadata = HashMap::from([(
+            "gemma4.attention.sliding_window_pattern".into(),
+            GgufMetadataValue::Array(safemlx::ops::GgufMetadataArray::Uint32(vec![1, 0])),
+        )]);
+        let error = super::gguf_optional_sliding_window_pattern(
+            &metadata,
+            "gemma4.attention.sliding_window_pattern",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("must be a Boolean array"));
     }
 
     #[test]
@@ -5412,7 +5866,7 @@ mod tests {
     fn full_attention_with_key_equal_value_does_not_allocate_v_proj() {
         let stream = test_stream();
         let attention =
-            Attention::new(&model_args(true), LayerType::FullAttention, 0, &stream).unwrap();
+            Attention::new(&model_args(true), AttentionPolicy::Full, 0, &stream).unwrap();
         let keys = parameter_keys(&attention);
 
         assert!(keys.iter().any(|key| key.starts_with("q_proj.")));
@@ -5425,7 +5879,7 @@ mod tests {
     fn attention_allocates_v_proj_when_key_equal_value_is_disabled() {
         let stream = test_stream();
         let attention =
-            Attention::new(&model_args(false), LayerType::FullAttention, 0, &stream).unwrap();
+            Attention::new(&model_args(false), AttentionPolicy::Full, 0, &stream).unwrap();
         let keys = parameter_keys(&attention);
 
         assert!(keys.iter().any(|key| key.starts_with("v_proj.")));

@@ -544,6 +544,10 @@ impl Model {
     /// Returns the canonical cache-relevant architecture identity derived from the loaded model.
     pub fn prompt_cache_architecture_fingerprint(&self) -> Result<String, Exception> {
         match self {
+            Self::Gemma4(model) => Ok(gemma4::prompt_cache_architecture_fingerprint(&model.args)),
+            Self::Gemma4Layerwise(model) => {
+                Ok(gemma4::prompt_cache_architecture_fingerprint(model.args()))
+            }
             Self::Llama(model) => Ok(llama::prompt_cache_architecture_fingerprint(&model.args)),
             Self::LlamaLayerwise(model) => {
                 Ok(llama::prompt_cache_architecture_fingerprint(model.args()))
@@ -695,7 +699,7 @@ impl Model {
                     inputs_embeds: None,
                     per_layer_input_ids: None,
                     mask,
-                    sliding_mask: None,
+                    sliding_masks: None,
                     cache: &mut cache.kv,
                 },
                 stream,
@@ -1453,31 +1457,28 @@ pub(super) fn validate_gemma4_drafter(
         )));
     }
     let draft = &assistant.config.text_config;
-    for layer_type in [
-        gemma4::LayerType::SlidingAttention,
-        gemma4::LayerType::FullAttention,
-    ] {
-        let draft_uses_layer = (0..draft.num_hidden_layers.max(0) as usize)
-            .any(|index| draft.layer_type(index) == layer_type);
-        if !draft_uses_layer {
-            continue;
-        }
-        let target_uses_layer = (0..target.num_hidden_layers.max(0) as usize)
-            .any(|index| target.layer_type(index) == layer_type);
-        if !target_uses_layer {
+    let mut required_policies = draft.attention_schedule.iter().copied().collect::<Vec<_>>();
+    required_policies.sort_unstable();
+    required_policies.dedup();
+    for policy in required_policies {
+        if !target
+            .attention_schedule
+            .iter()
+            .any(|candidate| *candidate == policy)
+        {
             return Err(Exception::custom(format!(
-                "Gemma 4 assistant requires {layer_type:?} shared KV state, but the target has no such attention layer"
+                "Gemma 4 assistant requires {policy:?} shared KV state, but the target has no matching attention policy"
             )));
         }
 
-        let target_kv_heads = if layer_type == gemma4::LayerType::FullAttention {
+        let target_kv_heads = if policy == crate::runtime::attention::AttentionPolicy::Full {
             target
                 .num_global_key_value_heads
                 .unwrap_or(target.num_key_value_heads)
         } else {
             target.num_key_value_heads
         };
-        let draft_kv_heads = if layer_type == gemma4::LayerType::FullAttention {
+        let draft_kv_heads = if policy == crate::runtime::attention::AttentionPolicy::Full {
             draft
                 .num_global_key_value_heads
                 .unwrap_or(draft.num_key_value_heads)
@@ -1486,42 +1487,33 @@ pub(super) fn validate_gemma4_drafter(
         };
         if draft_kv_heads != target_kv_heads {
             return Err(Exception::custom(format!(
-                "Gemma 4 assistant {layer_type:?} KV-head count {draft_kv_heads} does not match target count {target_kv_heads}"
+                "Gemma 4 assistant {policy:?} KV-head count {draft_kv_heads} does not match target count {target_kv_heads}"
             )));
         }
 
-        let target_head_dim = if layer_type == gemma4::LayerType::FullAttention {
+        let target_head_dim = if policy == crate::runtime::attention::AttentionPolicy::Full {
             target.global_head_dim.unwrap_or(target.head_dim)
         } else {
             target.head_dim
         };
-        let draft_head_dim = if layer_type == gemma4::LayerType::FullAttention {
+        let draft_head_dim = if policy == crate::runtime::attention::AttentionPolicy::Full {
             draft.global_head_dim.unwrap_or(draft.head_dim)
         } else {
             draft.head_dim
         };
         if draft_head_dim != target_head_dim {
             return Err(Exception::custom(format!(
-                "Gemma 4 assistant {layer_type:?} head dimension {draft_head_dim} does not match target dimension {target_head_dim}"
+                "Gemma 4 assistant {policy:?} head dimension {draft_head_dim} does not match target dimension {target_head_dim}"
             )));
         }
 
-        let target_rope_theta = target.rope_theta_for_layer(layer_type);
-        let draft_rope_theta = draft.rope_theta_for_layer(layer_type);
+        let target_rope_theta = target.rope_theta_for_layer(policy);
+        let draft_rope_theta = draft.rope_theta_for_layer(policy);
         if draft_rope_theta.to_bits() != target_rope_theta.to_bits() {
             return Err(Exception::custom(format!(
-                "Gemma 4 assistant {layer_type:?} RoPE base {draft_rope_theta} does not match target base {target_rope_theta}"
+                "Gemma 4 assistant {policy:?} RoPE base {draft_rope_theta} does not match target base {target_rope_theta}"
             )));
         }
-    }
-    if (0..draft.num_hidden_layers.max(0) as usize)
-        .any(|index| draft.layer_type(index) == gemma4::LayerType::SlidingAttention)
-        && draft.sliding_window != target.sliding_window
-    {
-        return Err(Exception::custom(format!(
-            "Gemma 4 assistant sliding-window configuration {:?} does not match target configuration {:?}",
-            draft.sliding_window, target.sliding_window
-        )));
     }
     if assistant.block_size() <= 1 {
         return Err(Exception::custom(
@@ -1776,11 +1768,12 @@ mod gemma4_drafter_compatibility_tests {
     use super::validate_gemma4_drafter;
     use crate::architectures::gemma4::{
         assistant::{Gemma4AssistantConfig, Gemma4AssistantDraftModel},
-        model::{LayerType, ModelArgs},
+        model::{model_args_from_config_value, ModelArgs},
     };
+    use crate::runtime::attention::{AttentionPolicy, LayerSchedule};
 
     fn target_args() -> ModelArgs {
-        serde_json::from_value(serde_json::json!({
+        model_args_from_config_value(&serde_json::json!({
             "model_type": "gemma4",
             "hidden_size": 8,
             "num_hidden_layers": 2,
@@ -1828,15 +1821,18 @@ mod gemma4_drafter_compatibility_tests {
         let error = validate_gemma4_drafter(&target, &assistant)
             .unwrap_err()
             .to_string();
-        assert!(error.contains("FullAttention KV-head count"));
+        assert!(error.contains("Full KV-head count"));
 
         assistant.config.text_config.num_global_key_value_heads = Some(1);
-        assistant.config.text_config.layer_types = vec![LayerType::SlidingAttention];
-        assistant.config.text_config.sliding_window = Some(32);
+        assistant.config.text_config.attention_schedule = LayerSchedule::new(
+            2,
+            vec![AttentionPolicy::sliding(32).unwrap(), AttentionPolicy::Full],
+        )
+        .unwrap();
         let error = validate_gemma4_drafter(&target, &assistant)
             .unwrap_err()
             .to_string();
-        assert!(error.contains("sliding-window configuration"));
+        assert!(error.contains("no matching attention policy"));
     }
 }
 

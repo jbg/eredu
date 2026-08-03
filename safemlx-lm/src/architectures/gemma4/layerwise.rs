@@ -17,8 +17,8 @@ use crate::{
     api::{
         common::generation::CausalLm,
         gemma4::{
-            self as resident, AttentionInput, Cache, Gemma4Embedding, Gemma4TextModel, LayerType,
-            ModelArgs, TransformerBlock,
+            self as resident, AttentionInput, Cache, Gemma4Embedding, Gemma4TextModel, ModelArgs,
+            TransformerBlock,
         },
         gemma4_audio::{
             AudioLayer, Gemma4AudioConfig, Gemma4AudioLayerwiseStatic, Gemma4AudioTower,
@@ -32,6 +32,7 @@ use crate::{
     },
     error::Error,
     nn::tensor::create_causal_mask,
+    runtime::attention::AttentionPolicy,
     runtime::cache::KeyValueCache,
     runtime::checkpoint::binding::{
         build_module_bindings_with_recipes, canonical_checkpoint_name, populate_module_from_lease,
@@ -714,9 +715,9 @@ impl ModuleParameters for Gemma4Layer {
 pub struct Gemma4ForwardContext {
     per_layer_inputs: Option<Array>,
     mask: Option<Array>,
-    sliding_mask: Option<Array>,
+    sliding_masks: Option<HashMap<AttentionPolicy, Array>>,
     position_offset: i32,
-    shared_kv: HashMap<LayerType, (Array, Array)>,
+    shared_kv: HashMap<AttentionPolicy, (Array, Array)>,
     parts: Vec<Gemma4PreparedPart>,
     vision_jobs: Vec<Gemma4VisionJob>,
     audio_jobs: Vec<Gemma4AudioJob>,
@@ -1010,7 +1011,7 @@ impl GeneralLayerwiseModelAdapter for Gemma4LayerwiseAdapter {
                     context: Gemma4ForwardContext {
                         per_layer_inputs,
                         mask,
-                        sliding_mask: None,
+                        sliding_masks: None,
                         position_offset: 0,
                         shared_kv: HashMap::new(),
                         parts,
@@ -1038,7 +1039,7 @@ impl GeneralLayerwiseModelAdapter for Gemma4LayerwiseAdapter {
                 context: Gemma4ForwardContext {
                     per_layer_inputs: None,
                     mask: None,
-                    sliding_mask: None,
+                    sliding_masks: None,
                     position_offset: 0,
                     shared_kv: HashMap::new(),
                     parts,
@@ -1076,7 +1077,7 @@ impl GeneralLayerwiseModelAdapter for Gemma4LayerwiseAdapter {
             context: Gemma4ForwardContext {
                 per_layer_inputs,
                 mask,
-                sliding_mask: None,
+                sliding_masks: None,
                 position_offset,
                 shared_kv: HashMap::new(),
                 parts: Vec::new(),
@@ -1147,7 +1148,11 @@ impl GeneralLayerwiseModelAdapter for Gemma4LayerwiseAdapter {
             )?))),
             "text_decoder" => Ok(Gemma4Layer::Text(Box::new(TransformerBlock::new(
                 &self.args,
-                self.args.layer_type(index),
+                *self.args.attention_policy(index).ok_or_else(|| {
+                    Error::UnsupportedArchitecture(format!(
+                        "Gemma 4 has no attention policy for layer {index}"
+                    ))
+                })?,
                 index,
                 stream,
             )?))),
@@ -1216,11 +1221,11 @@ impl GeneralLayerwiseModelAdapter for Gemma4LayerwiseAdapter {
                     .as_ref()
                     .map(|inputs| inputs.try_index_device((.., .., index as i32, ..), stream))
                     .transpose()?;
-                let mask = if layer.layer_type == LayerType::SlidingAttention {
-                    context.sliding_mask.as_ref().or(context.mask.as_ref())
-                } else {
-                    context.mask.as_ref()
-                };
+                let mask = context
+                    .sliding_masks
+                    .as_ref()
+                    .and_then(|masks| masks.get(&layer.layer_policy))
+                    .or(context.mask.as_ref());
                 Ok(layer.forward(
                     AttentionInput {
                         x: hidden,
@@ -1344,10 +1349,10 @@ impl GeneralLayerwiseModelAdapter for Gemma4LayerwiseAdapter {
             &cache.token_ids,
             self.image_token_id.map(|id| id as u32),
             self.video_token_id.map(|id| id as u32),
-            self.args.sliding_window,
+            &self.args.attention_schedule,
         );
         context.mask = Some(masks.full);
-        context.sliding_mask = Some(masks.sliding);
+        context.sliding_masks = Some(masks.sliding);
         context.tokens = Some(tokens);
         context.needs_assembly = false;
         Ok(hidden)
@@ -1417,7 +1422,7 @@ mod tests {
             "text_config": {
                 "model_type": "gemma4",
                 "hidden_size": 8,
-                "num_hidden_layers": 3,
+                "num_hidden_layers": 4,
                 "intermediate_size": 16,
                 "num_attention_heads": 2,
                 "rms_norm_eps": 1e-6,
@@ -1431,7 +1436,7 @@ mod tests {
                 "hidden_size_per_layer_input": 4,
                 "vocab_size_per_layer_input": 32,
                 "num_kv_shared_layers": 1,
-                "layer_types": ["sliding_attention", "full_attention", "full_attention"],
+                "layer_types": ["sliding_attention", "full_attention", "sliding_attention", "full_attention"],
                 "sliding_window": 8,
                 "final_logit_softcapping": 4.0
             }
@@ -1498,7 +1503,7 @@ mod tests {
     fn parity(depth: usize) {
         let gpu = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
         let cpu = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
-        let mut args: ModelArgs = serde_json::from_value(config()["text_config"].clone()).unwrap();
+        let mut args = resident::model_args_from_config_value(&config()["text_config"]).unwrap();
         args.tie_word_embeddings = false;
         let mut fixture = Model::new(args, gpu.stream()).unwrap();
         initialize(&mut fixture, gpu.stream());
@@ -1528,7 +1533,7 @@ mod tests {
                         inputs_embeds: None,
                         per_layer_input_ids: None,
                         mask: None,
-                        sliding_mask: None,
+                        sliding_masks: None,
                         cache: &mut eager_cache,
                     },
                     false,
@@ -1540,6 +1545,14 @@ mod tests {
                 .unwrap();
             assert_close(&actual, &expected);
         }
+        assert_eq!(
+            layerwise_cache
+                .kv
+                .iter()
+                .map(|cache| cache.as_ref().map_or(0, KeyValueCache::offset))
+                .collect::<Vec<_>>(),
+            vec![5, 5, 5, 0]
+        );
         let report = layerwise.residency_report().unwrap();
         let resident_layers = report
             .units()
@@ -1560,7 +1573,7 @@ mod tests {
     fn gemma4_multimodal_vision_audio_and_text_group_parity() {
         let gpu = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
         let cpu = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
-        let mut args: ModelArgs = serde_json::from_value(config()["text_config"].clone()).unwrap();
+        let mut args = resident::model_args_from_config_value(&config()["text_config"]).unwrap();
         args.tie_word_embeddings = false;
         let vision = Gemma4VisionConfig {
             hidden_size: 8,

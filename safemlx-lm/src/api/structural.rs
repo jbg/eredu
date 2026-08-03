@@ -1745,8 +1745,10 @@ fn validate_gemma4_safetensors(
     let first_shared_layer = layers - args.num_kv_shared_layers as usize;
     for layer in 0..layers {
         let prefix = format!("model.language_model.layers.{layer}");
-        let layer_type = args.layer_type(layer);
-        let full_attention = layer_type == gemma4::LayerType::FullAttention;
+        let policy = args
+            .attention_policy(layer)
+            .expect("validated Gemma 4 attention schedule");
+        let full_attention = *policy == crate::runtime::attention::AttentionPolicy::Full;
         let head_dim = if full_attention {
             args.global_head_dim.unwrap_or(args.head_dim)
         } else {
@@ -6242,7 +6244,10 @@ fn gemma4_gguf_expected(
         .collect::<BTreeSet<_>>();
     for layer in 0..layers {
         let gguf = format!("blk.{layer}");
-        let full_attention = args.layer_type(layer) == gemma4::LayerType::FullAttention;
+        let full_attention = *args
+            .attention_policy(layer)
+            .expect("validated Gemma 4 attention schedule")
+            == crate::runtime::attention::AttentionPolicy::Full;
         let head_dim = if full_attention {
             args.global_head_dim.unwrap_or(args.head_dim)
         } else {

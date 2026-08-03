@@ -6,11 +6,12 @@ use safemlx::{error::Exception, ops::indexing::TryIndexOp, transforms::eval, Arr
 
 use crate::{
     api::{
-        gemma4::{Cache, Gemma4Embedding, Gemma4StepOutput, LayerType, Model as Gemma4Model},
+        gemma4::{Cache, Gemma4Embedding, Gemma4StepOutput, Model as Gemma4Model},
         gemma4_assistant::{Gemma4AssistantDraftModel, Gemma4AssistantDraftState},
         input::ModelInput as RuntimeInput,
     },
     architectures::gemma4::layerwise::Gemma4LayerwiseModel,
+    runtime::attention::AttentionPolicy,
     runtime::generation::sampler::SpeculativeSampler,
     runtime::generation::speculative::{
         self as mtp, MtpBackend, MtpCommit, MtpConfig, MtpExecutionStreams, MtpPrefill,
@@ -22,7 +23,7 @@ use crate::{
 #[derive(Clone)]
 pub(crate) struct Gemma4TargetState {
     hidden: Array,
-    shared_kv: Arc<HashMap<LayerType, (Array, Array)>>,
+    shared_kv: Arc<HashMap<AttentionPolicy, (Array, Array)>>,
     cache_len: usize,
 }
 
@@ -474,7 +475,7 @@ mod tests {
             .unwrap();
         let state = Gemma4TargetState {
             hidden,
-            shared_kv: Arc::new(HashMap::from([(LayerType::FullAttention, (keys, values))])),
+            shared_kv: Arc::new(HashMap::from([(AttentionPolicy::Full, (keys, values))])),
             cache_len: 9,
         };
 
@@ -489,7 +490,7 @@ mod tests {
             copied.hidden.evaluated().unwrap().as_slice::<f32>(),
             &[1.0, 2.0]
         );
-        let (keys, values) = &copied.shared_kv[&LayerType::FullAttention];
+        let (keys, values) = &copied.shared_kv[&AttentionPolicy::Full];
         assert_eq!(keys.evaluated().unwrap().as_slice::<f32>(), &[3.0, 4.0]);
         assert_eq!(values.evaluated().unwrap().as_slice::<f32>(), &[5.0, 6.0]);
     }
@@ -513,7 +514,7 @@ mod tests {
         let hidden_ptr = hidden.evaluated().unwrap().as_slice::<f32>().as_ptr();
         let keys_ptr = keys.evaluated().unwrap().as_slice::<f32>().as_ptr();
         let values_ptr = values.evaluated().unwrap().as_slice::<f32>().as_ptr();
-        let shared_kv = Arc::new(HashMap::from([(LayerType::FullAttention, (keys, values))]));
+        let shared_kv = Arc::new(HashMap::from([(AttentionPolicy::Full, (keys, values))]));
         let state = Gemma4TargetState {
             hidden,
             shared_kv: shared_kv.clone(),
@@ -537,7 +538,7 @@ mod tests {
                 .as_ptr(),
             hidden_ptr
         );
-        let (keys, values) = &shared.shared_kv[&LayerType::FullAttention];
+        let (keys, values) = &shared.shared_kv[&AttentionPolicy::Full];
         assert_eq!(
             keys.evaluated().unwrap().as_slice::<f32>().as_ptr(),
             keys_ptr

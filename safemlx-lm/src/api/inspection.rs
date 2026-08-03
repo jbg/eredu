@@ -6807,6 +6807,48 @@ mod tests {
     }
 
     #[test]
+    fn gemma4_schedule_inspection_and_loader_preflight_reject_identically() {
+        for mutate in [
+            |config: &mut Value| {
+                config["text_config"]["layer_types"] = json!(["sliding_attention"])
+            },
+            |config: &mut Value| {
+                config["text_config"]["layer_types"] =
+                    json!(["sliding_attention", "full_attention"]);
+                config["text_config"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("sliding_window");
+            },
+            |config: &mut Value| config["text_config"]["sliding_window"] = json!(0),
+            |config: &mut Value| config["text_config"]["sliding_window"] = json!(-1),
+            |config: &mut Value| {
+                config["text_config"]["sliding_window"] = json!(i64::from(i32::MAX) + 1)
+            },
+        ] {
+            let directory = write_complete_gemma4_safetensors_dir(false, |_| {});
+            let mut config = gemma4_config(false);
+            mutate(&mut config);
+            std::fs::write(
+                directory.path().join("config.json"),
+                serde_json::to_vec(&config).unwrap(),
+            )
+            .unwrap();
+
+            let report =
+                inspect_model(directory.path(), ModelInspectionOptions::default()).unwrap();
+            assert_eq!(report.model_loadability, InspectionReadiness::Invalid);
+            assert!(!report.is_loadable());
+            assert!(structural::validate_safetensors_load_path(
+                ModelKind::Gemma4,
+                directory.path(),
+                ModelLoadOptions::default(),
+            )
+            .is_err());
+        }
+    }
+
+    #[test]
     fn gemma4_native_affine_catalog_and_companions_are_validated_exactly() {
         let complete = write_complete_quantized_gemma4_safetensors_dir(|_| {});
         let report = inspect_model(complete.path(), ModelInspectionOptions::default()).unwrap();

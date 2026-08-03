@@ -111,10 +111,11 @@ pub enum CacheStateStrategy {
         cached_layers: u64,
         /// Layers that reuse K/V produced by an earlier layer.
         shared_layers: u64,
-        /// Cached layers that apply a sliding attention mask.
-        sliding_attention_layers: u64,
-        /// Sliding attention bound; this does not bound cache allocation.
-        sliding_attention_window: Option<u64>,
+        /// Total full-attention layer count, including shared layers.
+        full_attention_layers: u64,
+        /// Total sliding-mask layers grouped by exact attention window,
+        /// including shared layers. These windows do not bound KV allocation.
+        sliding_attention: Vec<SlidingWindowLayerCount>,
     },
     /// Multi-head latent attention stores compressed latent and rotary state.
     CompressedMla {
@@ -966,34 +967,39 @@ fn gemma4_spec(
         });
     }
     let cached = layers - shared;
-    let sliding = (0..cached as usize)
-        .filter(|index| args.layer_type(*index) == gemma4::LayerType::SlidingAttention)
-        .count() as u64;
-    let full = cached - sliding;
-    let window = if sliding > 0 {
-        Some(
-            args.sliding_window
-                .ok_or_else(|| CapabilityError::InvalidConfiguration {
-                    field: "sliding_window",
-                    detail: "Gemma has sliding-attention layers but no window".into(),
-                })
-                .and_then(|value| positive(value, "sliding_window"))?,
-        )
-    } else {
-        None
-    };
+    let mut sliding_by_window = BTreeMap::<u64, u64>::new();
+    for policy in args.attention_schedule.iter() {
+        if let Some(window) = policy.window() {
+            *sliding_by_window
+                .entry(u64::from(window.get()))
+                .or_default() += 1;
+        }
+    }
+    let total_sliding = sliding_by_window.values().sum::<u64>();
+    let full_attention_layers = layers - total_sliding;
+    let mut cached_sliding = 0;
+    for policy in args.attention_schedule.iter().take(cached as usize) {
+        if policy.window().is_some() {
+            cached_sliding += 1;
+        }
+    }
+    let cached_full = cached - cached_sliding;
+    let sliding_attention = sliding_by_window
+        .into_iter()
+        .map(|(window, layers)| SlidingWindowLayerCount { window, layers })
+        .collect();
     let local_scalars = kv_scalars(args.num_key_value_heads, args.head_dim)?;
     let global_scalars = kv_scalars(
         args.num_global_key_value_heads
             .unwrap_or(args.num_key_value_heads),
         args.global_head_dim.unwrap_or(args.head_dim),
     )?;
-    let decoder = if shared > 0 || sliding > 0 {
+    let decoder = if shared > 0 || total_sliding > 0 {
         CacheStateStrategy::SharedFullKv {
             cached_layers: cached,
             shared_layers: shared,
-            sliding_attention_layers: sliding,
-            sliding_attention_window: window,
+            full_attention_layers,
+            sliding_attention,
         }
     } else {
         CacheStateStrategy::FullKv
@@ -1015,12 +1021,12 @@ fn gemma4_spec(
             fixed_scalars_per_batch: 0,
             growing: vec![
                 GrowingState {
-                    layers: full,
+                    layers: cached_full,
                     scalars_per_position: global_scalars,
                     window: None,
                 },
                 GrowingState {
-                    layers: sliding,
+                    layers: cached_sliding,
                     scalars_per_position: local_scalars,
                     // Gemma masks sliding attention but retains full KV.
                     window: None,
@@ -3339,13 +3345,16 @@ mod tests {
             hidden_size_per_layer_input: 0,
             vocab_size_per_layer_input: None,
             num_kv_shared_layers: 1,
-            layer_types: vec![
-                gemma4::LayerType::SlidingAttention,
-                gemma4::LayerType::FullAttention,
-                gemma4::LayerType::SlidingAttention,
-                gemma4::LayerType::FullAttention,
-            ],
-            sliding_window: Some(4),
+            attention_schedule: crate::runtime::attention::LayerSchedule::new(
+                4,
+                vec![
+                    AttentionPolicy::sliding(4).unwrap(),
+                    AttentionPolicy::Full,
+                    AttentionPolicy::sliding(4).unwrap(),
+                    AttentionPolicy::Full,
+                ],
+            )
+            .unwrap(),
             final_logit_softcapping: None,
             enable_moe_block: false,
             num_experts: None,
@@ -3737,8 +3746,11 @@ mod tests {
                 decoder: Box::new(CacheStateStrategy::SharedFullKv {
                     cached_layers: 3,
                     shared_layers: 1,
-                    sliding_attention_layers: 2,
-                    sliding_attention_window: Some(4),
+                    full_attention_layers: 2,
+                    sliding_attention: vec![SlidingWindowLayerCount {
+                        window: 4,
+                        layers: 2,
+                    }],
                 }),
                 media_consumes_decoder_positions: true,
             }
@@ -3756,6 +3768,40 @@ mod tests {
         assert_eq!(estimate.multimodal_embedding_bytes, 3 * 8 * 2 * 4);
         assert_eq!(estimate.media_execution_workspace_bytes, 2_048);
         assert_eq!(estimate.completeness, EstimationCompleteness::Conservative);
+    }
+
+    #[test]
+    fn gemma4_capabilities_report_each_exact_sliding_window() {
+        let mut args = tiny_gemma4();
+        args.attention_schedule = crate::runtime::attention::LayerSchedule::new(
+            4,
+            vec![
+                AttentionPolicy::sliding(3).unwrap(),
+                AttentionPolicy::Full,
+                AttentionPolicy::sliding(5).unwrap(),
+                AttentionPolicy::Full,
+            ],
+        )
+        .unwrap();
+        let (_, _, strategy, _, _) = gemma4_spec(&args, text_modalities()).unwrap();
+        assert_eq!(
+            strategy,
+            CacheStateStrategy::SharedFullKv {
+                cached_layers: 3,
+                shared_layers: 1,
+                full_attention_layers: 2,
+                sliding_attention: vec![
+                    SlidingWindowLayerCount {
+                        window: 3,
+                        layers: 1,
+                    },
+                    SlidingWindowLayerCount {
+                        window: 5,
+                        layers: 1,
+                    },
+                ],
+            }
+        );
     }
 
     #[test]

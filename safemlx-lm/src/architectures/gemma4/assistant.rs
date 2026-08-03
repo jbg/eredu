@@ -22,11 +22,12 @@ use serde_json::Value;
 use crate::{
     api::{
         common,
-        gemma4::{self, Gemma4Embedding, LayerType, ModelArgs, TransformerBlock},
+        gemma4::{self, Gemma4Embedding, ModelArgs, TransformerBlock},
         ModelLoadOptions,
     },
     error::Error,
     nn::tensor::rope::FloatOrString,
+    runtime::attention::AttentionPolicy,
     runtime::checkpoint::load::{
         gguf_affine_configs, gguf_metadata, load_gguf_strict, load_safetensors_quantized_strict,
         load_safetensors_strict, GgufTensorNames, StrictLoadConfig, StrictLoadReport,
@@ -34,34 +35,72 @@ use crate::{
     runtime::checkpoint::quantization::WeightQuantization,
 };
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone)]
 /// Configuration for a Gemma 4 assistant draft model.
 pub struct Gemma4AssistantConfig {
-    #[serde(default = "default_model_type")]
     /// Assistant model type.
     pub model_type: String,
     /// Hidden size of the target Gemma 4 backbone.
     pub backbone_hidden_size: i32,
-    #[serde(default)]
     /// Whether ordered masked embeddings are used for logits.
     pub use_ordered_embeddings: bool,
-    #[serde(default = "default_num_centroids")]
     /// Number of token-ordering centroids.
     pub num_centroids: i32,
-    #[serde(default = "default_centroid_top_k")]
     /// Number of centroid groups considered for masked logits.
     pub centroid_intermediate_top_k: i32,
-    #[serde(default = "default_true")]
     /// Whether logits use tied input embeddings.
     pub tie_word_embeddings: bool,
-    #[serde(default = "default_block_size")]
     /// Maximum draft block size.
     pub block_size: usize,
     /// Text model configuration for the assistant body.
     pub text_config: ModelArgs,
-    #[serde(default)]
     /// Optional MLX affine checkpoint metadata.
     pub quantization: Option<WeightQuantization>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct Gemma4AssistantConfigSource {
+    #[serde(default = "default_model_type")]
+    model_type: String,
+    backbone_hidden_size: i32,
+    #[serde(default)]
+    use_ordered_embeddings: bool,
+    #[serde(default = "default_num_centroids")]
+    num_centroids: i32,
+    #[serde(default = "default_centroid_top_k")]
+    centroid_intermediate_top_k: i32,
+    #[serde(default = "default_true")]
+    tie_word_embeddings: bool,
+    #[serde(default = "default_block_size")]
+    block_size: usize,
+    text_config: crate::architectures::gemma4::model::ModelArgsSource,
+    #[serde(default)]
+    quantization: Option<WeightQuantization>,
+}
+
+/// Parses and validates a Gemma 4 assistant configuration without loading weights.
+pub fn gemma4_assistant_config_from_value(value: &Value) -> Result<Gemma4AssistantConfig, Error> {
+    let source: Gemma4AssistantConfigSource =
+        serde_json::from_value(value.clone()).map_err(|error| {
+            Error::UnsupportedArchitecture(format!("invalid Gemma 4 assistant config: {error}"))
+        })?;
+    let mut text_config =
+        crate::architectures::gemma4::model::model_args_from_source(source.text_config)?;
+    if text_config.num_kv_shared_layers == 0 {
+        text_config.num_kv_shared_layers = text_config.num_hidden_layers;
+    }
+    crate::architectures::gemma4::model::validate_model_args(&text_config)?;
+    Ok(Gemma4AssistantConfig {
+        model_type: source.model_type,
+        backbone_hidden_size: source.backbone_hidden_size,
+        use_ordered_embeddings: source.use_ordered_embeddings,
+        num_centroids: source.num_centroids,
+        centroid_intermediate_top_k: source.centroid_intermediate_top_k,
+        tie_word_embeddings: source.tie_word_embeddings,
+        block_size: source.block_size,
+        text_config,
+        quantization: source.quantization,
+    })
 }
 
 fn default_model_type() -> String {
@@ -108,12 +147,10 @@ impl DraftInner {
         )?;
         let layers = (0..args.num_hidden_layers)
             .map(|index| {
-                TransformerBlock::new(
-                    args,
-                    args.layer_type(index as usize),
-                    index as usize,
-                    stream,
-                )
+                let policy = *args.attention_policy(index as usize).ok_or_else(|| {
+                    Exception::custom(format!("Gemma 4 assistant has no policy for layer {index}"))
+                })?;
+                TransformerBlock::new(args, policy, index as usize, stream)
             })
             .collect::<Result<Vec<_>, _>>()?;
         let norm =
@@ -245,7 +282,7 @@ pub struct Gemma4AssistantDraftModel {
 /// discard the losing branch without copying or mutating model parameters.
 #[derive(Debug, Clone)]
 pub(crate) struct Gemma4AssistantDraftState {
-    shared_kv: Arc<HashMap<LayerType, (Array, Array)>>,
+    shared_kv: Arc<HashMap<AttentionPolicy, (Array, Array)>>,
     kv_offset: i32,
     hidden: Array,
 }
@@ -267,9 +304,8 @@ impl Gemma4AssistantDraftModel {
         config.text_config.quantization_bits = config
             .quantization
             .map_or(4, |quantization| quantization.bits());
-        if config.text_config.num_kv_shared_layers == 0 {
-            config.text_config.num_kv_shared_layers = config.text_config.num_hidden_layers;
-        }
+        crate::architectures::gemma4::model::validate_model_args(&config.text_config)
+            .map_err(|error| Exception::custom(error.to_string()))?;
 
         let text_config = &config.text_config;
         let model = DraftInner::new(text_config, stream)?;
@@ -321,7 +357,7 @@ impl Gemma4AssistantDraftModel {
     /// Begins one generalized speculative round from committed target state.
     pub(crate) fn begin_round(
         &self,
-        shared_kv: Arc<HashMap<LayerType, (Array, Array)>>,
+        shared_kv: Arc<HashMap<AttentionPolicy, (Array, Array)>>,
         kv_offset: i32,
         hidden: &Array,
     ) -> Gemma4AssistantDraftState {
@@ -360,20 +396,19 @@ impl Gemma4AssistantDraftModel {
         for layer in &mut self.model.layers {
             let kv = state
                 .shared_kv
-                .get(&layer.layer_type)
+                .get(&layer.layer_policy)
                 .cloned()
                 .ok_or_else(|| Exception::custom("missing shared K/V state for assistant layer"))?;
             let mask = drafter_mask(
-                layer.layer_type,
+                layer.layer_policy,
                 query_len,
                 query_offset,
                 kv.0.shape()[kv.0.shape().len() - 2],
-                self.config.text_config.sliding_window.unwrap_or(0),
                 h.dtype(),
                 stream,
             )?;
             let mut kv_map = HashMap::new();
-            kv_map.insert(layer.layer_type, kv);
+            kv_map.insert(layer.layer_policy, kv);
             h = layer.forward(
                 crate::architectures::gemma4::model::AttentionInput {
                     x: &h,
@@ -403,20 +438,17 @@ impl Gemma4AssistantDraftModel {
 }
 
 fn drafter_mask(
-    layer_type: LayerType,
+    policy: AttentionPolicy,
     query_len: i32,
     query_offset: i32,
     kv_len: i32,
-    sliding_window: i32,
     _dtype: safemlx::Dtype,
     stream: &Stream,
 ) -> Result<Option<Array>, Exception> {
-    if layer_type == LayerType::FullAttention {
+    let Some(sliding_window) = policy.window().map(|window| window.get() as i32) else {
         return Ok(None);
-    }
-    if sliding_window <= 0
-        || (kv_len <= sliding_window && query_offset + query_len <= kv_len + sliding_window)
-    {
+    };
+    if kv_len <= sliding_window && query_offset + query_len <= kv_len + sliding_window {
         return Ok(None);
     }
     let q_idx =
@@ -454,7 +486,8 @@ pub(crate) fn load_gemma4_assistant_model_with_options(
 ) -> Result<Gemma4AssistantDraftModel, Error> {
     let model_dir = model_dir.as_ref();
     let file = std::fs::File::open(model_dir.join("config.json"))?;
-    let mut config: Gemma4AssistantConfig = serde_json::from_reader(file)?;
+    let value: Value = serde_json::from_reader(file)?;
+    let mut config = gemma4_assistant_config_from_value(&value)?;
     let quantize_on_load = if let Some(quantization) = options.quantization {
         if config.use_ordered_embeddings {
             return Err(Error::Quantization(
@@ -575,7 +608,10 @@ pub(crate) fn load_gemma4_assistant_gguf_with_options(
         }
     }
     let mut config: Gemma4AssistantConfig = match metadata.get("safemlx.mtp.config") {
-        Some(GgufMetadataValue::String(config)) => serde_json::from_str(config)?,
+        Some(GgufMetadataValue::String(config)) => {
+            let value: Value = serde_json::from_str(config)?;
+            gemma4_assistant_config_from_value(&value)?
+        }
         Some(_) => {
             return Err(Error::UnsupportedArchitecture(
                 "GGUF safemlx.mtp.config must be a JSON string".into(),
@@ -589,7 +625,8 @@ pub(crate) fn load_gemma4_assistant_gguf_with_options(
                 .parent()
                 .unwrap_or_else(|| Path::new("."))
                 .join("config.json");
-            serde_json::from_reader(std::fs::File::open(&config_file)?)?
+            let value: Value = serde_json::from_reader(std::fs::File::open(&config_file)?)?;
+            gemma4_assistant_config_from_value(&value)?
         }
     };
     crate::api::validate_gguf_quantization_source(&checkpoint, &metadata, options.quantization)?;
@@ -648,22 +685,13 @@ fn gemma4_assistant_config_from_gguf(
         &key("attention.sliding_window_pattern"),
     )?
     .unwrap_or_else(|| vec![0; num_hidden_layers as usize]);
-    if layer_pattern.len() != num_hidden_layers as usize {
-        return Err(Error::UnsupportedArchitecture(format!(
-            "Gemma 4 assistant sliding-window pattern has {} entries for {num_hidden_layers} layers",
-            layer_pattern.len()
-        )));
-    }
-    let layer_types = layer_pattern
-        .into_iter()
-        .map(|sliding| {
-            if sliding != 0 {
-                LayerType::SlidingAttention
-            } else {
-                LayerType::FullAttention
-            }
-        })
-        .collect::<Vec<_>>();
+    let sliding_window = gemma4::gguf_optional_i64(metadata, &key("attention.sliding_window"))?;
+    let attention_schedule = gemma4::attention_schedule_from_pattern(
+        num_hidden_layers,
+        layer_pattern.into_iter().map(|value| value != 0).collect(),
+        sliding_window,
+        "Gemma 4 assistant GGUF",
+    )?;
     let feed_forward_lengths = gemma4::expand_layer_values(
         &key("feed_forward_length"),
         gemma4::gguf_i64_values(metadata, &key("feed_forward_length"))?,
@@ -675,18 +703,18 @@ fn gemma4_assistant_config_from_gguf(
         gemma4::gguf_i64_values(metadata, &key("attention.head_count_kv"))?,
         num_hidden_layers,
     )?;
-    let sliding_kv_heads = layer_types
+    let sliding_kv_heads = attention_schedule
         .iter()
         .zip(&kv_heads)
-        .find_map(|(kind, value)| (*kind == LayerType::SlidingAttention).then_some(*value))
+        .find_map(|(policy, value)| policy.window().is_some().then_some(*value))
         .unwrap_or(kv_heads[0]);
-    let full_kv_heads = layer_types
+    let full_kv_heads = attention_schedule
         .iter()
         .zip(&kv_heads)
-        .find_map(|(kind, value)| (*kind == LayerType::FullAttention).then_some(*value))
+        .find_map(|(policy, value)| (*policy == AttentionPolicy::Full).then_some(*value))
         .unwrap_or(sliding_kv_heads);
-    for (kind, value) in layer_types.iter().zip(&kv_heads) {
-        let expected = if *kind == LayerType::FullAttention {
+    for (policy, value) in attention_schedule.iter().zip(&kv_heads) {
+        let expected = if *policy == AttentionPolicy::Full {
             full_kv_heads
         } else {
             sliding_kv_heads
@@ -823,15 +851,7 @@ fn gemma4_assistant_config_from_gguf(
             hidden_size_per_layer_input,
             vocab_size_per_layer_input: (hidden_size_per_layer_input > 0).then_some(vocab_size),
             num_kv_shared_layers,
-            layer_types,
-            sliding_window: gemma4::gguf_optional_i64(metadata, &key("attention.sliding_window"))?
-                .map(i32::try_from)
-                .transpose()
-                .map_err(|_| {
-                    Error::UnsupportedArchitecture(
-                        "Gemma 4 assistant sliding window exceeds i32".into(),
-                    )
-                })?,
+            attention_schedule,
             final_logit_softcapping: None,
             enable_moe_block: false,
             num_experts: None,
@@ -888,6 +908,7 @@ mod tests {
 
     use crate::{
         api::ModelLoadOptions,
+        runtime::attention::AttentionPolicy,
         runtime::checkpoint::quantization::{AffineQuantization, WeightQuantization},
     };
 
@@ -1043,6 +1064,37 @@ mod tests {
         assert_eq!(config.text_config.head_dim, 256);
         assert_eq!(config.text_config.global_head_dim, Some(512));
         assert_eq!(config.text_config.vocab_size, 32);
+        assert_eq!(
+            config
+                .text_config
+                .attention_schedule
+                .iter()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![
+                AttentionPolicy::sliding(1024).unwrap(),
+                AttentionPolicy::sliding(1024).unwrap(),
+                AttentionPolicy::sliding(1024).unwrap(),
+                AttentionPolicy::Full,
+            ]
+        );
+    }
+
+    #[test]
+    fn assistant_config_uses_the_same_fail_closed_schedule_normalization() {
+        let mut value: serde_json::Value = serde_json::from_str(CONFIG).unwrap();
+        value["text_config"]["layer_types"] = serde_json::json!(["sliding_attention"]);
+        assert!(super::gemma4_assistant_config_from_value(&value)
+            .unwrap_err()
+            .to_string()
+            .contains("no sliding window"));
+
+        value["text_config"]["sliding_window"] = serde_json::json!(32);
+        let config = super::gemma4_assistant_config_from_value(&value).unwrap();
+        assert_eq!(
+            config.text_config.attention_policy(0),
+            Some(&AttentionPolicy::sliding(32).unwrap())
+        );
     }
 
     #[test]
@@ -1060,7 +1112,8 @@ mod tests {
         let context = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
         let weights_context = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
         let stream = context.stream();
-        let config: super::Gemma4AssistantConfig = serde_json::from_str(CONFIG).unwrap();
+        let value: serde_json::Value = serde_json::from_str(CONFIG).unwrap();
+        let config = super::gemma4_assistant_config_from_value(&value).unwrap();
         let dense = super::Gemma4AssistantDraftModel::new(config, stream).unwrap();
         let parameters = dense.parameters().flatten();
         let arrays = parameters
