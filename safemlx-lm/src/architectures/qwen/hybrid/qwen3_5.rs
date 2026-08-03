@@ -46,7 +46,6 @@ use crate::{
         rope::{initialize_rope, FloatOrString, RopeVariant},
         AttentionMask,
     },
-    runtime::cache::{ConcatKeyValueCache, KeyValueCache},
     runtime::checkpoint::load::{
         for_each_safetensor_array, gguf_metadata, gguf_quantization_configs, load_array_strict,
         load_named_array_strict, load_safetensors_dir_strict_with_split_swiglu_experts,
@@ -55,18 +54,37 @@ use crate::{
     },
     runtime::checkpoint::quantization::{AffineQuantization, WeightQuantization},
     runtime::execution::inspection::{ActivationObserver, MoeRoutingObservation},
+    runtime::{
+        attention::{AttentionPolicy, LayerSchedule},
+        cache::{ConcatKeyValueCache, KeyValueCache},
+    },
 };
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-/// Qwen3.5 MoE layer kind.
-pub enum LayerType {
+#[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
+/// Stateful operator policy for one Qwen3.5 or Qwen3-Next decoder layer.
+pub enum LayerPolicy {
     /// Recurrent linear-attention layer.
     LinearAttention,
-    /// Full self-attention layer.
+    /// Self-attention layer with its exact attention policy.
+    SelfAttention(AttentionPolicy),
+}
+
+#[derive(Debug, Clone, Copy)]
+enum LayerPolicySource {
+    LinearAttention,
     FullAttention,
 }
 
-impl<'de> Deserialize<'de> for LayerType {
+impl LayerPolicySource {
+    const fn normalize(self) -> LayerPolicy {
+        match self {
+            Self::LinearAttention => LayerPolicy::LinearAttention,
+            Self::FullAttention => LayerPolicy::SelfAttention(AttentionPolicy::Full),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for LayerPolicySource {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: Deserializer<'de>,
@@ -75,7 +93,7 @@ impl<'de> Deserialize<'de> for LayerType {
             "linear_attention" => Ok(Self::LinearAttention),
             "full_attention" => Ok(Self::FullAttention),
             other => Err(serde::de::Error::custom(format!(
-                "Unsupported Qwen3.5-MoE layer type '{other}'"
+                "unsupported Qwen hybrid layer policy {other:?}"
             ))),
         }
     }
@@ -202,10 +220,9 @@ fn profile_array(component: PerfComponent, array: &Array) -> Result<(), Exceptio
     profile_arrays(component, &[array])
 }
 
-#[derive(Debug, Clone, Deserialize)]
-/// Deserialized dense or MoE Qwen3.5 text configuration used by this loader.
+#[derive(Debug, Clone)]
+/// Normalized dense or MoE Qwen3.5 text configuration used by this loader.
 pub struct ModelArgs {
-    #[serde(default = "default_text_model_type")]
     /// Effective text model type.
     pub model_type: String,
     /// Token vocabulary size.
@@ -214,81 +231,151 @@ pub struct ModelArgs {
     pub hidden_size: i32,
     /// Number of decoder layers.
     pub num_hidden_layers: i32,
-    #[serde(default, alias = "num_nextn_predict_layers")]
     /// Number of embedded multi-token-prediction layers.
     pub mtp_num_hidden_layers: i32,
     /// Number of full-attention query heads.
     pub num_attention_heads: i32,
     /// Number of full-attention key/value heads.
     pub num_key_value_heads: i32,
-    #[serde(default = "default_head_dim")]
     /// Full-attention head dimension.
     pub head_dim: i32,
     /// Maximum configured sequence length.
     pub max_position_embeddings: i32,
-    #[serde(default = "default_rms_norm_eps")]
     /// RMSNorm epsilon.
     pub rms_norm_eps: f32,
-    #[serde(default = "default_true")]
     /// Whether logits use tied input embeddings.
     pub tie_word_embeddings: bool,
-    #[serde(default)]
     /// Whether full-attention projections include bias terms.
     pub attention_bias: bool,
-    #[serde(default = "default_hidden_act")]
     /// Activation function name from the config.
     pub hidden_act: String,
-    #[serde(default = "default_linear_conv_kernel_dim")]
     /// Causal convolution kernel width in linear-attention layers.
     pub linear_conv_kernel_dim: i32,
-    #[serde(default = "default_linear_key_head_dim")]
     /// Key head dimension in linear-attention layers.
     pub linear_key_head_dim: i32,
-    #[serde(default = "default_linear_value_head_dim")]
     /// Value head dimension in linear-attention layers.
     pub linear_value_head_dim: i32,
-    #[serde(default = "default_linear_num_key_heads")]
     /// Number of key heads in linear-attention layers.
     pub linear_num_key_heads: i32,
-    #[serde(default = "default_linear_num_value_heads")]
     /// Number of value heads in linear-attention layers.
     pub linear_num_value_heads: i32,
-    #[serde(default)]
     /// Dense SwiGLU intermediate size. Zero for MoE checkpoints.
     pub intermediate_size: i32,
-    #[serde(default = "default_moe_intermediate_size")]
     /// Routed-expert intermediate size.
     pub moe_intermediate_size: i32,
-    #[serde(default = "default_shared_expert_intermediate_size")]
     /// Shared-expert intermediate size.
     pub shared_expert_intermediate_size: i32,
-    #[serde(default = "default_num_experts_per_tok")]
     /// Number of experts selected per token.
     pub num_experts_per_tok: i32,
-    #[serde(default = "default_num_experts")]
     /// Total number of routed experts.
     pub num_experts: i32,
-    #[serde(default)]
     /// Whether top-k routing probabilities are normalized.
     pub norm_topk_prob: bool,
-    #[serde(default)]
-    /// Layer-kind pattern.
-    pub layer_types: Vec<LayerType>,
-    #[serde(default)]
+    /// Authoritative stateful-operator policy in decoder-layer order.
+    pub layer_schedule: LayerSchedule<LayerPolicy>,
     /// RoPE parameter overrides.
     pub rope_parameters: Option<HashMap<String, Value>>,
-    #[serde(default)]
     /// RoPE scaling configuration.
     pub rope_scaling: Option<HashMap<String, Value>>,
-    #[serde(default, deserialize_with = "deserialize_optional_fp8")]
     /// Optional FP8 quantization configuration.
     pub quantization_config: Option<QwenFp8QuantizationConfig>,
-    #[serde(default)]
     /// Optional MLX affine or MXFP4 metadata for standard text weights.
     pub quantization: Option<WeightQuantization>,
-    #[serde(skip)]
     /// Exact GGUF affine settings keyed by runtime weight name.
     pub quantized_weight_configs: Option<HashMap<String, WeightQuantization>>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ModelArgsSource {
+    #[serde(default = "default_text_model_type")]
+    model_type: String,
+    vocab_size: i32,
+    hidden_size: i32,
+    num_hidden_layers: i32,
+    #[serde(default, alias = "num_nextn_predict_layers")]
+    mtp_num_hidden_layers: i32,
+    num_attention_heads: i32,
+    num_key_value_heads: i32,
+    #[serde(default = "default_head_dim")]
+    head_dim: i32,
+    max_position_embeddings: i32,
+    #[serde(default = "default_rms_norm_eps")]
+    rms_norm_eps: f32,
+    #[serde(default = "default_true")]
+    tie_word_embeddings: bool,
+    #[serde(default)]
+    attention_bias: bool,
+    #[serde(default = "default_hidden_act")]
+    hidden_act: String,
+    #[serde(default = "default_linear_conv_kernel_dim")]
+    linear_conv_kernel_dim: i32,
+    #[serde(default = "default_linear_key_head_dim")]
+    linear_key_head_dim: i32,
+    #[serde(default = "default_linear_value_head_dim")]
+    linear_value_head_dim: i32,
+    #[serde(default = "default_linear_num_key_heads")]
+    linear_num_key_heads: i32,
+    #[serde(default = "default_linear_num_value_heads")]
+    linear_num_value_heads: i32,
+    #[serde(default)]
+    intermediate_size: i32,
+    #[serde(default = "default_moe_intermediate_size")]
+    moe_intermediate_size: i32,
+    #[serde(default = "default_shared_expert_intermediate_size")]
+    shared_expert_intermediate_size: i32,
+    #[serde(default = "default_num_experts_per_tok")]
+    num_experts_per_tok: i32,
+    #[serde(default = "default_num_experts")]
+    num_experts: i32,
+    #[serde(default)]
+    norm_topk_prob: bool,
+    #[serde(default)]
+    layer_types: Vec<LayerPolicySource>,
+    #[serde(default)]
+    rope_parameters: Option<HashMap<String, Value>>,
+    #[serde(default)]
+    rope_scaling: Option<HashMap<String, Value>>,
+    #[serde(default, deserialize_with = "deserialize_optional_fp8")]
+    quantization_config: Option<QwenFp8QuantizationConfig>,
+    #[serde(default)]
+    quantization: Option<WeightQuantization>,
+}
+
+impl ModelArgsSource {
+    fn normalize(self, layer_schedule: LayerSchedule<LayerPolicy>) -> ModelArgs {
+        ModelArgs {
+            model_type: self.model_type,
+            vocab_size: self.vocab_size,
+            hidden_size: self.hidden_size,
+            num_hidden_layers: self.num_hidden_layers,
+            mtp_num_hidden_layers: self.mtp_num_hidden_layers,
+            num_attention_heads: self.num_attention_heads,
+            num_key_value_heads: self.num_key_value_heads,
+            head_dim: self.head_dim,
+            max_position_embeddings: self.max_position_embeddings,
+            rms_norm_eps: self.rms_norm_eps,
+            tie_word_embeddings: self.tie_word_embeddings,
+            attention_bias: self.attention_bias,
+            hidden_act: self.hidden_act,
+            linear_conv_kernel_dim: self.linear_conv_kernel_dim,
+            linear_key_head_dim: self.linear_key_head_dim,
+            linear_value_head_dim: self.linear_value_head_dim,
+            linear_num_key_heads: self.linear_num_key_heads,
+            linear_num_value_heads: self.linear_num_value_heads,
+            intermediate_size: self.intermediate_size,
+            moe_intermediate_size: self.moe_intermediate_size,
+            shared_expert_intermediate_size: self.shared_expert_intermediate_size,
+            num_experts_per_tok: self.num_experts_per_tok,
+            num_experts: self.num_experts,
+            norm_topk_prob: self.norm_topk_prob,
+            layer_schedule,
+            rope_parameters: self.rope_parameters,
+            rope_scaling: self.rope_scaling,
+            quantization_config: self.quantization_config,
+            quantization: self.quantization,
+            quantized_weight_configs: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -344,7 +431,7 @@ impl QwenFp8QuantizationConfig {
 struct TopLevelConfig {
     model_type: String,
     #[serde(default)]
-    text_config: Option<ModelArgs>,
+    text_config: Option<ModelArgsSource>,
     #[serde(default)]
     vision_config: Option<VisionConfig>,
     #[serde(default, deserialize_with = "deserialize_optional_fp8")]
@@ -504,13 +591,6 @@ impl ModelArgs {
 
     pub(crate) fn is_moe(&self) -> bool {
         self.num_experts > 0
-    }
-
-    pub(crate) fn layer_type(&self, index: usize) -> LayerType {
-        self.layer_types
-            .get(index)
-            .copied()
-            .unwrap_or_else(|| default_layer_type(index))
     }
 
     fn rope_theta(&self) -> f32 {
@@ -820,14 +900,6 @@ impl QwenLinear {
     }
 }
 
-fn default_layer_type(index: usize) -> LayerType {
-    if (index + 1).is_multiple_of(4) {
-        LayerType::FullAttention
-    } else {
-        LayerType::LinearAttention
-    }
-}
-
 #[derive(Debug, Clone)]
 /// Heterogeneous cache for Qwen3.5 MoE layers.
 pub struct Cache {
@@ -839,14 +911,18 @@ pub struct Cache {
 
 impl Cache {
     /// Creates an empty cache matching the layer pattern in `args`.
-    pub fn new(args: &ModelArgs) -> Self {
-        Self {
-            layers: (0..args.num_hidden_layers)
-                .map(|index| match args.layer_type(index as usize) {
-                    LayerType::FullAttention => {
+    pub fn new(args: &ModelArgs) -> Result<Self, Error> {
+        validate_text_model_args(args, "Qwen hybrid cache")?;
+        Ok(Self {
+            layers: args
+                .layer_schedule
+                .iter()
+                .map(|policy| match policy {
+                    LayerPolicy::SelfAttention(AttentionPolicy::Full) => {
                         LayerCache::FullAttention(ConcatKeyValueCache::new())
                     }
-                    LayerType::LinearAttention => {
+                    LayerPolicy::SelfAttention(AttentionPolicy::Sliding { .. }) => unreachable!(),
+                    LayerPolicy::LinearAttention => {
                         LayerCache::LinearAttention(LinearAttentionCache::default())
                     }
                 })
@@ -854,7 +930,7 @@ impl Cache {
             mtp_layers: (0..args.mtp_num_hidden_layers)
                 .map(|_| LayerCache::FullAttention(ConcatKeyValueCache::new()))
                 .collect(),
-        }
+        })
     }
 
     pub(crate) fn offset(&self) -> i32 {
@@ -2798,13 +2874,13 @@ impl ModuleParameters for FeedForward {
 #[derive(Debug, Clone, ModuleParameters)]
 /// Qwen3.5 transformer block.
 pub struct TransformerBlock {
-    /// Layer kind.
-    pub layer_type: LayerType,
+    /// Layer policy.
+    pub layer_policy: LayerPolicy,
     #[param]
-    /// Full-attention layer when `layer_type` is [`LayerType::FullAttention`].
+    /// Full-attention layer when selected by `layer_policy`.
     pub self_attn: Option<FullAttention>,
     #[param]
-    /// Linear-attention layer when `layer_type` is [`LayerType::LinearAttention`].
+    /// Linear-attention layer when selected by `layer_policy`.
     pub linear_attn: Option<LinearAttention>,
     #[param]
     /// Dense or sparse-MoE feed-forward block.
@@ -2830,8 +2906,11 @@ impl TransformerBlock {
         let BlockInput { x, mask, cache } = input;
         let residual = x;
         let h = self.input_layernorm.forward(x, stream)?;
-        let h = match (self.layer_type, cache) {
-            (LayerType::FullAttention, Some(LayerCache::FullAttention(cache))) => self
+        let h = match (self.layer_policy, cache) {
+            (
+                LayerPolicy::SelfAttention(AttentionPolicy::Full),
+                Some(LayerCache::FullAttention(cache)),
+            ) => self
                 .self_attn
                 .as_mut()
                 .expect("full attention layer")
@@ -2843,7 +2922,7 @@ impl TransformerBlock {
                     },
                     stream,
                 )?,
-            (LayerType::FullAttention, _) => self
+            (LayerPolicy::SelfAttention(AttentionPolicy::Full), None) => self
                 .self_attn
                 .as_mut()
                 .expect("full attention layer")
@@ -2855,7 +2934,7 @@ impl TransformerBlock {
                     },
                     stream,
                 )?,
-            (LayerType::LinearAttention, Some(LayerCache::LinearAttention(cache))) => self
+            (LayerPolicy::LinearAttention, Some(LayerCache::LinearAttention(cache))) => self
                 .linear_attn
                 .as_mut()
                 .expect("linear attention layer")
@@ -2866,11 +2945,21 @@ impl TransformerBlock {
                     },
                     stream,
                 )?,
-            (LayerType::LinearAttention, _) => self
+            (LayerPolicy::LinearAttention, None) => self
                 .linear_attn
                 .as_mut()
                 .expect("linear attention layer")
                 .forward(LinearAttentionInput { x: &h, cache: None }, stream)?,
+            (policy, Some(_)) => {
+                return Err(Exception::custom(format!(
+                    "Qwen hybrid cache kind does not match layer policy {policy:?}"
+                )))
+            }
+            (LayerPolicy::SelfAttention(AttentionPolicy::Sliding { .. }), _) => {
+                return Err(Exception::custom(
+                    "Qwen hybrid execution does not support sliding self-attention",
+                ))
+            }
         };
         let h = residual.add(h, stream)?;
         let residual = h.clone();
@@ -2897,11 +2986,15 @@ impl TransformerBlock {
         format: QwenWeightFormat,
         stream: &Stream,
     ) -> Result<Self, Exception> {
-        let layer_type = args.layer_type(layer_idx);
+        let layer_policy = *args.layer_schedule.get(layer_idx).ok_or_else(|| {
+            Exception::custom(format!(
+                "Qwen hybrid layer schedule is missing decoder layer {layer_idx}"
+            ))
+        })?;
         let prefix = format!("model.layers.{layer_idx}");
         Ok(Self {
-            layer_type,
-            self_attn: if layer_type == LayerType::FullAttention {
+            layer_policy,
+            self_attn: if layer_policy == LayerPolicy::SelfAttention(AttentionPolicy::Full) {
                 Some(FullAttention::new_with_format(
                     args,
                     Some(&format!("{prefix}.self_attn")),
@@ -2911,7 +3004,7 @@ impl TransformerBlock {
             } else {
                 None
             },
-            linear_attn: if layer_type == LayerType::LinearAttention {
+            linear_attn: if layer_policy == LayerPolicy::LinearAttention {
                 Some(LinearAttention::new_with_format(
                     args,
                     Some(&format!("{prefix}.linear_attn")),
@@ -2939,7 +3032,7 @@ impl TransformerBlock {
     ) -> Result<Self, Exception> {
         let prefix = format!("mtp.layers.{layer_idx}");
         Ok(Self {
-            layer_type: LayerType::FullAttention,
+            layer_policy: LayerPolicy::SelfAttention(AttentionPolicy::Full),
             self_attn: Some(FullAttention::new_with_format(
                 args,
                 Some(&format!("{prefix}.self_attn")),
@@ -2980,8 +3073,11 @@ impl Module<BlockInput<'_>> for TransformerBlock {
         let BlockInput { x, mask, cache } = input;
         let residual = x;
         let h = self.input_layernorm.forward(x, stream)?;
-        let h = match (self.layer_type, cache) {
-            (LayerType::FullAttention, Some(LayerCache::FullAttention(cache))) => self
+        let h = match (self.layer_policy, cache) {
+            (
+                LayerPolicy::SelfAttention(AttentionPolicy::Full),
+                Some(LayerCache::FullAttention(cache)),
+            ) => self
                 .self_attn
                 .as_mut()
                 .expect("full attention layer")
@@ -2993,7 +3089,7 @@ impl Module<BlockInput<'_>> for TransformerBlock {
                     },
                     stream,
                 )?,
-            (LayerType::FullAttention, _) => self
+            (LayerPolicy::SelfAttention(AttentionPolicy::Full), None) => self
                 .self_attn
                 .as_mut()
                 .expect("full attention layer")
@@ -3005,7 +3101,7 @@ impl Module<BlockInput<'_>> for TransformerBlock {
                     },
                     stream,
                 )?,
-            (LayerType::LinearAttention, Some(LayerCache::LinearAttention(cache))) => self
+            (LayerPolicy::LinearAttention, Some(LayerCache::LinearAttention(cache))) => self
                 .linear_attn
                 .as_mut()
                 .expect("linear attention layer")
@@ -3016,15 +3112,28 @@ impl Module<BlockInput<'_>> for TransformerBlock {
                     },
                     stream,
                 )?,
-            (LayerType::LinearAttention, _) => self
+            (LayerPolicy::LinearAttention, None) => self
                 .linear_attn
                 .as_mut()
                 .expect("linear attention layer")
                 .forward(LinearAttentionInput { x: &h, cache: None }, stream)?,
+            (policy, Some(_)) => {
+                return Err(Exception::custom(format!(
+                    "Qwen hybrid cache kind does not match layer policy {policy:?}"
+                )))
+            }
+            (LayerPolicy::SelfAttention(AttentionPolicy::Sliding { .. }), _) => {
+                return Err(Exception::custom(
+                    "Qwen hybrid execution does not support sliding self-attention",
+                ))
+            }
         };
-        match self.layer_type {
-            LayerType::FullAttention => profile_array(PerfComponent::FullAttention, &h)?,
-            LayerType::LinearAttention => profile_array(PerfComponent::LinearAttention, &h)?,
+        match self.layer_policy {
+            LayerPolicy::SelfAttention(AttentionPolicy::Full) => {
+                profile_array(PerfComponent::FullAttention, &h)?
+            }
+            LayerPolicy::LinearAttention => profile_array(PerfComponent::LinearAttention, &h)?,
+            LayerPolicy::SelfAttention(AttentionPolicy::Sliding { .. }) => unreachable!(),
         }
         let h = residual.add(h, stream)?;
         let residual = h.clone();
@@ -3061,8 +3170,11 @@ impl TransformerBlock {
         let residual = x;
         let h = self.input_layernorm.forward(x, stream)?;
         observer.observe(&format!("{prefix}.input_layernorm"), &h)?;
-        let h = match (self.layer_type, cache) {
-            (LayerType::FullAttention, Some(LayerCache::FullAttention(cache))) => self
+        let h = match (self.layer_policy, cache) {
+            (
+                LayerPolicy::SelfAttention(AttentionPolicy::Full),
+                Some(LayerCache::FullAttention(cache)),
+            ) => self
                 .self_attn
                 .as_mut()
                 .expect("full attention layer")
@@ -3076,7 +3188,7 @@ impl TransformerBlock {
                     &format!("{prefix}.self_attn"),
                     observer,
                 )?,
-            (LayerType::FullAttention, _) => self
+            (LayerPolicy::SelfAttention(AttentionPolicy::Full), None) => self
                 .self_attn
                 .as_mut()
                 .expect("full attention layer")
@@ -3090,7 +3202,7 @@ impl TransformerBlock {
                     &format!("{prefix}.self_attn"),
                     observer,
                 )?,
-            (LayerType::LinearAttention, Some(LayerCache::LinearAttention(cache))) => self
+            (LayerPolicy::LinearAttention, Some(LayerCache::LinearAttention(cache))) => self
                 .linear_attn
                 .as_mut()
                 .expect("linear attention layer")
@@ -3103,7 +3215,7 @@ impl TransformerBlock {
                     &format!("{prefix}.linear_attn"),
                     observer,
                 )?,
-            (LayerType::LinearAttention, _) => self
+            (LayerPolicy::LinearAttention, None) => self
                 .linear_attn
                 .as_mut()
                 .expect("linear attention layer")
@@ -3113,12 +3225,25 @@ impl TransformerBlock {
                     &format!("{prefix}.linear_attn"),
                     observer,
                 )?,
+            (policy, Some(_)) => {
+                return Err(Exception::custom(format!(
+                    "Qwen hybrid cache kind does not match layer policy {policy:?}"
+                )))
+            }
+            (LayerPolicy::SelfAttention(AttentionPolicy::Sliding { .. }), _) => {
+                return Err(Exception::custom(
+                    "Qwen hybrid execution does not support sliding self-attention",
+                ))
+            }
         };
         observer.observe(&format!("{prefix}.attention_output"), &h)?;
         observer.observe(&format!("{prefix}.residual_delta_attention"), &h)?;
-        match self.layer_type {
-            LayerType::FullAttention => profile_array(PerfComponent::FullAttention, &h)?,
-            LayerType::LinearAttention => profile_array(PerfComponent::LinearAttention, &h)?,
+        match self.layer_policy {
+            LayerPolicy::SelfAttention(AttentionPolicy::Full) => {
+                profile_array(PerfComponent::FullAttention, &h)?
+            }
+            LayerPolicy::LinearAttention => profile_array(PerfComponent::LinearAttention, &h)?,
+            LayerPolicy::SelfAttention(AttentionPolicy::Sliding { .. }) => unreachable!(),
         }
         let h = residual.add(h, stream)?;
         observer.observe(&format!("{prefix}.post_attention_residual"), &h)?;
@@ -3635,6 +3760,12 @@ impl Model {
         affine: Option<WeightQuantization>,
         stream: &Stream,
     ) -> Result<Self, Exception> {
+        validate_text_model_args(&args, "Qwen hybrid")
+            .map_err(|error| Exception::custom(error.to_string()))?;
+        if args.model_type == "qwen3_next" {
+            super::qwen3_next::fused_projection_widths(&args)
+                .map_err(|error| Exception::custom(error.to_string()))?;
+        }
         let format = QwenWeightFormat::for_text(&args, affine);
         let model = Qwen35MoeTextModel::new_with_format(&args, format, stream)?;
         let mtp = (args.mtp_num_hidden_layers > 0)
@@ -3670,7 +3801,7 @@ impl Model {
 
     /// Creates an empty heterogeneous cache for this model.
     pub fn new_cache(&self) -> Cache {
-        Cache::new(&self.args)
+        Cache::new(&self.args).expect("validated Qwen hybrid layer schedule")
     }
 
     /// Returns the configured model type.
@@ -4253,6 +4384,19 @@ fn qwen35_args_from_gguf_geometry(
         "partial_rotary_factor".into(),
         serde_json::json!(rope_dims as f32 / head_dim as f32),
     );
+    let layer_schedule = LayerSchedule::new(
+        num_hidden_layers as usize,
+        (0..num_hidden_layers as usize)
+            .map(|index| {
+                if (index + 1) % full_attention_interval == 0 {
+                    LayerPolicy::SelfAttention(AttentionPolicy::Full)
+                } else {
+                    LayerPolicy::LinearAttention
+                }
+            })
+            .collect(),
+    )
+    .map_err(|error| Error::UnsupportedArchitecture(format!("Qwen hybrid {error}")))?;
 
     Ok(ModelArgs {
         model_type: if architecture == "qwen3next" {
@@ -4310,15 +4454,7 @@ fn qwen35_args_from_gguf_geometry(
             0
         },
         norm_topk_prob: true,
-        layer_types: (0..num_hidden_layers as usize)
-            .map(|index| {
-                if (index + 1) % full_attention_interval == 0 {
-                    LayerType::FullAttention
-                } else {
-                    LayerType::LinearAttention
-                }
-            })
-            .collect(),
+        layer_schedule,
         rope_parameters: Some(rope_parameters),
         rope_scaling: None,
         quantization_config: None,
@@ -4744,7 +4880,12 @@ pub(crate) fn parse_qwen3_5_config_value(value: Value) -> Result<ParsedQwen35Con
         Error::UnsupportedArchitecture(format!("invalid Qwen3.5 config: {error}"))
     })?;
     let model_type = config.model_type.clone();
-    let (mut args, variant) = match model_type.as_str() {
+    let text_value = if matches!(model_type.as_str(), "qwen3_5" | "qwen3_5_moe") {
+        value.get("text_config").unwrap_or(&value)
+    } else {
+        &value
+    };
+    let (source, variant) = match model_type.as_str() {
         "qwen3_5" | "qwen3_5_moe" => {
             let variant = if model_type == "qwen3_5" {
                 Qwen35Variant::Dense
@@ -4764,19 +4905,74 @@ pub(crate) fn parse_qwen3_5_config_value(value: Value) -> Result<ParsedQwen35Con
             } else {
                 Qwen35Variant::Moe
             };
-            let args = serde_json::from_value(value.clone()).map_err(|error| {
+            let source = serde_json::from_value(value.clone()).map_err(|error| {
                 Error::UnsupportedArchitecture(format!("invalid {model_type} config: {error}"))
             })?;
-            (args, variant)
+            (source, variant)
         }
         "qwen3_next" => {
-            let args = serde_json::from_value(value.clone()).map_err(|error| {
+            let source = serde_json::from_value(value.clone()).map_err(|error| {
                 Error::UnsupportedArchitecture(format!("invalid qwen3_next config: {error}"))
             })?;
-            (args, Qwen35Variant::Qwen3Next)
+            (source, Qwen35Variant::Qwen3Next)
         }
         other => return Err(Error::UnsupportedModelType(other.to_string())),
     };
+
+    let layer_count = usize::try_from(source.num_hidden_layers).map_err(|_| {
+        Error::UnsupportedArchitecture(format!(
+            "{} num_hidden_layers must be positive, got {}",
+            variant.text_model_type(),
+            source.num_hidden_layers
+        ))
+    })?;
+    let layer_policies = if source.layer_types.is_empty() {
+        let interval = match text_value.get("full_attention_interval") {
+            Some(Value::Number(number)) => number
+                .as_u64()
+                .ok_or_else(|| {
+                    Error::UnsupportedArchitecture(
+                        "Qwen hybrid full_attention_interval must be a positive integer".into(),
+                    )
+                })?
+                .try_into()
+                .map_err(|_| {
+                    Error::UnsupportedArchitecture(
+                        "Qwen hybrid full_attention_interval exceeds usize".into(),
+                    )
+                })?,
+            Some(_) => {
+                return Err(Error::UnsupportedArchitecture(
+                    "Qwen hybrid full_attention_interval must be an integer".into(),
+                ))
+            }
+            None => 4,
+        };
+        if interval == 0 {
+            return Err(Error::UnsupportedArchitecture(
+                "Qwen hybrid full_attention_interval must be positive".into(),
+            ));
+        }
+        (0..layer_count)
+            .map(|index| {
+                if (index + 1).is_multiple_of(interval) {
+                    LayerPolicy::SelfAttention(AttentionPolicy::Full)
+                } else {
+                    LayerPolicy::LinearAttention
+                }
+            })
+            .collect()
+    } else {
+        source
+            .layer_types
+            .iter()
+            .copied()
+            .map(LayerPolicySource::normalize)
+            .collect()
+    };
+    let layer_schedule = LayerSchedule::new(layer_count, layer_policies)
+        .map_err(|error| Error::UnsupportedArchitecture(format!("Qwen hybrid {error}")))?;
+    let mut args = source.normalize(layer_schedule);
 
     args.model_type = variant.text_model_type().to_string();
     if variant == Qwen35Variant::Dense {
@@ -4804,33 +5000,6 @@ pub(crate) fn parse_qwen3_5_config_value(value: Value) -> Result<ParsedQwen35Con
             args.rope_parameters = Some(rope_parameters);
         }
     }
-    if args.layer_types.is_empty() {
-        let interval = value
-            .get("full_attention_interval")
-            .and_then(Value::as_u64)
-            .map(usize::try_from)
-            .transpose()
-            .map_err(|_| {
-                Error::UnsupportedArchitecture(
-                    "qwen3_next full_attention_interval exceeds usize".into(),
-                )
-            })?
-            .unwrap_or(4);
-        if interval == 0 {
-            return Err(Error::UnsupportedArchitecture(
-                "qwen3_next full_attention_interval must be positive".into(),
-            ));
-        }
-        args.layer_types = (0..args.num_hidden_layers)
-            .map(|idx| {
-                if (idx as usize + 1).is_multiple_of(interval) {
-                    LayerType::FullAttention
-                } else {
-                    LayerType::LinearAttention
-                }
-            })
-            .collect();
-    }
     Ok((
         args,
         config.image_token_id,
@@ -4852,6 +5021,15 @@ pub(crate) fn model_config_from_value(config: &Value) -> Result<ParsedQwen35Conf
     let parsed = parse_qwen3_5_config_value(config.clone())?;
     validate_text_model_args(&parsed.0, "Qwen3.5")?;
     Ok(parsed)
+}
+
+/// Normalizes a Qwen3.5 or Qwen3-Next JSON configuration into executable text geometry.
+pub fn model_args_from_config_value(config: &Value) -> Result<ModelArgs, Error> {
+    let args = model_config_from_value(config)?.0;
+    if args.model_type == "qwen3_next" {
+        super::qwen3_next::fused_projection_widths(&args)?;
+    }
+    Ok(args)
 }
 
 pub(crate) fn validate_text_model_args(args: &ModelArgs, architecture: &str) -> Result<(), Error> {
@@ -4878,6 +5056,23 @@ pub(crate) fn validate_text_model_args(args: &ModelArgs, architecture: &str) -> 
     if args.mtp_num_hidden_layers < 0 {
         return Err(Error::UnsupportedArchitecture(format!(
             "{architecture} mtp_num_hidden_layers must be non-negative"
+        )));
+    }
+    if args.layer_schedule.len() != args.num_hidden_layers as usize {
+        return Err(Error::UnsupportedArchitecture(format!(
+            "{architecture} layer schedule has {} entries for {} decoder layers",
+            args.layer_schedule.len(),
+            args.num_hidden_layers
+        )));
+    }
+    if args.layer_schedule.iter().any(|policy| {
+        matches!(
+            policy,
+            LayerPolicy::SelfAttention(AttentionPolicy::Sliding { .. })
+        )
+    }) {
+        return Err(Error::UnsupportedArchitecture(format!(
+            "{architecture} does not support sliding self-attention"
         )));
     }
     if args.hidden_size.checked_mul(2).is_none()
@@ -5646,14 +5841,14 @@ pub type Generate<'a, S = crate::runtime::generation::sampler::DefaultSampler> =
 #[cfg(test)]
 mod tests {
     use super::{
-        default_layer_type, get_qwen3_5_moe_model_args, load_qwen3_5_gguf, load_qwen3_5_moe_model,
+        get_qwen3_5_moe_model_args, load_qwen3_5_gguf, load_qwen3_5_moe_model,
         load_qwen3_5_moe_tokenizer, parse_fp8_expert_projection_key,
         qwen35_gguf_affine_quantization, qwen35_gguf_block_index, qwen35_is_offset_norm,
         qwen35_restore_v_head_order, qwen35_translate_gguf_weight,
         qwen35_translate_gguf_weight_name, qwen3_5_moe_strict_load_config, reverse_permutation,
         transform_split_qwen_fp8_experts, vision_window_index, FeedForward, Fp8ExpertProjection,
-        FullAttention, FullAttentionInput, LayerType, LinearAttention, LinearAttentionInput, Model,
-        ModelArgs, SparseMoeBlock, VisionConfig,
+        FullAttention, FullAttentionInput, LayerPolicy, LinearAttention, LinearAttentionInput,
+        Model, ModelArgs, SparseMoeBlock, VisionConfig,
     };
     #[cfg(feature = "image-processing")]
     use crate::runtime::media::{load_processor, MediaInput, ProcessorInput, RgbImageView};
@@ -5662,9 +5857,12 @@ mod tests {
             common::generation::CausalLm, input as runtime_input, Model as AnyModel, ModelCache,
         },
         error::Error,
-        runtime::checkpoint::load::{load_safetensors_strict, StrictLoadReport},
         runtime::checkpoint::quantization::AffineQuantization,
         runtime::execution::inspection::ActivationRecorder,
+        runtime::{
+            attention::{AttentionPolicy, LayerSchedule},
+            checkpoint::load::{load_safetensors_strict, StrictLoadReport},
+        },
     };
     use safemlx::{
         module::{Module, ModuleParameters, Param},
@@ -5713,12 +5911,15 @@ mod tests {
         })
     }
 
-    fn tiny_args(layer_types: Vec<LayerType>) -> ModelArgs {
+    const LINEAR: LayerPolicy = LayerPolicy::LinearAttention;
+    const FULL: LayerPolicy = LayerPolicy::SelfAttention(AttentionPolicy::Full);
+
+    fn tiny_args(layer_policies: Vec<LayerPolicy>) -> ModelArgs {
         ModelArgs {
             model_type: "qwen3_5_moe_text".to_string(),
             vocab_size: 128,
             hidden_size: 16,
-            num_hidden_layers: layer_types.len() as i32,
+            num_hidden_layers: layer_policies.len() as i32,
             mtp_num_hidden_layers: 0,
             num_attention_heads: 2,
             num_key_value_heads: 1,
@@ -5739,7 +5940,7 @@ mod tests {
             num_experts_per_tok: 2,
             num_experts: 4,
             norm_topk_prob: false,
-            layer_types,
+            layer_schedule: LayerSchedule::new(layer_policies.len(), layer_policies).unwrap(),
             rope_parameters: None,
             rope_scaling: None,
             quantization_config: None,
@@ -5992,19 +6193,11 @@ mod tests {
     }
 
     #[test]
-    fn default_layers_are_three_linear_then_full() {
-        assert_eq!(default_layer_type(0), LayerType::LinearAttention);
-        assert_eq!(default_layer_type(1), LayerType::LinearAttention);
-        assert_eq!(default_layer_type(2), LayerType::LinearAttention);
-        assert_eq!(default_layer_type(3), LayerType::FullAttention);
-    }
-
-    #[test]
     fn affine_packed_experts_match_explicitly_dequantized_routing() {
         let _guard = mlx_runtime_test_guard();
         let ctx = ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
         let stream = ctx.stream();
-        let mut args = tiny_args(vec![LayerType::FullAttention]);
+        let mut args = tiny_args(vec![FULL]);
         args.hidden_size = 32;
         args.num_attention_heads = 4;
         args.num_key_value_heads = 2;
@@ -6129,7 +6322,7 @@ mod tests {
         let _guard = mlx_runtime_test_guard();
         let ctx = ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
         let stream = ctx.stream();
-        let mut args = tiny_args(vec![LayerType::LinearAttention, LayerType::FullAttention]);
+        let mut args = tiny_args(vec![LINEAR, FULL]);
         args.hidden_size = 256;
         args.vocab_size = 256;
         args.head_dim = 128;
@@ -6273,7 +6466,7 @@ mod tests {
         let _guard = mlx_runtime_test_guard();
         let ctx = ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
         let stream = ctx.stream();
-        let mut args = tiny_args(vec![LayerType::LinearAttention]);
+        let mut args = tiny_args(vec![LINEAR]);
         args.hidden_size = 128;
         args.linear_num_key_heads = 2;
         args.linear_num_value_heads = 4;
@@ -6352,7 +6545,7 @@ mod tests {
         let _guard = mlx_runtime_test_guard();
         let ctx = ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
         let stream = ctx.stream();
-        let mut args = tiny_args(vec![LayerType::LinearAttention]);
+        let mut args = tiny_args(vec![LINEAR]);
         args.linear_num_key_heads = 2;
         args.linear_num_value_heads = 4;
         args.linear_value_head_dim = 1;
@@ -6580,8 +6773,8 @@ mod tests {
         let (args, image_token_id, video_token_id, vision_config) =
             get_qwen3_5_moe_model_args(&dir).unwrap();
         assert_eq!(args.model_type, "qwen3_5_moe_text");
-        assert_eq!(args.layer_types.len(), 4);
-        assert_eq!(args.layer_types[3], LayerType::FullAttention);
+        assert_eq!(args.layer_schedule.len(), 4);
+        assert_eq!(args.layer_schedule.get(3), Some(&FULL));
         assert_eq!(image_token_id, Some(248056));
         assert_eq!(video_token_id, Some(248057));
         assert!(vision_config.is_none());
@@ -6614,15 +6807,116 @@ mod tests {
         let (args, image_token_id, video_token_id, vision_config) =
             get_qwen3_5_moe_model_args(&dir).unwrap();
         assert_eq!(args.model_type, "qwen3_next");
-        assert_eq!(args.layer_types.len(), 8);
-        assert_eq!(args.layer_types[2], LayerType::LinearAttention);
-        assert_eq!(args.layer_types[3], LayerType::FullAttention);
+        assert_eq!(args.layer_schedule.len(), 8);
+        assert_eq!(args.layer_schedule.get(2), Some(&LINEAR));
+        assert_eq!(args.layer_schedule.get(3), Some(&FULL));
         assert_eq!(args.rope_theta(), 10_000_000.0);
         assert_eq!(args.partial_rotary_factor(), 0.25);
         assert_eq!(args.num_experts, 512);
         assert_eq!(image_token_id, None);
         assert_eq!(video_token_id, None);
         assert!(vision_config.is_none());
+    }
+
+    #[test]
+    fn explicit_hybrid_schedule_drives_cache_kinds_in_order() {
+        let config = serde_json::json!({
+            "model_type": "qwen3_next",
+            "vocab_size": 32,
+            "hidden_size": 16,
+            "num_hidden_layers": 3,
+            "num_attention_heads": 2,
+            "num_key_value_heads": 1,
+            "head_dim": 8,
+            "max_position_embeddings": 128,
+            "intermediate_size": 32,
+            "num_experts": 0,
+            "linear_key_head_dim": 4,
+            "linear_value_head_dim": 4,
+            "linear_num_key_heads": 2,
+            "linear_num_value_heads": 2,
+            "layer_types": ["full_attention", "linear_attention", "full_attention"]
+        });
+        let args = super::model_args_from_config_value(&config).unwrap();
+        assert_eq!(
+            args.layer_schedule.iter().copied().collect::<Vec<_>>(),
+            vec![FULL, LINEAR, FULL]
+        );
+        let cache = super::Cache::new(&args).unwrap();
+        assert!(matches!(
+            cache.layers[0],
+            super::LayerCache::FullAttention(_)
+        ));
+        assert!(matches!(
+            cache.layers[1],
+            super::LayerCache::LinearAttention(_)
+        ));
+        assert!(matches!(
+            cache.layers[2],
+            super::LayerCache::FullAttention(_)
+        ));
+    }
+
+    #[test]
+    fn rejects_explicit_hybrid_schedule_length_mismatch() {
+        let config = serde_json::json!({
+            "model_type": "qwen3_next",
+            "vocab_size": 32,
+            "hidden_size": 16,
+            "num_hidden_layers": 2,
+            "num_attention_heads": 2,
+            "num_key_value_heads": 1,
+            "head_dim": 8,
+            "max_position_embeddings": 128,
+            "intermediate_size": 32,
+            "num_experts": 0,
+            "layer_types": ["full_attention"]
+        });
+        let error = super::model_args_from_config_value(&config).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("layer schedule has 1 entries for 2 decoder layers"));
+    }
+
+    #[test]
+    fn rejects_invalid_full_attention_interval_encoding() {
+        let config = serde_json::json!({
+            "model_type": "qwen3_next",
+            "vocab_size": 32,
+            "hidden_size": 16,
+            "num_hidden_layers": 2,
+            "num_attention_heads": 2,
+            "num_key_value_heads": 1,
+            "head_dim": 8,
+            "max_position_embeddings": 128,
+            "intermediate_size": 32,
+            "num_experts": 0,
+            "full_attention_interval": "4"
+        });
+        let error = super::model_args_from_config_value(&config).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("full_attention_interval must be an integer"));
+    }
+
+    #[test]
+    fn rejects_sliding_policy_before_cache_or_weight_creation() {
+        let mut args = tiny_args(vec![FULL]);
+        args.num_experts = 0;
+        args.num_experts_per_tok = 0;
+        args.intermediate_size = 16;
+        args.layer_schedule = LayerSchedule::new(
+            1,
+            vec![LayerPolicy::SelfAttention(
+                AttentionPolicy::sliding(4).unwrap(),
+            )],
+        )
+        .unwrap();
+        let error = super::validate_text_model_args(&args, "test Qwen hybrid").unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("does not support sliding self-attention"));
+        assert!(super::Cache::new(&args).is_err());
     }
 
     #[test]
@@ -6643,7 +6937,7 @@ mod tests {
         let (args, _, _, _) = get_qwen3_5_moe_model_args(&dir).unwrap();
         assert_eq!(args.model_type, "qwen3_5_moe_text");
         assert_eq!(args.mtp_num_hidden_layers, 1);
-        assert_eq!(args.layer_types, vec![LayerType::FullAttention]);
+        assert_eq!(args.layer_schedule.get(0), Some(&FULL));
     }
 
     #[test]
@@ -6677,7 +6971,7 @@ mod tests {
         assert_eq!(args.num_experts, 0);
         assert_eq!(args.num_experts_per_tok, 0);
         assert_eq!(args.intermediate_size, 32);
-        assert_eq!(args.layer_types[3], LayerType::FullAttention);
+        assert_eq!(args.layer_schedule.get(3), Some(&FULL));
         assert_eq!(image_token_id, Some(248056));
         assert_eq!(video_token_id, None);
         assert!(vision_config.is_none());
@@ -6702,7 +6996,7 @@ mod tests {
         assert_eq!(args.model_type, "qwen3_5_text");
         assert_eq!(args.num_experts, 0);
         assert_eq!(args.num_experts_per_tok, 0);
-        assert_eq!(args.layer_types, vec![LayerType::FullAttention]);
+        assert_eq!(args.layer_schedule.get(0), Some(&FULL));
     }
 
     #[test]
@@ -7035,7 +7329,7 @@ mod tests {
         let _guard = mlx_runtime_test_guard();
         let ctx = ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
         let stream = ctx.stream();
-        let args = tiny_args(vec![LayerType::FullAttention]);
+        let args = tiny_args(vec![FULL]);
         let mut attn = FullAttention::new(&args, stream).unwrap();
         let x = Array::zeros::<f32>(&[1, 2, args.hidden_size], stream).unwrap();
         let out = attn
@@ -7057,7 +7351,7 @@ mod tests {
         let _guard = mlx_runtime_test_guard();
         let ctx = ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
         let stream = ctx.stream();
-        let args = tiny_args(vec![LayerType::LinearAttention]);
+        let args = tiny_args(vec![LINEAR]);
         let mut attn = LinearAttention::new(&args, stream).unwrap();
         let x = Array::zeros::<f32>(&[1, 2, args.hidden_size], stream).unwrap();
         let out = attn
@@ -7072,7 +7366,7 @@ mod tests {
         let _guard = mlx_runtime_test_guard();
         let ctx = ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
         let stream = ctx.stream();
-        let args = tiny_args(vec![LayerType::LinearAttention]);
+        let args = tiny_args(vec![LINEAR]);
         let mut attn = LinearAttention::new(&args, stream).unwrap();
         let x = Array::zeros::<f32>(&[1, 2, args.hidden_size], stream).unwrap();
         let mut recorder = ActivationRecorder::new();
@@ -7110,7 +7404,7 @@ mod tests {
         let _guard = mlx_runtime_test_guard();
         let ctx = ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
         let stream = ctx.stream();
-        let args = tiny_args(vec![LayerType::LinearAttention]);
+        let args = tiny_args(vec![LINEAR]);
         let mut moe = SparseMoeBlock::new(&args, 0, stream).unwrap();
         let gate_values = (0..args.num_experts)
             .flat_map(|expert| {
@@ -7138,7 +7432,7 @@ mod tests {
         let _guard = mlx_runtime_test_guard();
         let ctx = ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
         let stream = ctx.stream();
-        let args = tiny_args(vec![LayerType::LinearAttention]);
+        let args = tiny_args(vec![LINEAR]);
         let mut moe = SparseMoeBlock::new(&args, 0, stream).unwrap();
         let gate_values = (0..args.num_experts)
             .flat_map(|expert| {
@@ -7188,7 +7482,7 @@ mod tests {
         let _guard = mlx_runtime_test_guard();
         let ctx = ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
         let stream = ctx.stream();
-        let mut args = tiny_args(vec![LayerType::LinearAttention, LayerType::FullAttention]);
+        let mut args = tiny_args(vec![LINEAR, FULL]);
         args.mtp_num_hidden_layers = 1;
         let model = Model::new(args, Some(248056), Some(248057), None, stream).unwrap();
         let params = model.parameters().flatten();
@@ -7236,7 +7530,7 @@ mod tests {
         let _guard = mlx_runtime_test_guard();
         let ctx = ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
         let stream = ctx.stream();
-        let args = tiny_args(vec![LayerType::FullAttention]);
+        let args = tiny_args(vec![FULL]);
         let model = Model::new(
             args,
             Some(248056),
@@ -7273,7 +7567,7 @@ mod tests {
         let _guard = mlx_runtime_test_guard();
         let ctx = ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
         let stream = ctx.stream();
-        let args = tiny_args(vec![LayerType::FullAttention]);
+        let args = tiny_args(vec![FULL]);
         let mut model = Model::new(
             args,
             Some(42),
@@ -7311,7 +7605,7 @@ mod tests {
         let _guard = mlx_runtime_test_guard();
         let ctx = ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
         let stream = ctx.stream();
-        let args = tiny_args(vec![LayerType::FullAttention]);
+        let args = tiny_args(vec![FULL]);
         let mut qwen = Model::new(
             args,
             Some(42),
@@ -7364,7 +7658,7 @@ mod tests {
         let _guard = mlx_runtime_test_guard();
         let ctx = ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
         let stream = ctx.stream();
-        let args = tiny_args(vec![LayerType::FullAttention]);
+        let args = tiny_args(vec![FULL]);
         let mut normal_qwen = Model::new(
             args.clone(),
             Some(42),
@@ -7428,7 +7722,7 @@ mod tests {
         let _guard = mlx_runtime_test_guard();
         let ctx = ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
         let stream = ctx.stream();
-        let args = tiny_args(vec![LayerType::FullAttention]);
+        let args = tiny_args(vec![FULL]);
         let mut qwen = Model::new(args, None, None, None, stream).unwrap();
         zero_model_parameters(&mut qwen, stream);
         let mut model = AnyModel::Qwen35Moe(qwen);
@@ -7460,7 +7754,7 @@ mod tests {
         let _guard = mlx_runtime_test_guard();
         let ctx = ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
         let stream = ctx.stream();
-        let args = tiny_args(vec![LayerType::FullAttention]);
+        let args = tiny_args(vec![FULL]);
         let mut qwen = Model::new(args, None, None, None, stream).unwrap();
         zero_model_parameters(&mut qwen, stream);
         let mut model = AnyModel::Qwen35Moe(qwen);
@@ -7495,7 +7789,7 @@ mod tests {
         let _guard = mlx_runtime_test_guard();
         let ctx = ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
         let stream = ctx.stream();
-        let args = tiny_args(vec![LayerType::FullAttention]);
+        let args = tiny_args(vec![FULL]);
         let mut model = Model::new(
             args,
             Some(42),
@@ -7537,7 +7831,7 @@ mod tests {
         let _guard = mlx_runtime_test_guard();
         let ctx = ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
         let stream = ctx.stream();
-        let args = tiny_args(vec![LayerType::FullAttention]);
+        let args = tiny_args(vec![FULL]);
         let mut model = Model::new(
             args,
             Some(42),
@@ -7600,7 +7894,7 @@ mod tests {
         let _guard = mlx_runtime_test_guard();
         let ctx = ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
         let stream = ctx.stream();
-        let args = tiny_args(vec![LayerType::FullAttention]);
+        let args = tiny_args(vec![FULL]);
         let mut model = Model::new(
             args,
             Some(42),
@@ -7795,7 +8089,7 @@ mod tests {
         let _guard = mlx_runtime_test_guard();
         let ctx = ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
         let stream = ctx.stream();
-        let args = tiny_args(vec![LayerType::LinearAttention]);
+        let args = tiny_args(vec![LINEAR]);
         let source = Model::new(args.clone(), None, None, None, stream).unwrap();
         let dir = temp_model_dir("{}");
         let weights_path = dir.join("model.safetensors");
@@ -7828,7 +8122,7 @@ mod tests {
         let _guard = mlx_runtime_test_guard();
         let ctx = ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
         let stream = ctx.stream();
-        let args = tiny_args(vec![LayerType::LinearAttention]);
+        let args = tiny_args(vec![LINEAR]);
         let source = Model::new(args.clone(), None, None, None, stream).unwrap();
         let dir = temp_model_dir("{}");
         let weights_path = dir.join("model.safetensors");
@@ -7857,7 +8151,7 @@ mod tests {
         let _guard = mlx_runtime_test_guard();
         let ctx = ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
         let stream = ctx.stream();
-        let args = tiny_args(vec![LayerType::LinearAttention]);
+        let args = tiny_args(vec![LINEAR]);
         let source = Model::new(args.clone(), None, None, None, stream).unwrap();
         let dir = temp_model_dir("{}");
         let weights_path = dir.join("model.safetensors");

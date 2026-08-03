@@ -1225,7 +1225,7 @@ fn write_additional_sparse_fixtures(root: &Path) -> Vec<(&'static str, &'static 
         });
         std::fs::create_dir_all(&directory).unwrap();
         let mut model = qwen3_5_moe::Model::new(
-            serde_json::from_value(config.clone()).unwrap(),
+            qwen3_5_moe::model_args_from_config_value(&config).unwrap(),
             None,
             None,
             None,

@@ -23,7 +23,7 @@ use crate::{
 };
 
 pub use super::qwen3_5::{
-    sample, Cache, Generate, LayerCache, LayerType, LinearAttentionCache, Model, ModelArgs,
+    sample, Cache, Generate, LayerCache, LayerPolicy, LinearAttentionCache, Model, ModelArgs,
     ModelInput,
 };
 
@@ -34,7 +34,8 @@ pub fn get_qwen3_next_model_args(model_dir: impl AsRef<Path>) -> Result<ModelArg
     model_args_from_config_value(&config)
 }
 
-pub(crate) fn model_args_from_config_value(config: &serde_json::Value) -> Result<ModelArgs, Error> {
+/// Normalizes a Qwen3-Next JSON configuration into executable text geometry.
+pub fn model_args_from_config_value(config: &serde_json::Value) -> Result<ModelArgs, Error> {
     let (args, image_token_id, video_token_id, vision_config) =
         super::qwen3_5::parse_qwen3_5_config_value(config.clone())?;
     if image_token_id.is_some() || video_token_id.is_some() || vision_config.is_some() {
@@ -438,7 +439,7 @@ mod tests {
     }
 
     fn fp8_args() -> super::ModelArgs {
-        serde_json::from_value(fp8_config()).unwrap()
+        super::model_args_from_config_value(&fp8_config()).unwrap()
     }
 
     #[test]
@@ -935,7 +936,7 @@ mod tests {
     fn qwen3_next_parameter_tree_uses_split_runtime_projections() {
         let context = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
         let stream = context.stream();
-        let args: super::ModelArgs = serde_json::from_value(serde_json::json!({
+        let args = super::model_args_from_config_value(&serde_json::json!({
             "model_type":"qwen3_next","vocab_size":32,"hidden_size":16,
             "num_hidden_layers":1,"num_attention_heads":2,"num_key_value_heads":1,
             "head_dim":8,"max_position_embeddings":128,"intermediate_size":32,

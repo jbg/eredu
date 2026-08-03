@@ -9,9 +9,10 @@ use super::{
     PreparedModelInput,
 };
 use crate::{
-    architectures::qwen::hybrid::qwen3_5::LayerType as QwenHybridLayerType,
+    architectures::qwen::hybrid::qwen3_5::LayerPolicy as QwenHybridLayerPolicy,
     nn::rope::FloatOrString,
     runtime::{
+        attention::AttentionPolicy,
         media::input::{InputPayload, Modality},
         residency::policy::MemoryTier,
     },
@@ -1274,8 +1275,15 @@ fn qwen_hybrid_spec(
         }
     };
     let layers = positive(args.num_hidden_layers, "num_hidden_layers")?;
-    let attention = (0..layers as usize)
-        .filter(|index| args.layer_type(*index) == QwenHybridLayerType::FullAttention)
+    let attention = args
+        .layer_schedule
+        .iter()
+        .filter(|policy| {
+            matches!(
+                policy,
+                QwenHybridLayerPolicy::SelfAttention(AttentionPolicy::Full)
+            )
+        })
         .count() as u64;
     let recurrent = layers.saturating_sub(attention);
     let key_dim = checked_mul(

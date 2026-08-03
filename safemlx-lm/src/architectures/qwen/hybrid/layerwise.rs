@@ -20,7 +20,7 @@ use crate::{
         common::{self, generation::CausalLm, linear::project_logits_maybe_quantized},
         input,
         qwen3_5_moe::{
-            self as resident, BlockInput, Cache, Experts, LayerCache, LayerType, ModelArgs,
+            self as resident, BlockInput, Cache, Experts, LayerCache, LayerPolicy, ModelArgs,
             MtpModule, Qwen3NextRmsNorm, QwenMtpStepOutput, QwenWeightFormat, TransformerBlock,
         },
         qwen3_next,
@@ -31,7 +31,6 @@ use crate::{
     },
     error::Error,
     nn::tensor::{create_attention_mask, AttentionMask},
-    runtime::cache::KeyValueCache,
     runtime::checkpoint::binding::{
         build_module_bindings_with_recipes, canonical_checkpoint_name, populate_module_from_lease,
         populate_module_from_lease_excluding,
@@ -50,6 +49,7 @@ use crate::{
         ExpertPass,
     },
     runtime::residency::manager::{OffloadUnit, ResidencyReport, ResidentUnitLease, WeightBinding},
+    runtime::{attention::AttentionPolicy, cache::KeyValueCache},
 };
 
 const EMBEDDING_UNIT: &str = "qwen_hybrid.static.embedding";
@@ -844,7 +844,7 @@ impl QwenHybridLayerwiseAdapter {
     }
 
     fn new_cache(&self) -> Cache {
-        Cache::new(&self.args)
+        Cache::new(&self.args).expect("validated Qwen hybrid layer schedule")
     }
 
     fn forward_mtp_head(
@@ -876,7 +876,7 @@ impl QwenHybridLayerwiseAdapter {
 
         if let Some(index) = layer_index {
             if self.family == QwenHybridFamily::Qwen3Next
-                && self.args.layer_type(index) == LayerType::LinearAttention
+                && self.args.layer_schedule.get(index) == Some(&LayerPolicy::LinearAttention)
             {
                 add_fused_projection_recipes(&mut recipes, &normalized, index, &self.args)?;
             }
@@ -1868,14 +1868,21 @@ impl GeneralLayerwiseModelAdapter for QwenHybridLayerwiseAdapter {
             )));
         }
         for (index, cache) in cache.layers.iter().enumerate() {
+            let policy = self.args.layer_schedule.get(index).ok_or_else(|| {
+                Error::UnsupportedArchitecture(format!(
+                    "Qwen hybrid layer schedule is missing decoder layer {index}"
+                ))
+            })?;
             let matches = matches!(
-                (self.args.layer_type(index), cache),
-                (LayerType::FullAttention, LayerCache::FullAttention(_))
-                    | (LayerType::LinearAttention, LayerCache::LinearAttention(_))
+                (policy, cache),
+                (
+                    LayerPolicy::SelfAttention(AttentionPolicy::Full),
+                    LayerCache::FullAttention(_)
+                ) | (LayerPolicy::LinearAttention, LayerCache::LinearAttention(_))
             );
             if !matches {
                 return Err(Error::UnsupportedArchitecture(format!(
-                    "Qwen hybrid cache kind does not match layer_types at layer {index}"
+                    "Qwen hybrid cache kind does not match layer schedule at layer {index}"
                 )));
             }
         }
@@ -2430,7 +2437,9 @@ mod tests {
     }
 
     fn args(next: bool, moe: bool) -> ModelArgs {
-        serde_json::from_value(config(next, moe)).unwrap()
+        resident::parse_qwen3_5_config_value(config(next, moe))
+            .unwrap()
+            .0
     }
 
     fn initialize(model: &mut Model, stream: &Stream) {

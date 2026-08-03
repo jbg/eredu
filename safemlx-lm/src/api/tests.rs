@@ -699,19 +699,20 @@ fn prepared_chat_embedded_mtp_batch_dispatches_qwen_without_a_drafter() {
     )
     .unwrap();
     prepared.rendered_prompt.clear();
-    let args = serde_json::from_value(json!({
-        "model_type": "qwen3_5_moe",
+    let args = super::qwen3_5_moe::model_args_from_config_value(&json!({
+        "model_type": "qwen3_5_text",
         "vocab_size": 8,
         "hidden_size": 8,
-        "num_hidden_layers": 0,
+        "num_hidden_layers": 1,
         "mtp_num_hidden_layers": 1,
         "num_attention_heads": 1,
-        "num_key_value_heads": 32,
+        "num_key_value_heads": 1,
         "head_dim": 8,
         "max_position_embeddings": 16,
         "intermediate_size": 16,
         "num_experts": 0,
-        "tie_word_embeddings": true
+        "tie_word_embeddings": true,
+        "layer_types": ["full_attention"]
     }))
     .unwrap();
     let qwen = super::qwen3_5_moe::Model::new(args, None, None, None, stream).unwrap();

@@ -25,7 +25,10 @@ use crate::{
         },
     },
     error::Error,
-    runtime::checkpoint::store::{SafetensorsWeightStore, StoredDtype, WeightStore},
+    runtime::{
+        attention::AttentionPolicy,
+        checkpoint::store::{SafetensorsWeightStore, StoredDtype, WeightStore},
+    },
 };
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -3846,6 +3849,11 @@ fn validate_qwen_hybrid_safetensors(
         );
     }
     for layer in 0..args.num_hidden_layers as usize {
+        let Some(layer_policy) = args.layer_schedule.get(layer).copied() else {
+            return invalid_geometry(format!(
+                "Qwen hybrid layer schedule is missing decoder layer {layer}"
+            ));
+        };
         validate_qwen3_next_block(
             store,
             &keys,
@@ -3853,7 +3861,7 @@ fn validate_qwen_hybrid_safetensors(
             &mut issues,
             args,
             format!("model.layers.{layer}"),
-            args.layer_type(layer),
+            layer_policy,
             variant,
         );
     }
@@ -3899,7 +3907,7 @@ fn validate_qwen_hybrid_safetensors(
                 &mut issues,
                 args,
                 format!("mtp.layers.{layer}"),
-                qwen3_next::LayerType::FullAttention,
+                qwen3_next::LayerPolicy::SelfAttention(AttentionPolicy::Full),
                 variant,
             );
         }
@@ -3933,7 +3941,7 @@ fn validate_qwen3_next_block(
     issues: &mut Vec<StructuralIssue>,
     args: &qwen3_next::ModelArgs,
     prefix: String,
-    layer_type: qwen3_next::LayerType,
+    layer_policy: qwen3_next::LayerPolicy,
     variant: QwenHybridSafetensorsVariant,
 ) {
     let hidden = args.hidden_size as usize;
@@ -3949,8 +3957,8 @@ fn validate_qwen3_next_block(
             TensorOperation::Vector,
         );
     }
-    match layer_type {
-        qwen3_next::LayerType::FullAttention => {
+    match layer_policy {
+        qwen3_next::LayerPolicy::SelfAttention(AttentionPolicy::Full) => {
             let query = (args.num_attention_heads * args.head_dim) as usize;
             let key_value = (args.num_key_value_heads * args.head_dim) as usize;
             for (name, shape, operation) in [
@@ -4016,10 +4024,19 @@ fn validate_qwen3_next_block(
                 }
             }
         }
-        qwen3_next::LayerType::LinearAttention => {
+        qwen3_next::LayerPolicy::LinearAttention => {
             validate_qwen3_next_linear_attention(
                 store, keys, allowed, issues, args, &prefix, variant,
             );
+        }
+        qwen3_next::LayerPolicy::SelfAttention(AttentionPolicy::Sliding { .. }) => {
+            issues.push(StructuralIssue {
+                kind: StructuralIssueKind::InvalidGeometry,
+                detail: "Qwen hybrid does not support sliding self-attention".into(),
+                tensor_name: None,
+                tensor_type_code: None,
+                metadata_key: None,
+            });
         }
     }
     if args.is_moe() {
@@ -6945,8 +6962,12 @@ fn qwen35_gguf_expected(args: &qwen35::ModelArgs) -> Vec<ExpectedTensor> {
                 hidden,
             ),
         ]);
-        match args.layer_type(layer) {
-            qwen35::LayerType::FullAttention => {
+        match args
+            .layer_schedule
+            .get(layer)
+            .expect("validated Qwen hybrid layer schedule")
+        {
+            qwen35::LayerPolicy::SelfAttention(AttentionPolicy::Full) => {
                 tensors.extend([
                     expected(
                         format!("{model}.self_attn.q_proj.weight"),
@@ -7004,7 +7025,7 @@ fn qwen35_gguf_expected(args: &qwen35::ModelArgs) -> Vec<ExpectedTensor> {
                     ]);
                 }
             }
-            qwen35::LayerType::LinearAttention => {
+            qwen35::LayerPolicy::LinearAttention => {
                 if args.model_type == "qwen3_next" {
                     tensors.extend([
                         expected(
@@ -7075,6 +7096,9 @@ fn qwen35_gguf_expected(args: &qwen35::ModelArgs) -> Vec<ExpectedTensor> {
                         [hidden, value_dim],
                     ),
                 ]);
+            }
+            qwen35::LayerPolicy::SelfAttention(AttentionPolicy::Sliding { .. }) => {
+                unreachable!("Qwen hybrid validation rejects sliding self-attention")
             }
         }
         if args.is_moe() {
@@ -7228,7 +7252,7 @@ fn validate_qwen35_gguf(
         ));
     }
     for layer in 0..args.num_hidden_layers as usize {
-        if args.layer_type(layer) != qwen35::LayerType::LinearAttention {
+        if args.layer_schedule.get(layer) != Some(&qwen35::LayerPolicy::LinearAttention) {
             continue;
         }
         if is_next {
