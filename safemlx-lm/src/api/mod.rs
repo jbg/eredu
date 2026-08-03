@@ -97,12 +97,12 @@ pub(crate) use crate::architectures::moshi::model as moshi;
 pub(crate) use crate::architectures::moshi::personaplex;
 /// Nemotron-H hybrid Mamba2/attention/MoE config support.
 pub(crate) use crate::architectures::nemotron_h::model as nemotron_h;
+/// Shared Qwen2/Qwen2.5/Qwen3 dense decoder support.
+use crate::architectures::qwen::dense as dense_qwen;
 /// Qwen3.5 MoE text model support.
 pub(crate) use crate::architectures::qwen::hybrid::qwen3_5 as qwen3_5_moe;
 /// Qwen3-Next hybrid attention/MoE text model support.
 pub(crate) use crate::architectures::qwen::hybrid::qwen3_next;
-/// Qwen3 decoder-only model support.
-pub(crate) use crate::architectures::qwen::qwen3::model as qwen3;
 /// Qwen3-VL multimodal conditional-generation support.
 pub(crate) use crate::architectures::qwen::vl::model as qwen3_vl;
 /// Qwen3-VL-MoE multimodal conditional-generation support.
@@ -371,8 +371,11 @@ fn load_model_for_kind(
                     model_dir, expert_cache, non_expert, stream, weights_stream,
                 )?,
             )),
-            ModelKind::Qwen3 => Ok(Model::Qwen3Layerwise(
-                crate::architectures::qwen::qwen3::layerwise::load_qwen3_sparse_expert_cache_model_with_dense_layers(
+            ModelKind::Qwen2 => Err(Error::UnsupportedArchitecture(
+                "Qwen2 is dense and does not support sparse expert-cache residency".into(),
+            )),
+            ModelKind::Qwen3 => Ok(Model::DenseQwenLayerwise(
+                crate::architectures::qwen::dense::layerwise::load_qwen3_sparse_expert_cache_model_with_dense_layers(
                     model_dir, expert_cache, non_expert, stream, weights_stream,
                 )?,
             )),
@@ -450,8 +453,11 @@ fn load_model_for_kind(
                     weights_stream,
                 )?,
             )),
-            ModelKind::Qwen3 => Ok(Model::Qwen3Layerwise(
-                crate::architectures::qwen::qwen3::layerwise::load_qwen3_sparse_expert_cache_model(
+            ModelKind::Qwen2 => Err(Error::UnsupportedArchitecture(
+                "Qwen2 is dense and does not support sparse expert-cache residency".into(),
+            )),
+            ModelKind::Qwen3 => Ok(Model::DenseQwenLayerwise(
+                crate::architectures::qwen::dense::layerwise::load_qwen3_sparse_expert_cache_model(
                     model_dir,
                     expert_cache,
                     stream,
@@ -550,8 +556,8 @@ fn load_model_for_kind(
                     weights_stream,
                 )?,
             )),
-            ModelKind::Qwen3 => Ok(Model::Qwen3Layerwise(
-                crate::architectures::qwen::qwen3::layerwise::load_qwen3_layerwise_model(
+            ModelKind::Qwen2 | ModelKind::Qwen3 => Ok(Model::DenseQwenLayerwise(
+                crate::architectures::qwen::dense::layerwise::load_safetensors(
                     model_dir,
                     layerwise,
                     stream,
@@ -664,7 +670,7 @@ fn load_model_for_kind(
                 stream,
                 weights_stream,
             )?)),
-            ModelKind::Qwen3 => Ok(Model::Qwen3(qwen3::load_qwen3_model_quantized(
+            ModelKind::Qwen2 | ModelKind::Qwen3 => Ok(Model::DenseQwen(dense_qwen::load_safetensors_quantized(
                 model_dir,
                 quantization,
                 stream,
@@ -752,7 +758,7 @@ fn load_model_for_kind(
             stream,
             weights_stream,
         )?)),
-        ModelKind::Qwen3 => Ok(Model::Qwen3(qwen3::load_qwen3_model(
+        ModelKind::Qwen2 | ModelKind::Qwen3 => Ok(Model::DenseQwen(dense_qwen::load_safetensors(
             model_dir,
             stream,
             weights_stream,

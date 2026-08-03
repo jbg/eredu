@@ -40,11 +40,11 @@ real schemas, kwargs, and policies as request-specific.
 `is_loadable()` is an authoritative, fail-closed admission result. Container
 validity, architecture support, requested load-policy compatibility, and exact
 structural binding are reported separately. DeepSeek-V3/R1, Gemma 4 text and multimodal,
-GPT-OSS, Inkling, Kimi Linear, Llama/Mistral, Nemotron-H, Qwen3/Qwen3-MoE,
+GPT-OSS, Inkling, Kimi Linear, Llama/Mistral, Nemotron-H, Qwen2/Qwen2.5 text, Qwen3/Qwen3-MoE,
 Qwen3-Next, Qwen3-VL/Qwen3-VL-MoE, Qwen3.5 text and multimodal, PersonaPlex,
 and LFM2/LFM2-MoE
 SafeTensors, plus DeepSeek2,
-Gemma 4, GPT-OSS, Inkling, Llama/Mistral, Qwen3/Qwen3-MoE,
+Gemma 4, GPT-OSS, Inkling, Llama/Mistral, Qwen2/Qwen2.5 text, Qwen3/Qwen3-MoE,
 Qwen3.5/Qwen3.5-MoE, Qwen3-Next, Qwen3-VL, Kimi Linear,
 Nemotron-H/Nemotron-H-MoE, and LFM2/LFM2-MoE GGUF currently
 have exact header-only tensor-name, shape, dtype/encoding, tied-head,
@@ -161,6 +161,7 @@ checkpoint. The current architecture dispatch covers:
 - Llama and Mistral
 - LFM2 and LFM2.5, including MoE variants
 - Nemotron-H
+- Qwen2 and Qwen2.5 text models (`model_type: "qwen2"`)
 - Qwen3, including MoE variants
 - Qwen3-Next
 - Qwen3-VL and Qwen3-VL-MoE
@@ -182,7 +183,9 @@ Every high-level `LoadedModel` has an architecture-independent
 The dispatch is exhaustive over the public `Model` enum, so a new model variant
 must explicitly define its context, modalities, and state layout.
 
-- Llama/Mistral, Qwen3, and Qwen3-VL use KV-head-aware GQA accounting.
+- Llama/Mistral, Qwen2/Qwen2.5, Qwen3, and Qwen3-VL use KV-head-aware GQA accounting.
+- Qwen2 reports full and sliding layers separately; cache estimates use the actual KV-head count,
+  derived or explicit head dimension, configured window, and unbounded backing growth for full layers.
 - GPT-OSS and Gemma 4 account for full versus sliding attention separately.
 - DeepSeek-V3/R1 accounts for compressed MLA latent plus rotary-key state.
 - Kimi Linear separates bounded KDA convolution/recurrent state from
@@ -236,6 +239,7 @@ values:
 - `llama` and `mistral`
 - `lfm2` and `lfm2moe`
 - `nemotron_h` and `nemotron_h_moe`
+- `qwen2`
 - `qwen3` and `qwen3moe`
 - `qwen3next`
 - `qwen3vl` (with its companion vision projection checkpoint)
@@ -247,6 +251,15 @@ the file or uses an unsupported embedded tokenizer model. `qwen3vl` requires a
 validated sibling vision projector; Inkling remains text-loadable without its
 combined audio/vision projector and reports multimodal readiness separately.
 
+For Hugging Face Qwen2/Qwen2.5 directories, `tokenizer.json`,
+`tokenizer_config.json`, generation EOS metadata, padding/BOS/EOS ids, added
+stop tokens, and checkpoint chat templates flow through the architecture-neutral
+tokenizer and chat APIs. Standard Qwen2.5 instruct templates therefore use the
+same rendering, streaming, sampling, and EOS/stop handling as other text
+models. Native tools are reported only when the supplied template passes the
+existing behavioral protocol validation; SafeMLX does not infer tool syntax
+from the Qwen family name.
+
 `safemlx-gguf` parses GGUF v1-v3 in either byte order and validates all shard
 headers before payload materialization. Its supported dense and quantized
 tensor encodings are listed in the
@@ -257,10 +270,27 @@ tensor encodings are listed in the
 Fully resident loading is the default. SafeTensors and registered GGUF families
 can also use host-backed layer windows or experimental dense disk streaming.
 GGUF bounded loading covers Kimi Linear, DeepSeek2, Gemma 4, Llama/Mistral, LFM2,
-Nemotron-H, Qwen3, dense Qwen3-VL with its mmproj, Qwen3.5, and Qwen3-Next.
+Nemotron-H, Qwen2/Qwen2.5, Qwen3, dense Qwen3-VL with its mmproj, Qwen3.5, and Qwen3-Next.
 Supported MoE families can cache routed experts independently; for GGUF these
 are Kimi Linear, DeepSeek2, LFM2-MoE, Nemotron-H-MoE, Qwen3-MoE,
 Qwen3.5-MoE, and MoE Qwen3-Next.
+
+Qwen2/Qwen2.5 text checkpoints share the canonical `architectures::qwen::dense`
+decoder with Qwen3. SafeTensors and GGUF support fully resident, layerwise-host,
+and dense disk-streamed execution; floating SafeTensors may use supported
+load-time affine/MXFP4 quantization. Qwen2 applies the checkpoint-required Q/K/V
+biases and layer-selective sliding attention exactly. Qwen2-VL, Qwen2.5-VL,
+Qwen2 MoE, and older custom-code Qwen model types are rejected.
+
+The public architecture-erased variants are `Model::DenseQwen` and
+`Model::DenseQwenLayerwise`; the former Qwen3-specific variants and
+`architectures::qwen::qwen3` module were removed. Direct users now load through
+`architectures::qwen::dense::{load_safetensors, load_safetensors_quantized,
+load_gguf}` and its `layerwise` module. Full-attention resident models support
+normal, paged, and persisted prompt caches. Mixed full/sliding Qwen2 supports
+normal and paged caches but rejects persisted prompt-cache loading because the
+current manifest cannot express a per-layer window schedule. Tensor and
+pipeline parallel Qwen2 are also rejected during topology preflight.
 
 Kimi Linear SafeTensors supports fully resident, layerwise-host, dense
 disk-streamed, sparse-expert-cache, and sparse-expert-with-dense-layers

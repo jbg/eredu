@@ -53,7 +53,7 @@ materialization and storage I/O are different measurements.
 
 `ModelLoadOptions` selects either existing eager execution or the generic
 layerwise engine. DeepSeek-V3/R1, Gemma 4, Inkling, Kimi Linear, Llama,
-Mistral, GPT-OSS, LFM2/LFM2.5, Nemotron-H, Qwen3, Qwen3-Next, Qwen3-VL,
+Mistral, GPT-OSS, LFM2/LFM2.5, Nemotron-H, Qwen2/Qwen2.5 text, Qwen3, Qwen3-Next, Qwen3-VL,
 Qwen3-VL-MoE, and Qwen3.5 safetensors have registered adapters,
 including dense and MoE variants. Moshi and PersonaPlex use the same engine with
 independent temporal-layer and depth-codebook-slice windows. A requested family without a registered adapter returns
@@ -220,14 +220,21 @@ compute overlap are not supported by this policy. The opt-in
 latency, throughput, logical residency, transfer telemetry, allocator samples,
 and mapped-shard diagnostics.
 
-## Qwen3 weight residency
+## Dense Qwen2/Qwen2.5/Qwen3 weight residency
 
-Dense and sparse-MoE Qwen3 use one adapter. Token embeddings, final norm, and
+Qwen2/Qwen2.5 text and dense or sparse-MoE Qwen3 use one
+`architectures::qwen::dense` adapter. Token embeddings, final norm, and
 the tied or untied output projection stay pinned. Each complete transformer
 block, including its routed expert bank, is one `text_decoder` execution unit.
-Standard KV caches remain device resident. Matching checkpoint-native affine
+Qwen2 Q/K/V biases are materialized as required tensors. Full-attention layers
+grow their GQA KV cache with context; configured Qwen2 sliding layers retain
+exactly their declared window. Standard KV caches remain device resident. Matching checkpoint-native affine
 and MXFP4 parameter trees load directly; load-time conversion in the layerwise
 path is rejected.
+
+The former public `architectures::qwen::qwen3` module was removed. Dense Qwen
+callers use `architectures::qwen::dense`; architecture identity comes from
+validated checkpoint metadata rather than the module selected by the caller.
 
 ## GPT-OSS weight residency
 
@@ -293,6 +300,7 @@ never replaced by eager loading.
 | Family | Eager loader | Layerwise loader | Cache/state | Pinned static modules | Windowed unit | Checkpoint transform / native packing | Parity coverage |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | Llama / Mistral | yes | yes | growing or sliding KV | embedding, norm, head | decoder block | direct affine/MXFP4 | prefill and multi-step decode |
+| Qwen2 / Qwen2.5 text | yes | yes | GQA KV, split into full-context and configured sliding layers | embedding, norm, tied/untied head | decoder block | exact Q/K/V biases; direct affine/MXFP4 | full/sliding resident-to-layerwise prefill and decode |
 | Qwen3 dense / MoE | yes | yes | growing KV | embedding, norm, head | decoder block with local experts | direct affine/MXFP4 | dense and MoE prefill/decode |
 | GPT-OSS | yes | yes | alternating full/sliding KV | embedding, norm, head | sparse decoder block | native MXFP4 experts | both attention modes and multi-step decode |
 | LFM2/LFM2.5 dense / MoE | yes | yes | growing KV or convolution state | embedding, norm, tied/untied head | hybrid decoder block | split SwiGLU experts packed per layer; packed form accepted | dense and split-MoE hybrid prefill/decode |
@@ -323,7 +331,7 @@ than the Metal-specialized paths.
 The standard `api::load_model` and `api::LoadedModel::load` entry points
 accept Hugging Face-style model directories for Gemma 4, GPT-OSS, Inkling,
 Kimi Linear, Llama, dense Mistral,
-dense LFM2/LFM2.5 and LFM2-MoE, dense and sparse-MoE Nemotron-H, Qwen3,
+dense LFM2/LFM2.5 and LFM2-MoE, dense and sparse-MoE Nemotron-H, Qwen2/Qwen2.5 text, Qwen3,
 Qwen3-Next, Qwen3-VL, Qwen3-VL-MoE, and dense or MoE Qwen3.5. They also accept the
 GGUF architectures listed below. Canonically named sharded GGUF checkpoints
 are supported by passing the first
@@ -449,7 +457,7 @@ Q5_0 and Q5_1 tensors are losslessly repacked into MLX's five-bit affine
 layout; unsupported GGUF tensor types return an error. Model dispatch uses
 `general.architecture`; the current GGUF adapters support text-only `deepseek2`,
 `gemma4`, `gpt-oss`, `kimi-linear`, `llama`, `mistral`, `lfm2`, `lfm2moe`, `nemotron_h`,
-`nemotron_h_moe`, `qwen3`, `qwen3moe`, dense `qwen35`, and `qwen35moe`
+`nemotron_h_moe`, `qwen2`, `qwen3`, `qwen3moe`, dense `qwen35`, and `qwen35moe`
 architectures, plus multimodal `inkling`, `qwen3next`, and dense `qwen3vl` with separate projectors. For
 Qwen3-VL, put the llama.cpp-style dense F16/BF16/F32
 `mmproj-*.gguf` next to the language-model GGUF. The single-path loaders prefer
@@ -467,7 +475,17 @@ files. Multimodal projector files remain separate formats. Nemotron-H latent-spa
 Omni/multimodal checkpoints remain separate formats. Quantized Qwen3-VL language
 GGUFs retain their supported packed affine weights while the vision projector
 remains dense; quantized Qwen3-VL projectors and Qwen3.5-VL GGUF files are not
-currently handled.
+currently handled. Qwen2-VL, Qwen2.5-VL, Qwen2 MoE, and older custom-code Qwen
+architectures are intentionally unsupported.
+
+Qwen2 GGUF follows GGUF's absence-means-full-attention rule. When a file
+declares `qwen2.attention.sliding_window`, SafeMLX also requires an exact
+full-prefix/sliding-suffix `qwen2.attention.sliding_window_pattern` when the
+window is not global. Unsupported patterns and attention-affecting YaRN
+metadata are rejected during catalog inspection. Fully resident dense-Qwen
+models support normal and paged caches; persisted prompt caches are supported
+for full-attention Qwen2/Qwen2.5. Mixed full/sliding prompt-cache persistence,
+tensor parallelism, and pipeline parallelism are rejected explicitly.
 
 Kimi Linear GGUF accepts modern split `attn_k_b`/`attn_v_b` and legacy
 unsplit `attn_kv_b`, modern and singleton-ranked convolution tensors, dense
@@ -818,6 +836,7 @@ weights.
 |---|---:|---:|---:|---:|---|
 | Llama | yes | MLX affine/MXFP4 | yes / yes | `LoadedModel` | Linear, embedding, tied/untied head targets |
 | Mistral | yes | MLX affine/MXFP4 | yes / yes | `LoadedModel` | Reuses the Llama-compatible dense decoder; configured sliding attention uses bounded KV caches |
+| Qwen2/Qwen2.5 text | yes | MLX affine/MXFP4 and packed GGUF affine | yes / yes | `LoadedModel` | Biased Q/K/V projections, GQA, tied/untied heads, and exact full/sliding layer caches share the dense-Qwen plan |
 | LFM2/LFM2.5 and LFM2-MoE | yes | MLX affine/MXFP4 and packed GGUF affine | yes / yes | `LoadedModel` | Alternating short-convolution/attention cache; MoE uses sigmoid top-k routing and packed expert-major SwiGLU execution |
 | Kimi Linear | yes | MLX affine/MXFP4 and packed GGUF affine/IQ/MXFP4-MoE | yes / yes | `LoadedModel` | Hybrid KDA/no-RoPE MLA cache; packed routed experts and one shared expert; norms, transition parameters, biases, and convolution weights remain dense |
 | Qwen3 | yes | MLX affine/MXFP4 | yes / yes | `LoadedModel` | Linear, embedding, tied/untied head targets |

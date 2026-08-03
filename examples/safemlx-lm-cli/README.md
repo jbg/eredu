@@ -10,6 +10,12 @@ cargo run --release -p safemlx-lm-cli -- \
   "Write a Rust function that adds two integers."
 ```
 
+Qwen2 and Qwen2.5 text checkpoints use the same command. Hugging Face
+directories must declare `model_type: "qwen2"`; GGUF files must declare
+`general.architecture: "qwen2"`. Standard Qwen2.5 instruct templates and
+checkpoint EOS/stop tokens are applied by the shared chat and streaming path.
+Qwen2 vision-language and MoE variants are rejected explicitly.
+
 On a Linux system with the CUDA prerequisites installed, add the workspace
 feature to build and run the same CLI on MLX's CUDA backend:
 

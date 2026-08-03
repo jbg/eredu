@@ -1,4 +1,8 @@
-//! Qwen3 decoder-only model implementation.
+//! Shared Qwen2/Qwen2.5/Qwen3 decoder-only model implementation.
+
+/// Bounded and unified residency execution for dense Qwen decoders.
+#[path = "dense/layerwise.rs"]
+pub mod layerwise;
 
 use std::{
     collections::{HashMap, HashSet},
@@ -52,9 +56,18 @@ use crate::{
     runtime::execution::inspection::{ActivationObserver, MoeRoutingObservation},
 };
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+/// Dense Qwen decoder generation selected by checkpoint metadata.
+pub enum Architecture {
+    /// Qwen2 and Qwen2.5 text decoders with biased Q/K/V projections.
+    Qwen2,
+    /// Qwen3 dense or sparse-MoE text decoders with Q/K normalization.
+    Qwen3,
+}
+
 #[derive(Debug, Clone, Deserialize)]
-/// Deserialized Qwen3 `config.json` fields used by this loader.
-pub struct ModelArgs {
+/// Deserialized dense-Qwen `config.json` fields used by this loader.
+pub struct DecoderConfig {
     /// Model type from the configuration.
     pub model_type: String,
     /// Transformer hidden size.
@@ -75,12 +88,34 @@ pub struct ModelArgs {
     pub max_position_embeddings: i32,
     /// RoPE base frequency.
     pub rope_theta: f32,
-    /// Per-head attention dimension.
+    /// Per-head attention dimension. Zero is normalized from hidden/head geometry.
+    #[serde(default)]
     pub head_dim: i32,
     /// Whether logits use tied input embeddings.
     pub tie_word_embeddings: bool,
     /// Optional RoPE scaling configuration.
     pub rope_scaling: Option<HashMap<String, FloatOrString>>,
+    /// Attention activation. Dense Qwen text checkpoints use SiLU.
+    #[serde(default = "default_hidden_act")]
+    pub hidden_act: String,
+    /// Inference checkpoints must not request attention dropout.
+    #[serde(default)]
+    pub attention_dropout: f32,
+    /// Optional config declaration for attention projection bias.
+    #[serde(default)]
+    pub attention_bias: Option<bool>,
+    /// Optional declaration for MLP projection biases; dense Qwen requires none.
+    #[serde(default)]
+    pub mlp_bias: Option<bool>,
+    /// Enables Qwen2's layer-selective sliding-window attention.
+    #[serde(default)]
+    pub use_sliding_window: bool,
+    /// Retained attention window when sliding attention is enabled.
+    #[serde(default)]
+    pub sliding_window: Option<i32>,
+    /// First layer index that uses sliding attention.
+    #[serde(default)]
+    pub max_window_layers: Option<i32>,
     /// Preferred MLX-LM affine quantization metadata.
     #[serde(default)]
     pub quantization: Option<WeightQuantization>,
@@ -110,7 +145,45 @@ pub struct ModelArgs {
     pub quantized_weight_configs: Option<HashMap<String, WeightQuantization>>,
 }
 
-impl ModelArgs {
+fn default_hidden_act() -> String {
+    "silu".into()
+}
+
+impl DecoderConfig {
+    /// Returns the exact architecture identity established by `model_type`.
+    pub fn architecture(&self) -> Architecture {
+        match self.model_type.as_str() {
+            "qwen2" => Architecture::Qwen2,
+            "qwen3" | "qwen3_moe" | "qwen3_vl_text" | "qwen3_vl_moe_text" => Architecture::Qwen3,
+            _ => unreachable!("validated dense-Qwen model type"),
+        }
+    }
+
+    pub(crate) fn model_kind(&self) -> crate::api::ModelKind {
+        match self.architecture() {
+            Architecture::Qwen2 => crate::api::ModelKind::Qwen2,
+            Architecture::Qwen3 => crate::api::ModelKind::Qwen3,
+        }
+    }
+
+    /// Whether this architecture carries learned Q/K/V projection biases.
+    pub fn qkv_bias(&self) -> bool {
+        self.architecture() == Architecture::Qwen2
+    }
+
+    /// Whether this architecture applies per-head Q/K RMS normalization.
+    pub fn qk_norm(&self) -> bool {
+        self.architecture() == Architecture::Qwen3
+    }
+
+    /// Returns the configured window for one layer, or full attention.
+    pub fn sliding_window_for_layer(&self, layer: i32) -> Option<i32> {
+        self.use_sliding_window
+            .then_some(())
+            .and(self.sliding_window)
+            .filter(|_| layer >= self.max_window_layers.unwrap_or(self.num_hidden_layers))
+    }
+
     pub(crate) fn weight_quantization(&self) -> Option<WeightQuantization> {
         self.quantization.or(self.quantization_config)
     }
@@ -135,8 +208,43 @@ impl ModelArgs {
     }
 }
 
+pub(crate) fn prompt_cache_architecture_fingerprint(args: &DecoderConfig) -> String {
+    let mut rope = args
+        .rope_scaling
+        .as_ref()
+        .map(|config| {
+            config
+                .iter()
+                .map(|(key, value)| {
+                    let value = match value {
+                        FloatOrString::Float(value) => format!("f32:{:08x}", value.to_bits()),
+                        FloatOrString::String(value) => format!("string:{value}"),
+                        FloatOrString::Bool(value) => format!("bool:{value}"),
+                    };
+                    format!("{key}={value}")
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    rope.sort_unstable();
+    format!(
+        "dense-qwen-v1:type={}:hidden={}:layers={}:q_heads={}:kv_heads={}:head_dim={}:context={}:rope_theta={:08x}:rope={}:sliding={:?}:first_sliding={:?}",
+        args.model_type,
+        args.hidden_size,
+        args.num_hidden_layers,
+        args.num_attention_heads,
+        args.num_key_value_heads,
+        args.head_dim,
+        args.max_position_embeddings,
+        args.rope_theta.to_bits(),
+        rope.join(";"),
+        args.sliding_window.filter(|_| args.use_sliding_window),
+        args.max_window_layers.filter(|_| args.use_sliding_window),
+    )
+}
+
 fn quantization_for(
-    args: &ModelArgs,
+    args: &DecoderConfig,
     prefix: Option<&str>,
     parameter: &str,
 ) -> Option<WeightQuantization> {
@@ -147,7 +255,7 @@ fn quantization_for(
 }
 
 #[derive(Debug, Clone, ModuleParameters, Quantizable)]
-/// Qwen3 attention layer.
+/// Shared dense-Qwen attention layer.
 pub struct Attention {
     /// Number of query heads.
     pub n_heads: i32,
@@ -174,23 +282,25 @@ pub struct Attention {
     pub o_proj: MaybeQuantized<nn::Linear>,
     #[param]
     /// Query normalization.
-    pub q_norm: nn::RmsNorm,
+    pub q_norm: Option<nn::RmsNorm>,
     #[param]
     /// Key normalization.
-    pub k_norm: nn::RmsNorm,
+    pub k_norm: Option<nn::RmsNorm>,
     #[param]
     /// Rotary position embedding module.
     pub rope: RopeVariant,
+    /// Layer-local attention window; absent for full attention.
+    pub sliding_window: Option<i32>,
 }
 
 impl Attention {
     /// Creates an unloaded attention layer from model arguments.
-    pub fn new(args: &ModelArgs, stream: &Stream) -> Result<Self, Exception> {
+    pub fn new(args: &DecoderConfig, stream: &Stream) -> Result<Self, Exception> {
         Self::new_with_prefix(args, None, stream)
     }
 
     pub(crate) fn new_for_layer(
-        args: &ModelArgs,
+        args: &DecoderConfig,
         layer_index: i32,
         stream: &Stream,
     ) -> Result<Self, Exception> {
@@ -202,7 +312,7 @@ impl Attention {
     }
 
     fn new_with_prefix(
-        args: &ModelArgs,
+        args: &DecoderConfig,
         prefix: Option<String>,
         stream: &Stream,
     ) -> Result<Self, Exception> {
@@ -216,21 +326,21 @@ impl Attention {
         let q_proj = common::linear::unloaded_maybe_quantized_linear(
             dim,
             n_heads * head_dim,
-            false,
+            args.qkv_bias(),
             quantization_for(args, prefix.as_deref(), "q_proj"),
             stream,
         )?;
         let k_proj = common::linear::unloaded_maybe_quantized_linear(
             dim,
             n_kv_heads * head_dim,
-            false,
+            args.qkv_bias(),
             quantization_for(args, prefix.as_deref(), "k_proj"),
             stream,
         )?;
         let v_proj = common::linear::unloaded_maybe_quantized_linear(
             dim,
             n_kv_heads * head_dim,
-            false,
+            args.qkv_bias(),
             quantization_for(args, prefix.as_deref(), "v_proj"),
             stream,
         )?;
@@ -242,8 +352,14 @@ impl Attention {
             stream,
         )?;
 
-        let q_norm = nn::RmsNorm::unloaded(head_dim, args.rms_norm_eps, Dtype::Float32, stream)?;
-        let k_norm = nn::RmsNorm::unloaded(head_dim, args.rms_norm_eps, Dtype::Float32, stream)?;
+        let q_norm = args
+            .qk_norm()
+            .then(|| nn::RmsNorm::unloaded(head_dim, args.rms_norm_eps, Dtype::Float32, stream))
+            .transpose()?;
+        let k_norm = args
+            .qk_norm()
+            .then(|| nn::RmsNorm::unloaded(head_dim, args.rms_norm_eps, Dtype::Float32, stream))
+            .transpose()?;
 
         let rope = initialize_rope(
             head_dim,
@@ -265,7 +381,26 @@ impl Attention {
             q_norm,
             k_norm,
             rope,
+            sliding_window: prefix
+                .as_deref()
+                .and_then(|prefix| prefix.split('.').nth(2))
+                .and_then(|layer| layer.parse().ok())
+                .and_then(|layer| args.sliding_window_for_layer(layer)),
         })
+    }
+
+    fn normalize_query(&mut self, value: Array, stream: &Stream) -> Result<Array, Exception> {
+        match &mut self.q_norm {
+            Some(norm) => norm.forward(&value, stream),
+            None => Ok(value),
+        }
+    }
+
+    fn normalize_key(&mut self, value: Array, stream: &Stream) -> Result<Array, Exception> {
+        match &mut self.k_norm {
+            Some(norm) => norm.forward(&value, stream),
+            None => Ok(value),
+        }
     }
 
     /// Forward pass that reports attention activations to an observer.
@@ -290,30 +425,49 @@ impl Attention {
         let values = self.v_proj.forward(x, stream)?;
         observer.observe(&format!("{prefix}.v_proj"), &values)?;
 
-        let queries = self.q_norm.forward(
-            &reshape_attention_projection(queries, batch, seq_len, self.n_heads, stream)?,
+        let queries = self.normalize_query(
+            reshape_attention_projection(queries, batch, seq_len, self.n_heads, stream)?,
             stream,
         )?;
-        observer.observe(&format!("{prefix}.q_norm"), &queries)?;
-        let keys = self.k_norm.forward(
-            &reshape_attention_projection(keys, batch, seq_len, self.n_kv_heads, stream)?,
+        if self.q_norm.is_some() {
+            observer.observe(&format!("{prefix}.q_norm"), &queries)?;
+        }
+        let keys = self.normalize_key(
+            reshape_attention_projection(keys, batch, seq_len, self.n_kv_heads, stream)?,
             stream,
         )?;
-        observer.observe(&format!("{prefix}.k_norm"), &keys)?;
+        if self.k_norm.is_some() {
+            observer.observe(&format!("{prefix}.k_norm"), &keys)?;
+        }
         let values = reshape_attention_projection(values, batch, seq_len, self.n_kv_heads, stream)?;
         observer.observe(&format!("{prefix}.values"), &values)?;
 
+        let position_offset = cache.as_ref().map_or(0, |cache| cache.offset());
         let (queries, keys, values) =
             apply_rope_and_update_cache(&mut self.rope, queries, keys, values, &mut cache, stream)?;
         observer.observe(&format!("{prefix}.queries_rope"), &queries)?;
         observer.observe(&format!("{prefix}.keys_rope"), &keys)?;
         observer.observe(&format!("{prefix}.values_cache"), &values)?;
-        let attention_probs = attention_probabilities(&queries, &keys, self.scale, mask, stream)?;
-        observer.observe(&format!("{prefix}.attention_probs"), &attention_probs)?;
-
-        let output = finish_attention(
-            queries, keys, values, cache, self.scale, mask, batch, seq_len, stream,
-        )?;
+        let output = if let Some(window) = self.sliding_window.filter(|_| seq_len > 1) {
+            common::attention::sliding_window_prefill_attention(
+                queries,
+                keys,
+                values,
+                self.scale,
+                window,
+                position_offset,
+                batch,
+                seq_len,
+                stream,
+            )?
+        } else {
+            let attention_probs =
+                attention_probabilities(&queries, &keys, self.scale, mask, stream)?;
+            observer.observe(&format!("{prefix}.attention_probs"), &attention_probs)?;
+            finish_attention(
+                queries, keys, values, cache, self.scale, mask, batch, seq_len, stream,
+            )?
+        };
         observer.observe(&format!("{prefix}.attention"), &output)?;
 
         let output = self.o_proj.forward(&output, stream)?;
@@ -333,24 +487,14 @@ impl Attention {
     {
         let AttentionInput { x, mask, mut cache } = input;
         let (batch, seq_len) = batch_seq(x);
-        let queries = self.q_norm.forward(
-            &reshape_attention_projection(
-                self.q_proj.forward(x, stream)?,
-                batch,
-                seq_len,
-                self.n_heads,
-                stream,
-            )?,
+        let queries = self.q_proj.forward(x, stream)?;
+        let keys = self.k_proj.forward(x, stream)?;
+        let queries = self.normalize_query(
+            reshape_attention_projection(queries, batch, seq_len, self.n_heads, stream)?,
             stream,
         )?;
-        let keys = self.k_norm.forward(
-            &reshape_attention_projection(
-                self.k_proj.forward(x, stream)?,
-                batch,
-                seq_len,
-                self.n_kv_heads,
-                stream,
-            )?,
+        let keys = self.normalize_key(
+            reshape_attention_projection(keys, batch, seq_len, self.n_kv_heads, stream)?,
             stream,
         )?;
         let values = reshape_attention_projection(
@@ -360,12 +504,27 @@ impl Attention {
             self.n_kv_heads,
             stream,
         )?;
+        let position_offset = cache.as_ref().map_or(0, |cache| cache.offset());
         let (queries, keys, values) = apply_rotary_embeddings_and_update_cache(
             queries, keys, values, cos, sin, &mut cache, stream,
         )?;
-        let output = finish_attention(
-            queries, keys, values, cache, self.scale, mask, batch, seq_len, stream,
-        )?;
+        let output = if let Some(window) = self.sliding_window.filter(|_| seq_len > 1) {
+            common::attention::sliding_window_prefill_attention(
+                queries,
+                keys,
+                values,
+                self.scale,
+                window,
+                position_offset,
+                batch,
+                seq_len,
+                stream,
+            )?
+        } else {
+            finish_attention(
+                queries, keys, values, cache, self.scale, mask, batch, seq_len, stream,
+            )?
+        };
         self.o_proj.forward(&output, stream)
     }
 }
@@ -392,19 +551,33 @@ where
         let keys = self.k_proj.forward(x, stream)?;
         let values = self.v_proj.forward(x, stream)?;
 
-        let queries = self.q_norm.forward(
-            &reshape_attention_projection(queries, B, L, self.n_heads, stream)?,
+        let queries = self.normalize_query(
+            reshape_attention_projection(queries, B, L, self.n_heads, stream)?,
             stream,
         )?;
-        let keys = self.k_norm.forward(
-            &reshape_attention_projection(keys, B, L, self.n_kv_heads, stream)?,
+        let keys = self.normalize_key(
+            reshape_attention_projection(keys, B, L, self.n_kv_heads, stream)?,
             stream,
         )?;
         let values = reshape_attention_projection(values, B, L, self.n_kv_heads, stream)?;
+        let position_offset = cache.as_ref().map_or(0, |cache| cache.offset());
         let (queries, keys, values) =
             apply_rope_and_update_cache(&mut self.rope, queries, keys, values, &mut cache, stream)?;
-        let output =
-            finish_attention(queries, keys, values, cache, self.scale, mask, B, L, stream)?;
+        let output = if let Some(window) = self.sliding_window.filter(|_| L > 1) {
+            common::attention::sliding_window_prefill_attention(
+                queries,
+                keys,
+                values,
+                self.scale,
+                window,
+                position_offset,
+                B,
+                L,
+                stream,
+            )?
+        } else {
+            finish_attention(queries, keys, values, cache, self.scale, mask, B, L, stream)?
+        };
 
         self.o_proj.forward(&output, stream)
     }
@@ -414,13 +587,17 @@ where
         self.k_proj.training_mode(mode);
         self.v_proj.training_mode(mode);
         self.o_proj.training_mode(mode);
-        self.q_norm.training_mode(mode);
-        self.k_norm.training_mode(mode);
+        if let Some(norm) = &mut self.q_norm {
+            norm.training_mode(mode);
+        }
+        if let Some(norm) = &mut self.k_norm {
+            norm.training_mode(mode);
+        }
         <RopeVariant as Module<nn::RopeInput>>::training_mode(&mut self.rope, mode);
     }
 }
 
-/// Qwen3 feed-forward block.
+/// Dense-Qwen SwiGLU feed-forward block.
 pub type Mlp = SwiGluMlp;
 
 /// Packed routed-expert bank shared with other SwiGLU MoE architectures.
@@ -438,7 +615,7 @@ pub struct SparseMoeBlock {
 }
 
 impl SparseMoeBlock {
-    fn new(args: &ModelArgs, layer_index: i32, stream: &Stream) -> Result<Self, Exception> {
+    fn new(args: &DecoderConfig, layer_index: i32, stream: &Stream) -> Result<Self, Exception> {
         Ok(Self {
             gate: common::moe::TopKRouter::new(
                 common::moe::TopKRouterConfig {
@@ -607,7 +784,7 @@ pub enum FeedForward {
 }
 
 impl FeedForward {
-    fn new(args: &ModelArgs, layer_index: i32, stream: &Stream) -> Result<Self, Exception> {
+    fn new(args: &DecoderConfig, layer_index: i32, stream: &Stream) -> Result<Self, Exception> {
         if args.is_moe() {
             Ok(Self::Moe(SparseMoeBlock::new(args, layer_index, stream)?))
         } else {
@@ -780,7 +957,7 @@ impl safemlx::quantization::Quantizable for FeedForward {
 }
 
 #[derive(Debug, Clone, ModuleParameters, Quantizable)]
-/// Qwen3 decoder block.
+/// Shared dense-Qwen decoder block.
 pub struct TransformerBlock {
     /// Number of attention heads.
     pub num_attention_heads: i32,
@@ -808,12 +985,12 @@ pub struct TransformerBlock {
 
 impl TransformerBlock {
     /// Creates an unloaded decoder block from model arguments.
-    pub fn new(args: &ModelArgs, stream: &Stream) -> Result<Self, Exception> {
+    pub fn new(args: &DecoderConfig, stream: &Stream) -> Result<Self, Exception> {
         Self::new_for_layer(args, 0, stream)
     }
 
     pub(crate) fn new_for_layer(
-        args: &ModelArgs,
+        args: &DecoderConfig,
         layer_index: i32,
         stream: &Stream,
     ) -> Result<Self, Exception> {
@@ -1074,8 +1251,8 @@ where
 }
 
 #[derive(Debug, Clone, ModuleParameters, Quantizable)]
-/// Qwen3 transformer body without the language-model head.
-pub struct Qwen3Model {
+/// Shared dense-Qwen transformer body without the language-model head.
+pub struct Decoder {
     /// Token vocabulary size.
     pub vocab_size: i32,
     /// Number of decoder layers.
@@ -1096,9 +1273,9 @@ pub struct Qwen3Model {
     pub norm: nn::RmsNorm,
 }
 
-impl Qwen3Model {
-    /// Creates an unloaded Qwen3 transformer body.
-    pub fn new(args: &ModelArgs, stream: &Stream) -> Result<Self, Exception> {
+impl Decoder {
+    /// Creates an unloaded dense-Qwen transformer body.
+    pub fn new(args: &DecoderConfig, stream: &Stream) -> Result<Self, Exception> {
         assert!(args.vocab_size.is_positive());
 
         let vocab_size = args.vocab_size;
@@ -1232,7 +1409,7 @@ impl Qwen3Model {
     }
 }
 
-/// Input for a Qwen3 forward pass.
+/// Input for a dense-Qwen forward pass.
 pub struct ModelInput<'a, C> {
     /// Token ids with shape `[batch, sequence]`.
     pub inputs: &'a Array,
@@ -1242,7 +1419,7 @@ pub struct ModelInput<'a, C> {
     pub cache: &'a mut Vec<Option<C>>,
 }
 
-impl<C> Module<ModelInput<'_, C>> for Qwen3Model
+impl<C> Module<ModelInput<'_, C>> for Decoder
 where
     C: KeyValueCache + Default,
 {
@@ -1300,15 +1477,15 @@ where
 }
 
 #[derive(Debug, Clone, ModuleParameters, Quantizable)]
-/// Qwen3 causal language model.
+/// Qwen2/Qwen2.5/Qwen3 causal language model.
 pub struct Model {
     /// Model configuration.
-    pub args: ModelArgs,
+    pub args: DecoderConfig,
 
     #[quantizable]
     #[param]
     /// Transformer body.
-    pub model: Qwen3Model,
+    pub model: Decoder,
 
     #[quantizable]
     #[param]
@@ -1317,9 +1494,9 @@ pub struct Model {
 }
 
 impl Model {
-    /// Creates an unloaded Qwen3 causal language model.
-    pub fn new(args: ModelArgs, stream: &Stream) -> Result<Self, Exception> {
-        let model = Qwen3Model::new(&args, stream)?;
+    /// Creates an unloaded dense-Qwen causal language model.
+    pub fn new(args: DecoderConfig, stream: &Stream) -> Result<Self, Exception> {
+        let model = Decoder::new(&args, stream)?;
         let lm_head = if !args.tie_word_embeddings {
             Some(
                 common::linear::build_unloaded_maybe_quantized_lm_head_with_quantization(
@@ -1343,6 +1520,22 @@ impl Model {
     /// Returns the configured model type.
     pub fn model_type(&self) -> &str {
         &self.args.model_type
+    }
+
+    /// Creates architecture-correct per-layer KV caches, including Qwen2 SWA layers.
+    pub fn new_cache(&self) -> Vec<Option<crate::runtime::cache::ConcatKeyValueCache>> {
+        (0..self.args.num_hidden_layers)
+            .map(|layer| {
+                Some(match self.args.sliding_window_for_layer(layer) {
+                    Some(window) => {
+                        crate::runtime::cache::ConcatKeyValueCache::new_for_sliding_attention(
+                            window,
+                        )
+                    }
+                    None => crate::runtime::cache::ConcatKeyValueCache::new(),
+                })
+            })
+            .collect()
     }
 
     /// Forward pass that reports activations to an observer.
@@ -1470,39 +1663,132 @@ where
     }
 
     fn training_mode(&mut self, mode: bool) {
-        <Qwen3Model as Module<ModelInput<'_, C>>>::training_mode(&mut self.model, mode);
+        <Decoder as Module<ModelInput<'_, C>>>::training_mode(&mut self.model, mode);
         if let Some(lm_head) = &mut self.lm_head {
             lm_head.training_mode(mode);
         }
     }
 }
 
-/// Loads `tokenizer.json` from a Qwen3 model directory.
-pub fn load_qwen3_tokenizer(model_dir: impl AsRef<Path>) -> Result<Tokenizer, Error> {
+/// Loads `tokenizer.json` from a dense-Qwen model directory.
+pub fn load_tokenizer(model_dir: impl AsRef<Path>) -> Result<Tokenizer, Error> {
     let file = model_dir.as_ref().join("tokenizer.json");
     Tokenizer::from_file(file).map_err(Into::into)
 }
 
-/// Reads Qwen3 model arguments from `config.json`.
-pub fn get_qwen3_model_args(model_dir: impl AsRef<Path>) -> Result<ModelArgs, Error> {
+/// Reads and validates a dense-Qwen decoder configuration from `config.json`.
+pub fn load_config(model_dir: impl AsRef<Path>) -> Result<DecoderConfig, Error> {
     let model_args_filename = model_dir.as_ref().join("config.json");
     let file = std::fs::File::open(model_args_filename)?;
     let config: Value = serde_json::from_reader(file)?;
-    model_args_from_config_value(&config)
+    config_from_hf_value(&config)
 }
 
 /// Parses and validates the arguments shared by structural preflight and loading.
-pub(crate) fn model_args_from_config_value(config: &Value) -> Result<ModelArgs, Error> {
-    let args = serde_json::from_value::<ModelArgs>(config.clone()).map_err(|error| {
-        Error::UnsupportedArchitecture(format!("invalid Qwen3 config: {error}"))
+pub(crate) fn config_from_hf_value(config: &Value) -> Result<DecoderConfig, Error> {
+    if let Some(model_type) = config.get("model_type").and_then(Value::as_str) {
+        validate_declared_architectures(config, model_type)?;
+    }
+    validate_execution_fields(config)?;
+    let mut args = serde_json::from_value::<DecoderConfig>(config.clone()).map_err(|error| {
+        Error::UnsupportedArchitecture(format!("invalid dense-Qwen config: {error}"))
     })?;
+    if args.head_dim == 0
+        && args.num_attention_heads > 0
+        && args.hidden_size % args.num_attention_heads == 0
+    {
+        args.head_dim = args.hidden_size / args.num_attention_heads;
+    }
     validate_model_args(&args)?;
     Ok(args)
 }
 
-fn validate_model_args(args: &ModelArgs) -> Result<(), Error> {
-    if !matches!(args.model_type.as_str(), "qwen3" | "qwen3_moe") {
+fn validate_execution_fields(config: &Value) -> Result<(), Error> {
+    for field in [
+        "layer_types",
+        "sliding_window_pattern",
+        "attention_type",
+        "use_qk_norm",
+        "qk_norm",
+        "attention_chunk_size",
+        "value_head_dim",
+        "attention_output_bias",
+    ] {
+        if config.get(field).is_some() {
+            return Err(Error::UnsupportedArchitecture(format!(
+                "dense-Qwen config field {field:?} changes decoder execution and is not supported"
+            )));
+        }
+    }
+    if let Some(value) = config.get("partial_rotary_factor") {
+        match value.as_f64() {
+            Some(1.0) => {}
+            Some(_) => {
+                return Err(Error::UnsupportedArchitecture(
+                    "dense Qwen requires full-head rotary embeddings (partial_rotary_factor=1)"
+                        .into(),
+                ));
+            }
+            None => {
+                return Err(Error::UnsupportedArchitecture(
+                    "partial_rotary_factor must be numeric".into(),
+                ));
+            }
+        }
+    }
+    if let Some(value) = config.get("rope_interleaved") {
+        match value.as_bool() {
+            Some(false) => {}
+            Some(true) => {
+                return Err(Error::UnsupportedArchitecture(
+                    "dense Qwen does not support interleaved RoPE coordinates".into(),
+                ));
+            }
+            None => {
+                return Err(Error::UnsupportedArchitecture(
+                    "rope_interleaved must be boolean".into(),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_declared_architectures(config: &Value, model_type: &str) -> Result<(), Error> {
+    let Some(value) = config.get("architectures") else {
+        return Ok(());
+    };
+    let architectures = value.as_array().ok_or_else(|| {
+        Error::UnsupportedArchitecture("config architectures must be an array of strings".into())
+    })?;
+    let expected: &[&str] = match model_type {
+        "qwen2" => &["Qwen2ForCausalLM"],
+        "qwen3" => &["Qwen3ForCausalLM"],
+        "qwen3_moe" => &["Qwen3MoeForCausalLM"],
+        _ => return Ok(()),
+    };
+    if architectures.is_empty()
+        || architectures.iter().any(|architecture| {
+            architecture
+                .as_str()
+                .is_none_or(|architecture| !expected.contains(&architecture))
+        })
+    {
+        return Err(Error::UnsupportedArchitecture(format!(
+            "model_type {model_type:?} requires architectures {expected:?}; multimodal, MoE, and custom-code variants are not interchangeable"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_model_args(args: &DecoderConfig) -> Result<(), Error> {
+    if !matches!(args.model_type.as_str(), "qwen2" | "qwen3" | "qwen3_moe") {
         return Err(Error::UnsupportedModelType(args.model_type.clone()));
+    }
+    if args.model_type == "qwen2" && args.is_moe() {
+        return Err(Error::UnsupportedArchitecture(
+            "model_type qwen2 supports only the dense Qwen2/Qwen2.5 text architecture".into(),
+        ));
     }
     for (name, value) in [
         ("hidden_size", args.hidden_size),
@@ -1525,17 +1811,104 @@ fn validate_model_args(args: &ModelArgs) -> Result<(), Error> {
             args.num_attention_heads, args.num_key_value_heads
         )));
     }
-    for (name, heads) in [
-        ("query projection", args.num_attention_heads),
-        ("key/value projection", args.num_key_value_heads),
-    ] {
-        heads.checked_mul(args.head_dim).ok_or_else(|| {
+    let query_width = args
+        .num_attention_heads
+        .checked_mul(args.head_dim)
+        .ok_or_else(|| {
             Error::UnsupportedArchitecture(format!(
-                "{name} width overflows i32: {heads} heads x head_dim {}",
-                args.head_dim
+                "query projection width overflows i32: {} heads x head_dim {}",
+                args.num_attention_heads, args.head_dim
             ))
         })?;
+    args.num_key_value_heads
+        .checked_mul(args.head_dim)
+        .ok_or_else(|| {
+            Error::UnsupportedArchitecture(format!(
+                "key/value projection width overflows i32: {} heads x head_dim {}",
+                args.num_key_value_heads, args.head_dim
+            ))
+        })?;
+    if args.hidden_size != query_width {
+        return Err(Error::UnsupportedArchitecture(format!(
+            "hidden_size ({}) must equal num_attention_heads ({}) x head_dim ({})",
+            args.hidden_size, args.num_attention_heads, args.head_dim
+        )));
     }
+    if !args.rms_norm_eps.is_finite() || args.rms_norm_eps <= 0.0 {
+        return Err(Error::UnsupportedArchitecture(format!(
+            "rms_norm_eps must be finite and positive, got {}",
+            args.rms_norm_eps
+        )));
+    }
+    if !args.rope_theta.is_finite() || args.rope_theta <= 0.0 {
+        return Err(Error::UnsupportedArchitecture(format!(
+            "rope_theta must be finite and positive, got {}",
+            args.rope_theta
+        )));
+    }
+    if args.hidden_act != "silu" {
+        return Err(Error::UnsupportedArchitecture(format!(
+            "dense Qwen requires hidden_act=\"silu\", got {:?}",
+            args.hidden_act
+        )));
+    }
+    if args.attention_dropout != 0.0 {
+        return Err(Error::UnsupportedArchitecture(format!(
+            "dense Qwen inference requires attention_dropout=0, got {}",
+            args.attention_dropout
+        )));
+    }
+    match (args.architecture(), args.attention_bias) {
+        (Architecture::Qwen2, Some(false)) => {
+            return Err(Error::UnsupportedArchitecture(
+                "Qwen2 text checkpoints require learned Q/K/V projection biases".into(),
+            ));
+        }
+        (Architecture::Qwen3, Some(true)) => {
+            return Err(Error::UnsupportedArchitecture(
+                "Qwen3 dense attention does not support biased Q/K/V projections".into(),
+            ));
+        }
+        _ => {}
+    }
+    if args.mlp_bias == Some(true) {
+        return Err(Error::UnsupportedArchitecture(
+            "dense Qwen does not support biased SwiGLU projections".into(),
+        ));
+    }
+    match args.architecture() {
+        Architecture::Qwen2 if args.use_sliding_window => {
+            let window = args.sliding_window.ok_or_else(|| {
+                Error::UnsupportedArchitecture(
+                    "use_sliding_window=true requires a sliding_window value".into(),
+                )
+            })?;
+            let first = args.max_window_layers.ok_or_else(|| {
+                Error::UnsupportedArchitecture(
+                    "use_sliding_window=true requires max_window_layers".into(),
+                )
+            })?;
+            if window <= 0 {
+                return Err(Error::UnsupportedArchitecture(format!(
+                    "sliding_window must be positive, got {window}"
+                )));
+            }
+            if !(0..args.num_hidden_layers).contains(&first) {
+                return Err(Error::UnsupportedArchitecture(format!(
+                    "max_window_layers must select at least one configured layer, got {first} for {} layers",
+                    args.num_hidden_layers
+                )));
+            }
+        }
+        Architecture::Qwen2 => {}
+        Architecture::Qwen3 if args.use_sliding_window => {
+            return Err(Error::UnsupportedArchitecture(
+                "Qwen3 dense/MoE does not use Qwen2 sliding-window configuration".into(),
+            ));
+        }
+        Architecture::Qwen3 => {}
+    }
+    validate_rope_scaling(args)?;
     if args.is_moe() {
         for (name, value) in [
             ("moe_intermediate_size", args.moe_intermediate_size),
@@ -1563,45 +1936,110 @@ fn validate_model_args(args: &ModelArgs) -> Result<(), Error> {
     Ok(())
 }
 
-pub(crate) struct LoadedQwen3Gguf {
+fn validate_rope_scaling(args: &DecoderConfig) -> Result<(), Error> {
+    let Some(config) = &args.rope_scaling else {
+        return Ok(());
+    };
+    let rope_type = config
+        .get("rope_type")
+        .or_else(|| config.get("type"))
+        .and_then(|value| match value {
+            FloatOrString::String(value) => Some(value.as_str()),
+            _ => None,
+        })
+        .ok_or_else(|| {
+            Error::UnsupportedArchitecture(
+                "rope_scaling must contain string field type or rope_type".into(),
+            )
+        })?;
+    let allowed: &[&str] = match rope_type {
+        "default" => &["type", "rope_type"],
+        "linear" => &["type", "rope_type", "factor"],
+        "yarn" => &[
+            "type",
+            "rope_type",
+            "factor",
+            "original_max_position_embeddings",
+            "beta_fast",
+            "beta_slow",
+            "mscale",
+            "mscale_all_dim",
+            "truncate",
+        ],
+        other => {
+            return Err(Error::UnsupportedArchitecture(format!(
+                "dense Qwen RoPE scaling type {other:?} is unsupported"
+            )));
+        }
+    };
+    if let Some(key) = config.keys().find(|key| !allowed.contains(&key.as_str())) {
+        return Err(Error::UnsupportedArchitecture(format!(
+            "dense Qwen RoPE scaling field {key:?} affects unsupported execution semantics"
+        )));
+    }
+    let numeric = |key: &str| {
+        config.get(key).and_then(|value| match value {
+            FloatOrString::Float(value) if value.is_finite() => Some(*value),
+            FloatOrString::String(value) => value.parse::<f32>().ok().filter(|v| v.is_finite()),
+            _ => None,
+        })
+    };
+    if matches!(rope_type, "linear" | "yarn")
+        && numeric("factor").is_none_or(|factor| factor <= 0.0)
+    {
+        return Err(Error::UnsupportedArchitecture(
+            "scaled dense-Qwen RoPE requires a finite positive factor".into(),
+        ));
+    }
+    if rope_type == "yarn"
+        && numeric("original_max_position_embeddings").is_none_or(|value| value <= 0.0)
+    {
+        return Err(Error::UnsupportedArchitecture(
+            "YaRN dense-Qwen RoPE requires positive original_max_position_embeddings".into(),
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) struct LoadedGguf {
     pub(crate) model: Model,
     pub(crate) eos_token_ids: Vec<u32>,
 }
 
-/// Loads a Qwen3 GGUF checkpoint.
+/// Loads a dense-Qwen GGUF checkpoint.
 ///
 /// Dense tensors and GGUF Q2_K, Q3_K, Q4_0, Q4_1, Q4_K, Q5_K, Q6_K, and Q8_0 tensors are
 /// supported. The quantized formats are consumed in the packed affine
 /// representation emitted by MLX's GGUF loader.
-pub fn load_qwen3_gguf(
+pub fn load_gguf(
     gguf_file: impl AsRef<Path>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<Model, Error> {
-    Ok(load_qwen3_gguf_with_metadata(gguf_file, stream, weights_stream)?.model)
+    Ok(load_gguf_with_metadata(gguf_file, stream, weights_stream)?.model)
 }
 
-pub(crate) fn load_qwen3_gguf_with_metadata(
+pub(crate) fn load_gguf_with_metadata(
     gguf_file: impl AsRef<Path>,
     stream: &Stream,
     weights_stream: &Stream,
-) -> Result<LoadedQwen3Gguf, Error> {
+) -> Result<LoadedGguf, Error> {
     let checkpoint = GgufCheckpoint::open(gguf_file)?;
     let metadata = gguf_metadata(&checkpoint);
-    load_qwen3_gguf_checkpoint(&checkpoint, metadata, None, stream, weights_stream)
+    load_gguf_checkpoint(&checkpoint, metadata, None, stream, weights_stream)
 }
 
-pub(crate) fn load_qwen3_gguf_checkpoint(
+pub(crate) fn load_gguf_checkpoint(
     checkpoint: &GgufCheckpoint,
     metadata: HashMap<String, GgufMetadataValue>,
     quantization: Option<WeightQuantization>,
     stream: &Stream,
     weights_stream: &Stream,
-) -> Result<LoadedQwen3Gguf, Error> {
+) -> Result<LoadedGguf, Error> {
     let architecture = gguf_string(&metadata, "general.architecture")?;
-    if !matches!(architecture.as_str(), "qwen3" | "qwen3moe") {
+    if !matches!(architecture.as_str(), "qwen2" | "qwen3" | "qwen3moe") {
         return Err(Error::UnsupportedArchitecture(format!(
-            "GGUF architecture {architecture:?}; this loader supports qwen3 and qwen3moe"
+            "GGUF architecture {architecture:?}; this loader supports qwen2, qwen3, and qwen3moe"
         )));
     }
     let is_moe = architecture == "qwen3moe";
@@ -1613,12 +2051,12 @@ pub(crate) fn load_qwen3_gguf_checkpoint(
         crate::api::ModelLoadOptions::default(),
     )
     .into_loader_result()?;
-    let translate = |name: &str| translate_qwen3_gguf_weight_name(name, is_moe);
+    let translate = |name: &str| translate_gguf_weight_name(name, is_moe);
     checkpoint
         .catalog()
         .translated_outputs(translate)
         .map_err(safemlx::error::IoError::from)?;
-    let mut args = qwen3_args_from_gguf_catalog(checkpoint, &metadata, &architecture, is_moe)?;
+    let mut args = config_from_gguf_catalog(checkpoint, &metadata, &architecture, is_moe)?;
     let mut configs = gguf_quantization_configs(checkpoint, translate)?;
     if is_moe {
         for layer in 0..args.num_hidden_layers {
@@ -1649,7 +2087,7 @@ pub(crate) fn load_qwen3_gguf_checkpoint(
             quantization.map(|value| (value, stream)),
             &config,
             &mut report,
-            |name, value| Ok((translate_gguf_weight_name(&name), value)),
+            |name, value| Ok((translate_gguf_weight_name(&name, false), value)),
         )?;
     } else {
         let mut materializer = checkpoint.materializer();
@@ -1661,7 +2099,7 @@ pub(crate) fn load_qwen3_gguf_checkpoint(
             for (name, value) in materializer.converted_tensor(physical_name)?.into_arrays() {
                 load_named_array_strict(
                     &mut model,
-                    translate_qwen3_gguf_weight_name(&name, true),
+                    translate_gguf_weight_name(&name, true),
                     value,
                     quantization.map(|value| (value, stream)),
                     &config,
@@ -1712,18 +2150,18 @@ pub(crate) fn load_qwen3_gguf_checkpoint(
     report.finish(&model, &config)?;
     model.copy_to_stream(stream)?;
     let eos_token_ids = crate::api::gguf_eos_token_ids(&metadata)?;
-    Ok(LoadedQwen3Gguf {
+    Ok(LoadedGguf {
         model,
         eos_token_ids,
     })
 }
 
-pub(crate) fn prepare_qwen3_gguf_checkpoint(
+pub(crate) fn prepare_gguf_checkpoint(
     checkpoint: &GgufCheckpoint,
     metadata: &HashMap<String, GgufMetadataValue>,
     architecture: &str,
     is_moe: bool,
-) -> Result<(ModelArgs, Vec<u32>), Error> {
+) -> Result<(DecoderConfig, Vec<u32>), Error> {
     let gguf_architecture = crate::api::GgufArchitecture::resolve(architecture)?;
     crate::api::structural::validate_gguf(
         gguf_architecture,
@@ -1732,12 +2170,12 @@ pub(crate) fn prepare_qwen3_gguf_checkpoint(
         crate::api::ModelLoadOptions::default(),
     )
     .into_loader_result()?;
-    let translate = |name: &str| translate_qwen3_gguf_weight_name(name, is_moe);
+    let translate = |name: &str| translate_gguf_weight_name(name, is_moe);
     checkpoint
         .catalog()
         .translated_outputs(translate)
         .map_err(safemlx::error::IoError::from)?;
-    let mut args = qwen3_args_from_gguf_catalog(checkpoint, metadata, architecture, is_moe)?;
+    let mut args = config_from_gguf_catalog(checkpoint, metadata, architecture, is_moe)?;
     let mut configs = gguf_quantization_configs(checkpoint, translate)?;
     if is_moe {
         for layer in 0..args.num_hidden_layers {
@@ -1756,14 +2194,15 @@ pub(crate) fn prepare_qwen3_gguf_checkpoint(
 }
 
 /// Parses the GGUF arguments shared by structural preflight and loading.
-pub(crate) fn qwen3_args_from_gguf_catalog(
+pub(crate) fn config_from_gguf_catalog(
     arrays: &impl GgufTensorNames,
     metadata: &HashMap<String, GgufMetadataValue>,
     architecture: &str,
     is_moe: bool,
-) -> Result<ModelArgs, Error> {
+) -> Result<DecoderConfig, Error> {
     let key = |suffix: &str| format!("{architecture}.{suffix}");
     let hidden_size = gguf_i32_catalog(metadata, &key("embedding_length"))?;
+    let num_hidden_layers = gguf_i32_catalog(metadata, &key("block_count"))?;
     let num_attention_heads = gguf_i32_catalog(metadata, &key("attention.head_count"))?;
     if num_attention_heads <= 0 {
         return Err(Error::UnsupportedArchitecture(format!(
@@ -1782,6 +2221,43 @@ pub(crate) fn qwen3_args_from_gguf_catalog(
             Error::UnsupportedArchitecture("GGUF attention key length exceeds i32".into())
         })?
         .unwrap_or(hidden_size / num_attention_heads);
+    if let Some(value_head_dim) = gguf_optional_i64(metadata, &key("attention.value_length"))? {
+        if value_head_dim != i64::from(head_dim) {
+            return Err(Error::UnsupportedArchitecture(format!(
+                "GGUF attention value length {value_head_dim} does not match key/head length {head_dim}"
+            )));
+        }
+    }
+    if let Some(rotary_dim) = gguf_optional_i64(metadata, &key("rope.dimension_count"))? {
+        if rotary_dim != i64::from(head_dim) {
+            return Err(Error::UnsupportedArchitecture(format!(
+                "GGUF rotary dimension count {rotary_dim} does not match the full head dimension {head_dim}"
+            )));
+        }
+    }
+    if matches!(
+        gguf_optional_bool(metadata, &key("attention.causal"))?,
+        Some(false)
+    ) {
+        return Err(Error::UnsupportedArchitecture(
+            "dense Qwen GGUF checkpoints must use causal attention".into(),
+        ));
+    }
+    if let Some(scale) = gguf_optional_f32(metadata, &key("attention.scale"))? {
+        let expected = 1.0 / (head_dim as f32).sqrt();
+        if !scale.is_finite() || (scale - expected).abs() > expected.abs().max(1.0) * 1e-6 {
+            return Err(Error::UnsupportedArchitecture(format!(
+                "GGUF attention scale {scale} is unsupported; dense Qwen requires {expected} for head dimension {head_dim}"
+            )));
+        }
+    }
+    if let Some(activation) = gguf_optional_string(metadata, &key("hidden_activation"))? {
+        if activation != "silu" {
+            return Err(Error::UnsupportedArchitecture(format!(
+                "GGUF hidden activation {activation:?} is unsupported; dense Qwen requires \"silu\""
+            )));
+        }
+    }
     let vocab_size = match metadata
         .get("tokenizer.ggml.tokens")
         .and_then(GgufMetadataValue::as_strings)
@@ -1797,10 +2273,22 @@ pub(crate) fn qwen3_args_from_gguf_catalog(
         None => gguf_i32_catalog(metadata, &key("vocab_size"))?,
     };
 
-    let args = ModelArgs {
-        model_type: if is_moe { "qwen3_moe" } else { "qwen3" }.to_string(),
+    let (use_sliding_window, sliding_window, max_window_layers) = if architecture == "qwen2" {
+        qwen2_gguf_sliding_config(metadata, architecture, num_hidden_layers)?
+    } else {
+        (false, None, None)
+    };
+    let args = DecoderConfig {
+        model_type: if architecture == "qwen2" {
+            "qwen2"
+        } else if is_moe {
+            "qwen3_moe"
+        } else {
+            "qwen3"
+        }
+        .to_string(),
         hidden_size,
-        num_hidden_layers: gguf_i32_catalog(metadata, &key("block_count"))?,
+        num_hidden_layers,
         intermediate_size: if is_moe {
             gguf_optional_i64(metadata, &key("feed_forward_length"))?
                 .map(i32::try_from)
@@ -1821,6 +2309,13 @@ pub(crate) fn qwen3_args_from_gguf_catalog(
         head_dim,
         tie_word_embeddings: !arrays.contains_gguf_tensor("output.weight"),
         rope_scaling: gguf_rope_scaling(metadata, architecture)?,
+        hidden_act: default_hidden_act(),
+        attention_dropout: 0.0,
+        attention_bias: (architecture == "qwen2").then_some(true),
+        mlp_bias: Some(false),
+        use_sliding_window,
+        sliding_window,
+        max_window_layers,
         quantization: None,
         quantization_config: None,
         quantized_weights: None,
@@ -1846,6 +2341,68 @@ pub(crate) fn qwen3_args_from_gguf_catalog(
     Ok(args)
 }
 
+fn qwen2_gguf_sliding_config(
+    metadata: &HashMap<String, GgufMetadataValue>,
+    architecture: &str,
+    layers: i32,
+) -> Result<(bool, Option<i32>, Option<i32>), Error> {
+    let window_key = format!("{architecture}.attention.sliding_window");
+    let window = gguf_optional_i64(metadata, &window_key)?
+        .map(i32::try_from)
+        .transpose()
+        .map_err(|_| {
+            Error::UnsupportedArchitecture("Qwen2 GGUF sliding window exceeds i32".into())
+        })?;
+    let pattern_key = format!("{architecture}.attention.sliding_window_pattern");
+    let pattern = match metadata.get(&pattern_key) {
+        None => None,
+        Some(GgufMetadataValue::Array(safemlx::ops::GgufMetadataArray::Bool(values))) => {
+            Some(values.as_slice())
+        }
+        Some(_) => {
+            return Err(Error::UnsupportedArchitecture(format!(
+                "GGUF metadata key {pattern_key:?} must be a boolean array"
+            )));
+        }
+    };
+    let Some(window) = window else {
+        if pattern.is_some_and(|pattern| pattern.iter().any(|value| *value)) {
+            return Err(Error::UnsupportedArchitecture(format!(
+                "GGUF metadata {pattern_key:?} enables sliding layers without {window_key:?}"
+            )));
+        }
+        return Ok((false, None, None));
+    };
+    if window <= 0 {
+        return Err(Error::UnsupportedArchitecture(format!(
+            "Qwen2 GGUF sliding window must be positive, got {window}"
+        )));
+    }
+    let first = match pattern {
+        None => 0,
+        Some(pattern) => {
+            if pattern.len() != layers as usize {
+                return Err(Error::UnsupportedArchitecture(format!(
+                    "Qwen2 GGUF sliding-window pattern has {} entries for {layers} layers",
+                    pattern.len()
+                )));
+            }
+            let Some(first) = pattern.iter().position(|value| *value) else {
+                return Ok((false, None, None));
+            };
+            if pattern[first..].iter().any(|value| !*value) {
+                return Err(Error::UnsupportedArchitecture(
+                    "Qwen2 GGUF sliding-window pattern must be a full-attention prefix followed by a sliding-attention suffix".into(),
+                ));
+            }
+            i32::try_from(first).map_err(|_| {
+                Error::UnsupportedArchitecture("Qwen2 GGUF layer index exceeds i32".into())
+            })?
+        }
+    };
+    Ok((true, Some(window), Some(first)))
+}
+
 fn gguf_rope_scaling(
     metadata: &HashMap<String, GgufMetadataValue>,
     architecture: &str,
@@ -1860,7 +2417,7 @@ fn gguf_rope_scaling(
             let factor_key = format!("{architecture}.rope.scaling.factor");
             let factor = gguf_optional_f32(metadata, &factor_key)?.ok_or_else(|| {
                 Error::UnsupportedArchitecture(
-                    "linear GGUF RoPE scaling is missing qwen3.rope.scaling.factor".into(),
+                    format!("linear GGUF RoPE scaling is missing {factor_key}").into(),
                 )
             })?;
             Ok(Some(HashMap::from([
@@ -1871,17 +2428,54 @@ fn gguf_rope_scaling(
                 ("factor".to_string(), FloatOrString::Float(factor)),
             ])))
         }
+        "yarn" => {
+            // GGUF uses architecture-scoped names which differ from the
+            // Hugging Face map consumed by `initialize_rope`.
+            for suffix in ["yarn_ext_factor", "yarn_attn_factor", "yarn_log_multiplier"] {
+                let key = format!("{architecture}.rope.scaling.{suffix}");
+                if metadata.contains_key(&key) {
+                    return Err(Error::UnsupportedArchitecture(format!(
+                        "GGUF YaRN field {key:?} changes attention scaling semantics that the dense-Qwen decoder does not implement"
+                    )));
+                }
+            }
+            let factor = gguf_f32(metadata, &format!("{architecture}.rope.scaling.factor"))?;
+            let original = gguf_i32_catalog(
+                metadata,
+                &format!("{architecture}.rope.scaling.original_context_length"),
+            )? as f32;
+            let beta_fast = gguf_optional_f32(
+                metadata,
+                &format!("{architecture}.rope.scaling.yarn_beta_fast"),
+            )?
+            .unwrap_or(32.0);
+            let beta_slow = gguf_optional_f32(
+                metadata,
+                &format!("{architecture}.rope.scaling.yarn_beta_slow"),
+            )?
+            .unwrap_or(1.0);
+            Ok(Some(HashMap::from([
+                (
+                    "rope_type".to_string(),
+                    FloatOrString::String("yarn".to_string()),
+                ),
+                ("factor".to_string(), FloatOrString::Float(factor)),
+                (
+                    "original_max_position_embeddings".to_string(),
+                    FloatOrString::Float(original),
+                ),
+                ("beta_fast".to_string(), FloatOrString::Float(beta_fast)),
+                ("beta_slow".to_string(), FloatOrString::Float(beta_slow)),
+                ("truncate".to_string(), FloatOrString::Bool(false)),
+            ])))
+        }
         other => Err(Error::UnsupportedArchitecture(format!(
-            "GGUF RoPE scaling type {other:?} is not supported by the Qwen3 GGUF loader"
+            "GGUF RoPE scaling type {other:?} is not supported by the dense-Qwen GGUF loader"
         ))),
     }
 }
 
-pub(crate) fn translate_gguf_weight_name(name: &str) -> String {
-    translate_qwen3_gguf_weight_name(name, false)
-}
-
-pub(crate) fn translate_qwen3_gguf_weight_name(name: &str, is_moe: bool) -> String {
+pub(crate) fn translate_gguf_weight_name(name: &str, is_moe: bool) -> String {
     const ROOTS: [(&str, &str); 3] = [
         ("token_embd", "model.embed_tokens"),
         ("output_norm", "model.norm"),
@@ -2015,6 +2609,19 @@ fn gguf_optional_f32(
     }
 }
 
+fn gguf_optional_bool(
+    metadata: &HashMap<String, GgufMetadataValue>,
+    key: &str,
+) -> Result<Option<bool>, Error> {
+    match metadata.get(key) {
+        Some(GgufMetadataValue::Bool(value)) => Ok(Some(*value)),
+        Some(_) => Err(Error::UnsupportedArchitecture(format!(
+            "GGUF metadata key {key:?} has the wrong type"
+        ))),
+        None => Ok(None),
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 /// Hugging Face safetensors index file.
 pub struct WeightMap {
@@ -2024,19 +2631,19 @@ pub struct WeightMap {
     pub weight_map: HashMap<String, String>,
 }
 
-/// Loads a Qwen3 model and safetensors weights from a model directory.
-pub fn load_qwen3_model(
+/// Loads a dense-Qwen model and SafeTensors weights from a model directory.
+pub fn load_safetensors(
     model_dir: impl AsRef<Path>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<Model, Error> {
     let model_dir = model_dir.as_ref();
+    let model_args = load_config(model_dir)?;
     crate::api::structural::validate_safetensors_load_path(
-        crate::api::ModelKind::Qwen3,
+        model_args.model_kind(),
         model_dir,
         crate::api::ModelLoadOptions::default(),
     )?;
-    let model_args = get_qwen3_model_args(model_dir)?;
     let mut model = Model::new(model_args, stream)?;
 
     load_safetensors_dir_lenient(&mut model, model_dir, weights_stream)?;
@@ -2045,26 +2652,30 @@ pub fn load_qwen3_model(
     Ok(model)
 }
 
-/// Loads a dense Qwen3 checkpoint while quantizing matrices tensor-by-tensor.
-pub fn load_qwen3_model_quantized(
+/// Loads a dense-Qwen checkpoint while quantizing matrices tensor-by-tensor.
+pub fn load_safetensors_quantized(
     model_dir: impl AsRef<Path>,
     quantization: WeightQuantization,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<Model, Error> {
     let model_dir = model_dir.as_ref();
+    let mut model_args = load_config(model_dir)?;
     crate::api::structural::validate_safetensors_load_path(
-        crate::api::ModelKind::Qwen3,
+        model_args.model_kind(),
         model_dir,
         crate::api::ModelLoadOptions::with_quantization(quantization),
     )?;
-    let mut model_args = get_qwen3_model_args(model_dir)?;
+    let architecture_name = match model_args.architecture() {
+        Architecture::Qwen2 => "Qwen2/Qwen2.5",
+        Architecture::Qwen3 => "Qwen3",
+    };
     if !crate::runtime::checkpoint::quantization::should_quantize_on_load(
-        "Qwen3",
+        architecture_name,
         model_args.weight_quantization(),
         quantization,
     )? {
-        return load_qwen3_model(model_dir, stream, weights_stream);
+        return load_safetensors(model_dir, stream, weights_stream);
     }
     model_args.quantization = Some(quantization);
     let mut model = Model::new(model_args, stream)?;
@@ -2124,7 +2735,7 @@ where
     }
 }
 
-/// Qwen3 token generation iterator.
+/// Dense-Qwen token generation iterator.
 pub type Generate<'a, C, S = crate::runtime::generation::sampler::DefaultSampler> =
     common::generation::Generate<'a, Model, Vec<Option<C>>, S>;
 
@@ -2133,7 +2744,7 @@ mod tests {
     use std::collections::{HashMap, HashSet};
 
     use safemlx::{
-        module::ModuleParameters,
+        module::{Module, ModuleParameters},
         ops::indexing::{NewAxis, TryIndexOp},
         ops::GgufMetadataValue,
         transforms::eval,
@@ -2141,7 +2752,7 @@ mod tests {
     };
 
     use crate::{
-        architectures::qwen::qwen3::model::{load_qwen3_model, load_qwen3_tokenizer},
+        architectures::qwen::dense::{load_safetensors, load_tokenizer},
         nn::generation::CausalLm,
         runtime::cache::{ConcatKeyValueCache, KeyValueCache},
         runtime::checkpoint::quantization::AffineQuantization,
@@ -2149,8 +2760,8 @@ mod tests {
 
     const CACHED_TEST_MODEL_DIR: &str = "../cache/Qwen3-4B-bf16";
 
-    fn tiny_args() -> super::ModelArgs {
-        super::ModelArgs {
+    fn tiny_args() -> super::DecoderConfig {
+        super::DecoderConfig {
             model_type: "qwen3".into(),
             hidden_size: 32,
             num_hidden_layers: 1,
@@ -2164,6 +2775,13 @@ mod tests {
             head_dim: 32,
             tie_word_embeddings: true,
             rope_scaling: None,
+            hidden_act: "silu".into(),
+            attention_dropout: 0.0,
+            attention_bias: Some(false),
+            mlp_bias: Some(false),
+            use_sliding_window: false,
+            sliding_window: None,
+            max_window_layers: None,
             quantization: None,
             quantization_config: None,
             quantized_weights: None,
@@ -2175,22 +2793,185 @@ mod tests {
         }
     }
 
+    fn tiny_qwen2_args() -> super::DecoderConfig {
+        let mut args = tiny_args();
+        args.model_type = "qwen2".into();
+        args.hidden_size = 8;
+        args.num_hidden_layers = 4;
+        args.intermediate_size = 16;
+        args.num_attention_heads = 4;
+        args.num_key_value_heads = 2;
+        args.head_dim = 2;
+        args.attention_bias = None;
+        args
+    }
+
+    fn tiny_qwen2_config() -> serde_json::Value {
+        serde_json::json!({
+            "architectures": ["Qwen2ForCausalLM"],
+            "model_type": "qwen2",
+            "hidden_size": 8,
+            "num_hidden_layers": 2,
+            "intermediate_size": 16,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 2,
+            "rms_norm_eps": 1e-6,
+            "vocab_size": 32,
+            "max_position_embeddings": 128,
+            "rope_theta": 10000.0,
+            "tie_word_embeddings": false
+        })
+    }
+
+    #[test]
+    fn parses_qwen25_style_config_and_derives_head_dimension() {
+        let args = super::config_from_hf_value(&serde_json::json!({
+            "architectures": ["Qwen2ForCausalLM"],
+            "model_type": "qwen2",
+            "hidden_size": 3584,
+            "num_hidden_layers": 28,
+            "intermediate_size": 18944,
+            "num_attention_heads": 28,
+            "num_key_value_heads": 4,
+            "rms_norm_eps": 1e-6,
+            "vocab_size": 152064,
+            "max_position_embeddings": 32768,
+            "rope_theta": 1000000.0,
+            "tie_word_embeddings": false,
+            "use_sliding_window": false,
+            "sliding_window": 131072,
+            "max_window_layers": 28
+        }))
+        .unwrap();
+        assert_eq!(args.architecture(), super::Architecture::Qwen2);
+        assert_eq!(args.head_dim, 128);
+        assert!(args.qkv_bias());
+        assert!(!args.qk_norm());
+    }
+
+    #[test]
+    fn qwen2_accepts_supported_rope_scaling_and_rejects_semantic_drift() {
+        let mut linear = tiny_qwen2_config();
+        linear["rope_scaling"] = serde_json::json!({
+            "rope_type": "linear",
+            "factor": 2.0
+        });
+        assert!(super::config_from_hf_value(&linear).is_ok());
+
+        let mut yarn = tiny_qwen2_config();
+        yarn["rope_scaling"] = serde_json::json!({
+            "type": "yarn",
+            "factor": 4.0,
+            "original_max_position_embeddings": 128,
+            "beta_fast": 32.0,
+            "beta_slow": 1.0,
+            "truncate": false
+        });
+        assert!(super::config_from_hf_value(&yarn).is_ok());
+
+        let mut dynamic = tiny_qwen2_config();
+        dynamic["rope_scaling"] = serde_json::json!({
+            "rope_type": "dynamic",
+            "factor": 2.0
+        });
+        assert!(super::config_from_hf_value(&dynamic).is_err());
+
+        let mut unknown_semantics = tiny_qwen2_config();
+        unknown_semantics["rope_scaling"] = serde_json::json!({
+            "rope_type": "linear",
+            "factor": 2.0,
+            "attention_factor": 1.1
+        });
+        assert!(super::config_from_hf_value(&unknown_semantics).is_err());
+    }
+
+    #[test]
+    fn qwen2_builds_biased_gqa_without_qk_norm_parameters() {
+        let ctx = safemlx::ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
+        let model = super::Model::new(tiny_qwen2_args(), ctx.stream()).unwrap();
+        let params = model.parameters().flatten();
+        assert_eq!(
+            params["model.layers.0.self_attn.q_proj.weight"].shape(),
+            &[8, 8]
+        );
+        assert_eq!(
+            params["model.layers.0.self_attn.k_proj.weight"].shape(),
+            &[4, 8]
+        );
+        assert_eq!(params["model.layers.0.self_attn.v_proj.bias"].shape(), &[4]);
+        assert!(params.contains_key("model.layers.0.self_attn.q_proj.bias"));
+        assert!(params.contains_key("model.layers.0.self_attn.k_proj.bias"));
+        assert!(!params.contains_key("model.layers.0.self_attn.q_norm.weight"));
+        assert!(!params.contains_key("model.layers.0.self_attn.k_norm.weight"));
+    }
+
+    #[test]
+    fn qwen2_query_bias_matches_independent_affine_reference() {
+        let ctx = safemlx::ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
+        let stream = ctx.stream();
+        let mut attention = super::Attention::new(&tiny_qwen2_args(), stream).unwrap();
+        let bias = [0.25_f32, -0.5, 1.5, 2.0, -1.0, 0.75, 3.0, -2.5];
+        {
+            let mut parameters = attention.parameters_mut().flatten();
+            let weight = parameters.get_mut("q_proj.weight").unwrap();
+            **weight = safemlx::ops::zeros_dtype(weight.shape(), weight.dtype(), stream).unwrap();
+            **parameters.get_mut("q_proj.bias").unwrap() = Array::from_slice(&bias, &[8]);
+        }
+        let input = safemlx::ops::zeros_dtype(&[2, 3, 8], safemlx::Dtype::Float32, stream).unwrap();
+        let actual = attention.q_proj.forward(&input, stream).unwrap();
+        let expected_values = (0..6).flat_map(|_| bias).collect::<Vec<_>>();
+        let expected = Array::from_slice(&expected_values, &[2, 3, 8]);
+        assert!(actual
+            .all_close(&expected, Some(0.0), Some(0.0), None, stream)
+            .unwrap()
+            .item::<bool>(stream));
+    }
+
+    #[test]
+    fn qwen2_cache_layout_preserves_full_and_bounds_sliding_layers() {
+        let ctx = safemlx::ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
+        let mut args = tiny_qwen2_args();
+        args.use_sliding_window = true;
+        args.sliding_window = Some(7);
+        args.max_window_layers = Some(2);
+        let model = super::Model::new(args, ctx.stream()).unwrap();
+        let mut cache = model.new_cache();
+        assert_eq!(cache.len(), 4);
+        assert_eq!(cache[0].as_ref().unwrap().max_size(), None);
+        assert_eq!(cache[1].as_ref().unwrap().max_size(), None);
+        assert_eq!(cache[2].as_ref().unwrap().max_size(), Some(7));
+        assert_eq!(cache[3].as_ref().unwrap().max_size(), Some(7));
+
+        let sliding = cache[2].as_mut().unwrap();
+        let first = Array::from_slice(&[0.0_f32; 6], &[1, 1, 3, 2]);
+        sliding
+            .update_and_fetch(first.clone(), first, ctx.stream())
+            .unwrap();
+        let second = Array::from_slice(&[0.0_f32; 12], &[1, 1, 6, 2]);
+        let (visible, _) = sliding
+            .update_and_fetch(second.clone(), second, ctx.stream())
+            .unwrap();
+        assert_eq!(visible.dim(-2), 9);
+        assert_eq!(sliding.offset(), 9);
+        assert_eq!(sliding.retained_arrays()[0].dim(-2), 6);
+    }
+
     #[test]
     fn translates_gguf_qwen3_weight_names() {
         assert_eq!(
-            super::translate_gguf_weight_name("blk.3.attn_q.weight"),
+            super::translate_gguf_weight_name("blk.3.attn_q.weight", false),
             "model.layers.3.self_attn.q_proj.weight"
         );
         assert_eq!(
-            super::translate_gguf_weight_name("blk.3.attn_q_norm.weight"),
+            super::translate_gguf_weight_name("blk.3.attn_q_norm.weight", false),
             "model.layers.3.self_attn.q_norm.weight"
         );
         assert_eq!(
-            super::translate_gguf_weight_name("blk.3.attn_k_norm.weight"),
+            super::translate_gguf_weight_name("blk.3.attn_k_norm.weight", false),
             "model.layers.3.self_attn.k_norm.weight"
         );
         assert_eq!(
-            super::translate_gguf_weight_name("token_embd.weight"),
+            super::translate_gguf_weight_name("token_embd.weight", false),
             "model.embed_tokens.weight"
         );
     }
@@ -2198,15 +2979,15 @@ mod tests {
     #[test]
     fn translates_qwen3_moe_experts_and_mixed_affine_shapes() {
         assert_eq!(
-            super::translate_qwen3_gguf_weight_name("blk.3.ffn_gate_inp.weight", true),
+            super::translate_gguf_weight_name("blk.3.ffn_gate_inp.weight", true),
             "model.layers.3.mlp.gate.weight"
         );
         assert_eq!(
-            super::translate_qwen3_gguf_weight_name("blk.3.ffn_gate_exps.scales", true),
+            super::translate_gguf_weight_name("blk.3.ffn_gate_exps.scales", true),
             "model.layers.3.mlp.experts.gate_proj_scales"
         );
         assert_eq!(
-            super::translate_qwen3_gguf_weight_name("blk.3.ffn_down_exps.weight", true),
+            super::translate_gguf_weight_name("blk.3.ffn_down_exps.weight", true),
             "model.layers.3.mlp.experts.down_proj"
         );
         assert_eq!(
@@ -2300,20 +3081,30 @@ mod tests {
     }
 
     #[test]
-    fn mixed_quantization_builds_only_selected_qwen3_parameters() {
+    fn mixed_quantization_builds_only_selected_dense_qwen_parameters() {
         let ctx = safemlx::ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
-        let mut args = tiny_args();
-        args.quantization = Some(AffineQuantization::new(32, 4).unwrap().into());
-        args.quantized_weights = Some(HashSet::from([
-            "model.layers.0.self_attn.q_proj.weight".to_string()
-        ]));
+        let mut qwen2_args = tiny_qwen2_args();
+        qwen2_args.hidden_size = 32;
+        qwen2_args.intermediate_size = 64;
+        qwen2_args.head_dim = 8;
+        for mut args in [tiny_args(), qwen2_args] {
+            let group_size = args.hidden_size;
+            args.quantization = Some(AffineQuantization::new(group_size, 4).unwrap().into());
+            args.quantized_weights = Some(HashSet::from([
+                "model.layers.0.self_attn.q_proj.weight".to_string(),
+            ]));
 
-        let model = super::Model::new(args, ctx.stream()).unwrap();
-        let params = model.parameters().flatten();
-        assert!(params.contains_key("model.layers.0.self_attn.q_proj.inner.weight"));
-        assert!(params.contains_key("model.layers.0.self_attn.q_proj.scales"));
-        assert!(params.contains_key("model.layers.0.self_attn.k_proj.weight"));
-        assert!(!params.contains_key("model.layers.0.self_attn.k_proj.scales"));
+            let model = super::Model::new(args.clone(), ctx.stream()).unwrap();
+            let params = model.parameters().flatten();
+            assert!(params.contains_key("model.layers.0.self_attn.q_proj.inner.weight"));
+            assert!(params.contains_key("model.layers.0.self_attn.q_proj.scales"));
+            assert!(params.contains_key("model.layers.0.self_attn.k_proj.weight"));
+            assert!(!params.contains_key("model.layers.0.self_attn.k_proj.scales"));
+            assert_eq!(
+                params.contains_key("model.layers.0.self_attn.q_proj.inner.bias"),
+                args.architecture() == super::Architecture::Qwen2
+            );
+        }
     }
 
     #[test]
@@ -2321,7 +3112,7 @@ mod tests {
         let metadata = HashMap::from([
             (
                 "qwen3.embedding_length".into(),
-                GgufMetadataValue::Uint32(1024),
+                GgufMetadataValue::Uint32(2048),
             ),
             ("qwen3.block_count".into(), GgufMetadataValue::Uint32(28)),
             (
@@ -2361,13 +3152,107 @@ mod tests {
                 ])),
             ),
         ]);
-        let args = super::qwen3_args_from_gguf_catalog(&HashMap::new(), &metadata, "qwen3", false)
-            .unwrap();
+        let args =
+            super::config_from_gguf_catalog(&HashMap::new(), &metadata, "qwen3", false).unwrap();
 
         assert_eq!(args.head_dim, 128);
         assert_eq!(args.num_key_value_heads, 8);
         assert_eq!(args.vocab_size, 32);
         assert!(args.tie_word_embeddings);
+    }
+
+    #[test]
+    fn parses_qwen2_gguf_metadata_as_distinct_biased_architecture() {
+        let metadata = HashMap::from([
+            (
+                "qwen2.embedding_length".into(),
+                GgufMetadataValue::Uint32(16),
+            ),
+            ("qwen2.block_count".into(), GgufMetadataValue::Uint32(2)),
+            (
+                "qwen2.feed_forward_length".into(),
+                GgufMetadataValue::Uint32(32),
+            ),
+            (
+                "qwen2.attention.head_count".into(),
+                GgufMetadataValue::Uint32(4),
+            ),
+            (
+                "qwen2.attention.head_count_kv".into(),
+                GgufMetadataValue::Uint32(2),
+            ),
+            (
+                "qwen2.attention.key_length".into(),
+                GgufMetadataValue::Uint32(4),
+            ),
+            (
+                "qwen2.attention.value_length".into(),
+                GgufMetadataValue::Uint32(4),
+            ),
+            (
+                "qwen2.rope.dimension_count".into(),
+                GgufMetadataValue::Uint32(4),
+            ),
+            (
+                "qwen2.attention.causal".into(),
+                GgufMetadataValue::Bool(true),
+            ),
+            (
+                "qwen2.attention.scale".into(),
+                GgufMetadataValue::Float32(0.5),
+            ),
+            (
+                "qwen2.hidden_activation".into(),
+                GgufMetadataValue::String("silu".into()),
+            ),
+            (
+                "qwen2.attention.layer_norm_rms_epsilon".into(),
+                GgufMetadataValue::Float32(1e-6),
+            ),
+            (
+                "qwen2.context_length".into(),
+                GgufMetadataValue::Uint32(128),
+            ),
+            (
+                "qwen2.rope.freq_base".into(),
+                GgufMetadataValue::Float32(1_000_000.0),
+            ),
+            ("qwen2.vocab_size".into(), GgufMetadataValue::Uint32(64)),
+            (
+                "qwen2.attention.sliding_window".into(),
+                GgufMetadataValue::Uint32(8),
+            ),
+            (
+                "qwen2.attention.sliding_window_pattern".into(),
+                GgufMetadataValue::Array(safemlx::ops::GgufMetadataArray::Bool(vec![false, true])),
+            ),
+        ]);
+        let args =
+            super::config_from_gguf_catalog(&HashMap::new(), &metadata, "qwen2", false).unwrap();
+        assert_eq!(args.model_type, "qwen2");
+        assert_eq!(args.architecture(), super::Architecture::Qwen2);
+        assert!(args.qkv_bias());
+        assert!(!args.qk_norm());
+        assert_eq!(args.num_key_value_heads, 2);
+        assert_eq!(args.sliding_window_for_layer(0), None);
+        assert_eq!(args.sliding_window_for_layer(1), Some(8));
+
+        for (key, value) in [
+            ("qwen2.attention.value_length", GgufMetadataValue::Uint32(8)),
+            ("qwen2.rope.dimension_count", GgufMetadataValue::Uint32(2)),
+            ("qwen2.attention.causal", GgufMetadataValue::Bool(false)),
+            ("qwen2.attention.scale", GgufMetadataValue::Float32(0.25)),
+            (
+                "qwen2.hidden_activation",
+                GgufMetadataValue::String("gelu".into()),
+            ),
+        ] {
+            let mut invalid = metadata.clone();
+            invalid.insert(key.into(), value);
+            assert!(
+                super::config_from_gguf_catalog(&HashMap::new(), &invalid, "qwen2", false).is_err()
+            );
+        }
     }
 
     #[test]
@@ -2451,9 +3336,173 @@ mod tests {
         ]);
 
         let fixture = crate::test_utils::SyntheticGguf::dense(&arrays, &metadata);
-        let loaded = super::load_qwen3_gguf_with_metadata(fixture.path(), stream, stream).unwrap();
+        let loaded = super::load_gguf_with_metadata(fixture.path(), stream, stream).unwrap();
         assert_eq!(loaded.model.args.head_dim, 32);
         assert_eq!(loaded.eos_token_ids, vec![1]);
+    }
+
+    #[test]
+    fn qwen2_safetensors_layout_and_gguf_loading_are_numerically_identical() {
+        let ctx = safemlx::ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
+        let stream = ctx.stream();
+        let mut parity_args = tiny_qwen2_args();
+        parity_args.hidden_size = 32;
+        parity_args.intermediate_size = 64;
+        parity_args.head_dim = 8;
+        let mut source = super::Model::new(parity_args, stream).unwrap();
+        for (index, parameter) in source.parameters_mut().flatten().values_mut().enumerate() {
+            **parameter = Array::full::<f32>(
+                parameter.shape(),
+                Array::from_f32((index + 1) as f32 * 0.0025),
+                stream,
+            )
+            .unwrap();
+        }
+        let safetensors_dir = tempfile::tempdir().unwrap();
+        let source_parameters = source.parameters().flatten();
+        Array::save_safetensors(
+            source_parameters
+                .iter()
+                .map(|(name, value)| (name.as_ref(), *value)),
+            None,
+            safetensors_dir.path().join("model.safetensors"),
+        )
+        .unwrap();
+        let args = &source.args;
+        std::fs::write(
+            safetensors_dir.path().join("config.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "architectures": ["Qwen2ForCausalLM"],
+                "model_type": "qwen2",
+                "hidden_size": args.hidden_size,
+                "num_hidden_layers": args.num_hidden_layers,
+                "intermediate_size": args.intermediate_size,
+                "num_attention_heads": args.num_attention_heads,
+                "num_key_value_heads": args.num_key_value_heads,
+                "rms_norm_eps": args.rms_norm_eps,
+                "vocab_size": args.vocab_size,
+                "max_position_embeddings": args.max_position_embeddings,
+                "rope_theta": args.rope_theta,
+                "head_dim": args.head_dim,
+                "tie_word_embeddings": args.tie_word_embeddings,
+                "attention_bias": true
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let mut loaded_safetensors =
+            super::load_safetensors(safetensors_dir.path(), stream, stream).unwrap();
+        let quantized = super::load_safetensors_quantized(
+            safetensors_dir.path(),
+            AffineQuantization::new(32, 4).unwrap().into(),
+            stream,
+            stream,
+        )
+        .unwrap();
+        let quantized_parameters = quantized.parameters().flatten();
+        assert!(quantized_parameters.contains_key("model.layers.0.self_attn.q_proj.inner.weight"));
+        assert!(quantized_parameters.contains_key("model.layers.0.self_attn.q_proj.inner.bias"));
+
+        let arrays = source
+            .parameters()
+            .flatten()
+            .into_iter()
+            .map(|(name, value)| {
+                let name = name
+                    .replace("model.layers.", "blk.")
+                    .replace("self_attn.q_proj", "attn_q")
+                    .replace("self_attn.k_proj", "attn_k")
+                    .replace("self_attn.v_proj", "attn_v")
+                    .replace("self_attn.o_proj", "attn_output")
+                    .replace("input_layernorm", "attn_norm")
+                    .replace("post_attention_layernorm", "ffn_norm")
+                    .replace("mlp.gate_proj", "ffn_gate")
+                    .replace("mlp.down_proj", "ffn_down")
+                    .replace("mlp.up_proj", "ffn_up")
+                    .replace("model.embed_tokens", "token_embd")
+                    .replace("model.norm", "output_norm");
+                (name, value.clone())
+            })
+            .collect();
+        let metadata = HashMap::from([
+            (
+                "general.architecture".into(),
+                GgufMetadataValue::String("qwen2".into()),
+            ),
+            (
+                "qwen2.embedding_length".into(),
+                GgufMetadataValue::Uint32(32),
+            ),
+            ("qwen2.block_count".into(), GgufMetadataValue::Uint32(4)),
+            (
+                "qwen2.feed_forward_length".into(),
+                GgufMetadataValue::Uint32(64),
+            ),
+            (
+                "qwen2.attention.head_count".into(),
+                GgufMetadataValue::Uint32(4),
+            ),
+            (
+                "qwen2.attention.head_count_kv".into(),
+                GgufMetadataValue::Uint32(2),
+            ),
+            (
+                "qwen2.attention.key_length".into(),
+                GgufMetadataValue::Uint32(8),
+            ),
+            (
+                "qwen2.attention.layer_norm_rms_epsilon".into(),
+                GgufMetadataValue::Float32(1e-6),
+            ),
+            (
+                "qwen2.context_length".into(),
+                GgufMetadataValue::Uint32(128),
+            ),
+            (
+                "qwen2.rope.freq_base".into(),
+                GgufMetadataValue::Float32(1_000_000.0),
+            ),
+            (
+                "tokenizer.ggml.tokens".into(),
+                GgufMetadataValue::Array(safemlx::ops::GgufMetadataArray::String(vec![
+                    "token"
+                        .into();
+                    32
+                ])),
+            ),
+        ]);
+        let fixture = crate::test_utils::SyntheticGguf::dense(&arrays, &metadata);
+        let mut loaded = super::load_gguf_with_metadata(fixture.path(), stream, stream)
+            .unwrap()
+            .model;
+
+        let tokens = Array::from_slice(&[1_i32, 2, 3], &[1, 3]);
+        let mut safetensors_cache = loaded_safetensors.new_cache();
+        let mut loaded_cache = loaded.new_cache();
+        let safetensors_logits = loaded_safetensors
+            .forward(
+                super::ModelInput {
+                    inputs: &tokens,
+                    mask: None,
+                    cache: &mut safetensors_cache,
+                },
+                stream,
+            )
+            .unwrap();
+        let loaded_logits = loaded
+            .forward(
+                super::ModelInput {
+                    inputs: &tokens,
+                    mask: None,
+                    cache: &mut loaded_cache,
+                },
+                stream,
+            )
+            .unwrap();
+        assert!(safetensors_logits
+            .all_close(&loaded_logits, Some(1e-5), Some(1e-5), None, stream)
+            .unwrap()
+            .item::<bool>(stream));
     }
 
     #[test]
@@ -2563,7 +3612,7 @@ mod tests {
         assert_eq!(checkpoint.catalog().shards().len(), 2);
         assert_eq!(checkpoint.catalog().physical_tensor_count(), arrays.len());
 
-        let loaded = super::load_qwen3_gguf_with_metadata(fixture.path(), stream, stream).unwrap();
+        let loaded = super::load_gguf_with_metadata(fixture.path(), stream, stream).unwrap();
         assert_eq!(loaded.model.model_type(), "qwen3_moe");
         let parameters = loaded.model.parameters().flatten();
         let paired = &parameters["model.layers.0.mlp.experts.gate_up_proj"];
@@ -2584,7 +3633,7 @@ mod tests {
         let stream = ctx.stream();
         let weights_ctx =
             safemlx::ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
-        let mut model = super::load_qwen3_gguf(&gguf_file, stream, weights_ctx.stream()).unwrap();
+        let mut model = super::load_gguf(&gguf_file, stream, weights_ctx.stream()).unwrap();
         assert_eq!(model.model_type(), "qwen3_moe");
         assert_eq!(model.args.num_hidden_layers, 48);
         assert_eq!(model.args.num_experts, 128);
@@ -2627,7 +3676,7 @@ mod tests {
         let stream = ctx.stream();
         let weights_ctx =
             safemlx::ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
-        let mut model = super::load_qwen3_gguf(&gguf_file, stream, weights_ctx.stream()).unwrap();
+        let mut model = super::load_gguf(&gguf_file, stream, weights_ctx.stream()).unwrap();
         assert!(model
             .args
             .quantized_weight_configs
@@ -2658,7 +3707,7 @@ mod tests {
         let stream = ctx.stream();
         let weights_ctx =
             safemlx::ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
-        let mut model = super::load_qwen3_gguf(&gguf_file, stream, weights_ctx.stream()).unwrap();
+        let mut model = super::load_gguf(&gguf_file, stream, weights_ctx.stream()).unwrap();
         assert!(model
             .args
             .quantized_weight_configs
@@ -2709,19 +3758,19 @@ mod tests {
 
     #[test]
     #[ignore = "requires local model files"]
-    fn test_load_qwen3_model() {
+    fn loads_qwen3_model_from_cached_fixture() {
         let ctx = safemlx::ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
         let weights_ctx =
             safemlx::ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
         let _model =
-            super::load_qwen3_model(CACHED_TEST_MODEL_DIR, ctx.stream(), weights_ctx.stream())
+            super::load_safetensors(CACHED_TEST_MODEL_DIR, ctx.stream(), weights_ctx.stream())
                 .unwrap();
     }
 
     #[test]
     #[ignore = "requires local model files"]
     fn test_load_tokenizer() {
-        let tokenizer = load_qwen3_tokenizer(CACHED_TEST_MODEL_DIR).unwrap();
+        let tokenizer = load_tokenizer(CACHED_TEST_MODEL_DIR).unwrap();
 
         let _encoding = tokenizer.encode("Hello, world!", true).unwrap();
     }
@@ -2729,14 +3778,14 @@ mod tests {
     #[test]
     #[ignore = "requires local model files"]
     fn test_load_and_run_qwen3_with_concat_cache() {
-        let tokenizer = load_qwen3_tokenizer(CACHED_TEST_MODEL_DIR).unwrap();
+        let tokenizer = load_tokenizer(CACHED_TEST_MODEL_DIR).unwrap();
 
         let ctx = safemlx::ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
         let stream = ctx.stream();
         let weights_ctx =
             safemlx::ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
         let weights_stream = weights_ctx.stream();
-        let mut model = load_qwen3_model(CACHED_TEST_MODEL_DIR, stream, weights_stream).unwrap();
+        let mut model = load_safetensors(CACHED_TEST_MODEL_DIR, stream, weights_stream).unwrap();
 
         let encoding = tokenizer.encode("hello", true).unwrap();
         let prompt_tokens = Array::from(encoding.get_ids())

@@ -19,8 +19,8 @@ use crate::{
         moshi::personaplex,
         nemotron_h::model as nemotron_h,
         qwen::{
+            dense as dense_qwen,
             hybrid::{qwen3_5 as qwen35, qwen3_next},
-            qwen3::model as qwen3,
             vl::model as qwen3_vl,
         },
     },
@@ -102,6 +102,7 @@ pub(crate) const fn safetensors_policy(kind: ModelKind) -> StructuralValidationP
         | ModelKind::Llama
         | ModelKind::NemotronH
         | ModelKind::PersonaPlex
+        | ModelKind::Qwen2
         | ModelKind::Qwen3
         | ModelKind::Qwen3Next
         | ModelKind::Qwen3Vl
@@ -121,6 +122,7 @@ pub(crate) const fn gguf_policy(architecture: GgufArchitecture) -> StructuralVal
         | GgufArchitecture::GptOss
         | GgufArchitecture::Gemma4
         | GgufArchitecture::Inkling
+        | GgufArchitecture::Qwen2
         | GgufArchitecture::Qwen3
         | GgufArchitecture::Qwen3Moe
         | GgufArchitecture::NemotronH
@@ -150,7 +152,8 @@ pub(crate) fn validate_safetensors(
             ModelKind::Llama => validate_llama_safetensors(config, store),
             ModelKind::NemotronH => validate_nemotron_h_safetensors(config, store),
             ModelKind::PersonaPlex => validate_personaplex_safetensors(config, store),
-            ModelKind::Qwen3 => validate_qwen3_safetensors(config, store, options),
+            ModelKind::Qwen2 => validate_dense_qwen_safetensors(config, store, options),
+            ModelKind::Qwen3 => validate_dense_qwen_safetensors(config, store, options),
             ModelKind::Qwen3Next => validate_qwen3_next_safetensors(config, store, options),
             ModelKind::Qwen3Vl | ModelKind::Qwen3VlMoe => {
                 validate_qwen3_vl_safetensors(kind, config, store, options)
@@ -193,8 +196,8 @@ pub(crate) fn validate_gguf(
             GgufArchitecture::NemotronH | GgufArchitecture::NemotronHMoe => {
                 validate_nemotron_h_gguf(architecture, checkpoint, metadata, options)
             }
-            GgufArchitecture::Qwen3 | GgufArchitecture::Qwen3Moe => {
-                validate_qwen3_gguf(architecture, checkpoint, metadata)
+            GgufArchitecture::Qwen2 | GgufArchitecture::Qwen3 | GgufArchitecture::Qwen3Moe => {
+                validate_dense_qwen_gguf(architecture, checkpoint, metadata)
             }
             GgufArchitecture::Qwen3Vl => validate_qwen3_vl_gguf(checkpoint, metadata, options),
             GgufArchitecture::KimiLinear => validate_kimi_linear_gguf(checkpoint, metadata),
@@ -358,7 +361,7 @@ fn llama_expected(args: &llama::ModelArgs) -> Vec<ExpectedTensor> {
     tensors
 }
 
-fn qwen3_expected(args: &qwen3::ModelArgs) -> Vec<ExpectedTensor> {
+fn dense_qwen_expected(args: &dense_qwen::DecoderConfig) -> Vec<ExpectedTensor> {
     let hidden = args.hidden_size as usize;
     let vocab = args.vocab_size as usize;
     let query = (args.num_attention_heads * args.head_dim) as usize;
@@ -389,16 +392,6 @@ fn qwen3_expected(args: &qwen3::ModelArgs) -> Vec<ExpectedTensor> {
                 format!("{gguf}.ffn_norm.weight"),
                 hidden,
             ),
-            expected_vector(
-                format!("{model}.self_attn.q_norm.weight"),
-                format!("{gguf}.attn_q_norm.weight"),
-                head,
-            ),
-            expected_vector(
-                format!("{model}.self_attn.k_norm.weight"),
-                format!("{gguf}.attn_k_norm.weight"),
-                head,
-            ),
             expected(
                 format!("{model}.self_attn.q_proj.weight"),
                 format!("{gguf}.attn_q.weight"),
@@ -420,6 +413,39 @@ fn qwen3_expected(args: &qwen3::ModelArgs) -> Vec<ExpectedTensor> {
                 [hidden, query],
             ),
         ]);
+        if args.qk_norm() {
+            tensors.extend([
+                expected_vector(
+                    format!("{model}.self_attn.q_norm.weight"),
+                    format!("{gguf}.attn_q_norm.weight"),
+                    head,
+                ),
+                expected_vector(
+                    format!("{model}.self_attn.k_norm.weight"),
+                    format!("{gguf}.attn_k_norm.weight"),
+                    head,
+                ),
+            ]);
+        }
+        if args.qkv_bias() {
+            tensors.extend([
+                expected_vector(
+                    format!("{model}.self_attn.q_proj.bias"),
+                    format!("{gguf}.attn_q.bias"),
+                    query,
+                ),
+                expected_vector(
+                    format!("{model}.self_attn.k_proj.bias"),
+                    format!("{gguf}.attn_k.bias"),
+                    key_value,
+                ),
+                expected_vector(
+                    format!("{model}.self_attn.v_proj.bias"),
+                    format!("{gguf}.attn_v.bias"),
+                    key_value,
+                ),
+            ]);
+        }
         if args.is_moe() {
             let experts = args.num_experts as usize;
             let intermediate = args.moe_intermediate_size as usize;
@@ -4381,12 +4407,12 @@ fn qwen_hybrid_safetensors_format(
     }
 }
 
-fn validate_qwen3_safetensors(
+fn validate_dense_qwen_safetensors(
     config: &Value,
     store: &SafetensorsWeightStore,
     options: ModelLoadOptions,
 ) -> StructuralValidation {
-    let args = match qwen3::model_args_from_config_value(config) {
+    let args = match dense_qwen::config_from_hf_value(config) {
         Ok(args) => args,
         Err(error) => return invalid_geometry(error.to_string()),
     };
@@ -4397,11 +4423,34 @@ fn validate_qwen3_safetensors(
             store.keys().len()
         ));
     }
-    let mut expected = qwen3_expected(&args);
+    let mut expected = dense_qwen_expected(&args);
     if !args.is_moe() {
-        return validate_safetensor_plan_with(store, expected, |name| {
-            args.weight_quantization_for(name)
-        });
+        let mut allowed = BTreeSet::new();
+        for tensor in &expected {
+            allowed.insert(tensor.safetensors_name.clone());
+            if tensor.operation == TensorOperation::Matrix {
+                if let Some(quantization) = args.weight_quantization_for(&tensor.safetensors_name) {
+                    add_safetensors_format_companions(
+                        &mut allowed,
+                        &tensor.safetensors_name,
+                        SafetensorsMatrixFormat::Affine(quantization),
+                    );
+                }
+            }
+        }
+        let mut issues = Vec::new();
+        append_structural_issues(
+            validate_safetensor_plan_with(store, expected, |name| {
+                args.weight_quantization_for(name)
+            }),
+            &mut issues,
+        );
+        for name in store.keys() {
+            if !allowed.contains(&name) {
+                issues.push(unexpected_layout(&name, "dense-Qwen SafeTensors"));
+            }
+        }
+        return finish(issues);
     }
     expected.retain(|tensor| !tensor.safetensors_name.contains(".mlp.experts."));
     let mut issues = Vec::new();
@@ -4894,7 +4943,7 @@ fn validate_qwen3_vl_safetensors(
 fn qwen3_vl_safetensors_expected(
     args: &qwen3_vl::ModelArgs,
 ) -> (Vec<ExpectedTensor>, Vec<ExpectedTensor>) {
-    let mut text = qwen3_expected(&args.text_config);
+    let mut text = dense_qwen_expected(&args.text_config);
     for tensor in &mut text {
         if let Some(rest) = tensor.safetensors_name.strip_prefix("model.") {
             tensor.safetensors_name = format!("model.language_model.{rest}");
@@ -6626,14 +6675,14 @@ fn validate_nemotron_h_gguf(
     finish(issues)
 }
 
-fn validate_qwen3_gguf(
+fn validate_dense_qwen_gguf(
     architecture: GgufArchitecture,
     checkpoint: &GgufCheckpoint,
     metadata: &HashMap<String, GgufMetadataValue>,
 ) -> StructuralValidation {
     let is_moe = architecture == GgufArchitecture::Qwen3Moe;
     let metadata_name = architecture.metadata_name();
-    let translate = |name: &str| qwen3::translate_qwen3_gguf_weight_name(name, is_moe);
+    let translate = |name: &str| dense_qwen::translate_gguf_weight_name(name, is_moe);
     if let Err(error) = checkpoint.catalog().translated_outputs(translate) {
         return StructuralValidation::Invalid(vec![StructuralIssue {
             kind: StructuralIssueKind::ConflictingLayout,
@@ -6644,7 +6693,7 @@ fn validate_qwen3_gguf(
         }]);
     }
     let args =
-        match qwen3::qwen3_args_from_gguf_catalog(checkpoint, metadata, metadata_name, is_moe) {
+        match dense_qwen::config_from_gguf_catalog(checkpoint, metadata, metadata_name, is_moe) {
             Ok(args) => args,
             Err(error) => return invalid_geometry(error.to_string()),
         };
@@ -6655,7 +6704,15 @@ fn validate_qwen3_gguf(
             checkpoint.catalog().physical_tensor_count()
         ));
     }
-    let mut issues = validate_gguf_plan(checkpoint, qwen3_expected(&args), "Qwen3");
+    let mut issues = validate_gguf_plan(
+        checkpoint,
+        dense_qwen_expected(&args),
+        if architecture == GgufArchitecture::Qwen2 {
+            "Qwen2"
+        } else {
+            "Qwen3"
+        },
+    );
     if is_moe {
         issues.extend(validate_paired_expert_encodings(
             checkpoint,
@@ -6674,7 +6731,7 @@ fn validate_qwen3_vl_gguf(
     if let Err(error) = GgufArchitecture::Qwen3Vl.validate_load_policy(options) {
         return invalid_geometry(error.to_string());
     }
-    let translate = |name: &str| qwen3::translate_qwen3_gguf_weight_name(name, false);
+    let translate = |name: &str| dense_qwen::translate_gguf_weight_name(name, false);
     if let Err(error) = checkpoint.catalog().translated_outputs(translate) {
         return StructuralValidation::Invalid(vec![StructuralIssue {
             kind: StructuralIssueKind::ConflictingLayout,
@@ -6684,14 +6741,14 @@ fn validate_qwen3_vl_gguf(
             metadata_key: None,
         }]);
     }
-    let args = match qwen3::qwen3_args_from_gguf_catalog(checkpoint, metadata, "qwen3vl", false) {
+    let args = match dense_qwen::config_from_gguf_catalog(checkpoint, metadata, "qwen3vl", false) {
         Ok(args) => args,
         Err(error) => return invalid_geometry(error.to_string()),
     };
     if let Err(error) = qwen3_vl::validate_qwen3_vl_text_gguf_catalog(&args, metadata) {
         return invalid_geometry(error.to_string());
     }
-    let expected = qwen3_expected(&args);
+    let expected = dense_qwen_expected(&args);
     let allowed = expected
         .iter()
         .map(|tensor| tensor.gguf_name.clone())
@@ -6712,7 +6769,7 @@ pub(crate) fn validate_qwen3_vl_projector_gguf(
     checkpoint: &GgufCheckpoint,
     metadata: &HashMap<String, GgufMetadataValue>,
 ) -> StructuralValidation {
-    let text_args = match qwen3::qwen3_args_from_gguf_catalog(
+    let text_args = match dense_qwen::config_from_gguf_catalog(
         model_checkpoint,
         model_metadata,
         "qwen3vl",
@@ -7477,5 +7534,41 @@ fn shape_mismatch(name: &str, expected: &[usize], actual: &[usize]) -> Structura
         tensor_name: Some(name.into()),
         tensor_type_code: None,
         metadata_key: None,
+    }
+}
+
+#[cfg(test)]
+mod dense_qwen_tests {
+    use super::*;
+
+    fn qwen2_args(tied: bool) -> dense_qwen::DecoderConfig {
+        dense_qwen::config_from_hf_value(&serde_json::json!({
+            "model_type": "qwen2", "hidden_size": 8, "num_hidden_layers": 2,
+            "intermediate_size": 16, "num_attention_heads": 4,
+            "num_key_value_heads": 2, "rms_norm_eps": 1e-6, "vocab_size": 32,
+            "max_position_embeddings": 64, "rope_theta": 10000.0,
+            "tie_word_embeddings": tied, "use_sliding_window": false
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn qwen2_plan_is_exactly_biased_and_has_no_qk_norms() {
+        let tied = dense_qwen_expected(&qwen2_args(true));
+        let names = tied
+            .iter()
+            .map(|tensor| tensor.safetensors_name.as_str())
+            .collect::<BTreeSet<_>>();
+        assert!(names.contains("model.layers.0.self_attn.q_proj.bias"));
+        assert!(names.contains("model.layers.0.self_attn.k_proj.bias"));
+        assert!(names.contains("model.layers.0.self_attn.v_proj.bias"));
+        assert!(!names.contains("model.layers.0.self_attn.q_norm.weight"));
+        assert!(!names.contains("model.layers.0.self_attn.k_norm.weight"));
+        assert!(!names.contains("lm_head.weight"));
+
+        let untied = dense_qwen_expected(&qwen2_args(false));
+        assert!(untied
+            .iter()
+            .any(|tensor| tensor.safetensors_name == "lm_head.weight"));
     }
 }

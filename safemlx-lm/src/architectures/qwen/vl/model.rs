@@ -25,9 +25,10 @@ pub use super::vision::{QwenVisionTransformer, VisionConfig};
 use crate::{
     api::{
         common::{self, attention::AttentionInput, generation::CausalLm},
-        input as runtime_input, qwen3,
+        input as runtime_input,
         qwen_vl::grid_thw_from_array,
     },
+    architectures::qwen::dense as dense_qwen,
     error::Error,
     nn::tensor::{create_attention_mask, AttentionMask},
     runtime::cache::{ConcatKeyValueCache, KeyValueCache},
@@ -42,7 +43,7 @@ use crate::{
 /// Parsed Qwen3-VL configuration.
 pub struct ModelArgs {
     /// Text decoder configuration shared with Qwen3.
-    pub text_config: qwen3::ModelArgs,
+    pub text_config: dense_qwen::DecoderConfig,
     /// Vision encoder configuration shared across Qwen VL models.
     pub vision_config: VisionConfig,
     /// Placeholder token used for image embeddings.
@@ -120,7 +121,7 @@ fn parse_model_args_value(mut value: Value) -> Result<ModelArgs, Error> {
         rope.remove("mrope_section");
         rope.remove("mrope_interleaved");
     }
-    let mut text_config: qwen3::ModelArgs =
+    let mut text_config: dense_qwen::DecoderConfig =
         serde_json::from_value(text_value).map_err(|error| {
             Error::UnsupportedArchitecture(format!("invalid {model_type} text_config: {error}"))
         })?;
@@ -227,7 +228,7 @@ pub struct Qwen3VLModel {
     pub visual: QwenVisionTransformer,
     #[param]
     /// Qwen3-compatible language model body.
-    pub language_model: qwen3::Qwen3Model,
+    pub language_model: dense_qwen::Decoder,
 }
 
 #[derive(Debug, Clone, ModuleParameters)]
@@ -263,7 +264,7 @@ impl Model {
     /// Creates an unloaded Qwen3-VL model.
     pub fn new(args: ModelArgs, stream: &Stream) -> Result<Self, Exception> {
         let visual = QwenVisionTransformer::new_deepstack(args.vision_config.clone(), stream)?;
-        let language_model = qwen3::Qwen3Model::new(&args.text_config, stream)?;
+        let language_model = dense_qwen::Decoder::new(&args.text_config, stream)?;
         let lm_head = if args.text_config.tie_word_embeddings {
             None
         } else {
@@ -830,7 +831,7 @@ pub(crate) fn load_qwen3_vl_gguf_checkpoint(
     let mut report = StrictLoadReport::default();
     for tensor in checkpoint.converted_tensors() {
         for (name, value) in tensor?.into_arrays() {
-            let name = qwen3::translate_gguf_weight_name(&name);
+            let name = dense_qwen::translate_gguf_weight_name(&name, false);
             let name = name
                 .strip_prefix("model.")
                 .map(|name| format!("model.language_model.{name}"))
@@ -899,7 +900,7 @@ pub(crate) fn prepare_qwen3_vl_gguf_checkpoint(
     vision_checkpoint: &GgufCheckpoint,
     vision_metadata: &HashMap<String, GgufMetadataValue>,
 ) -> Result<PreparedQwen3VlGguf, Error> {
-    let architecture = qwen3::gguf_string(metadata, "general.architecture")?;
+    let architecture = dense_qwen::gguf_string(metadata, "general.architecture")?;
     if architecture != "qwen3vl" {
         return Err(Error::UnsupportedArchitecture(format!(
             "GGUF architecture {architecture:?}; this loader supports dense qwen3vl"
@@ -913,7 +914,7 @@ pub(crate) fn prepare_qwen3_vl_gguf_checkpoint(
     )
     .into_loader_result()?;
     let (mut text_config, eos_token_ids) =
-        qwen3::prepare_qwen3_gguf_checkpoint(checkpoint, metadata, &architecture, false)?;
+        dense_qwen::prepare_gguf_checkpoint(checkpoint, metadata, &architecture, false)?;
     text_config.model_type = "qwen3_vl_text".into();
     let args =
         qwen3_vl_args_from_gguf_catalog(text_config, metadata, vision_checkpoint, vision_metadata)?;
@@ -925,7 +926,7 @@ pub(crate) fn prepare_qwen3_vl_gguf_checkpoint(
 
 /// Builds the complete Qwen3-VL geometry from GGUF catalogs without reading payload bytes.
 pub(crate) fn qwen3_vl_args_from_gguf_catalog(
-    text_config: qwen3::ModelArgs,
+    text_config: dense_qwen::DecoderConfig,
     metadata: &HashMap<String, GgufMetadataValue>,
     vision_checkpoint: &GgufCheckpoint,
     vision_metadata: &HashMap<String, GgufMetadataValue>,
@@ -934,7 +935,8 @@ pub(crate) fn qwen3_vl_args_from_gguf_catalog(
     let (mrope_section, image_token_id, video_token_id) =
         validate_qwen3_vl_text_gguf_catalog(&text_config, metadata)?;
     let deepstack_visual_indexes = gguf_deepstack_layers(vision_metadata)?;
-    let hidden_size = qwen3::gguf_i32_catalog(vision_metadata, "clip.vision.embedding_length")?;
+    let hidden_size =
+        dense_qwen::gguf_i32_catalog(vision_metadata, "clip.vision.embedding_length")?;
     let position_layout = vision_checkpoint
         .catalog()
         .tensors()
@@ -952,26 +954,32 @@ pub(crate) fn qwen3_vl_args_from_gguf_catalog(
         )));
     }
     let vision_config = VisionConfig {
-        depth: qwen3::gguf_i32_catalog(vision_metadata, "clip.vision.block_count")?,
+        depth: dense_qwen::gguf_i32_catalog(vision_metadata, "clip.vision.block_count")?,
         hidden_size,
         hidden_act: "gelu_pytorch_tanh".into(),
-        intermediate_size: qwen3::gguf_i32_catalog(
+        intermediate_size: dense_qwen::gguf_i32_catalog(
             vision_metadata,
             "clip.vision.feed_forward_length",
         )?,
-        num_heads: qwen3::gguf_i32_catalog(vision_metadata, "clip.vision.attention.head_count")?,
+        num_heads: dense_qwen::gguf_i32_catalog(
+            vision_metadata,
+            "clip.vision.attention.head_count",
+        )?,
         num_position_embeddings: i32::try_from(position_layout.shape[0]).map_err(|_| {
             Error::UnsupportedArchitecture("qwen3vl position count exceeds i32".into())
         })?,
         in_channels: 3,
-        patch_size: qwen3::gguf_i32_catalog(vision_metadata, "clip.vision.patch_size")?,
-        spatial_merge_size: qwen3::gguf_i32_catalog(
+        patch_size: dense_qwen::gguf_i32_catalog(vision_metadata, "clip.vision.patch_size")?,
+        spatial_merge_size: dense_qwen::gguf_i32_catalog(
             vision_metadata,
             "clip.vision.spatial_merge_size",
         )?,
         temporal_patch_size: 2,
         window_size: 112,
-        out_hidden_size: qwen3::gguf_i32_catalog(vision_metadata, "clip.vision.projection_dim")?,
+        out_hidden_size: dense_qwen::gguf_i32_catalog(
+            vision_metadata,
+            "clip.vision.projection_dim",
+        )?,
         fullatt_block_indexes: Vec::new(),
         deepstack_visual_indexes,
     };
@@ -986,7 +994,7 @@ pub(crate) fn qwen3_vl_args_from_gguf_catalog(
 }
 
 pub(crate) fn validate_qwen3_vl_text_gguf_catalog(
-    text_config: &qwen3::ModelArgs,
+    text_config: &dense_qwen::DecoderConfig,
     metadata: &HashMap<String, GgufMetadataValue>,
 ) -> Result<(Vec<i32>, u32, u32), Error> {
     if !text_config.tie_word_embeddings {
@@ -1014,7 +1022,7 @@ pub(crate) fn validate_qwen3_vl_text_gguf_catalog(
 }
 
 pub(crate) fn validate_qwen3_vl_vision_geometry(
-    text_config: &qwen3::ModelArgs,
+    text_config: &dense_qwen::DecoderConfig,
     metadata: &HashMap<String, GgufMetadataValue>,
     vision_config: &VisionConfig,
 ) -> Result<(), Error> {
@@ -1064,8 +1072,8 @@ pub(crate) fn validate_qwen3_vl_vision_geometry(
 pub(crate) fn validate_qwen3_vl_mmproj(
     metadata: &HashMap<String, GgufMetadataValue>,
 ) -> Result<(), Error> {
-    let architecture = qwen3::gguf_string(metadata, "general.architecture")?;
-    let projector = qwen3::gguf_string(metadata, "clip.projector_type")?;
+    let architecture = dense_qwen::gguf_string(metadata, "general.architecture")?;
+    let projector = dense_qwen::gguf_string(metadata, "clip.projector_type")?;
     if architecture != "clip" || projector != "qwen3vl_merger" {
         return Err(Error::UnsupportedArchitecture(format!(
             "expected a qwen3vl GGUF vision projector, got architecture {architecture:?} and projector {projector:?}"
@@ -1250,7 +1258,7 @@ mod tests {
     use crate::api::{common::generation::CausalLm, input as runtime_input};
 
     fn tiny_model(stream: &safemlx::Stream) -> super::Model {
-        let text_config = crate::architectures::qwen::qwen3::model::ModelArgs {
+        let text_config = crate::architectures::qwen::dense::DecoderConfig {
             model_type: "qwen3_vl_text".into(),
             hidden_size: 12,
             num_hidden_layers: 1,
@@ -1264,6 +1272,13 @@ mod tests {
             head_dim: 12,
             tie_word_embeddings: true,
             rope_scaling: Some(HashMap::new()),
+            hidden_act: "silu".into(),
+            attention_dropout: 0.0,
+            attention_bias: Some(false),
+            mlp_bias: Some(false),
+            use_sliding_window: false,
+            sliding_window: None,
+            max_window_layers: None,
             quantization: None,
             quantization_config: None,
             quantized_weights: None,

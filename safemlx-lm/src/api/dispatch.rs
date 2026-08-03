@@ -36,10 +36,10 @@ pub enum Model {
     NemotronH(nemotron_h::Model),
     /// Nemotron-H hybrid model using bounded layer execution.
     NemotronHLayerwise(crate::architectures::nemotron_h::layerwise::NemotronHLayerwiseModel),
-    /// Qwen3 model.
-    Qwen3(qwen3::Model),
-    /// Qwen3 dense or sparse-MoE model using bounded layer execution.
-    Qwen3Layerwise(crate::architectures::qwen::qwen3::layerwise::Qwen3LayerwiseModel),
+    /// Dense Qwen2/Qwen2.5/Qwen3 model.
+    DenseQwen(dense_qwen::Model),
+    /// Dense Qwen model using bounded layer execution.
+    DenseQwenLayerwise(crate::architectures::qwen::dense::layerwise::LayerwiseDecoder),
     /// Qwen3-Next model.
     Qwen3Next(qwen3_next::Model),
     /// Qwen3-Next model using shared hybrid bounded layer execution.
@@ -447,7 +447,7 @@ impl Model {
             Self::Qwen3NextLayerwise(model) | Self::Qwen35MoeLayerwise(model) => {
                 Ok(Some(model.residency_report()?))
             }
-            Self::Qwen3Layerwise(model) => Ok(Some(model.residency_report()?)),
+            Self::DenseQwenLayerwise(model) => Ok(Some(model.residency_report()?)),
             Self::Qwen3VlLayerwise(model) | Self::Qwen3VlMoeLayerwise(model) => {
                 Ok(Some(model.residency_report()?))
             }
@@ -471,7 +471,7 @@ impl Model {
             Self::Qwen3NextLayerwise(model) | Self::Qwen35MoeLayerwise(model) => {
                 model.dense_stream_report()
             }
-            Self::Qwen3Layerwise(model) => model.dense_stream_report(),
+            Self::DenseQwenLayerwise(model) => model.dense_stream_report(),
             Self::Qwen3VlLayerwise(model) | Self::Qwen3VlMoeLayerwise(model) => {
                 model.dense_stream_report()
             }
@@ -490,7 +490,7 @@ impl Model {
             Self::InklingLayerwise(model) => model.expert_cache_report(),
             Self::Lfm2Layerwise(model) => model.expert_cache_report(),
             Self::NemotronHLayerwise(model) => model.expert_cache_report(),
-            Self::Qwen3Layerwise(model) => model.expert_cache_report(),
+            Self::DenseQwenLayerwise(model) => model.expert_cache_report(),
             Self::Qwen3NextLayerwise(model) | Self::Qwen35MoeLayerwise(model) => {
                 model.expert_cache_report()
             }
@@ -518,8 +518,8 @@ impl Model {
             Self::Lfm2Layerwise(model) => &model.args().model_type,
             Self::NemotronH(model) => model.model_type(),
             Self::NemotronHLayerwise(model) => &model.args().model_type,
-            Self::Qwen3(model) => model.model_type(),
-            Self::Qwen3Layerwise(model) => &model.args().model_type,
+            Self::DenseQwen(model) => model.model_type(),
+            Self::DenseQwenLayerwise(model) => &model.args().model_type,
             Self::Qwen3Next(model) => model.model_type(),
             Self::Qwen3NextLayerwise(model) => &model.args().model_type,
             Self::Qwen3Vl(model) => model.model_type(),
@@ -558,6 +558,9 @@ impl Model {
             Self::GptOssLayerwise(model) => {
                 Ok(gpt_oss::prompt_cache_architecture_fingerprint(model.args()))
             }
+            Self::DenseQwen(model) => Ok(dense_qwen::prompt_cache_architecture_fingerprint(
+                &model.args,
+            )),
             _ => Err(Exception::custom(format!(
                 "prompt-cache architecture identity is unsupported for model type {}",
                 self.model_type()
@@ -632,8 +635,8 @@ impl Model {
             (Self::LlamaLayerwise(_), ModelCache::LlamaLayerwise(_)) => Err(Exception::custom(
                 "detailed activation inspection is unavailable for bounded-layer Llama execution",
             )),
-            (Self::Qwen3(model), ModelCache::KeyValue(cache)) => model.forward_with_observer(
-                qwen3::ModelInput {
+            (Self::DenseQwen(model), ModelCache::KeyValue(cache)) => model.forward_with_observer(
+                dense_qwen::ModelInput {
                     inputs: input_tokens,
                     mask,
                     cache,
@@ -641,8 +644,11 @@ impl Model {
                 stream,
                 observer,
             ),
-            (Self::Qwen3Layerwise(_), ModelCache::KeyValue(_)) => Err(Exception::custom(
-                "detailed activation inspection is unavailable for bounded-layer Qwen3 execution",
+            (Self::DenseQwen(_), ModelCache::PagedKeyValue(_)) => Err(Exception::custom(
+                "detailed attention inspection is unavailable for paged dense-Qwen caches",
+            )),
+            (Self::DenseQwenLayerwise(_), ModelCache::KeyValue(_)) => Err(Exception::custom(
+                "detailed activation inspection is unavailable for bounded-layer dense-Qwen execution",
             )),
             (Self::Qwen35Moe(model), ModelCache::Qwen35Moe(cache)) => model.forward_with_observer(
                 qwen3_5_moe::ModelInput {
@@ -793,10 +799,10 @@ impl Model {
             (Self::LlamaLayerwise(_), ModelCache::LlamaLayerwise(_)) => Err(Exception::custom(
                 "detailed activation inspection is unavailable for bounded-layer Llama execution",
             )),
-            (Self::Qwen3(model), ModelCache::KeyValue(cache)) => {
+            (Self::DenseQwen(model), ModelCache::KeyValue(cache)) => {
                 let prompt_tokens = input::text_token_ids(input, stream)?;
                 let logits = model.forward_with_observer(
-                    qwen3::ModelInput {
+                    dense_qwen::ModelInput {
                         inputs: &prompt_tokens,
                         mask: None,
                         cache,
@@ -806,8 +812,11 @@ impl Model {
                 )?;
                 final_token_logits(&logits, stream)
             }
-            (Self::Qwen3Layerwise(_), ModelCache::KeyValue(_)) => Err(Exception::custom(
-                "detailed activation inspection is unavailable for bounded-layer Qwen3 execution",
+            (Self::DenseQwen(_), ModelCache::PagedKeyValue(_)) => Err(Exception::custom(
+                "detailed attention inspection is unavailable for paged dense-Qwen caches",
+            )),
+            (Self::DenseQwenLayerwise(_), ModelCache::KeyValue(_)) => Err(Exception::custom(
+                "detailed activation inspection is unavailable for bounded-layer dense-Qwen execution",
             )),
             (Self::Qwen35Moe(model), ModelCache::Qwen35Moe(cache)) => {
                 model.prefill_typed_with_observer(input, cache, stream, observer)
@@ -862,8 +871,8 @@ impl Model {
             Self::LlamaLayerwise(model) => ModelCache::LlamaLayerwise(model.new_cache()),
             Self::Lfm2(model) => ModelCache::Lfm2(model.new_cache()),
             Self::Lfm2Layerwise(model) => ModelCache::Lfm2(model.new_cache()),
-            Self::Qwen3(_) => ModelCache::KeyValue(Vec::new()),
-            Self::Qwen3Layerwise(model) => ModelCache::KeyValue(model.new_cache()),
+            Self::DenseQwen(model) => ModelCache::KeyValue(model.new_cache()),
+            Self::DenseQwenLayerwise(model) => ModelCache::KeyValue(model.new_cache()),
             Self::Qwen3Next(model) => ModelCache::Qwen3Next(model.new_cache()),
             Self::Qwen3NextLayerwise(model) => ModelCache::Qwen3Next(model.new_cache()),
             Self::Qwen3Vl(model) => ModelCache::Qwen3Vl(model.new_cache()),
@@ -879,11 +888,11 @@ impl Model {
 
     /// Creates ordinary cache state or an explicitly bounded paged cache.
     ///
-    /// Paged construction is currently supported for Llama-compatible text
-    /// attention, DeepSeek compressed-latent attention, GPT-OSS, Inkling
-    /// relative-position attention, and the corresponding bounded
-    /// weight-execution wrappers. Other cache representations return a precise
-    /// unsupported error and retain their device-resident defaults.
+    /// Paged construction is currently supported for Llama-compatible and
+    /// dense-Qwen text attention, DeepSeek compressed-latent attention,
+    /// GPT-OSS, Inkling relative-position attention, and the corresponding
+    /// bounded weight-execution wrappers. Other cache representations return a
+    /// precise unsupported error and retain their device-resident defaults.
     pub fn new_cache_with_options(
         &self,
         policy: CacheResidencyPolicy,
@@ -922,6 +931,23 @@ impl Model {
                     .new_cache_with_options(CacheResidencyPolicy::Paged(options))
                     .map(ModelCache::GptOss)
                     .map_err(|error| Exception::custom(error.to_string())),
+                Self::DenseQwen(model) => {
+                    let manager = CacheResidencyManager::new(options)
+                        .map_err(|error| Exception::custom(error.to_string()))?;
+                    let layer_count = usize::try_from(model.args.num_hidden_layers)
+                        .map_err(|_| Exception::custom("invalid dense-Qwen cache layer count"))?;
+                    let caches = (0..layer_count)
+                        .map(|layer| {
+                            PagedKeyValueCache::new(
+                                manager.clone(),
+                                layer,
+                                model.args.sliding_window_for_layer(layer as i32),
+                            )
+                            .map(Some)
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+                    Ok(ModelCache::PagedKeyValue(caches))
+                }
                 Self::Inkling(model) => model.new_paged_cache(options).map(ModelCache::Inkling),
                 Self::InklingLayerwise(model) => model
                     .new_cache_with_options(CacheResidencyPolicy::Paged(options))
@@ -1009,6 +1035,45 @@ impl Model {
                 .load_prompt_cache(directory, expected, prefix_token_ids, options)
                 .map(|(cache, manifest)| (ModelCache::GptOss(cache), manifest))
                 .map_err(|error| Exception::custom(error.to_string())),
+            Self::DenseQwen(model) if !model.args.use_sliding_window => {
+                let layer_count = usize::try_from(model.args.num_hidden_layers)
+                    .map_err(|_| Exception::custom("invalid dense-Qwen cache layer count"))?;
+                let identity = PromptCacheModelIdentity {
+                    model_family: "dense_qwen".into(),
+                    effective_model_type: model.args.model_type.clone(),
+                    architecture_fingerprint: dense_qwen::prompt_cache_architecture_fingerprint(
+                        &model.args,
+                    ),
+                    layer_count,
+                    global_layer_start: 0,
+                    global_layer_end: layer_count,
+                    sliding_window: None,
+                    sink_tokens: 0,
+                    topology: Default::default(),
+                    layer_layouts: PromptCacheModelIdentity::key_value_layouts(
+                        layer_count,
+                        model.args.num_key_value_heads,
+                        model.args.head_dim,
+                    ),
+                };
+                validate_prompt_cache_model_identity(expected, &identity)
+                    .map_err(|error| Exception::custom(error.to_string()))?;
+                let (manager, manifest) = open_prompt_cache(
+                    directory,
+                    expected,
+                    &identity,
+                    prefix_token_ids,
+                    options,
+                )
+                .map_err(|error| Exception::custom(error.to_string()))?;
+                let caches = (0..layer_count)
+                    .map(|layer| PagedKeyValueCache::new(manager.clone(), layer, None).map(Some))
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok((ModelCache::PagedKeyValue(caches), manifest))
+            }
+            Self::DenseQwen(_) => Err(Exception::custom(
+                "persisted prompt caches for mixed full/sliding Qwen2 layers are unsupported because the manifest has no per-layer window identity",
+            )),
             _ => Err(Exception::custom(
                 "prompt-cache loading is unsupported for this model cache representation; multimodal and recurrent prefixes require additional identity state",
             )),
@@ -1065,10 +1130,13 @@ impl Model {
             (Self::NemotronHLayerwise(model), ModelCache::NemotronH(cache)) => {
                 model.prefill_input_logits(input, cache, stream)
             }
-            (Self::Qwen3(model), ModelCache::KeyValue(cache)) => {
+            (Self::DenseQwen(model), ModelCache::KeyValue(cache)) => {
                 model.prefill_input_logits(input, cache, stream)
             }
-            (Self::Qwen3Layerwise(model), ModelCache::KeyValue(cache)) => {
+            (Self::DenseQwen(model), ModelCache::PagedKeyValue(cache)) => {
+                model.prefill_input_logits(input, cache, stream)
+            }
+            (Self::DenseQwenLayerwise(model), ModelCache::KeyValue(cache)) => {
                 model.prefill_input_logits(input, cache, stream)
             }
             (Self::Qwen3Vl(model), ModelCache::Qwen3Vl(cache)) => {
@@ -1199,11 +1267,18 @@ impl Model {
                     model, cache, temp, input, prng_key, stream, sampler,
                 ))
             }
-            (Self::Qwen3(model), ModelCache::KeyValue(cache)) => ModelGenerate::Qwen3(
-                qwen3::Generate::with_sampler(model, cache, temp, input, prng_key, stream, sampler),
-            ),
-            (Self::Qwen3Layerwise(model), ModelCache::KeyValue(cache)) => {
-                ModelGenerate::Qwen3Layerwise(common::generation::Generate::with_sampler(
+            (Self::DenseQwen(model), ModelCache::KeyValue(cache)) => {
+                ModelGenerate::DenseQwen(dense_qwen::Generate::with_sampler(
+                    model, cache, temp, input, prng_key, stream, sampler,
+                ))
+            }
+            (Self::DenseQwen(model), ModelCache::PagedKeyValue(cache)) => {
+                ModelGenerate::DenseQwenPaged(dense_qwen::Generate::with_sampler(
+                    model, cache, temp, input, prng_key, stream, sampler,
+                ))
+            }
+            (Self::DenseQwenLayerwise(model), ModelCache::KeyValue(cache)) => {
+                ModelGenerate::DenseQwenLayerwise(common::generation::Generate::with_sampler(
                     model, cache, temp, input, prng_key, stream, sampler,
                 ))
             }
@@ -1530,13 +1605,15 @@ where
             S,
         >,
     ),
-    /// Qwen3 generation iterator.
-    Qwen3(qwen3::Generate<'a, ConcatKeyValueCache, S>),
-    /// Qwen3 generation using bounded layer execution.
-    Qwen3Layerwise(
+    /// Dense-Qwen generation iterator.
+    DenseQwen(dense_qwen::Generate<'a, ConcatKeyValueCache, S>),
+    /// Dense-Qwen generation with paged key/value cache residency.
+    DenseQwenPaged(dense_qwen::Generate<'a, PagedKeyValueCache, S>),
+    /// Dense-Qwen generation using bounded layer execution.
+    DenseQwenLayerwise(
         common::generation::Generate<
             'a,
-            crate::architectures::qwen::qwen3::layerwise::Qwen3LayerwiseModel,
+            crate::architectures::qwen::dense::layerwise::LayerwiseDecoder,
             Vec<Option<ConcatKeyValueCache>>,
             S,
         >,
@@ -1592,8 +1669,9 @@ where
             Self::Lfm2Layerwise(generate) => generate.sampler_mut(),
             Self::NemotronH(generate) => generate.sampler_mut(),
             Self::NemotronHLayerwise(generate) => generate.sampler_mut(),
-            Self::Qwen3(generate) => generate.sampler_mut(),
-            Self::Qwen3Layerwise(generate) => generate.sampler_mut(),
+            Self::DenseQwen(generate) => generate.sampler_mut(),
+            Self::DenseQwenPaged(generate) => generate.sampler_mut(),
+            Self::DenseQwenLayerwise(generate) => generate.sampler_mut(),
             Self::Qwen3Vl(generate) => generate.sampler_mut(),
             Self::Qwen3VlLayerwise(generate) => generate.sampler_mut(),
             Self::Qwen3VlMoe(generate) => generate.sampler_mut(),
@@ -1632,8 +1710,9 @@ where
             Self::Lfm2Layerwise(generate) => generate.next(),
             Self::NemotronH(generate) => generate.next(),
             Self::NemotronHLayerwise(generate) => generate.next(),
-            Self::Qwen3(generate) => generate.next(),
-            Self::Qwen3Layerwise(generate) => generate.next(),
+            Self::DenseQwen(generate) => generate.next(),
+            Self::DenseQwenPaged(generate) => generate.next(),
+            Self::DenseQwenLayerwise(generate) => generate.next(),
             Self::Qwen3Vl(generate) => generate.next(),
             Self::Qwen3VlLayerwise(generate) => generate.next(),
             Self::Qwen3VlMoe(generate) => generate.next(),

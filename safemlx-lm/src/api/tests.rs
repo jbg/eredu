@@ -966,6 +966,38 @@ fn production_qwen_profile_renders_history_generation_prompt_and_dynamic_tokens(
 }
 
 #[test]
+fn qwen25_instruct_template_renders_chat_tools_and_checkpoint_stops() {
+    let compiler = Ok(ConstraintCompiler::synthetic_for_tests());
+    let mut tokenizer = production_chat_tokenizer(9);
+    let prepared = prepare_chat_from_parts(
+        &mut tokenizer,
+        ModelChatTemplate::Single(QWEN25_FIXTURE.into()),
+        "qwen2",
+        &[151_643, 151_645],
+        Some(&compiler),
+        ChatTemplateRequest {
+            messages: vec![json!({"role": "user", "content": "Use lookup."})],
+            tools: vec![production_tool("lookup")],
+            tool_choice: ToolChoice::Auto,
+            add_generation_prompt: true,
+            ..ChatTemplateRequest::default()
+        },
+    )
+    .unwrap();
+
+    assert!(prepared
+        .rendered_prompt()
+        .contains("<|im_start|>user\nUse lookup.<|im_end|>"));
+    assert!(prepared
+        .rendered_prompt()
+        .ends_with("<|im_start|>assistant\n"));
+    assert_eq!(prepared.eos_token_ids(), &[151_643, 151_645]);
+    assert_eq!(prepared.profile_stop_sequences(), ["<|im_end|>"]);
+    assert_eq!(prepared.format_profile_identity(), Some("xml-tools.v1"));
+    assert!(prepared.tool_runtime_plan().is_some());
+}
+
+#[test]
 fn production_qwen_vl_and_named_hermes_templates_prepare_without_architecture_keys() {
     let compiler = Ok(ConstraintCompiler::synthetic_for_tests());
     let mut qwen_vl_tokenizer = production_chat_tokenizer(3);
@@ -4366,9 +4398,9 @@ fn tiny_text_families_quantize_through_high_level_dispatch() {
                 );
             }
             "qwen3" => {
-                let args = super::qwen3::get_qwen3_model_args(&dir).unwrap();
+                let args = super::dense_qwen::load_config(&dir).unwrap();
                 save_zero_checkpoint(
-                    &super::qwen3::Model::new(args, stream).unwrap(),
+                    &super::dense_qwen::Model::new(args, stream).unwrap(),
                     &dir,
                     stream,
                 );
@@ -4879,6 +4911,78 @@ fn check_model_config_reports_supported_llama() {
     }));
 
     assert!(support.is_supported(), "{support:?}");
+}
+
+#[test]
+fn check_model_config_recognizes_exact_qwen2_identity() {
+    let config = json!({
+        "architectures": ["Qwen2ForCausalLM"],
+        "model_type": "qwen2",
+        "hidden_size": 16,
+        "num_hidden_layers": 2,
+        "intermediate_size": 32,
+        "num_attention_heads": 4,
+        "num_key_value_heads": 2,
+        "rms_norm_eps": 1e-6,
+        "vocab_size": 64,
+        "max_position_embeddings": 128,
+        "rope_theta": 1000000.0,
+        "tie_word_embeddings": false,
+        "use_sliding_window": false,
+        "sliding_window": 64,
+        "max_window_layers": 2
+    });
+    assert_eq!(
+        check_model_config(&config),
+        super::ModelConfigSupport::Supported(super::SupportedModelConfig {
+            kind: super::ModelKind::Qwen2,
+            model_type: "qwen2".into(),
+            effective_model_type: "qwen2".into(),
+        })
+    );
+
+    for nearby in ["qwen", "qwen2_moe", "qwen2_vl", "qwen2_5_vl"] {
+        let mut unsupported = config.clone();
+        unsupported["model_type"] = json!(nearby);
+        assert!(
+            !check_model_config(&unsupported).is_supported(),
+            "nearby architecture {nearby:?} must fail closed"
+        );
+    }
+    let mut disguised_vl = config;
+    disguised_vl["architectures"] = json!(["Qwen2VLForConditionalGeneration"]);
+    assert!(!check_model_config(&disguised_vl).is_supported());
+}
+
+#[test]
+fn gguf_architecture_resolution_recognizes_exact_qwen2_identity() {
+    assert_eq!(
+        super::GgufArchitecture::resolve("qwen2").unwrap(),
+        super::GgufArchitecture::Qwen2
+    );
+    for nearby in ["qwen", "qwen2moe", "qwen2vl", "qwen2.5"] {
+        assert!(super::GgufArchitecture::resolve(nearby).is_err());
+    }
+}
+
+#[test]
+fn check_model_config_validates_qwen2_sliding_window() {
+    let config = json!({
+        "model_type": "qwen2", "hidden_size": 16, "num_hidden_layers": 4,
+        "intermediate_size": 32, "num_attention_heads": 4,
+        "num_key_value_heads": 2, "rms_norm_eps": 1e-6, "vocab_size": 64,
+        "max_position_embeddings": 128, "rope_theta": 10000.0,
+        "tie_word_embeddings": true, "use_sliding_window": true,
+        "sliding_window": 8, "max_window_layers": 2
+    });
+    assert!(check_model_config(&config).is_supported());
+
+    let mut missing_window = config.clone();
+    missing_window["sliding_window"] = serde_json::Value::Null;
+    assert!(check_model_config(&missing_window)
+        .unsupported_reason()
+        .unwrap()
+        .contains("requires a sliding_window"));
 }
 
 #[test]

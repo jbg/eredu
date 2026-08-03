@@ -2042,19 +2042,19 @@ pub(super) fn load_gguf_model_data(
                 (Model::NemotronHLayerwise(loaded), eos_token_ids)
             }
         }
-        GgufArchitecture::Qwen3 | GgufArchitecture::Qwen3Moe => {
+        GgufArchitecture::Qwen2 | GgufArchitecture::Qwen3 | GgufArchitecture::Qwen3Moe => {
             if matches!(options.weight_residency, WeightResidency::FullyResident) {
-                let loaded = qwen3::load_qwen3_gguf_checkpoint(
+                let loaded = dense_qwen::load_gguf_checkpoint(
                     &checkpoint,
                     metadata,
                     options.quantization,
                     stream,
                     weights_stream,
                 )?;
-                (Model::Qwen3(loaded.model), loaded.eos_token_ids)
+                (Model::DenseQwen(loaded.model), loaded.eos_token_ids)
             } else {
                 let (loaded, eos_token_ids) =
-                    crate::architectures::qwen::qwen3::layerwise::load_qwen3_gguf_layerwise_model(
+                    crate::architectures::qwen::dense::layerwise::load_gguf_checkpoint(
                         &checkpoint,
                         &metadata,
                         &architecture,
@@ -2062,7 +2062,7 @@ pub(super) fn load_gguf_model_data(
                         stream,
                         weights_stream,
                     )?;
-                (Model::Qwen3Layerwise(loaded), eos_token_ids)
+                (Model::DenseQwenLayerwise(loaded), eos_token_ids)
             }
         }
         GgufArchitecture::Qwen3Vl => {

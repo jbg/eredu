@@ -20,7 +20,8 @@ use serde::Deserialize;
 use tokenizers::Tokenizer;
 
 use crate::{
-    api::{common, common::generation::CausalLm, input, qwen3::gguf_string},
+    api::{common, common::generation::CausalLm, input},
+    architectures::qwen::dense::gguf_string,
     error::Error,
     nn::tensor::{
         create_causal_mask,

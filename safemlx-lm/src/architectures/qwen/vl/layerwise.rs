@@ -24,13 +24,13 @@ use crate::{
     api::{
         common::{self, attention::AttentionInput, generation::CausalLm},
         input,
-        qwen3::{Experts as QwenExperts, Qwen3Model, TransformerBlock},
         qwen3_vl::{self as resident, Cache, ModelArgs},
         qwen_vl::{
             grid_thw_from_array, QwenVisionBlock, QwenVisionLayerwiseState,
             QwenVisionLayerwiseStatic, QwenVisionTransformer,
         },
     },
+    architectures::qwen::dense::{Decoder, Experts as QwenExperts, TransformerBlock},
     error::Error,
     nn::tensor::{create_attention_mask, AttentionMask},
     runtime::cache::KeyValueCache,
@@ -290,7 +290,7 @@ pub(crate) fn load_qwen3_vl_gguf_layerwise_model(
             .max_cached_readers(residency.max_mapped_shards())?
             .add_checkpoint(checkpoint.clone(), |name| {
                 let name =
-                    crate::architectures::qwen::qwen3::model::translate_gguf_weight_name(name);
+                    crate::architectures::qwen::dense::translate_gguf_weight_name(name, false);
                 name.strip_prefix("model.")
                     .map(|name| format!("model.language_model.{name}"))
                     .unwrap_or(name)
@@ -389,7 +389,7 @@ fn load_qwen3_vl_sparse_expert_cache_model_with_non_expert(
     let mut execution =
         load_general_layerwise_model(model_dir, adapter, non_expert, stream, weights_stream)?;
     let store = execution.weight_store_arc();
-    let entries = crate::architectures::qwen::qwen3::layerwise::qwen3_expert_catalog_at(
+    let entries = crate::architectures::qwen::dense::layerwise::qwen3_expert_catalog_at(
         &args.text_config,
         store.as_ref(),
         "model.language_model.layers",
@@ -534,7 +534,7 @@ pub struct Qwen3VlLayerwiseAdapter {
 impl Qwen3VlLayerwiseAdapter {
     fn new(args: ModelArgs, stream: &Stream) -> Result<Self, Error> {
         let visual = QwenVisionTransformer::new_deepstack(args.vision_config.clone(), stream)?;
-        let text = Qwen3Model::new(&args.text_config, stream)?;
+        let text = Decoder::new(&args.text_config, stream)?;
         let lm_head = if args.text_config.tie_word_embeddings {
             None
         } else {

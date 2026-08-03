@@ -23,6 +23,8 @@ pub enum ModelKind {
     NemotronH,
     /// PersonaPlex realtime speech-to-speech architecture.
     PersonaPlex,
+    /// Qwen2 and Qwen2.5 dense text decoder architecture.
+    Qwen2,
     /// Qwen3 decoder architecture.
     Qwen3,
     /// Qwen3-Next hybrid attention/MoE architecture.
@@ -122,7 +124,7 @@ impl ModelKind {
     /// Inspection parity tests iterate this list. The exhaustive matches in
     /// the loader and preflight planner remain the compile-time backstop when
     /// a new variant is added.
-    pub const ALL: [Self; 14] = [
+    pub const ALL: [Self; 15] = [
         Self::DeepSeekV3,
         Self::Gemma4,
         Self::GptOss,
@@ -132,6 +134,7 @@ impl ModelKind {
         Self::Lfm2,
         Self::NemotronH,
         Self::PersonaPlex,
+        Self::Qwen2,
         Self::Qwen3,
         Self::Qwen3Next,
         Self::Qwen3Vl,
@@ -151,6 +154,7 @@ impl ModelKind {
             Self::Lfm2 => "lfm2/lfm2_moe",
             Self::NemotronH => "nemotron_h",
             Self::PersonaPlex => "personaplex",
+            Self::Qwen2 => "qwen2",
             Self::Qwen3 => "qwen3",
             Self::Qwen3Next => "qwen3_next",
             Self::Qwen3Vl => "qwen3_vl",
@@ -170,6 +174,7 @@ impl ModelKind {
             "lfm2" | "lfm2_moe" => Ok(Self::Lfm2),
             "nemotron_h" => Ok(Self::NemotronH),
             "personaplex" => Ok(Self::PersonaPlex),
+            "qwen2" => Ok(Self::Qwen2),
             "qwen3" => Ok(Self::Qwen3),
             "qwen3_next" => Ok(Self::Qwen3Next),
             "qwen3_vl" | "qwen3_vl_text" => Ok(Self::Qwen3Vl),
@@ -199,6 +204,7 @@ pub(crate) enum GgufArchitecture {
     Lfm2Moe,
     NemotronH,
     NemotronHMoe,
+    Qwen2,
     Qwen3,
     Qwen3Moe,
     Qwen3Vl,
@@ -208,7 +214,7 @@ pub(crate) enum GgufArchitecture {
 }
 
 impl GgufArchitecture {
-    pub(crate) const SUPPORTED_NAMES: &'static str = "kimi-linear, deepseek2, gpt-oss, inkling, gemma4, llama, mistral, lfm2, lfm2moe, nemotron_h, nemotron_h_moe, qwen3, qwen3moe, qwen3vl, qwen35, qwen35moe, and qwen3next";
+    pub(crate) const SUPPORTED_NAMES: &'static str = "kimi-linear, deepseek2, gpt-oss, inkling, gemma4, llama, mistral, lfm2, lfm2moe, nemotron_h, nemotron_h_moe, qwen2, qwen3, qwen3moe, qwen3vl, qwen35, qwen35moe, and qwen3next";
 
     pub(crate) fn resolve(name: &str) -> Result<Self, Error> {
         match name {
@@ -223,6 +229,7 @@ impl GgufArchitecture {
             "lfm2moe" => Ok(Self::Lfm2Moe),
             "nemotron_h" => Ok(Self::NemotronH),
             "nemotron_h_moe" => Ok(Self::NemotronHMoe),
+            "qwen2" => Ok(Self::Qwen2),
             "qwen3" => Ok(Self::Qwen3),
             "qwen3moe" => Ok(Self::Qwen3Moe),
             "qwen3vl" => Ok(Self::Qwen3Vl),
@@ -246,6 +253,7 @@ impl GgufArchitecture {
             Self::Llama | Self::Mistral => ModelKind::Llama,
             Self::Lfm2 | Self::Lfm2Moe => ModelKind::Lfm2,
             Self::NemotronH | Self::NemotronHMoe => ModelKind::NemotronH,
+            Self::Qwen2 => ModelKind::Qwen2,
             Self::Qwen3 | Self::Qwen3Moe => ModelKind::Qwen3,
             Self::Qwen3Vl => ModelKind::Qwen3Vl,
             Self::Qwen35 | Self::Qwen35Moe => ModelKind::Qwen35Moe,
@@ -296,6 +304,7 @@ impl GgufArchitecture {
             Self::Lfm2Moe => "lfm2moe",
             Self::NemotronH => "nemotron_h",
             Self::NemotronHMoe => "nemotron_h_moe",
+            Self::Qwen2 => "qwen2",
             Self::Qwen3 => "qwen3",
             Self::Qwen3Moe => "qwen3moe",
             Self::Qwen3Vl => "qwen3vl",
@@ -537,7 +546,8 @@ fn validate_model_config(kind: ModelKind, config: &Value) -> Result<(), Error> {
         ModelKind::Lfm2 => lfm2::validate_model_config_value(config),
         ModelKind::NemotronH => nemotron_h::validate_model_config_value(config),
         ModelKind::PersonaPlex => personaplex::validate_model_config_value(config),
-        ModelKind::Qwen3 => qwen3::model_args_from_config_value(config).map(|_| ()),
+        ModelKind::Qwen2 => dense_qwen::config_from_hf_value(config).map(|_| ()),
+        ModelKind::Qwen3 => dense_qwen::config_from_hf_value(config).map(|_| ()),
         ModelKind::Qwen3Next => qwen3_next::validate_model_config_value(config),
         ModelKind::Qwen3Vl => qwen3_vl::validate_model_config_value(config),
         ModelKind::Qwen3VlMoe => qwen3_vl_moe::validate_model_config_value(config),

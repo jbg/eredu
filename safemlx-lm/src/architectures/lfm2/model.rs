@@ -32,8 +32,8 @@ use crate::{
             moe::{PackedSwiGluExperts, TopKRouterScoreFunction},
         },
         input,
-        qwen3::gguf_string,
     },
+    architectures::qwen::dense::gguf_string,
     error::Error,
     nn::tensor::{
         create_attention_mask,

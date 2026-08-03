@@ -44,10 +44,10 @@ pub fn load_tokenizer(model_dir: impl AsRef<Path>) -> Result<Tokenizer, Error> {
         ModelKind::PersonaPlex => Err(Error::UnsupportedArchitecture(
             "PersonaPlex uses the released SentencePiece tokenizer; load it outside the chat tokenizer API".into(),
         )),
-        ModelKind::Qwen3 => qwen3::load_qwen3_tokenizer(model_dir),
+        ModelKind::Qwen2 | ModelKind::Qwen3 => dense_qwen::load_tokenizer(model_dir),
         ModelKind::Qwen3Next => qwen3_next::load_qwen3_next_tokenizer(model_dir),
-        ModelKind::Qwen3Vl => qwen3::load_qwen3_tokenizer(model_dir),
-        ModelKind::Qwen3VlMoe => qwen3::load_qwen3_tokenizer(model_dir),
+        ModelKind::Qwen3Vl => dense_qwen::load_tokenizer(model_dir),
+        ModelKind::Qwen3VlMoe => dense_qwen::load_tokenizer(model_dir),
         ModelKind::Qwen35Moe => qwen3_5_moe::load_qwen3_5_moe_tokenizer(model_dir),
     }
 }

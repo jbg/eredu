@@ -59,7 +59,7 @@ pub use runtime::residency::expert_cache::SparseExpertDenseStreamLoadOptions;
 
 use safemlx::Array;
 
-use crate::architectures::qwen::qwen3::model as resident_qwen3;
+use crate::architectures::qwen::dense as resident_dense_qwen;
 
 /// Builder passed to [`ModelInput`] implementations during generic generation.
 pub struct ModelInputBuilder<'a, C, T> {
@@ -77,7 +77,7 @@ pub trait ModelInput<'a, C, T> {
     fn from_model_input_builder(builder: ModelInputBuilder<'a, C, T>) -> Self;
 }
 
-impl<'a, C> ModelInput<'a, C, Option<Array>> for resident_qwen3::ModelInput<'a, C> {
+impl<'a, C> ModelInput<'a, C, Option<Array>> for resident_dense_qwen::ModelInput<'a, C> {
     fn from_model_input_builder(builder: ModelInputBuilder<'a, C, Option<Array>>) -> Self {
         let ModelInputBuilder { y, cache, state } = builder;
 

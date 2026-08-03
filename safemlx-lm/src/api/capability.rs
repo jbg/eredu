@@ -589,13 +589,13 @@ impl Model {
         let result = match self {
             Self::Llama(model) => llama_spec(&model.args, false)?,
             Self::LlamaLayerwise(model) => llama_spec(model.args(), false)?,
-            Self::Qwen3(model) => qwen3_spec(&model.args, false)?,
-            Self::Qwen3Layerwise(model) => qwen3_spec(model.args(), false)?,
+            Self::DenseQwen(model) => dense_qwen_spec(&model.args, false)?,
+            Self::DenseQwenLayerwise(model) => dense_qwen_spec(model.args(), false)?,
             Self::Qwen3Vl(model) | Self::Qwen3VlMoe(model) => {
-                qwen3_spec(&model.args.text_config, true)?
+                dense_qwen_spec(&model.args.text_config, true)?
             }
             Self::Qwen3VlLayerwise(model) | Self::Qwen3VlMoeLayerwise(model) => {
-                qwen3_spec(&model.args().text_config, true)?
+                dense_qwen_spec(&model.args().text_config, true)?
             }
             Self::DeepSeekV3(model) => deepseek_spec(&model.args)?,
             Self::DeepSeekV3Layerwise(model) => deepseek_spec(model.args())?,
@@ -714,8 +714,11 @@ fn llama_spec(args: &super::llama::ModelArgs, multimodal: bool) -> Result<Spec, 
     ))
 }
 
-fn qwen3_spec(args: &super::qwen3::ModelArgs, multimodal: bool) -> Result<Spec, CapabilityError> {
-    llama_spec(
+fn dense_qwen_spec(
+    args: &super::dense_qwen::DecoderConfig,
+    multimodal: bool,
+) -> Result<Spec, CapabilityError> {
+    let mut spec = llama_spec(
         &super::llama::ModelArgs {
             model_type: args.model_type.clone(),
             hidden_size: args.hidden_size,
@@ -730,7 +733,7 @@ fn qwen3_spec(args: &super::qwen3::ModelArgs, multimodal: bool) -> Result<Spec, 
             rope_traditional: false,
             head_dim: args.head_dim,
             tie_word_embeddings: args.tie_word_embeddings,
-            attention_bias: false,
+            attention_bias: args.qkv_bias(),
             mlp_bias: false,
             rope_scaling: args.rope_scaling.clone(),
             sliding_window: None,
@@ -740,7 +743,40 @@ fn qwen3_spec(args: &super::qwen3::ModelArgs, multimodal: bool) -> Result<Spec, 
             quantized_weight_configs: None,
         },
         multimodal,
-    )
+    )?;
+    if args.use_sliding_window {
+        let full_layers = positive(
+            args.max_window_layers.unwrap_or(args.num_hidden_layers),
+            "max_window_layers",
+        )?;
+        let total_layers = positive(args.num_hidden_layers, "num_hidden_layers")?;
+        let sliding_layers = total_layers.checked_sub(full_layers).ok_or_else(|| {
+            CapabilityError::InvalidConfiguration {
+                field: "max_window_layers",
+                detail: "exceeds num_hidden_layers".into(),
+            }
+        })?;
+        let window = positive(args.sliding_window.unwrap_or_default(), "sliding_window")?;
+        let scalars = kv_scalars(args.num_key_value_heads, args.head_dim)?;
+        spec.2 = CacheStateStrategy::MixedKv {
+            full_layers,
+            sliding_layers,
+            window,
+        };
+        spec.4.growing = vec![
+            GrowingState {
+                layers: full_layers,
+                scalars_per_position: scalars,
+                window: None,
+            },
+            GrowingState {
+                layers: sliding_layers,
+                scalars_per_position: scalars,
+                window: Some(window),
+            },
+        ];
+    }
+    Ok(spec)
 }
 
 fn deepseek_spec(args: &deepseek_v3::ModelArgs) -> Result<Spec, CapabilityError> {
@@ -1331,7 +1367,7 @@ impl Model {
             Self::Llama(model) => Some(parameter_bytes(model)?),
             Self::Lfm2(model) => Some(parameter_bytes(model)?),
             Self::NemotronH(model) => Some(parameter_bytes(model)?),
-            Self::Qwen3(model) => Some(parameter_bytes(model)?),
+            Self::DenseQwen(model) => Some(parameter_bytes(model)?),
             Self::Qwen3Next(model) => Some(parameter_bytes(model)?),
             Self::Qwen3Vl(model) => Some(parameter_bytes(model)?),
             Self::Qwen3VlMoe(model) => Some(parameter_bytes(model)?),
@@ -1347,7 +1383,7 @@ impl Model {
             | Self::KimiLinearLayerwise(_)
             | Self::Lfm2Layerwise(_)
             | Self::NemotronHLayerwise(_)
-            | Self::Qwen3Layerwise(_)
+            | Self::DenseQwenLayerwise(_)
             | Self::Qwen3NextLayerwise(_)
             | Self::Qwen3VlLayerwise(_)
             | Self::Qwen3VlMoeLayerwise(_)
@@ -2276,8 +2312,8 @@ impl Model {
             | Self::Lfm2Layerwise(_)
             | Self::NemotronH(_)
             | Self::NemotronHLayerwise(_)
-            | Self::Qwen3(_)
-            | Self::Qwen3Layerwise(_) => Err(CapabilityError::UnsupportedInput {
+            | Self::DenseQwen(_)
+            | Self::DenseQwenLayerwise(_) => Err(CapabilityError::UnsupportedInput {
                 architecture: self.model_type().into(),
                 reason: format!("{} media is not supported", modality.as_str()),
             }),
@@ -2963,6 +2999,35 @@ mod tests {
     use crate::api::llama;
     use safemlx::{Device, DeviceType};
     use serde_json::json;
+
+    #[test]
+    fn qwen2_runtime_state_splits_full_and_sliding_gqa_layers() {
+        let args = crate::api::dense_qwen::config_from_hf_value(&json!({
+            "model_type": "qwen2", "hidden_size": 16, "num_hidden_layers": 6,
+            "intermediate_size": 32, "num_attention_heads": 4,
+            "num_key_value_heads": 2, "rms_norm_eps": 1e-6, "vocab_size": 64,
+            "max_position_embeddings": 128, "rope_theta": 10000.0,
+            "tie_word_embeddings": false, "use_sliding_window": true,
+            "sliding_window": 8, "max_window_layers": 4
+        }))
+        .unwrap();
+        let (_, _, strategy, _, estimate) = dense_qwen_spec(&args, false).unwrap();
+        assert_eq!(
+            strategy,
+            CacheStateStrategy::MixedKv {
+                full_layers: 4,
+                sliding_layers: 2,
+                window: 8,
+            }
+        );
+        assert_eq!(estimate.growing.len(), 2);
+        assert_eq!(estimate.growing[0].layers, 4);
+        assert_eq!(estimate.growing[0].window, None);
+        assert_eq!(estimate.growing[1].layers, 2);
+        assert_eq!(estimate.growing[1].window, Some(8));
+        // 2 KV heads x 4 values per head x key/value.
+        assert_eq!(estimate.growing[1].scalars_per_position, 16);
+    }
 
     fn tiny_llama(kv_heads: i32, sliding_window: Option<i32>) -> llama::ModelArgs {
         llama::ModelArgs {

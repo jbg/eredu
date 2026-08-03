@@ -1,4 +1,4 @@
-//! Unified fully resident and bounded layer execution for Qwen3.
+//! Bounded layer execution for the shared dense-Qwen decoder.
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
@@ -17,6 +17,7 @@ use safemlx::{
     Array, Dtype, Stream,
 };
 
+use super::{self as resident, DecoderConfig, TransformerBlock};
 use crate::{
     api::{
         common::{
@@ -28,7 +29,6 @@ use crate::{
             },
         },
         input,
-        qwen3::{self as resident, ModelArgs, TransformerBlock},
     },
     error::Error,
     nn::tensor::{create_attention_mask, AttentionMask},
@@ -51,25 +51,30 @@ use crate::{
     runtime::residency::manager::{OffloadUnit, ResidencyReport, ResidentUnitLease, WeightBinding},
 };
 
-const EMBEDDING_UNIT: &str = "qwen3.static.embedding";
-const NORM_UNIT: &str = "qwen3.static.norm";
-const HEAD_UNIT: &str = "qwen3.static.output";
+const EMBEDDING_UNIT: &str = "dense_qwen.static.embedding";
+const NORM_UNIT: &str = "dense_qwen.static.norm";
+const HEAD_UNIT: &str = "dense_qwen.static.output";
 
-/// Host-backed Qwen3 dense or sparse-MoE causal LM.
-pub struct Qwen3LayerwiseModel {
-    execution: LayerwiseModel<Qwen3LayerwiseAdapter>,
+/// Host-backed dense-Qwen causal LM.
+pub struct LayerwiseDecoder {
+    execution: LayerwiseModel<DenseQwenLayerwiseAdapter>,
 }
 
-impl Qwen3LayerwiseModel {
-    /// Returns normalized Qwen3 arguments.
-    pub fn args(&self) -> &ModelArgs {
+impl LayerwiseDecoder {
+    /// Returns the normalized decoder configuration.
+    pub fn args(&self) -> &DecoderConfig {
         self.execution.adapter().args()
     }
 
     /// Creates one standard device-resident KV cache per decoder block.
     pub fn new_cache(&self) -> Vec<Option<ConcatKeyValueCache>> {
         (0..self.args().num_hidden_layers)
-            .map(|_| Some(ConcatKeyValueCache::new()))
+            .map(|layer| {
+                Some(match self.args().sliding_window_for_layer(layer) {
+                    Some(window) => ConcatKeyValueCache::new_for_sliding_attention(window),
+                    None => ConcatKeyValueCache::new(),
+                })
+            })
             .collect()
     }
 
@@ -100,12 +105,7 @@ impl Qwen3LayerwiseModel {
         self.execution.checkpoint_store()
     }
 
-    /// Backward-compatible alias for [`Self::checkpoint_store`].
-    pub fn weight_store(&self) -> &(dyn WeightStore + Send + Sync) {
-        self.checkpoint_store()
-    }
-
-    /// Runs dense or sparse-MoE Qwen3 with a standard KV cache.
+    /// Runs Qwen2/Qwen2.5 or Qwen3 with a standard KV cache.
     pub fn forward(
         &mut self,
         inputs: &Array,
@@ -163,7 +163,7 @@ impl Qwen3LayerwiseModel {
     }
 }
 
-impl CausalLm<Vec<Option<ConcatKeyValueCache>>> for Qwen3LayerwiseModel {
+impl CausalLm<Vec<Option<ConcatKeyValueCache>>> for LayerwiseDecoder {
     fn prefill_input_logits(
         &mut self,
         input: input::ModelInput<'_>,
@@ -188,13 +188,13 @@ impl CausalLm<Vec<Option<ConcatKeyValueCache>>> for Qwen3LayerwiseModel {
     }
 }
 
-/// Loads dense or sparse-MoE Qwen3 through the bounded host-residency engine.
-pub fn load_qwen3_layerwise_model(
+/// Loads Qwen2/Qwen2.5 or Qwen3 through the bounded residency engine.
+pub fn load_safetensors(
     model_dir: impl AsRef<Path>,
     options: impl Into<LayerExecutionLoadOptions>,
     stream: &Stream,
     weights_stream: &Stream,
-) -> Result<Qwen3LayerwiseModel, Error> {
+) -> Result<LayerwiseDecoder, Error> {
     let model_dir = model_dir.as_ref();
     let options = options.into();
     let residency = match options {
@@ -205,43 +205,43 @@ pub fn load_qwen3_layerwise_model(
             WeightResidency::DenseDiskStream(options)
         }
     };
+    let args = resident::load_config(model_dir)?;
     crate::api::structural::validate_safetensors_load_path(
-        crate::api::ModelKind::Qwen3,
+        args.model_kind(),
         model_dir,
         crate::api::ModelLoadOptions::default().with_weight_residency(residency),
     )?;
-    let args = resident::get_qwen3_model_args(model_dir)?;
-    let adapter = Qwen3LayerwiseAdapter::new(args, stream)?;
-    Ok(Qwen3LayerwiseModel {
+    let adapter = DenseQwenLayerwiseAdapter::new(args, stream)?;
+    Ok(LayerwiseDecoder {
         execution: load_layerwise_model(model_dir, adapter, options, stream, weights_stream)?,
     })
 }
 
-pub(crate) fn load_qwen3_gguf_layerwise_model(
+pub(crate) fn load_gguf_checkpoint(
     checkpoint: &GgufCheckpoint,
     metadata: &HashMap<String, GgufMetadataValue>,
     architecture: &str,
     residency: WeightResidency,
     stream: &Stream,
     weights_stream: &Stream,
-) -> Result<(Qwen3LayerwiseModel, Vec<u32>), Error> {
+) -> Result<(LayerwiseDecoder, Vec<u32>), Error> {
     let is_moe = architecture == "qwen3moe";
     let (args, eos_token_ids) =
-        resident::prepare_qwen3_gguf_checkpoint(checkpoint, metadata, architecture, is_moe)?;
+        resident::prepare_gguf_checkpoint(checkpoint, metadata, architecture, is_moe)?;
     let store: Arc<dyn WeightStore + Send + Sync> =
         Arc::new(GgufWeightStore::new_with_max_mapped_shards(
             checkpoint.clone(),
-            |name| resident::translate_qwen3_gguf_weight_name(name, is_moe),
+            |name| resident::translate_gguf_weight_name(name, is_moe),
             residency.max_mapped_shards(),
         )?);
 
     let execution = match residency {
         WeightResidency::LayerwiseHost(options) => {
-            let adapter = Qwen3LayerwiseAdapter::new(args, stream)?;
+            let adapter = DenseQwenLayerwiseAdapter::new(args, stream)?;
             load_layerwise_model_with_store(store, adapter, options, stream, weights_stream)?
         }
         WeightResidency::DenseDiskStream(options) => {
-            let adapter = Qwen3LayerwiseAdapter::new(args, stream)?;
+            let adapter = DenseQwenLayerwiseAdapter::new(args, stream)?;
             load_layerwise_model_with_store(store, adapter, options, stream, weights_stream)?
         }
         WeightResidency::SparseExpertCache(options) => {
@@ -276,7 +276,7 @@ pub(crate) fn load_qwen3_gguf_layerwise_model(
             ));
         }
     };
-    Ok((Qwen3LayerwiseModel { execution }, eos_token_ids))
+    Ok((LayerwiseDecoder { execution }, eos_token_ids))
 }
 
 /// Loads replicated Qwen3-MoE GGUF parameters for sparse expert-parallel
@@ -288,8 +288,7 @@ pub(crate) fn load_qwen3_gguf_sparse_ep_base(
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<(resident::Model, Arc<dyn WeightStore + Send + Sync>), Error> {
-    let (args, _) =
-        resident::prepare_qwen3_gguf_checkpoint(checkpoint, metadata, "qwen3moe", true)?;
+    let (args, _) = resident::prepare_gguf_checkpoint(checkpoint, metadata, "qwen3moe", true)?;
     if !args.is_moe() {
         return Err(Error::UnsupportedArchitecture(
             "sparse GGUF expert parallelism requires a Qwen3 MoE checkpoint".into(),
@@ -298,10 +297,10 @@ pub(crate) fn load_qwen3_gguf_sparse_ep_base(
     let store: Arc<dyn WeightStore + Send + Sync> =
         Arc::new(GgufWeightStore::new_with_max_mapped_shards(
             checkpoint.clone(),
-            |name| resident::translate_qwen3_gguf_weight_name(name, true),
+            |name| resident::translate_gguf_weight_name(name, true),
             max_mapped_shards,
         )?);
-    let adapter = Qwen3LayerwiseAdapter::new_sparse(args.clone(), stream)?;
+    let adapter = DenseQwenLayerwiseAdapter::new_sparse(args.clone(), stream)?;
     let mut model = resident::Model::new(args, stream)?;
 
     let bindings = build_module_bindings(
@@ -336,18 +335,18 @@ pub(crate) fn load_qwen3_gguf_sparse_ep_base(
 
 fn load_qwen3_gguf_sparse_with_store(
     store: Arc<dyn WeightStore + Send + Sync>,
-    args: ModelArgs,
+    args: DecoderConfig,
     options: ExpertCacheLoadOptions,
     non_expert: impl Into<LayerExecutionLoadOptions>,
     stream: &Stream,
     weights_stream: &Stream,
-) -> Result<Qwen3LayerwiseModel, Error> {
+) -> Result<LayerwiseDecoder, Error> {
     if !args.is_moe() {
         return Err(Error::UnsupportedArchitecture(
             "sparse expert caching requires a Qwen3 sparse-MoE GGUF checkpoint".into(),
         ));
     }
-    let adapter = Qwen3LayerwiseAdapter::new_sparse(args.clone(), stream)?;
+    let adapter = DenseQwenLayerwiseAdapter::new_sparse(args.clone(), stream)?;
     let mut execution =
         load_layerwise_model_with_store(store, adapter, non_expert, stream, weights_stream)?;
     let checkpoint_store = execution.weight_store_arc();
@@ -359,26 +358,26 @@ fn load_qwen3_gguf_sparse_with_store(
         weights_stream.clone(),
         stream.clone(),
     )?);
-    Ok(Qwen3LayerwiseModel { execution })
+    Ok(LayerwiseDecoder { execution })
 }
 
 /// Builds the streamed nonexpert Qwen3 execution base used by distributed EP.
 pub(crate) fn load_qwen3_sparse_ep_base_with_store(
     store: Arc<dyn WeightStore + Send + Sync>,
-    args: ModelArgs,
+    args: DecoderConfig,
     non_expert: crate::runtime::residency::dense_stream::DenseDiskStreamLoadOptions,
     stream: &Stream,
     weights_stream: &Stream,
-) -> Result<Qwen3LayerwiseModel, Error> {
+) -> Result<LayerwiseDecoder, Error> {
     if !args.is_moe() {
         return Err(Error::UnsupportedArchitecture(
             "streamed sparse expert parallelism requires Qwen3 MoE".into(),
         ));
     }
-    let adapter = Qwen3LayerwiseAdapter::new_sparse(args, stream)?;
+    let adapter = DenseQwenLayerwiseAdapter::new_sparse(args, stream)?;
     let execution =
         load_layerwise_model_with_store(store, adapter, non_expert, stream, weights_stream)?;
-    Ok(Qwen3LayerwiseModel { execution })
+    Ok(LayerwiseDecoder { execution })
 }
 
 /// Loads sparse Qwen3 with layerwise non-expert weights and expert-granular caching.
@@ -387,7 +386,7 @@ pub fn load_qwen3_sparse_expert_cache_model(
     options: ExpertCacheLoadOptions,
     stream: &Stream,
     weights_stream: &Stream,
-) -> Result<Qwen3LayerwiseModel, Error> {
+) -> Result<LayerwiseDecoder, Error> {
     load_qwen3_sparse_expert_cache_model_with_non_expert(
         model_dir,
         options,
@@ -404,7 +403,7 @@ pub fn load_qwen3_sparse_expert_cache_model_with_dense_layers(
     non_expert: crate::runtime::residency::dense_stream::DenseDiskStreamLoadOptions,
     stream: &Stream,
     weights_stream: &Stream,
-) -> Result<Qwen3LayerwiseModel, Error> {
+) -> Result<LayerwiseDecoder, Error> {
     load_qwen3_sparse_expert_cache_model_with_non_expert(
         model_dir,
         options,
@@ -420,15 +419,15 @@ fn load_qwen3_sparse_expert_cache_model_with_non_expert(
     non_expert: impl Into<LayerExecutionLoadOptions>,
     stream: &Stream,
     weights_stream: &Stream,
-) -> Result<Qwen3LayerwiseModel, Error> {
+) -> Result<LayerwiseDecoder, Error> {
     let model_dir = model_dir.as_ref();
-    let args = resident::get_qwen3_model_args(model_dir)?;
+    let args = resident::load_config(model_dir)?;
     if !args.is_moe() {
         return Err(Error::UnsupportedArchitecture(
             "sparse expert caching requires a Qwen3 sparse-MoE checkpoint".into(),
         ));
     }
-    let adapter = Qwen3LayerwiseAdapter::new_sparse(args.clone(), stream)?;
+    let adapter = DenseQwenLayerwiseAdapter::new_sparse(args.clone(), stream)?;
     let mut execution =
         load_layerwise_model(model_dir, adapter, non_expert, stream, weights_stream)?;
     let store = execution.weight_store_arc();
@@ -441,12 +440,12 @@ fn load_qwen3_sparse_expert_cache_model_with_non_expert(
         stream.clone(),
     )?;
     execution.adapter_mut().expert_cache = Some(cache);
-    Ok(Qwen3LayerwiseModel { execution })
+    Ok(LayerwiseDecoder { execution })
 }
 
-/// Dense and sparse-MoE Qwen3 adapter sharing one complete-block execution path.
-pub struct Qwen3LayerwiseAdapter {
-    args: ModelArgs,
+/// Dense-Qwen adapter sharing one complete-block execution path.
+pub struct DenseQwenLayerwiseAdapter {
+    args: DecoderConfig,
     embedding: MaybeQuantized<nn::Embedding>,
     norm: nn::RmsNorm,
     lm_head: Option<MaybeQuantized<nn::Linear>>,
@@ -454,9 +453,9 @@ pub struct Qwen3LayerwiseAdapter {
     expert_cache: Option<ExpertCache>,
 }
 
-impl Qwen3LayerwiseAdapter {
-    /// Creates metadata-only static Qwen3 modules.
-    pub fn new(args: ModelArgs, stream: &Stream) -> Result<Self, Error> {
+impl DenseQwenLayerwiseAdapter {
+    /// Creates metadata-only static dense-Qwen modules.
+    pub fn new(args: DecoderConfig, stream: &Stream) -> Result<Self, Error> {
         let embedding = unloaded_maybe_quantized_embedding(
             args.vocab_size,
             args.hidden_size,
@@ -485,26 +484,26 @@ impl Qwen3LayerwiseAdapter {
         })
     }
 
-    fn new_sparse(args: ModelArgs, stream: &Stream) -> Result<Self, Error> {
+    fn new_sparse(args: DecoderConfig, stream: &Stream) -> Result<Self, Error> {
         let mut adapter = Self::new(args, stream)?;
         adapter.sparse_expert_cache = true;
         Ok(adapter)
     }
 
     /// Returns normalized model arguments.
-    pub const fn args(&self) -> &ModelArgs {
+    pub const fn args(&self) -> &DecoderConfig {
         &self.args
     }
 }
 
-/// Attention mask shared by every temporary Qwen3 decoder block.
-pub struct Qwen3ForwardContext {
+/// Attention mask shared by every temporary dense-Qwen decoder block.
+pub struct DenseQwenForwardContext {
     mask: Option<Array>,
 }
 
-impl LayerwiseModelAdapter for Qwen3LayerwiseAdapter {
+impl LayerwiseModelAdapter for DenseQwenLayerwiseAdapter {
     type Layer = TransformerBlock;
-    type ForwardContext = Qwen3ForwardContext;
+    type ForwardContext = DenseQwenForwardContext;
 
     fn model_type(&self) -> &str {
         &self.args.model_type
@@ -517,7 +516,7 @@ impl LayerwiseModelAdapter for Qwen3LayerwiseAdapter {
     fn layer_count(&self) -> Result<usize, Error> {
         usize::try_from(self.args.num_hidden_layers).map_err(|_| {
             Error::UnsupportedArchitecture(format!(
-                "Qwen3 layer count {} is invalid",
+                "dense-Qwen layer count {} is invalid",
                 self.args.num_hidden_layers
             ))
         })
@@ -547,7 +546,7 @@ impl LayerwiseModelAdapter for Qwen3LayerwiseAdapter {
         let expected = if self.lm_head.is_some() { 3 } else { 2 };
         if leases.len() != expected {
             return Err(Error::UnsupportedArchitecture(format!(
-                "Qwen3 adapter received {} static leases, expected {expected}",
+                "dense-Qwen adapter received {} static leases, expected {expected}",
                 leases.len()
             )));
         }
@@ -560,8 +559,9 @@ impl LayerwiseModelAdapter for Qwen3LayerwiseAdapter {
     }
 
     fn new_layer(&self, index: usize, stream: &Stream) -> Result<Self::Layer, Error> {
-        let index = i32::try_from(index)
-            .map_err(|_| Error::UnsupportedArchitecture("Qwen3 layer index exceeds i32".into()))?;
+        let index = i32::try_from(index).map_err(|_| {
+            Error::UnsupportedArchitecture("dense-Qwen layer index exceeds i32".into())
+        })?;
         Ok(TransformerBlock::new_for_layer(&self.args, index, stream)?)
     }
 
@@ -570,7 +570,7 @@ impl LayerwiseModelAdapter for Qwen3LayerwiseAdapter {
     }
 
     fn layer_unit_name(&self, index: usize) -> String {
-        format!("qwen3.layer.{index:05}")
+        format!("dense_qwen.layer.{index:05}")
     }
 
     fn populate_layer(
@@ -678,13 +678,13 @@ impl LayerwiseModelAdapter for Qwen3LayerwiseAdapter {
                 Some(AttentionMask::Array(mask)) => Some(mask),
                 Some(AttentionMask::Causal) => {
                     return Err(Error::UnsupportedArchitecture(
-                        "Qwen3 layerwise execution requires an array attention mask".into(),
+                        "dense-Qwen layerwise execution requires an array attention mask".into(),
                     ));
                 }
                 None => None,
             },
         };
-        Ok(Qwen3ForwardContext { mask })
+        Ok(DenseQwenForwardContext { mask })
     }
 
     fn forward_layer<C: KeyValueCache>(
@@ -811,14 +811,14 @@ impl LayerwiseModelAdapter for Qwen3LayerwiseAdapter {
 }
 
 pub(crate) fn qwen3_expert_catalog(
-    args: &ModelArgs,
+    args: &DecoderConfig,
     store: &dyn WeightStore,
 ) -> Result<Vec<ExpertCatalogEntry>, Error> {
     qwen3_expert_catalog_at(args, store, "model.layers")
 }
 
 pub(crate) fn qwen3_expert_catalog_at(
-    args: &ModelArgs,
+    args: &DecoderConfig,
     store: &dyn WeightStore,
     layer_root: &str,
 ) -> Result<Vec<ExpertCatalogEntry>, Error> {
@@ -1020,13 +1020,13 @@ mod tests {
 
     use super::*;
     use crate::{
-        api::qwen3,
+        architectures::qwen::dense as dense_qwen,
         runtime::execution::layerwise::LayerwiseLoadOptions,
         runtime::residency::policy::{MemoryTier, OffloadConfig, ResidencyPolicy},
     };
 
-    fn args(moe: bool) -> ModelArgs {
-        ModelArgs {
+    fn args(moe: bool) -> DecoderConfig {
+        DecoderConfig {
             model_type: "qwen3".into(),
             hidden_size: 8,
             num_hidden_layers: 3,
@@ -1040,6 +1040,13 @@ mod tests {
             head_dim: 4,
             tie_word_embeddings: false,
             rope_scaling: None,
+            hidden_act: "silu".into(),
+            attention_dropout: 0.0,
+            attention_bias: Some(false),
+            mlp_bias: Some(false),
+            use_sliding_window: false,
+            sliding_window: None,
+            max_window_layers: None,
             quantization: None,
             quantization_config: None,
             quantized_weights: None,
@@ -1075,7 +1082,7 @@ mod tests {
         }
     }
 
-    fn write_fixture(dir: &Path, model: &qwen3::Model, split_experts: bool, stream: &Stream) {
+    fn write_fixture(dir: &Path, model: &dense_qwen::Model, split_experts: bool, stream: &Stream) {
         let params = model.parameters().flatten();
         let mut arrays = Vec::<(String, Array)>::new();
         for (name, value) in params {
@@ -1133,6 +1140,10 @@ mod tests {
                 "rope_theta": model.args.rope_theta,
                 "head_dim": model.args.head_dim,
                 "tie_word_embeddings": model.args.tie_word_embeddings,
+                "attention_bias": model.args.attention_bias,
+                "use_sliding_window": model.args.use_sliding_window,
+                "sliding_window": model.args.sliding_window,
+                "max_window_layers": model.args.max_window_layers,
                 "moe_intermediate_size": model.args.moe_intermediate_size,
                 "num_experts": model.args.num_experts,
                 "num_experts_per_tok": model.args.num_experts_per_tok,
@@ -1152,23 +1163,24 @@ mod tests {
         }
     }
 
-    fn parity(moe: bool, depth: usize) {
-        let gpu = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
+    fn parity_with_args(model_args: DecoderConfig, depth: usize) {
+        let gpu = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
         let cpu = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
-        let mut fixture = qwen3::Model::new(args(moe), gpu.stream()).unwrap();
+        let mut fixture = dense_qwen::Model::new(model_args, gpu.stream()).unwrap();
         initialize(&mut fixture, gpu.stream());
         let dir = tempfile::tempdir().unwrap();
         write_fixture(dir.path(), &fixture, false, gpu.stream());
 
-        let mut resident = qwen3::load_qwen3_model(dir.path(), gpu.stream(), cpu.stream()).unwrap();
-        let mut layerwise = load_qwen3_layerwise_model(
+        let mut resident =
+            dense_qwen::load_safetensors(dir.path(), gpu.stream(), cpu.stream()).unwrap();
+        let mut layerwise = load_safetensors(
             dir.path(),
             LayerwiseLoadOptions::new(OffloadConfig::new(None, None, depth).unwrap()),
             gpu.stream(),
             cpu.stream(),
         )
         .unwrap();
-        let mut resident_cache: Vec<Option<ConcatKeyValueCache>> = Vec::new();
+        let mut resident_cache = resident.new_cache();
         let mut layerwise_cache = layerwise.new_cache();
         for tokens in [
             Array::from_slice(&[1u32, 2], &[1, 2]),
@@ -1178,7 +1190,7 @@ mod tests {
         ] {
             let expected = resident
                 .forward(
-                    qwen3::ModelInput {
+                    dense_qwen::ModelInput {
                         inputs: &tokens,
                         mask: None,
                         cache: &mut resident_cache,
@@ -1194,7 +1206,7 @@ mod tests {
             let layers = report
                 .units()
                 .iter()
-                .filter(|unit| unit.id().as_str().starts_with("qwen3.layer."))
+                .filter(|unit| unit.id().as_str().starts_with("dense_qwen.layer."))
                 .collect::<Vec<_>>();
             assert!(layers.iter().all(|unit| unit.host_resident()));
             assert!(layers.iter().filter(|unit| unit.device_resident()).count() <= depth);
@@ -1206,10 +1218,25 @@ mod tests {
         }
     }
 
+    fn parity(moe: bool, depth: usize) {
+        parity_with_args(args(moe), depth);
+    }
+
     #[test]
     fn qwen3_dense_layerwise_prefill_and_cached_decode_parity() {
         parity(false, 1);
         parity(false, 2);
+    }
+
+    #[test]
+    fn qwen2_resident_and_layerwise_full_and_sliding_attention_parity() {
+        let mut model_args = args(false);
+        model_args.model_type = "qwen2".into();
+        model_args.attention_bias = Some(true);
+        model_args.use_sliding_window = true;
+        model_args.sliding_window = Some(2);
+        model_args.max_window_layers = Some(1);
+        parity_with_args(model_args, 1);
     }
 
     #[test]
@@ -1227,7 +1254,7 @@ mod tests {
     fn qwen3_sparse_expert_cache_streams_non_expert_layers() {
         let gpu = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
         let cpu = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
-        let mut fixture = qwen3::Model::new(args(true), gpu.stream()).unwrap();
+        let mut fixture = dense_qwen::Model::new(args(true), gpu.stream()).unwrap();
         initialize(&mut fixture, gpu.stream());
         let dir = tempfile::tempdir().unwrap();
         write_fixture(dir.path(), &fixture, false, gpu.stream());
@@ -1261,14 +1288,15 @@ mod tests {
             .residency()
             .units()
             .iter()
-            .filter(|unit| unit.id().as_str().starts_with("qwen3.layer."))
+            .filter(|unit| unit.id().as_str().starts_with("dense_qwen.layer."))
             .all(|unit| {
                 unit.planned_tier() == MemoryTier::Disk
                     && !unit.host_resident()
                     && !unit.device_resident()
             }));
 
-        let mut resident = qwen3::load_qwen3_model(dir.path(), gpu.stream(), cpu.stream()).unwrap();
+        let mut resident =
+            dense_qwen::load_safetensors(dir.path(), gpu.stream(), cpu.stream()).unwrap();
         let mut resident_cache: Vec<Option<ConcatKeyValueCache>> = Vec::new();
         let mut cached_cache = cached.new_cache();
         for tokens in [
@@ -1277,7 +1305,7 @@ mod tests {
         ] {
             let expected = resident
                 .forward(
-                    qwen3::ModelInput {
+                    dense_qwen::ModelInput {
                         inputs: &tokens,
                         mask: None,
                         cache: &mut resident_cache,
@@ -1296,7 +1324,7 @@ mod tests {
     fn sparse_expert_cache_parity(split_experts: bool) {
         let gpu = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
         let cpu = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
-        let mut fixture = qwen3::Model::new(args(true), gpu.stream()).unwrap();
+        let mut fixture = dense_qwen::Model::new(args(true), gpu.stream()).unwrap();
         initialize(&mut fixture, gpu.stream());
         let dir = tempfile::tempdir().unwrap();
         write_fixture(dir.path(), &fixture, split_experts, gpu.stream());
@@ -1305,7 +1333,7 @@ mod tests {
         write_fixture(resident_dir.path(), &fixture, false, gpu.stream());
 
         let mut resident =
-            qwen3::load_qwen3_model(resident_dir.path(), gpu.stream(), cpu.stream()).unwrap();
+            dense_qwen::load_safetensors(resident_dir.path(), gpu.stream(), cpu.stream()).unwrap();
         let non_expert = LayerwiseLoadOptions::new(OffloadConfig::new(None, None, 1).unwrap());
         let expert_options = ExpertCacheLoadOptions::new(
             non_expert,
@@ -1330,7 +1358,7 @@ mod tests {
         ] {
             let expected = resident
                 .forward(
-                    qwen3::ModelInput {
+                    dense_qwen::ModelInput {
                         inputs: &tokens,
                         mask: None,
                         cache: &mut resident_cache,

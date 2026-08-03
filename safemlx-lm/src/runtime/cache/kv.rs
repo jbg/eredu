@@ -1727,6 +1727,10 @@ pub struct ConcatKeyValueCache {
     capacity: i32,
     step: i32,
     max_size: Option<i32>,
+    /// Attention window whose retained past is one token shorter because the
+    /// current token is included in the window. Updates return the full
+    /// submitted span before applying this retention bound.
+    attention_window: Option<i32>,
 }
 
 /// A bounded key/value cache for causal sliding-window attention.
@@ -1832,6 +1836,19 @@ impl ConcatKeyValueCache {
         }
     }
 
+    /// Creates a cache for exact causal sliding-window attention.
+    ///
+    /// A window of `N` includes the current token, so the cache retains at most
+    /// `N - 1` past states between calls while returning every newly submitted
+    /// state for multi-token prefill attention.
+    pub fn new_for_sliding_attention(window: i32) -> Self {
+        assert!(window > 0, "sliding attention window must be positive");
+        Self {
+            attention_window: Some(window),
+            ..Self::default()
+        }
+    }
+
     /// Creates an unbounded cache whose backing arrays grow in `step`-token chunks.
     pub(crate) fn new_with_step(step: i32) -> Self {
         Self {
@@ -1855,6 +1872,35 @@ impl ConcatKeyValueCache {
 
     /// Truncates the cache to `len` tokens.
     pub fn truncate(&mut self, len: i32, stream: &Stream) -> Result<(), Exception> {
+        if self.attention_window.is_some() {
+            if len < 0 || len > self.offset {
+                return Err(Exception::custom(format!(
+                    "sliding cache truncate position {len} is outside 0..{}",
+                    self.offset
+                )));
+            }
+            if len == 0 {
+                self.clear();
+                return Ok(());
+            }
+            let retained_origin = self.offset - self.length;
+            if len < retained_origin {
+                return Err(Exception::custom(format!(
+                    "cannot roll a sliding cache back to absolute position {len}; retained state starts at {retained_origin}"
+                )));
+            }
+            let retained = len - retained_origin;
+            if let Some(keys) = self.keys.take() {
+                self.keys = Some(keys.try_index_device((.., .., ..retained, ..), stream)?);
+            }
+            if let Some(values) = self.values.take() {
+                self.values = Some(values.try_index_device((.., .., ..retained, ..), stream)?);
+            }
+            self.offset = len;
+            self.length = retained;
+            self.capacity = retained;
+            return Ok(());
+        }
         if len < 0 || len > self.length {
             return Err(Exception::custom(format!(
                 "concatenating cache truncate length {len} is outside 0..{}",
@@ -1935,7 +1981,7 @@ impl KeyValueCache for ConcatKeyValueCache {
     }
 
     fn max_size(&self) -> Option<i32> {
-        self.max_size
+        self.attention_window.or(self.max_size)
     }
 
     fn retained_arrays(&self) -> Vec<&Array> {
@@ -1950,6 +1996,30 @@ impl KeyValueCache for ConcatKeyValueCache {
     ) -> Result<(Array, Array), Exception> {
         let new_tokens = keys.dim(-2);
         self.offset += new_tokens;
+
+        if let Some(window) = self.attention_window {
+            let combined_keys = match self.keys.take() {
+                Some(previous) => concatenate_axis(&[previous, keys], -2, stream)?,
+                None => keys,
+            };
+            let combined_values = match self.values.take() {
+                Some(previous) => concatenate_axis(&[previous, values], -2, stream)?,
+                None => values,
+            };
+            let retained = (window - 1).min(combined_keys.dim(-2));
+            if retained == 0 {
+                self.keys = None;
+                self.values = None;
+            } else {
+                let start = combined_keys.dim(-2) - retained;
+                self.keys = Some(combined_keys.try_index_device((.., .., start.., ..), stream)?);
+                self.values =
+                    Some(combined_values.try_index_device((.., .., start.., ..), stream)?);
+            }
+            self.length = retained;
+            self.capacity = retained;
+            return Ok((combined_keys, combined_values));
+        }
 
         if self.step <= 1 {
             match (self.keys.take(), self.values.take()) {

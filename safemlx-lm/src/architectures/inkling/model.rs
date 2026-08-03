@@ -36,8 +36,8 @@ use crate::{
             moe::PackedSwiGluExperts,
         },
         input,
-        qwen3::{gguf_i32_catalog, gguf_string},
     },
+    architectures::qwen::dense::{gguf_i32_catalog, gguf_string},
     error::Error,
     runtime::cache::residency::{
         CacheRankIdentity, CacheResidencyManager, CacheResidencyReport, PagedCacheOptions,

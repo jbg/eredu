@@ -1216,6 +1216,7 @@ fn modalities_for_safetensors(kind: ModelKind, config: &Value) -> Vec<ArtifactMo
         | ModelKind::Lfm2
         | ModelKind::NemotronH
         | ModelKind::PersonaPlex
+        | ModelKind::Qwen2
         | ModelKind::Qwen3
         | ModelKind::Qwen3Next
         | ModelKind::Qwen35Moe => {}
@@ -1365,7 +1366,7 @@ mod tests {
             .iter()
             .map(|(_, shape, dtype)| {
                 let bytes = match dtype {
-                    Dtype::F8_E4M3 | Dtype::U8 => 1,
+                    Dtype::F8_E4M3 | Dtype::U8 | Dtype::I8 => 1,
                     Dtype::F16 | Dtype::BF16 => 2,
                     Dtype::F32 | Dtype::U32 => 4,
                     other => panic!("unsupported fixture dtype {other:?}"),
@@ -1672,6 +1673,107 @@ mod tests {
             "num_experts_per_tok": if is_moe { 2 } else { 0 },
             "norm_topk_prob": is_moe
         })
+    }
+
+    fn qwen2_config(tied: bool) -> Value {
+        json!({
+            "architectures": ["Qwen2ForCausalLM"],
+            "model_type": "qwen2",
+            "hidden_size": 8,
+            "num_hidden_layers": 1,
+            "intermediate_size": 16,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 2,
+            "rms_norm_eps": 0.000001,
+            "vocab_size": 32,
+            "max_position_embeddings": 128,
+            "rope_theta": 1_000_000.0,
+            "head_dim": 2,
+            "tie_word_embeddings": tied,
+            "attention_bias": true,
+            "mlp_bias": false,
+            "use_sliding_window": false
+        })
+    }
+
+    fn qwen2_safetensor_specs(tied: bool) -> Vec<(String, Vec<usize>, Dtype)> {
+        let mut specs = vec![
+            ("model.embed_tokens.weight".into(), vec![32, 8], Dtype::F32),
+            ("model.norm.weight".into(), vec![8], Dtype::F32),
+            (
+                "model.layers.0.input_layernorm.weight".into(),
+                vec![8],
+                Dtype::F32,
+            ),
+            (
+                "model.layers.0.post_attention_layernorm.weight".into(),
+                vec![8],
+                Dtype::F32,
+            ),
+            (
+                "model.layers.0.self_attn.q_proj.weight".into(),
+                vec![8, 8],
+                Dtype::F32,
+            ),
+            (
+                "model.layers.0.self_attn.k_proj.weight".into(),
+                vec![4, 8],
+                Dtype::F32,
+            ),
+            (
+                "model.layers.0.self_attn.v_proj.weight".into(),
+                vec![4, 8],
+                Dtype::F32,
+            ),
+            (
+                "model.layers.0.self_attn.o_proj.weight".into(),
+                vec![8, 8],
+                Dtype::F32,
+            ),
+            (
+                "model.layers.0.self_attn.q_proj.bias".into(),
+                vec![8],
+                Dtype::F32,
+            ),
+            (
+                "model.layers.0.self_attn.k_proj.bias".into(),
+                vec![4],
+                Dtype::F32,
+            ),
+            (
+                "model.layers.0.self_attn.v_proj.bias".into(),
+                vec![4],
+                Dtype::F32,
+            ),
+            (
+                "model.layers.0.mlp.gate_proj.weight".into(),
+                vec![16, 8],
+                Dtype::F32,
+            ),
+            (
+                "model.layers.0.mlp.up_proj.weight".into(),
+                vec![16, 8],
+                Dtype::F32,
+            ),
+            (
+                "model.layers.0.mlp.down_proj.weight".into(),
+                vec![8, 16],
+                Dtype::F32,
+            ),
+        ];
+        if !tied {
+            specs.push(("lm_head.weight".into(), vec![32, 8], Dtype::F32));
+        }
+        specs
+    }
+
+    fn write_complete_qwen2_safetensors_dir(
+        tied: bool,
+        mutate: impl FnOnce(&mut Vec<(String, Vec<usize>, Dtype)>),
+    ) -> tempfile::TempDir {
+        let mut specs = qwen2_safetensor_specs(tied);
+        mutate(&mut specs);
+        write_typed_safetensors_dir(&qwen2_config(tied), &specs)
     }
 
     fn qwen3_safetensor_specs() -> Vec<(String, Vec<usize>)> {
@@ -5837,6 +5939,75 @@ mod tests {
             ModelLoadOptions::default(),
         )
         .unwrap();
+    }
+
+    #[test]
+    fn qwen2_tied_and_untied_safetensors_catalogs_are_exactly_loadable() {
+        for tied in [true, false] {
+            let directory = write_complete_qwen2_safetensors_dir(tied, |_| {});
+            let report =
+                inspect_model(directory.path(), ModelInspectionOptions::default()).unwrap();
+            assert_eq!(report.model_kind, Some(ModelKind::Qwen2));
+            assert_eq!(report.structural_binding, InspectionReadiness::Ready);
+            assert!(report.is_loadable());
+            structural::validate_safetensors_load_path(
+                ModelKind::Qwen2,
+                directory.path(),
+                ModelLoadOptions::default(),
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn qwen2_inspection_and_loader_preflight_reject_the_same_invalid_catalogs() {
+        let cases = [
+            write_complete_qwen2_safetensors_dir(false, |specs| {
+                specs.retain(|(name, _, _)| name != "model.layers.0.self_attn.q_proj.bias");
+            }),
+            write_complete_qwen2_safetensors_dir(false, |specs| {
+                specs.retain(|(name, _, _)| name != "model.layers.0.mlp.down_proj.weight");
+            }),
+            write_complete_qwen2_safetensors_dir(false, |specs| {
+                specs.push((
+                    "model.layers.0.self_attn.q_norm.weight".into(),
+                    vec![2],
+                    Dtype::F32,
+                ));
+            }),
+            write_complete_qwen2_safetensors_dir(false, |specs| {
+                let (_, shape, _) = specs
+                    .iter_mut()
+                    .find(|(name, _, _)| name == "model.layers.0.self_attn.k_proj.weight")
+                    .unwrap();
+                *shape = vec![8, 8];
+            }),
+            write_complete_qwen2_safetensors_dir(false, |specs| {
+                let (_, _, dtype) = specs
+                    .iter_mut()
+                    .find(|(name, _, _)| name == "model.layers.0.self_attn.v_proj.bias")
+                    .unwrap();
+                *dtype = Dtype::I8;
+            }),
+        ];
+
+        for (case, directory) in cases.into_iter().enumerate() {
+            let report =
+                inspect_model(directory.path(), ModelInspectionOptions::default()).unwrap();
+            assert_eq!(
+                report.structural_binding,
+                InspectionReadiness::Invalid,
+                "case {case}: {:#?}",
+                report.issues
+            );
+            assert!(!report.is_loadable());
+            assert!(structural::validate_safetensors_load_path(
+                ModelKind::Qwen2,
+                directory.path(),
+                ModelLoadOptions::default(),
+            )
+            .is_err());
+        }
     }
 
     #[test]

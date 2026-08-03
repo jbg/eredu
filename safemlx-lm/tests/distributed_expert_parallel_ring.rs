@@ -31,7 +31,7 @@ use safemlx_lm::{
         inkling::model as inkling,
         lfm2::model as lfm2,
         nemotron_h::model as nemotron_h,
-        qwen::{hybrid::qwen3_5 as qwen3_5_moe, qwen3::model as qwen3, vl::model as qwen3_vl},
+        qwen::{dense as dense_qwen, hybrid::qwen3_5 as qwen3_5_moe, vl::model as qwen3_vl},
     },
     runtime::cache::{ConcatKeyValueCache, SlidingKeyValueCache},
     runtime::checkpoint::quantization::{AffineQuantization, WeightQuantization},
@@ -612,7 +612,7 @@ fn save_index(directory: &Path, shards: &[(&str, &[(String, Array)])]) {
     .unwrap();
 }
 
-fn split_qwen_checkpoint(model: &qwen3::Model, directory: &Path, stream: &Stream) {
+fn split_qwen_checkpoint(model: &dense_qwen::Model, directory: &Path, stream: &Stream) {
     let mut replicated = Vec::new();
     let mut experts = (0..4).map(|_| Vec::new()).collect::<Vec<_>>();
     for (name, value) in model.parameters().flatten() {
@@ -735,12 +735,12 @@ fn save_expected(
     save_arrays(path, &arrays);
 }
 
-fn save_qwen_expected(model: &mut qwen3::Model, path: &Path, stream: &Stream) {
+fn save_qwen_expected(model: &mut dense_qwen::Model, path: &Path, stream: &Stream) {
     let prompt = Array::from_slice(&[1u32, 2, 3], &[1, 3]);
     let mut cache: Vec<Option<ConcatKeyValueCache>> = Vec::new();
     let prefill = model
         .forward(
-            qwen3::ModelInput {
+            dense_qwen::ModelInput {
                 inputs: &prompt,
                 mask: None,
                 cache: &mut cache,
@@ -751,7 +751,7 @@ fn save_qwen_expected(model: &mut qwen3::Model, path: &Path, stream: &Stream) {
     let first = greedy_token(&prefill, stream);
     let decode = model
         .forward(
-            qwen3::ModelInput {
+            dense_qwen::ModelInput {
                 inputs: &first,
                 mask: None,
                 cache: &mut cache,
@@ -762,7 +762,7 @@ fn save_qwen_expected(model: &mut qwen3::Model, path: &Path, stream: &Stream) {
     let second = greedy_token(&decode, stream);
     let decode_second = model
         .forward(
-            qwen3::ModelInput {
+            dense_qwen::ModelInput {
                 inputs: &second,
                 mask: None,
                 cache: &mut cache,
@@ -775,7 +775,7 @@ fn save_qwen_expected(model: &mut qwen3::Model, path: &Path, stream: &Stream) {
     let mut sliding_cache = vec![Some(SlidingKeyValueCache::new(2))];
     let sliding_prefill = model
         .forward(
-            qwen3::ModelInput {
+            dense_qwen::ModelInput {
                 inputs: &prompt,
                 mask: None,
                 cache: &mut sliding_cache,
@@ -786,7 +786,7 @@ fn save_qwen_expected(model: &mut qwen3::Model, path: &Path, stream: &Stream) {
     let sliding_first = greedy_token(&sliding_prefill, stream);
     let sliding_decode = model
         .forward(
-            qwen3::ModelInput {
+            dense_qwen::ModelInput {
                 inputs: &sliding_first,
                 mask: None,
                 cache: &mut sliding_cache,
@@ -797,7 +797,7 @@ fn save_qwen_expected(model: &mut qwen3::Model, path: &Path, stream: &Stream) {
     let sliding_second = greedy_token(&sliding_decode, stream);
     let sliding_decode_second = model
         .forward(
-            qwen3::ModelInput {
+            dense_qwen::ModelInput {
                 inputs: &sliding_second,
                 mask: None,
                 cache: &mut sliding_cache,
@@ -893,8 +893,8 @@ fn write_qwen_fixture(directory: &Path, packed_directory: &Path) {
     std::fs::write(packed_directory.join("config.json"), config).unwrap();
     let context = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
     let stream = context.stream();
-    let args = qwen3::get_qwen3_model_args(directory).unwrap();
-    let mut model = qwen3::Model::new(args, stream).unwrap();
+    let args = dense_qwen::load_config(directory).unwrap();
+    let mut model = dense_qwen::Model::new(args, stream).unwrap();
     initialize_parameters(&mut model, stream);
     save_arrays(
         &packed_directory.join("model.safetensors"),
@@ -909,7 +909,8 @@ fn write_qwen_fixture(directory: &Path, packed_directory: &Path) {
     save_qwen_expected(&mut model, &directory.join("expected.safetensors"), stream);
     let quantization = WeightQuantization::Affine(AffineQuantization::new(32, 4).unwrap());
     let mut quantized =
-        qwen3::load_qwen3_model_quantized(packed_directory, quantization, stream, stream).unwrap();
+        dense_qwen::load_safetensors_quantized(packed_directory, quantization, stream, stream)
+            .unwrap();
     save_qwen_expected(
         &mut quantized,
         &packed_directory.join("expected-affine.safetensors"),
