@@ -21,7 +21,7 @@ use crate::{
         common::{self, generation::CausalLm, linear::project_logits_maybe_quantized},
         input,
         nemotron_h::{
-            self as resident, BlockInput, Cache, Experts, LayerBlockType, LayerCache, ModelArgs,
+            self as resident, BlockInput, Cache, Experts, LayerCache, LayerPolicy, ModelArgs,
             TransformerBlock,
         },
     },
@@ -310,7 +310,11 @@ fn load_nemotron_h_gguf_sparse_with_store(
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<NemotronHLayerwiseModel, Error> {
-    if !args.layer_block_types()?.contains(&LayerBlockType::Moe) {
+    if !args
+        .layer_schedule
+        .iter()
+        .any(|policy| *policy == LayerPolicy::SparseMoe)
+    {
         return Err(Error::UnsupportedArchitecture(
             "sparse expert caching requires a Nemotron-H MoE GGUF checkpoint".into(),
         ));
@@ -404,7 +408,11 @@ fn load_nemotron_h_sparse_expert_cache_model_with_non_expert(
             .with_weight_residency(WeightResidency::SparseExpertCache(options)),
     )?;
     let args = resident::get_nemotron_h_model_args(model_dir)?;
-    if !args.layer_block_types()?.contains(&LayerBlockType::Moe) {
+    if !args
+        .layer_schedule
+        .iter()
+        .any(|policy| *policy == LayerPolicy::SparseMoe)
+    {
         return Err(Error::UnsupportedArchitecture(
             "sparse expert caching requires a Nemotron-H MoE checkpoint".into(),
         ));
@@ -438,6 +446,7 @@ pub struct NemotronHLayerwiseAdapter {
 impl NemotronHLayerwiseAdapter {
     /// Creates metadata-only pinned modules.
     pub fn new(args: ModelArgs, stream: &Stream) -> Result<Self, Error> {
+        resident::validate_model_args(&args)?;
         let embeddings = common::linear::unloaded_maybe_quantized_embedding(
             args.vocab_size,
             args.hidden_size,
@@ -472,7 +481,7 @@ impl NemotronHLayerwiseAdapter {
     }
 
     fn new_cache(&self) -> Cache {
-        Cache::new(&self.args).expect("validated Nemotron-H hybrid pattern")
+        Cache::new(&self.args)
     }
 
     fn recipes_for_module(
@@ -487,7 +496,7 @@ impl NemotronHLayerwiseAdapter {
         let mut recipes = BTreeMap::new();
 
         if let Some(index) = layer_index
-            .filter(|index| self.args.layer_block_type(*index).ok() == Some(LayerBlockType::Moe))
+            .filter(|index| self.args.layer_schedule.get(*index) == Some(&LayerPolicy::SparseMoe))
         {
             let packed_prefix = format!("model.layers.{index}.moe.experts");
             if !keys.contains(&format!("{packed_prefix}.up_proj"))
@@ -522,9 +531,9 @@ impl NemotronHLayerwiseAdapter {
             }
         }
 
-        if layer_index.is_some_and(|index| {
-            self.args.layer_block_type(index).ok() == Some(LayerBlockType::Mamba)
-        }) {
+        if layer_index
+            .is_some_and(|index| self.args.layer_schedule.get(index) == Some(&LayerPolicy::Mamba))
+        {
             let parameters = module.parameters().flatten();
             for local_name in [
                 "mamba.conv1d.weight",
@@ -712,25 +721,32 @@ impl GeneralLayerwiseModelAdapter for NemotronHLayerwiseAdapter {
             *cache = self.new_cache();
             return Ok(());
         }
-        let types = self.args.layer_block_types()?;
-        if cache.layers.len() != types.len() {
+        if cache.layers.len() != self.args.layer_schedule.len() {
             return Err(Error::UnsupportedArchitecture(format!(
                 "Nemotron-H cache has {} layers, expected {}",
                 cache.layers.len(),
-                types.len()
+                self.args.layer_schedule.len()
             )));
         }
-        for (index, (block_type, cache)) in types.iter().zip(&cache.layers).enumerate() {
-            let matches = matches!(
-                (block_type, cache),
-                (LayerBlockType::Mamba, LayerCache::Mamba(_))
-                    | (LayerBlockType::Attention, LayerCache::Attention(_))
-                    | (LayerBlockType::Mlp, LayerCache::Mlp)
-                    | (LayerBlockType::Moe, LayerCache::Moe)
-            );
+        for (index, (policy, cache)) in self
+            .args
+            .layer_schedule
+            .iter()
+            .zip(&cache.layers)
+            .enumerate()
+        {
+            let matches = match (policy, cache) {
+                (LayerPolicy::Mamba, LayerCache::Mamba(_))
+                | (LayerPolicy::DenseMlp, LayerCache::Mlp)
+                | (LayerPolicy::SparseMoe, LayerCache::Moe) => true,
+                (LayerPolicy::SelfAttention(expected), LayerCache::Attention(cache)) => {
+                    *expected == cache.policy()
+                }
+                _ => false,
+            };
             if !matches {
                 return Err(Error::UnsupportedArchitecture(format!(
-                    "Nemotron-H cache kind does not match layer pattern at layer {index}"
+                    "Nemotron-H cache kind does not match layer schedule at layer {index}"
                 )));
             }
         }
@@ -999,7 +1015,7 @@ pub(crate) fn nemotron_h_expert_catalog(
     let normalized = normalized_checkpoint_keys(store, args)?;
     let mut entries = Vec::new();
     for layer in 0..args.num_hidden_layers as usize {
-        if args.layer_block_type(layer)? != LayerBlockType::Moe {
+        if args.layer_schedule.get(layer) != Some(&LayerPolicy::SparseMoe) {
             continue;
         }
         let prefix = format!("model.layers.{layer}.moe.experts");
@@ -1088,8 +1104,9 @@ mod tests {
     use super::{load_nemotron_h_layerwise_model, load_nemotron_h_sparse_expert_cache_model};
     use crate::{
         architectures::nemotron_h::model::{
-            self as resident, Cache, LayerCache, Model, ModelArgs, ModelInput,
+            self as resident, Cache, LayerCache, LayerPolicy, Model, ModelArgs, ModelInput,
         },
+        runtime::cache::KeyValueCache,
         runtime::execution::layerwise::LayerwiseLoadOptions,
         runtime::residency::expert_cache::ExpertCacheLoadOptions,
         runtime::residency::policy::{OffloadConfig, ResidencyPolicy},
@@ -1107,6 +1124,7 @@ mod tests {
             "num_key_value_heads": 1,
             "head_dim": 4,
             "max_position_embeddings": 64,
+            "sliding_window": 3,
             "mamba_num_heads": 2,
             "mamba_head_dim": 4,
             "n_groups": 1,
@@ -1124,7 +1142,7 @@ mod tests {
     }
 
     fn args() -> ModelArgs {
-        serde_json::from_value(config()).unwrap()
+        resident::model_args_from_config_value(&config()).unwrap()
     }
 
     fn initialize(model: &mut Model, stream: &Stream) {
@@ -1152,11 +1170,11 @@ mod tests {
             let Some(rest) = runtime.strip_prefix(&prefix) else {
                 continue;
             };
-            let field = match args.layer_block_type(index).unwrap() {
-                crate::architectures::nemotron_h::model::LayerBlockType::Mamba => "mamba",
-                crate::architectures::nemotron_h::model::LayerBlockType::Attention => "attention",
-                crate::architectures::nemotron_h::model::LayerBlockType::Mlp => "mlp",
-                crate::architectures::nemotron_h::model::LayerBlockType::Moe => "moe",
+            let field = match args.layer_schedule.get(index).unwrap() {
+                LayerPolicy::Mamba => "mamba",
+                LayerPolicy::SelfAttention(_) => "attention",
+                LayerPolicy::DenseMlp => "mlp",
+                LayerPolicy::SparseMoe => "moe",
             };
             if let Some(mixer_rest) = rest.strip_prefix(&format!("{field}.")) {
                 return format!("backbone.layers.{index}.mixer.{mixer_rest}");
@@ -1269,6 +1287,22 @@ mod tests {
                     LayerCache::Mlp | LayerCache::Moe => None,
                 };
                 assert_eq!(expected_offset, actual_offset);
+                if let (LayerCache::Attention(expected), LayerCache::Attention(actual)) =
+                    (expected, actual)
+                {
+                    let expected_lengths = expected
+                        .retained_arrays()
+                        .iter()
+                        .map(|array| array.dim(-2))
+                        .collect::<Vec<_>>();
+                    let actual_lengths = actual
+                        .retained_arrays()
+                        .iter()
+                        .map(|array| array.dim(-2))
+                        .collect::<Vec<_>>();
+                    assert_eq!(actual_lengths, expected_lengths);
+                    assert!(actual_lengths.iter().all(|length| *length <= 2));
+                }
             }
             let report = layerwise.residency_report().unwrap();
             let layers = report

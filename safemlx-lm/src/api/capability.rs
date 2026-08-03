@@ -1,6 +1,6 @@
 //! Architecture-independent model capability, accounting, and admission APIs.
 
-use std::num::NonZeroU8;
+use std::{collections::BTreeMap, num::NonZeroU8};
 
 use safemlx::{module::ModuleParameters, Array, Stream};
 
@@ -123,10 +123,12 @@ pub enum CacheStateStrategy {
         /// Shared rotary-key width stored per layer and position.
         rotary_width: u64,
     },
-    /// Full attention is combined with bounded convolution or recurrent state.
+    /// Attention is combined with bounded convolution or recurrent state.
     HybridRecurrent {
         /// Full-context attention layer count.
-        attention_layers: u64,
+        full_attention_layers: u64,
+        /// Bounded attention layers grouped by exact window.
+        sliding_attention: Vec<SlidingWindowLayerCount>,
         /// Recurrent/linear-attention layer count.
         recurrent_layers: u64,
     },
@@ -881,7 +883,8 @@ fn kimi_linear_spec(args: &kimi_linear::ModelArgs) -> Result<Spec, CapabilityErr
         context.0,
         context.1,
         CacheStateStrategy::HybridRecurrent {
-            attention_layers: attention,
+            full_attention_layers: attention,
+            sliding_attention: Vec::new(),
             recurrent_layers: recurrent,
         },
         text_modalities(),
@@ -1137,7 +1140,8 @@ fn lfm2_spec(args: &lfm2::ModelArgs) -> Result<Spec, CapabilityError> {
         context.0,
         context.1,
         CacheStateStrategy::HybridRecurrent {
-            attention_layers: attention,
+            full_attention_layers: attention,
+            sliding_attention: Vec::new(),
             recurrent_layers: conv,
         },
         text_modalities(),
@@ -1157,20 +1161,18 @@ fn lfm2_spec(args: &lfm2::ModelArgs) -> Result<Spec, CapabilityError> {
 
 fn nemotron_spec(args: &nemotron_h::ModelArgs) -> Result<Spec, CapabilityError> {
     let context = plain_context(args.max_position_embeddings)?;
-    let kinds =
-        args.layer_block_types()
-            .map_err(|error| CapabilityError::InvalidConfiguration {
-                field: "hybrid_override_pattern",
-                detail: error.to_string(),
-            })?;
-    let attention = kinds
+    let mamba = args
+        .layer_schedule
         .iter()
-        .filter(|kind| **kind == nemotron_h::LayerBlockType::Attention)
+        .filter(|policy| **policy == nemotron_h::LayerPolicy::Mamba)
         .count() as u64;
-    let mamba = kinds
-        .iter()
-        .filter(|kind| **kind == nemotron_h::LayerBlockType::Mamba)
-        .count() as u64;
+    let mut attention_groups = BTreeMap::<Option<u64>, u64>::new();
+    for policy in args.layer_schedule.iter() {
+        if let nemotron_h::LayerPolicy::SelfAttention(policy) = policy {
+            let window = policy.window().map(|window| u64::from(window.get()));
+            *attention_groups.entry(window).or_default() += 1;
+        }
+    }
     let intermediate = checked_mul(
         positive(args.mamba_num_heads, "mamba_num_heads")?,
         positive(args.mamba_head_dim, "mamba_head_dim")?,
@@ -1204,21 +1206,37 @@ fn nemotron_spec(args: &nemotron_h::ModelArgs) -> Result<Spec, CapabilityError> 
         checked_add(conv_state, ssm_state, "Mamba fixed layer state")?,
         "all Mamba fixed state",
     )?;
+    let full_attention_layers = attention_groups.get(&None).copied().unwrap_or(0);
+    let sliding_attention = attention_groups
+        .iter()
+        .filter_map(|(window, layers)| {
+            window.map(|window| SlidingWindowLayerCount {
+                layers: *layers,
+                window,
+            })
+        })
+        .collect();
     Ok((
         context.0,
         context.1,
         CacheStateStrategy::HybridRecurrent {
-            attention_layers: attention,
+            full_attention_layers,
+            sliding_attention,
             recurrent_layers: mamba,
         },
         text_modalities(),
         ArchitectureEstimate {
             fixed_scalars_per_batch: fixed,
-            growing: vec![GrowingState {
-                layers: attention,
-                scalars_per_position: kv_scalars(args.num_key_value_heads, args.head_dim)?,
-                window: None,
-            }],
+            growing: attention_groups
+                .into_iter()
+                .map(|(window, layers)| {
+                    Ok(GrowingState {
+                        layers,
+                        scalars_per_position: kv_scalars(args.num_key_value_heads, args.head_dim)?,
+                        window,
+                    })
+                })
+                .collect::<Result<Vec<_>, CapabilityError>>()?,
             hidden_size: positive(args.hidden_size, "hidden_size")?,
             allocation_granularity: 1,
             completeness: EstimationCompleteness::Complete,
@@ -1321,7 +1339,8 @@ fn qwen_hybrid_spec(
         "all linear-attention fixed state",
     )?;
     let base = CacheStateStrategy::HybridRecurrent {
-        attention_layers: attention,
+        full_attention_layers: attention,
+        sliding_attention: Vec::new(),
         recurrent_layers: recurrent,
     };
     Ok((
@@ -3114,7 +3133,8 @@ mod tests {
         assert_eq!(
             strategy,
             CacheStateStrategy::HybridRecurrent {
-                attention_layers: 1,
+                full_attention_layers: 1,
+                sliding_attention: Vec::new(),
                 recurrent_layers: 2,
             }
         );
@@ -3123,6 +3143,48 @@ mod tests {
         assert_eq!(estimate.growing[0].layers, 1);
         assert_eq!(estimate.growing[0].scalars_per_position, 16);
         assert_eq!(estimate.growing[0].window, None);
+    }
+
+    #[test]
+    fn nemotron_runtime_state_tracks_mixed_recurrent_kv_and_stateless_layers() {
+        let args = nemotron_h::model_args_from_config_value(&json!({
+            "model_type": "nemotron_h", "vocab_size": 32, "hidden_size": 8,
+            "intermediate_size": 12, "num_hidden_layers": 4,
+            "hybrid_override_pattern": "M*-E", "num_attention_heads": 2,
+            "num_key_value_heads": 1, "head_dim": 4,
+            "max_position_embeddings": 128, "sliding_window": 5,
+            "mamba_num_heads": 2, "mamba_head_dim": 4, "n_groups": 1,
+            "ssm_state_size": 4, "conv_kernel": 3, "chunk_size": 2,
+            "moe_intermediate_size": 6,
+            "moe_shared_expert_intermediate_size": 10,
+            "n_routed_experts": 2, "n_shared_experts": 1,
+            "num_experts_per_tok": 2, "mlp_hidden_act": "relu2",
+            "mamba_hidden_act": "silu"
+        }))
+        .unwrap();
+        let (_, _, strategy, _, estimate) = nemotron_spec(&args).unwrap();
+        assert_eq!(
+            strategy,
+            CacheStateStrategy::HybridRecurrent {
+                full_attention_layers: 0,
+                sliding_attention: vec![SlidingWindowLayerCount {
+                    layers: 1,
+                    window: 5,
+                }],
+                recurrent_layers: 1,
+            }
+        );
+        assert_eq!(estimate.fixed_scalars_per_batch, 64);
+        assert_eq!(estimate.growing.len(), 1);
+        assert_eq!(estimate.growing[0].layers, 1);
+        assert_eq!(estimate.growing[0].scalars_per_position, 8);
+        assert_eq!(estimate.growing[0].window, Some(5));
+        let state =
+            estimate_architecture_state(&estimate, InputTokenCount::text(10), 0, 2).unwrap();
+        assert_eq!(state.fixed_state_bytes, 512);
+        assert_eq!(state.context_state_bytes, 320);
+        assert_eq!(state.bytes_per_position_per_batch, 0);
+        assert_eq!(state.assumptions.sliding_window_bounds, vec![5]);
     }
 
     #[test]
@@ -3145,7 +3207,8 @@ mod tests {
         assert_eq!(
             strategy,
             CacheStateStrategy::HybridRecurrent {
-                attention_layers: 2,
+                full_attention_layers: 2,
+                sliding_attention: Vec::new(),
                 recurrent_layers: 2,
             }
         );
@@ -3341,7 +3404,8 @@ mod tests {
         assert_eq!(
             strategy,
             CacheStateStrategy::HybridRecurrent {
-                attention_layers: 1,
+                full_attention_layers: 1,
+                sliding_attention: Vec::new(),
                 recurrent_layers: 1,
             }
         );

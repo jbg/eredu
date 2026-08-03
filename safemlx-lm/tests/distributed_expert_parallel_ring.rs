@@ -1170,8 +1170,11 @@ fn write_additional_sparse_fixtures(root: &Path) -> Vec<(&'static str, &'static 
     });
     let directory = root.join("nemotron-h-sparse");
     std::fs::create_dir_all(&directory).unwrap();
-    let mut model =
-        nemotron_h::Model::new(serde_json::from_value(config.clone()).unwrap(), stream).unwrap();
+    let mut model = nemotron_h::Model::new(
+        nemotron_h::model_args_from_config_value(&config).unwrap(),
+        stream,
+    )
+    .unwrap();
     save_zero_fixture(&mut model, &config, &directory, stream, 32);
     fixtures.push(("Nemotron-H sparse expert cache", "NemotronH", directory));
 

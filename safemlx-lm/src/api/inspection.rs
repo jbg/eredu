@@ -6443,6 +6443,35 @@ mod tests {
     }
 
     #[test]
+    fn nemotron_schedule_inspection_and_loader_preflight_reject_identically() {
+        for mutate in [
+            |config: &mut Value| config["hybrid_override_pattern"] = json!("M-E"),
+            |config: &mut Value| config["sliding_window"] = json!(0),
+            |config: &mut Value| config["sliding_window"] = json!(i64::from(i32::MAX) + 1),
+        ] {
+            let directory = write_complete_nemotron_h_safetensors_dir(false, |_| {});
+            let mut config = nemotron_h_config();
+            mutate(&mut config);
+            std::fs::write(
+                directory.path().join("config.json"),
+                serde_json::to_vec(&config).unwrap(),
+            )
+            .unwrap();
+
+            let report =
+                inspect_model(directory.path(), ModelInspectionOptions::default()).unwrap();
+            assert_eq!(report.model_loadability, InspectionReadiness::Invalid);
+            assert!(!report.is_loadable());
+            assert!(structural::validate_safetensors_load_path(
+                ModelKind::NemotronH,
+                directory.path(),
+                ModelLoadOptions::default(),
+            )
+            .is_err());
+        }
+    }
+
+    #[test]
     fn nemotron_h_missing_mamba_tensor_and_wrong_expert_shape_are_structured() {
         let missing = write_complete_nemotron_h_safetensors_dir(false, |specs| {
             specs.retain(|(name, _)| name != "backbone.layers.0.mixer.conv1d.weight");

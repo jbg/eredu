@@ -2554,11 +2554,7 @@ fn validate_nemotron_h_safetensors(
         );
     }
 
-    let block_types = match args.layer_block_types() {
-        Ok(types) => types,
-        Err(error) => return invalid_geometry(error.to_string()),
-    };
-    for (layer, block_type) in block_types.into_iter().enumerate() {
+    for (layer, block_type) in args.layer_schedule.iter().copied().enumerate() {
         let official = format!("backbone.layers.{layer}");
         let canonical = format!("model.layers.{layer}");
         validate_nemotron_alias(
@@ -2572,7 +2568,7 @@ fn validate_nemotron_h_safetensors(
             vec![hidden],
         );
         match block_type {
-            nemotron_h::LayerBlockType::Mamba => {
+            nemotron_h::LayerPolicy::Mamba => {
                 let intermediate = (args.mamba_num_heads * args.mamba_head_dim) as usize;
                 let conv = intermediate + 2 * args.n_groups as usize * args.ssm_state_size as usize;
                 let projection = intermediate + conv + args.mamba_num_heads as usize;
@@ -2662,7 +2658,7 @@ fn validate_nemotron_h_safetensors(
                     }
                 }
             }
-            nemotron_h::LayerBlockType::Attention => {
+            nemotron_h::LayerPolicy::SelfAttention(_) => {
                 let query = (args.num_attention_heads * args.head_dim) as usize;
                 let key_value = (args.num_key_value_heads * args.head_dim) as usize;
                 for (projection, output, input) in [
@@ -2695,7 +2691,7 @@ fn validate_nemotron_h_safetensors(
                     }
                 }
             }
-            nemotron_h::LayerBlockType::Mlp => {
+            nemotron_h::LayerPolicy::DenseMlp => {
                 let intermediate = args.intermediate_size as usize;
                 for (projection, shape) in [
                     ("up_proj", vec![intermediate, hidden]),
@@ -2730,7 +2726,7 @@ fn validate_nemotron_h_safetensors(
                     }
                 }
             }
-            nemotron_h::LayerBlockType::Moe => {
+            nemotron_h::LayerPolicy::SparseMoe => {
                 let experts = args.n_routed_experts as usize;
                 let intermediate = args.moe_intermediate_size as usize;
                 for (source, target, shape) in [
@@ -6512,7 +6508,7 @@ fn nemotron_h_gguf_expected(args: &nemotron_h::ModelArgs) -> Result<Vec<Expected
         tensors.push(expected("lm_head.weight", "output.weight", [vocab, hidden]));
     }
 
-    for (layer, block_type) in args.layer_block_types()?.into_iter().enumerate() {
+    for (layer, block_type) in args.layer_schedule.iter().copied().enumerate() {
         let model = format!("model.layers.{layer}");
         let gguf = format!("blk.{layer}");
         tensors.push(expected_vector(
@@ -6521,7 +6517,7 @@ fn nemotron_h_gguf_expected(args: &nemotron_h::ModelArgs) -> Result<Vec<Expected
             hidden,
         ));
         match block_type {
-            nemotron_h::LayerBlockType::Mamba => {
+            nemotron_h::LayerPolicy::Mamba => {
                 let heads = args.mamba_num_heads as usize;
                 let intermediate = heads * args.mamba_head_dim as usize;
                 let conv = intermediate + 2 * args.n_groups as usize * args.ssm_state_size as usize;
@@ -6571,7 +6567,7 @@ fn nemotron_h_gguf_expected(args: &nemotron_h::ModelArgs) -> Result<Vec<Expected
                     ]);
                 }
             }
-            nemotron_h::LayerBlockType::Attention => {
+            nemotron_h::LayerPolicy::SelfAttention(_) => {
                 let query = (args.num_attention_heads * args.head_dim) as usize;
                 let key_value = (args.num_key_value_heads * args.head_dim) as usize;
                 for (name, output, input) in [
@@ -6593,7 +6589,7 @@ fn nemotron_h_gguf_expected(args: &nemotron_h::ModelArgs) -> Result<Vec<Expected
                     }
                 }
             }
-            nemotron_h::LayerBlockType::Mlp => {
+            nemotron_h::LayerPolicy::DenseMlp => {
                 let intermediate = args.intermediate_size as usize;
                 tensors.extend([
                     expected("", format!("{gguf}.ffn_up.weight"), [intermediate, hidden]),
@@ -6610,7 +6606,7 @@ fn nemotron_h_gguf_expected(args: &nemotron_h::ModelArgs) -> Result<Vec<Expected
                     ]);
                 }
             }
-            nemotron_h::LayerBlockType::Moe => {
+            nemotron_h::LayerPolicy::SparseMoe => {
                 let experts = args.n_routed_experts as usize;
                 let intermediate = args.moe_intermediate_size as usize;
                 let shared = args.moe_shared_expert_intermediate_size as usize;

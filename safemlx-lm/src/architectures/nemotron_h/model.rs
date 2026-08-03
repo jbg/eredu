@@ -2,6 +2,7 @@
 
 use std::{
     collections::{HashMap, HashSet},
+    num::NonZeroU32,
     path::Path,
 };
 
@@ -40,35 +41,38 @@ use crate::{
     },
     error::Error,
     nn::tensor::{create_attention_mask, AttentionMask},
-    runtime::cache::{ConcatKeyValueCache, KeyValueCache},
     runtime::checkpoint::load::{
         gguf_metadata, gguf_quantization_configs, load_gguf_strict,
         load_safetensors_dir_strict_with_split_relu2_experts, transform_split_relu2_experts,
         GgufTensorNames, StrictLoadConfig, StrictLoadReport,
     },
     runtime::checkpoint::quantization::{AffineQuantization, WeightQuantization},
+    runtime::{
+        attention::{AttentionPolicy, LayerSchedule},
+        cache::{ConcatKeyValueCache, KeyValueCache},
+    },
 };
 
-/// Layer block kind encoded by `hybrid_override_pattern`.
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub enum LayerBlockType {
+/// Executable operator and state policy for one Nemotron-H decoder layer.
+#[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
+pub enum LayerPolicy {
     /// Mamba2 state-space layer.
     Mamba,
     /// Grouped-query self-attention layer.
-    Attention,
+    SelfAttention(AttentionPolicy),
     /// Dense feed-forward MLP layer.
-    Mlp,
+    DenseMlp,
     /// Sparse mixture-of-experts feed-forward layer.
-    Moe,
+    SparseMoe,
 }
 
-impl LayerBlockType {
-    fn from_pattern_char(ch: char) -> Result<Self, Error> {
+impl LayerPolicy {
+    fn from_pattern_char(ch: char, attention: AttentionPolicy) -> Result<Self, Error> {
         match ch {
             'M' => Ok(Self::Mamba),
-            '*' => Ok(Self::Attention),
-            '-' => Ok(Self::Mlp),
-            'E' => Ok(Self::Moe),
+            '*' => Ok(Self::SelfAttention(attention)),
+            '-' => Ok(Self::DenseMlp),
+            'E' => Ok(Self::SparseMoe),
             other => Err(Error::UnsupportedArchitecture(format!(
                 "Nemotron-H hybrid_override_pattern contains unsupported layer marker '{other}'"
             ))),
@@ -78,7 +82,7 @@ impl LayerBlockType {
 
 /// Deserialized Nemotron-H configuration fields used by this loader.
 #[derive(Debug, Clone, Deserialize)]
-pub struct ModelArgs {
+struct ModelArgsSource {
     /// Model type from the configuration.
     pub model_type: String,
     /// Token vocabulary size.
@@ -137,7 +141,7 @@ pub struct ModelArgs {
     pub num_logits_to_keep: i32,
     /// Optional sliding-window attention size.
     #[serde(default)]
-    pub sliding_window: Option<i32>,
+    pub sliding_window: Option<i64>,
     /// Mamba2 state dimension.
     #[serde(default = "default_ssm_state_size")]
     pub ssm_state_size: i32,
@@ -224,7 +228,206 @@ pub struct ModelArgs {
     pub quantized_weight_configs: Option<HashMap<String, WeightQuantization>>,
 }
 
+/// Validated Nemotron-H decoder configuration.
+#[derive(Debug, Clone)]
+pub struct ModelArgs {
+    /// Hugging Face model type.
+    pub model_type: String,
+    /// Token vocabulary size.
+    pub vocab_size: i32,
+    /// Whether logits reuse input embeddings.
+    pub tie_word_embeddings: bool,
+    /// Decoder hidden width.
+    pub hidden_size: i32,
+    /// Dense MLP intermediate width.
+    pub intermediate_size: i32,
+    /// Decoder layer count.
+    pub num_hidden_layers: i32,
+    /// Authoritative operator and attention policy in decoder-layer order.
+    pub layer_schedule: LayerSchedule<LayerPolicy>,
+    /// Query-head count.
+    pub num_attention_heads: i32,
+    /// Attention head width.
+    pub head_dim: i32,
+    /// Key/value-head count.
+    pub num_key_value_heads: i32,
+    /// RoPE base frequency.
+    pub rope_theta: f32,
+    /// Configured context limit.
+    pub max_position_embeddings: i32,
+    /// Whether attention projections use biases.
+    pub attention_bias: bool,
+    /// Whether dense MLP projections use biases.
+    pub mlp_bias: bool,
+    /// Global Mamba projection-bias setting.
+    pub use_bias: bool,
+    /// Layer normalization epsilon.
+    pub layer_norm_epsilon: f32,
+    /// Released checkpoint RMSNorm epsilon alias.
+    pub norm_eps: f32,
+    /// Whether residual accumulation uses float32.
+    pub residual_in_fp32: bool,
+    /// Prompt logits retained during generation.
+    pub num_logits_to_keep: i32,
+    /// Mamba SSM state width.
+    pub ssm_state_size: i32,
+    /// Mamba head count.
+    pub mamba_num_heads: i32,
+    /// Mamba B/C group count.
+    pub n_groups: i32,
+    /// Mamba head width.
+    pub mamba_head_dim: i32,
+    /// Causal convolution kernel width.
+    pub conv_kernel: i32,
+    /// Mamba expansion factor.
+    pub expand: i32,
+    /// Mamba activation name.
+    pub mamba_hidden_act: String,
+    /// Minimum Mamba time step.
+    pub time_step_min: f32,
+    /// Maximum Mamba time step.
+    pub time_step_max: f32,
+    /// Mamba time-step floor.
+    pub time_step_floor: f32,
+    /// Whether Mamba convolution uses bias.
+    pub use_conv_bias: bool,
+    /// Whether Mamba projections use bias.
+    pub mamba_proj_bias: bool,
+    /// Mamba scan chunk size.
+    pub chunk_size: i32,
+    /// Whether prenorm residuals are rescaled.
+    pub rescale_prenorm_residual: bool,
+    /// Dense and expert MLP activation name.
+    pub mlp_hidden_act: String,
+    /// Routed expert count.
+    pub n_routed_experts: i32,
+    /// Shared expert count.
+    pub n_shared_experts: i32,
+    /// Routed expert intermediate width.
+    pub moe_intermediate_size: i32,
+    /// Shared expert intermediate width.
+    pub moe_shared_expert_intermediate_size: i32,
+    /// Experts selected per token.
+    pub num_experts_per_tok: i32,
+    /// Routed expert output scale.
+    pub routed_scaling_factor: f32,
+    /// Router group count.
+    pub n_group: i32,
+    /// Router groups considered by top-k selection.
+    pub topk_group: i32,
+    /// Whether selected routing weights are normalized.
+    pub norm_topk_prob: bool,
+    /// Source checkpoint dtype label.
+    pub torch_dtype: Option<String>,
+    /// Optional MLX affine quantization settings.
+    pub quantization: Option<AffineQuantization>,
+    /// Exact affine-quantized weight names.
+    pub quantized_weights: Option<HashSet<String>>,
+    /// Per-weight GGUF quantization layouts.
+    pub quantized_weight_configs: Option<HashMap<String, WeightQuantization>>,
+}
+
+impl ModelArgsSource {
+    fn into_args(self) -> Result<ModelArgs, Error> {
+        let layer_count = usize::try_from(self.num_hidden_layers).map_err(|_| {
+            Error::UnsupportedArchitecture(format!(
+                "Nemotron-H num_hidden_layers must be positive, got {}",
+                self.num_hidden_layers
+            ))
+        })?;
+        let attention = match self.sliding_window {
+            None => AttentionPolicy::Full,
+            Some(window) => {
+                let window = u32::try_from(window)
+                    .ok()
+                    .filter(|window| *window <= i32::MAX as u32)
+                    .and_then(NonZeroU32::new)
+                    .ok_or_else(|| {
+                        Error::UnsupportedArchitecture(format!(
+                            "Nemotron-H sliding_window must be a positive integer in the executable i32 range, got {window}"
+                        ))
+                    })?;
+                AttentionPolicy::Sliding { window }
+            }
+        };
+        let policies = self
+            .hybrid_override_pattern
+            .chars()
+            .map(|ch| LayerPolicy::from_pattern_char(ch, attention))
+            .collect::<Result<Vec<_>, _>>()?;
+        let layer_schedule = LayerSchedule::new(layer_count, policies).map_err(|error| {
+            Error::UnsupportedArchitecture(format!("Nemotron-H hybrid_override_pattern {error}"))
+        })?;
+        Ok(ModelArgs {
+            model_type: self.model_type,
+            vocab_size: self.vocab_size,
+            tie_word_embeddings: self.tie_word_embeddings,
+            hidden_size: self.hidden_size,
+            intermediate_size: self.intermediate_size,
+            num_hidden_layers: self.num_hidden_layers,
+            layer_schedule,
+            num_attention_heads: self.num_attention_heads,
+            head_dim: self.head_dim,
+            num_key_value_heads: self.num_key_value_heads,
+            rope_theta: self.rope_theta,
+            max_position_embeddings: self.max_position_embeddings,
+            attention_bias: self.attention_bias,
+            mlp_bias: self.mlp_bias,
+            use_bias: self.use_bias,
+            layer_norm_epsilon: self.layer_norm_epsilon,
+            norm_eps: self.norm_eps,
+            residual_in_fp32: self.residual_in_fp32,
+            num_logits_to_keep: self.num_logits_to_keep,
+            ssm_state_size: self.ssm_state_size,
+            mamba_num_heads: self.mamba_num_heads,
+            n_groups: self.n_groups,
+            mamba_head_dim: self.mamba_head_dim,
+            conv_kernel: self.conv_kernel,
+            expand: self.expand,
+            mamba_hidden_act: self.mamba_hidden_act,
+            time_step_min: self.time_step_min,
+            time_step_max: self.time_step_max,
+            time_step_floor: self.time_step_floor,
+            use_conv_bias: self.use_conv_bias,
+            mamba_proj_bias: self.mamba_proj_bias,
+            chunk_size: self.chunk_size,
+            rescale_prenorm_residual: self.rescale_prenorm_residual,
+            mlp_hidden_act: self.mlp_hidden_act,
+            n_routed_experts: self.n_routed_experts,
+            n_shared_experts: self.n_shared_experts,
+            moe_intermediate_size: self.moe_intermediate_size,
+            moe_shared_expert_intermediate_size: self.moe_shared_expert_intermediate_size,
+            num_experts_per_tok: self.num_experts_per_tok,
+            routed_scaling_factor: self.routed_scaling_factor,
+            n_group: self.n_group,
+            topk_group: self.topk_group,
+            norm_topk_prob: self.norm_topk_prob,
+            torch_dtype: self.torch_dtype,
+            quantization: self.quantization,
+            quantized_weights: self.quantized_weights,
+            quantized_weight_configs: self.quantized_weight_configs,
+        })
+    }
+}
+
 impl ModelArgs {
+    /// Returns a stable ordered representation of all layer operators and attention windows.
+    pub fn layer_schedule_fingerprint(&self) -> String {
+        self.layer_schedule
+            .iter()
+            .map(|policy| match policy {
+                LayerPolicy::Mamba => "m".to_string(),
+                LayerPolicy::SelfAttention(AttentionPolicy::Full) => "af".to_string(),
+                LayerPolicy::SelfAttention(AttentionPolicy::Sliding { window }) => {
+                    format!("as{}", window.get())
+                }
+                LayerPolicy::DenseMlp => "d".to_string(),
+                LayerPolicy::SparseMoe => "e".to_string(),
+            })
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+
     pub(crate) fn affine_quantization_for(&self, weight_name: &str) -> Option<AffineQuantization> {
         if let Some(configs) = &self.quantized_weight_configs {
             return match configs.get(weight_name).copied() {
@@ -246,25 +449,27 @@ impl ModelArgs {
         self.affine_quantization_for(weight_name).map(Into::into)
     }
 
-    /// Returns the parsed layer kinds from `hybrid_override_pattern`.
-    pub fn layer_block_types(&self) -> Result<Vec<LayerBlockType>, Error> {
-        self.hybrid_override_pattern
-            .chars()
-            .map(LayerBlockType::from_pattern_char)
-            .collect()
+    fn layer_policy(&self, index: usize) -> Result<LayerPolicy, Error> {
+        self.layer_schedule.get(index).copied().ok_or_else(|| {
+            Error::UnsupportedArchitecture(format!(
+                "Nemotron-H layer schedule has no policy for layer {index}"
+            ))
+        })
     }
+}
 
-    pub(crate) fn layer_block_type(&self, index: usize) -> Result<LayerBlockType, Error> {
-        self.hybrid_override_pattern
-            .chars()
-            .nth(index)
-            .ok_or_else(|| {
-                Error::UnsupportedArchitecture(format!(
-                    "Nemotron-H layer index {index} is outside hybrid_override_pattern"
-                ))
-            })
-            .and_then(LayerBlockType::from_pattern_char)
-    }
+pub(crate) fn prompt_cache_architecture_fingerprint(args: &ModelArgs) -> String {
+    format!(
+        "nemotron-h-v1:hidden={}:layers={}:q_heads={}:kv_heads={}:head_dim={}:context={}:rope_theta={:08x}:schedule={}",
+        args.hidden_size,
+        args.num_hidden_layers,
+        args.num_attention_heads,
+        args.num_key_value_heads,
+        args.head_dim,
+        args.max_position_embeddings,
+        args.rope_theta.to_bits(),
+        args.layer_schedule_fingerprint(),
+    )
 }
 
 fn default_true() -> bool {
@@ -914,6 +1119,8 @@ pub struct Attention {
     pub n_kv_heads: i32,
     /// Attention scale.
     pub scale: f32,
+    /// Layer-local attention policy.
+    pub policy: AttentionPolicy,
     #[quantizable]
     #[param]
     /// Query projection.
@@ -935,11 +1142,25 @@ pub struct Attention {
 impl Attention {
     /// Creates an unloaded attention layer.
     pub fn new(args: &ModelArgs, layer_idx: usize, stream: &Stream) -> Result<Self, Exception> {
+        let policy = match args.layer_schedule.get(layer_idx) {
+            Some(LayerPolicy::SelfAttention(policy)) => *policy,
+            Some(other) => {
+                return Err(Exception::custom(format!(
+                    "Nemotron-H layer {layer_idx} has non-attention policy {other:?}"
+                )))
+            }
+            None => {
+                return Err(Exception::custom(format!(
+                    "Nemotron-H layer schedule has no policy for layer {layer_idx}"
+                )))
+            }
+        };
         let prefix = format!("model.layers.{layer_idx}.attention");
         Ok(Self {
             n_heads: args.num_attention_heads,
             n_kv_heads: args.num_key_value_heads,
             scale: (args.head_dim as f32).sqrt().recip(),
+            policy,
             q_proj: common::linear::unloaded_maybe_quantized_linear(
                 args.hidden_size,
                 args.num_attention_heads * args.head_dim,
@@ -979,7 +1200,7 @@ pub struct AttentionInput<'a> {
     /// Optional attention mask.
     pub mask: Option<&'a Array>,
     /// Optional key/value cache.
-    pub cache: Option<&'a mut ConcatKeyValueCache>,
+    pub cache: Option<&'a mut AttentionCache>,
 }
 
 impl Module<AttentionInput<'_>> for Attention {
@@ -992,6 +1213,15 @@ impl Module<AttentionInput<'_>> for Attention {
         stream: &Stream,
     ) -> Result<Self::Output, Self::Error> {
         let AttentionInput { x, mask, mut cache } = input;
+        if let Some(cache) = cache.as_ref() {
+            let cache_policy = cache.policy();
+            if cache_policy != self.policy {
+                return Err(Exception::custom(format!(
+                    "Nemotron-H attention cache policy {cache_policy:?} does not match layer policy {:?}",
+                    self.policy
+                )));
+            }
+        }
         let (batch, seq_len) = batch_seq(x);
         let queries = reshape_attention_projection(
             self.q_proj.forward(x, stream)?,
@@ -1014,20 +1244,38 @@ impl Module<AttentionInput<'_>> for Attention {
             self.n_kv_heads,
             stream,
         )?;
+        let position_offset = cache.as_ref().map_or(0, |cache| cache.offset());
         if let Some(cache) = cache.as_mut() {
             (keys, values) = cache.update_and_fetch(keys, values, stream)?;
         }
-        let out = finish_attention(
-            queries,
-            keys,
-            values,
-            None::<&mut ConcatKeyValueCache>,
-            self.scale,
-            mask,
-            batch,
-            seq_len,
-            stream,
-        )?;
+        let out = match self.policy {
+            AttentionPolicy::Sliding { window } if seq_len > 1 => {
+                common::attention::sliding_window_prefill_attention(
+                    queries,
+                    keys,
+                    values,
+                    self.scale,
+                    i32::try_from(window.get()).map_err(|_| {
+                        Exception::custom("Nemotron-H sliding attention window exceeds i32")
+                    })?,
+                    position_offset,
+                    batch,
+                    seq_len,
+                    stream,
+                )?
+            }
+            _ => finish_attention(
+                queries,
+                keys,
+                values,
+                None::<&mut ConcatKeyValueCache>,
+                self.scale,
+                mask,
+                batch,
+                seq_len,
+                stream,
+            )?,
+        };
         self.o_proj.forward(&out, stream)
     }
 
@@ -1449,12 +1697,90 @@ impl Module<Mamba2Input<'_>> for Mamba2Mixer {
 }
 
 #[derive(Debug, Clone)]
+/// Key/value state matching one attention policy.
+pub enum AttentionCache {
+    /// Context-growing full-attention state.
+    Full(ConcatKeyValueCache),
+    /// Window-bounded sliding-attention state.
+    Sliding {
+        /// Exact visible-position count, including the current token.
+        window: NonZeroU32,
+        /// Cache retaining at most `window - 1` past states between calls.
+        cache: ConcatKeyValueCache,
+    },
+}
+
+impl AttentionCache {
+    fn new(policy: AttentionPolicy) -> Self {
+        match policy {
+            AttentionPolicy::Full => Self::Full(ConcatKeyValueCache::new()),
+            AttentionPolicy::Sliding { window } => Self::Sliding {
+                window,
+                cache: ConcatKeyValueCache::new_for_sliding_attention(
+                    i32::try_from(window.get()).expect("validated executable attention window"),
+                ),
+            },
+        }
+    }
+
+    fn clear(&mut self) {
+        match self {
+            Self::Full(cache) => cache.clear(),
+            Self::Sliding { cache, .. } => cache.clear(),
+        }
+    }
+
+    /// Returns the attention behavior encoded by this cache.
+    pub fn policy(&self) -> AttentionPolicy {
+        match self {
+            Self::Full(_) => AttentionPolicy::Full,
+            Self::Sliding { window, .. } => AttentionPolicy::Sliding { window: *window },
+        }
+    }
+}
+
+impl KeyValueCache for AttentionCache {
+    fn offset(&self) -> i32 {
+        match self {
+            Self::Full(cache) => cache.offset(),
+            Self::Sliding { cache, .. } => cache.offset(),
+        }
+    }
+
+    fn max_size(&self) -> Option<i32> {
+        match self {
+            Self::Full(cache) => cache.max_size(),
+            Self::Sliding { cache, .. } => cache.max_size(),
+        }
+    }
+
+    fn retained_arrays(&self) -> Vec<&Array> {
+        match self {
+            Self::Full(cache) => cache.retained_arrays(),
+            Self::Sliding { cache, .. } => cache.retained_arrays(),
+        }
+    }
+
+    fn update_and_fetch(
+        &mut self,
+        keys: Array,
+        values: Array,
+        stream: &Stream,
+    ) -> Result<(Array, Array), Exception> {
+        match self {
+            Self::Full(cache) => cache.update_and_fetch(keys, values, stream),
+            Self::Sliding { cache, .. } => cache.update_and_fetch(keys, values, stream),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
 /// Per-layer cache for a Nemotron-H block.
 pub enum LayerCache {
     /// Mamba2 convolution and SSM cache.
     Mamba(Mamba2Cache),
     /// Attention key/value cache.
-    Attention(ConcatKeyValueCache),
+    Attention(AttentionCache),
     /// MLP block cache placeholder.
     Mlp,
     /// MoE block cache placeholder.
@@ -1464,8 +1790,8 @@ pub enum LayerCache {
 #[derive(Debug, Clone, ModuleParameters, Quantizable)]
 /// Pattern-selected Nemotron-H block.
 pub struct TransformerBlock {
-    /// Layer block type.
-    pub block_type: LayerBlockType,
+    /// Executable layer policy.
+    pub policy: LayerPolicy,
     #[param]
     /// Pre-mixer RMSNorm.
     pub norm: nn::RmsNorm,
@@ -1489,26 +1815,26 @@ pub struct TransformerBlock {
 impl TransformerBlock {
     /// Creates an unloaded block for `layer_idx`.
     pub fn new(args: &ModelArgs, layer_idx: usize, stream: &Stream) -> Result<Self, Error> {
-        let block_type = args.layer_block_type(layer_idx)?;
+        let policy = args.layer_policy(layer_idx)?;
         Ok(Self {
-            block_type,
+            policy,
             norm: nn::RmsNorm::unloaded(
                 args.hidden_size,
                 args.layer_norm_epsilon,
                 Dtype::Float32,
                 stream,
             )?,
-            mamba: if block_type == LayerBlockType::Mamba {
+            mamba: if policy == LayerPolicy::Mamba {
                 Some(Mamba2Mixer::new(args, layer_idx, stream)?)
             } else {
                 None
             },
-            attention: if block_type == LayerBlockType::Attention {
+            attention: if matches!(policy, LayerPolicy::SelfAttention(_)) {
                 Some(Attention::new(args, layer_idx, stream)?)
             } else {
                 None
             },
-            mlp: if block_type == LayerBlockType::Mlp {
+            mlp: if policy == LayerPolicy::DenseMlp {
                 let prefix = format!("model.layers.{layer_idx}.mlp");
                 Some(Mlp::new(
                     args.hidden_size,
@@ -1523,7 +1849,7 @@ impl TransformerBlock {
             } else {
                 None
             },
-            moe: if block_type == LayerBlockType::Moe {
+            moe: if policy == LayerPolicy::SparseMoe {
                 Some(SparseMoeBlock::new(args, layer_idx, stream)?)
             } else {
                 None
@@ -1543,8 +1869,8 @@ impl TransformerBlock {
         let BlockInput { x, mask, cache } = input;
         let residual = x;
         let h = self.norm.forward(x, stream)?;
-        let h = match (self.block_type, cache) {
-            (LayerBlockType::Mamba, Some(LayerCache::Mamba(cache))) => {
+        let h = match (self.policy, cache) {
+            (LayerPolicy::Mamba, Some(LayerCache::Mamba(cache))) => {
                 self.mamba.as_mut().expect("mamba block").forward(
                     Mamba2Input {
                         x: &h,
@@ -1553,12 +1879,12 @@ impl TransformerBlock {
                     stream,
                 )?
             }
-            (LayerBlockType::Mamba, _) => self
+            (LayerPolicy::Mamba, None) => self
                 .mamba
                 .as_mut()
                 .expect("mamba block")
                 .forward(Mamba2Input { x: &h, cache: None }, stream)?,
-            (LayerBlockType::Attention, Some(LayerCache::Attention(cache))) => {
+            (LayerPolicy::SelfAttention(_), Some(LayerCache::Attention(cache))) => {
                 self.attention.as_mut().expect("attention block").forward(
                     AttentionInput {
                         x: &h,
@@ -1568,7 +1894,7 @@ impl TransformerBlock {
                     stream,
                 )?
             }
-            (LayerBlockType::Attention, _) => {
+            (LayerPolicy::SelfAttention(_), None) => {
                 self.attention.as_mut().expect("attention block").forward(
                     AttentionInput {
                         x: &h,
@@ -1578,14 +1904,19 @@ impl TransformerBlock {
                     stream,
                 )?
             }
-            (LayerBlockType::Mlp, _) => {
+            (LayerPolicy::DenseMlp, None | Some(LayerCache::Mlp)) => {
                 self.mlp.as_mut().expect("mlp block").forward(&h, stream)?
             }
-            (LayerBlockType::Moe, _) => self
+            (LayerPolicy::SparseMoe, None | Some(LayerCache::Moe)) => self
                 .moe
                 .as_mut()
                 .expect("moe block")
                 .forward_with_expert_executor(&h, stream, execute)?,
+            (policy, Some(cache)) => {
+                return Err(Exception::custom(format!(
+                    "Nemotron-H cache {cache:?} does not match layer policy {policy:?}"
+                )))
+            }
         };
         residual.add(h, stream)
     }
@@ -1613,8 +1944,8 @@ impl Module<BlockInput<'_>> for TransformerBlock {
         let BlockInput { x, mask, cache } = input;
         let residual = x;
         let h = self.norm.forward(x, stream)?;
-        let h = match (self.block_type, cache) {
-            (LayerBlockType::Mamba, Some(LayerCache::Mamba(cache))) => {
+        let h = match (self.policy, cache) {
+            (LayerPolicy::Mamba, Some(LayerCache::Mamba(cache))) => {
                 self.mamba.as_mut().expect("mamba block").forward(
                     Mamba2Input {
                         x: &h,
@@ -1623,12 +1954,12 @@ impl Module<BlockInput<'_>> for TransformerBlock {
                     stream,
                 )?
             }
-            (LayerBlockType::Mamba, _) => self
+            (LayerPolicy::Mamba, None) => self
                 .mamba
                 .as_mut()
                 .expect("mamba block")
                 .forward(Mamba2Input { x: &h, cache: None }, stream)?,
-            (LayerBlockType::Attention, Some(LayerCache::Attention(cache))) => {
+            (LayerPolicy::SelfAttention(_), Some(LayerCache::Attention(cache))) => {
                 self.attention.as_mut().expect("attention block").forward(
                     AttentionInput {
                         x: &h,
@@ -1638,7 +1969,7 @@ impl Module<BlockInput<'_>> for TransformerBlock {
                     stream,
                 )?
             }
-            (LayerBlockType::Attention, _) => {
+            (LayerPolicy::SelfAttention(_), None) => {
                 self.attention.as_mut().expect("attention block").forward(
                     AttentionInput {
                         x: &h,
@@ -1648,11 +1979,16 @@ impl Module<BlockInput<'_>> for TransformerBlock {
                     stream,
                 )?
             }
-            (LayerBlockType::Mlp, _) => {
+            (LayerPolicy::DenseMlp, None | Some(LayerCache::Mlp)) => {
                 self.mlp.as_mut().expect("mlp block").forward(&h, stream)?
             }
-            (LayerBlockType::Moe, _) => {
+            (LayerPolicy::SparseMoe, None | Some(LayerCache::Moe)) => {
                 self.moe.as_mut().expect("moe block").forward(&h, stream)?
+            }
+            (policy, Some(cache)) => {
+                return Err(Exception::custom(format!(
+                    "Nemotron-H cache {cache:?} does not match layer policy {policy:?}"
+                )))
             }
         };
         residual.add(h, stream)
@@ -1676,12 +2012,12 @@ impl Module<BlockInput<'_>> for TransformerBlock {
 }
 
 impl LayerCache {
-    pub(crate) fn new(block_type: LayerBlockType) -> Self {
-        match block_type {
-            LayerBlockType::Mamba => Self::Mamba(Mamba2Cache::default()),
-            LayerBlockType::Attention => Self::Attention(ConcatKeyValueCache::new()),
-            LayerBlockType::Mlp => Self::Mlp,
-            LayerBlockType::Moe => Self::Moe,
+    pub(crate) fn new(policy: LayerPolicy) -> Self {
+        match policy {
+            LayerPolicy::Mamba => Self::Mamba(Mamba2Cache::default()),
+            LayerPolicy::SelfAttention(policy) => Self::Attention(AttentionCache::new(policy)),
+            LayerPolicy::DenseMlp => Self::Mlp,
+            LayerPolicy::SparseMoe => Self::Moe,
         }
     }
 
@@ -1714,15 +2050,16 @@ pub struct Cache {
 }
 
 impl Cache {
-    /// Creates an empty cache matching the hybrid layer pattern.
-    pub fn new(args: &ModelArgs) -> Result<Self, Error> {
-        Ok(Self {
+    /// Creates an empty cache matching the authoritative layer schedule.
+    pub fn new(args: &ModelArgs) -> Self {
+        Self {
             layers: args
-                .layer_block_types()?
-                .into_iter()
+                .layer_schedule
+                .iter()
+                .copied()
                 .map(LayerCache::new)
                 .collect(),
-        })
+        }
     }
 
     /// Returns the current sequence offset represented by the first stateful layer.
@@ -1820,13 +2157,20 @@ impl NemotronHModel {
         let cache = cache.as_mut().ok_or_else(|| {
             Exception::custom("cached expert parallelism requires a Nemotron-H cache")
         })?;
+        if cache.layers.len() != self.layers.len() {
+            return Err(Exception::custom(format!(
+                "Nemotron-H cache has {} layers, expected {}",
+                cache.layers.len(),
+                self.layers.len()
+            )));
+        }
         for (index, (layer, layer_cache)) in self
             .layers
             .iter_mut()
             .zip(cache.layers.iter_mut())
             .enumerate()
         {
-            h = if layer.block_type == LayerBlockType::Moe {
+            h = if layer.policy == LayerPolicy::SparseMoe {
                 layer.forward_sparse_experts(
                     BlockInput {
                         x: &h,
@@ -1895,6 +2239,13 @@ impl Module<ModelInput<'_>> for NemotronHModel {
         };
 
         if let Some(cache) = cache.as_mut() {
+            if cache.layers.len() != self.layers.len() {
+                return Err(Exception::custom(format!(
+                    "Nemotron-H cache has {} layers, expected {}",
+                    cache.layers.len(),
+                    self.layers.len()
+                )));
+            }
             for (layer, layer_cache) in self.layers.iter_mut().zip(cache.layers.iter_mut()) {
                 h = layer.forward(
                     BlockInput {
@@ -1974,6 +2325,7 @@ pub struct Model {
 impl Model {
     /// Creates an unloaded Nemotron-H causal language model.
     pub fn new(args: ModelArgs, stream: &Stream) -> Result<Self, Exception> {
+        validate_model_args(&args).map_err(|error| Exception::custom(error.to_string()))?;
         let model = NemotronHModel::new(&args, stream)?;
         let lm_head = if !args.tie_word_embeddings {
             Some(common::linear::unloaded_maybe_quantized_linear(
@@ -1995,7 +2347,7 @@ impl Model {
 
     /// Creates an empty heterogeneous cache for this model.
     pub fn new_cache(&self) -> Cache {
-        Cache::new(&self.args).expect("validated Nemotron-H layer pattern")
+        Cache::new(&self.args)
     }
 
     /// Returns the configured model type.
@@ -2350,7 +2702,7 @@ pub(crate) fn model_args_from_gguf_catalog(
         default_num_experts_per_tok()
     };
 
-    let args = ModelArgs {
+    let args = ModelArgsSource {
         model_type: "nemotron_h".into(),
         vocab_size,
         tie_word_embeddings: !arrays.contains_gguf_tensor("output.weight"),
@@ -2380,12 +2732,7 @@ pub(crate) fn model_args_from_gguf_catalog(
         norm_eps,
         residual_in_fp32: false,
         num_logits_to_keep: 1,
-        sliding_window: gguf_optional_i64(metadata, &key("attention.sliding_window"))?
-            .map(i32::try_from)
-            .transpose()
-            .map_err(|_| {
-                Error::UnsupportedArchitecture("Nemotron-H sliding window exceeds i32".into())
-            })?,
+        sliding_window: gguf_optional_i64(metadata, &key("attention.sliding_window"))?,
         ssm_state_size: gguf_i32(metadata, &key("ssm.state_size"))?,
         mamba_num_heads,
         n_groups: gguf_i32(metadata, &key("ssm.group_count"))?,
@@ -2442,7 +2789,8 @@ pub(crate) fn model_args_from_gguf_catalog(
         quantization: None,
         quantized_weights: None,
         quantized_weight_configs: None,
-    };
+    }
+    .into_args()?;
     validate_model_args(&args)?;
     Ok(args)
 }
@@ -2774,11 +3122,11 @@ pub(crate) fn rewrite_nemotron_h_weight_key(key: &str, args: &ModelArgs) -> Resu
             "invalid Nemotron-H layer index in checkpoint key '{key}': {error}"
         ))
     })?;
-    let field = match args.layer_block_type(layer_idx)? {
-        LayerBlockType::Mamba => "mamba",
-        LayerBlockType::Attention => "attention",
-        LayerBlockType::Mlp => "mlp",
-        LayerBlockType::Moe => "moe",
+    let field = match args.layer_policy(layer_idx)? {
+        LayerPolicy::Mamba => "mamba",
+        LayerPolicy::SelfAttention(_) => "attention",
+        LayerPolicy::DenseMlp => "mlp",
+        LayerPolicy::SparseMoe => "moe",
     };
     Ok(format!("backbone.layers.{layer_idx}.{field}.{suffix}"))
 }
@@ -2806,10 +3154,11 @@ pub fn load_nemotron_h_safetensors_strict<M: safemlx::module::ModuleParameters>(
 }
 
 /// Validates a parsed Nemotron-H config value.
-pub(crate) fn model_args_from_config_value(config: &Value) -> Result<ModelArgs, Error> {
-    let args: ModelArgs = serde_json::from_value(config.clone()).map_err(|error| {
+pub fn model_args_from_config_value(config: &Value) -> Result<ModelArgs, Error> {
+    let source: ModelArgsSource = serde_json::from_value(config.clone()).map_err(|error| {
         Error::UnsupportedArchitecture(format!("invalid nemotron_h config: {error}"))
     })?;
+    let args = source.into_args()?;
     validate_model_args(&args)?;
     Ok(args)
 }
@@ -2819,19 +3168,35 @@ pub(crate) fn validate_model_config_value(config: &Value) -> Result<(), Error> {
     model_args_from_config_value(config).map(|_| ())
 }
 
-fn validate_model_args(args: &ModelArgs) -> Result<(), Error> {
+pub(crate) fn validate_model_args(args: &ModelArgs) -> Result<(), Error> {
     if args.model_type != "nemotron_h" {
         return Err(Error::UnsupportedModelType(args.model_type.clone()));
     }
 
-    let layers = args.layer_block_types()?;
-    if layers.len() != args.num_hidden_layers as usize {
+    if args.layer_schedule.len() != args.num_hidden_layers as usize {
         return Err(Error::UnsupportedArchitecture(format!(
-            "Nemotron-H hybrid_override_pattern has {} layers, expected {}",
-            layers.len(),
+            "Nemotron-H layer schedule has {} entries, expected {}",
+            args.layer_schedule.len(),
             args.num_hidden_layers
         )));
     }
+
+    let has_attention = args
+        .layer_schedule
+        .iter()
+        .any(|policy| matches!(policy, LayerPolicy::SelfAttention(_)));
+    let has_mamba = args
+        .layer_schedule
+        .iter()
+        .any(|policy| *policy == LayerPolicy::Mamba);
+    let has_mlp = args
+        .layer_schedule
+        .iter()
+        .any(|policy| *policy == LayerPolicy::DenseMlp);
+    let has_moe = args
+        .layer_schedule
+        .iter()
+        .any(|policy| *policy == LayerPolicy::SparseMoe);
 
     ensure_positive("vocab_size", args.vocab_size)?;
     ensure_positive("hidden_size", args.hidden_size)?;
@@ -2850,15 +3215,13 @@ fn validate_model_args(args: &ModelArgs) -> Result<(), Error> {
     ensure_positive("n_shared_experts", args.n_shared_experts)?;
     ensure_positive("num_experts_per_tok", args.num_experts_per_tok)?;
 
-    if layers.contains(&LayerBlockType::Attention)
-        && args.num_attention_heads % args.num_key_value_heads != 0
-    {
+    if has_attention && args.num_attention_heads % args.num_key_value_heads != 0 {
         return Err(Error::UnsupportedArchitecture(format!(
             "Nemotron-H num_attention_heads ({}) must be divisible by num_key_value_heads ({})",
             args.num_attention_heads, args.num_key_value_heads
         )));
     }
-    if layers.contains(&LayerBlockType::Mamba) {
+    if has_mamba {
         if args.mamba_num_heads % args.n_groups != 0 {
             return Err(Error::UnsupportedArchitecture(format!(
                 "Nemotron-H mamba_num_heads ({}) must be divisible by n_groups ({})",
@@ -2890,10 +3253,10 @@ fn validate_model_args(args: &ModelArgs) -> Result<(), Error> {
                 )
             })?;
     }
-    if layers.contains(&LayerBlockType::Mlp) {
+    if has_mlp {
         ensure_positive("intermediate_size", args.intermediate_size)?;
     }
-    if layers.contains(&LayerBlockType::Moe) {
+    if has_moe {
         ensure_positive("moe_intermediate_size", args.moe_intermediate_size)?;
         ensure_positive(
             "moe_shared_expert_intermediate_size",
@@ -2958,8 +3321,9 @@ mod tests {
     use super::{
         expand_layer_values, gguf_affine_quantization, hybrid_pattern_from_gguf_layers,
         load_nemotron_h_gguf, load_nemotron_h_model, load_nemotron_h_safetensors_strict,
-        rewrite_nemotron_h_weight_key, translate_gguf_weight_name, unique_nonzero_layer_value,
-        validate_model_config_value, LayerBlockType, Model, ModelArgs, SparseMoeBlock,
+        model_args_from_config_value, rewrite_nemotron_h_weight_key, translate_gguf_weight_name,
+        unique_nonzero_layer_value, validate_model_config_value, LayerPolicy, Model, ModelArgs,
+        SparseMoeBlock,
     };
     use crate::runtime::checkpoint::load::{StrictLoadConfig, StrictLoadReport};
     use crate::{
@@ -3052,7 +3416,7 @@ mod tests {
         config["moe_shared_expert_intermediate_size"] = json!(5);
         config["n_routed_experts"] = json!(2);
         config["num_experts_per_tok"] = json!(2);
-        serde_json::from_value(config).unwrap()
+        model_args_from_config_value(&config).unwrap()
     }
 
     fn tiny_full_args() -> ModelArgs {
@@ -3075,12 +3439,12 @@ mod tests {
         config["moe_shared_expert_intermediate_size"] = json!(10);
         config["n_routed_experts"] = json!(2);
         config["num_experts_per_tok"] = json!(2);
-        serde_json::from_value(config).unwrap()
+        model_args_from_config_value(&config).unwrap()
     }
 
     #[test]
     fn parses_nemotron_nano_config_fields() {
-        let args: ModelArgs = serde_json::from_value(nemotron_nano_config()).unwrap();
+        let args = model_args_from_config_value(&nemotron_nano_config()).unwrap();
         assert_eq!(args.model_type, "nemotron_h");
         assert_eq!(args.hidden_size, 2688);
         assert_eq!(args.num_hidden_layers, 52);
@@ -3091,26 +3455,26 @@ mod tests {
         assert_eq!(args.mamba_hidden_act, "silu");
         assert_eq!(args.torch_dtype.as_deref(), Some("bfloat16"));
 
-        let blocks = args.layer_block_types().unwrap();
+        let blocks = &args.layer_schedule;
         assert_eq!(blocks.len(), 52);
         assert_eq!(
             blocks
                 .iter()
-                .filter(|&&block| block == LayerBlockType::Mamba)
+                .filter(|&&block| block == LayerPolicy::Mamba)
                 .count(),
             23
         );
         assert_eq!(
             blocks
                 .iter()
-                .filter(|&&block| block == LayerBlockType::Moe)
+                .filter(|&&block| block == LayerPolicy::SparseMoe)
                 .count(),
             23
         );
         assert_eq!(
             blocks
                 .iter()
-                .filter(|&&block| block == LayerBlockType::Attention)
+                .filter(|block| matches!(block, LayerPolicy::SelfAttention(_)))
                 .count(),
             6
         );
@@ -3455,9 +3819,9 @@ mod tests {
         assert_eq!(model.args.num_experts_per_tok, 6);
         assert!(model
             .args
-            .layer_block_types()
-            .unwrap()
-            .contains(&LayerBlockType::Moe));
+            .layer_schedule
+            .iter()
+            .any(|policy| *policy == LayerPolicy::SparseMoe));
 
         let tokens = Array::from_slice(&[1_u32, 2], &[1, 2]);
         let parts = [crate::runtime::media::input::InputPart::text_token_ids(
@@ -3479,7 +3843,7 @@ mod tests {
     fn moe_parameter_tree_uses_nemotron_weight_names_and_policy() {
         let ctx = ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
         let stream = ctx.stream();
-        let args: ModelArgs = serde_json::from_value(nemotron_nano_config()).unwrap();
+        let args = model_args_from_config_value(&nemotron_nano_config()).unwrap();
         let moe = SparseMoeBlock::new(&args, 0, stream).unwrap();
         let params = moe.parameters().flatten();
 
@@ -3520,7 +3884,63 @@ mod tests {
         let error = validate_model_config_value(&config).unwrap_err();
         assert_eq!(
             error.to_string(),
-            "unsupported model architecture: Nemotron-H hybrid_override_pattern has 2 layers, expected 52"
+            "unsupported model architecture: Nemotron-H hybrid_override_pattern layer schedule has 2 entries for 52 decoder layers"
+        );
+    }
+
+    #[test]
+    fn normalizes_four_operator_kinds_and_sliding_attention() {
+        let mut config = nemotron_nano_config();
+        config["num_hidden_layers"] = json!(4);
+        config["hybrid_override_pattern"] = json!("M*-E");
+        config["sliding_window"] = json!(7);
+        let args = model_args_from_config_value(&config).unwrap();
+        assert_eq!(
+            args.layer_schedule.iter().copied().collect::<Vec<_>>(),
+            vec![
+                LayerPolicy::Mamba,
+                LayerPolicy::SelfAttention(
+                    crate::runtime::attention::AttentionPolicy::sliding(7).unwrap()
+                ),
+                LayerPolicy::DenseMlp,
+                LayerPolicy::SparseMoe,
+            ]
+        );
+        let cache = super::Cache::new(&args);
+        assert!(matches!(cache.layers[0], super::LayerCache::Mamba(_)));
+        assert!(matches!(
+            &cache.layers[1],
+            super::LayerCache::Attention(cache)
+                if cache.policy() == crate::runtime::attention::AttentionPolicy::sliding(7).unwrap()
+        ));
+        assert!(matches!(cache.layers[2], super::LayerCache::Mlp));
+        assert!(matches!(cache.layers[3], super::LayerCache::Moe));
+    }
+
+    #[test]
+    fn rejects_invalid_sliding_windows_before_execution() {
+        for value in [json!(0), json!(-1), json!(i64::from(i32::MAX) + 1)] {
+            let mut config = nemotron_nano_config();
+            config["sliding_window"] = value;
+            let error = model_args_from_config_value(&config).unwrap_err();
+            assert!(error
+                .to_string()
+                .contains("sliding_window must be a positive integer in the executable i32 range"));
+        }
+    }
+
+    #[test]
+    fn architecture_fingerprint_tracks_ordered_layer_schedule() {
+        let mut first = nemotron_nano_config();
+        first["num_hidden_layers"] = json!(4);
+        first["hybrid_override_pattern"] = json!("M*-E");
+        let mut second = first.clone();
+        second["hybrid_override_pattern"] = json!("*M-E");
+        let first = model_args_from_config_value(&first).unwrap();
+        let second = model_args_from_config_value(&second).unwrap();
+        assert_ne!(
+            super::prompt_cache_architecture_fingerprint(&first),
+            super::prompt_cache_architecture_fingerprint(&second)
         );
     }
 

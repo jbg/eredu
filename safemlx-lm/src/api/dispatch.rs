@@ -564,6 +564,12 @@ impl Model {
             Self::DenseQwenLayerwise(model) => Ok(
                 dense_qwen::prompt_cache_architecture_fingerprint(model.args()),
             ),
+            Self::NemotronH(model) => Ok(nemotron_h::prompt_cache_architecture_fingerprint(
+                &model.args,
+            )),
+            Self::NemotronHLayerwise(model) => Ok(
+                nemotron_h::prompt_cache_architecture_fingerprint(model.args()),
+            ),
             _ => Err(Exception::custom(format!(
                 "prompt-cache architecture identity is unsupported for model type {}",
                 self.model_type()

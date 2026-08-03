@@ -4613,8 +4613,9 @@ fn load_additional_streamed_ep(
         ModelKind::NemotronH => {
             let args = nemotron_h::get_nemotron_h_model_args(model_dir)?;
             if !args
-                .layer_block_types()?
-                .contains(&nemotron_h::LayerBlockType::Moe)
+                .layer_schedule
+                .iter()
+                .any(|policy| *policy == nemotron_h::LayerPolicy::SparseMoe)
             {
                 return Err(Error::UnsupportedArchitecture(
                     "expert parallelism requires a Nemotron-H MoE checkpoint".into(),
@@ -4910,8 +4911,9 @@ fn load_additional_cached_ep(
         ModelKind::NemotronH => {
             let args = nemotron_h::get_nemotron_h_model_args(model_dir)?;
             if !args
-                .layer_block_types()?
-                .contains(&nemotron_h::LayerBlockType::Moe)
+                .layer_schedule
+                .iter()
+                .any(|policy| *policy == nemotron_h::LayerPolicy::SparseMoe)
             {
                 return Err(Error::UnsupportedArchitecture(
                     "expert parallelism requires a Nemotron-H MoE checkpoint".into(),
