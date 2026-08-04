@@ -5,7 +5,7 @@
 //! are immutable inputs with a different ownership and persistence model.
 
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap},
     fs::{self, File},
     io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write},
     num::NonZeroU32,
@@ -30,7 +30,7 @@ use crate::runtime::{
     residency::policy::CacheEvictionPolicy,
 };
 
-const PROMPT_CACHE_SCHEMA_VERSION: u32 = 3;
+const PROMPT_CACHE_SCHEMA_VERSION: u32 = 4;
 const MAX_PROMPT_CACHE_SHARD_HEADER_BYTES: u64 = 1024 * 1024;
 const PROMPT_CACHE_GENERATIONS_DIRECTORY: &str = ".generations";
 const PROMPT_CACHE_CURRENT_FILE: &str = "CURRENT";
@@ -280,6 +280,23 @@ pub enum CacheBlockLifecycle {
 pub(crate) enum CacheBlockArrays {
     KeyValue { keys: Array, values: Array },
     CompressedLatentRotary { latent: Array, rotary_key: Array },
+}
+
+/// One resident attention payload prepared for atomic prompt-cache publication.
+pub(crate) struct PromptCacheSnapshotBlock {
+    pub(crate) global_layer: usize,
+    pub(crate) start: i64,
+    pub(crate) end: i64,
+    pub(crate) rank: Option<CacheRankIdentity>,
+    pub(crate) arrays: CacheBlockArrays,
+}
+
+/// One materialized attention payload loaded from a prompt-cache snapshot.
+pub(crate) struct LoadedPromptCacheBlock {
+    pub(crate) global_layer: usize,
+    pub(crate) start: i64,
+    pub(crate) end: i64,
+    pub(crate) arrays: CacheBlockArrays,
 }
 
 impl CacheBlockArrays {
@@ -2489,6 +2506,7 @@ impl CacheResidencyManager {
         destination: impl AsRef<Path>,
         descriptor: PromptCacheDescriptor,
         prefix_token_ids: &[u32],
+        state_arrays: &[PromptCacheStateArray<'_>],
         options: &PromptCacheOptions,
     ) -> Result<PromptCacheManifest, CacheResidencyError> {
         let destination = destination.as_ref();
@@ -2569,6 +2587,7 @@ impl CacheResidencyManager {
             };
             validate_complete_prefix(&records, &descriptor, prefix_token_ids.len())?;
             let mut manifest_blocks = Vec::with_capacity(records.len());
+            let mut manifest_state = Vec::with_capacity(state_arrays.len());
             let mut logical_bytes = 0u64;
             for (index, record) in records.iter().enumerate() {
                 let arrays = match &record.arrays {
@@ -2604,11 +2623,50 @@ impl CacheResidencyManager {
                     payload_sha256,
                 });
             }
+            validate_state_arrays(
+                &descriptor.layer_layout,
+                descriptor.global_layer_start,
+                descriptor.batch_size,
+                prefix_token_ids.len(),
+                state_arrays,
+            )?;
+            for (index, state) in state_arrays.iter().enumerate() {
+                let shard = format!("state-{index:08}.safetensors");
+                let shard_path = temporary.join(&shard);
+                let array_name = "state";
+                Array::save_safetensors([(array_name, state.array)], None, &shard_path).map_err(
+                    |source| {
+                        CacheResidencyError::Runtime(format!(
+                            "save {}: {source}",
+                            shard_path.display()
+                        ))
+                    },
+                )?;
+                sync_file(&shard_path)?;
+                let payload_sha256 = hash_shard_payload(&shard_path)?;
+                let state_bytes = state.array.nbytes() as u64;
+                logical_bytes = logical_bytes.checked_add(state_bytes).ok_or_else(|| {
+                    CacheResidencyError::MalformedManifest(
+                        "prompt-cache state byte count overflow".into(),
+                    )
+                })?;
+                manifest_state.push(PromptCacheStateTensor {
+                    owner: state.owner,
+                    role: state.role,
+                    shard,
+                    array: array_name.into(),
+                    shape: state.array.shape().to_vec(),
+                    dtype: dtype_name(state.array.dtype()),
+                    logical_bytes: state_bytes,
+                    payload_sha256,
+                });
+            }
             let manifest = PromptCacheManifest {
                 schema_version: PROMPT_CACHE_SCHEMA_VERSION,
                 model_family: descriptor.model_family,
                 effective_model_type: descriptor.effective_model_type,
                 checkpoint_fingerprint: descriptor.checkpoint_fingerprint,
+                prefix_content_fingerprint: descriptor.prefix_content_fingerprint,
                 architecture_fingerprint: descriptor.architecture_fingerprint,
                 layer_count: descriptor.layer_count,
                 global_layer_start: descriptor.global_layer_start,
@@ -2622,6 +2680,7 @@ impl CacheResidencyManager {
                 topology: descriptor.topology,
                 application_namespace: options.application_namespace.clone(),
                 blocks: manifest_blocks,
+                state_tensors: manifest_state,
             };
             let manifest_path = temporary.join("manifest.json");
             let file = File::create(&manifest_path).map_err(|source| CacheResidencyError::Io {
@@ -2745,6 +2804,80 @@ pub enum LayerCachePolicy {
         /// Rotary-key width.
         rotary_dim: NonZeroU32,
     },
+    /// Fixed-size recurrent or convolution state without an attention payload.
+    FixedState {
+        /// Ordered tensors required to resume this layer.
+        tensors: Vec<StateTensorPolicy>,
+    },
+    /// Ordinary attention plus fixed-size recurrent or convolution state.
+    KeyValueWithFixedState {
+        /// Exact full or sliding attention range for this layer.
+        attention: AttentionPolicy,
+        /// Rank-local key/value head count.
+        num_key_value_heads: NonZeroU32,
+        /// Per-head key/value dimension.
+        head_dim: NonZeroU32,
+        /// Ordered tensors required in addition to keys and values.
+        tensors: Vec<StateTensorPolicy>,
+    },
+}
+
+/// Semantic role of one non-attention cache tensor.
+#[derive(Debug, Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StateTensorRole {
+    /// Bounded causal-convolution history. `slot` distinguishes parallel histories.
+    Convolution {
+        /// Stable slot within the layer's ordered convolution states.
+        slot: u32,
+    },
+    /// Recurrent transition or linear-attention state.
+    Recurrent,
+    /// Prepared multimodal prefix embeddings needed for exact replay.
+    PrefixEmbedding,
+    /// Model-global multimodal position offset.
+    PositionDelta,
+}
+
+/// One dimension in a persisted fixed-state tensor.
+#[derive(Debug, Clone, Copy, Eq, Hash, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StateTensorDimension {
+    /// Manifest batch size.
+    Batch,
+    /// Exact prompt token count.
+    PrefixTokens,
+    /// Positive architecture-defined dimension.
+    Fixed(NonZeroU32),
+    /// Scalar dimension list marker; only valid as the sole entry.
+    Scalar,
+}
+
+/// Accepted dtype family for one fixed-state tensor.
+#[derive(Debug, Clone, Copy, Eq, Hash, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StateTensorDtype {
+    /// Any MLX floating dtype; the exact stored dtype is still recorded and checked.
+    Floating,
+    /// Exactly IEEE F32.
+    Float32,
+    /// Signed 32-bit integer.
+    Int32,
+    /// Unsigned 32-bit integer.
+    Uint32,
+}
+
+/// Exact semantic role, symbolic shape, and dtype contract for a state tensor.
+#[derive(Debug, Clone, Eq, Hash, PartialEq, Serialize, Deserialize)]
+pub struct StateTensorPolicy {
+    /// Meaning of this tensor within its owning layer or global cache state.
+    pub role: StateTensorRole,
+    /// Exact shape with batch/prefix dimensions resolved from the manifest.
+    pub shape: Vec<StateTensorDimension>,
+    /// Accepted dtype family.
+    pub dtype: StateTensorDtype,
+    /// Whether every persisted cache must materialize this tensor.
+    pub required: bool,
 }
 
 impl LayerCachePolicy {
@@ -2774,14 +2907,77 @@ impl LayerCachePolicy {
         })
     }
 
+    /// Constructs a validated fixed-state-only layer policy.
+    pub fn fixed_only(tensors: Vec<StateTensorPolicy>) -> Result<Self, CacheResidencyError> {
+        let policy = Self::FixedState { tensors };
+        validate_layer_cache_policy(&policy)?;
+        Ok(policy)
+    }
+
+    /// Constructs validated ordinary attention plus fixed-state geometry.
+    pub fn key_value_with_fixed_state(
+        attention: AttentionPolicy,
+        num_key_value_heads: i32,
+        head_dim: i32,
+        tensors: Vec<StateTensorPolicy>,
+    ) -> Result<Self, CacheResidencyError> {
+        let policy = Self::KeyValueWithFixedState {
+            attention,
+            num_key_value_heads: positive_u32(num_key_value_heads, "key/value head count")?,
+            head_dim: positive_u32(head_dim, "key/value head dimension")?,
+            tensors,
+        };
+        validate_layer_cache_policy(&policy)?;
+        Ok(policy)
+    }
+
     /// Returns the exact attention policy when this layer owns attention state.
     pub const fn attention(&self) -> Option<AttentionPolicy> {
         match self {
-            Self::NoState => None,
-            Self::KeyValue { attention, .. } | Self::CompressedLatentRotary { attention, .. } => {
-                Some(*attention)
-            }
+            Self::NoState | Self::FixedState { .. } => None,
+            Self::KeyValue { attention, .. }
+            | Self::CompressedLatentRotary { attention, .. }
+            | Self::KeyValueWithFixedState { attention, .. } => Some(*attention),
         }
+    }
+
+    /// Returns the ordered non-attention tensor policies for this layer.
+    pub fn fixed_state(&self) -> &[StateTensorPolicy] {
+        match self {
+            Self::FixedState { tensors } | Self::KeyValueWithFixedState { tensors, .. } => tensors,
+            _ => &[],
+        }
+    }
+}
+
+impl StateTensorDimension {
+    /// Constructs a positive fixed dimension.
+    pub fn fixed(value: i32) -> Result<Self, CacheResidencyError> {
+        positive_u32(value, "fixed-state tensor dimension").map(Self::Fixed)
+    }
+}
+
+impl StateTensorPolicy {
+    /// Constructs a state-tensor policy after validating its symbolic shape.
+    pub fn new(
+        role: StateTensorRole,
+        shape: Vec<StateTensorDimension>,
+        dtype: StateTensorDtype,
+    ) -> Result<Self, CacheResidencyError> {
+        let policy = Self {
+            role,
+            shape,
+            dtype,
+            required: true,
+        };
+        validate_state_tensor_policies(std::slice::from_ref(&policy))?;
+        Ok(policy)
+    }
+
+    /// Marks this tensor as absent for cache instances that do not use the state.
+    pub const fn optional(mut self) -> Self {
+        self.required = false;
+        self
     }
 }
 
@@ -2844,14 +3040,19 @@ fn validate_layer_cache_policy(policy: &LayerCachePolicy) -> Result<(), CacheRes
         }
     };
     match policy {
-        LayerCachePolicy::NoState => Ok(()),
+        LayerCachePolicy::NoState => {}
         LayerCachePolicy::KeyValue {
+            num_key_value_heads,
+            head_dim,
+            ..
+        }
+        | LayerCachePolicy::KeyValueWithFixedState {
             num_key_value_heads,
             head_dim,
             ..
         } => {
             validate_dimension(*num_key_value_heads)?;
-            validate_dimension(*head_dim)
+            validate_dimension(*head_dim)?;
         }
         LayerCachePolicy::CompressedLatentRotary {
             latent_dim,
@@ -2859,8 +3060,152 @@ fn validate_layer_cache_policy(policy: &LayerCachePolicy) -> Result<(), CacheRes
             ..
         } => {
             validate_dimension(*latent_dim)?;
-            validate_dimension(*rotary_dim)
+            validate_dimension(*rotary_dim)?;
         }
+        LayerCachePolicy::FixedState { .. } => {}
+    }
+    let tensors = policy.fixed_state();
+    if tensors.is_empty()
+        && matches!(
+            policy,
+            LayerCachePolicy::FixedState { .. } | LayerCachePolicy::KeyValueWithFixedState { .. }
+        )
+    {
+        return Err(CacheResidencyError::InvalidOptions(
+            "fixed-state cache policy must contain at least one tensor".into(),
+        ));
+    }
+    validate_state_tensor_policies(tensors)
+}
+
+fn validate_state_tensor_policies(
+    tensors: &[StateTensorPolicy],
+) -> Result<(), CacheResidencyError> {
+    let mut roles = BTreeSet::new();
+    for tensor in tensors {
+        if !roles.insert(tensor.role) {
+            return Err(CacheResidencyError::InvalidOptions(format!(
+                "duplicate fixed-state tensor role {:?}",
+                tensor.role
+            )));
+        }
+        if tensor.shape.is_empty()
+            || (tensor.shape.contains(&StateTensorDimension::Scalar)
+                && tensor.shape.as_slice() != [StateTensorDimension::Scalar])
+        {
+            return Err(CacheResidencyError::InvalidOptions(format!(
+                "invalid fixed-state tensor shape for role {:?}",
+                tensor.role
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn resolved_state_shape(
+    policy: &StateTensorPolicy,
+    batch_size: usize,
+    prefix_tokens: usize,
+) -> Result<Vec<i32>, CacheResidencyError> {
+    policy
+        .shape
+        .iter()
+        .map(|dimension| match dimension {
+            StateTensorDimension::Batch => i32::try_from(batch_size),
+            StateTensorDimension::PrefixTokens => i32::try_from(prefix_tokens),
+            StateTensorDimension::Fixed(value) => i32::try_from(value.get()),
+            StateTensorDimension::Scalar => Ok(1),
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| {
+            CacheResidencyError::InvalidOptions(
+                "fixed-state tensor dimension exceeds runtime i32 range".into(),
+            )
+        })
+}
+
+fn state_policy<'a>(
+    layers: &'a LayerSchedule<LayerCachePolicy>,
+    global_layer_start: usize,
+    owner: StateTensorOwner,
+    role: StateTensorRole,
+) -> Option<&'a StateTensorPolicy> {
+    let StateTensorOwner::Layer(layer) = owner;
+    let policies = layers
+        .get(layer.checked_sub(global_layer_start)?)?
+        .fixed_state();
+    policies.iter().find(|policy| policy.role == role)
+}
+
+fn validate_state_arrays(
+    layers: &LayerSchedule<LayerCachePolicy>,
+    global_layer_start: usize,
+    batch_size: usize,
+    prefix_tokens: usize,
+    arrays: &[PromptCacheStateArray<'_>],
+) -> Result<(), CacheResidencyError> {
+    let mut seen = BTreeSet::new();
+    for state in arrays {
+        if !seen.insert((state.owner, state.role)) {
+            return Err(CacheResidencyError::MalformedManifest(format!(
+                "duplicate fixed-state tensor {:?} for {:?}",
+                state.role, state.owner
+            )));
+        }
+        let policy =
+            state_policy(layers, global_layer_start, state.owner, state.role).ok_or_else(|| {
+                CacheResidencyError::MalformedManifest(format!(
+                    "unexpected fixed-state tensor {:?} for {:?}",
+                    state.role, state.owner
+                ))
+            })?;
+        let expected = resolved_state_shape(policy, batch_size, prefix_tokens)?;
+        if state.array.shape() != expected {
+            return Err(CacheResidencyError::MalformedManifest(format!(
+                "fixed-state tensor {:?} for {:?} has shape {:?}, expected {:?}",
+                state.role,
+                state.owner,
+                state.array.shape(),
+                expected
+            )));
+        }
+        let dtype = dtype_name(state.array.dtype());
+        if !state_dtype_matches(policy.dtype, &dtype) {
+            return Err(CacheResidencyError::MalformedManifest(format!(
+                "fixed-state tensor {:?} for {:?} has incompatible dtype {dtype}",
+                state.role, state.owner
+            )));
+        }
+    }
+    let mut expected = Vec::new();
+    for (index, layer) in layers.iter().enumerate() {
+        let owner = StateTensorOwner::Layer(global_layer_start + index);
+        for policy in layer.fixed_state() {
+            if policy.required || seen.contains(&(owner, policy.role)) {
+                expected.push((owner, policy.role));
+            }
+        }
+    }
+    let actual = arrays
+        .iter()
+        .map(|state| (state.owner, state.role))
+        .collect::<Vec<_>>();
+    if actual != expected {
+        return Err(CacheResidencyError::MalformedManifest(format!(
+            "fixed-state tensors are missing, reordered, or unexpected: found {actual:?}, expected {expected:?}"
+        )));
+    }
+    Ok(())
+}
+
+fn state_dtype_matches(policy: StateTensorDtype, dtype: &str) -> bool {
+    match policy {
+        StateTensorDtype::Floating => {
+            matches!(dtype, "Float16" | "Bfloat16" | "Float32" | "Float64")
+        }
+        StateTensorDtype::Float32 => dtype == "Float32",
+        StateTensorDtype::Int32 => dtype == "Int32",
+        StateTensorDtype::Uint32 => dtype == "Uint32",
     }
 }
 
@@ -2873,6 +3218,11 @@ pub struct PromptCacheDescriptor {
     pub effective_model_type: String,
     /// Caller-verified checkpoint identity that is not based only on a path.
     pub checkpoint_fingerprint: String,
+    /// Caller-supplied identity for the fully processed prefix content.
+    ///
+    /// Text callers normally hash token IDs. Multimodal callers must also hash
+    /// media content and processor settings that contributed cached activations.
+    pub prefix_content_fingerprint: String,
     /// Hash or canonical serialization of RoPE and cache-relevant architecture settings.
     pub architecture_fingerprint: String,
     /// Total model layer count.
@@ -3054,6 +3404,8 @@ pub struct PromptCacheManifest {
     pub effective_model_type: String,
     /// Checkpoint identity contract selected by the caller.
     pub checkpoint_fingerprint: String,
+    /// Identity of text and any processed media that produced this prefix.
+    pub prefix_content_fingerprint: String,
     /// RoPE and cache-relevant architecture identity.
     pub architecture_fingerprint: String,
     /// Total model layer count.
@@ -3080,6 +3432,47 @@ pub struct PromptCacheManifest {
     pub application_namespace: Option<String>,
     /// Ordered immutable cache blocks.
     pub blocks: Vec<PromptCacheBlock>,
+    /// Ordered fixed-size layer and model-global state tensors.
+    pub state_tensors: Vec<PromptCacheStateTensor>,
+}
+
+/// Owner of one persisted non-attention state tensor.
+#[derive(Debug, Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StateTensorOwner {
+    /// Architecture-global decoder layer index.
+    Layer(usize),
+}
+
+/// One independently validated fixed-size state tensor.
+#[derive(Debug, Clone, Eq, Hash, PartialEq, Serialize, Deserialize)]
+pub struct PromptCacheStateTensor {
+    /// Layer or model-global owner.
+    pub owner: StateTensorOwner,
+    /// Semantic role declared by the canonical layout.
+    pub role: StateTensorRole,
+    /// Safe relative safetensors shard path.
+    pub shard: String,
+    /// Array name within the shard.
+    pub array: String,
+    /// Exact stored shape.
+    pub shape: Vec<i32>,
+    /// Exact stored dtype.
+    pub dtype: String,
+    /// Logical bytes in the array.
+    pub logical_bytes: u64,
+    /// SHA-256 of the exact safetensors payload bytes.
+    pub payload_sha256: String,
+}
+
+/// In-memory fixed state supplied when saving a cache snapshot.
+pub struct PromptCacheStateArray<'a> {
+    /// Layer or model-global owner.
+    pub owner: StateTensorOwner,
+    /// Semantic role declared by the canonical layout.
+    pub role: StateTensorRole,
+    /// Array to persist.
+    pub array: &'a Array,
 }
 
 /// One cache block catalog entry in a prompt-cache manifest.
@@ -3222,6 +3615,206 @@ pub(crate) fn open_prompt_cache(
     Ok((manager, manifest))
 }
 
+/// Atomically saves resident attention blocks and fixed state through the canonical manifest.
+pub(crate) fn save_prompt_cache_snapshot(
+    destination: impl AsRef<Path>,
+    descriptor: PromptCacheDescriptor,
+    prefix_token_ids: &[u32],
+    blocks: Vec<PromptCacheSnapshotBlock>,
+    state_arrays: &[PromptCacheStateArray<'_>],
+    options: &PromptCacheOptions,
+) -> Result<PromptCacheManifest, CacheResidencyError> {
+    let block_size = i32::try_from(prefix_token_ids.len()).map_err(|_| {
+        CacheResidencyError::InvalidOptions(
+            "prompt-cache prefix length exceeds the runtime i32 range".into(),
+        )
+    })?;
+    let bytes = blocks
+        .iter()
+        .map(|block| block.arrays.bytes())
+        .try_fold(0u64, |total, bytes| total.checked_add(bytes))
+        .ok_or_else(|| {
+            CacheResidencyError::InvalidOptions("prompt-cache byte count overflow".into())
+        })?
+        .max(1);
+    let manager = CacheResidencyManager::new(
+        PagedCacheOptions::new(block_size.max(1), bytes, 1, 1)?
+            .with_full_attention(true)
+            .with_persistence_retention(true),
+    )?;
+    for block in blocks {
+        manager.seal_block(
+            block.global_layer,
+            block.start,
+            block.end,
+            block.rank,
+            block.arrays,
+            false,
+        )?;
+    }
+    manager.save_prompt_cache(
+        destination,
+        descriptor,
+        prefix_token_ids,
+        state_arrays,
+        options,
+    )
+}
+
+/// Validates and materializes a resident prompt-cache snapshot on `stream`.
+pub(crate) fn open_prompt_cache_snapshot(
+    directory: impl AsRef<Path>,
+    expected: &PromptCacheDescriptor,
+    model: &PromptCacheModelIdentity,
+    prefix_token_ids: &[u32],
+    stream: &Stream,
+) -> Result<
+    (
+        Vec<LoadedPromptCacheBlock>,
+        Vec<LoadedPromptCacheStateTensor>,
+        PromptCacheManifest,
+    ),
+    CacheResidencyError,
+> {
+    validate_prompt_cache_model_identity(expected, model)?;
+    let root = resolve_prompt_cache_root(directory.as_ref())?;
+    let manifest = inspect_prompt_cache(directory.as_ref())?;
+    validate_compatibility(&manifest, expected, prefix_token_ids)?;
+    validate_prompt_cache_layer_layouts(&manifest, model)?;
+    let host_stream = Stream::new_with_device(&Device::new(DeviceType::Cpu, 0));
+    let mut blocks = Vec::with_capacity(manifest.blocks.len());
+    for block in &manifest.blocks {
+        let path = safe_shard_path(&root, &block.shard)?;
+        if hash_shard_payload(&path)? != block.payload_sha256 {
+            return Err(CacheResidencyError::MalformedShard {
+                path,
+                reason: "attention payload digest does not match the manifest".into(),
+            });
+        }
+        let mut arrays = Array::load_safetensors(&path, &host_stream).map_err(|source| {
+            CacheResidencyError::Runtime(format!("load {}: {source}", path.display()))
+        })?;
+        let first = arrays.remove(&block.first_array).ok_or_else(|| {
+            CacheResidencyError::MalformedShard {
+                path: path.clone(),
+                reason: format!("missing array {}", block.first_array),
+            }
+        })?;
+        let second = arrays.remove(&block.second_array).ok_or_else(|| {
+            CacheResidencyError::MalformedShard {
+                path: path.clone(),
+                reason: format!("missing array {}", block.second_array),
+            }
+        })?;
+        if !arrays.is_empty() {
+            return Err(CacheResidencyError::MalformedShard {
+                path,
+                reason: "attention shard contains unexpected arrays".into(),
+            });
+        }
+        let first = first.copy(stream).map_err(|source| {
+            CacheResidencyError::Runtime(format!(
+                "copy {} to execution stream: {source}",
+                path.display()
+            ))
+        })?;
+        let second = second.copy(stream).map_err(|source| {
+            CacheResidencyError::Runtime(format!(
+                "copy {} to execution stream: {source}",
+                path.display()
+            ))
+        })?;
+        eval([&first, &second]).map_err(|source| {
+            CacheResidencyError::Runtime(format!(
+                "evaluate {} on execution stream: {source}",
+                path.display()
+            ))
+        })?;
+        let arrays = match block.representation {
+            CacheRepresentation::KeyValue => CacheBlockArrays::KeyValue {
+                keys: first,
+                values: second,
+            },
+            CacheRepresentation::CompressedLatentRotary => {
+                CacheBlockArrays::CompressedLatentRotary {
+                    latent: first,
+                    rotary_key: second,
+                }
+            }
+        };
+        blocks.push(LoadedPromptCacheBlock {
+            global_layer: block.global_layer,
+            start: block.start,
+            end: block.end,
+            arrays,
+        });
+    }
+    let state = load_prompt_cache_state_tensors(directory, &manifest, stream)?;
+    Ok((blocks, state, manifest))
+}
+
+/// Materialized non-attention state tensor from a validated prompt cache.
+pub(crate) struct LoadedPromptCacheStateTensor {
+    pub(crate) owner: StateTensorOwner,
+    pub(crate) role: StateTensorRole,
+    pub(crate) array: Array,
+}
+
+/// Loads all fixed-state tensors after manifest and model compatibility validation.
+pub(crate) fn load_prompt_cache_state_tensors(
+    directory: impl AsRef<Path>,
+    manifest: &PromptCacheManifest,
+    stream: &Stream,
+) -> Result<Vec<LoadedPromptCacheStateTensor>, CacheResidencyError> {
+    let root = resolve_prompt_cache_root(directory.as_ref())?;
+    let host_stream = Stream::new_with_device(&Device::new(DeviceType::Cpu, 0));
+    let mut loaded = Vec::with_capacity(manifest.state_tensors.len());
+    for state in &manifest.state_tensors {
+        let path = safe_shard_path(&root, &state.shard)?;
+        let actual_hash = hash_shard_payload(&path)?;
+        if actual_hash != state.payload_sha256 {
+            return Err(CacheResidencyError::MalformedShard {
+                path,
+                reason: "fixed-state payload digest does not match the manifest".into(),
+            });
+        }
+        let mut arrays = Array::load_safetensors(&path, &host_stream).map_err(|source| {
+            CacheResidencyError::Runtime(format!("load {}: {source}", path.display()))
+        })?;
+        let array =
+            arrays
+                .remove(&state.array)
+                .ok_or_else(|| CacheResidencyError::MalformedShard {
+                    path: path.clone(),
+                    reason: format!("missing state array {}", state.array),
+                })?;
+        if !arrays.is_empty() {
+            return Err(CacheResidencyError::MalformedShard {
+                path,
+                reason: "fixed-state shard contains unexpected arrays".into(),
+            });
+        }
+        let array = array.copy(stream).map_err(|source| {
+            CacheResidencyError::Runtime(format!(
+                "copy {} to execution stream: {source}",
+                path.display()
+            ))
+        })?;
+        eval([&array]).map_err(|source| {
+            CacheResidencyError::Runtime(format!(
+                "evaluate {} on execution stream: {source}",
+                path.display()
+            ))
+        })?;
+        loaded.push(LoadedPromptCacheStateTensor {
+            owner: state.owner,
+            role: state.role,
+            array,
+        });
+    }
+    Ok(loaded)
+}
+
 fn validate_prompt_cache_layer_layouts(
     manifest: &PromptCacheManifest,
     model: &PromptCacheModelIdentity,
@@ -3267,13 +3860,18 @@ fn validate_prompt_cache_layer_layouts(
             .get(layout_index)
             .expect("validated prompt-cache layout index")
         {
-            LayerCachePolicy::NoState => {
+            LayerCachePolicy::NoState | LayerCachePolicy::FixedState { .. } => {
                 return Err(CacheResidencyError::IncompatiblePromptCache(format!(
                     "cache block unexpectedly materializes state for stateless layer {}",
                     block.global_layer
                 )))
             }
             LayerCachePolicy::KeyValue {
+                num_key_value_heads,
+                head_dim,
+                ..
+            }
+            | LayerCachePolicy::KeyValueWithFixedState {
                 num_key_value_heads,
                 head_dim,
                 ..
@@ -3387,6 +3985,7 @@ fn validate_compatibility(
     require_equal!(model_family);
     require_equal!(effective_model_type);
     require_equal!(checkpoint_fingerprint);
+    require_equal!(prefix_content_fingerprint);
     require_equal!(architecture_fingerprint);
     require_equal!(layer_count);
     require_equal!(global_layer_start);
@@ -3412,7 +4011,8 @@ fn validate_manifest(
             manifest.schema_version,
         ));
     }
-    if manifest.block_size_tokens <= 0
+    if manifest.prefix_content_fingerprint.is_empty()
+        || manifest.block_size_tokens <= 0
         || manifest.layer_count == 0
         || manifest.global_layer_start >= manifest.global_layer_end
         || manifest.global_layer_end > manifest.layer_count
@@ -3481,13 +4081,15 @@ fn validate_manifest(
                 ))
             })?;
         let expected_representation = match policy {
-            LayerCachePolicy::NoState => {
+            LayerCachePolicy::NoState | LayerCachePolicy::FixedState { .. } => {
                 return Err(CacheResidencyError::MalformedManifest(format!(
                     "stateless global layer {} has an unexpected payload",
                     block.global_layer
                 )))
             }
-            LayerCachePolicy::KeyValue { .. } => CacheRepresentation::KeyValue,
+            LayerCachePolicy::KeyValue { .. } | LayerCachePolicy::KeyValueWithFixedState { .. } => {
+                CacheRepresentation::KeyValue
+            }
             LayerCachePolicy::CompressedLatentRotary { .. } => {
                 CacheRepresentation::CompressedLatentRotary
             }
@@ -3506,8 +4108,13 @@ fn validate_manifest(
         })?;
         let batch = i32::try_from(manifest.batch_size).expect("validated prompt-cache batch");
         let (expected_first_shape, expected_second_shape) = match policy {
-            LayerCachePolicy::NoState => unreachable!(),
+            LayerCachePolicy::NoState | LayerCachePolicy::FixedState { .. } => unreachable!(),
             LayerCachePolicy::KeyValue {
+                num_key_value_heads,
+                head_dim,
+                ..
+            }
+            | LayerCachePolicy::KeyValueWithFixedState {
                 num_key_value_heads,
                 head_dim,
                 ..
@@ -3606,6 +4213,59 @@ fn validate_manifest(
             .or_default()
             .push(block);
     }
+    let actual_state = manifest
+        .state_tensors
+        .iter()
+        .map(|entry| (entry.owner, entry.role))
+        .collect::<BTreeSet<_>>();
+    if actual_state.len() != manifest.state_tensors.len() {
+        return Err(CacheResidencyError::MalformedManifest(
+            "fixed-state tensors contain duplicate owner/role entries".into(),
+        ));
+    }
+    let mut expected_state = Vec::new();
+    for (index, layer) in manifest.layer_layout.iter().enumerate() {
+        let owner = StateTensorOwner::Layer(manifest.global_layer_start + index);
+        for policy in layer.fixed_state() {
+            if policy.required || actual_state.contains(&(owner, policy.role)) {
+                expected_state.push((owner, policy));
+            }
+        }
+    }
+    if manifest.state_tensors.len() != expected_state.len() {
+        return Err(CacheResidencyError::MalformedManifest(format!(
+            "fixed-state tensor count {} does not match layout count {}",
+            manifest.state_tensors.len(),
+            expected_state.len()
+        )));
+    }
+    for (entry, (owner, policy)) in manifest.state_tensors.iter().zip(expected_state) {
+        if entry.owner != owner || entry.role != policy.role {
+            return Err(CacheResidencyError::MalformedManifest(format!(
+                "fixed-state tensors are missing, reordered, or unexpected at {:?} {:?}",
+                entry.owner, entry.role
+            )));
+        }
+        let expected_shape =
+            resolved_state_shape(policy, manifest.batch_size, manifest.total_prefix_tokens)
+                .map_err(|error| CacheResidencyError::MalformedManifest(error.to_string()))?;
+        if entry.shape != expected_shape
+            || !state_dtype_matches(policy.dtype, &entry.dtype)
+            || entry.logical_bytes == 0
+            || !is_sha256_hex(&entry.payload_sha256)
+            || entry.array != "state"
+        {
+            return Err(CacheResidencyError::MalformedManifest(format!(
+                "fixed-state tensor {:?} for {:?} does not match its policy",
+                entry.role, entry.owner
+            )));
+        }
+        let shard = safe_shard_path(directory, &entry.shard)?;
+        if !shard.is_file() {
+            return Err(CacheResidencyError::MissingShard(shard));
+        }
+        validate_state_shard_file(&shard, entry)?;
+    }
     for layer in manifest.global_layer_start..manifest.global_layer_end {
         let policy = manifest
             .layer_layout
@@ -3616,7 +4276,10 @@ fn validate_manifest(
             .filter(|((entry_layer, _), _)| *entry_layer == layer)
             .flat_map(|(_, blocks)| blocks.iter().copied())
             .collect::<Vec<_>>();
-        if matches!(policy, LayerCachePolicy::NoState) {
+        if matches!(
+            policy,
+            LayerCachePolicy::NoState | LayerCachePolicy::FixedState { .. }
+        ) {
             if !entries.is_empty() {
                 return Err(CacheResidencyError::MalformedManifest(format!(
                     "stateless global layer {layer} has unexpected blocks"
@@ -3690,7 +4353,10 @@ fn validate_complete_prefix(
             .iter()
             .filter(|record| record.id.global_layer == layer)
             .collect::<Vec<_>>();
-        if matches!(policy, LayerCachePolicy::NoState) {
+        if matches!(
+            policy,
+            LayerCachePolicy::NoState | LayerCachePolicy::FixedState { .. }
+        ) {
             if !blocks.is_empty() {
                 return Err(CacheResidencyError::MalformedManifest(format!(
                     "stateless global layer {layer} has unexpected cache blocks"
@@ -3715,8 +4381,9 @@ fn validate_complete_prefix(
         }
         for block in blocks {
             let expected_representation = match policy {
-                LayerCachePolicy::NoState => unreachable!(),
-                LayerCachePolicy::KeyValue { .. } => CacheRepresentation::KeyValue,
+                LayerCachePolicy::NoState | LayerCachePolicy::FixedState { .. } => unreachable!(),
+                LayerCachePolicy::KeyValue { .. }
+                | LayerCachePolicy::KeyValueWithFixedState { .. } => CacheRepresentation::KeyValue,
                 LayerCachePolicy::CompressedLatentRotary { .. } => {
                     CacheRepresentation::CompressedLatentRotary
                 }
@@ -3733,8 +4400,13 @@ fn validate_complete_prefix(
             })?;
             let batch = descriptor.batch_size as i32;
             let (first_shape, second_shape) = match policy {
-                LayerCachePolicy::NoState => unreachable!(),
+                LayerCachePolicy::NoState | LayerCachePolicy::FixedState { .. } => unreachable!(),
                 LayerCachePolicy::KeyValue {
+                    num_key_value_heads,
+                    head_dim,
+                    ..
+                }
+                | LayerCachePolicy::KeyValueWithFixedState {
                     num_key_value_heads,
                     head_dim,
                     ..
@@ -4508,6 +5180,60 @@ fn validate_shard_file(path: &Path, block: &PromptCacheBlock) -> Result<(), Cach
     Ok(())
 }
 
+fn validate_state_shard_file(
+    path: &Path,
+    state: &PromptCacheStateTensor,
+) -> Result<(), CacheResidencyError> {
+    let (metadata, file_len, data_start) = read_shard_metadata(path)?;
+    let entries = metadata.tensors();
+    if entries.len() != 1 {
+        return Err(CacheResidencyError::MalformedShard {
+            path: path.to_path_buf(),
+            reason: format!("expected one state array, found {}", entries.len()),
+        });
+    }
+    let tensor =
+        metadata
+            .info(&state.array)
+            .ok_or_else(|| CacheResidencyError::MalformedShard {
+                path: path.to_path_buf(),
+                reason: format!("missing state array {}", state.array),
+            })?;
+    let shape = tensor
+        .shape
+        .iter()
+        .map(|dimension| i32::try_from(*dimension))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| CacheResidencyError::MalformedShard {
+            path: path.to_path_buf(),
+            reason: "state array dimension exceeds runtime range".into(),
+        })?;
+    let logical_bytes = u64::try_from(tensor.data_offsets.1.saturating_sub(tensor.data_offsets.0))
+        .unwrap_or(u64::MAX);
+    if shape != state.shape
+        || stored_dtype_name(tensor.dtype) != state.dtype
+        || logical_bytes != state.logical_bytes
+    {
+        return Err(CacheResidencyError::MalformedShard {
+            path: path.to_path_buf(),
+            reason: "state array shape, dtype, or byte count does not match the manifest".into(),
+        });
+    }
+    let expected_file_len = data_start
+        .checked_add(metadata.data_len() as u64)
+        .ok_or_else(|| CacheResidencyError::MalformedShard {
+            path: path.to_path_buf(),
+            reason: "safetensors file length overflow".into(),
+        })?;
+    if expected_file_len != file_len {
+        return Err(CacheResidencyError::MalformedShard {
+            path: path.to_path_buf(),
+            reason: "state safetensors payload boundary does not match file length".into(),
+        });
+    }
+    Ok(())
+}
+
 fn read_shard_metadata(
     path: &Path,
 ) -> Result<(safetensors::tensor::Metadata, u64, u64), CacheResidencyError> {
@@ -4890,10 +5616,11 @@ mod tests {
         CacheResidencyManager, CacheTier, DiskLocation, DiskOperationKey, DiskOperationKind,
         DiskResult, DiskTask, DiskWorker, DiskWriteCommit, HostWriteReservation, LayerCachePolicy,
         LayerSchedule, PagedCacheOptions, PendingDiskOperation, PromptCacheBlock,
-        PromptCacheDescriptor, PromptCacheManifest, PromptCacheModelIdentity, PromptCacheTopology,
-        TemporaryFileGuard, CACHE_RESIDENCY_LAYER_REPORT_LIMIT,
-        MAX_PROMPT_CACHE_SHARD_HEADER_BYTES, PROMPT_CACHE_GENERATIONS_DIRECTORY,
-        PROMPT_CACHE_SCHEMA_VERSION,
+        PromptCacheDescriptor, PromptCacheManifest, PromptCacheModelIdentity,
+        PromptCacheStateTensor, PromptCacheTopology, StateTensorDimension, StateTensorDtype,
+        StateTensorOwner, StateTensorPolicy, StateTensorRole, TemporaryFileGuard,
+        CACHE_RESIDENCY_LAYER_REPORT_LIMIT, MAX_PROMPT_CACHE_SHARD_HEADER_BYTES,
+        PROMPT_CACHE_GENERATIONS_DIRECTORY, PROMPT_CACHE_SCHEMA_VERSION,
     };
     use safemlx::{transforms::eval, Array, Device, DeviceType, Stream};
     use safetensors::tensor::{serialize_to_file, Dtype as StoredDtype, TensorView};
@@ -4972,6 +5699,7 @@ mod tests {
             model_family: "llama".into(),
             effective_model_type: "llama".into(),
             checkpoint_fingerprint: "checkpoint".into(),
+            prefix_content_fingerprint: "text:prefix".into(),
             architecture_fingerprint: "architecture".into(),
             layer_count: 1,
             global_layer_start: 0,
@@ -5028,6 +5756,7 @@ mod tests {
             model_family: descriptor.model_family,
             effective_model_type: descriptor.effective_model_type,
             checkpoint_fingerprint: descriptor.checkpoint_fingerprint,
+            prefix_content_fingerprint: descriptor.prefix_content_fingerprint,
             architecture_fingerprint: descriptor.architecture_fingerprint,
             layer_count: 1,
             global_layer_start: 0,
@@ -5056,6 +5785,7 @@ mod tests {
                 logical_bytes: 8,
                 payload_sha256: hash_shard_payload(&root.join("block.safetensors")).unwrap(),
             }],
+            state_tensors: Vec::new(),
         };
         fs::write(
             root.join("manifest.json"),
@@ -5139,17 +5869,167 @@ mod tests {
     }
 
     #[test]
-    fn schema_v2_is_rejected_before_new_fields_are_decoded() {
+    fn schema_v3_is_rejected_before_v4_fields_are_decoded() {
         let directory = tempfile::tempdir().unwrap();
         fs::write(
             directory.path().join("manifest.json"),
-            br#"{"schema_version":2,"sliding_window":8}"#,
+            br#"{"schema_version":3,"layer_layout":[]}"#,
         )
         .unwrap();
         assert!(matches!(
             inspect_prompt_cache(directory.path()),
-            Err(CacheResidencyError::UnsupportedSchema(2))
+            Err(CacheResidencyError::UnsupportedSchema(3))
         ));
+    }
+
+    #[test]
+    fn v4_fixed_state_layout_round_trips_and_changes_identity() {
+        let convolution = StateTensorPolicy::new(
+            StateTensorRole::Convolution { slot: 0 },
+            vec![
+                StateTensorDimension::Batch,
+                StateTensorDimension::fixed(3).unwrap(),
+                StateTensorDimension::fixed(4).unwrap(),
+            ],
+            StateTensorDtype::Floating,
+        )
+        .unwrap();
+        let recurrent = StateTensorPolicy::new(
+            StateTensorRole::Recurrent,
+            vec![
+                StateTensorDimension::Batch,
+                StateTensorDimension::fixed(4).unwrap(),
+            ],
+            StateTensorDtype::Float32,
+        )
+        .unwrap();
+        let layouts = [
+            LayerSchedule::new(
+                1,
+                vec![LayerCachePolicy::fixed_only(vec![convolution.clone()]).unwrap()],
+            )
+            .unwrap(),
+            LayerSchedule::new(
+                1,
+                vec![LayerCachePolicy::fixed_only(vec![recurrent.clone()]).unwrap()],
+            )
+            .unwrap(),
+            LayerSchedule::new(
+                1,
+                vec![LayerCachePolicy::key_value_with_fixed_state(
+                    AttentionPolicy::Full,
+                    1,
+                    1,
+                    vec![convolution.clone()],
+                )
+                .unwrap()],
+            )
+            .unwrap(),
+        ];
+        let hashes = layouts
+            .iter()
+            .map(|layout| {
+                let json = serde_json::to_string(layout).unwrap();
+                let restored: LayerSchedule<LayerCachePolicy> =
+                    serde_json::from_str(&json).unwrap();
+                assert_eq!(&restored, layout);
+                stable_hash(layout)
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(hashes.len(), layouts.len());
+    }
+
+    fn write_fixed_state_fixture(root: &Path) -> PromptCacheManifest {
+        fs::create_dir_all(root).unwrap();
+        let values = (0..12)
+            .flat_map(|value| (value as f32).to_le_bytes())
+            .collect::<Vec<_>>();
+        let view = TensorView::new(StoredDtype::F32, vec![1, 3, 4], &values).unwrap();
+        let shard = root.join("state.safetensors");
+        serialize_to_file([("state", view)], None, &shard).unwrap();
+        let policy = StateTensorPolicy::new(
+            StateTensorRole::Convolution { slot: 0 },
+            vec![
+                StateTensorDimension::Batch,
+                StateTensorDimension::fixed(3).unwrap(),
+                StateTensorDimension::fixed(4).unwrap(),
+            ],
+            StateTensorDtype::Floating,
+        )
+        .unwrap();
+        let manifest = PromptCacheManifest {
+            schema_version: PROMPT_CACHE_SCHEMA_VERSION,
+            model_family: "fixed".into(),
+            effective_model_type: "fixed".into(),
+            checkpoint_fingerprint: "checkpoint".into(),
+            prefix_content_fingerprint: "state:prefix".into(),
+            architecture_fingerprint: "architecture".into(),
+            layer_count: 1,
+            global_layer_start: 0,
+            global_layer_end: 1,
+            block_size_tokens: 1,
+            batch_size: 1,
+            total_prefix_tokens: 1,
+            prefix_sha256: hash_token_ids(&[7]),
+            layer_layout: LayerSchedule::new(
+                1,
+                vec![LayerCachePolicy::fixed_only(vec![policy]).unwrap()],
+            )
+            .unwrap(),
+            sink_tokens: 0,
+            topology: PromptCacheTopology::default(),
+            application_namespace: None,
+            blocks: Vec::new(),
+            state_tensors: vec![PromptCacheStateTensor {
+                owner: StateTensorOwner::Layer(0),
+                role: StateTensorRole::Convolution { slot: 0 },
+                shard: "state.safetensors".into(),
+                array: "state".into(),
+                shape: vec![1, 3, 4],
+                dtype: "Float32".into(),
+                logical_bytes: 48,
+                payload_sha256: hash_shard_payload(&shard).unwrap(),
+            }],
+        };
+        fs::write(
+            root.join("manifest.json"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        manifest
+    }
+
+    #[test]
+    fn v4_fixed_state_validation_rejects_missing_reordered_kind_and_geometry() {
+        let directory = tempfile::tempdir().unwrap();
+        let base = write_fixed_state_fixture(directory.path());
+        inspect_prompt_cache(directory.path()).unwrap();
+        let write = |manifest: &PromptCacheManifest| {
+            fs::write(
+                directory.path().join("manifest.json"),
+                serde_json::to_vec(manifest).unwrap(),
+            )
+            .unwrap();
+            inspect_prompt_cache(directory.path())
+                .unwrap_err()
+                .to_string()
+        };
+
+        let mut missing = base.clone();
+        missing.state_tensors.clear();
+        assert!(write(&missing).contains("count"));
+
+        let mut unexpected = base.clone();
+        unexpected.state_tensors[0].role = StateTensorRole::Recurrent;
+        assert!(write(&unexpected).contains("missing, reordered, or unexpected"));
+
+        let mut geometry = base.clone();
+        geometry.state_tensors[0].shape = vec![1, 2, 4];
+        assert!(write(&geometry).contains("does not match its policy"));
+
+        let mut dtype = base;
+        dtype.state_tensors[0].dtype = "Int32".into();
+        assert!(write(&dtype).contains("does not match its policy"));
     }
 
     #[test]

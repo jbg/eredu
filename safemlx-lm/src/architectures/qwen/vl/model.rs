@@ -1,7 +1,7 @@
 //! Qwen3-VL conditional-generation model support.
 
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     path::{Path, PathBuf},
 };
 
@@ -34,7 +34,17 @@ use crate::{
     architectures::qwen::dense as dense_qwen,
     error::Error,
     nn::tensor::{create_attention_mask, AttentionMask},
-    runtime::cache::{ConcatKeyValueCache, KeyValueCache},
+    runtime::attention::{AttentionPolicy, LayerSchedule},
+    runtime::cache::{
+        residency::{
+            derive_prompt_cache_architecture_fingerprint, open_prompt_cache_snapshot,
+            save_prompt_cache_snapshot, CacheBlockArrays, LayerCachePolicy, PromptCacheDescriptor,
+            PromptCacheManifest, PromptCacheModelIdentity, PromptCacheOptions,
+            PromptCacheSnapshotBlock, PromptCacheStateArray, StateTensorDimension,
+            StateTensorDtype, StateTensorOwner, StateTensorPolicy, StateTensorRole,
+        },
+        ConcatKeyValueCache, KeyValueCache,
+    },
     runtime::checkpoint::load::{
         gguf_metadata, load_named_array_strict, load_safetensors_dir_quantized_strict,
         load_safetensors_dir_strict, StrictLoadConfig, StrictLoadReport,
@@ -164,6 +174,66 @@ pub(crate) fn model_args_from_config_value(config: &Value) -> Result<ModelArgs, 
     parse_model_args_value(config.clone())
 }
 
+pub(crate) fn prompt_cache_architecture_fingerprint(args: &ModelArgs) -> String {
+    derive_prompt_cache_architecture_fingerprint(
+        "qwen3_vl",
+        [
+            (
+                "text",
+                dense_qwen::prompt_cache_architecture_fingerprint(&args.text_config),
+            ),
+            ("image_token", args.image_token_id.to_string()),
+            ("video_token", args.video_token_id.to_string()),
+            ("mrope_section", format!("{:?}", args.mrope_section)),
+        ],
+    )
+}
+
+pub(crate) fn prompt_cache_layer_layout(
+    args: &ModelArgs,
+) -> Result<LayerSchedule<LayerCachePolicy>, Error> {
+    let cache_error = |error: crate::runtime::cache::residency::CacheResidencyError| {
+        Error::UnsupportedArchitecture(error.to_string())
+    };
+    let layers = args.text_config.num_hidden_layers as usize;
+    let policies = (0..layers)
+        .map(|layer| {
+            let attention = *args
+                .text_config
+                .attention_schedule
+                .get(layer)
+                .ok_or_else(|| {
+                    Error::UnsupportedArchitecture(format!(
+                        "Qwen3-VL text attention schedule has no layer {layer}"
+                    ))
+                })?;
+            if layer == 0 {
+                LayerCachePolicy::key_value_with_fixed_state(
+                    attention,
+                    args.text_config.num_key_value_heads,
+                    args.text_config.head_dim,
+                    vec![StateTensorPolicy::new(
+                        StateTensorRole::PositionDelta,
+                        vec![StateTensorDimension::Scalar],
+                        StateTensorDtype::Int32,
+                    )
+                    .map_err(cache_error)?],
+                )
+                .map_err(cache_error)
+            } else {
+                LayerCachePolicy::key_value(
+                    attention,
+                    args.text_config.num_key_value_heads,
+                    args.text_config.head_dim,
+                )
+                .map_err(cache_error)
+            }
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    LayerSchedule::new(layers, policies)
+        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
+}
+
 fn validate_qwen3_vl_model_args(args: &ModelArgs) -> Result<(), Error> {
     let vision = &args.vision_config;
     if vision.hidden_size <= 0
@@ -288,6 +358,137 @@ impl Model {
     /// Creates an empty cache.
     pub fn new_cache(&self) -> Cache {
         Cache::default()
+    }
+
+    pub(crate) fn save_prompt_cache(
+        cache: &Cache,
+        destination: impl AsRef<Path>,
+        descriptor: PromptCacheDescriptor,
+        prefix_token_ids: &[u32],
+        options: &PromptCacheOptions,
+        stream: &Stream,
+    ) -> Result<PromptCacheManifest, Exception> {
+        let end = i64::try_from(prefix_token_ids.len())
+            .map_err(|_| Exception::custom("Qwen-VL prompt length exceeds i64"))?;
+        let mut blocks = Vec::with_capacity(cache.kv.len());
+        for (layer, cache) in cache.kv.iter().enumerate() {
+            let cache = cache.as_ref().ok_or_else(|| {
+                Exception::custom("Qwen-VL prompt cache is missing a decoder layer")
+            })?;
+            if cache.offset() as i64 != end {
+                return Err(Exception::custom(
+                    "Qwen-VL cache offset does not match the persisted prefix",
+                ));
+            }
+            let (keys, values) = cache
+                .snapshot_arrays(stream)?
+                .ok_or_else(|| Exception::custom("Qwen-VL key/value state is missing"))?;
+            blocks.push(PromptCacheSnapshotBlock {
+                global_layer: layer,
+                start: end - i64::from(keys.dim(-2)),
+                end,
+                rank: None,
+                arrays: CacheBlockArrays::KeyValue { keys, values },
+            });
+        }
+        let position_delta = Array::from_slice(&[cache.rope_delta], &[1]);
+        let state = [PromptCacheStateArray {
+            owner: StateTensorOwner::Layer(0),
+            role: StateTensorRole::PositionDelta,
+            array: &position_delta,
+        }];
+        save_prompt_cache_snapshot(
+            destination,
+            descriptor,
+            prefix_token_ids,
+            blocks,
+            &state,
+            options,
+        )
+        .map_err(|error| Exception::custom(error.to_string()))
+    }
+
+    pub(crate) fn load_prompt_cache(
+        args: &ModelArgs,
+        directory: impl AsRef<Path>,
+        expected: &PromptCacheDescriptor,
+        prefix_token_ids: &[u32],
+        stream: &Stream,
+    ) -> Result<(Cache, PromptCacheManifest), Exception> {
+        let layer_count = args.text_config.num_hidden_layers as usize;
+        let identity = PromptCacheModelIdentity {
+            model_family: "qwen3_vl".into(),
+            effective_model_type: if args.text_config.model_type == "qwen3_vl_moe_text" {
+                "qwen3_vl_moe".into()
+            } else {
+                "qwen3_vl".into()
+            },
+            architecture_fingerprint: prompt_cache_architecture_fingerprint(args),
+            layer_count,
+            global_layer_start: 0,
+            global_layer_end: layer_count,
+            sink_tokens: 0,
+            topology: Default::default(),
+            layer_layout: prompt_cache_layer_layout(args)
+                .map_err(|error| Exception::custom(error.to_string()))?,
+        };
+        let (blocks, state, manifest) =
+            open_prompt_cache_snapshot(directory, expected, &identity, prefix_token_ids, stream)
+                .map_err(|error| Exception::custom(error.to_string()))?;
+        let mut blocks = blocks
+            .into_iter()
+            .map(|block| (block.global_layer, block))
+            .collect::<BTreeMap<_, _>>();
+        let mut state = state
+            .into_iter()
+            .map(|state| ((state.owner, state.role), state.array))
+            .collect::<BTreeMap<_, _>>();
+        let rope_delta = state
+            .remove(&(StateTensorOwner::Layer(0), StateTensorRole::PositionDelta))
+            .ok_or_else(|| Exception::custom("Qwen-VL position delta is missing"))?
+            .try_item::<i32>(stream)?;
+        let mut cache = Cache {
+            kv: (0..args.text_config.num_hidden_layers)
+                .map(|layer| {
+                    let window = args
+                        .text_config
+                        .attention_schedule
+                        .get(layer as usize)
+                        .and_then(|policy| policy.window())
+                        .map(|window| {
+                            i32::try_from(window.get())
+                                .expect("validated Qwen-VL attention window fits i32")
+                        });
+                    Some(match window {
+                        Some(window) => ConcatKeyValueCache::new_for_sliding_attention(window),
+                        None => ConcatKeyValueCache::new(),
+                    })
+                })
+                .collect(),
+            rope_delta,
+        };
+        let end = i32::try_from(prefix_token_ids.len())
+            .map_err(|_| Exception::custom("Qwen-VL prompt length exceeds i32"))?;
+        for (layer, cache) in cache.kv.iter_mut().enumerate() {
+            let cache = cache
+                .as_mut()
+                .ok_or_else(|| Exception::custom("Qwen-VL decoder cache layer is missing"))?;
+            let block = blocks
+                .remove(&layer)
+                .ok_or_else(|| Exception::custom("Qwen-VL prompt-cache block is missing"))?;
+            match block.arrays {
+                CacheBlockArrays::KeyValue { keys, values } => {
+                    cache.restore_resident(keys, values, end)?;
+                }
+                _ => return Err(Exception::custom("Qwen-VL prompt-cache kind mismatch")),
+            }
+        }
+        if !blocks.is_empty() || !state.is_empty() {
+            return Err(Exception::custom(
+                "Qwen-VL prompt cache has unexpected state",
+            ));
+        }
+        Ok((cache, manifest))
     }
 
     fn prepare_typed_prefill(
@@ -1265,7 +1466,7 @@ mod tests {
 
     use crate::api::{common::generation::CausalLm, input as runtime_input};
 
-    fn tiny_model(stream: &safemlx::Stream) -> super::Model {
+    fn tiny_args() -> super::ModelArgs {
         let text_config = crate::architectures::qwen::dense::DecoderConfig {
             model_type: "qwen3_vl_text".into(),
             hidden_size: 12,
@@ -1315,17 +1516,94 @@ mod tests {
             window_size: 8,
             out_hidden_size: 12,
         };
-        super::Model::new(
-            super::ModelArgs {
-                text_config,
-                vision_config,
-                image_token_id: 30,
-                video_token_id: 31,
-                mrope_section: vec![2, 2, 2],
-            },
+        super::ModelArgs {
+            text_config,
+            vision_config,
+            image_token_id: 30,
+            video_token_id: 31,
+            mrope_section: vec![2, 2, 2],
+        }
+    }
+
+    fn tiny_model(stream: &safemlx::Stream) -> super::Model {
+        super::Model::new(tiny_args(), stream).unwrap()
+    }
+
+    #[test]
+    fn prompt_cache_layout_records_multimodal_position_delta() {
+        use crate::runtime::cache::residency::{LayerCachePolicy, StateTensorRole};
+
+        let layout = super::prompt_cache_layer_layout(&tiny_args()).unwrap();
+        let LayerCachePolicy::KeyValueWithFixedState { tensors, .. } = layout.get(0).unwrap()
+        else {
+            panic!("Qwen-VL layer zero must carry its position delta");
+        };
+        assert_eq!(tensors.len(), 1);
+        assert_eq!(tensors[0].role, StateTensorRole::PositionDelta);
+    }
+
+    #[test]
+    #[ignore = "requires MLX runtime execution"]
+    fn schema_v4_multimodal_position_state_save_reload_parity() {
+        use crate::runtime::cache::{
+            residency::{PromptCacheDescriptor, PromptCacheOptions, PromptCacheTopology},
+            KeyValueCache,
+        };
+
+        let context = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
+        let stream = context.stream();
+        let args = tiny_args();
+        let mut kv = crate::runtime::cache::ConcatKeyValueCache::new();
+        let values = (0..48).map(|value| value as f32).collect::<Vec<_>>();
+        let keys = Array::from_slice(&values, &[1, 1, 4, 12]);
+        kv.update_and_fetch(keys.clone(), keys, stream).unwrap();
+        let cache = super::Cache {
+            kv: vec![Some(kv)],
+            rope_delta: 9,
+        };
+        let prefix_ids = [1_u32, 30, 30, 2];
+        let layout = super::prompt_cache_layer_layout(&args).unwrap();
+        let descriptor = PromptCacheDescriptor {
+            model_family: "qwen3_vl".into(),
+            effective_model_type: "qwen3_vl".into(),
+            checkpoint_fingerprint: "zero-fixture".into(),
+            prefix_content_fingerprint: "image:fixture-a;tokens:1,30,30,2".into(),
+            architecture_fingerprint: super::prompt_cache_architecture_fingerprint(&args),
+            layer_count: 1,
+            global_layer_start: 0,
+            global_layer_end: 1,
+            batch_size: 1,
+            layer_layout: layout,
+            sink_tokens: 0,
+            topology: PromptCacheTopology::default(),
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let destination = directory.path().join("prompt-cache");
+        super::Model::save_prompt_cache(
+            &cache,
+            &destination,
+            descriptor.clone(),
+            &prefix_ids,
+            &PromptCacheOptions::default(),
             stream,
         )
-        .unwrap()
+        .unwrap();
+        let (restored, _) =
+            super::Model::load_prompt_cache(&args, &destination, &descriptor, &prefix_ids, stream)
+                .unwrap();
+        assert_eq!(restored.rope_delta, 9);
+        assert_eq!(restored.kv[0].as_ref().unwrap().offset(), 4);
+
+        let mut wrong_media = descriptor;
+        wrong_media.prefix_content_fingerprint = "image:fixture-b;tokens:1,30,30,2".into();
+        assert!(super::Model::load_prompt_cache(
+            &args,
+            &destination,
+            &wrong_media,
+            &prefix_ids,
+            stream,
+        )
+        .is_err());
     }
 
     #[test]

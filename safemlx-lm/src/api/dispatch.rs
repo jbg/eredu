@@ -588,6 +588,18 @@ impl Model {
             Self::NemotronHLayerwise(model) => Ok(
                 nemotron_h::prompt_cache_architecture_fingerprint(model.args()),
             ),
+            Self::Qwen3Next(model) | Self::Qwen35Moe(model) => Ok(
+                qwen3_5_moe::prompt_cache_architecture_fingerprint(&model.args),
+            ),
+            Self::Qwen3NextLayerwise(model) | Self::Qwen35MoeLayerwise(model) => Ok(
+                qwen3_5_moe::prompt_cache_architecture_fingerprint(model.args()),
+            ),
+            Self::Qwen3Vl(model) | Self::Qwen3VlMoe(model) => {
+                Ok(qwen3_vl::prompt_cache_architecture_fingerprint(&model.args))
+            }
+            Self::Qwen3VlLayerwise(model) | Self::Qwen3VlMoeLayerwise(model) => Ok(
+                qwen3_vl::prompt_cache_architecture_fingerprint(model.args()),
+            ),
             _ => Err(Exception::custom(format!(
                 "prompt-cache architecture identity is unsupported for model type {}",
                 self.model_type()
@@ -657,16 +669,50 @@ impl Model {
                     args.head_dim,
                 )
             }
-            Self::DenseQwen(model) => PromptCacheModelIdentity::key_value_layouts(
-                model.args.attention_schedule.iter().map(|policy| {
-                    policy.window().map(|window| {
-                        i32::try_from(window.get())
-                            .expect("validated dense-Qwen attention window fits i32")
-                    })
-                }),
-                model.args.num_key_value_heads,
-                model.args.head_dim,
-            ),
+            Self::DenseQwen(model) => return dense_qwen::prompt_cache_layer_layout(&model.args),
+            Self::DenseQwenLayerwise(model) => {
+                return dense_qwen::prompt_cache_layer_layout(model.args())
+            }
+            Self::KimiLinear(model) => {
+                return kimi_linear::prompt_cache_layer_layout(&model.args)
+                    .map_err(|error| Exception::custom(error.to_string()));
+            }
+            Self::KimiLinearLayerwise(model) => {
+                return kimi_linear::prompt_cache_layer_layout(model.args())
+                    .map_err(|error| Exception::custom(error.to_string()));
+            }
+            Self::Qwen3Next(model) | Self::Qwen35Moe(model) => {
+                return qwen3_5_moe::prompt_cache_layer_layout(&model.args)
+                    .map_err(|error| Exception::custom(error.to_string()));
+            }
+            Self::Qwen3NextLayerwise(model) | Self::Qwen35MoeLayerwise(model) => {
+                return qwen3_5_moe::prompt_cache_layer_layout(model.args())
+                    .map_err(|error| Exception::custom(error.to_string()));
+            }
+            Self::Qwen3Vl(model) | Self::Qwen3VlMoe(model) => {
+                return qwen3_vl::prompt_cache_layer_layout(&model.args)
+                    .map_err(|error| Exception::custom(error.to_string()));
+            }
+            Self::Qwen3VlLayerwise(model) | Self::Qwen3VlMoeLayerwise(model) => {
+                return qwen3_vl::prompt_cache_layer_layout(model.args())
+                    .map_err(|error| Exception::custom(error.to_string()));
+            }
+            Self::Gemma4(model) => {
+                return gemma4::prompt_cache_layer_layout(&model.args)
+                    .map_err(|error| Exception::custom(error.to_string()));
+            }
+            Self::Gemma4Layerwise(model) => {
+                return gemma4::prompt_cache_layer_layout(model.args())
+                    .map_err(|error| Exception::custom(error.to_string()));
+            }
+            Self::Inkling(model) => {
+                return inkling::prompt_cache_layer_layout(&model.args)
+                    .map_err(|error| Exception::custom(error.to_string()));
+            }
+            Self::InklingLayerwise(model) => {
+                return inkling::prompt_cache_layer_layout(model.args())
+                    .map_err(|error| Exception::custom(error.to_string()));
+            }
             _ => {
                 return Err(Exception::custom(format!(
                     "prompt-cache state layout is unsupported for model type {}",
@@ -1061,6 +1107,7 @@ impl Model {
         expected: &PromptCacheDescriptor,
         prefix_token_ids: &[u32],
         options: PagedCacheOptions,
+        stream: &Stream,
     ) -> Result<(ModelCache, PromptCacheManifest), Exception> {
         match self {
             Self::Llama(model) => {
@@ -1194,8 +1241,249 @@ impl Model {
                     .collect::<Result<Vec<_>, _>>()?;
                 Ok((ModelCache::PagedKeyValue(caches), manifest))
             }
+            Self::DenseQwenLayerwise(model) => dense_qwen::load_prompt_cache(
+                model.args(),
+                directory,
+                expected,
+                prefix_token_ids,
+                stream,
+            )
+            .map(|(cache, manifest)| (ModelCache::KeyValue(cache), manifest)),
+            Self::KimiLinear(model) => kimi_linear::Model::load_prompt_cache(
+                &model.args, directory, expected, prefix_token_ids, stream,
+            )
+                .map(|(cache, manifest)| (ModelCache::KimiLinear(cache), manifest)),
+            Self::KimiLinearLayerwise(model) => kimi_linear::Model::load_prompt_cache(
+                model.args(), directory, expected, prefix_token_ids, stream,
+            )
+            .map(|(cache, manifest)| (ModelCache::KimiLinear(cache), manifest)),
+            Self::Qwen3Next(model) => qwen3_next::Model::load_prompt_cache(
+                &model.args, directory, expected, prefix_token_ids, stream,
+            )
+                .map(|(cache, manifest)| (ModelCache::Qwen3Next(cache), manifest)),
+            Self::Qwen3NextLayerwise(model) => qwen3_next::Model::load_prompt_cache(
+                model.args(), directory, expected, prefix_token_ids, stream,
+            )
+            .map(|(cache, manifest)| (ModelCache::Qwen3Next(cache), manifest)),
+            Self::Qwen35Moe(model) => qwen3_5_moe::Model::load_prompt_cache(
+                &model.args, directory, expected, prefix_token_ids, stream,
+            )
+                .map(|(cache, manifest)| (ModelCache::Qwen35Moe(cache), manifest)),
+            Self::Qwen35MoeLayerwise(model) => qwen3_5_moe::Model::load_prompt_cache(
+                model.args(), directory, expected, prefix_token_ids, stream,
+            )
+            .map(|(cache, manifest)| (ModelCache::Qwen35Moe(cache), manifest)),
+            Self::Qwen3Vl(model) => qwen3_vl::Model::load_prompt_cache(
+                &model.args, directory, expected, prefix_token_ids, stream,
+            )
+                .map(|(cache, manifest)| (ModelCache::Qwen3Vl(cache), manifest)),
+            Self::Qwen3VlLayerwise(model) => qwen3_vl::Model::load_prompt_cache(
+                model.args(), directory, expected, prefix_token_ids, stream,
+            )
+            .map(|(cache, manifest)| (ModelCache::Qwen3Vl(cache), manifest)),
+            Self::Qwen3VlMoe(model) => qwen3_vl_moe::Model::load_prompt_cache(
+                &model.args, directory, expected, prefix_token_ids, stream,
+            )
+                .map(|(cache, manifest)| (ModelCache::Qwen3VlMoe(cache), manifest)),
+            Self::Qwen3VlMoeLayerwise(model) => qwen3_vl_moe::Model::load_prompt_cache(
+                model.args(), directory, expected, prefix_token_ids, stream,
+            )
+            .map(|(cache, manifest)| (ModelCache::Qwen3VlMoe(cache), manifest)),
+            Self::Gemma4(model) => gemma4::Model::load_prompt_cache(
+                &model.args, directory, expected, prefix_token_ids, stream,
+            )
+                .map(|(cache, manifest)| (ModelCache::Gemma4(cache), manifest)),
+            Self::Gemma4Layerwise(model) => gemma4::Model::load_prompt_cache(
+                model.args(), directory, expected, prefix_token_ids, stream,
+            )
+            .map(|(cache, manifest)| (ModelCache::Gemma4(cache), manifest)),
+            Self::Inkling(model) => inkling::Model::load_prompt_cache(
+                &model.args, directory, expected, prefix_token_ids, stream,
+            )
+                .map(|(cache, manifest)| (ModelCache::Inkling(cache), manifest)),
+            Self::InklingLayerwise(model) => inkling::Model::load_prompt_cache(
+                model.args(), directory, expected, prefix_token_ids, stream,
+            )
+            .map(|(cache, manifest)| (ModelCache::Inkling(cache), manifest)),
+            Self::Lfm2(_) | Self::Lfm2Layerwise(_) => Err(Exception::custom(
+                "prompt-cache loading is unsupported for LFM2 because its causal-convolution state does not yet have a persisted state policy",
+            )),
+            Self::NemotronH(_) | Self::NemotronHLayerwise(_) => Err(Exception::custom(
+                "prompt-cache loading is unsupported for Nemotron-H because its Mamba convolution and recurrent state do not yet have persisted state policies",
+            )),
+        }
+    }
+
+    /// Atomically saves a completed immutable prefix with model-owned state validation.
+    pub fn save_prompt_cache(
+        &self,
+        cache: &mut ModelCache,
+        destination: impl AsRef<Path>,
+        descriptor: PromptCacheDescriptor,
+        prefix_token_ids: &[u32],
+        options: &PromptCacheOptions,
+        stream: &Stream,
+    ) -> Result<PromptCacheManifest, Exception> {
+        let layer_layout = self.prompt_cache_layer_layout()?;
+        let model_family = match self {
+            Self::Llama(_) | Self::LlamaLayerwise(_) => "llama",
+            Self::DeepSeekV3(_) | Self::DeepSeekV3Layerwise(_) => "deepseek_v3",
+            Self::GptOss(_) | Self::GptOssLayerwise(_) => "gpt_oss",
+            Self::DenseQwen(_) | Self::DenseQwenLayerwise(_) => "dense_qwen",
+            Self::KimiLinear(_) | Self::KimiLinearLayerwise(_) => "kimi_linear",
+            Self::Qwen3Next(_)
+            | Self::Qwen3NextLayerwise(_)
+            | Self::Qwen35Moe(_)
+            | Self::Qwen35MoeLayerwise(_) => "qwen_hybrid",
+            Self::Qwen3Vl(_)
+            | Self::Qwen3VlLayerwise(_)
+            | Self::Qwen3VlMoe(_)
+            | Self::Qwen3VlMoeLayerwise(_) => "qwen3_vl",
+            Self::Gemma4(_) | Self::Gemma4Layerwise(_) => "gemma4",
+            Self::Inkling(_) | Self::InklingLayerwise(_) => "inkling",
+            _ => {
+                return Err(Exception::custom(format!(
+                    "prompt-cache publication is unsupported for model type {}",
+                    self.model_type()
+                )))
+            }
+        };
+        let layer_count = layer_layout.len();
+        let identity = PromptCacheModelIdentity {
+            model_family: model_family.into(),
+            effective_model_type: self.model_type().into(),
+            architecture_fingerprint: self.prompt_cache_architecture_fingerprint()?,
+            layer_count,
+            global_layer_start: 0,
+            global_layer_end: layer_count,
+            sink_tokens: 0,
+            topology: Default::default(),
+            layer_layout,
+        };
+        validate_prompt_cache_model_identity(&descriptor, &identity)
+            .map_err(|error| Exception::custom(error.to_string()))?;
+        match (self, cache) {
+            (Self::KimiLinear(_), ModelCache::KimiLinear(cache))
+            | (Self::KimiLinearLayerwise(_), ModelCache::KimiLinear(cache)) => {
+                kimi_linear::Model::save_prompt_cache(
+                    cache,
+                    destination,
+                    descriptor,
+                    prefix_token_ids,
+                    options,
+                    stream,
+                )
+            }
+            (Self::Qwen3Next(_), ModelCache::Qwen3Next(cache))
+            | (Self::Qwen3NextLayerwise(_), ModelCache::Qwen3Next(cache)) => {
+                qwen3_next::Model::save_prompt_cache(
+                    cache,
+                    destination,
+                    descriptor,
+                    prefix_token_ids,
+                    options,
+                    stream,
+                )
+            }
+            (Self::Qwen35Moe(_), ModelCache::Qwen35Moe(cache))
+            | (Self::Qwen35MoeLayerwise(_), ModelCache::Qwen35Moe(cache)) => {
+                qwen3_5_moe::Model::save_prompt_cache(
+                    cache,
+                    destination,
+                    descriptor,
+                    prefix_token_ids,
+                    options,
+                    stream,
+                )
+            }
+            (Self::Qwen3Vl(_), ModelCache::Qwen3Vl(cache))
+            | (Self::Qwen3VlLayerwise(_), ModelCache::Qwen3Vl(cache)) => {
+                qwen3_vl::Model::save_prompt_cache(
+                    cache,
+                    destination,
+                    descriptor,
+                    prefix_token_ids,
+                    options,
+                    stream,
+                )
+            }
+            (Self::Qwen3VlMoe(_), ModelCache::Qwen3VlMoe(cache))
+            | (Self::Qwen3VlMoeLayerwise(_), ModelCache::Qwen3VlMoe(cache)) => {
+                qwen3_vl_moe::Model::save_prompt_cache(
+                    cache,
+                    destination,
+                    descriptor,
+                    prefix_token_ids,
+                    options,
+                    stream,
+                )
+            }
+            (Self::Gemma4(_), ModelCache::Gemma4(cache))
+            | (Self::Gemma4Layerwise(_), ModelCache::Gemma4(cache)) => {
+                gemma4::Model::save_prompt_cache(
+                    cache,
+                    destination,
+                    descriptor,
+                    prefix_token_ids,
+                    options,
+                    stream,
+                )
+            }
+            (Self::Inkling(_), ModelCache::Inkling(cache))
+            | (Self::InklingLayerwise(_), ModelCache::Inkling(cache)) => {
+                inkling::Model::save_prompt_cache(
+                    cache,
+                    destination,
+                    descriptor,
+                    prefix_token_ids,
+                    options,
+                    stream,
+                )
+            }
+            (Self::DenseQwen(model), ModelCache::KeyValue(cache)) => dense_qwen::save_prompt_cache(
+                &model.args,
+                cache,
+                destination,
+                descriptor,
+                prefix_token_ids,
+                options,
+                stream,
+            ),
+            (Self::DenseQwenLayerwise(model), ModelCache::KeyValue(cache)) => {
+                dense_qwen::save_prompt_cache(
+                    model.args(),
+                    cache,
+                    destination,
+                    descriptor,
+                    prefix_token_ids,
+                    options,
+                    stream,
+                )
+            }
+            (Self::Llama(_) | Self::DenseQwen(_), ModelCache::PagedKeyValue(caches)) => {
+                for cache in caches.iter_mut().flatten() {
+                    cache.finalize()?;
+                }
+                caches
+                    .iter()
+                    .flatten()
+                    .next()
+                    .ok_or_else(|| Exception::custom("cannot persist an empty paged cache"))?
+                    .manager()
+                    .save_prompt_cache(destination, descriptor, prefix_token_ids, &[], options)
+                    .map_err(|error| Exception::custom(error.to_string()))
+            }
+            (Self::LlamaLayerwise(_), ModelCache::LlamaLayerwise(cache)) => cache
+                .save_prompt_cache(destination, descriptor, prefix_token_ids, options)
+                .map_err(|error| Exception::custom(error.to_string())),
+            (Self::DeepSeekV3(_) | Self::DeepSeekV3Layerwise(_), ModelCache::DeepSeekV3(cache)) => {
+                cache.save_prompt_cache(destination, descriptor, prefix_token_ids, options)
+            }
+            (Self::GptOss(_) | Self::GptOssLayerwise(_), ModelCache::GptOss(cache)) => {
+                cache.save_prompt_cache(destination, descriptor, prefix_token_ids, options)
+            }
             _ => Err(Exception::custom(
-                "prompt-cache loading is unsupported for this model cache representation; multimodal and recurrent prefixes require additional identity state",
+                "model and cache representations do not match for prompt-cache publication",
             )),
         }
     }
@@ -1601,63 +1889,6 @@ impl ModelCache {
             _ => Ok(None),
         }
     }
-
-    /// Finalizes and atomically saves a completed immutable text prefix.
-    pub fn save_prompt_cache(
-        &mut self,
-        destination: impl AsRef<Path>,
-        descriptor: PromptCacheDescriptor,
-        prefix_token_ids: &[u32],
-        options: &PromptCacheOptions,
-    ) -> Result<PromptCacheManifest, Exception> {
-        match self {
-            Self::PagedKeyValue(caches) => {
-                persistable_attention_window(
-                    caches
-                        .iter()
-                        .flatten()
-                        .map(PagedKeyValueCache::attention_window),
-                )?;
-                for cache in caches.iter_mut().flatten() {
-                    cache.finalize()?;
-                }
-                caches
-                    .iter()
-                    .flatten()
-                    .next()
-                    .ok_or_else(|| Exception::custom("cannot persist an empty paged cache"))?
-                    .manager()
-                    .save_prompt_cache(destination, descriptor, prefix_token_ids, options)
-                    .map_err(|error| Exception::custom(error.to_string()))
-            }
-            Self::LlamaLayerwise(cache) => cache
-                .save_prompt_cache(destination, descriptor, prefix_token_ids, options)
-                .map_err(|error| Exception::custom(error.to_string())),
-            Self::DeepSeekV3(cache) => {
-                cache.save_prompt_cache(destination, descriptor, prefix_token_ids, options)
-            }
-            Self::GptOss(cache) => {
-                cache.save_prompt_cache(destination, descriptor, prefix_token_ids, options)
-            }
-            _ => Err(Exception::custom(
-                "prompt-cache persistence is unsupported for this model cache representation",
-            )),
-        }
-    }
-}
-
-fn persistable_attention_window(
-    mut windows: impl Iterator<Item = Option<i32>>,
-) -> Result<Option<i32>, Exception> {
-    let first = windows
-        .next()
-        .ok_or_else(|| Exception::custom("cannot persist an empty paged cache"))?;
-    if windows.any(|window| window != first) {
-        return Err(Exception::custom(
-            "persisted prompt caches for non-uniform per-layer attention schedules are unsupported because prompt-cache schema v2 stores only one model-wide sliding window",
-        ));
-    }
-    Ok(first)
 }
 
 /// Token iterator for any supported model variant.
@@ -1903,26 +2134,5 @@ mod gemma4_drafter_compatibility_tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("no matching publishing layer"));
-    }
-}
-
-#[cfg(test)]
-mod prompt_cache_attention_schedule_tests {
-    use super::persistable_attention_window;
-
-    #[test]
-    fn persistence_rejects_non_uniform_per_layer_windows() {
-        assert_eq!(
-            persistable_attention_window([Some(8), Some(8)].into_iter()).unwrap(),
-            Some(8)
-        );
-        assert_eq!(
-            persistable_attention_window([None, None].into_iter()).unwrap(),
-            None
-        );
-        let error = persistable_attention_window([Some(8), None, Some(8)].into_iter())
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("non-uniform per-layer attention schedules"));
     }
 }

@@ -210,6 +210,28 @@ impl CompressedLatentCache {
         Some((self.latent.as_ref()?, self.rotary_key.as_ref()?))
     }
 
+    pub(crate) fn restore_resident(
+        &mut self,
+        latent: Array,
+        rotary_key: Array,
+        end: i32,
+    ) -> Result<(), Exception> {
+        if latent.dim(1) != rotary_key.dim(1) || latent.dim(1) != end {
+            return Err(Exception::custom(
+                "restored compressed cache arrays do not match their token range",
+            ));
+        }
+        self.paged = None;
+        self.latent_storage = Some(latent.clone());
+        self.rotary_key_storage = Some(rotary_key.clone());
+        self.latent = Some(latent);
+        self.rotary_key = Some(rotary_key);
+        self.offset = end;
+        self.length = end;
+        self.capacity = end;
+        Ok(())
+    }
+
     /// Clears all retained state.
     pub fn clear(&mut self) -> Result<(), Exception> {
         if let Some(paged) = self.paged.as_deref_mut() {
@@ -1779,6 +1801,23 @@ impl SlidingKeyValueCache {
         self.keys.iter().chain(self.values.iter())
     }
 
+    pub(crate) fn restore_resident(
+        &mut self,
+        keys: Array,
+        values: Array,
+        end: i32,
+    ) -> Result<(), Exception> {
+        if keys.shape() != values.shape() || keys.dim(-2) > self.max_size || end < keys.dim(-2) {
+            return Err(Exception::custom(
+                "restored sliding cache arrays do not match their retained range",
+            ));
+        }
+        self.keys = Some(keys);
+        self.values = Some(values);
+        self.offset = end;
+        Ok(())
+    }
+
     /// Clears cached arrays while preserving the configured window size.
     pub fn clear(&mut self) {
         self.keys = None;
@@ -1977,6 +2016,48 @@ impl ConcatKeyValueCache {
             .expect("Values cannot be None")
             .try_index_device((.., .., ..self.length, ..), stream)?;
         Ok((keys, values))
+    }
+
+    pub(crate) fn snapshot_arrays(
+        &self,
+        stream: &Stream,
+    ) -> Result<Option<(Array, Array)>, Exception> {
+        if self.keys.is_none() {
+            return Ok(None);
+        }
+        self.logical_arrays(stream).map(Some)
+    }
+
+    pub(crate) fn restore_resident(
+        &mut self,
+        keys: Array,
+        values: Array,
+        end: i32,
+    ) -> Result<(), Exception> {
+        let length = keys.dim(-2);
+        if keys.shape() != values.shape() || end < length {
+            return Err(Exception::custom(
+                "restored key/value cache arrays do not match their retained range",
+            ));
+        }
+        if self.attention_window.is_none() && end != length {
+            return Err(Exception::custom(
+                "restored full-attention cache must begin at token zero",
+            ));
+        }
+        if let Some(window) = self.attention_window {
+            if length > window.saturating_sub(1) {
+                return Err(Exception::custom(
+                    "restored sliding cache exceeds its retained history",
+                ));
+            }
+        }
+        self.keys = Some(keys);
+        self.values = Some(values);
+        self.offset = end;
+        self.length = length;
+        self.capacity = length;
+        Ok(())
     }
 }
 
@@ -3053,6 +3134,7 @@ mod tests {
             model_family: "llama".into(),
             effective_model_type: "llama".into(),
             checkpoint_fingerprint: "sha256:test-checkpoint".into(),
+            prefix_content_fingerprint: "tokens:11,12,13,14,15".into(),
             architecture_fingerprint: "sha256:test-architecture".into(),
             layer_count: 1,
             global_layer_start: 0,
@@ -3074,6 +3156,7 @@ mod tests {
                 &invalid_destination,
                 invalid_descriptor,
                 &tokens,
+                &[],
                 &PromptCacheOptions::default(),
             )
             .is_err());
@@ -3083,6 +3166,7 @@ mod tests {
                 &destination,
                 descriptor.clone(),
                 &tokens,
+                &[],
                 &PromptCacheOptions::default(),
             )
             .unwrap();
@@ -3187,6 +3271,7 @@ mod tests {
             model_family: "schedule-fixture".into(),
             effective_model_type: "schedule-fixture".into(),
             checkpoint_fingerprint: "checkpoint".into(),
+            prefix_content_fingerprint: "tokens:0..6".into(),
             architecture_fingerprint: "architecture".into(),
             layer_count: windows.len(),
             global_layer_start: 0,
@@ -3204,6 +3289,7 @@ mod tests {
                 &destination,
                 descriptor.clone(),
                 &tokens,
+                &[],
                 &PromptCacheOptions::default(),
             )
             .unwrap();

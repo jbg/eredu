@@ -7,7 +7,10 @@
 
 #![allow(missing_docs)]
 
-use std::{collections::HashMap, path::Path};
+use std::{
+    collections::{BTreeMap, HashMap},
+    path::Path,
+};
 
 use safemlx::{
     error::Exception,
@@ -41,8 +44,12 @@ use crate::{
     error::Error,
     runtime::attention::{AttentionPolicy, LayerSchedule},
     runtime::cache::residency::{
-        derive_prompt_cache_architecture_fingerprint, CacheRankIdentity, CacheResidencyManager,
-        CacheResidencyReport, PagedCacheOptions,
+        derive_prompt_cache_architecture_fingerprint, open_prompt_cache_snapshot,
+        save_prompt_cache_snapshot, CacheBlockArrays, CacheRankIdentity, CacheResidencyManager,
+        CacheResidencyReport, LayerCachePolicy, PagedCacheOptions, PromptCacheDescriptor,
+        PromptCacheManifest, PromptCacheModelIdentity, PromptCacheOptions,
+        PromptCacheSnapshotBlock, PromptCacheStateArray, StateTensorDimension, StateTensorDtype,
+        StateTensorOwner, StateTensorPolicy, StateTensorRole,
     },
     runtime::cache::{
         BlockwiseAttentionAccumulator, ConcatKeyValueCache, KeyValueCache, PagedKeyValueCache,
@@ -318,6 +325,57 @@ impl TextArgs {
             self.head_dim
         }
     }
+}
+
+pub(crate) fn prompt_cache_layer_layout(
+    args: &ModelArgs,
+) -> Result<LayerSchedule<LayerCachePolicy>, Error> {
+    let text = &args.text_config;
+    let cache_error = |error: crate::runtime::cache::residency::CacheResidencyError| {
+        Error::UnsupportedArchitecture(error.to_string())
+    };
+    let history = text.sconv_kernel_size.checked_sub(1).ok_or_else(|| {
+        Error::UnsupportedArchitecture("invalid Inkling convolution width".into())
+    })?;
+    let fixed = |value| StateTensorDimension::fixed(value).map_err(cache_error);
+    let layers = text.num_hidden_layers as usize;
+    let policies = (0..layers)
+        .map(|layer| {
+            let policy = *text.layer_policy(layer).ok_or_else(|| {
+                Error::UnsupportedArchitecture(format!(
+                    "Inkling layer schedule has no decoder layer {layer}"
+                ))
+            })?;
+            let local = policy.attention.window().is_some();
+            let kv_width = text
+                .kv_heads(local)
+                .checked_mul(text.attention_head_dim(local))
+                .ok_or_else(|| {
+                    Error::UnsupportedArchitecture("Inkling KV width overflow".into())
+                })?;
+            let tensors = [kv_width, kv_width, text.hidden_size, text.hidden_size]
+                .into_iter()
+                .enumerate()
+                .map(|(slot, width)| {
+                    StateTensorPolicy::new(
+                        StateTensorRole::Convolution { slot: slot as u32 },
+                        vec![StateTensorDimension::Batch, fixed(history)?, fixed(width)?],
+                        StateTensorDtype::Floating,
+                    )
+                    .map_err(cache_error)
+                })
+                .collect::<Result<Vec<_>, Error>>()?;
+            LayerCachePolicy::key_value_with_fixed_state(
+                policy.attention,
+                text.kv_heads(local),
+                text.attention_head_dim(local),
+                tensors,
+            )
+            .map_err(cache_error)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    LayerSchedule::new(layers, policies)
+        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1886,6 +1944,202 @@ impl Model {
         Cache::new_paged(&self.args.text_config, options, None)
     }
 
+    pub(crate) fn save_prompt_cache(
+        cache: &mut Cache,
+        destination: impl AsRef<Path>,
+        descriptor: PromptCacheDescriptor,
+        prefix_token_ids: &[u32],
+        options: &PromptCacheOptions,
+        stream: &Stream,
+    ) -> Result<PromptCacheManifest, Exception> {
+        let end = i64::try_from(prefix_token_ids.len())
+            .map_err(|_| Exception::custom("Inkling prompt length exceeds i64"))?;
+        if cache.offset() as i64 != end {
+            return Err(Exception::custom(
+                "Inkling cache offset does not match the persisted prefix",
+            ));
+        }
+        let paged = cache
+            .layers
+            .iter()
+            .any(|layer| matches!(layer.kv, InklingKvCache::Paged(_)));
+        if paged {
+            if cache
+                .layers
+                .iter()
+                .any(|layer| !matches!(layer.kv, InklingKvCache::Paged(_)))
+            {
+                return Err(Exception::custom(
+                    "Inkling prompt cache cannot mix paged and resident attention layers",
+                ));
+            }
+            for layer in &mut cache.layers {
+                let InklingKvCache::Paged(attention) = &mut layer.kv else {
+                    unreachable!("validated paged Inkling cache")
+                };
+                attention.finalize()?;
+            }
+        }
+        let mut blocks = Vec::with_capacity(cache.layers.len());
+        let mut state = Vec::with_capacity(cache.layers.len() * 4);
+        for (layer, layer_cache) in cache.layers.iter().enumerate() {
+            for (slot, convolution) in layer_cache.convolutions.iter().enumerate() {
+                state.push(PromptCacheStateArray {
+                    owner: StateTensorOwner::Layer(layer),
+                    role: StateTensorRole::Convolution { slot: slot as u32 },
+                    array: convolution
+                        .state
+                        .as_ref()
+                        .ok_or_else(|| Exception::custom("Inkling convolution state is missing"))?,
+                });
+            }
+            let (start, keys, values) = match &layer_cache.kv {
+                InklingKvCache::Global(cache) => {
+                    let (keys, values) = cache.snapshot_arrays(stream)?.ok_or_else(|| {
+                        Exception::custom("Inkling full-attention cache state is missing")
+                    })?;
+                    (0, keys, values)
+                }
+                InklingKvCache::Sliding(cache) => {
+                    let arrays = cache.arrays().cloned().collect::<Vec<_>>();
+                    if arrays.len() != 2 {
+                        return Err(Exception::custom(
+                            "Inkling sliding-attention cache state is missing",
+                        ));
+                    }
+                    let retained = i64::from(arrays[0].dim(-2));
+                    (end - retained, arrays[0].clone(), arrays[1].clone())
+                }
+                InklingKvCache::Paged(_) => continue,
+            };
+            blocks.push(PromptCacheSnapshotBlock {
+                global_layer: layer,
+                start,
+                end,
+                rank: None,
+                arrays: CacheBlockArrays::KeyValue { keys, values },
+            });
+        }
+        if paged {
+            let manager = cache
+                .layers
+                .iter()
+                .find_map(|layer| match &layer.kv {
+                    InklingKvCache::Paged(cache) => Some(cache.manager()),
+                    _ => None,
+                })
+                .expect("validated paged Inkling cache");
+            manager
+                .save_prompt_cache(destination, descriptor, prefix_token_ids, &state, options)
+                .map_err(|error| Exception::custom(error.to_string()))
+        } else {
+            save_prompt_cache_snapshot(
+                destination,
+                descriptor,
+                prefix_token_ids,
+                blocks,
+                &state,
+                options,
+            )
+            .map_err(|error| Exception::custom(error.to_string()))
+        }
+    }
+
+    pub(crate) fn load_prompt_cache(
+        args: &ModelArgs,
+        directory: impl AsRef<Path>,
+        expected: &PromptCacheDescriptor,
+        prefix_token_ids: &[u32],
+        stream: &Stream,
+    ) -> Result<(Cache, PromptCacheManifest), Exception> {
+        let layer_count = usize::try_from(args.text_config.num_hidden_layers)
+            .map_err(|_| Exception::custom("invalid Inkling cache layer count"))?;
+        let identity = PromptCacheModelIdentity {
+            model_family: "inkling".into(),
+            effective_model_type: args.model_type.clone(),
+            architecture_fingerprint: prompt_cache_architecture_fingerprint(args),
+            layer_count,
+            global_layer_start: 0,
+            global_layer_end: layer_count,
+            sink_tokens: 0,
+            topology: Default::default(),
+            layer_layout: prompt_cache_layer_layout(args)
+                .map_err(|error| Exception::custom(error.to_string()))?,
+        };
+        let (blocks, states, manifest) =
+            open_prompt_cache_snapshot(directory, expected, &identity, prefix_token_ids, stream)
+                .map_err(|error| Exception::custom(error.to_string()))?;
+        let mut block_map = BTreeMap::<usize, Vec<_>>::new();
+        for block in blocks {
+            block_map.entry(block.global_layer).or_default().push(block);
+        }
+        let mut states = states
+            .into_iter()
+            .map(|state| ((state.owner, state.role), state.array))
+            .collect::<BTreeMap<_, _>>();
+        let mut cache = Cache::new(&args.text_config);
+        let end = i32::try_from(prefix_token_ids.len())
+            .map_err(|_| Exception::custom("Inkling prompt length exceeds i32"))?;
+        for (layer, layer_cache) in cache.layers.iter_mut().enumerate() {
+            let mut layer_blocks = block_map.remove(&layer).ok_or_else(|| {
+                Exception::custom("Inkling attention prompt-cache block is missing")
+            })?;
+            layer_blocks.sort_by_key(|block| block.start);
+            let expected_end = i64::from(end);
+            if layer_blocks
+                .last()
+                .is_none_or(|block| block.end != expected_end)
+            {
+                return Err(Exception::custom(
+                    "Inkling prompt-cache range ends at the wrong token",
+                ));
+            }
+            let start = layer_blocks[0].start;
+            let mut keys = Vec::with_capacity(layer_blocks.len());
+            let mut values = Vec::with_capacity(layer_blocks.len());
+            for block in layer_blocks {
+                let CacheBlockArrays::KeyValue {
+                    keys: block_keys,
+                    values: block_values,
+                } = block.arrays
+                else {
+                    return Err(Exception::custom("Inkling prompt-cache kind mismatch"));
+                };
+                keys.push(block_keys);
+                values.push(block_values);
+            }
+            let keys = concatenate_axis(&keys, -2, stream)?;
+            let values = concatenate_axis(&values, -2, stream)?;
+            if start != expected_end - i64::from(keys.dim(-2)) {
+                return Err(Exception::custom(
+                    "Inkling prompt-cache retained range is inconsistent",
+                ));
+            }
+            match &mut layer_cache.kv {
+                InklingKvCache::Global(cache) => cache.restore_resident(keys, values, end)?,
+                InklingKvCache::Sliding(cache) => cache.restore_resident(keys, values, end)?,
+                InklingKvCache::Paged(_) => unreachable!("resident cache constructor used"),
+            }
+            for (slot, convolution) in layer_cache.convolutions.iter_mut().enumerate() {
+                convolution.state = Some(
+                    states
+                        .remove(&(
+                            StateTensorOwner::Layer(layer),
+                            StateTensorRole::Convolution { slot: slot as u32 },
+                        ))
+                        .ok_or_else(|| Exception::custom("Inkling convolution state is missing"))?,
+                );
+                convolution.offset = end;
+            }
+        }
+        if !block_map.is_empty() || !states.is_empty() {
+            return Err(Exception::custom(
+                "Inkling prompt cache has unexpected state",
+            ));
+        }
+        Ok((cache, manifest))
+    }
+
     pub(crate) fn new_paged_cache_with_manager(
         &self,
         manager: CacheResidencyManager,
@@ -3425,6 +3679,131 @@ mod tests {
         Device, DeviceType, Dtype, ExecutionContext,
     };
     use serde_json::json;
+
+    #[test]
+    fn prompt_cache_layout_records_four_convolutions_and_attention_order() {
+        use crate::runtime::{
+            attention::AttentionPolicy,
+            cache::residency::{LayerCachePolicy, StateTensorRole},
+        };
+
+        let args = super::args_from_gguf_catalog(&tiny_gguf_metadata()).unwrap();
+        let layout = super::prompt_cache_layer_layout(&args).unwrap();
+        assert_eq!(layout.len(), 2);
+        for (layer, policy) in layout.iter().enumerate() {
+            let LayerCachePolicy::KeyValueWithFixedState {
+                attention, tensors, ..
+            } = policy
+            else {
+                panic!("unexpected Inkling policy {policy:?}");
+            };
+            assert_eq!(tensors.len(), 4);
+            assert_eq!(tensors[3].role, StateTensorRole::Convolution { slot: 3 });
+            assert_eq!(
+                matches!(attention, AttentionPolicy::Sliding { .. }),
+                args.text_config
+                    .layer_policy(layer)
+                    .expect("validated Inkling layer")
+                    .attention
+                    .window()
+                    .is_some()
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "requires MLX runtime execution"]
+    fn schema_v4_paged_multimodal_convolution_state_save_reload_parity() {
+        use crate::runtime::cache::{
+            residency::{
+                PagedCacheOptions, PromptCacheDescriptor, PromptCacheOptions, PromptCacheTopology,
+            },
+            KeyValueCache,
+        };
+
+        let args = super::args_from_gguf_catalog(&tiny_gguf_metadata()).unwrap();
+        let context = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        let stream = context.stream();
+        let mut cache = super::Cache::new_paged(
+            &args.text_config,
+            PagedCacheOptions::new(2, 1 << 20, 1 << 20, 1)
+                .unwrap()
+                .with_full_attention(true)
+                .with_persistence_retention(true),
+            None,
+        )
+        .unwrap();
+        let prefix_ids = [1_u32, 2, 3, 4];
+        for (layer, layer_cache) in cache.layers.iter_mut().enumerate() {
+            let local = args
+                .text_config
+                .layer_policy(layer)
+                .expect("validated Inkling layer")
+                .attention
+                .window()
+                .is_some();
+            let kv_heads = args.text_config.kv_heads(local);
+            let head_dim = args.text_config.attention_head_dim(local);
+            let keys = safemlx::Array::zeros::<f32>(&[1, kv_heads, 4, head_dim], stream).unwrap();
+            layer_cache
+                .kv
+                .update_and_fetch(keys.clone(), keys, stream)
+                .unwrap();
+            let widths = [
+                kv_heads * head_dim,
+                kv_heads * head_dim,
+                args.text_config.hidden_size,
+                args.text_config.hidden_size,
+            ];
+            for (convolution, width) in layer_cache.convolutions.iter_mut().zip(widths) {
+                convolution.state = Some(
+                    safemlx::Array::zeros::<f32>(
+                        &[1, args.text_config.sconv_kernel_size - 1, width],
+                        stream,
+                    )
+                    .unwrap(),
+                );
+                convolution.offset = 4;
+            }
+        }
+        let layout = super::prompt_cache_layer_layout(&args).unwrap();
+        let descriptor = PromptCacheDescriptor {
+            model_family: "inkling".into(),
+            effective_model_type: args.model_type.clone(),
+            checkpoint_fingerprint: "zero-fixture".into(),
+            prefix_content_fingerprint: "audio-video:fixture;tokens:1,2,3,4".into(),
+            architecture_fingerprint: super::prompt_cache_architecture_fingerprint(&args),
+            layer_count: layout.len(),
+            global_layer_start: 0,
+            global_layer_end: layout.len(),
+            batch_size: 1,
+            layer_layout: layout,
+            sink_tokens: 0,
+            topology: PromptCacheTopology::default(),
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let destination = directory.path().join("prompt-cache");
+        super::Model::save_prompt_cache(
+            &mut cache,
+            &destination,
+            descriptor.clone(),
+            &prefix_ids,
+            &PromptCacheOptions::default(),
+            stream,
+        )
+        .unwrap();
+        let (restored, _) =
+            super::Model::load_prompt_cache(&args, &destination, &descriptor, &prefix_ids, stream)
+                .unwrap();
+        assert_eq!(restored.offset(), 4);
+        for layer in restored.layers {
+            assert_eq!(layer.kv.offset(), 4);
+            assert!(layer
+                .convolutions
+                .iter()
+                .all(|state| state.offset == 4 && state.state.is_some()));
+        }
+    }
 
     #[test]
     fn gguf_names_translate_to_text_parameter_tree() {

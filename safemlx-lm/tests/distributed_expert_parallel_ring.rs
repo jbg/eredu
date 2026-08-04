@@ -308,6 +308,7 @@ fn expert_parallel_model_ring_worker() {
             },
             effective_model_type: model_type,
             checkpoint_fingerprint: "expert-ring-fixture".into(),
+            prefix_content_fingerprint: "tokens:1,2".into(),
             architecture_fingerprint: model.prompt_cache_architecture_fingerprint().unwrap(),
             layer_count: num_layers,
             global_layer_start: 0,

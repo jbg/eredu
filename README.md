@@ -21,9 +21,9 @@ SafeMLX is independent of Apple and is not an official MLX project.
 - SafeTensors and bounded, streaming GGUF checkpoint readers.
 - Fully resident, layerwise, dense disk-streaming, and sparse expert-cache
   weight-loading policies for supported SafeTensors models.
-- Versioned prompt-cache persistence with exact ordered per-layer full/sliding
-  attention policy, distinct windows, payload geometry, and distributed layer
-  identity for supported text decoders.
+- Schema-v4 prompt-cache persistence with exact ordered per-layer attention,
+  compressed-MLA, recurrent/convolution, and multimodal prefix state, distinct
+  windows, processed-prefix identity, and distributed layer identity.
 - A native Mimi audio codec implementation for codec-token speech models.
 - An example command-line text generator.
 

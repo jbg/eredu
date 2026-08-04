@@ -1700,16 +1700,41 @@ impl LoadedModel {
         self.model.prompt_cache_layer_layout()
     }
 
-    /// Lazily catalogs a compatible reusable text prefix for this loaded model.
+    /// Opens a compatible reusable prefix for this loaded model.
+    ///
+    /// Block-paged families retain mmap-lazy attention shards. Resident hybrid
+    /// and multimodal families materialize their validated fixed state on
+    /// `stream` before returning.
     pub fn load_prompt_cache(
         &self,
         directory: impl AsRef<Path>,
         expected: &PromptCacheDescriptor,
         prefix_token_ids: &[u32],
         options: PagedCacheOptions,
+        stream: &Stream,
     ) -> Result<(ModelCache, PromptCacheManifest), Exception> {
         self.model
-            .load_prompt_cache(directory, expected, prefix_token_ids, options)
+            .load_prompt_cache(directory, expected, prefix_token_ids, options, stream)
+    }
+
+    /// Atomically saves a completed immutable prefix with model-owned state validation.
+    pub fn save_prompt_cache(
+        &self,
+        cache: &mut ModelCache,
+        destination: impl AsRef<Path>,
+        descriptor: PromptCacheDescriptor,
+        prefix_token_ids: &[u32],
+        options: &PromptCacheOptions,
+        stream: &Stream,
+    ) -> Result<PromptCacheManifest, Exception> {
+        self.model.save_prompt_cache(
+            cache,
+            destination,
+            descriptor,
+            prefix_token_ids,
+            options,
+            stream,
+        )
     }
 
     /// Computes logits for an initial typed input using a cache returned by [`LoadedModel::new_cache`].

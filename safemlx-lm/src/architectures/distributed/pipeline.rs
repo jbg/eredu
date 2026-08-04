@@ -505,6 +505,7 @@ impl PipelineModel {
                 self.prompt_cache_rank_directory(root.as_ref()),
                 descriptor,
                 prefix_token_ids,
+                &[],
                 options,
             )
             .map_err(|error| Error::Parallel(error.to_string()))

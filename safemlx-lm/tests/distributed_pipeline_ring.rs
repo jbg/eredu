@@ -144,6 +144,7 @@ fn pipeline_ring_worker() {
         model_family: if deepseek { "deepseek_v3" } else { "llama" }.into(),
         effective_model_type: if deepseek { "deepseek_v3" } else { "llama" }.into(),
         checkpoint_fingerprint: "pipeline-ring-fixture".into(),
+        prefix_content_fingerprint: "tokens:1,2".into(),
         architecture_fingerprint: model.prompt_cache_architecture_fingerprint().unwrap(),
         layer_count: 2,
         global_layer_start: expected_rank,

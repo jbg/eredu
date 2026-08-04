@@ -85,6 +85,7 @@ fn tensor_ring_worker() {
         model_family: if deepseek { "deepseek_v3" } else { "llama" }.into(),
         effective_model_type: if deepseek { "deepseek_v3" } else { "llama" }.into(),
         checkpoint_fingerprint: "tensor-ring-fixture".into(),
+        prefix_content_fingerprint: "tokens:1,2".into(),
         architecture_fingerprint: model.prompt_cache_architecture_fingerprint().unwrap(),
         layer_count,
         global_layer_start: 0,

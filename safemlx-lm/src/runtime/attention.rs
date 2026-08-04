@@ -23,6 +23,26 @@ impl AttentionPolicy {
         Ok(Self::Sliding { window })
     }
 
+    /// Converts an optional signed runtime window into an exact attention policy.
+    pub fn from_sliding_window(window: Option<i32>) -> Result<Self, LayerScheduleError> {
+        match window {
+            None => Ok(Self::Full),
+            Some(window) if window <= 0 => Err(LayerScheduleError::ZeroWindow),
+            Some(window) => Self::sliding(window as u32),
+        }
+    }
+
+    /// Returns the exact signed runtime window, rejecting values outside `i32`.
+    pub fn sliding_window_i32(self) -> Result<Option<i32>, LayerScheduleError> {
+        self.window()
+            .map(|window| {
+                i32::try_from(window.get()).map_err(|_| LayerScheduleError::WindowOutOfRange {
+                    window: window.get(),
+                })
+            })
+            .transpose()
+    }
+
     /// Returns the sliding window, or `None` for full attention.
     pub const fn window(self) -> Option<NonZeroU32> {
         match self {
@@ -177,6 +197,11 @@ pub enum LayerScheduleError {
     ZeroWindow,
     /// At least one layer enables sliding attention but no window was supplied.
     MissingWindow,
+    /// A serialized window cannot be represented by runtime cache APIs.
+    WindowOutOfRange {
+        /// Unrepresentable positive window.
+        window: u32,
+    },
 }
 
 impl fmt::Display for LayerScheduleError {
@@ -190,6 +215,9 @@ impl fmt::Display for LayerScheduleError {
             Self::ZeroWindow => formatter.write_str("sliding attention window must be positive"),
             Self::MissingWindow => formatter
                 .write_str("sliding attention is enabled for at least one layer without a window"),
+            Self::WindowOutOfRange { window } => {
+                write!(formatter, "sliding attention window {window} exceeds i32")
+            }
         }
     }
 }

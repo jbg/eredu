@@ -2,7 +2,7 @@
 
 use std::{
     cell::RefCell,
-    collections::{BTreeSet, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     num::NonZeroU32,
     path::Path,
     time::Instant,
@@ -58,8 +58,16 @@ use crate::{
         rope::{initialize_rope, FloatOrString, RopeVariant},
     },
     runtime::attention::{AttentionPolicy, LayerSchedule},
-    runtime::cache::residency::derive_prompt_cache_architecture_fingerprint,
-    runtime::cache::{ConcatKeyValueCache, KeyValueCache},
+    runtime::cache::{
+        residency::{
+            derive_prompt_cache_architecture_fingerprint, open_prompt_cache_snapshot,
+            save_prompt_cache_snapshot, CacheBlockArrays, LayerCachePolicy, PromptCacheDescriptor,
+            PromptCacheManifest, PromptCacheModelIdentity, PromptCacheOptions,
+            PromptCacheSnapshotBlock, PromptCacheStateArray, StateTensorDimension,
+            StateTensorDtype, StateTensorOwner, StateTensorPolicy, StateTensorRole,
+        },
+        ConcatKeyValueCache, KeyValueCache,
+    },
     runtime::checkpoint::load::{
         gguf_metadata, gguf_quantization_configs, load_named_array_strict,
         load_safetensors_quantized_strict, load_safetensors_strict, GgufTensorNames,
@@ -991,6 +999,53 @@ pub(crate) fn prompt_cache_architecture_fingerprint(args: &ModelArgs) -> String 
             ("layer_rope", layer_rope),
         ],
     )
+}
+
+pub(crate) fn prompt_cache_layer_layout(
+    args: &ModelArgs,
+) -> Result<LayerSchedule<LayerCachePolicy>, Error> {
+    let cache_error = |error: crate::runtime::cache::residency::CacheResidencyError| {
+        Error::UnsupportedArchitecture(error.to_string())
+    };
+    let layers = args.num_hidden_layers as usize;
+    let policies = (0..layers)
+        .map(|layer| {
+            let policy = *args.layer_schedule.get(layer).ok_or_else(|| {
+                Error::UnsupportedArchitecture(format!(
+                    "Gemma 4 layer schedule has no decoder layer {layer}"
+                ))
+            })?;
+            if !policy.key_value.owns_state() {
+                return Ok(LayerCachePolicy::NoState);
+            }
+            let attention = policy.attention;
+            let kv_heads = policy.num_key_value_heads.get() as i32;
+            let head_dim = policy.head_dim.get() as i32;
+            if layer == 0 {
+                LayerCachePolicy::key_value_with_fixed_state(
+                    attention,
+                    kv_heads,
+                    head_dim,
+                    vec![StateTensorPolicy::new(
+                        StateTensorRole::PrefixEmbedding,
+                        vec![
+                            StateTensorDimension::Batch,
+                            StateTensorDimension::PrefixTokens,
+                            StateTensorDimension::fixed(args.hidden_size).map_err(cache_error)?,
+                        ],
+                        StateTensorDtype::Floating,
+                    )
+                    .map_err(cache_error)?
+                    .optional()],
+                )
+                .map_err(cache_error)
+            } else {
+                LayerCachePolicy::key_value(attention, kv_heads, head_dim).map_err(cache_error)
+            }
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    LayerSchedule::new(layers, policies)
+        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
 }
 
 fn partial_rotary_dims(head_dim: i32, scaling: &Option<HashMap<String, FloatOrString>>) -> i32 {
@@ -5170,6 +5225,126 @@ impl Model {
     pub(crate) fn new_cache(&self) -> Cache {
         Cache::new(&self.args)
     }
+
+    pub(crate) fn save_prompt_cache(
+        cache: &Cache,
+        destination: impl AsRef<Path>,
+        descriptor: PromptCacheDescriptor,
+        prefix_token_ids: &[u32],
+        options: &PromptCacheOptions,
+        stream: &Stream,
+    ) -> Result<PromptCacheManifest, Exception> {
+        if cache.token_ids != prefix_token_ids {
+            return Err(Exception::custom(
+                "Gemma 4 cache token history does not match the persisted prefix",
+            ));
+        }
+        let end = i64::try_from(prefix_token_ids.len())
+            .map_err(|_| Exception::custom("Gemma 4 prompt length exceeds i64"))?;
+        let mut blocks = Vec::with_capacity(cache.kv.len());
+        for (layer, cache) in cache.kv.iter().enumerate() {
+            let cache = cache.as_ref().ok_or_else(|| {
+                Exception::custom("Gemma 4 prompt cache is missing a decoder layer")
+            })?;
+            if cache.offset() as i64 != end {
+                return Err(Exception::custom(
+                    "Gemma 4 cache offset does not match the persisted prefix",
+                ));
+            }
+            let (keys, values) = cache
+                .snapshot_arrays(stream)?
+                .ok_or_else(|| Exception::custom("Gemma 4 key/value state is missing"))?;
+            blocks.push(PromptCacheSnapshotBlock {
+                global_layer: layer,
+                start: 0,
+                end,
+                rank: None,
+                arrays: CacheBlockArrays::KeyValue { keys, values },
+            });
+        }
+        let state = cache
+            .prefix_embeddings
+            .as_ref()
+            .map(|array| PromptCacheStateArray {
+                owner: StateTensorOwner::Layer(0),
+                role: StateTensorRole::PrefixEmbedding,
+                array,
+            })
+            .into_iter()
+            .collect::<Vec<_>>();
+        save_prompt_cache_snapshot(
+            destination,
+            descriptor,
+            prefix_token_ids,
+            blocks,
+            &state,
+            options,
+        )
+        .map_err(|error| Exception::custom(error.to_string()))
+    }
+
+    pub(crate) fn load_prompt_cache(
+        args: &ModelArgs,
+        directory: impl AsRef<Path>,
+        expected: &PromptCacheDescriptor,
+        prefix_token_ids: &[u32],
+        stream: &Stream,
+    ) -> Result<(Cache, PromptCacheManifest), Exception> {
+        let layer_count = args.num_hidden_layers as usize;
+        let identity = PromptCacheModelIdentity {
+            model_family: "gemma4".into(),
+            effective_model_type: args.model_type.clone(),
+            architecture_fingerprint: prompt_cache_architecture_fingerprint(args),
+            layer_count,
+            global_layer_start: 0,
+            global_layer_end: layer_count,
+            sink_tokens: 0,
+            topology: Default::default(),
+            layer_layout: prompt_cache_layer_layout(args)
+                .map_err(|error| Exception::custom(error.to_string()))?,
+        };
+        let (blocks, state, manifest) =
+            open_prompt_cache_snapshot(directory, expected, &identity, prefix_token_ids, stream)
+                .map_err(|error| Exception::custom(error.to_string()))?;
+        let mut blocks = blocks
+            .into_iter()
+            .map(|block| (block.global_layer, block))
+            .collect::<BTreeMap<_, _>>();
+        let mut state = state
+            .into_iter()
+            .map(|state| ((state.owner, state.role), state.array))
+            .collect::<BTreeMap<_, _>>();
+        let prefix_embeddings =
+            state.remove(&(StateTensorOwner::Layer(0), StateTensorRole::PrefixEmbedding));
+        let mut cache = Cache::new(args);
+        cache.token_ids = prefix_token_ids.to_vec();
+        cache.prefix_len = prefix_embeddings
+            .as_ref()
+            .map_or(0, |_| prefix_token_ids.len());
+        cache.prefix_embeddings = prefix_embeddings;
+        let end = i32::try_from(prefix_token_ids.len())
+            .map_err(|_| Exception::custom("Gemma 4 prompt length exceeds i32"))?;
+        for (layer, cache) in cache.kv.iter_mut().enumerate() {
+            let cache = cache
+                .as_mut()
+                .ok_or_else(|| Exception::custom("Gemma 4 decoder cache layer is missing"))?;
+            let block = blocks
+                .remove(&layer)
+                .ok_or_else(|| Exception::custom("Gemma 4 prompt-cache block is missing"))?;
+            match block.arrays {
+                CacheBlockArrays::KeyValue { keys, values } => {
+                    cache.restore_resident(keys, values, end)?;
+                }
+                _ => return Err(Exception::custom("Gemma 4 prompt-cache kind mismatch")),
+            }
+        }
+        if !blocks.is_empty() || !state.is_empty() {
+            return Err(Exception::custom(
+                "Gemma 4 prompt cache has unexpected state",
+            ));
+        }
+        Ok((cache, manifest))
+    }
 }
 
 pub(crate) fn token_ids_from_array(tokens: &Array, stream: &Stream) -> Result<Vec<u32>, Exception> {
@@ -5718,6 +5893,84 @@ mod tests {
         assert!(narrow.as_slice::<f32>()[6] < -1.0e8);
         assert_eq!(narrow.as_slice::<f32>()[7], 0.0);
         assert_eq!(wide.as_slice::<f32>()[6], 0.0);
+    }
+
+    #[test]
+    fn prompt_cache_layout_records_optional_multimodal_prefix_embeddings() {
+        use crate::runtime::cache::residency::{LayerCachePolicy, StateTensorRole};
+
+        let args = model_args(false);
+        let layout = super::prompt_cache_layer_layout(&args).unwrap();
+        let LayerCachePolicy::KeyValueWithFixedState { tensors, .. } = layout.get(0).unwrap()
+        else {
+            panic!("Gemma 4 layer zero must own multimodal prefix state");
+        };
+        assert_eq!(tensors[0].role, StateTensorRole::PrefixEmbedding);
+        assert!(!tensors[0].required);
+    }
+
+    #[test]
+    #[ignore = "requires MLX runtime execution"]
+    fn schema_v4_multimodal_prefix_embedding_save_reload_parity() {
+        use crate::runtime::cache::{
+            residency::{PromptCacheDescriptor, PromptCacheOptions, PromptCacheTopology},
+            KeyValueCache,
+        };
+
+        let stream = test_stream();
+        let args = model_args(false);
+        let prefix_ids = [1_u32, 2, 3, 4];
+        let mut cache = Cache::new(&args);
+        let values = (0..16).map(|value| value as f32).collect::<Vec<_>>();
+        let keys = Array::from_slice(&values, &[1, 1, 4, 4]);
+        cache.kv[0]
+            .as_mut()
+            .unwrap()
+            .update_and_fetch(keys.clone(), keys, &stream)
+            .unwrap();
+        cache.token_ids = prefix_ids.to_vec();
+        cache.prefix_len = 4;
+        cache.prefix_embeddings = Some(
+            Array::from_slice(
+                &(0..32).map(|value| value as f32).collect::<Vec<_>>(),
+                &[1, 4, 8],
+            )
+            .copy(&stream)
+            .unwrap(),
+        );
+        let layout = super::prompt_cache_layer_layout(&args).unwrap();
+        let descriptor = PromptCacheDescriptor {
+            model_family: "gemma4".into(),
+            effective_model_type: args.model_type.clone(),
+            checkpoint_fingerprint: "zero-fixture".into(),
+            prefix_content_fingerprint: "image:fixture;tokens:1,2,3,4".into(),
+            architecture_fingerprint: super::prompt_cache_architecture_fingerprint(&args),
+            layer_count: 1,
+            global_layer_start: 0,
+            global_layer_end: 1,
+            batch_size: 1,
+            layer_layout: layout,
+            sink_tokens: 0,
+            topology: PromptCacheTopology::default(),
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let destination = directory.path().join("prompt-cache");
+        super::Model::save_prompt_cache(
+            &cache,
+            &destination,
+            descriptor.clone(),
+            &prefix_ids,
+            &PromptCacheOptions::default(),
+            &stream,
+        )
+        .unwrap();
+        let (restored, _) =
+            super::Model::load_prompt_cache(&args, &destination, &descriptor, &prefix_ids, &stream)
+                .unwrap();
+        assert_eq!(restored.token_ids, prefix_ids);
+        assert_eq!(restored.prefix_len, 4);
+        assert_eq!(restored.prefix_embeddings.unwrap().shape(), &[1, 4, 8]);
+        assert_eq!(restored.kv[0].as_ref().unwrap().offset(), 4);
     }
 
     #[test]

@@ -1,6 +1,9 @@
 //! Kimi Linear hybrid KDA/MLA causal language model.
 
-use std::{collections::HashMap, path::Path};
+use std::{
+    collections::{BTreeMap, HashMap},
+    path::Path,
+};
 
 use safemlx::{
     error::Exception,
@@ -41,8 +44,18 @@ use crate::{
         tensor::create_causal_mask,
     },
     runtime::{
-        attention::LayerSchedule,
-        cache::{residency::derive_prompt_cache_architecture_fingerprint, CompressedLatentCache},
+        attention::{AttentionPolicy, LayerSchedule},
+        cache::{
+            residency::{
+                derive_prompt_cache_architecture_fingerprint, open_prompt_cache_snapshot,
+                save_prompt_cache_snapshot, CacheBlockArrays, LayerCachePolicy,
+                PromptCacheDescriptor, PromptCacheManifest, PromptCacheModelIdentity,
+                PromptCacheOptions, PromptCacheSnapshotBlock, PromptCacheStateArray,
+                StateTensorDimension, StateTensorDtype, StateTensorOwner, StateTensorPolicy,
+                StateTensorRole,
+            },
+            CompressedLatentCache,
+        },
         checkpoint::{
             load::{
                 gguf_metadata, gguf_quantization_configs, load_named_array_strict,
@@ -645,6 +658,76 @@ pub fn model_args_from_config_value(value: &Value) -> Result<ModelArgs, Error> {
         Error::UnsupportedArchitecture(format!("invalid Kimi Linear config: {error}"))
     })?;
     source.normalize()
+}
+
+pub(crate) fn prompt_cache_layer_layout(
+    args: &ModelArgs,
+) -> Result<LayerSchedule<LayerCachePolicy>, Error> {
+    let heads = args.kda_config.num_heads;
+    let head_dim = args.kda_config.head_dim;
+    let projection = heads.checked_mul(head_dim).ok_or_else(|| {
+        Error::UnsupportedArchitecture("Kimi KDA projection width overflow".into())
+    })?;
+    let history = args
+        .kda_config
+        .short_conv_kernel_size
+        .checked_sub(1)
+        .ok_or_else(|| Error::UnsupportedArchitecture("invalid Kimi KDA kernel width".into()))?;
+    let cache_error = |error: crate::runtime::cache::residency::CacheResidencyError| {
+        Error::UnsupportedArchitecture(error.to_string())
+    };
+    let fixed = |value| StateTensorDimension::fixed(value).map_err(cache_error);
+    let kda_tensors = || -> Result<Vec<StateTensorPolicy>, Error> {
+        let mut tensors = Vec::with_capacity(4);
+        for slot in 0..3 {
+            tensors.push(
+                StateTensorPolicy::new(
+                    StateTensorRole::Convolution { slot },
+                    vec![
+                        StateTensorDimension::Batch,
+                        fixed(history)?,
+                        fixed(projection)?,
+                    ],
+                    StateTensorDtype::Floating,
+                )
+                .map_err(cache_error)?,
+            );
+        }
+        tensors.push(
+            StateTensorPolicy::new(
+                StateTensorRole::Recurrent,
+                vec![
+                    StateTensorDimension::Batch,
+                    fixed(heads)?,
+                    fixed(head_dim)?,
+                    fixed(head_dim)?,
+                ],
+                StateTensorDtype::Float32,
+            )
+            .map_err(cache_error)?,
+        );
+        Ok(tensors)
+    };
+    let layers = args.num_hidden_layers as usize;
+    let policies = (0..layers)
+        .map(|layer| {
+            if matches!(
+                args.layer_policy(layer).map(|policy| policy.attention),
+                Some(AttentionKind::Kda)
+            ) {
+                LayerCachePolicy::fixed_only(kda_tensors()?).map_err(cache_error)
+            } else {
+                LayerCachePolicy::compressed_latent_rotary(
+                    AttentionPolicy::Full,
+                    args.kv_lora_rank,
+                    args.qk_rope_head_dim,
+                )
+                .map_err(cache_error)
+            }
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    LayerSchedule::new(layers, policies)
+        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
 }
 
 /// Loads and validates `config.json`.
@@ -1649,6 +1732,160 @@ impl Model {
     /// Returns the stable model type.
     pub fn model_type(&self) -> &str {
         &self.args.model_type
+    }
+
+    pub(crate) fn save_prompt_cache(
+        cache: &Cache,
+        destination: impl AsRef<Path>,
+        descriptor: PromptCacheDescriptor,
+        prefix_token_ids: &[u32],
+        options: &PromptCacheOptions,
+        stream: &Stream,
+    ) -> Result<PromptCacheManifest, Exception> {
+        let end = i64::try_from(prefix_token_ids.len())
+            .map_err(|_| Exception::custom("Kimi prompt length exceeds i64"))?;
+        if cache.offset() as i64 != end {
+            return Err(Exception::custom(
+                "Kimi cache offset does not match the persisted prefix",
+            ));
+        }
+        let mut blocks = Vec::new();
+        let mut state = Vec::new();
+        for (layer, cache) in cache.layers.iter().enumerate() {
+            match cache {
+                LayerCache::Kda(cache) => {
+                    for (slot, convolution) in [&cache.q_conv, &cache.k_conv, &cache.v_conv]
+                        .into_iter()
+                        .enumerate()
+                    {
+                        state.push(PromptCacheStateArray {
+                            owner: StateTensorOwner::Layer(layer),
+                            role: StateTensorRole::Convolution { slot: slot as u32 },
+                            array: convolution.state.as_ref().ok_or_else(|| {
+                                Exception::custom("Kimi KDA convolution state is missing")
+                            })?,
+                        });
+                    }
+                    state.push(PromptCacheStateArray {
+                        owner: StateTensorOwner::Layer(layer),
+                        role: StateTensorRole::Recurrent,
+                        array: cache.recurrent_state.as_ref().ok_or_else(|| {
+                            Exception::custom("Kimi KDA recurrent state is missing")
+                        })?,
+                    });
+                }
+                LayerCache::Mla(cache) => {
+                    let (latent, rotary_key) = cache
+                        .arrays()
+                        .ok_or_else(|| Exception::custom("Kimi MLA cache state is missing"))?;
+                    blocks.push(PromptCacheSnapshotBlock {
+                        global_layer: layer,
+                        start: 0,
+                        end,
+                        rank: None,
+                        arrays: CacheBlockArrays::CompressedLatentRotary {
+                            latent: latent.clone(),
+                            rotary_key: rotary_key.clone(),
+                        },
+                    });
+                }
+            }
+        }
+        let _ = stream;
+        save_prompt_cache_snapshot(
+            destination,
+            descriptor,
+            prefix_token_ids,
+            blocks,
+            &state,
+            options,
+        )
+        .map_err(|error| Exception::custom(error.to_string()))
+    }
+
+    pub(crate) fn load_prompt_cache(
+        args: &ModelArgs,
+        directory: impl AsRef<Path>,
+        expected: &PromptCacheDescriptor,
+        prefix_token_ids: &[u32],
+        stream: &Stream,
+    ) -> Result<(Cache, PromptCacheManifest), Exception> {
+        let layer_count = args.num_hidden_layers as usize;
+        let identity = PromptCacheModelIdentity {
+            model_family: "kimi_linear".into(),
+            effective_model_type: args.model_type.clone(),
+            architecture_fingerprint: prompt_cache_architecture_fingerprint(args),
+            layer_count,
+            global_layer_start: 0,
+            global_layer_end: layer_count,
+            sink_tokens: 0,
+            topology: Default::default(),
+            layer_layout: prompt_cache_layer_layout(args)
+                .map_err(|error| Exception::custom(error.to_string()))?,
+        };
+        let (blocks, state, manifest) =
+            open_prompt_cache_snapshot(directory, expected, &identity, prefix_token_ids, stream)
+                .map_err(|error| Exception::custom(error.to_string()))?;
+        let mut cache = Cache::new(args);
+        let mut block_map = BTreeMap::new();
+        for block in blocks {
+            if block_map.insert(block.global_layer, block).is_some() {
+                return Err(Exception::custom(
+                    "Kimi resident prompt cache contains multiple blocks for one layer",
+                ));
+            }
+        }
+        let mut state_map = BTreeMap::new();
+        for tensor in state {
+            state_map.insert((tensor.owner, tensor.role), tensor.array);
+        }
+        let end = i32::try_from(prefix_token_ids.len())
+            .map_err(|_| Exception::custom("Kimi prompt length exceeds i32"))?;
+        for (layer, layer_cache) in cache.layers.iter_mut().enumerate() {
+            match layer_cache {
+                LayerCache::Mla(cache) => {
+                    let block = block_map.remove(&layer).ok_or_else(|| {
+                        Exception::custom("Kimi MLA prompt-cache block is missing")
+                    })?;
+                    match block.arrays {
+                        CacheBlockArrays::CompressedLatentRotary { latent, rotary_key } => {
+                            cache.restore_resident(latent, rotary_key, end)?;
+                        }
+                        _ => return Err(Exception::custom("Kimi MLA prompt-cache kind mismatch")),
+                    }
+                }
+                LayerCache::Kda(cache) => {
+                    for (slot, convolution) in
+                        [&mut cache.q_conv, &mut cache.k_conv, &mut cache.v_conv]
+                            .into_iter()
+                            .enumerate()
+                    {
+                        convolution.state = Some(
+                            state_map
+                                .remove(&(
+                                    StateTensorOwner::Layer(layer),
+                                    StateTensorRole::Convolution { slot: slot as u32 },
+                                ))
+                                .ok_or_else(|| {
+                                    Exception::custom("Kimi KDA convolution state is missing")
+                                })?,
+                        );
+                        convolution.offset = end;
+                    }
+                    cache.recurrent_state = Some(
+                        state_map
+                            .remove(&(StateTensorOwner::Layer(layer), StateTensorRole::Recurrent))
+                            .ok_or_else(|| {
+                                Exception::custom("Kimi KDA recurrent state is missing")
+                            })?,
+                    );
+                }
+            }
+        }
+        if !block_map.is_empty() || !state_map.is_empty() {
+            return Err(Exception::custom("Kimi prompt cache has unexpected state"));
+        }
+        Ok((cache, manifest))
     }
 
     fn forward_logits_impl(
@@ -2763,6 +3000,117 @@ mod tests {
                 .to_string()
                 .contains(message));
         }
+    }
+
+    #[test]
+    fn prompt_cache_layout_records_kda_fixed_state_and_mla_in_order() {
+        use crate::runtime::cache::residency::{LayerCachePolicy, StateTensorRole};
+
+        let args = model_args_from_config_value(&config()).unwrap();
+        let layout = super::prompt_cache_layer_layout(&args).unwrap();
+        assert_eq!(layout.len(), 2);
+        match layout.get(0).unwrap() {
+            LayerCachePolicy::FixedState { tensors } => {
+                assert_eq!(tensors.len(), 4);
+                assert_eq!(tensors[0].role, StateTensorRole::Convolution { slot: 0 });
+                assert_eq!(tensors[3].role, StateTensorRole::Recurrent);
+            }
+            policy => panic!("unexpected KDA cache policy {policy:?}"),
+        }
+        assert!(matches!(
+            layout.get(1).unwrap(),
+            LayerCachePolicy::CompressedLatentRotary { .. }
+        ));
+    }
+
+    #[test]
+    #[ignore = "requires MLX runtime execution"]
+    fn schema_v4_kda_mla_save_drop_reload_continue_matches_uninterrupted() {
+        use crate::runtime::cache::residency::{
+            PromptCacheDescriptor, PromptCacheOptions, PromptCacheTopology,
+        };
+
+        let args = model_args_from_config_value(&config()).unwrap();
+        let context = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
+        let stream = context.stream();
+        let mut model = Model::new(args.clone(), stream).unwrap();
+        for (_, parameter) in model.parameters_mut().flatten() {
+            let shape = parameter.shape().to_vec();
+            *parameter = Array::zeros::<f32>(&shape, stream).unwrap();
+        }
+        let prefix_ids = [1_u32, 2, 3, 4];
+        let prefix = Array::from_slice(&prefix_ids, &[1, 4]);
+        let mut cache = model.new_cache();
+        model
+            .forward_logits(
+                ModelInput {
+                    inputs: &prefix,
+                    mask: None,
+                    cache: Some(&mut cache),
+                },
+                true,
+                stream,
+            )
+            .unwrap();
+        let mut uninterrupted_cache = cache.clone();
+        let suffix = Array::from_slice(&[5_u32], &[1, 1]);
+        let uninterrupted = model
+            .forward_logits(
+                ModelInput {
+                    inputs: &suffix,
+                    mask: None,
+                    cache: Some(&mut uninterrupted_cache),
+                },
+                true,
+                stream,
+            )
+            .unwrap();
+        let layout = super::prompt_cache_layer_layout(&args).unwrap();
+        let descriptor = PromptCacheDescriptor {
+            model_family: "kimi_linear".into(),
+            effective_model_type: args.model_type.clone(),
+            checkpoint_fingerprint: "zero-fixture".into(),
+            prefix_content_fingerprint: "tokens:1,2,3,4".into(),
+            architecture_fingerprint: super::prompt_cache_architecture_fingerprint(&args),
+            layer_count: layout.len(),
+            global_layer_start: 0,
+            global_layer_end: layout.len(),
+            batch_size: 1,
+            layer_layout: layout,
+            sink_tokens: 0,
+            topology: PromptCacheTopology::default(),
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let destination = directory.path().join("prompt-cache");
+        Model::save_prompt_cache(
+            &cache,
+            &destination,
+            descriptor.clone(),
+            &prefix_ids,
+            &PromptCacheOptions::default(),
+            stream,
+        )
+        .unwrap();
+        drop(cache);
+        let (mut restored, _) =
+            Model::load_prompt_cache(&args, &destination, &descriptor, &prefix_ids, stream)
+                .unwrap();
+        assert_eq!(restored.offset(), 4);
+        let continued = model
+            .forward_logits(
+                ModelInput {
+                    inputs: &suffix,
+                    mask: None,
+                    cache: Some(&mut restored),
+                },
+                true,
+                stream,
+            )
+            .unwrap();
+        assert!(uninterrupted
+            .all_close(&continued, 1e-5, 1e-5, None, stream)
+            .unwrap()
+            .item::<bool>(stream));
     }
 
     #[test]

@@ -133,6 +133,7 @@ fn main() -> anyhow::Result<()> {
         model_family: model_family.into(),
         effective_model_type: model_type,
         checkpoint_fingerprint: args.checkpoint_fingerprint,
+        prefix_content_fingerprint: format!("tokens:{prefix_ids:?}"),
         architecture_fingerprint: model.prompt_cache_architecture_fingerprint()?,
         layer_count,
         global_layer_start: 0,
@@ -142,7 +143,8 @@ fn main() -> anyhow::Result<()> {
         sink_tokens: 0,
         topology: PromptCacheTopology::default(),
     };
-    let manifest = persisted.save_prompt_cache(
+    let manifest = model.save_prompt_cache(
+        &mut persisted,
         &args.cache_dir,
         descriptor.clone(),
         &prefix_ids,
@@ -150,13 +152,14 @@ fn main() -> anyhow::Result<()> {
             application_namespace: Some("paged-prompt-cache-example".into()),
             replace_existing: args.replace,
         },
+        stream,
     )?;
     println!("saved blocks: {}", manifest.blocks.len());
     println!("save report: {:#?}", persisted.residency_report()?);
     drop(persisted);
 
     let (mut restored, inspected) =
-        model.load_prompt_cache(&args.cache_dir, &descriptor, &prefix_ids, paged)?;
+        model.load_prompt_cache(&args.cache_dir, &descriptor, &prefix_ids, paged, stream)?;
     println!("cataloged blocks: {}", inspected.blocks.len());
     println!("load report: {:#?}", restored.residency_report()?);
     let restored_logits = input_for_tokens(&suffix, &mut restored, &mut model, stream)?;

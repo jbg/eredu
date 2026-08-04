@@ -1558,7 +1558,10 @@ Licensed under either Apache-2.0 or MIT.
 Paged attention-cache residency and reusable prompt-cache persistence are
 opt-in. Device-resident caches remain the default. See
 [`CACHE_RESIDENCY.md`](CACHE_RESIDENCY.md) for configuration, compatibility,
-cost, and safety details. Prompt-cache schema v3 records the exact ordered
-per-layer state kind, tensor geometry, and full/sliding policy, including
-distinct sliding windows; older schema-v2 caches are rejected. Run
+cost, and safety details. Prompt-cache schema v4 records exact ordered per-layer
+attention plus convolution, recurrent, compressed-MLA, and multimodal prefix
+state, including distinct sliding windows. Schema-v3 and older caches are
+rejected. LFM2 causal-convolution state, Nemotron-H Mamba state, and realtime
+Moshi/PersonaPlex session state remain outside the persisted prompt-cache
+routes. Run
 `paged_prompt_cache` for a deterministic save/drop/reopen parity check.

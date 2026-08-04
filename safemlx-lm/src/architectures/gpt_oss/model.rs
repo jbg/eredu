@@ -981,7 +981,7 @@ impl Cache {
                     "prompt-cache persistence requires an explicitly configured paged GPT-OSS cache",
                 )
             })?
-            .save_prompt_cache(destination, descriptor, prefix_token_ids, options)
+            .save_prompt_cache(destination, descriptor, prefix_token_ids, &[], options)
             .map_err(|error| Exception::custom(error.to_string()))
     }
 }

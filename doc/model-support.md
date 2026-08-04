@@ -598,12 +598,13 @@ granularity for sparse-cache and expert-parallel execution.
 
 Important boundaries:
 
-- Prompt-cache schema v3 is intentionally incompatible with schema v2. Its
+- Prompt-cache schema v4 is intentionally incompatible with schema v3 and older. Its
   ordered architecture-neutral layout preserves full/sliding order, each
-  positive window, ordinary KV versus DeepSeek compressed MLA state, tensor
-  geometry, and global distributed layer indices. Llama/Mistral, dense Qwen,
-  GPT-OSS, and DeepSeek use this shared representation on their existing
-  persistence routes.
+  positive window, ordinary KV, DeepSeek compressed MLA, fixed convolution and
+  recurrent tensors, multimodal prefix state, tensor geometry, and global
+  distributed layer indices. Llama/Mistral, dense Qwen, GPT-OSS, DeepSeek,
+  Kimi Linear, Qwen3-Next/Qwen3.5, Gemma 4, Inkling, and Qwen3-VL use this
+  shared representation on resident and bounded-weight persistence routes.
 - GGUF remains fully resident by default. `LayerwiseHost`, `DenseDiskStream`,
   and supported sparse-expert policies use header-only logical catalogs and
   bounded payload materialization.
@@ -615,11 +616,15 @@ Important boundaries:
   the same physical unified memory. They do not create additional capacity.
 - Parameter budgets do not include activations, KV or recurrent state, kernels,
   allocator caches, checkpoint mappings, or every temporary buffer.
-- Kimi Linear paged and persisted prompt caches are unavailable because its
-  hybrid KDA recurrent state is not represented by the paged KV cache format.
-- Qwen3-Next/Qwen3.5 recurrent/convolution state, multimodal cross-attention,
-  and realtime Moshi/PersonaPlex temporal/depth state likewise remain outside
-  the text prompt-cache payload schema.
+- Kimi KDA and Qwen linear-attention state are persisted as fixed-state tensors,
+  not misrepresented as paged KV. Inkling may page attention while keeping its
+  convolution histories resident, and schema-v4 publication atomically records
+  both parts before reload into an exact resident continuation cache.
+- LFM2 causal-convolution state and Nemotron-H Mamba convolution/recurrent state
+  do not yet have persisted state policies or save/reopen continuation coverage,
+  so their prompt-cache rejection remains explicit.
+- Realtime Moshi/PersonaPlex temporal/depth session state remains outside schema
+  v4 and is intentionally deferred.
 - SafeTensors mapping and logical-transfer counters cannot report exact
   physical disk I/O. GGUF additionally reports physical payload read requests
   and bytes issued by its selected-read backend;

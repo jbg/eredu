@@ -39,7 +39,8 @@ pub use runtime::cache::residency::{
     CacheLayerResidencyStats, CacheRankIdentity, CacheRepresentation, CacheResidencyError,
     CacheResidencyManager, CacheResidencyPolicy, CacheResidencyReport, CacheTier, LayerCachePolicy,
     LiveCacheDiskPolicy, PagedCacheOptions, PromptCacheBlock, PromptCacheDescriptor,
-    PromptCacheManifest, PromptCacheOptions, PromptCacheTopology,
+    PromptCacheManifest, PromptCacheOptions, PromptCacheStateTensor, PromptCacheTopology,
+    StateTensorDimension, StateTensorDtype, StateTensorOwner, StateTensorPolicy, StateTensorRole,
     CACHE_RESIDENCY_LAYER_REPORT_LIMIT,
 };
 pub use runtime::cache::PagedKeyValueCache;

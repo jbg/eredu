@@ -5,7 +5,7 @@
 pub mod layerwise;
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     path::Path,
 };
 
@@ -46,7 +46,14 @@ use crate::{
         rope::{initialize_rope, FloatOrString, RopeVariant},
     },
     runtime::attention::{AttentionPolicy, LayerSchedule},
-    runtime::cache::KeyValueCache,
+    runtime::cache::{
+        residency::{
+            open_prompt_cache_snapshot, save_prompt_cache_snapshot, CacheBlockArrays,
+            LayerCachePolicy, PromptCacheDescriptor, PromptCacheManifest, PromptCacheModelIdentity,
+            PromptCacheOptions, PromptCacheSnapshotBlock,
+        },
+        ConcatKeyValueCache, KeyValueCache,
+    },
     runtime::checkpoint::load::{
         gguf_metadata, gguf_quantization_configs, load_gguf_strict, load_named_array_strict,
         load_safetensors_dir_lenient, load_safetensors_dir_quantized_strict, GgufTensorNames,
@@ -292,6 +299,152 @@ pub(crate) fn prompt_cache_architecture_fingerprint(args: &DecoderConfig) -> Str
         rope.join(";"),
         args.attention_schedule.fingerprint_component(),
     )
+}
+
+pub(crate) fn prompt_cache_layer_layout(
+    args: &DecoderConfig,
+) -> Result<LayerSchedule<LayerCachePolicy>, Exception> {
+    PromptCacheModelIdentity::key_value_layouts(
+        args.attention_schedule.iter().map(|policy| {
+            policy.window().map(|window| {
+                i32::try_from(window.get()).expect("validated dense-Qwen window fits i32")
+            })
+        }),
+        args.num_key_value_heads,
+        args.head_dim,
+    )
+    .map_err(|error| Exception::custom(error.to_string()))
+}
+
+fn prompt_cache_model_identity(
+    args: &DecoderConfig,
+) -> Result<PromptCacheModelIdentity, Exception> {
+    let layer_count = usize::try_from(args.num_hidden_layers)
+        .map_err(|_| Exception::custom("invalid dense-Qwen cache layer count"))?;
+    Ok(PromptCacheModelIdentity {
+        model_family: "dense_qwen".into(),
+        effective_model_type: args.model_type.clone(),
+        architecture_fingerprint: prompt_cache_architecture_fingerprint(args),
+        layer_count,
+        global_layer_start: 0,
+        global_layer_end: layer_count,
+        sink_tokens: 0,
+        topology: Default::default(),
+        layer_layout: prompt_cache_layer_layout(args)?,
+    })
+}
+
+pub(crate) fn save_prompt_cache(
+    args: &DecoderConfig,
+    cache: &[Option<ConcatKeyValueCache>],
+    destination: impl AsRef<Path>,
+    descriptor: PromptCacheDescriptor,
+    prefix_token_ids: &[u32],
+    options: &PromptCacheOptions,
+    stream: &Stream,
+) -> Result<PromptCacheManifest, Exception> {
+    let layer_count = usize::try_from(args.num_hidden_layers)
+        .map_err(|_| Exception::custom("invalid dense-Qwen cache layer count"))?;
+    if cache.len() != layer_count {
+        return Err(Exception::custom(format!(
+            "dense-Qwen cache has {} layers, expected {layer_count}",
+            cache.len()
+        )));
+    }
+    let end = i64::try_from(prefix_token_ids.len())
+        .map_err(|_| Exception::custom("dense-Qwen prompt length exceeds i64"))?;
+    let mut blocks = Vec::with_capacity(layer_count);
+    for (layer, cache) in cache.iter().enumerate() {
+        let cache = cache.as_ref().ok_or_else(|| {
+            Exception::custom(format!("dense-Qwen layer {layer} cache is missing"))
+        })?;
+        if i64::from(cache.offset()) != end {
+            return Err(Exception::custom(format!(
+                "dense-Qwen layer {layer} cache offset does not match the persisted prefix"
+            )));
+        }
+        let (keys, values) = cache.snapshot_arrays(stream)?.ok_or_else(|| {
+            Exception::custom(format!("dense-Qwen layer {layer} cache state is missing"))
+        })?;
+        let retained = i64::from(keys.dim(-2));
+        blocks.push(PromptCacheSnapshotBlock {
+            global_layer: layer,
+            start: end.checked_sub(retained).ok_or_else(|| {
+                Exception::custom(format!("dense-Qwen layer {layer} retained range underflow"))
+            })?,
+            end,
+            rank: None,
+            arrays: CacheBlockArrays::KeyValue { keys, values },
+        });
+    }
+    save_prompt_cache_snapshot(
+        destination,
+        descriptor,
+        prefix_token_ids,
+        blocks,
+        &[],
+        options,
+    )
+    .map_err(|error| Exception::custom(error.to_string()))
+}
+
+pub(crate) fn load_prompt_cache(
+    args: &DecoderConfig,
+    directory: impl AsRef<Path>,
+    expected: &PromptCacheDescriptor,
+    prefix_token_ids: &[u32],
+    stream: &Stream,
+) -> Result<(Vec<Option<ConcatKeyValueCache>>, PromptCacheManifest), Exception> {
+    let identity = prompt_cache_model_identity(args)?;
+    let (blocks, state, manifest) =
+        open_prompt_cache_snapshot(directory, expected, &identity, prefix_token_ids, stream)
+            .map_err(|error| Exception::custom(error.to_string()))?;
+    if !state.is_empty() {
+        return Err(Exception::custom(
+            "dense-Qwen prompt cache contains unexpected fixed state",
+        ));
+    }
+    let mut blocks = blocks
+        .into_iter()
+        .map(|block| (block.global_layer, block))
+        .collect::<BTreeMap<_, _>>();
+    let end = i32::try_from(prefix_token_ids.len())
+        .map_err(|_| Exception::custom("dense-Qwen prompt length exceeds i32"))?;
+    let mut cache = Vec::with_capacity(identity.layer_count);
+    for layer in 0..identity.layer_count {
+        let mut layer_cache = match args
+            .attention_schedule
+            .get(layer)
+            .and_then(|policy| policy.window())
+            .map(|window| {
+                i32::try_from(window.get()).expect("validated dense-Qwen window fits i32")
+            }) {
+            Some(window) => ConcatKeyValueCache::new_for_sliding_attention(window),
+            None => ConcatKeyValueCache::new(),
+        };
+        let block = blocks.remove(&layer).ok_or_else(|| {
+            Exception::custom(format!(
+                "dense-Qwen layer {layer} prompt-cache block is missing"
+            ))
+        })?;
+        match block.arrays {
+            CacheBlockArrays::KeyValue { keys, values } => {
+                layer_cache.restore_resident(keys, values, end)?;
+            }
+            CacheBlockArrays::CompressedLatentRotary { .. } => {
+                return Err(Exception::custom(format!(
+                    "dense-Qwen layer {layer} prompt cache contains compressed latent state"
+                )))
+            }
+        }
+        cache.push(Some(layer_cache));
+    }
+    if !blocks.is_empty() {
+        return Err(Exception::custom(
+            "dense-Qwen prompt cache contains unexpected attention blocks",
+        ));
+    }
+    Ok((cache, manifest))
 }
 
 fn quantization_for(
@@ -3097,6 +3250,113 @@ mod tests {
             fingerprint,
             super::prompt_cache_architecture_fingerprint(&reordered)
         );
+    }
+
+    #[test]
+    #[ignore = "requires MLX runtime execution"]
+    fn schema_v4_qwen2_ordinary_save_drop_reload_preserves_distinct_windows() {
+        use crate::runtime::cache::residency::{
+            PromptCacheDescriptor, PromptCacheOptions, PromptCacheTopology,
+        };
+
+        let context =
+            safemlx::ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
+        let stream = context.stream();
+        let mut args = tiny_qwen2_args();
+        args.attention_schedule = LayerSchedule::new(
+            4,
+            vec![
+                AttentionPolicy::sliding(3).unwrap(),
+                AttentionPolicy::Full,
+                AttentionPolicy::sliding(5).unwrap(),
+                AttentionPolicy::Full,
+            ],
+        )
+        .unwrap();
+        let mut model = super::Model::new(args.clone(), stream).unwrap();
+        for parameter in model.parameters_mut().flatten().values_mut() {
+            **parameter = Array::zeros::<f32>(parameter.shape(), stream).unwrap();
+        }
+        let prefix_ids = [1_u32, 2, 3, 4, 5, 6];
+        let prefix = Array::from_slice(&prefix_ids, &[1, 6]);
+        let mut cache = model.new_cache();
+        model
+            .forward(
+                super::ModelInput {
+                    inputs: &prefix,
+                    mask: None,
+                    cache: &mut cache,
+                },
+                stream,
+            )
+            .unwrap();
+        let retained_before = cache
+            .iter()
+            .map(|cache| cache.as_ref().unwrap().retained_arrays()[0].dim(-2))
+            .collect::<Vec<_>>();
+        assert_eq!(retained_before, vec![2, 6, 4, 6]);
+        let mut uninterrupted_cache = cache.clone();
+        let suffix = Array::from_slice(&[7_u32], &[1, 1]);
+        let uninterrupted = model
+            .forward(
+                super::ModelInput {
+                    inputs: &suffix,
+                    mask: None,
+                    cache: &mut uninterrupted_cache,
+                },
+                stream,
+            )
+            .unwrap();
+        let layout = super::prompt_cache_layer_layout(&args).unwrap();
+        let descriptor = PromptCacheDescriptor {
+            model_family: "dense_qwen".into(),
+            effective_model_type: args.model_type.clone(),
+            checkpoint_fingerprint: "zero-fixture".into(),
+            prefix_content_fingerprint: "tokens:1,2,3,4,5,6".into(),
+            architecture_fingerprint: super::prompt_cache_architecture_fingerprint(&args),
+            layer_count: layout.len(),
+            global_layer_start: 0,
+            global_layer_end: layout.len(),
+            batch_size: 1,
+            layer_layout: layout,
+            sink_tokens: 0,
+            topology: PromptCacheTopology::default(),
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let destination = directory.path().join("prompt-cache");
+        super::save_prompt_cache(
+            &args,
+            &cache,
+            &destination,
+            descriptor.clone(),
+            &prefix_ids,
+            &PromptCacheOptions::default(),
+            stream,
+        )
+        .unwrap();
+        drop(cache);
+        let (mut restored, _) =
+            super::load_prompt_cache(&args, &destination, &descriptor, &prefix_ids, stream)
+                .unwrap();
+        let retained_after = restored
+            .iter()
+            .map(|cache| cache.as_ref().unwrap().retained_arrays()[0].dim(-2))
+            .collect::<Vec<_>>();
+        assert_eq!(retained_after, retained_before);
+        let continued = model
+            .forward(
+                super::ModelInput {
+                    inputs: &suffix,
+                    mask: None,
+                    cache: &mut restored,
+                },
+                stream,
+            )
+            .unwrap();
+        assert!(uninterrupted
+            .all_close(&continued, 1e-5, 1e-5, None, stream)
+            .unwrap()
+            .item::<bool>(stream));
     }
 
     #[test]

@@ -19,7 +19,12 @@ use safemlx::{
 };
 use serde::{Deserialize, Deserializer};
 use serde_json::Value;
-use std::{cell::RefCell, collections::HashMap, path::Path, time::Instant};
+use std::{
+    cell::RefCell,
+    collections::{BTreeMap, HashMap},
+    path::Path,
+    time::Instant,
+};
 use tokenizers::Tokenizer;
 
 use crate::architectures::qwen::vl::vision::grid_thw_from_array;
@@ -47,6 +52,17 @@ use crate::{
         rope::{initialize_rope, FloatOrString, RopeVariant},
         AttentionMask,
     },
+    runtime::attention::{AttentionPolicy, LayerSchedule},
+    runtime::cache::{
+        residency::{
+            derive_prompt_cache_architecture_fingerprint, open_prompt_cache_snapshot,
+            save_prompt_cache_snapshot, CacheBlockArrays, LayerCachePolicy, PromptCacheDescriptor,
+            PromptCacheManifest, PromptCacheModelIdentity, PromptCacheOptions,
+            PromptCacheSnapshotBlock, PromptCacheStateArray, StateTensorDimension,
+            StateTensorDtype, StateTensorOwner, StateTensorPolicy, StateTensorRole,
+        },
+        ConcatKeyValueCache, KeyValueCache,
+    },
     runtime::checkpoint::load::{
         for_each_safetensor_array, gguf_metadata, gguf_quantization_configs, load_array_strict,
         load_named_array_strict, load_safetensors_dir_strict_with_split_swiglu_experts,
@@ -55,10 +71,6 @@ use crate::{
     },
     runtime::checkpoint::quantization::{AffineQuantization, WeightQuantization},
     runtime::execution::inspection::{ActivationObserver, MoeRoutingObservation},
-    runtime::{
-        attention::{AttentionPolicy, LayerSchedule},
-        cache::{ConcatKeyValueCache, KeyValueCache},
-    },
 };
 
 #[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
@@ -625,6 +637,117 @@ impl ModelArgs {
                 .clamp(2, self.head_dim)
         }
     }
+}
+
+fn canonical_config_map(value: &Option<HashMap<String, Value>>) -> String {
+    value.as_ref().map_or_else(String::new, |value| {
+        value
+            .iter()
+            .map(|(key, value)| (key.clone(), value.to_string()))
+            .collect::<BTreeMap<_, _>>()
+            .into_iter()
+            .map(|(key, value)| format!("{key}={value}"))
+            .collect::<Vec<_>>()
+            .join(";")
+    })
+}
+
+pub(crate) fn prompt_cache_architecture_fingerprint(args: &ModelArgs) -> String {
+    derive_prompt_cache_architecture_fingerprint(
+        "qwen_hybrid",
+        [
+            ("model_type", args.model_type.clone()),
+            ("layers", args.num_hidden_layers.to_string()),
+            (
+                "layer_types",
+                args.layer_schedule
+                    .iter()
+                    .map(|policy| format!("{policy:?}"))
+                    .collect::<Vec<_>>()
+                    .join(","),
+            ),
+            ("kv_heads", args.num_key_value_heads.to_string()),
+            ("head_dim", args.head_dim.to_string()),
+            ("linear_conv", args.linear_conv_kernel_dim.to_string()),
+            ("linear_key_dim", args.linear_key_head_dim.to_string()),
+            ("linear_value_dim", args.linear_value_head_dim.to_string()),
+            ("linear_key_heads", args.linear_num_key_heads.to_string()),
+            (
+                "linear_value_heads",
+                args.linear_num_value_heads.to_string(),
+            ),
+            ("max_positions", args.max_position_embeddings.to_string()),
+            (
+                "rope_parameters",
+                canonical_config_map(&args.rope_parameters),
+            ),
+            ("rope_scaling", canonical_config_map(&args.rope_scaling)),
+        ],
+    )
+}
+
+pub(crate) fn prompt_cache_layer_layout(
+    args: &ModelArgs,
+) -> Result<LayerSchedule<LayerCachePolicy>, Error> {
+    let cache_error = |error: crate::runtime::cache::residency::CacheResidencyError| {
+        Error::UnsupportedArchitecture(error.to_string())
+    };
+    let fixed = |value| StateTensorDimension::fixed(value).map_err(cache_error);
+    let key_dim = args
+        .linear_num_key_heads
+        .checked_mul(args.linear_key_head_dim)
+        .ok_or_else(|| Error::UnsupportedArchitecture("Qwen linear key width overflow".into()))?;
+    let value_dim = args
+        .linear_num_value_heads
+        .checked_mul(args.linear_value_head_dim)
+        .ok_or_else(|| Error::UnsupportedArchitecture("Qwen linear value width overflow".into()))?;
+    let conv_dim = key_dim
+        .checked_mul(2)
+        .and_then(|value| value.checked_add(value_dim))
+        .ok_or_else(|| {
+            Error::UnsupportedArchitecture("Qwen linear convolution width overflow".into())
+        })?;
+    let history = args.linear_conv_kernel_dim.checked_sub(1).ok_or_else(|| {
+        Error::UnsupportedArchitecture("invalid Qwen linear convolution kernel".into())
+    })?;
+    let layers = args.num_hidden_layers as usize;
+    let policies = (0..layers)
+        .map(|layer| match args.layer_schedule.get(layer).copied() {
+            Some(LayerPolicy::SelfAttention(attention)) => {
+                LayerCachePolicy::key_value(attention, args.num_key_value_heads, args.head_dim)
+                    .map_err(cache_error)
+            }
+            Some(LayerPolicy::LinearAttention) => LayerCachePolicy::fixed_only(vec![
+                StateTensorPolicy::new(
+                    StateTensorRole::Convolution { slot: 0 },
+                    vec![
+                        StateTensorDimension::Batch,
+                        fixed(history)?,
+                        fixed(conv_dim)?,
+                    ],
+                    StateTensorDtype::Floating,
+                )
+                .map_err(cache_error)?,
+                StateTensorPolicy::new(
+                    StateTensorRole::Recurrent,
+                    vec![
+                        StateTensorDimension::Batch,
+                        fixed(args.linear_num_value_heads)?,
+                        fixed(args.linear_key_head_dim)?,
+                        fixed(args.linear_value_head_dim)?,
+                    ],
+                    StateTensorDtype::Float32,
+                )
+                .map_err(cache_error)?,
+            ])
+            .map_err(cache_error),
+            None => Err(Error::UnsupportedArchitecture(format!(
+                "Qwen hybrid layer schedule has no decoder layer {layer}"
+            ))),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    LayerSchedule::new(layers, policies)
+        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -3810,6 +3933,143 @@ impl Model {
         &self.args.model_type
     }
 
+    pub(crate) fn save_prompt_cache(
+        cache: &Cache,
+        destination: impl AsRef<Path>,
+        descriptor: PromptCacheDescriptor,
+        prefix_token_ids: &[u32],
+        options: &PromptCacheOptions,
+        stream: &Stream,
+    ) -> Result<PromptCacheManifest, Exception> {
+        let end = i64::try_from(prefix_token_ids.len())
+            .map_err(|_| Exception::custom("Qwen hybrid prompt length exceeds i64"))?;
+        if cache.offset() as i64 != end {
+            return Err(Exception::custom(
+                "Qwen hybrid cache offset does not match the persisted prefix",
+            ));
+        }
+        let mut blocks = Vec::new();
+        let mut state = Vec::new();
+        for (layer, cache) in cache.layers.iter().enumerate() {
+            match cache {
+                LayerCache::FullAttention(cache) => {
+                    let (keys, values) = cache.snapshot_arrays(stream)?.ok_or_else(|| {
+                        Exception::custom("Qwen full-attention cache state is missing")
+                    })?;
+                    blocks.push(PromptCacheSnapshotBlock {
+                        global_layer: layer,
+                        start: 0,
+                        end,
+                        rank: None,
+                        arrays: CacheBlockArrays::KeyValue { keys, values },
+                    });
+                }
+                LayerCache::LinearAttention(cache) => {
+                    state.push(PromptCacheStateArray {
+                        owner: StateTensorOwner::Layer(layer),
+                        role: StateTensorRole::Convolution { slot: 0 },
+                        array: cache.conv_state.as_ref().ok_or_else(|| {
+                            Exception::custom("Qwen linear convolution state is missing")
+                        })?,
+                    });
+                    state.push(PromptCacheStateArray {
+                        owner: StateTensorOwner::Layer(layer),
+                        role: StateTensorRole::Recurrent,
+                        array: cache.recurrent_state.as_ref().ok_or_else(|| {
+                            Exception::custom("Qwen linear recurrent state is missing")
+                        })?,
+                    });
+                }
+            }
+        }
+        save_prompt_cache_snapshot(
+            destination,
+            descriptor,
+            prefix_token_ids,
+            blocks,
+            &state,
+            options,
+        )
+        .map_err(|error| Exception::custom(error.to_string()))
+    }
+
+    pub(crate) fn load_prompt_cache(
+        args: &ModelArgs,
+        directory: impl AsRef<Path>,
+        expected: &PromptCacheDescriptor,
+        prefix_token_ids: &[u32],
+        stream: &Stream,
+    ) -> Result<(Cache, PromptCacheManifest), Exception> {
+        let layer_count = args.num_hidden_layers as usize;
+        let identity = PromptCacheModelIdentity {
+            model_family: "qwen_hybrid".into(),
+            effective_model_type: args.model_type.clone(),
+            architecture_fingerprint: prompt_cache_architecture_fingerprint(args),
+            layer_count,
+            global_layer_start: 0,
+            global_layer_end: layer_count,
+            sink_tokens: 0,
+            topology: Default::default(),
+            layer_layout: prompt_cache_layer_layout(args)
+                .map_err(|error| Exception::custom(error.to_string()))?,
+        };
+        let (blocks, state, manifest) =
+            open_prompt_cache_snapshot(directory, expected, &identity, prefix_token_ids, stream)
+                .map_err(|error| Exception::custom(error.to_string()))?;
+        let mut blocks = blocks
+            .into_iter()
+            .map(|block| (block.global_layer, block))
+            .collect::<BTreeMap<_, _>>();
+        let mut state = state
+            .into_iter()
+            .map(|state| ((state.owner, state.role), state.array))
+            .collect::<BTreeMap<_, _>>();
+        let mut cache = Cache::new(args).map_err(|error| Exception::custom(error.to_string()))?;
+        let end = i32::try_from(prefix_token_ids.len())
+            .map_err(|_| Exception::custom("Qwen hybrid prompt length exceeds i32"))?;
+        for (layer, cache) in cache.layers.iter_mut().enumerate() {
+            match cache {
+                LayerCache::FullAttention(cache) => {
+                    let block = blocks.remove(&layer).ok_or_else(|| {
+                        Exception::custom("Qwen full-attention prompt-cache block is missing")
+                    })?;
+                    match block.arrays {
+                        CacheBlockArrays::KeyValue { keys, values } => {
+                            cache.restore_resident(keys, values, end)?;
+                        }
+                        _ => return Err(Exception::custom("Qwen prompt-cache kind mismatch")),
+                    }
+                }
+                LayerCache::LinearAttention(cache) => {
+                    cache.conv_state = Some(
+                        state
+                            .remove(&(
+                                StateTensorOwner::Layer(layer),
+                                StateTensorRole::Convolution { slot: 0 },
+                            ))
+                            .ok_or_else(|| {
+                                Exception::custom("Qwen linear convolution state is missing")
+                            })?,
+                    );
+                    cache.recurrent_state = Some(
+                        state
+                            .remove(&(StateTensorOwner::Layer(layer), StateTensorRole::Recurrent))
+                            .ok_or_else(|| {
+                                Exception::custom("Qwen linear recurrent state is missing")
+                            })?,
+                    );
+                    cache.offset = end;
+                }
+            }
+        }
+        if !blocks.is_empty() || !state.is_empty() {
+            return Err(Exception::custom(
+                "Qwen hybrid prompt cache has unexpected state",
+            ));
+        }
+        Ok((cache, manifest))
+    }
+
     fn reject_multimodal_tokens(
         &self,
         inputs: &Array,
@@ -5976,6 +6236,96 @@ mod tests {
             window_size: 8,
             out_hidden_size,
         }
+    }
+
+    #[test]
+    fn prompt_cache_layout_records_hybrid_state_in_exact_order() {
+        use crate::runtime::cache::residency::{LayerCachePolicy, StateTensorRole};
+
+        let args = tiny_args(vec![LINEAR, FULL, LINEAR]);
+        let layout = super::prompt_cache_layer_layout(&args).unwrap();
+        assert_eq!(layout.len(), 3);
+        for layer in [0, 2] {
+            match layout.get(layer).unwrap() {
+                LayerCachePolicy::FixedState { tensors } => {
+                    assert_eq!(tensors.len(), 2);
+                    assert_eq!(tensors[0].role, StateTensorRole::Convolution { slot: 0 });
+                    assert_eq!(tensors[1].role, StateTensorRole::Recurrent);
+                }
+                policy => panic!("unexpected linear-attention policy {policy:?}"),
+            }
+        }
+        assert!(matches!(
+            layout.get(1).unwrap(),
+            LayerCachePolicy::KeyValue { .. }
+        ));
+    }
+
+    #[test]
+    #[ignore = "requires MLX runtime execution"]
+    fn schema_v4_hybrid_save_drop_reload_continue_matches_uninterrupted() {
+        use crate::runtime::cache::residency::{
+            PromptCacheDescriptor, PromptCacheOptions, PromptCacheTopology,
+        };
+
+        let _guard = mlx_runtime_test_guard();
+        let context = ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
+        let stream = context.stream();
+        let args = tiny_args(vec![LINEAR, FULL]);
+        let mut model = Model::new(args.clone(), None, None, None, stream).unwrap();
+        zero_model_parameters(&mut model, stream);
+        let prefix_ids = [1_u32, 2, 3, 4];
+        let prefix = Array::from_slice(&prefix_ids, &[1, 4]);
+        let parts = [runtime_input::InputPart::text_token_ids(&prefix)];
+        let mut cache = model.new_cache();
+        CausalLm::prefill_input_logits(
+            &mut model,
+            runtime_input::ModelInput::new(&parts),
+            &mut cache,
+            stream,
+        )
+        .unwrap();
+        let mut uninterrupted_cache = cache.clone();
+        let suffix = Array::from_slice(&[5_u32], &[1, 1]);
+        let uninterrupted =
+            CausalLm::decode_logits(&mut model, &suffix, &mut uninterrupted_cache, stream).unwrap();
+        let layout = super::prompt_cache_layer_layout(&args).unwrap();
+        let descriptor = PromptCacheDescriptor {
+            model_family: "qwen_hybrid".into(),
+            effective_model_type: args.model_type.clone(),
+            checkpoint_fingerprint: "zero-fixture".into(),
+            prefix_content_fingerprint: "tokens:1,2,3,4".into(),
+            architecture_fingerprint: super::prompt_cache_architecture_fingerprint(&args),
+            layer_count: layout.len(),
+            global_layer_start: 0,
+            global_layer_end: layout.len(),
+            batch_size: 1,
+            layer_layout: layout,
+            sink_tokens: 0,
+            topology: PromptCacheTopology::default(),
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let destination = directory.path().join("prompt-cache");
+        Model::save_prompt_cache(
+            &cache,
+            &destination,
+            descriptor.clone(),
+            &prefix_ids,
+            &PromptCacheOptions::default(),
+            stream,
+        )
+        .unwrap();
+        drop(cache);
+        let (mut restored, _) =
+            Model::load_prompt_cache(&args, &destination, &descriptor, &prefix_ids, stream)
+                .unwrap();
+        assert_eq!(restored.offset(), 4);
+        let continued =
+            CausalLm::decode_logits(&mut model, &suffix, &mut restored, stream).unwrap();
+        assert!(uninterrupted
+            .all_close(&continued, 1e-5, 1e-5, None, stream)
+            .unwrap()
+            .item::<bool>(stream));
     }
 
     struct GgufFixtureTensor {

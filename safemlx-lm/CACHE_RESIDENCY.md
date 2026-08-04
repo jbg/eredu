@@ -44,16 +44,15 @@ currently covers:
 - Qwen3 replicated expert-parallel attention in full-context or explicitly
   bounded sliding-window mode.
 
-Qwen recurrent linear-attention state, Mamba state, convolution state, and
-multimodal transient state are not mapped onto this block representation.
-High-level paged constructors reject those representations instead of changing
-their semantics. Inkling is supported because its attention KV can be paged
-independently while the convolution state remains resident.
+Recurrent linear-attention, Mamba, and convolution state are not block-paged;
+they remain device resident while supported attention KV uses the paged block
+manager. Inkling uses this split because its attention KV can be paged
+independently from its four bounded convolution histories.
 Kimi Linear likewise uses a heterogeneous cache: KDA layers retain three
 bounded convolution histories plus an F32 recurrent state, while MLA layers
 retain compressed no-RoPE latents. That cache supports resident and
-weight-layerwise execution, but paged and persisted prompt-cache construction
-is deliberately rejected.
+weight-layerwise execution. Schema-v4 prompt snapshots persist both state kinds;
+KDA itself is not represented as paged KV.
 
 ## Sliding and full attention
 
@@ -129,8 +128,8 @@ ephemeral state.
 
 ## Reusable prompt caches
 
-A prompt cache is a completed immutable text prefix, not an arbitrary snapshot
-of lazy in-flight arrays. `ModelCache::save_prompt_cache` seals partial tails,
+A prompt cache is a completed immutable prefix, not an arbitrary snapshot
+of lazy in-flight arrays. `Model::save_prompt_cache` seals partial tails,
 writes one bounded safetensors shard per cache block, and flushes data and the
 manifest before publication. A new destination is published with one directory
 rename. Replacement writes an immutable generation under the existing
@@ -150,13 +149,13 @@ dimensions against the loaded model (including rank-local tensor-parallel KV
 head counts), then memory-map the compatible immutable shards as read-only disk
 blocks. Arrays are copied from those retained mappings only on demand, and
 suffix tokens append new mutable and sealed blocks without modifying imported
-files. Schema version 3 stores a SHA-256 digest of every exact safetensors
+files. Schema version 4 stores a SHA-256 digest of every exact safetensors
 payload. The digest is checked once against the mapped bytes before the shard is
 converted into MLX arrays, so opening remains mmap-lazy while same-length payload
 corruption cannot be consumed.
 
-Schema version 3 is an intentional break. Version 2 manifests are rejected
-with `unsupported prompt cache schema version 2`; no converter or legacy read
+Schema version 4 is an intentional break. Version 3 and older manifests are rejected
+with `unsupported prompt cache schema version 3` (or their recorded version); no converter or legacy read
 path is provided.
 
 The manifest records:
@@ -166,9 +165,13 @@ The manifest records:
 - global layer range and one authoritative ordered `LayerCachePolicy` per owned
   decoder layer, including state kind, exact full/sliding policy, positive
   per-layer window, and tensor geometry;
+- ordered fixed-state tensor contracts and shards for convolution, recurrent,
+  multimodal prefix-embedding, and multimodal position-delta state;
 - representation, block ranges, array names, shapes, dtypes, batch size, total
   prefix length, and per-block payload SHA-256;
-- SHA-256 of the exact little-endian prefix token IDs;
+- SHA-256 of the exact little-endian prefix token IDs plus a required
+  caller-supplied processed-prefix fingerprint. Multimodal callers include the
+  media bytes and processor configuration in that fingerprint;
 - sink count and distributed topology;
 - optional application namespace, which is never accepted as compatibility
   evidence.
@@ -196,7 +199,12 @@ never changes full attention to sliding attention or the reverse.
 Llama/Mistral, dense Qwen2/Qwen2.5, all-full Qwen3, and GPT-OSS share this
 layout. Arbitrary full/sliding ordering and distinct windows are preserved; no
 architecture-specific manifest field or model-wide persistence window exists.
-DeepSeek-V3/R1 uses the same layout with `CompressedLatentRotary` state.
+DeepSeek-V3/R1 uses the same layout with `CompressedLatentRotary` state. Kimi
+Linear records KDA convolution/recurrent or MLA state per layer; Qwen3-Next and
+Qwen3.5 record linear-attention convolution/recurrent state beside full-attention
+KV; Gemma 4, Inkling, and Qwen3-VL persist the non-transient prefix state needed
+for exact continuation. Resident and bounded-weight execution use these same
+family helpers and layouts.
 
 `PipelineModel`, `TensorParallelModel`, and `ExpertParallelModel` expose
 matching `save_prompt_cache` and `load_prompt_cache` workflows. Callers pass one
@@ -211,21 +219,22 @@ Checkpoint fingerprints are supplied by the application because hashing every
 checkpoint byte can be expensive. They must be based on stable checkpoint
 content or a trusted immutable model identifier, not solely on an absolute
 path. Applications that require a stronger identity must compute and supply a
-content hash. Architecture fingerprints are canonical SHA-256 identities
-derived by the loaded Llama, dense-Qwen, DeepSeek, or GPT-OSS model from its normalized
-dimensions, attention layout, RoPE and scaling settings, layer schedule,
-quantization layout, and other values that can change cached activations.
+content hash. Architecture fingerprints are deterministic identities derived by
+each supported loaded model from its normalized dimensions, ordered state and
+attention layout, RoPE and scaling settings, quantization layout, and other
+values that can change cached activations.
 Model-aware distributed saves and every model-aware load require caller
 descriptors to match this derived identity. Applications can obtain the exact
 value from `prompt_cache_architecture_fingerprint` on loaded, pipeline,
 tensor-parallel, and expert-parallel model surfaces.
 
-Token IDs are sufficient only for text prefixes. Multimodal and realtime
-prefixes need image, audio, video, timing, processor identity, and often
-additional state that this format does not encode. Kimi Linear KDA,
-Qwen3-Next/Qwen3.5 recurrent or convolution state, multimodal cross-attention,
-and Moshi/PersonaPlex temporal/depth state therefore remain explicitly
-unsupported. A loaded prefix contains attention state, not logits for an
+LFM2 causal-convolution state and Nemotron-H Mamba convolution/recurrent state
+remain outside the persisted prompt-cache routes because they do not yet have
+family state policies and save/reopen continuation coverage. Realtime
+Moshi/PersonaPlex temporal/depth caches are intentionally deferred because a
+prompt snapshot does not yet encode their continuous timing and depth-decoder
+session state.
+A loaded prefix contains model state, not logits for an
 empty suffix. Run at least one suffix token before sampling, or persist logits
 separately in the application.
 
