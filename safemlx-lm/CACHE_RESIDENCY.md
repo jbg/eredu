@@ -203,17 +203,21 @@ DeepSeek-V3/R1 uses the same layout with `CompressedLatentRotary` state. Kimi
 Linear records KDA convolution/recurrent or MLA state per layer; Qwen3-Next and
 Qwen3.5 record linear-attention convolution/recurrent state beside full-attention
 KV; Gemma 4, Inkling, and Qwen3-VL persist the non-transient prefix state needed
-for exact continuation. Resident and bounded-weight execution use these same
-family helpers and layouts.
+for exact continuation. LFM2 records causal-convolution history beside its
+full-attention KV, while Nemotron-H records Mamba convolution/recurrent state,
+full-attention KV, and explicit `NoState` entries for MLP/MoE-only layers.
+Resident and bounded-weight execution use these same family helpers and layouts.
 
 `PipelineModel`, `TensorParallelModel`, and `ExpertParallelModel` expose
 matching `save_prompt_cache` and `load_prompt_cache` workflows. Callers pass one
 shared root; each process publishes `rank-NNNNN` beneath it. Pipeline manifests
 contain only the stage's global layer interval, tensor-parallel manifests retain
 rank-local KV heads, and expert-parallel manifests explicitly record replicated
-attention state. Every load derives family, effective type, exact ordered layer
-ownership and policies, and topology from the loaded distributed model before
-opening its rank directory.
+attention state. LFM2 and Nemotron-H expert-parallel publication also records
+their replicated convolution/recurrent tensors under the same rank topology.
+Every load derives family, effective type, exact ordered layer ownership and
+policies, and topology from the loaded distributed model before opening its
+rank directory.
 
 Checkpoint fingerprints are supplied by the application because hashing every
 checkpoint byte can be expensive. They must be based on stable checkpoint
@@ -228,12 +232,9 @@ descriptors to match this derived identity. Applications can obtain the exact
 value from `prompt_cache_architecture_fingerprint` on loaded, pipeline,
 tensor-parallel, and expert-parallel model surfaces.
 
-LFM2 causal-convolution state and Nemotron-H Mamba convolution/recurrent state
-remain outside the persisted prompt-cache routes because they do not yet have
-family state policies and save/reopen continuation coverage. Realtime
-Moshi/PersonaPlex temporal/depth caches are intentionally deferred because a
-prompt snapshot does not yet encode their continuous timing and depth-decoder
-session state.
+Realtime Moshi/PersonaPlex temporal/depth caches are intentionally deferred
+because a prompt snapshot does not yet encode their continuous timing and
+depth-decoder session state.
 A loaded prefix contains model state, not logits for an
 empty suffix. Run at least one suffix token before sampling, or persist logits
 separately in the application.

@@ -1,7 +1,7 @@
 //! Liquid AI LFM2/LFM2.5 dense and mixture-of-experts text models.
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     path::Path,
 };
 
@@ -42,7 +42,15 @@ use crate::{
     },
     runtime::attention::{AttentionPolicy, LayerSchedule},
     runtime::cache::{
-        residency::derive_prompt_cache_architecture_fingerprint, ConcatKeyValueCache, KeyValueCache,
+        residency::{
+            derive_prompt_cache_architecture_fingerprint, open_prompt_cache_snapshot,
+            save_prompt_cache_snapshot, CacheBlockArrays, CacheRankIdentity, LayerCachePolicy,
+            PromptCacheDescriptor, PromptCacheManifest, PromptCacheModelIdentity,
+            PromptCacheOptions, PromptCacheSnapshotBlock, PromptCacheStateArray,
+            StateTensorDimension, StateTensorDtype, StateTensorOwner, StateTensorPolicy,
+            StateTensorRole,
+        },
+        ConcatKeyValueCache, KeyValueCache,
     },
     runtime::checkpoint::load::{
         gguf_metadata, gguf_quantization_configs, load_named_array_strict,
@@ -402,23 +410,6 @@ impl ModelArgs {
     }
 }
 
-/// Returns a deterministic cache identity including the complete ordered LFM2 schedule.
-pub(crate) fn prompt_cache_architecture_fingerprint(args: &ModelArgs) -> String {
-    derive_prompt_cache_architecture_fingerprint(
-        "lfm2",
-        [
-            ("model_type", args.model_type.clone()),
-            ("hidden_size", args.hidden_size.to_string()),
-            ("num_hidden_layers", args.num_hidden_layers.to_string()),
-            ("num_attention_heads", args.num_attention_heads.to_string()),
-            ("num_key_value_heads", args.num_key_value_heads.to_string()),
-            ("conv_l_cache", args.conv_l_cache.to_string()),
-            ("rope_theta", format!("{:08x}", args.rope_theta().to_bits())),
-            ("layer_schedule", args.layer_schedule_fingerprint()),
-        ],
-    )
-}
-
 /// Validates a parsed LFM2 configuration.
 pub(crate) fn validate_model_config_value(config: &Value) -> Result<(), Error> {
     model_args_from_config_value(config).map(|_| ())
@@ -431,6 +422,85 @@ pub fn model_args_from_config_value(config: &Value) -> Result<ModelArgs, Error> 
     let args = source.into_args()?;
     validate_args(&args)?;
     Ok(args)
+}
+
+pub(crate) fn prompt_cache_architecture_fingerprint(args: &ModelArgs) -> String {
+    let rope_parameters = args
+        .rope_parameters
+        .as_ref()
+        .map_or_else(String::new, |values| {
+            values
+                .iter()
+                .map(|(key, value)| (key, format!("{value:?}")))
+                .collect::<BTreeMap<_, _>>()
+                .into_iter()
+                .map(|(key, value)| format!("{key}={value}"))
+                .collect::<Vec<_>>()
+                .join(";")
+        });
+    derive_prompt_cache_architecture_fingerprint(
+        "lfm2",
+        [
+            ("model_type", args.model_type.clone()),
+            ("hidden_size", args.hidden_size.to_string()),
+            ("layers", args.num_hidden_layers.to_string()),
+            ("layer_schedule", args.layer_schedule_fingerprint()),
+            ("query_heads", args.num_attention_heads.to_string()),
+            ("kv_heads", args.num_key_value_heads.to_string()),
+            (
+                "head_dim",
+                (args.hidden_size / args.num_attention_heads).to_string(),
+            ),
+            ("max_positions", args.max_position_embeddings.to_string()),
+            ("rope_theta", format!("{:08x}", args.rope_theta().to_bits())),
+            ("rope_parameters", rope_parameters),
+            ("norm_eps", format!("{:08x}", args.norm_eps.to_bits())),
+            ("conv_history", args.conv_l_cache.to_string()),
+            ("conv_bias", args.conv_bias.to_string()),
+        ],
+    )
+}
+
+pub(crate) fn prompt_cache_layer_layout(
+    args: &ModelArgs,
+) -> Result<LayerSchedule<LayerCachePolicy>, Error> {
+    let cache_error = |error: crate::runtime::cache::residency::CacheResidencyError| {
+        Error::UnsupportedArchitecture(error.to_string())
+    };
+    let history = args
+        .conv_l_cache
+        .checked_sub(1)
+        .ok_or_else(|| Error::UnsupportedArchitecture("invalid LFM2 convolution width".into()))?;
+    let fixed = |value| StateTensorDimension::fixed(value).map_err(cache_error);
+    args.layer_schedule
+        .iter()
+        .map(|policy| match policy.operator {
+            OperatorPolicy::CausalConvolution if history == 0 => Ok(LayerCachePolicy::NoState),
+            OperatorPolicy::CausalConvolution => {
+                LayerCachePolicy::fixed_only(vec![StateTensorPolicy::new(
+                    StateTensorRole::Convolution { slot: 0 },
+                    vec![
+                        StateTensorDimension::Batch,
+                        fixed(history)?,
+                        fixed(args.hidden_size)?,
+                    ],
+                    StateTensorDtype::Floating,
+                )
+                .map_err(cache_error)?])
+                .map_err(cache_error)
+            }
+            OperatorPolicy::SelfAttention(attention) => LayerCachePolicy::key_value(
+                attention,
+                args.num_key_value_heads,
+                args.hidden_size / args.num_attention_heads,
+            )
+            .map_err(cache_error),
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .and_then(|policies| {
+            LayerSchedule::new(args.layer_schedule.len(), policies)
+                .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
+        })
 }
 
 fn validate_args(args: &ModelArgs) -> Result<(), Error> {
@@ -1319,6 +1389,181 @@ impl Model {
         Cache::new(&self.args).expect("validated LFM2 layer schedule")
     }
 
+    pub(crate) fn save_prompt_cache(
+        cache: &Cache,
+        destination: impl AsRef<Path>,
+        descriptor: PromptCacheDescriptor,
+        prefix_token_ids: &[u32],
+        options: &PromptCacheOptions,
+        stream: &Stream,
+    ) -> Result<PromptCacheManifest, Exception> {
+        Self::save_prompt_cache_with_rank(
+            cache,
+            destination,
+            descriptor,
+            prefix_token_ids,
+            options,
+            None,
+            stream,
+        )
+    }
+
+    pub(crate) fn save_prompt_cache_with_rank(
+        cache: &Cache,
+        destination: impl AsRef<Path>,
+        descriptor: PromptCacheDescriptor,
+        prefix_token_ids: &[u32],
+        options: &PromptCacheOptions,
+        rank: Option<CacheRankIdentity>,
+        stream: &Stream,
+    ) -> Result<PromptCacheManifest, Exception> {
+        let end = i64::try_from(prefix_token_ids.len())
+            .map_err(|_| Exception::custom("LFM2 prompt length exceeds i64"))?;
+        let mut blocks = Vec::new();
+        let mut state = Vec::new();
+        for (layer, cache) in cache.layers.iter().enumerate() {
+            if i64::from(cache.offset()) != end {
+                return Err(Exception::custom(format!(
+                    "LFM2 layer {layer} cache offset does not match the persisted prefix"
+                )));
+            }
+            match cache {
+                LayerCache::Attention(cache) => {
+                    let (keys, values) = cache.snapshot_arrays(stream)?.ok_or_else(|| {
+                        Exception::custom(format!("LFM2 layer {layer} attention state is missing"))
+                    })?;
+                    blocks.push(PromptCacheSnapshotBlock {
+                        global_layer: layer,
+                        start: 0,
+                        end,
+                        rank,
+                        arrays: CacheBlockArrays::KeyValue { keys, values },
+                    });
+                }
+                LayerCache::Conv(cache) => {
+                    let convolution = cache.state.as_ref().ok_or_else(|| {
+                        Exception::custom(format!(
+                            "LFM2 layer {layer} convolution state is missing"
+                        ))
+                    })?;
+                    if convolution.dim(1) > 0 {
+                        state.push(PromptCacheStateArray {
+                            owner: StateTensorOwner::Layer(layer),
+                            role: StateTensorRole::Convolution { slot: 0 },
+                            array: convolution,
+                        });
+                    }
+                }
+            }
+        }
+        save_prompt_cache_snapshot(
+            destination,
+            descriptor,
+            prefix_token_ids,
+            blocks,
+            &state,
+            options,
+        )
+        .map_err(|error| Exception::custom(error.to_string()))
+    }
+
+    pub(crate) fn load_prompt_cache(
+        args: &ModelArgs,
+        directory: impl AsRef<Path>,
+        expected: &PromptCacheDescriptor,
+        prefix_token_ids: &[u32],
+        stream: &Stream,
+    ) -> Result<(Cache, PromptCacheManifest), Exception> {
+        let layer_count = usize::try_from(args.num_hidden_layers)
+            .map_err(|_| Exception::custom("invalid LFM2 cache layer count"))?;
+        let identity = PromptCacheModelIdentity {
+            model_family: "lfm2".into(),
+            effective_model_type: args.model_type.clone(),
+            architecture_fingerprint: prompt_cache_architecture_fingerprint(args),
+            layer_count,
+            global_layer_start: 0,
+            global_layer_end: layer_count,
+            sink_tokens: 0,
+            topology: Default::default(),
+            layer_layout: prompt_cache_layer_layout(args)
+                .map_err(|error| Exception::custom(error.to_string()))?,
+        };
+        Self::load_prompt_cache_with_identity(
+            args,
+            directory,
+            expected,
+            prefix_token_ids,
+            identity,
+            stream,
+        )
+    }
+
+    pub(crate) fn load_prompt_cache_with_identity(
+        args: &ModelArgs,
+        directory: impl AsRef<Path>,
+        expected: &PromptCacheDescriptor,
+        prefix_token_ids: &[u32],
+        identity: PromptCacheModelIdentity,
+        stream: &Stream,
+    ) -> Result<(Cache, PromptCacheManifest), Exception> {
+        let (blocks, state, manifest) =
+            open_prompt_cache_snapshot(directory, expected, &identity, prefix_token_ids, stream)
+                .map_err(|error| Exception::custom(error.to_string()))?;
+        let mut blocks = blocks
+            .into_iter()
+            .map(|block| (block.global_layer, block))
+            .collect::<BTreeMap<_, _>>();
+        let mut state = state
+            .into_iter()
+            .map(|tensor| ((tensor.owner, tensor.role), tensor.array))
+            .collect::<BTreeMap<_, _>>();
+        let end = i32::try_from(prefix_token_ids.len())
+            .map_err(|_| Exception::custom("LFM2 prompt length exceeds i32"))?;
+        let mut cache = Cache::new(args).map_err(|error| Exception::custom(error.to_string()))?;
+        for (layer, cache) in cache.layers.iter_mut().enumerate() {
+            match cache {
+                LayerCache::Attention(cache) => {
+                    let block = blocks.remove(&layer).ok_or_else(|| {
+                        Exception::custom(format!(
+                            "LFM2 layer {layer} attention prompt-cache block is missing"
+                        ))
+                    })?;
+                    match block.arrays {
+                        CacheBlockArrays::KeyValue { keys, values } => {
+                            cache.restore_resident(keys, values, end)?;
+                        }
+                        CacheBlockArrays::CompressedLatentRotary { .. } => {
+                            return Err(Exception::custom(format!(
+                                "LFM2 layer {layer} prompt-cache kind mismatch"
+                            )))
+                        }
+                    }
+                }
+                LayerCache::Conv(cache) => {
+                    if args.conv_l_cache > 1 {
+                        cache.state = Some(
+                            state
+                                .remove(&(
+                                    StateTensorOwner::Layer(layer),
+                                    StateTensorRole::Convolution { slot: 0 },
+                                ))
+                                .ok_or_else(|| {
+                                    Exception::custom(format!(
+                                        "LFM2 layer {layer} convolution state is missing"
+                                    ))
+                                })?,
+                        );
+                    }
+                    cache.offset = end;
+                }
+            }
+        }
+        if !blocks.is_empty() || !state.is_empty() {
+            return Err(Exception::custom("LFM2 prompt cache has unexpected state"));
+        }
+        Ok((cache, manifest))
+    }
+
     pub(crate) fn forward_logits(
         &mut self,
         inputs: &Array,
@@ -2046,6 +2291,51 @@ mod tests {
     }
 
     #[test]
+    fn prompt_cache_layout_records_convolution_and_attention_in_order() {
+        use crate::runtime::cache::residency::{LayerCachePolicy, StateTensorRole};
+
+        let args = model_args_from_config_value(&dense_config()).unwrap();
+        let layout = super::prompt_cache_layer_layout(&args).unwrap();
+        assert_eq!(layout.len(), 3);
+        for layer in [0, 2] {
+            match layout.get(layer).unwrap() {
+                LayerCachePolicy::FixedState { tensors } => {
+                    assert_eq!(tensors.len(), 1);
+                    assert_eq!(tensors[0].role, StateTensorRole::Convolution { slot: 0 });
+                }
+                policy => panic!("unexpected LFM2 convolution policy {policy:?}"),
+            }
+        }
+        assert!(matches!(
+            layout.get(1).unwrap(),
+            LayerCachePolicy::KeyValue { .. }
+        ));
+        let mut reordered = args.clone();
+        reordered.layer_schedule = LayerSchedule::new(
+            3,
+            vec![
+                LayerPolicy {
+                    operator: OperatorPolicy::SelfAttention(crate::AttentionPolicy::Full),
+                    feed_forward: FeedForwardPolicy::Dense,
+                },
+                LayerPolicy {
+                    operator: OperatorPolicy::CausalConvolution,
+                    feed_forward: FeedForwardPolicy::Dense,
+                },
+                LayerPolicy {
+                    operator: OperatorPolicy::CausalConvolution,
+                    feed_forward: FeedForwardPolicy::Dense,
+                },
+            ],
+        )
+        .unwrap();
+        assert_ne!(
+            super::prompt_cache_architecture_fingerprint(&args),
+            super::prompt_cache_architecture_fingerprint(&reordered)
+        );
+    }
+
+    #[test]
     fn rejects_bad_schedule_length() {
         let mut config = dense_config();
         config["layer_types"] = json!(["conv"]);
@@ -2413,5 +2703,104 @@ mod tests {
             assert_eq!(logits.shape(), &[1, 32]);
             assert_eq!(cache.offset(), 4);
         }
+    }
+
+    #[test]
+    #[ignore = "requires MLX runtime execution"]
+    fn schema_v4_lfm2_save_drop_reload_continue_matches_uninterrupted() {
+        use crate::{
+            nn::generation::CausalLm,
+            runtime::{
+                cache::residency::{
+                    PromptCacheDescriptor, PromptCacheOptions, PromptCacheTopology,
+                },
+                media::input::{InputPart, ModelInput},
+            },
+        };
+
+        let context = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
+        let stream = context.stream();
+        let args = model_args_from_config_value(&dense_config()).unwrap();
+        let mut model = super::Model::new(args.clone(), stream).unwrap();
+        for (index, parameter) in model.parameters_mut().flatten().values_mut().enumerate() {
+            **parameter = safemlx::Array::full::<f32>(
+                parameter.shape(),
+                safemlx::Array::from_f32((index + 1) as f32 * 0.001),
+                stream,
+            )
+            .unwrap();
+        }
+        let prefix_ids = [1_u32, 2, 3, 4];
+        let prefix = safemlx::Array::from_slice(&prefix_ids, &[1, 4]);
+        let parts = [InputPart::text_token_ids(&prefix)];
+        let mut cache = model.new_cache();
+        CausalLm::prefill_input_logits(&mut model, ModelInput::new(&parts), &mut cache, stream)
+            .unwrap();
+        assert_eq!(cache.offset(), 4);
+        match &cache.layers[0] {
+            super::LayerCache::Conv(cache) => {
+                assert_eq!(cache.state.as_ref().unwrap().shape(), &[1, 2, 16]);
+            }
+            _ => panic!("expected LFM2 convolution cache"),
+        }
+        match &cache.layers[1] {
+            super::LayerCache::Attention(cache) => {
+                assert_eq!(cache.snapshot_arrays(stream).unwrap().unwrap().0.dim(-2), 4);
+            }
+            _ => panic!("expected LFM2 attention cache"),
+        }
+        let mut uninterrupted_cache = cache.clone();
+        let suffix = safemlx::Array::from_slice(&[5_u32], &[1, 1]);
+        let uninterrupted =
+            CausalLm::decode_logits(&mut model, &suffix, &mut uninterrupted_cache, stream).unwrap();
+        let layout = super::prompt_cache_layer_layout(&args).unwrap();
+        let descriptor = PromptCacheDescriptor {
+            model_family: "lfm2".into(),
+            effective_model_type: args.model_type.clone(),
+            checkpoint_fingerprint: "deterministic-fixture".into(),
+            prefix_content_fingerprint: "tokens:1,2,3,4".into(),
+            architecture_fingerprint: super::prompt_cache_architecture_fingerprint(&args),
+            layer_count: layout.len(),
+            global_layer_start: 0,
+            global_layer_end: layout.len(),
+            batch_size: 1,
+            layer_layout: layout,
+            sink_tokens: 0,
+            topology: PromptCacheTopology::default(),
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let destination = directory.path().join("prompt-cache");
+        super::Model::save_prompt_cache(
+            &cache,
+            &destination,
+            descriptor.clone(),
+            &prefix_ids,
+            &PromptCacheOptions::default(),
+            stream,
+        )
+        .unwrap();
+        drop(cache);
+        let (mut restored, _) =
+            super::Model::load_prompt_cache(&args, &destination, &descriptor, &prefix_ids, stream)
+                .unwrap();
+        assert_eq!(restored.offset(), 4);
+        match &restored.layers[2] {
+            super::LayerCache::Conv(cache) => {
+                assert_eq!(cache.state.as_ref().unwrap().shape(), &[1, 2, 16]);
+            }
+            _ => panic!("expected restored LFM2 convolution cache"),
+        }
+        match &restored.layers[1] {
+            super::LayerCache::Attention(cache) => {
+                assert_eq!(cache.snapshot_arrays(stream).unwrap().unwrap().0.dim(-2), 4);
+            }
+            _ => panic!("expected restored LFM2 attention cache"),
+        }
+        let continued =
+            CausalLm::decode_logits(&mut model, &suffix, &mut restored, stream).unwrap();
+        assert!(uninterrupted
+            .all_close(&continued, 1e-5, 1e-5, None, stream)
+            .unwrap()
+            .item::<bool>(stream));
     }
 }

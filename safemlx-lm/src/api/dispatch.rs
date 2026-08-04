@@ -600,10 +600,6 @@ impl Model {
             Self::Qwen3VlLayerwise(model) | Self::Qwen3VlMoeLayerwise(model) => Ok(
                 qwen3_vl::prompt_cache_architecture_fingerprint(model.args()),
             ),
-            _ => Err(Exception::custom(format!(
-                "prompt-cache architecture identity is unsupported for model type {}",
-                self.model_type()
-            ))),
         }
     }
 
@@ -681,6 +677,22 @@ impl Model {
                 return kimi_linear::prompt_cache_layer_layout(model.args())
                     .map_err(|error| Exception::custom(error.to_string()));
             }
+            Self::Lfm2(model) => {
+                return lfm2::prompt_cache_layer_layout(&model.args)
+                    .map_err(|error| Exception::custom(error.to_string()));
+            }
+            Self::Lfm2Layerwise(model) => {
+                return lfm2::prompt_cache_layer_layout(model.args())
+                    .map_err(|error| Exception::custom(error.to_string()));
+            }
+            Self::NemotronH(model) => {
+                return nemotron_h::prompt_cache_layer_layout(&model.args)
+                    .map_err(|error| Exception::custom(error.to_string()));
+            }
+            Self::NemotronHLayerwise(model) => {
+                return nemotron_h::prompt_cache_layer_layout(model.args())
+                    .map_err(|error| Exception::custom(error.to_string()));
+            }
             Self::Qwen3Next(model) | Self::Qwen35Moe(model) => {
                 return qwen3_5_moe::prompt_cache_layer_layout(&model.args)
                     .map_err(|error| Exception::custom(error.to_string()));
@@ -712,12 +724,6 @@ impl Model {
             Self::InklingLayerwise(model) => {
                 return inkling::prompt_cache_layer_layout(model.args())
                     .map_err(|error| Exception::custom(error.to_string()));
-            }
-            _ => {
-                return Err(Exception::custom(format!(
-                    "prompt-cache state layout is unsupported for model type {}",
-                    self.model_type()
-                )))
             }
         };
         layout.map_err(|error| Exception::custom(error.to_string()))
@@ -1114,37 +1120,33 @@ impl Model {
                 let layer_count = usize::try_from(model.args.num_hidden_layers)
                     .map_err(|_| Exception::custom("invalid Llama cache layer count"))?;
                 let identity = PromptCacheModelIdentity {
-                        model_family: "llama".into(),
-                        effective_model_type: model.args.model_type.clone(),
-                        architecture_fingerprint:
-                            llama::prompt_cache_architecture_fingerprint(&model.args),
-                        layer_count,
-                        global_layer_start: 0,
-                        global_layer_end: layer_count,
-                        sink_tokens: 0,
-                        topology: Default::default(),
-                        layer_layout: PromptCacheModelIdentity::key_value_layouts(
-                            model.args.attention_schedule.iter().map(|policy| {
-                                policy.window().map(|window| {
-                                    i32::try_from(window.get())
-                                        .expect("validated Llama attention window fits i32")
-                                })
-                            }),
-                            model.args.num_key_value_heads,
-                            model.args.head_dim,
-                        )
-                        .map_err(|error| Exception::custom(error.to_string()))?,
-                    };
+                    model_family: "llama".into(),
+                    effective_model_type: model.args.model_type.clone(),
+                    architecture_fingerprint: llama::prompt_cache_architecture_fingerprint(
+                        &model.args,
+                    ),
+                    layer_count,
+                    global_layer_start: 0,
+                    global_layer_end: layer_count,
+                    sink_tokens: 0,
+                    topology: Default::default(),
+                    layer_layout: PromptCacheModelIdentity::key_value_layouts(
+                        model.args.attention_schedule.iter().map(|policy| {
+                            policy.window().map(|window| {
+                                i32::try_from(window.get())
+                                    .expect("validated Llama attention window fits i32")
+                            })
+                        }),
+                        model.args.num_key_value_heads,
+                        model.args.head_dim,
+                    )
+                    .map_err(|error| Exception::custom(error.to_string()))?,
+                };
                 validate_prompt_cache_model_identity(expected, &identity)
-                .map_err(|error| Exception::custom(error.to_string()))?;
-                let (manager, manifest) = open_prompt_cache(
-                    directory,
-                    expected,
-                    &identity,
-                    prefix_token_ids,
-                    options,
-                )
-                .map_err(|error| Exception::custom(error.to_string()))?;
+                    .map_err(|error| Exception::custom(error.to_string()))?;
+                let (manager, manifest) =
+                    open_prompt_cache(directory, expected, &identity, prefix_token_ids, options)
+                        .map_err(|error| Exception::custom(error.to_string()))?;
                 let caches = model
                     .args
                     .attention_schedule
@@ -1161,12 +1163,7 @@ impl Model {
                 Ok((ModelCache::PagedKeyValue(caches), manifest))
             }
             Self::LlamaLayerwise(model) => model
-                .load_prompt_cache(
-                    directory,
-                    expected,
-                    prefix_token_ids,
-                    options,
-                )
+                .load_prompt_cache(directory, expected, prefix_token_ids, options)
                 .map(|(cache, manifest)| (ModelCache::LlamaLayerwise(cache), manifest))
                 .map_err(|error| Exception::custom(error.to_string())),
             Self::DeepSeekV3(model) => model
@@ -1211,32 +1208,18 @@ impl Model {
                 };
                 validate_prompt_cache_model_identity(expected, &identity)
                     .map_err(|error| Exception::custom(error.to_string()))?;
-                let (manager, manifest) = open_prompt_cache(
-                    directory,
-                    expected,
-                    &identity,
-                    prefix_token_ids,
-                    options,
-                )
-                .map_err(|error| Exception::custom(error.to_string()))?;
+                let (manager, manifest) =
+                    open_prompt_cache(directory, expected, &identity, prefix_token_ids, options)
+                        .map_err(|error| Exception::custom(error.to_string()))?;
                 let caches = (0..layer_count)
                     .map(|layer| {
-                        let window = model
-                            .args
-                            .attention_schedule
-                            .get(layer)
-                            .and_then(|policy| {
-                                policy.window().map(|window| {
-                                    i32::try_from(window.get())
-                                        .expect("validated dense-Qwen attention window fits i32")
-                                })
-                            });
-                        PagedKeyValueCache::new(
-                            manager.clone(),
-                            layer,
-                            window,
-                        )
-                        .map(Some)
+                        let window = model.args.attention_schedule.get(layer).and_then(|policy| {
+                            policy.window().map(|window| {
+                                i32::try_from(window.get())
+                                    .expect("validated dense-Qwen attention window fits i32")
+                            })
+                        });
+                        PagedKeyValueCache::new(manager.clone(), layer, window).map(Some)
                     })
                     .collect::<Result<Vec<_>, _>>()?;
                 Ok((ModelCache::PagedKeyValue(caches), manifest))
@@ -1250,67 +1233,149 @@ impl Model {
             )
             .map(|(cache, manifest)| (ModelCache::KeyValue(cache), manifest)),
             Self::KimiLinear(model) => kimi_linear::Model::load_prompt_cache(
-                &model.args, directory, expected, prefix_token_ids, stream,
+                &model.args,
+                directory,
+                expected,
+                prefix_token_ids,
+                stream,
             )
-                .map(|(cache, manifest)| (ModelCache::KimiLinear(cache), manifest)),
+            .map(|(cache, manifest)| (ModelCache::KimiLinear(cache), manifest)),
             Self::KimiLinearLayerwise(model) => kimi_linear::Model::load_prompt_cache(
-                model.args(), directory, expected, prefix_token_ids, stream,
+                model.args(),
+                directory,
+                expected,
+                prefix_token_ids,
+                stream,
             )
             .map(|(cache, manifest)| (ModelCache::KimiLinear(cache), manifest)),
             Self::Qwen3Next(model) => qwen3_next::Model::load_prompt_cache(
-                &model.args, directory, expected, prefix_token_ids, stream,
+                &model.args,
+                directory,
+                expected,
+                prefix_token_ids,
+                stream,
             )
-                .map(|(cache, manifest)| (ModelCache::Qwen3Next(cache), manifest)),
+            .map(|(cache, manifest)| (ModelCache::Qwen3Next(cache), manifest)),
             Self::Qwen3NextLayerwise(model) => qwen3_next::Model::load_prompt_cache(
-                model.args(), directory, expected, prefix_token_ids, stream,
+                model.args(),
+                directory,
+                expected,
+                prefix_token_ids,
+                stream,
             )
             .map(|(cache, manifest)| (ModelCache::Qwen3Next(cache), manifest)),
             Self::Qwen35Moe(model) => qwen3_5_moe::Model::load_prompt_cache(
-                &model.args, directory, expected, prefix_token_ids, stream,
+                &model.args,
+                directory,
+                expected,
+                prefix_token_ids,
+                stream,
             )
-                .map(|(cache, manifest)| (ModelCache::Qwen35Moe(cache), manifest)),
+            .map(|(cache, manifest)| (ModelCache::Qwen35Moe(cache), manifest)),
             Self::Qwen35MoeLayerwise(model) => qwen3_5_moe::Model::load_prompt_cache(
-                model.args(), directory, expected, prefix_token_ids, stream,
+                model.args(),
+                directory,
+                expected,
+                prefix_token_ids,
+                stream,
             )
             .map(|(cache, manifest)| (ModelCache::Qwen35Moe(cache), manifest)),
             Self::Qwen3Vl(model) => qwen3_vl::Model::load_prompt_cache(
-                &model.args, directory, expected, prefix_token_ids, stream,
+                &model.args,
+                directory,
+                expected,
+                prefix_token_ids,
+                stream,
             )
-                .map(|(cache, manifest)| (ModelCache::Qwen3Vl(cache), manifest)),
+            .map(|(cache, manifest)| (ModelCache::Qwen3Vl(cache), manifest)),
             Self::Qwen3VlLayerwise(model) => qwen3_vl::Model::load_prompt_cache(
-                model.args(), directory, expected, prefix_token_ids, stream,
+                model.args(),
+                directory,
+                expected,
+                prefix_token_ids,
+                stream,
             )
             .map(|(cache, manifest)| (ModelCache::Qwen3Vl(cache), manifest)),
             Self::Qwen3VlMoe(model) => qwen3_vl_moe::Model::load_prompt_cache(
-                &model.args, directory, expected, prefix_token_ids, stream,
+                &model.args,
+                directory,
+                expected,
+                prefix_token_ids,
+                stream,
             )
-                .map(|(cache, manifest)| (ModelCache::Qwen3VlMoe(cache), manifest)),
+            .map(|(cache, manifest)| (ModelCache::Qwen3VlMoe(cache), manifest)),
             Self::Qwen3VlMoeLayerwise(model) => qwen3_vl_moe::Model::load_prompt_cache(
-                model.args(), directory, expected, prefix_token_ids, stream,
+                model.args(),
+                directory,
+                expected,
+                prefix_token_ids,
+                stream,
             )
             .map(|(cache, manifest)| (ModelCache::Qwen3VlMoe(cache), manifest)),
             Self::Gemma4(model) => gemma4::Model::load_prompt_cache(
-                &model.args, directory, expected, prefix_token_ids, stream,
+                &model.args,
+                directory,
+                expected,
+                prefix_token_ids,
+                stream,
             )
-                .map(|(cache, manifest)| (ModelCache::Gemma4(cache), manifest)),
+            .map(|(cache, manifest)| (ModelCache::Gemma4(cache), manifest)),
             Self::Gemma4Layerwise(model) => gemma4::Model::load_prompt_cache(
-                model.args(), directory, expected, prefix_token_ids, stream,
+                model.args(),
+                directory,
+                expected,
+                prefix_token_ids,
+                stream,
             )
             .map(|(cache, manifest)| (ModelCache::Gemma4(cache), manifest)),
             Self::Inkling(model) => inkling::Model::load_prompt_cache(
-                &model.args, directory, expected, prefix_token_ids, stream,
-            )
-                .map(|(cache, manifest)| (ModelCache::Inkling(cache), manifest)),
-            Self::InklingLayerwise(model) => inkling::Model::load_prompt_cache(
-                model.args(), directory, expected, prefix_token_ids, stream,
+                &model.args,
+                directory,
+                expected,
+                prefix_token_ids,
+                stream,
             )
             .map(|(cache, manifest)| (ModelCache::Inkling(cache), manifest)),
-            Self::Lfm2(_) | Self::Lfm2Layerwise(_) => Err(Exception::custom(
-                "prompt-cache loading is unsupported for LFM2 because its causal-convolution state does not yet have a persisted state policy",
-            )),
-            Self::NemotronH(_) | Self::NemotronHLayerwise(_) => Err(Exception::custom(
-                "prompt-cache loading is unsupported for Nemotron-H because its Mamba convolution and recurrent state do not yet have persisted state policies",
-            )),
+            Self::InklingLayerwise(model) => inkling::Model::load_prompt_cache(
+                model.args(),
+                directory,
+                expected,
+                prefix_token_ids,
+                stream,
+            )
+            .map(|(cache, manifest)| (ModelCache::Inkling(cache), manifest)),
+            Self::Lfm2(model) => lfm2::Model::load_prompt_cache(
+                &model.args,
+                directory,
+                expected,
+                prefix_token_ids,
+                stream,
+            )
+            .map(|(cache, manifest)| (ModelCache::Lfm2(cache), manifest)),
+            Self::Lfm2Layerwise(model) => lfm2::Model::load_prompt_cache(
+                model.args(),
+                directory,
+                expected,
+                prefix_token_ids,
+                stream,
+            )
+            .map(|(cache, manifest)| (ModelCache::Lfm2(cache), manifest)),
+            Self::NemotronH(model) => nemotron_h::Model::load_prompt_cache(
+                &model.args,
+                directory,
+                expected,
+                prefix_token_ids,
+                stream,
+            )
+            .map(|(cache, manifest)| (ModelCache::NemotronH(cache), manifest)),
+            Self::NemotronHLayerwise(model) => nemotron_h::Model::load_prompt_cache(
+                model.args(),
+                directory,
+                expected,
+                prefix_token_ids,
+                stream,
+            )
+            .map(|(cache, manifest)| (ModelCache::NemotronH(cache), manifest)),
         }
     }
 
@@ -1331,6 +1396,8 @@ impl Model {
             Self::GptOss(_) | Self::GptOssLayerwise(_) => "gpt_oss",
             Self::DenseQwen(_) | Self::DenseQwenLayerwise(_) => "dense_qwen",
             Self::KimiLinear(_) | Self::KimiLinearLayerwise(_) => "kimi_linear",
+            Self::Lfm2(_) | Self::Lfm2Layerwise(_) => "lfm2",
+            Self::NemotronH(_) | Self::NemotronHLayerwise(_) => "nemotron_h",
             Self::Qwen3Next(_)
             | Self::Qwen3NextLayerwise(_)
             | Self::Qwen35Moe(_)
@@ -1341,12 +1408,6 @@ impl Model {
             | Self::Qwen3VlMoeLayerwise(_) => "qwen3_vl",
             Self::Gemma4(_) | Self::Gemma4Layerwise(_) => "gemma4",
             Self::Inkling(_) | Self::InklingLayerwise(_) => "inkling",
-            _ => {
-                return Err(Exception::custom(format!(
-                    "prompt-cache publication is unsupported for model type {}",
-                    self.model_type()
-                )))
-            }
         };
         let layer_count = layer_layout.len();
         let identity = PromptCacheModelIdentity {
@@ -1366,6 +1427,26 @@ impl Model {
             (Self::KimiLinear(_), ModelCache::KimiLinear(cache))
             | (Self::KimiLinearLayerwise(_), ModelCache::KimiLinear(cache)) => {
                 kimi_linear::Model::save_prompt_cache(
+                    cache,
+                    destination,
+                    descriptor,
+                    prefix_token_ids,
+                    options,
+                    stream,
+                )
+            }
+            (Self::Lfm2(_), ModelCache::Lfm2(cache))
+            | (Self::Lfm2Layerwise(_), ModelCache::Lfm2(cache)) => lfm2::Model::save_prompt_cache(
+                cache,
+                destination,
+                descriptor,
+                prefix_token_ids,
+                options,
+                stream,
+            ),
+            (Self::NemotronH(_), ModelCache::NemotronH(cache))
+            | (Self::NemotronHLayerwise(_), ModelCache::NemotronH(cache)) => {
+                nemotron_h::Model::save_prompt_cache(
                     cache,
                     destination,
                     descriptor,

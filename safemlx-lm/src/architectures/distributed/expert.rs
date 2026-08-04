@@ -613,7 +613,7 @@ impl ExpertParallelModel {
         }
     }
 
-    /// Persists this rank's replicated paged attention prefix below a shared root.
+    /// Persists this rank's replicated prompt state below a shared root.
     pub fn save_prompt_cache(
         &self,
         cache: &mut ExpertParallelCache,
@@ -621,44 +621,123 @@ impl ExpertParallelModel {
         descriptor: PromptCacheDescriptor,
         prefix_token_ids: &[u32],
         options: &PromptCacheOptions,
+        stream: &Stream,
     ) -> Result<PromptCacheManifest, Error> {
         let identity = self.prompt_cache_model_identity()?;
         validate_prompt_cache_model_identity(&descriptor, &identity)
             .map_err(|error| Error::Parallel(error.to_string()))?;
         let directory = self.prompt_cache_rank_directory(root.as_ref());
-        match cache {
-            ExpertParallelCache::DeepSeek(cache) => cache
+        let rank = Some(CacheRankIdentity {
+            pipeline_rank: None,
+            tensor_parallel_rank: None,
+            expert_parallel_rank: Some(self.topology.expert_parallel_rank),
+        });
+        match (&self.architecture, cache) {
+            (_, ExpertParallelCache::DeepSeek(cache)) => cache
                 .save_prompt_cache(directory, descriptor, prefix_token_ids, options)
                 .map_err(Into::into),
-            ExpertParallelCache::GptOss(cache) => cache
+            (_, ExpertParallelCache::GptOss(cache)) => cache
                 .save_prompt_cache(directory, descriptor, prefix_token_ids, options)
                 .map_err(Into::into),
+            (
+                ExpertArchitecture::Lfm2(_) | ExpertArchitecture::Lfm2Layerwise(_),
+                ExpertParallelCache::Lfm2(cache),
+            ) => lfm2::Model::save_prompt_cache_with_rank(
+                cache,
+                directory,
+                descriptor,
+                prefix_token_ids,
+                options,
+                rank,
+                stream,
+            )
+            .map_err(Into::into),
+            (
+                ExpertArchitecture::NemotronH(_) | ExpertArchitecture::NemotronHLayerwise(_),
+                ExpertParallelCache::NemotronH(cache),
+            ) => nemotron_h::Model::save_prompt_cache_with_rank(
+                cache,
+                directory,
+                descriptor,
+                prefix_token_ids,
+                options,
+                rank,
+                stream,
+            )
+            .map_err(Into::into),
             _ => Err(Error::Parallel(
-                "expert-parallel prompt persistence requires a supported paged attention cache"
-                    .into(),
+                "expert-parallel model and prompt-cache representations do not match".into(),
             )),
         }
     }
 
-    /// Opens this rank's compatible replicated prefix without eager array loading.
+    /// Opens this rank's compatible replicated prefix.
     pub fn load_prompt_cache(
         &self,
         root: impl AsRef<Path>,
         expected: &PromptCacheDescriptor,
         prefix_token_ids: &[u32],
         options: PagedCacheOptions,
+        stream: &Stream,
     ) -> Result<(ExpertParallelCache, PromptCacheManifest), Error> {
         let identity = self.prompt_cache_model_identity()?;
         validate_prompt_cache_model_identity(expected, &identity)
             .map_err(|error| Error::Parallel(error.to_string()))?;
-        let (manager, manifest) = open_prompt_cache(
-            self.prompt_cache_rank_directory(root.as_ref()),
-            expected,
-            &identity,
-            prefix_token_ids,
-            options,
-        )
-        .map_err(|error| Error::Parallel(error.to_string()))?;
+        let directory = self.prompt_cache_rank_directory(root.as_ref());
+        match &self.architecture {
+            ExpertArchitecture::Lfm2(model) => {
+                return lfm2::Model::load_prompt_cache_with_identity(
+                    &model.args,
+                    directory,
+                    expected,
+                    prefix_token_ids,
+                    identity,
+                    stream,
+                )
+                .map(|(cache, manifest)| (ExpertParallelCache::Lfm2(cache), manifest))
+                .map_err(Into::into);
+            }
+            ExpertArchitecture::Lfm2Layerwise(model) => {
+                return lfm2::Model::load_prompt_cache_with_identity(
+                    model.args(),
+                    directory,
+                    expected,
+                    prefix_token_ids,
+                    identity,
+                    stream,
+                )
+                .map(|(cache, manifest)| (ExpertParallelCache::Lfm2(cache), manifest))
+                .map_err(Into::into);
+            }
+            ExpertArchitecture::NemotronH(model) => {
+                return nemotron_h::Model::load_prompt_cache_with_identity(
+                    &model.args,
+                    directory,
+                    expected,
+                    prefix_token_ids,
+                    identity,
+                    stream,
+                )
+                .map(|(cache, manifest)| (ExpertParallelCache::NemotronH(cache), manifest))
+                .map_err(Into::into);
+            }
+            ExpertArchitecture::NemotronHLayerwise(model) => {
+                return nemotron_h::Model::load_prompt_cache_with_identity(
+                    model.args(),
+                    directory,
+                    expected,
+                    prefix_token_ids,
+                    identity,
+                    stream,
+                )
+                .map(|(cache, manifest)| (ExpertParallelCache::NemotronH(cache), manifest))
+                .map_err(Into::into);
+            }
+            _ => {}
+        }
+        let (manager, manifest) =
+            open_prompt_cache(directory, expected, &identity, prefix_token_ids, options)
+                .map_err(|error| Error::Parallel(error.to_string()))?;
         let rank = Some(CacheRankIdentity {
             pipeline_rank: None,
             tensor_parallel_rank: None,
@@ -733,11 +812,69 @@ impl ExpertParallelModel {
                     usize::try_from(model.args.num_hidden_layers)
                         .map_err(|_| Error::Parallel("invalid GPT-OSS layer count".into()))?,
                 ),
+                ExpertArchitecture::Lfm2(model) => (
+                    "lfm2".to_string(),
+                    model.args.model_type.clone(),
+                    lfm2::prompt_cache_architecture_fingerprint(&model.args),
+                    usize::try_from(model.args.num_hidden_layers)
+                        .map_err(|_| Error::Parallel("invalid LFM2 layer count".into()))?,
+                ),
+                ExpertArchitecture::Lfm2Layerwise(model) => (
+                    "lfm2".to_string(),
+                    model.args().model_type.clone(),
+                    lfm2::prompt_cache_architecture_fingerprint(model.args()),
+                    usize::try_from(model.args().num_hidden_layers)
+                        .map_err(|_| Error::Parallel("invalid LFM2 layer count".into()))?,
+                ),
+                ExpertArchitecture::NemotronH(model) => (
+                    "nemotron_h".to_string(),
+                    model.args.model_type.clone(),
+                    nemotron_h::prompt_cache_architecture_fingerprint(&model.args),
+                    usize::try_from(model.args.num_hidden_layers)
+                        .map_err(|_| Error::Parallel("invalid Nemotron-H layer count".into()))?,
+                ),
+                ExpertArchitecture::NemotronHLayerwise(model) => (
+                    "nemotron_h".to_string(),
+                    model.args().model_type.clone(),
+                    nemotron_h::prompt_cache_architecture_fingerprint(model.args()),
+                    usize::try_from(model.args().num_hidden_layers)
+                        .map_err(|_| Error::Parallel("invalid Nemotron-H layer count".into()))?,
+                ),
                 _ => return Err(Error::Parallel(
                     "prompt-cache persistence is unsupported for this expert-parallel architecture"
                         .into(),
                 )),
             };
+        let layer_layout = match &self.architecture {
+            ExpertArchitecture::DeepSeek(model) => PromptCacheModelIdentity::compressed_layouts(
+                layer_count,
+                model.args.kv_lora_rank,
+                model.args.qk_rope_head_dim,
+            )
+            .map_err(|error| Error::Parallel(error.to_string()))?,
+            ExpertArchitecture::GptOss(model) => PromptCacheModelIdentity::key_value_layouts(
+                model.args.attention_schedule.iter().map(|policy| {
+                    policy.window().map(|window| {
+                        i32::try_from(window.get())
+                            .expect("validated GPT-OSS sliding window fits i32")
+                    })
+                }),
+                model.args.num_key_value_heads,
+                model.args.head_dim,
+            )
+            .map_err(|error| Error::Parallel(error.to_string()))?,
+            ExpertArchitecture::Lfm2(model) => lfm2::prompt_cache_layer_layout(&model.args)?,
+            ExpertArchitecture::Lfm2Layerwise(model) => {
+                lfm2::prompt_cache_layer_layout(model.args())?
+            }
+            ExpertArchitecture::NemotronH(model) => {
+                nemotron_h::prompt_cache_layer_layout(&model.args)?
+            }
+            ExpertArchitecture::NemotronHLayerwise(model) => {
+                nemotron_h::prompt_cache_layer_layout(model.args())?
+            }
+            _ => unreachable!("identity rejects unsupported expert architectures"),
+        };
         Ok(PromptCacheModelIdentity {
             model_family,
             effective_model_type,
@@ -755,27 +892,7 @@ impl ExpertParallelModel {
                 )),
                 expert_parallel_cache_replicated: true,
             },
-            layer_layout: match &self.architecture {
-                ExpertArchitecture::DeepSeek(model) => {
-                    PromptCacheModelIdentity::compressed_layouts(
-                        layer_count,
-                        model.args.kv_lora_rank,
-                        model.args.qk_rope_head_dim,
-                    )
-                }
-                ExpertArchitecture::GptOss(model) => PromptCacheModelIdentity::key_value_layouts(
-                    model.args.attention_schedule.iter().map(|policy| {
-                        policy.window().map(|window| {
-                            i32::try_from(window.get())
-                                .expect("validated GPT-OSS sliding window fits i32")
-                        })
-                    }),
-                    model.args.num_key_value_heads,
-                    model.args.head_dim,
-                ),
-                _ => unreachable!("identity rejects unsupported expert architectures"),
-            }
-            .map_err(|error| Error::Parallel(error.to_string()))?,
+            layer_layout,
         })
     }
 

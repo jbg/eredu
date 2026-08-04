@@ -34,7 +34,7 @@ use crate::{
     architectures::qwen::dense as dense_qwen,
     error::Error,
     nn::tensor::{create_attention_mask, AttentionMask},
-    runtime::attention::{AttentionPolicy, LayerSchedule},
+    runtime::attention::LayerSchedule,
     runtime::cache::{
         residency::{
             derive_prompt_cache_architecture_fingerprint, open_prompt_cache_snapshot,

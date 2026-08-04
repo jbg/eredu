@@ -1561,7 +1561,7 @@ opt-in. Device-resident caches remain the default. See
 cost, and safety details. Prompt-cache schema v4 records exact ordered per-layer
 attention plus convolution, recurrent, compressed-MLA, and multimodal prefix
 state, including distinct sliding windows. Schema-v3 and older caches are
-rejected. LFM2 causal-convolution state, Nemotron-H Mamba state, and realtime
-Moshi/PersonaPlex session state remain outside the persisted prompt-cache
-routes. Run
+rejected. LFM2 causal-convolution state and Nemotron-H Mamba state use the same
+ordered fixed-state representation. Realtime Moshi/PersonaPlex session state
+remains outside the persisted prompt-cache routes. Run
 `paged_prompt_cache` for a deterministic save/drop/reopen parity check.

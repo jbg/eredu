@@ -603,8 +603,9 @@ Important boundaries:
   positive window, ordinary KV, DeepSeek compressed MLA, fixed convolution and
   recurrent tensors, multimodal prefix state, tensor geometry, and global
   distributed layer indices. Llama/Mistral, dense Qwen, GPT-OSS, DeepSeek,
-  Kimi Linear, Qwen3-Next/Qwen3.5, Gemma 4, Inkling, and Qwen3-VL use this
-  shared representation on resident and bounded-weight persistence routes.
+  Kimi Linear, Qwen3-Next/Qwen3.5, Gemma 4, Inkling, Qwen3-VL, LFM2, and
+  Nemotron-H use this shared representation on resident and bounded-weight
+  persistence routes.
 - GGUF remains fully resident by default. `LayerwiseHost`, `DenseDiskStream`,
   and supported sparse-expert policies use header-only logical catalogs and
   bounded payload materialization.
@@ -620,9 +621,11 @@ Important boundaries:
   not misrepresented as paged KV. Inkling may page attention while keeping its
   convolution histories resident, and schema-v4 publication atomically records
   both parts before reload into an exact resident continuation cache.
-- LFM2 causal-convolution state and Nemotron-H Mamba convolution/recurrent state
-  do not yet have persisted state policies or save/reopen continuation coverage,
-  so their prompt-cache rejection remains explicit.
+- LFM2 persists ordered causal-convolution history and full-attention KV.
+  Nemotron-H persists Mamba convolution/recurrent state and attention KV while
+  explicitly representing MLP/MoE-only layers as `NoState`. Their pure
+  expert-parallel routes persist the same replicated state with exact rank
+  topology.
 - Realtime Moshi/PersonaPlex temporal/depth session state remains outside schema
   v4 and is intentionally deferred.
 - SafeTensors mapping and logical-transfer counters cannot report exact

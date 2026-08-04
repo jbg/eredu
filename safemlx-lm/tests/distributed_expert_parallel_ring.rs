@@ -49,7 +49,7 @@ use safemlx_lm::{
 
 const WORKER_RANK: &str = "SAFEMLX_LM_EXPERT_MODEL_RING_WORKER";
 const CHECKPOINT_DIR: &str = "SAFEMLX_LM_EXPERT_MODEL_CHECKPOINT";
-const PAGED_PROMPT_MARKER: &str = ".paged-prompt-parity";
+const PROMPT_CACHE_MARKER: &str = ".prompt-cache-parity";
 const EXPECTED_FILE: &str = "SAFEMLX_LM_EXPERT_MODEL_EXPECTED";
 const ARCHITECTURE: &str = "SAFEMLX_LM_EXPERT_MODEL_ARCHITECTURE";
 const ENCODING: &str = "SAFEMLX_LM_EXPERT_MODEL_ENCODING";
@@ -260,7 +260,8 @@ fn expert_parallel_model_ring_worker() {
             .collect::<HashMap<_, _>>();
     let _profiling = profile_expert_parallel_timings();
     let prompt = Array::from_slice(&[1u32, 2, 3], &[1, 3]);
-    let paged_prompt = checkpoint.join(PAGED_PROMPT_MARKER).exists();
+    let persist_prompt = checkpoint.join(PROMPT_CACHE_MARKER).exists();
+    let paged_prompt = persist_prompt && matches!(architecture.as_str(), "DeepSeekV3" | "GptOss");
     let paged = PagedCacheOptions::new(1, 16 * 1024, 16 * 1024, 1)
         .unwrap()
         .with_full_attention(true);
@@ -296,19 +297,22 @@ fn expert_parallel_model_ring_worker() {
     let uninterrupted = model
         .decode(&first.token, &mut cache, &group, stream)
         .unwrap();
-    let decode = if paged_prompt {
+    let decode = if persist_prompt {
         let uninterrupted_values = uninterrupted.evaluated().unwrap();
         let uninterrupted_values = uninterrupted_values.as_slice::<f32>().to_vec();
         let model_type = config["model_type"].as_str().unwrap().to_string();
         let descriptor = PromptCacheDescriptor {
-            model_family: if architecture == "DeepSeekV3" {
-                "deepseek_v3".into()
-            } else {
-                "gpt_oss".into()
-            },
+            model_family: match architecture.as_str() {
+                "DeepSeekV3" => "deepseek_v3",
+                "GptOss" => "gpt_oss",
+                "Lfm2" => "lfm2",
+                "NemotronH" => "nemotron_h",
+                other => panic!("unexpected prompt-cache architecture {other}"),
+            }
+            .into(),
             effective_model_type: model_type,
             checkpoint_fingerprint: "expert-ring-fixture".into(),
-            prefix_content_fingerprint: "tokens:1,2".into(),
+            prefix_content_fingerprint: "tokens:1,2,3".into(),
             architecture_fingerprint: model.prompt_cache_architecture_fingerprint().unwrap(),
             layer_count: num_layers,
             global_layer_start: 0,
@@ -334,10 +338,11 @@ fn expert_parallel_model_ring_worker() {
                 descriptor.clone(),
                 &[1, 2, 3],
                 &PromptCacheOptions::default(),
+                stream,
             )
             .unwrap();
         let (mut restored, manifest) = model
-            .load_prompt_cache(&root, &descriptor, &[1, 2, 3], paged)
+            .load_prompt_cache(&root, &descriptor, &[1, 2, 3], paged, stream)
             .unwrap();
         assert_eq!(manifest.topology, descriptor.topology);
         let restored = model
@@ -1148,7 +1153,7 @@ fn write_additional_sparse_fixtures(root: &Path) -> Vec<(&'static str, &'static 
         "intermediate_size": 24, "moe_intermediate_size": 8, "num_hidden_layers": 2,
         "test_moe_layers": 2, "num_attention_heads": 4, "num_key_value_heads": 2,
         "max_position_embeddings": 64, "norm_eps": 1e-5,
-        "layer_types": ["full_attention", "full_attention"], "conv_L_cache": 3,
+        "layer_types": ["conv", "full_attention"], "conv_L_cache": 3,
         "conv_bias": false, "block_auto_adjust_ff_dim": false,
         "tie_word_embeddings": false, "num_dense_layers": 0, "num_experts": 4,
         "num_experts_per_tok": 2, "norm_topk_prob": true, "use_expert_bias": true
@@ -1163,8 +1168,8 @@ fn write_additional_sparse_fixtures(root: &Path) -> Vec<(&'static str, &'static 
     let config = serde_json::json!({
         "model_type": "nemotron_h", "vocab_size": 32, "hidden_size": 8,
         "intermediate_size": 12, "moe_intermediate_size": 6,
-        "moe_shared_expert_intermediate_size": 10, "num_hidden_layers": 2,
-        "test_moe_layers": 1, "hybrid_override_pattern": "E*", "num_attention_heads": 2,
+        "moe_shared_expert_intermediate_size": 10, "num_hidden_layers": 3,
+        "test_moe_layers": 1, "hybrid_override_pattern": "ME*", "num_attention_heads": 2,
         "num_key_value_heads": 1, "head_dim": 4, "max_position_embeddings": 64,
         "mamba_num_heads": 2, "mamba_head_dim": 4, "n_groups": 1,
         "ssm_state_size": 4, "conv_kernel": 3, "chunk_size": 2,
@@ -1263,8 +1268,8 @@ fn write_additional_sparse_fixtures(root: &Path) -> Vec<(&'static str, &'static 
             "depth": 1, "hidden_size": 8, "hidden_act": "gelu_pytorch_tanh",
             "intermediate_size": 16, "num_heads": 2, "num_position_embeddings": 16,
             "in_channels": 3, "patch_size": 2, "spatial_merge_size": 2,
-            "temporal_patch_size": 2, "window_size": 8, "out_hidden_size": 12,
-            "fullatt_block_indexes": [0], "deepstack_visual_indexes": []
+            "temporal_patch_size": 2, "out_hidden_size": 12,
+            "deepstack_visual_indexes": []
         }
     });
     let directory = root.join("qwen3-vl-moe-sparse");
@@ -1580,8 +1585,8 @@ fn ring_two_process_qwen_embedded_mtp_generation() {
     );
 }
 
-/// Verifies rank-local paged prompt save/load parity for the two EP cache
-/// representations supported by persistence: DeepSeek MLA and GPT-OSS KV.
+/// Verifies rank-local prompt save/load parity for paged MLA/KV and replicated
+/// fixed recurrent/convolution state.
 #[test]
 #[ignore = "spawns local Ring workers and opens loopback sockets"]
 fn ring_two_process_paged_prompt_cache_parity() {
@@ -1591,7 +1596,7 @@ fn ring_two_process_paged_prompt_cache_parity() {
     let deepseek = fixture.path().join("deepseek-v3-prompt");
     std::fs::create_dir_all(&deepseek).unwrap();
     write_deepseek_fixture(&deepseek);
-    std::fs::write(deepseek.join(PAGED_PROMPT_MARKER), b"1").unwrap();
+    std::fs::write(deepseek.join(PROMPT_CACHE_MARKER), b"1").unwrap();
     run_ring_fixture(
         "DeepSeekV3 paged prompt cache",
         "DeepSeekV3",
@@ -1602,12 +1607,16 @@ fn ring_two_process_paged_prompt_cache_parity() {
         "expected.safetensors",
     );
 
-    let gpt = write_additional_sparse_fixtures(fixture.path())
-        .into_iter()
-        .find(|(_, architecture, _)| *architecture == "GptOss")
-        .map(|(_, _, directory)| directory)
-        .unwrap();
-    std::fs::write(gpt.join(PAGED_PROMPT_MARKER), b"1").unwrap();
+    let additional = write_additional_sparse_fixtures(fixture.path());
+    let find = |architecture: &str| {
+        additional
+            .iter()
+            .find(|(_, candidate, _)| *candidate == architecture)
+            .map(|(_, _, directory)| directory.clone())
+            .unwrap()
+    };
+    let gpt = find("GptOss");
+    std::fs::write(gpt.join(PROMPT_CACHE_MARKER), b"1").unwrap();
     run_ring_fixture(
         "GPT-OSS paged prompt cache",
         "GptOss",
@@ -1615,6 +1624,30 @@ fn ring_two_process_paged_prompt_cache_parity() {
         "balanced",
         "sparse-cache",
         &gpt,
+        "expected.safetensors",
+    );
+
+    let lfm2 = find("Lfm2");
+    std::fs::write(lfm2.join(PROMPT_CACHE_MARKER), b"1").unwrap();
+    run_ring_fixture(
+        "LFM2 replicated convolution prompt cache",
+        "Lfm2",
+        "dense",
+        "balanced",
+        "sparse-cache",
+        &lfm2,
+        "expected.safetensors",
+    );
+
+    let nemotron = find("NemotronH");
+    std::fs::write(nemotron.join(PROMPT_CACHE_MARKER), b"1").unwrap();
+    run_ring_fixture(
+        "Nemotron-H replicated Mamba prompt cache",
+        "NemotronH",
+        "dense",
+        "balanced",
+        "sparse-cache",
+        &nemotron,
         "expected.safetensors",
     );
 }

@@ -1801,23 +1801,6 @@ impl SlidingKeyValueCache {
         self.keys.iter().chain(self.values.iter())
     }
 
-    pub(crate) fn restore_resident(
-        &mut self,
-        keys: Array,
-        values: Array,
-        end: i32,
-    ) -> Result<(), Exception> {
-        if keys.shape() != values.shape() || keys.dim(-2) > self.max_size || end < keys.dim(-2) {
-            return Err(Exception::custom(
-                "restored sliding cache arrays do not match their retained range",
-            ));
-        }
-        self.keys = Some(keys);
-        self.values = Some(values);
-        self.offset = end;
-        Ok(())
-    }
-
     /// Clears cached arrays while preserving the configured window size.
     pub fn clear(&mut self) {
         self.keys = None;
