@@ -373,8 +373,12 @@ Normalized `ModelArgs` no longer implements `Deserialize` or exposes raw
 `layer_types`/`sliding_window`; JSON callers use
 `architectures::gpt_oss::model::model_args_from_config_value`.
 
-Gemma 4 text and assistant models also use
-`LayerSchedule<AttentionPolicy>` as their authoritative attention geometry.
+Gemma 4 text and assistant models use
+`LayerSchedule<architectures::gemma4::model::LayerPolicy>` as their authoritative
+decoder geometry. Each ordered entry contains its full/exact-window attention
+policy, exact head dimension and KV-head count, KV local/publish/shared role,
+projected-value versus key-as-value topology, exact dense MLP width, and
+dense-only versus dense-plus-sparse-MoE feed-forward topology.
 Hugging Face `layer_types` is an exact decoder-order list of
 `full_attention`/`sliding_attention`; an omitted or empty list means all full.
 Any enabled sliding entry requires the one positive, executable
@@ -386,21 +390,27 @@ alternating and discontiguous layouts, are accepted. Wrong encodings, length
 mismatches, unknown entries, missing windows, and zero, negative, or overflowing
 windows fail in the same normalization used by inspection and loading.
 
-Resident, layerwise-host, multimodal prefill/decode, generation, shared-KV
-routing, and Gemma 4 assistant drafting query only the normalized schedule.
+Hugging Face global/full-attention geometry, doubled-final-layer MLP, shared-KV
+suffix, key-as-value, and MoE fields are source inputs only. GGUF per-layer
+feed-forward lengths and KV-head counts are preserved exactly. Resident,
+layerwise-host, multimodal prefill/decode, generation, shared-KV routing, and
+Gemma 4 assistant drafting query only the normalized composite schedule.
 Multimodal masks are keyed by exact policy, so internally constructed schedules
 may use different windows. Gemma sliding layers apply a bounded attention mask
 but deliberately retain full KV backing; shared layers reuse state by exact
-policy. Capability reports total full/sliding policy counts and groups sliding
-layers by each window, while memory estimates separately account for cached
-versus shared layers and context-growing backing.
-Architecture fingerprints include the complete ordered schedule. Persisted
+policy. Ordinary cache slots exist only for KV-owning layers. Capability reports
+total full/sliding policy counts and groups sliding layers by each window, while
+memory estimates group KV-owning layers by their exact per-position geometry and
+separately account for shared layers and context-growing backing. Architecture
+fingerprints include the complete ordered composite schedule. Persisted
 Gemma prompt caches, paged Gemma KV caches, and tensor/pipeline parallel Gemma
 execution remain unsupported.
 
 This is a breaking API migration: public `LayerType`, raw normalized
-`ModelArgs.layer_types`/`sliding_window`, and fallback-returning `layer_type`
-were removed. `ModelArgs` and `Gemma4AssistantConfig` are no longer directly
+`ModelArgs.layer_types`/`sliding_window`, scalar attention/head/KV/shared-layer,
+MLP-width, and MoE-enable execution fields, and fallback-returning `layer_type`
+were removed. `ModelArgs::layer_schedule` and `ModelArgs::layer_policy` are the
+only normalized layer APIs. `ModelArgs` and `Gemma4AssistantConfig` are no longer directly
 deserializable; JSON callers use `model_args_from_config_value` and
 `gemma4_assistant_config_from_value`. `TransformerBlock::layer_policy` and
 `ModelInput::sliding_masks` replace the old scalar/type fields. The public

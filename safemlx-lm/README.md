@@ -321,14 +321,19 @@ model-wide window. The normalized `ModelArgs` removed raw `layer_types` and
 
 Gemma 4 normalizes Hugging Face `layer_types` plus `sliding_window`, or GGUF's
 exact Boolean `gemma4.attention.sliding_window_pattern`, into one
-`LayerSchedule<AttentionPolicy>`. An omitted or empty pattern is all-full;
+`LayerSchedule<architectures::gemma4::model::LayerPolicy>`. Each entry includes
+the attention policy, exact head/KV geometry, KV local/publish/shared and
+key-as-value topology, exact dense MLP width, and dense-only versus
+dense-plus-sparse-MoE selection. An omitted or empty pattern is all-full;
 enabled sliding layers require a positive executable window. Arbitrary Boolean
 ordering is supported, including alternating and discontiguous patterns.
 Malformed entries, wrong GGUF encodings, count mismatches, missing windows, and
 zero, negative, or overflowing values fail before weights are materialized.
 Assistant-prefixed GGUF metadata and assistant JSON use the same normalization.
 
-Resident and layerwise execution, multimodal masks, generation, structural
+Hugging Face scalar geometry, shared-suffix, doubled-MLP, key-as-value, and MoE
+fields and GGUF metadata are normalized once and do not remain parallel
+execution inputs. Resident and layerwise execution, multimodal masks, generation, structural
 admission, shared-KV routing, MTP target/assistant handoff, architecture
 fingerprints, and runtime-state accounting consume only that schedule.
 Multimodal mask maps and shared-KV state are keyed by exact policy, allowing
@@ -336,10 +341,14 @@ internally distinct windows. Sliding layers use the exact `N`-position mask
 convention while retaining full context-growing KV backing; final shared layers
 reuse earlier K/V produced by the same exact policy. Capability reporting gives
 the total full-layer count, groups all sliding layers by exact window, and
-identifies that backing as unbounded.
+groups context-growing state by each exact KV-head/head-dimension geometry.
+Shared layers have no ordinary cache allocation; publishing layers retain the
+full state consumed by matching shared layers.
 
 The migration removes public `LayerType`, normalized `layer_types` and
-`sliding_window` fields, and fallback `layer_type` queries. `ModelArgs` and
+`sliding_window` fields, scalar normalized head/KV/shared-layer, MLP-width, and
+MoE-enable fields, and fallback `layer_type` queries. `ModelArgs::layer_schedule`
+and `ModelArgs::layer_policy` are the only normalized layer APIs. `ModelArgs` and
 `Gemma4AssistantConfig` are no longer directly deserializable; use
 `model_args_from_config_value` or `gemma4_assistant_config_from_value`.
 `TransformerBlock::layer_policy`, `ModelInput::sliding_masks`, and

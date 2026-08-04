@@ -118,11 +118,14 @@ resident, bounded, structural, tensor/pipeline/expert-parallel, cache-identity,
 and fingerprint paths consume the ordered schedule. Internally supplied
 schedules may use arbitrary dense/MoE ordering, while every layer continues to
 use the model-wide compressed MLA cache geometry.
-Gemma 4 text and assistant checkpoints now normalize their exact full/sliding
-layer pattern into `LayerSchedule<AttentionPolicy>` as well. The schedule drives
-resident and bounded execution, multimodal masks, shared-KV routing, assistant
-drafting, structural admission, architecture identity, and memory reporting;
-arbitrary Boolean GGUF patterns and internally distinct windows are supported.
+Gemma 4 text and assistant checkpoints now normalize every decoder-layer choice
+into `LayerSchedule<architectures::gemma4::model::LayerPolicy>`. Each entry owns
+its attention mode and exact window, head/KV geometry, KV ownership/publication
+and key-as-value topology, dense MLP width, and dense-only versus dense-plus-MoE
+selection. Resident and bounded execution, multimodal masks, shared-KV routing,
+assistant drafting, structural admission, architecture identity, cache
+allocation, and memory reporting consume only that schedule; arbitrary Boolean
+GGUF attention patterns and internally distinct windows or widths are supported.
 Llama and Mistral have also removed their normalized global-window field and
 separate sliding-cache dispatch. Hugging Face and GGUF scalar metadata normalize
 once into `LayerSchedule<AttentionPolicy>`; resident, bounded, paged, tensor,
