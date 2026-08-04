@@ -1864,9 +1864,7 @@ mod tests {
                 "patch_size": 2,
                 "spatial_merge_size": 2,
                 "temporal_patch_size": 2,
-                "window_size": 8,
                 "out_hidden_size": 32,
-                "fullatt_block_indexes": [0],
                 "deepstack_visual_indexes": [0]
             }
         })
@@ -6033,6 +6031,38 @@ mod tests {
     }
 
     #[test]
+    fn qwen3_vl_vision_schedule_rejections_match_inspection_and_load_preflight() {
+        for mutate in [
+            |config: &mut Value| config["vision_config"]["window_size"] = json!(8),
+            |config: &mut Value| config["vision_config"]["fullatt_block_indexes"] = json!([0]),
+            |config: &mut Value| {
+                config["vision_config"]["deepstack_visual_indexes"] = json!([0, 0])
+            },
+            |config: &mut Value| config["vision_config"]["deepstack_visual_indexes"] = json!([1]),
+        ] {
+            let directory = write_complete_qwen3_vl_safetensors_dir(false, |_| {});
+            let mut config = qwen3_vl_safetensors_config(false);
+            mutate(&mut config);
+            std::fs::write(
+                directory.path().join("config.json"),
+                serde_json::to_vec(&config).unwrap(),
+            )
+            .unwrap();
+
+            let report =
+                inspect_model(directory.path(), ModelInspectionOptions::default()).unwrap();
+            assert_eq!(report.model_loadability, InspectionReadiness::Invalid);
+            assert!(!report.is_loadable());
+            assert!(structural::validate_safetensors_load_path(
+                ModelKind::Qwen3Vl,
+                directory.path(),
+                ModelLoadOptions::default(),
+            )
+            .is_err());
+        }
+    }
+
+    #[test]
     fn qwen3_vl_moe_native_affine_text_and_dense_vision_are_exact() {
         let mut config = qwen3_vl_safetensors_config(true);
         config["text_config"]["moe_intermediate_size"] = json!(32);
@@ -8840,10 +8870,7 @@ mod tests {
         .unwrap();
         assert_eq!(prepared.args.text_config.hidden_size, 32);
         assert_eq!(prepared.args.vision_config.hidden_size, 8);
-        assert_eq!(
-            prepared.args.vision_config.deepstack_visual_indexes,
-            vec![0]
-        );
+        assert_eq!(prepared.args.vision_config.deepstack_layers(), vec![0]);
         assert_eq!(prepared.eos_token_ids, vec![2]);
     }
 

@@ -4874,12 +4874,12 @@ fn validate_qwen3_vl_safetensors(
         ));
     }
     if args.text_config.num_hidden_layers as usize > store.keys().len()
-        || args.vision_config.depth as usize > store.keys().len()
+        || args.vision_config.layer_count() > store.keys().len()
     {
         return invalid_geometry(format!(
             "configured Qwen3-VL text/vision depths {}/{} exceed the entire {}-tensor checkpoint catalog",
             args.text_config.num_hidden_layers,
-            args.vision_config.depth,
+            args.vision_config.layer_count(),
             store.keys().len()
         ));
     }
@@ -5015,7 +5015,7 @@ fn qwen_vision_safetensors_expected(
         ),
         dense(format!("{root}.patch_embed.proj.bias"), vec![hidden]),
     ];
-    for layer in 0..config.depth as usize {
+    for layer in 0..config.layer_count() {
         let prefix = format!("{root}.blocks.{layer}");
         vision.extend([
             dense(format!("{prefix}.norm1.weight"), vec![hidden]),
@@ -5058,7 +5058,7 @@ fn qwen_vision_safetensors_expected(
         ),
         dense(format!("{root}.merger.linear_fc2.bias"), vec![text_hidden]),
     ]);
-    for index in 0..config.deepstack_visual_indexes.len() {
+    for index in 0..config.deepstack_layer_count() {
         let prefix = format!("{root}.deepstack_merger_list.{index}");
         vision.extend([
             dense(format!("{prefix}.norm.weight"), vec![merger_hidden]),
@@ -6844,10 +6844,10 @@ pub(crate) fn validate_qwen3_vl_projector_gguf(
         Ok(args) => args,
         Err(error) => return invalid_geometry(error.to_string()),
     };
-    let deepstack = &args.vision_config.deepstack_visual_indexes;
+    let deepstack = args.vision_config.deepstack_layers();
     if let Err(error) = checkpoint
         .catalog()
-        .translated_outputs(|name| qwen3_vl::translate_qwen3_vl_mmproj_name(name, deepstack))
+        .translated_outputs(|name| qwen3_vl::translate_qwen3_vl_mmproj_name(name, &deepstack))
     {
         return StructuralValidation::Invalid(vec![StructuralIssue {
             kind: StructuralIssueKind::ConflictingLayout,
@@ -6894,7 +6894,7 @@ fn qwen3_vl_gguf_expected(args: &qwen3_vl::ModelArgs) -> Vec<ExpectedTensor> {
         ),
         dense("v.patch_embd.bias".into(), vec![hidden]),
     ];
-    for layer in 0..vision.depth as usize {
+    for layer in 0..vision.layer_count() {
         let prefix = format!("v.blk.{layer}");
         tensors.extend([
             dense(format!("{prefix}.ln1.weight"), vec![hidden]),
@@ -6928,7 +6928,7 @@ fn qwen3_vl_gguf_expected(args: &qwen3_vl::ModelArgs) -> Vec<ExpectedTensor> {
         dense("mm.2.weight".into(), vec![text_hidden, merger_hidden]),
         dense("mm.2.bias".into(), vec![text_hidden]),
     ]);
-    for &layer in &vision.deepstack_visual_indexes {
+    for layer in vision.deepstack_layers() {
         let prefix = format!("v.deepstack.{layer}");
         tensors.extend([
             dense(format!("{prefix}.norm.weight"), vec![merger_hidden]),

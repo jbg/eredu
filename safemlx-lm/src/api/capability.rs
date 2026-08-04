@@ -1742,12 +1742,25 @@ fn qwen_vision_workspace(
     }
     let (full_chunk_squares, window_chunk_squares) =
         qwen_attention_chunk_squares(&grid, merge, config.window_size, config.patch_size)?;
-    let depth = positive(config.depth, "Qwen vision depth")?;
-    let full_blocks = u64::try_from(config.fullatt_block_indexes.len())
-        .map_err(|_| CapabilityError::ArithmeticOverflow {
-            operation: "Qwen full-attention block count",
-        })?
-        .min(depth);
+    let depth =
+        u64::try_from(config.layer_count()).map_err(|_| CapabilityError::ArithmeticOverflow {
+            operation: "Qwen vision depth",
+        })?;
+    let full_blocks = u64::try_from(
+        config
+            .layer_schedule
+            .iter()
+            .filter(|policy| {
+                matches!(
+                    policy.attention,
+                    crate::architectures::qwen::vl::vision::VisionAttentionPolicy::Full
+                )
+            })
+            .count(),
+    )
+    .map_err(|_| CapabilityError::ArithmeticOverflow {
+        operation: "Qwen full-attention block count",
+    })?;
     let window_blocks = depth - full_blocks;
     let heads = positive(config.num_heads, "Qwen vision heads")?;
     let hidden = positive(config.hidden_size, "Qwen vision hidden size")?;
@@ -1804,7 +1817,7 @@ fn qwen_vision_workspace(
     )?;
     let mergers = checked_add(
         1,
-        u64::try_from(config.deepstack_visual_indexes.len()).map_err(|_| {
+        u64::try_from(config.deepstack_layer_count()).map_err(|_| {
             CapabilityError::ArithmeticOverflow {
                 operation: "Qwen deepstack merger count",
             }
@@ -3656,7 +3669,22 @@ mod tests {
     #[test]
     fn qwen_prepared_grid_bounds_vision_workspace() {
         let config = crate::architectures::qwen::vl::vision::VisionConfig {
-            depth: 2,
+            layer_schedule: crate::runtime::attention::LayerSchedule::new(
+                2,
+                vec![
+                    crate::architectures::qwen::vl::vision::VisionLayerPolicy {
+                        attention:
+                            crate::architectures::qwen::vl::vision::VisionAttentionPolicy::Windowed,
+                        deepstack_merger: Some(0),
+                    },
+                    crate::architectures::qwen::vl::vision::VisionLayerPolicy {
+                        attention:
+                            crate::architectures::qwen::vl::vision::VisionAttentionPolicy::Full,
+                        deepstack_merger: None,
+                    },
+                ],
+            )
+            .unwrap(),
             hidden_size: 8,
             hidden_act: "silu".into(),
             intermediate_size: 16,
@@ -3668,8 +3696,6 @@ mod tests {
             temporal_patch_size: 1,
             window_size: 4,
             out_hidden_size: 8,
-            fullatt_block_indexes: vec![1],
-            deepstack_visual_indexes: vec![0],
         };
         let payload = Array::from_slice(&[0.0f32; 12], &[4, 3]);
         let grid = Array::from_slice(&[1, 2, 2], &[1, 3]);

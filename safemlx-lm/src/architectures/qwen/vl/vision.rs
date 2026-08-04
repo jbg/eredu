@@ -14,53 +14,301 @@ use safemlx::{
 };
 use serde::Deserialize;
 
-use crate::{nn::layers::silu, runtime::cache::ConcatKeyValueCache};
+use crate::{
+    error::Error,
+    nn::layers::silu,
+    runtime::{attention::LayerSchedule, cache::ConcatKeyValueCache},
+};
 
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
+/// Attention topology for one Qwen vision transformer block.
+pub enum VisionAttentionPolicy {
+    /// Attend across each complete image or video-frame sequence.
+    Full,
+    /// Attend within the configured spatial vision window.
+    Windowed,
+}
+
+#[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
+/// Canonical execution policy for one Qwen vision transformer block.
+pub struct VisionLayerPolicy {
+    /// Attention topology used by the block.
+    pub attention: VisionAttentionPolicy,
+    /// DeepStack merger bank captured after this block, when present.
+    pub deepstack_merger: Option<u32>,
+}
+
+impl VisionLayerPolicy {
+    fn new(attention: VisionAttentionPolicy) -> Self {
+        Self {
+            attention,
+            deepstack_merger: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 /// Qwen VL vision encoder configuration.
 pub struct VisionConfig {
-    #[serde(default = "default_vision_depth")]
-    /// Number of vision transformer blocks.
-    pub depth: i32,
-    #[serde(default = "default_vision_hidden_size")]
+    /// Authoritative ordered execution policy for every vision block.
+    pub layer_schedule: LayerSchedule<VisionLayerPolicy>,
     /// Vision transformer hidden size.
     pub hidden_size: i32,
-    #[serde(default = "default_vision_hidden_act")]
     /// Vision MLP activation function.
     pub hidden_act: String,
-    #[serde(default = "default_vision_intermediate_size")]
     /// Vision MLP intermediate size.
     pub intermediate_size: i32,
-    #[serde(default = "default_vision_num_heads")]
     /// Number of vision attention heads.
     pub num_heads: i32,
-    #[serde(default = "default_vision_num_position_embeddings")]
     /// Number of learned spatial position embeddings.
     pub num_position_embeddings: i32,
-    #[serde(default = "default_vision_in_channels")]
     /// Number of input pixel channels.
     pub in_channels: i32,
-    #[serde(default = "default_vision_patch_size")]
     /// Spatial patch size.
     pub patch_size: i32,
-    #[serde(default = "default_vision_spatial_merge_size")]
     /// Spatial merge factor used before language-model insertion.
     pub spatial_merge_size: i32,
-    #[serde(default = "default_vision_temporal_patch_size")]
     /// Temporal patch size.
     pub temporal_patch_size: i32,
-    #[serde(default = "default_vision_window_size")]
-    /// Window attention size from the public config.
+    /// Spatial window size used by `Windowed` layers.
     pub window_size: i32,
-    #[serde(default = "default_vision_out_hidden_size")]
     /// Output hidden size projected into the language model space.
     pub out_hidden_size: i32,
-    #[serde(default = "default_vision_fullatt_block_indexes")]
-    /// Blocks configured for full attention in the reference implementation.
-    pub fullatt_block_indexes: Vec<i32>,
+}
+
+impl VisionConfig {
+    /// Returns the number of vision transformer blocks.
+    pub fn layer_count(&self) -> usize {
+        self.layer_schedule.len()
+    }
+
+    /// Returns one block policy without an out-of-range fallback.
+    pub fn layer_policy(&self, layer: usize) -> Option<&VisionLayerPolicy> {
+        self.layer_schedule.get(layer)
+    }
+
+    /// Returns the number of configured DeepStack merger banks.
+    pub fn deepstack_layer_count(&self) -> usize {
+        self.layer_schedule
+            .iter()
+            .filter(|policy| policy.deepstack_merger.is_some())
+            .count()
+    }
+
+    /// Returns DeepStack source layers in merger-bank order.
+    pub fn deepstack_layers(&self) -> Vec<i32> {
+        let mut layers = self
+            .layer_schedule
+            .iter()
+            .enumerate()
+            .filter_map(|(layer, policy)| {
+                policy.deepstack_merger.map(|merger| (merger, layer as i32))
+            })
+            .collect::<Vec<_>>();
+        layers.sort_unstable_by_key(|(merger, _)| *merger);
+        layers.into_iter().map(|(_, layer)| layer).collect()
+    }
+
+    /// Stable ordered component used by architecture diagnostics and tests.
+    pub fn layer_schedule_fingerprint(&self) -> String {
+        self.layer_schedule
+            .iter()
+            .map(|policy| {
+                let attention = match policy.attention {
+                    VisionAttentionPolicy::Full => "f",
+                    VisionAttentionPolicy::Windowed => "w",
+                };
+                match policy.deepstack_merger {
+                    Some(merger) => format!("{attention}d{merger}"),
+                    None => attention.to_string(),
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+
+    fn validate_for_mode(&self, mode: VisionMode) -> Result<(), Exception> {
+        let mut mergers = self
+            .layer_schedule
+            .iter()
+            .filter_map(|policy| policy.deepstack_merger)
+            .collect::<Vec<_>>();
+        mergers.sort_unstable();
+        let expected = (0..mergers.len())
+            .map(|index| index as u32)
+            .collect::<Vec<_>>();
+        if mergers != expected {
+            return Err(Exception::custom(format!(
+                "Qwen VL vision DeepStack merger banks must be unique and contiguous from zero, got {mergers:?}"
+            )));
+        }
+        if mode == VisionMode::Deepstack
+            && self
+                .layer_schedule
+                .iter()
+                .any(|policy| policy.attention != VisionAttentionPolicy::Full)
+        {
+            return Err(Exception::custom(
+                "Qwen3-VL vision schedules must use full attention in every block",
+            ));
+        }
+        if self
+            .layer_schedule
+            .iter()
+            .any(|policy| policy.attention == VisionAttentionPolicy::Windowed)
+            && self.window_size <= 0
+        {
+            return Err(Exception::custom(
+                "Qwen VL windowed vision schedules require a positive window_size",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct VisionConfigSource {
+    #[serde(default = "default_vision_depth")]
+    depth: i32,
+    #[serde(default = "default_vision_hidden_size")]
+    hidden_size: i32,
+    #[serde(default = "default_vision_hidden_act")]
+    hidden_act: String,
+    #[serde(default = "default_vision_intermediate_size")]
+    intermediate_size: i32,
+    #[serde(default = "default_vision_num_heads")]
+    num_heads: i32,
+    #[serde(default = "default_vision_num_position_embeddings")]
+    num_position_embeddings: i32,
+    #[serde(default = "default_vision_in_channels")]
+    in_channels: i32,
+    #[serde(default = "default_vision_patch_size")]
+    patch_size: i32,
+    #[serde(default = "default_vision_spatial_merge_size")]
+    spatial_merge_size: i32,
+    #[serde(default = "default_vision_temporal_patch_size")]
+    temporal_patch_size: i32,
     #[serde(default)]
-    /// Vision layers whose merged features are injected into early decoder layers.
-    pub deepstack_visual_indexes: Vec<i32>,
+    window_size: Option<i32>,
+    #[serde(default = "default_vision_out_hidden_size")]
+    out_hidden_size: i32,
+    #[serde(default)]
+    fullatt_block_indexes: Option<Vec<i32>>,
+    #[serde(default)]
+    deepstack_visual_indexes: Option<Vec<i32>>,
+}
+
+impl VisionConfigSource {
+    pub(crate) fn normalize_qwen3_vl(self) -> Result<VisionConfig, Error> {
+        if self.window_size.is_some() || self.fullatt_block_indexes.is_some() {
+            return Err(Error::UnsupportedArchitecture(
+                "qwen3_vl vision_config must not define window_size or fullatt_block_indexes; Qwen3-VL vision uses full attention in every block".into(),
+            ));
+        }
+        let deepstack = self
+            .deepstack_visual_indexes
+            .clone()
+            .unwrap_or_else(|| vec![8, 16, 24]);
+        let depth = positive_depth(self.depth, "qwen3_vl")?;
+        self.normalize(
+            vec![VisionAttentionPolicy::Full; depth],
+            deepstack,
+            default_vision_window_size(),
+            "qwen3_vl",
+        )
+    }
+
+    pub(crate) fn normalize_qwen3_5(self) -> Result<VisionConfig, Error> {
+        let depth = positive_depth(self.depth, "Qwen3.5")?;
+        let full = self
+            .fullatt_block_indexes
+            .clone()
+            .unwrap_or_else(default_vision_fullatt_block_indexes);
+        let mut attention = vec![VisionAttentionPolicy::Windowed; depth];
+        let mut seen = std::collections::BTreeSet::new();
+        for layer in full {
+            let index = checked_layer_index(layer, depth, "Qwen3.5 full-attention")?;
+            if !seen.insert(index) {
+                return Err(Error::UnsupportedArchitecture(format!(
+                    "Qwen3.5 full-attention vision layer {layer} is duplicated"
+                )));
+            }
+            attention[index] = VisionAttentionPolicy::Full;
+        }
+        let window_size = self.window_size.unwrap_or_else(default_vision_window_size);
+        if window_size <= 0 {
+            return Err(Error::UnsupportedArchitecture(
+                "Qwen3.5 vision window_size must be positive".into(),
+            ));
+        }
+        let deepstack = self.deepstack_visual_indexes.clone().unwrap_or_default();
+        self.normalize(attention, deepstack, window_size, "Qwen3.5")
+    }
+
+    fn normalize(
+        self,
+        attention: Vec<VisionAttentionPolicy>,
+        deepstack: Vec<i32>,
+        window_size: i32,
+        architecture: &str,
+    ) -> Result<VisionConfig, Error> {
+        let depth = positive_depth(self.depth, architecture)?;
+        let mut policies = attention
+            .into_iter()
+            .map(VisionLayerPolicy::new)
+            .collect::<Vec<_>>();
+        let mut seen = std::collections::BTreeSet::new();
+        for (merger, layer) in deepstack.into_iter().enumerate() {
+            let index = checked_layer_index(layer, depth, &format!("{architecture} DeepStack"))?;
+            if !seen.insert(index) {
+                return Err(Error::UnsupportedArchitecture(format!(
+                    "{architecture} DeepStack vision layer {layer} is duplicated"
+                )));
+            }
+            policies[index].deepstack_merger = Some(u32::try_from(merger).map_err(|_| {
+                Error::UnsupportedArchitecture(format!(
+                    "{architecture} has too many DeepStack vision layers"
+                ))
+            })?);
+        }
+        let layer_schedule = LayerSchedule::new(depth, policies).map_err(|error| {
+            Error::UnsupportedArchitecture(format!("{architecture} vision {error}"))
+        })?;
+        Ok(VisionConfig {
+            layer_schedule,
+            hidden_size: self.hidden_size,
+            hidden_act: self.hidden_act,
+            intermediate_size: self.intermediate_size,
+            num_heads: self.num_heads,
+            num_position_embeddings: self.num_position_embeddings,
+            in_channels: self.in_channels,
+            patch_size: self.patch_size,
+            spatial_merge_size: self.spatial_merge_size,
+            temporal_patch_size: self.temporal_patch_size,
+            window_size,
+            out_hidden_size: self.out_hidden_size,
+        })
+    }
+}
+
+fn positive_depth(depth: i32, architecture: &str) -> Result<usize, Error> {
+    usize::try_from(depth)
+        .ok()
+        .filter(|depth| *depth > 0)
+        .ok_or_else(|| {
+            Error::UnsupportedArchitecture(format!("{architecture} vision depth must be positive"))
+        })
+}
+
+fn checked_layer_index(layer: i32, depth: usize, label: &str) -> Result<usize, Error> {
+    usize::try_from(layer)
+        .ok()
+        .filter(|layer| *layer < depth)
+        .ok_or_else(|| {
+            Error::UnsupportedArchitecture(format!(
+                "{label} layer {layer} is outside vision depth {depth}"
+            ))
+        })
 }
 
 fn default_vision_depth() -> i32 {
@@ -558,7 +806,7 @@ pub(crate) struct VisionOutput {
 }
 
 #[derive(Debug, Clone, ModuleParameters)]
-/// Pinned Qwen3-VL vision modules surrounding the windowed transformer blocks.
+/// Pinned Qwen vision modules surrounding the scheduled transformer blocks.
 pub(crate) struct QwenVisionLayerwiseStatic {
     pub(crate) config: VisionConfig,
     #[param]
@@ -569,6 +817,7 @@ pub(crate) struct QwenVisionLayerwiseStatic {
     pub(crate) merger: QwenVisionPatchMerger,
     #[param]
     pub(crate) deepstack_merger_list: Vec<QwenVisionPatchMerger>,
+    mode: VisionMode,
 }
 
 /// Per-input rotary, window, and DeepStack state for layerwise vision execution.
@@ -595,6 +844,7 @@ impl QwenVisionLayerwiseStatic {
             patch_embed: transformer.patch_embed,
             merger: transformer.merger,
             deepstack_merger_list: transformer.deepstack_merger_list,
+            mode: transformer.mode,
         }
     }
 
@@ -624,8 +874,18 @@ impl QwenVisionLayerwiseStatic {
             )));
         }
         let merge_unit = self.config.spatial_merge_size * self.config.spatial_merge_size;
-        let window_index = (0..seq_len / merge_unit).collect::<Vec<_>>();
-        let window_chunk_lengths = full_chunk_lengths.clone();
+        let (window_index, window_chunk_lengths) = match self.mode {
+            VisionMode::Windowed => vision_window_index(
+                &grid,
+                self.config.spatial_merge_size,
+                self.config.window_size,
+                self.config.patch_size,
+            )?,
+            VisionMode::Deepstack => (
+                (0..seq_len / merge_unit).collect::<Vec<_>>(),
+                full_chunk_lengths.clone(),
+            ),
+        };
         let window_index_array = Array::from_slice(&window_index, &[window_index.len() as i32]);
         hidden = hidden.reshape(&[seq_len / merge_unit, merge_unit, -1], stream)?;
         hidden = hidden.try_index_device((&window_index_array, .., ..), stream)?;
@@ -663,10 +923,15 @@ impl QwenVisionLayerwiseStatic {
         state: &QwenVisionLayerwiseState,
         stream: &Stream,
     ) -> Result<Array, Exception> {
-        let chunks = if self.config.fullatt_block_indexes.contains(&(index as i32)) {
-            &state.full_chunk_lengths
-        } else {
-            &state.window_chunk_lengths
+        let policy = self.config.layer_policy(index).ok_or_else(|| {
+            Exception::custom(format!(
+                "Qwen VL vision block {index} is outside the configured {}-layer schedule",
+                self.config.layer_count()
+            ))
+        })?;
+        let chunks = match policy.attention {
+            VisionAttentionPolicy::Full => &state.full_chunk_lengths,
+            VisionAttentionPolicy::Windowed => &state.window_chunk_lengths,
         };
         block.forward(hidden, chunks, &state.cos, &state.sin, stream)
     }
@@ -678,14 +943,22 @@ impl QwenVisionLayerwiseStatic {
         state: &mut QwenVisionLayerwiseState,
         stream: &Stream,
     ) -> Result<(), Exception> {
-        if let Some(merger_index) = self
-            .config
-            .deepstack_visual_indexes
-            .iter()
-            .position(|&layer| layer == index as i32)
-        {
+        let policy = self.config.layer_policy(index).ok_or_else(|| {
+            Exception::custom(format!(
+                "Qwen VL vision block {index} is outside the configured {}-layer schedule",
+                self.config.layer_count()
+            ))
+        })?;
+        if let Some(merger_index) = policy.deepstack_merger {
+            let merger_index = merger_index as usize;
             state.deepstack_features.push(
-                self.deepstack_merger_list[merger_index]
+                self.deepstack_merger_list
+                    .get_mut(merger_index)
+                    .ok_or_else(|| {
+                        Exception::custom(format!(
+                            "Qwen VL vision layer {index} selects missing DeepStack merger {merger_index}"
+                        ))
+                    })?
                     .forward(hidden, stream)?
                     .try_index_device((NewAxis, .., ..), stream)?,
             );
@@ -749,6 +1022,7 @@ impl QwenVisionTransformer {
         mode: VisionMode,
         stream: &Stream,
     ) -> Result<Self, Exception> {
+        config.validate_for_mode(mode)?;
         if config.spatial_merge_size <= 0 {
             return Err(Exception::custom(
                 "Qwen VL vision spatial_merge_size must be positive",
@@ -761,15 +1035,13 @@ impl QwenVisionTransformer {
             stream,
         )?;
         let patch_embed = QwenVisionPatchEmbed::new(&config, stream)?;
-        let mut blocks = Vec::with_capacity(config.depth as usize);
-        for _ in 0..config.depth {
+        let mut blocks = Vec::with_capacity(config.layer_count());
+        for _ in 0..config.layer_count() {
             blocks.push(QwenVisionBlock::new(&config, stream)?);
         }
         let merger =
             QwenVisionPatchMerger::new(&config, false, mode == VisionMode::Windowed, stream)?;
-        let deepstack_merger_list = config
-            .deepstack_visual_indexes
-            .iter()
+        let deepstack_merger_list = (0..config.deepstack_layer_count())
             .map(|_| QwenVisionPatchMerger::new(&config, true, false, stream))
             .collect::<Result<Vec<_>, _>>()?;
         Ok(Self {
@@ -886,23 +1158,27 @@ impl QwenVisionTransformer {
 
         let mut deepstack_features = Vec::new();
         for (layer_num, block) in self.blocks.iter_mut().enumerate() {
-            let chunk_lengths = if self
-                .config
-                .fullatt_block_indexes
-                .contains(&(layer_num as i32))
-            {
-                &full_chunk_lengths
-            } else {
-                &window_chunk_lengths
+            let policy = self.config.layer_policy(layer_num).ok_or_else(|| {
+                Exception::custom(format!(
+                    "Qwen VL vision block {layer_num} is outside the configured {}-layer schedule",
+                    self.config.layer_count()
+                ))
+            })?;
+            let chunk_lengths = match policy.attention {
+                VisionAttentionPolicy::Full => &full_chunk_lengths,
+                VisionAttentionPolicy::Windowed => &window_chunk_lengths,
             };
             hidden_states = block.forward(hidden_states, chunk_lengths, &cos, &sin, stream)?;
-            if let Some(index) = self
-                .config
-                .deepstack_visual_indexes
-                .iter()
-                .position(|&index| index == layer_num as i32)
-            {
-                let feature = self.deepstack_merger_list[index]
+            if let Some(merger_index) = policy.deepstack_merger {
+                let merger_index = merger_index as usize;
+                let feature = self
+                    .deepstack_merger_list
+                    .get_mut(merger_index)
+                    .ok_or_else(|| {
+                        Exception::custom(format!(
+                            "Qwen VL vision layer {layer_num} selects missing DeepStack merger {merger_index}"
+                        ))
+                    })?
                     .forward(&hidden_states, stream)?
                     .try_index_device((NewAxis, .., ..), stream)?;
                 deepstack_features.push(feature);
@@ -1236,4 +1512,85 @@ fn vision_rotary_embeddings(
         Array::from_slice(&cos_values, &[seq_len, head_dim]),
         Array::from_slice(&sin_values, &[seq_len, head_dim]),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn source(depth: i32, full: Option<Vec<i32>>, deepstack: Vec<i32>) -> VisionConfigSource {
+        VisionConfigSource {
+            depth,
+            hidden_size: 8,
+            hidden_act: "gelu_pytorch_tanh".into(),
+            intermediate_size: 16,
+            num_heads: 2,
+            num_position_embeddings: 16,
+            in_channels: 3,
+            patch_size: 2,
+            spatial_merge_size: 2,
+            temporal_patch_size: 2,
+            window_size: None,
+            out_hidden_size: 12,
+            fullatt_block_indexes: full,
+            deepstack_visual_indexes: Some(deepstack),
+        }
+    }
+
+    #[test]
+    fn qwen3_vl_normalizes_full_attention_and_ordered_deepstack() {
+        let config = source(4, None, vec![2, 0]).normalize_qwen3_vl().unwrap();
+        assert_eq!(config.layer_count(), 4);
+        assert!(config
+            .layer_schedule
+            .iter()
+            .all(|policy| policy.attention == VisionAttentionPolicy::Full));
+        assert_eq!(config.deepstack_layers(), vec![2, 0]);
+        assert_eq!(config.layer_schedule_fingerprint(), "fd1,f,fd0,f");
+        assert!(config.layer_policy(4).is_none());
+    }
+
+    #[test]
+    fn qwen3_5_normalizes_arbitrary_attention_and_deepstack_policies() {
+        let config = source(4, Some(vec![3, 1]), vec![2])
+            .normalize_qwen3_5()
+            .unwrap();
+        assert_eq!(config.layer_schedule_fingerprint(), "w,f,wd0,f");
+        assert_eq!(config.deepstack_layers(), vec![2]);
+    }
+
+    #[test]
+    fn vision_schedule_validation_rejects_conflicts_and_bad_layer_indexes() {
+        let conflict = source(2, Some(vec![0]), Vec::new())
+            .normalize_qwen3_vl()
+            .unwrap_err()
+            .to_string();
+        assert!(conflict.contains("must not define window_size or fullatt_block_indexes"));
+
+        let duplicate = source(2, Some(vec![0, 0]), Vec::new())
+            .normalize_qwen3_5()
+            .unwrap_err()
+            .to_string();
+        assert!(duplicate.contains("duplicated"));
+
+        let out_of_range = source(2, Some(vec![0]), vec![2])
+            .normalize_qwen3_5()
+            .unwrap_err()
+            .to_string();
+        assert!(out_of_range.contains("outside vision depth 2"));
+    }
+
+    #[test]
+    fn ordered_policy_changes_vision_fingerprint() {
+        let first = source(4, Some(vec![0, 2]), vec![1])
+            .normalize_qwen3_5()
+            .unwrap();
+        let second = source(4, Some(vec![1, 2]), vec![0])
+            .normalize_qwen3_5()
+            .unwrap();
+        assert_ne!(
+            first.layer_schedule_fingerprint(),
+            second.layer_schedule_fingerprint()
+        );
+    }
 }

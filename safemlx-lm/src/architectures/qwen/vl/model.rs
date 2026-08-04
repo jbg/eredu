@@ -20,7 +20,10 @@ use safemlx::{
 };
 use serde_json::Value;
 
-pub use super::vision::{QwenVisionTransformer, VisionConfig};
+use super::vision::VisionConfigSource;
+pub use super::vision::{
+    QwenVisionTransformer, VisionAttentionPolicy, VisionConfig, VisionLayerPolicy,
+};
 
 use crate::{
     api::{
@@ -80,10 +83,12 @@ fn parse_model_args_value(mut value: Value) -> Result<ModelArgs, Error> {
         .ok_or_else(|| {
             Error::UnsupportedArchitecture("qwen3_vl config is missing video_token_id".into())
         })?;
-    let vision_config: VisionConfig =
-        serde_json::from_value(object.get("vision_config").cloned().ok_or_else(|| {
+    let vision_config = serde_json::from_value::<VisionConfigSource>(
+        object.get("vision_config").cloned().ok_or_else(|| {
             Error::UnsupportedArchitecture("qwen3_vl config is missing vision_config".into())
-        })?)?;
+        })?,
+    )?
+    .normalize_qwen3_vl()?;
     let top_level_quantization = object.get("quantization").cloned();
     let top_level_quantization_config = object.get("quantization_config").cloned();
     let mut text_value = object.get("text_config").cloned().ok_or_else(|| {
@@ -161,8 +166,7 @@ pub(crate) fn model_args_from_config_value(config: &Value) -> Result<ModelArgs, 
 
 fn validate_qwen3_vl_model_args(args: &ModelArgs) -> Result<(), Error> {
     let vision = &args.vision_config;
-    if vision.depth <= 0
-        || vision.hidden_size <= 0
+    if vision.hidden_size <= 0
         || vision.intermediate_size <= 0
         || vision.num_heads <= 0
         || vision.num_position_embeddings <= 0
@@ -188,20 +192,6 @@ fn validate_qwen3_vl_model_args(args: &ModelArgs) -> Result<(), Error> {
             "qwen3_vl vision output size {} does not match text hidden size {}",
             vision.out_hidden_size, args.text_config.hidden_size
         )));
-    }
-    let mut unique = std::collections::BTreeSet::new();
-    for &index in &vision.deepstack_visual_indexes {
-        if index < 0 || index >= vision.depth {
-            return Err(Error::UnsupportedArchitecture(format!(
-                "qwen3_vl DeepStack layer {index} is outside vision depth {}",
-                vision.depth
-            )));
-        }
-        if !unique.insert(index) {
-            return Err(Error::UnsupportedArchitecture(format!(
-                "qwen3_vl DeepStack layer {index} is duplicated"
-            )));
-        }
     }
     Ok(())
 }
@@ -315,7 +305,7 @@ impl Model {
                 token_id: self.args.video_token_id,
             },
         ];
-        let deepstack_count = self.args.vision_config.deepstack_visual_indexes.len();
+        let deepstack_count = self.args.vision_config.deepstack_layer_count();
         let mut collected = (0..deepstack_count)
             .map(|_| Vec::new())
             .collect::<Vec<Vec<Array>>>();
@@ -853,10 +843,8 @@ pub(crate) fn load_qwen3_vl_gguf_checkpoint(
             continue;
         }
         for (name, value) in vision_materializer.converted_tensor(name)?.into_arrays() {
-            let name = translate_qwen3_vl_mmproj_name(
-                &name,
-                &model.args.vision_config.deepstack_visual_indexes,
-            );
+            let name =
+                translate_qwen3_vl_mmproj_name(&name, &model.args.vision_config.deepstack_layers());
             load_named_array_strict(&mut model, name, value, None, &config, &mut report)?;
         }
     }
@@ -950,8 +938,44 @@ pub(crate) fn qwen3_vl_args_from_gguf_catalog(
             position_layout.shape
         )));
     }
+    let depth = dense_qwen::gguf_i32_catalog(vision_metadata, "clip.vision.block_count")?;
+    let depth = usize::try_from(depth)
+        .ok()
+        .filter(|depth| *depth > 0)
+        .ok_or_else(|| {
+            Error::UnsupportedArchitecture("qwen3vl GGUF vision depth must be positive".into())
+        })?;
+    let mut layer_policies = vec![
+        VisionLayerPolicy {
+            attention: VisionAttentionPolicy::Full,
+            deepstack_merger: None,
+        };
+        depth
+    ];
+    let mut seen = std::collections::BTreeSet::new();
+    for (merger, layer) in deepstack_visual_indexes.into_iter().enumerate() {
+        let index = usize::try_from(layer)
+            .ok()
+            .filter(|index| *index < depth)
+            .ok_or_else(|| {
+                Error::UnsupportedArchitecture(format!(
+                    "qwen3vl GGUF DeepStack layer {layer} is outside vision depth {depth}"
+                ))
+            })?;
+        if !seen.insert(index) {
+            return Err(Error::UnsupportedArchitecture(format!(
+                "qwen3vl GGUF DeepStack layer {layer} is duplicated"
+            )));
+        }
+        layer_policies[index].deepstack_merger = Some(u32::try_from(merger).map_err(|_| {
+            Error::UnsupportedArchitecture("qwen3vl GGUF has too many DeepStack layers".into())
+        })?);
+    }
     let vision_config = VisionConfig {
-        depth: dense_qwen::gguf_i32_catalog(vision_metadata, "clip.vision.block_count")?,
+        layer_schedule: crate::runtime::attention::LayerSchedule::new(depth, layer_policies)
+            .map_err(|error| {
+                Error::UnsupportedArchitecture(format!("qwen3vl GGUF vision {error}"))
+            })?,
         hidden_size,
         hidden_act: "gelu_pytorch_tanh".into(),
         intermediate_size: dense_qwen::gguf_i32_catalog(
@@ -977,8 +1001,6 @@ pub(crate) fn qwen3_vl_args_from_gguf_catalog(
             vision_metadata,
             "clip.vision.projection_dim",
         )?,
-        fullatt_block_indexes: Vec::new(),
-        deepstack_visual_indexes,
     };
     validate_qwen3_vl_vision_geometry(&text_config, metadata, &vision_config)?;
     Ok(ModelArgs {
@@ -1023,8 +1045,7 @@ pub(crate) fn validate_qwen3_vl_vision_geometry(
     metadata: &HashMap<String, GgufMetadataValue>,
     vision_config: &VisionConfig,
 ) -> Result<(), Error> {
-    if vision_config.depth <= 0
-        || vision_config.hidden_size <= 0
+    if vision_config.hidden_size <= 0
         || vision_config.intermediate_size <= 0
         || vision_config.num_heads <= 0
         || vision_config.patch_size <= 0
@@ -1034,26 +1055,16 @@ pub(crate) fn validate_qwen3_vl_vision_geometry(
             "qwen3vl GGUF vision geometry must be positive".into(),
         ));
     }
-    if vision_config
-        .deepstack_visual_indexes
-        .iter()
-        .any(|&layer| layer < 0 || layer >= vision_config.depth)
-    {
-        return Err(Error::UnsupportedArchitecture(format!(
-            "qwen3vl GGUF DeepStack layers {:?} exceed vision depth {}",
-            vision_config.deepstack_visual_indexes, vision_config.depth
-        )));
-    }
     if let Some(value) = metadata.get("qwen3vl.n_deepstack_layers") {
         let expected = value.as_i64().ok_or_else(|| {
             Error::UnsupportedArchitecture(
                 "GGUF metadata key \"qwen3vl.n_deepstack_layers\" has the wrong type".into(),
             )
         })?;
-        if expected != vision_config.deepstack_visual_indexes.len() as i64 {
+        if expected != vision_config.deepstack_layer_count() as i64 {
             return Err(Error::UnsupportedArchitecture(format!(
                 "qwen3vl GGUF expects {expected} DeepStack layers, but its mmproj contains {}",
-                vision_config.deepstack_visual_indexes.len()
+                vision_config.deepstack_layer_count()
             )));
         }
     }
@@ -1284,7 +1295,14 @@ mod tests {
             quantized_weight_configs: None,
         };
         let vision_config = super::VisionConfig {
-            depth: 1,
+            layer_schedule: crate::runtime::attention::LayerSchedule::new(
+                1,
+                vec![super::VisionLayerPolicy {
+                    attention: super::VisionAttentionPolicy::Full,
+                    deepstack_merger: Some(0),
+                }],
+            )
+            .unwrap(),
             hidden_size: 8,
             hidden_act: "gelu_pytorch_tanh".into(),
             intermediate_size: 16,
@@ -1296,8 +1314,6 @@ mod tests {
             temporal_patch_size: 2,
             window_size: 8,
             out_hidden_size: 12,
-            fullatt_block_indexes: Vec::new(),
-            deepstack_visual_indexes: vec![0],
         };
         super::Model::new(
             super::ModelArgs {
@@ -1333,7 +1349,7 @@ mod tests {
         });
         let args = super::parse_model_args_value(config.clone()).unwrap();
         assert_eq!(args.text_config.hidden_size, 2048);
-        assert_eq!(args.vision_config.deepstack_visual_indexes, vec![5, 11, 17]);
+        assert_eq!(args.vision_config.deepstack_layers(), vec![5, 11, 17]);
         assert_eq!(args.mrope_section, vec![24, 20, 20]);
         assert!(args.text_config.quantization.is_none());
 
@@ -1372,7 +1388,7 @@ mod tests {
         assert_eq!(args.text_config.num_experts, 128);
         assert_eq!(args.text_config.num_experts_per_tok, 8);
         assert!(!args.text_config.tie_word_embeddings);
-        assert_eq!(args.vision_config.deepstack_visual_indexes, vec![8, 16, 24]);
+        assert_eq!(args.vision_config.deepstack_layers(), vec![8, 16, 24]);
     }
 
     #[test]

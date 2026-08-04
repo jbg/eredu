@@ -531,6 +531,21 @@ expert-parallel Qwen3-Next loading. Qwen3.5 dense and packed-MoE checkpoints use
 the same block loop. Multimodal checkpoints add an independent Qwen vision-block
 group and reuse the resident patch, position, and merger math around that group.
 
+The shared Qwen vision tower also normalizes once into
+`LayerSchedule<qwen::vl::vision::VisionLayerPolicy>`. A policy records full or
+spatial-window attention plus an optional exact DeepStack merger bank. Qwen3-VL
+creates an all-full vision schedule from Hugging Face or GGUF metadata and
+preserves the declared DeepStack source order; Qwen3.5 maps its positive
+`window_size` and full-attention block indexes into the same representation.
+Invalid, duplicate, or out-of-range layer indexes fail before materialization,
+and Qwen3-VL rejects Qwen3.5-only window fields. Resident execution, the
+independent bounded vision-block group, structural admission, name translation,
+and conservative tower-workspace accounting consume only the schedule. The old
+normalized vision `depth`, `fullatt_block_indexes`, and
+`deepstack_visual_indexes` fields have been removed. Persisted Qwen3-VL prompt
+caches remain unsupported because the schema does not capture multimodal
+prefill state.
+
 ## Layerwise safetensors coverage
 
 The table records the architecture inventory used by the normal and realtime
@@ -609,8 +624,8 @@ Gemma 4 estimates cover persistent state completely. Gemma's shared-KV layers
 and full-context backing for sliding-attention layers are accounted separately.
 Multimodal models additionally count persistent media embeddings, decoder
 positions, and a conservative media-tower execution workspace derived from the
-actual prepared tensors. Qwen uses its prepared `grid_thw`, full/window
-attention schedule, merger, and DeepStack outputs; Gemma 4 uses padded and
+actual prepared tensors. Qwen uses its prepared `grid_thw`, canonical per-layer
+vision attention/DeepStack schedule, and merger outputs; Gemma 4 uses padded and
 valid patch/audio geometry plus its loaded vision/audio tower configuration;
 Inkling uses the released hMLP fold shapes and dMel codebook/mask geometry.
 These requests report `Conservative`: decoder state remains exact under the

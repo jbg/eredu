@@ -511,6 +511,24 @@ not retained as compatibility paths. JSON callers use the architecture module's
 `model_args_from_config_value` function. `TransformerBlock::layer_type` is now
 `layer_policy`, and `Cache::new` returns a validation result.
 
+Qwen3-VL and Qwen3.5 vision blocks use
+`LayerSchedule<architectures::qwen::vl::vision::VisionLayerPolicy>`. Each entry
+independently identifies `VisionAttentionPolicy::{Full, Windowed}` and an
+optional DeepStack merger-bank index. Qwen3-VL Hugging Face and GGUF metadata
+normalize to an all-full attention schedule; `deepstack_visual_indexes` is
+validated for exact range and uniqueness, and its source order is preserved as
+the merger-bank mapping. Qwen3-VL rejects the Qwen3.5-only `window_size` and
+`fullatt_block_indexes` fields instead of silently ignoring them. Qwen3.5
+normalizes its positive window and exact full-attention block list into the same
+policy type.
+
+The schedule length is the sole vision depth after normalization. Resident and
+bounded vision execution, DeepStack capture, SafeTensors/GGUF structural plans,
+GGUF name translation, and prepared-input workspace accounting all use safe
+indexed policy access. Ordered schedule fingerprints include both attention and
+DeepStack choices. Qwen3-VL prompt-cache persistence remains unsupported; the
+decoder cache cannot be saved independently of its multimodal prefill state.
+
 Kimi Linear normalizes its orthogonal attention and feed-forward choices into
 `LayerSchedule<architectures::kimi_linear::model::LayerPolicy>`. Each entry
 contains `AttentionKind::{Kda, Mla}` and

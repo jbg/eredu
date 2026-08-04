@@ -4573,8 +4573,8 @@ fn tiny_qwen3_vl_mxfp4_on_load_quantizes_only_language_model() {
                 "depth":1,"hidden_size":8,"hidden_act":"gelu_pytorch_tanh",
                 "intermediate_size":16,"num_heads":2,"num_position_embeddings":16,
                 "in_channels":3,"patch_size":2,"spatial_merge_size":2,
-                "temporal_patch_size":2,"window_size":8,"out_hidden_size":32,
-                "fullatt_block_indexes":[],"deepstack_visual_indexes":[0]
+                "temporal_patch_size":2,"out_hidden_size":32,
+                "deepstack_visual_indexes":[0]
               }
             }"#,
     );

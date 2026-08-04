@@ -2034,9 +2034,12 @@ impl GeneralLayerwiseModelAdapter for QwenHybridLayerwiseAdapter {
 
     fn layer_count(&self, group: usize) -> Result<usize, Error> {
         match self.execution_group_id(group)?.as_str() {
-            "vision_encoder" => {
-                Ok(self.vision.as_ref().expect("vision group").config.depth as usize)
-            }
+            "vision_encoder" => Ok(self
+                .vision
+                .as_ref()
+                .expect("vision group")
+                .config
+                .layer_count()),
             "text_decoder" => Ok(self.args.num_hidden_layers as usize),
             _ => unreachable!(),
         }
@@ -2749,7 +2752,14 @@ mod tests {
         let gpu = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
         let cpu = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
         let vision = VisionConfig {
-            depth: 1,
+            layer_schedule: crate::runtime::attention::LayerSchedule::new(
+                1,
+                vec![crate::architectures::qwen::vl::vision::VisionLayerPolicy {
+                    attention: crate::architectures::qwen::vl::vision::VisionAttentionPolicy::Full,
+                    deepstack_merger: None,
+                }],
+            )
+            .unwrap(),
             hidden_size: 8,
             hidden_act: "silu".into(),
             intermediate_size: 4,
@@ -2761,8 +2771,6 @@ mod tests {
             temporal_patch_size: 1,
             window_size: 8,
             out_hidden_size: 16,
-            fullatt_block_indexes: vec![0],
-            deepstack_visual_indexes: Vec::new(),
         };
         let mut fixture = Model::new(
             args(false, false),

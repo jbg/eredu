@@ -23,6 +23,7 @@ use std::{cell::RefCell, collections::HashMap, path::Path, time::Instant};
 use tokenizers::Tokenizer;
 
 use crate::architectures::qwen::vl::vision::grid_thw_from_array;
+use crate::architectures::qwen::vl::vision::VisionConfigSource;
 #[cfg(test)]
 pub(crate) use crate::architectures::qwen::vl::vision::{reverse_permutation, vision_window_index};
 pub use crate::architectures::qwen::vl::vision::{
@@ -433,7 +434,7 @@ struct TopLevelConfig {
     #[serde(default)]
     text_config: Option<ModelArgsSource>,
     #[serde(default)]
-    vision_config: Option<VisionConfig>,
+    vision_config: Option<VisionConfigSource>,
     #[serde(default, deserialize_with = "deserialize_optional_fp8")]
     quantization_config: Option<QwenFp8QuantizationConfig>,
     #[serde(default)]
@@ -5000,11 +5001,15 @@ pub(crate) fn parse_qwen3_5_config_value(value: Value) -> Result<ParsedQwen35Con
             args.rope_parameters = Some(rope_parameters);
         }
     }
+    let vision_config = config
+        .vision_config
+        .map(VisionConfigSource::normalize_qwen3_5)
+        .transpose()?;
     Ok((
         args,
         config.image_token_id,
         config.video_token_id,
-        config.vision_config,
+        vision_config,
     ))
 }
 
@@ -5951,7 +5956,14 @@ mod tests {
 
     fn tiny_vision_config(out_hidden_size: i32) -> VisionConfig {
         VisionConfig {
-            depth: 1,
+            layer_schedule: LayerSchedule::new(
+                1,
+                vec![crate::architectures::qwen::vl::vision::VisionLayerPolicy {
+                    attention: crate::architectures::qwen::vl::vision::VisionAttentionPolicy::Full,
+                    deepstack_merger: None,
+                }],
+            )
+            .unwrap(),
             hidden_size: 8,
             hidden_act: "silu".to_string(),
             intermediate_size: 4,
@@ -5963,8 +5975,6 @@ mod tests {
             temporal_patch_size: 1,
             window_size: 8,
             out_hidden_size,
-            fullatt_block_indexes: vec![0],
-            deepstack_visual_indexes: Vec::new(),
         }
     }
 

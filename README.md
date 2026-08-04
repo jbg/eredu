@@ -77,10 +77,18 @@ SafeTensors and `qwen2` GGUF checkpoints, plus Kimi Linear SafeTensors and
 per-layer full/sliding attention with arbitrary GGUF Boolean layer patterns,
 standard tokenizer/chat sidecars, and resident or bounded weight residency;
 vision-language and MoE Qwen2 variants are rejected.
-LFM2/LFM2-MoE hybrid convolution/attention layouts use the same generic
-validated `LayerSchedule<P>` container with an LFM2-specific layer policy.
+LFM2/LFM2-MoE uses the same generic validated `LayerSchedule<P>` container.
+Each LFM2 policy independently records convolution versus full attention and
+dense versus sparse-MoE feed-forward execution, so runtime and bounded expert
+routes support arbitrary internal combinations without a dense-prefix fallback.
 Qwen3.5/Qwen3-Next likewise normalize full self-attention and recurrent linear
 attention into an ordered Qwen hybrid layer schedule before execution.
+Qwen3-VL vision now uses the same generic schedule container with a
+vision-specific policy. Every ordered entry records full versus spatial-window
+attention and an optional exact DeepStack merger bank. Qwen3-VL normalizes to
+full attention at every vision block; Qwen3.5 retains its configured
+full/window topology. Resident, bounded, structural, and workspace paths query
+only that schedule, and the old normalized depth and layer-index lists are gone.
 Nemotron-H completes the four-operator pilot with an ordered schedule covering
 Mamba, full or sliding self-attention, dense MLP, and sparse MoE layers; the
 same schedule drives cache identity, bounded recurrent/KV state, and stateless

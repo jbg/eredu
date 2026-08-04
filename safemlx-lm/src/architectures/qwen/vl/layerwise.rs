@@ -284,7 +284,7 @@ pub(crate) fn load_qwen3_vl_gguf_layerwise_model(
         vision_checkpoint,
         vision_metadata,
     )?;
-    let deepstack = prepared.args.vision_config.deepstack_visual_indexes.clone();
+    let deepstack = prepared.args.vision_config.deepstack_layers();
     let store: Arc<dyn WeightStore + Send + Sync> = Arc::new(
         GgufWeightStore::builder()
             .max_cached_readers(residency.max_mapped_shards())?
@@ -818,7 +818,7 @@ impl GeneralLayerwiseModelAdapter for Qwen3VlLayerwiseAdapter {
 
     fn layer_count(&self, group: usize) -> Result<usize, Error> {
         match group {
-            0 => Ok(self.args.vision_config.depth as usize),
+            0 => Ok(self.args.vision_config.layer_count()),
             1 => Ok(self.args.text_config.num_hidden_layers as usize),
             _ => Err(Error::UnsupportedArchitecture(format!(
                 "Qwen3-VL has no execution group {group}"
@@ -1248,9 +1248,7 @@ mod tests {
                 "patch_size": 2,
                 "spatial_merge_size": 2,
                 "temporal_patch_size": 2,
-                "window_size": 8,
                 "out_hidden_size": 12,
-                "fullatt_block_indexes": [1],
                 "deepstack_visual_indexes": [0]
             }
         })
