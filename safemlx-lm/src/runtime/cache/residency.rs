@@ -8,6 +8,7 @@ use std::{
     collections::{BTreeMap, HashMap},
     fs::{self, File},
     io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write},
+    num::NonZeroU32,
     panic::{catch_unwind, AssertUnwindSafe},
     path::{Component, Path, PathBuf},
     sync::{
@@ -24,9 +25,12 @@ use safemlx::{transforms::eval, Array, Device, DeviceType, Dtype, Stream};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::runtime::residency::policy::CacheEvictionPolicy;
+use crate::runtime::{
+    attention::{AttentionPolicy, LayerSchedule},
+    residency::policy::CacheEvictionPolicy,
+};
 
-const PROMPT_CACHE_SCHEMA_VERSION: u32 = 2;
+const PROMPT_CACHE_SCHEMA_VERSION: u32 = 3;
 const MAX_PROMPT_CACHE_SHARD_HEADER_BYTES: u64 = 1024 * 1024;
 const PROMPT_CACHE_GENERATIONS_DIRECTORY: &str = ".generations";
 const PROMPT_CACHE_CURRENT_FILE: &str = "CURRENT";
@@ -2491,12 +2495,17 @@ impl CacheResidencyManager {
         if descriptor.layer_count == 0
             || descriptor.global_layer_start >= descriptor.global_layer_end
             || descriptor.global_layer_end > descriptor.layer_count
+            || descriptor.layer_layout.len()
+                != descriptor.global_layer_end - descriptor.global_layer_start
             || descriptor.batch_size == 0
             || descriptor.batch_size > i32::MAX as usize
         {
             return Err(CacheResidencyError::MalformedManifest(
                 "invalid prompt-cache descriptor dimensions".into(),
             ));
+        }
+        for policy in descriptor.layer_layout.iter() {
+            validate_layer_cache_policy(policy)?;
         }
         let parent = destination.parent().ok_or_else(|| {
             CacheResidencyError::InvalidPromptCachePath(destination.to_path_buf())
@@ -2558,12 +2567,7 @@ impl CacheResidencyManager {
                 }
                 state.blocks.values().cloned().collect::<Vec<_>>()
             };
-            validate_complete_prefix(
-                &records,
-                descriptor.global_layer_start,
-                descriptor.global_layer_end,
-                prefix_token_ids.len(),
-            )?;
+            validate_complete_prefix(&records, &descriptor, prefix_token_ids.len())?;
             let mut manifest_blocks = Vec::with_capacity(records.len());
             let mut logical_bytes = 0u64;
             for (index, record) in records.iter().enumerate() {
@@ -2613,7 +2617,7 @@ impl CacheResidencyManager {
                 batch_size: descriptor.batch_size,
                 total_prefix_tokens: prefix_token_ids.len(),
                 prefix_sha256: hash_token_ids(prefix_token_ids),
-                sliding_window: descriptor.sliding_window,
+                layer_layout: descriptor.layer_layout,
                 sink_tokens: descriptor.sink_tokens,
                 topology: descriptor.topology,
                 application_namespace: options.application_namespace.clone(),
@@ -2717,8 +2721,151 @@ impl Drop for CacheBlockLease {
     }
 }
 
+/// Exact state kind, attention policy, and tensor geometry for one decoder layer.
+#[derive(Debug, Clone, Eq, Hash, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LayerCachePolicy {
+    /// This layer contributes no independently persisted attention state.
+    NoState,
+    /// Ordinary attention keys and values.
+    KeyValue {
+        /// Exact full or sliding attention range for this layer.
+        attention: AttentionPolicy,
+        /// Rank-local key/value head count.
+        num_key_value_heads: NonZeroU32,
+        /// Per-head key/value dimension.
+        head_dim: NonZeroU32,
+    },
+    /// DeepSeek compressed latent state plus rotary keys.
+    CompressedLatentRotary {
+        /// Exact full or sliding attention range for this layer.
+        attention: AttentionPolicy,
+        /// Compressed latent width.
+        latent_dim: NonZeroU32,
+        /// Rotary-key width.
+        rotary_dim: NonZeroU32,
+    },
+}
+
+impl LayerCachePolicy {
+    /// Constructs validated ordinary key/value state geometry.
+    pub fn key_value(
+        attention: AttentionPolicy,
+        num_key_value_heads: i32,
+        head_dim: i32,
+    ) -> Result<Self, CacheResidencyError> {
+        Ok(Self::KeyValue {
+            attention,
+            num_key_value_heads: positive_u32(num_key_value_heads, "key/value head count")?,
+            head_dim: positive_u32(head_dim, "key/value head dimension")?,
+        })
+    }
+
+    /// Constructs validated compressed-latent state geometry.
+    pub fn compressed_latent_rotary(
+        attention: AttentionPolicy,
+        latent_dim: i32,
+        rotary_dim: i32,
+    ) -> Result<Self, CacheResidencyError> {
+        Ok(Self::CompressedLatentRotary {
+            attention,
+            latent_dim: positive_u32(latent_dim, "compressed latent dimension")?,
+            rotary_dim: positive_u32(rotary_dim, "rotary-key dimension")?,
+        })
+    }
+
+    /// Returns the exact attention policy when this layer owns attention state.
+    pub const fn attention(&self) -> Option<AttentionPolicy> {
+        match self {
+            Self::NoState => None,
+            Self::KeyValue { attention, .. } | Self::CompressedLatentRotary { attention, .. } => {
+                Some(*attention)
+            }
+        }
+    }
+}
+
+fn positive_u32(value: i32, field: &str) -> Result<NonZeroU32, CacheResidencyError> {
+    u32::try_from(value)
+        .ok()
+        .and_then(NonZeroU32::new)
+        .ok_or_else(|| {
+            CacheResidencyError::InvalidOptions(format!(
+                "prompt-cache {field} must be positive and fit u32, got {value}"
+            ))
+        })
+}
+
+fn attention_policy_from_sliding_window(
+    window: Option<i32>,
+) -> Result<AttentionPolicy, CacheResidencyError> {
+    match window {
+        None => Ok(AttentionPolicy::Full),
+        Some(window) => {
+            let window = u32::try_from(window)
+                .ok()
+                .and_then(NonZeroU32::new)
+                .ok_or_else(|| {
+                    CacheResidencyError::InvalidOptions(format!(
+                        "attention sliding window must be positive and fit u32, got {window}"
+                    ))
+                })?;
+            Ok(AttentionPolicy::Sliding { window })
+        }
+    }
+}
+
+fn attention_policy_sliding_window_i32(
+    attention: AttentionPolicy,
+) -> Result<Option<i32>, CacheResidencyError> {
+    attention
+        .window()
+        .map(|window| {
+            i32::try_from(window.get()).map_err(|_| {
+                CacheResidencyError::IncompatiblePromptCache(format!(
+                    "attention sliding window {window} exceeds the runtime i32 range"
+                ))
+            })
+        })
+        .transpose()
+}
+
+fn validate_layer_cache_policy(policy: &LayerCachePolicy) -> Result<(), CacheResidencyError> {
+    if let Some(attention) = policy.attention() {
+        attention_policy_sliding_window_i32(attention)?;
+    }
+    let validate_dimension = |dimension: NonZeroU32| {
+        if dimension.get() > i32::MAX as u32 {
+            Err(CacheResidencyError::IncompatiblePromptCache(format!(
+                "prompt-cache layer dimension {dimension} exceeds the runtime i32 range"
+            )))
+        } else {
+            Ok(())
+        }
+    };
+    match policy {
+        LayerCachePolicy::NoState => Ok(()),
+        LayerCachePolicy::KeyValue {
+            num_key_value_heads,
+            head_dim,
+            ..
+        } => {
+            validate_dimension(*num_key_value_heads)?;
+            validate_dimension(*head_dim)
+        }
+        LayerCachePolicy::CompressedLatentRotary {
+            latent_dim,
+            rotary_dim,
+            ..
+        } => {
+            validate_dimension(*latent_dim)?;
+            validate_dimension(*rotary_dim)
+        }
+    }
+}
+
 /// Compatibility identity supplied by a model when persisting a prefix cache.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Eq, Hash, PartialEq)]
 pub struct PromptCacheDescriptor {
     /// Stable architecture family, such as `llama` or `deepseek_v3`.
     pub model_family: String,
@@ -2736,8 +2883,8 @@ pub struct PromptCacheDescriptor {
     pub global_layer_end: usize,
     /// Prefix batch size.
     pub batch_size: usize,
-    /// Sliding attention window, when present.
-    pub sliding_window: Option<i32>,
+    /// Exact ordered cache state and attention layout for the owned layer range.
+    pub layer_layout: LayerSchedule<LayerCachePolicy>,
     /// Attention sink or pinned-prefix token count.
     pub sink_tokens: usize,
     /// Distributed rank-local layout.
@@ -2745,7 +2892,7 @@ pub struct PromptCacheDescriptor {
 }
 
 /// Cache-relevant structure derived from a loaded model instance.
-#[derive(Debug, Clone, Eq, PartialEq)]
+#[derive(Debug, Clone, Eq, Hash, PartialEq)]
 pub(crate) struct PromptCacheModelIdentity {
     pub(crate) model_family: String,
     pub(crate) effective_model_type: String,
@@ -2753,52 +2900,44 @@ pub(crate) struct PromptCacheModelIdentity {
     pub(crate) layer_count: usize,
     pub(crate) global_layer_start: usize,
     pub(crate) global_layer_end: usize,
-    pub(crate) sliding_window: Option<i32>,
     pub(crate) sink_tokens: usize,
     pub(crate) topology: PromptCacheTopology,
-    pub(crate) layer_layouts: Vec<PromptCacheLayerLayout>,
-}
-
-/// Exact cache tensor layout expected by one model-owned decoder layer.
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub(crate) enum PromptCacheLayerLayout {
-    KeyValue {
-        num_key_value_heads: i32,
-        head_dim: i32,
-    },
-    CompressedLatentRotary {
-        latent_dim: i32,
-        rotary_dim: i32,
-    },
+    pub(crate) layer_layout: LayerSchedule<LayerCachePolicy>,
 }
 
 impl PromptCacheModelIdentity {
     pub(crate) fn key_value_layouts(
-        layer_count: usize,
+        sliding_windows: impl IntoIterator<Item = Option<i32>>,
         num_key_value_heads: i32,
         head_dim: i32,
-    ) -> Vec<PromptCacheLayerLayout> {
-        vec![
-            PromptCacheLayerLayout::KeyValue {
-                num_key_value_heads,
-                head_dim,
-            };
-            layer_count
-        ]
+    ) -> Result<LayerSchedule<LayerCachePolicy>, CacheResidencyError> {
+        let policies = sliding_windows
+            .into_iter()
+            .map(|window| {
+                let attention = attention_policy_from_sliding_window(window)?;
+                LayerCachePolicy::key_value(attention, num_key_value_heads, head_dim)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        LayerSchedule::new(policies.len(), policies)
+            .map_err(|error| CacheResidencyError::InvalidOptions(error.to_string()))
     }
 
     pub(crate) fn compressed_layouts(
         layer_count: usize,
         latent_dim: i32,
         rotary_dim: i32,
-    ) -> Vec<PromptCacheLayerLayout> {
-        vec![
-            PromptCacheLayerLayout::CompressedLatentRotary {
-                latent_dim,
-                rotary_dim,
-            };
-            layer_count
-        ]
+    ) -> Result<LayerSchedule<LayerCachePolicy>, CacheResidencyError> {
+        let policies = (0..layer_count)
+            .map(|_| {
+                LayerCachePolicy::compressed_latent_rotary(
+                    AttentionPolicy::Full,
+                    latent_dim,
+                    rotary_dim,
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        LayerSchedule::new(layer_count, policies)
+            .map_err(|error| CacheResidencyError::InvalidOptions(error.to_string()))
     }
 }
 
@@ -2822,9 +2961,9 @@ pub(crate) fn validate_prompt_cache_model_identity(
     require_model_equal!(layer_count);
     require_model_equal!(global_layer_start);
     require_model_equal!(global_layer_end);
-    require_model_equal!(sliding_window);
     require_model_equal!(sink_tokens);
     require_model_equal!(topology);
+    require_model_equal!(layer_layout);
     let owned_layers = model
         .global_layer_end
         .checked_sub(model.global_layer_start)
@@ -2833,10 +2972,10 @@ pub(crate) fn validate_prompt_cache_model_identity(
                 "loaded model has an invalid prompt-cache layer range".into(),
             )
         })?;
-    if model.layer_layouts.len() != owned_layers {
+    if model.layer_layout.len() != owned_layers {
         return Err(CacheResidencyError::IncompatiblePromptCache(format!(
             "loaded model supplied {} cache layouts for {owned_layers} owned layers",
-            model.layer_layouts.len()
+            model.layer_layout.len()
         )));
     }
     Ok(())
@@ -2872,7 +3011,7 @@ fn hash_fingerprint_component(hasher: &mut Sha256, value: &[u8]) {
 }
 
 /// Rank-local topology recorded in a prompt-cache manifest.
-#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Eq, Hash, PartialEq, Serialize, Deserialize)]
 pub struct PromptCacheTopology {
     /// Pipeline world size and rank.
     pub pipeline: Option<(usize, usize)>,
@@ -2905,7 +3044,7 @@ pub struct PromptCacheOptions {
 }
 
 /// Versioned metadata that can be inspected without loading block arrays.
-#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Eq, Hash, PartialEq, Serialize, Deserialize)]
 pub struct PromptCacheManifest {
     /// Persistence schema version.
     pub schema_version: u32,
@@ -2931,8 +3070,8 @@ pub struct PromptCacheManifest {
     pub total_prefix_tokens: usize,
     /// SHA-256 over little-endian prefix token ids.
     pub prefix_sha256: String,
-    /// Sliding attention window, when applicable.
-    pub sliding_window: Option<i32>,
+    /// Exact ordered cache state, attention policy, and tensor geometry.
+    pub layer_layout: LayerSchedule<LayerCachePolicy>,
     /// Pinned prefix or sink token count.
     pub sink_tokens: usize,
     /// Distributed rank-local representation.
@@ -2944,7 +3083,7 @@ pub struct PromptCacheManifest {
 }
 
 /// One cache block catalog entry in a prompt-cache manifest.
-#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Eq, Hash, PartialEq, Serialize, Deserialize)]
 pub struct PromptCacheBlock {
     /// Architecture-global layer identity.
     pub global_layer: usize,
@@ -2973,7 +3112,6 @@ pub struct PromptCacheBlock {
     /// Logical bytes in both arrays.
     pub logical_bytes: u64,
     /// SHA-256 of the exact safetensors payload bytes.
-    #[serde(default)]
     pub payload_sha256: String,
 }
 
@@ -2991,8 +3129,22 @@ pub fn inspect_prompt_cache(
                 source,
             })?,
         );
-    let manifest: PromptCacheManifest =
+    let value: serde_json::Value =
         serde_json::from_reader(reader).map_err(CacheResidencyError::ManifestJson)?;
+    let schema_version = value
+        .get("schema_version")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|version| u32::try_from(version).ok())
+        .ok_or_else(|| {
+            CacheResidencyError::MalformedManifest(
+                "prompt-cache schema_version is missing or is not a u32".into(),
+            )
+        })?;
+    if schema_version != PROMPT_CACHE_SCHEMA_VERSION {
+        return Err(CacheResidencyError::UnsupportedSchema(schema_version));
+    }
+    let manifest: PromptCacheManifest =
+        serde_json::from_value(value).map_err(CacheResidencyError::ManifestJson)?;
     validate_manifest(&directory, &manifest)?;
     Ok(manifest)
 }
@@ -3082,17 +3234,17 @@ fn validate_prompt_cache_layer_layouts(
                 "loaded model has an invalid prompt-cache layer range".into(),
             )
         })?;
-    if model.layer_layouts.len() != owned_layers {
+    if model.layer_layout.len() != owned_layers {
         return Err(CacheResidencyError::IncompatiblePromptCache(format!(
             "loaded model supplied {} cache layouts for {owned_layers} owned layers",
-            model.layer_layouts.len()
+            model.layer_layout.len()
         )));
     }
     for block in &manifest.blocks {
         let layout_index = block
             .global_layer
             .checked_sub(model.global_layer_start)
-            .filter(|index| *index < model.layer_layouts.len())
+            .filter(|index| *index < model.layer_layout.len())
             .ok_or_else(|| {
                 CacheResidencyError::IncompatiblePromptCache(format!(
                     "cache block layer {} is not owned by the loaded model",
@@ -3110,22 +3262,44 @@ fn validate_prompt_cache_layer_layouts(
                 "prompt-cache batch size exceeds runtime dimensions".into(),
             )
         })?;
-        let (representation, first_shape, second_shape) = match model.layer_layouts[layout_index] {
-            PromptCacheLayerLayout::KeyValue {
+        let (representation, first_shape, second_shape) = match model
+            .layer_layout
+            .get(layout_index)
+            .expect("validated prompt-cache layout index")
+        {
+            LayerCachePolicy::NoState => {
+                return Err(CacheResidencyError::IncompatiblePromptCache(format!(
+                    "cache block unexpectedly materializes state for stateless layer {}",
+                    block.global_layer
+                )))
+            }
+            LayerCachePolicy::KeyValue {
                 num_key_value_heads,
                 head_dim,
+                ..
             } => (
                 CacheRepresentation::KeyValue,
-                vec![batch, num_key_value_heads, token_count, head_dim],
-                vec![batch, num_key_value_heads, token_count, head_dim],
+                vec![
+                    batch,
+                    num_key_value_heads.get() as i32,
+                    token_count,
+                    head_dim.get() as i32,
+                ],
+                vec![
+                    batch,
+                    num_key_value_heads.get() as i32,
+                    token_count,
+                    head_dim.get() as i32,
+                ],
             ),
-            PromptCacheLayerLayout::CompressedLatentRotary {
+            LayerCachePolicy::CompressedLatentRotary {
                 latent_dim,
                 rotary_dim,
+                ..
             } => (
                 CacheRepresentation::CompressedLatentRotary,
-                vec![batch, token_count, latent_dim],
-                vec![batch, token_count, rotary_dim],
+                vec![batch, token_count, latent_dim.get() as i32],
+                vec![batch, token_count, rotary_dim.get() as i32],
             ),
         };
         if block.representation != representation {
@@ -3218,7 +3392,7 @@ fn validate_compatibility(
     require_equal!(global_layer_start);
     require_equal!(global_layer_end);
     require_equal!(batch_size);
-    require_equal!(sliding_window);
+    require_equal!(layer_layout);
     require_equal!(sink_tokens);
     require_equal!(topology);
     if manifest.total_prefix_tokens != prefix_token_ids.len()
@@ -3242,6 +3416,7 @@ fn validate_manifest(
         || manifest.layer_count == 0
         || manifest.global_layer_start >= manifest.global_layer_end
         || manifest.global_layer_end > manifest.layer_count
+        || manifest.layer_layout.len() != manifest.global_layer_end - manifest.global_layer_start
         || manifest.batch_size == 0
         || manifest.batch_size > i32::MAX as usize
         || manifest.total_prefix_tokens == 0
@@ -3249,6 +3424,14 @@ fn validate_manifest(
         return Err(CacheResidencyError::MalformedManifest(
             "invalid global cache dimensions".into(),
         ));
+    }
+    for (index, policy) in manifest.layer_layout.iter().enumerate() {
+        validate_layer_cache_policy(policy).map_err(|error| {
+            CacheResidencyError::MalformedManifest(format!(
+                "invalid policy for global layer {}: {error}",
+                manifest.global_layer_start + index
+            ))
+        })?;
     }
     for (name, topology) in [
         ("pipeline", manifest.topology.pipeline),
@@ -3263,6 +3446,7 @@ fn validate_manifest(
     }
     let mut by_layer: BTreeMap<(usize, CacheRepresentation), Vec<&PromptCacheBlock>> =
         BTreeMap::new();
+    let mut previous_block = None;
     for block in &manifest.blocks {
         if block.global_layer < manifest.global_layer_start
             || block.global_layer >= manifest.global_layer_end
@@ -3277,6 +3461,83 @@ fn validate_manifest(
             return Err(CacheResidencyError::MalformedManifest(format!(
                 "invalid block at layer {} range {}..{}",
                 block.global_layer, block.start, block.end
+            )));
+        }
+        let order = (block.global_layer, block.start, block.end);
+        if previous_block.is_some_and(|previous| previous >= order) {
+            return Err(CacheResidencyError::MalformedManifest(format!(
+                "prompt-cache blocks are reordered or duplicated at layer {} range {}..{}",
+                block.global_layer, block.start, block.end
+            )));
+        }
+        previous_block = Some(order);
+        let policy = manifest
+            .layer_layout
+            .get(block.global_layer - manifest.global_layer_start)
+            .ok_or_else(|| {
+                CacheResidencyError::MalformedManifest(format!(
+                    "missing cache policy for global layer {}",
+                    block.global_layer
+                ))
+            })?;
+        let expected_representation = match policy {
+            LayerCachePolicy::NoState => {
+                return Err(CacheResidencyError::MalformedManifest(format!(
+                    "stateless global layer {} has an unexpected payload",
+                    block.global_layer
+                )))
+            }
+            LayerCachePolicy::KeyValue { .. } => CacheRepresentation::KeyValue,
+            LayerCachePolicy::CompressedLatentRotary { .. } => {
+                CacheRepresentation::CompressedLatentRotary
+            }
+        };
+        if block.representation != expected_representation {
+            return Err(CacheResidencyError::MalformedManifest(format!(
+                "global layer {} payload {:?} does not match policy {:?}",
+                block.global_layer, block.representation, policy
+            )));
+        }
+        let token_count = i32::try_from(block.end - block.start).map_err(|_| {
+            CacheResidencyError::MalformedManifest(format!(
+                "global layer {} block token count exceeds runtime dimensions",
+                block.global_layer
+            ))
+        })?;
+        let batch = i32::try_from(manifest.batch_size).expect("validated prompt-cache batch");
+        let (expected_first_shape, expected_second_shape) = match policy {
+            LayerCachePolicy::NoState => unreachable!(),
+            LayerCachePolicy::KeyValue {
+                num_key_value_heads,
+                head_dim,
+                ..
+            } => {
+                let shape = vec![
+                    batch,
+                    num_key_value_heads.get() as i32,
+                    token_count,
+                    head_dim.get() as i32,
+                ];
+                (shape.clone(), shape)
+            }
+            LayerCachePolicy::CompressedLatentRotary {
+                latent_dim,
+                rotary_dim,
+                ..
+            } => (
+                vec![batch, token_count, latent_dim.get() as i32],
+                vec![batch, token_count, rotary_dim.get() as i32],
+            ),
+        };
+        if block.first_shape != expected_first_shape || block.second_shape != expected_second_shape
+        {
+            return Err(CacheResidencyError::MalformedManifest(format!(
+                "global layer {} payload geometry {:?}/{:?} does not match policy geometry {:?}/{:?}",
+                block.global_layer,
+                block.first_shape,
+                block.second_shape,
+                expected_first_shape,
+                expected_second_shape
             )));
         }
         let expected_rank = CacheRankIdentity {
@@ -3346,11 +3607,23 @@ fn validate_manifest(
             .push(block);
     }
     for layer in manifest.global_layer_start..manifest.global_layer_end {
+        let policy = manifest
+            .layer_layout
+            .get(layer - manifest.global_layer_start)
+            .expect("validated prompt-cache layout length");
         let entries = by_layer
             .iter()
             .filter(|((entry_layer, _), _)| *entry_layer == layer)
             .flat_map(|(_, blocks)| blocks.iter().copied())
             .collect::<Vec<_>>();
+        if matches!(policy, LayerCachePolicy::NoState) {
+            if !entries.is_empty() {
+                return Err(CacheResidencyError::MalformedManifest(format!(
+                    "stateless global layer {layer} has unexpected blocks"
+                )));
+            }
+            continue;
+        }
         if entries.is_empty() {
             return Err(CacheResidencyError::MalformedManifest(format!(
                 "missing blocks for global layer {layer}"
@@ -3358,7 +3631,15 @@ fn validate_manifest(
         }
         let mut entries = entries;
         entries.sort_by_key(|block| block.start);
-        let mut expected_start = 0i64;
+        let required_start = required_persisted_start(policy, manifest.total_prefix_tokens)?;
+        let mut expected_start = entries[0].start;
+        if expected_start > required_start
+            || (matches!(policy.attention(), Some(AttentionPolicy::Full)) && expected_start != 0)
+        {
+            return Err(CacheResidencyError::MalformedManifest(format!(
+                "global layer {layer} starts at {expected_start}, but its policy requires history from {required_start}"
+            )));
+        }
         for block in entries {
             if block.start != expected_start {
                 return Err(CacheResidencyError::MalformedManifest(format!(
@@ -3380,8 +3661,7 @@ fn validate_manifest(
 
 fn validate_complete_prefix(
     records: &[CacheBlockRecord],
-    global_layer_start: usize,
-    global_layer_end: usize,
+    descriptor: &PromptCacheDescriptor,
     prefix_tokens: usize,
 ) -> Result<(), CacheResidencyError> {
     if prefix_tokens == 0 {
@@ -3390,20 +3670,97 @@ fn validate_complete_prefix(
         ));
     }
     if records.iter().any(|record| {
-        record.id.global_layer < global_layer_start || record.id.global_layer >= global_layer_end
+        record.id.global_layer < descriptor.global_layer_start
+            || record.id.global_layer >= descriptor.global_layer_end
     }) {
         return Err(CacheResidencyError::MalformedManifest(
             "cache contains blocks outside the persisted global layer range".into(),
         ));
     }
-    for layer in global_layer_start..global_layer_end {
+    for layer in descriptor.global_layer_start..descriptor.global_layer_end {
+        let policy = descriptor
+            .layer_layout
+            .get(layer - descriptor.global_layer_start)
+            .ok_or_else(|| {
+                CacheResidencyError::MalformedManifest(format!(
+                    "missing descriptor cache policy for global layer {layer}"
+                ))
+            })?;
         let mut blocks = records
             .iter()
             .filter(|record| record.id.global_layer == layer)
             .collect::<Vec<_>>();
+        if matches!(policy, LayerCachePolicy::NoState) {
+            if !blocks.is_empty() {
+                return Err(CacheResidencyError::MalformedManifest(format!(
+                    "stateless global layer {layer} has unexpected cache blocks"
+                )));
+            }
+            continue;
+        }
         blocks.sort_by_key(|record| record.id.start);
-        let mut end = 0i64;
+        if blocks.is_empty() {
+            return Err(CacheResidencyError::MalformedManifest(format!(
+                "global layer {layer} has no persisted cache blocks"
+            )));
+        }
+        let required_start = required_persisted_start(policy, prefix_tokens)?;
+        let mut end = blocks[0].id.start;
+        if end > required_start
+            || (matches!(policy.attention(), Some(AttentionPolicy::Full)) && end != 0)
+        {
+            return Err(CacheResidencyError::MalformedManifest(format!(
+                "global layer {layer} starts at {end}, but its policy requires history from {required_start}"
+            )));
+        }
         for block in blocks {
+            let expected_representation = match policy {
+                LayerCachePolicy::NoState => unreachable!(),
+                LayerCachePolicy::KeyValue { .. } => CacheRepresentation::KeyValue,
+                LayerCachePolicy::CompressedLatentRotary { .. } => {
+                    CacheRepresentation::CompressedLatentRotary
+                }
+            };
+            if block.id.representation != expected_representation {
+                return Err(CacheResidencyError::MalformedManifest(format!(
+                    "global layer {layer} cache representation does not match its policy"
+                )));
+            }
+            let token_count = i32::try_from(block.id.end - block.id.start).map_err(|_| {
+                CacheResidencyError::MalformedManifest(format!(
+                    "global layer {layer} block token count exceeds runtime dimensions"
+                ))
+            })?;
+            let batch = descriptor.batch_size as i32;
+            let (first_shape, second_shape) = match policy {
+                LayerCachePolicy::NoState => unreachable!(),
+                LayerCachePolicy::KeyValue {
+                    num_key_value_heads,
+                    head_dim,
+                    ..
+                } => {
+                    let shape = vec![
+                        batch,
+                        num_key_value_heads.get() as i32,
+                        token_count,
+                        head_dim.get() as i32,
+                    ];
+                    (shape.clone(), shape)
+                }
+                LayerCachePolicy::CompressedLatentRotary {
+                    latent_dim,
+                    rotary_dim,
+                    ..
+                } => (
+                    vec![batch, token_count, latent_dim.get() as i32],
+                    vec![batch, token_count, rotary_dim.get() as i32],
+                ),
+            };
+            if block.shapes != [first_shape, second_shape] {
+                return Err(CacheResidencyError::MalformedManifest(format!(
+                    "global layer {layer} live cache geometry does not match its persistence policy"
+                )));
+            }
             if block.id.start != end {
                 return Err(CacheResidencyError::MalformedManifest(format!(
                     "global layer {layer} has a gap or overlap at {end}"
@@ -3418,6 +3775,24 @@ fn validate_complete_prefix(
         }
     }
     Ok(())
+}
+
+fn required_persisted_start(
+    policy: &LayerCachePolicy,
+    total_prefix_tokens: usize,
+) -> Result<i64, CacheResidencyError> {
+    let total = i64::try_from(total_prefix_tokens).map_err(|_| {
+        CacheResidencyError::MalformedManifest(
+            "prompt-cache prefix length exceeds the runtime position range".into(),
+        )
+    })?;
+    match policy.attention() {
+        None | Some(AttentionPolicy::Full) => Ok(0),
+        Some(AttentionPolicy::Sliding { window }) => {
+            let retained_past = i64::from(window.get() - 1);
+            Ok((total - retained_past).max(0))
+        }
+    }
 }
 
 fn validate_block_arrays(
@@ -4510,20 +4885,22 @@ mod tests {
         durable_rename, hash_shard_payload, hash_token_ids, inspect_prompt_cache, live_block_paths,
         map_prompt_cache_shard, open_prompt_cache, publish_live_block_file,
         publish_prompt_cache_generation, safe_shard_path, validate_prompt_cache_model_identity,
-        verify_disk_payload, CacheBlockArrays, CacheBlockId, CacheBlockRecord,
+        verify_disk_payload, AttentionPolicy, CacheBlockArrays, CacheBlockId, CacheBlockRecord,
         CacheLayerResidencyStats, CacheRankIdentity, CacheRepresentation, CacheResidencyError,
         CacheResidencyManager, CacheTier, DiskLocation, DiskOperationKey, DiskOperationKind,
-        DiskResult, DiskTask, DiskWorker, DiskWriteCommit, HostWriteReservation, PagedCacheOptions,
-        PendingDiskOperation, PromptCacheBlock, PromptCacheDescriptor, PromptCacheManifest,
-        PromptCacheModelIdentity, PromptCacheTopology, TemporaryFileGuard,
-        CACHE_RESIDENCY_LAYER_REPORT_LIMIT, MAX_PROMPT_CACHE_SHARD_HEADER_BYTES,
-        PROMPT_CACHE_GENERATIONS_DIRECTORY, PROMPT_CACHE_SCHEMA_VERSION,
+        DiskResult, DiskTask, DiskWorker, DiskWriteCommit, HostWriteReservation, LayerCachePolicy,
+        LayerSchedule, PagedCacheOptions, PendingDiskOperation, PromptCacheBlock,
+        PromptCacheDescriptor, PromptCacheManifest, PromptCacheModelIdentity, PromptCacheTopology,
+        TemporaryFileGuard, CACHE_RESIDENCY_LAYER_REPORT_LIMIT,
+        MAX_PROMPT_CACHE_SHARD_HEADER_BYTES, PROMPT_CACHE_GENERATIONS_DIRECTORY,
+        PROMPT_CACHE_SCHEMA_VERSION,
     };
     use safemlx::{transforms::eval, Array, Device, DeviceType, Stream};
     use safetensors::tensor::{serialize_to_file, Dtype as StoredDtype, TensorView};
     use std::{
         fs,
         fs::OpenOptions,
+        hash::{DefaultHasher, Hash, Hasher},
         io::Write as _,
         path::Path,
         sync::{mpsc, Arc, OnceLock},
@@ -4600,10 +4977,22 @@ mod tests {
             global_layer_start: 0,
             global_layer_end: 1,
             batch_size: 1,
-            sliding_window: None,
+            layer_layout: PromptCacheModelIdentity::key_value_layouts([None], 1, 1).unwrap(),
             sink_tokens: 0,
             topology: PromptCacheTopology::default(),
         }
+    }
+
+    fn key_value_layout(
+        windows: impl IntoIterator<Item = Option<i32>>,
+    ) -> LayerSchedule<LayerCachePolicy> {
+        PromptCacheModelIdentity::key_value_layouts(windows, 1, 1).unwrap()
+    }
+
+    fn stable_hash(value: &impl Hash) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        value.hash(&mut hasher);
+        hasher.finish()
     }
 
     fn prompt_model_identity() -> PromptCacheModelIdentity {
@@ -4615,10 +5004,9 @@ mod tests {
             layer_count: descriptor.layer_count,
             global_layer_start: descriptor.global_layer_start,
             global_layer_end: descriptor.global_layer_end,
-            sliding_window: descriptor.sliding_window,
             sink_tokens: descriptor.sink_tokens,
             topology: descriptor.topology,
-            layer_layouts: PromptCacheModelIdentity::key_value_layouts(1, 1, 1),
+            layer_layout: descriptor.layer_layout,
         }
     }
 
@@ -4648,7 +5036,7 @@ mod tests {
             batch_size: 1,
             total_prefix_tokens: 1,
             prefix_sha256: hash_token_ids(&[7]),
-            sliding_window: None,
+            layer_layout: descriptor.layer_layout,
             sink_tokens: 0,
             topology: PromptCacheTopology::default(),
             application_namespace: Some(namespace.into()),
@@ -4689,6 +5077,146 @@ mod tests {
     fn prefix_hash_is_stable_and_order_sensitive() {
         assert_eq!(hash_token_ids(&[1, 2, 3]), hash_token_ids(&[1, 2, 3]));
         assert_ne!(hash_token_ids(&[1, 2, 3]), hash_token_ids(&[3, 2, 1]));
+    }
+
+    #[test]
+    fn ordered_layer_layout_round_trips_all_attention_patterns() {
+        let schedules = [
+            vec![None, None, None, None],
+            vec![Some(4), Some(4), Some(4), Some(4)],
+            vec![None, Some(4), None, Some(4)],
+            vec![Some(3), None, None, Some(9)],
+            vec![Some(2), Some(5), Some(11), None],
+        ];
+        for windows in schedules {
+            let layout = key_value_layout(windows);
+            let json = serde_json::to_string(&layout).unwrap();
+            let restored: LayerSchedule<LayerCachePolicy> = serde_json::from_str(&json).unwrap();
+            assert_eq!(restored, layout);
+        }
+    }
+
+    #[test]
+    fn attention_windows_reject_zero_negative_and_overflowing_sources() {
+        assert!(super::attention_policy_from_sliding_window(Some(0)).is_err());
+        assert!(super::attention_policy_from_sliding_window(Some(-1)).is_err());
+        for json in [
+            r#"{"sliding":{"window":0}}"#,
+            r#"{"sliding":{"window":-1}}"#,
+            r#"{"sliding":{"window":4294967296}}"#,
+        ] {
+            assert!(serde_json::from_str::<AttentionPolicy>(json).is_err());
+        }
+    }
+
+    #[test]
+    fn cache_identity_hashes_the_complete_ordered_layout() {
+        let base = prompt_descriptor();
+        let variants = [
+            key_value_layout([Some(4)]),
+            key_value_layout([Some(5)]),
+            key_value_layout([None]),
+            key_value_layout([None, Some(4)]),
+            LayerSchedule::new(1, vec![LayerCachePolicy::NoState]).unwrap(),
+            PromptCacheModelIdentity::compressed_layouts(1, 1, 1).unwrap(),
+        ];
+        let hashes = variants
+            .into_iter()
+            .map(|layer_layout| {
+                stable_hash(&PromptCacheDescriptor {
+                    layer_count: layer_layout.len(),
+                    global_layer_end: layer_layout.len(),
+                    layer_layout,
+                    ..base.clone()
+                })
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(hashes.len(), 6);
+
+        let first = key_value_layout([None, Some(4)]);
+        let reordered = key_value_layout([Some(4), None]);
+        assert_ne!(stable_hash(&first), stable_hash(&reordered));
+    }
+
+    #[test]
+    fn schema_v2_is_rejected_before_new_fields_are_decoded() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(
+            directory.path().join("manifest.json"),
+            br#"{"schema_version":2,"sliding_window":8}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            inspect_prompt_cache(directory.path()),
+            Err(CacheResidencyError::UnsupportedSchema(2))
+        ));
+    }
+
+    #[test]
+    fn manifest_rejects_reordered_duplicate_missing_and_unexpected_layers() {
+        let directory = tempfile::tempdir().unwrap();
+        let base = write_prompt_fixture(directory.path(), "ordered-layout");
+        let mut two_layers = base.clone();
+        two_layers.layer_count = 2;
+        two_layers.global_layer_end = 2;
+        two_layers.layer_layout = key_value_layout([None, Some(7)]);
+        let mut second = two_layers.blocks[0].clone();
+        second.global_layer = 1;
+        two_layers.blocks.push(second);
+
+        let write = |manifest: &PromptCacheManifest| {
+            fs::write(
+                directory.path().join("manifest.json"),
+                serde_json::to_vec(manifest).unwrap(),
+            )
+            .unwrap();
+            inspect_prompt_cache(directory.path()).unwrap_err()
+        };
+
+        let mut reordered = two_layers.clone();
+        reordered.blocks.reverse();
+        assert!(write(&reordered).to_string().contains("reordered"));
+
+        let mut duplicate = two_layers.clone();
+        duplicate.blocks.insert(1, duplicate.blocks[0].clone());
+        assert!(write(&duplicate).to_string().contains("duplicated"));
+
+        let mut missing = two_layers.clone();
+        missing.blocks.pop();
+        assert!(write(&missing).to_string().contains("missing blocks"));
+
+        let mut unexpected = two_layers.clone();
+        unexpected.blocks[1].global_layer = 2;
+        assert!(write(&unexpected).to_string().contains("invalid block"));
+    }
+
+    #[test]
+    fn manifest_rejects_policy_payload_kind_and_geometry_mismatches() {
+        let directory = tempfile::tempdir().unwrap();
+        let base = write_prompt_fixture(directory.path(), "policy-mismatch");
+        let mut kind = base.clone();
+        kind.layer_layout = PromptCacheModelIdentity::compressed_layouts(1, 1, 1).unwrap();
+        fs::write(
+            directory.path().join("manifest.json"),
+            serde_json::to_vec(&kind).unwrap(),
+        )
+        .unwrap();
+        assert!(inspect_prompt_cache(directory.path())
+            .unwrap_err()
+            .to_string()
+            .contains("does not match policy"));
+
+        let mut geometry = base;
+        geometry.layer_layout = PromptCacheModelIdentity::key_value_layouts([None], 2, 1).unwrap();
+        fs::write(
+            directory.path().join("manifest.json"),
+            serde_json::to_vec(&geometry).unwrap(),
+        )
+        .unwrap();
+        assert!(inspect_prompt_cache(directory.path())
+            .unwrap_err()
+            .to_string()
+            .contains("policy geometry"));
     }
 
     #[test]
@@ -4924,10 +5452,9 @@ mod tests {
             layer_count: 1,
             global_layer_start: 0,
             global_layer_end: 1,
-            sliding_window: None,
             sink_tokens: 0,
             topology: PromptCacheTopology::default(),
-            layer_layouts: PromptCacheModelIdentity::key_value_layouts(1, 1, 1),
+            layer_layout: PromptCacheModelIdentity::key_value_layouts([None], 1, 1).unwrap(),
         };
         assert!(matches!(
             validate_prompt_cache_model_identity(&descriptor, &loaded_model),
@@ -4945,10 +5472,9 @@ mod tests {
             layer_count: descriptor.layer_count,
             global_layer_start: descriptor.global_layer_start,
             global_layer_end: descriptor.global_layer_end,
-            sliding_window: descriptor.sliding_window,
             sink_tokens: descriptor.sink_tokens,
             topology: descriptor.topology.clone(),
-            layer_layouts: PromptCacheModelIdentity::key_value_layouts(1, 1, 1),
+            layer_layout: descriptor.layer_layout.clone(),
         };
         descriptor.architecture_fingerprint = "sha256:caller-repeated-stale-value".into();
         let error = validate_prompt_cache_model_identity(&descriptor, &loaded_model).unwrap_err();
@@ -4986,7 +5512,7 @@ mod tests {
             PagedCacheOptions::new(1, 64, 64, 1).unwrap(),
         )
         .unwrap_err();
-        assert!(error.to_string().contains("dimensions"));
+        assert!(error.to_string().contains("policy geometry"));
     }
 
     #[test]
@@ -5023,7 +5549,7 @@ mod tests {
             PagedCacheOptions::new(1, 64, 64, 1).unwrap(),
         )
         .unwrap_err();
-        assert!(error.to_string().contains("expects KeyValue"));
+        assert!(error.to_string().contains("does not match policy"));
     }
 
     #[test]

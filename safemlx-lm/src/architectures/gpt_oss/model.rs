@@ -221,26 +221,6 @@ impl ModelArgs {
         }
         Ok(())
     }
-
-    pub(crate) fn prompt_cache_sliding_window(&self) -> Result<Option<i32>, Error> {
-        let windows = self.attention_schedule.sliding_windows();
-        if windows.len() > 1 {
-            return Err(Error::UnsupportedArchitecture(
-                "GPT-OSS prompt-cache persistence requires one shared sliding window across all sliding-attention layers".into(),
-            ));
-        }
-        windows
-            .keys()
-            .next()
-            .map(|window| {
-                i32::try_from(window.get()).map_err(|_| {
-                    Error::UnsupportedArchitecture(
-                        "GPT-OSS sliding attention window exceeds the executable i32 range".into(),
-                    )
-                })
-            })
-            .transpose()
-    }
 }
 
 fn alternating_attention_schedule(
@@ -1271,17 +1251,17 @@ impl Model {
             layer_count,
             global_layer_start: 0,
             global_layer_end: layer_count,
-            sliding_window: self
-                .args
-                .prompt_cache_sliding_window()
-                .map_err(|error| Exception::custom(error.to_string()))?,
             sink_tokens: 0,
             topology: Default::default(),
-            layer_layouts: PromptCacheModelIdentity::key_value_layouts(
-                layer_count,
+            layer_layout: PromptCacheModelIdentity::key_value_layouts(
+                self.args
+                    .attention_schedule
+                    .iter()
+                    .map(|policy| policy.window().map(|window| window.get() as i32)),
                 self.args.num_key_value_heads,
                 self.args.head_dim,
-            ),
+            )
+            .map_err(|error| Exception::custom(error.to_string()))?,
         };
         validate_prompt_cache_model_identity(expected, &identity)
             .map_err(|error| Exception::custom(error.to_string()))?;
@@ -1916,6 +1896,45 @@ mod tests {
     }
 
     #[test]
+    fn gpt_oss_fingerprint_preserves_arbitrary_distinct_windows() {
+        let mut args = tiny_args();
+        args.num_hidden_layers = 4;
+        args.attention_schedule = LayerSchedule::new(
+            4,
+            vec![
+                AttentionPolicy::sliding(3).unwrap(),
+                AttentionPolicy::Full,
+                AttentionPolicy::sliding(9).unwrap(),
+                AttentionPolicy::Full,
+            ],
+        )
+        .unwrap();
+        args.validate().unwrap();
+        assert_eq!(
+            args.attention_schedule
+                .iter()
+                .map(|policy| policy.window().map(|window| window.get() as i32))
+                .collect::<Vec<_>>(),
+            vec![Some(3), None, Some(9), None]
+        );
+        let fingerprint = super::prompt_cache_architecture_fingerprint(&args);
+        args.attention_schedule = LayerSchedule::new(
+            4,
+            vec![
+                AttentionPolicy::Full,
+                AttentionPolicy::sliding(3).unwrap(),
+                AttentionPolicy::sliding(9).unwrap(),
+                AttentionPolicy::Full,
+            ],
+        )
+        .unwrap();
+        assert_ne!(
+            fingerprint,
+            super::prompt_cache_architecture_fingerprint(&args)
+        );
+    }
+
+    #[test]
     fn gguf_names_translate_to_native_parameter_tree() {
         assert_eq!(
             super::translate_gguf_weight_name("blk.3.attn_sinks.weight"),
@@ -2239,7 +2258,6 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![None, Some(3), Some(5), None]
         );
-        assert!(model.args.prompt_cache_sliding_window().is_err());
     }
 
     #[test]

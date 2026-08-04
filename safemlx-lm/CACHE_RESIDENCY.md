@@ -150,46 +150,69 @@ dimensions against the loaded model (including rank-local tensor-parallel KV
 head counts), then memory-map the compatible immutable shards as read-only disk
 blocks. Arrays are copied from those retained mappings only on demand, and
 suffix tokens append new mutable and sealed blocks without modifying imported
-files. Schema version 2 stores a SHA-256 digest of every exact safetensors
+files. Schema version 3 stores a SHA-256 digest of every exact safetensors
 payload. The digest is checked once against the mapped bytes before the shard is
 converted into MLX arrays, so opening remains mmap-lazy while same-length payload
 corruption cannot be consumed.
+
+Schema version 3 is an intentional break. Version 2 manifests are rejected
+with `unsupported prompt cache schema version 2`; no converter or legacy read
+path is provided.
 
 The manifest records:
 
 - schema version, model family, effective model type, caller-supplied checkpoint
   fingerprint, and a canonical architecture fingerprint derived from the loaded model;
-- global layer range, representation, block ranges, array names, shapes,
-  dtypes, batch size, total prefix length, and per-block payload SHA-256;
+- global layer range and one authoritative ordered `LayerCachePolicy` per owned
+  decoder layer, including state kind, exact full/sliding policy, positive
+  per-layer window, and tensor geometry;
+- representation, block ranges, array names, shapes, dtypes, batch size, total
+  prefix length, and per-block payload SHA-256;
 - SHA-256 of the exact little-endian prefix token IDs;
-- sliding window, sink count, and distributed topology;
+- sink count and distributed topology;
 - optional application namespace, which is never accepted as compatibility
   evidence.
 
 Loading requires the exact prefix token IDs and rejects wrong fingerprints,
-architecture settings, layer ranges, topology, block size, or prefix identity.
-Inspection rejects missing or truncated shards, duplicate or overlapping
-blocks, gaps, invalid ranges, inconsistent shapes or dtypes, extra arrays, and
-relative paths or symlinks that escape the cache directory. A tensor-parallel
-cache is rank-local and cannot be reused under a different topology. Pipeline
-stages persist only their global layer range. Expert-parallel attention state
-is recorded as replicated, not expert-sharded.
+architecture settings, ordered layer policies, layer ranges, topology, block
+size, or prefix identity. Inspection and import share validation for missing,
+duplicate, reordered, or unexpected layer payloads; policy/state-kind
+mismatches; tensor geometry; gaps; ranges; shapes and dtypes; extra arrays; and
+paths or symlinks escaping the cache root. All checks run before arrays attach
+to a live cache. A tensor-parallel cache is rank-local and cannot be reused
+under a different topology. Pipeline stages persist only their global layer
+range. Expert-parallel attention state is recorded as replicated, not
+expert-sharded.
+
+`AttentionPolicy::Sliding { window: N }` includes the current token in the `N`
+positions. Ordinary live state therefore needs at most `N - 1` past positions
+between calls. Paged backing is block-granular and may retain an older block
+outside that logical range; absolute-position masks keep it invisible. With
+`with_persistence_retention(true)`, discarded history is deliberately kept and
+the persisted layer may contain the full prefix. Otherwise a sliding layer may
+begin at a block boundary at or before the required `N - 1` history. Reload
+never changes full attention to sliding attention or the reverse.
+
+Llama/Mistral, dense Qwen2/Qwen2.5, all-full Qwen3, and GPT-OSS share this
+layout. Arbitrary full/sliding ordering and distinct windows are preserved; no
+architecture-specific manifest field or model-wide persistence window exists.
+DeepSeek-V3/R1 uses the same layout with `CompressedLatentRotary` state.
 
 `PipelineModel`, `TensorParallelModel`, and `ExpertParallelModel` expose
 matching `save_prompt_cache` and `load_prompt_cache` workflows. Callers pass one
 shared root; each process publishes `rank-NNNNN` beneath it. Pipeline manifests
 contain only the stage's global layer interval, tensor-parallel manifests retain
 rank-local KV heads, and expert-parallel manifests explicitly record replicated
-attention state. Every load derives family, effective type, layer ownership,
-window, and topology from the loaded distributed model before opening its rank
-directory.
+attention state. Every load derives family, effective type, exact ordered layer
+ownership and policies, and topology from the loaded distributed model before
+opening its rank directory.
 
 Checkpoint fingerprints are supplied by the application because hashing every
 checkpoint byte can be expensive. They must be based on stable checkpoint
 content or a trusted immutable model identifier, not solely on an absolute
 path. Applications that require a stronger identity must compute and supply a
 content hash. Architecture fingerprints are canonical SHA-256 identities
-derived by the loaded Llama, DeepSeek, or GPT-OSS model from its normalized
+derived by the loaded Llama, dense-Qwen, DeepSeek, or GPT-OSS model from its normalized
 dimensions, attention layout, RoPE and scaling settings, layer schedule,
 quantization layout, and other values that can change cached activations.
 Model-aware distributed saves and every model-aware load require caller
@@ -198,9 +221,11 @@ value from `prompt_cache_architecture_fingerprint` on loaded, pipeline,
 tensor-parallel, and expert-parallel model surfaces.
 
 Token IDs are sufficient only for text prefixes. Multimodal and realtime
-prefixes need image, audio, video, timing, and processor identity that this
-format does not yet encode, so high-level loading rejects those cache
-representations. A loaded prefix contains attention state, not logits for an
+prefixes need image, audio, video, timing, processor identity, and often
+additional state that this format does not encode. Kimi Linear KDA,
+Qwen3-Next/Qwen3.5 recurrent or convolution state, multimodal cross-attention,
+and Moshi/PersonaPlex temporal/depth state therefore remain explicitly
+unsupported. A loaded prefix contains attention state, not logits for an
 empty suffix. Run at least one suffix token before sampling, or persist logits
 separately in the application.
 
@@ -212,7 +237,6 @@ cargo run -p safemlx-lm --example paged_prompt_cache -- \
   /path/to/model /tmp/reusable-prefix \
   --prompt "Explain unified memory briefly." \
   --suffix-token 42 \
-  --layer-count 32 \
   --checkpoint-fingerprint sha256:CHECKPOINT_DIGEST
 ```
 
@@ -220,8 +244,8 @@ The example runs uninterrupted and restored suffix paths, prints logit parity,
 and reports block, tier, transfer, attention-scan, mapping, queue, and
 persistence counters. Use `--live-disk-dir` to demonstrate explicit live
 backing. Compare that output with `--device-cache` for the ordinary cache and
-with a model's configured sliding window for bounded sliding residency. Do not
-flush privileged operating-system caches when measuring.
+with the model's configured ordered attention schedule for bounded sliding
+residency. Do not flush privileged operating-system caches when measuring.
 
 `CacheResidencyReport::per_layer` provides current token, representation,
 tier, byte, protection, and in-flight-write observations plus cumulative

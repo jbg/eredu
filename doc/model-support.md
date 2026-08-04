@@ -346,10 +346,10 @@ The public architecture-erased variants are `Model::DenseQwen` and
 load_gguf}` and its `layerwise` module. Every schedule supports resident,
 layerwise-host, dense-streamed, ordinary-cache, and paged-cache execution. The
 complete ordered schedule participates in architecture and prompt-cache
-fingerprints. Persisted prompt caches support uniform all-full or all-sliding
-schedules; non-uniform schedules fail closed because schema v2 cannot serialize
-a per-layer window schedule. Tensor and pipeline parallel Qwen2 are also
-rejected during topology preflight.
+fingerprints. Resident models support schema-v4 persisted prompt caches for arbitrary ordered Qwen2
+full/sliding patterns and exact per-layer windows; all-full Qwen3 uses the same
+route. Qwen2 Q/K/V biases are unchanged. Tensor and pipeline parallel Qwen2
+remain rejected during topology preflight.
 
 GPT-OSS uses the same architecture-neutral
 `LayerSchedule<AttentionPolicy>` representation. Hugging Face `layer_types`
@@ -598,6 +598,12 @@ granularity for sparse-cache and expert-parallel execution.
 
 Important boundaries:
 
+- Prompt-cache schema v3 is intentionally incompatible with schema v2. Its
+  ordered architecture-neutral layout preserves full/sliding order, each
+  positive window, ordinary KV versus DeepSeek compressed MLA state, tensor
+  geometry, and global distributed layer indices. Llama/Mistral, dense Qwen,
+  GPT-OSS, and DeepSeek use this shared representation on their existing
+  persistence routes.
 - GGUF remains fully resident by default. `LayerwiseHost`, `DenseDiskStream`,
   and supported sparse-expert policies use header-only logical catalogs and
   bounded payload materialization.
@@ -611,6 +617,9 @@ Important boundaries:
   allocator caches, checkpoint mappings, or every temporary buffer.
 - Kimi Linear paged and persisted prompt caches are unavailable because its
   hybrid KDA recurrent state is not represented by the paged KV cache format.
+- Qwen3-Next/Qwen3.5 recurrent/convolution state, multimodal cross-attention,
+  and realtime Moshi/PersonaPlex temporal/depth state likewise remain outside
+  the text prompt-cache payload schema.
 - SafeTensors mapping and logical-transfer counters cannot report exact
   physical disk I/O. GGUF additionally reports physical payload read requests
   and bytes issued by its selected-read backend;

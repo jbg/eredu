@@ -7,8 +7,8 @@ use safemlx::{Array, Device, DeviceType, ExecutionContext};
 use safemlx_lm::{
     api::{LoadedModel, ModelCache},
     runtime::media::input::{InputPart, ModelInput},
-    CacheResidencyPolicy, PagedCacheOptions, PromptCacheDescriptor, PromptCacheOptions,
-    PromptCacheTopology,
+    AttentionPolicy, CacheResidencyPolicy, PagedCacheOptions, PromptCacheDescriptor,
+    PromptCacheOptions, PromptCacheTopology,
 };
 
 #[derive(Debug, Parser)]
@@ -24,15 +24,9 @@ struct Args {
     /// One token appended after the restored prefix.
     #[arg(long)]
     suffix_token: u32,
-    /// Total decoder layer count from the normalized model configuration.
-    #[arg(long)]
-    layer_count: usize,
     /// Stable content-based checkpoint identity.
     #[arg(long)]
     checkpoint_fingerprint: String,
-    /// Sliding attention window, when the model uses one.
-    #[arg(long)]
-    sliding_window: Option<i32>,
     /// Token count per immutable cache block.
     #[arg(long, default_value_t = 128)]
     block_tokens: i32,
@@ -95,13 +89,17 @@ fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
+    let layer_layout = model.prompt_cache_layer_layout()?;
+    let has_full_attention = layer_layout
+        .iter()
+        .any(|policy| matches!(policy.attention(), Some(AttentionPolicy::Full)));
     let mut paged = PagedCacheOptions::new(
         args.block_tokens,
         args.device_cache_bytes,
         args.host_cache_bytes,
         args.recent_device_blocks,
     )?
-    .with_full_attention(args.sliding_window.is_none())
+    .with_full_attention(has_full_attention)
     .with_persistence_retention(true)
     .with_process_sampling(true);
     if let Some(directory) = &args.live_disk_dir {
@@ -123,19 +121,24 @@ fn main() -> anyhow::Result<()> {
     let model_type = model.model_type().to_owned();
     let model_family = if model_type.contains("deepseek") {
         "deepseek_v3"
+    } else if model_type.contains("qwen") {
+        "dense_qwen"
+    } else if model_type.contains("gpt_oss") {
+        "gpt_oss"
     } else {
         "llama"
     };
+    let layer_count = layer_layout.len();
     let descriptor = PromptCacheDescriptor {
         model_family: model_family.into(),
         effective_model_type: model_type,
         checkpoint_fingerprint: args.checkpoint_fingerprint,
         architecture_fingerprint: model.prompt_cache_architecture_fingerprint()?,
-        layer_count: args.layer_count,
+        layer_count,
         global_layer_start: 0,
-        global_layer_end: args.layer_count,
+        global_layer_end: layer_count,
         batch_size: 1,
-        sliding_window: args.sliding_window,
+        layer_layout,
         sink_tokens: 0,
         topology: PromptCacheTopology::default(),
     };

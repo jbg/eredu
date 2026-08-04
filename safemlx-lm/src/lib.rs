@@ -37,7 +37,7 @@ pub use runtime::attention::{AttentionPolicy, LayerSchedule, LayerScheduleError}
 pub use runtime::cache::residency::{
     inspect_prompt_cache, CacheBlockId, CacheBlockLifecycle, CacheLayerResidencyReport,
     CacheLayerResidencyStats, CacheRankIdentity, CacheRepresentation, CacheResidencyError,
-    CacheResidencyManager, CacheResidencyPolicy, CacheResidencyReport, CacheTier,
+    CacheResidencyManager, CacheResidencyPolicy, CacheResidencyReport, CacheTier, LayerCachePolicy,
     LiveCacheDiskPolicy, PagedCacheOptions, PromptCacheBlock, PromptCacheDescriptor,
     PromptCacheManifest, PromptCacheOptions, PromptCacheTopology,
     CACHE_RESIDENCY_LAYER_REPORT_LIMIT,

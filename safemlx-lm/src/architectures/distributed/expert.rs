@@ -706,14 +706,15 @@ impl ExpertParallelModel {
         Ok(self.prompt_cache_model_identity()?.architecture_fingerprint)
     }
 
+    /// Returns this rank's exact ordered prompt-cache layout.
+    pub fn prompt_cache_layer_layout(
+        &self,
+    ) -> Result<crate::LayerSchedule<crate::LayerCachePolicy>, Error> {
+        Ok(self.prompt_cache_model_identity()?.layer_layout)
+    }
+
     fn prompt_cache_model_identity(&self) -> Result<PromptCacheModelIdentity, Error> {
-        let (
-            model_family,
-            effective_model_type,
-            architecture_fingerprint,
-            layer_count,
-            sliding_window,
-        ) =
+        let (model_family, effective_model_type, architecture_fingerprint, layer_count) =
             match &self.architecture {
                 ExpertArchitecture::DeepSeek(model) => (
                     "deepseek_v3".to_string(),
@@ -722,7 +723,6 @@ impl ExpertParallelModel {
                         &model.args,
                     ),
                     model.args.layer_schedule.len(),
-                    None,
                 ),
                 ExpertArchitecture::GptOss(model) => (
                     "gpt_oss".to_string(),
@@ -732,10 +732,6 @@ impl ExpertParallelModel {
                     ),
                     usize::try_from(model.args.num_hidden_layers)
                         .map_err(|_| Error::Parallel("invalid GPT-OSS layer count".into()))?,
-                    model
-                        .args
-                        .prompt_cache_sliding_window()
-                        .map_err(|error| Error::Parallel(error.to_string()))?,
                 ),
                 _ => return Err(Error::Parallel(
                     "prompt-cache persistence is unsupported for this expert-parallel architecture"
@@ -749,7 +745,6 @@ impl ExpertParallelModel {
             layer_count,
             global_layer_start: 0,
             global_layer_end: layer_count,
-            sliding_window,
             sink_tokens: 0,
             topology: PromptCacheTopology {
                 pipeline: None,
@@ -760,7 +755,7 @@ impl ExpertParallelModel {
                 )),
                 expert_parallel_cache_replicated: true,
             },
-            layer_layouts: match &self.architecture {
+            layer_layout: match &self.architecture {
                 ExpertArchitecture::DeepSeek(model) => {
                     PromptCacheModelIdentity::compressed_layouts(
                         layer_count,
@@ -769,12 +764,18 @@ impl ExpertParallelModel {
                     )
                 }
                 ExpertArchitecture::GptOss(model) => PromptCacheModelIdentity::key_value_layouts(
-                    layer_count,
+                    model.args.attention_schedule.iter().map(|policy| {
+                        policy.window().map(|window| {
+                            i32::try_from(window.get())
+                                .expect("validated GPT-OSS sliding window fits i32")
+                        })
+                    }),
                     model.args.num_key_value_heads,
                     model.args.head_dim,
                 ),
                 _ => unreachable!("identity rejects unsupported expert architectures"),
-            },
+            }
+            .map_err(|error| Error::Parallel(error.to_string()))?,
         })
     }
 

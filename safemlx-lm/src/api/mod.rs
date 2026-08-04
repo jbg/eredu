@@ -52,10 +52,11 @@ use crate::runtime::media::PreparedModelInput;
 use crate::runtime::media::{load_processor, ChatMediaBinding, ModelProcessor, ProcessorInput};
 use crate::{
     error::Error,
+    runtime::attention::LayerSchedule,
     runtime::cache::residency::{
         open_prompt_cache, validate_prompt_cache_model_identity, CacheResidencyManager,
-        CacheResidencyPolicy, CacheResidencyReport, PagedCacheOptions, PromptCacheDescriptor,
-        PromptCacheManifest, PromptCacheModelIdentity, PromptCacheOptions,
+        CacheResidencyPolicy, CacheResidencyReport, LayerCachePolicy, PagedCacheOptions,
+        PromptCacheDescriptor, PromptCacheManifest, PromptCacheModelIdentity, PromptCacheOptions,
     },
     runtime::cache::{ConcatKeyValueCache, PagedKeyValueCache},
     runtime::execution::layerwise::{LayerExecutionLoadOptions, WeightResidency},

@@ -748,9 +748,10 @@ order. Alternating and discontiguous patterns are supported. A declared window
 without a pattern applies globally. Pattern/type/window conflicts and
 attention-affecting unsupported YaRN metadata are rejected during the same
 catalog inspection used by loading. Fully resident dense-Qwen models support
-normal and paged caches. Uniform schedules also support persisted prompt
-caches; non-uniform schedules, tensor parallelism, and pipeline parallelism are
-rejected explicitly.
+normal, paged, and schema-v4 persisted prompt caches for full or mixed
+Qwen2/Qwen2.5 schedules. The normalized schedule can carry distinct windows,
+and all-full Qwen3 uses the same persistence route. Qwen tensor and pipeline
+parallelism remain unsupported independently of prompt-cache schema.
 
 Kimi Linear GGUF accepts modern split `attn_k_b`/`attn_v_b` and legacy
 unsplit `attn_kv_b`, modern and singleton-ranked convolution tensors, dense
@@ -1557,5 +1558,7 @@ Licensed under either Apache-2.0 or MIT.
 Paged attention-cache residency and reusable prompt-cache persistence are
 opt-in. Device-resident caches remain the default. See
 [`CACHE_RESIDENCY.md`](CACHE_RESIDENCY.md) for configuration, compatibility,
-cost, and safety details, and run `paged_prompt_cache` for a deterministic
-save/drop/reopen parity check.
+cost, and safety details. Prompt-cache schema v3 records the exact ordered
+per-layer state kind, tensor geometry, and full/sliding policy, including
+distinct sliding windows; older schema-v2 caches are rejected. Run
+`paged_prompt_cache` for a deterministic save/drop/reopen parity check.

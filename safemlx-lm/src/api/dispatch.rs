@@ -595,6 +595,88 @@ impl Model {
         }
     }
 
+    /// Returns the exact ordered prompt-cache state and attention layout.
+    pub fn prompt_cache_layer_layout(&self) -> Result<LayerSchedule<LayerCachePolicy>, Exception> {
+        let layout = match self {
+            Self::Llama(model) => PromptCacheModelIdentity::key_value_layouts(
+                model.args.attention_schedule.iter().map(|policy| {
+                    policy.window().map(|window| {
+                        i32::try_from(window.get())
+                            .expect("validated Llama attention window fits i32")
+                    })
+                }),
+                model.args.num_key_value_heads,
+                model.args.head_dim,
+            ),
+            Self::LlamaLayerwise(model) => {
+                let args = model.args();
+                PromptCacheModelIdentity::key_value_layouts(
+                    args.attention_schedule.iter().map(|policy| {
+                        policy.window().map(|window| {
+                            i32::try_from(window.get())
+                                .expect("validated Llama attention window fits i32")
+                        })
+                    }),
+                    args.num_key_value_heads,
+                    args.head_dim,
+                )
+            }
+            Self::DeepSeekV3(model) => PromptCacheModelIdentity::compressed_layouts(
+                model.args.num_hidden_layers as usize,
+                model.args.kv_lora_rank,
+                model.args.qk_rope_head_dim,
+            ),
+            Self::DeepSeekV3Layerwise(model) => {
+                let args = model.args();
+                PromptCacheModelIdentity::compressed_layouts(
+                    args.num_hidden_layers as usize,
+                    args.kv_lora_rank,
+                    args.qk_rope_head_dim,
+                )
+            }
+            Self::GptOss(model) => PromptCacheModelIdentity::key_value_layouts(
+                model.args.attention_schedule.iter().map(|policy| {
+                    policy.window().map(|window| {
+                        i32::try_from(window.get())
+                            .expect("validated GPT-OSS sliding window fits i32")
+                    })
+                }),
+                model.args.num_key_value_heads,
+                model.args.head_dim,
+            ),
+            Self::GptOssLayerwise(model) => {
+                let args = model.args();
+                PromptCacheModelIdentity::key_value_layouts(
+                    args.attention_schedule.iter().map(|policy| {
+                        policy.window().map(|window| {
+                            i32::try_from(window.get())
+                                .expect("validated GPT-OSS sliding window fits i32")
+                        })
+                    }),
+                    args.num_key_value_heads,
+                    args.head_dim,
+                )
+            }
+            Self::DenseQwen(model) => PromptCacheModelIdentity::key_value_layouts(
+                model.args.attention_schedule.iter().map(|policy| {
+                    policy.window().map(|window| {
+                        i32::try_from(window.get())
+                            .expect("validated dense-Qwen attention window fits i32")
+                    })
+                }),
+                model.args.num_key_value_heads,
+                model.args.head_dim,
+            ),
+            _ => {
+                return Err(Exception::custom(format!(
+                    "prompt-cache state layout is unsupported for model type {}",
+                    self.model_type()
+                )))
+            }
+        };
+        layout.map_err(|error| Exception::custom(error.to_string()))
+    }
+
     /// Runs a detailed instrumented forward pass for supported model families.
     ///
     /// DeepSeek-V3/R1, Kimi Linear, Llama, Qwen3, Qwen3.5 MoE, and Gemma4
@@ -982,12 +1064,6 @@ impl Model {
     ) -> Result<(ModelCache, PromptCacheManifest), Exception> {
         match self {
             Self::Llama(model) => {
-                let Some(sliding_window) = llama::uniform_attention_window(&model.args)
-                else {
-                    return Err(Exception::custom(
-                        "persisted prompt caches for non-uniform Llama/Mistral attention schedules are unsupported because prompt-cache schema v2 stores only one model-wide sliding window; the ordered schedule remains part of the architecture fingerprint",
-                    ));
-                };
                 let layer_count = usize::try_from(model.args.num_hidden_layers)
                     .map_err(|_| Exception::custom("invalid Llama cache layer count"))?;
                 let identity = PromptCacheModelIdentity {
@@ -998,14 +1074,19 @@ impl Model {
                         layer_count,
                         global_layer_start: 0,
                         global_layer_end: layer_count,
-                        sliding_window,
                         sink_tokens: 0,
                         topology: Default::default(),
-                        layer_layouts: PromptCacheModelIdentity::key_value_layouts(
-                            layer_count,
+                        layer_layout: PromptCacheModelIdentity::key_value_layouts(
+                            model.args.attention_schedule.iter().map(|policy| {
+                                policy.window().map(|window| {
+                                    i32::try_from(window.get())
+                                        .expect("validated Llama attention window fits i32")
+                                })
+                            }),
                             model.args.num_key_value_heads,
                             model.args.head_dim,
-                        ),
+                        )
+                        .map_err(|error| Exception::custom(error.to_string()))?,
                     };
                 validate_prompt_cache_model_identity(expected, &identity)
                 .map_err(|error| Exception::custom(error.to_string()))?;
@@ -1055,13 +1136,9 @@ impl Model {
                 .load_prompt_cache(directory, expected, prefix_token_ids, options)
                 .map(|(cache, manifest)| (ModelCache::GptOss(cache), manifest))
                 .map_err(|error| Exception::custom(error.to_string())),
-            Self::DenseQwen(model)
-                if dense_qwen::uniform_attention_window(&model.args).is_some() =>
-            {
+            Self::DenseQwen(model) => {
                 let layer_count = usize::try_from(model.args.num_hidden_layers)
                     .map_err(|_| Exception::custom("invalid dense-Qwen cache layer count"))?;
-                let sliding_window = dense_qwen::uniform_attention_window(&model.args)
-                    .expect("guarded uniform dense-Qwen attention schedule");
                 let identity = PromptCacheModelIdentity {
                     model_family: "dense_qwen".into(),
                     effective_model_type: model.args.model_type.clone(),
@@ -1071,14 +1148,19 @@ impl Model {
                     layer_count,
                     global_layer_start: 0,
                     global_layer_end: layer_count,
-                    sliding_window,
                     sink_tokens: 0,
                     topology: Default::default(),
-                    layer_layouts: PromptCacheModelIdentity::key_value_layouts(
-                        layer_count,
+                    layer_layout: PromptCacheModelIdentity::key_value_layouts(
+                        model.args.attention_schedule.iter().map(|policy| {
+                            policy.window().map(|window| {
+                                i32::try_from(window.get())
+                                    .expect("validated dense-Qwen attention window fits i32")
+                            })
+                        }),
                         model.args.num_key_value_heads,
                         model.args.head_dim,
-                    ),
+                    )
+                    .map_err(|error| Exception::custom(error.to_string()))?,
                 };
                 validate_prompt_cache_model_identity(expected, &identity)
                     .map_err(|error| Exception::custom(error.to_string()))?;
@@ -1092,14 +1174,26 @@ impl Model {
                 .map_err(|error| Exception::custom(error.to_string()))?;
                 let caches = (0..layer_count)
                     .map(|layer| {
-                        PagedKeyValueCache::new(manager.clone(), layer, sliding_window).map(Some)
+                        let window = model
+                            .args
+                            .attention_schedule
+                            .get(layer)
+                            .and_then(|policy| {
+                                policy.window().map(|window| {
+                                    i32::try_from(window.get())
+                                        .expect("validated dense-Qwen attention window fits i32")
+                                })
+                            });
+                        PagedKeyValueCache::new(
+                            manager.clone(),
+                            layer,
+                            window,
+                        )
+                        .map(Some)
                     })
                     .collect::<Result<Vec<_>, _>>()?;
                 Ok((ModelCache::PagedKeyValue(caches), manifest))
             }
-            Self::DenseQwen(_) => Err(Exception::custom(
-                "persisted prompt caches for non-uniform dense-Qwen attention schedules are unsupported because prompt-cache schema v2 stores only one model-wide sliding window; the ordered schedule is still included in the architecture fingerprint",
-            )),
             _ => Err(Exception::custom(
                 "prompt-cache loading is unsupported for this model cache representation; multimodal and recurrent prefixes require additional identity state",
             )),

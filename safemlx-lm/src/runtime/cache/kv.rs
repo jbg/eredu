@@ -3058,7 +3058,7 @@ mod tests {
             global_layer_start: 0,
             global_layer_end: 1,
             batch_size: 1,
-            sliding_window: None,
+            layer_layout: PromptCacheModelIdentity::key_value_layouts([None], 1, 1).unwrap(),
             sink_tokens: 0,
             topology: PromptCacheTopology {
                 pipeline: Some((2, 1)),
@@ -3105,10 +3105,9 @@ mod tests {
             layer_count: 1,
             global_layer_start: 0,
             global_layer_end: 1,
-            sliding_window: None,
             sink_tokens: 0,
             topology: descriptor.topology.clone(),
-            layer_layouts: PromptCacheModelIdentity::key_value_layouts(1, 1, 1),
+            layer_layout: descriptor.layer_layout.clone(),
         };
         assert!(open_prompt_cache(
             &destination,
@@ -3143,6 +3142,137 @@ mod tests {
         )
         .unwrap();
         assert!(inspect_prompt_cache(&destination).is_err());
+    }
+
+    #[test]
+    #[ignore = "requires MLX runtime execution"]
+    fn distinct_window_schedule_save_reopen_continue_preserves_ranges() {
+        let context = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        let stream = context.stream();
+        let options = PagedCacheOptions::new(2, 1 << 20, 1 << 20, 1)
+            .unwrap()
+            .with_full_attention(true)
+            .with_persistence_retention(true);
+        let manager = CacheResidencyManager::new(options.clone()).unwrap();
+        let windows = [None, Some(3), Some(5), Some(2)];
+        let mut caches = windows
+            .iter()
+            .enumerate()
+            .map(|(layer, window)| {
+                PagedKeyValueCache::new(manager.clone(), layer, *window).unwrap()
+            })
+            .collect::<Vec<_>>();
+        let prefix = Array::from_slice(&[0.0f32, 1.0, 2.0, 3.0, 4.0, 5.0], &[1, 1, 6, 1]);
+        for cache in &mut caches {
+            cache
+                .update_and_fetch(prefix.clone(), prefix.clone(), stream)
+                .unwrap();
+            cache.finalize().unwrap();
+        }
+        let retained_before = windows
+            .iter()
+            .enumerate()
+            .map(|(layer, _)| {
+                manager
+                    .layer_block_ids(layer, CacheRepresentation::KeyValue, 0, i64::MAX, 0)
+                    .unwrap()
+                    .into_iter()
+                    .map(|id| (id.start, id.end))
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(retained_before, vec![vec![(0, 2), (2, 4), (4, 6)]; 4]);
+        let layer_layout = PromptCacheModelIdentity::key_value_layouts(windows, 1, 1).unwrap();
+        let descriptor = PromptCacheDescriptor {
+            model_family: "schedule-fixture".into(),
+            effective_model_type: "schedule-fixture".into(),
+            checkpoint_fingerprint: "checkpoint".into(),
+            architecture_fingerprint: "architecture".into(),
+            layer_count: windows.len(),
+            global_layer_start: 0,
+            global_layer_end: windows.len(),
+            batch_size: 1,
+            layer_layout: layer_layout.clone(),
+            sink_tokens: 0,
+            topology: PromptCacheTopology::default(),
+        };
+        let tokens = [10, 11, 12, 13, 14, 15];
+        let directory = tempfile::tempdir().unwrap();
+        let destination = directory.path().join("distinct-windows");
+        manager
+            .save_prompt_cache(
+                &destination,
+                descriptor.clone(),
+                &tokens,
+                &PromptCacheOptions::default(),
+            )
+            .unwrap();
+
+        let query = Array::from_slice(&[1.0f32], &[1, 1, 1, 1]);
+        let suffix = Array::from_slice(&[6.0f32], &[1, 1, 1, 1]);
+        let mut uninterrupted = Vec::new();
+        for (cache, window) in caches.iter_mut().zip(windows) {
+            cache
+                .update_for_attention(suffix.clone(), suffix.clone(), stream)
+                .unwrap();
+            let output = cache
+                .paged_attention(&query, 1.0, None, None, stream)
+                .unwrap()
+                .unwrap()
+                .evaluated()
+                .unwrap()
+                .item::<f32>();
+            let expected_start = window.map_or(0, |window| 6 - i64::from(window - 1));
+            let normalizer = (expected_start..=6)
+                .map(|value| ((value - 6) as f32).exp())
+                .sum::<f32>();
+            let expected = (expected_start..=6)
+                .map(|value| value as f32 * ((value - 6) as f32).exp())
+                .sum::<f32>()
+                / normalizer;
+            assert!((output - expected).abs() < 1e-5);
+            uninterrupted.push(output);
+        }
+        drop(caches);
+        drop(manager);
+
+        let identity = PromptCacheModelIdentity {
+            model_family: descriptor.model_family.clone(),
+            effective_model_type: descriptor.effective_model_type.clone(),
+            architecture_fingerprint: descriptor.architecture_fingerprint.clone(),
+            layer_count: windows.len(),
+            global_layer_start: 0,
+            global_layer_end: windows.len(),
+            sink_tokens: 0,
+            topology: PromptCacheTopology::default(),
+            layer_layout,
+        };
+        let (manager, manifest) =
+            open_prompt_cache(&destination, &descriptor, &identity, &tokens, options).unwrap();
+        assert_eq!(manifest.layer_layout, descriptor.layer_layout);
+
+        for (layer, window) in windows.into_iter().enumerate() {
+            let retained_after = manager
+                .layer_block_ids(layer, CacheRepresentation::KeyValue, 0, i64::MAX, 0)
+                .unwrap()
+                .into_iter()
+                .map(|id| (id.start, id.end))
+                .collect::<Vec<_>>();
+            assert_eq!(retained_after, retained_before[layer]);
+            let mut restored = PagedKeyValueCache::new(manager.clone(), layer, window).unwrap();
+            assert_eq!(restored.offset(), 6);
+            restored
+                .update_for_attention(suffix.clone(), suffix.clone(), stream)
+                .unwrap();
+            let output = restored
+                .paged_attention(&query, 1.0, None, None, stream)
+                .unwrap()
+                .unwrap()
+                .evaluated()
+                .unwrap()
+                .item::<f32>();
+            assert!((output - uninterrupted[layer]).abs() < 1e-6);
+        }
     }
 
     #[test]

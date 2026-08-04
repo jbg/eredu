@@ -149,7 +149,7 @@ fn pipeline_ring_worker() {
         global_layer_start: expected_rank,
         global_layer_end: expected_rank + 1,
         batch_size: 1,
-        sliding_window: None,
+        layer_layout: model.prompt_cache_layer_layout().unwrap(),
         sink_tokens: 0,
         topology: PromptCacheTopology {
             pipeline: Some((2, expected_rank)),
@@ -307,7 +307,8 @@ fn write_fixture(directory: &Path) {
             "max_position_embeddings": 32,
             "tie_word_embeddings": false,
             "attention_bias": false,
-            "mlp_bias": false
+            "mlp_bias": false,
+            "attention_schedule": ["full", {"sliding": {"window": 2}}]
         }))
         .unwrap(),
     )

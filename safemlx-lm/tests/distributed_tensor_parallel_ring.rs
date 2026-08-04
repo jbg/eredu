@@ -90,7 +90,7 @@ fn tensor_ring_worker() {
         global_layer_start: 0,
         global_layer_end: layer_count,
         batch_size: 1,
-        sliding_window: None,
+        layer_layout: model.prompt_cache_layer_layout().unwrap(),
         sink_tokens: 0,
         topology: PromptCacheTopology {
             pipeline: None,
@@ -175,7 +175,8 @@ fn write_fixture(directory: &Path) {
             "max_position_embeddings": 32,
             "tie_word_embeddings": false,
             "attention_bias": false,
-            "mlp_bias": false
+            "mlp_bias": false,
+            "attention_schedule": [{"sliding": {"window": 2}}]
         }))
         .unwrap(),
     )

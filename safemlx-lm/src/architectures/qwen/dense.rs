@@ -42,9 +42,8 @@ use crate::{
     },
     error::Error,
     nn::tensor::{
-        create_attention_mask,
+        create_causal_mask,
         rope::{initialize_rope, FloatOrString, RopeVariant},
-        AttentionMask,
     },
     runtime::attention::{AttentionPolicy, LayerSchedule},
     runtime::cache::KeyValueCache,
@@ -293,16 +292,6 @@ pub(crate) fn prompt_cache_architecture_fingerprint(args: &DecoderConfig) -> Str
         rope.join(";"),
         args.attention_schedule.fingerprint_component(),
     )
-}
-
-pub(crate) fn uniform_attention_window(args: &DecoderConfig) -> Option<Option<i32>> {
-    let mut policies = args.attention_schedule.iter();
-    let first = policies.next()?;
-    policies.all(|policy| policy == first).then(|| {
-        first.window().map(|window| {
-            i32::try_from(window.get()).expect("validated dense-Qwen attention window fits i32")
-        })
-    })
 }
 
 fn quantization_for(
@@ -1339,6 +1328,22 @@ pub struct Decoder {
     pub norm: nn::RmsNorm,
 }
 
+fn full_attention_mask<C: KeyValueCache>(
+    hidden: &Array,
+    cache: &[Option<C>],
+    explicit_mask: bool,
+    stream: &Stream,
+) -> Result<Option<Array>, Exception> {
+    if explicit_mask || hidden.dim(1) <= 1 {
+        return Ok(None);
+    }
+    let offset = cache
+        .first()
+        .and_then(Option::as_ref)
+        .map_or(0, KeyValueCache::offset);
+    create_causal_mask(hidden.dim(1), Some(offset), None, None, stream).map(Some)
+}
+
 impl Decoder {
     /// Creates an unloaded dense-Qwen transformer body.
     pub fn new(args: &DecoderConfig, stream: &Stream) -> Result<Self, Exception> {
@@ -1388,17 +1393,8 @@ impl Decoder {
         let mut h = self.embed_tokens.forward(inputs, stream)?;
         observer.observe("model.embed_tokens", &h)?;
 
-        let mask = match mask {
-            Some(mask) => Some(mask.clone()),
-            None => match create_attention_mask(&h, cache, Some(true), stream)? {
-                Some(AttentionMask::Array(a)) => Some(a),
-                Some(AttentionMask::Causal) => {
-                    return Err(Exception::custom("Only `Array` mask is supported"));
-                }
-                None => None,
-            },
-        };
-        if let Some(mask) = mask.as_ref() {
+        let full_mask = full_attention_mask(&h, cache, mask.is_some(), stream)?;
+        if let Some(mask) = mask.or(full_mask.as_ref()) {
             observer.observe("model.attention_mask", mask)?;
         }
 
@@ -1407,9 +1403,14 @@ impl Decoder {
         }
 
         for (i, (layer, c)) in self.layers.iter_mut().zip(cache.iter_mut()).enumerate() {
+            let layer_mask = match mask {
+                Some(mask) => Some(mask),
+                None if layer.self_attn.sliding_window.is_none() => full_mask.as_ref(),
+                None => None,
+            };
             let layer_input = AttentionInput {
                 x: &h,
-                mask: mask.as_ref(),
+                mask: layer_mask,
                 cache: c.as_mut(),
             };
             h = layer.forward_with_observer(
@@ -1443,25 +1444,23 @@ impl Decoder {
             cache,
         } = input;
         let mut hidden = self.embed_tokens.forward(inputs, stream)?;
-        let mask = match mask {
-            Some(mask) => Some(mask.clone()),
-            None => match create_attention_mask(&hidden, cache, Some(true), stream)? {
-                Some(AttentionMask::Array(mask)) => Some(mask),
-                Some(AttentionMask::Causal) => unreachable!("array mask requested"),
-                None => None,
-            },
-        };
+        let full_mask = full_attention_mask(&hidden, cache, mask.is_some(), stream)?;
         if cache.is_empty() {
             *cache = (0..self.layers.len()).map(|_| Some(C::default())).collect();
         }
         for (index, (layer, cache)) in self.layers.iter_mut().zip(cache.iter_mut()).enumerate() {
+            let layer_mask = match mask {
+                Some(mask) => Some(mask),
+                None if layer.self_attn.sliding_window.is_none() => full_mask.as_ref(),
+                None => None,
+            };
             let layer_observer = observer
                 .as_mut()
                 .map(|observer| &mut **observer as &mut dyn ActivationObserver);
             hidden = layer.forward_expert_parallel(
                 AttentionInput {
                     x: &hidden,
-                    mask: mask.as_ref(),
+                    mask: layer_mask,
                     cache: cache.as_mut(),
                 },
                 assignment,
@@ -1507,25 +1506,21 @@ where
 
         let mut h = self.embed_tokens.forward(inputs, stream)?;
 
-        let mask = match mask {
-            Some(mask) => Some(mask.clone()),
-            None => match create_attention_mask(&h, cache, Some(true), stream)? {
-                Some(AttentionMask::Array(a)) => Some(a),
-                Some(AttentionMask::Causal) => {
-                    return Err(Exception::custom("Only `Array` mask is supported"));
-                }
-                None => None,
-            },
-        };
+        let full_mask = full_attention_mask(&h, cache, mask.is_some(), stream)?;
 
         if cache.is_empty() {
             *cache = (0..self.layers.len()).map(|_| Some(C::default())).collect();
         }
 
         for (layer, c) in self.layers.iter_mut().zip(cache.iter_mut()) {
+            let layer_mask = match mask {
+                Some(mask) => Some(mask),
+                None if layer.self_attn.sliding_window.is_none() => full_mask.as_ref(),
+                None => None,
+            };
             let layer_input = AttentionInput {
                 x: &h,
-                mask: mask.as_ref(),
+                mask: layer_mask,
                 cache: c.as_mut(),
             };
             h = layer.forward(layer_input, stream)?;
@@ -1670,14 +1665,7 @@ impl Model {
             cache,
         } = input;
         let mut hidden = self.model.embed_tokens.forward(inputs, stream)?;
-        let mask = match mask {
-            Some(mask) => Some(mask.clone()),
-            None => match create_attention_mask(&hidden, cache, Some(true), stream)? {
-                Some(AttentionMask::Array(mask)) => Some(mask),
-                Some(AttentionMask::Causal) => unreachable!("array mask requested"),
-                None => None,
-            },
-        };
+        let full_mask = full_attention_mask(&hidden, cache, mask.is_some(), stream)?;
         if cache.is_empty() {
             *cache = (0..self.model.layers.len())
                 .map(|_| Some(C::default()))
@@ -1690,10 +1678,15 @@ impl Model {
             .zip(cache.iter_mut())
             .enumerate()
         {
+            let layer_mask = match mask {
+                Some(mask) => Some(mask),
+                None if layer.self_attn.sliding_window.is_none() => full_mask.as_ref(),
+                None => None,
+            };
             hidden = layer.forward_sparse_experts(
                 AttentionInput {
                     x: &hidden,
-                    mask: mask.as_ref(),
+                    mask: layer_mask,
                     cache: layer_cache.as_mut(),
                 },
                 stream,
@@ -3064,6 +3057,46 @@ mod tests {
             .all_close(right, Some(3e-5), Some(3e-5), None, stream)
             .unwrap()
             .item::<bool>(stream));
+    }
+
+    #[test]
+    fn qwen2_normalized_schedule_preserves_arbitrary_distinct_windows() {
+        let mut config = tiny_qwen2_config();
+        config["num_hidden_layers"] = serde_json::json!(4);
+        let mut args = super::config_from_hf_value(&config).unwrap();
+        args.attention_schedule = LayerSchedule::new(
+            4,
+            vec![
+                AttentionPolicy::sliding(3).unwrap(),
+                AttentionPolicy::Full,
+                AttentionPolicy::sliding(11).unwrap(),
+                AttentionPolicy::Full,
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            args.attention_schedule
+                .iter()
+                .map(|policy| policy.window().map(|window| window.get() as i32))
+                .collect::<Vec<_>>(),
+            vec![Some(3), None, Some(11), None]
+        );
+        let fingerprint = super::prompt_cache_architecture_fingerprint(&args);
+        let mut reordered = args.clone();
+        reordered.attention_schedule = LayerSchedule::new(
+            4,
+            vec![
+                AttentionPolicy::Full,
+                AttentionPolicy::sliding(3).unwrap(),
+                AttentionPolicy::sliding(11).unwrap(),
+                AttentionPolicy::Full,
+            ],
+        )
+        .unwrap();
+        assert_ne!(
+            fingerprint,
+            super::prompt_cache_architecture_fingerprint(&reordered)
+        );
     }
 
     #[test]

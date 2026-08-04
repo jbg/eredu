@@ -236,16 +236,6 @@ pub(crate) fn prompt_cache_architecture_fingerprint(args: &ModelArgs) -> String 
     )
 }
 
-pub(crate) fn uniform_attention_window(args: &ModelArgs) -> Option<Option<i32>> {
-    let mut policies = args.attention_schedule.iter();
-    let first = policies.next()?;
-    policies.all(|policy| policy == first).then(|| {
-        first.window().map(|window| {
-            i32::try_from(window.get()).expect("validated Llama attention window fits i32")
-        })
-    })
-}
-
 fn default_true() -> bool {
     true
 }
@@ -1988,6 +1978,49 @@ mod tests {
         args.rope_theta = 500_000.0;
         let changed = super::prompt_cache_architecture_fingerprint(&args);
         assert_ne!(first, changed);
+    }
+
+    #[test]
+    fn llama_fingerprint_and_runtime_preserve_distinct_ordered_windows() {
+        let mut args = super::model_args_from_config_value(&serde_json::json!({
+            "model_type": "llama", "hidden_size": 64, "num_hidden_layers": 4,
+            "intermediate_size": 128, "num_attention_heads": 4,
+            "num_key_value_heads": 2, "head_dim": 16, "rms_norm_eps": 0.00001,
+            "vocab_size": 128, "max_position_embeddings": 4096,
+            "rope_theta": 10000.0
+        }))
+        .unwrap();
+        args.attention_schedule = crate::runtime::attention::LayerSchedule::new(
+            4,
+            vec![
+                crate::runtime::attention::AttentionPolicy::Full,
+                crate::runtime::attention::AttentionPolicy::sliding(3).unwrap(),
+                crate::runtime::attention::AttentionPolicy::Full,
+                crate::runtime::attention::AttentionPolicy::sliding(9).unwrap(),
+            ],
+        )
+        .unwrap();
+        super::validate_model_args(&args).unwrap();
+        assert_eq!(
+            args.attention_schedule
+                .iter()
+                .map(|policy| policy.window().map(|window| window.get() as i32))
+                .collect::<Vec<_>>(),
+            vec![None, Some(3), None, Some(9)]
+        );
+        let first = super::prompt_cache_architecture_fingerprint(&args);
+        args.attention_schedule = crate::runtime::attention::LayerSchedule::new(
+            4,
+            vec![
+                crate::runtime::attention::AttentionPolicy::sliding(3).unwrap(),
+                crate::runtime::attention::AttentionPolicy::Full,
+                crate::runtime::attention::AttentionPolicy::Full,
+                crate::runtime::attention::AttentionPolicy::sliding(9).unwrap(),
+            ],
+        )
+        .unwrap();
+        let reordered = super::prompt_cache_architecture_fingerprint(&args);
+        assert_ne!(first, reordered);
     }
 
     #[test]

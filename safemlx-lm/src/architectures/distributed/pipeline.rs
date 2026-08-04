@@ -590,38 +590,37 @@ impl PipelineModel {
         Ok(self.prompt_cache_model_identity()?.architecture_fingerprint)
     }
 
+    /// Returns this stage's exact ordered prompt-cache layout.
+    pub fn prompt_cache_layer_layout(
+        &self,
+    ) -> Result<crate::LayerSchedule<crate::LayerCachePolicy>, Error> {
+        Ok(self.prompt_cache_model_identity()?.layer_layout)
+    }
+
     fn prompt_cache_model_identity(&self) -> Result<PromptCacheModelIdentity, Error> {
-        let (
-            model_family,
-            effective_model_type,
-            architecture_fingerprint,
-            layer_count,
-            range,
-            sliding_window,
-        ) = match &self.stage {
-            ArchitectureStage::Llama(stage) => (
-                "llama".to_string(),
-                stage.args.model_type.clone(),
-                crate::architectures::llama::model::prompt_cache_architecture_fingerprint(
-                    &stage.args,
+        let (model_family, effective_model_type, architecture_fingerprint, layer_count, range) =
+            match &self.stage {
+                ArchitectureStage::Llama(stage) => (
+                    "llama".to_string(),
+                    stage.args.model_type.clone(),
+                    crate::architectures::llama::model::prompt_cache_architecture_fingerprint(
+                        &stage.args,
+                    ),
+                    usize::try_from(stage.args.num_hidden_layers)
+                        .map_err(|_| Error::Parallel("invalid Llama layer count".into()))?,
+                    stage.range.clone(),
                 ),
-                usize::try_from(stage.args.num_hidden_layers)
-                    .map_err(|_| Error::Parallel("invalid Llama layer count".into()))?,
-                stage.range.clone(),
-                crate::architectures::llama::model::uniform_attention_window(&stage.args)
-                    .ok_or_else(|| Error::Parallel("persisted prompt caches for non-uniform Llama/Mistral attention schedules are unsupported because prompt-cache schema v2 stores only one model-wide sliding window".into()))?,
-            ),
-            ArchitectureStage::DeepSeek(stage) => (
-                "deepseek_v3".to_string(),
-                stage.args.model_type.clone(),
-                crate::architectures::deepseek_v3::model::prompt_cache_architecture_fingerprint(
-                    &stage.args,
+                ArchitectureStage::DeepSeek(stage) => (
+                    "deepseek_v3".to_string(),
+                    stage.args.model_type.clone(),
+                    crate::architectures::deepseek_v3::model::prompt_cache_architecture_fingerprint(
+                        &stage.args,
+                    ),
+                    usize::try_from(stage.args.num_hidden_layers)
+                        .map_err(|_| Error::Parallel("invalid DeepSeek layer count".into()))?,
+                    stage.range.clone(),
                 ),
-                stage.args.layer_schedule.len(),
-                stage.range.clone(),
-                None,
-            ),
-        };
+            };
         Ok(PromptCacheModelIdentity {
             model_family,
             effective_model_type,
@@ -629,7 +628,6 @@ impl PipelineModel {
             layer_count,
             global_layer_start: range.start,
             global_layer_end: range.end,
-            sliding_window,
             sink_tokens: 0,
             topology: PromptCacheTopology {
                 pipeline: Some((
@@ -640,9 +638,20 @@ impl PipelineModel {
                 expert_parallel: None,
                 expert_parallel_cache_replicated: true,
             },
-            layer_layouts: match &self.stage {
+            layer_layout: match &self.stage {
                 ArchitectureStage::Llama(stage) => PromptCacheModelIdentity::key_value_layouts(
-                    stage.range.len(),
+                    stage.range.clone().map(|layer| {
+                        stage
+                            .args
+                            .attention_schedule
+                            .get(layer)
+                            .expect("validated Llama pipeline layer range")
+                            .window()
+                            .map(|window| {
+                                i32::try_from(window.get())
+                                    .expect("validated Llama attention window fits i32")
+                            })
+                    }),
                     stage.args.num_key_value_heads,
                     stage.args.head_dim,
                 ),
@@ -651,7 +660,8 @@ impl PipelineModel {
                     stage.args.kv_lora_rank,
                     stage.args.qk_rope_head_dim,
                 ),
-            },
+            }
+            .map_err(|error| Error::Parallel(error.to_string()))?,
         })
     }
 

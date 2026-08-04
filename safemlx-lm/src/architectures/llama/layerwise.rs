@@ -300,16 +300,19 @@ impl LlamaModel {
             layer_count,
             global_layer_start: 0,
             global_layer_end: layer_count,
-            sliding_window: resident::uniform_attention_window(args).ok_or_else(|| {
-                Exception::custom("persisted prompt caches for non-uniform Llama/Mistral attention schedules are unsupported because prompt-cache schema v2 stores only one model-wide sliding window; the ordered schedule remains part of the architecture fingerprint")
-            })?,
             sink_tokens: 0,
             topology: Default::default(),
-            layer_layouts: PromptCacheModelIdentity::key_value_layouts(
-                layer_count,
+            layer_layout: PromptCacheModelIdentity::key_value_layouts(
+                args.attention_schedule.iter().map(|policy| {
+                    policy.window().map(|window| {
+                        i32::try_from(window.get())
+                            .expect("validated Llama attention window fits i32")
+                    })
+                }),
                 args.num_key_value_heads,
                 args.head_dim,
-            ),
+            )
+            .map_err(|error| Exception::custom(error.to_string()))?,
         };
         validate_prompt_cache_model_identity(expected, &identity)
             .map_err(|error| Exception::custom(error.to_string()))?;

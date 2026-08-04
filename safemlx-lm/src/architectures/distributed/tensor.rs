@@ -404,37 +404,35 @@ impl TensorParallelModel {
         Ok(self.prompt_cache_model_identity()?.architecture_fingerprint)
     }
 
+    /// Returns this rank's exact ordered prompt-cache layout.
+    pub fn prompt_cache_layer_layout(
+        &self,
+    ) -> Result<crate::LayerSchedule<crate::LayerCachePolicy>, Error> {
+        Ok(self.prompt_cache_model_identity()?.layer_layout)
+    }
+
     fn prompt_cache_model_identity(&self) -> Result<PromptCacheModelIdentity, Error> {
-        let (
-            model_family,
-            effective_model_type,
-            architecture_fingerprint,
-            layer_count,
-            sliding_window,
-        ) = match &self.architecture {
-            TensorArchitecture::Llama(model) => (
-                "llama".to_string(),
-                model.global_args.model_type.clone(),
-                crate::architectures::llama::model::prompt_cache_architecture_fingerprint(
-                    &model.global_args,
+        let (model_family, effective_model_type, architecture_fingerprint, layer_count) =
+            match &self.architecture {
+                TensorArchitecture::Llama(model) => (
+                    "llama".to_string(),
+                    model.global_args.model_type.clone(),
+                    crate::architectures::llama::model::prompt_cache_architecture_fingerprint(
+                        &model.global_args,
+                    ),
+                    usize::try_from(model.global_args.num_hidden_layers)
+                        .map_err(|_| Error::Parallel("invalid Llama layer count".into()))?,
                 ),
-                usize::try_from(model.global_args.num_hidden_layers)
-                    .map_err(|_| Error::Parallel("invalid Llama layer count".into()))?,
-                crate::architectures::llama::model::uniform_attention_window(
-                    &model.global_args,
-                )
-                .ok_or_else(|| Error::Parallel("persisted prompt caches for non-uniform Llama/Mistral attention schedules are unsupported because prompt-cache schema v2 stores only one model-wide sliding window".into()))?,
-            ),
-            TensorArchitecture::DeepSeek(model) => (
-                "deepseek_v3".to_string(),
-                model.global_args.model_type.clone(),
-                crate::architectures::deepseek_v3::model::prompt_cache_architecture_fingerprint(
-                    &model.global_args,
+                TensorArchitecture::DeepSeek(model) => (
+                    "deepseek_v3".to_string(),
+                    model.global_args.model_type.clone(),
+                    crate::architectures::deepseek_v3::model::prompt_cache_architecture_fingerprint(
+                        &model.global_args,
+                    ),
+                    usize::try_from(model.global_args.num_hidden_layers)
+                        .map_err(|_| Error::Parallel("invalid DeepSeek layer count".into()))?,
                 ),
-                model.global_args.layer_schedule.len(),
-                None,
-            ),
-        };
+            };
         Ok(PromptCacheModelIdentity {
             model_family,
             effective_model_type,
@@ -442,7 +440,6 @@ impl TensorParallelModel {
             layer_count,
             global_layer_start: 0,
             global_layer_end: layer_count,
-            sliding_window,
             sink_tokens: 0,
             topology: PromptCacheTopology {
                 pipeline: None,
@@ -453,7 +450,7 @@ impl TensorParallelModel {
                 expert_parallel: None,
                 expert_parallel_cache_replicated: true,
             },
-            layer_layouts: match &self.architecture {
+            layer_layout: match &self.architecture {
                 TensorArchitecture::Llama(model) => {
                     let local_kv_heads = exact_division(
                         "Llama prompt-cache KV heads",
@@ -461,7 +458,12 @@ impl TensorParallelModel {
                         self.topology.tensor_parallel_size,
                     )?;
                     PromptCacheModelIdentity::key_value_layouts(
-                        layer_count,
+                        model.global_args.attention_schedule.iter().map(|policy| {
+                            policy.window().map(|window| {
+                                i32::try_from(window.get())
+                                    .expect("validated Llama attention window fits i32")
+                            })
+                        }),
                         local_kv_heads,
                         model.global_args.head_dim,
                     )
@@ -473,7 +475,8 @@ impl TensorParallelModel {
                         model.global_args.qk_rope_head_dim,
                     )
                 }
-            },
+            }
+            .map_err(|error| Error::Parallel(error.to_string()))?,
         })
     }
 

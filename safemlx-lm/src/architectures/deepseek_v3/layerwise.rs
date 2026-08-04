@@ -94,14 +94,14 @@ impl DeepSeekV3LayerwiseModel {
             layer_count,
             global_layer_start: 0,
             global_layer_end: layer_count,
-            sliding_window: None,
             sink_tokens: 0,
             topology: Default::default(),
-            layer_layouts: PromptCacheModelIdentity::compressed_layouts(
+            layer_layout: PromptCacheModelIdentity::compressed_layouts(
                 layer_count,
                 args.kv_lora_rank,
                 args.qk_rope_head_dim,
-            ),
+            )
+            .map_err(|error| Exception::custom(error.to_string()))?,
         };
         validate_prompt_cache_model_identity(expected, &identity)
             .map_err(|error| Exception::custom(error.to_string()))?;

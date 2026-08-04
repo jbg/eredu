@@ -1,9 +1,11 @@
 //! Architecture-neutral decoder layer schedules and attention geometry.
 
+use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, fmt, num::NonZeroU32};
 
 /// Attention behavior for one decoder layer.
-#[derive(Debug, Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(Debug, Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum AttentionPolicy {
     /// Attend to the complete causal prefix.
     Full,
@@ -35,7 +37,8 @@ impl AttentionPolicy {
 /// The policy type is architecture-defined. Pure-attention decoders use
 /// `LayerSchedule<AttentionPolicy>`; hybrid decoders can use their own policy
 /// enum without weakening layer-count validation or indexed access.
-#[derive(Debug, Clone, Eq, Hash, PartialEq)]
+#[derive(Debug, Clone, Eq, Hash, PartialEq, Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct LayerSchedule<P> {
     layers: Box<[P]>,
 }

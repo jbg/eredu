@@ -1695,6 +1695,11 @@ impl LoadedModel {
         self.model.prompt_cache_architecture_fingerprint()
     }
 
+    /// Returns the exact ordered prompt-cache state and attention layout.
+    pub fn prompt_cache_layer_layout(&self) -> Result<LayerSchedule<LayerCachePolicy>, Exception> {
+        self.model.prompt_cache_layer_layout()
+    }
+
     /// Lazily catalogs a compatible reusable text prefix for this loaded model.
     pub fn load_prompt_cache(
         &self,
