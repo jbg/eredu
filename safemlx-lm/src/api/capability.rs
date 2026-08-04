@@ -990,17 +990,15 @@ fn gemma4_spec(
 ) -> Result<Spec, CapabilityError> {
     let context = context_from_rope(args.max_position_embeddings, args.rope_scaling.as_ref())?;
     let layers = positive(args.num_hidden_layers, "num_hidden_layers")?;
-    let shared = positive(args.num_kv_shared_layers, "num_kv_shared_layers")?;
-    if shared > layers {
-        return Err(CapabilityError::InvalidConfiguration {
-            field: "num_kv_shared_layers",
-            detail: format!("{shared} shared layers exceed {layers} total layers"),
-        });
-    }
+    let shared = args
+        .layer_schedule
+        .iter()
+        .filter(|policy| !policy.key_value.owns_state())
+        .count() as u64;
     let cached = layers - shared;
     let mut sliding_by_window = BTreeMap::<u64, u64>::new();
-    for policy in args.attention_schedule.iter() {
-        if let Some(window) = policy.window() {
+    for policy in args.layer_schedule.iter() {
+        if let Some(window) = policy.attention.window() {
             *sliding_by_window
                 .entry(u64::from(window.get()))
                 .or_default() += 1;
@@ -1008,23 +1006,10 @@ fn gemma4_spec(
     }
     let total_sliding = sliding_by_window.values().sum::<u64>();
     let full_attention_layers = layers - total_sliding;
-    let mut cached_sliding = 0;
-    for policy in args.attention_schedule.iter().take(cached as usize) {
-        if policy.window().is_some() {
-            cached_sliding += 1;
-        }
-    }
-    let cached_full = cached - cached_sliding;
     let sliding_attention = sliding_by_window
         .into_iter()
         .map(|(window, layers)| SlidingWindowLayerCount { window, layers })
         .collect();
-    let local_scalars = kv_scalars(args.num_key_value_heads, args.head_dim)?;
-    let global_scalars = kv_scalars(
-        args.num_global_key_value_heads
-            .unwrap_or(args.num_key_value_heads),
-        args.global_head_dim.unwrap_or(args.head_dim),
-    )?;
     let decoder = if shared > 0 || total_sliding > 0 {
         CacheStateStrategy::SharedFullKv {
             cached_layers: cached,
@@ -1050,19 +1035,28 @@ fn gemma4_spec(
         modalities,
         ArchitectureEstimate {
             fixed_scalars_per_batch: 0,
-            growing: vec![
-                GrowingState {
-                    layers: cached_full,
-                    scalars_per_position: global_scalars,
-                    window: None,
-                },
-                GrowingState {
-                    layers: cached_sliding,
-                    scalars_per_position: local_scalars,
-                    // Gemma masks sliding attention but retains full KV.
-                    window: None,
-                },
-            ],
+            growing: {
+                let mut groups = BTreeMap::<u64, u64>::new();
+                for policy in args
+                    .layer_schedule
+                    .iter()
+                    .filter(|policy| policy.key_value.owns_state())
+                {
+                    let scalars = 2
+                        * u64::from(policy.num_key_value_heads.get())
+                        * u64::from(policy.head_dim.get());
+                    *groups.entry(scalars).or_default() += 1;
+                }
+                groups
+                    .into_iter()
+                    .map(|(scalars_per_position, layers)| GrowingState {
+                        layers,
+                        scalars_per_position,
+                        // Gemma masks sliding attention but retains full KV backing.
+                        window: None,
+                    })
+                    .collect()
+            },
             hidden_size: positive(args.hidden_size, "hidden_size")?,
             allocation_granularity: 256,
             completeness: EstimationCompleteness::Complete,
@@ -3367,26 +3361,26 @@ mod tests {
     }
 
     fn tiny_gemma4() -> gemma4::ModelArgs {
+        let layer = |attention, key_value| gemma4::LayerPolicy {
+            attention,
+            head_dim: std::num::NonZeroU32::new(4).unwrap(),
+            num_key_value_heads: std::num::NonZeroU32::new(1).unwrap(),
+            key_value,
+            intermediate_size: std::num::NonZeroU32::new(16).unwrap(),
+            feed_forward: gemma4::FeedForwardPolicy::Dense,
+        };
         gemma4::ModelArgs {
             model_type: "gemma4_unified".into(),
             hidden_size: 8,
             num_hidden_layers: 4,
-            intermediate_size: 16,
-            use_double_wide_mlp: false,
-            feed_forward_lengths: None,
             num_attention_heads: 2,
             rms_norm_eps: 1e-5,
             vocab_size: 32,
             pad_token_id: 0,
-            num_key_value_heads: 1,
-            num_global_key_value_heads: Some(1),
             max_position_embeddings: 128,
             rope_theta: 10_000.0,
-            head_dim: 4,
-            global_head_dim: Some(4),
             tie_word_embeddings: true,
             attention_bias: false,
-            attention_k_eq_v: false,
             quantized: false,
             weight_quantization: None,
             quantized_weights: None,
@@ -3395,19 +3389,32 @@ mod tests {
             quantization_bits: 4,
             hidden_size_per_layer_input: 0,
             vocab_size_per_layer_input: None,
-            num_kv_shared_layers: 1,
-            attention_schedule: crate::runtime::attention::LayerSchedule::new(
+            layer_schedule: crate::runtime::attention::LayerSchedule::new(
                 4,
                 vec![
-                    AttentionPolicy::sliding(4).unwrap(),
-                    AttentionPolicy::Full,
-                    AttentionPolicy::sliding(4).unwrap(),
-                    AttentionPolicy::Full,
+                    layer(
+                        AttentionPolicy::sliding(4).unwrap(),
+                        gemma4::KeyValuePolicy::Local {
+                            value: gemma4::ValuePolicy::Projected,
+                        },
+                    ),
+                    layer(
+                        AttentionPolicy::Full,
+                        gemma4::KeyValuePolicy::Publish {
+                            value: gemma4::ValuePolicy::Projected,
+                        },
+                    ),
+                    layer(
+                        AttentionPolicy::sliding(4).unwrap(),
+                        gemma4::KeyValuePolicy::Local {
+                            value: gemma4::ValuePolicy::Projected,
+                        },
+                    ),
+                    layer(AttentionPolicy::Full, gemma4::KeyValuePolicy::Shared),
                 ],
             )
             .unwrap(),
             final_logit_softcapping: None,
-            enable_moe_block: false,
             num_experts: None,
             top_k_experts: None,
             moe_intermediate_size: None,
@@ -3864,14 +3871,23 @@ mod tests {
     #[test]
     fn gemma4_capabilities_report_each_exact_sliding_window() {
         let mut args = tiny_gemma4();
-        args.attention_schedule = crate::runtime::attention::LayerSchedule::new(
+        let attentions = [
+            AttentionPolicy::sliding(3).unwrap(),
+            AttentionPolicy::Full,
+            AttentionPolicy::sliding(5).unwrap(),
+            AttentionPolicy::Full,
+        ];
+        args.layer_schedule = crate::runtime::attention::LayerSchedule::new(
             4,
-            vec![
-                AttentionPolicy::sliding(3).unwrap(),
-                AttentionPolicy::Full,
-                AttentionPolicy::sliding(5).unwrap(),
-                AttentionPolicy::Full,
-            ],
+            args.layer_schedule
+                .iter()
+                .copied()
+                .zip(attentions)
+                .map(|(policy, attention)| gemma4::LayerPolicy {
+                    attention,
+                    ..policy
+                })
+                .collect(),
         )
         .unwrap();
         let (_, _, strategy, _, _) = gemma4_spec(&args, text_modalities()).unwrap();
@@ -3893,6 +3909,23 @@ mod tests {
                 ],
             }
         );
+    }
+
+    #[test]
+    fn gemma4_runtime_state_uses_each_scheduled_kv_geometry() {
+        let mut args = tiny_gemma4();
+        let mut policies = args.layer_schedule.iter().copied().collect::<Vec<_>>();
+        policies[0].head_dim = std::num::NonZeroU32::new(8).unwrap();
+        args.layer_schedule = crate::runtime::attention::LayerSchedule::new(4, policies).unwrap();
+
+        let (_, _, _, _, layout) = gemma4_spec(&args, text_modalities()).unwrap();
+        assert_eq!(layout.growing.len(), 2);
+        assert_eq!(layout.growing[0].layers, 2);
+        assert_eq!(layout.growing[0].scalars_per_position, 8);
+        assert_eq!(layout.growing[0].window, None);
+        assert_eq!(layout.growing[1].layers, 1);
+        assert_eq!(layout.growing[1].scalars_per_position, 16);
+        assert_eq!(layout.growing[1].window, None);
     }
 
     #[test]

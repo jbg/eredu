@@ -2,7 +2,8 @@
 
 use std::{
     cell::RefCell,
-    collections::{HashMap, HashSet},
+    collections::{BTreeSet, HashMap, HashSet},
+    num::NonZeroU32,
     path::Path,
     time::Instant,
 };
@@ -363,12 +364,6 @@ pub struct ModelArgs {
     pub hidden_size: i32,
     /// Number of decoder layers.
     pub num_hidden_layers: i32,
-    /// Dense MLP intermediate size.
-    pub intermediate_size: i32,
-    /// Whether final shared-KV layers use twice the base MLP width.
-    pub use_double_wide_mlp: bool,
-    /// Optional GGUF-provided per-layer MLP widths.
-    pub feed_forward_lengths: Option<Vec<i32>>,
     /// Number of query attention heads.
     pub num_attention_heads: i32,
     /// RMSNorm epsilon.
@@ -377,24 +372,14 @@ pub struct ModelArgs {
     pub vocab_size: i32,
     /// Padding token used for media positions in per-layer embeddings.
     pub pad_token_id: i32,
-    /// Number of key/value heads for sliding attention.
-    pub num_key_value_heads: i32,
-    /// Optional number of key/value heads for full attention.
-    pub num_global_key_value_heads: Option<i32>,
     /// Maximum configured sequence length.
     pub max_position_embeddings: i32,
     /// Default RoPE base frequency.
     pub rope_theta: f32,
-    /// Per-head dimension for sliding attention.
-    pub head_dim: i32,
-    /// Optional per-head dimension for full attention.
-    pub global_head_dim: Option<i32>,
     /// Whether logits use tied input embeddings.
     pub tie_word_embeddings: bool,
     /// Whether attention projections include bias terms.
     pub attention_bias: bool,
-    /// Whether full-attention keys are reused as values.
-    pub attention_k_eq_v: bool,
     /// Whether Gemma-specific quantized tensors are expected.
     pub quantized: bool,
     /// Model-wide SafeTensors quantization encoding.
@@ -411,14 +396,10 @@ pub struct ModelArgs {
     pub hidden_size_per_layer_input: i32,
     /// Optional vocabulary size for per-layer input embeddings.
     pub vocab_size_per_layer_input: Option<i32>,
-    /// Number of final layers that consume shared key/value states.
-    pub num_kv_shared_layers: i32,
-    /// Authoritative full/sliding policy in decoder-layer order.
-    pub attention_schedule: LayerSchedule<AttentionPolicy>,
+    /// Authoritative execution and state policy in decoder-layer order.
+    pub layer_schedule: LayerSchedule<LayerPolicy>,
     /// Optional final-logit soft cap.
     pub final_logit_softcapping: Option<f32>,
-    /// Whether the config requests a Gemma MoE block.
-    pub enable_moe_block: bool,
     /// Number of experts when MoE is present.
     pub num_experts: Option<i32>,
     /// Number of selected experts when MoE is present.
@@ -429,6 +410,113 @@ pub struct ModelArgs {
     pub rope_scaling: Option<HashMap<String, FloatOrString>>,
     /// Per-attention-kind RoPE parameter overrides.
     pub rope_parameters: Option<HashMap<String, HashMap<String, FloatOrString>>>,
+}
+
+#[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
+/// Value-projection topology for a Gemma attention layer that owns KV state.
+pub enum ValuePolicy {
+    /// Project values independently from keys.
+    Projected,
+    /// Reuse the projected keys as values.
+    ReuseKey,
+}
+
+#[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
+/// Key/value ownership and sharing role for one Gemma layer.
+pub enum KeyValuePolicy {
+    /// Own KV projections and keep the resulting state local to this layer.
+    Local {
+        /// Whether values are projected independently or reuse keys.
+        value: ValuePolicy,
+    },
+    /// Own KV projections and publish the resulting state to shared layers.
+    Publish {
+        /// Whether values are projected independently or reuse keys.
+        value: ValuePolicy,
+    },
+    /// Consume KV state published by an earlier layer or supplied externally.
+    Shared,
+}
+
+impl KeyValuePolicy {
+    /// Returns whether this layer owns key/value projections and cache state.
+    pub const fn owns_state(self) -> bool {
+        !matches!(self, Self::Shared)
+    }
+
+    /// Returns whether this layer publishes its KV state for reuse.
+    pub const fn publishes_state(self) -> bool {
+        matches!(self, Self::Publish { .. })
+    }
+
+    /// Returns the value policy for a KV-owning layer.
+    pub const fn value(self) -> Option<ValuePolicy> {
+        match self {
+            Self::Local { value } | Self::Publish { value } => Some(value),
+            Self::Shared => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
+/// Feed-forward topology selected for one Gemma layer.
+pub enum FeedForwardPolicy {
+    /// Dense gated MLP only.
+    Dense,
+    /// Dense gated MLP combined with a routed sparse-expert branch.
+    DenseWithSparseMoe,
+}
+
+#[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
+/// Complete execution and state policy for one Gemma decoder layer.
+pub struct LayerPolicy {
+    /// Full or exact-window sliding attention.
+    pub attention: AttentionPolicy,
+    /// Exact positive attention head dimension.
+    pub head_dim: NonZeroU32,
+    /// Exact positive key/value-head count.
+    pub num_key_value_heads: NonZeroU32,
+    /// KV ownership, publication, and value-projection topology.
+    pub key_value: KeyValuePolicy,
+    /// Exact positive dense MLP intermediate width.
+    pub intermediate_size: NonZeroU32,
+    /// Dense-only or dense-plus-sparse-MoE feed-forward topology.
+    pub feed_forward: FeedForwardPolicy,
+}
+
+impl LayerPolicy {
+    /// Returns a stable representation for architecture and cache identity.
+    pub fn fingerprint_component(self) -> String {
+        let attention = match self.attention {
+            AttentionPolicy::Full => "f".to_string(),
+            AttentionPolicy::Sliding { window } => format!("s{}", window.get()),
+        };
+        let key_value = match self.key_value {
+            KeyValuePolicy::Local {
+                value: ValuePolicy::Projected,
+            } => "lp",
+            KeyValuePolicy::Local {
+                value: ValuePolicy::ReuseKey,
+            } => "lr",
+            KeyValuePolicy::Publish {
+                value: ValuePolicy::Projected,
+            } => "pp",
+            KeyValuePolicy::Publish {
+                value: ValuePolicy::ReuseKey,
+            } => "pr",
+            KeyValuePolicy::Shared => "s",
+        };
+        let feed_forward = match self.feed_forward {
+            FeedForwardPolicy::Dense => "d",
+            FeedForwardPolicy::DenseWithSparseMoe => "m",
+        };
+        format!(
+            "{attention}:h{}:k{}:{key_value}:i{}:{feed_forward}",
+            self.head_dim.get(),
+            self.num_key_value_heads.get(),
+            self.intermediate_size.get()
+        )
+    }
 }
 
 fn default_model_type() -> String {
@@ -571,26 +659,82 @@ pub(super) fn attention_schedule_from_pattern(
 
 pub(super) fn model_args_from_source(source: ModelArgsSource) -> Result<ModelArgs, Error> {
     let attention_schedule = attention_schedule_from_source(&source)?;
+    let layer_count = usize::try_from(source.num_hidden_layers).map_err(|_| {
+        Error::UnsupportedArchitecture(format!(
+            "Gemma 4 layer count must be positive, got {}",
+            source.num_hidden_layers
+        ))
+    })?;
+    let first_shared_layer = source.num_hidden_layers - source.num_kv_shared_layers;
+    let feed_forward_lengths = match source.feed_forward_lengths.as_ref() {
+        Some(lengths) => lengths.clone(),
+        None => (0..layer_count)
+            .map(|layer| {
+                if source.use_double_wide_mlp && layer as i32 >= first_shared_layer {
+                    source.intermediate_size.checked_mul(2).ok_or_else(|| {
+                        Error::UnsupportedArchitecture(
+                            "Gemma 4 doubled MLP width exceeds i32".into(),
+                        )
+                    })
+                } else {
+                    Ok(source.intermediate_size)
+                }
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+    };
+    let kv_heads = attention_schedule
+        .iter()
+        .map(|attention| {
+            if *attention == AttentionPolicy::Full {
+                source
+                    .num_global_key_value_heads
+                    .unwrap_or(source.num_key_value_heads)
+            } else {
+                source.num_key_value_heads
+            }
+        })
+        .collect::<Vec<_>>();
+    let head_dims = attention_schedule
+        .iter()
+        .map(|attention| {
+            if *attention == AttentionPolicy::Full {
+                source.global_head_dim.unwrap_or(source.head_dim)
+            } else {
+                source.head_dim
+            }
+        })
+        .collect::<Vec<_>>();
+    let layer_schedule = layer_schedule_from_parts(
+        &attention_schedule,
+        &feed_forward_lengths,
+        &kv_heads,
+        &head_dims,
+        source.num_kv_shared_layers,
+        &attention_schedule
+            .iter()
+            .map(|attention| {
+                if source.attention_k_eq_v && *attention == AttentionPolicy::Full {
+                    ValuePolicy::ReuseKey
+                } else {
+                    ValuePolicy::Projected
+                }
+            })
+            .collect::<Vec<_>>(),
+        source.enable_moe_block,
+        "Gemma 4",
+    )?;
     Ok(ModelArgs {
         model_type: source.model_type,
         hidden_size: source.hidden_size,
         num_hidden_layers: source.num_hidden_layers,
-        intermediate_size: source.intermediate_size,
-        use_double_wide_mlp: source.use_double_wide_mlp,
-        feed_forward_lengths: source.feed_forward_lengths,
         num_attention_heads: source.num_attention_heads,
         rms_norm_eps: source.rms_norm_eps,
         vocab_size: source.vocab_size,
         pad_token_id: source.pad_token_id,
-        num_key_value_heads: source.num_key_value_heads,
-        num_global_key_value_heads: source.num_global_key_value_heads,
         max_position_embeddings: source.max_position_embeddings,
         rope_theta: source.rope_theta,
-        head_dim: source.head_dim,
-        global_head_dim: source.global_head_dim,
         tie_word_embeddings: source.tie_word_embeddings,
         attention_bias: source.attention_bias,
-        attention_k_eq_v: source.attention_k_eq_v,
         quantized: source.quantized,
         weight_quantization: source.weight_quantization,
         quantized_weights: source.quantized_weights,
@@ -599,16 +743,132 @@ pub(super) fn model_args_from_source(source: ModelArgsSource) -> Result<ModelArg
         quantization_bits: source.quantization_bits,
         hidden_size_per_layer_input: source.hidden_size_per_layer_input,
         vocab_size_per_layer_input: source.vocab_size_per_layer_input,
-        num_kv_shared_layers: source.num_kv_shared_layers,
-        attention_schedule,
+        layer_schedule,
         final_logit_softcapping: source.final_logit_softcapping,
-        enable_moe_block: source.enable_moe_block,
         num_experts: source.num_experts,
         top_k_experts: source.top_k_experts,
         moe_intermediate_size: source.moe_intermediate_size,
         rope_scaling: source.rope_scaling,
         rope_parameters: source.rope_parameters,
     })
+}
+
+pub(super) fn layer_schedule_from_parts(
+    attention: &LayerSchedule<AttentionPolicy>,
+    feed_forward_lengths: &[i32],
+    kv_heads: &[i32],
+    head_dims: &[i32],
+    shared_layers: i32,
+    value_policies: &[ValuePolicy],
+    enable_moe: bool,
+    source: &str,
+) -> Result<LayerSchedule<LayerPolicy>, Error> {
+    let layer_count = attention.len();
+    for (name, values) in [
+        ("feed-forward widths", feed_forward_lengths),
+        ("KV-head counts", kv_heads),
+        ("head dimensions", head_dims),
+    ] {
+        if values.len() != layer_count {
+            return Err(Error::UnsupportedArchitecture(format!(
+                "{source} {name} has {} entries for {layer_count} layers",
+                values.len()
+            )));
+        }
+    }
+    if value_policies.len() != layer_count {
+        return Err(Error::UnsupportedArchitecture(format!(
+            "{source} value policies has {} entries for {layer_count} layers",
+            value_policies.len()
+        )));
+    }
+    let shared_layers = usize::try_from(shared_layers).map_err(|_| {
+        Error::UnsupportedArchitecture(format!(
+            "{source} shared-KV layer count must be non-negative, got {shared_layers}"
+        ))
+    })?;
+    if shared_layers > layer_count {
+        return Err(Error::UnsupportedArchitecture(format!(
+            "{source} shared-KV layer count {shared_layers} exceeds {layer_count} layers"
+        )));
+    }
+    let first_shared = layer_count - shared_layers;
+    for layer in first_shared..layer_count {
+        if let Some(provider) = attention
+            .iter()
+            .take(first_shared)
+            .enumerate()
+            .filter_map(|(index, candidate)| {
+                (*candidate == *attention.get(layer).expect("validated schedule")).then_some(index)
+            })
+            .last()
+        {
+            if kv_heads[provider] != kv_heads[layer] || head_dims[provider] != head_dims[layer] {
+                return Err(Error::UnsupportedArchitecture(format!(
+                    "{source} shared-KV layer {layer} geometry does not match publishing layer {provider}"
+                )));
+            }
+        }
+    }
+    let shared_attention = attention
+        .iter()
+        .skip(first_shared)
+        .copied()
+        .collect::<HashSet<_>>();
+    let publishers = shared_attention
+        .into_iter()
+        .filter_map(|required| {
+            attention
+                .iter()
+                .take(first_shared)
+                .enumerate()
+                .filter_map(|(index, candidate)| (*candidate == required).then_some(index))
+                .last()
+        })
+        .collect::<HashSet<_>>();
+    let positive = |name: &str, layer: usize, value: i32| {
+        u32::try_from(value)
+            .ok()
+            .and_then(NonZeroU32::new)
+            .ok_or_else(|| {
+                Error::UnsupportedArchitecture(format!(
+                    "{source} {name} for layer {layer} must be positive and fit u32, got {value}"
+                ))
+            })
+    };
+    let policies = attention
+        .iter()
+        .copied()
+        .enumerate()
+        .map(|(layer, attention)| {
+            let value = value_policies[layer];
+            let key_value = if layer >= first_shared {
+                KeyValuePolicy::Shared
+            } else if publishers.contains(&layer) {
+                KeyValuePolicy::Publish { value }
+            } else {
+                KeyValuePolicy::Local { value }
+            };
+            Ok(LayerPolicy {
+                attention,
+                head_dim: positive("head dimension", layer, head_dims[layer])?,
+                num_key_value_heads: positive("KV-head count", layer, kv_heads[layer])?,
+                key_value,
+                intermediate_size: positive(
+                    "feed-forward width",
+                    layer,
+                    feed_forward_lengths[layer],
+                )?,
+                feed_forward: if enable_moe {
+                    FeedForwardPolicy::DenseWithSparseMoe
+                } else {
+                    FeedForwardPolicy::Dense
+                },
+            })
+        })
+        .collect::<Result<Vec<_>, Error>>()?;
+    LayerSchedule::new(layer_count, policies)
+        .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))
 }
 
 impl ModelArgs {
@@ -643,39 +903,16 @@ impl ModelArgs {
                 .is_none_or(|weights| weights.contains(weight_name))
     }
 
-    pub(crate) fn feed_forward_length_for_layer(&self, layer_index: usize) -> i32 {
-        if let Some(lengths) = &self.feed_forward_lengths {
-            return lengths
-                .get(layer_index)
-                .copied()
-                .unwrap_or(self.intermediate_size);
-        }
-        let first_shared_layer = self.num_hidden_layers - self.num_kv_shared_layers;
-        if self.use_double_wide_mlp && layer_index as i32 >= first_shared_layer {
-            self.intermediate_size * 2
-        } else {
-            self.intermediate_size
-        }
-    }
-
-    fn for_layer(&self, policy: AttentionPolicy) -> Self {
+    fn rope_args_for_layer(&self, policy: AttentionPolicy) -> Self {
         let mut args = self.clone();
-        if policy == AttentionPolicy::Full {
-            if let Some(global_head_dim) = self.global_head_dim {
-                args.head_dim = global_head_dim;
-            }
-            if let Some(global_kv_heads) = self.num_global_key_value_heads {
-                args.num_key_value_heads = global_kv_heads;
-            }
-        }
         args.rope_theta = self.rope_theta_for_layer(policy);
         args.rope_scaling = self.rope_scaling_for_layer(policy);
         args
     }
 
-    /// Returns one validated layer policy without a fallback.
-    pub fn attention_policy(&self, index: usize) -> Option<&AttentionPolicy> {
-        self.attention_schedule.get(index)
+    /// Returns one complete validated layer policy without a fallback.
+    pub fn layer_policy(&self, index: usize) -> Option<&LayerPolicy> {
+        self.layer_schedule.get(index)
     }
 
     pub(crate) fn rope_theta_for_layer(&self, policy: AttentionPolicy) -> f32 {
@@ -711,10 +948,11 @@ impl ModelArgs {
 
 pub(crate) fn prompt_cache_architecture_fingerprint(args: &ModelArgs) -> String {
     let layer_rope = args
-        .attention_schedule
+        .layer_schedule
         .iter()
         .copied()
-        .map(|policy| {
+        .map(|layer| {
+            let policy = layer.attention;
             let mut scaling = args
                 .rope_scaling_for_layer(policy)
                 .unwrap_or_default()
@@ -738,25 +976,17 @@ pub(crate) fn prompt_cache_architecture_fingerprint(args: &ModelArgs) -> String 
             ("hidden_size", args.hidden_size.to_string()),
             ("num_hidden_layers", args.num_hidden_layers.to_string()),
             ("num_attention_heads", args.num_attention_heads.to_string()),
-            ("num_key_value_heads", args.num_key_value_heads.to_string()),
-            (
-                "num_global_key_value_heads",
-                format!("{:?}", args.num_global_key_value_heads),
-            ),
-            ("head_dim", args.head_dim.to_string()),
-            ("global_head_dim", format!("{:?}", args.global_head_dim)),
             (
                 "max_position_embeddings",
                 args.max_position_embeddings.to_string(),
             ),
             (
-                "num_kv_shared_layers",
-                args.num_kv_shared_layers.to_string(),
-            ),
-            ("attention_k_eq_v", args.attention_k_eq_v.to_string()),
-            (
-                "attention_schedule",
-                args.attention_schedule.fingerprint_component(),
+                "layer_schedule",
+                args.layer_schedule
+                    .iter()
+                    .map(|policy| policy.fingerprint_component())
+                    .collect::<Vec<_>>()
+                    .join(","),
             ),
             ("layer_rope", layer_rope),
         ],
@@ -892,14 +1122,10 @@ pub struct Attention {
     pub n_kv_heads: i32,
     /// Attention scaling factor.
     pub scale: f32,
-    /// Whether key projections are reused as value projections.
-    pub attention_k_eq_v: bool,
     /// Exact full/sliding attention policy.
     pub policy: AttentionPolicy,
-    /// Whether this layer reads shared key/value states from another layer.
-    pub is_kv_shared_layer: bool,
-    /// Whether this layer stores full-length key/value states for sharing.
-    pub store_full_length_kv: bool,
+    /// KV ownership, sharing, publication, and value-projection policy.
+    pub key_value_policy: KeyValuePolicy,
 
     #[quantizable]
     #[param]
@@ -932,28 +1158,18 @@ impl Attention {
     /// Creates an unloaded Gemma 4 attention layer.
     pub fn new(
         args: &ModelArgs,
-        policy: AttentionPolicy,
+        layer_policy: LayerPolicy,
         layer_idx: usize,
         stream: &Stream,
     ) -> Result<Self, Exception> {
         let dim = args.hidden_size;
         let n_heads = args.num_attention_heads;
-        let n_kv_heads = args.num_key_value_heads;
-        let head_dim = args.head_dim;
+        let n_kv_heads = layer_policy.num_key_value_heads.get() as i32;
+        let head_dim = layer_policy.head_dim.get() as i32;
         let scale = 1.0;
-        let attention_k_eq_v = args.attention_k_eq_v && policy == AttentionPolicy::Full;
-        let first_kv_shared_layer_idx = args.num_hidden_layers - args.num_kv_shared_layers;
-        let is_kv_shared_layer =
-            args.num_kv_shared_layers > 0 && layer_idx as i32 >= first_kv_shared_layer_idx;
-        let store_full_length_kv = if args.num_kv_shared_layers > 0 && !is_kv_shared_layer {
-            let first_kv_shared_layer_idx = first_kv_shared_layer_idx.max(0) as usize;
-            (0..first_kv_shared_layer_idx)
-                .rev()
-                .find(|index| args.attention_policy(*index) == Some(&policy))
-                .is_some_and(|index| index == layer_idx)
-        } else {
-            false
-        };
+        let policy = layer_policy.attention;
+        let is_kv_shared_layer = !layer_policy.key_value.owns_state();
+        let attention_k_eq_v = layer_policy.key_value.value() == Some(ValuePolicy::ReuseKey);
 
         let prefix = format!("model.language_model.layers.{layer_idx}.self_attn");
         let q_proj = maybe_quantized_linear_with_config(
@@ -1015,10 +1231,8 @@ impl Attention {
             n_heads,
             n_kv_heads,
             scale,
-            attention_k_eq_v,
             policy,
-            is_kv_shared_layer,
-            store_full_length_kv,
+            key_value_policy: layer_policy.key_value,
             q_proj,
             k_proj,
             v_proj,
@@ -1096,7 +1310,7 @@ where
             stream,
         )?;
 
-        let (keys, values) = if self.is_kv_shared_layer {
+        let (keys, values) = if !self.key_value_policy.owns_state() {
             shared_kv
                 .as_ref()
                 .and_then(|shared_kv| shared_kv.get(&self.policy))
@@ -1108,7 +1322,7 @@ where
                 .as_mut()
                 .ok_or_else(|| Exception::custom("missing Gemma 4 key projection"))?
                 .forward(x, stream)?;
-            let values = if self.attention_k_eq_v {
+            let values = if self.key_value_policy.value() == Some(ValuePolicy::ReuseKey) {
                 keys.clone()
             } else {
                 self.v_proj
@@ -1137,17 +1351,20 @@ where
             if let Some(cache) = cache.as_mut() {
                 (keys, values) = cache.update_and_fetch(keys, values, stream)?;
             }
-            if let Some(shared_kv) = shared_kv.as_mut() {
-                shared_kv.insert(self.policy, (keys.clone(), values.clone()));
+            if self.key_value_policy.publishes_state() {
+                if let Some(shared_kv) = shared_kv.as_mut() {
+                    shared_kv.insert(self.policy, (keys.clone(), values.clone()));
+                }
             }
             (keys, values)
         };
 
-        let attention_cache = if self.is_kv_shared_layer || shared_kv.is_some() {
-            None
-        } else {
-            cache
-        };
+        let attention_cache =
+            if !self.key_value_policy.owns_state() || self.key_value_policy.publishes_state() {
+                None
+            } else {
+                cache
+            };
         let generated_sliding_window = generated_sliding_window.filter(|sliding_window| {
             attention_cache.is_none()
                 && mask.is_some()
@@ -1241,7 +1458,7 @@ impl Attention {
         )?;
         observer.observe(&format!("{prefix}.queries_rope"), &queries)?;
 
-        let (keys, values) = if self.is_kv_shared_layer {
+        let (keys, values) = if !self.key_value_policy.owns_state() {
             let (keys, values) = shared_kv
                 .as_ref()
                 .and_then(|shared_kv| shared_kv.get(&self.policy))
@@ -1257,7 +1474,7 @@ impl Attention {
                 .ok_or_else(|| Exception::custom("missing Gemma 4 key projection"))?
                 .forward(x, stream)?;
             observer.observe(&format!("{prefix}.k_proj"), &keys)?;
-            let values = if self.attention_k_eq_v {
+            let values = if self.key_value_policy.value() == Some(ValuePolicy::ReuseKey) {
                 keys.clone()
             } else {
                 let values = self
@@ -1296,10 +1513,12 @@ impl Attention {
             }
             observer.observe(&format!("{prefix}.keys_cache"), &keys)?;
             observer.observe(&format!("{prefix}.values_cache"), &values)?;
-            if let Some(shared_kv) = shared_kv.as_mut() {
-                shared_kv.insert(self.policy, (keys.clone(), values.clone()));
-                observer.observe(&format!("{prefix}.shared_keys_stored"), &keys)?;
-                observer.observe(&format!("{prefix}.shared_values_stored"), &values)?;
+            if self.key_value_policy.publishes_state() {
+                if let Some(shared_kv) = shared_kv.as_mut() {
+                    shared_kv.insert(self.policy, (keys.clone(), values.clone()));
+                    observer.observe(&format!("{prefix}.shared_keys_stored"), &keys)?;
+                    observer.observe(&format!("{prefix}.shared_values_stored"), &values)?;
+                }
             }
             (keys, values)
         };
@@ -1307,11 +1526,12 @@ impl Attention {
         let attention_probs = attention_probabilities(&queries, &keys, self.scale, mask, stream)?;
         observer.observe(&format!("{prefix}.attention_probs"), &attention_probs)?;
 
-        let attention_cache = if self.is_kv_shared_layer || shared_kv.is_some() {
-            None
-        } else {
-            cache
-        };
+        let attention_cache =
+            if !self.key_value_policy.owns_state() || self.key_value_policy.publishes_state() {
+                None
+            } else {
+                cache
+            };
         let generated_sliding_window = generated_sliding_window.filter(|sliding_window| {
             attention_cache.is_none()
                 && mask.is_some()
@@ -2054,8 +2274,8 @@ pub struct TransformerBlock {
     pub num_attention_heads: i32,
     /// Transformer hidden size.
     pub hidden_size: i32,
-    /// Exact full/sliding attention policy.
-    pub layer_policy: AttentionPolicy,
+    /// Complete execution and state policy.
+    pub layer_policy: LayerPolicy,
 
     #[quantizable]
     #[param]
@@ -2113,16 +2333,16 @@ impl TransformerBlock {
     /// Creates an unloaded transformer block.
     pub fn new(
         args: &ModelArgs,
-        layer_policy: AttentionPolicy,
+        layer_policy: LayerPolicy,
         layer_idx: usize,
         stream: &Stream,
     ) -> Result<Self, Exception> {
-        let layer_args = args.for_layer(layer_policy);
+        let layer_args = args.rope_args_for_layer(layer_policy.attention);
         let self_attn = Attention::new(&layer_args, layer_policy, layer_idx, stream)?;
         let prefix = format!("model.language_model.layers.{layer_idx}");
         let mlp = Mlp::new_selective(
             args.hidden_size,
-            args.feed_forward_length_for_layer(layer_idx),
+            layer_policy.intermediate_size.get() as i32,
             [
                 args.quantization_for(&format!("{prefix}.mlp.gate_proj.weight")),
                 args.quantization_for(&format!("{prefix}.mlp.down_proj.weight")),
@@ -2138,28 +2358,25 @@ impl TransformerBlock {
             nn::RmsNorm::unloaded(args.hidden_size, args.rms_norm_eps, Dtype::Float32, stream)?;
         let post_feedforward_layernorm =
             nn::RmsNorm::unloaded(args.hidden_size, args.rms_norm_eps, Dtype::Float32, stream)?;
-        let moe = args
-            .enable_moe_block
+        let has_moe = layer_policy.feed_forward == FeedForwardPolicy::DenseWithSparseMoe;
+        let moe = has_moe
             .then(|| Moe::new(args, layer_idx, stream))
             .transpose()?;
         let (router, experts) = match moe {
             Some(moe) => (Some(moe.router), Some(moe.experts)),
             None => (None, None),
         };
-        let post_feedforward_layernorm_1 = args
-            .enable_moe_block
+        let post_feedforward_layernorm_1 = has_moe
             .then(|| {
                 nn::RmsNorm::unloaded(args.hidden_size, args.rms_norm_eps, Dtype::Float32, stream)
             })
             .transpose()?;
-        let pre_feedforward_layernorm_2 = args
-            .enable_moe_block
+        let pre_feedforward_layernorm_2 = has_moe
             .then(|| {
                 nn::RmsNorm::unloaded(args.hidden_size, args.rms_norm_eps, Dtype::Float32, stream)
             })
             .transpose()?;
-        let post_feedforward_layernorm_2 = args
-            .enable_moe_block
+        let post_feedforward_layernorm_2 = has_moe
             .then(|| {
                 nn::RmsNorm::unloaded(args.hidden_size, args.rms_norm_eps, Dtype::Float32, stream)
             })
@@ -2219,7 +2436,10 @@ impl TransformerBlock {
 
 impl TransformerBlock {
     fn sliding_window(&self) -> Option<i32> {
-        self.layer_policy.window().map(|window| window.get() as i32)
+        self.layer_policy
+            .attention
+            .window()
+            .map(|window| window.get() as i32)
     }
 
     fn apply_layer_scalar(&self, x: Array, stream: &Stream) -> Result<Array, Exception> {
@@ -2249,7 +2469,7 @@ impl TransformerBlock {
         } = input;
         let generated_mask = if disable_generated_mask {
             None
-        } else if self.layer_policy.window().is_some() {
+        } else if self.layer_policy.attention.window().is_some() {
             let sliding_window = self.sliding_window();
             let seq_len = x.shape()[1];
             if needs_generated_sliding_mask(seq_len, position_offset, sliding_window) {
@@ -2408,7 +2628,7 @@ where
         } = input;
         let generated_mask = if disable_generated_mask {
             None
-        } else if self.layer_policy.window().is_some() {
+        } else if self.layer_policy.attention.window().is_some() {
             let sliding_window = self.sliding_window();
             let seq_len = x.shape()[1];
             if needs_generated_sliding_mask(seq_len, position_offset, sliding_window) {
@@ -2598,7 +2818,7 @@ impl Gemma4TextModel {
         };
         let layers = (0..args.num_hidden_layers)
             .map(|index| {
-                let policy = *args.attention_policy(index as usize).ok_or_else(|| {
+                let policy = *args.layer_policy(index as usize).ok_or_else(|| {
                     Exception::custom(format!("Gemma 4 has no policy for layer {index}"))
                 })?;
                 TransformerBlock::new(args, policy, index as usize, stream)
@@ -2794,16 +3014,20 @@ impl Gemma4TextModel {
         };
 
         if cache.is_empty() {
-            *cache = (0..self.layers.len()).map(|_| Some(C::default())).collect();
+            *cache = self
+                .layers
+                .iter()
+                .map(|layer| layer.layer_policy.key_value.owns_state().then(C::default))
+                .collect();
         }
         for (index, (layer, c)) in self.layers.iter_mut().zip(cache.iter_mut()).enumerate() {
             let layer_ple = per_layer_inputs
                 .as_ref()
                 .map(|inputs| inputs.try_index_device((.., .., index as i32, ..), stream))
                 .transpose()?;
-            let layer_mask = if layer.layer_policy.window().is_some() {
+            let layer_mask = if layer.layer_policy.attention.window().is_some() {
                 sliding_masks
-                    .and_then(|masks| masks.get(&layer.layer_policy))
+                    .and_then(|masks| masks.get(&layer.layer_policy.attention))
                     .or(mask.as_ref())
             } else {
                 mask.as_ref()
@@ -2890,16 +3114,20 @@ impl Gemma4TextModel {
         }
 
         if cache.is_empty() {
-            *cache = (0..self.layers.len()).map(|_| Some(C::default())).collect();
+            *cache = self
+                .layers
+                .iter()
+                .map(|layer| layer.layer_policy.key_value.owns_state().then(C::default))
+                .collect();
         }
         for (index, (layer, c)) in self.layers.iter_mut().zip(cache.iter_mut()).enumerate() {
             let layer_ple = per_layer_inputs
                 .as_ref()
                 .map(|inputs| inputs.try_index_device((.., .., index as i32, ..), stream))
                 .transpose()?;
-            let layer_mask = if layer.layer_policy.window().is_some() {
+            let layer_mask = if layer.layer_policy.attention.window().is_some() {
                 sliding_masks
-                    .and_then(|masks| masks.get(&layer.layer_policy))
+                    .and_then(|masks| masks.get(&layer.layer_policy.attention))
                     .or(mask.as_ref())
             } else {
                 mask.as_ref()
@@ -3119,7 +3347,7 @@ impl Model {
                     &cache.token_ids,
                     self.image_token_id.map(|id| id as u32),
                     self.video_token_id.map(|id| id as u32),
-                    &self.args.attention_schedule,
+                    &self.args.layer_schedule,
                 );
                 self.forward_with_observer(
                     ModelInput {
@@ -3463,9 +3691,10 @@ pub(crate) fn load_gemma4_gguf_checkpoint(
     let mut config = StrictLoadConfig::default()
         .allow_unused_prefix("rope_freqs.")
         .allow_missing_suffix(".bias");
-    let first_shared_layer =
-        (model.args.num_hidden_layers - model.args.num_kv_shared_layers).max(0);
-    for layer in first_shared_layer..model.args.num_hidden_layers {
+    for (layer, policy) in model.args.layer_schedule.iter().enumerate() {
+        if policy.key_value != KeyValuePolicy::Shared {
+            continue;
+        }
         let prefix = format!("model.language_model.layers.{layer}.self_attn");
         config = config
             .allow_unused_prefix(format!("{prefix}.k_proj."))
@@ -3520,8 +3749,8 @@ pub(crate) fn prepare_gemma4_gguf_checkpoint(
     let mut args = gemma4_args_from_gguf_catalog(checkpoint, metadata)?;
     let mut quantized_weight_configs =
         gguf_quantization_configs(checkpoint, translate_gguf_weight_name)?;
-    if args.enable_moe_block {
-        for layer in 0..args.num_hidden_layers {
+    for (layer, policy) in args.layer_schedule.iter().enumerate() {
+        if policy.feed_forward == FeedForwardPolicy::DenseWithSparseMoe {
             let prefix = format!("model.language_model.layers.{layer}.experts.switch_glu");
             if let Some(config) =
                 quantized_weight_configs.remove(&format!("{prefix}.gate_up_proj.weight"))
@@ -3567,8 +3796,8 @@ fn load_gemma4_gguf_weights(
     config: &StrictLoadConfig,
     report: &mut StrictLoadReport,
 ) -> Result<(), Error> {
-    if model.args.enable_moe_block {
-        for layer in 0..model.args.num_hidden_layers {
+    for (layer, policy) in model.args.layer_schedule.iter().enumerate() {
+        if policy.feed_forward == FeedForwardPolicy::DenseWithSparseMoe {
             let prefix = format!("blk.{layer}");
             let fused =
                 checkpoint.contains_gguf_tensor(&format!("{prefix}.ffn_gate_up_exps.weight"));
@@ -4028,37 +4257,12 @@ pub(crate) fn gemma4_args_from_gguf_catalog(
         feed_forward_values,
         num_hidden_layers,
     )?;
-    let intermediate_size = feed_forward_lengths[0];
-
     let kv_head_values = gguf_i64_values(metadata, "gemma4.attention.head_count_kv")?;
     let kv_head_values = expand_layer_values(
         "gemma4.attention.head_count_kv",
         kv_head_values,
         num_hidden_layers,
     )?;
-    let sliding_kv_heads = attention_schedule
-        .iter()
-        .zip(&kv_head_values)
-        .find_map(|(policy, value)| policy.window().is_some().then_some(*value))
-        .unwrap_or(kv_head_values[0]);
-    let full_kv_heads = attention_schedule
-        .iter()
-        .zip(&kv_head_values)
-        .find_map(|(policy, value)| (*policy == AttentionPolicy::Full).then_some(*value))
-        .unwrap_or(sliding_kv_heads);
-    for (policy, value) in attention_schedule.iter().zip(&kv_head_values) {
-        let expected = if *policy == AttentionPolicy::Full {
-            full_kv_heads
-        } else {
-            sliding_kv_heads
-        };
-        if *value != expected {
-            return Err(Error::UnsupportedArchitecture(
-                "Gemma 4 GGUF uses non-uniform KV-head counts within one attention type".into(),
-            ));
-        }
-    }
-
     let hidden_size = gguf_i32(metadata, "gemma4.embedding_length")?;
     let num_attention_heads = gguf_i32(metadata, "gemma4.attention.head_count")?;
     let global_head_dim = gguf_i32(metadata, "gemma4.attention.key_length")?;
@@ -4128,36 +4332,54 @@ pub(crate) fn gemma4_args_from_gguf_catalog(
     ]));
 
     let first_shared_layer = num_hidden_layers - num_kv_shared_layers;
-    let attention_k_eq_v = attention_schedule
+    let value_policies = attention_schedule
         .iter()
         .enumerate()
-        .find(|(index, policy)| {
-            **policy == AttentionPolicy::Full && *index < first_shared_layer.max(0) as usize
-        })
-        .is_some_and(|(index, _)| {
-            arrays.contains_gguf_tensor(&format!("blk.{index}.attn_k.weight"))
+        .map(|(index, policy)| {
+            if *policy == AttentionPolicy::Full
+                && index < first_shared_layer.max(0) as usize
+                && arrays.contains_gguf_tensor(&format!("blk.{index}.attn_k.weight"))
                 && !arrays.contains_gguf_tensor(&format!("blk.{index}.attn_v.weight"))
-        });
+            {
+                ValuePolicy::ReuseKey
+            } else {
+                ValuePolicy::Projected
+            }
+        })
+        .collect::<Vec<_>>();
+    let head_dims = attention_schedule
+        .iter()
+        .map(|policy| {
+            if *policy == AttentionPolicy::Full {
+                global_head_dim
+            } else {
+                head_dim
+            }
+        })
+        .collect::<Vec<_>>();
+    let layer_schedule = layer_schedule_from_parts(
+        &attention_schedule,
+        &feed_forward_lengths,
+        &kv_head_values,
+        &head_dims,
+        num_kv_shared_layers,
+        &value_policies,
+        enable_moe_block,
+        "Gemma 4 GGUF",
+    )?;
 
     let args = ModelArgs {
         model_type: "gemma4".into(),
         hidden_size,
         num_hidden_layers,
-        intermediate_size,
-        use_double_wide_mlp: false,
-        feed_forward_lengths: Some(feed_forward_lengths),
         num_attention_heads,
         rms_norm_eps: gguf_f32(metadata, "gemma4.attention.layer_norm_rms_epsilon")?,
         vocab_size,
         pad_token_id: gguf_optional_i64(metadata, "tokenizer.ggml.padding_token_id")?
             .and_then(|value| i32::try_from(value).ok())
             .unwrap_or(0),
-        num_key_value_heads: sliding_kv_heads,
-        num_global_key_value_heads: (full_kv_heads != sliding_kv_heads).then_some(full_kv_heads),
         max_position_embeddings: gguf_i32(metadata, "gemma4.context_length")?,
         rope_theta: sliding_rope_theta,
-        head_dim,
-        global_head_dim: (global_head_dim != head_dim).then_some(global_head_dim),
         tie_word_embeddings: !arrays.contains_gguf_tensor("output.weight"),
         attention_bias: arrays.any_gguf_tensor(|name| {
             name.ends_with("attn_q.bias")
@@ -4165,7 +4387,6 @@ pub(crate) fn gemma4_args_from_gguf_catalog(
                 || name.ends_with("attn_v.bias")
                 || name.ends_with("attn_output.bias")
         }),
-        attention_k_eq_v,
         quantized: false,
         weight_quantization: None,
         quantized_weights: None,
@@ -4174,10 +4395,8 @@ pub(crate) fn gemma4_args_from_gguf_catalog(
         quantization_bits: 4,
         hidden_size_per_layer_input,
         vocab_size_per_layer_input: (hidden_size_per_layer_input > 0).then_some(vocab_size),
-        num_kv_shared_layers,
-        attention_schedule,
+        layer_schedule,
         final_logit_softcapping: gguf_optional_f32(metadata, "gemma4.final_logit_softcapping")?,
-        enable_moe_block,
         num_experts,
         top_k_experts,
         moe_intermediate_size,
@@ -4416,8 +4635,8 @@ pub fn get_gemma4_model_args(model_dir: impl AsRef<Path>) -> Result<ModelArgs, E
 
 /// Parses and validates a Gemma 4 text configuration without loading weights.
 ///
-/// Raw `layer_types` and `sliding_window` checkpoint fields are normalized once
-/// into [`ModelArgs::attention_schedule`].
+/// Raw layer, attention, MLP, MoE, and shared-KV fields are normalized once
+/// into [`ModelArgs::layer_schedule`].
 pub fn model_args_from_config_value(config: &Value) -> Result<ModelArgs, Error> {
     let source: ModelArgsSource = serde_json::from_value(config.clone()).map_err(|error| {
         Error::UnsupportedArchitecture(format!("invalid Gemma 4 text config: {error}"))
@@ -4475,37 +4694,15 @@ pub(super) fn validate_model_args(args: &ModelArgs) -> Result<(), Error> {
     for (name, value) in [
         ("hidden_size", args.hidden_size),
         ("num_hidden_layers", args.num_hidden_layers),
-        ("intermediate_size", args.intermediate_size),
         ("num_attention_heads", args.num_attention_heads),
         ("vocab_size", args.vocab_size),
-        ("num_key_value_heads", args.num_key_value_heads),
         ("max_position_embeddings", args.max_position_embeddings),
-        ("head_dim", args.head_dim),
     ] {
         if value <= 0 {
             return Err(Error::UnsupportedArchitecture(format!(
                 "Gemma 4 {name} must be positive, got {value}"
             )));
         }
-    }
-    for (name, value) in [
-        ("global_head_dim", args.global_head_dim),
-        (
-            "num_global_key_value_heads",
-            args.num_global_key_value_heads,
-        ),
-    ] {
-        if value.is_some_and(|value| value <= 0) {
-            return Err(Error::UnsupportedArchitecture(format!(
-                "Gemma 4 {name} must be positive when configured"
-            )));
-        }
-    }
-    if args.num_kv_shared_layers < 0 || args.num_kv_shared_layers > args.num_hidden_layers {
-        return Err(Error::UnsupportedArchitecture(format!(
-            "Gemma 4 num_kv_shared_layers must be between zero and num_hidden_layers, got {}",
-            args.num_kv_shared_layers
-        )));
     }
     if args.hidden_size_per_layer_input < 0 {
         return Err(Error::UnsupportedArchitecture(format!(
@@ -4522,34 +4719,16 @@ pub(super) fn validate_model_args(args: &ModelArgs) -> Result<(), Error> {
             "Gemma 4 vocab_size_per_layer_input must be positive when configured".into(),
         ));
     }
-    if args.use_double_wide_mlp && args.intermediate_size.checked_mul(2).is_none() {
-        return Err(Error::UnsupportedArchitecture(
-            "Gemma 4 doubled MLP width exceeds i32".into(),
-        ));
-    }
-    if let Some(lengths) = &args.feed_forward_lengths {
-        if lengths.len() != args.num_hidden_layers as usize {
-            return Err(Error::UnsupportedArchitecture(format!(
-                "Gemma 4 feed_forward_lengths has {} entries for {} layers",
-                lengths.len(),
-                args.num_hidden_layers
-            )));
-        }
-        if let Some((layer, value)) = lengths.iter().enumerate().find(|(_, value)| **value <= 0) {
-            return Err(Error::UnsupportedArchitecture(format!(
-                "Gemma 4 feed-forward length for layer {layer} must be positive, got {value}"
-            )));
-        }
-    }
-    if args.attention_schedule.len() != args.num_hidden_layers as usize {
+    if args.layer_schedule.len() != args.num_hidden_layers as usize {
         return Err(Error::UnsupportedArchitecture(format!(
-            "Gemma 4 attention schedule has {} entries for {} layers",
-            args.attention_schedule.len(),
+            "Gemma 4 layer schedule has {} entries for {} layers",
+            args.layer_schedule.len(),
             args.num_hidden_layers
         )));
     }
-    for (layer, policy) in args.attention_schedule.iter().copied().enumerate() {
+    for (layer, policy) in args.layer_schedule.iter().copied().enumerate() {
         if policy
+            .attention
             .window()
             .is_some_and(|window| window.get() > i32::MAX as u32)
         {
@@ -4557,21 +4736,17 @@ pub(super) fn validate_model_args(args: &ModelArgs) -> Result<(), Error> {
                 "Gemma 4 layer {layer} sliding window exceeds the executable i32 range"
             )));
         }
-        let layer_args = args.for_layer(policy);
-        if layer_args.num_attention_heads % layer_args.num_key_value_heads != 0 {
+        let kv_heads = policy.num_key_value_heads.get() as i32;
+        let head_dim = policy.head_dim.get() as i32;
+        if args.num_attention_heads % kv_heads != 0 {
             return Err(Error::UnsupportedArchitecture(format!(
                 "Gemma 4 layer {layer} query heads ({}) must be divisible by KV heads ({})",
-                layer_args.num_attention_heads, layer_args.num_key_value_heads
+                args.num_attention_heads, kv_heads
             )));
         }
-        layer_args
-            .num_attention_heads
-            .checked_mul(layer_args.head_dim)
-            .and_then(|_| {
-                layer_args
-                    .num_key_value_heads
-                    .checked_mul(layer_args.head_dim)
-            })
+        args.num_attention_heads
+            .checked_mul(head_dim)
+            .and_then(|_| kv_heads.checked_mul(head_dim))
             .ok_or_else(|| {
                 Error::UnsupportedArchitecture(format!(
                     "Gemma 4 layer {layer} attention projection size overflows i32"
@@ -4585,7 +4760,11 @@ pub(super) fn validate_model_args(args: &ModelArgs) -> Result<(), Error> {
 }
 
 fn validate_moe_args(args: &ModelArgs) -> Result<(), Error> {
-    if !args.enable_moe_block {
+    if !args
+        .layer_schedule
+        .iter()
+        .any(|policy| policy.feed_forward == FeedForwardPolicy::DenseWithSparseMoe)
+    {
         return Ok(());
     }
     let num_experts = args.num_experts.unwrap_or(0);
@@ -4814,7 +4993,7 @@ impl Model {
                     &cache.token_ids,
                     self.image_token_id.map(|id| id as u32),
                     self.video_token_id.map(|id| id as u32),
-                    &self.args.attention_schedule,
+                    &self.args.layer_schedule,
                 );
                 self.forward_with_state(
                     ModelInput {
@@ -4949,8 +5128,15 @@ impl Cache {
     }
 
     pub(crate) fn reset_kv(&mut self, args: &ModelArgs) {
-        self.kv = (0..args.num_hidden_layers)
-            .map(|_| Some(ConcatKeyValueCache::new_with_step(Self::KV_GROWTH_STEP)))
+        self.kv = args
+            .layer_schedule
+            .iter()
+            .map(|policy| {
+                policy
+                    .key_value
+                    .owns_state()
+                    .then(|| ConcatKeyValueCache::new_with_step(Self::KV_GROWTH_STEP))
+            })
             .collect();
     }
 
@@ -5017,7 +5203,7 @@ pub(crate) fn multimodal_attention_masks(
     token_ids: &[u32],
     image_token_id: Option<u32>,
     video_token_id: Option<u32>,
-    schedule: &LayerSchedule<AttentionPolicy>,
+    schedule: &LayerSchedule<LayerPolicy>,
 ) -> Gemma4AttentionMasks {
     let sequence = token_ids.len();
     let mut groups = vec![-1i32; sequence];
@@ -5042,8 +5228,10 @@ pub(crate) fn multimodal_attention_masks(
     }
     let shape = [1, 1, sequence as i32, sequence as i32];
     let sliding = schedule
-        .sliding_windows()
-        .into_keys()
+        .iter()
+        .filter_map(|policy| policy.attention.window())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
         .map(|window| {
             let window_i32 = window.get() as i32;
             let mut mask = Vec::with_capacity(sequence * sequence);
@@ -5107,7 +5295,7 @@ impl CausalLm<Cache> for Model {
                     &cache.token_ids,
                     self.image_token_id.map(|id| id as u32),
                     self.video_token_id.map(|id| id as u32),
-                    &self.args.attention_schedule,
+                    &self.args.layer_schedule,
                 );
                 self.forward_logits(
                     ModelInput {
@@ -5180,7 +5368,7 @@ impl CausalLm<Cache> for Model {
                 &cache.token_ids,
                 self.image_token_id.map(|id| id as u32),
                 self.video_token_id.map(|id| id as u32),
-                &self.args.attention_schedule,
+                &self.args.layer_schedule,
             )
         });
         self.forward_logits(
@@ -5214,7 +5402,7 @@ mod tests {
 
     use super::{
         load_gemma4_model, needs_generated_sliding_mask, partial_rotary_dims, Attention, Cache,
-        FloatOrString, ModelArgs,
+        FeedForwardPolicy, FloatOrString, KeyValuePolicy, LayerPolicy, ModelArgs, ValuePolicy,
     };
     use crate::api::{
         common::generation::CausalLm,
@@ -5230,26 +5418,32 @@ mod tests {
     }
 
     fn model_args(attention_k_eq_v: bool) -> ModelArgs {
+        let layer_policy = LayerPolicy {
+            attention: AttentionPolicy::Full,
+            head_dim: std::num::NonZeroU32::new(4).unwrap(),
+            num_key_value_heads: std::num::NonZeroU32::new(1).unwrap(),
+            key_value: KeyValuePolicy::Local {
+                value: if attention_k_eq_v {
+                    ValuePolicy::ReuseKey
+                } else {
+                    ValuePolicy::Projected
+                },
+            },
+            intermediate_size: std::num::NonZeroU32::new(16).unwrap(),
+            feed_forward: FeedForwardPolicy::Dense,
+        };
         ModelArgs {
             model_type: "gemma4_unified_text".to_string(),
             hidden_size: 8,
             num_hidden_layers: 1,
-            intermediate_size: 16,
-            use_double_wide_mlp: false,
-            feed_forward_lengths: None,
             num_attention_heads: 2,
             rms_norm_eps: 0.00001,
             vocab_size: 32,
             pad_token_id: 0,
-            num_key_value_heads: 1,
-            num_global_key_value_heads: None,
             max_position_embeddings: 128,
             rope_theta: 10_000.0,
-            head_dim: 4,
-            global_head_dim: None,
             tie_word_embeddings: true,
             attention_bias: false,
-            attention_k_eq_v,
             quantized: false,
             weight_quantization: None,
             quantized_weights: None,
@@ -5258,10 +5452,8 @@ mod tests {
             quantization_bits: 4,
             hidden_size_per_layer_input: 0,
             vocab_size_per_layer_input: None,
-            num_kv_shared_layers: 0,
-            attention_schedule: LayerSchedule::all_full(1).unwrap(),
+            layer_schedule: LayerSchedule::new(1, vec![layer_policy]).unwrap(),
             final_logit_softcapping: None,
-            enable_moe_block: false,
             num_experts: None,
             top_k_experts: None,
             moe_intermediate_size: None,
@@ -5303,7 +5495,10 @@ mod tests {
         ))
         .unwrap();
         assert_eq!(
-            args.attention_schedule.iter().copied().collect::<Vec<_>>(),
+            args.layer_schedule
+                .iter()
+                .map(|policy| policy.attention)
+                .collect::<Vec<_>>(),
             vec![
                 AttentionPolicy::sliding(17).unwrap(),
                 AttentionPolicy::Full,
@@ -5311,11 +5506,100 @@ mod tests {
                 AttentionPolicy::Full,
             ]
         );
-        assert_eq!(args.attention_policy(4), None);
+        assert_eq!(args.layer_policy(4), None);
 
         let full =
             super::model_args_from_config_value(&text_config(serde_json::json!([]), None)).unwrap();
-        assert_eq!(full.attention_schedule.full_layer_count(), 4);
+        assert!(full
+            .layer_schedule
+            .iter()
+            .all(|policy| policy.attention == AttentionPolicy::Full));
+    }
+
+    #[test]
+    fn normalizes_all_orthogonal_layer_properties_into_one_schedule() {
+        let mut config = text_config(
+            serde_json::json!([
+                "sliding_attention",
+                "full_attention",
+                "sliding_attention",
+                "full_attention"
+            ]),
+            Some(17),
+        );
+        config["use_double_wide_mlp"] = true.into();
+        config["num_kv_shared_layers"] = 2.into();
+        config["attention_k_eq_v"] = true.into();
+        config["enable_moe_block"] = true.into();
+        config["num_experts"] = 4.into();
+        config["top_k_experts"] = 2.into();
+        config["moe_intermediate_size"] = 8.into();
+        config["num_global_key_value_heads"] = 2.into();
+        config["global_head_dim"] = 2.into();
+
+        let args = super::model_args_from_config_value(&config).unwrap();
+        let policies = args.layer_schedule.iter().copied().collect::<Vec<_>>();
+        assert_eq!(
+            policies
+                .iter()
+                .map(|policy| policy.intermediate_size.get())
+                .collect::<Vec<_>>(),
+            vec![16, 16, 32, 32]
+        );
+        assert!(matches!(
+            policies[0].key_value,
+            KeyValuePolicy::Publish {
+                value: ValuePolicy::Projected
+            }
+        ));
+        assert!(matches!(
+            policies[1].key_value,
+            KeyValuePolicy::Publish {
+                value: ValuePolicy::ReuseKey
+            }
+        ));
+        assert_eq!(policies[2].key_value, KeyValuePolicy::Shared);
+        assert_eq!(policies[3].key_value, KeyValuePolicy::Shared);
+        assert_eq!(policies[0].head_dim.get(), 4);
+        assert_eq!(policies[1].head_dim.get(), 2);
+        assert_eq!(policies[0].num_key_value_heads.get(), 1);
+        assert_eq!(policies[1].num_key_value_heads.get(), 2);
+        assert!(policies
+            .iter()
+            .all(|policy| { policy.feed_forward == FeedForwardPolicy::DenseWithSparseMoe }));
+
+        let cache = Cache::new(&args);
+        assert_eq!(
+            cache.kv.iter().map(Option::is_some).collect::<Vec<_>>(),
+            vec![true, true, false, false]
+        );
+    }
+
+    #[test]
+    fn direct_schedule_preserves_per_layer_width_and_kv_geometry() {
+        let attention = LayerSchedule::all_full(3).unwrap();
+        let schedule = super::layer_schedule_from_parts(
+            &attention,
+            &[16, 24, 32],
+            &[1, 2, 1],
+            &[4, 2, 8],
+            0,
+            &[
+                ValuePolicy::Projected,
+                ValuePolicy::ReuseKey,
+                ValuePolicy::Projected,
+            ],
+            false,
+            "test",
+        )
+        .unwrap();
+        assert_eq!(schedule.get(0).unwrap().intermediate_size.get(), 16);
+        assert_eq!(schedule.get(1).unwrap().num_key_value_heads.get(), 2);
+        assert_eq!(schedule.get(2).unwrap().head_dim.get(), 8);
+        assert_eq!(
+            schedule.get(1).unwrap().key_value.value(),
+            Some(ValuePolicy::ReuseKey)
+        );
     }
 
     #[test]
@@ -5361,38 +5645,64 @@ mod tests {
     fn architecture_fingerprint_tracks_ordered_policy_and_exact_windows() {
         let mut first = model_args(false);
         first.num_hidden_layers = 3;
-        first.attention_schedule = LayerSchedule::new(
+        let base = *first.layer_policy(0).unwrap();
+        first.layer_schedule = LayerSchedule::new(
             3,
-            vec![
+            [
                 AttentionPolicy::sliding(4).unwrap(),
                 AttentionPolicy::Full,
                 AttentionPolicy::sliding(8).unwrap(),
-            ],
+            ]
+            .into_iter()
+            .map(|attention| LayerPolicy { attention, ..base })
+            .collect(),
         )
         .unwrap();
         let mut reordered = first.clone();
-        reordered.attention_schedule = LayerSchedule::new(
+        reordered.layer_schedule = LayerSchedule::new(
             3,
-            vec![
+            [
                 AttentionPolicy::Full,
                 AttentionPolicy::sliding(4).unwrap(),
                 AttentionPolicy::sliding(8).unwrap(),
-            ],
+            ]
+            .into_iter()
+            .map(|attention| LayerPolicy { attention, ..base })
+            .collect(),
         )
         .unwrap();
         assert_ne!(
             super::prompt_cache_architecture_fingerprint(&first),
             super::prompt_cache_architecture_fingerprint(&reordered)
         );
+        let mut different_width = first.clone();
+        let mut policies = different_width
+            .layer_schedule
+            .iter()
+            .copied()
+            .collect::<Vec<_>>();
+        policies[1].intermediate_size = std::num::NonZeroU32::new(24).unwrap();
+        different_width.layer_schedule = LayerSchedule::new(3, policies).unwrap();
+        assert_ne!(
+            super::prompt_cache_architecture_fingerprint(&first),
+            super::prompt_cache_architecture_fingerprint(&different_width)
+        );
     }
 
     #[test]
     fn multimodal_masks_apply_each_exact_window_with_current_token_included() {
+        let base = *model_args(false).layer_policy(0).unwrap();
         let schedule = LayerSchedule::new(
             2,
             vec![
-                AttentionPolicy::sliding(2).unwrap(),
-                AttentionPolicy::sliding(3).unwrap(),
+                LayerPolicy {
+                    attention: AttentionPolicy::sliding(2).unwrap(),
+                    ..base
+                },
+                LayerPolicy {
+                    attention: AttentionPolicy::sliding(3).unwrap(),
+                    ..base
+                },
             ],
         )
         .unwrap();
@@ -5561,7 +5871,9 @@ mod tests {
     fn moe_parameter_tree_matches_published_safetensors_layout() {
         let context = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
         let mut args = model_args(true);
-        args.enable_moe_block = true;
+        let mut policy = *args.layer_policy(0).unwrap();
+        policy.feed_forward = FeedForwardPolicy::DenseWithSparseMoe;
+        args.layer_schedule = LayerSchedule::new(1, vec![policy]).unwrap();
         args.num_experts = Some(4);
         args.top_k_experts = Some(2);
         args.moe_intermediate_size = Some(8);
@@ -5590,7 +5902,9 @@ mod tests {
         let context = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
         let stream = context.stream();
         let mut args = model_args(true);
-        args.enable_moe_block = true;
+        let mut policy = *args.layer_policy(0).unwrap();
+        policy.feed_forward = FeedForwardPolicy::DenseWithSparseMoe;
+        args.layer_schedule = LayerSchedule::new(1, vec![policy]).unwrap();
         args.num_experts = Some(4);
         args.top_k_experts = Some(2);
         args.moe_intermediate_size = Some(8);
@@ -5770,11 +6084,17 @@ mod tests {
 
         let args = super::gemma4_args_from_gguf_catalog(&HashMap::new(), &metadata).unwrap();
         assert_eq!(
-            args.feed_forward_lengths,
-            Some(vec![6144, 12288, 6144, 12288])
+            args.layer_schedule
+                .iter()
+                .map(|policy| policy.intermediate_size.get())
+                .collect::<Vec<_>>(),
+            vec![6144, 12288, 6144, 12288]
         );
         assert_eq!(
-            args.attention_schedule.iter().copied().collect::<Vec<_>>(),
+            args.layer_schedule
+                .iter()
+                .map(|policy| policy.attention)
+                .collect::<Vec<_>>(),
             vec![
                 AttentionPolicy::sliding(4096).unwrap(),
                 AttentionPolicy::Full,
@@ -5782,11 +6102,14 @@ mod tests {
                 AttentionPolicy::Full,
             ]
         );
-        assert_eq!(args.head_dim, 256);
-        assert_eq!(args.global_head_dim, Some(512));
-        assert_eq!(args.num_key_value_heads, 1);
-        assert_eq!(args.num_global_key_value_heads, Some(2));
-        assert_eq!(args.num_kv_shared_layers, 1);
+        assert_eq!(args.layer_policy(0).unwrap().head_dim.get(), 256);
+        assert_eq!(args.layer_policy(1).unwrap().head_dim.get(), 512);
+        assert_eq!(args.layer_policy(0).unwrap().num_key_value_heads.get(), 1);
+        assert_eq!(args.layer_policy(1).unwrap().num_key_value_heads.get(), 2);
+        assert_eq!(
+            args.layer_policy(3).unwrap().key_value,
+            KeyValuePolicy::Shared
+        );
         assert_eq!(args.vocab_size, 32);
     }
 
@@ -5855,7 +6178,10 @@ mod tests {
         let arrays = HashMap::<String, Array>::new();
 
         let args = super::gemma4_args_from_gguf_catalog(&arrays, &metadata).unwrap();
-        assert!(args.enable_moe_block);
+        assert_eq!(
+            args.layer_policy(0).unwrap().feed_forward,
+            FeedForwardPolicy::DenseWithSparseMoe
+        );
         assert_eq!(args.num_experts, Some(8));
         assert_eq!(args.top_k_experts, Some(2));
         assert_eq!(args.moe_intermediate_size, Some(16));
@@ -5865,8 +6191,8 @@ mod tests {
     #[ignore = "requires MLX runtime execution"]
     fn full_attention_with_key_equal_value_does_not_allocate_v_proj() {
         let stream = test_stream();
-        let attention =
-            Attention::new(&model_args(true), AttentionPolicy::Full, 0, &stream).unwrap();
+        let args = model_args(true);
+        let attention = Attention::new(&args, *args.layer_policy(0).unwrap(), 0, &stream).unwrap();
         let keys = parameter_keys(&attention);
 
         assert!(keys.iter().any(|key| key.starts_with("q_proj.")));
@@ -5878,8 +6204,8 @@ mod tests {
     #[ignore = "requires MLX runtime execution"]
     fn attention_allocates_v_proj_when_key_equal_value_is_disabled() {
         let stream = test_stream();
-        let attention =
-            Attention::new(&model_args(false), AttentionPolicy::Full, 0, &stream).unwrap();
+        let args = model_args(false);
+        let attention = Attention::new(&args, *args.layer_policy(0).unwrap(), 0, &stream).unwrap();
         let keys = parameter_keys(&attention);
 
         assert!(keys.iter().any(|key| key.starts_with("v_proj.")));

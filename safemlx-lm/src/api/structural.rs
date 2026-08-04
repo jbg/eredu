@@ -1739,33 +1739,18 @@ fn validate_gemma4_safetensors(
         }
     }
 
-    let first_shared_layer = layers - args.num_kv_shared_layers as usize;
     for layer in 0..layers {
         let prefix = format!("model.language_model.layers.{layer}");
         let policy = args
-            .attention_policy(layer)
-            .expect("validated Gemma 4 attention schedule");
-        let full_attention = *policy == crate::runtime::attention::AttentionPolicy::Full;
-        let head_dim = if full_attention {
-            args.global_head_dim.unwrap_or(args.head_dim)
-        } else {
-            args.head_dim
-        } as usize;
-        let kv_heads = if full_attention {
-            args.num_global_key_value_heads
-                .unwrap_or(args.num_key_value_heads)
-        } else {
-            args.num_key_value_heads
-        } as usize;
+            .layer_policy(layer)
+            .expect("validated Gemma 4 layer schedule");
+        let head_dim = policy.head_dim.get() as usize;
+        let kv_heads = policy.num_key_value_heads.get() as usize;
         let query = args.num_attention_heads as usize * head_dim;
         let key_value = kv_heads * head_dim;
-        let shared_kv = layer >= first_shared_layer;
-        let attention_k_eq_v = args.attention_k_eq_v && full_attention;
-        let intermediate = if args.use_double_wide_mlp && shared_kv {
-            args.intermediate_size as usize * 2
-        } else {
-            args.intermediate_size as usize
-        };
+        let shared_kv = !policy.key_value.owns_state();
+        let attention_k_eq_v = policy.key_value.value() == Some(gemma4::ValuePolicy::ReuseKey);
+        let intermediate = policy.intermediate_size.get() as usize;
 
         for name in [
             "input_layernorm",
@@ -1911,7 +1896,7 @@ fn validate_gemma4_safetensors(
                 );
             }
         }
-        if args.enable_moe_block {
+        if policy.feed_forward == gemma4::FeedForwardPolicy::DenseWithSparseMoe {
             let experts = args.num_experts.expect("validated Gemma 4 MoE") as usize;
             let moe_intermediate =
                 args.moe_intermediate_size.expect("validated Gemma 4 MoE") as usize;
@@ -6241,7 +6226,6 @@ fn gemma4_gguf_expected(
         ]);
     }
 
-    let first_shared_layer = layers - args.num_kv_shared_layers as usize;
     let catalog = checkpoint
         .catalog()
         .tensors()
@@ -6249,26 +6233,16 @@ fn gemma4_gguf_expected(
         .collect::<BTreeSet<_>>();
     for layer in 0..layers {
         let gguf = format!("blk.{layer}");
-        let full_attention = *args
-            .attention_policy(layer)
-            .expect("validated Gemma 4 attention schedule")
-            == crate::runtime::attention::AttentionPolicy::Full;
-        let head_dim = if full_attention {
-            args.global_head_dim.unwrap_or(args.head_dim)
-        } else {
-            args.head_dim
-        } as usize;
-        let kv_heads = if full_attention {
-            args.num_global_key_value_heads
-                .unwrap_or(args.num_key_value_heads)
-        } else {
-            args.num_key_value_heads
-        } as usize;
+        let policy = args
+            .layer_policy(layer)
+            .expect("validated Gemma 4 layer schedule");
+        let head_dim = policy.head_dim.get() as usize;
+        let kv_heads = policy.num_key_value_heads.get() as usize;
         let query = args.num_attention_heads as usize * head_dim;
         let key_value = kv_heads * head_dim;
-        let shared_kv = layer >= first_shared_layer;
-        let attention_k_eq_v = args.attention_k_eq_v && full_attention;
-        let intermediate = args.feed_forward_length_for_layer(layer) as usize;
+        let shared_kv = !policy.key_value.owns_state();
+        let attention_k_eq_v = policy.key_value.value() == Some(gemma4::ValuePolicy::ReuseKey);
+        let intermediate = policy.intermediate_size.get() as usize;
 
         for name in [
             "attn_norm",
@@ -6319,7 +6293,7 @@ fn gemma4_gguf_expected(
                 expected_vector_shape(format!("{gguf}.post_norm.weight"), vec![hidden]),
             ]);
         }
-        if args.enable_moe_block {
+        if policy.feed_forward == gemma4::FeedForwardPolicy::DenseWithSparseMoe {
             let experts = args.num_experts.expect("validated Gemma 4 MoE") as usize;
             let moe = args.moe_intermediate_size.expect("validated Gemma 4 MoE") as usize;
             tensors.extend([
@@ -6403,7 +6377,6 @@ fn validate_gemma4_gguf(
         .map(|tensor| tensor.gguf_name.clone())
         .collect::<BTreeSet<_>>();
     issues.extend(validate_gguf_plan(checkpoint, expected, "Gemma 4"));
-    let first_shared_layer = args.num_hidden_layers as usize - args.num_kv_shared_layers as usize;
     for tensor in checkpoint.catalog().tensors() {
         let name = &tensor.descriptor().name;
         let optional_shared_kv = name
@@ -6413,7 +6386,8 @@ fn validate_gemma4_gguf(
                 layer.parse::<usize>().ok().map(|layer| (layer, parameter))
             })
             .is_some_and(|(layer, parameter)| {
-                layer >= first_shared_layer
+                args.layer_policy(layer)
+                    .is_some_and(|policy| !policy.key_value.owns_state())
                     && ["attn_k.", "attn_v.", "attn_k_norm."]
                         .iter()
                         .any(|prefix| parameter.starts_with(prefix))

@@ -1445,61 +1445,38 @@ pub(super) fn validate_gemma4_drafter(
         )));
     }
     let draft = &assistant.config.text_config;
-    let mut required_policies = draft.attention_schedule.iter().copied().collect::<Vec<_>>();
-    required_policies.sort_unstable();
-    required_policies.dedup();
-    for policy in required_policies {
-        if !target
-            .attention_schedule
+    for (layer, draft_policy) in draft.layer_schedule.iter().enumerate() {
+        let attention = draft_policy.attention;
+        let Some(target_policy) = target
+            .layer_schedule
             .iter()
-            .any(|candidate| *candidate == policy)
-        {
+            .find(|policy| policy.attention == attention && policy.key_value.publishes_state())
+        else {
             return Err(Exception::custom(format!(
-                "Gemma 4 assistant requires {policy:?} shared KV state, but the target has no matching attention policy"
+                "Gemma 4 assistant layer {layer} requires {attention:?} shared KV state, but the target has no matching publishing layer"
             )));
-        }
-
-        let target_kv_heads = if policy == crate::runtime::attention::AttentionPolicy::Full {
-            target
-                .num_global_key_value_heads
-                .unwrap_or(target.num_key_value_heads)
-        } else {
-            target.num_key_value_heads
         };
-        let draft_kv_heads = if policy == crate::runtime::attention::AttentionPolicy::Full {
-            draft
-                .num_global_key_value_heads
-                .unwrap_or(draft.num_key_value_heads)
-        } else {
-            draft.num_key_value_heads
-        };
+        let target_kv_heads = target_policy.num_key_value_heads.get();
+        let draft_kv_heads = draft_policy.num_key_value_heads.get();
         if draft_kv_heads != target_kv_heads {
             return Err(Exception::custom(format!(
-                "Gemma 4 assistant {policy:?} KV-head count {draft_kv_heads} does not match target count {target_kv_heads}"
+                "Gemma 4 assistant layer {layer} {attention:?} KV-head count {draft_kv_heads} does not match target count {target_kv_heads}"
             )));
         }
 
-        let target_head_dim = if policy == crate::runtime::attention::AttentionPolicy::Full {
-            target.global_head_dim.unwrap_or(target.head_dim)
-        } else {
-            target.head_dim
-        };
-        let draft_head_dim = if policy == crate::runtime::attention::AttentionPolicy::Full {
-            draft.global_head_dim.unwrap_or(draft.head_dim)
-        } else {
-            draft.head_dim
-        };
+        let target_head_dim = target_policy.head_dim.get();
+        let draft_head_dim = draft_policy.head_dim.get();
         if draft_head_dim != target_head_dim {
             return Err(Exception::custom(format!(
-                "Gemma 4 assistant {policy:?} head dimension {draft_head_dim} does not match target dimension {target_head_dim}"
+                "Gemma 4 assistant layer {layer} {attention:?} head dimension {draft_head_dim} does not match target dimension {target_head_dim}"
             )));
         }
 
-        let target_rope_theta = target.rope_theta_for_layer(policy);
-        let draft_rope_theta = draft.rope_theta_for_layer(policy);
+        let target_rope_theta = target.rope_theta_for_layer(attention);
+        let draft_rope_theta = draft.rope_theta_for_layer(attention);
         if draft_rope_theta.to_bits() != target_rope_theta.to_bits() {
             return Err(Exception::custom(format!(
-                "Gemma 4 assistant {policy:?} RoPE base {draft_rope_theta} does not match target base {target_rope_theta}"
+                "Gemma 4 assistant layer {layer} {attention:?} RoPE base {draft_rope_theta} does not match target base {target_rope_theta}"
             )));
         }
     }
@@ -1760,7 +1737,7 @@ mod gemma4_drafter_compatibility_tests {
         model_args_from_config_value(&serde_json::json!({
             "model_type": "gemma4",
             "hidden_size": 8,
-            "num_hidden_layers": 2,
+            "num_hidden_layers": 4,
             "intermediate_size": 16,
             "num_attention_heads": 2,
             "rms_norm_eps": 0.00001,
@@ -1773,7 +1750,7 @@ mod gemma4_drafter_compatibility_tests {
             "global_head_dim": 4,
             "tie_word_embeddings": true,
             "num_kv_shared_layers": 2,
-            "layer_types": ["sliding_attention", "full_attention"],
+            "layer_types": ["sliding_attention", "full_attention", "sliding_attention", "full_attention"],
             "sliding_window": 64
         }))
         .unwrap()
@@ -1801,22 +1778,37 @@ mod gemma4_drafter_compatibility_tests {
         let mut assistant = assistant(&target);
         validate_gemma4_drafter(&target, &assistant).unwrap();
 
-        assistant.config.text_config.num_global_key_value_heads = Some(2);
+        let mut policies = assistant
+            .config
+            .text_config
+            .layer_schedule
+            .iter()
+            .copied()
+            .collect::<Vec<_>>();
+        for policy in &mut policies {
+            if policy.attention == AttentionPolicy::Full {
+                policy.num_key_value_heads = std::num::NonZeroU32::new(2).unwrap();
+            }
+        }
+        assistant.config.text_config.layer_schedule = LayerSchedule::new(4, policies).unwrap();
         let error = validate_gemma4_drafter(&target, &assistant)
             .unwrap_err()
             .to_string();
         assert!(error.contains("Full KV-head count"));
 
-        assistant.config.text_config.num_global_key_value_heads = Some(1);
-        assistant.config.text_config.attention_schedule = LayerSchedule::new(
-            2,
-            vec![AttentionPolicy::sliding(32).unwrap(), AttentionPolicy::Full],
-        )
-        .unwrap();
+        let mut policies = assistant
+            .config
+            .text_config
+            .layer_schedule
+            .iter()
+            .copied()
+            .collect::<Vec<_>>();
+        policies[0].attention = AttentionPolicy::sliding(32).unwrap();
+        assistant.config.text_config.layer_schedule = LayerSchedule::new(4, policies).unwrap();
         let error = validate_gemma4_drafter(&target, &assistant)
             .unwrap_err()
             .to_string();
-        assert!(error.contains("no matching attention policy"));
+        assert!(error.contains("no matching publishing layer"));
     }
 }
 

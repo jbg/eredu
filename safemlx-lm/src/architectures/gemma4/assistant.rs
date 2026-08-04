@@ -22,12 +22,12 @@ use serde_json::Value;
 use crate::{
     api::{
         common,
-        gemma4::{self, Gemma4Embedding, ModelArgs, TransformerBlock},
+        gemma4::{self, Gemma4Embedding, KeyValuePolicy, ModelArgs, TransformerBlock},
         ModelLoadOptions,
     },
     error::Error,
     nn::tensor::rope::FloatOrString,
-    runtime::attention::AttentionPolicy,
+    runtime::attention::{AttentionPolicy, LayerSchedule},
     runtime::checkpoint::load::{
         gguf_affine_configs, gguf_metadata, load_gguf_strict, load_safetensors_quantized_strict,
         load_safetensors_strict, GgufTensorNames, StrictLoadConfig, StrictLoadReport,
@@ -86,8 +86,23 @@ pub fn gemma4_assistant_config_from_value(value: &Value) -> Result<Gemma4Assista
         })?;
     let mut text_config =
         crate::architectures::gemma4::model::model_args_from_source(source.text_config)?;
-    if text_config.num_kv_shared_layers == 0 {
-        text_config.num_kv_shared_layers = text_config.num_hidden_layers;
+    if !text_config
+        .layer_schedule
+        .iter()
+        .any(|policy| policy.key_value == KeyValuePolicy::Shared)
+    {
+        let policies = text_config
+            .layer_schedule
+            .iter()
+            .copied()
+            .map(|mut policy| {
+                policy.key_value = KeyValuePolicy::Shared;
+                policy
+            })
+            .collect();
+        text_config.layer_schedule =
+            LayerSchedule::new(text_config.num_hidden_layers as usize, policies)
+                .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
     }
     crate::architectures::gemma4::model::validate_model_args(&text_config)?;
     Ok(Gemma4AssistantConfig {
@@ -147,7 +162,7 @@ impl DraftInner {
         )?;
         let layers = (0..args.num_hidden_layers)
             .map(|index| {
-                let policy = *args.attention_policy(index as usize).ok_or_else(|| {
+                let policy = *args.layer_policy(index as usize).ok_or_else(|| {
                     Exception::custom(format!("Gemma 4 assistant has no policy for layer {index}"))
                 })?;
                 TransformerBlock::new(args, policy, index as usize, stream)
@@ -396,11 +411,11 @@ impl Gemma4AssistantDraftModel {
         for layer in &mut self.model.layers {
             let kv = state
                 .shared_kv
-                .get(&layer.layer_policy)
+                .get(&layer.layer_policy.attention)
                 .cloned()
                 .ok_or_else(|| Exception::custom("missing shared K/V state for assistant layer"))?;
             let mask = drafter_mask(
-                layer.layer_policy,
+                layer.layer_policy.attention,
                 query_len,
                 query_offset,
                 kv.0.shape()[kv.0.shape().len() - 2],
@@ -408,7 +423,7 @@ impl Gemma4AssistantDraftModel {
                 stream,
             )?;
             let mut kv_map = HashMap::new();
-            kv_map.insert(layer.layer_policy, kv);
+            kv_map.insert(layer.layer_policy.attention, kv);
             h = layer.forward(
                 crate::architectures::gemma4::model::AttentionInput {
                     x: &h,
@@ -697,36 +712,11 @@ fn gemma4_assistant_config_from_gguf(
         gemma4::gguf_i64_values(metadata, &key("feed_forward_length"))?,
         num_hidden_layers,
     )?;
-    let intermediate_size = feed_forward_lengths[0];
     let kv_heads = gemma4::expand_layer_values(
         &key("attention.head_count_kv"),
         gemma4::gguf_i64_values(metadata, &key("attention.head_count_kv"))?,
         num_hidden_layers,
     )?;
-    let sliding_kv_heads = attention_schedule
-        .iter()
-        .zip(&kv_heads)
-        .find_map(|(policy, value)| policy.window().is_some().then_some(*value))
-        .unwrap_or(kv_heads[0]);
-    let full_kv_heads = attention_schedule
-        .iter()
-        .zip(&kv_heads)
-        .find_map(|(policy, value)| (*policy == AttentionPolicy::Full).then_some(*value))
-        .unwrap_or(sliding_kv_heads);
-    for (policy, value) in attention_schedule.iter().zip(&kv_heads) {
-        let expected = if *policy == AttentionPolicy::Full {
-            full_kv_heads
-        } else {
-            sliding_kv_heads
-        };
-        if *value != expected {
-            return Err(Error::UnsupportedArchitecture(
-                "Gemma 4 assistant uses non-uniform KV-head counts within one attention type"
-                    .into(),
-            ));
-        }
-    }
-
     let global_head_dim = gemma4::gguf_i32(metadata, &key("attention.key_length"))?;
     let head_dim = gemma4::gguf_optional_i64(metadata, &key("attention.key_length_swa"))?
         .map(i32::try_from)
@@ -792,6 +782,26 @@ fn gemma4_assistant_config_from_gguf(
                 )
             })?
             .unwrap_or(num_hidden_layers);
+    let head_dims = attention_schedule
+        .iter()
+        .map(|policy| {
+            if *policy == AttentionPolicy::Full {
+                global_head_dim
+            } else {
+                head_dim
+            }
+        })
+        .collect::<Vec<_>>();
+    let layer_schedule = gemma4::layer_schedule_from_parts(
+        &attention_schedule,
+        &feed_forward_lengths,
+        &kv_heads,
+        &head_dims,
+        num_kv_shared_layers,
+        &vec![gemma4::ValuePolicy::Projected; num_hidden_layers as usize],
+        false,
+        "Gemma 4 assistant GGUF",
+    )?;
     let hidden_size_per_layer_input =
         gemma4::gguf_optional_i64(metadata, &key("embedding_length_per_layer_input"))?
             .map(i32::try_from)
@@ -823,25 +833,16 @@ fn gemma4_assistant_config_from_gguf(
             model_type: "gemma4".into(),
             hidden_size: gemma4::gguf_i32(metadata, &key("embedding_length"))?,
             num_hidden_layers,
-            intermediate_size,
-            use_double_wide_mlp: false,
-            feed_forward_lengths: Some(feed_forward_lengths),
             num_attention_heads: gemma4::gguf_i32(metadata, &key("attention.head_count"))?,
             rms_norm_eps: gemma4::gguf_f32(metadata, &key("attention.layer_norm_rms_epsilon"))?,
             vocab_size,
             pad_token_id: gemma4::gguf_optional_i64(metadata, "tokenizer.ggml.padding_token_id")?
                 .and_then(|value| i32::try_from(value).ok())
                 .unwrap_or(0),
-            num_key_value_heads: sliding_kv_heads,
-            num_global_key_value_heads: (full_kv_heads != sliding_kv_heads)
-                .then_some(full_kv_heads),
             max_position_embeddings: gemma4::gguf_i32(metadata, &key("context_length"))?,
             rope_theta: sliding_rope_theta,
-            head_dim,
-            global_head_dim: (global_head_dim != head_dim).then_some(global_head_dim),
             tie_word_embeddings: !checkpoint.contains_gguf_tensor("output.weight"),
             attention_bias: false,
-            attention_k_eq_v: false,
             quantized: false,
             weight_quantization: None,
             quantized_weights: None,
@@ -850,10 +851,8 @@ fn gemma4_assistant_config_from_gguf(
             quantization_bits: 4,
             hidden_size_per_layer_input,
             vocab_size_per_layer_input: (hidden_size_per_layer_input > 0).then_some(vocab_size),
-            num_kv_shared_layers,
-            attention_schedule,
+            layer_schedule,
             final_logit_softcapping: None,
-            enable_moe_block: false,
             num_experts: None,
             top_k_experts: None,
             moe_intermediate_size: None,
@@ -1059,17 +1058,39 @@ mod tests {
         assert_eq!(config.block_size, 5);
         assert_eq!(config.text_config.hidden_size, 1024);
         assert_eq!(config.text_config.num_hidden_layers, 4);
-        assert_eq!(config.text_config.num_key_value_heads, 8);
-        assert_eq!(config.text_config.num_global_key_value_heads, Some(2));
-        assert_eq!(config.text_config.head_dim, 256);
-        assert_eq!(config.text_config.global_head_dim, Some(512));
+        assert_eq!(
+            config
+                .text_config
+                .layer_policy(0)
+                .unwrap()
+                .num_key_value_heads
+                .get(),
+            8
+        );
+        assert_eq!(
+            config
+                .text_config
+                .layer_policy(3)
+                .unwrap()
+                .num_key_value_heads
+                .get(),
+            2
+        );
+        assert_eq!(
+            config.text_config.layer_policy(0).unwrap().head_dim.get(),
+            256
+        );
+        assert_eq!(
+            config.text_config.layer_policy(3).unwrap().head_dim.get(),
+            512
+        );
         assert_eq!(config.text_config.vocab_size, 32);
         assert_eq!(
             config
                 .text_config
-                .attention_schedule
+                .layer_schedule
                 .iter()
-                .copied()
+                .map(|policy| policy.attention)
                 .collect::<Vec<_>>(),
             vec![
                 AttentionPolicy::sliding(1024).unwrap(),
@@ -1092,8 +1113,11 @@ mod tests {
         value["text_config"]["sliding_window"] = serde_json::json!(32);
         let config = super::gemma4_assistant_config_from_value(&value).unwrap();
         assert_eq!(
-            config.text_config.attention_policy(0),
-            Some(&AttentionPolicy::sliding(32).unwrap())
+            config
+                .text_config
+                .layer_policy(0)
+                .map(|policy| policy.attention),
+            Some(AttentionPolicy::sliding(32).unwrap())
         );
     }
 

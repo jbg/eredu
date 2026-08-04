@@ -1148,7 +1148,7 @@ impl GeneralLayerwiseModelAdapter for Gemma4LayerwiseAdapter {
             )?))),
             "text_decoder" => Ok(Gemma4Layer::Text(Box::new(TransformerBlock::new(
                 &self.args,
-                *self.args.attention_policy(index).ok_or_else(|| {
+                *self.args.layer_policy(index).ok_or_else(|| {
                     Error::UnsupportedArchitecture(format!(
                         "Gemma 4 has no attention policy for layer {index}"
                     ))
@@ -1224,7 +1224,7 @@ impl GeneralLayerwiseModelAdapter for Gemma4LayerwiseAdapter {
                 let mask = context
                     .sliding_masks
                     .as_ref()
-                    .and_then(|masks| masks.get(&layer.layer_policy))
+                    .and_then(|masks| masks.get(&layer.layer_policy.attention))
                     .or(context.mask.as_ref());
                 Ok(layer.forward(
                     AttentionInput {
@@ -1349,7 +1349,7 @@ impl GeneralLayerwiseModelAdapter for Gemma4LayerwiseAdapter {
             &cache.token_ids,
             self.image_token_id.map(|id| id as u32),
             self.video_token_id.map(|id| id as u32),
-            &self.args.attention_schedule,
+            &self.args.layer_schedule,
         );
         context.mask = Some(masks.full);
         context.sliding_masks = Some(masks.sliding);
