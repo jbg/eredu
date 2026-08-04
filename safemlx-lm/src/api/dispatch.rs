@@ -572,6 +572,10 @@ impl Model {
             Self::KimiLinearLayerwise(model) => Ok(
                 kimi_linear::prompt_cache_architecture_fingerprint(model.args()),
             ),
+            Self::Lfm2(model) => Ok(lfm2::prompt_cache_architecture_fingerprint(&model.args)),
+            Self::Lfm2Layerwise(model) => {
+                Ok(lfm2::prompt_cache_architecture_fingerprint(model.args()))
+            }
             Self::DenseQwen(model) => Ok(dense_qwen::prompt_cache_architecture_fingerprint(
                 &model.args,
             )),

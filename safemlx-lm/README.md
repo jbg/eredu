@@ -356,6 +356,19 @@ before a block lease is released. Public per-expert `w1`/`w2`/`w3` tensors are
 concatenated and stacked into runtime expert banks one layer at a time on the
 host; already-packed checkpoint representations load directly.
 
+LFM2's authoritative `LayerSchedule<LayerPolicy>` now carries both independent
+decisions for every decoder layer: `OperatorPolicy` selects convolution or
+self-attention, and `FeedForwardPolicy` selects dense SwiGLU or sparse MoE. HF
+`num_dense_layers` and GGUF `leading_dense_block_count` are validated
+source-format inputs used once to construct the schedule; they are not retained
+in normalized `ModelArgs`. Arbitrary internal dense/MoE ordering is supported by
+resident, layerwise, dense-stream, sparse-expert, structural, and
+expert-parallel paths. `ModelArgs::layer_policy` and
+`ModelArgs::layer_schedule_fingerprint` replace the removed model-wide
+`num_dense_layers`, `is_moe`, and operator-only `LayerPolicy` API.
+Persisted LFM2 prompt caches remain unsupported, but loaded-model cache identity
+includes the complete ordered operator/feed-forward schedule.
+
 LFM2 uses the generic `LayerSchedule<P>` runtime geometry. Hugging Face
 `layer_types` and GGUF per-layer KV-head metadata
 normalize once into `LayerSchedule<architectures::lfm2::model::LayerPolicy>`, whose entries are
@@ -530,7 +543,7 @@ never replaced by eager loading.
 | Qwen2 / Qwen2.5 text | yes | yes | GQA KV, split into full-context and configured sliding layers | embedding, norm, tied/untied head | decoder block | exact Q/K/V biases; direct affine/MXFP4 | full/sliding resident-to-layerwise prefill and decode |
 | Qwen3 dense / MoE | yes | yes | growing KV | embedding, norm, head | decoder block with local experts | direct affine/MXFP4 | dense and MoE prefill/decode |
 | GPT-OSS | yes | yes | scheduled full/sliding KV | embedding, norm, head | sparse decoder block | native MXFP4 experts | arbitrary schedule, ordinary/paged caches, and multi-step decode |
-| LFM2/LFM2.5 dense / MoE | yes | yes | growing KV or convolution state | embedding, norm, tied/untied head | hybrid decoder block | split SwiGLU experts packed per layer; packed form accepted | dense and split-MoE hybrid prefill/decode |
+| LFM2/LFM2.5 dense / MoE | yes | yes | scheduled growing KV or convolution state | embedding, norm, tied/untied head | independently scheduled operator and dense/MoE block | split SwiGLU experts packed for each scheduled sparse layer; packed form accepted | arbitrary dense/MoE schedule plus hybrid prefill/decode |
 | DeepSeek-V3/R1 | yes | yes | compressed MLA latent and rotary-key state | embedding, norm, head | MLA decoder block with dense or routed/shared experts | official split experts stacked per layer; direct dense/affine and native block-FP8 banks | dense-to-MoE prefill/decode at two depths; native block-FP8 prefill/decode |
 | Kimi Linear | yes | yes | bounded Q/K/V convolution and F32 KDA recurrent state, or growing compressed no-RoPE MLA state | embedding, norm, head | hybrid KDA/MLA block with dense or routed/shared experts | official split experts packed per layer; convolution and transition-state reshaping | prefill/decode primitive, cache, loader, and real-checkpoint smoke coverage |
 | Gemma 4 multimodal | yes | yes | scheduled full/sliding KV plus transient shared-KV and media state | patch embedding/pooling, audio subsampling/output, modality projections, token/per-layer embeddings, norm, head | independent vision, audio, and exact-policy text groups | public prefix rewrite; direct affine/MXFP4 text and modality projections | vision/audio/text typed prefill parity; arbitrary-pattern per-layer inputs, shared KV, prefill/decode at two depths |

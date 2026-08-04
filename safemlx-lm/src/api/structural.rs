@@ -1040,12 +1040,13 @@ fn lfm2_expected(args: &lfm2::ModelArgs) -> Result<Vec<ExpectedTensor>, Error> {
                 hidden,
             ),
         ]);
-        match args.layer_schedule.get(layer).ok_or_else(|| {
+        let policy = args.layer_schedule.get(layer).ok_or_else(|| {
             Error::UnsupportedArchitecture(format!(
                 "LFM2 layer schedule has no policy for layer {layer}"
             ))
-        })? {
-            lfm2::LayerPolicy::CausalConvolution => {
+        })?;
+        match policy.operator {
+            lfm2::OperatorPolicy::CausalConvolution => {
                 tensors.extend([
                     expected_dense_with_gguf_shape(
                         format!("{model}.conv.conv.weight"),
@@ -1084,7 +1085,7 @@ fn lfm2_expected(args: &lfm2::ModelArgs) -> Result<Vec<ExpectedTensor>, Error> {
                     ]);
                 }
             }
-            lfm2::LayerPolicy::SelfAttention(crate::AttentionPolicy::Full) => tensors.extend([
+            lfm2::OperatorPolicy::SelfAttention(crate::AttentionPolicy::Full) => tensors.extend([
                 expected(
                     format!("{model}.self_attn.q_proj.weight"),
                     format!("{gguf}.attn_q.weight"),
@@ -1116,13 +1117,13 @@ fn lfm2_expected(args: &lfm2::ModelArgs) -> Result<Vec<ExpectedTensor>, Error> {
                     head,
                 ),
             ]),
-            lfm2::LayerPolicy::SelfAttention(crate::AttentionPolicy::Sliding { .. }) => {
+            lfm2::OperatorPolicy::SelfAttention(crate::AttentionPolicy::Sliding { .. }) => {
                 return Err(Error::UnsupportedArchitecture(
                     "LFM2 structural admission does not support sliding attention".into(),
                 ));
             }
         }
-        if args.is_moe() && layer >= args.num_dense_layers as usize {
+        if policy.feed_forward == lfm2::FeedForwardPolicy::SparseMoe {
             let experts = args.num_experts as usize;
             let intermediate = args.moe_intermediate_size as usize;
             tensors.extend([
@@ -1155,11 +1156,7 @@ fn lfm2_expected(args: &lfm2::ModelArgs) -> Result<Vec<ExpectedTensor>, Error> {
                 ));
             }
         } else {
-            let intermediate = if args.is_moe() {
-                args.intermediate_size as usize
-            } else {
-                args.dense_intermediate_size() as usize
-            };
+            let intermediate = args.dense_layer_intermediate_size() as usize;
             tensors.extend([
                 expected(
                     format!("{model}.feed_forward.w1.weight"),
@@ -3175,7 +3172,7 @@ fn validate_lfm2_safetensors(
         Ok(expected) => expected,
         Err(error) => return invalid_geometry(error.to_string()),
     };
-    if !args.is_moe() {
+    if !args.has_sparse_moe_layers() {
         return validate_safetensor_plan_with(store, expected, |name| {
             args.weight_quantization_for(name)
         });
@@ -3193,7 +3190,12 @@ fn validate_lfm2_safetensors(
         &mut issues,
     );
     let allow_derived_packed = !matches!(options.weight_residency, WeightResidency::FullyResident);
-    for layer in args.num_dense_layers as usize..args.num_hidden_layers as usize {
+    for (layer, _) in args
+        .layer_schedule
+        .iter()
+        .enumerate()
+        .filter(|(_, policy)| policy.feed_forward == lfm2::FeedForwardPolicy::SparseMoe)
+    {
         validate_split_or_packed_swiglu_experts(
             store,
             &format!("model.layers.{layer}.feed_forward.experts"),
@@ -5842,7 +5844,12 @@ fn validate_lfm2_gguf(
     if is_moe {
         issues.extend(validate_paired_expert_encodings(
             checkpoint,
-            args.num_dense_layers as usize..args.num_hidden_layers as usize,
+            args.layer_schedule
+                .iter()
+                .enumerate()
+                .filter_map(|(layer, policy)| {
+                    (policy.feed_forward == lfm2::FeedForwardPolicy::SparseMoe).then_some(layer)
+                }),
             "LFM2 MoE",
         ));
     }
@@ -7331,7 +7338,7 @@ fn validate_qwen35_gguf(
 
 fn validate_paired_expert_encodings(
     checkpoint: &GgufCheckpoint,
-    layers: std::ops::Range<usize>,
+    layers: impl IntoIterator<Item = usize>,
     loader_name: &str,
 ) -> Vec<StructuralIssue> {
     let catalog = checkpoint
@@ -7627,5 +7634,54 @@ mod dense_qwen_tests {
         assert!(untied
             .iter()
             .any(|tensor| tensor.safetensors_name == "lm_head.weight"));
+    }
+}
+
+#[cfg(test)]
+mod lfm2_schedule_tests {
+    use super::*;
+
+    #[test]
+    fn structural_plan_uses_each_feed_forward_policy_in_order() {
+        let mut args = lfm2::model_args_from_config_value(&serde_json::json!({
+            "model_type": "lfm2_moe", "vocab_size": 32, "hidden_size": 16,
+            "intermediate_size": 24, "num_hidden_layers": 3,
+            "num_attention_heads": 4, "num_key_value_heads": 2,
+            "max_position_embeddings": 64, "norm_eps": 1e-5,
+            "layer_types": ["conv", "full_attention", "conv"],
+            "conv_L_cache": 3, "block_auto_adjust_ff_dim": false,
+            "moe_intermediate_size": 8, "num_dense_layers": 1,
+            "num_experts": 2, "num_experts_per_tok": 1
+        }))
+        .unwrap();
+        args.layer_schedule = crate::LayerSchedule::new(
+            3,
+            vec![
+                lfm2::LayerPolicy {
+                    operator: lfm2::OperatorPolicy::CausalConvolution,
+                    feed_forward: lfm2::FeedForwardPolicy::SparseMoe,
+                },
+                lfm2::LayerPolicy {
+                    operator: lfm2::OperatorPolicy::SelfAttention(crate::AttentionPolicy::Full),
+                    feed_forward: lfm2::FeedForwardPolicy::Dense,
+                },
+                lfm2::LayerPolicy {
+                    operator: lfm2::OperatorPolicy::CausalConvolution,
+                    feed_forward: lfm2::FeedForwardPolicy::SparseMoe,
+                },
+            ],
+        )
+        .unwrap();
+
+        let names = lfm2_expected(&args)
+            .unwrap()
+            .into_iter()
+            .map(|tensor| tensor.safetensors_name)
+            .collect::<BTreeSet<_>>();
+        assert!(names.contains("model.layers.0.feed_forward.gate.weight"));
+        assert!(!names.contains("model.layers.0.feed_forward.w1.weight"));
+        assert!(names.contains("model.layers.1.feed_forward.w1.weight"));
+        assert!(!names.contains("model.layers.1.feed_forward.gate.weight"));
+        assert!(names.contains("model.layers.2.feed_forward.gate.weight"));
     }
 }

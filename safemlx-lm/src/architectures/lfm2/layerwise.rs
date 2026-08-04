@@ -21,7 +21,10 @@ use crate::{
         common::moe::PackedSwiGluExperts,
         common::{self, generation::CausalLm, linear::project_logits_maybe_quantized},
         input,
-        lfm2::{self as resident, Cache, DecoderLayer, LayerCache, LayerPolicy, ModelArgs},
+        lfm2::{
+            self as resident, Cache, DecoderLayer, FeedForwardPolicy, LayerCache, ModelArgs,
+            OperatorPolicy,
+        },
     },
     error::Error,
     nn::tensor::{create_attention_mask, AttentionMask},
@@ -208,7 +211,7 @@ pub(crate) fn load_lfm2_gguf_layerwise_model(
 ) -> Result<(Lfm2LayerwiseModel, Vec<u32>), Error> {
     let prepared = resident::prepare_gguf_checkpoint(checkpoint, metadata, weights_stream)?;
     let args = prepared.args;
-    let is_moe = prepared.is_moe;
+    let is_moe = args.model_type == "lfm2_moe";
     let store: Arc<dyn WeightStore + Send + Sync> =
         Arc::new(GgufWeightStore::new_with_max_mapped_shards(
             checkpoint.clone(),
@@ -273,7 +276,7 @@ fn load_lfm2_gguf_sparse_with_store(
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<Lfm2LayerwiseModel, Error> {
-    if !args.is_moe() {
+    if !args.has_sparse_moe_layers() {
         return Err(Error::UnsupportedArchitecture(
             "sparse expert caching requires an LFM2 MoE GGUF checkpoint".into(),
         ));
@@ -361,7 +364,7 @@ fn load_lfm2_sparse_expert_cache_model_with_non_expert(
 ) -> Result<Lfm2LayerwiseModel, Error> {
     let model_dir = model_dir.as_ref();
     let args = resident::get_model_args(model_dir)?;
-    if !args.is_moe() {
+    if !args.has_sparse_moe_layers() {
         return Err(Error::UnsupportedArchitecture(
             "sparse expert caching requires an LFM2 MoE checkpoint".into(),
         ));
@@ -437,7 +440,17 @@ impl Lfm2LayerwiseAdapter {
         index: usize,
         store: &dyn WeightStore,
     ) -> Result<BTreeMap<String, DerivedWeightRecipe>, Error> {
-        if !self.args.is_moe() || index < self.args.num_dense_layers as usize {
+        if self
+            .args
+            .layer_policy(index)
+            .ok_or_else(|| {
+                Error::UnsupportedArchitecture(format!(
+                    "LFM2 layer schedule has no policy for layer {index}"
+                ))
+            })?
+            .feed_forward
+            != FeedForwardPolicy::SparseMoe
+        {
             return Ok(BTreeMap::new());
         }
         let runtime_prefix = format!("model.layers.{index}.feed_forward.experts");
@@ -619,9 +632,9 @@ impl GeneralLayerwiseModelAdapter for Lfm2LayerwiseAdapter {
                 ))
             })?;
             let matches = matches!(
-                (policy, layer_cache),
-                (LayerPolicy::CausalConvolution, LayerCache::Conv(_))
-                    | (LayerPolicy::SelfAttention(_), LayerCache::Attention(_))
+                (policy.operator, layer_cache),
+                (OperatorPolicy::CausalConvolution, LayerCache::Conv(_))
+                    | (OperatorPolicy::SelfAttention(_), LayerCache::Attention(_))
             );
             if !matches {
                 return Err(Error::UnsupportedArchitecture(format!(
@@ -781,7 +794,12 @@ impl GeneralLayerwiseModelAdapter for Lfm2LayerwiseAdapter {
         stream: &Stream,
     ) -> Result<Array, Error> {
         self.layer_count(group)?;
-        if self.sparse_expert_cache && layer.feed_forward.is_moe {
+        let policy = self.args.layer_policy(index).ok_or_else(|| {
+            Error::UnsupportedArchitecture(format!(
+                "LFM2 layer schedule has no policy for layer {index}"
+            ))
+        })?;
+        if self.sparse_expert_cache && policy.feed_forward == FeedForwardPolicy::SparseMoe {
             let expert_cache = self.expert_cache.as_ref().ok_or_else(|| {
                 Error::UnsupportedArchitecture(
                     "LFM2 sparse expert cache was not initialized".into(),
@@ -909,7 +927,12 @@ pub(crate) fn lfm2_expert_catalog(
         .into_iter()
         .collect::<std::collections::BTreeSet<_>>();
     let mut entries = Vec::new();
-    for layer in args.num_dense_layers as usize..args.num_hidden_layers as usize {
+    for (layer, _) in args
+        .layer_schedule
+        .iter()
+        .enumerate()
+        .filter(|(_, policy)| policy.feed_forward == FeedForwardPolicy::SparseMoe)
+    {
         let prefix = format!("model.layers.{layer}.feed_forward.experts");
         let packed_gate_up = format!("{prefix}.gate_up_proj");
         let packed_down = format!("{prefix}.down_proj");
@@ -1082,13 +1105,24 @@ mod tests {
         Array, Device, DeviceType, ExecutionContext, Stream,
     };
 
-    use super::{load_lfm2_layerwise_model, load_lfm2_sparse_expert_cache_model};
+    use super::{
+        load_lfm2_layerwise_model, load_lfm2_sparse_expert_cache_model, Lfm2LayerwiseAdapter,
+        Lfm2LayerwiseModel,
+    };
     use crate::{
-        architectures::lfm2::model::{self as resident, Cache, LayerCache, Model, ModelArgs},
-        runtime::execution::layerwise::{LayerExecutionLoadOptions, LayerwiseLoadOptions},
+        architectures::lfm2::model::{
+            self as resident, Cache, FeedForwardPolicy, LayerCache, LayerPolicy, Model, ModelArgs,
+            OperatorPolicy,
+        },
         runtime::residency::dense_stream::DenseDiskStreamLoadOptions,
         runtime::residency::expert_cache::ExpertCacheLoadOptions,
         runtime::residency::policy::{MemoryTier, OffloadConfig, ResidencyPolicy},
+        runtime::{
+            attention::LayerSchedule,
+            execution::layerwise::{
+                load_general_layerwise_model, LayerExecutionLoadOptions, LayerwiseLoadOptions,
+            },
+        },
     };
 
     fn args(moe: bool) -> ModelArgs {
@@ -1174,6 +1208,16 @@ mod tests {
             dir.join("model.safetensors"),
         )
         .unwrap();
+        let num_dense_layers = if model.args.model_type == "lfm2_moe" {
+            model
+                .args
+                .layer_schedule
+                .iter()
+                .position(|policy| policy.feed_forward == resident::FeedForwardPolicy::SparseMoe)
+                .unwrap_or(model.args.layer_schedule.len())
+        } else {
+            0
+        };
         fs::write(
             dir.join("config.json"),
             serde_json::to_vec(&serde_json::json!({
@@ -1186,17 +1230,17 @@ mod tests {
                 "num_key_value_heads": model.args.num_key_value_heads,
                 "max_position_embeddings": model.args.max_position_embeddings,
                 "norm_eps": model.args.norm_eps,
-                "layer_types": model.args.layer_schedule.iter().map(|policy| match policy {
-                    resident::LayerPolicy::CausalConvolution => "conv",
-                    resident::LayerPolicy::SelfAttention(crate::AttentionPolicy::Full) => "full_attention",
-                    resident::LayerPolicy::SelfAttention(crate::AttentionPolicy::Sliding { .. }) => unreachable!("validated LFM2 test schedule"),
+                "layer_types": model.args.layer_schedule.iter().map(|policy| match policy.operator {
+                    resident::OperatorPolicy::CausalConvolution => "conv",
+                    resident::OperatorPolicy::SelfAttention(crate::AttentionPolicy::Full) => "full_attention",
+                    resident::OperatorPolicy::SelfAttention(crate::AttentionPolicy::Sliding { .. }) => unreachable!("validated LFM2 test schedule"),
                 }).collect::<Vec<_>>(),
                 "conv_L_cache": model.args.conv_l_cache,
                 "conv_bias": model.args.conv_bias,
                 "block_auto_adjust_ff_dim": false,
                 "tie_word_embeddings": model.args.tie_word_embeddings,
                 "moe_intermediate_size": model.args.moe_intermediate_size,
-                "num_dense_layers": model.args.num_dense_layers,
+                "num_dense_layers": num_dense_layers,
                 "num_experts": model.args.num_experts,
                 "num_experts_per_tok": model.args.num_experts_per_tok,
                 "norm_topk_prob": model.args.norm_topk_prob,
@@ -1306,6 +1350,65 @@ mod tests {
     #[test]
     fn lfm2_split_moe_hybrid_layerwise_prefill_and_cached_decode_parity() {
         parity(true, 1, false);
+    }
+
+    #[test]
+    fn arbitrary_feed_forward_schedule_matches_resident_execution() {
+        let gpu = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
+        let cpu = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        let mut custom_args = args(true);
+        custom_args.layer_schedule = LayerSchedule::new(
+            3,
+            vec![
+                LayerPolicy {
+                    operator: OperatorPolicy::CausalConvolution,
+                    feed_forward: FeedForwardPolicy::SparseMoe,
+                },
+                LayerPolicy {
+                    operator: OperatorPolicy::SelfAttention(crate::AttentionPolicy::Full),
+                    feed_forward: FeedForwardPolicy::Dense,
+                },
+                LayerPolicy {
+                    operator: OperatorPolicy::CausalConvolution,
+                    feed_forward: FeedForwardPolicy::SparseMoe,
+                },
+            ],
+        )
+        .unwrap();
+        let mut resident = Model::new(custom_args.clone(), gpu.stream()).unwrap();
+        assert!(resident.model.layers[0].feed_forward.is_moe);
+        assert!(!resident.model.layers[1].feed_forward.is_moe);
+        assert!(resident.model.layers[2].feed_forward.is_moe);
+        initialize(&mut resident, gpu.stream());
+        let directory = tempfile::tempdir().unwrap();
+        write_fixture(directory.path(), &resident, gpu.stream());
+
+        let adapter = Lfm2LayerwiseAdapter::new(custom_args, gpu.stream()).unwrap();
+        let execution = load_general_layerwise_model(
+            directory.path(),
+            adapter,
+            LayerwiseLoadOptions::new(OffloadConfig::new(None, None, 1).unwrap()),
+            gpu.stream(),
+            cpu.stream(),
+        )
+        .unwrap();
+        let mut layerwise = Lfm2LayerwiseModel { execution };
+        let mut resident_cache = resident.new_cache();
+        let mut layerwise_cache = Cache { layers: Vec::new() };
+        for tokens in [
+            Array::from_slice(&[1u32, 2], &[1, 2]),
+            Array::from_slice(&[3u32], &[1, 1]),
+        ] {
+            let expected = resident
+                .forward_logits(&tokens, Some(&mut resident_cache), false, gpu.stream())
+                .unwrap();
+            let actual = layerwise
+                .forward(&tokens, &mut layerwise_cache, gpu.stream())
+                .unwrap();
+            assert_close(&actual, &expected);
+        }
+        assert_eq!(resident_cache.offset(), 3);
+        assert_eq!(layerwise_cache.offset(), 3);
     }
 
     #[test]

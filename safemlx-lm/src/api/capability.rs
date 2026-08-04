@@ -1170,12 +1170,12 @@ fn lfm2_spec(args: &lfm2::ModelArgs) -> Result<Spec, CapabilityError> {
     let attention = args
         .layer_schedule
         .iter()
-        .filter(|policy| matches!(policy, lfm2::LayerPolicy::SelfAttention(_)))
+        .filter(|policy| matches!(policy.operator, lfm2::OperatorPolicy::SelfAttention(_)))
         .count() as u64;
     let conv = args
         .layer_schedule
         .iter()
-        .filter(|policy| matches!(policy, lfm2::LayerPolicy::CausalConvolution))
+        .filter(|policy| matches!(policy.operator, lfm2::OperatorPolicy::CausalConvolution))
         .count() as u64;
     let head_dim = args.hidden_size / args.num_attention_heads;
     let fixed = checked_mul(

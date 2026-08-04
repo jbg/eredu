@@ -4607,7 +4607,7 @@ fn load_additional_streamed_ep(
         }
         ModelKind::Lfm2 => {
             let args = lfm2::get_model_args(model_dir)?;
-            if !args.is_moe() {
+            if !args.has_sparse_moe_layers() {
                 return Err(Error::UnsupportedArchitecture(
                     "expert parallelism requires an LFM2 MoE checkpoint".into(),
                 ));
@@ -4896,7 +4896,7 @@ fn load_additional_cached_ep(
         }
         ModelKind::Lfm2 => {
             let args = lfm2::get_model_args(model_dir)?;
-            if !args.is_moe() {
+            if !args.has_sparse_moe_layers() {
                 return Err(Error::UnsupportedArchitecture(
                     "expert parallelism requires an LFM2 MoE checkpoint".into(),
                 ));

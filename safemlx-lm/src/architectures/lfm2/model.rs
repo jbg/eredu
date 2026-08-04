@@ -41,7 +41,9 @@ use crate::{
         AttentionMask,
     },
     runtime::attention::{AttentionPolicy, LayerSchedule},
-    runtime::cache::{ConcatKeyValueCache, KeyValueCache},
+    runtime::cache::{
+        residency::derive_prompt_cache_architecture_fingerprint, ConcatKeyValueCache, KeyValueCache,
+    },
     runtime::checkpoint::load::{
         gguf_metadata, gguf_quantization_configs, load_named_array_strict,
         load_safetensors_dir_quantized_strict, load_safetensors_dir_strict,
@@ -81,14 +83,14 @@ fn default_routed_scaling_factor() -> f32 {
 
 #[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
 /// Stateful operator used by an LFM2 decoder layer.
-pub enum LayerPolicy {
+pub enum OperatorPolicy {
     /// Gated causal depthwise convolution.
     CausalConvolution,
     /// Grouped-query self-attention with its exact cache-retention policy.
     SelfAttention(AttentionPolicy),
 }
 
-impl LayerPolicy {
+impl OperatorPolicy {
     fn parse(value: &str) -> Result<Self, Error> {
         match value {
             "conv" => Ok(Self::CausalConvolution),
@@ -98,6 +100,24 @@ impl LayerPolicy {
             ))),
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
+/// Feed-forward operator used by an LFM2 decoder layer.
+pub enum FeedForwardPolicy {
+    /// Dense SwiGLU feed-forward block.
+    Dense,
+    /// Routed sparse mixture-of-experts block.
+    SparseMoe,
+}
+
+#[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
+/// Complete execution policy for one LFM2 decoder layer.
+pub struct LayerPolicy {
+    /// Stateful token-mixing operator.
+    pub operator: OperatorPolicy,
+    /// Feed-forward operator.
+    pub feed_forward: FeedForwardPolicy,
 }
 
 #[derive(Debug, Clone)]
@@ -121,7 +141,7 @@ pub struct ModelArgs {
     pub max_position_embeddings: i32,
     /// RMSNorm epsilon.
     pub norm_eps: f32,
-    /// Authoritative stateful operator policy in decoder-layer order.
+    /// Authoritative operator and feed-forward policy in decoder-layer order.
     pub layer_schedule: LayerSchedule<LayerPolicy>,
     /// Causal convolution kernel width.
     pub conv_l_cache: i32,
@@ -145,8 +165,6 @@ pub struct ModelArgs {
     pub rope_parameters: Option<HashMap<String, FloatOrString>>,
     /// Per-expert intermediate size for MoE checkpoints.
     pub moe_intermediate_size: i32,
-    /// Number of leading dense feed-forward layers in MoE checkpoints.
-    pub num_dense_layers: i32,
     /// Number of routed experts.
     pub num_experts: i32,
     /// Experts selected per token.
@@ -228,11 +246,39 @@ impl ModelArgsSource {
                 self.num_hidden_layers
             ))
         })?;
-        let policies = self
+        let operators = self
             .layer_types
             .iter()
-            .map(|value| LayerPolicy::parse(value))
+            .map(|value| OperatorPolicy::parse(value))
             .collect::<Result<Vec<_>, _>>()?;
+        if self.model_type == "lfm2" && self.num_dense_layers != 0 {
+            return Err(Error::UnsupportedArchitecture(format!(
+                "LFM2 dense config conflicts with num_dense_layers={}",
+                self.num_dense_layers
+            )));
+        }
+        if self.model_type == "lfm2_moe"
+            && (self.num_dense_layers < 0 || self.num_dense_layers > self.num_hidden_layers)
+        {
+            return Err(Error::UnsupportedArchitecture(format!(
+                "LFM2 MoE num_dense_layers must be between 0 and {}, got {}",
+                self.num_hidden_layers, self.num_dense_layers
+            )));
+        }
+        let policies = operators
+            .into_iter()
+            .enumerate()
+            .map(|(layer, operator)| LayerPolicy {
+                operator,
+                feed_forward: if self.model_type == "lfm2_moe"
+                    && layer >= self.num_dense_layers as usize
+                {
+                    FeedForwardPolicy::SparseMoe
+                } else {
+                    FeedForwardPolicy::Dense
+                },
+            })
+            .collect();
         let layer_schedule = LayerSchedule::new(layer_count, policies)
             .map_err(|error| Error::UnsupportedArchitecture(format!("LFM2 {error}")))?;
         Ok(ModelArgs {
@@ -257,7 +303,6 @@ impl ModelArgsSource {
             rope_theta: self.rope_theta,
             rope_parameters: self.rope_parameters,
             moe_intermediate_size: self.moe_intermediate_size,
-            num_dense_layers: self.num_dense_layers,
             num_experts: self.num_experts,
             num_experts_per_tok: self.num_experts_per_tok,
             norm_topk_prob: self.norm_topk_prob,
@@ -272,9 +317,38 @@ impl ModelArgsSource {
 }
 
 impl ModelArgs {
-    /// Returns whether this is an MoE checkpoint.
-    pub fn is_moe(&self) -> bool {
-        self.model_type == "lfm2_moe"
+    /// Returns one validated layer policy without an out-of-range fallback.
+    pub fn layer_policy(&self, layer: usize) -> Option<&LayerPolicy> {
+        self.layer_schedule.get(layer)
+    }
+
+    /// Returns whether any layer contains routed experts.
+    pub fn has_sparse_moe_layers(&self) -> bool {
+        self.layer_schedule
+            .iter()
+            .any(|policy| policy.feed_forward == FeedForwardPolicy::SparseMoe)
+    }
+
+    /// Returns a stable ordered representation of the complete layer schedule.
+    pub fn layer_schedule_fingerprint(&self) -> String {
+        self.layer_schedule
+            .iter()
+            .map(|policy| {
+                let operator = match policy.operator {
+                    OperatorPolicy::CausalConvolution => "c".to_string(),
+                    OperatorPolicy::SelfAttention(AttentionPolicy::Full) => "af".to_string(),
+                    OperatorPolicy::SelfAttention(AttentionPolicy::Sliding { window }) => {
+                        format!("as{}", window.get())
+                    }
+                };
+                let feed_forward = match policy.feed_forward {
+                    FeedForwardPolicy::Dense => "d",
+                    FeedForwardPolicy::SparseMoe => "e",
+                };
+                format!("{operator}{feed_forward}")
+            })
+            .collect::<Vec<_>>()
+            .join(",")
     }
 
     pub(crate) fn dense_intermediate_size(&self) -> i32 {
@@ -286,6 +360,14 @@ impl ModelArgs {
                 * ((size + self.block_multiple_of - 1) / self.block_multiple_of);
         }
         size
+    }
+
+    pub(crate) fn dense_layer_intermediate_size(&self) -> i32 {
+        if self.model_type == "lfm2_moe" {
+            self.intermediate_size
+        } else {
+            self.dense_intermediate_size()
+        }
     }
 
     fn rope_theta(&self) -> f32 {
@@ -318,6 +400,23 @@ impl ModelArgs {
             _ => Some(quantization),
         }
     }
+}
+
+/// Returns a deterministic cache identity including the complete ordered LFM2 schedule.
+pub(crate) fn prompt_cache_architecture_fingerprint(args: &ModelArgs) -> String {
+    derive_prompt_cache_architecture_fingerprint(
+        "lfm2",
+        [
+            ("model_type", args.model_type.clone()),
+            ("hidden_size", args.hidden_size.to_string()),
+            ("num_hidden_layers", args.num_hidden_layers.to_string()),
+            ("num_attention_heads", args.num_attention_heads.to_string()),
+            ("num_key_value_heads", args.num_key_value_heads.to_string()),
+            ("conv_l_cache", args.conv_l_cache.to_string()),
+            ("rope_theta", format!("{:08x}", args.rope_theta().to_bits())),
+            ("layer_schedule", args.layer_schedule_fingerprint()),
+        ],
+    )
 }
 
 /// Validates a parsed LFM2 configuration.
@@ -365,8 +464,8 @@ fn validate_args(args: &ModelArgs) -> Result<(), Error> {
     }
     if args.layer_schedule.iter().any(|policy| {
         matches!(
-            policy,
-            LayerPolicy::SelfAttention(AttentionPolicy::Sliding { .. })
+            policy.operator,
+            OperatorPolicy::SelfAttention(AttentionPolicy::Sliding { .. })
         )
     }) {
         return Err(Error::UnsupportedArchitecture(
@@ -385,16 +484,19 @@ fn validate_args(args: &ModelArgs) -> Result<(), Error> {
             "LFM2 adjusted dense intermediate size must be positive".into(),
         ));
     }
-    if args.is_moe()
+    if args.has_sparse_moe_layers()
         && (args.moe_intermediate_size <= 0
             || args.num_experts <= 0
             || args.num_experts_per_tok <= 0
-            || args.num_experts_per_tok > args.num_experts
-            || args.num_dense_layers < 0
-            || args.num_dense_layers > args.num_hidden_layers)
+            || args.num_experts_per_tok > args.num_experts)
     {
         return Err(Error::UnsupportedArchitecture(
-            "LFM2 MoE expert or dense-prefix configuration is invalid".into(),
+            "LFM2 MoE expert configuration is invalid".into(),
+        ));
+    }
+    if args.model_type == "lfm2" && args.has_sparse_moe_layers() {
+        return Err(Error::UnsupportedArchitecture(
+            "LFM2 dense config contains a sparse-MoE layer policy".into(),
         ));
     }
     Ok(())
@@ -788,14 +890,14 @@ pub enum LayerCache {
 
 impl LayerCache {
     pub(crate) fn new(policy: LayerPolicy) -> Self {
-        match policy {
-            LayerPolicy::CausalConvolution => Self::Conv(CausalConv1dCache::default()),
+        match policy.operator {
+            OperatorPolicy::CausalConvolution => Self::Conv(CausalConv1dCache::default()),
             // Match mlx-lm's KVCache growth policy. Chunked backing arrays
             // avoid concatenating the complete cache for every decode token.
-            LayerPolicy::SelfAttention(AttentionPolicy::Full) => {
+            OperatorPolicy::SelfAttention(AttentionPolicy::Full) => {
                 Self::Attention(ConcatKeyValueCache::new_with_step(256))
             }
-            LayerPolicy::SelfAttention(AttentionPolicy::Sliding { .. }) => {
+            OperatorPolicy::SelfAttention(AttentionPolicy::Sliding { .. }) => {
                 unreachable!("validated LFM2 schedules contain only full self-attention")
             }
         }
@@ -888,29 +990,21 @@ impl DecoderLayer {
             })?;
         Ok(Self {
             layer_policy,
-            self_attn: if matches!(layer_policy, LayerPolicy::SelfAttention(_)) {
+            self_attn: if matches!(layer_policy.operator, OperatorPolicy::SelfAttention(_)) {
                 Some(Attention::new(args, index, stream)?)
             } else {
                 None
             },
-            conv: if layer_policy == LayerPolicy::CausalConvolution {
+            conv: if layer_policy.operator == OperatorPolicy::CausalConvolution {
                 Some(ShortConv::new(args, index, stream)?)
             } else {
                 None
             },
-            feed_forward: if args.is_moe() && index >= args.num_dense_layers {
-                FeedForward::moe(args, index, stream)?
-            } else {
-                FeedForward::dense(
-                    args,
-                    index,
-                    if args.is_moe() {
-                        args.intermediate_size
-                    } else {
-                        args.dense_intermediate_size()
-                    },
-                    stream,
-                )?
+            feed_forward: match layer_policy.feed_forward {
+                FeedForwardPolicy::SparseMoe => FeedForward::moe(args, index, stream)?,
+                FeedForwardPolicy::Dense => {
+                    FeedForward::dense(args, index, args.dense_layer_intermediate_size(), stream)?
+                }
             },
             operator_norm: nn::RmsNorm::unloaded(
                 args.hidden_size,
@@ -935,8 +1029,8 @@ impl DecoderLayer {
         stream: &Stream,
     ) -> Result<Array, Exception> {
         let normalized = self.operator_norm.forward(x, stream)?;
-        let operator = match (self.layer_policy, cache) {
-            (LayerPolicy::SelfAttention(_), Some(LayerCache::Attention(cache))) => {
+        let operator = match (self.layer_policy.operator, cache) {
+            (OperatorPolicy::SelfAttention(_), Some(LayerCache::Attention(cache))) => {
                 self.self_attn.as_mut().expect("attention layer").forward(
                     AttentionInput {
                         x: &normalized,
@@ -946,7 +1040,7 @@ impl DecoderLayer {
                     stream,
                 )?
             }
-            (LayerPolicy::SelfAttention(_), None) => {
+            (OperatorPolicy::SelfAttention(_), None) => {
                 self.self_attn.as_mut().expect("attention layer").forward(
                     AttentionInput {
                         x: &normalized,
@@ -956,12 +1050,12 @@ impl DecoderLayer {
                     stream,
                 )?
             }
-            (LayerPolicy::CausalConvolution, Some(LayerCache::Conv(cache))) => self
+            (OperatorPolicy::CausalConvolution, Some(LayerCache::Conv(cache))) => self
                 .conv
                 .as_mut()
                 .expect("conv layer")
                 .forward(&normalized, Some(cache), stream)?,
-            (LayerPolicy::CausalConvolution, None) => self
+            (OperatorPolicy::CausalConvolution, None) => self
                 .conv
                 .as_mut()
                 .expect("conv layer")
@@ -991,8 +1085,8 @@ impl DecoderLayer {
         F: FnOnce(&Array, &Array, &Array, &Stream) -> Result<Array, Exception>,
     {
         let normalized = self.operator_norm.forward(x, stream)?;
-        let operator = match (self.layer_policy, cache) {
-            (LayerPolicy::SelfAttention(_), Some(LayerCache::Attention(cache))) => {
+        let operator = match (self.layer_policy.operator, cache) {
+            (OperatorPolicy::SelfAttention(_), Some(LayerCache::Attention(cache))) => {
                 self.self_attn.as_mut().expect("attention layer").forward(
                     AttentionInput {
                         x: &normalized,
@@ -1002,7 +1096,7 @@ impl DecoderLayer {
                     stream,
                 )?
             }
-            (LayerPolicy::SelfAttention(_), None) => {
+            (OperatorPolicy::SelfAttention(_), None) => {
                 self.self_attn.as_mut().expect("attention layer").forward(
                     AttentionInput {
                         x: &normalized,
@@ -1012,12 +1106,12 @@ impl DecoderLayer {
                     stream,
                 )?
             }
-            (LayerPolicy::CausalConvolution, Some(LayerCache::Conv(cache))) => self
+            (OperatorPolicy::CausalConvolution, Some(LayerCache::Conv(cache))) => self
                 .conv
                 .as_mut()
                 .expect("conv layer")
                 .forward(&normalized, Some(cache), stream)?,
-            (LayerPolicy::CausalConvolution, None) => self
+            (OperatorPolicy::CausalConvolution, None) => self
                 .conv
                 .as_mut()
                 .expect("conv layer")
@@ -1134,7 +1228,7 @@ impl Lfm2Model {
             .zip(cache.layers.iter_mut())
             .enumerate()
         {
-            h = if layer.feed_forward.is_moe {
+            h = if layer.layer_policy.feed_forward == FeedForwardPolicy::SparseMoe {
                 layer.forward_with_expert_executor(
                     &h,
                     mask.as_ref(),
@@ -1316,7 +1410,7 @@ pub fn load_model(
     let mut model = Model::new(args.clone(), stream)?;
     let config = StrictLoadConfig::default();
     let mut report = StrictLoadReport::default();
-    if args.is_moe() {
+    if args.has_sparse_moe_layers() {
         load_safetensors_dir_strict_with_split_swiglu_experts(
             &mut model,
             model_dir,
@@ -1360,7 +1454,7 @@ pub fn load_model_quantized(
     let mut model = Model::new(args.clone(), stream)?;
     let config = StrictLoadConfig::default();
     let mut report = StrictLoadReport::default();
-    if args.is_moe() {
+    if args.has_sparse_moe_layers() {
         load_safetensors_dir_strict_with_split_swiglu_experts(
             &mut model,
             model_dir,
@@ -1402,7 +1496,6 @@ pub(crate) struct LoadedLfm2Gguf {
 pub(crate) struct PreparedLfm2Gguf {
     pub(crate) args: ModelArgs,
     pub(crate) eos_token_ids: Vec<u32>,
-    pub(crate) is_moe: bool,
 }
 
 /// Loads an LFM2 or LFM2-MoE GGUF checkpoint.
@@ -1446,7 +1539,12 @@ pub(crate) fn load_gguf_checkpoint(
         .map_err(safemlx::error::IoError::from)?;
     let mut configs = gguf_quantization_configs(checkpoint, translate)?;
     if is_moe {
-        for layer in args.num_dense_layers..args.num_hidden_layers {
+        for (layer, _) in args
+            .layer_schedule
+            .iter()
+            .enumerate()
+            .filter(|(_, policy)| policy.feed_forward == FeedForwardPolicy::SparseMoe)
+        {
             let prefix = format!("model.layers.{layer}.feed_forward.experts");
             for suffix in ["", "_scales", "_biases"] {
                 let gate = format!("{prefix}.gate_proj{suffix}");
@@ -1495,7 +1593,16 @@ pub(crate) fn load_gguf_checkpoint(
         }
     }
     if is_moe {
-        for layer in model.args.num_dense_layers..model.args.num_hidden_layers {
+        let sparse_layers = model
+            .args
+            .layer_schedule
+            .iter()
+            .enumerate()
+            .filter_map(|(layer, policy)| {
+                (policy.feed_forward == FeedForwardPolicy::SparseMoe).then_some(layer)
+            })
+            .collect::<Vec<_>>();
+        for layer in sparse_layers {
             let source_prefix = format!("blk.{layer}");
             let target_prefix = format!("model.layers.{layer}.feed_forward.experts");
             let gate =
@@ -1569,7 +1676,12 @@ pub(crate) fn prepare_gguf_checkpoint(
         .map_err(safemlx::error::IoError::from)?;
     let mut configs = gguf_quantization_configs(checkpoint, translate)?;
     if is_moe {
-        for layer in args.num_dense_layers..args.num_hidden_layers {
+        for (layer, _) in args
+            .layer_schedule
+            .iter()
+            .enumerate()
+            .filter(|(_, policy)| policy.feed_forward == FeedForwardPolicy::SparseMoe)
+        {
             let prefix = format!("model.layers.{layer}.feed_forward.experts");
             if let Some(config) = configs.remove(&format!("{prefix}.gate_proj")) {
                 configs.remove(&format!("{prefix}.up_proj"));
@@ -1584,7 +1696,6 @@ pub(crate) fn prepare_gguf_checkpoint(
     Ok(PreparedLfm2Gguf {
         args,
         eos_token_ids,
-        is_moe,
     })
 }
 
@@ -1608,16 +1719,32 @@ pub(crate) fn args_from_gguf_catalog(
         num_hidden_layers,
     )?;
     let num_key_value_heads = unique_nonzero(&key("attention.head_count_kv"), &kv_heads)?;
+    let num_dense_layers = if is_moe {
+        gguf_i32_catalog(metadata, &key("leading_dense_block_count"))?
+    } else {
+        0
+    };
+    if num_dense_layers < 0 || num_dense_layers > num_hidden_layers {
+        return Err(Error::UnsupportedArchitecture(format!(
+            "LFM2 MoE GGUF leading_dense_block_count must be between 0 and {num_hidden_layers}, got {num_dense_layers}"
+        )));
+    }
     let layer_schedule = LayerSchedule::new(
         num_hidden_layers as usize,
         kv_heads
             .iter()
-            .map(|heads| {
-                if *heads == 0 {
-                    LayerPolicy::CausalConvolution
+            .enumerate()
+            .map(|(layer, heads)| LayerPolicy {
+                operator: if *heads == 0 {
+                    OperatorPolicy::CausalConvolution
                 } else {
-                    LayerPolicy::SelfAttention(AttentionPolicy::Full)
-                }
+                    OperatorPolicy::SelfAttention(AttentionPolicy::Full)
+                },
+                feed_forward: if is_moe && layer >= num_dense_layers as usize {
+                    FeedForwardPolicy::SparseMoe
+                } else {
+                    FeedForwardPolicy::Dense
+                },
             })
             .collect(),
     )
@@ -1663,11 +1790,6 @@ pub(crate) fn args_from_gguf_catalog(
         rope_parameters: None,
         moe_intermediate_size: if is_moe {
             gguf_i32_catalog(metadata, &key("expert_feed_forward_length"))?
-        } else {
-            0
-        },
-        num_dense_layers: if is_moe {
-            gguf_i32_catalog(metadata, &key("leading_dense_block_count"))?
         } else {
             0
         },
@@ -1862,12 +1984,19 @@ fn unique_nonzero(key: &str, values: &[i32]) -> Result<i32, Error> {
 
 #[cfg(test)]
 mod tests {
-    use safemlx::{module::ModuleParameters, Device, DeviceType, ExecutionContext};
+    use std::collections::HashMap;
+
+    use safemlx::{
+        module::ModuleParameters,
+        ops::{GgufMetadataArray, GgufMetadataValue},
+        Array, Device, DeviceType, ExecutionContext,
+    };
 
     use super::{
         model_args_from_config_value, translate_gguf_weight_name, validate_model_config_value,
-        LayerPolicy,
+        FeedForwardPolicy, LayerPolicy, OperatorPolicy,
     };
+    use crate::LayerSchedule;
     use serde_json::json;
 
     fn dense_config() -> serde_json::Value {
@@ -1896,11 +2025,17 @@ mod tests {
         let args = model_args_from_config_value(&config).unwrap();
         assert_eq!(
             args.layer_schedule.get(0),
-            Some(&LayerPolicy::CausalConvolution)
+            Some(&LayerPolicy {
+                operator: OperatorPolicy::CausalConvolution,
+                feed_forward: FeedForwardPolicy::Dense,
+            })
         );
         assert_eq!(
             args.layer_schedule.get(1),
-            Some(&LayerPolicy::SelfAttention(crate::AttentionPolicy::Full))
+            Some(&LayerPolicy {
+                operator: OperatorPolicy::SelfAttention(crate::AttentionPolicy::Full),
+                feed_forward: FeedForwardPolicy::Dense,
+            })
         );
         assert_eq!(args.dense_intermediate_size(), 16);
         let cache = super::Cache::new(&args).unwrap();
@@ -1962,7 +2097,172 @@ mod tests {
             "norm_topk_prob": true,
             "use_expert_bias": true
         });
+        let args = model_args_from_config_value(&config).unwrap();
+        assert_eq!(
+            args.layer_schedule
+                .iter()
+                .map(|policy| policy.feed_forward)
+                .collect::<Vec<_>>(),
+            vec![
+                FeedForwardPolicy::Dense,
+                FeedForwardPolicy::Dense,
+                FeedForwardPolicy::SparseMoe,
+                FeedForwardPolicy::SparseMoe,
+            ]
+        );
+        assert_eq!(args.layer_schedule_fingerprint(), "cd,cd,afe,ce");
         validate_model_config_value(&config).unwrap();
+    }
+
+    #[test]
+    fn rejects_invalid_or_conflicting_dense_prefix_metadata() {
+        let mut moe = dense_config();
+        moe["model_type"] = json!("lfm2_moe");
+        moe["moe_intermediate_size"] = json!(8);
+        moe["num_experts"] = json!(4);
+        moe["num_experts_per_tok"] = json!(2);
+        moe["num_dense_layers"] = json!(4);
+        let error = model_args_from_config_value(&moe).unwrap_err().to_string();
+        assert!(error.contains("num_dense_layers must be between 0 and 3"));
+
+        let mut dense = dense_config();
+        dense["num_dense_layers"] = json!(1);
+        let error = model_args_from_config_value(&dense)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("dense config conflicts with num_dense_layers=1"));
+    }
+
+    #[test]
+    fn inspection_and_loading_reject_invalid_prefix_with_same_diagnostic() {
+        let mut config = dense_config();
+        config["model_type"] = json!("lfm2_moe");
+        config["moe_intermediate_size"] = json!(8);
+        config["num_experts"] = json!(4);
+        config["num_experts_per_tok"] = json!(2);
+        config["num_dense_layers"] = json!(-1);
+        let loading = model_args_from_config_value(&config)
+            .unwrap_err()
+            .to_string();
+        let inspection = crate::api::check_model_config(&config)
+            .unsupported_reason()
+            .unwrap()
+            .to_string();
+        assert_eq!(inspection, loading);
+        assert!(loading.contains("num_dense_layers must be between 0 and 3"));
+    }
+
+    #[test]
+    fn arbitrary_feed_forward_order_is_authoritative_and_fingerprinted() {
+        let mut config = dense_config();
+        config["model_type"] = json!("lfm2_moe");
+        config["moe_intermediate_size"] = json!(8);
+        config["num_experts"] = json!(4);
+        config["num_experts_per_tok"] = json!(2);
+        config["num_dense_layers"] = json!(1);
+        let mut args = model_args_from_config_value(&config).unwrap();
+        let baseline = args.layer_schedule_fingerprint();
+        let baseline_cache_identity = super::prompt_cache_architecture_fingerprint(&args);
+        args.layer_schedule = LayerSchedule::new(
+            3,
+            vec![
+                LayerPolicy {
+                    operator: OperatorPolicy::CausalConvolution,
+                    feed_forward: FeedForwardPolicy::SparseMoe,
+                },
+                LayerPolicy {
+                    operator: OperatorPolicy::SelfAttention(crate::AttentionPolicy::Full),
+                    feed_forward: FeedForwardPolicy::Dense,
+                },
+                LayerPolicy {
+                    operator: OperatorPolicy::CausalConvolution,
+                    feed_forward: FeedForwardPolicy::SparseMoe,
+                },
+            ],
+        )
+        .unwrap();
+        super::validate_args(&args).unwrap();
+        assert_eq!(args.layer_schedule_fingerprint(), "ce,afd,ce");
+        assert_ne!(args.layer_schedule_fingerprint(), baseline);
+        assert_ne!(
+            super::prompt_cache_architecture_fingerprint(&args),
+            baseline_cache_identity
+        );
+        assert_eq!(
+            args.layer_policy(1).unwrap().feed_forward,
+            FeedForwardPolicy::Dense
+        );
+        assert!(args.layer_policy(3).is_none());
+    }
+
+    #[test]
+    fn gguf_leading_dense_count_normalizes_into_combined_schedule() {
+        let arrays = HashMap::<String, Array>::new();
+        let mut metadata = HashMap::from([
+            ("lfm2moe.block_count".into(), GgufMetadataValue::Uint32(4)),
+            (
+                "lfm2moe.attention.head_count_kv".into(),
+                GgufMetadataValue::Array(GgufMetadataArray::Uint32(vec![0, 2, 0, 2])),
+            ),
+            (
+                "lfm2moe.embedding_length".into(),
+                GgufMetadataValue::Uint32(16),
+            ),
+            (
+                "lfm2moe.feed_forward_length".into(),
+                GgufMetadataValue::Uint32(24),
+            ),
+            (
+                "lfm2moe.attention.head_count".into(),
+                GgufMetadataValue::Uint32(4),
+            ),
+            (
+                "lfm2moe.context_length".into(),
+                GgufMetadataValue::Uint32(128),
+            ),
+            (
+                "lfm2moe.attention.layer_norm_rms_epsilon".into(),
+                GgufMetadataValue::Float32(1e-5),
+            ),
+            (
+                "lfm2moe.shortconv.l_cache".into(),
+                GgufMetadataValue::Uint32(3),
+            ),
+            ("lfm2moe.vocab_size".into(), GgufMetadataValue::Uint32(32)),
+            (
+                "lfm2moe.expert_feed_forward_length".into(),
+                GgufMetadataValue::Uint32(8),
+            ),
+            (
+                "lfm2moe.leading_dense_block_count".into(),
+                GgufMetadataValue::Uint32(2),
+            ),
+            ("lfm2moe.expert_count".into(), GgufMetadataValue::Uint32(4)),
+            (
+                "lfm2moe.expert_used_count".into(),
+                GgufMetadataValue::Uint32(2),
+            ),
+        ]);
+        let args = super::args_from_gguf_catalog(&arrays, &metadata, "lfm2moe", true).unwrap();
+        assert_eq!(args.layer_schedule_fingerprint(), "cd,afd,ce,afe");
+
+        metadata.insert(
+            "lfm2moe.leading_dense_block_count".into(),
+            GgufMetadataValue::Uint32(5),
+        );
+        let error = super::args_from_gguf_catalog(&arrays, &metadata, "lfm2moe", true)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("leading_dense_block_count must be between 0 and 4"));
+
+        metadata.insert(
+            "lfm2moe.leading_dense_block_count".into(),
+            GgufMetadataValue::String("2".into()),
+        );
+        let error = super::args_from_gguf_catalog(&arrays, &metadata, "lfm2moe", true)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("must be a numeric scalar"));
     }
 
     #[test]

@@ -451,15 +451,29 @@ queries `is_local` and `is_dense` were removed. JSON callers use
 `architectures::inkling::model::model_args_from_config_value`, then query
 `TextArgs::layer_policy` or `TextArgs::layer_schedule`.
 
-LFM2 and LFM2-MoE normalize Hugging Face `layer_types` and GGUF per-layer
-KV-head metadata into
-`LayerSchedule<architectures::lfm2::model::LayerPolicy>`. Full-attention layers
-carry `AttentionPolicy::Full`; short-convolution layers carry
-`LayerPolicy::CausalConvolution`. This canonical hybrid schedule drives
-resident and bounded execution, cache construction and validation, structural
-admission, and runtime-state accounting. Public normalized `ModelArgs` exposes
-only `layer_schedule`; JSON callers use
-`architectures::lfm2::model::model_args_from_config_value`.
+LFM2 and LFM2-MoE normalize both decoder choices into
+`LayerSchedule<architectures::lfm2::model::LayerPolicy>`. Each entry contains
+an `OperatorPolicy::{CausalConvolution, SelfAttention(AttentionPolicy)}` and a
+`FeedForwardPolicy::{Dense, SparseMoe}`. Hugging Face `layer_types` supplies the
+operator order; for `lfm2_moe`, `num_dense_layers` supplies a leading dense
+count and all later entries become sparse MoE. Dense `lfm2` rejects a nonzero
+`num_dense_layers`. GGUF similarly combines its per-layer KV-head metadata with
+`leading_dense_block_count`. Counts outside the decoder range fail during the
+same normalization used by inspection and loading.
+
+After normalization, the source thresholds are discarded. Resident, bounded,
+dense-streamed, sparse-expert, structural, GGUF materialization, and
+expert-parallel paths query the ordered schedule. Internally constructed
+schedules may freely interleave dense and sparse-MoE blocks independently of
+convolution and attention. The full ordered operator/feed-forward schedule is
+hashable and available through `ModelArgs::layer_schedule_fingerprint`;
+fallback-free lookup uses `ModelArgs::layer_policy`. This intentionally removes
+the normalized `num_dense_layers` field, the model-wide `is_moe` query, and the
+old operator-only `LayerPolicy` variants. JSON callers use
+`architectures::lfm2::model::model_args_from_config_value`. Persisted LFM2
+prompt caches remain unsupported; the complete schedule nevertheless
+participates in the loaded-model architecture fingerprint so distinct layouts
+cannot share an identity.
 
 Nemotron-H normalizes the Hugging Face `hybrid_override_pattern` and GGUF
 per-layer feed-forward/KV-head metadata into
