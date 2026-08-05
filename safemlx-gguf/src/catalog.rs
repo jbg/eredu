@@ -2,8 +2,8 @@ use crate::convert::{
     affine_shapes, conversion_kind, iquant_packed_shape, mxfp4_shapes, ConversionKind,
 };
 use crate::{
-    ConvertedTensor, DenseDtype, Endian, Error, Limits, MetadataValue, OuterSelection, Reader,
-    Result, TensorDescriptor,
+    ConvertedTensor, DenseDtype, Endian, Error, Limits, MetadataValue, Reader, Result,
+    TensorDescriptor, TensorSelection, TensorSelectionPlan,
 };
 use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
@@ -596,42 +596,25 @@ impl TensorMaterializer {
         })
     }
 
-    /// Materialize selected slabs along the outermost MLX tensor axis.
-    pub fn converted_tensor_outer(
+    /// Materialize a bounded selection along one MLX tensor axis.
+    pub fn converted_tensor_selected(
         &mut self,
         name: &str,
-        selection: &OuterSelection,
+        selection: &TensorSelection,
     ) -> Result<ConvertedCheckpointTensor> {
         let (location, mut descriptor, _) = self.location_and_reader(name)?;
+        let plan = TensorSelectionPlan::new(&descriptor, selection.clone())?;
         let converted = self
             .reader
             .as_mut()
             .expect("requested shard reader opened above")
             .1
-            .read_tensor_outer(&descriptor, selection)
+            .read_tensor_plan(&plan)
             .map_err(|source| Error::Shard {
                 path: self.checkpoint.shards[location.shard_index].path.clone(),
                 source: Box::new(source),
             })?;
-        let selected_outer = match selection {
-            OuterSelection::Range { start, end } => end - start,
-            OuterSelection::Indices(indices) => indices.len(),
-        };
-        let original_outer = *descriptor
-            .dimensions
-            .last()
-            .expect("reader rejects scalar outer selections");
-        let selected_outer_u64 = u64::try_from(selected_outer)
-            .map_err(|_| Error::Overflow("selected outer dimension"))?;
-        descriptor.byte_len = descriptor
-            .byte_len
-            .checked_div(original_outer)
-            .and_then(|bytes| bytes.checked_mul(selected_outer_u64))
-            .ok_or(Error::Overflow("selected GGUF payload bytes"))?;
-        *descriptor
-            .dimensions
-            .last_mut()
-            .expect("reader rejects scalar outer selections") = selected_outer_u64;
+        descriptor = plan.selected_descriptor().clone();
         Ok(ConvertedCheckpointTensor {
             shard_index: location.shard_index,
             tensor_index: location.tensor_index,

@@ -6,9 +6,11 @@ use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
 
 pub use safemlx_gguf::{
-    Endian as GgufEndian, GgmlType as GgufType, LogicalDtype as GgufLogicalDtype,
-    MetadataArray as GgufMetadataArray, MetadataValue as GgufMetadataValue,
-    OuterSelection as GgufOuterSelection,
+    EncodedSpan as GgufEncodedSpan, Endian as GgufEndian, GgmlType as GgufType,
+    LogicalDtype as GgufLogicalDtype, MetadataArray as GgufMetadataArray,
+    MetadataValue as GgufMetadataValue, SelectionAlignment as GgufSelectionAlignment,
+    TensorDescriptor as GgufTensorDescriptor, TensorSelection as GgufTensorSelection,
+    TensorSelectionPlan as GgufTensorSelectionPlan,
 };
 
 /// A validated GGUF checkpoint that materializes one physical tensor at a time.
@@ -342,13 +344,13 @@ impl GgufMaterializer {
         convert_tensor(self.inner.converted_tensor(name)?)
     }
 
-    /// Materialize selected slabs along the outermost MLX tensor axis.
-    pub fn converted_tensor_outer(
+    /// Materialize a bounded selection along one MLX tensor axis.
+    pub fn converted_tensor_selected(
         &mut self,
         name: &str,
-        selection: &GgufOuterSelection,
+        selection: &GgufTensorSelection,
     ) -> Result<GgufTensor, IoError> {
-        convert_tensor(self.inner.converted_tensor_outer(name, selection)?)
+        convert_tensor(self.inner.converted_tensor_selected(name, selection)?)
     }
 
     /// Materialize one physical tensor without converting its GGUF blocks.

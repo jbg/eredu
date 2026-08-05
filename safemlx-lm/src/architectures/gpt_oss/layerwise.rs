@@ -44,9 +44,10 @@ use crate::{
         ParameterRole, ProjectionSharding,
     },
     runtime::execution::layerwise::{
-        load_layerwise_model, load_layerwise_model_with_store,
-        load_tensor_parallel_layerwise_model, ArchitectureAdapter, LayerExecutionLoadOptions,
-        LayerwiseForwardState, LayerwiseModel, StaticUnitBindings, WeightResidency,
+        load_layerwise_model, load_safetensors_layerwise_model,
+        load_tensor_parallel_layerwise_model, open_safetensors_weight_store, ArchitectureAdapter,
+        LayerExecutionLoadOptions, LayerwiseForwardState, LayerwiseModel, StaticUnitBindings,
+        WeightResidency,
     },
     runtime::residency::expert_cache::{
         ExpertCache, ExpertCacheLoadOptions, ExpertCacheReport, ExpertCatalogEntry, ExpertIdentity,
@@ -360,7 +361,13 @@ pub fn load_gpt_oss_layerwise_model(
     let args = resident::get_model_args(model_dir)?;
     let adapter = GptOssLayerwiseAdapter::new(args, stream)?;
     Ok(GptOssLayerwiseModel {
-        execution: load_layerwise_model(model_dir, adapter, options, stream, weights_stream)?,
+        execution: load_safetensors_layerwise_model(
+            model_dir,
+            adapter,
+            options,
+            stream,
+            weights_stream,
+        )?,
     })
 }
 
@@ -378,6 +385,22 @@ pub fn load_gpt_oss_tensor_parallel_model(
         LayerExecutionLoadOptions::LayerwiseHost(v) => WeightResidency::LayerwiseHost(v),
         LayerExecutionLoadOptions::DenseDiskStream(v) => WeightResidency::DenseDiskStream(v),
     };
+    if model_dir
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("gguf"))
+    {
+        let checkpoint = GgufCheckpoint::open(model_dir)?;
+        let metadata = crate::runtime::checkpoint::load::gguf_metadata(&checkpoint);
+        return load_gpt_oss_gguf_tensor_parallel_model(
+            &checkpoint,
+            &metadata,
+            options,
+            build,
+            stream,
+            weights_stream,
+        )
+        .map(|(model, _)| model);
+    }
     crate::api::structural::validate_safetensors_load_path(
         crate::api::ModelKind::GptOss,
         model_dir,
@@ -386,7 +409,7 @@ pub fn load_gpt_oss_tensor_parallel_model(
     let adapter = GptOssLayerwiseAdapter::new(resident::get_model_args(model_dir)?, stream)?;
     Ok(GptOssLayerwiseModel {
         execution: load_tensor_parallel_layerwise_model(
-            model_dir,
+            open_safetensors_weight_store(model_dir, options.max_mapped_shards())?,
             adapter,
             options,
             build,
@@ -394,6 +417,35 @@ pub fn load_gpt_oss_tensor_parallel_model(
             weights_stream,
         )?,
     })
+}
+
+pub(crate) fn load_gpt_oss_gguf_tensor_parallel_model(
+    checkpoint: &GgufCheckpoint,
+    metadata: &HashMap<String, GgufMetadataValue>,
+    options: LayerExecutionLoadOptions,
+    build: crate::runtime::distributed::parallel::ParallelBuildContext,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<(GptOssLayerwiseModel, Vec<u32>), Error> {
+    crate::runtime::execution::layerwise::validate_gguf_layerwise_source(
+        checkpoint, metadata, options,
+    )?;
+    let prepared = resident::prepare_gguf_checkpoint(checkpoint, metadata, weights_stream)?;
+    let store: Arc<dyn WeightStore + Send + Sync> =
+        Arc::new(GgufWeightStore::new_with_max_mapped_shards(
+            checkpoint.clone(),
+            resident::translate_gguf_weight_name,
+            options.max_mapped_shards(),
+        )?);
+    let execution = load_tensor_parallel_layerwise_model(
+        store,
+        GptOssLayerwiseAdapter::new(prepared.args, stream)?,
+        options,
+        build,
+        stream,
+        weights_stream,
+    )?;
+    Ok((GptOssLayerwiseModel { execution }, prepared.eos_token_ids))
 }
 
 pub(crate) fn load_gpt_oss_gguf_layerwise_model(
@@ -412,14 +464,14 @@ pub(crate) fn load_gpt_oss_gguf_layerwise_model(
         )?);
     let args = prepared.args;
     let execution = match residency {
-        WeightResidency::LayerwiseHost(options) => load_layerwise_model_with_store(
+        WeightResidency::LayerwiseHost(options) => load_layerwise_model(
             store,
             GptOssLayerwiseAdapter::new(args, stream)?,
             options,
             stream,
             weights_stream,
         )?,
-        WeightResidency::DenseDiskStream(options) => load_layerwise_model_with_store(
+        WeightResidency::DenseDiskStream(options) => load_layerwise_model(
             store,
             GptOssLayerwiseAdapter::new(args, stream)?,
             options,
@@ -471,8 +523,7 @@ fn load_gpt_oss_gguf_sparse_with_store(
 ) -> Result<GptOssLayerwiseModel, Error> {
     let mut adapter = GptOssLayerwiseAdapter::new(args.clone(), stream)?;
     adapter.sparse_expert_cache = true;
-    let mut execution =
-        load_layerwise_model_with_store(store, adapter, non_expert, stream, weights_stream)?;
+    let mut execution = load_layerwise_model(store, adapter, non_expert, stream, weights_stream)?;
     let checkpoint_store = execution.weight_store_arc();
     let entries = gpt_oss_expert_catalog(&args, checkpoint_store.as_ref())?;
     execution.adapter_mut().expert_cache = Some(ExpertCache::new_shared(
@@ -535,7 +586,7 @@ fn load_gpt_oss_sparse_expert_cache_model_with_non_expert(
     let mut adapter = GptOssLayerwiseAdapter::new(args.clone(), stream)?;
     adapter.sparse_expert_cache = true;
     let mut execution =
-        load_layerwise_model(model_dir, adapter, non_expert, stream, weights_stream)?;
+        load_safetensors_layerwise_model(model_dir, adapter, non_expert, stream, weights_stream)?;
     let store = execution.weight_store_arc();
     let entries = gpt_oss_expert_catalog(&args, store.as_ref())?;
     execution.adapter_mut().expert_cache = Some(ExpertCache::new_shared(
@@ -558,8 +609,7 @@ pub(crate) fn load_gpt_oss_sparse_ep_base_with_store(
 ) -> Result<GptOssLayerwiseModel, Error> {
     let mut adapter = GptOssLayerwiseAdapter::new(args, stream)?;
     adapter.sparse_expert_cache = true;
-    let execution =
-        load_layerwise_model_with_store(store, adapter, non_expert, stream, weights_stream)?;
+    let execution = load_layerwise_model(store, adapter, non_expert, stream, weights_stream)?;
     Ok(GptOssLayerwiseModel { execution })
 }
 
@@ -1160,6 +1210,7 @@ impl ArchitectureAdapter for GptOssLayerwiseAdapter {
         crate::runtime::execution::layerwise::shard_layer_bindings(
             self.layer_bindings(group, index, &global, store)?,
             &self.layer_checkpoint_prefix(group, index),
+            store,
             layout,
         )
     }

@@ -52,7 +52,7 @@ pub struct ModelLoadOptions {
     /// topologies must be loaded through the explicit pipeline/expert APIs or
     /// through the selected architecture's generalized tensor-parallel loader.
     pub parallel: Option<ParallelTopology>,
-    /// Parameter placement and execution policy for safetensors checkpoints.
+    /// Parameter placement and execution policy for cataloged checkpoint stores.
     pub weight_residency: WeightResidency,
 }
 
@@ -77,7 +77,7 @@ impl ModelLoadOptions {
         Self::default().with_parallel_topology(topology)
     }
 
-    /// Selects fully resident or bounded layer execution for safetensors.
+    /// Selects fully resident or bounded layer execution for checkpoint weights.
     pub fn with_weight_residency(mut self, residency: WeightResidency) -> Self {
         self.weight_residency = residency;
         self

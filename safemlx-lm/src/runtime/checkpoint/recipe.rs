@@ -13,7 +13,8 @@ use safemlx::{
 };
 
 use crate::runtime::checkpoint::store::{
-    PendingWeightMaterialization, StoredDtype, TensorSelection, WeightStore, WeightStoreError,
+    PendingWeightMaterialization, StoredDtype, TensorSelection, WeightReadPolicy, WeightStore,
+    WeightStoreError,
 };
 
 /// Scalar encoding produced by a derived-weight recipe.
@@ -233,6 +234,61 @@ impl DerivedWeightRecipe {
         keys.into_iter().collect()
     }
 
+    /// Rewrites an output selection toward checkpoint sources.
+    ///
+    /// The returned recipe is metadata-equivalent to selecting this recipe's
+    /// output, but joins and shape transforms are rewritten so source stores
+    /// can perform bounded reads. Geometry that cannot be represented by the
+    /// store's single-axis selection contract is rejected during planning.
+    pub fn select_bounded(
+        &self,
+        store: &dyn WeightStore,
+        selection: TensorSelection,
+    ) -> Result<Self, WeightRecipeError> {
+        let metadata = self.infer(store)?;
+        let selection = normalize_selection(selection, &metadata.shape)?;
+        let expected_shape = selected_shape(metadata.shape.clone(), &selection)?;
+        let rewritten = push_selection(self, store, selection)?;
+        let actual = rewritten.infer(store)?;
+        if actual.shape != expected_shape || actual.dtype != metadata.dtype {
+            return Err(WeightRecipeError::SelectionPushdownUnsupported {
+                operation: "recipe",
+                reason: format!(
+                    "rewrite produced shape {:?} and dtype {:?}, expected {:?} and {:?}",
+                    actual.shape, actual.dtype, expected_shape, metadata.dtype
+                ),
+            });
+        }
+        Ok(rewritten)
+    }
+
+    /// Validates that every checkpoint source can be acquired without a
+    /// complete-tensor fallback.
+    pub fn preflight_bounded(&self, store: &dyn WeightStore) -> Result<(), WeightRecipeError> {
+        match self {
+            Self::Source { key, selection } => {
+                drop(store.acquire_with_policy(
+                    key,
+                    selection.clone(),
+                    WeightReadPolicy::RequireBounded,
+                )?);
+            }
+            Self::Concatenate { inputs, .. } | Self::Stack { inputs, .. } => {
+                for input in inputs {
+                    input.preflight_bounded(store)?;
+                }
+            }
+            Self::Select { input, .. }
+            | Self::Reshape { input, .. }
+            | Self::Transpose { input, .. }
+            | Self::Cast { input, .. }
+            | Self::View { input, .. }
+            | Self::NegLog { input }
+            | Self::SubtractOne { input } => input.preflight_bounded(store)?,
+        }
+        Ok(())
+    }
+
     fn collect_source_keys<'a>(&'a self, keys: &mut BTreeSet<&'a str>) {
         match self {
             Self::Source { key, .. } => {
@@ -355,7 +411,11 @@ impl DerivedWeightRecipe {
     ) -> Result<Array, WeightRecipeError> {
         match self {
             Self::Source { key, selection } => {
-                let lease = store.acquire(key, selection.clone())?;
+                let lease = store.acquire_with_policy(
+                    key,
+                    selection.clone(),
+                    WeightReadPolicy::RequireBounded,
+                )?;
                 let pending = lease.prepare_materialization(stream, stream)?;
                 let array = pending.output().clone();
                 sources.push(pending);
@@ -454,6 +514,484 @@ impl DerivedWeightRecipe {
                 Ok(array.subtract(Array::from_f32(1.0), stream)?)
             }
         }
+    }
+}
+
+fn push_selection(
+    recipe: &DerivedWeightRecipe,
+    store: &dyn WeightStore,
+    selection: TensorSelection,
+) -> Result<DerivedWeightRecipe, WeightRecipeError> {
+    if matches!(selection, TensorSelection::Full) {
+        return Ok(recipe.clone());
+    }
+    match recipe {
+        DerivedWeightRecipe::Source {
+            key,
+            selection: source_selection,
+        } => {
+            let source_shape = store.metadata(key)?.shape;
+            let source_selection = normalize_selection(source_selection.clone(), &source_shape)?;
+            let selected_source_shape = selected_shape(source_shape, &source_selection)?;
+            let selection = normalize_selection(selection, &selected_source_shape)?;
+            if matches!(selection, TensorSelection::Full) {
+                return Ok(DerivedWeightRecipe::source(key.clone(), source_selection));
+            }
+            if matches!(source_selection, TensorSelection::Full) {
+                return Ok(DerivedWeightRecipe::source(key.clone(), selection));
+            }
+            if selection_axis(&source_selection) == selection_axis(&selection) {
+                return Ok(DerivedWeightRecipe::source(
+                    key.clone(),
+                    compose_same_axis_selection(&source_selection, &selection)?,
+                ));
+            }
+            Ok(DerivedWeightRecipe::Select {
+                input: Box::new(DerivedWeightRecipe::source(key.clone(), source_selection)),
+                selection,
+            })
+        }
+        DerivedWeightRecipe::Select {
+            input,
+            selection: existing,
+        } => {
+            if matches!(existing, TensorSelection::Full) {
+                return push_selection(input, store, selection);
+            }
+            if select_chain_has_bounded_source(recipe) {
+                if selection_axis(existing) == selection_axis(&selection) {
+                    return Ok(DerivedWeightRecipe::Select {
+                        input: input.clone(),
+                        selection: compose_same_axis_selection(existing, &selection)?,
+                    });
+                }
+                return Ok(DerivedWeightRecipe::Select {
+                    input: Box::new(recipe.clone()),
+                    selection,
+                });
+            }
+            if selection_axis(existing) == selection_axis(&selection) {
+                return push_selection(
+                    input,
+                    store,
+                    compose_same_axis_selection(existing, &selection)?,
+                );
+            }
+            // Independent axis selections commute. Push the new selection
+            // first, then push the pre-existing selection through that result.
+            let selected_input = push_selection(input, store, selection)?;
+            push_selection(&selected_input, store, existing.clone())
+        }
+        DerivedWeightRecipe::Concatenate { axis, inputs } => {
+            push_concatenate_selection(*axis, inputs, store, selection)
+        }
+        DerivedWeightRecipe::Stack { axis, inputs } => {
+            push_stack_selection(*axis, inputs, store, selection)
+        }
+        DerivedWeightRecipe::Reshape { input, shape } => {
+            let input_metadata = input.infer(store)?;
+            let output_metadata = recipe.infer(store)?;
+            let input_selection = map_reinterpret_selection(
+                &input_metadata,
+                &output_metadata,
+                &selection,
+                "reshape",
+            )?;
+            Ok(DerivedWeightRecipe::Reshape {
+                input: Box::new(push_selection(input, store, input_selection)?),
+                shape: selected_shape(shape.clone(), &selection)?,
+            })
+        }
+        DerivedWeightRecipe::Transpose { input, axes } => {
+            let output_axis = selection_axis(&selection).expect("non-full selection");
+            let input_axis =
+                *axes
+                    .get(output_axis)
+                    .ok_or(WeightRecipeError::InvalidSelectionAxis {
+                        axis: output_axis,
+                        rank: axes.len(),
+                    })?;
+            Ok(DerivedWeightRecipe::Transpose {
+                input: Box::new(push_selection(
+                    input,
+                    store,
+                    selection_with_axis(selection, input_axis),
+                )?),
+                axes: axes.clone(),
+            })
+        }
+        DerivedWeightRecipe::Cast { input, dtype } => Ok(DerivedWeightRecipe::Cast {
+            input: Box::new(push_selection(input, store, selection)?),
+            dtype: *dtype,
+        }),
+        DerivedWeightRecipe::View {
+            input,
+            dtype,
+            shape,
+        } => {
+            let input_metadata = input.infer(store)?;
+            let output_metadata = recipe.infer(store)?;
+            let input_selection =
+                map_reinterpret_selection(&input_metadata, &output_metadata, &selection, "view")?;
+            Ok(DerivedWeightRecipe::View {
+                input: Box::new(push_selection(input, store, input_selection)?),
+                dtype: *dtype,
+                shape: selected_shape(shape.clone(), &selection)?,
+            })
+        }
+        DerivedWeightRecipe::NegLog { input } => Ok(DerivedWeightRecipe::NegLog {
+            input: Box::new(push_selection(input, store, selection)?),
+        }),
+        DerivedWeightRecipe::SubtractOne { input } => Ok(DerivedWeightRecipe::SubtractOne {
+            input: Box::new(push_selection(input, store, selection)?),
+        }),
+    }
+}
+
+fn push_concatenate_selection(
+    axis: usize,
+    inputs: &[DerivedWeightRecipe],
+    store: &dyn WeightStore,
+    selection: TensorSelection,
+) -> Result<DerivedWeightRecipe, WeightRecipeError> {
+    let selected_axis = selection_axis(&selection).expect("non-full selection");
+    if selected_axis != axis {
+        let inputs = inputs
+            .iter()
+            .map(|input| push_selection(input, store, selection.clone()))
+            .collect::<Result<Vec<_>, _>>()?;
+        return Ok(DerivedWeightRecipe::Concatenate { axis, inputs });
+    }
+    let metadata = inputs
+        .iter()
+        .map(|input| input.infer(store))
+        .collect::<Result<Vec<_>, _>>()?;
+    let dimensions = metadata
+        .iter()
+        .map(|item| item.shape[axis])
+        .collect::<Vec<_>>();
+    let mut rewritten = Vec::new();
+    match selection {
+        TensorSelection::Range { start, end, .. } => {
+            let mut offset = 0usize;
+            for (input, dimension) in inputs.iter().zip(dimensions) {
+                let child_end =
+                    offset
+                        .checked_add(dimension)
+                        .ok_or(WeightRecipeError::ArithmeticOverflow(
+                            "concatenate selection offset",
+                        ))?;
+                let overlap_start = start.max(offset);
+                let overlap_end = end.min(child_end);
+                if overlap_start < overlap_end {
+                    let child_selection = normalize_selection(
+                        TensorSelection::Range {
+                            axis,
+                            start: overlap_start - offset,
+                            end: overlap_end - offset,
+                        },
+                        &input.infer(store)?.shape,
+                    )?;
+                    rewritten.push(push_selection(input, store, child_selection)?);
+                }
+                offset = child_end;
+            }
+        }
+        TensorSelection::Indices { indices, .. } => {
+            let mut offsets = Vec::with_capacity(dimensions.len() + 1);
+            offsets.push(0usize);
+            for dimension in dimensions {
+                let next = offsets
+                    .last()
+                    .copied()
+                    .unwrap()
+                    .checked_add(dimension)
+                    .ok_or(WeightRecipeError::ArithmeticOverflow(
+                        "concatenate selection offset",
+                    ))?;
+                offsets.push(next);
+            }
+            let mut runs = Vec::<(usize, Vec<usize>)>::new();
+            for index in indices {
+                let child = offsets
+                    .windows(2)
+                    .position(|bounds| index >= bounds[0] && index < bounds[1])
+                    .ok_or(WeightRecipeError::InvalidIndices {
+                        axis,
+                        dimension: *offsets.last().unwrap(),
+                    })?;
+                let local = index - offsets[child];
+                if let Some((last_child, local_indices)) = runs.last_mut() {
+                    if *last_child == child {
+                        local_indices.push(local);
+                        continue;
+                    }
+                }
+                runs.push((child, vec![local]));
+            }
+            for (child, indices) in runs {
+                rewritten.push(push_selection(
+                    &inputs[child],
+                    store,
+                    TensorSelection::Indices { axis, indices },
+                )?);
+            }
+        }
+        TensorSelection::Full => unreachable!(),
+    }
+    match rewritten.len() {
+        0 => Err(WeightRecipeError::SelectionPushdownUnsupported {
+            operation: "concatenate",
+            reason: "selection did not intersect any child".into(),
+        }),
+        1 => Ok(rewritten.pop().unwrap()),
+        _ => Ok(DerivedWeightRecipe::Concatenate {
+            axis,
+            inputs: rewritten,
+        }),
+    }
+}
+
+fn push_stack_selection(
+    axis: usize,
+    inputs: &[DerivedWeightRecipe],
+    store: &dyn WeightStore,
+    selection: TensorSelection,
+) -> Result<DerivedWeightRecipe, WeightRecipeError> {
+    let selected_axis = selection_axis(&selection).expect("non-full selection");
+    if selected_axis == axis {
+        let selected = match selection {
+            TensorSelection::Range { start, end, .. } => inputs[start..end].to_vec(),
+            TensorSelection::Indices { indices, .. } => indices
+                .into_iter()
+                .map(|index| inputs[index].clone())
+                .collect(),
+            TensorSelection::Full => unreachable!(),
+        };
+        return Ok(DerivedWeightRecipe::Stack {
+            axis,
+            inputs: selected,
+        });
+    }
+    let input_axis = if selected_axis < axis {
+        selected_axis
+    } else {
+        selected_axis - 1
+    };
+    let input_selection = selection_with_axis(selection, input_axis);
+    let inputs = inputs
+        .iter()
+        .map(|input| push_selection(input, store, input_selection.clone()))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(DerivedWeightRecipe::Stack { axis, inputs })
+}
+
+fn map_reinterpret_selection(
+    input: &WeightRecipeMetadata,
+    output: &WeightRecipeMetadata,
+    selection: &TensorSelection,
+    operation: &'static str,
+) -> Result<TensorSelection, WeightRecipeError> {
+    let output_axis = selection_axis(selection).expect("non-full selection");
+    let output_unit = axis_unit_bytes(&output.shape, output.dtype.byte_width()?, output_axis)?;
+    let output_cycle = output_unit
+        .checked_mul(output.shape[output_axis] as u64)
+        .ok_or(WeightRecipeError::ArithmeticOverflow(
+            "selection output cycle",
+        ))?;
+    for input_axis in 0..input.shape.len() {
+        let input_unit = axis_unit_bytes(&input.shape, input.dtype.byte_width()?, input_axis)?;
+        let input_cycle = input_unit
+            .checked_mul(input.shape[input_axis] as u64)
+            .ok_or(WeightRecipeError::ArithmeticOverflow(
+                "selection input cycle",
+            ))?;
+        if input_cycle != output_cycle {
+            continue;
+        }
+        if let Some(mapped) = map_selection_units(
+            selection,
+            input_axis,
+            input.shape[input_axis],
+            output_unit,
+            input_unit,
+        )? {
+            return normalize_selection(mapped, &input.shape);
+        }
+    }
+    Err(WeightRecipeError::SelectionPushdownUnsupported {
+        operation,
+        reason: format!(
+            "axis {output_axis} selection cannot be expressed as a single-axis bounded selection from shape {:?} to {:?}",
+            input.shape, output.shape
+        ),
+    })
+}
+
+fn map_selection_units(
+    selection: &TensorSelection,
+    input_axis: usize,
+    input_dimension: usize,
+    output_unit: u64,
+    input_unit: u64,
+) -> Result<Option<TensorSelection>, WeightRecipeError> {
+    let map_interval =
+        |start: usize, end: usize| -> Result<Option<(usize, usize)>, WeightRecipeError> {
+            let start_bytes = (start as u64).checked_mul(output_unit).ok_or(
+                WeightRecipeError::ArithmeticOverflow("selection interval start"),
+            )?;
+            let end_bytes = (end as u64).checked_mul(output_unit).ok_or(
+                WeightRecipeError::ArithmeticOverflow("selection interval end"),
+            )?;
+            if start_bytes % input_unit != 0 || end_bytes % input_unit != 0 {
+                return Ok(None);
+            }
+            let start = usize::try_from(start_bytes / input_unit)
+                .map_err(|_| WeightRecipeError::ArithmeticOverflow("mapped selection start"))?;
+            let end = usize::try_from(end_bytes / input_unit)
+                .map_err(|_| WeightRecipeError::ArithmeticOverflow("mapped selection end"))?;
+            Ok((end <= input_dimension).then_some((start, end)))
+        };
+    match selection {
+        TensorSelection::Range { start, end, .. } => Ok(map_interval(*start, *end)?.map(
+            |(start, end)| TensorSelection::Range {
+                axis: input_axis,
+                start,
+                end,
+            },
+        )),
+        TensorSelection::Indices { indices, .. } => {
+            let mut mapped = Vec::new();
+            let mut run_start = indices[0];
+            let mut run_end = run_start + 1;
+            for index in indices.iter().copied().skip(1) {
+                if index == run_end {
+                    run_end += 1;
+                    continue;
+                }
+                let Some((start, end)) = map_interval(run_start, run_end)? else {
+                    return Ok(None);
+                };
+                mapped.extend(start..end);
+                run_start = index;
+                run_end = index + 1;
+            }
+            let Some((start, end)) = map_interval(run_start, run_end)? else {
+                return Ok(None);
+            };
+            mapped.extend(start..end);
+            Ok(Some(TensorSelection::Indices {
+                axis: input_axis,
+                indices: mapped,
+            }))
+        }
+        TensorSelection::Full => Ok(Some(TensorSelection::Full)),
+    }
+}
+
+fn axis_unit_bytes(
+    shape: &[usize],
+    dtype_width: u64,
+    axis: usize,
+) -> Result<u64, WeightRecipeError> {
+    shape[axis + 1..]
+        .iter()
+        .try_fold(dtype_width, |bytes, dimension| {
+            bytes
+                .checked_mul(*dimension as u64)
+                .ok_or(WeightRecipeError::ArithmeticOverflow("selection axis unit"))
+        })
+}
+
+fn selection_axis(selection: &TensorSelection) -> Option<usize> {
+    match selection {
+        TensorSelection::Full => None,
+        TensorSelection::Range { axis, .. } | TensorSelection::Indices { axis, .. } => Some(*axis),
+    }
+}
+
+fn select_chain_has_bounded_source(recipe: &DerivedWeightRecipe) -> bool {
+    match recipe {
+        DerivedWeightRecipe::Source { selection, .. } => {
+            !matches!(selection, TensorSelection::Full)
+        }
+        DerivedWeightRecipe::Select { input, .. } => select_chain_has_bounded_source(input),
+        _ => false,
+    }
+}
+
+fn selection_with_axis(selection: TensorSelection, axis: usize) -> TensorSelection {
+    match selection {
+        TensorSelection::Full => TensorSelection::Full,
+        TensorSelection::Range { start, end, .. } => TensorSelection::Range { axis, start, end },
+        TensorSelection::Indices { indices, .. } => TensorSelection::Indices { axis, indices },
+    }
+}
+
+fn normalize_selection(
+    selection: TensorSelection,
+    shape: &[usize],
+) -> Result<TensorSelection, WeightRecipeError> {
+    selected_shape(shape.to_vec(), &selection)?;
+    match selection {
+        TensorSelection::Range {
+            axis,
+            start: 0,
+            end,
+        } if end == shape[axis] => Ok(TensorSelection::Full),
+        TensorSelection::Indices { axis, indices }
+            if indices.len() == shape[axis] && indices.iter().copied().eq(0..shape[axis]) =>
+        {
+            Ok(TensorSelection::Full)
+        }
+        selection => Ok(selection),
+    }
+}
+
+fn compose_same_axis_selection(
+    existing: &TensorSelection,
+    requested: &TensorSelection,
+) -> Result<TensorSelection, WeightRecipeError> {
+    debug_assert_eq!(selection_axis(existing), selection_axis(requested));
+    let axis = selection_axis(existing).expect("non-full selections");
+    match (existing, requested) {
+        (
+            TensorSelection::Range { start, .. },
+            TensorSelection::Range {
+                start: requested_start,
+                end: requested_end,
+                ..
+            },
+        ) => Ok(TensorSelection::Range {
+            axis,
+            start: start + requested_start,
+            end: start + requested_end,
+        }),
+        (TensorSelection::Range { start, .. }, TensorSelection::Indices { indices, .. }) => {
+            Ok(TensorSelection::Indices {
+                axis,
+                indices: indices.iter().map(|index| start + index).collect(),
+            })
+        }
+        (TensorSelection::Indices { indices, .. }, TensorSelection::Range { start, end, .. }) => {
+            Ok(TensorSelection::Indices {
+                axis,
+                indices: indices[*start..*end].to_vec(),
+            })
+        }
+        (
+            TensorSelection::Indices {
+                indices: existing, ..
+            },
+            TensorSelection::Indices { indices, .. },
+        ) => Ok(TensorSelection::Indices {
+            axis,
+            indices: indices.iter().map(|index| existing[*index]).collect(),
+        }),
+        _ => Err(WeightRecipeError::SelectionPushdownUnsupported {
+            operation: "selection composition",
+            reason: "full selections must be normalized before composition".into(),
+        }),
     }
 }
 
@@ -758,6 +1296,14 @@ pub enum WeightRecipeError {
     /// Checked shape or byte arithmetic overflowed.
     #[error("derived-weight arithmetic overflow: {0}")]
     ArithmeticOverflow(&'static str),
+    /// A selected derived output could not be represented by bounded source reads.
+    #[error("cannot push bounded selection through {operation}: {reason}")]
+    SelectionPushdownUnsupported {
+        /// Recipe operation that could not preserve the selection.
+        operation: &'static str,
+        /// Checked geometry that prevented the rewrite.
+        reason: String,
+    },
     /// A transition-rate normalization contained zero or a positive value.
     #[error("log(-x) derived-weight input must contain only negative values")]
     NonNegativeNegLogInput,
@@ -789,6 +1335,10 @@ mod tests {
             .into_iter()
             .flat_map(i32::to_le_bytes)
             .collect::<Vec<_>>();
+        let cube = [0i32; 8]
+            .into_iter()
+            .flat_map(i32::to_le_bytes)
+            .collect::<Vec<_>>();
         serialize_to_file(
             [
                 (
@@ -798,6 +1348,10 @@ mod tests {
                 (
                     "right",
                     TensorView::new(SafeDtype::I32, vec![2, 2], &right).unwrap(),
+                ),
+                (
+                    "cube",
+                    TensorView::new(SafeDtype::I32, vec![2, 2, 2], &cube).unwrap(),
                 ),
             ],
             None,
@@ -976,6 +1530,308 @@ mod tests {
         let stream = Stream::new_with_device(&Device::new(DeviceType::Cpu, 0));
         let output = recipe.materialize(store.as_ref(), &stream).unwrap();
         assert_eq!(output.evaluated().unwrap().as_slice::<i32>(), &[2]);
+    }
+
+    #[test]
+    fn bounded_selection_composes_at_the_source() {
+        let (_dir, store) = fixture();
+        let recipe = DerivedWeightRecipe::source(
+            "left",
+            TensorSelection::Indices {
+                axis: 0,
+                indices: vec![1, 0],
+            },
+        );
+        let rewritten = recipe
+            .select_bounded(
+                store.as_ref(),
+                TensorSelection::Range {
+                    axis: 0,
+                    start: 0,
+                    end: 1,
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            rewritten,
+            DerivedWeightRecipe::source(
+                "left",
+                TensorSelection::Indices {
+                    axis: 0,
+                    indices: vec![1],
+                }
+            )
+        );
+    }
+
+    #[test]
+    fn independent_axis_selections_remain_local_to_an_already_bounded_source() {
+        let (_dir, store) = fixture();
+        let recipe = DerivedWeightRecipe::Select {
+            input: Box::new(DerivedWeightRecipe::source(
+                "cube",
+                TensorSelection::Range {
+                    axis: 0,
+                    start: 0,
+                    end: 1,
+                },
+            )),
+            selection: TensorSelection::Range {
+                axis: 1,
+                start: 0,
+                end: 1,
+            },
+        };
+        let rewritten = recipe
+            .select_bounded(
+                store.as_ref(),
+                TensorSelection::Range {
+                    axis: 2,
+                    start: 0,
+                    end: 1,
+                },
+            )
+            .unwrap();
+        assert_eq!(rewritten.infer(store.as_ref()).unwrap().shape(), &[1, 1, 1]);
+        assert!(matches!(rewritten, DerivedWeightRecipe::Select { .. }));
+    }
+
+    #[test]
+    fn bounded_selection_prunes_and_reorders_join_children() {
+        let (_dir, store) = fixture();
+        let concatenate = DerivedWeightRecipe::Concatenate {
+            axis: 0,
+            inputs: vec![source("left"), source("right")],
+        };
+        let rewritten = concatenate
+            .select_bounded(
+                store.as_ref(),
+                TensorSelection::Indices {
+                    axis: 0,
+                    indices: vec![3, 0, 2],
+                },
+            )
+            .unwrap();
+        assert_eq!(rewritten.infer(store.as_ref()).unwrap().shape(), &[3, 2]);
+        assert_eq!(
+            rewritten,
+            DerivedWeightRecipe::Concatenate {
+                axis: 0,
+                inputs: vec![
+                    DerivedWeightRecipe::source(
+                        "right",
+                        TensorSelection::Indices {
+                            axis: 0,
+                            indices: vec![1],
+                        },
+                    ),
+                    DerivedWeightRecipe::source(
+                        "left",
+                        TensorSelection::Indices {
+                            axis: 0,
+                            indices: vec![0],
+                        },
+                    ),
+                    DerivedWeightRecipe::source(
+                        "right",
+                        TensorSelection::Indices {
+                            axis: 0,
+                            indices: vec![0],
+                        },
+                    ),
+                ],
+            }
+        );
+        let stream = Stream::new_with_device(&Device::new(DeviceType::Cpu, 0));
+        let output = rewritten.materialize(store.as_ref(), &stream).unwrap();
+        assert_eq!(
+            output.evaluated().unwrap().as_slice::<i32>(),
+            &[7, 8, 1, 2, 5, 6]
+        );
+
+        let stack = DerivedWeightRecipe::Stack {
+            axis: 0,
+            inputs: vec![source("left"), source("right")],
+        };
+        let rewritten = stack
+            .select_bounded(
+                store.as_ref(),
+                TensorSelection::Indices {
+                    axis: 0,
+                    indices: vec![1, 0, 1],
+                },
+            )
+            .unwrap();
+        assert_eq!(rewritten.source_keys(), vec!["left", "right"]);
+        assert_eq!(rewritten.infer(store.as_ref()).unwrap().shape(), &[3, 2, 2]);
+        assert!(matches!(
+            rewritten,
+            DerivedWeightRecipe::Stack { inputs, .. }
+                if inputs == vec![source("right"), source("left"), source("right")]
+        ));
+    }
+
+    #[test]
+    fn bounded_selection_crosses_transpose_reshape_and_view() {
+        let (_dir, store) = fixture();
+        let transpose = DerivedWeightRecipe::Transpose {
+            input: Box::new(source("left")),
+            axes: vec![1, 0],
+        };
+        let rewritten = transpose
+            .select_bounded(
+                store.as_ref(),
+                TensorSelection::Range {
+                    axis: 0,
+                    start: 0,
+                    end: 1,
+                },
+            )
+            .unwrap();
+        assert!(matches!(
+            rewritten,
+            DerivedWeightRecipe::Transpose { input, .. }
+                if matches!(
+                    *input,
+                    DerivedWeightRecipe::Source {
+                        selection: TensorSelection::Range {
+                            axis: 1,
+                            start: 0,
+                            end: 1,
+                        },
+                        ..
+                    }
+                )
+        ));
+
+        let reshape = DerivedWeightRecipe::Reshape {
+            input: Box::new(source("left")),
+            shape: vec![4],
+        };
+        let rewritten = reshape
+            .select_bounded(
+                store.as_ref(),
+                TensorSelection::Range {
+                    axis: 0,
+                    start: 0,
+                    end: 2,
+                },
+            )
+            .unwrap();
+        assert!(matches!(
+            rewritten,
+            DerivedWeightRecipe::Reshape { input, shape }
+                if shape == vec![2]
+                    && matches!(
+                        *input,
+                        DerivedWeightRecipe::Source {
+                            selection: TensorSelection::Range {
+                                axis: 0,
+                                start: 0,
+                                end: 1,
+                            },
+                            ..
+                        }
+                    )
+        ));
+
+        let view = DerivedWeightRecipe::View {
+            input: Box::new(source("left")),
+            dtype: Dtype::Uint8,
+            shape: vec![2, 8],
+        };
+        let rewritten = view
+            .select_bounded(
+                store.as_ref(),
+                TensorSelection::Range {
+                    axis: 1,
+                    start: 0,
+                    end: 4,
+                },
+            )
+            .unwrap();
+        assert!(matches!(
+            rewritten,
+            DerivedWeightRecipe::View { input, shape, .. }
+                if shape == vec![2, 4]
+                    && matches!(
+                        *input,
+                        DerivedWeightRecipe::Source {
+                            selection: TensorSelection::Range {
+                                axis: 1,
+                                start: 0,
+                                end: 1,
+                            },
+                            ..
+                        }
+                    )
+        ));
+    }
+
+    #[test]
+    fn bounded_selection_splits_a_stacked_expert_reshape_at_sources() {
+        let (_dir, store) = fixture();
+        let recipe = DerivedWeightRecipe::Reshape {
+            input: Box::new(DerivedWeightRecipe::Stack {
+                axis: 2,
+                inputs: vec![source("cube"), source("cube")],
+            }),
+            shape: vec![2, 4, 2],
+        };
+        let rewritten = recipe
+            .select_bounded(
+                store.as_ref(),
+                TensorSelection::Range {
+                    axis: 1,
+                    start: 2,
+                    end: 4,
+                },
+            )
+            .unwrap();
+        assert_eq!(rewritten.infer(store.as_ref()).unwrap().shape(), &[2, 2, 2]);
+        assert!(matches!(
+            rewritten,
+            DerivedWeightRecipe::Reshape { input, .. }
+                if matches!(
+                    &*input,
+                    DerivedWeightRecipe::Stack { inputs, .. }
+                        if inputs.iter().all(|input| matches!(
+                            input,
+                            DerivedWeightRecipe::Source {
+                                selection: TensorSelection::Range {
+                                    axis: 1,
+                                    start: 1,
+                                    end: 2,
+                                },
+                                ..
+                            }
+                        ))
+                )
+        ));
+    }
+
+    #[test]
+    fn bounded_selection_rejects_unaligned_view_geometry() {
+        let (_dir, store) = fixture();
+        let view = DerivedWeightRecipe::View {
+            input: Box::new(source("left")),
+            dtype: Dtype::Uint8,
+            shape: vec![2, 8],
+        };
+        assert!(matches!(
+            view.select_bounded(
+                store.as_ref(),
+                TensorSelection::Range {
+                    axis: 1,
+                    start: 1,
+                    end: 2,
+                },
+            ),
+            Err(WeightRecipeError::SelectionPushdownUnsupported {
+                operation: "view",
+                ..
+            })
+        ));
     }
 
     #[test]

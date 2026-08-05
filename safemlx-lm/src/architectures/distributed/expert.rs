@@ -44,8 +44,7 @@ use crate::{
     runtime::checkpoint::store::{GgufWeightStore, SafetensorsWeightStore, WeightStore},
     runtime::distributed::parallel::{sample_and_synchronize, SynchronizedToken},
     runtime::distributed::topology::{
-        load_safetensors_partition_from_store_on_streams, ParallelTopology, PlacementPlan,
-        TensorPlacement,
+        load_partition_from_store_on_streams, ParallelTopology, PlacementPlan, TensorPlacement,
     },
     runtime::execution::inspection::ActivationObserver,
     runtime::generation::sampler::{DefaultSampler, Sampler, SpeculativeSampler},
@@ -4131,7 +4130,7 @@ fn load_kimi_linear_cached_ep(
         expert_options.non_expert.max_mapped_shards,
     )?);
     let plan = expert_cache_base_plan(store.as_ref(), topology, ModelKind::KimiLinear);
-    let partition = load_safetensors_partition_from_store_on_streams(
+    let partition = load_partition_from_store_on_streams(
         store.as_ref(),
         &plan,
         weights_stream,
@@ -4262,13 +4261,8 @@ fn load_deepseek_ep(
             source_args.num_hidden_layers + index
         ));
     }
-    let partition = load_safetensors_partition_from_store_on_streams(
-        &store,
-        &plan,
-        weights_stream,
-        stream,
-        &strict,
-    )?;
+    let partition =
+        load_partition_from_store_on_streams(&store, &plan, weights_stream, stream, &strict)?;
     let opened_checkpoint_shards = partition.opened_shards().to_vec();
     let mut tensors = partition.into_tensors();
     let mut model = deepseek_v3::Model::new(target_args, stream)?;
@@ -4410,7 +4404,7 @@ fn load_qwen3_ep(
         resolve_model_assignment(assignment, source_args.num_experts as usize, topology)?;
     let store = SafetensorsWeightStore::open(model_dir)?;
     let (plan, has_split) = expert_placement_plan(&store, topology, &assignment)?;
-    let partition = load_safetensors_partition_from_store_on_streams(
+    let partition = load_partition_from_store_on_streams(
         &store,
         &plan,
         weights_stream,
@@ -4900,7 +4894,7 @@ fn load_additional_cached_ep(
         expert_options.non_expert.max_mapped_shards,
     )?);
     let plan = expert_cache_base_plan(store.as_ref(), topology, kind);
-    let partition = load_safetensors_partition_from_store_on_streams(
+    let partition = load_partition_from_store_on_streams(
         store.as_ref(),
         &plan,
         weights_stream,
@@ -5317,7 +5311,7 @@ fn load_deepseek_cached_ep(
         strict =
             strict.allow_unused_prefix(format!("model.layers.{}.", args.num_hidden_layers + index));
     }
-    let partition = load_safetensors_partition_from_store_on_streams(
+    let partition = load_partition_from_store_on_streams(
         store.as_ref(),
         &plan,
         weights_stream,
@@ -5404,7 +5398,7 @@ fn load_qwen3_cached_ep(
         expert_options.non_expert.max_mapped_shards,
     )?);
     let plan = expert_cache_base_plan(store.as_ref(), topology, ModelKind::Qwen3);
-    let partition = load_safetensors_partition_from_store_on_streams(
+    let partition = load_partition_from_store_on_streams(
         store.as_ref(),
         &plan,
         weights_stream,

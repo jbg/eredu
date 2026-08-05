@@ -25,9 +25,10 @@ pub use convolution::*;
 pub use cumulative::*;
 pub use factory::*;
 pub use gguf::{
-    GgufAffineTensor, GgufArray, GgufCheckpoint, GgufEndian, GgufLogicalDtype, GgufMaterializer,
-    GgufMetadata, GgufMetadataArray, GgufMetadataValue, GgufMxFp4Tensor, GgufOuterSelection,
-    GgufRawTensor, GgufTensor, GgufTensorIter, GgufType,
+    GgufAffineTensor, GgufArray, GgufCheckpoint, GgufEncodedSpan, GgufEndian, GgufLogicalDtype,
+    GgufMaterializer, GgufMetadata, GgufMetadataArray, GgufMetadataValue, GgufMxFp4Tensor,
+    GgufRawTensor, GgufSelectionAlignment, GgufTensor, GgufTensorDescriptor, GgufTensorIter,
+    GgufTensorSelection, GgufTensorSelectionPlan, GgufType,
 };
 pub use logical::*;
 pub use moe::*;

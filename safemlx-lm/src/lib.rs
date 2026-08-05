@@ -53,11 +53,10 @@ pub use runtime::distributed::topology::{
     DeviceAssignment, ParallelTopology, PlacementPlan, RankPartition, TensorPlacement,
 };
 pub use runtime::execution::layerwise::{
-    load_layerwise_model, load_tensor_parallel_layerwise_model, ArchitectureAdapter,
-    DenseCacheMetrics, DenseDiskStreamReport, DenseExecutionGroupReport, DensePassReport,
-    DenseTierResidencyReport, LayerExecutionLoadOptions, LayerwiseForwardState,
-    LayerwiseLoadOptions, LayerwiseModel, LayerwiseModelMetadata, ParallelModelInfo,
-    WeightResidency,
+    load_layerwise_model, ArchitectureAdapter, DenseCacheMetrics, DenseDiskStreamReport,
+    DenseExecutionGroupReport, DensePassReport, DenseTierResidencyReport,
+    LayerExecutionLoadOptions, LayerwiseForwardState, LayerwiseLoadOptions, LayerwiseModel,
+    LayerwiseModelMetadata, ParallelModelInfo, SharedWeightStore, WeightResidency,
 };
 pub use runtime::residency::dense_stream::{
     BackgroundPrefetchReport, DenseDiskStreamLoadOptions, DenseStreamError,

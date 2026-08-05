@@ -55,9 +55,10 @@ use crate::{
         ParameterRole, ProjectionSharding,
     },
     runtime::execution::layerwise::{
-        load_layerwise_model, load_layerwise_model_with_store,
-        load_tensor_parallel_layerwise_model, ArchitectureAdapter, LayerExecutionLoadOptions,
-        LayerwiseForwardState, LayerwiseModel, StaticUnitBindings, WeightResidency,
+        load_layerwise_model, load_safetensors_layerwise_model,
+        load_tensor_parallel_layerwise_model, open_safetensors_weight_store, ArchitectureAdapter,
+        LayerExecutionLoadOptions, LayerwiseForwardState, LayerwiseModel, StaticUnitBindings,
+        WeightResidency,
     },
     runtime::residency::expert_cache::{
         ExpertCache, ExpertCacheError, ExpertCacheLoadOptions, ExpertCacheReport,
@@ -425,13 +426,19 @@ pub fn load_safetensors(
     )?;
     let adapter = DenseQwenLayerwiseAdapter::new(args, stream)?;
     Ok(LayerwiseDecoder {
-        execution: load_layerwise_model(model_dir, adapter, options, stream, weights_stream)?,
+        execution: load_safetensors_layerwise_model(
+            model_dir,
+            adapter,
+            options,
+            stream,
+            weights_stream,
+        )?,
     })
 }
 
 /// Loads Qwen2/3 dense or MoE checkpoints through the generalized
 /// tensor-parallel execution-group engine.
-pub fn load_tensor_parallel_safetensors(
+pub fn load_tensor_parallel_model(
     model_dir: impl AsRef<Path>,
     options: impl Into<LayerExecutionLoadOptions>,
     build: crate::runtime::distributed::parallel::ParallelBuildContext,
@@ -448,6 +455,36 @@ pub fn load_tensor_parallel_safetensors(
             WeightResidency::DenseDiskStream(options)
         }
     };
+    if model_dir
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("gguf"))
+    {
+        let checkpoint = GgufCheckpoint::open(model_dir)?;
+        let metadata = crate::runtime::checkpoint::load::gguf_metadata(&checkpoint);
+        let architecture = match metadata.get("general.architecture") {
+            Some(GgufMetadataValue::String(architecture)) => architecture.as_str(),
+            Some(_) => {
+                return Err(Error::UnsupportedArchitecture(
+                    "GGUF metadata key general.architecture has the wrong type".into(),
+                ));
+            }
+            None => {
+                return Err(Error::UnsupportedArchitecture(
+                    "GGUF metadata is missing general.architecture".into(),
+                ));
+            }
+        };
+        return load_gguf_tensor_parallel_model(
+            &checkpoint,
+            &metadata,
+            architecture,
+            options,
+            build,
+            stream,
+            weights_stream,
+        )
+        .map(|(model, _)| model);
+    }
     let args = resident::load_config(model_dir)?;
     crate::api::structural::validate_safetensors_load_path(
         args.model_kind(),
@@ -457,7 +494,7 @@ pub fn load_tensor_parallel_safetensors(
     let adapter = DenseQwenLayerwiseAdapter::new(args, stream)?;
     Ok(LayerwiseDecoder {
         execution: load_tensor_parallel_layerwise_model(
-            model_dir,
+            open_safetensors_weight_store(model_dir, options.max_mapped_shards())?,
             adapter,
             options,
             build,
@@ -465,6 +502,38 @@ pub fn load_tensor_parallel_safetensors(
             weights_stream,
         )?,
     })
+}
+
+pub(crate) fn load_gguf_tensor_parallel_model(
+    checkpoint: &GgufCheckpoint,
+    metadata: &HashMap<String, GgufMetadataValue>,
+    architecture: &str,
+    options: LayerExecutionLoadOptions,
+    build: crate::runtime::distributed::parallel::ParallelBuildContext,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<(LayerwiseDecoder, Vec<u32>), Error> {
+    crate::runtime::execution::layerwise::validate_gguf_layerwise_source(
+        checkpoint, metadata, options,
+    )?;
+    let is_moe = architecture == "qwen3moe";
+    let (args, eos_token_ids) =
+        resident::prepare_gguf_checkpoint(checkpoint, metadata, architecture, is_moe)?;
+    let store: Arc<dyn WeightStore + Send + Sync> =
+        Arc::new(GgufWeightStore::new_with_max_mapped_shards(
+            checkpoint.clone(),
+            move |name| resident::translate_gguf_weight_name(name, is_moe),
+            options.max_mapped_shards(),
+        )?);
+    let execution = load_tensor_parallel_layerwise_model(
+        store,
+        DenseQwenLayerwiseAdapter::new(args, stream)?,
+        options,
+        build,
+        stream,
+        weights_stream,
+    )?;
+    Ok((LayerwiseDecoder { execution }, eos_token_ids))
 }
 
 pub(crate) fn load_gguf_checkpoint(
@@ -488,11 +557,11 @@ pub(crate) fn load_gguf_checkpoint(
     let execution = match residency {
         WeightResidency::LayerwiseHost(options) => {
             let adapter = DenseQwenLayerwiseAdapter::new(args, stream)?;
-            load_layerwise_model_with_store(store, adapter, options, stream, weights_stream)?
+            load_layerwise_model(store, adapter, options, stream, weights_stream)?
         }
         WeightResidency::DenseDiskStream(options) => {
             let adapter = DenseQwenLayerwiseAdapter::new(args, stream)?;
-            load_layerwise_model_with_store(store, adapter, options, stream, weights_stream)?
+            load_layerwise_model(store, adapter, options, stream, weights_stream)?
         }
         WeightResidency::SparseExpertCache(options) => {
             return Ok((
@@ -597,8 +666,7 @@ fn load_qwen3_gguf_sparse_with_store(
         ));
     }
     let adapter = DenseQwenLayerwiseAdapter::new_sparse(args.clone(), stream)?;
-    let mut execution =
-        load_layerwise_model_with_store(store, adapter, non_expert, stream, weights_stream)?;
+    let mut execution = load_layerwise_model(store, adapter, non_expert, stream, weights_stream)?;
     let checkpoint_store = execution.weight_store_arc();
     let entries = qwen3_expert_catalog(&args, checkpoint_store.as_ref())?;
     execution.adapter_mut().expert_cache = Some(ExpertCache::new_shared(
@@ -625,8 +693,7 @@ pub(crate) fn load_qwen3_sparse_ep_base_with_store(
         ));
     }
     let adapter = DenseQwenLayerwiseAdapter::new_sparse(args, stream)?;
-    let execution =
-        load_layerwise_model_with_store(store, adapter, non_expert, stream, weights_stream)?;
+    let execution = load_layerwise_model(store, adapter, non_expert, stream, weights_stream)?;
     Ok(LayerwiseDecoder { execution })
 }
 
@@ -679,7 +746,7 @@ fn load_qwen3_sparse_expert_cache_model_with_non_expert(
     }
     let adapter = DenseQwenLayerwiseAdapter::new_sparse(args.clone(), stream)?;
     let mut execution =
-        load_layerwise_model(model_dir, adapter, non_expert, stream, weights_stream)?;
+        load_safetensors_layerwise_model(model_dir, adapter, non_expert, stream, weights_stream)?;
     let store = execution.weight_store_arc();
     let entries = qwen3_expert_catalog(&args, store.as_ref())?;
     let cache = ExpertCache::new_shared(
@@ -1358,6 +1425,7 @@ impl ArchitectureAdapter for DenseQwenLayerwiseAdapter {
         crate::runtime::execution::layerwise::shard_layer_bindings(
             self.layer_bindings(group, index, &global, store)?,
             &self.layer_checkpoint_prefix(group, index),
+            store,
             layout,
         )
     }
@@ -2106,7 +2174,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         write_fixture(dir.path(), &fixture, false, execution.stream());
 
-        let model = load_tensor_parallel_safetensors(
+        let model = load_tensor_parallel_model(
             dir.path(),
             LayerwiseLoadOptions::default(),
             tensor_parallel_context(),
@@ -2189,7 +2257,7 @@ mod tests {
         let store: Arc<dyn WeightStore + Send + Sync> =
             Arc::new(SafetensorsWeightStore::open(dir.path()).unwrap());
         let adapter = DenseQwenLayerwiseAdapter::new(model_args, gpu.stream()).unwrap();
-        let execution = load_layerwise_model_with_store(
+        let execution = load_layerwise_model(
             store,
             adapter,
             LayerwiseLoadOptions::new(OffloadConfig::new(None, None, 1).unwrap()),

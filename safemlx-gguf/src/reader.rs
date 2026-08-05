@@ -7,13 +7,397 @@ use std::fs::File;
 use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::path::Path;
 
-/// A non-empty selection along the outermost MLX/row-major tensor axis.
+/// A non-empty selection along one MLX/row-major tensor axis.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum OuterSelection {
-    /// Select the half-open outer-axis range `start..end`.
-    Range { start: usize, end: usize },
-    /// Select outer-axis indices in caller-supplied order.
-    Indices(Vec<usize>),
+pub enum TensorSelection {
+    /// Select the half-open range `start..end` on `axis`.
+    Range {
+        axis: usize,
+        start: usize,
+        end: usize,
+    },
+    /// Select indices on `axis` in caller-supplied order.
+    Indices { axis: usize, indices: Vec<usize> },
+}
+
+impl TensorSelection {
+    fn axis(&self) -> usize {
+        match self {
+            Self::Range { axis, .. } | Self::Indices { axis, .. } => *axis,
+        }
+    }
+}
+
+/// GGUF block geometry constraining a physical tensor selection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SelectionAlignment {
+    block_values: u64,
+    block_bytes: u64,
+    selected_axis_multiple: u64,
+}
+
+impl SelectionAlignment {
+    /// Values represented by one native GGUF block.
+    pub const fn block_values(&self) -> u64 {
+        self.block_values
+    }
+
+    /// Encoded bytes occupied by one native GGUF block.
+    pub const fn block_bytes(&self) -> u64 {
+        self.block_bytes
+    }
+
+    /// Required selection boundary multiple on the selected MLX axis.
+    ///
+    /// This is the GGUF block length when selecting the fastest physical
+    /// dimension and one for every other dimension.
+    pub const fn selected_axis_multiple(&self) -> u64 {
+        self.selected_axis_multiple
+    }
+}
+
+/// One absolute, contiguous encoded file range required by a selection plan.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EncodedSpan {
+    offset: u64,
+    byte_len: u64,
+}
+
+impl EncodedSpan {
+    /// Absolute byte offset in the GGUF shard.
+    pub const fn offset(&self) -> u64 {
+        self.offset
+    }
+
+    /// Number of encoded payload bytes in this span.
+    pub const fn byte_len(&self) -> u64 {
+        self.byte_len
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RelativeEncodedSpan {
+    offset: u64,
+    byte_len: u64,
+}
+
+/// Metadata-only physical read plan for a single-axis tensor selection.
+///
+/// GGUF dimensions are fastest-moving first while MLX dimensions are
+/// row-major. The plan records that axis translation, validates native block
+/// alignment, describes the exact encoded reads as a compact repeated pattern,
+/// and carries the descriptor expected by conversion after compaction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TensorSelectionPlan {
+    selection: TensorSelection,
+    gguf_dimension: usize,
+    alignment: SelectionAlignment,
+    selected_descriptor: TensorDescriptor,
+    source_data_offset: u64,
+    repetition_stride: u64,
+    repetitions: u64,
+    relative_spans: Vec<RelativeEncodedSpan>,
+    encoded_byte_len: u64,
+}
+
+impl TensorSelectionPlan {
+    /// Build and validate a physical selection plan without reading payloads.
+    pub fn new(tensor: &TensorDescriptor, selection: TensorSelection) -> Result<Self> {
+        let rank = tensor.dimensions.len();
+        let logical_axis = selection.axis();
+        if logical_axis >= rank {
+            return Err(Error::tensor(
+                &tensor.name,
+                format!("selection axis {logical_axis} is outside rank {rank}"),
+            ));
+        }
+        if tensor.byte_len == 0 || tensor.dimensions.contains(&0) {
+            return Err(Error::tensor(
+                &tensor.name,
+                "cannot select from an empty tensor",
+            ));
+        }
+
+        let gguf_dimension = rank - 1 - logical_axis;
+        let dimension_u64 = tensor.dimensions[gguf_dimension];
+        let dimension = usize::try_from(dimension_u64)
+            .map_err(|_| Error::Overflow("selected tensor dimension"))?;
+        let (block_values, block_bytes) = tensor.ggml_type.block_and_bytes()?;
+        if !tensor.dimensions[0].is_multiple_of(block_values) {
+            return Err(Error::tensor(
+                &tensor.name,
+                format!(
+                    "fastest dimension {} is not divisible by GGUF block length {block_values}",
+                    tensor.dimensions[0]
+                ),
+            ));
+        }
+        let source_byte_len = tensor
+            .element_count()?
+            .checked_div(block_values)
+            .and_then(|blocks| blocks.checked_mul(block_bytes))
+            .ok_or(Error::Overflow("tensor descriptor byte length"))?;
+        if source_byte_len != tensor.byte_len {
+            return Err(Error::tensor(
+                &tensor.name,
+                format!(
+                    "descriptor declares {} encoded bytes but its shape and type require {source_byte_len}",
+                    tensor.byte_len
+                ),
+            ));
+        }
+        let selected_axis_multiple = if gguf_dimension == 0 { block_values } else { 1 };
+        let selected_axis_multiple_usize = usize::try_from(selected_axis_multiple)
+            .map_err(|_| Error::Overflow("selection alignment"))?;
+
+        let (selected_values, encoded_ranges) = match &selection {
+            TensorSelection::Range { start, end, .. } => {
+                if start >= end || *end > dimension {
+                    return Err(Error::tensor(
+                        &tensor.name,
+                        format!(
+                            "selection range {start}..{end} exceeds MLX axis {logical_axis} dimension {dimension}"
+                        ),
+                    ));
+                }
+                if start % selected_axis_multiple_usize != 0
+                    || end % selected_axis_multiple_usize != 0
+                {
+                    return Err(Error::tensor(
+                        &tensor.name,
+                        format!(
+                            "selection range {start}..{end} on MLX axis {logical_axis} must align to {selected_axis_multiple}-value GGUF blocks"
+                        ),
+                    ));
+                }
+                let encoded_start = start / selected_axis_multiple_usize;
+                let encoded_end = end / selected_axis_multiple_usize;
+                (
+                    end - start,
+                    vec![(encoded_start, encoded_end - encoded_start)],
+                )
+            }
+            TensorSelection::Indices { indices, .. } => {
+                if indices.is_empty() || indices.iter().any(|index| *index >= dimension) {
+                    return Err(Error::tensor(
+                        &tensor.name,
+                        format!(
+                            "selection indices {indices:?} exceed MLX axis {logical_axis} dimension {dimension}"
+                        ),
+                    ));
+                }
+                let encoded_indices = if selected_axis_multiple_usize == 1 {
+                    indices.clone()
+                } else {
+                    if !indices.len().is_multiple_of(selected_axis_multiple_usize) {
+                        return Err(Error::tensor(
+                            &tensor.name,
+                            format!(
+                                "selection indices on MLX axis {logical_axis} must contain complete {selected_axis_multiple}-value GGUF blocks"
+                            ),
+                        ));
+                    }
+                    let mut blocks =
+                        Vec::with_capacity(indices.len() / selected_axis_multiple_usize);
+                    for chunk in indices.chunks_exact(selected_axis_multiple_usize) {
+                        let start = chunk[0];
+                        if start % selected_axis_multiple_usize != 0
+                            || chunk
+                                .iter()
+                                .copied()
+                                .ne(start..start + selected_axis_multiple_usize)
+                        {
+                            return Err(Error::tensor(
+                                &tensor.name,
+                                format!(
+                                    "selection indices on MLX axis {logical_axis} must preserve every complete aligned {selected_axis_multiple}-value GGUF block"
+                                ),
+                            ));
+                        }
+                        blocks.push(start / selected_axis_multiple_usize);
+                    }
+                    blocks
+                };
+                (indices.len(), coalesce_indices(&encoded_indices))
+            }
+        };
+
+        let mut encoded_dimensions = tensor.dimensions.clone();
+        encoded_dimensions[0] /= block_values;
+        let inner_units =
+            encoded_dimensions[..gguf_dimension]
+                .iter()
+                .try_fold(1u64, |product, dimension| {
+                    product
+                        .checked_mul(*dimension)
+                        .ok_or(Error::Overflow("selection inner stride"))
+                })?;
+        let inner_bytes = inner_units
+            .checked_mul(block_bytes)
+            .ok_or(Error::Overflow("selection inner byte stride"))?;
+        let repetition_stride = encoded_dimensions[gguf_dimension]
+            .checked_mul(inner_bytes)
+            .ok_or(Error::Overflow("selection repetition stride"))?;
+        let mut repetitions = encoded_dimensions[gguf_dimension + 1..].iter().try_fold(
+            1u64,
+            |product, dimension| {
+                product
+                    .checked_mul(*dimension)
+                    .ok_or(Error::Overflow("selection repetition count"))
+            },
+        )?;
+        let mut relative_spans = encoded_ranges
+            .into_iter()
+            .map(|(start, count)| {
+                let start =
+                    u64::try_from(start).map_err(|_| Error::Overflow("selection span offset"))?;
+                let count =
+                    u64::try_from(count).map_err(|_| Error::Overflow("selection span length"))?;
+                Ok(RelativeEncodedSpan {
+                    offset: start
+                        .checked_mul(inner_bytes)
+                        .ok_or(Error::Overflow("selection span offset"))?,
+                    byte_len: count
+                        .checked_mul(inner_bytes)
+                        .ok_or(Error::Overflow("selection span length"))?,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        let full_canonical_selection = relative_spans.len() == 1
+            && relative_spans[0].offset == 0
+            && relative_spans[0].byte_len == repetition_stride;
+        if full_canonical_selection {
+            repetitions = 1;
+            relative_spans[0].byte_len = tensor.byte_len;
+        }
+        let encoded_bytes_per_repetition =
+            relative_spans.iter().try_fold(0u64, |total, span| {
+                total
+                    .checked_add(span.byte_len)
+                    .ok_or(Error::Overflow("selected tensor byte length"))
+            })?;
+        let encoded_byte_len = encoded_bytes_per_repetition
+            .checked_mul(repetitions)
+            .ok_or(Error::Overflow("selected tensor byte length"))?;
+
+        let mut selected_descriptor = tensor.clone();
+        selected_descriptor.dimensions[gguf_dimension] = u64::try_from(selected_values)
+            .map_err(|_| Error::Overflow("selected tensor dimension"))?;
+        selected_descriptor.byte_len = encoded_byte_len;
+        let expected_byte_len = selected_descriptor
+            .element_count()?
+            .checked_div(block_values)
+            .and_then(|blocks| blocks.checked_mul(block_bytes))
+            .ok_or(Error::Overflow("selected tensor descriptor byte length"))?;
+        if expected_byte_len != encoded_byte_len {
+            return Err(Error::tensor(
+                &tensor.name,
+                format!(
+                    "selection plan produced {encoded_byte_len} encoded bytes but its rewritten descriptor requires {expected_byte_len}"
+                ),
+            ));
+        }
+        let maximum_relative_end = relative_spans.iter().try_fold(0u64, |maximum, span| {
+            let end = span
+                .offset
+                .checked_add(span.byte_len)
+                .ok_or(Error::Overflow("selection span end"))?;
+            Ok::<_, Error>(maximum.max(end))
+        })?;
+        if maximum_relative_end > repetition_stride && !full_canonical_selection {
+            return Err(Error::tensor(
+                &tensor.name,
+                "selection span exceeds its encoded repetition stride",
+            ));
+        }
+        let final_span_end = tensor
+            .data_offset
+            .checked_add(
+                repetition_stride
+                    .checked_mul(repetitions.saturating_sub(1))
+                    .ok_or(Error::Overflow("selection final span offset"))?,
+            )
+            .and_then(|offset| offset.checked_add(maximum_relative_end))
+            .ok_or(Error::Overflow("selection final span end"))?;
+        let tensor_end = tensor
+            .data_offset
+            .checked_add(tensor.byte_len)
+            .ok_or(Error::Overflow("tensor end offset"))?;
+        if final_span_end > tensor_end {
+            return Err(Error::tensor(
+                &tensor.name,
+                "selection plan exceeds the encoded tensor payload",
+            ));
+        }
+
+        Ok(Self {
+            selection,
+            gguf_dimension,
+            alignment: SelectionAlignment {
+                block_values,
+                block_bytes,
+                selected_axis_multiple,
+            },
+            selected_descriptor,
+            source_data_offset: tensor.data_offset,
+            repetition_stride,
+            repetitions,
+            relative_spans,
+            encoded_byte_len,
+        })
+    }
+
+    /// Original logical selection represented by this plan.
+    pub const fn selection(&self) -> &TensorSelection {
+        &self.selection
+    }
+
+    /// Selected MLX/row-major axis.
+    pub fn logical_axis(&self) -> usize {
+        self.selection.axis()
+    }
+
+    /// Corresponding fastest-first GGUF dimension.
+    pub const fn gguf_dimension(&self) -> usize {
+        self.gguf_dimension
+    }
+
+    /// Native block geometry and selected-axis alignment.
+    pub const fn alignment(&self) -> SelectionAlignment {
+        self.alignment
+    }
+
+    /// Descriptor used to convert the compacted selected payload.
+    pub const fn selected_descriptor(&self) -> &TensorDescriptor {
+        &self.selected_descriptor
+    }
+
+    /// Exact number of encoded bytes read by the plan.
+    pub const fn encoded_byte_len(&self) -> u64 {
+        self.encoded_byte_len
+    }
+
+    /// Exact absolute encoded file spans in output order.
+    pub fn encoded_spans(&self) -> impl Iterator<Item = EncodedSpan> + '_ {
+        (0..self.repetitions).flat_map(move |repetition| {
+            self.relative_spans.iter().map(move |span| EncodedSpan {
+                offset: self.source_data_offset + repetition * self.repetition_stride + span.offset,
+                byte_len: span.byte_len,
+            })
+        })
+    }
+}
+
+fn coalesce_indices(indices: &[usize]) -> Vec<(usize, usize)> {
+    let mut ranges = Vec::new();
+    for &index in indices {
+        match ranges.last_mut() {
+            Some((start, count)) if *start + *count == index => *count += 1,
+            _ => ranges.push((index, 1)),
+        }
+    }
+    ranges
 }
 
 #[derive(Debug, Clone)]
@@ -295,118 +679,38 @@ impl<R: Read + Seek> Reader<R> {
         crate::convert::convert(tensor, &raw, self.endian)
     }
 
-    /// Reads and converts only selected outermost row-major tensor slabs.
-    ///
-    /// GGUF stores its fastest-moving dimension first. Consequently the
-    /// outermost MLX dimension is the last GGUF dimension and each selected
-    /// item is one contiguous payload span, including for block-quantized
-    /// encodings.
-    pub fn read_tensor_outer(
-        &mut self,
-        tensor: &TensorDescriptor,
-        selection: &OuterSelection,
-    ) -> Result<ConvertedTensor> {
-        let outer = tensor
-            .dimensions
-            .last()
-            .copied()
-            .ok_or_else(|| Error::tensor(&tensor.name, "scalar outer selection is invalid"))?;
-        let outer = usize::try_from(outer).map_err(|_| Error::Overflow("outer dimension"))?;
-        if outer == 0 {
-            return Err(Error::tensor(
-                &tensor.name,
-                "empty tensor outer selection is invalid",
-            ));
-        }
-        let (selected_outer, spans) = match selection {
-            OuterSelection::Range { start, end } => {
-                if start >= end || *end > outer {
-                    return Err(Error::tensor(
-                        &tensor.name,
-                        format!("outer range {start}..{end} exceeds dimension {outer}"),
-                    ));
-                }
-                (*end - *start, vec![(*start, *end - *start)])
-            }
-            OuterSelection::Indices(indices) => {
-                if indices.is_empty() || indices.iter().any(|index| *index >= outer) {
-                    return Err(Error::tensor(
-                        &tensor.name,
-                        format!("outer indices {indices:?} exceed dimension {outer}"),
-                    ));
-                }
-                let mut spans = Vec::new();
-                for &index in indices {
-                    match spans.last_mut() {
-                        Some((start, count)) if *start + *count == index => *count += 1,
-                        _ => spans.push((index, 1)),
-                    }
-                }
-                (indices.len(), spans)
-            }
-        };
-        let outer_u64 = u64::try_from(outer).map_err(|_| Error::Overflow("outer dimension"))?;
-        if !tensor.byte_len.is_multiple_of(outer_u64) {
-            return Err(Error::tensor(
-                &tensor.name,
-                "payload is not divisible by its outer dimension",
-            ));
-        }
-        let slab_bytes = tensor.byte_len / outer_u64;
-        if slab_bytes == 0 {
-            return Err(Error::tensor(
-                &tensor.name,
-                "outer tensor slabs must contain payload bytes",
-            ));
-        }
-        let selected_bytes = slab_bytes
-            .checked_mul(
-                u64::try_from(selected_outer)
-                    .map_err(|_| Error::Overflow("selected outer dimension"))?,
-            )
-            .ok_or(Error::Overflow("selected tensor byte length"))?;
+    /// Execute a validated metadata-only physical selection plan.
+    pub fn read_tensor_plan(&mut self, plan: &TensorSelectionPlan) -> Result<ConvertedTensor> {
         check_limit(
             "tensor allocation",
-            selected_bytes,
+            plan.encoded_byte_len(),
             self.limits.max_allocation_bytes,
         )?;
-        let selected_len = usize::try_from(selected_bytes)
+        let selected_len = usize::try_from(plan.encoded_byte_len())
             .map_err(|_| Error::Overflow("selected tensor allocation"))?;
-        let slab_len =
-            usize::try_from(slab_bytes).map_err(|_| Error::Overflow("tensor slab allocation"))?;
         let mut raw = Vec::with_capacity(selected_len);
-        for (index, count) in spans {
-            let offset = tensor
-                .data_offset
-                .checked_add(
-                    slab_bytes
-                        .checked_mul(
-                            u64::try_from(index)
-                                .map_err(|_| Error::Overflow("outer selection offset"))?,
-                        )
-                        .ok_or(Error::Overflow("outer selection offset"))?,
-                )
-                .ok_or(Error::Overflow("outer selection offset"))?;
-            let span_len = slab_len
-                .checked_mul(count)
-                .ok_or(Error::Overflow("outer selection span allocation"))?;
+        for span in plan.encoded_spans() {
+            let span_len = usize::try_from(span.byte_len())
+                .map_err(|_| Error::Overflow("selection span allocation"))?;
             self.inner
-                .seek(SeekFrom::Start(offset))
-                .map_err(|source| Error::Io { offset, source })?;
+                .seek(SeekFrom::Start(span.offset()))
+                .map_err(|source| Error::Io {
+                    offset: span.offset(),
+                    source,
+                })?;
             let start = raw.len();
-            raw.resize(start + span_len, 0);
+            let end = start
+                .checked_add(span_len)
+                .ok_or(Error::Overflow("selected tensor allocation"))?;
+            raw.resize(end, 0);
             self.inner
-                .read_exact(&mut raw[start..])
-                .map_err(|source| Error::Io { offset, source })?;
+                .read_exact(&mut raw[start..end])
+                .map_err(|source| Error::Io {
+                    offset: span.offset(),
+                    source,
+                })?;
         }
-        let mut descriptor = tensor.clone();
-        *descriptor
-            .dimensions
-            .last_mut()
-            .expect("validated non-scalar tensor above") = u64::try_from(selected_outer)
-            .map_err(|_| Error::Overflow("selected outer dimension"))?;
-        descriptor.byte_len = selected_bytes;
-        crate::convert::convert(&descriptor, &raw, self.endian)
+        crate::convert::convert(plan.selected_descriptor(), &raw, self.endian)
     }
 }
 

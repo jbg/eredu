@@ -57,9 +57,10 @@ use crate::{
     runtime::checkpoint::store::{GgufWeightStore, TensorSelection, WeightStore},
     runtime::distributed::parallel::exact_parallel_division,
     runtime::execution::layerwise::{
-        load_layerwise_model, load_layerwise_model_with_store,
-        load_tensor_parallel_layerwise_model, ArchitectureAdapter, LayerExecutionLoadOptions,
-        LayerwiseForwardState, LayerwiseModel, StaticUnitBindings, WeightResidency,
+        load_layerwise_model, load_safetensors_layerwise_model,
+        load_tensor_parallel_layerwise_model, open_safetensors_weight_store, ArchitectureAdapter,
+        LayerExecutionLoadOptions, LayerwiseForwardState, LayerwiseModel, StaticUnitBindings,
+        WeightResidency,
     },
     runtime::residency::expert_cache::{
         ExpertCache, ExpertCacheLoadOptions, ExpertCacheReport, ExpertPass,
@@ -322,8 +323,8 @@ pub fn load_qwen3_vl_layerwise_model(
     weights_stream: &Stream,
 ) -> Result<Qwen3VlLayerwiseModel, Error> {
     let model_dir = model_dir.as_ref();
-    let args = resident::get_qwen3_vl_model_args(model_dir)?;
     let options = options.into();
+    let args = resident::get_qwen3_vl_model_args(model_dir)?;
     let residency = match options {
         LayerExecutionLoadOptions::LayerwiseHost(options) => {
             WeightResidency::LayerwiseHost(options)
@@ -344,7 +345,13 @@ pub fn load_qwen3_vl_layerwise_model(
     )?;
     let adapter = Qwen3VlLayerwiseAdapter::new(args, stream)?;
     Ok(Qwen3VlLayerwiseModel {
-        execution: load_layerwise_model(model_dir, adapter, options, stream, weights_stream)?,
+        execution: load_safetensors_layerwise_model(
+            model_dir,
+            adapter,
+            options,
+            stream,
+            weights_stream,
+        )?,
     })
 }
 
@@ -357,8 +364,28 @@ pub fn load_qwen3_vl_tensor_parallel_layerwise_model(
     weights_stream: &Stream,
 ) -> Result<Qwen3VlLayerwiseModel, Error> {
     let model_dir = model_dir.as_ref();
-    let args = resident::get_qwen3_vl_model_args(model_dir)?;
     let options = options.into();
+    if model_dir
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("gguf"))
+    {
+        let checkpoint = GgufCheckpoint::open(model_dir)?;
+        let metadata = crate::runtime::checkpoint::load::gguf_metadata(&checkpoint);
+        let vision_path = resident::find_qwen3_vl_mmproj(model_dir)?;
+        let vision_checkpoint = GgufCheckpoint::open(vision_path)?;
+        let vision_metadata = crate::runtime::checkpoint::load::gguf_metadata(&vision_checkpoint);
+        return load_qwen3_vl_gguf_tensor_parallel_model(
+            &checkpoint,
+            &metadata,
+            (&vision_checkpoint, &vision_metadata),
+            options,
+            build,
+            stream,
+            weights_stream,
+        )
+        .map(|(model, _)| model);
+    }
+    let args = resident::get_qwen3_vl_model_args(model_dir)?;
     let residency = match options {
         LayerExecutionLoadOptions::LayerwiseHost(options) => {
             WeightResidency::LayerwiseHost(options)
@@ -380,7 +407,7 @@ pub fn load_qwen3_vl_tensor_parallel_layerwise_model(
     let adapter = Qwen3VlLayerwiseAdapter::new(args, stream)?;
     Ok(Qwen3VlLayerwiseModel {
         execution: load_tensor_parallel_layerwise_model(
-            model_dir,
+            open_safetensors_weight_store(model_dir, options.max_mapped_shards())?,
             adapter,
             options,
             build,
@@ -388,6 +415,52 @@ pub fn load_qwen3_vl_tensor_parallel_layerwise_model(
             weights_stream,
         )?,
     })
+}
+
+pub(crate) fn load_qwen3_vl_gguf_tensor_parallel_model(
+    checkpoint: &GgufCheckpoint,
+    metadata: &HashMap<String, GgufMetadataValue>,
+    vision: (&GgufCheckpoint, &HashMap<String, GgufMetadataValue>),
+    options: LayerExecutionLoadOptions,
+    build: crate::runtime::distributed::parallel::ParallelBuildContext,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<(Qwen3VlLayerwiseModel, Vec<u32>), Error> {
+    let (vision_checkpoint, vision_metadata) = vision;
+    crate::runtime::execution::layerwise::validate_gguf_layerwise_source(
+        checkpoint, metadata, options,
+    )?;
+    let prepared = resident::prepare_qwen3_vl_gguf_checkpoint(
+        checkpoint,
+        metadata,
+        vision_checkpoint,
+        vision_metadata,
+    )?;
+    let deepstack = prepared.args.vision_config.deepstack_layers();
+    let store: Arc<dyn WeightStore + Send + Sync> = Arc::new(
+        GgufWeightStore::builder()
+            .max_cached_readers(options.max_mapped_shards())?
+            .add_checkpoint(checkpoint.clone(), |name| {
+                let name =
+                    crate::architectures::qwen::dense::translate_gguf_weight_name(name, false);
+                name.strip_prefix("model.")
+                    .map(|name| format!("model.language_model.{name}"))
+                    .unwrap_or(name)
+            })?
+            .add_checkpoint(vision_checkpoint.clone(), |name| {
+                resident::translate_qwen3_vl_mmproj_name(name, &deepstack)
+            })?
+            .build()?,
+    );
+    let execution = load_tensor_parallel_layerwise_model(
+        store,
+        Qwen3VlLayerwiseAdapter::new(prepared.args, stream)?,
+        options,
+        build,
+        stream,
+        weights_stream,
+    )?;
+    Ok((Qwen3VlLayerwiseModel { execution }, prepared.eos_token_ids))
 }
 
 pub(crate) fn load_qwen3_vl_gguf_layerwise_model(
@@ -424,10 +497,10 @@ pub(crate) fn load_qwen3_vl_gguf_layerwise_model(
     let adapter = Qwen3VlLayerwiseAdapter::new(prepared.args, stream)?;
     let execution = match residency {
         WeightResidency::LayerwiseHost(options) => {
-            load_layerwise_model_with_store(store, adapter, options, stream, weights_stream)?
+            load_layerwise_model(store, adapter, options, stream, weights_stream)?
         }
         WeightResidency::DenseDiskStream(options) => {
-            load_layerwise_model_with_store(store, adapter, options, stream, weights_stream)?
+            load_layerwise_model(store, adapter, options, stream, weights_stream)?
         }
         WeightResidency::SparseExpertCache(_)
         | WeightResidency::SparseExpertCacheWithDenseLayers(_) => {
@@ -500,7 +573,7 @@ fn load_qwen3_vl_sparse_expert_cache_model_with_non_expert(
     let mut adapter = Qwen3VlLayerwiseAdapter::new(args.clone(), stream)?;
     adapter.sparse_expert_cache = true;
     let mut execution =
-        load_layerwise_model(model_dir, adapter, non_expert, stream, weights_stream)?;
+        load_safetensors_layerwise_model(model_dir, adapter, non_expert, stream, weights_stream)?;
     let store = execution.weight_store_arc();
     let entries = crate::architectures::qwen::dense::layerwise::qwen3_expert_catalog_at(
         &args.text_config,
@@ -532,8 +605,7 @@ pub(crate) fn load_qwen3_vl_sparse_ep_base_with_store(
     }
     let mut adapter = Qwen3VlLayerwiseAdapter::new(args, stream)?;
     adapter.sparse_expert_cache = true;
-    let execution =
-        load_layerwise_model_with_store(store, adapter, non_expert, stream, weights_stream)?;
+    let execution = load_layerwise_model(store, adapter, non_expert, stream, weights_stream)?;
     Ok(Qwen3VlLayerwiseModel { execution })
 }
 

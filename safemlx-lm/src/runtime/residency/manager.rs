@@ -19,8 +19,8 @@ use safemlx::{transforms::eval, Array, DeviceType, Stream};
 use crate::{
     runtime::checkpoint::recipe::{DerivedWeightRecipe, WeightRecipeError},
     runtime::checkpoint::store::{
-        PendingWeightMaterialization, TensorSelection, WeightStore, WeightStoreDiagnostics,
-        WeightStoreError,
+        PendingWeightMaterialization, TensorSelection, WeightReadPolicy, WeightStore,
+        WeightStoreDiagnostics, WeightStoreError,
     },
     runtime::residency::policy::{
         CacheEvictionPolicy, MemoryTier, OffloadPlan, OffloadReport, OffloadTelemetry,
@@ -1455,15 +1455,27 @@ fn validate_unit_bytes(
             },
         )?;
         let actual = match &binding.recipe {
-            Some(recipe) => recipe
-                .infer(store)
-                .map_err(|source| ResidencyError::Recipe {
-                    binding: binding.name.clone(),
-                    source,
-                })?
-                .byte_len(),
+            Some(recipe) => {
+                recipe
+                    .preflight_bounded(store)
+                    .map_err(|source| ResidencyError::Recipe {
+                        binding: binding.name.clone(),
+                        source,
+                    })?;
+                recipe
+                    .infer(store)
+                    .map_err(|source| ResidencyError::Recipe {
+                        binding: binding.name.clone(),
+                        source,
+                    })?
+                    .byte_len()
+            }
             None => {
-                let lease = store.acquire(&binding.checkpoint_key, binding.selection.clone())?;
+                let lease = store.acquire_with_policy(
+                    &binding.checkpoint_key,
+                    binding.selection.clone(),
+                    WeightReadPolicy::RequireBounded,
+                )?;
                 u64::try_from(lease.selected_byte_len()).map_err(|_| {
                     ResidencyError::ArithmeticOverflow {
                         context: "selected binding byte conversion",
@@ -1885,8 +1897,11 @@ fn prepare_from_disk(
                     }
                 }
                 None => {
-                    let lease =
-                        store.acquire(&binding.checkpoint_key, binding.selection.clone())?;
+                    let lease = store.acquire_with_policy(
+                        &binding.checkpoint_key,
+                        binding.selection.clone(),
+                        WeightReadPolicy::RequireBounded,
+                    )?;
                     let pending = lease.prepare_materialization(source_stream, execution_stream)?;
                     let output = pending.output().clone();
                     Ok((output, vec![pending], None))

@@ -17,7 +17,7 @@ use safemlx::{
     error::Exception,
     module::{Module, ModuleParameters},
     nn,
-    ops::{quantized_packed_dimension, stack_axis},
+    ops::{quantized_packed_dimension, stack_axis, GgufCheckpoint, GgufMetadataValue},
     quantization::MaybeQuantized,
     transforms::eval,
     Array, Dtype, Stream,
@@ -44,15 +44,16 @@ use crate::{
     },
     runtime::checkpoint::load::StrictLoadConfig,
     runtime::checkpoint::quantization::{quantize_tensor, WeightQuantization},
-    runtime::checkpoint::store::{SafetensorsWeightStore, WeightStore},
+    runtime::checkpoint::store::{GgufWeightStore, WeightStore},
     runtime::distributed::parallel::{sample_and_synchronize, SynchronizedToken},
     runtime::distributed::topology::{
-        load_safetensors_partition_on_streams, ParallelTopology, PlacementPlan, RankPartition,
+        load_partition_from_store_on_streams, ParallelTopology, PlacementPlan, RankPartition,
         TensorPlacement,
     },
     runtime::execution::inspection::ActivationObserver,
     runtime::execution::layerwise::{
-        ArchitectureAdapter, DenseDiskStreamReport, DenseStreamController, WeightResidency,
+        open_safetensors_weight_store, ArchitectureAdapter, DenseDiskStreamReport,
+        DenseStreamController, SharedWeightStore, WeightResidency,
     },
     runtime::generation::sampler::Sampler,
     runtime::residency::manager::{OffloadUnit, ResidencyManager},
@@ -1089,13 +1090,13 @@ where
 }
 
 fn load_partition(
-    model_dir: &Path,
+    store: &dyn WeightStore,
     plan: &PlacementPlan,
     weights_stream: &Stream,
     stream: &Stream,
     config: &StrictLoadConfig,
 ) -> Result<RankPartition, Error> {
-    load_safetensors_partition_on_streams(model_dir, plan, weights_stream, stream, config)
+    load_partition_from_store_on_streams(store, plan, weights_stream, stream, config)
 }
 
 fn pipeline_load_config(
@@ -1111,7 +1112,7 @@ fn pipeline_load_config(
 
 #[allow(clippy::too_many_arguments)]
 fn build_pipeline_dense_layers<L, F, B>(
-    model_dir: &Path,
+    store: SharedWeightStore,
     range: Range<usize>,
     options: crate::runtime::residency::dense_stream::DenseDiskStreamLoadOptions,
     static_device_bytes: u64,
@@ -1145,10 +1146,6 @@ where
             options.host_lookahead
         )));
     }
-    let store = Arc::new(SafetensorsWeightStore::open_with_max_mapped_shards(
-        model_dir,
-        options.max_mapped_shards,
-    )?);
     let mut definitions = Vec::with_capacity(layer_count);
     let mut specs = Vec::with_capacity(layer_count);
     let mut units = Vec::with_capacity(layer_count);
@@ -1212,7 +1209,7 @@ where
     )?
     .with_eviction_policy(options.eviction_policy);
     let plan = OffloadPlan::new(config, specs)?;
-    let residency = ResidencyManager::new(
+    let residency = ResidencyManager::new_shared(
         store,
         plan,
         definitions,
@@ -1258,15 +1255,6 @@ pub fn load_pipeline_model_with_options(
     weights_stream: &Stream,
 ) -> Result<PipelineModel, Error> {
     let model_dir = model_dir.as_ref();
-    if model_dir
-        .extension()
-        .is_some_and(|extension| extension == "gguf")
-    {
-        return Err(Error::Parallel(
-            "pipeline GGUF loading is unsupported because bounded local-layer selection is not available; use safetensors"
-                .into(),
-        ));
-    }
     let topology = options.parallel.ok_or_else(|| {
         Error::Parallel("pipeline loading requires ModelLoadOptions::parallel".into())
     })?;
@@ -1288,12 +1276,80 @@ pub fn load_pipeline_model_with_options(
             ));
         }
     };
+    let max_mapped_shards = options.weight_residency.max_mapped_shards();
+
+    if model_dir
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("gguf"))
+    {
+        let checkpoint = GgufCheckpoint::open(model_dir)?;
+        let metadata = crate::runtime::checkpoint::load::gguf_metadata(&checkpoint);
+        let architecture = pipeline_gguf_architecture(&metadata)?;
+        crate::api::structural::validate_gguf(architecture, &checkpoint, &metadata, options)
+            .into_loader_result()?;
+        return match architecture {
+            crate::api::GgufArchitecture::Llama | crate::api::GgufArchitecture::Mistral => {
+                let prepared = llama::prepare_llama_gguf_checkpoint(
+                    &checkpoint,
+                    &metadata,
+                    None,
+                    weights_stream,
+                )?;
+                let store: SharedWeightStore = Arc::new(
+                    GgufWeightStore::new_with_max_mapped_shards(
+                        checkpoint,
+                        llama::translate_gguf_weight_name,
+                        max_mapped_shards,
+                    )?,
+                );
+                load_llama_pipeline(
+                    prepared.args,
+                    store,
+                    topology,
+                    options.quantization,
+                    dense_stream,
+                    stream,
+                    weights_stream,
+                )
+            }
+            crate::api::GgufArchitecture::DeepSeek2 => {
+                let prepared = deepseek_v3::prepare_gguf_checkpoint(
+                    &checkpoint,
+                    &metadata,
+                    None,
+                    weights_stream,
+                )?;
+                let store: SharedWeightStore = Arc::new(
+                    GgufWeightStore::new_with_max_mapped_shards(
+                        checkpoint,
+                        deepseek_v3::translate_gguf_weight_name,
+                        max_mapped_shards,
+                    )?,
+                );
+                load_deepseek_pipeline(
+                    prepared.args,
+                    store,
+                    topology,
+                    options.quantization,
+                    dense_stream,
+                    stream,
+                    weights_stream,
+                )
+            }
+            architecture => Err(Error::UnsupportedArchitecture(format!(
+                "pipeline execution supports Llama-compatible and DeepSeek-V3/R1 text models, not GGUF architecture {}",
+                architecture.metadata_name()
+            ))),
+        };
+    }
 
     let config: serde_json::Value =
         serde_json::from_reader(std::fs::File::open(model_dir.join("config.json"))?)?;
+    let store = open_safetensors_weight_store(model_dir, max_mapped_shards)?;
     match config.get("model_type").and_then(serde_json::Value::as_str) {
         Some("llama" | "mistral") => load_llama_pipeline(
-            model_dir,
+            llama::get_llama_model_args(model_dir)?,
+            store,
             topology,
             options.quantization,
             dense_stream,
@@ -1301,7 +1357,8 @@ pub fn load_pipeline_model_with_options(
             weights_stream,
         ),
         Some("deepseek_v3") => load_deepseek_pipeline(
-            model_dir,
+            deepseek_v3::get_model_args(model_dir)?,
+            store,
             topology,
             options.quantization,
             dense_stream,
@@ -1317,8 +1374,28 @@ pub fn load_pipeline_model_with_options(
     }
 }
 
+fn pipeline_gguf_architecture(
+    metadata: &HashMap<String, GgufMetadataValue>,
+) -> Result<crate::api::GgufArchitecture, Error> {
+    let architecture = match metadata.get("general.architecture") {
+        Some(GgufMetadataValue::String(architecture)) => architecture,
+        Some(_) => {
+            return Err(Error::UnsupportedArchitecture(
+                "GGUF metadata key general.architecture has the wrong type".into(),
+            ));
+        }
+        None => {
+            return Err(Error::UnsupportedArchitecture(
+                "GGUF metadata is missing general.architecture".into(),
+            ));
+        }
+    };
+    crate::api::GgufArchitecture::resolve(architecture)
+}
+
 fn load_llama_pipeline(
-    model_dir: &Path,
+    source_args: llama::ModelArgs,
+    store: SharedWeightStore,
     topology: ParallelTopology,
     requested_quantization: Option<WeightQuantization>,
     dense_stream: Option<crate::runtime::residency::dense_stream::DenseDiskStreamLoadOptions>,
@@ -1331,7 +1408,6 @@ fn load_llama_pipeline(
                 .into(),
         ));
     }
-    let source_args = llama::get_llama_model_args(model_dir)?;
     let quantize_on_load = requested_quantization
         .map(|requested| {
             crate::runtime::checkpoint::quantization::should_quantize_on_load(
@@ -1397,7 +1473,7 @@ fn load_llama_pipeline(
         insert_module_plan(&mut plan, &head, "lm_head", info.is_last);
     }
     let strict = pipeline_load_config(dense_stream, StrictLoadConfig::default());
-    let partition = load_partition(model_dir, &plan, weights_stream, stream, &strict)?;
+    let partition = load_partition(store.as_ref(), &plan, weights_stream, stream, &strict)?;
     info.activation_dtype = infer_activation_dtype(&partition);
     info.local_parameter_bytes = partition.tensors().map(|(_, value)| value.nbytes()).sum();
     let static_device_bytes = u64::try_from(info.local_parameter_bytes)
@@ -1419,7 +1495,7 @@ fn load_llama_pipeline(
     )?;
     if let Some(dense_stream) = dense_stream {
         stage.dense_layers = Some(build_pipeline_dense_layers(
-            model_dir,
+            Arc::clone(&store),
             stage.range.clone(),
             dense_stream,
             static_device_bytes,
@@ -1757,7 +1833,8 @@ impl LlamaStage {
 }
 
 fn load_deepseek_pipeline(
-    model_dir: &Path,
+    source_args: deepseek_v3::ModelArgs,
+    store: SharedWeightStore,
     topology: ParallelTopology,
     requested_quantization: Option<WeightQuantization>,
     dense_stream: Option<crate::runtime::residency::dense_stream::DenseDiskStreamLoadOptions>,
@@ -1770,7 +1847,6 @@ fn load_deepseek_pipeline(
                 .into(),
         ));
     }
-    let source_args = deepseek_v3::get_model_args(model_dir)?;
     if requested_quantization.is_some() && source_args.native_fp8_config().is_some() {
         return Err(Error::Quantization(
             "native DeepSeek block-FP8 pipeline weights cannot be implicitly requantized".into(),
@@ -1849,7 +1925,7 @@ fn load_deepseek_pipeline(
         ));
     }
     strict = pipeline_load_config(dense_stream, strict);
-    let partition = load_partition(model_dir, &plan, weights_stream, stream, &strict)?;
+    let partition = load_partition(store.as_ref(), &plan, weights_stream, stream, &strict)?;
     info.activation_dtype = infer_activation_dtype(&partition);
     info.local_parameter_bytes = partition.tensors().map(|(_, value)| value.nbytes()).sum();
     let static_device_bytes = u64::try_from(info.local_parameter_bytes)
@@ -1875,7 +1951,7 @@ fn load_deepseek_pipeline(
                 stream,
             )?;
         stage.dense_layers = Some(build_pipeline_dense_layers(
-            model_dir,
+            Arc::clone(&store),
             stage.range.clone(),
             dense_stream,
             static_device_bytes,
@@ -2326,7 +2402,7 @@ pub fn forward_stage_with_observer(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runtime::distributed::topology::DeviceAssignment;
+    use crate::{runtime::distributed::topology::DeviceAssignment, test_utils::SyntheticGguf};
     use safemlx::{module::Param, ops::ones_dtype, Device, DeviceType, ExecutionContext};
     use std::fs;
 
@@ -2512,6 +2588,146 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
+    }
+
+    fn llama_gguf_fixture(model: &llama::ResidentModel) -> SyntheticGguf {
+        let arrays = model
+            .parameters()
+            .flatten()
+            .into_iter()
+            .map(|(name, value)| {
+                let canonical =
+                    crate::runtime::checkpoint::binding::canonical_checkpoint_name(&name);
+                let gguf = match canonical.as_str() {
+                    "model.embed_tokens.weight" => "token_embd.weight".into(),
+                    "model.norm.weight" => "output_norm.weight".into(),
+                    name => name
+                        .replace("model.layers.", "blk.")
+                        .replace(".input_layernorm.", ".attn_norm.")
+                        .replace(".post_attention_layernorm.", ".ffn_norm.")
+                        .replace(".self_attn.q_proj.", ".attn_q.")
+                        .replace(".self_attn.k_proj.", ".attn_k.")
+                        .replace(".self_attn.v_proj.", ".attn_v.")
+                        .replace(".self_attn.o_proj.", ".attn_output.")
+                        .replace(".mlp.gate_proj.", ".ffn_gate.")
+                        .replace(".mlp.up_proj.", ".ffn_up.")
+                        .replace(".mlp.down_proj.", ".ffn_down."),
+                };
+                (gguf, value.clone())
+            })
+            .collect::<HashMap<_, _>>();
+        let metadata = HashMap::from([
+            (
+                "general.architecture".into(),
+                GgufMetadataValue::String("llama".into()),
+            ),
+            ("general.file_type".into(), GgufMetadataValue::Uint32(0)),
+            ("llama.block_count".into(), GgufMetadataValue::Uint32(2)),
+            (
+                "llama.embedding_length".into(),
+                GgufMetadataValue::Uint32(8),
+            ),
+            (
+                "llama.attention.head_count".into(),
+                GgufMetadataValue::Uint32(2),
+            ),
+            (
+                "llama.attention.head_count_kv".into(),
+                GgufMetadataValue::Uint32(2),
+            ),
+            (
+                "llama.attention.key_length".into(),
+                GgufMetadataValue::Uint32(4),
+            ),
+            (
+                "llama.feed_forward_length".into(),
+                GgufMetadataValue::Uint32(16),
+            ),
+            (
+                "llama.attention.layer_norm_rms_epsilon".into(),
+                GgufMetadataValue::Float32(1e-5),
+            ),
+            ("llama.context_length".into(), GgufMetadataValue::Uint32(64)),
+            ("llama.vocab_size".into(), GgufMetadataValue::Uint32(16)),
+        ]);
+        SyntheticGguf::dense(&arrays, &metadata)
+    }
+
+    #[test]
+    fn llama_gguf_pipeline_two_rank_outputs_and_caches_match_resident_model() {
+        let gpu = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
+        let cpu = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        let stream = gpu.stream();
+        let mut source = llama::ResidentModel::new(llama_args(true), stream).unwrap();
+        initialize_parameters(&mut source, stream);
+        let fixture = llama_gguf_fixture(&source);
+        let mut reference = llama::load_llama_gguf(fixture.path(), stream, cpu.stream()).unwrap();
+        let mut first = load_pipeline_model_with_options(
+            fixture.path(),
+            ModelLoadOptions::with_parallel(gpu_topology(0)),
+            stream,
+            cpu.stream(),
+        )
+        .unwrap();
+        let mut last = load_pipeline_model_with_options(
+            fixture.path(),
+            ModelLoadOptions::with_parallel(gpu_topology(1)),
+            stream,
+            cpu.stream(),
+        )
+        .unwrap();
+        assert_eq!(first.stage_info().global_layer_range, 0..1);
+        assert_eq!(last.stage_info().global_layer_range, 1..2);
+
+        let mut reference_cache = reference.new_cache();
+        let mut first_cache = first.new_cache();
+        let mut last_cache = last.new_cache();
+        for tokens in [
+            Array::from_slice(&[1u32, 2], &[1, 2]),
+            Array::from_slice(&[3u32], &[1, 1]),
+        ] {
+            let expected = reference
+                .forward(
+                    llama::ModelInput {
+                        inputs: &tokens,
+                        mask: None,
+                        cache: &mut reference_cache,
+                    },
+                    stream,
+                )
+                .unwrap();
+            let step = PipelineStep::new(1, tokens.shape()[1]).unwrap();
+            let hidden = match first
+                .forward_stage(
+                    PipelineStageInput::Tokens(&tokens),
+                    step,
+                    None,
+                    &mut first_cache,
+                    stream,
+                )
+                .unwrap()
+            {
+                PipelineStageOutput::Hidden(hidden) => hidden,
+                PipelineStageOutput::Logits(_) => panic!("first stage produced logits"),
+            };
+            let actual = match last
+                .forward_stage(
+                    PipelineStageInput::Hidden(&hidden),
+                    step,
+                    None,
+                    &mut last_cache,
+                    stream,
+                )
+                .unwrap()
+            {
+                PipelineStageOutput::Logits(logits) => logits,
+                PipelineStageOutput::Hidden(_) => panic!("last stage produced hidden state"),
+            };
+            assert_close(&actual, &expected);
+        }
+        assert_eq!(reference_cache[0].as_ref().unwrap().offset(), 3);
+        assert_eq!(first_cache.global_layers(), [0]);
+        assert_eq!(last_cache.global_layers(), [1]);
     }
 
     fn llama_pipeline_dense_requirements(

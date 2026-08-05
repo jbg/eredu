@@ -1,6 +1,7 @@
 #![cfg(unix)]
 
 use std::{
+    collections::BTreeMap,
     net::TcpListener,
     path::{Path, PathBuf},
     process::{Child, Command, Output, Stdio},
@@ -11,9 +12,11 @@ use std::{
 use safemlx::{
     distributed::{self, Backend},
     module::ModuleParameters,
+    ops::GgufMetadataValue,
     random::{self, RandomState},
     Array, Device, DeviceType, ExecutionContext, Stream,
 };
+use safemlx_gguf::{GgmlType, TensorInput, Writer};
 use safemlx_lm::{
     architectures::{
         deepseek_v3::{
@@ -193,11 +196,21 @@ fn tensor_ring_worker() {
     };
     let expected_rank: usize = rank.to_string_lossy().parse().unwrap();
     let checkpoint = PathBuf::from(std::env::var_os(CHECKPOINT_DIR).unwrap());
-    let config: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(checkpoint.join("config.json")).unwrap()).unwrap();
-    let deepseek = config["model_type"] == "deepseek_v3";
-    let layer_count = config["num_hidden_layers"].as_u64().unwrap() as usize;
-    let vocab_size = config["vocab_size"].as_u64().unwrap() as usize;
+    let (deepseek, layer_count, vocab_size) = if checkpoint
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("gguf"))
+    {
+        (false, 1, 5)
+    } else {
+        let config: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(checkpoint.join("config.json")).unwrap())
+                .unwrap();
+        (
+            config["model_type"] == "deepseek_v3",
+            config["num_hidden_layers"].as_u64().unwrap() as usize,
+            config["vocab_size"].as_u64().unwrap() as usize,
+        )
+    };
     let prompt_cache_root = PathBuf::from(std::env::var_os(PROMPT_CACHE_ROOT).unwrap());
     let group = distributed::init(true, Backend::Ring).unwrap();
     let topology =
@@ -359,6 +372,78 @@ fn write_fixture(directory: &Path) {
     .unwrap();
 }
 
+fn write_gguf_fixture(path: &Path) {
+    let metadata = BTreeMap::from([
+        (
+            "general.architecture".into(),
+            GgufMetadataValue::String("llama".into()),
+        ),
+        ("general.file_type".into(), GgufMetadataValue::Uint32(0)),
+        ("llama.block_count".into(), GgufMetadataValue::Uint32(1)),
+        (
+            "llama.embedding_length".into(),
+            GgufMetadataValue::Uint32(4),
+        ),
+        (
+            "llama.attention.head_count".into(),
+            GgufMetadataValue::Uint32(2),
+        ),
+        (
+            "llama.attention.head_count_kv".into(),
+            GgufMetadataValue::Uint32(2),
+        ),
+        (
+            "llama.attention.key_length".into(),
+            GgufMetadataValue::Uint32(2),
+        ),
+        (
+            "llama.feed_forward_length".into(),
+            GgufMetadataValue::Uint32(4),
+        ),
+        (
+            "llama.attention.layer_norm_rms_epsilon".into(),
+            GgufMetadataValue::Float32(0.00001),
+        ),
+        ("llama.context_length".into(), GgufMetadataValue::Uint32(32)),
+        ("llama.vocab_size".into(), GgufMetadataValue::Uint32(5)),
+    ]);
+    let specs = [
+        ("token_embd.weight", vec![4, 5], 0.01f32),
+        ("blk.0.attn_q.weight", vec![4, 4], 0.01),
+        ("blk.0.attn_k.weight", vec![4, 4], 0.01),
+        ("blk.0.attn_v.weight", vec![4, 4], 0.01),
+        ("blk.0.attn_output.weight", vec![4, 4], 0.01),
+        ("blk.0.ffn_gate.weight", vec![4, 4], 0.01),
+        ("blk.0.ffn_up.weight", vec![4, 4], 0.01),
+        ("blk.0.ffn_down.weight", vec![4, 4], 0.01),
+        ("blk.0.attn_norm.weight", vec![4], 1.0),
+        ("blk.0.ffn_norm.weight", vec![4], 1.0),
+        ("output_norm.weight", vec![4], 1.0),
+        ("output.weight", vec![4, 5], 0.01),
+    ];
+    let payloads = specs
+        .iter()
+        .map(|(_, dimensions, value)| {
+            (0..dimensions.iter().product::<u64>())
+                .flat_map(|_| value.to_le_bytes())
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    let tensors = specs
+        .iter()
+        .zip(&payloads)
+        .map(|((name, dimensions, _), data)| TensorInput {
+            name,
+            dimensions,
+            ggml_type: GgmlType::F32,
+            data,
+        })
+        .collect::<Vec<_>>();
+    Writer::default()
+        .write(std::fs::File::create(path).unwrap(), &metadata, &tensors)
+        .unwrap();
+}
+
 fn write_deepseek_fixture(directory: &Path, layers: i32) {
     let config = serde_json::json!({
         "model_type": "deepseek_v3",
@@ -466,24 +551,37 @@ fn render_failure(rank: usize, output: &Output) -> String {
 #[test]
 #[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
 fn ring_two_process_tensor_parallel() {
-    run_ring_tensor_parallel(false);
+    run_ring_tensor_parallel(false, false);
+}
+
+/// Verifies bounded GGUF reads through the same two-rank generalized engine.
+#[test]
+#[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
+fn ring_two_process_gguf_tensor_parallel() {
+    run_ring_tensor_parallel(false, true);
 }
 
 /// Verifies DeepSeek MLA paged-prefix persistence across two tensor ranks.
 #[test]
 #[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
 fn ring_two_process_deepseek_tensor_parallel_persistence() {
-    run_ring_tensor_parallel(true);
+    run_ring_tensor_parallel(true, false);
 }
 
-fn run_ring_tensor_parallel(deepseek: bool) {
+fn run_ring_tensor_parallel(deepseek: bool, gguf: bool) {
     assert!(distributed::is_available(Backend::Ring));
     let checkpoint = tempfile::tempdir().unwrap();
-    if deepseek {
+    let checkpoint_path = if gguf {
+        let path = checkpoint.path().join("model.gguf");
+        write_gguf_fixture(&path);
+        path
+    } else if deepseek {
         write_deepseek_fixture(checkpoint.path(), 1);
+        checkpoint.path().to_path_buf()
     } else {
         write_fixture(checkpoint.path());
-    }
+        checkpoint.path().to_path_buf()
+    };
     let prompt_cache = tempfile::tempdir().unwrap();
     let (first_socket, second_socket, first_port, second_port) = reserve_two_ports();
     let ring = tempfile::tempdir().unwrap();
@@ -506,7 +604,7 @@ fn run_ring_tensor_parallel(deepseek: bool) {
             Command::new(&executable)
                 .args(["--exact", "tensor_ring_worker", "--nocapture"])
                 .env(WORKER_RANK, rank.to_string())
-                .env(CHECKPOINT_DIR, checkpoint.path())
+                .env(CHECKPOINT_DIR, &checkpoint_path)
                 .env(PROMPT_CACHE_ROOT, prompt_cache.path())
                 .env("MLX_RANK", rank.to_string())
                 .env("MLX_HOSTFILE", &hostfile)

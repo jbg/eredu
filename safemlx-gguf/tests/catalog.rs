@@ -1,6 +1,6 @@
 use safemlx_gguf::{
     Checkpoint, ConvertedTensor, Endian, Error, GgmlType, LogicalDtype, MetadataValue,
-    OuterSelection, TensorInput, Writer, WriterOptions,
+    TensorDescriptor, TensorInput, TensorSelection, TensorSelectionPlan, Writer, WriterOptions,
 };
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -36,7 +36,14 @@ fn selects_dense_outer_ranges_and_reordered_indices_without_full_conversion() {
     let checkpoint = Checkpoint::open(path).unwrap();
     let mut materializer = checkpoint.materializer();
     let range = materializer
-        .converted_tensor_outer("matrix.weight", &OuterSelection::Range { start: 1, end: 3 })
+        .converted_tensor_selected(
+            "matrix.weight",
+            &TensorSelection::Range {
+                axis: 0,
+                start: 1,
+                end: 3,
+            },
+        )
         .unwrap();
     let ConvertedTensor::Dense(range) = range.converted() else {
         panic!("expected dense selection");
@@ -45,7 +52,13 @@ fn selects_dense_outer_ranges_and_reordered_indices_without_full_conversion() {
     assert_eq!(range.data, bytes[12..36]);
 
     let reordered = materializer
-        .converted_tensor_outer("matrix.weight", &OuterSelection::Indices(vec![3, 0, 2]))
+        .converted_tensor_selected(
+            "matrix.weight",
+            &TensorSelection::Indices {
+                axis: 0,
+                indices: vec![3, 0, 2],
+            },
+        )
         .unwrap();
     let ConvertedTensor::Dense(reordered) = reordered.converted() else {
         panic!("expected dense selection");
@@ -83,7 +96,13 @@ fn selects_affine_outer_rows_equal_to_slicing_the_converted_group() {
     let mut materializer = checkpoint.materializer();
     let full = materializer.converted_tensor("experts.weight").unwrap();
     let selected = materializer
-        .converted_tensor_outer("experts.weight", &OuterSelection::Indices(vec![1]))
+        .converted_tensor_selected(
+            "experts.weight",
+            &TensorSelection::Indices {
+                axis: 0,
+                indices: vec![1],
+            },
+        )
         .unwrap();
     let ConvertedTensor::Affine(full) = full.converted() else {
         panic!("expected affine tensor");
@@ -99,7 +118,340 @@ fn selects_affine_outer_rows_equal_to_slicing_the_converted_group() {
 }
 
 #[test]
-fn rejects_invalid_outer_selections() {
+fn plans_and_reads_dense_inner_axis_ranges_as_strided_spans() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("selected-inner.gguf");
+    let values = (0..12).map(|value| value as f32).collect::<Vec<_>>();
+    let bytes = values
+        .iter()
+        .flat_map(|value| value.to_le_bytes())
+        .collect::<Vec<_>>();
+    write_file(
+        &path,
+        None,
+        "selected inner",
+        &[FixtureTensor {
+            name: "matrix.weight",
+            dimensions: &[3, 4],
+            ty: GgmlType::F32,
+            data: &bytes,
+        }],
+    );
+
+    let checkpoint = Checkpoint::open(path).unwrap();
+    let descriptor = checkpoint.shards()[0].tensors()[0].descriptor();
+    let selection = TensorSelection::Range {
+        axis: 1,
+        start: 1,
+        end: 3,
+    };
+    let plan = TensorSelectionPlan::new(descriptor, selection.clone()).unwrap();
+    assert_eq!(plan.logical_axis(), 1);
+    assert_eq!(plan.gguf_dimension(), 0);
+    assert_eq!(plan.alignment().block_values(), 1);
+    assert_eq!(plan.alignment().block_bytes(), 4);
+    assert_eq!(plan.alignment().selected_axis_multiple(), 1);
+    assert_eq!(plan.selected_descriptor().mlx_shape(), [4, 2]);
+    assert_eq!(plan.encoded_byte_len(), 32);
+    let spans = plan.encoded_spans().collect::<Vec<_>>();
+    assert_eq!(spans.len(), 4);
+    assert_eq!(spans[0].offset(), descriptor.data_offset + 4);
+    assert_eq!(spans[0].byte_len(), 8);
+    assert_eq!(spans[3].offset(), descriptor.data_offset + 40);
+
+    let selected = checkpoint
+        .materializer()
+        .converted_tensor_selected("matrix.weight", &selection)
+        .unwrap();
+    let ConvertedTensor::Dense(selected) = selected.converted() else {
+        panic!("expected dense selection");
+    };
+    assert_eq!(selected.shape, [4, 2]);
+    let selected = selected
+        .data
+        .chunks_exact(4)
+        .map(|bytes| f32::from_ne_bytes(bytes.try_into().unwrap()))
+        .collect::<Vec<_>>();
+    assert_eq!(selected, [1.0, 2.0, 4.0, 5.0, 7.0, 8.0, 10.0, 11.0]);
+}
+
+#[test]
+fn reads_reordered_dense_indices_on_an_intermediate_axis() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("selected-intermediate.gguf");
+    let values = (0..12).map(|value| value as f32).collect::<Vec<_>>();
+    let bytes = values
+        .iter()
+        .flat_map(|value| value.to_le_bytes())
+        .collect::<Vec<_>>();
+    write_file(
+        &path,
+        None,
+        "selected intermediate",
+        &[FixtureTensor {
+            name: "bank.weight",
+            dimensions: &[2, 3, 2],
+            ty: GgmlType::F32,
+            data: &bytes,
+        }],
+    );
+
+    let checkpoint = Checkpoint::open(path).unwrap();
+    let selection = TensorSelection::Indices {
+        axis: 1,
+        indices: vec![2, 0],
+    };
+    let descriptor = checkpoint.shards()[0].tensors()[0].descriptor();
+    let plan = TensorSelectionPlan::new(descriptor, selection.clone()).unwrap();
+    assert_eq!(plan.gguf_dimension(), 1);
+    assert_eq!(plan.selected_descriptor().mlx_shape(), [2, 2, 2]);
+    assert_eq!(plan.encoded_spans().count(), 4);
+
+    let selected = checkpoint
+        .materializer()
+        .converted_tensor_selected("bank.weight", &selection)
+        .unwrap();
+    let ConvertedTensor::Dense(selected) = selected.converted() else {
+        panic!("expected dense selection");
+    };
+    assert_eq!(selected.shape, [2, 2, 2]);
+    let selected = selected
+        .data
+        .chunks_exact(4)
+        .map(|bytes| f32::from_ne_bytes(bytes.try_into().unwrap()))
+        .collect::<Vec<_>>();
+    assert_eq!(selected, [4.0, 5.0, 0.0, 1.0, 10.0, 11.0, 6.0, 7.0]);
+}
+
+#[test]
+fn reads_block_aligned_affine_inner_ranges_without_other_blocks() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("selected-affine-inner.gguf");
+    let blocks = [[0x00u8; 18], [0x11u8; 18], [0x22u8; 18], [0x33u8; 18]];
+    let bytes = blocks.into_iter().flatten().collect::<Vec<_>>();
+    write_file(
+        &path,
+        None,
+        "selected affine inner",
+        &[FixtureTensor {
+            name: "matrix.weight",
+            dimensions: &[64, 2],
+            ty: GgmlType::Q4_0,
+            data: &bytes,
+        }],
+    );
+
+    let checkpoint = Checkpoint::open(path).unwrap();
+    let mut materializer = checkpoint.materializer();
+    let full = materializer.converted_tensor("matrix.weight").unwrap();
+    let selection = TensorSelection::Range {
+        axis: 1,
+        start: 32,
+        end: 64,
+    };
+    let descriptor = checkpoint.shards()[0].tensors()[0].descriptor();
+    let plan = TensorSelectionPlan::new(descriptor, selection.clone()).unwrap();
+    assert_eq!(plan.alignment().selected_axis_multiple(), 32);
+    assert_eq!(plan.encoded_byte_len(), 36);
+    assert_eq!(plan.encoded_spans().count(), 2);
+
+    let selected = materializer
+        .converted_tensor_selected("matrix.weight", &selection)
+        .unwrap();
+    let ConvertedTensor::Affine(full) = full.converted() else {
+        panic!("expected affine tensor");
+    };
+    let ConvertedTensor::Affine(selected) = selected.converted() else {
+        panic!("expected affine tensor");
+    };
+    assert_eq!(selected.weight_shape, [2, 4]);
+    assert_eq!(selected.scale_shape, [2, 1]);
+    assert_eq!(
+        selected.weights,
+        [full.weights[4..8].to_vec(), full.weights[12..16].to_vec()].concat()
+    );
+    assert_eq!(selected.scales, [full.scales[1], full.scales[3]]);
+    assert_eq!(selected.biases, [full.biases[1], full.biases[3]]);
+}
+
+#[test]
+fn reads_reordered_complete_quantization_blocks() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("selected-affine-blocks.gguf");
+    let blocks = [[0x00u8; 18], [0x11u8; 18], [0x22u8; 18], [0x33u8; 18]];
+    let bytes = blocks.into_iter().flatten().collect::<Vec<_>>();
+    write_file(
+        &path,
+        None,
+        "selected affine blocks",
+        &[FixtureTensor {
+            name: "matrix.weight",
+            dimensions: &[64, 2],
+            ty: GgmlType::Q4_0,
+            data: &bytes,
+        }],
+    );
+
+    let checkpoint = Checkpoint::open(path).unwrap();
+    let mut materializer = checkpoint.materializer();
+    let full = materializer.converted_tensor("matrix.weight").unwrap();
+    let indices = (32..64).chain(0..32).collect::<Vec<_>>();
+    let selected = materializer
+        .converted_tensor_selected(
+            "matrix.weight",
+            &TensorSelection::Indices { axis: 1, indices },
+        )
+        .unwrap();
+    let ConvertedTensor::Affine(full) = full.converted() else {
+        panic!("expected affine tensor");
+    };
+    let ConvertedTensor::Affine(selected) = selected.converted() else {
+        panic!("expected affine tensor");
+    };
+    assert_eq!(selected.weight_shape, [2, 8]);
+    assert_eq!(selected.scale_shape, [2, 2]);
+    assert_eq!(
+        selected.weights,
+        [
+            full.weights[4..8].to_vec(),
+            full.weights[0..4].to_vec(),
+            full.weights[12..16].to_vec(),
+            full.weights[8..12].to_vec(),
+        ]
+        .concat()
+    );
+    assert_eq!(
+        selected.scales,
+        [
+            full.scales[1],
+            full.scales[0],
+            full.scales[3],
+            full.scales[2],
+        ]
+    );
+    assert_eq!(
+        selected.biases,
+        [
+            full.biases[1],
+            full.biases[0],
+            full.biases[3],
+            full.biases[2],
+        ]
+    );
+}
+
+#[test]
+fn every_block_encoding_exposes_its_inner_axis_alignment() {
+    let encodings = [
+        GgmlType::Q4_0,
+        GgmlType::Q4_1,
+        GgmlType::Q5_0,
+        GgmlType::Q5_1,
+        GgmlType::Q8_0,
+        GgmlType::Q2K,
+        GgmlType::Q3K,
+        GgmlType::Q4K,
+        GgmlType::Q5K,
+        GgmlType::Q6K,
+        GgmlType::IQ2XXS,
+        GgmlType::IQ2XS,
+        GgmlType::IQ3XXS,
+        GgmlType::IQ1S,
+        GgmlType::IQ4NL,
+        GgmlType::IQ3S,
+        GgmlType::IQ2S,
+        GgmlType::IQ4XS,
+        GgmlType::IQ1M,
+        GgmlType::MxFp4,
+    ];
+    for encoding in encodings {
+        let (block_values, block_bytes) = encoding.block_and_bytes().unwrap();
+        let descriptor = TensorDescriptor {
+            name: format!("{encoding:?}"),
+            dimensions: vec![block_values * 2, 3],
+            ggml_type: encoding,
+            relative_offset: 0,
+            data_offset: 4096,
+            byte_len: block_bytes * 6,
+        };
+        let plan = TensorSelectionPlan::new(
+            &descriptor,
+            TensorSelection::Range {
+                axis: 1,
+                start: block_values as usize,
+                end: (block_values * 2) as usize,
+            },
+        )
+        .unwrap();
+        assert_eq!(plan.alignment().block_values(), block_values);
+        assert_eq!(plan.alignment().block_bytes(), block_bytes);
+        assert_eq!(plan.alignment().selected_axis_multiple(), block_values);
+        assert_eq!(plan.encoded_byte_len(), block_bytes * 3);
+        assert_eq!(plan.encoded_spans().count(), 3);
+    }
+}
+
+#[test]
+fn rejects_partial_or_scrambled_native_blocks() {
+    let descriptor = TensorDescriptor {
+        name: "quant.weight".into(),
+        dimensions: vec![64, 2],
+        ggml_type: GgmlType::Q4_0,
+        relative_offset: 0,
+        data_offset: 1024,
+        byte_len: 72,
+    };
+    assert!(TensorSelectionPlan::new(
+        &descriptor,
+        TensorSelection::Range {
+            axis: 1,
+            start: 1,
+            end: 33,
+        },
+    )
+    .is_err());
+    assert!(TensorSelectionPlan::new(
+        &descriptor,
+        TensorSelection::Indices {
+            axis: 1,
+            indices: (1..33).collect(),
+        },
+    )
+    .is_err());
+    let mut scrambled = (0..32).collect::<Vec<_>>();
+    scrambled.swap(0, 1);
+    assert!(TensorSelectionPlan::new(
+        &descriptor,
+        TensorSelection::Indices {
+            axis: 1,
+            indices: scrambled,
+        },
+    )
+    .is_err());
+    let mut malformed = descriptor.clone();
+    malformed.byte_len -= 1;
+    assert!(TensorSelectionPlan::new(
+        &malformed,
+        TensorSelection::Range {
+            axis: 0,
+            start: 0,
+            end: 1,
+        },
+    )
+    .is_err());
+    assert!(TensorSelectionPlan::new(
+        &descriptor,
+        TensorSelection::Range {
+            axis: 2,
+            start: 0,
+            end: 1,
+        },
+    )
+    .is_err());
+}
+
+#[test]
+fn rejects_invalid_selections() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("invalid-selection.gguf");
     let bytes = [0u8; 16];
@@ -117,13 +469,32 @@ fn rejects_invalid_outer_selections() {
     let checkpoint = Checkpoint::open(path).unwrap();
     let mut materializer = checkpoint.materializer();
     assert!(materializer
-        .converted_tensor_outer("matrix.weight", &OuterSelection::Range { start: 2, end: 1 },)
+        .converted_tensor_selected(
+            "matrix.weight",
+            &TensorSelection::Range {
+                axis: 0,
+                start: 2,
+                end: 1,
+            },
+        )
         .is_err());
     assert!(materializer
-        .converted_tensor_outer("matrix.weight", &OuterSelection::Indices(vec![]))
+        .converted_tensor_selected(
+            "matrix.weight",
+            &TensorSelection::Indices {
+                axis: 0,
+                indices: vec![],
+            },
+        )
         .is_err());
     assert!(materializer
-        .converted_tensor_outer("matrix.weight", &OuterSelection::Indices(vec![2]))
+        .converted_tensor_selected(
+            "matrix.weight",
+            &TensorSelection::Indices {
+                axis: 0,
+                indices: vec![2],
+            },
+        )
         .is_err());
 }
 
@@ -201,7 +572,14 @@ fn selects_from_a_big_endian_tensor_in_a_noninitial_shard() {
     let checkpoint = Checkpoint::open(first).unwrap();
     let selected = checkpoint
         .materializer()
-        .converted_tensor_outer("second.weight", &OuterSelection::Range { start: 1, end: 2 })
+        .converted_tensor_selected(
+            "second.weight",
+            &TensorSelection::Range {
+                axis: 0,
+                start: 1,
+                end: 2,
+            },
+        )
         .unwrap();
     let ConvertedTensor::Dense(selected) = selected.converted() else {
         panic!("expected dense selection");

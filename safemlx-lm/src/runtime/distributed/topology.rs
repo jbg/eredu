@@ -19,7 +19,9 @@ use safemlx::{
 use crate::{
     error::Error,
     runtime::checkpoint::load::StrictLoadConfig,
-    runtime::checkpoint::store::{SafetensorsWeightStore, TensorSelection, WeightStore},
+    runtime::checkpoint::store::{
+        SafetensorsWeightStore, TensorSelection, WeightReadPolicy, WeightStore,
+    },
 };
 
 /// Explicit process-local execution-device assignment.
@@ -840,23 +842,17 @@ pub fn load_safetensors_partition_on_streams(
     config: &StrictLoadConfig,
 ) -> Result<RankPartition, Error> {
     let store = SafetensorsWeightStore::open(model_dir)?;
-    load_safetensors_partition_from_store_on_streams(
-        &store,
-        plan,
-        source_stream,
-        execution_stream,
-        config,
-    )
+    load_partition_from_store_on_streams(&store, plan, source_stream, execution_stream, config)
 }
 
 /// Selectively loads a rank partition from a reusable checkpoint store.
-pub fn load_safetensors_partition_from_store(
+pub fn load_partition_from_store(
     store: &(impl WeightStore + ?Sized),
     plan: &PlacementPlan,
     stream: &Stream,
     config: &StrictLoadConfig,
 ) -> Result<RankPartition, Error> {
-    load_safetensors_partition_from_store_on_streams(store, plan, stream, stream, config)
+    load_partition_from_store_on_streams(store, plan, stream, stream, config)
 }
 
 /// Selectively loads a rank partition from a reusable checkpoint store using
@@ -864,7 +860,7 @@ pub fn load_safetensors_partition_from_store(
 ///
 /// Placement is resolved from catalog metadata before a lease materializes an
 /// array. Remote-only indexed shards are therefore never acquired or mapped.
-pub fn load_safetensors_partition_from_store_on_streams(
+pub fn load_partition_from_store_on_streams(
     store: &(impl WeightStore + ?Sized),
     plan: &PlacementPlan,
     source_stream: &Stream,
@@ -906,7 +902,8 @@ pub fn load_safetensors_partition_from_store_on_streams(
                 TensorSelection::Indices { axis, indices }
             }
         };
-        let lease = store.acquire(&source, selection)?;
+        let lease =
+            store.acquire_with_policy(&source, selection, WeightReadPolicy::RequireBounded)?;
         let value = lease.materialize(source_stream, execution_stream)?;
         opened_shards.insert(lease.backing_shard().to_path_buf());
         report.loaded.insert(target.clone());

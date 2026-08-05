@@ -35,7 +35,54 @@ use crate::{
     },
 };
 
-pub(crate) type SharedWeightStore = Arc<dyn WeightStore + Send + Sync>;
+/// Type-erased checkpoint store accepted by the generalized execution engine.
+pub type SharedWeightStore = Arc<dyn WeightStore + Send + Sync>;
+
+pub(crate) fn open_safetensors_weight_store(
+    model_dir: &Path,
+    max_mapped_shards: usize,
+) -> Result<SharedWeightStore, Error> {
+    Ok(Arc::new(
+        SafetensorsWeightStore::open_with_max_mapped_shards(model_dir, max_mapped_shards)?,
+    ))
+}
+
+pub(crate) fn validate_gguf_layerwise_source(
+    checkpoint: &safemlx::ops::GgufCheckpoint,
+    metadata: &std::collections::HashMap<String, safemlx::ops::GgufMetadataValue>,
+    options: LayerExecutionLoadOptions,
+) -> Result<crate::api::GgufArchitecture, Error> {
+    let architecture_name = match metadata.get("general.architecture") {
+        Some(safemlx::ops::GgufMetadataValue::String(name)) => name,
+        Some(_) => {
+            return Err(Error::UnsupportedArchitecture(
+                "GGUF metadata key general.architecture has the wrong type".into(),
+            ));
+        }
+        None => {
+            return Err(Error::UnsupportedArchitecture(
+                "GGUF metadata is missing general.architecture".into(),
+            ));
+        }
+    };
+    let architecture = crate::api::GgufArchitecture::resolve(architecture_name)?;
+    let residency = match options {
+        LayerExecutionLoadOptions::LayerwiseHost(options) => {
+            WeightResidency::LayerwiseHost(options)
+        }
+        LayerExecutionLoadOptions::DenseDiskStream(options) => {
+            WeightResidency::DenseDiskStream(options)
+        }
+    };
+    crate::api::structural::validate_gguf(
+        architecture,
+        checkpoint,
+        metadata,
+        crate::api::ModelLoadOptions::default().with_weight_residency(residency),
+    )
+    .into_loader_result()?;
+    Ok(architecture)
+}
 
 /// Loader controls for a host-backed layerwise execution engine.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -135,7 +182,7 @@ impl From<DenseDiskStreamLoadOptions> for LayerExecutionLoadOptions {
 }
 
 impl LayerExecutionLoadOptions {
-    fn max_mapped_shards(self) -> usize {
+    pub(crate) fn max_mapped_shards(self) -> usize {
         match self {
             Self::LayerwiseHost(options) => options.max_mapped_shards,
             Self::DenseDiskStream(options) => options.max_mapped_shards,
@@ -2122,7 +2169,7 @@ impl<A: ArchitectureAdapter> LayerwiseModel<A> {
 }
 
 /// Builds a generalized layerwise model with independently bounded groups.
-pub fn load_layerwise_model<A, O>(
+pub(crate) fn load_safetensors_layerwise_model<A, O>(
     model_dir: impl AsRef<Path>,
     adapter: A,
     options: O,
@@ -2134,52 +2181,12 @@ where
     O: Into<LayerExecutionLoadOptions>,
 {
     let options = options.into();
-    let model_dir = model_dir.as_ref();
-    if model_dir.extension().and_then(|value| value.to_str()) == Some("gguf") {
-        return Err(LayerwiseModelError::GgufUnsupported.into());
-    }
-    let store = Arc::new(SafetensorsWeightStore::open_with_max_mapped_shards(
-        model_dir,
-        options.max_mapped_shards(),
-    )?);
-    load_layerwise_model_with_store(store, adapter, options, stream, weights_stream)
-}
-
-/// Builds a rank-local generalized model whose named execution groups use the
-/// architecture adapter's typed tensor-parallel plan.
-pub fn load_tensor_parallel_layerwise_model<A, O>(
-    model_dir: impl AsRef<Path>,
-    adapter: A,
-    options: O,
-    build: crate::runtime::distributed::parallel::ParallelBuildContext,
-    stream: &Stream,
-    weights_stream: &Stream,
-) -> Result<LayerwiseModel<A>, Error>
-where
-    A: ArchitectureAdapter,
-    O: Into<LayerExecutionLoadOptions>,
-{
-    let options = options.into();
-    let model_dir = model_dir.as_ref();
-    if model_dir.extension().and_then(|value| value.to_str()) == Some("gguf") {
-        return Err(LayerwiseModelError::GgufUnsupported.into());
-    }
-    let store = Arc::new(SafetensorsWeightStore::open_with_max_mapped_shards(
-        model_dir,
-        options.max_mapped_shards(),
-    )?);
-    load_tensor_parallel_layerwise_model_with_store(
-        store,
-        adapter,
-        options,
-        build,
-        stream,
-        weights_stream,
-    )
+    let store = open_safetensors_weight_store(model_dir.as_ref(), options.max_mapped_shards())?;
+    load_layerwise_model(store, adapter, options, stream, weights_stream)
 }
 
 /// Builds a generalized layerwise model from an already cataloged checkpoint.
-pub(crate) fn load_layerwise_model_with_store<A, O>(
+pub fn load_layerwise_model<A, O>(
     store: SharedWeightStore,
     mut adapter: A,
     options: O,
@@ -2351,7 +2358,7 @@ where
     Ok(model)
 }
 
-pub(crate) fn load_tensor_parallel_layerwise_model_with_store<A, O>(
+pub(crate) fn load_tensor_parallel_layerwise_model<A, O>(
     store: SharedWeightStore,
     mut adapter: A,
     options: O,
@@ -2386,7 +2393,7 @@ where
     let mut static_device_bytes = 0u64;
     let mut static_ids = Vec::new();
     for unit in static_units {
-        let bindings = shard_layer_bindings(unit.bindings, "", &layout)?;
+        let bindings = shard_layer_bindings(unit.bindings, "", store.as_ref(), &layout)?;
         static_ids.push(unit.id.clone());
         add_unit(
             &mut definitions,
@@ -2563,9 +2570,9 @@ where
 pub(crate) fn shard_layer_bindings(
     bindings: Vec<crate::runtime::residency::manager::WeightBinding>,
     prefix: &str,
+    store: &dyn WeightStore,
     layout: &crate::runtime::distributed::parallel::LocalModelLayout,
 ) -> Result<Vec<crate::runtime::residency::manager::WeightBinding>, Error> {
-    use crate::runtime::checkpoint::recipe::DerivedWeightRecipe;
     use crate::runtime::checkpoint::store::TensorSelection;
     use crate::runtime::distributed::topology::TensorPlacement;
     let mut output = Vec::with_capacity(bindings.len());
@@ -2636,10 +2643,7 @@ pub(crate) fn shard_layer_bindings(
         let sharded = if let Some(recipe) = binding.recipe() {
             crate::runtime::residency::manager::WeightBinding::from_recipe(
                 binding.name(),
-                DerivedWeightRecipe::Select {
-                    input: Box::new(recipe.clone()),
-                    selection,
-                },
+                recipe.select_bounded(store, selection)?,
                 expected_bytes,
             )?
         } else {
@@ -2893,9 +2897,6 @@ pub enum LayerwiseModelError {
     /// A requested execution group does not exist.
     #[error("unknown resident execution group {0:?}")]
     UnknownExecutionGroup(String),
-    /// GGUF is intentionally outside this loader's safetensors contract.
-    #[error("bounded layer residency requires safetensors; GGUF is unsupported")]
-    GgufUnsupported,
     /// The configured ordered layer window was invalid.
     #[error("device layer window depth {depth} must be between 1 and layer count {layer_count}")]
     InvalidLayerWindow {
@@ -2977,6 +2978,7 @@ mod tests {
         ops::ones_dtype,
         Device, DeviceType, ExecutionContext,
     };
+    use safetensors::tensor::{serialize_to_file, Dtype as SafeDtype, TensorView};
 
     use super::*;
     use crate::{
@@ -3067,6 +3069,18 @@ mod tests {
             )
             .unwrap();
         let (_, layout) = planner.finish().unwrap();
+        let checkpoint = tempfile::tempdir().unwrap();
+        let raw = vec![0u8; 8 * 4 * std::mem::size_of::<f32>()];
+        serialize_to_file(
+            [(
+                "raw.weight",
+                TensorView::new(SafeDtype::F32, vec![8, 4], &raw).unwrap(),
+            )],
+            None,
+            &checkpoint.path().join("model.safetensors"),
+        )
+        .unwrap();
+        let store = SafetensorsWeightStore::open(checkpoint.path()).unwrap();
         let direct = WeightBinding::new(
             "projection.weight",
             "stack.0.projection.weight",
@@ -3080,7 +3094,7 @@ mod tests {
             128,
         )
         .unwrap();
-        let direct = shard_layer_bindings(vec![direct], "stack.0", &layout).unwrap();
+        let direct = shard_layer_bindings(vec![direct], "stack.0", &store, &layout).unwrap();
         assert_eq!(
             direct[0].selection(),
             &TensorSelection::Range {
@@ -3090,18 +3104,18 @@ mod tests {
             }
         );
         assert_eq!(direct[0].expected_bytes(), 64);
-        let derived = shard_layer_bindings(vec![derived], "stack.0", &layout).unwrap();
+        let derived = shard_layer_bindings(vec![derived], "stack.0", &store, &layout).unwrap();
         assert_eq!(derived[0].expected_bytes(), 64);
         assert!(matches!(
             derived[0].recipe(),
-            Some(DerivedWeightRecipe::Select {
+            Some(DerivedWeightRecipe::Source {
+                key,
                 selection: TensorSelection::Range {
                     axis: 0,
                     start: 4,
                     end: 8,
                 },
-                ..
-            })
+            }) if key == "raw.weight"
         ));
     }
 
@@ -3308,7 +3322,7 @@ mod tests {
         let adapter =
             crate::architectures::llama::layerwise::LlamaLayerwiseAdapter::new(model_args, stream)
                 .unwrap();
-        let mut layerwise = load_layerwise_model(
+        let mut layerwise = load_safetensors_layerwise_model(
             dir.path(),
             adapter,
             LayerwiseLoadOptions::new(OffloadConfig::new(None, None, 2).unwrap()),
@@ -3551,8 +3565,14 @@ mod tests {
             gpu.stream(),
         )
         .unwrap();
-        let mut streamed =
-            load_layerwise_model(dir.path(), adapter, options, gpu.stream(), cpu.stream()).unwrap();
+        let mut streamed = load_safetensors_layerwise_model(
+            dir.path(),
+            adapter,
+            options,
+            gpu.stream(),
+            cpu.stream(),
+        )
+        .unwrap();
 
         {
             let controller = streamed.dense_stream.as_ref().unwrap();

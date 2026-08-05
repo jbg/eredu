@@ -45,9 +45,10 @@ use crate::{
     runtime::checkpoint::store::{GgufWeightStore, TensorSelection, WeightStore},
     runtime::distributed::parallel::exact_parallel_division,
     runtime::execution::layerwise::{
-        load_layerwise_model, load_layerwise_model_with_store,
-        load_tensor_parallel_layerwise_model, ArchitectureAdapter, LayerExecutionLoadOptions,
-        LayerwiseForwardState, LayerwiseModel, StaticUnitBindings, WeightResidency,
+        load_layerwise_model, load_safetensors_layerwise_model,
+        load_tensor_parallel_layerwise_model, open_safetensors_weight_store, ArchitectureAdapter,
+        LayerExecutionLoadOptions, LayerwiseForwardState, LayerwiseModel, StaticUnitBindings,
+        WeightResidency,
     },
     runtime::residency::expert_cache::{
         AcquiredExperts, ExpertCache, ExpertCacheError, ExpertCacheLoadOptions, ExpertCacheReport,
@@ -337,7 +338,13 @@ pub fn load_inkling_layerwise_model(
     let args = resident::get_model_args(model_dir)?;
     let adapter = InklingLayerwiseAdapter::new(args, stream)?;
     Ok(InklingLayerwiseModel {
-        execution: load_layerwise_model(model_dir, adapter, options, stream, weights_stream)?,
+        execution: load_safetensors_layerwise_model(
+            model_dir,
+            adapter,
+            options,
+            stream,
+            weights_stream,
+        )?,
     })
 }
 
@@ -359,6 +366,24 @@ pub fn load_inkling_tensor_parallel_layerwise_model(
             WeightResidency::DenseDiskStream(options)
         }
     };
+    if model_dir
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("gguf"))
+    {
+        let checkpoint = GgufCheckpoint::open(model_dir)?;
+        let metadata = crate::runtime::checkpoint::load::gguf_metadata(&checkpoint);
+        let mmproj = resident::open_sibling_mmproj(model_dir)?;
+        return load_inkling_gguf_tensor_parallel_model(
+            &checkpoint,
+            &metadata,
+            mmproj.as_ref(),
+            options,
+            build,
+            stream,
+            weights_stream,
+        )
+        .map(|(model, _)| model);
+    }
     crate::api::structural::validate_safetensors_load_path(
         crate::api::ModelKind::Inkling,
         model_dir,
@@ -368,7 +393,7 @@ pub fn load_inkling_tensor_parallel_layerwise_model(
     let adapter = InklingLayerwiseAdapter::new(args, stream)?;
     Ok(InklingLayerwiseModel {
         execution: load_tensor_parallel_layerwise_model(
-            model_dir,
+            open_safetensors_weight_store(model_dir, options.max_mapped_shards())?,
             adapter,
             options,
             build,
@@ -376,6 +401,43 @@ pub fn load_inkling_tensor_parallel_layerwise_model(
             weights_stream,
         )?,
     })
+}
+
+pub(crate) fn load_inkling_gguf_tensor_parallel_model(
+    checkpoint: &GgufCheckpoint,
+    metadata: &HashMap<String, GgufMetadataValue>,
+    mmproj: Option<&resident::InklingMmprojGguf>,
+    options: LayerExecutionLoadOptions,
+    build: crate::runtime::distributed::parallel::ParallelBuildContext,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<(InklingLayerwiseModel, Vec<u32>), Error> {
+    let residency = match options {
+        LayerExecutionLoadOptions::LayerwiseHost(options) => {
+            WeightResidency::LayerwiseHost(options)
+        }
+        LayerExecutionLoadOptions::DenseDiskStream(options) => {
+            WeightResidency::DenseDiskStream(options)
+        }
+    };
+    crate::api::structural::validate_gguf(
+        crate::api::GgufArchitecture::Inkling,
+        checkpoint,
+        metadata,
+        crate::api::ModelLoadOptions::default().with_weight_residency(residency),
+    )
+    .into_loader_result()?;
+    let prepared = resident::prepare_gguf_checkpoint_with_mmproj(checkpoint, metadata, mmproj)?;
+    let store = inkling_gguf_store(checkpoint, mmproj, options.max_mapped_shards())?;
+    let execution = load_tensor_parallel_layerwise_model(
+        store,
+        InklingLayerwiseAdapter::new(prepared.args, stream)?,
+        options,
+        build,
+        stream,
+        weights_stream,
+    )?;
+    Ok((InklingLayerwiseModel { execution }, prepared.eos_token_ids))
 }
 
 pub(crate) fn load_inkling_gguf_layerwise_model(
@@ -397,14 +459,14 @@ pub(crate) fn load_inkling_gguf_layerwise_model(
     let store = inkling_gguf_store(checkpoint, mmproj, residency.max_mapped_shards())?;
     let args = prepared.args;
     let execution = match residency {
-        WeightResidency::LayerwiseHost(options) => load_layerwise_model_with_store(
+        WeightResidency::LayerwiseHost(options) => load_layerwise_model(
             store,
             InklingLayerwiseAdapter::new(args, stream)?,
             options,
             stream,
             weights_stream,
         )?,
-        WeightResidency::DenseDiskStream(options) => load_layerwise_model_with_store(
+        WeightResidency::DenseDiskStream(options) => load_layerwise_model(
             store,
             InklingLayerwiseAdapter::new(args, stream)?,
             options,
@@ -473,8 +535,7 @@ fn load_inkling_gguf_sparse_with_store(
 ) -> Result<InklingLayerwiseModel, Error> {
     let mut adapter = InklingLayerwiseAdapter::new(args.clone(), stream)?;
     adapter.sparse_expert_cache = true;
-    let mut execution =
-        load_layerwise_model_with_store(store, adapter, non_expert, stream, weights_stream)?;
+    let mut execution = load_layerwise_model(store, adapter, non_expert, stream, weights_stream)?;
     let checkpoint_store = execution.weight_store_arc();
     let entries = inkling_expert_catalog(&args, checkpoint_store.as_ref())?;
     execution.adapter_mut().expert_cache = Some(ExpertCache::new_shared(
@@ -549,7 +610,7 @@ fn load_inkling_sparse_expert_cache_model_with_non_expert(
     let mut adapter = InklingLayerwiseAdapter::new(args.clone(), stream)?;
     adapter.sparse_expert_cache = true;
     let mut execution =
-        load_layerwise_model(model_dir, adapter, non_expert, stream, weights_stream)?;
+        load_safetensors_layerwise_model(model_dir, adapter, non_expert, stream, weights_stream)?;
     let store = execution.weight_store_arc();
     let entries = inkling_expert_catalog(&args, store.as_ref())?;
     execution.adapter_mut().expert_cache = Some(ExpertCache::new_shared(
@@ -572,8 +633,7 @@ pub(crate) fn load_inkling_sparse_ep_base_with_store(
 ) -> Result<InklingLayerwiseModel, Error> {
     let mut adapter = InklingLayerwiseAdapter::new(args, stream)?;
     adapter.sparse_expert_cache = true;
-    let execution =
-        load_layerwise_model_with_store(store, adapter, non_expert, stream, weights_stream)?;
+    let execution = load_layerwise_model(store, adapter, non_expert, stream, weights_stream)?;
     Ok(InklingLayerwiseModel { execution })
 }
 
@@ -1871,6 +1931,7 @@ impl ArchitectureAdapter for InklingLayerwiseAdapter {
         crate::runtime::execution::layerwise::shard_layer_bindings(
             self.layer_bindings(group, index, &global, store)?,
             &self.layer_checkpoint_prefix(group, index),
+            store,
             layout,
         )
     }

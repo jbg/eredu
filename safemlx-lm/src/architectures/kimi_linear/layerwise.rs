@@ -43,9 +43,10 @@ use crate::{
             ParameterRole, ProjectionSharding,
         },
         execution::layerwise::{
-            load_layerwise_model, load_layerwise_model_with_store,
-            load_tensor_parallel_layerwise_model, ArchitectureAdapter, LayerExecutionLoadOptions,
-            LayerwiseForwardState, LayerwiseModel, StaticUnitBindings, WeightResidency,
+            load_layerwise_model, load_safetensors_layerwise_model,
+            load_tensor_parallel_layerwise_model, open_safetensors_weight_store,
+            ArchitectureAdapter, LayerExecutionLoadOptions, LayerwiseForwardState, LayerwiseModel,
+            StaticUnitBindings, WeightResidency,
         },
         residency::{
             expert_cache::{
@@ -497,7 +498,13 @@ pub fn load_kimi_linear_layerwise_model(
     args.validate()?;
     let adapter = KimiLinearLayerwiseAdapter::new(args, stream)?;
     Ok(KimiLinearLayerwiseModel {
-        execution: load_layerwise_model(model_dir, adapter, options, stream, weights_stream)?,
+        execution: load_safetensors_layerwise_model(
+            model_dir,
+            adapter,
+            options,
+            stream,
+            weights_stream,
+        )?,
     })
 }
 
@@ -515,6 +522,22 @@ pub fn load_kimi_linear_tensor_parallel_model(
         LayerExecutionLoadOptions::LayerwiseHost(v) => WeightResidency::LayerwiseHost(v),
         LayerExecutionLoadOptions::DenseDiskStream(v) => WeightResidency::DenseDiskStream(v),
     };
+    if model_dir
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("gguf"))
+    {
+        let checkpoint = GgufCheckpoint::open(model_dir)?;
+        let metadata = crate::runtime::checkpoint::load::gguf_metadata(&checkpoint);
+        return load_kimi_linear_gguf_tensor_parallel_model(
+            &checkpoint,
+            &metadata,
+            options,
+            build,
+            stream,
+            weights_stream,
+        )
+        .map(|(model, _)| model);
+    }
     crate::api::structural::validate_safetensors_load_path(
         crate::api::ModelKind::KimiLinear,
         model_dir,
@@ -524,7 +547,7 @@ pub fn load_kimi_linear_tensor_parallel_model(
     args.validate()?;
     Ok(KimiLinearLayerwiseModel {
         execution: load_tensor_parallel_layerwise_model(
-            model_dir,
+            open_safetensors_weight_store(model_dir, options.max_mapped_shards())?,
             KimiLinearLayerwiseAdapter::new(args, stream)?,
             options,
             build,
@@ -532,6 +555,38 @@ pub fn load_kimi_linear_tensor_parallel_model(
             weights_stream,
         )?,
     })
+}
+
+pub(crate) fn load_kimi_linear_gguf_tensor_parallel_model(
+    checkpoint: &GgufCheckpoint,
+    metadata: &std::collections::HashMap<String, GgufMetadataValue>,
+    options: LayerExecutionLoadOptions,
+    build: crate::runtime::distributed::parallel::ParallelBuildContext,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<(KimiLinearLayerwiseModel, Vec<u32>), Error> {
+    crate::runtime::execution::layerwise::validate_gguf_layerwise_source(
+        checkpoint, metadata, options,
+    )?;
+    let prepared = resident::prepare_gguf_checkpoint(checkpoint, metadata, None, weights_stream)?;
+    let store: Arc<dyn WeightStore + Send + Sync> =
+        Arc::new(GgufWeightStore::new_with_max_mapped_shards(
+            checkpoint.clone(),
+            resident::translate_gguf_weight_name,
+            options.max_mapped_shards(),
+        )?);
+    let execution = load_tensor_parallel_layerwise_model(
+        store,
+        KimiLinearLayerwiseAdapter::new(prepared.args, stream)?,
+        options,
+        build,
+        stream,
+        weights_stream,
+    )?;
+    Ok((
+        KimiLinearLayerwiseModel { execution },
+        prepared.eos_token_ids,
+    ))
 }
 
 pub(crate) fn load_kimi_linear_gguf_layerwise_model(
@@ -550,14 +605,14 @@ pub(crate) fn load_kimi_linear_gguf_layerwise_model(
             residency.max_mapped_shards(),
         )?);
     let execution = match residency {
-        WeightResidency::LayerwiseHost(options) => load_layerwise_model_with_store(
+        WeightResidency::LayerwiseHost(options) => load_layerwise_model(
             store,
             KimiLinearLayerwiseAdapter::new(args, stream)?,
             options,
             stream,
             weights_stream,
         )?,
-        WeightResidency::DenseDiskStream(options) => load_layerwise_model_with_store(
+        WeightResidency::DenseDiskStream(options) => load_layerwise_model(
             store,
             KimiLinearLayerwiseAdapter::new(args, stream)?,
             options,
@@ -709,7 +764,7 @@ fn load_kimi_linear_sparse_expert_cache_model_with_non_expert(
     args.validate()?;
     let adapter = KimiLinearLayerwiseAdapter::new_sparse(args.clone(), stream)?;
     let mut execution =
-        load_layerwise_model(model_dir, adapter, non_expert, stream, weights_stream)?;
+        load_safetensors_layerwise_model(model_dir, adapter, non_expert, stream, weights_stream)?;
     let store = execution.weight_store_arc();
     let entries = kimi_expert_catalog(&args, store.as_ref())?;
     execution.adapter_mut().expert_cache = Some(ExpertCache::new_shared(
@@ -731,13 +786,8 @@ fn load_kimi_linear_sparse_with_store(
     weights_stream: &Stream,
 ) -> Result<KimiLinearLayerwiseModel, Error> {
     let adapter = KimiLinearLayerwiseAdapter::new_sparse(args.clone(), stream)?;
-    let mut execution = load_layerwise_model_with_store(
-        store.clone(),
-        adapter,
-        non_expert,
-        stream,
-        weights_stream,
-    )?;
+    let mut execution =
+        load_layerwise_model(store.clone(), adapter, non_expert, stream, weights_stream)?;
     let entries = kimi_expert_catalog(&args, store.as_ref())?;
     execution.adapter_mut().expert_cache = Some(ExpertCache::new_shared(
         store,
@@ -759,8 +809,7 @@ pub(crate) fn load_kimi_linear_sparse_ep_base_with_store(
 ) -> Result<KimiLinearLayerwiseModel, Error> {
     args.validate()?;
     let adapter = KimiLinearLayerwiseAdapter::new_sparse(args, stream)?;
-    let execution =
-        load_layerwise_model_with_store(store, adapter, non_expert, stream, weights_stream)?;
+    let execution = load_layerwise_model(store, adapter, non_expert, stream, weights_stream)?;
     Ok(KimiLinearLayerwiseModel { execution })
 }
 
@@ -1330,6 +1379,7 @@ impl ArchitectureAdapter for KimiLinearLayerwiseAdapter {
         crate::runtime::execution::layerwise::shard_layer_bindings(
             self.layer_bindings(group, index, &global, store)?,
             &self.layer_checkpoint_prefix(group, index),
+            store,
             layout,
         )
     }

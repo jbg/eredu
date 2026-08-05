@@ -50,9 +50,10 @@ use crate::{
         ParameterRole, ProjectionSharding,
     },
     runtime::execution::layerwise::{
-        load_layerwise_model, load_layerwise_model_with_store,
-        load_tensor_parallel_layerwise_model, ArchitectureAdapter, LayerExecutionLoadOptions,
-        LayerwiseForwardState, LayerwiseModel, StaticUnitBindings, WeightResidency,
+        load_layerwise_model, load_safetensors_layerwise_model,
+        load_tensor_parallel_layerwise_model, open_safetensors_weight_store, ArchitectureAdapter,
+        LayerExecutionLoadOptions, LayerwiseForwardState, LayerwiseModel, StaticUnitBindings,
+        WeightResidency,
     },
     runtime::residency::expert_cache::{
         ExpertCache, ExpertCacheLoadOptions, ExpertCacheReport, ExpertCatalogEntry, ExpertIdentity,
@@ -415,7 +416,13 @@ pub fn load_lfm2_layerwise_model(
     let args = resident::get_model_args(model_dir)?;
     let adapter = Lfm2LayerwiseAdapter::new(args, stream)?;
     Ok(Lfm2LayerwiseModel {
-        execution: load_layerwise_model(model_dir, adapter, options, stream, weights_stream)?,
+        execution: load_safetensors_layerwise_model(
+            model_dir,
+            adapter,
+            options,
+            stream,
+            weights_stream,
+        )?,
     })
 }
 /// Loads dense or MoE LFM2 through the generalized tensor-parallel engine.
@@ -432,6 +439,22 @@ pub fn load_lfm2_tensor_parallel_model(
         LayerExecutionLoadOptions::LayerwiseHost(v) => WeightResidency::LayerwiseHost(v),
         LayerExecutionLoadOptions::DenseDiskStream(v) => WeightResidency::DenseDiskStream(v),
     };
+    if model_dir
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("gguf"))
+    {
+        let checkpoint = GgufCheckpoint::open(model_dir)?;
+        let metadata = crate::runtime::checkpoint::load::gguf_metadata(&checkpoint);
+        return load_lfm2_gguf_tensor_parallel_model(
+            &checkpoint,
+            &metadata,
+            options,
+            build,
+            stream,
+            weights_stream,
+        )
+        .map(|(model, _)| model);
+    }
     crate::api::structural::validate_safetensors_load_path(
         crate::api::ModelKind::Lfm2,
         model_dir,
@@ -439,7 +462,7 @@ pub fn load_lfm2_tensor_parallel_model(
     )?;
     Ok(Lfm2LayerwiseModel {
         execution: load_tensor_parallel_layerwise_model(
-            model_dir,
+            open_safetensors_weight_store(model_dir, options.max_mapped_shards())?,
             Lfm2LayerwiseAdapter::new(resident::get_model_args(model_dir)?, stream)?,
             options,
             build,
@@ -447,6 +470,36 @@ pub fn load_lfm2_tensor_parallel_model(
             weights_stream,
         )?,
     })
+}
+
+pub(crate) fn load_lfm2_gguf_tensor_parallel_model(
+    checkpoint: &GgufCheckpoint,
+    metadata: &HashMap<String, GgufMetadataValue>,
+    options: LayerExecutionLoadOptions,
+    build: crate::runtime::distributed::parallel::ParallelBuildContext,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<(Lfm2LayerwiseModel, Vec<u32>), Error> {
+    crate::runtime::execution::layerwise::validate_gguf_layerwise_source(
+        checkpoint, metadata, options,
+    )?;
+    let prepared = resident::prepare_gguf_checkpoint(checkpoint, metadata, weights_stream)?;
+    let is_moe = prepared.args.model_type == "lfm2_moe";
+    let store: Arc<dyn WeightStore + Send + Sync> =
+        Arc::new(GgufWeightStore::new_with_max_mapped_shards(
+            checkpoint.clone(),
+            move |name| resident::translate_gguf_weight_name(name, is_moe),
+            options.max_mapped_shards(),
+        )?);
+    let execution = load_tensor_parallel_layerwise_model(
+        store,
+        Lfm2LayerwiseAdapter::new(prepared.args, stream)?,
+        options,
+        build,
+        stream,
+        weights_stream,
+    )?;
+    Ok((Lfm2LayerwiseModel { execution }, prepared.eos_token_ids))
 }
 
 pub(crate) fn load_lfm2_gguf_layerwise_model(
@@ -466,14 +519,14 @@ pub(crate) fn load_lfm2_gguf_layerwise_model(
             residency.max_mapped_shards(),
         )?);
     let execution = match residency {
-        WeightResidency::LayerwiseHost(options) => load_layerwise_model_with_store(
+        WeightResidency::LayerwiseHost(options) => load_layerwise_model(
             store,
             Lfm2LayerwiseAdapter::new(args, stream)?,
             options,
             stream,
             weights_stream,
         )?,
-        WeightResidency::DenseDiskStream(options) => load_layerwise_model_with_store(
+        WeightResidency::DenseDiskStream(options) => load_layerwise_model(
             store,
             Lfm2LayerwiseAdapter::new(args, stream)?,
             options,
@@ -530,8 +583,7 @@ fn load_lfm2_gguf_sparse_with_store(
     }
     let mut adapter = Lfm2LayerwiseAdapter::new(args.clone(), stream)?;
     adapter.sparse_expert_cache = true;
-    let mut execution =
-        load_layerwise_model_with_store(store, adapter, non_expert, stream, weights_stream)?;
+    let mut execution = load_layerwise_model(store, adapter, non_expert, stream, weights_stream)?;
     let checkpoint_store = execution.weight_store_arc();
     let entries = lfm2_expert_catalog(&args, checkpoint_store.as_ref())?;
     execution.adapter_mut().expert_cache = Some(ExpertCache::new_shared(
@@ -554,8 +606,7 @@ pub(crate) fn load_lfm2_sparse_ep_base_with_store(
 ) -> Result<Lfm2LayerwiseModel, Error> {
     let mut adapter = Lfm2LayerwiseAdapter::new(args, stream)?;
     adapter.sparse_expert_cache = true;
-    let execution =
-        load_layerwise_model_with_store(store, adapter, non_expert, stream, weights_stream)?;
+    let execution = load_layerwise_model(store, adapter, non_expert, stream, weights_stream)?;
     Ok(Lfm2LayerwiseModel { execution })
 }
 
@@ -609,7 +660,7 @@ fn load_lfm2_sparse_expert_cache_model_with_non_expert(
     let mut adapter = Lfm2LayerwiseAdapter::new(args.clone(), stream)?;
     adapter.sparse_expert_cache = true;
     let mut execution =
-        load_layerwise_model(model_dir, adapter, non_expert, stream, weights_stream)?;
+        load_safetensors_layerwise_model(model_dir, adapter, non_expert, stream, weights_stream)?;
     let store = execution.weight_store_arc();
     let entries = lfm2_expert_catalog(&args, store.as_ref())?;
     execution.adapter_mut().expert_cache = Some(ExpertCache::new_shared(
@@ -1235,6 +1286,7 @@ impl ArchitectureAdapter for Lfm2LayerwiseAdapter {
         crate::runtime::execution::layerwise::shard_layer_bindings(
             self.layer_bindings(group, index, &global, store)?,
             &self.layer_checkpoint_prefix(group, index),
+            store,
             layout,
         )
     }
@@ -1639,7 +1691,7 @@ mod tests {
                 topology::{DeviceAssignment, ParallelTopology},
             },
             execution::layerwise::{
-                load_layerwise_model, ArchitectureAdapter, LayerExecutionLoadOptions,
+                load_safetensors_layerwise_model, ArchitectureAdapter, LayerExecutionLoadOptions,
                 LayerwiseLoadOptions,
             },
         },
@@ -1941,7 +1993,7 @@ mod tests {
         write_fixture(directory.path(), &resident, gpu.stream());
 
         let adapter = Lfm2LayerwiseAdapter::new(custom_args, gpu.stream()).unwrap();
-        let execution = load_layerwise_model(
+        let execution = load_safetensors_layerwise_model(
             directory.path(),
             adapter,
             LayerwiseLoadOptions::new(OffloadConfig::new(None, None, 1).unwrap()),

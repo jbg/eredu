@@ -42,10 +42,11 @@ use crate::{
         ParallelPlanBuilder, ProjectionSharding,
     },
     runtime::execution::layerwise::{
-        load_layerwise_model, load_layerwise_model_with_store,
-        load_tensor_parallel_layerwise_model, ArchitectureAdapter, DenseDiskStreamReport,
-        LayerExecutionLoadOptions, LayerwiseForwardState, LayerwiseLoadOptions, LayerwiseModel,
-        LayerwiseModelMetadata, StaticUnitBindings, WeightResidency,
+        load_layerwise_model, load_safetensors_layerwise_model,
+        load_tensor_parallel_layerwise_model, open_safetensors_weight_store, ArchitectureAdapter,
+        DenseDiskStreamReport, LayerExecutionLoadOptions, LayerwiseForwardState,
+        LayerwiseLoadOptions, LayerwiseModel, LayerwiseModelMetadata, StaticUnitBindings,
+        WeightResidency,
     },
     runtime::residency::manager::{ResidencyReport, ResidentUnitLease},
 };
@@ -620,7 +621,7 @@ pub fn load_llama_model(
         WeightResidency::LayerwiseHost(options) => {
             let args = resident::get_llama_model_args(model_dir)?;
             let adapter = LlamaLayerwiseAdapter::new(args, stream)?;
-            LlamaExecution::LayerwiseHost(Box::new(load_layerwise_model(
+            LlamaExecution::LayerwiseHost(Box::new(load_safetensors_layerwise_model(
                 model_dir,
                 adapter,
                 options,
@@ -631,7 +632,7 @@ pub fn load_llama_model(
         WeightResidency::DenseDiskStream(options) => {
             let args = resident::get_llama_model_args(model_dir)?;
             let adapter = LlamaLayerwiseAdapter::new(args, stream)?;
-            LlamaExecution::LayerwiseHost(Box::new(load_layerwise_model(
+            LlamaExecution::LayerwiseHost(Box::new(load_safetensors_layerwise_model(
                 model_dir,
                 adapter,
                 options,
@@ -667,6 +668,22 @@ pub fn load_llama_tensor_parallel_model(
             WeightResidency::DenseDiskStream(options)
         }
     };
+    if model_dir
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("gguf"))
+    {
+        let checkpoint = GgufCheckpoint::open(model_dir)?;
+        let metadata = crate::runtime::checkpoint::load::gguf_metadata(&checkpoint);
+        return load_llama_gguf_tensor_parallel_model(
+            &checkpoint,
+            &metadata,
+            options,
+            build,
+            stream,
+            weights_stream,
+        )
+        .map(|(model, _)| model);
+    }
     crate::api::structural::validate_safetensors_load_path(
         crate::api::ModelKind::Llama,
         model_dir,
@@ -676,7 +693,7 @@ pub fn load_llama_tensor_parallel_model(
     let adapter = LlamaLayerwiseAdapter::new(args, stream)?;
     Ok(LlamaModel {
         execution: LlamaExecution::LayerwiseHost(Box::new(load_tensor_parallel_layerwise_model(
-            model_dir,
+            open_safetensors_weight_store(model_dir, options.max_mapped_shards())?,
             adapter,
             options,
             build,
@@ -684,6 +701,42 @@ pub fn load_llama_tensor_parallel_model(
             weights_stream,
         )?)),
     })
+}
+
+pub(crate) fn load_llama_gguf_tensor_parallel_model(
+    checkpoint: &GgufCheckpoint,
+    metadata: &HashMap<String, GgufMetadataValue>,
+    options: LayerExecutionLoadOptions,
+    build: crate::runtime::distributed::parallel::ParallelBuildContext,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<(LlamaModel, Vec<u32>), Error> {
+    crate::runtime::execution::layerwise::validate_gguf_layerwise_source(
+        checkpoint, metadata, options,
+    )?;
+    let prepared =
+        resident::prepare_llama_gguf_checkpoint(checkpoint, metadata, None, weights_stream)?;
+    let store: Arc<dyn WeightStore + Send + Sync> =
+        Arc::new(GgufWeightStore::new_with_max_mapped_shards(
+            checkpoint.clone(),
+            resident::translate_gguf_weight_name,
+            options.max_mapped_shards(),
+        )?);
+    let adapter = LlamaLayerwiseAdapter::new(prepared.args, stream)?;
+    let execution = load_tensor_parallel_layerwise_model(
+        store,
+        adapter,
+        options,
+        build,
+        stream,
+        weights_stream,
+    )?;
+    Ok((
+        LlamaModel {
+            execution: LlamaExecution::LayerwiseHost(Box::new(execution)),
+        },
+        prepared.eos_token_ids,
+    ))
 }
 
 /// Loads a Llama/Mistral GGUF checkpoint using the selected residency policy.
@@ -705,10 +758,10 @@ pub(crate) fn load_llama_gguf_model(
     let adapter = LlamaLayerwiseAdapter::new(prepared.args, stream)?;
     let execution = match residency {
         WeightResidency::LayerwiseHost(options) => LlamaExecution::LayerwiseHost(Box::new(
-            load_layerwise_model_with_store(store, adapter, options, stream, weights_stream)?,
+            load_layerwise_model(store, adapter, options, stream, weights_stream)?,
         )),
         WeightResidency::DenseDiskStream(options) => LlamaExecution::LayerwiseHost(Box::new(
-            load_layerwise_model_with_store(store, adapter, options, stream, weights_stream)?,
+            load_layerwise_model(store, adapter, options, stream, weights_stream)?,
         )),
         WeightResidency::SparseExpertCache(_)
         | WeightResidency::SparseExpertCacheWithDenseLayers(_) => {

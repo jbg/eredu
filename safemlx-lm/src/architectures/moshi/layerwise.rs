@@ -27,8 +27,9 @@ use crate::{
     runtime::checkpoint::recipe::DerivedWeightRecipe,
     runtime::checkpoint::store::{TensorSelection, WeightStore},
     runtime::execution::layerwise::{
-        load_layerwise_model, load_tensor_parallel_layerwise_model, ArchitectureAdapter,
-        LayerwiseForwardState, LayerwiseModel, StaticUnitBindings,
+        load_safetensors_layerwise_model, load_tensor_parallel_layerwise_model,
+        open_safetensors_weight_store, ArchitectureAdapter, LayerwiseForwardState, LayerwiseModel,
+        StaticUnitBindings,
     },
     runtime::generation::sampler::Sampler,
     runtime::residency::manager::{
@@ -900,6 +901,7 @@ pub fn load_moshi_layerwise_model(
     weights_stream: &Stream,
 ) -> Result<MoshiLayerwiseModel, Error> {
     let model_dir = model_dir.as_ref();
+    let options = options.into();
     let args = resident::get_model_args(model_dir)?;
     let weights_name = args
         .moshi_name
@@ -931,6 +933,7 @@ pub fn load_moshi_tensor_parallel_layerwise_model(
     weights_stream: &Stream,
 ) -> Result<MoshiLayerwiseModel, Error> {
     let model_dir = model_dir.as_ref();
+    let options = options.into();
     let args = resident::get_model_args(model_dir)?;
     let weights_name = args
         .moshi_name
@@ -946,7 +949,7 @@ pub fn load_moshi_tensor_parallel_layerwise_model(
     let adapter = MoshiLayerwiseAdapter::new(args, CheckpointLayout::Native, stream)?;
     Ok(MoshiLayerwiseModel {
         execution: load_tensor_parallel_layerwise_model(
-            source,
+            open_safetensors_weight_store(&source, options.max_mapped_shards())?,
             adapter,
             options,
             build,
@@ -964,6 +967,7 @@ pub fn load_personaplex_layerwise_model(
     weights_stream: &Stream,
 ) -> Result<MoshiLayerwiseModel, Error> {
     let model_dir = model_dir.as_ref();
+    let options = options.into();
     crate::api::structural::validate_safetensors_load_path(
         crate::api::ModelKind::PersonaPlex,
         model_dir,
@@ -991,6 +995,7 @@ pub fn load_personaplex_tensor_parallel_layerwise_model(
     weights_stream: &Stream,
 ) -> Result<MoshiLayerwiseModel, Error> {
     let model_dir = model_dir.as_ref();
+    let options = options.into();
     crate::api::structural::validate_safetensors_load_path(
         crate::api::ModelKind::PersonaPlex,
         model_dir,
@@ -1002,7 +1007,7 @@ pub fn load_personaplex_tensor_parallel_layerwise_model(
     let adapter = MoshiLayerwiseAdapter::new(args, CheckpointLayout::Pytorch, stream)?;
     Ok(MoshiLayerwiseModel {
         execution: load_tensor_parallel_layerwise_model(
-            model_dir,
+            open_safetensors_weight_store(model_dir, options.max_mapped_shards())?,
             adapter,
             options,
             build,
@@ -1022,7 +1027,13 @@ fn load_with_layout(
 ) -> Result<MoshiLayerwiseModel, Error> {
     let adapter = MoshiLayerwiseAdapter::new(args, layout, stream)?;
     Ok(MoshiLayerwiseModel {
-        execution: load_layerwise_model(source, adapter, options, stream, weights_stream)?,
+        execution: load_safetensors_layerwise_model(
+            source,
+            adapter,
+            options,
+            stream,
+            weights_stream,
+        )?,
     })
 }
 
@@ -1680,6 +1691,7 @@ impl ArchitectureAdapter for MoshiLayerwiseAdapter {
         crate::runtime::execution::layerwise::shard_layer_bindings(
             self.layer_bindings(group, index, &global, store)?,
             &self.layer_checkpoint_prefix(group, index),
+            store,
             layout,
         )
     }

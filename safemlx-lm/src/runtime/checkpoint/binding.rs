@@ -9,7 +9,7 @@ use safemlx::{module::ModuleParameters, transforms::eval, Array, Stream};
 
 use crate::{
     runtime::checkpoint::recipe::{DerivedWeightRecipe, RecipeDtype},
-    runtime::checkpoint::store::{TensorSelection, WeightStore},
+    runtime::checkpoint::store::{TensorSelection, WeightReadPolicy, WeightStore},
     runtime::residency::manager::{ResidentUnitLease, WeightBinding},
 };
 
@@ -111,7 +111,11 @@ pub(crate) fn materialize_module_bindings(
             }
         } else {
             store
-                .acquire(binding.checkpoint_key(), binding.selection().clone())?
+                .acquire_with_policy(
+                    binding.checkpoint_key(),
+                    binding.selection().clone(),
+                    WeightReadPolicy::RequireBounded,
+                )?
                 .materialize(source_stream, execution_stream)?
         };
         if arrays.insert(binding.name().to_string(), value).is_some() {
