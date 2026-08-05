@@ -290,9 +290,9 @@ pub fn all_gather(input: &Array, group: &Group, stream: impl AsRef<Stream>) -> R
 
 /// Gather equal-shaped shards along an arbitrary existing tensor axis.
 ///
-/// MLX's primitive all-gather always concatenates on axis zero. This helper
-/// moves `axis` to the front, performs the collective, and restores the
-/// original axis order without forcing evaluation.
+/// MLX's primitive all-gather always concatenates complete rank payloads on
+/// axis zero. This helper recovers those payloads and concatenates them along
+/// `axis` without forcing evaluation.
 pub fn all_gather_axis(
     input: &Array,
     axis: i32,
@@ -317,9 +317,26 @@ pub fn all_gather_axis(
     if axis == 0 {
         return all_gather(input, group, stream);
     }
-    let front = input.move_axis(axis, 0, stream)?;
-    let gathered = all_gather(&front, group, stream)?;
-    gathered.move_axis(0, axis, stream)
+    // MLX's primitive consumes each rank's complete payload and concatenates
+    // those payloads on axis zero. Gather before rearranging, recover each
+    // rank's original tensor by slicing axis zero, then concatenate the rank
+    // tensors along the requested axis. Passing a moved (strided) view to the
+    // collective gathers its underlying storage order for multi-row tensors.
+    let gathered = all_gather(input, group, stream)?;
+    let rank_height = input.shape()[0];
+    let mut shards = Vec::with_capacity(group.size());
+    for rank in 0..group.size() {
+        let start = i32::try_from(rank)
+            .ok()
+            .and_then(|rank| rank.checked_mul(rank_height))
+            .ok_or_else(|| Exception::custom("gathered rank offset exceeds i32"))?;
+        let end = start
+            .checked_add(rank_height)
+            .ok_or_else(|| Exception::custom("gathered rank end exceeds i32"))?;
+        shards.push(gathered.try_index_device(start..end, stream)?);
+    }
+    let shard_refs = shards.iter().collect::<Vec<_>>();
+    concatenate_axis(&shard_refs, axis, stream)
 }
 
 /// Gather unequal contiguous shards along an arbitrary tensor axis.
@@ -374,44 +391,37 @@ pub fn all_gather_uneven_axis(
         ));
     }
 
-    let front = if axis == 0 {
+    let padded = if local_width == max_width {
         input.clone()
     } else {
-        input.move_axis(axis, 0, stream)?
-    };
-    let padded = if local_width == max_width {
-        front
-    } else {
-        let mut padding_shape = front.shape().to_vec();
-        padding_shape[0] = i32::try_from(max_width - local_width)
+        let mut padding_shape = input.shape().to_vec();
+        padding_shape[axis as usize] = i32::try_from(max_width - local_width)
             .map_err(|_| Exception::custom("padding width does not fit in i32"))?;
-        let padding = zeros_dtype(&padding_shape, front.dtype(), stream)?;
-        concatenate_axis(&[&front, &padding], 0, stream)?
+        let padding = zeros_dtype(&padding_shape, input.dtype(), stream)?;
+        concatenate_axis(&[input, &padding], axis, stream)?
     };
-    let gathered = all_gather(&padded, group, stream)?;
-    let max_width_i32 = i32::try_from(max_width)
-        .map_err(|_| Exception::custom("maximum shard width does not fit in i32"))?;
+    let gathered = all_gather_axis(&padded, axis, group, stream)?;
+    let group_size = i32::try_from(group.size())
+        .map_err(|_| Exception::custom("distributed group size does not fit in i32"))?;
+    let padded_shards = gathered.split(group_size, Some(axis), stream)?;
     let mut shards = Vec::with_capacity(widths.len());
-    for (rank, &width) in widths.iter().enumerate() {
-        let start = i32::try_from(rank)
-            .ok()
-            .and_then(|rank| rank.checked_mul(max_width_i32))
-            .ok_or_else(|| Exception::custom("gathered shard offset exceeds i32"))?;
-        let end = start
-            .checked_add(
-                i32::try_from(width)
-                    .map_err(|_| Exception::custom("shard width does not fit in i32"))?,
-            )
-            .ok_or_else(|| Exception::custom("gathered shard end exceeds i32"))?;
-        shards.push(gathered.try_index_device(start..end, stream)?);
+    for (padded, &width) in padded_shards.into_iter().zip(widths) {
+        if width == max_width {
+            shards.push(padded);
+        } else {
+            let width = i32::try_from(width)
+                .map_err(|_| Exception::custom("shard width does not fit in i32"))?;
+            shards.push(
+                padded
+                    .split_axis(&[width], Some(axis), stream)?
+                    .into_iter()
+                    .next()
+                    .expect("one split index produces a leading shard"),
+            );
+        }
     }
     let shard_refs = shards.iter().collect::<Vec<_>>();
-    let trimmed = concatenate_axis(&shard_refs, 0, stream)?;
-    if axis == 0 {
-        Ok(trimmed)
-    } else {
-        trimmed.move_axis(0, axis, stream)
-    }
+    concatenate_axis(&shard_refs, axis, stream)
 }
 
 /// Sum across `group` and scatter equal axis-zero chunks to each rank.

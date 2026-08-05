@@ -72,6 +72,19 @@ fn ring_worker() {
     assert_eq!(gathered.as_array().shape(), &[1, 3]);
     assert_eq!(gathered.as_slice::<i32>(), &[0, 1, 2]);
 
+    // Exercise more than one row so arbitrary-axis reconstruction cannot
+    // accidentally interleave rows across complete rank payloads.
+    let batched_uneven = if expected_rank == 0 {
+        Array::from_slice(&[0i32, 1, 10, 11], &[1, 2, 2])
+    } else {
+        Array::from_slice(&[2i32, 12], &[1, 2, 1])
+    };
+    let gathered =
+        distributed::all_gather_uneven_axis(&batched_uneven, -1, &[2, 1], &group, &stream).unwrap();
+    let gathered = gathered.evaluated().unwrap();
+    assert_eq!(gathered.as_array().shape(), &[1, 2, 3]);
+    assert_eq!(gathered.as_slice::<i32>(), &[0, 1, 2, 10, 11, 12]);
+
     let column_full = Linear {
         weight: Param::new(Array::from_slice(
             &[

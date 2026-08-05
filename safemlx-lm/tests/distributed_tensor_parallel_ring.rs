@@ -11,7 +11,7 @@ use std::{
 
 use safemlx::{
     distributed::{self, Backend},
-    module::ModuleParameters,
+    module::{Module, ModuleParameters},
     ops::GgufMetadataValue,
     random::{self, RandomState},
     Array, Device, DeviceType, ExecutionContext, Stream,
@@ -24,7 +24,15 @@ use safemlx_lm::{
             model::{self as deepseek_v3, Cache as DeepSeekCache},
         },
         llama::layerwise::{load_llama_tensor_parallel_model, LlamaCache, LlamaModel},
+        qwen::dense::{
+            self as dense_qwen,
+            layerwise::{
+                load_tensor_parallel_model as load_qwen_tensor_parallel_model,
+                DenseQwenLayerwiseCache, LayerwiseDecoder as DenseQwenLayerwiseDecoder,
+            },
+        },
     },
+    runtime::cache::KeyValueCache,
     runtime::checkpoint::binding::canonical_checkpoint_name,
     runtime::generation::sampler::DefaultSampler,
     sample_and_synchronize, CacheResidencyPolicy, DeviceAssignment, LayerCachePolicy,
@@ -37,36 +45,123 @@ use safetensors::tensor::{serialize_to_file, Dtype, TensorView};
 const WORKER_RANK: &str = "SAFEMLX_LM_TENSOR_RING_WORKER";
 const CHECKPOINT_DIR: &str = "SAFEMLX_LM_TENSOR_CHECKPOINT";
 const PROMPT_CACHE_ROOT: &str = "SAFEMLX_LM_TENSOR_PROMPT_CACHE";
+const FIXTURE_FAMILY: &str = "SAFEMLX_LM_TENSOR_FIXTURE_FAMILY";
+const ZERO_BIAS_CHECKPOINT: &str = "SAFEMLX_LM_TENSOR_ZERO_BIAS_CHECKPOINT";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FixtureFamily {
+    LlamaSafetensors,
+    LlamaGguf,
+    DeepSeekSafetensors,
+    Qwen2Gguf,
+    Qwen2Q8Gguf,
+}
+
+impl FixtureFamily {
+    const fn name(self) -> &'static str {
+        match self {
+            Self::LlamaSafetensors => "llama-safetensors",
+            Self::LlamaGguf => "llama-gguf",
+            Self::DeepSeekSafetensors => "deepseek-safetensors",
+            Self::Qwen2Gguf => "qwen2-gguf",
+            Self::Qwen2Q8Gguf => "qwen2-q8_0-gguf",
+        }
+    }
+
+    fn parse(value: &str) -> Self {
+        match value {
+            "llama-safetensors" => Self::LlamaSafetensors,
+            "llama-gguf" => Self::LlamaGguf,
+            "deepseek-safetensors" => Self::DeepSeekSafetensors,
+            "qwen2-gguf" => Self::Qwen2Gguf,
+            "qwen2-q8_0-gguf" => Self::Qwen2Q8Gguf,
+            _ => panic!("unknown tensor-parallel fixture family {value:?}"),
+        }
+    }
+
+    const fn layer_count(self) -> usize {
+        match self {
+            Self::Qwen2Gguf | Self::Qwen2Q8Gguf => 2,
+            _ => 1,
+        }
+    }
+
+    const fn vocab_size(self) -> usize {
+        match self {
+            Self::DeepSeekSafetensors => 8,
+            Self::Qwen2Gguf => 8,
+            Self::Qwen2Q8Gguf => 64,
+            _ => 5,
+        }
+    }
+
+    const fn model_type(self) -> &'static str {
+        match self {
+            Self::LlamaSafetensors | Self::LlamaGguf => "llama",
+            Self::DeepSeekSafetensors => "deepseek_v3",
+            Self::Qwen2Gguf | Self::Qwen2Q8Gguf => "qwen2",
+        }
+    }
+
+    const fn persists_paged_prefix(self) -> bool {
+        !self.is_qwen2()
+    }
+
+    const fn is_qwen2(self) -> bool {
+        matches!(self, Self::Qwen2Gguf | Self::Qwen2Q8Gguf)
+    }
+
+    const fn qwen2_head_dim(self) -> i32 {
+        match self {
+            Self::Qwen2Gguf => 2,
+            Self::Qwen2Q8Gguf => 16,
+            _ => panic!("non-Qwen fixture has no Qwen head dimension"),
+        }
+    }
+
+    fn qwen2_payload_bytes(self) -> u64 {
+        match self {
+            Self::Qwen2Gguf => qwen2_gguf_payload_bytes(),
+            Self::Qwen2Q8Gguf => qwen2_q8_0_gguf_payload_bytes(),
+            _ => panic!("non-Qwen fixture has no Qwen GGUF payload"),
+        }
+    }
+}
 
 enum GeneralizedTensorModel {
     Llama(LlamaModel),
     DeepSeek(DeepSeekV3LayerwiseModel),
+    Qwen(DenseQwenLayerwiseDecoder),
 }
 
 enum GeneralizedTensorCache {
     Llama(LlamaCache),
     DeepSeek(DeepSeekCache),
+    Qwen(DenseQwenLayerwiseCache),
 }
 
 impl GeneralizedTensorModel {
     fn load(
         checkpoint: &Path,
-        deepseek: bool,
+        family: FixtureFamily,
         topology: ParallelTopology,
         stream: &Stream,
     ) -> Self {
         let build = ParallelBuildContext::new(topology, ShardingPolicy::Require);
         let options = LayerwiseLoadOptions::default();
-        if deepseek {
-            Self::DeepSeek(
+        match family {
+            FixtureFamily::DeepSeekSafetensors => Self::DeepSeek(
                 load_deepseek_v3_tensor_parallel_model(checkpoint, options, build, stream, stream)
                     .unwrap(),
-            )
-        } else {
-            Self::Llama(
+            ),
+            FixtureFamily::LlamaSafetensors | FixtureFamily::LlamaGguf => Self::Llama(
                 load_llama_tensor_parallel_model(checkpoint, options, build, stream, stream)
                     .unwrap(),
-            )
+            ),
+            FixtureFamily::Qwen2Gguf | FixtureFamily::Qwen2Q8Gguf => Self::Qwen(
+                load_qwen_tensor_parallel_model(checkpoint, options, build, stream, stream)
+                    .unwrap(),
+            ),
         }
     }
 
@@ -74,6 +169,7 @@ impl GeneralizedTensorModel {
         match self {
             Self::Llama(model) => model.parallel_info().unwrap(),
             Self::DeepSeek(model) => model.parallel_info().unwrap(),
+            Self::Qwen(model) => model.parallel_info().unwrap(),
         }
     }
 
@@ -81,6 +177,7 @@ impl GeneralizedTensorModel {
         match self {
             Self::Llama(model) => model.prompt_cache_architecture_fingerprint(),
             Self::DeepSeek(model) => model.prompt_cache_architecture_fingerprint(),
+            Self::Qwen(model) => model.prompt_cache_architecture_fingerprint(),
         }
     }
 
@@ -88,6 +185,7 @@ impl GeneralizedTensorModel {
         match self {
             Self::Llama(model) => model.prompt_cache_layer_layout().unwrap(),
             Self::DeepSeek(model) => model.prompt_cache_layer_layout().unwrap(),
+            Self::Qwen(model) => model.prompt_cache_layer_layout().unwrap(),
         }
     }
 
@@ -103,6 +201,9 @@ impl GeneralizedTensorModel {
                     .new_cache_with_options(CacheResidencyPolicy::Paged(options))
                     .unwrap(),
             ),
+            Self::Qwen(model) => {
+                GeneralizedTensorCache::Qwen(DenseQwenLayerwiseCache::Concat(model.new_cache()))
+            }
         }
     }
 
@@ -120,7 +221,20 @@ impl GeneralizedTensorModel {
             (Self::DeepSeek(model), GeneralizedTensorCache::DeepSeek(cache)) => model
                 .forward_tensor_parallel(inputs, cache, group, stream)
                 .unwrap(),
+            (Self::Qwen(model), GeneralizedTensorCache::Qwen(cache)) => model
+                .forward_tensor_parallel(inputs, None, cache, group, stream)
+                .unwrap(),
             _ => panic!("generalized tensor model/cache architecture mismatch"),
+        }
+    }
+
+    fn checkpoint_diagnostics(
+        &self,
+    ) -> safemlx_lm::runtime::checkpoint::store::WeightStoreDiagnostics {
+        match self {
+            Self::Llama(model) => model.checkpoint_store().unwrap().diagnostics().unwrap(),
+            Self::DeepSeek(model) => model.checkpoint_store().diagnostics().unwrap(),
+            Self::Qwen(model) => model.checkpoint_store().diagnostics().unwrap(),
         }
     }
 
@@ -152,6 +266,9 @@ impl GeneralizedTensorModel {
                     stream,
                 )
                 .unwrap(),
+            (Self::Qwen(_), GeneralizedTensorCache::Qwen(_)) => {
+                panic!("Qwen2 GGUF fixture does not exercise prompt-cache persistence")
+            }
             _ => panic!("generalized tensor model/cache architecture mismatch"),
         }
     }
@@ -176,6 +293,9 @@ impl GeneralizedTensorModel {
                     .unwrap();
                 (GeneralizedTensorCache::DeepSeek(cache), manifest)
             }
+            Self::Qwen(_) => {
+                panic!("Qwen2 GGUF fixture does not exercise prompt-cache persistence")
+            }
         }
     }
 }
@@ -185,8 +305,71 @@ impl GeneralizedTensorCache {
         match self {
             Self::Llama(cache) => cache.offset(),
             Self::DeepSeek(cache) => cache.offset(),
+            Self::Qwen(DenseQwenLayerwiseCache::Concat(cache)) => cache
+                .first()
+                .and_then(Option::as_ref)
+                .map_or(0, KeyValueCache::offset),
+            Self::Qwen(DenseQwenLayerwiseCache::Sliding(cache)) => cache
+                .first()
+                .and_then(Option::as_ref)
+                .map_or(0, KeyValueCache::offset),
+            Self::Qwen(DenseQwenLayerwiseCache::Paged(cache)) => cache
+                .first()
+                .and_then(Option::as_ref)
+                .map_or(0, KeyValueCache::offset),
         }
     }
+
+    fn assert_qwen2_local_cache_geometry(&self, full_sequence: i32, head_dim: i32) {
+        let Self::Qwen(DenseQwenLayerwiseCache::Concat(layers)) = self else {
+            panic!("Qwen2 local cache assertion requires a concat dense-Qwen cache")
+        };
+        assert_eq!(layers.len(), 2);
+        for (index, cache) in layers.iter().enumerate() {
+            let cache = cache.as_ref().unwrap();
+            let arrays = cache.retained_arrays();
+            assert_eq!(arrays.len(), 2);
+            let retained_sequence = if index == 1 {
+                full_sequence.min(1)
+            } else {
+                full_sequence
+            };
+            assert_eq!(arrays[0].shape(), &[1, 1, retained_sequence, head_dim]);
+            assert_eq!(arrays[1].shape(), &[1, 1, retained_sequence, head_dim]);
+            assert_eq!(cache.max_size(), (index == 1).then_some(2));
+        }
+    }
+}
+
+fn evaluated_values(array: &Array) -> Vec<f32> {
+    array.evaluated().unwrap().as_slice::<f32>().to_vec()
+}
+
+fn assert_arrays_close(actual: &Array, expected: &Array, tolerance: f32) {
+    let actual_values = evaluated_values(actual);
+    let expected_values = evaluated_values(expected);
+    assert_eq!(actual_values.len(), expected_values.len());
+    for (index, (actual, expected)) in actual_values.iter().zip(&expected_values).enumerate() {
+        assert!(
+            (actual - expected).abs() <= tolerance,
+            "tensor element {index} was {actual}, expected {expected} within {tolerance}; actual={actual_values:?}, expected={expected_values:?}",
+        );
+    }
+}
+
+fn assert_arrays_materially_different(left: &Array, right: &Array, threshold: f32) {
+    let left = evaluated_values(left);
+    let right = evaluated_values(right);
+    assert_eq!(left.len(), right.len());
+    let maximum_difference = left
+        .iter()
+        .zip(&right)
+        .map(|(left, right)| (left - right).abs())
+        .fold(0.0f32, f32::max);
+    assert!(
+        maximum_difference > threshold,
+        "Q/K/V biases changed logits by only {maximum_difference}; expected more than {threshold}"
+    );
 }
 
 #[test]
@@ -196,21 +379,9 @@ fn tensor_ring_worker() {
     };
     let expected_rank: usize = rank.to_string_lossy().parse().unwrap();
     let checkpoint = PathBuf::from(std::env::var_os(CHECKPOINT_DIR).unwrap());
-    let (deepseek, layer_count, vocab_size) = if checkpoint
-        .extension()
-        .is_some_and(|extension| extension.eq_ignore_ascii_case("gguf"))
-    {
-        (false, 1, 5)
-    } else {
-        let config: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(checkpoint.join("config.json")).unwrap())
-                .unwrap();
-        (
-            config["model_type"] == "deepseek_v3",
-            config["num_hidden_layers"].as_u64().unwrap() as usize,
-            config["vocab_size"].as_u64().unwrap() as usize,
-        )
-    };
+    let family = FixtureFamily::parse(&std::env::var(FIXTURE_FAMILY).unwrap());
+    let layer_count = family.layer_count();
+    let vocab_size = family.vocab_size();
     let prompt_cache_root = PathBuf::from(std::env::var_os(PROMPT_CACHE_ROOT).unwrap());
     let group = distributed::init(true, Backend::Ring).unwrap();
     let topology =
@@ -218,18 +389,34 @@ fn tensor_ring_worker() {
             .unwrap();
     assert_eq!(topology.global_rank, expected_rank);
     let stream = Stream::new_with_device(&topology.device.device().unwrap());
-    let mut model = GeneralizedTensorModel::load(&checkpoint, deepseek, topology, &stream);
+    let mut model = GeneralizedTensorModel::load(&checkpoint, family, topology, &stream);
     let info = model.parallel_info();
     assert_eq!(info.topology(), topology);
     assert_eq!(info.topology().tensor_parallel_rank, expected_rank);
     assert_eq!(info.topology().tensor_parallel_size, 2);
-    if !deepseek {
+    if matches!(
+        family,
+        FixtureFamily::LlamaSafetensors | FixtureFamily::LlamaGguf
+    ) {
         assert!(info.local_parameter_bytes() < 656);
     }
     assert!(info
         .owned_tensors()
         .iter()
-        .any(|name| name == "model.embed_tokens.weight"));
+        .any(|name| canonical_checkpoint_name(name) == "model.embed_tokens.weight"));
+
+    if family.is_qwen2() {
+        assert_eq!(info.model_type(), "qwen2");
+        assert!(info.local_parameter_bytes() < family.qwen2_payload_bytes());
+        for layer in 0..2 {
+            for projection in ["q", "k", "v"] {
+                assert!(info.owned_tensors().iter().any(|name| {
+                    canonical_checkpoint_name(name)
+                        == format!("model.layers.{layer}.self_attn.{projection}_proj.bias")
+                }));
+            }
+        }
+    }
 
     let paged = PagedCacheOptions::new(1, 4096, 4096, 1)
         .unwrap()
@@ -238,9 +425,74 @@ fn tensor_ring_worker() {
     let prompt = safemlx::Array::from_slice(&[1u32, 2], &[1, 2]);
     let logits = model.forward_tensor_parallel(&prompt, &mut cache, &group, &stream);
     assert_eq!(logits.shape(), &[1, 2, vocab_size as i32]);
+
+    if family.is_qwen2() {
+        let mut reference = dense_qwen::load_gguf(&checkpoint, &stream, &stream).unwrap();
+        let mut reference_cache = reference.new_cache();
+        let reference_logits = reference
+            .forward(
+                dense_qwen::ModelInput {
+                    inputs: &prompt,
+                    mask: None,
+                    cache: &mut reference_cache,
+                },
+                &stream,
+            )
+            .unwrap();
+        let tolerance = if family == FixtureFamily::Qwen2Q8Gguf {
+            2e-4
+        } else {
+            5e-5
+        };
+        assert_arrays_close(&logits, &reference_logits, tolerance);
+        cache.assert_qwen2_local_cache_geometry(2, family.qwen2_head_dim());
+
+        let diagnostics = model.checkpoint_diagnostics();
+        assert!(diagnostics.physical_reads > 0);
+        assert!(
+            diagnostics.physical_read_bytes < family.qwen2_payload_bytes(),
+            "rank {expected_rank} read {} GGUF bytes for a {}-byte global tensor payload",
+            diagnostics.physical_read_bytes,
+            family.qwen2_payload_bytes()
+        );
+
+        let zero_bias_checkpoint = PathBuf::from(std::env::var_os(ZERO_BIAS_CHECKPOINT).unwrap());
+        let mut zero_bias = dense_qwen::load_gguf(zero_bias_checkpoint, &stream, &stream).unwrap();
+        let mut zero_bias_cache = zero_bias.new_cache();
+        let zero_bias_logits = zero_bias
+            .forward(
+                dense_qwen::ModelInput {
+                    inputs: &prompt,
+                    mask: None,
+                    cache: &mut zero_bias_cache,
+                },
+                &stream,
+            )
+            .unwrap();
+        assert_arrays_materially_different(&reference_logits, &zero_bias_logits, 1e-5);
+
+        let token = Array::from_slice(&[3u32], &[1, 1]);
+        let distributed_decode = model.forward_tensor_parallel(&token, &mut cache, &group, &stream);
+        let reference_decode = reference
+            .forward(
+                dense_qwen::ModelInput {
+                    inputs: &token,
+                    mask: None,
+                    cache: &mut reference_cache,
+                },
+                &stream,
+            )
+            .unwrap();
+        assert_arrays_close(&distributed_decode, &reference_decode, tolerance);
+        cache.assert_qwen2_local_cache_geometry(3, family.qwen2_head_dim());
+        assert_eq!(cache.offset(), 3);
+        return;
+    }
+
+    assert!(family.persists_paged_prefix());
     let descriptor = PromptCacheDescriptor {
-        model_family: if deepseek { "deepseek_v3" } else { "llama" }.into(),
-        effective_model_type: if deepseek { "deepseek_v3" } else { "llama" }.into(),
+        model_family: family.model_type().into(),
+        effective_model_type: family.model_type().into(),
         checkpoint_fingerprint: "tensor-ring-fixture".into(),
         prefix_content_fingerprint: "tokens:1,2".into(),
         architecture_fingerprint: model.prompt_cache_architecture_fingerprint(),
@@ -372,7 +624,7 @@ fn write_fixture(directory: &Path) {
     .unwrap();
 }
 
-fn write_gguf_fixture(path: &Path) {
+fn write_llama_gguf_fixture(path: &Path) {
     let metadata = BTreeMap::from([
         (
             "general.architecture".into(),
@@ -437,6 +689,370 @@ fn write_gguf_fixture(path: &Path) {
             dimensions,
             ggml_type: GgmlType::F32,
             data,
+        })
+        .collect::<Vec<_>>();
+    Writer::default()
+        .write(std::fs::File::create(path).unwrap(), &metadata, &tensors)
+        .unwrap();
+}
+
+fn patterned_values(length: usize, scale: f32, phase: usize) -> Vec<f32> {
+    (0..length)
+        .map(|index| {
+            let centered = ((index * 17 + phase * 11) % 29) as f32 - 14.0;
+            centered * scale
+        })
+        .collect()
+}
+
+fn qwen2_gguf_specs(with_biases: bool) -> Vec<(String, Vec<u64>, Vec<f32>)> {
+    let mut specs = vec![(
+        "token_embd.weight".into(),
+        vec![8, 8],
+        patterned_values(64, 0.015, 1),
+    )];
+    for layer in 0..2 {
+        let phase = layer * 10;
+        specs.extend([
+            (
+                format!("blk.{layer}.attn_q.weight"),
+                vec![8, 8],
+                patterned_values(64, 0.012, phase + 2),
+            ),
+            (
+                format!("blk.{layer}.attn_q.bias"),
+                vec![8],
+                if with_biases {
+                    patterned_values(8, 0.035, phase + 3)
+                } else {
+                    vec![0.0; 8]
+                },
+            ),
+            (
+                format!("blk.{layer}.attn_k.weight"),
+                vec![8, 4],
+                patterned_values(32, 0.014, phase + 4),
+            ),
+            (
+                format!("blk.{layer}.attn_k.bias"),
+                vec![4],
+                if with_biases {
+                    patterned_values(4, 0.04, phase + 5)
+                } else {
+                    vec![0.0; 4]
+                },
+            ),
+            (
+                format!("blk.{layer}.attn_v.weight"),
+                vec![8, 4],
+                patterned_values(32, 0.013, phase + 6),
+            ),
+            (
+                format!("blk.{layer}.attn_v.bias"),
+                vec![4],
+                if with_biases {
+                    patterned_values(4, 0.045, phase + 7)
+                } else {
+                    vec![0.0; 4]
+                },
+            ),
+            (
+                format!("blk.{layer}.attn_output.weight"),
+                vec![8, 8],
+                patterned_values(64, 0.011, phase + 8),
+            ),
+            (
+                format!("blk.{layer}.ffn_gate.weight"),
+                vec![8, 16],
+                patterned_values(128, 0.009, phase + 9),
+            ),
+            (
+                format!("blk.{layer}.ffn_up.weight"),
+                vec![8, 16],
+                patterned_values(128, 0.008, phase + 10),
+            ),
+            (
+                format!("blk.{layer}.ffn_down.weight"),
+                vec![16, 8],
+                patterned_values(128, 0.01, phase + 11),
+            ),
+            (
+                format!("blk.{layer}.attn_norm.weight"),
+                vec![8],
+                vec![1.0; 8],
+            ),
+            (
+                format!("blk.{layer}.ffn_norm.weight"),
+                vec![8],
+                vec![1.0; 8],
+            ),
+        ]);
+    }
+    specs.extend([
+        ("output_norm.weight".into(), vec![8], vec![1.0; 8]),
+        (
+            "output.weight".into(),
+            vec![8, 8],
+            patterned_values(64, 0.017, 23),
+        ),
+    ]);
+    specs
+}
+
+fn qwen2_gguf_payload_bytes() -> u64 {
+    qwen2_gguf_specs(true)
+        .iter()
+        .map(|(_, _, values)| values.len() as u64 * 4)
+        .sum()
+}
+
+fn qwen2_gguf_metadata(
+    hidden_size: u32,
+    head_dim: u32,
+    intermediate_size: u32,
+    vocab_size: u32,
+) -> BTreeMap<String, GgufMetadataValue> {
+    BTreeMap::from([
+        (
+            "general.architecture".into(),
+            GgufMetadataValue::String("qwen2".into()),
+        ),
+        ("general.file_type".into(), GgufMetadataValue::Uint32(0)),
+        ("qwen2.block_count".into(), GgufMetadataValue::Uint32(2)),
+        (
+            "qwen2.embedding_length".into(),
+            GgufMetadataValue::Uint32(hidden_size),
+        ),
+        (
+            "qwen2.attention.head_count".into(),
+            GgufMetadataValue::Uint32(4),
+        ),
+        (
+            "qwen2.attention.head_count_kv".into(),
+            GgufMetadataValue::Uint32(2),
+        ),
+        (
+            "qwen2.attention.key_length".into(),
+            GgufMetadataValue::Uint32(head_dim),
+        ),
+        (
+            "qwen2.attention.value_length".into(),
+            GgufMetadataValue::Uint32(head_dim),
+        ),
+        (
+            "qwen2.rope.dimension_count".into(),
+            GgufMetadataValue::Uint32(head_dim),
+        ),
+        (
+            "qwen2.feed_forward_length".into(),
+            GgufMetadataValue::Uint32(intermediate_size),
+        ),
+        (
+            "qwen2.attention.layer_norm_rms_epsilon".into(),
+            GgufMetadataValue::Float32(0.000001),
+        ),
+        ("qwen2.context_length".into(), GgufMetadataValue::Uint32(32)),
+        (
+            "qwen2.rope.freq_base".into(),
+            GgufMetadataValue::Float32(1_000_000.0),
+        ),
+        (
+            "qwen2.vocab_size".into(),
+            GgufMetadataValue::Uint32(vocab_size),
+        ),
+        (
+            "qwen2.attention.sliding_window".into(),
+            GgufMetadataValue::Uint32(2),
+        ),
+        (
+            "qwen2.attention.sliding_window_pattern".into(),
+            GgufMetadataValue::Array(safemlx::ops::GgufMetadataArray::Bool(vec![false, true])),
+        ),
+    ])
+}
+
+fn write_qwen2_gguf_fixture(path: &Path, with_biases: bool) {
+    let metadata = qwen2_gguf_metadata(8, 2, 16, 8);
+    let specs = qwen2_gguf_specs(with_biases);
+    let payloads = specs
+        .iter()
+        .map(|(_, _, values)| {
+            values
+                .iter()
+                .flat_map(|value| value.to_le_bytes())
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    let tensors = specs
+        .iter()
+        .zip(&payloads)
+        .map(|((name, dimensions, _), data)| TensorInput {
+            name,
+            dimensions,
+            ggml_type: GgmlType::F32,
+            data,
+        })
+        .collect::<Vec<_>>();
+    Writer::default()
+        .write(std::fs::File::create(path).unwrap(), &metadata, &tensors)
+        .unwrap();
+}
+
+struct QuantizedGgufTensor {
+    name: String,
+    dimensions: Vec<u64>,
+    ggml_type: GgmlType,
+    data: Vec<u8>,
+}
+
+fn q8_0_payload(elements: u64, phase: usize) -> Vec<u8> {
+    assert_eq!(elements % 32, 0);
+    let blocks = usize::try_from(elements / 32).unwrap();
+    let mut data = Vec::with_capacity(blocks * 34);
+    for block in 0..blocks {
+        // Exact little-endian f16 encodings for 0.015625, 0.017578125,
+        // and 0.01953125 keep the fixture dependency-free and deterministic.
+        let scale_bits = [0x2400u16, 0x2480, 0x2500][block % 3];
+        data.extend_from_slice(&scale_bits.to_le_bytes());
+        data.extend((0..32).map(|index| {
+            let quantized = ((index * 13 + block * 7 + phase * 11) % 127) as i16 - 63;
+            quantized as i8 as u8
+        }));
+    }
+    data
+}
+
+fn q8_0_tensor(name: impl Into<String>, dimensions: Vec<u64>, phase: usize) -> QuantizedGgufTensor {
+    let elements = dimensions.iter().product();
+    QuantizedGgufTensor {
+        name: name.into(),
+        dimensions,
+        ggml_type: GgmlType::Q8_0,
+        data: q8_0_payload(elements, phase),
+    }
+}
+
+fn f32_gguf_tensor(
+    name: impl Into<String>,
+    dimensions: Vec<u64>,
+    values: Vec<f32>,
+) -> QuantizedGgufTensor {
+    assert_eq!(dimensions.iter().product::<u64>() as usize, values.len());
+    QuantizedGgufTensor {
+        name: name.into(),
+        dimensions,
+        ggml_type: GgmlType::F32,
+        data: values
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect(),
+    }
+}
+
+fn qwen2_q8_0_gguf_specs(with_biases: bool) -> Vec<QuantizedGgufTensor> {
+    let mut specs = vec![q8_0_tensor("token_embd.weight", vec![64, 64], 1)];
+    for layer in 0..2 {
+        let phase = layer * 10;
+        specs.extend([
+            q8_0_tensor(
+                format!("blk.{layer}.attn_q.weight"),
+                vec![64, 64],
+                phase + 2,
+            ),
+            f32_gguf_tensor(
+                format!("blk.{layer}.attn_q.bias"),
+                vec![64],
+                if with_biases {
+                    patterned_values(64, 0.02, phase + 3)
+                } else {
+                    vec![0.0; 64]
+                },
+            ),
+            q8_0_tensor(
+                format!("blk.{layer}.attn_k.weight"),
+                vec![64, 32],
+                phase + 4,
+            ),
+            f32_gguf_tensor(
+                format!("blk.{layer}.attn_k.bias"),
+                vec![32],
+                if with_biases {
+                    patterned_values(32, 0.025, phase + 5)
+                } else {
+                    vec![0.0; 32]
+                },
+            ),
+            q8_0_tensor(
+                format!("blk.{layer}.attn_v.weight"),
+                vec![64, 32],
+                phase + 6,
+            ),
+            f32_gguf_tensor(
+                format!("blk.{layer}.attn_v.bias"),
+                vec![32],
+                if with_biases {
+                    patterned_values(32, 0.03, phase + 7)
+                } else {
+                    vec![0.0; 32]
+                },
+            ),
+            q8_0_tensor(
+                format!("blk.{layer}.attn_output.weight"),
+                vec![64, 64],
+                phase + 8,
+            ),
+            q8_0_tensor(
+                format!("blk.{layer}.ffn_gate.weight"),
+                vec![64, 64],
+                phase + 9,
+            ),
+            q8_0_tensor(
+                format!("blk.{layer}.ffn_up.weight"),
+                vec![64, 64],
+                phase + 10,
+            ),
+            q8_0_tensor(
+                format!("blk.{layer}.ffn_down.weight"),
+                vec![64, 64],
+                phase + 11,
+            ),
+            f32_gguf_tensor(
+                format!("blk.{layer}.attn_norm.weight"),
+                vec![64],
+                vec![1.0; 64],
+            ),
+            f32_gguf_tensor(
+                format!("blk.{layer}.ffn_norm.weight"),
+                vec![64],
+                vec![1.0; 64],
+            ),
+        ]);
+    }
+    specs.extend([
+        f32_gguf_tensor("output_norm.weight", vec![64], vec![1.0; 64]),
+        q8_0_tensor("output.weight", vec![64, 64], 23),
+    ]);
+    specs
+}
+
+fn qwen2_q8_0_gguf_payload_bytes() -> u64 {
+    qwen2_q8_0_gguf_specs(true)
+        .iter()
+        .map(|tensor| tensor.data.len() as u64)
+        .sum()
+}
+
+fn write_qwen2_q8_0_gguf_fixture(path: &Path, with_biases: bool) {
+    let mut metadata = qwen2_gguf_metadata(64, 16, 64, 64);
+    metadata.insert("general.file_type".into(), GgufMetadataValue::Uint32(7));
+    let specs = qwen2_q8_0_gguf_specs(with_biases);
+    let tensors = specs
+        .iter()
+        .map(|tensor| TensorInput {
+            name: &tensor.name,
+            dimensions: &tensor.dimensions,
+            ggml_type: tensor.ggml_type,
+            data: &tensor.data,
         })
         .collect::<Vec<_>>();
     Writer::default()
@@ -551,37 +1167,76 @@ fn render_failure(rank: usize, output: &Output) -> String {
 #[test]
 #[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
 fn ring_two_process_tensor_parallel() {
-    run_ring_tensor_parallel(false, false);
+    run_ring_tensor_parallel(FixtureFamily::LlamaSafetensors);
 }
 
 /// Verifies bounded GGUF reads through the same two-rank generalized engine.
 #[test]
 #[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
 fn ring_two_process_gguf_tensor_parallel() {
-    run_ring_tensor_parallel(false, true);
+    run_ring_tensor_parallel(FixtureFamily::LlamaGguf);
+}
+
+/// Verifies Qwen2 GQA, learned Q/K/V biases, mixed attention, and bounded GGUF reads.
+#[test]
+#[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
+fn ring_two_process_qwen2_gguf_tensor_parallel() {
+    run_ring_tensor_parallel(FixtureFamily::Qwen2Gguf);
+}
+
+/// Verifies block-aligned Q8_0 Qwen2 tensor sharding and bounded GGUF reads.
+#[test]
+#[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
+fn ring_two_process_qwen2_q8_0_gguf_tensor_parallel() {
+    run_ring_tensor_parallel(FixtureFamily::Qwen2Q8Gguf);
 }
 
 /// Verifies DeepSeek MLA paged-prefix persistence across two tensor ranks.
 #[test]
 #[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
 fn ring_two_process_deepseek_tensor_parallel_persistence() {
-    run_ring_tensor_parallel(true, false);
+    run_ring_tensor_parallel(FixtureFamily::DeepSeekSafetensors);
 }
 
-fn run_ring_tensor_parallel(deepseek: bool, gguf: bool) {
+fn run_ring_tensor_parallel(family: FixtureFamily) {
     assert!(distributed::is_available(Backend::Ring));
     let checkpoint = tempfile::tempdir().unwrap();
-    let checkpoint_path = if gguf {
-        let path = checkpoint.path().join("model.gguf");
-        write_gguf_fixture(&path);
-        path
-    } else if deepseek {
-        write_deepseek_fixture(checkpoint.path(), 1);
-        checkpoint.path().to_path_buf()
-    } else {
-        write_fixture(checkpoint.path());
-        checkpoint.path().to_path_buf()
+    let checkpoint_path = match family {
+        FixtureFamily::LlamaSafetensors => {
+            write_fixture(checkpoint.path());
+            checkpoint.path().to_path_buf()
+        }
+        FixtureFamily::LlamaGguf => {
+            let path = checkpoint.path().join("model.gguf");
+            write_llama_gguf_fixture(&path);
+            path
+        }
+        FixtureFamily::DeepSeekSafetensors => {
+            write_deepseek_fixture(checkpoint.path(), 1);
+            checkpoint.path().to_path_buf()
+        }
+        FixtureFamily::Qwen2Gguf => {
+            let path = checkpoint.path().join("model.gguf");
+            write_qwen2_gguf_fixture(&path, true);
+            path
+        }
+        FixtureFamily::Qwen2Q8Gguf => {
+            let path = checkpoint.path().join("model.gguf");
+            write_qwen2_q8_0_gguf_fixture(&path, true);
+            path
+        }
     };
+    let zero_bias_checkpoint = tempfile::tempdir().unwrap();
+    let zero_bias_checkpoint_path = zero_bias_checkpoint.path().join("model.gguf");
+    match family {
+        FixtureFamily::Qwen2Gguf => {
+            write_qwen2_gguf_fixture(&zero_bias_checkpoint_path, false);
+        }
+        FixtureFamily::Qwen2Q8Gguf => {
+            write_qwen2_q8_0_gguf_fixture(&zero_bias_checkpoint_path, false);
+        }
+        _ => {}
+    }
     let prompt_cache = tempfile::tempdir().unwrap();
     let (first_socket, second_socket, first_port, second_port) = reserve_two_ports();
     let ring = tempfile::tempdir().unwrap();
@@ -605,7 +1260,9 @@ fn run_ring_tensor_parallel(deepseek: bool, gguf: bool) {
                 .args(["--exact", "tensor_ring_worker", "--nocapture"])
                 .env(WORKER_RANK, rank.to_string())
                 .env(CHECKPOINT_DIR, &checkpoint_path)
+                .env(FIXTURE_FAMILY, family.name())
                 .env(PROMPT_CACHE_ROOT, prompt_cache.path())
+                .env(ZERO_BIAS_CHECKPOINT, &zero_bias_checkpoint_path)
                 .env("MLX_RANK", rank.to_string())
                 .env("MLX_HOSTFILE", &hostfile)
                 .env_remove("MLX_RING_VERBOSE")

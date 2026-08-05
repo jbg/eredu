@@ -121,6 +121,11 @@ impl LayerwiseDecoder {
         self.execution.prompt_cache_layer_layout()
     }
 
+    /// Returns the architecture identity used to validate persisted prompt caches.
+    pub fn prompt_cache_architecture_fingerprint(&self) -> String {
+        resident::prompt_cache_architecture_fingerprint(self.args())
+    }
+
     /// Persists a compatible standard prefix cache.
     pub fn save_prompt_cache(
         &self,
