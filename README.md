@@ -133,9 +133,9 @@ Llama and Mistral have also removed their normalized global-window field and
 separate sliding-cache dispatch. Hugging Face and GGUF scalar metadata normalize
 once into `LayerSchedule<AttentionPolicy>`; resident, bounded, paged, tensor,
 pipeline, cache-identity, and memory paths then use the exact policy at each
-layer. Internally mixed and distinct-window schedules are supported, while
-prompt-cache persistence remains fail-closed for non-uniform schedules under
-schema v2.
+layer. Internally mixed and distinct-window schedules are supported. Prompt-cache
+schema v4 persists the exact ordered per-layer layout, including distinct
+sliding windows and each layer's retained token interval.
 
 ## Platforms
 

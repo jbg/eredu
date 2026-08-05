@@ -248,9 +248,10 @@ implements `Deserialize` or exposes `sliding_window`; JSON callers use
 `attention_schedule`. `ResidentModel::sliding_window`, `new_sliding_cache`, the
 `LlamaCache::Standard`/`Sliding` split, and architecture-erased
 `ModelCache::SlidingKeyValue`/`ModelGenerate::LlamaSliding` routes were removed.
-Persisted prompt caches remain limited to uniform all-full or all-sliding
-schedules because schema v2 stores one model-wide window; non-uniform schedules
-fail closed, while their complete order is still included in cache identity.
+Prompt-cache schema v4 persists the complete ordered schedule, exact per-layer
+windows, tensor geometry, and retained token intervals. Save/reload therefore
+supports non-uniform and distinct-window schedules without weakening cache
+identity validation.
 
 ## Dense Qwen2/Qwen2.5/Qwen3 weight residency
 
@@ -285,10 +286,10 @@ This intentionally replaces the public dense-Qwen `use_sliding_window`,
 `sliding_window`, and `max_window_layers` fields and removes
 `sliding_window_for_layer`. Callers construct or query `attention_schedule`
 directly. Ordered policies are included in architecture and prompt-cache
-fingerprints. Normal and paged caches support every schedule; persisted prompt
-caches support uniform all-full or all-sliding schedules, while non-uniform
-schedules fail closed because prompt-cache schema v2 has only one model-wide
-window. Qwen2 safetensors tensor parallelism uses the generalized family
+fingerprints. Normal and paged caches support every schedule; schema-v4
+persisted prompt caches preserve arbitrary ordered full/sliding policies,
+distinct per-layer windows, and each layer's retained token interval. Qwen2
+safetensors tensor parallelism uses the generalized family
 adapter; pipeline parallelism remains unsupported.
 
 The former public `architectures::qwen::qwen3` module was removed. Dense Qwen
@@ -312,10 +313,9 @@ Resident, layerwise-host, dense-streamed, ordinary-cache, paged-cache,
 generation, structural, expert-parallel, fingerprint, and runtime-state paths
 all consume the canonical schedule. Arbitrary ordering and internally distinct
 windows are supported; state reports group sliding layers by exact window and
-full layers grow with context. Prompt-cache identity includes the complete
-ordered schedule. Persistence accepts arbitrary patterns with one shared
-sliding window and rejects distinct-window schedules because schema v2 has one
-model-wide window. The normalized `ModelArgs` removed raw `layer_types` and
+full layers grow with context. Prompt-cache schema v4 persists the complete
+ordered schedule, exact per-layer windows, tensor geometry, and retained token
+intervals. The normalized `ModelArgs` removed raw `layer_types` and
 `sliding_window` and no longer implements `Deserialize`; JSON callers use
 `model_args_from_config_value`.
 

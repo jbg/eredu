@@ -3578,6 +3578,147 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires MLX runtime execution"]
+    fn schema_v4_qwen2_paged_save_drop_reload_preserves_distinct_windows() {
+        use crate::{
+            api::{Model as ApiModel, ModelCache},
+            runtime::cache::residency::{
+                CacheResidencyPolicy, PagedCacheOptions, PromptCacheDescriptor, PromptCacheOptions,
+                PromptCacheTopology,
+            },
+        };
+
+        let context =
+            safemlx::ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
+        let stream = context.stream();
+        let mut args = tiny_qwen2_args();
+        args.attention_schedule = LayerSchedule::new(
+            4,
+            vec![
+                AttentionPolicy::sliding(3).unwrap(),
+                AttentionPolicy::Full,
+                AttentionPolicy::sliding(5).unwrap(),
+                AttentionPolicy::Full,
+            ],
+        )
+        .unwrap();
+        let mut resident = super::Model::new(args.clone(), stream).unwrap();
+        initialize_model(&mut resident, stream);
+
+        let prefix_ids = [1_u32, 2, 3, 4, 5, 6];
+        let prefix = Array::from_slice(&prefix_ids, &[1, 6]);
+        let suffix = Array::from_slice(&[7_u32], &[1, 1]);
+        let mut reference = resident.clone();
+        let mut reference_cache = reference.new_cache();
+        reference
+            .forward(
+                super::ModelInput {
+                    inputs: &prefix,
+                    mask: None,
+                    cache: &mut reference_cache,
+                },
+                stream,
+            )
+            .unwrap();
+        let expected = reference
+            .forward(
+                super::ModelInput {
+                    inputs: &suffix,
+                    mask: None,
+                    cache: &mut reference_cache,
+                },
+                stream,
+            )
+            .unwrap();
+
+        let options = PagedCacheOptions::new(2, 1 << 20, 1 << 20, 1)
+            .unwrap()
+            .with_full_attention(true);
+        let mut model = ApiModel::DenseQwen(resident);
+        let mut cache = model
+            .new_cache_with_options(CacheResidencyPolicy::Paged(options.clone()))
+            .unwrap();
+        let (ApiModel::DenseQwen(resident), ModelCache::PagedKeyValue(paged)) =
+            (&mut model, &mut cache)
+        else {
+            panic!("expected resident dense-Qwen model with a paged cache");
+        };
+        resident
+            .forward(
+                super::ModelInput {
+                    inputs: &prefix,
+                    mask: None,
+                    cache: paged,
+                },
+                stream,
+            )
+            .unwrap();
+
+        let layout = model.prompt_cache_layer_layout().unwrap();
+        let descriptor = PromptCacheDescriptor {
+            model_family: "dense_qwen".into(),
+            effective_model_type: args.model_type.clone(),
+            checkpoint_fingerprint: "initialized-fixture".into(),
+            prefix_content_fingerprint: "tokens:1,2,3,4,5,6".into(),
+            architecture_fingerprint: super::prompt_cache_architecture_fingerprint(&args),
+            layer_count: layout.len(),
+            global_layer_start: 0,
+            global_layer_end: layout.len(),
+            batch_size: 1,
+            layer_layout: layout,
+            sink_tokens: 0,
+            topology: PromptCacheTopology::default(),
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let destination = directory.path().join("prompt-cache");
+        let saved = model
+            .save_prompt_cache(
+                &mut cache,
+                &destination,
+                descriptor.clone(),
+                &prefix_ids,
+                &PromptCacheOptions::default(),
+                stream,
+            )
+            .unwrap();
+        assert_eq!(saved.schema_version, 4);
+        drop(cache);
+
+        let (mut restored, manifest) = model
+            .load_prompt_cache(&destination, &descriptor, &prefix_ids, options, stream)
+            .unwrap();
+        assert_eq!(manifest.schema_version, 4);
+        let ModelCache::PagedKeyValue(restored_paged) = &mut restored else {
+            panic!("expected restored dense-Qwen paged cache");
+        };
+        assert_eq!(
+            restored_paged
+                .iter()
+                .map(|cache| cache.as_ref().unwrap().max_size())
+                .collect::<Vec<_>>(),
+            vec![Some(3), None, Some(5), None]
+        );
+        assert!(restored_paged
+            .iter()
+            .all(|cache| cache.as_ref().unwrap().offset() == prefix_ids.len() as i32));
+
+        let ApiModel::DenseQwen(resident) = &mut model else {
+            unreachable!("model variant changed after prompt-cache restore")
+        };
+        let continued = resident
+            .forward(
+                super::ModelInput {
+                    inputs: &suffix,
+                    mask: None,
+                    cache: restored_paged,
+                },
+                stream,
+            )
+            .unwrap();
+        assert_close(&expected, &continued, stream);
+    }
+
+    #[test]
     fn parses_qwen25_style_config_and_derives_head_dimension() {
         let args = super::config_from_hf_value(&serde_json::json!({
             "architectures": ["Qwen2ForCausalLM"],

@@ -308,9 +308,8 @@ full/sliding order and distinct positive windows. Each ordinary or paged cache
 receives its layer's exact policy; an `N`-position sliding window includes the
 current token and retains at most `N - 1` past positions between calls. Memory
 reports count context-growing full layers and group bounded layers by exact
-window. Prompt-cache fingerprints contain the complete order, but persistence
-fails closed for non-uniform schedules because schema v2 stores only one
-model-wide window.
+window. Prompt-cache schema v4 persists the complete order, exact per-layer
+windows and tensor layouts, and each layer's retained token interval.
 
 The migration intentionally removes normalized `ModelArgs.sliding_window`,
 direct `ModelArgs` deserialization, `ResidentModel::sliding_window`,
@@ -365,11 +364,10 @@ parser before weights are materialized.
 The schedule is the sole source for resident, layerwise-host, dense-streamed,
 ordinary-cache, paged-cache, generation, structural, expert-parallel,
 fingerprint, and runtime-state paths. Internally constructed schedules may use
-arbitrary ordering and distinct windows. Prompt-cache fingerprints include the
-complete ordered schedule. Persistence supports arbitrary ordering when every
-sliding layer has the same window; schedules with distinct sliding windows fail
-closed because prompt-cache schema v2 stores only one model-wide window.
-Normalized `ModelArgs` no longer implements `Deserialize` or exposes raw
+arbitrary ordering and distinct windows. Prompt-cache schema v4 persists the
+complete ordered schedule, exact per-layer windows and tensor layouts, and each
+layer's retained token interval. Normalized `ModelArgs` no longer implements
+`Deserialize` or exposes raw
 `layer_types`/`sliding_window`; JSON callers use
 `architectures::gpt_oss::model::model_args_from_config_value`.
 
