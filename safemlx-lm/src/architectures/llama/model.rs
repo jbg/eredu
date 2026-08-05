@@ -697,6 +697,87 @@ impl TransformerBlock {
         observer.observe(&format!("{prefix}.residual_after_mlp"), &output)?;
         Ok(output)
     }
+
+    /// Executes a block whose attention heads and MLP intermediates are
+    /// rank-local, reducing each row projection exactly once.
+    pub(crate) fn forward_tensor_parallel<C: KeyValueCache>(
+        &mut self,
+        hidden: &Array,
+        mask: Option<&Array>,
+        cache: Option<&mut C>,
+        allow_sliding_prefill: bool,
+        group: &safemlx::distributed::Group,
+        stream: &Stream,
+    ) -> Result<Array, Exception> {
+        let normalized = self.input_layernorm.forward(hidden, stream)?;
+        let attention = &mut self.self_attn;
+        let (batch, sequence) = batch_seq(&normalized);
+        let queries = attention.q_proj.forward(&normalized, stream)?;
+        let keys = attention.k_proj.forward(&normalized, stream)?;
+        let values = attention.v_proj.forward(&normalized, stream)?;
+        let queries =
+            reshape_attention_projection(queries, batch, sequence, attention.n_heads, stream)?;
+        let keys =
+            reshape_attention_projection(keys, batch, sequence, attention.n_kv_heads, stream)?;
+        let values =
+            reshape_attention_projection(values, batch, sequence, attention.n_kv_heads, stream)?;
+        let offset = cache.as_ref().map_or(0, |cache| cache.offset());
+        let mut cache = cache;
+        let (queries, keys, values) = apply_rope_and_update_cache(
+            &mut attention.rope,
+            queries,
+            keys,
+            values,
+            &mut cache,
+            stream,
+        )?;
+        let attended = if let Some(window) = attention
+            .sliding_window
+            .filter(|_| allow_sliding_prefill && sequence > 1)
+        {
+            common::attention::sliding_window_prefill_attention(
+                queries,
+                keys,
+                values,
+                attention.scale,
+                window,
+                offset,
+                batch,
+                sequence,
+                stream,
+            )?
+        } else {
+            finish_attention(
+                queries,
+                keys,
+                values,
+                cache,
+                attention.scale,
+                mask,
+                batch,
+                sequence,
+                stream,
+            )?
+        };
+        let attention = crate::nn::parallel::forward_row_parallel(
+            &mut attention.o_proj,
+            &attended,
+            group,
+            stream,
+        )?;
+        let hidden = hidden.add(attention, stream)?;
+        let normalized = self.post_attention_layernorm.forward(&hidden, stream)?;
+        let gate =
+            crate::nn::layers::silu(self.mlp.gate_proj.forward(&normalized, stream)?, stream)?;
+        let up = self.mlp.up_proj.forward(&normalized, stream)?;
+        let mlp = crate::nn::parallel::forward_row_parallel(
+            &mut self.mlp.down_proj,
+            &gate.multiply(up, stream)?,
+            group,
+            stream,
+        )?;
+        hidden.add(mlp, stream)
+    }
 }
 
 impl<C> Module<AttentionInput<'_, C>> for TransformerBlock

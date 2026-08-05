@@ -519,6 +519,62 @@ impl Attention {
             stream,
         )
     }
+
+    fn forward_tensor_parallel(
+        &mut self,
+        x: &Array,
+        mask: Option<&Array>,
+        cache: &mut LayerCache,
+        group: &safemlx::distributed::Group,
+        stream: &Stream,
+    ) -> Result<Array, Exception> {
+        let shape = x.shape();
+        let (batch, length) = (shape[0], shape[1]);
+        let project = |projection: Array, heads: i32| {
+            projection
+                .reshape(&[batch, length, heads, self.head_dim], stream)?
+                .transpose_axes(&[0, 2, 1, 3], stream)
+        };
+        let mut q = project(self.q_proj.forward(x, stream)?, self.n_heads)?;
+        let mut k = project(self.k_proj.forward(x, stream)?, self.n_kv_heads)?;
+        let v = project(self.v_proj.forward(x, stream)?, self.n_kv_heads)?;
+        let offset = cache.offset();
+        q = self.rope.forward(nn::RopeInput { x: &q, offset }, stream)?;
+        k = self.rope.forward(nn::RopeInput { x: &k, offset }, stream)?;
+        let (k, v) = cache.update_and_fetch(k, v, stream)?;
+        let attended =
+            match cache.paged_attention(&q, self.scale, mask, Some(self.sinks.as_ref()), stream)? {
+                Some(output) => output,
+                None => safemlx::fast::scaled_dot_product_attention(
+                    q,
+                    k,
+                    v,
+                    self.scale,
+                    mask.map(ScaledDotProductAttentionMask::Array),
+                    self.sinks.as_ref(),
+                    stream,
+                )?,
+            };
+        let output = self.o_proj.forward(
+            &attended
+                .transpose_axes(&[0, 2, 1, 3], stream)?
+                .reshape(&[batch, length, -1], stream)?,
+            stream,
+        )?;
+        let bias = match &self.o_proj {
+            MaybeQuantized::Original(linear) => linear.bias.as_ref().as_ref(),
+            MaybeQuantized::Quantized(linear) => linear.inner.bias.as_ref().as_ref(),
+        };
+        let partial = match bias {
+            Some(bias) => output.subtract(bias, stream)?,
+            None => output,
+        };
+        let reduced = safemlx::distributed::all_sum(&partial, group, stream)?;
+        match bias {
+            Some(bias) => reduced.add(bias, stream),
+            None => Ok(reduced),
+        }
+    }
 }
 
 /// Checkpoint-native combined MXFP4 expert tensors.
@@ -680,6 +736,56 @@ impl Experts {
         debug_assert_eq!(output.dim(-1), self.hidden_size);
         common::moe::weighted_route_sum(output, top_k_weights, &plan, tokens, stream)
     }
+
+    fn forward_tensor_parallel(
+        &mut self,
+        hidden_states: &Array,
+        top_k_index: &Array,
+        top_k_weights: &Array,
+        group: &safemlx::distributed::Group,
+        stream: &Stream,
+    ) -> Result<Array, Exception> {
+        let tokens = hidden_states.dim(0);
+        let plan = topk_route_plan(top_k_index, self.num_experts, stream)?;
+        let routed = gather_grouped_rows(hidden_states, &plan, stream)?;
+        let gate_up = Self::mxfp4_linear(
+            &routed,
+            self.gate_up_proj_blocks.as_ref(),
+            self.gate_up_proj_scales.as_ref(),
+            self.gate_up_proj_bias.as_ref(),
+            &plan.sorted_group_ids,
+            stream,
+        )?;
+        let gate = gate_up.try_index_device((.., (0..).stride_by(2)), stream)?;
+        let linear = gate_up.try_index_device((.., (1..).stride_by(2)), stream)?;
+        let gate = clip(gate, ((), self.limit), stream)?;
+        let linear = clip(linear, (-self.limit, self.limit), stream)?;
+        let activated = gate
+            .multiply(
+                sigmoid(gate.multiply(Array::from_f32(1.702), stream)?, stream)?,
+                stream,
+            )?
+            .multiply(linear.add(Array::from_f32(1.0), stream)?, stream)?;
+        let output = Self::mxfp4_linear(
+            &activated,
+            self.down_proj_blocks.as_ref(),
+            self.down_proj_scales.as_ref(),
+            self.down_proj_bias.as_ref(),
+            &plan.sorted_group_ids,
+            stream,
+        )?;
+        let routed_bias =
+            self.down_proj_bias
+                .as_ref()
+                .take_axis(&plan.sorted_group_ids, 0, stream)?;
+        let partial = output.subtract(&routed_bias, stream)?;
+        let partial =
+            common::moe::weighted_route_sum(partial, top_k_weights, &plan, tokens, stream)?;
+        let reduced = safemlx::distributed::all_sum(&partial, group, stream)?;
+        let bias =
+            common::moe::weighted_route_sum(routed_bias, top_k_weights, &plan, tokens, stream)?;
+        reduced.add(bias, stream)
+    }
 }
 
 /// GPT-OSS sparse MoE block.
@@ -720,6 +826,21 @@ impl Mlp {
         let (indices, weights) = common::moe::top_k_softmax_routing(&logits, self.top_k, stream)?;
         self.experts
             .forward(&flat, &indices, &weights, stream)?
+            .reshape(shape, stream)
+    }
+
+    fn forward_tensor_parallel(
+        &mut self,
+        x: &Array,
+        group: &safemlx::distributed::Group,
+        stream: &Stream,
+    ) -> Result<Array, Exception> {
+        let shape = x.shape();
+        let flat = x.reshape(&[-1, shape[2]], stream)?;
+        let logits = self.router.forward(&flat, stream)?;
+        let (indices, weights) = common::moe::top_k_softmax_routing(&logits, self.top_k, stream)?;
+        self.experts
+            .forward_tensor_parallel(&flat, &indices, &weights, group, stream)?
             .reshape(shape, stream)
     }
 
@@ -791,6 +912,27 @@ impl TransformerBlock {
         )?;
         let normed = self.post_attention_layernorm.forward(&hidden, stream)?;
         hidden.add(self.mlp.forward(&normed, stream)?, stream)
+    }
+
+    pub(crate) fn forward_tensor_parallel(
+        &mut self,
+        x: &Array,
+        mask: Option<&Array>,
+        cache: &mut LayerCache,
+        group: &safemlx::distributed::Group,
+        stream: &Stream,
+    ) -> Result<Array, Exception> {
+        let normed = self.input_layernorm.forward(x, stream)?;
+        let hidden = x.add(
+            self.self_attn
+                .forward_tensor_parallel(&normed, mask, cache, group, stream)?,
+            stream,
+        )?;
+        let normed = self.post_attention_layernorm.forward(&hidden, stream)?;
+        hidden.add(
+            self.mlp.forward_tensor_parallel(&normed, group, stream)?,
+            stream,
+        )
     }
 
     pub(crate) fn forward_with_expert_executor<F>(
@@ -931,6 +1073,25 @@ pub struct Cache {
 }
 
 impl Cache {
+    pub(crate) fn new_paged(
+        attention_schedule: &LayerSchedule<AttentionPolicy>,
+        manager: CacheResidencyManager,
+        rank: Option<CacheRankIdentity>,
+    ) -> Result<Self, Exception> {
+        let layers = attention_schedule
+            .iter()
+            .enumerate()
+            .map(|(layer, policy)| {
+                let window = policy.window().map(|window| {
+                    i32::try_from(window.get()).expect("validated GPT-OSS sliding window fits i32")
+                });
+                PagedKeyValueCache::new_with_layout(manager.clone(), layer, window, 0, rank)
+                    .map(LayerCache::Paged)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self { layers })
+    }
+
     pub(crate) fn reset(&mut self) -> Result<(), Exception> {
         for layer in &mut self.layers {
             match layer {
@@ -1057,19 +1218,7 @@ impl GptOssModel {
         manager: CacheResidencyManager,
         rank: Option<CacheRankIdentity>,
     ) -> Result<Cache, Exception> {
-        let layers = self
-            .attention_schedule
-            .iter()
-            .enumerate()
-            .map(|(layer, policy)| {
-                let window = policy.window().map(|window| {
-                    i32::try_from(window.get()).expect("validated GPT-OSS sliding window fits i32")
-                });
-                PagedKeyValueCache::new_with_layout(manager.clone(), layer, window, 0, rank)
-                    .map(LayerCache::Paged)
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(Cache { layers })
+        Cache::new_paged(&self.attention_schedule, manager, rank)
     }
 
     pub(crate) fn forward(

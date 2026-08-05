@@ -774,12 +774,20 @@ impl Cache {
         layer_schedule: &LayerSchedule<LayerPolicy>,
         policy: CacheResidencyPolicy,
     ) -> Result<Self, Exception> {
+        Self::new_with_options_and_rank(layer_schedule, policy, None)
+    }
+
+    pub(crate) fn new_with_options_and_rank(
+        layer_schedule: &LayerSchedule<LayerPolicy>,
+        policy: CacheResidencyPolicy,
+        rank: Option<CacheRankIdentity>,
+    ) -> Result<Self, Exception> {
         match policy {
             CacheResidencyPolicy::Device => Ok(Self::new(layer_schedule)),
             CacheResidencyPolicy::Paged(options) => {
                 let manager = CacheResidencyManager::new(options)
                     .map_err(|error| Exception::custom(error.to_string()))?;
-                Self::new_with_manager(layer_schedule, manager, None)
+                Self::new_with_manager(layer_schedule, manager, rank)
             }
         }
     }
@@ -851,7 +859,11 @@ impl Cache {
             open_prompt_cache(directory, expected, model, prefix_token_ids, options)
                 .map_err(|error| Exception::custom(error.to_string()))?;
         Ok((
-            Self::new_with_manager(layer_schedule, manager, None)?,
+            Self::new_with_manager(
+                layer_schedule,
+                manager,
+                model.topology.cache_rank_identity(),
+            )?,
             manifest,
         ))
     }

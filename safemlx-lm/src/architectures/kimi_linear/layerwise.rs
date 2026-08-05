@@ -20,9 +20,14 @@ use crate::{
             project_logits_maybe_quantized, unloaded_maybe_quantized_embedding,
             unloaded_maybe_quantized_linear,
         },
+        parallel::{VocabParallelEmbedding, VocabParallelLmHead},
         tensor::create_causal_mask,
     },
     runtime::{
+        cache::residency::{
+            PagedCacheOptions, PromptCacheDescriptor, PromptCacheManifest,
+            PromptCacheModelIdentity, PromptCacheOptions, PromptCacheTopology,
+        },
         checkpoint::{
             binding::{
                 build_module_bindings_with_recipes, canonical_checkpoint_name,
@@ -32,10 +37,11 @@ use crate::{
             recipe::DerivedWeightRecipe,
             store::{GgufWeightStore, TensorSelection, WeightStore, WeightStoreBackend},
         },
+        distributed::parallel::exact_parallel_division,
         execution::layerwise::{
-            load_general_layerwise_model, load_general_layerwise_model_with_store,
-            GeneralLayerwiseModel, GeneralLayerwiseModelAdapter, LayerExecutionLoadOptions,
-            LayerwiseForwardState, StaticUnitBindings, WeightResidency,
+            load_layerwise_model, load_layerwise_model_with_store,
+            load_tensor_parallel_layerwise_model, ArchitectureAdapter, LayerExecutionLoadOptions,
+            LayerwiseForwardState, LayerwiseModel, StaticUnitBindings, WeightResidency,
         },
         residency::{
             expert_cache::{
@@ -55,7 +61,7 @@ const HEAD_UNIT: &str = "kimi_linear.static.output";
 
 /// Kimi Linear causal LM with a bounded decoder-layer window.
 pub struct KimiLinearLayerwiseModel {
-    execution: GeneralLayerwiseModel<KimiLinearLayerwiseAdapter>,
+    execution: LayerwiseModel<KimiLinearLayerwiseAdapter>,
 }
 
 impl KimiLinearLayerwiseModel {
@@ -67,6 +73,51 @@ impl KimiLinearLayerwiseModel {
     /// Creates an empty heterogeneous KDA/MLA cache.
     pub fn new_cache(&self) -> Cache {
         Cache::new(self.args())
+    }
+
+    /// Returns rank-local generalized parallel information when applicable.
+    pub fn parallel_info(&self) -> Option<&crate::ParallelModelInfo> {
+        self.execution.parallel_info()
+    }
+
+    /// Returns this rank's exact prompt-cache state layout.
+    pub fn prompt_cache_layer_layout(
+        &self,
+    ) -> Result<crate::LayerSchedule<crate::LayerCachePolicy>, Error> {
+        self.execution.prompt_cache_layer_layout()
+    }
+
+    /// Persists a compatible prefix cache.
+    pub fn save_prompt_cache(
+        &self,
+        cache: &mut Cache,
+        destination: impl AsRef<Path>,
+        descriptor: PromptCacheDescriptor,
+        prefix_token_ids: &[u32],
+        options: &PromptCacheOptions,
+        stream: &Stream,
+    ) -> Result<PromptCacheManifest, Error> {
+        self.execution.save_prompt_cache(
+            cache,
+            destination,
+            descriptor,
+            prefix_token_ids,
+            options,
+            stream,
+        )
+    }
+
+    /// Restores a compatible prefix cache.
+    pub fn load_prompt_cache(
+        &self,
+        directory: impl AsRef<Path>,
+        expected: &PromptCacheDescriptor,
+        prefix_token_ids: &[u32],
+        options: PagedCacheOptions,
+        stream: &Stream,
+    ) -> Result<(Cache, PromptCacheManifest), Error> {
+        self.execution
+            .load_prompt_cache(directory, expected, prefix_token_ids, options, stream)
     }
 
     /// Returns current weight-residency telemetry.
@@ -100,6 +151,18 @@ impl KimiLinearLayerwiseModel {
         stream: &Stream,
     ) -> Result<Array, Error> {
         self.execution.forward(inputs, cache, stream)
+    }
+
+    /// Runs a rank-local tensor-parallel KDA/MLA forward pass.
+    pub fn forward_tensor_parallel(
+        &mut self,
+        inputs: &Array,
+        cache: &mut Cache,
+        group: &safemlx::distributed::Group,
+        stream: &Stream,
+    ) -> Result<Array, Error> {
+        self.execution
+            .forward_tensor_parallel(inputs, cache, group, stream)
     }
 
     /// Runs streamed layers while delegating routed experts to a caller.
@@ -187,10 +250,37 @@ pub fn load_kimi_linear_layerwise_model(
     args.validate()?;
     let adapter = KimiLinearLayerwiseAdapter::new(args, stream)?;
     Ok(KimiLinearLayerwiseModel {
-        execution: load_general_layerwise_model(
+        execution: load_layerwise_model(model_dir, adapter, options, stream, weights_stream)?,
+    })
+}
+
+/// Loads Kimi Linear through the generalized tensor-parallel engine.
+pub fn load_kimi_linear_tensor_parallel_model(
+    model_dir: impl AsRef<Path>,
+    options: impl Into<LayerExecutionLoadOptions>,
+    build: crate::runtime::distributed::parallel::ParallelBuildContext,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<KimiLinearLayerwiseModel, Error> {
+    let model_dir = model_dir.as_ref();
+    let options = options.into();
+    let residency = match options {
+        LayerExecutionLoadOptions::LayerwiseHost(v) => WeightResidency::LayerwiseHost(v),
+        LayerExecutionLoadOptions::DenseDiskStream(v) => WeightResidency::DenseDiskStream(v),
+    };
+    crate::api::structural::validate_safetensors_load_path(
+        crate::api::ModelKind::KimiLinear,
+        model_dir,
+        crate::api::ModelLoadOptions::default().with_weight_residency(residency),
+    )?;
+    let args = resident::get_model_args(model_dir)?;
+    args.validate()?;
+    Ok(KimiLinearLayerwiseModel {
+        execution: load_tensor_parallel_layerwise_model(
             model_dir,
-            adapter,
+            KimiLinearLayerwiseAdapter::new(args, stream)?,
             options,
+            build,
             stream,
             weights_stream,
         )?,
@@ -213,14 +303,14 @@ pub(crate) fn load_kimi_linear_gguf_layerwise_model(
             residency.max_mapped_shards(),
         )?);
     let execution = match residency {
-        WeightResidency::LayerwiseHost(options) => load_general_layerwise_model_with_store(
+        WeightResidency::LayerwiseHost(options) => load_layerwise_model_with_store(
             store,
             KimiLinearLayerwiseAdapter::new(args, stream)?,
             options,
             stream,
             weights_stream,
         )?,
-        WeightResidency::DenseDiskStream(options) => load_general_layerwise_model_with_store(
+        WeightResidency::DenseDiskStream(options) => load_layerwise_model_with_store(
             store,
             KimiLinearLayerwiseAdapter::new(args, stream)?,
             options,
@@ -372,7 +462,7 @@ fn load_kimi_linear_sparse_expert_cache_model_with_non_expert(
     args.validate()?;
     let adapter = KimiLinearLayerwiseAdapter::new_sparse(args.clone(), stream)?;
     let mut execution =
-        load_general_layerwise_model(model_dir, adapter, non_expert, stream, weights_stream)?;
+        load_layerwise_model(model_dir, adapter, non_expert, stream, weights_stream)?;
     let store = execution.weight_store_arc();
     let entries = kimi_expert_catalog(&args, store.as_ref())?;
     execution.adapter_mut().expert_cache = Some(ExpertCache::new_shared(
@@ -394,7 +484,7 @@ fn load_kimi_linear_sparse_with_store(
     weights_stream: &Stream,
 ) -> Result<KimiLinearLayerwiseModel, Error> {
     let adapter = KimiLinearLayerwiseAdapter::new_sparse(args.clone(), stream)?;
-    let mut execution = load_general_layerwise_model_with_store(
+    let mut execution = load_layerwise_model_with_store(
         store.clone(),
         adapter,
         non_expert,
@@ -422,13 +512,8 @@ pub(crate) fn load_kimi_linear_sparse_ep_base_with_store(
 ) -> Result<KimiLinearLayerwiseModel, Error> {
     args.validate()?;
     let adapter = KimiLinearLayerwiseAdapter::new_sparse(args, stream)?;
-    let execution = load_general_layerwise_model_with_store(
-        store,
-        adapter,
-        non_expert,
-        stream,
-        weights_stream,
-    )?;
+    let execution =
+        load_layerwise_model_with_store(store, adapter, non_expert, stream, weights_stream)?;
     Ok(KimiLinearLayerwiseModel { execution })
 }
 
@@ -438,6 +523,8 @@ pub struct KimiLinearLayerwiseAdapter {
     embedding: MaybeQuantized<nn::Embedding>,
     norm: nn::RmsNorm,
     lm_head: Option<MaybeQuantized<nn::Linear>>,
+    parallel_embedding: Option<VocabParallelEmbedding>,
+    parallel_lm_head: Option<VocabParallelLmHead>,
     sparse_expert_cache: bool,
     expert_cache: Option<ExpertCache>,
 }
@@ -469,6 +556,8 @@ impl KimiLinearLayerwiseAdapter {
                 stream,
             )?,
             lm_head,
+            parallel_embedding: None,
+            parallel_lm_head: None,
             sparse_expert_cache: false,
             expert_cache: None,
             args,
@@ -636,11 +725,94 @@ pub struct KimiLinearForwardContext {
     mask: Option<Array>,
 }
 
-impl GeneralLayerwiseModelAdapter for KimiLinearLayerwiseAdapter {
+impl ArchitectureAdapter for KimiLinearLayerwiseAdapter {
     type Input<'a> = &'a Array;
     type Cache = Cache;
     type Layer = DecoderLayer;
     type ForwardContext = KimiLinearForwardContext;
+
+    fn model_type(&self) -> &str {
+        &self.args.model_type
+    }
+
+    fn prompt_cache_model_identity(
+        &self,
+        topology: Option<crate::ParallelTopology>,
+    ) -> Result<PromptCacheModelIdentity, Error> {
+        let mut local = self.args.clone();
+        if let Some(topology) = topology {
+            local.num_attention_heads = exact_parallel_division(
+                "Kimi prompt-cache MLA heads",
+                local.num_attention_heads,
+                topology.tensor_parallel_size,
+            )?;
+            local.num_key_value_heads = exact_parallel_division(
+                "Kimi prompt-cache MLA KV heads",
+                local.num_key_value_heads,
+                topology.tensor_parallel_size,
+            )?;
+            local.kda_config.num_heads = exact_parallel_division(
+                "Kimi prompt-cache KDA heads",
+                local.kda_config.num_heads,
+                topology.tensor_parallel_size,
+            )?;
+        }
+        let layer_count = self.args.num_hidden_layers as usize;
+        Ok(PromptCacheModelIdentity {
+            model_family: "kimi_linear".into(),
+            effective_model_type: self.args.model_type.clone(),
+            architecture_fingerprint: resident::prompt_cache_architecture_fingerprint(&self.args),
+            layer_count,
+            global_layer_start: 0,
+            global_layer_end: layer_count,
+            sink_tokens: 0,
+            topology: topology.map_or_else(
+                PromptCacheTopology::default,
+                PromptCacheTopology::for_parallel_topology,
+            ),
+            layer_layout: resident::prompt_cache_layer_layout(&local)
+                .map_err(|error| Exception::custom(error.to_string()))?,
+        })
+    }
+
+    fn save_prompt_cache(
+        &self,
+        cache: &mut Self::Cache,
+        destination: &Path,
+        descriptor: PromptCacheDescriptor,
+        prefix_token_ids: &[u32],
+        options: &PromptCacheOptions,
+        _stream: &Stream,
+    ) -> Result<PromptCacheManifest, Error> {
+        resident::Model::save_prompt_cache(
+            cache,
+            destination,
+            descriptor,
+            prefix_token_ids,
+            options,
+        )
+        .map_err(Into::into)
+    }
+
+    fn load_prompt_cache(
+        &self,
+        directory: &Path,
+        expected: &PromptCacheDescriptor,
+        identity: &PromptCacheModelIdentity,
+        prefix_token_ids: &[u32],
+        _options: PagedCacheOptions,
+        stream: &Stream,
+    ) -> Result<(Self::Cache, PromptCacheManifest), Error> {
+        resident::Model::load_prompt_cache_with_identity(
+            &self.args,
+            directory,
+            expected,
+            prefix_token_ids,
+            identity,
+            stream,
+        )
+        .map_err(Into::into)
+    }
 
     fn static_units(&self, store: &dyn WeightStore) -> Result<Vec<StaticUnitBindings>, Error> {
         let mut units = vec![
@@ -680,9 +852,15 @@ impl GeneralLayerwiseModelAdapter for KimiLinearLayerwiseAdapter {
                 leases.len()
             )));
         }
-        populate_module_from_lease(&mut self.embedding, &leases[0])?;
+        if let Some(v) = &mut self.parallel_embedding {
+            populate_module_from_lease(v.inner_mut(), &leases[0])?;
+        } else {
+            populate_module_from_lease(&mut self.embedding, &leases[0])?;
+        }
         populate_module_from_lease(&mut self.norm, &leases[1])?;
-        if let Some(lm_head) = &mut self.lm_head {
+        if let Some(v) = &mut self.parallel_lm_head {
+            populate_module_from_lease(v.inner_mut(), &leases[2])?;
+        } else if let Some(lm_head) = &mut self.lm_head {
             populate_module_from_lease(lm_head, &leases[2])?;
         }
         Ok(())
@@ -719,6 +897,33 @@ impl GeneralLayerwiseModelAdapter for KimiLinearLayerwiseAdapter {
             context: KimiLinearForwardContext { mask },
         })
     }
+    fn begin_forward_with_execution<'a>(
+        &mut self,
+        input: Self::Input<'a>,
+        cache: &mut Self::Cache,
+        execution: &crate::runtime::distributed::parallel::ParallelExecutionContext<'_>,
+    ) -> Result<LayerwiseForwardState<Self::ForwardContext>, Error> {
+        let Some(v) = &mut self.parallel_embedding else {
+            return self.begin_forward(input, cache, execution.stream());
+        };
+        let hidden = v.forward(input, execution)?;
+        let offset = cache.offset();
+        let mask = if hidden.dim(1) > 1 && offset > 0 {
+            Some(create_causal_mask(
+                hidden.dim(1),
+                Some(offset),
+                None,
+                None,
+                execution.stream(),
+            )?)
+        } else {
+            None
+        };
+        Ok(LayerwiseForwardState {
+            hidden,
+            context: KimiLinearForwardContext { mask },
+        })
+    }
 
     fn execution_group_count(&self) -> usize {
         1
@@ -745,6 +950,96 @@ impl GeneralLayerwiseModelAdapter for KimiLinearLayerwiseAdapter {
     fn new_layer(&self, group: usize, index: usize, stream: &Stream) -> Result<Self::Layer, Error> {
         self.layer_count(group)?;
         Ok(DecoderLayer::new(&self.args, index, stream)?)
+    }
+    fn register_parallel_parameters(
+        &self,
+        _context: crate::runtime::distributed::parallel::ParallelBuildContext,
+        planner: &mut crate::runtime::distributed::parallel::ParallelPlanBuilder,
+        stream: &Stream,
+    ) -> Result<(), Error> {
+        planner.register(crate::nn::parallel::vocab_embedding_parameter_group(
+            &self.embedding,
+            "model.embed_tokens",
+            self.args.vocab_size as usize,
+            self.args.hidden_size,
+            false,
+        )?)?;
+        crate::nn::parallel::register_replicated_parameter_group(
+            planner,
+            &self.norm,
+            "model.norm",
+        )?;
+        if let Some(head) = &self.lm_head {
+            planner.register(crate::nn::parallel::vocab_lm_head_parameter_group(
+                head,
+                "lm_head",
+                self.args.hidden_size,
+                self.args.vocab_size as usize,
+                false,
+            )?)?;
+        }
+        for index in 0..self.args.layer_schedule.len() {
+            let layer = DecoderLayer::new(&self.args, index, stream)?;
+            crate::architectures::distributed::tensor::insert_kimi_layerwise_plan(
+                planner, &layer, index,
+            )?;
+        }
+        Ok(())
+    }
+    fn configure_parallel_static(
+        &mut self,
+        context: crate::runtime::distributed::parallel::ParallelBuildContext,
+        _layout: &crate::runtime::distributed::parallel::LocalModelLayout,
+        stream: &Stream,
+    ) -> Result<(), Error> {
+        self.parallel_embedding = Some(VocabParallelEmbedding::unloaded(
+            self.args.vocab_size as usize,
+            self.args.hidden_size,
+            self.args
+                .weight_quantization_for("model.embed_tokens.weight"),
+            context,
+            stream,
+        )?);
+        if self.lm_head.is_some() {
+            self.parallel_lm_head = Some(VocabParallelLmHead::unloaded(
+                self.args.hidden_size,
+                self.args.vocab_size as usize,
+                self.args.weight_quantization_for("lm_head.weight"),
+                context,
+                stream,
+            )?);
+        }
+        Ok(())
+    }
+    fn new_parallel_layer(
+        &self,
+        group: usize,
+        index: usize,
+        layout: &crate::runtime::distributed::parallel::LocalModelLayout,
+        stream: &Stream,
+    ) -> Result<Self::Layer, Error> {
+        self.layer_count(group)?;
+        let prefix = format!("model.layers.{index}");
+        let find = |n: &str| {
+            layout
+                .tensor(&format!("{prefix}.{n}.weight"))
+                .or_else(|| layout.tensor(&format!("{prefix}.{n}.inner.weight")))
+        };
+        let q = find("self_attn.q_proj")
+            .or_else(|| find("self_attn.q_b_proj"))
+            .ok_or_else(|| Error::Parallel(format!("missing TP layout for {prefix} attention")))?;
+        let parts = q.global_shape()[0] / q.local_shape()[0];
+        let mut args = self.args.clone();
+        args.num_attention_heads /= parts as i32;
+        args.num_key_value_heads /= parts as i32;
+        args.kda_config.num_heads /= parts as i32;
+        if let Some(v) = find("mlp.gate_proj") {
+            args.intermediate_size = v.local_shape()[0] as i32;
+        }
+        if let Some(v) = layout.tensor(&format!("{prefix}.mlp.experts.gate_up_proj")) {
+            args.moe_intermediate_size = v.local_shape()[1] as i32 / 2;
+        }
+        Ok(DecoderLayer::new(&args, index, stream)?)
     }
 
     fn layer_checkpoint_prefix(&self, _group: usize, index: usize) -> String {
@@ -776,6 +1071,22 @@ impl GeneralLayerwiseModelAdapter for KimiLinearLayerwiseAdapter {
         } else {
             Ok(bindings)
         }
+    }
+    fn parallel_layer_bindings(
+        &self,
+        group: usize,
+        index: usize,
+        _layer: &Self::Layer,
+        store: &dyn WeightStore,
+        layout: &crate::runtime::distributed::parallel::LocalModelLayout,
+        stream: &Stream,
+    ) -> Result<Vec<WeightBinding>, Error> {
+        let global = self.new_layer(group, index, stream)?;
+        crate::runtime::execution::layerwise::shard_layer_bindings(
+            self.layer_bindings(group, index, &global, store)?,
+            &self.layer_checkpoint_prefix(group, index),
+            layout,
+        )
     }
 
     fn populate_layer(
@@ -924,6 +1235,36 @@ impl GeneralLayerwiseModelAdapter for KimiLinearLayerwiseAdapter {
             &mut observer,
         )?)
     }
+    fn forward_layer_with_execution(
+        &mut self,
+        group: usize,
+        index: usize,
+        layer: &mut Self::Layer,
+        hidden: &Array,
+        cache: &mut Self::Cache,
+        context: &mut Self::ForwardContext,
+        execution: &crate::runtime::distributed::parallel::ParallelExecutionContext<'_>,
+    ) -> Result<Array, Error> {
+        let Some(tp_group) = execution.group() else {
+            return self.forward_layer(
+                group,
+                index,
+                layer,
+                hidden,
+                cache,
+                context,
+                execution.stream(),
+            );
+        };
+        self.layer_count(group)?;
+        Ok(layer.forward_tensor_parallel(
+            hidden,
+            context.mask.as_ref(),
+            Some(&mut cache.layers[index]),
+            tp_group,
+            execution.stream(),
+        )?)
+    }
 
     fn retained_arrays<'a>(
         &self,
@@ -948,6 +1289,23 @@ impl GeneralLayerwiseModelAdapter for KimiLinearLayerwiseAdapter {
             &hidden,
             stream,
         )?)
+    }
+    fn finish_with_execution(
+        &mut self,
+        hidden: &Array,
+        cache: &mut Self::Cache,
+        context: &Self::ForwardContext,
+        execution: &crate::runtime::distributed::parallel::ParallelExecutionContext<'_>,
+    ) -> Result<Array, Error> {
+        let Some(embedding) = &mut self.parallel_embedding else {
+            return self.finish(hidden, cache, context, execution.stream());
+        };
+        let hidden = self.norm.forward(hidden, execution.stream())?;
+        let logits = match &mut self.parallel_lm_head {
+            Some(head) => head.forward(&hidden, execution)?,
+            None => embedding.project_logits(&hidden, execution)?,
+        };
+        logits.all_gather(execution)
     }
 
     fn ignores_checkpoint_key(&self, key: &str) -> bool {

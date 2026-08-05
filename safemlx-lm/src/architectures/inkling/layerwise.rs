@@ -28,7 +28,14 @@ use crate::{
         input,
     },
     error::Error,
-    runtime::cache::residency::{CacheResidencyPolicy, CacheResidencyReport},
+    nn::parallel::{
+        vocab_embedding_parameter_group, vocab_lm_head_parameter_group, VocabParallelEmbedding,
+        VocabParallelLmHead,
+    },
+    runtime::cache::residency::{
+        CacheResidencyPolicy, CacheResidencyReport, PagedCacheOptions, PromptCacheDescriptor,
+        PromptCacheManifest, PromptCacheModelIdentity, PromptCacheOptions, PromptCacheTopology,
+    },
     runtime::cache::KeyValueCache,
     runtime::checkpoint::binding::{
         build_module_bindings_with_recipes, populate_module_from_lease,
@@ -36,10 +43,11 @@ use crate::{
     },
     runtime::checkpoint::recipe::DerivedWeightRecipe,
     runtime::checkpoint::store::{GgufWeightStore, TensorSelection, WeightStore},
+    runtime::distributed::parallel::exact_parallel_division,
     runtime::execution::layerwise::{
-        load_general_layerwise_model, load_general_layerwise_model_with_store,
-        GeneralLayerwiseModel, GeneralLayerwiseModelAdapter, LayerExecutionLoadOptions,
-        LayerwiseForwardState, StaticUnitBindings, WeightResidency,
+        load_layerwise_model, load_layerwise_model_with_store,
+        load_tensor_parallel_layerwise_model, ArchitectureAdapter, LayerExecutionLoadOptions,
+        LayerwiseForwardState, LayerwiseModel, StaticUnitBindings, WeightResidency,
     },
     runtime::residency::expert_cache::{
         AcquiredExperts, ExpertCache, ExpertCacheError, ExpertCacheLoadOptions, ExpertCacheReport,
@@ -57,7 +65,7 @@ const VISION_NORM_UNIT: &str = "inkling.static.vision_norm";
 
 /// Inkling multimodal model using bounded residency for hMLP and decoder blocks.
 pub struct InklingLayerwiseModel {
-    execution: GeneralLayerwiseModel<InklingLayerwiseAdapter>,
+    execution: LayerwiseModel<InklingLayerwiseAdapter>,
 }
 
 impl InklingLayerwiseModel {
@@ -71,14 +79,62 @@ impl InklingLayerwiseModel {
         self.execution.adapter().new_cache()
     }
 
+    /// Returns rank-local generalized parallel information when applicable.
+    pub fn parallel_info(&self) -> Option<&crate::ParallelModelInfo> {
+        self.execution.parallel_info()
+    }
+
+    /// Returns this rank's exact prompt-cache state layout.
+    pub fn prompt_cache_layer_layout(
+        &self,
+    ) -> Result<crate::LayerSchedule<crate::LayerCachePolicy>, Error> {
+        self.execution.prompt_cache_layer_layout()
+    }
+
+    /// Persists a compatible multimodal prefix cache.
+    pub fn save_prompt_cache(
+        &self,
+        cache: &mut Cache,
+        destination: impl AsRef<Path>,
+        descriptor: PromptCacheDescriptor,
+        prefix_token_ids: &[u32],
+        options: &PromptCacheOptions,
+        stream: &Stream,
+    ) -> Result<PromptCacheManifest, Error> {
+        self.execution.save_prompt_cache(
+            cache,
+            destination,
+            descriptor,
+            prefix_token_ids,
+            options,
+            stream,
+        )
+    }
+
+    /// Restores a compatible multimodal prefix cache.
+    pub fn load_prompt_cache(
+        &self,
+        directory: impl AsRef<Path>,
+        expected: &PromptCacheDescriptor,
+        prefix_token_ids: &[u32],
+        options: PagedCacheOptions,
+        stream: &Stream,
+    ) -> Result<(Cache, PromptCacheManifest), Error> {
+        self.execution
+            .load_prompt_cache(directory, expected, prefix_token_ids, options, stream)
+    }
+
     /// Creates global/sliding paged attention state while retaining the small
     /// short-convolution state on device.
     pub fn new_cache_with_options(&self, policy: CacheResidencyPolicy) -> Result<Cache, Error> {
         match policy {
             CacheResidencyPolicy::Device => Ok(self.new_cache()),
-            CacheResidencyPolicy::Paged(options) => {
-                Cache::new_paged(&self.args().text_config, options, None).map_err(Into::into)
-            }
+            CacheResidencyPolicy::Paged(options) => Cache::new_paged(
+                &self.args().text_config,
+                options,
+                self.execution.prompt_cache_rank_identity(),
+            )
+            .map_err(Into::into),
         }
     }
 
@@ -135,6 +191,44 @@ impl InklingLayerwiseModel {
                 last_token_only: false,
             },
             cache,
+            stream,
+        )
+    }
+
+    /// Runs a typed multimodal prefill through rank-local hMLP units.
+    pub fn prefill_tensor_parallel(
+        &mut self,
+        input: input::ModelInput<'_>,
+        cache: &mut Cache,
+        group: &safemlx::distributed::Group,
+        stream: &Stream,
+    ) -> Result<Array, Error> {
+        self.execution.forward_tensor_parallel(
+            InklingExecutionInput {
+                input: InklingInput::Prefill(input),
+                last_token_only: false,
+            },
+            cache,
+            group,
+            stream,
+        )
+    }
+
+    /// Runs decode on a TP-loaded Inkling model.
+    pub fn decode_tensor_parallel(
+        &mut self,
+        tokens: &Array,
+        cache: &mut Cache,
+        group: &safemlx::distributed::Group,
+        stream: &Stream,
+    ) -> Result<Array, Error> {
+        self.execution.forward_tensor_parallel(
+            InklingExecutionInput {
+                input: InklingInput::Decode(tokens),
+                last_token_only: false,
+            },
+            cache,
+            group,
             stream,
         )
     }
@@ -243,10 +337,41 @@ pub fn load_inkling_layerwise_model(
     let args = resident::get_model_args(model_dir)?;
     let adapter = InklingLayerwiseAdapter::new(args, stream)?;
     Ok(InklingLayerwiseModel {
-        execution: load_general_layerwise_model(
+        execution: load_layerwise_model(model_dir, adapter, options, stream, weights_stream)?,
+    })
+}
+
+/// Loads Inkling with a rank-local hierarchical vision execution group.
+pub fn load_inkling_tensor_parallel_layerwise_model(
+    model_dir: impl AsRef<Path>,
+    options: impl Into<LayerExecutionLoadOptions>,
+    build: crate::runtime::distributed::parallel::ParallelBuildContext,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<InklingLayerwiseModel, Error> {
+    let model_dir = model_dir.as_ref();
+    let options = options.into();
+    let residency = match options {
+        LayerExecutionLoadOptions::LayerwiseHost(options) => {
+            WeightResidency::LayerwiseHost(options)
+        }
+        LayerExecutionLoadOptions::DenseDiskStream(options) => {
+            WeightResidency::DenseDiskStream(options)
+        }
+    };
+    crate::api::structural::validate_safetensors_load_path(
+        crate::api::ModelKind::Inkling,
+        model_dir,
+        crate::api::ModelLoadOptions::default().with_weight_residency(residency),
+    )?;
+    let args = resident::get_model_args(model_dir)?;
+    let adapter = InklingLayerwiseAdapter::new(args, stream)?;
+    Ok(InklingLayerwiseModel {
+        execution: load_tensor_parallel_layerwise_model(
             model_dir,
             adapter,
             options,
+            build,
             stream,
             weights_stream,
         )?,
@@ -272,14 +397,14 @@ pub(crate) fn load_inkling_gguf_layerwise_model(
     let store = inkling_gguf_store(checkpoint, mmproj, residency.max_mapped_shards())?;
     let args = prepared.args;
     let execution = match residency {
-        WeightResidency::LayerwiseHost(options) => load_general_layerwise_model_with_store(
+        WeightResidency::LayerwiseHost(options) => load_layerwise_model_with_store(
             store,
             InklingLayerwiseAdapter::new(args, stream)?,
             options,
             stream,
             weights_stream,
         )?,
-        WeightResidency::DenseDiskStream(options) => load_general_layerwise_model_with_store(
+        WeightResidency::DenseDiskStream(options) => load_layerwise_model_with_store(
             store,
             InklingLayerwiseAdapter::new(args, stream)?,
             options,
@@ -348,13 +473,8 @@ fn load_inkling_gguf_sparse_with_store(
 ) -> Result<InklingLayerwiseModel, Error> {
     let mut adapter = InklingLayerwiseAdapter::new(args.clone(), stream)?;
     adapter.sparse_expert_cache = true;
-    let mut execution = load_general_layerwise_model_with_store(
-        store,
-        adapter,
-        non_expert,
-        stream,
-        weights_stream,
-    )?;
+    let mut execution =
+        load_layerwise_model_with_store(store, adapter, non_expert, stream, weights_stream)?;
     let checkpoint_store = execution.weight_store_arc();
     let entries = inkling_expert_catalog(&args, checkpoint_store.as_ref())?;
     execution.adapter_mut().expert_cache = Some(ExpertCache::new_shared(
@@ -429,7 +549,7 @@ fn load_inkling_sparse_expert_cache_model_with_non_expert(
     let mut adapter = InklingLayerwiseAdapter::new(args.clone(), stream)?;
     adapter.sparse_expert_cache = true;
     let mut execution =
-        load_general_layerwise_model(model_dir, adapter, non_expert, stream, weights_stream)?;
+        load_layerwise_model(model_dir, adapter, non_expert, stream, weights_stream)?;
     let store = execution.weight_store_arc();
     let entries = inkling_expert_catalog(&args, store.as_ref())?;
     execution.adapter_mut().expert_cache = Some(ExpertCache::new_shared(
@@ -452,13 +572,8 @@ pub(crate) fn load_inkling_sparse_ep_base_with_store(
 ) -> Result<InklingLayerwiseModel, Error> {
     let mut adapter = InklingLayerwiseAdapter::new(args, stream)?;
     adapter.sparse_expert_cache = true;
-    let execution = load_general_layerwise_model_with_store(
-        store,
-        adapter,
-        non_expert,
-        stream,
-        weights_stream,
-    )?;
+    let execution =
+        load_layerwise_model_with_store(store, adapter, non_expert, stream, weights_stream)?;
     Ok(InklingLayerwiseModel { execution })
 }
 
@@ -466,9 +581,11 @@ pub(crate) fn load_inkling_sparse_ep_base_with_store(
 struct InklingLayerwiseAdapter {
     args: ModelArgs,
     embedding: MaybeQuantized<nn::Embedding>,
+    parallel_embedding: Option<VocabParallelEmbedding>,
     embed_norm: nn::RmsNorm,
     norm: nn::RmsNorm,
     lm_head: MaybeQuantized<nn::Linear>,
+    parallel_lm_head: Option<VocabParallelLmHead>,
     audio: Option<AudioModel>,
     vision_norm: Option<nn::RmsNorm>,
     vision_depth: usize,
@@ -501,6 +618,7 @@ impl InklingLayerwiseAdapter {
                 text.weight_dtype(),
                 stream,
             )?,
+            parallel_embedding: None,
             embed_norm: nn::RmsNorm::unloaded(
                 text.hidden_size,
                 text.rms_norm_eps,
@@ -521,6 +639,7 @@ impl InklingLayerwiseAdapter {
                 text.weight_dtype(),
                 stream,
             )?,
+            parallel_lm_head: None,
             audio,
             vision_norm,
             vision_depth,
@@ -938,11 +1057,110 @@ fn inkling_w13_recipe(
     }))
 }
 
-impl GeneralLayerwiseModelAdapter for InklingLayerwiseAdapter {
+impl ArchitectureAdapter for InklingLayerwiseAdapter {
     type Input<'a> = InklingExecutionInput<'a>;
     type Cache = Cache;
     type Layer = InklingLayer;
     type ForwardContext = InklingForwardContext;
+
+    fn model_type(&self) -> &str {
+        &self.args.model_type
+    }
+
+    fn prompt_cache_model_identity(
+        &self,
+        topology: Option<crate::ParallelTopology>,
+    ) -> Result<PromptCacheModelIdentity, Error> {
+        let mut local = self.args.clone();
+        if let Some(topology) = topology {
+            let text = &mut local.text_config;
+            text.num_attention_heads = exact_parallel_division(
+                "Inkling prompt-cache attention heads",
+                text.num_attention_heads,
+                topology.tensor_parallel_size,
+            )?;
+            text.num_key_value_heads = exact_parallel_division(
+                "Inkling prompt-cache KV heads",
+                text.num_key_value_heads,
+                topology.tensor_parallel_size,
+            )?;
+            text.swa_num_attention_heads = text
+                .swa_num_attention_heads
+                .map(|value| {
+                    exact_parallel_division(
+                        "Inkling prompt-cache sliding attention heads",
+                        value,
+                        topology.tensor_parallel_size,
+                    )
+                })
+                .transpose()?;
+            text.swa_num_key_value_heads = text
+                .swa_num_key_value_heads
+                .map(|value| {
+                    exact_parallel_division(
+                        "Inkling prompt-cache sliding KV heads",
+                        value,
+                        topology.tensor_parallel_size,
+                    )
+                })
+                .transpose()?;
+        }
+        let layer_count = self.args.text_config.num_hidden_layers as usize;
+        Ok(PromptCacheModelIdentity {
+            model_family: "inkling".into(),
+            effective_model_type: self.args.model_type.clone(),
+            architecture_fingerprint: resident::prompt_cache_architecture_fingerprint(&self.args),
+            layer_count,
+            global_layer_start: 0,
+            global_layer_end: layer_count,
+            sink_tokens: 0,
+            topology: topology.map_or_else(
+                PromptCacheTopology::default,
+                PromptCacheTopology::for_parallel_topology,
+            ),
+            layer_layout: resident::prompt_cache_layer_layout(&local)?,
+        })
+    }
+
+    fn save_prompt_cache(
+        &self,
+        cache: &mut Self::Cache,
+        destination: &Path,
+        descriptor: PromptCacheDescriptor,
+        prefix_token_ids: &[u32],
+        options: &PromptCacheOptions,
+        stream: &Stream,
+    ) -> Result<PromptCacheManifest, Error> {
+        resident::Model::save_prompt_cache(
+            cache,
+            destination,
+            descriptor,
+            prefix_token_ids,
+            options,
+            stream,
+        )
+        .map_err(Into::into)
+    }
+
+    fn load_prompt_cache(
+        &self,
+        directory: &Path,
+        expected: &PromptCacheDescriptor,
+        identity: &PromptCacheModelIdentity,
+        prefix_token_ids: &[u32],
+        _options: PagedCacheOptions,
+        stream: &Stream,
+    ) -> Result<(Self::Cache, PromptCacheManifest), Error> {
+        resident::Model::load_prompt_cache_with_identity(
+            &self.args,
+            directory,
+            expected,
+            prefix_token_ids,
+            identity,
+            stream,
+        )
+        .map_err(Into::into)
+    }
 
     fn static_units(&self, store: &dyn WeightStore) -> Result<Vec<StaticUnitBindings>, Error> {
         let mut units = vec![
@@ -1017,10 +1235,18 @@ impl GeneralLayerwiseModelAdapter for InklingLayerwiseAdapter {
                 leases.len()
             )));
         }
-        populate_module_from_lease(&mut self.embedding, &leases[0])?;
+        if let Some(embedding) = &mut self.parallel_embedding {
+            populate_module_from_lease(embedding.inner_mut(), &leases[0])?;
+        } else {
+            populate_module_from_lease(&mut self.embedding, &leases[0])?;
+        }
         populate_module_from_lease(&mut self.embed_norm, &leases[1])?;
         populate_module_from_lease(&mut self.norm, &leases[2])?;
-        populate_module_from_lease(&mut self.lm_head, &leases[3])?;
+        if let Some(head) = &mut self.parallel_lm_head {
+            populate_module_from_lease(head.inner_mut(), &leases[3])?;
+        } else {
+            populate_module_from_lease(&mut self.lm_head, &leases[3])?;
+        }
         let mut index = 4;
         if let Some(audio) = &mut self.audio {
             populate_module_from_lease(audio, &leases[index])?;
@@ -1198,6 +1424,173 @@ impl GeneralLayerwiseModelAdapter for InklingLayerwiseAdapter {
         })
     }
 
+    fn begin_forward_with_execution<'a>(
+        &mut self,
+        input: Self::Input<'a>,
+        _cache: &mut Self::Cache,
+        execution: &crate::runtime::distributed::parallel::ParallelExecutionContext<'_>,
+    ) -> Result<LayerwiseForwardState<Self::ForwardContext>, Error> {
+        let Some(embedding) = &mut self.parallel_embedding else {
+            return self.begin_forward(input, _cache, execution.stream());
+        };
+        let InklingExecutionInput {
+            input,
+            last_token_only,
+        } = input;
+        let stream = execution.stream();
+        if let InklingInput::Decode(tokens) = input {
+            let hidden = self
+                .embed_norm
+                .forward(&embedding.forward(tokens, execution)?, stream)?;
+            return Ok(LayerwiseForwardState {
+                hidden,
+                context: InklingForwardContext {
+                    parts: Vec::new(),
+                    vision_jobs: Vec::new(),
+                    needs_assembly: false,
+                    last_token_only,
+                },
+            });
+        }
+        let InklingInput::Prefill(typed) = input else {
+            unreachable!()
+        };
+        input::validate(typed)?;
+        let mut parts = Vec::with_capacity(typed.parts.len());
+        let mut vision_jobs = Vec::new();
+        for part in typed.parts {
+            match (part.modality, part.payload) {
+                (input::Modality::Text, input::InputPayload::TokenIds(tokens)) => {
+                    let embeddings = self
+                        .embed_norm
+                        .forward(&embedding.forward(tokens, execution)?, stream)?;
+                    parts.push(PreparedPart::Ready {
+                        tokens: tokens.clone(),
+                        embeddings,
+                    });
+                }
+                (input::Modality::Image, input::InputPayload::Tensor(pixels)) => {
+                    if self.vision_norm.is_none() {
+                        return Err(Error::UnsupportedArchitecture(
+                            "Inkling image input requires vision_config and vision weights".into(),
+                        ));
+                    }
+                    let job = vision_jobs.len();
+                    vision_jobs.push(VisionJob {
+                        hidden: pixels.clone(),
+                    });
+                    parts.push(PreparedPart::Vision {
+                        tokens: input::token_ids_array(
+                            &vec![self.args.image_token_id; pixels.dim(0) as usize],
+                            stream,
+                        )?,
+                        job,
+                    });
+                }
+                (input::Modality::Audio, input::InputPayload::Tensor(ids)) => {
+                    let embeddings = self
+                        .audio
+                        .as_mut()
+                        .ok_or_else(|| {
+                            Error::UnsupportedArchitecture(
+                                "Inkling audio input requires audio_config and audio weights"
+                                    .into(),
+                            )
+                        })?
+                        .forward_tensor_parallel(
+                            ids,
+                            part.metadata.audio_mask,
+                            execution.group().ok_or_else(|| {
+                                Error::Parallel("missing Inkling TP group".into())
+                            })?,
+                            stream,
+                        )?;
+                    parts.push(PreparedPart::Ready {
+                        tokens: input::token_ids_array(
+                            &vec![self.args.audio_token_id; embeddings.dim(1) as usize],
+                            stream,
+                        )?,
+                        embeddings,
+                    });
+                }
+                (
+                    input::Modality::Image | input::Modality::Audio,
+                    input::InputPayload::Embeddings(embeddings),
+                ) => {
+                    input::ensure_hidden_size(
+                        embeddings,
+                        self.args.text_config.hidden_size,
+                        "Inkling media embeddings",
+                    )?;
+                    let token = if part.modality == input::Modality::Image {
+                        self.args.image_token_id
+                    } else {
+                        self.args.audio_token_id
+                    };
+                    parts.push(PreparedPart::Ready {
+                        tokens: input::token_ids_array(
+                            &vec![token; embeddings.dim(1) as usize],
+                            stream,
+                        )?,
+                        embeddings: embeddings.clone(),
+                    });
+                }
+                (modality, _) => {
+                    return Err(Error::UnsupportedArchitecture(format!(
+                        "Inkling layerwise input does not support {} payloads of this kind",
+                        modality.as_str()
+                    )));
+                }
+            }
+        }
+        if vision_jobs.is_empty() {
+            let token_parts = parts
+                .iter()
+                .map(|part| match part {
+                    PreparedPart::Ready { tokens, .. } => tokens,
+                    PreparedPart::Vision { .. } => unreachable!(),
+                })
+                .collect::<Vec<_>>();
+            let embedding_parts = parts
+                .iter()
+                .map(|part| match part {
+                    PreparedPart::Ready { embeddings, .. } => embeddings,
+                    PreparedPart::Vision { .. } => unreachable!(),
+                })
+                .collect::<Vec<_>>();
+            let _tokens = concatenate_axis(&token_parts, 1, stream)?;
+            let hidden = concatenate_axis(&embedding_parts, 1, stream)?;
+            return Ok(LayerwiseForwardState {
+                hidden,
+                context: InklingForwardContext {
+                    parts,
+                    vision_jobs,
+                    needs_assembly: false,
+                    last_token_only,
+                },
+            });
+        }
+        let hidden = vision_jobs
+            .first()
+            .map(|job| job.hidden.clone())
+            .or_else(|| {
+                parts.iter().find_map(|part| match part {
+                    PreparedPart::Ready { embeddings, .. } => Some(embeddings.clone()),
+                    PreparedPart::Vision { .. } => None,
+                })
+            })
+            .expect("validated non-empty Inkling input");
+        Ok(LayerwiseForwardState {
+            hidden,
+            context: InklingForwardContext {
+                parts,
+                vision_jobs,
+                needs_assembly: true,
+                last_token_only,
+            },
+        })
+    }
+
     fn execution_group_count(&self) -> usize {
         1 + usize::from(self.vision_depth > 0)
     }
@@ -1252,6 +1645,177 @@ impl GeneralLayerwiseModelAdapter for InklingLayerwiseAdapter {
         }
     }
 
+    fn parallel_parameter_groups(
+        &self,
+        _context: crate::runtime::distributed::parallel::ParallelBuildContext,
+    ) -> Result<Vec<crate::runtime::distributed::parallel::ParameterGroupSpec>, Error> {
+        use crate::runtime::distributed::parallel::{
+            MemberSharding, ParameterGroupSpec, ParameterMemberSpec, ParameterRole,
+        };
+        let text = &self.args.text_config;
+        let mut groups = vec![
+            vocab_embedding_parameter_group(
+                &self.embedding,
+                "model.embed_tokens",
+                text.vocab_size as usize,
+                text.hidden_size,
+                false,
+            )?,
+            vocab_lm_head_parameter_group(
+                &self.lm_head,
+                "lm_head",
+                text.hidden_size,
+                text.vocab_size as usize,
+                false,
+            )?,
+        ];
+        let Some(args) = &self.args.vision_config else {
+            return Ok(groups);
+        };
+        for (index, (input, output, _, _)) in args.layer_specs().into_iter().enumerate() {
+            let name = format!("visual.layers.{index}.projection.weight");
+            let quantization = args.weight_quantization_for(&name);
+            let mut members = vec![ParameterMemberSpec::new(
+                name,
+                [
+                    output as usize,
+                    quantization.map_or(input as usize, |quantization| {
+                        safemlx::ops::quantized_packed_dimension(input, quantization.bits())
+                            as usize
+                    }),
+                ],
+                MemberSharding::Equal { axis: 1 },
+            )];
+            if let Some(quantization) = quantization {
+                let companion_shape = [
+                    output as usize,
+                    (input / quantization.group_size()) as usize,
+                ];
+                members.push(ParameterMemberSpec::new(
+                    format!("visual.layers.{index}.projection.scales"),
+                    companion_shape,
+                    MemberSharding::Equal { axis: 1 },
+                ));
+                if quantization.has_biases() {
+                    members.push(ParameterMemberSpec::new(
+                        format!("visual.layers.{index}.projection.biases"),
+                        companion_shape,
+                        MemberSharding::Equal { axis: 1 },
+                    ));
+                }
+            }
+            groups.push(ParameterGroupSpec::new(
+                format!("visual.layers.{index}.projection"),
+                ParameterRole::RowProjection,
+                members,
+            )?);
+        }
+        Ok(groups)
+    }
+
+    fn configure_parallel_static(
+        &mut self,
+        context: crate::runtime::distributed::parallel::ParallelBuildContext,
+        _layout: &crate::runtime::distributed::parallel::LocalModelLayout,
+        stream: &Stream,
+    ) -> Result<(), Error> {
+        let text = &self.args.text_config;
+        self.parallel_embedding = Some(VocabParallelEmbedding::unloaded_with_dtype(
+            text.vocab_size as usize,
+            text.hidden_size,
+            text.weight_quantization_for("model.embed_tokens.weight"),
+            text.weight_dtype(),
+            context,
+            stream,
+        )?);
+        self.parallel_lm_head = Some(VocabParallelLmHead::unloaded_with_dtype(
+            text.hidden_size,
+            text.vocab_size as usize,
+            text.weight_quantization_for("lm_head.weight"),
+            text.weight_dtype(),
+            context,
+            stream,
+        )?);
+        if let Some(audio) = &self.args.audio_config {
+            self.audio = Some(AudioModel::new_tensor_parallel(
+                audio,
+                text.weight_dtype(),
+                context.topology(),
+                stream,
+            )?);
+        }
+        Ok(())
+    }
+
+    fn register_parallel_parameters(
+        &self,
+        context: crate::runtime::distributed::parallel::ParallelBuildContext,
+        planner: &mut crate::runtime::distributed::parallel::ParallelPlanBuilder,
+        stream: &Stream,
+    ) -> Result<(), Error> {
+        for group in self.parallel_parameter_groups(context)? {
+            planner.register(group)?;
+        }
+        for index in 0..self.args.text_config.num_hidden_layers as usize {
+            let layer = DecoderLayer::new(&self.args.text_config, index as i32, stream)?;
+            layer.register_tensor_parallel_parameters(planner, &format!("model.layers.{index}"))?;
+        }
+        if let Some(audio) = &self.audio {
+            audio.register_tensor_parallel_parameters(planner, "audio")?;
+        }
+        Ok(())
+    }
+
+    fn new_parallel_layer(
+        &self,
+        group: usize,
+        index: usize,
+        layout: &crate::runtime::distributed::parallel::LocalModelLayout,
+        stream: &Stream,
+    ) -> Result<Self::Layer, Error> {
+        if self.execution_group_id(group)? != "vision_encoder" {
+            let prefix = format!("model.layers.{index}.self_attn.q_proj");
+            let query = layout
+                .tensor(&format!("{prefix}.weight"))
+                .or_else(|| layout.tensor(&format!("{prefix}.inner.weight")))
+                .ok_or_else(|| Error::Parallel(format!("missing TP layout for {prefix}")))?;
+            let parts = query.global_shape()[0]
+                .checked_div(query.local_shape()[0])
+                .ok_or_else(|| Error::Parallel("invalid Inkling TP query geometry".into()))?;
+            return Ok(InklingLayer::Text(Box::new(
+                DecoderLayer::new_tensor_parallel(
+                    &self.args.text_config,
+                    index as i32,
+                    parts,
+                    stream,
+                )?,
+            )));
+        }
+        let args = self
+            .args
+            .vision_config
+            .as_ref()
+            .expect("vision group config");
+        let specs = args.layer_specs();
+        let (_, output, t_fold, hw_fold) = specs[index];
+        let target = format!("visual.layers.{index}.projection.weight");
+        let local_input = i32::try_from(
+            layout
+                .tensor(&target)
+                .ok_or_else(|| Error::Parallel(format!("missing TP layout for {target}")))?
+                .local_shape()[1],
+        )
+        .map_err(|_| Error::Parallel("Inkling vision local input exceeds i32".into()))?;
+        Ok(InklingLayer::Vision(VisionLayer::new(
+            (local_input, output, t_fold, hw_fold),
+            index + 1 != specs.len(),
+            args.rms_norm_eps,
+            args.weight_quantization_for(&target),
+            self.args.text_config.weight_dtype(),
+            stream,
+        )?))
+    }
+
     fn layer_checkpoint_prefix(&self, group: usize, index: usize) -> String {
         if self.execution_group_id(group).ok().as_deref() == Some("vision_encoder") {
             format!("visual.layers.{index}")
@@ -1291,6 +1855,23 @@ impl GeneralLayerwiseModelAdapter for InklingLayerwiseAdapter {
             } else {
                 bindings
             },
+        )
+    }
+
+    fn parallel_layer_bindings(
+        &self,
+        group: usize,
+        index: usize,
+        _layer: &Self::Layer,
+        store: &dyn WeightStore,
+        layout: &crate::runtime::distributed::parallel::LocalModelLayout,
+        stream: &Stream,
+    ) -> Result<Vec<WeightBinding>, Error> {
+        let global = self.new_layer(group, index, stream)?;
+        crate::runtime::execution::layerwise::shard_layer_bindings(
+            self.layer_bindings(group, index, &global, store)?,
+            &self.layer_checkpoint_prefix(group, index),
+            layout,
         )
     }
 
@@ -1391,6 +1972,60 @@ impl GeneralLayerwiseModelAdapter for InklingLayerwiseAdapter {
         }
     }
 
+    fn forward_layer_with_execution(
+        &mut self,
+        group: usize,
+        index: usize,
+        layer: &mut Self::Layer,
+        hidden: &Array,
+        cache: &mut Self::Cache,
+        context: &mut Self::ForwardContext,
+        execution: &crate::runtime::distributed::parallel::ParallelExecutionContext<'_>,
+    ) -> Result<Array, Error> {
+        let Some(tp_group) = execution.group() else {
+            return self.forward_layer(
+                group,
+                index,
+                layer,
+                hidden,
+                cache,
+                context,
+                execution.stream(),
+            );
+        };
+        if self.execution_group_id(group)? == "vision_encoder" {
+            if let InklingLayer::Vision(layer) = layer {
+                for job in &mut context.vision_jobs {
+                    job.hidden =
+                        layer.forward_tensor_parallel(&job.hidden, tp_group, execution.stream())?;
+                }
+                return Ok(context.vision_jobs[0].hidden.clone());
+            }
+        } else if let InklingLayer::Text(layer) = layer {
+            if self.sparse_expert_cache {
+                return Err(Error::Parallel(
+                    "Inkling tensor parallelism cannot be combined with sparse expert caching"
+                        .into(),
+                ));
+            }
+            return Ok(layer.forward_tensor_parallel(
+                hidden,
+                Some(&mut cache.layers[index]),
+                tp_group,
+                execution.stream(),
+            )?);
+        }
+        self.forward_layer(
+            group,
+            index,
+            layer,
+            hidden,
+            cache,
+            context,
+            execution.stream(),
+        )
+    }
+
     fn retained_arrays<'a>(
         &self,
         cache: &'a Self::Cache,
@@ -1485,6 +2120,41 @@ impl GeneralLayerwiseModelAdapter for InklingLayerwiseAdapter {
                 return Ok(match logits.ndim() {
                     2 => logits.try_index_device((.., ..size), stream)?,
                     3 => logits.try_index_device((.., .., ..size), stream)?,
+                    rank => {
+                        return Err(Error::UnsupportedArchitecture(format!(
+                            "Inkling logits have unsupported rank {rank}"
+                        )));
+                    }
+                });
+            }
+        }
+        Ok(logits)
+    }
+
+    fn finish_with_execution(
+        &mut self,
+        hidden: &Array,
+        cache: &mut Self::Cache,
+        context: &Self::ForwardContext,
+        execution: &crate::runtime::distributed::parallel::ParallelExecutionContext<'_>,
+    ) -> Result<Array, Error> {
+        let Some(head) = &mut self.parallel_lm_head else {
+            return self.finish(hidden, cache, context, execution.stream());
+        };
+        let mut hidden = self.norm.forward(hidden, execution.stream())?;
+        if context.last_token_only {
+            hidden = hidden.try_index_device((.., -1, ..), execution.stream())?;
+        }
+        let hidden = hidden.divide(
+            Array::from_f32(self.args.text_config.logits_mup_width_multiplier),
+            execution.stream(),
+        )?;
+        let logits = head.forward(&hidden, execution)?.all_gather(execution)?;
+        if let Some(size) = self.args.text_config.unpadded_vocab_size {
+            if size < logits.dim(-1) {
+                return Ok(match logits.ndim() {
+                    2 => logits.try_index_device((.., ..size), execution.stream())?,
+                    3 => logits.try_index_device((.., .., ..size), execution.stream())?,
                     rank => {
                         return Err(Error::UnsupportedArchitecture(format!(
                             "Inkling logits have unsupported rank {rank}"
@@ -1690,12 +2360,16 @@ mod tests {
     use std::{fs, path::Path};
 
     use safemlx::{
+        distributed::{Backend, Group},
         module::ModuleParameters,
         ops::{indexing::TryIndexOp, ones_dtype, stack_axis},
         Array, Device, DeviceType, Dtype, ExecutionContext, Stream,
     };
 
-    use super::{load_inkling_layerwise_model, load_inkling_sparse_expert_cache_model};
+    use super::{
+        load_inkling_layerwise_model, load_inkling_sparse_expert_cache_model,
+        load_inkling_tensor_parallel_layerwise_model,
+    };
     use crate::{
         api::{
             common::generation::CausalLm,
@@ -1703,7 +2377,12 @@ mod tests {
             input as runtime_input,
         },
         runtime::cache::KeyValueCache,
-        runtime::execution::layerwise::LayerwiseLoadOptions,
+        runtime::distributed::{
+            parallel::{ParallelBuildContext, ShardingPolicy},
+            topology::{DeviceAssignment, ParallelTopology},
+        },
+        runtime::execution::layerwise::{LayerExecutionLoadOptions, LayerwiseLoadOptions},
+        runtime::residency::dense_stream::DenseDiskStreamLoadOptions,
         runtime::residency::expert_cache::ExpertCacheLoadOptions,
         runtime::residency::policy::{OffloadConfig, ResidencyPolicy},
         PagedCacheOptions,
@@ -1982,6 +2661,42 @@ mod tests {
                 .filter(|unit| unit.device_resident() && !layers.contains(unit))
                 .all(|unit| unit.policy() == ResidencyPolicy::Pinned));
         }
+    }
+
+    #[test]
+    #[ignore = "requires an MLX runtime with a Metal device"]
+    fn tensor_parallel_dense_stream_loads_multimodal_static_and_text_group() {
+        let gpu = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
+        let cpu = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        let mut fixture = Model::new(args(), gpu.stream()).unwrap();
+        initialize(&mut fixture, gpu.stream());
+        let dir = tempfile::tempdir().unwrap();
+        write_fixture(dir.path(), &fixture, gpu.stream());
+        let group = Group::init(false, Backend::Any).unwrap();
+        assert_eq!(group.size(), 1);
+        let topology =
+            ParallelTopology::from_rank(1, 0, 1, 1, 1, DeviceAssignment::new(DeviceType::Gpu, 0))
+                .unwrap();
+        let build = ParallelBuildContext::new(topology, ShardingPolicy::Require);
+        let options = DenseDiskStreamLoadOptions::new(u64::MAX, u64::MAX, 1, 1, 1).unwrap();
+        let model = load_inkling_tensor_parallel_layerwise_model(
+            dir.path(),
+            LayerExecutionLoadOptions::DenseDiskStream(options),
+            build,
+            gpu.stream(),
+            cpu.stream(),
+        )
+        .unwrap();
+        let report = model.dense_stream_report().unwrap().unwrap();
+        assert!(
+            report
+                .residency()
+                .units()
+                .iter()
+                .filter(|unit| unit.id().as_str().contains("inkling.text."))
+                .all(|unit| unit.planned_tier()
+                    == crate::runtime::residency::policy::MemoryTier::Disk)
+        );
     }
 
     #[test]

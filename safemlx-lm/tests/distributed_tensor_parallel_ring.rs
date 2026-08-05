@@ -14,18 +14,175 @@ use safemlx::{
     Array, Device, DeviceType, ExecutionContext, Stream,
 };
 use safemlx_lm::{
-    architectures::deepseek_v3::model as deepseek_v3,
-    architectures::distributed::tensor::load_tensor_parallel_model,
+    architectures::{
+        deepseek_v3::{
+            layerwise::{load_deepseek_v3_tensor_parallel_model, DeepSeekV3LayerwiseModel},
+            model::{self as deepseek_v3, Cache as DeepSeekCache},
+        },
+        llama::layerwise::{load_llama_tensor_parallel_model, LlamaCache, LlamaModel},
+    },
     runtime::checkpoint::binding::canonical_checkpoint_name,
-    runtime::generation::sampler::DefaultSampler, CacheResidencyPolicy, DeviceAssignment,
-    PagedCacheOptions, ParallelTopology, PromptCacheDescriptor, PromptCacheOptions,
-    PromptCacheTopology,
+    CacheResidencyPolicy, DeviceAssignment, LayerCachePolicy, LayerwiseLoadOptions,
+    PagedCacheOptions, ParallelBuildContext, ParallelModelInfo, ParallelTopology,
+    PromptCacheDescriptor, PromptCacheManifest, PromptCacheOptions, PromptCacheTopology,
+    ShardingPolicy,
 };
 use safetensors::tensor::{serialize_to_file, Dtype, TensorView};
 
 const WORKER_RANK: &str = "SAFEMLX_LM_TENSOR_RING_WORKER";
 const CHECKPOINT_DIR: &str = "SAFEMLX_LM_TENSOR_CHECKPOINT";
 const PROMPT_CACHE_ROOT: &str = "SAFEMLX_LM_TENSOR_PROMPT_CACHE";
+
+enum GeneralizedTensorModel {
+    Llama(LlamaModel),
+    DeepSeek(DeepSeekV3LayerwiseModel),
+}
+
+enum GeneralizedTensorCache {
+    Llama(LlamaCache),
+    DeepSeek(DeepSeekCache),
+}
+
+impl GeneralizedTensorModel {
+    fn load(
+        checkpoint: &Path,
+        deepseek: bool,
+        topology: ParallelTopology,
+        stream: &Stream,
+    ) -> Self {
+        let build = ParallelBuildContext::new(topology, ShardingPolicy::Require);
+        let options = LayerwiseLoadOptions::default();
+        if deepseek {
+            Self::DeepSeek(
+                load_deepseek_v3_tensor_parallel_model(checkpoint, options, build, stream, stream)
+                    .unwrap(),
+            )
+        } else {
+            Self::Llama(
+                load_llama_tensor_parallel_model(checkpoint, options, build, stream, stream)
+                    .unwrap(),
+            )
+        }
+    }
+
+    fn parallel_info(&self) -> &ParallelModelInfo {
+        match self {
+            Self::Llama(model) => model.parallel_info().unwrap(),
+            Self::DeepSeek(model) => model.parallel_info().unwrap(),
+        }
+    }
+
+    fn prompt_cache_architecture_fingerprint(&self) -> String {
+        match self {
+            Self::Llama(model) => model.prompt_cache_architecture_fingerprint(),
+            Self::DeepSeek(model) => model.prompt_cache_architecture_fingerprint(),
+        }
+    }
+
+    fn prompt_cache_layer_layout(&self) -> safemlx_lm::LayerSchedule<LayerCachePolicy> {
+        match self {
+            Self::Llama(model) => model.prompt_cache_layer_layout().unwrap(),
+            Self::DeepSeek(model) => model.prompt_cache_layer_layout().unwrap(),
+        }
+    }
+
+    fn new_paged_cache(&self, options: PagedCacheOptions) -> GeneralizedTensorCache {
+        match self {
+            Self::Llama(model) => GeneralizedTensorCache::Llama(
+                model
+                    .new_cache_with_options(CacheResidencyPolicy::Paged(options))
+                    .unwrap(),
+            ),
+            Self::DeepSeek(model) => GeneralizedTensorCache::DeepSeek(
+                model
+                    .new_cache_with_options(CacheResidencyPolicy::Paged(options))
+                    .unwrap(),
+            ),
+        }
+    }
+
+    fn forward_tensor_parallel(
+        &mut self,
+        inputs: &Array,
+        cache: &mut GeneralizedTensorCache,
+        group: &safemlx::distributed::Group,
+        stream: &Stream,
+    ) -> Array {
+        match (self, cache) {
+            (Self::Llama(model), GeneralizedTensorCache::Llama(cache)) => model
+                .forward_tensor_parallel(inputs, cache, group, stream)
+                .unwrap(),
+            (Self::DeepSeek(model), GeneralizedTensorCache::DeepSeek(cache)) => model
+                .forward_tensor_parallel(inputs, cache, group, stream)
+                .unwrap(),
+            _ => panic!("generalized tensor model/cache architecture mismatch"),
+        }
+    }
+
+    fn save_prompt_cache(
+        &self,
+        cache: &mut GeneralizedTensorCache,
+        root: &Path,
+        descriptor: PromptCacheDescriptor,
+        stream: &Stream,
+    ) -> PromptCacheManifest {
+        match (self, cache) {
+            (Self::Llama(model), GeneralizedTensorCache::Llama(cache)) => model
+                .save_prompt_cache(
+                    cache,
+                    root,
+                    descriptor,
+                    &[1, 2],
+                    &PromptCacheOptions::default(),
+                    stream,
+                )
+                .unwrap(),
+            (Self::DeepSeek(model), GeneralizedTensorCache::DeepSeek(cache)) => model
+                .save_prompt_cache(
+                    cache,
+                    root,
+                    descriptor,
+                    &[1, 2],
+                    &PromptCacheOptions::default(),
+                    stream,
+                )
+                .unwrap(),
+            _ => panic!("generalized tensor model/cache architecture mismatch"),
+        }
+    }
+
+    fn load_prompt_cache(
+        &self,
+        root: &Path,
+        descriptor: &PromptCacheDescriptor,
+        options: PagedCacheOptions,
+        stream: &Stream,
+    ) -> (GeneralizedTensorCache, PromptCacheManifest) {
+        match self {
+            Self::Llama(model) => {
+                let (cache, manifest) = model
+                    .load_prompt_cache(root, descriptor, &[1, 2], options, stream)
+                    .unwrap();
+                (GeneralizedTensorCache::Llama(cache), manifest)
+            }
+            Self::DeepSeek(model) => {
+                let (cache, manifest) = model
+                    .load_prompt_cache(root, descriptor, &[1, 2], options, stream)
+                    .unwrap();
+                (GeneralizedTensorCache::DeepSeek(cache), manifest)
+            }
+        }
+    }
+}
+
+impl GeneralizedTensorCache {
+    fn offset(&self) -> i32 {
+        match self {
+            Self::Llama(cache) => cache.offset(),
+            Self::DeepSeek(cache) => cache.offset(),
+        }
+    }
+}
 
 #[test]
 fn tensor_ring_worker() {
@@ -46,52 +203,37 @@ fn tensor_ring_worker() {
             .unwrap();
     assert_eq!(topology.global_rank, expected_rank);
     let stream = Stream::new_with_device(&topology.device.device().unwrap());
-    let mut model = load_tensor_parallel_model(&checkpoint, topology, &stream, &stream).unwrap();
-    let info = model.info();
-    assert_eq!(info.local_attention_heads, 1);
-    assert_eq!(info.local_kv_heads, 1);
-    assert_eq!(
-        info.local_vocabulary_range,
-        if deepseek {
-            if expected_rank == 0 {
-                0..4
-            } else {
-                4..8
-            }
-        } else if expected_rank == 0 {
-            0..3
-        } else {
-            3..5
-        }
-    );
+    let mut model = GeneralizedTensorModel::load(&checkpoint, deepseek, topology, &stream);
+    let info = model.parallel_info();
+    assert_eq!(info.topology(), topology);
+    assert_eq!(info.topology().tensor_parallel_rank, expected_rank);
+    assert_eq!(info.topology().tensor_parallel_size, 2);
     if !deepseek {
-        assert!(info.local_parameter_bytes < 656);
+        assert!(info.local_parameter_bytes() < 656);
     }
     assert!(info
-        .owned_tensors
+        .owned_tensors()
         .iter()
         .any(|name| name == "model.embed_tokens.weight"));
 
     let paged = PagedCacheOptions::new(1, 4096, 4096, 1)
         .unwrap()
         .with_full_attention(true);
-    let mut cache = model
-        .new_cache_with_options(CacheResidencyPolicy::Paged(paged.clone()))
-        .unwrap();
+    let mut cache = model.new_paged_cache(paged.clone());
     let prompt = safemlx::Array::from_slice(&[1u32, 2], &[1, 2]);
-    let logits = model.prefill(&prompt, &mut cache, &group, &stream).unwrap();
+    let logits = model.forward_tensor_parallel(&prompt, &mut cache, &group, &stream);
     assert_eq!(logits.shape(), &[1, 2, vocab_size as i32]);
     let descriptor = PromptCacheDescriptor {
         model_family: if deepseek { "deepseek_v3" } else { "llama" }.into(),
         effective_model_type: if deepseek { "deepseek_v3" } else { "llama" }.into(),
         checkpoint_fingerprint: "tensor-ring-fixture".into(),
         prefix_content_fingerprint: "tokens:1,2".into(),
-        architecture_fingerprint: model.prompt_cache_architecture_fingerprint().unwrap(),
+        architecture_fingerprint: model.prompt_cache_architecture_fingerprint(),
         layer_count,
         global_layer_start: 0,
         global_layer_end: layer_count,
         batch_size: 1,
-        layer_layout: model.prompt_cache_layer_layout().unwrap(),
+        layer_layout: model.prompt_cache_layer_layout(),
         sink_tokens: 0,
         topology: PromptCacheTopology {
             pipeline: None,
@@ -100,42 +242,23 @@ fn tensor_ring_worker() {
             expert_parallel_cache_replicated: true,
         },
     };
-    model
-        .save_prompt_cache(
-            &mut cache,
-            &prompt_cache_root,
-            descriptor.clone(),
-            &[1, 2],
-            &PromptCacheOptions::default(),
-        )
-        .unwrap();
+    let saved =
+        model.save_prompt_cache(&mut cache, &prompt_cache_root, descriptor.clone(), &stream);
+    assert_eq!(saved.topology, descriptor.topology);
     let token = safemlx::Array::from_slice(&[0u32], &[1, 1]);
-    let uninterrupted = model.decode(&token, &mut cache, &group, &stream).unwrap();
+    let uninterrupted = model.forward_tensor_parallel(&token, &mut cache, &group, &stream);
     let uninterrupted = uninterrupted.evaluated().unwrap();
     let uninterrupted_values = uninterrupted.as_slice::<f32>().to_vec();
     drop(uninterrupted);
-    let (mut cache, manifest) = model
-        .load_prompt_cache(&prompt_cache_root, &descriptor, &[1, 2], paged)
-        .unwrap();
+    let (mut cache, manifest) =
+        model.load_prompt_cache(&prompt_cache_root, &descriptor, paged, &stream);
     assert_eq!(manifest.topology, descriptor.topology);
-    let restored = model.decode(&token, &mut cache, &group, &stream).unwrap();
+    let restored = model.forward_tensor_parallel(&token, &mut cache, &group, &stream);
     let restored = restored.evaluated().unwrap();
     assert_eq!(uninterrupted_values, restored.as_slice::<f32>());
-    let mut logits = restored.as_array().clone();
     drop(restored);
-    let mut sampler = DefaultSampler;
-    for _ in 0..1 {
-        let synchronized = model
-            .sample_and_synchronize(&logits, &mut sampler, 0.0, None, false, 0, &group, &stream)
-            .unwrap();
-        let token = synchronized.token.evaluated().unwrap();
-        assert_eq!(token.as_slice::<u32>(), &[0]);
-        drop(token);
-        logits = model
-            .decode(&synchronized.token, &mut cache, &group, &stream)
-            .unwrap();
-        assert_eq!(logits.shape(), &[1, 1, vocab_size as i32]);
-    }
+    let logits = model.forward_tensor_parallel(&token, &mut cache, &group, &stream);
+    assert_eq!(logits.shape(), &[1, 1, vocab_size as i32]);
     assert_eq!(cache.offset(), 4);
 }
 

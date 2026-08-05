@@ -31,8 +31,17 @@ use crate::{
         input,
     },
     error::Error,
-    nn::tensor::{create_attention_mask, AttentionMask},
-    runtime::cache::{ConcatKeyValueCache, KeyValueCache},
+    nn::{
+        parallel::{VocabParallelEmbedding, VocabParallelLmHead},
+        tensor::{create_attention_mask, AttentionMask},
+    },
+    runtime::cache::residency::{
+        PagedCacheOptions, PromptCacheDescriptor, PromptCacheManifest, PromptCacheModelIdentity,
+        PromptCacheOptions, PromptCacheTopology,
+    },
+    runtime::cache::{
+        ConcatKeyValueCache, KeyValueCache, PagedKeyValueCache, SlidingKeyValueCache,
+    },
     runtime::checkpoint::binding::{
         build_module_bindings, build_module_bindings_excluding, build_module_bindings_with_recipes,
         materialize_module_bindings, populate_module_from_arrays_excluding,
@@ -40,9 +49,11 @@ use crate::{
     },
     runtime::checkpoint::recipe::DerivedWeightRecipe,
     runtime::checkpoint::store::{GgufWeightStore, TensorSelection, WeightStore},
+    runtime::distributed::parallel::exact_parallel_division,
     runtime::execution::layerwise::{
-        load_layerwise_model, load_layerwise_model_with_store, LayerExecutionLoadOptions,
-        LayerwiseInput, LayerwiseModel, LayerwiseModelAdapter, StaticUnitBindings, WeightResidency,
+        load_layerwise_model, load_layerwise_model_with_store,
+        load_tensor_parallel_layerwise_model, ArchitectureAdapter, LayerExecutionLoadOptions,
+        LayerwiseForwardState, LayerwiseModel, StaticUnitBindings, WeightResidency,
     },
     runtime::residency::expert_cache::{
         ExpertCache, ExpertCacheError, ExpertCacheLoadOptions, ExpertCacheReport,
@@ -54,6 +65,16 @@ use crate::{
 const EMBEDDING_UNIT: &str = "dense_qwen.static.embedding";
 const NORM_UNIT: &str = "dense_qwen.static.norm";
 const HEAD_UNIT: &str = "dense_qwen.static.output";
+
+/// Architecture-owned KV cache accepted by the canonical dense-Qwen adapter.
+pub enum DenseQwenLayerwiseCache {
+    /// Append-only device KV caches.
+    Concat(Vec<Option<ConcatKeyValueCache>>),
+    /// Sliding device KV caches used by expert-parallel execution.
+    Sliding(Vec<Option<SlidingKeyValueCache>>),
+    /// Paged KV caches used by expert-parallel execution.
+    Paged(Vec<Option<PagedKeyValueCache>>),
+}
 
 /// Host-backed dense-Qwen causal LM.
 pub struct LayerwiseDecoder {
@@ -83,6 +104,68 @@ impl LayerwiseDecoder {
             .collect()
     }
 
+    /// Returns rank-local generalized parallel information when applicable.
+    pub fn parallel_info(&self) -> Option<&crate::ParallelModelInfo> {
+        self.execution.parallel_info()
+    }
+
+    /// Returns this rank's exact prompt-cache state layout.
+    pub fn prompt_cache_layer_layout(
+        &self,
+    ) -> Result<crate::LayerSchedule<crate::LayerCachePolicy>, Error> {
+        self.execution.prompt_cache_layer_layout()
+    }
+
+    /// Persists a compatible standard prefix cache.
+    pub fn save_prompt_cache(
+        &self,
+        cache: &mut Vec<Option<ConcatKeyValueCache>>,
+        destination: impl AsRef<Path>,
+        descriptor: PromptCacheDescriptor,
+        prefix_token_ids: &[u32],
+        options: &PromptCacheOptions,
+        stream: &Stream,
+    ) -> Result<PromptCacheManifest, Error> {
+        let mut owned = DenseQwenLayerwiseCache::Concat(std::mem::take(cache));
+        let result = self.execution.save_prompt_cache(
+            &mut owned,
+            destination,
+            descriptor,
+            prefix_token_ids,
+            options,
+            stream,
+        );
+        let DenseQwenLayerwiseCache::Concat(owned) = owned else {
+            unreachable!("dense-Qwen prompt-cache wrapper changed variants")
+        };
+        *cache = owned;
+        result
+    }
+
+    /// Restores a compatible standard prefix cache.
+    pub fn load_prompt_cache(
+        &self,
+        directory: impl AsRef<Path>,
+        expected: &PromptCacheDescriptor,
+        prefix_token_ids: &[u32],
+        options: PagedCacheOptions,
+        stream: &Stream,
+    ) -> Result<(Vec<Option<ConcatKeyValueCache>>, PromptCacheManifest), Error> {
+        let (cache, manifest) = self.execution.load_prompt_cache(
+            directory,
+            expected,
+            prefix_token_ids,
+            options,
+            stream,
+        )?;
+        let DenseQwenLayerwiseCache::Concat(cache) = cache else {
+            return Err(Error::Parallel(
+                "dense-Qwen prompt-cache restore returned a non-concat representation".into(),
+            ));
+        };
+        Ok((cache, manifest))
+    }
+
     /// Returns current logical residency and transfer telemetry.
     pub fn residency_report(&self) -> Result<ResidencyReport, Error> {
         self.execution.residency_report()
@@ -110,6 +193,24 @@ impl LayerwiseDecoder {
         self.execution.checkpoint_store()
     }
 
+    /// Runs a rank-local tensor-parallel forward pass through the generalized
+    /// execution-group engine.
+    pub fn forward_tensor_parallel(
+        &mut self,
+        inputs: &Array,
+        mask: Option<&Array>,
+        cache: &mut DenseQwenLayerwiseCache,
+        group: &safemlx::distributed::Group,
+        stream: &Stream,
+    ) -> Result<Array, Error> {
+        self.execution.forward_tensor_parallel(
+            DenseQwenAdapterInput { inputs, mask },
+            cache,
+            group,
+            stream,
+        )
+    }
+
     /// Runs Qwen2/Qwen2.5 or Qwen3 with a standard KV cache.
     pub fn forward(
         &mut self,
@@ -118,54 +219,156 @@ impl LayerwiseDecoder {
         cache: &mut Vec<Option<ConcatKeyValueCache>>,
         stream: &Stream,
     ) -> Result<Array, Error> {
-        self.execution.forward_with_cache(
-            LayerwiseInput {
-                inputs,
-                mask,
-                cache,
-            },
-            stream,
-        )
+        let mut owned = DenseQwenLayerwiseCache::Concat(std::mem::take(cache));
+        let result =
+            self.execution
+                .forward(DenseQwenAdapterInput { inputs, mask }, &mut owned, stream);
+        let DenseQwenLayerwiseCache::Concat(owned) = owned else {
+            unreachable!("dense-Qwen concat cache wrapper changed variants")
+        };
+        *cache = owned;
+        result
     }
 
     /// Runs streamed layers while delegating routed experts to a caller.
-    pub(crate) fn forward_with_expert_executor<C, F>(
+    pub(crate) fn forward_with_expert_executor<F>(
         &mut self,
         inputs: &Array,
         mask: Option<&Array>,
-        cache: &mut Vec<Option<C>>,
+        cache: &mut Vec<Option<ConcatKeyValueCache>>,
         mut execute: F,
         stream: &Stream,
     ) -> Result<Array, Error>
     where
-        C: KeyValueCache + Default,
+        F: FnMut(usize, &Array, &Array, &Array, &Stream) -> Result<Array, Exception>,
+    {
+        let mut owned = DenseQwenLayerwiseCache::Concat(std::mem::take(cache));
+        let result =
+            self.forward_with_expert_executor_cache(inputs, mask, &mut owned, &mut execute, stream);
+        let DenseQwenLayerwiseCache::Concat(owned) = owned else {
+            unreachable!("dense-Qwen concat cache wrapper changed variants")
+        };
+        *cache = owned;
+        result
+    }
+
+    pub(crate) fn forward_with_sliding_expert_executor<F>(
+        &mut self,
+        inputs: &Array,
+        mask: Option<&Array>,
+        cache: &mut Vec<Option<SlidingKeyValueCache>>,
+        mut execute: F,
+        stream: &Stream,
+    ) -> Result<Array, Error>
+    where
+        F: FnMut(usize, &Array, &Array, &Array, &Stream) -> Result<Array, Exception>,
+    {
+        let mut owned = DenseQwenLayerwiseCache::Sliding(std::mem::take(cache));
+        let result =
+            self.forward_with_expert_executor_cache(inputs, mask, &mut owned, &mut execute, stream);
+        let DenseQwenLayerwiseCache::Sliding(owned) = owned else {
+            unreachable!("dense-Qwen sliding cache wrapper changed variants")
+        };
+        *cache = owned;
+        result
+    }
+
+    pub(crate) fn forward_with_paged_expert_executor<F>(
+        &mut self,
+        inputs: &Array,
+        mask: Option<&Array>,
+        cache: &mut Vec<Option<PagedKeyValueCache>>,
+        mut execute: F,
+        stream: &Stream,
+    ) -> Result<Array, Error>
+    where
+        F: FnMut(usize, &Array, &Array, &Array, &Stream) -> Result<Array, Exception>,
+    {
+        let mut owned = DenseQwenLayerwiseCache::Paged(std::mem::take(cache));
+        let result =
+            self.forward_with_expert_executor_cache(inputs, mask, &mut owned, &mut execute, stream);
+        let DenseQwenLayerwiseCache::Paged(owned) = owned else {
+            unreachable!("dense-Qwen paged cache wrapper changed variants")
+        };
+        *cache = owned;
+        result
+    }
+
+    fn forward_with_expert_executor_cache<F>(
+        &mut self,
+        inputs: &Array,
+        mask: Option<&Array>,
+        cache: &mut DenseQwenLayerwiseCache,
+        execute: &mut F,
+        stream: &Stream,
+    ) -> Result<Array, Error>
+    where
         F: FnMut(usize, &Array, &Array, &Array, &Stream) -> Result<Array, Exception>,
     {
         self.execution.forward_with_layer_executor(
-            LayerwiseInput {
-                inputs,
-                mask,
-                cache,
-            },
+            DenseQwenAdapterInput { inputs, mask },
+            cache,
             stream,
-            |_adapter, index, layer, hidden, cache, context, stream| {
-                Ok(layer.forward_sparse_experts(
-                    AttentionInput {
-                        x: hidden,
-                        mask: context.mask.as_ref(),
-                        cache: Some(cache),
-                    },
+            |_adapter, _group, index, layer, hidden, cache, context, stream| match cache {
+                DenseQwenLayerwiseCache::Concat(cache) => forward_sparse_with_executor(
+                    layer,
+                    hidden,
+                    cache[index].as_mut(),
+                    context,
+                    index,
+                    execute,
                     stream,
-                    |hidden, ids, weights, stream| execute(index, hidden, ids, weights, stream),
-                )?)
+                ),
+                DenseQwenLayerwiseCache::Sliding(cache) => forward_sparse_with_executor(
+                    layer,
+                    hidden,
+                    cache[index].as_mut(),
+                    context,
+                    index,
+                    execute,
+                    stream,
+                ),
+                DenseQwenLayerwiseCache::Paged(cache) => forward_sparse_with_executor(
+                    layer,
+                    hidden,
+                    cache[index].as_mut(),
+                    context,
+                    index,
+                    execute,
+                    stream,
+                ),
             },
         )
     }
 
     /// Clears temporary device decoder copies.
     pub fn clear_device_layer_window(&self) -> Result<(), Error> {
-        self.execution.clear_device_layer_window()
+        self.execution.clear_device_group("text_decoder")
     }
+}
+
+fn forward_sparse_with_executor<C, F>(
+    layer: &mut TransformerBlock,
+    hidden: &Array,
+    cache: Option<&mut C>,
+    context: &DenseQwenForwardContext,
+    index: usize,
+    execute: &mut F,
+    stream: &Stream,
+) -> Result<Array, Error>
+where
+    C: KeyValueCache,
+    F: FnMut(usize, &Array, &Array, &Array, &Stream) -> Result<Array, Exception>,
+{
+    Ok(layer.forward_sparse_experts(
+        AttentionInput {
+            x: hidden,
+            mask: context.mask.as_ref(),
+            cache,
+        },
+        stream,
+        |hidden, ids, weights, stream| execute(index, hidden, ids, weights, stream),
+    )?)
 }
 
 impl CausalLm<Vec<Option<ConcatKeyValueCache>>> for LayerwiseDecoder {
@@ -219,6 +422,44 @@ pub fn load_safetensors(
     let adapter = DenseQwenLayerwiseAdapter::new(args, stream)?;
     Ok(LayerwiseDecoder {
         execution: load_layerwise_model(model_dir, adapter, options, stream, weights_stream)?,
+    })
+}
+
+/// Loads Qwen2/3 dense or MoE checkpoints through the generalized
+/// tensor-parallel execution-group engine.
+pub fn load_tensor_parallel_safetensors(
+    model_dir: impl AsRef<Path>,
+    options: impl Into<LayerExecutionLoadOptions>,
+    build: crate::runtime::distributed::parallel::ParallelBuildContext,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<LayerwiseDecoder, Error> {
+    let model_dir = model_dir.as_ref();
+    let options = options.into();
+    let residency = match options {
+        LayerExecutionLoadOptions::LayerwiseHost(options) => {
+            WeightResidency::LayerwiseHost(options)
+        }
+        LayerExecutionLoadOptions::DenseDiskStream(options) => {
+            WeightResidency::DenseDiskStream(options)
+        }
+    };
+    let args = resident::load_config(model_dir)?;
+    crate::api::structural::validate_safetensors_load_path(
+        args.model_kind(),
+        model_dir,
+        crate::api::ModelLoadOptions::default().with_weight_residency(residency),
+    )?;
+    let adapter = DenseQwenLayerwiseAdapter::new(args, stream)?;
+    Ok(LayerwiseDecoder {
+        execution: load_tensor_parallel_layerwise_model(
+            model_dir,
+            adapter,
+            options,
+            build,
+            stream,
+            weights_stream,
+        )?,
     })
 }
 
@@ -328,7 +569,7 @@ pub(crate) fn load_qwen3_gguf_sparse_ep_base(
     }
 
     for (index, layer) in model.model.layers.iter_mut().enumerate() {
-        let bindings = adapter.layer_bindings(index, layer, store.as_ref())?;
+        let bindings = adapter.layer_bindings(0, index, layer, store.as_ref())?;
         let arrays =
             materialize_module_bindings(store.as_ref(), &bindings, weights_stream, stream)?;
         populate_module_from_arrays_excluding(layer, &arrays, |name| {
@@ -454,6 +695,8 @@ pub struct DenseQwenLayerwiseAdapter {
     embedding: MaybeQuantized<nn::Embedding>,
     norm: nn::RmsNorm,
     lm_head: Option<MaybeQuantized<nn::Linear>>,
+    parallel_embedding: Option<VocabParallelEmbedding>,
+    parallel_lm_head: Option<VocabParallelLmHead>,
     sparse_expert_cache: bool,
     expert_cache: Option<ExpertCache>,
 }
@@ -484,6 +727,8 @@ impl DenseQwenLayerwiseAdapter {
             embedding,
             norm,
             lm_head,
+            parallel_embedding: None,
+            parallel_lm_head: None,
             sparse_expert_cache: false,
             expert_cache: None,
         })
@@ -506,7 +751,15 @@ pub struct DenseQwenForwardContext {
     mask: Option<Array>,
 }
 
-impl LayerwiseModelAdapter for DenseQwenLayerwiseAdapter {
+/// Dense-Qwen input consumed by the architecture-neutral layerwise engine.
+pub struct DenseQwenAdapterInput<'a> {
+    inputs: &'a Array,
+    mask: Option<&'a Array>,
+}
+
+impl ArchitectureAdapter for DenseQwenLayerwiseAdapter {
+    type Input<'a> = DenseQwenAdapterInput<'a>;
+    type Cache = DenseQwenLayerwiseCache;
     type Layer = TransformerBlock;
     type ForwardContext = DenseQwenForwardContext;
 
@@ -518,7 +771,199 @@ impl LayerwiseModelAdapter for DenseQwenLayerwiseAdapter {
         self.args.quantization.or(self.args.quantization_config)
     }
 
-    fn layer_count(&self) -> Result<usize, Error> {
+    fn prompt_cache_model_identity(
+        &self,
+        topology: Option<crate::ParallelTopology>,
+    ) -> Result<PromptCacheModelIdentity, Error> {
+        let layer_count = usize::try_from(self.args.num_hidden_layers)
+            .map_err(|_| Exception::custom("invalid dense-Qwen cache layer count"))?;
+        let local_kv_heads = topology.map_or(Ok(self.args.num_key_value_heads), |topology| {
+            exact_parallel_division(
+                "dense-Qwen prompt-cache KV heads",
+                self.args.num_key_value_heads,
+                topology.tensor_parallel_size,
+            )
+        })?;
+        Ok(PromptCacheModelIdentity {
+            model_family: "dense_qwen".into(),
+            effective_model_type: self.args.model_type.clone(),
+            architecture_fingerprint: resident::prompt_cache_architecture_fingerprint(&self.args),
+            layer_count,
+            global_layer_start: 0,
+            global_layer_end: layer_count,
+            sink_tokens: 0,
+            topology: topology.map_or_else(
+                PromptCacheTopology::default,
+                PromptCacheTopology::for_parallel_topology,
+            ),
+            layer_layout: PromptCacheModelIdentity::key_value_layouts(
+                self.args.attention_schedule.iter().map(|policy| {
+                    policy.window().map(|window| {
+                        i32::try_from(window.get())
+                            .expect("validated dense-Qwen attention window fits i32")
+                    })
+                }),
+                local_kv_heads,
+                self.args.head_dim,
+            )
+            .map_err(|error| Exception::custom(error.to_string()))?,
+        })
+    }
+
+    fn save_prompt_cache(
+        &self,
+        cache: &mut Self::Cache,
+        destination: &Path,
+        descriptor: PromptCacheDescriptor,
+        prefix_token_ids: &[u32],
+        options: &PromptCacheOptions,
+        stream: &Stream,
+    ) -> Result<PromptCacheManifest, Error> {
+        match cache {
+            DenseQwenLayerwiseCache::Concat(cache) => resident::save_prompt_cache(
+                &self.args,
+                cache,
+                destination,
+                descriptor,
+                prefix_token_ids,
+                options,
+                stream,
+            )
+            .map_err(Into::into),
+            DenseQwenLayerwiseCache::Paged(caches) => {
+                for cache in caches.iter_mut().flatten() {
+                    cache.finalize()?;
+                }
+                caches
+                    .iter()
+                    .flatten()
+                    .next()
+                    .ok_or_else(|| Error::Parallel("cannot persist an empty dense-Qwen cache".into()))?
+                    .manager()
+                    .save_prompt_cache(destination, descriptor, prefix_token_ids, &[], options)
+                    .map_err(|error| Error::Parallel(error.to_string()))
+            }
+            DenseQwenLayerwiseCache::Sliding(_) => Err(Error::Parallel(
+                "dense-Qwen sliding-cache persistence is unsupported; use concat or paged cache state".into(),
+            )),
+        }
+    }
+
+    fn load_prompt_cache(
+        &self,
+        directory: &Path,
+        expected: &PromptCacheDescriptor,
+        identity: &PromptCacheModelIdentity,
+        prefix_token_ids: &[u32],
+        _options: PagedCacheOptions,
+        stream: &Stream,
+    ) -> Result<(Self::Cache, PromptCacheManifest), Error> {
+        let (cache, manifest) = resident::load_prompt_cache_with_identity(
+            &self.args,
+            directory,
+            expected,
+            prefix_token_ids,
+            identity,
+            stream,
+        )?;
+        Ok((DenseQwenLayerwiseCache::Concat(cache), manifest))
+    }
+
+    fn validate_cache(&self, cache: &mut Self::Cache) -> Result<(), Error> {
+        let expected = usize::try_from(self.args.num_hidden_layers).map_err(|_| {
+            Error::UnsupportedArchitecture(format!(
+                "dense-Qwen layer count {} is invalid",
+                self.args.num_hidden_layers
+            ))
+        })?;
+        match cache {
+            DenseQwenLayerwiseCache::Concat(caches) => {
+                if caches.is_empty() {
+                    *caches = self
+                        .args
+                        .attention_schedule
+                        .iter()
+                        .map(|policy| {
+                            Some(match policy.window() {
+                                Some(window) => ConcatKeyValueCache::new_for_sliding_attention(
+                                    i32::try_from(window.get())
+                                        .expect("validated dense-Qwen attention window fits i32"),
+                                ),
+                                None => ConcatKeyValueCache::new(),
+                            })
+                        })
+                        .collect();
+                }
+                validate_dense_qwen_cache(caches, expected)
+            }
+            DenseQwenLayerwiseCache::Sliding(caches) => validate_dense_qwen_cache(caches, expected),
+            DenseQwenLayerwiseCache::Paged(caches) => validate_dense_qwen_cache(caches, expected),
+        }
+    }
+
+    fn begin_forward<'a>(
+        &mut self,
+        input: Self::Input<'a>,
+        cache: &mut Self::Cache,
+        stream: &Stream,
+    ) -> Result<LayerwiseForwardState<Self::ForwardContext>, Error> {
+        let hidden = self.embedding.forward(input.inputs, stream)?;
+        let mask = match cache {
+            DenseQwenLayerwiseCache::Concat(caches) => {
+                dense_qwen_attention_mask(&hidden, input.mask, caches, stream)?
+            }
+            DenseQwenLayerwiseCache::Sliding(caches) => {
+                dense_qwen_attention_mask(&hidden, input.mask, caches, stream)?
+            }
+            DenseQwenLayerwiseCache::Paged(caches) => {
+                dense_qwen_attention_mask(&hidden, input.mask, caches, stream)?
+            }
+        };
+        Ok(LayerwiseForwardState {
+            hidden,
+            context: DenseQwenForwardContext { mask },
+        })
+    }
+
+    fn begin_forward_with_execution<'a>(
+        &mut self,
+        input: Self::Input<'a>,
+        cache: &mut Self::Cache,
+        execution: &crate::runtime::distributed::parallel::ParallelExecutionContext<'_>,
+    ) -> Result<LayerwiseForwardState<Self::ForwardContext>, Error> {
+        let Some(embedding) = &mut self.parallel_embedding else {
+            return self.begin_forward(input, cache, execution.stream());
+        };
+        let hidden = embedding.forward(input.inputs, execution)?;
+        let mask = match cache {
+            DenseQwenLayerwiseCache::Concat(caches) => {
+                dense_qwen_attention_mask(&hidden, input.mask, caches, execution.stream())?
+            }
+            DenseQwenLayerwiseCache::Sliding(caches) => {
+                dense_qwen_attention_mask(&hidden, input.mask, caches, execution.stream())?
+            }
+            DenseQwenLayerwiseCache::Paged(caches) => {
+                dense_qwen_attention_mask(&hidden, input.mask, caches, execution.stream())?
+            }
+        };
+        Ok(LayerwiseForwardState {
+            hidden,
+            context: DenseQwenForwardContext { mask },
+        })
+    }
+
+    fn execution_group_count(&self) -> usize {
+        1
+    }
+
+    fn execution_group_id(&self, group: usize) -> Result<String, Error> {
+        (group == 0).then(|| "text_decoder".into()).ok_or_else(|| {
+            Error::UnsupportedArchitecture(format!("dense Qwen has no group {group}"))
+        })
+    }
+
+    fn layer_count(&self, group: usize) -> Result<usize, Error> {
+        self.execution_group_id(group)?;
         usize::try_from(self.args.num_hidden_layers).map_err(|_| {
             Error::UnsupportedArchitecture(format!(
                 "dense-Qwen layer count {} is invalid",
@@ -555,31 +1000,144 @@ impl LayerwiseModelAdapter for DenseQwenLayerwiseAdapter {
                 leases.len()
             )));
         }
-        populate_module_from_lease(&mut self.embedding, &leases[0])?;
+        if let Some(embedding) = &mut self.parallel_embedding {
+            populate_module_from_lease(embedding.inner_mut(), &leases[0])?;
+        } else {
+            populate_module_from_lease(&mut self.embedding, &leases[0])?;
+        }
         populate_module_from_lease(&mut self.norm, &leases[1])?;
-        if let Some(head) = &mut self.lm_head {
+        if let Some(head) = &mut self.parallel_lm_head {
+            populate_module_from_lease(head.inner_mut(), &leases[2])?;
+        } else if let Some(head) = &mut self.lm_head {
             populate_module_from_lease(head, &leases[2])?;
         }
         Ok(())
     }
 
-    fn new_layer(&self, index: usize, stream: &Stream) -> Result<Self::Layer, Error> {
+    fn new_layer(&self, group: usize, index: usize, stream: &Stream) -> Result<Self::Layer, Error> {
+        self.execution_group_id(group)?;
         let index = i32::try_from(index).map_err(|_| {
             Error::UnsupportedArchitecture("dense-Qwen layer index exceeds i32".into())
         })?;
         Ok(TransformerBlock::new_for_layer(&self.args, index, stream)?)
     }
 
-    fn layer_checkpoint_prefix(&self, index: usize) -> String {
+    fn register_parallel_parameters(
+        &self,
+        _context: crate::runtime::distributed::parallel::ParallelBuildContext,
+        planner: &mut crate::runtime::distributed::parallel::ParallelPlanBuilder,
+        stream: &Stream,
+    ) -> Result<(), Error> {
+        planner.register(crate::nn::parallel::vocab_embedding_parameter_group(
+            &self.embedding,
+            "model.embed_tokens",
+            self.args.vocab_size as usize,
+            self.args.hidden_size,
+            false,
+        )?)?;
+        crate::nn::parallel::register_replicated_parameter_group(
+            planner,
+            &self.norm,
+            "model.norm",
+        )?;
+        if let Some(head) = &self.lm_head {
+            planner.register(crate::nn::parallel::vocab_lm_head_parameter_group(
+                head,
+                "lm_head",
+                self.args.hidden_size,
+                self.args.vocab_size as usize,
+                false,
+            )?)?;
+        }
+        for index in 0..self.args.num_hidden_layers as usize {
+            let layer = TransformerBlock::new_for_layer(&self.args, index as i32, stream)?;
+            crate::architectures::distributed::tensor::insert_qwen_layer_plan_with_prefix(
+                planner,
+                &layer,
+                &format!("model.layers.{index}"),
+            )?;
+        }
+        Ok(())
+    }
+
+    fn configure_parallel_static(
+        &mut self,
+        context: crate::runtime::distributed::parallel::ParallelBuildContext,
+        _layout: &crate::runtime::distributed::parallel::LocalModelLayout,
+        stream: &Stream,
+    ) -> Result<(), Error> {
+        self.parallel_embedding = Some(VocabParallelEmbedding::unloaded(
+            self.args.vocab_size as usize,
+            self.args.hidden_size,
+            self.args
+                .weight_quantization_for("model.embed_tokens.weight"),
+            context,
+            stream,
+        )?);
+        if self.lm_head.is_some() {
+            self.parallel_lm_head = Some(VocabParallelLmHead::unloaded(
+                self.args.hidden_size,
+                self.args.vocab_size as usize,
+                self.args.weight_quantization_for("lm_head.weight"),
+                context,
+                stream,
+            )?);
+        }
+        Ok(())
+    }
+
+    fn new_parallel_layer(
+        &self,
+        group: usize,
+        index: usize,
+        layout: &crate::runtime::distributed::parallel::LocalModelLayout,
+        stream: &Stream,
+    ) -> Result<Self::Layer, Error> {
+        self.execution_group_id(group)?;
+        let prefix = format!("model.layers.{index}");
+        let tensor = |suffix: &str| {
+            layout
+                .tensor(&format!("{prefix}.{suffix}.weight"))
+                .or_else(|| layout.tensor(&format!("{prefix}.{suffix}.inner.weight")))
+        };
+        let q = tensor("self_attn.q_proj")
+            .ok_or_else(|| Error::Parallel(format!("missing TP layout for {prefix} query")))?;
+        let k = tensor("self_attn.k_proj")
+            .ok_or_else(|| Error::Parallel(format!("missing TP layout for {prefix} key")))?;
+        let mut args = self.args.clone();
+        args.num_attention_heads = q.local_shape()[0] as i32 / args.head_dim;
+        args.num_key_value_heads = k.local_shape()[0] as i32 / args.head_dim;
+        if args.is_moe() {
+            let expert = layout
+                .tensor(&format!("{prefix}.mlp.experts.gate_up_proj"))
+                .ok_or_else(|| {
+                    Error::Parallel(format!("missing TP layout for {prefix} experts"))
+                })?;
+            args.moe_intermediate_size = expert.local_shape()[1] as i32 / 2;
+        } else {
+            let gate = tensor("mlp.gate_proj")
+                .ok_or_else(|| Error::Parallel(format!("missing TP layout for {prefix} MLP")))?;
+            args.intermediate_size = gate.local_shape()[0] as i32;
+        }
+        Ok(TransformerBlock::new_for_layer(
+            &args,
+            index as i32,
+            stream,
+        )?)
+    }
+
+    fn layer_checkpoint_prefix(&self, _group: usize, index: usize) -> String {
         format!("model.layers.{index}")
     }
 
-    fn layer_unit_name(&self, index: usize) -> String {
+    fn layer_unit_name(&self, _group: usize, index: usize) -> String {
         format!("dense_qwen.layer.{index:05}")
     }
 
     fn populate_layer(
         &self,
+        _group: usize,
+        _index: usize,
         layer: &mut Self::Layer,
         lease: &ResidentUnitLease,
     ) -> Result<(), Error> {
@@ -596,6 +1154,7 @@ impl LayerwiseModelAdapter for DenseQwenLayerwiseAdapter {
 
     fn layer_bindings(
         &self,
+        _group: usize,
         index: usize,
         layer: &Self::Layer,
         store: &dyn WeightStore,
@@ -654,6 +1213,23 @@ impl LayerwiseModelAdapter for DenseQwenLayerwiseAdapter {
         }
     }
 
+    fn parallel_layer_bindings(
+        &self,
+        group: usize,
+        index: usize,
+        _layer: &Self::Layer,
+        store: &dyn WeightStore,
+        layout: &crate::runtime::distributed::parallel::LocalModelLayout,
+        stream: &Stream,
+    ) -> Result<Vec<WeightBinding>, Error> {
+        let global = self.new_layer(group, index, stream)?;
+        crate::runtime::execution::layerwise::shard_layer_bindings(
+            self.layer_bindings(group, index, &global, store)?,
+            &self.layer_checkpoint_prefix(group, index),
+            layout,
+        )
+    }
+
     fn additional_consumed_checkpoint_keys(&self, store: &dyn WeightStore) -> Vec<String> {
         if self.sparse_expert_cache {
             store
@@ -666,39 +1242,146 @@ impl LayerwiseModelAdapter for DenseQwenLayerwiseAdapter {
         }
     }
 
-    fn embed(&mut self, inputs: &Array, stream: &Stream) -> Result<Array, Error> {
-        Ok(self.embedding.forward(inputs, stream)?)
-    }
-
-    fn prepare_forward<C: KeyValueCache>(
-        &self,
-        hidden: &Array,
-        mask: Option<&Array>,
-        cache: &[Option<C>],
-        stream: &Stream,
-    ) -> Result<Self::ForwardContext, Error> {
-        let mask = match mask {
-            Some(mask) => Some(mask.clone()),
-            None => match create_attention_mask(hidden, cache, Some(true), stream)? {
-                Some(AttentionMask::Array(mask)) => Some(mask),
-                Some(AttentionMask::Causal) => {
-                    return Err(Error::UnsupportedArchitecture(
-                        "dense-Qwen layerwise execution requires an array attention mask".into(),
-                    ));
-                }
-                None => None,
-            },
-        };
-        Ok(DenseQwenForwardContext { mask })
-    }
-
-    fn forward_layer<C: KeyValueCache>(
-        &self,
+    fn forward_layer(
+        &mut self,
+        _group: usize,
         index: usize,
         layer: &mut Self::Layer,
         hidden: &Array,
-        cache: &mut C,
+        cache: &mut Self::Cache,
+        context: &mut Self::ForwardContext,
+        stream: &Stream,
+    ) -> Result<Array, Error> {
+        match cache {
+            DenseQwenLayerwiseCache::Concat(caches) => self.forward_cached_layer(
+                index,
+                layer,
+                hidden,
+                caches[index].as_mut().expect("validated dense-Qwen cache"),
+                context,
+                stream,
+            ),
+            DenseQwenLayerwiseCache::Sliding(caches) => self.forward_cached_layer(
+                index,
+                layer,
+                hidden,
+                caches[index].as_mut().expect("validated dense-Qwen cache"),
+                context,
+                stream,
+            ),
+            DenseQwenLayerwiseCache::Paged(caches) => self.forward_cached_layer(
+                index,
+                layer,
+                hidden,
+                caches[index].as_mut().expect("validated dense-Qwen cache"),
+                context,
+                stream,
+            ),
+        }
+    }
+
+    fn forward_layer_with_execution(
+        &mut self,
+        group: usize,
+        index: usize,
+        layer: &mut Self::Layer,
+        hidden: &Array,
+        cache: &mut Self::Cache,
+        context: &mut Self::ForwardContext,
+        execution: &crate::runtime::distributed::parallel::ParallelExecutionContext<'_>,
+    ) -> Result<Array, Error> {
+        let Some(tp_group) = execution.group() else {
+            return self.forward_layer(
+                group,
+                index,
+                layer,
+                hidden,
+                cache,
+                context,
+                execution.stream(),
+            );
+        };
+        match cache {
+            DenseQwenLayerwiseCache::Concat(caches) => Ok(layer.forward_tensor_parallel(
+                hidden,
+                context.mask.as_ref(),
+                caches[index].as_mut(),
+                tp_group,
+                execution.stream(),
+            )?),
+            DenseQwenLayerwiseCache::Sliding(caches) => Ok(layer.forward_tensor_parallel(
+                hidden,
+                context.mask.as_ref(),
+                caches[index].as_mut(),
+                tp_group,
+                execution.stream(),
+            )?),
+            DenseQwenLayerwiseCache::Paged(caches) => Ok(layer.forward_tensor_parallel(
+                hidden,
+                context.mask.as_ref(),
+                caches[index].as_mut(),
+                tp_group,
+                execution.stream(),
+            )?),
+        }
+    }
+
+    fn retained_arrays<'a>(
+        &self,
+        cache: &'a Self::Cache,
+        _group: usize,
+        index: usize,
+    ) -> Vec<&'a Array> {
+        match cache {
+            DenseQwenLayerwiseCache::Concat(caches) => retained_cache_arrays(caches, index),
+            DenseQwenLayerwiseCache::Sliding(caches) => retained_cache_arrays(caches, index),
+            DenseQwenLayerwiseCache::Paged(caches) => retained_cache_arrays(caches, index),
+        }
+    }
+
+    fn finish(
+        &mut self,
+        hidden: &Array,
+        _cache: &mut Self::Cache,
+        _context: &Self::ForwardContext,
+        stream: &Stream,
+    ) -> Result<Array, Error> {
+        let hidden = self.norm.forward(hidden, stream)?;
+        Ok(project_logits_maybe_quantized(
+            &mut self.lm_head,
+            &mut self.embedding,
+            &hidden,
+            stream,
+        )?)
+    }
+
+    fn finish_with_execution(
+        &mut self,
+        hidden: &Array,
+        cache: &mut Self::Cache,
         context: &Self::ForwardContext,
+        execution: &crate::runtime::distributed::parallel::ParallelExecutionContext<'_>,
+    ) -> Result<Array, Error> {
+        let Some(embedding) = &mut self.parallel_embedding else {
+            return self.finish(hidden, cache, context, execution.stream());
+        };
+        let hidden = self.norm.forward(hidden, execution.stream())?;
+        let logits = match &mut self.parallel_lm_head {
+            Some(head) => head.forward(&hidden, execution)?,
+            None => embedding.project_logits(&hidden, execution)?,
+        };
+        logits.all_gather(execution)
+    }
+}
+
+impl DenseQwenLayerwiseAdapter {
+    fn forward_cached_layer<C: KeyValueCache>(
+        &self,
+        index: usize,
+        layer: &mut TransformerBlock,
+        hidden: &Array,
+        cache: &mut C,
+        context: &DenseQwenForwardContext,
         stream: &Stream,
     ) -> Result<Array, Error> {
         if self.sparse_expert_cache {
@@ -712,7 +1395,7 @@ impl LayerwiseModelAdapter for DenseQwenLayerwiseAdapter {
             } else {
                 ExpertPass::Decode
             };
-            let output = layer.forward_sparse_experts(
+            return Ok(layer.forward_sparse_experts(
                 AttentionInput {
                     x: hidden,
                     mask: context.mask.as_ref(),
@@ -791,8 +1474,7 @@ impl LayerwiseModelAdapter for DenseQwenLayerwiseAdapter {
                         )
                         .map_err(|error| Exception::custom(error.to_string()))
                 },
-            )?;
-            return Ok(output);
+            )?);
         }
         Ok(layer.forward(
             AttentionInput {
@@ -803,16 +1485,50 @@ impl LayerwiseModelAdapter for DenseQwenLayerwiseAdapter {
             stream,
         )?)
     }
+}
 
-    fn finish(&mut self, hidden: &Array, stream: &Stream) -> Result<Array, Error> {
-        let hidden = self.norm.forward(hidden, stream)?;
-        Ok(project_logits_maybe_quantized(
-            &mut self.lm_head,
-            &mut self.embedding,
-            &hidden,
-            stream,
-        )?)
+fn validate_dense_qwen_cache<C: KeyValueCache>(
+    caches: &[Option<C>],
+    expected: usize,
+) -> Result<(), Error> {
+    if caches.len() != expected {
+        return Err(Exception::custom(format!(
+            "dense-Qwen cache has {} layers, expected {expected}",
+            caches.len()
+        ))
+        .into());
     }
+    for (index, cache) in caches.iter().enumerate() {
+        cache.as_ref().ok_or_else(|| {
+            Exception::custom(format!("dense-Qwen cache is missing layer {index}"))
+        })?;
+    }
+    Ok(())
+}
+
+fn dense_qwen_attention_mask<C: KeyValueCache>(
+    hidden: &Array,
+    explicit: Option<&Array>,
+    caches: &[Option<C>],
+    stream: &Stream,
+) -> Result<Option<Array>, Error> {
+    if let Some(mask) = explicit {
+        return Ok(Some(mask.clone()));
+    }
+    match create_attention_mask(hidden, caches, Some(true), stream)? {
+        Some(AttentionMask::Array(mask)) => Ok(Some(mask)),
+        Some(AttentionMask::Causal) => Err(Error::UnsupportedArchitecture(
+            "dense-Qwen layerwise execution requires an array attention mask".into(),
+        )),
+        None => Ok(None),
+    }
+}
+
+fn retained_cache_arrays<C: KeyValueCache>(caches: &[Option<C>], index: usize) -> Vec<&Array> {
+    caches[index]
+        .as_ref()
+        .map(KeyValueCache::retained_arrays)
+        .unwrap_or_default()
 }
 
 pub(crate) fn qwen3_expert_catalog(

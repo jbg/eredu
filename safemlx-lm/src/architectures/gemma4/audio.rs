@@ -91,6 +91,8 @@ impl AudioSubsampleLayer {
 
 #[derive(Debug, Clone, ModuleParameters)]
 pub(crate) struct AudioSubsampleConvProjection {
+    pub global_hidden_size: i32,
+    pub parallel_parts: usize,
     #[param]
     pub layer0: AudioSubsampleLayer,
     #[param]
@@ -119,6 +121,8 @@ impl AudioSubsampleConvProjection {
         let first = config.subsampling_conv_channels[0];
         let second = config.subsampling_conv_channels[1];
         Ok(Self {
+            global_hidden_size: config.hidden_size,
+            parallel_parts: 1,
             layer0: AudioSubsampleLayer::new(1, first, config.rms_norm_eps, stream)?,
             layer1: AudioSubsampleLayer::new(first, second, config.rms_norm_eps, stream)?,
             input_proj_linear: nn::Linear::unloaded(
@@ -129,6 +133,28 @@ impl AudioSubsampleConvProjection {
                 stream,
             )?,
         })
+    }
+
+    pub(crate) fn new_tensor_parallel(
+        config: &Gemma4AudioConfig,
+        context: crate::runtime::distributed::parallel::ParallelBuildContext,
+        stream: &Stream,
+    ) -> Result<Self, crate::error::Error> {
+        let mut output = Self::new(config, stream)?;
+        let local = context.equal_local_dimension(
+            "Gemma audio input projection hidden size",
+            config.hidden_size as usize,
+        )?;
+        output.global_hidden_size = config.hidden_size;
+        output.parallel_parts = context.topology().tensor_parallel_size;
+        output.input_proj_linear = nn::Linear::unloaded(
+            32 * config.subsampling_conv_channels[1],
+            local as i32,
+            false,
+            Dtype::Float32,
+            stream,
+        )?;
+        Ok(output)
     }
 
     pub(crate) fn forward(
@@ -165,6 +191,18 @@ impl AudioSubsampleConvProjection {
             .forward(&x.multiply(first_mask, stream)?, stream)?;
         let x = x.reshape(&[x.dim(0), x.dim(1), x.dim(2) * x.dim(3)], stream)?;
         self.input_proj_linear.forward(&x, stream)
+    }
+
+    pub(crate) fn forward_tensor_parallel(
+        &mut self,
+        features: &Array,
+        valid_frames: i32,
+        group: &safemlx::distributed::Group,
+        stream: &Stream,
+    ) -> Result<Array, Exception> {
+        let local = self.forward(features, valid_frames, stream)?;
+        let widths = vec![local.dim(-1) as usize; self.parallel_parts];
+        safemlx::distributed::all_gather_uneven_axis(&local, -1, &widths, group, stream)
     }
 }
 
@@ -212,11 +250,41 @@ impl AudioFeedForward {
         })
     }
 
+    fn new_tensor_parallel(
+        config: &Gemma4AudioConfig,
+        local_intermediate: i32,
+        stream: &Stream,
+    ) -> Result<Self, Exception> {
+        let mut block = Self::new(config, stream)?;
+        block.ffw_layer_1 =
+            Gemma4ClippedLinear::new(config.hidden_size, local_intermediate, false, stream)?;
+        block.ffw_layer_2 =
+            Gemma4ClippedLinear::new(local_intermediate, config.hidden_size, false, stream)?;
+        Ok(block)
+    }
+
     fn forward(&mut self, x: &Array, stream: &Stream) -> Result<Array, Exception> {
         let residual = x.clone();
         let x = self.pre_layer_norm.forward(x, stream)?;
         let x = nn::silu(self.ffw_layer_1.forward(&x, stream)?, stream)?;
         let x = self.ffw_layer_2.forward(&x, stream)?;
+        let x = self.post_layer_norm.forward(&x, stream)?;
+        residual.add(
+            x.multiply(Array::from_f32(self.residual_weight), stream)?,
+            stream,
+        )
+    }
+
+    fn forward_tensor_parallel(
+        &mut self,
+        x: &Array,
+        group: &safemlx::distributed::Group,
+        stream: &Stream,
+    ) -> Result<Array, Exception> {
+        let residual = x.clone();
+        let x = self.pre_layer_norm.forward(x, stream)?;
+        let x = nn::silu(self.ffw_layer_1.forward(&x, stream)?, stream)?;
+        let x = self.ffw_layer_2.forward_row_parallel(&x, group, stream)?;
         let x = self.post_layer_norm.forward(&x, stream)?;
         residual.add(
             x.multiply(Array::from_f32(self.residual_weight), stream)?,
@@ -264,6 +332,42 @@ impl AudioLightConv1d {
         })
     }
 
+    fn new_tensor_parallel(
+        config: &Gemma4AudioConfig,
+        local_hidden: i32,
+        stream: &Stream,
+    ) -> Result<Self, Exception> {
+        Ok(Self {
+            pre_layer_norm: nn::RmsNorm::unloaded(
+                config.hidden_size,
+                config.rms_norm_eps,
+                Dtype::Float32,
+                stream,
+            )?,
+            linear_start: Gemma4ClippedLinear::new(
+                config.hidden_size,
+                2 * local_hidden,
+                false,
+                stream,
+            )?,
+            depthwise_conv1d: AudioConvWeight {
+                weight: Param::<Array>::unloaded(
+                    &[local_hidden, config.conv_kernel_size, 1],
+                    Dtype::Float32,
+                    stream,
+                )?,
+            },
+            conv_norm: nn::RmsNorm::unloaded(
+                local_hidden,
+                config.rms_norm_eps,
+                Dtype::Float32,
+                stream,
+            )?,
+            linear_end: Gemma4ClippedLinear::new(local_hidden, config.hidden_size, false, stream)?,
+            kernel_size: config.conv_kernel_size,
+        })
+    }
+
     fn forward(&mut self, x: &Array, stream: &Stream) -> Result<Array, Exception> {
         let residual = x.clone();
         let projected = self
@@ -291,6 +395,62 @@ impl AudioLightConv1d {
         )?;
         let x = nn::silu(self.conv_norm.forward(&x, stream)?, stream)?;
         residual.add(self.linear_end.forward(&x, stream)?, stream)
+    }
+
+    fn forward_tensor_parallel(
+        &mut self,
+        x: &Array,
+        group: &safemlx::distributed::Group,
+        stream: &Stream,
+    ) -> Result<Array, Exception> {
+        let residual = x.clone();
+        let projected = self
+            .linear_start
+            .forward(&self.pre_layer_norm.forward(x, stream)?, stream)?;
+        let hidden = projected.dim(2) / 2;
+        let left = projected.try_index_device((.., .., ..hidden), stream)?;
+        let right = projected.try_index_device((.., .., hidden..), stream)?;
+        let gated = left.multiply(nn::sigmoid(right, stream)?, stream)?;
+        let padded = pad(
+            &gated,
+            PadWidth::from(&[(0, 0), (self.kernel_size - 1, 0), (0, 0)][..]),
+            None,
+            None,
+            stream,
+        )?;
+        let convolved = conv1d(
+            &padded,
+            &*self.depthwise_conv1d.weight,
+            None,
+            None,
+            None,
+            Some(hidden),
+            stream,
+        )?;
+        let local_square = convolved.square(stream)?.sum_axes(&[-1], true, stream)?;
+        let global_square = safemlx::distributed::all_sum(&local_square, group, stream)?;
+        let global_hidden = hidden
+            .checked_mul(
+                i32::try_from(group.size())
+                    .map_err(|_| Exception::custom("Gemma audio TP size exceeds i32"))?,
+            )
+            .ok_or_else(|| Exception::custom("Gemma audio TP hidden width overflow"))?;
+        let normalized = convolved.multiply(
+            safemlx::ops::rsqrt(
+                global_square
+                    .divide(Array::from_f32(global_hidden as f32), stream)?
+                    .add(Array::from_f32(self.conv_norm.eps), stream)?,
+                stream,
+            )?,
+            stream,
+        )?;
+        let normalized = normalized.multiply(&*self.conv_norm.weight, stream)?;
+        let activated = nn::silu(normalized, stream)?;
+        residual.add(
+            self.linear_end
+                .forward_row_parallel(&activated, group, stream)?,
+            stream,
+        )
     }
 }
 
@@ -335,10 +495,39 @@ impl AudioAttention {
         })
     }
 
+    fn new_tensor_parallel(
+        config: &Gemma4AudioConfig,
+        local_heads: i32,
+        stream: &Stream,
+    ) -> Result<Self, Exception> {
+        let head_dim = config.head_dim();
+        let local_hidden = local_heads * head_dim;
+        Ok(Self {
+            q_proj: Gemma4ClippedLinear::new(config.hidden_size, local_hidden, false, stream)?,
+            k_proj: Gemma4ClippedLinear::new(config.hidden_size, local_hidden, false, stream)?,
+            v_proj: Gemma4ClippedLinear::new(config.hidden_size, local_hidden, false, stream)?,
+            post: Gemma4ClippedLinear::new(local_hidden, config.hidden_size, false, stream)?,
+            relative_k_proj: nn::Linear::unloaded(
+                config.hidden_size,
+                local_hidden,
+                false,
+                Dtype::Float32,
+                stream,
+            )?,
+            per_dim_scale: Param::<Array>::unloaded(&[head_dim], Dtype::Float32, stream)?,
+            heads: local_heads,
+            head_dim,
+            chunk_size: config.attention_chunk_size,
+            past: config.attention_context_left - 1,
+            logit_cap: config.attention_logit_cap,
+            invalid_logits: config.attention_invalid_logits_value,
+        })
+    }
+
     fn relative_embeddings(&self) -> Array {
         let mut values =
             Vec::with_capacity(((self.past + 1) * self.heads * self.head_dim) as usize);
-        let hidden = self.heads * self.head_dim;
+        let hidden = self.relative_k_proj.weight.dim(1);
         let timescales = hidden / 2;
         let increment = 10_000.0_f32.ln() / (timescales - 1).max(1) as f32;
         for position in (0..=self.past).rev() {
@@ -349,10 +538,15 @@ impl AudioAttention {
                 values.push((position as f32 * (-increment * index as f32).exp()).cos());
             }
         }
-        Array::from_slice(&values, &[self.past + 1, self.heads * self.head_dim])
+        Array::from_slice(&values, &[self.past + 1, hidden])
     }
 
-    fn forward(&mut self, x: &Array, valid: i32, stream: &Stream) -> Result<Array, Exception> {
+    fn forward_without_post(
+        &mut self,
+        x: &Array,
+        valid: i32,
+        stream: &Stream,
+    ) -> Result<Array, Exception> {
         if x.dim(0) != 1 {
             return Err(Exception::custom(
                 "Gemma 4 audio currently requires batch size 1",
@@ -463,7 +657,23 @@ impl AudioAttention {
             .try_index_device((.., .., ..sequence, ..), stream)?
             .transpose_axes(&[0, 2, 1, 3], stream)?
             .reshape(&[1, sequence, self.heads * self.head_dim], stream)?;
+        Ok(output)
+    }
+
+    fn forward(&mut self, x: &Array, valid: i32, stream: &Stream) -> Result<Array, Exception> {
+        let output = self.forward_without_post(x, valid, stream)?;
         self.post.forward(&output, stream)
+    }
+
+    fn forward_tensor_parallel(
+        &mut self,
+        x: &Array,
+        valid: i32,
+        group: &safemlx::distributed::Group,
+        stream: &Stream,
+    ) -> Result<Array, Exception> {
+        let output = self.forward_without_post(x, valid, stream)?;
+        self.post.forward_row_parallel(&output, group, stream)
     }
 }
 
@@ -507,6 +717,40 @@ impl AudioLayer {
         })
     }
 
+    pub(crate) fn new_tensor_parallel(
+        config: &Gemma4AudioConfig,
+        local_heads: i32,
+        local_intermediate: i32,
+        local_hidden: i32,
+        stream: &Stream,
+    ) -> Result<Self, Exception> {
+        let norm = || {
+            nn::RmsNorm::unloaded(
+                config.hidden_size,
+                config.rms_norm_eps,
+                Dtype::Float32,
+                stream,
+            )
+        };
+        Ok(Self {
+            feed_forward1: AudioFeedForward::new_tensor_parallel(
+                config,
+                local_intermediate,
+                stream,
+            )?,
+            norm_pre_attn: norm()?,
+            self_attn: AudioAttention::new_tensor_parallel(config, local_heads, stream)?,
+            norm_post_attn: norm()?,
+            lconv1d: AudioLightConv1d::new_tensor_parallel(config, local_hidden, stream)?,
+            feed_forward2: AudioFeedForward::new_tensor_parallel(
+                config,
+                local_intermediate,
+                stream,
+            )?,
+            norm_out: norm()?,
+        })
+    }
+
     pub(crate) fn forward(
         &mut self,
         x: &Array,
@@ -521,6 +765,31 @@ impl AudioLayer {
         let x = residual.add(self.norm_post_attn.forward(&attended, stream)?, stream)?;
         let x = self.lconv1d.forward(&x, stream)?;
         let x = self.feed_forward2.forward(&x, stream)?;
+        self.norm_out.forward(&x, stream)
+    }
+
+    pub(crate) fn forward_tensor_parallel(
+        &mut self,
+        x: &Array,
+        valid: i32,
+        group: &safemlx::distributed::Group,
+        stream: &Stream,
+    ) -> Result<Array, Exception> {
+        let x = self
+            .feed_forward1
+            .forward_tensor_parallel(x, group, stream)?;
+        let residual = x.clone();
+        let attended = self.self_attn.forward_tensor_parallel(
+            &self.norm_pre_attn.forward(&x, stream)?,
+            valid,
+            group,
+            stream,
+        )?;
+        let x = residual.add(self.norm_post_attn.forward(&attended, stream)?, stream)?;
+        let x = self.lconv1d.forward_tensor_parallel(&x, group, stream)?;
+        let x = self
+            .feed_forward2
+            .forward_tensor_parallel(&x, group, stream)?;
         self.norm_out.forward(&x, stream)
     }
 }
@@ -540,6 +809,30 @@ impl Gemma4AudioLayerwiseStatic {
             subsample_conv_projection: tower.subsample_conv_projection,
             output_proj: tower.output_proj,
         }
+    }
+
+    pub(crate) fn new_tensor_parallel(
+        tower: &Self,
+        config: &Gemma4AudioConfig,
+        context: crate::runtime::distributed::parallel::ParallelBuildContext,
+        stream: &Stream,
+    ) -> Result<Self, crate::error::Error> {
+        let local_output = context.equal_local_dimension(
+            "Gemma audio output projection",
+            config.output_proj_dims as usize,
+        )?;
+        Ok(Self {
+            subsample_conv_projection: AudioSubsampleConvProjection::new_tensor_parallel(
+                config, context, stream,
+            )?,
+            output_proj: nn::Linear::unloaded(
+                config.hidden_size,
+                local_output as i32,
+                tower.output_proj.bias.value.is_some(),
+                Dtype::Float32,
+                stream,
+            )?,
+        })
     }
 
     pub(crate) fn begin(
@@ -567,7 +860,47 @@ impl Gemma4AudioLayerwiseStatic {
         ))
     }
 
+    pub(crate) fn begin_tensor_parallel(
+        &mut self,
+        features: &Array,
+        mask: &Array,
+        group: &safemlx::distributed::Group,
+        stream: &Stream,
+    ) -> Result<(Array, i32), Exception> {
+        if mask.shape().len() != 2
+            || mask.dim(0) != features.dim(0)
+            || mask.dim(1) != features.dim(1)
+        {
+            return Err(Exception::custom(format!(
+                "Gemma 4 audio mask must be [batch, frames], got {:?} for {:?}",
+                mask.shape(),
+                features.shape()
+            )));
+        }
+        let valid_frames = mask.sum(None, stream)?.item::<i32>(stream);
+        let valid = (valid_frames + 3) / 4;
+        Ok((
+            self.subsample_conv_projection.forward_tensor_parallel(
+                features,
+                valid_frames,
+                group,
+                stream,
+            )?,
+            valid,
+        ))
+    }
+
     pub(crate) fn finish(
+        &mut self,
+        hidden: &Array,
+        valid: i32,
+        stream: &Stream,
+    ) -> Result<Array, Exception> {
+        self.output_proj
+            .forward(&hidden.try_index_device((.., ..valid, ..), stream)?, stream)
+    }
+
+    pub(crate) fn finish_tensor_parallel(
         &mut self,
         hidden: &Array,
         valid: i32,

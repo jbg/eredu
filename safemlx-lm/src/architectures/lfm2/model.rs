@@ -622,36 +622,53 @@ pub struct Attention {
 
 impl Attention {
     fn new(args: &ModelArgs, layer: i32, stream: &Stream) -> Result<Self, Exception> {
-        let head_dim = args.hidden_size / args.num_attention_heads;
+        Self::new_with_geometry(
+            args,
+            layer,
+            args.num_attention_heads,
+            args.num_key_value_heads,
+            args.hidden_size / args.num_attention_heads,
+            stream,
+        )
+    }
+
+    fn new_with_geometry(
+        args: &ModelArgs,
+        layer: i32,
+        n_heads: i32,
+        n_kv_heads: i32,
+        head_dim: i32,
+        stream: &Stream,
+    ) -> Result<Self, Exception> {
         let prefix = format!("model.layers.{layer}.self_attn");
         Ok(Self {
-            n_heads: args.num_attention_heads,
-            n_kv_heads: args.num_key_value_heads,
+            n_heads,
+            n_kv_heads,
             head_dim,
             scale: (head_dim as f32).sqrt().recip(),
             q_proj: common::linear::unloaded_maybe_quantized_linear(
                 args.hidden_size,
-                args.num_attention_heads * head_dim,
+                n_heads * head_dim,
                 false,
                 args.weight_quantization_for(&format!("{prefix}.q_proj.weight")),
                 stream,
             )?,
             k_proj: common::linear::unloaded_maybe_quantized_linear(
                 args.hidden_size,
-                args.num_key_value_heads * head_dim,
+                n_kv_heads * head_dim,
                 false,
                 args.weight_quantization_for(&format!("{prefix}.k_proj.weight")),
                 stream,
             )?,
             v_proj: common::linear::unloaded_maybe_quantized_linear(
                 args.hidden_size,
-                args.num_key_value_heads * head_dim,
+                n_kv_heads * head_dim,
                 false,
                 args.weight_quantization_for(&format!("{prefix}.v_proj.weight")),
                 stream,
             )?,
             out_proj: common::linear::unloaded_maybe_quantized_linear(
-                args.num_attention_heads * head_dim,
+                n_heads * head_dim,
                 args.hidden_size,
                 false,
                 args.weight_quantization_for(&format!("{prefix}.out_proj.weight")),
@@ -1049,6 +1066,24 @@ pub struct DecoderLayer {
 
 impl DecoderLayer {
     pub(crate) fn new(args: &ModelArgs, index: i32, stream: &Stream) -> Result<Self, Error> {
+        Self::new_with_widths(
+            args,
+            index,
+            args.dense_layer_intermediate_size(),
+            args.moe_intermediate_size,
+            None,
+            stream,
+        )
+    }
+
+    pub(crate) fn new_with_widths(
+        args: &ModelArgs,
+        index: i32,
+        dense_intermediate_size: i32,
+        moe_intermediate_size: i32,
+        attention_head_dim: Option<i32>,
+        stream: &Stream,
+    ) -> Result<Self, Error> {
         let layer_policy = args
             .layer_schedule
             .get(index as usize)
@@ -1061,7 +1096,17 @@ impl DecoderLayer {
         Ok(Self {
             layer_policy,
             self_attn: if matches!(layer_policy.operator, OperatorPolicy::SelfAttention(_)) {
-                Some(Attention::new(args, index, stream)?)
+                Some(match attention_head_dim {
+                    Some(head_dim) => Attention::new_with_geometry(
+                        args,
+                        index,
+                        args.num_attention_heads,
+                        args.num_key_value_heads,
+                        head_dim,
+                        stream,
+                    )?,
+                    None => Attention::new(args, index, stream)?,
+                })
             } else {
                 None
             },
@@ -1071,9 +1116,13 @@ impl DecoderLayer {
                 None
             },
             feed_forward: match layer_policy.feed_forward {
-                FeedForwardPolicy::SparseMoe => FeedForward::moe(args, index, stream)?,
+                FeedForwardPolicy::SparseMoe => {
+                    let mut local = args.clone();
+                    local.moe_intermediate_size = moe_intermediate_size;
+                    FeedForward::moe(&local, index, stream)?
+                }
                 FeedForwardPolicy::Dense => {
-                    FeedForward::dense(args, index, args.dense_layer_intermediate_size(), stream)?
+                    FeedForward::dense(args, index, dense_intermediate_size, stream)?
                 }
             },
             operator_norm: nn::RmsNorm::unloaded(
@@ -1141,6 +1190,64 @@ impl DecoderLayer {
             .feed_forward
             .forward(&self.ffn_norm.forward(&h, stream)?, stream)?;
         h.add(feed_forward, stream)
+    }
+
+    /// Executes one hybrid LFM2 layer with local attention heads and local
+    /// feed-forward intermediates. Causal-convolution operators remain
+    /// replicated because their channels are residual-width coupled.
+    pub(crate) fn forward_tensor_parallel(
+        &mut self,
+        x: &Array,
+        mask: Option<&Array>,
+        cache: Option<&mut LayerCache>,
+        group: &safemlx::distributed::Group,
+        stream: &Stream,
+    ) -> Result<Array, Exception> {
+        let normalized = self.operator_norm.forward(x, stream)?;
+        let operator = match (self.layer_policy.operator, cache) {
+            (OperatorPolicy::SelfAttention(_), Some(LayerCache::Attention(cache))) => {
+                let partial = self.self_attn.as_mut().expect("attention layer").forward(
+                    AttentionInput {
+                        x: &normalized,
+                        mask,
+                        cache: Some(cache),
+                    },
+                    stream,
+                )?;
+                safemlx::distributed::all_sum(&partial, group, stream)?
+            }
+            (OperatorPolicy::SelfAttention(_), None) => {
+                let partial = self.self_attn.as_mut().expect("attention layer").forward(
+                    AttentionInput {
+                        x: &normalized,
+                        mask,
+                        cache: None,
+                    },
+                    stream,
+                )?;
+                safemlx::distributed::all_sum(&partial, group, stream)?
+            }
+            (OperatorPolicy::CausalConvolution, Some(LayerCache::Conv(cache))) => self
+                .conv
+                .as_mut()
+                .expect("conv layer")
+                .forward(&normalized, Some(cache), stream)?,
+            (OperatorPolicy::CausalConvolution, None) => self
+                .conv
+                .as_mut()
+                .expect("conv layer")
+                .forward(&normalized, None, stream)?,
+            (policy, Some(_)) => {
+                return Err(Exception::custom(format!(
+                    "LFM2 tensor-parallel cache kind does not match layer policy {policy:?}"
+                )))
+            }
+        };
+        let hidden = x.add(operator, stream)?;
+        let normalized = self.ffn_norm.forward(&hidden, stream)?;
+        let partial = self.feed_forward.forward(&normalized, stream)?;
+        let feed_forward = safemlx::distributed::all_sum(&partial, group, stream)?;
+        hidden.add(feed_forward, stream)
     }
 
     pub(crate) fn forward_with_expert_executor<F>(
@@ -1356,6 +1463,15 @@ pub struct Model {
     pub lm_head: Option<MaybeQuantized<nn::Linear>>,
 }
 
+/// Rank-local dimensions used to construct an LFM2 tensor-parallel shard.
+pub(crate) struct TensorParallelGeometry {
+    pub vocab_size: i32,
+    pub attention_heads: i32,
+    pub kv_heads: i32,
+    pub dense_intermediate: i32,
+    pub moe_intermediate: i32,
+}
+
 impl Model {
     /// Creates an unloaded LFM2 model.
     pub fn new(args: ModelArgs, stream: &Stream) -> Result<Self, Error> {
@@ -1369,6 +1485,71 @@ impl Model {
                 args.vocab_size,
                 false,
                 args.weight_quantization_for("lm_head.weight"),
+                stream,
+            )?)
+        };
+        Ok(Self {
+            args,
+            model,
+            lm_head,
+        })
+    }
+
+    /// Creates a rank-local tensor-parallel model while retaining the global
+    /// configuration for cache identity and scheduling.
+    pub(crate) fn new_tensor_parallel(
+        args: ModelArgs,
+        geometry: TensorParallelGeometry,
+        quantization: Option<WeightQuantization>,
+        stream: &Stream,
+    ) -> Result<Self, Error> {
+        validate_args(&args)?;
+        let global_head_dim = args.hidden_size / args.num_attention_heads;
+        let mut local = args.clone();
+        local.vocab_size = geometry.vocab_size;
+        local.num_attention_heads = geometry.attention_heads;
+        local.num_key_value_heads = geometry.kv_heads;
+        local.moe_intermediate_size = geometry.moe_intermediate;
+        if let Some(quantization) = quantization {
+            local.quantization = Some(quantization);
+            local.quantization_config = None;
+            local.quantized_weight_configs = None;
+            local.quantized_weights = None;
+        }
+        let model = Lfm2Model {
+            embed_tokens: common::linear::unloaded_maybe_quantized_embedding(
+                geometry.vocab_size,
+                local.hidden_size,
+                local.weight_quantization_for("model.embed_tokens.weight"),
+                stream,
+            )?,
+            layers: (0..local.num_hidden_layers)
+                .map(|index| {
+                    DecoderLayer::new_with_widths(
+                        &local,
+                        index,
+                        geometry.dense_intermediate,
+                        geometry.moe_intermediate,
+                        Some(global_head_dim),
+                        stream,
+                    )
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+            embedding_norm: nn::RmsNorm::unloaded(
+                local.hidden_size,
+                local.norm_eps,
+                Dtype::Float32,
+                stream,
+            )?,
+        };
+        let lm_head = if local.tie_word_embeddings {
+            None
+        } else {
+            Some(common::linear::unloaded_maybe_quantized_linear(
+                local.hidden_size,
+                geometry.vocab_size,
+                false,
+                local.weight_quantization_for("lm_head.weight"),
                 stream,
             )?)
         };

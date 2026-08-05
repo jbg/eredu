@@ -316,6 +316,7 @@ pub(crate) fn prompt_cache_layer_layout(
     .map_err(|error| Exception::custom(error.to_string()))
 }
 
+#[cfg(test)]
 fn prompt_cache_model_identity(
     args: &DecoderConfig,
 ) -> Result<PromptCacheModelIdentity, Exception> {
@@ -388,6 +389,7 @@ pub(crate) fn save_prompt_cache(
     .map_err(|error| Exception::custom(error.to_string()))
 }
 
+#[cfg(test)]
 pub(crate) fn load_prompt_cache(
     args: &DecoderConfig,
     directory: impl AsRef<Path>,
@@ -396,8 +398,26 @@ pub(crate) fn load_prompt_cache(
     stream: &Stream,
 ) -> Result<(Vec<Option<ConcatKeyValueCache>>, PromptCacheManifest), Exception> {
     let identity = prompt_cache_model_identity(args)?;
+    load_prompt_cache_with_identity(
+        args,
+        directory,
+        expected,
+        prefix_token_ids,
+        &identity,
+        stream,
+    )
+}
+
+pub(crate) fn load_prompt_cache_with_identity(
+    args: &DecoderConfig,
+    directory: impl AsRef<Path>,
+    expected: &PromptCacheDescriptor,
+    prefix_token_ids: &[u32],
+    identity: &PromptCacheModelIdentity,
+    stream: &Stream,
+) -> Result<(Vec<Option<ConcatKeyValueCache>>, PromptCacheManifest), Exception> {
     let (blocks, state, manifest) =
-        open_prompt_cache_snapshot(directory, expected, &identity, prefix_token_ids, stream)
+        open_prompt_cache_snapshot(directory, expected, identity, prefix_token_ids, stream)
             .map_err(|error| Exception::custom(error.to_string()))?;
     if !state.is_empty() {
         return Err(Exception::custom(
@@ -735,6 +755,56 @@ impl Attention {
         };
         self.o_proj.forward(&output, stream)
     }
+
+    pub(crate) fn forward_with_rotary_embeddings_tensor_parallel<C>(
+        &mut self,
+        input: AttentionInput<'_, C>,
+        cos: &Array,
+        sin: &Array,
+        group: &safemlx::distributed::Group,
+        stream: &Stream,
+    ) -> Result<Array, Exception>
+    where
+        C: KeyValueCache,
+    {
+        let AttentionInput { x, mask, mut cache } = input;
+        let (batch, seq_len) = batch_seq(x);
+        let queries = self.q_proj.forward(x, stream)?;
+        let queries = reshape_attention_projection(queries, batch, seq_len, self.n_heads, stream)?;
+        let queries = self.normalize_query(queries, stream)?;
+        let keys = self.k_proj.forward(x, stream)?;
+        let keys = reshape_attention_projection(keys, batch, seq_len, self.n_kv_heads, stream)?;
+        let keys = self.normalize_key(keys, stream)?;
+        let values = reshape_attention_projection(
+            self.v_proj.forward(x, stream)?,
+            batch,
+            seq_len,
+            self.n_kv_heads,
+            stream,
+        )?;
+        let position_offset = cache.as_ref().map_or(0, |cache| cache.offset());
+        let (queries, keys, values) = apply_rotary_embeddings_and_update_cache(
+            queries, keys, values, cos, sin, &mut cache, stream,
+        )?;
+        let attended = if let Some(window) = self.sliding_window.filter(|_| seq_len > 1) {
+            common::attention::sliding_window_prefill_attention(
+                queries,
+                keys,
+                values,
+                self.scale,
+                window,
+                position_offset,
+                batch,
+                seq_len,
+                stream,
+            )?
+        } else {
+            finish_attention(
+                queries, keys, values, cache, self.scale, mask, batch, seq_len, stream,
+            )?
+        };
+        crate::nn::parallel::forward_row_parallel(&mut self.o_proj, &attended, group, stream)
+    }
 }
 
 impl<C> Module<AttentionInput<'_, C>> for Attention
@@ -853,6 +923,19 @@ impl SparseMoeBlock {
                 stream,
             )?,
         })
+    }
+
+    pub(crate) fn forward_tensor_parallel(
+        &mut self,
+        hidden_states: &Array,
+        group: &safemlx::distributed::Group,
+        stream: &Stream,
+    ) -> Result<Array, Exception> {
+        let shape = hidden_states.shape();
+        let flat = hidden_states.reshape(&[-1, shape[2]], stream)?;
+        let (indices, weights) = self.gate.forward(&flat, stream)?;
+        let partial = self.experts.forward(&flat, &indices, &weights, stream)?;
+        safemlx::distributed::all_sum(&partial, group, stream)?.reshape(shape, stream)
     }
 
     fn forward_with_observer(
@@ -1307,6 +1390,141 @@ impl TransformerBlock {
         let normed = self.post_attention_layernorm.forward(&hidden, stream)?;
         let mlp = self.mlp.forward(&normed, stream)?;
         hidden.add(mlp, stream)
+    }
+
+    /// Executes a block whose attention heads and dense/expert intermediates
+    /// are rank-local, reducing row projections exactly once.
+    pub(crate) fn forward_tensor_parallel<C: KeyValueCache>(
+        &mut self,
+        hidden: &Array,
+        mask: Option<&Array>,
+        cache: Option<&mut C>,
+        group: &safemlx::distributed::Group,
+        stream: &Stream,
+    ) -> Result<Array, Exception> {
+        let normalized = self.input_layernorm.forward(hidden, stream)?;
+        let attention = &mut self.self_attn;
+        let (batch, sequence) = batch_seq(&normalized);
+        let queries = attention.q_proj.forward(&normalized, stream)?;
+        let keys = attention.k_proj.forward(&normalized, stream)?;
+        let values = attention.v_proj.forward(&normalized, stream)?;
+        let queries =
+            reshape_attention_projection(queries, batch, sequence, attention.n_heads, stream)?;
+        let queries = match attention.q_norm.as_mut() {
+            Some(norm) => norm.forward(&queries, stream)?,
+            None => queries,
+        };
+        let keys =
+            reshape_attention_projection(keys, batch, sequence, attention.n_kv_heads, stream)?;
+        let keys = match attention.k_norm.as_mut() {
+            Some(norm) => norm.forward(&keys, stream)?,
+            None => keys,
+        };
+        let values =
+            reshape_attention_projection(values, batch, sequence, attention.n_kv_heads, stream)?;
+        let offset = cache.as_ref().map_or(0, |cache| cache.offset());
+        let mut cache = cache;
+        let (queries, keys, values) = apply_rope_and_update_cache(
+            &mut attention.rope,
+            queries,
+            keys,
+            values,
+            &mut cache,
+            stream,
+        )?;
+        let attended = if let Some(window) = attention.sliding_window.filter(|_| sequence > 1) {
+            common::attention::sliding_window_prefill_attention(
+                queries,
+                keys,
+                values,
+                attention.scale,
+                window,
+                offset,
+                batch,
+                sequence,
+                stream,
+            )?
+        } else {
+            finish_attention(
+                queries,
+                keys,
+                values,
+                cache,
+                attention.scale,
+                mask,
+                batch,
+                sequence,
+                stream,
+            )?
+        };
+        let attention = crate::nn::parallel::forward_row_parallel(
+            &mut attention.o_proj,
+            &attended,
+            group,
+            stream,
+        )?;
+        let hidden = hidden.add(attention, stream)?;
+        let normalized = self.post_attention_layernorm.forward(&hidden, stream)?;
+        let feed_forward = match &mut self.mlp {
+            FeedForward::Dense(mlp) => {
+                let gate =
+                    crate::nn::layers::silu(mlp.gate_proj.forward(&normalized, stream)?, stream)?;
+                let up = mlp.up_proj.forward(&normalized, stream)?;
+                crate::nn::parallel::forward_row_parallel(
+                    &mut mlp.down_proj,
+                    &gate.multiply(up, stream)?,
+                    group,
+                    stream,
+                )?
+            }
+            FeedForward::Moe(moe) => moe.forward_tensor_parallel(&normalized, group, stream)?,
+        };
+        hidden.add(feed_forward, stream)
+    }
+
+    pub(crate) fn forward_with_rotary_embeddings_tensor_parallel<C>(
+        &mut self,
+        input: AttentionInput<'_, C>,
+        cos: &Array,
+        sin: &Array,
+        group: &safemlx::distributed::Group,
+        stream: &Stream,
+    ) -> Result<Array, Exception>
+    where
+        C: KeyValueCache,
+    {
+        let AttentionInput { x, mask, cache } = input;
+        let normed = self.input_layernorm.forward(x, stream)?;
+        let attention = self
+            .self_attn
+            .forward_with_rotary_embeddings_tensor_parallel(
+                AttentionInput {
+                    x: &normed,
+                    mask,
+                    cache,
+                },
+                cos,
+                sin,
+                group,
+                stream,
+            )?;
+        let hidden = x.add(attention, stream)?;
+        let normed = self.post_attention_layernorm.forward(&hidden, stream)?;
+        let feed_forward = match &mut self.mlp {
+            FeedForward::Dense(mlp) => {
+                let gate =
+                    crate::nn::layers::silu(mlp.gate_proj.forward(&normed, stream)?, stream)?;
+                let up = mlp.up_proj.forward(&normed, stream)?;
+                crate::nn::parallel::forward_row_parallel(
+                    &mut mlp.down_proj,
+                    &gate.multiply(up, stream)?,
+                    group,
+                    stream,
+                )?
+            }
+            FeedForward::Moe(moe) => moe.forward_tensor_parallel(&normed, group, stream)?,
+        };
+        hidden.add(feed_forward, stream)
     }
 
     /// Executes a block while delegating routed-expert evaluation to a compact bank.

@@ -1118,7 +1118,7 @@ impl KimiDeltaAttention {
 }
 
 #[derive(Debug, Clone)]
-enum Attention {
+pub(crate) enum Attention {
     Kda(Box<KimiDeltaAttention>),
     Mla(Box<MultiHeadLatentAttention>),
 }
@@ -1175,13 +1175,13 @@ impl ModuleParameters for Attention {
 }
 
 #[derive(Debug, Clone, ModuleParameters)]
-struct SparseMoe {
+pub(crate) struct SparseMoe {
     #[param]
-    gate: TopKRouter,
+    pub(crate) gate: TopKRouter,
     #[param]
-    experts: PackedSwiGluExperts,
+    pub(crate) experts: PackedSwiGluExperts,
     #[param]
-    shared_experts: SwiGluMlp,
+    pub(crate) shared_experts: SwiGluMlp,
 }
 
 impl SparseMoe {
@@ -1353,7 +1353,7 @@ impl SparseMoe {
 }
 
 #[derive(Debug, Clone)]
-enum FeedForward {
+pub(crate) enum FeedForward {
     Dense(Box<SwiGluMlp>),
     Moe(Box<SparseMoe>),
 }
@@ -1413,13 +1413,13 @@ impl ModuleParameters for FeedForward {
 /// One Kimi Linear decoder layer.
 pub struct DecoderLayer {
     #[param]
-    self_attn: Attention,
+    pub(crate) self_attn: Attention,
     #[param]
-    mlp: FeedForward,
+    pub(crate) mlp: FeedForward,
     #[param]
-    input_layernorm: nn::RmsNorm,
+    pub(crate) input_layernorm: nn::RmsNorm,
     #[param]
-    post_attention_layernorm: nn::RmsNorm,
+    pub(crate) post_attention_layernorm: nn::RmsNorm,
 }
 
 impl DecoderLayer {
@@ -1471,6 +1471,62 @@ impl DecoderLayer {
                 stream,
             )?,
         })
+    }
+
+    /// Executes a Kimi hybrid layer with rank-local KDA/MLA heads and
+    /// feed-forward intermediates.
+    pub(crate) fn forward_tensor_parallel(
+        &mut self,
+        input: &Array,
+        mask: Option<&Array>,
+        cache: Option<&mut LayerCache>,
+        group: &safemlx::distributed::Group,
+        stream: &Stream,
+    ) -> Result<Array, Exception> {
+        let normalized = self.input_layernorm.forward(input, stream)?;
+        let mut observer = None;
+        let attention = match (&mut self.self_attn, cache) {
+            (Attention::Kda(attention), Some(LayerCache::Kda(cache))) => {
+                let partial =
+                    attention.forward_impl(&normalized, Some(cache), stream, "", &mut observer)?;
+                safemlx::distributed::all_sum(&partial, group, stream)?
+            }
+            (Attention::Kda(attention), None) => {
+                let partial =
+                    attention.forward_impl(&normalized, None, stream, "", &mut observer)?;
+                safemlx::distributed::all_sum(&partial, group, stream)?
+            }
+            (Attention::Mla(attention), Some(LayerCache::Mla(cache))) => {
+                let partial = attention.forward_shared(
+                    &normalized,
+                    mask,
+                    Some(cache),
+                    stream,
+                    "",
+                    &mut observer,
+                )?;
+                safemlx::distributed::all_sum(&partial, group, stream)?
+            }
+            (Attention::Mla(attention), None) => {
+                let partial =
+                    attention.forward_shared(&normalized, mask, None, stream, "", &mut observer)?;
+                safemlx::distributed::all_sum(&partial, group, stream)?
+            }
+            (Attention::Kda(_), Some(LayerCache::Mla(_)))
+            | (Attention::Mla(_), Some(LayerCache::Kda(_))) => {
+                return Err(Exception::custom(
+                    "Kimi tensor-parallel cache kind mismatch",
+                ));
+            }
+        };
+        let hidden = input.add(attention, stream)?;
+        let normalized = self.post_attention_layernorm.forward(&hidden, stream)?;
+        let feed_forward = match &mut self.mlp {
+            FeedForward::Dense(mlp) => mlp.forward(&normalized, stream)?,
+            FeedForward::Moe(moe) => moe.forward_impl(&normalized, stream, "", &mut observer)?,
+        };
+        let feed_forward = safemlx::distributed::all_sum(&feed_forward, group, stream)?;
+        hidden.add(feed_forward, stream)
     }
 
     pub(super) fn forward_impl(
@@ -1740,7 +1796,6 @@ impl Model {
         descriptor: PromptCacheDescriptor,
         prefix_token_ids: &[u32],
         options: &PromptCacheOptions,
-        stream: &Stream,
     ) -> Result<PromptCacheManifest, Exception> {
         let end = i64::try_from(prefix_token_ids.len())
             .map_err(|_| Exception::custom("Kimi prompt length exceeds i64"))?;
@@ -1791,7 +1846,6 @@ impl Model {
                 }
             }
         }
-        let _ = stream;
         save_prompt_cache_snapshot(
             destination,
             descriptor,
@@ -1823,8 +1877,26 @@ impl Model {
             layer_layout: prompt_cache_layer_layout(args)
                 .map_err(|error| Exception::custom(error.to_string()))?,
         };
+        Self::load_prompt_cache_with_identity(
+            args,
+            directory,
+            expected,
+            prefix_token_ids,
+            &identity,
+            stream,
+        )
+    }
+
+    pub(crate) fn load_prompt_cache_with_identity(
+        args: &ModelArgs,
+        directory: impl AsRef<Path>,
+        expected: &PromptCacheDescriptor,
+        prefix_token_ids: &[u32],
+        identity: &PromptCacheModelIdentity,
+        stream: &Stream,
+    ) -> Result<(Cache, PromptCacheManifest), Exception> {
         let (blocks, state, manifest) =
-            open_prompt_cache_snapshot(directory, expected, &identity, prefix_token_ids, stream)
+            open_prompt_cache_snapshot(directory, expected, identity, prefix_token_ids, stream)
                 .map_err(|error| Exception::custom(error.to_string()))?;
         let mut cache = Cache::new(args);
         let mut block_map = BTreeMap::new();
@@ -2201,7 +2273,7 @@ impl CausalLm<Cache> for Model {
 pub type Generate<'a, S = crate::runtime::generation::sampler::DefaultSampler> =
     crate::nn::generation::Generate<'a, Model, Cache, S>;
 
-fn transform_safetensors_weight(
+pub(crate) fn transform_safetensors_weight(
     args: &ModelArgs,
     mut key: String,
     value: Array,
@@ -3088,7 +3160,6 @@ mod tests {
             descriptor.clone(),
             &prefix_ids,
             &PromptCacheOptions::default(),
-            stream,
         )
         .unwrap();
         drop(cache);

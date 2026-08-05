@@ -59,6 +59,29 @@ pub enum Model {
 }
 
 impl Model {
+    /// Returns architecture-neutral rank-local placement information when this
+    /// model was loaded through generalized parallel execution groups.
+    pub fn parallel_info(&self) -> Option<&crate::ParallelModelInfo> {
+        match self {
+            Self::LlamaLayerwise(model) => model.parallel_info(),
+            Self::DeepSeekV3Layerwise(model) => model.parallel_info(),
+            Self::GptOssLayerwise(model) => model.parallel_info(),
+            Self::DenseQwenLayerwise(model) => model.parallel_info(),
+            Self::KimiLinearLayerwise(model) => model.parallel_info(),
+            Self::Lfm2Layerwise(model) => model.parallel_info(),
+            Self::NemotronHLayerwise(model) => model.parallel_info(),
+            Self::Qwen3NextLayerwise(model) | Self::Qwen35MoeLayerwise(model) => {
+                model.parallel_info()
+            }
+            Self::Qwen3VlLayerwise(model) | Self::Qwen3VlMoeLayerwise(model) => {
+                model.parallel_info()
+            }
+            Self::Gemma4Layerwise(model) => model.parallel_info(),
+            Self::InklingLayerwise(model) => model.parallel_info(),
+            _ => None,
+        }
+    }
+
     /// Reports how this model architecture exposes MTP weights.
     pub fn mtp_capability(&self) -> MtpCapability {
         match self {
@@ -617,17 +640,9 @@ impl Model {
                 model.args.head_dim,
             ),
             Self::LlamaLayerwise(model) => {
-                let args = model.args();
-                PromptCacheModelIdentity::key_value_layouts(
-                    args.attention_schedule.iter().map(|policy| {
-                        policy.window().map(|window| {
-                            i32::try_from(window.get())
-                                .expect("validated Llama attention window fits i32")
-                        })
-                    }),
-                    args.num_key_value_heads,
-                    args.head_dim,
-                )
+                return model
+                    .prompt_cache_layer_layout()
+                    .map_err(|error| Exception::custom(error.to_string()))
             }
             Self::DeepSeekV3(model) => PromptCacheModelIdentity::compressed_layouts(
                 model.args.num_hidden_layers as usize,
@@ -635,12 +650,9 @@ impl Model {
                 model.args.qk_rope_head_dim,
             ),
             Self::DeepSeekV3Layerwise(model) => {
-                let args = model.args();
-                PromptCacheModelIdentity::compressed_layouts(
-                    args.num_hidden_layers as usize,
-                    args.kv_lora_rank,
-                    args.qk_rope_head_dim,
-                )
+                return model
+                    .prompt_cache_layer_layout()
+                    .map_err(|error| Exception::custom(error.to_string()))
             }
             Self::GptOss(model) => PromptCacheModelIdentity::key_value_layouts(
                 model.args.attention_schedule.iter().map(|policy| {
@@ -653,60 +665,59 @@ impl Model {
                 model.args.head_dim,
             ),
             Self::GptOssLayerwise(model) => {
-                let args = model.args();
-                PromptCacheModelIdentity::key_value_layouts(
-                    args.attention_schedule.iter().map(|policy| {
-                        policy.window().map(|window| {
-                            i32::try_from(window.get())
-                                .expect("validated GPT-OSS sliding window fits i32")
-                        })
-                    }),
-                    args.num_key_value_heads,
-                    args.head_dim,
-                )
+                return model
+                    .prompt_cache_layer_layout()
+                    .map_err(|error| Exception::custom(error.to_string()))
             }
             Self::DenseQwen(model) => return dense_qwen::prompt_cache_layer_layout(&model.args),
             Self::DenseQwenLayerwise(model) => {
-                return dense_qwen::prompt_cache_layer_layout(model.args())
+                return model
+                    .prompt_cache_layer_layout()
+                    .map_err(|error| Exception::custom(error.to_string()))
             }
             Self::KimiLinear(model) => {
                 return kimi_linear::prompt_cache_layer_layout(&model.args)
                     .map_err(|error| Exception::custom(error.to_string()));
             }
             Self::KimiLinearLayerwise(model) => {
-                return kimi_linear::prompt_cache_layer_layout(model.args())
-                    .map_err(|error| Exception::custom(error.to_string()));
+                return model
+                    .prompt_cache_layer_layout()
+                    .map_err(|error| Exception::custom(error.to_string()))
             }
             Self::Lfm2(model) => {
                 return lfm2::prompt_cache_layer_layout(&model.args)
                     .map_err(|error| Exception::custom(error.to_string()));
             }
             Self::Lfm2Layerwise(model) => {
-                return lfm2::prompt_cache_layer_layout(model.args())
-                    .map_err(|error| Exception::custom(error.to_string()));
+                return model
+                    .prompt_cache_layer_layout()
+                    .map_err(|error| Exception::custom(error.to_string()))
             }
             Self::NemotronH(model) => {
                 return nemotron_h::prompt_cache_layer_layout(&model.args)
                     .map_err(|error| Exception::custom(error.to_string()));
             }
             Self::NemotronHLayerwise(model) => {
-                return nemotron_h::prompt_cache_layer_layout(model.args())
-                    .map_err(|error| Exception::custom(error.to_string()));
+                return model
+                    .prompt_cache_layer_layout()
+                    .map_err(|error| Exception::custom(error.to_string()))
             }
             Self::Qwen3Next(model) | Self::Qwen35Moe(model) => {
                 return qwen3_5_moe::prompt_cache_layer_layout(&model.args)
                     .map_err(|error| Exception::custom(error.to_string()));
             }
             Self::Qwen3NextLayerwise(model) | Self::Qwen35MoeLayerwise(model) => {
-                return qwen3_5_moe::prompt_cache_layer_layout(model.args())
-                    .map_err(|error| Exception::custom(error.to_string()));
+                return model
+                    .prompt_cache_layer_layout()
+                    .map_err(|error| Exception::custom(error.to_string()))
             }
             Self::Qwen3Vl(model) | Self::Qwen3VlMoe(model) => {
                 return qwen3_vl::prompt_cache_layer_layout(&model.args)
                     .map_err(|error| Exception::custom(error.to_string()));
             }
             Self::Qwen3VlLayerwise(model) | Self::Qwen3VlMoeLayerwise(model) => {
-                return qwen3_vl::prompt_cache_layer_layout(model.args())
+                return model
+                    .prompt_cache_layer_layout()
                     .map_err(|error| Exception::custom(error.to_string()));
             }
             Self::Gemma4(model) => {
@@ -714,15 +725,17 @@ impl Model {
                     .map_err(|error| Exception::custom(error.to_string()));
             }
             Self::Gemma4Layerwise(model) => {
-                return gemma4::prompt_cache_layer_layout(model.args())
-                    .map_err(|error| Exception::custom(error.to_string()));
+                return model
+                    .prompt_cache_layer_layout()
+                    .map_err(|error| Exception::custom(error.to_string()))
             }
             Self::Inkling(model) => {
                 return inkling::prompt_cache_layer_layout(&model.args)
                     .map_err(|error| Exception::custom(error.to_string()));
             }
             Self::InklingLayerwise(model) => {
-                return inkling::prompt_cache_layer_layout(model.args())
+                return model
+                    .prompt_cache_layer_layout()
                     .map_err(|error| Exception::custom(error.to_string()));
             }
         };
@@ -1163,21 +1176,21 @@ impl Model {
                 Ok((ModelCache::PagedKeyValue(caches), manifest))
             }
             Self::LlamaLayerwise(model) => model
-                .load_prompt_cache(directory, expected, prefix_token_ids, options)
+                .load_prompt_cache(directory, expected, prefix_token_ids, options, stream)
                 .map(|(cache, manifest)| (ModelCache::LlamaLayerwise(cache), manifest))
                 .map_err(|error| Exception::custom(error.to_string())),
             Self::DeepSeekV3(model) => model
                 .load_prompt_cache(directory, expected, prefix_token_ids, options)
                 .map(|(cache, manifest)| (ModelCache::DeepSeekV3(cache), manifest)),
             Self::DeepSeekV3Layerwise(model) => model
-                .load_prompt_cache(directory, expected, prefix_token_ids, options)
+                .load_prompt_cache(directory, expected, prefix_token_ids, options, stream)
                 .map(|(cache, manifest)| (ModelCache::DeepSeekV3(cache), manifest))
                 .map_err(|error| Exception::custom(error.to_string())),
             Self::GptOss(model) => model
                 .load_prompt_cache(directory, expected, prefix_token_ids, options)
                 .map(|(cache, manifest)| (ModelCache::GptOss(cache), manifest)),
             Self::GptOssLayerwise(model) => model
-                .load_prompt_cache(directory, expected, prefix_token_ids, options)
+                .load_prompt_cache(directory, expected, prefix_token_ids, options, stream)
                 .map(|(cache, manifest)| (ModelCache::GptOss(cache), manifest))
                 .map_err(|error| Exception::custom(error.to_string())),
             Self::DenseQwen(model) => {
@@ -1224,14 +1237,10 @@ impl Model {
                     .collect::<Result<Vec<_>, _>>()?;
                 Ok((ModelCache::PagedKeyValue(caches), manifest))
             }
-            Self::DenseQwenLayerwise(model) => dense_qwen::load_prompt_cache(
-                model.args(),
-                directory,
-                expected,
-                prefix_token_ids,
-                stream,
-            )
-            .map(|(cache, manifest)| (ModelCache::KeyValue(cache), manifest)),
+            Self::DenseQwenLayerwise(model) => model
+                .load_prompt_cache(directory, expected, prefix_token_ids, options, stream)
+                .map(|(cache, manifest)| (ModelCache::KeyValue(cache), manifest))
+                .map_err(|error| Exception::custom(error.to_string())),
             Self::KimiLinear(model) => kimi_linear::Model::load_prompt_cache(
                 &model.args,
                 directory,
@@ -1240,14 +1249,10 @@ impl Model {
                 stream,
             )
             .map(|(cache, manifest)| (ModelCache::KimiLinear(cache), manifest)),
-            Self::KimiLinearLayerwise(model) => kimi_linear::Model::load_prompt_cache(
-                model.args(),
-                directory,
-                expected,
-                prefix_token_ids,
-                stream,
-            )
-            .map(|(cache, manifest)| (ModelCache::KimiLinear(cache), manifest)),
+            Self::KimiLinearLayerwise(model) => model
+                .load_prompt_cache(directory, expected, prefix_token_ids, options, stream)
+                .map(|(cache, manifest)| (ModelCache::KimiLinear(cache), manifest))
+                .map_err(|error| Exception::custom(error.to_string())),
             Self::Qwen3Next(model) => qwen3_next::Model::load_prompt_cache(
                 &model.args,
                 directory,
@@ -1256,14 +1261,10 @@ impl Model {
                 stream,
             )
             .map(|(cache, manifest)| (ModelCache::Qwen3Next(cache), manifest)),
-            Self::Qwen3NextLayerwise(model) => qwen3_next::Model::load_prompt_cache(
-                model.args(),
-                directory,
-                expected,
-                prefix_token_ids,
-                stream,
-            )
-            .map(|(cache, manifest)| (ModelCache::Qwen3Next(cache), manifest)),
+            Self::Qwen3NextLayerwise(model) => model
+                .load_prompt_cache(directory, expected, prefix_token_ids, options, stream)
+                .map(|(cache, manifest)| (ModelCache::Qwen3Next(cache), manifest))
+                .map_err(|error| Exception::custom(error.to_string())),
             Self::Qwen35Moe(model) => qwen3_5_moe::Model::load_prompt_cache(
                 &model.args,
                 directory,
@@ -1272,14 +1273,10 @@ impl Model {
                 stream,
             )
             .map(|(cache, manifest)| (ModelCache::Qwen35Moe(cache), manifest)),
-            Self::Qwen35MoeLayerwise(model) => qwen3_5_moe::Model::load_prompt_cache(
-                model.args(),
-                directory,
-                expected,
-                prefix_token_ids,
-                stream,
-            )
-            .map(|(cache, manifest)| (ModelCache::Qwen35Moe(cache), manifest)),
+            Self::Qwen35MoeLayerwise(model) => model
+                .load_prompt_cache(directory, expected, prefix_token_ids, options, stream)
+                .map(|(cache, manifest)| (ModelCache::Qwen35Moe(cache), manifest))
+                .map_err(|error| Exception::custom(error.to_string())),
             Self::Qwen3Vl(model) => qwen3_vl::Model::load_prompt_cache(
                 &model.args,
                 directory,
@@ -1288,14 +1285,10 @@ impl Model {
                 stream,
             )
             .map(|(cache, manifest)| (ModelCache::Qwen3Vl(cache), manifest)),
-            Self::Qwen3VlLayerwise(model) => qwen3_vl::Model::load_prompt_cache(
-                model.args(),
-                directory,
-                expected,
-                prefix_token_ids,
-                stream,
-            )
-            .map(|(cache, manifest)| (ModelCache::Qwen3Vl(cache), manifest)),
+            Self::Qwen3VlLayerwise(model) => model
+                .load_prompt_cache(directory, expected, prefix_token_ids, options, stream)
+                .map(|(cache, manifest)| (ModelCache::Qwen3Vl(cache), manifest))
+                .map_err(|error| Exception::custom(error.to_string())),
             Self::Qwen3VlMoe(model) => qwen3_vl_moe::Model::load_prompt_cache(
                 &model.args,
                 directory,
@@ -1304,14 +1297,10 @@ impl Model {
                 stream,
             )
             .map(|(cache, manifest)| (ModelCache::Qwen3VlMoe(cache), manifest)),
-            Self::Qwen3VlMoeLayerwise(model) => qwen3_vl_moe::Model::load_prompt_cache(
-                model.args(),
-                directory,
-                expected,
-                prefix_token_ids,
-                stream,
-            )
-            .map(|(cache, manifest)| (ModelCache::Qwen3VlMoe(cache), manifest)),
+            Self::Qwen3VlMoeLayerwise(model) => model
+                .load_prompt_cache(directory, expected, prefix_token_ids, options, stream)
+                .map(|(cache, manifest)| (ModelCache::Qwen3VlMoe(cache), manifest))
+                .map_err(|error| Exception::custom(error.to_string())),
             Self::Gemma4(model) => gemma4::Model::load_prompt_cache(
                 &model.args,
                 directory,
@@ -1320,14 +1309,10 @@ impl Model {
                 stream,
             )
             .map(|(cache, manifest)| (ModelCache::Gemma4(cache), manifest)),
-            Self::Gemma4Layerwise(model) => gemma4::Model::load_prompt_cache(
-                model.args(),
-                directory,
-                expected,
-                prefix_token_ids,
-                stream,
-            )
-            .map(|(cache, manifest)| (ModelCache::Gemma4(cache), manifest)),
+            Self::Gemma4Layerwise(model) => model
+                .load_prompt_cache(directory, expected, prefix_token_ids, options, stream)
+                .map(|(cache, manifest)| (ModelCache::Gemma4(cache), manifest))
+                .map_err(|error| Exception::custom(error.to_string())),
             Self::Inkling(model) => inkling::Model::load_prompt_cache(
                 &model.args,
                 directory,
@@ -1336,14 +1321,10 @@ impl Model {
                 stream,
             )
             .map(|(cache, manifest)| (ModelCache::Inkling(cache), manifest)),
-            Self::InklingLayerwise(model) => inkling::Model::load_prompt_cache(
-                model.args(),
-                directory,
-                expected,
-                prefix_token_ids,
-                stream,
-            )
-            .map(|(cache, manifest)| (ModelCache::Inkling(cache), manifest)),
+            Self::InklingLayerwise(model) => model
+                .load_prompt_cache(directory, expected, prefix_token_ids, options, stream)
+                .map(|(cache, manifest)| (ModelCache::Inkling(cache), manifest))
+                .map_err(|error| Exception::custom(error.to_string())),
             Self::Lfm2(model) => lfm2::Model::load_prompt_cache(
                 &model.args,
                 directory,
@@ -1352,14 +1333,10 @@ impl Model {
                 stream,
             )
             .map(|(cache, manifest)| (ModelCache::Lfm2(cache), manifest)),
-            Self::Lfm2Layerwise(model) => lfm2::Model::load_prompt_cache(
-                model.args(),
-                directory,
-                expected,
-                prefix_token_ids,
-                stream,
-            )
-            .map(|(cache, manifest)| (ModelCache::Lfm2(cache), manifest)),
+            Self::Lfm2Layerwise(model) => model
+                .load_prompt_cache(directory, expected, prefix_token_ids, options, stream)
+                .map(|(cache, manifest)| (ModelCache::Lfm2(cache), manifest))
+                .map_err(|error| Exception::custom(error.to_string())),
             Self::NemotronH(model) => nemotron_h::Model::load_prompt_cache(
                 &model.args,
                 directory,
@@ -1368,14 +1345,10 @@ impl Model {
                 stream,
             )
             .map(|(cache, manifest)| (ModelCache::NemotronH(cache), manifest)),
-            Self::NemotronHLayerwise(model) => nemotron_h::Model::load_prompt_cache(
-                model.args(),
-                directory,
-                expected,
-                prefix_token_ids,
-                stream,
-            )
-            .map(|(cache, manifest)| (ModelCache::NemotronH(cache), manifest)),
+            Self::NemotronHLayerwise(model) => model
+                .load_prompt_cache(directory, expected, prefix_token_ids, options, stream)
+                .map(|(cache, manifest)| (ModelCache::NemotronH(cache), manifest))
+                .map_err(|error| Exception::custom(error.to_string())),
         }
     }
 
@@ -1389,6 +1362,143 @@ impl Model {
         options: &PromptCacheOptions,
         stream: &Stream,
     ) -> Result<PromptCacheManifest, Exception> {
+        match (self, &mut *cache) {
+            (Self::LlamaLayerwise(model), ModelCache::LlamaLayerwise(cache)) => {
+                return model
+                    .save_prompt_cache(
+                        cache,
+                        &destination,
+                        descriptor,
+                        prefix_token_ids,
+                        options,
+                        stream,
+                    )
+                    .map_err(|error| Exception::custom(error.to_string()));
+            }
+            (Self::DeepSeekV3Layerwise(model), ModelCache::DeepSeekV3(cache)) => {
+                return model
+                    .save_prompt_cache(
+                        cache,
+                        &destination,
+                        descriptor,
+                        prefix_token_ids,
+                        options,
+                        stream,
+                    )
+                    .map_err(|error| Exception::custom(error.to_string()));
+            }
+            (Self::GptOssLayerwise(model), ModelCache::GptOss(cache)) => {
+                return model
+                    .save_prompt_cache(
+                        cache,
+                        &destination,
+                        descriptor,
+                        prefix_token_ids,
+                        options,
+                        stream,
+                    )
+                    .map_err(|error| Exception::custom(error.to_string()));
+            }
+            (Self::DenseQwenLayerwise(model), ModelCache::KeyValue(cache)) => {
+                return model
+                    .save_prompt_cache(
+                        cache,
+                        &destination,
+                        descriptor,
+                        prefix_token_ids,
+                        options,
+                        stream,
+                    )
+                    .map_err(|error| Exception::custom(error.to_string()));
+            }
+            (Self::KimiLinearLayerwise(model), ModelCache::KimiLinear(cache)) => {
+                return model
+                    .save_prompt_cache(
+                        cache,
+                        &destination,
+                        descriptor,
+                        prefix_token_ids,
+                        options,
+                        stream,
+                    )
+                    .map_err(|error| Exception::custom(error.to_string()));
+            }
+            (Self::Lfm2Layerwise(model), ModelCache::Lfm2(cache)) => {
+                return model
+                    .save_prompt_cache(
+                        cache,
+                        &destination,
+                        descriptor,
+                        prefix_token_ids,
+                        options,
+                        stream,
+                    )
+                    .map_err(|error| Exception::custom(error.to_string()));
+            }
+            (Self::NemotronHLayerwise(model), ModelCache::NemotronH(cache)) => {
+                return model
+                    .save_prompt_cache(
+                        cache,
+                        &destination,
+                        descriptor,
+                        prefix_token_ids,
+                        options,
+                        stream,
+                    )
+                    .map_err(|error| Exception::custom(error.to_string()));
+            }
+            (Self::Qwen3NextLayerwise(model), ModelCache::Qwen3Next(cache))
+            | (Self::Qwen35MoeLayerwise(model), ModelCache::Qwen35Moe(cache)) => {
+                return model
+                    .save_prompt_cache(
+                        cache,
+                        &destination,
+                        descriptor,
+                        prefix_token_ids,
+                        options,
+                        stream,
+                    )
+                    .map_err(|error| Exception::custom(error.to_string()));
+            }
+            (Self::Gemma4Layerwise(model), ModelCache::Gemma4(cache)) => {
+                return model
+                    .save_prompt_cache(
+                        cache,
+                        &destination,
+                        descriptor,
+                        prefix_token_ids,
+                        options,
+                        stream,
+                    )
+                    .map_err(|error| Exception::custom(error.to_string()));
+            }
+            (Self::Qwen3VlLayerwise(model), ModelCache::Qwen3Vl(cache))
+            | (Self::Qwen3VlMoeLayerwise(model), ModelCache::Qwen3VlMoe(cache)) => {
+                return model
+                    .save_prompt_cache(
+                        cache,
+                        &destination,
+                        descriptor,
+                        prefix_token_ids,
+                        options,
+                        stream,
+                    )
+                    .map_err(|error| Exception::custom(error.to_string()));
+            }
+            (Self::InklingLayerwise(model), ModelCache::Inkling(cache)) => {
+                return model
+                    .save_prompt_cache(
+                        cache,
+                        &destination,
+                        descriptor,
+                        prefix_token_ids,
+                        options,
+                        stream,
+                    )
+                    .map_err(|error| Exception::custom(error.to_string()));
+            }
+            _ => {}
+        }
         let layer_layout = self.prompt_cache_layer_layout()?;
         let model_family = match self {
             Self::Llama(_) | Self::LlamaLayerwise(_) => "llama",
@@ -1432,7 +1542,6 @@ impl Model {
                     descriptor,
                     prefix_token_ids,
                     options,
-                    stream,
                 )
             }
             (Self::Lfm2(_), ModelCache::Lfm2(cache))

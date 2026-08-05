@@ -27,18 +27,28 @@ use crate::{
         },
     },
     error::Error,
-    nn::tensor::{create_attention_mask, AttentionMask},
-    runtime::cache::KeyValueCache,
+    nn::{
+        parallel::{VocabParallelEmbedding, VocabParallelLmHead},
+        tensor::{create_attention_mask, AttentionMask},
+    },
+    runtime::cache::{
+        residency::{
+            PagedCacheOptions, PromptCacheDescriptor, PromptCacheManifest,
+            PromptCacheModelIdentity, PromptCacheOptions, PromptCacheTopology,
+        },
+        KeyValueCache,
+    },
     runtime::checkpoint::binding::{
         build_module_bindings, build_module_bindings_with_recipes, populate_module_from_lease,
         populate_module_from_lease_excluding,
     },
     runtime::checkpoint::recipe::DerivedWeightRecipe,
     runtime::checkpoint::store::{GgufWeightStore, TensorSelection, WeightStore},
+    runtime::distributed::parallel::exact_parallel_division,
     runtime::execution::layerwise::{
-        load_general_layerwise_model, load_general_layerwise_model_with_store,
-        GeneralLayerwiseModel, GeneralLayerwiseModelAdapter, LayerExecutionLoadOptions,
-        LayerwiseForwardState, StaticUnitBindings, WeightResidency,
+        load_layerwise_model, load_layerwise_model_with_store,
+        load_tensor_parallel_layerwise_model, ArchitectureAdapter, LayerExecutionLoadOptions,
+        LayerwiseForwardState, LayerwiseModel, StaticUnitBindings, WeightResidency,
     },
     runtime::residency::expert_cache::{
         ExpertCache, ExpertCacheLoadOptions, ExpertCacheReport, ExpertCatalogEntry, ExpertIdentity,
@@ -53,7 +63,7 @@ const HEAD_UNIT: &str = "lfm2.static.output";
 
 /// LFM2/LFM2.5 causal LM with host-backed decoder blocks.
 pub struct Lfm2LayerwiseModel {
-    execution: GeneralLayerwiseModel<Lfm2LayerwiseAdapter>,
+    execution: LayerwiseModel<Lfm2LayerwiseAdapter>,
 }
 
 impl Lfm2LayerwiseModel {
@@ -65,6 +75,51 @@ impl Lfm2LayerwiseModel {
     /// Creates heterogeneous attention and convolution state.
     pub fn new_cache(&self) -> Cache {
         self.execution.adapter().new_cache()
+    }
+
+    /// Returns rank-local generalized parallel information when applicable.
+    pub fn parallel_info(&self) -> Option<&crate::ParallelModelInfo> {
+        self.execution.parallel_info()
+    }
+
+    /// Returns this rank's exact prompt-cache state layout.
+    pub fn prompt_cache_layer_layout(
+        &self,
+    ) -> Result<crate::LayerSchedule<crate::LayerCachePolicy>, Error> {
+        self.execution.prompt_cache_layer_layout()
+    }
+
+    /// Persists a compatible prefix cache.
+    pub fn save_prompt_cache(
+        &self,
+        cache: &mut Cache,
+        destination: impl AsRef<Path>,
+        descriptor: PromptCacheDescriptor,
+        prefix_token_ids: &[u32],
+        options: &PromptCacheOptions,
+        stream: &Stream,
+    ) -> Result<PromptCacheManifest, Error> {
+        self.execution.save_prompt_cache(
+            cache,
+            destination,
+            descriptor,
+            prefix_token_ids,
+            options,
+            stream,
+        )
+    }
+
+    /// Restores a compatible prefix cache.
+    pub fn load_prompt_cache(
+        &self,
+        directory: impl AsRef<Path>,
+        expected: &PromptCacheDescriptor,
+        prefix_token_ids: &[u32],
+        options: PagedCacheOptions,
+        stream: &Stream,
+    ) -> Result<(Cache, PromptCacheManifest), Error> {
+        self.execution
+            .load_prompt_cache(directory, expected, prefix_token_ids, options, stream)
     }
 
     /// Returns current logical residency and transfer telemetry.
@@ -107,6 +162,17 @@ impl Lfm2LayerwiseModel {
         stream: &Stream,
     ) -> Result<Array, Error> {
         self.execution.forward(inputs, cache, stream)
+    }
+    /// Runs a rank-local tensor-parallel hybrid forward pass.
+    pub fn forward_tensor_parallel(
+        &mut self,
+        inputs: &Array,
+        cache: &mut Cache,
+        group: &safemlx::distributed::Group,
+        stream: &Stream,
+    ) -> Result<Array, Error> {
+        self.execution
+            .forward_tensor_parallel(inputs, cache, group, stream)
     }
 
     /// Runs streamed layers while delegating routed experts to a caller.
@@ -192,10 +258,34 @@ pub fn load_lfm2_layerwise_model(
     let args = resident::get_model_args(model_dir)?;
     let adapter = Lfm2LayerwiseAdapter::new(args, stream)?;
     Ok(Lfm2LayerwiseModel {
-        execution: load_general_layerwise_model(
+        execution: load_layerwise_model(model_dir, adapter, options, stream, weights_stream)?,
+    })
+}
+/// Loads dense or MoE LFM2 through the generalized tensor-parallel engine.
+pub fn load_lfm2_tensor_parallel_model(
+    model_dir: impl AsRef<Path>,
+    options: impl Into<LayerExecutionLoadOptions>,
+    build: crate::runtime::distributed::parallel::ParallelBuildContext,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<Lfm2LayerwiseModel, Error> {
+    let model_dir = model_dir.as_ref();
+    let options = options.into();
+    let residency = match options {
+        LayerExecutionLoadOptions::LayerwiseHost(v) => WeightResidency::LayerwiseHost(v),
+        LayerExecutionLoadOptions::DenseDiskStream(v) => WeightResidency::DenseDiskStream(v),
+    };
+    crate::api::structural::validate_safetensors_load_path(
+        crate::api::ModelKind::Lfm2,
+        model_dir,
+        crate::api::ModelLoadOptions::default().with_weight_residency(residency),
+    )?;
+    Ok(Lfm2LayerwiseModel {
+        execution: load_tensor_parallel_layerwise_model(
             model_dir,
-            adapter,
+            Lfm2LayerwiseAdapter::new(resident::get_model_args(model_dir)?, stream)?,
             options,
+            build,
             stream,
             weights_stream,
         )?,
@@ -219,14 +309,14 @@ pub(crate) fn load_lfm2_gguf_layerwise_model(
             residency.max_mapped_shards(),
         )?);
     let execution = match residency {
-        WeightResidency::LayerwiseHost(options) => load_general_layerwise_model_with_store(
+        WeightResidency::LayerwiseHost(options) => load_layerwise_model_with_store(
             store,
             Lfm2LayerwiseAdapter::new(args, stream)?,
             options,
             stream,
             weights_stream,
         )?,
-        WeightResidency::DenseDiskStream(options) => load_general_layerwise_model_with_store(
+        WeightResidency::DenseDiskStream(options) => load_layerwise_model_with_store(
             store,
             Lfm2LayerwiseAdapter::new(args, stream)?,
             options,
@@ -283,13 +373,8 @@ fn load_lfm2_gguf_sparse_with_store(
     }
     let mut adapter = Lfm2LayerwiseAdapter::new(args.clone(), stream)?;
     adapter.sparse_expert_cache = true;
-    let mut execution = load_general_layerwise_model_with_store(
-        store,
-        adapter,
-        non_expert,
-        stream,
-        weights_stream,
-    )?;
+    let mut execution =
+        load_layerwise_model_with_store(store, adapter, non_expert, stream, weights_stream)?;
     let checkpoint_store = execution.weight_store_arc();
     let entries = lfm2_expert_catalog(&args, checkpoint_store.as_ref())?;
     execution.adapter_mut().expert_cache = Some(ExpertCache::new_shared(
@@ -312,13 +397,8 @@ pub(crate) fn load_lfm2_sparse_ep_base_with_store(
 ) -> Result<Lfm2LayerwiseModel, Error> {
     let mut adapter = Lfm2LayerwiseAdapter::new(args, stream)?;
     adapter.sparse_expert_cache = true;
-    let execution = load_general_layerwise_model_with_store(
-        store,
-        adapter,
-        non_expert,
-        stream,
-        weights_stream,
-    )?;
+    let execution =
+        load_layerwise_model_with_store(store, adapter, non_expert, stream, weights_stream)?;
     Ok(Lfm2LayerwiseModel { execution })
 }
 
@@ -372,7 +452,7 @@ fn load_lfm2_sparse_expert_cache_model_with_non_expert(
     let mut adapter = Lfm2LayerwiseAdapter::new(args.clone(), stream)?;
     adapter.sparse_expert_cache = true;
     let mut execution =
-        load_general_layerwise_model(model_dir, adapter, non_expert, stream, weights_stream)?;
+        load_layerwise_model(model_dir, adapter, non_expert, stream, weights_stream)?;
     let store = execution.weight_store_arc();
     let entries = lfm2_expert_catalog(&args, store.as_ref())?;
     execution.adapter_mut().expert_cache = Some(ExpertCache::new_shared(
@@ -391,6 +471,8 @@ pub struct Lfm2LayerwiseAdapter {
     embedding: MaybeQuantized<nn::Embedding>,
     norm: nn::RmsNorm,
     lm_head: Option<MaybeQuantized<nn::Linear>>,
+    parallel_embedding: Option<VocabParallelEmbedding>,
+    parallel_lm_head: Option<VocabParallelLmHead>,
     sparse_expert_cache: bool,
     expert_cache: Option<ExpertCache>,
 }
@@ -421,6 +503,8 @@ impl Lfm2LayerwiseAdapter {
             embedding,
             norm,
             lm_head,
+            parallel_embedding: None,
+            parallel_lm_head: None,
             sparse_expert_cache: false,
             expert_cache: None,
         })
@@ -571,11 +655,97 @@ impl KeyValueCache for OffsetOnlyCache {
     }
 }
 
-impl GeneralLayerwiseModelAdapter for Lfm2LayerwiseAdapter {
+impl ArchitectureAdapter for Lfm2LayerwiseAdapter {
     type Input<'a> = &'a Array;
     type Cache = Cache;
     type Layer = DecoderLayer;
     type ForwardContext = Lfm2ForwardContext;
+
+    fn model_type(&self) -> &str {
+        &self.args.model_type
+    }
+
+    fn quantization(&self) -> Option<crate::runtime::checkpoint::quantization::WeightQuantization> {
+        self.args.weight_quantization()
+    }
+
+    fn prompt_cache_model_identity(
+        &self,
+        topology: Option<crate::ParallelTopology>,
+    ) -> Result<PromptCacheModelIdentity, Error> {
+        let mut local = self.args.clone();
+        if let Some(topology) = topology {
+            local.num_attention_heads = exact_parallel_division(
+                "LFM2 prompt-cache attention heads",
+                local.num_attention_heads,
+                topology.tensor_parallel_size,
+            )?;
+            local.num_key_value_heads = exact_parallel_division(
+                "LFM2 prompt-cache KV heads",
+                local.num_key_value_heads,
+                topology.tensor_parallel_size,
+            )?;
+        }
+        let layer_count = usize::try_from(self.args.num_hidden_layers)
+            .map_err(|_| Exception::custom("invalid LFM2 cache layer count"))?;
+        Ok(PromptCacheModelIdentity {
+            model_family: "lfm2".into(),
+            effective_model_type: self.args.model_type.clone(),
+            architecture_fingerprint: resident::prompt_cache_architecture_fingerprint(&self.args),
+            layer_count,
+            global_layer_start: 0,
+            global_layer_end: layer_count,
+            sink_tokens: 0,
+            topology: topology.map_or_else(
+                PromptCacheTopology::default,
+                PromptCacheTopology::for_parallel_topology,
+            ),
+            layer_layout: resident::prompt_cache_layer_layout(&local)
+                .map_err(|error| Exception::custom(error.to_string()))?,
+        })
+    }
+
+    fn save_prompt_cache(
+        &self,
+        cache: &mut Self::Cache,
+        destination: &Path,
+        descriptor: PromptCacheDescriptor,
+        prefix_token_ids: &[u32],
+        options: &PromptCacheOptions,
+        stream: &Stream,
+    ) -> Result<PromptCacheManifest, Error> {
+        let rank = descriptor.topology.cache_rank_identity();
+        resident::Model::save_prompt_cache_with_rank(
+            cache,
+            destination,
+            descriptor,
+            prefix_token_ids,
+            options,
+            rank,
+            stream,
+        )
+        .map_err(Into::into)
+    }
+
+    fn load_prompt_cache(
+        &self,
+        directory: &Path,
+        expected: &PromptCacheDescriptor,
+        identity: &PromptCacheModelIdentity,
+        prefix_token_ids: &[u32],
+        _options: PagedCacheOptions,
+        stream: &Stream,
+    ) -> Result<(Self::Cache, PromptCacheManifest), Error> {
+        resident::Model::load_prompt_cache_with_identity(
+            &self.args,
+            directory,
+            expected,
+            prefix_token_ids,
+            identity.clone(),
+            stream,
+        )
+        .map_err(Into::into)
+    }
 
     fn static_units(&self, store: &dyn WeightStore) -> Result<Vec<StaticUnitBindings>, Error> {
         let mut units = vec![
@@ -605,9 +775,15 @@ impl GeneralLayerwiseModelAdapter for Lfm2LayerwiseAdapter {
                 leases.len()
             )));
         }
-        populate_module_from_lease(&mut self.embedding, &leases[0])?;
+        if let Some(v) = &mut self.parallel_embedding {
+            populate_module_from_lease(v.inner_mut(), &leases[0])?;
+        } else {
+            populate_module_from_lease(&mut self.embedding, &leases[0])?;
+        }
         populate_module_from_lease(&mut self.norm, &leases[1])?;
-        if let Some(head) = &mut self.lm_head {
+        if let Some(v) = &mut self.parallel_lm_head {
+            populate_module_from_lease(v.inner_mut(), &leases[2])?;
+        } else if let Some(head) = &mut self.lm_head {
             populate_module_from_lease(head, &leases[2])?;
         }
         Ok(())
@@ -671,6 +847,35 @@ impl GeneralLayerwiseModelAdapter for Lfm2LayerwiseAdapter {
             context: Lfm2ForwardContext { mask },
         })
     }
+    fn begin_forward_with_execution<'a>(
+        &mut self,
+        input: Self::Input<'a>,
+        cache: &mut Self::Cache,
+        execution: &crate::runtime::distributed::parallel::ParallelExecutionContext<'_>,
+    ) -> Result<LayerwiseForwardState<Self::ForwardContext>, Error> {
+        let Some(v) = &mut self.parallel_embedding else {
+            return self.begin_forward(input, cache, execution.stream());
+        };
+        let hidden = v.forward(input, execution)?;
+        let mask = if hidden.dim(1) > 1 {
+            let offset_cache = vec![Some(OffsetOnlyCache(cache.offset()))];
+            match create_attention_mask(&hidden, &offset_cache, Some(true), execution.stream())? {
+                Some(AttentionMask::Array(v)) => Some(v),
+                Some(AttentionMask::Causal) => {
+                    return Err(Error::UnsupportedArchitecture(
+                        "LFM2 requires an array causal mask".into(),
+                    ))
+                }
+                None => None,
+            }
+        } else {
+            None
+        };
+        Ok(LayerwiseForwardState {
+            hidden,
+            context: Lfm2ForwardContext { mask },
+        })
+    }
 
     fn execution_group_count(&self) -> usize {
         1
@@ -701,6 +906,98 @@ impl GeneralLayerwiseModelAdapter for Lfm2LayerwiseAdapter {
         let index = i32::try_from(index)
             .map_err(|_| Error::UnsupportedArchitecture("LFM2 layer index exceeds i32".into()))?;
         DecoderLayer::new(&self.args, index, stream)
+    }
+    fn register_parallel_parameters(
+        &self,
+        _context: crate::runtime::distributed::parallel::ParallelBuildContext,
+        planner: &mut crate::runtime::distributed::parallel::ParallelPlanBuilder,
+        stream: &Stream,
+    ) -> Result<(), Error> {
+        planner.register(crate::nn::parallel::vocab_embedding_parameter_group(
+            &self.embedding,
+            "model.embed_tokens",
+            self.args.vocab_size as usize,
+            self.args.hidden_size,
+            false,
+        )?)?;
+        crate::nn::parallel::register_replicated_parameter_group(
+            planner,
+            &self.norm,
+            "model.embedding_norm",
+        )?;
+        if let Some(head) = &self.lm_head {
+            planner.register(crate::nn::parallel::vocab_lm_head_parameter_group(
+                head,
+                "lm_head",
+                self.args.hidden_size,
+                self.args.vocab_size as usize,
+                false,
+            )?)?;
+        }
+        for index in 0..self.args.num_hidden_layers as usize {
+            let layer = DecoderLayer::new(&self.args, index as i32, stream)?;
+            crate::architectures::distributed::tensor::insert_lfm2_layer_plan(
+                planner, &layer, index, false,
+            )?;
+        }
+        Ok(())
+    }
+    fn configure_parallel_static(
+        &mut self,
+        context: crate::runtime::distributed::parallel::ParallelBuildContext,
+        _layout: &crate::runtime::distributed::parallel::LocalModelLayout,
+        stream: &Stream,
+    ) -> Result<(), Error> {
+        self.parallel_embedding = Some(VocabParallelEmbedding::unloaded(
+            self.args.vocab_size as usize,
+            self.args.hidden_size,
+            self.args
+                .weight_quantization_for("model.embed_tokens.weight"),
+            context,
+            stream,
+        )?);
+        if self.lm_head.is_some() {
+            self.parallel_lm_head = Some(VocabParallelLmHead::unloaded(
+                self.args.hidden_size,
+                self.args.vocab_size as usize,
+                self.args.weight_quantization_for("lm_head.weight"),
+                context,
+                stream,
+            )?);
+        }
+        Ok(())
+    }
+    fn new_parallel_layer(
+        &self,
+        group: usize,
+        index: usize,
+        layout: &crate::runtime::distributed::parallel::LocalModelLayout,
+        stream: &Stream,
+    ) -> Result<Self::Layer, Error> {
+        self.layer_count(group)?;
+        let prefix = format!("model.layers.{index}");
+        let find = |n: &str| {
+            layout
+                .tensor(&format!("{prefix}.{n}.weight"))
+                .or_else(|| layout.tensor(&format!("{prefix}.{n}.inner.weight")))
+        };
+        let mut args = self.args.clone();
+        let head_dim = self.args.hidden_size / self.args.num_attention_heads;
+        if let Some(q) = find("self_attn.q_proj") {
+            args.num_attention_heads = q.local_shape()[0] as i32 / head_dim;
+        }
+        if let Some(k) = find("self_attn.k_proj") {
+            args.num_key_value_heads = k.local_shape()[0] as i32 / head_dim;
+        }
+        let dense = find("feed_forward.w1").map_or(args.dense_layer_intermediate_size(), |v| {
+            v.local_shape()[0] as i32
+        });
+        let moe = layout
+            .tensor(&format!("{prefix}.feed_forward.experts.gate_up_proj"))
+            .map_or(args.moe_intermediate_size, |v| {
+                v.local_shape()[1] as i32 / 2
+            });
+        DecoderLayer::new_with_widths(&args, index as i32, dense, moe, Some(head_dim), stream)
     }
 
     fn layer_checkpoint_prefix(&self, _group: usize, index: usize) -> String {
@@ -769,6 +1066,22 @@ impl GeneralLayerwiseModelAdapter for Lfm2LayerwiseAdapter {
         } else {
             bindings
         })
+    }
+    fn parallel_layer_bindings(
+        &self,
+        group: usize,
+        index: usize,
+        _layer: &Self::Layer,
+        store: &dyn WeightStore,
+        layout: &crate::runtime::distributed::parallel::LocalModelLayout,
+        stream: &Stream,
+    ) -> Result<Vec<WeightBinding>, Error> {
+        let global = self.new_layer(group, index, stream)?;
+        crate::runtime::execution::layerwise::shard_layer_bindings(
+            self.layer_bindings(group, index, &global, store)?,
+            &self.layer_checkpoint_prefix(group, index),
+            layout,
+        )
     }
 
     fn additional_consumed_checkpoint_keys(&self, store: &dyn WeightStore) -> Vec<String> {
@@ -891,6 +1204,36 @@ impl GeneralLayerwiseModelAdapter for Lfm2LayerwiseAdapter {
             stream,
         )?)
     }
+    fn forward_layer_with_execution(
+        &mut self,
+        group: usize,
+        index: usize,
+        layer: &mut Self::Layer,
+        hidden: &Array,
+        cache: &mut Self::Cache,
+        context: &mut Self::ForwardContext,
+        execution: &crate::runtime::distributed::parallel::ParallelExecutionContext<'_>,
+    ) -> Result<Array, Error> {
+        let Some(tp_group) = execution.group() else {
+            return self.forward_layer(
+                group,
+                index,
+                layer,
+                hidden,
+                cache,
+                context,
+                execution.stream(),
+            );
+        };
+        self.layer_count(group)?;
+        Ok(layer.forward_tensor_parallel(
+            hidden,
+            context.mask.as_ref(),
+            Some(&mut cache.layers[index]),
+            tp_group,
+            execution.stream(),
+        )?)
+    }
 
     fn retained_arrays<'a>(
         &self,
@@ -915,6 +1258,23 @@ impl GeneralLayerwiseModelAdapter for Lfm2LayerwiseAdapter {
             &hidden,
             stream,
         )?)
+    }
+    fn finish_with_execution(
+        &mut self,
+        hidden: &Array,
+        cache: &mut Self::Cache,
+        context: &Self::ForwardContext,
+        execution: &crate::runtime::distributed::parallel::ParallelExecutionContext<'_>,
+    ) -> Result<Array, Error> {
+        let Some(embedding) = &mut self.parallel_embedding else {
+            return self.finish(hidden, cache, context, execution.stream());
+        };
+        let hidden = self.norm.forward(hidden, execution.stream())?;
+        let logits = match &mut self.parallel_lm_head {
+            Some(head) => head.forward(&hidden, execution)?,
+            None => embedding.project_logits(&hidden, execution)?,
+        };
+        logits.all_gather(execution)
     }
 }
 
@@ -1120,7 +1480,7 @@ mod tests {
         runtime::{
             attention::LayerSchedule,
             execution::layerwise::{
-                load_general_layerwise_model, LayerExecutionLoadOptions, LayerwiseLoadOptions,
+                load_layerwise_model, LayerExecutionLoadOptions, LayerwiseLoadOptions,
             },
         },
     };
@@ -1384,7 +1744,7 @@ mod tests {
         write_fixture(directory.path(), &resident, gpu.stream());
 
         let adapter = Lfm2LayerwiseAdapter::new(custom_args, gpu.stream()).unwrap();
-        let execution = load_general_layerwise_model(
+        let execution = load_layerwise_model(
             directory.path(),
             adapter,
             LayerwiseLoadOptions::new(OffloadConfig::new(None, None, 1).unwrap()),

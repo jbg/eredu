@@ -827,6 +827,30 @@ impl Module<&Array> for Mlp {
     }
 }
 
+fn ordinary_linear_bias(linear: &MaybeQuantized<nn::Linear>) -> Option<&Array> {
+    match linear {
+        MaybeQuantized::Original(linear) => linear.bias.as_ref().as_ref(),
+        MaybeQuantized::Quantized(linear) => linear.inner.bias.as_ref().as_ref(),
+    }
+}
+
+fn reduce_row_parallel_output(
+    mut partial: Array,
+    projection: &MaybeQuantized<nn::Linear>,
+    group: &safemlx::distributed::Group,
+    stream: &Stream,
+) -> Result<Array, Exception> {
+    let bias = ordinary_linear_bias(projection);
+    if let Some(bias) = bias {
+        partial = partial.subtract(bias, stream)?;
+    }
+    let mut output = safemlx::distributed::all_sum(&partial, group, stream)?;
+    if let Some(bias) = bias {
+        output = output.add(bias, stream)?;
+    }
+    Ok(output)
+}
+
 /// Sigmoid top-k router used by Nemotron-H MoE layers.
 pub type TopKRouter = common::moe::TopKRouter;
 
@@ -2033,6 +2057,90 @@ impl TransformerBlock {
             }
         };
         residual.add(h, stream)
+    }
+
+    /// Executes one Nemotron-H layer with rank-local attention, Mamba, dense,
+    /// or expert channels and one row-parallel reduction.
+    pub(crate) fn forward_tensor_parallel(
+        &mut self,
+        input: BlockInput<'_>,
+        group: &safemlx::distributed::Group,
+        stream: &Stream,
+    ) -> Result<Array, Exception> {
+        let BlockInput { x, mask, cache } = input;
+        let normalized = self.norm.forward(x, stream)?;
+        let output = match (self.policy, cache) {
+            (LayerPolicy::Mamba, Some(LayerCache::Mamba(cache))) => {
+                let mamba = self.mamba.as_mut().expect("mamba block");
+                let partial = mamba.forward(
+                    Mamba2Input {
+                        x: &normalized,
+                        cache: Some(cache),
+                    },
+                    stream,
+                )?;
+                reduce_row_parallel_output(partial, &mamba.out_proj, group, stream)?
+            }
+            (LayerPolicy::Mamba, None) => {
+                let mamba = self.mamba.as_mut().expect("mamba block");
+                let partial = mamba.forward(
+                    Mamba2Input {
+                        x: &normalized,
+                        cache: None,
+                    },
+                    stream,
+                )?;
+                reduce_row_parallel_output(partial, &mamba.out_proj, group, stream)?
+            }
+            (LayerPolicy::SelfAttention(_), Some(LayerCache::Attention(cache))) => {
+                let attention = self.attention.as_mut().expect("attention block");
+                let partial = attention.forward(
+                    AttentionInput {
+                        x: &normalized,
+                        mask,
+                        cache: Some(cache),
+                    },
+                    stream,
+                )?;
+                reduce_row_parallel_output(partial, &attention.o_proj, group, stream)?
+            }
+            (LayerPolicy::SelfAttention(_), None) => {
+                let attention = self.attention.as_mut().expect("attention block");
+                let partial = attention.forward(
+                    AttentionInput {
+                        x: &normalized,
+                        mask,
+                        cache: None,
+                    },
+                    stream,
+                )?;
+                reduce_row_parallel_output(partial, &attention.o_proj, group, stream)?
+            }
+            (LayerPolicy::DenseMlp, None | Some(LayerCache::Mlp)) => {
+                let mlp = self.mlp.as_mut().expect("mlp block");
+                let partial = mlp.forward(&normalized, stream)?;
+                reduce_row_parallel_output(partial, &mlp.down_proj, group, stream)?
+            }
+            (LayerPolicy::SparseMoe, None | Some(LayerCache::Moe)) => {
+                let moe = self.moe.as_mut().expect("moe block");
+                let mut partial = moe.forward(&normalized, stream)?;
+                let bias = ordinary_linear_bias(&moe.shared_experts.down_proj);
+                if let Some(bias) = bias {
+                    partial = partial.subtract(bias, stream)?;
+                }
+                let mut reduced = safemlx::distributed::all_sum(&partial, group, stream)?;
+                if let Some(bias) = bias {
+                    reduced = reduced.add(bias, stream)?;
+                }
+                reduced
+            }
+            (policy, Some(cache)) => {
+                return Err(Exception::custom(format!(
+                "Nemotron-H tensor-parallel cache {cache:?} does not match layer policy {policy:?}"
+            )))
+            }
+        };
+        x.add(output, stream)
     }
 }
 

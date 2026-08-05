@@ -30,7 +30,14 @@ use crate::{
         },
     },
     error::Error,
-    nn::tensor::{create_attention_mask, AttentionMask},
+    nn::{
+        parallel::{VocabParallelEmbedding, VocabParallelLmHead},
+        tensor::{create_attention_mask, AttentionMask},
+    },
+    runtime::cache::residency::{
+        PagedCacheOptions, PromptCacheDescriptor, PromptCacheManifest, PromptCacheModelIdentity,
+        PromptCacheOptions, PromptCacheTopology,
+    },
     runtime::checkpoint::binding::{
         build_module_bindings_with_recipes, canonical_checkpoint_name, populate_module_from_lease,
         populate_module_from_lease_excluding,
@@ -39,10 +46,11 @@ use crate::{
     runtime::checkpoint::store::{
         GgufWeightStore, TensorSelection, WeightStore, WeightStoreBackend,
     },
+    runtime::distributed::parallel::exact_parallel_division,
     runtime::execution::layerwise::{
-        load_general_layerwise_model, load_general_layerwise_model_with_store,
-        GeneralLayerwiseModel, GeneralLayerwiseModelAdapter, LayerExecutionLoadOptions,
-        LayerwiseForwardState, StaticUnitBindings, WeightResidency,
+        load_layerwise_model, load_layerwise_model_with_store,
+        load_tensor_parallel_layerwise_model, ArchitectureAdapter, LayerExecutionLoadOptions,
+        LayerwiseForwardState, LayerwiseModel, StaticUnitBindings, WeightResidency,
     },
     runtime::residency::expert_cache::{
         ExpertCache, ExpertCacheLoadOptions, ExpertCacheReport, ExpertCatalogEntry, ExpertIdentity,
@@ -66,7 +74,7 @@ enum QwenHybridFamily {
 
 /// Qwen3-Next or Qwen3.5 text model using host-backed hybrid blocks.
 pub struct QwenHybridLayerwiseModel {
-    execution: GeneralLayerwiseModel<QwenHybridLayerwiseAdapter>,
+    execution: LayerwiseModel<QwenHybridLayerwiseAdapter>,
 }
 
 impl QwenHybridLayerwiseModel {
@@ -92,6 +100,51 @@ impl QwenHybridLayerwiseModel {
     /// Creates heterogeneous recurrent/full-attention cache state.
     pub fn new_cache(&self) -> Cache {
         self.execution.adapter().new_cache()
+    }
+
+    /// Returns rank-local generalized parallel information when applicable.
+    pub fn parallel_info(&self) -> Option<&crate::ParallelModelInfo> {
+        self.execution.parallel_info()
+    }
+
+    /// Returns this rank's exact prompt-cache state layout.
+    pub fn prompt_cache_layer_layout(
+        &self,
+    ) -> Result<crate::LayerSchedule<crate::LayerCachePolicy>, Error> {
+        self.execution.prompt_cache_layer_layout()
+    }
+
+    /// Persists a compatible prefix cache.
+    pub fn save_prompt_cache(
+        &self,
+        cache: &mut Cache,
+        destination: impl AsRef<Path>,
+        descriptor: PromptCacheDescriptor,
+        prefix_token_ids: &[u32],
+        options: &PromptCacheOptions,
+        stream: &Stream,
+    ) -> Result<PromptCacheManifest, Error> {
+        self.execution.save_prompt_cache(
+            cache,
+            destination,
+            descriptor,
+            prefix_token_ids,
+            options,
+            stream,
+        )
+    }
+
+    /// Restores a compatible prefix cache.
+    pub fn load_prompt_cache(
+        &self,
+        directory: impl AsRef<Path>,
+        expected: &PromptCacheDescriptor,
+        prefix_token_ids: &[u32],
+        options: PagedCacheOptions,
+        stream: &Stream,
+    ) -> Result<(Cache, PromptCacheManifest), Error> {
+        self.execution
+            .load_prompt_cache(directory, expected, prefix_token_ids, options, stream)
     }
 
     /// Returns current logical residency and transfer telemetry.
@@ -135,6 +188,21 @@ impl QwenHybridLayerwiseModel {
     ) -> Result<Array, Error> {
         self.execution
             .forward(QwenHybridInput::Decode(inputs), cache, stream)
+    }
+    /// Runs a rank-local tensor-parallel text forward pass.
+    pub fn forward_tensor_parallel(
+        &mut self,
+        inputs: &Array,
+        cache: &mut Cache,
+        group: &safemlx::distributed::Group,
+        stream: &Stream,
+    ) -> Result<Array, Error> {
+        self.execution.forward_tensor_parallel(
+            QwenHybridInput::Decode(inputs),
+            cache,
+            group,
+            stream,
+        )
     }
 
     /// Runs streamed text layers while delegating routed experts to a caller.
@@ -351,6 +419,40 @@ pub fn load_qwen3_next_layerwise_model(
     )
 }
 
+/// Loads text-only Qwen3-Next through the generalized tensor-parallel engine.
+pub fn load_qwen3_next_tensor_parallel_model(
+    model_dir: impl AsRef<Path>,
+    options: impl Into<LayerExecutionLoadOptions>,
+    build: crate::runtime::distributed::parallel::ParallelBuildContext,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<QwenHybridLayerwiseModel, Error> {
+    let model_dir = model_dir.as_ref();
+    let options = options.into();
+    let residency = match options {
+        LayerExecutionLoadOptions::LayerwiseHost(v) => WeightResidency::LayerwiseHost(v),
+        LayerExecutionLoadOptions::DenseDiskStream(v) => WeightResidency::DenseDiskStream(v),
+    };
+    crate::api::structural::validate_safetensors_load_path(
+        crate::api::ModelKind::Qwen3Next,
+        model_dir,
+        crate::api::ModelLoadOptions::default().with_weight_residency(residency),
+    )?;
+    let args = qwen3_next::get_qwen3_next_model_args(model_dir)?;
+    if let Some(config) = &args.quantization_config {
+        config.validate_supported()?;
+    }
+    load_qwen_hybrid_tensor_parallel_model(
+        model_dir,
+        args,
+        QwenHybridFamily::Qwen3Next,
+        options,
+        build,
+        stream,
+        weights_stream,
+    )
+}
+
 /// Loads a text-only or multimodal dense/MoE Qwen3.5 model through bounded residency.
 pub fn load_qwen35_layerwise_model(
     model_dir: impl AsRef<Path>,
@@ -388,6 +490,67 @@ pub fn load_qwen35_layerwise_model(
     )
 }
 
+/// Loads a text-only Qwen3.5 dense or MoE checkpoint through the generalized tensor-parallel engine.
+pub fn load_qwen35_tensor_parallel_model(
+    model_dir: impl AsRef<Path>,
+    options: impl Into<LayerExecutionLoadOptions>,
+    build: crate::runtime::distributed::parallel::ParallelBuildContext,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<QwenHybridLayerwiseModel, Error> {
+    let model_dir = model_dir.as_ref();
+    let options = options.into();
+    let residency = match options {
+        LayerExecutionLoadOptions::LayerwiseHost(v) => WeightResidency::LayerwiseHost(v),
+        LayerExecutionLoadOptions::DenseDiskStream(v) => WeightResidency::DenseDiskStream(v),
+    };
+    crate::api::structural::validate_safetensors_load_path(
+        crate::api::ModelKind::Qwen35Moe,
+        model_dir,
+        crate::api::ModelLoadOptions::default().with_weight_residency(residency),
+    )?;
+    let (args, _, _, vision) = resident::get_qwen3_5_moe_model_args(model_dir)?;
+    if vision.is_some() {
+        return Err(Error::Parallel("the token-only Qwen3.5 TP loader does not accept a vision tower; use the multimodal execution-group loader".into()));
+    }
+    load_qwen_hybrid_tensor_parallel_model(
+        model_dir,
+        args,
+        QwenHybridFamily::Qwen35,
+        options,
+        build,
+        stream,
+        weights_stream,
+    )
+}
+
+fn load_qwen_hybrid_tensor_parallel_model(
+    model_dir: &Path,
+    args: ModelArgs,
+    family: QwenHybridFamily,
+    options: LayerExecutionLoadOptions,
+    build: crate::runtime::distributed::parallel::ParallelBuildContext,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<QwenHybridLayerwiseModel, Error> {
+    if args.mtp_num_hidden_layers > 0 {
+        return Err(Error::Parallel(
+            "the token-only Qwen hybrid TP loader does not execute embedded MTP layers".into(),
+        ));
+    }
+    let adapter = QwenHybridLayerwiseAdapter::new(args, family, None, None, None, stream)?;
+    Ok(QwenHybridLayerwiseModel {
+        execution: load_tensor_parallel_layerwise_model(
+            model_dir,
+            adapter,
+            options,
+            build,
+            stream,
+            weights_stream,
+        )?,
+    })
+}
+
 pub(crate) fn load_qwen_hybrid_gguf_layerwise_model(
     checkpoint: &GgufCheckpoint,
     metadata: &HashMap<String, GgufMetadataValue>,
@@ -418,14 +581,14 @@ pub(crate) fn load_qwen_hybrid_gguf_layerwise_model(
             residency.max_mapped_shards(),
         )?);
     let execution = match residency {
-        WeightResidency::LayerwiseHost(options) => load_general_layerwise_model_with_store(
+        WeightResidency::LayerwiseHost(options) => load_layerwise_model_with_store(
             store,
             QwenHybridLayerwiseAdapter::new(args, family, None, None, None, stream)?,
             options,
             stream,
             weights_stream,
         )?,
-        WeightResidency::DenseDiskStream(options) => load_general_layerwise_model_with_store(
+        WeightResidency::DenseDiskStream(options) => load_layerwise_model_with_store(
             store,
             QwenHybridLayerwiseAdapter::new(args, family, None, None, None, stream)?,
             options,
@@ -492,13 +655,8 @@ fn load_qwen_hybrid_gguf_sparse_with_store(
     let mut adapter =
         QwenHybridLayerwiseAdapter::new(args.clone(), family, None, None, None, stream)?;
     adapter.sparse_expert_cache = true;
-    let mut execution = load_general_layerwise_model_with_store(
-        store,
-        adapter,
-        non_expert,
-        stream,
-        weights_stream,
-    )?;
+    let mut execution =
+        load_layerwise_model_with_store(store, adapter, non_expert, stream, weights_stream)?;
     let checkpoint_store = execution.weight_store_arc();
     let entries = qwen_hybrid_expert_catalog(&args, checkpoint_store.as_ref())?;
     execution.adapter_mut().expert_cache = Some(ExpertCache::new_shared(
@@ -680,7 +838,7 @@ fn load_qwen_hybrid_sparse_model(
     )?;
     adapter.sparse_expert_cache = true;
     let mut execution =
-        load_general_layerwise_model(model_dir, adapter, non_expert, stream, weights_stream)?;
+        load_layerwise_model(model_dir, adapter, non_expert, stream, weights_stream)?;
     let store = execution.weight_store_arc();
     let entries = qwen_hybrid_expert_catalog(&args, store.as_ref())?;
     execution.adapter_mut().expert_cache = Some(ExpertCache::new_shared(
@@ -709,13 +867,8 @@ pub(crate) fn load_qwen_hybrid_sparse_ep_base_with_store(
     };
     let mut adapter = QwenHybridLayerwiseAdapter::new(args, family, None, None, None, stream)?;
     adapter.sparse_expert_cache = true;
-    let execution = load_general_layerwise_model_with_store(
-        store,
-        adapter,
-        non_expert,
-        stream,
-        weights_stream,
-    )?;
+    let execution =
+        load_layerwise_model_with_store(store, adapter, non_expert, stream, weights_stream)?;
     Ok(QwenHybridLayerwiseModel { execution })
 }
 
@@ -761,13 +914,7 @@ fn load_qwen_hybrid_layerwise_model_with_vision(
         stream,
     )?;
     Ok(QwenHybridLayerwiseModel {
-        execution: load_general_layerwise_model(
-            model_dir,
-            adapter,
-            options,
-            stream,
-            weights_stream,
-        )?,
+        execution: load_layerwise_model(model_dir, adapter, options, stream, weights_stream)?,
     })
 }
 
@@ -778,6 +925,8 @@ pub struct QwenHybridLayerwiseAdapter {
     embedding: MaybeQuantized<safemlx::nn::Embedding>,
     norm: Qwen3NextRmsNorm,
     lm_head: Option<MaybeQuantized<safemlx::nn::Linear>>,
+    parallel_embedding: Option<VocabParallelEmbedding>,
+    parallel_lm_head: Option<VocabParallelLmHead>,
     mtp: Option<MtpModule>,
     vision: Option<QwenVisionLayerwiseStatic>,
     image_token_id: Option<i32>,
@@ -829,6 +978,8 @@ impl QwenHybridLayerwiseAdapter {
             embedding,
             norm,
             lm_head,
+            parallel_embedding: None,
+            parallel_lm_head: None,
             mtp,
             vision,
             image_token_id,
@@ -1769,11 +1920,100 @@ impl KeyValueCache for OffsetOnlyCache {
     }
 }
 
-impl GeneralLayerwiseModelAdapter for QwenHybridLayerwiseAdapter {
+impl ArchitectureAdapter for QwenHybridLayerwiseAdapter {
     type Input<'a> = QwenHybridInput<'a>;
     type Cache = Cache;
     type Layer = QwenHybridLayer;
     type ForwardContext = QwenHybridForwardContext;
+
+    fn model_type(&self) -> &str {
+        &self.args.model_type
+    }
+
+    fn prompt_cache_model_identity(
+        &self,
+        topology: Option<crate::ParallelTopology>,
+    ) -> Result<PromptCacheModelIdentity, Error> {
+        let mut local = self.args.clone();
+        if let Some(topology) = topology {
+            local.num_attention_heads = exact_parallel_division(
+                "Qwen hybrid prompt-cache attention heads",
+                local.num_attention_heads,
+                topology.tensor_parallel_size,
+            )?;
+            local.num_key_value_heads = exact_parallel_division(
+                "Qwen hybrid prompt-cache KV heads",
+                local.num_key_value_heads,
+                topology.tensor_parallel_size,
+            )?;
+            local.linear_num_key_heads = exact_parallel_division(
+                "Qwen hybrid prompt-cache recurrent key heads",
+                local.linear_num_key_heads,
+                topology.tensor_parallel_size,
+            )?;
+            local.linear_num_value_heads = exact_parallel_division(
+                "Qwen hybrid prompt-cache recurrent value heads",
+                local.linear_num_value_heads,
+                topology.tensor_parallel_size,
+            )?;
+        }
+        let layer_count = self.args.num_hidden_layers as usize;
+        Ok(PromptCacheModelIdentity {
+            model_family: "qwen_hybrid".into(),
+            effective_model_type: self.args.model_type.clone(),
+            architecture_fingerprint: resident::prompt_cache_architecture_fingerprint(&self.args),
+            layer_count,
+            global_layer_start: 0,
+            global_layer_end: layer_count,
+            sink_tokens: 0,
+            topology: topology.map_or_else(
+                PromptCacheTopology::default,
+                PromptCacheTopology::for_parallel_topology,
+            ),
+            layer_layout: resident::prompt_cache_layer_layout(&local)
+                .map_err(|error| Exception::custom(error.to_string()))?,
+        })
+    }
+
+    fn save_prompt_cache(
+        &self,
+        cache: &mut Self::Cache,
+        destination: &Path,
+        descriptor: PromptCacheDescriptor,
+        prefix_token_ids: &[u32],
+        options: &PromptCacheOptions,
+        stream: &Stream,
+    ) -> Result<PromptCacheManifest, Error> {
+        resident::Model::save_prompt_cache(
+            cache,
+            destination,
+            descriptor,
+            prefix_token_ids,
+            options,
+            stream,
+        )
+        .map_err(Into::into)
+    }
+
+    fn load_prompt_cache(
+        &self,
+        directory: &Path,
+        expected: &PromptCacheDescriptor,
+        identity: &PromptCacheModelIdentity,
+        prefix_token_ids: &[u32],
+        _options: PagedCacheOptions,
+        stream: &Stream,
+    ) -> Result<(Self::Cache, PromptCacheManifest), Error> {
+        resident::Model::load_prompt_cache_with_identity(
+            &self.args,
+            directory,
+            expected,
+            prefix_token_ids,
+            identity,
+            stream,
+        )
+        .map_err(Into::into)
+    }
 
     fn static_units(&self, store: &dyn WeightStore) -> Result<Vec<StaticUnitBindings>, Error> {
         let mut units = vec![
@@ -1838,10 +2078,17 @@ impl GeneralLayerwiseModelAdapter for QwenHybridLayerwiseAdapter {
                 leases.len()
             )));
         }
-        populate_module_from_lease(&mut self.embedding, &leases[0])?;
+        if let Some(v) = &mut self.parallel_embedding {
+            populate_module_from_lease(v.inner_mut(), &leases[0])?;
+        } else {
+            populate_module_from_lease(&mut self.embedding, &leases[0])?;
+        }
         populate_module_from_lease(&mut self.norm, &leases[1])?;
         let mut index = 2;
-        if let Some(head) = &mut self.lm_head {
+        if let Some(v) = &mut self.parallel_lm_head {
+            populate_module_from_lease(v.inner_mut(), &leases[index])?;
+            index += 1;
+        } else if let Some(head) = &mut self.lm_head {
             populate_module_from_lease(head, &leases[index])?;
             index += 1;
         }
@@ -2012,6 +2259,70 @@ impl GeneralLayerwiseModelAdapter for QwenHybridLayerwiseAdapter {
             },
         })
     }
+    fn begin_forward_with_execution<'a>(
+        &mut self,
+        input: Self::Input<'a>,
+        cache: &mut Self::Cache,
+        execution: &crate::runtime::distributed::parallel::ParallelExecutionContext<'_>,
+    ) -> Result<LayerwiseForwardState<Self::ForwardContext>, Error> {
+        let Some(embedding) = &mut self.parallel_embedding else {
+            return self.begin_forward(input, cache, execution.stream());
+        };
+        let stream = execution.stream();
+        let hidden = match input {
+            QwenHybridInput::Decode(tokens) => embedding.forward(tokens, execution)?,
+            QwenHybridInput::Prefill(typed) => {
+                input::validate(typed)?;
+                let mut values = Vec::with_capacity(typed.parts.len());
+                for part in typed.parts {
+                    match (part.modality, part.payload) {
+                        (input::Modality::Text, input::InputPayload::TokenIds(tokens)) => {
+                            values.push(embedding.forward(tokens, execution)?)
+                        }
+                        (_, input::InputPayload::Embeddings(value)) => {
+                            input::ensure_hidden_size(
+                                value,
+                                self.args.hidden_size,
+                                "Qwen hybrid embeddings",
+                            )?;
+                            values.push(value.clone());
+                        }
+                        (modality, _) => {
+                            return Err(Error::UnsupportedArchitecture(format!(
+                                "token-only Qwen TP does not accept {} tensor input",
+                                modality.as_str()
+                            )))
+                        }
+                    }
+                }
+                concatenate_axis(&values, 1, stream)?
+            }
+        };
+        let mask = if hidden.dim(1) > 1 {
+            let offset_cache = vec![Some(OffsetOnlyCache(cache.offset()))];
+            match create_attention_mask(&hidden, &offset_cache, Some(true), stream)? {
+                Some(AttentionMask::Array(v)) => Some(v),
+                Some(AttentionMask::Causal) => {
+                    return Err(Error::UnsupportedArchitecture(
+                        "Qwen hybrid decoder requires an array causal mask".into(),
+                    ))
+                }
+                None => None,
+            }
+        } else {
+            None
+        };
+        Ok(LayerwiseForwardState {
+            hidden,
+            context: QwenHybridForwardContext {
+                mask,
+                parts: Vec::new(),
+                vision_jobs: Vec::new(),
+                needs_assembly: false,
+                draft_hidden: None,
+            },
+        })
+    }
 
     fn execution_group_count(&self) -> usize {
         1 + usize::from(self.vision.is_some())
@@ -2058,6 +2369,113 @@ impl GeneralLayerwiseModelAdapter for QwenHybridLayerwiseAdapter {
             )?)))
         }
     }
+    fn register_parallel_parameters(
+        &self,
+        _context: crate::runtime::distributed::parallel::ParallelBuildContext,
+        planner: &mut crate::runtime::distributed::parallel::ParallelPlanBuilder,
+        stream: &Stream,
+    ) -> Result<(), Error> {
+        if self.vision.is_some() || self.mtp.is_some() {
+            return Err(Error::Parallel(
+                "token-only Qwen hybrid TP requires vision and MTP execution groups to be absent"
+                    .into(),
+            ));
+        }
+        planner.register(crate::nn::parallel::vocab_embedding_parameter_group(
+            &self.embedding,
+            "model.embed_tokens",
+            self.args.vocab_size as usize,
+            self.args.hidden_size,
+            false,
+        )?)?;
+        crate::nn::parallel::register_replicated_parameter_group(
+            planner,
+            &self.norm,
+            "model.norm",
+        )?;
+        if let Some(head) = &self.lm_head {
+            planner.register(crate::nn::parallel::vocab_lm_head_parameter_group(
+                head,
+                "lm_head",
+                self.args.hidden_size,
+                self.args.vocab_size as usize,
+                false,
+            )?)?;
+        }
+        for index in 0..self.args.num_hidden_layers as usize {
+            let layer = TransformerBlock::new(&self.args, index, stream)?;
+            crate::architectures::distributed::tensor::insert_qwen_hybrid_layer_plan(
+                planner, &layer, index, &self.args, false,
+            )?;
+        }
+        Ok(())
+    }
+    fn configure_parallel_static(
+        &mut self,
+        context: crate::runtime::distributed::parallel::ParallelBuildContext,
+        _layout: &crate::runtime::distributed::parallel::LocalModelLayout,
+        stream: &Stream,
+    ) -> Result<(), Error> {
+        self.parallel_embedding = Some(VocabParallelEmbedding::unloaded(
+            self.args.vocab_size as usize,
+            self.args.hidden_size,
+            self.args.quantization,
+            context,
+            stream,
+        )?);
+        if self.lm_head.is_some() {
+            self.parallel_lm_head = Some(VocabParallelLmHead::unloaded(
+                self.args.hidden_size,
+                self.args.vocab_size as usize,
+                self.args.quantization,
+                context,
+                stream,
+            )?);
+        }
+        Ok(())
+    }
+    fn new_parallel_layer(
+        &self,
+        group: usize,
+        index: usize,
+        layout: &crate::runtime::distributed::parallel::LocalModelLayout,
+        stream: &Stream,
+    ) -> Result<Self::Layer, Error> {
+        if self.execution_group_id(group)? != "text_decoder" {
+            return Err(Error::Parallel(
+                "token-only Qwen TP has no vision execution group".into(),
+            ));
+        }
+        let prefix = format!("model.layers.{index}.");
+        let parts = layout
+            .tensors()
+            .filter(|(name, _)| name.starts_with(&prefix))
+            .flat_map(|(_, v)| {
+                v.global_shape()
+                    .iter()
+                    .zip(v.local_shape())
+                    .filter_map(|(g, l)| (*l > 0 && g % l == 0).then_some(g / l))
+            })
+            .max()
+            .unwrap_or(1) as i32;
+        let mut args = self.args.clone();
+        args.num_attention_heads /= parts;
+        args.num_key_value_heads /= parts;
+        args.linear_num_key_heads /= parts;
+        args.linear_num_value_heads /= parts;
+        if args.intermediate_size > 0 {
+            args.intermediate_size /= parts;
+        }
+        if args.moe_intermediate_size > 0 {
+            args.moe_intermediate_size /= parts;
+        }
+        if args.shared_expert_intermediate_size > 0 {
+            args.shared_expert_intermediate_size /= parts;
+        }
+        Ok(QwenHybridLayer::Text(Box::new(TransformerBlock::new(
+            &args, index, stream,
+        )?)))
+    }
 
     fn layer_checkpoint_prefix(&self, group: usize, index: usize) -> String {
         if self.execution_group_id(group).ok().as_deref() == Some("vision_encoder") {
@@ -2103,6 +2521,22 @@ impl GeneralLayerwiseModelAdapter for QwenHybridLayerwiseAdapter {
             } else {
                 bindings
             },
+        )
+    }
+    fn parallel_layer_bindings(
+        &self,
+        group: usize,
+        index: usize,
+        _layer: &Self::Layer,
+        store: &dyn WeightStore,
+        layout: &crate::runtime::distributed::parallel::LocalModelLayout,
+        stream: &Stream,
+    ) -> Result<Vec<WeightBinding>, Error> {
+        let global = self.new_layer(group, index, stream)?;
+        crate::runtime::execution::layerwise::shard_layer_bindings(
+            self.layer_bindings(group, index, &global, store)?,
+            &self.layer_checkpoint_prefix(group, index),
+            layout,
         )
     }
 
@@ -2278,6 +2712,42 @@ impl GeneralLayerwiseModelAdapter for QwenHybridLayerwiseAdapter {
             ))),
         }
     }
+    fn forward_layer_with_execution(
+        &mut self,
+        group: usize,
+        index: usize,
+        layer: &mut Self::Layer,
+        hidden: &Array,
+        cache: &mut Self::Cache,
+        context: &mut Self::ForwardContext,
+        execution: &crate::runtime::distributed::parallel::ParallelExecutionContext<'_>,
+    ) -> Result<Array, Error> {
+        let Some(tp_group) = execution.group() else {
+            return self.forward_layer(
+                group,
+                index,
+                layer,
+                hidden,
+                cache,
+                context,
+                execution.stream(),
+            );
+        };
+        match (self.execution_group_id(group)?.as_str(), layer) {
+            ("text_decoder", QwenHybridLayer::Text(block)) => Ok(block.forward_tensor_parallel(
+                BlockInput {
+                    x: hidden,
+                    mask: context.mask.as_ref(),
+                    cache: Some(&mut cache.layers[index]),
+                },
+                tp_group,
+                execution.stream(),
+            )?),
+            _ => Err(Error::Parallel(
+                "token-only Qwen TP received a non-text execution unit".into(),
+            )),
+        }
+    }
 
     fn retained_arrays<'a>(
         &self,
@@ -2369,6 +2839,23 @@ impl GeneralLayerwiseModelAdapter for QwenHybridLayerwiseAdapter {
             &hidden,
             stream,
         )?)
+    }
+    fn finish_with_execution(
+        &mut self,
+        hidden: &Array,
+        cache: &mut Self::Cache,
+        context: &Self::ForwardContext,
+        execution: &crate::runtime::distributed::parallel::ParallelExecutionContext<'_>,
+    ) -> Result<Array, Error> {
+        let Some(embedding) = &mut self.parallel_embedding else {
+            return self.finish(hidden, cache, context, execution.stream());
+        };
+        let hidden = self.norm.forward(hidden, execution.stream())?;
+        let logits = match &mut self.parallel_lm_head {
+            Some(head) => head.forward(&hidden, execution)?,
+            None => embedding.project_logits(&hidden, execution)?,
+        };
+        logits.all_gather(execution)
     }
 
     fn ignores_checkpoint_key(&self, key: &str) -> bool {

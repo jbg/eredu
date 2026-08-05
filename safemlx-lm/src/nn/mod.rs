@@ -16,6 +16,8 @@ pub mod layers;
 pub mod linear;
 /// Mixture-of-experts routing and packed expert implementations.
 pub mod moe;
+/// Parallel-aware projections, embeddings, attention projections, and MLPs.
+pub mod parallel;
 /// Rotary position-embedding variants and initialization.
 pub mod rope;
 /// Shared tensor and attention-mask helpers.

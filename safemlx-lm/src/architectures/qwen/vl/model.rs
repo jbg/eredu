@@ -432,8 +432,26 @@ impl Model {
             layer_layout: prompt_cache_layer_layout(args)
                 .map_err(|error| Exception::custom(error.to_string()))?,
         };
+        Self::load_prompt_cache_with_identity(
+            args,
+            directory,
+            expected,
+            prefix_token_ids,
+            &identity,
+            stream,
+        )
+    }
+
+    pub(crate) fn load_prompt_cache_with_identity(
+        args: &ModelArgs,
+        directory: impl AsRef<Path>,
+        expected: &PromptCacheDescriptor,
+        prefix_token_ids: &[u32],
+        identity: &PromptCacheModelIdentity,
+        stream: &Stream,
+    ) -> Result<(Cache, PromptCacheManifest), Exception> {
         let (blocks, state, manifest) =
-            open_prompt_cache_snapshot(directory, expected, &identity, prefix_token_ids, stream)
+            open_prompt_cache_snapshot(directory, expected, identity, prefix_token_ids, stream)
                 .map_err(|error| Exception::custom(error.to_string()))?;
         let mut blocks = blocks
             .into_iter()

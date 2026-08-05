@@ -3243,7 +3243,7 @@ pub struct PromptCacheDescriptor {
 
 /// Cache-relevant structure derived from a loaded model instance.
 #[derive(Debug, Clone, Eq, Hash, PartialEq)]
-pub(crate) struct PromptCacheModelIdentity {
+pub struct PromptCacheModelIdentity {
     pub(crate) model_family: String,
     pub(crate) effective_model_type: String,
     pub(crate) architecture_fingerprint: String,
@@ -3381,6 +3381,35 @@ impl Default for PromptCacheTopology {
             expert_parallel: None,
             expert_parallel_cache_replicated: true,
         }
+    }
+}
+
+impl PromptCacheTopology {
+    pub(crate) fn for_parallel_topology(
+        topology: crate::runtime::distributed::topology::ParallelTopology,
+    ) -> Self {
+        Self {
+            pipeline: (topology.pipeline_parallel_size > 1).then_some((
+                topology.pipeline_parallel_size,
+                topology.pipeline_parallel_rank,
+            )),
+            tensor_parallel: (topology.tensor_parallel_size > 1)
+                .then_some((topology.tensor_parallel_size, topology.tensor_parallel_rank)),
+            expert_parallel: (topology.expert_parallel_size > 1)
+                .then_some((topology.expert_parallel_size, topology.expert_parallel_rank)),
+            expert_parallel_cache_replicated: true,
+        }
+    }
+
+    pub(crate) fn cache_rank_identity(&self) -> Option<CacheRankIdentity> {
+        (self.pipeline.is_some()
+            || self.tensor_parallel.is_some()
+            || self.expert_parallel.is_some())
+        .then(|| CacheRankIdentity {
+            pipeline_rank: self.pipeline.map(|(_, rank)| rank),
+            tensor_parallel_rank: self.tensor_parallel.map(|(_, rank)| rank),
+            expert_parallel_rank: self.expert_parallel.map(|(_, rank)| rank),
+        })
     }
 }
 
@@ -5807,6 +5836,35 @@ mod tests {
     fn prefix_hash_is_stable_and_order_sensitive() {
         assert_eq!(hash_token_ids(&[1, 2, 3]), hash_token_ids(&[1, 2, 3]));
         assert_ne!(hash_token_ids(&[1, 2, 3]), hash_token_ids(&[3, 2, 1]));
+    }
+
+    #[test]
+    fn prompt_cache_topology_preserves_parallel_coordinates_and_rank_identity() {
+        use crate::runtime::distributed::topology::{DeviceAssignment, ParallelTopology};
+
+        let topology =
+            ParallelTopology::from_rank(8, 5, 2, 2, 2, DeviceAssignment::new(DeviceType::Cpu, 0))
+                .unwrap();
+        let cache_topology = PromptCacheTopology::for_parallel_topology(topology);
+
+        assert_eq!(cache_topology.pipeline, Some((2, 1)));
+        assert_eq!(cache_topology.tensor_parallel, Some((2, 0)));
+        assert_eq!(cache_topology.expert_parallel, Some((2, 1)));
+        assert_eq!(
+            cache_topology.cache_rank_identity(),
+            Some(CacheRankIdentity {
+                pipeline_rank: Some(1),
+                tensor_parallel_rank: Some(0),
+                expert_parallel_rank: Some(1),
+            })
+        );
+
+        let replicated =
+            ParallelTopology::from_rank(1, 0, 1, 1, 1, DeviceAssignment::new(DeviceType::Cpu, 0))
+                .unwrap();
+        let replicated = PromptCacheTopology::for_parallel_topology(replicated);
+        assert_eq!(replicated, PromptCacheTopology::default());
+        assert_eq!(replicated.cache_rank_identity(), None);
     }
 
     #[test]

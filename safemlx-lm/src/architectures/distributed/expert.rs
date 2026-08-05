@@ -1241,7 +1241,7 @@ impl ExpertParallelModel {
                     ExpertParallelCache::DenseQwenSliding(cache),
                 ) => {
                     let args = model.args().clone();
-                    model.forward_with_expert_executor(
+                    model.forward_with_sliding_expert_executor(
                         tokens,
                         mask,
                         cache,
@@ -1276,7 +1276,7 @@ impl ExpertParallelModel {
                     ExpertParallelCache::DenseQwenPaged(cache),
                 ) => {
                     let args = model.args().clone();
-                    model.forward_with_expert_executor(
+                    model.forward_with_paged_expert_executor(
                         tokens,
                         mask,
                         cache,

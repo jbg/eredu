@@ -32,18 +32,31 @@ use crate::{
     },
     architectures::qwen::dense::{Decoder, Experts as QwenExperts, TransformerBlock},
     error::Error,
-    nn::tensor::{create_attention_mask, AttentionMask},
-    runtime::cache::KeyValueCache,
+    nn::{
+        parallel::{
+            vocab_embedding_parameter_group, vocab_lm_head_parameter_group, VocabParallelEmbedding,
+            VocabParallelLmHead,
+        },
+        tensor::{create_attention_mask, AttentionMask},
+    },
+    runtime::cache::{
+        residency::{
+            PagedCacheOptions, PromptCacheDescriptor, PromptCacheManifest,
+            PromptCacheModelIdentity, PromptCacheOptions, PromptCacheTopology,
+        },
+        KeyValueCache,
+    },
     runtime::checkpoint::binding::{
         build_module_bindings, build_module_bindings_with_recipes, populate_module_from_lease,
         populate_module_from_lease_excluding,
     },
     runtime::checkpoint::recipe::DerivedWeightRecipe,
     runtime::checkpoint::store::{GgufWeightStore, TensorSelection, WeightStore},
+    runtime::distributed::parallel::exact_parallel_division,
     runtime::execution::layerwise::{
-        load_general_layerwise_model, load_general_layerwise_model_with_store,
-        GeneralLayerwiseModel, GeneralLayerwiseModelAdapter, LayerExecutionLoadOptions,
-        LayerwiseForwardState, StaticUnitBindings, WeightResidency,
+        load_layerwise_model, load_layerwise_model_with_store,
+        load_tensor_parallel_layerwise_model, ArchitectureAdapter, LayerExecutionLoadOptions,
+        LayerwiseForwardState, LayerwiseModel, StaticUnitBindings, WeightResidency,
     },
     runtime::residency::expert_cache::{
         ExpertCache, ExpertCacheLoadOptions, ExpertCacheReport, ExpertPass,
@@ -58,7 +71,7 @@ const HEAD_UNIT: &str = "qwen3_vl.static.output";
 
 /// Dense or MoE Qwen3-VL with independent vision and text residency windows.
 pub struct Qwen3VlLayerwiseModel {
-    execution: GeneralLayerwiseModel<Qwen3VlLayerwiseAdapter>,
+    execution: LayerwiseModel<Qwen3VlLayerwiseAdapter>,
 }
 
 impl Qwen3VlLayerwiseModel {
@@ -90,6 +103,51 @@ impl Qwen3VlLayerwiseModel {
     /// Creates empty KV and multimodal position state.
     pub fn new_cache(&self) -> Cache {
         Cache::default()
+    }
+
+    /// Returns rank-local generalized parallel information when applicable.
+    pub fn parallel_info(&self) -> Option<&crate::ParallelModelInfo> {
+        self.execution.parallel_info()
+    }
+
+    /// Returns this rank's exact prompt-cache state layout.
+    pub fn prompt_cache_layer_layout(
+        &self,
+    ) -> Result<crate::LayerSchedule<crate::LayerCachePolicy>, Error> {
+        self.execution.prompt_cache_layer_layout()
+    }
+
+    /// Persists a compatible multimodal prefix cache.
+    pub fn save_prompt_cache(
+        &self,
+        cache: &mut Cache,
+        destination: impl AsRef<Path>,
+        descriptor: PromptCacheDescriptor,
+        prefix_token_ids: &[u32],
+        options: &PromptCacheOptions,
+        stream: &Stream,
+    ) -> Result<PromptCacheManifest, Error> {
+        self.execution.save_prompt_cache(
+            cache,
+            destination,
+            descriptor,
+            prefix_token_ids,
+            options,
+            stream,
+        )
+    }
+
+    /// Restores a compatible multimodal prefix cache.
+    pub fn load_prompt_cache(
+        &self,
+        directory: impl AsRef<Path>,
+        expected: &PromptCacheDescriptor,
+        prefix_token_ids: &[u32],
+        options: PagedCacheOptions,
+        stream: &Stream,
+    ) -> Result<(Cache, PromptCacheManifest), Error> {
+        self.execution
+            .load_prompt_cache(directory, expected, prefix_token_ids, options, stream)
     }
 
     /// Returns current logical residency and transfer telemetry.
@@ -133,6 +191,30 @@ impl Qwen3VlLayerwiseModel {
     ) -> Result<Array, Error> {
         self.execution
             .forward(Qwen3VlInput::Decode(tokens), cache, stream)
+    }
+
+    /// Runs a multimodal prefill through rank-local vision execution units.
+    pub fn prefill_tensor_parallel(
+        &mut self,
+        input: input::ModelInput<'_>,
+        cache: &mut Cache,
+        group: &safemlx::distributed::Group,
+        stream: &Stream,
+    ) -> Result<Array, Error> {
+        self.execution
+            .forward_tensor_parallel(Qwen3VlInput::Prefill(input), cache, group, stream)
+    }
+
+    /// Runs text decode on a TP-loaded multimodal model.
+    pub fn decode_tensor_parallel(
+        &mut self,
+        tokens: &Array,
+        cache: &mut Cache,
+        group: &safemlx::distributed::Group,
+        stream: &Stream,
+    ) -> Result<Array, Error> {
+        self.execution
+            .forward_tensor_parallel(Qwen3VlInput::Decode(tokens), cache, group, stream)
     }
 
     /// Runs streamed text layers while delegating routed experts to a caller.
@@ -259,10 +341,46 @@ pub fn load_qwen3_vl_layerwise_model(
     )?;
     let adapter = Qwen3VlLayerwiseAdapter::new(args, stream)?;
     Ok(Qwen3VlLayerwiseModel {
-        execution: load_general_layerwise_model(
+        execution: load_layerwise_model(model_dir, adapter, options, stream, weights_stream)?,
+    })
+}
+
+/// Loads Qwen3-VL with rank-local vision execution groups.
+pub fn load_qwen3_vl_tensor_parallel_layerwise_model(
+    model_dir: impl AsRef<Path>,
+    options: impl Into<LayerExecutionLoadOptions>,
+    build: crate::runtime::distributed::parallel::ParallelBuildContext,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<Qwen3VlLayerwiseModel, Error> {
+    let model_dir = model_dir.as_ref();
+    let args = resident::get_qwen3_vl_model_args(model_dir)?;
+    let options = options.into();
+    let residency = match options {
+        LayerExecutionLoadOptions::LayerwiseHost(options) => {
+            WeightResidency::LayerwiseHost(options)
+        }
+        LayerExecutionLoadOptions::DenseDiskStream(options) => {
+            WeightResidency::DenseDiskStream(options)
+        }
+    };
+    let kind = if args.text_config.is_moe() {
+        crate::api::ModelKind::Qwen3VlMoe
+    } else {
+        crate::api::ModelKind::Qwen3Vl
+    };
+    crate::api::structural::validate_safetensors_load_path(
+        kind,
+        model_dir,
+        crate::api::ModelLoadOptions::default().with_weight_residency(residency),
+    )?;
+    let adapter = Qwen3VlLayerwiseAdapter::new(args, stream)?;
+    Ok(Qwen3VlLayerwiseModel {
+        execution: load_tensor_parallel_layerwise_model(
             model_dir,
             adapter,
             options,
+            build,
             stream,
             weights_stream,
         )?,
@@ -302,20 +420,12 @@ pub(crate) fn load_qwen3_vl_gguf_layerwise_model(
     );
     let adapter = Qwen3VlLayerwiseAdapter::new(prepared.args, stream)?;
     let execution = match residency {
-        WeightResidency::LayerwiseHost(options) => load_general_layerwise_model_with_store(
-            store,
-            adapter,
-            options,
-            stream,
-            weights_stream,
-        )?,
-        WeightResidency::DenseDiskStream(options) => load_general_layerwise_model_with_store(
-            store,
-            adapter,
-            options,
-            stream,
-            weights_stream,
-        )?,
+        WeightResidency::LayerwiseHost(options) => {
+            load_layerwise_model_with_store(store, adapter, options, stream, weights_stream)?
+        }
+        WeightResidency::DenseDiskStream(options) => {
+            load_layerwise_model_with_store(store, adapter, options, stream, weights_stream)?
+        }
         WeightResidency::SparseExpertCache(_)
         | WeightResidency::SparseExpertCacheWithDenseLayers(_) => {
             return Err(Error::UnsupportedArchitecture(
@@ -387,7 +497,7 @@ fn load_qwen3_vl_sparse_expert_cache_model_with_non_expert(
     let mut adapter = Qwen3VlLayerwiseAdapter::new(args.clone(), stream)?;
     adapter.sparse_expert_cache = true;
     let mut execution =
-        load_general_layerwise_model(model_dir, adapter, non_expert, stream, weights_stream)?;
+        load_layerwise_model(model_dir, adapter, non_expert, stream, weights_stream)?;
     let store = execution.weight_store_arc();
     let entries = crate::architectures::qwen::dense::layerwise::qwen3_expert_catalog_at(
         &args.text_config,
@@ -419,13 +529,8 @@ pub(crate) fn load_qwen3_vl_sparse_ep_base_with_store(
     }
     let mut adapter = Qwen3VlLayerwiseAdapter::new(args, stream)?;
     adapter.sparse_expert_cache = true;
-    let execution = load_general_layerwise_model_with_store(
-        store,
-        adapter,
-        non_expert,
-        stream,
-        weights_stream,
-    )?;
+    let execution =
+        load_layerwise_model_with_store(store, adapter, non_expert, stream, weights_stream)?;
     Ok(Qwen3VlLayerwiseModel { execution })
 }
 
@@ -525,8 +630,10 @@ pub struct Qwen3VlLayerwiseAdapter {
     args: ModelArgs,
     vision: QwenVisionLayerwiseStatic,
     embedding: MaybeQuantized<nn::Embedding>,
+    parallel_embedding: Option<VocabParallelEmbedding>,
     norm: nn::RmsNorm,
     lm_head: Option<MaybeQuantized<nn::Linear>>,
+    parallel_lm_head: Option<VocabParallelLmHead>,
     sparse_expert_cache: bool,
     expert_cache: Option<ExpertCache>,
 }
@@ -553,8 +660,10 @@ impl Qwen3VlLayerwiseAdapter {
             args,
             vision: QwenVisionLayerwiseStatic::from_transformer(visual),
             embedding: text.embed_tokens,
+            parallel_embedding: None,
             norm: text.norm,
             lm_head,
+            parallel_lm_head: None,
             sparse_expert_cache: false,
             expert_cache: None,
         })
@@ -569,6 +678,7 @@ impl Qwen3VlLayerwiseAdapter {
         &mut self,
         typed: input::ModelInput<'_>,
         cache: &mut Cache,
+        execution: Option<&crate::runtime::distributed::parallel::ParallelExecutionContext<'_>>,
         stream: &Stream,
     ) -> Result<LayerwiseForwardState<Qwen3VlForwardContext>, Error> {
         input::validate(typed)?;
@@ -581,8 +691,13 @@ impl Qwen3VlLayerwiseAdapter {
             match (part.modality, part.payload) {
                 (input::Modality::Text, input::InputPayload::TokenIds(tokens)) => {
                     token_parts.push(tokens.clone());
-                    prepared_parts
-                        .push(PreparedPart::Text(self.embedding.forward(tokens, stream)?));
+                    let embedding = match (&mut self.parallel_embedding, execution) {
+                        (Some(embedding), Some(execution)) => {
+                            embedding.forward(tokens, execution)?
+                        }
+                        _ => self.embedding.forward(tokens, stream)?,
+                    };
+                    prepared_parts.push(PreparedPart::Text(embedding));
                 }
                 (
                     input::Modality::Image | input::Modality::Video,
@@ -666,9 +781,13 @@ impl Qwen3VlLayerwiseAdapter {
         &mut self,
         tokens: &Array,
         cache: &mut Cache,
+        execution: Option<&crate::runtime::distributed::parallel::ParallelExecutionContext<'_>>,
         stream: &Stream,
     ) -> Result<LayerwiseForwardState<Qwen3VlForwardContext>, Error> {
-        let hidden = self.embedding.forward(tokens, stream)?;
+        let hidden = match (&mut self.parallel_embedding, execution) {
+            (Some(embedding), Some(execution)) => embedding.forward(tokens, execution)?,
+            _ => self.embedding.forward(tokens, stream)?,
+        };
         let start = cache
             .kv
             .first()
@@ -703,11 +822,93 @@ impl Qwen3VlLayerwiseAdapter {
     }
 }
 
-impl GeneralLayerwiseModelAdapter for Qwen3VlLayerwiseAdapter {
+impl ArchitectureAdapter for Qwen3VlLayerwiseAdapter {
     type Input<'a> = Qwen3VlInput<'a>;
     type Cache = Cache;
     type Layer = Qwen3VlLayer;
     type ForwardContext = Qwen3VlForwardContext;
+
+    fn model_type(&self) -> &str {
+        if self.args.text_config.model_type == "qwen3_vl_moe_text" {
+            "qwen3_vl_moe"
+        } else {
+            "qwen3_vl"
+        }
+    }
+
+    fn prompt_cache_model_identity(
+        &self,
+        topology: Option<crate::ParallelTopology>,
+    ) -> Result<PromptCacheModelIdentity, Error> {
+        let mut local = self.args.clone();
+        if let Some(topology) = topology {
+            local.text_config.num_attention_heads = exact_parallel_division(
+                "Qwen3-VL prompt-cache attention heads",
+                local.text_config.num_attention_heads,
+                topology.tensor_parallel_size,
+            )?;
+            local.text_config.num_key_value_heads = exact_parallel_division(
+                "Qwen3-VL prompt-cache KV heads",
+                local.text_config.num_key_value_heads,
+                topology.tensor_parallel_size,
+            )?;
+        }
+        let layer_count = self.args.text_config.num_hidden_layers as usize;
+        Ok(PromptCacheModelIdentity {
+            model_family: "qwen3_vl".into(),
+            effective_model_type: self.model_type().into(),
+            architecture_fingerprint: resident::prompt_cache_architecture_fingerprint(&self.args),
+            layer_count,
+            global_layer_start: 0,
+            global_layer_end: layer_count,
+            sink_tokens: 0,
+            topology: topology.map_or_else(
+                PromptCacheTopology::default,
+                PromptCacheTopology::for_parallel_topology,
+            ),
+            layer_layout: resident::prompt_cache_layer_layout(&local)?,
+        })
+    }
+
+    fn save_prompt_cache(
+        &self,
+        cache: &mut Self::Cache,
+        destination: &Path,
+        descriptor: PromptCacheDescriptor,
+        prefix_token_ids: &[u32],
+        options: &PromptCacheOptions,
+        stream: &Stream,
+    ) -> Result<PromptCacheManifest, Error> {
+        resident::Model::save_prompt_cache(
+            cache,
+            destination,
+            descriptor,
+            prefix_token_ids,
+            options,
+            stream,
+        )
+        .map_err(Into::into)
+    }
+
+    fn load_prompt_cache(
+        &self,
+        directory: &Path,
+        expected: &PromptCacheDescriptor,
+        identity: &PromptCacheModelIdentity,
+        prefix_token_ids: &[u32],
+        _options: PagedCacheOptions,
+        stream: &Stream,
+    ) -> Result<(Self::Cache, PromptCacheManifest), Error> {
+        resident::Model::load_prompt_cache_with_identity(
+            &self.args,
+            directory,
+            expected,
+            prefix_token_ids,
+            identity,
+            stream,
+        )
+        .map_err(Into::into)
+    }
 
     fn static_units(&self, store: &dyn WeightStore) -> Result<Vec<StaticUnitBindings>, Error> {
         let patch = "model.visual.patch_embed.proj.weight";
@@ -762,9 +963,15 @@ impl GeneralLayerwiseModelAdapter for Qwen3VlLayerwiseAdapter {
             )));
         }
         populate_module_from_lease(&mut self.vision, &leases[0])?;
-        populate_module_from_lease(&mut self.embedding, &leases[1])?;
+        if let Some(embedding) = &mut self.parallel_embedding {
+            populate_module_from_lease(embedding.inner_mut(), &leases[1])?;
+        } else {
+            populate_module_from_lease(&mut self.embedding, &leases[1])?;
+        }
         populate_module_from_lease(&mut self.norm, &leases[2])?;
-        if let Some(head) = &mut self.lm_head {
+        if let Some(head) = &mut self.parallel_lm_head {
+            populate_module_from_lease(head.inner_mut(), &leases[3])?;
+        } else if let Some(head) = &mut self.lm_head {
             populate_module_from_lease(head, &leases[3])?;
         }
         Ok(())
@@ -793,8 +1000,24 @@ impl GeneralLayerwiseModelAdapter for Qwen3VlLayerwiseAdapter {
         stream: &Stream,
     ) -> Result<LayerwiseForwardState<Self::ForwardContext>, Error> {
         match input {
-            Qwen3VlInput::Prefill(input) => self.prepare_prefill(input, cache, stream),
-            Qwen3VlInput::Decode(tokens) => self.prepare_decode(tokens, cache, stream),
+            Qwen3VlInput::Prefill(input) => self.prepare_prefill(input, cache, None, stream),
+            Qwen3VlInput::Decode(tokens) => self.prepare_decode(tokens, cache, None, stream),
+        }
+    }
+
+    fn begin_forward_with_execution<'a>(
+        &mut self,
+        input: Self::Input<'a>,
+        cache: &mut Self::Cache,
+        execution: &crate::runtime::distributed::parallel::ParallelExecutionContext<'_>,
+    ) -> Result<LayerwiseForwardState<Self::ForwardContext>, Error> {
+        match input {
+            Qwen3VlInput::Prefill(input) => {
+                self.prepare_prefill(input, cache, Some(execution), execution.stream())
+            }
+            Qwen3VlInput::Decode(tokens) => {
+                self.prepare_decode(tokens, cache, Some(execution), execution.stream())
+            }
         }
     }
 
@@ -839,6 +1062,289 @@ impl GeneralLayerwiseModelAdapter for Qwen3VlLayerwiseAdapter {
                 "Qwen3-VL has no execution group {group}"
             ))),
         }
+    }
+
+    fn parallel_parameter_groups(
+        &self,
+        _context: crate::runtime::distributed::parallel::ParallelBuildContext,
+    ) -> Result<Vec<crate::runtime::distributed::parallel::ParameterGroupSpec>, Error> {
+        use crate::runtime::distributed::parallel::{
+            MemberSharding, ParameterGroupSpec, ParameterMemberSpec, ParameterRole,
+        };
+        let config = &self.args.vision_config;
+        let hidden = config.hidden_size as usize;
+        let intermediate = config.intermediate_size as usize;
+        let mut groups = vec![vocab_embedding_parameter_group(
+            &self.embedding,
+            "model.language_model.embed_tokens",
+            self.args.text_config.vocab_size as usize,
+            self.args.text_config.hidden_size,
+            false,
+        )?];
+        if let Some(head) = &self.lm_head {
+            groups.push(vocab_lm_head_parameter_group(
+                head,
+                "lm_head",
+                self.args.text_config.hidden_size,
+                self.args.text_config.vocab_size as usize,
+                false,
+            )?);
+        }
+        for index in 0..config.layer_count() {
+            let prefix = format!("model.visual.blocks.{index}");
+            groups.push(ParameterGroupSpec::new(
+                format!("{prefix}.attention.qkv"),
+                ParameterRole::Segmented,
+                [
+                    ParameterMemberSpec::new(
+                        format!("{prefix}.attn.qkv.weight"),
+                        [3 * hidden, hidden],
+                        MemberSharding::Segmented {
+                            axis: 0,
+                            segments: vec![0..hidden, hidden..2 * hidden, 2 * hidden..3 * hidden],
+                        },
+                    ),
+                    ParameterMemberSpec::new(
+                        format!("{prefix}.attn.qkv.bias"),
+                        [3 * hidden],
+                        MemberSharding::Segmented {
+                            axis: 0,
+                            segments: vec![0..hidden, hidden..2 * hidden, 2 * hidden..3 * hidden],
+                        },
+                    ),
+                ],
+            )?);
+            groups.push(ParameterGroupSpec::new(
+                format!("{prefix}.attention.output"),
+                ParameterRole::RowProjection,
+                [
+                    ParameterMemberSpec::new(
+                        format!("{prefix}.attn.proj.weight"),
+                        [hidden, hidden],
+                        MemberSharding::Equal { axis: 1 },
+                    ),
+                    ParameterMemberSpec::new(
+                        format!("{prefix}.attn.proj.bias"),
+                        [hidden],
+                        MemberSharding::Replicated,
+                    ),
+                ],
+            )?);
+            groups.push(ParameterGroupSpec::new(
+                format!("{prefix}.mlp.input"),
+                ParameterRole::ColumnProjection,
+                [
+                    ParameterMemberSpec::new(
+                        format!("{prefix}.mlp.linear_fc1.weight"),
+                        [intermediate, hidden],
+                        MemberSharding::Equal { axis: 0 },
+                    ),
+                    ParameterMemberSpec::new(
+                        format!("{prefix}.mlp.linear_fc1.bias"),
+                        [intermediate],
+                        MemberSharding::Equal { axis: 0 },
+                    ),
+                ],
+            )?);
+            groups.push(ParameterGroupSpec::new(
+                format!("{prefix}.mlp.output"),
+                ParameterRole::RowProjection,
+                [
+                    ParameterMemberSpec::new(
+                        format!("{prefix}.mlp.linear_fc2.weight"),
+                        [hidden, intermediate],
+                        MemberSharding::Equal { axis: 1 },
+                    ),
+                    ParameterMemberSpec::new(
+                        format!("{prefix}.mlp.linear_fc2.bias"),
+                        [hidden],
+                        MemberSharding::Replicated,
+                    ),
+                ],
+            )?);
+        }
+        let merger_hidden =
+            (config.hidden_size * config.spatial_merge_size * config.spatial_merge_size) as usize;
+        let mut register_merger = |prefix: String| -> Result<(), Error> {
+            groups.push(ParameterGroupSpec::new(
+                format!("{prefix}.input"),
+                ParameterRole::ColumnProjection,
+                [
+                    ParameterMemberSpec::new(
+                        format!("{prefix}.linear_fc1.weight"),
+                        [merger_hidden, merger_hidden],
+                        MemberSharding::Equal { axis: 0 },
+                    ),
+                    ParameterMemberSpec::new(
+                        format!("{prefix}.linear_fc1.bias"),
+                        [merger_hidden],
+                        MemberSharding::Equal { axis: 0 },
+                    ),
+                ],
+            )?);
+            groups.push(ParameterGroupSpec::new(
+                format!("{prefix}.output"),
+                ParameterRole::RowProjection,
+                [
+                    ParameterMemberSpec::new(
+                        format!("{prefix}.linear_fc2.weight"),
+                        [config.out_hidden_size as usize, merger_hidden],
+                        MemberSharding::Equal { axis: 1 },
+                    ),
+                    ParameterMemberSpec::new(
+                        format!("{prefix}.linear_fc2.bias"),
+                        [config.out_hidden_size as usize],
+                        MemberSharding::Replicated,
+                    ),
+                ],
+            )?);
+            Ok(())
+        };
+        register_merger("model.visual.merger".into())?;
+        for index in 0..config.deepstack_layer_count() {
+            register_merger(format!("model.visual.deepstack_merger_list.{index}"))?;
+        }
+        Ok(groups)
+    }
+
+    fn configure_parallel_static(
+        &mut self,
+        context: crate::runtime::distributed::parallel::ParallelBuildContext,
+        _layout: &crate::runtime::distributed::parallel::LocalModelLayout,
+        stream: &Stream,
+    ) -> Result<(), Error> {
+        let config = &self.args.text_config;
+        self.parallel_embedding = Some(VocabParallelEmbedding::unloaded(
+            config.vocab_size as usize,
+            config.hidden_size,
+            config.quantization.or(config.quantization_config),
+            context,
+            stream,
+        )?);
+        if self.lm_head.is_some() {
+            self.parallel_lm_head = Some(VocabParallelLmHead::unloaded(
+                config.hidden_size,
+                config.vocab_size as usize,
+                config.quantization.or(config.quantization_config),
+                context,
+                stream,
+            )?);
+        }
+        let vision = &self.args.vision_config;
+        let merger_target = "model.visual.merger.linear_fc1.weight";
+        let local_hidden = i32::try_from(
+            _layout
+                .tensor(merger_target)
+                .ok_or_else(|| Error::Parallel(format!("missing TP layout for {merger_target}")))?
+                .local_shape()[0],
+        )
+        .map_err(|_| Error::Parallel("Qwen merger local width exceeds i32".into()))?;
+        self.vision.merger = crate::api::qwen_vl::QwenVisionPatchMerger::new_tensor_parallel(
+            vision,
+            false,
+            false,
+            local_hidden,
+            stream,
+        )?;
+        for (index, merger) in self.vision.deepstack_merger_list.iter_mut().enumerate() {
+            let target = format!("model.visual.deepstack_merger_list.{index}.linear_fc1.weight");
+            let local_hidden = i32::try_from(
+                _layout
+                    .tensor(&target)
+                    .ok_or_else(|| Error::Parallel(format!("missing TP layout for {target}")))?
+                    .local_shape()[0],
+            )
+            .map_err(|_| Error::Parallel("Qwen DeepStack local width exceeds i32".into()))?;
+            *merger = crate::api::qwen_vl::QwenVisionPatchMerger::new_tensor_parallel(
+                vision,
+                true,
+                false,
+                local_hidden,
+                stream,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn register_parallel_parameters(
+        &self,
+        context: crate::runtime::distributed::parallel::ParallelBuildContext,
+        planner: &mut crate::runtime::distributed::parallel::ParallelPlanBuilder,
+        stream: &Stream,
+    ) -> Result<(), Error> {
+        for group in self.parallel_parameter_groups(context)? {
+            planner.register(group)?;
+        }
+        for index in 0..self.args.text_config.num_hidden_layers as usize {
+            let layer =
+                TransformerBlock::new_for_layer(&self.args.text_config, index as i32, stream)?;
+            crate::architectures::distributed::tensor::insert_qwen_layer_plan_with_prefix(
+                planner,
+                &layer,
+                &format!("model.language_model.layers.{index}"),
+            )?;
+        }
+        Ok(())
+    }
+
+    fn new_parallel_layer(
+        &self,
+        group: usize,
+        index: usize,
+        layout: &crate::runtime::distributed::parallel::LocalModelLayout,
+        stream: &Stream,
+    ) -> Result<Self::Layer, Error> {
+        if group != 0 {
+            let prefix = format!("model.language_model.layers.{index}");
+            let planned = |name: &str| {
+                layout
+                    .tensor(&format!("{prefix}.{name}.weight"))
+                    .or_else(|| layout.tensor(&format!("{prefix}.{name}.inner.weight")))
+            };
+            let mut config = self.args.text_config.clone();
+            let query = planned("self_attn.q_proj")
+                .ok_or_else(|| Error::Parallel(format!("missing TP query for {prefix}")))?;
+            let key = planned("self_attn.k_proj")
+                .ok_or_else(|| Error::Parallel(format!("missing TP key for {prefix}")))?;
+            config.num_attention_heads = i32::try_from(query.local_shape()[0])
+                .map_err(|_| Error::Parallel("Qwen local query width exceeds i32".into()))?
+                / config.head_dim;
+            config.num_key_value_heads = i32::try_from(key.local_shape()[0])
+                .map_err(|_| Error::Parallel("Qwen local key width exceeds i32".into()))?
+                / config.head_dim;
+            if config.is_moe() {
+                let experts = layout
+                    .tensor(&format!("{prefix}.mlp.experts.gate_up_proj"))
+                    .ok_or_else(|| Error::Parallel(format!("missing TP experts for {prefix}")))?;
+                config.moe_intermediate_size = i32::try_from(experts.local_shape()[1] / 2)
+                    .map_err(|_| Error::Parallel("Qwen local expert width exceeds i32".into()))?;
+            } else {
+                let gate = planned("mlp.gate_proj")
+                    .ok_or_else(|| Error::Parallel(format!("missing TP MLP for {prefix}")))?;
+                config.intermediate_size = i32::try_from(gate.local_shape()[0])
+                    .map_err(|_| Error::Parallel("Qwen local MLP width exceeds i32".into()))?;
+            }
+            return Ok(Qwen3VlLayer::Text(Box::new(
+                TransformerBlock::new_for_layer(&config, index as i32, stream)?,
+            )));
+        }
+        let config = &self.args.vision_config;
+        let prefix = format!("model.visual.blocks.{index}");
+        let qkv = layout
+            .tensor(&format!("{prefix}.attn.qkv.weight"))
+            .ok_or_else(|| Error::Parallel(format!("missing TP layout for {prefix} QKV")))?;
+        let fc1 = layout
+            .tensor(&format!("{prefix}.mlp.linear_fc1.weight"))
+            .ok_or_else(|| Error::Parallel(format!("missing TP layout for {prefix} MLP")))?;
+        let head_dim = config.hidden_size / config.num_heads;
+        let local_heads = i32::try_from(qkv.local_shape()[0] / 3)
+            .map_err(|_| Error::Parallel("Qwen vision local head width exceeds i32".into()))?
+            / head_dim;
+        let local_intermediate = i32::try_from(fc1.local_shape()[0])
+            .map_err(|_| Error::Parallel("Qwen vision local MLP width exceeds i32".into()))?;
+        Ok(Qwen3VlLayer::Vision(Box::new(
+            QwenVisionBlock::new_tensor_parallel(config, local_heads, local_intermediate, stream)?,
+        )))
     }
 
     fn layer_checkpoint_prefix(&self, group: usize, index: usize) -> String {
@@ -1075,6 +1581,73 @@ impl GeneralLayerwiseModelAdapter for Qwen3VlLayerwiseAdapter {
         }
     }
 
+    fn forward_layer_with_execution(
+        &mut self,
+        group: usize,
+        index: usize,
+        layer: &mut Self::Layer,
+        hidden: &Array,
+        cache: &mut Self::Cache,
+        context: &mut Self::ForwardContext,
+        execution: &crate::runtime::distributed::parallel::ParallelExecutionContext<'_>,
+    ) -> Result<Array, Error> {
+        let Some(tp_group) = execution.group() else {
+            return self.forward_layer(
+                group,
+                index,
+                layer,
+                hidden,
+                cache,
+                context,
+                execution.stream(),
+            );
+        };
+        if group == 0 {
+            if let Qwen3VlLayer::Vision(block) = layer {
+                let Some(state) = context.vision.as_mut() else {
+                    return Ok(hidden.clone());
+                };
+                let output = self.vision.forward_block_tensor_parallel(
+                    block,
+                    index,
+                    hidden.clone(),
+                    state,
+                    tp_group,
+                    execution.stream(),
+                )?;
+                self.vision.capture_deepstack_tensor_parallel(
+                    index,
+                    &output,
+                    state,
+                    tp_group,
+                    execution.stream(),
+                )?;
+                return Ok(output);
+            }
+        } else if let Qwen3VlLayer::Text(block) = layer {
+            return Ok(block.forward_with_rotary_embeddings_tensor_parallel(
+                AttentionInput {
+                    x: hidden,
+                    mask: context.mask.as_ref(),
+                    cache: cache.kv[index].as_mut(),
+                },
+                &context.cos,
+                &context.sin,
+                tp_group,
+                execution.stream(),
+            )?);
+        }
+        self.forward_layer(
+            group,
+            index,
+            layer,
+            hidden,
+            cache,
+            context,
+            execution.stream(),
+        )
+    }
+
     fn retained_arrays<'a>(
         &self,
         cache: &'a Self::Cache,
@@ -1167,6 +1740,71 @@ impl GeneralLayerwiseModelAdapter for Qwen3VlLayerwiseAdapter {
         Ok(hidden)
     }
 
+    fn finish_execution_group_with_execution(
+        &mut self,
+        group: usize,
+        hidden: &Array,
+        cache: &mut Self::Cache,
+        context: &mut Self::ForwardContext,
+        execution: &crate::runtime::distributed::parallel::ParallelExecutionContext<'_>,
+    ) -> Result<Array, Error> {
+        let Some(tp_group) = execution.group() else {
+            return self.finish_execution_group(group, hidden, cache, context, execution.stream());
+        };
+        if group != 0 {
+            return Ok(hidden.clone());
+        }
+        let stream = execution.stream();
+        let hidden = if let Some(mut state) = context.vision.take() {
+            let output = self
+                .vision
+                .finish_tensor_parallel(hidden, &mut state, tp_group, stream)?;
+            context.deepstack_features = output.deepstack_features;
+            let mut visual_offset = 0;
+            let mut assembled = Vec::with_capacity(context.parts.len());
+            for part in &context.parts {
+                match part {
+                    PreparedPart::Text(embedding) => assembled.push(embedding.clone()),
+                    PreparedPart::Visual(len) => {
+                        assembled.push(output.embeddings.try_index_device(
+                            (.., visual_offset..visual_offset + *len, ..),
+                            stream,
+                        )?);
+                        visual_offset += *len;
+                    }
+                }
+            }
+            concatenate_axis(&assembled.iter().collect::<Vec<_>>(), 1, stream)?
+        } else {
+            hidden.clone()
+        };
+        context.mask = match create_attention_mask(&hidden, &cache.kv, Some(true), stream)? {
+            Some(AttentionMask::Array(mask)) => Some(mask),
+            Some(AttentionMask::Causal) => {
+                return Err(Error::UnsupportedArchitecture(
+                    "Qwen3-VL layerwise execution requires an explicit causal mask".into(),
+                ));
+            }
+            None => None,
+        };
+        context.visual_mask = if context.deepstack_features.is_empty() {
+            None
+        } else {
+            Some(
+                context
+                    .tokens
+                    .eq(Array::from_int(self.args.image_token_id as i32), stream)?
+                    .logical_or(
+                        &context
+                            .tokens
+                            .eq(Array::from_int(self.args.video_token_id as i32), stream)?,
+                        stream,
+                    )?,
+            )
+        };
+        Ok(hidden)
+    }
+
     fn finish(
         &mut self,
         hidden: &Array,
@@ -1182,6 +1820,28 @@ impl GeneralLayerwiseModelAdapter for Qwen3VlLayerwiseAdapter {
             stream,
         )?)
     }
+
+    fn finish_with_execution(
+        &mut self,
+        hidden: &Array,
+        cache: &mut Self::Cache,
+        context: &Self::ForwardContext,
+        execution: &crate::runtime::distributed::parallel::ParallelExecutionContext<'_>,
+    ) -> Result<Array, Error> {
+        if self.parallel_embedding.is_none() {
+            return self.finish(hidden, cache, context, execution.stream());
+        }
+        let hidden = self.norm.forward(hidden, execution.stream())?;
+        let logits = if let Some(head) = &mut self.parallel_lm_head {
+            head.forward(&hidden, execution)?
+        } else {
+            self.parallel_embedding
+                .as_mut()
+                .expect("parallel embedding")
+                .project_logits(&hidden, execution)?
+        };
+        logits.all_gather(execution)
+    }
 }
 
 /// Qwen3-VL generation using shared vision/text bounded layer execution.
@@ -1193,6 +1853,7 @@ mod tests {
     use std::{fs, path::Path};
 
     use safemlx::{
+        distributed::{Backend, Group},
         module::ModuleParameters,
         ops::{ones_dtype, zeros_dtype},
         Array, Device, DeviceType, ExecutionContext, Stream,
@@ -1201,6 +1862,10 @@ mod tests {
     use super::*;
     use crate::{
         api::qwen3_vl as eager,
+        runtime::distributed::{
+            parallel::{ParallelBuildContext, ShardingPolicy},
+            topology::{DeviceAssignment, ParallelTopology},
+        },
         runtime::execution::layerwise::{LayerExecutionLoadOptions, LayerwiseLoadOptions},
         runtime::residency::dense_stream::DenseDiskStreamLoadOptions,
         runtime::residency::expert_cache::ExpertCacheLoadOptions,
@@ -1419,6 +2084,48 @@ mod tests {
             assert!(vision.peak_device_layers() > 0);
             assert!(text.peak_device_layers() > 0);
         }
+    }
+
+    #[test]
+    #[ignore = "requires an MLX runtime with a Metal device"]
+    fn tensor_parallel_dense_stream_loads_composed_static_and_execution_groups() {
+        let gpu = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
+        let cpu = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        let config_dir = tempfile::tempdir().unwrap();
+        fs::write(
+            config_dir.path().join("config.json"),
+            serde_json::to_vec(&config(false)).unwrap(),
+        )
+        .unwrap();
+        let args = eager::get_qwen3_vl_model_args(config_dir.path()).unwrap();
+        let mut fixture = eager::Model::new(args, gpu.stream()).unwrap();
+        initialize(&mut fixture, gpu.stream());
+        let dir = tempfile::tempdir().unwrap();
+        write_fixture(dir.path(), &fixture, false);
+
+        let group = Group::init(false, Backend::Any).unwrap();
+        assert_eq!(group.size(), 1);
+        let topology =
+            ParallelTopology::from_rank(1, 0, 1, 1, 1, DeviceAssignment::new(DeviceType::Gpu, 0))
+                .unwrap();
+        let build = ParallelBuildContext::new(topology, ShardingPolicy::Require);
+        let options = DenseDiskStreamLoadOptions::new(u64::MAX, u64::MAX, 1, 1, 1).unwrap();
+        let model = load_qwen3_vl_tensor_parallel_layerwise_model(
+            dir.path(),
+            LayerExecutionLoadOptions::DenseDiskStream(options),
+            build,
+            gpu.stream(),
+            cpu.stream(),
+        )
+        .unwrap();
+        let report = model.dense_stream_report().unwrap().unwrap();
+        assert!(report
+            .residency()
+            .units()
+            .iter()
+            .filter(|unit| unit.id().as_str().contains(".vision.")
+                || unit.id().as_str().contains(".text."))
+            .all(|unit| unit.planned_tier() == MemoryTier::Disk));
     }
 
     #[test]

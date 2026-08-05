@@ -5,7 +5,7 @@ use std::{collections::BTreeMap, path::Path};
 use safemlx::{
     error::Exception,
     module::ModuleParameters,
-    ops::{indexing::TryIndexOp, stack_axis},
+    ops::{indexing::TryIndexOp, stack_axis, zeros},
     random::RandomState,
     Array, Stream,
 };
@@ -27,8 +27,8 @@ use crate::{
     runtime::checkpoint::recipe::DerivedWeightRecipe,
     runtime::checkpoint::store::{TensorSelection, WeightStore},
     runtime::execution::layerwise::{
-        load_general_layerwise_model, GeneralLayerwiseModel, GeneralLayerwiseModelAdapter,
-        LayerwiseForwardState, StaticUnitBindings,
+        load_layerwise_model, load_tensor_parallel_layerwise_model, ArchitectureAdapter,
+        LayerwiseForwardState, LayerwiseModel, StaticUnitBindings,
     },
     runtime::generation::sampler::Sampler,
     runtime::residency::manager::{
@@ -46,7 +46,7 @@ enum CheckpointLayout {
 
 /// Moshi-family model with independent temporal and depth-codebook residency windows.
 pub struct MoshiLayerwiseModel {
-    execution: GeneralLayerwiseModel<MoshiLayerwiseAdapter>,
+    execution: LayerwiseModel<MoshiLayerwiseAdapter>,
 }
 
 impl MoshiLayerwiseModel {
@@ -125,6 +125,33 @@ impl MoshiLayerwiseModel {
         context.into_token_output()
     }
 
+    /// Runs one teacher-forced frame through rank-local temporal and depth groups.
+    pub fn token_step_tensor_parallel(
+        &mut self,
+        text_token: &Array,
+        audio_tokens: &Array,
+        depth_tokens: &Array,
+        cache: &mut MoshiCache,
+        group: &safemlx::distributed::Group,
+        stream: &Stream,
+    ) -> Result<TokenStepOutput, Exception> {
+        let (_, context) = self
+            .execution
+            .forward_tensor_parallel_with_context_hook(
+                MoshiLayerwiseInput::TeacherForced {
+                    text_token,
+                    audio_tokens,
+                    depth_tokens,
+                },
+                cache,
+                group,
+                stream,
+                |_, _, _| Ok(()),
+            )
+            .map_err(layerwise_exception)?;
+        context.into_token_output()
+    }
+
     /// Runs one frame with caller-provided text and audio samplers.
     #[allow(clippy::too_many_arguments)]
     pub fn sample_step<TS: Sampler, AS: Sampler>(
@@ -153,6 +180,94 @@ impl MoshiLayerwiseModel {
             prng_state,
             stream,
         )
+    }
+
+    /// Runs one autoregressive frame through rank-local temporal and depth groups.
+    #[allow(clippy::too_many_arguments)]
+    pub fn sample_step_tensor_parallel<TS: Sampler, AS: Sampler>(
+        &mut self,
+        text_token: &Array,
+        audio_tokens: &Array,
+        cache: &mut MoshiCache,
+        text_sampler: &mut TS,
+        audio_samplers: &mut [AS],
+        text_temperature: f32,
+        audio_temperature: f32,
+        mut prng_state: Option<&mut RandomState>,
+        group: &safemlx::distributed::Group,
+        stream: &Stream,
+    ) -> Result<SampleStepOutput, Exception> {
+        let depth_count = self.args().dep_q as usize;
+        let temporal_layers = self.args().num_layers as usize;
+        if audio_samplers.len() != depth_count {
+            return Err(Exception::custom(format!(
+                "Moshi requires one audio sampler per generated codebook (expected {depth_count}, got {})",
+                audio_samplers.len()
+            )));
+        }
+        let (_, context) = self
+            .execution
+            .forward_tensor_parallel_with_context_hook(
+                MoshiLayerwiseInput::Autoregressive {
+                    text_token,
+                    audio_tokens,
+                    forced_text_token: None,
+                    forced_audio_tokens: None,
+                    forced_audio_codebooks: None,
+                },
+                cache,
+                group,
+                stream,
+                |execution_group, index, context| {
+                    if execution_group == 0 && index + 1 == temporal_layers {
+                        let local = if group.rank() == 0 {
+                            text_sampler.sample(
+                                context
+                                    .text_logits
+                                    .as_ref()
+                                    .expect("last temporal layer logits"),
+                                text_temperature,
+                                prng_state.as_deref_mut(),
+                                stream,
+                            )?
+                        } else {
+                            zeros::<u32>(&[text_token.dim(0), 1], stream)?
+                        };
+                        let text = safemlx::distributed::all_sum(&local, group, stream)?;
+                        context.previous = Some(text.clone());
+                        context.sampled_text = Some(text);
+                    } else if execution_group == 1 {
+                        let local = if group.rank() == 0 {
+                            audio_samplers[index].sample(
+                                context.current_audio_logits.as_ref().expect("depth logits"),
+                                audio_temperature,
+                                prng_state.as_deref_mut(),
+                                stream,
+                            )?
+                        } else {
+                            zeros::<u32>(&[text_token.dim(0), 1], stream)?
+                        };
+                        let next = safemlx::distributed::all_sum(&local, group, stream)?;
+                        context
+                            .predicted_audio
+                            .push(next.squeeze_axes(&[-1], stream)?);
+                        context.previous = Some(next);
+                    }
+                    Ok(())
+                },
+            )
+            .map_err(layerwise_exception)?;
+        let text = context
+            .sampled_text
+            .as_ref()
+            .expect("autoregressive text token")
+            .clone();
+        let audio = stack_axis(&context.predicted_audio, 1, stream)?;
+        Ok(SampleStepOutput {
+            text_token: text,
+            audio_tokens: audio,
+            logits: context.into_token_output()?,
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -807,6 +922,40 @@ pub fn load_moshi_layerwise_model(
     )
 }
 
+/// Loads native Moshi with rank-local temporal and depth transformers.
+pub fn load_moshi_tensor_parallel_layerwise_model(
+    model_dir: impl AsRef<Path>,
+    options: impl Into<crate::runtime::execution::layerwise::LayerExecutionLoadOptions>,
+    build: crate::runtime::distributed::parallel::ParallelBuildContext,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<MoshiLayerwiseModel, Error> {
+    let model_dir = model_dir.as_ref();
+    let args = resident::get_model_args(model_dir)?;
+    let weights_name = args
+        .moshi_name
+        .clone()
+        .unwrap_or_else(|| "model.safetensors".to_string());
+    let source = if weights_name == "model.safetensors"
+        && model_dir.join("model.safetensors.index.json").exists()
+    {
+        model_dir.to_path_buf()
+    } else {
+        model_dir.join(weights_name)
+    };
+    let adapter = MoshiLayerwiseAdapter::new(args, CheckpointLayout::Native, stream)?;
+    Ok(MoshiLayerwiseModel {
+        execution: load_tensor_parallel_layerwise_model(
+            source,
+            adapter,
+            options,
+            build,
+            stream,
+            weights_stream,
+        )?,
+    })
+}
+
 /// Loads the released PersonaPlex PyTorch checkpoint through bounded layer residency.
 pub fn load_personaplex_layerwise_model(
     model_dir: impl AsRef<Path>,
@@ -833,6 +982,36 @@ pub fn load_personaplex_layerwise_model(
     )
 }
 
+/// Loads PersonaPlex with rank-local temporal and depth transformers.
+pub fn load_personaplex_tensor_parallel_layerwise_model(
+    model_dir: impl AsRef<Path>,
+    options: impl Into<crate::runtime::execution::layerwise::LayerExecutionLoadOptions>,
+    build: crate::runtime::distributed::parallel::ParallelBuildContext,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<MoshiLayerwiseModel, Error> {
+    let model_dir = model_dir.as_ref();
+    crate::api::structural::validate_safetensors_load_path(
+        crate::api::ModelKind::PersonaPlex,
+        model_dir,
+        crate::api::ModelLoadOptions::default(),
+    )?;
+    let metadata = crate::architectures::moshi::personaplex::get_model_metadata(model_dir)?;
+    let mut args = crate::architectures::moshi::personaplex::model_args_7b_v1();
+    args.quantization = metadata.quantization;
+    let adapter = MoshiLayerwiseAdapter::new(args, CheckpointLayout::Pytorch, stream)?;
+    Ok(MoshiLayerwiseModel {
+        execution: load_tensor_parallel_layerwise_model(
+            model_dir,
+            adapter,
+            options,
+            build,
+            stream,
+            weights_stream,
+        )?,
+    })
+}
+
 fn load_with_layout(
     source: impl AsRef<Path>,
     args: ModelArgs,
@@ -843,7 +1022,7 @@ fn load_with_layout(
 ) -> Result<MoshiLayerwiseModel, Error> {
     let adapter = MoshiLayerwiseAdapter::new(args, layout, stream)?;
     Ok(MoshiLayerwiseModel {
-        execution: load_general_layerwise_model(source, adapter, options, stream, weights_stream)?,
+        execution: load_layerwise_model(source, adapter, options, stream, weights_stream)?,
     })
 }
 
@@ -977,7 +1156,7 @@ impl MoshiLayerwiseAdapter {
     }
 }
 
-impl GeneralLayerwiseModelAdapter for MoshiLayerwiseAdapter {
+impl ArchitectureAdapter for MoshiLayerwiseAdapter {
     type Input<'a> = MoshiLayerwiseInput<'a>;
     type Cache = MoshiCache;
     type Layer = MoshiExecutionUnit;
@@ -1091,6 +1270,74 @@ impl GeneralLayerwiseModelAdapter for MoshiLayerwiseAdapter {
         })
     }
 
+    fn begin_forward_with_execution<'a>(
+        &mut self,
+        input: Self::Input<'a>,
+        cache: &mut Self::Cache,
+        execution: &crate::runtime::distributed::parallel::ParallelExecutionContext<'_>,
+    ) -> Result<LayerwiseForwardState<Self::ForwardContext>, Error> {
+        let Some(group) = execution.group() else {
+            return self.begin_forward(input, cache, execution.stream());
+        };
+        let (text, audio, depth, forced_text, forced_audio, forced_mask, autoregressive) =
+            match input {
+                MoshiLayerwiseInput::TeacherForced {
+                    text_token,
+                    audio_tokens,
+                    depth_tokens,
+                } => (
+                    text_token,
+                    audio_tokens,
+                    Some(depth_tokens.clone()),
+                    None,
+                    None,
+                    None,
+                    false,
+                ),
+                MoshiLayerwiseInput::Autoregressive {
+                    text_token,
+                    audio_tokens,
+                    forced_text_token,
+                    forced_audio_tokens,
+                    forced_audio_codebooks,
+                } => (
+                    text_token,
+                    audio_tokens,
+                    None,
+                    forced_text_token.cloned(),
+                    forced_audio_tokens.cloned(),
+                    forced_audio_codebooks.map(ToOwned::to_owned),
+                    true,
+                ),
+            };
+        cache.reset_depth();
+        let hidden = self.static_modules.temporal_input_tensor_parallel(
+            &self.args,
+            text,
+            audio,
+            group,
+            execution.stream(),
+        )?;
+        Ok(LayerwiseForwardState {
+            context: MoshiForwardContext {
+                temporal_input: hidden.clone(),
+                temporal_output: None,
+                text_logits: None,
+                audio_logits: Vec::with_capacity(self.args.dep_q as usize),
+                depth_tokens: depth,
+                previous: None,
+                sampled_text: None,
+                predicted_audio: Vec::with_capacity(self.args.dep_q as usize),
+                current_audio_logits: None,
+                forced_text_token: forced_text,
+                forced_audio_tokens: forced_audio,
+                forced_audio_codebooks: forced_mask,
+                autoregressive,
+            },
+            hidden,
+        })
+    }
+
     fn execution_group_count(&self) -> usize {
         2
     }
@@ -1122,6 +1369,262 @@ impl GeneralLayerwiseModelAdapter for MoshiLayerwiseAdapter {
             ))),
             1 => Ok(MoshiExecutionUnit::Depth(Box::new(
                 DepFormerSlice::new_for_index(&self.args, index, stream)?,
+            ))),
+            _ => Err(Error::UnsupportedArchitecture(format!(
+                "Moshi has no execution group {group}"
+            ))),
+        }
+    }
+
+    fn parallel_parameter_groups(
+        &self,
+        _context: crate::runtime::distributed::parallel::ParallelBuildContext,
+    ) -> Result<Vec<crate::runtime::distributed::parallel::ParameterGroupSpec>, Error> {
+        use crate::runtime::distributed::parallel::{
+            MemberSharding, ParameterGroupSpec, ParameterMemberSpec, ParameterRole,
+        };
+        use safemlx::ops::quantized_packed_dimension;
+
+        let mut groups = Vec::new();
+        let mut register_vocab = |prefix: String, vocabulary: usize, dimensions: i32| {
+            let packed = self.args.quantization.map_or(dimensions, |quantization| {
+                quantized_packed_dimension(dimensions, quantization.bits())
+            }) as usize;
+            let mut members = vec![ParameterMemberSpec::new(
+                format!("{prefix}.weight"),
+                [vocabulary, packed],
+                MemberSharding::Balanced { axis: 0 },
+            )];
+            if let Some(quantization) = self.args.quantization {
+                let companions = [
+                    vocabulary,
+                    (dimensions / quantization.group_size()) as usize,
+                ];
+                members.push(ParameterMemberSpec::new(
+                    format!("{prefix}.scales"),
+                    companions,
+                    MemberSharding::Balanced { axis: 0 },
+                ));
+                if quantization.has_biases() {
+                    members.push(ParameterMemberSpec::new(
+                        format!("{prefix}.biases"),
+                        companions,
+                        MemberSharding::Balanced { axis: 0 },
+                    ));
+                }
+            }
+            groups.push(ParameterGroupSpec::new(
+                prefix,
+                ParameterRole::Vocabulary,
+                members,
+            )?);
+            Ok::<_, Error>(())
+        };
+        register_vocab(
+            "text_emb".into(),
+            (self.args.text_card + 1) as usize,
+            self.args.dim,
+        )?;
+        for index in 0..self.args.n_q {
+            register_vocab(
+                format!("audio_embs.{index}"),
+                (self.args.card + 1) as usize,
+                self.args.dim,
+            )?;
+        }
+        register_vocab(
+            "text_linear".into(),
+            self.args.text_card as usize,
+            self.args.dim,
+        )?;
+        let mut register_transformer = |prefix: String,
+                                        dim: i32,
+                                        feed_forward: i32,
+                                        layers: i32|
+         -> Result<(), Error> {
+            let hidden = if feed_forward == 4 * dim {
+                11 * dim / 4
+            } else {
+                2 * feed_forward / 3
+            };
+            let quant = self.args.quantization;
+            let packed = |width: i32| {
+                quant.map_or(width, |q| quantized_packed_dimension(width, q.bits())) as usize
+            };
+            let linear_members =
+                |target: String, output: i32, input: i32, sharding: MemberSharding| {
+                    let mut members = vec![ParameterMemberSpec::new(
+                        format!("{target}.weight"),
+                        [output as usize, packed(input)],
+                        sharding.clone(),
+                    )];
+                    if let Some(q) = quant {
+                        let companion = match sharding {
+                            MemberSharding::Equal { axis: 0 }
+                            | MemberSharding::Segmented { axis: 0, .. } => sharding.clone(),
+                            MemberSharding::Equal { axis: 1 } => MemberSharding::Equal { axis: 1 },
+                            _ => sharding.clone(),
+                        };
+                        members.push(ParameterMemberSpec::new(
+                            format!("{target}.scales"),
+                            [output as usize, (input / q.group_size()) as usize],
+                            companion.clone(),
+                        ));
+                        if q.has_biases() {
+                            members.push(ParameterMemberSpec::new(
+                                format!("{target}.biases"),
+                                [output as usize, (input / q.group_size()) as usize],
+                                companion,
+                            ));
+                        }
+                    }
+                    members
+                };
+            for layer in 0..layers {
+                let layer = format!("{prefix}.layers.{layer}");
+                let segments = vec![
+                    0..dim as usize,
+                    dim as usize..2 * dim as usize,
+                    2 * dim as usize..3 * dim as usize,
+                ];
+                groups.push(ParameterGroupSpec::new(
+                    format!("{layer}.attention.input"),
+                    ParameterRole::Segmented,
+                    linear_members(
+                        format!("{layer}.self_attn.in_proj"),
+                        3 * dim,
+                        dim,
+                        MemberSharding::Segmented { axis: 0, segments },
+                    ),
+                )?);
+                groups.push(ParameterGroupSpec::new(
+                    format!("{layer}.attention.output"),
+                    ParameterRole::RowProjection,
+                    linear_members(
+                        format!("{layer}.self_attn.out_proj"),
+                        dim,
+                        dim,
+                        MemberSharding::Equal { axis: 1 },
+                    ),
+                )?);
+                let mlp_segments = vec![0..hidden as usize, hidden as usize..2 * hidden as usize];
+                groups.push(ParameterGroupSpec::new(
+                    format!("{layer}.mlp.input"),
+                    ParameterRole::Segmented,
+                    linear_members(
+                        format!("{layer}.gating.linear_in"),
+                        2 * hidden,
+                        dim,
+                        MemberSharding::Segmented {
+                            axis: 0,
+                            segments: mlp_segments,
+                        },
+                    ),
+                )?);
+                groups.push(ParameterGroupSpec::new(
+                    format!("{layer}.mlp.output"),
+                    ParameterRole::RowProjection,
+                    linear_members(
+                        format!("{layer}.gating.linear_out"),
+                        dim,
+                        hidden,
+                        MemberSharding::Equal { axis: 1 },
+                    ),
+                )?);
+            }
+            Ok(())
+        };
+        register_transformer(
+            "transformer".into(),
+            self.args.dim,
+            self.args.dim_feedforward.unwrap_or(4 * self.args.dim),
+            self.args.num_layers,
+        )?;
+        for slice in 0..self.args.dep_q {
+            register_transformer(
+                format!("depformer.slices.{slice}.transformer"),
+                self.args.depformer_dim,
+                self.args
+                    .depformer_dim_feedforward
+                    .unwrap_or(4 * self.args.depformer_dim),
+                self.args.depformer_num_layers,
+            )?;
+        }
+        Ok(groups)
+    }
+
+    fn configure_parallel_static(
+        &mut self,
+        context: crate::runtime::distributed::parallel::ParallelBuildContext,
+        _layout: &crate::runtime::distributed::parallel::LocalModelLayout,
+        stream: &Stream,
+    ) -> Result<(), Error> {
+        self.static_modules =
+            MoshiLayerwiseStatic::new_tensor_parallel(&self.args, context.topology(), stream)?;
+        Ok(())
+    }
+
+    fn new_parallel_layer(
+        &self,
+        group: usize,
+        index: usize,
+        layout: &crate::runtime::distributed::parallel::LocalModelLayout,
+        stream: &Stream,
+    ) -> Result<Self::Layer, Error> {
+        let (prefix, dim, heads, feed_forward) = if group == 0 {
+            (
+                format!("transformer.layers.{index}"),
+                self.args.dim,
+                self.args.num_heads,
+                self.args.dim_feedforward.unwrap_or(4 * self.args.dim),
+            )
+        } else {
+            (
+                format!("depformer.slices.{index}.transformer.layers.0"),
+                self.args.depformer_dim,
+                self.args.depformer_num_heads,
+                self.args
+                    .depformer_dim_feedforward
+                    .unwrap_or(4 * self.args.depformer_dim),
+            )
+        };
+        let local_qkv = layout
+            .tensor(&format!("{prefix}.self_attn.in_proj.weight"))
+            .ok_or_else(|| Error::Parallel(format!("missing TP layout for {prefix} attention")))?
+            .local_shape()[0];
+        let local_in = layout
+            .tensor(&format!("{prefix}.gating.linear_in.weight"))
+            .ok_or_else(|| Error::Parallel(format!("missing TP layout for {prefix} MLP")))?
+            .local_shape()[0];
+        let head_dim = dim / heads;
+        let local_heads = i32::try_from(local_qkv / 3)
+            .map_err(|_| Error::Parallel("Moshi local attention width exceeds i32".into()))?
+            / head_dim;
+        let global_hidden = if feed_forward == 4 * dim {
+            11 * dim / 4
+        } else {
+            2 * feed_forward / 3
+        };
+        let _ = global_hidden;
+        let local_hidden = i32::try_from(local_in / 2)
+            .map_err(|_| Error::Parallel("Moshi local MLP width exceeds i32".into()))?;
+        match group {
+            0 => Ok(MoshiExecutionUnit::Temporal(Box::new(
+                MoshiTransformerLayer::new_temporal_tensor_parallel(
+                    &self.args,
+                    local_heads,
+                    local_hidden,
+                    stream,
+                )?,
+            ))),
+            1 => Ok(MoshiExecutionUnit::Depth(Box::new(
+                DepFormerSlice::new_for_index_tensor_parallel(
+                    &self.args,
+                    index,
+                    local_heads,
+                    local_hidden,
+                    stream,
+                )?,
             ))),
             _ => Err(Error::UnsupportedArchitecture(format!(
                 "Moshi has no execution group {group}"
@@ -1162,6 +1665,23 @@ impl GeneralLayerwiseModelAdapter for MoshiLayerwiseAdapter {
                 pytorch_layer_bindings(layer, group, index, self.args.dep_q as usize, store)
             }
         }
+    }
+
+    fn parallel_layer_bindings(
+        &self,
+        group: usize,
+        index: usize,
+        _layer: &Self::Layer,
+        store: &dyn WeightStore,
+        layout: &crate::runtime::distributed::parallel::LocalModelLayout,
+        stream: &Stream,
+    ) -> Result<Vec<WeightBinding>, Error> {
+        let global = self.new_layer(group, index, stream)?;
+        crate::runtime::execution::layerwise::shard_layer_bindings(
+            self.layer_bindings(group, index, &global, store)?,
+            &self.layer_checkpoint_prefix(group, index),
+            layout,
+        )
     }
 
     fn forward_layer(
@@ -1220,6 +1740,85 @@ impl GeneralLayerwiseModelAdapter for MoshiLayerwiseAdapter {
             }
             _ => Err(Error::UnsupportedArchitecture(format!(
                 "Moshi execution unit does not match group {group}"
+            ))),
+        }
+    }
+
+    fn forward_layer_with_execution(
+        &mut self,
+        group: usize,
+        index: usize,
+        layer: &mut Self::Layer,
+        hidden: &Array,
+        cache: &mut Self::Cache,
+        context: &mut Self::ForwardContext,
+        execution: &crate::runtime::distributed::parallel::ParallelExecutionContext<'_>,
+    ) -> Result<Array, Error> {
+        let Some(tp_group) = execution.group() else {
+            return self.forward_layer(
+                group,
+                index,
+                layer,
+                hidden,
+                cache,
+                context,
+                execution.stream(),
+            );
+        };
+        match layer {
+            MoshiExecutionUnit::Temporal(layer) if group == 0 => {
+                let output = layer.forward_tensor_parallel(
+                    hidden.clone(),
+                    &mut cache.temporal[index],
+                    tp_group,
+                    execution.stream(),
+                )?;
+                if index + 1 == self.args.num_layers as usize {
+                    let (temporal, logits) = self.static_modules.finish_temporal_tensor_parallel(
+                        &output,
+                        tp_group,
+                        execution.stream(),
+                    )?;
+                    context.temporal_output = Some(temporal.clone());
+                    context.text_logits = Some(logits);
+                    Ok(temporal)
+                } else {
+                    Ok(output)
+                }
+            }
+            MoshiExecutionUnit::Depth(slice) if group == 1 => {
+                let previous = if context.autoregressive {
+                    context
+                        .previous
+                        .as_ref()
+                        .ok_or_else(|| {
+                            Error::UnsupportedArchitecture(
+                                "Moshi depth execution started before text sampling".into(),
+                            )
+                        })?
+                        .clone()
+                } else {
+                    context
+                        .depth_tokens
+                        .as_ref()
+                        .expect("teacher-forced depth tokens")
+                        .try_index_device((.., index as i32), execution.stream())?
+                        .expand_dims(1, execution.stream())?
+                };
+                let logits = slice.forward_tensor_parallel(
+                    context.temporal_output.as_ref().expect("temporal output"),
+                    &previous,
+                    context.autoregressive,
+                    &mut cache.depth,
+                    tp_group,
+                    execution.stream(),
+                )?;
+                context.current_audio_logits = Some(logits.clone());
+                context.audio_logits.push(logits);
+                Ok(hidden.clone())
+            }
+            _ => Err(Error::UnsupportedArchitecture(format!(
+                "Moshi TP execution unit does not match group {group}"
             ))),
         }
     }
@@ -1472,6 +2071,7 @@ mod tests {
     use std::{collections::BTreeMap, fs, path::Path};
 
     use safemlx::{
+        distributed::{Backend, Group},
         module::ModuleParameters,
         ops::{concatenate_axis, ones_dtype, zeros_dtype},
         Array, Device, DeviceType, ExecutionContext, Stream,
@@ -1481,6 +2081,10 @@ mod tests {
     use crate::{
         api::moshi as eager,
         api::realtime::{generate_encoded_greedy, RealtimeSpeechModel},
+        runtime::distributed::{
+            parallel::{ParallelBuildContext, ShardingPolicy},
+            topology::{DeviceAssignment, ParallelTopology},
+        },
         runtime::execution::layerwise::{LayerExecutionLoadOptions, LayerwiseLoadOptions},
         runtime::residency::dense_stream::DenseDiskStreamLoadOptions,
         runtime::residency::policy::{MemoryTier, OffloadConfig},
@@ -1660,6 +2264,37 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         write_fixture(dir.path(), &model);
         dir
+    }
+
+    #[test]
+    #[ignore = "requires an MLX runtime with a Metal device"]
+    fn tensor_parallel_dense_stream_loads_realtime_static_and_groups() {
+        let gpu = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
+        let cpu = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        let dir = fixture(&gpu);
+        let group = Group::init(false, Backend::Any).unwrap();
+        assert_eq!(group.size(), 1);
+        let topology =
+            ParallelTopology::from_rank(1, 0, 1, 1, 1, DeviceAssignment::new(DeviceType::Gpu, 0))
+                .unwrap();
+        let build = ParallelBuildContext::new(topology, ShardingPolicy::Require);
+        let options = DenseDiskStreamLoadOptions::new(u64::MAX, u64::MAX, 1, 1, 1).unwrap();
+        let model = load_moshi_tensor_parallel_layerwise_model(
+            dir.path(),
+            LayerExecutionLoadOptions::DenseDiskStream(options),
+            build,
+            gpu.stream(),
+            cpu.stream(),
+        )
+        .unwrap();
+        let report = model.dense_stream_report().unwrap().unwrap();
+        assert!(report
+            .residency()
+            .units()
+            .iter()
+            .filter(|unit| unit.id().as_str().contains("moshi.temporal.")
+                || unit.id().as_str().contains("moshi.depth."))
+            .all(|unit| unit.planned_tier() == MemoryTier::Disk));
     }
 
     fn assert_close(left: &Array, right: &Array) {

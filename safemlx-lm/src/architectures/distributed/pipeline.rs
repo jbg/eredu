@@ -52,7 +52,7 @@ use crate::{
     },
     runtime::execution::inspection::ActivationObserver,
     runtime::execution::layerwise::{
-        DenseDiskStreamReport, DenseStreamController, GeneralLayerwiseModelAdapter, WeightResidency,
+        ArchitectureAdapter, DenseDiskStreamReport, DenseStreamController, WeightResidency,
     },
     runtime::generation::sampler::Sampler,
     runtime::residency::manager::{OffloadUnit, ResidencyManager},

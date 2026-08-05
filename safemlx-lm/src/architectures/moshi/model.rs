@@ -6,7 +6,7 @@
 //! output predicts text; the depth transformer then predicts generated audio
 //! codebooks autoregressively within the same frame.
 
-use std::{collections::HashMap, path::Path};
+use std::{collections::HashMap, ops::Range, path::Path};
 
 use safemlx::{
     builder::Builder,
@@ -569,6 +569,33 @@ impl MoshiAttention {
         })
     }
 
+    fn unloaded_tensor_parallel(
+        cfg: TransformerConfig,
+        local_heads: i32,
+        stream: &Stream,
+    ) -> Result<Self, Exception> {
+        let mut attention = Self::unloaded(cfg, stream)?;
+        let local_dim = local_heads * (cfg.dim / cfg.num_heads);
+        attention.num_heads = local_heads;
+        attention.in_proj = MoshiLinear::unloaded(
+            cfg.dim,
+            3 * local_dim,
+            false,
+            Dtype::Float32,
+            cfg.quantization,
+            stream,
+        )?;
+        attention.out_proj = MoshiLinear::unloaded(
+            local_dim,
+            cfg.dim,
+            false,
+            Dtype::Float32,
+            cfg.quantization,
+            stream,
+        )?;
+        Ok(attention)
+    }
+
     fn attend_projected(
         &mut self,
         qkv: Array,
@@ -731,6 +758,32 @@ impl MoshiMlp {
         })
     }
 
+    fn unloaded_tensor_parallel(
+        cfg: TransformerConfig,
+        local_hidden: i32,
+        stream: &Stream,
+    ) -> Result<Self, Exception> {
+        Ok(Self {
+            linear_in: MoshiLinear::unloaded(
+                cfg.dim,
+                2 * local_hidden,
+                false,
+                Dtype::Float32,
+                cfg.quantization,
+                stream,
+            )?,
+            linear_out: MoshiLinear::unloaded(
+                local_hidden,
+                cfg.dim,
+                false,
+                Dtype::Float32,
+                cfg.quantization,
+                stream,
+            )?,
+            compiled: compile_unary_with_stream_and_captures(moshi_mlp as MoshiMlpFn, [], false),
+        })
+    }
+
     fn forward(&mut self, x: &Array, stream: &Stream) -> Result<Array, Exception> {
         if self.linear_in.is_quantized() {
             let projected = self.linear_in.forward(x, stream)?;
@@ -799,6 +852,32 @@ impl MoshiTransformerLayer {
         Self::unloaded(temporal_transformer_config(args), stream)
     }
 
+    fn unloaded_tensor_parallel(
+        cfg: TransformerConfig,
+        local_heads: i32,
+        local_hidden: i32,
+        stream: &Stream,
+    ) -> Result<Self, Exception> {
+        let mut layer = Self::unloaded(cfg, stream)?;
+        layer.self_attn = MoshiAttention::unloaded_tensor_parallel(cfg, local_heads, stream)?;
+        layer.gating = MoshiMlp::unloaded_tensor_parallel(cfg, local_hidden, stream)?;
+        Ok(layer)
+    }
+
+    pub(crate) fn new_temporal_tensor_parallel(
+        args: &ModelArgs,
+        local_heads: i32,
+        local_hidden: i32,
+        stream: &Stream,
+    ) -> Result<Self, Exception> {
+        Self::unloaded_tensor_parallel(
+            temporal_transformer_config(args),
+            local_heads,
+            local_hidden,
+            stream,
+        )
+    }
+
     fn forward(
         &mut self,
         x: Array,
@@ -841,6 +920,36 @@ impl MoshiTransformerLayer {
         stream: &Stream,
     ) -> Result<Array, Exception> {
         self.forward(x, cache, stream)
+    }
+
+    pub(crate) fn forward_tensor_parallel(
+        &mut self,
+        x: Array,
+        cache: &mut ConcatKeyValueCache,
+        group: &safemlx::distributed::Group,
+        stream: &Stream,
+    ) -> Result<Array, Exception> {
+        let norm1 = self.norm1.forward(&x, stream)?;
+        let projected = self.self_attn.in_proj.forward(&norm1, stream)?;
+        let attended = self.self_attn.attend_projected(projected, cache, stream)?;
+        let attention = safemlx::distributed::all_sum(
+            &self.self_attn.out_proj.forward(&attended, stream)?,
+            group,
+            stream,
+        )?;
+        let x = x.add(attention, stream)?;
+        let norm2 = self.norm2.forward(&x, stream)?;
+        let projected = self.gating.linear_in.forward(&norm2, stream)?;
+        let mut parts = split(projected, 2, -1, stream)?;
+        let gate = nn::silu(parts.remove(0), stream)?;
+        let partial = self
+            .gating
+            .linear_out
+            .forward(&gate.multiply(parts.remove(0), stream)?, stream)?;
+        x.add(
+            safemlx::distributed::all_sum(&partial, group, stream)?,
+            stream,
+        )
     }
 
     fn forward_traced(
@@ -1003,6 +1112,28 @@ impl DepFormerSlice {
         )
     }
 
+    pub(crate) fn new_for_index_tensor_parallel(
+        args: &ModelArgs,
+        index: usize,
+        local_heads: i32,
+        local_hidden: i32,
+        stream: &Stream,
+    ) -> Result<Self, Exception> {
+        let mut slice = Self::new_for_index(args, index, stream)?;
+        let cfg = depth_transformer_config(args);
+        slice.transformer.layers = (0..cfg.num_layers)
+            .map(|_| {
+                MoshiTransformerLayer::unloaded_tensor_parallel(
+                    cfg,
+                    local_heads,
+                    local_hidden,
+                    stream,
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(slice)
+    }
+
     pub(crate) fn forward_layerwise(
         &mut self,
         temporal_output: &Array,
@@ -1021,6 +1152,33 @@ impl DepFormerSlice {
             .forward(temporal_output, stream)?
             .add(embedded, stream)?;
         let x = self.transformer.forward(x, cache, stream)?;
+        self.linear_out.forward(&x, stream)
+    }
+
+    pub(crate) fn forward_tensor_parallel(
+        &mut self,
+        temporal_output: &Array,
+        previous: &Array,
+        nonnegative: bool,
+        cache: &mut [ConcatKeyValueCache],
+        group: &safemlx::distributed::Group,
+        stream: &Stream,
+    ) -> Result<Array, Exception> {
+        let embedded = if nonnegative {
+            self.emb.forward_nonnegative(previous, stream)?
+        } else {
+            self.emb.forward(previous, stream)?
+        };
+        let mut x = self
+            .linear_in
+            .forward(temporal_output, stream)?
+            .add(embedded, stream)?;
+        if cache.len() != self.transformer.layers.len() {
+            return Err(Exception::custom("invalid Moshi depth TP cache length"));
+        }
+        for (layer, cache) in self.transformer.layers.iter_mut().zip(cache) {
+            x = layer.forward_tensor_parallel(x, cache, group, stream)?;
+        }
         self.linear_out.forward(&x, stream)
     }
 }
@@ -1181,6 +1339,15 @@ pub(crate) struct MoshiLayerwiseStatic {
     text_linear: MoshiLinear,
     #[param]
     audio_embs: Vec<ScaledEmbedding>,
+    parallel: Option<MoshiStaticParallel>,
+}
+
+#[derive(Debug, Clone)]
+struct MoshiStaticParallel {
+    text_embedding: Range<usize>,
+    audio_embedding: Range<usize>,
+    global_text_output: usize,
+    parts: usize,
 }
 
 impl MoshiLayerwiseStatic {
@@ -1205,7 +1372,147 @@ impl MoshiLayerwiseStatic {
                 stream,
             )?,
             audio_embs,
+            parallel: None,
         })
+    }
+
+    pub(crate) fn new_tensor_parallel(
+        args: &ModelArgs,
+        topology: crate::runtime::distributed::topology::ParallelTopology,
+        stream: &Stream,
+    ) -> Result<Self, Error> {
+        use crate::runtime::distributed::topology::balanced_contiguous_range;
+        let text_embedding = balanced_contiguous_range(
+            (args.text_card + 1) as usize,
+            topology.tensor_parallel_size,
+            topology.tensor_parallel_rank,
+            false,
+        )?;
+        let audio_embedding = balanced_contiguous_range(
+            (args.card + 1) as usize,
+            topology.tensor_parallel_size,
+            topology.tensor_parallel_rank,
+            false,
+        )?;
+        let text_output = balanced_contiguous_range(
+            args.text_card as usize,
+            topology.tensor_parallel_size,
+            topology.tensor_parallel_rank,
+            false,
+        )?;
+        let audio_embs = (0..args.n_q)
+            .map(|_| {
+                ScaledEmbedding::unloaded(
+                    audio_embedding.len() as i32,
+                    args.dim,
+                    args.quantization,
+                    stream,
+                )
+            })
+            .collect::<Result<_, _>>()?;
+        Ok(Self {
+            text_emb: ScaledEmbedding::unloaded(
+                text_embedding.len() as i32,
+                args.dim,
+                args.quantization,
+                stream,
+            )?,
+            out_norm: nn::RmsNorm::unloaded(args.dim, RMS_NORM_EPS, Dtype::Float32, stream)?,
+            text_linear: MoshiLinear::unloaded(
+                args.dim,
+                text_output.len() as i32,
+                false,
+                Dtype::Float32,
+                args.quantization,
+                stream,
+            )?,
+            audio_embs,
+            parallel: Some(MoshiStaticParallel {
+                text_embedding,
+                audio_embedding,
+                global_text_output: args.text_card as usize,
+                parts: topology.tensor_parallel_size,
+            }),
+        })
+    }
+
+    fn parallel_embedding(
+        embedding: &mut ScaledEmbedding,
+        tokens: &Array,
+        range: &Range<usize>,
+        group: &safemlx::distributed::Group,
+        stream: &Stream,
+    ) -> Result<Array, Exception> {
+        let start = Array::from_int(range.start as i32);
+        let end = Array::from_int(range.end as i32);
+        let valid = tokens
+            .ge(&start, stream)?
+            .logical_and(tokens.lt(&end, stream)?, stream)?;
+        let local = tokens.subtract(&start, stream)?;
+        let safe = r#where(&valid, &local, Array::from_int(0), stream)?;
+        let value = embedding.forward_nonnegative(&safe, stream)?;
+        let value = r#where(
+            &valid.expand_dims(-1, stream)?,
+            &value,
+            zeros_like(&value, stream)?,
+            stream,
+        )?;
+        safemlx::distributed::all_sum(&value, group, stream)
+    }
+
+    pub(crate) fn temporal_input_tensor_parallel(
+        &mut self,
+        args: &ModelArgs,
+        text_token: &Array,
+        audio_tokens: &Array,
+        group: &safemlx::distributed::Group,
+        stream: &Stream,
+    ) -> Result<Array, Exception> {
+        if text_token.shape().len() != 2 || text_token.dim(1) != 1 {
+            return Err(Exception::custom(
+                "Moshi text input must have shape [batch, 1]",
+            ));
+        }
+        if audio_tokens.shape().len() != 2
+            || audio_tokens.dim(0) != text_token.dim(0)
+            || audio_tokens.dim(1) != args.n_q
+        {
+            return Err(Exception::custom(format!(
+                "Moshi audio input must have shape [batch, {}]",
+                args.n_q
+            )));
+        }
+        let parallel = self
+            .parallel
+            .as_ref()
+            .expect("TP Moshi static modules")
+            .clone();
+        if group.size() != parallel.parts {
+            return Err(Exception::custom("Moshi static TP group size mismatch"));
+        }
+        let mut x = Self::parallel_embedding(
+            &mut self.text_emb,
+            text_token,
+            &parallel.text_embedding,
+            group,
+            stream,
+        )?;
+        for codebook in 0..args.n_q {
+            let token = audio_tokens
+                .try_index_device((.., codebook), stream)?
+                .expand_dims(1, stream)?;
+            x = x.add(
+                Self::parallel_embedding(
+                    &mut self.audio_embs[codebook as usize],
+                    &token,
+                    &parallel.audio_embedding,
+                    group,
+                    stream,
+                )?,
+                stream,
+            )?;
+        }
+        Ok(x)
     }
 
     pub(crate) fn temporal_input(
@@ -1249,6 +1556,32 @@ impl MoshiLayerwiseStatic {
     ) -> Result<(Array, Array), Exception> {
         let output = self.out_norm.forward(hidden, stream)?;
         let logits = self.text_linear.forward(&output, stream)?;
+        Ok((output, logits))
+    }
+
+    pub(crate) fn finish_temporal_tensor_parallel(
+        &mut self,
+        hidden: &Array,
+        group: &safemlx::distributed::Group,
+        stream: &Stream,
+    ) -> Result<(Array, Array), Exception> {
+        let output = self.out_norm.forward(hidden, stream)?;
+        let local = self.text_linear.forward(&output, stream)?;
+        let parallel = self.parallel.as_ref().expect("TP Moshi static modules");
+        let widths = (0..parallel.parts)
+            .map(|rank| {
+                crate::runtime::distributed::topology::balanced_contiguous_range(
+                    parallel.global_text_output,
+                    parallel.parts,
+                    rank,
+                    false,
+                )
+                .map(|range| range.len())
+                .map_err(|error| Exception::custom(error.to_string()))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let logits =
+            safemlx::distributed::all_gather_uneven_axis(&local, -1, &widths, group, stream)?;
         Ok((output, logits))
     }
 }

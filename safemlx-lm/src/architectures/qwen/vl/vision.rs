@@ -532,6 +532,29 @@ impl QwenVisionMlp {
         self.linear_fc2.forward(&hidden, stream)
     }
 
+    fn forward_tensor_parallel(
+        &mut self,
+        hidden_states: &Array,
+        group: &safemlx::distributed::Group,
+        stream: &Stream,
+    ) -> Result<Array, Exception> {
+        let hidden_act = self.hidden_act.clone();
+        let hidden = Self::activate(
+            hidden_act.as_str(),
+            self.linear_fc1.forward(hidden_states, stream)?,
+            stream,
+        )?;
+        let mut partial = self.linear_fc2.forward(&hidden, stream)?;
+        if let Some(bias) = self.linear_fc2.bias.as_ref() {
+            partial = partial.subtract(bias, stream)?;
+        }
+        let mut output = safemlx::distributed::all_sum(&partial, group, stream)?;
+        if let Some(bias) = self.linear_fc2.bias.as_ref() {
+            output = output.add(bias, stream)?;
+        }
+        Ok(output)
+    }
+
     fn training_mode(&mut self, mode: bool) {
         self.linear_fc1.training_mode(mode);
         self.linear_fc2.training_mode(mode);
@@ -577,6 +600,39 @@ impl QwenVisionAttention {
             )?,
             proj: nn::Linear::unloaded(
                 config.hidden_size,
+                config.hidden_size,
+                true,
+                Dtype::Float32,
+                stream,
+            )?,
+        })
+    }
+
+    pub(crate) fn new_tensor_parallel(
+        config: &VisionConfig,
+        local_heads: i32,
+        stream: &Stream,
+    ) -> Result<Self, Exception> {
+        if config.hidden_size % config.num_heads != 0 || local_heads <= 0 {
+            return Err(Exception::custom(
+                "invalid Qwen vision tensor-parallel head geometry",
+            ));
+        }
+        let head_dim = config.hidden_size / config.num_heads;
+        let local_width = local_heads * head_dim;
+        Ok(Self {
+            num_heads: local_heads,
+            head_dim,
+            scale: (head_dim as f32).sqrt().recip(),
+            qkv: nn::Linear::unloaded(
+                config.hidden_size,
+                3 * local_width,
+                true,
+                Dtype::Float32,
+                stream,
+            )?,
+            proj: nn::Linear::unloaded(
+                local_width,
                 config.hidden_size,
                 true,
                 Dtype::Float32,
@@ -638,6 +694,26 @@ impl QwenVisionAttention {
         self.proj.forward(&out, stream)
     }
 
+    fn forward_tensor_parallel(
+        &mut self,
+        hidden_states: &Array,
+        chunk_lengths: &[i32],
+        cos: &Array,
+        sin: &Array,
+        group: &safemlx::distributed::Group,
+        stream: &Stream,
+    ) -> Result<Array, Exception> {
+        let mut partial = self.forward(hidden_states, chunk_lengths, cos, sin, stream)?;
+        if let Some(bias) = self.proj.bias.as_ref() {
+            partial = partial.subtract(bias, stream)?;
+        }
+        let mut output = safemlx::distributed::all_sum(&partial, group, stream)?;
+        if let Some(bias) = self.proj.bias.as_ref() {
+            output = output.add(bias, stream)?;
+        }
+        Ok(output)
+    }
+
     fn training_mode(&mut self, mode: bool) {
         self.qkv.training_mode(mode);
         self.proj.training_mode(mode);
@@ -671,6 +747,31 @@ impl QwenVisionBlock {
         })
     }
 
+    pub(crate) fn new_tensor_parallel(
+        config: &VisionConfig,
+        local_heads: i32,
+        local_intermediate: i32,
+        stream: &Stream,
+    ) -> Result<Self, Exception> {
+        let mut block = Self::new(config, stream)?;
+        block.attn = QwenVisionAttention::new_tensor_parallel(config, local_heads, stream)?;
+        block.mlp.linear_fc1 = nn::Linear::unloaded(
+            config.hidden_size,
+            local_intermediate,
+            true,
+            Dtype::Float32,
+            stream,
+        )?;
+        block.mlp.linear_fc2 = nn::Linear::unloaded(
+            local_intermediate,
+            config.hidden_size,
+            true,
+            Dtype::Float32,
+            stream,
+        )?;
+        Ok(block)
+    }
+
     fn forward(
         &mut self,
         hidden_states: Array,
@@ -686,6 +787,25 @@ impl QwenVisionBlock {
         let hidden_states = hidden_states.add(attn, stream)?;
         let normed = self.norm2.forward(&hidden_states, stream)?;
         let mlp = self.mlp.forward(&normed, stream)?;
+        hidden_states.add(mlp, stream)
+    }
+
+    pub(crate) fn forward_tensor_parallel(
+        &mut self,
+        hidden_states: Array,
+        chunk_lengths: &[i32],
+        cos: &Array,
+        sin: &Array,
+        group: &safemlx::distributed::Group,
+        stream: &Stream,
+    ) -> Result<Array, Exception> {
+        let normed = self.norm1.forward(&hidden_states, stream)?;
+        let attention =
+            self.attn
+                .forward_tensor_parallel(&normed, chunk_lengths, cos, sin, group, stream)?;
+        let hidden_states = hidden_states.add(attention, stream)?;
+        let normed = self.norm2.forward(&hidden_states, stream)?;
+        let mlp = self.mlp.forward_tensor_parallel(&normed, group, stream)?;
         hidden_states.add(mlp, stream)
     }
 
@@ -762,6 +882,47 @@ impl QwenVisionPatchMerger {
         })
     }
 
+    pub(crate) fn new_tensor_parallel(
+        config: &VisionConfig,
+        use_postshuffle_norm: bool,
+        approximate_gelu: bool,
+        local_hidden_size: i32,
+        stream: &Stream,
+    ) -> Result<Self, Exception> {
+        let spatial_merge_unit = config.spatial_merge_size * config.spatial_merge_size;
+        let hidden_size = config.hidden_size * spatial_merge_unit;
+        Ok(Self {
+            spatial_merge_unit,
+            context_dim: config.hidden_size,
+            hidden_size,
+            use_postshuffle_norm,
+            approximate_gelu,
+            norm: QwenVisionRmsNorm::new(
+                if use_postshuffle_norm {
+                    hidden_size
+                } else {
+                    config.hidden_size
+                },
+                1e-6,
+                stream,
+            )?,
+            linear_fc1: nn::Linear::unloaded(
+                hidden_size,
+                local_hidden_size,
+                true,
+                Dtype::Float32,
+                stream,
+            )?,
+            linear_fc2: nn::Linear::unloaded(
+                local_hidden_size,
+                config.out_hidden_size,
+                true,
+                Dtype::Float32,
+                stream,
+            )?,
+        })
+    }
+
     fn forward(&mut self, hidden_states: &Array, stream: &Stream) -> Result<Array, Exception> {
         let seq_len = hidden_states.dim(0);
         if seq_len % self.spatial_merge_unit != 0 {
@@ -784,6 +945,44 @@ impl QwenVisionPatchMerger {
             nn::gelu(hidden_states, stream)?
         };
         self.linear_fc2.forward(&hidden_states, stream)
+    }
+
+    fn forward_tensor_parallel(
+        &mut self,
+        hidden_states: &Array,
+        group: &safemlx::distributed::Group,
+        stream: &Stream,
+    ) -> Result<Array, Exception> {
+        let seq_len = hidden_states.dim(0);
+        if seq_len % self.spatial_merge_unit != 0 {
+            return Err(Exception::custom(format!(
+                "Qwen VL vision sequence length {seq_len} is not divisible by spatial merge unit {}",
+                self.spatial_merge_unit
+            )));
+        }
+        let hidden_states = if self.use_postshuffle_norm {
+            let hidden_states = hidden_states.reshape(&[-1, self.hidden_size], stream)?;
+            self.norm.forward(&hidden_states, stream)?
+        } else {
+            let hidden_states = self.norm.forward(hidden_states, stream)?;
+            hidden_states.reshape(&[-1, self.hidden_size], stream)?
+        };
+        let hidden_states = self.linear_fc1.forward(&hidden_states, stream)?;
+        let hidden_states = if self.approximate_gelu {
+            nn::gelu_approximate(hidden_states, stream)?
+        } else {
+            nn::gelu(hidden_states, stream)?
+        };
+        let partial = safemlx::ops::matmul(
+            &hidden_states,
+            self.linear_fc2.weight.value.transpose(stream)?,
+            stream,
+        )?;
+        let mut output = safemlx::distributed::all_sum(&partial, group, stream)?;
+        if let Some(bias) = self.linear_fc2.bias.as_ref() {
+            output = output.add(bias, stream)?;
+        }
+        Ok(output)
     }
 
     fn training_mode(&mut self, mode: bool) {
@@ -936,6 +1135,28 @@ impl QwenVisionLayerwiseStatic {
         block.forward(hidden, chunks, &state.cos, &state.sin, stream)
     }
 
+    pub(crate) fn forward_block_tensor_parallel(
+        &self,
+        block: &mut QwenVisionBlock,
+        index: usize,
+        hidden: Array,
+        state: &QwenVisionLayerwiseState,
+        group: &safemlx::distributed::Group,
+        stream: &Stream,
+    ) -> Result<Array, Exception> {
+        let policy = self.config.layer_policy(index).ok_or_else(|| {
+            Exception::custom(format!(
+                "Qwen VL vision block {index} is outside the configured {}-layer schedule",
+                self.config.layer_count()
+            ))
+        })?;
+        let chunks = match policy.attention {
+            VisionAttentionPolicy::Full => &state.full_chunk_lengths,
+            VisionAttentionPolicy::Windowed => &state.window_chunk_lengths,
+        };
+        block.forward_tensor_parallel(hidden, chunks, &state.cos, &state.sin, group, stream)
+    }
+
     pub(crate) fn capture_deepstack(
         &mut self,
         index: usize,
@@ -966,6 +1187,33 @@ impl QwenVisionLayerwiseStatic {
         Ok(())
     }
 
+    pub(crate) fn capture_deepstack_tensor_parallel(
+        &mut self,
+        index: usize,
+        hidden: &Array,
+        state: &mut QwenVisionLayerwiseState,
+        group: &safemlx::distributed::Group,
+        stream: &Stream,
+    ) -> Result<(), Exception> {
+        let policy = self.config.layer_policy(index).ok_or_else(|| {
+            Exception::custom(format!(
+                "Qwen VL vision block {index} is outside the configured {}-layer schedule",
+                self.config.layer_count()
+            ))
+        })?;
+        if let Some(merger_index) = policy.deepstack_merger {
+            let merger_index = merger_index as usize;
+            state.deepstack_features.push(
+                self.deepstack_merger_list
+                    .get_mut(merger_index)
+                    .ok_or_else(|| Exception::custom("missing Qwen DeepStack merger"))?
+                    .forward_tensor_parallel(hidden, group, stream)?
+                    .try_index_device((NewAxis, .., ..), stream)?,
+            );
+        }
+        Ok(())
+    }
+
     pub(crate) fn finish(
         &mut self,
         hidden: &Array,
@@ -973,6 +1221,25 @@ impl QwenVisionLayerwiseStatic {
         stream: &Stream,
     ) -> Result<VisionOutput, Exception> {
         let hidden = self.merger.forward(hidden, stream)?;
+        let reverse_index = reverse_permutation(&state.window_index);
+        let reverse_index_array = Array::from_slice(&reverse_index, &[reverse_index.len() as i32]);
+        let embeddings = hidden
+            .try_index_device((&reverse_index_array, ..), stream)?
+            .try_index_device((NewAxis, .., ..), stream)?;
+        Ok(VisionOutput {
+            embeddings,
+            deepstack_features: std::mem::take(&mut state.deepstack_features),
+        })
+    }
+
+    pub(crate) fn finish_tensor_parallel(
+        &mut self,
+        hidden: &Array,
+        state: &mut QwenVisionLayerwiseState,
+        group: &safemlx::distributed::Group,
+        stream: &Stream,
+    ) -> Result<VisionOutput, Exception> {
+        let hidden = self.merger.forward_tensor_parallel(hidden, group, stream)?;
         let reverse_index = reverse_permutation(&state.window_index);
         let reverse_index_array = Array::from_slice(&reverse_index, &[reverse_index.len() as i32]);
         let embeddings = hidden

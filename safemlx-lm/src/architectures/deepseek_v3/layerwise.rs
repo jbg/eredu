@@ -23,10 +23,14 @@ use crate::{
         input,
     },
     error::Error,
-    nn::tensor::create_causal_mask,
+    nn::{
+        parallel::{VocabParallelEmbedding, VocabParallelLmHead},
+        tensor::create_causal_mask,
+    },
     runtime::cache::residency::{
         validate_prompt_cache_model_identity, CacheResidencyPolicy, PagedCacheOptions,
-        PromptCacheDescriptor, PromptCacheManifest, PromptCacheModelIdentity,
+        PromptCacheDescriptor, PromptCacheManifest, PromptCacheModelIdentity, PromptCacheOptions,
+        PromptCacheTopology,
     },
     runtime::checkpoint::binding::{
         build_module_bindings_with_recipes, canonical_checkpoint_name, materialize_module_bindings,
@@ -36,9 +40,9 @@ use crate::{
     runtime::checkpoint::recipe::DerivedWeightRecipe,
     runtime::checkpoint::store::{GgufWeightStore, TensorSelection, WeightStore},
     runtime::execution::layerwise::{
-        load_general_layerwise_model, load_general_layerwise_model_with_store,
-        GeneralLayerwiseModel, GeneralLayerwiseModelAdapter, LayerExecutionLoadOptions,
-        LayerwiseForwardState, StaticUnitBindings, WeightResidency,
+        load_layerwise_model, load_layerwise_model_with_store,
+        load_tensor_parallel_layerwise_model, ArchitectureAdapter, LayerExecutionLoadOptions,
+        LayerwiseForwardState, LayerwiseModel, StaticUnitBindings, WeightResidency,
     },
     runtime::residency::expert_cache::{
         ExpertCache, ExpertCacheError, ExpertCacheLoadOptions, ExpertCacheReport,
@@ -53,7 +57,7 @@ const HEAD_UNIT: &str = "deepseek_v3.static.output";
 
 /// DeepSeek-V3/R1 causal LM using bounded residency for decoder blocks.
 pub struct DeepSeekV3LayerwiseModel {
-    execution: GeneralLayerwiseModel<DeepSeekV3LayerwiseAdapter>,
+    execution: LayerwiseModel<DeepSeekV3LayerwiseAdapter>,
 }
 
 impl DeepSeekV3LayerwiseModel {
@@ -67,6 +71,20 @@ impl DeepSeekV3LayerwiseModel {
         resident::prompt_cache_architecture_fingerprint(self.args())
     }
 
+    /// Returns this rank's exact prompt-cache state layout.
+    pub fn prompt_cache_layer_layout(
+        &self,
+    ) -> Result<crate::LayerSchedule<crate::LayerCachePolicy>, Error> {
+        self.execution.prompt_cache_layer_layout()
+    }
+
+    /// Returns rank-local generalized parallel information when applicable.
+    pub fn parallel_info(
+        &self,
+    ) -> Option<&crate::runtime::execution::layerwise::ParallelModelInfo> {
+        self.execution.parallel_info()
+    }
+
     /// Creates one compressed MLA cache per decoder block.
     pub fn new_cache(&self) -> Cache {
         self.execution.adapter().new_cache()
@@ -74,7 +92,12 @@ impl DeepSeekV3LayerwiseModel {
 
     /// Creates ordinary or paged compressed attention state independently of weight residency.
     pub fn new_cache_with_options(&self, policy: CacheResidencyPolicy) -> Result<Cache, Error> {
-        Cache::new_with_options(&self.args().layer_schedule, policy).map_err(Into::into)
+        Cache::new_with_options_and_rank(
+            &self.args().layer_schedule,
+            policy,
+            self.execution.prompt_cache_rank_identity(),
+        )
+        .map_err(Into::into)
     }
 
     /// Lazily catalogs a compatible persisted compressed prefix.
@@ -84,7 +107,17 @@ impl DeepSeekV3LayerwiseModel {
         expected: &PromptCacheDescriptor,
         prefix_token_ids: &[u32],
         options: PagedCacheOptions,
+        stream: &Stream,
     ) -> Result<(Cache, PromptCacheManifest), Error> {
+        if self.execution.parallel_info().is_some() {
+            return self.execution.load_prompt_cache(
+                directory,
+                expected,
+                prefix_token_ids,
+                options,
+                stream,
+            );
+        }
         let args = self.args();
         let layer_count = args.layer_schedule.len();
         let identity = PromptCacheModelIdentity {
@@ -116,6 +149,26 @@ impl DeepSeekV3LayerwiseModel {
         .map_err(Into::into)
     }
 
+    /// Persists a prefix through the generalized execution contract.
+    pub fn save_prompt_cache(
+        &self,
+        cache: &mut Cache,
+        destination: impl AsRef<Path>,
+        descriptor: PromptCacheDescriptor,
+        prefix_token_ids: &[u32],
+        options: &PromptCacheOptions,
+        stream: &Stream,
+    ) -> Result<PromptCacheManifest, Error> {
+        self.execution.save_prompt_cache(
+            cache,
+            destination,
+            descriptor,
+            prefix_token_ids,
+            options,
+            stream,
+        )
+    }
+
     /// Returns current logical residency and transfer telemetry.
     pub fn residency_report(&self) -> Result<ResidencyReport, Error> {
         self.execution.residency_report()
@@ -141,6 +194,18 @@ impl DeepSeekV3LayerwiseModel {
     /// Returns the persistent checkpoint store.
     pub fn checkpoint_store(&self) -> &(dyn WeightStore + Send + Sync) {
         self.execution.checkpoint_store()
+    }
+
+    /// Runs a rank-local tensor-parallel forward pass through the generalized engine.
+    pub fn forward_tensor_parallel(
+        &mut self,
+        inputs: &Array,
+        cache: &mut Cache,
+        group: &safemlx::distributed::Group,
+        stream: &Stream,
+    ) -> Result<Array, Error> {
+        self.execution
+            .forward_tensor_parallel(inputs, cache, group, stream)
     }
 
     /// Backward-compatible alias for [`Self::checkpoint_store`].
@@ -243,10 +308,42 @@ pub fn load_deepseek_v3_layerwise_model(
     args.validate()?;
     let adapter = DeepSeekV3LayerwiseAdapter::new(args, stream)?;
     Ok(DeepSeekV3LayerwiseModel {
-        execution: load_general_layerwise_model(
+        execution: load_layerwise_model(model_dir, adapter, options, stream, weights_stream)?,
+    })
+}
+
+/// Loads DeepSeek-V3/R1 through the generalized tensor-parallel engine.
+pub fn load_deepseek_v3_tensor_parallel_model(
+    model_dir: impl AsRef<Path>,
+    options: impl Into<LayerExecutionLoadOptions>,
+    build: crate::runtime::distributed::parallel::ParallelBuildContext,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<DeepSeekV3LayerwiseModel, Error> {
+    let model_dir = model_dir.as_ref();
+    let options = options.into();
+    let residency = match options {
+        LayerExecutionLoadOptions::LayerwiseHost(options) => {
+            WeightResidency::LayerwiseHost(options)
+        }
+        LayerExecutionLoadOptions::DenseDiskStream(options) => {
+            WeightResidency::DenseDiskStream(options)
+        }
+    };
+    crate::api::structural::validate_safetensors_load_path(
+        crate::api::ModelKind::DeepSeekV3,
+        model_dir,
+        crate::api::ModelLoadOptions::default().with_weight_residency(residency),
+    )?;
+    let args = resident::get_model_args(model_dir)?;
+    args.validate()?;
+    let adapter = DeepSeekV3LayerwiseAdapter::new(args, stream)?;
+    Ok(DeepSeekV3LayerwiseModel {
+        execution: load_tensor_parallel_layerwise_model(
             model_dir,
             adapter,
             options,
+            build,
             stream,
             weights_stream,
         )?,
@@ -276,14 +373,14 @@ pub(crate) fn load_deepseek_v3_gguf_layerwise_model(
             residency.max_mapped_shards(),
         )?);
     let execution = match residency {
-        WeightResidency::LayerwiseHost(options) => load_general_layerwise_model_with_store(
+        WeightResidency::LayerwiseHost(options) => load_layerwise_model_with_store(
             store,
             DeepSeekV3LayerwiseAdapter::new(args, stream)?,
             options,
             stream,
             weights_stream,
         )?,
-        WeightResidency::DenseDiskStream(options) => load_general_layerwise_model_with_store(
+        WeightResidency::DenseDiskStream(options) => load_layerwise_model_with_store(
             store,
             DeepSeekV3LayerwiseAdapter::new(args, stream)?,
             options,
@@ -395,13 +492,8 @@ fn load_deepseek_gguf_sparse_with_store(
     weights_stream: &Stream,
 ) -> Result<DeepSeekV3LayerwiseModel, Error> {
     let adapter = DeepSeekV3LayerwiseAdapter::new_sparse(args.clone(), stream)?;
-    let mut execution = load_general_layerwise_model_with_store(
-        store,
-        adapter,
-        non_expert,
-        stream,
-        weights_stream,
-    )?;
+    let mut execution =
+        load_layerwise_model_with_store(store, adapter, non_expert, stream, weights_stream)?;
     let checkpoint_store = execution.weight_store_arc();
     let entries = deepseek_expert_catalog(&args, checkpoint_store.as_ref())?;
     execution.adapter_mut().expert_cache = Some(ExpertCache::new_shared(
@@ -424,13 +516,8 @@ pub(crate) fn load_deepseek_v3_sparse_ep_base_with_store(
 ) -> Result<DeepSeekV3LayerwiseModel, Error> {
     args.validate()?;
     let adapter = DeepSeekV3LayerwiseAdapter::new_sparse(args, stream)?;
-    let execution = load_general_layerwise_model_with_store(
-        store,
-        adapter,
-        non_expert,
-        stream,
-        weights_stream,
-    )?;
+    let execution =
+        load_layerwise_model_with_store(store, adapter, non_expert, stream, weights_stream)?;
     Ok(DeepSeekV3LayerwiseModel { execution })
 }
 
@@ -485,7 +572,7 @@ fn load_deepseek_v3_sparse_expert_cache_model_with_non_expert(
     args.validate()?;
     let adapter = DeepSeekV3LayerwiseAdapter::new_sparse(args.clone(), stream)?;
     let mut execution =
-        load_general_layerwise_model(model_dir, adapter, non_expert, stream, weights_stream)?;
+        load_layerwise_model(model_dir, adapter, non_expert, stream, weights_stream)?;
     let store = execution.weight_store_arc();
     let entries = deepseek_expert_catalog(&args, store.as_ref())?;
     let cache = ExpertCache::new_shared(
@@ -505,6 +592,8 @@ pub struct DeepSeekV3LayerwiseAdapter {
     embedding: MaybeQuantized<nn::Embedding>,
     norm: nn::RmsNorm,
     lm_head: MaybeQuantized<nn::Linear>,
+    parallel_embedding: Option<VocabParallelEmbedding>,
+    parallel_lm_head: Option<VocabParallelLmHead>,
     sparse_expert_cache: bool,
     expert_cache: Option<ExpertCache>,
 }
@@ -531,6 +620,8 @@ impl DeepSeekV3LayerwiseAdapter {
                 args.weight_quantization_for("lm_head.weight"),
                 stream,
             )?,
+            parallel_embedding: None,
+            parallel_lm_head: None,
             sparse_expert_cache: false,
             expert_cache: None,
             args,
@@ -637,11 +728,75 @@ pub struct DeepSeekV3ForwardContext {
     mask: Option<Array>,
 }
 
-impl GeneralLayerwiseModelAdapter for DeepSeekV3LayerwiseAdapter {
+impl ArchitectureAdapter for DeepSeekV3LayerwiseAdapter {
     type Input<'a> = &'a Array;
     type Cache = Cache;
     type Layer = DecoderLayer;
     type ForwardContext = DeepSeekV3ForwardContext;
+
+    fn model_type(&self) -> &str {
+        &self.args.model_type
+    }
+
+    fn prompt_cache_model_identity(
+        &self,
+        topology: Option<crate::ParallelTopology>,
+    ) -> Result<PromptCacheModelIdentity, Error> {
+        let layer_count = self.args.layer_schedule.len();
+        Ok(PromptCacheModelIdentity {
+            model_family: "deepseek_v3".into(),
+            effective_model_type: self.args.model_type.clone(),
+            architecture_fingerprint: resident::prompt_cache_architecture_fingerprint(&self.args),
+            layer_count,
+            global_layer_start: 0,
+            global_layer_end: layer_count,
+            sink_tokens: 0,
+            topology: topology.map_or_else(
+                PromptCacheTopology::default,
+                PromptCacheTopology::for_parallel_topology,
+            ),
+            layer_layout: PromptCacheModelIdentity::compressed_layouts(
+                layer_count,
+                self.args.kv_lora_rank,
+                self.args.qk_rope_head_dim,
+            )
+            .map_err(|error| Exception::custom(error.to_string()))?,
+        })
+    }
+
+    fn save_prompt_cache(
+        &self,
+        cache: &mut Self::Cache,
+        destination: &Path,
+        descriptor: PromptCacheDescriptor,
+        prefix_token_ids: &[u32],
+        options: &PromptCacheOptions,
+        _stream: &Stream,
+    ) -> Result<PromptCacheManifest, Error> {
+        cache
+            .save_prompt_cache(destination, descriptor, prefix_token_ids, options)
+            .map_err(Into::into)
+    }
+
+    fn load_prompt_cache(
+        &self,
+        directory: &Path,
+        expected: &PromptCacheDescriptor,
+        identity: &PromptCacheModelIdentity,
+        prefix_token_ids: &[u32],
+        options: PagedCacheOptions,
+        _stream: &Stream,
+    ) -> Result<(Self::Cache, PromptCacheManifest), Error> {
+        Cache::load_prompt_cache(
+            &self.args.layer_schedule,
+            directory,
+            expected,
+            identity,
+            prefix_token_ids,
+            options,
+        )
+        .map_err(Into::into)
+    }
 
     fn static_units(&self, store: &dyn WeightStore) -> Result<Vec<StaticUnitBindings>, Error> {
         Ok(vec![
@@ -682,9 +837,17 @@ impl GeneralLayerwiseModelAdapter for DeepSeekV3LayerwiseAdapter {
                 leases.len()
             )));
         }
-        populate_module_from_lease(&mut self.embedding, &leases[0])?;
+        if let Some(embedding) = &mut self.parallel_embedding {
+            populate_module_from_lease(embedding.inner_mut(), &leases[0])?;
+        } else {
+            populate_module_from_lease(&mut self.embedding, &leases[0])?;
+        }
         populate_module_from_lease(&mut self.norm, &leases[1])?;
-        populate_module_from_lease(&mut self.lm_head, &leases[2])?;
+        if let Some(head) = &mut self.parallel_lm_head {
+            populate_module_from_lease(head.inner_mut(), &leases[2])?;
+        } else {
+            populate_module_from_lease(&mut self.lm_head, &leases[2])?;
+        }
         Ok(())
     }
 
@@ -727,6 +890,34 @@ impl GeneralLayerwiseModelAdapter for DeepSeekV3LayerwiseAdapter {
         })
     }
 
+    fn begin_forward_with_execution<'a>(
+        &mut self,
+        input: Self::Input<'a>,
+        cache: &mut Self::Cache,
+        execution: &crate::runtime::distributed::parallel::ParallelExecutionContext<'_>,
+    ) -> Result<LayerwiseForwardState<Self::ForwardContext>, Error> {
+        let Some(embedding) = &mut self.parallel_embedding else {
+            return self.begin_forward(input, cache, execution.stream());
+        };
+        let hidden = embedding.forward(input, execution)?;
+        let offset = cache.offset();
+        let mask = if hidden.dim(1) > 1 && offset > 0 {
+            Some(create_causal_mask(
+                hidden.dim(1),
+                Some(offset),
+                None,
+                None,
+                execution.stream(),
+            )?)
+        } else {
+            None
+        };
+        Ok(LayerwiseForwardState {
+            hidden,
+            context: DeepSeekV3ForwardContext { mask },
+        })
+    }
+
     fn execution_group_count(&self) -> usize {
         1
     }
@@ -758,6 +949,93 @@ impl GeneralLayerwiseModelAdapter for DeepSeekV3LayerwiseAdapter {
             index as i32,
             stream,
         )?)
+    }
+
+    fn register_parallel_parameters(
+        &self,
+        _context: crate::runtime::distributed::parallel::ParallelBuildContext,
+        planner: &mut crate::runtime::distributed::parallel::ParallelPlanBuilder,
+        stream: &Stream,
+    ) -> Result<(), Error> {
+        planner.register(crate::nn::parallel::vocab_embedding_parameter_group(
+            &self.embedding,
+            "model.embed_tokens",
+            self.args.vocab_size as usize,
+            self.args.hidden_size,
+            false,
+        )?)?;
+        crate::nn::parallel::register_replicated_parameter_group(
+            planner,
+            &self.norm,
+            "model.norm",
+        )?;
+        planner.register(crate::nn::parallel::vocab_lm_head_parameter_group(
+            &self.lm_head,
+            "lm_head",
+            self.args.hidden_size,
+            self.args.vocab_size as usize,
+            false,
+        )?)?;
+        for index in 0..self.args.layer_schedule.len() {
+            let layer = DecoderLayer::new_layerwise(&self.args, index as i32, stream)?;
+            crate::architectures::distributed::tensor::insert_deepseek_layer_plan(
+                planner, &layer, index,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn configure_parallel_static(
+        &mut self,
+        context: crate::runtime::distributed::parallel::ParallelBuildContext,
+        _layout: &crate::runtime::distributed::parallel::LocalModelLayout,
+        stream: &Stream,
+    ) -> Result<(), Error> {
+        self.parallel_embedding = Some(VocabParallelEmbedding::unloaded(
+            self.args.vocab_size as usize,
+            self.args.hidden_size,
+            self.args
+                .weight_quantization_for("model.embed_tokens.weight"),
+            context,
+            stream,
+        )?);
+        self.parallel_lm_head = Some(VocabParallelLmHead::unloaded(
+            self.args.hidden_size,
+            self.args.vocab_size as usize,
+            self.args.weight_quantization_for("lm_head.weight"),
+            context,
+            stream,
+        )?);
+        Ok(())
+    }
+
+    fn new_parallel_layer(
+        &self,
+        group: usize,
+        index: usize,
+        layout: &crate::runtime::distributed::parallel::LocalModelLayout,
+        stream: &Stream,
+    ) -> Result<Self::Layer, Error> {
+        self.layer_count(group)?;
+        let prefix = format!("model.layers.{index}");
+        let tensor = |suffix: &str| {
+            layout
+                .tensor(&format!("{prefix}.{suffix}.weight"))
+                .or_else(|| layout.tensor(&format!("{prefix}.{suffix}.inner.weight")))
+        };
+        let attention = tensor("self_attn.q_proj")
+            .or_else(|| tensor("self_attn.q_b_proj"))
+            .ok_or_else(|| Error::Parallel(format!("missing TP layout for {prefix} MLA query")))?;
+        let mut args = self.args.clone();
+        args.num_attention_heads =
+            attention.local_shape()[0] as i32 / (args.qk_nope_head_dim + args.qk_rope_head_dim);
+        if let Some(gate) = tensor("mlp.gate_proj") {
+            args.intermediate_size = gate.local_shape()[0] as i32;
+        }
+        if let Some(gate) = layout.tensor(&format!("{prefix}.mlp.experts.gate_proj")) {
+            args.moe_intermediate_size = gate.local_shape()[1] as i32;
+        }
+        Ok(DecoderLayer::new_layerwise(&args, index as i32, stream)?)
     }
 
     fn layer_checkpoint_prefix(&self, _group: usize, index: usize) -> String {
@@ -808,6 +1086,23 @@ impl GeneralLayerwiseModelAdapter for DeepSeekV3LayerwiseAdapter {
         } else {
             Ok(bindings)
         }
+    }
+
+    fn parallel_layer_bindings(
+        &self,
+        group: usize,
+        index: usize,
+        _layer: &Self::Layer,
+        store: &dyn WeightStore,
+        layout: &crate::runtime::distributed::parallel::LocalModelLayout,
+        stream: &Stream,
+    ) -> Result<Vec<WeightBinding>, Error> {
+        let global = self.new_layer(group, index, stream)?;
+        crate::runtime::execution::layerwise::shard_layer_bindings(
+            self.layer_bindings(group, index, &global, store)?,
+            &self.layer_checkpoint_prefix(group, index),
+            layout,
+        )
     }
 
     fn additional_consumed_checkpoint_keys(&self, store: &dyn WeightStore) -> Vec<String> {
@@ -959,6 +1254,37 @@ impl GeneralLayerwiseModelAdapter for DeepSeekV3LayerwiseAdapter {
         )?)
     }
 
+    fn forward_layer_with_execution(
+        &mut self,
+        group: usize,
+        index: usize,
+        layer: &mut Self::Layer,
+        hidden: &Array,
+        cache: &mut Self::Cache,
+        context: &mut Self::ForwardContext,
+        execution: &crate::runtime::distributed::parallel::ParallelExecutionContext<'_>,
+    ) -> Result<Array, Error> {
+        let Some(tp_group) = execution.group() else {
+            return self.forward_layer(
+                group,
+                index,
+                layer,
+                hidden,
+                cache,
+                context,
+                execution.stream(),
+            );
+        };
+        self.layer_count(group)?;
+        Ok(layer.forward_tensor_parallel(
+            hidden,
+            context.mask.as_ref(),
+            Some(&mut cache.layers[index]),
+            tp_group,
+            execution.stream(),
+        )?)
+    }
+
     fn retained_arrays<'a>(
         &self,
         cache: &'a Self::Cache,
@@ -980,6 +1306,20 @@ impl GeneralLayerwiseModelAdapter for DeepSeekV3LayerwiseAdapter {
     ) -> Result<Array, Error> {
         let hidden = self.norm.forward(hidden, stream)?;
         Ok(self.lm_head.forward(&hidden, stream)?)
+    }
+
+    fn finish_with_execution(
+        &mut self,
+        hidden: &Array,
+        cache: &mut Self::Cache,
+        context: &Self::ForwardContext,
+        execution: &crate::runtime::distributed::parallel::ParallelExecutionContext<'_>,
+    ) -> Result<Array, Error> {
+        let Some(head) = &mut self.parallel_lm_head else {
+            return self.finish(hidden, cache, context, execution.stream());
+        };
+        let hidden = self.norm.forward(hidden, execution.stream())?;
+        head.forward(&hidden, execution)?.all_gather(execution)
     }
 
     fn ignores_checkpoint_key(&self, key: &str) -> bool {
@@ -1109,7 +1449,7 @@ mod tests {
         },
         runtime::attention::LayerSchedule,
         runtime::checkpoint::binding::canonical_checkpoint_name,
-        runtime::execution::layerwise::{load_general_layerwise_model, LayerwiseLoadOptions},
+        runtime::execution::layerwise::{load_layerwise_model, LayerwiseLoadOptions},
         runtime::residency::expert_cache::ExpertCacheLoadOptions,
         runtime::residency::policy::{OffloadConfig, ResidencyPolicy},
     };
@@ -1345,7 +1685,7 @@ mod tests {
 
         let options = LayerwiseLoadOptions::new(OffloadConfig::new(None, None, 1).unwrap());
         let adapter = DeepSeekV3LayerwiseAdapter::new(custom_args, gpu.stream()).unwrap();
-        let execution = load_general_layerwise_model(
+        let execution = load_layerwise_model(
             directory.path(),
             adapter,
             options,

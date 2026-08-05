@@ -52,6 +52,7 @@ impl Gemma4VisionConfig {
 
 #[derive(Debug, Clone, ModuleParameters)]
 pub(crate) struct VisionPatchEmbedder {
+    pub parallel_parts: usize,
     #[param]
     pub input_proj: nn::Linear,
     #[param]
@@ -61,6 +62,7 @@ pub(crate) struct VisionPatchEmbedder {
 impl VisionPatchEmbedder {
     pub(crate) fn new(config: &Gemma4VisionConfig, stream: &Stream) -> Result<Self, Exception> {
         Ok(Self {
+            parallel_parts: 1,
             input_proj: nn::Linear::unloaded(
                 3 * config.patch_size * config.patch_size,
                 config.hidden_size,
@@ -70,6 +72,32 @@ impl VisionPatchEmbedder {
             )?,
             position_embedding_table: Param::<Array>::unloaded(
                 &[2, config.position_embedding_size, config.hidden_size],
+                Dtype::Float32,
+                stream,
+            )?,
+        })
+    }
+
+    pub(crate) fn new_tensor_parallel(
+        config: &Gemma4VisionConfig,
+        context: crate::runtime::distributed::parallel::ParallelBuildContext,
+        stream: &Stream,
+    ) -> Result<Self, crate::error::Error> {
+        let local = context.equal_local_dimension(
+            "Gemma vision patch hidden size",
+            config.hidden_size as usize,
+        )?;
+        Ok(Self {
+            parallel_parts: context.topology().tensor_parallel_size,
+            input_proj: nn::Linear::unloaded(
+                3 * config.patch_size * config.patch_size,
+                local as i32,
+                false,
+                Dtype::Float32,
+                stream,
+            )?,
+            position_embedding_table: Param::<Array>::unloaded(
+                &[2, config.position_embedding_size, local as i32],
                 Dtype::Float32,
                 stream,
             )?,
@@ -112,6 +140,21 @@ impl VisionPatchEmbedder {
             self.input_proj
                 .forward(&scaled_pixels, stream)?
                 .add(positions, stream)?,
+            padding,
+        ))
+    }
+
+    pub(crate) fn forward_tensor_parallel(
+        &mut self,
+        pixel_values: &Array,
+        position_ids: &Array,
+        group: &safemlx::distributed::Group,
+        stream: &Stream,
+    ) -> Result<(Array, Array), Exception> {
+        let (local, padding) = self.forward(pixel_values, position_ids, stream)?;
+        let widths = vec![local.dim(-1) as usize; self.parallel_parts];
+        Ok((
+            safemlx::distributed::all_gather_uneven_axis(&local, -1, &widths, group, stream)?,
             padding,
         ))
     }
@@ -163,6 +206,56 @@ impl VisionAttention {
             )?,
             o_proj: Gemma4ClippedLinear::new(
                 config.num_attention_heads * config.head_dim,
+                config.hidden_size,
+                false,
+                stream,
+            )?,
+            q_norm: nn::RmsNorm::unloaded(
+                config.head_dim,
+                config.rms_norm_eps,
+                Dtype::Float32,
+                stream,
+            )?,
+            k_norm: nn::RmsNorm::unloaded(
+                config.head_dim,
+                config.rms_norm_eps,
+                Dtype::Float32,
+                stream,
+            )?,
+            norm_eps: config.rms_norm_eps,
+        })
+    }
+
+    fn new_tensor_parallel(
+        config: &Gemma4VisionConfig,
+        local_heads: i32,
+        local_kv_heads: i32,
+        stream: &Stream,
+    ) -> Result<Self, Exception> {
+        Ok(Self {
+            num_heads: local_heads,
+            num_kv_heads: local_kv_heads,
+            head_dim: config.head_dim,
+            q_proj: Gemma4ClippedLinear::new(
+                config.hidden_size,
+                local_heads * config.head_dim,
+                false,
+                stream,
+            )?,
+            k_proj: Gemma4ClippedLinear::new(
+                config.hidden_size,
+                local_kv_heads * config.head_dim,
+                false,
+                stream,
+            )?,
+            v_proj: Gemma4ClippedLinear::new(
+                config.hidden_size,
+                local_kv_heads * config.head_dim,
+                false,
+                stream,
+            )?,
+            o_proj: Gemma4ClippedLinear::new(
+                local_heads * config.head_dim,
                 config.hidden_size,
                 false,
                 stream,
@@ -236,6 +329,61 @@ impl VisionAttention {
         .reshape(&[batch, sequence, -1], stream)?;
         self.o_proj.forward(&output, stream)
     }
+
+    fn forward_tensor_parallel(
+        &mut self,
+        hidden: &Array,
+        padding: &Array,
+        cos: &Array,
+        sin: &Array,
+        group: &safemlx::distributed::Group,
+        stream: &Stream,
+    ) -> Result<Array, Exception> {
+        let batch = hidden.dim(0);
+        let sequence = hidden.dim(1);
+        let query = self.q_norm.forward(
+            &self
+                .q_proj
+                .forward(hidden, stream)?
+                .reshape(&[batch, sequence, self.num_heads, self.head_dim], stream)?,
+            stream,
+        )?;
+        let key = self.k_norm.forward(
+            &self
+                .k_proj
+                .forward(hidden, stream)?
+                .reshape(&[batch, sequence, self.num_kv_heads, self.head_dim], stream)?,
+            stream,
+        )?;
+        let value = rms_norm_without_scale(
+            &self
+                .v_proj
+                .forward(hidden, stream)?
+                .reshape(&[batch, sequence, self.num_kv_heads, self.head_dim], stream)?,
+            self.norm_eps,
+            stream,
+        )?;
+        let query =
+            apply_2d_rope(query, cos, sin, stream)?.transpose_axes(&[0, 2, 1, 3], stream)?;
+        let key = apply_2d_rope(key, cos, sin, stream)?.transpose_axes(&[0, 2, 1, 3], stream)?;
+        let value = value.transpose_axes(&[0, 2, 1, 3], stream)?;
+        let key_mask = padding
+            .try_index_device((.., NewAxis, NewAxis, ..), stream)?
+            .as_dtype(query.dtype(), stream)?
+            .multiply(Array::from_f32(-1.0e9), stream)?;
+        let output = scaled_dot_product_attention(
+            query,
+            key,
+            value,
+            1.0,
+            Some(ScaledDotProductAttentionMask::Array(&key_mask)),
+            None,
+            stream,
+        )?
+        .transpose_axes(&[0, 2, 1, 3], stream)?
+        .reshape(&[batch, sequence, -1], stream)?;
+        self.o_proj.forward_row_parallel(&output, group, stream)
+    }
 }
 
 #[derive(Debug, Clone, ModuleParameters)]
@@ -274,6 +422,34 @@ impl VisionMlp {
         })
     }
 
+    fn new_tensor_parallel(
+        config: &Gemma4VisionConfig,
+        local_intermediate: i32,
+        stream: &Stream,
+    ) -> Result<Self, Exception> {
+        Ok(Self {
+            activation: config.hidden_activation.clone(),
+            gate_proj: Gemma4ClippedLinear::new(
+                config.hidden_size,
+                local_intermediate,
+                false,
+                stream,
+            )?,
+            up_proj: Gemma4ClippedLinear::new(
+                config.hidden_size,
+                local_intermediate,
+                false,
+                stream,
+            )?,
+            down_proj: Gemma4ClippedLinear::new(
+                local_intermediate,
+                config.hidden_size,
+                false,
+                stream,
+            )?,
+        })
+    }
+
     fn forward(&mut self, x: &Array, stream: &Stream) -> Result<Array, Exception> {
         if self.activation != "gelu_pytorch_tanh" && self.activation != "gelu_new" {
             return Err(Exception::custom(format!(
@@ -284,6 +460,24 @@ impl VisionMlp {
         let gate = nn::gelu_approximate(self.gate_proj.forward(x, stream)?, stream)?;
         let up = self.up_proj.forward(x, stream)?;
         self.down_proj.forward(&gate.multiply(up, stream)?, stream)
+    }
+
+    fn forward_tensor_parallel(
+        &mut self,
+        x: &Array,
+        group: &safemlx::distributed::Group,
+        stream: &Stream,
+    ) -> Result<Array, Exception> {
+        if self.activation != "gelu_pytorch_tanh" && self.activation != "gelu_new" {
+            return Err(Exception::custom(format!(
+                "Gemma 4 vision activation '{}' is not supported",
+                self.activation
+            )));
+        }
+        let gate = nn::gelu_approximate(self.gate_proj.forward(x, stream)?, stream)?;
+        let up = self.up_proj.forward(x, stream)?;
+        self.down_proj
+            .forward_row_parallel(&gate.multiply(up, stream)?, group, stream)
     }
 }
 
@@ -324,6 +518,20 @@ impl VisionLayer {
         })
     }
 
+    pub(crate) fn new_tensor_parallel(
+        config: &Gemma4VisionConfig,
+        local_heads: i32,
+        local_kv_heads: i32,
+        local_intermediate: i32,
+        stream: &Stream,
+    ) -> Result<Self, Exception> {
+        let mut layer = Self::new(config, stream)?;
+        layer.self_attn =
+            VisionAttention::new_tensor_parallel(config, local_heads, local_kv_heads, stream)?;
+        layer.mlp = VisionMlp::new_tensor_parallel(config, local_intermediate, stream)?;
+        Ok(layer)
+    }
+
     pub(crate) fn forward(
         &mut self,
         hidden: &Array,
@@ -345,6 +553,39 @@ impl VisionLayer {
         )?;
         let feed_forward = self.mlp.forward(
             &self.pre_feedforward_layernorm.forward(&hidden, stream)?,
+            stream,
+        )?;
+        hidden.add(
+            self.post_feedforward_layernorm
+                .forward(&feed_forward, stream)?,
+            stream,
+        )
+    }
+
+    pub(crate) fn forward_tensor_parallel(
+        &mut self,
+        hidden: &Array,
+        padding: &Array,
+        cos: &Array,
+        sin: &Array,
+        group: &safemlx::distributed::Group,
+        stream: &Stream,
+    ) -> Result<Array, Exception> {
+        let attention = self.self_attn.forward_tensor_parallel(
+            &self.input_layernorm.forward(hidden, stream)?,
+            padding,
+            cos,
+            sin,
+            group,
+            stream,
+        )?;
+        let hidden = hidden.add(
+            self.post_attention_layernorm.forward(&attention, stream)?,
+            stream,
+        )?;
+        let feed_forward = self.mlp.forward_tensor_parallel(
+            &self.pre_feedforward_layernorm.forward(&hidden, stream)?,
+            group,
             stream,
         )?;
         hidden.add(
@@ -401,6 +642,38 @@ impl Gemma4VisionLayerwiseStatic {
         let (hidden, padding) = self
             .patch_embedder
             .forward(pixel_values, position_ids, stream)?;
+        let working_dtype = hidden.dtype();
+        let (cos, sin) = vision_rope(
+            position_ids,
+            self.config.head_dim,
+            self.config.rope_theta(),
+            stream,
+        )?;
+        Ok((
+            hidden,
+            Gemma4VisionLayerwiseState {
+                position_ids: position_ids.clone(),
+                padding,
+                cos,
+                sin,
+                working_dtype,
+            },
+        ))
+    }
+
+    pub(crate) fn begin_tensor_parallel(
+        &mut self,
+        pixel_values: &Array,
+        position_ids: &Array,
+        group: &safemlx::distributed::Group,
+        stream: &Stream,
+    ) -> Result<(Array, Gemma4VisionLayerwiseState), Exception> {
+        let (hidden, padding) = self.patch_embedder.forward_tensor_parallel(
+            pixel_values,
+            position_ids,
+            group,
+            stream,
+        )?;
         let working_dtype = hidden.dtype();
         let (cos, sin) = vision_rope(
             position_ids,

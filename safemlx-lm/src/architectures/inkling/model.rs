@@ -9,6 +9,7 @@
 
 use std::{
     collections::{BTreeMap, HashMap},
+    ops::Range,
     path::Path,
 };
 
@@ -915,6 +916,17 @@ impl InklingAttention {
         }
     }
 
+    fn forward_tensor_parallel(
+        &mut self,
+        hidden: &Array,
+        cache: Option<&mut LayerCache>,
+        group: &safemlx::distributed::Group,
+        stream: &Stream,
+    ) -> Result<Array, Exception> {
+        let partial = self.forward(hidden, cache, stream)?;
+        safemlx::distributed::all_sum(&partial, group, stream)
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn attend_chunked(
         &mut self,
@@ -1300,6 +1312,16 @@ impl InklingMoe {
         routed.add(shared, stream)?.reshape(&shape, stream)
     }
 
+    fn forward_tensor_parallel(
+        &mut self,
+        hidden: &Array,
+        group: &safemlx::distributed::Group,
+        stream: &Stream,
+    ) -> Result<Array, Exception> {
+        let partial = self.forward(hidden, stream)?;
+        safemlx::distributed::all_sum(&partial, group, stream)
+    }
+
     fn forward_with_expert_executor<F>(
         &mut self,
         hidden: &Array,
@@ -1423,6 +1445,263 @@ impl DecoderLayer {
         })
     }
 
+    pub(crate) fn new_tensor_parallel(
+        args: &TextArgs,
+        layer: i32,
+        parts: usize,
+        stream: &Stream,
+    ) -> Result<Self, Exception> {
+        let parts =
+            i32::try_from(parts).map_err(|_| Exception::custom("Inkling TP size exceeds i32"))?;
+        let divide = |name: &str, value: i32| {
+            if value <= 0 || value % parts != 0 {
+                Err(Exception::custom(format!(
+                    "Inkling {name} {value} is not divisible by TP size {parts}"
+                )))
+            } else {
+                Ok(value / parts)
+            }
+        };
+        let mut local = args.clone();
+        local.num_attention_heads = divide("attention heads", args.num_attention_heads)?;
+        local.num_key_value_heads = divide("KV heads", args.num_key_value_heads)?;
+        local.swa_num_attention_heads = args
+            .swa_num_attention_heads
+            .map(|value| divide("sliding attention heads", value))
+            .transpose()?;
+        local.swa_num_key_value_heads = args
+            .swa_num_key_value_heads
+            .map(|value| divide("sliding KV heads", value))
+            .transpose()?;
+        local.dense_intermediate_size = Some(divide(
+            "dense intermediate width",
+            args.dense_intermediate_size(),
+        )?);
+        local.moe_intermediate_size = Some(divide(
+            "expert intermediate width",
+            args.moe_intermediate_size(),
+        )?);
+        Self::new(&local, layer, stream)
+    }
+
+    pub(crate) fn register_tensor_parallel_parameters(
+        &self,
+        planner: &mut crate::runtime::distributed::parallel::ParallelPlanBuilder,
+        prefix: &str,
+    ) -> Result<(), Error> {
+        use crate::nn::parallel::LinearParallelism;
+        use crate::runtime::distributed::parallel::{
+            MemberSharding, ParameterGroupSpec, ParameterMemberSpec, ParameterRole,
+        };
+        let register_linear =
+            |planner: &mut crate::runtime::distributed::parallel::ParallelPlanBuilder,
+             projection: &MaybeQuantized<nn::Linear>,
+             name: &str,
+             parallelism| {
+                crate::nn::parallel::register_linear_parameter_group(
+                    planner,
+                    projection,
+                    &format!("{prefix}.{name}"),
+                    parallelism,
+                )
+            };
+        for (name, projection) in [
+            ("self_attn.q_proj", &self.self_attn.q_proj),
+            ("self_attn.k_proj", &self.self_attn.k_proj),
+            ("self_attn.v_proj", &self.self_attn.v_proj),
+            ("self_attn.r_proj", &self.self_attn.r_proj),
+        ] {
+            register_linear(planner, projection, name, LinearParallelism::Column)?;
+        }
+        register_linear(
+            planner,
+            &self.self_attn.o_proj,
+            "self_attn.o_proj",
+            LinearParallelism::Row,
+        )?;
+        macro_rules! replicated {
+            ($name:literal, $module:expr) => {
+                crate::nn::parallel::register_replicated_parameter_group(
+                    planner,
+                    $module,
+                    &format!("{prefix}.{}", $name),
+                )?;
+            };
+        }
+        replicated!("input_layernorm", &self.input_layernorm);
+        replicated!("post_attention_layernorm", &self.post_attention_layernorm);
+        replicated!("self_attn.q_norm", &self.self_attn.q_norm);
+        replicated!("self_attn.k_norm", &self.self_attn.k_norm);
+        replicated!("attn_sconv", &self.attn_sconv);
+        replicated!("mlp_sconv", &self.mlp_sconv);
+        planner.register(ParameterGroupSpec::new(
+            format!("{prefix}.self_attn.rel_proj"),
+            ParameterRole::Replicated,
+            [ParameterMemberSpec::new(
+                format!("{prefix}.self_attn.rel_proj"),
+                self.self_attn
+                    .rel_proj
+                    .value
+                    .shape()
+                    .iter()
+                    .map(|&value| value as usize)
+                    .collect::<Vec<_>>(),
+                MemberSharding::Replicated,
+            )],
+        )?)?;
+        if let Some(scale) = self.dense_global_scale.value.as_ref() {
+            planner.register(ParameterGroupSpec::new(
+                format!("{prefix}.dense_global_scale"),
+                ParameterRole::Replicated,
+                [ParameterMemberSpec::new(
+                    format!("{prefix}.dense_global_scale"),
+                    scale
+                        .shape()
+                        .iter()
+                        .map(|&value| value as usize)
+                        .collect::<Vec<_>>(),
+                    MemberSharding::Replicated,
+                )],
+            )?)?;
+        }
+        for (name, convolution) in [
+            ("self_attn.k_sconv", &self.self_attn.k_sconv),
+            ("self_attn.v_sconv", &self.self_attn.v_sconv),
+        ] {
+            let mut members = vec![ParameterMemberSpec::new(
+                format!("{prefix}.{name}.weight"),
+                convolution
+                    .weight
+                    .value
+                    .shape()
+                    .iter()
+                    .map(|&value| value as usize)
+                    .collect::<Vec<_>>(),
+                MemberSharding::Equal { axis: 0 },
+            )];
+            if let Some(bias) = &convolution.bias.value {
+                members.push(ParameterMemberSpec::new(
+                    format!("{prefix}.{name}.bias"),
+                    [bias.dim(0) as usize],
+                    MemberSharding::Equal { axis: 0 },
+                ));
+            }
+            planner.register(ParameterGroupSpec::new(
+                format!("{prefix}.{name}"),
+                ParameterRole::Channels,
+                members,
+            )?)?;
+        }
+        if let Some(dense) = &self.dense {
+            for (name, projection, parallelism) in [
+                (
+                    "dense.gate_proj",
+                    &dense.gate_proj,
+                    LinearParallelism::Column,
+                ),
+                ("dense.up_proj", &dense.up_proj, LinearParallelism::Column),
+                ("dense.down_proj", &dense.down_proj, LinearParallelism::Row),
+            ] {
+                register_linear(planner, projection, name, parallelism)?;
+            }
+        }
+        if let Some(moe) = &self.moe {
+            crate::nn::parallel::register_replicated_parameter_group(
+                planner,
+                &moe.router,
+                &format!("{prefix}.moe.router"),
+            )?;
+            for (bank_name, bank) in [
+                ("experts", &moe.experts),
+                ("shared_experts", &moe.shared_experts),
+            ] {
+                let bank_prefix = format!("{prefix}.moe.{bank_name}");
+                let mut gate_up = vec![ParameterMemberSpec::new(
+                    format!("{bank_prefix}.gate_up_proj"),
+                    bank.gate_up_proj
+                        .value
+                        .shape()
+                        .iter()
+                        .map(|&value| value as usize)
+                        .collect::<Vec<_>>(),
+                    MemberSharding::Segmented {
+                        axis: 1,
+                        segments: vec![
+                            0..bank.intermediate_dim as usize,
+                            bank.intermediate_dim as usize..2 * bank.intermediate_dim as usize,
+                        ],
+                    },
+                )];
+                for (suffix, value) in [
+                    (
+                        "gate_up_proj_scales",
+                        bank.gate_up_proj_scales.value.as_ref(),
+                    ),
+                    (
+                        "gate_up_proj_biases",
+                        bank.gate_up_proj_biases.value.as_ref(),
+                    ),
+                ] {
+                    if let Some(value) = value {
+                        gate_up.push(ParameterMemberSpec::new(
+                            format!("{bank_prefix}.{suffix}"),
+                            value
+                                .shape()
+                                .iter()
+                                .map(|&value| value as usize)
+                                .collect::<Vec<_>>(),
+                            MemberSharding::Segmented {
+                                axis: 1,
+                                segments: vec![
+                                    0..bank.intermediate_dim as usize,
+                                    bank.intermediate_dim as usize
+                                        ..2 * bank.intermediate_dim as usize,
+                                ],
+                            },
+                        ));
+                    }
+                }
+                planner.register(ParameterGroupSpec::new(
+                    format!("{bank_prefix}.gate_up"),
+                    ParameterRole::ExpertIntermediate,
+                    gate_up,
+                )?)?;
+                let mut down = vec![ParameterMemberSpec::new(
+                    format!("{bank_prefix}.down_proj"),
+                    bank.down_proj
+                        .value
+                        .shape()
+                        .iter()
+                        .map(|&value| value as usize)
+                        .collect::<Vec<_>>(),
+                    MemberSharding::Equal { axis: 2 },
+                )];
+                for (suffix, value) in [
+                    ("down_proj_scales", bank.down_proj_scales.value.as_ref()),
+                    ("down_proj_biases", bank.down_proj_biases.value.as_ref()),
+                ] {
+                    if let Some(value) = value {
+                        down.push(ParameterMemberSpec::new(
+                            format!("{bank_prefix}.{suffix}"),
+                            value
+                                .shape()
+                                .iter()
+                                .map(|&value| value as usize)
+                                .collect::<Vec<_>>(),
+                            MemberSharding::Equal { axis: 2 },
+                        ));
+                    }
+                }
+                planner.register(ParameterGroupSpec::new(
+                    format!("{bank_prefix}.down"),
+                    ParameterRole::ExpertIntermediate,
+                    down,
+                )?)?;
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn forward(
         &mut self,
         hidden: &Array,
@@ -1461,6 +1740,71 @@ impl DecoderLayer {
                 hidden.add(mlp, stream)
             }
         }
+    }
+
+    pub(crate) fn forward_tensor_parallel(
+        &mut self,
+        hidden: &Array,
+        cache: Option<&mut LayerCache>,
+        group: &safemlx::distributed::Group,
+        stream: &Stream,
+    ) -> Result<Array, Exception> {
+        let normalized = self.input_layernorm.forward(hidden, stream)?;
+        let (attention, mut mlp_cache) = match cache {
+            Some(cache) => {
+                let attention = self.self_attn.forward_tensor_parallel(
+                    &normalized,
+                    Some(cache),
+                    group,
+                    stream,
+                )?;
+                (attention, Some(cache))
+            }
+            None => (
+                self.self_attn
+                    .forward_tensor_parallel(&normalized, None, group, stream)?,
+                None,
+            ),
+        };
+        let attention = short_convolution(
+            &self.attn_sconv,
+            &attention,
+            mlp_cache
+                .as_deref_mut()
+                .map(|cache| &mut cache.convolutions[2]),
+            stream,
+        )?;
+        let hidden = hidden.add(attention, stream)?;
+        let normalized = self.post_attention_layernorm.forward(&hidden, stream)?;
+        let mlp = if let Some(dense) = &mut self.dense {
+            let gate =
+                crate::nn::layers::silu(dense.gate_proj.forward(&normalized, stream)?, stream)?;
+            let up = dense.up_proj.forward(&normalized, stream)?;
+            let partial = crate::nn::parallel::forward_row_parallel(
+                &mut dense.down_proj,
+                &gate.multiply(up, stream)?,
+                group,
+                stream,
+            )?;
+            match self.dense_global_scale.as_ref() {
+                Some(scale) => partial.multiply(scale, stream)?,
+                None => partial,
+            }
+        } else {
+            self.moe
+                .as_mut()
+                .expect("validated sparse layer")
+                .forward_tensor_parallel(&normalized, group, stream)?
+        };
+        let mlp = short_convolution(
+            &self.mlp_sconv,
+            &mlp,
+            mlp_cache
+                .as_deref_mut()
+                .map(|cache| &mut cache.convolutions[3]),
+            stream,
+        )?;
+        hidden.add(mlp, stream)
     }
 
     pub(crate) fn forward_with_expert_executor<F>(
@@ -1652,6 +1996,8 @@ pub(crate) struct AudioModel {
     encoder: MaybeQuantized<nn::Embedding>,
     #[param]
     final_norm: nn::RmsNorm,
+    parallel_range: Option<Range<usize>>,
+    parallel_parts: usize,
 }
 
 impl AudioModel {
@@ -1676,7 +2022,75 @@ impl AudioModel {
                 dense_dtype,
                 stream,
             )?,
+            parallel_range: None,
+            parallel_parts: 1,
         })
+    }
+
+    pub(crate) fn new_tensor_parallel(
+        args: &AudioArgs,
+        dense_dtype: Dtype,
+        topology: crate::runtime::distributed::topology::ParallelTopology,
+        stream: &Stream,
+    ) -> Result<Self, Error> {
+        let global = (args.num_codebooks * args.codebook_size) as usize;
+        let range = crate::runtime::distributed::topology::balanced_contiguous_range(
+            global,
+            topology.tensor_parallel_size,
+            topology.tensor_parallel_rank,
+            false,
+        )?;
+        Ok(Self {
+            num_codebooks: args.num_codebooks,
+            codebook_size: args.codebook_size,
+            encoder: common::linear::unloaded_maybe_quantized_embedding_with_dtype(
+                range.len() as i32,
+                args.text_hidden_size,
+                args.weight_quantization_for("audio.encoder.weight"),
+                dense_dtype,
+                stream,
+            )?,
+            final_norm: nn::RmsNorm::unloaded(
+                args.text_hidden_size,
+                args.rms_norm_eps,
+                dense_dtype,
+                stream,
+            )?,
+            parallel_range: Some(range),
+            parallel_parts: topology.tensor_parallel_size,
+        })
+    }
+
+    pub(crate) fn register_tensor_parallel_parameters(
+        &self,
+        planner: &mut crate::runtime::distributed::parallel::ParallelPlanBuilder,
+        prefix: &str,
+    ) -> Result<(), Error> {
+        use crate::runtime::distributed::parallel::{
+            MemberSharding, ParameterGroupSpec, ParameterMemberSpec, ParameterRole,
+        };
+        let mut members = Vec::new();
+        for (name, value) in self.encoder.parameters().flatten() {
+            members.push(ParameterMemberSpec::new(
+                format!("{prefix}.encoder.{name}"),
+                value
+                    .shape()
+                    .iter()
+                    .map(|&dimension| dimension as usize)
+                    .collect::<Vec<_>>(),
+                MemberSharding::Balanced { axis: 0 },
+            ));
+        }
+        planner.register(ParameterGroupSpec::new(
+            format!("{prefix}.encoder"),
+            ParameterRole::Vocabulary,
+            members,
+        )?)?;
+        crate::nn::parallel::register_replicated_parameter_group(
+            planner,
+            &self.final_norm,
+            &format!("{prefix}.final_norm"),
+        )
     }
 
     pub(crate) fn forward(
@@ -1729,6 +2143,67 @@ impl AudioModel {
         }
         Ok(embedded)
     }
+
+    pub(crate) fn forward_tensor_parallel(
+        &mut self,
+        input_ids: &Array,
+        mask: Option<&Array>,
+        group: &safemlx::distributed::Group,
+        stream: &Stream,
+    ) -> Result<Array, Exception> {
+        if group.size() != self.parallel_parts {
+            return Err(Exception::custom("Inkling audio TP group size mismatch"));
+        }
+        let range = self
+            .parallel_range
+            .as_ref()
+            .expect("TP Inkling audio encoder")
+            .clone();
+        let input_ids = match input_ids.ndim() {
+            2 => input_ids.try_index_device(NewAxis, stream)?,
+            3 if input_ids.dim(0) == 1 => input_ids.clone(),
+            _ => {
+                return Err(Exception::custom(format!(
+                    "Inkling audio IDs must be [frames, {}] or [1, frames, {}], got {:?}",
+                    self.num_codebooks,
+                    self.num_codebooks,
+                    input_ids.shape()
+                )))
+            }
+        };
+        let offsets = arange::<i32, i32>(
+            0,
+            self.num_codebooks * self.codebook_size,
+            self.codebook_size,
+            stream,
+        )?
+        .reshape(&[1, 1, self.num_codebooks], stream)?;
+        let indices = input_ids
+            .as_dtype(Dtype::Int32, stream)?
+            .add(offsets, stream)?;
+        let start = Array::from_int(range.start as i32);
+        let end = Array::from_int(range.end as i32);
+        let valid = indices
+            .ge(&start, stream)?
+            .logical_and(indices.lt(&end, stream)?, stream)?;
+        let local = indices.subtract(&start, stream)?;
+        let safe = r#where(&valid, &local, Array::from_int(0), stream)?;
+        let embedded = self.encoder.forward(&safe, stream)?;
+        let embedded = r#where(
+            &valid.expand_dims(-1, stream)?,
+            &embedded,
+            safemlx::ops::zeros_like(&embedded, stream)?,
+            stream,
+        )?;
+        let embedded = safemlx::distributed::all_sum(&embedded, group, stream)?;
+        let mut embedded = sum_axis(&embedded, -2, false, stream)?;
+        embedded = self.final_norm.forward(&embedded, stream)?;
+        if let Some(mask) = mask {
+            let valid = mask.sum(None, stream)?.item::<i32>(stream);
+            embedded = embedded.try_index_device((.., ..valid, ..), stream)?;
+        }
+        Ok(embedded)
+    }
 }
 
 #[derive(Debug, Clone, ModuleParameters)]
@@ -1769,7 +2244,17 @@ impl VisionLayer {
     }
 
     pub(crate) fn forward(&mut self, hidden: &Array, stream: &Stream) -> Result<Array, Exception> {
-        let mut hidden = if self.t_fold > 1 || self.hw_fold > 1 {
+        let mut hidden = self.fold(hidden, stream)?;
+        hidden = self.projection.forward(&hidden, stream)?;
+        if let Some(norm) = &mut self.layer_norm {
+            hidden = norm.forward(&hidden, stream)?;
+            hidden = nn::gelu(hidden, stream)?;
+        }
+        Ok(hidden)
+    }
+
+    fn fold(&self, hidden: &Array, stream: &Stream) -> Result<Array, Exception> {
+        if self.t_fold > 1 || self.hw_fold > 1 {
             let shape = hidden.shape();
             if shape.len() != 5
                 || shape[1] % self.t_fold != 0
@@ -1783,7 +2268,7 @@ impl VisionLayer {
             }
             let (batch, time, height, width, channels) =
                 (shape[0], shape[1], shape[2], shape[3], shape[4]);
-            hidden
+            Ok(hidden
                 .reshape(
                     &[
                         batch,
@@ -1807,11 +2292,34 @@ impl VisionLayer {
                         self.t_fold * self.hw_fold * self.hw_fold * channels,
                     ],
                     stream,
-                )?
+                )?)
         } else {
-            hidden.clone()
-        };
-        hidden = self.projection.forward(&hidden, stream)?;
+            Ok(hidden.clone())
+        }
+    }
+
+    pub(crate) fn forward_tensor_parallel(
+        &mut self,
+        hidden: &Array,
+        group: &safemlx::distributed::Group,
+        stream: &Stream,
+    ) -> Result<Array, Exception> {
+        let hidden = self.fold(hidden, stream)?;
+        let parts = i32::try_from(group.size())
+            .map_err(|_| Exception::custom("Inkling TP size exceeds i32"))?;
+        if hidden.dim(-1) % parts != 0 {
+            return Err(Exception::custom(format!(
+                "Inkling vision input width {} is not divisible by TP size {parts}",
+                hidden.dim(-1)
+            )));
+        }
+        let width = hidden.dim(-1) / parts;
+        let start = i32::try_from(group.rank())
+            .map_err(|_| Exception::custom("Inkling TP rank exceeds i32"))?
+            * width;
+        let local = hidden.try_index_device((.., .., .., .., start..start + width), stream)?;
+        let partial = self.projection.forward(&local, stream)?;
+        let mut hidden = safemlx::distributed::all_sum(&partial, group, stream)?;
         if let Some(norm) = &mut self.layer_norm {
             hidden = norm.forward(&hidden, stream)?;
             hidden = nn::gelu(hidden, stream)?;
@@ -2066,8 +2574,26 @@ impl Model {
             layer_layout: prompt_cache_layer_layout(args)
                 .map_err(|error| Exception::custom(error.to_string()))?,
         };
+        Self::load_prompt_cache_with_identity(
+            args,
+            directory,
+            expected,
+            prefix_token_ids,
+            &identity,
+            stream,
+        )
+    }
+
+    pub(crate) fn load_prompt_cache_with_identity(
+        args: &ModelArgs,
+        directory: impl AsRef<Path>,
+        expected: &PromptCacheDescriptor,
+        prefix_token_ids: &[u32],
+        identity: &PromptCacheModelIdentity,
+        stream: &Stream,
+    ) -> Result<(Cache, PromptCacheManifest), Exception> {
         let (blocks, states, manifest) =
-            open_prompt_cache_snapshot(directory, expected, &identity, prefix_token_ids, stream)
+            open_prompt_cache_snapshot(directory, expected, identity, prefix_token_ids, stream)
                 .map_err(|error| Exception::custom(error.to_string()))?;
         let mut block_map = BTreeMap::<usize, Vec<_>>::new();
         for block in blocks {

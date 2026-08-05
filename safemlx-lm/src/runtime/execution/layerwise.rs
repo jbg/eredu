@@ -1,8 +1,8 @@
 //! Architecture-independent execution of decoder models from resident layers.
 //!
 //! [`LayerwiseModel`] owns checkpoint storage, residency, bounded device
-//! windows, and synchronization. Model-family behavior is supplied by a
-//! [`LayerwiseModelAdapter`].
+//! windows, and synchronization. Model-family behavior is supplied by an
+//! [`ArchitectureAdapter`].
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -14,7 +14,10 @@ use safemlx::{module::ModuleParameters, transforms::eval, Array, Stream};
 
 use crate::{
     error::Error,
-    runtime::cache::KeyValueCache,
+    runtime::cache::residency::{
+        validate_prompt_cache_model_identity, PagedCacheOptions, PromptCacheDescriptor,
+        PromptCacheManifest, PromptCacheModelIdentity, PromptCacheOptions, PromptCacheTopology,
+    },
     runtime::checkpoint::binding::{
         binding_bytes, build_module_bindings, populate_module_from_lease, ModuleBindingError,
     },
@@ -1045,6 +1048,37 @@ pub struct LayerwiseModelMetadata {
     device_layer_window: usize,
 }
 
+/// Architecture-neutral information for a rank-local parallel model.
+#[derive(Debug, Clone)]
+pub struct ParallelModelInfo {
+    topology: crate::runtime::distributed::topology::ParallelTopology,
+    model_type: String,
+    owned_tensors: Vec<String>,
+    local_parameter_bytes: u64,
+}
+
+impl ParallelModelInfo {
+    /// Returns the complete distributed topology and this process's coordinates.
+    pub const fn topology(&self) -> crate::runtime::distributed::topology::ParallelTopology {
+        self.topology
+    }
+
+    /// Returns the adapter's normalized model type.
+    pub fn model_type(&self) -> &str {
+        &self.model_type
+    }
+
+    /// Returns exact checkpoint targets owned or replicated by this rank.
+    pub fn owned_tensors(&self) -> &[String] {
+        &self.owned_tensors
+    }
+
+    /// Returns planned rank-local parameter bytes across static and execution units.
+    pub const fn local_parameter_bytes(&self) -> u64 {
+        self.local_parameter_bytes
+    }
+}
+
 impl LayerwiseModelMetadata {
     /// Returns the checkpoint model type supplied by the adapter.
     pub fn model_type(&self) -> &str {
@@ -1100,82 +1134,6 @@ impl StaticUnitBindings {
     }
 }
 
-/// Architecture behavior required by the generic layerwise execution engine.
-pub trait LayerwiseModelAdapter: Sized {
-    /// Temporary unloaded decoder-block type.
-    type Layer: ModuleParameters;
-    /// Per-forward state shared by every decoder block.
-    type ForwardContext;
-
-    /// Returns the checkpoint model type.
-    fn model_type(&self) -> &str;
-    /// Returns checkpoint-native packed quantization metadata, if present.
-    fn quantization(&self) -> Option<crate::runtime::checkpoint::quantization::WeightQuantization>;
-    /// Returns the number of decoder blocks.
-    fn layer_count(&self) -> Result<usize, Error>;
-    /// Builds bindings for modules that remain pinned on the execution device.
-    fn static_units(&self, store: &dyn WeightStore) -> Result<Vec<StaticUnitBindings>, Error>;
-    /// Assigns pinned leases to the adapter's static modules.
-    fn populate_static(&mut self, leases: &[ResidentUnitLease]) -> Result<(), Error>;
-    /// Creates one metadata-only decoder block.
-    fn new_layer(&self, index: usize, stream: &Stream) -> Result<Self::Layer, Error>;
-    /// Returns the checkpoint prefix for one decoder block.
-    fn layer_checkpoint_prefix(&self, index: usize) -> String;
-    /// Returns the stable residency unit name for one decoder block.
-    fn layer_unit_name(&self, index: usize) -> String;
-    /// Populates one temporary decoder block from its protected lease.
-    fn populate_layer(
-        &self,
-        layer: &mut Self::Layer,
-        lease: &ResidentUnitLease,
-    ) -> Result<(), Error> {
-        Ok(populate_module_from_lease(layer, lease)?)
-    }
-    /// Builds direct or derived bindings for one decoder block.
-    fn layer_bindings(
-        &self,
-        index: usize,
-        layer: &Self::Layer,
-        store: &dyn WeightStore,
-    ) -> Result<Vec<crate::runtime::residency::manager::WeightBinding>, Error> {
-        Ok(build_module_bindings(
-            layer,
-            &self.layer_checkpoint_prefix(index),
-            store,
-        )?)
-    }
-    /// Returns checkpoint keys consumed by dependent units outside the block unit.
-    fn additional_consumed_checkpoint_keys(&self, _store: &dyn WeightStore) -> Vec<String> {
-        Vec::new()
-    }
-    /// Executes the architecture's input embedding.
-    fn embed(&mut self, inputs: &Array, stream: &Stream) -> Result<Array, Error>;
-    /// Prepares masks or other state shared by the decoder-block loop.
-    fn prepare_forward<C: KeyValueCache>(
-        &self,
-        hidden: &Array,
-        mask: Option<&Array>,
-        cache: &[Option<C>],
-        stream: &Stream,
-    ) -> Result<Self::ForwardContext, Error>;
-    /// Executes one populated decoder block.
-    fn forward_layer<C: KeyValueCache>(
-        &self,
-        index: usize,
-        layer: &mut Self::Layer,
-        hidden: &Array,
-        cache: &mut C,
-        context: &Self::ForwardContext,
-        stream: &Stream,
-    ) -> Result<Array, Error>;
-    /// Applies final normalization and logits projection.
-    fn finish(&mut self, hidden: &Array, stream: &Stream) -> Result<Array, Error>;
-    /// Returns whether a checkpoint key is intentionally ignored by strict loading.
-    fn ignores_checkpoint_key(&self, _key: &str) -> bool {
-        false
-    }
-}
-
 /// Forward state returned by a generalized architecture adapter.
 pub struct LayerwiseForwardState<C> {
     /// Activation consumed by the first sequential execution group.
@@ -1184,12 +1142,13 @@ pub struct LayerwiseForwardState<C> {
     pub context: C,
 }
 
-/// General adapter contract for heterogeneous caches and architecture-specific input.
+/// Canonical architecture contract for resident, bounded-residency, and future
+/// distributed execution.
 ///
-/// The original [`LayerwiseModelAdapter`] remains available for Llama-compatible
-/// callers. New hybrid, multimodal, and realtime adapters can use this companion
-/// contract without pretending recurrent or convolution state is a KV cache.
-pub trait GeneralLayerwiseModelAdapter: Sized {
+/// Heterogeneous caches, architecture-specific inputs, multiple execution
+/// groups, and retained recurrent state are represented directly rather than
+/// being forced into a decoder-only KV-cache interface.
+pub trait ArchitectureAdapter: Sized {
     /// Borrowed family-specific forward input.
     type Input<'a>;
     /// Complete architecture-owned cache and recurrent state.
@@ -1198,6 +1157,62 @@ pub trait GeneralLayerwiseModelAdapter: Sized {
     type Layer: ModuleParameters;
     /// Masks, positions, prepared media, or other per-forward state.
     type ForwardContext;
+
+    /// Stable architecture identity used by residency metadata.
+    fn model_type(&self) -> &str {
+        std::any::type_name::<Self>()
+    }
+
+    /// Model-wide checkpoint quantization, when one uniform encoding exists.
+    fn quantization(&self) -> Option<crate::runtime::checkpoint::quantization::WeightQuantization> {
+        None
+    }
+
+    /// Returns the exact cache compatibility identity for replicated or
+    /// rank-local parallel execution.
+    fn prompt_cache_model_identity(
+        &self,
+        _topology: Option<crate::runtime::distributed::topology::ParallelTopology>,
+    ) -> Result<PromptCacheModelIdentity, Error> {
+        Err(Error::Parallel(format!(
+            "architecture adapter {} has not declared a prompt-cache identity",
+            std::any::type_name::<Self>()
+        )))
+    }
+
+    /// Persists a validated architecture-owned cache.
+    #[allow(clippy::too_many_arguments)]
+    fn save_prompt_cache(
+        &self,
+        _cache: &mut Self::Cache,
+        _destination: &Path,
+        _descriptor: PromptCacheDescriptor,
+        _prefix_token_ids: &[u32],
+        _options: &PromptCacheOptions,
+        _stream: &Stream,
+    ) -> Result<PromptCacheManifest, Error> {
+        Err(Error::Parallel(format!(
+            "architecture adapter {} has not implemented prompt-cache persistence",
+            std::any::type_name::<Self>()
+        )))
+    }
+
+    /// Restores a validated architecture-owned cache.
+    #[allow(clippy::too_many_arguments)]
+    fn load_prompt_cache(
+        &self,
+        _directory: &Path,
+        _expected: &PromptCacheDescriptor,
+        _identity: &PromptCacheModelIdentity,
+        _prefix_token_ids: &[u32],
+        _options: PagedCacheOptions,
+        _stream: &Stream,
+    ) -> Result<(Self::Cache, PromptCacheManifest), Error> {
+        Err(Error::Parallel(format!(
+            "architecture adapter {} has not implemented prompt-cache restoration",
+            std::any::type_name::<Self>()
+        )))
+    }
 
     /// Builds bindings for modules that remain pinned on the execution device.
     fn static_units(&self, store: &dyn WeightStore) -> Result<Vec<StaticUnitBindings>, Error>;
@@ -1215,6 +1230,16 @@ pub trait GeneralLayerwiseModelAdapter: Sized {
         cache: &mut Self::Cache,
         stream: &Stream,
     ) -> Result<LayerwiseForwardState<Self::ForwardContext>, Error>;
+
+    /// Embeds or prepares input under an explicit execution context.
+    fn begin_forward_with_execution<'a>(
+        &mut self,
+        input: Self::Input<'a>,
+        cache: &mut Self::Cache,
+        execution: &crate::runtime::distributed::parallel::ParallelExecutionContext<'_>,
+    ) -> Result<LayerwiseForwardState<Self::ForwardContext>, Error> {
+        self.begin_forward(input, cache, execution.stream())
+    }
 
     /// Returns the number of named sequential groups used by this adapter.
     fn execution_group_count(&self) -> usize;
@@ -1234,6 +1259,64 @@ pub trait GeneralLayerwiseModelAdapter: Sized {
 
     /// Creates a metadata-only runtime unit for one group position.
     fn new_layer(&self, group: usize, index: usize, stream: &Stream) -> Result<Self::Layer, Error>;
+
+    /// Describes this architecture's physical checkpoint tensors using typed
+    /// logical roles for tensor-parallel planning.
+    ///
+    /// Existing family adapters deliberately fail here until their dedicated
+    /// tensor-parallel migration is complete.
+    fn parallel_parameter_groups(
+        &self,
+        _context: crate::runtime::distributed::parallel::ParallelBuildContext,
+    ) -> Result<Vec<crate::runtime::distributed::parallel::ParameterGroupSpec>, Error> {
+        Err(Error::Parallel(format!(
+            "architecture adapter {} has not declared tensor-parallel parameter roles",
+            std::any::type_name::<Self>()
+        )))
+    }
+
+    /// Registers placement for streamed and pinned parameters. Composite
+    /// adapters can override this to reuse the planners of their nested model
+    /// families instead of duplicating parameter-name logic.
+    fn register_parallel_parameters(
+        &self,
+        context: crate::runtime::distributed::parallel::ParallelBuildContext,
+        planner: &mut crate::runtime::distributed::parallel::ParallelPlanBuilder,
+        _stream: &Stream,
+    ) -> Result<(), Error> {
+        for group in self.parallel_parameter_groups(context)? {
+            planner.register(group)?;
+        }
+        Ok(())
+    }
+
+    /// Rebuilds pinned modules whose parameter geometry is rank-local.
+    ///
+    /// The loader captures the global static bindings before invoking this
+    /// hook, then applies the typed layout to those bindings before residency
+    /// initialization.
+    fn configure_parallel_static(
+        &mut self,
+        _context: crate::runtime::distributed::parallel::ParallelBuildContext,
+        _layout: &crate::runtime::distributed::parallel::LocalModelLayout,
+        _stream: &Stream,
+    ) -> Result<(), Error> {
+        Ok(())
+    }
+
+    /// Creates a rank-local runtime unit from planned model geometry.
+    fn new_parallel_layer(
+        &self,
+        _group: usize,
+        _index: usize,
+        _layout: &crate::runtime::distributed::parallel::LocalModelLayout,
+        _stream: &Stream,
+    ) -> Result<Self::Layer, Error> {
+        Err(Error::Parallel(format!(
+            "architecture adapter {} has not implemented rank-local layer construction",
+            std::any::type_name::<Self>()
+        )))
+    }
 
     /// Returns the checkpoint prefix for one runtime unit.
     fn layer_checkpoint_prefix(&self, group: usize, index: usize) -> String;
@@ -1266,6 +1349,24 @@ pub trait GeneralLayerwiseModelAdapter: Sized {
         )?)
     }
 
+    /// Builds rank-local bindings for a tensor-parallel execution unit.
+    fn parallel_layer_bindings(
+        &self,
+        group: usize,
+        index: usize,
+        layer: &Self::Layer,
+        store: &dyn WeightStore,
+        layout: &crate::runtime::distributed::parallel::LocalModelLayout,
+        _stream: &Stream,
+    ) -> Result<Vec<crate::runtime::residency::manager::WeightBinding>, Error> {
+        build_parallel_module_bindings(
+            layer,
+            &self.layer_checkpoint_prefix(group, index),
+            store,
+            layout,
+        )
+    }
+
     /// Returns checkpoint keys consumed by dependent units outside execution groups.
     fn additional_consumed_checkpoint_keys(&self, _store: &dyn WeightStore) -> Vec<String> {
         Vec::new()
@@ -1283,6 +1384,39 @@ pub trait GeneralLayerwiseModelAdapter: Sized {
         context: &mut Self::ForwardContext,
         stream: &Stream,
     ) -> Result<Array, Error>;
+
+    /// Executes one unit under an explicit replicated or TP context.
+    ///
+    /// The default preserves ordinary execution and rejects TP, ensuring a
+    /// family cannot become distributed merely because it implements the
+    /// resident adapter contract.
+    #[allow(clippy::too_many_arguments)]
+    fn forward_layer_with_execution(
+        &mut self,
+        group: usize,
+        index: usize,
+        layer: &mut Self::Layer,
+        hidden: &Array,
+        cache: &mut Self::Cache,
+        context: &mut Self::ForwardContext,
+        execution: &crate::runtime::distributed::parallel::ParallelExecutionContext<'_>,
+    ) -> Result<Array, Error> {
+        if execution.is_tensor_parallel() {
+            return Err(Error::Parallel(format!(
+                "architecture adapter {} has not implemented tensor-parallel execution",
+                std::any::type_name::<Self>()
+            )));
+        }
+        self.forward_layer(
+            group,
+            index,
+            layer,
+            hidden,
+            cache,
+            context,
+            execution.stream(),
+        )
+    }
 
     /// Returns every cache/state array that must be evaluated before lease release.
     fn retained_arrays<'a>(
@@ -1317,6 +1451,18 @@ pub trait GeneralLayerwiseModelAdapter: Sized {
         Ok(hidden.clone())
     }
 
+    /// Converts group output under an explicit execution context.
+    fn finish_execution_group_with_execution(
+        &mut self,
+        group: usize,
+        hidden: &Array,
+        cache: &mut Self::Cache,
+        context: &mut Self::ForwardContext,
+        execution: &crate::runtime::distributed::parallel::ParallelExecutionContext<'_>,
+    ) -> Result<Array, Error> {
+        self.finish_execution_group(group, hidden, cache, context, execution.stream())
+    }
+
     /// Applies final normalization, projections, or family-specific output assembly.
     fn finish(
         &mut self,
@@ -1325,6 +1471,17 @@ pub trait GeneralLayerwiseModelAdapter: Sized {
         context: &Self::ForwardContext,
         stream: &Stream,
     ) -> Result<Array, Error>;
+
+    /// Produces final output under an explicit execution context.
+    fn finish_with_execution(
+        &mut self,
+        hidden: &Array,
+        cache: &mut Self::Cache,
+        context: &Self::ForwardContext,
+        execution: &crate::runtime::distributed::parallel::ParallelExecutionContext<'_>,
+    ) -> Result<Array, Error> {
+        self.finish(hidden, cache, context, execution.stream())
+    }
 
     /// Returns whether a checkpoint key is intentionally ignored by strict loading.
     fn ignores_checkpoint_key(&self, _key: &str) -> bool {
@@ -1337,7 +1494,7 @@ pub trait GeneralLayerwiseModelAdapter: Sized {
 /// Group windows, lease lifetime, retained-state evaluation, stream
 /// synchronization, and telemetry stay centralized here. Adapter code owns only
 /// architecture math, cache validation, and runtime-unit construction.
-pub struct GeneralLayerwiseModel<A: GeneralLayerwiseModelAdapter> {
+pub struct LayerwiseModel<A: ArchitectureAdapter> {
     adapter: A,
     store: SharedWeightStore,
     residency: ResidencyManager,
@@ -1346,9 +1503,13 @@ pub struct GeneralLayerwiseModel<A: GeneralLayerwiseModelAdapter> {
     dense_stream: Option<DenseStreamController>,
     sample_mlx_memory: bool,
     sample_process_memory: bool,
+    metadata: LayerwiseModelMetadata,
+    parallel_layout: Option<crate::runtime::distributed::parallel::LocalModelLayout>,
+    parallel_topology: Option<crate::runtime::distributed::topology::ParallelTopology>,
+    parallel_info: Option<ParallelModelInfo>,
 }
 
-impl<A: GeneralLayerwiseModelAdapter> GeneralLayerwiseModel<A> {
+impl<A: ArchitectureAdapter> LayerwiseModel<A> {
     /// Creates an engine from a validated residency manager and execution groups.
     pub fn new(
         adapter: A,
@@ -1375,6 +1536,16 @@ impl<A: GeneralLayerwiseModelAdapter> GeneralLayerwiseModel<A> {
                 .into());
             }
         }
+        let layer_count = groups.iter().map(|group| group.units().len()).sum();
+        let metadata = LayerwiseModelMetadata {
+            model_type: adapter.model_type().into(),
+            quantization: adapter.quantization(),
+            layer_count,
+            static_device_bytes: 0,
+            host_layer_bytes: 0,
+            maximum_window_bytes: 0,
+            device_layer_window: 0,
+        };
         Ok(Self {
             adapter,
             store,
@@ -1384,6 +1555,10 @@ impl<A: GeneralLayerwiseModelAdapter> GeneralLayerwiseModel<A> {
             dense_stream: None,
             sample_mlx_memory: false,
             sample_process_memory: false,
+            metadata,
+            parallel_layout: None,
+            parallel_topology: None,
+            parallel_info: None,
         })
     }
 
@@ -1397,6 +1572,111 @@ impl<A: GeneralLayerwiseModelAdapter> GeneralLayerwiseModel<A> {
     /// Returns the architecture adapter.
     pub const fn adapter(&self) -> &A {
         &self.adapter
+    }
+
+    /// Returns aggregate residency metadata for all execution groups.
+    pub const fn metadata(&self) -> &LayerwiseModelMetadata {
+        &self.metadata
+    }
+
+    /// Returns rank-local parallel placement information when loaded with a
+    /// generalized distributed execution group.
+    pub const fn parallel_info(&self) -> Option<&ParallelModelInfo> {
+        self.parallel_info.as_ref()
+    }
+
+    /// Returns the exact typed rank-local parameter layout, when parallel.
+    pub const fn parallel_layout(
+        &self,
+    ) -> Option<&crate::runtime::distributed::parallel::LocalModelLayout> {
+        self.parallel_layout.as_ref()
+    }
+
+    /// Returns the cache-relevant architecture fingerprint for this execution rank.
+    pub fn prompt_cache_architecture_fingerprint(&self) -> Result<String, Error> {
+        Ok(self
+            .adapter
+            .prompt_cache_model_identity(self.parallel_topology)?
+            .architecture_fingerprint
+            .clone())
+    }
+
+    /// Returns this execution rank's exact ordered cache-state layout.
+    pub fn prompt_cache_layer_layout(
+        &self,
+    ) -> Result<crate::runtime::attention::LayerSchedule<crate::LayerCachePolicy>, Error> {
+        Ok(self
+            .adapter
+            .prompt_cache_model_identity(self.parallel_topology)?
+            .layer_layout
+            .clone())
+    }
+
+    /// Persists a compatible architecture-owned prefix cache. Parallel ranks
+    /// publish into deterministic subdirectories below the supplied root.
+    pub fn save_prompt_cache(
+        &self,
+        cache: &mut A::Cache,
+        root: impl AsRef<Path>,
+        descriptor: PromptCacheDescriptor,
+        prefix_token_ids: &[u32],
+        options: &PromptCacheOptions,
+        stream: &Stream,
+    ) -> Result<PromptCacheManifest, Error> {
+        let identity = self
+            .adapter
+            .prompt_cache_model_identity(self.parallel_topology)?;
+        validate_prompt_cache_model_identity(&descriptor, &identity)
+            .map_err(|error| Error::Parallel(error.to_string()))?;
+        let directory = self.prompt_cache_directory(root.as_ref());
+        self.adapter.save_prompt_cache(
+            cache,
+            &directory,
+            descriptor,
+            prefix_token_ids,
+            options,
+            stream,
+        )
+    }
+
+    /// Restores a compatible architecture-owned prefix cache from this rank's
+    /// deterministic cache directory.
+    pub fn load_prompt_cache(
+        &self,
+        root: impl AsRef<Path>,
+        expected: &PromptCacheDescriptor,
+        prefix_token_ids: &[u32],
+        options: PagedCacheOptions,
+        stream: &Stream,
+    ) -> Result<(A::Cache, PromptCacheManifest), Error> {
+        let identity = self
+            .adapter
+            .prompt_cache_model_identity(self.parallel_topology)?;
+        validate_prompt_cache_model_identity(expected, &identity)
+            .map_err(|error| Error::Parallel(error.to_string()))?;
+        self.adapter.load_prompt_cache(
+            &self.prompt_cache_directory(root.as_ref()),
+            expected,
+            &identity,
+            prefix_token_ids,
+            options,
+            stream,
+        )
+    }
+
+    fn prompt_cache_directory(&self, root: &Path) -> std::path::PathBuf {
+        match self.parallel_topology {
+            Some(topology) => root.join(format!("rank-{:05}", topology.global_rank)),
+            None => root.to_path_buf(),
+        }
+    }
+
+    pub(crate) fn prompt_cache_rank_identity(
+        &self,
+    ) -> Option<crate::runtime::cache::residency::CacheRankIdentity> {
+        self.parallel_topology
+            .map(PromptCacheTopology::for_parallel_topology)
+            .and_then(|topology| topology.cache_rank_identity())
     }
 
     /// Returns the mutable adapter for loader-time dependent-unit setup.
@@ -1454,11 +1734,154 @@ impl<A: GeneralLayerwiseModelAdapter> GeneralLayerwiseModel<A> {
             cache,
             stream,
             |adapter, group, index, layer, hidden, cache, context, stream| {
-                adapter.forward_layer(group, index, layer, hidden, cache, context, stream)
+                let execution =
+                    crate::runtime::distributed::parallel::ParallelExecutionContext::replicated(
+                        stream,
+                    );
+                adapter.forward_layer_with_execution(
+                    group, index, layer, hidden, cache, context, &execution,
+                )
             },
             |_, _, _| Ok(()),
         )
         .map(|(output, _)| output)
+    }
+
+    /// Runs a rank-local layerwise model using the tensor-parallel subgroup.
+    pub fn forward_tensor_parallel<'a>(
+        &mut self,
+        input: A::Input<'a>,
+        cache: &mut A::Cache,
+        group: &safemlx::distributed::Group,
+        stream: &Stream,
+    ) -> Result<Array, Error> {
+        self.forward_tensor_parallel_with_context_hook(
+            input,
+            cache,
+            group,
+            stream,
+            |_, _, _| Ok(()),
+        )
+        .map(|(output, _)| output)
+    }
+
+    /// Runs TP execution groups and invokes a context hook after each unit.
+    pub(crate) fn forward_tensor_parallel_with_context_hook<'a, H>(
+        &mut self,
+        input: A::Input<'a>,
+        cache: &mut A::Cache,
+        group: &safemlx::distributed::Group,
+        stream: &Stream,
+        mut hook: H,
+    ) -> Result<(Array, A::ForwardContext), Error>
+    where
+        H: FnMut(usize, usize, &mut A::ForwardContext) -> Result<(), Error>,
+    {
+        let topology = self.parallel_topology.ok_or_else(|| {
+            Error::Parallel("layerwise model was not loaded for tensor-parallel execution".into())
+        })?;
+        let execution =
+            crate::runtime::distributed::parallel::ParallelExecutionContext::tensor_parallel(
+                topology, group, stream,
+            )?;
+        self.adapter.validate_cache(cache)?;
+        let LayerwiseForwardState {
+            mut hidden,
+            mut context,
+        } = self
+            .adapter
+            .begin_forward_with_execution(input, cache, &execution)?;
+        let prefill = hidden.dim(1) > 1;
+        let dense_forward = self
+            .dense_stream
+            .as_ref()
+            .map(|streamer| streamer.forward_guard(prefill, &self.residency))
+            .transpose()?;
+        let layout = self
+            .parallel_layout
+            .as_ref()
+            .expect("parallel topology has a layout");
+        for (group_index, resident_group) in self.groups.iter().enumerate() {
+            let execute_group = self.adapter.should_execute_group(group_index, &context);
+            let dense_guard = execute_group.then(|| {
+                self.dense_stream
+                    .as_ref()
+                    .map(|streamer| streamer.group_guard(&self.residency, resident_group.id()))
+            });
+            if execute_group {
+                for index in 0..resident_group.units().len() {
+                    let id = &resident_group.units()[index];
+                    {
+                        let (_host_lease, lease) = if let Some(streamer) = &self.dense_stream {
+                            streamer.prepare(
+                                &self.residency,
+                                resident_group.id(),
+                                resident_group.units(),
+                                index,
+                                prefill,
+                            )?
+                        } else {
+                            resident_group.prepare(&self.residency, index)?;
+                            (None, self.residency.acquire(id, MemoryTier::Device)?)
+                        };
+                        let mut layer =
+                            self.adapter
+                                .new_parallel_layer(group_index, index, layout, stream)?;
+                        self.adapter
+                            .populate_layer(group_index, index, &mut layer, &lease)?;
+                        hidden = self.adapter.forward_layer_with_execution(
+                            group_index,
+                            index,
+                            &mut layer,
+                            &hidden,
+                            cache,
+                            &mut context,
+                            &execution,
+                        )?;
+                        let hook_result = hook(group_index, index, &mut context);
+                        let retained = self.adapter.retained_arrays(cache, group_index, index);
+                        let retained_context =
+                            self.adapter
+                                .retained_context_arrays(&context, group_index, index);
+                        eval(
+                            std::iter::once(&hidden)
+                                .chain(retained)
+                                .chain(retained_context),
+                        )?;
+                        stream.synchronize()?;
+                        hook_result?;
+                    }
+                    if self.dense_stream.is_none() {
+                        let end = index
+                            .saturating_add(resident_group.depth())
+                            .min(resident_group.units().len());
+                        resident_group
+                            .trim_to(&self.residency, &resident_group.units()[index..end])?;
+                    }
+                }
+            }
+            hidden = self.adapter.finish_execution_group_with_execution(
+                group_index,
+                &hidden,
+                cache,
+                &mut context,
+                &execution,
+            )?;
+            eval([&hidden])?;
+            stream.synchronize()?;
+            if let Some(Some(guard)) = dense_guard {
+                guard.complete()?;
+            }
+        }
+        let output = self
+            .adapter
+            .finish_with_execution(&hidden, cache, &context, &execution)?;
+        eval([&output])?;
+        stream.synchronize()?;
+        if let Some(guard) = dense_forward {
+            guard.complete()?;
+        }
+        Ok((output, context))
     }
 
     /// Runs a generalized forward pass while allowing the caller to replace
@@ -1537,7 +1960,13 @@ impl<A: GeneralLayerwiseModelAdapter> GeneralLayerwiseModel<A> {
             cache,
             stream,
             |adapter, group, index, layer, hidden, cache, context, stream| {
-                adapter.forward_layer(group, index, layer, hidden, cache, context, stream)
+                let execution =
+                    crate::runtime::distributed::parallel::ParallelExecutionContext::replicated(
+                        stream,
+                    );
+                adapter.forward_layer_with_execution(
+                    group, index, layer, hidden, cache, context, &execution,
+                )
             },
             hook,
         )
@@ -1566,10 +1995,14 @@ impl<A: GeneralLayerwiseModelAdapter> GeneralLayerwiseModel<A> {
         H: FnMut(usize, usize, &mut A::ForwardContext) -> Result<(), Error>,
     {
         self.adapter.validate_cache(cache)?;
+        let execution =
+            crate::runtime::distributed::parallel::ParallelExecutionContext::replicated(stream);
         let LayerwiseForwardState {
             mut hidden,
             mut context,
-        } = self.adapter.begin_forward(input, cache, stream)?;
+        } = self
+            .adapter
+            .begin_forward_with_execution(input, cache, &execution)?;
         let prefill = hidden.dim(1) > 1;
         let dense_forward = self
             .dense_stream
@@ -1632,12 +2065,12 @@ impl<A: GeneralLayerwiseModelAdapter> GeneralLayerwiseModel<A> {
                     }
                 }
             }
-            hidden = self.adapter.finish_execution_group(
+            hidden = self.adapter.finish_execution_group_with_execution(
                 group_index,
                 &hidden,
                 cache,
                 &mut context,
-                stream,
+                &execution,
             )?;
             let retained_context =
                 self.adapter
@@ -1649,7 +2082,9 @@ impl<A: GeneralLayerwiseModelAdapter> GeneralLayerwiseModel<A> {
             }
         }
 
-        let output = self.adapter.finish(&hidden, cache, &context, stream)?;
+        let output = self
+            .adapter
+            .finish_with_execution(&hidden, cache, &context, &execution)?;
         eval([&output])?;
         stream.synchronize()?;
         if self.dense_stream.is_none() && (self.sample_mlx_memory || self.sample_process_memory) {
@@ -1687,15 +2122,15 @@ impl<A: GeneralLayerwiseModelAdapter> GeneralLayerwiseModel<A> {
 }
 
 /// Builds a generalized layerwise model with independently bounded groups.
-pub fn load_general_layerwise_model<A, O>(
+pub fn load_layerwise_model<A, O>(
     model_dir: impl AsRef<Path>,
     adapter: A,
     options: O,
     stream: &Stream,
     weights_stream: &Stream,
-) -> Result<GeneralLayerwiseModel<A>, Error>
+) -> Result<LayerwiseModel<A>, Error>
 where
-    A: GeneralLayerwiseModelAdapter,
+    A: ArchitectureAdapter,
     O: Into<LayerExecutionLoadOptions>,
 {
     let options = options.into();
@@ -1707,19 +2142,52 @@ where
         model_dir,
         options.max_mapped_shards(),
     )?);
-    load_general_layerwise_model_with_store(store, adapter, options, stream, weights_stream)
+    load_layerwise_model_with_store(store, adapter, options, stream, weights_stream)
+}
+
+/// Builds a rank-local generalized model whose named execution groups use the
+/// architecture adapter's typed tensor-parallel plan.
+pub fn load_tensor_parallel_layerwise_model<A, O>(
+    model_dir: impl AsRef<Path>,
+    adapter: A,
+    options: O,
+    build: crate::runtime::distributed::parallel::ParallelBuildContext,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<LayerwiseModel<A>, Error>
+where
+    A: ArchitectureAdapter,
+    O: Into<LayerExecutionLoadOptions>,
+{
+    let options = options.into();
+    let model_dir = model_dir.as_ref();
+    if model_dir.extension().and_then(|value| value.to_str()) == Some("gguf") {
+        return Err(LayerwiseModelError::GgufUnsupported.into());
+    }
+    let store = Arc::new(SafetensorsWeightStore::open_with_max_mapped_shards(
+        model_dir,
+        options.max_mapped_shards(),
+    )?);
+    load_tensor_parallel_layerwise_model_with_store(
+        store,
+        adapter,
+        options,
+        build,
+        stream,
+        weights_stream,
+    )
 }
 
 /// Builds a generalized layerwise model from an already cataloged checkpoint.
-pub(crate) fn load_general_layerwise_model_with_store<A, O>(
+pub(crate) fn load_layerwise_model_with_store<A, O>(
     store: SharedWeightStore,
     mut adapter: A,
     options: O,
     stream: &Stream,
     weights_stream: &Stream,
-) -> Result<GeneralLayerwiseModel<A>, Error>
+) -> Result<LayerwiseModel<A>, Error>
 where
-    A: GeneralLayerwiseModelAdapter,
+    A: ArchitectureAdapter,
     O: Into<LayerExecutionLoadOptions>,
 {
     let options = options.into();
@@ -1854,8 +2322,17 @@ where
         .collect::<Result<Vec<_>, _>>()?;
     adapter.populate_static(&static_leases)?;
 
-    let mut model = GeneralLayerwiseModel::new(adapter, store, residency, groups, static_leases)?
+    let mut model = LayerwiseModel::new(adapter, store, residency, groups, static_leases)?
         .with_memory_sampling(options.sample_mlx_memory(), options.sample_process_memory());
+    model.metadata = LayerwiseModelMetadata {
+        model_type: model.adapter.model_type().into(),
+        quantization: model.adapter.quantization(),
+        layer_count: planned_layer_count,
+        static_device_bytes,
+        host_layer_bytes,
+        maximum_window_bytes: device_window_bytes,
+        device_layer_window: depth,
+    };
     if let Some(dense) = dense {
         let execution_groups = model
             .groups
@@ -1874,336 +2351,153 @@ where
     Ok(model)
 }
 
-/// Generic host-backed layerwise decoder execution engine.
-pub struct LayerwiseModel<A: LayerwiseModelAdapter> {
-    adapter: A,
-    store: SharedWeightStore,
-    residency: ResidencyManager,
-    layer_group: ResidentLayerGroup,
-    static_leases: Vec<ResidentUnitLease>,
-    dense_stream: Option<DenseStreamController>,
-    metadata: LayerwiseModelMetadata,
-    sample_mlx_memory: bool,
-    sample_process_memory: bool,
-}
-
-impl<A: LayerwiseModelAdapter> LayerwiseModel<A> {
-    /// Returns the architecture adapter.
-    pub const fn adapter(&self) -> &A {
-        &self.adapter
-    }
-
-    /// Returns the mutable architecture adapter for loader-time dependent-unit setup.
-    pub(crate) fn adapter_mut(&mut self) -> &mut A {
-        &mut self.adapter
-    }
-
-    /// Returns a shared handle to the persistent checkpoint store.
-    pub(crate) fn weight_store_arc(&self) -> SharedWeightStore {
-        Arc::clone(&self.store)
-    }
-
-    /// Returns parameter-residency metadata.
-    pub const fn metadata(&self) -> &LayerwiseModelMetadata {
-        &self.metadata
-    }
-
-    /// Returns the persistent backend-neutral checkpoint store.
-    pub fn checkpoint_store(&self) -> &(dyn WeightStore + Send + Sync) {
-        self.store.as_ref()
-    }
-
-    /// Returns the persistent backend-neutral checkpoint store.
-    pub fn weight_store(&self) -> &(dyn WeightStore + Send + Sync) {
-        self.checkpoint_store()
-    }
-
-    /// Returns the reusable residency manager.
-    pub const fn residency_manager(&self) -> &ResidencyManager {
-        &self.residency
-    }
-
-    /// Returns a current logical residency, transfer, and store report.
-    pub fn residency_report(&self) -> Result<ResidencyReport, Error> {
-        Ok(self.residency.report()?)
-    }
-
-    /// Returns dense-stream observations when that experimental policy is active.
-    pub fn dense_stream_report(&self) -> Result<Option<DenseDiskStreamReport>, Error> {
-        self.dense_stream
-            .as_ref()
-            .map(|streamer| streamer.report(&self.residency))
-            .transpose()
-    }
-
-    /// Runs the model with a caller-selected compatible cache implementation.
-    pub fn forward_with_cache<C>(
-        &mut self,
-        input: LayerwiseInput<'_, C>,
-        stream: &Stream,
-    ) -> Result<Array, Error>
-    where
-        C: KeyValueCache + Default,
-    {
-        self.forward_with_layer_executor(
-            input,
-            stream,
-            |adapter, index, layer, hidden, cache, context, stream| {
-                adapter.forward_layer(index, layer, hidden, cache, context, stream)
-            },
-        )
-    }
-
-    /// Runs a homogeneous layerwise model while allowing the caller to replace
-    /// execution of each populated decoder layer.
-    #[allow(clippy::type_complexity)]
-    pub(crate) fn forward_with_layer_executor<C, F>(
-        &mut self,
-        input: LayerwiseInput<'_, C>,
-        stream: &Stream,
-        mut executor: F,
-    ) -> Result<Array, Error>
-    where
-        C: KeyValueCache + Default,
-        F: FnMut(
-            &mut A,
-            usize,
-            &mut A::Layer,
-            &Array,
-            &mut C,
-            &A::ForwardContext,
-            &Stream,
-        ) -> Result<Array, Error>,
-    {
-        let LayerwiseInput {
-            inputs,
-            mask,
-            cache,
-        } = input;
-        let prefill = inputs.dim(1) > 1;
-        validate_cache(cache, self.metadata.layer_count)?;
-        let dense_forward = self
-            .dense_stream
-            .as_ref()
-            .map(|streamer| streamer.forward_guard(prefill, &self.residency))
-            .transpose()?;
-        let dense_guard = self
-            .dense_stream
-            .as_ref()
-            .map(|streamer| streamer.group_guard(&self.residency, self.layer_group.id()));
-
-        let mut h = self.adapter.embed(inputs, stream)?;
-        let context = self.adapter.prepare_forward(&h, mask, cache, stream)?;
-
-        for (index, layer_cache) in cache.iter_mut().enumerate().take(self.metadata.layer_count) {
-            let id = &self.layer_group.units()[index];
-            {
-                let (_host_lease, lease) = if let Some(streamer) = &self.dense_stream {
-                    streamer.prepare(
-                        &self.residency,
-                        self.layer_group.id(),
-                        self.layer_group.units(),
-                        index,
-                        prefill,
-                    )?
-                } else {
-                    self.layer_group.prepare(&self.residency, index)?;
-                    (None, self.residency.acquire(id, MemoryTier::Device)?)
-                };
-                let mut layer = self.adapter.new_layer(index, stream)?;
-                self.adapter.populate_layer(&mut layer, &lease)?;
-                let layer_cache = layer_cache
-                    .as_mut()
-                    .ok_or(LayerwiseModelError::MissingLayerCache { index })?;
-                h = executor(
-                    &mut self.adapter,
-                    index,
-                    &mut layer,
-                    &h,
-                    layer_cache,
-                    &context,
-                    stream,
-                )?;
-
-                // MLX is lazy. Materialize both the activation and every cache
-                // handle updated by this block before its lease can be dropped.
-                eval(std::iter::once(&h).chain(layer_cache.retained_arrays()))?;
-                stream.synchronize()?;
-            }
-            if self.dense_stream.is_none() {
-                let end = index
-                    .saturating_add(self.layer_group.depth())
-                    .min(self.layer_group.units().len());
-                let desired = &self.layer_group.units()[index..end];
-                self.layer_group.trim_to(&self.residency, desired)?;
-            }
-        }
-
-        if let Some(guard) = dense_guard {
-            guard.complete()?;
-        }
-
-        let logits = self.adapter.finish(&h, stream)?;
-        if self.dense_stream.is_none() && (self.sample_mlx_memory || self.sample_process_memory) {
-            self.residency
-                .sample_memory(self.sample_mlx_memory, self.sample_process_memory)?;
-        }
-        if let Some(guard) = dense_forward {
-            guard.complete()?;
-        }
-        Ok(logits)
-    }
-
-    /// Explicitly evicts all decoder copies from the execution device.
-    pub fn clear_device_layer_window(&self) -> Result<(), Error> {
-        Ok(self.layer_group.clear(&self.residency)?)
-    }
-
-    /// Returns the number of long-lived pinned static leases.
-    pub fn static_lease_count(&self) -> usize {
-        self.static_leases.len()
-    }
-}
-
-/// Input shared by architecture adapters using the layerwise engine.
-pub struct LayerwiseInput<'a, C> {
-    /// Token ids with shape `[batch, sequence]`.
-    pub inputs: &'a Array,
-    /// Optional caller-provided attention mask.
-    pub mask: Option<&'a Array>,
-    /// Mutable per-layer caches.
-    pub cache: &'a mut Vec<Option<C>>,
-}
-
-/// Builds a generic layerwise model from an architecture adapter and safetensors.
-pub fn load_layerwise_model<A, O>(
-    model_dir: impl AsRef<Path>,
-    adapter: A,
-    options: O,
-    stream: &Stream,
-    weights_stream: &Stream,
-) -> Result<LayerwiseModel<A>, Error>
-where
-    A: LayerwiseModelAdapter,
-    O: Into<LayerExecutionLoadOptions>,
-{
-    let options = options.into();
-    let model_dir = model_dir.as_ref();
-    if model_dir.extension().and_then(|value| value.to_str()) == Some("gguf") {
-        return Err(LayerwiseModelError::GgufUnsupported.into());
-    }
-    let store = Arc::new(SafetensorsWeightStore::open_with_max_mapped_shards(
-        model_dir,
-        options.max_mapped_shards(),
-    )?);
-    load_layerwise_model_with_store(store, adapter, options, stream, weights_stream)
-}
-
-/// Builds a homogeneous layerwise model from an already cataloged checkpoint.
-pub(crate) fn load_layerwise_model_with_store<A, O>(
+pub(crate) fn load_tensor_parallel_layerwise_model_with_store<A, O>(
     store: SharedWeightStore,
     mut adapter: A,
     options: O,
+    build: crate::runtime::distributed::parallel::ParallelBuildContext,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<LayerwiseModel<A>, Error>
 where
-    A: LayerwiseModelAdapter,
+    A: ArchitectureAdapter,
     O: Into<LayerExecutionLoadOptions>,
 {
     let options = options.into();
-    let layer_count = adapter.layer_count()?;
     let depth = options.device_depth();
     let dense = options.dense();
     let offload = options.offload()?;
-    if depth > layer_count {
-        return Err(LayerwiseModelError::InvalidLayerWindow { depth, layer_count }.into());
+    let mut planner = build.planner();
+    adapter.register_parallel_parameters(build, &mut planner, stream)?;
+    let (_, layout) = planner.finish()?;
+    if layout.is_empty() {
+        return Err(Error::Parallel(format!(
+            "architecture adapter {} declared no tensor-parallel execution-group parameters",
+            adapter.model_type()
+        )));
     }
-    if let Some(dense) = dense {
-        if dense.host_budget_bytes > 0 && dense.host_lookahead > layer_count {
-            return Err(LayerwiseModelError::InvalidHostLayerWindow {
-                depth: dense.host_lookahead,
-                layer_count,
-            }
-            .into());
-        }
-    }
+
+    let static_units = adapter.static_units(store.as_ref())?;
+    adapter.configure_parallel_static(build, &layout, stream)?;
+
     let mut definitions = Vec::new();
     let mut specs = Vec::new();
     let mut consumed = BTreeSet::new();
     let mut static_device_bytes = 0u64;
     let mut static_ids = Vec::new();
-
-    for unit in adapter.static_units(store.as_ref())? {
+    for unit in static_units {
+        let bindings = shard_layer_bindings(unit.bindings, "", &layout)?;
         static_ids.push(unit.id.clone());
         add_unit(
             &mut definitions,
             &mut specs,
             &mut consumed,
             unit.id,
-            unit.bindings,
+            bindings,
             ResidencyPolicy::Pinned,
             MemoryTier::Device,
             &mut static_device_bytes,
         )?;
     }
 
-    let mut layer_ids = Vec::with_capacity(layer_count);
-    let mut layer_bytes = Vec::with_capacity(layer_count);
+    let mut groups = Vec::with_capacity(adapter.execution_group_count());
     let mut host_layer_bytes = 0u64;
-    for index in 0..layer_count {
-        let layer = adapter.new_layer(index, stream)?;
-        let bindings = adapter.layer_bindings(index, &layer, store.as_ref())?;
-        let bytes = binding_bytes(&bindings)?;
-        host_layer_bytes =
-            host_layer_bytes
-                .checked_add(bytes)
-                .ok_or(LayerwiseModelError::ArithmeticOverflow {
-                    context: "host decoder byte total",
-                })?;
-        let id = OffloadUnitId::new(adapter.layer_unit_name(index))?;
-        consumed.extend(
-            bindings
-                .iter()
-                .flat_map(|binding| binding.checkpoint_keys().into_iter().map(str::to_string)),
-        );
-        definitions.push(OffloadUnit::new(id.clone(), bindings)?);
-        specs.push(OffloadUnitSpec::new(
-            id.clone(),
-            bytes,
-            if dense.is_some() {
-                ResidencyPolicy::Cacheable
-            } else {
-                ResidencyPolicy::Windowed
-            },
-            if dense.is_some() {
-                MemoryTier::Disk
-            } else {
-                MemoryTier::Host
-            },
+    let mut device_window_bytes = 0u64;
+    let mut host_window_bytes = 0u64;
+    let mut planned_layer_count = 0usize;
+    for group_index in 0..adapter.execution_group_count() {
+        let layer_count = adapter.layer_count(group_index)?;
+        if depth > layer_count {
+            return Err(LayerwiseModelError::InvalidLayerWindow { depth, layer_count }.into());
+        }
+        if let Some(dense) = dense {
+            if dense.host_budget_bytes > 0 && dense.host_lookahead > layer_count {
+                return Err(LayerwiseModelError::InvalidHostLayerWindow {
+                    depth: dense.host_lookahead,
+                    layer_count,
+                }
+                .into());
+            }
+        }
+        let mut layer_ids = Vec::with_capacity(layer_count);
+        let mut layer_bytes = Vec::with_capacity(layer_count);
+        for index in 0..layer_count {
+            let layer = adapter.new_parallel_layer(group_index, index, &layout, stream)?;
+            let bindings = adapter.parallel_layer_bindings(
+                group_index,
+                index,
+                &layer,
+                store.as_ref(),
+                &layout,
+                stream,
+            )?;
+            let bytes = binding_bytes(&bindings)?;
+            host_layer_bytes = host_layer_bytes.checked_add(bytes).ok_or(
+                LayerwiseModelError::ArithmeticOverflow {
+                    context: "host TP execution-unit byte total",
+                },
+            )?;
+            let id = OffloadUnitId::new(adapter.layer_unit_name(group_index, index))?;
+            consumed.extend(
+                bindings
+                    .iter()
+                    .flat_map(|binding| binding.checkpoint_keys().into_iter().map(str::to_string)),
+            );
+            definitions.push(OffloadUnit::new(id.clone(), bindings)?);
+            specs.push(OffloadUnitSpec::new(
+                id.clone(),
+                bytes,
+                if dense.is_some() {
+                    ResidencyPolicy::Cacheable
+                } else {
+                    ResidencyPolicy::Windowed
+                },
+                if dense.is_some() {
+                    MemoryTier::Disk
+                } else {
+                    MemoryTier::Host
+                },
+            )?);
+            planned_layer_count = planned_layer_count.checked_add(1).ok_or(
+                LayerwiseModelError::ArithmeticOverflow {
+                    context: "TP execution-unit count",
+                },
+            )?;
+            layer_ids.push(id);
+            layer_bytes.push(bytes);
+        }
+        let group_device_window = largest_window_bytes(&layer_bytes, depth)?;
+        if dense.is_some() {
+            device_window_bytes = device_window_bytes.max(group_device_window);
+            if let Some(dense) = dense {
+                if dense.host_budget_bytes > 0 {
+                    host_window_bytes = host_window_bytes
+                        .max(largest_window_bytes(&layer_bytes, dense.host_lookahead)?);
+                }
+            }
+        } else {
+            device_window_bytes = device_window_bytes.checked_add(group_device_window).ok_or(
+                LayerwiseModelError::ArithmeticOverflow {
+                    context: "combined TP device execution-window byte total",
+                },
+            )?;
+        }
+        groups.push(ResidentLayerGroup::new(
+            adapter.execution_group_id(group_index)?,
+            layer_ids,
+            depth,
         )?);
-        layer_ids.push(id);
-        layer_bytes.push(bytes);
     }
-
     consumed.extend(adapter.additional_consumed_checkpoint_keys(store.as_ref()));
-
     validate_unused(store.as_ref(), &consumed, options.strict_loading(), |key| {
         adapter.ignores_checkpoint_key(key)
     })?;
-    let host_required = if let Some(dense) = dense {
-        if dense.host_budget_bytes == 0 {
-            0
-        } else {
-            largest_window_bytes(&layer_bytes, dense.host_lookahead)?
-        }
+    if dense.is_some() {
+        validate_host_budget(offload, host_window_bytes)?;
     } else {
-        host_layer_bytes
-    };
-    validate_host_budget(offload, host_required)?;
-    let maximum_window_bytes = largest_window_bytes(&layer_bytes, depth)?;
-    validate_device_budget(offload, static_device_bytes, maximum_window_bytes, depth)?;
-
+        validate_host_budget(offload, host_layer_bytes)?;
+    }
+    validate_device_budget(offload, static_device_bytes, device_window_bytes, depth)?;
     let plan = OffloadPlan::new(offload, specs)?;
     let residency = ResidencyManager::new_shared(
         Arc::clone(&store),
@@ -2213,49 +2507,261 @@ where
         stream.clone(),
     )?;
     residency.initialize()?;
-
     let static_leases = static_ids
         .iter()
         .map(|id| residency.acquire(id, MemoryTier::Device))
         .collect::<Result<Vec<_>, _>>()?;
     adapter.populate_static(&static_leases)?;
-
-    let layer_group = ResidentLayerGroup::new("text_decoder", layer_ids, depth)?;
-    let metadata = LayerwiseModelMetadata {
-        model_type: adapter.model_type().to_string(),
-        quantization: adapter.quantization(),
-        layer_count,
+    let mut model = LayerwiseModel::new(adapter, store, residency, groups, static_leases)?
+        .with_memory_sampling(options.sample_mlx_memory(), options.sample_process_memory());
+    model.parallel_layout = Some(layout);
+    model.parallel_topology = Some(build.topology());
+    model.metadata = LayerwiseModelMetadata {
+        model_type: model.adapter.model_type().into(),
+        quantization: model.adapter.quantization(),
+        layer_count: planned_layer_count,
         static_device_bytes,
         host_layer_bytes,
-        maximum_window_bytes,
+        maximum_window_bytes: device_window_bytes,
         device_layer_window: depth,
     };
-    let mut model = LayerwiseModel {
-        adapter,
-        store,
-        residency,
-        layer_group,
-        static_leases,
-        dense_stream: None,
-        metadata,
-        sample_mlx_memory: options.sample_mlx_memory(),
-        sample_process_memory: options.sample_process_memory(),
-    };
+    let local_parameter_bytes = static_device_bytes.checked_add(host_layer_bytes).ok_or(
+        LayerwiseModelError::ArithmeticOverflow {
+            context: "rank-local parallel parameter byte total",
+        },
+    )?;
+    model.parallel_info = Some(ParallelModelInfo {
+        topology: build.topology(),
+        model_type: model.adapter.model_type().into(),
+        owned_tensors: model
+            .parallel_layout
+            .as_ref()
+            .expect("parallel layout was assigned")
+            .tensors()
+            .map(|(target, _)| target.to_string())
+            .collect(),
+        local_parameter_bytes,
+    });
     if let Some(dense) = dense {
-        let execution_groups = [(
-            model.layer_group.id().to_string(),
-            model.layer_group.units().to_vec(),
-        )];
+        let execution_groups = model
+            .groups
+            .iter()
+            .map(|group| (group.id().to_string(), group.units().to_vec()))
+            .collect::<Vec<_>>();
         model.dense_stream = Some(DenseStreamController::new(
             &model.residency,
             dense,
-            layer_count,
+            planned_layer_count,
             host_layer_bytes,
             static_device_bytes,
             execution_groups,
         )?);
     }
     Ok(model)
+}
+
+pub(crate) fn shard_layer_bindings(
+    bindings: Vec<crate::runtime::residency::manager::WeightBinding>,
+    prefix: &str,
+    layout: &crate::runtime::distributed::parallel::LocalModelLayout,
+) -> Result<Vec<crate::runtime::residency::manager::WeightBinding>, Error> {
+    use crate::runtime::checkpoint::recipe::DerivedWeightRecipe;
+    use crate::runtime::checkpoint::store::TensorSelection;
+    use crate::runtime::distributed::topology::TensorPlacement;
+    let mut output = Vec::with_capacity(bindings.len());
+    for binding in bindings {
+        let canonical_name = crate::runtime::checkpoint::binding::canonical_checkpoint_name(
+            &format!("{prefix}.{}", binding.name()),
+        );
+        let tensor = layout
+            .tensor(binding.checkpoint_key())
+            .or_else(|| layout.tensor(&canonical_name))
+            .or_else(|| {
+                layout.tensors().find_map(|(target, tensor)| {
+                    let canonical_target =
+                        crate::runtime::checkpoint::binding::canonical_checkpoint_name(target);
+                    (canonical_target == binding.checkpoint_key()
+                        || canonical_target == canonical_name)
+                        .then_some(tensor)
+                })
+            });
+        let Some(tensor) = tensor else {
+            output.push(binding);
+            continue;
+        };
+        let selection = match tensor.placement() {
+            TensorPlacement::Replicated | TensorPlacement::Local => {
+                output.push(binding);
+                continue;
+            }
+            TensorPlacement::Shard { axis, index, parts } => {
+                let width = tensor.global_shape()[*axis] / *parts;
+                TensorSelection::Range {
+                    axis: *axis,
+                    start: index * width,
+                    end: (index + 1) * width,
+                }
+            }
+            TensorPlacement::Range { axis, start, end } => TensorSelection::Range {
+                axis: *axis,
+                start: *start,
+                end: *end,
+            },
+            TensorPlacement::Indices { axis, indices } => TensorSelection::Indices {
+                axis: *axis,
+                indices: indices.clone(),
+            },
+            TensorPlacement::Omit
+            | TensorPlacement::Rank { .. }
+            | TensorPlacement::PipelineStage { .. } => {
+                return Err(Error::Parallel(format!(
+                    "execution-group binding {:?} has non-TP placement {:?}",
+                    binding.name(),
+                    tensor.placement()
+                )))
+            }
+        };
+        let global_elements = tensor.global_shape().iter().product::<usize>();
+        let local_elements = tensor.local_shape().iter().product::<usize>();
+        let expected_bytes = binding
+            .expected_bytes()
+            .checked_mul(local_elements as u64)
+            .and_then(|bytes| bytes.checked_div(global_elements as u64))
+            .ok_or_else(|| {
+                Error::Parallel(format!(
+                    "cannot size rank-local binding {:?}",
+                    binding.name()
+                ))
+            })?;
+        let sharded = if let Some(recipe) = binding.recipe() {
+            crate::runtime::residency::manager::WeightBinding::from_recipe(
+                binding.name(),
+                DerivedWeightRecipe::Select {
+                    input: Box::new(recipe.clone()),
+                    selection,
+                },
+                expected_bytes,
+            )?
+        } else {
+            crate::runtime::residency::manager::WeightBinding::new(
+                binding.name(),
+                binding.checkpoint_key(),
+                selection,
+                expected_bytes,
+            )?
+        };
+        output.push(sharded);
+    }
+    Ok(output)
+}
+
+fn build_parallel_module_bindings(
+    module: &impl ModuleParameters,
+    prefix: &str,
+    store: &dyn WeightStore,
+    layout: &crate::runtime::distributed::parallel::LocalModelLayout,
+) -> Result<Vec<crate::runtime::residency::manager::WeightBinding>, Error> {
+    use crate::runtime::checkpoint::store::TensorSelection;
+    use crate::runtime::distributed::topology::TensorPlacement;
+    let keys = store.keys().into_iter().collect::<BTreeSet<_>>();
+    let params = module.parameters().flatten();
+    let mut names = params.keys().map(ToString::to_string).collect::<Vec<_>>();
+    names.sort();
+    let mut bindings = Vec::with_capacity(names.len());
+    for local_name in names {
+        let parameter = params.get(local_name.as_str()).expect("known parameter");
+        let destination = if prefix.is_empty() {
+            local_name.clone()
+        } else {
+            format!("{prefix}.{local_name}")
+        };
+        let canonical =
+            crate::runtime::checkpoint::binding::canonical_checkpoint_name(&destination);
+        let checkpoint_key = if keys.contains(&destination) {
+            destination.clone()
+        } else if keys.contains(&canonical) {
+            canonical.clone()
+        } else {
+            return Err(
+                crate::runtime::checkpoint::binding::ModuleBindingError::MissingParameter {
+                    destination,
+                }
+                .into(),
+            );
+        };
+        let metadata = store.metadata(&checkpoint_key)?;
+        let tensor = layout
+            .tensor(&checkpoint_key)
+            .or_else(|| layout.tensor(&canonical));
+        let (selection, expected_bytes) = if let Some(tensor) = tensor {
+            let local_shape = parameter
+                .shape()
+                .iter()
+                .map(|&dim| usize::try_from(dim))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|_| Error::Parallel(format!("invalid local shape for {destination}")))?;
+            if tensor.local_shape() != local_shape {
+                return Err(Error::Parallel(format!(
+                    "planned local shape {:?} for {destination} does not match runtime {:?}",
+                    tensor.local_shape(),
+                    local_shape
+                )));
+            }
+            let selection = match tensor.placement() {
+                TensorPlacement::Replicated | TensorPlacement::Local => TensorSelection::Full,
+                TensorPlacement::Shard { axis, index, parts } => {
+                    let width = tensor.global_shape()[*axis] / *parts;
+                    TensorSelection::Range {
+                        axis: *axis,
+                        start: index * width,
+                        end: (index + 1) * width,
+                    }
+                }
+                TensorPlacement::Range { axis, start, end } => TensorSelection::Range {
+                    axis: *axis,
+                    start: *start,
+                    end: *end,
+                },
+                TensorPlacement::Indices { axis, indices } => TensorSelection::Indices {
+                    axis: *axis,
+                    indices: indices.clone(),
+                },
+                other => {
+                    return Err(Error::Parallel(format!(
+                        "unsupported execution-group placement {other:?} for {destination}"
+                    )))
+                }
+            };
+            let global_elements = tensor.global_shape().iter().product::<usize>();
+            let local_elements = tensor.local_shape().iter().product::<usize>();
+            let bytes = (metadata.logical_byte_len as u64)
+                .checked_mul(local_elements as u64)
+                .and_then(|value| value.checked_div(global_elements as u64))
+                .ok_or_else(|| Error::Parallel(format!("cannot size {destination}")))?;
+            (selection, bytes)
+        } else {
+            let expected = parameter
+                .shape()
+                .iter()
+                .map(|&dim| usize::try_from(dim))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|_| Error::Parallel(format!("invalid shape for {destination}")))?;
+            if metadata.shape != expected {
+                return Err(Error::Parallel(format!(
+                    "unplanned parameter {destination} has checkpoint shape {:?}, runtime expects {:?}",
+                    metadata.shape, expected
+                )));
+            }
+            (TensorSelection::Full, metadata.logical_byte_len as u64)
+        };
+        bindings.push(crate::runtime::residency::manager::WeightBinding::new(
+            local_name,
+            checkpoint_key,
+            selection,
+            expected_bytes,
+        )?);
+    }
+    Ok(bindings)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2308,27 +2814,6 @@ where
     } else {
         Err(LayerwiseModelError::UnexpectedCheckpointParameters { unused }.into())
     }
-}
-
-fn validate_cache<C>(cache: &mut Vec<Option<C>>, layer_count: usize) -> Result<(), Error>
-where
-    C: KeyValueCache + Default,
-{
-    if cache.is_empty() {
-        *cache = (0..layer_count).map(|_| Some(C::default())).collect();
-        return Ok(());
-    }
-    if cache.len() != layer_count {
-        return Err(LayerwiseModelError::CacheLengthMismatch {
-            expected: layer_count,
-            actual: cache.len(),
-        }
-        .into());
-    }
-    if let Some(index) = cache.iter().position(Option::is_none) {
-        return Err(LayerwiseModelError::MissingLayerCache { index }.into());
-    }
-    Ok(())
 }
 
 fn largest_window_bytes(layer_bytes: &[u64], depth: usize) -> Result<u64, Error> {
@@ -2496,10 +2981,9 @@ mod tests {
     use super::*;
     use crate::{
         architectures::llama::layerwise::{
-            load_llama_model, LlamaCache, LlamaLayerwiseAdapter, LlamaLoadOptions, LlamaModel,
+            load_llama_model, LlamaCache, LlamaLoadOptions, LlamaModel,
         },
         architectures::llama::model::{self as llama, ModelArgs},
-        runtime::cache::ConcatKeyValueCache,
         runtime::residency::manager::UnitResidencyReport,
         runtime::residency::policy::TransferDirection,
     };
@@ -2549,6 +3033,76 @@ mod tests {
             quantized_weights: None,
             quantized_weight_configs: None,
         }
+    }
+
+    #[test]
+    fn execution_group_binding_sharding_preserves_direct_and_derived_selections() {
+        use crate::runtime::distributed::{
+            parallel::{
+                MemberSharding, ParallelPlanBuilder, ParameterGroupSpec, ParameterMemberSpec,
+                ParameterRole,
+            },
+            topology::{DeviceAssignment, ParallelTopology},
+        };
+        use crate::runtime::{
+            checkpoint::{recipe::DerivedWeightRecipe, store::TensorSelection},
+            residency::manager::WeightBinding,
+        };
+        let topology =
+            ParallelTopology::from_rank(2, 1, 2, 1, 1, DeviceAssignment::new(DeviceType::Cpu, 0))
+                .unwrap();
+        let mut planner = ParallelPlanBuilder::new(topology);
+        planner
+            .register(
+                ParameterGroupSpec::new(
+                    "group.projection",
+                    ParameterRole::ColumnProjection,
+                    [ParameterMemberSpec::new(
+                        "stack.0.projection.weight",
+                        [8, 4],
+                        MemberSharding::Equal { axis: 0 },
+                    )],
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let (_, layout) = planner.finish().unwrap();
+        let direct = WeightBinding::new(
+            "projection.weight",
+            "stack.0.projection.weight",
+            TensorSelection::Full,
+            128,
+        )
+        .unwrap();
+        let derived = WeightBinding::from_recipe(
+            "projection.weight",
+            DerivedWeightRecipe::source("raw.weight", TensorSelection::Full),
+            128,
+        )
+        .unwrap();
+        let direct = shard_layer_bindings(vec![direct], "stack.0", &layout).unwrap();
+        assert_eq!(
+            direct[0].selection(),
+            &TensorSelection::Range {
+                axis: 0,
+                start: 4,
+                end: 8,
+            }
+        );
+        assert_eq!(direct[0].expected_bytes(), 64);
+        let derived = shard_layer_bindings(vec![derived], "stack.0", &layout).unwrap();
+        assert_eq!(derived[0].expected_bytes(), 64);
+        assert!(matches!(
+            derived[0].recipe(),
+            Some(DerivedWeightRecipe::Select {
+                selection: TensorSelection::Range {
+                    axis: 0,
+                    start: 4,
+                    end: 8,
+                },
+                ..
+            })
+        ));
     }
 
     fn initialize(module: &mut impl ModuleParameters, stream: &Stream) {
@@ -2748,10 +3302,12 @@ mod tests {
         let mut resident = llama::ResidentModel::new(model_args.clone(), stream).unwrap();
         initialize(&mut resident, stream);
         let mut resident_cache = resident.new_cache();
-        let mut layerwise_cache = resident.new_cache();
+        let mut layerwise_cache = LlamaCache::Device(resident.new_cache());
         let dir = tempfile::tempdir().unwrap();
         write_fixture(dir.path(), &resident);
-        let adapter = LlamaLayerwiseAdapter::new(model_args, stream).unwrap();
+        let adapter =
+            crate::architectures::llama::layerwise::LlamaLayerwiseAdapter::new(model_args, stream)
+                .unwrap();
         let mut layerwise = load_layerwise_model(
             dir.path(),
             adapter,
@@ -2777,12 +3333,12 @@ mod tests {
                 )
                 .unwrap();
             let actual = layerwise
-                .forward_with_cache(
-                    LayerwiseInput {
+                .forward(
+                    crate::architectures::llama::layerwise::LlamaAdapterInput {
                         inputs: &tokens,
                         mask: None,
-                        cache: &mut layerwise_cache,
                     },
+                    &mut layerwise_cache,
                     stream,
                 )
                 .unwrap();
@@ -3001,13 +3557,14 @@ mod tests {
         {
             let controller = streamed.dense_stream.as_ref().unwrap();
             let forward = controller.forward_guard(true, &streamed.residency).unwrap();
-            let group = controller.group_guard(&streamed.residency, streamed.layer_group.id());
+            let layer_group = &streamed.groups[0];
+            let group = controller.group_guard(&streamed.residency, layer_group.id());
             {
                 let _leases = controller
                     .prepare(
                         &streamed.residency,
-                        streamed.layer_group.id(),
-                        streamed.layer_group.units(),
+                        layer_group.id(),
+                        layer_group.units(),
                         0,
                         true,
                     )
@@ -3023,14 +3580,14 @@ mod tests {
         let successful_start = DenseCounterSnapshot::from_report(after_abort.residency().offload());
 
         let tokens = Array::from_slice(&[1u32], &[1, 1]);
-        let mut cache = Vec::<Option<ConcatKeyValueCache>>::new();
+        let mut cache = LlamaCache::Device(Vec::new());
         streamed
-            .forward_with_cache(
-                LayerwiseInput {
+            .forward(
+                crate::architectures::llama::layerwise::LlamaAdapterInput {
                     inputs: &tokens,
                     mask: None,
-                    cache: &mut cache,
                 },
+                &mut cache,
                 gpu.stream(),
             )
             .unwrap();

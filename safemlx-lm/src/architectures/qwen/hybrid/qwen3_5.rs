@@ -1496,6 +1496,23 @@ impl FullAttention {
         observer.observe(&format!("{prefix}.o_proj"), &output)?;
         Ok(output)
     }
+
+    pub(crate) fn forward_tensor_parallel(
+        &mut self,
+        input: FullAttentionInput<'_>,
+        group: &safemlx::distributed::Group,
+        stream: &Stream,
+    ) -> Result<Array, Exception> {
+        let mut partial = self.forward(input, stream)?;
+        if let Some(bias) = self.o_proj.bias.as_ref() {
+            partial = partial.subtract(bias, stream)?;
+        }
+        let mut output = safemlx::distributed::all_sum(&partial, group, stream)?;
+        if let Some(bias) = self.o_proj.bias.as_ref() {
+            output = output.add(bias, stream)?;
+        }
+        Ok(output)
+    }
 }
 
 #[derive(Debug, Clone, ModuleParameters)]
@@ -1834,6 +1851,20 @@ impl Module<LinearAttentionInput<'_>> for LinearAttention {
         self.in_proj_a.training_mode(mode);
         self.norm.training_mode(mode);
         self.out_proj.training_mode(mode);
+    }
+}
+
+impl LinearAttention {
+    /// Executes rank-local recurrent heads and reduces the row-parallel output
+    /// projection exactly once.
+    pub(crate) fn forward_tensor_parallel(
+        &mut self,
+        input: LinearAttentionInput<'_>,
+        group: &safemlx::distributed::Group,
+        stream: &Stream,
+    ) -> Result<Array, Exception> {
+        let partial = self.forward(input, stream)?;
+        safemlx::distributed::all_sum(&partial, group, stream)
     }
 }
 
@@ -3094,6 +3125,98 @@ impl TransformerBlock {
         residual.add(h, stream)
     }
 
+    /// Executes local full/recurrent-attention heads and local dense/expert
+    /// intermediates.
+    pub(crate) fn forward_tensor_parallel(
+        &mut self,
+        input: BlockInput<'_>,
+        group: &safemlx::distributed::Group,
+        stream: &Stream,
+    ) -> Result<Array, Exception> {
+        let BlockInput { x, mask, cache } = input;
+        let normalized = self.input_layernorm.forward(x, stream)?;
+        let attention = match (self.layer_policy, cache) {
+            (
+                LayerPolicy::SelfAttention(AttentionPolicy::Full),
+                Some(LayerCache::FullAttention(cache)),
+            ) => self
+                .self_attn
+                .as_mut()
+                .expect("full attention layer")
+                .forward_tensor_parallel(
+                    FullAttentionInput {
+                        x: &normalized,
+                        mask,
+                        cache: Some(cache),
+                    },
+                    group,
+                    stream,
+                )?,
+            (LayerPolicy::SelfAttention(AttentionPolicy::Full), None) => self
+                .self_attn
+                .as_mut()
+                .expect("full attention layer")
+                .forward_tensor_parallel(
+                    FullAttentionInput {
+                        x: &normalized,
+                        mask,
+                        cache: None,
+                    },
+                    group,
+                    stream,
+                )?,
+            (LayerPolicy::LinearAttention, Some(LayerCache::LinearAttention(cache))) => self
+                .linear_attn
+                .as_mut()
+                .expect("linear attention layer")
+                .forward_tensor_parallel(
+                    LinearAttentionInput {
+                        x: &normalized,
+                        cache: Some(cache),
+                    },
+                    group,
+                    stream,
+                )?,
+            (LayerPolicy::LinearAttention, None) => self
+                .linear_attn
+                .as_mut()
+                .expect("linear attention layer")
+                .forward_tensor_parallel(
+                    LinearAttentionInput {
+                        x: &normalized,
+                        cache: None,
+                    },
+                    group,
+                    stream,
+                )?,
+            (policy, Some(_)) => {
+                return Err(Exception::custom(format!(
+                    "Qwen hybrid tensor-parallel cache kind does not match layer policy {policy:?}"
+                )))
+            }
+            (LayerPolicy::SelfAttention(AttentionPolicy::Sliding { .. }), _) => {
+                return Err(Exception::custom(
+                    "Qwen hybrid tensor parallelism does not support sliding attention",
+                ))
+            }
+        };
+        let hidden = x.add(attention, stream)?;
+        let normalized = self.post_attention_layernorm.forward(&hidden, stream)?;
+        let mut partial = self.mlp.forward(&normalized, stream)?;
+        let ordinary_bias = match &self.mlp {
+            FeedForward::Dense(mlp) => mlp.down_proj.bias.as_ref().as_ref(),
+            FeedForward::Moe(_) => None,
+        };
+        if let Some(bias) = ordinary_bias {
+            partial = partial.subtract(bias, stream)?;
+        }
+        let mut feed_forward = safemlx::distributed::all_sum(&partial, group, stream)?;
+        if let Some(bias) = ordinary_bias {
+            feed_forward = feed_forward.add(bias, stream)?;
+        }
+        hidden.add(feed_forward, stream)
+    }
+
     /// Creates an unloaded transformer block.
     pub fn new(args: &ModelArgs, layer_idx: usize, stream: &Stream) -> Result<Self, Exception> {
         Self::new_with_format(
@@ -4013,8 +4136,26 @@ impl Model {
             layer_layout: prompt_cache_layer_layout(args)
                 .map_err(|error| Exception::custom(error.to_string()))?,
         };
+        Self::load_prompt_cache_with_identity(
+            args,
+            directory,
+            expected,
+            prefix_token_ids,
+            &identity,
+            stream,
+        )
+    }
+
+    pub(crate) fn load_prompt_cache_with_identity(
+        args: &ModelArgs,
+        directory: impl AsRef<Path>,
+        expected: &PromptCacheDescriptor,
+        prefix_token_ids: &[u32],
+        identity: &PromptCacheModelIdentity,
+        stream: &Stream,
+    ) -> Result<(Cache, PromptCacheManifest), Exception> {
         let (blocks, state, manifest) =
-            open_prompt_cache_snapshot(directory, expected, &identity, prefix_token_ids, stream)
+            open_prompt_cache_snapshot(directory, expected, identity, prefix_token_ids, stream)
                 .map_err(|error| Exception::custom(error.to_string()))?;
         let mut blocks = blocks
             .into_iter()

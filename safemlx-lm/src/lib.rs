@@ -44,14 +44,19 @@ pub use runtime::cache::residency::{
     CACHE_RESIDENCY_LAYER_REPORT_LIMIT,
 };
 pub use runtime::cache::PagedKeyValueCache;
+pub use runtime::distributed::parallel::{
+    LocalModelLayout, LocalTensorLayout, MemberSharding, ParallelBuildContext,
+    ParallelExecutionContext, ParallelPlanBuilder, ParameterGroupSpec, ParameterMemberSpec,
+    ParameterRole, ShardingPolicy,
+};
 pub use runtime::distributed::topology::{
     DeviceAssignment, ParallelTopology, PlacementPlan, RankPartition, TensorPlacement,
 };
 pub use runtime::execution::layerwise::{
-    load_general_layerwise_model, DenseCacheMetrics, DenseDiskStreamReport,
-    DenseExecutionGroupReport, DensePassReport, DenseTierResidencyReport, GeneralLayerwiseModel,
-    GeneralLayerwiseModelAdapter, LayerExecutionLoadOptions, LayerwiseForwardState,
-    LayerwiseLoadOptions, LayerwiseModel, LayerwiseModelAdapter, LayerwiseModelMetadata,
+    load_layerwise_model, load_tensor_parallel_layerwise_model, ArchitectureAdapter,
+    DenseCacheMetrics, DenseDiskStreamReport, DenseExecutionGroupReport, DensePassReport,
+    DenseTierResidencyReport, LayerExecutionLoadOptions, LayerwiseForwardState,
+    LayerwiseLoadOptions, LayerwiseModel, LayerwiseModelMetadata, ParallelModelInfo,
     WeightResidency,
 };
 pub use runtime::residency::dense_stream::{

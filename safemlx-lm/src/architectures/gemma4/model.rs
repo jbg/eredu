@@ -4,6 +4,7 @@ use std::{
     cell::RefCell,
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     num::NonZeroU32,
+    ops::Range,
     path::Path,
     time::Instant,
 };
@@ -1070,7 +1071,7 @@ fn partial_rotary_dims(head_dim: i32, scaling: &Option<HashMap<String, FloatOrSt
     ((head_dim as f32 * partial_factor).round() as i32).clamp(2, head_dim)
 }
 
-fn needs_generated_sliding_mask(
+pub(crate) fn needs_generated_sliding_mask(
     seq_len: i32,
     position_offset: i32,
     sliding_window: Option<i32>,
@@ -1296,6 +1297,97 @@ impl Attention {
             k_norm,
             rope,
         })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn forward_tensor_parallel<C: KeyValueCache>(
+        &mut self,
+        x: &Array,
+        mask: Option<&Array>,
+        mut cache: Option<&mut C>,
+        position_offset: i32,
+        shared_kv: &mut HashMap<AttentionPolicy, (Array, Array)>,
+        group: &safemlx::distributed::Group,
+        stream: &Stream,
+    ) -> Result<Array, Exception> {
+        let (batch, sequence) = batch_seq(x);
+        let queries = self.q_proj.forward(x, stream)?;
+        let mut queries = self.q_norm.forward(
+            &reshape_attention_projection(queries, batch, sequence, self.n_heads, stream)?,
+            stream,
+        )?;
+        queries = self.rope.forward(
+            nn::RopeInputBuilder::new(&queries)
+                .offset(position_offset)
+                .build()?,
+            stream,
+        )?;
+
+        let (keys, values) = if !self.key_value_policy.owns_state() {
+            shared_kv
+                .get(&self.policy)
+                .cloned()
+                .ok_or_else(|| Exception::custom("missing shared Gemma tensor-parallel KV state"))?
+        } else {
+            let keys = self
+                .k_proj
+                .as_mut()
+                .ok_or_else(|| Exception::custom("missing Gemma key projection"))?
+                .forward(x, stream)?;
+            let values = if self.key_value_policy.value() == Some(ValuePolicy::ReuseKey) {
+                keys.clone()
+            } else {
+                self.v_proj
+                    .as_mut()
+                    .ok_or_else(|| Exception::custom("missing Gemma value projection"))?
+                    .forward(x, stream)?
+            };
+            let mut keys = self
+                .k_norm
+                .as_mut()
+                .ok_or_else(|| Exception::custom("missing Gemma key normalization"))?
+                .forward(
+                    &reshape_attention_projection(keys, batch, sequence, self.n_kv_heads, stream)?,
+                    stream,
+                )?;
+            let mut values = rms_norm_without_scale(
+                &values.reshape(&[batch, sequence, self.n_kv_heads, -1], stream)?,
+                1e-6,
+                stream,
+            )?
+            .transpose_axes(&[0, 2, 1, 3], stream)?;
+            keys = self.rope.forward(
+                nn::RopeInputBuilder::new(&keys)
+                    .offset(position_offset)
+                    .build()?,
+                stream,
+            )?;
+            if let Some(cache) = cache.as_mut() {
+                (keys, values) = cache.update_and_fetch(keys, values, stream)?;
+            }
+            if self.key_value_policy.publishes_state() {
+                shared_kv.insert(self.policy, (keys.clone(), values.clone()));
+            }
+            (keys, values)
+        };
+        let attention_cache =
+            if !self.key_value_policy.owns_state() || self.key_value_policy.publishes_state() {
+                None
+            } else {
+                cache
+            };
+        let attended = finish_attention(
+            queries,
+            keys,
+            values,
+            attention_cache,
+            self.scale,
+            mask,
+            batch,
+            sequence,
+            stream,
+        )?;
+        crate::nn::parallel::forward_row_parallel(&mut self.o_proj, &attended, group, stream)
     }
 }
 
@@ -1692,6 +1784,22 @@ impl Mlp {
             up_proj: maybe_quantized_linear_with_config(dim, hidden_dim, quantization[2], stream)?,
         })
     }
+
+    pub(crate) fn forward_tensor_parallel(
+        &mut self,
+        input: &Array,
+        group: &safemlx::distributed::Group,
+        stream: &Stream,
+    ) -> Result<Array, Exception> {
+        let gate = nn::gelu_approximate(self.gate_proj.forward(input, stream)?, stream)?;
+        let up = self.up_proj.forward(input, stream)?;
+        crate::nn::parallel::forward_row_parallel(
+            &mut self.down_proj,
+            &gate.multiply(up, stream)?,
+            group,
+            stream,
+        )
+    }
 }
 
 impl Module<&Array> for Mlp {
@@ -1784,7 +1892,7 @@ impl MoeRouter {
         })
     }
 
-    fn forward(
+    pub(crate) fn forward(
         &mut self,
         hidden_states: &Array,
         stream: &Stream,
@@ -2100,6 +2208,34 @@ impl GemmaExperts {
         concatenate_axis(&outputs, 0, stream)
     }
 
+    pub(crate) fn forward_tensor_parallel(
+        &self,
+        hidden_states: &Array,
+        top_k_index: &Array,
+        top_k_weights: &Array,
+        group: &safemlx::distributed::Group,
+        stream: &Stream,
+    ) -> Result<Array, Exception> {
+        let num_tokens = hidden_states.dim(0);
+        let plan = topk_route_plan(top_k_index, self.num_experts, stream)?;
+        let hidden = gather_grouped_rows(hidden_states, &plan, stream)?;
+        let gate = self
+            .switch_glu
+            .gate_proj
+            .forward(&hidden, &plan.sorted_group_ids, stream)?;
+        let up = self
+            .switch_glu
+            .up_proj
+            .forward(&hidden, &plan.sorted_group_ids, stream)?;
+        let activated = nn::gelu_approximate(gate, stream)?.multiply(up, stream)?;
+        let partial =
+            self.switch_glu
+                .down_proj
+                .forward(&activated, &plan.sorted_group_ids, stream)?;
+        let partial = weighted_route_sum(partial, top_k_weights, &plan, num_tokens, stream)?;
+        safemlx::distributed::all_sum(&partial, group, stream)
+    }
+
     fn training_mode(&mut self, _mode: bool) {}
 }
 
@@ -2318,6 +2454,71 @@ impl Gemma4Embedding {
         safemlx::ops::matmul(x, self.weight.as_ref().transpose(stream)?, stream)
     }
 
+    pub(crate) fn register_tensor_parallel_parameters(
+        &self,
+        planner: &mut crate::runtime::distributed::parallel::ParallelPlanBuilder,
+        prefix: &str,
+    ) -> Result<(), Error> {
+        use crate::runtime::distributed::parallel::{
+            MemberSharding, ParameterGroupSpec, ParameterMemberSpec, ParameterRole,
+        };
+        let mut members = vec![ParameterMemberSpec::new(
+            format!("{prefix}.weight"),
+            self.weight
+                .value
+                .shape()
+                .iter()
+                .map(|&dimension| dimension as usize)
+                .collect::<Vec<_>>(),
+            MemberSharding::Balanced { axis: 0 },
+        )];
+        for (name, value) in [
+            ("scales", self.scales.value.as_ref()),
+            ("biases", self.biases.value.as_ref()),
+        ] {
+            if let Some(value) = value {
+                members.push(ParameterMemberSpec::new(
+                    format!("{prefix}.{name}"),
+                    value
+                        .shape()
+                        .iter()
+                        .map(|&dimension| dimension as usize)
+                        .collect::<Vec<_>>(),
+                    MemberSharding::Balanced { axis: 0 },
+                ));
+            }
+        }
+        planner.register(ParameterGroupSpec::new(
+            prefix,
+            ParameterRole::Vocabulary,
+            members,
+        )?)
+    }
+
+    pub(crate) fn forward_tensor_parallel(
+        &mut self,
+        input: &Array,
+        range: &Range<usize>,
+        group: &safemlx::distributed::Group,
+        stream: &Stream,
+    ) -> Result<Array, Exception> {
+        let start = Array::from_int(range.start as i32);
+        let end = Array::from_int(range.end as i32);
+        let valid = input
+            .ge(&start, stream)?
+            .logical_and(input.lt(&end, stream)?, stream)?;
+        let local = input.subtract(&start, stream)?;
+        let safe = r#where(&valid, &local, Array::from_int(0), stream)?;
+        let value = self.forward(&safe, stream)?;
+        let value = r#where(
+            &valid.expand_dims(-1, stream)?,
+            &value,
+            safemlx::ops::zeros_like(&value, stream)?,
+            stream,
+        )?;
+        safemlx::distributed::all_sum(&value, group, stream)
+    }
+
     /// Sets training mode.
     pub fn training_mode(&mut self, _mode: bool) {}
 }
@@ -2499,6 +2700,93 @@ impl TransformerBlock {
 
     fn apply_layer_scalar(&self, x: Array, stream: &Stream) -> Result<Array, Exception> {
         x.multiply(&*self.layer_scalar, stream)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn forward_tensor_parallel<C: KeyValueCache>(
+        &mut self,
+        hidden: &Array,
+        mask: Option<&Array>,
+        cache: Option<&mut C>,
+        position_offset: i32,
+        per_layer_input: Option<&Array>,
+        shared_kv: &mut HashMap<AttentionPolicy, (Array, Array)>,
+        group: &safemlx::distributed::Group,
+        stream: &Stream,
+    ) -> Result<Array, Exception> {
+        let sliding_window = self.sliding_window();
+        let generated =
+            if needs_generated_sliding_mask(hidden.dim(1), position_offset, sliding_window) {
+                Some(create_causal_mask(
+                    hidden.dim(1),
+                    Some(position_offset),
+                    sliding_window.map(|window| window - 1),
+                    None,
+                    stream,
+                )?)
+            } else {
+                None
+            };
+        let normalized = self.input_layernorm.forward(hidden, stream)?;
+        let attention = self.self_attn.forward_tensor_parallel(
+            &normalized,
+            generated.as_ref().or(mask),
+            cache,
+            position_offset,
+            shared_kv,
+            group,
+            stream,
+        )?;
+        let attention = self.post_attention_layernorm.forward(&attention, stream)?;
+        let mut output = hidden.add(attention, stream)?;
+
+        let normalized = self.pre_feedforward_layernorm.forward(&output, stream)?;
+        let dense = self
+            .mlp
+            .forward_tensor_parallel(&normalized, group, stream)?;
+        let mlp =
+            if let (Some(router), Some(experts)) = (self.router.as_mut(), self.experts.as_mut()) {
+                let dense = self
+                    .post_feedforward_layernorm_1
+                    .as_mut()
+                    .expect("MoE dense output norm")
+                    .forward(&dense, stream)?;
+                let shape = output.shape().to_vec();
+                let flat = output.reshape(&[-1, self.hidden_size], stream)?;
+                let routed_input = self
+                    .pre_feedforward_layernorm_2
+                    .as_mut()
+                    .expect("MoE routed input norm")
+                    .forward(&flat, stream)?;
+                let (indices, weights) = router.forward(&flat, stream)?;
+                let routed = experts
+                    .forward_tensor_parallel(&routed_input, &indices, &weights, group, stream)?
+                    .reshape(&shape, stream)?;
+                let routed = self
+                    .post_feedforward_layernorm_2
+                    .as_mut()
+                    .expect("MoE routed output norm")
+                    .forward(&routed, stream)?;
+                dense.add(routed, stream)?
+            } else {
+                dense
+            };
+        let mlp = self.post_feedforward_layernorm.forward(&mlp, stream)?;
+        output = output.add(mlp, stream)?;
+
+        if let (Some(per_layer_input), Some(gate), Some(projection), Some(norm)) = (
+            per_layer_input,
+            self.per_layer_input_gate.as_mut(),
+            self.per_layer_projection.as_mut(),
+            self.post_per_layer_input_norm.as_mut(),
+        ) {
+            let residual = output.clone();
+            let projected = nn::gelu_approximate(gate.forward(&output, stream)?, stream)?
+                .multiply(per_layer_input, stream)?;
+            let projected = norm.forward(&projection.forward(&projected, stream)?, stream)?;
+            output = residual.add(projected, stream)?;
+        }
+        self.apply_layer_scalar(output, stream)
     }
 
     /// Forward pass that reports block activations to an observer.
@@ -5303,8 +5591,26 @@ impl Model {
             layer_layout: prompt_cache_layer_layout(args)
                 .map_err(|error| Exception::custom(error.to_string()))?,
         };
+        Self::load_prompt_cache_with_identity(
+            args,
+            directory,
+            expected,
+            prefix_token_ids,
+            &identity,
+            stream,
+        )
+    }
+
+    pub(crate) fn load_prompt_cache_with_identity(
+        args: &ModelArgs,
+        directory: impl AsRef<Path>,
+        expected: &PromptCacheDescriptor,
+        prefix_token_ids: &[u32],
+        identity: &PromptCacheModelIdentity,
+        stream: &Stream,
+    ) -> Result<(Cache, PromptCacheManifest), Exception> {
         let (blocks, state, manifest) =
-            open_prompt_cache_snapshot(directory, expected, &identity, prefix_token_ids, stream)
+            open_prompt_cache_snapshot(directory, expected, identity, prefix_token_ids, stream)
                 .map_err(|error| Exception::custom(error.to_string()))?;
         let mut blocks = blocks
             .into_iter()

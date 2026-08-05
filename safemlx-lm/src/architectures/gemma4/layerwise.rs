@@ -1,6 +1,6 @@
 //! Text-decoder bounded layer execution for Gemma 4 checkpoints.
 
-use std::{collections::BTreeMap, collections::HashMap, path::Path, sync::Arc};
+use std::{collections::BTreeMap, collections::HashMap, ops::Range, path::Path, sync::Arc};
 
 use safemlx::{
     error::Exception,
@@ -31,18 +31,28 @@ use crate::{
         input,
     },
     error::Error,
-    nn::tensor::create_causal_mask,
-    runtime::attention::AttentionPolicy,
-    runtime::cache::KeyValueCache,
+    nn::{
+        parallel::{LinearParallelism, ParallelLinear, VocabParallelLmHead},
+        tensor::create_causal_mask,
+    },
+    runtime::attention::{AttentionPolicy, LayerSchedule},
+    runtime::cache::{
+        residency::{
+            CacheResidencyError, LayerCachePolicy, PagedCacheOptions, PromptCacheDescriptor,
+            PromptCacheManifest, PromptCacheModelIdentity, PromptCacheOptions, PromptCacheTopology,
+        },
+        KeyValueCache,
+    },
     runtime::checkpoint::binding::{
         build_module_bindings_with_recipes, canonical_checkpoint_name, populate_module_from_lease,
     },
     runtime::checkpoint::recipe::DerivedWeightRecipe,
     runtime::checkpoint::store::{GgufWeightStore, TensorSelection, WeightStore},
+    runtime::distributed::parallel::exact_parallel_division,
     runtime::execution::layerwise::{
-        load_general_layerwise_model, load_general_layerwise_model_with_store,
-        GeneralLayerwiseModel, GeneralLayerwiseModelAdapter, LayerExecutionLoadOptions,
-        LayerwiseForwardState, StaticUnitBindings, WeightResidency,
+        load_layerwise_model, load_layerwise_model_with_store,
+        load_tensor_parallel_layerwise_model, ArchitectureAdapter, LayerExecutionLoadOptions,
+        LayerwiseForwardState, LayerwiseModel, StaticUnitBindings, WeightResidency,
     },
     runtime::residency::manager::{ResidencyReport, ResidentUnitLease, WeightBinding},
 };
@@ -60,7 +70,7 @@ const AUDIO_EMBED_UNIT: &str = "gemma4.static.audio_embed";
 
 /// Gemma 4 multimodal model using bounded residency for media and text blocks.
 pub struct Gemma4LayerwiseModel {
-    execution: GeneralLayerwiseModel<Gemma4LayerwiseAdapter>,
+    execution: LayerwiseModel<Gemma4LayerwiseAdapter>,
 }
 
 impl Gemma4LayerwiseModel {
@@ -93,6 +103,51 @@ impl Gemma4LayerwiseModel {
         Cache::new(self.args())
     }
 
+    /// Returns rank-local generalized parallel information when applicable.
+    pub fn parallel_info(&self) -> Option<&crate::ParallelModelInfo> {
+        self.execution.parallel_info()
+    }
+
+    /// Returns this rank's exact prompt-cache state layout.
+    pub fn prompt_cache_layer_layout(
+        &self,
+    ) -> Result<crate::LayerSchedule<crate::LayerCachePolicy>, Error> {
+        self.execution.prompt_cache_layer_layout()
+    }
+
+    /// Persists a compatible prefix cache.
+    pub fn save_prompt_cache(
+        &self,
+        cache: &mut Cache,
+        destination: impl AsRef<Path>,
+        descriptor: PromptCacheDescriptor,
+        prefix_token_ids: &[u32],
+        options: &PromptCacheOptions,
+        stream: &Stream,
+    ) -> Result<PromptCacheManifest, Error> {
+        self.execution.save_prompt_cache(
+            cache,
+            destination,
+            descriptor,
+            prefix_token_ids,
+            options,
+            stream,
+        )
+    }
+
+    /// Restores a compatible prefix cache.
+    pub fn load_prompt_cache(
+        &self,
+        directory: impl AsRef<Path>,
+        expected: &PromptCacheDescriptor,
+        prefix_token_ids: &[u32],
+        options: PagedCacheOptions,
+        stream: &Stream,
+    ) -> Result<(Cache, PromptCacheManifest), Error> {
+        self.execution
+            .load_prompt_cache(directory, expected, prefix_token_ids, options, stream)
+    }
+
     /// Returns current logical residency and transfer telemetry.
     pub fn residency_report(&self) -> Result<ResidencyReport, Error> {
         self.execution.residency_report()
@@ -123,6 +178,30 @@ impl Gemma4LayerwiseModel {
     ) -> Result<Array, Error> {
         self.execution
             .forward(Gemma4Input::Decode(inputs), cache, stream)
+    }
+
+    /// Runs multimodal prefill through rank-local vision and audio groups.
+    pub fn prefill_tensor_parallel(
+        &mut self,
+        input: input::ModelInput<'_>,
+        cache: &mut Cache,
+        group: &safemlx::distributed::Group,
+        stream: &Stream,
+    ) -> Result<Array, Error> {
+        self.execution
+            .forward_tensor_parallel(Gemma4Input::Prefill(input), cache, group, stream)
+    }
+
+    /// Runs decode on a TP-loaded Gemma multimodal model.
+    pub fn decode_tensor_parallel(
+        &mut self,
+        tokens: &Array,
+        cache: &mut Cache,
+        group: &safemlx::distributed::Group,
+        stream: &Stream,
+    ) -> Result<Array, Error> {
+        self.execution
+            .forward_tensor_parallel(Gemma4Input::Decode(tokens), cache, group, stream)
     }
 
     pub(crate) fn prefill_mtp(
@@ -238,10 +317,50 @@ pub fn load_gemma4_layerwise_model(
         stream,
     )?;
     Ok(Gemma4LayerwiseModel {
-        execution: load_general_layerwise_model(
+        execution: load_layerwise_model(model_dir, adapter, options, stream, weights_stream)?,
+    })
+}
+
+/// Loads Gemma 4 with rank-local vision and audio execution groups.
+pub fn load_gemma4_tensor_parallel_layerwise_model(
+    model_dir: impl AsRef<Path>,
+    options: impl Into<LayerExecutionLoadOptions>,
+    build: crate::runtime::distributed::parallel::ParallelBuildContext,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<Gemma4LayerwiseModel, Error> {
+    let model_dir = model_dir.as_ref();
+    let options = options.into();
+    let residency = match options {
+        LayerExecutionLoadOptions::LayerwiseHost(options) => {
+            WeightResidency::LayerwiseHost(options)
+        }
+        LayerExecutionLoadOptions::DenseDiskStream(options) => {
+            WeightResidency::DenseDiskStream(options)
+        }
+    };
+    crate::api::structural::validate_safetensors_load_path(
+        crate::api::ModelKind::Gemma4,
+        model_dir,
+        crate::api::ModelLoadOptions::default().with_weight_residency(residency),
+    )?;
+    let (args, vision, image_token_id, video_token_id, audio, audio_token_id) =
+        resident::get_gemma4_model_config(model_dir)?;
+    let adapter = Gemma4LayerwiseAdapter::new(
+        args,
+        vision,
+        image_token_id,
+        video_token_id,
+        audio,
+        audio_token_id,
+        stream,
+    )?;
+    Ok(Gemma4LayerwiseModel {
+        execution: load_tensor_parallel_layerwise_model(
             model_dir,
             adapter,
             options,
+            build,
             stream,
             weights_stream,
         )?,
@@ -271,20 +390,12 @@ pub(crate) fn load_gemma4_gguf_layerwise_model(
             residency.max_mapped_shards(),
         )?);
     let execution = match residency {
-        WeightResidency::LayerwiseHost(options) => load_general_layerwise_model_with_store(
-            store,
-            adapter,
-            options,
-            stream,
-            weights_stream,
-        )?,
-        WeightResidency::DenseDiskStream(options) => load_general_layerwise_model_with_store(
-            store,
-            adapter,
-            options,
-            stream,
-            weights_stream,
-        )?,
+        WeightResidency::LayerwiseHost(options) => {
+            load_layerwise_model_with_store(store, adapter, options, stream, weights_stream)?
+        }
+        WeightResidency::DenseDiskStream(options) => {
+            load_layerwise_model_with_store(store, adapter, options, stream, weights_stream)?
+        }
         WeightResidency::SparseExpertCache(_)
         | WeightResidency::SparseExpertCacheWithDenseLayers(_) => {
             return Err(Error::UnsupportedArchitecture(
@@ -319,6 +430,10 @@ pub struct Gemma4LayerwiseAdapter {
     image_token_id: Option<i32>,
     video_token_id: Option<i32>,
     audio_token_id: Option<i32>,
+    parallel_vocabulary: Option<Range<usize>>,
+    parallel_per_layer_vocabulary: Option<Range<usize>>,
+    parallel_lm_head: Option<VocabParallelLmHead>,
+    parallel_per_layer_projection: Option<ParallelLinear>,
 }
 
 impl Gemma4LayerwiseAdapter {
@@ -404,6 +519,10 @@ impl Gemma4LayerwiseAdapter {
             image_token_id,
             video_token_id,
             audio_token_id,
+            parallel_vocabulary: None,
+            parallel_per_layer_vocabulary: None,
+            parallel_lm_head: None,
+            parallel_per_layer_projection: None,
         })
     }
 
@@ -514,10 +633,11 @@ impl Gemma4LayerwiseAdapter {
         )?)
     }
 
-    fn prepare_per_layer_inputs(
+    fn prepare_per_layer_inputs_with_execution(
         &mut self,
         input_ids: &Array,
         hidden: &Array,
+        execution: Option<&crate::runtime::distributed::parallel::ParallelExecutionContext<'_>>,
         stream: &Stream,
     ) -> Result<Option<Array>, Error> {
         match (
@@ -527,33 +647,51 @@ impl Gemma4LayerwiseAdapter {
         ) {
             (Some(token_embedding), Some(projection), Some(norm)) => {
                 let ple = self.args.hidden_size_per_layer_input;
-                let token_identity = token_embedding
-                    .forward(input_ids, stream)?
-                    .multiply(Array::from_f32((ple as f32).sqrt()), stream)?
-                    .reshape(
-                        &[
-                            input_ids.dim(0),
-                            input_ids.dim(1),
-                            self.args.num_hidden_layers,
-                            ple,
-                        ],
-                        stream,
-                    )?;
-                let projected = projection
-                    .forward(hidden, stream)?
-                    .multiply(
-                        Array::from_f32((self.args.hidden_size as f32).sqrt().recip()),
-                        stream,
-                    )?
-                    .reshape(
-                        &[
-                            hidden.dim(0),
-                            hidden.dim(1),
-                            self.args.num_hidden_layers,
-                            ple,
-                        ],
-                        stream,
-                    )?;
+                let token_identity = match (
+                    execution.and_then(|execution| execution.group()),
+                    self.parallel_per_layer_vocabulary.as_ref(),
+                ) {
+                    (Some(group), Some(range)) => {
+                        token_embedding.forward_tensor_parallel(input_ids, range, group, stream)?
+                    }
+                    _ => token_embedding.forward(input_ids, stream)?,
+                }
+                .multiply(Array::from_f32((ple as f32).sqrt()), stream)?
+                .reshape(
+                    &[
+                        input_ids.dim(0),
+                        input_ids.dim(1),
+                        self.args.num_hidden_layers,
+                        ple,
+                    ],
+                    stream,
+                )?;
+                let projected = match (execution, self.parallel_per_layer_projection.as_mut()) {
+                    (Some(execution), Some(projection)) => {
+                        let local = projection.forward(hidden, execution)?;
+                        let group = execution.group().ok_or_else(|| {
+                            Error::Parallel("Gemma per-layer projection requires TP group".into())
+                        })?;
+                        let widths = vec![local.dim(-1) as usize; execution.size()];
+                        safemlx::distributed::all_gather_uneven_axis(
+                            &local, -1, &widths, group, stream,
+                        )?
+                    }
+                    _ => projection.forward(hidden, stream)?,
+                }
+                .multiply(
+                    Array::from_f32((self.args.hidden_size as f32).sqrt().recip()),
+                    stream,
+                )?
+                .reshape(
+                    &[
+                        hidden.dim(0),
+                        hidden.dim(1),
+                        self.args.num_hidden_layers,
+                        ple,
+                    ],
+                    stream,
+                )?;
                 Ok(Some(
                     norm.forward(&projected, stream)?
                         .add(token_identity, stream)?
@@ -565,6 +703,15 @@ impl Gemma4LayerwiseAdapter {
                 "Gemma 4 per-layer input modules are incomplete".into(),
             )),
         }
+    }
+
+    fn prepare_per_layer_inputs(
+        &mut self,
+        input_ids: &Array,
+        hidden: &Array,
+        stream: &Stream,
+    ) -> Result<Option<Array>, Error> {
+        self.prepare_per_layer_inputs_with_execution(input_ids, hidden, None, stream)
     }
 
     fn media_safe_per_layer_ids(&self, tokens: &Array, stream: &Stream) -> Result<Array, Error> {
@@ -726,11 +873,113 @@ pub struct Gemma4ForwardContext {
     draft_hidden: Option<Array>,
 }
 
-impl GeneralLayerwiseModelAdapter for Gemma4LayerwiseAdapter {
+impl ArchitectureAdapter for Gemma4LayerwiseAdapter {
     type Input<'a> = Gemma4Input<'a>;
     type Cache = Cache;
     type Layer = Gemma4Layer;
     type ForwardContext = Gemma4ForwardContext;
+
+    fn model_type(&self) -> &str {
+        &self.args.model_type
+    }
+
+    fn quantization(&self) -> Option<crate::runtime::checkpoint::quantization::WeightQuantization> {
+        self.args.weight_quantization()
+    }
+
+    fn prompt_cache_model_identity(
+        &self,
+        topology: Option<crate::ParallelTopology>,
+    ) -> Result<PromptCacheModelIdentity, Error> {
+        let layer_count = self.args.num_hidden_layers as usize;
+        let policies = self
+            .args
+            .layer_schedule
+            .iter()
+            .map(|policy| {
+                if !policy.key_value.owns_state() {
+                    return Ok(LayerCachePolicy::NoState);
+                }
+                let global_kv_heads =
+                    i32::try_from(policy.num_key_value_heads.get()).map_err(|_| {
+                        CacheResidencyError::InvalidOptions("Gemma KV heads exceed i32".into())
+                    })?;
+                let local_kv_heads = topology.map_or(Ok(global_kv_heads), |topology| {
+                    exact_parallel_division(
+                        "Gemma prompt-cache KV heads",
+                        global_kv_heads,
+                        topology.tensor_parallel_size,
+                    )
+                    .map_err(|error| CacheResidencyError::InvalidOptions(error.to_string()))
+                })?;
+                LayerCachePolicy::key_value(
+                    policy.attention,
+                    local_kv_heads,
+                    i32::try_from(policy.head_dim.get()).map_err(|_| {
+                        CacheResidencyError::InvalidOptions(
+                            "Gemma head dimension exceeds i32".into(),
+                        )
+                    })?,
+                )
+            })
+            .collect::<Result<Vec<_>, CacheResidencyError>>()
+            .map_err(|error| Error::Parallel(error.to_string()))?;
+        Ok(PromptCacheModelIdentity {
+            model_family: "gemma4".into(),
+            effective_model_type: self.args.model_type.clone(),
+            architecture_fingerprint: resident::prompt_cache_architecture_fingerprint(&self.args),
+            layer_count,
+            global_layer_start: 0,
+            global_layer_end: layer_count,
+            sink_tokens: 0,
+            topology: topology.map_or_else(
+                PromptCacheTopology::default,
+                PromptCacheTopology::for_parallel_topology,
+            ),
+            layer_layout: LayerSchedule::new(policies.len(), policies)
+                .map_err(|error| Exception::custom(error.to_string()))?,
+        })
+    }
+
+    fn save_prompt_cache(
+        &self,
+        cache: &mut Self::Cache,
+        destination: &Path,
+        descriptor: PromptCacheDescriptor,
+        prefix_token_ids: &[u32],
+        options: &PromptCacheOptions,
+        stream: &Stream,
+    ) -> Result<PromptCacheManifest, Error> {
+        resident::Model::save_prompt_cache(
+            cache,
+            destination,
+            descriptor,
+            prefix_token_ids,
+            options,
+            stream,
+        )
+        .map_err(Into::into)
+    }
+
+    fn load_prompt_cache(
+        &self,
+        directory: &Path,
+        expected: &PromptCacheDescriptor,
+        identity: &PromptCacheModelIdentity,
+        prefix_token_ids: &[u32],
+        _options: PagedCacheOptions,
+        stream: &Stream,
+    ) -> Result<(Self::Cache, PromptCacheManifest), Error> {
+        resident::Model::load_prompt_cache_with_identity(
+            &self.args,
+            directory,
+            expected,
+            prefix_token_ids,
+            identity,
+            stream,
+        )
+        .map_err(Into::into)
+    }
 
     fn static_units(&self, store: &dyn WeightStore) -> Result<Vec<StaticUnitBindings>, Error> {
         let mut units = vec![StaticUnitBindings::new(
@@ -808,8 +1057,12 @@ impl GeneralLayerwiseModelAdapter for Gemma4LayerwiseAdapter {
             populate_module_from_lease(module, &leases[index])?;
             index += 1;
         }
-        if let Some(module) = &mut self.per_layer_projection {
-            populate_module_from_lease(module, &leases[index])?;
+        if self.per_layer_projection.is_some() {
+            if let Some(module) = &mut self.parallel_per_layer_projection {
+                populate_module_from_lease(module.inner_mut(), &leases[index])?;
+            } else if let Some(module) = &mut self.per_layer_projection {
+                populate_module_from_lease(module, &leases[index])?;
+            }
             index += 1;
         }
         if let Some(module) = &mut self.per_layer_norm {
@@ -818,8 +1071,12 @@ impl GeneralLayerwiseModelAdapter for Gemma4LayerwiseAdapter {
         }
         populate_module_from_lease(&mut self.norm, &leases[index])?;
         index += 1;
-        if let Some(module) = &mut self.lm_head {
-            populate_module_from_lease(module, &leases[index])?;
+        if self.lm_head.is_some() {
+            if let Some(module) = &mut self.parallel_lm_head {
+                populate_module_from_lease(module.inner_mut(), &leases[index])?;
+            } else if let Some(module) = &mut self.lm_head {
+                populate_module_from_lease(module, &leases[index])?;
+            }
             index += 1;
         }
         if let Some(module) = &mut self.vision {
@@ -1090,6 +1347,252 @@ impl GeneralLayerwiseModelAdapter for Gemma4LayerwiseAdapter {
         })
     }
 
+    fn begin_forward_with_execution<'a>(
+        &mut self,
+        input: Self::Input<'a>,
+        cache: &mut Self::Cache,
+        execution: &crate::runtime::distributed::parallel::ParallelExecutionContext<'_>,
+    ) -> Result<LayerwiseForwardState<Self::ForwardContext>, Error> {
+        let Some(group) = execution.group() else {
+            return self.begin_forward(input, cache, execution.stream());
+        };
+        let stream = execution.stream();
+        let vocabulary = self
+            .parallel_vocabulary
+            .as_ref()
+            .ok_or_else(|| Error::Parallel("Gemma TP embedding was not configured".into()))?;
+        if let Gemma4Input::Prefill(typed) = input {
+            input::validate(typed)?;
+            cache.token_ids.clear();
+            cache.reset_kv(&self.args);
+            let mut parts = Vec::with_capacity(typed.parts.len());
+            let mut vision_jobs = Vec::new();
+            let mut audio_jobs = Vec::new();
+            let scale = Array::from_f32((self.args.hidden_size as f32).sqrt());
+            for part in typed.parts {
+                match (part.modality, part.payload) {
+                    (input::Modality::Text, input::InputPayload::TokenIds(tokens)) => {
+                        parts.push(Gemma4PreparedPart::Ready {
+                            tokens: tokens.clone(),
+                            embeddings: self
+                                .embedding
+                                .forward_tensor_parallel(tokens, vocabulary, group, stream)?
+                                .multiply(&scale, stream)?,
+                        });
+                    }
+                    (
+                        modality @ (input::Modality::Image | input::Modality::Video),
+                        input::InputPayload::Tensor(pixels),
+                    ) => {
+                        let positions = part.metadata.patch_position_ids.ok_or_else(|| {
+                            Error::UnsupportedArchitecture(format!(
+                                "gemma4 {} tensor input requires patch_position_ids metadata",
+                                modality.as_str()
+                            ))
+                        })?;
+                        let token_id = if modality == input::Modality::Image {
+                            self.image_token_id
+                        } else {
+                            self.video_token_id
+                        }
+                        .ok_or_else(|| {
+                            Error::UnsupportedArchitecture(format!(
+                                "gemma4 config does not define a {} token ID",
+                                modality.as_str()
+                            ))
+                        })? as u32;
+                        let (hidden, state) = self
+                            .vision
+                            .as_mut()
+                            .ok_or_else(|| {
+                                Error::UnsupportedArchitecture(format!(
+                                    "gemma4 {} tensor input requires vision_config and vision weights",
+                                    modality.as_str()
+                                ))
+                            })?
+                            .begin_tensor_parallel(pixels, positions, group, stream)?;
+                        let job = vision_jobs.len();
+                        vision_jobs.push(Gemma4VisionJob { hidden, state });
+                        parts.push(Gemma4PreparedPart::Vision { token_id, job });
+                    }
+                    (input::Modality::Audio, input::InputPayload::Tensor(features)) => {
+                        let mask = part.metadata.audio_mask.ok_or_else(|| {
+                            Error::UnsupportedArchitecture(
+                                "gemma4 audio tensor input requires audio_mask metadata".into(),
+                            )
+                        })?;
+                        let token_id = self.audio_token_id.ok_or_else(|| {
+                            Error::UnsupportedArchitecture(
+                                "gemma4 config does not define an audio token ID".into(),
+                            )
+                        })? as u32;
+                        let (hidden, valid) = self
+                            .audio
+                            .as_mut()
+                            .ok_or_else(|| {
+                                Error::UnsupportedArchitecture(
+                                    "gemma4 audio tensor input requires audio_config and audio weights".into(),
+                                )
+                            })?
+                            .begin_tensor_parallel(features, mask, group, stream)?;
+                        let job = audio_jobs.len();
+                        audio_jobs.push(Gemma4AudioJob { hidden, valid });
+                        parts.push(Gemma4PreparedPart::Audio { token_id, job });
+                    }
+                    (
+                        modality @ (input::Modality::Image
+                        | input::Modality::Video
+                        | input::Modality::Audio),
+                        input::InputPayload::Embeddings(embeddings),
+                    ) => {
+                        input::ensure_hidden_size(
+                            embeddings,
+                            self.args.hidden_size,
+                            "Gemma 4 media embeddings",
+                        )?;
+                        let token_id = match modality {
+                            input::Modality::Image => self.image_token_id,
+                            input::Modality::Video => self.video_token_id,
+                            input::Modality::Audio => self.audio_token_id,
+                            input::Modality::Text => unreachable!(),
+                        }
+                        .ok_or_else(|| {
+                            Error::UnsupportedArchitecture(format!(
+                                "gemma4 config does not define a {} token ID",
+                                modality.as_str()
+                            ))
+                        })? as u32;
+                        parts.push(Gemma4PreparedPart::Ready {
+                            tokens: input::token_ids_array(
+                                &vec![token_id; embeddings.dim(1) as usize],
+                                stream,
+                            )?,
+                            embeddings: embeddings.clone(),
+                        });
+                    }
+                    (modality, _) => {
+                        return Err(Error::UnsupportedArchitecture(format!(
+                            "gemma4 layerwise input does not support {} payloads of this kind",
+                            modality.as_str()
+                        )));
+                    }
+                }
+            }
+            if self.vision_depth == 0 && self.audio_depth == 0 {
+                let token_parts = parts
+                    .iter()
+                    .filter_map(|part| match part {
+                        Gemma4PreparedPart::Ready { tokens, .. } => Some(tokens),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
+                let embedding_parts = parts
+                    .iter()
+                    .filter_map(|part| match part {
+                        Gemma4PreparedPart::Ready { embeddings, .. } => Some(embeddings),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
+                let tokens = concatenate_axis(&token_parts, 1, stream)?;
+                let hidden = concatenate_axis(&embedding_parts, 1, stream)?;
+                cache.token_ids = resident::token_ids_from_array(&tokens, stream)?;
+                let per_layer_inputs = self.prepare_per_layer_inputs_with_execution(
+                    &tokens,
+                    &hidden,
+                    Some(execution),
+                    stream,
+                )?;
+                let mask = (hidden.dim(1) > 1)
+                    .then(|| create_causal_mask(hidden.dim(1), Some(0), None, None, stream))
+                    .transpose()?;
+                return Ok(LayerwiseForwardState {
+                    hidden,
+                    context: Gemma4ForwardContext {
+                        per_layer_inputs,
+                        mask,
+                        sliding_masks: None,
+                        position_offset: 0,
+                        shared_kv: HashMap::new(),
+                        parts,
+                        vision_jobs,
+                        audio_jobs,
+                        tokens: Some(tokens),
+                        needs_assembly: false,
+                        draft_hidden: None,
+                    },
+                });
+            }
+            let hidden = vision_jobs
+                .first()
+                .map(|job| job.hidden.clone())
+                .or_else(|| audio_jobs.first().map(|job| job.hidden.clone()))
+                .or_else(|| {
+                    parts.iter().find_map(|part| match part {
+                        Gemma4PreparedPart::Ready { embeddings, .. } => Some(embeddings.clone()),
+                        _ => None,
+                    })
+                })
+                .expect("validated non-empty Gemma 4 input");
+            return Ok(LayerwiseForwardState {
+                hidden,
+                context: Gemma4ForwardContext {
+                    per_layer_inputs: None,
+                    mask: None,
+                    sliding_masks: None,
+                    position_offset: 0,
+                    shared_kv: HashMap::new(),
+                    parts,
+                    vision_jobs,
+                    audio_jobs,
+                    tokens: None,
+                    needs_assembly: true,
+                    draft_hidden: None,
+                },
+            });
+        }
+        let Gemma4Input::Decode(tokens) = input else {
+            unreachable!()
+        };
+        cache
+            .token_ids
+            .extend(resident::token_ids_from_array(tokens, stream)?);
+        let hidden = self
+            .embedding
+            .forward_tensor_parallel(tokens, vocabulary, group, stream)?
+            .multiply(
+                Array::from_f32((self.args.hidden_size as f32).sqrt()),
+                stream,
+            )?;
+        let position_offset = cache
+            .kv
+            .iter()
+            .flatten()
+            .map(KeyValueCache::offset)
+            .max()
+            .unwrap_or(0);
+        let mask = (hidden.dim(1) > 1)
+            .then(|| create_causal_mask(hidden.dim(1), Some(position_offset), None, None, stream))
+            .transpose()?;
+        let per_layer_inputs =
+            self.prepare_per_layer_inputs_with_execution(tokens, &hidden, Some(execution), stream)?;
+        Ok(LayerwiseForwardState {
+            hidden,
+            context: Gemma4ForwardContext {
+                per_layer_inputs,
+                mask,
+                sliding_masks: None,
+                position_offset,
+                shared_kv: HashMap::new(),
+                parts: Vec::new(),
+                vision_jobs: Vec::new(),
+                audio_jobs: Vec::new(),
+                tokens: Some(tokens.clone()),
+                needs_assembly: false,
+                draft_hidden: None,
+            },
+        })
+    }
+
     fn execution_group_count(&self) -> usize {
         1 + usize::from(self.vision_depth > 0) + usize::from(self.audio_depth > 0)
     }
@@ -1160,6 +1663,507 @@ impl GeneralLayerwiseModelAdapter for Gemma4LayerwiseAdapter {
         }
     }
 
+    fn parallel_parameter_groups(
+        &self,
+        _context: crate::runtime::distributed::parallel::ParallelBuildContext,
+    ) -> Result<Vec<crate::runtime::distributed::parallel::ParameterGroupSpec>, Error> {
+        use crate::runtime::distributed::parallel::{
+            MemberSharding, ParameterGroupSpec, ParameterMemberSpec, ParameterRole,
+        };
+        let mut groups = Vec::new();
+        if let Some(vision) = &self.vision {
+            let cfg = &vision.config;
+            let hidden = cfg.hidden_size as usize;
+            let q = (cfg.num_attention_heads * cfg.head_dim) as usize;
+            let kv = (cfg.num_key_value_heads * cfg.head_dim) as usize;
+            let intermediate = cfg.intermediate_size as usize;
+            for index in 0..self.vision_depth {
+                let prefix = format!("model.vision_tower.encoder.layers.{index}");
+                for (name, output) in [("q_proj", q), ("k_proj", kv), ("v_proj", kv)] {
+                    groups.push(ParameterGroupSpec::new(
+                        format!("{prefix}.attention.{name}"),
+                        ParameterRole::AttentionHeads,
+                        [ParameterMemberSpec::new(
+                            format!("{prefix}.self_attn.{name}.linear.weight"),
+                            [output, hidden],
+                            MemberSharding::Equal { axis: 0 },
+                        )],
+                    )?);
+                }
+                groups.push(ParameterGroupSpec::new(
+                    format!("{prefix}.attention.output"),
+                    ParameterRole::RowProjection,
+                    [ParameterMemberSpec::new(
+                        format!("{prefix}.self_attn.o_proj.linear.weight"),
+                        [hidden, q],
+                        MemberSharding::Equal { axis: 1 },
+                    )],
+                )?);
+                for name in ["gate_proj", "up_proj"] {
+                    groups.push(ParameterGroupSpec::new(
+                        format!("{prefix}.mlp.{name}"),
+                        ParameterRole::ColumnProjection,
+                        [ParameterMemberSpec::new(
+                            format!("{prefix}.mlp.{name}.linear.weight"),
+                            [intermediate, hidden],
+                            MemberSharding::Equal { axis: 0 },
+                        )],
+                    )?);
+                }
+                groups.push(ParameterGroupSpec::new(
+                    format!("{prefix}.mlp.down_proj"),
+                    ParameterRole::RowProjection,
+                    [ParameterMemberSpec::new(
+                        format!("{prefix}.mlp.down_proj.linear.weight"),
+                        [hidden, intermediate],
+                        MemberSharding::Equal { axis: 1 },
+                    )],
+                )?);
+            }
+        }
+        if let Some(cfg) = &self.audio_config {
+            let hidden = cfg.hidden_size as usize;
+            let intermediate = 4 * hidden;
+            for index in 0..self.audio_depth {
+                let prefix = format!("model.audio_tower.layers.{index}");
+                for ffw in ["feed_forward1", "feed_forward2"] {
+                    groups.push(ParameterGroupSpec::new(
+                        format!("{prefix}.{ffw}.input"),
+                        ParameterRole::ColumnProjection,
+                        [ParameterMemberSpec::new(
+                            format!("{prefix}.{ffw}.ffw_layer_1.linear.weight"),
+                            [intermediate, hidden],
+                            MemberSharding::Equal { axis: 0 },
+                        )],
+                    )?);
+                    groups.push(ParameterGroupSpec::new(
+                        format!("{prefix}.{ffw}.output"),
+                        ParameterRole::RowProjection,
+                        [ParameterMemberSpec::new(
+                            format!("{prefix}.{ffw}.ffw_layer_2.linear.weight"),
+                            [hidden, intermediate],
+                            MemberSharding::Equal { axis: 1 },
+                        )],
+                    )?);
+                }
+                for name in ["q_proj", "k_proj", "v_proj", "relative_k_proj"] {
+                    let target = if name == "relative_k_proj" {
+                        format!("{prefix}.self_attn.{name}.weight")
+                    } else {
+                        format!("{prefix}.self_attn.{name}.linear.weight")
+                    };
+                    groups.push(ParameterGroupSpec::new(
+                        format!("{prefix}.attention.{name}"),
+                        ParameterRole::AttentionHeads,
+                        [ParameterMemberSpec::new(
+                            target,
+                            [hidden, hidden],
+                            MemberSharding::Equal { axis: 0 },
+                        )],
+                    )?);
+                }
+                groups.push(ParameterGroupSpec::new(
+                    format!("{prefix}.attention.output"),
+                    ParameterRole::RowProjection,
+                    [ParameterMemberSpec::new(
+                        format!("{prefix}.self_attn.post.linear.weight"),
+                        [hidden, hidden],
+                        MemberSharding::Equal { axis: 1 },
+                    )],
+                )?);
+                groups.push(ParameterGroupSpec::new(
+                    format!("{prefix}.lightconv.input"),
+                    ParameterRole::Segmented,
+                    [ParameterMemberSpec::new(
+                        format!("{prefix}.lconv1d.linear_start.linear.weight"),
+                        [2 * hidden, hidden],
+                        MemberSharding::Segmented {
+                            axis: 0,
+                            segments: vec![0..hidden, hidden..2 * hidden],
+                        },
+                    )],
+                )?);
+                groups.push(ParameterGroupSpec::new(
+                    format!("{prefix}.lightconv.channels"),
+                    ParameterRole::Channels,
+                    [
+                        ParameterMemberSpec::new(
+                            format!("{prefix}.lconv1d.depthwise_conv1d.weight"),
+                            [hidden, cfg.conv_kernel_size as usize, 1],
+                            MemberSharding::Equal { axis: 0 },
+                        ),
+                        ParameterMemberSpec::new(
+                            format!("{prefix}.lconv1d.conv_norm.weight"),
+                            [hidden],
+                            MemberSharding::Equal { axis: 0 },
+                        ),
+                    ],
+                )?);
+                groups.push(ParameterGroupSpec::new(
+                    format!("{prefix}.lightconv.output"),
+                    ParameterRole::RowProjection,
+                    [ParameterMemberSpec::new(
+                        format!("{prefix}.lconv1d.linear_end.linear.weight"),
+                        [hidden, hidden],
+                        MemberSharding::Equal { axis: 1 },
+                    )],
+                )?);
+            }
+        }
+        Ok(groups)
+    }
+
+    fn register_parallel_parameters(
+        &self,
+        context: crate::runtime::distributed::parallel::ParallelBuildContext,
+        planner: &mut crate::runtime::distributed::parallel::ParallelPlanBuilder,
+        stream: &Stream,
+    ) -> Result<(), Error> {
+        for group in self.parallel_parameter_groups(context)? {
+            planner.register(group)?;
+        }
+        self.embedding
+            .register_tensor_parallel_parameters(planner, "model.language_model.embed_tokens")?;
+        if let Some(embedding) = &self.per_layer_embedding {
+            embedding.register_tensor_parallel_parameters(
+                planner,
+                "model.language_model.embed_tokens_per_layer",
+            )?;
+        }
+        if let Some(projection) = &self.per_layer_projection {
+            crate::nn::parallel::register_linear_parameter_group(
+                planner,
+                projection,
+                "model.language_model.per_layer_model_projection",
+                LinearParallelism::Column,
+            )?;
+        }
+        if let Some(norm) = &self.per_layer_norm {
+            crate::nn::parallel::register_replicated_parameter_group(
+                planner,
+                norm,
+                "model.language_model.per_layer_projection_norm",
+            )?;
+        }
+        crate::nn::parallel::register_replicated_parameter_group(
+            planner,
+            &self.norm,
+            "model.language_model.norm",
+        )?;
+        if let Some(head) = &self.lm_head {
+            planner.register(crate::nn::parallel::vocab_lm_head_parameter_group(
+                head,
+                "lm_head",
+                self.args.hidden_size,
+                self.args.vocab_size as usize,
+                false,
+            )?)?;
+        }
+        if let Some(vision) = &self.vision {
+            crate::nn::parallel::register_linear_parameter_group(
+                planner,
+                &MaybeQuantized::Original(vision.patch_embedder.input_proj.clone()),
+                "model.vision_tower.patch_embedder.input_proj",
+                LinearParallelism::Column,
+            )?;
+            use crate::runtime::distributed::parallel::{
+                MemberSharding, ParameterGroupSpec, ParameterMemberSpec, ParameterRole,
+            };
+            planner.register(ParameterGroupSpec::new(
+                "model.vision_tower.patch_embedder.position_embedding_table",
+                ParameterRole::ColumnProjection,
+                [ParameterMemberSpec::new(
+                    "model.vision_tower.patch_embedder.position_embedding_table",
+                    vision
+                        .patch_embedder
+                        .position_embedding_table
+                        .shape()
+                        .iter()
+                        .map(|&dimension| dimension as usize)
+                        .collect::<Vec<_>>(),
+                    MemberSharding::Equal { axis: 2 },
+                )],
+            )?)?;
+            for (name, value) in [
+                ("std_bias", vision.std_bias.as_ref()),
+                ("std_scale", vision.std_scale.as_ref()),
+            ] {
+                if let Some(value) = value {
+                    planner.register(ParameterGroupSpec::new(
+                        format!("model.vision_tower.{name}"),
+                        ParameterRole::Replicated,
+                        [ParameterMemberSpec::new(
+                            format!("model.vision_tower.{name}"),
+                            value
+                                .shape()
+                                .iter()
+                                .map(|&dimension| dimension as usize)
+                                .collect::<Vec<_>>(),
+                            MemberSharding::Replicated,
+                        )],
+                    )?)?;
+                }
+            }
+        }
+        if let Some(embedder) = &self.embed_vision {
+            crate::nn::parallel::register_linear_parameter_group(
+                planner,
+                &embedder.embedding_projection,
+                "model.embed_vision.embedding_projection",
+                LinearParallelism::Row,
+            )?;
+        }
+        if let Some(audio) = &self.audio {
+            crate::nn::parallel::register_replicated_parameter_group(
+                planner,
+                &audio.subsample_conv_projection.layer0,
+                "model.audio_tower.subsample_conv_projection.layer0",
+            )?;
+            crate::nn::parallel::register_replicated_parameter_group(
+                planner,
+                &audio.subsample_conv_projection.layer1,
+                "model.audio_tower.subsample_conv_projection.layer1",
+            )?;
+            crate::nn::parallel::register_linear_parameter_group(
+                planner,
+                &MaybeQuantized::Original(
+                    audio.subsample_conv_projection.input_proj_linear.clone(),
+                ),
+                "model.audio_tower.subsample_conv_projection.input_proj_linear",
+                LinearParallelism::Column,
+            )?;
+            crate::nn::parallel::register_linear_parameter_group(
+                planner,
+                &MaybeQuantized::Original(audio.output_proj.clone()),
+                "model.audio_tower.output_proj",
+                LinearParallelism::Column,
+            )?;
+        }
+        if let Some(embedder) = &self.embed_audio {
+            crate::nn::parallel::register_linear_parameter_group(
+                planner,
+                &embedder.embedding_projection,
+                "model.embed_audio.embedding_projection",
+                LinearParallelism::Row,
+            )?;
+        }
+        for index in 0..self.args.num_hidden_layers as usize {
+            let layer = TransformerBlock::new(
+                &self.args,
+                *self.args.layer_policy(index).ok_or_else(|| {
+                    Error::Parallel(format!("missing Gemma policy for layer {index}"))
+                })?,
+                index,
+                stream,
+            )?;
+            crate::architectures::distributed::tensor::insert_gemma_layer_plan_with_prefix(
+                planner,
+                &layer,
+                &format!("model.language_model.layers.{index}"),
+            )?;
+        }
+        Ok(())
+    }
+
+    fn configure_parallel_static(
+        &mut self,
+        context: crate::runtime::distributed::parallel::ParallelBuildContext,
+        _layout: &crate::runtime::distributed::parallel::LocalModelLayout,
+        stream: &Stream,
+    ) -> Result<(), Error> {
+        let topology = context.topology();
+        let vocabulary = crate::runtime::distributed::topology::balanced_contiguous_range(
+            self.args.vocab_size as usize,
+            topology.tensor_parallel_size,
+            topology.tensor_parallel_rank,
+            false,
+        )?;
+        self.embedding = Gemma4Embedding::unloaded(
+            vocabulary.len() as i32,
+            self.args.hidden_size,
+            self.args
+                .quantization_for("model.language_model.embed_tokens.weight"),
+            stream,
+        )?;
+        self.parallel_vocabulary = Some(vocabulary);
+        if self.per_layer_embedding.is_some() {
+            let global = self
+                .args
+                .vocab_size_per_layer_input
+                .unwrap_or(self.args.vocab_size) as usize;
+            let range = crate::runtime::distributed::topology::balanced_contiguous_range(
+                global,
+                topology.tensor_parallel_size,
+                topology.tensor_parallel_rank,
+                false,
+            )?;
+            self.per_layer_embedding = Some(Gemma4Embedding::unloaded(
+                range.len() as i32,
+                self.args.num_hidden_layers * self.args.hidden_size_per_layer_input,
+                self.args
+                    .quantization_for("model.language_model.embed_tokens_per_layer.weight"),
+                stream,
+            )?);
+            self.parallel_per_layer_vocabulary = Some(range);
+        }
+        if self.per_layer_projection.is_some() {
+            self.parallel_per_layer_projection = Some(ParallelLinear::unloaded(
+                self.args.hidden_size,
+                self.args.num_hidden_layers * self.args.hidden_size_per_layer_input,
+                false,
+                self.args
+                    .quantization_for("model.language_model.per_layer_model_projection.weight"),
+                LinearParallelism::Column,
+                context,
+                stream,
+            )?);
+        }
+        if self.lm_head.is_some() {
+            self.parallel_lm_head = Some(VocabParallelLmHead::unloaded(
+                self.args.hidden_size,
+                self.args.vocab_size as usize,
+                self.args.quantization_for("lm_head.weight"),
+                context,
+                stream,
+            )?);
+        }
+        if let Some(embedder) = &self.embed_vision {
+            self.embed_vision = Some(Gemma4ModalityEmbedder::new_tensor_parallel(
+                embedder.input_size,
+                self.args.hidden_size,
+                embedder.eps,
+                false,
+                self.args.weight_quantization(),
+                context,
+                stream,
+            )?);
+        }
+        if let Some(vision) = &mut self.vision {
+            vision.patch_embedder =
+                crate::api::gemma4_vision::VisionPatchEmbedder::new_tensor_parallel(
+                    &vision.config,
+                    context,
+                    stream,
+                )?;
+        }
+        if let (Some(audio), Some(config)) = (&self.audio, &self.audio_config) {
+            self.audio = Some(Gemma4AudioLayerwiseStatic::new_tensor_parallel(
+                audio, config, context, stream,
+            )?);
+        }
+        if let Some(embedder) = &self.embed_audio {
+            self.embed_audio = Some(Gemma4ModalityEmbedder::new_tensor_parallel(
+                embedder.input_size,
+                self.args.hidden_size,
+                embedder.eps,
+                false,
+                self.args.weight_quantization(),
+                context,
+                stream,
+            )?);
+        }
+        Ok(())
+    }
+
+    fn new_parallel_layer(
+        &self,
+        group: usize,
+        index: usize,
+        layout: &crate::runtime::distributed::parallel::LocalModelLayout,
+        stream: &Stream,
+    ) -> Result<Self::Layer, Error> {
+        let id = self.execution_group_id(group)?;
+        match id.as_str() {
+            "vision_encoder" => {
+                let cfg = &self.vision.as_ref().expect("vision group").config;
+                let prefix = format!("model.vision_tower.encoder.layers.{index}");
+                let q = layout
+                    .tensor(&format!("{prefix}.self_attn.q_proj.linear.weight"))
+                    .ok_or_else(|| {
+                        Error::Parallel(format!("missing TP layout for {prefix} query"))
+                    })?;
+                let mlp = layout
+                    .tensor(&format!("{prefix}.mlp.gate_proj.linear.weight"))
+                    .ok_or_else(|| {
+                        Error::Parallel(format!("missing TP layout for {prefix} MLP"))
+                    })?;
+                let local_heads = i32::try_from(q.local_shape()[0])
+                    .map_err(|_| Error::Parallel("Gemma vision local width exceeds i32".into()))?
+                    / cfg.head_dim;
+                let local_kv_heads =
+                    local_heads * cfg.num_key_value_heads / cfg.num_attention_heads;
+                Ok(Gemma4Layer::Vision(Box::new(
+                    VisionLayer::new_tensor_parallel(
+                        cfg,
+                        local_heads,
+                        local_kv_heads,
+                        i32::try_from(mlp.local_shape()[0]).map_err(|_| {
+                            Error::Parallel("Gemma vision local MLP exceeds i32".into())
+                        })?,
+                        stream,
+                    )?,
+                )))
+            }
+            "audio_encoder" => {
+                let cfg = self.audio_config.as_ref().expect("audio group");
+                let prefix = format!("model.audio_tower.layers.{index}");
+                let q = layout
+                    .tensor(&format!("{prefix}.self_attn.q_proj.linear.weight"))
+                    .ok_or_else(|| {
+                        Error::Parallel(format!("missing TP layout for {prefix} query"))
+                    })?;
+                let local_hidden = i32::try_from(q.local_shape()[0])
+                    .map_err(|_| Error::Parallel("Gemma audio local width exceeds i32".into()))?;
+                Ok(Gemma4Layer::Audio(Box::new(
+                    AudioLayer::new_tensor_parallel(
+                        cfg,
+                        local_hidden / (cfg.hidden_size / cfg.num_attention_heads),
+                        4 * local_hidden,
+                        local_hidden,
+                        stream,
+                    )?,
+                )))
+            }
+            "text_decoder" => {
+                let prefix = format!("model.language_model.layers.{index}");
+                let source_policy = *self.args.layer_policy(index).ok_or_else(|| {
+                    Error::Parallel(format!("missing Gemma policy for layer {index}"))
+                })?;
+                let q = layout
+                    .tensor(&format!("{prefix}.self_attn.q_proj.weight"))
+                    .or_else(|| layout.tensor(&format!("{prefix}.self_attn.q_proj.inner.weight")))
+                    .ok_or_else(|| {
+                        Error::Parallel(format!("missing TP layout for {prefix} query"))
+                    })?;
+                let local_heads =
+                    u32::try_from(q.local_shape()[0] / source_policy.head_dim.get() as usize)
+                        .map_err(|_| Error::Parallel("Gemma local heads exceed u32".into()))?;
+                let parts = self.args.num_attention_heads as usize / local_heads as usize;
+                let local_kv = source_policy.num_key_value_heads.get() as usize / parts;
+                let gate = layout
+                    .tensor(&format!("{prefix}.mlp.gate_proj.weight"))
+                    .or_else(|| layout.tensor(&format!("{prefix}.mlp.gate_proj.inner.weight")))
+                    .ok_or_else(|| {
+                        Error::Parallel(format!("missing TP layout for {prefix} MLP"))
+                    })?;
+                let mut policy = source_policy;
+                policy.num_key_value_heads = std::num::NonZeroU32::new(local_kv as u32)
+                    .ok_or_else(|| Error::Parallel("Gemma local KV heads are empty".into()))?;
+                policy.intermediate_size = std::num::NonZeroU32::new(gate.local_shape()[0] as u32)
+                    .ok_or_else(|| Error::Parallel("Gemma local MLP is empty".into()))?;
+                let mut args = self.args.clone();
+                args.num_attention_heads = local_heads as i32;
+                if let Some(width) = args.moe_intermediate_size {
+                    args.moe_intermediate_size = Some(width / parts as i32);
+                }
+                Ok(Gemma4Layer::Text(Box::new(TransformerBlock::new(
+                    &args, policy, index, stream,
+                )?)))
+            }
+            _ => unreachable!(),
+        }
+    }
+
     fn layer_checkpoint_prefix(&self, group: usize, index: usize) -> String {
         match self.execution_group_id(group).ok().as_deref() {
             Some("vision_encoder") => format!("model.vision_tower.encoder.layers.{index}"),
@@ -1184,6 +2188,23 @@ impl GeneralLayerwiseModelAdapter for Gemma4LayerwiseAdapter {
         store: &dyn WeightStore,
     ) -> Result<Vec<WeightBinding>, Error> {
         self.bindings(layer, &self.layer_checkpoint_prefix(group, index), store)
+    }
+
+    fn parallel_layer_bindings(
+        &self,
+        group: usize,
+        index: usize,
+        _layer: &Self::Layer,
+        store: &dyn WeightStore,
+        layout: &crate::runtime::distributed::parallel::LocalModelLayout,
+        stream: &Stream,
+    ) -> Result<Vec<WeightBinding>, Error> {
+        let global = self.new_layer(group, index, stream)?;
+        crate::runtime::execution::layerwise::shard_layer_bindings(
+            self.layer_bindings(group, index, &global, store)?,
+            &self.layer_checkpoint_prefix(group, index),
+            layout,
+        )
     }
 
     fn forward_layer(
@@ -1244,6 +2265,91 @@ impl GeneralLayerwiseModelAdapter for Gemma4LayerwiseAdapter {
                 "Gemma 4 execution unit does not match group {group}"
             ))),
         }
+    }
+
+    fn forward_layer_with_execution(
+        &mut self,
+        group: usize,
+        index: usize,
+        layer: &mut Self::Layer,
+        hidden: &Array,
+        cache: &mut Self::Cache,
+        context: &mut Self::ForwardContext,
+        execution: &crate::runtime::distributed::parallel::ParallelExecutionContext<'_>,
+    ) -> Result<Array, Error> {
+        let Some(tp_group) = execution.group() else {
+            return self.forward_layer(
+                group,
+                index,
+                layer,
+                hidden,
+                cache,
+                context,
+                execution.stream(),
+            );
+        };
+        let id = self.execution_group_id(group)?;
+        if id == "vision_encoder" {
+            if let Gemma4Layer::Vision(layer) = layer {
+                for job in &mut context.vision_jobs {
+                    job.hidden = layer.forward_tensor_parallel(
+                        &job.hidden,
+                        &job.state.padding,
+                        &job.state.cos,
+                        &job.state.sin,
+                        tp_group,
+                        execution.stream(),
+                    )?;
+                }
+                return Ok(context.vision_jobs[0].hidden.clone());
+            }
+        } else if id == "audio_encoder" {
+            if let Gemma4Layer::Audio(layer) = layer {
+                for job in &mut context.audio_jobs {
+                    job.hidden = layer.forward_tensor_parallel(
+                        &job.hidden,
+                        job.valid,
+                        tp_group,
+                        execution.stream(),
+                    )?;
+                }
+                return Ok(context.audio_jobs[0].hidden.clone());
+            }
+        } else if id == "text_decoder" {
+            if let Gemma4Layer::Text(layer) = layer {
+                let per_layer_input = context
+                    .per_layer_inputs
+                    .as_ref()
+                    .map(|inputs| {
+                        inputs.try_index_device((.., .., index as i32, ..), execution.stream())
+                    })
+                    .transpose()?;
+                let mask = context
+                    .sliding_masks
+                    .as_ref()
+                    .and_then(|masks| masks.get(&layer.layer_policy.attention))
+                    .or(context.mask.as_ref());
+                return Ok(layer.forward_tensor_parallel(
+                    hidden,
+                    mask,
+                    cache.kv[index].as_mut(),
+                    context.position_offset,
+                    per_layer_input.as_ref(),
+                    &mut context.shared_kv,
+                    tp_group,
+                    execution.stream(),
+                )?);
+            }
+        }
+        self.forward_layer(
+            group,
+            index,
+            layer,
+            hidden,
+            cache,
+            context,
+            execution.stream(),
+        )
     }
 
     fn retained_arrays<'a>(
@@ -1358,6 +2464,95 @@ impl GeneralLayerwiseModelAdapter for Gemma4LayerwiseAdapter {
         Ok(hidden)
     }
 
+    fn finish_execution_group_with_execution(
+        &mut self,
+        group: usize,
+        hidden: &Array,
+        cache: &mut Self::Cache,
+        context: &mut Self::ForwardContext,
+        execution: &crate::runtime::distributed::parallel::ParallelExecutionContext<'_>,
+    ) -> Result<Array, Error> {
+        let Some(tp_group) = execution.group() else {
+            return self.finish_execution_group(group, hidden, cache, context, execution.stream());
+        };
+        if !context.needs_assembly || group + 1 != self.execution_group_count() - 1 {
+            if group + 1 == self.execution_group_count() {
+                context.draft_hidden = Some(hidden.clone());
+            }
+            return Ok(hidden.clone());
+        }
+        let stream = execution.stream();
+        if let (Some(vision), Some(embedder)) = (&self.vision, &mut self.embed_vision) {
+            for job in &mut context.vision_jobs {
+                job.hidden = embedder.forward_tensor_parallel(
+                    &vision.finish(&job.hidden, &job.state, stream)?,
+                    tp_group,
+                    stream,
+                )?;
+            }
+        }
+        if let (Some(audio), Some(embedder)) = (&mut self.audio, &mut self.embed_audio) {
+            for job in &mut context.audio_jobs {
+                job.hidden = embedder.forward_tensor_parallel(
+                    &audio.finish_tensor_parallel(&job.hidden, job.valid, stream)?,
+                    tp_group,
+                    stream,
+                )?;
+            }
+        }
+        let mut token_parts = Vec::with_capacity(context.parts.len());
+        let mut embedding_parts = Vec::with_capacity(context.parts.len());
+        for part in &context.parts {
+            match part {
+                Gemma4PreparedPart::Ready { tokens, embeddings } => {
+                    token_parts.push(tokens.clone());
+                    embedding_parts.push(embeddings.clone());
+                }
+                Gemma4PreparedPart::Vision { token_id, job } => {
+                    let embeddings = context.vision_jobs[*job].hidden.clone();
+                    token_parts.push(input::token_ids_array(
+                        &vec![*token_id; embeddings.dim(0) as usize * embeddings.dim(1) as usize],
+                        stream,
+                    )?);
+                    embedding_parts.push(if embeddings.dim(0) == 1 {
+                        embeddings
+                    } else {
+                        embeddings.reshape(&[1, -1, embeddings.dim(2)], stream)?
+                    });
+                }
+                Gemma4PreparedPart::Audio { token_id, job } => {
+                    let embeddings = context.audio_jobs[*job].hidden.clone();
+                    token_parts.push(input::token_ids_array(
+                        &vec![*token_id; embeddings.dim(1) as usize],
+                        stream,
+                    )?);
+                    embedding_parts.push(embeddings);
+                }
+            }
+        }
+        let tokens = concatenate_axis(&token_parts.iter().collect::<Vec<_>>(), 1, stream)?;
+        let hidden = concatenate_axis(&embedding_parts.iter().collect::<Vec<_>>(), 1, stream)?;
+        cache.token_ids = resident::token_ids_from_array(&tokens, stream)?;
+        let per_layer_ids = self.media_safe_per_layer_ids(&tokens, stream)?;
+        context.per_layer_inputs = self.prepare_per_layer_inputs_with_execution(
+            &per_layer_ids,
+            &hidden,
+            Some(execution),
+            stream,
+        )?;
+        let masks = resident::multimodal_attention_masks(
+            &cache.token_ids,
+            self.image_token_id.map(|id| id as u32),
+            self.video_token_id.map(|id| id as u32),
+            &self.args.layer_schedule,
+        );
+        context.mask = Some(masks.full);
+        context.sliding_masks = Some(masks.sliding);
+        context.tokens = Some(tokens);
+        context.needs_assembly = false;
+        Ok(hidden)
+    }
+
     fn finish(
         &mut self,
         hidden: &Array,
@@ -1373,6 +2568,63 @@ impl GeneralLayerwiseModelAdapter for Gemma4LayerwiseAdapter {
         if let Some(softcap) = self.args.final_logit_softcapping {
             logits = tanh(&logits.divide(Array::from_f32(softcap), stream)?, stream)?
                 .multiply(Array::from_f32(softcap), stream)?;
+        }
+        Ok(logits)
+    }
+
+    fn finish_with_execution(
+        &mut self,
+        hidden: &Array,
+        cache: &mut Self::Cache,
+        context: &Self::ForwardContext,
+        execution: &crate::runtime::distributed::parallel::ParallelExecutionContext<'_>,
+    ) -> Result<Array, Error> {
+        let Some(group) = execution.group() else {
+            return self.finish(hidden, cache, context, execution.stream());
+        };
+        let hidden = self.norm.forward(hidden, execution.stream())?;
+        let local = if let Some(head) = &mut self.parallel_lm_head {
+            return head
+                .forward(&hidden, execution)?
+                .all_gather(execution)
+                .and_then(|logits| {
+                    if let Some(softcap) = self.args.final_logit_softcapping {
+                        Ok(tanh(
+                            &logits.divide(Array::from_f32(softcap), execution.stream())?,
+                            execution.stream(),
+                        )?
+                        .multiply(Array::from_f32(softcap), execution.stream())?)
+                    } else {
+                        Ok(logits)
+                    }
+                });
+        } else {
+            self.embedding.as_linear(&hidden, execution.stream())?
+        };
+        let widths = (0..execution.size())
+            .map(|rank| {
+                crate::runtime::distributed::topology::balanced_contiguous_range(
+                    self.args.vocab_size as usize,
+                    execution.size(),
+                    rank,
+                    false,
+                )
+                .map(|range| range.len())
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut logits = safemlx::distributed::all_gather_uneven_axis(
+            &local,
+            -1,
+            &widths,
+            group,
+            execution.stream(),
+        )?;
+        if let Some(softcap) = self.args.final_logit_softcapping {
+            logits = tanh(
+                &logits.divide(Array::from_f32(softcap), execution.stream())?,
+                execution.stream(),
+            )?
+            .multiply(Array::from_f32(softcap), execution.stream())?;
         }
         Ok(logits)
     }
@@ -1397,8 +2649,10 @@ mod tests {
     use std::{fs, path::Path};
 
     use safemlx::{
-        module::ModuleParameters, ops::ones_dtype, Array, Device, DeviceType, ExecutionContext,
-        Stream,
+        distributed::{Backend, Group},
+        module::ModuleParameters,
+        ops::ones_dtype,
+        Array, Device, DeviceType, ExecutionContext, Stream,
     };
 
     use super::*;
@@ -1410,9 +2664,18 @@ mod tests {
             gemma4_vision::Gemma4VisionConfig,
             input as runtime_input,
         },
-        runtime::cache::ConcatKeyValueCache,
-        runtime::execution::layerwise::LayerwiseLoadOptions,
-        runtime::residency::policy::OffloadConfig,
+        runtime::{
+            cache::ConcatKeyValueCache,
+            distributed::{
+                parallel::{ParallelBuildContext, ShardingPolicy},
+                topology::{DeviceAssignment, ParallelTopology},
+            },
+            execution::layerwise::{LayerExecutionLoadOptions, LayerwiseLoadOptions},
+            residency::{
+                dense_stream::DenseDiskStreamLoadOptions,
+                policy::{MemoryTier, OffloadConfig},
+            },
+        },
     };
 
     fn config() -> serde_json::Value {
@@ -1564,6 +2827,42 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires an MLX runtime with a Metal device"]
+    fn tensor_parallel_dense_stream_loads_text_static_and_decoder_group() {
+        let gpu = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
+        let cpu = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        let mut args = resident::model_args_from_config_value(&config()["text_config"]).unwrap();
+        args.tie_word_embeddings = false;
+        let mut fixture = Model::new(args, gpu.stream()).unwrap();
+        initialize(&mut fixture, gpu.stream());
+        let dir = tempfile::tempdir().unwrap();
+        write_fixture(dir.path(), &fixture);
+
+        let group = Group::init(false, Backend::Any).unwrap();
+        assert_eq!(group.size(), 1);
+        let topology =
+            ParallelTopology::from_rank(1, 0, 1, 1, 1, DeviceAssignment::new(DeviceType::Gpu, 0))
+                .unwrap();
+        let build = ParallelBuildContext::new(topology, ShardingPolicy::Require);
+        let options = DenseDiskStreamLoadOptions::new(u64::MAX, u64::MAX, 1, 1, 1).unwrap();
+        let model = load_gemma4_tensor_parallel_layerwise_model(
+            dir.path(),
+            LayerExecutionLoadOptions::DenseDiskStream(options),
+            build,
+            gpu.stream(),
+            cpu.stream(),
+        )
+        .unwrap();
+        let report = model.dense_stream_report().unwrap().unwrap();
+        assert!(report
+            .residency()
+            .units()
+            .iter()
+            .filter(|unit| unit.id().as_str().contains("gemma4.layer."))
+            .all(|unit| unit.planned_tier() == MemoryTier::Disk));
+    }
+
+    #[test]
     fn gemma4_per_layer_inputs_and_shared_kv_parity() {
         parity(1);
         parity(2);
@@ -1701,5 +3000,23 @@ mod tests {
             .units()
             .iter()
             .any(|unit| unit.id().as_str().starts_with("gemma4.audio.")));
+
+        let group = Group::init(false, Backend::Any).unwrap();
+        assert_eq!(group.size(), 1);
+        let topology =
+            ParallelTopology::from_rank(1, 0, 1, 1, 1, DeviceAssignment::new(DeviceType::Gpu, 0))
+                .unwrap();
+        let build = ParallelBuildContext::new(topology, ShardingPolicy::Require);
+        let options = DenseDiskStreamLoadOptions::new(u64::MAX, u64::MAX, 1, 1, 1).unwrap();
+        let tp = load_gemma4_tensor_parallel_layerwise_model(
+            dir.path(),
+            LayerExecutionLoadOptions::DenseDiskStream(options),
+            build,
+            gpu.stream(),
+            cpu.stream(),
+        )
+        .unwrap();
+        let report = tp.dense_stream_report().unwrap().unwrap();
+        assert_eq!(report.execution_groups().len(), 3);
     }
 }

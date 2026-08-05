@@ -97,10 +97,11 @@ diagnostics remain separate.
 `ResidentLayerGroup` adds named, deterministic ordered-unit preparation and
 explicit trimming even under an unlimited device budget. Independent groups
 can represent text, vision, audio, temporal, or depth-transformer stacks and
-can be cleared without disturbing each other. `LayerwiseModel<A>` preserves the
-compatible homogeneous-KV path. `GeneralLayerwiseModel<A>` adds associated
-input and cache types, heterogeneous runtime units, full-cache access, and
-central retained-state evaluation for recurrent and multimodal adapters.
+can be cleared without disturbing each other. `LayerwiseModel<A>` and its
+canonical `ArchitectureAdapter` contract carry associated input, cache,
+heterogeneous runtime-unit, and forward-context types, so retained KV,
+convolution, recurrent, and multimodal state is evaluated before a unit lease
+is released.
 
 ## Experimental dense disk streaming
 
@@ -939,11 +940,40 @@ stay with their packed weight shards; they are distinct from ordinary linear
 bias. Row partitions must align with the affine group, the MXFP4 32-value
 group, or DeepSeek's 128-by-128 block-FP8 grid.
 
-Llama Q/K/V and gate/up outputs are sharded. RoPE, attention, SiLU, and the
-gated product remain local; only attention output and MLP down projections
-all-sum. Query heads, KV heads, and intermediate width must divide TP, and the
-local query/KV ratio must preserve GQA. Each cache contains only local K/V
-heads, including bounded sliding-window caches.
+The token-only executable architecture dispatch covers Llama/Mistral, Qwen2/Qwen3
+(including Qwen3 MoE), Gemma text, GPT-OSS, DeepSeek-V3/R1, Kimi Linear, LFM2
+dense/MoE, Nemotron-H, and the text decoders of Qwen3-Next and Qwen3.5
+dense/MoE. Qwen vision towers and embedded multi-token-prediction layers are
+not part of that token-only TP API and are rejected before loading. They use
+the execution-group TP path described below instead.
+
+`load_tensor_parallel_layerwise_model` applies the same typed parameter-role
+planner and rank-local checkpoint selection to named layerwise execution
+groups. Family entry points are provided for Qwen3-VL, Gemma 4, Inkling,
+Moshi, and PersonaPlex. Qwen vision shards QKV heads and MLP intermediates;
+Gemma vision shards GQA heads and MLP intermediates; Gemma audio additionally
+shards light-convolution channels and computes its RMS statistic across ranks;
+Inkling row-shards each folded hMLP input; and Moshi/PersonaPlex shard temporal
+and within-frame depth attention heads, caches, and MLP intermediates.
+Checkpoint selection happens before host or device materialization. Composite
+text decoders use the same family planners as token-only execution. Token,
+audio-codebook, and output vocabularies use balanced row ranges; media mergers,
+per-layer-input projections, patch projections, and modality projections use
+column/row contracts with their required gather or reduction. Gemma vision
+position rows and audio input/output projections are rank-local as well.
+Quantized Inkling hMLP and Moshi affine companions stay attached to their
+packed weight shards. Dense disk streaming operates on rank-local bindings for
+every execution group, while pinned static modules retain only their planned
+local partitions. Scalars, routers, expert identities, and convolution stems
+without a valid feature-local decomposition remain replicated deliberately.
+
+Llama, dense Qwen, and Gemma-text Q/K/V and gate/up outputs are sharded. RoPE,
+attention, activations, and gated products remain local; only attention output
+and MLP down projections all-sum. Query heads, KV heads, and intermediate width
+must divide TP, and the local query/KV ratio must preserve GQA. Each cache
+contains only local K/V heads, including bounded sliding-window caches. Qwen3
+MoE retains every routed expert and the router on every rank while sharding the
+packed gate/up and down intermediate dimensions.
 
 DeepSeek keeps Q-LoRA input, compressed KV latent projection/normalization,
 and routing replicated. Head-expanded MLA projections use contiguous head
@@ -951,6 +981,40 @@ shards, while output projection all-sums once. Compressed-latent caches remain
 rank-local and work for both prefill and absorbed decode. Routed and shared
 experts retain all expert identities on each rank but shard their intermediate
 dimension; their combined residual delta is all-summed once.
+
+GPT-OSS shards attention heads and each retained MXFP4 routed expert's
+intermediate dimension. Its learned attention sinks and router stay
+replicated; ordinary output/down bias is added once after reduction. GPT-OSS TP
+accepts its native MXFP4 checkpoint representation rather than converting the
+expert banks to another load-time format.
+
+Kimi shards MLA and KDA heads, KDA convolution channels and recurrent state,
+and dense, routed, and shared expert intermediates. Its low-rank KDA input
+bottlenecks and per-head normalization remain replicated. LFM2 shards full
+attention and feed-forward intermediates while replicating short-convolution
+operators and state. Official per-expert safetensors are range-loaded for the
+local intermediate slice and then packed into the runtime expert banks, so a
+rank does not materialize the global expert intermediate tensors first.
+
+Qwen3-Next and Qwen3.5 shard full-attention heads and dense/routed/shared MoE
+intermediates together with recurrent key/value heads, convolution channels,
+transition parameters, and recurrent state. Qwen3.5's fused query/gate rows
+and Qwen3-Next's checkpoint-fused recurrent projections use segmented placement
+rules so logical components retain their local geometry before runtime
+splitting.
+
+Nemotron-H uses its authoritative four-operator schedule to shard Mamba heads,
+B/C groups, convolution channels, and SSM state; attention heads; dense MLP
+intermediates; and routed/shared ReLU2 expert intermediates. Layer norms,
+routers, and expert identities remain replicated, and every operator performs
+one row-parallel reduction for its residual delta.
+
+Resident caches work for all of these text models. Paged prompt-cache residency
+is unavailable for the Kimi, LFM2, Nemotron-H, and Qwen hybrid TP adapters
+because their cache also owns recurrent or convolution state; requesting it
+returns a structured error instead of silently dropping that state. Persisted
+TP prompt-cache snapshots are likewise unavailable for Nemotron-H until mixed
+Mamba/KV rank-local state has a sharded snapshot format.
 
 Embedding and output rows use balanced contiguous vocabulary ranges, including
 uneven vocabulary sizes. Embedding masks out non-local ids then all-sums hidden
@@ -975,6 +1039,13 @@ cargo test -p safemlx-lm --test distributed_tensor_parallel_ring \
   ring_two_process_tensor_parallel -- --ignored --exact --nocapture
 cargo test -p safemlx-lm --test distributed_tensor_parallel_ring \
   ring_two_process_deepseek_tensor_parallel_persistence -- --ignored --exact --nocapture
+```
+
+The architecture planning and synthetic rank-local loader fixtures run with:
+
+```sh
+cargo test -p safemlx-lm --lib \
+  architectures::distributed::tensor::tests -- --nocapture
 ```
 
 The model-level probe is:
