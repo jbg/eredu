@@ -49,8 +49,8 @@ pub struct ModelLoadOptions {
     /// Optional validated runtime topology and process-local device assignment.
     ///
     /// Singleton topologies preserve normal model loading. Non-replicated
-    /// topologies must be loaded through the explicit [`crate::architectures::distributed::pipeline`],
-    /// [`crate::architectures::distributed::tensor`], or [`crate::architectures::distributed::expert`] APIs.
+    /// topologies must be loaded through the explicit pipeline/expert APIs or
+    /// through the selected architecture's generalized tensor-parallel loader.
     pub parallel: Option<ParallelTopology>,
     /// Parameter placement and execution policy for safetensors checkpoints.
     pub weight_residency: WeightResidency,
@@ -94,7 +94,7 @@ pub(crate) fn ensure_executable_load_options(options: ModelLoadOptions) -> Resul
                 && topology.pipeline_parallel_size == 1
                 && topology.expert_parallel_size == 1
             {
-                "non-replicated pure tensor-parallel loading cannot return the complete Model type; use architectures::distributed::tensor::load_tensor_parallel_model_with_options"
+                "non-replicated pure tensor-parallel loading requires an architecture adapter; use the selected model family's generalized tensor-parallel loader"
                     .into()
             } else if topology.pipeline_parallel_size > 1
                 && topology.tensor_parallel_size == 1

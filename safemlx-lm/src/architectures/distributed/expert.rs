@@ -27,7 +27,7 @@ use crate::{
         qwen3_5_moe, qwen3_next, qwen3_vl, ModelKind, ModelLoadOptions,
     },
     architectures::distributed::pipeline::{
-        assign_module, assign_module_excluding, load_deepseek_experts, SynchronizedToken,
+        assign_module, assign_module_excluding, load_deepseek_experts,
     },
     error::Error,
     runtime::cache::residency::{
@@ -42,6 +42,7 @@ use crate::{
     runtime::checkpoint::load::{transform_split_swiglu_experts, StrictLoadConfig},
     runtime::checkpoint::quantization::{should_quantize_on_load, WeightQuantization},
     runtime::checkpoint::store::{GgufWeightStore, SafetensorsWeightStore, WeightStore},
+    runtime::distributed::parallel::{sample_and_synchronize, SynchronizedToken},
     runtime::distributed::topology::{
         load_safetensors_partition_from_store_on_streams, ParallelTopology, PlacementPlan,
         TensorPlacement,
@@ -2126,37 +2127,17 @@ impl ExpertParallelModel {
         stream: &Stream,
     ) -> Result<SynchronizedToken, Error> {
         self.validate_group(group)?;
-        if sampling_rank >= group.size() {
-            return Err(Error::Parallel(format!(
-                "sampling rank {sampling_rank} is outside EP size {}",
-                group.size()
-            )));
-        }
-        let batch = logits.dim(0);
-        let local_token = if group.rank() == sampling_rank {
-            let last = if logits.ndim() == 3 {
-                logits.try_index_device((.., -1, ..), stream)?
-            } else {
-                logits.clone()
-            };
-            sampler
-                .sample(&last, temperature, prng_state, stream)?
-                .reshape(&[batch, 1], stream)?
-        } else {
-            Array::zeros::<u32>(&[batch, 1], stream)?
-        };
-        let token = distributed::all_sum(&local_token, group, stream)?;
-        let local_finished = if group.rank() == sampling_rank && finished {
-            Array::ones::<i32>(&[], stream)?
-        } else {
-            Array::zeros::<i32>(&[], stream)?
-        };
-        let finished = distributed::all_sum(&local_finished, group, stream)?;
-        eval([&token, &finished])?;
-        Ok(SynchronizedToken {
-            token,
-            finished: finished.try_item::<i32>(stream)? != 0,
-        })
+        sample_and_synchronize(
+            Some(logits),
+            logits.dim(0),
+            sampler,
+            temperature,
+            prng_state,
+            finished,
+            sampling_rank,
+            group,
+            stream,
+        )
     }
 
     fn validate_group(&self, group: &Group) -> Result<(), Error> {

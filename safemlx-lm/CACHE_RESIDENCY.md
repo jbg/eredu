@@ -208,16 +208,16 @@ full-attention KV, while Nemotron-H records Mamba convolution/recurrent state,
 full-attention KV, and explicit `NoState` entries for MLP/MoE-only layers.
 Resident and bounded-weight execution use these same family helpers and layouts.
 
-`PipelineModel`, `TensorParallelModel`, and `ExpertParallelModel` expose
-matching `save_prompt_cache` and `load_prompt_cache` workflows. Callers pass one
-shared root; each process publishes `rank-NNNNN` beneath it. Pipeline manifests
-contain only the stage's global layer interval, tensor-parallel manifests retain
-rank-local KV heads, and expert-parallel manifests explicitly record replicated
-attention state. LFM2 and Nemotron-H expert-parallel publication also records
-their replicated convolution/recurrent tensors under the same rank topology.
-Every load derives family, effective type, exact ordered layer ownership and
-policies, and topology from the loaded distributed model before opening its
-rank directory.
+`PipelineModel`, family-specific generalized tensor-parallel models, and
+`ExpertParallelModel` expose matching `save_prompt_cache` and
+`load_prompt_cache` workflows. Callers pass one shared root; each process
+publishes `rank-NNNNN` beneath it. Pipeline manifests contain only the stage's
+global layer interval, tensor-parallel manifests retain rank-local KV heads,
+and expert-parallel manifests explicitly record replicated attention state.
+LFM2 and Nemotron-H expert-parallel publication also records their replicated
+convolution/recurrent tensors under the same rank topology. Every load derives
+family, effective type, exact ordered layer ownership and policies, and topology
+from the loaded distributed model before opening its rank directory.
 
 Checkpoint fingerprints are supplied by the application because hashing every
 checkpoint byte can be expensive. They must be based on stable checkpoint

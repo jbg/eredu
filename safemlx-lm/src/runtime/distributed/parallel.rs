@@ -9,36 +9,95 @@ use std::{
     ops::Range,
 };
 
-use safemlx::{distributed::Group, module::ModuleParameters, Array, Stream};
+use safemlx::{
+    distributed::{self, Group},
+    module::ModuleParameters,
+    ops::{indexing::TryIndexOp, ones, zeros},
+    transforms::eval,
+    Array, Stream,
+};
 
 use crate::{
     error::Error,
     runtime::distributed::topology::{
         balanced_contiguous_range, ParallelTopology, PlacementPlan, TensorPlacement,
     },
+    runtime::generation::sampler::Sampler,
 };
 
-/// Validates the topology accepted by a pure tensor-parallel execution group.
-pub(crate) fn validate_pure_tensor_topology(topology: ParallelTopology) -> Result<(), Error> {
-    if topology.tensor_parallel_size <= 1 {
-        return Err(Error::Parallel(
-            "tensor-parallel loading requires tensor_parallel_size > 1".into(),
-        ));
-    }
-    if topology.pipeline_parallel_size != 1 || topology.expert_parallel_size != 1 {
+/// Token selected on one distributed rank together with synchronized stop state.
+#[derive(Debug)]
+pub struct SynchronizedToken {
+    /// Selected token ids with shape `[batch, 1]` on every rank.
+    pub token: Array,
+    /// Whether every rank should terminate generation.
+    pub finished: bool,
+}
+
+/// Samples on one designated rank and synchronizes only token ids and stop state.
+///
+/// `logits` is required on `sampling_rank` and ignored elsewhere. Accepting an
+/// optional value lets pipeline stages avoid retaining full logits while TP and
+/// EP callers may pass their identical complete logits on every rank.
+#[allow(clippy::too_many_arguments)]
+pub fn sample_and_synchronize<S: Sampler>(
+    logits: Option<&Array>,
+    batch_size: i32,
+    sampler: &mut S,
+    temperature: f32,
+    prng_state: Option<&mut safemlx::random::RandomState>,
+    finished: bool,
+    sampling_rank: usize,
+    group: &Group,
+    stream: &Stream,
+) -> Result<SynchronizedToken, Error> {
+    if sampling_rank >= group.size() {
         return Err(Error::Parallel(format!(
-            "pure tensor-parallel execution requires PP=1 and EP=1, got TP={} PP={} EP={}; hybrid TP+PP and TP+EP are unsupported",
-            topology.tensor_parallel_size,
-            topology.pipeline_parallel_size,
-            topology.expert_parallel_size
+            "sampling rank {sampling_rank} is outside distributed group size {}",
+            group.size()
         )));
     }
-    if topology.world_size != topology.tensor_parallel_size {
-        return Err(Error::Parallel(
-            "pure tensor-parallel world size must equal tensor-parallel size".into(),
-        ));
+    if batch_size <= 0 {
+        return Err(Error::Parallel(format!(
+            "distributed sampling batch size must be positive, got {batch_size}"
+        )));
     }
-    Ok(())
+    let local_token = if group.rank() == sampling_rank {
+        let logits = logits.ok_or_else(|| {
+            Error::Parallel(format!(
+                "sampling rank {sampling_rank} requires complete logits"
+            ))
+        })?;
+        if logits.dim(0) != batch_size {
+            return Err(Error::Parallel(format!(
+                "sampling logits batch {} does not match declared batch {batch_size}",
+                logits.dim(0)
+            )));
+        }
+        let logits = if logits.ndim() == 3 {
+            logits.try_index_device((.., -1, ..), stream)?
+        } else {
+            logits.clone()
+        };
+        sampler
+            .sample(&logits, temperature, prng_state, stream)?
+            .reshape(&[batch_size, 1], stream)?
+    } else {
+        zeros::<u32>(&[batch_size, 1], stream)?
+    };
+    let token = distributed::all_sum(&local_token, group, stream)?;
+    let local_finished = if group.rank() == sampling_rank && finished {
+        ones::<i32>(&[], stream)?
+    } else {
+        zeros::<i32>(&[], stream)?
+    };
+    let finished = distributed::all_sum(&local_finished, group, stream)?;
+    eval([&token, &finished])?;
+    stream.synchronize()?;
+    Ok(SynchronizedToken {
+        token,
+        finished: finished.try_item::<i32>(stream)? != 0,
+    })
 }
 
 /// Divides a positive model dimension exactly across tensor-parallel ranks.
@@ -51,34 +110,6 @@ pub(crate) fn exact_parallel_division(name: &str, value: i32, parts: usize) -> R
         )));
     }
     Ok(value / parts_i32)
-}
-
-/// Validates a local shard dimension against a storage block or group size.
-pub(crate) fn require_parallel_alignment(
-    tensor: &str,
-    dimension: i32,
-    alignment: i32,
-    topology: ParallelTopology,
-) -> Result<(), Error> {
-    if alignment <= 0 || dimension % alignment != 0 {
-        return Err(Error::Parallel(format!(
-            "tensor {tensor} local dimension {dimension} is not aligned to block/group size {alignment} for TP size {}",
-            topology.tensor_parallel_size
-        )));
-    }
-    Ok(())
-}
-
-/// Returns the balanced vocabulary width assigned to every rank.
-pub(crate) fn balanced_parallel_widths(
-    vocabulary: usize,
-    parts: usize,
-) -> Result<Vec<usize>, Error> {
-    (0..parts)
-        .map(|rank| {
-            balanced_contiguous_range(vocabulary, parts, rank, false).map(|range| range.len())
-        })
-        .collect()
 }
 
 /// Semantic role of a logical parameter group.
@@ -240,28 +271,6 @@ pub(crate) fn register_projection_module(
                     "unsupported row-projection member {prefix}.{name} with shape {shape:?}"
                 ))),
             },
-        },
-    )?)
-}
-
-/// Registers a module partitioned across its leading vocabulary dimension.
-pub(crate) fn register_vocabulary_module(
-    planner: &mut ParallelPlanBuilder,
-    module: &impl ModuleParameters,
-    prefix: &str,
-) -> Result<(), Error> {
-    planner.register(module_parameter_group(
-        prefix,
-        ParameterRole::Vocabulary,
-        module,
-        prefix,
-        |name, shape| {
-            if shape.is_empty() {
-                return Err(Error::Parallel(format!(
-                    "vocabulary member {prefix}.{name} has scalar shape"
-                )));
-            }
-            Ok(MemberSharding::Balanced { axis: 0 })
         },
     )?)
 }

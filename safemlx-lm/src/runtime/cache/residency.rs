@@ -6498,7 +6498,6 @@ mod tests {
                 distributed::{
                     expert::ExpertParallelCache,
                     pipeline::{PipelineCache, PipelineLlamaLayerCache},
-                    tensor::{TensorParallelCache, TensorParallelLlamaLayerCache},
                 },
                 llama::layerwise::LlamaCache,
             },
@@ -6510,14 +6509,6 @@ mod tests {
             PagedKeyValueCache::new(manager.clone(), 0, None).unwrap(),
         )]);
         assert!(llama.clear().is_err());
-        assert_eq!(manager.lock().unwrap().blocks.len(), 1);
-
-        let manager = manager_with_leased_block();
-        let mut tensor_parallel =
-            TensorParallelCache::Llama(vec![TensorParallelLlamaLayerCache::Paged(
-                PagedKeyValueCache::new(manager.clone(), 0, None).unwrap(),
-            )]);
-        assert!(tensor_parallel.reset().is_err());
         assert_eq!(manager.lock().unwrap().blocks.len(), 1);
 
         let manager = manager_with_leased_block();

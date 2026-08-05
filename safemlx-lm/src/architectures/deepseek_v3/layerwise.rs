@@ -39,6 +39,11 @@ use crate::{
     },
     runtime::checkpoint::recipe::DerivedWeightRecipe,
     runtime::checkpoint::store::{GgufWeightStore, TensorSelection, WeightStore},
+    runtime::distributed::parallel::{
+        register_projection_module, register_replicated_module, MemberSharding,
+        ParallelPlanBuilder, ParameterGroupSpec, ParameterMemberSpec, ParameterRole,
+        ProjectionSharding,
+    },
     runtime::execution::layerwise::{
         load_layerwise_model, load_layerwise_model_with_store,
         load_tensor_parallel_layerwise_model, ArchitectureAdapter, LayerExecutionLoadOptions,
@@ -728,6 +733,189 @@ pub struct DeepSeekV3ForwardContext {
     mask: Option<Array>,
 }
 
+fn register_deepseek_layer_parallel_plan(
+    planner: &mut ParallelPlanBuilder,
+    layer: &DecoderLayer,
+    index: usize,
+) -> Result<(), Error> {
+    let prefix = format!("model.layers.{index}");
+    let attention = &layer.self_attn;
+    for (name, projection) in [
+        ("q_proj", attention.q_proj.as_ref()),
+        ("q_b_proj", attention.q_b_proj.as_ref()),
+        ("kv_b_proj", attention.kv_b_proj.as_ref()),
+    ] {
+        if let Some(projection) = projection {
+            register_projection_module(
+                planner,
+                projection,
+                &format!("{prefix}.self_attn.{name}"),
+                ProjectionSharding::Column,
+            )?;
+        }
+    }
+    for (name, projection) in [
+        ("k_b_proj", attention.k_b_proj.as_ref()),
+        ("v_b_proj", attention.v_b_proj.as_ref()),
+    ] {
+        if let Some(projection) = projection {
+            register_projection_module(
+                planner,
+                projection,
+                &format!("{prefix}.self_attn.{name}"),
+                ProjectionSharding::Column,
+            )?;
+        }
+    }
+    for (name, projection) in [
+        ("q_a_proj", attention.q_a_proj.as_ref()),
+        ("kv_a_proj_with_mqa", Some(&attention.kv_a_proj_with_mqa)),
+    ] {
+        if let Some(projection) = projection {
+            register_projection_module(
+                planner,
+                projection,
+                &format!("{prefix}.self_attn.{name}"),
+                ProjectionSharding::Replicated,
+            )?;
+        }
+    }
+    register_projection_module(
+        planner,
+        &attention.o_proj,
+        &format!("{prefix}.self_attn.o_proj"),
+        ProjectionSharding::Row,
+    )?;
+    for (name, module) in [
+        ("q_a_layernorm", attention.q_a_layernorm.as_ref()),
+        ("kv_a_layernorm", Some(&attention.kv_a_layernorm)),
+    ] {
+        if let Some(module) = module {
+            register_replicated_module(planner, module, &format!("{prefix}.self_attn.{name}"))?;
+        }
+    }
+    register_replicated_module(
+        planner,
+        &attention.rope,
+        &format!("{prefix}.self_attn.rope"),
+    )?;
+    for (name, norm) in [
+        ("input_layernorm", &layer.input_layernorm),
+        ("post_attention_layernorm", &layer.post_attention_layernorm),
+    ] {
+        register_replicated_module(planner, norm, &format!("{prefix}.{name}"))?;
+    }
+    let register_mlp = |planner: &mut ParallelPlanBuilder,
+                        mlp: &resident::Mlp,
+                        prefix: &str|
+     -> Result<(), Error> {
+        for (name, projection, sharding) in [
+            ("gate_proj", &mlp.gate_proj, ProjectionSharding::Column),
+            ("up_proj", &mlp.up_proj, ProjectionSharding::Column),
+            ("down_proj", &mlp.down_proj, ProjectionSharding::Row),
+        ] {
+            register_projection_module(planner, projection, &format!("{prefix}.{name}"), sharding)?;
+        }
+        Ok(())
+    };
+    match &layer.mlp {
+        resident::FeedForward::Dense(mlp) => register_mlp(planner, mlp, &format!("{prefix}.mlp"))?,
+        resident::FeedForward::Moe(moe) => {
+            register_replicated_module(planner, &moe.gate, &format!("{prefix}.mlp.gate"))?;
+            register_mlp(
+                planner,
+                &moe.shared_experts,
+                &format!("{prefix}.mlp.shared_experts"),
+            )?;
+            let experts = &moe.experts;
+            let banks = [
+                (
+                    "gate_proj",
+                    experts.gate_proj.as_ref().as_ref(),
+                    MemberSharding::Equal { axis: 0 },
+                ),
+                (
+                    "gate_proj.weight_scale_inv",
+                    experts.gate_proj_scale_inv.as_ref().as_ref(),
+                    MemberSharding::Equal { axis: 0 },
+                ),
+                (
+                    "gate_proj.scales",
+                    experts.gate_proj_scales.as_ref().as_ref(),
+                    MemberSharding::Equal { axis: 0 },
+                ),
+                (
+                    "gate_proj.biases",
+                    experts.gate_proj_biases.as_ref().as_ref(),
+                    MemberSharding::Equal { axis: 0 },
+                ),
+                (
+                    "up_proj",
+                    experts.up_proj.as_ref().as_ref(),
+                    MemberSharding::Equal { axis: 0 },
+                ),
+                (
+                    "up_proj.weight_scale_inv",
+                    experts.up_proj_scale_inv.as_ref().as_ref(),
+                    MemberSharding::Equal { axis: 0 },
+                ),
+                (
+                    "up_proj.scales",
+                    experts.up_proj_scales.as_ref().as_ref(),
+                    MemberSharding::Equal { axis: 0 },
+                ),
+                (
+                    "up_proj.biases",
+                    experts.up_proj_biases.as_ref().as_ref(),
+                    MemberSharding::Equal { axis: 0 },
+                ),
+                (
+                    "down_proj",
+                    experts.down_proj.as_ref().as_ref(),
+                    MemberSharding::Equal { axis: 1 },
+                ),
+                (
+                    "down_proj.weight_scale_inv",
+                    experts.down_proj_scale_inv.as_ref().as_ref(),
+                    MemberSharding::Equal { axis: 1 },
+                ),
+                (
+                    "down_proj.scales",
+                    experts.down_proj_scales.as_ref().as_ref(),
+                    MemberSharding::Equal { axis: 1 },
+                ),
+                (
+                    "down_proj.biases",
+                    experts.down_proj_biases.as_ref().as_ref(),
+                    MemberSharding::Equal { axis: 1 },
+                ),
+            ];
+            for expert in 0..experts.num_experts {
+                for (suffix, bank, sharding) in &banks {
+                    let Some(bank) = bank else { continue };
+                    let shape = bank.shape()[1..]
+                        .iter()
+                        .map(|dimension| {
+                            usize::try_from(*dimension).map_err(|_| {
+                                Error::Parallel("DeepSeek expert shape exceeds usize".into())
+                            })
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+                    let (projection, component) =
+                        suffix.split_once('.').unwrap_or((suffix, "weight"));
+                    let target = format!("{prefix}.mlp.experts.{expert}.{projection}.{component}");
+                    planner.register(ParameterGroupSpec::new(
+                        target.clone(),
+                        ParameterRole::ExpertIntermediate,
+                        [ParameterMemberSpec::new(target, shape, sharding.clone())],
+                    )?)?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 impl ArchitectureAdapter for DeepSeekV3LayerwiseAdapter {
     type Input<'a> = &'a Array;
     type Cache = Cache;
@@ -978,9 +1166,7 @@ impl ArchitectureAdapter for DeepSeekV3LayerwiseAdapter {
         )?)?;
         for index in 0..self.args.layer_schedule.len() {
             let layer = DecoderLayer::new_layerwise(&self.args, index as i32, stream)?;
-            crate::architectures::distributed::tensor::insert_deepseek_layer_plan(
-                planner, &layer, index,
-            )?;
+            register_deepseek_layer_parallel_plan(planner, &layer, index)?;
         }
         Ok(())
     }

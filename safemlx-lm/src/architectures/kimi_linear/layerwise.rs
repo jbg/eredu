@@ -37,7 +37,11 @@ use crate::{
             recipe::DerivedWeightRecipe,
             store::{GgufWeightStore, TensorSelection, WeightStore, WeightStoreBackend},
         },
-        distributed::parallel::exact_parallel_division,
+        distributed::parallel::{
+            array_parameter_member, exact_parallel_division, register_projection_module,
+            register_replicated_module, MemberSharding, ParallelPlanBuilder, ParameterGroupSpec,
+            ParameterRole, ProjectionSharding,
+        },
         execution::layerwise::{
             load_layerwise_model, load_layerwise_model_with_store,
             load_tensor_parallel_layerwise_model, ArchitectureAdapter, LayerExecutionLoadOptions,
@@ -58,6 +62,249 @@ use super::model::{self as resident, Cache, DecoderLayer, FeedForwardPolicy, Mod
 const EMBEDDING_UNIT: &str = "kimi_linear.static.embedding";
 const NORM_UNIT: &str = "kimi_linear.static.norm";
 const HEAD_UNIT: &str = "kimi_linear.static.output";
+
+fn register_kimi_layer_parallel_plan(
+    planner: &mut ParallelPlanBuilder,
+    layer: &DecoderLayer,
+    index: usize,
+) -> Result<(), Error> {
+    let prefix = format!("model.layers.{index}");
+    match &layer.self_attn {
+        resident::Attention::Kda(attention) => {
+            for (name, projection) in [
+                ("q_proj", &attention.q_proj),
+                ("k_proj", &attention.k_proj),
+                ("v_proj", &attention.v_proj),
+                ("f_b_proj", &attention.f_b_proj),
+                ("b_proj", &attention.b_proj),
+                ("g_b_proj", &attention.g_b_proj),
+            ] {
+                register_projection_module(
+                    planner,
+                    projection,
+                    &format!("{prefix}.self_attn.{name}"),
+                    ProjectionSharding::Column,
+                )?;
+            }
+            for (name, convolution) in [
+                ("q_conv1d", &attention.q_conv1d),
+                ("k_conv1d", &attention.k_conv1d),
+                ("v_conv1d", &attention.v_conv1d),
+            ] {
+                planner.register(ParameterGroupSpec::new(
+                    format!("{prefix}.self_attn.{name}"),
+                    ParameterRole::Channels,
+                    [array_parameter_member(
+                        format!("{prefix}.self_attn.{name}.weight"),
+                        convolution.weight.as_ref(),
+                        MemberSharding::Equal { axis: 0 },
+                    )?],
+                )?)?;
+            }
+            for (name, projection) in [
+                ("f_a_proj", &attention.f_a_proj),
+                ("g_a_proj", &attention.g_a_proj),
+            ] {
+                register_projection_module(
+                    planner,
+                    projection,
+                    &format!("{prefix}.self_attn.{name}"),
+                    ProjectionSharding::Replicated,
+                )?;
+            }
+            for (name, value, axis) in [
+                ("A_log", attention.A_log.as_ref(), 2usize),
+                ("dt_bias", attention.dt_bias.as_ref(), 0usize),
+            ] {
+                planner.register(ParameterGroupSpec::new(
+                    format!("{prefix}.self_attn.{name}"),
+                    ParameterRole::Channels,
+                    [array_parameter_member(
+                        format!("{prefix}.self_attn.{name}"),
+                        value,
+                        MemberSharding::Equal { axis },
+                    )?],
+                )?)?;
+            }
+            register_replicated_module(
+                planner,
+                &attention.o_norm,
+                &format!("{prefix}.self_attn.o_norm"),
+            )?;
+            register_projection_module(
+                planner,
+                &attention.o_proj,
+                &format!("{prefix}.self_attn.o_proj"),
+                ProjectionSharding::Row,
+            )?;
+        }
+        resident::Attention::Mla(attention) => {
+            for (name, projection) in [
+                ("q_proj", attention.q_proj.as_ref()),
+                ("q_b_proj", attention.q_b_proj.as_ref()),
+                ("kv_b_proj", attention.kv_b_proj.as_ref()),
+            ] {
+                if let Some(projection) = projection {
+                    register_projection_module(
+                        planner,
+                        projection,
+                        &format!("{prefix}.self_attn.{name}"),
+                        ProjectionSharding::Column,
+                    )?;
+                }
+            }
+            for (name, projection) in [
+                ("k_b_proj", attention.k_b_proj.as_ref()),
+                ("v_b_proj", attention.v_b_proj.as_ref()),
+            ] {
+                if let Some(projection) = projection {
+                    register_projection_module(
+                        planner,
+                        projection,
+                        &format!("{prefix}.self_attn.{name}"),
+                        ProjectionSharding::Column,
+                    )?;
+                }
+            }
+            for (name, projection) in [
+                ("q_a_proj", attention.q_a_proj.as_ref()),
+                ("kv_a_proj_with_mqa", Some(&attention.kv_a_proj_with_mqa)),
+            ] {
+                if let Some(projection) = projection {
+                    register_projection_module(
+                        planner,
+                        projection,
+                        &format!("{prefix}.self_attn.{name}"),
+                        ProjectionSharding::Replicated,
+                    )?;
+                }
+            }
+            register_projection_module(
+                planner,
+                &attention.o_proj,
+                &format!("{prefix}.self_attn.o_proj"),
+                ProjectionSharding::Row,
+            )?;
+            for (name, norm) in [
+                ("q_a_layernorm", attention.q_a_layernorm.as_ref()),
+                ("kv_a_layernorm", Some(&attention.kv_a_layernorm)),
+            ] {
+                if let Some(norm) = norm {
+                    register_replicated_module(
+                        planner,
+                        norm,
+                        &format!("{prefix}.self_attn.{name}"),
+                    )?;
+                }
+            }
+            register_replicated_module(
+                planner,
+                &attention.rope,
+                &format!("{prefix}.self_attn.rope"),
+            )?;
+        }
+    }
+    for (name, norm) in [
+        ("input_layernorm", &layer.input_layernorm),
+        ("post_attention_layernorm", &layer.post_attention_layernorm),
+    ] {
+        register_replicated_module(planner, norm, &format!("{prefix}.{name}"))?;
+    }
+    let register_swiglu = |planner: &mut ParallelPlanBuilder,
+                           mlp: &crate::nn::layers::SwiGluMlp,
+                           prefix: &str|
+     -> Result<(), Error> {
+        for (name, projection, sharding) in [
+            ("gate_proj", &mlp.gate_proj, ProjectionSharding::Column),
+            ("up_proj", &mlp.up_proj, ProjectionSharding::Column),
+            ("down_proj", &mlp.down_proj, ProjectionSharding::Row),
+        ] {
+            register_projection_module(planner, projection, &format!("{prefix}.{name}"), sharding)?;
+        }
+        Ok(())
+    };
+    match &layer.mlp {
+        resident::FeedForward::Dense(mlp) => {
+            register_swiglu(planner, mlp, &format!("{prefix}.mlp"))?
+        }
+        resident::FeedForward::Moe(moe) => {
+            let source_prefix = format!("{prefix}.mlp");
+            register_replicated_module(planner, &moe.gate, &format!("{source_prefix}.gate"))?;
+            register_swiglu(
+                planner,
+                &moe.shared_experts,
+                &format!("{source_prefix}.shared_experts"),
+            )?;
+            let experts = &moe.experts;
+            let intermediate = usize::try_from(experts.intermediate_dim)
+                .map_err(|_| Error::Parallel("Kimi expert width exceeds usize".into()))?;
+            let segments = vec![0..intermediate, intermediate..2 * intermediate];
+            let mut gate_up = vec![array_parameter_member(
+                format!("{source_prefix}.experts.gate_up_proj"),
+                experts.gate_up_proj.as_ref(),
+                MemberSharding::Segmented {
+                    axis: 1,
+                    segments: segments.clone(),
+                },
+            )?];
+            for (name, value) in [
+                (
+                    "gate_up_proj_scales",
+                    experts.gate_up_proj_scales.as_ref().as_ref(),
+                ),
+                (
+                    "gate_up_proj_biases",
+                    experts.gate_up_proj_biases.as_ref().as_ref(),
+                ),
+            ] {
+                if let Some(value) = value {
+                    gate_up.push(array_parameter_member(
+                        format!("{source_prefix}.experts.{name}"),
+                        value,
+                        MemberSharding::Segmented {
+                            axis: 1,
+                            segments: segments.clone(),
+                        },
+                    )?);
+                }
+            }
+            planner.register(ParameterGroupSpec::new(
+                format!("{source_prefix}.experts.gate_up"),
+                ParameterRole::ExpertIntermediate,
+                gate_up,
+            )?)?;
+            let mut down = vec![array_parameter_member(
+                format!("{source_prefix}.experts.down_proj"),
+                experts.down_proj.as_ref(),
+                MemberSharding::Equal { axis: 2 },
+            )?];
+            for (name, value) in [
+                (
+                    "down_proj_scales",
+                    experts.down_proj_scales.as_ref().as_ref(),
+                ),
+                (
+                    "down_proj_biases",
+                    experts.down_proj_biases.as_ref().as_ref(),
+                ),
+            ] {
+                if let Some(value) = value {
+                    down.push(array_parameter_member(
+                        format!("{source_prefix}.experts.{name}"),
+                        value,
+                        MemberSharding::Equal { axis: 2 },
+                    )?);
+                }
+            }
+            planner.register(ParameterGroupSpec::new(
+                format!("{source_prefix}.experts.down"),
+                ParameterRole::ExpertIntermediate,
+                down,
+            )?)?;
+        }
+    }
+    Ok(())
+}
 
 /// Kimi Linear causal LM with a bounded decoder-layer window.
 pub struct KimiLinearLayerwiseModel {
@@ -980,9 +1227,7 @@ impl ArchitectureAdapter for KimiLinearLayerwiseAdapter {
         }
         for index in 0..self.args.layer_schedule.len() {
             let layer = DecoderLayer::new(&self.args, index, stream)?;
-            crate::architectures::distributed::tensor::insert_kimi_layerwise_plan(
-                planner, &layer, index,
-            )?;
+            register_kimi_layer_parallel_plan(planner, &layer, index)?;
         }
         Ok(())
     }
@@ -1505,7 +1750,7 @@ mod tests {
 
     use super::{
         expert_projection_recipe, load_kimi_linear_sparse_expert_cache_model,
-        normalized_checkpoint_keys, optional_expert_component_recipe,
+        normalized_checkpoint_keys, optional_expert_component_recipe, KimiLinearLayerwiseAdapter,
     };
     use crate::{
         api::ModelKind,
@@ -1514,7 +1759,11 @@ mod tests {
         },
         runtime::{
             checkpoint::store::{SafetensorsWeightStore, WeightStore},
-            execution::layerwise::LayerwiseLoadOptions,
+            distributed::{
+                parallel::{ParallelBuildContext, ShardingPolicy},
+                topology::{DeviceAssignment, ParallelTopology},
+            },
+            execution::layerwise::{ArchitectureAdapter, LayerwiseLoadOptions},
             residency::{expert_cache::ExpertCacheLoadOptions, policy::OffloadConfig},
         },
     };
@@ -1560,6 +1809,51 @@ mod tests {
             "tie_word_embeddings": false,
             "num_nextn_predict_layers": 0
         })
+    }
+
+    #[test]
+    fn tensor_parallel_plan_shards_kda_and_packed_moe_geometry() {
+        let execution = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        let args = model_args_from_config_value(&tiny_config()).unwrap();
+        let adapter = KimiLinearLayerwiseAdapter::new(args, execution.stream()).unwrap();
+        let context = ParallelBuildContext::new(
+            ParallelTopology::from_rank(2, 0, 2, 1, 1, DeviceAssignment::new(DeviceType::Cpu, 0))
+                .unwrap(),
+            ShardingPolicy::Require,
+        );
+        let mut planner = context.planner();
+        adapter
+            .register_parallel_parameters(context, &mut planner, execution.stream())
+            .unwrap();
+        let (_, layout) = planner.finish().unwrap();
+        assert_eq!(
+            layout
+                .tensor("model.layers.0.self_attn.q_proj.weight")
+                .unwrap()
+                .local_shape(),
+            &[4, 8]
+        );
+        assert_eq!(
+            layout
+                .tensor("model.layers.0.self_attn.q_conv1d.weight")
+                .unwrap()
+                .local_shape(),
+            &[4, 1, 2]
+        );
+        assert_eq!(
+            layout
+                .tensor("model.layers.1.mlp.experts.gate_up_proj")
+                .unwrap()
+                .local_shape(),
+            &[4, 8, 8]
+        );
+        assert_eq!(
+            layout
+                .tensor("model.layers.1.mlp.experts.down_proj")
+                .unwrap()
+                .local_shape(),
+            &[4, 8, 4]
+        );
     }
 
     fn write_official_style_fixture(directory: &std::path::Path, model: &Model, stream: &Stream) {

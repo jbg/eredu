@@ -49,7 +49,11 @@ use crate::{
     },
     runtime::checkpoint::recipe::DerivedWeightRecipe,
     runtime::checkpoint::store::{GgufWeightStore, TensorSelection, WeightStore},
-    runtime::distributed::parallel::exact_parallel_division,
+    runtime::distributed::parallel::{
+        array_parameter_member, exact_parallel_division, register_projection_module,
+        register_replicated_module, MemberSharding, ParallelPlanBuilder, ParameterGroupSpec,
+        ParameterRole, ProjectionSharding,
+    },
     runtime::execution::layerwise::{
         load_layerwise_model, load_layerwise_model_with_store,
         load_tensor_parallel_layerwise_model, ArchitectureAdapter, LayerExecutionLoadOptions,
@@ -757,6 +761,138 @@ pub struct DenseQwenAdapterInput<'a> {
     mask: Option<&'a Array>,
 }
 
+pub(crate) fn register_qwen_layer_parallel_plan(
+    planner: &mut ParallelPlanBuilder,
+    layer: &TransformerBlock,
+    prefix: &str,
+) -> Result<(), Error> {
+    let attention = &layer.self_attn;
+    for (name, projection) in [
+        ("q_proj", &attention.q_proj),
+        ("k_proj", &attention.k_proj),
+        ("v_proj", &attention.v_proj),
+    ] {
+        register_projection_module(
+            planner,
+            projection,
+            &format!("{prefix}.self_attn.{name}"),
+            ProjectionSharding::Column,
+        )?;
+    }
+    register_projection_module(
+        planner,
+        &attention.o_proj,
+        &format!("{prefix}.self_attn.o_proj"),
+        ProjectionSharding::Row,
+    )?;
+    if let Some(norm) = &attention.q_norm {
+        register_replicated_module(planner, norm, &format!("{prefix}.self_attn.q_norm"))?;
+    }
+    if let Some(norm) = &attention.k_norm {
+        register_replicated_module(planner, norm, &format!("{prefix}.self_attn.k_norm"))?;
+    }
+    register_replicated_module(
+        planner,
+        &attention.rope,
+        &format!("{prefix}.self_attn.rope"),
+    )?;
+    match &layer.mlp {
+        resident::FeedForward::Dense(mlp) => {
+            for (name, projection, sharding) in [
+                ("gate_proj", &mlp.gate_proj, ProjectionSharding::Column),
+                ("up_proj", &mlp.up_proj, ProjectionSharding::Column),
+                ("down_proj", &mlp.down_proj, ProjectionSharding::Row),
+            ] {
+                register_projection_module(
+                    planner,
+                    projection,
+                    &format!("{prefix}.mlp.{name}"),
+                    sharding,
+                )?;
+            }
+        }
+        resident::FeedForward::Moe(moe) => {
+            register_replicated_module(planner, &moe.gate, &format!("{prefix}.mlp.gate"))?;
+            let experts = &moe.experts;
+            let intermediate = usize::try_from(experts.intermediate_dim)
+                .map_err(|_| Error::Parallel("Qwen expert width exceeds usize".into()))?;
+            let segments = vec![0..intermediate, intermediate..2 * intermediate];
+            let mut gate_up = vec![array_parameter_member(
+                format!("{prefix}.mlp.experts.gate_up_proj"),
+                experts.gate_up_proj.as_ref(),
+                MemberSharding::Segmented {
+                    axis: 1,
+                    segments: segments.clone(),
+                },
+            )?];
+            for (name, value) in [
+                (
+                    "gate_up_proj_scales",
+                    experts.gate_up_proj_scales.as_ref().as_ref(),
+                ),
+                (
+                    "gate_up_proj_biases",
+                    experts.gate_up_proj_biases.as_ref().as_ref(),
+                ),
+            ] {
+                if let Some(value) = value {
+                    gate_up.push(array_parameter_member(
+                        format!("{prefix}.mlp.experts.{name}"),
+                        value,
+                        MemberSharding::Segmented {
+                            axis: 1,
+                            segments: segments.clone(),
+                        },
+                    )?);
+                }
+            }
+            planner.register(ParameterGroupSpec::new(
+                format!("{prefix}.mlp.experts.gate_up"),
+                ParameterRole::ExpertIntermediate,
+                gate_up,
+            )?)?;
+            let mut down = vec![array_parameter_member(
+                format!("{prefix}.mlp.experts.down_proj"),
+                experts.down_proj.as_ref(),
+                MemberSharding::Equal { axis: 2 },
+            )?];
+            for (name, value) in [
+                (
+                    "down_proj_scales",
+                    experts.down_proj_scales.as_ref().as_ref(),
+                ),
+                (
+                    "down_proj_biases",
+                    experts.down_proj_biases.as_ref().as_ref(),
+                ),
+            ] {
+                if let Some(value) = value {
+                    down.push(array_parameter_member(
+                        format!("{prefix}.mlp.experts.{name}"),
+                        value,
+                        MemberSharding::Equal { axis: 2 },
+                    )?);
+                }
+            }
+            planner.register(ParameterGroupSpec::new(
+                format!("{prefix}.mlp.experts.down"),
+                ParameterRole::ExpertIntermediate,
+                down,
+            )?)?;
+        }
+    }
+    register_replicated_module(
+        planner,
+        &layer.input_layernorm,
+        &format!("{prefix}.input_layernorm"),
+    )?;
+    register_replicated_module(
+        planner,
+        &layer.post_attention_layernorm,
+        &format!("{prefix}.post_attention_layernorm"),
+    )
+}
+
 impl ArchitectureAdapter for DenseQwenLayerwiseAdapter {
     type Input<'a> = DenseQwenAdapterInput<'a>;
     type Cache = DenseQwenLayerwiseCache;
@@ -1051,11 +1187,7 @@ impl ArchitectureAdapter for DenseQwenLayerwiseAdapter {
         }
         for index in 0..self.args.num_hidden_layers as usize {
             let layer = TransformerBlock::new_for_layer(&self.args, index as i32, stream)?;
-            crate::architectures::distributed::tensor::insert_qwen_layer_plan_with_prefix(
-                planner,
-                &layer,
-                &format!("model.layers.{index}"),
-            )?;
+            register_qwen_layer_parallel_plan(planner, &layer, &format!("model.layers.{index}"))?;
         }
         Ok(())
     }
@@ -1742,9 +1874,23 @@ mod tests {
     use super::*;
     use crate::{
         architectures::qwen::dense as dense_qwen,
-        runtime::execution::layerwise::LayerwiseLoadOptions,
         runtime::residency::policy::{MemoryTier, OffloadConfig, ResidencyPolicy},
+        runtime::{
+            distributed::{
+                parallel::{ParallelBuildContext, ShardingPolicy},
+                topology::{DeviceAssignment, ParallelTopology},
+            },
+            execution::layerwise::LayerwiseLoadOptions,
+        },
     };
+
+    fn tensor_parallel_context() -> ParallelBuildContext {
+        ParallelBuildContext::new(
+            ParallelTopology::from_rank(2, 0, 2, 1, 1, DeviceAssignment::new(DeviceType::Cpu, 0))
+                .unwrap(),
+            ShardingPolicy::Require,
+        )
+    }
 
     fn args(moe: bool) -> DecoderConfig {
         DecoderConfig {
@@ -1949,6 +2095,53 @@ mod tests {
 
     fn parity(moe: bool, depth: usize) {
         parity_with_args(args(moe), depth);
+    }
+
+    #[test]
+    fn generalized_tensor_parallel_loader_preserves_packed_moe_geometry() {
+        let execution = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        let weights = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        let mut fixture = dense_qwen::Model::new(args(true), execution.stream()).unwrap();
+        initialize(&mut fixture, execution.stream());
+        let dir = tempfile::tempdir().unwrap();
+        write_fixture(dir.path(), &fixture, false, execution.stream());
+
+        let model = load_tensor_parallel_safetensors(
+            dir.path(),
+            LayerwiseLoadOptions::default(),
+            tensor_parallel_context(),
+            execution.stream(),
+            weights.stream(),
+        )
+        .unwrap();
+        let layout = model.execution.parallel_layout().unwrap();
+        assert_eq!(
+            layout
+                .tensor("model.layers.0.self_attn.q_proj.weight")
+                .unwrap()
+                .local_shape(),
+            &[4, 8]
+        );
+        assert_eq!(
+            layout
+                .tensor("model.layers.0.mlp.experts.gate_up_proj")
+                .unwrap()
+                .local_shape(),
+            &[4, 8, 8]
+        );
+        assert_eq!(
+            layout
+                .tensor("model.layers.0.mlp.experts.down_proj")
+                .unwrap()
+                .local_shape(),
+            &[4, 8, 4]
+        );
+        assert!(model
+            .parallel_info()
+            .unwrap()
+            .owned_tensors()
+            .iter()
+            .any(|name| name == "model.layers.0.mlp.experts.gate_up_proj"));
     }
 
     #[test]

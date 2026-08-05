@@ -11,6 +11,7 @@ use std::{
 use safemlx::{
     distributed::{self, Backend},
     module::ModuleParameters,
+    random::{self, RandomState},
     Array, Device, DeviceType, ExecutionContext, Stream,
 };
 use safemlx_lm::{
@@ -22,10 +23,11 @@ use safemlx_lm::{
         llama::layerwise::{load_llama_tensor_parallel_model, LlamaCache, LlamaModel},
     },
     runtime::checkpoint::binding::canonical_checkpoint_name,
-    CacheResidencyPolicy, DeviceAssignment, LayerCachePolicy, LayerwiseLoadOptions,
-    PagedCacheOptions, ParallelBuildContext, ParallelModelInfo, ParallelTopology,
-    PromptCacheDescriptor, PromptCacheManifest, PromptCacheOptions, PromptCacheTopology,
-    ShardingPolicy,
+    runtime::generation::sampler::DefaultSampler,
+    sample_and_synchronize, CacheResidencyPolicy, DeviceAssignment, LayerCachePolicy,
+    LayerwiseLoadOptions, PagedCacheOptions, ParallelBuildContext, ParallelModelInfo,
+    ParallelTopology, PromptCacheDescriptor, PromptCacheManifest, PromptCacheOptions,
+    PromptCacheTopology, ShardingPolicy,
 };
 use safetensors::tensor::{serialize_to_file, Dtype, TensorView};
 
@@ -256,8 +258,26 @@ fn tensor_ring_worker() {
     let restored = model.forward_tensor_parallel(&token, &mut cache, &group, &stream);
     let restored = restored.evaluated().unwrap();
     assert_eq!(uninterrupted_values, restored.as_slice::<f32>());
+    let logits = restored.as_array().clone();
     drop(restored);
-    let logits = model.forward_tensor_parallel(&token, &mut cache, &group, &stream);
+    let mut sampler = DefaultSampler;
+    let mut prng = (expected_rank == 0).then(|| RandomState::from_key(random::key(7).unwrap()));
+    let synchronized = sample_and_synchronize(
+        Some(&logits),
+        1,
+        &mut sampler,
+        1.0,
+        prng.as_mut(),
+        false,
+        0,
+        &group,
+        &stream,
+    )
+    .unwrap();
+    let sampled = synchronized.token.evaluated().unwrap();
+    assert!(sampled.as_slice::<u32>()[0] < vocab_size as u32);
+    drop(sampled);
+    let logits = model.forward_tensor_parallel(&synchronized.token, &mut cache, &group, &stream);
     assert_eq!(logits.shape(), &[1, 1, vocab_size as i32]);
     assert_eq!(cache.offset(), 4);
 }

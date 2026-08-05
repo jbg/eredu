@@ -1463,15 +1463,6 @@ pub struct Model {
     pub lm_head: Option<MaybeQuantized<nn::Linear>>,
 }
 
-/// Rank-local dimensions used to construct an LFM2 tensor-parallel shard.
-pub(crate) struct TensorParallelGeometry {
-    pub vocab_size: i32,
-    pub attention_heads: i32,
-    pub kv_heads: i32,
-    pub dense_intermediate: i32,
-    pub moe_intermediate: i32,
-}
-
 impl Model {
     /// Creates an unloaded LFM2 model.
     pub fn new(args: ModelArgs, stream: &Stream) -> Result<Self, Error> {
@@ -1485,71 +1476,6 @@ impl Model {
                 args.vocab_size,
                 false,
                 args.weight_quantization_for("lm_head.weight"),
-                stream,
-            )?)
-        };
-        Ok(Self {
-            args,
-            model,
-            lm_head,
-        })
-    }
-
-    /// Creates a rank-local tensor-parallel model while retaining the global
-    /// configuration for cache identity and scheduling.
-    pub(crate) fn new_tensor_parallel(
-        args: ModelArgs,
-        geometry: TensorParallelGeometry,
-        quantization: Option<WeightQuantization>,
-        stream: &Stream,
-    ) -> Result<Self, Error> {
-        validate_args(&args)?;
-        let global_head_dim = args.hidden_size / args.num_attention_heads;
-        let mut local = args.clone();
-        local.vocab_size = geometry.vocab_size;
-        local.num_attention_heads = geometry.attention_heads;
-        local.num_key_value_heads = geometry.kv_heads;
-        local.moe_intermediate_size = geometry.moe_intermediate;
-        if let Some(quantization) = quantization {
-            local.quantization = Some(quantization);
-            local.quantization_config = None;
-            local.quantized_weight_configs = None;
-            local.quantized_weights = None;
-        }
-        let model = Lfm2Model {
-            embed_tokens: common::linear::unloaded_maybe_quantized_embedding(
-                geometry.vocab_size,
-                local.hidden_size,
-                local.weight_quantization_for("model.embed_tokens.weight"),
-                stream,
-            )?,
-            layers: (0..local.num_hidden_layers)
-                .map(|index| {
-                    DecoderLayer::new_with_widths(
-                        &local,
-                        index,
-                        geometry.dense_intermediate,
-                        geometry.moe_intermediate,
-                        Some(global_head_dim),
-                        stream,
-                    )
-                })
-                .collect::<Result<Vec<_>, _>>()?,
-            embedding_norm: nn::RmsNorm::unloaded(
-                local.hidden_size,
-                local.norm_eps,
-                Dtype::Float32,
-                stream,
-            )?,
-        };
-        let lm_head = if local.tie_word_embeddings {
-            None
-        } else {
-            Some(common::linear::unloaded_maybe_quantized_linear(
-                local.hidden_size,
-                geometry.vocab_size,
-                false,
-                local.weight_quantization_for("lm_head.weight"),
                 stream,
             )?)
         };

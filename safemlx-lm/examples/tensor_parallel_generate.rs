@@ -1,12 +1,13 @@
-//! Minimal two-or-more-process tensor-parallel generation probe.
+//! Minimal generalized two-or-more-process Llama/Mistral TP generation probe.
 
 use safemlx::{
     distributed::{self, Backend},
     DeviceType, Stream,
 };
 use safemlx_lm::{
-    architectures::distributed::tensor::load_tensor_parallel_model,
-    runtime::generation::sampler::DefaultSampler, DeviceAssignment, ParallelTopology,
+    architectures::llama::layerwise::load_llama_tensor_parallel_model,
+    runtime::generation::sampler::DefaultSampler, sample_and_synchronize, DeviceAssignment,
+    LayerwiseLoadOptions, ParallelBuildContext, ParallelTopology, ShardingPolicy,
 };
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -27,14 +28,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     )?;
     let stream = Stream::new_with_device(&topology.device.device()?);
     let weights_stream = Stream::new_with_device(&topology.device.device()?);
-    let mut model = load_tensor_parallel_model(&model_dir, topology, &stream, &weights_stream)?;
+    let build = ParallelBuildContext::new(topology, ShardingPolicy::Require);
+    let mut model = load_llama_tensor_parallel_model(
+        &model_dir,
+        LayerwiseLoadOptions::default(),
+        build,
+        &stream,
+        &weights_stream,
+    )?;
     let mut cache = model.new_cache();
     let prompt = safemlx::Array::from_slice(&[1u32, 2, 3], &[1, 3]);
-    let mut logits = model.prefill(&prompt, &mut cache, &group, &stream)?;
+    let mut logits = model.forward_tensor_parallel(&prompt, &mut cache, &group, &stream)?;
     let mut sampler = DefaultSampler;
     for _ in 0..8 {
-        let synchronized = model.sample_and_synchronize(
-            &logits,
+        let synchronized = sample_and_synchronize(
+            Some(&logits),
+            logits.dim(0),
             &mut sampler,
             0.0,
             None,
@@ -52,7 +61,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if synchronized.finished {
             break;
         }
-        logits = model.decode(&synchronized.token, &mut cache, &group, &stream)?;
+        logits = model.forward_tensor_parallel(&synchronized.token, &mut cache, &group, &stream)?;
     }
     Ok(())
 }

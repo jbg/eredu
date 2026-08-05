@@ -30,7 +30,10 @@ use crate::{
             QwenVisionLayerwiseStatic, QwenVisionTransformer,
         },
     },
-    architectures::qwen::dense::{Decoder, Experts as QwenExperts, TransformerBlock},
+    architectures::qwen::dense::{
+        layerwise::register_qwen_layer_parallel_plan, Decoder, Experts as QwenExperts,
+        TransformerBlock,
+    },
     error::Error,
     nn::{
         parallel::{
@@ -1278,7 +1281,7 @@ impl ArchitectureAdapter for Qwen3VlLayerwiseAdapter {
         for index in 0..self.args.text_config.num_hidden_layers as usize {
             let layer =
                 TransformerBlock::new_for_layer(&self.args.text_config, index as i32, stream)?;
-            crate::architectures::distributed::tensor::insert_qwen_layer_plan_with_prefix(
+            register_qwen_layer_parallel_plan(
                 planner,
                 &layer,
                 &format!("model.language_model.layers.{index}"),

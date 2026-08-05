@@ -46,7 +46,12 @@ use crate::{
     runtime::checkpoint::store::{
         GgufWeightStore, TensorSelection, WeightStore, WeightStoreBackend,
     },
-    runtime::distributed::parallel::exact_parallel_division,
+    runtime::distributed::parallel::{
+        array_parameter_member, exact_parallel_division, module_parameter_group,
+        register_projection_module, register_replicated_module, MemberSharding,
+        ParallelPlanBuilder, ParameterGroupSpec, ParameterMemberSpec, ParameterRole,
+        ProjectionSharding,
+    },
     runtime::execution::layerwise::{
         load_layerwise_model, load_layerwise_model_with_store,
         load_tensor_parallel_layerwise_model, ArchitectureAdapter, LayerExecutionLoadOptions,
@@ -65,6 +70,358 @@ const NORM_UNIT: &str = "qwen_hybrid.static.norm";
 const HEAD_UNIT: &str = "qwen_hybrid.static.output";
 const VISION_STATIC_UNIT: &str = "qwen_hybrid.static.vision";
 const MTP_STATIC_UNIT: &str = "qwen_hybrid.static.mtp";
+
+fn register_qwen_hybrid_layer_parallel_plan(
+    planner: &mut ParallelPlanBuilder,
+    layer: &TransformerBlock,
+    index: usize,
+    args: &ModelArgs,
+) -> Result<(), Error> {
+    let prefix = format!("model.layers.{index}");
+    if let Some(attention) = &layer.self_attn {
+        let query_width = usize::try_from(attention.n_heads * attention.head_dim)
+            .map_err(|_| Error::Parallel("Qwen hybrid query width exceeds usize".into()))?;
+        let query_blocks = query_width.div_ceil(128);
+        planner.register(module_parameter_group(
+            &format!("{prefix}.self_attn.q_proj"),
+            ParameterRole::Segmented,
+            &attention.q_proj,
+            &format!("{prefix}.self_attn.q_proj"),
+            |name, _| {
+                let width = if name == "weight_scale_inv" {
+                    query_blocks
+                } else {
+                    query_width
+                };
+                Ok(MemberSharding::Segmented {
+                    axis: 0,
+                    segments: vec![0..width, width..2 * width],
+                })
+            },
+        )?)?;
+        for (name, projection) in [("k_proj", &attention.k_proj), ("v_proj", &attention.v_proj)] {
+            register_projection_module(
+                planner,
+                projection,
+                &format!("{prefix}.self_attn.{name}"),
+                ProjectionSharding::Column,
+            )?;
+        }
+        register_projection_module(
+            planner,
+            &attention.o_proj,
+            &format!("{prefix}.self_attn.o_proj"),
+            ProjectionSharding::Row,
+        )?;
+        for (name, module) in [("q_norm", &attention.q_norm), ("k_norm", &attention.k_norm)] {
+            register_replicated_module(planner, module, &format!("{prefix}.self_attn.{name}"))?;
+        }
+        register_replicated_module(
+            planner,
+            &attention.rope,
+            &format!("{prefix}.self_attn.rope"),
+        )?;
+    }
+    if let Some(linear_attention) = &layer.linear_attn {
+        if args.model_type == "qwen3_next" {
+            let fused_group = |planner: &mut ParallelPlanBuilder,
+                               name: &str,
+                               first: &resident::QwenLinear,
+                               second: &resident::QwenLinear|
+             -> Result<(), Error> {
+                let first_params = first.parameters().flatten();
+                let second_params = second.parameters().flatten();
+                let mut members = Vec::new();
+                for component in ["weight", "weight_scale_inv", "scales", "biases", "bias"] {
+                    let (Some(first), Some(second)) =
+                        (first_params.get(component), second_params.get(component))
+                    else {
+                        continue;
+                    };
+                    let mut shape = first.shape().to_vec();
+                    shape[0] += second.dim(0);
+                    members.push(ParameterMemberSpec::new(
+                        format!("{prefix}.linear_attn.{name}.{component}"),
+                        shape
+                            .into_iter()
+                            .map(|dimension| {
+                                usize::try_from(dimension).map_err(|_| {
+                                    Error::Parallel(
+                                        "Qwen fused projection shape exceeds usize".into(),
+                                    )
+                                })
+                            })
+                            .collect::<Result<Vec<_>, _>>()?,
+                        MemberSharding::Equal { axis: 0 },
+                    ));
+                }
+                planner.register(ParameterGroupSpec::new(
+                    format!("{prefix}.linear_attn.{name}"),
+                    ParameterRole::Channels,
+                    members,
+                )?)
+            };
+            fused_group(
+                planner,
+                "in_proj_qkvz",
+                &linear_attention.in_proj_qkv,
+                &linear_attention.in_proj_z,
+            )?;
+            fused_group(
+                planner,
+                "in_proj_ba",
+                &linear_attention.in_proj_b,
+                &linear_attention.in_proj_a,
+            )?;
+        } else {
+            let key_width = usize::try_from(linear_attention.key_dim)
+                .map_err(|_| Error::Parallel("Qwen recurrent key width exceeds usize".into()))?;
+            let value_width = usize::try_from(linear_attention.value_dim)
+                .map_err(|_| Error::Parallel("Qwen recurrent value width exceeds usize".into()))?;
+            let standard_segments = vec![
+                0..key_width,
+                key_width..2 * key_width,
+                2 * key_width..2 * key_width + value_width,
+            ];
+            let key_blocks = key_width.div_ceil(128);
+            let value_blocks = value_width.div_ceil(128);
+            let scale_segments = vec![
+                0..key_blocks,
+                key_blocks..2 * key_blocks,
+                2 * key_blocks..2 * key_blocks + value_blocks,
+            ];
+            planner.register(module_parameter_group(
+                &format!("{prefix}.linear_attn.in_proj_qkv"),
+                ParameterRole::Segmented,
+                &linear_attention.in_proj_qkv,
+                &format!("{prefix}.linear_attn.in_proj_qkv"),
+                |name, _| {
+                    Ok(MemberSharding::Segmented {
+                        axis: 0,
+                        segments: if name == "weight_scale_inv" {
+                            scale_segments.clone()
+                        } else {
+                            standard_segments.clone()
+                        },
+                    })
+                },
+            )?)?;
+            for (name, projection) in [
+                ("in_proj_z", &linear_attention.in_proj_z),
+                ("in_proj_b", &linear_attention.in_proj_b),
+                ("in_proj_a", &linear_attention.in_proj_a),
+            ] {
+                register_projection_module(
+                    planner,
+                    projection,
+                    &format!("{prefix}.linear_attn.{name}"),
+                    ProjectionSharding::Column,
+                )?;
+            }
+        }
+        let key_width = usize::try_from(linear_attention.key_dim)
+            .map_err(|_| Error::Parallel("Qwen recurrent key width exceeds usize".into()))?;
+        let value_width = usize::try_from(linear_attention.value_dim)
+            .map_err(|_| Error::Parallel("Qwen recurrent value width exceeds usize".into()))?;
+        planner.register(ParameterGroupSpec::new(
+            format!("{prefix}.linear_attn.conv1d"),
+            ParameterRole::Channels,
+            [array_parameter_member(
+                format!("{prefix}.linear_attn.conv1d.weight"),
+                linear_attention.conv1d.weight.as_ref(),
+                MemberSharding::Segmented {
+                    axis: 0,
+                    segments: vec![
+                        0..key_width,
+                        key_width..2 * key_width,
+                        2 * key_width..2 * key_width + value_width,
+                    ],
+                },
+            )?],
+        )?)?;
+        for (name, value) in [
+            ("dt_bias", linear_attention.dt_bias.as_ref()),
+            ("A_log", linear_attention.A_log.as_ref()),
+        ] {
+            planner.register(ParameterGroupSpec::new(
+                format!("{prefix}.linear_attn.{name}"),
+                ParameterRole::Channels,
+                [array_parameter_member(
+                    format!("{prefix}.linear_attn.{name}"),
+                    value,
+                    MemberSharding::Equal { axis: 0 },
+                )?],
+            )?)?;
+        }
+        register_replicated_module(
+            planner,
+            &linear_attention.norm,
+            &format!("{prefix}.linear_attn.norm"),
+        )?;
+        register_projection_module(
+            planner,
+            &linear_attention.out_proj,
+            &format!("{prefix}.linear_attn.out_proj"),
+            ProjectionSharding::Row,
+        )?;
+    }
+    for (name, norm) in [
+        ("input_layernorm", &layer.input_layernorm),
+        ("post_attention_layernorm", &layer.post_attention_layernorm),
+    ] {
+        register_replicated_module(planner, norm, &format!("{prefix}.{name}"))?;
+    }
+    let register_mlp = |planner: &mut ParallelPlanBuilder,
+                        mlp: &resident::Mlp,
+                        prefix: &str|
+     -> Result<(), Error> {
+        for (name, projection, placement) in [
+            ("gate_proj", &mlp.gate_proj, ProjectionSharding::Column),
+            ("up_proj", &mlp.up_proj, ProjectionSharding::Column),
+            ("down_proj", &mlp.down_proj, ProjectionSharding::Row),
+        ] {
+            register_projection_module(
+                planner,
+                projection,
+                &format!("{prefix}.{name}"),
+                placement,
+            )?;
+        }
+        Ok(())
+    };
+    match &layer.mlp {
+        resident::FeedForward::Dense(mlp) => register_mlp(planner, mlp, &format!("{prefix}.mlp"))?,
+        resident::FeedForward::Moe(moe) => {
+            register_replicated_module(planner, &moe.gate, &format!("{prefix}.mlp.gate"))?;
+            register_replicated_module(
+                planner,
+                &moe.shared_expert_gate,
+                &format!("{prefix}.mlp.shared_expert_gate"),
+            )?;
+            register_mlp(
+                planner,
+                &moe.shared_expert,
+                &format!("{prefix}.mlp.shared_expert"),
+            )?;
+            let experts = &moe.experts;
+            let expert_prefix = format!("{prefix}.mlp.experts");
+            if experts.use_fp8 {
+                let hidden = usize::try_from(experts.hidden_dim).map_err(|_| {
+                    Error::Parallel("Qwen hybrid hidden width exceeds usize".into())
+                })?;
+                let intermediate = usize::try_from(experts.intermediate_dim).map_err(|_| {
+                    Error::Parallel("Qwen hybrid expert width exceeds usize".into())
+                })?;
+                for expert in 0..experts.num_experts {
+                    for (projection, shape, sharding) in [
+                        (
+                            "gate_proj",
+                            vec![intermediate, hidden],
+                            MemberSharding::Equal { axis: 0 },
+                        ),
+                        (
+                            "up_proj",
+                            vec![intermediate, hidden],
+                            MemberSharding::Equal { axis: 0 },
+                        ),
+                        (
+                            "down_proj",
+                            vec![hidden, intermediate],
+                            MemberSharding::Equal { axis: 1 },
+                        ),
+                    ] {
+                        let target = format!("{expert_prefix}.{expert}.{projection}.weight");
+                        planner.register(ParameterGroupSpec::new(
+                            target.clone(),
+                            ParameterRole::ExpertIntermediate,
+                            [ParameterMemberSpec::new(
+                                target,
+                                shape.clone(),
+                                sharding.clone(),
+                            )],
+                        )?)?;
+                        let scale_shape = vec![shape[0].div_ceil(128), shape[1].div_ceil(128)];
+                        let target =
+                            format!("{expert_prefix}.{expert}.{projection}.weight_scale_inv");
+                        planner.register(ParameterGroupSpec::new(
+                            target.clone(),
+                            ParameterRole::ExpertIntermediate,
+                            [ParameterMemberSpec::new(target, scale_shape, sharding)],
+                        )?)?;
+                    }
+                }
+            } else {
+                let intermediate = usize::try_from(experts.intermediate_dim).map_err(|_| {
+                    Error::Parallel("Qwen hybrid expert width exceeds usize".into())
+                })?;
+                let segments = vec![0..intermediate, intermediate..2 * intermediate];
+                let mut gate_up = vec![array_parameter_member(
+                    format!("{expert_prefix}.gate_up_proj"),
+                    experts.gate_up_proj.as_ref(),
+                    MemberSharding::Segmented {
+                        axis: 1,
+                        segments: segments.clone(),
+                    },
+                )?];
+                for (name, value) in [
+                    (
+                        "gate_up_proj_scales",
+                        experts.gate_up_proj_scales.as_ref().as_ref(),
+                    ),
+                    (
+                        "gate_up_proj_biases",
+                        experts.gate_up_proj_biases.as_ref().as_ref(),
+                    ),
+                ] {
+                    if let Some(value) = value {
+                        gate_up.push(array_parameter_member(
+                            format!("{expert_prefix}.{name}"),
+                            value,
+                            MemberSharding::Segmented {
+                                axis: 1,
+                                segments: segments.clone(),
+                            },
+                        )?);
+                    }
+                }
+                planner.register(ParameterGroupSpec::new(
+                    format!("{expert_prefix}.gate_up"),
+                    ParameterRole::ExpertIntermediate,
+                    gate_up,
+                )?)?;
+                let mut down = vec![array_parameter_member(
+                    format!("{expert_prefix}.down_proj"),
+                    experts.down_proj.as_ref(),
+                    MemberSharding::Equal { axis: 2 },
+                )?];
+                for (name, value) in [
+                    (
+                        "down_proj_scales",
+                        experts.down_proj_scales.as_ref().as_ref(),
+                    ),
+                    (
+                        "down_proj_biases",
+                        experts.down_proj_biases.as_ref().as_ref(),
+                    ),
+                ] {
+                    if let Some(value) = value {
+                        down.push(array_parameter_member(
+                            format!("{expert_prefix}.{name}"),
+                            value,
+                            MemberSharding::Equal { axis: 2 },
+                        )?);
+                    }
+                }
+                planner.register(ParameterGroupSpec::new(
+                    format!("{expert_prefix}.down"),
+                    ParameterRole::ExpertIntermediate,
+                    down,
+                )?)?;
+            }
+        }
+    }
+    Ok(())
+}
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 enum QwenHybridFamily {
@@ -2404,9 +2761,7 @@ impl ArchitectureAdapter for QwenHybridLayerwiseAdapter {
         }
         for index in 0..self.args.num_hidden_layers as usize {
             let layer = TransformerBlock::new(&self.args, index, stream)?;
-            crate::architectures::distributed::tensor::insert_qwen_hybrid_layer_plan(
-                planner, &layer, index, &self.args, false,
-            )?;
+            register_qwen_hybrid_layer_parallel_plan(planner, &layer, index, &self.args)?;
         }
         Ok(())
     }
@@ -2884,6 +3239,7 @@ mod tests {
     use super::{
         load_qwen35_layerwise_model, load_qwen35_sparse_expert_cache_model,
         load_qwen3_next_layerwise_model, load_qwen3_next_sparse_expert_cache_model,
+        QwenHybridFamily, QwenHybridLayerwiseAdapter,
     };
     use crate::{
         api::{
@@ -2893,7 +3249,11 @@ mod tests {
             qwen3_next,
             qwen_vl::VisionConfig,
         },
-        runtime::execution::layerwise::LayerwiseLoadOptions,
+        runtime::distributed::{
+            parallel::{ParallelBuildContext, ShardingPolicy},
+            topology::{DeviceAssignment, ParallelTopology},
+        },
+        runtime::execution::layerwise::{ArchitectureAdapter, LayerwiseLoadOptions},
         runtime::residency::expert_cache::ExpertCacheLoadOptions,
         runtime::residency::policy::{OffloadConfig, ResidencyPolicy},
     };
@@ -2930,6 +3290,60 @@ mod tests {
         resident::parse_qwen3_5_config_value(config(next, moe))
             .unwrap()
             .0
+    }
+
+    #[test]
+    fn tensor_parallel_plan_preserves_recurrent_and_packed_moe_geometry() {
+        let execution = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        let mut model_args = args(false, true);
+        model_args.mtp_num_hidden_layers = 0;
+        let adapter = QwenHybridLayerwiseAdapter::new(
+            model_args,
+            QwenHybridFamily::Qwen35,
+            None,
+            None,
+            None,
+            execution.stream(),
+        )
+        .unwrap();
+        let context = ParallelBuildContext::new(
+            ParallelTopology::from_rank(2, 0, 2, 1, 1, DeviceAssignment::new(DeviceType::Cpu, 0))
+                .unwrap(),
+            ShardingPolicy::Require,
+        );
+        let mut planner = context.planner();
+        adapter
+            .register_parallel_parameters(context, &mut planner, execution.stream())
+            .unwrap();
+        let (_, layout) = planner.finish().unwrap();
+        assert_eq!(
+            layout
+                .tensor("model.layers.0.linear_attn.in_proj_qkv.weight")
+                .unwrap()
+                .local_shape(),
+            &[16, 16]
+        );
+        assert_eq!(
+            layout
+                .tensor("model.layers.1.self_attn.q_proj.weight")
+                .unwrap()
+                .local_shape(),
+            &[16, 16]
+        );
+        assert_eq!(
+            layout
+                .tensor("model.layers.0.mlp.experts.gate_up_proj")
+                .unwrap()
+                .local_shape(),
+            &[2, 8, 16]
+        );
+        assert_eq!(
+            layout
+                .tensor("model.layers.0.mlp.experts.down_proj")
+                .unwrap()
+                .local_shape(),
+            &[2, 16, 4]
+        );
     }
 
     fn initialize(model: &mut Model, stream: &Stream) {

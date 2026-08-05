@@ -43,7 +43,11 @@ use crate::{
     },
     runtime::checkpoint::recipe::DerivedWeightRecipe,
     runtime::checkpoint::store::{GgufWeightStore, TensorSelection, WeightStore},
-    runtime::distributed::parallel::exact_parallel_division,
+    runtime::distributed::parallel::{
+        array_parameter_member, exact_parallel_division, module_parameter_group,
+        register_projection_module, register_replicated_module, MemberSharding,
+        ParallelPlanBuilder, ParameterGroupSpec, ParameterRole, ProjectionSharding,
+    },
     runtime::execution::layerwise::{
         load_layerwise_model, load_layerwise_model_with_store,
         load_tensor_parallel_layerwise_model, ArchitectureAdapter, LayerExecutionLoadOptions,
@@ -59,6 +63,223 @@ use crate::{
 const EMBEDDING_UNIT: &str = "nemotron_h.static.embedding";
 const NORM_UNIT: &str = "nemotron_h.static.norm";
 const HEAD_UNIT: &str = "nemotron_h.static.output";
+
+fn register_nemotron_layer_parallel_plan(
+    planner: &mut ParallelPlanBuilder,
+    layer: &TransformerBlock,
+    index: usize,
+) -> Result<(), Error> {
+    let prefix = format!("model.layers.{index}");
+    register_replicated_module(planner, &layer.norm, &format!("{prefix}.norm"))?;
+    match layer.policy {
+        LayerPolicy::Mamba => {
+            let mamba = layer.mamba.as_ref().ok_or_else(|| {
+                Error::Parallel(format!(
+                    "Nemotron-H layer {index} is missing its Mamba mixer"
+                ))
+            })?;
+            let intermediate = usize::try_from(mamba.intermediate_size)
+                .map_err(|_| Error::Parallel("Nemotron Mamba width exceeds usize".into()))?;
+            let grouped = usize::try_from(mamba.n_groups * mamba.ssm_state_size)
+                .map_err(|_| Error::Parallel("Nemotron Mamba group width exceeds usize".into()))?;
+            let heads = usize::try_from(mamba.num_heads)
+                .map_err(|_| Error::Parallel("Nemotron Mamba heads exceed usize".into()))?;
+            let in_segments = vec![
+                0..intermediate,
+                intermediate..2 * intermediate,
+                2 * intermediate..2 * intermediate + grouped,
+                2 * intermediate + grouped..2 * intermediate + 2 * grouped,
+                2 * intermediate + 2 * grouped..2 * intermediate + 2 * grouped + heads,
+            ];
+            planner.register(module_parameter_group(
+                &format!("{prefix}.mamba.in_proj"),
+                ParameterRole::Segmented,
+                &mamba.in_proj,
+                &format!("{prefix}.mamba.in_proj"),
+                |_, _| {
+                    Ok(MemberSharding::Segmented {
+                        axis: 0,
+                        segments: in_segments.clone(),
+                    })
+                },
+            )?)?;
+            let conv_segments = vec![
+                0..intermediate,
+                intermediate..intermediate + grouped,
+                intermediate + grouped..intermediate + 2 * grouped,
+            ];
+            let mut convolution = vec![array_parameter_member(
+                format!("{prefix}.mamba.conv1d.weight"),
+                mamba.conv1d.weight.as_ref(),
+                MemberSharding::Segmented {
+                    axis: 0,
+                    segments: conv_segments.clone(),
+                },
+            )?];
+            if let Some(bias) = mamba.conv1d.bias.as_ref().as_ref() {
+                convolution.push(array_parameter_member(
+                    format!("{prefix}.mamba.conv1d.bias"),
+                    bias,
+                    MemberSharding::Segmented {
+                        axis: 0,
+                        segments: conv_segments,
+                    },
+                )?);
+            }
+            planner.register(ParameterGroupSpec::new(
+                format!("{prefix}.mamba.conv1d"),
+                ParameterRole::Channels,
+                convolution,
+            )?)?;
+            for (name, value) in [
+                ("dt_bias", mamba.dt_bias.as_ref()),
+                ("A_log", mamba.A_log.as_ref()),
+                ("D", mamba.D.as_ref()),
+            ] {
+                planner.register(ParameterGroupSpec::new(
+                    format!("{prefix}.mamba.{name}"),
+                    ParameterRole::Channels,
+                    [array_parameter_member(
+                        format!("{prefix}.mamba.{name}"),
+                        value,
+                        MemberSharding::Equal { axis: 0 },
+                    )?],
+                )?)?;
+            }
+            planner.register(ParameterGroupSpec::new(
+                format!("{prefix}.mamba.norm"),
+                ParameterRole::Channels,
+                [array_parameter_member(
+                    format!("{prefix}.mamba.norm.weight"),
+                    mamba.norm.weight.as_ref(),
+                    MemberSharding::Equal { axis: 0 },
+                )?],
+            )?)?;
+            register_projection_module(
+                planner,
+                &mamba.out_proj,
+                &format!("{prefix}.mamba.out_proj"),
+                ProjectionSharding::Row,
+            )?;
+        }
+        LayerPolicy::SelfAttention(_) => {
+            let attention = layer.attention.as_ref().ok_or_else(|| {
+                Error::Parallel(format!(
+                    "Nemotron-H layer {index} is missing its attention mixer"
+                ))
+            })?;
+            for (name, projection, placement) in [
+                ("q_proj", &attention.q_proj, ProjectionSharding::Column),
+                ("k_proj", &attention.k_proj, ProjectionSharding::Column),
+                ("v_proj", &attention.v_proj, ProjectionSharding::Column),
+                ("o_proj", &attention.o_proj, ProjectionSharding::Row),
+            ] {
+                register_projection_module(
+                    planner,
+                    projection,
+                    &format!("{prefix}.attention.{name}"),
+                    placement,
+                )?;
+            }
+        }
+        LayerPolicy::DenseMlp => {
+            let mlp = layer.mlp.as_ref().ok_or_else(|| {
+                Error::Parallel(format!("Nemotron-H layer {index} is missing its dense MLP"))
+            })?;
+            register_projection_module(
+                planner,
+                &mlp.up_proj,
+                &format!("{prefix}.mlp.up_proj"),
+                ProjectionSharding::Column,
+            )?;
+            register_projection_module(
+                planner,
+                &mlp.down_proj,
+                &format!("{prefix}.mlp.down_proj"),
+                ProjectionSharding::Row,
+            )?;
+        }
+        LayerPolicy::SparseMoe => {
+            let moe = layer.moe.as_ref().ok_or_else(|| {
+                Error::Parallel(format!(
+                    "Nemotron-H layer {index} is missing its sparse MoE"
+                ))
+            })?;
+            register_replicated_module(planner, &moe.gate, &format!("{prefix}.moe.gate"))?;
+            for (name, projection, placement) in [
+                (
+                    "up_proj",
+                    &moe.shared_experts.up_proj,
+                    ProjectionSharding::Column,
+                ),
+                (
+                    "down_proj",
+                    &moe.shared_experts.down_proj,
+                    ProjectionSharding::Row,
+                ),
+            ] {
+                register_projection_module(
+                    planner,
+                    projection,
+                    &format!("{prefix}.moe.shared_experts.{name}"),
+                    placement,
+                )?;
+            }
+            let experts = &moe.experts;
+            let mut up = vec![array_parameter_member(
+                format!("{prefix}.moe.experts.up_proj"),
+                experts.up_proj.as_ref(),
+                MemberSharding::Equal { axis: 1 },
+            )?];
+            for (name, value) in [
+                ("up_proj_scales", experts.up_proj_scales.as_ref().as_ref()),
+                ("up_proj_biases", experts.up_proj_biases.as_ref().as_ref()),
+            ] {
+                if let Some(value) = value {
+                    up.push(array_parameter_member(
+                        format!("{prefix}.moe.experts.{name}"),
+                        value,
+                        MemberSharding::Equal { axis: 1 },
+                    )?);
+                }
+            }
+            planner.register(ParameterGroupSpec::new(
+                format!("{prefix}.moe.experts.up"),
+                ParameterRole::ExpertIntermediate,
+                up,
+            )?)?;
+            let mut down = vec![array_parameter_member(
+                format!("{prefix}.moe.experts.down_proj"),
+                experts.down_proj.as_ref(),
+                MemberSharding::Equal { axis: 2 },
+            )?];
+            for (name, value) in [
+                (
+                    "down_proj_scales",
+                    experts.down_proj_scales.as_ref().as_ref(),
+                ),
+                (
+                    "down_proj_biases",
+                    experts.down_proj_biases.as_ref().as_ref(),
+                ),
+            ] {
+                if let Some(value) = value {
+                    down.push(array_parameter_member(
+                        format!("{prefix}.moe.experts.{name}"),
+                        value,
+                        MemberSharding::Equal { axis: 2 },
+                    )?);
+                }
+            }
+            planner.register(ParameterGroupSpec::new(
+                format!("{prefix}.moe.experts.down"),
+                ParameterRole::ExpertIntermediate,
+                down,
+            )?)?;
+        }
+    }
+    Ok(())
+}
 
 /// Nemotron-H causal LM using bounded residency for hybrid blocks.
 pub struct NemotronHLayerwiseModel {
@@ -1051,9 +1272,7 @@ impl ArchitectureAdapter for NemotronHLayerwiseAdapter {
         }
         for index in 0..self.args.num_hidden_layers as usize {
             let layer = TransformerBlock::new(&self.args, index, stream)?;
-            crate::architectures::distributed::tensor::insert_nemotron_layer_plan(
-                planner, &layer, index, false,
-            )?;
+            register_nemotron_layer_parallel_plan(planner, &layer, index)?;
         }
         Ok(())
     }
@@ -1469,15 +1688,24 @@ mod tests {
         Array, Device, DeviceType, ExecutionContext, Stream,
     };
 
-    use super::{load_nemotron_h_layerwise_model, load_nemotron_h_sparse_expert_cache_model};
+    use super::{
+        load_nemotron_h_layerwise_model, load_nemotron_h_sparse_expert_cache_model,
+        NemotronHLayerwiseAdapter,
+    };
     use crate::{
         architectures::nemotron_h::model::{
             self as resident, Cache, LayerCache, LayerPolicy, Model, ModelArgs, ModelInput,
         },
-        runtime::cache::KeyValueCache,
-        runtime::execution::layerwise::LayerwiseLoadOptions,
         runtime::residency::expert_cache::ExpertCacheLoadOptions,
         runtime::residency::policy::{OffloadConfig, ResidencyPolicy},
+        runtime::{
+            cache::KeyValueCache,
+            distributed::{
+                parallel::{ParallelBuildContext, ShardingPolicy},
+                topology::{DeviceAssignment, ParallelTopology},
+            },
+            execution::layerwise::{ArchitectureAdapter, LayerwiseLoadOptions},
+        },
     };
 
     fn config() -> serde_json::Value {
@@ -1511,6 +1739,43 @@ mod tests {
 
     fn args() -> ModelArgs {
         resident::model_args_from_config_value(&config()).unwrap()
+    }
+
+    #[test]
+    fn tensor_parallel_plan_shards_every_hybrid_operator() {
+        let execution = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        let adapter = NemotronHLayerwiseAdapter::new(args(), execution.stream()).unwrap();
+        let context = ParallelBuildContext::new(
+            ParallelTopology::from_rank(2, 0, 2, 1, 1, DeviceAssignment::new(DeviceType::Cpu, 0))
+                .unwrap(),
+            ShardingPolicy::Require,
+        );
+        let mut planner = context.planner();
+        adapter
+            .register_parallel_parameters(context, &mut planner, execution.stream())
+            .unwrap();
+        let (_, layout) = planner.finish().unwrap();
+        assert_eq!(
+            layout
+                .tensor("model.layers.0.mamba.in_proj.weight")
+                .unwrap()
+                .local_shape(),
+            &[13, 8]
+        );
+        assert_eq!(
+            layout
+                .tensor("model.layers.3.attention.q_proj.weight")
+                .unwrap()
+                .local_shape(),
+            &[4, 8]
+        );
+        assert_eq!(
+            layout
+                .tensor("model.layers.2.moe.experts.up_proj")
+                .unwrap()
+                .local_shape(),
+            &[2, 3, 8]
+        );
     }
 
     fn initialize(model: &mut Model, stream: &Stream) {

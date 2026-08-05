@@ -37,7 +37,10 @@ use crate::{
     runtime::cache::{ConcatKeyValueCache, KeyValueCache, PagedKeyValueCache},
     runtime::checkpoint::binding::{build_module_bindings, populate_module_from_lease},
     runtime::checkpoint::store::{GgufWeightStore, WeightStore},
-    runtime::distributed::parallel::exact_parallel_division,
+    runtime::distributed::parallel::{
+        exact_parallel_division, register_projection_module, register_replicated_module,
+        ParallelPlanBuilder, ProjectionSharding,
+    },
     runtime::execution::layerwise::{
         load_layerwise_model, load_layerwise_model_with_store,
         load_tensor_parallel_layerwise_model, ArchitectureAdapter, DenseDiskStreamReport,
@@ -783,6 +786,58 @@ pub struct LlamaAdapterInput<'a> {
     pub mask: Option<&'a Array>,
 }
 
+fn register_llama_layer_parallel_plan(
+    planner: &mut ParallelPlanBuilder,
+    layer: &TransformerBlock,
+    prefix: &str,
+) -> Result<(), Error> {
+    let attention = &layer.self_attn;
+    for (name, projection, sharding) in [
+        ("q_proj", &attention.q_proj, ProjectionSharding::Column),
+        ("k_proj", &attention.k_proj, ProjectionSharding::Column),
+        ("v_proj", &attention.v_proj, ProjectionSharding::Column),
+        ("o_proj", &attention.o_proj, ProjectionSharding::Row),
+    ] {
+        register_projection_module(
+            planner,
+            projection,
+            &format!("{prefix}.self_attn.{name}"),
+            sharding,
+        )?;
+    }
+    register_replicated_module(
+        planner,
+        &attention.rope,
+        &format!("{prefix}.self_attn.rope"),
+    )?;
+    for (name, projection, sharding) in [
+        (
+            "gate_proj",
+            &layer.mlp.gate_proj,
+            ProjectionSharding::Column,
+        ),
+        ("up_proj", &layer.mlp.up_proj, ProjectionSharding::Column),
+        ("down_proj", &layer.mlp.down_proj, ProjectionSharding::Row),
+    ] {
+        register_projection_module(
+            planner,
+            projection,
+            &format!("{prefix}.mlp.{name}"),
+            sharding,
+        )?;
+    }
+    register_replicated_module(
+        planner,
+        &layer.input_layernorm,
+        &format!("{prefix}.input_layernorm"),
+    )?;
+    register_replicated_module(
+        planner,
+        &layer.post_attention_layernorm,
+        &format!("{prefix}.post_attention_layernorm"),
+    )
+}
+
 impl ArchitectureAdapter for LlamaLayerwiseAdapter {
     type Input<'a> = LlamaAdapterInput<'a>;
     type Cache = LlamaCache;
@@ -1081,11 +1136,7 @@ impl ArchitectureAdapter for LlamaLayerwiseAdapter {
         }
         for index in 0..self.args.num_hidden_layers as usize {
             let layer = TransformerBlock::new_for_layer(&self.args, index as i32, stream)?;
-            crate::architectures::distributed::tensor::insert_llama_layer_plan_with_prefix(
-                planner,
-                &layer,
-                &format!("model.layers.{index}"),
-            )?;
+            register_llama_layer_parallel_plan(planner, &layer, &format!("model.layers.{index}"))?;
         }
         Ok(())
     }

@@ -45,9 +45,9 @@ pub use runtime::cache::residency::{
 };
 pub use runtime::cache::PagedKeyValueCache;
 pub use runtime::distributed::parallel::{
-    LocalModelLayout, LocalTensorLayout, MemberSharding, ParallelBuildContext,
-    ParallelExecutionContext, ParallelPlanBuilder, ParameterGroupSpec, ParameterMemberSpec,
-    ParameterRole, ShardingPolicy,
+    sample_and_synchronize, LocalModelLayout, LocalTensorLayout, MemberSharding,
+    ParallelBuildContext, ParallelExecutionContext, ParallelPlanBuilder, ParameterGroupSpec,
+    ParameterMemberSpec, ParameterRole, ShardingPolicy, SynchronizedToken,
 };
 pub use runtime::distributed::topology::{
     DeviceAssignment, ParallelTopology, PlacementPlan, RankPartition, TensorPlacement,

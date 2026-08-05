@@ -17,8 +17,7 @@ use safemlx::{
     error::Exception,
     module::{Module, ModuleParameters},
     nn,
-    ops::indexing::TryIndexOp,
-    ops::{ones, quantized_packed_dimension, stack_axis, zeros},
+    ops::{quantized_packed_dimension, stack_axis},
     quantization::MaybeQuantized,
     transforms::eval,
     Array, Dtype, Stream,
@@ -46,6 +45,7 @@ use crate::{
     runtime::checkpoint::load::StrictLoadConfig,
     runtime::checkpoint::quantization::{quantize_tensor, WeightQuantization},
     runtime::checkpoint::store::{SafetensorsWeightStore, WeightStore},
+    runtime::distributed::parallel::{sample_and_synchronize, SynchronizedToken},
     runtime::distributed::topology::{
         load_safetensors_partition_on_streams, ParallelTopology, PlacementPlan, RankPartition,
         TensorPlacement,
@@ -60,6 +60,9 @@ use crate::{
         MemoryTier, OffloadConfig, OffloadPlan, OffloadUnitId, OffloadUnitSpec, ResidencyPolicy,
     },
 };
+
+#[cfg(test)]
+use safemlx::ops::indexing::TryIndexOp;
 
 /// Immutable, inspectable description of the local pipeline stage.
 #[derive(Debug, Clone)]
@@ -791,44 +794,22 @@ impl PipelineModel {
         stream: &Stream,
     ) -> Result<SynchronizedToken, Error> {
         self.validate_group(group)?;
-        let local_token = if self.info.is_last {
-            let logits = logits.ok_or_else(|| {
-                Error::Parallel("the last pipeline stage requires logits for sampling".into())
-            })?;
-            if logits.dim(0) != step.batch_size {
-                return Err(Error::Parallel(format!(
-                    "last-stage logits batch {} does not match pipeline batch {}",
-                    logits.dim(0),
-                    step.batch_size
-                )));
-            }
-            let sampling_logits = if logits.ndim() == 3 {
-                logits.try_index_device((.., -1, ..), stream)?
-            } else {
-                logits.clone()
-            };
-            sampler
-                .sample(&sampling_logits, temperature, prng_state, stream)?
-                .reshape(&[step.batch_size, 1], stream)?
-        } else {
-            if logits.is_some() {
-                return Err(Error::Parallel(
-                    "only the last pipeline stage may supply logits".into(),
-                ));
-            }
-            zeros::<u32>(&[step.batch_size, 1], stream)?
-        };
-        let token = distributed::all_sum(&local_token, group, stream)?;
-        let local_finished = if self.info.is_last && finished {
-            ones::<i32>(&[], stream)?
-        } else {
-            zeros::<i32>(&[], stream)?
-        };
-        let finished = distributed::all_sum(&local_finished, group, stream)?;
-        eval([&token, &finished])?;
-        stream.synchronize()?;
-        let finished = finished.try_item::<i32>(stream)? != 0;
-        Ok(SynchronizedToken { token, finished })
+        if !self.info.is_last && logits.is_some() {
+            return Err(Error::Parallel(
+                "only the last pipeline stage may supply logits".into(),
+            ));
+        }
+        sample_and_synchronize(
+            logits,
+            step.batch_size,
+            sampler,
+            temperature,
+            prng_state,
+            finished,
+            self.topology.world_size - 1,
+            group,
+            stream,
+        )
     }
 
     fn validate_group(&self, group: &Group) -> Result<(), Error> {
@@ -843,15 +824,6 @@ impl PipelineModel {
         }
         Ok(())
     }
-}
-
-/// Sampled token and globally synchronized termination state.
-#[derive(Debug)]
-pub struct SynchronizedToken {
-    /// Selected token id array; full logits are never broadcast.
-    pub token: Array,
-    /// Whether every rank should terminate generation.
-    pub finished: bool,
 }
 
 fn validate_pure_pipeline(topology: ParallelTopology) -> Result<(), Error> {

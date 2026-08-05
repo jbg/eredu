@@ -288,7 +288,8 @@ directly. Ordered policies are included in architecture and prompt-cache
 fingerprints. Normal and paged caches support every schedule; persisted prompt
 caches support uniform all-full or all-sliding schedules, while non-uniform
 schedules fail closed because prompt-cache schema v2 has only one model-wide
-window. Qwen2 tensor and pipeline parallelism remain unsupported.
+window. Qwen2 safetensors tensor parallelism uses the generalized family
+adapter; pipeline parallelism remains unsupported.
 
 The former public `architectures::qwen::qwen3` module was removed. Dense Qwen
 callers use `architectures::qwen::dense`; architecture identity comes from
@@ -355,8 +356,8 @@ and `ModelArgs::layer_policy` are the only normalized layer APIs. `ModelArgs` an
 `TransformerBlock::layer_policy`, `ModelInput::sliding_masks`, and
 `CacheStateStrategy::SharedFullKv::sliding_attention` are the replacement APIs.
 The complete ordered policy list participates in architecture identity.
-Persisted and paged Gemma prompt/KV caches remain unsupported, as do Gemma
-tensor and pipeline parallelism.
+Gemma prompt-cache persistence and safetensors tensor parallelism use the
+family layerwise adapter. Gemma pipeline parallelism remains unsupported.
 
 ## LFM2/LFM2.5 weight residency
 
@@ -751,8 +752,9 @@ attention-affecting unsupported YaRN metadata are rejected during the same
 catalog inspection used by loading. Fully resident dense-Qwen models support
 normal, paged, and schema-v4 persisted prompt caches for full or mixed
 Qwen2/Qwen2.5 schedules. The normalized schedule can carry distinct windows,
-and all-full Qwen3 uses the same persistence route. Qwen tensor and pipeline
-parallelism remain unsupported independently of prompt-cache schema.
+and all-full Qwen3 uses the same persistence route. Qwen safetensors tensor
+parallelism uses the generalized family adapter; GGUF tensor parallelism and
+pipeline parallelism remain unsupported independently of prompt-cache schema.
 
 Kimi Linear GGUF accepts modern split `attn_k_b`/`attn_v_b` and legacy
 unsplit `attn_kv_b`, modern and singleton-ranked convolution tensors, dense
@@ -928,8 +930,11 @@ Ring environment (`MLX_RANK` and `MLX_HOSTFILE`) configured for all processes.
 Pure tensor parallelism uses `TP > 1`, `PP = 1`, and `EP = 1`. Hybrid TP+PP
 and TP+EP configurations fail before checkpoint payloads are opened because
 Ring and JACCL cannot reliably form the required subgroups in the vendored MLX
-version. Use `tensor_parallel::load_tensor_parallel_model` with a topology
-whose tensor size equals the world size.
+version. Use the selected architecture's `load_*_tensor_parallel_model` entry
+point (or `load_tensor_parallel_safetensors` for Qwen2/3) with a
+`ParallelBuildContext` whose tensor size equals the world size. Tensor
+parallelism is implemented by the generalized layerwise execution-group
+engine; there is no architecture-dispatching TP model wrapper.
 
 All-to-sharded (column-parallel) projections take a complete replicated input,
 shard weight/output rows, and keep the output local without communication.
@@ -940,12 +945,11 @@ stay with their packed weight shards; they are distinct from ordinary linear
 bias. Row partitions must align with the affine group, the MXFP4 32-value
 group, or DeepSeek's 128-by-128 block-FP8 grid.
 
-The token-only executable architecture dispatch covers Llama/Mistral, Qwen2/Qwen3
+Family-specific generalized loaders cover Llama/Mistral, Qwen2/Qwen3
 (including Qwen3 MoE), Gemma text, GPT-OSS, DeepSeek-V3/R1, Kimi Linear, LFM2
 dense/MoE, Nemotron-H, and the text decoders of Qwen3-Next and Qwen3.5
-dense/MoE. Qwen vision towers and embedded multi-token-prediction layers are
-not part of that token-only TP API and are rejected before loading. They use
-the execution-group TP path described below instead.
+dense/MoE. Qwen vision towers and embedded multi-token-prediction layers use
+their own execution groups through the same generalized engine.
 
 `load_tensor_parallel_layerwise_model` applies the same typed parameter-role
 planner and rank-local checkpoint selection to named layerwise execution
@@ -1041,11 +1045,11 @@ cargo test -p safemlx-lm --test distributed_tensor_parallel_ring \
   ring_two_process_deepseek_tensor_parallel_persistence -- --ignored --exact --nocapture
 ```
 
-The architecture planning and synthetic rank-local loader fixtures run with:
+Architecture-neutral planner tests and family-owned rank-local loader fixtures
+run with the library test suite:
 
 ```sh
-cargo test -p safemlx-lm --lib \
-  architectures::distributed::tensor::tests -- --nocapture
+cargo test -p safemlx-lm --lib -- --nocapture
 ```
 
 The model-level probe is:

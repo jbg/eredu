@@ -38,7 +38,11 @@ use crate::{
     },
     runtime::checkpoint::recipe::DerivedWeightRecipe,
     runtime::checkpoint::store::{GgufWeightStore, TensorSelection, WeightStore},
-    runtime::distributed::parallel::exact_parallel_division,
+    runtime::distributed::parallel::{
+        array_parameter_member, exact_parallel_division, register_projection_module,
+        register_replicated_module, MemberSharding, ParallelPlanBuilder, ParameterGroupSpec,
+        ParameterRole, ProjectionSharding,
+    },
     runtime::execution::layerwise::{
         load_layerwise_model, load_layerwise_model_with_store,
         load_tensor_parallel_layerwise_model, ArchitectureAdapter, LayerExecutionLoadOptions,
@@ -706,6 +710,102 @@ pub struct GptOssForwardContext {
     sequence_length: i32,
 }
 
+fn register_gpt_oss_layer_parallel_plan(
+    planner: &mut ParallelPlanBuilder,
+    layer: &TransformerBlock,
+    index: usize,
+) -> Result<(), Error> {
+    let prefix = format!("model.layers.{index}");
+    let attention = &layer.self_attn;
+    for (name, projection) in [
+        ("q_proj", &attention.q_proj),
+        ("k_proj", &attention.k_proj),
+        ("v_proj", &attention.v_proj),
+    ] {
+        register_projection_module(
+            planner,
+            projection,
+            &format!("{prefix}.self_attn.{name}"),
+            ProjectionSharding::Column,
+        )?;
+    }
+    register_projection_module(
+        planner,
+        &attention.o_proj,
+        &format!("{prefix}.self_attn.o_proj"),
+        ProjectionSharding::Row,
+    )?;
+    planner.register(ParameterGroupSpec::new(
+        format!("{prefix}.self_attn.sinks"),
+        ParameterRole::AttentionHeads,
+        [array_parameter_member(
+            format!("{prefix}.self_attn.sinks"),
+            attention.sinks.as_ref(),
+            MemberSharding::Equal { axis: 0 },
+        )?],
+    )?)?;
+    register_replicated_module(
+        planner,
+        &layer.input_layernorm,
+        &format!("{prefix}.input_layernorm"),
+    )?;
+    register_replicated_module(
+        planner,
+        &layer.post_attention_layernorm,
+        &format!("{prefix}.post_attention_layernorm"),
+    )?;
+    register_projection_module(
+        planner,
+        &layer.mlp.router,
+        &format!("{prefix}.mlp.router"),
+        ProjectionSharding::Replicated,
+    )?;
+    let experts = &layer.mlp.experts;
+    planner.register(ParameterGroupSpec::new(
+        format!("{prefix}.mlp.experts.gate_up"),
+        ParameterRole::ExpertIntermediate,
+        [
+            array_parameter_member(
+                format!("{prefix}.mlp.experts.gate_up_proj_blocks"),
+                experts.gate_up_proj_blocks.as_ref(),
+                MemberSharding::Equal { axis: 1 },
+            )?,
+            array_parameter_member(
+                format!("{prefix}.mlp.experts.gate_up_proj_scales"),
+                experts.gate_up_proj_scales.as_ref(),
+                MemberSharding::Equal { axis: 1 },
+            )?,
+            array_parameter_member(
+                format!("{prefix}.mlp.experts.gate_up_proj_bias"),
+                experts.gate_up_proj_bias.as_ref(),
+                MemberSharding::Equal { axis: 1 },
+            )?,
+        ],
+    )?)?;
+    planner.register(ParameterGroupSpec::new(
+        format!("{prefix}.mlp.experts.down"),
+        ParameterRole::ExpertIntermediate,
+        [
+            array_parameter_member(
+                format!("{prefix}.mlp.experts.down_proj_blocks"),
+                experts.down_proj_blocks.as_ref(),
+                MemberSharding::Equal { axis: 2 },
+            )?,
+            array_parameter_member(
+                format!("{prefix}.mlp.experts.down_proj_scales"),
+                experts.down_proj_scales.as_ref(),
+                MemberSharding::Equal { axis: 2 },
+            )?,
+            array_parameter_member(
+                format!("{prefix}.mlp.experts.down_proj_bias"),
+                experts.down_proj_bias.as_ref(),
+                MemberSharding::Replicated,
+            )?,
+        ],
+    )?)?;
+    Ok(())
+}
+
 impl ArchitectureAdapter for GptOssLayerwiseAdapter {
     type Input<'a> = &'a Array;
     type Cache = Cache;
@@ -946,9 +1046,7 @@ impl ArchitectureAdapter for GptOssLayerwiseAdapter {
         )?)?;
         for index in 0..self.args.num_hidden_layers as usize {
             let layer = TransformerBlock::new(&self.args, index, stream)?;
-            crate::architectures::distributed::tensor::insert_gpt_oss_layer_plan(
-                planner, &layer, index,
-            )?;
+            register_gpt_oss_layer_parallel_plan(planner, &layer, index)?;
         }
         Ok(())
     }
@@ -1395,13 +1493,19 @@ mod tests {
     use super::{load_gpt_oss_layerwise_model, load_gpt_oss_sparse_expert_cache_model};
     use crate::{
         architectures::gpt_oss::model::{self as resident, Cache, Model, ModelArgs, MxFp4Config},
-        runtime::execution::layerwise::{LayerExecutionLoadOptions, LayerwiseLoadOptions},
         runtime::residency::dense_stream::DenseDiskStreamLoadOptions,
         runtime::residency::expert_cache::ExpertCacheLoadOptions,
         runtime::residency::policy::{MemoryTier, OffloadConfig, ResidencyPolicy},
         runtime::{
             attention::{AttentionPolicy, LayerSchedule},
             cache::KeyValueCache,
+        },
+        runtime::{
+            distributed::{
+                parallel::{ParallelBuildContext, ShardingPolicy},
+                topology::{DeviceAssignment, ParallelTopology},
+            },
+            execution::layerwise::{LayerExecutionLoadOptions, LayerwiseLoadOptions},
         },
     };
 
@@ -1438,6 +1542,14 @@ mod tests {
             quantized_weight_configs: None,
             swiglu_limit: 7.0,
         }
+    }
+
+    fn tensor_parallel_context() -> ParallelBuildContext {
+        ParallelBuildContext::new(
+            ParallelTopology::from_rank(2, 0, 2, 1, 1, DeviceAssignment::new(DeviceType::Cpu, 0))
+                .unwrap(),
+            ShardingPolicy::Require,
+        )
     }
 
     fn initialize(model: &mut Model, stream: &Stream) {
@@ -1521,6 +1633,55 @@ mod tests {
         for (left, right) in left.as_slice::<f32>().iter().zip(right.as_slice::<f32>()) {
             assert!((left - right).abs() <= 3e-5, "{left} != {right}");
         }
+    }
+
+    #[test]
+    fn generalized_tensor_parallel_loader_shards_native_mxfp4_groups() {
+        let execution = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        let weights = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        let mut model_args = tiny_args();
+        model_args.hidden_size = 64;
+        model_args.intermediate_size = 64;
+        model_args.num_attention_heads = 2;
+        model_args.num_key_value_heads = 2;
+        model_args.num_hidden_layers = 1;
+        model_args.attention_schedule =
+            LayerSchedule::new(1, vec![AttentionPolicy::sliding(8).unwrap()]).unwrap();
+        let mut fixture = Model::new(model_args, execution.stream()).unwrap();
+        initialize(&mut fixture, execution.stream());
+        let dir = tempfile::tempdir().unwrap();
+        write_fixture(dir.path(), &fixture);
+
+        let model = super::load_gpt_oss_tensor_parallel_model(
+            dir.path(),
+            LayerwiseLoadOptions::default(),
+            tensor_parallel_context(),
+            execution.stream(),
+            weights.stream(),
+        )
+        .unwrap();
+        let layout = model.execution.parallel_layout().unwrap();
+        assert_eq!(
+            layout
+                .tensor("model.layers.0.self_attn.q_proj.weight")
+                .unwrap()
+                .local_shape(),
+            &[32, 64]
+        );
+        assert_eq!(
+            layout
+                .tensor("model.layers.0.mlp.experts.gate_up_proj_blocks")
+                .unwrap()
+                .local_shape(),
+            &[2, 64, 2, 16]
+        );
+        assert_eq!(
+            layout
+                .tensor("model.layers.0.mlp.experts.down_proj_scales")
+                .unwrap()
+                .local_shape(),
+            &[2, 64, 1]
+        );
     }
 
     fn parity(depth: usize, dense_stream: bool) {

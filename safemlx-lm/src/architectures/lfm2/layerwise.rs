@@ -44,7 +44,11 @@ use crate::{
     },
     runtime::checkpoint::recipe::DerivedWeightRecipe,
     runtime::checkpoint::store::{GgufWeightStore, TensorSelection, WeightStore},
-    runtime::distributed::parallel::exact_parallel_division,
+    runtime::distributed::parallel::{
+        array_parameter_member, exact_parallel_division, register_projection_module,
+        register_replicated_module, MemberSharding, ParallelPlanBuilder, ParameterGroupSpec,
+        ParameterRole, ProjectionSharding,
+    },
     runtime::execution::layerwise::{
         load_layerwise_model, load_layerwise_model_with_store,
         load_tensor_parallel_layerwise_model, ArchitectureAdapter, LayerExecutionLoadOptions,
@@ -60,6 +64,159 @@ use crate::{
 const EMBEDDING_UNIT: &str = "lfm2.static.embedding";
 const NORM_UNIT: &str = "lfm2.static.norm";
 const HEAD_UNIT: &str = "lfm2.static.output";
+
+fn register_lfm2_layer_parallel_plan(
+    planner: &mut ParallelPlanBuilder,
+    layer: &DecoderLayer,
+    index: usize,
+) -> Result<(), Error> {
+    let prefix = format!("model.layers.{index}");
+    if let Some(attention) = &layer.self_attn {
+        for (name, projection) in [
+            ("q_proj", &attention.q_proj),
+            ("k_proj", &attention.k_proj),
+            ("v_proj", &attention.v_proj),
+        ] {
+            register_projection_module(
+                planner,
+                projection,
+                &format!("{prefix}.self_attn.{name}"),
+                ProjectionSharding::Column,
+            )?;
+        }
+        register_projection_module(
+            planner,
+            &attention.out_proj,
+            &format!("{prefix}.self_attn.out_proj"),
+            ProjectionSharding::Row,
+        )?;
+        for (name, module) in [
+            ("q_layernorm", &attention.q_layernorm),
+            ("k_layernorm", &attention.k_layernorm),
+        ] {
+            register_replicated_module(planner, module, &format!("{prefix}.self_attn.{name}"))?;
+        }
+        register_replicated_module(
+            planner,
+            &attention.rope,
+            &format!("{prefix}.self_attn.rope"),
+        )?;
+    }
+    if let Some(conv) = &layer.conv {
+        register_replicated_module(planner, conv, &format!("{prefix}.conv"))?;
+    }
+    for (name, norm) in [
+        ("operator_norm", &layer.operator_norm),
+        ("ffn_norm", &layer.ffn_norm),
+    ] {
+        register_replicated_module(planner, norm, &format!("{prefix}.{name}"))?;
+    }
+
+    let feed_forward = &layer.feed_forward;
+    if feed_forward.is_moe {
+        let gate = feed_forward.gate.as_ref().ok_or_else(|| {
+            Error::Parallel(format!("LFM2 layer {index} is missing its MoE gate"))
+        })?;
+        register_replicated_module(planner, gate, &format!("{prefix}.feed_forward.gate"))?;
+        if let Some(bias) = feed_forward.expert_bias.as_ref().as_ref() {
+            planner.register(ParameterGroupSpec::new(
+                format!("{prefix}.feed_forward.expert_bias"),
+                ParameterRole::Replicated,
+                [array_parameter_member(
+                    format!("{prefix}.feed_forward.expert_bias"),
+                    bias,
+                    MemberSharding::Replicated,
+                )?],
+            )?)?;
+        }
+        let experts = feed_forward.experts.as_ref().ok_or_else(|| {
+            Error::Parallel(format!("LFM2 layer {index} is missing its expert bank"))
+        })?;
+        let expert_prefix = format!("{prefix}.feed_forward.experts");
+        let intermediate = usize::try_from(experts.intermediate_dim)
+            .map_err(|_| Error::Parallel("LFM2 expert width exceeds usize".into()))?;
+        let segments = vec![0..intermediate, intermediate..2 * intermediate];
+        let mut gate_up = vec![array_parameter_member(
+            format!("{expert_prefix}.gate_up_proj"),
+            experts.gate_up_proj.as_ref(),
+            MemberSharding::Segmented {
+                axis: 1,
+                segments: segments.clone(),
+            },
+        )?];
+        for (name, value) in [
+            (
+                "gate_up_proj_scales",
+                experts.gate_up_proj_scales.as_ref().as_ref(),
+            ),
+            (
+                "gate_up_proj_biases",
+                experts.gate_up_proj_biases.as_ref().as_ref(),
+            ),
+        ] {
+            if let Some(value) = value {
+                gate_up.push(array_parameter_member(
+                    format!("{expert_prefix}.{name}"),
+                    value,
+                    MemberSharding::Segmented {
+                        axis: 1,
+                        segments: segments.clone(),
+                    },
+                )?);
+            }
+        }
+        planner.register(ParameterGroupSpec::new(
+            format!("{expert_prefix}.gate_up"),
+            ParameterRole::ExpertIntermediate,
+            gate_up,
+        )?)?;
+        let mut down = vec![array_parameter_member(
+            format!("{expert_prefix}.down_proj"),
+            experts.down_proj.as_ref(),
+            MemberSharding::Equal { axis: 2 },
+        )?];
+        for (name, value) in [
+            (
+                "down_proj_scales",
+                experts.down_proj_scales.as_ref().as_ref(),
+            ),
+            (
+                "down_proj_biases",
+                experts.down_proj_biases.as_ref().as_ref(),
+            ),
+        ] {
+            if let Some(value) = value {
+                down.push(array_parameter_member(
+                    format!("{expert_prefix}.{name}"),
+                    value,
+                    MemberSharding::Equal { axis: 2 },
+                )?);
+            }
+        }
+        planner.register(ParameterGroupSpec::new(
+            format!("{expert_prefix}.down"),
+            ParameterRole::ExpertIntermediate,
+            down,
+        )?)?;
+    } else {
+        for (name, projection, placement) in [
+            ("w1", feed_forward.w1.as_ref(), ProjectionSharding::Column),
+            ("w3", feed_forward.w3.as_ref(), ProjectionSharding::Column),
+            ("w2", feed_forward.w2.as_ref(), ProjectionSharding::Row),
+        ] {
+            let projection = projection.ok_or_else(|| {
+                Error::Parallel(format!("LFM2 dense layer {index} is missing {name}"))
+            })?;
+            register_projection_module(
+                planner,
+                projection,
+                &format!("{prefix}.feed_forward.{name}"),
+                placement,
+            )?;
+        }
+    }
+    Ok(())
+}
 
 /// LFM2/LFM2.5 causal LM with host-backed decoder blocks.
 pub struct Lfm2LayerwiseModel {
@@ -936,9 +1093,7 @@ impl ArchitectureAdapter for Lfm2LayerwiseAdapter {
         }
         for index in 0..self.args.num_hidden_layers as usize {
             let layer = DecoderLayer::new(&self.args, index as i32, stream)?;
-            crate::architectures::distributed::tensor::insert_lfm2_layer_plan(
-                planner, &layer, index, false,
-            )?;
+            register_lfm2_layer_parallel_plan(planner, &layer, index)?;
         }
         Ok(())
     }
@@ -1479,8 +1634,13 @@ mod tests {
         runtime::residency::policy::{MemoryTier, OffloadConfig, ResidencyPolicy},
         runtime::{
             attention::LayerSchedule,
+            distributed::{
+                parallel::{ParallelBuildContext, ShardingPolicy},
+                topology::{DeviceAssignment, ParallelTopology},
+            },
             execution::layerwise::{
-                load_layerwise_model, LayerExecutionLoadOptions, LayerwiseLoadOptions,
+                load_layerwise_model, ArchitectureAdapter, LayerExecutionLoadOptions,
+                LayerwiseLoadOptions,
             },
         },
     };
@@ -1509,6 +1669,43 @@ mod tests {
             "use_expert_bias": moe
         }))
         .unwrap()
+    }
+
+    #[test]
+    fn tensor_parallel_plan_preserves_attention_and_packed_moe_geometry() {
+        let execution = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        let adapter = Lfm2LayerwiseAdapter::new(args(true), execution.stream()).unwrap();
+        let context = ParallelBuildContext::new(
+            ParallelTopology::from_rank(2, 0, 2, 1, 1, DeviceAssignment::new(DeviceType::Cpu, 0))
+                .unwrap(),
+            ShardingPolicy::Require,
+        );
+        let mut planner = context.planner();
+        adapter
+            .register_parallel_parameters(context, &mut planner, execution.stream())
+            .unwrap();
+        let (_, layout) = planner.finish().unwrap();
+        assert_eq!(
+            layout
+                .tensor("model.layers.1.self_attn.q_proj.weight")
+                .unwrap()
+                .local_shape(),
+            &[8, 16]
+        );
+        assert_eq!(
+            layout
+                .tensor("model.layers.1.feed_forward.experts.gate_up_proj")
+                .unwrap()
+                .local_shape(),
+            &[2, 8, 16]
+        );
+        assert_eq!(
+            layout
+                .tensor("model.layers.1.feed_forward.experts.down_proj")
+                .unwrap()
+                .local_shape(),
+            &[2, 16, 4]
+        );
     }
 
     fn initialize(model: &mut Model, stream: &Stream) {

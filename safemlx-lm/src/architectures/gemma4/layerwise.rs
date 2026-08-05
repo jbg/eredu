@@ -48,7 +48,11 @@ use crate::{
     },
     runtime::checkpoint::recipe::DerivedWeightRecipe,
     runtime::checkpoint::store::{GgufWeightStore, TensorSelection, WeightStore},
-    runtime::distributed::parallel::exact_parallel_division,
+    runtime::distributed::parallel::{
+        array_parameter_member, exact_parallel_division, register_projection_module,
+        register_replicated_module, MemberSharding, ParallelPlanBuilder, ParameterGroupSpec,
+        ParameterMemberSpec, ParameterRole, ProjectionSharding,
+    },
     runtime::execution::layerwise::{
         load_layerwise_model, load_layerwise_model_with_store,
         load_tensor_parallel_layerwise_model, ArchitectureAdapter, LayerExecutionLoadOptions,
@@ -67,6 +71,188 @@ const VISION_STATIC_UNIT: &str = "gemma4.static.vision";
 const VISION_EMBED_UNIT: &str = "gemma4.static.vision_embed";
 const AUDIO_STATIC_UNIT: &str = "gemma4.static.audio";
 const AUDIO_EMBED_UNIT: &str = "gemma4.static.audio_embed";
+
+fn register_gemma_expert_parallel_projection(
+    planner: &mut ParallelPlanBuilder,
+    projection: &resident::ExpertProjection,
+    prefix: &str,
+    axis: usize,
+) -> Result<(), Error> {
+    let mut members = vec![array_parameter_member(
+        format!("{prefix}.weight"),
+        projection.weight.as_ref(),
+        MemberSharding::Equal { axis },
+    )?];
+    if let Some(scales) = projection.scales.as_ref().as_ref() {
+        members.push(array_parameter_member(
+            format!("{prefix}.scales"),
+            scales,
+            MemberSharding::Equal { axis },
+        )?);
+    }
+    if let Some(biases) = projection.biases.as_ref().as_ref() {
+        members.push(array_parameter_member(
+            format!("{prefix}.biases"),
+            biases,
+            MemberSharding::Equal { axis },
+        )?);
+    }
+    planner.register(ParameterGroupSpec::new(
+        prefix,
+        ParameterRole::ExpertIntermediate,
+        members,
+    )?)
+}
+
+fn register_gemma_layer_parallel_plan(
+    planner: &mut ParallelPlanBuilder,
+    layer: &TransformerBlock,
+    prefix: &str,
+) -> Result<(), Error> {
+    let attention = &layer.self_attn;
+    register_projection_module(
+        planner,
+        &attention.q_proj,
+        &format!("{prefix}.self_attn.q_proj"),
+        ProjectionSharding::Column,
+    )?;
+    if let Some(projection) = &attention.k_proj {
+        register_projection_module(
+            planner,
+            projection,
+            &format!("{prefix}.self_attn.k_proj"),
+            ProjectionSharding::Column,
+        )?;
+    }
+    if let Some(projection) = &attention.v_proj {
+        register_projection_module(
+            planner,
+            projection,
+            &format!("{prefix}.self_attn.v_proj"),
+            ProjectionSharding::Column,
+        )?;
+    }
+    register_projection_module(
+        planner,
+        &attention.o_proj,
+        &format!("{prefix}.self_attn.o_proj"),
+        ProjectionSharding::Row,
+    )?;
+    register_replicated_module(
+        planner,
+        &attention.q_norm,
+        &format!("{prefix}.self_attn.q_norm"),
+    )?;
+    if let Some(norm) = &attention.k_norm {
+        register_replicated_module(planner, norm, &format!("{prefix}.self_attn.k_norm"))?;
+    }
+    register_replicated_module(
+        planner,
+        &attention.rope,
+        &format!("{prefix}.self_attn.rope"),
+    )?;
+    for (name, projection, sharding) in [
+        (
+            "gate_proj",
+            &layer.mlp.gate_proj,
+            ProjectionSharding::Column,
+        ),
+        ("up_proj", &layer.mlp.up_proj, ProjectionSharding::Column),
+        ("down_proj", &layer.mlp.down_proj, ProjectionSharding::Row),
+    ] {
+        register_projection_module(
+            planner,
+            projection,
+            &format!("{prefix}.mlp.{name}"),
+            sharding,
+        )?;
+    }
+    if let Some(router) = &layer.router {
+        register_replicated_module(planner, router, &format!("{prefix}.router"))?;
+    }
+    if let Some(experts) = &layer.experts {
+        let expert_prefix = format!("{prefix}.experts.switch_glu");
+        register_gemma_expert_parallel_projection(
+            planner,
+            &experts.switch_glu.gate_proj,
+            &format!("{expert_prefix}.gate_proj"),
+            1,
+        )?;
+        register_gemma_expert_parallel_projection(
+            planner,
+            &experts.switch_glu.up_proj,
+            &format!("{expert_prefix}.up_proj"),
+            1,
+        )?;
+        register_gemma_expert_parallel_projection(
+            planner,
+            &experts.switch_glu.down_proj,
+            &format!("{expert_prefix}.down_proj"),
+            2,
+        )?;
+    }
+    if let Some(projection) = &layer.per_layer_input_gate {
+        register_projection_module(
+            planner,
+            projection,
+            &format!("{prefix}.per_layer_input_gate"),
+            ProjectionSharding::Replicated,
+        )?;
+    }
+    if let Some(projection) = &layer.per_layer_projection {
+        register_projection_module(
+            planner,
+            projection,
+            &format!("{prefix}.per_layer_projection"),
+            ProjectionSharding::Replicated,
+        )?;
+    }
+    for (name, norm) in [
+        ("input_layernorm", Some(&layer.input_layernorm)),
+        (
+            "post_attention_layernorm",
+            Some(&layer.post_attention_layernorm),
+        ),
+        (
+            "pre_feedforward_layernorm",
+            Some(&layer.pre_feedforward_layernorm),
+        ),
+        (
+            "post_feedforward_layernorm",
+            Some(&layer.post_feedforward_layernorm),
+        ),
+        (
+            "post_per_layer_input_norm",
+            layer.post_per_layer_input_norm.as_ref(),
+        ),
+        (
+            "post_feedforward_layernorm_1",
+            layer.post_feedforward_layernorm_1.as_ref(),
+        ),
+        (
+            "pre_feedforward_layernorm_2",
+            layer.pre_feedforward_layernorm_2.as_ref(),
+        ),
+        (
+            "post_feedforward_layernorm_2",
+            layer.post_feedforward_layernorm_2.as_ref(),
+        ),
+    ] {
+        if let Some(norm) = norm {
+            register_replicated_module(planner, norm, &format!("{prefix}.{name}"))?;
+        }
+    }
+    planner.register(ParameterGroupSpec::new(
+        format!("{prefix}.layer_scalar"),
+        ParameterRole::Replicated,
+        [ParameterMemberSpec::new(
+            format!("{prefix}.layer_scalar"),
+            [1],
+            MemberSharding::Replicated,
+        )],
+    )?)?;
+    Ok(())
+}
 
 /// Gemma 4 multimodal model using bounded residency for media and text blocks.
 pub struct Gemma4LayerwiseModel {
@@ -1956,7 +2142,7 @@ impl ArchitectureAdapter for Gemma4LayerwiseAdapter {
                 index,
                 stream,
             )?;
-            crate::architectures::distributed::tensor::insert_gemma_layer_plan_with_prefix(
+            register_gemma_layer_parallel_plan(
                 planner,
                 &layer,
                 &format!("model.language_model.layers.{index}"),
