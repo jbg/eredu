@@ -36,9 +36,9 @@ use safemlx_lm::{
     runtime::checkpoint::binding::canonical_checkpoint_name,
     runtime::generation::sampler::DefaultSampler,
     sample_and_synchronize, CacheResidencyPolicy, DeviceAssignment, LayerCachePolicy,
-    LayerwiseLoadOptions, PagedCacheOptions, ParallelBuildContext, ParallelModelInfo,
-    ParallelTopology, PromptCacheDescriptor, PromptCacheManifest, PromptCacheOptions,
-    PromptCacheTopology, ShardingPolicy,
+    LayerExecutionLoadOptions, LayerwiseLoadOptions, PagedCacheOptions, ParallelBuildContext,
+    ParallelModelInfo, ParallelTopology, PromptCacheDescriptor, PromptCacheManifest,
+    PromptCacheOptions, PromptCacheTopology, ShardingPolicy,
 };
 use safetensors::tensor::{serialize_to_file, Dtype, TensorView};
 
@@ -47,6 +47,39 @@ const CHECKPOINT_DIR: &str = "SAFEMLX_LM_TENSOR_CHECKPOINT";
 const PROMPT_CACHE_ROOT: &str = "SAFEMLX_LM_TENSOR_PROMPT_CACHE";
 const FIXTURE_FAMILY: &str = "SAFEMLX_LM_TENSOR_FIXTURE_FAMILY";
 const ZERO_BIAS_CHECKPOINT: &str = "SAFEMLX_LM_TENSOR_ZERO_BIAS_CHECKPOINT";
+const PARAMETER_RESIDENCY: &str = "SAFEMLX_LM_TENSOR_PARAMETER_RESIDENCY";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TensorParameterResidency {
+    LayerwiseHost,
+    FullyResident,
+}
+
+impl TensorParameterResidency {
+    const fn name(self) -> &'static str {
+        match self {
+            Self::LayerwiseHost => "layerwise-host",
+            Self::FullyResident => "fully-resident",
+        }
+    }
+
+    fn parse(value: &str) -> Self {
+        match value {
+            "layerwise-host" => Self::LayerwiseHost,
+            "fully-resident" => Self::FullyResident,
+            _ => panic!("unknown tensor-parallel parameter residency {value:?}"),
+        }
+    }
+
+    fn load_options(self) -> LayerExecutionLoadOptions {
+        match self {
+            Self::LayerwiseHost => {
+                LayerExecutionLoadOptions::LayerwiseHost(LayerwiseLoadOptions::default())
+            }
+            Self::FullyResident => LayerExecutionLoadOptions::FullyResident,
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum FixtureFamily {
@@ -144,11 +177,12 @@ impl GeneralizedTensorModel {
     fn load(
         checkpoint: &Path,
         family: FixtureFamily,
+        residency: TensorParameterResidency,
         topology: ParallelTopology,
         stream: &Stream,
     ) -> Self {
         let build = ParallelBuildContext::new(topology, ShardingPolicy::Require);
-        let options = LayerwiseLoadOptions::default();
+        let options = residency.load_options();
         match family {
             FixtureFamily::DeepSeekSafetensors => Self::DeepSeek(
                 load_deepseek_v3_tensor_parallel_model(checkpoint, options, build, stream, stream)
@@ -380,6 +414,8 @@ fn tensor_ring_worker() {
     let expected_rank: usize = rank.to_string_lossy().parse().unwrap();
     let checkpoint = PathBuf::from(std::env::var_os(CHECKPOINT_DIR).unwrap());
     let family = FixtureFamily::parse(&std::env::var(FIXTURE_FAMILY).unwrap());
+    let parameter_residency =
+        TensorParameterResidency::parse(&std::env::var(PARAMETER_RESIDENCY).unwrap());
     let layer_count = family.layer_count();
     let vocab_size = family.vocab_size();
     let prompt_cache_root = PathBuf::from(std::env::var_os(PROMPT_CACHE_ROOT).unwrap());
@@ -389,11 +425,29 @@ fn tensor_ring_worker() {
             .unwrap();
     assert_eq!(topology.global_rank, expected_rank);
     let stream = Stream::new_with_device(&topology.device.device().unwrap());
-    let mut model = GeneralizedTensorModel::load(&checkpoint, family, topology, &stream);
+    let mut model =
+        GeneralizedTensorModel::load(&checkpoint, family, parameter_residency, topology, &stream);
     let info = model.parallel_info();
     assert_eq!(info.topology(), topology);
     assert_eq!(info.topology().tensor_parallel_rank, expected_rank);
     assert_eq!(info.topology().tensor_parallel_size, 2);
+    match parameter_residency {
+        TensorParameterResidency::FullyResident => {
+            assert_eq!(
+                info.pinned_device_parameter_bytes(),
+                info.local_parameter_bytes()
+            );
+            assert_eq!(
+                info.maximum_device_parameter_bytes(),
+                info.local_parameter_bytes()
+            );
+        }
+        TensorParameterResidency::LayerwiseHost => {
+            assert!(info.pinned_device_parameter_bytes() < info.local_parameter_bytes());
+            assert!(info.maximum_device_parameter_bytes() <= info.local_parameter_bytes());
+        }
+    }
+    assert!(info.global_parameter_bytes() >= info.local_parameter_bytes());
     if matches!(
         family,
         FixtureFamily::LlamaSafetensors | FixtureFamily::LlamaGguf
@@ -1167,38 +1221,63 @@ fn render_failure(rank: usize, output: &Output) -> String {
 #[test]
 #[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
 fn ring_two_process_tensor_parallel() {
-    run_ring_tensor_parallel(FixtureFamily::LlamaSafetensors);
+    run_ring_tensor_parallel(
+        FixtureFamily::LlamaSafetensors,
+        TensorParameterResidency::LayerwiseHost,
+    );
 }
 
 /// Verifies bounded GGUF reads through the same two-rank generalized engine.
 #[test]
 #[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
 fn ring_two_process_gguf_tensor_parallel() {
-    run_ring_tensor_parallel(FixtureFamily::LlamaGguf);
+    run_ring_tensor_parallel(
+        FixtureFamily::LlamaGguf,
+        TensorParameterResidency::LayerwiseHost,
+    );
 }
 
 /// Verifies Qwen2 GQA, learned Q/K/V biases, mixed attention, and bounded GGUF reads.
 #[test]
 #[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
 fn ring_two_process_qwen2_gguf_tensor_parallel() {
-    run_ring_tensor_parallel(FixtureFamily::Qwen2Gguf);
+    run_ring_tensor_parallel(
+        FixtureFamily::Qwen2Gguf,
+        TensorParameterResidency::LayerwiseHost,
+    );
+}
+
+/// Verifies the generalized engine's fully resident policy with Qwen2 TP math.
+#[test]
+#[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
+fn ring_two_process_qwen2_fully_resident_tensor_parallel() {
+    run_ring_tensor_parallel(
+        FixtureFamily::Qwen2Gguf,
+        TensorParameterResidency::FullyResident,
+    );
 }
 
 /// Verifies block-aligned Q8_0 Qwen2 tensor sharding and bounded GGUF reads.
 #[test]
 #[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
 fn ring_two_process_qwen2_q8_0_gguf_tensor_parallel() {
-    run_ring_tensor_parallel(FixtureFamily::Qwen2Q8Gguf);
+    run_ring_tensor_parallel(
+        FixtureFamily::Qwen2Q8Gguf,
+        TensorParameterResidency::LayerwiseHost,
+    );
 }
 
 /// Verifies DeepSeek MLA paged-prefix persistence across two tensor ranks.
 #[test]
 #[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
 fn ring_two_process_deepseek_tensor_parallel_persistence() {
-    run_ring_tensor_parallel(FixtureFamily::DeepSeekSafetensors);
+    run_ring_tensor_parallel(
+        FixtureFamily::DeepSeekSafetensors,
+        TensorParameterResidency::LayerwiseHost,
+    );
 }
 
-fn run_ring_tensor_parallel(family: FixtureFamily) {
+fn run_ring_tensor_parallel(family: FixtureFamily, parameter_residency: TensorParameterResidency) {
     assert!(distributed::is_available(Backend::Ring));
     let checkpoint = tempfile::tempdir().unwrap();
     let checkpoint_path = match family {
@@ -1261,6 +1340,7 @@ fn run_ring_tensor_parallel(family: FixtureFamily) {
                 .env(WORKER_RANK, rank.to_string())
                 .env(CHECKPOINT_DIR, &checkpoint_path)
                 .env(FIXTURE_FAMILY, family.name())
+                .env(PARAMETER_RESIDENCY, parameter_residency.name())
                 .env(PROMPT_CACHE_ROOT, prompt_cache.path())
                 .env(ZERO_BIAS_CHECKPOINT, &zero_bias_checkpoint_path)
                 .env("MLX_RANK", rank.to_string())

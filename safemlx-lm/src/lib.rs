@@ -54,7 +54,7 @@ pub use runtime::distributed::topology::{
 };
 pub use runtime::execution::layerwise::{
     load_layerwise_model, ArchitectureAdapter, DenseCacheMetrics, DenseDiskStreamReport,
-    DenseExecutionGroupReport, DensePassReport, DenseTierResidencyReport,
+    DenseExecutionGroupReport, DensePassReport, DenseTierResidencyReport, ExecutionResidency,
     LayerExecutionLoadOptions, LayerwiseForwardState, LayerwiseLoadOptions, LayerwiseModel,
     LayerwiseModelMetadata, ParallelModelInfo, SharedWeightStore, WeightResidency,
 };

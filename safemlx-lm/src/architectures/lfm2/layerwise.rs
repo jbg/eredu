@@ -391,7 +391,7 @@ impl CausalLm<Cache> for Lfm2LayerwiseModel {
     }
 }
 
-/// Loads dense or MoE LFM2 through bounded layer residency.
+/// Loads dense or MoE LFM2 through generalized parameter residency.
 pub fn load_lfm2_layerwise_model(
     model_dir: impl AsRef<Path>,
     options: impl Into<LayerExecutionLoadOptions>,
@@ -400,14 +400,7 @@ pub fn load_lfm2_layerwise_model(
 ) -> Result<Lfm2LayerwiseModel, Error> {
     let model_dir = model_dir.as_ref();
     let options = options.into();
-    let residency = match options {
-        LayerExecutionLoadOptions::LayerwiseHost(options) => {
-            WeightResidency::LayerwiseHost(options)
-        }
-        LayerExecutionLoadOptions::DenseDiskStream(options) => {
-            WeightResidency::DenseDiskStream(options)
-        }
-    };
+    let residency = options.weight_residency();
     crate::api::structural::validate_safetensors_load_path(
         crate::api::ModelKind::Lfm2,
         model_dir,
@@ -435,10 +428,7 @@ pub fn load_lfm2_tensor_parallel_model(
 ) -> Result<Lfm2LayerwiseModel, Error> {
     let model_dir = model_dir.as_ref();
     let options = options.into();
-    let residency = match options {
-        LayerExecutionLoadOptions::LayerwiseHost(v) => WeightResidency::LayerwiseHost(v),
-        LayerExecutionLoadOptions::DenseDiskStream(v) => WeightResidency::DenseDiskStream(v),
-    };
+    let residency = options.weight_residency();
     if model_dir
         .extension()
         .is_some_and(|extension| extension.eq_ignore_ascii_case("gguf"))

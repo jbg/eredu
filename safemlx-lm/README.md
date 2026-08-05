@@ -936,6 +936,19 @@ point (or `load_tensor_parallel_safetensors` for Qwen2/3) with a
 parallelism is implemented by the generalized layerwise execution-group
 engine; there is no architecture-dispatching TP model wrapper.
 
+The generalized engine accepts three explicit parameter policies through
+`LayerExecutionLoadOptions`: `FullyResident`, `LayerwiseHost`, and
+`DenseDiskStream`. `FullyResident` uses the same rank-local planner, cache
+layout, collectives, and logits gathering as the bounded policies, but creates
+and populates every locally owned layer module once during loading and pins all
+local parameters on the execution device. It does not retain a second
+architecture-specific resident decoder. `ParallelModelInfo` reports unsharded
+global parameter bytes, total rank-local parameter bytes, and the rank-local
+subset permanently pinned on device, plus the maximum planned local device
+footprint. `LayerwiseModelMetadata` reports the selected policy and its maximum
+layer-device footprint. Current bounded-policy residency remains available
+through `ResidencyReport`.
+
 All-to-sharded (column-parallel) projections take a complete replicated input,
 shard weight/output rows, and keep the output local without communication.
 Sharded-to-all (row-parallel) projections take a final-feature input shard,

@@ -114,6 +114,11 @@ impl LayerwiseDecoder {
         self.execution.parallel_info()
     }
 
+    /// Returns generalized parameter-residency and memory metadata.
+    pub fn residency_metadata(&self) -> &crate::LayerwiseModelMetadata {
+        self.execution.metadata()
+    }
+
     /// Returns this rank's exact prompt-cache state layout.
     pub fn prompt_cache_layer_layout(
         &self,
@@ -406,7 +411,7 @@ impl CausalLm<Vec<Option<ConcatKeyValueCache>>> for LayerwiseDecoder {
     }
 }
 
-/// Loads Qwen2/Qwen2.5 or Qwen3 through the bounded residency engine.
+/// Loads Qwen2/Qwen2.5 or Qwen3 through the generalized residency engine.
 pub fn load_safetensors(
     model_dir: impl AsRef<Path>,
     options: impl Into<LayerExecutionLoadOptions>,
@@ -415,14 +420,7 @@ pub fn load_safetensors(
 ) -> Result<LayerwiseDecoder, Error> {
     let model_dir = model_dir.as_ref();
     let options = options.into();
-    let residency = match options {
-        LayerExecutionLoadOptions::LayerwiseHost(options) => {
-            WeightResidency::LayerwiseHost(options)
-        }
-        LayerExecutionLoadOptions::DenseDiskStream(options) => {
-            WeightResidency::DenseDiskStream(options)
-        }
-    };
+    let residency = options.weight_residency();
     let args = resident::load_config(model_dir)?;
     crate::api::structural::validate_safetensors_load_path(
         args.model_kind(),
@@ -452,14 +450,7 @@ pub fn load_tensor_parallel_model(
 ) -> Result<LayerwiseDecoder, Error> {
     let model_dir = model_dir.as_ref();
     let options = options.into();
-    let residency = match options {
-        LayerExecutionLoadOptions::LayerwiseHost(options) => {
-            WeightResidency::LayerwiseHost(options)
-        }
-        LayerExecutionLoadOptions::DenseDiskStream(options) => {
-            WeightResidency::DenseDiskStream(options)
-        }
-    };
+    let residency = options.weight_residency();
     if model_dir
         .extension()
         .is_some_and(|extension| extension.eq_ignore_ascii_case("gguf"))
@@ -1953,7 +1944,9 @@ mod tests {
                 parallel::{ParallelBuildContext, ShardingPolicy},
                 topology::{DeviceAssignment, ParallelTopology},
             },
-            execution::layerwise::LayerwiseLoadOptions,
+            execution::layerwise::{
+                ExecutionResidency, LayerExecutionLoadOptions, LayerwiseLoadOptions,
+            },
         },
     };
 
@@ -2215,6 +2208,108 @@ mod tests {
             .owned_tensors()
             .iter()
             .any(|name| name == "model.layers.0.mlp.experts.gate_up_proj"));
+    }
+
+    #[test]
+    fn generalized_fully_resident_execution_materializes_layers_once() {
+        let execution = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        let weights = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        let mut fixture = dense_qwen::Model::new(args(false), execution.stream()).unwrap();
+        initialize(&mut fixture, execution.stream());
+        let dir = tempfile::tempdir().unwrap();
+        write_fixture(dir.path(), &fixture, false, execution.stream());
+
+        let mut model = load_safetensors(
+            dir.path(),
+            LayerExecutionLoadOptions::FullyResident,
+            execution.stream(),
+            weights.stream(),
+        )
+        .unwrap();
+        let metadata = model.residency_metadata();
+        assert_eq!(metadata.residency(), ExecutionResidency::FullyResident);
+        assert_eq!(metadata.device_layer_capacity(), metadata.layer_count());
+        assert_eq!(
+            metadata.maximum_device_layer_bytes(),
+            metadata.layer_parameter_bytes()
+        );
+        let before = model.residency_report().unwrap();
+        let layers = before
+            .units()
+            .iter()
+            .filter(|unit| unit.id().as_str().starts_with("dense_qwen.layer."))
+            .collect::<Vec<_>>();
+        assert_eq!(layers.len(), metadata.layer_count());
+        assert!(layers.iter().all(|unit| {
+            unit.policy() == ResidencyPolicy::Pinned
+                && unit.planned_tier() == MemoryTier::Device
+                && unit.device_resident()
+                && !unit.host_resident()
+                && unit.device_pins() == 1
+        }));
+
+        let initial_telemetry = before.offload().clone();
+        let mut cache = model.new_cache();
+        for tokens in [
+            Array::from_slice(&[1u32, 2], &[1, 2]),
+            Array::from_slice(&[3u32], &[1, 1]),
+        ] {
+            model
+                .forward(&tokens, None, &mut cache, execution.stream())
+                .unwrap();
+        }
+        let after = model.residency_report().unwrap();
+        assert_eq!(after.offload(), &initial_telemetry);
+        assert!(after
+            .units()
+            .iter()
+            .all(|unit| { unit.policy() == ResidencyPolicy::Pinned && unit.device_resident() }));
+        model.clear_device_layer_window().unwrap();
+        assert!(model
+            .residency_report()
+            .unwrap()
+            .units()
+            .iter()
+            .all(|unit| unit.device_resident()));
+    }
+
+    #[test]
+    fn generalized_fully_resident_tensor_parallel_reports_local_and_global_memory() {
+        let execution = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        let weights = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        let mut fixture = dense_qwen::Model::new(args(false), execution.stream()).unwrap();
+        initialize(&mut fixture, execution.stream());
+        let dir = tempfile::tempdir().unwrap();
+        write_fixture(dir.path(), &fixture, false, execution.stream());
+
+        let model = load_tensor_parallel_model(
+            dir.path(),
+            LayerExecutionLoadOptions::FullyResident,
+            tensor_parallel_context(),
+            execution.stream(),
+            weights.stream(),
+        )
+        .unwrap();
+        let info = model.parallel_info().unwrap();
+        assert_eq!(
+            info.pinned_device_parameter_bytes(),
+            info.local_parameter_bytes()
+        );
+        assert_eq!(
+            info.maximum_device_parameter_bytes(),
+            info.local_parameter_bytes()
+        );
+        assert!(info.global_parameter_bytes() > info.local_parameter_bytes());
+        let metadata = model.residency_metadata();
+        assert_eq!(metadata.residency(), ExecutionResidency::FullyResident);
+        assert_eq!(metadata.device_layer_capacity(), metadata.layer_count());
+        let report = model.residency_report().unwrap();
+        assert!(report.units().iter().all(|unit| {
+            unit.policy() == ResidencyPolicy::Pinned
+                && unit.planned_tier() == MemoryTier::Device
+                && unit.device_resident()
+                && !unit.host_resident()
+        }));
     }
 
     #[test]

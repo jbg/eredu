@@ -472,7 +472,7 @@ impl CausalLm<Cache> for KimiLinearLayerwiseModel {
     }
 }
 
-/// Loads Kimi Linear through the shared bounded host/disk execution engine.
+/// Loads Kimi Linear through the shared generalized execution engine.
 pub fn load_kimi_linear_layerwise_model(
     model_dir: impl AsRef<Path>,
     options: impl Into<LayerExecutionLoadOptions>,
@@ -481,14 +481,7 @@ pub fn load_kimi_linear_layerwise_model(
 ) -> Result<KimiLinearLayerwiseModel, Error> {
     let model_dir = model_dir.as_ref();
     let options = options.into();
-    let residency = match options {
-        LayerExecutionLoadOptions::LayerwiseHost(options) => {
-            WeightResidency::LayerwiseHost(options)
-        }
-        LayerExecutionLoadOptions::DenseDiskStream(options) => {
-            WeightResidency::DenseDiskStream(options)
-        }
-    };
+    let residency = options.weight_residency();
     crate::api::structural::validate_safetensors_load_path(
         crate::api::ModelKind::KimiLinear,
         model_dir,
@@ -518,10 +511,7 @@ pub fn load_kimi_linear_tensor_parallel_model(
 ) -> Result<KimiLinearLayerwiseModel, Error> {
     let model_dir = model_dir.as_ref();
     let options = options.into();
-    let residency = match options {
-        LayerExecutionLoadOptions::LayerwiseHost(v) => WeightResidency::LayerwiseHost(v),
-        LayerExecutionLoadOptions::DenseDiskStream(v) => WeightResidency::DenseDiskStream(v),
-    };
+    let residency = options.weight_residency();
     if model_dir
         .extension()
         .is_some_and(|extension| extension.eq_ignore_ascii_case("gguf"))

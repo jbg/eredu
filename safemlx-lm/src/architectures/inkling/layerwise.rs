@@ -313,7 +313,7 @@ impl CausalLm<Cache> for InklingLayerwiseModel {
     }
 }
 
-/// Loads Inkling's multimodal model through the generalized host-residency engine.
+/// Loads Inkling's multimodal model through the generalized execution engine.
 pub fn load_inkling_layerwise_model(
     model_dir: impl AsRef<Path>,
     options: impl Into<LayerExecutionLoadOptions>,
@@ -322,14 +322,7 @@ pub fn load_inkling_layerwise_model(
 ) -> Result<InklingLayerwiseModel, Error> {
     let model_dir = model_dir.as_ref();
     let options = options.into();
-    let residency = match options {
-        LayerExecutionLoadOptions::LayerwiseHost(options) => {
-            WeightResidency::LayerwiseHost(options)
-        }
-        LayerExecutionLoadOptions::DenseDiskStream(options) => {
-            WeightResidency::DenseDiskStream(options)
-        }
-    };
+    let residency = options.weight_residency();
     crate::api::structural::validate_safetensors_load_path(
         crate::api::ModelKind::Inkling,
         model_dir,
@@ -358,14 +351,7 @@ pub fn load_inkling_tensor_parallel_layerwise_model(
 ) -> Result<InklingLayerwiseModel, Error> {
     let model_dir = model_dir.as_ref();
     let options = options.into();
-    let residency = match options {
-        LayerExecutionLoadOptions::LayerwiseHost(options) => {
-            WeightResidency::LayerwiseHost(options)
-        }
-        LayerExecutionLoadOptions::DenseDiskStream(options) => {
-            WeightResidency::DenseDiskStream(options)
-        }
-    };
+    let residency = options.weight_residency();
     if model_dir
         .extension()
         .is_some_and(|extension| extension.eq_ignore_ascii_case("gguf"))
@@ -412,14 +398,7 @@ pub(crate) fn load_inkling_gguf_tensor_parallel_model(
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<(InklingLayerwiseModel, Vec<u32>), Error> {
-    let residency = match options {
-        LayerExecutionLoadOptions::LayerwiseHost(options) => {
-            WeightResidency::LayerwiseHost(options)
-        }
-        LayerExecutionLoadOptions::DenseDiskStream(options) => {
-            WeightResidency::DenseDiskStream(options)
-        }
-    };
+    let residency = options.weight_residency();
     crate::api::structural::validate_gguf(
         crate::api::GgufArchitecture::Inkling,
         checkpoint,

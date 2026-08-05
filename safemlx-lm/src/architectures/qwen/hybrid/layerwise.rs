@@ -741,7 +741,7 @@ impl CausalLm<Cache> for QwenHybridLayerwiseModel {
     }
 }
 
-/// Loads a text-only Qwen3-Next model through bounded layer residency.
+/// Loads a text-only Qwen3-Next model through generalized parameter residency.
 pub fn load_qwen3_next_layerwise_model(
     model_dir: impl AsRef<Path>,
     options: impl Into<LayerExecutionLoadOptions>,
@@ -750,14 +750,7 @@ pub fn load_qwen3_next_layerwise_model(
 ) -> Result<QwenHybridLayerwiseModel, Error> {
     let model_dir = model_dir.as_ref();
     let options = options.into();
-    let residency = match options {
-        LayerExecutionLoadOptions::LayerwiseHost(options) => {
-            WeightResidency::LayerwiseHost(options)
-        }
-        LayerExecutionLoadOptions::DenseDiskStream(options) => {
-            WeightResidency::DenseDiskStream(options)
-        }
-    };
+    let residency = options.weight_residency();
     crate::api::structural::validate_safetensors_load_path(
         crate::api::ModelKind::Qwen3Next,
         model_dir,
@@ -787,10 +780,7 @@ pub fn load_qwen3_next_tensor_parallel_model(
 ) -> Result<QwenHybridLayerwiseModel, Error> {
     let model_dir = model_dir.as_ref();
     let options = options.into();
-    let residency = match options {
-        LayerExecutionLoadOptions::LayerwiseHost(v) => WeightResidency::LayerwiseHost(v),
-        LayerExecutionLoadOptions::DenseDiskStream(v) => WeightResidency::DenseDiskStream(v),
-    };
+    let residency = options.weight_residency();
     if model_dir
         .extension()
         .is_some_and(|extension| extension.eq_ignore_ascii_case("gguf"))
@@ -832,7 +822,7 @@ pub fn load_qwen3_next_tensor_parallel_model(
     )
 }
 
-/// Loads a text-only or multimodal dense/MoE Qwen3.5 model through bounded residency.
+/// Loads a text-only or multimodal dense/MoE Qwen3.5 model through generalized residency.
 pub fn load_qwen35_layerwise_model(
     model_dir: impl AsRef<Path>,
     options: impl Into<LayerExecutionLoadOptions>,
@@ -841,14 +831,7 @@ pub fn load_qwen35_layerwise_model(
 ) -> Result<QwenHybridLayerwiseModel, Error> {
     let model_dir = model_dir.as_ref();
     let options = options.into();
-    let residency = match options {
-        LayerExecutionLoadOptions::LayerwiseHost(options) => {
-            WeightResidency::LayerwiseHost(options)
-        }
-        LayerExecutionLoadOptions::DenseDiskStream(options) => {
-            WeightResidency::DenseDiskStream(options)
-        }
-    };
+    let residency = options.weight_residency();
     crate::api::structural::validate_safetensors_load_path(
         crate::api::ModelKind::Qwen35Moe,
         model_dir,
@@ -879,10 +862,7 @@ pub fn load_qwen35_tensor_parallel_model(
 ) -> Result<QwenHybridLayerwiseModel, Error> {
     let model_dir = model_dir.as_ref();
     let options = options.into();
-    let residency = match options {
-        LayerExecutionLoadOptions::LayerwiseHost(v) => WeightResidency::LayerwiseHost(v),
-        LayerExecutionLoadOptions::DenseDiskStream(v) => WeightResidency::DenseDiskStream(v),
-    };
+    let residency = options.weight_residency();
     if model_dir
         .extension()
         .is_some_and(|extension| extension.eq_ignore_ascii_case("gguf"))
@@ -961,14 +941,7 @@ pub(crate) fn load_qwen_hybrid_gguf_tensor_parallel_model(
 ) -> Result<(QwenHybridLayerwiseModel, Vec<u32>, bool), Error> {
     let prepared = resident::prepare_qwen35_gguf_checkpoint(checkpoint, metadata, weights_stream)?;
     let architecture = crate::api::GgufArchitecture::resolve(&prepared.architecture)?;
-    let residency = match options {
-        LayerExecutionLoadOptions::LayerwiseHost(options) => {
-            WeightResidency::LayerwiseHost(options)
-        }
-        LayerExecutionLoadOptions::DenseDiskStream(options) => {
-            WeightResidency::DenseDiskStream(options)
-        }
-    };
+    let residency = options.weight_residency();
     crate::api::structural::validate_gguf(
         architecture,
         checkpoint,

@@ -315,7 +315,7 @@ impl CausalLm<Cache> for Qwen3VlLayerwiseModel {
     }
 }
 
-/// Loads either Qwen3-VL architecture through shared bounded residency.
+/// Loads either Qwen3-VL architecture through shared generalized residency.
 pub fn load_qwen3_vl_layerwise_model(
     model_dir: impl AsRef<Path>,
     options: impl Into<LayerExecutionLoadOptions>,
@@ -325,14 +325,7 @@ pub fn load_qwen3_vl_layerwise_model(
     let model_dir = model_dir.as_ref();
     let options = options.into();
     let args = resident::get_qwen3_vl_model_args(model_dir)?;
-    let residency = match options {
-        LayerExecutionLoadOptions::LayerwiseHost(options) => {
-            WeightResidency::LayerwiseHost(options)
-        }
-        LayerExecutionLoadOptions::DenseDiskStream(options) => {
-            WeightResidency::DenseDiskStream(options)
-        }
-    };
+    let residency = options.weight_residency();
     let kind = if args.text_config.is_moe() {
         crate::api::ModelKind::Qwen3VlMoe
     } else {
@@ -386,14 +379,7 @@ pub fn load_qwen3_vl_tensor_parallel_layerwise_model(
         .map(|(model, _)| model);
     }
     let args = resident::get_qwen3_vl_model_args(model_dir)?;
-    let residency = match options {
-        LayerExecutionLoadOptions::LayerwiseHost(options) => {
-            WeightResidency::LayerwiseHost(options)
-        }
-        LayerExecutionLoadOptions::DenseDiskStream(options) => {
-            WeightResidency::DenseDiskStream(options)
-        }
-    };
+    let residency = options.weight_residency();
     let kind = if args.text_config.is_moe() {
         crate::api::ModelKind::Qwen3VlMoe
     } else {

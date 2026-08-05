@@ -66,14 +66,7 @@ pub(crate) fn validate_gguf_layerwise_source(
         }
     };
     let architecture = crate::api::GgufArchitecture::resolve(architecture_name)?;
-    let residency = match options {
-        LayerExecutionLoadOptions::LayerwiseHost(options) => {
-            WeightResidency::LayerwiseHost(options)
-        }
-        LayerExecutionLoadOptions::DenseDiskStream(options) => {
-            WeightResidency::DenseDiskStream(options)
-        }
-    };
+    let residency = options.weight_residency();
     crate::api::structural::validate_gguf(
         architecture,
         checkpoint,
@@ -160,13 +153,27 @@ impl WeightResidency {
     }
 }
 
-/// Loader controls accepted by the shared layerwise execution engines.
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+/// Loader controls accepted by the shared generalized execution engine.
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
 pub enum LayerExecutionLoadOptions {
+    /// Materialize every rank-local module once and retain it on the execution device.
+    #[default]
+    FullyResident,
     /// Preserve eager host materialization and a bounded device window.
     LayerwiseHost(LayerwiseLoadOptions),
     /// Keep execution units cold on disk and use finite retained tier caches.
     DenseDiskStream(DenseDiskStreamLoadOptions),
+}
+
+/// Static-parameter placement used by the generalized execution engine.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum ExecutionResidency {
+    /// Every module is constructed once and all rank-local parameters remain on device.
+    FullyResident,
+    /// Decoder parameters remain on host behind bounded device windows.
+    LayerwiseHost,
+    /// Decoder parameters are materialized through bounded disk, host, and device caches.
+    DenseDiskStream,
 }
 
 impl From<LayerwiseLoadOptions> for LayerExecutionLoadOptions {
@@ -184,6 +191,7 @@ impl From<DenseDiskStreamLoadOptions> for LayerExecutionLoadOptions {
 impl LayerExecutionLoadOptions {
     pub(crate) fn max_mapped_shards(self) -> usize {
         match self {
+            Self::FullyResident => crate::runtime::checkpoint::store::DEFAULT_MAX_MAPPED_SHARDS,
             Self::LayerwiseHost(options) => options.max_mapped_shards,
             Self::DenseDiskStream(options) => options.max_mapped_shards,
         }
@@ -191,6 +199,7 @@ impl LayerExecutionLoadOptions {
 
     fn strict_loading(self) -> bool {
         match self {
+            Self::FullyResident => true,
             Self::LayerwiseHost(options) => options.strict_loading,
             Self::DenseDiskStream(options) => options.strict_loading,
         }
@@ -198,6 +207,7 @@ impl LayerExecutionLoadOptions {
 
     fn sample_mlx_memory(self) -> bool {
         match self {
+            Self::FullyResident => false,
             Self::LayerwiseHost(options) => options.sample_mlx_memory,
             Self::DenseDiskStream(options) => options.sample_mlx_memory,
         }
@@ -205,13 +215,15 @@ impl LayerExecutionLoadOptions {
 
     fn sample_process_memory(self) -> bool {
         match self {
+            Self::FullyResident => false,
             Self::LayerwiseHost(options) => options.sample_process_memory,
             Self::DenseDiskStream(options) => options.sample_process_memory,
         }
     }
 
-    fn device_depth(self) -> usize {
+    fn device_depth(self, layer_count: usize) -> usize {
         match self {
+            Self::FullyResident => layer_count,
             Self::LayerwiseHost(options) => options.offload.prefetch_depth(),
             Self::DenseDiskStream(options) => options.device_lookahead,
         }
@@ -219,6 +231,7 @@ impl LayerExecutionLoadOptions {
 
     fn offload(self) -> Result<OffloadConfig, Error> {
         match self {
+            Self::FullyResident => Ok(OffloadConfig::default()),
             Self::LayerwiseHost(options) => Ok(options.offload),
             Self::DenseDiskStream(options) => {
                 options.validate()?;
@@ -235,7 +248,27 @@ impl LayerExecutionLoadOptions {
     fn dense(self) -> Option<DenseDiskStreamLoadOptions> {
         match self {
             Self::DenseDiskStream(options) => Some(options),
-            Self::LayerwiseHost(_) => None,
+            Self::FullyResident | Self::LayerwiseHost(_) => None,
+        }
+    }
+
+    pub(crate) const fn weight_residency(self) -> WeightResidency {
+        match self {
+            Self::FullyResident => WeightResidency::FullyResident,
+            Self::LayerwiseHost(options) => WeightResidency::LayerwiseHost(options),
+            Self::DenseDiskStream(options) => WeightResidency::DenseDiskStream(options),
+        }
+    }
+
+    const fn is_fully_resident(self) -> bool {
+        matches!(self, Self::FullyResident)
+    }
+
+    const fn residency(self) -> ExecutionResidency {
+        match self {
+            Self::FullyResident => ExecutionResidency::FullyResident,
+            Self::LayerwiseHost(_) => ExecutionResidency::LayerwiseHost,
+            Self::DenseDiskStream(_) => ExecutionResidency::DenseDiskStream,
         }
     }
 }
@@ -1090,9 +1123,10 @@ pub struct LayerwiseModelMetadata {
     quantization: Option<crate::runtime::checkpoint::quantization::WeightQuantization>,
     layer_count: usize,
     static_device_bytes: u64,
-    host_layer_bytes: u64,
-    maximum_window_bytes: u64,
-    device_layer_window: usize,
+    residency: ExecutionResidency,
+    layer_parameter_bytes: u64,
+    maximum_device_layer_bytes: u64,
+    device_layer_capacity: usize,
 }
 
 /// Architecture-neutral information for a rank-local parallel model.
@@ -1102,6 +1136,9 @@ pub struct ParallelModelInfo {
     model_type: String,
     owned_tensors: Vec<String>,
     local_parameter_bytes: u64,
+    global_parameter_bytes: u64,
+    pinned_device_parameter_bytes: u64,
+    maximum_device_parameter_bytes: u64,
 }
 
 impl ParallelModelInfo {
@@ -1124,6 +1161,21 @@ impl ParallelModelInfo {
     pub const fn local_parameter_bytes(&self) -> u64 {
         self.local_parameter_bytes
     }
+
+    /// Returns the unsharded model parameter bytes represented by this checkpoint.
+    pub const fn global_parameter_bytes(&self) -> u64 {
+        self.global_parameter_bytes
+    }
+
+    /// Returns rank-local parameter bytes permanently pinned on the execution device.
+    pub const fn pinned_device_parameter_bytes(&self) -> u64 {
+        self.pinned_device_parameter_bytes
+    }
+
+    /// Returns the maximum planned rank-local parameter footprint on device.
+    pub const fn maximum_device_parameter_bytes(&self) -> u64 {
+        self.maximum_device_parameter_bytes
+    }
 }
 
 impl LayerwiseModelMetadata {
@@ -1145,20 +1197,21 @@ impl LayerwiseModelMetadata {
     pub const fn static_device_bytes(&self) -> u64 {
         self.static_device_bytes
     }
-    /// Returns the complete decoder-weight byte total.
-    ///
-    /// Layerwise-host models retain this total on the host; dense disk streaming
-    /// reports it as planned layer bytes rather than current residency.
-    pub const fn host_layer_bytes(&self) -> u64 {
-        self.host_layer_bytes
+    /// Returns the selected generalized parameter-residency policy.
+    pub const fn residency(&self) -> ExecutionResidency {
+        self.residency
     }
-    /// Returns the largest permitted consecutive device-window byte total.
-    pub const fn maximum_window_bytes(&self) -> u64 {
-        self.maximum_window_bytes
+    /// Returns the complete rank-local decoder-layer parameter byte total.
+    pub const fn layer_parameter_bytes(&self) -> u64 {
+        self.layer_parameter_bytes
     }
-    /// Returns the configured device decoder-layer bound.
-    pub const fn device_layer_window(&self) -> usize {
-        self.device_layer_window
+    /// Returns the largest possible device-resident decoder-layer byte total.
+    pub const fn maximum_device_layer_bytes(&self) -> u64 {
+        self.maximum_device_layer_bytes
+    }
+    /// Returns the maximum number of decoder layers retained on device.
+    pub const fn device_layer_capacity(&self) -> usize {
+        self.device_layer_capacity
     }
 }
 
@@ -1547,6 +1600,9 @@ pub struct LayerwiseModel<A: ArchitectureAdapter> {
     residency: ResidencyManager,
     groups: Vec<ResidentLayerGroup>,
     static_leases: Vec<ResidentUnitLease>,
+    resident_layers: Option<Vec<Vec<A::Layer>>>,
+    // Keep every populated layer's source arrays protected for the model lifetime.
+    _resident_layer_leases: Vec<Vec<ResidentUnitLease>>,
     dense_stream: Option<DenseStreamController>,
     sample_mlx_memory: bool,
     sample_process_memory: bool,
@@ -1554,6 +1610,24 @@ pub struct LayerwiseModel<A: ArchitectureAdapter> {
     parallel_layout: Option<crate::runtime::distributed::parallel::LocalModelLayout>,
     parallel_topology: Option<crate::runtime::distributed::topology::ParallelTopology>,
     parallel_info: Option<ParallelModelInfo>,
+}
+
+enum PreparedExecutionLayer<'a, L> {
+    Resident(&'a mut L),
+    Leased {
+        layer: L,
+        _host: Option<ResidentUnitLease>,
+        _device: ResidentUnitLease,
+    },
+}
+
+impl<L> PreparedExecutionLayer<'_, L> {
+    fn layer_mut(&mut self) -> &mut L {
+        match self {
+            Self::Resident(layer) => layer,
+            Self::Leased { layer, .. } => layer,
+        }
+    }
 }
 
 impl<A: ArchitectureAdapter> LayerwiseModel<A> {
@@ -1589,9 +1663,10 @@ impl<A: ArchitectureAdapter> LayerwiseModel<A> {
             quantization: adapter.quantization(),
             layer_count,
             static_device_bytes: 0,
-            host_layer_bytes: 0,
-            maximum_window_bytes: 0,
-            device_layer_window: 0,
+            residency: ExecutionResidency::LayerwiseHost,
+            layer_parameter_bytes: 0,
+            maximum_device_layer_bytes: 0,
+            device_layer_capacity: 0,
         };
         Ok(Self {
             adapter,
@@ -1599,6 +1674,8 @@ impl<A: ArchitectureAdapter> LayerwiseModel<A> {
             residency,
             groups,
             static_leases,
+            resident_layers: None,
+            _resident_layer_leases: Vec::new(),
             dense_stream: None,
             sample_mlx_memory: false,
             sample_process_memory: false,
@@ -1607,6 +1684,33 @@ impl<A: ArchitectureAdapter> LayerwiseModel<A> {
             parallel_topology: None,
             parallel_info: None,
         })
+    }
+
+    fn materialize_resident_layers(&mut self, stream: &Stream) -> Result<(), Error> {
+        let mut resident_layers = Vec::with_capacity(self.groups.len());
+        let mut resident_layer_leases = Vec::with_capacity(self.groups.len());
+        for (group_index, group) in self.groups.iter().enumerate() {
+            let mut layers = Vec::with_capacity(group.units().len());
+            let mut leases = Vec::with_capacity(group.units().len());
+            for (index, id) in group.units().iter().enumerate() {
+                let mut layer = if let Some(layout) = &self.parallel_layout {
+                    self.adapter
+                        .new_parallel_layer(group_index, index, layout, stream)?
+                } else {
+                    self.adapter.new_layer(group_index, index, stream)?
+                };
+                let lease = self.residency.acquire(id, MemoryTier::Device)?;
+                self.adapter
+                    .populate_layer(group_index, index, &mut layer, &lease)?;
+                layers.push(layer);
+                leases.push(lease);
+            }
+            resident_layers.push(layers);
+            resident_layer_leases.push(leases);
+        }
+        self.resident_layers = Some(resident_layers);
+        self._resident_layer_leases = resident_layer_leases;
+        Ok(())
     }
 
     /// Enables optional allocator and process-memory samples after forward.
@@ -1859,27 +1963,39 @@ impl<A: ArchitectureAdapter> LayerwiseModel<A> {
                 for index in 0..resident_group.units().len() {
                     let id = &resident_group.units()[index];
                     {
-                        let (_host_lease, lease) = if let Some(streamer) = &self.dense_stream {
-                            streamer.prepare(
-                                &self.residency,
-                                resident_group.id(),
-                                resident_group.units(),
-                                index,
-                                prefill,
-                            )?
+                        let mut prepared = if let Some(layers) = &mut self.resident_layers {
+                            PreparedExecutionLayer::Resident(&mut layers[group_index][index])
                         } else {
-                            resident_group.prepare(&self.residency, index)?;
-                            (None, self.residency.acquire(id, MemoryTier::Device)?)
-                        };
-                        let mut layer =
+                            let (host, lease) = if let Some(streamer) = &self.dense_stream {
+                                streamer.prepare(
+                                    &self.residency,
+                                    resident_group.id(),
+                                    resident_group.units(),
+                                    index,
+                                    prefill,
+                                )?
+                            } else {
+                                resident_group.prepare(&self.residency, index)?;
+                                (None, self.residency.acquire(id, MemoryTier::Device)?)
+                            };
+                            let mut layer = self.adapter.new_parallel_layer(
+                                group_index,
+                                index,
+                                layout,
+                                stream,
+                            )?;
                             self.adapter
-                                .new_parallel_layer(group_index, index, layout, stream)?;
-                        self.adapter
-                            .populate_layer(group_index, index, &mut layer, &lease)?;
+                                .populate_layer(group_index, index, &mut layer, &lease)?;
+                            PreparedExecutionLayer::Leased {
+                                layer,
+                                _host: host,
+                                _device: lease,
+                            }
+                        };
                         hidden = self.adapter.forward_layer_with_execution(
                             group_index,
                             index,
-                            &mut layer,
+                            prepared.layer_mut(),
                             &hidden,
                             cache,
                             &mut context,
@@ -1898,7 +2014,7 @@ impl<A: ArchitectureAdapter> LayerwiseModel<A> {
                         stream.synchronize()?;
                         hook_result?;
                     }
-                    if self.dense_stream.is_none() {
+                    if self.dense_stream.is_none() && self.resident_layers.is_none() {
                         let end = index
                             .saturating_add(resident_group.depth())
                             .min(resident_group.units().len());
@@ -2068,26 +2184,35 @@ impl<A: ArchitectureAdapter> LayerwiseModel<A> {
                 for index in 0..group.units().len() {
                     let id = &group.units()[index];
                     {
-                        let (_host_lease, lease) = if let Some(streamer) = &self.dense_stream {
-                            streamer.prepare(
-                                &self.residency,
-                                group.id(),
-                                group.units(),
-                                index,
-                                prefill,
-                            )?
+                        let mut prepared = if let Some(layers) = &mut self.resident_layers {
+                            PreparedExecutionLayer::Resident(&mut layers[group_index][index])
                         } else {
-                            group.prepare(&self.residency, index)?;
-                            (None, self.residency.acquire(id, MemoryTier::Device)?)
+                            let (host, lease) = if let Some(streamer) = &self.dense_stream {
+                                streamer.prepare(
+                                    &self.residency,
+                                    group.id(),
+                                    group.units(),
+                                    index,
+                                    prefill,
+                                )?
+                            } else {
+                                group.prepare(&self.residency, index)?;
+                                (None, self.residency.acquire(id, MemoryTier::Device)?)
+                            };
+                            let mut layer = self.adapter.new_layer(group_index, index, stream)?;
+                            self.adapter
+                                .populate_layer(group_index, index, &mut layer, &lease)?;
+                            PreparedExecutionLayer::Leased {
+                                layer,
+                                _host: host,
+                                _device: lease,
+                            }
                         };
-                        let mut layer = self.adapter.new_layer(group_index, index, stream)?;
-                        self.adapter
-                            .populate_layer(group_index, index, &mut layer, &lease)?;
                         hidden = executor(
                             &mut self.adapter,
                             group_index,
                             index,
-                            &mut layer,
+                            prepared.layer_mut(),
                             &hidden,
                             cache,
                             &mut context,
@@ -2106,7 +2231,7 @@ impl<A: ArchitectureAdapter> LayerwiseModel<A> {
                         stream.synchronize()?;
                         hook_result?;
                     }
-                    if self.dense_stream.is_none() {
+                    if self.dense_stream.is_none() && self.resident_layers.is_none() {
                         let end = index.saturating_add(group.depth()).min(group.units().len());
                         group.trim_to(&self.residency, &group.units()[index..end])?;
                     }
@@ -2151,11 +2276,17 @@ impl<A: ArchitectureAdapter> LayerwiseModel<A> {
             .iter()
             .find(|group| group.id() == id)
             .ok_or_else(|| LayerwiseModelError::UnknownExecutionGroup(id.to_string()))?;
+        if self.resident_layers.is_some() {
+            return Ok(());
+        }
         Ok(group.clear(&self.residency)?)
     }
 
     /// Clears every temporary device execution group.
     pub fn clear_all_device_groups(&self) -> Result<(), Error> {
+        if self.resident_layers.is_some() {
+            return Ok(());
+        }
         for group in &self.groups {
             group.clear(&self.residency)?;
         }
@@ -2198,7 +2329,7 @@ where
     O: Into<LayerExecutionLoadOptions>,
 {
     let options = options.into();
-    let depth = options.device_depth();
+    let fully_resident = options.is_fully_resident();
     let dense = options.dense();
     let offload = options.offload()?;
     let mut definitions = Vec::new();
@@ -2221,12 +2352,15 @@ where
     }
 
     let mut groups = Vec::with_capacity(adapter.execution_group_count());
-    let mut host_layer_bytes = 0u64;
+    let mut layer_parameter_bytes = 0u64;
     let mut device_window_bytes = 0u64;
     let mut host_window_bytes = 0u64;
     let mut planned_layer_count = 0usize;
+    let mut maximum_group_depth = 0usize;
     for group_index in 0..adapter.execution_group_count() {
         let layer_count = adapter.layer_count(group_index)?;
+        let depth = options.device_depth(layer_count);
+        maximum_group_depth = maximum_group_depth.max(depth);
         if depth > layer_count {
             return Err(LayerwiseModelError::InvalidLayerWindow { depth, layer_count }.into());
         }
@@ -2245,7 +2379,7 @@ where
             let layer = adapter.new_layer(group_index, index, stream)?;
             let bindings = adapter.layer_bindings(group_index, index, &layer, store.as_ref())?;
             let bytes = binding_bytes(&bindings)?;
-            host_layer_bytes = host_layer_bytes.checked_add(bytes).ok_or(
+            layer_parameter_bytes = layer_parameter_bytes.checked_add(bytes).ok_or(
                 LayerwiseModelError::ArithmeticOverflow {
                     context: "host execution-unit byte total",
                 },
@@ -2260,12 +2394,16 @@ where
             specs.push(OffloadUnitSpec::new(
                 id.clone(),
                 bytes,
-                if dense.is_some() {
+                if fully_resident {
+                    ResidencyPolicy::Pinned
+                } else if dense.is_some() {
                     ResidencyPolicy::Cacheable
                 } else {
                     ResidencyPolicy::Windowed
                 },
-                if dense.is_some() {
+                if fully_resident {
+                    MemoryTier::Device
+                } else if dense.is_some() {
                     MemoryTier::Disk
                 } else {
                     MemoryTier::Host
@@ -2307,12 +2445,19 @@ where
     validate_unused(store.as_ref(), &consumed, options.strict_loading(), |key| {
         adapter.ignores_checkpoint_key(key)
     })?;
-    if dense.is_some() {
+    if fully_resident {
+        validate_host_budget(offload, 0)?;
+    } else if dense.is_some() {
         validate_host_budget(offload, host_window_bytes)?;
     } else {
-        validate_host_budget(offload, host_layer_bytes)?;
+        validate_host_budget(offload, layer_parameter_bytes)?;
     }
-    validate_device_budget(offload, static_device_bytes, device_window_bytes, depth)?;
+    validate_device_budget(
+        offload,
+        static_device_bytes,
+        device_window_bytes,
+        maximum_group_depth,
+    )?;
 
     let plan = OffloadPlan::new(offload, specs)?;
     let residency = ResidencyManager::new_shared(
@@ -2331,14 +2476,22 @@ where
 
     let mut model = LayerwiseModel::new(adapter, store, residency, groups, static_leases)?
         .with_memory_sampling(options.sample_mlx_memory(), options.sample_process_memory());
+    if fully_resident {
+        model.materialize_resident_layers(stream)?;
+    }
     model.metadata = LayerwiseModelMetadata {
         model_type: model.adapter.model_type().into(),
         quantization: model.adapter.quantization(),
         layer_count: planned_layer_count,
         static_device_bytes,
-        host_layer_bytes,
-        maximum_window_bytes: device_window_bytes,
-        device_layer_window: depth,
+        residency: options.residency(),
+        layer_parameter_bytes,
+        maximum_device_layer_bytes: device_window_bytes,
+        device_layer_capacity: if fully_resident {
+            planned_layer_count
+        } else {
+            maximum_group_depth
+        },
     };
     if let Some(dense) = dense {
         let execution_groups = model
@@ -2350,7 +2503,7 @@ where
             &model.residency,
             dense,
             planned_layer_count,
-            host_layer_bytes,
+            layer_parameter_bytes,
             static_device_bytes,
             execution_groups,
         )?);
@@ -2371,7 +2524,7 @@ where
     O: Into<LayerExecutionLoadOptions>,
 {
     let options = options.into();
-    let depth = options.device_depth();
+    let fully_resident = options.is_fully_resident();
     let dense = options.dense();
     let offload = options.offload()?;
     let mut planner = build.planner();
@@ -2391,8 +2544,14 @@ where
     let mut specs = Vec::new();
     let mut consumed = BTreeSet::new();
     let mut static_device_bytes = 0u64;
+    let mut global_parameter_bytes = 0u64;
     let mut static_ids = Vec::new();
     for unit in static_units {
+        global_parameter_bytes = global_parameter_bytes
+            .checked_add(binding_bytes(&unit.bindings)?)
+            .ok_or(LayerwiseModelError::ArithmeticOverflow {
+                context: "global static parameter byte total",
+            })?;
         let bindings = shard_layer_bindings(unit.bindings, "", store.as_ref(), &layout)?;
         static_ids.push(unit.id.clone());
         add_unit(
@@ -2408,12 +2567,15 @@ where
     }
 
     let mut groups = Vec::with_capacity(adapter.execution_group_count());
-    let mut host_layer_bytes = 0u64;
+    let mut layer_parameter_bytes = 0u64;
     let mut device_window_bytes = 0u64;
     let mut host_window_bytes = 0u64;
     let mut planned_layer_count = 0usize;
+    let mut maximum_group_depth = 0usize;
     for group_index in 0..adapter.execution_group_count() {
         let layer_count = adapter.layer_count(group_index)?;
+        let depth = options.device_depth(layer_count);
+        maximum_group_depth = maximum_group_depth.max(depth);
         if depth > layer_count {
             return Err(LayerwiseModelError::InvalidLayerWindow { depth, layer_count }.into());
         }
@@ -2429,6 +2591,14 @@ where
         let mut layer_ids = Vec::with_capacity(layer_count);
         let mut layer_bytes = Vec::with_capacity(layer_count);
         for index in 0..layer_count {
+            let global_layer = adapter.new_layer(group_index, index, stream)?;
+            let global_bindings =
+                adapter.layer_bindings(group_index, index, &global_layer, store.as_ref())?;
+            global_parameter_bytes = global_parameter_bytes
+                .checked_add(binding_bytes(&global_bindings)?)
+                .ok_or(LayerwiseModelError::ArithmeticOverflow {
+                    context: "global TP execution-unit byte total",
+                })?;
             let layer = adapter.new_parallel_layer(group_index, index, &layout, stream)?;
             let bindings = adapter.parallel_layer_bindings(
                 group_index,
@@ -2439,7 +2609,7 @@ where
                 stream,
             )?;
             let bytes = binding_bytes(&bindings)?;
-            host_layer_bytes = host_layer_bytes.checked_add(bytes).ok_or(
+            layer_parameter_bytes = layer_parameter_bytes.checked_add(bytes).ok_or(
                 LayerwiseModelError::ArithmeticOverflow {
                     context: "host TP execution-unit byte total",
                 },
@@ -2454,12 +2624,16 @@ where
             specs.push(OffloadUnitSpec::new(
                 id.clone(),
                 bytes,
-                if dense.is_some() {
+                if fully_resident {
+                    ResidencyPolicy::Pinned
+                } else if dense.is_some() {
                     ResidencyPolicy::Cacheable
                 } else {
                     ResidencyPolicy::Windowed
                 },
-                if dense.is_some() {
+                if fully_resident {
+                    MemoryTier::Device
+                } else if dense.is_some() {
                     MemoryTier::Disk
                 } else {
                     MemoryTier::Host
@@ -2499,12 +2673,19 @@ where
     validate_unused(store.as_ref(), &consumed, options.strict_loading(), |key| {
         adapter.ignores_checkpoint_key(key)
     })?;
-    if dense.is_some() {
+    if fully_resident {
+        validate_host_budget(offload, 0)?;
+    } else if dense.is_some() {
         validate_host_budget(offload, host_window_bytes)?;
     } else {
-        validate_host_budget(offload, host_layer_bytes)?;
+        validate_host_budget(offload, layer_parameter_bytes)?;
     }
-    validate_device_budget(offload, static_device_bytes, device_window_bytes, depth)?;
+    validate_device_budget(
+        offload,
+        static_device_bytes,
+        device_window_bytes,
+        maximum_group_depth,
+    )?;
     let plan = OffloadPlan::new(offload, specs)?;
     let residency = ResidencyManager::new_shared(
         Arc::clone(&store),
@@ -2523,20 +2704,28 @@ where
         .with_memory_sampling(options.sample_mlx_memory(), options.sample_process_memory());
     model.parallel_layout = Some(layout);
     model.parallel_topology = Some(build.topology());
+    if fully_resident {
+        model.materialize_resident_layers(stream)?;
+    }
     model.metadata = LayerwiseModelMetadata {
         model_type: model.adapter.model_type().into(),
         quantization: model.adapter.quantization(),
         layer_count: planned_layer_count,
         static_device_bytes,
-        host_layer_bytes,
-        maximum_window_bytes: device_window_bytes,
-        device_layer_window: depth,
-    };
-    let local_parameter_bytes = static_device_bytes.checked_add(host_layer_bytes).ok_or(
-        LayerwiseModelError::ArithmeticOverflow {
-            context: "rank-local parallel parameter byte total",
+        residency: options.residency(),
+        layer_parameter_bytes,
+        maximum_device_layer_bytes: device_window_bytes,
+        device_layer_capacity: if fully_resident {
+            planned_layer_count
+        } else {
+            maximum_group_depth
         },
-    )?;
+    };
+    let local_parameter_bytes = static_device_bytes
+        .checked_add(layer_parameter_bytes)
+        .ok_or(LayerwiseModelError::ArithmeticOverflow {
+            context: "rank-local parallel parameter byte total",
+        })?;
     model.parallel_info = Some(ParallelModelInfo {
         topology: build.topology(),
         model_type: model.adapter.model_type().into(),
@@ -2548,6 +2737,17 @@ where
             .map(|(target, _)| target.to_string())
             .collect(),
         local_parameter_bytes,
+        global_parameter_bytes,
+        pinned_device_parameter_bytes: if fully_resident {
+            local_parameter_bytes
+        } else {
+            static_device_bytes
+        },
+        maximum_device_parameter_bytes: static_device_bytes
+            .checked_add(device_window_bytes)
+            .ok_or(LayerwiseModelError::ArithmeticOverflow {
+                context: "maximum rank-local device parameter byte total",
+            })?,
     });
     if let Some(dense) = dense {
         let execution_groups = model
@@ -2559,7 +2759,7 @@ where
             &model.residency,
             dense,
             planned_layer_count,
-            host_layer_bytes,
+            layer_parameter_bytes,
             static_device_bytes,
             execution_groups,
         )?);
@@ -3380,9 +3580,9 @@ mod tests {
         let metadata = sizing.layerwise_metadata().unwrap();
         let device_budget = metadata
             .static_device_bytes()
-            .checked_add(metadata.maximum_window_bytes())
+            .checked_add(metadata.maximum_device_layer_bytes())
             .unwrap();
-        let host_budget = metadata.maximum_window_bytes();
+        let host_budget = metadata.maximum_device_layer_bytes();
         drop(sizing);
 
         let options = DenseDiskStreamLoadOptions::new(device_budget, host_budget, 1, 1, 1).unwrap();
@@ -3554,9 +3754,9 @@ mod tests {
         let metadata = sizing.layerwise_metadata().unwrap();
         let device_budget = metadata
             .static_device_bytes()
-            .checked_add(metadata.maximum_window_bytes())
+            .checked_add(metadata.maximum_device_layer_bytes())
             .unwrap();
-        let host_budget = metadata.maximum_window_bytes();
+        let host_budget = metadata.maximum_device_layer_bytes();
         drop(sizing);
 
         let options = DenseDiskStreamLoadOptions::new(device_budget, host_budget, 1, 1, 1).unwrap();

@@ -167,12 +167,12 @@ fn main() -> anyhow::Result<()> {
         metadata.static_device_bytes()
     );
     println!(
-        "host-resident decoder bytes: {}",
-        metadata.host_layer_bytes()
+        "decoder-layer parameter bytes: {}",
+        metadata.layer_parameter_bytes()
     );
     println!(
         "configured/observed device-layer window: {}/{}",
-        metadata.device_layer_window(),
+        metadata.device_layer_capacity(),
         observed_window
     );
     println!(

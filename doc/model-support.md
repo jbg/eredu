@@ -291,6 +291,23 @@ load-time affine/MXFP4 quantization. Qwen2 applies the checkpoint-required Q/K/V
 biases and layer-selective sliding attention exactly. Qwen2-VL, Qwen2.5-VL,
 Qwen2 MoE, and older custom-code Qwen model types are rejected.
 
+Generalized tensor-parallel family loaders support all three parameter
+residency policies through one execution model. `FullyResident` plans the same
+rank-local tensors as `LayerwiseHost` and `DenseDiskStream`, then constructs
+and populates each local layer once and pins it on the execution device. The
+bounded policies continue to construct transient execution modules under
+their host/device or disk/host/device windows. Reports distinguish global
+unsharded parameter bytes, total local parameter bytes, and currently resident
+local device bytes through the residency report; parallel model information
+also exposes permanently pinned and maximum planned device bytes. These
+parameter totals exclude KV/recurrent caches,
+activations, temporary collective buffers, and allocator caches.
+
+The residency-reporting API is intentionally canonical rather than retaining
+host-only terminology: `LayerwiseModelMetadata` now exposes `residency`,
+`layer_parameter_bytes`, `maximum_device_layer_bytes`, and
+`device_layer_capacity`. The former host/window-named accessors were removed.
+
 Llama and Mistral now use the same architecture-neutral
 `LayerSchedule<AttentionPolicy>` as their sole normalized attention geometry.
 Hugging Face absence or `null` produces an all-full schedule; a positive

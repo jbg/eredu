@@ -44,9 +44,9 @@ use crate::{
     runtime::execution::layerwise::{
         load_layerwise_model, load_safetensors_layerwise_model,
         load_tensor_parallel_layerwise_model, open_safetensors_weight_store, ArchitectureAdapter,
-        DenseDiskStreamReport, LayerExecutionLoadOptions, LayerwiseForwardState,
-        LayerwiseLoadOptions, LayerwiseModel, LayerwiseModelMetadata, StaticUnitBindings,
-        WeightResidency,
+        DenseDiskStreamReport, ExecutionResidency, LayerExecutionLoadOptions,
+        LayerwiseForwardState, LayerwiseLoadOptions, LayerwiseModel, LayerwiseModelMetadata,
+        StaticUnitBindings, WeightResidency,
     },
     runtime::residency::manager::{ResidencyReport, ResidentUnitLease},
 };
@@ -169,7 +169,7 @@ impl LlamaCache {
 
 enum LlamaExecution {
     FullyResident(Box<resident::ResidentModel>),
-    LayerwiseHost(Box<LayerwiseModel<LlamaLayerwiseAdapter>>),
+    Generalized(Box<LayerwiseModel<LlamaLayerwiseAdapter>>),
 }
 
 /// Llama/Mistral causal LM whose execution engine follows its residency policy.
@@ -182,7 +182,7 @@ impl LlamaModel {
     pub fn args(&self) -> &ModelArgs {
         match &self.execution {
             LlamaExecution::FullyResident(model) => &model.args,
-            LlamaExecution::LayerwiseHost(model) => model.adapter().args(),
+            LlamaExecution::Generalized(model) => model.adapter().args(),
         }
     }
 
@@ -196,7 +196,7 @@ impl LlamaModel {
         &self,
     ) -> Result<crate::LayerSchedule<crate::LayerCachePolicy>, Error> {
         match &self.execution {
-            LlamaExecution::LayerwiseHost(model) => model.prompt_cache_layer_layout(),
+            LlamaExecution::Generalized(model) => model.prompt_cache_layer_layout(),
             LlamaExecution::FullyResident(_) => {
                 let args = self.args();
                 PromptCacheModelIdentity::key_value_layouts(
@@ -223,7 +223,7 @@ impl LlamaModel {
     pub fn layerwise_metadata(&self) -> Option<&LayerwiseModelMetadata> {
         match &self.execution {
             LlamaExecution::FullyResident(_) => None,
-            LlamaExecution::LayerwiseHost(model) => Some(model.metadata()),
+            LlamaExecution::Generalized(model) => Some(model.metadata()),
         }
     }
 
@@ -233,7 +233,7 @@ impl LlamaModel {
     ) -> Option<&crate::runtime::execution::layerwise::ParallelModelInfo> {
         match &self.execution {
             LlamaExecution::FullyResident(_) => None,
-            LlamaExecution::LayerwiseHost(model) => model.parallel_info(),
+            LlamaExecution::Generalized(model) => model.parallel_info(),
         }
     }
 
@@ -252,7 +252,7 @@ impl LlamaModel {
                             .ok_or("Llama parameter byte total overflowed u64")
                     }),
             ),
-            LlamaExecution::LayerwiseHost(_) => None,
+            LlamaExecution::Generalized(_) => None,
         }
     }
 
@@ -260,7 +260,7 @@ impl LlamaModel {
     pub fn residency_report(&self) -> Result<Option<ResidencyReport>, Error> {
         match &self.execution {
             LlamaExecution::FullyResident(_) => Ok(None),
-            LlamaExecution::LayerwiseHost(model) => Ok(Some(model.residency_report()?)),
+            LlamaExecution::Generalized(model) => Ok(Some(model.residency_report()?)),
         }
     }
 
@@ -268,7 +268,7 @@ impl LlamaModel {
     pub fn dense_stream_report(&self) -> Result<Option<DenseDiskStreamReport>, Error> {
         match &self.execution {
             LlamaExecution::FullyResident(_) => Ok(None),
-            LlamaExecution::LayerwiseHost(model) => model.dense_stream_report(),
+            LlamaExecution::Generalized(model) => model.dense_stream_report(),
         }
     }
 
@@ -276,7 +276,7 @@ impl LlamaModel {
     pub fn checkpoint_store(&self) -> Option<&(dyn WeightStore + Send + Sync)> {
         match &self.execution {
             LlamaExecution::FullyResident(_) => None,
-            LlamaExecution::LayerwiseHost(model) => Some(model.checkpoint_store()),
+            LlamaExecution::Generalized(model) => Some(model.checkpoint_store()),
         }
     }
 
@@ -289,7 +289,7 @@ impl LlamaModel {
     pub fn layerwise_static_lease_count(&self) -> Option<usize> {
         match &self.execution {
             LlamaExecution::FullyResident(_) => None,
-            LlamaExecution::LayerwiseHost(model) => Some(model.static_lease_count()),
+            LlamaExecution::Generalized(model) => Some(model.static_lease_count()),
         }
     }
 
@@ -324,7 +324,7 @@ impl LlamaModel {
                 None,
                 match &self.execution {
                     LlamaExecution::FullyResident(_) => None,
-                    LlamaExecution::LayerwiseHost(model) => model.prompt_cache_rank_identity(),
+                    LlamaExecution::Generalized(model) => model.prompt_cache_rank_identity(),
                 },
             ),
         }
@@ -339,7 +339,7 @@ impl LlamaModel {
         options: PagedCacheOptions,
         stream: &Stream,
     ) -> Result<(LlamaCache, PromptCacheManifest), Error> {
-        if let LlamaExecution::LayerwiseHost(model) = &self.execution {
+        if let LlamaExecution::Generalized(model) = &self.execution {
             return model.load_prompt_cache(directory, expected, prefix_token_ids, options, stream);
         }
         let args = self.args();
@@ -387,7 +387,7 @@ impl LlamaModel {
         stream: &Stream,
     ) -> Result<PromptCacheManifest, Error> {
         match &self.execution {
-            LlamaExecution::LayerwiseHost(model) => model.save_prompt_cache(
+            LlamaExecution::Generalized(model) => model.save_prompt_cache(
                 cache,
                 destination,
                 descriptor,
@@ -463,7 +463,7 @@ impl LlamaModel {
                     stream,
                 )?),
             },
-            LlamaExecution::LayerwiseHost(model) => {
+            LlamaExecution::Generalized(model) => {
                 model.forward(LlamaAdapterInput { inputs, mask: None }, cache, stream)
             }
         }
@@ -479,7 +479,7 @@ impl LlamaModel {
     ) -> Result<Array, Error> {
         self.validate_cache(cache)?;
         match &mut self.execution {
-            LlamaExecution::LayerwiseHost(model) => model.forward_tensor_parallel(
+            LlamaExecution::Generalized(model) => model.forward_tensor_parallel(
                 LlamaAdapterInput { inputs, mask: None },
                 cache,
                 group,
@@ -520,7 +520,10 @@ impl LlamaModel {
     pub fn clear_device_layer_window(&self) -> Result<bool, Error> {
         match &self.execution {
             LlamaExecution::FullyResident(_) => Ok(false),
-            LlamaExecution::LayerwiseHost(model) => {
+            LlamaExecution::Generalized(model) => {
+                if model.metadata().residency() == ExecutionResidency::FullyResident {
+                    return Ok(false);
+                }
                 model.clear_device_group("text_decoder")?;
                 Ok(true)
             }
@@ -621,7 +624,7 @@ pub fn load_llama_model(
         WeightResidency::LayerwiseHost(options) => {
             let args = resident::get_llama_model_args(model_dir)?;
             let adapter = LlamaLayerwiseAdapter::new(args, stream)?;
-            LlamaExecution::LayerwiseHost(Box::new(load_safetensors_layerwise_model(
+            LlamaExecution::Generalized(Box::new(load_safetensors_layerwise_model(
                 model_dir,
                 adapter,
                 options,
@@ -632,7 +635,7 @@ pub fn load_llama_model(
         WeightResidency::DenseDiskStream(options) => {
             let args = resident::get_llama_model_args(model_dir)?;
             let adapter = LlamaLayerwiseAdapter::new(args, stream)?;
-            LlamaExecution::LayerwiseHost(Box::new(load_safetensors_layerwise_model(
+            LlamaExecution::Generalized(Box::new(load_safetensors_layerwise_model(
                 model_dir,
                 adapter,
                 options,
@@ -660,14 +663,7 @@ pub fn load_llama_tensor_parallel_model(
 ) -> Result<LlamaModel, Error> {
     let model_dir = model_dir.as_ref();
     let options = options.into();
-    let residency = match options {
-        LayerExecutionLoadOptions::LayerwiseHost(options) => {
-            WeightResidency::LayerwiseHost(options)
-        }
-        LayerExecutionLoadOptions::DenseDiskStream(options) => {
-            WeightResidency::DenseDiskStream(options)
-        }
-    };
+    let residency = options.weight_residency();
     if model_dir
         .extension()
         .is_some_and(|extension| extension.eq_ignore_ascii_case("gguf"))
@@ -692,7 +688,7 @@ pub fn load_llama_tensor_parallel_model(
     let args = resident::get_llama_model_args(model_dir)?;
     let adapter = LlamaLayerwiseAdapter::new(args, stream)?;
     Ok(LlamaModel {
-        execution: LlamaExecution::LayerwiseHost(Box::new(load_tensor_parallel_layerwise_model(
+        execution: LlamaExecution::Generalized(Box::new(load_tensor_parallel_layerwise_model(
             open_safetensors_weight_store(model_dir, options.max_mapped_shards())?,
             adapter,
             options,
@@ -733,7 +729,7 @@ pub(crate) fn load_llama_gguf_tensor_parallel_model(
     )?;
     Ok((
         LlamaModel {
-            execution: LlamaExecution::LayerwiseHost(Box::new(execution)),
+            execution: LlamaExecution::Generalized(Box::new(execution)),
         },
         prepared.eos_token_ids,
     ))
@@ -757,10 +753,10 @@ pub(crate) fn load_llama_gguf_model(
         )?);
     let adapter = LlamaLayerwiseAdapter::new(prepared.args, stream)?;
     let execution = match residency {
-        WeightResidency::LayerwiseHost(options) => LlamaExecution::LayerwiseHost(Box::new(
+        WeightResidency::LayerwiseHost(options) => LlamaExecution::Generalized(Box::new(
             load_layerwise_model(store, adapter, options, stream, weights_stream)?,
         )),
-        WeightResidency::DenseDiskStream(options) => LlamaExecution::LayerwiseHost(Box::new(
+        WeightResidency::DenseDiskStream(options) => LlamaExecution::Generalized(Box::new(
             load_layerwise_model(store, adapter, options, stream, weights_stream)?,
         )),
         WeightResidency::SparseExpertCache(_)

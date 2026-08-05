@@ -544,14 +544,7 @@ fn load_model_for_kind(
                 crate::architectures::llama::layerwise::load_llama_model(
                     model_dir,
                     crate::architectures::llama::layerwise::LlamaLoadOptions {
-                        weight_residency: match layerwise {
-                            LayerExecutionLoadOptions::LayerwiseHost(options) => {
-                                WeightResidency::LayerwiseHost(options)
-                            }
-                            LayerExecutionLoadOptions::DenseDiskStream(options) => {
-                                WeightResidency::DenseDiskStream(options)
-                            }
-                        },
+                        weight_residency: layerwise.weight_residency(),
                     },
                     stream,
                     weights_stream,
