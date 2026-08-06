@@ -20,7 +20,10 @@ use crate::{
             project_logits_maybe_quantized, unloaded_maybe_quantized_embedding,
             unloaded_maybe_quantized_linear,
         },
-        parallel::{VocabParallelEmbedding, VocabParallelLmHead},
+        parallel::{
+            planned_optional_partition_widths, register_swiglu_projection_group,
+            SwiGluProjectionNames, VocabParallelEmbedding, VocabParallelLmHead,
+        },
         tensor::create_causal_mask,
     },
     runtime::{
@@ -38,20 +41,20 @@ use crate::{
             store::{GgufWeightStore, TensorSelection, WeightStore, WeightStoreBackend},
         },
         distributed::parallel::{
-            array_parameter_member, exact_parallel_division, register_projection_module,
-            register_replicated_module, MemberSharding, ParallelPlanBuilder, ParameterGroupSpec,
-            ParameterRole, ProjectionSharding,
+            aligned_partition_units, array_parameter_member, partitioned_projection_members,
+            register_projection_module, register_replicated_module, MemberSharding,
+            ParallelPlanBuilder, ParameterGroupSpec, ParameterRole, ProjectionSharding,
         },
         execution::layerwise::{
             load_layerwise_model, load_safetensors_layerwise_model,
             load_tensor_parallel_layerwise_model, open_safetensors_weight_store,
-            ArchitectureAdapter, LayerExecutionLoadOptions, LayerwiseForwardState, LayerwiseModel,
-            StaticUnitBindings, WeightResidency,
+            transformed_module_weight_store, ArchitectureAdapter, LayerExecutionLoadOptions,
+            LayerwiseForwardState, LayerwiseModel, StaticUnitBindings, WeightResidency,
         },
         residency::{
             expert_cache::{
                 ExpertCache, ExpertCacheLoadOptions, ExpertCacheReport, ExpertCatalogEntry,
-                ExpertIdentity, ExpertPass,
+                ExpertIdentity, ExpertPass, ExpertRouteBatch,
             },
             manager::{OffloadUnit, ResidencyReport, ResidentUnitLease, WeightBinding},
         },
@@ -67,40 +70,72 @@ const HEAD_UNIT: &str = "kimi_linear.static.output";
 fn register_kimi_layer_parallel_plan(
     planner: &mut ParallelPlanBuilder,
     layer: &DecoderLayer,
+    args: &ModelArgs,
     index: usize,
 ) -> Result<(), Error> {
     let prefix = format!("model.layers.{index}");
     match &layer.self_attn {
         resident::Attention::Kda(attention) => {
-            for (name, projection) in [
-                ("q_proj", &attention.q_proj),
-                ("k_proj", &attention.k_proj),
-                ("v_proj", &attention.v_proj),
-                ("f_b_proj", &attention.f_b_proj),
-                ("b_proj", &attention.b_proj),
-                ("g_b_proj", &attention.g_b_proj),
-            ] {
-                register_projection_module(
-                    planner,
-                    projection,
-                    &format!("{prefix}.self_attn.{name}"),
-                    ProjectionSharding::Column,
-                )?;
-            }
+            let attention_prefix = format!("{prefix}.self_attn");
+            let q_prefix = format!("{attention_prefix}.q_proj");
+            let k_prefix = format!("{attention_prefix}.k_proj");
+            let v_prefix = format!("{attention_prefix}.v_proj");
+            let f_prefix = format!("{attention_prefix}.f_b_proj");
+            let b_prefix = format!("{attention_prefix}.b_proj");
+            let g_prefix = format!("{attention_prefix}.g_b_proj");
+            let o_prefix = format!("{attention_prefix}.o_proj");
+            let preferred_heads = usize::try_from(attention.num_heads)
+                .map_err(|_| Error::Parallel("Kimi KDA head count exceeds usize".into()))?;
+            let (head_units, mut members) = partitioned_projection_members(
+                &[
+                    (
+                        &attention.q_proj,
+                        q_prefix.as_str(),
+                        ProjectionSharding::Column,
+                    ),
+                    (
+                        &attention.k_proj,
+                        k_prefix.as_str(),
+                        ProjectionSharding::Column,
+                    ),
+                    (
+                        &attention.v_proj,
+                        v_prefix.as_str(),
+                        ProjectionSharding::Column,
+                    ),
+                    (
+                        &attention.f_b_proj,
+                        f_prefix.as_str(),
+                        ProjectionSharding::Column,
+                    ),
+                    (
+                        &attention.b_proj,
+                        b_prefix.as_str(),
+                        ProjectionSharding::Column,
+                    ),
+                    (
+                        &attention.g_b_proj,
+                        g_prefix.as_str(),
+                        ProjectionSharding::Column,
+                    ),
+                    (
+                        &attention.o_proj,
+                        o_prefix.as_str(),
+                        ProjectionSharding::Row,
+                    ),
+                ],
+                preferred_heads,
+            )?;
             for (name, convolution) in [
                 ("q_conv1d", &attention.q_conv1d),
                 ("k_conv1d", &attention.k_conv1d),
                 ("v_conv1d", &attention.v_conv1d),
             ] {
-                planner.register(ParameterGroupSpec::new(
-                    format!("{prefix}.self_attn.{name}"),
-                    ParameterRole::Channels,
-                    [array_parameter_member(
-                        format!("{prefix}.self_attn.{name}.weight"),
-                        convolution.weight.as_ref(),
-                        MemberSharding::Equal { axis: 0 },
-                    )?],
-                )?)?;
+                members.push(array_parameter_member(
+                    format!("{attention_prefix}.{name}.weight"),
+                    convolution.weight.as_ref(),
+                    MemberSharding::Partitioned { axis: 0 },
+                )?);
             }
             for (name, projection) in [
                 ("f_a_proj", &attention.f_a_proj),
@@ -117,55 +152,75 @@ fn register_kimi_layer_parallel_plan(
                 ("A_log", attention.A_log.as_ref(), 2usize),
                 ("dt_bias", attention.dt_bias.as_ref(), 0usize),
             ] {
-                planner.register(ParameterGroupSpec::new(
-                    format!("{prefix}.self_attn.{name}"),
-                    ParameterRole::Channels,
-                    [array_parameter_member(
-                        format!("{prefix}.self_attn.{name}"),
-                        value,
-                        MemberSharding::Equal { axis },
-                    )?],
-                )?)?;
+                members.push(array_parameter_member(
+                    format!("{attention_prefix}.{name}"),
+                    value,
+                    MemberSharding::Partitioned { axis },
+                )?);
             }
             register_replicated_module(
                 planner,
                 &attention.o_norm,
                 &format!("{prefix}.self_attn.o_norm"),
             )?;
-            register_projection_module(
-                planner,
-                &attention.o_proj,
-                &format!("{prefix}.self_attn.o_proj"),
-                ProjectionSharding::Row,
-            )?;
+            planner.register(ParameterGroupSpec::partitioned(
+                format!("{attention_prefix}.heads"),
+                ParameterRole::AttentionHeads,
+                head_units,
+                members,
+            )?)?;
         }
         resident::Attention::Mla(attention) => {
+            let attention_prefix = format!("{prefix}.self_attn");
+            let mut projection_names = Vec::new();
             for (name, projection) in [
                 ("q_proj", attention.q_proj.as_ref()),
                 ("q_b_proj", attention.q_b_proj.as_ref()),
                 ("kv_b_proj", attention.kv_b_proj.as_ref()),
             ] {
                 if let Some(projection) = projection {
-                    register_projection_module(
-                        planner,
+                    projection_names.push((
                         projection,
-                        &format!("{prefix}.self_attn.{name}"),
+                        format!("{attention_prefix}.{name}"),
                         ProjectionSharding::Column,
-                    )?;
+                    ));
                 }
             }
+            projection_names.push((
+                &attention.o_proj,
+                format!("{attention_prefix}.o_proj"),
+                ProjectionSharding::Row,
+            ));
+            let projections = projection_names
+                .iter()
+                .map(|(projection, name, sharding)| (*projection, name.as_str(), *sharding))
+                .collect::<Vec<_>>();
+            let preferred_heads = usize::try_from(attention.num_heads)
+                .map_err(|_| Error::Parallel("Kimi MLA head count exceeds usize".into()))?;
+            let (mut head_units, mut members) =
+                partitioned_projection_members(&projections, preferred_heads)?;
+            let mut packed_names = Vec::new();
             for (name, projection) in [
                 ("k_b_proj", attention.k_b_proj.as_ref()),
                 ("v_b_proj", attention.v_b_proj.as_ref()),
             ] {
                 if let Some(projection) = projection {
-                    register_projection_module(
-                        planner,
+                    packed_names.push((
                         projection,
-                        &format!("{prefix}.self_attn.{name}"),
+                        format!("{attention_prefix}.{name}"),
                         ProjectionSharding::Column,
-                    )?;
+                    ));
                 }
+            }
+            if !packed_names.is_empty() {
+                let packed = packed_names
+                    .iter()
+                    .map(|(projection, name, sharding)| (*projection, name.as_str(), *sharding))
+                    .collect::<Vec<_>>();
+                let (packed_units, packed_members) =
+                    partitioned_projection_members(&packed, head_units)?;
+                head_units = packed_units;
+                members.extend(packed_members);
             }
             for (name, projection) in [
                 ("q_a_proj", attention.q_a_proj.as_ref()),
@@ -180,12 +235,12 @@ fn register_kimi_layer_parallel_plan(
                     )?;
                 }
             }
-            register_projection_module(
-                planner,
-                &attention.o_proj,
-                &format!("{prefix}.self_attn.o_proj"),
-                ProjectionSharding::Row,
-            )?;
+            planner.register(ParameterGroupSpec::partitioned(
+                format!("{attention_prefix}.heads"),
+                ParameterRole::AttentionHeads,
+                head_units,
+                members,
+            )?)?;
             for (name, norm) in [
                 ("q_a_layernorm", attention.q_a_layernorm.as_ref()),
                 ("kv_a_layernorm", Some(&attention.kv_a_layernorm)),
@@ -213,21 +268,30 @@ fn register_kimi_layer_parallel_plan(
     }
     let register_swiglu = |planner: &mut ParallelPlanBuilder,
                            mlp: &crate::nn::layers::SwiGluMlp,
-                           prefix: &str|
+                           prefix: &str,
+                           intermediate: i32|
      -> Result<(), Error> {
-        for (name, projection, sharding) in [
-            ("gate_proj", &mlp.gate_proj, ProjectionSharding::Column),
-            ("up_proj", &mlp.up_proj, ProjectionSharding::Column),
-            ("down_proj", &mlp.down_proj, ProjectionSharding::Row),
-        ] {
-            register_projection_module(planner, projection, &format!("{prefix}.{name}"), sharding)?;
-        }
-        Ok(())
+        register_swiglu_projection_group(
+            planner,
+            prefix,
+            SwiGluProjectionNames {
+                gate: "gate_proj",
+                up: "up_proj",
+                down: "down_proj",
+            },
+            &mlp.gate_proj,
+            &mlp.up_proj,
+            &mlp.down_proj,
+            intermediate,
+        )
     };
     match &layer.mlp {
-        resident::FeedForward::Dense(mlp) => {
-            register_swiglu(planner, mlp, &format!("{prefix}.mlp"))?
-        }
+        resident::FeedForward::Dense(mlp) => register_swiglu(
+            planner,
+            mlp,
+            &format!("{prefix}.mlp"),
+            args.intermediate_size,
+        )?,
         resident::FeedForward::Moe(moe) => {
             let source_prefix = format!("{prefix}.mlp");
             register_replicated_module(planner, &moe.gate, &format!("{source_prefix}.gate"))?;
@@ -235,15 +299,31 @@ fn register_kimi_layer_parallel_plan(
                 planner,
                 &moe.shared_experts,
                 &format!("{source_prefix}.shared_experts"),
+                args.moe_intermediate_size * args.num_shared_experts,
             )?;
             let experts = &moe.experts;
             let intermediate = usize::try_from(experts.intermediate_dim)
                 .map_err(|_| Error::Parallel("Kimi expert width exceeds usize".into()))?;
             let segments = vec![0..intermediate, intermediate..2 * intermediate];
-            let mut gate_up = vec![array_parameter_member(
+            let down_alignment =
+                experts
+                    .down_affine
+                    .or(experts.down_iquant)
+                    .map_or(Ok(1usize), |quantization| {
+                        usize::try_from(quantization.group_size()).map_err(|_| {
+                            Error::Parallel("Kimi expert quantization group exceeds usize".into())
+                        })
+                    })?;
+            let expert_units = aligned_partition_units(
+                &format!("{source_prefix}.experts.intermediate"),
+                intermediate,
+                1,
+                down_alignment,
+            )?;
+            let mut members = vec![array_parameter_member(
                 format!("{source_prefix}.experts.gate_up_proj"),
                 experts.gate_up_proj.as_ref(),
-                MemberSharding::Segmented {
+                MemberSharding::PartitionedSegments {
                     axis: 1,
                     segments: segments.clone(),
                 },
@@ -259,26 +339,21 @@ fn register_kimi_layer_parallel_plan(
                 ),
             ] {
                 if let Some(value) = value {
-                    gate_up.push(array_parameter_member(
+                    members.push(array_parameter_member(
                         format!("{source_prefix}.experts.{name}"),
                         value,
-                        MemberSharding::Segmented {
+                        MemberSharding::PartitionedSegments {
                             axis: 1,
                             segments: segments.clone(),
                         },
                     )?);
                 }
             }
-            planner.register(ParameterGroupSpec::new(
-                format!("{source_prefix}.experts.gate_up"),
-                ParameterRole::ExpertIntermediate,
-                gate_up,
-            )?)?;
-            let mut down = vec![array_parameter_member(
+            members.push(array_parameter_member(
                 format!("{source_prefix}.experts.down_proj"),
                 experts.down_proj.as_ref(),
-                MemberSharding::Equal { axis: 2 },
-            )?];
+                MemberSharding::Partitioned { axis: 2 },
+            )?);
             for (name, value) in [
                 (
                     "down_proj_scales",
@@ -290,17 +365,18 @@ fn register_kimi_layer_parallel_plan(
                 ),
             ] {
                 if let Some(value) = value {
-                    down.push(array_parameter_member(
+                    members.push(array_parameter_member(
                         format!("{source_prefix}.experts.{name}"),
                         value,
-                        MemberSharding::Equal { axis: 2 },
+                        MemberSharding::Partitioned { axis: 2 },
                     )?);
                 }
             }
-            planner.register(ParameterGroupSpec::new(
-                format!("{source_prefix}.experts.down"),
+            planner.register(ParameterGroupSpec::partitioned(
+                format!("{source_prefix}.experts.intermediate"),
                 ParameterRole::ExpertIntermediate,
-                down,
+                expert_units,
+                members,
             )?)?;
         }
     }
@@ -323,6 +399,28 @@ impl KimiLinearLayerwiseModel {
         Cache::new(self.args())
     }
 
+    /// Creates device-resident or blockwise-paged MLA state. KDA's bounded
+    /// convolution and recurrent tensors remain resident under either policy.
+    pub fn new_cache_with_options(
+        &self,
+        policy: crate::CacheResidencyPolicy,
+    ) -> Result<Cache, Error> {
+        Cache::new_with_options_and_rank(
+            self.args(),
+            policy,
+            self.execution.prompt_cache_rank_identity(),
+        )
+        .map_err(Into::into)
+    }
+
+    /// Returns aggregate live MLA paging observations, if paging is enabled.
+    pub fn cache_residency_report(
+        &self,
+        cache: &Cache,
+    ) -> Result<Option<crate::CacheResidencyReport>, Error> {
+        cache.residency_report().map_err(Into::into)
+    }
+
     /// Returns rank-local generalized parallel information when applicable.
     pub fn parallel_info(&self) -> Option<&crate::ParallelModelInfo> {
         self.execution.parallel_info()
@@ -333,6 +431,11 @@ impl KimiLinearLayerwiseModel {
         &self,
     ) -> Result<crate::LayerSchedule<crate::LayerCachePolicy>, Error> {
         self.execution.prompt_cache_layer_layout()
+    }
+
+    /// Returns the cache-relevant architecture fingerprint for this rank.
+    pub fn prompt_cache_architecture_fingerprint(&self) -> String {
+        resident::prompt_cache_architecture_fingerprint(self.args())
     }
 
     /// Persists a compatible prefix cache.
@@ -368,6 +471,11 @@ impl KimiLinearLayerwiseModel {
             .load_prompt_cache(directory, expected, prefix_token_ids, options, stream)
     }
 
+    /// Returns the persistent checkpoint store.
+    pub fn checkpoint_store(&self) -> &(dyn WeightStore + Send + Sync) {
+        self.execution.checkpoint_store()
+    }
+
     /// Returns current weight-residency telemetry.
     pub fn residency_report(&self) -> Result<ResidencyReport, Error> {
         self.execution.residency_report()
@@ -399,6 +507,18 @@ impl KimiLinearLayerwiseModel {
         stream: &Stream,
     ) -> Result<Array, Error> {
         self.execution.forward(inputs, cache, stream)
+    }
+
+    /// Runs the canonical execution path with stable per-layer observation points.
+    pub fn forward_with_observer(
+        &mut self,
+        inputs: &Array,
+        cache: &mut Cache,
+        stream: &Stream,
+        observer: &mut dyn crate::runtime::execution::inspection::ActivationObserver,
+    ) -> Result<Array, Error> {
+        self.execution
+            .forward_with_observer(inputs, cache, stream, observer)
     }
 
     /// Runs a rank-local tensor-parallel KDA/MLA forward pass.
@@ -495,6 +615,24 @@ pub fn load_kimi_linear_layerwise_model(
             model_dir,
             adapter,
             options,
+            stream,
+            weights_stream,
+        )?,
+    })
+}
+
+pub(crate) fn execute_transformed_kimi_linear_model(
+    model: resident::Model,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<KimiLinearLayerwiseModel, Error> {
+    let adapter = KimiLinearLayerwiseAdapter::new(model.args.clone(), stream)?;
+    let store = transformed_module_weight_store(&model)?;
+    Ok(KimiLinearLayerwiseModel {
+        execution: load_layerwise_model(
+            store,
+            adapter,
+            LayerExecutionLoadOptions::FullyResident,
             stream,
             weights_stream,
         )?,
@@ -635,11 +773,13 @@ pub(crate) fn load_kimi_linear_gguf_layerwise_model(
                 prepared.eos_token_ids,
             ));
         }
-        WeightResidency::FullyResident => {
-            return Err(Error::UnsupportedArchitecture(
-                "the bounded Kimi Linear GGUF loader does not accept fully resident policy".into(),
-            ));
-        }
+        WeightResidency::FullyResident => load_layerwise_model(
+            store,
+            KimiLinearLayerwiseAdapter::new(args, stream)?,
+            LayerExecutionLoadOptions::FullyResident,
+            stream,
+            weights_stream,
+        )?,
     };
     Ok((
         KimiLinearLayerwiseModel { execution },
@@ -755,7 +895,7 @@ fn load_kimi_linear_sparse_expert_cache_model_with_non_expert(
     let adapter = KimiLinearLayerwiseAdapter::new_sparse(args.clone(), stream)?;
     let mut execution =
         load_safetensors_layerwise_model(model_dir, adapter, non_expert, stream, weights_stream)?;
-    let store = execution.weight_store_arc();
+    let store = execution.checkpoint_store_arc();
     let entries = kimi_expert_catalog(&args, store.as_ref())?;
     execution.adapter_mut().expert_cache = Some(ExpertCache::new_shared(
         store,
@@ -811,12 +951,13 @@ pub struct KimiLinearLayerwiseAdapter {
     lm_head: Option<MaybeQuantized<nn::Linear>>,
     parallel_embedding: Option<VocabParallelEmbedding>,
     parallel_lm_head: Option<VocabParallelLmHead>,
+    parallel_cache_geometry: Option<Vec<resident::KimiLayerCacheGeometry>>,
     sparse_expert_cache: bool,
     expert_cache: Option<ExpertCache>,
 }
 
 impl KimiLinearLayerwiseAdapter {
-    fn new(args: ModelArgs, stream: &Stream) -> Result<Self, Error> {
+    pub(crate) fn new(args: ModelArgs, stream: &Stream) -> Result<Self, Error> {
         let lm_head = if args.tie_word_embeddings {
             None
         } else {
@@ -844,6 +985,7 @@ impl KimiLinearLayerwiseAdapter {
             lm_head,
             parallel_embedding: None,
             parallel_lm_head: None,
+            parallel_cache_geometry: None,
             sparse_expert_cache: false,
             expert_cache: None,
             args,
@@ -1025,24 +1167,23 @@ impl ArchitectureAdapter for KimiLinearLayerwiseAdapter {
         &self,
         topology: Option<crate::ParallelTopology>,
     ) -> Result<PromptCacheModelIdentity, Error> {
-        let mut local = self.args.clone();
-        if let Some(topology) = topology {
-            local.num_attention_heads = exact_parallel_division(
-                "Kimi prompt-cache MLA heads",
-                local.num_attention_heads,
-                topology.tensor_parallel_size,
-            )?;
-            local.num_key_value_heads = exact_parallel_division(
-                "Kimi prompt-cache MLA KV heads",
-                local.num_key_value_heads,
-                topology.tensor_parallel_size,
-            )?;
-            local.kda_config.num_heads = exact_parallel_division(
-                "Kimi prompt-cache KDA heads",
-                local.kda_config.num_heads,
-                topology.tensor_parallel_size,
-            )?;
-        }
+        let geometry = match topology {
+            None => self
+                .args
+                .layer_schedule
+                .iter()
+                .map(|policy| resident::KimiLayerCacheGeometry {
+                    kda_heads: (policy.attention == resident::AttentionKind::Kda)
+                        .then_some(self.args.kda_config.num_heads),
+                })
+                .collect(),
+            Some(_) => self.parallel_cache_geometry.clone().ok_or_else(|| {
+                Error::Parallel(
+                    "Kimi parallel cache identity requested before local layout configuration"
+                        .into(),
+                )
+            })?,
+        };
         let layer_count = self.args.num_hidden_layers as usize;
         Ok(PromptCacheModelIdentity {
             model_family: "kimi_linear".into(),
@@ -1056,7 +1197,7 @@ impl ArchitectureAdapter for KimiLinearLayerwiseAdapter {
                 PromptCacheTopology::default,
                 PromptCacheTopology::for_parallel_topology,
             ),
-            layer_layout: resident::prompt_cache_layer_layout(&local)
+            layer_layout: resident::prompt_cache_layer_layout_with_geometry(&self.args, &geometry)
                 .map_err(|error| Exception::custom(error.to_string()))?,
         })
     }
@@ -1070,12 +1211,14 @@ impl ArchitectureAdapter for KimiLinearLayerwiseAdapter {
         options: &PromptCacheOptions,
         _stream: &Stream,
     ) -> Result<PromptCacheManifest, Error> {
-        resident::Model::save_prompt_cache(
+        let rank = descriptor.topology.cache_rank_identity();
+        resident::Model::save_prompt_cache_with_rank(
             cache,
             destination,
             descriptor,
             prefix_token_ids,
             options,
+            rank,
         )
         .map_err(Into::into)
     }
@@ -1086,23 +1229,33 @@ impl ArchitectureAdapter for KimiLinearLayerwiseAdapter {
         expected: &PromptCacheDescriptor,
         identity: &PromptCacheModelIdentity,
         prefix_token_ids: &[u32],
-        _options: PagedCacheOptions,
+        options: PagedCacheOptions,
         stream: &Stream,
     ) -> Result<(Self::Cache, PromptCacheManifest), Error> {
-        resident::Model::load_prompt_cache_with_identity(
+        resident::Model::load_paged_prompt_cache_with_identity(
             &self.args,
             directory,
             expected,
             prefix_token_ids,
             identity,
+            options,
             stream,
         )
         .map_err(Into::into)
     }
 
     fn static_units(&self, store: &dyn WeightStore) -> Result<Vec<StaticUnitBindings>, Error> {
-        let mut units = vec![
-            StaticUnitBindings::new(
+        self.selected_static_units(store, &|_| true)
+    }
+
+    fn selected_static_units(
+        &self,
+        store: &dyn WeightStore,
+        select: &dyn Fn(&str) -> bool,
+    ) -> Result<Vec<StaticUnitBindings>, Error> {
+        let mut units = Vec::new();
+        if select(EMBEDDING_UNIT) {
+            units.push(StaticUnitBindings::new(
                 EMBEDDING_UNIT,
                 build_module_bindings_with_recipes(
                     &self.embedding,
@@ -1110,8 +1263,10 @@ impl ArchitectureAdapter for KimiLinearLayerwiseAdapter {
                     store,
                     BTreeMap::new(),
                 )?,
-            )?,
-            StaticUnitBindings::new(
+            )?);
+        }
+        if select(NORM_UNIT) {
+            units.push(StaticUnitBindings::new(
                 NORM_UNIT,
                 build_module_bindings_with_recipes(
                     &self.norm,
@@ -1119,13 +1274,15 @@ impl ArchitectureAdapter for KimiLinearLayerwiseAdapter {
                     store,
                     BTreeMap::new(),
                 )?,
-            )?,
-        ];
-        if let Some(lm_head) = &self.lm_head {
-            units.push(StaticUnitBindings::new(
-                HEAD_UNIT,
-                build_module_bindings_with_recipes(lm_head, "lm_head", store, BTreeMap::new())?,
             )?);
+        }
+        if select(HEAD_UNIT) {
+            if let Some(lm_head) = &self.lm_head {
+                units.push(StaticUnitBindings::new(
+                    HEAD_UNIT,
+                    build_module_bindings_with_recipes(lm_head, "lm_head", store, BTreeMap::new())?,
+                )?);
+            }
         }
         Ok(units)
     }
@@ -1211,16 +1368,10 @@ impl ArchitectureAdapter for KimiLinearLayerwiseAdapter {
         })
     }
 
-    fn execution_group_count(&self) -> usize {
-        1
-    }
-
-    fn execution_group_id(&self, group: usize) -> Result<String, Error> {
-        (group == 0).then(|| "text_decoder".into()).ok_or_else(|| {
-            Error::UnsupportedArchitecture(format!(
-                "Kimi Linear decoder has no execution group {group}"
-            ))
-        })
+    fn execution_graph(
+        &self,
+    ) -> Result<crate::runtime::execution::layerwise::ExecutionGroupDag, Error> {
+        crate::runtime::execution::layerwise::ExecutionGroupDag::chain(["text_decoder"])
     }
 
     fn layer_count(&self, group: usize) -> Result<usize, Error> {
@@ -1266,16 +1417,32 @@ impl ArchitectureAdapter for KimiLinearLayerwiseAdapter {
         }
         for index in 0..self.args.layer_schedule.len() {
             let layer = DecoderLayer::new(&self.args, index, stream)?;
-            register_kimi_layer_parallel_plan(planner, &layer, index)?;
+            register_kimi_layer_parallel_plan(planner, &layer, &self.args, index)?;
         }
         Ok(())
     }
     fn configure_parallel_static(
         &mut self,
         context: crate::runtime::distributed::parallel::ParallelBuildContext,
-        _layout: &crate::runtime::distributed::parallel::LocalModelLayout,
+        layout: &crate::runtime::distributed::parallel::LocalModelLayout,
         stream: &Stream,
     ) -> Result<(), Error> {
+        let kda_heads = planned_optional_partition_widths(
+            layout,
+            self.args
+                .layer_schedule
+                .iter()
+                .map(|policy| policy.attention == resident::AttentionKind::Kda),
+            self.args.kda_config.head_dim,
+            "model.layers",
+            "self_attn.q_proj",
+        )?;
+        self.parallel_cache_geometry = Some(
+            kda_heads
+                .into_iter()
+                .map(|kda_heads| resident::KimiLayerCacheGeometry { kda_heads })
+                .collect(),
+        );
         self.parallel_embedding = Some(VocabParallelEmbedding::unloaded(
             self.args.vocab_size as usize,
             self.args.hidden_size,
@@ -1309,21 +1476,84 @@ impl ArchitectureAdapter for KimiLinearLayerwiseAdapter {
                 .tensor(&format!("{prefix}.{n}.weight"))
                 .or_else(|| layout.tensor(&format!("{prefix}.{n}.inner.weight")))
         };
-        let q = find("self_attn.q_proj")
-            .or_else(|| find("self_attn.q_b_proj"))
-            .ok_or_else(|| Error::Parallel(format!("missing TP layout for {prefix} attention")))?;
-        let parts = q.global_shape()[0] / q.local_shape()[0];
         let mut args = self.args.clone();
-        args.num_attention_heads /= parts as i32;
-        args.num_key_value_heads /= parts as i32;
-        args.kda_config.num_heads /= parts as i32;
-        if let Some(v) = find("mlp.gate_proj") {
-            args.intermediate_size = v.local_shape()[0] as i32;
+        let attention_kind = self
+            .args
+            .layer_policy(index)
+            .ok_or_else(|| Error::Parallel(format!("missing Kimi layer policy {index}")))?
+            .attention;
+        match attention_kind {
+            resident::AttentionKind::Kda => {
+                let q = find("self_attn.q_proj").ok_or_else(|| {
+                    Error::Parallel(format!("missing KDA query layout for {prefix}"))
+                })?;
+                let width = i32::try_from(q.local_shape()[0]).map_err(|_| {
+                    Error::Parallel("Kimi local KDA query width exceeds i32".into())
+                })?;
+                if width % self.args.kda_config.head_dim != 0 {
+                    return Err(Error::Parallel(format!(
+                        "Kimi local KDA query width {width} splits head dimension {}",
+                        self.args.kda_config.head_dim
+                    )));
+                }
+                args.kda_config.num_heads = width / self.args.kda_config.head_dim;
+            }
+            resident::AttentionKind::Mla => {
+                let q = find(if self.args.q_lora_rank.is_some() {
+                    "self_attn.q_b_proj"
+                } else {
+                    "self_attn.q_proj"
+                })
+                .ok_or_else(|| Error::Parallel(format!("missing MLA query layout for {prefix}")))?;
+                let head_width = self.args.qk_nope_head_dim + self.args.qk_rope_head_dim;
+                let width = i32::try_from(q.local_shape()[0]).map_err(|_| {
+                    Error::Parallel("Kimi local MLA query width exceeds i32".into())
+                })?;
+                if width % head_width != 0 {
+                    return Err(Error::Parallel(format!(
+                        "Kimi local MLA query width {width} splits head width {head_width}"
+                    )));
+                }
+                args.num_attention_heads = width / head_width;
+            }
         }
-        if let Some(v) = layout.tensor(&format!("{prefix}.mlp.experts.gate_up_proj")) {
-            args.moe_intermediate_size = v.local_shape()[1] as i32 / 2;
-        }
-        Ok(DecoderLayer::new(&args, index, stream)?)
+        let dense_intermediate = find("mlp.gate_proj")
+            .map(|value| {
+                i32::try_from(value.local_shape()[0])
+                    .map_err(|_| Error::Parallel("Kimi local dense width exceeds i32".into()))
+            })
+            .transpose()?
+            .unwrap_or(args.intermediate_size);
+        let routed_intermediate = layout
+            .tensor(&format!("{prefix}.mlp.experts.gate_up_proj"))
+            .map(|value| {
+                let packed = i32::try_from(value.local_shape()[1])
+                    .map_err(|_| Error::Parallel("Kimi local routed expert width exceeds i32".into()))?;
+                if packed % 2 != 0 {
+                    return Err(Error::Parallel(format!(
+                        "Kimi local packed expert width {packed} does not contain equal gate/up segments"
+                    )));
+                }
+                Ok(packed / 2)
+            })
+            .transpose()?
+            .unwrap_or(args.moe_intermediate_size);
+        let shared_intermediate = find("mlp.shared_experts.gate_proj")
+            .map(|value| {
+                i32::try_from(value.local_shape()[0]).map_err(|_| {
+                    Error::Parallel("Kimi local shared expert width exceeds i32".into())
+                })
+            })
+            .transpose()?
+            .unwrap_or(args.moe_intermediate_size * args.num_shared_experts);
+        Ok(DecoderLayer::new_with_widths(
+            &args,
+            index,
+            dense_intermediate,
+            routed_intermediate,
+            shared_intermediate,
+            stream,
+        )?)
     }
 
     fn layer_checkpoint_prefix(&self, _group: usize, index: usize) -> String {
@@ -1441,11 +1671,7 @@ impl ArchitectureAdapter for KimiLinearLayerwiseAdapter {
                 |flat, indices, weights, stream| {
                     expert_cache
                         .execute_routes_bounded(
-                            index,
-                            flat,
-                            indices,
-                            weights,
-                            pass,
+                            ExpertRouteBatch::new(index, flat, indices, weights, pass),
                             stream,
                             |flat, acquired, weights, stream| {
                                 let started = Instant::now();
@@ -1789,8 +2015,9 @@ mod tests {
     };
 
     use super::{
-        expert_projection_recipe, load_kimi_linear_sparse_expert_cache_model,
-        normalized_checkpoint_keys, optional_expert_component_recipe, KimiLinearLayerwiseAdapter,
+        expert_projection_recipe, load_kimi_linear_layerwise_model,
+        load_kimi_linear_sparse_expert_cache_model, normalized_checkpoint_keys,
+        optional_expert_component_recipe, KimiLinearLayerwiseAdapter,
     };
     use crate::{
         api::ModelKind,
@@ -1803,7 +2030,9 @@ mod tests {
                 parallel::{ParallelBuildContext, ShardingPolicy},
                 topology::{DeviceAssignment, ParallelTopology},
             },
-            execution::layerwise::{ArchitectureAdapter, LayerwiseLoadOptions},
+            execution::layerwise::{
+                ArchitectureAdapter, LayerExecutionLoadOptions, LayerwiseLoadOptions,
+            },
             residency::{expert_cache::ExpertCacheLoadOptions, policy::OffloadConfig},
         },
     };
@@ -1896,6 +2125,185 @@ mod tests {
         );
     }
 
+    #[test]
+    fn tensor_parallel_plan_supports_uneven_hybrid_heads_and_intermediates() {
+        let execution = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        let mut config = tiny_config();
+        config["num_attention_heads"] = 3.into();
+        config["intermediate_size"] = 17.into();
+        config["linear_attn_config"]["num_heads"] = 3.into();
+        config["moe_intermediate_size"] = 9.into();
+        let args = model_args_from_config_value(&config).unwrap();
+
+        for (rank, local_heads, dense_width, expert_width) in
+            [(0, 2usize, 9usize, 5usize), (1, 1, 8, 4)]
+        {
+            let mut adapter =
+                KimiLinearLayerwiseAdapter::new(args.clone(), execution.stream()).unwrap();
+            let topology = ParallelTopology::from_rank(
+                2,
+                rank,
+                2,
+                1,
+                1,
+                DeviceAssignment::new(DeviceType::Cpu, 0),
+            )
+            .unwrap();
+            let context = ParallelBuildContext::new(topology, ShardingPolicy::Require);
+            let mut planner = context.planner();
+            adapter
+                .register_parallel_parameters(context, &mut planner, execution.stream())
+                .unwrap();
+            let (_, layout) = planner.finish().unwrap();
+            adapter
+                .configure_parallel_static(context, &layout, execution.stream())
+                .unwrap();
+
+            assert_eq!(
+                layout
+                    .tensor("model.layers.0.self_attn.q_proj.weight")
+                    .unwrap()
+                    .local_shape(),
+                &[local_heads * 4, 8]
+            );
+            assert_eq!(
+                layout
+                    .tensor("model.layers.0.self_attn.A_log")
+                    .unwrap()
+                    .local_shape(),
+                &[1, 1, local_heads, 1]
+            );
+            assert_eq!(
+                layout
+                    .tensor("model.layers.1.self_attn.q_proj.weight")
+                    .unwrap()
+                    .local_shape(),
+                &[local_heads * 4, 8]
+            );
+            assert_eq!(
+                layout
+                    .tensor("model.layers.0.mlp.gate_proj.weight")
+                    .unwrap()
+                    .local_shape(),
+                &[dense_width, 8]
+            );
+            assert_eq!(
+                layout
+                    .tensor("model.layers.1.mlp.experts.gate_up_proj")
+                    .unwrap()
+                    .local_shape(),
+                &[4, 2 * expert_width, 8]
+            );
+            assert_eq!(
+                layout
+                    .tensor("model.layers.1.mlp.shared_experts.gate_proj.weight")
+                    .unwrap()
+                    .local_shape(),
+                &[expert_width, 8]
+            );
+
+            adapter
+                .new_parallel_layer(0, 0, &layout, execution.stream())
+                .unwrap();
+            adapter
+                .new_parallel_layer(0, 1, &layout, execution.stream())
+                .unwrap();
+            let identity = adapter.prompt_cache_model_identity(Some(topology)).unwrap();
+            let recurrent = identity.layer_layout.get(0).unwrap().fixed_state()[3]
+                .shape
+                .clone();
+            assert_eq!(
+                recurrent,
+                vec![
+                    crate::StateTensorDimension::Batch,
+                    crate::StateTensorDimension::fixed(local_heads as i32).unwrap(),
+                    crate::StateTensorDimension::fixed(4).unwrap(),
+                    crate::StateTensorDimension::fixed(4).unwrap(),
+                ]
+            );
+            assert!(matches!(
+                identity.layer_layout.get(1).unwrap(),
+                crate::LayerCachePolicy::CompressedLatentRotary { .. }
+            ));
+        }
+    }
+
+    #[test]
+    fn tensor_parallel_plan_keeps_affine_blocks_aligned_without_equal_division() {
+        let execution = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        let mut config = tiny_config();
+        config["hidden_size"] = 48.into();
+        config["num_attention_heads"] = 3.into();
+        config["head_dim"] = 16.into();
+        config["intermediate_size"] = 48.into();
+        config["linear_attn_config"]["num_heads"] = 3.into();
+        config["linear_attn_config"]["head_dim"] = 16.into();
+        config["moe_intermediate_size"] = 48.into();
+        config["kv_lora_rank"] = 16.into();
+        config["qk_nope_head_dim"] = 8.into();
+        config["qk_rope_head_dim"] = 8.into();
+        config["v_head_dim"] = 16.into();
+        config["quantization"] = serde_json::json!({
+            "group_size": 16,
+            "bits": 4,
+            "mode": "affine"
+        });
+        let args = model_args_from_config_value(&config).unwrap();
+
+        for (rank, local_heads, local_intermediate, packed_down, scale_groups) in
+            [(0, 2usize, 32usize, 4usize, 2usize), (1, 1, 16, 2, 1)]
+        {
+            let adapter =
+                KimiLinearLayerwiseAdapter::new(args.clone(), execution.stream()).unwrap();
+            let context = ParallelBuildContext::new(
+                ParallelTopology::from_rank(
+                    2,
+                    rank,
+                    2,
+                    1,
+                    1,
+                    DeviceAssignment::new(DeviceType::Cpu, 0),
+                )
+                .unwrap(),
+                ShardingPolicy::Require,
+            );
+            let mut planner = context.planner();
+            adapter
+                .register_parallel_parameters(context, &mut planner, execution.stream())
+                .unwrap();
+            let (_, layout) = planner.finish().unwrap();
+            assert_eq!(
+                layout
+                    .tensor("model.layers.0.self_attn.q_proj.weight")
+                    .or_else(|| { layout.tensor("model.layers.0.self_attn.q_proj.inner.weight") })
+                    .unwrap()
+                    .local_shape()[0],
+                local_heads * 16
+            );
+            assert_eq!(
+                layout
+                    .tensor("model.layers.1.mlp.experts.gate_up_proj")
+                    .unwrap()
+                    .local_shape()[1],
+                2 * local_intermediate
+            );
+            assert_eq!(
+                layout
+                    .tensor("model.layers.1.mlp.experts.down_proj")
+                    .unwrap()
+                    .local_shape()[2],
+                packed_down
+            );
+            assert_eq!(
+                layout
+                    .tensor("model.layers.1.mlp.experts.down_proj_scales")
+                    .unwrap()
+                    .local_shape()[2],
+                scale_groups
+            );
+        }
+    }
+
     fn write_official_style_fixture(directory: &std::path::Path, model: &Model, stream: &Stream) {
         let mut arrays = Vec::<(String, Array)>::new();
         for (name, parameter) in model.parameters().flatten() {
@@ -1963,6 +2371,69 @@ mod tests {
             serde_json::to_vec(&tiny_config()).unwrap(),
         )
         .unwrap();
+    }
+
+    #[test]
+    fn high_level_resident_and_layerwise_dispatch_report_live_paged_mla_state() {
+        let gpu = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
+        let cpu = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        let fixture = Model::new(
+            model_args_from_config_value(&tiny_config()).unwrap(),
+            gpu.stream(),
+        )
+        .unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        write_official_style_fixture(directory.path(), &fixture, gpu.stream());
+        let fully_resident = load_kimi_linear_layerwise_model(
+            directory.path(),
+            LayerExecutionLoadOptions::FullyResident,
+            gpu.stream(),
+            cpu.stream(),
+        )
+        .unwrap();
+        let layerwise = load_kimi_linear_layerwise_model(
+            directory.path(),
+            LayerwiseLoadOptions::default(),
+            gpu.stream(),
+            cpu.stream(),
+        )
+        .unwrap();
+
+        for mut model in [
+            crate::api::Model::KimiLinear(fully_resident),
+            crate::api::Model::KimiLinear(layerwise),
+        ] {
+            let options = crate::PagedCacheOptions::new(1, 16 * 1024, 16 * 1024, 1)
+                .unwrap()
+                .with_full_attention(true);
+            let mut cache = model
+                .new_cache_with_options(crate::CacheResidencyPolicy::Paged(options))
+                .unwrap();
+            assert_eq!(
+                cache
+                    .residency_report()
+                    .unwrap()
+                    .unwrap()
+                    .logical_cached_tokens,
+                0
+            );
+            let tokens = Array::from_slice(&[1u32, 2, 3], &[1, 3]);
+            let parts = [crate::runtime::media::input::InputPart::text_token_ids(
+                &tokens,
+            )];
+            model
+                .prefill_input_with_cache(
+                    crate::runtime::media::input::ModelInput::new(&parts),
+                    &mut cache,
+                    gpu.stream(),
+                )
+                .unwrap()
+                .evaluated()
+                .unwrap();
+            let report = cache.residency_report().unwrap().unwrap();
+            assert_eq!(report.logical_cached_tokens, 3);
+            assert!(report.current_device_bytes > 0);
+        }
     }
 
     #[test]

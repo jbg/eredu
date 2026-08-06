@@ -1,7 +1,8 @@
 //! Reusable neural-network primitives with explicit tensor-parallel semantics.
 //!
 //! These modules do not retain communication groups. Callers borrow a
-//! [`ParallelExecutionContext`] for each operation, allowing the same module
+//! [`crate::runtime::distributed::parallel::ParallelExecutionContext`] for each
+//! operation, allowing the same module
 //! implementation to execute in replicated and tensor-parallel modes.
 
 use std::ops::Range;
@@ -18,15 +19,16 @@ use safemlx::{
 
 use crate::{
     error::Error,
-    nn::{layers::silu, linear},
+    nn::{convolution::DepthwiseConv1d, layers::silu, linear},
     runtime::{
         checkpoint::quantization::WeightQuantization,
         distributed::{
             parallel::{
-                register_projection_module, register_replicated_module, MemberSharding,
-                ParallelBuildContext, ParallelExecutionContext, ParallelPlanBuilder,
-                ParameterGroupSpec, ParameterMemberSpec, ParameterRole, ProjectionSharding,
-                ShardingPolicy,
+                aligned_partition_units, partitioned_projection_members,
+                register_partitioned_projection_group, register_projection_module,
+                register_replicated_module, MemberSharding, ParallelBuildContext,
+                ParallelExecutionContext, ParallelPlanBuilder, ParameterGroupSpec,
+                ParameterMemberSpec, ParameterRole, ProjectionSharding, ShardingPolicy,
             },
             topology::balanced_contiguous_range,
         },
@@ -69,6 +71,333 @@ pub(crate) fn register_replicated_parameter_group(
     register_replicated_module(planner, module, prefix)
 }
 
+fn row_partition_alignment(projection: &MaybeQuantized<nn::Linear>) -> Result<usize, Error> {
+    match projection {
+        MaybeQuantized::Original(_) => Ok(1),
+        MaybeQuantized::Quantized(projection) => usize::try_from(projection.group_size)
+            .map_err(|_| Error::Parallel("projection quantization group exceeds usize".into())),
+    }
+}
+
+/// Checkpoint-facing names for the four projections that share one GQA head
+/// partition. Keeping names in the descriptor lets architecture modules reuse
+/// the same semantic planner without pretending their tensor catalogs match.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct GqaProjectionNames {
+    pub query: &'static str,
+    pub key: &'static str,
+    pub value: &'static str,
+    pub output: &'static str,
+}
+
+/// Checkpoint-facing names for projections sharing one SwiGLU intermediate
+/// partition.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct SwiGluProjectionNames {
+    pub gate: &'static str,
+    pub up: &'static str,
+    pub down: &'static str,
+}
+
+/// Registers separate GQA projections as one logical head domain. The output
+/// projection's packed-input alignment determines the smallest legal group of
+/// complete KV/query-head bundles.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn register_gqa_projection_group(
+    planner: &mut ParallelPlanBuilder,
+    prefix: &str,
+    names: GqaProjectionNames,
+    q_proj: &MaybeQuantized<nn::Linear>,
+    k_proj: &MaybeQuantized<nn::Linear>,
+    v_proj: &MaybeQuantized<nn::Linear>,
+    o_proj: &MaybeQuantized<nn::Linear>,
+    query_heads: i32,
+    kv_heads: i32,
+    head_dim: i32,
+) -> Result<(), Error> {
+    let (units, members) = gqa_projection_members(
+        prefix,
+        names,
+        q_proj,
+        k_proj,
+        v_proj,
+        o_proj,
+        query_heads,
+        kv_heads,
+        head_dim,
+    )?;
+    planner.register(ParameterGroupSpec::partitioned(
+        format!("{prefix}.projections"),
+        ParameterRole::AttentionHeads,
+        units,
+        members,
+    )?)
+}
+
+/// Builds the physical members for one GQA head domain. Architectures with
+/// additional per-head state, such as learned attention sinks, can append that
+/// state before registering the resulting atomic parameter group.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn gqa_projection_members(
+    prefix: &str,
+    names: GqaProjectionNames,
+    q_proj: &MaybeQuantized<nn::Linear>,
+    k_proj: &MaybeQuantized<nn::Linear>,
+    v_proj: &MaybeQuantized<nn::Linear>,
+    o_proj: &MaybeQuantized<nn::Linear>,
+    query_heads: i32,
+    kv_heads: i32,
+    head_dim: i32,
+) -> Result<(usize, Vec<ParameterMemberSpec>), Error> {
+    let query_heads = usize::try_from(query_heads)
+        .map_err(|_| Error::Parallel("query-head count exceeds usize".into()))?;
+    let kv_heads = usize::try_from(kv_heads)
+        .map_err(|_| Error::Parallel("KV-head count exceeds usize".into()))?;
+    let head_dim = usize::try_from(head_dim)
+        .map_err(|_| Error::Parallel("attention head dimension exceeds usize".into()))?;
+    if head_dim == 0 || kv_heads == 0 || !query_heads.is_multiple_of(kv_heads) {
+        return Err(Error::Parallel(format!(
+            "attention head geometry q={query_heads}, kv={kv_heads}, dim={head_dim} does not form positive integral GQA groups"
+        )));
+    }
+    let group_width = (query_heads / kv_heads)
+        .checked_mul(head_dim)
+        .ok_or_else(|| Error::Parallel("GQA group width overflowed usize".into()))?;
+    let units = aligned_partition_units(
+        prefix,
+        kv_heads,
+        group_width,
+        row_partition_alignment(o_proj)?,
+    )?;
+    let q_prefix = format!("{prefix}.{}", names.query);
+    let k_prefix = format!("{prefix}.{}", names.key);
+    let v_prefix = format!("{prefix}.{}", names.value);
+    let o_prefix = format!("{prefix}.{}", names.output);
+    partitioned_projection_members(
+        &[
+            (q_proj, q_prefix.as_str(), ProjectionSharding::Column),
+            (k_proj, k_prefix.as_str(), ProjectionSharding::Column),
+            (v_proj, v_prefix.as_str(), ProjectionSharding::Column),
+            (o_proj, o_prefix.as_str(), ProjectionSharding::Row),
+        ],
+        units,
+    )
+}
+
+/// Registers gate, up, and down projections as one logical dense
+/// feed-forward intermediate domain, including packed quantization companions.
+pub(crate) fn register_swiglu_projection_group(
+    planner: &mut ParallelPlanBuilder,
+    prefix: &str,
+    names: SwiGluProjectionNames,
+    gate_proj: &MaybeQuantized<nn::Linear>,
+    up_proj: &MaybeQuantized<nn::Linear>,
+    down_proj: &MaybeQuantized<nn::Linear>,
+    intermediate_size: i32,
+) -> Result<(), Error> {
+    let intermediate = usize::try_from(intermediate_size)
+        .map_err(|_| Error::Parallel("feed-forward width exceeds usize".into()))?;
+    let units =
+        aligned_partition_units(prefix, intermediate, 1, row_partition_alignment(down_proj)?)?;
+    let gate_prefix = format!("{prefix}.{}", names.gate);
+    let up_prefix = format!("{prefix}.{}", names.up);
+    let down_prefix = format!("{prefix}.{}", names.down);
+    let logical_name = format!("{prefix}.projections");
+    register_partitioned_projection_group(
+        planner,
+        &logical_name,
+        ParameterRole::FeedForwardIntermediate,
+        &[
+            (gate_proj, gate_prefix.as_str(), ProjectionSharding::Column),
+            (up_proj, up_prefix.as_str(), ProjectionSharding::Column),
+            (down_proj, down_prefix.as_str(), ProjectionSharding::Row),
+        ],
+        units,
+    )
+}
+
+/// Registers a fused gated depthwise-convolution block as one logical channel
+/// domain. The three input-projection segments, depthwise kernel, recurrent
+/// channel state, and row projection therefore receive the identical range.
+pub(crate) fn register_gated_depthwise_conv_group(
+    planner: &mut ParallelPlanBuilder,
+    prefix: &str,
+    input_projection: &MaybeQuantized<nn::Linear>,
+    convolution: &DepthwiseConv1d,
+    output_projection: &MaybeQuantized<nn::Linear>,
+    channels: i32,
+) -> Result<(), Error> {
+    let channels = usize::try_from(channels)
+        .map_err(|_| Error::Parallel("convolution channel count exceeds usize".into()))?;
+    let units = aligned_partition_units(
+        prefix,
+        channels,
+        1,
+        row_partition_alignment(output_projection)?,
+    )?;
+    let output_prefix = format!("{prefix}.out_proj");
+    let (units, mut members) = partitioned_projection_members(
+        &[(
+            output_projection,
+            output_prefix.as_str(),
+            ProjectionSharding::Row,
+        )],
+        units,
+    )?;
+    let segments = vec![
+        0..channels,
+        channels..2 * channels,
+        2 * channels..3 * channels,
+    ];
+    for (name, parameter) in input_projection.parameters().flatten() {
+        let shape = parameter
+            .shape()
+            .iter()
+            .map(|dimension| {
+                usize::try_from(*dimension).map_err(|_| {
+                    Error::Parallel(format!(
+                        "parameter {prefix}.in_proj.{name} has negative dimension {dimension}"
+                    ))
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        if shape.first().copied() != Some(3 * channels) {
+            return Err(Error::Parallel(format!(
+                "parameter {prefix}.in_proj.{name} has shape {shape:?}, expected a fused three-segment channel axis of length {}",
+                3 * channels
+            )));
+        }
+        members.push(ParameterMemberSpec::new(
+            format!("{prefix}.in_proj.{name}"),
+            shape,
+            MemberSharding::PartitionedSegments {
+                axis: 0,
+                segments: segments.clone(),
+            },
+        ));
+    }
+    for (name, parameter) in convolution.parameters().flatten() {
+        let shape = parameter
+            .shape()
+            .iter()
+            .map(|dimension| {
+                usize::try_from(*dimension).map_err(|_| {
+                    Error::Parallel(format!(
+                        "parameter {prefix}.conv.{name} has negative dimension {dimension}"
+                    ))
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        if shape.first().copied() != Some(channels) {
+            return Err(Error::Parallel(format!(
+                "parameter {prefix}.conv.{name} has shape {shape:?}, expected channel axis length {channels}"
+            )));
+        }
+        members.push(ParameterMemberSpec::new(
+            format!("{prefix}.conv.{name}"),
+            shape,
+            MemberSharding::Partitioned { axis: 0 },
+        ));
+    }
+    planner.register(ParameterGroupSpec::partitioned(
+        format!("{prefix}.channels"),
+        ParameterRole::Channels,
+        units,
+        members,
+    )?)
+}
+
+/// Returns the exact rank-local KV-head count selected for each decoder layer.
+/// Cache creation and persistence use this planner-derived geometry instead of
+/// reconstructing it from topology scalars.
+pub(crate) fn planned_kv_head_layout(
+    layout: &crate::runtime::distributed::parallel::LocalModelLayout,
+    layer_count: usize,
+    head_dim: i32,
+    layer_prefix: &str,
+) -> Result<Vec<i32>, Error> {
+    planned_optional_kv_head_layout(
+        layout,
+        (0..layer_count).map(|_| true),
+        head_dim,
+        layer_prefix,
+    )
+    .map(|layers| {
+        layers
+            .into_iter()
+            .map(|heads| heads.expect("all requested layers contain attention"))
+            .collect()
+    })
+}
+
+/// Returns planner-derived KV geometry for a heterogeneous layer schedule.
+/// Layers without attention deliberately have no KV entry; their architecture
+/// remains responsible for describing any other recurrent state.
+pub(crate) fn planned_optional_kv_head_layout(
+    layout: &crate::runtime::distributed::parallel::LocalModelLayout,
+    attention_layers: impl IntoIterator<Item = bool>,
+    head_dim: i32,
+    layer_prefix: &str,
+) -> Result<Vec<Option<i32>>, Error> {
+    planned_optional_partition_widths(
+        layout,
+        attention_layers,
+        head_dim,
+        layer_prefix,
+        "self_attn.k_proj",
+    )
+}
+
+/// Returns the exact local semantic width for selected layers from one
+/// planner-owned tensor axis. This is shared by attention heads and recurrent
+/// or convolution channels so cache topology never re-derives partitions from
+/// rank counts.
+pub(crate) fn planned_optional_partition_widths(
+    layout: &crate::runtime::distributed::parallel::LocalModelLayout,
+    participating_layers: impl IntoIterator<Item = bool>,
+    unit_width: i32,
+    layer_prefix: &str,
+    tensor_suffix: &str,
+) -> Result<Vec<Option<i32>>, Error> {
+    if unit_width <= 0 {
+        return Err(Error::Parallel(format!(
+            "partition unit width must be positive, got {unit_width}"
+        )));
+    }
+    participating_layers
+        .into_iter()
+        .enumerate()
+        .map(|(index, participates)| {
+            if !participates {
+                return Ok(None);
+            }
+            let prefix = format!("{layer_prefix}.{index}.{tensor_suffix}");
+            let key = layout
+                .tensor(&format!("{prefix}.weight"))
+                .or_else(|| layout.tensor(&format!("{prefix}.inner.weight")))
+                .ok_or_else(|| {
+                    Error::Parallel(format!(
+                        "missing {tensor_suffix} layout for decoder layer {index}"
+                    ))
+                })?;
+            let local_width = i32::try_from(key.local_shape()[0])
+                .map_err(|_| Error::Parallel("local partition width exceeds i32".into()))?;
+            if local_width % unit_width != 0 {
+                return Err(Error::Parallel(format!(
+                    "local {tensor_suffix} width {local_width} splits semantic unit width {unit_width}"
+                )));
+            }
+            let units = local_width / unit_width;
+            if units <= 0 {
+                return Err(Error::Parallel(format!(
+                    "decoder layer {index} has no rank-local {tensor_suffix} units"
+                )));
+            }
+            Ok(Some(units))
+        })
+        .collect()
+}
+
 /// Linear projection carrying its local geometry and collective contract.
 #[derive(Debug, Clone)]
 pub struct ParallelLinear {
@@ -80,6 +409,7 @@ pub struct ParallelLinear {
     local_input_dims: i32,
     local_output_dims: i32,
     tensor_parallel_size: usize,
+    partition_units: Option<usize>,
     fell_back_to_replication: bool,
 }
 
@@ -129,6 +459,53 @@ impl ParallelLinear {
         context: ParallelBuildContext,
         stream: &Stream,
     ) -> Result<Self, Error> {
+        let partition_units = match requested {
+            LinearParallelism::Replicated => None,
+            LinearParallelism::Column => {
+                Some(usize::try_from(global_output_dims).map_err(|_| {
+                    Error::Parallel("parallel linear output width exceeds usize".into())
+                })?)
+            }
+            LinearParallelism::Row => {
+                let input = usize::try_from(global_input_dims).map_err(|_| {
+                    Error::Parallel("parallel linear input width exceeds usize".into())
+                })?;
+                let alignment = quantization.map_or(Ok(1usize), |quantization| {
+                    usize::try_from(quantization.group_size()).map_err(|_| {
+                        Error::Parallel("parallel linear quantization group exceeds usize".into())
+                    })
+                })?;
+                Some(aligned_partition_units(
+                    "row-parallel linear",
+                    input,
+                    1,
+                    alignment,
+                )?)
+            }
+        };
+        Self::unloaded_with_partition_units(
+            global_input_dims,
+            global_output_dims,
+            bias,
+            quantization,
+            requested,
+            partition_units,
+            context,
+            stream,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn unloaded_with_partition_units(
+        global_input_dims: i32,
+        global_output_dims: i32,
+        bias: bool,
+        quantization: Option<WeightQuantization>,
+        requested: LinearParallelism,
+        requested_units: Option<usize>,
+        context: ParallelBuildContext,
+        stream: &Stream,
+    ) -> Result<Self, Error> {
         if global_input_dims <= 0 || global_output_dims <= 0 {
             return Err(Error::Parallel(format!(
                 "parallel linear dimensions must be positive, got {global_input_dims} -> {global_output_dims}"
@@ -137,26 +514,19 @@ impl ParallelLinear {
         let parts = context.topology().tensor_parallel_size;
         let dimension = match requested {
             LinearParallelism::Replicated => None,
-            LinearParallelism::Column => Some(global_output_dims),
-            LinearParallelism::Row => Some(global_input_dims),
+            LinearParallelism::Column => Some(usize::try_from(global_output_dims).unwrap()),
+            LinearParallelism::Row => Some(usize::try_from(global_input_dims).unwrap()),
         };
-        let sharding_error = dimension.and_then(|dimension| {
-            let dimension = usize::try_from(dimension).ok()?;
-            let invalid_division = parts == 0 || dimension % parts != 0;
-            let invalid_quantization = requested == LinearParallelism::Row
-                && quantization.is_some_and(|quantization| {
-                    let local = dimension.checked_div(parts).unwrap_or(0);
-                    local == 0
-                        || local % usize::try_from(quantization.group_size()).unwrap_or(usize::MAX)
-                            != 0
-                });
-            (invalid_division || invalid_quantization).then_some(())
-        });
-        let (parallelism, fell_back_to_replication) = if sharding_error.is_some() {
+        let sharding_error = dimension
+            .zip(requested_units)
+            .is_some_and(|(dimension, units)| {
+                parts == 0 || units < parts || units == 0 || !dimension.is_multiple_of(units)
+            });
+        let (parallelism, fell_back_to_replication) = if sharding_error {
             match context.policy() {
                 ShardingPolicy::Require => {
                     return Err(Error::Parallel(format!(
-                        "{requested:?} linear {global_input_dims} -> {global_output_dims} is incompatible with TP size {parts}{}",
+                        "{requested:?} linear {global_input_dims} -> {global_output_dims} has no non-empty aligned partition for TP size {parts}{}",
                         quantization.map_or(String::new(), |quantization| format!(
                             " and quantization group size {}",
                             quantization.group_size()
@@ -168,20 +538,29 @@ impl ParallelLinear {
         } else {
             (requested, false)
         };
-        let local_input_dims = match parallelism {
-            LinearParallelism::Row => {
-                global_input_dims
-                    / i32::try_from(parts)
-                        .map_err(|_| Error::Parallel("TP size exceeds i32".into()))?
+        let partition_units = (!fell_back_to_replication)
+            .then_some(requested_units)
+            .flatten();
+        let local_sharded_dimension = match (dimension, partition_units) {
+            (Some(dimension), Some(units)) => {
+                let logical = balanced_contiguous_range(
+                    units,
+                    parts,
+                    context.topology().tensor_parallel_rank,
+                    false,
+                )?;
+                logical.len() * (dimension / units)
             }
+            _ => 0,
+        };
+        let local_input_dims = match parallelism {
+            LinearParallelism::Row => i32::try_from(local_sharded_dimension)
+                .map_err(|_| Error::Parallel("local row width exceeds i32".into()))?,
             _ => global_input_dims,
         };
         let local_output_dims = match parallelism {
-            LinearParallelism::Column => {
-                global_output_dims
-                    / i32::try_from(parts)
-                        .map_err(|_| Error::Parallel("TP size exceeds i32".into()))?
-            }
+            LinearParallelism::Column => i32::try_from(local_sharded_dimension)
+                .map_err(|_| Error::Parallel("local column width exceeds i32".into()))?,
             _ => global_output_dims,
         };
         let inner = linear::unloaded_maybe_quantized_linear(
@@ -200,6 +579,7 @@ impl ParallelLinear {
             local_input_dims,
             local_output_dims,
             tensor_parallel_size: parts,
+            partition_units,
             fell_back_to_replication,
         })
     }
@@ -241,20 +621,22 @@ impl ParallelLinear {
 
     /// Describes every physical parameter without checkpoint-name inference.
     pub fn parameter_group(&self, prefix: &str) -> Result<ParameterGroupSpec, Error> {
+        let aligned = |axis| {
+            self.partition_units
+                .map_or(MemberSharding::Replicated, |_| {
+                    MemberSharding::Partitioned { axis }
+                })
+        };
         let (role, weight_sharding, output_companion) = match self.parallelism {
             LinearParallelism::Replicated => (
                 ParameterRole::Replicated,
                 MemberSharding::Replicated,
                 MemberSharding::Replicated,
             ),
-            LinearParallelism::Column => (
-                ParameterRole::ColumnProjection,
-                MemberSharding::Equal { axis: 0 },
-                MemberSharding::Equal { axis: 0 },
-            ),
+            LinearParallelism::Column => (ParameterRole::ColumnProjection, aligned(0), aligned(0)),
             LinearParallelism::Row => (
                 ParameterRole::RowProjection,
-                MemberSharding::Equal { axis: 1 },
+                aligned(1),
                 MemberSharding::Replicated,
             ),
         };
@@ -282,12 +664,8 @@ impl ParallelLinear {
                 let output = usize::try_from(self.global_output_dims).unwrap();
                 let native_iq = linear.native_format.is_some();
                 let packed = if native_iq {
-                    let local = usize::try_from(linear.inner.weight.value.dim(1)).unwrap();
-                    if self.parallelism == LinearParallelism::Row {
-                        local * self.tensor_parallel_size.max(1)
-                    } else {
-                        local
-                    }
+                    input / usize::try_from(linear.group_size).unwrap()
+                        * usize::try_from(linear.bits).unwrap()
                 } else {
                     usize::try_from(safemlx::ops::quantized_packed_dimension(
                         self.global_input_dims,
@@ -304,13 +682,13 @@ impl ParallelLinear {
                     members.push(ParameterMemberSpec::new(
                         format!("{prefix}.scales"),
                         [output, input / usize::try_from(linear.group_size).unwrap()],
-                        input_or_output_sharding(self.parallelism),
+                        input_or_output_sharding(self.parallelism, self.partition_units),
                     ));
                     if linear.biases.value.is_some() {
                         members.push(ParameterMemberSpec::new(
                             format!("{prefix}.biases"),
                             [output, input / usize::try_from(linear.group_size).unwrap()],
-                            input_or_output_sharding(self.parallelism),
+                            input_or_output_sharding(self.parallelism, self.partition_units),
                         ));
                     }
                 }
@@ -323,7 +701,10 @@ impl ParallelLinear {
                 }
             }
         }
-        ParameterGroupSpec::new(prefix, role, members)
+        match self.partition_units {
+            Some(units) => ParameterGroupSpec::partitioned(prefix, role, units, members),
+            None => ParameterGroupSpec::new(prefix, role, members),
+        }
     }
 
     /// Executes the projection and its declared collective.
@@ -364,11 +745,19 @@ impl ParallelLinear {
     }
 }
 
-fn input_or_output_sharding(parallelism: LinearParallelism) -> MemberSharding {
+fn input_or_output_sharding(
+    parallelism: LinearParallelism,
+    partition_units: Option<usize>,
+) -> MemberSharding {
+    let aligned = |axis| {
+        partition_units.map_or(MemberSharding::Replicated, |_| {
+            MemberSharding::Partitioned { axis }
+        })
+    };
     match parallelism {
         LinearParallelism::Replicated => MemberSharding::Replicated,
-        LinearParallelism::Column => MemberSharding::Equal { axis: 0 },
-        LinearParallelism::Row => MemberSharding::Equal { axis: 1 },
+        LinearParallelism::Column => aligned(0),
+        LinearParallelism::Row => aligned(1),
     }
 }
 
@@ -1031,26 +1420,35 @@ impl ParallelAttentionProjections {
         context: ParallelBuildContext,
         stream: &Stream,
     ) -> Result<Self, Error> {
-        let parts = i32::try_from(context.topology().tensor_parallel_size)
-            .map_err(|_| Error::Parallel("TP size exceeds i32".into()))?;
+        let parts = context.topology().tensor_parallel_size;
         let row_width = query_heads
             .checked_mul(value_head_dim)
             .ok_or_else(|| Error::Parallel("attention output width overflowed i32".into()))?;
-        let shardable = query_heads > 0
-            && kv_heads > 0
-            && parts > 0
-            && query_heads % parts == 0
-            && kv_heads % parts == 0
-            && row_width % parts == 0
-            && quantization
-                .is_none_or(|quantization| (row_width / parts) % quantization.group_size() == 0);
+        let query_per_kv = (query_heads > 0 && kv_heads > 0 && query_heads % kv_heads == 0)
+            .then_some(query_heads / kv_heads);
+        let alignment = quantization.map_or(Ok(1usize), |quantization| {
+            usize::try_from(quantization.group_size())
+                .map_err(|_| Error::Parallel("attention quantization group exceeds usize".into()))
+        })?;
+        let partition_units = query_per_kv
+            .and_then(|query_per_kv| {
+                aligned_partition_units(
+                    "parallel attention",
+                    usize::try_from(kv_heads).ok()?,
+                    usize::try_from(query_per_kv.checked_mul(value_head_dim)?).ok()?,
+                    alignment,
+                )
+                .ok()
+            })
+            .filter(|units| *units >= parts && parts > 0);
+        let shardable = partition_units.is_some();
         let parallelism = if shardable {
             LinearParallelism::Column
         } else if context.policy() == ShardingPolicy::ReplicateUnsupported {
             LinearParallelism::Replicated
         } else {
             return Err(Error::Parallel(format!(
-                "attention geometry q={query_heads}, kv={kv_heads}, value_head_dim={value_head_dim} is incompatible with TP size {parts}{}",
+                "attention geometry q={query_heads}, kv={kv_heads}, value_head_dim={value_head_dim} has no non-empty aligned partition for TP size {parts}{}",
                 quantization.map_or(String::new(), |quantization| format!(
                     " and quantization group size {}",
                     quantization.group_size()
@@ -1062,50 +1460,66 @@ impl ParallelAttentionProjections {
         } else {
             LinearParallelism::Replicated
         };
-        let local_query_heads = if shardable {
-            query_heads / parts
+        let (local_query_heads, local_kv_heads) = if let Some(units) = partition_units {
+            let logical = balanced_contiguous_range(
+                units,
+                parts,
+                context.topology().tensor_parallel_rank,
+                false,
+            )?;
+            let local_kv_heads = i32::try_from(
+                logical.len()
+                    * (usize::try_from(kv_heads)
+                        .map_err(|_| Error::Parallel("KV heads exceed usize".into()))?
+                        / units),
+            )
+            .map_err(|_| Error::Parallel("local KV heads exceed i32".into()))?;
+            (
+                local_kv_heads * query_per_kv.expect("validated GQA ratio"),
+                local_kv_heads,
+            )
         } else {
-            query_heads
+            (query_heads, kv_heads)
         };
-        let local_kv_heads = if shardable {
-            kv_heads / parts
-        } else {
-            kv_heads
-        };
+        let projection_units = shardable.then_some(partition_units).flatten();
         Ok(Self {
-            q_proj: ParallelLinear::unloaded(
+            q_proj: ParallelLinear::unloaded_with_partition_units(
                 hidden_size,
                 query_heads * query_key_head_dim,
                 bias,
                 quantization,
                 parallelism,
+                projection_units,
                 context,
                 stream,
             )?,
-            k_proj: ParallelLinear::unloaded(
+            k_proj: ParallelLinear::unloaded_with_partition_units(
                 hidden_size,
                 kv_heads * query_key_head_dim,
                 bias,
                 quantization,
                 parallelism,
+                projection_units,
                 context,
                 stream,
             )?,
-            v_proj: ParallelLinear::unloaded(
+            v_proj: ParallelLinear::unloaded_with_partition_units(
                 hidden_size,
                 kv_heads * value_head_dim,
                 bias,
                 quantization,
                 parallelism,
+                projection_units,
                 context,
                 stream,
             )?,
-            o_proj: ParallelLinear::unloaded(
-                query_heads * value_head_dim,
+            o_proj: ParallelLinear::unloaded_with_partition_units(
+                row_width,
                 hidden_size,
                 bias,
                 quantization,
                 output_parallelism,
+                projection_units,
                 context,
                 stream,
             )?,
@@ -1181,21 +1595,25 @@ impl ParallelSwiGluMlp {
         context: ParallelBuildContext,
         stream: &Stream,
     ) -> Result<Self, Error> {
-        let parts = i32::try_from(context.topology().tensor_parallel_size)
-            .map_err(|_| Error::Parallel("TP size exceeds i32".into()))?;
-        let shardable = intermediate_size > 0
-            && parts > 0
-            && intermediate_size % parts == 0
-            && quantization.is_none_or(|quantization| {
-                (intermediate_size / parts) % quantization.group_size() == 0
-            });
+        let parts = context.topology().tensor_parallel_size;
+        let alignment = quantization.map_or(Ok(1usize), |quantization| {
+            usize::try_from(quantization.group_size())
+                .map_err(|_| Error::Parallel("MLP quantization group exceeds usize".into()))
+        })?;
+        let partition_units = usize::try_from(intermediate_size)
+            .ok()
+            .and_then(|intermediate| {
+                aligned_partition_units("parallel SwiGLU", intermediate, 1, alignment).ok()
+            })
+            .filter(|units| *units >= parts && parts > 0);
+        let shardable = partition_units.is_some();
         let (input_parallelism, output_parallelism) = if shardable {
             (LinearParallelism::Column, LinearParallelism::Row)
         } else if context.policy() == ShardingPolicy::ReplicateUnsupported {
             (LinearParallelism::Replicated, LinearParallelism::Replicated)
         } else {
             return Err(Error::Parallel(format!(
-                "SwiGLU intermediate size {intermediate_size} is incompatible with TP size {parts}{}",
+                "SwiGLU intermediate size {intermediate_size} has no non-empty aligned partition for TP size {parts}{}",
                 quantization.map_or(String::new(), |quantization| format!(
                     " and quantization group size {}",
                     quantization.group_size()
@@ -1203,30 +1621,33 @@ impl ParallelSwiGluMlp {
             )));
         };
         Ok(Self {
-            gate_proj: ParallelLinear::unloaded(
+            gate_proj: ParallelLinear::unloaded_with_partition_units(
                 hidden_size,
                 intermediate_size,
                 bias,
                 quantization,
                 input_parallelism,
+                partition_units,
                 context,
                 stream,
             )?,
-            up_proj: ParallelLinear::unloaded(
+            up_proj: ParallelLinear::unloaded_with_partition_units(
                 hidden_size,
                 intermediate_size,
                 bias,
                 quantization,
                 input_parallelism,
+                partition_units,
                 context,
                 stream,
             )?,
-            down_proj: ParallelLinear::unloaded(
+            down_proj: ParallelLinear::unloaded_with_partition_units(
                 intermediate_size,
                 hidden_size,
                 bias,
                 quantization,
                 output_parallelism,
+                partition_units,
                 context,
                 stream,
             )?,
@@ -1319,7 +1740,43 @@ mod tests {
             &stream,
         )
         .unwrap_err();
-        assert!(error.to_string().contains("group size"));
+        assert!(error.to_string().contains("alignment-64"));
+    }
+
+    #[test]
+    fn row_quantization_balances_complete_groups() {
+        let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(DeviceType::Cpu, 0));
+        let quantization = WeightQuantization::Affine(
+            crate::runtime::checkpoint::quantization::AffineQuantization::new(64, 4).unwrap(),
+        );
+        let first = ParallelLinear::unloaded(
+            192,
+            32,
+            false,
+            Some(quantization),
+            LinearParallelism::Row,
+            build_context(2, 0),
+            &stream,
+        )
+        .unwrap();
+        let second = ParallelLinear::unloaded(
+            192,
+            32,
+            false,
+            Some(quantization),
+            LinearParallelism::Row,
+            build_context(2, 1),
+            &stream,
+        )
+        .unwrap();
+        assert_eq!(first.local_input_dims(), 128);
+        assert_eq!(second.local_input_dims(), 64);
+        let first = first.parameter_group("projection").unwrap();
+        assert_eq!(first.partition_units(), Some(3));
+        assert!(first
+            .members()
+            .iter()
+            .all(|member| matches!(member.sharding(), MemberSharding::Partitioned { .. })));
     }
 
     #[test]
@@ -1375,19 +1832,50 @@ mod tests {
     }
 
     #[test]
-    fn swiglu_fallback_replicates_the_complete_subgraph() {
+    fn attention_balances_whole_gqa_groups() {
         let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(DeviceType::Cpu, 0));
-        let mlp = ParallelSwiGluMlp::unloaded(
-            8,
-            10,
-            false,
+        let first = ParallelAttentionProjections::unloaded(
+            12,
+            6,
+            3,
+            2,
+            2,
+            true,
             None,
-            build_context_with_policy(3, 0, ShardingPolicy::ReplicateUnsupported),
+            build_context(2, 0),
             &stream,
         )
         .unwrap();
-        assert_eq!(mlp.gate_proj.parallelism(), LinearParallelism::Replicated);
-        assert_eq!(mlp.up_proj.parallelism(), LinearParallelism::Replicated);
-        assert_eq!(mlp.down_proj.parallelism(), LinearParallelism::Replicated);
+        let second = ParallelAttentionProjections::unloaded(
+            12,
+            6,
+            3,
+            2,
+            2,
+            true,
+            None,
+            build_context(2, 1),
+            &stream,
+        )
+        .unwrap();
+        assert_eq!(first.query_heads(), (6, 4));
+        assert_eq!(first.kv_heads(), (3, 2));
+        assert_eq!(second.query_heads(), (6, 2));
+        assert_eq!(second.kv_heads(), (3, 1));
+        assert_eq!(first.o_proj.local_input_dims(), 8);
+        assert_eq!(second.o_proj.local_input_dims(), 4);
+    }
+
+    #[test]
+    fn swiglu_balances_uneven_intermediate_widths() {
+        let stream = safemlx::Stream::new_with_device(&safemlx::Device::new(DeviceType::Cpu, 0));
+        let first =
+            ParallelSwiGluMlp::unloaded(8, 10, false, None, build_context(3, 0), &stream).unwrap();
+        let last =
+            ParallelSwiGluMlp::unloaded(8, 10, false, None, build_context(3, 2), &stream).unwrap();
+        assert_eq!(first.gate_proj.local_output_dims(), 4);
+        assert_eq!(first.down_proj.local_input_dims(), 4);
+        assert_eq!(last.gate_proj.local_output_dims(), 3);
+        assert_eq!(last.down_proj.local_input_dims(), 3);
     }
 }

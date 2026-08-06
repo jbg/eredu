@@ -61,6 +61,31 @@ fn default_swiglu_limit() -> f32 {
     7.0
 }
 
+/// Builds the explicit mask required by one scheduled GPT-OSS attention layer.
+///
+/// Sliding caches retain exactly `window - 1` past tokens, so single-token
+/// decode needs no explicit mask. Multi-token calls still need both causal and
+/// sliding constraints over the cache span returned for the current call.
+pub(crate) fn attention_mask(
+    policy: &AttentionPolicy,
+    sequence_length: i32,
+    offset: i32,
+    stream: &Stream,
+) -> Result<Option<Array>, Exception> {
+    if sequence_length <= 1 {
+        return Ok(None);
+    }
+    let max_past = policy.window().map(|window| window.get() as i32 - 1);
+    create_causal_mask(
+        sequence_length,
+        Some(offset.min(max_past.unwrap_or(offset))),
+        max_past,
+        None,
+        stream,
+    )
+    .map(Some)
+}
+
 /// GPT-OSS checkpoint quantization metadata.
 #[derive(Debug, Clone, Deserialize)]
 pub struct MxFp4Config {
@@ -478,11 +503,11 @@ impl Attention {
         })
     }
 
-    fn forward(
+    fn forward<C: KeyValueCache>(
         &mut self,
         x: &Array,
         mask: Option<&Array>,
-        cache: &mut LayerCache,
+        cache: &mut C,
         stream: &Stream,
     ) -> Result<Array, Exception> {
         let shape = x.shape();
@@ -898,11 +923,11 @@ impl TransformerBlock {
         })
     }
 
-    pub(crate) fn forward(
+    pub(crate) fn forward<C: KeyValueCache>(
         &mut self,
         x: &Array,
         mask: Option<&Array>,
-        cache: &mut LayerCache,
+        cache: &mut C,
         stream: &Stream,
     ) -> Result<Array, Exception> {
         let normed = self.input_layernorm.forward(x, stream)?;
@@ -1240,19 +1265,7 @@ impl GptOssModel {
             .zip(self.attention_schedule.iter())
         {
             let offset = layer_cache.offset();
-            let window = policy.window().map(|window| window.get() as i32);
-            let mask = (length > 1)
-                .then(|| {
-                    let max_past = window.map(|size| size - 1);
-                    create_causal_mask(
-                        length,
-                        Some(offset.min(max_past.unwrap_or(offset))),
-                        max_past,
-                        None,
-                        stream,
-                    )
-                })
-                .transpose()?;
+            let mask = attention_mask(policy, length, offset, stream)?;
             hidden = layer.forward(&hidden, mask.as_ref(), layer_cache, stream)?;
         }
         self.norm.forward(&hidden, stream)
@@ -1282,19 +1295,7 @@ impl GptOssModel {
             .enumerate()
         {
             let offset = layer_cache.offset();
-            let window = policy.window().map(|window| window.get() as i32);
-            let mask = (length > 1)
-                .then(|| {
-                    let max_past = window.map(|size| size - 1);
-                    create_causal_mask(
-                        length,
-                        Some(offset.min(max_past.unwrap_or(offset))),
-                        max_past,
-                        None,
-                        stream,
-                    )
-                })
-                .transpose()?;
+            let mask = attention_mask(policy, length, offset, stream)?;
             hidden = layer.forward_with_expert_executor(
                 &hidden,
                 mask.as_ref(),

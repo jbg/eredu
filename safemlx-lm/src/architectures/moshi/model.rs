@@ -30,9 +30,7 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use crate::{
-    api::realtime::{
-        self, RealtimeSampling, RealtimeSpeechConfig, RealtimeSpeechModel, RealtimeStepInput,
-    },
+    api::realtime::{self, RealtimeSpeechConfig},
     error::Error,
     runtime::cache::{ConcatKeyValueCache, KeyValueCache},
     runtime::checkpoint::load::{
@@ -1232,12 +1230,6 @@ pub struct SampleStepOutput {
     pub logits: TokenStepOutput,
 }
 
-/// Greedy specialization of [`SampleStepOutput`].
-pub type GreedyStepOutput = SampleStepOutput;
-
-/// Output from one encoded-audio generation step.
-pub type GenerationStepOutput = realtime::RealtimeStepOutput;
-
 /// Realtime generation output with the distributions used for its decisions.
 ///
 /// The first PersonaPlex delayed-stream step initializes state and therefore
@@ -1245,7 +1237,7 @@ pub type GenerationStepOutput = realtime::RealtimeStepOutput;
 /// distribution per depth codebook.
 pub struct GenerationStepWithLogits {
     /// Normal realtime tokens and optional delay-aligned output frame.
-    pub output: GenerationStepOutput,
+    pub output: realtime::RealtimeStepOutput,
     /// Text logits shaped `[batch, 1, text_card]`, absent during initialization.
     pub text_logits: Option<Array>,
     /// Audio logits ordered by depth codebook.
@@ -1280,9 +1272,6 @@ impl GenerationState {
         self.step
     }
 }
-
-/// Text tokens and delay-aligned Mimi tokens from offline generation.
-pub type EncodedAudioOutput = realtime::EncodedAudioOutput;
 
 /// Intermediate states retained for temporal-layer parity diagnostics.
 pub struct TemporalLayerTrace {
@@ -1695,6 +1684,19 @@ impl Model {
         }
     }
 
+    /// Returns the codec-token stream geometry consumed by realtime scheduling.
+    pub fn realtime_config(&self) -> RealtimeSpeechConfig<'_> {
+        RealtimeSpeechConfig {
+            total_audio_codebooks: self.args.n_q,
+            input_audio_codebooks: self.args.input_audio_codebooks(),
+            generated_audio_codebooks: self.args.generated_audio_codebooks(),
+            depth_audio_codebooks: self.args.dep_q,
+            text_padding_token: self.args.text_padding_token(),
+            audio_padding_token: self.args.audio_padding_token(),
+            audio_delays: self.args.audio_delays(),
+        }
+    }
+
     fn temporal_input(
         &mut self,
         text_token: &Array,
@@ -2056,7 +2058,7 @@ impl Model {
         audio_tokens: &Array,
         cache: &mut MoshiCache,
         stream: &Stream,
-    ) -> Result<GreedyStepOutput, Exception> {
+    ) -> Result<SampleStepOutput, Exception> {
         let mut text_sampler = DefaultSampler;
         let mut audio_samplers = (0..self.args.dep_q)
             .map(|_| DefaultSampler)
@@ -2077,7 +2079,7 @@ impl Model {
     /// Consumes one Mimi input-side frame and advances delayed-stream generation.
     ///
     /// `input_audio_tokens` must be `[batch, n_q - dep_q]`. Supply one sampler
-    /// per generated codebook. [`GenerationStepOutput::output_audio_tokens`]
+    /// per generated codebook. [`realtime::RealtimeStepOutput::output_audio_tokens`]
     /// contains a delay-aligned `[batch, dep_q]` frame once one is available.
     #[allow(clippy::too_many_arguments)]
     pub fn generate_step<TS: Sampler, AS: Sampler>(
@@ -2090,7 +2092,7 @@ impl Model {
         audio_temperature: f32,
         prng_state: Option<&mut RandomState>,
         stream: &Stream,
-    ) -> Result<GenerationStepOutput, Exception> {
+    ) -> Result<realtime::RealtimeStepOutput, Exception> {
         self.generate_step_forced(
             state,
             input_audio_tokens,
@@ -2123,7 +2125,7 @@ impl Model {
         audio_temperature: f32,
         prng_state: Option<&mut RandomState>,
         stream: &Stream,
-    ) -> Result<GenerationStepOutput, Exception> {
+    ) -> Result<realtime::RealtimeStepOutput, Exception> {
         Ok(self
             .generate_step_forced_internal(
                 state,
@@ -2366,71 +2368,13 @@ impl Model {
         state.previous_text = Some(text_token.clone());
         state.step += 1;
         Ok(GenerationStepWithLogits {
-            output: GenerationStepOutput {
+            output: realtime::RealtimeStepOutput {
                 text_token,
                 sampled_audio_tokens,
                 output_audio_tokens,
             },
             text_logits: Some(text_logits),
             audio_logits,
-        })
-    }
-
-    /// Greedily generates delay-aligned Mimi tokens from an encoded input sequence.
-    ///
-    /// Input and output use Mimi's `[batch, codebooks, frames]` layout. This
-    /// method does not append encoded silence, so delayed tail frames are not
-    /// flushed after the supplied input ends.
-    pub fn generate_encoded_greedy(
-        &mut self,
-        input_audio_tokens: &Array,
-        stream: &Stream,
-    ) -> Result<EncodedAudioOutput, Exception> {
-        let input_codebooks = self.args.input_audio_codebooks();
-        if input_audio_tokens.shape().len() != 3 || input_audio_tokens.dim(1) != input_codebooks {
-            return Err(Exception::custom(format!(
-                "Moshi encoded input sequence must have shape [batch, {input_codebooks}, frames], got {:?}",
-                input_audio_tokens.shape()
-            )));
-        }
-        let batch = input_audio_tokens.dim(0);
-        let mut state = GenerationState::new(self);
-        let mut text_sampler = DefaultSampler;
-        let mut audio_samplers = (0..self.args.dep_q)
-            .map(|_| DefaultSampler)
-            .collect::<Vec<_>>();
-        let mut text = Vec::with_capacity(input_audio_tokens.dim(2) as usize);
-        let mut audio = Vec::new();
-        for frame in 0..input_audio_tokens.dim(2) {
-            let input = input_audio_tokens.try_index_device((.., .., frame), stream)?;
-            let output = self.generate_step(
-                &mut state,
-                &input,
-                &mut text_sampler,
-                &mut audio_samplers,
-                0.0,
-                0.0,
-                None,
-                stream,
-            )?;
-            text.push(output.text_token.squeeze_axes(&[-1], stream)?);
-            if let Some(tokens) = output.output_audio_tokens {
-                audio.push(tokens);
-            }
-        }
-        let text_tokens = if text.is_empty() {
-            Array::zeros::<i32>(&[batch, 0], stream)?
-        } else {
-            safemlx::ops::stack_axis(&text, 1, stream)?
-        };
-        let audio_tokens = if audio.is_empty() {
-            Array::zeros::<i32>(&[batch, self.args.generated_audio_codebooks(), 0], stream)?
-        } else {
-            safemlx::ops::stack_axis(&audio, 2, stream)?
-        };
-        Ok(EncodedAudioOutput {
-            text_tokens,
-            audio_tokens,
         })
     }
 
@@ -2531,7 +2475,7 @@ impl Model {
         if offset == 0 {
             state.step += 1;
             return Ok(GenerationStepWithLogits {
-                output: GenerationStepOutput {
+                output: realtime::RealtimeStepOutput {
                     text_token: Array::full::<i32>(
                         &[batch, 1],
                         Array::from_int(self.args.text_card),
@@ -2621,7 +2565,7 @@ impl Model {
         state.previous_text = Some(text_token.clone());
         state.step += 1;
         Ok(GenerationStepWithLogits {
-            output: GenerationStepOutput {
+            output: realtime::RealtimeStepOutput {
                 text_token,
                 sampled_audio_tokens,
                 output_audio_tokens,
@@ -2652,49 +2596,6 @@ fn token_position(
                 "Moshi delayed stream is missing slot {slot} at position {position}"
             ))
         })
-}
-
-impl RealtimeSpeechModel for Model {
-    type State = GenerationState;
-
-    fn realtime_config(&self) -> RealtimeSpeechConfig<'_> {
-        RealtimeSpeechConfig {
-            total_audio_codebooks: self.args.n_q,
-            input_audio_codebooks: self.args.input_audio_codebooks(),
-            generated_audio_codebooks: self.args.generated_audio_codebooks(),
-            depth_audio_codebooks: self.args.dep_q,
-            text_padding_token: self.args.text_padding_token(),
-            audio_padding_token: self.args.audio_padding_token(),
-            audio_delays: self.args.audio_delays(),
-        }
-    }
-
-    fn new_realtime_state(&self) -> Self::State {
-        GenerationState::new(self)
-    }
-
-    fn step_realtime<TS, AS>(
-        &mut self,
-        state: &mut Self::State,
-        input: RealtimeStepInput<'_>,
-        sampling: RealtimeSampling<'_, TS, AS>,
-        stream: &Stream,
-    ) -> Result<GenerationStepOutput, Exception>
-    where
-        TS: Sampler,
-        AS: Sampler,
-    {
-        self.generate_step(
-            state,
-            input.input_audio_tokens,
-            sampling.text_sampler,
-            sampling.audio_samplers,
-            sampling.text_temperature,
-            sampling.audio_temperature,
-            sampling.prng_state,
-            stream,
-        )
-    }
 }
 
 struct TemporalStepOutput {

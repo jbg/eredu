@@ -8,8 +8,13 @@ use std::collections::{BTreeMap, BTreeSet};
 use safemlx::{module::ModuleParameters, transforms::eval, Array, Stream};
 
 use crate::{
+    error::Error,
     runtime::checkpoint::recipe::{DerivedWeightRecipe, RecipeDtype},
     runtime::checkpoint::store::{TensorSelection, WeightReadPolicy, WeightStore},
+    runtime::checkpoint::{
+        load::{load_array_quantized_strict, StrictLoadConfig, StrictLoadReport},
+        quantization::WeightQuantization,
+    },
     runtime::residency::manager::{ResidentUnitLease, WeightBinding},
 };
 
@@ -175,6 +180,39 @@ where
     Ok(())
 }
 
+/// Populates a quantized target module from dense direct or derived bindings.
+///
+/// Binding materialization uses the dense source module's local parameter
+/// names. This operation applies the ordinary strict-loader quantization rules
+/// to those arrays one at a time, so embeddings, linear projections, packed
+/// expert banks, biases, and non-quantizable parameters follow the same target
+/// module contract as a conventional SafeTensors load.
+pub(crate) fn populate_module_from_dense_arrays_quantized(
+    module: &mut impl ModuleParameters,
+    arrays: &BTreeMap<String, Array>,
+    quantization: WeightQuantization,
+    stream: &Stream,
+) -> Result<(), Error> {
+    quantization.validate()?;
+    let config = StrictLoadConfig::default();
+    let mut report = StrictLoadReport::default();
+    {
+        let mut parameters = module.parameters_mut().flatten();
+        for (name, value) in arrays {
+            load_array_quantized_strict(
+                &mut parameters,
+                name.clone(),
+                value.clone(),
+                stream,
+                quantization,
+                &config,
+                &mut report,
+            )?;
+        }
+    }
+    report.finish(module, &config)
+}
+
 fn build_module_bindings_with_recipes_excluding<F>(
     module: &impl ModuleParameters,
     prefix: &str,
@@ -201,6 +239,7 @@ where
             .get(local_name.as_str())
             .expect("parameter name came from the same flattened tree");
         if let Some(recipe) = recipes.remove(&local_name) {
+            let destination = qualify(prefix, &local_name);
             let metadata = recipe.infer(store)?;
             let expected_shape = parameter
                 .shape()
@@ -226,11 +265,10 @@ where
                     actual: metadata.dtype().clone(),
                 });
             }
-            bindings.push(WeightBinding::from_recipe(
-                local_name,
-                recipe,
-                metadata.byte_len(),
-            )?);
+            bindings.push(
+                WeightBinding::from_recipe(local_name, recipe, metadata.byte_len())?
+                    .with_logical_target(destination)?,
+            );
             continue;
         }
         let destination = qualify(prefix, &local_name);
@@ -274,12 +312,15 @@ where
                 context: "checkpoint tensor byte length",
             }
         })?;
-        bindings.push(WeightBinding::new(
-            local_name,
-            metadata.name,
-            TensorSelection::Full,
-            expected_bytes,
-        )?);
+        bindings.push(
+            WeightBinding::new(
+                local_name,
+                metadata.name,
+                TensorSelection::Full,
+                expected_bytes,
+            )?
+            .with_logical_target(destination)?,
+        );
     }
 
     if !recipes.is_empty() {
@@ -454,7 +495,7 @@ pub enum ModuleBindingError {
         /// Lease bindings absent from the module.
         unexpected: Vec<String>,
     },
-    /// A resident array no longer matched its unloaded placeholder.
+    /// A resident array shape differs from its unloaded placeholder.
     #[error(
         "resident unit {unit} parameter {parameter:?} has shape {actual:?}, expected {expected:?}"
     )]

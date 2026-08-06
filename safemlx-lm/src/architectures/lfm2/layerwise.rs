@@ -28,7 +28,12 @@ use crate::{
     },
     error::Error,
     nn::{
-        parallel::{VocabParallelEmbedding, VocabParallelLmHead},
+        parallel::{
+            planned_optional_kv_head_layout, planned_optional_partition_widths,
+            register_gated_depthwise_conv_group, register_gqa_projection_group,
+            register_swiglu_projection_group, GqaProjectionNames, SwiGluProjectionNames,
+            VocabParallelEmbedding, VocabParallelLmHead,
+        },
         tensor::{create_attention_mask, AttentionMask},
     },
     runtime::cache::{
@@ -45,19 +50,18 @@ use crate::{
     runtime::checkpoint::recipe::DerivedWeightRecipe,
     runtime::checkpoint::store::{GgufWeightStore, TensorSelection, WeightStore},
     runtime::distributed::parallel::{
-        array_parameter_member, exact_parallel_division, register_projection_module,
-        register_replicated_module, MemberSharding, ParallelPlanBuilder, ParameterGroupSpec,
-        ParameterRole, ProjectionSharding,
+        aligned_partition_units, array_parameter_member, register_replicated_module,
+        MemberSharding, ParallelPlanBuilder, ParameterGroupSpec, ParameterRole,
     },
     runtime::execution::layerwise::{
         load_layerwise_model, load_safetensors_layerwise_model,
-        load_tensor_parallel_layerwise_model, open_safetensors_weight_store, ArchitectureAdapter,
-        LayerExecutionLoadOptions, LayerwiseForwardState, LayerwiseModel, StaticUnitBindings,
-        WeightResidency,
+        load_tensor_parallel_layerwise_model, open_safetensors_weight_store,
+        transformed_module_weight_store, ArchitectureAdapter, LayerExecutionLoadOptions,
+        LayerwiseForwardState, LayerwiseModel, StaticUnitBindings, WeightResidency,
     },
     runtime::residency::expert_cache::{
         ExpertCache, ExpertCacheLoadOptions, ExpertCacheReport, ExpertCatalogEntry, ExpertIdentity,
-        ExpertPass,
+        ExpertPass, ExpertRouteBatch,
     },
     runtime::residency::manager::{OffloadUnit, ResidencyReport, ResidentUnitLease, WeightBinding},
 };
@@ -69,27 +73,27 @@ const HEAD_UNIT: &str = "lfm2.static.output";
 fn register_lfm2_layer_parallel_plan(
     planner: &mut ParallelPlanBuilder,
     layer: &DecoderLayer,
+    args: &ModelArgs,
     index: usize,
 ) -> Result<(), Error> {
     let prefix = format!("model.layers.{index}");
     if let Some(attention) = &layer.self_attn {
-        for (name, projection) in [
-            ("q_proj", &attention.q_proj),
-            ("k_proj", &attention.k_proj),
-            ("v_proj", &attention.v_proj),
-        ] {
-            register_projection_module(
-                planner,
-                projection,
-                &format!("{prefix}.self_attn.{name}"),
-                ProjectionSharding::Column,
-            )?;
-        }
-        register_projection_module(
+        register_gqa_projection_group(
             planner,
+            &format!("{prefix}.self_attn"),
+            GqaProjectionNames {
+                query: "q_proj",
+                key: "k_proj",
+                value: "v_proj",
+                output: "out_proj",
+            },
+            &attention.q_proj,
+            &attention.k_proj,
+            &attention.v_proj,
             &attention.out_proj,
-            &format!("{prefix}.self_attn.out_proj"),
-            ProjectionSharding::Row,
+            attention.n_heads,
+            attention.n_kv_heads,
+            attention.head_dim,
         )?;
         for (name, module) in [
             ("q_layernorm", &attention.q_layernorm),
@@ -104,7 +108,14 @@ fn register_lfm2_layer_parallel_plan(
         )?;
     }
     if let Some(conv) = &layer.conv {
-        register_replicated_module(planner, conv, &format!("{prefix}.conv"))?;
+        register_gated_depthwise_conv_group(
+            planner,
+            &format!("{prefix}.conv"),
+            &conv.in_proj,
+            &conv.conv,
+            &conv.out_proj,
+            args.hidden_size,
+        )?;
     }
     for (name, norm) in [
         ("operator_norm", &layer.operator_norm),
@@ -136,11 +147,26 @@ fn register_lfm2_layer_parallel_plan(
         let expert_prefix = format!("{prefix}.feed_forward.experts");
         let intermediate = usize::try_from(experts.intermediate_dim)
             .map_err(|_| Error::Parallel("LFM2 expert width exceeds usize".into()))?;
+        let down_alignment =
+            experts
+                .down_affine
+                .or(experts.down_iquant)
+                .map_or(Ok(1usize), |quantization| {
+                    usize::try_from(quantization.group_size()).map_err(|_| {
+                        Error::Parallel("LFM2 expert quantization group exceeds usize".into())
+                    })
+                })?;
+        let expert_units = aligned_partition_units(
+            &format!("{expert_prefix}.intermediate"),
+            intermediate,
+            1,
+            down_alignment,
+        )?;
         let segments = vec![0..intermediate, intermediate..2 * intermediate];
-        let mut gate_up = vec![array_parameter_member(
+        let mut members = vec![array_parameter_member(
             format!("{expert_prefix}.gate_up_proj"),
             experts.gate_up_proj.as_ref(),
-            MemberSharding::Segmented {
+            MemberSharding::PartitionedSegments {
                 axis: 1,
                 segments: segments.clone(),
             },
@@ -156,26 +182,21 @@ fn register_lfm2_layer_parallel_plan(
             ),
         ] {
             if let Some(value) = value {
-                gate_up.push(array_parameter_member(
+                members.push(array_parameter_member(
                     format!("{expert_prefix}.{name}"),
                     value,
-                    MemberSharding::Segmented {
+                    MemberSharding::PartitionedSegments {
                         axis: 1,
                         segments: segments.clone(),
                     },
                 )?);
             }
         }
-        planner.register(ParameterGroupSpec::new(
-            format!("{expert_prefix}.gate_up"),
-            ParameterRole::ExpertIntermediate,
-            gate_up,
-        )?)?;
-        let mut down = vec![array_parameter_member(
+        members.push(array_parameter_member(
             format!("{expert_prefix}.down_proj"),
             experts.down_proj.as_ref(),
-            MemberSharding::Equal { axis: 2 },
-        )?];
+            MemberSharding::Partitioned { axis: 2 },
+        )?);
         for (name, value) in [
             (
                 "down_proj_scales",
@@ -187,34 +208,45 @@ fn register_lfm2_layer_parallel_plan(
             ),
         ] {
             if let Some(value) = value {
-                down.push(array_parameter_member(
+                members.push(array_parameter_member(
                     format!("{expert_prefix}.{name}"),
                     value,
-                    MemberSharding::Equal { axis: 2 },
+                    MemberSharding::Partitioned { axis: 2 },
                 )?);
             }
         }
-        planner.register(ParameterGroupSpec::new(
-            format!("{expert_prefix}.down"),
+        planner.register(ParameterGroupSpec::partitioned(
+            format!("{expert_prefix}.intermediate"),
             ParameterRole::ExpertIntermediate,
-            down,
+            expert_units,
+            members,
         )?)?;
     } else {
-        for (name, projection, placement) in [
-            ("w1", feed_forward.w1.as_ref(), ProjectionSharding::Column),
-            ("w3", feed_forward.w3.as_ref(), ProjectionSharding::Column),
-            ("w2", feed_forward.w2.as_ref(), ProjectionSharding::Row),
-        ] {
-            let projection = projection.ok_or_else(|| {
-                Error::Parallel(format!("LFM2 dense layer {index} is missing {name}"))
-            })?;
-            register_projection_module(
-                planner,
-                projection,
-                &format!("{prefix}.feed_forward.{name}"),
-                placement,
-            )?;
-        }
+        let w1 = feed_forward
+            .w1
+            .as_ref()
+            .ok_or_else(|| Error::Parallel(format!("LFM2 dense layer {index} is missing w1")))?;
+        let w3 = feed_forward
+            .w3
+            .as_ref()
+            .ok_or_else(|| Error::Parallel(format!("LFM2 dense layer {index} is missing w3")))?;
+        let w2 = feed_forward
+            .w2
+            .as_ref()
+            .ok_or_else(|| Error::Parallel(format!("LFM2 dense layer {index} is missing w2")))?;
+        register_swiglu_projection_group(
+            planner,
+            &format!("{prefix}.feed_forward"),
+            SwiGluProjectionNames {
+                gate: "w1",
+                up: "w3",
+                down: "w2",
+            },
+            w1,
+            w3,
+            w2,
+            args.dense_intermediate_size,
+        )?;
     }
     Ok(())
 }
@@ -245,6 +277,11 @@ impl Lfm2LayerwiseModel {
         &self,
     ) -> Result<crate::LayerSchedule<crate::LayerCachePolicy>, Error> {
         self.execution.prompt_cache_layer_layout()
+    }
+
+    /// Returns the cache-relevant architecture fingerprint for this rank.
+    pub fn prompt_cache_architecture_fingerprint(&self) -> Result<String, Error> {
+        self.execution.prompt_cache_architecture_fingerprint()
     }
 
     /// Persists a compatible prefix cache.
@@ -305,11 +342,6 @@ impl Lfm2LayerwiseModel {
     /// Returns the persistent checkpoint store.
     pub fn checkpoint_store(&self) -> &(dyn WeightStore + Send + Sync) {
         self.execution.checkpoint_store()
-    }
-
-    /// Backward-compatible alias for [`Self::checkpoint_store`].
-    pub fn weight_store(&self) -> &(dyn WeightStore + Send + Sync) {
-        self.checkpoint_store()
     }
 
     /// Runs the hybrid decoder while preserving recurrent and KV state.
@@ -418,6 +450,25 @@ pub fn load_lfm2_layerwise_model(
         )?,
     })
 }
+
+pub(crate) fn execute_transformed_lfm2_model(
+    model: resident::Model,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<Lfm2LayerwiseModel, Error> {
+    let adapter = Lfm2LayerwiseAdapter::new(model.args.clone(), stream)?;
+    let store = transformed_module_weight_store(&model)?;
+    Ok(Lfm2LayerwiseModel {
+        execution: load_layerwise_model(
+            store,
+            adapter,
+            LayerExecutionLoadOptions::FullyResident,
+            stream,
+            weights_stream,
+        )?,
+    })
+}
+
 /// Loads dense or MoE LFM2 through the generalized tensor-parallel engine.
 pub fn load_lfm2_tensor_parallel_model(
     model_dir: impl AsRef<Path>,
@@ -549,11 +600,13 @@ pub(crate) fn load_lfm2_gguf_layerwise_model(
                 prepared.eos_token_ids,
             ));
         }
-        WeightResidency::FullyResident => {
-            return Err(Error::UnsupportedArchitecture(
-                "the bounded GGUF LFM2 loader does not accept fully resident policy".into(),
-            ));
-        }
+        WeightResidency::FullyResident => load_layerwise_model(
+            store,
+            Lfm2LayerwiseAdapter::new(args, stream)?,
+            LayerExecutionLoadOptions::FullyResident,
+            stream,
+            weights_stream,
+        )?,
     };
     Ok((Lfm2LayerwiseModel { execution }, prepared.eos_token_ids))
 }
@@ -574,7 +627,7 @@ fn load_lfm2_gguf_sparse_with_store(
     let mut adapter = Lfm2LayerwiseAdapter::new(args.clone(), stream)?;
     adapter.sparse_expert_cache = true;
     let mut execution = load_layerwise_model(store, adapter, non_expert, stream, weights_stream)?;
-    let checkpoint_store = execution.weight_store_arc();
+    let checkpoint_store = execution.checkpoint_store_arc();
     let entries = lfm2_expert_catalog(&args, checkpoint_store.as_ref())?;
     execution.adapter_mut().expert_cache = Some(ExpertCache::new_shared(
         checkpoint_store,
@@ -651,7 +704,7 @@ fn load_lfm2_sparse_expert_cache_model_with_non_expert(
     adapter.sparse_expert_cache = true;
     let mut execution =
         load_safetensors_layerwise_model(model_dir, adapter, non_expert, stream, weights_stream)?;
-    let store = execution.weight_store_arc();
+    let store = execution.checkpoint_store_arc();
     let entries = lfm2_expert_catalog(&args, store.as_ref())?;
     execution.adapter_mut().expert_cache = Some(ExpertCache::new_shared(
         store,
@@ -671,6 +724,7 @@ pub struct Lfm2LayerwiseAdapter {
     lm_head: Option<MaybeQuantized<nn::Linear>>,
     parallel_embedding: Option<VocabParallelEmbedding>,
     parallel_lm_head: Option<VocabParallelLmHead>,
+    parallel_cache_geometry: Option<Vec<resident::Lfm2LayerCacheGeometry>>,
     sparse_expert_cache: bool,
     expert_cache: Option<ExpertCache>,
 }
@@ -703,6 +757,7 @@ impl Lfm2LayerwiseAdapter {
             lm_head,
             parallel_embedding: None,
             parallel_lm_head: None,
+            parallel_cache_geometry: None,
             sparse_expert_cache: false,
             expert_cache: None,
         })
@@ -864,28 +919,38 @@ impl ArchitectureAdapter for Lfm2LayerwiseAdapter {
     }
 
     fn quantization(&self) -> Option<crate::runtime::checkpoint::quantization::WeightQuantization> {
-        self.args.weight_quantization()
+        self.args.weight_quantization
     }
 
     fn prompt_cache_model_identity(
         &self,
         topology: Option<crate::ParallelTopology>,
     ) -> Result<PromptCacheModelIdentity, Error> {
-        let mut local = self.args.clone();
-        if let Some(topology) = topology {
-            local.num_attention_heads = exact_parallel_division(
-                "LFM2 prompt-cache attention heads",
-                local.num_attention_heads,
-                topology.tensor_parallel_size,
-            )?;
-            local.num_key_value_heads = exact_parallel_division(
-                "LFM2 prompt-cache KV heads",
-                local.num_key_value_heads,
-                topology.tensor_parallel_size,
-            )?;
-        }
         let layer_count = usize::try_from(self.args.num_hidden_layers)
             .map_err(|_| Exception::custom("invalid LFM2 cache layer count"))?;
+        let geometry = match topology {
+            None => self
+                .args
+                .layer_schedule
+                .iter()
+                .map(|policy| match policy.operator {
+                    OperatorPolicy::CausalConvolution => resident::Lfm2LayerCacheGeometry {
+                        kv_heads: None,
+                        convolution_channels: Some(self.args.hidden_size),
+                    },
+                    OperatorPolicy::SelfAttention(_) => resident::Lfm2LayerCacheGeometry {
+                        kv_heads: Some(self.args.num_key_value_heads),
+                        convolution_channels: None,
+                    },
+                })
+                .collect(),
+            Some(_) => self.parallel_cache_geometry.clone().ok_or_else(|| {
+                Error::Parallel(
+                    "LFM2 parallel cache identity requested before local layout configuration"
+                        .into(),
+                )
+            })?,
+        };
         Ok(PromptCacheModelIdentity {
             model_family: "lfm2".into(),
             effective_model_type: self.args.model_type.clone(),
@@ -898,7 +963,7 @@ impl ArchitectureAdapter for Lfm2LayerwiseAdapter {
                 PromptCacheTopology::default,
                 PromptCacheTopology::for_parallel_topology,
             ),
-            layer_layout: resident::prompt_cache_layer_layout(&local)
+            layer_layout: resident::prompt_cache_layer_layout_with_geometry(&self.args, &geometry)
                 .map_err(|error| Exception::custom(error.to_string()))?,
         })
     }
@@ -946,21 +1011,34 @@ impl ArchitectureAdapter for Lfm2LayerwiseAdapter {
     }
 
     fn static_units(&self, store: &dyn WeightStore) -> Result<Vec<StaticUnitBindings>, Error> {
-        let mut units = vec![
-            StaticUnitBindings::new(
+        self.selected_static_units(store, &|_| true)
+    }
+
+    fn selected_static_units(
+        &self,
+        store: &dyn WeightStore,
+        select: &dyn Fn(&str) -> bool,
+    ) -> Result<Vec<StaticUnitBindings>, Error> {
+        let mut units = Vec::new();
+        if select(EMBEDDING_UNIT) {
+            units.push(StaticUnitBindings::new(
                 EMBEDDING_UNIT,
                 build_module_bindings(&self.embedding, "model.embed_tokens", store)?,
-            )?,
-            StaticUnitBindings::new(
+            )?);
+        }
+        if select(NORM_UNIT) {
+            units.push(StaticUnitBindings::new(
                 NORM_UNIT,
                 build_module_bindings(&self.norm, "model.embedding_norm", store)?,
-            )?,
-        ];
-        if let Some(head) = &self.lm_head {
-            units.push(StaticUnitBindings::new(
-                HEAD_UNIT,
-                build_module_bindings(head, "lm_head", store)?,
             )?);
+        }
+        if select(HEAD_UNIT) {
+            if let Some(head) = &self.lm_head {
+                units.push(StaticUnitBindings::new(
+                    HEAD_UNIT,
+                    build_module_bindings(head, "lm_head", store)?,
+                )?);
+            }
         }
         Ok(units)
     }
@@ -1075,18 +1153,10 @@ impl ArchitectureAdapter for Lfm2LayerwiseAdapter {
         })
     }
 
-    fn execution_group_count(&self) -> usize {
-        1
-    }
-
-    fn execution_group_id(&self, group: usize) -> Result<String, Error> {
-        if group == 0 {
-            Ok("text_decoder".into())
-        } else {
-            Err(Error::UnsupportedArchitecture(format!(
-                "LFM2 has no execution group {group}"
-            )))
-        }
+    fn execution_graph(
+        &self,
+    ) -> Result<crate::runtime::execution::layerwise::ExecutionGroupDag, Error> {
+        crate::runtime::execution::layerwise::ExecutionGroupDag::chain(["text_decoder"])
     }
 
     fn layer_count(&self, group: usize) -> Result<usize, Error> {
@@ -1134,16 +1204,48 @@ impl ArchitectureAdapter for Lfm2LayerwiseAdapter {
         }
         for index in 0..self.args.num_hidden_layers as usize {
             let layer = DecoderLayer::new(&self.args, index as i32, stream)?;
-            register_lfm2_layer_parallel_plan(planner, &layer, index)?;
+            register_lfm2_layer_parallel_plan(planner, &layer, &self.args, index)?;
         }
         Ok(())
     }
     fn configure_parallel_static(
         &mut self,
         context: crate::runtime::distributed::parallel::ParallelBuildContext,
-        _layout: &crate::runtime::distributed::parallel::LocalModelLayout,
+        layout: &crate::runtime::distributed::parallel::LocalModelLayout,
         stream: &Stream,
     ) -> Result<(), Error> {
+        let head_dim = self.args.hidden_size / self.args.num_attention_heads;
+        let kv_heads = planned_optional_kv_head_layout(
+            layout,
+            self.args
+                .layer_schedule
+                .iter()
+                .map(|policy| matches!(policy.operator, OperatorPolicy::SelfAttention(_))),
+            head_dim,
+            "model.layers",
+        )?;
+        let convolution_channels = planned_optional_partition_widths(
+            layout,
+            self.args
+                .layer_schedule
+                .iter()
+                .map(|policy| policy.operator == OperatorPolicy::CausalConvolution),
+            1,
+            "model.layers",
+            "conv.conv",
+        )?;
+        self.parallel_cache_geometry = Some(
+            kv_heads
+                .into_iter()
+                .zip(convolution_channels)
+                .map(
+                    |(kv_heads, convolution_channels)| resident::Lfm2LayerCacheGeometry {
+                        kv_heads,
+                        convolution_channels,
+                    },
+                )
+                .collect(),
+        );
         self.parallel_embedding = Some(VocabParallelEmbedding::unloaded(
             self.args.vocab_size as usize,
             self.args.hidden_size,
@@ -1180,20 +1282,62 @@ impl ArchitectureAdapter for Lfm2LayerwiseAdapter {
         let mut args = self.args.clone();
         let head_dim = self.args.hidden_size / self.args.num_attention_heads;
         if let Some(q) = find("self_attn.q_proj") {
-            args.num_attention_heads = q.local_shape()[0] as i32 / head_dim;
+            let width = i32::try_from(q.local_shape()[0])
+                .map_err(|_| Error::Parallel("LFM2 local query width exceeds i32".into()))?;
+            if width % head_dim != 0 {
+                return Err(Error::Parallel(format!(
+                    "LFM2 local query width {width} splits head dimension {head_dim}"
+                )));
+            }
+            args.num_attention_heads = width / head_dim;
         }
         if let Some(k) = find("self_attn.k_proj") {
-            args.num_key_value_heads = k.local_shape()[0] as i32 / head_dim;
+            let width = i32::try_from(k.local_shape()[0])
+                .map_err(|_| Error::Parallel("LFM2 local key width exceeds i32".into()))?;
+            if width % head_dim != 0 {
+                return Err(Error::Parallel(format!(
+                    "LFM2 local key width {width} splits head dimension {head_dim}"
+                )));
+            }
+            args.num_key_value_heads = width / head_dim;
         }
-        let dense = find("feed_forward.w1").map_or(args.dense_layer_intermediate_size(), |v| {
-            v.local_shape()[0] as i32
-        });
+        let dense = find("feed_forward.w1")
+            .map(|value| {
+                i32::try_from(value.local_shape()[0])
+                    .map_err(|_| Error::Parallel("LFM2 local dense width exceeds i32".into()))
+            })
+            .transpose()?
+            .unwrap_or(args.dense_intermediate_size);
         let moe = layout
             .tensor(&format!("{prefix}.feed_forward.experts.gate_up_proj"))
-            .map_or(args.moe_intermediate_size, |v| {
-                v.local_shape()[1] as i32 / 2
-            });
-        DecoderLayer::new_with_widths(&args, index as i32, dense, moe, Some(head_dim), stream)
+            .map(|value| {
+                let packed = i32::try_from(value.local_shape()[1])
+                    .map_err(|_| Error::Parallel("LFM2 local expert width exceeds i32".into()))?;
+                if packed % 2 != 0 {
+                    return Err(Error::Parallel(format!(
+                        "LFM2 packed expert width {packed} does not contain equal gate/up segments"
+                    )));
+                }
+                Ok(packed / 2)
+            })
+            .transpose()?
+            .unwrap_or(args.moe_intermediate_size);
+        let convolution_channels = layout
+            .tensor(&format!("{prefix}.conv.conv.weight"))
+            .map(|value| {
+                i32::try_from(value.local_shape()[0])
+                    .map_err(|_| Error::Parallel("LFM2 local convolution width exceeds i32".into()))
+            })
+            .transpose()?;
+        DecoderLayer::new_with_widths(
+            &args,
+            index as i32,
+            dense,
+            moe,
+            Some(head_dim),
+            convolution_channels,
+            stream,
+        )
     }
 
     fn layer_checkpoint_prefix(&self, _group: usize, index: usize) -> String {
@@ -1328,11 +1472,7 @@ impl ArchitectureAdapter for Lfm2LayerwiseAdapter {
                 |flat, indices, weights, stream| {
                     expert_cache
                         .execute_routes_bounded(
-                            index,
-                            flat,
-                            indices,
-                            weights,
-                            pass,
+                            ExpertRouteBatch::new(index, flat, indices, weights, pass),
                             stream,
                             |flat, acquired, weights, stream| {
                                 let started = Instant::now();
@@ -1654,7 +1794,7 @@ pub type Generate<'a, S = crate::runtime::generation::sampler::DefaultSampler> =
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, path::Path};
+    use std::{collections::HashMap, fs, path::Path};
 
     use safemlx::{
         module::ModuleParameters,
@@ -1671,6 +1811,7 @@ mod tests {
             self as resident, Cache, FeedForwardPolicy, LayerCache, LayerPolicy, Model, ModelArgs,
             OperatorPolicy,
         },
+        runtime::checkpoint::quantization::AffineQuantization,
         runtime::residency::dense_stream::DenseDiskStreamLoadOptions,
         runtime::residency::expert_cache::ExpertCacheLoadOptions,
         runtime::residency::policy::{MemoryTier, OffloadConfig, ResidencyPolicy},
@@ -1690,20 +1831,20 @@ mod tests {
     fn args(moe: bool) -> ModelArgs {
         resident::model_args_from_config_value(&serde_json::json!({
             "model_type": if moe { "lfm2_moe" } else { "lfm2" },
-            "vocab_size": 32,
-            "hidden_size": 16,
-            "intermediate_size": 24,
+            "vocab_size": 31,
+            "hidden_size": 12,
+            "intermediate_size": 17,
             "num_hidden_layers": 3,
-            "num_attention_heads": 4,
-            "num_key_value_heads": 2,
+            "num_attention_heads": 6,
+            "num_key_value_heads": 3,
             "max_position_embeddings": 64,
             "norm_eps": 1e-5,
             "layer_types": ["conv", "full_attention", "conv"],
             "conv_L_cache": 3,
-            "conv_bias": false,
+            "conv_bias": true,
             "block_auto_adjust_ff_dim": false,
             "tie_word_embeddings": false,
-            "moe_intermediate_size": if moe { 8 } else { 0 },
+            "moe_intermediate_size": if moe { 9 } else { 0 },
             "num_dense_layers": if moe { 1 } else { 0 },
             "num_experts": if moe { 2 } else { 0 },
             "num_experts_per_tok": if moe { 1 } else { 0 },
@@ -1715,39 +1856,186 @@ mod tests {
 
     #[test]
     fn tensor_parallel_plan_preserves_attention_and_packed_moe_geometry() {
+        use crate::runtime::cache::residency::{LayerCachePolicy, StateTensorDimension};
+
         let execution = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
-        let adapter = Lfm2LayerwiseAdapter::new(args(true), execution.stream()).unwrap();
-        let context = ParallelBuildContext::new(
-            ParallelTopology::from_rank(2, 0, 2, 1, 1, DeviceAssignment::new(DeviceType::Cpu, 0))
-                .unwrap(),
-            ShardingPolicy::Require,
-        );
-        let mut planner = context.planner();
-        adapter
-            .register_parallel_parameters(context, &mut planner, execution.stream())
+        for (rank, query_width, kv_width, dense_width, expert_width, local_kv_heads) in
+            [(0, 8, 4, 9, 5, 2_u32), (1, 4, 2, 8, 4, 1_u32)]
+        {
+            let topology = ParallelTopology::from_rank(
+                2,
+                rank,
+                2,
+                1,
+                1,
+                DeviceAssignment::new(DeviceType::Cpu, 0),
+            )
             .unwrap();
-        let (_, layout) = planner.finish().unwrap();
-        assert_eq!(
-            layout
-                .tensor("model.layers.1.self_attn.q_proj.weight")
-                .unwrap()
-                .local_shape(),
-            &[8, 16]
-        );
-        assert_eq!(
-            layout
-                .tensor("model.layers.1.feed_forward.experts.gate_up_proj")
-                .unwrap()
-                .local_shape(),
-            &[2, 8, 16]
-        );
-        assert_eq!(
-            layout
-                .tensor("model.layers.1.feed_forward.experts.down_proj")
-                .unwrap()
-                .local_shape(),
-            &[2, 16, 4]
-        );
+            let context = ParallelBuildContext::new(topology, ShardingPolicy::Require);
+            let mut adapter = Lfm2LayerwiseAdapter::new(args(true), execution.stream()).unwrap();
+            assert!(adapter.prompt_cache_model_identity(Some(topology)).is_err());
+            let mut planner = context.planner();
+            adapter
+                .register_parallel_parameters(context, &mut planner, execution.stream())
+                .unwrap();
+            let (_, layout) = planner.finish().unwrap();
+            for (name, expected) in [
+                (
+                    "model.layers.1.self_attn.q_proj.weight",
+                    vec![query_width, 12],
+                ),
+                ("model.layers.1.self_attn.k_proj.weight", vec![kv_width, 12]),
+                (
+                    "model.layers.0.feed_forward.w1.weight",
+                    vec![dense_width, 12],
+                ),
+                (
+                    "model.layers.0.feed_forward.w2.weight",
+                    vec![12, dense_width],
+                ),
+                (
+                    "model.layers.1.feed_forward.experts.gate_up_proj",
+                    vec![2, 2 * expert_width, 12],
+                ),
+                (
+                    "model.layers.1.feed_forward.experts.down_proj",
+                    vec![2, 12, expert_width],
+                ),
+                ("model.layers.0.conv.in_proj.weight", vec![18, 12]),
+                ("model.layers.0.conv.in_proj.bias", vec![18]),
+                ("model.layers.0.conv.conv.weight", vec![6, 1, 3]),
+                ("model.layers.0.conv.conv.bias", vec![6]),
+                ("model.layers.0.conv.out_proj.weight", vec![12, 6]),
+                ("model.layers.0.conv.out_proj.bias", vec![12]),
+            ] {
+                assert_eq!(layout.tensor(name).unwrap().local_shape(), expected);
+            }
+
+            adapter
+                .configure_parallel_static(context, &layout, execution.stream())
+                .unwrap();
+            let identity = adapter.prompt_cache_model_identity(Some(topology)).unwrap();
+            let assert_convolution = |policy: &LayerCachePolicy| {
+                let LayerCachePolicy::FixedState { tensors } = policy else {
+                    panic!("LFM2 convolution layer must persist fixed state")
+                };
+                assert_eq!(
+                    tensors[0].shape,
+                    vec![
+                        StateTensorDimension::Batch,
+                        StateTensorDimension::fixed(2).unwrap(),
+                        StateTensorDimension::fixed(6).unwrap(),
+                    ]
+                );
+            };
+            assert_convolution(identity.layer_layout.get(0).unwrap());
+            let LayerCachePolicy::KeyValue {
+                num_key_value_heads,
+                head_dim,
+                ..
+            } = identity.layer_layout.get(1).unwrap()
+            else {
+                panic!("LFM2 attention layer must persist KV state")
+            };
+            assert_eq!(num_key_value_heads.get(), local_kv_heads);
+            assert_eq!(head_dim.get(), 2);
+            assert_convolution(identity.layer_layout.get(2).unwrap());
+        }
+    }
+
+    #[test]
+    fn quantized_lfm2_groups_share_aligned_attention_dense_and_expert_ranges() {
+        let execution = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        let quantization = AffineQuantization::new(32, 4).unwrap().into();
+        let mut args = args(true);
+        args.hidden_size = 96;
+        args.dense_intermediate_size = 96;
+        args.num_attention_heads = 6;
+        args.num_key_value_heads = 3;
+        args.moe_intermediate_size = 96;
+        args.quantized_weight_configs = Some(HashMap::from([
+            ("model.layers.0.conv.in_proj.weight".into(), quantization),
+            ("model.layers.0.conv.out_proj.weight".into(), quantization),
+            ("model.layers.0.feed_forward.w2.weight".into(), quantization),
+            (
+                "model.layers.1.self_attn.out_proj.weight".into(),
+                quantization,
+            ),
+            (
+                "model.layers.1.feed_forward.experts.down_proj".into(),
+                quantization,
+            ),
+        ]));
+
+        for (rank, query_width, kv_width, local_width, packed_width, scale_width) in
+            [(0, 64, 32, 64, 8, 2), (1, 32, 16, 32, 4, 1)]
+        {
+            let topology = ParallelTopology::from_rank(
+                2,
+                rank,
+                2,
+                1,
+                1,
+                DeviceAssignment::new(DeviceType::Cpu, 0),
+            )
+            .unwrap();
+            let context = ParallelBuildContext::new(topology, ShardingPolicy::Require);
+            let adapter = Lfm2LayerwiseAdapter::new(args.clone(), execution.stream()).unwrap();
+            let mut planner = context.planner();
+            adapter
+                .register_parallel_parameters(context, &mut planner, execution.stream())
+                .unwrap();
+            let (_, layout) = planner.finish().unwrap();
+            for (name, expected) in [
+                (
+                    "model.layers.1.self_attn.q_proj.weight",
+                    vec![query_width, 96],
+                ),
+                ("model.layers.1.self_attn.k_proj.weight", vec![kv_width, 96]),
+                (
+                    "model.layers.0.feed_forward.w1.weight",
+                    vec![local_width, 96],
+                ),
+                (
+                    "model.layers.0.feed_forward.w2.inner.weight",
+                    vec![96, packed_width],
+                ),
+                (
+                    "model.layers.0.feed_forward.w2.scales",
+                    vec![96, scale_width],
+                ),
+                (
+                    "model.layers.1.feed_forward.experts.gate_up_proj",
+                    vec![2, 2 * local_width, 96],
+                ),
+                (
+                    "model.layers.1.feed_forward.experts.down_proj",
+                    vec![2, 96, packed_width],
+                ),
+                (
+                    "model.layers.1.feed_forward.experts.down_proj_scales",
+                    vec![2, 96, scale_width],
+                ),
+                (
+                    "model.layers.0.conv.in_proj.inner.weight",
+                    vec![3 * local_width, 12],
+                ),
+                (
+                    "model.layers.0.conv.in_proj.inner.bias",
+                    vec![3 * local_width],
+                ),
+                ("model.layers.0.conv.conv.weight", vec![local_width, 1, 3]),
+                ("model.layers.0.conv.conv.bias", vec![local_width]),
+                (
+                    "model.layers.0.conv.out_proj.inner.weight",
+                    vec![96, packed_width],
+                ),
+                ("model.layers.0.conv.out_proj.inner.bias", vec![96]),
+                ("model.layers.0.conv.out_proj.scales", vec![96, scale_width]),
+            ] {
+                assert_eq!(layout.tensor(name).unwrap().local_shape(), expected);
+            }
+        }
     }
 
     fn initialize(model: &mut Model, stream: &Stream) {
@@ -1823,7 +2111,7 @@ mod tests {
                 "model_type": model.args.model_type,
                 "vocab_size": model.args.vocab_size,
                 "hidden_size": model.args.hidden_size,
-                "intermediate_size": model.args.intermediate_size,
+                "intermediate_size": model.args.dense_intermediate_size,
                 "num_hidden_layers": model.args.num_hidden_layers,
                 "num_attention_heads": model.args.num_attention_heads,
                 "num_key_value_heads": model.args.num_key_value_heads,

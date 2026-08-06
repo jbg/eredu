@@ -11,25 +11,24 @@ use safemlx::{
 };
 
 use crate::{
-    api::realtime::{
-        RealtimeSampling, RealtimeSpeechConfig, RealtimeSpeechModel, RealtimeStepInput,
-        RealtimeStepOutput,
-    },
+    api::realtime::{RealtimeSpeechConfig, RealtimeStepOutput},
     architectures::moshi::model::{
         self as resident, DepFormerSlice, ModelArgs, MoshiCache, MoshiLayerwiseStatic,
         MoshiTransformerLayer, SampleStepOutput, TokenStepOutput,
     },
     error::Error,
     runtime::cache::KeyValueCache,
+    runtime::checkpoint::artifact::LoadedArtifactIdentity,
     runtime::checkpoint::binding::{
         build_module_bindings, build_module_bindings_with_recipes, populate_module_from_lease,
     },
     runtime::checkpoint::recipe::DerivedWeightRecipe,
     runtime::checkpoint::store::{TensorSelection, WeightStore},
     runtime::execution::layerwise::{
-        load_safetensors_layerwise_model, load_tensor_parallel_layerwise_model,
-        open_safetensors_weight_store, ArchitectureAdapter, LayerwiseForwardState, LayerwiseModel,
-        StaticUnitBindings,
+        load_layerwise_model, load_safetensors_layerwise_model,
+        load_tensor_parallel_layerwise_model, open_safetensors_weight_store,
+        transformed_module_weight_store, ArchitectureAdapter, LayerExecutionLoadOptions,
+        LayerwiseForwardState, LayerwiseModel, StaticUnitBindings,
     },
     runtime::generation::sampler::Sampler,
     runtime::residency::manager::{
@@ -48,9 +47,19 @@ enum CheckpointLayout {
 /// Moshi-family model with independent temporal and depth-codebook residency windows.
 pub struct MoshiLayerwiseModel {
     execution: LayerwiseModel<MoshiLayerwiseAdapter>,
+    artifact_identity: LoadedArtifactIdentity,
 }
 
 impl MoshiLayerwiseModel {
+    pub(crate) fn with_artifact_identity(mut self, identity: LoadedArtifactIdentity) -> Self {
+        self.artifact_identity = identity;
+        self
+    }
+
+    pub(crate) fn artifact_identity(&self) -> &LoadedArtifactIdentity {
+        &self.artifact_identity
+    }
+
     /// Returns the parsed Moshi-family configuration.
     pub fn args(&self) -> &ModelArgs {
         self.execution.adapter().args()
@@ -59,6 +68,19 @@ impl MoshiLayerwiseModel {
     /// Allocates empty temporal and within-frame depth caches.
     pub fn new_cache(&self) -> MoshiCache {
         new_cache(self.args())
+    }
+
+    /// Returns the codec-token stream geometry consumed by realtime scheduling.
+    pub fn realtime_config(&self) -> RealtimeSpeechConfig<'_> {
+        RealtimeSpeechConfig {
+            total_audio_codebooks: self.args().n_q,
+            input_audio_codebooks: self.args().input_audio_codebooks(),
+            generated_audio_codebooks: self.args().generated_audio_codebooks(),
+            depth_audio_codebooks: self.args().dep_q,
+            text_padding_token: self.args().text_padding_token(),
+            audio_padding_token: self.args().audio_padding_token(),
+            audio_delays: self.args().audio_delays(),
+        }
     }
 
     /// Returns current logical residency and transfer telemetry.
@@ -94,11 +116,6 @@ impl MoshiLayerwiseModel {
     /// Returns the persistent checkpoint store.
     pub fn checkpoint_store(&self) -> &(dyn WeightStore + Send + Sync) {
         self.execution.checkpoint_store()
-    }
-
-    /// Backward-compatible alias for [`Self::checkpoint_store`].
-    pub fn weight_store(&self) -> &(dyn WeightStore + Send + Sync) {
-        self.checkpoint_store()
     }
 
     /// Runs one frame with teacher-forced depth inputs.
@@ -387,7 +404,7 @@ impl MoshiLayerwiseModel {
         audio_tokens: &Array,
         cache: &mut MoshiCache,
         stream: &Stream,
-    ) -> Result<resident::GreedyStepOutput, Exception> {
+    ) -> Result<resident::SampleStepOutput, Exception> {
         let mut text_sampler = crate::runtime::generation::sampler::DefaultSampler;
         let mut audio_samplers = (0..self.args().dep_q)
             .map(|_| crate::runtime::generation::sampler::DefaultSampler)
@@ -427,7 +444,7 @@ impl MoshiLayerwiseModel {
         audio_temperature: f32,
         prng_state: Option<&mut RandomState>,
         stream: &Stream,
-    ) -> Result<resident::GenerationStepOutput, Exception> {
+    ) -> Result<RealtimeStepOutput, Exception> {
         self.generate_step_forced(
             state,
             input_audio_tokens,
@@ -456,7 +473,7 @@ impl MoshiLayerwiseModel {
         audio_temperature: f32,
         prng_state: Option<&mut RandomState>,
         stream: &Stream,
-    ) -> Result<resident::GenerationStepOutput, Exception> {
+    ) -> Result<RealtimeStepOutput, Exception> {
         if self.args().existing_text_padding_id.is_some() && self.args().dep_q == self.args().n_q {
             return self.generate_step_pytorch_style(
                 state,
@@ -498,7 +515,7 @@ impl MoshiLayerwiseModel {
         audio_temperature: f32,
         prng_state: Option<&mut RandomState>,
         stream: &Stream,
-    ) -> Result<resident::GenerationStepOutput, Exception> {
+    ) -> Result<RealtimeStepOutput, Exception> {
         let args = self.args().clone();
         let input_codebooks = args.input_audio_codebooks();
         if input_audio_tokens.shape().len() != 2 || input_audio_tokens.dim(1) != input_codebooks {
@@ -638,7 +655,7 @@ impl MoshiLayerwiseModel {
             .transpose()?;
         state.previous_text = Some(sampled.text_token.clone());
         state.step += 1;
-        Ok(resident::GenerationStepOutput {
+        Ok(RealtimeStepOutput {
             text_token: sampled.text_token,
             sampled_audio_tokens: sampled.audio_tokens,
             output_audio_tokens,
@@ -658,7 +675,7 @@ impl MoshiLayerwiseModel {
         audio_temperature: f32,
         prng_state: Option<&mut RandomState>,
         stream: &Stream,
-    ) -> Result<resident::GenerationStepOutput, Exception> {
+    ) -> Result<RealtimeStepOutput, Exception> {
         let args = self.args().clone();
         let input_codebooks = args.input_audio_codebooks();
         if input_audio_tokens.shape().len() != 2 || input_audio_tokens.dim(1) != input_codebooks {
@@ -724,7 +741,7 @@ impl MoshiLayerwiseModel {
         }
         if offset == 0 {
             state.step += 1;
-            return Ok(resident::GenerationStepOutput {
+            return Ok(RealtimeStepOutput {
                 text_token: Array::full::<i32>(
                     &[batch, 1],
                     Array::from_int(args.text_card),
@@ -804,54 +821,11 @@ impl MoshiLayerwiseModel {
         };
         state.previous_text = Some(sampled.text_token.clone());
         state.step += 1;
-        Ok(resident::GenerationStepOutput {
+        Ok(RealtimeStepOutput {
             text_token: sampled.text_token,
             sampled_audio_tokens: sampled.audio_tokens,
             output_audio_tokens,
         })
-    }
-}
-
-impl RealtimeSpeechModel for MoshiLayerwiseModel {
-    type State = resident::GenerationState;
-
-    fn realtime_config(&self) -> RealtimeSpeechConfig<'_> {
-        RealtimeSpeechConfig {
-            total_audio_codebooks: self.args().n_q,
-            input_audio_codebooks: self.args().input_audio_codebooks(),
-            generated_audio_codebooks: self.args().generated_audio_codebooks(),
-            depth_audio_codebooks: self.args().dep_q,
-            text_padding_token: self.args().text_padding_token(),
-            audio_padding_token: self.args().audio_padding_token(),
-            audio_delays: self.args().audio_delays(),
-        }
-    }
-
-    fn new_realtime_state(&self) -> Self::State {
-        self.new_generation_state()
-    }
-
-    fn step_realtime<TS, AS>(
-        &mut self,
-        state: &mut Self::State,
-        input: RealtimeStepInput<'_>,
-        sampling: RealtimeSampling<'_, TS, AS>,
-        stream: &Stream,
-    ) -> Result<RealtimeStepOutput, Exception>
-    where
-        TS: Sampler,
-        AS: Sampler,
-    {
-        self.generate_step(
-            state,
-            input.input_audio_tokens,
-            sampling.text_sampler,
-            sampling.audio_samplers,
-            sampling.text_temperature,
-            sampling.audio_temperature,
-            sampling.prng_state,
-            stream,
-        )
     }
 }
 
@@ -956,6 +930,7 @@ pub fn load_moshi_tensor_parallel_layerwise_model(
             stream,
             weights_stream,
         )?,
+        artifact_identity: LoadedArtifactIdentity::in_memory(),
     })
 }
 
@@ -986,6 +961,46 @@ pub fn load_personaplex_layerwise_model(
     )
 }
 
+/// Loads an explicit PyTorch-layout Moshi-family checkpoint through the
+/// canonical generalized engine.
+pub fn load_pytorch_layerwise_model(
+    args: ModelArgs,
+    checkpoint: impl AsRef<Path>,
+    options: impl Into<LayerExecutionLoadOptions>,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<MoshiLayerwiseModel, Error> {
+    load_with_layout(
+        checkpoint,
+        args,
+        CheckpointLayout::Pytorch,
+        options,
+        stream,
+        weights_stream,
+    )
+}
+
+/// Hands a completed Moshi/PersonaPlex load-time transformation to the
+/// canonical generalized execution engine.
+pub(crate) fn execute_transformed_model(
+    model: resident::Model,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<MoshiLayerwiseModel, Error> {
+    let adapter = MoshiLayerwiseAdapter::new(model.args.clone(), CheckpointLayout::Native, stream)?;
+    let store = transformed_module_weight_store(&model)?;
+    Ok(MoshiLayerwiseModel {
+        execution: load_layerwise_model(
+            store,
+            adapter,
+            LayerExecutionLoadOptions::FullyResident,
+            stream,
+            weights_stream,
+        )?,
+        artifact_identity: LoadedArtifactIdentity::in_memory(),
+    })
+}
+
 /// Loads PersonaPlex with rank-local temporal and depth transformers.
 pub fn load_personaplex_tensor_parallel_layerwise_model(
     model_dir: impl AsRef<Path>,
@@ -1014,6 +1029,7 @@ pub fn load_personaplex_tensor_parallel_layerwise_model(
             stream,
             weights_stream,
         )?,
+        artifact_identity: LoadedArtifactIdentity::in_memory(),
     })
 }
 
@@ -1034,6 +1050,7 @@ fn load_with_layout(
             stream,
             weights_stream,
         )?,
+        artifact_identity: LoadedArtifactIdentity::in_memory(),
     })
 }
 
@@ -1349,18 +1366,13 @@ impl ArchitectureAdapter for MoshiLayerwiseAdapter {
         })
     }
 
-    fn execution_group_count(&self) -> usize {
-        2
-    }
-
-    fn execution_group_id(&self, group: usize) -> Result<String, Error> {
-        match group {
-            0 => Ok("temporal_transformer".into()),
-            1 => Ok("depth_codebook_slices".into()),
-            _ => Err(Error::UnsupportedArchitecture(format!(
-                "Moshi has no execution group {group}"
-            ))),
-        }
+    fn execution_graph(
+        &self,
+    ) -> Result<crate::runtime::execution::layerwise::ExecutionGroupDag, Error> {
+        crate::runtime::execution::layerwise::ExecutionGroupDag::chain([
+            "temporal_transformer",
+            "depth_codebook_slices",
+        ])
     }
 
     fn layer_count(&self, group: usize) -> Result<usize, Error> {
@@ -2091,15 +2103,22 @@ mod tests {
 
     use super::*;
     use crate::{
-        api::moshi as eager,
-        api::realtime::{generate_encoded_greedy, RealtimeSpeechModel},
+        api::realtime::{
+            generate_encoded_greedy, LoadedRealtimeModel, RealtimeInferenceScheduler,
+            RealtimeSampling,
+        },
+        api::{moshi as eager, ModelLoadOptions},
         runtime::distributed::{
             parallel::{ParallelBuildContext, ShardingPolicy},
             topology::{DeviceAssignment, ParallelTopology},
         },
-        runtime::execution::layerwise::{LayerExecutionLoadOptions, LayerwiseLoadOptions},
+        runtime::execution::layerwise::{
+            LayerExecutionLoadOptions, LayerwiseLoadOptions, WeightResidency,
+        },
+        runtime::generation::sampler::DefaultSampler,
         runtime::residency::dense_stream::DenseDiskStreamLoadOptions,
         runtime::residency::policy::{MemoryTier, OffloadConfig},
+        runtime::scheduler::{RequestId, SchedulerLimits},
     };
 
     fn config() -> &'static str {
@@ -2280,6 +2299,71 @@ mod tests {
 
     #[test]
     #[ignore = "requires an MLX runtime with a Metal device"]
+    fn realtime_session_identity_tracks_checkpoint_content_across_residency() {
+        let gpu = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
+        let cpu = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        let source = fixture(&gpu);
+        let resident =
+            crate::api::realtime::load_model(source.path(), gpu.stream(), cpu.stream()).unwrap();
+        let layerwise = crate::api::realtime::load_model_with_options(
+            source.path(),
+            ModelLoadOptions::default().with_weight_residency(WeightResidency::LayerwiseHost(
+                LayerwiseLoadOptions::new(OffloadConfig::new(None, None, 1).unwrap()),
+            )),
+            gpu.stream(),
+            cpu.stream(),
+        )
+        .unwrap();
+
+        let request = RequestId::new(19);
+        let samplers = || vec![DefaultSampler, DefaultSampler];
+        let mut resident_scheduler =
+            RealtimeInferenceScheduler::new(&resident, SchedulerLimits::new(1, 1).unwrap())
+                .unwrap();
+        resident_scheduler
+            .register_request(
+                &resident,
+                request,
+                DefaultSampler,
+                samplers(),
+                RealtimeSampling::greedy(),
+            )
+            .unwrap();
+        let session = resident_scheduler.release_request(request).unwrap();
+
+        let mut layerwise_scheduler =
+            RealtimeInferenceScheduler::new(&layerwise, SchedulerLimits::new(1, 1).unwrap())
+                .unwrap();
+        layerwise_scheduler
+            .register_request_with_session(&layerwise, request, session)
+            .unwrap();
+        let session = layerwise_scheduler.release_request(request).unwrap();
+
+        let changed = tempfile::tempdir().unwrap();
+        fs::copy(
+            source.path().join("config.json"),
+            changed.path().join("config.json"),
+        )
+        .unwrap();
+        let mut weights = fs::read(source.path().join("model.safetensors")).unwrap();
+        let last = weights.last_mut().unwrap();
+        *last ^= 1;
+        fs::write(changed.path().join("model.safetensors"), weights).unwrap();
+        let changed_model =
+            crate::api::realtime::load_model(changed.path(), gpu.stream(), cpu.stream()).unwrap();
+        let mut changed_scheduler =
+            RealtimeInferenceScheduler::new(&changed_model, SchedulerLimits::new(1, 1).unwrap())
+                .unwrap();
+        let error = changed_scheduler
+            .register_request_with_session(&changed_model, request, session)
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("checkpoint artifact fingerprint"));
+    }
+
+    #[test]
+    #[ignore = "requires an MLX runtime with a Metal device"]
     fn tensor_parallel_dense_stream_loads_realtime_static_and_groups() {
         let gpu = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
         let cpu = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
@@ -2357,8 +2441,8 @@ mod tests {
             assert_close(expected, actual);
         }
 
-        let mut resident_state = resident.new_realtime_state();
-        let mut layerwise_state = layerwise.new_realtime_state();
+        let mut resident_state = resident::GenerationState::new(&resident);
+        let mut layerwise_state = layerwise.new_generation_state();
         let input = Array::from_slice(&[4i32, 5], &[1, 2]);
         let mut resident_text = crate::runtime::generation::sampler::DefaultSampler;
         let mut layerwise_text = crate::runtime::generation::sampler::DefaultSampler;
@@ -2437,7 +2521,7 @@ mod tests {
         .unwrap();
         assert!(matches!(
             &loaded,
-            crate::api::realtime::LoadedRealtimeModel::MoshiLayerwise(_)
+            crate::api::realtime::LoadedRealtimeModel::Moshi(_)
         ));
         assert_eq!(loaded.execution_group_reports().unwrap().unwrap().len(), 2);
     }
@@ -2490,8 +2574,8 @@ mod tests {
             assert_close(expected, actual);
         }
 
-        let mut resident_state = resident.new_realtime_state();
-        let mut streamed_state = streamed.new_realtime_state();
+        let mut resident_state = resident::GenerationState::new(&resident);
+        let mut streamed_state = streamed.new_generation_state();
         let input = Array::from_slice(&[4i32, 5], &[1, 2]);
         let mut resident_text = crate::runtime::generation::sampler::DefaultSampler;
         let mut streamed_text = crate::runtime::generation::sampler::DefaultSampler;
@@ -2548,7 +2632,7 @@ mod tests {
         .unwrap();
         assert!(matches!(
             &loaded,
-            crate::api::realtime::LoadedRealtimeModel::MoshiLayerwise(_)
+            crate::api::realtime::LoadedRealtimeModel::Moshi(_)
         ));
         assert!(loaded.dense_stream_report().unwrap().is_some());
     }
@@ -2559,8 +2643,14 @@ mod tests {
         let gpu = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
         let cpu = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
         let dir = fixture(&gpu);
-        let mut resident = eager::load_model(dir.path(), gpu.stream(), cpu.stream()).unwrap();
-        let mut layerwise = load_moshi_layerwise_model(
+        let resident = load_moshi_layerwise_model(
+            dir.path(),
+            LayerExecutionLoadOptions::FullyResident,
+            gpu.stream(),
+            cpu.stream(),
+        )
+        .unwrap();
+        let layerwise = load_moshi_layerwise_model(
             dir.path(),
             LayerwiseLoadOptions::new(OffloadConfig::new(None, None, 1).unwrap()),
             gpu.stream(),
@@ -2568,6 +2658,8 @@ mod tests {
         )
         .unwrap();
         let input = Array::from_slice(&[1i32, 2, 3, 4, 5, 6], &[1, 2, 3]);
+        let mut resident = LoadedRealtimeModel::Moshi(resident);
+        let mut layerwise = LoadedRealtimeModel::Moshi(layerwise);
         let expected = generate_encoded_greedy(&mut resident, &input, gpu.stream()).unwrap();
         let actual = generate_encoded_greedy(&mut layerwise, &input, gpu.stream()).unwrap();
         assert_eq!(
@@ -2604,8 +2696,8 @@ mod tests {
             cpu.stream(),
         )
         .unwrap();
-        let mut resident_state = resident.new_realtime_state();
-        let mut layerwise_state = layerwise.new_realtime_state();
+        let mut resident_state = resident::GenerationState::new(&resident);
+        let mut layerwise_state = layerwise.new_generation_state();
         let user = Array::from_slice(&[3i32, 4], &[1, 2]);
         let agent = Array::from_slice(&[1i32, 2], &[1, 2]);
         let forced_text = Array::from_slice(&[5i32], &[1, 1]);
@@ -2620,17 +2712,20 @@ mod tests {
 
         for forced in [true, true, false] {
             let expected = if forced {
-                crate::architectures::moshi::personaplex::step_prompt_frame_greedy(
-                    &mut resident,
-                    &mut resident_state,
-                    crate::architectures::moshi::personaplex::PromptFrame {
-                        agent_audio_tokens: &agent,
-                        user_audio_tokens: &user,
-                        text_token: &forced_text,
-                    },
-                    gpu.stream(),
-                )
-                .unwrap()
+                resident
+                    .generate_step_forced(
+                        &mut resident_state,
+                        &user,
+                        Some(&agent),
+                        Some(&forced_text),
+                        &mut resident_text,
+                        &mut resident_audio,
+                        0.0,
+                        0.0,
+                        None,
+                        gpu.stream(),
+                    )
+                    .unwrap()
             } else {
                 resident
                     .generate_step(
@@ -2646,17 +2741,20 @@ mod tests {
                     .unwrap()
             };
             let actual = if forced {
-                crate::architectures::moshi::personaplex::step_prompt_frame_greedy(
-                    &mut layerwise,
-                    &mut layerwise_state,
-                    crate::architectures::moshi::personaplex::PromptFrame {
-                        agent_audio_tokens: &agent,
-                        user_audio_tokens: &user,
-                        text_token: &forced_text,
-                    },
-                    gpu.stream(),
-                )
-                .unwrap()
+                layerwise
+                    .generate_step_forced(
+                        &mut layerwise_state,
+                        &user,
+                        Some(&agent),
+                        Some(&forced_text),
+                        &mut layerwise_text,
+                        &mut layerwise_audio,
+                        0.0,
+                        0.0,
+                        None,
+                        gpu.stream(),
+                    )
+                    .unwrap()
             } else {
                 layerwise
                     .generate_step(

@@ -63,10 +63,9 @@ their individual tensors use the encodings listed above (and the existing dense
 or K-quant encodings). In particular, dynamic Q2_K/Q3_K recipes that select
 IQ4_NL for some tensors are supported.
 
-Codes 36, 37, and 38 (`IQ4_NL_4_4`, `IQ4_NL_4_8`, and `IQ4_NL_8_8`) are known
-by `GgmlType` for diagnostics, but current upstream explicitly marks them as
-removed runtime-repacking layouts with zero block/type sizes. They were never
-canonical GGUF tensor encodings and are therefore rejected rather than guessed.
+Codes 36, 37, and 38 (`IQ4_NL_4_4`, `IQ4_NL_4_8`, and `IQ4_NL_8_8`) have zero
+block/type sizes and are not canonical GGUF tensor encodings. `GgmlType`
+recognizes them for diagnostics, and the reader rejects them.
 
 `Limits` bounds metadata counts, string/array sizes, tensor counts and ranks,
 nesting depth, and per-tensor allocation. Parsing uses checked arithmetic and
@@ -74,7 +73,7 @@ rejects duplicate names, invalid alignment, impossible block shapes, truncated
 or out-of-range data, and overlapping tensor ranges.
 
 The affine conversion code is a Rust translation of Apple MLX v0.32.0's
-`mlx/io/gguf_quants.cpp` and the former safemlx K-quant patches (MIT licensed).
+`mlx/io/gguf_quants.cpp` and SafeMLX K-quant code (MIT licensed).
 The IQ decoder and codebooks are safe Rust translations of the pinned
 llama.cpp scalar implementation. See `tests/fixtures/README.md` for both
 differential oracle provenances.

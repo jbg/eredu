@@ -2,7 +2,8 @@
 //!
 //! Runtime parallelism is deliberately independent of architecture metadata in
 //! `config.json`. In particular, a checkpoint's `ep_size` describes how that
-//! checkpoint was written, while [`ParallelTopology::expert_parallel_size`]
+//! checkpoint was written, while
+//! [`crate::runtime::distributed::topology::ParallelTopology::expert_parallel_size`]
 //! describes how the current inference job is arranged.
 
 use std::{

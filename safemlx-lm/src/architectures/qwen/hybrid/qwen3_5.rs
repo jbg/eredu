@@ -298,6 +298,109 @@ pub struct ModelArgs {
     pub quantized_weight_configs: Option<HashMap<String, WeightQuantization>>,
 }
 
+/// Rank-local execution geometry for one hybrid decoder layer.
+///
+/// Attention/recurrent heads and feed-forward intermediates are independent
+/// logical partition domains. Keeping both dimensions explicit prevents
+/// packed checkpoint shapes from becoming an accidental source of runtime
+/// geometry.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub(crate) struct ParallelLayerGeometry {
+    pub attention: ParallelAttentionGeometry,
+    pub feed_forward: ParallelFeedForwardGeometry,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub(crate) enum ParallelAttentionGeometry {
+    Full { query_heads: i32, kv_heads: i32 },
+    Linear { key_heads: i32, value_heads: i32 },
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub(crate) enum ParallelFeedForwardGeometry {
+    Dense {
+        intermediate: i32,
+    },
+    Moe {
+        routed_intermediate: i32,
+        shared_intermediate: i32,
+    },
+}
+
+impl ParallelLayerGeometry {
+    fn resident(args: &ModelArgs, layer: usize) -> Result<Self, Error> {
+        let attention = match args.layer_schedule.get(layer).copied() {
+            Some(LayerPolicy::SelfAttention(AttentionPolicy::Full)) => {
+                ParallelAttentionGeometry::Full {
+                    query_heads: args.num_attention_heads,
+                    kv_heads: args.num_key_value_heads,
+                }
+            }
+            Some(LayerPolicy::LinearAttention) => ParallelAttentionGeometry::Linear {
+                key_heads: args.linear_num_key_heads,
+                value_heads: args.linear_num_value_heads,
+            },
+            Some(LayerPolicy::SelfAttention(AttentionPolicy::Sliding { .. })) => {
+                return Err(Error::UnsupportedArchitecture(
+                    "Qwen hybrid execution does not support sliding self-attention".into(),
+                ));
+            }
+            None => {
+                return Err(Error::UnsupportedArchitecture(format!(
+                    "Qwen hybrid layer schedule has no decoder layer {layer}"
+                )));
+            }
+        };
+        let feed_forward = if args.is_moe() {
+            ParallelFeedForwardGeometry::Moe {
+                routed_intermediate: args.moe_intermediate_size,
+                shared_intermediate: args.shared_expert_intermediate_size,
+            }
+        } else {
+            ParallelFeedForwardGeometry::Dense {
+                intermediate: args.intermediate_size,
+            }
+        };
+        Ok(Self {
+            attention,
+            feed_forward,
+        })
+    }
+
+    fn local_args(self, args: &ModelArgs) -> ModelArgs {
+        let mut local = args.clone();
+        match self.attention {
+            ParallelAttentionGeometry::Full {
+                query_heads,
+                kv_heads,
+            } => {
+                local.num_attention_heads = query_heads;
+                local.num_key_value_heads = kv_heads;
+            }
+            ParallelAttentionGeometry::Linear {
+                key_heads,
+                value_heads,
+            } => {
+                local.linear_num_key_heads = key_heads;
+                local.linear_num_value_heads = value_heads;
+            }
+        }
+        match self.feed_forward {
+            ParallelFeedForwardGeometry::Dense { intermediate } => {
+                local.intermediate_size = intermediate;
+            }
+            ParallelFeedForwardGeometry::Moe {
+                routed_intermediate,
+                shared_intermediate,
+            } => {
+                local.moe_intermediate_size = routed_intermediate;
+                local.shared_expert_intermediate_size = shared_intermediate;
+            }
+        }
+        local
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 struct ModelArgsSource {
     #[serde(default = "default_text_model_type")]
@@ -689,35 +792,66 @@ pub(crate) fn prompt_cache_architecture_fingerprint(args: &ModelArgs) -> String 
 pub(crate) fn prompt_cache_layer_layout(
     args: &ModelArgs,
 ) -> Result<LayerSchedule<LayerCachePolicy>, Error> {
+    let geometry = (0..args.layer_schedule.len())
+        .map(|layer| ParallelLayerGeometry::resident(args, layer))
+        .collect::<Result<Vec<_>, _>>()?;
+    prompt_cache_layer_layout_with_geometry(args, &geometry)
+}
+
+pub(crate) fn prompt_cache_layer_layout_with_geometry(
+    args: &ModelArgs,
+    geometry: &[ParallelLayerGeometry],
+) -> Result<LayerSchedule<LayerCachePolicy>, Error> {
     let cache_error = |error: crate::runtime::cache::residency::CacheResidencyError| {
         Error::UnsupportedArchitecture(error.to_string())
     };
     let fixed = |value| StateTensorDimension::fixed(value).map_err(cache_error);
-    let key_dim = args
-        .linear_num_key_heads
-        .checked_mul(args.linear_key_head_dim)
-        .ok_or_else(|| Error::UnsupportedArchitecture("Qwen linear key width overflow".into()))?;
-    let value_dim = args
-        .linear_num_value_heads
-        .checked_mul(args.linear_value_head_dim)
-        .ok_or_else(|| Error::UnsupportedArchitecture("Qwen linear value width overflow".into()))?;
-    let conv_dim = key_dim
-        .checked_mul(2)
-        .and_then(|value| value.checked_add(value_dim))
-        .ok_or_else(|| {
-            Error::UnsupportedArchitecture("Qwen linear convolution width overflow".into())
-        })?;
     let history = args.linear_conv_kernel_dim.checked_sub(1).ok_or_else(|| {
         Error::UnsupportedArchitecture("invalid Qwen linear convolution kernel".into())
     })?;
     let layers = args.num_hidden_layers as usize;
-    let policies = (0..layers)
-        .map(|layer| match args.layer_schedule.get(layer).copied() {
-            Some(LayerPolicy::SelfAttention(attention)) => {
-                LayerCachePolicy::key_value(attention, args.num_key_value_heads, args.head_dim)
-                    .map_err(cache_error)
-            }
-            Some(LayerPolicy::LinearAttention) => LayerCachePolicy::fixed_only(vec![
+    if geometry.len() != layers {
+        return Err(Error::UnsupportedArchitecture(format!(
+            "Qwen hybrid cache geometry has {} layers, expected {layers}",
+            geometry.len()
+        )));
+    }
+    let policies = args
+        .layer_schedule
+        .iter()
+        .copied()
+        .zip(geometry.iter().copied())
+        .enumerate()
+        .map(|(layer, (policy, geometry))| match (policy, geometry.attention) {
+            (
+                LayerPolicy::SelfAttention(attention),
+                ParallelAttentionGeometry::Full { kv_heads, .. },
+            ) => LayerCachePolicy::key_value(attention, kv_heads, args.head_dim)
+                .map_err(cache_error),
+            (
+                LayerPolicy::LinearAttention,
+                ParallelAttentionGeometry::Linear {
+                    key_heads,
+                    value_heads,
+                },
+            ) => {
+                let key_dim = key_heads.checked_mul(args.linear_key_head_dim).ok_or_else(|| {
+                    Error::UnsupportedArchitecture("Qwen linear key width overflow".into())
+                })?;
+                let value_dim = value_heads
+                    .checked_mul(args.linear_value_head_dim)
+                    .ok_or_else(|| {
+                        Error::UnsupportedArchitecture("Qwen linear value width overflow".into())
+                    })?;
+                let conv_dim = key_dim
+                    .checked_mul(2)
+                    .and_then(|value| value.checked_add(value_dim))
+                    .ok_or_else(|| {
+                        Error::UnsupportedArchitecture(
+                            "Qwen linear convolution width overflow".into(),
+                        )
+                    })?;
+                LayerCachePolicy::fixed_only(vec![
                 StateTensorPolicy::new(
                     StateTensorRole::Convolution { slot: 0 },
                     vec![
@@ -732,7 +866,7 @@ pub(crate) fn prompt_cache_layer_layout(
                     StateTensorRole::Recurrent,
                     vec![
                         StateTensorDimension::Batch,
-                        fixed(args.linear_num_value_heads)?,
+                        fixed(value_heads)?,
                         fixed(args.linear_key_head_dim)?,
                         fixed(args.linear_value_head_dim)?,
                     ],
@@ -740,9 +874,10 @@ pub(crate) fn prompt_cache_layer_layout(
                 )
                 .map_err(cache_error)?,
             ])
-            .map_err(cache_error),
-            None => Err(Error::UnsupportedArchitecture(format!(
-                "Qwen hybrid layer schedule has no decoder layer {layer}"
+                .map_err(cache_error)
+            }
+            (policy, geometry) => Err(Error::UnsupportedArchitecture(format!(
+                "Qwen hybrid cache geometry {geometry:?} does not match layer {layer} policy {policy:?}"
             ))),
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -1336,7 +1471,7 @@ pub struct FullAttentionInput<'a> {
     /// Optional attention mask.
     pub mask: Option<&'a Array>,
     /// Optional key/value cache.
-    pub cache: Option<&'a mut ConcatKeyValueCache>,
+    pub cache: Option<&'a mut dyn KeyValueCache>,
 }
 
 impl Module<FullAttentionInput<'_>> for FullAttention {
@@ -3227,6 +3362,16 @@ impl TransformerBlock {
         )
     }
 
+    pub(crate) fn new_parallel_layerwise(
+        args: &ModelArgs,
+        layer_idx: usize,
+        geometry: ParallelLayerGeometry,
+        stream: &Stream,
+    ) -> Result<Self, Error> {
+        let local = geometry.local_args(args);
+        Self::new(&local, layer_idx, stream).map_err(Into::into)
+    }
+
     fn new_with_format(
         args: &ModelArgs,
         layer_idx: usize,
@@ -3306,6 +3451,88 @@ pub struct BlockInput<'a> {
     pub mask: Option<&'a Array>,
     /// Optional layer cache.
     pub cache: Option<&'a mut LayerCache>,
+}
+
+/// Borrowed hybrid operator state used by generalized execution runtimes.
+pub(crate) enum OperatorCache<'a> {
+    /// Full-attention key/value state.
+    FullAttention(&'a mut dyn KeyValueCache),
+    /// Linear-attention convolution and recurrent state.
+    LinearAttention(&'a mut LinearAttentionCache),
+}
+
+impl TransformerBlock {
+    /// Executes one text block from semantic operator state without requiring
+    /// the resident model's family-specific cache container.
+    pub(crate) fn forward_with_operator_cache(
+        &mut self,
+        x: &Array,
+        mask: Option<&Array>,
+        cache: Option<OperatorCache<'_>>,
+        stream: &Stream,
+    ) -> Result<Array, Exception> {
+        let residual = x;
+        let h = self.input_layernorm.forward(x, stream)?;
+        let h = match (self.layer_policy, cache) {
+            (
+                LayerPolicy::SelfAttention(AttentionPolicy::Full),
+                Some(OperatorCache::FullAttention(cache)),
+            ) => self
+                .self_attn
+                .as_mut()
+                .expect("full attention layer")
+                .forward(
+                    FullAttentionInput {
+                        x: &h,
+                        mask,
+                        cache: Some(cache),
+                    },
+                    stream,
+                )?,
+            (LayerPolicy::SelfAttention(AttentionPolicy::Full), None) => self
+                .self_attn
+                .as_mut()
+                .expect("full attention layer")
+                .forward(
+                    FullAttentionInput {
+                        x: &h,
+                        mask,
+                        cache: None,
+                    },
+                    stream,
+                )?,
+            (LayerPolicy::LinearAttention, Some(OperatorCache::LinearAttention(cache))) => self
+                .linear_attn
+                .as_mut()
+                .expect("linear attention layer")
+                .forward(
+                    LinearAttentionInput {
+                        x: &h,
+                        cache: Some(cache),
+                    },
+                    stream,
+                )?,
+            (LayerPolicy::LinearAttention, None) => self
+                .linear_attn
+                .as_mut()
+                .expect("linear attention layer")
+                .forward(LinearAttentionInput { x: &h, cache: None }, stream)?,
+            (LayerPolicy::SelfAttention(AttentionPolicy::Sliding { .. }), _) => {
+                return Err(Exception::custom(
+                    "Qwen hybrid execution does not support sliding self-attention",
+                ))
+            }
+            (policy, Some(_)) => {
+                return Err(Exception::custom(format!(
+                    "Qwen hybrid operator cache does not match layer policy {policy:?}"
+                )))
+            }
+        };
+        let h = residual.add(h, stream)?;
+        let residual = h.clone();
+        let normalized = self.post_attention_layernorm.forward(&h, stream)?;
+        residual.add(self.mlp.forward(&normalized, stream)?, stream)
+    }
 }
 
 impl Module<BlockInput<'_>> for TransformerBlock {
@@ -3634,7 +3861,7 @@ impl MtpModule {
 
 /// Qwen3.5 MoE text transformer body without the language-model head.
 #[derive(Debug, Clone, ModuleParameters)]
-pub struct Qwen35MoeTextModel {
+pub struct Qwen35TextModel {
     /// Token vocabulary size.
     pub vocab_size: i32,
     /// Number of decoder layers.
@@ -3650,7 +3877,7 @@ pub struct Qwen35MoeTextModel {
     pub norm: Qwen3NextRmsNorm,
 }
 
-impl Qwen35MoeTextModel {
+impl Qwen35TextModel {
     /// Creates an unloaded Qwen3.5 MoE text transformer body.
     pub fn new(args: &ModelArgs, stream: &Stream) -> Result<Self, Exception> {
         Self::new_with_format(args, QwenWeightFormat::for_text(args, None), stream)
@@ -3842,7 +4069,7 @@ pub struct ModelInput<'a> {
     pub cache: Option<&'a mut Cache>,
 }
 
-impl Qwen35MoeTextModel {
+impl Qwen35TextModel {
     pub(crate) fn forward_hidden(
         &mut self,
         input: ModelInput<'_>,
@@ -3904,7 +4131,7 @@ impl Qwen35MoeTextModel {
     }
 }
 
-impl Module<ModelInput<'_>> for Qwen35MoeTextModel {
+impl Module<ModelInput<'_>> for Qwen35TextModel {
     type Output = Array;
     type Error = Exception;
 
@@ -3971,7 +4198,7 @@ pub struct Model {
     pub visual: Option<QwenVisionTransformer>,
     #[param]
     /// Text transformer body.
-    pub model: Qwen35MoeTextModel,
+    pub model: Qwen35TextModel,
     #[param]
     /// Embedded multi-token-prediction head when present in the checkpoint.
     pub(crate) mtp: Option<MtpModule>,
@@ -4014,7 +4241,7 @@ impl Model {
                 .map_err(|error| Exception::custom(error.to_string()))?;
         }
         let format = QwenWeightFormat::for_text(&args, affine);
-        let model = Qwen35MoeTextModel::new_with_format(&args, format, stream)?;
+        let model = Qwen35TextModel::new_with_format(&args, format, stream)?;
         let mtp = (args.mtp_num_hidden_layers > 0)
             .then(|| MtpModule::new_with_format(&args, format, stream))
             .transpose()?;
@@ -4116,6 +4343,7 @@ impl Model {
         .map_err(|error| Exception::custom(error.to_string()))
     }
 
+    #[cfg(test)]
     pub(crate) fn load_prompt_cache(
         args: &ModelArgs,
         directory: impl AsRef<Path>,
@@ -4445,29 +4673,20 @@ pub fn load_qwen3_5_gguf(
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<Model, Error> {
-    Ok(load_qwen3_5_moe_gguf_with_metadata(gguf_file, stream, weights_stream)?.model)
+    Ok(load_qwen3_5_gguf_with_metadata(gguf_file, stream, weights_stream)?.model)
 }
 
-/// Backward-compatible name for loading a Qwen3.5 GGUF checkpoint.
-pub fn load_qwen3_5_moe_gguf(
-    gguf_file: impl AsRef<Path>,
-    stream: &Stream,
-    weights_stream: &Stream,
-) -> Result<Model, Error> {
-    load_qwen3_5_gguf(gguf_file, stream, weights_stream)
-}
-
-pub(crate) fn load_qwen3_5_moe_gguf_with_metadata(
+pub(crate) fn load_qwen3_5_gguf_with_metadata(
     gguf_file: impl AsRef<Path>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<LoadedQwen35Gguf, Error> {
     let checkpoint = GgufCheckpoint::open(gguf_file)?;
     let metadata = gguf_metadata(&checkpoint);
-    load_qwen3_5_moe_gguf_checkpoint(&checkpoint, metadata, None, stream, weights_stream)
+    load_qwen3_5_gguf_checkpoint(&checkpoint, metadata, None, stream, weights_stream)
 }
 
-pub(crate) fn load_qwen3_5_moe_gguf_checkpoint(
+pub(crate) fn load_qwen3_5_gguf_checkpoint(
     checkpoint: &GgufCheckpoint,
     metadata: HashMap<String, GgufMetadataValue>,
     quantization: Option<WeightQuantization>,
@@ -4541,7 +4760,7 @@ pub(crate) fn load_qwen3_5_moe_gguf_checkpoint(
     }
 
     let mut model = Model::new(args, None, None, None, stream)?;
-    let config = qwen3_5_moe_strict_load_config(false).allow_unused_prefix("rope_freqs.");
+    let config = qwen3_5_strict_load_config(false).allow_unused_prefix("rope_freqs.");
     let mut report = StrictLoadReport::default();
     let mut materializer = checkpoint.materializer();
     for tensor in checkpoint.catalog().tensors() {
@@ -5253,7 +5472,7 @@ fn qwen35_gguf_catalog_optional_f32(
 }
 
 /// Loads `tokenizer.json` from a Qwen3.5 model directory.
-pub fn load_qwen3_5_moe_tokenizer(model_dir: impl AsRef<Path>) -> Result<Tokenizer, Error> {
+pub fn load_qwen3_5_tokenizer(model_dir: impl AsRef<Path>) -> Result<Tokenizer, Error> {
     let file = model_dir.as_ref().join("tokenizer.json");
     Tokenizer::from_file(file).map_err(Into::into)
 }
@@ -5415,9 +5634,7 @@ pub(crate) fn parse_qwen3_5_config_value(value: Value) -> Result<ParsedQwen35Con
 }
 
 /// Reads and normalizes dense or MoE Qwen3.5 model arguments from `config.json`.
-pub fn get_qwen3_5_moe_model_args(
-    model_dir: impl AsRef<Path>,
-) -> Result<ParsedQwen35Config, Error> {
+pub fn get_qwen3_5_model_args(model_dir: impl AsRef<Path>) -> Result<ParsedQwen35Config, Error> {
     let file = std::fs::File::open(model_dir.as_ref().join("config.json"))?;
     let value = serde_json::from_reader(file)?;
     model_config_from_value(&value)
@@ -5545,26 +5762,25 @@ pub(crate) fn validate_model_config_value(config: &Value) -> Result<(), Error> {
 }
 
 /// Loads a dense or MoE Qwen3.5 model and safetensors weights from a model directory.
-pub fn load_qwen3_5_moe_model(
+pub fn load_qwen3_5_model(
     model_dir: impl AsRef<Path>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<Model, Error> {
     let model_dir = model_dir.as_ref();
     crate::api::structural::validate_safetensors_load_path(
-        crate::api::ModelKind::Qwen35Moe,
+        crate::api::ModelKind::Qwen35,
         model_dir,
         crate::api::ModelLoadOptions::default(),
     )?;
-    let (args, image_token_id, video_token_id, vision_config) =
-        get_qwen3_5_moe_model_args(model_dir)?;
+    let (args, image_token_id, video_token_id, vision_config) = get_qwen3_5_model_args(model_dir)?;
     if let Some(quantization_config) = &args.quantization_config {
         quantization_config.validate_supported()?;
     }
     let uses_fp8 = args.quantization_config.is_some();
     let load_visual = vision_config.is_some();
     let mut model = Model::new(args, image_token_id, video_token_id, vision_config, stream)?;
-    let config = qwen3_5_moe_strict_load_config(load_visual);
+    let config = qwen3_5_strict_load_config(load_visual);
     let mut report = StrictLoadReport::default();
     if uses_fp8 {
         let num_experts = model.args.num_experts;
@@ -5608,7 +5824,7 @@ pub fn load_qwen3_5_moe_model(
 
 /// Loads a dense or MoE Qwen3.5/3.6 checkpoint while affine-quantizing eligible
 /// text weights, including packed rank-3 routed expert banks when present.
-pub fn load_qwen3_5_moe_model_quantized(
+pub fn load_qwen3_5_model_quantized(
     model_dir: impl AsRef<Path>,
     quantization: WeightQuantization,
     stream: &Stream,
@@ -5616,8 +5832,7 @@ pub fn load_qwen3_5_moe_model_quantized(
 ) -> Result<Model, Error> {
     quantization.validate()?;
     let model_dir = model_dir.as_ref();
-    let (args, image_token_id, video_token_id, vision_config) =
-        get_qwen3_5_moe_model_args(model_dir)?;
+    let (args, image_token_id, video_token_id, vision_config) = get_qwen3_5_model_args(model_dir)?;
     if args.quantization_config.is_some() {
         return Err(Error::Quantization(
             "Qwen3.5/3.6 on-load quantization requires floating-point weights; native FP8 checkpoints cannot be implicitly transcoded".into(),
@@ -5628,10 +5843,10 @@ pub fn load_qwen3_5_moe_model_quantized(
         args.quantization,
         quantization,
     )? {
-        return load_qwen3_5_moe_model(model_dir, stream, weights_stream);
+        return load_qwen3_5_model(model_dir, stream, weights_stream);
     }
     crate::api::structural::validate_safetensors_load_path(
-        crate::api::ModelKind::Qwen35Moe,
+        crate::api::ModelKind::Qwen35,
         model_dir,
         crate::api::ModelLoadOptions::with_quantization(quantization),
     )?;
@@ -5644,7 +5859,7 @@ pub fn load_qwen3_5_moe_model_quantized(
         Some(quantization),
         stream,
     )?;
-    let config = qwen3_5_moe_strict_load_config(load_visual);
+    let config = qwen3_5_strict_load_config(load_visual);
     let mut report = StrictLoadReport::default();
     let num_experts = model.args.num_experts;
     load_safetensors_dir_strict_with_split_swiglu_experts(
@@ -6022,7 +6237,7 @@ fn parse_fp8_expert_scale_key(key: &str) -> Option<(String, i32, Fp8ExpertProjec
     parse_fp8_expert_projection_key(&weight_key)
 }
 
-pub(crate) fn qwen3_5_moe_strict_load_config(load_visual: bool) -> StrictLoadConfig {
+pub(crate) fn qwen3_5_strict_load_config(load_visual: bool) -> StrictLoadConfig {
     let config = StrictLoadConfig::default()
         .rewrite_prefix("model.language_model.", "model.")
         .rewrite_prefix("language_model.", "model.")
@@ -6113,6 +6328,7 @@ impl Model {
         )
     }
 
+    #[cfg(test)]
     pub(crate) fn prefill_typed_with_observer(
         &mut self,
         input: runtime_input::ModelInput<'_>,
@@ -6247,21 +6463,18 @@ pub type Generate<'a, S = crate::runtime::generation::sampler::DefaultSampler> =
 #[cfg(test)]
 mod tests {
     use super::{
-        get_qwen3_5_moe_model_args, load_qwen3_5_gguf, load_qwen3_5_moe_model,
-        load_qwen3_5_moe_tokenizer, parse_fp8_expert_projection_key,
-        qwen35_gguf_affine_quantization, qwen35_gguf_block_index, qwen35_is_offset_norm,
-        qwen35_restore_v_head_order, qwen35_translate_gguf_weight,
-        qwen35_translate_gguf_weight_name, qwen3_5_moe_strict_load_config, reverse_permutation,
-        transform_split_qwen_fp8_experts, vision_window_index, FeedForward, Fp8ExpertProjection,
-        FullAttention, FullAttentionInput, LayerPolicy, LinearAttention, LinearAttentionInput,
-        Model, ModelArgs, SparseMoeBlock, VisionConfig,
+        get_qwen3_5_model_args, load_qwen3_5_gguf, load_qwen3_5_model, load_qwen3_5_tokenizer,
+        parse_fp8_expert_projection_key, qwen35_gguf_affine_quantization, qwen35_gguf_block_index,
+        qwen35_is_offset_norm, qwen35_restore_v_head_order, qwen35_translate_gguf_weight,
+        qwen35_translate_gguf_weight_name, qwen3_5_strict_load_config, reverse_permutation,
+        transform_split_qwen_fp8_experts, vision_window_index, Fp8ExpertProjection, FullAttention,
+        FullAttentionInput, LayerPolicy, LinearAttention, LinearAttentionInput, Model, ModelArgs,
+        SparseMoeBlock, VisionConfig,
     };
     #[cfg(feature = "image-processing")]
     use crate::runtime::media::{load_processor, MediaInput, ProcessorInput, RgbImageView};
     use crate::{
-        api::{
-            common::generation::CausalLm, input as runtime_input, Model as AnyModel, ModelCache,
-        },
+        api::{common::generation::CausalLm, input as runtime_input, Model as AnyModel},
         error::Error,
         runtime::checkpoint::quantization::AffineQuantization,
         runtime::execution::inspection::ActivationRecorder,
@@ -6400,6 +6613,71 @@ mod tests {
             layout.get(1).unwrap(),
             LayerCachePolicy::KeyValue { .. }
         ));
+    }
+
+    #[test]
+    fn prompt_cache_layout_uses_rank_local_hybrid_geometry() {
+        use crate::runtime::cache::residency::{
+            LayerCachePolicy, StateTensorDimension, StateTensorRole,
+        };
+
+        let args = tiny_args(vec![LINEAR, FULL]);
+        let geometry = [
+            super::ParallelLayerGeometry {
+                attention: super::ParallelAttentionGeometry::Linear {
+                    key_heads: 1,
+                    value_heads: 3,
+                },
+                feed_forward: super::ParallelFeedForwardGeometry::Moe {
+                    routed_intermediate: 3,
+                    shared_intermediate: 2,
+                },
+            },
+            super::ParallelLayerGeometry {
+                attention: super::ParallelAttentionGeometry::Full {
+                    query_heads: 2,
+                    kv_heads: 1,
+                },
+                feed_forward: super::ParallelFeedForwardGeometry::Moe {
+                    routed_intermediate: 2,
+                    shared_intermediate: 2,
+                },
+            },
+        ];
+        let layout = super::prompt_cache_layer_layout_with_geometry(&args, &geometry).unwrap();
+        let LayerCachePolicy::FixedState { tensors } = layout.get(0).unwrap() else {
+            panic!("linear layer must retain fixed state")
+        };
+        assert_eq!(tensors[0].role, StateTensorRole::Convolution { slot: 0 });
+        assert_eq!(
+            tensors[0].shape,
+            vec![
+                StateTensorDimension::Batch,
+                StateTensorDimension::fixed(3).unwrap(),
+                StateTensorDimension::fixed(20).unwrap(),
+            ]
+        );
+        assert_eq!(tensors[1].role, StateTensorRole::Recurrent);
+        assert_eq!(
+            tensors[1].shape,
+            vec![
+                StateTensorDimension::Batch,
+                StateTensorDimension::fixed(3).unwrap(),
+                StateTensorDimension::fixed(4).unwrap(),
+                StateTensorDimension::fixed(4).unwrap(),
+            ]
+        );
+        match layout.get(1).unwrap() {
+            LayerCachePolicy::KeyValue {
+                num_key_value_heads,
+                head_dim,
+                ..
+            } => {
+                assert_eq!(num_key_value_heads.get(), 1);
+                assert_eq!(head_dim.get(), 8);
+            }
+            policy => panic!("unexpected attention cache policy {policy:?}"),
+        }
     }
 
     #[test]
@@ -7272,7 +7550,7 @@ mod tests {
             }"#,
         );
         let (args, image_token_id, video_token_id, vision_config) =
-            get_qwen3_5_moe_model_args(&dir).unwrap();
+            get_qwen3_5_model_args(&dir).unwrap();
         assert_eq!(args.model_type, "qwen3_5_moe_text");
         assert_eq!(args.layer_schedule.len(), 4);
         assert_eq!(args.layer_schedule.get(3), Some(&FULL));
@@ -7306,7 +7584,7 @@ mod tests {
             }"#,
         );
         let (args, image_token_id, video_token_id, vision_config) =
-            get_qwen3_5_moe_model_args(&dir).unwrap();
+            get_qwen3_5_model_args(&dir).unwrap();
         assert_eq!(args.model_type, "qwen3_next");
         assert_eq!(args.layer_schedule.len(), 8);
         assert_eq!(args.layer_schedule.get(2), Some(&LINEAR));
@@ -7435,7 +7713,7 @@ mod tests {
               "layer_types": ["full_attention"]
             }"#,
         );
-        let (args, _, _, _) = get_qwen3_5_moe_model_args(&dir).unwrap();
+        let (args, _, _, _) = get_qwen3_5_model_args(&dir).unwrap();
         assert_eq!(args.model_type, "qwen3_5_moe_text");
         assert_eq!(args.mtp_num_hidden_layers, 1);
         assert_eq!(args.layer_schedule.get(0), Some(&FULL));
@@ -7467,7 +7745,7 @@ mod tests {
             }"#,
         );
         let (args, image_token_id, video_token_id, vision_config) =
-            get_qwen3_5_moe_model_args(&dir).unwrap();
+            get_qwen3_5_model_args(&dir).unwrap();
         assert_eq!(args.model_type, "qwen3_5_text");
         assert_eq!(args.num_experts, 0);
         assert_eq!(args.num_experts_per_tok, 0);
@@ -7493,7 +7771,7 @@ mod tests {
               "layer_types": ["full_attention"]
             }"#,
         );
-        let (args, _, _, _) = get_qwen3_5_moe_model_args(&dir).unwrap();
+        let (args, _, _, _) = get_qwen3_5_model_args(&dir).unwrap();
         assert_eq!(args.model_type, "qwen3_5_text");
         assert_eq!(args.num_experts, 0);
         assert_eq!(args.num_experts_per_tok, 0);
@@ -7502,7 +7780,7 @@ mod tests {
 
     #[test]
     fn dense_safetensor_keys_map_directly_to_checkpoint_native_mlp_names() {
-        let config = qwen3_5_moe_strict_load_config(false);
+        let config = qwen3_5_strict_load_config(false);
         assert!(config
             .candidates("model.language_model.layers.0.mlp.gate_proj.weight")
             .contains(&"model.layers.0.mlp.gate_proj.weight".to_string()));
@@ -7537,7 +7815,7 @@ mod tests {
               }
             }"#,
         );
-        let (args, _, _, _) = get_qwen3_5_moe_model_args(&dir).unwrap();
+        let (args, _, _, _) = get_qwen3_5_model_args(&dir).unwrap();
         let mut source = Model::new(args, None, None, None, stream).unwrap();
         zero_model_parameters(&mut source, stream);
 
@@ -7560,13 +7838,12 @@ mod tests {
         .unwrap();
 
         let model = crate::api::load_model(&dir, stream, weights_ctx.stream()).unwrap();
-        let AnyModel::Qwen35Moe(mut model) = model else {
+        let AnyModel::Qwen35(mut model) = model else {
             panic!("qwen3_5 must dispatch to the Qwen3.5 loader");
         };
-        assert_eq!(model.model_type(), "qwen3_5_text");
-        assert_eq!(model.args.num_experts, 0);
+        assert_eq!(model.args().model_type, "qwen3_5_text");
+        assert_eq!(model.args().num_experts, 0);
         assert_eq!(model.mtp_len(), 1);
-        assert!(matches!(model.model.layers[0].mlp, FeedForward::Dense(_)));
 
         let tokens = Array::from_slice(&[1_u32, 2], &[1, 2]);
         let parts = [runtime_input::InputPart::text_token_ids(&tokens)];
@@ -7610,32 +7887,13 @@ mod tests {
             weights_ctx.stream(),
         )
         .unwrap();
-        let AnyModel::Qwen35Moe(mut quantized) = quantized else {
+        let AnyModel::Qwen35(mut quantized) = quantized else {
             panic!("qwen3_5 must dispatch to the Qwen3.5 affine loader");
         };
-        let params = quantized.parameters().flatten();
         assert_eq!(
-            params
-                .get("model.layers.0.mlp.gate_proj.weight")
-                .unwrap()
-                .dtype(),
-            safemlx::Dtype::Uint32
+            quantized.residency_metadata().quantization(),
+            Some(AffineQuantization::new(32, 4).unwrap().into())
         );
-        assert!(params.contains_key("model.layers.0.mlp.gate_proj.scales"));
-        assert!(params.contains_key("model.layers.0.mlp.gate_proj.biases"));
-        assert_eq!(
-            params.get("mtp.fc.weight").unwrap().dtype(),
-            safemlx::Dtype::Float32
-        );
-        assert_eq!(
-            params
-                .get("mtp.layers.0.self_attn.q_proj.weight")
-                .unwrap()
-                .dtype(),
-            safemlx::Dtype::Uint32
-        );
-        assert!(!params.keys().any(|key| key.contains("dense_mlp")));
-        drop(params);
         let mut cache = quantized.new_cache();
         let logits = CausalLm::prefill_input_logits(
             &mut quantized,
@@ -7694,7 +7952,7 @@ mod tests {
               }
             }"#,
         );
-        let (_, image_token_id, _, vision_config) = get_qwen3_5_moe_model_args(&dir).unwrap();
+        let (_, image_token_id, _, vision_config) = get_qwen3_5_model_args(&dir).unwrap();
 
         assert_eq!(image_token_id, Some(248056));
         assert_eq!(vision_config, Some(tiny_vision_config(16)));
@@ -7722,7 +7980,7 @@ mod tests {
               }
             }"#,
         );
-        let (args, _, _, _) = get_qwen3_5_moe_model_args(&dir).unwrap();
+        let (args, _, _, _) = get_qwen3_5_model_args(&dir).unwrap();
         let quantization_config = args.quantization_config.unwrap();
         assert_eq!(quantization_config.quant_method, "fp8");
         assert_eq!(quantization_config.fmt, "e4m3");
@@ -7734,7 +7992,7 @@ mod tests {
         quantization_config.validate_supported().unwrap();
 
         let cpu = ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
-        let error = super::load_qwen3_5_moe_model_quantized(
+        let error = super::load_qwen3_5_model_quantized(
             &dir,
             crate::runtime::checkpoint::quantization::AffineQuantization::default().into(),
             cpu.stream(),
@@ -7802,7 +8060,7 @@ mod tests {
 
     #[test]
     fn strict_load_rewrites_public_vision_keys() {
-        let config = qwen3_5_moe_strict_load_config(true);
+        let config = qwen3_5_strict_load_config(true);
 
         assert!(config
             .candidates("model.visual.merger.linear_fc1.weight")
@@ -8116,7 +8374,6 @@ mod tests {
         )
         .unwrap();
         zero_model_parameters(&mut qwen, stream);
-        let mut model = AnyModel::Qwen35Moe(qwen);
 
         let before = runtime_input::token_ids_array(&[7], stream).unwrap();
         let after = runtime_input::token_ids_array(&[8], stream).unwrap();
@@ -8130,11 +8387,11 @@ mod tests {
             ),
             runtime_input::InputPart::text_token_ids(&after),
         ];
-        let mut cache = model.new_cache();
+        let mut cache = qwen.new_cache();
         let mut recorder = ActivationRecorder::new();
 
-        let logits = model
-            .prefill_input_with_observer(
+        let logits = qwen
+            .prefill_typed_with_observer(
                 runtime_input::ModelInput::new(&parts),
                 &mut cache,
                 stream,
@@ -8143,9 +8400,6 @@ mod tests {
             .unwrap();
 
         assert_eq!(logits.shape(), &[1, 128]);
-        let ModelCache::Qwen35Moe(cache) = cache else {
-            panic!("expected qwen cache");
-        };
         assert_eq!(cache.offset(), 4);
         assert!(recorder
             .activations()
@@ -8178,8 +8432,6 @@ mod tests {
         .unwrap();
         zero_model_parameters(&mut normal_qwen, stream);
         zero_model_parameters(&mut observed_qwen, stream);
-        let mut normal = AnyModel::Qwen35Moe(normal_qwen);
-        let mut observed = AnyModel::Qwen35Moe(observed_qwen);
 
         let before = runtime_input::token_ids_array(&[7], stream).unwrap();
         let after = runtime_input::token_ids_array(&[8], stream).unwrap();
@@ -8195,24 +8447,18 @@ mod tests {
             runtime_input::InputPart::text_token_ids(&after),
         ];
         let input = runtime_input::ModelInput::new(&parts);
-        let mut normal_cache = normal.new_cache();
-        let mut observed_cache = observed.new_cache();
+        let mut normal_cache = normal_qwen.new_cache();
+        let mut observed_cache = observed_qwen.new_cache();
         let mut recorder = ActivationRecorder::new();
 
-        let normal_logits = normal
-            .prefill_input_with_cache(input, &mut normal_cache, stream)
+        let normal_logits = normal_qwen
+            .prefill_input_logits(input, &mut normal_cache, stream)
             .unwrap();
-        let observed_logits = observed
-            .prefill_input_with_observer(input, &mut observed_cache, stream, &mut recorder)
+        let observed_logits = observed_qwen
+            .prefill_typed_with_observer(input, &mut observed_cache, stream, &mut recorder)
             .unwrap();
 
         assert_eq!(normal_logits.shape(), observed_logits.shape());
-        let ModelCache::Qwen35Moe(normal_cache) = normal_cache else {
-            panic!("expected qwen cache");
-        };
-        let ModelCache::Qwen35Moe(observed_cache) = observed_cache else {
-            panic!("expected qwen cache");
-        };
         assert_eq!(normal_cache.offset(), observed_cache.offset());
         assert_eq!(observed_cache.offset(), 5);
     }
@@ -8226,15 +8472,14 @@ mod tests {
         let args = tiny_args(vec![FULL]);
         let mut qwen = Model::new(args, None, None, None, stream).unwrap();
         zero_model_parameters(&mut qwen, stream);
-        let mut model = AnyModel::Qwen35Moe(qwen);
 
         let text = runtime_input::token_ids_array(&[7, 8, 9], stream).unwrap();
         let parts = [runtime_input::InputPart::text_token_ids(&text)];
-        let mut cache = model.new_cache();
+        let mut cache = qwen.new_cache();
         let mut recorder = ActivationRecorder::new();
 
-        let logits = model
-            .prefill_input_with_observer(
+        let logits = qwen
+            .prefill_typed_with_observer(
                 runtime_input::ModelInput::new(&parts),
                 &mut cache,
                 stream,
@@ -8243,9 +8488,6 @@ mod tests {
             .unwrap();
 
         assert_eq!(logits.shape(), &[1, 128]);
-        let ModelCache::Qwen35Moe(cache) = cache else {
-            panic!("expected qwen cache");
-        };
         assert_eq!(cache.offset(), 3);
     }
 
@@ -8258,7 +8500,6 @@ mod tests {
         let args = tiny_args(vec![FULL]);
         let mut qwen = Model::new(args, None, None, None, stream).unwrap();
         zero_model_parameters(&mut qwen, stream);
-        let mut model = AnyModel::Qwen35Moe(qwen);
 
         let image_embeddings = Array::zeros::<f32>(&[1, 3, 16], stream).unwrap();
         let grid_thw = Array::from_slice(&[1i32, 2, 4], &[1, 3]);
@@ -8267,11 +8508,11 @@ mod tests {
             payload: runtime_input::InputPayload::Embeddings(&image_embeddings),
             metadata: runtime_input::InputMetadata::qwen_grid_thw(&grid_thw),
         }];
-        let mut cache = model.new_cache();
+        let mut cache = qwen.new_cache();
         let mut recorder = ActivationRecorder::new();
 
-        let error = model
-            .prefill_input_with_observer(
+        let error = qwen
+            .prefill_typed_with_observer(
                 runtime_input::ModelInput::new(&parts),
                 &mut cache,
                 stream,
@@ -8543,11 +8784,11 @@ mod tests {
         let stream = ctx.stream();
         let model_dir = cached_test_model_dir();
         let (args, image_token_id, video_token_id, vision_config) =
-            get_qwen3_5_moe_model_args(&model_dir).unwrap();
+            get_qwen3_5_model_args(&model_dir).unwrap();
         let model =
             Model::new(args, image_token_id, video_token_id, vision_config, stream).unwrap();
         let params = model.parameters().flatten();
-        let strict_config = qwen3_5_moe_strict_load_config(true);
+        let strict_config = qwen3_5_strict_load_config(true);
         let index_file =
             std::fs::File::open(model_dir.join("model.safetensors.index.json")).unwrap();
         let index: serde_json::Value = serde_json::from_reader(index_file).unwrap();
@@ -8611,7 +8852,7 @@ mod tests {
         );
 
         let mut target = Model::new(args, None, None, None, stream).unwrap();
-        let config = qwen3_5_moe_strict_load_config(false);
+        let config = qwen3_5_strict_load_config(false);
         let mut report = StrictLoadReport::default();
         load_safetensors_strict(&mut target, &weights_path, stream, &config, &mut report).unwrap();
         report.finish(&target, &config).unwrap();
@@ -8635,7 +8876,7 @@ mod tests {
         );
 
         let mut target = Model::new(args, None, None, None, stream).unwrap();
-        let config = qwen3_5_moe_strict_load_config(false);
+        let config = qwen3_5_strict_load_config(false);
         let mut report = StrictLoadReport::default();
         load_safetensors_strict(&mut target, &weights_path, stream, &config, &mut report).unwrap();
         let Err(Error::StrictLoadValidation { missing, unused }) = report.finish(&target, &config)
@@ -8667,7 +8908,7 @@ mod tests {
         );
 
         let mut target = Model::new(args, None, None, None, stream).unwrap();
-        let config = qwen3_5_moe_strict_load_config(false);
+        let config = qwen3_5_strict_load_config(false);
         let mut report = StrictLoadReport::default();
         load_safetensors_strict(&mut target, &weights_path, stream, &config, &mut report).unwrap();
         let Err(Error::StrictLoadValidation { missing, unused }) = report.finish(&target, &config)
@@ -8689,8 +8930,8 @@ mod tests {
         let weights_ctx = ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
         let weights_stream = weights_ctx.stream();
         let model_dir = cached_test_model_dir();
-        let tokenizer = load_qwen3_5_moe_tokenizer(&model_dir).unwrap();
-        let mut model = load_qwen3_5_moe_model(&model_dir, stream, weights_stream).unwrap();
+        let tokenizer = load_qwen3_5_tokenizer(&model_dir).unwrap();
+        let mut model = load_qwen3_5_model(&model_dir, stream, weights_stream).unwrap();
         let cases = [
             (
                 "What is 84 * 3 / 2?",

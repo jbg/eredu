@@ -105,7 +105,7 @@ pub fn apply_rope_and_update_cache<C>(
     stream: &Stream,
 ) -> Result<(Array, Array, Array), Exception>
 where
-    C: KeyValueCache,
+    C: KeyValueCache + ?Sized,
 {
     if let Some(cache) = cache.as_mut() {
         let offset = cache.offset();
@@ -140,7 +140,7 @@ pub(crate) fn apply_rotary_embeddings_and_update_cache<C>(
     stream: &Stream,
 ) -> Result<(Array, Array, Array), Exception>
 where
-    C: KeyValueCache,
+    C: KeyValueCache + ?Sized,
 {
     let cos = cos
         .as_dtype(queries.dtype(), stream)?
@@ -184,7 +184,7 @@ pub fn finish_attention<C>(
     stream: &Stream,
 ) -> Result<Array, Exception>
 where
-    C: KeyValueCache,
+    C: KeyValueCache + ?Sized,
 {
     let attention = if let Some(cache) = cache {
         match cache.paged_attention(&queries, scale, mask, None, stream)? {

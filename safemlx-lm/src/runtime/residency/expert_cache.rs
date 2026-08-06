@@ -140,6 +140,35 @@ pub enum ExpertPass {
     Decode,
 }
 
+/// One routed hidden-state batch and its layer-local expert assignments.
+#[derive(Debug, Clone, Copy)]
+pub struct ExpertRouteBatch<'a> {
+    layer: usize,
+    hidden: &'a Array,
+    expert_ids: &'a Array,
+    weights: &'a Array,
+    pass: ExpertPass,
+}
+
+impl<'a> ExpertRouteBatch<'a> {
+    /// Binds routed activations, expert ids, and weights to one decoder layer.
+    pub const fn new(
+        layer: usize,
+        hidden: &'a Array,
+        expert_ids: &'a Array,
+        weights: &'a Array,
+        pass: ExpertPass,
+    ) -> Self {
+        Self {
+            layer,
+            hidden,
+            expert_ids,
+            weights,
+            pass,
+        }
+    }
+}
+
 /// One atomic expert definition supplied by an architecture adapter.
 pub struct ExpertCatalogEntry {
     identity: ExpertIdentity,
@@ -394,17 +423,20 @@ impl ExpertCache {
     /// concatenation in original row order.
     pub fn execute_routes_bounded<F>(
         &self,
-        layer: usize,
-        routed_hidden: &Array,
-        routed_ids: &Array,
-        route_weights: &Array,
-        pass: ExpertPass,
+        batch: ExpertRouteBatch<'_>,
         stream: &Stream,
         mut execute_bank: F,
     ) -> Result<Array, ExpertCacheError>
     where
         F: FnMut(&Array, &AcquiredExperts, &Array, &Stream) -> Result<Array, ExpertCacheError>,
     {
+        let ExpertRouteBatch {
+            layer,
+            hidden: routed_hidden,
+            expert_ids: routed_ids,
+            weights: route_weights,
+            pass,
+        } = batch;
         if routed_hidden.ndim() == 0
             || routed_ids.ndim() == 0
             || route_weights.ndim() == 0
@@ -1280,11 +1312,7 @@ mod tests {
         let mut prefill_banks = 0;
         let output = cache
             .execute_routes_bounded(
-                2,
-                &hidden,
-                &routes,
-                &weights,
-                ExpertPass::Prefill,
+                ExpertRouteBatch::new(2, &hidden, &routes, &weights, ExpertPass::Prefill),
                 &execution,
                 |hidden, _acquired, _weights, _stream| {
                     prefill_banks += 1;
@@ -1301,11 +1329,7 @@ mod tests {
         let mut decode_banks = 0;
         cache
             .execute_routes_bounded(
-                2,
-                &hidden,
-                &routes,
-                &weights,
-                ExpertPass::Decode,
+                ExpertRouteBatch::new(2, &hidden, &routes, &weights, ExpertPass::Decode),
                 &execution,
                 |hidden, _acquired, _weights, _stream| {
                     decode_banks += 1;
@@ -1320,11 +1344,13 @@ mod tests {
         let mut distributed_banks = 0;
         cache
             .execute_routes_bounded(
-                2,
-                &hidden,
-                &distributed_routes,
-                &distributed_weights,
-                ExpertPass::Prefill,
+                ExpertRouteBatch::new(
+                    2,
+                    &hidden,
+                    &distributed_routes,
+                    &distributed_weights,
+                    ExpertPass::Prefill,
+                ),
                 &execution,
                 |hidden, _acquired, _weights, _stream| {
                     distributed_banks += 1;

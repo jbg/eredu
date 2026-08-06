@@ -2,10 +2,10 @@
 
 use std::{collections::BTreeMap, num::NonZeroU8};
 
-use safemlx::{module::ModuleParameters, Array, Stream};
+use safemlx::{Array, Stream};
 
 use super::{
-    deepseek_v3, gemma4, gpt_oss, inkling, kimi_linear, lfm2, nemotron_h, qwen3_5_moe, Model,
+    deepseek_v3, gemma4, gpt_oss, inkling, kimi_linear, lfm2, nemotron_h, qwen3_5, Model,
     PreparedModelInput,
 };
 use crate::{
@@ -598,30 +598,14 @@ impl Model {
     ) -> Result<(ModelCapabilities, ArchitectureEstimate), CapabilityError> {
         let model_type = self.model_type().to_string();
         let result = match self {
-            Self::Llama(model) => llama_spec(&model.args, false)?,
-            Self::LlamaLayerwise(model) => llama_spec(model.args(), false)?,
-            Self::DenseQwen(model) => dense_qwen_spec(&model.args, false)?,
-            Self::DenseQwenLayerwise(model) => dense_qwen_spec(model.args(), false)?,
+            Self::Llama(model) => llama_spec(model.args(), false)?,
+            Self::DenseQwen(model) => dense_qwen_spec(model.args(), false)?,
             Self::Qwen3Vl(model) | Self::Qwen3VlMoe(model) => {
-                dense_qwen_spec(&model.args.text_config, true)?
-            }
-            Self::Qwen3VlLayerwise(model) | Self::Qwen3VlMoeLayerwise(model) => {
                 dense_qwen_spec(&model.args().text_config, true)?
             }
-            Self::DeepSeekV3(model) => deepseek_spec(&model.args)?,
-            Self::DeepSeekV3Layerwise(model) => deepseek_spec(model.args())?,
-            Self::GptOss(model) => gpt_oss_spec(&model.args)?,
-            Self::GptOssLayerwise(model) => gpt_oss_spec(model.args())?,
+            Self::DeepSeekV3(model) => deepseek_spec(model.args())?,
+            Self::GptOss(model) => gpt_oss_spec(model.args())?,
             Self::Gemma4(model) => {
-                let modalities = InputModalities {
-                    text: true,
-                    image: model.image_token_id.is_some(),
-                    audio: model.audio_token_id.is_some(),
-                    video: model.video_token_id.is_some(),
-                };
-                gemma4_spec(&model.args, modalities)?
-            }
-            Self::Gemma4Layerwise(model) => {
                 let (_, _, image, audio, video) = model.media_accounting();
                 gemma4_spec(
                     model.args(),
@@ -633,18 +617,11 @@ impl Model {
                     },
                 )?
             }
-            Self::Inkling(model) => inkling_spec(&model.args)?,
-            Self::InklingLayerwise(model) => inkling_spec(model.args())?,
-            Self::KimiLinear(model) => kimi_linear_spec(&model.args)?,
-            Self::KimiLinearLayerwise(model) => kimi_linear_spec(model.args())?,
-            Self::Lfm2(model) => lfm2_spec(&model.args)?,
-            Self::Lfm2Layerwise(model) => lfm2_spec(model.args())?,
-            Self::NemotronH(model) => nemotron_spec(&model.args)?,
-            Self::NemotronHLayerwise(model) => nemotron_spec(model.args())?,
-            Self::Qwen3Next(model) | Self::Qwen35Moe(model) => {
-                qwen_hybrid_spec(&model.args, model.vision_args.is_some())?
-            }
-            Self::Qwen3NextLayerwise(model) | Self::Qwen35MoeLayerwise(model) => {
+            Self::Inkling(model) => inkling_spec(model.args())?,
+            Self::KimiLinear(model) => kimi_linear_spec(model.args())?,
+            Self::Lfm2(model) => lfm2_spec(model.args())?,
+            Self::NemotronH(model) => nemotron_spec(model.args())?,
+            Self::Qwen3Next(model) | Self::Qwen35(model) => {
                 qwen_hybrid_spec(model.args(), model.vision_spatial_merge_size().is_some())?
             }
         };
@@ -1289,10 +1266,7 @@ fn nemotron_spec(args: &nemotron_h::ModelArgs) -> Result<Spec, CapabilityError> 
     ))
 }
 
-fn qwen_hybrid_spec(
-    args: &qwen3_5_moe::ModelArgs,
-    multimodal: bool,
-) -> Result<Spec, CapabilityError> {
+fn qwen_hybrid_spec(args: &qwen3_5::ModelArgs, multimodal: bool) -> Result<Spec, CapabilityError> {
     let configured = positive(args.max_position_embeddings, "max_position_embeddings")?;
     let original = args
         .rope_scaling
@@ -1425,58 +1399,6 @@ fn qwen_hybrid_spec(
             completeness: EstimationCompleteness::Complete,
         },
     ))
-}
-
-fn parameter_bytes<M: ModuleParameters>(model: &M) -> Result<u64, CapabilityError> {
-    model
-        .parameters()
-        .flatten()
-        .values()
-        .try_fold(0u64, |total, parameter| {
-            let bytes = u64::try_from(parameter.nbytes()).map_err(|_| {
-                CapabilityError::ArithmeticOverflow {
-                    operation: "parameter byte conversion",
-                }
-            })?;
-            checked_add(total, bytes, "logical parameter byte total")
-        })
-}
-
-impl Model {
-    fn resident_parameter_bytes(&self) -> Result<Option<u64>, CapabilityError> {
-        let value = match self {
-            Self::DeepSeekV3(model) => Some(parameter_bytes(model)?),
-            Self::Gemma4(model) => Some(parameter_bytes(model)?),
-            Self::GptOss(model) => Some(parameter_bytes(model)?),
-            Self::Inkling(model) => Some(parameter_bytes(model)?),
-            Self::KimiLinear(model) => Some(parameter_bytes(model)?),
-            Self::Llama(model) => Some(parameter_bytes(model)?),
-            Self::Lfm2(model) => Some(parameter_bytes(model)?),
-            Self::NemotronH(model) => Some(parameter_bytes(model)?),
-            Self::DenseQwen(model) => Some(parameter_bytes(model)?),
-            Self::Qwen3Next(model) => Some(parameter_bytes(model)?),
-            Self::Qwen3Vl(model) => Some(parameter_bytes(model)?),
-            Self::Qwen3VlMoe(model) => Some(parameter_bytes(model)?),
-            Self::Qwen35Moe(model) => Some(parameter_bytes(model)?),
-            Self::LlamaLayerwise(model) => model
-                .resident_parameter_bytes()
-                .transpose()
-                .map_err(|detail| CapabilityError::Observation(detail.into()))?,
-            Self::DeepSeekV3Layerwise(_)
-            | Self::Gemma4Layerwise(_)
-            | Self::GptOssLayerwise(_)
-            | Self::InklingLayerwise(_)
-            | Self::KimiLinearLayerwise(_)
-            | Self::Lfm2Layerwise(_)
-            | Self::NemotronHLayerwise(_)
-            | Self::DenseQwenLayerwise(_)
-            | Self::Qwen3NextLayerwise(_)
-            | Self::Qwen3VlLayerwise(_)
-            | Self::Qwen3VlMoeLayerwise(_)
-            | Self::Qwen35MoeLayerwise(_) => None,
-        };
-        Ok(value)
-    }
 }
 
 fn unavailable_counter(error: safemlx::error::Exception) -> CapabilityValue<u64> {
@@ -2272,41 +2194,14 @@ impl Model {
     ) -> Result<(u64, u64), CapabilityError> {
         match self {
             Self::Qwen3Vl(model) | Self::Qwen3VlMoe(model) => qwen_vision_workspace(
-                &model.args.vision_config,
+                &model.args().vision_config,
                 modality,
                 payload,
                 metadata,
                 stream,
                 self.model_type(),
             ),
-            Self::Qwen3VlLayerwise(model) | Self::Qwen3VlMoeLayerwise(model) => {
-                qwen_vision_workspace(
-                    &model.args().vision_config,
-                    modality,
-                    payload,
-                    metadata,
-                    stream,
-                    self.model_type(),
-                )
-            }
-            Self::Qwen3Next(model) | Self::Qwen35Moe(model) => model
-                .vision_args
-                .as_ref()
-                .ok_or_else(|| CapabilityError::UnsupportedInput {
-                    architecture: self.model_type().into(),
-                    reason: "loaded model has no vision configuration".into(),
-                })
-                .and_then(|config| {
-                    qwen_vision_workspace(
-                        config,
-                        modality,
-                        payload,
-                        metadata,
-                        stream,
-                        self.model_type(),
-                    )
-                }),
-            Self::Qwen3NextLayerwise(model) | Self::Qwen35MoeLayerwise(model) => model
+            Self::Qwen3Next(model) | Self::Qwen35(model) => model
                 .vision_config()
                 .ok_or_else(|| CapabilityError::UnsupportedInput {
                     architecture: self.model_type().into(),
@@ -2322,44 +2217,7 @@ impl Model {
                         self.model_type(),
                     )
                 }),
-            Self::Gemma4(model) => match modality {
-                Modality::Image | Modality::Video => model
-                    .model
-                    .vision_tower
-                    .as_ref()
-                    .ok_or_else(|| CapabilityError::UnsupportedInput {
-                        architecture: self.model_type().into(),
-                        reason: "loaded model has no vision tower".into(),
-                    })
-                    .and_then(|tower| {
-                        gemma_vision_workspace(
-                            &tower.config,
-                            positive(model.args.hidden_size, "Gemma text hidden size")?,
-                            payload,
-                            metadata,
-                            self.model_type(),
-                        )
-                    }),
-                Modality::Audio => model
-                    .model
-                    .audio_tower
-                    .as_ref()
-                    .ok_or_else(|| CapabilityError::UnsupportedInput {
-                        architecture: self.model_type().into(),
-                        reason: "loaded model has no audio tower".into(),
-                    })
-                    .and_then(|tower| {
-                        gemma_audio_workspace(
-                            &tower.config,
-                            positive(model.args.hidden_size, "Gemma text hidden size")?,
-                            payload,
-                            metadata,
-                            self.model_type(),
-                        )
-                    }),
-                Modality::Text => unreachable!("text handled separately"),
-            },
-            Self::Gemma4Layerwise(model) => {
+            Self::Gemma4(model) => {
                 let (vision, audio, _, _, _) = model.media_accounting();
                 match modality {
                     Modality::Image | Modality::Video => vision
@@ -2394,25 +2252,15 @@ impl Model {
                 }
             }
             Self::Inkling(model) => {
-                inkling_workspace(&model.args, modality, payload, metadata, self.model_type())
-            }
-            Self::InklingLayerwise(model) => {
                 inkling_workspace(model.args(), modality, payload, metadata, self.model_type())
             }
             Self::DeepSeekV3(_)
-            | Self::DeepSeekV3Layerwise(_)
             | Self::GptOss(_)
-            | Self::GptOssLayerwise(_)
             | Self::KimiLinear(_)
-            | Self::KimiLinearLayerwise(_)
             | Self::Llama(_)
-            | Self::LlamaLayerwise(_)
             | Self::Lfm2(_)
-            | Self::Lfm2Layerwise(_)
             | Self::NemotronH(_)
-            | Self::NemotronHLayerwise(_)
-            | Self::DenseQwen(_)
-            | Self::DenseQwenLayerwise(_) => Err(CapabilityError::UnsupportedInput {
+            | Self::DenseQwen(_) => Err(CapabilityError::UnsupportedInput {
                 architecture: self.model_type().into(),
                 reason: format!("{} media is not supported", modality.as_str()),
             }),
@@ -2700,7 +2548,6 @@ impl super::LoadedModel {
             .model
             .residency_report()
             .map_err(|error| CapabilityError::Observation(error.to_string()))?;
-        let resident = self.model.resident_parameter_bytes()?;
         let (logical, host, device, disk, mappings) = if let Some(report) = residency {
             let planned = report.offload().planned_bytes();
             let resident = report.offload().resident_bytes();
@@ -2738,31 +2585,6 @@ impl super::LoadedModel {
                     value: report.weight_store().currently_mapped_shards as u64,
                     kind: MeasurementKind::Observational,
                     source: "checkpoint-store mapping cache",
-                },
-            )
-        } else if let Some(bytes) = resident {
-            (
-                CapabilityValue::Available {
-                    value: bytes,
-                    kind: MeasurementKind::Exact,
-                    source: "loaded module parameter arrays",
-                },
-                CapabilityValue::Unsupported {
-                    reason: "fully resident MLX arrays do not expose independent host ownership"
-                        .into(),
-                },
-                CapabilityValue::Unavailable {
-                    reason: "MLX active memory is process-global, not attributable per model"
-                        .into(),
-                },
-                CapabilityValue::Available {
-                    value: 0,
-                    kind: MeasurementKind::Exact,
-                    source: "fully resident load policy",
-                },
-                CapabilityValue::Unsupported {
-                    reason: "fully resident checkpoint does not retain a bounded mapping cache"
-                        .into(),
                 },
             )
         } else {
@@ -3298,7 +3120,7 @@ mod tests {
 
     #[test]
     fn qwen_hybrid_runtime_state_uses_the_normalized_schedule() {
-        let args = qwen3_5_moe::model_args_from_config_value(&json!({
+        let args = qwen3_5::model_args_from_config_value(&json!({
             "model_type": "qwen3_next", "vocab_size": 32, "hidden_size": 16,
             "num_hidden_layers": 4, "num_attention_heads": 2,
             "num_key_value_heads": 1, "head_dim": 8,

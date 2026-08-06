@@ -27,13 +27,16 @@ use crate::{
     },
     error::Error,
     nn::{
-        parallel::{VocabParallelEmbedding, VocabParallelLmHead},
+        parallel::{
+            register_gqa_projection_group, GqaProjectionNames, VocabParallelEmbedding,
+            VocabParallelLmHead,
+        },
         tensor::{create_attention_mask, AttentionMask},
     },
     runtime::cache::{
         residency::{
-            PagedCacheOptions, PromptCacheDescriptor, PromptCacheManifest,
-            PromptCacheModelIdentity, PromptCacheOptions, PromptCacheTopology,
+            CacheResidencyPolicy, CacheResidencyReport, PagedCacheOptions, PromptCacheDescriptor,
+            PromptCacheManifest, PromptCacheModelIdentity, PromptCacheOptions, PromptCacheTopology,
         },
         KeyValueCache,
     },
@@ -44,9 +47,10 @@ use crate::{
     runtime::checkpoint::recipe::DerivedWeightRecipe,
     runtime::checkpoint::store::{GgufWeightStore, TensorSelection, WeightStore},
     runtime::distributed::parallel::{
-        array_parameter_member, exact_parallel_division, module_parameter_group,
-        register_projection_module, register_replicated_module, MemberSharding,
-        ParallelPlanBuilder, ParameterGroupSpec, ParameterRole, ProjectionSharding,
+        aligned_partition_units, array_parameter_member, partitioned_projection_members,
+        register_partitioned_projection_group, register_replicated_module, MemberSharding,
+        ParallelPlanBuilder, ParameterGroupSpec, ParameterMemberSpec, ParameterRole,
+        ProjectionSharding,
     },
     runtime::execution::layerwise::{
         load_layerwise_model, load_safetensors_layerwise_model,
@@ -56,7 +60,7 @@ use crate::{
     },
     runtime::residency::expert_cache::{
         ExpertCache, ExpertCacheLoadOptions, ExpertCacheReport, ExpertCatalogEntry, ExpertIdentity,
-        ExpertPass,
+        ExpertPass, ExpertRouteBatch,
     },
     runtime::residency::manager::{OffloadUnit, ResidencyReport, ResidentUnitLease, WeightBinding},
 };
@@ -68,6 +72,7 @@ const HEAD_UNIT: &str = "nemotron_h.static.output";
 fn register_nemotron_layer_parallel_plan(
     planner: &mut ParallelPlanBuilder,
     layer: &TransformerBlock,
+    args: &ModelArgs,
     index: usize,
 ) -> Result<(), Error> {
     let prefix = format!("model.layers.{index}");
@@ -85,6 +90,22 @@ fn register_nemotron_layer_parallel_plan(
                 .map_err(|_| Error::Parallel("Nemotron Mamba group width exceeds usize".into()))?;
             let heads = usize::try_from(mamba.num_heads)
                 .map_err(|_| Error::Parallel("Nemotron Mamba heads exceed usize".into()))?;
+            let groups = usize::try_from(mamba.n_groups)
+                .map_err(|_| Error::Parallel("Nemotron Mamba groups exceed usize".into()))?;
+            if groups == 0 || !heads.is_multiple_of(groups) {
+                return Err(Error::Parallel(format!(
+                    "Nemotron Mamba geometry has {heads} heads and {groups} groups"
+                )));
+            }
+            let out_prefix = format!("{prefix}.mamba.out_proj");
+            let (units, mut members) = partitioned_projection_members(
+                &[(
+                    &mamba.out_proj,
+                    out_prefix.as_str(),
+                    ProjectionSharding::Row,
+                )],
+                groups,
+            )?;
             let in_segments = vec![
                 0..intermediate,
                 intermediate..2 * intermediate,
@@ -92,76 +113,78 @@ fn register_nemotron_layer_parallel_plan(
                 2 * intermediate + grouped..2 * intermediate + 2 * grouped,
                 2 * intermediate + 2 * grouped..2 * intermediate + 2 * grouped + heads,
             ];
-            planner.register(module_parameter_group(
-                &format!("{prefix}.mamba.in_proj"),
-                ParameterRole::Segmented,
-                &mamba.in_proj,
-                &format!("{prefix}.mamba.in_proj"),
-                |_, _| {
-                    Ok(MemberSharding::Segmented {
+            let projection_size = in_segments.last().map_or(0, |segment| segment.end);
+            for (name, parameter) in mamba.in_proj.parameters().flatten() {
+                let shape = parameter
+                    .shape()
+                    .iter()
+                    .map(|dimension| {
+                        usize::try_from(*dimension).map_err(|_| {
+                            Error::Parallel(format!(
+                                "parameter {prefix}.mamba.in_proj.{name} has negative dimension {dimension}"
+                            ))
+                        })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                if shape.first().copied() != Some(projection_size) {
+                    return Err(Error::Parallel(format!(
+                        "Nemotron Mamba input member {prefix}.mamba.in_proj.{name} has shape {shape:?}, expected fused output width {projection_size}"
+                    )));
+                }
+                members.push(ParameterMemberSpec::new(
+                    format!("{prefix}.mamba.in_proj.{name}"),
+                    shape,
+                    MemberSharding::PartitionedSegments {
                         axis: 0,
                         segments: in_segments.clone(),
-                    })
-                },
-            )?)?;
+                    },
+                ));
+            }
             let conv_segments = vec![
                 0..intermediate,
                 intermediate..intermediate + grouped,
                 intermediate + grouped..intermediate + 2 * grouped,
             ];
-            let mut convolution = vec![array_parameter_member(
+            members.push(array_parameter_member(
                 format!("{prefix}.mamba.conv1d.weight"),
                 mamba.conv1d.weight.as_ref(),
-                MemberSharding::Segmented {
+                MemberSharding::PartitionedSegments {
                     axis: 0,
                     segments: conv_segments.clone(),
                 },
-            )?];
+            )?);
             if let Some(bias) = mamba.conv1d.bias.as_ref().as_ref() {
-                convolution.push(array_parameter_member(
+                members.push(array_parameter_member(
                     format!("{prefix}.mamba.conv1d.bias"),
                     bias,
-                    MemberSharding::Segmented {
+                    MemberSharding::PartitionedSegments {
                         axis: 0,
                         segments: conv_segments,
                     },
                 )?);
             }
-            planner.register(ParameterGroupSpec::new(
-                format!("{prefix}.mamba.conv1d"),
-                ParameterRole::Channels,
-                convolution,
-            )?)?;
             for (name, value) in [
                 ("dt_bias", mamba.dt_bias.as_ref()),
                 ("A_log", mamba.A_log.as_ref()),
                 ("D", mamba.D.as_ref()),
             ] {
-                planner.register(ParameterGroupSpec::new(
+                members.push(array_parameter_member(
                     format!("{prefix}.mamba.{name}"),
-                    ParameterRole::Channels,
-                    [array_parameter_member(
-                        format!("{prefix}.mamba.{name}"),
-                        value,
-                        MemberSharding::Equal { axis: 0 },
-                    )?],
-                )?)?;
+                    value,
+                    MemberSharding::Partitioned { axis: 0 },
+                )?);
             }
-            planner.register(ParameterGroupSpec::new(
-                format!("{prefix}.mamba.norm"),
+            members.push(array_parameter_member(
+                format!("{prefix}.mamba.norm.weight"),
+                mamba.norm.weight.as_ref(),
+                MemberSharding::Partitioned { axis: 0 },
+            )?);
+            planner.register(ParameterGroupSpec::partitioned(
+                format!("{prefix}.mamba.groups"),
                 ParameterRole::Channels,
-                [array_parameter_member(
-                    format!("{prefix}.mamba.norm.weight"),
-                    mamba.norm.weight.as_ref(),
-                    MemberSharding::Equal { axis: 0 },
-                )?],
+                units,
+                members,
             )?)?;
-            register_projection_module(
-                planner,
-                &mamba.out_proj,
-                &format!("{prefix}.mamba.out_proj"),
-                ProjectionSharding::Row,
-            )?;
         }
         LayerPolicy::SelfAttention(_) => {
             let attention = layer.attention.as_ref().ok_or_else(|| {
@@ -169,35 +192,41 @@ fn register_nemotron_layer_parallel_plan(
                     "Nemotron-H layer {index} is missing its attention mixer"
                 ))
             })?;
-            for (name, projection, placement) in [
-                ("q_proj", &attention.q_proj, ProjectionSharding::Column),
-                ("k_proj", &attention.k_proj, ProjectionSharding::Column),
-                ("v_proj", &attention.v_proj, ProjectionSharding::Column),
-                ("o_proj", &attention.o_proj, ProjectionSharding::Row),
-            ] {
-                register_projection_module(
-                    planner,
-                    projection,
-                    &format!("{prefix}.attention.{name}"),
-                    placement,
-                )?;
-            }
+            register_gqa_projection_group(
+                planner,
+                &format!("{prefix}.attention"),
+                GqaProjectionNames {
+                    query: "q_proj",
+                    key: "k_proj",
+                    value: "v_proj",
+                    output: "o_proj",
+                },
+                &attention.q_proj,
+                &attention.k_proj,
+                &attention.v_proj,
+                &attention.o_proj,
+                attention.n_heads,
+                attention.n_kv_heads,
+                args.head_dim,
+            )?;
         }
         LayerPolicy::DenseMlp => {
             let mlp = layer.mlp.as_ref().ok_or_else(|| {
                 Error::Parallel(format!("Nemotron-H layer {index} is missing its dense MLP"))
             })?;
-            register_projection_module(
+            let intermediate = usize::try_from(args.intermediate_size)
+                .map_err(|_| Error::Parallel("Nemotron dense MLP width exceeds usize".into()))?;
+            let up = format!("{prefix}.mlp.up_proj");
+            let down = format!("{prefix}.mlp.down_proj");
+            register_partitioned_projection_group(
                 planner,
-                &mlp.up_proj,
-                &format!("{prefix}.mlp.up_proj"),
-                ProjectionSharding::Column,
-            )?;
-            register_projection_module(
-                planner,
-                &mlp.down_proj,
-                &format!("{prefix}.mlp.down_proj"),
-                ProjectionSharding::Row,
+                &format!("{prefix}.mlp.intermediate"),
+                ParameterRole::FeedForwardIntermediate,
+                &[
+                    (&mlp.up_proj, up.as_str(), ProjectionSharding::Column),
+                    (&mlp.down_proj, down.as_str(), ProjectionSharding::Row),
+                ],
+                intermediate,
             )?;
         }
         LayerPolicy::SparseMoe => {
@@ -207,53 +236,75 @@ fn register_nemotron_layer_parallel_plan(
                 ))
             })?;
             register_replicated_module(planner, &moe.gate, &format!("{prefix}.moe.gate"))?;
-            for (name, projection, placement) in [
-                (
-                    "up_proj",
-                    &moe.shared_experts.up_proj,
-                    ProjectionSharding::Column,
-                ),
-                (
-                    "down_proj",
-                    &moe.shared_experts.down_proj,
-                    ProjectionSharding::Row,
-                ),
-            ] {
-                register_projection_module(
-                    planner,
-                    projection,
-                    &format!("{prefix}.moe.shared_experts.{name}"),
-                    placement,
-                )?;
-            }
+            let shared =
+                usize::try_from(args.moe_shared_expert_intermediate_size).map_err(|_| {
+                    Error::Parallel("Nemotron shared-expert width exceeds usize".into())
+                })?;
+            let shared_up = format!("{prefix}.moe.shared_experts.up_proj");
+            let shared_down = format!("{prefix}.moe.shared_experts.down_proj");
+            register_partitioned_projection_group(
+                planner,
+                &format!("{prefix}.moe.shared_experts.intermediate"),
+                ParameterRole::ExpertIntermediate,
+                &[
+                    (
+                        &moe.shared_experts.up_proj,
+                        shared_up.as_str(),
+                        ProjectionSharding::Column,
+                    ),
+                    (
+                        &moe.shared_experts.down_proj,
+                        shared_down.as_str(),
+                        ProjectionSharding::Row,
+                    ),
+                ],
+                shared,
+            )?;
             let experts = &moe.experts;
-            let mut up = vec![array_parameter_member(
+            let intermediate = usize::try_from(experts.intermediate_size).map_err(|_| {
+                Error::Parallel("Nemotron routed-expert width exceeds usize".into())
+            })?;
+            let alignment = experts
+                .down_quantization
+                .map(|quantization| quantization.group_size)
+                .or_else(|| {
+                    experts
+                        .down_iquant
+                        .map(|quantization| quantization.group_size())
+                })
+                .map_or(Ok(1usize), |alignment| {
+                    usize::try_from(alignment).map_err(|_| {
+                        Error::Parallel("Nemotron expert alignment exceeds usize".into())
+                    })
+                })?;
+            let units = aligned_partition_units(
+                &format!("{prefix}.moe.experts.intermediate"),
+                intermediate,
+                1,
+                alignment,
+            )?;
+            let mut members = vec![array_parameter_member(
                 format!("{prefix}.moe.experts.up_proj"),
                 experts.up_proj.as_ref(),
-                MemberSharding::Equal { axis: 1 },
+                MemberSharding::Partitioned { axis: 1 },
             )?];
             for (name, value) in [
                 ("up_proj_scales", experts.up_proj_scales.as_ref().as_ref()),
                 ("up_proj_biases", experts.up_proj_biases.as_ref().as_ref()),
             ] {
                 if let Some(value) = value {
-                    up.push(array_parameter_member(
+                    members.push(array_parameter_member(
                         format!("{prefix}.moe.experts.{name}"),
                         value,
-                        MemberSharding::Equal { axis: 1 },
+                        MemberSharding::Partitioned { axis: 1 },
                     )?);
                 }
             }
-            planner.register(ParameterGroupSpec::new(
-                format!("{prefix}.moe.experts.up"),
-                ParameterRole::ExpertIntermediate,
-                up,
-            )?)?;
-            let mut down = vec![array_parameter_member(
+            members.push(array_parameter_member(
                 format!("{prefix}.moe.experts.down_proj"),
                 experts.down_proj.as_ref(),
-                MemberSharding::Equal { axis: 2 },
-            )?];
+                MemberSharding::Partitioned { axis: 2 },
+            )?);
             for (name, value) in [
                 (
                     "down_proj_scales",
@@ -265,17 +316,18 @@ fn register_nemotron_layer_parallel_plan(
                 ),
             ] {
                 if let Some(value) = value {
-                    down.push(array_parameter_member(
+                    members.push(array_parameter_member(
                         format!("{prefix}.moe.experts.{name}"),
                         value,
-                        MemberSharding::Equal { axis: 2 },
+                        MemberSharding::Partitioned { axis: 2 },
                     )?);
                 }
             }
-            planner.register(ParameterGroupSpec::new(
-                format!("{prefix}.moe.experts.down"),
+            planner.register(ParameterGroupSpec::partitioned(
+                format!("{prefix}.moe.experts.intermediate"),
                 ParameterRole::ExpertIntermediate,
-                down,
+                units,
+                members,
             )?)?;
         }
     }
@@ -296,6 +348,30 @@ impl NemotronHLayerwiseModel {
     /// Creates cache/state matching the hybrid block pattern.
     pub fn new_cache(&self) -> Cache {
         self.execution.adapter().new_cache()
+    }
+
+    /// Creates resident state or pages attention blocks while bounded Mamba
+    /// convolution and recurrent tensors remain device resident.
+    pub fn new_cache_with_options(&self, policy: CacheResidencyPolicy) -> Result<Cache, Error> {
+        Cache::new_with_options_and_rank(
+            self.args(),
+            policy,
+            self.execution.prompt_cache_rank_identity(),
+        )
+        .map_err(Into::into)
+    }
+
+    /// Returns aggregate live attention paging observations, if enabled.
+    pub fn cache_residency_report(
+        &self,
+        cache: &Cache,
+    ) -> Result<Option<CacheResidencyReport>, Error> {
+        cache.residency_report().map_err(Into::into)
+    }
+
+    /// Returns the stable global architecture fingerprint used by prompt caches.
+    pub fn prompt_cache_architecture_fingerprint(&self) -> String {
+        resident::prompt_cache_architecture_fingerprint(self.args())
     }
 
     /// Returns rank-local generalized parallel information when applicable.
@@ -368,11 +444,6 @@ impl NemotronHLayerwiseModel {
     /// Returns the persistent checkpoint store.
     pub fn checkpoint_store(&self) -> &(dyn WeightStore + Send + Sync) {
         self.execution.checkpoint_store()
-    }
-
-    /// Backward-compatible alias for [`Self::checkpoint_store`].
-    pub fn weight_store(&self) -> &(dyn WeightStore + Send + Sync) {
-        self.checkpoint_store()
     }
 
     /// Runs the hybrid decoder while preserving KV and Mamba state.
@@ -650,11 +721,13 @@ pub(crate) fn load_nemotron_h_gguf_layerwise_model(
                 prepared.eos_token_ids,
             ));
         }
-        WeightResidency::FullyResident => {
-            return Err(Error::UnsupportedArchitecture(
-                "the bounded GGUF Nemotron-H loader does not accept fully resident policy".into(),
-            ));
-        }
+        WeightResidency::FullyResident => load_layerwise_model(
+            store,
+            NemotronHLayerwiseAdapter::new(args, stream)?,
+            LayerExecutionLoadOptions::FullyResident,
+            stream,
+            weights_stream,
+        )?,
     };
     Ok((
         NemotronHLayerwiseModel { execution },
@@ -682,7 +755,7 @@ fn load_nemotron_h_gguf_sparse_with_store(
     let mut adapter = NemotronHLayerwiseAdapter::new(args.clone(), stream)?;
     adapter.sparse_expert_cache = true;
     let mut execution = load_layerwise_model(store, adapter, non_expert, stream, weights_stream)?;
-    let checkpoint_store = execution.weight_store_arc();
+    let checkpoint_store = execution.checkpoint_store_arc();
     let entries = nemotron_h_expert_catalog(&args, checkpoint_store.as_ref())?;
     execution.adapter_mut().expert_cache = Some(ExpertCache::new_shared(
         checkpoint_store,
@@ -769,7 +842,7 @@ fn load_nemotron_h_sparse_expert_cache_model_with_non_expert(
     adapter.sparse_expert_cache = true;
     let mut execution =
         load_safetensors_layerwise_model(model_dir, adapter, non_expert, stream, weights_stream)?;
-    let store = execution.weight_store_arc();
+    let store = execution.checkpoint_store_arc();
     let entries = nemotron_h_expert_catalog(&args, store.as_ref())?;
     execution.adapter_mut().expert_cache = Some(ExpertCache::new_shared(
         store,
@@ -789,6 +862,7 @@ pub struct NemotronHLayerwiseAdapter {
     lm_head: Option<MaybeQuantized<nn::Linear>>,
     parallel_embedding: Option<VocabParallelEmbedding>,
     parallel_lm_head: Option<VocabParallelLmHead>,
+    parallel_geometry: Option<Vec<resident::ParallelLayerGeometry>>,
     sparse_expert_cache: bool,
     expert_cache: Option<ExpertCache>,
 }
@@ -822,6 +896,7 @@ impl NemotronHLayerwiseAdapter {
             lm_head,
             parallel_embedding: None,
             parallel_lm_head: None,
+            parallel_geometry: None,
             sparse_expert_cache: false,
             expert_cache: None,
         })
@@ -1025,31 +1100,20 @@ impl ArchitectureAdapter for NemotronHLayerwiseAdapter {
         &self,
         topology: Option<crate::ParallelTopology>,
     ) -> Result<PromptCacheModelIdentity, Error> {
-        let mut local = self.args.clone();
-        if let Some(topology) = topology {
-            local.num_attention_heads = exact_parallel_division(
-                "Nemotron-H prompt-cache attention heads",
-                local.num_attention_heads,
-                topology.tensor_parallel_size,
-            )?;
-            local.num_key_value_heads = exact_parallel_division(
-                "Nemotron-H prompt-cache KV heads",
-                local.num_key_value_heads,
-                topology.tensor_parallel_size,
-            )?;
-            local.mamba_num_heads = exact_parallel_division(
-                "Nemotron-H prompt-cache Mamba heads",
-                local.mamba_num_heads,
-                topology.tensor_parallel_size,
-            )?;
-            local.n_groups = exact_parallel_division(
-                "Nemotron-H prompt-cache Mamba groups",
-                local.n_groups,
-                topology.tensor_parallel_size,
-            )?;
-        }
         let layer_count = usize::try_from(self.args.num_hidden_layers)
             .map_err(|_| Exception::custom("invalid Nemotron-H cache layer count"))?;
+        let layer_layout = match topology {
+            None => resident::prompt_cache_layer_layout(&self.args),
+            Some(_) => {
+                let geometry = self.parallel_geometry.as_ref().ok_or_else(|| {
+                    Error::Parallel(
+                        "Nemotron-H parallel cache identity requested before local layout configuration"
+                            .into(),
+                    )
+                })?;
+                resident::prompt_cache_layer_layout_with_geometry(&self.args, geometry)
+            }
+        }?;
         Ok(PromptCacheModelIdentity {
             model_family: "nemotron_h".into(),
             effective_model_type: self.args.model_type.clone(),
@@ -1062,8 +1126,7 @@ impl ArchitectureAdapter for NemotronHLayerwiseAdapter {
                 PromptCacheTopology::default,
                 PromptCacheTopology::for_parallel_topology,
             ),
-            layer_layout: resident::prompt_cache_layer_layout(&local)
-                .map_err(|error| Exception::custom(error.to_string()))?,
+            layer_layout,
         })
     }
 
@@ -1095,23 +1158,33 @@ impl ArchitectureAdapter for NemotronHLayerwiseAdapter {
         expected: &PromptCacheDescriptor,
         identity: &PromptCacheModelIdentity,
         prefix_token_ids: &[u32],
-        _options: PagedCacheOptions,
+        options: PagedCacheOptions,
         stream: &Stream,
     ) -> Result<(Self::Cache, PromptCacheManifest), Error> {
-        resident::Model::load_prompt_cache_with_identity(
+        resident::Model::load_paged_prompt_cache_with_identity(
             &self.args,
             directory,
             expected,
             prefix_token_ids,
-            identity.clone(),
+            identity,
+            options,
             stream,
         )
         .map_err(Into::into)
     }
 
     fn static_units(&self, store: &dyn WeightStore) -> Result<Vec<StaticUnitBindings>, Error> {
-        let mut units = vec![
-            StaticUnitBindings::new(
+        self.selected_static_units(store, &|_| true)
+    }
+
+    fn selected_static_units(
+        &self,
+        store: &dyn WeightStore,
+        select: &dyn Fn(&str) -> bool,
+    ) -> Result<Vec<StaticUnitBindings>, Error> {
+        let mut units = Vec::new();
+        if select(EMBEDDING_UNIT) {
+            units.push(StaticUnitBindings::new(
                 EMBEDDING_UNIT,
                 build_module_bindings_with_recipes(
                     &self.embeddings,
@@ -1119,8 +1192,10 @@ impl ArchitectureAdapter for NemotronHLayerwiseAdapter {
                     store,
                     self.recipes_for_module(&self.embeddings, "model.embeddings", store, None)?,
                 )?,
-            )?,
-            StaticUnitBindings::new(
+            )?);
+        }
+        if select(NORM_UNIT) {
+            units.push(StaticUnitBindings::new(
                 NORM_UNIT,
                 build_module_bindings_with_recipes(
                     &self.norm,
@@ -1128,18 +1203,20 @@ impl ArchitectureAdapter for NemotronHLayerwiseAdapter {
                     store,
                     self.recipes_for_module(&self.norm, "model.norm_f", store, None)?,
                 )?,
-            )?,
-        ];
-        if let Some(head) = &self.lm_head {
-            units.push(StaticUnitBindings::new(
-                HEAD_UNIT,
-                build_module_bindings_with_recipes(
-                    head,
-                    "lm_head",
-                    store,
-                    self.recipes_for_module(head, "lm_head", store, None)?,
-                )?,
             )?);
+        }
+        if select(HEAD_UNIT) {
+            if let Some(head) = &self.lm_head {
+                units.push(StaticUnitBindings::new(
+                    HEAD_UNIT,
+                    build_module_bindings_with_recipes(
+                        head,
+                        "lm_head",
+                        store,
+                        self.recipes_for_module(head, "lm_head", store, None)?,
+                    )?,
+                )?);
+            }
         }
         Ok(units)
     }
@@ -1259,18 +1336,10 @@ impl ArchitectureAdapter for NemotronHLayerwiseAdapter {
         })
     }
 
-    fn execution_group_count(&self) -> usize {
-        1
-    }
-
-    fn execution_group_id(&self, group: usize) -> Result<String, Error> {
-        if group == 0 {
-            Ok("text_decoder".into())
-        } else {
-            Err(Error::UnsupportedArchitecture(format!(
-                "Nemotron-H has no execution group {group}"
-            )))
-        }
+    fn execution_graph(
+        &self,
+    ) -> Result<crate::runtime::execution::layerwise::ExecutionGroupDag, Error> {
+        crate::runtime::execution::layerwise::ExecutionGroupDag::chain(["text_decoder"])
     }
 
     fn layer_count(&self, group: usize) -> Result<usize, Error> {
@@ -1316,16 +1385,86 @@ impl ArchitectureAdapter for NemotronHLayerwiseAdapter {
         }
         for index in 0..self.args.num_hidden_layers as usize {
             let layer = TransformerBlock::new(&self.args, index, stream)?;
-            register_nemotron_layer_parallel_plan(planner, &layer, index)?;
+            register_nemotron_layer_parallel_plan(planner, &layer, &self.args, index)?;
         }
         Ok(())
     }
     fn configure_parallel_static(
         &mut self,
         context: crate::runtime::distributed::parallel::ParallelBuildContext,
-        _layout: &crate::runtime::distributed::parallel::LocalModelLayout,
+        layout: &crate::runtime::distributed::parallel::LocalModelLayout,
         stream: &Stream,
     ) -> Result<(), Error> {
+        let local_dimension = |target: &str, axis: usize| -> Result<i32, Error> {
+            let tensor = layout.tensor(target).ok_or_else(|| {
+                Error::Parallel(format!("missing Nemotron-H TP layout for {target}"))
+            })?;
+            let dimension = tensor.local_shape().get(axis).copied().ok_or_else(|| {
+                Error::Parallel(format!(
+                    "Nemotron-H TP layout for {target} has no axis {axis}"
+                ))
+            })?;
+            i32::try_from(dimension)
+                .map_err(|_| Error::Parallel(format!("Nemotron-H local {target} exceeds i32")))
+        };
+        let projection_dimension = |prefix: &str, axis: usize| -> Result<i32, Error> {
+            for target in [format!("{prefix}.weight"), format!("{prefix}.inner.weight")] {
+                if layout.tensor(&target).is_some() {
+                    return local_dimension(&target, axis);
+                }
+            }
+            Err(Error::Parallel(format!(
+                "missing Nemotron-H TP projection layout for {prefix}"
+            )))
+        };
+        let mut geometry = Vec::with_capacity(self.args.layer_schedule.len());
+        for (index, policy) in self.args.layer_schedule.iter().enumerate() {
+            let prefix = format!("model.layers.{index}");
+            geometry.push(match policy {
+                LayerPolicy::Mamba => {
+                    let heads = local_dimension(&format!("{prefix}.mamba.dt_bias"), 0)?;
+                    let conv = local_dimension(&format!("{prefix}.mamba.conv1d.weight"), 0)?;
+                    let intermediate = heads.checked_mul(self.args.mamba_head_dim).ok_or_else(|| {
+                        Error::Parallel("Nemotron-H local Mamba width overflowed".into())
+                    })?;
+                    let grouped = conv.checked_sub(intermediate).ok_or_else(|| {
+                        Error::Parallel("Nemotron-H local convolution width is inconsistent".into())
+                    })?;
+                    let divisor = self.args.ssm_state_size.checked_mul(2).ok_or_else(|| {
+                        Error::Parallel("Nemotron-H Mamba state divisor overflowed".into())
+                    })?;
+                    if divisor <= 0 || grouped % divisor != 0 {
+                        return Err(Error::Parallel(format!(
+                            "Nemotron-H local convolution width {conv} does not encode integral Mamba groups"
+                        )));
+                    }
+                    resident::ParallelLayerGeometry::Mamba {
+                        heads,
+                        groups: grouped / divisor,
+                    }
+                }
+                LayerPolicy::SelfAttention(_) => resident::ParallelLayerGeometry::Attention {
+                    query_heads: projection_dimension(&format!("{prefix}.attention.q_proj"), 0)?
+                        / self.args.head_dim,
+                    kv_heads: projection_dimension(&format!("{prefix}.attention.k_proj"), 0)?
+                        / self.args.head_dim,
+                },
+                LayerPolicy::DenseMlp => resident::ParallelLayerGeometry::DenseMlp {
+                    intermediate: projection_dimension(&format!("{prefix}.mlp.up_proj"), 0)?,
+                },
+                LayerPolicy::SparseMoe => resident::ParallelLayerGeometry::SparseMoe {
+                    routed_intermediate: local_dimension(
+                        &format!("{prefix}.moe.experts.up_proj"),
+                        1,
+                    )?,
+                    shared_intermediate: projection_dimension(
+                        &format!("{prefix}.moe.shared_experts.up_proj"),
+                        0,
+                    )?,
+                },
+            });
+        }
+        self.parallel_geometry = Some(geometry);
         self.parallel_embedding = Some(VocabParallelEmbedding::unloaded(
             self.args.vocab_size as usize,
             self.args.hidden_size,
@@ -1352,27 +1491,18 @@ impl ArchitectureAdapter for NemotronHLayerwiseAdapter {
         stream: &Stream,
     ) -> Result<Self::Layer, Error> {
         self.layer_count(group)?;
-        let prefix = format!("model.layers.{index}.");
-        let parts = layout
-            .tensors()
-            .filter(|(name, _)| name.starts_with(&prefix))
-            .flat_map(|(_, v)| {
-                v.global_shape()
-                    .iter()
-                    .zip(v.local_shape())
-                    .filter_map(|(g, l)| (*l > 0 && g % l == 0).then_some(g / l))
-            })
-            .max()
-            .unwrap_or(1) as i32;
-        let mut args = self.args.clone();
-        args.num_attention_heads /= parts;
-        args.num_key_value_heads /= parts;
-        args.mamba_num_heads /= parts;
-        args.n_groups /= parts;
-        args.intermediate_size /= parts;
-        args.moe_intermediate_size /= parts;
-        args.moe_shared_expert_intermediate_size /= parts;
-        TransformerBlock::new(&args, index, stream)
+        let _ = layout;
+        let geometry = self
+            .parallel_geometry
+            .as_ref()
+            .and_then(|geometry| geometry.get(index))
+            .copied()
+            .ok_or_else(|| {
+                Error::Parallel(format!(
+                    "Nemotron-H local geometry is unavailable for layer {index}"
+                ))
+            })?;
+        TransformerBlock::new_parallel_layerwise(&self.args, index, geometry, stream)
     }
 
     fn layer_checkpoint_prefix(&self, _group: usize, index: usize) -> String {
@@ -1486,11 +1616,7 @@ impl ArchitectureAdapter for NemotronHLayerwiseAdapter {
                 |flat, indices, weights, stream| {
                     expert_cache
                         .execute_routes_bounded(
-                            index,
-                            flat,
-                            indices,
-                            weights,
-                            pass,
+                            ExpertRouteBatch::new(index, flat, indices, weights, pass),
                             stream,
                             |flat, acquired, weights, stream| {
                                 let started = Instant::now();
@@ -1725,7 +1851,7 @@ pub type Generate<'a, S = crate::runtime::generation::sampler::DefaultSampler> =
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, path::Path};
+    use std::{collections::HashMap, fs, path::Path};
 
     use safemlx::{
         module::ModuleParameters,
@@ -1745,6 +1871,7 @@ mod tests {
         runtime::residency::policy::{OffloadConfig, ResidencyPolicy},
         runtime::{
             cache::KeyValueCache,
+            checkpoint::quantization::AffineQuantization,
             distributed::{
                 parallel::{ParallelBuildContext, ShardingPolicy},
                 topology::{DeviceAssignment, ParallelTopology},
@@ -1756,24 +1883,24 @@ mod tests {
     fn config() -> serde_json::Value {
         serde_json::json!({
             "model_type": "nemotron_h",
-            "vocab_size": 16,
-            "hidden_size": 8,
-            "intermediate_size": 12,
+            "vocab_size": 13,
+            "hidden_size": 12,
+            "intermediate_size": 17,
             "num_hidden_layers": 4,
             "hybrid_override_pattern": "M-E*",
-            "num_attention_heads": 2,
-            "num_key_value_heads": 1,
-            "head_dim": 4,
+            "num_attention_heads": 6,
+            "num_key_value_heads": 3,
+            "head_dim": 2,
             "max_position_embeddings": 64,
             "sliding_window": 3,
-            "mamba_num_heads": 2,
-            "mamba_head_dim": 4,
-            "n_groups": 1,
-            "ssm_state_size": 4,
+            "mamba_num_heads": 6,
+            "mamba_head_dim": 2,
+            "n_groups": 3,
+            "ssm_state_size": 2,
             "conv_kernel": 3,
             "chunk_size": 2,
-            "moe_intermediate_size": 6,
-            "moe_shared_expert_intermediate_size": 10,
+            "moe_intermediate_size": 5,
+            "moe_shared_expert_intermediate_size": 7,
             "n_routed_experts": 2,
             "n_shared_experts": 1,
             "num_experts_per_tok": 2,
@@ -1786,41 +1913,322 @@ mod tests {
         resident::model_args_from_config_value(&config()).unwrap()
     }
 
+    fn output_width_for_test(
+        linear: &safemlx::quantization::MaybeQuantized<safemlx::nn::Linear>,
+    ) -> i32 {
+        linear
+            .parameters()
+            .flatten()
+            .into_iter()
+            .find(|(name, _)| name.as_ref() == "weight" || name.as_ref() == "inner.weight")
+            .expect("linear weight")
+            .1
+            .dim(0)
+    }
+
     #[test]
     fn tensor_parallel_plan_shards_every_hybrid_operator() {
+        struct ParallelCase {
+            rank: usize,
+            mamba_heads: i32,
+            mamba_groups: i32,
+            dense: i32,
+            routed: i32,
+            shared: i32,
+            query: i32,
+            kv: i32,
+        }
+
         let execution = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
-        let adapter = NemotronHLayerwiseAdapter::new(args(), execution.stream()).unwrap();
-        let context = ParallelBuildContext::new(
-            ParallelTopology::from_rank(2, 0, 2, 1, 1, DeviceAssignment::new(DeviceType::Cpu, 0))
-                .unwrap(),
-            ShardingPolicy::Require,
-        );
-        let mut planner = context.planner();
-        adapter
-            .register_parallel_parameters(context, &mut planner, execution.stream())
+        let cases = [
+            ParallelCase {
+                rank: 0,
+                mamba_heads: 4,
+                mamba_groups: 2,
+                dense: 9,
+                routed: 3,
+                shared: 4,
+                query: 4,
+                kv: 2,
+            },
+            ParallelCase {
+                rank: 1,
+                mamba_heads: 2,
+                mamba_groups: 1,
+                dense: 8,
+                routed: 2,
+                shared: 3,
+                query: 2,
+                kv: 1,
+            },
+        ];
+        for ParallelCase {
+            rank,
+            mamba_heads,
+            mamba_groups,
+            dense,
+            routed,
+            shared,
+            query,
+            kv,
+        } in cases
+        {
+            let mut adapter = NemotronHLayerwiseAdapter::new(args(), execution.stream()).unwrap();
+            let topology = ParallelTopology::from_rank(
+                2,
+                rank,
+                2,
+                1,
+                1,
+                DeviceAssignment::new(DeviceType::Cpu, 0),
+            )
             .unwrap();
-        let (_, layout) = planner.finish().unwrap();
-        assert_eq!(
-            layout
-                .tensor("model.layers.0.mamba.in_proj.weight")
-                .unwrap()
-                .local_shape(),
-            &[13, 8]
-        );
-        assert_eq!(
-            layout
-                .tensor("model.layers.3.attention.q_proj.weight")
-                .unwrap()
-                .local_shape(),
-            &[4, 8]
-        );
-        assert_eq!(
-            layout
-                .tensor("model.layers.2.moe.experts.up_proj")
-                .unwrap()
-                .local_shape(),
-            &[2, 3, 8]
-        );
+            let context = ParallelBuildContext::new(topology, ShardingPolicy::Require);
+            let mut planner = context.planner();
+            adapter
+                .register_parallel_parameters(context, &mut planner, execution.stream())
+                .unwrap();
+            let (_, layout) = planner.finish().unwrap();
+            assert_eq!(
+                layout
+                    .tensor("model.layers.0.mamba.dt_bias")
+                    .unwrap()
+                    .local_shape(),
+                &[mamba_heads as usize]
+            );
+            assert_eq!(
+                layout
+                    .tensor("model.layers.0.mamba.conv1d.weight")
+                    .unwrap()
+                    .local_shape()[0],
+                (mamba_heads * 2 + 2 * mamba_groups * 2) as usize
+            );
+            assert_eq!(
+                layout
+                    .tensor("model.layers.1.mlp.up_proj.weight")
+                    .unwrap()
+                    .local_shape()[0],
+                dense as usize
+            );
+            assert_eq!(
+                layout
+                    .tensor("model.layers.2.moe.experts.up_proj")
+                    .unwrap()
+                    .local_shape(),
+                &[2, routed as usize, 12]
+            );
+            assert_eq!(
+                layout
+                    .tensor("model.layers.2.moe.shared_experts.up_proj.weight")
+                    .unwrap()
+                    .local_shape()[0],
+                shared as usize
+            );
+            assert_eq!(
+                layout
+                    .tensor("model.layers.3.attention.q_proj.weight")
+                    .unwrap()
+                    .local_shape(),
+                &[(query * 2) as usize, 12]
+            );
+            assert_eq!(
+                layout
+                    .tensor("model.layers.3.attention.k_proj.weight")
+                    .unwrap()
+                    .local_shape(),
+                &[(kv * 2) as usize, 12]
+            );
+
+            adapter
+                .configure_parallel_static(context, &layout, execution.stream())
+                .unwrap();
+            let identity = adapter.prompt_cache_model_identity(Some(topology)).unwrap();
+            let crate::LayerCachePolicy::FixedState { tensors } =
+                identity.layer_layout.get(0).unwrap()
+            else {
+                panic!("Nemotron layer 0 must expose Mamba fixed state")
+            };
+            assert_eq!(
+                tensors[0].shape[2],
+                crate::StateTensorDimension::fixed(mamba_heads * 2 + 2 * mamba_groups * 2).unwrap()
+            );
+            assert_eq!(
+                tensors[1].shape[1],
+                crate::StateTensorDimension::fixed(mamba_heads).unwrap()
+            );
+            let crate::LayerCachePolicy::KeyValue {
+                num_key_value_heads,
+                head_dim,
+                ..
+            } = identity.layer_layout.get(3).unwrap()
+            else {
+                panic!("Nemotron layer 3 must expose KV state")
+            };
+            assert_eq!(num_key_value_heads.get(), kv as u32);
+            assert_eq!(head_dim.get(), 2);
+
+            for index in 0..4 {
+                let layer = adapter
+                    .new_parallel_layer(0, index, &layout, execution.stream())
+                    .unwrap();
+                match index {
+                    0 => {
+                        let mixer = layer.mamba.unwrap();
+                        assert_eq!(mixer.num_heads, mamba_heads);
+                        assert_eq!(mixer.n_groups, mamba_groups);
+                    }
+                    1 => assert_eq!(output_width_for_test(&layer.mlp.unwrap().up_proj), dense),
+                    2 => {
+                        let moe = layer.moe.unwrap();
+                        assert_eq!(moe.experts.intermediate_size, routed);
+                        assert_eq!(output_width_for_test(&moe.shared_experts.up_proj), shared);
+                    }
+                    3 => {
+                        let attention = layer.attention.unwrap();
+                        assert_eq!(attention.n_heads, query);
+                        assert_eq!(attention.n_kv_heads, kv);
+                    }
+                    _ => unreachable!(),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn quantized_tensor_parallel_plan_preserves_aligned_hybrid_domains() {
+        let execution = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        let quantization = AffineQuantization::new(32, 4).unwrap().into();
+        let mut args = args();
+        args.hidden_size = 96;
+        args.intermediate_size = 96;
+        args.num_attention_heads = 6;
+        args.num_key_value_heads = 3;
+        args.head_dim = 16;
+        args.mamba_num_heads = 6;
+        args.mamba_head_dim = 16;
+        args.moe_intermediate_size = 96;
+        args.moe_shared_expert_intermediate_size = 96;
+        args.quantized_weight_configs = Some(HashMap::from([
+            ("model.layers.0.mamba.out_proj.weight".into(), quantization),
+            ("model.layers.1.mlp.down_proj.weight".into(), quantization),
+            ("model.layers.2.moe.experts.down_proj".into(), quantization),
+            (
+                "model.layers.2.moe.shared_experts.down_proj.weight".into(),
+                quantization,
+            ),
+            (
+                "model.layers.3.attention.o_proj.weight".into(),
+                quantization,
+            ),
+        ]));
+
+        for (rank, local_heads, local_groups, local_width, packed_width, scale_width) in
+            [(0, 4, 2, 64, 8, 2), (1, 2, 1, 32, 4, 1)]
+        {
+            let topology = ParallelTopology::from_rank(
+                2,
+                rank,
+                2,
+                1,
+                1,
+                DeviceAssignment::new(DeviceType::Cpu, 0),
+            )
+            .unwrap();
+            let context = ParallelBuildContext::new(topology, ShardingPolicy::Require);
+            let mut adapter =
+                NemotronHLayerwiseAdapter::new(args.clone(), execution.stream()).unwrap();
+            let mut planner = context.planner();
+            adapter
+                .register_parallel_parameters(context, &mut planner, execution.stream())
+                .unwrap();
+            let (_, layout) = planner.finish().unwrap();
+
+            assert_eq!(
+                layout
+                    .tensor("model.layers.0.mamba.out_proj.inner.weight")
+                    .unwrap()
+                    .local_shape(),
+                &[96, packed_width]
+            );
+            assert_eq!(
+                layout
+                    .tensor("model.layers.0.mamba.out_proj.scales")
+                    .unwrap()
+                    .local_shape(),
+                &[96, scale_width]
+            );
+            assert_eq!(
+                layout
+                    .tensor("model.layers.1.mlp.down_proj.inner.weight")
+                    .unwrap()
+                    .local_shape(),
+                &[96, packed_width]
+            );
+            assert_eq!(
+                layout
+                    .tensor("model.layers.2.moe.experts.down_proj")
+                    .unwrap()
+                    .local_shape(),
+                &[2, 96, packed_width]
+            );
+            assert_eq!(
+                layout
+                    .tensor("model.layers.2.moe.experts.down_proj_scales")
+                    .unwrap()
+                    .local_shape(),
+                &[2, 96, scale_width]
+            );
+            assert_eq!(
+                layout
+                    .tensor("model.layers.2.moe.shared_experts.down_proj.inner.weight")
+                    .unwrap()
+                    .local_shape(),
+                &[96, packed_width]
+            );
+            assert_eq!(
+                layout
+                    .tensor("model.layers.3.attention.o_proj.inner.weight")
+                    .unwrap()
+                    .local_shape(),
+                &[96, packed_width]
+            );
+
+            adapter
+                .configure_parallel_static(context, &layout, execution.stream())
+                .unwrap();
+            let identity = adapter.prompt_cache_model_identity(Some(topology)).unwrap();
+            let crate::LayerCachePolicy::FixedState { tensors } =
+                identity.layer_layout.get(0).unwrap()
+            else {
+                panic!("Nemotron layer 0 must expose Mamba fixed state")
+            };
+            assert_eq!(
+                tensors[1].shape[1],
+                crate::StateTensorDimension::fixed(local_heads).unwrap()
+            );
+            assert_eq!(
+                tensors[0].shape[2],
+                crate::StateTensorDimension::fixed(local_heads * 16 + local_groups * 4).unwrap()
+            );
+            for (index, expected_width) in [(1, local_width), (2, local_width)] {
+                let layer = adapter
+                    .new_parallel_layer(0, index, &layout, execution.stream())
+                    .unwrap();
+                if index == 1 {
+                    assert_eq!(
+                        output_width_for_test(&layer.mlp.unwrap().up_proj),
+                        expected_width
+                    );
+                } else {
+                    let moe = layer.moe.unwrap();
+                    assert_eq!(moe.experts.intermediate_size, expected_width);
+                    assert_eq!(
+                        output_width_for_test(&moe.shared_experts.up_proj),
+                        expected_width
+                    );
+                }
+            }
+        }
     }
 
     fn initialize(model: &mut Model, stream: &Stream) {

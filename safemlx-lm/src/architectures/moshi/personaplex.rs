@@ -10,15 +10,21 @@ use std::path::Path;
 
 use safemlx::{
     error::Exception, module::ModuleParametersExt, ops::broadcast_to, ops::indexing::TryIndexOp,
-    random::RandomState, Array, Stream,
+    Array, Stream,
 };
 use serde::Deserialize;
 
 use crate::{
-    api::moshi,
+    api::{
+        moshi,
+        realtime::{LoadedRealtimeModel, RealtimeInferenceScheduler, RealtimeStepInput},
+    },
     error::Error,
     runtime::checkpoint::quantization::WeightQuantization,
-    runtime::generation::sampler::{DefaultSampler, Sampler},
+    runtime::{
+        generation::sampler::Sampler,
+        scheduler::{RequestId, WorkId},
+    },
 };
 
 /// Hugging Face repository for the released PersonaPlex checkpoint.
@@ -54,100 +60,6 @@ pub struct ModelMetadata {
 
 /// PersonaPlex uses the Moshi-family token model implementation.
 pub type Model = moshi::Model;
-/// Stateful realtime generation session.
-pub type GenerationState = moshi::GenerationState;
-/// Output from one realtime generation step.
-pub type GenerationStepOutput = moshi::GenerationStepOutput;
-/// Offline encoded-audio output.
-pub type EncodedAudioOutput = moshi::EncodedAudioOutput;
-
-/// PersonaPlex model operations needed by forced system-prompt prefill.
-pub trait PromptModel {
-    /// Number of within-frame depth codebooks.
-    fn depth_codebooks(&self) -> i32;
-
-    /// Advances one prompt frame with forced agent audio and text.
-    #[allow(clippy::too_many_arguments)]
-    fn generate_prompt_step<TS: Sampler, AS: Sampler>(
-        &mut self,
-        state: &mut GenerationState,
-        input_audio_tokens: &Array,
-        forced_generated_audio_tokens: Option<&Array>,
-        forced_text_token: Option<&Array>,
-        text_sampler: &mut TS,
-        audio_samplers: &mut [AS],
-        text_temperature: f32,
-        audio_temperature: f32,
-        prng_state: Option<&mut RandomState>,
-        stream: &Stream,
-    ) -> Result<GenerationStepOutput, Exception>;
-}
-
-impl PromptModel for Model {
-    fn depth_codebooks(&self) -> i32 {
-        self.args.dep_q
-    }
-
-    fn generate_prompt_step<TS: Sampler, AS: Sampler>(
-        &mut self,
-        state: &mut GenerationState,
-        input_audio_tokens: &Array,
-        forced_generated_audio_tokens: Option<&Array>,
-        forced_text_token: Option<&Array>,
-        text_sampler: &mut TS,
-        audio_samplers: &mut [AS],
-        text_temperature: f32,
-        audio_temperature: f32,
-        prng_state: Option<&mut RandomState>,
-        stream: &Stream,
-    ) -> Result<GenerationStepOutput, Exception> {
-        self.generate_step_forced(
-            state,
-            input_audio_tokens,
-            forced_generated_audio_tokens,
-            forced_text_token,
-            text_sampler,
-            audio_samplers,
-            text_temperature,
-            audio_temperature,
-            prng_state,
-            stream,
-        )
-    }
-}
-
-impl PromptModel for crate::architectures::moshi::layerwise::MoshiLayerwiseModel {
-    fn depth_codebooks(&self) -> i32 {
-        self.args().dep_q
-    }
-
-    fn generate_prompt_step<TS: Sampler, AS: Sampler>(
-        &mut self,
-        state: &mut GenerationState,
-        input_audio_tokens: &Array,
-        forced_generated_audio_tokens: Option<&Array>,
-        forced_text_token: Option<&Array>,
-        text_sampler: &mut TS,
-        audio_samplers: &mut [AS],
-        text_temperature: f32,
-        audio_temperature: f32,
-        prng_state: Option<&mut RandomState>,
-        stream: &Stream,
-    ) -> Result<GenerationStepOutput, Exception> {
-        self.generate_step_forced(
-            state,
-            input_audio_tokens,
-            forced_generated_audio_tokens,
-            forced_text_token,
-            text_sampler,
-            audio_samplers,
-            text_temperature,
-            audio_temperature,
-            prng_state,
-            stream,
-        )
-    }
-}
 
 /// Returns the published PersonaPlex 7B v1 language-model defaults.
 pub fn model_args_7b_v1() -> moshi::ModelArgs {
@@ -431,72 +343,49 @@ fn repeated_frame(tokens: &[i32; 8], batch: i32, stream: &Stream) -> Result<Arra
     )
 }
 
-/// Runs one forced PersonaPlex prompt frame.
-#[allow(clippy::too_many_arguments)]
-pub fn step_prompt_frame<M: PromptModel, TS: Sampler, AS: Sampler>(
-    model: &mut M,
-    state: &mut GenerationState,
+/// Enqueues one forced PersonaPlex prompt frame on an existing request.
+pub fn enqueue_prompt_frame<TS: Sampler, AS: Sampler>(
+    scheduler: &mut RealtimeInferenceScheduler<TS, AS>,
+    model: &LoadedRealtimeModel,
+    request: RequestId,
     frame: PromptFrame<'_>,
-    text_sampler: &mut TS,
-    audio_samplers: &mut [AS],
-    text_temperature: f32,
-    audio_temperature: f32,
-    prng_state: Option<&mut RandomState>,
-    stream: &Stream,
-) -> Result<GenerationStepOutput, Exception> {
-    model.generate_prompt_step(
-        state,
-        frame.user_audio_tokens,
-        Some(frame.agent_audio_tokens),
-        Some(frame.text_token),
-        text_sampler,
-        audio_samplers,
-        text_temperature,
-        audio_temperature,
-        prng_state,
-        stream,
-    )
-}
-
-/// Greedily runs one forced PersonaPlex prompt frame.
-pub fn step_prompt_frame_greedy<M: PromptModel>(
-    model: &mut M,
-    state: &mut GenerationState,
-    frame: PromptFrame<'_>,
-    stream: &Stream,
-) -> Result<GenerationStepOutput, Exception> {
-    let mut text_sampler = DefaultSampler;
-    let mut audio_samplers = (0..model.depth_codebooks())
-        .map(|_| DefaultSampler)
-        .collect::<Vec<_>>();
-    step_prompt_frame(
+) -> Result<WorkId, Error> {
+    scheduler.enqueue(
         model,
-        state,
-        frame,
-        &mut text_sampler,
-        &mut audio_samplers,
-        0.0,
-        0.0,
-        None,
-        stream,
+        request,
+        RealtimeStepInput::encoded_audio(frame.user_audio_tokens)
+            .with_forced_generated_audio(frame.agent_audio_tokens)
+            .with_forced_text(frame.text_token),
     )
 }
 
-/// Runs a sequence of forced voice-prompt frames.
+/// Enqueues a sequence of forced voice-prompt frames.
 ///
 /// `voice_prompt_tokens` uses codec layout `[batch, 8, frames]`; the user side
 /// is filled with PersonaPlex's sine-conditioning token frame and text is
 /// forced to the existing text pad id.
-pub fn prefill_voice_prompt_greedy<M: PromptModel>(
-    model: &mut M,
-    state: &mut GenerationState,
+pub fn enqueue_voice_prompt<TS: Sampler, AS: Sampler>(
+    scheduler: &mut RealtimeInferenceScheduler<TS, AS>,
+    model: &LoadedRealtimeModel,
+    request: RequestId,
     voice_prompt_tokens: &Array,
     stream: &Stream,
-) -> Result<(), Exception> {
+) -> Result<Vec<WorkId>, Error> {
+    scheduler.enqueue_batch(
+        model,
+        request,
+        voice_prompt_inputs(voice_prompt_tokens, stream)?,
+    )
+}
+
+fn voice_prompt_inputs(
+    voice_prompt_tokens: &Array,
+    stream: &Stream,
+) -> Result<Vec<RealtimeStepInput>, Error> {
     if voice_prompt_tokens.shape().len() != 3
         || voice_prompt_tokens.dim(1) != AUDIO_TOKENS_PER_STREAM
     {
-        return Err(Exception::custom(format!(
+        return Err(Error::Parallel(format!(
             "PersonaPlex voice prompt tokens must have shape [batch, 8, frames], got {:?}",
             voice_prompt_tokens.shape()
         )));
@@ -504,36 +393,44 @@ pub fn prefill_voice_prompt_greedy<M: PromptModel>(
     let batch = voice_prompt_tokens.dim(0);
     let sine = sine_frame(batch, stream)?;
     let text = text_padding_frame(batch, stream)?;
+    let mut inputs = Vec::with_capacity(voice_prompt_tokens.dim(2) as usize);
     for frame in 0..voice_prompt_tokens.dim(2) {
         let agent = voice_prompt_tokens.try_index_device((.., .., frame), stream)?;
-        step_prompt_frame_greedy(
-            model,
-            state,
-            PromptFrame {
-                agent_audio_tokens: &agent,
-                user_audio_tokens: &sine,
-                text_token: &text,
-            },
-            stream,
-        )?;
+        inputs.push(
+            RealtimeStepInput::encoded_audio(&sine)
+                .with_forced_generated_audio(&agent)
+                .with_forced_text(&text),
+        );
     }
-    Ok(())
+    Ok(inputs)
 }
 
-/// Runs a sequence of forced text-prompt tokens.
+/// Enqueues a sequence of forced text-prompt tokens.
 ///
 /// `text_prompt_tokens` is shaped `[batch, frames]` and should contain token ids
 /// from the caller's PersonaPlex-compatible text tokenizer. The generated audio
 /// side is forced to PersonaPlex silence while the user side is filled with the
 /// sine-conditioning frame.
-pub fn prefill_text_prompt_greedy<M: PromptModel>(
-    model: &mut M,
-    state: &mut GenerationState,
+pub fn enqueue_text_prompt<TS: Sampler, AS: Sampler>(
+    scheduler: &mut RealtimeInferenceScheduler<TS, AS>,
+    model: &LoadedRealtimeModel,
+    request: RequestId,
     text_prompt_tokens: &Array,
     stream: &Stream,
-) -> Result<(), Exception> {
+) -> Result<Vec<WorkId>, Error> {
+    scheduler.enqueue_batch(
+        model,
+        request,
+        text_prompt_inputs(text_prompt_tokens, stream)?,
+    )
+}
+
+fn text_prompt_inputs(
+    text_prompt_tokens: &Array,
+    stream: &Stream,
+) -> Result<Vec<RealtimeStepInput>, Error> {
     if text_prompt_tokens.shape().len() != 2 {
-        return Err(Exception::custom(format!(
+        return Err(Error::Parallel(format!(
             "PersonaPlex text prompt tokens must have shape [batch, frames], got {:?}",
             text_prompt_tokens.shape()
         )));
@@ -541,42 +438,41 @@ pub fn prefill_text_prompt_greedy<M: PromptModel>(
     let batch = text_prompt_tokens.dim(0);
     let silence = silence_frame(batch, stream)?;
     let sine = sine_frame(batch, stream)?;
+    let mut inputs = Vec::with_capacity(text_prompt_tokens.dim(1) as usize);
     for frame in 0..text_prompt_tokens.dim(1) {
         let text = text_prompt_tokens
             .try_index_device((.., frame), stream)?
             .expand_dims(1, stream)?;
-        step_prompt_frame_greedy(
-            model,
-            state,
-            PromptFrame {
-                agent_audio_tokens: &silence,
-                user_audio_tokens: &sine,
-                text_token: &text,
-            },
-            stream,
-        )?;
+        inputs.push(
+            RealtimeStepInput::encoded_audio(&sine)
+                .with_forced_generated_audio(&silence)
+                .with_forced_text(&text),
+        );
     }
-    Ok(())
+    Ok(inputs)
 }
 
-/// Runs PersonaPlex's hybrid system prompt prefill from codec and text tokens.
+/// Enqueues PersonaPlex's hybrid system prompt from codec and text tokens.
 ///
 /// `voice_prompt_tokens`, when present, uses codec layout `[batch, 8, frames]`.
 /// `text_prompt_tokens` uses text-token layout `[batch, frames]`. Text wrapping
 /// and tokenization stay outside this crate; callers can use
 /// [`wrap_system_prompt`] before tokenizing with a compatible SentencePiece
 /// tokenizer.
-pub fn prefill_system_prompt_greedy<M: PromptModel>(
-    model: &mut M,
-    state: &mut GenerationState,
+pub fn enqueue_system_prompt<TS: Sampler, AS: Sampler>(
+    scheduler: &mut RealtimeInferenceScheduler<TS, AS>,
+    model: &LoadedRealtimeModel,
+    request: RequestId,
     voice_prompt_tokens: Option<&Array>,
     text_prompt_tokens: &Array,
     stream: &Stream,
-) -> Result<(), Exception> {
+) -> Result<Vec<WorkId>, Error> {
+    let mut inputs = Vec::new();
     if let Some(tokens) = voice_prompt_tokens {
-        prefill_voice_prompt_greedy(model, state, tokens, stream)?;
+        inputs.extend(voice_prompt_inputs(tokens, stream)?);
     }
-    prefill_text_prompt_greedy(model, state, text_prompt_tokens, stream)
+    inputs.extend(text_prompt_inputs(text_prompt_tokens, stream)?);
+    scheduler.enqueue_batch(model, request, inputs)
 }
 
 #[cfg(test)]
@@ -586,10 +482,12 @@ mod tests {
     };
     use crate::{
         api::realtime::{
-            LoadedRealtimeModel, RealtimeModelKind, RealtimeSampling, RealtimeSpeechModel,
-            RealtimeState, RealtimeStepInput,
+            RealtimeInferenceScheduler, RealtimeModelKind, RealtimeSampling, RealtimeStepInput,
         },
-        runtime::generation::sampler::DefaultSampler,
+        runtime::{
+            generation::sampler::DefaultSampler,
+            scheduler::{RequestId, SchedulerLimits},
+        },
     };
     use safemlx::{Array, Device, DeviceType, ExecutionContext};
 
@@ -642,10 +540,9 @@ mod tests {
             gpu.stream(),
             cpu.stream(),
         )
-        .unwrap()
-        .into_moshi_model();
-        assert_eq!(model.args.quantization.unwrap().bits(), 4);
-        assert_eq!(model.args.dep_q, 16);
+        .unwrap();
+        assert_eq!(model.args().quantization.unwrap().bits(), 4);
+        assert_eq!(model.args().dep_q, 16);
     }
 
     #[test]
@@ -657,33 +554,41 @@ mod tests {
         let mut model =
             crate::api::realtime::load_model(&model_dir, ctx.stream(), ctx.stream()).unwrap();
         assert_eq!(model.kind(), RealtimeModelKind::PersonaPlex);
-        let mut state = model.new_realtime_state();
         let stream = ctx.stream();
+        let request = RequestId::new(1);
+        let audio_samplers = (0..model.realtime_config().depth_audio_codebooks)
+            .map(|_| DefaultSampler)
+            .collect::<Vec<_>>();
+        let mut scheduler =
+            RealtimeInferenceScheduler::new(&model, SchedulerLimits::new(1, 4).unwrap()).unwrap();
+        scheduler
+            .register_request(
+                &model,
+                request,
+                DefaultSampler,
+                audio_samplers,
+                RealtimeSampling::greedy(),
+            )
+            .unwrap();
 
         let text_prompt =
             Array::full::<i32>(&[1, 2], Array::from_int(TEXT_PADDING_TOKEN), stream).unwrap();
-        match (&mut model, &mut state) {
-            (LoadedRealtimeModel::PersonaPlex(model), RealtimeState::PersonaPlex(state)) => {
-                super::prefill_text_prompt_greedy(model, state, &text_prompt, stream).unwrap()
-            }
-            _ => panic!("expected PersonaPlex realtime model and state"),
-        }
+        super::enqueue_text_prompt(&mut scheduler, &model, request, &text_prompt, stream).unwrap();
+        scheduler.run_queued(&mut model, stream).unwrap();
 
         let input = super::sine_frame(1, stream).unwrap();
-        let mut text_sampler = DefaultSampler;
-        let mut audio_samplers = (0..model.realtime_config().depth_audio_codebooks)
-            .map(|_| DefaultSampler)
-            .collect::<Vec<_>>();
         let mut emitted = None;
         for _ in 0..3 {
-            let output = model
-                .step_realtime(
-                    &mut state,
-                    RealtimeStepInput::encoded_audio(&input),
-                    RealtimeSampling::new(&mut text_sampler, &mut audio_samplers, 0.0, 0.0, None),
-                    stream,
-                )
+            scheduler
+                .enqueue(&model, request, RealtimeStepInput::encoded_audio(&input))
                 .unwrap();
+            let output = scheduler
+                .run_queued(&mut model, stream)
+                .unwrap()
+                .pop()
+                .unwrap()
+                .into_parts()
+                .1;
             emitted = output.output_audio_tokens;
         }
         let emitted = emitted.expect("PersonaPlex should emit a delay-aligned frame");

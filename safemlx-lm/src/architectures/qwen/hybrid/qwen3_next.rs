@@ -50,7 +50,7 @@ pub fn model_args_from_config_value(config: &serde_json::Value) -> Result<ModelA
 
 /// Loads `tokenizer.json` from a Qwen3-Next model directory.
 pub fn load_qwen3_next_tokenizer(model_dir: impl AsRef<Path>) -> Result<Tokenizer, Error> {
-    super::qwen3_5::load_qwen3_5_moe_tokenizer(model_dir)
+    super::qwen3_5::load_qwen3_5_tokenizer(model_dir)
 }
 
 /// Loads a Qwen3-Next safetensors checkpoint.
@@ -110,7 +110,7 @@ fn load_qwen3_next_model_with_quantization(
     }
     let mut model = Model::new(args, None, None, None, stream)?;
     let args = model.args.clone();
-    let config = super::qwen3_5::qwen3_5_moe_strict_load_config(false);
+    let config = super::qwen3_5::qwen3_5_strict_load_config(false);
     let mut report = StrictLoadReport::default();
     if args.uses_fp8() {
         super::qwen3_5::load_qwen_fp8_safetensors_dir_strict_with_transform(
@@ -685,7 +685,7 @@ mod tests {
         )
         .unwrap();
 
-        let config = super::super::qwen3_5::qwen3_5_moe_strict_load_config(false);
+        let config = super::super::qwen3_5::qwen3_5_strict_load_config(false);
         let mut report = crate::runtime::checkpoint::load::StrictLoadReport::default();
         super::super::qwen3_5::load_qwen_fp8_safetensors_dir_strict_with_transform(
             &mut model,
@@ -818,7 +818,7 @@ mod tests {
         )
         .unwrap();
 
-        let config = super::super::qwen3_5::qwen3_5_moe_strict_load_config(false);
+        let config = super::super::qwen3_5::qwen3_5_strict_load_config(false);
         let mut report = crate::runtime::checkpoint::load::StrictLoadReport::default();
         let error = super::super::qwen3_5::load_qwen_fp8_safetensors_dir_strict_with_transform(
             &mut model,

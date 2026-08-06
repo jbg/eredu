@@ -354,8 +354,7 @@ fn default_vision_fullatt_block_indexes() -> Vec<i32> {
 #[derive(Debug, Clone, ModuleParameters)]
 /// Layer normalization used by Qwen vision encoders.
 ///
-/// The public type name is retained for compatibility with the original
-/// Qwen3.5 vision implementation this shared module was extracted from.
+/// Shared RMSNorm implementation for dense and MoE Qwen vision towers.
 pub struct QwenVisionRmsNorm {
     #[param]
     /// Learned scale.

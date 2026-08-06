@@ -493,6 +493,43 @@ pub struct LayerPolicy {
     pub feed_forward: FeedForwardPolicy,
 }
 
+/// Rank-local decoder geometry selected by the tensor-parallel planner.
+///
+/// The attention, dense, and routed-expert widths are independent semantic
+/// domains. Recording them explicitly keeps cache topology and execution from
+/// reverse-engineering model geometry from packed checkpoint shapes.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub(crate) struct ParallelLayerGeometry {
+    pub query_heads: i32,
+    pub kv_heads: i32,
+    pub dense_intermediate: i32,
+    pub expert_intermediate: Option<i32>,
+}
+
+impl ParallelLayerGeometry {
+    fn resident(args: &ModelArgs, layer: usize) -> Result<Self, Error> {
+        let policy = args.layer_policy(layer).ok_or_else(|| {
+            Error::UnsupportedArchitecture(format!(
+                "Gemma 4 layer schedule has no decoder layer {layer}"
+            ))
+        })?;
+        Ok(Self {
+            query_heads: args.num_attention_heads,
+            kv_heads: policy.num_key_value_heads.get() as i32,
+            dense_intermediate: policy.intermediate_size.get() as i32,
+            expert_intermediate: if policy.feed_forward == FeedForwardPolicy::DenseWithSparseMoe {
+                Some(args.moe_intermediate_size.ok_or_else(|| {
+                    Error::UnsupportedArchitecture(format!(
+                        "Gemma 4 MoE layer {layer} has no expert intermediate width"
+                    ))
+                })?)
+            } else {
+                None
+            },
+        })
+    }
+}
+
 impl LayerPolicy {
     /// Returns a stable representation for architecture and cache identity.
     pub fn fingerprint_component(self) -> String {
@@ -713,25 +750,26 @@ pub(super) fn model_args_from_source(source: ModelArgsSource) -> Result<ModelArg
             }
         })
         .collect::<Vec<_>>();
-    let layer_schedule = layer_schedule_from_parts(
-        &attention_schedule,
-        &feed_forward_lengths,
-        &kv_heads,
-        &head_dims,
-        source.num_kv_shared_layers,
-        &attention_schedule
-            .iter()
-            .map(|attention| {
-                if source.attention_k_eq_v && *attention == AttentionPolicy::Full {
-                    ValuePolicy::ReuseKey
-                } else {
-                    ValuePolicy::Projected
-                }
-            })
-            .collect::<Vec<_>>(),
-        source.enable_moe_block,
-        "Gemma 4",
-    )?;
+    let value_policies = attention_schedule
+        .iter()
+        .map(|attention| {
+            if source.attention_k_eq_v && *attention == AttentionPolicy::Full {
+                ValuePolicy::ReuseKey
+            } else {
+                ValuePolicy::Projected
+            }
+        })
+        .collect::<Vec<_>>();
+    let layer_schedule = layer_schedule_from_parts(LayerScheduleParts {
+        attention: &attention_schedule,
+        feed_forward_lengths: &feed_forward_lengths,
+        kv_heads: &kv_heads,
+        head_dims: &head_dims,
+        shared_layers: source.num_kv_shared_layers,
+        value_policies: &value_policies,
+        enable_moe: source.enable_moe_block,
+        source: "Gemma 4",
+    })?;
     Ok(ModelArgs {
         model_type: source.model_type,
         hidden_size: source.hidden_size,
@@ -762,16 +800,30 @@ pub(super) fn model_args_from_source(source: ModelArgsSource) -> Result<ModelArg
     })
 }
 
+pub(super) struct LayerScheduleParts<'a> {
+    pub(super) attention: &'a LayerSchedule<AttentionPolicy>,
+    pub(super) feed_forward_lengths: &'a [i32],
+    pub(super) kv_heads: &'a [i32],
+    pub(super) head_dims: &'a [i32],
+    pub(super) shared_layers: i32,
+    pub(super) value_policies: &'a [ValuePolicy],
+    pub(super) enable_moe: bool,
+    pub(super) source: &'a str,
+}
+
 pub(super) fn layer_schedule_from_parts(
-    attention: &LayerSchedule<AttentionPolicy>,
-    feed_forward_lengths: &[i32],
-    kv_heads: &[i32],
-    head_dims: &[i32],
-    shared_layers: i32,
-    value_policies: &[ValuePolicy],
-    enable_moe: bool,
-    source: &str,
+    parts: LayerScheduleParts<'_>,
 ) -> Result<LayerSchedule<LayerPolicy>, Error> {
+    let LayerScheduleParts {
+        attention,
+        feed_forward_lengths,
+        kv_heads,
+        head_dims,
+        shared_layers,
+        value_policies,
+        enable_moe,
+        source,
+    } = parts;
     let layer_count = attention.len();
     for (name, values) in [
         ("feed-forward widths", feed_forward_lengths),
@@ -1005,10 +1057,26 @@ pub(crate) fn prompt_cache_architecture_fingerprint(args: &ModelArgs) -> String 
 pub(crate) fn prompt_cache_layer_layout(
     args: &ModelArgs,
 ) -> Result<LayerSchedule<LayerCachePolicy>, Error> {
+    let geometry = (0..args.num_hidden_layers as usize)
+        .map(|layer| ParallelLayerGeometry::resident(args, layer))
+        .collect::<Result<Vec<_>, _>>()?;
+    prompt_cache_layer_layout_with_geometry(args, &geometry)
+}
+
+pub(crate) fn prompt_cache_layer_layout_with_geometry(
+    args: &ModelArgs,
+    geometry: &[ParallelLayerGeometry],
+) -> Result<LayerSchedule<LayerCachePolicy>, Error> {
     let cache_error = |error: crate::runtime::cache::residency::CacheResidencyError| {
         Error::UnsupportedArchitecture(error.to_string())
     };
     let layers = args.num_hidden_layers as usize;
+    if geometry.len() != layers {
+        return Err(Error::UnsupportedArchitecture(format!(
+            "Gemma 4 cache geometry has {} layers, expected {layers}",
+            geometry.len()
+        )));
+    }
     let policies = (0..layers)
         .map(|layer| {
             let policy = *args.layer_schedule.get(layer).ok_or_else(|| {
@@ -1019,8 +1087,14 @@ pub(crate) fn prompt_cache_layer_layout(
             if !policy.key_value.owns_state() {
                 return Ok(LayerCachePolicy::NoState);
             }
+            let geometry = geometry[layer];
+            if geometry.query_heads <= 0 || geometry.kv_heads <= 0 {
+                return Err(Error::UnsupportedArchitecture(format!(
+                    "Gemma 4 layer {layer} has invalid cache geometry {geometry:?}"
+                )));
+            }
             let attention = policy.attention;
-            let kv_heads = policy.num_key_value_heads.get() as i32;
+            let kv_heads = geometry.kv_heads;
             let head_dim = policy.head_dim.get() as i32;
             if layer == 0 {
                 LayerCachePolicy::key_value_with_fixed_state(
@@ -2688,6 +2762,37 @@ impl TransformerBlock {
             post_feedforward_layernorm_2,
         })
     }
+
+    /// Creates an unloaded rank-local block from planner-authored geometry.
+    pub(crate) fn new_parallel_layerwise(
+        args: &ModelArgs,
+        layer_idx: usize,
+        geometry: ParallelLayerGeometry,
+        stream: &Stream,
+    ) -> Result<Self, Exception> {
+        let mut policy = *args.layer_policy(layer_idx).ok_or_else(|| {
+            Exception::custom(format!(
+                "Gemma 4 layer schedule has no decoder layer {layer_idx}"
+            ))
+        })?;
+        if geometry.query_heads <= 0
+            || geometry.kv_heads <= 0
+            || geometry.dense_intermediate <= 0
+            || geometry.expert_intermediate.is_some_and(|width| width <= 0)
+        {
+            return Err(Exception::custom(format!(
+                "Gemma 4 layer {layer_idx} has invalid local geometry {geometry:?}"
+            )));
+        }
+        policy.num_key_value_heads = NonZeroU32::new(geometry.kv_heads as u32)
+            .ok_or_else(|| Exception::custom("Gemma 4 local KV-head count is empty"))?;
+        policy.intermediate_size = NonZeroU32::new(geometry.dense_intermediate as u32)
+            .ok_or_else(|| Exception::custom("Gemma 4 local dense intermediate is empty"))?;
+        let mut local_args = args.clone();
+        local_args.num_attention_heads = geometry.query_heads;
+        local_args.moe_intermediate_size = geometry.expert_intermediate;
+        Self::new(&local_args, policy, layer_idx, stream)
+    }
 }
 
 impl TransformerBlock {
@@ -3652,61 +3757,6 @@ impl Model {
         }
         profile_array(PerfComponent::LmHead, &logits)?;
         Ok(logits)
-    }
-
-    pub(crate) fn prefill_typed_with_observer(
-        &mut self,
-        input: input::ModelInput<'_>,
-        cache: &mut Cache,
-        stream: &Stream,
-        observer: &mut impl ActivationObserver,
-    ) -> Result<Array, Exception> {
-        let logits = match self.prepare_typed_prefill(input, stream)? {
-            input::PreparedPrefill::Text(tokens) => {
-                cache.token_ids = token_ids_from_array(&tokens, stream)?;
-                cache.prefix_embeddings = None;
-                cache.prefix_len = 0;
-                cache.reset_kv(&self.args);
-                self.forward_with_observer(
-                    ModelInput {
-                        inputs: &tokens,
-                        inputs_embeds: None,
-                        per_layer_input_ids: None,
-                        mask: None,
-                        sliding_masks: None,
-                        cache: &mut cache.kv,
-                    },
-                    stream,
-                    observer,
-                )?
-            }
-            input::PreparedPrefill::Embeddings { tokens, embeddings } => {
-                cache.token_ids = token_ids_from_array(&tokens, stream)?;
-                cache.prefix_len = cache.token_ids.len();
-                cache.prefix_embeddings = Some(embeddings.clone());
-                cache.reset_kv(&self.args);
-                let per_layer_ids = self.per_layer_ids_for_media(&tokens, stream)?;
-                let masks = multimodal_attention_masks(
-                    &cache.token_ids,
-                    self.image_token_id.map(|id| id as u32),
-                    self.video_token_id.map(|id| id as u32),
-                    &self.args.layer_schedule,
-                );
-                self.forward_with_observer(
-                    ModelInput {
-                        inputs: &tokens,
-                        inputs_embeds: Some(&embeddings),
-                        per_layer_input_ids: Some(&per_layer_ids),
-                        mask: Some(&masks.full),
-                        sliding_masks: Some(&masks.sliding),
-                        cache: &mut cache.kv,
-                    },
-                    stream,
-                    observer,
-                )?
-            }
-        };
-        logits.try_index_device((.., -1, ..), stream)
     }
 
     pub(crate) fn forward_logits<C>(
@@ -4700,16 +4750,16 @@ pub(crate) fn gemma4_args_from_gguf_catalog(
             }
         })
         .collect::<Vec<_>>();
-    let layer_schedule = layer_schedule_from_parts(
-        &attention_schedule,
-        &feed_forward_lengths,
-        &kv_head_values,
-        &head_dims,
-        num_kv_shared_layers,
-        &value_policies,
-        enable_moe_block,
-        "Gemma 4 GGUF",
-    )?;
+    let layer_schedule = layer_schedule_from_parts(LayerScheduleParts {
+        attention: &attention_schedule,
+        feed_forward_lengths: &feed_forward_lengths,
+        kv_heads: &kv_head_values,
+        head_dims: &head_dims,
+        shared_layers: num_kv_shared_layers,
+        value_policies: &value_policies,
+        enable_moe: enable_moe_block,
+        source: "Gemma 4 GGUF",
+    })?;
 
     let args = ModelArgs {
         model_type: "gemma4".into(),
@@ -5510,10 +5560,6 @@ impl Cache {
 }
 
 impl Model {
-    pub(crate) fn new_cache(&self) -> Cache {
-        Cache::new(&self.args)
-    }
-
     pub(crate) fn save_prompt_cache(
         cache: &Cache,
         destination: impl AsRef<Path>,
@@ -5571,6 +5617,7 @@ impl Model {
         .map_err(|error| Exception::custom(error.to_string()))
     }
 
+    #[cfg(test)]
     pub(crate) fn load_prompt_cache(
         args: &ModelArgs,
         directory: impl AsRef<Path>,
@@ -6059,20 +6106,20 @@ mod tests {
     #[test]
     fn direct_schedule_preserves_per_layer_width_and_kv_geometry() {
         let attention = LayerSchedule::all_full(3).unwrap();
-        let schedule = super::layer_schedule_from_parts(
-            &attention,
-            &[16, 24, 32],
-            &[1, 2, 1],
-            &[4, 2, 8],
-            0,
-            &[
+        let schedule = super::layer_schedule_from_parts(super::LayerScheduleParts {
+            attention: &attention,
+            feed_forward_lengths: &[16, 24, 32],
+            kv_heads: &[1, 2, 1],
+            head_dims: &[4, 2, 8],
+            shared_layers: 0,
+            value_policies: &[
                 ValuePolicy::Projected,
                 ValuePolicy::ReuseKey,
                 ValuePolicy::Projected,
             ],
-            false,
-            "test",
-        )
+            enable_moe: false,
+            source: "test",
+        })
         .unwrap();
         assert_eq!(schedule.get(0).unwrap().intermediate_size.get(), 16);
         assert_eq!(schedule.get(1).unwrap().num_key_value_heads.get(), 2);
@@ -6213,6 +6260,34 @@ mod tests {
         };
         assert_eq!(tensors[0].role, StateTensorRole::PrefixEmbedding);
         assert!(!tensors[0].required);
+    }
+
+    #[test]
+    fn prompt_cache_layout_uses_planner_authored_local_kv_geometry() {
+        use crate::runtime::cache::residency::LayerCachePolicy;
+
+        let args = model_args(false);
+        let geometry = (0..args.num_hidden_layers as usize)
+            .map(|layer| {
+                let policy = args.layer_policy(layer).unwrap();
+                super::ParallelLayerGeometry {
+                    query_heads: 2,
+                    kv_heads: 1,
+                    dense_intermediate: policy.intermediate_size.get() as i32,
+                    expert_intermediate: None,
+                }
+            })
+            .collect::<Vec<_>>();
+        let layout = super::prompt_cache_layer_layout_with_geometry(&args, &geometry).unwrap();
+        let LayerCachePolicy::KeyValueWithFixedState {
+            num_key_value_heads,
+            ..
+        } = layout.get(0).unwrap()
+        else {
+            panic!("Gemma 4 layer zero must own multimodal prefix state")
+        };
+        assert_eq!(num_key_value_heads.get(), 1);
+        assert!(super::prompt_cache_layer_layout_with_geometry(&args, &geometry[..0]).is_err());
     }
 
     #[test]

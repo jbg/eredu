@@ -1,12 +1,15 @@
-//! Executable serial pipeline parallelism for decoder-only language models.
+//! Executable pipeline parallelism for decoder-only language models.
 //!
-//! A [`PipelineModel`] owns only one balanced contiguous decoder-layer range
-//! and the boundary modules required by its explicit stage role. Communication
-//! groups are borrowed for each operation and are never retained by model
-//! state.
+//! A [`crate::architectures::distributed::pipeline::PipelineModel`] owns one dependency-safe, balanced contiguous
+//! decoder-layer range and the boundary modules required by its explicit stage
+//! role. [`crate::architectures::distributed::pipeline::PipelineInferenceScheduler`]
+//! keeps independent request caches and
+//! drains bounded, round-robin microbatch queues so different requests can
+//! occupy different pipeline stages concurrently. Communication groups are
+//! borrowed for each operation and are never retained by model state.
 
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     ops::Range,
     path::{Path, PathBuf},
     sync::Arc,
@@ -17,7 +20,7 @@ use safemlx::{
     error::Exception,
     module::{Module, ModuleParameters},
     nn,
-    ops::{quantized_packed_dimension, stack_axis, GgufCheckpoint, GgufMetadataValue},
+    ops::{quantized_packed_dimension, stack_axis, tanh, GgufCheckpoint, GgufMetadataValue},
     quantization::MaybeQuantized,
     transforms::eval,
     Array, Dtype, Stream,
@@ -25,44 +28,59 @@ use safemlx::{
 
 use crate::{
     api::{
-        common::{linear, linear::project_logits_maybe_quantized},
-        deepseek_v3, llama, ModelKind, ModelLoadOptions,
+        common::{attention::AttentionInput, linear, linear::project_logits_maybe_quantized},
+        deepseek_v3, gemma4, gpt_oss, inkling, kimi_linear, lfm2, llama, nemotron_h, ModelKind,
+        ModelLoadOptions,
+    },
+    architectures::{
+        inkling::layerwise::{InklingLayer, InklingLayerwiseAdapter},
+        kimi_linear::layerwise::KimiLinearLayerwiseAdapter,
+        lfm2::layerwise::Lfm2LayerwiseAdapter,
+        nemotron_h::layerwise::NemotronHLayerwiseAdapter,
+        qwen::{
+            dense as dense_qwen,
+            hybrid::{
+                layerwise::{QwenHybridLayer, QwenHybridLayerwiseAdapter},
+                qwen3_5 as qwen_hybrid,
+            },
+        },
     },
     error::Error,
     nn::tensor::create_causal_mask,
     runtime::cache::residency::{
-        open_prompt_cache, validate_prompt_cache_model_identity, CacheRankIdentity,
-        CacheResidencyManager, CacheResidencyPolicy, CacheResidencyReport, PagedCacheOptions,
-        PromptCacheDescriptor, PromptCacheManifest, PromptCacheModelIdentity, PromptCacheOptions,
-        PromptCacheTopology,
+        load_prompt_cache_state_tensors, open_prompt_cache, validate_prompt_cache_model_identity,
+        CacheRankIdentity, CacheResidencyManager, CacheResidencyPolicy, CacheResidencyReport,
+        PagedCacheOptions, PromptCacheDescriptor, PromptCacheManifest, PromptCacheModelIdentity,
+        PromptCacheOptions, PromptCacheStateArray, PromptCacheTopology, StateTensorOwner,
+        StateTensorPolicy, StateTensorRole,
     },
     runtime::cache::{
         CompressedLatentCache, ConcatKeyValueCache, KeyValueCache, PagedKeyValueCache,
     },
     runtime::checkpoint::binding::{
-        binding_bytes, build_module_bindings, populate_module_from_lease,
+        binding_bytes, materialize_module_bindings, populate_module_from_arrays_excluding,
+        populate_module_from_dense_arrays_quantized, populate_module_from_lease,
     },
-    runtime::checkpoint::load::StrictLoadConfig,
     runtime::checkpoint::quantization::{quantize_tensor, WeightQuantization},
-    runtime::checkpoint::store::{GgufWeightStore, WeightStore},
+    runtime::checkpoint::store::{GgufWeightStore, WeightStore, WeightStoreDiagnostics},
     runtime::distributed::parallel::{sample_and_synchronize, SynchronizedToken},
-    runtime::distributed::topology::{
-        load_partition_from_store_on_streams, ParallelTopology, PlacementPlan, RankPartition,
-        TensorPlacement,
-    },
+    runtime::distributed::topology::ParallelTopology,
     runtime::execution::inspection::ActivationObserver,
     runtime::execution::layerwise::{
         open_safetensors_weight_store, ArchitectureAdapter, DenseDiskStreamReport,
-        DenseStreamController, SharedWeightStore, WeightResidency,
+        DenseStreamController, SharedWeightStore, StaticUnitBindings, WeightResidency,
     },
     runtime::generation::sampler::Sampler,
     runtime::residency::manager::{OffloadUnit, ResidencyManager},
     runtime::residency::policy::{
         MemoryTier, OffloadConfig, OffloadPlan, OffloadUnitId, OffloadUnitSpec, ResidencyPolicy,
     },
+    runtime::scheduler::{
+        FairScheduler, RequestId, RequestStatus, SchedulerLimits, SchedulerReport, WorkDescriptor,
+        WorkId,
+    },
 };
 
-#[cfg(test)]
 use safemlx::ops::indexing::TryIndexOp;
 
 /// Immutable, inspectable description of the local pipeline stage.
@@ -141,93 +159,684 @@ impl PipelineStep {
     }
 }
 
+/// The cache transition performed by one scheduled microbatch.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum PipelineInferencePhase {
+    /// Add one prompt chunk to a request cache.
+    Prefill,
+    /// Add one autoregressive token to a request cache.
+    Decode,
+}
+
+impl PipelineInferencePhase {
+    const fn wire_tag(self) -> u32 {
+        match self {
+            Self::Prefill => 0,
+            Self::Decode => 1,
+        }
+    }
+}
+
+/// Rank-local input for one scheduled pipeline cache transition.
+///
+/// Stage zero supplies token ids. Later stages leave `tokens` absent and
+/// receive hidden activations from their predecessor. An architecture-specific
+/// additive mask, when supported, is supplied independently on every rank.
+#[derive(Debug, Clone)]
+pub struct PipelineMicrobatchInput {
+    request: RequestId,
+    phase: PipelineInferencePhase,
+    step: PipelineStep,
+    tokens: Option<Array>,
+    mask: Option<Array>,
+}
+
+impl PipelineMicrobatchInput {
+    /// Creates a microbatch without rank-local token or mask tensors.
+    pub const fn new(
+        request: RequestId,
+        phase: PipelineInferencePhase,
+        step: PipelineStep,
+    ) -> Self {
+        Self {
+            request,
+            phase,
+            step,
+            tokens: None,
+            mask: None,
+        }
+    }
+
+    /// Supplies stage-zero token ids.
+    pub fn with_tokens(mut self, tokens: Array) -> Self {
+        self.tokens = Some(tokens);
+        self
+    }
+
+    /// Supplies an architecture-supported additive attention mask.
+    pub fn with_mask(mut self, mask: Array) -> Self {
+        self.mask = Some(mask);
+        self
+    }
+
+    /// Returns the target request.
+    pub const fn request(&self) -> RequestId {
+        self.request
+    }
+
+    /// Returns the cache transition phase.
+    pub const fn phase(&self) -> PipelineInferencePhase {
+        self.phase
+    }
+
+    /// Returns the validated batch and sequence geometry.
+    pub const fn step(&self) -> PipelineStep {
+        self.step
+    }
+
+    /// Returns stage-zero token ids when present on this rank.
+    pub const fn tokens(&self) -> Option<&Array> {
+        self.tokens.as_ref()
+    }
+
+    /// Returns the rank-local additive mask when present.
+    pub const fn mask(&self) -> Option<&Array> {
+        self.mask.as_ref()
+    }
+}
+
+/// Result metadata for one completed microbatch.
+#[derive(Debug)]
+pub struct PipelineMicrobatchOutput {
+    work: WorkId,
+    phase: PipelineInferencePhase,
+    step: PipelineStep,
+    logits: Option<Array>,
+}
+
+impl PipelineMicrobatchOutput {
+    /// Returns the globally agreed work identity.
+    pub const fn work(&self) -> WorkId {
+        self.work
+    }
+
+    /// Returns the completed cache transition phase.
+    pub const fn phase(&self) -> PipelineInferencePhase {
+        self.phase
+    }
+
+    /// Returns the completed batch and sequence geometry.
+    pub const fn step(&self) -> PipelineStep {
+        self.step
+    }
+
+    /// Returns vocabulary logits on the final rank and `None` elsewhere.
+    pub const fn logits(&self) -> Option<&Array> {
+        self.logits.as_ref()
+    }
+
+    /// Consumes the record and returns final-rank logits when present.
+    pub fn into_logits(self) -> Option<Array> {
+        self.logits
+    }
+}
+
+/// Immutable tensors that accompany hidden activations between stages.
+///
+/// Most decoder families leave this empty. Architectures whose later blocks
+/// depend on ingress-time values can declare and transport those values here
+/// without adding family-specific point-to-point protocols.
+#[derive(Debug, Clone, Default)]
+pub struct PipelineAuxiliaryState {
+    tensors: Vec<Array>,
+}
+
+impl PipelineAuxiliaryState {
+    /// Creates auxiliary state in the architecture descriptor's declared order.
+    pub fn new(tensors: Vec<Array>) -> Self {
+        Self { tensors }
+    }
+
+    /// Returns the ordered auxiliary tensors declared by the stage descriptor.
+    pub fn tensors(&self) -> &[Array] {
+        &self.tensors
+    }
+}
+
+/// Hidden activations plus architecture-declared immutable stage context.
+#[derive(Debug, Clone)]
+pub struct PipelinePayload {
+    /// Evolving decoder hidden activations.
+    pub hidden: Array,
+    /// Immutable tensors relayed unchanged through the remaining stages.
+    pub auxiliary: PipelineAuxiliaryState,
+}
+
 /// Explicit input to stage-local execution.
 pub enum PipelineStageInput<'a> {
     /// Integer token ids for stage zero.
     Tokens(&'a Array),
     /// Hidden activations for every later stage.
-    Hidden(&'a Array),
+    Hidden(&'a PipelinePayload),
 }
 
 /// Result of one stage-local forward operation.
 #[derive(Debug)]
 pub enum PipelineStageOutput {
     /// Hidden activations to transfer to the next stage.
-    Hidden(Array),
+    Hidden(PipelinePayload),
     /// Vocabulary logits produced only by the final stage.
     Logits(Array),
 }
 
-/// One globally identified Llama cache entry.
+/// Storage representation for one ordinary key/value cache.
 #[derive(Debug, Clone)]
-pub enum PipelineLlamaLayerCache {
+pub enum PipelineKeyValueCache {
     /// Unbounded concatenating KV cache.
-    Standard {
-        /// Global decoder-layer index.
-        global_layer: usize,
-        /// Layer-local cache state.
-        cache: ConcatKeyValueCache,
-    },
+    Standard(ConcatKeyValueCache),
     /// Block-addressable full or sliding state.
-    Paged {
+    Paged(PagedKeyValueCache),
+}
+
+/// One descriptor-backed semantic pipeline state tensor.
+#[derive(Debug, Clone)]
+pub struct PipelineStateSlot {
+    policy: StateTensorPolicy,
+    value: Option<Array>,
+    offset: i32,
+}
+
+impl PipelineStateSlot {
+    fn empty(policy: StateTensorPolicy) -> Self {
+        Self {
+            policy,
+            value: None,
+            offset: 0,
+        }
+    }
+
+    /// Returns the authoritative semantic tensor descriptor.
+    pub const fn policy(&self) -> &StateTensorPolicy {
+        &self.policy
+    }
+
+    /// Returns the materialized recurrent or convolution tensor, if initialized.
+    pub const fn value(&self) -> Option<&Array> {
+        self.value.as_ref()
+    }
+
+    /// Returns the number of input positions incorporated into this slot.
+    pub const fn offset(&self) -> i32 {
+        self.offset
+    }
+
+    fn clear(&mut self) {
+        self.value = None;
+        self.offset = 0;
+    }
+}
+
+/// One globally identified semantic pipeline cache entry.
+#[derive(Debug, Clone)]
+pub enum PipelineLayerCache {
+    /// Descriptor-backed fixed state, or an explicitly stateless layer when empty.
+    StateSlots {
         /// Global decoder-layer index.
         global_layer: usize,
-        /// Layer-local cache state sharing a stage-wide manager.
-        cache: PagedKeyValueCache,
+        /// Ordered architecture-authored state tensors.
+        slots: Vec<PipelineStateSlot>,
+    },
+    /// Ordinary attention key/value state.
+    KeyValue {
+        /// Global decoder-layer index.
+        global_layer: usize,
+        /// Device or paged storage selected by residency policy.
+        cache: PipelineKeyValueCache,
+        /// Additional ordered fixed-state tensors.
+        slots: Vec<PipelineStateSlot>,
+    },
+    /// DeepSeek compressed latent plus rotary-key state.
+    CompressedLatent {
+        /// Global decoder-layer index.
+        global_layer: usize,
+        /// Layer-local MLA cache state.
+        cache: CompressedLatentCache,
+        /// Additional ordered fixed-state tensors.
+        slots: Vec<PipelineStateSlot>,
     },
 }
 
-/// One globally identified DeepSeek compressed-latent cache entry.
+/// Architecture-checked stage-local inference cache.
 #[derive(Debug, Clone)]
-pub struct PipelineDeepSeekLayerCache {
-    /// Global decoder-layer index.
-    pub global_layer: usize,
-    /// Layer-local MLA cache state.
-    pub cache: CompressedLatentCache,
-}
-
-/// Architecture-checked stage-local inference caches.
-#[derive(Debug, Clone)]
-pub enum PipelineCache {
-    /// Llama standard or sliding-window cache entries.
-    Llama(Vec<PipelineLlamaLayerCache>),
-    /// DeepSeek compressed-latent cache entries.
-    DeepSeek(Vec<PipelineDeepSeekLayerCache>),
+pub struct PipelineCache {
+    model_kind: ModelKind,
+    layers: Vec<PipelineLayerCache>,
+    residency_manager: Option<CacheResidencyManager>,
 }
 
 impl PipelineCache {
+    /// Creates a cache from an explicit architecture identity and ordered layer entries.
+    pub(crate) fn new(model_kind: ModelKind, layers: Vec<PipelineLayerCache>) -> Self {
+        Self {
+            model_kind,
+            layers,
+            residency_manager: None,
+        }
+    }
+
+    fn with_residency_manager(
+        model_kind: ModelKind,
+        layers: Vec<PipelineLayerCache>,
+        residency_manager: CacheResidencyManager,
+    ) -> Self {
+        Self {
+            model_kind,
+            layers,
+            residency_manager: Some(residency_manager),
+        }
+    }
+
+    /// Returns the architecture identity checked by stage execution.
+    pub const fn model_kind(&self) -> ModelKind {
+        self.model_kind
+    }
+
+    /// Returns the ordered local cache entries.
+    pub fn layers(&self) -> &[PipelineLayerCache] {
+        &self.layers
+    }
+
     /// Returns the global decoder-layer ids represented locally.
     pub fn global_layers(&self) -> Vec<usize> {
-        match self {
-            Self::Llama(layers) => layers
-                .iter()
-                .map(|layer| match layer {
-                    PipelineLlamaLayerCache::Standard { global_layer, .. }
-                    | PipelineLlamaLayerCache::Paged { global_layer, .. } => *global_layer,
-                })
-                .collect(),
-            Self::DeepSeek(layers) => layers.iter().map(|layer| layer.global_layer).collect(),
-        }
+        self.layers
+            .iter()
+            .map(|layer| match layer {
+                PipelineLayerCache::StateSlots { global_layer, .. }
+                | PipelineLayerCache::KeyValue { global_layer, .. }
+                | PipelineLayerCache::CompressedLatent { global_layer, .. } => *global_layer,
+            })
+            .collect()
     }
 
     /// Clears retained state without changing local layer ownership.
     pub fn reset(&mut self) -> Result<(), Error> {
-        match self {
-            Self::Llama(layers) => {
-                for layer in layers {
-                    match layer {
-                        PipelineLlamaLayerCache::Standard { cache, .. } => cache.clear(),
-                        PipelineLlamaLayerCache::Paged { cache, .. } => cache.clear()?,
-                    }
+        for layer in &mut self.layers {
+            match layer {
+                PipelineLayerCache::StateSlots { slots, .. } => {
+                    slots.iter_mut().for_each(PipelineStateSlot::clear);
                 }
-            }
-            Self::DeepSeek(layers) => {
-                for layer in layers {
-                    layer.cache.clear()?;
+                PipelineLayerCache::KeyValue {
+                    cache: PipelineKeyValueCache::Standard(cache),
+                    slots,
+                    ..
+                } => {
+                    cache.clear();
+                    slots.iter_mut().for_each(PipelineStateSlot::clear);
+                }
+                PipelineLayerCache::KeyValue {
+                    cache: PipelineKeyValueCache::Paged(cache),
+                    slots,
+                    ..
+                } => {
+                    cache.clear()?;
+                    slots.iter_mut().for_each(PipelineStateSlot::clear);
+                }
+                PipelineLayerCache::CompressedLatent { cache, slots, .. } => {
+                    cache.clear()?;
+                    slots.iter_mut().for_each(PipelineStateSlot::clear);
                 }
             }
         }
         Ok(())
+    }
+}
+
+#[derive(Debug)]
+struct PipelineRequestState {
+    cache: PipelineCache,
+    batch_size: Option<i32>,
+    last_phase: Option<PipelineInferencePhase>,
+}
+
+#[derive(Debug, Clone)]
+struct ScheduledPipelineMicrobatch {
+    phase: PipelineInferencePhase,
+    step: PipelineStep,
+    tokens: Option<Array>,
+    mask: Option<Array>,
+}
+
+impl WorkDescriptor for ScheduledPipelineMicrobatch {
+    fn encode_descriptor(&self, output: &mut Vec<u32>) -> Result<(), Error> {
+        output.extend_from_slice(&[
+            self.phase.wire_tag(),
+            self.step.batch_size() as u32,
+            self.step.sequence_length() as u32,
+        ]);
+        match &self.mask {
+            Some(mask) => {
+                output.extend_from_slice(&[1, mask.dtype() as u32, mask.ndim() as u32]);
+                output.extend(mask.shape().iter().map(|dimension| *dimension as u32));
+            }
+            None => output.push(0),
+        }
+        Ok(())
+    }
+}
+
+/// Bounded, fair inference scheduler for one rank-local pipeline stage.
+///
+/// The scheduler owns an independent [`PipelineCache`] for each active request.
+/// Submitted work is drained in round-robin request order while preserving the
+/// exact transition order within each request. Because ranks are independent
+/// processes, every rank must register requests and submit matching work
+/// descriptors. [`Self::run_queued`] performs an exact collective descriptor
+/// comparison before point-to-point traffic begins, turning divergent schedules
+/// into an error instead of an unmatched send/receive deadlock.
+///
+/// Sampling remains outside this type: callers consume final-rank logits, call
+/// [`PipelineModel::sample_and_synchronize`], and either enqueue the selected
+/// decode token or call [`Self::finish_request`] after EOS. This keeps sampling
+/// policy separate from cache ownership and pipeline scheduling.
+#[derive(Debug)]
+pub struct PipelineInferenceScheduler {
+    topology: ParallelTopology,
+    model_kind: ModelKind,
+    global_layer_range: Range<usize>,
+    architecture_fingerprint: String,
+    scheduler: FairScheduler<ScheduledPipelineMicrobatch, PipelineRequestState>,
+}
+
+impl PipelineInferenceScheduler {
+    /// Binds a scheduler to one loaded pipeline stage.
+    pub fn new(model: &PipelineModel, limits: SchedulerLimits) -> Result<Self, Error> {
+        Ok(Self {
+            topology: model.topology,
+            model_kind: model.info.model_kind,
+            global_layer_range: model.info.global_layer_range.clone(),
+            architecture_fingerprint: model.prompt_cache_architecture_fingerprint()?,
+            scheduler: FairScheduler::new(limits)?,
+        })
+    }
+
+    /// Registers a request with a fresh device-resident cache.
+    pub fn register_request(
+        &mut self,
+        model: &PipelineModel,
+        request: RequestId,
+    ) -> Result<(), Error> {
+        self.validate_model(model)?;
+        self.scheduler.validate_registration(request)?;
+        let cache = model.new_cache()?;
+        self.validate_cache(model, &cache)?;
+        self.scheduler.register(
+            request,
+            PipelineRequestState {
+                cache,
+                batch_size: None,
+                last_phase: None,
+            },
+        )
+    }
+
+    /// Registers a request with a fresh cache under an explicit residency policy.
+    pub fn register_request_with_options(
+        &mut self,
+        model: &PipelineModel,
+        request: RequestId,
+        policy: CacheResidencyPolicy,
+    ) -> Result<(), Error> {
+        self.validate_model(model)?;
+        self.scheduler.validate_registration(request)?;
+        let cache = model.new_cache_with_options(policy)?;
+        self.validate_cache(model, &cache)?;
+        self.scheduler.register(
+            request,
+            PipelineRequestState {
+                cache,
+                batch_size: None,
+                last_phase: None,
+            },
+        )
+    }
+
+    /// Registers a request with a restored or caller-created stage-local cache.
+    pub fn register_request_with_cache(
+        &mut self,
+        model: &PipelineModel,
+        request: RequestId,
+        cache: PipelineCache,
+    ) -> Result<(), Error> {
+        self.validate_model(model)?;
+        self.scheduler.validate_registration(request)?;
+        self.validate_cache(model, &cache)?;
+        self.scheduler.register(
+            request,
+            PipelineRequestState {
+                cache,
+                batch_size: None,
+                last_phase: None,
+            },
+        )
+    }
+
+    /// Submits one rank-local microbatch and returns its ordered work identity.
+    ///
+    /// Requests may contain multiple prompt chunks. Once decode begins, later
+    /// prefill work is rejected. Decode work always has sequence length one and
+    /// every transition for a request must retain its original batch size.
+    pub fn enqueue(&mut self, input: PipelineMicrobatchInput) -> Result<WorkId, Error> {
+        if self.topology.pipeline_parallel_rank == 0 {
+            let tokens = input.tokens.as_ref().ok_or_else(|| {
+                Error::Parallel("pipeline stage zero microbatch requires token ids".into())
+            })?;
+            if tokens.ndim() != 2
+                || tokens.shape() != [input.step.batch_size(), input.step.sequence_length()]
+            {
+                return Err(Error::Parallel(format!(
+                    "pipeline stage zero microbatch expected token ids shaped [{}, {}], got {:?}",
+                    input.step.batch_size(),
+                    input.step.sequence_length(),
+                    tokens.shape()
+                )));
+            }
+        } else if input.tokens.is_some() {
+            return Err(Error::Parallel(format!(
+                "pipeline stage {} microbatch must receive hidden activations rather than token ids",
+                self.topology.pipeline_parallel_rank
+            )));
+        }
+        if input.phase == PipelineInferencePhase::Decode && input.step.sequence_length() != 1 {
+            return Err(Error::Parallel(format!(
+                "pipeline decode microbatch sequence length must be one, got {}",
+                input.step.sequence_length()
+            )));
+        }
+
+        let request = self.scheduler.request_state(input.request).ok_or_else(|| {
+            Error::Parallel(format!(
+                "pipeline request {} is not active",
+                input.request.value()
+            ))
+        })?;
+        if request.last_phase == Some(PipelineInferencePhase::Decode)
+            && input.phase == PipelineInferencePhase::Prefill
+        {
+            return Err(Error::Parallel(format!(
+                "pipeline request {} cannot return to prefill after decode began",
+                input.request.value()
+            )));
+        }
+        if let Some(batch_size) = request.batch_size {
+            if batch_size != input.step.batch_size() {
+                return Err(Error::Parallel(format!(
+                    "pipeline request {} changed batch size from {batch_size} to {}",
+                    input.request.value(),
+                    input.step.batch_size()
+                )));
+            }
+        }
+        let phase = input.phase;
+        let batch_size = input.step.batch_size();
+        let request_id = input.request;
+        let work = self.scheduler.enqueue(
+            request_id,
+            ScheduledPipelineMicrobatch {
+                phase: input.phase,
+                step: input.step,
+                tokens: input.tokens,
+                mask: input.mask,
+            },
+        )?;
+        let request = self.scheduler.request_state_mut(request_id)?;
+        request.batch_size.get_or_insert(batch_size);
+        request.last_phase = Some(phase);
+        Ok(work)
+    }
+
+    /// Drains the current queue using fair round-robin request ordering.
+    ///
+    /// A collective preflight compares every work descriptor exactly across
+    /// ranks before any point-to-point send or receive is issued. Stage zero can
+    /// then advance to a later request while downstream stages finish an earlier
+    /// request, filling the pipeline without mixing request caches.
+    pub fn run_queued(
+        &mut self,
+        model: &mut PipelineModel,
+        group: &Group,
+        stream: &Stream,
+    ) -> Result<Vec<PipelineMicrobatchOutput>, Error> {
+        self.validate_model(model)?;
+        model.validate_group(group)?;
+        let protocol = 0x5049_5045_0001_0000u64 | self.model_kind as u64;
+        self.scheduler
+            .drain_distributed(protocol, group, stream, |_, work, request| {
+                model.forward_pipeline(
+                    work.tokens.as_ref(),
+                    work.step,
+                    work.mask.as_ref(),
+                    &mut request.cache,
+                    group,
+                    stream,
+                )
+            })
+            .map(|completed| {
+                completed
+                    .into_iter()
+                    .map(|completed| {
+                        let (work, input, logits) = completed.into_parts();
+                        PipelineMicrobatchOutput {
+                            work,
+                            phase: input.phase,
+                            step: input.step,
+                            logits,
+                        }
+                    })
+                    .collect()
+            })
+    }
+
+    /// Marks a request complete after EOS and releases its cache.
+    ///
+    /// Any speculative work still queued for the request is discarded.
+    pub fn finish_request(&mut self, request: RequestId) -> Result<(), Error> {
+        self.scheduler.finish(request)
+    }
+
+    /// Cancels a request, releases its cache, and discards its queued work.
+    pub fn cancel_request(&mut self, request: RequestId) -> Result<(), Error> {
+        self.scheduler.cancel(request)
+    }
+
+    /// Releases an idle active request and returns its cache to the caller.
+    ///
+    /// This is the handoff used before explicit prompt-cache persistence. Work
+    /// must be drained or cancelled first.
+    pub fn release_request_cache(&mut self, request: RequestId) -> Result<PipelineCache, Error> {
+        Ok(self.scheduler.release(request)?.cache)
+    }
+
+    /// Removes a terminal identity so a caller may explicitly reuse it.
+    pub fn forget_terminal_request(&mut self, request: RequestId) -> Result<RequestStatus, Error> {
+        self.scheduler.forget_terminal(request)
+    }
+
+    /// Returns the known request lifecycle state.
+    pub fn request_status(&self, request: RequestId) -> Option<RequestStatus> {
+        self.scheduler.request_status(request)
+    }
+
+    /// Returns the number of queued transitions for one active request.
+    pub fn queued_for_request(&self, request: RequestId) -> usize {
+        self.scheduler.queued_for_request(request)
+    }
+
+    /// Returns a current observability snapshot.
+    pub fn report(&self) -> SchedulerReport {
+        self.scheduler.report()
+    }
+
+    /// Returns the failure that invalidated this scheduler, if any.
+    pub fn poison_reason(&self) -> Option<&str> {
+        self.scheduler.poison_reason()
+    }
+
+    fn validate_model(&self, model: &PipelineModel) -> Result<(), Error> {
+        if model.topology != self.topology
+            || model.info.model_kind != self.model_kind
+            || model.info.global_layer_range != self.global_layer_range
+            || model.prompt_cache_architecture_fingerprint()? != self.architecture_fingerprint
+        {
+            return Err(Error::Parallel(
+                "pipeline scheduler is bound to a different model stage".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_cache(&self, model: &PipelineModel, cache: &PipelineCache) -> Result<(), Error> {
+        if cache.model_kind() != self.model_kind
+            || cache.global_layers() != model.info.global_layer_range.clone().collect::<Vec<_>>()
+        {
+            return Err(Error::Parallel(format!(
+                "pipeline request cache {:?} layers {:?} do not match {:?} layers {:?}",
+                cache.model_kind(),
+                cache.global_layers(),
+                self.model_kind,
+                model.info.global_layer_range
+            )));
+        }
+        Ok(())
+    }
+}
+
+impl PipelineLayerCache {
+    fn retained_arrays(&self) -> Vec<&Array> {
+        match self {
+            Self::StateSlots { slots, .. } => {
+                slots.iter().filter_map(PipelineStateSlot::value).collect()
+            }
+            Self::KeyValue {
+                cache: PipelineKeyValueCache::Standard(cache),
+                slots,
+                ..
+            } => cache
+                .retained_arrays()
+                .into_iter()
+                .chain(slots.iter().filter_map(PipelineStateSlot::value))
+                .collect(),
+            Self::KeyValue {
+                cache: PipelineKeyValueCache::Paged(_),
+                slots,
+                ..
+            } => slots.iter().filter_map(PipelineStateSlot::value).collect(),
+            Self::CompressedLatent { cache, slots, .. } => cache
+                .arrays()
+                .into_iter()
+                .flat_map(|(latent, rotary)| [latent, rotary])
+                .chain(slots.iter().filter_map(PipelineStateSlot::value))
+                .collect(),
+        }
     }
 }
 
@@ -252,12 +861,198 @@ struct DeepSeekStage {
     lm_head: Option<MaybeQuantized<nn::Linear>>,
 }
 
-enum ArchitectureStage {
-    Llama(LlamaStage),
-    DeepSeek(DeepSeekStage),
+struct GemmaStage {
+    args: gemma4::ModelArgs,
+    range: Range<usize>,
+    embedding: Option<gemma4::Gemma4Embedding>,
+    output_embedding: Option<gemma4::Gemma4Embedding>,
+    per_layer_embedding: Option<gemma4::Gemma4Embedding>,
+    per_layer_projection: Option<MaybeQuantized<nn::Linear>>,
+    per_layer_norm: Option<nn::RmsNorm>,
+    layers: Vec<gemma4::TransformerBlock>,
+    dense_layers: Option<PipelineDenseLayers>,
+    norm: Option<nn::RmsNorm>,
+    lm_head: Option<MaybeQuantized<nn::Linear>>,
+}
+
+struct DenseQwenStage {
+    args: dense_qwen::DecoderConfig,
+    range: Range<usize>,
+    embedding: Option<MaybeQuantized<nn::Embedding>>,
+    output_embedding: Option<MaybeQuantized<nn::Embedding>>,
+    layers: Vec<dense_qwen::TransformerBlock>,
+    dense_layers: Option<PipelineDenseLayers>,
+    norm: Option<nn::RmsNorm>,
+    lm_head: Option<MaybeQuantized<nn::Linear>>,
+}
+
+struct GptOssStage {
+    args: gpt_oss::ModelArgs,
+    range: Range<usize>,
+    embedding: Option<MaybeQuantized<nn::Embedding>>,
+    layers: Vec<gpt_oss::TransformerBlock>,
+    dense_layers: Option<PipelineDenseLayers>,
+    norm: Option<nn::RmsNorm>,
+    lm_head: Option<MaybeQuantized<nn::Linear>>,
+}
+
+struct Lfm2Stage {
+    args: lfm2::ModelArgs,
+    range: Range<usize>,
+    embedding: Option<MaybeQuantized<nn::Embedding>>,
+    output_embedding: Option<MaybeQuantized<nn::Embedding>>,
+    layers: Vec<lfm2::DecoderLayer>,
+    dense_layers: Option<PipelineDenseLayers>,
+    norm: Option<nn::RmsNorm>,
+    lm_head: Option<MaybeQuantized<nn::Linear>>,
+}
+
+struct NemotronHStage {
+    args: nemotron_h::ModelArgs,
+    range: Range<usize>,
+    embedding: Option<MaybeQuantized<nn::Embedding>>,
+    output_embedding: Option<MaybeQuantized<nn::Embedding>>,
+    layers: Vec<nemotron_h::TransformerBlock>,
+    dense_layers: Option<PipelineDenseLayers>,
+    norm: Option<nn::RmsNorm>,
+    lm_head: Option<MaybeQuantized<nn::Linear>>,
+}
+
+struct QwenHybridStage {
+    args: qwen_hybrid::ModelArgs,
+    range: Range<usize>,
+    embedding: Option<MaybeQuantized<nn::Embedding>>,
+    output_embedding: Option<MaybeQuantized<nn::Embedding>>,
+    layers: Vec<qwen_hybrid::TransformerBlock>,
+    dense_layers: Option<PipelineDenseLayers>,
+    norm: Option<qwen_hybrid::Qwen3NextRmsNorm>,
+    lm_head: Option<MaybeQuantized<nn::Linear>>,
+}
+
+struct KimiLinearStage {
+    args: kimi_linear::ModelArgs,
+    range: Range<usize>,
+    embedding: Option<MaybeQuantized<nn::Embedding>>,
+    output_embedding: Option<MaybeQuantized<nn::Embedding>>,
+    layers: Vec<kimi_linear::DecoderLayer>,
+    dense_layers: Option<PipelineDenseLayers>,
+    norm: Option<nn::RmsNorm>,
+    lm_head: Option<MaybeQuantized<nn::Linear>>,
+}
+
+struct InklingStage {
+    args: inkling::ModelArgs,
+    range: Range<usize>,
+    embedding: Option<MaybeQuantized<nn::Embedding>>,
+    embed_norm: Option<nn::RmsNorm>,
+    layers: Vec<inkling::DecoderLayer>,
+    dense_layers: Option<PipelineDenseLayers>,
+    norm: Option<nn::RmsNorm>,
+    lm_head: Option<MaybeQuantized<nn::Linear>>,
+}
+
+/// Architecture-owned behavior needed by the shared pipeline runtime.
+///
+/// Implementations contain only decoder math, immutable payload declarations,
+/// and architecture identity. Transport, cache materialization, persistence,
+/// residency, and sampling remain centralized in [`PipelineModel`].
+trait PipelineStageAdapter {
+    /// Returns the exact architecture identity implemented by this adapter.
+    fn model_kind(&self) -> ModelKind;
+
+    /// Returns immutable auxiliary tensor shapes in wire order for one step.
+    fn auxiliary_shapes(&self, step: PipelineStep) -> Vec<Vec<i32>>;
+
+    /// Returns dense-stream observations when this stage uses bounded loading.
+    fn dense_stream_report(&self) -> Result<Option<DenseDiskStreamReport>, Error>;
+    fn checkpoint_diagnostics(&self) -> Result<Option<WeightStoreDiagnostics>, Error>;
+
+    /// Returns the exact cache identity and local semantic state schedule.
+    fn prompt_cache_model_identity(
+        &self,
+        topology: ParallelTopology,
+    ) -> Result<PromptCacheModelIdentity, Error>;
+
+    /// Executes this stage's local decoder range.
+    fn forward(
+        &mut self,
+        input: PipelineStageInput<'_>,
+        step: PipelineStep,
+        mask: Option<&Array>,
+        cache: &mut [PipelineLayerCache],
+        stream: &Stream,
+    ) -> Result<PipelineStageOutput, Error>;
+}
+
+/// Architecture-owned semantics consumed by the common pipeline stage shell.
+trait PipelineStageSemantics {
+    fn model_kind(&self) -> ModelKind;
+    fn auxiliary_shapes(&self, step: PipelineStep) -> Vec<Vec<i32>>;
+    fn dense_layers(&self) -> Option<&PipelineDenseLayers>;
+    fn prompt_cache_model_identity(
+        &self,
+        topology: ParallelTopology,
+    ) -> Result<PromptCacheModelIdentity, Error>;
+    fn forward(
+        &mut self,
+        input: PipelineStageInput<'_>,
+        step: PipelineStep,
+        mask: Option<&Array>,
+        cache: &mut [PipelineLayerCache],
+        stream: &Stream,
+    ) -> Result<PipelineStageOutput, Error>;
+}
+
+/// One architecture-neutral pipeline stage wrapper.
+///
+/// Transport, residency reporting, and adapter dispatch live here. Concrete
+/// payloads retain only their boundary modules and architecture math.
+struct PipelineStage<S>(S);
+
+impl<S: PipelineStageSemantics> PipelineStageAdapter for PipelineStage<S> {
+    fn model_kind(&self) -> ModelKind {
+        self.0.model_kind()
+    }
+
+    fn auxiliary_shapes(&self, step: PipelineStep) -> Vec<Vec<i32>> {
+        self.0.auxiliary_shapes(step)
+    }
+
+    fn dense_stream_report(&self) -> Result<Option<DenseDiskStreamReport>, Error> {
+        self.0
+            .dense_layers()
+            .map(PipelineDenseLayers::report)
+            .transpose()
+    }
+
+    fn checkpoint_diagnostics(&self) -> Result<Option<WeightStoreDiagnostics>, Error> {
+        self.0
+            .dense_layers()
+            .map(PipelineDenseLayers::checkpoint_diagnostics)
+            .transpose()
+    }
+
+    fn prompt_cache_model_identity(
+        &self,
+        topology: ParallelTopology,
+    ) -> Result<PromptCacheModelIdentity, Error> {
+        self.0.prompt_cache_model_identity(topology)
+    }
+
+    fn forward(
+        &mut self,
+        input: PipelineStageInput<'_>,
+        step: PipelineStep,
+        mask: Option<&Array>,
+        cache: &mut [PipelineLayerCache],
+        stream: &Stream,
+    ) -> Result<PipelineStageOutput, Error> {
+        self.0.forward(input, step, mask, cache, stream)
+    }
 }
 
 struct PipelineDenseLayers {
+    store: SharedWeightStore,
     residency: ResidencyManager,
     controller: DenseStreamController,
     units: Vec<OffloadUnitId>,
@@ -287,13 +1082,917 @@ impl PipelineDenseLayers {
     fn report(&self) -> Result<DenseDiskStreamReport, Error> {
         self.controller.report(&self.residency)
     }
+
+    fn checkpoint_diagnostics(&self) -> Result<WeightStoreDiagnostics, Error> {
+        Ok(self.store.diagnostics()?)
+    }
+}
+
+/// Executes one contiguous local decoder range under the shared residency
+/// contract. Architecture payloads provide only layer construction and math;
+/// lease preparation, retained-state evaluation, synchronization, and dense
+/// stream accounting stay here.
+struct PipelineLayerForward {
+    hidden: Array,
+    retained: Vec<Array>,
+}
+
+trait IntoPipelineLayerForward {
+    fn into_pipeline_layer_forward(self) -> PipelineLayerForward;
+}
+
+impl IntoPipelineLayerForward for Array {
+    fn into_pipeline_layer_forward(self) -> PipelineLayerForward {
+        PipelineLayerForward {
+            hidden: self,
+            retained: Vec::new(),
+        }
+    }
+}
+
+impl IntoPipelineLayerForward for PipelineLayerForward {
+    fn into_pipeline_layer_forward(self) -> PipelineLayerForward {
+        self
+    }
+}
+
+struct PipelineLayerExecution<'a, L> {
+    range: Range<usize>,
+    resident_layers: &'a mut [L],
+    dense_layers: Option<&'a PipelineDenseLayers>,
+    step: PipelineStep,
+    caches: &'a mut [PipelineLayerCache],
+    hidden: Array,
+    stream: &'a Stream,
+}
+
+fn execute_pipeline_layer_range<L, N, F, O>(
+    execution: PipelineLayerExecution<'_, L>,
+    mut new_layer: N,
+    mut forward_layer: F,
+) -> Result<Array, Error>
+where
+    L: ModuleParameters,
+    N: FnMut(usize, &Stream) -> Result<L, Error>,
+    F: FnMut(usize, &mut L, &Array, &mut PipelineLayerCache, &Stream) -> Result<O, Error>,
+    O: IntoPipelineLayerForward,
+{
+    let PipelineLayerExecution {
+        range,
+        resident_layers,
+        dense_layers,
+        step,
+        caches,
+        mut hidden,
+        stream,
+    } = execution;
+    if caches.len() != range.len()
+        || (dense_layers.is_none() && resident_layers.len() != range.len())
+    {
+        return Err(Error::Parallel(format!(
+            "pipeline local execution range {:?} has {} cache entries and {} resident layers",
+            range,
+            caches.len(),
+            resident_layers.len()
+        )));
+    }
+    let prefill = step.sequence_length > 1;
+    let forward_guard = dense_layers
+        .map(|dense| dense.controller.forward_guard(prefill, &dense.residency))
+        .transpose()?;
+    let group_guard = dense_layers.map(|dense| {
+        dense
+            .controller
+            .group_guard(&dense.residency, "pipeline_stage")
+    });
+    for (local_index, (global_layer, cache)) in range.zip(caches.iter_mut()).enumerate() {
+        if let Some(dense) = dense_layers {
+            let (_host, lease) = dense.prepare(local_index, prefill)?;
+            let mut layer = new_layer(global_layer, stream)?;
+            populate_module_from_lease(&mut layer, &lease)?;
+            let forwarded = forward_layer(global_layer, &mut layer, &hidden, cache, stream)?
+                .into_pipeline_layer_forward();
+            hidden = forwarded.hidden;
+            eval(
+                std::iter::once(&hidden)
+                    .chain(cache.retained_arrays())
+                    .chain(forwarded.retained.iter()),
+            )?;
+            stream.synchronize()?;
+        } else {
+            hidden = forward_layer(
+                global_layer,
+                &mut resident_layers[local_index],
+                &hidden,
+                cache,
+                stream,
+            )?
+            .into_pipeline_layer_forward()
+            .hidden;
+        }
+    }
+    if let Some(guard) = group_guard {
+        guard.complete()?;
+    }
+    if let Some(guard) = forward_guard {
+        guard.complete()?;
+    }
+    Ok(hidden)
+}
+
+fn pipeline_prompt_cache_identity(
+    topology: ParallelTopology,
+    model_family: &str,
+    effective_model_type: &str,
+    architecture_fingerprint: String,
+    layer_count: usize,
+    range: Range<usize>,
+    layer_layout: crate::LayerSchedule<crate::LayerCachePolicy>,
+) -> PromptCacheModelIdentity {
+    PromptCacheModelIdentity {
+        model_family: model_family.into(),
+        effective_model_type: effective_model_type.into(),
+        architecture_fingerprint,
+        layer_count,
+        global_layer_start: range.start,
+        global_layer_end: range.end,
+        sink_tokens: 0,
+        topology: PromptCacheTopology {
+            pipeline: Some((
+                topology.pipeline_parallel_size,
+                topology.pipeline_parallel_rank,
+            )),
+            tensor_parallel: None,
+            expert_parallel: None,
+            expert_parallel_cache_replicated: true,
+        },
+        layer_layout,
+    }
+}
+
+fn attention_window_i32(
+    attention: crate::AttentionPolicy,
+    global_layer: usize,
+) -> Result<Option<i32>, Error> {
+    attention
+        .window()
+        .map(|window| {
+            i32::try_from(window.get()).map_err(|_| {
+                Error::Parallel(format!(
+                    "pipeline attention window at global layer {global_layer} exceeds i32"
+                ))
+            })
+        })
+        .transpose()
+}
+
+fn materialize_pipeline_key_value_cache(
+    global_layer: usize,
+    attention: crate::AttentionPolicy,
+    slots: Vec<PipelineStateSlot>,
+    paged: &Option<(CacheResidencyManager, Option<CacheRankIdentity>)>,
+) -> Result<PipelineLayerCache, Error> {
+    let window = attention_window_i32(attention, global_layer)?;
+    let cache = match paged {
+        Some((manager, rank)) => PipelineKeyValueCache::Paged(PagedKeyValueCache::new_with_layout(
+            manager.clone(),
+            global_layer,
+            window,
+            0,
+            *rank,
+        )?),
+        None => PipelineKeyValueCache::Standard(match window {
+            Some(window) => ConcatKeyValueCache::new_for_sliding_attention(window),
+            None => ConcatKeyValueCache::new(),
+        }),
+    };
+    Ok(PipelineLayerCache::KeyValue {
+        global_layer,
+        cache,
+        slots,
+    })
+}
+
+fn materialize_pipeline_cache_layers(
+    identity: &PromptCacheModelIdentity,
+    paged: Option<(CacheResidencyManager, Option<CacheRankIdentity>)>,
+) -> Result<Vec<PipelineLayerCache>, Error> {
+    identity
+        .layer_layout
+        .iter()
+        .enumerate()
+        .map(|(local_layer, policy)| {
+            let global_layer = identity
+                .global_layer_start
+                .checked_add(local_layer)
+                .ok_or_else(|| Error::Parallel("pipeline cache layer index overflowed".into()))?;
+            match policy {
+                crate::LayerCachePolicy::NoState => Ok(PipelineLayerCache::StateSlots {
+                    global_layer,
+                    slots: Vec::new(),
+                }),
+                crate::LayerCachePolicy::KeyValue { attention, .. } => {
+                    materialize_pipeline_key_value_cache(
+                        global_layer,
+                        *attention,
+                        Vec::new(),
+                        &paged,
+                    )
+                }
+                crate::LayerCachePolicy::KeyValueWithFixedState {
+                    attention, tensors, ..
+                } => materialize_pipeline_key_value_cache(
+                    global_layer,
+                    *attention,
+                    tensors
+                        .iter()
+                        .cloned()
+                        .map(PipelineStateSlot::empty)
+                        .collect(),
+                    &paged,
+                ),
+                crate::LayerCachePolicy::CompressedLatentRotary { .. } => {
+                    let cache = match &paged {
+                        Some((manager, rank)) => {
+                            CompressedLatentCache::new_paged(manager.clone(), global_layer, *rank)?
+                        }
+                        None => CompressedLatentCache::new(),
+                    };
+                    Ok(PipelineLayerCache::CompressedLatent {
+                        global_layer,
+                        cache,
+                        slots: Vec::new(),
+                    })
+                }
+                crate::LayerCachePolicy::FixedState { tensors } => {
+                    Ok(PipelineLayerCache::StateSlots {
+                        global_layer,
+                        slots: tensors
+                            .iter()
+                            .cloned()
+                            .map(PipelineStateSlot::empty)
+                            .collect(),
+                    })
+                }
+            }
+        })
+        .collect()
+}
+
+fn validate_scheduled_pipeline_kv_cache(
+    family: &str,
+    range: Range<usize>,
+    schedule: &crate::LayerSchedule<crate::AttentionPolicy>,
+    caches: &[PipelineLayerCache],
+) -> Result<(), Error> {
+    if caches.len() != range.len() {
+        return Err(Error::Parallel(format!(
+            "{family} stage cache has {} entries, expected {}",
+            caches.len(),
+            range.len()
+        )));
+    }
+    for (global_layer, cache) in range.zip(caches) {
+        let expected = schedule
+            .get(global_layer)
+            .ok_or_else(|| Error::Parallel(format!("{family} has no layer {global_layer}")))?
+            .window()
+            .map(|window| {
+                i32::try_from(window.get()).expect("validated attention window fits i32")
+            });
+        let (cached_layer, actual) = match cache {
+            PipelineLayerCache::KeyValue {
+                global_layer,
+                cache: PipelineKeyValueCache::Standard(cache),
+                ..
+            } => (*global_layer, cache.max_size()),
+            PipelineLayerCache::KeyValue {
+                global_layer,
+                cache: PipelineKeyValueCache::Paged(cache),
+                ..
+            } => (*global_layer, cache.max_size()),
+            _ => {
+                return Err(Error::Parallel(format!(
+                    "{family} stage cache is not key/value state at global layer {global_layer}"
+                )))
+            }
+        };
+        if cached_layer != global_layer || actual != expected {
+            return Err(Error::Parallel(format!(
+                "{family} pipeline cache policy mismatch at global layer {global_layer}: cached layer {cached_layer}, expected window {expected:?}, got {actual:?}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn pipeline_kv_offset(caches: &[PipelineLayerCache]) -> i32 {
+    caches.first().map_or(0, |cache| match cache {
+        PipelineLayerCache::KeyValue {
+            cache: PipelineKeyValueCache::Standard(cache),
+            ..
+        } => cache.offset(),
+        PipelineLayerCache::KeyValue {
+            cache: PipelineKeyValueCache::Paged(cache),
+            ..
+        } => cache.offset(),
+        PipelineLayerCache::StateSlots { .. } | PipelineLayerCache::CompressedLatent { .. } => 0,
+    })
+}
+
+fn pipeline_state_offset(family: &str, caches: &[PipelineLayerCache]) -> Result<i32, Error> {
+    let mut offset = None;
+    for cache in caches {
+        let (global_layer, attention_offset, slots) = match cache {
+            PipelineLayerCache::StateSlots {
+                global_layer,
+                slots,
+            } => (*global_layer, None, slots.as_slice()),
+            PipelineLayerCache::KeyValue {
+                global_layer,
+                cache: PipelineKeyValueCache::Standard(cache),
+                slots,
+            } => (*global_layer, Some(cache.offset()), slots.as_slice()),
+            PipelineLayerCache::KeyValue {
+                global_layer,
+                cache: PipelineKeyValueCache::Paged(cache),
+                slots,
+            } => (*global_layer, Some(cache.offset()), slots.as_slice()),
+            PipelineLayerCache::CompressedLatent {
+                global_layer,
+                cache,
+                slots,
+            } => (*global_layer, Some(cache.offset()), slots.as_slice()),
+        };
+        for current in attention_offset
+            .into_iter()
+            .chain((!slots.is_empty()).then(|| slots[0].offset))
+            .chain(slots.iter().skip(1).map(|slot| slot.offset))
+        {
+            if let Some(expected) = offset {
+                if current != expected {
+                    return Err(Error::Parallel(format!(
+                        "{family} pipeline state offsets disagree at global layer {global_layer}: found {current}, expected {expected}"
+                    )));
+                }
+            } else {
+                offset = Some(current);
+            }
+        }
+    }
+    Ok(offset.unwrap_or(0))
+}
+
+impl PipelineStageSemantics for LlamaStage {
+    fn model_kind(&self) -> ModelKind {
+        ModelKind::Llama
+    }
+
+    fn auxiliary_shapes(&self, _step: PipelineStep) -> Vec<Vec<i32>> {
+        Vec::new()
+    }
+
+    fn dense_layers(&self) -> Option<&PipelineDenseLayers> {
+        self.dense_layers.as_ref()
+    }
+
+    fn prompt_cache_model_identity(
+        &self,
+        topology: ParallelTopology,
+    ) -> Result<PromptCacheModelIdentity, Error> {
+        let layout = PromptCacheModelIdentity::key_value_layouts(
+            self.range.clone().map(|layer| {
+                self.args
+                    .attention_schedule
+                    .get(layer)
+                    .expect("validated Llama pipeline layer range")
+                    .window()
+                    .map(|window| {
+                        i32::try_from(window.get())
+                            .expect("validated Llama attention window fits i32")
+                    })
+            }),
+            self.args.num_key_value_heads,
+            self.args.head_dim,
+        )
+        .map_err(|error| Error::Parallel(error.to_string()))?;
+        Ok(pipeline_prompt_cache_identity(
+            topology,
+            "llama",
+            &self.args.model_type,
+            crate::architectures::llama::model::prompt_cache_architecture_fingerprint(&self.args),
+            usize::try_from(self.args.num_hidden_layers)
+                .map_err(|_| Error::Parallel("invalid Llama layer count".into()))?,
+            self.range.clone(),
+            layout,
+        ))
+    }
+
+    fn forward(
+        &mut self,
+        input: PipelineStageInput<'_>,
+        step: PipelineStep,
+        mask: Option<&Array>,
+        cache: &mut [PipelineLayerCache],
+        stream: &Stream,
+    ) -> Result<PipelineStageOutput, Error> {
+        LlamaStage::forward(self, input, step, mask, cache, stream)
+    }
+}
+
+impl PipelineStageSemantics for DeepSeekStage {
+    fn model_kind(&self) -> ModelKind {
+        ModelKind::DeepSeekV3
+    }
+
+    fn auxiliary_shapes(&self, _step: PipelineStep) -> Vec<Vec<i32>> {
+        Vec::new()
+    }
+
+    fn dense_layers(&self) -> Option<&PipelineDenseLayers> {
+        self.dense_layers.as_ref()
+    }
+
+    fn prompt_cache_model_identity(
+        &self,
+        topology: ParallelTopology,
+    ) -> Result<PromptCacheModelIdentity, Error> {
+        let layout = PromptCacheModelIdentity::compressed_layouts(
+            self.range.len(),
+            self.args.kv_lora_rank,
+            self.args.qk_rope_head_dim,
+        )
+        .map_err(|error| Error::Parallel(error.to_string()))?;
+        Ok(pipeline_prompt_cache_identity(
+            topology,
+            "deepseek_v3",
+            &self.args.model_type,
+            crate::architectures::deepseek_v3::model::prompt_cache_architecture_fingerprint(
+                &self.args,
+            ),
+            usize::try_from(self.args.num_hidden_layers)
+                .map_err(|_| Error::Parallel("invalid DeepSeek layer count".into()))?,
+            self.range.clone(),
+            layout,
+        ))
+    }
+
+    fn forward(
+        &mut self,
+        input: PipelineStageInput<'_>,
+        step: PipelineStep,
+        mask: Option<&Array>,
+        cache: &mut [PipelineLayerCache],
+        stream: &Stream,
+    ) -> Result<PipelineStageOutput, Error> {
+        DeepSeekStage::forward(self, input, step, mask, cache, stream)
+    }
+}
+
+impl PipelineStageSemantics for GemmaStage {
+    fn model_kind(&self) -> ModelKind {
+        ModelKind::Gemma4
+    }
+
+    fn auxiliary_shapes(&self, step: PipelineStep) -> Vec<Vec<i32>> {
+        if self.args.hidden_size_per_layer_input > 0 {
+            vec![vec![
+                step.batch_size,
+                step.sequence_length,
+                self.args.num_hidden_layers,
+                self.args.hidden_size_per_layer_input,
+            ]]
+        } else {
+            Vec::new()
+        }
+    }
+
+    fn dense_layers(&self) -> Option<&PipelineDenseLayers> {
+        self.dense_layers.as_ref()
+    }
+
+    fn prompt_cache_model_identity(
+        &self,
+        topology: ParallelTopology,
+    ) -> Result<PromptCacheModelIdentity, Error> {
+        let complete = crate::architectures::gemma4::model::prompt_cache_layer_layout(&self.args)?;
+        let layout = crate::LayerSchedule::new(
+            self.range.len(),
+            complete
+                .iter()
+                .skip(self.range.start)
+                .take(self.range.len())
+                .cloned()
+                .collect(),
+        )
+        .map_err(|error| Error::Parallel(error.to_string()))?;
+        Ok(pipeline_prompt_cache_identity(
+            topology,
+            "gemma4",
+            &self.args.model_type,
+            crate::architectures::gemma4::model::prompt_cache_architecture_fingerprint(&self.args),
+            usize::try_from(self.args.num_hidden_layers)
+                .map_err(|_| Error::Parallel("invalid Gemma layer count".into()))?,
+            self.range.clone(),
+            layout,
+        ))
+    }
+
+    fn forward(
+        &mut self,
+        input: PipelineStageInput<'_>,
+        step: PipelineStep,
+        mask: Option<&Array>,
+        cache: &mut [PipelineLayerCache],
+        stream: &Stream,
+    ) -> Result<PipelineStageOutput, Error> {
+        GemmaStage::forward(self, input, step, mask, cache, stream)
+    }
+}
+
+impl PipelineStageSemantics for DenseQwenStage {
+    fn model_kind(&self) -> ModelKind {
+        self.args.model_kind()
+    }
+
+    fn auxiliary_shapes(&self, _step: PipelineStep) -> Vec<Vec<i32>> {
+        Vec::new()
+    }
+
+    fn dense_layers(&self) -> Option<&PipelineDenseLayers> {
+        self.dense_layers.as_ref()
+    }
+
+    fn prompt_cache_model_identity(
+        &self,
+        topology: ParallelTopology,
+    ) -> Result<PromptCacheModelIdentity, Error> {
+        let complete = dense_qwen::prompt_cache_layer_layout(&self.args)?;
+        let layout = crate::LayerSchedule::new(
+            self.range.len(),
+            complete
+                .iter()
+                .skip(self.range.start)
+                .take(self.range.len())
+                .cloned()
+                .collect(),
+        )
+        .map_err(|error| Error::Parallel(error.to_string()))?;
+        Ok(pipeline_prompt_cache_identity(
+            topology,
+            "dense_qwen",
+            &self.args.model_type,
+            dense_qwen::prompt_cache_architecture_fingerprint(&self.args),
+            usize::try_from(self.args.num_hidden_layers)
+                .map_err(|_| Error::Parallel("invalid dense-Qwen layer count".into()))?,
+            self.range.clone(),
+            layout,
+        ))
+    }
+
+    fn forward(
+        &mut self,
+        input: PipelineStageInput<'_>,
+        step: PipelineStep,
+        mask: Option<&Array>,
+        cache: &mut [PipelineLayerCache],
+        stream: &Stream,
+    ) -> Result<PipelineStageOutput, Error> {
+        DenseQwenStage::forward(self, input, step, mask, cache, stream)
+    }
+}
+
+impl PipelineStageSemantics for GptOssStage {
+    fn model_kind(&self) -> ModelKind {
+        ModelKind::GptOss
+    }
+
+    fn auxiliary_shapes(&self, _step: PipelineStep) -> Vec<Vec<i32>> {
+        Vec::new()
+    }
+
+    fn dense_layers(&self) -> Option<&PipelineDenseLayers> {
+        self.dense_layers.as_ref()
+    }
+
+    fn prompt_cache_model_identity(
+        &self,
+        topology: ParallelTopology,
+    ) -> Result<PromptCacheModelIdentity, Error> {
+        let complete = PromptCacheModelIdentity::key_value_layouts(
+            self.args
+                .attention_schedule
+                .iter()
+                .map(|policy| policy.window().map(|window| window.get() as i32)),
+            self.args.num_key_value_heads,
+            self.args.head_dim,
+        )
+        .map_err(|error| Error::Parallel(error.to_string()))?;
+        let layout = crate::LayerSchedule::new(
+            self.range.len(),
+            complete
+                .iter()
+                .skip(self.range.start)
+                .take(self.range.len())
+                .cloned()
+                .collect(),
+        )
+        .map_err(|error| Error::Parallel(error.to_string()))?;
+        Ok(pipeline_prompt_cache_identity(
+            topology,
+            "gpt_oss",
+            &self.args.model_type,
+            gpt_oss::prompt_cache_architecture_fingerprint(&self.args),
+            usize::try_from(self.args.num_hidden_layers)
+                .map_err(|_| Error::Parallel("invalid GPT-OSS layer count".into()))?,
+            self.range.clone(),
+            layout,
+        ))
+    }
+
+    fn forward(
+        &mut self,
+        input: PipelineStageInput<'_>,
+        step: PipelineStep,
+        mask: Option<&Array>,
+        cache: &mut [PipelineLayerCache],
+        stream: &Stream,
+    ) -> Result<PipelineStageOutput, Error> {
+        GptOssStage::forward(self, input, step, mask, cache, stream)
+    }
+}
+
+impl PipelineStageSemantics for Lfm2Stage {
+    fn model_kind(&self) -> ModelKind {
+        ModelKind::Lfm2
+    }
+
+    fn auxiliary_shapes(&self, _step: PipelineStep) -> Vec<Vec<i32>> {
+        Vec::new()
+    }
+
+    fn dense_layers(&self) -> Option<&PipelineDenseLayers> {
+        self.dense_layers.as_ref()
+    }
+
+    fn prompt_cache_model_identity(
+        &self,
+        topology: ParallelTopology,
+    ) -> Result<PromptCacheModelIdentity, Error> {
+        let complete = lfm2::prompt_cache_layer_layout(&self.args)?;
+        let layout = crate::LayerSchedule::new(
+            self.range.len(),
+            complete
+                .iter()
+                .skip(self.range.start)
+                .take(self.range.len())
+                .cloned()
+                .collect(),
+        )
+        .map_err(|error| Error::Parallel(error.to_string()))?;
+        Ok(pipeline_prompt_cache_identity(
+            topology,
+            "lfm2",
+            &self.args.model_type,
+            lfm2::prompt_cache_architecture_fingerprint(&self.args),
+            self.args.layer_schedule.len(),
+            self.range.clone(),
+            layout,
+        ))
+    }
+
+    fn forward(
+        &mut self,
+        input: PipelineStageInput<'_>,
+        step: PipelineStep,
+        mask: Option<&Array>,
+        cache: &mut [PipelineLayerCache],
+        stream: &Stream,
+    ) -> Result<PipelineStageOutput, Error> {
+        Lfm2Stage::forward(self, input, step, mask, cache, stream)
+    }
+}
+
+impl PipelineStageSemantics for NemotronHStage {
+    fn model_kind(&self) -> ModelKind {
+        ModelKind::NemotronH
+    }
+
+    fn auxiliary_shapes(&self, _step: PipelineStep) -> Vec<Vec<i32>> {
+        Vec::new()
+    }
+
+    fn dense_layers(&self) -> Option<&PipelineDenseLayers> {
+        self.dense_layers.as_ref()
+    }
+
+    fn prompt_cache_model_identity(
+        &self,
+        topology: ParallelTopology,
+    ) -> Result<PromptCacheModelIdentity, Error> {
+        let complete = nemotron_h::prompt_cache_layer_layout(&self.args)?;
+        let layout = crate::LayerSchedule::new(
+            self.range.len(),
+            complete
+                .iter()
+                .skip(self.range.start)
+                .take(self.range.len())
+                .cloned()
+                .collect(),
+        )
+        .map_err(|error| Error::Parallel(error.to_string()))?;
+        Ok(pipeline_prompt_cache_identity(
+            topology,
+            "nemotron_h",
+            &self.args.model_type,
+            nemotron_h::prompt_cache_architecture_fingerprint(&self.args),
+            usize::try_from(self.args.num_hidden_layers)
+                .map_err(|_| Error::Parallel("invalid Nemotron-H layer count".into()))?,
+            self.range.clone(),
+            layout,
+        ))
+    }
+
+    fn forward(
+        &mut self,
+        input: PipelineStageInput<'_>,
+        step: PipelineStep,
+        mask: Option<&Array>,
+        cache: &mut [PipelineLayerCache],
+        stream: &Stream,
+    ) -> Result<PipelineStageOutput, Error> {
+        NemotronHStage::forward(self, input, step, mask, cache, stream)
+    }
+}
+
+impl PipelineStageSemantics for QwenHybridStage {
+    fn model_kind(&self) -> ModelKind {
+        if self.args.model_type == "qwen3_next" {
+            ModelKind::Qwen3Next
+        } else {
+            ModelKind::Qwen35
+        }
+    }
+
+    fn auxiliary_shapes(&self, _step: PipelineStep) -> Vec<Vec<i32>> {
+        Vec::new()
+    }
+
+    fn dense_layers(&self) -> Option<&PipelineDenseLayers> {
+        self.dense_layers.as_ref()
+    }
+
+    fn prompt_cache_model_identity(
+        &self,
+        topology: ParallelTopology,
+    ) -> Result<PromptCacheModelIdentity, Error> {
+        let complete = qwen_hybrid::prompt_cache_layer_layout(&self.args)?;
+        let layout = crate::LayerSchedule::new(
+            self.range.len(),
+            complete
+                .iter()
+                .skip(self.range.start)
+                .take(self.range.len())
+                .cloned()
+                .collect(),
+        )
+        .map_err(|error| Error::Parallel(error.to_string()))?;
+        Ok(pipeline_prompt_cache_identity(
+            topology,
+            "qwen_hybrid",
+            &self.args.model_type,
+            qwen_hybrid::prompt_cache_architecture_fingerprint(&self.args),
+            self.args.num_hidden_layers as usize,
+            self.range.clone(),
+            layout,
+        ))
+    }
+
+    fn forward(
+        &mut self,
+        input: PipelineStageInput<'_>,
+        step: PipelineStep,
+        mask: Option<&Array>,
+        cache: &mut [PipelineLayerCache],
+        stream: &Stream,
+    ) -> Result<PipelineStageOutput, Error> {
+        QwenHybridStage::forward(self, input, step, mask, cache, stream)
+    }
+}
+
+impl PipelineStageSemantics for KimiLinearStage {
+    fn model_kind(&self) -> ModelKind {
+        ModelKind::KimiLinear
+    }
+
+    fn auxiliary_shapes(&self, _step: PipelineStep) -> Vec<Vec<i32>> {
+        Vec::new()
+    }
+
+    fn dense_layers(&self) -> Option<&PipelineDenseLayers> {
+        self.dense_layers.as_ref()
+    }
+
+    fn prompt_cache_model_identity(
+        &self,
+        topology: ParallelTopology,
+    ) -> Result<PromptCacheModelIdentity, Error> {
+        let complete = kimi_linear::prompt_cache_layer_layout(&self.args)?;
+        let layout = crate::LayerSchedule::new(
+            self.range.len(),
+            complete
+                .iter()
+                .skip(self.range.start)
+                .take(self.range.len())
+                .cloned()
+                .collect(),
+        )
+        .map_err(|error| Error::Parallel(error.to_string()))?;
+        Ok(pipeline_prompt_cache_identity(
+            topology,
+            "kimi_linear",
+            &self.args.model_type,
+            kimi_linear::prompt_cache_architecture_fingerprint(&self.args),
+            self.args.num_hidden_layers as usize,
+            self.range.clone(),
+            layout,
+        ))
+    }
+
+    fn forward(
+        &mut self,
+        input: PipelineStageInput<'_>,
+        step: PipelineStep,
+        mask: Option<&Array>,
+        cache: &mut [PipelineLayerCache],
+        stream: &Stream,
+    ) -> Result<PipelineStageOutput, Error> {
+        KimiLinearStage::forward(self, input, step, mask, cache, stream)
+    }
+}
+
+impl PipelineStageSemantics for InklingStage {
+    fn model_kind(&self) -> ModelKind {
+        ModelKind::Inkling
+    }
+
+    fn auxiliary_shapes(&self, _step: PipelineStep) -> Vec<Vec<i32>> {
+        Vec::new()
+    }
+
+    fn dense_layers(&self) -> Option<&PipelineDenseLayers> {
+        self.dense_layers.as_ref()
+    }
+
+    fn prompt_cache_model_identity(
+        &self,
+        topology: ParallelTopology,
+    ) -> Result<PromptCacheModelIdentity, Error> {
+        let complete = inkling::prompt_cache_layer_layout(&self.args)?;
+        let layout = crate::LayerSchedule::new(
+            self.range.len(),
+            complete
+                .iter()
+                .skip(self.range.start)
+                .take(self.range.len())
+                .cloned()
+                .collect(),
+        )
+        .map_err(|error| Error::Parallel(error.to_string()))?;
+        Ok(pipeline_prompt_cache_identity(
+            topology,
+            "inkling",
+            &self.args.model_type,
+            inkling::prompt_cache_architecture_fingerprint(&self.args),
+            self.args.text_config.num_hidden_layers as usize,
+            self.range.clone(),
+            layout,
+        ))
+    }
+
+    fn forward(
+        &mut self,
+        input: PipelineStageInput<'_>,
+        step: PipelineStep,
+        mask: Option<&Array>,
+        cache: &mut [PipelineLayerCache],
+        stream: &Stream,
+    ) -> Result<PipelineStageOutput, Error> {
+        if mask.is_some() {
+            return Err(Error::Parallel(
+                "Inkling relative attention does not accept an external additive mask".into(),
+            ));
+        }
+        InklingStage::forward(self, input, step, cache, stream)
+    }
 }
 
 /// An executable, rank-local piece of a pipeline-parallel model.
 pub struct PipelineModel {
     topology: ParallelTopology,
     info: PipelineStageInfo,
-    stage: ArchitectureStage,
+    stage: Box<dyn PipelineStageAdapter>,
+    cache_identity: PromptCacheModelIdentity,
 }
 
 impl std::fmt::Debug for PipelineModel {
@@ -306,6 +2005,45 @@ impl std::fmt::Debug for PipelineModel {
 }
 
 impl PipelineModel {
+    fn from_adapter(
+        topology: ParallelTopology,
+        info: PipelineStageInfo,
+        stage: impl PipelineStageAdapter + 'static,
+    ) -> Result<Self, Error> {
+        if stage.model_kind() != info.model_kind {
+            return Err(Error::Parallel(format!(
+                "pipeline adapter architecture {:?} does not match stage architecture {:?}",
+                stage.model_kind(),
+                info.model_kind
+            )));
+        }
+        let cache_identity = stage.prompt_cache_model_identity(topology)?;
+        if cache_identity.global_layer_start != info.global_layer_range.start
+            || cache_identity.global_layer_end != info.global_layer_range.end
+            || cache_identity.layer_layout.len() != info.global_layer_range.len()
+            || cache_identity.global_layer_end > cache_identity.layer_count
+        {
+            return Err(Error::Parallel(format!(
+                "pipeline adapter cache range {}..{} ({} entries of {} total layers) does not match stage range {:?}",
+                cache_identity.global_layer_start,
+                cache_identity.global_layer_end,
+                cache_identity.layer_layout.len(),
+                cache_identity.layer_count,
+                info.global_layer_range
+            )));
+        }
+        Ok(Self {
+            topology,
+            info,
+            stage: Box::new(stage),
+            cache_identity,
+        })
+    }
+
+    fn auxiliary_shapes(&self, step: PipelineStep) -> Vec<Vec<i32>> {
+        self.stage.auxiliary_shapes(step)
+    }
+
     /// Returns the immutable stage description.
     pub fn stage_info(&self) -> &PipelineStageInfo {
         &self.info
@@ -313,58 +2051,24 @@ impl PipelineModel {
 
     /// Returns stage-local dense-stream observations when enabled.
     pub fn dense_stream_report(&self) -> Result<Option<DenseDiskStreamReport>, Error> {
-        match &self.stage {
-            ArchitectureStage::Llama(stage) => stage
-                .dense_layers
-                .as_ref()
-                .map(PipelineDenseLayers::report)
-                .transpose(),
-            ArchitectureStage::DeepSeek(stage) => stage
-                .dense_layers
-                .as_ref()
-                .map(PipelineDenseLayers::report)
-                .transpose(),
-        }
+        self.stage.dense_stream_report()
+    }
+
+    /// Returns physical checkpoint-read telemetry for a streamed local stage.
+    pub fn checkpoint_diagnostics(&self) -> Result<Option<WeightStoreDiagnostics>, Error> {
+        self.stage.checkpoint_diagnostics()
     }
 
     /// Allocates cache entries only for locally owned decoder layers.
-    pub fn new_cache(&self) -> PipelineCache {
-        match &self.stage {
-            ArchitectureStage::Llama(stage) => PipelineCache::Llama(
-                stage
-                    .range
-                    .clone()
-                    .map(|global_layer| {
-                        let policy = stage
-                            .args
-                            .attention_schedule
-                            .get(global_layer)
-                            .expect("validated Llama pipeline layer range");
-                        let cache = match policy.window() {
-                            Some(window) => ConcatKeyValueCache::new_for_sliding_attention(
-                                i32::try_from(window.get())
-                                    .expect("validated Llama attention window fits i32"),
-                            ),
-                            None => ConcatKeyValueCache::new(),
-                        };
-                        PipelineLlamaLayerCache::Standard {
-                            global_layer,
-                            cache,
-                        }
-                    })
-                    .collect(),
-            ),
-            ArchitectureStage::DeepSeek(stage) => PipelineCache::DeepSeek(
-                stage
-                    .range
-                    .clone()
-                    .map(|global_layer| PipelineDeepSeekLayerCache {
-                        global_layer,
-                        cache: CompressedLatentCache::new(),
-                    })
-                    .collect(),
-            ),
-        }
+    ///
+    /// The stage's canonical [`crate::LayerCachePolicy`] schedule is validated
+    /// and materialized without architecture dispatch. Fixed state uses
+    /// semantic slots rather than architecture-specific cache variants.
+    pub fn new_cache(&self) -> Result<PipelineCache, Error> {
+        Ok(PipelineCache::new(
+            self.info.model_kind,
+            materialize_pipeline_cache_layers(&self.cache_identity, None)?,
+        ))
     }
 
     /// Allocates stage-local cache state under an explicit cache policy.
@@ -373,7 +2077,7 @@ impl PipelineModel {
         policy: CacheResidencyPolicy,
     ) -> Result<PipelineCache, Error> {
         match policy {
-            CacheResidencyPolicy::Device => Ok(self.new_cache()),
+            CacheResidencyPolicy::Device => self.new_cache(),
             CacheResidencyPolicy::Paged(options) => {
                 let manager = CacheResidencyManager::new(options)
                     .map_err(|error| Exception::custom(error.to_string()))?;
@@ -384,57 +2088,15 @@ impl PipelineModel {
                     expert_parallel_rank: (self.topology.expert_parallel_size > 1)
                         .then_some(self.topology.expert_parallel_rank),
                 });
-                match &self.stage {
-                    ArchitectureStage::Llama(stage) => Ok(PipelineCache::Llama(
-                        stage
-                            .range
-                            .clone()
-                            .map(|global_layer| {
-                                PagedKeyValueCache::new_with_layout(
-                                    manager.clone(),
-                                    global_layer,
-                                    stage
-                                        .args
-                                        .attention_schedule
-                                        .get(global_layer)
-                                        .expect("validated Llama pipeline layer range")
-                                        .window()
-                                        .map(|window| {
-                                            i32::try_from(window.get())
-                                                .expect("validated Llama attention window fits i32")
-                                        }),
-                                    0,
-                                    rank,
-                                )
-                                .map(|cache| {
-                                    PipelineLlamaLayerCache::Paged {
-                                        global_layer,
-                                        cache,
-                                    }
-                                })
-                            })
-                            .collect::<Result<Vec<_>, _>>()?,
-                    )),
-                    ArchitectureStage::DeepSeek(stage) => Ok(PipelineCache::DeepSeek(
-                        stage
-                            .range
-                            .clone()
-                            .map(|global_layer| {
-                                CompressedLatentCache::new_paged(
-                                    manager.clone(),
-                                    global_layer,
-                                    rank,
-                                )
-                                .map(|cache| {
-                                    PipelineDeepSeekLayerCache {
-                                        global_layer,
-                                        cache,
-                                    }
-                                })
-                            })
-                            .collect::<Result<Vec<_>, _>>()?,
-                    )),
-                }
+                let layers = materialize_pipeline_cache_layers(
+                    &self.cache_identity,
+                    Some((manager.clone(), rank)),
+                )?;
+                Ok(PipelineCache::with_residency_manager(
+                    self.info.model_kind,
+                    layers,
+                    manager,
+                ))
             }
         }
     }
@@ -444,15 +2106,7 @@ impl PipelineModel {
         &self,
         cache: &PipelineCache,
     ) -> Result<Option<CacheResidencyReport>, Error> {
-        let manager = match cache {
-            PipelineCache::Llama(layers) => layers.iter().find_map(|layer| match layer {
-                PipelineLlamaLayerCache::Paged { cache, .. } => Some(cache.manager()),
-                PipelineLlamaLayerCache::Standard { .. } => None,
-            }),
-            PipelineCache::DeepSeek(layers) => layers
-                .iter()
-                .find_map(|layer| layer.cache.residency_manager()),
-        };
+        let manager = cache.residency_manager.as_ref();
         manager
             .map(|manager| {
                 manager
@@ -474,42 +2128,92 @@ impl PipelineModel {
         let identity = self.prompt_cache_model_identity()?;
         validate_prompt_cache_model_identity(&descriptor, &identity)
             .map_err(|error| Error::Parallel(error.to_string()))?;
-        let manager = match cache {
-            PipelineCache::Llama(layers) => {
-                let mut manager = None;
-                for layer in layers {
-                    let PipelineLlamaLayerCache::Paged { cache, .. } = layer else {
-                        return Err(Error::Parallel(
-                            "pipeline prompt persistence requires a paged cache".into(),
-                        ));
-                    };
+        if cache.model_kind != self.info.model_kind {
+            return Err(Error::Parallel(
+                "pipeline prompt cache architecture does not match the stage".into(),
+            ));
+        }
+        let manager = cache.residency_manager.clone().ok_or_else(|| {
+            Error::Parallel("pipeline prompt persistence requires a paged cache".into())
+        })?;
+        for layer in &mut cache.layers {
+            match layer {
+                PipelineLayerCache::StateSlots { .. } => {}
+                PipelineLayerCache::KeyValue {
+                    cache: PipelineKeyValueCache::Paged(cache),
+                    ..
+                } => {
                     cache.finalize()?;
-                    manager.get_or_insert_with(|| cache.manager().clone());
                 }
-                manager
-            }
-            PipelineCache::DeepSeek(layers) => {
-                let mut manager = None;
-                for layer in layers {
-                    layer.cache.finalize()?;
-                    if let Some(paged) = layer.cache.residency_manager() {
-                        manager.get_or_insert_with(|| paged.clone());
-                    } else {
+                PipelineLayerCache::CompressedLatent { cache, .. } => {
+                    cache.finalize()?;
+                    if cache.residency_manager().is_none() {
                         return Err(Error::Parallel(
                             "pipeline prompt persistence requires a paged cache".into(),
                         ));
                     }
                 }
-                manager
+                PipelineLayerCache::KeyValue {
+                    cache: PipelineKeyValueCache::Standard(_),
+                    ..
+                } => {
+                    return Err(Error::Parallel(
+                        "pipeline prompt persistence requires a paged cache".into(),
+                    ));
+                }
             }
         }
-        .ok_or_else(|| Error::Parallel("cannot persist an empty pipeline stage cache".into()))?;
+        let expected_offset = i32::try_from(prefix_token_ids.len())
+            .map_err(|_| Error::Parallel("pipeline prompt length exceeds i32".into()))?;
+        let mut state_arrays = Vec::new();
+        for layer in &cache.layers {
+            let (global_layer, slots) = match layer {
+                PipelineLayerCache::StateSlots {
+                    global_layer,
+                    slots,
+                }
+                | PipelineLayerCache::KeyValue {
+                    global_layer,
+                    slots,
+                    ..
+                }
+                | PipelineLayerCache::CompressedLatent {
+                    global_layer,
+                    slots,
+                    ..
+                } => (*global_layer, slots),
+            };
+            for slot in slots {
+                match slot.value.as_ref() {
+                    Some(array) => {
+                        if slot.offset != expected_offset {
+                            return Err(Error::Parallel(format!(
+                                "pipeline state {:?} at global layer {global_layer} has offset {}, expected {expected_offset}",
+                                slot.policy.role, slot.offset
+                            )));
+                        }
+                        state_arrays.push(PromptCacheStateArray {
+                            owner: StateTensorOwner::Layer(global_layer),
+                            role: slot.policy.role,
+                            array,
+                        });
+                    }
+                    None if slot.policy.required => {
+                        return Err(Error::Parallel(format!(
+                            "pipeline state {:?} at global layer {global_layer} is required but uninitialized",
+                            slot.policy.role
+                        )));
+                    }
+                    None => {}
+                }
+            }
+        }
         manager
             .save_prompt_cache(
                 self.prompt_cache_rank_directory(root.as_ref()),
                 descriptor,
                 prefix_token_ids,
-                &[],
+                &state_arrays,
                 options,
             )
             .map_err(|error| Error::Parallel(error.to_string()))
@@ -522,6 +2226,7 @@ impl PipelineModel {
         expected: &PromptCacheDescriptor,
         prefix_token_ids: &[u32],
         options: PagedCacheOptions,
+        stream: &Stream,
     ) -> Result<(PipelineCache, PromptCacheManifest), Error> {
         let identity = self.prompt_cache_model_identity()?;
         validate_prompt_cache_model_identity(expected, &identity)
@@ -534,55 +2239,60 @@ impl PipelineModel {
             options,
         )
         .map_err(|error| Error::Parallel(error.to_string()))?;
+        let mut restored_state = load_prompt_cache_state_tensors(
+            self.prompt_cache_rank_directory(root.as_ref()),
+            &manifest,
+            stream,
+        )
+        .map_err(|error| Error::Parallel(error.to_string()))?
+        .into_iter()
+        .map(|state| ((state.owner, state.role), state.array))
+        .collect::<BTreeMap<_, _>>();
         let rank = Some(CacheRankIdentity {
             pipeline_rank: Some(self.topology.pipeline_parallel_rank),
             tensor_parallel_rank: None,
             expert_parallel_rank: None,
         });
-        let cache = match &self.stage {
-            ArchitectureStage::Llama(stage) => PipelineCache::Llama(
-                stage
-                    .range
-                    .clone()
-                    .map(|global_layer| {
-                        PagedKeyValueCache::new_with_layout(
-                            manager.clone(),
-                            global_layer,
-                            stage
-                                .args
-                                .attention_schedule
-                                .get(global_layer)
-                                .expect("validated Llama pipeline layer range")
-                                .window()
-                                .map(|window| {
-                                    i32::try_from(window.get())
-                                        .expect("validated Llama attention window fits i32")
-                                }),
-                            0,
-                            rank,
-                        )
-                        .map(|cache| PipelineLlamaLayerCache::Paged {
-                            global_layer,
-                            cache,
-                        })
-                    })
-                    .collect::<Result<Vec<_>, _>>()?,
-            ),
-            ArchitectureStage::DeepSeek(stage) => PipelineCache::DeepSeek(
-                stage
-                    .range
-                    .clone()
-                    .map(|global_layer| {
-                        CompressedLatentCache::new_paged(manager.clone(), global_layer, rank).map(
-                            |cache| PipelineDeepSeekLayerCache {
-                                global_layer,
-                                cache,
-                            },
-                        )
-                    })
-                    .collect::<Result<Vec<_>, _>>()?,
-            ),
-        };
+        let mut layers =
+            materialize_pipeline_cache_layers(&self.cache_identity, Some((manager.clone(), rank)))?;
+        let offset = i32::try_from(prefix_token_ids.len())
+            .map_err(|_| Error::Parallel("pipeline prompt length exceeds i32".into()))?;
+        for layer in &mut layers {
+            let (global_layer, slots) = match layer {
+                PipelineLayerCache::StateSlots {
+                    global_layer,
+                    slots,
+                }
+                | PipelineLayerCache::KeyValue {
+                    global_layer,
+                    slots,
+                    ..
+                }
+                | PipelineLayerCache::CompressedLatent {
+                    global_layer,
+                    slots,
+                    ..
+                } => (*global_layer, slots),
+            };
+            for slot in slots {
+                slot.value = restored_state
+                    .remove(&(StateTensorOwner::Layer(global_layer), slot.policy.role));
+                if slot.value.is_some() {
+                    slot.offset = offset;
+                } else if slot.policy.required {
+                    return Err(Error::Parallel(format!(
+                        "persisted pipeline state {:?} at global layer {global_layer} is missing",
+                        slot.policy.role
+                    )));
+                }
+            }
+        }
+        if !restored_state.is_empty() {
+            return Err(Error::Parallel(
+                "persisted pipeline cache contains unexpected fixed state".into(),
+            ));
+        }
+        let cache = PipelineCache::with_residency_manager(self.info.model_kind, layers, manager);
         Ok((cache, manifest))
     }
 
@@ -603,71 +2313,7 @@ impl PipelineModel {
     }
 
     fn prompt_cache_model_identity(&self) -> Result<PromptCacheModelIdentity, Error> {
-        let (model_family, effective_model_type, architecture_fingerprint, layer_count, range) =
-            match &self.stage {
-                ArchitectureStage::Llama(stage) => (
-                    "llama".to_string(),
-                    stage.args.model_type.clone(),
-                    crate::architectures::llama::model::prompt_cache_architecture_fingerprint(
-                        &stage.args,
-                    ),
-                    usize::try_from(stage.args.num_hidden_layers)
-                        .map_err(|_| Error::Parallel("invalid Llama layer count".into()))?,
-                    stage.range.clone(),
-                ),
-                ArchitectureStage::DeepSeek(stage) => (
-                    "deepseek_v3".to_string(),
-                    stage.args.model_type.clone(),
-                    crate::architectures::deepseek_v3::model::prompt_cache_architecture_fingerprint(
-                        &stage.args,
-                    ),
-                    usize::try_from(stage.args.num_hidden_layers)
-                        .map_err(|_| Error::Parallel("invalid DeepSeek layer count".into()))?,
-                    stage.range.clone(),
-                ),
-            };
-        Ok(PromptCacheModelIdentity {
-            model_family,
-            effective_model_type,
-            architecture_fingerprint,
-            layer_count,
-            global_layer_start: range.start,
-            global_layer_end: range.end,
-            sink_tokens: 0,
-            topology: PromptCacheTopology {
-                pipeline: Some((
-                    self.topology.pipeline_parallel_size,
-                    self.topology.pipeline_parallel_rank,
-                )),
-                tensor_parallel: None,
-                expert_parallel: None,
-                expert_parallel_cache_replicated: true,
-            },
-            layer_layout: match &self.stage {
-                ArchitectureStage::Llama(stage) => PromptCacheModelIdentity::key_value_layouts(
-                    stage.range.clone().map(|layer| {
-                        stage
-                            .args
-                            .attention_schedule
-                            .get(layer)
-                            .expect("validated Llama pipeline layer range")
-                            .window()
-                            .map(|window| {
-                                i32::try_from(window.get())
-                                    .expect("validated Llama attention window fits i32")
-                            })
-                    }),
-                    stage.args.num_key_value_heads,
-                    stage.args.head_dim,
-                ),
-                ArchitectureStage::DeepSeek(stage) => PromptCacheModelIdentity::compressed_layouts(
-                    stage.range.len(),
-                    stage.args.kv_lora_rank,
-                    stage.args.qk_rope_head_dim,
-                ),
-            }
-            .map_err(|error| Error::Parallel(error.to_string()))?,
-        })
+        Ok(self.cache_identity.clone())
     }
 
     /// Executes only this stage, without communication.
@@ -684,29 +2330,25 @@ impl PipelineModel {
         stream: &Stream,
     ) -> Result<PipelineStageOutput, Error> {
         self.topology.validate_execution_stream(stream)?;
-        validate_stage_input(&self.info, &input, step)?;
-        match (&mut self.stage, cache) {
-            (ArchitectureStage::Llama(stage), PipelineCache::Llama(cache)) => {
-                stage.forward(input, step, mask, cache, stream)
-            }
-            (ArchitectureStage::DeepSeek(stage), PipelineCache::DeepSeek(cache)) => {
-                stage.forward(input, step, mask, cache, stream)
-            }
-            (ArchitectureStage::Llama(_), _) => Err(Error::Parallel(
-                "pipeline cache architecture is DeepSeek, but model stage is Llama".into(),
-            )),
-            (ArchitectureStage::DeepSeek(_), _) => Err(Error::Parallel(
-                "pipeline cache architecture is Llama, but model stage is DeepSeek".into(),
-            )),
+        validate_stage_input(&self.info, &input, step, &self.auxiliary_shapes(step))?;
+        if cache.model_kind != self.info.model_kind {
+            return Err(Error::Parallel(format!(
+                "pipeline cache architecture {:?} does not match stage {:?}",
+                cache.model_kind, self.info.model_kind
+            )));
         }
+        self.stage
+            .forward(input, step, mask, &mut cache.layers, stream)
     }
 
-    /// Runs one serial distributed pipeline operation.
+    /// Runs one distributed pipeline microbatch without queue management.
     ///
     /// Stage zero embeds and sends, intermediate stages receive/execute/send,
     /// and the final stage receives and returns logits. Every lazy point-to-
     /// point operation is evaluated and synchronized before the operation
-    /// returns.
+    /// returns. Multi-request inference should normally use
+    /// [`PipelineInferenceScheduler::run_queued`], which calls this primitive
+    /// in a collectively validated order that can fill different stages.
     pub fn forward_pipeline(
         &mut self,
         tokens: Option<&Array>,
@@ -718,41 +2360,71 @@ impl PipelineModel {
     ) -> Result<Option<Array>, Error> {
         self.validate_group(group)?;
         let received;
-        let input =
-            if self.info.is_first {
-                PipelineStageInput::Tokens(tokens.ok_or_else(|| {
+        let received_auxiliary;
+        let received_payload;
+        let input = if self.info.is_first {
+            PipelineStageInput::Tokens(
+                tokens.ok_or_else(|| {
                     Error::Parallel("pipeline stage zero requires token ids".into())
-                })?)
-            } else {
-                if tokens.is_some() {
-                    return Err(Error::Parallel(format!(
+                })?,
+            )
+        } else {
+            if tokens.is_some() {
+                return Err(Error::Parallel(format!(
                     "pipeline stage {} receives hidden activations and must not receive token ids",
                     self.info.pipeline_stage
                 )));
-                }
-                let peer = self.info.predecessor_rank.expect("non-first predecessor");
-                received = distributed::recv(
-                    &step.activation_shape(self.info.hidden_size),
-                    self.info.activation_dtype,
-                    peer,
-                    group,
-                    stream,
-                )
-                .map_err(|error| {
-                    Error::Parallel(format!(
+            }
+            let peer = self.info.predecessor_rank.expect("non-first predecessor");
+            received = distributed::recv(
+                &step.activation_shape(self.info.hidden_size),
+                self.info.activation_dtype,
+                peer,
+                group,
+                stream,
+            )
+            .map_err(|error| {
+                Error::Parallel(format!(
                     "stage {} failed to receive {:?} {:?} activations from rank {peer}: {error}",
                     self.info.pipeline_stage,
                     step.activation_shape(self.info.hidden_size),
                     self.info.activation_dtype
                 ))
-                })?;
-                eval([&received])?;
-                stream.synchronize()?;
-                PipelineStageInput::Hidden(&received)
+            })?;
+            eval([&received])?;
+            stream.synchronize()?;
+            received_auxiliary = self
+                    .auxiliary_shapes(step)
+                    .into_iter()
+                    .map(|shape| {
+                        let value = distributed::recv(
+                            &shape,
+                            self.info.activation_dtype,
+                            peer,
+                            group,
+                            stream,
+                        )
+                        .map_err(|error| {
+                            Error::Parallel(format!(
+                                "stage {} failed to receive auxiliary {shape:?} from rank {peer}: {error}",
+                                self.info.pipeline_stage
+                            ))
+                        })?;
+                        eval([&value])?;
+                        Ok(value)
+                    })
+                    .collect::<Result<Vec<_>, Error>>()?;
+            stream.synchronize()?;
+            received_payload = PipelinePayload {
+                hidden: received,
+                auxiliary: PipelineAuxiliaryState::new(received_auxiliary),
             };
+            PipelineStageInput::Hidden(&received_payload)
+        };
 
         match self.forward_stage(input, step, mask, cache, stream)? {
-            PipelineStageOutput::Hidden(hidden) => {
+            PipelineStageOutput::Hidden(payload) => {
+                let hidden = &payload.hidden;
                 let expected = step.activation_shape(self.info.hidden_size);
                 if hidden.shape() != expected || hidden.dtype() != self.info.activation_dtype {
                     return Err(Error::Parallel(format!(
@@ -764,7 +2436,7 @@ impl PipelineModel {
                     )));
                 }
                 let peer = self.info.successor_rank.expect("non-final successor");
-                let sent = distributed::send(&hidden, peer, group, stream).map_err(|error| {
+                let sent = distributed::send(hidden, peer, group, stream).map_err(|error| {
                     Error::Parallel(format!(
                         "stage {} failed to send {:?} {:?} activations to rank {peer}: {error}",
                         self.info.pipeline_stage,
@@ -773,6 +2445,18 @@ impl PipelineModel {
                     ))
                 })?;
                 eval([&sent])?;
+                for auxiliary in payload.auxiliary.tensors() {
+                    let sent =
+                        distributed::send(auxiliary, peer, group, stream).map_err(|error| {
+                            Error::Parallel(format!(
+                            "stage {} failed to send auxiliary {:?} {:?} to rank {peer}: {error}",
+                            self.info.pipeline_stage,
+                            auxiliary.shape(),
+                            auxiliary.dtype()
+                        ))
+                        })?;
+                    eval([&sent])?;
+                }
                 stream.synchronize()?;
                 Ok(None)
             }
@@ -848,6 +2532,101 @@ fn rank_for_stage(topology: ParallelTopology, stage: usize) -> usize {
     (stage * topology.tensor_parallel_size) * topology.expert_parallel_size
 }
 
+/// Partitions decoder layers only at legal dependency boundaries.
+///
+/// `can_split_after[i]` describes the boundary between layers `i` and `i + 1`.
+/// The planner balances layer counts across the resulting atomic contiguous
+/// units while guaranteeing every stage receives at least one unit.
+fn dependency_safe_layer_ranges(
+    layer_count: usize,
+    stages: usize,
+    can_split_after: &[bool],
+) -> Result<Vec<Range<usize>>, Error> {
+    if layer_count == 0 || can_split_after.len() != layer_count.saturating_sub(1) {
+        return Err(Error::Parallel(
+            "pipeline dependency plan has inconsistent layer geometry".into(),
+        ));
+    }
+    let mut units = Vec::new();
+    let mut start = 0;
+    for (boundary, can_split) in can_split_after.iter().copied().enumerate() {
+        if can_split {
+            units.push(start..boundary + 1);
+            start = boundary + 1;
+        }
+    }
+    units.push(start..layer_count);
+    if units.len() < stages {
+        return Err(Error::Parallel(format!(
+            "{stages} pipeline stages cannot be assigned to {} dependency-safe decoder units; reduce pipeline_parallel_size",
+            units.len()
+        )));
+    }
+
+    // Minimize the largest stage by dynamic programming over legal units.
+    // This handles a large dependency group better than a local greedy cut.
+    let count = units.len();
+    let mut prefix = vec![0usize; count + 1];
+    for (index, unit) in units.iter().enumerate() {
+        prefix[index + 1] = prefix[index] + unit.len();
+    }
+    let mut cost = vec![vec![usize::MAX; count + 1]; stages + 1];
+    let mut split = vec![vec![0usize; count + 1]; stages + 1];
+    cost[0][0] = 0;
+    for groups in 1..=stages {
+        for end in groups..=count {
+            for previous in groups - 1..end {
+                let candidate = cost[groups - 1][previous].max(prefix[end] - prefix[previous]);
+                if candidate < cost[groups][end] {
+                    cost[groups][end] = candidate;
+                    split[groups][end] = previous;
+                }
+            }
+        }
+    }
+    let mut cuts = vec![count];
+    let mut end = count;
+    for groups in (1..=stages).rev() {
+        end = split[groups][end];
+        cuts.push(end);
+    }
+    cuts.reverse();
+    let ranges = cuts
+        .windows(2)
+        .map(|cut| units[cut[0]].start..units[cut[1] - 1].end)
+        .collect();
+    Ok(ranges)
+}
+
+fn gemma_pipeline_ranges(
+    args: &gemma4::ModelArgs,
+    stages: usize,
+) -> Result<Vec<Range<usize>>, Error> {
+    let layers = args.layer_schedule.len();
+    let mut can_split_after = vec![true; layers.saturating_sub(1)];
+    let mut publishers = HashMap::new();
+    for (layer, policy) in args.layer_schedule.iter().copied().enumerate() {
+        match policy.key_value {
+            gemma4::KeyValuePolicy::Publish { .. } => {
+                publishers.insert(policy.attention, layer);
+            }
+            gemma4::KeyValuePolicy::Shared => {
+                let publisher = publishers.get(&policy.attention).copied().ok_or_else(|| {
+                    Error::Parallel(format!(
+                        "Gemma layer {layer} consumes {:?} shared KV before any publisher",
+                        policy.attention
+                    ))
+                })?;
+                for boundary in can_split_after.iter_mut().take(layer).skip(publisher) {
+                    *boundary = false;
+                }
+            }
+            gemma4::KeyValuePolicy::Local { .. } => {}
+        }
+    }
+    dependency_safe_layer_ranges(layers, stages, &can_split_after)
+}
+
 fn base_info(
     topology: ParallelTopology,
     range: Range<usize>,
@@ -875,6 +2654,7 @@ fn base_info(
     }
 }
 
+#[cfg(test)]
 fn owns_embedding_weight(info: &PipelineStageInfo, tied: bool) -> bool {
     info.is_first || (tied && info.is_last)
 }
@@ -883,6 +2663,7 @@ fn validate_stage_input(
     info: &PipelineStageInfo,
     input: &PipelineStageInput<'_>,
     step: PipelineStep,
+    auxiliary_shapes: &[Vec<i32>],
 ) -> Result<(), Error> {
     match (info.is_first, input) {
         (true, PipelineStageInput::Tokens(tokens)) => {
@@ -895,8 +2676,33 @@ fn validate_stage_input(
                 )));
             }
         }
-        (false, PipelineStageInput::Hidden(hidden)) => {
-            validate_hidden_metadata(info, hidden.shape(), hidden.dtype(), step)?;
+        (false, PipelineStageInput::Hidden(payload)) => {
+            validate_hidden_metadata(info, payload.hidden.shape(), payload.hidden.dtype(), step)?;
+            if payload.auxiliary.tensors().len() != auxiliary_shapes.len() {
+                return Err(Error::Parallel(format!(
+                    "pipeline stage {} expected {} auxiliary tensors, got {}",
+                    info.pipeline_stage,
+                    auxiliary_shapes.len(),
+                    payload.auxiliary.tensors().len()
+                )));
+            }
+            for (index, (value, expected)) in payload
+                .auxiliary
+                .tensors()
+                .iter()
+                .zip(auxiliary_shapes)
+                .enumerate()
+            {
+                if value.shape() != expected || value.dtype() != info.activation_dtype {
+                    return Err(Error::Parallel(format!(
+                        "pipeline stage {} auxiliary tensor {index} has shape {:?} and {:?}, expected {expected:?} and {:?}",
+                        info.pipeline_stage,
+                        value.shape(),
+                        value.dtype(),
+                        info.activation_dtype
+                    )));
+                }
+            }
         }
         (true, PipelineStageInput::Hidden(_)) => {
             return Err(Error::Parallel(
@@ -935,47 +2741,8 @@ fn validate_hidden_metadata(
     Ok(())
 }
 
-fn full_parameter_names(module: &impl ModuleParameters, prefix: &str) -> Vec<String> {
-    module
-        .parameters()
-        .flatten()
-        .keys()
-        .map(|name| {
-            if prefix.is_empty() {
-                name.to_string()
-            } else {
-                format!("{prefix}.{name}")
-            }
-        })
-        .collect()
-}
-
 fn checkpoint_name(parameter_name: &str) -> String {
     crate::runtime::checkpoint::binding::canonical_checkpoint_name(parameter_name)
-}
-
-fn infer_activation_dtype(partition: &RankPartition) -> Dtype {
-    partition
-        .tensors()
-        .map(|(_, value)| value)
-        .find(|value| value.ndim() >= 2 && value.dtype().is_float())
-        .map_or(Dtype::Float32, Array::dtype)
-}
-
-fn insert_module_plan(
-    plan: &mut PlacementPlan,
-    module: &impl ModuleParameters,
-    prefix: &str,
-    local: bool,
-) {
-    let placement = if local {
-        TensorPlacement::Local
-    } else {
-        TensorPlacement::Omit
-    };
-    for parameter in full_parameter_names(module, prefix) {
-        plan.insert(parameter, placement.clone());
-    }
 }
 
 pub(crate) fn assign_module(
@@ -1089,25 +2856,152 @@ where
     }
 }
 
-fn load_partition(
+fn load_bound_module(
+    module: &mut impl ModuleParameters,
     store: &dyn WeightStore,
-    plan: &PlacementPlan,
+    bindings: &[crate::runtime::residency::manager::WeightBinding],
+    quantize_on_load: Option<WeightQuantization>,
     weights_stream: &Stream,
     stream: &Stream,
-    config: &StrictLoadConfig,
-) -> Result<RankPartition, Error> {
-    load_partition_from_store_on_streams(store, plan, weights_stream, stream, config)
+) -> Result<(u64, Vec<String>, Option<Dtype>), Error> {
+    let arrays = materialize_module_bindings(store, bindings, weights_stream, stream)?;
+    let dtype = arrays
+        .values()
+        .find(|value| value.dtype().is_float())
+        .map(Array::dtype);
+    if let Some(quantization) = quantize_on_load {
+        populate_module_from_dense_arrays_quantized(module, &arrays, quantization, stream)?;
+    } else {
+        populate_module_from_arrays_excluding(module, &arrays, |_| false)?;
+    }
+    let bytes = module
+        .parameters()
+        .flatten()
+        .values()
+        .try_fold(0u64, |total, value| {
+            total
+                .checked_add(value.nbytes() as u64)
+                .ok_or_else(|| Error::Parallel("pipeline module byte total overflowed".into()))
+        })?;
+    let mut names = bindings
+        .iter()
+        .flat_map(|binding| binding.checkpoint_keys())
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+    names.sort();
+    names.dedup();
+    Ok((bytes, names, dtype))
 }
 
-fn pipeline_load_config(
-    dense_stream: Option<crate::runtime::residency::dense_stream::DenseDiskStreamLoadOptions>,
-    config: StrictLoadConfig,
-) -> StrictLoadConfig {
-    if dense_stream.is_some_and(|options| !options.strict_loading) {
-        config.allow_all_unused()
-    } else {
-        config
+/// Shared accounting and materialization for pipeline-owned modules.
+///
+/// Architecture adapters remain the sole source of checkpoint bindings. The
+/// pipeline only selects the static unit it owns and records the result.
+struct PipelineLoadAccumulator {
+    family: &'static str,
+    bytes: u64,
+    activation_dtype: Option<Dtype>,
+    owned_tensors: Vec<String>,
+}
+
+impl PipelineLoadAccumulator {
+    fn new(family: &'static str) -> Self {
+        Self {
+            family,
+            bytes: 0,
+            activation_dtype: None,
+            owned_tensors: Vec::new(),
+        }
     }
+
+    fn load<M: ModuleParameters>(
+        &mut self,
+        module: &mut M,
+        store: &dyn WeightStore,
+        bindings: &[crate::runtime::residency::manager::WeightBinding],
+        quantize_on_load: Option<WeightQuantization>,
+        weights_stream: &Stream,
+        stream: &Stream,
+    ) -> Result<(), Error> {
+        let (bytes, names, dtype) = load_bound_module(
+            module,
+            store,
+            bindings,
+            quantize_on_load,
+            weights_stream,
+            stream,
+        )?;
+        self.bytes = self.bytes.checked_add(bytes).ok_or_else(|| {
+            Error::Parallel(format!("{} pipeline byte total overflowed", self.family))
+        })?;
+        self.activation_dtype = self.activation_dtype.or(dtype);
+        self.owned_tensors.extend(names);
+        Ok(())
+    }
+
+    fn finish(self, info: &mut PipelineStageInfo) -> Result<u64, Error> {
+        self.finish_with_default(info, Dtype::Float32)
+    }
+
+    fn finish_with_default(
+        mut self,
+        info: &mut PipelineStageInfo,
+        default_dtype: Dtype,
+    ) -> Result<u64, Error> {
+        info.activation_dtype = self.activation_dtype.unwrap_or(default_dtype);
+        info.local_parameter_bytes = usize::try_from(self.bytes).map_err(|_| {
+            Error::Parallel(format!(
+                "{} pipeline parameter bytes exceed usize",
+                self.family
+            ))
+        })?;
+        self.owned_tensors.sort();
+        self.owned_tensors.dedup();
+        info.owned_tensors = self.owned_tensors;
+        Ok(self.bytes)
+    }
+}
+
+fn pipeline_static_bindings<'a>(
+    units: &'a [StaticUnitBindings],
+    role: &str,
+) -> Result<&'a [crate::runtime::residency::manager::WeightBinding], Error> {
+    let suffix = format!(".static.{role}");
+    units
+        .iter()
+        .find(|unit| unit.id().as_str().ends_with(&suffix))
+        .map(StaticUnitBindings::bindings)
+        .ok_or_else(|| {
+            Error::Parallel(format!(
+                "pipeline architecture adapter did not declare static role {role:?}"
+            ))
+        })
+}
+
+fn selected_pipeline_static_roles(
+    roles: impl IntoIterator<Item = (&'static str, bool)>,
+) -> Vec<&'static str> {
+    roles
+        .into_iter()
+        .filter_map(|(role, selected)| selected.then_some(role))
+        .collect()
+}
+
+/// Selects rank-owned static bindings from the architecture adapter.
+///
+/// Exact whole-artifact admission is performed once by the shared structural
+/// plan before dispatch. This function deliberately selects only stage-owned
+/// static modules and never reconstructs a second namespace validator.
+fn pipeline_binding_units<A: ArchitectureAdapter>(
+    adapter: &A,
+    store: &dyn WeightStore,
+    roles: &[&str],
+) -> Result<Vec<StaticUnitBindings>, Error> {
+    adapter.selected_static_units(store, &|id| {
+        roles
+            .iter()
+            .any(|role| id.ends_with(&format!(".static.{role}")))
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1210,7 +3104,7 @@ where
     .with_eviction_policy(options.eviction_policy);
     let plan = OffloadPlan::new(config, specs)?;
     let residency = ResidencyManager::new_shared(
-        store,
+        Arc::clone(&store),
         plan,
         definitions,
         weights_stream.clone(),
@@ -1226,6 +3120,7 @@ where
         [("pipeline_stage".to_string(), units.clone())],
     )?;
     Ok(PipelineDenseLayers {
+        store,
         residency,
         controller,
         units,
@@ -1285,8 +3180,17 @@ pub fn load_pipeline_model_with_options(
         let checkpoint = GgufCheckpoint::open(model_dir)?;
         let metadata = crate::runtime::checkpoint::load::gguf_metadata(&checkpoint);
         let architecture = pipeline_gguf_architecture(&metadata)?;
-        crate::api::structural::validate_gguf(architecture, &checkpoint, &metadata, options)
-            .into_loader_result()?;
+        let mut structural_options = options;
+        // The explicit pipeline loader has already validated its topology;
+        // complete-model structural policy must not reject the PP coordinate.
+        structural_options.parallel = None;
+        crate::api::structural::validate_gguf(
+            architecture,
+            &checkpoint,
+            &metadata,
+            structural_options,
+        )
+        .into_loader_result()?;
         return match architecture {
             crate::api::GgufArchitecture::Llama | crate::api::GgufArchitecture::Mistral => {
                 let prepared = llama::prepare_llama_gguf_checkpoint(
@@ -1336,8 +3240,191 @@ pub fn load_pipeline_model_with_options(
                     weights_stream,
                 )
             }
+            crate::api::GgufArchitecture::Gemma4 => {
+                let prepared =
+                    gemma4::prepare_gemma4_gguf_checkpoint(&checkpoint, &metadata, None)?;
+                let store: SharedWeightStore = Arc::new(
+                    GgufWeightStore::new_with_max_mapped_shards(
+                        checkpoint,
+                        gemma4::translate_gguf_weight_name,
+                        max_mapped_shards,
+                    )?,
+                );
+                load_gemma_pipeline(
+                    prepared.args,
+                    store,
+                    topology,
+                    options.quantization,
+                    dense_stream,
+                    stream,
+                    weights_stream,
+                )
+            }
+            architecture @ (crate::api::GgufArchitecture::Qwen2
+            | crate::api::GgufArchitecture::Qwen3
+            | crate::api::GgufArchitecture::Qwen3Moe) => {
+                let architecture_name = architecture.metadata_name();
+                let is_moe = architecture == crate::api::GgufArchitecture::Qwen3Moe;
+                let (args, _) = dense_qwen::prepare_gguf_checkpoint(
+                    &checkpoint,
+                    &metadata,
+                    architecture_name,
+                    is_moe,
+                )?;
+                let store: SharedWeightStore = Arc::new(
+                    GgufWeightStore::new_with_max_mapped_shards(
+                        checkpoint,
+                        move |name| dense_qwen::translate_gguf_weight_name(name, is_moe),
+                        max_mapped_shards,
+                    )?,
+                );
+                load_dense_qwen_pipeline(
+                    args,
+                    store,
+                    topology,
+                    options.quantization,
+                    dense_stream,
+                    stream,
+                    weights_stream,
+                )
+            }
+            crate::api::GgufArchitecture::GptOss => {
+                let prepared =
+                    gpt_oss::prepare_gguf_checkpoint(&checkpoint, &metadata, weights_stream)?;
+                let store: SharedWeightStore = Arc::new(
+                    GgufWeightStore::new_with_max_mapped_shards(
+                        checkpoint,
+                        gpt_oss::translate_gguf_weight_name,
+                        max_mapped_shards,
+                    )?,
+                );
+                load_gpt_oss_pipeline(
+                    prepared.args,
+                    store,
+                    topology,
+                    options.quantization,
+                    dense_stream,
+                    stream,
+                    weights_stream,
+                )
+            }
+            architecture @ (crate::api::GgufArchitecture::Lfm2
+            | crate::api::GgufArchitecture::Lfm2Moe) => {
+                let prepared = lfm2::prepare_gguf_checkpoint(&checkpoint, &metadata, weights_stream)?;
+                let is_moe = architecture == crate::api::GgufArchitecture::Lfm2Moe;
+                let store: SharedWeightStore = Arc::new(
+                    GgufWeightStore::new_with_max_mapped_shards(
+                        checkpoint,
+                        move |name| lfm2::translate_gguf_weight_name(name, is_moe),
+                        max_mapped_shards,
+                    )?,
+                );
+                load_lfm2_pipeline(
+                    prepared.args,
+                    store,
+                    topology,
+                    options.quantization,
+                    dense_stream,
+                    stream,
+                    weights_stream,
+                )
+            }
+            architecture @ (crate::api::GgufArchitecture::NemotronH
+            | crate::api::GgufArchitecture::NemotronHMoe) => {
+                let prepared = nemotron_h::prepare_nemotron_h_gguf_checkpoint(
+                    &checkpoint,
+                    &metadata,
+                    weights_stream,
+                )?;
+                let store: SharedWeightStore = Arc::new(
+                    GgufWeightStore::new_with_max_mapped_shards(
+                        checkpoint,
+                        nemotron_h::translate_gguf_weight_name,
+                        max_mapped_shards,
+                    )?,
+                );
+                let _ = architecture;
+                load_nemotron_h_pipeline(
+                    prepared.args,
+                    store,
+                    topology,
+                    options.quantization,
+                    dense_stream,
+                    stream,
+                    weights_stream,
+                )
+            }
+            crate::api::GgufArchitecture::Qwen35
+            | crate::api::GgufArchitecture::Qwen35Moe
+            | crate::api::GgufArchitecture::Qwen3Next => {
+                let prepared = qwen_hybrid::prepare_qwen35_gguf_checkpoint(
+                    &checkpoint,
+                    &metadata,
+                    weights_stream,
+                )?;
+                let store: SharedWeightStore = Arc::new(
+                    GgufWeightStore::new_with_max_mapped_shards(
+                        checkpoint,
+                        qwen_hybrid::qwen35_translate_gguf_weight_name,
+                        max_mapped_shards,
+                    )?,
+                );
+                load_qwen_hybrid_pipeline(
+                    prepared.args,
+                    store,
+                    topology,
+                    options.quantization,
+                    dense_stream,
+                    stream,
+                    weights_stream,
+                )
+            }
+            crate::api::GgufArchitecture::KimiLinear => {
+                let prepared = kimi_linear::prepare_gguf_checkpoint(
+                    &checkpoint,
+                    &metadata,
+                    options.quantization,
+                    weights_stream,
+                )?;
+                let store: SharedWeightStore = Arc::new(
+                    GgufWeightStore::new_with_max_mapped_shards(
+                        checkpoint,
+                        kimi_linear::translate_gguf_weight_name,
+                        max_mapped_shards,
+                    )?,
+                );
+                load_kimi_linear_pipeline(
+                    prepared.args,
+                    store,
+                    topology,
+                    options.quantization,
+                    dense_stream,
+                    stream,
+                    weights_stream,
+                )
+            }
+            crate::api::GgufArchitecture::Inkling => {
+                let prepared =
+                    inkling::prepare_gguf_checkpoint_with_mmproj(&checkpoint, &metadata, None)?;
+                let store: SharedWeightStore = Arc::new(
+                    GgufWeightStore::new_with_max_mapped_shards(
+                        checkpoint,
+                        inkling::translate_gguf_weight_name,
+                        max_mapped_shards,
+                    )?,
+                );
+                load_inkling_pipeline(
+                    prepared.args,
+                    store,
+                    topology,
+                    options.quantization,
+                    dense_stream,
+                    stream,
+                    weights_stream,
+                )
+            }
             architecture => Err(Error::UnsupportedArchitecture(format!(
-                "pipeline execution supports Llama-compatible and DeepSeek-V3/R1 text models, not GGUF architecture {}",
+                "pipeline execution supports Llama-compatible, DeepSeek-V3/R1, Gemma 4 text, Qwen2/Qwen3/Qwen3-MoE, GPT-OSS, LFM2/LFM2-MoE, Nemotron-H, Kimi Linear, Qwen3-Next/Qwen3.5 text, and Inkling text models, not GGUF architecture {}",
                 architecture.metadata_name()
             ))),
         };
@@ -1347,26 +3434,207 @@ pub fn load_pipeline_model_with_options(
         serde_json::from_reader(std::fs::File::open(model_dir.join("config.json"))?)?;
     let store = open_safetensors_weight_store(model_dir, max_mapped_shards)?;
     match config.get("model_type").and_then(serde_json::Value::as_str) {
-        Some("llama" | "mistral") => load_llama_pipeline(
-            llama::get_llama_model_args(model_dir)?,
-            store,
-            topology,
-            options.quantization,
-            dense_stream,
-            stream,
-            weights_stream,
-        ),
-        Some("deepseek_v3") => load_deepseek_pipeline(
-            deepseek_v3::get_model_args(model_dir)?,
-            store,
-            topology,
-            options.quantization,
-            dense_stream,
-            stream,
-            weights_stream,
-        ),
+        Some("llama" | "mistral") => {
+            crate::api::structural::validate_safetensors_load_path(
+                ModelKind::Llama,
+                model_dir,
+                options,
+            )?;
+            load_llama_pipeline(
+                llama::get_llama_model_args(model_dir)?,
+                store,
+                topology,
+                options.quantization,
+                dense_stream,
+                stream,
+                weights_stream,
+            )
+        }
+        Some("deepseek_v3") => {
+            crate::api::structural::validate_safetensors_load_path(
+                ModelKind::DeepSeekV3,
+                model_dir,
+                options,
+            )?;
+            load_deepseek_pipeline(
+                deepseek_v3::get_model_args(model_dir)?,
+                store,
+                topology,
+                options.quantization,
+                dense_stream,
+                stream,
+                weights_stream,
+            )
+        }
+        Some("gemma4" | "gemma4_text" | "gemma4_unified" | "gemma4_unified_text") => {
+            crate::api::structural::validate_safetensors_load_path(
+                ModelKind::Gemma4,
+                model_dir,
+                options,
+            )?;
+            let (args, _, _, _, _, _) = gemma4::get_gemma4_model_config(model_dir)?;
+            load_gemma_pipeline(
+                args,
+                store,
+                topology,
+                options.quantization,
+                dense_stream,
+                stream,
+                weights_stream,
+            )
+        }
+        Some("qwen2" | "qwen3" | "qwen3_moe") => {
+            let args = dense_qwen::load_config(model_dir)?;
+            crate::api::structural::validate_safetensors_load_path(
+                args.model_kind(),
+                model_dir,
+                options,
+            )?;
+            load_dense_qwen_pipeline(
+                args,
+                store,
+                topology,
+                options.quantization,
+                dense_stream,
+                stream,
+                weights_stream,
+            )
+        }
+        Some("gpt_oss") => {
+            crate::api::structural::validate_safetensors_load_path(
+                ModelKind::GptOss,
+                model_dir,
+                options,
+            )?;
+            load_gpt_oss_pipeline(
+                gpt_oss::get_model_args(model_dir)?,
+                store,
+                topology,
+                options.quantization,
+                dense_stream,
+                stream,
+                weights_stream,
+            )
+        }
+        Some("lfm2" | "lfm2_moe") => {
+            crate::api::structural::validate_safetensors_load_path(
+                ModelKind::Lfm2,
+                model_dir,
+                options,
+            )?;
+            load_lfm2_pipeline(
+                lfm2::get_model_args(model_dir)?,
+                store,
+                topology,
+                options.quantization,
+                dense_stream,
+                stream,
+                weights_stream,
+            )
+        }
+        Some("nemotron_h") => {
+            crate::api::structural::validate_safetensors_load_path(
+                ModelKind::NemotronH,
+                model_dir,
+                options,
+            )?;
+            load_nemotron_h_pipeline(
+                nemotron_h::get_nemotron_h_model_args(model_dir)?,
+                store,
+                topology,
+                options.quantization,
+                dense_stream,
+                stream,
+                weights_stream,
+            )
+        }
+        Some("qwen3_next") => {
+            crate::api::structural::validate_safetensors_load_path(
+                ModelKind::Qwen3Next,
+                model_dir,
+                options,
+            )?;
+            load_qwen_hybrid_pipeline(
+                crate::architectures::qwen::hybrid::qwen3_next::get_qwen3_next_model_args(
+                    model_dir,
+                )?,
+                store,
+                topology,
+                options.quantization,
+                dense_stream,
+                stream,
+                weights_stream,
+            )
+        }
+        Some("qwen3_5" | "qwen3_5_text" | "qwen3_5_moe" | "qwen3_5_moe_text") => {
+            crate::api::structural::validate_safetensors_load_path(
+                ModelKind::Qwen35,
+                model_dir,
+                options,
+            )?;
+            let (args, image_token, video_token, vision) =
+                qwen_hybrid::get_qwen3_5_model_args(model_dir)?;
+            if image_token.is_some() || video_token.is_some() || vision.is_some() {
+                return Err(Error::UnsupportedArchitecture(
+                    "Qwen3.5 pipeline execution accepts text-only checkpoints; multimodal ingress must be folded before the decoder pipeline"
+                        .into(),
+                ));
+            }
+            load_qwen_hybrid_pipeline(
+                args,
+                store,
+                topology,
+                options.quantization,
+                dense_stream,
+                stream,
+                weights_stream,
+            )
+        }
+        Some("kimi_linear") => {
+            crate::api::structural::validate_safetensors_load_path(
+                ModelKind::KimiLinear,
+                model_dir,
+                options,
+            )?;
+            load_kimi_linear_pipeline(
+                kimi_linear::get_model_args(model_dir)?,
+                store,
+                topology,
+                options.quantization,
+                dense_stream,
+                stream,
+                weights_stream,
+            )
+        }
+        Some("inkling_mm_model") => {
+            crate::api::structural::validate_safetensors_load_path(
+                ModelKind::Inkling,
+                model_dir,
+                options,
+            )?;
+            let args = inkling::get_model_args(model_dir)?;
+            if args.audio_config.is_some() || args.vision_config.is_some() {
+                return Err(Error::UnsupportedArchitecture(
+                    "Inkling pipeline execution accepts text-only checkpoints; image/audio ingress must be folded before the decoder pipeline"
+                        .into(),
+                ));
+            }
+            load_inkling_pipeline(
+                args,
+                store,
+                topology,
+                options.quantization,
+                dense_stream,
+                stream,
+                weights_stream,
+            )
+        }
+        Some("personaplex") => Err(Error::UnsupportedArchitecture(
+            "PersonaPlex/Moshi is a realtime multi-stream temporal/depth model, not a single-hidden-stream decoder pipeline; use RealtimeInferenceScheduler"
+                .into(),
+        )),
         Some(model_type) => Err(Error::UnsupportedArchitecture(format!(
-            "pipeline execution supports Llama-compatible and DeepSeek-V3/R1 text models, not {model_type}"
+            "pipeline execution supports Llama-compatible, DeepSeek-V3/R1, Gemma 4 text, Qwen2/Qwen3/Qwen3-MoE, GPT-OSS, LFM2/LFM2-MoE, Nemotron-H, Kimi Linear, Qwen3-Next/Qwen3.5 text, and Inkling text models, not {model_type}"
         ))),
         None => Err(Error::UnsupportedArchitecture(
             "pipeline model config is missing model_type".into(),
@@ -1431,68 +3699,81 @@ fn load_llama_pipeline(
         ModelKind::Llama,
         source_args.hidden_size,
     );
-    let mut plan = PlacementPlan::new(topology);
-    let last_stage = topology.pipeline_parallel_size - 1;
-
-    let embedding = linear::unloaded_maybe_quantized_embedding(
-        source_args.vocab_size,
-        source_args.hidden_size,
-        source_args.affine_quantization_for("model.embed_tokens.weight"),
+    let mut stage = LlamaStage::new(target_args.clone(), range, &info, stream)?;
+    let binding_adapter = crate::architectures::llama::layerwise::LlamaLayerwiseAdapter::new(
+        source_args.clone(),
         stream,
     )?;
-    insert_module_plan(
-        &mut plan,
-        &embedding,
-        "model.embed_tokens",
-        owns_embedding_weight(&info, source_args.tie_word_embeddings),
-    );
-    for global_layer in 0..source_args.attention_schedule.len() {
-        let layer =
-            llama::TransformerBlock::new_for_layer(&source_args, global_layer as i32, stream)?;
-        insert_module_plan(
-            &mut plan,
-            &layer,
-            &format!("model.layers.{global_layer}"),
-            range.contains(&global_layer) && dense_stream.is_none(),
-        );
-    }
-    let norm = nn::RmsNorm::unloaded(
-        source_args.hidden_size,
-        source_args.rms_norm_eps,
-        Dtype::Float32,
-        stream,
+    let static_units = pipeline_binding_units(
+        &binding_adapter,
+        store.as_ref(),
+        &selected_pipeline_static_roles([
+            (
+                "embedding",
+                stage.embedding.is_some() || stage.output_embedding.is_some(),
+            ),
+            ("norm", stage.norm.is_some()),
+            ("output", stage.lm_head.is_some()),
+        ]),
     )?;
-    insert_module_plan(&mut plan, &norm, "model.norm", info.is_last);
-    if !source_args.tie_word_embeddings {
-        let head = linear::build_unloaded_maybe_quantized_lm_head_with_quantization(
-            source_args.hidden_size,
-            source_args.vocab_size,
-            source_args.affine_quantization_for("lm_head.weight"),
+    let mut loaded = PipelineLoadAccumulator::new("Llama");
+    if let Some(module) = &mut stage.embedding {
+        loaded.load(
+            module,
+            store.as_ref(),
+            pipeline_static_bindings(&static_units, "embedding")?,
+            quantize_on_load,
+            weights_stream,
             stream,
         )?;
-        insert_module_plan(&mut plan, &head, "lm_head", info.is_last);
     }
-    let strict = pipeline_load_config(dense_stream, StrictLoadConfig::default());
-    let partition = load_partition(store.as_ref(), &plan, weights_stream, stream, &strict)?;
-    info.activation_dtype = infer_activation_dtype(&partition);
-    info.local_parameter_bytes = partition.tensors().map(|(_, value)| value.nbytes()).sum();
-    let static_device_bytes = u64::try_from(info.local_parameter_bytes)
-        .map_err(|_| Error::Parallel("pipeline static parameter byte total overflowed".into()))?;
-    info.opened_checkpoint_shards = partition.opened_shards().to_vec();
-    info.owned_tensors = partition
-        .tensors()
-        .map(|(name, _)| checkpoint_name(name))
-        .collect();
-    info.owned_tensors.sort();
-    let mut tensors = partition.into_tensors();
-
-    let mut stage = LlamaStage::new(target_args, range, &info, stream)?;
-    stage.load(
-        &mut tensors,
-        quantize_on_load,
-        dense_stream.is_none(),
-        stream,
-    )?;
+    if let Some(module) = &mut stage.output_embedding {
+        loaded.load(
+            module,
+            store.as_ref(),
+            pipeline_static_bindings(&static_units, "embedding")?,
+            quantize_on_load,
+            weights_stream,
+            stream,
+        )?;
+    }
+    if let Some(module) = &mut stage.norm {
+        loaded.load(
+            module,
+            store.as_ref(),
+            pipeline_static_bindings(&static_units, "norm")?,
+            quantize_on_load,
+            weights_stream,
+            stream,
+        )?;
+    }
+    if let Some(module) = &mut stage.lm_head {
+        loaded.load(
+            module,
+            store.as_ref(),
+            pipeline_static_bindings(&static_units, "output")?,
+            quantize_on_load,
+            weights_stream,
+            stream,
+        )?;
+    }
+    if dense_stream.is_none() {
+        for (global_layer, layer) in stage.range.clone().zip(&mut stage.layers) {
+            let source_layer = binding_adapter.new_layer(0, global_layer, stream)?;
+            let bindings =
+                binding_adapter.layer_bindings(0, global_layer, &source_layer, store.as_ref())?;
+            loaded.load(
+                layer,
+                store.as_ref(),
+                &bindings,
+                quantize_on_load,
+                weights_stream,
+                stream,
+            )?;
+        }
+    }
+    let static_device_bytes = loaded.finish(&mut info)?;
+    let materialized_shards = store.diagnostics()?.touched_shard_paths;
     if let Some(dense_stream) = dense_stream {
         stage.dense_layers = Some(build_pipeline_dense_layers(
             Arc::clone(&store),
@@ -1503,17 +3784,13 @@ fn load_llama_pipeline(
             weights_stream,
             |global_layer, stream| {
                 Ok(llama::TransformerBlock::new_for_layer(
-                    &source_args,
+                    &target_args,
                     global_layer as i32,
                     stream,
                 )?)
             },
             |global_layer, layer, store| {
-                Ok(build_module_bindings(
-                    layer,
-                    &format!("model.layers.{global_layer}"),
-                    store,
-                )?)
+                binding_adapter.layer_bindings(0, global_layer, layer, store)
             },
         )?);
         let report = stage.dense_layers.as_ref().unwrap().report()?;
@@ -1525,20 +3802,8 @@ fn load_llama_pipeline(
     } else {
         info.planned_owned_parameter_bytes = static_device_bytes;
     }
-    if !tensors.is_empty() {
-        let mut unused = tensors.into_keys().collect::<Vec<_>>();
-        unused.sort();
-        return Err(Error::StrictLoadValidation {
-            missing: Vec::new(),
-            unused,
-        });
-    }
-    debug_assert_eq!(last_stage, info.pipeline_stages - 1);
-    Ok(PipelineModel {
-        topology,
-        info,
-        stage: ArchitectureStage::Llama(stage),
-    })
+    info.opened_checkpoint_shards = materialized_shards;
+    PipelineModel::from_adapter(topology, info, PipelineStage(stage))
 }
 
 impl LlamaStage {
@@ -1557,7 +3822,7 @@ impl LlamaStage {
             )
         };
         let embedding = info.is_first.then(make_embedding).transpose()?;
-        let output_embedding = (info.is_last && args.tie_word_embeddings)
+        let output_embedding = (info.is_last && !info.is_first && args.tie_word_embeddings)
             .then(make_embedding)
             .transpose()?;
         let layers = range
@@ -1592,57 +3857,12 @@ impl LlamaStage {
         })
     }
 
-    fn load(
-        &mut self,
-        tensors: &mut HashMap<String, Array>,
-        quantization: Option<WeightQuantization>,
-        load_layers: bool,
-        stream: &Stream,
-    ) -> Result<(), Error> {
-        if let Some(embedding) = &mut self.embedding {
-            assign_module(
-                embedding,
-                "model.embed_tokens",
-                tensors,
-                quantization,
-                stream,
-            )?;
-        }
-        if let Some(embedding) = &mut self.output_embedding {
-            assign_module(
-                embedding,
-                "model.embed_tokens",
-                tensors,
-                quantization,
-                stream,
-            )?;
-        }
-        if load_layers {
-            for (global_layer, layer) in self.range.clone().zip(&mut self.layers) {
-                assign_module(
-                    layer,
-                    &format!("model.layers.{global_layer}"),
-                    tensors,
-                    quantization,
-                    stream,
-                )?;
-            }
-        }
-        if let Some(norm) = &mut self.norm {
-            assign_module(norm, "model.norm", tensors, None, stream)?;
-        }
-        if let Some(head) = &mut self.lm_head {
-            assign_module(head, "lm_head", tensors, quantization, stream)?;
-        }
-        Ok(())
-    }
-
     fn forward(
         &mut self,
         input: PipelineStageInput<'_>,
         step: PipelineStep,
         explicit_mask: Option<&Array>,
-        caches: &mut [PipelineLlamaLayerCache],
+        caches: &mut [PipelineLayerCache],
         stream: &Stream,
     ) -> Result<PipelineStageOutput, Error> {
         if caches.len() != self.layers.len() {
@@ -1663,14 +3883,21 @@ impl LlamaStage {
                     i32::try_from(window.get()).expect("validated Llama attention window fits i32")
                 });
             let (cached_layer, actual) = match cache {
-                PipelineLlamaLayerCache::Standard {
+                PipelineLayerCache::KeyValue {
                     global_layer,
-                    cache,
+                    cache: PipelineKeyValueCache::Standard(cache),
+                    ..
                 } => (*global_layer, cache.max_size()),
-                PipelineLlamaLayerCache::Paged {
+                PipelineLayerCache::KeyValue {
                     global_layer,
-                    cache,
+                    cache: PipelineKeyValueCache::Paged(cache),
+                    ..
                 } => (*global_layer, cache.max_size()),
+                _ => {
+                    return Err(Error::Parallel(format!(
+                        "Llama stage cache is not key/value state at global layer {global_layer}"
+                    )))
+                }
             };
             if cached_layer != global_layer || actual != expected {
                 return Err(Error::Parallel(format!(
@@ -1678,17 +3905,28 @@ impl LlamaStage {
                 )));
             }
         }
-        let mut hidden = match input {
-            PipelineStageInput::Tokens(tokens) => self
-                .embedding
-                .as_mut()
-                .expect("first stage embedding")
-                .forward(tokens, stream)?,
-            PipelineStageInput::Hidden(hidden) => hidden.clone(),
+        let (mut hidden, auxiliary) = match input {
+            PipelineStageInput::Tokens(tokens) => (
+                self.embedding
+                    .as_mut()
+                    .expect("first stage embedding")
+                    .forward(tokens, stream)?,
+                PipelineAuxiliaryState::default(),
+            ),
+            PipelineStageInput::Hidden(payload) => {
+                (payload.hidden.clone(), payload.auxiliary.clone())
+            }
         };
         let offset = caches.first().map_or(0, |cache| match cache {
-            PipelineLlamaLayerCache::Standard { cache, .. } => cache.offset(),
-            PipelineLlamaLayerCache::Paged { cache, .. } => cache.offset(),
+            PipelineLayerCache::KeyValue {
+                cache: PipelineKeyValueCache::Standard(cache),
+                ..
+            } => cache.offset(),
+            PipelineLayerCache::KeyValue {
+                cache: PipelineKeyValueCache::Paged(cache),
+                ..
+            } => cache.offset(),
+            _ => 0,
         });
         let allow_sliding_prefill = explicit_mask.is_none();
         let generated_mask = if explicit_mask.is_some() {
@@ -1699,114 +3937,56 @@ impl LlamaStage {
                 .transpose()?
         };
         let mask = explicit_mask.or(generated_mask.as_ref());
-        let dense_forward = self
-            .dense_layers
-            .as_ref()
-            .map(|dense| {
-                dense
-                    .controller
-                    .forward_guard(step.sequence_length > 1, &dense.residency)
-            })
-            .transpose()?;
-        if let Some(dense_layers) = &self.dense_layers {
-            let dense_guard = dense_layers
-                .controller
-                .group_guard(&dense_layers.residency, "pipeline_stage");
-            for (local_index, (global_layer, cache)) in
-                self.range.clone().zip(caches.iter_mut()).enumerate()
-            {
-                let (_host_lease, lease) =
-                    dense_layers.prepare(local_index, step.sequence_length > 1)?;
-                let mut layer = llama::TransformerBlock::new_for_layer(
-                    &self.args,
+        let args = &self.args;
+        hidden = execute_pipeline_layer_range(
+            PipelineLayerExecution {
+                range: self.range.clone(),
+                resident_layers: &mut self.layers,
+                dense_layers: self.dense_layers.as_ref(),
+                step,
+                caches,
+                hidden,
+                stream,
+            },
+            |global_layer, stream| {
+                Ok(llama::TransformerBlock::new_for_layer(
+                    args,
                     global_layer as i32,
                     stream,
-                )?;
-                populate_module_from_lease(&mut layer, &lease)?;
-                match cache {
-                    PipelineLlamaLayerCache::Standard {
-                        global_layer: cached_layer,
-                        cache,
-                    } if *cached_layer == global_layer => {
-                        hidden = layer.forward(
-                            llama::AttentionInput {
-                                x: &hidden,
-                                mask,
-                                cache: Some(cache),
-                                allow_sliding_prefill,
-                            },
-                            stream,
-                        )?;
-                        eval(std::iter::once(&hidden).chain(cache.retained_arrays()))?;
-                    }
-                    PipelineLlamaLayerCache::Paged {
-                        global_layer: cached_layer,
-                        cache,
-                    } if *cached_layer == global_layer => {
-                        hidden = layer.forward(
-                            llama::AttentionInput {
-                                x: &hidden,
-                                mask,
-                                cache: Some(cache),
-                                allow_sliding_prefill,
-                            },
-                            stream,
-                        )?;
-                        eval(std::iter::once(&hidden).chain(cache.retained_arrays()))?;
-                    }
-                    _ => {
-                        return Err(Error::Parallel(format!(
-                            "Llama stage cache does not match global layer {global_layer}"
-                        )))
-                    }
-                }
-                stream.synchronize()?;
-            }
-            dense_guard.complete()?;
-        } else {
-            for ((global_layer, layer), cache) in self
-                .range
-                .clone()
-                .zip(&mut self.layers)
-                .zip(caches.iter_mut())
-            {
-                match cache {
-                    PipelineLlamaLayerCache::Standard {
-                        global_layer: cached_layer,
-                        cache,
-                    } if *cached_layer == global_layer => {
-                        hidden = layer.forward(
-                            llama::AttentionInput {
-                                x: &hidden,
-                                mask,
-                                cache: Some(cache),
-                                allow_sliding_prefill,
-                            },
-                            stream,
-                        )?;
-                    }
-                    PipelineLlamaLayerCache::Paged {
-                        global_layer: cached_layer,
-                        cache,
-                    } if *cached_layer == global_layer => {
-                        hidden = layer.forward(
-                            llama::AttentionInput {
-                                x: &hidden,
-                                mask,
-                                cache: Some(cache),
-                                allow_sliding_prefill,
-                            },
-                            stream,
-                        )?;
-                    }
-                    _ => {
-                        return Err(Error::Parallel(format!(
-                            "Llama stage cache does not match global layer {global_layer}"
-                        )))
-                    }
-                }
-            }
-        }
+                )?)
+            },
+            |global_layer, layer, hidden, cache, stream| match cache {
+                PipelineLayerCache::KeyValue {
+                    global_layer: cached_layer,
+                    cache: PipelineKeyValueCache::Standard(cache),
+                    ..
+                } if *cached_layer == global_layer => Ok(layer.forward(
+                    llama::AttentionInput {
+                        x: hidden,
+                        mask,
+                        cache: Some(cache),
+                        allow_sliding_prefill,
+                    },
+                    stream,
+                )?),
+                PipelineLayerCache::KeyValue {
+                    global_layer: cached_layer,
+                    cache: PipelineKeyValueCache::Paged(cache),
+                    ..
+                } if *cached_layer == global_layer => Ok(layer.forward(
+                    llama::AttentionInput {
+                        x: hidden,
+                        mask,
+                        cache: Some(cache),
+                        allow_sliding_prefill,
+                    },
+                    stream,
+                )?),
+                _ => Err(Error::Parallel(format!(
+                    "Llama stage cache does not match global layer {global_layer}"
+                ))),
+            },
+        )?;
         let output = if let Some(norm) = &mut self.norm {
             hidden = norm.forward(&hidden, stream)?;
             let logits = if let Some(head) = &mut self.lm_head {
@@ -1816,6 +3996,7 @@ impl LlamaStage {
                     &mut self.lm_head,
                     self.output_embedding
                         .as_mut()
+                        .or(self.embedding.as_mut())
                         .expect("last tied stage output embedding"),
                     &hidden,
                     stream,
@@ -1823,11 +4004,2737 @@ impl LlamaStage {
             };
             PipelineStageOutput::Logits(logits)
         } else {
-            PipelineStageOutput::Hidden(hidden)
+            PipelineStageOutput::Hidden(PipelinePayload { hidden, auxiliary })
         };
-        if let Some(guard) = dense_forward {
-            guard.complete()?;
+        Ok(output)
+    }
+}
+
+fn load_dense_qwen_pipeline(
+    source_args: dense_qwen::DecoderConfig,
+    store: SharedWeightStore,
+    topology: ParallelTopology,
+    requested_quantization: Option<WeightQuantization>,
+    dense_stream: Option<crate::runtime::residency::dense_stream::DenseDiskStreamLoadOptions>,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<PipelineModel, Error> {
+    let quantize_on_load = requested_quantization
+        .map(|requested| {
+            crate::runtime::checkpoint::quantization::should_quantize_on_load(
+                "dense-Qwen pipeline",
+                source_args.weight_quantization(),
+                requested,
+            )
+            .map(|required| required.then_some(requested))
+        })
+        .transpose()?
+        .flatten();
+    if dense_stream.is_some() && quantize_on_load.is_some() {
+        return Err(Error::Quantization(
+            "load-time quantization is unsupported for dense-Qwen pipeline dense disk streaming; use checkpoint-native packed weights"
+                .into(),
+        ));
+    }
+    let mut target_args = source_args.clone();
+    if let Some(quantization) = quantize_on_load {
+        target_args.quantization = Some(quantization);
+        target_args.quantization_config = None;
+        target_args.quantized_weight_configs = None;
+    }
+    let range = topology.layer_range(source_args.attention_schedule.len())?;
+    let mut info = base_info(
+        topology,
+        range.clone(),
+        source_args.model_kind(),
+        source_args.hidden_size,
+    );
+    let mut stage = DenseQwenStage::new(target_args.clone(), range, &info, stream)?;
+    let binding_adapter =
+        dense_qwen::layerwise::DenseQwenLayerwiseAdapter::new(source_args.clone(), stream)?;
+    let static_units = pipeline_binding_units(
+        &binding_adapter,
+        store.as_ref(),
+        &selected_pipeline_static_roles([
+            (
+                "embedding",
+                stage.embedding.is_some() || stage.output_embedding.is_some(),
+            ),
+            ("norm", stage.norm.is_some()),
+            ("output", stage.lm_head.is_some()),
+        ]),
+    )?;
+    let mut loaded = PipelineLoadAccumulator::new("dense-Qwen");
+    if let Some(module) = &mut stage.embedding {
+        loaded.load(
+            module,
+            store.as_ref(),
+            pipeline_static_bindings(&static_units, "embedding")?,
+            quantize_on_load,
+            weights_stream,
+            stream,
+        )?;
+    }
+    if let Some(module) = &mut stage.output_embedding {
+        loaded.load(
+            module,
+            store.as_ref(),
+            pipeline_static_bindings(&static_units, "embedding")?,
+            quantize_on_load,
+            weights_stream,
+            stream,
+        )?;
+    }
+    if let Some(module) = &mut stage.norm {
+        loaded.load(
+            module,
+            store.as_ref(),
+            pipeline_static_bindings(&static_units, "norm")?,
+            quantize_on_load,
+            weights_stream,
+            stream,
+        )?;
+    }
+    if let Some(module) = &mut stage.lm_head {
+        loaded.load(
+            module,
+            store.as_ref(),
+            pipeline_static_bindings(&static_units, "output")?,
+            quantize_on_load,
+            weights_stream,
+            stream,
+        )?;
+    }
+    if dense_stream.is_none() {
+        for (global_layer, layer) in stage.range.clone().zip(&mut stage.layers) {
+            let source_layer = binding_adapter.new_layer(0, global_layer, stream)?;
+            let bindings =
+                binding_adapter.layer_bindings(0, global_layer, &source_layer, store.as_ref())?;
+            loaded.load(
+                layer,
+                store.as_ref(),
+                &bindings,
+                quantize_on_load,
+                weights_stream,
+                stream,
+            )?;
         }
+    }
+    let static_bytes = loaded.finish(&mut info)?;
+    let materialized_shards = store.diagnostics()?.touched_shard_paths;
+    if let Some(options) = dense_stream {
+        stage.dense_layers = Some(build_pipeline_dense_layers(
+            Arc::clone(&store),
+            stage.range.clone(),
+            options,
+            static_bytes,
+            stream,
+            weights_stream,
+            |global_layer, stream| {
+                Ok(dense_qwen::TransformerBlock::new_for_layer(
+                    &target_args,
+                    global_layer as i32,
+                    stream,
+                )?)
+            },
+            |global_layer, layer, store| {
+                binding_adapter.layer_bindings(0, global_layer, layer, store)
+            },
+        )?);
+        let report = stage.dense_layers.as_ref().unwrap().report()?;
+        info.planned_owned_parameter_bytes = static_bytes
+            .checked_add(report.planned_layer_bytes())
+            .ok_or_else(|| {
+                Error::Parallel("dense-Qwen pipeline planned bytes overflowed".into())
+            })?;
+    } else {
+        info.planned_owned_parameter_bytes = static_bytes;
+    }
+    info.opened_checkpoint_shards = materialized_shards;
+    PipelineModel::from_adapter(topology, info, PipelineStage(stage))
+}
+
+impl DenseQwenStage {
+    fn new(
+        args: dense_qwen::DecoderConfig,
+        range: Range<usize>,
+        info: &PipelineStageInfo,
+        stream: &Stream,
+    ) -> Result<Self, Error> {
+        let make_embedding = || {
+            linear::unloaded_maybe_quantized_embedding(
+                args.vocab_size,
+                args.hidden_size,
+                args.weight_quantization_for("model.embed_tokens.weight"),
+                stream,
+            )
+        };
+        let embedding = info.is_first.then(make_embedding).transpose()?;
+        let output_embedding = (info.is_last && !info.is_first && args.tie_word_embeddings)
+            .then(make_embedding)
+            .transpose()?;
+        let layers = range
+            .clone()
+            .map(|layer| dense_qwen::TransformerBlock::new_for_layer(&args, layer as i32, stream))
+            .collect::<Result<Vec<_>, _>>()?;
+        let norm = info
+            .is_last
+            .then(|| {
+                nn::RmsNorm::unloaded(args.hidden_size, args.rms_norm_eps, Dtype::Float32, stream)
+            })
+            .transpose()?;
+        let lm_head = (info.is_last && !args.tie_word_embeddings)
+            .then(|| {
+                linear::build_unloaded_maybe_quantized_lm_head_with_quantization(
+                    args.hidden_size,
+                    args.vocab_size,
+                    args.weight_quantization_for("lm_head.weight"),
+                    stream,
+                )
+            })
+            .transpose()?;
+        Ok(Self {
+            args,
+            range,
+            embedding,
+            output_embedding,
+            layers,
+            dense_layers: None,
+            norm,
+            lm_head,
+        })
+    }
+
+    fn forward(
+        &mut self,
+        input: PipelineStageInput<'_>,
+        step: PipelineStep,
+        explicit_mask: Option<&Array>,
+        caches: &mut [PipelineLayerCache],
+        stream: &Stream,
+    ) -> Result<PipelineStageOutput, Error> {
+        validate_scheduled_pipeline_kv_cache(
+            "dense-Qwen",
+            self.range.clone(),
+            &self.args.attention_schedule,
+            caches,
+        )?;
+        let (mut hidden, auxiliary) = match input {
+            PipelineStageInput::Tokens(tokens) => (
+                self.embedding
+                    .as_mut()
+                    .expect("first dense-Qwen stage embedding")
+                    .forward(tokens, stream)?,
+                PipelineAuxiliaryState::default(),
+            ),
+            PipelineStageInput::Hidden(payload) => {
+                (payload.hidden.clone(), payload.auxiliary.clone())
+            }
+        };
+        let offset = pipeline_kv_offset(caches);
+        let generated_mask = (explicit_mask.is_none() && step.sequence_length > 1)
+            .then(|| create_causal_mask(step.sequence_length, Some(offset), None, None, stream))
+            .transpose()?;
+        let full_mask = explicit_mask.or(generated_mask.as_ref());
+        let args = &self.args;
+        hidden = execute_pipeline_layer_range(
+            PipelineLayerExecution {
+                range: self.range.clone(),
+                resident_layers: &mut self.layers,
+                dense_layers: self.dense_layers.as_ref(),
+                step,
+                caches,
+                hidden,
+                stream,
+            },
+            |global_layer, stream| {
+                Ok(dense_qwen::TransformerBlock::new_for_layer(
+                    args,
+                    global_layer as i32,
+                    stream,
+                )?)
+            },
+            |global_layer, layer, hidden, cache, stream| {
+                let policy = *args
+                    .attention_schedule
+                    .get(global_layer)
+                    .expect("validated dense-Qwen pipeline range");
+                let mask = match explicit_mask {
+                    Some(mask) => Some(mask),
+                    None if policy.window().is_none() => full_mask,
+                    None => None,
+                };
+                match cache {
+                    PipelineLayerCache::KeyValue {
+                        global_layer: cached,
+                        cache: PipelineKeyValueCache::Standard(cache),
+                        ..
+                    } if *cached == global_layer => Ok(layer.forward(
+                        AttentionInput {
+                            x: hidden,
+                            mask,
+                            cache: Some(cache),
+                        },
+                        stream,
+                    )?),
+                    PipelineLayerCache::KeyValue {
+                        global_layer: cached,
+                        cache: PipelineKeyValueCache::Paged(cache),
+                        ..
+                    } if *cached == global_layer => Ok(layer.forward(
+                        AttentionInput {
+                            x: hidden,
+                            mask,
+                            cache: Some(cache),
+                        },
+                        stream,
+                    )?),
+                    _ => Err(Error::Parallel(format!(
+                        "dense-Qwen stage cache does not match global layer {global_layer}"
+                    ))),
+                }
+            },
+        )?;
+        let output = if let Some(norm) = &mut self.norm {
+            hidden = norm.forward(&hidden, stream)?;
+            let logits = if let Some(head) = &mut self.lm_head {
+                head.forward(&hidden, stream)?
+            } else {
+                project_logits_maybe_quantized(
+                    &mut self.lm_head,
+                    self.output_embedding
+                        .as_mut()
+                        .or(self.embedding.as_mut())
+                        .expect("last tied dense-Qwen stage output embedding"),
+                    &hidden,
+                    stream,
+                )?
+            };
+            PipelineStageOutput::Logits(logits)
+        } else {
+            PipelineStageOutput::Hidden(PipelinePayload { hidden, auxiliary })
+        };
+        Ok(output)
+    }
+}
+
+fn load_gpt_oss_pipeline(
+    source_args: gpt_oss::ModelArgs,
+    store: SharedWeightStore,
+    topology: ParallelTopology,
+    requested_quantization: Option<WeightQuantization>,
+    dense_stream: Option<crate::runtime::residency::dense_stream::DenseDiskStreamLoadOptions>,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<PipelineModel, Error> {
+    if requested_quantization.is_some_and(|value| value != WeightQuantization::MxFp4) {
+        return Err(Error::Quantization(
+            "GPT-OSS native MXFP4 experts cannot be implicitly dequantized and requantized to affine"
+                .into(),
+        ));
+    }
+    let quantize_on_load = requested_quantization
+        .map(|requested| {
+            crate::runtime::checkpoint::quantization::should_quantize_on_load(
+                "GPT-OSS pipeline dense matrices",
+                source_args.quantization,
+                requested,
+            )
+            .map(|required| required.then_some(requested))
+        })
+        .transpose()?
+        .flatten();
+    if dense_stream.is_some() && quantize_on_load.is_some() {
+        return Err(Error::Quantization(
+            "load-time quantization is unsupported for GPT-OSS pipeline dense disk streaming; use checkpoint-native packed weights"
+                .into(),
+        ));
+    }
+    let mut target_args = source_args.clone();
+    if let Some(quantization) = quantize_on_load {
+        target_args.quantization = Some(quantization);
+        target_args.quantized_weight_configs = None;
+    }
+    let range = topology.layer_range(source_args.attention_schedule.len())?;
+    let mut info = base_info(
+        topology,
+        range.clone(),
+        ModelKind::GptOss,
+        source_args.hidden_size,
+    );
+    let mut stage = GptOssStage::new(target_args.clone(), range, &info, stream)?;
+    let binding_adapter = crate::architectures::gpt_oss::layerwise::GptOssLayerwiseAdapter::new(
+        source_args.clone(),
+        stream,
+    )?;
+    let static_units = pipeline_binding_units(
+        &binding_adapter,
+        store.as_ref(),
+        &selected_pipeline_static_roles([
+            ("embedding", stage.embedding.is_some()),
+            ("norm", stage.norm.is_some()),
+            ("output", stage.lm_head.is_some()),
+        ]),
+    )?;
+    let mut loaded = PipelineLoadAccumulator::new("GPT-OSS");
+    if let Some(module) = &mut stage.embedding {
+        loaded.load(
+            module,
+            store.as_ref(),
+            pipeline_static_bindings(&static_units, "embedding")?,
+            quantize_on_load,
+            weights_stream,
+            stream,
+        )?;
+    }
+    if let Some(module) = &mut stage.norm {
+        loaded.load(
+            module,
+            store.as_ref(),
+            pipeline_static_bindings(&static_units, "norm")?,
+            quantize_on_load,
+            weights_stream,
+            stream,
+        )?;
+    }
+    if let Some(module) = &mut stage.lm_head {
+        loaded.load(
+            module,
+            store.as_ref(),
+            pipeline_static_bindings(&static_units, "output")?,
+            quantize_on_load,
+            weights_stream,
+            stream,
+        )?;
+    }
+    if dense_stream.is_none() {
+        for (global_layer, layer) in stage.range.clone().zip(&mut stage.layers) {
+            let source_layer = binding_adapter.new_layer(0, global_layer, stream)?;
+            let bindings =
+                binding_adapter.layer_bindings(0, global_layer, &source_layer, store.as_ref())?;
+            loaded.load(
+                layer,
+                store.as_ref(),
+                &bindings,
+                quantize_on_load,
+                weights_stream,
+                stream,
+            )?;
+        }
+    }
+    let static_bytes = loaded.finish(&mut info)?;
+    let materialized_shards = store.diagnostics()?.touched_shard_paths;
+    if let Some(options) = dense_stream {
+        stage.dense_layers = Some(build_pipeline_dense_layers(
+            Arc::clone(&store),
+            stage.range.clone(),
+            options,
+            static_bytes,
+            stream,
+            weights_stream,
+            |global_layer, stream| {
+                Ok(gpt_oss::TransformerBlock::new(
+                    &target_args,
+                    global_layer,
+                    stream,
+                )?)
+            },
+            |global_layer, layer, store| {
+                binding_adapter.layer_bindings(0, global_layer, layer, store)
+            },
+        )?);
+        let report = stage.dense_layers.as_ref().unwrap().report()?;
+        info.planned_owned_parameter_bytes = static_bytes
+            .checked_add(report.planned_layer_bytes())
+            .ok_or_else(|| Error::Parallel("GPT-OSS pipeline planned bytes overflowed".into()))?;
+    } else {
+        info.planned_owned_parameter_bytes = static_bytes;
+    }
+    info.opened_checkpoint_shards = materialized_shards;
+    PipelineModel::from_adapter(topology, info, PipelineStage(stage))
+}
+
+impl GptOssStage {
+    fn new(
+        args: gpt_oss::ModelArgs,
+        range: Range<usize>,
+        info: &PipelineStageInfo,
+        stream: &Stream,
+    ) -> Result<Self, Error> {
+        let embedding = info
+            .is_first
+            .then(|| {
+                linear::unloaded_maybe_quantized_embedding(
+                    args.vocab_size,
+                    args.hidden_size,
+                    args.weight_quantization_for("model.embed_tokens.weight"),
+                    stream,
+                )
+            })
+            .transpose()?;
+        let layers = range
+            .clone()
+            .map(|layer| gpt_oss::TransformerBlock::new(&args, layer, stream))
+            .collect::<Result<Vec<_>, _>>()?;
+        let norm = info
+            .is_last
+            .then(|| {
+                nn::RmsNorm::unloaded(args.hidden_size, args.rms_norm_eps, Dtype::Float32, stream)
+            })
+            .transpose()?;
+        let lm_head = info
+            .is_last
+            .then(|| {
+                linear::unloaded_maybe_quantized_linear(
+                    args.hidden_size,
+                    args.vocab_size,
+                    false,
+                    args.weight_quantization_for("lm_head.weight"),
+                    stream,
+                )
+            })
+            .transpose()?;
+        Ok(Self {
+            args,
+            range,
+            embedding,
+            layers,
+            dense_layers: None,
+            norm,
+            lm_head,
+        })
+    }
+
+    fn forward(
+        &mut self,
+        input: PipelineStageInput<'_>,
+        step: PipelineStep,
+        explicit_mask: Option<&Array>,
+        caches: &mut [PipelineLayerCache],
+        stream: &Stream,
+    ) -> Result<PipelineStageOutput, Error> {
+        validate_scheduled_pipeline_kv_cache(
+            "GPT-OSS",
+            self.range.clone(),
+            &self.args.attention_schedule,
+            caches,
+        )?;
+        let (mut hidden, auxiliary) = match input {
+            PipelineStageInput::Tokens(tokens) => (
+                self.embedding
+                    .as_mut()
+                    .expect("first GPT-OSS stage embedding")
+                    .forward(tokens, stream)?,
+                PipelineAuxiliaryState::default(),
+            ),
+            PipelineStageInput::Hidden(payload) => {
+                (payload.hidden.clone(), payload.auxiliary.clone())
+            }
+        };
+        let args = &self.args;
+        hidden = execute_pipeline_layer_range(
+            PipelineLayerExecution {
+                range: self.range.clone(),
+                resident_layers: &mut self.layers,
+                dense_layers: self.dense_layers.as_ref(),
+                step,
+                caches,
+                hidden,
+                stream,
+            },
+            |global_layer, stream| Ok(gpt_oss::TransformerBlock::new(args, global_layer, stream)?),
+            |global_layer, layer, hidden, cache, stream| {
+                let policy = *args
+                    .attention_schedule
+                    .get(global_layer)
+                    .expect("validated GPT-OSS pipeline range");
+                let offset = match cache {
+                    PipelineLayerCache::KeyValue {
+                        cache: PipelineKeyValueCache::Standard(cache),
+                        ..
+                    } => cache.offset(),
+                    PipelineLayerCache::KeyValue {
+                        cache: PipelineKeyValueCache::Paged(cache),
+                        ..
+                    } => cache.offset(),
+                    _ => 0,
+                };
+                let generated_mask = (explicit_mask.is_none() && step.sequence_length > 1)
+                    .then(|| {
+                        let max_past = policy.window().map(|window| window.get() as i32 - 1);
+                        create_causal_mask(
+                            step.sequence_length,
+                            Some(offset.min(max_past.unwrap_or(offset))),
+                            max_past,
+                            None,
+                            stream,
+                        )
+                    })
+                    .transpose()?;
+                let mask = explicit_mask.or(generated_mask.as_ref());
+                match cache {
+                    PipelineLayerCache::KeyValue {
+                        global_layer: cached,
+                        cache: PipelineKeyValueCache::Standard(cache),
+                        ..
+                    } if *cached == global_layer => Ok(layer.forward(hidden, mask, cache, stream)?),
+                    PipelineLayerCache::KeyValue {
+                        global_layer: cached,
+                        cache: PipelineKeyValueCache::Paged(cache),
+                        ..
+                    } if *cached == global_layer => Ok(layer.forward(hidden, mask, cache, stream)?),
+                    _ => Err(Error::Parallel(format!(
+                        "GPT-OSS stage cache does not match global layer {global_layer}"
+                    ))),
+                }
+            },
+        )?;
+        let output = if let Some(norm) = &mut self.norm {
+            hidden = norm.forward(&hidden, stream)?;
+            PipelineStageOutput::Logits(
+                self.lm_head
+                    .as_mut()
+                    .expect("last GPT-OSS stage head")
+                    .forward(&hidden, stream)?,
+            )
+        } else {
+            PipelineStageOutput::Hidden(PipelinePayload { hidden, auxiliary })
+        };
+        Ok(output)
+    }
+}
+
+fn load_lfm2_pipeline(
+    source_args: lfm2::ModelArgs,
+    store: SharedWeightStore,
+    topology: ParallelTopology,
+    requested_quantization: Option<WeightQuantization>,
+    dense_stream: Option<crate::runtime::residency::dense_stream::DenseDiskStreamLoadOptions>,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<PipelineModel, Error> {
+    let quantize_on_load = requested_quantization
+        .map(|requested| {
+            crate::runtime::checkpoint::quantization::should_quantize_on_load(
+                "LFM2 pipeline",
+                source_args.weight_quantization,
+                requested,
+            )
+            .map(|required| required.then_some(requested))
+        })
+        .transpose()?
+        .flatten();
+    if dense_stream.is_some() && quantize_on_load.is_some() {
+        return Err(Error::Quantization(
+            "load-time quantization is unsupported for LFM2 pipeline dense disk streaming; use checkpoint-native packed weights"
+                .into(),
+        ));
+    }
+    let mut target_args = source_args.clone();
+    if let Some(quantization) = quantize_on_load {
+        target_args.weight_quantization = Some(quantization);
+        target_args.quantized_weight_configs = None;
+    }
+    let range = topology.layer_range(source_args.layer_schedule.len())?;
+    let mut info = base_info(
+        topology,
+        range.clone(),
+        ModelKind::Lfm2,
+        source_args.hidden_size,
+    );
+    let mut stage = Lfm2Stage::new(target_args.clone(), range, &info, stream)?;
+    let binding_adapter = Lfm2LayerwiseAdapter::new(source_args.clone(), stream)?;
+    let static_units = pipeline_binding_units(
+        &binding_adapter,
+        store.as_ref(),
+        &selected_pipeline_static_roles([
+            (
+                "embedding",
+                stage.embedding.is_some() || stage.output_embedding.is_some(),
+            ),
+            ("norm", stage.norm.is_some()),
+            ("output", stage.lm_head.is_some()),
+        ]),
+    )?;
+    let mut loaded = PipelineLoadAccumulator::new("LFM2");
+    if let Some(module) = &mut stage.embedding {
+        loaded.load(
+            module,
+            store.as_ref(),
+            pipeline_static_bindings(&static_units, "embedding")?,
+            quantize_on_load,
+            weights_stream,
+            stream,
+        )?;
+    }
+    if let Some(module) = &mut stage.output_embedding {
+        loaded.load(
+            module,
+            store.as_ref(),
+            pipeline_static_bindings(&static_units, "embedding")?,
+            quantize_on_load,
+            weights_stream,
+            stream,
+        )?;
+    }
+    if let Some(module) = &mut stage.norm {
+        loaded.load(
+            module,
+            store.as_ref(),
+            pipeline_static_bindings(&static_units, "norm")?,
+            quantize_on_load,
+            weights_stream,
+            stream,
+        )?;
+    }
+    if let Some(module) = &mut stage.lm_head {
+        loaded.load(
+            module,
+            store.as_ref(),
+            pipeline_static_bindings(&static_units, "output")?,
+            quantize_on_load,
+            weights_stream,
+            stream,
+        )?;
+    }
+    if dense_stream.is_none() {
+        for (global_layer, layer) in stage.range.clone().zip(&mut stage.layers) {
+            let source_layer = binding_adapter.new_layer(0, global_layer, stream)?;
+            let bindings =
+                binding_adapter.layer_bindings(0, global_layer, &source_layer, store.as_ref())?;
+            loaded.load(
+                layer,
+                store.as_ref(),
+                &bindings,
+                quantize_on_load,
+                weights_stream,
+                stream,
+            )?;
+        }
+    }
+    let static_bytes = loaded.finish(&mut info)?;
+    let materialized_shards = store.diagnostics()?.touched_shard_paths;
+    if let Some(options) = dense_stream {
+        stage.dense_layers = Some(build_pipeline_dense_layers(
+            Arc::clone(&store),
+            stage.range.clone(),
+            options,
+            static_bytes,
+            stream,
+            weights_stream,
+            |global_layer, stream| {
+                lfm2::DecoderLayer::new(&target_args, global_layer as i32, stream)
+            },
+            |global_layer, layer, store| {
+                binding_adapter.layer_bindings(0, global_layer, layer, store)
+            },
+        )?);
+        let report = stage.dense_layers.as_ref().unwrap().report()?;
+        info.planned_owned_parameter_bytes = static_bytes
+            .checked_add(report.planned_layer_bytes())
+            .ok_or_else(|| Error::Parallel("LFM2 pipeline planned bytes overflowed".into()))?;
+    } else {
+        info.planned_owned_parameter_bytes = static_bytes;
+    }
+    info.opened_checkpoint_shards = materialized_shards;
+    PipelineModel::from_adapter(topology, info, PipelineStage(stage))
+}
+
+impl Lfm2Stage {
+    fn new(
+        args: lfm2::ModelArgs,
+        range: Range<usize>,
+        info: &PipelineStageInfo,
+        stream: &Stream,
+    ) -> Result<Self, Error> {
+        let complete = lfm2::Model::new(args.clone(), stream)?;
+        let lfm2::Model { model, lm_head, .. } = complete;
+        let lfm2::Lfm2Model {
+            embed_tokens,
+            layers,
+            embedding_norm,
+        } = model;
+        let mut embedding = None;
+        let mut output_embedding = None;
+        if info.is_first {
+            embedding = Some(embed_tokens);
+        } else if info.is_last && args.tie_word_embeddings {
+            output_embedding = Some(embed_tokens);
+        }
+        let layers = layers
+            .into_iter()
+            .enumerate()
+            .filter_map(|(index, layer)| range.contains(&index).then_some(layer))
+            .collect();
+        Ok(Self {
+            args,
+            range,
+            embedding,
+            output_embedding,
+            layers,
+            dense_layers: None,
+            norm: info.is_last.then_some(embedding_norm),
+            lm_head: info.is_last.then_some(lm_head).flatten(),
+        })
+    }
+
+    fn forward_layer(
+        layer: &mut lfm2::DecoderLayer,
+        global_layer: usize,
+        hidden: &Array,
+        mask: Option<&Array>,
+        cache: &mut PipelineLayerCache,
+        stream: &Stream,
+    ) -> Result<Array, Error> {
+        match (layer.layer_policy.operator, cache) {
+            (
+                lfm2::OperatorPolicy::SelfAttention(_),
+                PipelineLayerCache::KeyValue {
+                    global_layer: cached,
+                    cache,
+                    slots,
+                },
+            ) if *cached == global_layer && slots.is_empty() => {
+                let cache: &mut dyn KeyValueCache = match cache {
+                    PipelineKeyValueCache::Standard(cache) => cache,
+                    PipelineKeyValueCache::Paged(cache) => cache,
+                };
+                layer
+                    .forward_with_operator_cache(
+                        hidden,
+                        mask,
+                        Some(lfm2::OperatorCache::Attention(cache)),
+                        stream,
+                    )
+                    .map_err(Into::into)
+            }
+            (
+                lfm2::OperatorPolicy::CausalConvolution,
+                PipelineLayerCache::StateSlots {
+                    global_layer: cached,
+                    slots,
+                },
+            ) if *cached == global_layer && slots.is_empty() => layer
+                .forward_with_operator_cache(hidden, mask, None, stream)
+                .map_err(Into::into),
+            (
+                lfm2::OperatorPolicy::CausalConvolution,
+                PipelineLayerCache::StateSlots {
+                    global_layer: cached,
+                    slots,
+                },
+            ) if *cached == global_layer
+                && slots.len() == 1
+                && slots[0].policy.role == (StateTensorRole::Convolution { slot: 0 }) =>
+            {
+                let slot = &mut slots[0];
+                let mut local = crate::nn::convolution::CausalConv1dCache {
+                    state: slot.value.take(),
+                    offset: slot.offset,
+                };
+                let output = layer.forward_with_operator_cache(
+                    hidden,
+                    mask,
+                    Some(lfm2::OperatorCache::Convolution(&mut local)),
+                    stream,
+                )?;
+                slot.value = local.state;
+                slot.offset = local.offset;
+                Ok(output)
+            }
+            _ => Err(Error::Parallel(format!(
+                "LFM2 pipeline cache does not match global layer {global_layer}"
+            ))),
+        }
+    }
+
+    fn forward(
+        &mut self,
+        input: PipelineStageInput<'_>,
+        step: PipelineStep,
+        explicit_mask: Option<&Array>,
+        caches: &mut [PipelineLayerCache],
+        stream: &Stream,
+    ) -> Result<PipelineStageOutput, Error> {
+        if caches.len() != self.layers.len() {
+            return Err(Error::Parallel(format!(
+                "LFM2 stage cache has {} entries, expected {}",
+                caches.len(),
+                self.layers.len()
+            )));
+        }
+        let (mut hidden, auxiliary) = match input {
+            PipelineStageInput::Tokens(tokens) => (
+                self.embedding
+                    .as_mut()
+                    .expect("first LFM2 stage embedding")
+                    .forward(tokens, stream)?,
+                PipelineAuxiliaryState::default(),
+            ),
+            PipelineStageInput::Hidden(payload) => {
+                (payload.hidden.clone(), payload.auxiliary.clone())
+            }
+        };
+        let offset = pipeline_state_offset("LFM2", caches)?;
+        let generated_mask = (explicit_mask.is_none() && step.sequence_length > 1)
+            .then(|| create_causal_mask(step.sequence_length, Some(offset), None, None, stream))
+            .transpose()?;
+        let mask = explicit_mask.or(generated_mask.as_ref());
+        let args = &self.args;
+        hidden = execute_pipeline_layer_range(
+            PipelineLayerExecution {
+                range: self.range.clone(),
+                resident_layers: &mut self.layers,
+                dense_layers: self.dense_layers.as_ref(),
+                step,
+                caches,
+                hidden,
+                stream,
+            },
+            |global_layer, stream| lfm2::DecoderLayer::new(args, global_layer as i32, stream),
+            |global_layer, layer, hidden, cache, stream| {
+                Self::forward_layer(layer, global_layer, hidden, mask, cache, stream)
+            },
+        )?;
+        let output = if let Some(norm) = &mut self.norm {
+            hidden = norm.forward(&hidden, stream)?;
+            let logits = if let Some(head) = &mut self.lm_head {
+                head.forward(&hidden, stream)?
+            } else {
+                project_logits_maybe_quantized(
+                    &mut self.lm_head,
+                    self.output_embedding
+                        .as_mut()
+                        .or(self.embedding.as_mut())
+                        .expect("last tied LFM2 stage output embedding"),
+                    &hidden,
+                    stream,
+                )?
+            };
+            PipelineStageOutput::Logits(logits)
+        } else {
+            PipelineStageOutput::Hidden(PipelinePayload { hidden, auxiliary })
+        };
+        Ok(output)
+    }
+}
+
+fn load_nemotron_h_pipeline(
+    source_args: nemotron_h::ModelArgs,
+    store: SharedWeightStore,
+    topology: ParallelTopology,
+    requested_quantization: Option<WeightQuantization>,
+    dense_stream: Option<crate::runtime::residency::dense_stream::DenseDiskStreamLoadOptions>,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<PipelineModel, Error> {
+    let existing = source_args.quantization.map(WeightQuantization::Affine);
+    let quantize_on_load = requested_quantization
+        .map(|requested| {
+            crate::runtime::checkpoint::quantization::should_quantize_on_load(
+                "Nemotron-H pipeline",
+                existing,
+                requested,
+            )
+            .and_then(|required| match (required, requested) {
+                (false, _) => Ok(None),
+                (true, WeightQuantization::Affine(affine)) => Ok(Some(affine)),
+                (true, _) => Err(Error::Quantization(
+                    "Nemotron-H pipeline load-time quantization supports MLX affine weights".into(),
+                )),
+            })
+        })
+        .transpose()?
+        .flatten();
+    if dense_stream.is_some() && quantize_on_load.is_some() {
+        return Err(Error::Quantization(
+            "load-time quantization is unsupported for Nemotron-H pipeline dense disk streaming; use checkpoint-native packed weights"
+                .into(),
+        ));
+    }
+    let mut target_args = source_args.clone();
+    if let Some(affine) = quantize_on_load {
+        target_args.quantization = Some(affine);
+        target_args.quantized_weights = None;
+        target_args.quantized_weight_configs = None;
+    }
+    let range = topology.layer_range(source_args.num_hidden_layers as usize)?;
+    let mut info = base_info(
+        topology,
+        range.clone(),
+        ModelKind::NemotronH,
+        source_args.hidden_size,
+    );
+    let mut stage = NemotronHStage::new(target_args.clone(), range, &info, stream)?;
+    let binding_adapter = NemotronHLayerwiseAdapter::new(source_args.clone(), stream)?;
+    let requested = quantize_on_load.map(WeightQuantization::Affine);
+    let static_units = pipeline_binding_units(
+        &binding_adapter,
+        store.as_ref(),
+        &selected_pipeline_static_roles([
+            (
+                "embedding",
+                stage.embedding.is_some() || stage.output_embedding.is_some(),
+            ),
+            ("norm", stage.norm.is_some()),
+            ("output", stage.lm_head.is_some()),
+        ]),
+    )?;
+    let mut loaded = PipelineLoadAccumulator::new("Nemotron-H");
+    if let Some(module) = &mut stage.embedding {
+        loaded.load(
+            module,
+            store.as_ref(),
+            pipeline_static_bindings(&static_units, "embedding")?,
+            requested,
+            weights_stream,
+            stream,
+        )?;
+    }
+    if let Some(module) = &mut stage.output_embedding {
+        loaded.load(
+            module,
+            store.as_ref(),
+            pipeline_static_bindings(&static_units, "embedding")?,
+            requested,
+            weights_stream,
+            stream,
+        )?;
+    }
+    if let Some(module) = &mut stage.norm {
+        loaded.load(
+            module,
+            store.as_ref(),
+            pipeline_static_bindings(&static_units, "norm")?,
+            requested,
+            weights_stream,
+            stream,
+        )?;
+    }
+    if let Some(module) = &mut stage.lm_head {
+        loaded.load(
+            module,
+            store.as_ref(),
+            pipeline_static_bindings(&static_units, "output")?,
+            requested,
+            weights_stream,
+            stream,
+        )?;
+    }
+    if dense_stream.is_none() {
+        for (global_layer, layer) in stage.range.clone().zip(&mut stage.layers) {
+            let source_layer = binding_adapter.new_layer(0, global_layer, stream)?;
+            let bindings =
+                binding_adapter.layer_bindings(0, global_layer, &source_layer, store.as_ref())?;
+            loaded.load(
+                layer,
+                store.as_ref(),
+                &bindings,
+                requested,
+                weights_stream,
+                stream,
+            )?;
+        }
+    }
+    let static_bytes = loaded.finish(&mut info)?;
+    let materialized_shards = store.diagnostics()?.touched_shard_paths;
+    if let Some(options) = dense_stream {
+        stage.dense_layers = Some(build_pipeline_dense_layers(
+            Arc::clone(&store),
+            stage.range.clone(),
+            options,
+            static_bytes,
+            stream,
+            weights_stream,
+            |global_layer, stream| {
+                nemotron_h::TransformerBlock::new(&target_args, global_layer, stream)
+            },
+            |global_layer, layer, store| {
+                binding_adapter.layer_bindings(0, global_layer, layer, store)
+            },
+        )?);
+        let report = stage.dense_layers.as_ref().unwrap().report()?;
+        info.planned_owned_parameter_bytes = static_bytes
+            .checked_add(report.planned_layer_bytes())
+            .ok_or_else(|| {
+                Error::Parallel("Nemotron-H pipeline planned bytes overflowed".into())
+            })?;
+    } else {
+        info.planned_owned_parameter_bytes = static_bytes;
+    }
+    info.opened_checkpoint_shards = materialized_shards;
+    PipelineModel::from_adapter(topology, info, PipelineStage(stage))
+}
+
+impl NemotronHStage {
+    fn new(
+        args: nemotron_h::ModelArgs,
+        range: Range<usize>,
+        info: &PipelineStageInfo,
+        stream: &Stream,
+    ) -> Result<Self, Error> {
+        let complete = nemotron_h::Model::new(args.clone(), stream)?;
+        let nemotron_h::Model { model, lm_head, .. } = complete;
+        let nemotron_h::NemotronHModel {
+            embeddings,
+            layers,
+            norm_f,
+            ..
+        } = model;
+        let mut embedding = None;
+        let mut output_embedding = None;
+        if info.is_first {
+            embedding = Some(embeddings);
+        } else if info.is_last && args.tie_word_embeddings {
+            output_embedding = Some(embeddings);
+        }
+        let layers = layers
+            .into_iter()
+            .enumerate()
+            .filter_map(|(index, layer)| range.contains(&index).then_some(layer))
+            .collect();
+        Ok(Self {
+            args,
+            range,
+            embedding,
+            output_embedding,
+            layers,
+            dense_layers: None,
+            norm: info.is_last.then_some(norm_f),
+            lm_head: info.is_last.then_some(lm_head).flatten(),
+        })
+    }
+
+    fn forward_layer(
+        layer: &mut nemotron_h::TransformerBlock,
+        global_layer: usize,
+        hidden: &Array,
+        mask: Option<&Array>,
+        cache: &mut PipelineLayerCache,
+        stream: &Stream,
+    ) -> Result<Array, Error> {
+        match (layer.policy, cache) {
+            (
+                nemotron_h::LayerPolicy::SelfAttention(_),
+                PipelineLayerCache::KeyValue {
+                    global_layer: cached,
+                    cache,
+                    slots,
+                },
+            ) if *cached == global_layer && slots.is_empty() => {
+                let cache: &mut dyn KeyValueCache = match cache {
+                    PipelineKeyValueCache::Standard(cache) => cache,
+                    PipelineKeyValueCache::Paged(cache) => cache,
+                };
+                Ok(layer.forward_with_operator_cache(
+                    hidden,
+                    mask,
+                    Some(nemotron_h::OperatorCache::Attention(cache)),
+                    stream,
+                )?)
+            }
+            (
+                nemotron_h::LayerPolicy::Mamba,
+                PipelineLayerCache::StateSlots {
+                    global_layer: cached,
+                    slots,
+                },
+            ) if *cached == global_layer
+                && slots.len() == 2
+                && slots[0].policy.role == (StateTensorRole::Convolution { slot: 0 })
+                && slots[1].policy.role == StateTensorRole::Recurrent =>
+            {
+                let (conv, recurrent) = slots.split_at_mut(1);
+                let mut local = nemotron_h::Mamba2Cache {
+                    conv_state: conv[0].value.take(),
+                    ssm_state: recurrent[0].value.take(),
+                    offset: conv[0].offset,
+                };
+                if recurrent[0].offset != local.offset {
+                    return Err(Error::Parallel(format!(
+                        "Nemotron-H Mamba state offsets disagree at global layer {global_layer}"
+                    )));
+                }
+                let output = layer.forward_with_operator_cache(
+                    hidden,
+                    mask,
+                    Some(nemotron_h::OperatorCache::Mamba(&mut local)),
+                    stream,
+                )?;
+                conv[0].value = local.conv_state;
+                conv[0].offset = local.offset;
+                recurrent[0].value = local.ssm_state;
+                recurrent[0].offset = local.offset;
+                Ok(output)
+            }
+            (
+                nemotron_h::LayerPolicy::DenseMlp | nemotron_h::LayerPolicy::SparseMoe,
+                PipelineLayerCache::StateSlots {
+                    global_layer: cached,
+                    slots,
+                },
+            ) if *cached == global_layer && slots.is_empty() => {
+                Ok(layer.forward_with_operator_cache(hidden, mask, None, stream)?)
+            }
+            _ => Err(Error::Parallel(format!(
+                "Nemotron-H pipeline cache does not match global layer {global_layer}"
+            ))),
+        }
+    }
+
+    fn forward(
+        &mut self,
+        input: PipelineStageInput<'_>,
+        step: PipelineStep,
+        explicit_mask: Option<&Array>,
+        caches: &mut [PipelineLayerCache],
+        stream: &Stream,
+    ) -> Result<PipelineStageOutput, Error> {
+        if caches.len() != self.layers.len() {
+            return Err(Error::Parallel(format!(
+                "Nemotron-H stage cache has {} entries, expected {}",
+                caches.len(),
+                self.layers.len()
+            )));
+        }
+        let (mut hidden, auxiliary) = match input {
+            PipelineStageInput::Tokens(tokens) => (
+                self.embedding
+                    .as_mut()
+                    .expect("first Nemotron-H stage embedding")
+                    .forward(tokens, stream)?,
+                PipelineAuxiliaryState::default(),
+            ),
+            PipelineStageInput::Hidden(payload) => {
+                (payload.hidden.clone(), payload.auxiliary.clone())
+            }
+        };
+        let offset = pipeline_state_offset("Nemotron-H", caches)?;
+        let generated_mask = (explicit_mask.is_none() && step.sequence_length > 1)
+            .then(|| create_causal_mask(step.sequence_length, Some(offset), None, None, stream))
+            .transpose()?;
+        let mask = explicit_mask.or(generated_mask.as_ref());
+        let args = &self.args;
+        hidden = execute_pipeline_layer_range(
+            PipelineLayerExecution {
+                range: self.range.clone(),
+                resident_layers: &mut self.layers,
+                dense_layers: self.dense_layers.as_ref(),
+                step,
+                caches,
+                hidden,
+                stream,
+            },
+            |global_layer, stream| nemotron_h::TransformerBlock::new(args, global_layer, stream),
+            |global_layer, layer, hidden, cache, stream| {
+                Self::forward_layer(layer, global_layer, hidden, mask, cache, stream)
+            },
+        )?;
+        let output = if let Some(norm) = &mut self.norm {
+            hidden = norm.forward(&hidden, stream)?;
+            let logits = if let Some(head) = &mut self.lm_head {
+                head.forward(&hidden, stream)?
+            } else {
+                project_logits_maybe_quantized(
+                    &mut self.lm_head,
+                    self.output_embedding
+                        .as_mut()
+                        .or(self.embedding.as_mut())
+                        .expect("last tied Nemotron-H stage output embedding"),
+                    &hidden,
+                    stream,
+                )?
+            };
+            PipelineStageOutput::Logits(logits)
+        } else {
+            PipelineStageOutput::Hidden(PipelinePayload { hidden, auxiliary })
+        };
+        Ok(output)
+    }
+}
+
+fn load_qwen_hybrid_pipeline(
+    source_args: qwen_hybrid::ModelArgs,
+    store: SharedWeightStore,
+    topology: ParallelTopology,
+    requested_quantization: Option<WeightQuantization>,
+    dense_stream: Option<crate::runtime::residency::dense_stream::DenseDiskStreamLoadOptions>,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<PipelineModel, Error> {
+    if requested_quantization.is_some() && source_args.quantization_config.is_some() {
+        return Err(Error::Quantization(
+            "Qwen hybrid pipeline cannot implicitly transcode checkpoint-native FP8 weights".into(),
+        ));
+    }
+    let quantize_on_load = requested_quantization
+        .map(|requested| {
+            crate::runtime::checkpoint::quantization::should_quantize_on_load(
+                "Qwen hybrid pipeline",
+                source_args.quantization,
+                requested,
+            )
+            .map(|required| required.then_some(requested))
+        })
+        .transpose()?
+        .flatten();
+    if dense_stream.is_some() && quantize_on_load.is_some() {
+        return Err(Error::Quantization(
+            "load-time quantization is unsupported for Qwen hybrid pipeline dense disk streaming; use checkpoint-native packed weights"
+                .into(),
+        ));
+    }
+    let mut target_args = source_args.clone();
+    if let Some(quantization) = quantize_on_load {
+        target_args.quantization = Some(quantization);
+        target_args.quantization_config = None;
+        target_args.quantized_weight_configs = None;
+    }
+    let range = topology.layer_range(source_args.num_hidden_layers as usize)?;
+    let kind = if source_args.model_type == "qwen3_next" {
+        ModelKind::Qwen3Next
+    } else {
+        ModelKind::Qwen35
+    };
+    let mut info = base_info(topology, range.clone(), kind, source_args.hidden_size);
+    let mut stage = QwenHybridStage::new(target_args.clone(), range, &info, stream)?;
+    let binding_adapter = QwenHybridLayerwiseAdapter::new_text(source_args.clone(), stream)?;
+    let static_units = pipeline_binding_units(
+        &binding_adapter,
+        store.as_ref(),
+        &selected_pipeline_static_roles([
+            (
+                "embedding",
+                stage.embedding.is_some() || stage.output_embedding.is_some(),
+            ),
+            ("norm", stage.norm.is_some()),
+            ("output", stage.lm_head.is_some()),
+        ]),
+    )?;
+    let mut loaded = PipelineLoadAccumulator::new("Qwen hybrid");
+    if let Some(module) = &mut stage.embedding {
+        loaded.load(
+            module,
+            store.as_ref(),
+            pipeline_static_bindings(&static_units, "embedding")?,
+            quantize_on_load,
+            weights_stream,
+            stream,
+        )?;
+    }
+    if let Some(module) = &mut stage.output_embedding {
+        loaded.load(
+            module,
+            store.as_ref(),
+            pipeline_static_bindings(&static_units, "embedding")?,
+            quantize_on_load,
+            weights_stream,
+            stream,
+        )?;
+    }
+    if let Some(module) = &mut stage.norm {
+        loaded.load(
+            module,
+            store.as_ref(),
+            pipeline_static_bindings(&static_units, "norm")?,
+            quantize_on_load,
+            weights_stream,
+            stream,
+        )?;
+    }
+    if let Some(module) = &mut stage.lm_head {
+        loaded.load(
+            module,
+            store.as_ref(),
+            pipeline_static_bindings(&static_units, "output")?,
+            quantize_on_load,
+            weights_stream,
+            stream,
+        )?;
+    }
+    if dense_stream.is_none() {
+        for (global_layer, layer) in stage.range.clone().zip(&mut stage.layers) {
+            let source_layer = QwenHybridLayer::Text(Box::new(qwen_hybrid::TransformerBlock::new(
+                &source_args,
+                global_layer,
+                stream,
+            )?));
+            let bindings =
+                binding_adapter.layer_bindings(0, global_layer, &source_layer, store.as_ref())?;
+            loaded.load(
+                layer,
+                store.as_ref(),
+                &bindings,
+                quantize_on_load,
+                weights_stream,
+                stream,
+            )?;
+        }
+    }
+    let static_bytes = loaded.finish(&mut info)?;
+    let materialized_shards = store.diagnostics()?.touched_shard_paths;
+    if let Some(options) = dense_stream {
+        stage.dense_layers = Some(build_pipeline_dense_layers(
+            Arc::clone(&store),
+            stage.range.clone(),
+            options,
+            static_bytes,
+            stream,
+            weights_stream,
+            |global_layer, stream| {
+                qwen_hybrid::TransformerBlock::new(&target_args, global_layer, stream)
+                    .map_err(Into::into)
+            },
+            |global_layer, _layer, store| {
+                let source_layer = QwenHybridLayer::Text(Box::new(
+                    qwen_hybrid::TransformerBlock::new(&source_args, global_layer, stream)?,
+                ));
+                binding_adapter.layer_bindings(0, global_layer, &source_layer, store)
+            },
+        )?);
+        let report = stage.dense_layers.as_ref().unwrap().report()?;
+        info.planned_owned_parameter_bytes = static_bytes
+            .checked_add(report.planned_layer_bytes())
+            .ok_or_else(|| {
+                Error::Parallel("Qwen hybrid pipeline planned bytes overflowed".into())
+            })?;
+    } else {
+        info.planned_owned_parameter_bytes = static_bytes;
+    }
+    info.opened_checkpoint_shards = materialized_shards;
+    PipelineModel::from_adapter(topology, info, PipelineStage(stage))
+}
+
+impl QwenHybridStage {
+    fn new(
+        args: qwen_hybrid::ModelArgs,
+        range: Range<usize>,
+        info: &PipelineStageInfo,
+        stream: &Stream,
+    ) -> Result<Self, Error> {
+        let complete = qwen_hybrid::Model::new(args.clone(), None, None, None, stream)?;
+        let qwen_hybrid::Model { model, lm_head, .. } = complete;
+        let qwen_hybrid::Qwen35TextModel {
+            embed_tokens,
+            layers,
+            norm,
+            ..
+        } = model;
+        let mut embedding = None;
+        let mut output_embedding = None;
+        if info.is_first {
+            embedding = Some(embed_tokens);
+        } else if info.is_last && args.tie_word_embeddings {
+            output_embedding = Some(embed_tokens);
+        }
+        let layers = layers
+            .into_iter()
+            .enumerate()
+            .filter_map(|(index, layer)| range.contains(&index).then_some(layer))
+            .collect();
+        Ok(Self {
+            args,
+            range,
+            embedding,
+            output_embedding,
+            layers,
+            dense_layers: None,
+            norm: info.is_last.then_some(norm),
+            lm_head: info.is_last.then_some(lm_head).flatten(),
+        })
+    }
+
+    fn forward_layer(
+        layer: &mut qwen_hybrid::TransformerBlock,
+        global_layer: usize,
+        hidden: &Array,
+        mask: Option<&Array>,
+        cache: &mut PipelineLayerCache,
+        stream: &Stream,
+    ) -> Result<Array, Error> {
+        match (layer.layer_policy, cache) {
+            (
+                qwen_hybrid::LayerPolicy::SelfAttention(crate::AttentionPolicy::Full),
+                PipelineLayerCache::KeyValue {
+                    global_layer: cached,
+                    cache,
+                    slots,
+                },
+            ) if *cached == global_layer && slots.is_empty() => {
+                let cache: &mut dyn KeyValueCache = match cache {
+                    PipelineKeyValueCache::Standard(cache) => cache,
+                    PipelineKeyValueCache::Paged(cache) => cache,
+                };
+                Ok(layer.forward_with_operator_cache(
+                    hidden,
+                    mask,
+                    Some(qwen_hybrid::OperatorCache::FullAttention(cache)),
+                    stream,
+                )?)
+            }
+            (
+                qwen_hybrid::LayerPolicy::LinearAttention,
+                PipelineLayerCache::StateSlots {
+                    global_layer: cached,
+                    slots,
+                },
+            ) if *cached == global_layer
+                && slots.len() == 2
+                && slots[0].policy.role == (StateTensorRole::Convolution { slot: 0 })
+                && slots[1].policy.role == StateTensorRole::Recurrent =>
+            {
+                let (conv, recurrent) = slots.split_at_mut(1);
+                if conv[0].offset != recurrent[0].offset {
+                    return Err(Error::Parallel(format!(
+                        "Qwen hybrid state offsets disagree at global layer {global_layer}"
+                    )));
+                }
+                let mut local = qwen_hybrid::LinearAttentionCache {
+                    conv_state: conv[0].value.take(),
+                    recurrent_state: recurrent[0].value.take(),
+                    offset: conv[0].offset,
+                };
+                let output = layer.forward_with_operator_cache(
+                    hidden,
+                    mask,
+                    Some(qwen_hybrid::OperatorCache::LinearAttention(&mut local)),
+                    stream,
+                )?;
+                conv[0].value = local.conv_state;
+                conv[0].offset = local.offset;
+                recurrent[0].value = local.recurrent_state;
+                recurrent[0].offset = local.offset;
+                Ok(output)
+            }
+            _ => Err(Error::Parallel(format!(
+                "Qwen hybrid pipeline cache does not match global layer {global_layer}"
+            ))),
+        }
+    }
+
+    fn forward(
+        &mut self,
+        input: PipelineStageInput<'_>,
+        step: PipelineStep,
+        explicit_mask: Option<&Array>,
+        caches: &mut [PipelineLayerCache],
+        stream: &Stream,
+    ) -> Result<PipelineStageOutput, Error> {
+        if caches.len() != self.layers.len() {
+            return Err(Error::Parallel(format!(
+                "Qwen hybrid stage cache has {} entries, expected {}",
+                caches.len(),
+                self.layers.len()
+            )));
+        }
+        let (mut hidden, auxiliary) = match input {
+            PipelineStageInput::Tokens(tokens) => (
+                self.embedding
+                    .as_mut()
+                    .expect("first Qwen hybrid stage embedding")
+                    .forward(tokens, stream)?,
+                PipelineAuxiliaryState::default(),
+            ),
+            PipelineStageInput::Hidden(payload) => {
+                (payload.hidden.clone(), payload.auxiliary.clone())
+            }
+        };
+        let offset = pipeline_state_offset("Qwen hybrid", caches)?;
+        let generated_mask = (explicit_mask.is_none() && step.sequence_length > 1)
+            .then(|| create_causal_mask(step.sequence_length, Some(offset), None, None, stream))
+            .transpose()?;
+        let mask = explicit_mask.or(generated_mask.as_ref());
+        let args = &self.args;
+        hidden = execute_pipeline_layer_range(
+            PipelineLayerExecution {
+                range: self.range.clone(),
+                resident_layers: &mut self.layers,
+                dense_layers: self.dense_layers.as_ref(),
+                step,
+                caches,
+                hidden,
+                stream,
+            },
+            |global_layer, stream| {
+                qwen_hybrid::TransformerBlock::new(args, global_layer, stream).map_err(Into::into)
+            },
+            |global_layer, layer, hidden, cache, stream| {
+                Self::forward_layer(layer, global_layer, hidden, mask, cache, stream)
+            },
+        )?;
+        let output = if let Some(norm) = &mut self.norm {
+            hidden = norm.forward(&hidden, stream)?;
+            let logits = if let Some(head) = &mut self.lm_head {
+                head.forward(&hidden, stream)?
+            } else {
+                project_logits_maybe_quantized(
+                    &mut self.lm_head,
+                    self.output_embedding
+                        .as_mut()
+                        .or(self.embedding.as_mut())
+                        .expect("last tied Qwen hybrid stage output embedding"),
+                    &hidden,
+                    stream,
+                )?
+            };
+            PipelineStageOutput::Logits(logits)
+        } else {
+            PipelineStageOutput::Hidden(PipelinePayload { hidden, auxiliary })
+        };
+        Ok(output)
+    }
+}
+
+fn load_kimi_linear_pipeline(
+    source_args: kimi_linear::ModelArgs,
+    store: SharedWeightStore,
+    topology: ParallelTopology,
+    requested_quantization: Option<WeightQuantization>,
+    dense_stream: Option<crate::runtime::residency::dense_stream::DenseDiskStreamLoadOptions>,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<PipelineModel, Error> {
+    let quantize_on_load = requested_quantization
+        .map(|requested| {
+            crate::runtime::checkpoint::quantization::should_quantize_on_load(
+                "Kimi Linear pipeline",
+                source_args.quantization,
+                requested,
+            )
+            .map(|required| required.then_some(requested))
+        })
+        .transpose()?
+        .flatten();
+    if dense_stream.is_some() && quantize_on_load.is_some() {
+        return Err(Error::Quantization(
+            "load-time quantization is unsupported for Kimi Linear pipeline dense disk streaming; use checkpoint-native packed weights"
+                .into(),
+        ));
+    }
+    let mut target_args = source_args.clone();
+    if let Some(quantization) = quantize_on_load {
+        target_args.quantization = Some(quantization);
+        target_args.quantized_weight_configs = None;
+    }
+    let range = topology.layer_range(source_args.num_hidden_layers as usize)?;
+    let mut info = base_info(
+        topology,
+        range.clone(),
+        ModelKind::KimiLinear,
+        source_args.hidden_size,
+    );
+    let mut stage = KimiLinearStage::new(target_args.clone(), range, &info, stream)?;
+    let binding_adapter = KimiLinearLayerwiseAdapter::new(source_args.clone(), stream)?;
+    let static_units = pipeline_binding_units(
+        &binding_adapter,
+        store.as_ref(),
+        &selected_pipeline_static_roles([
+            (
+                "embedding",
+                stage.embedding.is_some() || stage.output_embedding.is_some(),
+            ),
+            ("norm", stage.norm.is_some()),
+            ("output", stage.lm_head.is_some()),
+        ]),
+    )?;
+    let mut loaded = PipelineLoadAccumulator::new("Kimi Linear");
+    if let Some(module) = &mut stage.embedding {
+        loaded.load(
+            module,
+            store.as_ref(),
+            pipeline_static_bindings(&static_units, "embedding")?,
+            quantize_on_load,
+            weights_stream,
+            stream,
+        )?;
+    }
+    if let Some(module) = &mut stage.output_embedding {
+        loaded.load(
+            module,
+            store.as_ref(),
+            pipeline_static_bindings(&static_units, "embedding")?,
+            quantize_on_load,
+            weights_stream,
+            stream,
+        )?;
+    }
+    if let Some(module) = &mut stage.norm {
+        loaded.load(
+            module,
+            store.as_ref(),
+            pipeline_static_bindings(&static_units, "norm")?,
+            quantize_on_load,
+            weights_stream,
+            stream,
+        )?;
+    }
+    if let Some(module) = &mut stage.lm_head {
+        loaded.load(
+            module,
+            store.as_ref(),
+            pipeline_static_bindings(&static_units, "output")?,
+            quantize_on_load,
+            weights_stream,
+            stream,
+        )?;
+    }
+    if dense_stream.is_none() {
+        for (global_layer, layer) in stage.range.clone().zip(&mut stage.layers) {
+            let source_layer = binding_adapter.new_layer(0, global_layer, stream)?;
+            let bindings =
+                binding_adapter.layer_bindings(0, global_layer, &source_layer, store.as_ref())?;
+            loaded.load(
+                layer,
+                store.as_ref(),
+                &bindings,
+                quantize_on_load,
+                weights_stream,
+                stream,
+            )?;
+        }
+    }
+    let static_bytes = loaded.finish(&mut info)?;
+    let materialized_shards = store.diagnostics()?.touched_shard_paths;
+    if let Some(options) = dense_stream {
+        stage.dense_layers = Some(build_pipeline_dense_layers(
+            Arc::clone(&store),
+            stage.range.clone(),
+            options,
+            static_bytes,
+            stream,
+            weights_stream,
+            |global_layer, stream| {
+                kimi_linear::DecoderLayer::new(&target_args, global_layer, stream)
+                    .map_err(Into::into)
+            },
+            |global_layer, layer, store| {
+                binding_adapter.layer_bindings(0, global_layer, layer, store)
+            },
+        )?);
+        let report = stage.dense_layers.as_ref().unwrap().report()?;
+        info.planned_owned_parameter_bytes = static_bytes
+            .checked_add(report.planned_layer_bytes())
+            .ok_or_else(|| {
+                Error::Parallel("Kimi Linear pipeline planned bytes overflowed".into())
+            })?;
+    } else {
+        info.planned_owned_parameter_bytes = static_bytes;
+    }
+    info.opened_checkpoint_shards = materialized_shards;
+    PipelineModel::from_adapter(topology, info, PipelineStage(stage))
+}
+
+impl KimiLinearStage {
+    fn new(
+        args: kimi_linear::ModelArgs,
+        range: Range<usize>,
+        info: &PipelineStageInfo,
+        stream: &Stream,
+    ) -> Result<Self, Error> {
+        let complete = kimi_linear::Model::new(args.clone(), stream)?;
+        let kimi_linear::Model { model, lm_head, .. } = complete;
+        let kimi_linear::TextModel {
+            embed_tokens,
+            layers,
+            norm,
+        } = model;
+        let mut embedding = None;
+        let mut output_embedding = None;
+        if info.is_first {
+            embedding = Some(embed_tokens);
+        } else if info.is_last && args.tie_word_embeddings {
+            output_embedding = Some(embed_tokens);
+        }
+        let layers = layers
+            .into_iter()
+            .enumerate()
+            .filter_map(|(index, layer)| range.contains(&index).then_some(layer))
+            .collect();
+        Ok(Self {
+            args,
+            range,
+            embedding,
+            output_embedding,
+            layers,
+            dense_layers: None,
+            norm: info.is_last.then_some(norm),
+            lm_head: info.is_last.then_some(lm_head).flatten(),
+        })
+    }
+
+    fn forward_layer(
+        layer: &mut kimi_linear::DecoderLayer,
+        global_layer: usize,
+        hidden: &Array,
+        mask: Option<&Array>,
+        cache: &mut PipelineLayerCache,
+        stream: &Stream,
+    ) -> Result<Array, Error> {
+        match cache {
+            PipelineLayerCache::CompressedLatent {
+                global_layer: cached,
+                cache,
+                slots,
+            } if *cached == global_layer && slots.is_empty() => Ok(layer
+                .forward_with_operator_cache(
+                    hidden,
+                    mask,
+                    Some(kimi_linear::OperatorCache::Mla(cache)),
+                    stream,
+                )?),
+            PipelineLayerCache::StateSlots {
+                global_layer: cached,
+                slots,
+            } if *cached == global_layer
+                && slots.len() == 4
+                && slots[0].policy.role == (StateTensorRole::Convolution { slot: 0 })
+                && slots[1].policy.role == (StateTensorRole::Convolution { slot: 1 })
+                && slots[2].policy.role == (StateTensorRole::Convolution { slot: 2 })
+                && slots[3].policy.role == StateTensorRole::Recurrent =>
+            {
+                let offset = slots[0].offset;
+                if slots.iter().any(|slot| slot.offset != offset) {
+                    return Err(Error::Parallel(format!(
+                        "Kimi Linear KDA state offsets disagree at global layer {global_layer}"
+                    )));
+                }
+                let mut local = kimi_linear::KdaCache {
+                    q_conv: crate::nn::convolution::CausalConv1dCache {
+                        state: slots[0].value.take(),
+                        offset,
+                    },
+                    k_conv: crate::nn::convolution::CausalConv1dCache {
+                        state: slots[1].value.take(),
+                        offset,
+                    },
+                    v_conv: crate::nn::convolution::CausalConv1dCache {
+                        state: slots[2].value.take(),
+                        offset,
+                    },
+                    recurrent_state: slots[3].value.take(),
+                };
+                let output = layer.forward_with_operator_cache(
+                    hidden,
+                    mask,
+                    Some(kimi_linear::OperatorCache::Kda(&mut local)),
+                    stream,
+                )?;
+                slots[0].value = local.q_conv.state;
+                slots[1].value = local.k_conv.state;
+                slots[2].value = local.v_conv.state;
+                slots[3].value = local.recurrent_state;
+                let offset = local.q_conv.offset;
+                if local.k_conv.offset != offset || local.v_conv.offset != offset {
+                    return Err(Error::Parallel(format!(
+                        "Kimi Linear KDA convolution offsets disagree at global layer {global_layer}"
+                    )));
+                }
+                slots.iter_mut().for_each(|slot| slot.offset = offset);
+                Ok(output)
+            }
+            _ => Err(Error::Parallel(format!(
+                "Kimi Linear pipeline cache does not match global layer {global_layer}"
+            ))),
+        }
+    }
+
+    fn forward(
+        &mut self,
+        input: PipelineStageInput<'_>,
+        step: PipelineStep,
+        explicit_mask: Option<&Array>,
+        caches: &mut [PipelineLayerCache],
+        stream: &Stream,
+    ) -> Result<PipelineStageOutput, Error> {
+        if caches.len() != self.layers.len() {
+            return Err(Error::Parallel(format!(
+                "Kimi Linear stage cache has {} entries, expected {}",
+                caches.len(),
+                self.layers.len()
+            )));
+        }
+        let (mut hidden, auxiliary) = match input {
+            PipelineStageInput::Tokens(tokens) => (
+                self.embedding
+                    .as_mut()
+                    .expect("first Kimi Linear stage embedding")
+                    .forward(tokens, stream)?,
+                PipelineAuxiliaryState::default(),
+            ),
+            PipelineStageInput::Hidden(payload) => {
+                (payload.hidden.clone(), payload.auxiliary.clone())
+            }
+        };
+        let offset = pipeline_state_offset("Kimi Linear", caches)?;
+        let generated_mask = (explicit_mask.is_none() && step.sequence_length > 1 && offset > 0)
+            .then(|| create_causal_mask(step.sequence_length, Some(offset), None, None, stream))
+            .transpose()?;
+        let mask = explicit_mask.or(generated_mask.as_ref());
+        let args = &self.args;
+        hidden = execute_pipeline_layer_range(
+            PipelineLayerExecution {
+                range: self.range.clone(),
+                resident_layers: &mut self.layers,
+                dense_layers: self.dense_layers.as_ref(),
+                step,
+                caches,
+                hidden,
+                stream,
+            },
+            |global_layer, stream| {
+                kimi_linear::DecoderLayer::new(args, global_layer, stream).map_err(Into::into)
+            },
+            |global_layer, layer, hidden, cache, stream| {
+                Self::forward_layer(layer, global_layer, hidden, mask, cache, stream)
+            },
+        )?;
+        let output = if let Some(norm) = &mut self.norm {
+            hidden = norm.forward(&hidden, stream)?;
+            let logits = if let Some(head) = &mut self.lm_head {
+                head.forward(&hidden, stream)?
+            } else {
+                project_logits_maybe_quantized(
+                    &mut self.lm_head,
+                    self.output_embedding
+                        .as_mut()
+                        .or(self.embedding.as_mut())
+                        .expect("last tied Kimi Linear stage output embedding"),
+                    &hidden,
+                    stream,
+                )?
+            };
+            PipelineStageOutput::Logits(logits)
+        } else {
+            PipelineStageOutput::Hidden(PipelinePayload { hidden, auxiliary })
+        };
+        Ok(output)
+    }
+}
+
+fn load_inkling_pipeline(
+    args: inkling::ModelArgs,
+    store: SharedWeightStore,
+    topology: ParallelTopology,
+    requested_quantization: Option<WeightQuantization>,
+    dense_stream: Option<crate::runtime::residency::dense_stream::DenseDiskStreamLoadOptions>,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<PipelineModel, Error> {
+    if requested_quantization.is_some() {
+        return Err(Error::Quantization(
+            "Inkling pipeline load-time requantization is unsupported; use checkpoint-native encodings"
+                .into(),
+        ));
+    }
+    let range = topology.layer_range(args.text_config.num_hidden_layers as usize)?;
+    let mut info = base_info(
+        topology,
+        range.clone(),
+        ModelKind::Inkling,
+        args.text_config.hidden_size,
+    );
+    let mut stage = InklingStage::new(args.clone(), range, &info, stream)?;
+    let binding_adapter = InklingLayerwiseAdapter::new(args.clone(), stream)?;
+    let static_units = pipeline_binding_units(
+        &binding_adapter,
+        store.as_ref(),
+        &selected_pipeline_static_roles([
+            ("embedding", stage.embedding.is_some()),
+            ("embed_norm", stage.embed_norm.is_some()),
+            ("norm", stage.norm.is_some()),
+            ("output", stage.lm_head.is_some()),
+        ]),
+    )?;
+    let mut loaded = PipelineLoadAccumulator::new("Inkling");
+    if let Some(module) = &mut stage.embedding {
+        loaded.load(
+            module,
+            store.as_ref(),
+            pipeline_static_bindings(&static_units, "embedding")?,
+            None,
+            weights_stream,
+            stream,
+        )?;
+    }
+    if let Some(module) = &mut stage.embed_norm {
+        loaded.load(
+            module,
+            store.as_ref(),
+            pipeline_static_bindings(&static_units, "embed_norm")?,
+            None,
+            weights_stream,
+            stream,
+        )?;
+    }
+    if let Some(module) = &mut stage.norm {
+        loaded.load(
+            module,
+            store.as_ref(),
+            pipeline_static_bindings(&static_units, "norm")?,
+            None,
+            weights_stream,
+            stream,
+        )?;
+    }
+    if let Some(module) = &mut stage.lm_head {
+        loaded.load(
+            module,
+            store.as_ref(),
+            pipeline_static_bindings(&static_units, "output")?,
+            None,
+            weights_stream,
+            stream,
+        )?;
+    }
+    if dense_stream.is_none() {
+        for (global_layer, layer) in stage.range.clone().zip(&mut stage.layers) {
+            let source_layer = InklingLayer::Text(Box::new(inkling::DecoderLayer::new(
+                &args.text_config,
+                global_layer as i32,
+                stream,
+            )?));
+            let bindings =
+                binding_adapter.layer_bindings(0, global_layer, &source_layer, store.as_ref())?;
+            loaded.load(
+                layer,
+                store.as_ref(),
+                &bindings,
+                None,
+                weights_stream,
+                stream,
+            )?;
+        }
+    }
+    let static_bytes = loaded.finish_with_default(&mut info, args.text_config.weight_dtype())?;
+    let materialized_shards = store.diagnostics()?.touched_shard_paths;
+    if let Some(options) = dense_stream {
+        stage.dense_layers = Some(build_pipeline_dense_layers(
+            Arc::clone(&store),
+            stage.range.clone(),
+            options,
+            static_bytes,
+            stream,
+            weights_stream,
+            |global_layer, stream| {
+                inkling::DecoderLayer::new(&args.text_config, global_layer as i32, stream)
+                    .map_err(Into::into)
+            },
+            |global_layer, _layer, store| {
+                let source_layer = InklingLayer::Text(Box::new(inkling::DecoderLayer::new(
+                    &args.text_config,
+                    global_layer as i32,
+                    stream,
+                )?));
+                binding_adapter.layer_bindings(0, global_layer, &source_layer, store)
+            },
+        )?);
+        let report = stage.dense_layers.as_ref().unwrap().report()?;
+        info.planned_owned_parameter_bytes = static_bytes
+            .checked_add(report.planned_layer_bytes())
+            .ok_or_else(|| Error::Parallel("Inkling pipeline planned bytes overflowed".into()))?;
+    } else {
+        info.planned_owned_parameter_bytes = static_bytes;
+    }
+    info.opened_checkpoint_shards = materialized_shards;
+    PipelineModel::from_adapter(topology, info, PipelineStage(stage))
+}
+
+impl InklingStage {
+    fn new(
+        args: inkling::ModelArgs,
+        range: Range<usize>,
+        info: &PipelineStageInfo,
+        stream: &Stream,
+    ) -> Result<Self, Error> {
+        let complete = inkling::Model::new(args.clone(), stream)?;
+        let inkling::Model { model, lm_head, .. } = complete;
+        let inkling::TextModel {
+            embed_tokens,
+            embed_norm,
+            layers,
+            norm,
+        } = model;
+        let layers = layers
+            .into_iter()
+            .enumerate()
+            .filter_map(|(index, layer)| range.contains(&index).then_some(layer))
+            .collect();
+        Ok(Self {
+            args,
+            range,
+            embedding: info.is_first.then_some(embed_tokens),
+            embed_norm: info.is_first.then_some(embed_norm),
+            layers,
+            dense_layers: None,
+            norm: info.is_last.then_some(norm),
+            lm_head: info.is_last.then_some(lm_head),
+        })
+    }
+
+    fn forward_layer(
+        layer: &mut inkling::DecoderLayer,
+        global_layer: usize,
+        hidden: &Array,
+        cache: &mut PipelineLayerCache,
+        stream: &Stream,
+    ) -> Result<Array, Error> {
+        let PipelineLayerCache::KeyValue {
+            global_layer: cached,
+            cache,
+            slots,
+        } = cache
+        else {
+            return Err(Error::Parallel(format!(
+                "Inkling pipeline cache is not KV-plus-fixed state at global layer {global_layer}"
+            )));
+        };
+        if *cached != global_layer
+            || slots.len() != 4
+            || slots.iter().enumerate().any(|(slot, state)| {
+                state.policy.role != (StateTensorRole::Convolution { slot: slot as u32 })
+            })
+        {
+            return Err(Error::Parallel(format!(
+                "Inkling pipeline cache does not match global layer {global_layer}"
+            )));
+        }
+        let offset = slots[0].offset;
+        if slots.iter().any(|slot| slot.offset != offset) {
+            return Err(Error::Parallel(format!(
+                "Inkling convolution state offsets disagree at global layer {global_layer}"
+            )));
+        }
+        let mut convolutions = [
+            crate::nn::convolution::CausalConv1dCache {
+                state: slots[0].value.take(),
+                offset,
+            },
+            crate::nn::convolution::CausalConv1dCache {
+                state: slots[1].value.take(),
+                offset,
+            },
+            crate::nn::convolution::CausalConv1dCache {
+                state: slots[2].value.take(),
+                offset,
+            },
+            crate::nn::convolution::CausalConv1dCache {
+                state: slots[3].value.take(),
+                offset,
+            },
+        ];
+        let mut kv = match cache {
+            PipelineKeyValueCache::Standard(cache) => {
+                inkling::PipelineInklingKvCache::Standard(cache)
+            }
+            PipelineKeyValueCache::Paged(cache) => inkling::PipelineInklingKvCache::Paged(cache),
+        };
+        let output =
+            layer.forward_with_operator_cache(hidden, &mut kv, &mut convolutions, stream)?;
+        let kv_offset = match &kv {
+            inkling::PipelineInklingKvCache::Standard(cache) => cache.offset(),
+            inkling::PipelineInklingKvCache::Paged(cache) => cache.offset(),
+        };
+        for (slot, convolution) in slots.iter_mut().zip(convolutions) {
+            if convolution.offset != kv_offset {
+                return Err(Error::Parallel(format!(
+                    "Inkling KV/convolution offsets disagree at global layer {global_layer}"
+                )));
+            }
+            slot.value = convolution.state;
+            slot.offset = convolution.offset;
+        }
+        Ok(output)
+    }
+
+    fn forward(
+        &mut self,
+        input: PipelineStageInput<'_>,
+        step: PipelineStep,
+        caches: &mut [PipelineLayerCache],
+        stream: &Stream,
+    ) -> Result<PipelineStageOutput, Error> {
+        if caches.len() != self.layers.len() {
+            return Err(Error::Parallel(format!(
+                "Inkling stage cache has {} entries, expected {}",
+                caches.len(),
+                self.layers.len()
+            )));
+        }
+        let (mut hidden, auxiliary) = match input {
+            PipelineStageInput::Tokens(tokens) => {
+                let embedded = self
+                    .embedding
+                    .as_mut()
+                    .expect("first Inkling stage embedding")
+                    .forward(tokens, stream)?;
+                (
+                    self.embed_norm
+                        .as_mut()
+                        .expect("first Inkling stage embedding norm")
+                        .forward(&embedded, stream)?,
+                    PipelineAuxiliaryState::default(),
+                )
+            }
+            PipelineStageInput::Hidden(payload) => {
+                (payload.hidden.clone(), payload.auxiliary.clone())
+            }
+        };
+        let _ = pipeline_state_offset("Inkling", caches)?;
+        let text_args = &self.args.text_config;
+        hidden = execute_pipeline_layer_range(
+            PipelineLayerExecution {
+                range: self.range.clone(),
+                resident_layers: &mut self.layers,
+                dense_layers: self.dense_layers.as_ref(),
+                step,
+                caches,
+                hidden,
+                stream,
+            },
+            |global_layer, stream| {
+                inkling::DecoderLayer::new(text_args, global_layer as i32, stream)
+                    .map_err(Into::into)
+            },
+            |global_layer, layer, hidden, cache, stream| {
+                Self::forward_layer(layer, global_layer, hidden, cache, stream)
+            },
+        )?;
+        let output = if let Some(norm) = &mut self.norm {
+            hidden = norm.forward(&hidden, stream)?;
+            let logits = inkling::project_text_logits(
+                &hidden,
+                &self.args.text_config,
+                false,
+                stream,
+                |hidden, stream| {
+                    self.lm_head
+                        .as_mut()
+                        .expect("last Inkling stage head")
+                        .forward(hidden, stream)
+                },
+            )?;
+            PipelineStageOutput::Logits(logits)
+        } else {
+            PipelineStageOutput::Hidden(PipelinePayload { hidden, auxiliary })
+        };
+        Ok(output)
+    }
+}
+
+fn load_gemma_pipeline(
+    source_args: gemma4::ModelArgs,
+    store: SharedWeightStore,
+    topology: ParallelTopology,
+    requested_quantization: Option<WeightQuantization>,
+    dense_stream: Option<crate::runtime::residency::dense_stream::DenseDiskStreamLoadOptions>,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<PipelineModel, Error> {
+    let quantize_on_load = requested_quantization
+        .map(|requested| {
+            crate::runtime::checkpoint::quantization::should_quantize_on_load(
+                "Gemma pipeline",
+                source_args.weight_quantization(),
+                requested,
+            )
+            .map(|required| required.then_some(requested))
+        })
+        .transpose()?
+        .flatten();
+    if dense_stream.is_some() && quantize_on_load.is_some() {
+        return Err(Error::Quantization(
+            "load-time quantization is unsupported for Gemma pipeline dense disk streaming; use checkpoint-native packed weights"
+                .into(),
+        ));
+    }
+    let mut target_args = source_args.clone();
+    if let Some(quantization) = quantize_on_load {
+        target_args.quantized = true;
+        target_args.weight_quantization = Some(quantization);
+        target_args.quantization_group_size = quantization.group_size();
+        target_args.quantization_bits = quantization.bits();
+        target_args.quantized_weights = None;
+        target_args.quantized_weight_configs = None;
+    }
+    let ranges = gemma_pipeline_ranges(&source_args, topology.pipeline_parallel_size)?;
+    let range = ranges
+        .get(topology.pipeline_parallel_rank)
+        .cloned()
+        .ok_or_else(|| Error::Parallel("Gemma pipeline rank has no planned layer range".into()))?;
+    let mut info = base_info(
+        topology,
+        range.clone(),
+        ModelKind::Gemma4,
+        source_args.hidden_size,
+    );
+    let mut stage = GemmaStage::new(target_args.clone(), range, &info, stream)?;
+    let binding_adapter =
+        crate::architectures::gemma4::layerwise::Gemma4LayerwiseAdapter::new_text(
+            source_args.clone(),
+            stream,
+        )?;
+    let static_units = pipeline_binding_units(
+        &binding_adapter,
+        store.as_ref(),
+        &selected_pipeline_static_roles([
+            (
+                "embedding",
+                stage.embedding.is_some() || stage.output_embedding.is_some(),
+            ),
+            ("per_layer_embedding", stage.per_layer_embedding.is_some()),
+            ("per_layer_projection", stage.per_layer_projection.is_some()),
+            ("per_layer_norm", stage.per_layer_norm.is_some()),
+            ("norm", stage.norm.is_some()),
+            ("output", stage.lm_head.is_some()),
+        ]),
+    )?;
+    let mut loaded = PipelineLoadAccumulator::new("Gemma");
+    if let Some(module) = &mut stage.embedding {
+        loaded.load(
+            module,
+            store.as_ref(),
+            pipeline_static_bindings(&static_units, "embedding")?,
+            quantize_on_load,
+            weights_stream,
+            stream,
+        )?;
+    }
+    if let Some(module) = &mut stage.output_embedding {
+        loaded.load(
+            module,
+            store.as_ref(),
+            pipeline_static_bindings(&static_units, "embedding")?,
+            quantize_on_load,
+            weights_stream,
+            stream,
+        )?;
+    }
+    if let Some(module) = &mut stage.per_layer_embedding {
+        loaded.load(
+            module,
+            store.as_ref(),
+            pipeline_static_bindings(&static_units, "per_layer_embedding")?,
+            quantize_on_load,
+            weights_stream,
+            stream,
+        )?;
+    }
+    if let Some(module) = &mut stage.per_layer_projection {
+        loaded.load(
+            module,
+            store.as_ref(),
+            pipeline_static_bindings(&static_units, "per_layer_projection")?,
+            quantize_on_load,
+            weights_stream,
+            stream,
+        )?;
+    }
+    if let Some(module) = &mut stage.per_layer_norm {
+        loaded.load(
+            module,
+            store.as_ref(),
+            pipeline_static_bindings(&static_units, "per_layer_norm")?,
+            quantize_on_load,
+            weights_stream,
+            stream,
+        )?;
+    }
+    if let Some(module) = &mut stage.norm {
+        loaded.load(
+            module,
+            store.as_ref(),
+            pipeline_static_bindings(&static_units, "norm")?,
+            quantize_on_load,
+            weights_stream,
+            stream,
+        )?;
+    }
+    if let Some(module) = &mut stage.lm_head {
+        loaded.load(
+            module,
+            store.as_ref(),
+            pipeline_static_bindings(&static_units, "output")?,
+            quantize_on_load,
+            weights_stream,
+            stream,
+        )?;
+    }
+
+    if dense_stream.is_none() {
+        for (global_layer, layer) in stage.range.clone().zip(&mut stage.layers) {
+            let policy = *source_args.layer_policy(global_layer).ok_or_else(|| {
+                Error::Parallel(format!("Gemma has no layer policy {global_layer}"))
+            })?;
+            let source_layer =
+                gemma4::TransformerBlock::new(&source_args, policy, global_layer, stream)?;
+            let bindings =
+                binding_adapter.text_layer_bindings(global_layer, &source_layer, store.as_ref())?;
+            loaded.load(
+                layer,
+                store.as_ref(),
+                &bindings,
+                quantize_on_load,
+                weights_stream,
+                stream,
+            )?;
+        }
+    }
+
+    let static_bytes = loaded.finish(&mut info)?;
+    let materialized_shards = store.diagnostics()?.touched_shard_paths;
+    if let Some(options) = dense_stream {
+        stage.dense_layers = Some(build_pipeline_dense_layers(
+            Arc::clone(&store),
+            stage.range.clone(),
+            options,
+            static_bytes,
+            stream,
+            weights_stream,
+            |global_layer, stream| {
+                let policy = *target_args.layer_policy(global_layer).ok_or_else(|| {
+                    Error::Parallel(format!("Gemma has no layer policy {global_layer}"))
+                })?;
+                Ok(gemma4::TransformerBlock::new(
+                    &target_args,
+                    policy,
+                    global_layer,
+                    stream,
+                )?)
+            },
+            |global_layer, layer, store| {
+                binding_adapter.text_layer_bindings(global_layer, layer, store)
+            },
+        )?);
+        let report = stage.dense_layers.as_ref().unwrap().report()?;
+        info.planned_owned_parameter_bytes = static_bytes
+            .checked_add(report.planned_layer_bytes())
+            .ok_or_else(|| Error::Parallel("Gemma pipeline planned bytes overflowed".into()))?;
+    } else {
+        info.planned_owned_parameter_bytes = static_bytes;
+    }
+    info.opened_checkpoint_shards = materialized_shards;
+    PipelineModel::from_adapter(topology, info, PipelineStage(stage))
+}
+
+impl GemmaStage {
+    fn new(
+        args: gemma4::ModelArgs,
+        range: Range<usize>,
+        info: &PipelineStageInfo,
+        stream: &Stream,
+    ) -> Result<Self, Error> {
+        let make_embedding = || {
+            gemma4::Gemma4Embedding::unloaded(
+                args.vocab_size,
+                args.hidden_size,
+                args.quantization_for("model.language_model.embed_tokens.weight"),
+                stream,
+            )
+        };
+        let embedding = info.is_first.then(make_embedding).transpose()?;
+        let output_embedding = (info.is_last && !info.is_first && args.tie_word_embeddings)
+            .then(make_embedding)
+            .transpose()?;
+        let per_layer_embedding = (info.is_first && args.hidden_size_per_layer_input > 0)
+            .then(|| {
+                gemma4::Gemma4Embedding::unloaded(
+                    args.vocab_size_per_layer_input.unwrap_or(args.vocab_size),
+                    args.num_hidden_layers * args.hidden_size_per_layer_input,
+                    args.quantization_for("model.language_model.embed_tokens_per_layer.weight"),
+                    stream,
+                )
+            })
+            .transpose()?;
+        let per_layer_projection = (info.is_first && args.hidden_size_per_layer_input > 0)
+            .then(|| {
+                linear::unloaded_maybe_quantized_linear(
+                    args.hidden_size,
+                    args.num_hidden_layers * args.hidden_size_per_layer_input,
+                    false,
+                    args.quantization_for("model.language_model.per_layer_model_projection.weight"),
+                    stream,
+                )
+            })
+            .transpose()?;
+        let per_layer_norm = (info.is_first && args.hidden_size_per_layer_input > 0)
+            .then(|| {
+                nn::RmsNorm::unloaded(
+                    args.hidden_size_per_layer_input,
+                    args.rms_norm_eps,
+                    Dtype::Float32,
+                    stream,
+                )
+            })
+            .transpose()?;
+        let layers = range
+            .clone()
+            .map(|layer| {
+                gemma4::TransformerBlock::new(
+                    &args,
+                    *args
+                        .layer_policy(layer)
+                        .expect("validated Gemma pipeline range"),
+                    layer,
+                    stream,
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let norm = info
+            .is_last
+            .then(|| {
+                nn::RmsNorm::unloaded(args.hidden_size, args.rms_norm_eps, Dtype::Float32, stream)
+            })
+            .transpose()?;
+        let lm_head = (info.is_last && !args.tie_word_embeddings)
+            .then(|| {
+                linear::unloaded_maybe_quantized_linear(
+                    args.hidden_size,
+                    args.vocab_size,
+                    false,
+                    args.quantization_for("lm_head.weight"),
+                    stream,
+                )
+            })
+            .transpose()?;
+        Ok(Self {
+            args,
+            range,
+            embedding,
+            output_embedding,
+            per_layer_embedding,
+            per_layer_projection,
+            per_layer_norm,
+            layers,
+            dense_layers: None,
+            norm,
+            lm_head,
+        })
+    }
+
+    fn prepare_input(
+        &mut self,
+        input: PipelineStageInput<'_>,
+        stream: &Stream,
+    ) -> Result<(Array, PipelineAuxiliaryState), Error> {
+        match input {
+            PipelineStageInput::Hidden(payload) => {
+                Ok((payload.hidden.clone(), payload.auxiliary.clone()))
+            }
+            PipelineStageInput::Tokens(tokens) => {
+                let hidden = self
+                    .embedding
+                    .as_mut()
+                    .expect("first Gemma stage embedding")
+                    .forward(tokens, stream)?
+                    .multiply(
+                        Array::from_f32((self.args.hidden_size as f32).sqrt()),
+                        stream,
+                    )?;
+                if self.args.hidden_size_per_layer_input == 0 {
+                    return Ok((hidden, PipelineAuxiliaryState::default()));
+                }
+                let width = self.args.hidden_size_per_layer_input;
+                let token_identity = self
+                    .per_layer_embedding
+                    .as_mut()
+                    .expect("first Gemma stage per-layer embedding")
+                    .forward(tokens, stream)?
+                    .multiply(Array::from_f32((width as f32).sqrt()), stream)?
+                    .reshape(
+                        &[
+                            tokens.shape()[0],
+                            tokens.shape()[1],
+                            self.args.num_hidden_layers,
+                            width,
+                        ],
+                        stream,
+                    )?;
+                let projected = self
+                    .per_layer_projection
+                    .as_mut()
+                    .expect("first Gemma stage per-layer projection")
+                    .forward(&hidden, stream)?
+                    .multiply(
+                        Array::from_f32((self.args.hidden_size as f32).sqrt().recip()),
+                        stream,
+                    )?
+                    .reshape(
+                        &[
+                            hidden.shape()[0],
+                            hidden.shape()[1],
+                            self.args.num_hidden_layers,
+                            width,
+                        ],
+                        stream,
+                    )?;
+                let projected = self
+                    .per_layer_norm
+                    .as_mut()
+                    .expect("first Gemma stage per-layer norm")
+                    .forward(&projected, stream)?;
+                let per_layer = projected
+                    .add(token_identity, stream)?
+                    .multiply(Array::from_f32(2.0_f32.powf(-0.5)), stream)?;
+                Ok((hidden, PipelineAuxiliaryState::new(vec![per_layer])))
+            }
+        }
+    }
+
+    fn forward(
+        &mut self,
+        input: PipelineStageInput<'_>,
+        step: PipelineStep,
+        explicit_mask: Option<&Array>,
+        caches: &mut [PipelineLayerCache],
+        stream: &Stream,
+    ) -> Result<PipelineStageOutput, Error> {
+        if caches.len() != self.layers.len() {
+            return Err(Error::Parallel(format!(
+                "Gemma stage cache has {} entries, expected {}",
+                caches.len(),
+                self.layers.len()
+            )));
+        }
+        let (mut hidden, auxiliary) = self.prepare_input(input, stream)?;
+        let offset = caches
+            .iter()
+            .filter_map(|cache| match cache {
+                PipelineLayerCache::StateSlots { .. } => None,
+                PipelineLayerCache::KeyValue {
+                    cache: PipelineKeyValueCache::Standard(cache),
+                    ..
+                } => Some(cache.offset()),
+                PipelineLayerCache::KeyValue {
+                    cache: PipelineKeyValueCache::Paged(cache),
+                    ..
+                } => Some(cache.offset()),
+                PipelineLayerCache::CompressedLatent { .. } => None,
+            })
+            .max()
+            .unwrap_or(0);
+        let generated_mask = (explicit_mask.is_none() && step.sequence_length > 1)
+            .then(|| create_causal_mask(step.sequence_length, Some(offset), None, None, stream))
+            .transpose()?;
+        let mask = explicit_mask.or(generated_mask.as_ref());
+        let per_layer_inputs = auxiliary.tensors().first();
+        let mut shared_kv = HashMap::new();
+        let args = &self.args;
+        hidden = execute_pipeline_layer_range(
+            PipelineLayerExecution {
+                range: self.range.clone(),
+                resident_layers: &mut self.layers,
+                dense_layers: self.dense_layers.as_ref(),
+                step,
+                caches,
+                hidden,
+                stream,
+            },
+            |global_layer, stream| {
+                let policy = *args
+                    .layer_policy(global_layer)
+                    .expect("validated Gemma pipeline range");
+                Ok(gemma4::TransformerBlock::new(
+                    args,
+                    policy,
+                    global_layer,
+                    stream,
+                )?)
+            },
+            |global_layer, layer, hidden, cache, stream| {
+                let policy = *args
+                    .layer_policy(global_layer)
+                    .expect("validated Gemma pipeline range");
+                let per_layer_input = per_layer_inputs
+                    .map(|inputs| {
+                        inputs.try_index_device((.., .., global_layer as i32, ..), stream)
+                    })
+                    .transpose()?;
+                let hidden = match cache {
+                    PipelineLayerCache::StateSlots {
+                        global_layer: cached,
+                        ..
+                    } if *cached == global_layer && !policy.key_value.owns_state() => layer
+                        .forward(
+                            gemma4::AttentionInput {
+                                x: hidden,
+                                mask,
+                                cache: Option::<&mut ConcatKeyValueCache>::None,
+                                position_offset: offset,
+                                per_layer_input: per_layer_input.as_ref(),
+                                shared_kv: Some(&mut shared_kv),
+                                disable_generated_mask: false,
+                                generated_sliding_window: None,
+                            },
+                            stream,
+                        )?,
+                    PipelineLayerCache::KeyValue {
+                        global_layer: cached,
+                        cache: PipelineKeyValueCache::Standard(cache),
+                        ..
+                    } if *cached == global_layer && policy.key_value.owns_state() => layer
+                        .forward(
+                            gemma4::AttentionInput {
+                                x: hidden,
+                                mask,
+                                cache: Some(cache),
+                                position_offset: offset,
+                                per_layer_input: per_layer_input.as_ref(),
+                                shared_kv: Some(&mut shared_kv),
+                                disable_generated_mask: false,
+                                generated_sliding_window: None,
+                            },
+                            stream,
+                        )?,
+                    PipelineLayerCache::KeyValue {
+                        global_layer: cached,
+                        cache: PipelineKeyValueCache::Paged(cache),
+                        ..
+                    } if *cached == global_layer && policy.key_value.owns_state() => layer
+                        .forward(
+                            gemma4::AttentionInput {
+                                x: hidden,
+                                mask,
+                                cache: Some(cache),
+                                position_offset: offset,
+                                per_layer_input: per_layer_input.as_ref(),
+                                shared_kv: Some(&mut shared_kv),
+                                disable_generated_mask: false,
+                                generated_sliding_window: None,
+                            },
+                            stream,
+                        )?,
+                    _ => {
+                        return Err(Error::Parallel(format!(
+                            "Gemma stage cache does not match global layer {global_layer}"
+                        )))
+                    }
+                };
+                let retained = shared_kv
+                    .values()
+                    .flat_map(|(keys, values)| [keys.clone(), values.clone()])
+                    .collect();
+                Ok(PipelineLayerForward { hidden, retained })
+            },
+        )?;
+        let output = if let Some(norm) = &mut self.norm {
+            hidden = norm.forward(&hidden, stream)?;
+            let mut logits = if let Some(head) = &mut self.lm_head {
+                head.forward(&hidden, stream)?
+            } else {
+                self.output_embedding
+                    .as_mut()
+                    .or(self.embedding.as_mut())
+                    .expect("last tied Gemma stage output embedding")
+                    .as_linear(&hidden, stream)?
+            };
+            if let Some(softcap) = self.args.final_logit_softcapping {
+                logits = tanh(&logits.divide(Array::from_f32(softcap), stream)?, stream)?
+                    .multiply(Array::from_f32(softcap), stream)?;
+            }
+            PipelineStageOutput::Logits(logits)
+        } else {
+            PipelineStageOutput::Hidden(PipelinePayload { hidden, auxiliary })
+        };
         Ok(output)
     }
 }
@@ -1875,81 +6782,70 @@ fn load_deepseek_pipeline(
         ModelKind::DeepSeekV3,
         source_args.hidden_size,
     );
-    let mut plan = PlacementPlan::new(topology);
-    let embedding = linear::unloaded_maybe_quantized_embedding(
-        source_args.vocab_size,
-        source_args.hidden_size,
-        source_args.weight_quantization_for("model.embed_tokens.weight"),
-        stream,
+    let mut stage = DeepSeekStage::new(target_args.clone(), range, &info, stream)?;
+    let binding_adapter =
+        crate::architectures::deepseek_v3::layerwise::DeepSeekV3LayerwiseAdapter::new(
+            source_args.clone(),
+            stream,
+        )?;
+    let static_units = pipeline_binding_units(
+        &binding_adapter,
+        store.as_ref(),
+        &selected_pipeline_static_roles([
+            ("embedding", stage.embedding.is_some()),
+            ("norm", stage.norm.is_some()),
+            ("output", stage.lm_head.is_some()),
+        ]),
     )?;
-    insert_module_plan(&mut plan, &embedding, "model.embed_tokens", info.is_first);
-    for global_layer in 0..source_args.layer_schedule.len() {
-        let layer = deepseek_v3::DecoderLayer::new(&source_args, global_layer as i32, stream)?;
-        let local = range.contains(&global_layer) && dense_stream.is_none();
-        insert_module_plan(
-            &mut plan,
-            &layer,
-            &format!("model.layers.{global_layer}"),
-            local,
-        );
-        if source_args.layer_policy(global_layer) == Some(&deepseek_v3::LayerPolicy::SparseMoe) {
-            insert_deepseek_expert_plan(
-                &mut plan,
-                &source_args,
-                global_layer,
-                local,
-                quantize_on_load.is_some(),
-            );
-        }
+    let mut loaded = PipelineLoadAccumulator::new("DeepSeek");
+    if let Some(module) = &mut stage.embedding {
+        loaded.load(
+            module,
+            store.as_ref(),
+            pipeline_static_bindings(&static_units, "embedding")?,
+            quantize_on_load,
+            weights_stream,
+            stream,
+        )?;
     }
-    let norm = nn::RmsNorm::unloaded(
-        source_args.hidden_size,
-        source_args.rms_norm_eps,
-        Dtype::Float32,
-        stream,
-    )?;
-    insert_module_plan(&mut plan, &norm, "model.norm", info.is_last);
-    let head = linear::unloaded_maybe_quantized_linear(
-        source_args.hidden_size,
-        source_args.vocab_size,
-        false,
-        source_args.weight_quantization_for("lm_head.weight"),
-        stream,
-    )?;
-    insert_module_plan(&mut plan, &head, "lm_head", info.is_last);
-    let mut strict = StrictLoadConfig::default();
-    for index in 0..source_args.num_nextn_predict_layers {
-        strict = strict.allow_unused_prefix(format!(
-            "model.layers.{}.",
-            source_args.num_hidden_layers + index
-        ));
+    if let Some(module) = &mut stage.norm {
+        loaded.load(
+            module,
+            store.as_ref(),
+            pipeline_static_bindings(&static_units, "norm")?,
+            quantize_on_load,
+            weights_stream,
+            stream,
+        )?;
     }
-    strict = pipeline_load_config(dense_stream, strict);
-    let partition = load_partition(store.as_ref(), &plan, weights_stream, stream, &strict)?;
-    info.activation_dtype = infer_activation_dtype(&partition);
-    info.local_parameter_bytes = partition.tensors().map(|(_, value)| value.nbytes()).sum();
-    let static_device_bytes = u64::try_from(info.local_parameter_bytes)
-        .map_err(|_| Error::Parallel("pipeline static parameter byte total overflowed".into()))?;
-    info.opened_checkpoint_shards = partition.opened_shards().to_vec();
-    info.owned_tensors = partition
-        .tensors()
-        .map(|(name, _)| checkpoint_name(name))
-        .collect();
-    info.owned_tensors.sort();
-    let mut tensors = partition.into_tensors();
-    let mut stage = DeepSeekStage::new(target_args, range, &info, stream)?;
-    stage.load(
-        &mut tensors,
-        quantize_on_load,
-        dense_stream.is_none(),
-        stream,
-    )?;
-    if let Some(dense_stream) = dense_stream {
-        let binding_adapter =
-            crate::architectures::deepseek_v3::layerwise::DeepSeekV3LayerwiseAdapter::new(
-                source_args.clone(),
+    if let Some(module) = &mut stage.lm_head {
+        loaded.load(
+            module,
+            store.as_ref(),
+            pipeline_static_bindings(&static_units, "output")?,
+            quantize_on_load,
+            weights_stream,
+            stream,
+        )?;
+    }
+    if dense_stream.is_none() {
+        for (global_layer, layer) in stage.range.clone().zip(&mut stage.layers) {
+            let source_layer = binding_adapter.new_layer(0, global_layer, stream)?;
+            let bindings =
+                binding_adapter.layer_bindings(0, global_layer, &source_layer, store.as_ref())?;
+            loaded.load(
+                layer,
+                store.as_ref(),
+                &bindings,
+                quantize_on_load,
+                weights_stream,
                 stream,
             )?;
+        }
+    }
+    let static_device_bytes = loaded.finish(&mut info)?;
+    let materialized_shards = store.diagnostics()?.touched_shard_paths;
+    if let Some(dense_stream) = dense_stream {
         stage.dense_layers = Some(build_pipeline_dense_layers(
             Arc::clone(&store),
             stage.range.clone(),
@@ -1959,7 +6855,7 @@ fn load_deepseek_pipeline(
             weights_stream,
             |global_layer, stream| {
                 Ok(deepseek_v3::DecoderLayer::new_layerwise(
-                    &source_args,
+                    &target_args,
                     global_layer as i32,
                     stream,
                 )?)
@@ -1977,59 +6873,8 @@ fn load_deepseek_pipeline(
     } else {
         info.planned_owned_parameter_bytes = static_device_bytes;
     }
-    if !tensors.is_empty() {
-        let mut unused = tensors.into_keys().collect::<Vec<_>>();
-        unused.sort();
-        return Err(Error::StrictLoadValidation {
-            missing: Vec::new(),
-            unused,
-        });
-    }
-    Ok(PipelineModel {
-        topology,
-        info,
-        stage: ArchitectureStage::DeepSeek(stage),
-    })
-}
-
-fn insert_deepseek_expert_plan(
-    plan: &mut PlacementPlan,
-    args: &deepseek_v3::ModelArgs,
-    layer: usize,
-    local: bool,
-    dense_source: bool,
-) {
-    let placement = if local {
-        TensorPlacement::Local
-    } else {
-        TensorPlacement::Omit
-    };
-    let components: &[&str] = if dense_source {
-        &["weight"]
-    } else if args.native_fp8_config().is_some() {
-        &["weight", "weight_scale_inv"]
-    } else if let Some(quantization) = args
-        .affine_quantization()
-        .expect("validated DeepSeek quantization")
-    {
-        if quantization.has_biases() {
-            &["weight", "scales", "biases"]
-        } else {
-            &["weight", "scales"]
-        }
-    } else {
-        &["weight"]
-    };
-    for expert in 0..args.n_routed_experts {
-        for projection in ["gate_proj", "up_proj", "down_proj"] {
-            for component in components {
-                plan.insert(
-                    format!("model.layers.{layer}.mlp.experts.{expert}.{projection}.{component}"),
-                    placement.clone(),
-                );
-            }
-        }
-    }
+    info.opened_checkpoint_shards = materialized_shards;
+    PipelineModel::from_adapter(topology, info, PipelineStage(stage))
 }
 
 impl DeepSeekStage {
@@ -2083,62 +6928,12 @@ impl DeepSeekStage {
         })
     }
 
-    fn load(
-        &mut self,
-        tensors: &mut HashMap<String, Array>,
-        quantization: Option<WeightQuantization>,
-        load_layers: bool,
-        stream: &Stream,
-    ) -> Result<(), Error> {
-        if let Some(embedding) = &mut self.embedding {
-            assign_module(
-                embedding,
-                "model.embed_tokens",
-                tensors,
-                quantization,
-                stream,
-            )?;
-        }
-        if load_layers {
-            for (global_layer, layer) in self.range.clone().zip(&mut self.layers) {
-                assign_module(
-                    layer,
-                    &format!("model.layers.{global_layer}"),
-                    tensors,
-                    quantization,
-                    stream,
-                )?;
-                if let Some(moe) = layer.mlp.moe_mut() {
-                    load_deepseek_experts(
-                        moe,
-                        global_layer,
-                        (
-                            self.args.n_routed_experts,
-                            self.args.hidden_size,
-                            self.args.moe_intermediate_size,
-                        ),
-                        tensors,
-                        quantization,
-                        stream,
-                    )?;
-                }
-            }
-        }
-        if let Some(norm) = &mut self.norm {
-            assign_module(norm, "model.norm", tensors, None, stream)?;
-        }
-        if let Some(head) = &mut self.lm_head {
-            assign_module(head, "lm_head", tensors, quantization, stream)?;
-        }
-        Ok(())
-    }
-
     fn forward(
         &mut self,
         input: PipelineStageInput<'_>,
         step: PipelineStep,
         explicit_mask: Option<&Array>,
-        caches: &mut [PipelineDeepSeekLayerCache],
+        caches: &mut [PipelineLayerCache],
         stream: &Stream,
     ) -> Result<PipelineStageOutput, Error> {
         if caches.len() != self.layers.len() {
@@ -2148,73 +6943,63 @@ impl DeepSeekStage {
                 self.layers.len()
             )));
         }
-        let mut hidden = match input {
-            PipelineStageInput::Tokens(tokens) => self
-                .embedding
-                .as_mut()
-                .expect("first stage embedding")
-                .forward(tokens, stream)?,
-            PipelineStageInput::Hidden(hidden) => hidden.clone(),
+        let (mut hidden, auxiliary) = match input {
+            PipelineStageInput::Tokens(tokens) => (
+                self.embedding
+                    .as_mut()
+                    .expect("first stage embedding")
+                    .forward(tokens, stream)?,
+                PipelineAuxiliaryState::default(),
+            ),
+            PipelineStageInput::Hidden(payload) => {
+                (payload.hidden.clone(), payload.auxiliary.clone())
+            }
         };
-        let offset = caches.first().map_or(0, |cache| cache.cache.offset());
+        let offset = caches.first().map_or(0, |cache| match cache {
+            PipelineLayerCache::CompressedLatent { cache, .. } => cache.offset(),
+            _ => 0,
+        });
         let generated_mask = (explicit_mask.is_none() && step.sequence_length > 1 && offset > 0)
             .then(|| create_causal_mask(step.sequence_length, Some(offset), None, None, stream))
             .transpose()?;
         let mask = explicit_mask.or(generated_mask.as_ref());
-        let dense_forward = self
-            .dense_layers
-            .as_ref()
-            .map(|dense| {
-                dense
-                    .controller
-                    .forward_guard(step.sequence_length > 1, &dense.residency)
-            })
-            .transpose()?;
-        if let Some(dense_layers) = &self.dense_layers {
-            let dense_guard = dense_layers
-                .controller
-                .group_guard(&dense_layers.residency, "pipeline_stage");
-            for (local_index, (global_layer, cache)) in
-                self.range.clone().zip(caches.iter_mut()).enumerate()
-            {
-                if cache.global_layer != global_layer {
-                    return Err(Error::Parallel(format!(
-                        "DeepSeek stage cache does not match global layer {global_layer}"
-                    )));
-                }
-                let (_host_lease, lease) =
-                    dense_layers.prepare(local_index, step.sequence_length > 1)?;
-                let mut layer = deepseek_v3::DecoderLayer::new_layerwise(
-                    &self.args,
+        let args = &self.args;
+        hidden = execute_pipeline_layer_range(
+            PipelineLayerExecution {
+                range: self.range.clone(),
+                resident_layers: &mut self.layers,
+                dense_layers: self.dense_layers.as_ref(),
+                step,
+                caches,
+                hidden,
+                stream,
+            },
+            |global_layer, stream| {
+                Ok(deepseek_v3::DecoderLayer::new_layerwise(
+                    args,
                     global_layer as i32,
                     stream,
-                )?;
-                populate_module_from_lease(&mut layer, &lease)?;
-                hidden = layer.forward_stage(&hidden, mask, Some(&mut cache.cache), stream)?;
-                let retained = cache
-                    .cache
-                    .arrays()
-                    .into_iter()
-                    .flat_map(|(latent, rotary)| [latent, rotary]);
-                eval(std::iter::once(&hidden).chain(retained))?;
-                stream.synchronize()?;
-            }
-            dense_guard.complete()?;
-        } else {
-            for ((global_layer, layer), cache) in self
-                .range
-                .clone()
-                .zip(&mut self.layers)
-                .zip(caches.iter_mut())
-            {
-                if cache.global_layer != global_layer {
+                )?)
+            },
+            |global_layer, layer, hidden, cache, stream| {
+                let PipelineLayerCache::CompressedLatent {
+                    global_layer: cached_layer,
+                    cache,
+                    ..
+                } = cache
+                else {
+                    return Err(Error::Parallel(format!(
+                        "DeepSeek stage cache is not compressed-latent state at global layer {global_layer}"
+                    )));
+                };
+                if *cached_layer != global_layer {
                     return Err(Error::Parallel(format!(
                         "DeepSeek stage cache does not match global layer {global_layer}"
                     )));
                 }
-                hidden = layer.forward_stage(&hidden, mask, Some(&mut cache.cache), stream)?;
-            }
-        }
+                Ok(layer.forward_stage(hidden, mask, Some(cache), stream)?)
+            },
+        )?;
         let output = if let Some(norm) = &mut self.norm {
             hidden = norm.forward(&hidden, stream)?;
             let logits = self
@@ -2224,11 +7009,8 @@ impl DeepSeekStage {
                 .forward(&hidden, stream)?;
             PipelineStageOutput::Logits(logits)
         } else {
-            PipelineStageOutput::Hidden(hidden)
+            PipelineStageOutput::Hidden(PipelinePayload { hidden, auxiliary })
         };
-        if let Some(guard) = dense_forward {
-            guard.complete()?;
-        }
         Ok(output)
     }
 }
@@ -2392,7 +7174,7 @@ pub fn forward_stage_with_observer(
                 "model.layers.{}.pipeline_stage_output",
                 model.info.global_layer_range.end - 1
             ),
-            hidden,
+            &hidden.hidden,
         )?,
         PipelineStageOutput::Logits(logits) => observer.observe("lm_head.logits", logits)?,
     }
@@ -2403,7 +7185,11 @@ pub fn forward_stage_with_observer(
 mod tests {
     use super::*;
     use crate::{runtime::distributed::topology::DeviceAssignment, test_utils::SyntheticGguf};
-    use safemlx::{module::Param, ops::ones_dtype, Device, DeviceType, ExecutionContext};
+    use safemlx::{
+        module::Param,
+        ops::{indexing::TryIndexOp, ones_dtype},
+        Device, DeviceType, ExecutionContext,
+    };
     use std::fs;
 
     fn topology(world: usize, rank: usize, pp: usize) -> ParallelTopology {
@@ -2473,17 +7259,241 @@ mod tests {
 
     #[test]
     fn cache_reports_only_local_global_layers() {
-        let cache = PipelineCache::Llama(vec![
-            PipelineLlamaLayerCache::Standard {
-                global_layer: 3,
-                cache: ConcatKeyValueCache::new(),
-            },
-            PipelineLlamaLayerCache::Standard {
-                global_layer: 4,
-                cache: ConcatKeyValueCache::new(),
-            },
-        ]);
+        let cache = PipelineCache::new(
+            ModelKind::Llama,
+            vec![
+                PipelineLayerCache::KeyValue {
+                    global_layer: 3,
+                    cache: PipelineKeyValueCache::Standard(ConcatKeyValueCache::new()),
+                    slots: Vec::new(),
+                },
+                PipelineLayerCache::KeyValue {
+                    global_layer: 4,
+                    cache: PipelineKeyValueCache::Standard(ConcatKeyValueCache::new()),
+                    slots: Vec::new(),
+                },
+            ],
+        );
         assert_eq!(cache.global_layers(), vec![3, 4]);
+    }
+
+    #[test]
+    fn semantic_cache_layout_materializes_without_architecture_dispatch() {
+        let layout = crate::LayerSchedule::new(
+            3,
+            vec![
+                crate::LayerCachePolicy::NoState,
+                crate::LayerCachePolicy::key_value(crate::AttentionPolicy::Full, 2, 4).unwrap(),
+                crate::LayerCachePolicy::compressed_latent_rotary(
+                    crate::AttentionPolicy::Full,
+                    4,
+                    2,
+                )
+                .unwrap(),
+            ],
+        )
+        .unwrap();
+        let identity = pipeline_prompt_cache_identity(
+            topology(2, 0, 2),
+            "synthetic",
+            "synthetic",
+            "synthetic".into(),
+            5,
+            2..5,
+            layout,
+        );
+        let layers = materialize_pipeline_cache_layers(&identity, None).unwrap();
+        assert!(matches!(
+            layers.as_slice(),
+            [
+                PipelineLayerCache::StateSlots {
+                    global_layer: 2,
+                    slots,
+                },
+                PipelineLayerCache::KeyValue {
+                    global_layer: 3,
+                    ..
+                },
+                PipelineLayerCache::CompressedLatent {
+                    global_layer: 4,
+                    ..
+                }
+            ] if slots.is_empty()
+        ));
+
+        let unsupported = pipeline_prompt_cache_identity(
+            topology(2, 0, 2),
+            "synthetic",
+            "synthetic",
+            "synthetic-fixed".into(),
+            1,
+            0..1,
+            crate::LayerSchedule::new(
+                1,
+                vec![crate::LayerCachePolicy::FixedState {
+                    tensors: vec![crate::runtime::cache::residency::StateTensorPolicy {
+                        role: crate::runtime::cache::residency::StateTensorRole::Recurrent,
+                        shape: vec![crate::runtime::cache::residency::StateTensorDimension::Scalar],
+                        dtype: crate::runtime::cache::residency::StateTensorDtype::Float32,
+                        required: true,
+                    }],
+                }],
+            )
+            .unwrap(),
+        );
+        let fixed = materialize_pipeline_cache_layers(&unsupported, None).unwrap();
+        let PipelineLayerCache::StateSlots {
+            global_layer,
+            slots,
+        } = &fixed[0]
+        else {
+            panic!("fixed state must materialize descriptor-backed slots")
+        };
+        assert_eq!(*global_layer, 0);
+        assert_eq!(slots.len(), 1);
+        assert_eq!(
+            slots[0].policy().role,
+            crate::runtime::cache::residency::StateTensorRole::Recurrent
+        );
+        assert!(slots[0].value().is_none());
+        assert_eq!(slots[0].offset(), 0);
+    }
+
+    #[test]
+    fn semantic_state_slots_reset_and_reject_inconsistent_offsets() {
+        let policy = StateTensorPolicy::new(
+            StateTensorRole::Recurrent,
+            vec![crate::runtime::cache::residency::StateTensorDimension::Scalar],
+            crate::runtime::cache::residency::StateTensorDtype::Float32,
+        )
+        .unwrap();
+        let mut first = PipelineStateSlot::empty(policy.clone());
+        first.value = Some(Array::from_f32(1.0));
+        first.offset = 3;
+        let mut second = PipelineStateSlot::empty(policy);
+        second.offset = 2;
+        let mut cache = PipelineCache::new(
+            ModelKind::Lfm2,
+            vec![
+                PipelineLayerCache::StateSlots {
+                    global_layer: 4,
+                    slots: vec![first],
+                },
+                PipelineLayerCache::StateSlots {
+                    global_layer: 5,
+                    slots: vec![second],
+                },
+            ],
+        );
+        let error = pipeline_state_offset("synthetic", &cache.layers)
+            .expect_err("different semantic state offsets must fail closed");
+        assert!(error.to_string().contains("global layer 5"));
+        cache.reset().unwrap();
+        assert_eq!(
+            pipeline_state_offset("synthetic", &cache.layers).unwrap(),
+            0
+        );
+        for layer in cache.layers() {
+            let PipelineLayerCache::StateSlots { slots, .. } = layer else {
+                unreachable!()
+            };
+            assert_eq!(slots[0].policy().role, StateTensorRole::Recurrent);
+            assert!(slots[0].value().is_none());
+            assert_eq!(slots[0].offset(), 0);
+        }
+    }
+
+    #[test]
+    fn recurrent_pipeline_layouts_use_only_semantic_cache_variants() {
+        use crate::runtime::cache::residency::{StateTensorDimension, StateTensorDtype};
+
+        let tensor = |role| {
+            StateTensorPolicy::new(
+                role,
+                vec![
+                    StateTensorDimension::Batch,
+                    StateTensorDimension::fixed(1).unwrap(),
+                ],
+                StateTensorDtype::Float32,
+            )
+            .unwrap()
+        };
+        let kimi_kda = crate::LayerCachePolicy::FixedState {
+            tensors: vec![
+                tensor(StateTensorRole::Convolution { slot: 0 }),
+                tensor(StateTensorRole::Convolution { slot: 1 }),
+                tensor(StateTensorRole::Convolution { slot: 2 }),
+                tensor(StateTensorRole::Recurrent),
+            ],
+        };
+        let nemotron_mamba = crate::LayerCachePolicy::FixedState {
+            tensors: vec![
+                tensor(StateTensorRole::Convolution { slot: 0 }),
+                tensor(StateTensorRole::Recurrent),
+            ],
+        };
+        let qwen_linear = nemotron_mamba.clone();
+        let inkling = crate::LayerCachePolicy::key_value_with_fixed_state(
+            crate::AttentionPolicy::Sliding {
+                window: std::num::NonZeroU32::new(8).unwrap(),
+            },
+            2,
+            4,
+            (0..4)
+                .map(|slot| tensor(StateTensorRole::Convolution { slot }))
+                .collect(),
+        )
+        .unwrap();
+        let layout = crate::LayerSchedule::new(
+            5,
+            vec![
+                kimi_kda,
+                crate::LayerCachePolicy::compressed_latent_rotary(
+                    crate::AttentionPolicy::Full,
+                    4,
+                    2,
+                )
+                .unwrap(),
+                nemotron_mamba,
+                qwen_linear,
+                inkling,
+            ],
+        )
+        .unwrap();
+        let identity = pipeline_prompt_cache_identity(
+            topology(2, 0, 2),
+            "hybrid",
+            "hybrid",
+            "hybrid-layout".into(),
+            5,
+            0..5,
+            layout,
+        );
+        let layers = materialize_pipeline_cache_layers(&identity, None).unwrap();
+        assert!(matches!(
+            &layers[0],
+            PipelineLayerCache::StateSlots { slots, .. } if slots.len() == 4
+        ));
+        assert!(matches!(
+            &layers[1],
+            PipelineLayerCache::CompressedLatent { slots, .. } if slots.is_empty()
+        ));
+        assert!(matches!(
+            &layers[2],
+            PipelineLayerCache::StateSlots { slots, .. } if slots.len() == 2
+        ));
+        assert!(matches!(
+            &layers[3],
+            PipelineLayerCache::StateSlots { slots, .. } if slots.len() == 2
+        ));
+        assert!(matches!(
+            &layers[4],
+            PipelineLayerCache::KeyValue {
+                cache: PipelineKeyValueCache::Standard(cache),
+                slots,
+                ..
+            } if cache.max_size() == Some(8) && slots.len() == 4
+        ));
     }
 
     fn gpu_topology(rank: usize) -> ParallelTopology {
@@ -2495,12 +7505,15 @@ mod tests {
         for (name, parameter) in module.parameters_mut().flatten() {
             let shape = parameter.shape().to_vec();
             let dtype = parameter.dtype();
-            *parameter =
-                if name.ends_with("layernorm.weight") || name.as_ref() == "model.norm.weight" {
-                    ones_dtype(&shape, dtype, stream).unwrap()
-                } else {
-                    Array::full::<f32>(&shape, Array::from_f32(0.01), stream).unwrap()
-                };
+            *parameter = if name.ends_with("_scales") {
+                Array::full::<u8>(&shape, Array::from_slice(&[127u8], &[]), stream).unwrap()
+            } else if name.ends_with("_blocks") {
+                Array::full::<u8>(&shape, Array::from_slice(&[0x11u8], &[]), stream).unwrap()
+            } else if name.ends_with("norm.weight") {
+                ones_dtype(&shape, dtype, stream).unwrap()
+            } else {
+                Array::full::<f32>(&shape, Array::from_f32(0.01), stream).unwrap()
+            };
         }
     }
 
@@ -2511,6 +7524,1109 @@ mod tests {
         for (left, right) in left.as_slice::<f32>().iter().zip(right.as_slice::<f32>()) {
             assert!((left - right).abs() <= 1e-5, "{left} != {right}");
         }
+    }
+
+    fn write_parameter_fixture(
+        dir: &Path,
+        config: &serde_json::Value,
+        model: &impl ModuleParameters,
+    ) {
+        let arrays = model
+            .parameters()
+            .flatten()
+            .iter()
+            .map(|(name, value)| {
+                (
+                    crate::runtime::checkpoint::binding::canonical_checkpoint_name(name),
+                    (*value).clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        Array::save_safetensors(
+            arrays.iter().map(|(name, value)| (name.as_str(), value)),
+            None,
+            dir.join("model.safetensors"),
+        )
+        .unwrap();
+        fs::write(dir.join("config.json"), serde_json::to_vec(config).unwrap()).unwrap();
+    }
+
+    fn write_split_qwen3_moe_fixture(
+        dir: &Path,
+        config: &serde_json::Value,
+        model: &dense_qwen::Model,
+        stream: &Stream,
+    ) {
+        let mut arrays = Vec::new();
+        for (name, value) in model.parameters().flatten() {
+            let name = crate::runtime::checkpoint::binding::canonical_checkpoint_name(&name);
+            if let Some(prefix) = name.strip_suffix(".mlp.experts.gate_up_proj") {
+                for expert in 0..model.args.num_experts {
+                    let selected = value.try_index_device(expert, stream).unwrap();
+                    let intermediate = model.args.moe_intermediate_size;
+                    arrays.push((
+                        format!("{prefix}.mlp.experts.{expert}.gate_proj.weight"),
+                        selected
+                            .try_index_device((..intermediate, ..), stream)
+                            .unwrap(),
+                    ));
+                    arrays.push((
+                        format!("{prefix}.mlp.experts.{expert}.up_proj.weight"),
+                        selected
+                            .try_index_device((intermediate.., ..), stream)
+                            .unwrap(),
+                    ));
+                }
+                continue;
+            }
+            if let Some(prefix) = name.strip_suffix(".mlp.experts.down_proj") {
+                for expert in 0..model.args.num_experts {
+                    arrays.push((
+                        format!("{prefix}.mlp.experts.{expert}.down_proj.weight"),
+                        value.try_index_device(expert, stream).unwrap(),
+                    ));
+                }
+                continue;
+            }
+            arrays.push((name, value.clone()));
+        }
+        Array::save_safetensors(
+            arrays.iter().map(|(name, value)| (name.as_str(), value)),
+            None,
+            dir.join("model.safetensors"),
+        )
+        .unwrap();
+        fs::write(dir.join("config.json"), serde_json::to_vec(config).unwrap()).unwrap();
+    }
+
+    fn run_pipeline_sequence(
+        first: &mut PipelineModel,
+        last: &mut PipelineModel,
+        token_batches: &[Array],
+        stream: &Stream,
+    ) -> Vec<Array> {
+        let mut first_cache = first.new_cache().unwrap();
+        let mut last_cache = last.new_cache().unwrap();
+        let mut outputs = Vec::with_capacity(token_batches.len());
+        for tokens in token_batches {
+            let step = PipelineStep::new(1, tokens.shape()[1]).unwrap();
+            let hidden = match first
+                .forward_stage(
+                    PipelineStageInput::Tokens(tokens),
+                    step,
+                    None,
+                    &mut first_cache,
+                    stream,
+                )
+                .unwrap()
+            {
+                PipelineStageOutput::Hidden(hidden) => hidden,
+                PipelineStageOutput::Logits(_) => panic!("first stage produced logits"),
+            };
+            let logits = match last
+                .forward_stage(
+                    PipelineStageInput::Hidden(&hidden),
+                    step,
+                    None,
+                    &mut last_cache,
+                    stream,
+                )
+                .unwrap()
+            {
+                PipelineStageOutput::Logits(logits) => logits,
+                PipelineStageOutput::Hidden(_) => panic!("last stage produced hidden state"),
+            };
+            eval([&logits]).unwrap();
+            outputs.push(logits);
+        }
+        outputs
+    }
+
+    fn dense_stream_options() -> crate::runtime::residency::dense_stream::DenseDiskStreamLoadOptions
+    {
+        crate::runtime::residency::dense_stream::DenseDiskStreamLoadOptions::new(
+            u64::MAX,
+            u64::MAX,
+            1,
+            1,
+            1,
+        )
+        .unwrap()
+    }
+
+    fn dense_qwen_config(model_type: &str, tied: bool) -> serde_json::Value {
+        let is_moe = model_type == "qwen3_moe";
+        let mut config = serde_json::json!({
+            "architectures": [match model_type {
+                "qwen2" => "Qwen2ForCausalLM",
+                "qwen3" => "Qwen3ForCausalLM",
+                "qwen3_moe" => "Qwen3MoeForCausalLM",
+                _ => panic!("unsupported dense-Qwen test model type {model_type}"),
+            }],
+            "model_type": model_type,
+            "hidden_size": 32,
+            "num_hidden_layers": 2,
+            "intermediate_size": if is_moe { 0 } else { 64 },
+            "num_attention_heads": 4,
+            "num_key_value_heads": 2,
+            "head_dim": 8,
+            "rms_norm_eps": 0.000001,
+            "vocab_size": 32,
+            "max_position_embeddings": 128,
+            "rope_theta": 10000.0,
+            "tie_word_embeddings": tied,
+            "attention_bias": model_type == "qwen2",
+            "mlp_bias": false,
+            "moe_intermediate_size": if is_moe { 32 } else { 0 },
+            "num_experts": if is_moe { 4 } else { 0 },
+            "num_experts_per_tok": if is_moe { 2 } else { 0 },
+            "norm_topk_prob": is_moe
+        });
+        if model_type == "qwen2" {
+            config["use_sliding_window"] = serde_json::json!(true);
+            config["sliding_window"] = serde_json::json!(3);
+            config["max_window_layers"] = serde_json::json!(1);
+        }
+        config
+    }
+
+    fn qwen_hybrid_config() -> serde_json::Value {
+        serde_json::json!({
+            "architectures": ["Qwen3NextForCausalLM"],
+            "model_type": "qwen3_next",
+            "vocab_size": 32,
+            "hidden_size": 16,
+            "num_hidden_layers": 2,
+            "num_attention_heads": 2,
+            "num_key_value_heads": 1,
+            "head_dim": 8,
+            "max_position_embeddings": 128,
+            "intermediate_size": 32,
+            "num_experts": 0,
+            "linear_conv_kernel_dim": 3,
+            "linear_key_head_dim": 4,
+            "linear_value_head_dim": 4,
+            "linear_num_key_heads": 2,
+            "linear_num_value_heads": 2,
+            "layer_types": ["linear_attention", "full_attention"],
+            "tie_word_embeddings": false
+        })
+    }
+
+    fn gpt_oss_config() -> serde_json::Value {
+        serde_json::json!({
+            "model_type": "gpt_oss",
+            "hidden_size": 64,
+            "intermediate_size": 96,
+            "num_hidden_layers": 2,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 2,
+            "head_dim": 32,
+            "vocab_size": 64,
+            "num_local_experts": 2,
+            "num_experts_per_tok": 1,
+            "rms_norm_eps": 0.00001,
+            "sliding_window": 3,
+            "max_position_embeddings": 128,
+            "rope_theta": 150000.0,
+            "layer_types": ["sliding_attention", "full_attention"],
+            "quantization_config": {"quant_method": "mxfp4"},
+            "swiglu_limit": 7.0
+        })
+    }
+
+    fn lfm2_config(moe: bool) -> serde_json::Value {
+        serde_json::json!({
+            "model_type": if moe { "lfm2_moe" } else { "lfm2" },
+            "vocab_size": 16,
+            "hidden_size": 12,
+            "intermediate_size": 17,
+            "num_hidden_layers": 2,
+            "num_attention_heads": 6,
+            "num_key_value_heads": 3,
+            "max_position_embeddings": 64,
+            "norm_eps": 0.00001,
+            "layer_types": ["conv", "full_attention"],
+            "conv_L_cache": 3,
+            "conv_bias": true,
+            "block_auto_adjust_ff_dim": false,
+            "tie_word_embeddings": false,
+            "moe_intermediate_size": if moe { 9 } else { 0 },
+            "num_dense_layers": if moe { 1 } else { 0 },
+            "num_experts": if moe { 2 } else { 0 },
+            "num_experts_per_tok": if moe { 1 } else { 0 },
+            "norm_topk_prob": moe,
+            "use_expert_bias": moe
+        })
+    }
+
+    fn lfm2_gguf_fixture(model: &lfm2::Model, stream: &Stream) -> SyntheticGguf {
+        let arrays = model
+            .parameters()
+            .flatten()
+            .into_iter()
+            .map(|(name, value)| {
+                let canonical =
+                    crate::runtime::checkpoint::binding::canonical_checkpoint_name(&name);
+                let gguf = match canonical.as_str() {
+                    "model.embed_tokens.weight" => "token_embd.weight".into(),
+                    "model.embedding_norm.weight" => "token_embd_norm.weight".into(),
+                    "lm_head.weight" => "output.weight".into(),
+                    name => name
+                        .replace("model.layers.", "blk.")
+                        .replace(".conv.conv.", ".shortconv.conv.")
+                        .replace(".conv.in_proj.", ".shortconv.in_proj.")
+                        .replace(".conv.out_proj.", ".shortconv.out_proj.")
+                        .replace(".self_attn.q_layernorm.", ".attn_q_norm.")
+                        .replace(".self_attn.k_layernorm.", ".attn_k_norm.")
+                        .replace(".self_attn.q_proj.", ".attn_q.")
+                        .replace(".self_attn.k_proj.", ".attn_k.")
+                        .replace(".self_attn.v_proj.", ".attn_v.")
+                        .replace(".self_attn.out_proj.", ".attn_output.")
+                        .replace(".operator_norm.", ".attn_norm.")
+                        .replace(".feed_forward.w1.", ".ffn_gate.")
+                        .replace(".feed_forward.w2.", ".ffn_down.")
+                        .replace(".feed_forward.w3.", ".ffn_up."),
+                };
+                let value = if canonical.ends_with(".conv.conv.weight") {
+                    value
+                        .reshape(&[value.shape()[0], value.shape()[2]], stream)
+                        .unwrap()
+                } else {
+                    value.clone()
+                };
+                (gguf, value)
+            })
+            .collect::<HashMap<_, _>>();
+        let metadata = HashMap::from([
+            (
+                "general.architecture".into(),
+                GgufMetadataValue::String("lfm2".into()),
+            ),
+            ("general.file_type".into(), GgufMetadataValue::Uint32(0)),
+            ("lfm2.block_count".into(), GgufMetadataValue::Uint32(2)),
+            (
+                "lfm2.embedding_length".into(),
+                GgufMetadataValue::Uint32(12),
+            ),
+            (
+                "lfm2.feed_forward_length".into(),
+                GgufMetadataValue::Uint32(17),
+            ),
+            (
+                "lfm2.attention.head_count".into(),
+                GgufMetadataValue::Uint32(6),
+            ),
+            (
+                "lfm2.attention.head_count_kv".into(),
+                GgufMetadataValue::Array(safemlx::ops::GgufMetadataArray::Uint32(vec![0, 3])),
+            ),
+            (
+                "lfm2.attention.layer_norm_rms_epsilon".into(),
+                GgufMetadataValue::Float32(0.00001),
+            ),
+            ("lfm2.context_length".into(), GgufMetadataValue::Uint32(64)),
+            (
+                "lfm2.shortconv.l_cache".into(),
+                GgufMetadataValue::Uint32(3),
+            ),
+            (
+                "lfm2.rope.freq_base".into(),
+                GgufMetadataValue::Float32(10_000.0),
+            ),
+            ("lfm2.vocab_size".into(), GgufMetadataValue::Uint32(16)),
+        ]);
+        SyntheticGguf::dense(&arrays, &metadata)
+    }
+
+    fn dense_qwen_gguf_fixture(model: &dense_qwen::Model, stream: &Stream) -> SyntheticGguf {
+        let args = &model.args;
+        let is_moe = args.is_moe();
+        let architecture = if is_moe {
+            "qwen3moe"
+        } else {
+            args.model_type.as_str()
+        };
+        let mut arrays = HashMap::new();
+        for (name, value) in model.parameters().flatten() {
+            if let Some(prefix) = name.strip_suffix(".mlp.experts.gate_up_proj") {
+                let intermediate = args.moe_intermediate_size;
+                let prefix = prefix.replace("model.layers.", "blk.");
+                arrays.insert(
+                    format!("{prefix}.ffn_gate_exps.weight"),
+                    value
+                        .try_index_device((.., ..intermediate, ..), stream)
+                        .unwrap(),
+                );
+                arrays.insert(
+                    format!("{prefix}.ffn_up_exps.weight"),
+                    value
+                        .try_index_device((.., intermediate.., ..), stream)
+                        .unwrap(),
+                );
+                continue;
+            }
+            if let Some(prefix) = name.strip_suffix(".mlp.experts.down_proj") {
+                arrays.insert(
+                    format!(
+                        "{}.ffn_down_exps.weight",
+                        prefix.replace("model.layers.", "blk.")
+                    ),
+                    value.clone(),
+                );
+                continue;
+            }
+            let name = name
+                .replace("model.layers.", "blk.")
+                .replace("self_attn.q_norm", "attn_q_norm")
+                .replace("self_attn.k_norm", "attn_k_norm")
+                .replace("self_attn.q_proj", "attn_q")
+                .replace("self_attn.k_proj", "attn_k")
+                .replace("self_attn.v_proj", "attn_v")
+                .replace("self_attn.o_proj", "attn_output")
+                .replace("input_layernorm", "attn_norm")
+                .replace("post_attention_layernorm", "ffn_norm")
+                .replace("mlp.gate.weight", "ffn_gate_inp.weight")
+                .replace("mlp.gate_proj", "ffn_gate")
+                .replace("mlp.down_proj", "ffn_down")
+                .replace("mlp.up_proj", "ffn_up")
+                .replace("model.embed_tokens", "token_embd")
+                .replace("model.norm", "output_norm")
+                .replace("lm_head", "output");
+            arrays.insert(name, value.clone());
+        }
+        let key = |suffix: &str| format!("{architecture}.{suffix}");
+        let mut metadata = HashMap::from([
+            (
+                "general.architecture".into(),
+                GgufMetadataValue::String(architecture.into()),
+            ),
+            ("general.file_type".into(), GgufMetadataValue::Uint32(0)),
+            (
+                key("embedding_length"),
+                GgufMetadataValue::Uint32(args.hidden_size as u32),
+            ),
+            (
+                key("block_count"),
+                GgufMetadataValue::Uint32(args.num_hidden_layers as u32),
+            ),
+            (
+                key("attention.head_count"),
+                GgufMetadataValue::Uint32(args.num_attention_heads as u32),
+            ),
+            (
+                key("attention.head_count_kv"),
+                GgufMetadataValue::Uint32(args.num_key_value_heads as u32),
+            ),
+            (
+                key("attention.key_length"),
+                GgufMetadataValue::Uint32(args.head_dim as u32),
+            ),
+            (
+                key("attention.layer_norm_rms_epsilon"),
+                GgufMetadataValue::Float32(args.rms_norm_eps),
+            ),
+            (
+                key("context_length"),
+                GgufMetadataValue::Uint32(args.max_position_embeddings as u32),
+            ),
+            (
+                key("rope.freq_base"),
+                GgufMetadataValue::Float32(args.rope_theta),
+            ),
+            (
+                key("vocab_size"),
+                GgufMetadataValue::Uint32(args.vocab_size as u32),
+            ),
+        ]);
+        if is_moe {
+            metadata.extend([
+                (
+                    key("expert_feed_forward_length"),
+                    GgufMetadataValue::Uint32(args.moe_intermediate_size as u32),
+                ),
+                (
+                    key("expert_count"),
+                    GgufMetadataValue::Uint32(args.num_experts as u32),
+                ),
+                (
+                    key("expert_used_count"),
+                    GgufMetadataValue::Uint32(args.num_experts_per_tok as u32),
+                ),
+            ]);
+        } else {
+            metadata.insert(
+                key("feed_forward_length"),
+                GgufMetadataValue::Uint32(args.intermediate_size as u32),
+            );
+        }
+        if let Some(window) = args
+            .attention_schedule
+            .iter()
+            .find_map(|policy| policy.window())
+        {
+            metadata.insert(
+                key("attention.sliding_window"),
+                GgufMetadataValue::Uint32(window.get()),
+            );
+            metadata.insert(
+                key("attention.sliding_window_pattern"),
+                GgufMetadataValue::Array(safemlx::ops::GgufMetadataArray::Bool(
+                    args.attention_schedule
+                        .iter()
+                        .map(|policy| policy.window().is_some())
+                        .collect(),
+                )),
+            );
+        }
+        SyntheticGguf::dense(&arrays, &metadata)
+    }
+
+    fn gpt_oss_gguf_fixture(stream: &Stream) -> SyntheticGguf {
+        let mut arrays = HashMap::new();
+        let mut insert = |name: String, shape: &[i32], value: f32| {
+            arrays.insert(
+                name,
+                Array::full::<f32>(shape, Array::from_f32(value), stream).unwrap(),
+            );
+        };
+        insert("token_embd.weight".into(), &[64, 64], 0.01);
+        for layer in 0..2 {
+            let prefix = format!("blk.{layer}");
+            insert(format!("{prefix}.attn_norm.weight"), &[64], 1.0);
+            insert(format!("{prefix}.attn_post_norm.weight"), &[64], 1.0);
+            insert(format!("{prefix}.attn_q.weight"), &[128, 64], 0.01);
+            insert(format!("{prefix}.attn_q.bias"), &[128], 0.001);
+            insert(format!("{prefix}.attn_k.weight"), &[64, 64], 0.01);
+            insert(format!("{prefix}.attn_k.bias"), &[64], 0.001);
+            insert(format!("{prefix}.attn_v.weight"), &[64, 64], 0.01);
+            insert(format!("{prefix}.attn_v.bias"), &[64], 0.001);
+            insert(format!("{prefix}.attn_output.weight"), &[64, 128], 0.01);
+            insert(format!("{prefix}.attn_output.bias"), &[64], 0.001);
+            insert(format!("{prefix}.attn_sinks.weight"), &[4], 0.001);
+            insert(format!("{prefix}.ffn_gate_inp.weight"), &[2, 64], 0.01);
+            insert(format!("{prefix}.ffn_gate_inp.bias"), &[2], 0.001);
+            insert(format!("{prefix}.ffn_gate_exps.weight"), &[2, 96, 64], 0.01);
+            insert(format!("{prefix}.ffn_gate_exps.bias"), &[2, 96], 0.001);
+            insert(format!("{prefix}.ffn_up_exps.weight"), &[2, 96, 64], 0.01);
+            insert(format!("{prefix}.ffn_up_exps.bias"), &[2, 96], 0.001);
+            insert(format!("{prefix}.ffn_down_exps.weight"), &[2, 64, 96], 0.01);
+            insert(format!("{prefix}.ffn_down_exps.bias"), &[2, 64], 0.001);
+        }
+        insert("output_norm.weight".into(), &[64], 1.0);
+        insert("output.weight".into(), &[64, 64], 0.01);
+        let metadata = HashMap::from([
+            (
+                "general.architecture".into(),
+                GgufMetadataValue::String("gpt-oss".into()),
+            ),
+            ("general.file_type".into(), GgufMetadataValue::Uint32(39)),
+            (
+                "gpt-oss.embedding_length".into(),
+                GgufMetadataValue::Uint32(64),
+            ),
+            ("gpt-oss.block_count".into(), GgufMetadataValue::Uint32(2)),
+            (
+                "gpt-oss.expert_feed_forward_length".into(),
+                GgufMetadataValue::Uint32(96),
+            ),
+            (
+                "gpt-oss.attention.head_count".into(),
+                GgufMetadataValue::Uint32(4),
+            ),
+            (
+                "gpt-oss.attention.head_count_kv".into(),
+                GgufMetadataValue::Uint32(2),
+            ),
+            (
+                "gpt-oss.attention.key_length".into(),
+                GgufMetadataValue::Uint32(32),
+            ),
+            (
+                "gpt-oss.attention.layer_norm_rms_epsilon".into(),
+                GgufMetadataValue::Float32(0.00001),
+            ),
+            (
+                "gpt-oss.attention.sliding_window".into(),
+                GgufMetadataValue::Uint32(3),
+            ),
+            (
+                "gpt-oss.context_length".into(),
+                GgufMetadataValue::Uint32(128),
+            ),
+            (
+                "gpt-oss.rope.freq_base".into(),
+                GgufMetadataValue::Float32(150000.0),
+            ),
+            ("gpt-oss.expert_count".into(), GgufMetadataValue::Uint32(2)),
+            (
+                "gpt-oss.expert_used_count".into(),
+                GgufMetadataValue::Uint32(1),
+            ),
+            ("gpt-oss.vocab_size".into(), GgufMetadataValue::Uint32(64)),
+        ]);
+        SyntheticGguf::with_packed_tensors(&arrays, &metadata, |name, _| {
+            (name.contains("ffn_gate_exps.weight")
+                || name.contains("ffn_up_exps.weight")
+                || name.contains("ffn_down_exps.weight"))
+            .then_some(safemlx_gguf::GgmlType::MxFp4)
+        })
+    }
+
+    #[test]
+    fn dense_qwen_pipeline_matches_resident_decode_and_dense_streaming() {
+        let gpu = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
+        let cpu = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        let stream = gpu.stream();
+        let token_batches = [
+            Array::from_slice(&[1u32, 2], &[1, 2]),
+            Array::from_slice(&[3u32], &[1, 1]),
+        ];
+
+        for model_type in ["qwen2", "qwen3", "qwen3_moe"] {
+            for tied in [false, true] {
+                let config = dense_qwen_config(model_type, tied);
+                let args = dense_qwen::config_from_hf_value(&config).unwrap();
+                let mut source = dense_qwen::Model::new(args, stream).unwrap();
+                initialize_parameters(&mut source, stream);
+                let expected_model_kind = source.args.model_kind();
+                let dir = tempfile::tempdir().unwrap();
+                if model_type == "qwen3_moe" {
+                    write_split_qwen3_moe_fixture(dir.path(), &config, &source, stream);
+                } else {
+                    write_parameter_fixture(dir.path(), &config, &source);
+                }
+
+                let mut reference = source;
+                let mut reference_cache = reference.new_cache();
+                let expected = token_batches
+                    .iter()
+                    .map(|tokens| {
+                        reference
+                            .forward(
+                                dense_qwen::ModelInput {
+                                    inputs: tokens,
+                                    mask: None,
+                                    cache: &mut reference_cache,
+                                },
+                                stream,
+                            )
+                            .unwrap()
+                    })
+                    .collect::<Vec<_>>();
+
+                let load = |rank, dense_stream| {
+                    let options = ModelLoadOptions::with_parallel(gpu_topology(rank));
+                    let options = if dense_stream {
+                        options.with_weight_residency(WeightResidency::DenseDiskStream(
+                            dense_stream_options(),
+                        ))
+                    } else {
+                        options
+                    };
+                    load_pipeline_model_with_options(dir.path(), options, stream, cpu.stream())
+                        .unwrap()
+                };
+                let mut first = load(0, false);
+                let mut last = load(1, false);
+                assert_eq!(first.stage_info().model_kind, expected_model_kind);
+                assert_eq!(first.stage_info().global_layer_range, 0..1);
+                assert_eq!(last.stage_info().global_layer_range, 1..2);
+                assert_eq!(first.prompt_cache_layer_layout().unwrap().len(), 1);
+                assert_eq!(last.prompt_cache_layer_layout().unwrap().len(), 1);
+                let actual = run_pipeline_sequence(&mut first, &mut last, &token_batches, stream);
+                for (actual, expected) in actual.iter().zip(&expected) {
+                    assert_close(actual, expected);
+                }
+
+                let mut streamed_first = load(0, true);
+                let mut streamed_last = load(1, true);
+                let streamed = run_pipeline_sequence(
+                    &mut streamed_first,
+                    &mut streamed_last,
+                    &token_batches,
+                    stream,
+                );
+                for (actual, expected) in streamed.iter().zip(&expected) {
+                    assert_close(actual, expected);
+                }
+                for stage in [&streamed_first, &streamed_last] {
+                    let report = stage.dense_stream_report().unwrap().unwrap();
+                    assert_eq!(report.planned_layer_count(), 1);
+                    assert_eq!(report.prefill_forwards(), 1);
+                    assert_eq!(report.decode_forwards(), 1);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn qwen_hybrid_pipeline_matches_resident_recurrent_decode_and_streaming() {
+        let gpu = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
+        let cpu = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        let stream = gpu.stream();
+        let config = qwen_hybrid_config();
+        let args = qwen_hybrid::model_args_from_config_value(&config).unwrap();
+        let mut source = qwen_hybrid::Model::new(args, None, None, None, stream).unwrap();
+        initialize_parameters(&mut source, stream);
+        let dir = tempfile::tempdir().unwrap();
+        write_parameter_fixture(dir.path(), &config, &source);
+        let mut reference = crate::architectures::qwen::hybrid::qwen3_next::load_qwen3_next_model(
+            dir.path(),
+            stream,
+            cpu.stream(),
+        )
+        .unwrap();
+        let mut reference_cache = qwen_hybrid::Cache::new(&reference.args).unwrap();
+        let token_batches = [
+            Array::from_slice(&[1u32, 2], &[1, 2]),
+            Array::from_slice(&[3u32], &[1, 1]),
+        ];
+        let expected = token_batches
+            .iter()
+            .map(|tokens| {
+                reference
+                    .forward(
+                        qwen_hybrid::ModelInput {
+                            inputs: tokens,
+                            inputs_embeds: None,
+                            mask: None,
+                            cache: Some(&mut reference_cache),
+                        },
+                        stream,
+                    )
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let load = |rank, streamed| {
+            let options = ModelLoadOptions::with_parallel(gpu_topology(rank));
+            let options = if streamed {
+                options
+                    .with_weight_residency(WeightResidency::DenseDiskStream(dense_stream_options()))
+            } else {
+                options
+            };
+            load_pipeline_model_with_options(dir.path(), options, stream, cpu.stream()).unwrap()
+        };
+        for streamed in [false, true] {
+            let mut first = load(0, streamed);
+            let mut last = load(1, streamed);
+            assert_eq!(first.stage_info().model_kind, ModelKind::Qwen3Next);
+            assert!(matches!(
+                &first.new_cache().unwrap().layers()[0],
+                PipelineLayerCache::StateSlots { slots, .. } if slots.len() == 2
+            ));
+            assert!(matches!(
+                &last.new_cache().unwrap().layers()[0],
+                PipelineLayerCache::KeyValue { slots, .. } if slots.is_empty()
+            ));
+            let actual = run_pipeline_sequence(&mut first, &mut last, &token_batches, stream);
+            for (actual, expected) in actual.iter().zip(&expected) {
+                assert_close(actual, expected);
+            }
+        }
+    }
+
+    #[test]
+    fn gpt_oss_pipeline_matches_resident_mixed_attention_and_dense_streaming() {
+        let gpu = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
+        let cpu = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        let stream = gpu.stream();
+        let config = gpt_oss_config();
+        let args = gpt_oss::model_args_from_config_value(&config).unwrap();
+        let mut source = gpt_oss::Model::new(args, stream).unwrap();
+        initialize_parameters(&mut source, stream);
+        let dir = tempfile::tempdir().unwrap();
+        write_parameter_fixture(dir.path(), &config, &source);
+
+        let token_batches = [
+            Array::from_slice(&[1u32, 2], &[1, 2]),
+            Array::from_slice(&[3u32], &[1, 1]),
+        ];
+        let mut reference = gpt_oss::load_model(dir.path(), stream, cpu.stream()).unwrap();
+        let mut reference_cache = reference.new_cache();
+        let expected = token_batches
+            .iter()
+            .map(|tokens| {
+                reference
+                    .forward(tokens, &mut reference_cache, stream)
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+
+        let load = |rank, dense_stream| {
+            let options = ModelLoadOptions::with_parallel(gpu_topology(rank));
+            let options = if dense_stream {
+                options
+                    .with_weight_residency(WeightResidency::DenseDiskStream(dense_stream_options()))
+            } else {
+                options
+            };
+            load_pipeline_model_with_options(dir.path(), options, stream, cpu.stream()).unwrap()
+        };
+        let mut first = load(0, false);
+        let mut last = load(1, false);
+        assert_eq!(first.stage_info().model_kind, ModelKind::GptOss);
+        assert_eq!(first.stage_info().global_layer_range, 0..1);
+        assert_eq!(last.stage_info().global_layer_range, 1..2);
+        let first_layout = first.prompt_cache_layer_layout().unwrap();
+        let last_layout = last.prompt_cache_layer_layout().unwrap();
+        assert!(matches!(
+            first_layout.get(0),
+            Some(crate::LayerCachePolicy::KeyValue {
+                attention: crate::AttentionPolicy::Sliding { window },
+                ..
+            }) if window.get() == 3
+        ));
+        assert!(matches!(
+            last_layout.get(0),
+            Some(crate::LayerCachePolicy::KeyValue {
+                attention: crate::AttentionPolicy::Full,
+                ..
+            })
+        ));
+        let actual = run_pipeline_sequence(&mut first, &mut last, &token_batches, stream);
+        for (actual, expected) in actual.iter().zip(&expected) {
+            assert_close(actual, expected);
+        }
+
+        let mut streamed_first = load(0, true);
+        let mut streamed_last = load(1, true);
+        let streamed = run_pipeline_sequence(
+            &mut streamed_first,
+            &mut streamed_last,
+            &token_batches,
+            stream,
+        );
+        for (actual, expected) in streamed.iter().zip(&expected) {
+            assert_close(actual, expected);
+        }
+        for stage in [&streamed_first, &streamed_last] {
+            let report = stage.dense_stream_report().unwrap().unwrap();
+            assert_eq!(report.planned_layer_count(), 1);
+            assert_eq!(report.prefill_forwards(), 1);
+            assert_eq!(report.decode_forwards(), 1);
+        }
+    }
+
+    #[test]
+    fn dense_qwen_and_gpt_oss_gguf_pipelines_match_resident_decoders() {
+        let gpu = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
+        let cpu = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        let stream = gpu.stream();
+        let tokens = [Array::from_slice(&[1u32, 2], &[1, 2])];
+
+        let qwen_config = dense_qwen_config("qwen2", false);
+        let qwen_args = dense_qwen::config_from_hf_value(&qwen_config).unwrap();
+        let mut qwen_source = dense_qwen::Model::new(qwen_args, stream).unwrap();
+        initialize_parameters(&mut qwen_source, stream);
+        let qwen_fixture = dense_qwen_gguf_fixture(&qwen_source, stream);
+        let mut qwen_reference =
+            dense_qwen::load_gguf(qwen_fixture.path(), stream, cpu.stream()).unwrap();
+        let mut qwen_cache = qwen_reference.new_cache();
+        let qwen_expected = qwen_reference
+            .forward(
+                dense_qwen::ModelInput {
+                    inputs: &tokens[0],
+                    mask: None,
+                    cache: &mut qwen_cache,
+                },
+                stream,
+            )
+            .unwrap();
+        let mut qwen_first = load_pipeline_model_with_options(
+            qwen_fixture.path(),
+            ModelLoadOptions::with_parallel(gpu_topology(0)),
+            stream,
+            cpu.stream(),
+        )
+        .unwrap();
+        let mut qwen_last = load_pipeline_model_with_options(
+            qwen_fixture.path(),
+            ModelLoadOptions::with_parallel(gpu_topology(1)),
+            stream,
+            cpu.stream(),
+        )
+        .unwrap();
+        let qwen_actual = run_pipeline_sequence(&mut qwen_first, &mut qwen_last, &tokens, stream);
+        assert_close(&qwen_actual[0], &qwen_expected);
+
+        let gpt_fixture = gpt_oss_gguf_fixture(stream);
+        let mut gpt_reference =
+            gpt_oss::load_gguf(gpt_fixture.path(), stream, cpu.stream()).unwrap();
+        let mut gpt_cache = gpt_reference.new_cache();
+        let gpt_expected = gpt_reference
+            .forward(&tokens[0], &mut gpt_cache, stream)
+            .unwrap();
+        let mut gpt_first = load_pipeline_model_with_options(
+            gpt_fixture.path(),
+            ModelLoadOptions::with_parallel(gpu_topology(0)),
+            stream,
+            cpu.stream(),
+        )
+        .unwrap();
+        let mut gpt_last = load_pipeline_model_with_options(
+            gpt_fixture.path(),
+            ModelLoadOptions::with_parallel(gpu_topology(1)),
+            stream,
+            cpu.stream(),
+        )
+        .unwrap();
+        let gpt_actual = run_pipeline_sequence(&mut gpt_first, &mut gpt_last, &tokens, stream);
+        assert_close(&gpt_actual[0], &gpt_expected);
+    }
+
+    #[test]
+    fn qwen3_moe_gguf_pipeline_matches_resident_and_dense_streaming() {
+        let gpu = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
+        let cpu = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        let stream = gpu.stream();
+        let token_batches = [
+            Array::from_slice(&[1u32, 2], &[1, 2]),
+            Array::from_slice(&[3u32], &[1, 1]),
+        ];
+        let config = dense_qwen_config("qwen3_moe", false);
+        let args = dense_qwen::config_from_hf_value(&config).unwrap();
+        let mut source = dense_qwen::Model::new(args, stream).unwrap();
+        initialize_parameters(&mut source, stream);
+        let fixture = dense_qwen_gguf_fixture(&source, stream);
+
+        let mut reference = dense_qwen::load_gguf(fixture.path(), stream, cpu.stream()).unwrap();
+        let mut reference_cache = reference.new_cache();
+        let expected = token_batches
+            .iter()
+            .map(|tokens| {
+                reference
+                    .forward(
+                        dense_qwen::ModelInput {
+                            inputs: tokens,
+                            mask: None,
+                            cache: &mut reference_cache,
+                        },
+                        stream,
+                    )
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+
+        for streamed in [false, true] {
+            let load = |rank| {
+                let options = ModelLoadOptions::with_parallel(gpu_topology(rank));
+                let options = if streamed {
+                    options.with_weight_residency(WeightResidency::DenseDiskStream(
+                        dense_stream_options(),
+                    ))
+                } else {
+                    options
+                };
+                load_pipeline_model_with_options(fixture.path(), options, stream, cpu.stream())
+                    .unwrap()
+            };
+            let mut first = load(0);
+            let mut last = load(1);
+            assert_eq!(first.stage_info().model_kind, ModelKind::Qwen3);
+            let actual = run_pipeline_sequence(&mut first, &mut last, &token_batches, stream);
+            for (actual, expected) in actual.iter().zip(&expected) {
+                assert_close(actual, expected);
+            }
+            if streamed {
+                for stage in [&first, &last] {
+                    let report = stage.dense_stream_report().unwrap().unwrap();
+                    assert_eq!(report.planned_layer_count(), 1);
+                    assert_eq!(report.prefill_forwards(), 1);
+                    assert_eq!(report.decode_forwards(), 1);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn lfm2_gguf_pipeline_matches_resident_hybrid_decoder() {
+        let gpu = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
+        let cpu = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        let stream = gpu.stream();
+        let args = lfm2::model_args_from_config_value(&lfm2_config(false)).unwrap();
+        let mut source = lfm2::Model::new(args, stream).unwrap();
+        initialize_parameters(&mut source, stream);
+        let fixture = lfm2_gguf_fixture(&source, stream);
+        let mut reference = lfm2::load_gguf(fixture.path(), stream, cpu.stream()).unwrap();
+        let mut reference_cache = reference.new_cache();
+        let token_batches = [
+            Array::from_slice(&[1u32, 2], &[1, 2]),
+            Array::from_slice(&[3u32], &[1, 1]),
+        ];
+        let mut expected = Vec::new();
+        for tokens in &token_batches {
+            expected.push(
+                reference
+                    .forward_logits(tokens, Some(&mut reference_cache), false, stream)
+                    .unwrap(),
+            );
+        }
+        let mut first = load_pipeline_model_with_options(
+            fixture.path(),
+            ModelLoadOptions::with_parallel(gpu_topology(0)),
+            stream,
+            cpu.stream(),
+        )
+        .unwrap();
+        let mut last = load_pipeline_model_with_options(
+            fixture.path(),
+            ModelLoadOptions::with_parallel(gpu_topology(1)),
+            stream,
+            cpu.stream(),
+        )
+        .unwrap();
+        let actual = run_pipeline_sequence(&mut first, &mut last, &token_batches, stream);
+        for (actual, expected) in actual.iter().zip(expected) {
+            assert_close(actual, &expected);
+        }
+    }
+
+    #[test]
+    fn dense_qwen_and_gpt_oss_pipeline_requantization_uses_shared_bindings() {
+        let gpu = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
+        let cpu = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        let stream = gpu.stream();
+        let tokens = [Array::from_slice(&[1u32, 2], &[1, 2])];
+
+        let qwen_config = dense_qwen_config("qwen2", false);
+        let qwen_args = dense_qwen::config_from_hf_value(&qwen_config).unwrap();
+        let mut qwen_source = dense_qwen::Model::new(qwen_args, stream).unwrap();
+        initialize_parameters(&mut qwen_source, stream);
+        let qwen_dir = tempfile::tempdir().unwrap();
+        write_parameter_fixture(qwen_dir.path(), &qwen_config, &qwen_source);
+        let affine: WeightQuantization =
+            crate::runtime::checkpoint::quantization::AffineQuantization::new(32, 4)
+                .unwrap()
+                .into();
+        let qwen_load = |rank, quantization| {
+            let options = match quantization {
+                Some(quantization) => ModelLoadOptions::with_quantization(quantization)
+                    .with_parallel_topology(gpu_topology(rank)),
+                None => ModelLoadOptions::with_parallel(gpu_topology(rank)),
+            };
+            load_pipeline_model_with_options(qwen_dir.path(), options, stream, cpu.stream())
+                .unwrap()
+        };
+        let mut qwen_dense_first = qwen_load(0, None);
+        let mut qwen_dense_last = qwen_load(1, None);
+        let mut qwen_quant_first = qwen_load(0, Some(affine));
+        let mut qwen_quant_last = qwen_load(1, Some(affine));
+        assert!(
+            qwen_quant_first.stage_info().local_parameter_bytes
+                < qwen_dense_first.stage_info().local_parameter_bytes
+        );
+        assert!(
+            qwen_quant_last.stage_info().local_parameter_bytes
+                < qwen_dense_last.stage_info().local_parameter_bytes
+        );
+        let qwen_expected =
+            run_pipeline_sequence(&mut qwen_dense_first, &mut qwen_dense_last, &tokens, stream);
+        let qwen_actual =
+            run_pipeline_sequence(&mut qwen_quant_first, &mut qwen_quant_last, &tokens, stream);
+        assert!(qwen_actual[0]
+            .all_close(&qwen_expected[0], Some(2e-3), Some(2e-3), None, stream)
+            .unwrap()
+            .item::<bool>(stream));
+
+        let gpt_config = gpt_oss_config();
+        let gpt_args = gpt_oss::model_args_from_config_value(&gpt_config).unwrap();
+        let mut gpt_source = gpt_oss::Model::new(gpt_args, stream).unwrap();
+        initialize_parameters(&mut gpt_source, stream);
+        let gpt_dir = tempfile::tempdir().unwrap();
+        write_parameter_fixture(gpt_dir.path(), &gpt_config, &gpt_source);
+        let gpt_load = |rank, quantized| {
+            let options = if quantized {
+                ModelLoadOptions::with_quantization(WeightQuantization::MxFp4)
+                    .with_parallel_topology(gpu_topology(rank))
+            } else {
+                ModelLoadOptions::with_parallel(gpu_topology(rank))
+            };
+            load_pipeline_model_with_options(gpt_dir.path(), options, stream, cpu.stream()).unwrap()
+        };
+        let mut gpt_dense_first = gpt_load(0, false);
+        let mut gpt_dense_last = gpt_load(1, false);
+        let mut gpt_quant_first = gpt_load(0, true);
+        let mut gpt_quant_last = gpt_load(1, true);
+        assert!(
+            gpt_quant_first.stage_info().local_parameter_bytes
+                < gpt_dense_first.stage_info().local_parameter_bytes
+        );
+        assert!(
+            gpt_quant_last.stage_info().local_parameter_bytes
+                < gpt_dense_last.stage_info().local_parameter_bytes
+        );
+        let gpt_expected =
+            run_pipeline_sequence(&mut gpt_dense_first, &mut gpt_dense_last, &tokens, stream);
+        let gpt_actual =
+            run_pipeline_sequence(&mut gpt_quant_first, &mut gpt_quant_last, &tokens, stream);
+        let gpt_actual_values = gpt_actual[0].evaluated().unwrap();
+        let gpt_expected_values = gpt_expected[0].evaluated().unwrap();
+        assert_eq!(
+            gpt_actual_values.as_array().shape(),
+            gpt_expected_values.as_array().shape()
+        );
+        assert!(gpt_actual_values
+            .as_slice::<f32>()
+            .iter()
+            .all(|value| value.is_finite()));
+
+        let error = load_pipeline_model_with_options(
+            gpt_dir.path(),
+            ModelLoadOptions::with_quantization(affine).with_parallel_topology(gpu_topology(0)),
+            stream,
+            cpu.stream(),
+        )
+        .expect_err("GPT-OSS expert banks cannot transcode to affine");
+        assert!(error
+            .to_string()
+            .contains("cannot be implicitly dequantized"));
+    }
+
+    #[test]
+    fn qwen3_moe_pipeline_requantization_uses_shared_expert_bindings() {
+        let gpu = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
+        let cpu = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        let stream = gpu.stream();
+        let tokens = [Array::from_slice(&[1u32, 2], &[1, 2])];
+        let config = dense_qwen_config("qwen3_moe", false);
+        let args = dense_qwen::config_from_hf_value(&config).unwrap();
+        let mut source = dense_qwen::Model::new(args, stream).unwrap();
+        initialize_parameters(&mut source, stream);
+        let dir = tempfile::tempdir().unwrap();
+        write_parameter_fixture(dir.path(), &config, &source);
+        let affine: WeightQuantization =
+            crate::runtime::checkpoint::quantization::AffineQuantization::new(32, 4)
+                .unwrap()
+                .into();
+        let load = |rank, quantization| {
+            let options = match quantization {
+                Some(quantization) => ModelLoadOptions::with_quantization(quantization)
+                    .with_parallel_topology(gpu_topology(rank)),
+                None => ModelLoadOptions::with_parallel(gpu_topology(rank)),
+            };
+            load_pipeline_model_with_options(dir.path(), options, stream, cpu.stream()).unwrap()
+        };
+        let mut dense_first = load(0, None);
+        let mut dense_last = load(1, None);
+        let mut quantized_first = load(0, Some(affine));
+        let mut quantized_last = load(1, Some(affine));
+        assert!(
+            quantized_first.stage_info().local_parameter_bytes
+                < dense_first.stage_info().local_parameter_bytes
+        );
+        assert!(
+            quantized_last.stage_info().local_parameter_bytes
+                < dense_last.stage_info().local_parameter_bytes
+        );
+        let expected = run_pipeline_sequence(&mut dense_first, &mut dense_last, &tokens, stream);
+        let actual =
+            run_pipeline_sequence(&mut quantized_first, &mut quantized_last, &tokens, stream);
+        assert!(actual[0]
+            .all_close(&expected[0], Some(2e-3), Some(2e-3), None, stream)
+            .unwrap()
+            .item::<bool>(stream));
     }
 
     fn llama_args(tied: bool) -> llama::ModelArgs {
@@ -2536,6 +8652,854 @@ mod tests {
             quantization_config: None,
             quantized_weights: None,
             quantized_weight_configs: None,
+        }
+    }
+
+    fn gemma_config() -> serde_json::Value {
+        serde_json::json!({
+            "model_type": "gemma4",
+            "tie_word_embeddings": true,
+            "text_config": {
+                "model_type": "gemma4",
+                "hidden_size": 8,
+                "num_hidden_layers": 4,
+                "intermediate_size": 16,
+                "num_attention_heads": 2,
+                "rms_norm_eps": 1e-6,
+                "vocab_size": 32,
+                "pad_token_id": 0,
+                "num_key_value_heads": 2,
+                "max_position_embeddings": 128,
+                "rope_theta": 10000.0,
+                "head_dim": 4,
+                "attention_bias": false,
+                "hidden_size_per_layer_input": 4,
+                "vocab_size_per_layer_input": 32,
+                "num_kv_shared_layers": 1,
+                "layer_types": [
+                    "sliding_attention",
+                    "full_attention",
+                    "sliding_attention",
+                    "full_attention"
+                ],
+                "sliding_window": 8,
+                "final_logit_softcapping": 4.0
+            }
+        })
+    }
+
+    fn quantizable_gemma_config() -> serde_json::Value {
+        let mut config = gemma_config();
+        let text = config["text_config"]
+            .as_object_mut()
+            .expect("Gemma fixture text config");
+        text.insert("hidden_size".into(), serde_json::json!(32));
+        text.insert("intermediate_size".into(), serde_json::json!(64));
+        text.insert("head_dim".into(), serde_json::json!(16));
+        text.insert("hidden_size_per_layer_input".into(), serde_json::json!(32));
+        config
+    }
+
+    fn quantizable_gemma_moe_config() -> serde_json::Value {
+        let mut config = quantizable_gemma_config();
+        let text = config["text_config"]
+            .as_object_mut()
+            .expect("Gemma fixture text config");
+        text.insert("enable_moe_block".into(), serde_json::json!(true));
+        text.insert("num_experts".into(), serde_json::json!(4));
+        text.insert("top_k_experts".into(), serde_json::json!(2));
+        text.insert("moe_intermediate_size".into(), serde_json::json!(32));
+        config
+    }
+
+    fn write_gemma_fixture_with_config(
+        dir: &Path,
+        model: &gemma4::Model,
+        config: &serde_json::Value,
+    ) {
+        let arrays = model
+            .parameters()
+            .flatten()
+            .iter()
+            .map(|(name, value)| {
+                (
+                    crate::runtime::checkpoint::binding::canonical_checkpoint_name(name),
+                    (*value).clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        Array::save_safetensors(
+            arrays.iter().map(|(name, value)| (name.as_str(), value)),
+            None,
+            dir.join("model.safetensors"),
+        )
+        .unwrap();
+        fs::write(dir.join("config.json"), serde_json::to_vec(config).unwrap()).unwrap();
+    }
+
+    fn write_gemma_fixture(dir: &Path, model: &gemma4::Model) {
+        write_gemma_fixture_with_config(dir, model, &gemma_config());
+    }
+
+    fn gemma_gguf_fixture(model: &gemma4::Model, stream: &Stream) -> SyntheticGguf {
+        let args = &model.args;
+        let as_u32 = |value: i32| u32::try_from(value).expect("positive Gemma fixture geometry");
+        let feed_forward = args
+            .layer_schedule
+            .iter()
+            .map(|policy| policy.intermediate_size.get())
+            .collect::<Vec<_>>();
+        let kv_heads = args
+            .layer_schedule
+            .iter()
+            .map(|policy| policy.num_key_value_heads.get())
+            .collect::<Vec<_>>();
+        let sliding_pattern = args
+            .layer_schedule
+            .iter()
+            .map(|policy| policy.attention.window().is_some())
+            .collect::<Vec<_>>();
+        let head_dim = args
+            .layer_schedule
+            .get(0)
+            .expect("Gemma fixture has layers")
+            .head_dim
+            .get();
+        let sliding_window = args
+            .layer_schedule
+            .iter()
+            .find_map(|policy| policy.attention.window())
+            .map_or(8, |window| window.get());
+        let shared_layers = args
+            .layer_schedule
+            .iter()
+            .filter(|policy| policy.key_value == gemma4::KeyValuePolicy::Shared)
+            .count() as u32;
+        let arrays = model
+            .parameters()
+            .flatten()
+            .iter()
+            .map(|(name, value)| {
+                let canonical =
+                    crate::runtime::checkpoint::binding::canonical_checkpoint_name(name);
+                let gguf = if canonical.starts_with("model.language_model.embed_tokens_per_layer.")
+                {
+                    canonical.replacen(
+                        "model.language_model.embed_tokens_per_layer",
+                        "per_layer_token_embd",
+                        1,
+                    )
+                } else if canonical.starts_with("model.language_model.per_layer_model_projection.")
+                {
+                    canonical.replacen(
+                        "model.language_model.per_layer_model_projection",
+                        "per_layer_model_proj",
+                        1,
+                    )
+                } else if canonical.starts_with("model.language_model.per_layer_projection_norm.") {
+                    canonical.replacen(
+                        "model.language_model.per_layer_projection_norm",
+                        "per_layer_proj_norm",
+                        1,
+                    )
+                } else if canonical.starts_with("model.language_model.embed_tokens.") {
+                    canonical.replacen("model.language_model.embed_tokens", "token_embd", 1)
+                } else if canonical.starts_with("model.language_model.norm.") {
+                    canonical.replacen("model.language_model.norm", "output_norm", 1)
+                } else if canonical.starts_with("lm_head.") {
+                    canonical.replacen("lm_head", "output", 1)
+                } else {
+                    let rest = canonical
+                        .strip_prefix("model.language_model.layers.")
+                        .expect("Gemma fixture parameter has a known root");
+                    let (layer, parameter) = rest.split_once('.').unwrap();
+                    let parameter = if parameter == "layer_scalar" {
+                        "layer_output_scale.weight".to_string()
+                    } else {
+                        [
+                            ("self_attn.q_norm", "attn_q_norm"),
+                            ("self_attn.k_norm", "attn_k_norm"),
+                            ("self_attn.q_proj", "attn_q"),
+                            ("self_attn.k_proj", "attn_k"),
+                            ("self_attn.v_proj", "attn_v"),
+                            ("self_attn.o_proj", "attn_output"),
+                            ("input_layernorm", "attn_norm"),
+                            ("post_attention_layernorm", "post_attention_norm"),
+                            ("pre_feedforward_layernorm", "ffn_norm"),
+                            ("post_feedforward_layernorm", "post_ffw_norm"),
+                            ("mlp.gate_proj", "ffn_gate"),
+                            ("mlp.down_proj", "ffn_down"),
+                            ("mlp.up_proj", "ffn_up"),
+                            ("router.proj", "ffn_gate_inp"),
+                            ("experts.switch_glu.gate_proj", "ffn_gate_exps"),
+                            ("experts.switch_glu.up_proj", "ffn_up_exps"),
+                            ("experts.switch_glu.down_proj", "ffn_down_exps"),
+                            ("post_feedforward_layernorm_1", "post_ffw_norm_1"),
+                            ("pre_feedforward_layernorm_2", "pre_ffw_norm_2"),
+                            ("post_feedforward_layernorm_2", "post_ffw_norm_2"),
+                            ("per_layer_input_gate", "inp_gate"),
+                            ("per_layer_projection", "proj"),
+                            ("post_per_layer_input_norm", "post_norm"),
+                        ]
+                        .into_iter()
+                        .find_map(|(target, source)| {
+                            (parameter == target || parameter.starts_with(&format!("{target}.")))
+                                .then(|| parameter.replacen(target, source, 1))
+                        })
+                        .or_else(|| {
+                            (parameter == "router.scale").then(|| "ffn_gate_inp.scale".to_string())
+                        })
+                        .or_else(|| {
+                            (parameter == "router.per_expert_scale")
+                                .then(|| "ffn_down_exps.scale".to_string())
+                        })
+                        .expect("Gemma fixture block parameter has a GGUF spelling")
+                    };
+                    format!("blk.{layer}.{parameter}")
+                };
+                (gguf, (*value).clone())
+            })
+            .collect::<HashMap<_, _>>();
+        let mut arrays = arrays;
+        if args.num_experts.is_some() {
+            for layer in 0..args.num_hidden_layers {
+                let gate = arrays.remove(&format!("blk.{layer}.ffn_gate_exps.weight"));
+                let up = arrays.remove(&format!("blk.{layer}.ffn_up_exps.weight"));
+                match (gate, up) {
+                    (Some(gate), Some(up)) => {
+                        let fused = safemlx::ops::concatenate_axis(&[gate, up], 1, stream).unwrap();
+                        arrays.insert(format!("blk.{layer}.ffn_gate_up_exps.weight"), fused);
+                    }
+                    (None, None) => {}
+                    _ => panic!("Gemma fixture has incomplete expert gate/up tensors"),
+                }
+            }
+        }
+        let mut metadata = HashMap::from([
+            (
+                "general.architecture".into(),
+                GgufMetadataValue::String("gemma4".into()),
+            ),
+            ("general.file_type".into(), GgufMetadataValue::Uint32(0)),
+            (
+                "gemma4.block_count".into(),
+                GgufMetadataValue::Uint32(as_u32(args.num_hidden_layers)),
+            ),
+            (
+                "gemma4.embedding_length".into(),
+                GgufMetadataValue::Uint32(as_u32(args.hidden_size)),
+            ),
+            (
+                "gemma4.embedding_length_per_layer_input".into(),
+                GgufMetadataValue::Uint32(as_u32(args.hidden_size_per_layer_input)),
+            ),
+            (
+                "gemma4.feed_forward_length".into(),
+                GgufMetadataValue::Array(safemlx::ops::GgufMetadataArray::Uint32(feed_forward)),
+            ),
+            (
+                "gemma4.attention.head_count".into(),
+                GgufMetadataValue::Uint32(as_u32(args.num_attention_heads)),
+            ),
+            (
+                "gemma4.attention.head_count_kv".into(),
+                GgufMetadataValue::Array(safemlx::ops::GgufMetadataArray::Uint32(kv_heads)),
+            ),
+            (
+                "gemma4.attention.key_length".into(),
+                GgufMetadataValue::Uint32(head_dim),
+            ),
+            (
+                "gemma4.attention.key_length_swa".into(),
+                GgufMetadataValue::Uint32(head_dim),
+            ),
+            (
+                "gemma4.attention.sliding_window_pattern".into(),
+                GgufMetadataValue::Array(safemlx::ops::GgufMetadataArray::Bool(sliding_pattern)),
+            ),
+            (
+                "gemma4.attention.sliding_window".into(),
+                GgufMetadataValue::Uint32(sliding_window),
+            ),
+            (
+                "gemma4.attention.shared_kv_layers".into(),
+                GgufMetadataValue::Uint32(shared_layers),
+            ),
+            (
+                "gemma4.attention.layer_norm_rms_epsilon".into(),
+                GgufMetadataValue::Float32(1e-6),
+            ),
+            (
+                "gemma4.context_length".into(),
+                GgufMetadataValue::Uint32(as_u32(args.max_position_embeddings)),
+            ),
+            (
+                "gemma4.vocab_size".into(),
+                GgufMetadataValue::Uint32(as_u32(args.vocab_size)),
+            ),
+            (
+                "gemma4.final_logit_softcapping".into(),
+                GgufMetadataValue::Float32(4.0),
+            ),
+            (
+                "gemma4.rope.freq_base".into(),
+                GgufMetadataValue::Float32(10_000.0),
+            ),
+            (
+                "gemma4.rope.freq_base_swa".into(),
+                GgufMetadataValue::Float32(10_000.0),
+            ),
+        ]);
+        if let (Some(num_experts), Some(top_k), Some(intermediate)) = (
+            args.num_experts,
+            args.top_k_experts,
+            args.moe_intermediate_size,
+        ) {
+            metadata.insert(
+                "gemma4.expert_count".into(),
+                GgufMetadataValue::Uint32(as_u32(num_experts)),
+            );
+            metadata.insert(
+                "gemma4.expert_used_count".into(),
+                GgufMetadataValue::Uint32(as_u32(top_k)),
+            );
+            metadata.insert(
+                "gemma4.expert_feed_forward_length".into(),
+                GgufMetadataValue::Uint32(as_u32(intermediate)),
+            );
+        }
+        SyntheticGguf::dense(&arrays, &metadata)
+    }
+
+    #[test]
+    fn dependency_planner_preserves_atomic_units_and_rejects_too_many_stages() {
+        let ranges =
+            dependency_safe_layer_ranges(7, 3, &[true, false, false, true, true, true]).unwrap();
+        assert_eq!(ranges, [0..1, 1..4, 4..7]);
+        let error = dependency_safe_layer_ranges(4, 3, &[false, false, true])
+            .expect_err("two atomic units cannot occupy three stages");
+        assert!(error.to_string().contains("dependency-safe decoder units"));
+
+        let (args, _, _, _, _, _) = gemma4::model_config_from_value(&gemma_config()).unwrap();
+        let ranges = gemma_pipeline_ranges(&args, 2).unwrap();
+        assert_eq!(ranges, [0..1, 1..4]);
+        assert!(gemma_pipeline_ranges(&args, 3).is_err());
+    }
+
+    #[test]
+    fn gemma_pipeline_preserves_per_layer_inputs_shared_kv_and_decode_state() {
+        let gpu = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
+        let cpu = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        let stream = gpu.stream();
+        let (args, _, _, _, _, _) = gemma4::model_config_from_value(&gemma_config()).unwrap();
+        let mut source = gemma4::Model::new(args.clone(), stream).unwrap();
+        initialize_parameters(&mut source, stream);
+        let dir = tempfile::tempdir().unwrap();
+        write_gemma_fixture(dir.path(), &source);
+        let mut reference = gemma4::load_gemma4_model(dir.path(), stream, cpu.stream()).unwrap();
+        let mut first = load_pipeline_model_with_options(
+            dir.path(),
+            ModelLoadOptions::with_parallel(gpu_topology(0)),
+            stream,
+            cpu.stream(),
+        )
+        .unwrap();
+        let mut last = load_pipeline_model_with_options(
+            dir.path(),
+            ModelLoadOptions::with_parallel(gpu_topology(1)),
+            stream,
+            cpu.stream(),
+        )
+        .unwrap();
+        assert_eq!(first.stage_info().model_kind, ModelKind::Gemma4);
+        assert_eq!(first.stage_info().global_layer_range, 0..1);
+        assert_eq!(last.stage_info().global_layer_range, 1..4);
+
+        let mut reference_cache = Vec::<Option<ConcatKeyValueCache>>::new();
+        let mut first_cache = first.new_cache().unwrap();
+        let mut last_cache = last.new_cache().unwrap();
+        for tokens in [
+            Array::from_slice(&[1u32, 2], &[1, 2]),
+            Array::from_slice(&[3u32], &[1, 1]),
+        ] {
+            let expected = reference
+                .forward_logits(
+                    gemma4::ModelInput {
+                        inputs: &tokens,
+                        inputs_embeds: None,
+                        per_layer_input_ids: None,
+                        mask: None,
+                        sliding_masks: None,
+                        cache: &mut reference_cache,
+                    },
+                    false,
+                    stream,
+                )
+                .unwrap();
+            let step = PipelineStep::new(1, tokens.shape()[1]).unwrap();
+            let payload = match first
+                .forward_stage(
+                    PipelineStageInput::Tokens(&tokens),
+                    step,
+                    None,
+                    &mut first_cache,
+                    stream,
+                )
+                .unwrap()
+            {
+                PipelineStageOutput::Hidden(payload) => payload,
+                PipelineStageOutput::Logits(_) => panic!("first stage produced logits"),
+            };
+            assert_eq!(payload.auxiliary.tensors().len(), 1);
+            assert_eq!(
+                payload.auxiliary.tensors()[0].shape(),
+                [1, tokens.shape()[1], 4, 4]
+            );
+            let actual = match last
+                .forward_stage(
+                    PipelineStageInput::Hidden(&payload),
+                    step,
+                    None,
+                    &mut last_cache,
+                    stream,
+                )
+                .unwrap()
+            {
+                PipelineStageOutput::Logits(logits) => logits,
+                PipelineStageOutput::Hidden(_) => panic!("last stage produced hidden state"),
+            };
+            assert_close(&actual, &expected);
+        }
+        assert_eq!(first_cache.global_layers(), [0]);
+        assert_eq!(last_cache.global_layers(), [1, 2, 3]);
+        assert!(matches!(
+            last_cache.layers().last(),
+            Some(PipelineLayerCache::StateSlots {
+                global_layer: 3,
+                slots
+            }) if slots.is_empty()
+        ));
+    }
+
+    #[test]
+    fn gemma_gguf_pipeline_uses_the_same_dependency_plan_and_matches_resident() {
+        let gpu = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
+        let cpu = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        let stream = gpu.stream();
+        let (args, _, _, _, _, _) = gemma4::model_config_from_value(&gemma_config()).unwrap();
+        let mut reference = gemma4::Model::new(args, stream).unwrap();
+        initialize_parameters(&mut reference, stream);
+        let fixture = gemma_gguf_fixture(&reference, stream);
+        let mut first = load_pipeline_model_with_options(
+            fixture.path(),
+            ModelLoadOptions::with_parallel(gpu_topology(0)),
+            stream,
+            cpu.stream(),
+        )
+        .unwrap();
+        let mut last = load_pipeline_model_with_options(
+            fixture.path(),
+            ModelLoadOptions::with_parallel(gpu_topology(1)),
+            stream,
+            cpu.stream(),
+        )
+        .unwrap();
+        assert_eq!(first.stage_info().global_layer_range, 0..1);
+        assert_eq!(last.stage_info().global_layer_range, 1..4);
+        let tokens = Array::from_slice(&[1u32, 2], &[1, 2]);
+        let mut reference_cache = Vec::<Option<ConcatKeyValueCache>>::new();
+        let expected = reference
+            .forward_logits(
+                gemma4::ModelInput {
+                    inputs: &tokens,
+                    inputs_embeds: None,
+                    per_layer_input_ids: None,
+                    mask: None,
+                    sliding_masks: None,
+                    cache: &mut reference_cache,
+                },
+                false,
+                stream,
+            )
+            .unwrap();
+        let step = PipelineStep::new(1, 2).unwrap();
+        let mut first_cache = first.new_cache().unwrap();
+        let payload = match first
+            .forward_stage(
+                PipelineStageInput::Tokens(&tokens),
+                step,
+                None,
+                &mut first_cache,
+                stream,
+            )
+            .unwrap()
+        {
+            PipelineStageOutput::Hidden(payload) => payload,
+            PipelineStageOutput::Logits(_) => panic!("first stage produced logits"),
+        };
+        let mut last_cache = last.new_cache().unwrap();
+        let actual = match last
+            .forward_stage(
+                PipelineStageInput::Hidden(&payload),
+                step,
+                None,
+                &mut last_cache,
+                stream,
+            )
+            .unwrap()
+        {
+            PipelineStageOutput::Logits(logits) => logits,
+            PipelineStageOutput::Hidden(_) => panic!("last stage produced hidden state"),
+        };
+        assert_close(&actual, &expected);
+        assert!(!first.stage_info().opened_checkpoint_shards.is_empty());
+        assert!(!last.stage_info().opened_checkpoint_shards.is_empty());
+    }
+
+    #[test]
+    fn gemma_dense_stream_pipeline_matches_fully_resident_stages() {
+        let gpu = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
+        let cpu = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        let stream = gpu.stream();
+        let (args, _, _, _, _, _) = gemma4::model_config_from_value(&gemma_config()).unwrap();
+        let mut source = gemma4::Model::new(args, stream).unwrap();
+        initialize_parameters(&mut source, stream);
+        let dir = tempfile::tempdir().unwrap();
+        write_gemma_fixture(dir.path(), &source);
+        let dense_options = || {
+            crate::runtime::residency::dense_stream::DenseDiskStreamLoadOptions::new(
+                u64::MAX,
+                u64::MAX,
+                1,
+                1,
+                1,
+            )
+            .unwrap()
+        };
+        let mut resident_first = load_pipeline_model_with_options(
+            dir.path(),
+            ModelLoadOptions::with_parallel(gpu_topology(0)),
+            stream,
+            cpu.stream(),
+        )
+        .unwrap();
+        let mut resident_last = load_pipeline_model_with_options(
+            dir.path(),
+            ModelLoadOptions::with_parallel(gpu_topology(1)),
+            stream,
+            cpu.stream(),
+        )
+        .unwrap();
+        let mut dense_first = load_pipeline_model_with_options(
+            dir.path(),
+            ModelLoadOptions::with_parallel(gpu_topology(0))
+                .with_weight_residency(WeightResidency::DenseDiskStream(dense_options())),
+            stream,
+            cpu.stream(),
+        )
+        .unwrap();
+        let mut dense_last = load_pipeline_model_with_options(
+            dir.path(),
+            ModelLoadOptions::with_parallel(gpu_topology(1))
+                .with_weight_residency(WeightResidency::DenseDiskStream(dense_options())),
+            stream,
+            cpu.stream(),
+        )
+        .unwrap();
+        let tokens = Array::from_slice(&[1u32, 2], &[1, 2]);
+        let step = PipelineStep::new(1, 2).unwrap();
+        let run = |first: &mut PipelineModel, last: &mut PipelineModel| {
+            let mut first_cache = first.new_cache().unwrap();
+            let mut last_cache = last.new_cache().unwrap();
+            let payload = match first
+                .forward_stage(
+                    PipelineStageInput::Tokens(&tokens),
+                    step,
+                    None,
+                    &mut first_cache,
+                    stream,
+                )
+                .unwrap()
+            {
+                PipelineStageOutput::Hidden(payload) => payload,
+                PipelineStageOutput::Logits(_) => panic!("first stage produced logits"),
+            };
+            match last
+                .forward_stage(
+                    PipelineStageInput::Hidden(&payload),
+                    step,
+                    None,
+                    &mut last_cache,
+                    stream,
+                )
+                .unwrap()
+            {
+                PipelineStageOutput::Logits(logits) => logits,
+                PipelineStageOutput::Hidden(_) => panic!("last stage produced hidden state"),
+            }
+        };
+        let expected = run(&mut resident_first, &mut resident_last);
+        let actual = run(&mut dense_first, &mut dense_last);
+        assert_close(&actual, &expected);
+        assert!(dense_first.dense_stream_report().unwrap().is_some());
+        assert!(dense_last.dense_stream_report().unwrap().is_some());
+    }
+
+    #[test]
+    fn gemma_pipeline_requantizes_shared_bindings_and_matches_dense_execution() {
+        let gpu = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
+        let cpu = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        let stream = gpu.stream();
+        let quantization =
+            crate::runtime::checkpoint::quantization::AffineQuantization::new(32, 4).unwrap();
+
+        for tied in [true, false] {
+            let mut config = quantizable_gemma_config();
+            config["tie_word_embeddings"] = serde_json::json!(tied);
+            let (args, _, _, _, _, _) = gemma4::model_config_from_value(&config).unwrap();
+            let mut source = gemma4::Model::new(args, stream).unwrap();
+            initialize_parameters(&mut source, stream);
+            let dir = tempfile::tempdir().unwrap();
+            write_gemma_fixture_with_config(dir.path(), &source, &config);
+
+            let load = |rank, quantized| {
+                let options = if quantized {
+                    ModelLoadOptions::with_quantization(quantization)
+                        .with_parallel_topology(gpu_topology(rank))
+                } else {
+                    ModelLoadOptions::with_parallel(gpu_topology(rank))
+                };
+                load_pipeline_model_with_options(dir.path(), options, stream, cpu.stream()).unwrap()
+            };
+            let mut dense_first = load(0, false);
+            let mut dense_last = load(1, false);
+            let mut quantized_first = load(0, true);
+            let mut quantized_last = load(1, true);
+            assert!(
+                quantized_first.stage_info().local_parameter_bytes
+                    < dense_first.stage_info().local_parameter_bytes
+            );
+            assert!(
+                quantized_last.stage_info().local_parameter_bytes
+                    < dense_last.stage_info().local_parameter_bytes
+            );
+
+            let run = |first: &mut PipelineModel, last: &mut PipelineModel| {
+                let mut first_cache = first.new_cache().unwrap();
+                let mut last_cache = last.new_cache().unwrap();
+                let mut outputs = Vec::new();
+                for tokens in [
+                    Array::from_slice(&[1u32, 2], &[1, 2]),
+                    Array::from_slice(&[3u32], &[1, 1]),
+                ] {
+                    let step = PipelineStep::new(1, tokens.shape()[1]).unwrap();
+                    let payload = match first
+                        .forward_stage(
+                            PipelineStageInput::Tokens(&tokens),
+                            step,
+                            None,
+                            &mut first_cache,
+                            stream,
+                        )
+                        .unwrap()
+                    {
+                        PipelineStageOutput::Hidden(payload) => payload,
+                        PipelineStageOutput::Logits(_) => panic!("first stage produced logits"),
+                    };
+                    let logits = match last
+                        .forward_stage(
+                            PipelineStageInput::Hidden(&payload),
+                            step,
+                            None,
+                            &mut last_cache,
+                            stream,
+                        )
+                        .unwrap()
+                    {
+                        PipelineStageOutput::Logits(logits) => logits,
+                        PipelineStageOutput::Hidden(_) => panic!("last stage produced hidden"),
+                    };
+                    eval([&logits]).unwrap();
+                    outputs.push(logits);
+                }
+                outputs
+            };
+            let expected = run(&mut dense_first, &mut dense_last);
+            let actual = run(&mut quantized_first, &mut quantized_last);
+            for (actual, expected) in actual.iter().zip(&expected) {
+                let actual = actual.evaluated().unwrap();
+                let expected = expected.evaluated().unwrap();
+                assert_eq!(actual.as_array().shape(), expected.as_array().shape());
+                for (actual, expected) in actual
+                    .as_slice::<f32>()
+                    .iter()
+                    .zip(expected.as_slice::<f32>())
+                {
+                    assert!((actual - expected).abs() <= 2e-3, "{actual} != {expected}");
+                }
+            }
+
+            let gguf = gemma_gguf_fixture(&source, stream);
+            let load_gguf = |rank, quantized| {
+                let options = if quantized {
+                    ModelLoadOptions::with_quantization(quantization)
+                        .with_parallel_topology(gpu_topology(rank))
+                } else {
+                    ModelLoadOptions::with_parallel(gpu_topology(rank))
+                };
+                load_pipeline_model_with_options(gguf.path(), options, stream, cpu.stream())
+                    .unwrap()
+            };
+            let mut dense_gguf_first = load_gguf(0, false);
+            let mut dense_gguf_last = load_gguf(1, false);
+            let mut quantized_gguf_first = load_gguf(0, true);
+            let mut quantized_gguf_last = load_gguf(1, true);
+            assert!(
+                quantized_gguf_first.stage_info().local_parameter_bytes
+                    < dense_gguf_first.stage_info().local_parameter_bytes
+            );
+            assert!(
+                quantized_gguf_last.stage_info().local_parameter_bytes
+                    < dense_gguf_last.stage_info().local_parameter_bytes
+            );
+            let expected = run(&mut dense_gguf_first, &mut dense_gguf_last);
+            let actual = run(&mut quantized_gguf_first, &mut quantized_gguf_last);
+            for (actual, expected) in actual.iter().zip(&expected) {
+                let actual = actual.evaluated().unwrap();
+                let expected = expected.evaluated().unwrap();
+                for (actual, expected) in actual
+                    .as_slice::<f32>()
+                    .iter()
+                    .zip(expected.as_slice::<f32>())
+                {
+                    assert!((actual - expected).abs() <= 2e-3, "{actual} != {expected}");
+                }
+            }
+
+            let dense_stream =
+                crate::runtime::residency::dense_stream::DenseDiskStreamLoadOptions::new(
+                    u64::MAX,
+                    u64::MAX,
+                    1,
+                    1,
+                    1,
+                )
+                .unwrap();
+            let error = load_pipeline_model_with_options(
+                dir.path(),
+                ModelLoadOptions::with_quantization(quantization)
+                    .with_parallel_topology(gpu_topology(0))
+                    .with_weight_residency(WeightResidency::DenseDiskStream(dense_stream)),
+                stream,
+                cpu.stream(),
+            )
+            .expect_err("dense streaming must reject on-load Gemma quantization");
+            assert!(error
+                .to_string()
+                .contains("Gemma pipeline dense disk streaming"));
+        }
+    }
+
+    #[test]
+    fn gemma_pipeline_requantizes_fused_gguf_expert_bindings() {
+        let gpu = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
+        let stream = gpu.stream();
+        let cpu = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        let quantization =
+            crate::runtime::checkpoint::quantization::AffineQuantization::new(32, 4).unwrap();
+        let config = quantizable_gemma_moe_config();
+        let (args, _, _, _, _, _) = gemma4::model_config_from_value(&config).unwrap();
+        let mut source = gemma4::Model::new(args, stream).unwrap();
+        initialize_parameters(&mut source, stream);
+        let gguf = gemma_gguf_fixture(&source, stream);
+
+        let load = |rank, quantized| {
+            let options = if quantized {
+                ModelLoadOptions::with_quantization(quantization)
+                    .with_parallel_topology(gpu_topology(rank))
+            } else {
+                ModelLoadOptions::with_parallel(gpu_topology(rank))
+            };
+            load_pipeline_model_with_options(gguf.path(), options, stream, cpu.stream()).unwrap()
+        };
+        let mut dense_first = load(0, false);
+        let mut dense_last = load(1, false);
+        let mut quantized_first = load(0, true);
+        let mut quantized_last = load(1, true);
+        let mxfp4_first = load_pipeline_model_with_options(
+            gguf.path(),
+            ModelLoadOptions::with_quantization(WeightQuantization::MxFp4)
+                .with_parallel_topology(gpu_topology(0)),
+            stream,
+            cpu.stream(),
+        )
+        .unwrap();
+        assert!(
+            quantized_first.stage_info().local_parameter_bytes
+                < dense_first.stage_info().local_parameter_bytes
+        );
+        assert!(
+            quantized_last.stage_info().local_parameter_bytes
+                < dense_last.stage_info().local_parameter_bytes
+        );
+        assert!(
+            mxfp4_first.stage_info().local_parameter_bytes
+                < dense_first.stage_info().local_parameter_bytes
+        );
+        for stage in [&quantized_first, &quantized_last] {
+            assert!(
+                stage
+                    .stage_info()
+                    .owned_tensors
+                    .iter()
+                    .any(|name| name.contains("gate_up")),
+                "missing fused expert binding in {:?}",
+                stage.stage_info().owned_tensors
+            );
+        }
+
+        let run = |first: &mut PipelineModel, last: &mut PipelineModel| {
+            let tokens = Array::from_slice(&[1u32, 2], &[1, 2]);
+            let step = PipelineStep::new(1, 2).unwrap();
+            let mut first_cache = first.new_cache().unwrap();
+            let mut last_cache = last.new_cache().unwrap();
+            let payload = match first
+                .forward_stage(
+                    PipelineStageInput::Tokens(&tokens),
+                    step,
+                    None,
+                    &mut first_cache,
+                    stream,
+                )
+                .unwrap()
+            {
+                PipelineStageOutput::Hidden(payload) => payload,
+                PipelineStageOutput::Logits(_) => panic!("first stage produced logits"),
+            };
+            match last
+                .forward_stage(
+                    PipelineStageInput::Hidden(&payload),
+                    step,
+                    None,
+                    &mut last_cache,
+                    stream,
+                )
+                .unwrap()
+            {
+                PipelineStageOutput::Logits(logits) => logits,
+                PipelineStageOutput::Hidden(_) => panic!("last stage produced hidden"),
+            }
+        };
+        let expected_logits = run(&mut dense_first, &mut dense_last);
+        let expected = expected_logits.evaluated().unwrap();
+        let actual_logits = run(&mut quantized_first, &mut quantized_last);
+        let actual = actual_logits.evaluated().unwrap();
+        for (actual, expected) in actual
+            .as_slice::<f32>()
+            .iter()
+            .zip(expected.as_slice::<f32>())
+        {
+            assert!((actual - expected).abs() <= 2e-3, "{actual} != {expected}");
         }
     }
 
@@ -2680,8 +9644,8 @@ mod tests {
         assert_eq!(last.stage_info().global_layer_range, 1..2);
 
         let mut reference_cache = reference.new_cache();
-        let mut first_cache = first.new_cache();
-        let mut last_cache = last.new_cache();
+        let mut first_cache = first.new_cache().unwrap();
+        let mut last_cache = last.new_cache().unwrap();
         for tokens in [
             Array::from_slice(&[1u32, 2], &[1, 2]),
             Array::from_slice(&[3u32], &[1, 1]),
@@ -2804,11 +9768,16 @@ mod tests {
             cpu.stream(),
         )
         .expect_err("strict pipeline loading must reject an unrelated checkpoint tensor");
-        assert!(matches!(
-            strict_error,
-            Error::StrictLoadValidation { missing, unused }
-                if missing.is_empty() && unused == ["unrelated.weight"]
-        ));
+        assert!(
+            matches!(
+                &strict_error,
+                Error::StrictLoadValidation { missing, unused }
+                    if missing.is_empty()
+                        && unused.len() == 1
+                        && unused[0] == "unrelated.weight"
+            ),
+            "unexpected strict pipeline diagnostic: {strict_error:?}"
+        );
 
         dense.strict_loading = false;
         let model = load_pipeline_model_with_options(
@@ -2820,22 +9789,6 @@ mod tests {
         )
         .expect("non-strict pipeline loading must ignore unrelated checkpoint tensors");
         assert!(model.dense_stream_report().unwrap().is_some());
-    }
-
-    #[test]
-    fn non_strict_pipeline_config_preserves_architecture_allowances() {
-        let mut dense =
-            crate::runtime::residency::dense_stream::DenseDiskStreamLoadOptions::new(8, 0, 0, 1, 0)
-                .unwrap();
-        let architecture = StrictLoadConfig::default().allow_unused_prefix("model.mtp.");
-        let strict = pipeline_load_config(Some(dense), architecture.clone());
-        assert!(strict.is_unused_allowed("model.mtp.weight"));
-        assert!(!strict.is_unused_allowed("unrelated.weight"));
-
-        dense.strict_loading = false;
-        let non_strict = pipeline_load_config(Some(dense), architecture);
-        assert!(non_strict.is_unused_allowed("model.mtp.weight"));
-        assert!(non_strict.is_unused_allowed("unrelated.weight"));
     }
 
     #[test]
@@ -2891,8 +9844,8 @@ mod tests {
         }
 
         let mut reference_cache = reference.new_cache();
-        let mut first_cache = first.new_cache();
-        let mut last_cache = last.new_cache();
+        let mut first_cache = first.new_cache().unwrap();
+        let mut last_cache = last.new_cache().unwrap();
         for tokens in [
             Array::from_slice(&[1u32, 2], &[1, 2]),
             Array::from_slice(&[3u32], &[1, 1]),
@@ -3050,17 +10003,129 @@ mod tests {
         };
         let _ = stream;
         (
-            PipelineModel {
-                topology: first_topology,
-                info: first_info,
-                stage: ArchitectureStage::Llama(first),
-            },
-            PipelineModel {
-                topology: last_topology,
-                info: last_info,
-                stage: ArchitectureStage::Llama(last),
-            },
+            PipelineModel::from_adapter(first_topology, first_info, PipelineStage(first)).unwrap(),
+            PipelineModel::from_adapter(last_topology, last_info, PipelineStage(last)).unwrap(),
         )
+    }
+
+    #[test]
+    fn pipeline_program_enforces_phase_lifecycle_and_cache_handoff() {
+        let context = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
+        let stream = context.stream();
+        let mut source = llama::ResidentModel::new(llama_args(false), stream).unwrap();
+        initialize_parameters(&mut source, stream);
+        let (first, _) = llama_pipeline_stages(&source, stream);
+        let mut scheduler =
+            PipelineInferenceScheduler::new(&first, SchedulerLimits::new(2, 4).unwrap()).unwrap();
+        let first_request = RequestId::new(11);
+        let second_request = RequestId::new(22);
+        scheduler.register_request(&first, first_request).unwrap();
+        scheduler.register_request(&first, second_request).unwrap();
+        assert!(scheduler
+            .register_request(&first, RequestId::new(33))
+            .unwrap_err()
+            .to_string()
+            .contains("active-request capacity"));
+
+        scheduler
+            .enqueue(
+                PipelineMicrobatchInput::new(
+                    first_request,
+                    PipelineInferencePhase::Prefill,
+                    PipelineStep::new(1, 2).unwrap(),
+                )
+                .with_tokens(Array::from_slice(&[1u32, 2], &[1, 2])),
+            )
+            .unwrap();
+        scheduler
+            .enqueue(
+                PipelineMicrobatchInput::new(
+                    first_request,
+                    PipelineInferencePhase::Decode,
+                    PipelineStep::new(1, 1).unwrap(),
+                )
+                .with_tokens(Array::from_slice(&[3u32], &[1, 1])),
+            )
+            .unwrap();
+        assert!(scheduler
+            .enqueue(
+                PipelineMicrobatchInput::new(
+                    first_request,
+                    PipelineInferencePhase::Prefill,
+                    PipelineStep::new(1, 1).unwrap(),
+                )
+                .with_tokens(Array::from_slice(&[4u32], &[1, 1])),
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("cannot return to prefill"));
+        scheduler
+            .enqueue(
+                PipelineMicrobatchInput::new(
+                    second_request,
+                    PipelineInferencePhase::Prefill,
+                    PipelineStep::new(1, 3).unwrap(),
+                )
+                .with_tokens(Array::from_slice(&[4u32, 5, 6], &[1, 3])),
+            )
+            .unwrap();
+        scheduler
+            .enqueue(
+                PipelineMicrobatchInput::new(
+                    second_request,
+                    PipelineInferencePhase::Decode,
+                    PipelineStep::new(1, 1).unwrap(),
+                )
+                .with_tokens(Array::from_slice(&[7u32], &[1, 1])),
+            )
+            .unwrap();
+        assert!(scheduler
+            .enqueue(
+                PipelineMicrobatchInput::new(
+                    second_request,
+                    PipelineInferencePhase::Decode,
+                    PipelineStep::new(1, 1).unwrap(),
+                )
+                .with_tokens(Array::from_slice(&[0u32], &[1, 1])),
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("queue capacity"));
+
+        scheduler.cancel_request(first_request).unwrap();
+        scheduler.finish_request(second_request).unwrap();
+        assert_eq!(
+            scheduler.request_status(first_request),
+            Some(RequestStatus::Cancelled)
+        );
+        assert_eq!(
+            scheduler.request_status(second_request),
+            Some(RequestStatus::Finished)
+        );
+        assert_eq!(
+            scheduler.report(),
+            SchedulerReport {
+                active_requests: 0,
+                queued_work: 0,
+                peak_queued_work: 4,
+                submitted_work: 4,
+                completed_work: 0,
+                failed_work: 0,
+                discarded_work: 4,
+                finished_requests: 1,
+                cancelled_requests: 1,
+                drain_cycles: 0,
+                poisoned: false,
+            }
+        );
+        assert_eq!(
+            scheduler.forget_terminal_request(second_request).unwrap(),
+            RequestStatus::Finished
+        );
+        scheduler.register_request(&first, second_request).unwrap();
+        let released = scheduler.release_request_cache(second_request).unwrap();
+        assert_eq!(released.global_layers(), vec![0]);
+        assert_eq!(scheduler.request_status(second_request), None);
     }
 
     #[test]
@@ -3072,8 +10137,8 @@ mod tests {
             initialize_parameters(&mut reference, stream);
             let (mut first, mut last) = llama_pipeline_stages(&reference, stream);
             let mut reference_cache = reference.new_cache();
-            let mut first_cache = first.new_cache();
-            let mut last_cache = last.new_cache();
+            let mut first_cache = first.new_cache().unwrap();
+            let mut last_cache = last.new_cache().unwrap();
             let prompt = Array::from_slice(&[1u32, 2], &[1, 2]);
 
             for (tokens, sequence) in [
@@ -3315,8 +10380,8 @@ mod tests {
         );
 
         let mut reference_cache = reference.new_cache();
-        let mut first_cache = first.new_cache();
-        let mut last_cache = last.new_cache();
+        let mut first_cache = first.new_cache().unwrap();
+        let mut last_cache = last.new_cache().unwrap();
         for tokens in [
             Array::from_slice(&[1u32, 2], &[1, 2]),
             Array::from_slice(&[3u32], &[1, 1]),
@@ -3371,10 +10436,10 @@ mod tests {
 
         let first_topology = gpu_topology(0);
         let last_topology = gpu_topology(1);
-        let mut first = PipelineModel {
-            topology: first_topology,
-            info: base_info(first_topology, 0..1, ModelKind::DeepSeekV3, 8),
-            stage: ArchitectureStage::DeepSeek(DeepSeekStage {
+        let mut first = PipelineModel::from_adapter(
+            first_topology,
+            base_info(first_topology, 0..1, ModelKind::DeepSeekV3, 8),
+            PipelineStage(DeepSeekStage {
                 args: reference.args.clone(),
                 range: 0..1,
                 embedding: Some(reference.model.embed_tokens.clone()),
@@ -3383,11 +10448,12 @@ mod tests {
                 norm: None,
                 lm_head: None,
             }),
-        };
-        let mut last = PipelineModel {
-            topology: last_topology,
-            info: base_info(last_topology, 1..2, ModelKind::DeepSeekV3, 8),
-            stage: ArchitectureStage::DeepSeek(DeepSeekStage {
+        )
+        .unwrap();
+        let mut last = PipelineModel::from_adapter(
+            last_topology,
+            base_info(last_topology, 1..2, ModelKind::DeepSeekV3, 8),
+            PipelineStage(DeepSeekStage {
                 args: reference.args.clone(),
                 range: 1..2,
                 embedding: None,
@@ -3396,10 +10462,11 @@ mod tests {
                 norm: Some(reference.model.norm.clone()),
                 lm_head: Some(reference.lm_head.clone()),
             }),
-        };
+        )
+        .unwrap();
         let mut reference_cache = reference.new_cache();
-        let mut first_cache = first.new_cache();
-        let mut last_cache = last.new_cache();
+        let mut first_cache = first.new_cache().unwrap();
+        let mut last_cache = last.new_cache().unwrap();
         let prompt = Array::from_slice(&[1u32, 2], &[1, 2]);
 
         for (tokens, sequence) in [

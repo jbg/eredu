@@ -210,6 +210,7 @@ impl CompressedLatentCache {
         Some((self.latent.as_ref()?, self.rotary_key.as_ref()?))
     }
 
+    #[cfg(test)]
     pub(crate) fn restore_resident(
         &mut self,
         latent: Array,
@@ -650,7 +651,7 @@ pub(crate) struct PagedLatentAttentionBlock {
 
 impl<T> KeyValueCache for &'_ mut T
 where
-    T: KeyValueCache,
+    T: KeyValueCache + ?Sized,
 {
     fn is_quantized(&self) -> bool {
         T::is_quantized(self)

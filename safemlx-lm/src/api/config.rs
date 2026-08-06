@@ -34,7 +34,7 @@ pub enum ModelKind {
     /// Qwen3-VL multimodal architecture with a sparse MoE text decoder.
     Qwen3VlMoe,
     /// Qwen3.5 dense or mixture-of-experts architecture.
-    Qwen35Moe,
+    Qwen35,
 }
 
 /// Architecture-independent options for loading model weights.
@@ -139,7 +139,7 @@ impl ModelKind {
         Self::Qwen3Next,
         Self::Qwen3Vl,
         Self::Qwen3VlMoe,
-        Self::Qwen35Moe,
+        Self::Qwen35,
     ];
 
     /// Returns a stable model-family name for diagnostics and capability dispatch.
@@ -159,7 +159,7 @@ impl ModelKind {
             Self::Qwen3Next => "qwen3_next",
             Self::Qwen3Vl => "qwen3_vl",
             Self::Qwen3VlMoe => "qwen3_vl_moe",
-            Self::Qwen35Moe => "qwen3_5",
+            Self::Qwen35 => "qwen3_5",
         }
     }
 
@@ -179,7 +179,7 @@ impl ModelKind {
             "qwen3_next" => Ok(Self::Qwen3Next),
             "qwen3_vl" | "qwen3_vl_text" => Ok(Self::Qwen3Vl),
             "qwen3_vl_moe" | "qwen3_vl_moe_text" => Ok(Self::Qwen3VlMoe),
-            "qwen3_5" | "qwen3_5_text" | "qwen3_5_moe" | "qwen3_5_moe_text" => Ok(Self::Qwen35Moe),
+            "qwen3_5" | "qwen3_5_text" | "qwen3_5_moe" | "qwen3_5_moe_text" => Ok(Self::Qwen35),
             other => Err(Error::UnsupportedModelType(other.to_string())),
         }
     }
@@ -256,7 +256,7 @@ impl GgufArchitecture {
             Self::Qwen2 => ModelKind::Qwen2,
             Self::Qwen3 | Self::Qwen3Moe => ModelKind::Qwen3,
             Self::Qwen3Vl => ModelKind::Qwen3Vl,
-            Self::Qwen35 | Self::Qwen35Moe => ModelKind::Qwen35Moe,
+            Self::Qwen35 | Self::Qwen35Moe => ModelKind::Qwen35,
             Self::Qwen3Next => ModelKind::Qwen3Next,
         }
     }
@@ -422,7 +422,7 @@ pub(crate) fn validate_load_policy(
                 | ModelKind::Qwen3
                 | ModelKind::Qwen3Next
                 | ModelKind::Qwen3VlMoe
-                | ModelKind::Qwen35Moe
+                | ModelKind::Qwen35
         )
     {
         return Err(Error::UnsupportedArchitecture(format!(
@@ -433,62 +433,12 @@ pub(crate) fn validate_load_policy(
     Ok(())
 }
 
-/// Details for a model config that this crate can load.
+/// Canonical resolution of a validated model config.
 #[derive(Debug, Clone, Eq, PartialEq)]
-pub struct SupportedModelConfig {
-    /// The runtime model implementation that will be used.
-    pub kind: ModelKind,
-    /// The top-level `model_type` from the submitted config.
-    pub model_type: String,
-    /// The resolved text model type used for dispatch.
-    pub effective_model_type: String,
-}
-
-/// Result of checking whether a submitted model config is supported.
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub enum ModelConfigSupport {
-    /// The config is supported by this crate's loader.
-    Supported(SupportedModelConfig),
-    /// The config is not supported, with a human-readable reason.
-    Unsupported {
-        /// Human-readable reason the config is unsupported.
-        reason: String,
-    },
-}
-
-impl ModelConfigSupport {
-    /// Returns true when this config is supported.
-    pub fn is_supported(&self) -> bool {
-        matches!(self, Self::Supported(_))
-    }
-
-    /// Returns the unsupported reason, if this result is unsupported.
-    pub fn unsupported_reason(&self) -> Option<&str> {
-        match self {
-            Self::Supported(_) => None,
-            Self::Unsupported { reason } => Some(reason),
-        }
-    }
-}
-
-/// Checks a `config.json` string and reports whether it is supported.
-pub fn check_model_config_json(config_json: &str) -> ModelConfigSupport {
-    match serde_json::from_str::<Value>(config_json) {
-        Ok(config) => check_model_config(&config),
-        Err(error) => ModelConfigSupport::Unsupported {
-            reason: format!("invalid model config JSON: {error}"),
-        },
-    }
-}
-
-/// Checks a parsed model config value and reports whether it is supported.
-pub fn check_model_config(config: &Value) -> ModelConfigSupport {
-    match resolve_model_config(config) {
-        Ok(supported) => ModelConfigSupport::Supported(supported),
-        Err(error) => ModelConfigSupport::Unsupported {
-            reason: error.to_string(),
-        },
-    }
+pub(crate) struct ResolvedModelConfig {
+    pub(crate) kind: ModelKind,
+    pub(crate) model_type: String,
+    pub(crate) effective_model_type: String,
 }
 
 #[derive(Debug)]
@@ -510,29 +460,18 @@ impl std::fmt::Display for ModelConfigResolutionError {
 
 pub(crate) fn resolve_model_config(
     config: &Value,
-) -> Result<SupportedModelConfig, ModelConfigResolutionError> {
+) -> Result<ResolvedModelConfig, ModelConfigResolutionError> {
     let metadata = serde_json::from_value::<ModelMetadata>(config.clone())
         .map_err(ModelConfigResolutionError::InvalidMetadata)?;
     let effective_model_type = effective_model_type(&metadata);
     let kind = ModelKind::from_model_type(&effective_model_type)
         .map_err(ModelConfigResolutionError::Loader)?;
     validate_model_config(kind, config).map_err(ModelConfigResolutionError::Loader)?;
-    Ok(SupportedModelConfig {
+    Ok(ResolvedModelConfig {
         kind,
         model_type: metadata.model_type,
         effective_model_type,
     })
-}
-
-/// Reads `config.json` from a model directory and reports whether it is supported.
-pub fn check_model_dir(model_dir: impl AsRef<Path>) -> ModelConfigSupport {
-    let config_path = model_dir.as_ref().join("config.json");
-    match std::fs::read_to_string(&config_path) {
-        Ok(config_json) => check_model_config_json(&config_json),
-        Err(error) => ModelConfigSupport::Unsupported {
-            reason: format!("could not read {}: {error}", config_path.display()),
-        },
-    }
 }
 
 fn validate_model_config(kind: ModelKind, config: &Value) -> Result<(), Error> {
@@ -551,6 +490,6 @@ fn validate_model_config(kind: ModelKind, config: &Value) -> Result<(), Error> {
         ModelKind::Qwen3Next => qwen3_next::validate_model_config_value(config),
         ModelKind::Qwen3Vl => qwen3_vl::validate_model_config_value(config),
         ModelKind::Qwen3VlMoe => qwen3_vl_moe::validate_model_config_value(config),
-        ModelKind::Qwen35Moe => qwen3_5_moe::validate_model_config_value(config),
+        ModelKind::Qwen35 => qwen3_5::validate_model_config_value(config),
     }
 }

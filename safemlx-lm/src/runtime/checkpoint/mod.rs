@@ -1,5 +1,7 @@
 //! Checkpoint loading, storage, binding, and conversion.
 
+/// Stable identities for loaded checkpoint artifacts.
+pub(crate) mod artifact;
 /// Canonical unloaded-module checkpoint binding.
 pub mod binding;
 /// GGUF tokenizer metadata conversion.

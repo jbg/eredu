@@ -112,19 +112,21 @@ impl Gemma4ModalityEmbedder {
         eps: f32,
         bias: bool,
         quantization: Option<WeightQuantization>,
-        context: crate::runtime::distributed::parallel::ParallelBuildContext,
+        local_input_range: Range<usize>,
         stream: &Stream,
     ) -> Result<Self, crate::error::Error> {
-        let local = context.equal_local_dimension(
-            "Gemma modality projection input",
-            usize::try_from(input_size)
-                .map_err(|_| crate::error::Error::Parallel("negative modality width".into()))?,
-        )?;
-        let start = context.topology().tensor_parallel_rank * local;
+        let input = usize::try_from(input_size)
+            .map_err(|_| crate::error::Error::Parallel("negative modality width".into()))?;
+        if local_input_range.start >= local_input_range.end || local_input_range.end > input {
+            return Err(crate::error::Error::Parallel(format!(
+                "invalid Gemma modality input range {local_input_range:?} for width {input}"
+            )));
+        }
+        let local = local_input_range.len();
         Ok(Self {
             eps,
             input_size,
-            parallel_input_range: Some(start..start + local),
+            parallel_input_range: Some(local_input_range),
             embedding_projection: maybe_quantized_linear_with_bias(
                 quantization,
                 i32::try_from(local).map_err(|_| {

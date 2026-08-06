@@ -35,10 +35,13 @@ use crate::{
     },
     architectures::qwen::dense::gguf_string,
     error::Error,
-    nn::tensor::{
-        create_attention_mask,
-        rope::{initialize_rope, FloatOrString, RopeVariant},
-        AttentionMask,
+    nn::{
+        parallel::forward_row_parallel,
+        tensor::{
+            create_attention_mask,
+            rope::{initialize_rope, FloatOrString, RopeVariant},
+            AttentionMask,
+        },
     },
     runtime::attention::{AttentionPolicy, LayerSchedule},
     runtime::cache::{
@@ -128,6 +131,13 @@ pub struct LayerPolicy {
     pub feed_forward: FeedForwardPolicy,
 }
 
+#[derive(Debug, Clone, Copy)]
+/// Canonical rotary-position configuration used by LFM2 attention layers.
+pub struct RopeConfig {
+    /// RoPE frequency base.
+    pub theta: f32,
+}
+
 #[derive(Debug, Clone)]
 /// Validated LFM2/LFM2.5 decoder configuration.
 pub struct ModelArgs {
@@ -137,8 +147,8 @@ pub struct ModelArgs {
     pub vocab_size: i32,
     /// Hidden dimension.
     pub hidden_size: i32,
-    /// Configured dense intermediate size before optional LFM adjustment.
-    pub intermediate_size: i32,
+    /// Exact intermediate size used by dense feed-forward layers.
+    pub dense_intermediate_size: i32,
     /// Number of decoder layers.
     pub num_hidden_layers: i32,
     /// Number of query heads.
@@ -155,22 +165,10 @@ pub struct ModelArgs {
     pub conv_l_cache: i32,
     /// Whether convolution projections and kernels include biases.
     pub conv_bias: bool,
-    /// Dense FFN rounding multiple.
-    pub block_multiple_of: i32,
-    /// Dense FFN multiplier after the LFM two-thirds adjustment.
-    pub block_ffn_dim_multiplier: f32,
-    /// Whether the configured dense FFN size receives LFM's two-thirds adjustment.
-    pub block_auto_adjust_ff_dim: bool,
-    /// Legacy dense hidden-size alias.
-    pub block_dim: Option<i32>,
-    /// Legacy dense FFN-size alias.
-    pub block_ff_dim: Option<i32>,
     /// Whether logits use tied input embeddings.
     pub tie_word_embeddings: bool,
-    /// Legacy top-level RoPE base.
-    pub rope_theta: f32,
-    /// Hugging Face v5 RoPE configuration.
-    pub rope_parameters: Option<HashMap<String, FloatOrString>>,
+    /// Canonical rotary-position configuration.
+    pub rope: RopeConfig,
     /// Per-expert intermediate size for MoE checkpoints.
     pub moe_intermediate_size: i32,
     /// Number of routed experts.
@@ -183,10 +181,8 @@ pub struct ModelArgs {
     pub routed_scaling_factor: f32,
     /// Whether MoE selection uses the checkpoint expert bias.
     pub use_expert_bias: bool,
-    /// Preferred MLX quantization metadata.
-    pub quantization: Option<WeightQuantization>,
-    /// Hugging Face-compatible quantization metadata alias.
-    pub quantization_config: Option<WeightQuantization>,
+    /// Checkpoint-wide weight quantization, when present.
+    pub weight_quantization: Option<WeightQuantization>,
     /// Exact mixed-quantization weight names populated by GGUF loading.
     pub quantized_weights: Option<HashSet<String>>,
     /// Per-weight affine layouts populated by GGUF loading.
@@ -222,8 +218,8 @@ struct ModelArgsSource {
     block_ff_dim: Option<i32>,
     #[serde(default = "default_true", alias = "tie_embedding")]
     tie_word_embeddings: bool,
-    #[serde(default = "default_rope_theta")]
-    rope_theta: f32,
+    #[serde(default)]
+    rope_theta: Option<f32>,
     #[serde(default)]
     rope_parameters: Option<HashMap<String, FloatOrString>>,
     #[serde(default)]
@@ -289,11 +285,116 @@ impl ModelArgsSource {
             .collect();
         let layer_schedule = LayerSchedule::new(layer_count, policies)
             .map_err(|error| Error::UnsupportedArchitecture(format!("LFM2 {error}")))?;
+        if self
+            .block_dim
+            .is_some_and(|value| value != self.hidden_size)
+        {
+            return Err(Error::UnsupportedArchitecture(format!(
+                "LFM2 block_dim must equal hidden_size {}, got {}",
+                self.hidden_size,
+                self.block_dim.expect("checked above")
+            )));
+        }
+        let dense_intermediate_size = if self.model_type == "lfm2_moe" {
+            if self
+                .block_ff_dim
+                .is_some_and(|value| value != self.intermediate_size)
+            {
+                return Err(Error::UnsupportedArchitecture(format!(
+                    "LFM2 MoE block_ff_dim must equal intermediate_size {}, got {}",
+                    self.intermediate_size,
+                    self.block_ff_dim.expect("checked above")
+                )));
+            }
+            self.intermediate_size
+        } else {
+            let mut size = i64::from(self.block_ff_dim.unwrap_or(self.intermediate_size));
+            if self.block_auto_adjust_ff_dim {
+                if self.block_multiple_of <= 0
+                    || !self.block_ffn_dim_multiplier.is_finite()
+                    || self.block_ffn_dim_multiplier <= 0.0
+                {
+                    return Err(Error::UnsupportedArchitecture(
+                        "LFM2 dense FFN adjustment requires a positive rounding multiple and finite positive multiplier"
+                            .into(),
+                    ));
+                }
+                size = 2 * size / 3;
+                size = (self.block_ffn_dim_multiplier * size as f32) as i64;
+                let multiple = i64::from(self.block_multiple_of);
+                size = multiple * ((size + multiple - 1) / multiple);
+            }
+            i32::try_from(size).map_err(|_| {
+                Error::UnsupportedArchitecture(format!(
+                    "LFM2 adjusted dense intermediate size {size} exceeds i32"
+                ))
+            })?
+        };
+        let top_level_rope_theta = self.rope_theta;
+        let rope_theta = match self.rope_parameters {
+            Some(parameters) => {
+                for key in parameters.keys() {
+                    if !matches!(key.as_str(), "rope_theta" | "rope_type") {
+                        return Err(Error::UnsupportedArchitecture(format!(
+                            "LFM2 rope_parameters key {key:?} is unsupported"
+                        )));
+                    }
+                }
+                if let Some(rope_type) = parameters.get("rope_type") {
+                    let FloatOrString::String(rope_type) = rope_type else {
+                        return Err(Error::UnsupportedArchitecture(
+                            "LFM2 rope_parameters.rope_type must be \"default\"".into(),
+                        ));
+                    };
+                    if rope_type != "default" {
+                        return Err(Error::UnsupportedArchitecture(format!(
+                            "LFM2 rope type {rope_type:?} is unsupported"
+                        )));
+                    }
+                }
+                let nested = match parameters.get("rope_theta") {
+                    Some(FloatOrString::Float(value)) => Some(*value),
+                    Some(FloatOrString::String(value)) => {
+                        Some(value.parse::<f32>().map_err(|_| {
+                            Error::UnsupportedArchitecture(format!(
+                                "LFM2 rope_parameters.rope_theta {value:?} is not a float"
+                            ))
+                        })?)
+                    }
+                    Some(FloatOrString::Bool(_)) => {
+                        return Err(Error::UnsupportedArchitecture(
+                            "LFM2 rope_parameters.rope_theta must be a float".into(),
+                        ));
+                    }
+                    None => None,
+                };
+                if let (Some(top), Some(nested)) = (top_level_rope_theta, nested) {
+                    if top != nested {
+                        return Err(Error::UnsupportedArchitecture(format!(
+                            "LFM2 rope_theta {top} conflicts with rope_parameters.rope_theta {nested}"
+                        )));
+                    }
+                }
+                nested
+                    .or(top_level_rope_theta)
+                    .unwrap_or_else(default_rope_theta)
+            }
+            None => top_level_rope_theta.unwrap_or_else(default_rope_theta),
+        };
+        let weight_quantization = match (self.quantization, self.quantization_config) {
+            (Some(first), Some(second)) if first != second => {
+                return Err(Error::Quantization(
+                    "LFM2 quantization and quantization_config disagree".into(),
+                ));
+            }
+            (Some(value), _) | (_, Some(value)) => Some(value),
+            (None, None) => None,
+        };
         Ok(ModelArgs {
             model_type: self.model_type,
             vocab_size: self.vocab_size,
             hidden_size: self.hidden_size,
-            intermediate_size: self.intermediate_size,
+            dense_intermediate_size,
             num_hidden_layers: self.num_hidden_layers,
             num_attention_heads: self.num_attention_heads,
             num_key_value_heads: self.num_key_value_heads,
@@ -302,22 +403,15 @@ impl ModelArgsSource {
             layer_schedule,
             conv_l_cache: self.conv_l_cache,
             conv_bias: self.conv_bias,
-            block_multiple_of: self.block_multiple_of,
-            block_ffn_dim_multiplier: self.block_ffn_dim_multiplier,
-            block_auto_adjust_ff_dim: self.block_auto_adjust_ff_dim,
-            block_dim: self.block_dim,
-            block_ff_dim: self.block_ff_dim,
             tie_word_embeddings: self.tie_word_embeddings,
-            rope_theta: self.rope_theta,
-            rope_parameters: self.rope_parameters,
+            rope: RopeConfig { theta: rope_theta },
             moe_intermediate_size: self.moe_intermediate_size,
             num_experts: self.num_experts,
             num_experts_per_tok: self.num_experts_per_tok,
             norm_topk_prob: self.norm_topk_prob,
             routed_scaling_factor: self.routed_scaling_factor,
             use_expert_bias: self.use_expert_bias,
-            quantization: self.quantization,
-            quantization_config: self.quantization_config,
+            weight_quantization,
             quantized_weights: None,
             quantized_weight_configs: None,
         })
@@ -359,41 +453,6 @@ impl ModelArgs {
             .join(",")
     }
 
-    pub(crate) fn dense_intermediate_size(&self) -> i32 {
-        let mut size = self.block_ff_dim.unwrap_or(self.intermediate_size);
-        if self.block_auto_adjust_ff_dim {
-            size = 2 * size / 3;
-            size = (self.block_ffn_dim_multiplier * size as f32) as i32;
-            size = self.block_multiple_of
-                * ((size + self.block_multiple_of - 1) / self.block_multiple_of);
-        }
-        size
-    }
-
-    pub(crate) fn dense_layer_intermediate_size(&self) -> i32 {
-        if self.model_type == "lfm2_moe" {
-            self.intermediate_size
-        } else {
-            self.dense_intermediate_size()
-        }
-    }
-
-    fn rope_theta(&self) -> f32 {
-        match self
-            .rope_parameters
-            .as_ref()
-            .and_then(|parameters| parameters.get("rope_theta"))
-        {
-            Some(FloatOrString::Float(value)) => *value,
-            Some(FloatOrString::String(value)) => value.parse().unwrap_or(self.rope_theta),
-            _ => self.rope_theta,
-        }
-    }
-
-    pub(crate) fn weight_quantization(&self) -> Option<WeightQuantization> {
-        self.quantization.or(self.quantization_config)
-    }
-
     pub(crate) fn weight_quantization_for(&self, weight_name: &str) -> Option<WeightQuantization> {
         if let Some(config) = self
             .quantized_weight_configs
@@ -402,7 +461,7 @@ impl ModelArgs {
         {
             return Some(*config);
         }
-        let quantization = self.weight_quantization()?;
+        let quantization = self.weight_quantization?;
         match &self.quantized_weights {
             Some(names) if !names.contains(weight_name) => None,
             _ => Some(quantization),
@@ -425,19 +484,6 @@ pub fn model_args_from_config_value(config: &Value) -> Result<ModelArgs, Error> 
 }
 
 pub(crate) fn prompt_cache_architecture_fingerprint(args: &ModelArgs) -> String {
-    let rope_parameters = args
-        .rope_parameters
-        .as_ref()
-        .map_or_else(String::new, |values| {
-            values
-                .iter()
-                .map(|(key, value)| (key, format!("{value:?}")))
-                .collect::<BTreeMap<_, _>>()
-                .into_iter()
-                .map(|(key, value)| format!("{key}={value}"))
-                .collect::<Vec<_>>()
-                .join(";")
-        });
     derive_prompt_cache_architecture_fingerprint(
         "lfm2",
         [
@@ -452,8 +498,7 @@ pub(crate) fn prompt_cache_architecture_fingerprint(args: &ModelArgs) -> String 
                 (args.hidden_size / args.num_attention_heads).to_string(),
             ),
             ("max_positions", args.max_position_embeddings.to_string()),
-            ("rope_theta", format!("{:08x}", args.rope_theta().to_bits())),
-            ("rope_parameters", rope_parameters),
+            ("rope_theta", format!("{:08x}", args.rope.theta.to_bits())),
             ("norm_eps", format!("{:08x}", args.norm_eps.to_bits())),
             ("conv_history", args.conv_l_cache.to_string()),
             ("conv_bias", args.conv_bias.to_string()),
@@ -464,6 +509,42 @@ pub(crate) fn prompt_cache_architecture_fingerprint(args: &ModelArgs) -> String 
 pub(crate) fn prompt_cache_layer_layout(
     args: &ModelArgs,
 ) -> Result<LayerSchedule<LayerCachePolicy>, Error> {
+    prompt_cache_layer_layout_with_geometry(
+        args,
+        &args
+            .layer_schedule
+            .iter()
+            .map(|policy| match policy.operator {
+                OperatorPolicy::CausalConvolution => Lfm2LayerCacheGeometry {
+                    kv_heads: None,
+                    convolution_channels: Some(args.hidden_size),
+                },
+                OperatorPolicy::SelfAttention(_) => Lfm2LayerCacheGeometry {
+                    kv_heads: Some(args.num_key_value_heads),
+                    convolution_channels: None,
+                },
+            })
+            .collect::<Vec<_>>(),
+    )
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub(crate) struct Lfm2LayerCacheGeometry {
+    pub kv_heads: Option<i32>,
+    pub convolution_channels: Option<i32>,
+}
+
+pub(crate) fn prompt_cache_layer_layout_with_geometry(
+    args: &ModelArgs,
+    geometry: &[Lfm2LayerCacheGeometry],
+) -> Result<LayerSchedule<LayerCachePolicy>, Error> {
+    if geometry.len() != args.layer_schedule.len() {
+        return Err(Error::UnsupportedArchitecture(format!(
+            "LFM2 cache geometry has {} layers, expected {}",
+            geometry.len(),
+            args.layer_schedule.len()
+        )));
+    }
     let cache_error = |error: crate::runtime::cache::residency::CacheResidencyError| {
         Error::UnsupportedArchitecture(error.to_string())
     };
@@ -474,27 +555,45 @@ pub(crate) fn prompt_cache_layer_layout(
     let fixed = |value| StateTensorDimension::fixed(value).map_err(cache_error);
     args.layer_schedule
         .iter()
-        .map(|policy| match policy.operator {
-            OperatorPolicy::CausalConvolution if history == 0 => Ok(LayerCachePolicy::NoState),
-            OperatorPolicy::CausalConvolution => {
-                LayerCachePolicy::fixed_only(vec![StateTensorPolicy::new(
-                    StateTensorRole::Convolution { slot: 0 },
-                    vec![
-                        StateTensorDimension::Batch,
-                        fixed(history)?,
-                        fixed(args.hidden_size)?,
-                    ],
-                    StateTensorDtype::Floating,
-                )
-                .map_err(cache_error)?])
-                .map_err(cache_error)
+        .zip(geometry)
+        .map(|(policy, geometry)| {
+            match (
+                policy.operator,
+                geometry.kv_heads,
+                geometry.convolution_channels,
+            ) {
+                (OperatorPolicy::CausalConvolution, None, Some(_)) if history == 0 => {
+                    Ok(LayerCachePolicy::NoState)
+                }
+                (OperatorPolicy::CausalConvolution, None, Some(channels)) => {
+                    LayerCachePolicy::fixed_only(vec![StateTensorPolicy::new(
+                        StateTensorRole::Convolution { slot: 0 },
+                        vec![
+                            StateTensorDimension::Batch,
+                            fixed(history)?,
+                            fixed(channels)?,
+                        ],
+                        StateTensorDtype::Floating,
+                    )
+                    .map_err(cache_error)?])
+                    .map_err(cache_error)
+                }
+                (OperatorPolicy::SelfAttention(attention), Some(kv_heads), None) => {
+                    LayerCachePolicy::key_value(
+                        attention,
+                        kv_heads,
+                        args.hidden_size / args.num_attention_heads,
+                    )
+                    .map_err(cache_error)
+                }
+                (OperatorPolicy::CausalConvolution, _, _) => Err(Error::UnsupportedArchitecture(
+                    "LFM2 convolution layer requires only convolution-channel cache geometry"
+                        .into(),
+                )),
+                (OperatorPolicy::SelfAttention(_), _, _) => Err(Error::UnsupportedArchitecture(
+                    "LFM2 attention layer requires only KV-head cache geometry".into(),
+                )),
             }
-            OperatorPolicy::SelfAttention(attention) => LayerCachePolicy::key_value(
-                attention,
-                args.num_key_value_heads,
-                args.hidden_size / args.num_attention_heads,
-            )
-            .map_err(cache_error),
         })
         .collect::<Result<Vec<_>, _>>()
         .and_then(|policies| {
@@ -513,7 +612,7 @@ fn validate_args(args: &ModelArgs) -> Result<(), Error> {
     for (name, value) in [
         ("vocab_size", args.vocab_size),
         ("hidden_size", args.hidden_size),
-        ("intermediate_size", args.intermediate_size),
+        ("dense_intermediate_size", args.dense_intermediate_size),
         ("num_hidden_layers", args.num_hidden_layers),
         ("num_attention_heads", args.num_attention_heads),
         ("num_key_value_heads", args.num_key_value_heads),
@@ -549,10 +648,16 @@ fn validate_args(args: &ModelArgs) -> Result<(), Error> {
             "LFM2 attention head counts do not divide hidden/query dimensions".into(),
         ));
     }
-    if args.dense_intermediate_size() <= 0 {
+    if args.dense_intermediate_size <= 0 {
         return Err(Error::UnsupportedArchitecture(
             "LFM2 adjusted dense intermediate size must be positive".into(),
         ));
+    }
+    if !args.rope.theta.is_finite() || args.rope.theta <= 0.0 {
+        return Err(Error::UnsupportedArchitecture(format!(
+            "LFM2 RoPE theta must be finite and positive, got {}",
+            args.rope.theta
+        )));
     }
     if args.has_sparse_moe_layers()
         && (args.moe_intermediate_size <= 0
@@ -579,7 +684,7 @@ pub struct AttentionInput<'a> {
     /// Optional causal mask.
     pub mask: Option<&'a Array>,
     /// Optional KV cache.
-    pub cache: Option<&'a mut ConcatKeyValueCache>,
+    pub cache: Option<&'a mut dyn KeyValueCache>,
 }
 
 #[derive(Debug, Clone, ModuleParameters, Quantizable)]
@@ -678,7 +783,7 @@ impl Attention {
             k_layernorm: nn::RmsNorm::unloaded(head_dim, args.norm_eps, Dtype::Float32, stream)?,
             rope: initialize_rope(
                 head_dim,
-                args.rope_theta(),
+                args.rope.theta,
                 false,
                 &None,
                 args.max_position_embeddings,
@@ -762,23 +867,27 @@ pub struct ShortConv {
 
 impl ShortConv {
     fn new(args: &ModelArgs, layer: i32, stream: &Stream) -> Result<Self, Exception> {
+        Self::new_with_channels(args, layer, args.hidden_size, stream)
+    }
+
+    fn new_with_channels(
+        args: &ModelArgs,
+        layer: i32,
+        channels: i32,
+        stream: &Stream,
+    ) -> Result<Self, Exception> {
         let prefix = format!("model.layers.{layer}.conv");
         Ok(Self {
-            conv: DepthwiseConv1d::new(
-                args.hidden_size,
-                args.conv_l_cache,
-                args.conv_bias,
-                stream,
-            )?,
+            conv: DepthwiseConv1d::new(channels, args.conv_l_cache, args.conv_bias, stream)?,
             in_proj: common::linear::unloaded_maybe_quantized_linear(
                 args.hidden_size,
-                3 * args.hidden_size,
+                3 * channels,
                 args.conv_bias,
                 args.weight_quantization_for(&format!("{prefix}.in_proj.weight")),
                 stream,
             )?,
             out_proj: common::linear::unloaded_maybe_quantized_linear(
-                args.hidden_size,
+                channels,
                 args.hidden_size,
                 args.conv_bias,
                 args.weight_quantization_for(&format!("{prefix}.out_proj.weight")),
@@ -794,14 +903,42 @@ impl ShortConv {
         stream: &Stream,
     ) -> Result<Array, Exception> {
         let projected = self.in_proj.forward(x, stream)?;
-        let hidden = x.dim(-1);
-        let b = projected.try_index_device((.., .., ..hidden), stream)?;
-        let c = projected.try_index_device((.., .., hidden..2 * hidden), stream)?;
-        let x = projected.try_index_device((.., .., 2 * hidden..), stream)?;
+        let channels = projected.dim(-1) / 3;
+        let b = projected.try_index_device((.., .., ..channels), stream)?;
+        let c = projected.try_index_device((.., .., channels..2 * channels), stream)?;
+        let x = projected.try_index_device((.., .., 2 * channels..), stream)?;
         let bx = b.multiply(x, stream)?;
         let convolution = causal_depthwise_conv1d(&self.conv, &bx, cache, stream)?;
         self.out_proj
             .forward(&c.multiply(convolution, stream)?, stream)
+    }
+
+    fn forward_tensor_parallel(
+        &mut self,
+        x: &Array,
+        cache: Option<&mut CausalConv1dCache>,
+        group: &safemlx::distributed::Group,
+        stream: &Stream,
+    ) -> Result<Array, Exception> {
+        let projected = self.in_proj.forward(x, stream)?;
+        if projected.dim(-1) % 3 != 0 {
+            return Err(Exception::custom(format!(
+                "LFM2 fused short-convolution projection width {} is not divisible by three",
+                projected.dim(-1)
+            )));
+        }
+        let channels = projected.dim(-1) / 3;
+        let b = projected.try_index_device((.., .., ..channels), stream)?;
+        let c = projected.try_index_device((.., .., channels..2 * channels), stream)?;
+        let x = projected.try_index_device((.., .., 2 * channels..), stream)?;
+        let bx = b.multiply(x, stream)?;
+        let convolution = causal_depthwise_conv1d(&self.conv, &bx, cache, stream)?;
+        forward_row_parallel(
+            &mut self.out_proj,
+            &c.multiply(convolution, stream)?,
+            group,
+            stream,
+        )
     }
 }
 
@@ -975,6 +1112,18 @@ pub enum LayerCache {
     Conv(CausalConv1dCache),
 }
 
+/// Borrowed execution state for one LFM2 operator.
+///
+/// This separates decoder execution from the resident cache container so
+/// generalized runtimes can supply any exact KV implementation alongside
+/// descriptor-backed convolution state.
+pub(crate) enum OperatorCache<'a> {
+    /// Full-attention state implementing the shared KV contract.
+    Attention(&'a mut dyn KeyValueCache),
+    /// Short-convolution history.
+    Convolution(&'a mut CausalConv1dCache),
+}
+
 impl LayerCache {
     pub(crate) fn new(policy: LayerPolicy) -> Self {
         match policy.operator {
@@ -1069,8 +1218,9 @@ impl DecoderLayer {
         Self::new_with_widths(
             args,
             index,
-            args.dense_layer_intermediate_size(),
+            args.dense_intermediate_size,
             args.moe_intermediate_size,
+            None,
             None,
             stream,
         )
@@ -1082,6 +1232,7 @@ impl DecoderLayer {
         dense_intermediate_size: i32,
         moe_intermediate_size: i32,
         attention_head_dim: Option<i32>,
+        convolution_channels: Option<i32>,
         stream: &Stream,
     ) -> Result<Self, Error> {
         let layer_policy = args
@@ -1111,7 +1262,10 @@ impl DecoderLayer {
                 None
             },
             conv: if layer_policy.operator == OperatorPolicy::CausalConvolution {
-                Some(ShortConv::new(args, index, stream)?)
+                Some(match convolution_channels {
+                    Some(channels) => ShortConv::new_with_channels(args, index, channels, stream)?,
+                    None => ShortConv::new(args, index, stream)?,
+                })
             } else {
                 None
             },
@@ -1147,9 +1301,23 @@ impl DecoderLayer {
         cache: Option<&mut LayerCache>,
         stream: &Stream,
     ) -> Result<Array, Exception> {
+        let cache = cache.map(|cache| match cache {
+            LayerCache::Attention(cache) => OperatorCache::Attention(cache),
+            LayerCache::Conv(cache) => OperatorCache::Convolution(cache),
+        });
+        self.forward_with_operator_cache(x, mask, cache, stream)
+    }
+
+    pub(crate) fn forward_with_operator_cache(
+        &mut self,
+        x: &Array,
+        mask: Option<&Array>,
+        cache: Option<OperatorCache<'_>>,
+        stream: &Stream,
+    ) -> Result<Array, Exception> {
         let normalized = self.operator_norm.forward(x, stream)?;
         let operator = match (self.layer_policy.operator, cache) {
-            (OperatorPolicy::SelfAttention(_), Some(LayerCache::Attention(cache))) => {
+            (OperatorPolicy::SelfAttention(_), Some(OperatorCache::Attention(cache))) => {
                 self.self_attn.as_mut().expect("attention layer").forward(
                     AttentionInput {
                         x: &normalized,
@@ -1169,7 +1337,7 @@ impl DecoderLayer {
                     stream,
                 )?
             }
-            (OperatorPolicy::CausalConvolution, Some(LayerCache::Conv(cache))) => self
+            (OperatorPolicy::CausalConvolution, Some(OperatorCache::Convolution(cache))) => self
                 .conv
                 .as_mut()
                 .expect("conv layer")
@@ -1192,9 +1360,8 @@ impl DecoderLayer {
         h.add(feed_forward, stream)
     }
 
-    /// Executes one hybrid LFM2 layer with local attention heads and local
-    /// feed-forward intermediates. Causal-convolution operators remain
-    /// replicated because their channels are residual-width coupled.
+    /// Executes one hybrid LFM2 layer with local attention heads, convolution
+    /// channels, and feed-forward intermediates.
     pub(crate) fn forward_tensor_parallel(
         &mut self,
         x: &Array,
@@ -1231,12 +1398,12 @@ impl DecoderLayer {
                 .conv
                 .as_mut()
                 .expect("conv layer")
-                .forward(&normalized, Some(cache), stream)?,
+                .forward_tensor_parallel(&normalized, Some(cache), group, stream)?,
             (OperatorPolicy::CausalConvolution, None) => self
                 .conv
                 .as_mut()
                 .expect("conv layer")
-                .forward(&normalized, None, stream)?,
+                .forward_tensor_parallel(&normalized, None, group, stream)?,
             (policy, Some(_)) => {
                 return Err(Exception::custom(format!(
                     "LFM2 tensor-parallel cache kind does not match layer policy {policy:?}"
@@ -1496,25 +1663,6 @@ impl Model {
         Cache::new(&self.args).expect("validated LFM2 layer schedule")
     }
 
-    pub(crate) fn save_prompt_cache(
-        cache: &Cache,
-        destination: impl AsRef<Path>,
-        descriptor: PromptCacheDescriptor,
-        prefix_token_ids: &[u32],
-        options: &PromptCacheOptions,
-        stream: &Stream,
-    ) -> Result<PromptCacheManifest, Exception> {
-        Self::save_prompt_cache_with_rank(
-            cache,
-            destination,
-            descriptor,
-            prefix_token_ids,
-            options,
-            None,
-            stream,
-        )
-    }
-
     pub(crate) fn save_prompt_cache_with_rank(
         cache: &Cache,
         destination: impl AsRef<Path>,
@@ -1574,6 +1722,27 @@ impl Model {
         .map_err(|error| Exception::custom(error.to_string()))
     }
 
+    #[cfg(test)]
+    pub(crate) fn save_prompt_cache(
+        cache: &Cache,
+        destination: impl AsRef<Path>,
+        descriptor: PromptCacheDescriptor,
+        prefix_token_ids: &[u32],
+        options: &PromptCacheOptions,
+        stream: &Stream,
+    ) -> Result<PromptCacheManifest, Exception> {
+        Self::save_prompt_cache_with_rank(
+            cache,
+            destination,
+            descriptor,
+            prefix_token_ids,
+            options,
+            None,
+            stream,
+        )
+    }
+
+    #[cfg(test)]
     pub(crate) fn load_prompt_cache(
         args: &ModelArgs,
         directory: impl AsRef<Path>,
@@ -1797,12 +1966,12 @@ pub fn load_model_quantized(
     let mut args = get_model_args(model_dir)?;
     if !crate::runtime::checkpoint::quantization::should_quantize_on_load(
         "LFM2",
-        args.weight_quantization(),
+        args.weight_quantization,
         quantization,
     )? {
         return load_model(model_dir, stream, weights_stream);
     }
-    args.quantization = Some(quantization);
+    args.weight_quantization = Some(quantization);
     let mut model = Model::new(args.clone(), stream)?;
     let config = StrictLoadConfig::default();
     let mut report = StrictLoadReport::default();
@@ -1912,8 +2081,7 @@ pub(crate) fn load_gguf_checkpoint(
     args.quantized_weights = Some(configs.keys().cloned().collect());
     args.quantized_weight_configs = Some(configs);
     if let Some(quantization) = quantization {
-        args.quantization = Some(quantization);
-        args.quantization_config = None;
+        args.weight_quantization = Some(quantization);
         args.quantized_weights = None;
         args.quantized_weight_configs = None;
     }
@@ -2121,7 +2289,7 @@ pub(crate) fn args_from_gguf_catalog(
         model_type: if is_moe { "lfm2_moe" } else { "lfm2" }.into(),
         vocab_size,
         hidden_size: gguf_i32_catalog(metadata, &key("embedding_length"))?,
-        intermediate_size: gguf_i32_catalog(metadata, &key("feed_forward_length"))?,
+        dense_intermediate_size: gguf_i32_catalog(metadata, &key("feed_forward_length"))?,
         num_hidden_layers,
         num_attention_heads: gguf_i32_catalog(metadata, &key("attention.head_count"))?,
         num_key_value_heads,
@@ -2131,15 +2299,11 @@ pub(crate) fn args_from_gguf_catalog(
         conv_l_cache: gguf_i32_catalog(metadata, &key("shortconv.l_cache"))?,
         conv_bias: arrays
             .any_gguf_tensor(|name| name.contains("shortconv") && name.ends_with(".bias")),
-        block_multiple_of: 1,
-        block_ffn_dim_multiplier: 1.0,
-        block_auto_adjust_ff_dim: false,
-        block_dim: None,
-        block_ff_dim: None,
         tie_word_embeddings: !arrays.contains_gguf_tensor("output.weight"),
-        rope_theta: gguf_optional_f32(metadata, &key("rope.freq_base"))?
-            .unwrap_or_else(default_rope_theta),
-        rope_parameters: None,
+        rope: RopeConfig {
+            theta: gguf_optional_f32(metadata, &key("rope.freq_base"))?
+                .unwrap_or_else(default_rope_theta),
+        },
         moe_intermediate_size: if is_moe {
             gguf_i32_catalog(metadata, &key("expert_feed_forward_length"))?
         } else {
@@ -2163,8 +2327,7 @@ pub(crate) fn args_from_gguf_catalog(
         routed_scaling_factor: gguf_optional_f32(metadata, &key("expert_weights_scale"))?
             .unwrap_or_else(default_routed_scaling_factor),
         use_expert_bias: arrays.any_gguf_tensor(expert_bias_name),
-        quantization: None,
-        quantization_config: None,
+        weight_quantization: None,
         quantized_weights: None,
         quantized_weight_configs: None,
     };
@@ -2389,7 +2552,7 @@ mod tests {
                 feed_forward: FeedForwardPolicy::Dense,
             })
         );
-        assert_eq!(args.dense_intermediate_size(), 16);
+        assert_eq!(args.dense_intermediate_size, 16);
         let cache = super::Cache::new(&args).unwrap();
         assert!(matches!(cache.layers[0], super::LayerCache::Conv(_)));
         assert!(matches!(cache.layers[1], super::LayerCache::Attention(_)));
@@ -2460,8 +2623,10 @@ mod tests {
     }
 
     #[test]
-    fn accepts_published_dense_aliases_and_rope_parameters() {
+    fn source_aliases_normalize_into_canonical_geometry() {
         let mut config = dense_config();
+        config["block_dim"] = json!(16);
+        config["block_ff_dim"] = json!(24);
         config["block_norm_eps"] = json!(0.00001);
         config["rope_parameters"] = json!({
             "rope_theta": 1_000_000.0,
@@ -2470,7 +2635,59 @@ mod tests {
         validate_model_config_value(&config).unwrap();
         let args = model_args_from_config_value(&config).unwrap();
         assert!(args.tie_word_embeddings);
-        assert_eq!(args.rope_theta(), 1_000_000.0);
+        assert_eq!(args.dense_intermediate_size, 16);
+        assert_eq!(args.rope.theta, 1_000_000.0);
+    }
+
+    #[test]
+    fn source_aliases_fail_closed_on_conflicting_geometry_or_rope() {
+        let mut wrong_hidden = dense_config();
+        wrong_hidden["block_dim"] = json!(32);
+        assert!(model_args_from_config_value(&wrong_hidden)
+            .unwrap_err()
+            .to_string()
+            .contains("block_dim must equal hidden_size"));
+
+        let mut invalid_rope = dense_config();
+        invalid_rope["rope_parameters"] = json!({
+            "rope_theta": "not-a-number",
+            "rope_type": "default"
+        });
+        assert!(model_args_from_config_value(&invalid_rope)
+            .unwrap_err()
+            .to_string()
+            .contains("rope_parameters.rope_theta"));
+
+        let mut unsupported_rope = dense_config();
+        unsupported_rope["rope_parameters"] = json!({
+            "rope_theta": 1_000_000.0,
+            "rope_type": "yarn"
+        });
+        assert!(model_args_from_config_value(&unsupported_rope)
+            .unwrap_err()
+            .to_string()
+            .contains("rope type \"yarn\" is unsupported"));
+
+        let mut conflicting_rope = dense_config();
+        conflicting_rope["rope_theta"] = json!(10_000.0);
+        conflicting_rope["rope_parameters"] = json!({
+            "rope_theta": 1_000_000.0,
+            "rope_type": "default"
+        });
+        assert!(model_args_from_config_value(&conflicting_rope)
+            .unwrap_err()
+            .to_string()
+            .contains("conflicts with rope_parameters.rope_theta"));
+
+        let mut conflicting_quantization = dense_config();
+        conflicting_quantization["quantization"] =
+            json!({"group_size": 32, "bits": 4, "mode": "affine"});
+        conflicting_quantization["quantization_config"] =
+            json!({"group_size": 64, "bits": 4, "mode": "affine"});
+        assert!(model_args_from_config_value(&conflicting_quantization)
+            .unwrap_err()
+            .to_string()
+            .contains("quantization and quantization_config disagree"));
     }
 
     #[test]
@@ -2541,9 +2758,8 @@ mod tests {
         let loading = model_args_from_config_value(&config)
             .unwrap_err()
             .to_string();
-        let inspection = crate::api::check_model_config(&config)
-            .unsupported_reason()
-            .unwrap()
+        let inspection = crate::api::resolve_model_config(&config)
+            .unwrap_err()
             .to_string();
         assert_eq!(inspection, loading);
         assert!(loading.contains("num_dense_layers must be between 0 and 3"));

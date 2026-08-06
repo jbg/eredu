@@ -22,13 +22,13 @@ mod test_utils;
 
 pub use api::realtime::{
     load_model as load_realtime_model, load_model_with_options as load_realtime_model_with_options,
-    LoadedRealtimeModel, RealtimeModelKind, RealtimeState,
+    LoadedRealtimeModel, RealtimeCompletedStep, RealtimeInferenceScheduler, RealtimeModelKind,
+    RealtimeSampling, RealtimeSession, RealtimeSpeechConfig, RealtimeStepInput, RealtimeStepOutput,
 };
 pub use api::{
-    check_model_config, check_model_config_json, check_model_dir, inspect_model, ArtifactKind,
-    ArtifactModality, ArtifactTensorEncoding, InspectionIssue, InspectionIssueCode,
-    InspectionReadiness, InspectionRequirement, InspectionSeverity, ModelConfigSupport,
-    ModelInspectionOptions, ModelInspectionReport, ModelLoadOptions, SupportedModelConfig,
+    inspect_model, ArtifactKind, ArtifactModality, ArtifactTensorEncoding, InspectionIssue,
+    InspectionIssueCode, InspectionReadiness, InspectionRequirement, InspectionSeverity,
+    ModelInspectionOptions, ModelInspectionReport, ModelLoadOptions,
 };
 pub use architectures::llama::layerwise::{
     load_llama_model, LlamaCache, LlamaLoadOptions, LlamaModel,

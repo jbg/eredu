@@ -2,12 +2,14 @@ use std::{path::PathBuf, time::Instant};
 
 use safemlx::{transforms::eval, Array, Device, DeviceType, Dtype, ExecutionContext, Stream};
 use safemlx_lm::{
-    api::realtime::{RealtimeSampling, RealtimeSpeechModel, RealtimeStepInput},
+    api::realtime::{RealtimeInferenceScheduler, RealtimeSampling, RealtimeStepInput},
     api::ModelLoadOptions,
     architectures::moshi::personaplex,
     load_realtime_model, load_realtime_model_with_options,
     runtime::checkpoint::quantization::AffineQuantization,
     runtime::generation::sampler::DefaultSampler,
+    runtime::scheduler::{RequestId, SchedulerLimits},
+    LoadedRealtimeModel,
 };
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -74,8 +76,8 @@ fn report_memory() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn benchmark_model<M: RealtimeSpeechModel>(
-    model: &mut M,
+fn benchmark_model(
+    model: &mut LoadedRealtimeModel,
     frames: i32,
     stream: &Stream,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -97,30 +99,38 @@ struct StepBenchResult {
     token_hash: u64,
 }
 
-fn run_steps<M: RealtimeSpeechModel>(
-    model: &mut M,
+fn run_steps(
+    model: &mut LoadedRealtimeModel,
     input: &safemlx::Array,
     frames: i32,
     stream: &Stream,
 ) -> Result<StepBenchResult, Box<dyn std::error::Error>> {
-    let mut state = model.new_realtime_state();
     let config = model.realtime_config();
-    let mut text_sampler = DefaultSampler;
-    let mut audio_samplers = (0..config.depth_audio_codebooks)
+    let audio_samplers = (0..config.depth_audio_codebooks)
         .map(|_| DefaultSampler)
         .collect::<Vec<_>>();
+    let request = RequestId::new(1);
+    let mut scheduler = RealtimeInferenceScheduler::new(model, SchedulerLimits::new(1, 1)?)?;
+    scheduler.register_request(
+        model,
+        request,
+        DefaultSampler,
+        audio_samplers,
+        RealtimeSampling::greedy(),
+    )?;
     let mut latencies_ms = Vec::with_capacity(frames as usize);
     let mut emitted_frames = 0;
     let mut token_hash = 0xcbf29ce484222325u64;
 
     for _ in 0..frames {
         let start = Instant::now();
-        let output = model.step_realtime(
-            &mut state,
-            RealtimeStepInput::encoded_audio(input),
-            RealtimeSampling::new(&mut text_sampler, &mut audio_samplers, 0.0, 0.0, None),
-            stream,
-        )?;
+        scheduler.enqueue(model, request, RealtimeStepInput::encoded_audio(input))?;
+        let output = scheduler
+            .run_queued(model, stream)?
+            .pop()
+            .expect("one queued realtime frame")
+            .into_parts()
+            .1;
         if let Some(tokens) = &output.output_audio_tokens {
             eval([&output.text_token, &output.sampled_audio_tokens, tokens])?;
             emitted_frames += 1;

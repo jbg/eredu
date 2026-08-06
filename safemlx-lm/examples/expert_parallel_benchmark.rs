@@ -313,13 +313,13 @@ fn benchmark_replicated_ep(
 ) -> anyhow::Result<ModelResults> {
     for _ in 0..warmup {
         let mut cache = model.new_cache();
-        eval([&model.prefill(prompt, &mut cache, group, stream)?])?;
+        eval([&model.forward(prompt, None, &mut cache, group, stream)?])?;
     }
     let mut prefill = PhaseResult::default();
     for _ in 0..iterations {
         let mut cache = model.new_cache();
         let started = Instant::now();
-        let output = model.prefill(prompt, &mut cache, group, stream)?;
+        let output = model.forward(prompt, None, &mut cache, group, stream)?;
         eval([&output])?;
         prefill.seconds += started.elapsed().as_secs_f64();
         prefill
@@ -332,10 +332,10 @@ fn benchmark_replicated_ep(
     let mut decode = PhaseResult::default();
     for _ in 0..iterations {
         let mut cache = model.new_cache();
-        eval([&model.prefill(prompt, &mut cache, group, stream)?])?;
+        eval([&model.forward(prompt, None, &mut cache, group, stream)?])?;
         let started = Instant::now();
         for _ in 0..decode_steps {
-            let output = model.decode(decode_token, &mut cache, group, stream)?;
+            let output = model.forward(decode_token, None, &mut cache, group, stream)?;
             eval([&output])?;
             decode
                 .statistics

@@ -92,7 +92,7 @@ impl AudioSubsampleLayer {
 #[derive(Debug, Clone, ModuleParameters)]
 pub(crate) struct AudioSubsampleConvProjection {
     pub global_hidden_size: i32,
-    pub parallel_parts: usize,
+    pub parallel_widths: Vec<usize>,
     #[param]
     pub layer0: AudioSubsampleLayer,
     #[param]
@@ -122,7 +122,7 @@ impl AudioSubsampleConvProjection {
         let second = config.subsampling_conv_channels[1];
         Ok(Self {
             global_hidden_size: config.hidden_size,
-            parallel_parts: 1,
+            parallel_widths: vec![config.hidden_size as usize],
             layer0: AudioSubsampleLayer::new(1, first, config.rms_norm_eps, stream)?,
             layer1: AudioSubsampleLayer::new(first, second, config.rms_norm_eps, stream)?,
             input_proj_linear: nn::Linear::unloaded(
@@ -137,19 +137,24 @@ impl AudioSubsampleConvProjection {
 
     pub(crate) fn new_tensor_parallel(
         config: &Gemma4AudioConfig,
-        context: crate::runtime::distributed::parallel::ParallelBuildContext,
+        local_hidden: i32,
+        parallel_widths: Vec<usize>,
         stream: &Stream,
     ) -> Result<Self, crate::error::Error> {
         let mut output = Self::new(config, stream)?;
-        let local = context.equal_local_dimension(
-            "Gemma audio input projection hidden size",
-            config.hidden_size as usize,
-        )?;
+        if local_hidden <= 0
+            || parallel_widths.is_empty()
+            || parallel_widths.iter().sum::<usize>() != config.hidden_size as usize
+        {
+            return Err(crate::error::Error::Parallel(
+                "invalid Gemma audio input tensor-parallel widths".into(),
+            ));
+        }
         output.global_hidden_size = config.hidden_size;
-        output.parallel_parts = context.topology().tensor_parallel_size;
+        output.parallel_widths = parallel_widths;
         output.input_proj_linear = nn::Linear::unloaded(
             32 * config.subsampling_conv_channels[1],
-            local as i32,
+            local_hidden,
             false,
             Dtype::Float32,
             stream,
@@ -201,8 +206,13 @@ impl AudioSubsampleConvProjection {
         stream: &Stream,
     ) -> Result<Array, Exception> {
         let local = self.forward(features, valid_frames, stream)?;
-        let widths = vec![local.dim(-1) as usize; self.parallel_parts];
-        safemlx::distributed::all_gather_uneven_axis(&local, -1, &widths, group, stream)
+        safemlx::distributed::all_gather_uneven_axis(
+            &local,
+            -1,
+            &self.parallel_widths,
+            group,
+            stream,
+        )
     }
 }
 
@@ -306,6 +316,7 @@ pub(crate) struct AudioLightConv1d {
     #[param]
     pub linear_end: Gemma4ClippedLinear,
     pub kernel_size: i32,
+    pub global_hidden_size: i32,
 }
 
 impl AudioLightConv1d {
@@ -329,6 +340,7 @@ impl AudioLightConv1d {
             conv_norm: nn::RmsNorm::unloaded(hidden, config.rms_norm_eps, Dtype::Float32, stream)?,
             linear_end: Gemma4ClippedLinear::new(hidden, hidden, false, stream)?,
             kernel_size: config.conv_kernel_size,
+            global_hidden_size: hidden,
         })
     }
 
@@ -365,6 +377,7 @@ impl AudioLightConv1d {
             )?,
             linear_end: Gemma4ClippedLinear::new(local_hidden, config.hidden_size, false, stream)?,
             kernel_size: config.conv_kernel_size,
+            global_hidden_size: config.hidden_size,
         })
     }
 
@@ -429,16 +442,10 @@ impl AudioLightConv1d {
         )?;
         let local_square = convolved.square(stream)?.sum_axes(&[-1], true, stream)?;
         let global_square = safemlx::distributed::all_sum(&local_square, group, stream)?;
-        let global_hidden = hidden
-            .checked_mul(
-                i32::try_from(group.size())
-                    .map_err(|_| Exception::custom("Gemma audio TP size exceeds i32"))?,
-            )
-            .ok_or_else(|| Exception::custom("Gemma audio TP hidden width overflow"))?;
         let normalized = convolved.multiply(
             safemlx::ops::rsqrt(
                 global_square
-                    .divide(Array::from_f32(global_hidden as f32), stream)?
+                    .divide(Array::from_f32(self.global_hidden_size as f32), stream)?
                     .add(Array::from_f32(self.conv_norm.eps), stream)?,
                 stream,
             )?,
@@ -814,20 +821,21 @@ impl Gemma4AudioLayerwiseStatic {
     pub(crate) fn new_tensor_parallel(
         tower: &Self,
         config: &Gemma4AudioConfig,
-        context: crate::runtime::distributed::parallel::ParallelBuildContext,
+        local_input_hidden: i32,
+        input_widths: Vec<usize>,
+        local_output: i32,
         stream: &Stream,
     ) -> Result<Self, crate::error::Error> {
-        let local_output = context.equal_local_dimension(
-            "Gemma audio output projection",
-            config.output_proj_dims as usize,
-        )?;
         Ok(Self {
             subsample_conv_projection: AudioSubsampleConvProjection::new_tensor_parallel(
-                config, context, stream,
+                config,
+                local_input_hidden,
+                input_widths,
+                stream,
             )?,
             output_proj: nn::Linear::unloaded(
                 config.hidden_size,
-                local_output as i32,
+                local_output,
                 tower.output_proj.bias.value.is_some(),
                 Dtype::Float32,
                 stream,
@@ -913,7 +921,6 @@ impl Gemma4AudioLayerwiseStatic {
 
 #[derive(Debug, Clone, ModuleParameters)]
 pub(crate) struct Gemma4AudioTower {
-    pub(crate) config: Gemma4AudioConfig,
     #[param]
     pub subsample_conv_projection: AudioSubsampleConvProjection,
     #[param]
@@ -925,7 +932,6 @@ pub(crate) struct Gemma4AudioTower {
 impl Gemma4AudioTower {
     pub(crate) fn new(config: &Gemma4AudioConfig, stream: &Stream) -> Result<Self, Exception> {
         Ok(Self {
-            config: config.clone(),
             subsample_conv_projection: AudioSubsampleConvProjection::new(config, stream)?,
             layers: (0..config.num_hidden_layers)
                 .map(|_| AudioLayer::new(config, stream))

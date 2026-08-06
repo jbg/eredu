@@ -675,6 +675,7 @@ fn apply_structural_validation(
                 severity| {
         let code = match issue.kind {
             StructuralIssueKind::MissingTensor => InspectionIssueCode::MissingRequiredTensor,
+            StructuralIssueKind::UnexpectedTensor => InspectionIssueCode::ConflictingTensorLayout,
             StructuralIssueKind::ConflictingLayout => InspectionIssueCode::ConflictingTensorLayout,
             StructuralIssueKind::ShapeMismatch => InspectionIssueCode::TensorShapeMismatch,
             StructuralIssueKind::UnsupportedEncoding => {
@@ -1199,7 +1200,7 @@ fn modalities_for_safetensors(kind: ModelKind, config: &Value) -> Vec<ArtifactMo
             modalities.insert(ArtifactModality::Image);
             modalities.insert(ArtifactModality::Video);
         }
-        ModelKind::Qwen35Moe
+        ModelKind::Qwen35
             if config.get("vision_config").is_some()
                 || config
                     .get("text_config")
@@ -1219,7 +1220,7 @@ fn modalities_for_safetensors(kind: ModelKind, config: &Value) -> Vec<ArtifactMo
         | ModelKind::Qwen2
         | ModelKind::Qwen3
         | ModelKind::Qwen3Next
-        | ModelKind::Qwen35Moe => {}
+        | ModelKind::Qwen35 => {}
     }
     modalities.into_iter().collect()
 }
@@ -1638,7 +1639,7 @@ mod tests {
             offset = end;
         }
         let mut header = serde_json::to_vec(&Value::Object(header)).unwrap();
-        while header.len() % 8 != 0 {
+        while !header.len().is_multiple_of(8) {
             header.push(b' ');
         }
         let path = directory.path().join("model.safetensors");
@@ -7195,7 +7196,7 @@ mod tests {
                     report.issues
                 );
                 structural::validate_safetensors_load_path(
-                    ModelKind::Qwen35Moe,
+                    ModelKind::Qwen35,
                     directory.path(),
                     load,
                 )
@@ -7463,16 +7464,12 @@ mod tests {
     }
 
     #[test]
-    fn qwen3_moe_split_safetensors_are_residency_sensitive() {
+    fn qwen3_moe_split_safetensors_are_exact_for_all_residencies() {
         let directory = write_complete_qwen3_moe_safetensors_dir(true, |_| {});
         let resident = inspect_model(directory.path(), ModelInspectionOptions::default()).unwrap();
-        assert_eq!(resident.structural_binding, InspectionReadiness::Invalid);
-        assert!(resident.issues.iter().any(|issue| {
-            issue.code == InspectionIssueCode::ConflictingTensorLayout
-                && issue.tensor_name.as_deref()
-                    == Some("model.layers.0.mlp.experts.0.down_proj.weight")
-        }));
-        assert!(!resident.is_loadable());
+        assert_eq!(resident.structural_binding, InspectionReadiness::Ready);
+        assert_eq!(resident.model_loadability, InspectionReadiness::Ready);
+        assert!(resident.is_loadable());
 
         let bounded = inspect_model(
             directory.path(),
@@ -7489,7 +7486,7 @@ mod tests {
     }
 
     #[test]
-    fn qwen3_moe_separately_packed_safetensors_are_residency_sensitive() {
+    fn qwen3_moe_separately_packed_safetensors_are_exact_for_all_residencies() {
         let directory = write_complete_qwen3_moe_safetensors_dir(false, |specs| {
             specs.retain(|(name, _)| !name.ends_with("experts.gate_up_proj"));
             specs.extend([
@@ -7501,12 +7498,9 @@ mod tests {
             ]);
         });
         let resident = inspect_model(directory.path(), ModelInspectionOptions::default()).unwrap();
-        assert_eq!(resident.structural_binding, InspectionReadiness::Invalid);
-        assert!(resident
-            .issues
-            .iter()
-            .any(|issue| issue.code == InspectionIssueCode::ConflictingTensorLayout));
-        assert!(!resident.is_loadable());
+        assert_eq!(resident.structural_binding, InspectionReadiness::Ready);
+        assert_eq!(resident.model_loadability, InspectionReadiness::Ready);
+        assert!(resident.is_loadable());
 
         let bounded = inspect_model(
             directory.path(),
@@ -7807,7 +7801,7 @@ mod tests {
     }
 
     #[test]
-    fn safetensors_config_rejections_are_structured_and_legacy_check_remains_compatible() {
+    fn safetensors_config_rejections_are_structured() {
         let unsupported = write_safetensors_dir(&json!({"model_type": "falcon"}));
         let report = inspect_model(unsupported.path(), ModelInspectionOptions::default()).unwrap();
         assert_eq!(report.model_loadability, InspectionReadiness::Unsupported);
@@ -7815,7 +7809,6 @@ mod tests {
             .issues
             .iter()
             .any(|issue| issue.code == InspectionIssueCode::UnsupportedArchitecture));
-        assert!(!check_model_dir(unsupported.path()).is_supported());
 
         let invalid = write_safetensors_dir(&json!({"model_type": "llama", "hidden_size": "bad"}));
         let report = inspect_model(invalid.path(), ModelInspectionOptions::default()).unwrap();
@@ -7824,12 +7817,11 @@ mod tests {
             .issues
             .iter()
             .any(|issue| issue.code == InspectionIssueCode::InvalidConfiguration));
-        assert!(
-            !check_model_config(&json!({"model_type":"llama","hidden_size":"bad"})).is_supported()
-        );
-        assert!(check_model_config(&json!({}))
-            .unsupported_reason()
-            .is_some_and(|reason| reason.starts_with("invalid model config metadata:")));
+        assert!(!resolve_model_config(&json!({"model_type":"llama","hidden_size":"bad"})).is_ok());
+        assert!(resolve_model_config(&json!({}))
+            .unwrap_err()
+            .to_string()
+            .starts_with("invalid model config metadata:"));
     }
 
     #[test]

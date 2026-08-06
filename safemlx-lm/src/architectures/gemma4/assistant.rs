@@ -792,16 +792,17 @@ fn gemma4_assistant_config_from_gguf(
             }
         })
         .collect::<Vec<_>>();
-    let layer_schedule = gemma4::layer_schedule_from_parts(
-        &attention_schedule,
-        &feed_forward_lengths,
-        &kv_heads,
-        &head_dims,
-        num_kv_shared_layers,
-        &vec![gemma4::ValuePolicy::Projected; num_hidden_layers as usize],
-        false,
-        "Gemma 4 assistant GGUF",
-    )?;
+    let value_policies = vec![gemma4::ValuePolicy::Projected; num_hidden_layers as usize];
+    let layer_schedule = gemma4::layer_schedule_from_parts(gemma4::LayerScheduleParts {
+        attention: &attention_schedule,
+        feed_forward_lengths: &feed_forward_lengths,
+        kv_heads: &kv_heads,
+        head_dims: &head_dims,
+        shared_layers: num_kv_shared_layers,
+        value_policies: &value_policies,
+        enable_moe: false,
+        source: "Gemma 4 assistant GGUF",
+    })?;
     let hidden_size_per_layer_input =
         gemma4::gguf_optional_i64(metadata, &key("embedding_length_per_layer_input"))?
             .map(i32::try_from)

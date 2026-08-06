@@ -33,7 +33,7 @@ use crate::nn as common;
 use crate::{
     api::{
         input as runtime_input,
-        qwen3_5_moe::{QwenLinear as Linear, QwenWeightFormat as WeightFormat},
+        qwen3_5::{QwenLinear as Linear, QwenWeightFormat as WeightFormat},
     },
     nn::{
         generation::CausalLm,
@@ -2108,6 +2108,30 @@ pub struct Moe {
 
 impl Moe {
     fn new(args: &ModelArgs, layer: i32, stream: &Stream) -> Result<Self, Exception> {
+        Self::new_with_widths(
+            args,
+            layer,
+            args.moe_intermediate_size,
+            args.moe_intermediate_size * args.n_shared_experts,
+            false,
+            stream,
+        )
+    }
+
+    fn new_with_widths(
+        args: &ModelArgs,
+        layer: i32,
+        routed_intermediate: i32,
+        shared_intermediate: i32,
+        initialize_experts: bool,
+        stream: &Stream,
+    ) -> Result<Self, Exception> {
+        let mut expert_args = args.clone();
+        expert_args.moe_intermediate_size = routed_intermediate;
+        let mut experts = RoutedExperts::new(&expert_args, layer)?;
+        if initialize_experts {
+            experts.initialize_unloaded_banks(&expert_args, stream)?;
+        }
         Ok(Self {
             gate: TopKRouter::new(
                 TopKRouterConfig {
@@ -2124,11 +2148,11 @@ impl Moe {
                 },
                 stream,
             )?,
-            experts: RoutedExperts::new(args, layer)?,
+            experts,
             shared_experts: Mlp::new(
                 args,
                 &format!("model.layers.{layer}.mlp.shared_experts"),
-                args.moe_intermediate_size * args.n_shared_experts,
+                shared_intermediate,
                 stream,
             )?,
         })
@@ -2476,6 +2500,56 @@ impl DecoderLayer {
         Ok(block)
     }
 
+    pub(crate) fn new_parallel_layerwise(
+        args: &ModelArgs,
+        layer: i32,
+        attention_heads: i32,
+        dense_intermediate: i32,
+        routed_intermediate: i32,
+        shared_intermediate: i32,
+        stream: &Stream,
+    ) -> Result<Self, Exception> {
+        let mut attention_args = args.clone();
+        attention_args.num_attention_heads = attention_heads;
+        let index = usize::try_from(layer)
+            .map_err(|_| Exception::custom("DeepSeek parallel layer index is negative"))?;
+        let policy = args.layer_policy(index).ok_or_else(|| {
+            Exception::custom("DeepSeek parallel layer is outside the decoder schedule")
+        })?;
+        let mlp = match policy {
+            LayerPolicy::DenseMlp => FeedForward::Dense(Box::new(Mlp::new(
+                args,
+                &format!("model.layers.{layer}.mlp"),
+                dense_intermediate,
+                stream,
+            )?)),
+            LayerPolicy::SparseMoe => FeedForward::Moe(Box::new(Moe::new_with_widths(
+                args,
+                layer,
+                routed_intermediate,
+                shared_intermediate,
+                true,
+                stream,
+            )?)),
+        };
+        Ok(Self {
+            self_attn: MultiHeadLatentAttention::new(&attention_args, layer, stream)?,
+            mlp,
+            input_layernorm: nn::RmsNorm::unloaded(
+                args.hidden_size,
+                args.rms_norm_eps,
+                Dtype::Float32,
+                stream,
+            )?,
+            post_attention_layernorm: nn::RmsNorm::unloaded(
+                args.hidden_size,
+                args.rms_norm_eps,
+                Dtype::Float32,
+                stream,
+            )?,
+        })
+    }
+
     fn forward_impl(
         &mut self,
         x: &Array,
@@ -2569,6 +2643,19 @@ impl DecoderLayer {
     ) -> Result<Array, Exception> {
         let mut observer = None;
         self.forward_impl(x, mask, cache, stream, "", &mut observer)
+    }
+
+    pub(crate) fn forward_stage_with_observer(
+        &mut self,
+        x: &Array,
+        mask: Option<&Array>,
+        cache: Option<&mut CompressedLatentCache>,
+        stream: &Stream,
+        prefix: &str,
+        observer: &mut dyn ActivationObserver,
+    ) -> Result<Array, Exception> {
+        let mut observer = Some(observer);
+        self.forward_impl(x, mask, cache, stream, prefix, &mut observer)
     }
 
     /// Executes a block while delegating routed-expert evaluation to a compact bank.
@@ -3358,7 +3445,7 @@ fn expected_expert_banks(args: &ModelArgs) -> Vec<ExpertBankKey> {
                 });
                 if affine.has_biases() {
                     expected.push(ExpertBankKey {
-                        layer: layer as usize,
+                        layer,
                         projection,
                         component: ExpertComponent::AffineBiases,
                     });
@@ -4472,8 +4559,8 @@ mod tests {
                 .collect::<Vec<_>>()
         );
         assert_eq!(
-            crate::api::check_model_config(&value),
-            crate::api::ModelConfigSupport::Supported(crate::api::SupportedModelConfig {
+            crate::api::resolve_model_config(&value).ok(),
+            Some(crate::api::ResolvedModelConfig {
                 kind: ModelKind::DeepSeekV3,
                 model_type: "deepseek_v3".into(),
                 effective_model_type: "deepseek_v3".into(),
@@ -4542,9 +4629,8 @@ mod tests {
         let mut value = tiny_config_value(Some(4));
         value["moe_layer_freq"] = json!(0);
         let loading = parse_config_value(value.clone()).unwrap_err().to_string();
-        let inspection = crate::api::check_model_config(&value)
-            .unsupported_reason()
-            .unwrap()
+        let inspection = crate::api::resolve_model_config(&value)
+            .unwrap_err()
             .to_string();
         assert_eq!(inspection, loading);
         assert!(loading.contains("moe_layer_freq must be positive"));
@@ -4616,7 +4702,18 @@ mod tests {
         let stream = context.stream();
         let mut plain = Model::new(tiny_args(Some(4)), stream).unwrap();
         initialize_dense_model(&mut plain, stream);
-        let mut observed = crate::api::Model::DeepSeekV3(plain.clone());
+        let directory = temp_dir();
+        save_fixture(&directory, &plain, stream, None, Vec::new());
+        let weights = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        let generalized =
+            crate::architectures::deepseek_v3::layerwise::load_deepseek_v3_layerwise_model(
+                &directory,
+                crate::LayerExecutionLoadOptions::FullyResident,
+                stream,
+                weights.stream(),
+            )
+            .unwrap();
+        let mut observed = crate::api::Model::DeepSeekV3(generalized);
         let input = Array::from_slice(&[1i32, 2, 3], &[1, 3]);
         let mut plain_cache = plain.new_cache();
         let mut observed_cache = observed.new_cache();
@@ -4653,22 +4750,17 @@ mod tests {
         };
         assert_eq!(plain_cache.offset(), observed_cache.offset());
         for expected_name in [
-            "model.embed_tokens",
+            "model.layers.0.input",
             "model.layers.0.input_layernorm",
             "model.layers.0.self_attn.q_a_proj",
-            "model.layers.0.self_attn.attention_mask",
-            "model.layers.0.self_attn.attention_probs",
-            "model.layers.0.residual_delta_attention",
             "model.layers.0.mlp.gate_proj",
-            "model.layers.1.mlp.gate.router_logits",
+            "model.layers.0.output",
+            "model.layers.1.input",
             "model.layers.1.mlp.gate.top_k_experts",
-            "model.layers.1.mlp.experts.gate_proj",
-            "model.layers.1.mlp.shared_experts.down_proj",
-            "model.layers.1.moe_output",
+            "model.layers.1.mlp.routed_expert_output",
+            "model.layers.1.mlp.shared_expert_output",
             "model.layers.1.output",
-            "model.norm",
-            "model.output",
-            "lm_head.logits",
+            "model.logits",
         ] {
             assert!(
                 observer.names.iter().any(|name| name == expected_name),
@@ -4680,6 +4772,7 @@ mod tests {
             observer.interventions,
             ["model.layers.0.output", "model.layers.1.output"]
         );
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
@@ -4923,7 +5016,9 @@ mod tests {
     #[test]
     fn strict_loading_accepts_only_configured_mtp_prefix_and_dispatches_loaded_model() {
         let context = test_context();
+        let weights_context = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
         let stream = context.stream();
+        let weights_stream = weights_context.stream();
         let mut source = Model::new(tiny_args(Some(4)), stream).unwrap();
         initialize_dense_model(&mut source, stream);
         let dir = temp_dir();
@@ -4948,9 +5043,9 @@ mod tests {
         )
         .unwrap();
 
-        let loaded = load_model(&dir, stream, stream).unwrap();
+        let loaded = load_model(&dir, stream, weights_stream).unwrap();
         assert_eq!(loaded.model_type(), "deepseek_v3");
-        let loaded = LoadedModel::load(&dir, stream, stream).unwrap();
+        let loaded = LoadedModel::load(&dir, stream, weights_stream).unwrap();
         assert_eq!(loaded.model_type(), "deepseek_v3");
         assert_eq!(loaded.eos_token_ids(), &[1]);
         assert!(loaded.has_chat_template());

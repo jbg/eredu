@@ -54,9 +54,9 @@ use crate::{
     error::Error,
     runtime::attention::LayerSchedule,
     runtime::cache::residency::{
-        open_prompt_cache, validate_prompt_cache_model_identity, CacheResidencyManager,
-        CacheResidencyPolicy, CacheResidencyReport, LayerCachePolicy, PagedCacheOptions,
-        PromptCacheDescriptor, PromptCacheManifest, PromptCacheModelIdentity, PromptCacheOptions,
+        validate_prompt_cache_model_identity, CacheResidencyPolicy, CacheResidencyReport,
+        LayerCachePolicy, PagedCacheOptions, PromptCacheDescriptor, PromptCacheManifest,
+        PromptCacheModelIdentity, PromptCacheOptions,
     },
     runtime::cache::{ConcatKeyValueCache, PagedKeyValueCache},
     runtime::execution::layerwise::{LayerExecutionLoadOptions, WeightResidency},
@@ -100,8 +100,8 @@ pub(crate) use crate::architectures::moshi::personaplex;
 pub(crate) use crate::architectures::nemotron_h::model as nemotron_h;
 /// Shared Qwen2/Qwen2.5/Qwen3 dense decoder support.
 use crate::architectures::qwen::dense as dense_qwen;
-/// Qwen3.5 MoE text model support.
-pub(crate) use crate::architectures::qwen::hybrid::qwen3_5 as qwen3_5_moe;
+/// Qwen3.5 dense and MoE text model support.
+pub(crate) use crate::architectures::qwen::hybrid::qwen3_5;
 /// Qwen3-Next hybrid attention/MoE text model support.
 pub(crate) use crate::architectures::qwen::hybrid::qwen3_next;
 /// Qwen3-VL multimodal conditional-generation support.
@@ -239,13 +239,12 @@ pub(crate) fn gguf_eos_token_ids(
 }
 
 mod config;
-pub use config::{
-    check_model_config, check_model_config_json, check_model_dir, ModelConfigSupport, ModelKind,
-    ModelLoadOptions, SupportedModelConfig,
-};
 pub(crate) use config::{
     ensure_executable_load_options, validate_load_policy, ArtifactLoadKind, GgufArchitecture,
 };
+#[cfg(test)]
+pub(crate) use config::{resolve_model_config, ResolvedModelConfig};
+pub use config::{ModelKind, ModelLoadOptions};
 
 mod capability;
 pub use capability::{
@@ -275,9 +274,9 @@ pub use request::{
 pub mod realtime;
 
 mod loaded;
+use loaded::load_gguf_model_data;
 pub(crate) use loaded::validate_gguf_quantization_source;
 pub use loaded::LoadedModel;
-use loaded::{final_token_logits, load_gguf_model_data};
 
 mod inspection;
 pub(crate) mod structural;
@@ -342,32 +341,32 @@ fn load_model_for_kind(
         let expert_cache = combined.expert_cache;
         let non_expert = combined.non_expert;
         return match kind {
-            ModelKind::KimiLinear => Ok(Model::KimiLinearLayerwise(
+            ModelKind::KimiLinear => Ok(Model::KimiLinear(
                 crate::architectures::kimi_linear::layerwise::load_kimi_linear_sparse_expert_cache_model_with_dense_layers(
                     model_dir, expert_cache, non_expert, stream, weights_stream,
                 )?,
             )),
-            ModelKind::DeepSeekV3 => Ok(Model::DeepSeekV3Layerwise(
+            ModelKind::DeepSeekV3 => Ok(Model::DeepSeekV3(
                 crate::architectures::deepseek_v3::layerwise::load_deepseek_v3_sparse_expert_cache_model_with_dense_layers(
                     model_dir, expert_cache, non_expert, stream, weights_stream,
                 )?,
             )),
-            ModelKind::GptOss => Ok(Model::GptOssLayerwise(
+            ModelKind::GptOss => Ok(Model::GptOss(
                 crate::architectures::gpt_oss::layerwise::load_gpt_oss_sparse_expert_cache_model_with_dense_layers(
                     model_dir, expert_cache, non_expert, stream, weights_stream,
                 )?,
             )),
-            ModelKind::Inkling => Ok(Model::InklingLayerwise(
+            ModelKind::Inkling => Ok(Model::Inkling(
                 crate::architectures::inkling::layerwise::load_inkling_sparse_expert_cache_model_with_dense_layers(
                     model_dir, expert_cache, non_expert, stream, weights_stream,
                 )?,
             )),
-            ModelKind::Lfm2 => Ok(Model::Lfm2Layerwise(
+            ModelKind::Lfm2 => Ok(Model::Lfm2(
                 crate::architectures::lfm2::layerwise::load_lfm2_sparse_expert_cache_model_with_dense_layers(
                     model_dir, expert_cache, non_expert, stream, weights_stream,
                 )?,
             )),
-            ModelKind::NemotronH => Ok(Model::NemotronHLayerwise(
+            ModelKind::NemotronH => Ok(Model::NemotronH(
                 crate::architectures::nemotron_h::layerwise::load_nemotron_h_sparse_expert_cache_model_with_dense_layers(
                     model_dir, expert_cache, non_expert, stream, weights_stream,
                 )?,
@@ -375,22 +374,22 @@ fn load_model_for_kind(
             ModelKind::Qwen2 => Err(Error::UnsupportedArchitecture(
                 "Qwen2 is dense and does not support sparse expert-cache residency".into(),
             )),
-            ModelKind::Qwen3 => Ok(Model::DenseQwenLayerwise(
+            ModelKind::Qwen3 => Ok(Model::DenseQwen(
                 crate::architectures::qwen::dense::layerwise::load_qwen3_sparse_expert_cache_model_with_dense_layers(
                     model_dir, expert_cache, non_expert, stream, weights_stream,
                 )?,
             )),
-            ModelKind::Qwen3Next => Ok(Model::Qwen3NextLayerwise(
+            ModelKind::Qwen3Next => Ok(Model::Qwen3Next(
                 crate::architectures::qwen::hybrid::layerwise::load_qwen3_next_sparse_expert_cache_model_with_dense_layers(
                     model_dir, expert_cache, non_expert, stream, weights_stream,
                 )?,
             )),
-            ModelKind::Qwen3VlMoe => Ok(Model::Qwen3VlMoeLayerwise(
+            ModelKind::Qwen3VlMoe => Ok(Model::Qwen3VlMoe(
                 crate::architectures::qwen::vl::layerwise::load_qwen3_vl_sparse_expert_cache_model_with_dense_layers(
                     model_dir, expert_cache, non_expert, stream, weights_stream,
                 )?,
             )),
-            ModelKind::Qwen35Moe => Ok(Model::Qwen35MoeLayerwise(
+            ModelKind::Qwen35 => Ok(Model::Qwen35(
                 crate::architectures::qwen::hybrid::layerwise::load_qwen35_sparse_expert_cache_model_with_dense_layers(
                     model_dir, expert_cache, non_expert, stream, weights_stream,
                 )?,
@@ -409,12 +408,12 @@ fn load_model_for_kind(
             )));
         }
         return match kind {
-            ModelKind::KimiLinear => Ok(Model::KimiLinearLayerwise(
+            ModelKind::KimiLinear => Ok(Model::KimiLinear(
                 crate::architectures::kimi_linear::layerwise::load_kimi_linear_sparse_expert_cache_model(
                     model_dir, expert_cache, stream, weights_stream,
                 )?,
             )),
-            ModelKind::DeepSeekV3 => Ok(Model::DeepSeekV3Layerwise(
+            ModelKind::DeepSeekV3 => Ok(Model::DeepSeekV3(
                 crate::architectures::deepseek_v3::layerwise::load_deepseek_v3_sparse_expert_cache_model(
                     model_dir,
                     expert_cache,
@@ -422,7 +421,7 @@ fn load_model_for_kind(
                     weights_stream,
                 )?,
             )),
-            ModelKind::GptOss => Ok(Model::GptOssLayerwise(
+            ModelKind::GptOss => Ok(Model::GptOss(
                 crate::architectures::gpt_oss::layerwise::load_gpt_oss_sparse_expert_cache_model(
                     model_dir,
                     expert_cache,
@@ -430,7 +429,7 @@ fn load_model_for_kind(
                     weights_stream,
                 )?,
             )),
-            ModelKind::Inkling => Ok(Model::InklingLayerwise(
+            ModelKind::Inkling => Ok(Model::Inkling(
                 crate::architectures::inkling::layerwise::load_inkling_sparse_expert_cache_model(
                     model_dir,
                     expert_cache,
@@ -438,7 +437,7 @@ fn load_model_for_kind(
                     weights_stream,
                 )?,
             )),
-            ModelKind::Lfm2 => Ok(Model::Lfm2Layerwise(
+            ModelKind::Lfm2 => Ok(Model::Lfm2(
                 crate::architectures::lfm2::layerwise::load_lfm2_sparse_expert_cache_model(
                     model_dir,
                     expert_cache,
@@ -446,7 +445,7 @@ fn load_model_for_kind(
                     weights_stream,
                 )?,
             )),
-            ModelKind::NemotronH => Ok(Model::NemotronHLayerwise(
+            ModelKind::NemotronH => Ok(Model::NemotronH(
                 crate::architectures::nemotron_h::layerwise::load_nemotron_h_sparse_expert_cache_model(
                     model_dir,
                     expert_cache,
@@ -457,7 +456,7 @@ fn load_model_for_kind(
             ModelKind::Qwen2 => Err(Error::UnsupportedArchitecture(
                 "Qwen2 is dense and does not support sparse expert-cache residency".into(),
             )),
-            ModelKind::Qwen3 => Ok(Model::DenseQwenLayerwise(
+            ModelKind::Qwen3 => Ok(Model::DenseQwen(
                 crate::architectures::qwen::dense::layerwise::load_qwen3_sparse_expert_cache_model(
                     model_dir,
                     expert_cache,
@@ -465,7 +464,7 @@ fn load_model_for_kind(
                     weights_stream,
                 )?,
             )),
-            ModelKind::Qwen3Next => Ok(Model::Qwen3NextLayerwise(
+            ModelKind::Qwen3Next => Ok(Model::Qwen3Next(
                 crate::architectures::qwen::hybrid::layerwise::load_qwen3_next_sparse_expert_cache_model(
                     model_dir,
                     expert_cache,
@@ -473,7 +472,7 @@ fn load_model_for_kind(
                     weights_stream,
                 )?,
             )),
-            ModelKind::Qwen3VlMoe => Ok(Model::Qwen3VlMoeLayerwise(
+            ModelKind::Qwen3VlMoe => Ok(Model::Qwen3VlMoe(
                 crate::architectures::qwen::vl::layerwise::load_qwen3_vl_sparse_expert_cache_model(
                     model_dir,
                     expert_cache,
@@ -481,7 +480,7 @@ fn load_model_for_kind(
                     weights_stream,
                 )?,
             )),
-            ModelKind::Qwen35Moe => Ok(Model::Qwen35MoeLayerwise(
+            ModelKind::Qwen35 => Ok(Model::Qwen35(
                 crate::architectures::qwen::hybrid::layerwise::load_qwen35_sparse_expert_cache_model(
                     model_dir,
                     expert_cache,
@@ -495,290 +494,212 @@ fn load_model_for_kind(
             ))),
         };
     }
-    let layerwise: Option<LayerExecutionLoadOptions> = match options.weight_residency {
-        WeightResidency::LayerwiseHost(options) => Some(options.into()),
-        WeightResidency::DenseDiskStream(options) => Some(options.into()),
-        _ => None,
-    };
-    if let Some(layerwise) = layerwise {
-        if options.quantization.is_some() {
-            return Err(Error::Quantization(format!(
-                "load-time quantization is unsupported for {} layer streaming; use a matching checkpoint-native packed format",
-                kind.model_type_name()
-            )));
+    let execution = match options.weight_residency {
+        WeightResidency::FullyResident => LayerExecutionLoadOptions::FullyResident,
+        WeightResidency::LayerwiseHost(options) => options.into(),
+        WeightResidency::DenseDiskStream(options) => options.into(),
+        WeightResidency::SparseExpertCache(_)
+        | WeightResidency::SparseExpertCacheWithDenseLayers(_) => {
+            unreachable!("sparse residency policies returned above")
         }
-        return match kind {
-            ModelKind::DeepSeekV3 => Ok(Model::DeepSeekV3Layerwise(
-                crate::architectures::deepseek_v3::layerwise::load_deepseek_v3_layerwise_model(
-                    model_dir,
-                    layerwise,
-                    stream,
-                    weights_stream,
-                )?,
-            )),
-            ModelKind::Gemma4 => Ok(Model::Gemma4Layerwise(
-                crate::architectures::gemma4::layerwise::load_gemma4_layerwise_model(
-                    model_dir,
-                    layerwise,
-                    stream,
-                    weights_stream,
-                )?,
-            )),
-            ModelKind::Inkling => Ok(Model::InklingLayerwise(
-                crate::architectures::inkling::layerwise::load_inkling_layerwise_model(
-                    model_dir,
-                    layerwise,
-                    stream,
-                    weights_stream,
-                )?,
-            )),
-            ModelKind::KimiLinear => Ok(Model::KimiLinearLayerwise(
-                crate::architectures::kimi_linear::layerwise::load_kimi_linear_layerwise_model(
-                    model_dir,
-                    layerwise,
-                    stream,
-                    weights_stream,
-                )?,
-            )),
-            ModelKind::Llama => Ok(Model::LlamaLayerwise(
-                crate::architectures::llama::layerwise::load_llama_model(
-                    model_dir,
-                    crate::architectures::llama::layerwise::LlamaLoadOptions {
-                        weight_residency: layerwise.weight_residency(),
-                    },
-                    stream,
-                    weights_stream,
-                )?,
-            )),
-            ModelKind::Qwen2 | ModelKind::Qwen3 => Ok(Model::DenseQwenLayerwise(
-                crate::architectures::qwen::dense::layerwise::load_safetensors(
-                    model_dir,
-                    layerwise,
-                    stream,
-                    weights_stream,
-                )?,
-            )),
-            ModelKind::GptOss => Ok(Model::GptOssLayerwise(
-                crate::architectures::gpt_oss::layerwise::load_gpt_oss_layerwise_model(
-                    model_dir,
-                    layerwise,
-                    stream,
-                    weights_stream,
-                )?,
-            )),
-            ModelKind::Lfm2 => Ok(Model::Lfm2Layerwise(
-                crate::architectures::lfm2::layerwise::load_lfm2_layerwise_model(
-                    model_dir,
-                    layerwise,
-                    stream,
-                    weights_stream,
-                )?,
-            )),
-            ModelKind::NemotronH => Ok(Model::NemotronHLayerwise(
-                crate::architectures::nemotron_h::layerwise::load_nemotron_h_layerwise_model(
-                    model_dir,
-                    layerwise,
-                    stream,
-                    weights_stream,
-                )?,
-            )),
-            ModelKind::Qwen3Next => Ok(Model::Qwen3NextLayerwise(
-                crate::architectures::qwen::hybrid::layerwise::load_qwen3_next_layerwise_model(
-                    model_dir,
-                    layerwise,
-                    stream,
-                    weights_stream,
-                )?,
-            )),
-            ModelKind::Qwen3Vl => Ok(Model::Qwen3VlLayerwise(
-                crate::architectures::qwen::vl::layerwise::load_qwen3_vl_layerwise_model(
-                    model_dir,
-                    layerwise,
-                    stream,
-                    weights_stream,
-                )?,
-            )),
-            ModelKind::Qwen3VlMoe => Ok(Model::Qwen3VlMoeLayerwise(
-                crate::architectures::qwen::vl::layerwise::load_qwen3_vl_layerwise_model(
-                    model_dir,
-                    layerwise,
-                    stream,
-                    weights_stream,
-                )?,
-            )),
-            ModelKind::Qwen35Moe => Ok(Model::Qwen35MoeLayerwise(
-                crate::architectures::qwen::hybrid::layerwise::load_qwen35_layerwise_model(
-                    model_dir,
-                    layerwise,
-                    stream,
-                    weights_stream,
-                )?,
-            )),
-            ModelKind::PersonaPlex => Err(Error::UnsupportedArchitecture(
-                "PersonaPlex bounded layer residency is selected through the realtime loader"
-                    .into(),
-            )),
-        };
-    }
+    };
     if let Some(quantization) = options.quantization {
         quantization.validate()?;
         return match kind {
             ModelKind::DeepSeekV3 => Ok(Model::DeepSeekV3(
-                deepseek_v3::load_model_quantized(
-                    model_dir,
-                    quantization,
+                crate::architectures::deepseek_v3::layerwise::execute_transformed_deepseek_v3_model(
+                    deepseek_v3::load_model_quantized(model_dir, quantization, stream, weights_stream)?,
                     stream,
                     weights_stream,
                 )?,
             )),
-            ModelKind::Gemma4 => Ok(Model::Gemma4(gemma4::load_gemma4_model_quantized(
-                model_dir,
-                quantization,
-                stream,
-                weights_stream,
-            )?)),
-            ModelKind::GptOss => Ok(Model::GptOss(gpt_oss::load_model_quantized(
-                model_dir,
-                quantization,
-                stream,
-                weights_stream,
-            )?)),
-            ModelKind::Inkling => Err(Error::Quantization(
-                "Inkling affine/MXFP4 on-load quantization is unavailable because its routed experts use packed rank-3 grouped-matmul weights without a matching quantized grouped-matmul implementation".into(),
-            )),
-            ModelKind::KimiLinear => Ok(Model::KimiLinear(kimi_linear::load_model_quantized(
-                model_dir,
-                quantization,
-                stream,
-                weights_stream,
-            )?)),
-            ModelKind::Llama => Ok(Model::Llama(llama::load_resident_llama_model_quantized(
-                model_dir,
-                quantization,
-                stream,
-                weights_stream,
-            )?)),
-            ModelKind::Lfm2 => Ok(Model::Lfm2(lfm2::load_model_quantized(
-                model_dir,
-                quantization,
-                stream,
-                weights_stream,
-            )?)),
-            ModelKind::Qwen2 | ModelKind::Qwen3 => Ok(Model::DenseQwen(dense_qwen::load_safetensors_quantized(
-                model_dir,
-                quantization,
-                stream,
-                weights_stream,
-            )?)),
-            ModelKind::Qwen3Next => Ok(Model::Qwen3Next(
-                qwen3_next::load_qwen3_next_model_quantized(
+            ModelKind::Gemma4 => Ok(Model::Gemma4(
+                crate::architectures::gemma4::layerwise::execute_transformed_gemma4_model(
                     model_dir,
+                    gemma4::load_gemma4_model_quantized(model_dir, quantization, stream, weights_stream)?,
+                    stream,
+                    weights_stream,
+                )?,
+            )),
+            ModelKind::GptOss => Ok(Model::GptOss(
+                crate::architectures::gpt_oss::layerwise::execute_transformed_gpt_oss_model(
+                    gpt_oss::load_model_quantized(model_dir, quantization, stream, weights_stream)?,
+                    stream,
+                    weights_stream,
+                )?,
+            )),
+            ModelKind::KimiLinear => Ok(Model::KimiLinear(
+                crate::architectures::kimi_linear::layerwise::execute_transformed_kimi_linear_model(
+                    kimi_linear::load_model_quantized(model_dir, quantization, stream, weights_stream)?,
+                    stream,
+                    weights_stream,
+                )?,
+            )),
+            ModelKind::Llama => Ok(Model::Llama(
+                crate::architectures::llama::layerwise::execute_transformed_llama_model(
+                    llama::load_resident_llama_model_quantized(model_dir, quantization, stream, weights_stream)?,
+                    stream,
+                    weights_stream,
+                )?,
+            )),
+            ModelKind::Lfm2 => Ok(Model::Lfm2(
+                crate::architectures::lfm2::layerwise::execute_transformed_lfm2_model(
+                    lfm2::load_model_quantized(model_dir, quantization, stream, weights_stream)?,
+                    stream,
+                    weights_stream,
+                )?,
+            )),
+            ModelKind::Qwen2 | ModelKind::Qwen3 => Ok(Model::DenseQwen(
+                crate::architectures::qwen::dense::layerwise::execute_transformed_model(
+                    dense_qwen::load_safetensors_quantized(model_dir, quantization, stream, weights_stream)?,
+                    stream,
+                    weights_stream,
+                )?,
+            )),
+            ModelKind::Qwen3Next => Ok(Model::Qwen3Next(
+                crate::architectures::qwen::hybrid::layerwise::execute_transformed_qwen_hybrid_model(
+                    qwen3_next::load_qwen3_next_model_quantized(model_dir, quantization, stream, weights_stream)?,
                     quantization,
                     stream,
                     weights_stream,
                 )?,
             )),
             ModelKind::Qwen3Vl => Ok(Model::Qwen3Vl(
-                qwen3_vl::load_qwen3_vl_model_quantized(
-                    model_dir,
-                    quantization,
+                crate::architectures::qwen::vl::layerwise::execute_transformed_qwen3_vl_model(
+                    qwen3_vl::load_qwen3_vl_model_quantized(model_dir, quantization, stream, weights_stream)?,
                     stream,
                     weights_stream,
                 )?,
             )),
             ModelKind::Qwen3VlMoe => Ok(Model::Qwen3VlMoe(
-                qwen3_vl_moe::load_qwen3_vl_moe_model_quantized(
-                    model_dir,
+                crate::architectures::qwen::vl::layerwise::execute_transformed_qwen3_vl_model(
+                    qwen3_vl_moe::load_qwen3_vl_moe_model_quantized(model_dir, quantization, stream, weights_stream)?,
+                    stream,
+                    weights_stream,
+                )?,
+            )),
+            ModelKind::Qwen35 => Ok(Model::Qwen35(
+                crate::architectures::qwen::hybrid::layerwise::execute_transformed_qwen_hybrid_model(
+                    qwen3_5::load_qwen3_5_model_quantized(model_dir, quantization, stream, weights_stream)?,
                     quantization,
                     stream,
                     weights_stream,
                 )?,
             )),
-            ModelKind::NemotronH => Err(Error::Quantization(
-                "Nemotron-H affine on-load quantization is unavailable because its routed experts use packed rank-3 grouped-matmul weights without an affine grouped-matmul implementation".into(),
-            )),
-            ModelKind::Qwen35Moe => Ok(Model::Qwen35Moe(
-                qwen3_5_moe::load_qwen3_5_moe_model_quantized(
-                    model_dir,
-                    quantization,
-                    stream,
-                    weights_stream,
-                )?,
-            )),
-            ModelKind::PersonaPlex => Err(Error::UnsupportedArchitecture(
-                "PersonaPlex must be loaded through the realtime API".into(),
-            )),
+            ModelKind::Inkling | ModelKind::NemotronH | ModelKind::PersonaPlex => {
+                unreachable!("load policy rejects unsupported load-time transformations")
+            }
         };
     }
-
     match kind {
-        ModelKind::DeepSeekV3 => Ok(Model::DeepSeekV3(deepseek_v3::load_model(
-            model_dir,
-            stream,
-            weights_stream,
-        )?)),
-        ModelKind::Gemma4 => Ok(Model::Gemma4(gemma4::load_gemma4_model(
-            model_dir,
-            stream,
-            weights_stream,
-        )?)),
-        ModelKind::GptOss => Ok(Model::GptOss(gpt_oss::load_model(
-            model_dir,
-            stream,
-            weights_stream,
-        )?)),
-        ModelKind::Inkling => Ok(Model::Inkling(inkling::load_model(
-            model_dir,
-            stream,
-            weights_stream,
-        )?)),
-        ModelKind::KimiLinear => Ok(Model::KimiLinear(kimi_linear::load_model(
-            model_dir,
-            stream,
-            weights_stream,
-        )?)),
-        ModelKind::Llama => Ok(Model::Llama(llama::load_resident_llama_model(
-            model_dir,
-            stream,
-            weights_stream,
-        )?)),
-        ModelKind::Lfm2 => Ok(Model::Lfm2(lfm2::load_model(
-            model_dir,
-            stream,
-            weights_stream,
-        )?)),
-        ModelKind::NemotronH => Ok(Model::NemotronH(nemotron_h::load_nemotron_h_model(
-            model_dir,
-            stream,
-            weights_stream,
-        )?)),
-        ModelKind::Qwen2 | ModelKind::Qwen3 => Ok(Model::DenseQwen(dense_qwen::load_safetensors(
-            model_dir,
-            stream,
-            weights_stream,
-        )?)),
-        ModelKind::Qwen3Next => Ok(Model::Qwen3Next(qwen3_next::load_qwen3_next_model(
-            model_dir,
-            stream,
-            weights_stream,
-        )?)),
-        ModelKind::Qwen3Vl => Ok(Model::Qwen3Vl(qwen3_vl::load_qwen3_vl_model(
-            model_dir,
-            stream,
-            weights_stream,
-        )?)),
-        ModelKind::Qwen3VlMoe => Ok(Model::Qwen3VlMoe(qwen3_vl_moe::load_qwen3_vl_moe_model(
-            model_dir,
-            stream,
-            weights_stream,
-        )?)),
-        ModelKind::Qwen35Moe => Ok(Model::Qwen35Moe(qwen3_5_moe::load_qwen3_5_moe_model(
-            model_dir,
-            stream,
-            weights_stream,
-        )?)),
+        ModelKind::DeepSeekV3 => Ok(Model::DeepSeekV3(
+            crate::architectures::deepseek_v3::layerwise::load_deepseek_v3_layerwise_model(
+                model_dir,
+                execution,
+                stream,
+                weights_stream,
+            )?,
+        )),
+        ModelKind::Gemma4 => Ok(Model::Gemma4(
+            crate::architectures::gemma4::layerwise::load_gemma4_layerwise_model(
+                model_dir,
+                execution,
+                stream,
+                weights_stream,
+            )?,
+        )),
+        ModelKind::Inkling => Ok(Model::Inkling(
+            crate::architectures::inkling::layerwise::load_inkling_layerwise_model(
+                model_dir,
+                execution,
+                stream,
+                weights_stream,
+            )?,
+        )),
+        ModelKind::KimiLinear => Ok(Model::KimiLinear(
+            crate::architectures::kimi_linear::layerwise::load_kimi_linear_layerwise_model(
+                model_dir,
+                execution,
+                stream,
+                weights_stream,
+            )?,
+        )),
+        ModelKind::Llama => Ok(Model::Llama(
+            crate::architectures::llama::layerwise::load_llama_model(
+                model_dir,
+                crate::architectures::llama::layerwise::LlamaLoadOptions {
+                    weight_residency: execution.weight_residency(),
+                },
+                stream,
+                weights_stream,
+            )?,
+        )),
+        ModelKind::Qwen2 | ModelKind::Qwen3 => Ok(Model::DenseQwen(
+            crate::architectures::qwen::dense::layerwise::load_safetensors(
+                model_dir,
+                execution,
+                stream,
+                weights_stream,
+            )?,
+        )),
+        ModelKind::GptOss => Ok(Model::GptOss(
+            crate::architectures::gpt_oss::layerwise::load_gpt_oss_layerwise_model(
+                model_dir,
+                execution,
+                stream,
+                weights_stream,
+            )?,
+        )),
+        ModelKind::Lfm2 => Ok(Model::Lfm2(
+            crate::architectures::lfm2::layerwise::load_lfm2_layerwise_model(
+                model_dir,
+                execution,
+                stream,
+                weights_stream,
+            )?,
+        )),
+        ModelKind::NemotronH => Ok(Model::NemotronH(
+            crate::architectures::nemotron_h::layerwise::load_nemotron_h_layerwise_model(
+                model_dir,
+                execution,
+                stream,
+                weights_stream,
+            )?,
+        )),
+        ModelKind::Qwen3Next => Ok(Model::Qwen3Next(
+            crate::architectures::qwen::hybrid::layerwise::load_qwen3_next_layerwise_model(
+                model_dir,
+                execution,
+                stream,
+                weights_stream,
+            )?,
+        )),
+        ModelKind::Qwen3Vl => Ok(Model::Qwen3Vl(
+            crate::architectures::qwen::vl::layerwise::load_qwen3_vl_layerwise_model(
+                model_dir,
+                execution,
+                stream,
+                weights_stream,
+            )?,
+        )),
+        ModelKind::Qwen3VlMoe => Ok(Model::Qwen3VlMoe(
+            crate::architectures::qwen::vl::layerwise::load_qwen3_vl_layerwise_model(
+                model_dir,
+                execution,
+                stream,
+                weights_stream,
+            )?,
+        )),
+        ModelKind::Qwen35 => Ok(Model::Qwen35(
+            crate::architectures::qwen::hybrid::layerwise::load_qwen35_layerwise_model(
+                model_dir,
+                execution,
+                stream,
+                weights_stream,
+            )?,
+        )),
         ModelKind::PersonaPlex => Err(Error::UnsupportedArchitecture(
-            "PersonaPlex must be loaded through the realtime API".into(),
+            "PersonaPlex bounded layer residency is selected through the realtime loader".into(),
         )),
     }
 }

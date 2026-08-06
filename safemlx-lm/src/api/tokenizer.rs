@@ -48,7 +48,7 @@ pub fn load_tokenizer(model_dir: impl AsRef<Path>) -> Result<Tokenizer, Error> {
         ModelKind::Qwen3Next => qwen3_next::load_qwen3_next_tokenizer(model_dir),
         ModelKind::Qwen3Vl => dense_qwen::load_tokenizer(model_dir),
         ModelKind::Qwen3VlMoe => dense_qwen::load_tokenizer(model_dir),
-        ModelKind::Qwen35Moe => qwen3_5_moe::load_qwen3_5_moe_tokenizer(model_dir),
+        ModelKind::Qwen35 => qwen3_5::load_qwen3_5_tokenizer(model_dir),
     }
 }
 

@@ -203,16 +203,16 @@ where
     })
 }
 
-fn qwen_next_mtp_cache(cache: &mut ModelCache) -> Option<&mut qwen3_5_moe::Cache> {
+fn qwen_next_mtp_cache(cache: &mut ModelCache) -> Option<&mut qwen3_5::Cache> {
     match cache {
         ModelCache::Qwen3Next(cache) => Some(cache),
         _ => None,
     }
 }
 
-fn qwen35_mtp_cache(cache: &mut ModelCache) -> Option<&mut qwen3_5_moe::Cache> {
+fn qwen35_mtp_cache(cache: &mut ModelCache) -> Option<&mut qwen3_5::Cache> {
     match cache {
-        ModelCache::Qwen35Moe(cache) => Some(cache),
+        ModelCache::Qwen35(cache) => Some(cache),
         _ => None,
     }
 }
@@ -221,7 +221,7 @@ fn qwen35_mtp_cache(cache: &mut ModelCache) -> Option<&mut qwen3_5_moe::Cache> {
 fn run_embedded_mtp_batch<'a, B, S>(
     backend: &'a mut B,
     lanes: &'a mut [ModelCache],
-    cache_for_lane: fn(&mut ModelCache) -> Option<&mut qwen3_5_moe::Cache>,
+    cache_for_lane: fn(&mut ModelCache) -> Option<&mut qwen3_5::Cache>,
     prompt_tokens: &Array,
     config: &MtpConfig,
     prng_key: Option<Array>,
@@ -229,7 +229,7 @@ fn run_embedded_mtp_batch<'a, B, S>(
     stream: &'a Stream,
 ) -> Result<MtpBatchOutput, Exception>
 where
-    B: crate::runtime::generation::speculative::MtpBackend<Cache = qwen3_5_moe::Cache>,
+    B: crate::runtime::generation::speculative::MtpBackend<Cache = qwen3_5::Cache>,
     S: SpeculativeSampler + Clone + 'a,
 {
     let streams = MtpExecutionStreams::single(stream);
@@ -281,8 +281,7 @@ impl LoadedModel {
     pub fn validate_drafter_compatibility(&self, drafter: &LoadedDrafter) -> Result<(), Error> {
         let assistant = drafter.gemma4();
         match &self.model {
-            Model::Gemma4(target) => validate_gemma4_drafter(&target.args, assistant)?,
-            Model::Gemma4Layerwise(target) => validate_gemma4_drafter(target.args(), assistant)?,
+            Model::Gemma4(target) => validate_gemma4_drafter(target.args(), assistant)?,
             model => {
                 return Err(Error::UnsupportedArchitecture(format!(
                     "external MTP is unavailable for model type {} ({:?})",
@@ -420,20 +419,6 @@ impl LoadedModel {
         let assistant = drafter.gemma4_mut();
         match &mut self.model {
             Model::Gemma4(target) => {
-                validate_gemma4_drafter(&target.args, assistant)?;
-                let mut backend =
-                    crate::architectures::gemma4::mtp::Gemma4MtpBackend::new(target, assistant);
-                run_prepared_chat_mtp_batch(
-                    &mut backend,
-                    prepared_lanes,
-                    gemma4_mtp_cache,
-                    "Gemma 4",
-                    streams,
-                    scheduler,
-                )
-                .map_err(|error| Error::PreparedChatGeneration(error.to_string()))
-            }
-            Model::Gemma4Layerwise(target) => {
                 validate_gemma4_drafter(target.args(), assistant)?;
                 let mut backend =
                     crate::architectures::gemma4::mtp::Gemma4MtpBackend::new(target, assistant);
@@ -490,31 +475,7 @@ impl LoadedModel {
                 )
                 .map_err(|error| Error::PreparedChatGeneration(error.to_string()))
             }
-            Model::Qwen35Moe(target) => {
-                let mut backend = crate::architectures::qwen::hybrid::mtp::QwenMtpBackend::new(target);
-                run_prepared_chat_mtp_batch(
-                    &mut backend,
-                    prepared_lanes,
-                    qwen35_mtp_cache,
-                    "Qwen3.5 embedded",
-                    streams,
-                    scheduler,
-                )
-                .map_err(|error| Error::PreparedChatGeneration(error.to_string()))
-            }
-            Model::Qwen3NextLayerwise(target) => {
-                let mut backend = crate::architectures::qwen::hybrid::mtp::QwenMtpBackend::new(target);
-                run_prepared_chat_mtp_batch(
-                    &mut backend,
-                    prepared_lanes,
-                    qwen_next_mtp_cache,
-                    "Qwen3-Next embedded",
-                    streams,
-                    scheduler,
-                )
-                .map_err(|error| Error::PreparedChatGeneration(error.to_string()))
-            }
-            Model::Qwen35MoeLayerwise(target) => {
+            Model::Qwen35(target) => {
                 let mut backend = crate::architectures::qwen::hybrid::mtp::QwenMtpBackend::new(target);
                 run_prepared_chat_mtp_batch(
                     &mut backend,
@@ -1154,20 +1115,6 @@ impl LoadedModel {
         let assistant = drafter.gemma4_mut();
         match &mut self.model {
             Model::Gemma4(target) => {
-                validate_gemma4_drafter(&target.args, assistant)?;
-                let mut backend =
-                    crate::architectures::gemma4::mtp::Gemma4MtpBackend::new(target, assistant);
-                run_external_mtp_batch(
-                    &mut backend,
-                    &mut cache.lanes,
-                    prompt_tokens,
-                    &config,
-                    prng_key,
-                    sampler,
-                    streams,
-                )
-            }
-            Model::Gemma4Layerwise(target) => {
                 validate_gemma4_drafter(target.args(), assistant)?;
                 let mut backend =
                     crate::architectures::gemma4::mtp::Gemma4MtpBackend::new(target, assistant);
@@ -1262,35 +1209,7 @@ impl LoadedModel {
                     stream,
                 )
             }
-            Model::Qwen35Moe(target) => {
-                let mut backend =
-                    crate::architectures::qwen::hybrid::mtp::QwenMtpBackend::new(target);
-                run_embedded_mtp_batch(
-                    &mut backend,
-                    &mut cache.lanes,
-                    qwen35_mtp_cache,
-                    prompt_tokens,
-                    &config,
-                    prng_key,
-                    sampler,
-                    stream,
-                )
-            }
-            Model::Qwen3NextLayerwise(target) => {
-                let mut backend =
-                    crate::architectures::qwen::hybrid::mtp::QwenMtpBackend::new(target);
-                run_embedded_mtp_batch(
-                    &mut backend,
-                    &mut cache.lanes,
-                    qwen_next_mtp_cache,
-                    prompt_tokens,
-                    &config,
-                    prng_key,
-                    sampler,
-                    stream,
-                )
-            }
-            Model::Qwen35MoeLayerwise(target) => {
+            Model::Qwen35(target) => {
                 let mut backend =
                     crate::architectures::qwen::hybrid::mtp::QwenMtpBackend::new(target);
                 run_embedded_mtp_batch(
@@ -1823,17 +1742,6 @@ impl LoadedModel {
     }
 }
 
-pub(super) fn final_token_logits(logits: &Array, stream: &Stream) -> Result<Array, Exception> {
-    match logits.ndim() {
-        2 => Ok(logits.clone()),
-        3 => logits.try_index_device((.., -1, ..), stream),
-        ndim => Err(Exception::custom(format!(
-            "expected 2D or 3D logits, got {ndim}D with shape {:?}",
-            logits.shape()
-        ))),
-    }
-}
-
 pub(super) struct LoadedGgufModel {
     pub(super) model: Model,
     #[cfg(feature = "media-processing")]
@@ -1890,18 +1798,165 @@ pub(super) fn load_gguf_model_data(
     #[cfg(feature = "media-processing")]
     let mut processor = None;
 
-    let (model, architecture_eos_token_ids) = match gguf_architecture {
-        GgufArchitecture::KimiLinear => {
-            if matches!(options.weight_residency, WeightResidency::FullyResident) {
+    let (model, architecture_eos_token_ids) = if let Some(quantization) = options.quantization {
+        match gguf_architecture {
+            GgufArchitecture::KimiLinear => {
                 let loaded = kimi_linear::load_gguf_checkpoint(
                     &checkpoint,
-                    metadata,
-                    options.quantization,
+                    metadata.clone(),
+                    Some(quantization),
                     stream,
                     weights_stream,
                 )?;
-                (Model::KimiLinear(loaded.model), loaded.eos_token_ids)
-            } else {
+                let model = crate::architectures::kimi_linear::layerwise::execute_transformed_kimi_linear_model(
+                    loaded.model, stream, weights_stream,
+                )?;
+                (Model::KimiLinear(model), loaded.eos_token_ids)
+            }
+            GgufArchitecture::DeepSeek2 => {
+                let loaded = deepseek_v3::load_gguf_checkpoint(
+                    &checkpoint,
+                    metadata.clone(),
+                    Some(quantization),
+                    stream,
+                    weights_stream,
+                )?;
+                let model = crate::architectures::deepseek_v3::layerwise::execute_transformed_deepseek_v3_model(
+                    loaded.model, stream, weights_stream,
+                )?;
+                (Model::DeepSeekV3(model), loaded.eos_token_ids)
+            }
+            GgufArchitecture::GptOss => {
+                let loaded = gpt_oss::load_gguf_checkpoint(
+                    &checkpoint,
+                    metadata.clone(),
+                    Some(quantization),
+                    stream,
+                    weights_stream,
+                )?;
+                let model =
+                    crate::architectures::gpt_oss::layerwise::execute_transformed_gpt_oss_model(
+                        loaded.model,
+                        stream,
+                        weights_stream,
+                    )?;
+                (Model::GptOss(model), loaded.eos_token_ids)
+            }
+            GgufArchitecture::Gemma4 => {
+                let loaded = gemma4::load_gemma4_gguf_checkpoint(
+                    &checkpoint,
+                    metadata.clone(),
+                    Some(quantization),
+                    stream,
+                    weights_stream,
+                )?;
+                let model =
+                    crate::architectures::gemma4::layerwise::execute_transformed_gemma4_text_model(
+                        loaded.model,
+                        stream,
+                        weights_stream,
+                    )?;
+                (Model::Gemma4(model), loaded.eos_token_ids)
+            }
+            GgufArchitecture::Llama | GgufArchitecture::Mistral => {
+                let loaded = llama::load_llama_gguf_checkpoint(
+                    &checkpoint,
+                    metadata.clone(),
+                    Some(quantization),
+                    stream,
+                    weights_stream,
+                )?;
+                let model =
+                    crate::architectures::llama::layerwise::execute_transformed_llama_model(
+                        loaded.model,
+                        stream,
+                        weights_stream,
+                    )?;
+                (Model::Llama(model), loaded.eos_token_ids)
+            }
+            GgufArchitecture::Lfm2 | GgufArchitecture::Lfm2Moe => {
+                let loaded = lfm2::load_gguf_checkpoint(
+                    &checkpoint,
+                    metadata.clone(),
+                    Some(quantization),
+                    stream,
+                    weights_stream,
+                )?;
+                let model = crate::architectures::lfm2::layerwise::execute_transformed_lfm2_model(
+                    loaded.model,
+                    stream,
+                    weights_stream,
+                )?;
+                (Model::Lfm2(model), loaded.eos_token_ids)
+            }
+            GgufArchitecture::Qwen2 | GgufArchitecture::Qwen3 | GgufArchitecture::Qwen3Moe => {
+                let loaded = dense_qwen::load_gguf_checkpoint(
+                    &checkpoint,
+                    metadata.clone(),
+                    Some(quantization),
+                    stream,
+                    weights_stream,
+                )?;
+                let model =
+                    crate::architectures::qwen::dense::layerwise::execute_transformed_model(
+                        loaded.model,
+                        stream,
+                        weights_stream,
+                    )?;
+                (Model::DenseQwen(model), loaded.eos_token_ids)
+            }
+            GgufArchitecture::Qwen3Vl => {
+                let mmproj_file = qwen3_vl::find_qwen3_vl_mmproj(gguf_file)?;
+                let vision_checkpoint = GgufCheckpoint::open(mmproj_file)?;
+                let vision_metadata =
+                    crate::runtime::checkpoint::load::gguf_metadata(&vision_checkpoint);
+                let loaded = qwen3_vl::load_qwen3_vl_gguf_checkpoint(
+                    &checkpoint,
+                    metadata.clone(),
+                    &vision_checkpoint,
+                    vision_metadata,
+                    Some(quantization),
+                    stream,
+                    weights_stream,
+                )?;
+                let model =
+                    crate::architectures::qwen::vl::layerwise::execute_transformed_qwen3_vl_model(
+                        loaded.model,
+                        stream,
+                        weights_stream,
+                    )?;
+                (Model::Qwen3Vl(model), loaded.eos_token_ids)
+            }
+            GgufArchitecture::Qwen35
+            | GgufArchitecture::Qwen35Moe
+            | GgufArchitecture::Qwen3Next => {
+                let loaded = qwen3_5::load_qwen3_5_gguf_checkpoint(
+                    &checkpoint,
+                    metadata.clone(),
+                    Some(quantization),
+                    stream,
+                    weights_stream,
+                )?;
+                let is_next = gguf_architecture == GgufArchitecture::Qwen3Next;
+                let model = crate::architectures::qwen::hybrid::layerwise::execute_transformed_qwen_hybrid_model(
+                    loaded.model, quantization, stream, weights_stream,
+                )?;
+                let model = if is_next {
+                    Model::Qwen3Next(model)
+                } else {
+                    Model::Qwen35(model)
+                };
+                (model, loaded.eos_token_ids)
+            }
+            GgufArchitecture::Inkling
+            | GgufArchitecture::NemotronH
+            | GgufArchitecture::NemotronHMoe => {
+                unreachable!("load policy rejects unsupported load-time transformations")
+            }
+        }
+    } else {
+        match gguf_architecture {
+            GgufArchitecture::KimiLinear => {
                 let (loaded, eos_token_ids) =
                     crate::architectures::kimi_linear::layerwise::load_kimi_linear_gguf_layerwise_model(
                         &checkpoint,
@@ -1910,20 +1965,9 @@ pub(super) fn load_gguf_model_data(
                         stream,
                         weights_stream,
                     )?;
-                (Model::KimiLinearLayerwise(loaded), eos_token_ids)
+                (Model::KimiLinear(loaded), eos_token_ids)
             }
-        }
-        GgufArchitecture::DeepSeek2 => {
-            if matches!(options.weight_residency, WeightResidency::FullyResident) {
-                let loaded = deepseek_v3::load_gguf_checkpoint(
-                    &checkpoint,
-                    metadata,
-                    options.quantization,
-                    stream,
-                    weights_stream,
-                )?;
-                (Model::DeepSeekV3(loaded.model), loaded.eos_token_ids)
-            } else {
+            GgufArchitecture::DeepSeek2 => {
                 let (loaded, eos_token_ids) =
                     crate::architectures::deepseek_v3::layerwise::load_deepseek_v3_gguf_layerwise_model(
                         &checkpoint,
@@ -1932,20 +1976,9 @@ pub(super) fn load_gguf_model_data(
                         stream,
                         weights_stream,
                     )?;
-                (Model::DeepSeekV3Layerwise(loaded), eos_token_ids)
+                (Model::DeepSeekV3(loaded), eos_token_ids)
             }
-        }
-        GgufArchitecture::GptOss => {
-            if matches!(options.weight_residency, WeightResidency::FullyResident) {
-                let loaded = gpt_oss::load_gguf_checkpoint(
-                    &checkpoint,
-                    metadata,
-                    options.quantization,
-                    stream,
-                    weights_stream,
-                )?;
-                (Model::GptOss(loaded.model), loaded.eos_token_ids)
-            } else {
+            GgufArchitecture::GptOss => {
                 let (loaded, eos_token_ids) =
                     crate::architectures::gpt_oss::layerwise::load_gpt_oss_gguf_layerwise_model(
                         &checkpoint,
@@ -1954,25 +1987,14 @@ pub(super) fn load_gguf_model_data(
                         stream,
                         weights_stream,
                     )?;
-                (Model::GptOssLayerwise(loaded), eos_token_ids)
+                (Model::GptOss(loaded), eos_token_ids)
             }
-        }
-        GgufArchitecture::Inkling => {
-            let mmproj = inkling::open_sibling_mmproj(gguf_file)?;
-            #[cfg(feature = "media-processing")]
-            if mmproj.is_some() {
-                processor = Some(ModelProcessor::load_inkling_gguf(&metadata)?);
-            }
-            if matches!(options.weight_residency, WeightResidency::FullyResident) {
-                let loaded = inkling::load_gguf_checkpoint_with_mmproj(
-                    &checkpoint,
-                    metadata,
-                    mmproj.as_ref(),
-                    stream,
-                    weights_stream,
-                )?;
-                (Model::Inkling(loaded.model), loaded.eos_token_ids)
-            } else {
+            GgufArchitecture::Inkling => {
+                let mmproj = inkling::open_sibling_mmproj(gguf_file)?;
+                #[cfg(feature = "media-processing")]
+                if mmproj.is_some() {
+                    processor = Some(ModelProcessor::load_inkling_gguf(&metadata)?);
+                }
                 let (loaded, eos_token_ids) =
                     crate::architectures::inkling::layerwise::load_inkling_gguf_layerwise_model(
                         &checkpoint,
@@ -1982,20 +2004,9 @@ pub(super) fn load_gguf_model_data(
                         stream,
                         weights_stream,
                     )?;
-                (Model::InklingLayerwise(loaded), eos_token_ids)
+                (Model::Inkling(loaded), eos_token_ids)
             }
-        }
-        GgufArchitecture::Gemma4 => {
-            if matches!(options.weight_residency, WeightResidency::FullyResident) {
-                let loaded = gemma4::load_gemma4_gguf_checkpoint(
-                    &checkpoint,
-                    metadata,
-                    options.quantization,
-                    stream,
-                    weights_stream,
-                )?;
-                (Model::Gemma4(loaded.model), loaded.eos_token_ids)
-            } else {
+            GgufArchitecture::Gemma4 => {
                 let (loaded, eos_token_ids) =
                     crate::architectures::gemma4::layerwise::load_gemma4_gguf_layerwise_model(
                         &checkpoint,
@@ -2004,20 +2015,9 @@ pub(super) fn load_gguf_model_data(
                         stream,
                         weights_stream,
                     )?;
-                (Model::Gemma4Layerwise(loaded), eos_token_ids)
+                (Model::Gemma4(loaded), eos_token_ids)
             }
-        }
-        GgufArchitecture::Llama | GgufArchitecture::Mistral => {
-            if matches!(options.weight_residency, WeightResidency::FullyResident) {
-                let loaded = llama::load_llama_gguf_checkpoint(
-                    &checkpoint,
-                    metadata,
-                    options.quantization,
-                    stream,
-                    weights_stream,
-                )?;
-                (Model::Llama(loaded.model), loaded.eos_token_ids)
-            } else {
+            GgufArchitecture::Llama | GgufArchitecture::Mistral => {
                 let (loaded, eos_token_ids) =
                     crate::architectures::llama::layerwise::load_llama_gguf_model(
                         &checkpoint,
@@ -2026,20 +2026,9 @@ pub(super) fn load_gguf_model_data(
                         stream,
                         weights_stream,
                     )?;
-                (Model::LlamaLayerwise(loaded), eos_token_ids)
+                (Model::Llama(loaded), eos_token_ids)
             }
-        }
-        GgufArchitecture::Lfm2 | GgufArchitecture::Lfm2Moe => {
-            if matches!(options.weight_residency, WeightResidency::FullyResident) {
-                let loaded = lfm2::load_gguf_checkpoint(
-                    &checkpoint,
-                    metadata,
-                    options.quantization,
-                    stream,
-                    weights_stream,
-                )?;
-                (Model::Lfm2(loaded.model), loaded.eos_token_ids)
-            } else {
+            GgufArchitecture::Lfm2 | GgufArchitecture::Lfm2Moe => {
                 let (loaded, eos_token_ids) =
                     crate::architectures::lfm2::layerwise::load_lfm2_gguf_layerwise_model(
                         &checkpoint,
@@ -2048,41 +2037,20 @@ pub(super) fn load_gguf_model_data(
                         stream,
                         weights_stream,
                     )?;
-                (Model::Lfm2Layerwise(loaded), eos_token_ids)
+                (Model::Lfm2(loaded), eos_token_ids)
             }
-        }
-        GgufArchitecture::NemotronH | GgufArchitecture::NemotronHMoe => {
-            if matches!(options.weight_residency, WeightResidency::FullyResident) {
-                let loaded = nemotron_h::load_nemotron_h_gguf_checkpoint(
-                    &checkpoint,
-                    metadata,
-                    stream,
-                    weights_stream,
-                )?;
-                (Model::NemotronH(loaded.model), loaded.eos_token_ids)
-            } else {
+            GgufArchitecture::NemotronH | GgufArchitecture::NemotronHMoe => {
                 let (loaded, eos_token_ids) =
-                    crate::architectures::nemotron_h::layerwise::load_nemotron_h_gguf_layerwise_model(
-                        &checkpoint,
-                        &metadata,
-                        options.weight_residency,
-                        stream,
-                        weights_stream,
-                    )?;
-                (Model::NemotronHLayerwise(loaded), eos_token_ids)
-            }
-        }
-        GgufArchitecture::Qwen2 | GgufArchitecture::Qwen3 | GgufArchitecture::Qwen3Moe => {
-            if matches!(options.weight_residency, WeightResidency::FullyResident) {
-                let loaded = dense_qwen::load_gguf_checkpoint(
+                crate::architectures::nemotron_h::layerwise::load_nemotron_h_gguf_layerwise_model(
                     &checkpoint,
-                    metadata,
-                    options.quantization,
+                    &metadata,
+                    options.weight_residency,
                     stream,
                     weights_stream,
                 )?;
-                (Model::DenseQwen(loaded.model), loaded.eos_token_ids)
-            } else {
+                (Model::NemotronH(loaded), eos_token_ids)
+            }
+            GgufArchitecture::Qwen2 | GgufArchitecture::Qwen3 | GgufArchitecture::Qwen3Moe => {
                 let (loaded, eos_token_ids) =
                     crate::architectures::qwen::dense::layerwise::load_gguf_checkpoint(
                         &checkpoint,
@@ -2092,26 +2060,13 @@ pub(super) fn load_gguf_model_data(
                         stream,
                         weights_stream,
                     )?;
-                (Model::DenseQwenLayerwise(loaded), eos_token_ids)
+                (Model::DenseQwen(loaded), eos_token_ids)
             }
-        }
-        GgufArchitecture::Qwen3Vl => {
-            let mmproj_file = qwen3_vl::find_qwen3_vl_mmproj(gguf_file)?;
-            let vision_checkpoint = GgufCheckpoint::open(mmproj_file)?;
-            let vision_metadata =
-                crate::runtime::checkpoint::load::gguf_metadata(&vision_checkpoint);
-            if matches!(options.weight_residency, WeightResidency::FullyResident) {
-                let loaded = qwen3_vl::load_qwen3_vl_gguf_checkpoint(
-                    &checkpoint,
-                    metadata,
-                    &vision_checkpoint,
-                    vision_metadata,
-                    options.quantization,
-                    stream,
-                    weights_stream,
-                )?;
-                (Model::Qwen3Vl(loaded.model), loaded.eos_token_ids)
-            } else {
+            GgufArchitecture::Qwen3Vl => {
+                let mmproj_file = qwen3_vl::find_qwen3_vl_mmproj(gguf_file)?;
+                let vision_checkpoint = GgufCheckpoint::open(mmproj_file)?;
+                let vision_metadata =
+                    crate::runtime::checkpoint::load::gguf_metadata(&vision_checkpoint);
                 let (loaded, eos_token_ids) =
                     crate::architectures::qwen::vl::layerwise::load_qwen3_vl_gguf_layerwise_model(
                         &checkpoint,
@@ -2122,25 +2077,11 @@ pub(super) fn load_gguf_model_data(
                         stream,
                         weights_stream,
                     )?;
-                (Model::Qwen3VlLayerwise(loaded), eos_token_ids)
+                (Model::Qwen3Vl(loaded), eos_token_ids)
             }
-        }
-        GgufArchitecture::Qwen35 | GgufArchitecture::Qwen35Moe | GgufArchitecture::Qwen3Next => {
-            if matches!(options.weight_residency, WeightResidency::FullyResident) {
-                let loaded = qwen3_5_moe::load_qwen3_5_moe_gguf_checkpoint(
-                    &checkpoint,
-                    metadata,
-                    options.quantization,
-                    stream,
-                    weights_stream,
-                )?;
-                let model = if gguf_architecture == GgufArchitecture::Qwen3Next {
-                    Model::Qwen3Next(loaded.model)
-                } else {
-                    Model::Qwen35Moe(loaded.model)
-                };
-                (model, loaded.eos_token_ids)
-            } else {
+            GgufArchitecture::Qwen35
+            | GgufArchitecture::Qwen35Moe
+            | GgufArchitecture::Qwen3Next => {
                 let (loaded, eos_token_ids, is_next) =
                     crate::architectures::qwen::hybrid::layerwise::load_qwen_hybrid_gguf_layerwise_model(
                         &checkpoint,
@@ -2150,9 +2091,9 @@ pub(super) fn load_gguf_model_data(
                         weights_stream,
                     )?;
                 let model = if is_next {
-                    Model::Qwen3NextLayerwise(loaded)
+                    Model::Qwen3Next(loaded)
                 } else {
-                    Model::Qwen35MoeLayerwise(loaded)
+                    Model::Qwen35(loaded)
                 };
                 (model, eos_token_ids)
             }

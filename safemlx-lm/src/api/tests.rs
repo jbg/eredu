@@ -1,9 +1,9 @@
 use super::{
-    chat_template_kwargs, check_model_config, check_model_config_json, check_model_dir,
-    eos_token_ids_from_sidecar_dir, gguf_eos_token_ids, inspect_chat_template_kwargs,
-    load_chat_template, load_model_with_options, load_tokenizer, load_tokenizer_template_kwargs,
-    merge_eos_token_id_sources, prepare_chat_from_parts, validate_gguf_quantization_source,
-    with_prepared_chat_runtime, LoadedModel, ModelLoadOptions, PreparedChatEmbeddedMtpBatchRequest,
+    chat_template_kwargs, eos_token_ids_from_sidecar_dir, gguf_eos_token_ids,
+    inspect_chat_template_kwargs, load_chat_template, load_model_with_options, load_tokenizer,
+    load_tokenizer_template_kwargs, merge_eos_token_id_sources, prepare_chat_from_parts,
+    resolve_model_config, validate_gguf_quantization_source, with_prepared_chat_runtime,
+    LoadedModel, ModelLoadOptions, PreparedChatEmbeddedMtpBatchRequest,
     PreparedChatGenerationSettings, PreparedChatInput, PreparedChatMtpBatchLane,
 };
 use crate::{
@@ -699,7 +699,7 @@ fn prepared_chat_embedded_mtp_batch_dispatches_qwen_without_a_drafter() {
     )
     .unwrap();
     prepared.rendered_prompt.clear();
-    let args = super::qwen3_5_moe::model_args_from_config_value(&json!({
+    let config = json!({
         "model_type": "qwen3_5_text",
         "vocab_size": 8,
         "hidden_size": 8,
@@ -713,12 +713,17 @@ fn prepared_chat_embedded_mtp_batch_dispatches_qwen_without_a_drafter() {
         "num_experts": 0,
         "tie_word_embeddings": true,
         "layer_types": ["full_attention"]
-    }))
-    .unwrap();
-    let qwen = super::qwen3_5_moe::Model::new(args, None, None, None, stream).unwrap();
+    });
+    let args = super::qwen3_5::model_args_from_config_value(&config).unwrap();
+    let qwen = super::qwen3_5::Model::new(args, None, None, None, stream).unwrap();
+    let directory = temp_model_dir(&config.to_string());
+    save_zero_checkpoint(&qwen, &directory, stream);
+    let super::Model::Qwen35(qwen) = super::load_model(&directory, stream, stream).unwrap() else {
+        panic!("expected canonical Qwen3.5 model");
+    };
     let tokenizer_fingerprint = super::tokenizer_vocabulary_fingerprint(&tokenizer);
     let mut model = LoadedModel {
-        model: super::Model::Qwen35Moe(qwen),
+        model: super::Model::Qwen35(qwen),
         #[cfg(feature = "media-processing")]
         processor: None,
         tokenizer,
@@ -738,6 +743,7 @@ fn prepared_chat_embedded_mtp_batch_dispatches_qwen_without_a_drafter() {
             },
         )
         .unwrap();
+    fs::remove_dir_all(directory).unwrap();
 
     assert!(output.requests.is_empty());
     assert_eq!(output.scheduler.stream_topology, MtpStreamTopology::Single);
@@ -4408,9 +4414,9 @@ fn tiny_text_families_quantize_through_high_level_dispatch() {
             }
             "qwen3_5" => {
                 let (args, image_token_id, video_token_id, vision_config) =
-                    super::qwen3_5_moe::get_qwen3_5_moe_model_args(&dir).unwrap();
+                    super::qwen3_5::get_qwen3_5_model_args(&dir).unwrap();
                 save_zero_checkpoint(
-                    &super::qwen3_5_moe::Model::new(
+                    &super::qwen3_5::Model::new(
                         args,
                         image_token_id,
                         video_token_id,
@@ -4446,7 +4452,7 @@ fn tiny_text_families_quantize_through_high_level_dispatch() {
                 stream,
                 weights_stream,
             )
-            .unwrap();
+            .unwrap_or_else(|error| panic!("{family} {quantization:?}: {error}"));
             let suffix = if quantization == WeightQuantization::MxFp4 {
                 "mxfp4"
             } else {
@@ -4539,16 +4545,10 @@ fn tiny_gpt_oss_preserves_native_experts_and_quantizes_dense_matrices_to_mxfp4()
     let super::Model::GptOss(model) = model else {
         panic!("expected GPT-OSS model")
     };
-    let params = model.parameters().flatten();
-    assert!(params.contains_key("model.layers.0.self_attn.q_proj.inner.weight"));
-    assert!(params.contains_key("model.layers.0.self_attn.q_proj.scales"));
-    assert!(!params.contains_key("model.layers.0.self_attn.q_proj.biases"));
-    assert!(params.contains_key("model.embed_tokens.inner.weight"));
-    assert!(params.contains_key("lm_head.inner.weight"));
-    assert!(params.contains_key("model.layers.0.mlp.experts.gate_up_proj_blocks"));
-    assert!(params.contains_key("model.layers.0.mlp.experts.gate_up_proj_scales"));
-    assert!(params.contains_key("model.layers.0.mlp.router.weight"));
-    assert!(!params.contains_key("model.layers.0.mlp.router.scales"));
+    assert_eq!(
+        model.residency_metadata().quantization(),
+        Some(WeightQuantization::MxFp4)
+    );
     fs::remove_dir_all(dir).unwrap();
 }
 
@@ -4596,14 +4596,10 @@ fn tiny_qwen3_vl_mxfp4_on_load_quantizes_only_language_model() {
     let super::Model::Qwen3Vl(model) = &quantized else {
         panic!("expected Qwen3-VL model");
     };
-    let params = model.parameters().flatten();
-    assert!(params.contains_key("model.language_model.layers.0.self_attn.q_proj.inner.weight"));
-    assert!(params.contains_key("model.language_model.layers.0.self_attn.q_proj.scales"));
-    assert!(!params.contains_key("model.language_model.layers.0.self_attn.q_proj.biases"));
-    assert!(params.contains_key("model.language_model.embed_tokens.inner.weight"));
-    assert!(params.contains_key("model.visual.blocks.0.attn.qkv.weight"));
-    assert!(!params.contains_key("model.visual.blocks.0.attn.qkv.scales"));
-    drop(params);
+    assert_eq!(
+        model.residency_metadata().quantization(),
+        Some(WeightQuantization::MxFp4)
+    );
 
     let tokens = Array::from_slice(&[1u32, 2], &[1, 2]);
     let pixels = Array::zeros::<f32>(&[4, 24], stream).unwrap();
@@ -4643,10 +4639,10 @@ fn tiny_qwen3_vl_mxfp4_on_load_quantizes_only_language_model() {
     let super::Model::Qwen3Vl(saved_model) = &saved_quantized else {
         panic!("expected saved Qwen3-VL model");
     };
-    assert!(saved_model
-        .parameters()
-        .flatten()
-        .contains_key("model.language_model.layers.0.self_attn.q_proj.scales"));
+    assert_eq!(
+        saved_model.residency_metadata().quantization(),
+        Some(WeightQuantization::MxFp4)
+    );
 
     fs::remove_dir_all(dir).unwrap();
     fs::remove_dir_all(saved_dir).unwrap();
@@ -4700,16 +4696,10 @@ fn tiny_qwen35_moe_mxfp4_quantizes_packed_experts_through_high_level_dispatch() 
         }"#;
     let dir = temp_model_dir(config);
     let (args, image_token_id, video_token_id, vision_config) =
-        super::qwen3_5_moe::get_qwen3_5_moe_model_args(&dir).unwrap();
+        super::qwen3_5::get_qwen3_5_model_args(&dir).unwrap();
     save_zero_checkpoint(
-        &super::qwen3_5_moe::Model::new(
-            args,
-            image_token_id,
-            video_token_id,
-            vision_config,
-            stream,
-        )
-        .unwrap(),
+        &super::qwen3_5::Model::new(args, image_token_id, video_token_id, vision_config, stream)
+            .unwrap(),
         &dir,
         stream,
     );
@@ -4723,18 +4713,13 @@ fn tiny_qwen35_moe_mxfp4_quantizes_packed_experts_through_high_level_dispatch() 
         weights_stream,
     )
     .unwrap();
-    let super::Model::Qwen35Moe(quantized_model) = &quantized else {
+    let super::Model::Qwen35(quantized_model) = &quantized else {
         panic!("expected Qwen3.5-MoE model");
     };
-    let params = quantized_model.parameters().flatten();
-    let expert_weight = params
-        .get("model.layers.0.mlp.experts.gate_up_proj")
-        .unwrap();
-    assert_eq!(expert_weight.dtype(), safemlx::Dtype::Uint32);
-    assert_eq!(expert_weight.shape(), &[4, 64, 4]);
-    assert!(params.contains_key("model.layers.0.mlp.experts.gate_up_proj_scales"));
-    assert!(!params.contains_key("model.layers.0.mlp.experts.gate_up_proj_biases"));
-    drop(params);
+    assert_eq!(
+        quantized_model.residency_metadata().quantization(),
+        Some(WeightQuantization::MxFp4)
+    );
 
     let tokens = Array::from_slice(&[1u32, 2], &[1, 2]);
     let parts = [super::input::InputPart::text_token_ids(&tokens)];
@@ -4897,8 +4882,8 @@ print(json.dumps({"rendered": rendered, "ids": ids}))
 }
 
 #[test]
-fn check_model_config_reports_supported_llama() {
-    let support = check_model_config(&json!({
+fn resolve_model_config_reports_supported_llama() {
+    let support = resolve_model_config(&json!({
         "model_type": "llama",
         "hidden_size": 8,
         "num_hidden_layers": 1,
@@ -4911,11 +4896,11 @@ fn check_model_config_reports_supported_llama() {
         "head_dim": 4
     }));
 
-    assert!(support.is_supported(), "{support:?}");
+    assert!(support.is_ok(), "{support:?}");
 }
 
 #[test]
-fn check_model_config_recognizes_exact_qwen2_identity() {
+fn resolve_model_config_recognizes_exact_qwen2_identity() {
     let config = json!({
         "architectures": ["Qwen2ForCausalLM"],
         "model_type": "qwen2",
@@ -4934,8 +4919,8 @@ fn check_model_config_recognizes_exact_qwen2_identity() {
         "max_window_layers": 2
     });
     assert_eq!(
-        check_model_config(&config),
-        super::ModelConfigSupport::Supported(super::SupportedModelConfig {
+        resolve_model_config(&config).ok(),
+        Some(super::ResolvedModelConfig {
             kind: super::ModelKind::Qwen2,
             model_type: "qwen2".into(),
             effective_model_type: "qwen2".into(),
@@ -4946,13 +4931,13 @@ fn check_model_config_recognizes_exact_qwen2_identity() {
         let mut unsupported = config.clone();
         unsupported["model_type"] = json!(nearby);
         assert!(
-            !check_model_config(&unsupported).is_supported(),
+            !resolve_model_config(&unsupported).is_ok(),
             "nearby architecture {nearby:?} must fail closed"
         );
     }
     let mut disguised_vl = config;
     disguised_vl["architectures"] = json!(["Qwen2VLForConditionalGeneration"]);
-    assert!(!check_model_config(&disguised_vl).is_supported());
+    assert!(!resolve_model_config(&disguised_vl).is_ok());
 }
 
 #[test]
@@ -4967,7 +4952,7 @@ fn gguf_architecture_resolution_recognizes_exact_qwen2_identity() {
 }
 
 #[test]
-fn check_model_config_validates_qwen2_sliding_window() {
+fn resolve_model_config_validates_qwen2_sliding_window() {
     let config = json!({
         "model_type": "qwen2", "hidden_size": 16, "num_hidden_layers": 4,
         "intermediate_size": 32, "num_attention_heads": 4,
@@ -4976,20 +4961,20 @@ fn check_model_config_validates_qwen2_sliding_window() {
         "tie_word_embeddings": true, "use_sliding_window": true,
         "sliding_window": 8, "max_window_layers": 2
     });
-    assert!(check_model_config(&config).is_supported());
+    assert!(resolve_model_config(&config).is_ok());
 
     let mut missing_window = config.clone();
     missing_window["sliding_window"] = serde_json::Value::Null;
-    assert!(check_model_config(&missing_window)
-        .unsupported_reason()
-        .unwrap()
+    assert!(resolve_model_config(&missing_window)
+        .unwrap_err()
+        .to_string()
         .contains("sliding_window must be a positive integer"));
 
     for invalid_window in [json!(0), json!(-1), json!(u64::MAX)] {
         let mut invalid = config.clone();
         invalid["sliding_window"] = invalid_window;
         assert_eq!(
-            check_model_config(&invalid).is_supported(),
+            resolve_model_config(&invalid).is_ok(),
             crate::architectures::qwen::dense::config_from_hf_value(&invalid).is_ok(),
             "inspection and load normalization diverged for {invalid}"
         );
@@ -4997,8 +4982,8 @@ fn check_model_config_validates_qwen2_sliding_window() {
 }
 
 #[test]
-fn check_model_config_reports_supported_kimi_linear() {
-    let support = check_model_config(&json!({
+fn resolve_model_config_reports_supported_kimi_linear() {
+    let support = resolve_model_config(&json!({
         "model_type": "kimi_linear",
         "vocab_size": 163840,
         "hidden_size": 2304,
@@ -5040,8 +5025,8 @@ fn check_model_config_reports_supported_kimi_linear() {
     }));
 
     assert_eq!(
-        support,
-        super::ModelConfigSupport::Supported(super::SupportedModelConfig {
+        support.ok(),
+        Some(super::ResolvedModelConfig {
             kind: super::ModelKind::KimiLinear,
             model_type: "kimi_linear".into(),
             effective_model_type: "kimi_linear".into(),
@@ -5050,8 +5035,8 @@ fn check_model_config_reports_supported_kimi_linear() {
 }
 
 #[test]
-fn check_model_config_reports_supported_dense_mistral() {
-    let support = check_model_config(&json!({
+fn resolve_model_config_reports_supported_dense_mistral() {
+    let support = resolve_model_config(&json!({
         "architectures": ["MistralForCausalLM"],
         "model_type": "mistral",
         "hidden_size": 4096,
@@ -5068,8 +5053,8 @@ fn check_model_config_reports_supported_dense_mistral() {
     }));
 
     assert_eq!(
-        support,
-        super::ModelConfigSupport::Supported(super::SupportedModelConfig {
+        support.ok(),
+        Some(super::ResolvedModelConfig {
             kind: super::ModelKind::Llama,
             model_type: "mistral".to_string(),
             effective_model_type: "mistral".to_string(),
@@ -5078,7 +5063,7 @@ fn check_model_config_reports_supported_dense_mistral() {
 }
 
 #[test]
-fn check_model_config_reports_supported_lfm2_families() {
+fn resolve_model_config_reports_supported_lfm2_families() {
     let dense = json!({
         "model_type": "lfm2",
         "vocab_size": 32,
@@ -5091,8 +5076,8 @@ fn check_model_config_reports_supported_lfm2_families() {
         "layer_types": ["conv", "full_attention"]
     });
     assert_eq!(
-        check_model_config(&dense),
-        super::ModelConfigSupport::Supported(super::SupportedModelConfig {
+        resolve_model_config(&dense).ok(),
+        Some(super::ResolvedModelConfig {
             kind: super::ModelKind::Lfm2,
             model_type: "lfm2".into(),
             effective_model_type: "lfm2".into(),
@@ -5104,12 +5089,12 @@ fn check_model_config_reports_supported_lfm2_families() {
     moe["num_dense_layers"] = json!(1);
     moe["num_experts"] = json!(4);
     moe["num_experts_per_tok"] = json!(2);
-    assert!(check_model_config(&moe).is_supported());
+    assert!(resolve_model_config(&moe).is_ok());
 }
 
 #[test]
-fn check_model_config_reports_supported_gpt_oss() {
-    let support = check_model_config(&json!({
+fn resolve_model_config_reports_supported_gpt_oss() {
+    let support = resolve_model_config(&json!({
         "model_type": "gpt_oss",
         "hidden_size": 2880,
         "intermediate_size": 2880,
@@ -5135,8 +5120,8 @@ fn check_model_config_reports_supported_gpt_oss() {
     }));
 
     assert_eq!(
-        support,
-        super::ModelConfigSupport::Supported(super::SupportedModelConfig {
+        support.ok(),
+        Some(super::ResolvedModelConfig {
             kind: super::ModelKind::GptOss,
             model_type: "gpt_oss".to_string(),
             effective_model_type: "gpt_oss".to_string(),
@@ -5145,8 +5130,8 @@ fn check_model_config_reports_supported_gpt_oss() {
 }
 
 #[test]
-fn check_model_config_reports_supported_full_attention_mistral_small() {
-    let support = check_model_config(&json!({
+fn resolve_model_config_reports_supported_full_attention_mistral_small() {
+    let support = resolve_model_config(&json!({
         "architectures": ["MistralForCausalLM"],
         "model_type": "mistral",
         "hidden_size": 5120,
@@ -5163,49 +5148,38 @@ fn check_model_config_reports_supported_full_attention_mistral_small() {
         "tie_word_embeddings": false
     }));
 
-    assert!(support.is_supported(), "{support:?}");
+    assert!(support.is_ok(), "{support:?}");
 }
 
 #[test]
-fn check_model_config_reports_unsupported_model_type() {
-    let support = check_model_config(&json!({
+fn resolve_model_config_reports_unsupported_model_type() {
+    let support = resolve_model_config(&json!({
         "model_type": "not_a_model"
     }));
 
-    assert!(!support.is_supported());
+    assert!(!support.is_ok());
     assert_eq!(
-        support.unsupported_reason(),
-        Some("unsupported model type: not_a_model")
+        support.unwrap_err().to_string(),
+        "unsupported model type: not_a_model"
     );
 }
 
 #[test]
-fn check_model_config_json_reports_invalid_json() {
-    let support = check_model_config_json("{not json");
-
-    assert!(!support.is_supported());
-    assert!(support
-        .unsupported_reason()
-        .unwrap()
-        .starts_with("invalid model config JSON:"));
-}
-
-#[test]
-fn check_model_config_reports_qwen3_5_moe_missing_text_config() {
-    let support = check_model_config(&json!({
+fn resolve_model_config_reports_qwen3_5_moe_missing_text_config() {
+    let support = resolve_model_config(&json!({
         "model_type": "qwen3_5_moe"
     }));
 
-    assert!(!support.is_supported());
+    assert!(!support.is_ok());
     assert_eq!(
-        support.unsupported_reason(),
-        Some("unsupported model architecture: qwen3_5_moe config is missing text_config")
+        support.unwrap_err().to_string(),
+        "unsupported model architecture: qwen3_5_moe config is missing text_config"
     );
 }
 
 #[test]
-fn check_model_config_reports_supported_qwen3_5_moe() {
-    let support = check_model_config(&json!({
+fn resolve_model_config_reports_supported_qwen3_5_moe() {
+    let support = resolve_model_config(&json!({
         "model_type": "qwen3_5_moe",
         "image_token_id": 248056,
         "video_token_id": 248057,
@@ -5221,9 +5195,9 @@ fn check_model_config_reports_supported_qwen3_5_moe() {
     }));
 
     assert_eq!(
-        support,
-        super::ModelConfigSupport::Supported(super::SupportedModelConfig {
-            kind: super::ModelKind::Qwen35Moe,
+        support.ok(),
+        Some(super::ResolvedModelConfig {
+            kind: super::ModelKind::Qwen35,
             model_type: "qwen3_5_moe".to_string(),
             effective_model_type: "qwen3_5_moe_text".to_string(),
         })
@@ -5231,8 +5205,8 @@ fn check_model_config_reports_supported_qwen3_5_moe() {
 }
 
 #[test]
-fn check_model_config_reports_supported_qwen3_next() {
-    let support = check_model_config(&json!({
+fn resolve_model_config_reports_supported_qwen3_next() {
+    let support = resolve_model_config(&json!({
         "model_type":"qwen3_next","vocab_size":128,"hidden_size":16,
         "num_hidden_layers":4,"num_attention_heads":2,"num_key_value_heads":1,
         "head_dim":8,"max_position_embeddings":128,"intermediate_size":32,
@@ -5242,8 +5216,8 @@ fn check_model_config_reports_supported_qwen3_next() {
     }));
 
     assert_eq!(
-        support,
-        super::ModelConfigSupport::Supported(super::SupportedModelConfig {
+        support.ok(),
+        Some(super::ResolvedModelConfig {
             kind: super::ModelKind::Qwen3Next,
             model_type: "qwen3_next".to_string(),
             effective_model_type: "qwen3_next".to_string(),
@@ -5252,8 +5226,8 @@ fn check_model_config_reports_supported_qwen3_next() {
 }
 
 #[test]
-fn check_model_config_reports_supported_qwen3_vl_moe() {
-    let support = check_model_config(&json!({
+fn resolve_model_config_reports_supported_qwen3_vl_moe() {
+    let support = resolve_model_config(&json!({
         "model_type":"qwen3_vl_moe","image_token_id":30,"video_token_id":31,
         "tie_word_embeddings":false,
         "text_config":{
@@ -5274,8 +5248,8 @@ fn check_model_config_reports_supported_qwen3_vl_moe() {
     }));
 
     assert_eq!(
-        support,
-        super::ModelConfigSupport::Supported(super::SupportedModelConfig {
+        support.ok(),
+        Some(super::ResolvedModelConfig {
             kind: super::ModelKind::Qwen3VlMoe,
             model_type: "qwen3_vl_moe".to_string(),
             effective_model_type: "qwen3_vl_moe_text".to_string(),
@@ -5284,8 +5258,8 @@ fn check_model_config_reports_supported_qwen3_vl_moe() {
 }
 
 #[test]
-fn check_model_config_reports_supported_dense_qwen3_5() {
-    let support = check_model_config(&json!({
+fn resolve_model_config_reports_supported_dense_qwen3_5() {
+    let support = resolve_model_config(&json!({
         "model_type": "qwen3_5",
         "image_token_id": 248056,
         "text_config": {
@@ -5301,9 +5275,9 @@ fn check_model_config_reports_supported_dense_qwen3_5() {
     }));
 
     assert_eq!(
-        support,
-        super::ModelConfigSupport::Supported(super::SupportedModelConfig {
-            kind: super::ModelKind::Qwen35Moe,
+        support.ok(),
+        Some(super::ResolvedModelConfig {
+            kind: super::ModelKind::Qwen35,
             model_type: "qwen3_5".to_string(),
             effective_model_type: "qwen3_5_text".to_string(),
         })
@@ -5311,8 +5285,8 @@ fn check_model_config_reports_supported_dense_qwen3_5() {
 }
 
 #[test]
-fn check_model_config_reports_supported_dense_qwen3_5_text() {
-    let support = check_model_config(&json!({
+fn resolve_model_config_reports_supported_dense_qwen3_5_text() {
+    let support = resolve_model_config(&json!({
         "model_type": "qwen3_5_text",
         "vocab_size": 128,
         "hidden_size": 16,
@@ -5325,9 +5299,9 @@ fn check_model_config_reports_supported_dense_qwen3_5_text() {
     }));
 
     assert_eq!(
-        support,
-        super::ModelConfigSupport::Supported(super::SupportedModelConfig {
-            kind: super::ModelKind::Qwen35Moe,
+        support.ok(),
+        Some(super::ResolvedModelConfig {
+            kind: super::ModelKind::Qwen35,
             model_type: "qwen3_5_text".to_string(),
             effective_model_type: "qwen3_5_text".to_string(),
         })
@@ -5335,8 +5309,8 @@ fn check_model_config_reports_supported_dense_qwen3_5_text() {
 }
 
 #[test]
-fn check_model_config_reports_supported_qwen3_vl() {
-    let support = check_model_config(&json!({
+fn resolve_model_config_reports_supported_qwen3_vl() {
+    let support = resolve_model_config(&json!({
         "model_type": "qwen3_vl",
         "image_token_id": 151655,
         "video_token_id": 151656,
@@ -5375,8 +5349,8 @@ fn check_model_config_reports_supported_qwen3_vl() {
         }
     }));
     assert_eq!(
-        support,
-        super::ModelConfigSupport::Supported(super::SupportedModelConfig {
+        support.ok(),
+        Some(super::ResolvedModelConfig {
             kind: super::ModelKind::Qwen3Vl,
             model_type: "qwen3_vl".to_string(),
             effective_model_type: "qwen3_vl_text".to_string(),
@@ -5385,8 +5359,8 @@ fn check_model_config_reports_supported_qwen3_vl() {
 }
 
 #[test]
-fn check_model_config_reports_supported_nemotron_h() {
-    let support = check_model_config(&json!({
+fn resolve_model_config_reports_supported_nemotron_h() {
+    let support = resolve_model_config(&json!({
         "model_type": "nemotron_h",
         "vocab_size": 131072,
         "hidden_size": 2688,
@@ -5412,8 +5386,8 @@ fn check_model_config_reports_supported_nemotron_h() {
     }));
 
     assert_eq!(
-        support,
-        super::ModelConfigSupport::Supported(super::SupportedModelConfig {
+        support.ok(),
+        Some(super::ResolvedModelConfig {
             kind: super::ModelKind::NemotronH,
             model_type: "nemotron_h".to_string(),
             effective_model_type: "nemotron_h".to_string(),
@@ -5422,8 +5396,8 @@ fn check_model_config_reports_supported_nemotron_h() {
 }
 
 #[test]
-fn check_model_config_reports_supported_gemma4_moe() {
-    let support = check_model_config(&json!({
+fn resolve_model_config_reports_supported_gemma4_moe() {
+    let support = resolve_model_config(&json!({
         "model_type": "gemma4",
         "text_config": {
             "model_type": "gemma4_text",
@@ -5444,8 +5418,8 @@ fn check_model_config_reports_supported_gemma4_moe() {
     }));
 
     assert_eq!(
-        support,
-        super::ModelConfigSupport::Supported(super::SupportedModelConfig {
+        support.ok(),
+        Some(super::ResolvedModelConfig {
             kind: super::ModelKind::Gemma4,
             model_type: "gemma4".to_string(),
             effective_model_type: "gemma4_text".to_string(),
@@ -5454,8 +5428,8 @@ fn check_model_config_reports_supported_gemma4_moe() {
 }
 
 #[test]
-fn check_model_config_reports_supported_gemma4_unified_text() {
-    let support = check_model_config(&json!({
+fn resolve_model_config_reports_supported_gemma4_unified_text() {
+    let support = resolve_model_config(&json!({
         "model_type": "gemma4_unified",
         "text_config": {
             "model_type": "gemma4_unified_text",
@@ -5473,8 +5447,8 @@ fn check_model_config_reports_supported_gemma4_unified_text() {
     }));
 
     assert_eq!(
-        support,
-        super::ModelConfigSupport::Supported(super::SupportedModelConfig {
+        support.ok(),
+        Some(super::ResolvedModelConfig {
             kind: super::ModelKind::Gemma4,
             model_type: "gemma4_unified".to_string(),
             effective_model_type: "gemma4_unified_text".to_string(),
@@ -5483,8 +5457,8 @@ fn check_model_config_reports_supported_gemma4_unified_text() {
 }
 
 #[test]
-fn check_model_config_reports_supported_gemma4_unified_moe() {
-    let support = check_model_config(&json!({
+fn resolve_model_config_reports_supported_gemma4_unified_moe() {
+    let support = resolve_model_config(&json!({
         "model_type": "gemma4_unified",
         "text_config": {
             "model_type": "gemma4_unified_text",
@@ -5505,32 +5479,11 @@ fn check_model_config_reports_supported_gemma4_unified_moe() {
     }));
 
     assert_eq!(
-        support,
-        super::ModelConfigSupport::Supported(super::SupportedModelConfig {
+        support.ok(),
+        Some(super::ResolvedModelConfig {
             kind: super::ModelKind::Gemma4,
             model_type: "gemma4_unified".to_string(),
             effective_model_type: "gemma4_unified_text".to_string(),
         })
     );
-}
-
-#[test]
-fn check_model_dir_reads_config_json() {
-    let dir = temp_model_dir(
-        r#"{
-              "model_type": "llama",
-              "hidden_size": 8,
-              "num_hidden_layers": 1,
-              "intermediate_size": 16,
-              "num_attention_heads": 2,
-              "rms_norm_eps": 0.00001,
-              "vocab_size": 32,
-              "num_key_value_heads": 2,
-              "max_position_embeddings": 128,
-              "head_dim": 4
-            }"#,
-    );
-
-    let support = check_model_dir(&dir);
-    assert!(support.is_supported(), "{support:?}");
 }

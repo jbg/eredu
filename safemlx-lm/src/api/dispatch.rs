@@ -5,57 +5,31 @@ use super::*;
 /// Loaded model value for any architecture supported by this crate.
 pub enum Model {
     /// DeepSeek-V3/R1 model.
-    DeepSeekV3(deepseek_v3::Model),
-    /// DeepSeek-V3/R1 model using bounded layer execution.
-    DeepSeekV3Layerwise(crate::architectures::deepseek_v3::layerwise::DeepSeekV3LayerwiseModel),
-    /// Gemma 4 text model.
-    Gemma4(gemma4::Model),
-    /// Gemma 4 multimodal model using bounded layer execution.
-    Gemma4Layerwise(crate::architectures::gemma4::layerwise::Gemma4LayerwiseModel),
+    DeepSeekV3(crate::architectures::deepseek_v3::layerwise::DeepSeekV3LayerwiseModel),
+    /// Gemma 4 text and multimodal model.
+    Gemma4(crate::architectures::gemma4::layerwise::Gemma4LayerwiseModel),
     /// OpenAI GPT-OSS model.
-    GptOss(gpt_oss::Model),
-    /// OpenAI GPT-OSS model using bounded layer execution.
-    GptOssLayerwise(crate::architectures::gpt_oss::layerwise::GptOssLayerwiseModel),
-    /// Thinking Machines Lab Inkling model.
-    Inkling(inkling::Model),
+    GptOss(crate::architectures::gpt_oss::layerwise::GptOssLayerwiseModel),
     /// Moonshot Kimi Linear hybrid KDA/MLA sparse decoder.
-    KimiLinear(kimi_linear::Model),
-    /// Kimi Linear model using bounded layer execution.
-    KimiLinearLayerwise(crate::architectures::kimi_linear::layerwise::KimiLinearLayerwiseModel),
-    /// Inkling multimodal model using bounded layer execution.
-    InklingLayerwise(crate::architectures::inkling::layerwise::InklingLayerwiseModel),
+    KimiLinear(crate::architectures::kimi_linear::layerwise::KimiLinearLayerwiseModel),
+    /// Thinking Machines Lab Inkling multimodal model.
+    Inkling(crate::architectures::inkling::layerwise::InklingLayerwiseModel),
     /// Llama-compatible dense model.
-    Llama(llama::ResidentModel),
-    /// Llama-compatible model using the unified bounded layer API.
-    LlamaLayerwise(crate::architectures::llama::layerwise::LlamaModel),
+    Llama(crate::architectures::llama::layerwise::LlamaModel),
     /// Liquid AI LFM2/LFM2.5 model.
-    Lfm2(lfm2::Model),
-    /// Liquid AI LFM2/LFM2.5 model using bounded layer execution.
-    Lfm2Layerwise(crate::architectures::lfm2::layerwise::Lfm2LayerwiseModel),
+    Lfm2(crate::architectures::lfm2::layerwise::Lfm2LayerwiseModel),
     /// Nemotron-H hybrid model.
-    NemotronH(nemotron_h::Model),
-    /// Nemotron-H hybrid model using bounded layer execution.
-    NemotronHLayerwise(crate::architectures::nemotron_h::layerwise::NemotronHLayerwiseModel),
+    NemotronH(crate::architectures::nemotron_h::layerwise::NemotronHLayerwiseModel),
     /// Dense Qwen2/Qwen2.5/Qwen3 model.
-    DenseQwen(dense_qwen::Model),
-    /// Dense Qwen model using bounded layer execution.
-    DenseQwenLayerwise(crate::architectures::qwen::dense::layerwise::LayerwiseDecoder),
+    DenseQwen(crate::architectures::qwen::dense::layerwise::LayerwiseDecoder),
     /// Qwen3-Next model.
-    Qwen3Next(qwen3_next::Model),
-    /// Qwen3-Next model using shared hybrid bounded layer execution.
-    Qwen3NextLayerwise(crate::architectures::qwen::hybrid::layerwise::QwenHybridLayerwiseModel),
+    Qwen3Next(crate::architectures::qwen::hybrid::layerwise::QwenHybridLayerwiseModel),
     /// Qwen3-VL multimodal model.
-    Qwen3Vl(qwen3_vl::Model),
-    /// Qwen3-VL multimodal model using vision/text bounded layer execution.
-    Qwen3VlLayerwise(crate::architectures::qwen::vl::layerwise::Qwen3VlLayerwiseModel),
+    Qwen3Vl(crate::architectures::qwen::vl::layerwise::Qwen3VlLayerwiseModel),
     /// Qwen3-VL-MoE multimodal model.
-    Qwen3VlMoe(qwen3_vl_moe::Model),
-    /// Qwen3-VL-MoE multimodal model using vision/text bounded layer execution.
-    Qwen3VlMoeLayerwise(crate::architectures::qwen::vl::layerwise::Qwen3VlLayerwiseModel),
+    Qwen3VlMoe(crate::architectures::qwen::vl::layerwise::Qwen3VlLayerwiseModel),
     /// Qwen3.5 dense or MoE model, optionally multimodal.
-    Qwen35Moe(qwen3_5_moe::Model),
-    /// Qwen3.5 model using shared vision/hybrid bounded layer execution.
-    Qwen35MoeLayerwise(crate::architectures::qwen::hybrid::layerwise::QwenHybridLayerwiseModel),
+    Qwen35(crate::architectures::qwen::hybrid::layerwise::QwenHybridLayerwiseModel),
 }
 
 impl Model {
@@ -63,60 +37,43 @@ impl Model {
     /// model was loaded through generalized parallel execution groups.
     pub fn parallel_info(&self) -> Option<&crate::ParallelModelInfo> {
         match self {
-            Self::LlamaLayerwise(model) => model.parallel_info(),
-            Self::DeepSeekV3Layerwise(model) => model.parallel_info(),
-            Self::GptOssLayerwise(model) => model.parallel_info(),
-            Self::DenseQwenLayerwise(model) => model.parallel_info(),
-            Self::KimiLinearLayerwise(model) => model.parallel_info(),
-            Self::Lfm2Layerwise(model) => model.parallel_info(),
-            Self::NemotronHLayerwise(model) => model.parallel_info(),
-            Self::Qwen3NextLayerwise(model) | Self::Qwen35MoeLayerwise(model) => {
-                model.parallel_info()
-            }
-            Self::Qwen3VlLayerwise(model) | Self::Qwen3VlMoeLayerwise(model) => {
-                model.parallel_info()
-            }
-            Self::Gemma4Layerwise(model) => model.parallel_info(),
-            Self::InklingLayerwise(model) => model.parallel_info(),
-            _ => None,
+            Self::Llama(model) => model.parallel_info(),
+            Self::DeepSeekV3(model) => model.parallel_info(),
+            Self::GptOss(model) => model.parallel_info(),
+            Self::DenseQwen(model) => model.parallel_info(),
+            Self::KimiLinear(model) => model.parallel_info(),
+            Self::Lfm2(model) => model.parallel_info(),
+            Self::NemotronH(model) => model.parallel_info(),
+            Self::Qwen3Next(model) | Self::Qwen35(model) => model.parallel_info(),
+            Self::Qwen3Vl(model) | Self::Qwen3VlMoe(model) => model.parallel_info(),
+            Self::Gemma4(model) => model.parallel_info(),
+            Self::Inkling(model) => model.parallel_info(),
         }
     }
 
     /// Reports how this model architecture exposes MTP weights.
     pub fn mtp_capability(&self) -> MtpCapability {
         match self {
-            Self::Gemma4(_) | Self::Gemma4Layerwise(_) => MtpCapability::Ready {
+            Self::Gemma4(_) => MtpCapability::Ready {
                 checkpoint: MtpCheckpointKind::Separate,
             },
-            Self::DeepSeekV3(model) if model.args.num_nextn_predict_layers > 0 => {
+            Self::DeepSeekV3(model) if model.args().num_nextn_predict_layers > 0 => {
                 MtpCapability::Unsupported {
                     checkpoint: MtpCheckpointKind::Embedded,
                     architecture: "deepseek_v3".into(),
                 }
             }
-            Self::DeepSeekV3Layerwise(model) if model.args().num_nextn_predict_layers > 0 => {
-                MtpCapability::Unsupported {
-                    checkpoint: MtpCheckpointKind::Embedded,
-                    architecture: "deepseek_v3".into(),
-                }
-            }
-            Self::Inkling(_) | Self::InklingLayerwise(_) => MtpCapability::Unsupported {
+            Self::Inkling(_) => MtpCapability::Unsupported {
                 checkpoint: MtpCheckpointKind::Embedded,
                 architecture: "inkling".into(),
             },
             Self::Qwen3Next(model) if model.mtp_len() > 0 => MtpCapability::Ready {
                 checkpoint: MtpCheckpointKind::Embedded,
             },
-            Self::Qwen3NextLayerwise(model) if model.mtp_len() > 0 => MtpCapability::Ready {
+            Self::Qwen35(model) if model.mtp_len() > 0 => MtpCapability::Ready {
                 checkpoint: MtpCheckpointKind::Embedded,
             },
-            Self::Qwen35Moe(model) if model.mtp_len() > 0 => MtpCapability::Ready {
-                checkpoint: MtpCheckpointKind::Embedded,
-            },
-            Self::Qwen35MoeLayerwise(model) if model.mtp_len() > 0 => MtpCapability::Ready {
-                checkpoint: MtpCheckpointKind::Embedded,
-            },
-            Self::NemotronH(_) | Self::NemotronHLayerwise(_) => MtpCapability::Unsupported {
+            Self::NemotronH(_) => MtpCapability::Unsupported {
                 checkpoint: MtpCheckpointKind::Embedded,
                 architecture: "nemotron_h".into(),
             },
@@ -218,21 +175,6 @@ impl Model {
         let assistant = drafter.gemma4_mut();
         match (self, cache) {
             (Self::Gemma4(target), ModelCache::Gemma4(cache)) => {
-                validate_gemma4_drafter(&target.args, assistant)?;
-                crate::architectures::gemma4::mtp::generate_with_streams_and_callback_and_options(
-                    target,
-                    assistant,
-                    cache,
-                    input,
-                    config,
-                    prng_key,
-                    sampler,
-                    streams,
-                    scheduler_options,
-                    on_token,
-                )
-            }
-            (Self::Gemma4Layerwise(target), ModelCache::Gemma4(cache)) => {
                 validate_gemma4_drafter(target.args(), assistant)?;
                 crate::architectures::gemma4::mtp::generate_with_streams_and_callback_and_options(
                     target,
@@ -277,23 +219,6 @@ impl Model {
         let assistant = drafter.gemma4_mut();
         match (self, cache) {
             (Self::Gemma4(target), ModelCache::Gemma4(cache)) => {
-                validate_gemma4_drafter(&target.args, assistant)?;
-                crate::architectures::gemma4::mtp::generate_with_semantics_and_options(
-                    target,
-                    assistant,
-                    cache,
-                    input,
-                    config,
-                    prng_key,
-                    sampler,
-                    semantic,
-                    cancellation,
-                    streams,
-                    scheduler_options,
-                    on_event,
-                )
-            }
-            (Self::Gemma4Layerwise(target), ModelCache::Gemma4(cache)) => {
                 validate_gemma4_drafter(target.args(), assistant)?;
                 crate::architectures::gemma4::mtp::generate_with_semantics_and_options(
                     target,
@@ -376,13 +301,7 @@ impl Model {
     {
         match (self, cache) {
             (Self::Qwen3Next(target), ModelCache::Qwen3Next(cache))
-            | (Self::Qwen35Moe(target), ModelCache::Qwen35Moe(cache)) => {
-                crate::architectures::qwen::hybrid::mtp::generate_with_callback(
-                    target, cache, input, config, prng_key, sampler, stream, on_token,
-                )
-            }
-            (Self::Qwen3NextLayerwise(target), ModelCache::Qwen3Next(cache))
-            | (Self::Qwen35MoeLayerwise(target), ModelCache::Qwen35Moe(cache)) => {
+            | (Self::Qwen35(target), ModelCache::Qwen35(cache)) => {
                 crate::architectures::qwen::hybrid::mtp::generate_with_callback(
                     target, cache, input, config, prng_key, sampler, stream, on_token,
                 )
@@ -415,23 +334,7 @@ impl Model {
     {
         match (self, cache) {
             (Self::Qwen3Next(target), ModelCache::Qwen3Next(cache))
-            | (Self::Qwen35Moe(target), ModelCache::Qwen35Moe(cache)) => {
-                crate::architectures::qwen::hybrid::mtp::generate_with_semantics_and_options(
-                    target,
-                    cache,
-                    input,
-                    config,
-                    prng_key,
-                    sampler,
-                    semantic,
-                    cancellation,
-                    stream,
-                    scheduler_options,
-                    on_event,
-                )
-            }
-            (Self::Qwen3NextLayerwise(target), ModelCache::Qwen3Next(cache))
-            | (Self::Qwen35MoeLayerwise(target), ModelCache::Qwen35Moe(cache)) => {
+            | (Self::Qwen35(target), ModelCache::Qwen35(cache)) => {
                 crate::architectures::qwen::hybrid::mtp::generate_with_semantics_and_options(
                     target,
                     cache,
@@ -459,22 +362,17 @@ impl Model {
         &self,
     ) -> Result<Option<crate::runtime::residency::manager::ResidencyReport>, Error> {
         match self {
-            Self::DeepSeekV3Layerwise(model) => Ok(Some(model.residency_report()?)),
-            Self::Gemma4Layerwise(model) => Ok(Some(model.residency_report()?)),
-            Self::InklingLayerwise(model) => Ok(Some(model.residency_report()?)),
-            Self::KimiLinearLayerwise(model) => Ok(Some(model.residency_report()?)),
-            Self::LlamaLayerwise(model) => model.residency_report(),
-            Self::GptOssLayerwise(model) => Ok(Some(model.residency_report()?)),
-            Self::Lfm2Layerwise(model) => Ok(Some(model.residency_report()?)),
-            Self::NemotronHLayerwise(model) => Ok(Some(model.residency_report()?)),
-            Self::Qwen3NextLayerwise(model) | Self::Qwen35MoeLayerwise(model) => {
-                Ok(Some(model.residency_report()?))
-            }
-            Self::DenseQwenLayerwise(model) => Ok(Some(model.residency_report()?)),
-            Self::Qwen3VlLayerwise(model) | Self::Qwen3VlMoeLayerwise(model) => {
-                Ok(Some(model.residency_report()?))
-            }
-            _ => Ok(None),
+            Self::DeepSeekV3(model) => Ok(Some(model.residency_report()?)),
+            Self::Gemma4(model) => Ok(Some(model.residency_report()?)),
+            Self::Inkling(model) => Ok(Some(model.residency_report()?)),
+            Self::KimiLinear(model) => Ok(Some(model.residency_report()?)),
+            Self::Llama(model) => model.residency_report(),
+            Self::GptOss(model) => Ok(Some(model.residency_report()?)),
+            Self::Lfm2(model) => Ok(Some(model.residency_report()?)),
+            Self::NemotronH(model) => Ok(Some(model.residency_report()?)),
+            Self::Qwen3Next(model) | Self::Qwen35(model) => Ok(Some(model.residency_report()?)),
+            Self::DenseQwen(model) => Ok(Some(model.residency_report()?)),
+            Self::Qwen3Vl(model) | Self::Qwen3VlMoe(model) => Ok(Some(model.residency_report()?)),
         }
     }
 
@@ -483,22 +381,17 @@ impl Model {
         &self,
     ) -> Result<Option<crate::runtime::execution::layerwise::DenseDiskStreamReport>, Error> {
         match self {
-            Self::DeepSeekV3Layerwise(model) => model.dense_stream_report(),
-            Self::Gemma4Layerwise(model) => model.dense_stream_report(),
-            Self::InklingLayerwise(model) => model.dense_stream_report(),
-            Self::KimiLinearLayerwise(model) => model.dense_stream_report(),
-            Self::LlamaLayerwise(model) => model.dense_stream_report(),
-            Self::GptOssLayerwise(model) => model.dense_stream_report(),
-            Self::Lfm2Layerwise(model) => model.dense_stream_report(),
-            Self::NemotronHLayerwise(model) => model.dense_stream_report(),
-            Self::Qwen3NextLayerwise(model) | Self::Qwen35MoeLayerwise(model) => {
-                model.dense_stream_report()
-            }
-            Self::DenseQwenLayerwise(model) => model.dense_stream_report(),
-            Self::Qwen3VlLayerwise(model) | Self::Qwen3VlMoeLayerwise(model) => {
-                model.dense_stream_report()
-            }
-            _ => Ok(None),
+            Self::DeepSeekV3(model) => model.dense_stream_report(),
+            Self::Gemma4(model) => model.dense_stream_report(),
+            Self::Inkling(model) => model.dense_stream_report(),
+            Self::KimiLinear(model) => model.dense_stream_report(),
+            Self::Llama(model) => model.dense_stream_report(),
+            Self::GptOss(model) => model.dense_stream_report(),
+            Self::Lfm2(model) => model.dense_stream_report(),
+            Self::NemotronH(model) => model.dense_stream_report(),
+            Self::Qwen3Next(model) | Self::Qwen35(model) => model.dense_stream_report(),
+            Self::DenseQwen(model) => model.dense_stream_report(),
+            Self::Qwen3Vl(model) | Self::Qwen3VlMoe(model) => model.dense_stream_report(),
         }
     }
 
@@ -507,17 +400,15 @@ impl Model {
         &self,
     ) -> Result<Option<crate::runtime::residency::expert_cache::ExpertCacheReport>, Error> {
         match self {
-            Self::DeepSeekV3Layerwise(model) => model.expert_cache_report(),
-            Self::KimiLinearLayerwise(model) => model.expert_cache_report(),
-            Self::GptOssLayerwise(model) => model.expert_cache_report(),
-            Self::InklingLayerwise(model) => model.expert_cache_report(),
-            Self::Lfm2Layerwise(model) => model.expert_cache_report(),
-            Self::NemotronHLayerwise(model) => model.expert_cache_report(),
-            Self::DenseQwenLayerwise(model) => model.expert_cache_report(),
-            Self::Qwen3NextLayerwise(model) | Self::Qwen35MoeLayerwise(model) => {
-                model.expert_cache_report()
-            }
-            Self::Qwen3VlMoeLayerwise(model) => model.expert_cache_report(),
+            Self::DeepSeekV3(model) => model.expert_cache_report(),
+            Self::KimiLinear(model) => model.expert_cache_report(),
+            Self::GptOss(model) => model.expert_cache_report(),
+            Self::Inkling(model) => model.expert_cache_report(),
+            Self::Lfm2(model) => model.expert_cache_report(),
+            Self::NemotronH(model) => model.expert_cache_report(),
+            Self::DenseQwen(model) => model.expert_cache_report(),
+            Self::Qwen3Next(model) | Self::Qwen35(model) => model.expert_cache_report(),
+            Self::Qwen3VlMoe(model) => model.expert_cache_report(),
             _ => Ok(None),
         }
     }
@@ -525,32 +416,19 @@ impl Model {
     /// Returns the effective model type used for dispatch.
     pub fn model_type(&self) -> &str {
         match self {
-            Self::DeepSeekV3(model) => model.model_type(),
-            Self::DeepSeekV3Layerwise(model) => &model.args().model_type,
-            Self::Gemma4(model) => model.model_type(),
-            Self::Gemma4Layerwise(model) => &model.args().model_type,
-            Self::GptOss(model) => model.model_type(),
-            Self::GptOssLayerwise(model) => &model.args().model_type,
-            Self::Inkling(model) => model.model_type(),
-            Self::InklingLayerwise(model) => &model.args().model_type,
-            Self::KimiLinear(model) => model.model_type(),
-            Self::KimiLinearLayerwise(model) => &model.args().model_type,
-            Self::Llama(model) => model.model_type(),
-            Self::LlamaLayerwise(model) => &model.args().model_type,
-            Self::Lfm2(model) => model.model_type(),
-            Self::Lfm2Layerwise(model) => &model.args().model_type,
-            Self::NemotronH(model) => model.model_type(),
-            Self::NemotronHLayerwise(model) => &model.args().model_type,
-            Self::DenseQwen(model) => model.model_type(),
-            Self::DenseQwenLayerwise(model) => &model.args().model_type,
-            Self::Qwen3Next(model) => model.model_type(),
-            Self::Qwen3NextLayerwise(model) => &model.args().model_type,
+            Self::DeepSeekV3(model) => &model.args().model_type,
+            Self::Gemma4(model) => &model.args().model_type,
+            Self::GptOss(model) => &model.args().model_type,
+            Self::Inkling(model) => &model.args().model_type,
+            Self::KimiLinear(model) => &model.args().model_type,
+            Self::Llama(model) => &model.args().model_type,
+            Self::Lfm2(model) => &model.args().model_type,
+            Self::NemotronH(model) => &model.args().model_type,
+            Self::DenseQwen(model) => &model.args().model_type,
+            Self::Qwen3Next(model) => &model.args().model_type,
             Self::Qwen3Vl(model) => model.model_type(),
-            Self::Qwen3VlLayerwise(model) => model.model_type(),
             Self::Qwen3VlMoe(model) => model.model_type(),
-            Self::Qwen3VlMoeLayerwise(model) => model.model_type(),
-            Self::Qwen35Moe(model) => model.model_type(),
-            Self::Qwen35MoeLayerwise(model) => &model.args().model_type,
+            Self::Qwen35(model) => &model.args().model_type,
         }
     }
 
@@ -558,69 +436,35 @@ impl Model {
     pub fn native_quantization_stats(
         &self,
     ) -> Option<&safemlx::native_quantization::NativeQuantizationStats> {
-        match self {
-            Self::Gemma4(model) => Some(&model.native_quantization_stats),
-            _ => None,
-        }
+        None
     }
 
     /// Returns the canonical cache-relevant architecture identity derived from the loaded model.
     pub fn prompt_cache_architecture_fingerprint(&self) -> Result<String, Exception> {
         match self {
-            Self::Gemma4(model) => Ok(gemma4::prompt_cache_architecture_fingerprint(&model.args)),
-            Self::Gemma4Layerwise(model) => {
-                Ok(gemma4::prompt_cache_architecture_fingerprint(model.args()))
-            }
-            Self::Llama(model) => Ok(llama::prompt_cache_architecture_fingerprint(&model.args)),
-            Self::LlamaLayerwise(model) => {
-                Ok(llama::prompt_cache_architecture_fingerprint(model.args()))
-            }
+            Self::Gemma4(model) => Ok(gemma4::prompt_cache_architecture_fingerprint(model.args())),
+            Self::Llama(model) => Ok(llama::prompt_cache_architecture_fingerprint(model.args())),
             Self::DeepSeekV3(model) => Ok(deepseek_v3::prompt_cache_architecture_fingerprint(
-                &model.args,
+                model.args(),
             )),
-            Self::DeepSeekV3Layerwise(model) => Ok(
-                deepseek_v3::prompt_cache_architecture_fingerprint(model.args()),
-            ),
-            Self::GptOss(model) => Ok(gpt_oss::prompt_cache_architecture_fingerprint(&model.args)),
-            Self::GptOssLayerwise(model) => {
-                Ok(gpt_oss::prompt_cache_architecture_fingerprint(model.args()))
-            }
-            Self::Inkling(model) => Ok(inkling::prompt_cache_architecture_fingerprint(&model.args)),
-            Self::InklingLayerwise(model) => {
+            Self::GptOss(model) => Ok(gpt_oss::prompt_cache_architecture_fingerprint(model.args())),
+            Self::Inkling(model) => {
                 Ok(inkling::prompt_cache_architecture_fingerprint(model.args()))
             }
             Self::KimiLinear(model) => Ok(kimi_linear::prompt_cache_architecture_fingerprint(
-                &model.args,
+                model.args(),
             )),
-            Self::KimiLinearLayerwise(model) => Ok(
-                kimi_linear::prompt_cache_architecture_fingerprint(model.args()),
-            ),
-            Self::Lfm2(model) => Ok(lfm2::prompt_cache_architecture_fingerprint(&model.args)),
-            Self::Lfm2Layerwise(model) => {
-                Ok(lfm2::prompt_cache_architecture_fingerprint(model.args()))
-            }
+            Self::Lfm2(model) => Ok(lfm2::prompt_cache_architecture_fingerprint(model.args())),
             Self::DenseQwen(model) => Ok(dense_qwen::prompt_cache_architecture_fingerprint(
-                &model.args,
+                model.args(),
             )),
-            Self::DenseQwenLayerwise(model) => Ok(
-                dense_qwen::prompt_cache_architecture_fingerprint(model.args()),
-            ),
             Self::NemotronH(model) => Ok(nemotron_h::prompt_cache_architecture_fingerprint(
-                &model.args,
+                model.args(),
             )),
-            Self::NemotronHLayerwise(model) => Ok(
-                nemotron_h::prompt_cache_architecture_fingerprint(model.args()),
-            ),
-            Self::Qwen3Next(model) | Self::Qwen35Moe(model) => Ok(
-                qwen3_5_moe::prompt_cache_architecture_fingerprint(&model.args),
-            ),
-            Self::Qwen3NextLayerwise(model) | Self::Qwen35MoeLayerwise(model) => Ok(
-                qwen3_5_moe::prompt_cache_architecture_fingerprint(model.args()),
-            ),
-            Self::Qwen3Vl(model) | Self::Qwen3VlMoe(model) => {
-                Ok(qwen3_vl::prompt_cache_architecture_fingerprint(&model.args))
+            Self::Qwen3Next(model) | Self::Qwen35(model) => {
+                Ok(qwen3_5::prompt_cache_architecture_fingerprint(model.args()))
             }
-            Self::Qwen3VlLayerwise(model) | Self::Qwen3VlMoeLayerwise(model) => Ok(
+            Self::Qwen3Vl(model) | Self::Qwen3VlMoe(model) => Ok(
                 qwen3_vl::prompt_cache_architecture_fingerprint(model.args()),
             ),
         }
@@ -628,125 +472,23 @@ impl Model {
 
     /// Returns the exact ordered prompt-cache state and attention layout.
     pub fn prompt_cache_layer_layout(&self) -> Result<LayerSchedule<LayerCachePolicy>, Exception> {
-        let layout = match self {
-            Self::Llama(model) => PromptCacheModelIdentity::key_value_layouts(
-                model.args.attention_schedule.iter().map(|policy| {
-                    policy.window().map(|window| {
-                        i32::try_from(window.get())
-                            .expect("validated Llama attention window fits i32")
-                    })
-                }),
-                model.args.num_key_value_heads,
-                model.args.head_dim,
-            ),
-            Self::LlamaLayerwise(model) => {
-                return model
-                    .prompt_cache_layer_layout()
-                    .map_err(|error| Exception::custom(error.to_string()))
-            }
-            Self::DeepSeekV3(model) => PromptCacheModelIdentity::compressed_layouts(
-                model.args.num_hidden_layers as usize,
-                model.args.kv_lora_rank,
-                model.args.qk_rope_head_dim,
-            ),
-            Self::DeepSeekV3Layerwise(model) => {
-                return model
-                    .prompt_cache_layer_layout()
-                    .map_err(|error| Exception::custom(error.to_string()))
-            }
-            Self::GptOss(model) => PromptCacheModelIdentity::key_value_layouts(
-                model.args.attention_schedule.iter().map(|policy| {
-                    policy.window().map(|window| {
-                        i32::try_from(window.get())
-                            .expect("validated GPT-OSS sliding window fits i32")
-                    })
-                }),
-                model.args.num_key_value_heads,
-                model.args.head_dim,
-            ),
-            Self::GptOssLayerwise(model) => {
-                return model
-                    .prompt_cache_layer_layout()
-                    .map_err(|error| Exception::custom(error.to_string()))
-            }
-            Self::DenseQwen(model) => return dense_qwen::prompt_cache_layer_layout(&model.args),
-            Self::DenseQwenLayerwise(model) => {
-                return model
-                    .prompt_cache_layer_layout()
-                    .map_err(|error| Exception::custom(error.to_string()))
-            }
-            Self::KimiLinear(model) => {
-                return kimi_linear::prompt_cache_layer_layout(&model.args)
-                    .map_err(|error| Exception::custom(error.to_string()));
-            }
-            Self::KimiLinearLayerwise(model) => {
-                return model
-                    .prompt_cache_layer_layout()
-                    .map_err(|error| Exception::custom(error.to_string()))
-            }
-            Self::Lfm2(model) => {
-                return lfm2::prompt_cache_layer_layout(&model.args)
-                    .map_err(|error| Exception::custom(error.to_string()));
-            }
-            Self::Lfm2Layerwise(model) => {
-                return model
-                    .prompt_cache_layer_layout()
-                    .map_err(|error| Exception::custom(error.to_string()))
-            }
-            Self::NemotronH(model) => {
-                return nemotron_h::prompt_cache_layer_layout(&model.args)
-                    .map_err(|error| Exception::custom(error.to_string()));
-            }
-            Self::NemotronHLayerwise(model) => {
-                return model
-                    .prompt_cache_layer_layout()
-                    .map_err(|error| Exception::custom(error.to_string()))
-            }
-            Self::Qwen3Next(model) | Self::Qwen35Moe(model) => {
-                return qwen3_5_moe::prompt_cache_layer_layout(&model.args)
-                    .map_err(|error| Exception::custom(error.to_string()));
-            }
-            Self::Qwen3NextLayerwise(model) | Self::Qwen35MoeLayerwise(model) => {
-                return model
-                    .prompt_cache_layer_layout()
-                    .map_err(|error| Exception::custom(error.to_string()))
-            }
-            Self::Qwen3Vl(model) | Self::Qwen3VlMoe(model) => {
-                return qwen3_vl::prompt_cache_layer_layout(&model.args)
-                    .map_err(|error| Exception::custom(error.to_string()));
-            }
-            Self::Qwen3VlLayerwise(model) | Self::Qwen3VlMoeLayerwise(model) => {
-                return model
-                    .prompt_cache_layer_layout()
-                    .map_err(|error| Exception::custom(error.to_string()));
-            }
-            Self::Gemma4(model) => {
-                return gemma4::prompt_cache_layer_layout(&model.args)
-                    .map_err(|error| Exception::custom(error.to_string()));
-            }
-            Self::Gemma4Layerwise(model) => {
-                return model
-                    .prompt_cache_layer_layout()
-                    .map_err(|error| Exception::custom(error.to_string()))
-            }
-            Self::Inkling(model) => {
-                return inkling::prompt_cache_layer_layout(&model.args)
-                    .map_err(|error| Exception::custom(error.to_string()));
-            }
-            Self::InklingLayerwise(model) => {
-                return model
-                    .prompt_cache_layer_layout()
-                    .map_err(|error| Exception::custom(error.to_string()));
-            }
-        };
-        layout.map_err(|error| Exception::custom(error.to_string()))
+        match self {
+            Self::Llama(model) => model.prompt_cache_layer_layout(),
+            Self::DeepSeekV3(model) => model.prompt_cache_layer_layout(),
+            Self::GptOss(model) => model.prompt_cache_layer_layout(),
+            Self::DenseQwen(model) => model.prompt_cache_layer_layout(),
+            Self::KimiLinear(model) => model.prompt_cache_layer_layout(),
+            Self::Lfm2(model) => model.prompt_cache_layer_layout(),
+            Self::NemotronH(model) => model.prompt_cache_layer_layout(),
+            Self::Qwen3Next(model) | Self::Qwen35(model) => model.prompt_cache_layer_layout(),
+            Self::Qwen3Vl(model) | Self::Qwen3VlMoe(model) => model.prompt_cache_layer_layout(),
+            Self::Gemma4(model) => model.prompt_cache_layer_layout(),
+            Self::Inkling(model) => model.prompt_cache_layer_layout(),
+        }
+        .map_err(|error| Exception::custom(error.to_string()))
     }
 
-    /// Runs a detailed instrumented forward pass for supported model families.
-    ///
-    /// DeepSeek-V3/R1, Kimi Linear, Llama, Qwen3, Qwen3.5 MoE, and Gemma4
-    /// currently report detailed layer activations. Other families return an
-    /// error until their family-specific inspection paths are wired.
+    /// Runs an instrumented pass through the canonical generalized executor.
     pub fn forward_with_observer(
         &mut self,
         input_tokens: &Array,
@@ -755,137 +497,60 @@ impl Model {
         stream: &Stream,
         observer: &mut impl ActivationObserver,
     ) -> Result<Array, Exception> {
-        match (self, cache) {
-            (Self::DeepSeekV3(model), ModelCache::DeepSeekV3(cache)) => model
-                .forward_with_observer(
-                    deepseek_v3::ModelInput {
-                        inputs: input_tokens,
-                        mask,
-                        cache: Some(cache),
-                    },
-                    stream,
-                    observer,
-                ),
-            (Self::DeepSeekV3Layerwise(_), ModelCache::DeepSeekV3(_)) => Err(Exception::custom(
-                "detailed activation inspection is unavailable for bounded-layer DeepSeek-V3 execution",
-            )),
-            (Self::KimiLinear(model), ModelCache::KimiLinear(cache)) => model
-                .forward_with_observer(
-                    kimi_linear::ModelInput {
-                        inputs: input_tokens,
-                        mask,
-                        cache: Some(cache),
-                    },
-                    stream,
-                    observer,
-                ),
-            (Self::KimiLinearLayerwise(_), ModelCache::KimiLinear(_)) => Err(
-                Exception::custom(
-                    "detailed activation inspection is unavailable for bounded-layer Kimi Linear execution",
-                ),
-            ),
-            (Self::Llama(model), ModelCache::KeyValue(cache)) => model.forward_with_observer(
-                llama::ModelInput {
-                    inputs: input_tokens,
-                    mask,
-                    cache,
-                },
-                stream,
-                observer,
-            ),
-            (Self::Llama(_), ModelCache::PagedKeyValue(_)) => Err(Exception::custom(
-                "detailed attention inspection is unavailable for paged key/value caches",
-            )),
-            (Self::LlamaLayerwise(_), ModelCache::LlamaLayerwise(_)) => Err(Exception::custom(
-                "detailed activation inspection is unavailable for bounded-layer Llama execution",
-            )),
-            (Self::DenseQwen(model), ModelCache::KeyValue(cache)) => model.forward_with_observer(
-                dense_qwen::ModelInput {
-                    inputs: input_tokens,
-                    mask,
-                    cache,
-                },
-                stream,
-                observer,
-            ),
-            (Self::DenseQwen(_), ModelCache::PagedKeyValue(_)) => Err(Exception::custom(
-                "detailed attention inspection is unavailable for paged dense-Qwen caches",
-            )),
-            (Self::DenseQwenLayerwise(_), ModelCache::KeyValue(_)) => Err(Exception::custom(
-                "detailed activation inspection is unavailable for bounded-layer dense-Qwen execution",
-            )),
-            (Self::Qwen35Moe(model), ModelCache::Qwen35Moe(cache)) => model.forward_with_observer(
-                qwen3_5_moe::ModelInput {
-                    inputs: input_tokens,
-                    inputs_embeds: None,
-                    mask,
-                    cache: Some(cache),
-                },
-                stream,
-                observer,
-            ),
-            (Self::Qwen35MoeLayerwise(_), ModelCache::Qwen35Moe(_)) => Err(Exception::custom(
-                "detailed activation inspection is unavailable for bounded-layer Qwen3.5 execution",
-            )),
-            (Self::Qwen3Next(model), ModelCache::Qwen3Next(cache)) => model.forward_with_observer(
-                qwen3_next::ModelInput {
-                    inputs: input_tokens,
-                    inputs_embeds: None,
-                    mask,
-                    cache: Some(cache),
-                },
-                stream,
-                observer,
-            ),
-            (Self::Qwen3NextLayerwise(_), ModelCache::Qwen3Next(_)) => Err(Exception::custom(
-                "detailed activation inspection is unavailable for bounded-layer Qwen3-Next execution",
-            )),
-            (Self::Gemma4(model), ModelCache::Gemma4(cache)) => model.forward_with_observer(
-                gemma4::ModelInput {
-                    inputs: input_tokens,
-                    inputs_embeds: None,
-                    per_layer_input_ids: None,
-                    mask,
-                    sliding_masks: None,
-                    cache: &mut cache.kv,
-                },
-                stream,
-                observer,
-            ),
-            (Self::Gemma4Layerwise(_), ModelCache::Gemma4(_)) => Err(Exception::custom(
-                "detailed activation inspection is unavailable for bounded-layer Gemma 4 execution",
-            )),
-            (Self::NemotronH(_) | Self::NemotronHLayerwise(_), _) => Err(Exception::custom(
-                "detailed activation inspection is not implemented for nemotron_h yet",
-            )),
-            (Self::Lfm2(_) | Self::Lfm2Layerwise(_), _) => Err(Exception::custom(
-                "detailed activation inspection is not implemented for lfm2 yet",
-            )),
-            (Self::Qwen3Vl(_) | Self::Qwen3VlLayerwise(_), _) => Err(Exception::custom(
-                "detailed activation inspection is not implemented for qwen3_vl yet",
-            )),
-            (Self::Qwen3VlMoe(_) | Self::Qwen3VlMoeLayerwise(_), _) => Err(Exception::custom(
-                "detailed activation inspection is not implemented for qwen3_vl_moe yet",
-            )),
-            (Self::GptOss(_) | Self::GptOssLayerwise(_), _) => Err(Exception::custom(
-                "detailed activation inspection is not implemented for gpt_oss yet",
-            )),
-            (Self::Inkling(_) | Self::InklingLayerwise(_), _) => Err(Exception::custom(
-                "detailed activation inspection is not implemented for Inkling yet",
-            )),
-            _ => Err(Exception::custom(
-                "model cache type does not match model kind",
-            )),
-        }
+        let result = match (self, cache) {
+            (Self::DeepSeekV3(model), ModelCache::DeepSeekV3(cache)) => {
+                if mask.is_some() {
+                    return Err(Exception::custom(
+                        "an explicit DeepSeek observer mask is unsupported; the adapter constructs the causal mask from cache state",
+                    ));
+                }
+                model.forward_with_observer(input_tokens, cache, stream, observer)
+            }
+            (Self::KimiLinear(model), ModelCache::KimiLinear(cache)) => {
+                if mask.is_some() {
+                    return Err(Exception::custom(
+                        "an explicit Kimi Linear observer mask is unsupported; the adapter constructs the causal mask from cache state",
+                    ));
+                }
+                model.forward_with_observer(input_tokens, cache, stream, observer)
+            }
+            (Self::Llama(model), ModelCache::Llama(cache)) => {
+                model.forward_with_observer(input_tokens, mask, cache, stream, observer)
+            }
+            (Self::DenseQwen(model), ModelCache::KeyValue(cache)) => {
+                model.forward_with_observer(input_tokens, mask, cache, stream, observer)
+            }
+            (Self::DenseQwen(model), ModelCache::PagedKeyValue(cache)) => {
+                model.forward_paged_with_observer(input_tokens, mask, cache, stream, observer)
+            }
+            (Self::Qwen3Next(model), ModelCache::Qwen3Next(cache))
+            | (Self::Qwen35(model), ModelCache::Qwen35(cache)) => {
+                if mask.is_some() {
+                    return Err(Exception::custom(
+                        "an explicit Qwen hybrid observer mask is unsupported; the adapter constructs the causal mask from cache state",
+                    ));
+                }
+                model.forward_with_observer(input_tokens, cache, stream, observer)
+            }
+            (Self::Gemma4(model), ModelCache::Gemma4(cache)) => {
+                if mask.is_some() {
+                    return Err(Exception::custom(
+                        "an explicit Gemma observer mask is unsupported; the adapter constructs its per-layer masks from cache state",
+                    ));
+                }
+                model.forward_with_observer(input_tokens, cache, stream, observer)
+            }
+            (model, _) => {
+                return Err(Exception::custom(format!(
+                    "activation observation is unavailable for model type {} or the supplied cache does not match",
+                    model.model_type()
+                )))
+            }
+        };
+        result.map_err(|error| Exception::custom(error.to_string()))
     }
 
     /// Computes initial prompt logits while reporting detailed activations.
-    ///
-    /// This mirrors each model family's prefill semantics and returns logits for
-    /// the final prompt token with shape `[batch, vocab]`. Gemma4 uses a split
-    /// prefill internally, so callers that want faithful instrumented generation
-    /// should use this instead of calling [`Model::forward_with_observer`]
-    /// directly on the whole prompt.
     pub fn prefill_input_with_observer(
         &mut self,
         input: input::ModelInput<'_>,
@@ -893,154 +558,47 @@ impl Model {
         stream: &Stream,
         observer: &mut impl ActivationObserver,
     ) -> Result<Array, Exception> {
-        match (self, cache) {
-            (Self::DeepSeekV3(model), ModelCache::DeepSeekV3(cache)) => {
-                let prompt_tokens = input::text_token_ids(input, stream)?;
-                let logits = model.forward_with_observer(
-                    deepseek_v3::ModelInput {
-                        inputs: &prompt_tokens,
-                        mask: None,
-                        cache: Some(cache),
-                    },
-                    stream,
-                    observer,
-                )?;
-                final_token_logits(&logits, stream)
-            }
-            (Self::KimiLinear(model), ModelCache::KimiLinear(cache)) => {
-                let prompt_tokens = input::text_token_ids(input, stream)?;
-                let logits = model.forward_with_observer(
-                    kimi_linear::ModelInput {
-                        inputs: &prompt_tokens,
-                        mask: None,
-                        cache: Some(cache),
-                    },
-                    stream,
-                    observer,
-                )?;
-                final_token_logits(&logits, stream)
-            }
-            (Self::KimiLinearLayerwise(_), ModelCache::KimiLinear(_)) => Err(
-                Exception::custom(
-                    "detailed activation inspection is unavailable for bounded-layer Kimi Linear execution",
-                ),
-            ),
-            (Self::Gemma4(model), ModelCache::Gemma4(cache)) => {
-                model.prefill_typed_with_observer(input, cache, stream, observer)
-            }
-            (Self::Gemma4Layerwise(_), ModelCache::Gemma4(_)) => Err(Exception::custom(
-                "detailed activation inspection is unavailable for bounded-layer Gemma 4 execution",
-            )),
-            (Self::Llama(model), ModelCache::KeyValue(cache)) => {
-                let prompt_tokens = input::text_token_ids(input, stream)?;
-                let logits = model.forward_with_observer(
-                    llama::ModelInput {
-                        inputs: &prompt_tokens,
-                        mask: None,
-                        cache,
-                    },
-                    stream,
-                    observer,
-                )?;
-                final_token_logits(&logits, stream)
-            }
-            (Self::Llama(_), ModelCache::PagedKeyValue(_)) => Err(Exception::custom(
-                "detailed attention inspection is unavailable for paged key/value caches",
-            )),
-            (Self::LlamaLayerwise(_), ModelCache::LlamaLayerwise(_)) => Err(Exception::custom(
-                "detailed activation inspection is unavailable for bounded-layer Llama execution",
-            )),
-            (Self::DenseQwen(model), ModelCache::KeyValue(cache)) => {
-                let prompt_tokens = input::text_token_ids(input, stream)?;
-                let logits = model.forward_with_observer(
-                    dense_qwen::ModelInput {
-                        inputs: &prompt_tokens,
-                        mask: None,
-                        cache,
-                    },
-                    stream,
-                    observer,
-                )?;
-                final_token_logits(&logits, stream)
-            }
-            (Self::DenseQwen(_), ModelCache::PagedKeyValue(_)) => Err(Exception::custom(
-                "detailed attention inspection is unavailable for paged dense-Qwen caches",
-            )),
-            (Self::DenseQwenLayerwise(_), ModelCache::KeyValue(_)) => Err(Exception::custom(
-                "detailed activation inspection is unavailable for bounded-layer dense-Qwen execution",
-            )),
-            (Self::Qwen35Moe(model), ModelCache::Qwen35Moe(cache)) => {
-                model.prefill_typed_with_observer(input, cache, stream, observer)
-            }
-            (Self::Qwen35MoeLayerwise(_), ModelCache::Qwen35Moe(_)) => Err(Exception::custom(
-                "detailed activation inspection is unavailable for bounded-layer Qwen3.5 execution",
-            )),
-            (Self::Qwen3Next(model), ModelCache::Qwen3Next(cache)) => {
-                model.prefill_typed_with_observer(input, cache, stream, observer)
-            }
-            (Self::Qwen3NextLayerwise(_), ModelCache::Qwen3Next(_)) => Err(Exception::custom(
-                "detailed activation inspection is unavailable for bounded-layer Qwen3-Next execution",
-            )),
-            (Self::NemotronH(_) | Self::NemotronHLayerwise(_), _) => Err(Exception::custom(
-                "detailed activation inspection is not implemented for nemotron_h yet",
-            )),
-            (Self::Lfm2(_) | Self::Lfm2Layerwise(_), _) => Err(Exception::custom(
-                "detailed activation inspection is not implemented for lfm2 yet",
-            )),
-            (Self::Inkling(_), _) => Err(Exception::custom(
-                "detailed activation inspection is not implemented for Inkling yet",
-            )),
-            (Self::Qwen3Vl(_) | Self::Qwen3VlLayerwise(_), _) => Err(Exception::custom(
-                "detailed activation inspection is not implemented for qwen3_vl yet",
-            )),
-            (Self::Qwen3VlMoe(_) | Self::Qwen3VlMoeLayerwise(_), _) => Err(Exception::custom(
-                "detailed activation inspection is not implemented for qwen3_vl_moe yet",
-            )),
-            _ => Err(Exception::custom(
-                "model cache type does not match model kind",
-            )),
+        if let (Self::Gemma4(model), ModelCache::Gemma4(cache)) = (&mut *self, &mut *cache) {
+            return model
+                .prefill_input_with_observer(input, cache, stream, observer)
+                .map_err(|error| Exception::custom(error.to_string()))?
+                .try_index_device((.., -1, ..), stream);
         }
+        match (&mut *self, &mut *cache) {
+            (Self::Qwen3Next(model), ModelCache::Qwen3Next(cache))
+            | (Self::Qwen35(model), ModelCache::Qwen35(cache)) => {
+                return model
+                    .prefill_input_with_observer(input, cache, stream, observer)
+                    .map_err(|error| Exception::custom(error.to_string()))?
+                    .try_index_device((.., -1, ..), stream);
+            }
+            _ => {}
+        }
+        let tokens = input::text_token_ids(input, stream)?;
+        self.forward_with_observer(&tokens, None, cache, stream, observer)?
+            .try_index_device((.., -1, ..), stream)
     }
 
     /// Creates an empty cache value appropriate for this model.
     pub fn new_cache(&self) -> ModelCache {
         match self {
             Self::DeepSeekV3(model) => ModelCache::DeepSeekV3(model.new_cache()),
-            Self::DeepSeekV3Layerwise(model) => ModelCache::DeepSeekV3(model.new_cache()),
             Self::Gemma4(model) => ModelCache::Gemma4(model.new_cache()),
-            Self::Gemma4Layerwise(model) => ModelCache::Gemma4(model.new_cache()),
             Self::GptOss(model) => ModelCache::GptOss(model.new_cache()),
-            Self::GptOssLayerwise(model) => ModelCache::GptOss(model.new_cache()),
             Self::Inkling(model) => ModelCache::Inkling(model.new_cache()),
-            Self::InklingLayerwise(model) => ModelCache::Inkling(model.new_cache()),
             Self::KimiLinear(model) => ModelCache::KimiLinear(model.new_cache()),
-            Self::KimiLinearLayerwise(model) => ModelCache::KimiLinear(model.new_cache()),
-            Self::Llama(model) => ModelCache::KeyValue(model.new_cache()),
-            Self::LlamaLayerwise(model) => ModelCache::LlamaLayerwise(model.new_cache()),
+            Self::Llama(model) => ModelCache::Llama(model.new_cache()),
             Self::Lfm2(model) => ModelCache::Lfm2(model.new_cache()),
-            Self::Lfm2Layerwise(model) => ModelCache::Lfm2(model.new_cache()),
             Self::DenseQwen(model) => ModelCache::KeyValue(model.new_cache()),
-            Self::DenseQwenLayerwise(model) => ModelCache::KeyValue(model.new_cache()),
             Self::Qwen3Next(model) => ModelCache::Qwen3Next(model.new_cache()),
-            Self::Qwen3NextLayerwise(model) => ModelCache::Qwen3Next(model.new_cache()),
             Self::Qwen3Vl(model) => ModelCache::Qwen3Vl(model.new_cache()),
-            Self::Qwen3VlLayerwise(model) => ModelCache::Qwen3Vl(model.new_cache()),
             Self::Qwen3VlMoe(model) => ModelCache::Qwen3VlMoe(model.new_cache()),
-            Self::Qwen3VlMoeLayerwise(model) => ModelCache::Qwen3VlMoe(model.new_cache()),
             Self::NemotronH(model) => ModelCache::NemotronH(model.new_cache()),
-            Self::NemotronHLayerwise(model) => ModelCache::NemotronH(model.new_cache()),
-            Self::Qwen35Moe(model) => ModelCache::Qwen35Moe(model.new_cache()),
-            Self::Qwen35MoeLayerwise(model) => ModelCache::Qwen35Moe(model.new_cache()),
+            Self::Qwen35(model) => ModelCache::Qwen35(model.new_cache()),
         }
     }
 
     /// Creates ordinary cache state or an explicitly bounded paged cache.
-    ///
-    /// Paged construction is currently supported for Llama-compatible and
-    /// dense-Qwen text attention, DeepSeek compressed-latent attention,
-    /// GPT-OSS, Inkling relative-position attention, and the corresponding
-    /// bounded weight-execution wrappers. Other cache representations return a
-    /// precise unsupported error and retain their device-resident defaults.
     pub fn new_cache_with_options(
         &self,
         policy: CacheResidencyPolicy,
@@ -1048,68 +606,38 @@ impl Model {
         match policy {
             CacheResidencyPolicy::Device => Ok(self.new_cache()),
             CacheResidencyPolicy::Paged(options) => match self {
-                Self::Llama(model) => {
-                    let manager = CacheResidencyManager::new(options)
-                        .map_err(|error| Exception::custom(error.to_string()))?;
-                    let caches = model
-                        .args
-                        .attention_schedule
-                        .iter()
-                        .enumerate()
-                        .map(|(layer, policy)| {
-                            let window = policy.window().map(|window| {
-                                i32::try_from(window.get())
-                                    .expect("validated Llama attention window fits i32")
-                            });
-                            PagedKeyValueCache::new(manager.clone(), layer, window).map(Some)
-                        })
-                        .collect::<Result<Vec<_>, _>>()?;
-                    Ok(ModelCache::PagedKeyValue(caches))
-                }
-                Self::LlamaLayerwise(model) => model
+                Self::Llama(model) => model
                     .new_cache_with_options(CacheResidencyPolicy::Paged(options))
-                    .map(ModelCache::LlamaLayerwise)
+                    .map(ModelCache::Llama)
                     .map_err(|error| Exception::custom(error.to_string())),
                 Self::DeepSeekV3(model) => model
                     .new_cache_with_options(CacheResidencyPolicy::Paged(options))
-                    .map(ModelCache::DeepSeekV3),
-                Self::DeepSeekV3Layerwise(model) => model
-                    .new_cache_with_options(CacheResidencyPolicy::Paged(options))
                     .map(ModelCache::DeepSeekV3)
+                    .map_err(|error| Exception::custom(error.to_string())),
+                Self::KimiLinear(model) => model
+                    .new_cache_with_options(CacheResidencyPolicy::Paged(options))
+                    .map(ModelCache::KimiLinear)
                     .map_err(|error| Exception::custom(error.to_string())),
                 Self::GptOss(model) => model
                     .new_cache_with_options(CacheResidencyPolicy::Paged(options))
-                    .map(ModelCache::GptOss),
-                Self::GptOssLayerwise(model) => model
-                    .new_cache_with_options(CacheResidencyPolicy::Paged(options))
                     .map(ModelCache::GptOss)
                     .map_err(|error| Exception::custom(error.to_string())),
-                Self::DenseQwen(model) => {
-                    let manager = CacheResidencyManager::new(options)
-                        .map_err(|error| Exception::custom(error.to_string()))?;
-                    let caches = model
-                        .args
-                        .attention_schedule
-                        .iter()
-                        .enumerate()
-                        .map(|(layer, policy)| {
-                            PagedKeyValueCache::new(
-                                manager.clone(),
-                                layer,
-                                policy.window().map(|window| {
-                                    i32::try_from(window.get())
-                                        .expect("validated dense-Qwen attention window fits i32")
-                                }),
-                            )
-                            .map(Some)
-                        })
-                        .collect::<Result<Vec<_>, _>>()?;
-                    Ok(ModelCache::PagedKeyValue(caches))
-                }
-                Self::Inkling(model) => model.new_paged_cache(options).map(ModelCache::Inkling),
-                Self::InklingLayerwise(model) => model
+                Self::DenseQwen(model) => model
+                    .new_cache_with_options(CacheResidencyPolicy::Paged(options))
+                    .and_then(|cache| match cache {
+                        crate::architectures::qwen::dense::layerwise::DenseQwenLayerwiseCache::Paged(caches) => Ok(ModelCache::PagedKeyValue(caches)),
+                        _ => Err(Error::UnsupportedArchitecture(
+                            "dense-Qwen paged cache construction returned device state".into(),
+                        )),
+                    })
+                    .map_err(|error| Exception::custom(error.to_string())),
+                Self::Inkling(model) => model
                     .new_cache_with_options(CacheResidencyPolicy::Paged(options))
                     .map(ModelCache::Inkling)
+                    .map_err(|error| Exception::custom(error.to_string())),
+                Self::NemotronH(model) => model
+                    .new_cache_with_options(CacheResidencyPolicy::Paged(options))
+                    .map(ModelCache::NemotronH)
                     .map_err(|error| Exception::custom(error.to_string())),
                 _ => Err(Exception::custom(format!(
                     "paged cache residency is unsupported for model type {}",
@@ -1128,227 +656,28 @@ impl Model {
         options: PagedCacheOptions,
         stream: &Stream,
     ) -> Result<(ModelCache, PromptCacheManifest), Exception> {
+        macro_rules! load {
+            ($model:expr, $variant:path) => {
+                $model
+                    .load_prompt_cache(directory, expected, prefix_token_ids, options, stream)
+                    .map(|(cache, manifest)| ($variant(cache), manifest))
+                    .map_err(|error| Exception::custom(error.to_string()))
+            };
+        }
         match self {
-            Self::Llama(model) => {
-                let layer_count = usize::try_from(model.args.num_hidden_layers)
-                    .map_err(|_| Exception::custom("invalid Llama cache layer count"))?;
-                let identity = PromptCacheModelIdentity {
-                    model_family: "llama".into(),
-                    effective_model_type: model.args.model_type.clone(),
-                    architecture_fingerprint: llama::prompt_cache_architecture_fingerprint(
-                        &model.args,
-                    ),
-                    layer_count,
-                    global_layer_start: 0,
-                    global_layer_end: layer_count,
-                    sink_tokens: 0,
-                    topology: Default::default(),
-                    layer_layout: PromptCacheModelIdentity::key_value_layouts(
-                        model.args.attention_schedule.iter().map(|policy| {
-                            policy.window().map(|window| {
-                                i32::try_from(window.get())
-                                    .expect("validated Llama attention window fits i32")
-                            })
-                        }),
-                        model.args.num_key_value_heads,
-                        model.args.head_dim,
-                    )
-                    .map_err(|error| Exception::custom(error.to_string()))?,
-                };
-                validate_prompt_cache_model_identity(expected, &identity)
-                    .map_err(|error| Exception::custom(error.to_string()))?;
-                let (manager, manifest) =
-                    open_prompt_cache(directory, expected, &identity, prefix_token_ids, options)
-                        .map_err(|error| Exception::custom(error.to_string()))?;
-                let caches = model
-                    .args
-                    .attention_schedule
-                    .iter()
-                    .enumerate()
-                    .map(|(layer, policy)| {
-                        let window = policy.window().map(|window| {
-                            i32::try_from(window.get())
-                                .expect("validated Llama attention window fits i32")
-                        });
-                        PagedKeyValueCache::new(manager.clone(), layer, window).map(Some)
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
-                Ok((ModelCache::PagedKeyValue(caches), manifest))
-            }
-            Self::LlamaLayerwise(model) => model
-                .load_prompt_cache(directory, expected, prefix_token_ids, options, stream)
-                .map(|(cache, manifest)| (ModelCache::LlamaLayerwise(cache), manifest))
-                .map_err(|error| Exception::custom(error.to_string())),
-            Self::DeepSeekV3(model) => model
-                .load_prompt_cache(directory, expected, prefix_token_ids, options)
-                .map(|(cache, manifest)| (ModelCache::DeepSeekV3(cache), manifest)),
-            Self::DeepSeekV3Layerwise(model) => model
-                .load_prompt_cache(directory, expected, prefix_token_ids, options, stream)
-                .map(|(cache, manifest)| (ModelCache::DeepSeekV3(cache), manifest))
-                .map_err(|error| Exception::custom(error.to_string())),
-            Self::GptOss(model) => model
-                .load_prompt_cache(directory, expected, prefix_token_ids, options)
-                .map(|(cache, manifest)| (ModelCache::GptOss(cache), manifest)),
-            Self::GptOssLayerwise(model) => model
-                .load_prompt_cache(directory, expected, prefix_token_ids, options, stream)
-                .map(|(cache, manifest)| (ModelCache::GptOss(cache), manifest))
-                .map_err(|error| Exception::custom(error.to_string())),
-            Self::DenseQwen(model) => {
-                let layer_count = usize::try_from(model.args.num_hidden_layers)
-                    .map_err(|_| Exception::custom("invalid dense-Qwen cache layer count"))?;
-                let identity = PromptCacheModelIdentity {
-                    model_family: "dense_qwen".into(),
-                    effective_model_type: model.args.model_type.clone(),
-                    architecture_fingerprint: dense_qwen::prompt_cache_architecture_fingerprint(
-                        &model.args,
-                    ),
-                    layer_count,
-                    global_layer_start: 0,
-                    global_layer_end: layer_count,
-                    sink_tokens: 0,
-                    topology: Default::default(),
-                    layer_layout: PromptCacheModelIdentity::key_value_layouts(
-                        model.args.attention_schedule.iter().map(|policy| {
-                            policy.window().map(|window| {
-                                i32::try_from(window.get())
-                                    .expect("validated dense-Qwen attention window fits i32")
-                            })
-                        }),
-                        model.args.num_key_value_heads,
-                        model.args.head_dim,
-                    )
-                    .map_err(|error| Exception::custom(error.to_string()))?,
-                };
-                validate_prompt_cache_model_identity(expected, &identity)
-                    .map_err(|error| Exception::custom(error.to_string()))?;
-                let (manager, manifest) =
-                    open_prompt_cache(directory, expected, &identity, prefix_token_ids, options)
-                        .map_err(|error| Exception::custom(error.to_string()))?;
-                let caches = (0..layer_count)
-                    .map(|layer| {
-                        let window = model.args.attention_schedule.get(layer).and_then(|policy| {
-                            policy.window().map(|window| {
-                                i32::try_from(window.get())
-                                    .expect("validated dense-Qwen attention window fits i32")
-                            })
-                        });
-                        PagedKeyValueCache::new(manager.clone(), layer, window).map(Some)
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
-                Ok((ModelCache::PagedKeyValue(caches), manifest))
-            }
-            Self::DenseQwenLayerwise(model) => model
-                .load_prompt_cache(directory, expected, prefix_token_ids, options, stream)
-                .map(|(cache, manifest)| (ModelCache::KeyValue(cache), manifest))
-                .map_err(|error| Exception::custom(error.to_string())),
-            Self::KimiLinear(model) => kimi_linear::Model::load_prompt_cache(
-                &model.args,
-                directory,
-                expected,
-                prefix_token_ids,
-                stream,
-            )
-            .map(|(cache, manifest)| (ModelCache::KimiLinear(cache), manifest)),
-            Self::KimiLinearLayerwise(model) => model
-                .load_prompt_cache(directory, expected, prefix_token_ids, options, stream)
-                .map(|(cache, manifest)| (ModelCache::KimiLinear(cache), manifest))
-                .map_err(|error| Exception::custom(error.to_string())),
-            Self::Qwen3Next(model) => qwen3_next::Model::load_prompt_cache(
-                &model.args,
-                directory,
-                expected,
-                prefix_token_ids,
-                stream,
-            )
-            .map(|(cache, manifest)| (ModelCache::Qwen3Next(cache), manifest)),
-            Self::Qwen3NextLayerwise(model) => model
-                .load_prompt_cache(directory, expected, prefix_token_ids, options, stream)
-                .map(|(cache, manifest)| (ModelCache::Qwen3Next(cache), manifest))
-                .map_err(|error| Exception::custom(error.to_string())),
-            Self::Qwen35Moe(model) => qwen3_5_moe::Model::load_prompt_cache(
-                &model.args,
-                directory,
-                expected,
-                prefix_token_ids,
-                stream,
-            )
-            .map(|(cache, manifest)| (ModelCache::Qwen35Moe(cache), manifest)),
-            Self::Qwen35MoeLayerwise(model) => model
-                .load_prompt_cache(directory, expected, prefix_token_ids, options, stream)
-                .map(|(cache, manifest)| (ModelCache::Qwen35Moe(cache), manifest))
-                .map_err(|error| Exception::custom(error.to_string())),
-            Self::Qwen3Vl(model) => qwen3_vl::Model::load_prompt_cache(
-                &model.args,
-                directory,
-                expected,
-                prefix_token_ids,
-                stream,
-            )
-            .map(|(cache, manifest)| (ModelCache::Qwen3Vl(cache), manifest)),
-            Self::Qwen3VlLayerwise(model) => model
-                .load_prompt_cache(directory, expected, prefix_token_ids, options, stream)
-                .map(|(cache, manifest)| (ModelCache::Qwen3Vl(cache), manifest))
-                .map_err(|error| Exception::custom(error.to_string())),
-            Self::Qwen3VlMoe(model) => qwen3_vl_moe::Model::load_prompt_cache(
-                &model.args,
-                directory,
-                expected,
-                prefix_token_ids,
-                stream,
-            )
-            .map(|(cache, manifest)| (ModelCache::Qwen3VlMoe(cache), manifest)),
-            Self::Qwen3VlMoeLayerwise(model) => model
-                .load_prompt_cache(directory, expected, prefix_token_ids, options, stream)
-                .map(|(cache, manifest)| (ModelCache::Qwen3VlMoe(cache), manifest))
-                .map_err(|error| Exception::custom(error.to_string())),
-            Self::Gemma4(model) => gemma4::Model::load_prompt_cache(
-                &model.args,
-                directory,
-                expected,
-                prefix_token_ids,
-                stream,
-            )
-            .map(|(cache, manifest)| (ModelCache::Gemma4(cache), manifest)),
-            Self::Gemma4Layerwise(model) => model
-                .load_prompt_cache(directory, expected, prefix_token_ids, options, stream)
-                .map(|(cache, manifest)| (ModelCache::Gemma4(cache), manifest))
-                .map_err(|error| Exception::custom(error.to_string())),
-            Self::Inkling(model) => inkling::Model::load_prompt_cache(
-                &model.args,
-                directory,
-                expected,
-                prefix_token_ids,
-                stream,
-            )
-            .map(|(cache, manifest)| (ModelCache::Inkling(cache), manifest)),
-            Self::InklingLayerwise(model) => model
-                .load_prompt_cache(directory, expected, prefix_token_ids, options, stream)
-                .map(|(cache, manifest)| (ModelCache::Inkling(cache), manifest))
-                .map_err(|error| Exception::custom(error.to_string())),
-            Self::Lfm2(model) => lfm2::Model::load_prompt_cache(
-                &model.args,
-                directory,
-                expected,
-                prefix_token_ids,
-                stream,
-            )
-            .map(|(cache, manifest)| (ModelCache::Lfm2(cache), manifest)),
-            Self::Lfm2Layerwise(model) => model
-                .load_prompt_cache(directory, expected, prefix_token_ids, options, stream)
-                .map(|(cache, manifest)| (ModelCache::Lfm2(cache), manifest))
-                .map_err(|error| Exception::custom(error.to_string())),
-            Self::NemotronH(model) => nemotron_h::Model::load_prompt_cache(
-                &model.args,
-                directory,
-                expected,
-                prefix_token_ids,
-                stream,
-            )
-            .map(|(cache, manifest)| (ModelCache::NemotronH(cache), manifest)),
-            Self::NemotronHLayerwise(model) => model
-                .load_prompt_cache(directory, expected, prefix_token_ids, options, stream)
-                .map(|(cache, manifest)| (ModelCache::NemotronH(cache), manifest))
-                .map_err(|error| Exception::custom(error.to_string())),
+            Self::Llama(model) => load!(model, ModelCache::Llama),
+            Self::DeepSeekV3(model) => load!(model, ModelCache::DeepSeekV3),
+            Self::GptOss(model) => load!(model, ModelCache::GptOss),
+            Self::DenseQwen(model) => load!(model, ModelCache::KeyValue),
+            Self::KimiLinear(model) => load!(model, ModelCache::KimiLinear),
+            Self::Qwen3Next(model) => load!(model, ModelCache::Qwen3Next),
+            Self::Qwen35(model) => load!(model, ModelCache::Qwen35),
+            Self::Qwen3Vl(model) => load!(model, ModelCache::Qwen3Vl),
+            Self::Qwen3VlMoe(model) => load!(model, ModelCache::Qwen3VlMoe),
+            Self::Gemma4(model) => load!(model, ModelCache::Gemma4),
+            Self::Inkling(model) => load!(model, ModelCache::Inkling),
+            Self::Lfm2(model) => load!(model, ModelCache::Lfm2),
+            Self::NemotronH(model) => load!(model, ModelCache::NemotronH),
         }
     }
 
@@ -1363,7 +692,7 @@ impl Model {
         stream: &Stream,
     ) -> Result<PromptCacheManifest, Exception> {
         match (self, &mut *cache) {
-            (Self::LlamaLayerwise(model), ModelCache::LlamaLayerwise(cache)) => {
+            (Self::Llama(model), ModelCache::Llama(cache)) => {
                 return model
                     .save_prompt_cache(
                         cache,
@@ -1375,7 +704,7 @@ impl Model {
                     )
                     .map_err(|error| Exception::custom(error.to_string()));
             }
-            (Self::DeepSeekV3Layerwise(model), ModelCache::DeepSeekV3(cache)) => {
+            (Self::DeepSeekV3(model), ModelCache::DeepSeekV3(cache)) => {
                 return model
                     .save_prompt_cache(
                         cache,
@@ -1387,7 +716,7 @@ impl Model {
                     )
                     .map_err(|error| Exception::custom(error.to_string()));
             }
-            (Self::GptOssLayerwise(model), ModelCache::GptOss(cache)) => {
+            (Self::GptOss(model), ModelCache::GptOss(cache)) => {
                 return model
                     .save_prompt_cache(
                         cache,
@@ -1399,7 +728,7 @@ impl Model {
                     )
                     .map_err(|error| Exception::custom(error.to_string()));
             }
-            (Self::DenseQwenLayerwise(model), ModelCache::KeyValue(cache)) => {
+            (Self::DenseQwen(model), ModelCache::KeyValue(cache)) => {
                 return model
                     .save_prompt_cache(
                         cache,
@@ -1411,7 +740,7 @@ impl Model {
                     )
                     .map_err(|error| Exception::custom(error.to_string()));
             }
-            (Self::KimiLinearLayerwise(model), ModelCache::KimiLinear(cache)) => {
+            (Self::KimiLinear(model), ModelCache::KimiLinear(cache)) => {
                 return model
                     .save_prompt_cache(
                         cache,
@@ -1423,7 +752,7 @@ impl Model {
                     )
                     .map_err(|error| Exception::custom(error.to_string()));
             }
-            (Self::Lfm2Layerwise(model), ModelCache::Lfm2(cache)) => {
+            (Self::Lfm2(model), ModelCache::Lfm2(cache)) => {
                 return model
                     .save_prompt_cache(
                         cache,
@@ -1435,7 +764,7 @@ impl Model {
                     )
                     .map_err(|error| Exception::custom(error.to_string()));
             }
-            (Self::NemotronHLayerwise(model), ModelCache::NemotronH(cache)) => {
+            (Self::NemotronH(model), ModelCache::NemotronH(cache)) => {
                 return model
                     .save_prompt_cache(
                         cache,
@@ -1447,8 +776,8 @@ impl Model {
                     )
                     .map_err(|error| Exception::custom(error.to_string()));
             }
-            (Self::Qwen3NextLayerwise(model), ModelCache::Qwen3Next(cache))
-            | (Self::Qwen35MoeLayerwise(model), ModelCache::Qwen35Moe(cache)) => {
+            (Self::Qwen3Next(model), ModelCache::Qwen3Next(cache))
+            | (Self::Qwen35(model), ModelCache::Qwen35(cache)) => {
                 return model
                     .save_prompt_cache(
                         cache,
@@ -1460,7 +789,7 @@ impl Model {
                     )
                     .map_err(|error| Exception::custom(error.to_string()));
             }
-            (Self::Gemma4Layerwise(model), ModelCache::Gemma4(cache)) => {
+            (Self::Gemma4(model), ModelCache::Gemma4(cache)) => {
                 return model
                     .save_prompt_cache(
                         cache,
@@ -1472,8 +801,8 @@ impl Model {
                     )
                     .map_err(|error| Exception::custom(error.to_string()));
             }
-            (Self::Qwen3VlLayerwise(model), ModelCache::Qwen3Vl(cache))
-            | (Self::Qwen3VlMoeLayerwise(model), ModelCache::Qwen3VlMoe(cache)) => {
+            (Self::Qwen3Vl(model), ModelCache::Qwen3Vl(cache))
+            | (Self::Qwen3VlMoe(model), ModelCache::Qwen3VlMoe(cache)) => {
                 return model
                     .save_prompt_cache(
                         cache,
@@ -1485,7 +814,7 @@ impl Model {
                     )
                     .map_err(|error| Exception::custom(error.to_string()));
             }
-            (Self::InklingLayerwise(model), ModelCache::Inkling(cache)) => {
+            (Self::Inkling(model), ModelCache::Inkling(cache)) => {
                 return model
                     .save_prompt_cache(
                         cache,
@@ -1501,23 +830,17 @@ impl Model {
         }
         let layer_layout = self.prompt_cache_layer_layout()?;
         let model_family = match self {
-            Self::Llama(_) | Self::LlamaLayerwise(_) => "llama",
-            Self::DeepSeekV3(_) | Self::DeepSeekV3Layerwise(_) => "deepseek_v3",
-            Self::GptOss(_) | Self::GptOssLayerwise(_) => "gpt_oss",
-            Self::DenseQwen(_) | Self::DenseQwenLayerwise(_) => "dense_qwen",
-            Self::KimiLinear(_) | Self::KimiLinearLayerwise(_) => "kimi_linear",
-            Self::Lfm2(_) | Self::Lfm2Layerwise(_) => "lfm2",
-            Self::NemotronH(_) | Self::NemotronHLayerwise(_) => "nemotron_h",
-            Self::Qwen3Next(_)
-            | Self::Qwen3NextLayerwise(_)
-            | Self::Qwen35Moe(_)
-            | Self::Qwen35MoeLayerwise(_) => "qwen_hybrid",
-            Self::Qwen3Vl(_)
-            | Self::Qwen3VlLayerwise(_)
-            | Self::Qwen3VlMoe(_)
-            | Self::Qwen3VlMoeLayerwise(_) => "qwen3_vl",
-            Self::Gemma4(_) | Self::Gemma4Layerwise(_) => "gemma4",
-            Self::Inkling(_) | Self::InklingLayerwise(_) => "inkling",
+            Self::Llama(_) => "llama",
+            Self::DeepSeekV3(_) => "deepseek_v3",
+            Self::GptOss(_) => "gpt_oss",
+            Self::DenseQwen(_) => "dense_qwen",
+            Self::KimiLinear(_) => "kimi_linear",
+            Self::Lfm2(_) => "lfm2",
+            Self::NemotronH(_) => "nemotron_h",
+            Self::Qwen3Next(_) | Self::Qwen35(_) => "qwen_hybrid",
+            Self::Qwen3Vl(_) | Self::Qwen3VlMoe(_) => "qwen3_vl",
+            Self::Gemma4(_) => "gemma4",
+            Self::Inkling(_) => "inkling",
         };
         let layer_count = layer_layout.len();
         let identity = PromptCacheModelIdentity {
@@ -1534,123 +857,7 @@ impl Model {
         validate_prompt_cache_model_identity(&descriptor, &identity)
             .map_err(|error| Exception::custom(error.to_string()))?;
         match (self, cache) {
-            (Self::KimiLinear(_), ModelCache::KimiLinear(cache))
-            | (Self::KimiLinearLayerwise(_), ModelCache::KimiLinear(cache)) => {
-                kimi_linear::Model::save_prompt_cache(
-                    cache,
-                    destination,
-                    descriptor,
-                    prefix_token_ids,
-                    options,
-                )
-            }
-            (Self::Lfm2(_), ModelCache::Lfm2(cache))
-            | (Self::Lfm2Layerwise(_), ModelCache::Lfm2(cache)) => lfm2::Model::save_prompt_cache(
-                cache,
-                destination,
-                descriptor,
-                prefix_token_ids,
-                options,
-                stream,
-            ),
-            (Self::NemotronH(_), ModelCache::NemotronH(cache))
-            | (Self::NemotronHLayerwise(_), ModelCache::NemotronH(cache)) => {
-                nemotron_h::Model::save_prompt_cache(
-                    cache,
-                    destination,
-                    descriptor,
-                    prefix_token_ids,
-                    options,
-                    stream,
-                )
-            }
-            (Self::Qwen3Next(_), ModelCache::Qwen3Next(cache))
-            | (Self::Qwen3NextLayerwise(_), ModelCache::Qwen3Next(cache)) => {
-                qwen3_next::Model::save_prompt_cache(
-                    cache,
-                    destination,
-                    descriptor,
-                    prefix_token_ids,
-                    options,
-                    stream,
-                )
-            }
-            (Self::Qwen35Moe(_), ModelCache::Qwen35Moe(cache))
-            | (Self::Qwen35MoeLayerwise(_), ModelCache::Qwen35Moe(cache)) => {
-                qwen3_5_moe::Model::save_prompt_cache(
-                    cache,
-                    destination,
-                    descriptor,
-                    prefix_token_ids,
-                    options,
-                    stream,
-                )
-            }
-            (Self::Qwen3Vl(_), ModelCache::Qwen3Vl(cache))
-            | (Self::Qwen3VlLayerwise(_), ModelCache::Qwen3Vl(cache)) => {
-                qwen3_vl::Model::save_prompt_cache(
-                    cache,
-                    destination,
-                    descriptor,
-                    prefix_token_ids,
-                    options,
-                    stream,
-                )
-            }
-            (Self::Qwen3VlMoe(_), ModelCache::Qwen3VlMoe(cache))
-            | (Self::Qwen3VlMoeLayerwise(_), ModelCache::Qwen3VlMoe(cache)) => {
-                qwen3_vl_moe::Model::save_prompt_cache(
-                    cache,
-                    destination,
-                    descriptor,
-                    prefix_token_ids,
-                    options,
-                    stream,
-                )
-            }
-            (Self::Gemma4(_), ModelCache::Gemma4(cache))
-            | (Self::Gemma4Layerwise(_), ModelCache::Gemma4(cache)) => {
-                gemma4::Model::save_prompt_cache(
-                    cache,
-                    destination,
-                    descriptor,
-                    prefix_token_ids,
-                    options,
-                    stream,
-                )
-            }
-            (Self::Inkling(_), ModelCache::Inkling(cache))
-            | (Self::InklingLayerwise(_), ModelCache::Inkling(cache)) => {
-                inkling::Model::save_prompt_cache(
-                    cache,
-                    destination,
-                    descriptor,
-                    prefix_token_ids,
-                    options,
-                    stream,
-                )
-            }
-            (Self::DenseQwen(model), ModelCache::KeyValue(cache)) => dense_qwen::save_prompt_cache(
-                &model.args,
-                cache,
-                destination,
-                descriptor,
-                prefix_token_ids,
-                options,
-                stream,
-            ),
-            (Self::DenseQwenLayerwise(model), ModelCache::KeyValue(cache)) => {
-                dense_qwen::save_prompt_cache(
-                    model.args(),
-                    cache,
-                    destination,
-                    descriptor,
-                    prefix_token_ids,
-                    options,
-                    stream,
-                )
-            }
-            (Self::Llama(_) | Self::DenseQwen(_), ModelCache::PagedKeyValue(caches)) => {
+            (Self::DenseQwen(_), ModelCache::PagedKeyValue(caches)) => {
                 for cache in caches.iter_mut().flatten() {
                     cache.finalize()?;
                 }
@@ -1662,15 +869,6 @@ impl Model {
                     .manager()
                     .save_prompt_cache(destination, descriptor, prefix_token_ids, &[], options)
                     .map_err(|error| Exception::custom(error.to_string()))
-            }
-            (Self::LlamaLayerwise(_), ModelCache::LlamaLayerwise(cache)) => cache
-                .save_prompt_cache(destination, descriptor, prefix_token_ids, options)
-                .map_err(|error| Exception::custom(error.to_string())),
-            (Self::DeepSeekV3(_) | Self::DeepSeekV3Layerwise(_), ModelCache::DeepSeekV3(cache)) => {
-                cache.save_prompt_cache(destination, descriptor, prefix_token_ids, options)
-            }
-            (Self::GptOss(_) | Self::GptOssLayerwise(_), ModelCache::GptOss(cache)) => {
-                cache.save_prompt_cache(destination, descriptor, prefix_token_ids, options)
             }
             _ => Err(Exception::custom(
                 "model and cache representations do not match for prompt-cache publication",
@@ -1689,40 +887,19 @@ impl Model {
             (Self::Gemma4(model), ModelCache::Gemma4(cache)) => {
                 model.prefill_input_logits(input, cache, stream)
             }
-            (Self::Gemma4Layerwise(model), ModelCache::Gemma4(cache)) => {
-                model.prefill_input_logits(input, cache, stream)
-            }
             (Self::GptOss(model), ModelCache::GptOss(cache)) => {
-                model.prefill_input_logits(input, cache, stream)
-            }
-            (Self::GptOssLayerwise(model), ModelCache::GptOss(cache)) => {
                 model.prefill_input_logits(input, cache, stream)
             }
             (Self::Inkling(model), ModelCache::Inkling(cache)) => {
                 model.prefill_input_logits(input, cache, stream)
             }
-            (Self::InklingLayerwise(model), ModelCache::Inkling(cache)) => {
-                model.prefill_input_logits(input, cache, stream)
-            }
-            (Self::Llama(model), ModelCache::KeyValue(cache)) => {
-                model.prefill_input_logits(input, cache, stream)
-            }
-            (Self::Llama(model), ModelCache::PagedKeyValue(cache)) => {
-                model.prefill_input_logits(input, cache, stream)
-            }
-            (Self::LlamaLayerwise(model), ModelCache::LlamaLayerwise(cache)) => {
+            (Self::Llama(model), ModelCache::Llama(cache)) => {
                 model.prefill_input_logits(input, cache, stream)
             }
             (Self::Lfm2(model), ModelCache::Lfm2(cache)) => {
                 model.prefill_input_logits(input, cache, stream)
             }
-            (Self::Lfm2Layerwise(model), ModelCache::Lfm2(cache)) => {
-                model.prefill_input_logits(input, cache, stream)
-            }
             (Self::NemotronH(model), ModelCache::NemotronH(cache)) => {
-                model.prefill_input_logits(input, cache, stream)
-            }
-            (Self::NemotronHLayerwise(model), ModelCache::NemotronH(cache)) => {
                 model.prefill_input_logits(input, cache, stream)
             }
             (Self::DenseQwen(model), ModelCache::KeyValue(cache)) => {
@@ -1731,43 +908,22 @@ impl Model {
             (Self::DenseQwen(model), ModelCache::PagedKeyValue(cache)) => {
                 model.prefill_input_logits(input, cache, stream)
             }
-            (Self::DenseQwenLayerwise(model), ModelCache::KeyValue(cache)) => {
-                model.prefill_input_logits(input, cache, stream)
-            }
             (Self::Qwen3Vl(model), ModelCache::Qwen3Vl(cache)) => {
-                model.prefill_input_logits(input, cache, stream)
-            }
-            (Self::Qwen3VlLayerwise(model), ModelCache::Qwen3Vl(cache)) => {
                 model.prefill_input_logits(input, cache, stream)
             }
             (Self::Qwen3VlMoe(model), ModelCache::Qwen3VlMoe(cache)) => {
                 model.prefill_input_logits(input, cache, stream)
             }
-            (Self::Qwen3VlMoeLayerwise(model), ModelCache::Qwen3VlMoe(cache)) => {
-                model.prefill_input_logits(input, cache, stream)
-            }
             (Self::Qwen3Next(model), ModelCache::Qwen3Next(cache)) => {
                 model.prefill_input_logits(input, cache, stream)
             }
-            (Self::Qwen3NextLayerwise(model), ModelCache::Qwen3Next(cache)) => {
-                model.prefill_input_logits(input, cache, stream)
-            }
-            (Self::Qwen35Moe(model), ModelCache::Qwen35Moe(cache)) => {
-                model.prefill_input_logits(input, cache, stream)
-            }
-            (Self::Qwen35MoeLayerwise(model), ModelCache::Qwen35Moe(cache)) => {
+            (Self::Qwen35(model), ModelCache::Qwen35(cache)) => {
                 model.prefill_input_logits(input, cache, stream)
             }
             (Self::DeepSeekV3(model), ModelCache::DeepSeekV3(cache)) => {
                 model.prefill_input_logits(input, cache, stream)
             }
-            (Self::DeepSeekV3Layerwise(model), ModelCache::DeepSeekV3(cache)) => {
-                model.prefill_input_logits(input, cache, stream)
-            }
             (Self::KimiLinear(model), ModelCache::KimiLinear(cache)) => {
-                model.prefill_input_logits(input, cache, stream)
-            }
-            (Self::KimiLinearLayerwise(model), ModelCache::KimiLinear(cache)) => {
                 model.prefill_input_logits(input, cache, stream)
             }
             _ => Err(Exception::custom(
@@ -1802,160 +958,76 @@ impl Model {
         S: Sampler,
     {
         match (self, cache) {
-            (Self::Gemma4(model), ModelCache::Gemma4(cache)) => {
-                ModelGenerate::Gemma4(gemma4::Generate::with_sampler(
+            (Self::Gemma4(model), ModelCache::Gemma4(cache)) => ModelGenerate::Gemma4(
+                crate::architectures::gemma4::layerwise::Generate::with_sampler(
                     model, cache, temp, input, prng_key, stream, sampler,
-                ))
-            }
-            (Self::Gemma4Layerwise(model), ModelCache::Gemma4(cache)) => {
-                ModelGenerate::Gemma4Layerwise(
-                    crate::architectures::gemma4::layerwise::Generate::with_sampler(
-                        model, cache, temp, input, prng_key, stream, sampler,
-                    ),
-                )
-            }
-            (Self::Lfm2(model), ModelCache::Lfm2(cache)) => ModelGenerate::Lfm2(
-                lfm2::Generate::with_sampler(model, cache, temp, input, prng_key, stream, sampler),
+                ),
             ),
-            (Self::Lfm2Layerwise(model), ModelCache::Lfm2(cache)) => ModelGenerate::Lfm2Layerwise(
+            (Self::Lfm2(model), ModelCache::Lfm2(cache)) => ModelGenerate::Lfm2(
                 crate::architectures::lfm2::layerwise::Generate::with_sampler(
                     model, cache, temp, input, prng_key, stream, sampler,
                 ),
             ),
-            (Self::GptOss(model), ModelCache::GptOss(cache)) => {
-                ModelGenerate::GptOss(gpt_oss::Generate::with_sampler(
+            (Self::GptOss(model), ModelCache::GptOss(cache)) => ModelGenerate::GptOss(
+                crate::architectures::gpt_oss::layerwise::Generate::with_sampler(
                     model, cache, temp, input, prng_key, stream, sampler,
-                ))
-            }
-            (Self::GptOssLayerwise(model), ModelCache::GptOss(cache)) => {
-                ModelGenerate::GptOssLayerwise(
-                    crate::architectures::gpt_oss::layerwise::Generate::with_sampler(
-                        model, cache, temp, input, prng_key, stream, sampler,
-                    ),
-                )
-            }
-            (Self::Inkling(model), ModelCache::Inkling(cache)) => {
-                ModelGenerate::Inkling(inkling::Generate::with_sampler(
+                ),
+            ),
+            (Self::Inkling(model), ModelCache::Inkling(cache)) => ModelGenerate::Inkling(
+                crate::architectures::inkling::layerwise::Generate::with_sampler(
                     model, cache, temp, input, prng_key, stream, sampler,
-                ))
-            }
-            (Self::InklingLayerwise(model), ModelCache::Inkling(cache)) => {
-                ModelGenerate::InklingLayerwise(
-                    crate::architectures::inkling::layerwise::Generate::with_sampler(
-                        model, cache, temp, input, prng_key, stream, sampler,
-                    ),
-                )
-            }
-            (Self::Llama(model), ModelCache::KeyValue(cache)) => ModelGenerate::Llama(
-                llama::Generate::with_sampler(model, cache, temp, input, prng_key, stream, sampler),
+                ),
             ),
-            (Self::Llama(model), ModelCache::PagedKeyValue(cache)) => ModelGenerate::LlamaPaged(
-                llama::Generate::with_sampler(model, cache, temp, input, prng_key, stream, sampler),
-            ),
-            (Self::LlamaLayerwise(model), ModelCache::LlamaLayerwise(cache)) => {
-                ModelGenerate::LlamaLayerwise(common::generation::Generate::with_sampler(
+            (Self::Llama(model), ModelCache::Llama(cache)) => {
+                ModelGenerate::Llama(common::generation::Generate::with_sampler(
                     model, cache, temp, input, prng_key, stream, sampler,
                 ))
             }
             (Self::DenseQwen(model), ModelCache::KeyValue(cache)) => {
-                ModelGenerate::DenseQwen(dense_qwen::Generate::with_sampler(
+                ModelGenerate::DenseQwen(common::generation::Generate::with_sampler(
                     model, cache, temp, input, prng_key, stream, sampler,
                 ))
             }
             (Self::DenseQwen(model), ModelCache::PagedKeyValue(cache)) => {
-                ModelGenerate::DenseQwenPaged(dense_qwen::Generate::with_sampler(
+                ModelGenerate::DenseQwenPaged(common::generation::Generate::with_sampler(
                     model, cache, temp, input, prng_key, stream, sampler,
                 ))
             }
-            (Self::DenseQwenLayerwise(model), ModelCache::KeyValue(cache)) => {
-                ModelGenerate::DenseQwenLayerwise(common::generation::Generate::with_sampler(
+            (Self::Qwen3Vl(model), ModelCache::Qwen3Vl(cache)) => ModelGenerate::Qwen3Vl(
+                crate::architectures::qwen::vl::layerwise::Generate::with_sampler(
                     model, cache, temp, input, prng_key, stream, sampler,
-                ))
-            }
-            (Self::Qwen3Vl(model), ModelCache::Qwen3Vl(cache)) => {
-                ModelGenerate::Qwen3Vl(qwen3_vl::Generate::with_sampler(
+                ),
+            ),
+            (Self::Qwen3VlMoe(model), ModelCache::Qwen3VlMoe(cache)) => ModelGenerate::Qwen3VlMoe(
+                crate::architectures::qwen::vl::layerwise::Generate::with_sampler(
                     model, cache, temp, input, prng_key, stream, sampler,
-                ))
-            }
-            (Self::Qwen3VlLayerwise(model), ModelCache::Qwen3Vl(cache)) => {
-                ModelGenerate::Qwen3VlLayerwise(
-                    crate::architectures::qwen::vl::layerwise::Generate::with_sampler(
-                        model, cache, temp, input, prng_key, stream, sampler,
-                    ),
-                )
-            }
-            (Self::Qwen3VlMoe(model), ModelCache::Qwen3VlMoe(cache)) => {
-                ModelGenerate::Qwen3VlMoe(qwen3_vl_moe::Generate::with_sampler(
+                ),
+            ),
+            (Self::NemotronH(model), ModelCache::NemotronH(cache)) => ModelGenerate::NemotronH(
+                crate::architectures::nemotron_h::layerwise::Generate::with_sampler(
                     model, cache, temp, input, prng_key, stream, sampler,
-                ))
-            }
-            (Self::Qwen3VlMoeLayerwise(model), ModelCache::Qwen3VlMoe(cache)) => {
-                ModelGenerate::Qwen3VlMoeLayerwise(
-                    crate::architectures::qwen::vl::layerwise::Generate::with_sampler(
-                        model, cache, temp, input, prng_key, stream, sampler,
-                    ),
-                )
-            }
-            (Self::NemotronH(model), ModelCache::NemotronH(cache)) => {
-                ModelGenerate::NemotronH(nemotron_h::Generate::with_sampler(
+                ),
+            ),
+            (Self::Qwen35(model), ModelCache::Qwen35(cache)) => ModelGenerate::Qwen35(
+                crate::architectures::qwen::hybrid::layerwise::Generate::with_sampler(
                     model, cache, temp, input, prng_key, stream, sampler,
-                ))
-            }
-            (Self::NemotronHLayerwise(model), ModelCache::NemotronH(cache)) => {
-                ModelGenerate::NemotronHLayerwise(
-                    crate::architectures::nemotron_h::layerwise::Generate::with_sampler(
-                        model, cache, temp, input, prng_key, stream, sampler,
-                    ),
-                )
-            }
-            (Self::Qwen35Moe(model), ModelCache::Qwen35Moe(cache)) => {
-                ModelGenerate::Qwen35Moe(qwen3_5_moe::Generate::with_sampler(
+                ),
+            ),
+            (Self::Qwen3Next(model), ModelCache::Qwen3Next(cache)) => ModelGenerate::Qwen3Next(
+                crate::architectures::qwen::hybrid::layerwise::Generate::with_sampler(
                     model, cache, temp, input, prng_key, stream, sampler,
-                ))
-            }
-            (Self::Qwen35MoeLayerwise(model), ModelCache::Qwen35Moe(cache)) => {
-                ModelGenerate::Qwen35MoeLayerwise(
-                    crate::architectures::qwen::hybrid::layerwise::Generate::with_sampler(
-                        model, cache, temp, input, prng_key, stream, sampler,
-                    ),
-                )
-            }
-            (Self::Qwen3Next(model), ModelCache::Qwen3Next(cache)) => {
-                ModelGenerate::Qwen3Next(qwen3_next::Generate::with_sampler(
+                ),
+            ),
+            (Self::DeepSeekV3(model), ModelCache::DeepSeekV3(cache)) => ModelGenerate::DeepSeekV3(
+                crate::architectures::deepseek_v3::layerwise::Generate::with_sampler(
                     model, cache, temp, input, prng_key, stream, sampler,
-                ))
-            }
-            (Self::Qwen3NextLayerwise(model), ModelCache::Qwen3Next(cache)) => {
-                ModelGenerate::Qwen3NextLayerwise(
-                    crate::architectures::qwen::hybrid::layerwise::Generate::with_sampler(
-                        model, cache, temp, input, prng_key, stream, sampler,
-                    ),
-                )
-            }
-            (Self::DeepSeekV3(model), ModelCache::DeepSeekV3(cache)) => {
-                ModelGenerate::DeepSeekV3(deepseek_v3::Generate::with_sampler(
+                ),
+            ),
+            (Self::KimiLinear(model), ModelCache::KimiLinear(cache)) => ModelGenerate::KimiLinear(
+                crate::architectures::kimi_linear::layerwise::Generate::with_sampler(
                     model, cache, temp, input, prng_key, stream, sampler,
-                ))
-            }
-            (Self::DeepSeekV3Layerwise(model), ModelCache::DeepSeekV3(cache)) => {
-                ModelGenerate::DeepSeekV3Layerwise(
-                    crate::architectures::deepseek_v3::layerwise::Generate::with_sampler(
-                        model, cache, temp, input, prng_key, stream, sampler,
-                    ),
-                )
-            }
-            (Self::KimiLinear(model), ModelCache::KimiLinear(cache)) => {
-                ModelGenerate::KimiLinear(kimi_linear::Generate::with_sampler(
-                    model, cache, temp, input, prng_key, stream, sampler,
-                ))
-            }
-            (Self::KimiLinearLayerwise(model), ModelCache::KimiLinear(cache)) => {
-                ModelGenerate::KimiLinearLayerwise(
-                    crate::architectures::kimi_linear::layerwise::Generate::with_sampler(
-                        model, cache, temp, input, prng_key, stream, sampler,
-                    ),
-                )
-            }
+                ),
+            ),
             _ => panic!("model cache type does not match model kind"),
         }
     }
@@ -1975,7 +1047,7 @@ pub enum ModelCache {
     /// Per-layer key/value caches whose bounds follow the model schedule.
     KeyValue(Vec<Option<ConcatKeyValueCache>>),
     /// Unified Llama cache used by bounded layer execution.
-    LlamaLayerwise(crate::architectures::llama::layerwise::LlamaCache),
+    Llama(crate::architectures::llama::layerwise::LlamaCache),
     /// Qwen3-VL key/value cache and multimodal position state.
     Qwen3Vl(qwen3_vl::Cache),
     /// Qwen3-VL-MoE key/value cache and multimodal position state.
@@ -1989,7 +1061,7 @@ pub enum ModelCache {
     /// Heterogeneous Kimi Linear KDA/MLA cache.
     KimiLinear(kimi_linear::Cache),
     /// Heterogeneous Qwen3.5 MoE cache.
-    Qwen35Moe(qwen3_5_moe::Cache),
+    Qwen35(qwen3_5::Cache),
     /// Heterogeneous Qwen3-Next cache.
     Qwen3Next(qwen3_next::Cache),
 }
@@ -2070,12 +1142,14 @@ impl ModelCache {
                 .next()
                 .map(PagedKeyValueCache::report)
                 .transpose(),
-            Self::LlamaLayerwise(cache) => cache
+            Self::Llama(cache) => cache
                 .residency_report()
                 .map_err(|error| Exception::custom(error.to_string())),
             Self::DeepSeekV3(cache) => cache.residency_report(),
             Self::GptOss(cache) => cache.residency_report(),
             Self::Inkling(cache) => cache.residency_report(),
+            Self::KimiLinear(cache) => cache.residency_report(),
+            Self::NemotronH(cache) => cache.residency_report(),
             _ => Ok(None),
         }
     }
@@ -2087,31 +1161,17 @@ where
     S: Sampler,
 {
     /// DeepSeek-V3/R1 generation iterator.
-    DeepSeekV3(deepseek_v3::Generate<'a, S>),
-    /// DeepSeek-V3/R1 generation using bounded layer execution.
-    DeepSeekV3Layerwise(crate::architectures::deepseek_v3::layerwise::Generate<'a, S>),
+    DeepSeekV3(crate::architectures::deepseek_v3::layerwise::Generate<'a, S>),
     /// Gemma 4 generation iterator.
-    Gemma4(gemma4::Generate<'a, S>),
-    /// Gemma 4 multimodal-prefill generation using bounded layer execution.
-    Gemma4Layerwise(crate::architectures::gemma4::layerwise::Generate<'a, S>),
+    Gemma4(crate::architectures::gemma4::layerwise::Generate<'a, S>),
     /// GPT-OSS generation iterator.
-    GptOss(gpt_oss::Generate<'a, S>),
-    /// GPT-OSS generation using bounded layer execution.
-    GptOssLayerwise(crate::architectures::gpt_oss::layerwise::Generate<'a, S>),
+    GptOss(crate::architectures::gpt_oss::layerwise::Generate<'a, S>),
     /// Inkling generation iterator.
-    Inkling(inkling::Generate<'a, S>),
-    /// Inkling multimodal-prefill generation using bounded layer execution.
-    InklingLayerwise(crate::architectures::inkling::layerwise::Generate<'a, S>),
+    Inkling(crate::architectures::inkling::layerwise::Generate<'a, S>),
     /// Kimi Linear generation iterator.
-    KimiLinear(kimi_linear::Generate<'a, S>),
-    /// Kimi Linear generation using bounded layer execution.
-    KimiLinearLayerwise(crate::architectures::kimi_linear::layerwise::Generate<'a, S>),
+    KimiLinear(crate::architectures::kimi_linear::layerwise::Generate<'a, S>),
     /// Llama generation iterator.
-    Llama(llama::Generate<'a, ConcatKeyValueCache, S>),
-    /// Llama-compatible generation with block-addressable cache residency.
-    LlamaPaged(llama::Generate<'a, PagedKeyValueCache, S>),
-    /// Llama-compatible generation using bounded layer execution.
-    LlamaLayerwise(
+    Llama(
         common::generation::Generate<
             'a,
             crate::architectures::llama::layerwise::LlamaModel,
@@ -2120,11 +1180,7 @@ where
         >,
     ),
     /// Dense-Qwen generation iterator.
-    DenseQwen(dense_qwen::Generate<'a, ConcatKeyValueCache, S>),
-    /// Dense-Qwen generation with paged key/value cache residency.
-    DenseQwenPaged(dense_qwen::Generate<'a, PagedKeyValueCache, S>),
-    /// Dense-Qwen generation using bounded layer execution.
-    DenseQwenLayerwise(
+    DenseQwen(
         common::generation::Generate<
             'a,
             crate::architectures::qwen::dense::layerwise::LayerwiseDecoder,
@@ -2132,30 +1188,27 @@ where
             S,
         >,
     ),
+    /// Dense-Qwen generation using a paged KV cache.
+    DenseQwenPaged(
+        common::generation::Generate<
+            'a,
+            crate::architectures::qwen::dense::layerwise::LayerwiseDecoder,
+            Vec<Option<PagedKeyValueCache>>,
+            S,
+        >,
+    ),
     /// Qwen3-VL generation iterator.
-    Qwen3Vl(qwen3_vl::Generate<'a, S>),
-    /// Qwen3-VL generation using vision/text bounded layer execution.
-    Qwen3VlLayerwise(crate::architectures::qwen::vl::layerwise::Generate<'a, S>),
+    Qwen3Vl(crate::architectures::qwen::vl::layerwise::Generate<'a, S>),
     /// Qwen3-VL-MoE generation iterator.
-    Qwen3VlMoe(qwen3_vl_moe::Generate<'a, S>),
-    /// Qwen3-VL-MoE generation using vision/text bounded layer execution.
-    Qwen3VlMoeLayerwise(crate::architectures::qwen::vl::layerwise::Generate<'a, S>),
+    Qwen3VlMoe(crate::architectures::qwen::vl::layerwise::Generate<'a, S>),
     /// Nemotron-H generation iterator.
-    NemotronH(nemotron_h::Generate<'a, S>),
-    /// Nemotron-H generation using bounded layer execution.
-    NemotronHLayerwise(crate::architectures::nemotron_h::layerwise::Generate<'a, S>),
+    NemotronH(crate::architectures::nemotron_h::layerwise::Generate<'a, S>),
     /// LFM2 generation iterator.
-    Lfm2(lfm2::Generate<'a, S>),
-    /// LFM2 generation using bounded layer execution.
-    Lfm2Layerwise(crate::architectures::lfm2::layerwise::Generate<'a, S>),
+    Lfm2(crate::architectures::lfm2::layerwise::Generate<'a, S>),
     /// Qwen3.5 MoE generation iterator.
-    Qwen35Moe(qwen3_5_moe::Generate<'a, S>),
-    /// Qwen3.5 multimodal-prefill generation using shared bounded layer execution.
-    Qwen35MoeLayerwise(crate::architectures::qwen::hybrid::layerwise::Generate<'a, S>),
+    Qwen35(crate::architectures::qwen::hybrid::layerwise::Generate<'a, S>),
     /// Qwen3-Next generation iterator.
-    Qwen3Next(qwen3_next::Generate<'a, S>),
-    /// Qwen3-Next generation using shared hybrid bounded layer execution.
-    Qwen3NextLayerwise(crate::architectures::qwen::hybrid::layerwise::Generate<'a, S>),
+    Qwen3Next(crate::architectures::qwen::hybrid::layerwise::Generate<'a, S>),
 }
 
 impl<S> ModelGenerate<'_, S>
@@ -2166,33 +1219,19 @@ where
     pub fn sampler_mut(&mut self) -> &mut S {
         match self {
             Self::DeepSeekV3(generate) => generate.sampler_mut(),
-            Self::DeepSeekV3Layerwise(generate) => generate.sampler_mut(),
             Self::Gemma4(generate) => generate.sampler_mut(),
-            Self::Gemma4Layerwise(generate) => generate.sampler_mut(),
             Self::GptOss(generate) => generate.sampler_mut(),
-            Self::GptOssLayerwise(generate) => generate.sampler_mut(),
             Self::Inkling(generate) => generate.sampler_mut(),
-            Self::InklingLayerwise(generate) => generate.sampler_mut(),
             Self::KimiLinear(generate) => generate.sampler_mut(),
-            Self::KimiLinearLayerwise(generate) => generate.sampler_mut(),
             Self::Llama(generate) => generate.sampler_mut(),
-            Self::LlamaPaged(generate) => generate.sampler_mut(),
-            Self::LlamaLayerwise(generate) => generate.sampler_mut(),
             Self::Lfm2(generate) => generate.sampler_mut(),
-            Self::Lfm2Layerwise(generate) => generate.sampler_mut(),
             Self::NemotronH(generate) => generate.sampler_mut(),
-            Self::NemotronHLayerwise(generate) => generate.sampler_mut(),
-            Self::DenseQwen(generate) => generate.sampler_mut(),
             Self::DenseQwenPaged(generate) => generate.sampler_mut(),
-            Self::DenseQwenLayerwise(generate) => generate.sampler_mut(),
+            Self::DenseQwen(generate) => generate.sampler_mut(),
             Self::Qwen3Vl(generate) => generate.sampler_mut(),
-            Self::Qwen3VlLayerwise(generate) => generate.sampler_mut(),
             Self::Qwen3VlMoe(generate) => generate.sampler_mut(),
-            Self::Qwen3VlMoeLayerwise(generate) => generate.sampler_mut(),
-            Self::Qwen35Moe(generate) => generate.sampler_mut(),
-            Self::Qwen35MoeLayerwise(generate) => generate.sampler_mut(),
+            Self::Qwen35(generate) => generate.sampler_mut(),
             Self::Qwen3Next(generate) => generate.sampler_mut(),
-            Self::Qwen3NextLayerwise(generate) => generate.sampler_mut(),
         }
     }
 }
@@ -2206,33 +1245,19 @@ where
     fn next(&mut self) -> Option<Self::Item> {
         match self {
             Self::DeepSeekV3(generate) => generate.next(),
-            Self::DeepSeekV3Layerwise(generate) => generate.next(),
             Self::Gemma4(generate) => generate.next(),
-            Self::Gemma4Layerwise(generate) => generate.next(),
             Self::GptOss(generate) => generate.next(),
-            Self::GptOssLayerwise(generate) => generate.next(),
             Self::Inkling(generate) => generate.next(),
-            Self::InklingLayerwise(generate) => generate.next(),
             Self::KimiLinear(generate) => generate.next(),
-            Self::KimiLinearLayerwise(generate) => generate.next(),
             Self::Llama(generate) => generate.next(),
-            Self::LlamaPaged(generate) => generate.next(),
-            Self::LlamaLayerwise(generate) => generate.next(),
             Self::Lfm2(generate) => generate.next(),
-            Self::Lfm2Layerwise(generate) => generate.next(),
             Self::NemotronH(generate) => generate.next(),
-            Self::NemotronHLayerwise(generate) => generate.next(),
-            Self::DenseQwen(generate) => generate.next(),
             Self::DenseQwenPaged(generate) => generate.next(),
-            Self::DenseQwenLayerwise(generate) => generate.next(),
+            Self::DenseQwen(generate) => generate.next(),
             Self::Qwen3Vl(generate) => generate.next(),
-            Self::Qwen3VlLayerwise(generate) => generate.next(),
             Self::Qwen3VlMoe(generate) => generate.next(),
-            Self::Qwen3VlMoeLayerwise(generate) => generate.next(),
-            Self::Qwen35Moe(generate) => generate.next(),
-            Self::Qwen35MoeLayerwise(generate) => generate.next(),
+            Self::Qwen35(generate) => generate.next(),
             Self::Qwen3Next(generate) => generate.next(),
-            Self::Qwen3NextLayerwise(generate) => generate.next(),
         }
     }
 }

@@ -4,7 +4,10 @@ use safemlx::{
     module::ModuleParameters, ops::indexing::TryIndexOp, Array, Device, DeviceType,
     ExecutionContext,
 };
-use safemlx_lm::architectures::moshi::model as moshi;
+use safemlx_lm::{
+    api::realtime::{generate_encoded_greedy, load_model as load_realtime_model},
+    architectures::moshi::model as moshi,
+};
 
 fn main() -> anyhow::Result<()> {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
@@ -130,8 +133,12 @@ fn main() -> anyhow::Result<()> {
         }
     }
 
-    let generated =
-        model.generate_encoded_greedy(required(&fixture, "generation.input_audio")?, stream)?;
+    let mut model = load_realtime_model(&model_dir, stream, cpu.stream())?;
+    let generated = generate_encoded_greedy(
+        &mut model,
+        required(&fixture, "generation.input_audio")?,
+        stream,
+    )?;
     compare_tokens(
         &generated.text_tokens,
         required(&fixture, "generation.expected_text")?,

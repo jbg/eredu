@@ -353,10 +353,14 @@ impl StrictLoadConfig {
         let mut expanded = Vec::with_capacity(candidates.len() * 2);
         for candidate in candidates {
             expanded.push(candidate.clone());
-            if let Some(inner_key) = candidate.strip_suffix(".weight") {
+            if candidate == "weight" {
+                expanded.push("inner.weight".to_string());
+            } else if let Some(inner_key) = candidate.strip_suffix(".weight") {
                 expanded.push(format!("{inner_key}.inner.weight"));
             }
-            if let Some(inner_key) = candidate.strip_suffix(".bias") {
+            if candidate == "bias" {
+                expanded.push("inner.bias".to_string());
+            } else if let Some(inner_key) = candidate.strip_suffix(".bias") {
                 expanded.push(format!("{inner_key}.inner.bias"));
             }
             if let Some(rest) = candidate.strip_prefix("model.language_model.embed_tokens.") {
@@ -617,20 +621,27 @@ pub(crate) fn load_array_quantized_strict(
 ) -> Result<(), Error> {
     {
         let target = config.candidates(&key).into_iter().find_map(|candidate| {
-            let (prefix, weight_key, underscore_companions) =
-                if let Some(prefix) = candidate.strip_suffix(".inner.weight") {
-                    (prefix.to_string(), candidate, false)
-                } else if let Some(prefix) = candidate.strip_suffix(".weight") {
-                    (prefix.to_string(), candidate, false)
-                } else {
-                    (candidate.clone(), candidate, true)
-                };
-            let scales_key = if underscore_companions {
+            let (prefix, weight_key, underscore_companions) = if candidate == "inner.weight" {
+                (String::new(), candidate, false)
+            } else if let Some(prefix) = candidate.strip_suffix(".inner.weight") {
+                (prefix.to_string(), candidate, false)
+            } else if let Some(prefix) = candidate.strip_suffix(".weight") {
+                (prefix.to_string(), candidate, false)
+            } else if candidate == "weight" {
+                (String::new(), candidate, false)
+            } else {
+                (candidate.clone(), candidate, true)
+            };
+            let scales_key = if prefix.is_empty() {
+                "scales".to_string()
+            } else if underscore_companions {
                 format!("{prefix}_scales")
             } else {
                 format!("{prefix}.scales")
             };
-            let biases_key = if underscore_companions {
+            let biases_key = if prefix.is_empty() {
+                "biases".to_string()
+            } else if underscore_companions {
                 format!("{prefix}_biases")
             } else {
                 format!("{prefix}.biases")

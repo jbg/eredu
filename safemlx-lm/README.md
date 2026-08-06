@@ -51,13 +51,19 @@ contain only remote tensors remain untouched. Cache hits and memory-mapped page
 faults are not reported as known physical disk transfers because logical
 materialization and storage I/O are different measurements.
 
-`ModelLoadOptions` selects either existing eager execution or the generic
-layerwise engine. DeepSeek-V3/R1, Gemma 4, Inkling, Kimi Linear, Llama,
+`ModelLoadOptions` selects a parameter-residency policy inside one generalized
+execution engine. `FullyResident`, `LayerwiseHost`, and `DenseDiskStream` all
+return the same architecture variant and use the same cache, forward,
+generation, observation, and capability dispatch. DeepSeek-V3/R1, Gemma 4,
+Inkling, Kimi Linear, Llama,
 Mistral, GPT-OSS, LFM2/LFM2.5, Nemotron-H, Qwen2/Qwen2.5 text, Qwen3, Qwen3-Next, Qwen3-VL,
 Qwen3-VL-MoE, and Qwen3.5 safetensors have registered adapters,
 including dense and MoE variants. Moshi and PersonaPlex use the same engine with
 independent temporal-layer and depth-codebook-slice windows. A requested family without a registered adapter returns
-a specific error and never silently falls back to fully resident execution.
+a specific error and never silently falls back to a separate resident decoder.
+
+Residency is an internal backend choice and is not part of public model
+identity.
 
 ## Offload planning and observability
 
@@ -242,12 +248,8 @@ of `N` includes the current token, so a device cache retains at most `N - 1`
 past states between calls. Runtime-state estimates count full layers as
 context-growing and group bounded layers by exact window.
 
-This is an intentional breaking API change. Normalized `ModelArgs` no longer
-implements `Deserialize` or exposes `sliding_window`; JSON callers use
-`model_args_from_config_value` and execution callers inspect
-`attention_schedule`. `ResidentModel::sliding_window`, `new_sliding_cache`, the
-`LlamaCache::Standard`/`Sliding` split, and architecture-erased
-`ModelCache::SlidingKeyValue`/`ModelGenerate::LlamaSliding` routes were removed.
+JSON callers use `model_args_from_config_value`, and execution callers inspect
+`attention_schedule`.
 Prompt-cache schema v4 persists the complete ordered schedule, exact per-layer
 windows, tensor geometry, and retained token intervals. Save/reload therefore
 supports non-uniform and distinct-window schedules without weakening cache
@@ -282,18 +284,16 @@ no pattern applies to every layer; no window and no enabled pattern means all
 full. Enabled layers without a window, invalid windows, length mismatches, and
 non-Boolean encodings fail during the shared inspection/load parser.
 
-This intentionally replaces the public dense-Qwen `use_sliding_window`,
-`sliding_window`, and `max_window_layers` fields and removes
-`sliding_window_for_layer`. Callers construct or query `attention_schedule`
-directly. Ordered policies are included in architecture and prompt-cache
+Callers construct or query `attention_schedule` directly. Ordered policies are included in architecture and prompt-cache
 fingerprints. Normal and paged caches support every schedule; schema-v4
 persisted prompt caches preserve arbitrary ordered full/sliding policies,
 distinct per-layer windows, and each layer's retained token interval. Qwen2
-safetensors tensor parallelism uses the generalized family
-adapter; pipeline parallelism remains unsupported.
+SafeTensors and GGUF tensor parallelism use the generalized family adapter.
+Pure pipeline parallelism supports Qwen2/Qwen2.5, Qwen3, and Qwen3 MoE
+SafeTensors and GGUF through the same canonical binding, schedule, and
+routed-expert plans.
 
-The former public `architectures::qwen::qwen3` module was removed. Dense Qwen
-callers use `architectures::qwen::dense`; architecture identity comes from
+Dense Qwen callers use `architectures::qwen::dense`; architecture identity comes from
 validated checkpoint metadata rather than the module selected by the caller.
 
 ## GPT-OSS weight residency
@@ -315,9 +315,13 @@ all consume the canonical schedule. Arbitrary ordering and internally distinct
 windows are supported; state reports group sliding layers by exact window and
 full layers grow with context. Prompt-cache schema v4 persists the complete
 ordered schedule, exact per-layer windows, tensor geometry, and retained token
-intervals. The normalized `ModelArgs` removed raw `layer_types` and
-`sliding_window` and no longer implements `Deserialize`; JSON callers use
-`model_args_from_config_value`.
+intervals. JSON callers use `model_args_from_config_value`.
+
+Pure GPT-OSS pipeline stages support SafeTensors and canonical `gpt-oss` GGUF,
+including native MXFP4 expert bindings, fully resident or dense disk-streamed
+local layers, ordinary/paged/persisted caches, and rank-synchronized
+generation. Fully resident stages may MXFP4-quantize eligible dense matrices;
+affine transcoding and streamed load-time requantization fail closed.
 
 ## Gemma 4 and assistant weight residency
 
@@ -347,17 +351,24 @@ groups context-growing state by each exact KV-head/head-dimension geometry.
 Shared layers have no ordinary cache allocation; publishing layers retain the
 full state consumed by matching shared layers.
 
-The migration removes public `LayerType`, normalized `layer_types` and
-`sliding_window` fields, scalar normalized head/KV/shared-layer, MLP-width, and
-MoE-enable fields, and fallback `layer_type` queries. `ModelArgs::layer_schedule`
-and `ModelArgs::layer_policy` are the only normalized layer APIs. `ModelArgs` and
-`Gemma4AssistantConfig` are no longer directly deserializable; use
+`ModelArgs::layer_schedule` and `ModelArgs::layer_policy` are the normalized
+layer APIs. JSON callers use
 `model_args_from_config_value` or `gemma4_assistant_config_from_value`.
 `TransformerBlock::layer_policy`, `ModelInput::sliding_masks`, and
-`CacheStateStrategy::SharedFullKv::sliding_attention` are the replacement APIs.
+`CacheStateStrategy::SharedFullKv::sliding_attention` expose the execution and
+reporting state.
 The complete ordered policy list participates in architecture identity.
 Gemma prompt-cache persistence and safetensors tensor parallelism use the
-family layerwise adapter. Gemma pipeline parallelism remains unsupported.
+family layerwise adapter. Tensor-parallel text, vision, and audio layers consume
+planner-authored semantic ranges: complete GQA groups, dense and routed
+intermediates, vision patch/position channels, audio heads and feed-forward
+widths, light-convolution channels, and modality input/output widths may be
+uneven across ranks. Packed expert companions remain on the same aligned range,
+and prompt-cache identity records the actual rank-local KV geometry. Gemma
+text pipeline stages use dependency-safe contiguous placement: a shared-KV
+consumer is always colocated with its publisher. Per-layer residual inputs are
+prepared once on the ingress stage and relayed as typed immutable auxiliary
+state. Image/audio encoder execution is not part of the decoder pipeline API.
 
 ## LFM2/LFM2.5 weight residency
 
@@ -367,7 +378,7 @@ before a block lease is released. Public per-expert `w1`/`w2`/`w3` tensors are
 concatenated and stacked into runtime expert banks one layer at a time on the
 host; already-packed checkpoint representations load directly.
 
-LFM2's authoritative `LayerSchedule<LayerPolicy>` now carries both independent
+LFM2's authoritative `LayerSchedule<LayerPolicy>` carries both independent
 decisions for every decoder layer: `OperatorPolicy` selects convolution or
 self-attention, and `FeedForwardPolicy` selects dense SwiGLU or sparse MoE. HF
 `num_dense_layers` and GGUF `leading_dense_block_count` are validated
@@ -375,18 +386,17 @@ source-format inputs used once to construct the schedule; they are not retained
 in normalized `ModelArgs`. Arbitrary internal dense/MoE ordering is supported by
 resident, layerwise, dense-stream, sparse-expert, structural, and
 expert-parallel paths. `ModelArgs::layer_policy` and
-`ModelArgs::layer_schedule_fingerprint` replace the removed model-wide
-`num_dense_layers`, `is_moe`, and operator-only `LayerPolicy` API.
-Persisted LFM2 prompt caches remain unsupported, but loaded-model cache identity
-includes the complete ordered operator/feed-forward schedule.
+`ModelArgs::layer_schedule_fingerprint` expose the normalized topology. Persisted
+LFM2 prompt caches record ordered convolution history and attention KV state.
+Tensor-parallel identities preserve fixed convolution state while deriving each
+attention layer's exact rank-local KV-head count from the parameter planner.
 
 LFM2 uses the generic `LayerSchedule<P>` runtime geometry. Hugging Face
 `layer_types` and GGUF per-layer KV-head metadata
 normalize once into `LayerSchedule<architectures::lfm2::model::LayerPolicy>`, whose entries are
 `SelfAttention(AttentionPolicy::Full)` or `CausalConvolution`. Resident,
 layerwise, structural-admission, cache-validation, and state-accounting paths
-consume that schedule directly. Normalized `ModelArgs` no longer implements
-`Deserialize` or exposes raw `layer_types`; callers with a JSON value use
+consume that schedule directly. Callers with a JSON value use
 `architectures::lfm2::model::model_args_from_config_value`.
 
 ## DeepSeek-V3/R1 weight residency
@@ -409,8 +419,7 @@ schedule with every later layer sparse. Invalid counts, negative thresholds,
 thresholds beyond decoder depth, and non-positive frequencies fail in the parser
 shared by inspection and loading.
 
-Normalized `ModelArgs` no longer implements `Deserialize` or exposes the raw
-threshold fields or `is_moe_layer`; JSON callers use
+JSON callers use
 `deepseek_v3::model_args_from_config_value`, then query `layer_schedule` or
 `layer_policy`. Resident, layerwise-host, dense-stream, structural-admission,
 sparse-expert, tensor/pipeline/expert-parallel, and cache-identity paths use the
@@ -425,10 +434,7 @@ Kimi Linear normalizes its two independent decoder choices into
 `LayerSchedule<architectures::kimi_linear::model::LayerPolicy>`. Every entry
 contains `AttentionKind::{Kda, Mla}` and
 `FeedForwardPolicy::{Dense, SparseMoe}`. The normalized `ModelArgs` exposes the
-ordered `layer_schedule` and shared `kda_config`; it no longer implements
-`Deserialize` or exposes raw KDA/MLA index lists, `first_k_dense_replace`,
-`moe_layer_freq`, or the fallback queries `is_kda_layer` and `is_moe_layer`.
-JSON callers use
+ordered `layer_schedule` and shared `kda_config`. JSON callers use
 `architectures::kimi_linear::model::model_args_from_config_value` and query
 `ModelArgs::layer_policy` or `layer_schedule`.
 
@@ -449,9 +455,9 @@ bounded KDA recurrent state or context-growing compressed MLA state per exact
 entry, and the complete ordered attention/feed-forward policy participates in
 architecture identity. Internally constructed schedules may use arbitrary
 KDA/MLA and dense/MoE combinations even though current checkpoint formats have
-more constrained feed-forward metadata. Paged and persisted prompt caches
-remain unsupported because the persistence schema does not represent KDA
-convolution/recurrent state mixed with compressed MLA state.
+more constrained feed-forward metadata. Paged and persisted prompt caches use
+the heterogeneous state schema to represent KDA convolution/recurrent state
+alongside compressed MLA state.
 
 ## Inkling weight residency
 
@@ -483,15 +489,16 @@ projection/fold layers use an independent vision window. Typed prompts may
 interleave text, discrete audio, precomputed media embeddings, and image
 patches.
 
-Normalized Inkling `ModelArgs`/`TextArgs` are no longer directly deserializable
-and no longer expose raw layer lists, thresholds, or the model-wide window.
 JSON callers use `inkling::model::model_args_from_config_value` and query
-`TextArgs::layer_policy` or `layer_schedule`; the old `is_local` and `is_dense`
-queries were removed. The complete ordered schedule participates in
-architecture identity. Persisted Inkling prompt caches remain unsupported
-because the schema does not encode its multimodal prefix and short-convolution
-state. Tensor and pipeline parallel Inkling remain unsupported; supported
-expert parallelism derives sparse layers and cache policies from the schedule.
+`TextArgs::layer_policy` or `layer_schedule`. The complete ordered schedule participates in
+architecture identity. Inkling prompt caches persist rank-local KV state and
+all four short-convolution histories using the shared heterogeneous-state
+schema. Tensor parallelism covers the text decoder, dMel vocabulary, and hMLP
+folded inputs. Pure text pipeline stages support SafeTensors and canonical
+`inkling` GGUF through the shared KV-plus-fixed-state cache descriptor, with
+fully resident or dense disk-streamed local layers. Image/audio ingress must
+be folded before decoder pipeline execution. Expert parallelism derives sparse
+layers and cache policies from the same schedule.
 
 ## Nemotron-H weight residency
 
@@ -508,14 +515,18 @@ attention entry. Resident, bounded, structural, expert-parallel, cache,
 fingerprint, and memory-accounting paths consume only this schedule. Full
 attention uses growing KV state, sliding attention retains its exact window,
 Mamba uses bounded convolution/SSM state, and MLP/MoE entries are stateless.
-The old `LayerBlockType`, raw normalized `hybrid_override_pattern` and
-`sliding_window` fields, and reparsing query methods were removed. JSON callers
-use `nemotron_h::model_args_from_config_value`. Persisted Nemotron-H prompt
-caches remain unsupported because mixed recurrent/KV state is not represented
-by the persistence schema.
-The public `CacheStateStrategy::HybridRecurrent` report now separates
+JSON callers use `nemotron_h::model_args_from_config_value`. Persisted Nemotron-H prompt
+caches store ordered Mamba convolution/SSM tensors, attention KV, and explicit
+stateless MLP/MoE entries. Tensor-parallel manifests use the parameter planner's
+exact rank-local Mamba head/group and KV-head geometry, so uneven partitions
+save and reopen without scalar division. `CacheResidencyPolicy::Paged` pages
+only the context-growing or sliding-window attention blocks; bounded Mamba
+convolution/SSM state stays resident. Resident, layerwise-host, dense-stream,
+tensor-parallel, and replicated expert-parallel execution all use this same
+heterogeneous cache, residency report, and lazy prompt-cache reopen path.
+The public `CacheStateStrategy::HybridRecurrent` report separates
 `full_attention_layers` from exact `sliding_attention` window groups alongside
-`recurrent_layers`; its old aggregate `attention_layers` field was removed.
+`recurrent_layers`.
 
 ## Qwen hybrid weight residency
 
@@ -526,11 +537,9 @@ into
 `LayerSchedule<architectures::qwen::hybrid::qwen3_5::LayerPolicy>`. Entries are
 `LinearAttention` or `SelfAttention(AttentionPolicy::Full)`; resident,
 layerwise, structural-admission, cache-validation, and state-accounting paths
-consume only this schedule. The old `LayerType`, `ModelArgs.layer_types`, and
-fallback-returning `ModelArgs::layer_type` APIs are removed. Normalized
-`ModelArgs` is no longer directly deserializable; JSON callers use
+consume only this schedule. JSON callers use
 `model_args_from_config_value` from the Qwen3.5 or Qwen3-Next module.
-`TransformerBlock::layer_type` is now `layer_policy`, and `Cache::new` returns a
+`TransformerBlock::layer_policy` selects execution, and `Cache::new` returns a
 validation result.
 
 Qwen3-Next fused QKVZ/BA tensors are selected into runtime
@@ -551,11 +560,11 @@ preserves the declared DeepStack source order; Qwen3.5 maps its positive
 Invalid, duplicate, or out-of-range layer indexes fail before materialization,
 and Qwen3-VL rejects Qwen3.5-only window fields. Resident execution, the
 independent bounded vision-block group, structural admission, name translation,
-and conservative tower-workspace accounting consume only the schedule. The old
-normalized vision `depth`, `fullatt_block_indexes`, and
-`deepstack_visual_indexes` fields have been removed. Persisted Qwen3-VL prompt
-caches remain unsupported because the schema does not capture multimodal
-prefill state.
+and conservative tower-workspace accounting consume only the schedule. Persisted Qwen3-VL prompt
+caches store the text KV state together with the multimodal RoPE position delta;
+callers must include the processed media and processor settings in the prefix
+content fingerprint. Tensor-parallel manifests use the text planner's exact
+per-layer rank-local KV-head geometry and record rank ownership on every block.
 
 ## Layerwise safetensors coverage
 
@@ -752,12 +761,14 @@ attention-affecting unsupported YaRN metadata are rejected during the same
 catalog inspection used by loading. Fully resident dense-Qwen models support
 normal, paged, and schema-v4 persisted prompt caches for full or mixed
 Qwen2/Qwen2.5 schedules. The normalized schedule can carry distinct windows,
-and all-full Qwen3 uses the same persistence route. Qwen safetensors tensor
-parallelism uses the generalized family adapter; GGUF tensor parallelism and
-pipeline parallelism remain unsupported independently of prompt-cache schema.
+and all-full Qwen3 uses the same persistence route. Qwen SafeTensors and GGUF
+tensor parallelism use the generalized family adapter. Pure dense-Qwen
+pipeline stages support Qwen2/Qwen2.5, Qwen3, and Qwen3 MoE in both formats
+with the same schedule, prompt-cache identity, and direct or derived
+layer-binding plan.
 
-Kimi Linear GGUF accepts modern split `attn_k_b`/`attn_v_b` and legacy
-unsplit `attn_kv_b`, modern and singleton-ranked convolution tensors, dense
+Kimi Linear GGUF accepts split `attn_k_b`/`attn_v_b` and combined
+`attn_kv_b` projections, vector and singleton-ranked convolution tensors, dense
 and supported K/IQ formats, and type-39 MXFP4-MoE expert banks. GGUF
 `ssm_a = -exp(A_log)` is validated and converted back to canonical `A_log`.
 Fully resident, bounded-layer, dense-streamed, and sparse-expert residency
@@ -791,7 +802,7 @@ reduction, avoiding intermediate dense expert weights. Q4_K, Q5_1, and Q8_0
 checkpoint-native linear paths use the same activation-row tiling where
 applicable.
 
-CPU execution no longer creates a transient dense weight matrix. It streams one
+CPU execution streams one
 packed logical row into F32 scratch and immediately consumes it; scratch memory
 is therefore proportional to the tensor width rather than its full element
 count. These direct kernels preserve the packed-memory advantage, but they
@@ -809,8 +820,8 @@ mixed-precision file recipes rather than extra tensor type codes. Recipe files
 are tensor-format compatible when each contained tensor uses a supported
 encoding. This includes UD-IQ2_XXS, UD-IQ2_M, UD-Q2_K_XL with IQ4_NL,
 UD-IQ3_XXS, UD-IQ3_S, UD-Q3_K_M or UD-Q3_K_XL with IQ4_NL, UD-IQ4_XS, and
-UD-IQ4_NL. Historical codes 36-38 named IQ4_NL_4_4, IQ4_NL_4_8, and
-IQ4_NL_8_8 are removed upstream runtime layouts, not canonical GGUF encodings.
+UD-IQ4_NL. Codes 36-38 (`IQ4_NL_4_4`, `IQ4_NL_4_8`, and
+`IQ4_NL_8_8`) are not canonical GGUF encodings and are rejected.
 
 ## Usage
 
@@ -830,7 +841,11 @@ group and must not be reused as a local GPU index.
 ```rust,ignore
 use safemlx::{distributed::{self, Backend}, DeviceType, Stream};
 use safemlx_lm::{
-    pipeline::{load_pipeline_model_with_options, PipelineStep},
+    architectures::distributed::pipeline::{
+        load_pipeline_model_with_options, PipelineInferencePhase,
+        PipelineInferenceScheduler, PipelineMicrobatchInput, PipelineStep,
+    },
+    runtime::scheduler::{RequestId, SchedulerLimits},
     DeviceAssignment, ModelLoadOptions, ParallelTopology,
 };
 
@@ -851,16 +866,25 @@ let mut model = load_pipeline_model_with_options(
     &stream,
     cpu_weights_stream,
 )?;
-let mut cache = model.new_cache();
-let step = PipelineStep::new(1, prompt_length)?;
-let logits = model.forward_pipeline(
-    (group.rank() == 0).then_some(&prompt_tokens),
-    step,
-    None,
-    &mut cache,
-    &group,
-    &stream,
+let request = RequestId::new(42);
+let mut scheduler = PipelineInferenceScheduler::new(
+    &model,
+    SchedulerLimits::default(),
 )?;
+scheduler.register_request(&model, request)?;
+let step = PipelineStep::new(1, prompt_length)?;
+let input = PipelineMicrobatchInput::new(
+    request,
+    PipelineInferencePhase::Prefill,
+    step,
+);
+scheduler.enqueue(if group.rank() == 0 {
+    input.with_tokens(prompt_tokens)
+} else {
+    input
+})?;
+let output = scheduler.run_queued(&mut model, &group, &stream)?;
+let logits = output[0].logits(); // Some only on the final stage.
 ```
 
 Pure pipeline parallelism currently requires `PP > 1`, `TP = 1`, and `EP = 1`.
@@ -868,40 +892,139 @@ Hybrid TP+PP and PP+EP jobs fail before checkpoint payloads are loaded. The
 ordinary `Model` loader remains a complete single-device API and directs
 non-replicated requests to the explicit pipeline loader.
 
-Decoder layers use balanced contiguous placement from
-`ParallelTopology::layer_range`. Stage zero owns token embedding and its local
+Decoder layers use balanced contiguous placement. Architectures may declare
+unsplittable dependency units; Gemma 4 uses this to keep each shared-KV
+publisher with all of its consumers, and preflight rejects a stage count that
+cannot receive nonempty legal units. Stage zero owns token embedding and its local
 layers. Intermediate stages own only their local layers and constants. The last
 stage owns its local layers, final normalization, and the language-model head.
-For tied Llama weights, the embedding table is present only on stage zero and
+For tied Llama and Gemma weights, the embedding table is present only on stage zero and
 the last stage. DeepSeek routed and shared experts stay with their decoder
 layer; expert banks for remote layers are filtered before packing.
 
 Indexed safetensors placement is resolved before payload files are opened, so
 remote-only shards are skipped and remote tensors never become MLX arrays.
 Quantized companions remain colocated. Dense and supported prequantized
-safetensors are supported for Llama-compatible models. DeepSeek supports its
+safetensors are supported for Llama-compatible and dense-Qwen models. DeepSeek supports its
 official split-expert safetensors, native block-FP8 and affine layouts, and
 local expert-bank packing. Requested on-load quantization is applied only to
-selected local tensors. Pipeline GGUF remains unsupported because its
-placement-aware loader has not yet been migrated to the GGUF tensor stream.
+selected local tensors. Gemma 4 accepts exact SafeTensors catalogs and dense or
+checkpoint-native quantized GGUF text tensors through the same derived-binding
+plan used by bounded execution. Fully resident Gemma text stages can requantize
+dense SafeTensors and dense GGUF tensors to affine or MXFP4 storage, including
+derived fused-expert bindings, when operation dimensions satisfy the requested
+group alignment. Matching checkpoint-native encodings load directly and packed
+formats are never implicitly transcoded. Dense disk-streamed stages require
+checkpoint-native quantization because load-time requantization is incompatible
+with their bounded-residency contract.
+
+Qwen2/Qwen2.5, Qwen3, and Qwen3 MoE use their shared structural binding plan
+for SafeTensors and canonical GGUF. Fully resident stages support aligned
+affine or MXFP4 load-time quantization, exact Qwen2 Q/K/V biases, Qwen3 Q/K
+norms, GQA, tied or untied heads, routed experts, and every normalized
+full/sliding layer policy.
+Kimi Linear, Nemotron-H/Nemotron-H-MoE, and text-only Qwen3-Next/Qwen3.5 also
+use the generalized pipeline runtime for SafeTensors and canonical GGUF. KDA,
+Mamba2, and linear-attention state is represented by semantic fixed slots; MLA
+and full/sliding attention use the shared compressed or KV cache. These
+families support fully resident and dense disk-streamed local stages, ordinary
+and paged live caches, persisted prompt caches, and synchronized generation.
+
+GPT-OSS SafeTensors and GGUF stages use its canonical split/fused expert binding
+recipes; native MXFP4 experts remain packed, while eligible resident dense
+matrices may be quantized to MXFP4 on load. Qwen3 MoE likewise uses the shared
+dense-Qwen stage and canonical expert binding recipes rather than a separate
+pipeline implementation.
+
+LFM2 and LFM2-MoE stages accept exact SafeTensors catalogs and canonical
+`lfm2`/`lfm2moe` GGUF checkpoints. Fully resident and dense disk-streamed
+stages use the shared LFM2 binding plan. Causal-convolution histories are
+materialized as descriptor-backed state slots, full-attention layers use the
+same ordinary or paged KV implementation as other decoders, and paged prompt
+publication saves both representations atomically. A stage containing only
+convolution layers still owns a residency manager, so fixed-state-only stage
+snapshots are valid and reload with their exact prefix offset.
 
 `PipelineCache` contains only the local global-layer range: standard or
-sliding-window KV entries for Llama and compressed-latent entries for DeepSeek.
+sliding-window KV entries for Llama, dense Qwen, and GPT-OSS;
+compressed-latent entries for DeepSeek; and descriptor-backed `StateSlots` for
+fixed convolution, recurrent, prefix, and position state. KV and compressed
+entries can carry the same ordered slots, so hybrid families do not add cache
+variants. Empty `StateSlots` explicitly represent stateless or non-owning
+layers such as Gemma shared-KV consumers.
 Cache reuse and reset are explicit. Every stage recreates causal mask state from
 the shared `PipelineStep` and its local cache offset; explicit masks must be
 supplied consistently by every rank.
 
-Execution is correctness-first and serial: receive from the predecessor,
-execute local layers, then send to the successor. Lazy point-to-point arrays are
-evaluated and their stream synchronized at each boundary. Logits stay on the
-last stage. `sample_and_synchronize` samples only there, then all ranks enter
-the same two collectives for the small token id and EOS/stop flag. Other ranks
-never mutate sampler or PRNG state and only the last rank should print text.
+Hidden stage input and output use `PipelinePayload`, which carries hidden
+activations plus an ordered `PipelineAuxiliaryState`.
+`PipelineCache` is one architecture-tagged container of semantic
+`PipelineLayerCache` entries (`StateSlots`, `KeyValue`, or
+`CompressedLatent`); an empty `StateSlots` entry is the stateless
+representation. `PipelineModel`
+likewise owns one type-erased stage shell rather than an architecture enum.
+Every decoder payload runs through the same local-layer executor and load
+accumulator, using the corresponding generalized architecture adapter as the
+sole source of static and layer bindings. Static units are selected lazily by
+stage role, and streamed binding preparation does not count cold shards as
+materialized. Family semantics supply only decoder math, auxiliary payload
+shapes, and one canonical prompt-cache identity; transport, cache
+materialization, persistence, residency, and sampling contain no family
+dispatch. `PipelineModel::new_cache` is fallible so a future adapter cannot
+silently coerce an unsupported semantic state layout.
 
-There is currently no microbatch overlap, so prefill and decode latency include
-all stages in series. Pipeline training/backward, multimodal models, expert
-token dispatch, hybrid pipeline/tensor execution, and pipeline GGUF are not
-supported.
+Each individual microbatch receives from its predecessor, executes local
+layers, and sends to its successor. Lazy point-to-point arrays are evaluated
+and their stream synchronized at each boundary. The canonical
+`runtime::scheduler::FairScheduler` owns request/work identity,
+bounded stable round-robin queues, isolated program state, lifecycle,
+cross-rank consensus, poisoning, and telemetry. `PipelineInferenceScheduler`
+is its decoder adapter: the program state is an independent `PipelineCache`
+and the work descriptors are prefill/decode transitions. After one collective
+exact-descriptor preflight, stage zero can advance to a later request while
+downstream stages finish an earlier one, filling the pipeline without combining
+cache state. Different prompt lengths are supported. Batch size remains fixed
+within one request, decode work has sequence length one, and prefill cannot
+resume after decode begins.
+
+Queue capacity and active-request capacity provide explicit backpressure.
+Cross-rank differences in request id, work sequence, phase, dimensions, or mask
+metadata fail before point-to-point traffic. Any execution failure poisons the
+scheduler and releases its caches rather than permitting an ambiguous retry.
+EOS and cancellation discard queued work and release the corresponding cache;
+an idle cache can instead be released for prompt-cache persistence. Scheduler
+reports expose current/peak queue occupancy, request count, completed and
+failed/discarded work, terminal counts, drain cycles, and poison state.
+
+Realtime and other programs reuse `FairScheduler` by supplying program state,
+a work payload implementing `WorkDescriptor`, and an executor closure.
+Single-process realtime drains locally; distributed programs additionally
+supply a versioned protocol identity for exact rank consensus. They do not need
+pipeline cache, prefill/decode, or hidden-state semantics, and do not duplicate
+identity, queueing, cancellation, or accounting. Callers use `RequestId`,
+`WorkId`, `SchedulerLimits`, `RequestStatus`, and `SchedulerReport` from the
+canonical scheduler module.
+
+The realtime API is `RealtimeInferenceScheduler`; request-owned samplers,
+PRNG state, delayed streams, and temporal/depth caches live together in
+`RealtimeSession`, while normal and forced prompt frames use `RealtimeStepInput`.
+
+Logits stay on the last stage. `sample_and_synchronize` samples only there,
+then all ranks enter the same collectives for the small token id and EOS/stop
+flag. Sampling policy is intentionally separate from scheduling: after each
+drain, callers enqueue the synchronized token or finish the request on every
+rank. A single autoregressive request remains token-dependency limited;
+pipeline utilization comes from multiple requests or teacher-forced chunks.
+
+Pipeline training/backward, Gemma image/audio encoder execution, hybrid
+pipeline/expert dispatch, and hybrid pipeline/tensor execution are not
+supported. Moshi/PersonaPlex uses its coupled temporal/depth program adapter
+over the same generic scheduler rather than the decoder pipeline's
+single-hidden-edge adapter. Pipeline GGUF loading is registered for `llama`,
+`mistral`, `deepseek2`, `gemma4`, `qwen2`, `qwen3`, `qwen3moe`, `gpt-oss`,
+`lfm2`, `lfm2moe`, `nemotron_h`, `nemotron_h_moe`, `qwen3next`, `qwen35`,
+`qwen35moe`, `kimi-linear`, and `inkling`. Support is not inferred for other
+GGUF architectures.
 
 A checkpoint's DeepSeek `ep_size` remains checkpoint layout/compatibility
 metadata and retains its existing validation. Runtime
@@ -918,12 +1041,80 @@ cargo test -p safemlx-lm --test distributed_pipeline_ring \
 cargo test -p safemlx-lm --test distributed_pipeline_ring \
   ring_two_process_dense_stream_pipeline -- --ignored --exact --nocapture
 cargo test -p safemlx-lm --test distributed_pipeline_ring \
+  ring_two_process_pipeline_microbatch_scheduler -- --ignored --exact --nocapture
+cargo test -p safemlx-lm --test distributed_pipeline_ring \
+  ring_two_process_dense_stream_pipeline_microbatch_scheduler -- --ignored --exact --nocapture
+cargo test -p safemlx-lm --test distributed_pipeline_ring \
+  ring_two_process_pipeline_schedule_mismatch_fails_closed -- --ignored --exact --nocapture
+cargo test -p safemlx-lm --test distributed_pipeline_ring \
   ring_two_process_deepseek_pipeline_persistence -- --ignored --exact --nocapture
+cargo test -p safemlx-lm --test distributed_pipeline_ring \
+  ring_two_process_gemma_pipeline -- --ignored --exact --nocapture
+cargo test -p safemlx-lm --test distributed_pipeline_ring \
+  ring_two_process_qwen2_pipeline -- --ignored --exact --nocapture
+cargo test -p safemlx-lm --test distributed_pipeline_ring \
+  ring_two_process_qwen3_dense_stream_pipeline -- --ignored --exact --nocapture
+cargo test -p safemlx-lm --test distributed_pipeline_ring \
+  ring_two_process_qwen3_moe_pipeline -- --ignored --exact --nocapture
+cargo test -p safemlx-lm --test distributed_pipeline_ring \
+  ring_two_process_gpt_oss_pipeline -- --ignored --exact --nocapture
+cargo test -p safemlx-lm --test distributed_pipeline_ring \
+  ring_two_process_lfm2_pipeline -- --ignored --exact --nocapture
+cargo test -p safemlx-lm --test distributed_pipeline_ring \
+  ring_two_process_lfm2_dense_stream_pipeline -- --ignored --exact --nocapture
+cargo test -p safemlx-lm --test distributed_pipeline_ring \
+  ring_two_process_lfm2_moe_pipeline -- --ignored --exact --nocapture
+cargo test -p safemlx-lm --test distributed_pipeline_ring \
+  ring_two_process_kimi_linear -- --ignored --nocapture
+cargo test -p safemlx-lm --test distributed_pipeline_ring \
+  ring_two_process_nemotron_h_dense_stream_pipeline -- --ignored --exact --nocapture
+cargo test -p safemlx-lm --test distributed_pipeline_ring \
+  ring_two_process_qwen3_next_dense_stream_pipeline -- --ignored --exact --nocapture
+cargo test -p safemlx-lm --test distributed_pipeline_ring \
+  ring_two_process_qwen35_dense_stream_pipeline -- --ignored --exact --nocapture
+cargo test -p safemlx-lm --test distributed_pipeline_ring \
+  ring_two_process_inkling_dense_stream_pipeline -- --ignored --exact --nocapture
 ```
+
+The Kimi command runs both SafeTensors and canonical GGUF fixtures. These
+adapter proofs compare two-rank prefill and decode logits with the ordinary
+resident loader, validate stage-local semantic state, and assert bounded layer
+residency. The GGUF case also checks physical read telemetry before layer
+execution, proving that neither rank reads the complete tensor payload while
+loading its static modules.
 
 See `cargo run -p safemlx-lm --example pipeline_generate -- MODEL_DIR` for the
 minimal rank-aware prefill/decode probe. Launch one process per stage with the
 Ring environment (`MLX_RANK` and `MLX_HOSTFILE`) configured for all processes.
+
+### Execution-group dependency graphs
+
+The generalized resident/layerwise engine executes a validated
+`ExecutionGroupDag`. Every adapter declares stable group names, named input
+dependencies, and one authoritative output; the runtime validates missing or
+duplicate names, unknown or repeated dependencies, cycles, disconnected
+groups, residency-plan identity, and group lengths before materialization.
+Ready groups run in a stable topological order. Root groups receive the initial
+activation, single-input groups receive their dependency output, and adapters
+with multiple inputs must implement an exact merge instead of relying on
+numeric adjacency.
+Completed activations are retained only until their final declared consumer,
+so a chain does not accumulate every prior group output and a branch keeps only
+the roots still needed by its merge.
+
+Gemma multimodal execution declares independent vision and audio roots which
+both feed the text decoder. Qwen3-VL, multimodal Qwen3.5, and Inkling declare a
+vision-to-text edge. Their media jobs are finalized and assembled only when the
+text node becomes ready, so skipped media branches and future non-adjacent
+placement cannot change ingress semantics. Ordinary text decoders declare a
+single-node graph; Moshi/PersonaPlex declare temporal-to-depth dependencies.
+Scheduling is currently topological and serial, not concurrent across ready
+roots.
+
+`ArchitectureAdapter::execution_graph`, `begin_execution_group`, and
+`complete_execution_group` define group topology and execution boundaries.
+`LayerwiseModel::execution_graph` exposes the exact validated graph used by the
+loader and executor.
 
 ### Executable tensor parallelism
 
@@ -959,7 +1150,8 @@ bias. Row partitions must align with the affine group, the MXFP4 32-value
 group, or DeepSeek's 128-by-128 block-FP8 grid.
 
 Family-specific generalized loaders cover Llama/Mistral, Qwen2/Qwen3
-(including Qwen3 MoE), Gemma text, GPT-OSS, DeepSeek-V3/R1, Kimi Linear, LFM2
+(including Qwen3 MoE), Gemma 4 text and multimodal towers, GPT-OSS,
+DeepSeek-V3/R1, Kimi Linear, LFM2
 dense/MoE, Nemotron-H, and the text decoders of Qwen3-Next and Qwen3.5
 dense/MoE. Qwen vision towers and embedded multi-token-prediction layers use
 their own execution groups through the same generalized engine.
@@ -984,54 +1176,127 @@ every execution group, while pinned static modules retain only their planned
 local partitions. Scalars, routers, expert identities, and convolution stems
 without a valid feature-local decomposition remain replicated deliberately.
 
-Llama, dense Qwen, and Gemma-text Q/K/V and gate/up outputs are sharded. RoPE,
-attention, activations, and gated products remain local; only attention output
-and MLP down projections all-sum. Query heads, KV heads, and intermediate width
-must divide TP, and the local query/KV ratio must preserve GQA. Each cache
-contains only local K/V heads, including bounded sliding-window caches. Qwen3
-MoE retains every routed expert and the router on every rank while sharding the
-packed gate/up and down intermediate dimensions.
+Llama/Mistral, dense Qwen, Inkling, Kimi Linear, LFM2 attention, Nemotron-H
+attention, GPT-OSS, and Gemma 4 text/vision/audio projections are sharded. RoPE, attention,
+activations, and gated products remain local; only attention output and MLP
+down projections all-sum. Llama/Mistral, dense Qwen, LFM2, Nemotron-H, and
+GPT-OSS and Inkling partition balanced ranges of whole GQA KV groups, so query/KV head
+counts need not divide TP and every rank still preserves the exact query-to-KV
+ratio. Kimi Linear independently partitions whole KDA or MLA heads. GPT-OSS
+learned sinks follow their local query heads. Dense feed-forward intermediates
+may also be uneven.
+Quantized row ranges combine adjacent
+head groups or intermediate channels as needed to align affine, MXFP4, and
+checkpoint-native GGML blocks; packed weights and companions consume the same
+logical range.
+Inkling additionally assigns each dense or routed/shared expert intermediate
+one atomic range across its input projections, fused gate/up segments, down
+projection, and quantization companions. Its K/V depthwise convolution
+channels follow the local KV groups, and each hMLP layer slices the exact
+planner-derived folded-input range rather than reconstructing equal rank
+chunks. Every rank must receive at least one legal unit. Families not described here retain
+their documented exact-divisibility constraints. Each cache contains only its rank's
+local K/V heads, including bounded sliding-window caches, and persisted cache
+descriptors record the possibly different per-layer local counts. Qwen3-VL
+reuses that planner-derived text-cache geometry while retaining its
+architecture-owned multimodal position state. Qwen3 MoE and LFM2-MoE
+retains every routed expert and the router on every rank while assigning a
+balanced logical intermediate range to each rank. The same group-level range
+selects both fused gate/up segments, the down-projection input, packed weights,
+scales, and quantization biases. Expert intermediate widths therefore need not
+divide TP, although every rank must receive at least one complete dense or
+quantization-aligned unit.
+
+Gemma 4 uses one planner contract across its related text, vision, and audio
+components. Text and vision attention assign balanced ranges of whole GQA KV
+groups and retain the corresponding query heads and reduced output columns.
+Dense gated-GELU and routed gated-GELU intermediates are separate domains;
+packed expert weights, scales, and biases follow the same aligned range.
+Vision patch projections and position tables share one hidden-channel range.
+Audio attention heads, its paired feed-forward blocks, fused gated
+light-convolution input, depthwise kernel/norm, and reduced output consume
+authoritative semantic domains; global RMS statistics remain correct when
+channel counts differ by rank. Audio and vision modality projections use exact
+planner-derived ranges, and persisted prompt caches record local KV heads
+without reconstructing them from the rank count.
 
 DeepSeek keeps Q-LoRA input, compressed KV latent projection/normalization,
-and routing replicated. Head-expanded MLA projections use contiguous head
-shards, while output projection all-sums once. Compressed-latent caches remain
-rank-local and work for both prefill and absorbed decode. Routed and shared
-experts retain all expert identities on each rank but shard their intermediate
-dimension; their combined residual delta is all-summed once.
+and routing replicated. One balanced, potentially uneven MLA-head domain owns
+the expanded query, fused or split key/value, and reduced output projections,
+so every rank's local decoder geometry comes from the planner rather than
+integer division of global fields. Compressed-latent caches remain rank-local
+and work for both prefill and absorbed decode. Dense MLP, routed-expert, and
+shared-expert intermediates use independent balanced domains. Routed and
+shared experts retain all expert identities on each rank, while packed weights,
+scales, quantization biases, and native block-FP8 companions share the same
+aligned local intermediate range; each residual delta is all-summed once.
 
-GPT-OSS shards attention heads and each retained MXFP4 routed expert's
-intermediate dimension. Its learned attention sinks and router stay
-replicated; ordinary output/down bias is added once after reduction. GPT-OSS TP
-accepts its native MXFP4 checkpoint representation rather than converting the
-expert banks to another load-time format.
+GPT-OSS assigns complete GQA groups and each retained MXFP4 routed expert's
+intermediate dimension through balanced planner ranges. Learned attention sinks
+follow their query heads; the router remains replicated. Native expert blocks,
+scales, and fused gate/up biases share one 32-channel-aligned intermediate
+range, while ordinary output/down bias is added once after reduction. GPT-OSS
+TP accepts its native MXFP4 checkpoint representation rather than converting
+the expert banks to another load-time format. KV and persisted prompt-cache
+geometry comes from the actual local plan, including uneven per-rank head
+counts. Two-rank SafeTensors and native MXFP4 GGUF fixtures verify numerical
+parity, bounded GGUF reads, and save/drop/reload continuation.
 
-Kimi shards MLA and KDA heads, KDA convolution channels and recurrent state,
-and dense, routed, and shared expert intermediates. Its low-rank KDA input
-bottlenecks and per-head normalization remain replicated. LFM2 shards full
-attention and feed-forward intermediates while replicating short-convolution
-operators and state. Official per-expert safetensors are range-loaded for the
-local intermediate slice and then packed into the runtime expert banks, so a
-rank does not materialize the global expert intermediate tensors first.
+Kimi assigns balanced, potentially uneven MLA and KDA head ranges. One KDA
+logical domain jointly partitions Q/K/V, decay/update/gate expansions, all
+three depthwise kernels, transition parameters, recurrent state, and the
+row-reduced output projection. MLA head-expanded projections share a second
+domain while compressed latent state remains head-independent. Dense, routed,
+and shared-expert intermediates use independent balanced domains; affine and
+MXFP4 down-projection boundaries combine channels into complete quantization
+groups before partitioning. KDA's low-rank input bottlenecks and per-head
+normalization remain replicated. Rank-local cache descriptors are derived from
+the actual KDA plan, and two-rank mixed KDA/MLA fixtures verify all three
+parameter-residency policies plus save/drop/reload parity. LFM2 shards complete
+GQA groups, balanced dense or routed SwiGLU intermediate ranges, and gated
+short-convolution channels. The fused B/C/x projection, depthwise kernel,
+bounded convolution state, and row-reduced output projection share one planner
+range. Official per-expert safetensors are range-loaded for the local
+intermediate slice and then packed into the runtime expert banks, so a rank does
+not materialize the global expert intermediate tensors first. Prompt-cache
+manifests combine planner-derived per-layer KV and convolution-channel geometry.
 
 Qwen3-Next and Qwen3.5 shard full-attention heads and dense/routed/shared MoE
 intermediates together with recurrent key/value heads, convolution channels,
 transition parameters, and recurrent state. Qwen3.5's fused query/gate rows
 and Qwen3-Next's checkpoint-fused recurrent projections use segmented placement
 rules so logical components retain their local geometry before runtime
-splitting.
+splitting. These are independent balanced domains: ranks may own different
+numbers of complete GQA/recurrent groups and different routed, shared, or dense
+intermediate widths. Layer construction and prompt-cache manifests consume the
+planner's semantic ranges directly, including packed FP8, affine, MXFP4, and
+native GGML companions; they do not infer a shard count from physical tensor
+shapes.
 
 Nemotron-H uses its authoritative four-operator schedule to shard Mamba heads,
 B/C groups, convolution channels, and SSM state; attention heads; dense MLP
 intermediates; and routed/shared ReLU2 expert intermediates. Layer norms,
 routers, and expert identities remain replicated, and every operator performs
-one row-parallel reduction for its residual delta.
+one row-parallel reduction for its residual delta. A complete Mamba B/C group
+is the atomic logical unit: all of that group's heads remain attached across the
+fused input segments, depthwise convolution, transition/state parameters,
+gated RMSNorm, output projection, and fixed cache. GQA, dense MLP, routed
+expert, and shared-expert widths use independent balanced domains. Affine and
+native GGML packed boundaries combine adjacent units when required, then apply
+the identical semantic range to packed values and companions. Two-rank
+SafeTensors coverage exercises fully resident, layerwise-host, and dense-stream
+policies plus prompt-cache reload; a matching GGUF fixture verifies numerical
+parity and bounded rank-selective reads.
 
-Resident caches work for all of these text models. Paged prompt-cache residency
-is unavailable for the Kimi, LFM2, Nemotron-H, and Qwen hybrid TP adapters
-because their cache also owns recurrent or convolution state; requesting it
-returns a structured error instead of silently dropping that state. Persisted
-TP prompt-cache snapshots are likewise unavailable for Nemotron-H until mixed
-Mamba/KV rank-local state has a sharded snapshot format.
+Resident caches work for all of these text models. Kimi and Nemotron-H also
+support heterogeneous live paging: growing MLA blocks and Nemotron attention
+KV blocks use the shared paging manager, while bounded KDA or Mamba
+convolution/recurrent tensors remain device resident. The same per-layer
+descriptors persist fixed state and lazily reopen paged blocks with exact
+rank-local topology. Paged live-cache residency remains unavailable for the
+LFM2 and Qwen hybrid TP adapters; requesting it returns a structured error
+instead of silently dropping their state. LFM2 supports rank-aware persisted
+prompt-cache snapshots and restores them into its heterogeneous resident cache.
 
 Embedding and output rows use balanced contiguous vocabulary ranges, including
 uneven vocabulary sizes. Embedding masks out non-local ids then all-sums hidden
@@ -1043,8 +1308,10 @@ the selected token and stop flag are synchronized.
 Rank-aware safetensors selection happens before execution-device
 materialization. Indexed payload shards with no local tensors are not opened.
 Dense, MLX affine/MXFP4, DeepSeek native block-FP8, official split-expert, and
-local on-load quantization paths are supported subject to alignment. TP GGUF is
-rejected early because its reader cannot guarantee bounded local-range loads.
+local on-load quantization paths are supported subject to alignment. Registered
+GGUF families use the same planner to select bounded rank-local ranges before
+materialization; unsupported encodings or packed ranges that cannot meet their
+quantization alignment are rejected during preflight.
 
 Ring is useful for correctness testing. Practical low-latency TP should use
 JACCL or NCCL where available. Run the collective proof with:
@@ -1056,6 +1323,12 @@ cargo test -p safemlx-lm --test distributed_tensor_parallel_ring \
   ring_two_process_tensor_parallel -- --ignored --exact --nocapture
 cargo test -p safemlx-lm --test distributed_tensor_parallel_ring \
   ring_two_process_deepseek_tensor_parallel_persistence -- --ignored --exact --nocapture
+cargo test -p safemlx-lm --test distributed_tensor_parallel_ring \
+  ring_two_process_deepseek_gguf_tensor_parallel -- --ignored --exact --nocapture
+cargo test -p safemlx-lm --test distributed_tensor_parallel_ring \
+  ring_two_process_nemotron_tensor_parallel -- --ignored --exact --nocapture
+cargo test -p safemlx-lm --test distributed_tensor_parallel_ring \
+  ring_two_process_nemotron_gguf_tensor_parallel -- --ignored --exact --nocapture
 ```
 
 Architecture-neutral planner tests and family-owned rank-local loader fixtures
@@ -1332,29 +1605,49 @@ families separately from the chat/text `LoadedModel` path:
 ```rust,ignore
 use safemlx_lm::{
     load_realtime_model,
-    realtime::{RealtimeSampling, RealtimeSpeechModel, RealtimeStepInput},
-    sampler::DefaultSampler,
+    RealtimeInferenceScheduler, RealtimeSampling, RealtimeStepInput,
+    runtime::{
+        scheduler::{RequestId, SchedulerLimits},
+        generation::sampler::DefaultSampler,
+    },
 };
 
 let mut model = load_realtime_model(model_dir, stream, weights_stream)?;
 let config = model.realtime_config();
-let mut state = model.new_realtime_state();
-let mut text_sampler = DefaultSampler;
-let mut audio_samplers = (0..config.depth_audio_codebooks)
+let input_codebooks = config.input_audio_codebooks;
+let generated_codebooks = config.generated_audio_codebooks;
+let audio_samplers = (0..config.depth_audio_codebooks)
     .map(|_| DefaultSampler)
     .collect::<Vec<_>>();
-
-// Your codec supplies one user/input-side frame shaped
-// [batch, config.input_audio_codebooks].
-let output = model.step_realtime(
-    &mut state,
-    RealtimeStepInput::encoded_audio(&encoded_input_frame),
-    RealtimeSampling::new(&mut text_sampler, &mut audio_samplers, 0.0, 0.0, None),
-    stream,
+let request = RequestId::new(42);
+let mut scheduler = RealtimeInferenceScheduler::new(
+    &model,
+    SchedulerLimits::new(1, 4)?,
+)?;
+scheduler.register_request(
+    &model,
+    request,
+    DefaultSampler,
+    audio_samplers,
+    RealtimeSampling::greedy(),
 )?;
 
+// Your codec supplies one user/input-side frame shaped
+// [batch, input_codebooks].
+scheduler.enqueue(
+    &model,
+    request,
+    RealtimeStepInput::encoded_audio(&encoded_input_frame),
+)?;
+let output = scheduler
+    .run_queued(&mut model, stream)?
+    .pop()
+    .expect("one queued frame")
+    .into_parts()
+    .1;
+
 if let Some(codec_tokens) = output.output_audio_tokens {
-    // Decode [batch, config.generated_audio_codebooks] with your codec.
+    // Decode [batch, generated_codebooks] with your codec.
 }
 ```
 
@@ -1362,14 +1655,20 @@ Pass `ModelLoadOptions::default().with_weight_residency(WeightResidency::Layerwi
 to `load_realtime_model_with_options` to keep temporal layers and Moshi-family
 depth-codebook slices on the host. Text/audio embeddings and temporal output
 modules remain pinned, and `residency_report()` exposes the two execution groups.
-PersonaPlex system-prompt helpers accept either the fully resident model or
-`MoshiLayerwiseModel`, so forced voice/text prefill continues into ordinary
-realtime generation with the same delayed-stream and transformer caches.
+The scheduler uses the same request-state representation for fully resident,
+host-layerwise, and dense-streamed models, so a released session can resume
+across residency policies only when the selected checkpoint-file SHA-256 and
+normalized execution identity match. Geometry alone is insufficient;
+quantization changes and same-shaped checkpoints with different weights are
+rejected without a residency-specific state enum.
+`run_bounded` limits one drain to a caller-selected number of frames, providing
+cooperative deadline and cancellation boundaries; `run_queued` drains all work
+that was ready at entry.
 
 The `architectures::moshi::model` module implements Moshi's temporal and depth language
-models over pre-tokenized Mimi streams. `GenerationState` accepts one
-input-side Mimi frame at a time and returns delay-aligned generated-side Mimi
-frames; `generate_encoded_greedy` is the offline sequence convenience API.
+models over pre-tokenized Mimi streams. Production session ownership is through
+`RealtimeInferenceScheduler`; `generate_encoded_greedy` is the one-request
+offline scheduler convenience API.
 Sequence tensors use Mimi's `[batch, codebooks, frames]` layout.
 
 `architectures::moshi::personaplex` exposes PersonaPlex's Moshi-family realtime token API,
@@ -1380,10 +1679,11 @@ helpers. It can load the released Hugging Face PyTorch-layout
 PersonaPlex consumes 8 user-side codec codebooks per realtime frame and emits 8
 agent-side codec codebooks per output frame. Its depth transformer still samples
 or teacher-forces 16 codebooks, so realtime sampling requires 16 audio samplers.
-Prompt helpers remain token-only: use `wrap_system_prompt` before external text
-tokenization, pass text ids shaped `[batch, frames]` to
-`prefill_text_prompt_greedy`, and optionally pass agent voice codec tokens
-shaped `[batch, 8, frames]` to `prefill_system_prompt_greedy`.
+Prompt helpers are token-only: use `wrap_system_prompt` before external text
+tokenization, then use `enqueue_text_prompt` or `enqueue_system_prompt` on the
+same registered request used for live frames. Prompt and live work therefore
+share one queue, one delayed-stream state, and the same cancellation and
+backpressure contract.
 
 Mimi audio encoding/decoding and audio device I/O deliberately remain outside
 `safemlx-lm`. The sibling `safemlx-codec` crate provides safemlx-native codec
@@ -1476,9 +1776,8 @@ For a lightweight end-to-end check without downloading released weights, add
 checkpoint in the supplied model directory before exporting its reference
 fixture.
 
-Moshi projections preserve their checkpoint dtype. MLX 0.32.0 fixes the
-locally built NAX metallib behavior that previously required FP32 promotion
-with MLX 0.31.2.
+Moshi projections preserve their checkpoint dtype and execute with the MLX
+0.32.0 NAX kernels.
 
 ## Expert-parallel sparse MoE inference
 
@@ -1648,8 +1947,9 @@ opt-in. Device-resident caches remain the default. See
 [`CACHE_RESIDENCY.md`](CACHE_RESIDENCY.md) for configuration, compatibility,
 cost, and safety details. Prompt-cache schema v4 records exact ordered per-layer
 attention plus convolution, recurrent, compressed-MLA, and multimodal prefix
-state, including distinct sliding windows. Schema-v3 and older caches are
-rejected. LFM2 causal-convolution state and Nemotron-H Mamba state use the same
-ordered fixed-state representation. Realtime Moshi/PersonaPlex session state
-remains outside the persisted prompt-cache routes. Run
+state, including distinct sliding windows. Prompt-cache loading accepts schema
+v4. LFM2 causal-convolution state and Nemotron-H Mamba state use the same
+ordered fixed-state representation. Realtime Moshi/PersonaPlex sessions can be
+released from their scheduler for application-owned handoff but remain outside
+the persisted prompt-cache routes. Run
 `paged_prompt_cache` for a deterministic save/drop/reopen parity check.

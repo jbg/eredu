@@ -4,7 +4,7 @@ use std::{collections::HashMap, path::Path, sync::Arc};
 
 use safemlx::{
     error::Exception,
-    module::{Module, ModuleParameters},
+    module::Module,
     nn,
     ops::indexing::TryIndexOp,
     ops::{GgufCheckpoint, GgufMetadataValue},
@@ -26,27 +26,28 @@ use crate::{
     },
     error::Error,
     nn::{
-        parallel::{VocabParallelEmbedding, VocabParallelLmHead},
+        parallel::{
+            planned_kv_head_layout, register_gqa_projection_group,
+            register_swiglu_projection_group, GqaProjectionNames, SwiGluProjectionNames,
+            VocabParallelEmbedding, VocabParallelLmHead,
+        },
         tensor::{create_attention_mask, AttentionMask},
     },
     runtime::cache::residency::{
-        open_prompt_cache, validate_prompt_cache_model_identity, CacheResidencyManager,
-        CacheResidencyPolicy, CacheResidencyReport, PagedCacheOptions, PromptCacheDescriptor,
-        PromptCacheManifest, PromptCacheModelIdentity, PromptCacheOptions, PromptCacheTopology,
+        open_prompt_cache, CacheResidencyManager, CacheResidencyPolicy, CacheResidencyReport,
+        LayerCachePolicy, PagedCacheOptions, PromptCacheDescriptor, PromptCacheManifest,
+        PromptCacheModelIdentity, PromptCacheOptions, PromptCacheTopology,
     },
     runtime::cache::{ConcatKeyValueCache, KeyValueCache, PagedKeyValueCache},
     runtime::checkpoint::binding::{build_module_bindings, populate_module_from_lease},
     runtime::checkpoint::store::{GgufWeightStore, WeightStore},
-    runtime::distributed::parallel::{
-        exact_parallel_division, register_projection_module, register_replicated_module,
-        ParallelPlanBuilder, ProjectionSharding,
-    },
+    runtime::distributed::parallel::{register_replicated_module, ParallelPlanBuilder},
     runtime::execution::layerwise::{
         load_layerwise_model, load_safetensors_layerwise_model,
-        load_tensor_parallel_layerwise_model, open_safetensors_weight_store, ArchitectureAdapter,
-        DenseDiskStreamReport, ExecutionResidency, LayerExecutionLoadOptions,
-        LayerwiseForwardState, LayerwiseLoadOptions, LayerwiseModel, LayerwiseModelMetadata,
-        StaticUnitBindings, WeightResidency,
+        load_tensor_parallel_layerwise_model, open_safetensors_weight_store,
+        transformed_module_weight_store, ArchitectureAdapter, DenseDiskStreamReport,
+        ExecutionResidency, LayerExecutionLoadOptions, LayerwiseForwardState, LayerwiseLoadOptions,
+        LayerwiseModel, LayerwiseModelMetadata, StaticUnitBindings, WeightResidency,
     },
     runtime::residency::manager::{ResidencyReport, ResidentUnitLease},
 };
@@ -167,23 +168,15 @@ impl LlamaCache {
     }
 }
 
-enum LlamaExecution {
-    FullyResident(Box<resident::ResidentModel>),
-    Generalized(Box<LayerwiseModel<LlamaLayerwiseAdapter>>),
-}
-
 /// Llama/Mistral causal LM whose execution engine follows its residency policy.
 pub struct LlamaModel {
-    execution: LlamaExecution,
+    execution: Box<LayerwiseModel<LlamaLayerwiseAdapter>>,
 }
 
 impl LlamaModel {
     /// Returns normalized model arguments regardless of execution engine.
     pub fn args(&self) -> &ModelArgs {
-        match &self.execution {
-            LlamaExecution::FullyResident(model) => &model.args,
-            LlamaExecution::Generalized(model) => model.adapter().args(),
-        }
+        self.execution.adapter().args()
     }
 
     /// Returns the canonical cache-relevant architecture identity.
@@ -195,102 +188,44 @@ impl LlamaModel {
     pub fn prompt_cache_layer_layout(
         &self,
     ) -> Result<crate::LayerSchedule<crate::LayerCachePolicy>, Error> {
-        match &self.execution {
-            LlamaExecution::Generalized(model) => model.prompt_cache_layer_layout(),
-            LlamaExecution::FullyResident(_) => {
-                let args = self.args();
-                PromptCacheModelIdentity::key_value_layouts(
-                    args.attention_schedule.iter().map(|policy| {
-                        policy.window().map(|window| {
-                            i32::try_from(window.get())
-                                .expect("validated Llama attention window fits i32")
-                        })
-                    }),
-                    args.num_key_value_heads,
-                    args.head_dim,
-                )
-                .map_err(|error| Error::Parallel(error.to_string()))
-            }
-        }
+        self.execution.prompt_cache_layer_layout()
     }
 
     /// Returns whether all parameters use the eager execution-device engine.
-    pub const fn is_fully_resident(&self) -> bool {
-        matches!(&self.execution, LlamaExecution::FullyResident(_))
+    pub fn is_fully_resident(&self) -> bool {
+        self.execution.metadata().residency() == ExecutionResidency::FullyResident
     }
 
-    /// Returns layerwise parameter metadata when that engine is selected.
-    pub fn layerwise_metadata(&self) -> Option<&LayerwiseModelMetadata> {
-        match &self.execution {
-            LlamaExecution::FullyResident(_) => None,
-            LlamaExecution::Generalized(model) => Some(model.metadata()),
-        }
+    /// Returns canonical parameter and residency metadata.
+    pub fn metadata(&self) -> &LayerwiseModelMetadata {
+        self.execution.metadata()
     }
 
     /// Returns rank-local generalized parallel information when applicable.
     pub fn parallel_info(
         &self,
     ) -> Option<&crate::runtime::execution::layerwise::ParallelModelInfo> {
-        match &self.execution {
-            LlamaExecution::FullyResident(_) => None,
-            LlamaExecution::Generalized(model) => model.parallel_info(),
-        }
-    }
-
-    pub(crate) fn resident_parameter_bytes(&self) -> Option<Result<u64, &'static str>> {
-        match &self.execution {
-            LlamaExecution::FullyResident(model) => Some(
-                model
-                    .parameters()
-                    .flatten()
-                    .values()
-                    .try_fold(0u64, |total, parameter| {
-                        let bytes = u64::try_from(parameter.nbytes())
-                            .map_err(|_| "Llama parameter byte count does not fit u64")?;
-                        total
-                            .checked_add(bytes)
-                            .ok_or("Llama parameter byte total overflowed u64")
-                    }),
-            ),
-            LlamaExecution::Generalized(_) => None,
-        }
+        self.execution.parallel_info()
     }
 
     /// Returns logical residency and transfer telemetry for a layerwise model.
     pub fn residency_report(&self) -> Result<Option<ResidencyReport>, Error> {
-        match &self.execution {
-            LlamaExecution::FullyResident(_) => Ok(None),
-            LlamaExecution::Generalized(model) => Ok(Some(model.residency_report()?)),
-        }
+        Ok(Some(self.execution.residency_report()?))
     }
 
     /// Returns dense-stream observations when that policy is active.
     pub fn dense_stream_report(&self) -> Result<Option<DenseDiskStreamReport>, Error> {
-        match &self.execution {
-            LlamaExecution::FullyResident(_) => Ok(None),
-            LlamaExecution::Generalized(model) => model.dense_stream_report(),
-        }
+        self.execution.dense_stream_report()
     }
 
     /// Returns the persistent checkpoint store used by a layerwise model.
-    pub fn checkpoint_store(&self) -> Option<&(dyn WeightStore + Send + Sync)> {
-        match &self.execution {
-            LlamaExecution::FullyResident(_) => None,
-            LlamaExecution::Generalized(model) => Some(model.checkpoint_store()),
-        }
-    }
-
-    /// Backward-compatible alias for [`Self::checkpoint_store`].
-    pub fn weight_store(&self) -> Option<&(dyn WeightStore + Send + Sync)> {
-        self.checkpoint_store()
+    pub fn checkpoint_store(&self) -> &(dyn WeightStore + Send + Sync) {
+        self.execution.checkpoint_store()
     }
 
     /// Returns the number of pinned static leases used by the layerwise engine.
-    pub fn layerwise_static_lease_count(&self) -> Option<usize> {
-        match &self.execution {
-            LlamaExecution::FullyResident(_) => None,
-            LlamaExecution::Generalized(model) => Some(model.static_lease_count()),
-        }
+    pub fn static_lease_count(&self) -> usize {
+        self.execution.static_lease_count()
     }
 
     /// Creates the cache representation required by the model configuration.
@@ -319,14 +254,9 @@ impl LlamaModel {
     ) -> Result<LlamaCache, Error> {
         match policy {
             CacheResidencyPolicy::Device => Ok(self.new_cache()),
-            CacheResidencyPolicy::Paged(options) => self.new_paged_cache(
-                options,
-                None,
-                match &self.execution {
-                    LlamaExecution::FullyResident(_) => None,
-                    LlamaExecution::Generalized(model) => model.prompt_cache_rank_identity(),
-                },
-            ),
+            CacheResidencyPolicy::Paged(options) => {
+                self.new_paged_cache(options, None, self.execution.prompt_cache_rank_identity())
+            }
         }
     }
 
@@ -339,41 +269,8 @@ impl LlamaModel {
         options: PagedCacheOptions,
         stream: &Stream,
     ) -> Result<(LlamaCache, PromptCacheManifest), Error> {
-        if let LlamaExecution::Generalized(model) = &self.execution {
-            return model.load_prompt_cache(directory, expected, prefix_token_ids, options, stream);
-        }
-        let args = self.args();
-        let layer_count = usize::try_from(args.num_hidden_layers)
-            .map_err(|_| Exception::custom("invalid Llama cache layer count"))?;
-        let identity = PromptCacheModelIdentity {
-            model_family: "llama".into(),
-            effective_model_type: args.model_type.clone(),
-            architecture_fingerprint:
-                crate::architectures::llama::model::prompt_cache_architecture_fingerprint(args),
-            layer_count,
-            global_layer_start: 0,
-            global_layer_end: layer_count,
-            sink_tokens: 0,
-            topology: Default::default(),
-            layer_layout: PromptCacheModelIdentity::key_value_layouts(
-                args.attention_schedule.iter().map(|policy| {
-                    policy.window().map(|window| {
-                        i32::try_from(window.get())
-                            .expect("validated Llama attention window fits i32")
-                    })
-                }),
-                args.num_key_value_heads,
-                args.head_dim,
-            )
-            .map_err(|error| Exception::custom(error.to_string()))?,
-        };
-        validate_prompt_cache_model_identity(expected, &identity)
-            .map_err(|error| Exception::custom(error.to_string()))?;
-        let (manager, manifest) =
-            open_prompt_cache(directory, expected, &identity, prefix_token_ids, options)
-                .map_err(|error| Exception::custom(error.to_string()))?;
-        let cache = self.new_paged_cache_from_manager(manager, None)?;
-        Ok((cache, manifest))
+        self.execution
+            .load_prompt_cache(directory, expected, prefix_token_ids, options, stream)
     }
 
     /// Persists a prefix through the generalized execution contract.
@@ -386,19 +283,14 @@ impl LlamaModel {
         options: &PromptCacheOptions,
         stream: &Stream,
     ) -> Result<PromptCacheManifest, Error> {
-        match &self.execution {
-            LlamaExecution::Generalized(model) => model.save_prompt_cache(
-                cache,
-                destination,
-                descriptor,
-                prefix_token_ids,
-                options,
-                stream,
-            ),
-            LlamaExecution::FullyResident(_) => {
-                cache.save_prompt_cache(destination, descriptor, prefix_token_ids, options)
-            }
-        }
+        self.execution.save_prompt_cache(
+            cache,
+            destination,
+            descriptor,
+            prefix_token_ids,
+            options,
+            stream,
+        )
     }
 
     fn new_paged_cache(
@@ -444,29 +336,26 @@ impl LlamaModel {
         stream: &Stream,
     ) -> Result<Array, Error> {
         self.validate_cache(cache)?;
-        match &mut self.execution {
-            LlamaExecution::FullyResident(model) => match cache {
-                LlamaCache::Device(caches) => Ok(model.forward(
-                    resident::ModelInput {
-                        inputs,
-                        mask: None,
-                        cache: caches,
-                    },
-                    stream,
-                )?),
-                LlamaCache::Paged(caches) => Ok(model.forward(
-                    resident::ModelInput {
-                        inputs,
-                        mask: None,
-                        cache: caches,
-                    },
-                    stream,
-                )?),
-            },
-            LlamaExecution::Generalized(model) => {
-                model.forward(LlamaAdapterInput { inputs, mask: None }, cache, stream)
-            }
-        }
+        self.execution
+            .forward(LlamaAdapterInput { inputs, mask: None }, cache, stream)
+    }
+
+    /// Runs the canonical execution path with stable per-layer observation points.
+    pub fn forward_with_observer(
+        &mut self,
+        inputs: &Array,
+        mask: Option<&Array>,
+        cache: &mut LlamaCache,
+        stream: &Stream,
+        observer: &mut dyn crate::runtime::execution::inspection::ActivationObserver,
+    ) -> Result<Array, Error> {
+        self.validate_cache(cache)?;
+        self.execution.forward_with_observer(
+            LlamaAdapterInput { inputs, mask },
+            cache,
+            stream,
+            observer,
+        )
     }
 
     /// Runs a rank-local tensor-parallel forward pass.
@@ -478,17 +367,12 @@ impl LlamaModel {
         stream: &Stream,
     ) -> Result<Array, Error> {
         self.validate_cache(cache)?;
-        match &mut self.execution {
-            LlamaExecution::Generalized(model) => model.forward_tensor_parallel(
-                LlamaAdapterInput { inputs, mask: None },
-                cache,
-                group,
-                stream,
-            ),
-            LlamaExecution::FullyResident(_) => Err(Error::Parallel(
-                "Llama model was not loaded for tensor-parallel execution".into(),
-            )),
-        }
+        self.execution.forward_tensor_parallel(
+            LlamaAdapterInput { inputs, mask: None },
+            cache,
+            group,
+            stream,
+        )
     }
 
     /// Runs prompt prefill and returns last-token logits.
@@ -518,16 +402,11 @@ impl LlamaModel {
     /// Returns `true` when a layerwise window was cleared and `false` for the
     /// fully resident engine.
     pub fn clear_device_layer_window(&self) -> Result<bool, Error> {
-        match &self.execution {
-            LlamaExecution::FullyResident(_) => Ok(false),
-            LlamaExecution::Generalized(model) => {
-                if model.metadata().residency() == ExecutionResidency::FullyResident {
-                    return Ok(false);
-                }
-                model.clear_device_group("text_decoder")?;
-                Ok(true)
-            }
+        if self.is_fully_resident() {
+            return Ok(false);
         }
+        self.execution.clear_device_group("text_decoder")?;
+        Ok(true)
     }
 
     fn validate_cache(&self, cache: &LlamaCache) -> Result<(), Error> {
@@ -617,31 +496,13 @@ pub fn load_llama_model(
         model_dir,
         crate::api::ModelLoadOptions::default().with_weight_residency(options.weight_residency),
     )?;
-    let execution = match options.weight_residency {
-        WeightResidency::FullyResident => LlamaExecution::FullyResident(Box::new(
-            resident::load_resident_llama_model(model_dir, stream, weights_stream)?,
-        )),
+    let execution_options = match options.weight_residency {
+        WeightResidency::FullyResident => LayerExecutionLoadOptions::FullyResident,
         WeightResidency::LayerwiseHost(options) => {
-            let args = resident::get_llama_model_args(model_dir)?;
-            let adapter = LlamaLayerwiseAdapter::new(args, stream)?;
-            LlamaExecution::Generalized(Box::new(load_safetensors_layerwise_model(
-                model_dir,
-                adapter,
-                options,
-                stream,
-                weights_stream,
-            )?))
+            LayerExecutionLoadOptions::LayerwiseHost(options)
         }
         WeightResidency::DenseDiskStream(options) => {
-            let args = resident::get_llama_model_args(model_dir)?;
-            let adapter = LlamaLayerwiseAdapter::new(args, stream)?;
-            LlamaExecution::Generalized(Box::new(load_safetensors_layerwise_model(
-                model_dir,
-                adapter,
-                options,
-                stream,
-                weights_stream,
-            )?))
+            LayerExecutionLoadOptions::DenseDiskStream(options)
         }
         WeightResidency::SparseExpertCache(_)
         | WeightResidency::SparseExpertCacheWithDenseLayers(_) => {
@@ -650,7 +511,35 @@ pub fn load_llama_model(
             ));
         }
     };
-    Ok(LlamaModel { execution })
+    let args = resident::get_llama_model_args(model_dir)?;
+    let adapter = LlamaLayerwiseAdapter::new(args, stream)?;
+    Ok(LlamaModel {
+        execution: Box::new(load_safetensors_layerwise_model(
+            model_dir,
+            adapter,
+            execution_options,
+            stream,
+            weights_stream,
+        )?),
+    })
+}
+
+pub(crate) fn execute_transformed_llama_model(
+    model: resident::ResidentModel,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<LlamaModel, Error> {
+    let adapter = LlamaLayerwiseAdapter::new(model.args.clone(), stream)?;
+    let store = transformed_module_weight_store(&model)?;
+    Ok(LlamaModel {
+        execution: Box::new(load_layerwise_model(
+            store,
+            adapter,
+            LayerExecutionLoadOptions::FullyResident,
+            stream,
+            weights_stream,
+        )?),
+    })
 }
 
 /// Loads Llama/Mistral through the generalized tensor-parallel execution engine.
@@ -688,14 +577,14 @@ pub fn load_llama_tensor_parallel_model(
     let args = resident::get_llama_model_args(model_dir)?;
     let adapter = LlamaLayerwiseAdapter::new(args, stream)?;
     Ok(LlamaModel {
-        execution: LlamaExecution::Generalized(Box::new(load_tensor_parallel_layerwise_model(
+        execution: Box::new(load_tensor_parallel_layerwise_model(
             open_safetensors_weight_store(model_dir, options.max_mapped_shards())?,
             adapter,
             options,
             build,
             stream,
             weights_stream,
-        )?)),
+        )?),
     })
 }
 
@@ -729,7 +618,7 @@ pub(crate) fn load_llama_gguf_tensor_parallel_model(
     )?;
     Ok((
         LlamaModel {
-            execution: LlamaExecution::Generalized(Box::new(execution)),
+            execution: Box::new(execution),
         },
         prepared.eos_token_ids,
     ))
@@ -752,26 +641,33 @@ pub(crate) fn load_llama_gguf_model(
             residency.max_mapped_shards(),
         )?);
     let adapter = LlamaLayerwiseAdapter::new(prepared.args, stream)?;
-    let execution = match residency {
-        WeightResidency::LayerwiseHost(options) => LlamaExecution::Generalized(Box::new(
-            load_layerwise_model(store, adapter, options, stream, weights_stream)?,
-        )),
-        WeightResidency::DenseDiskStream(options) => LlamaExecution::Generalized(Box::new(
-            load_layerwise_model(store, adapter, options, stream, weights_stream)?,
-        )),
+    let execution_options = match residency {
+        WeightResidency::FullyResident => LayerExecutionLoadOptions::FullyResident,
+        WeightResidency::LayerwiseHost(options) => {
+            LayerExecutionLoadOptions::LayerwiseHost(options)
+        }
+        WeightResidency::DenseDiskStream(options) => {
+            LayerExecutionLoadOptions::DenseDiskStream(options)
+        }
         WeightResidency::SparseExpertCache(_)
         | WeightResidency::SparseExpertCacheWithDenseLayers(_) => {
             return Err(Error::UnsupportedArchitecture(
                 "sparse expert caching is not supported for Llama GGUF checkpoints".into(),
             ));
         }
-        WeightResidency::FullyResident => {
-            return Err(Error::UnsupportedArchitecture(
-                "the bounded GGUF Llama loader does not accept fully resident policy".into(),
-            ));
-        }
     };
-    Ok((LlamaModel { execution }, prepared.eos_token_ids))
+    Ok((
+        LlamaModel {
+            execution: Box::new(load_layerwise_model(
+                store,
+                adapter,
+                execution_options,
+                stream,
+                weights_stream,
+            )?),
+        },
+        prepared.eos_token_ids,
+    ))
 }
 
 /// Llama implementation of the generic layerwise model-family contract.
@@ -782,6 +678,7 @@ pub struct LlamaLayerwiseAdapter {
     lm_head: Option<MaybeQuantized<nn::Linear>>,
     parallel_embedding: Option<VocabParallelEmbedding>,
     parallel_lm_head: Option<VocabParallelLmHead>,
+    parallel_kv_heads: Option<Vec<i32>>,
 }
 
 impl LlamaLayerwiseAdapter {
@@ -812,6 +709,7 @@ impl LlamaLayerwiseAdapter {
             lm_head,
             parallel_embedding: None,
             parallel_lm_head: None,
+            parallel_kv_heads: None,
         })
     }
 
@@ -838,43 +736,45 @@ pub struct LlamaAdapterInput<'a> {
 fn register_llama_layer_parallel_plan(
     planner: &mut ParallelPlanBuilder,
     layer: &TransformerBlock,
+    args: &ModelArgs,
     prefix: &str,
 ) -> Result<(), Error> {
     let attention = &layer.self_attn;
-    for (name, projection, sharding) in [
-        ("q_proj", &attention.q_proj, ProjectionSharding::Column),
-        ("k_proj", &attention.k_proj, ProjectionSharding::Column),
-        ("v_proj", &attention.v_proj, ProjectionSharding::Column),
-        ("o_proj", &attention.o_proj, ProjectionSharding::Row),
-    ] {
-        register_projection_module(
-            planner,
-            projection,
-            &format!("{prefix}.self_attn.{name}"),
-            sharding,
-        )?;
-    }
+    register_gqa_projection_group(
+        planner,
+        &format!("{prefix}.self_attn"),
+        GqaProjectionNames {
+            query: "q_proj",
+            key: "k_proj",
+            value: "v_proj",
+            output: "o_proj",
+        },
+        &attention.q_proj,
+        &attention.k_proj,
+        &attention.v_proj,
+        &attention.o_proj,
+        attention.n_heads,
+        attention.n_kv_heads,
+        args.head_dim,
+    )?;
     register_replicated_module(
         planner,
         &attention.rope,
         &format!("{prefix}.self_attn.rope"),
     )?;
-    for (name, projection, sharding) in [
-        (
-            "gate_proj",
-            &layer.mlp.gate_proj,
-            ProjectionSharding::Column,
-        ),
-        ("up_proj", &layer.mlp.up_proj, ProjectionSharding::Column),
-        ("down_proj", &layer.mlp.down_proj, ProjectionSharding::Row),
-    ] {
-        register_projection_module(
-            planner,
-            projection,
-            &format!("{prefix}.mlp.{name}"),
-            sharding,
-        )?;
-    }
+    register_swiglu_projection_group(
+        planner,
+        &format!("{prefix}.mlp"),
+        SwiGluProjectionNames {
+            gate: "gate_proj",
+            up: "up_proj",
+            down: "down_proj",
+        },
+        &layer.mlp.gate_proj,
+        &layer.mlp.up_proj,
+        &layer.mlp.down_proj,
+        args.intermediate_size,
+    )?;
     register_replicated_module(
         planner,
         &layer.input_layernorm,
@@ -908,13 +808,33 @@ impl ArchitectureAdapter for LlamaLayerwiseAdapter {
         let layer_count = usize::try_from(self.args.num_hidden_layers)
             .map_err(|_| Exception::custom("invalid Llama cache layer count"))?;
         let local_kv_heads = match topology {
-            Some(topology) => exact_parallel_division(
-                "Llama prompt-cache KV heads",
-                self.args.num_key_value_heads,
-                topology.tensor_parallel_size,
-            )?,
-            None => self.args.num_key_value_heads,
+            None => vec![self.args.num_key_value_heads; layer_count],
+            Some(_) => self.parallel_kv_heads.clone().ok_or_else(|| {
+                Error::Parallel(
+                    "Llama parallel cache identity requested before local layout configuration"
+                        .into(),
+                )
+            })?,
         };
+        if local_kv_heads.len() != layer_count {
+            return Err(Error::Parallel(format!(
+                "Llama parallel cache geometry has {} layers, expected {layer_count}",
+                local_kv_heads.len()
+            )));
+        }
+        let layer_layout = crate::LayerSchedule::new(
+            layer_count,
+            self.args
+                .attention_schedule
+                .iter()
+                .zip(local_kv_heads)
+                .map(|(attention, kv_heads)| {
+                    LayerCachePolicy::key_value(*attention, kv_heads, self.args.head_dim)
+                })
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| Error::Parallel(error.to_string()))?,
+        )
+        .map_err(|error| Error::Parallel(error.to_string()))?;
         Ok(PromptCacheModelIdentity {
             model_family: "llama".into(),
             effective_model_type: self.args.model_type.clone(),
@@ -930,17 +850,7 @@ impl ArchitectureAdapter for LlamaLayerwiseAdapter {
                 PromptCacheTopology::default,
                 PromptCacheTopology::for_parallel_topology,
             ),
-            layer_layout: PromptCacheModelIdentity::key_value_layouts(
-                self.args.attention_schedule.iter().map(|policy| {
-                    policy.window().map(|window| {
-                        i32::try_from(window.get())
-                            .expect("validated Llama attention window fits i32")
-                    })
-                }),
-                local_kv_heads,
-                self.args.head_dim,
-            )
-            .map_err(|error| Exception::custom(error.to_string()))?,
+            layer_layout,
         })
     }
 
@@ -992,21 +902,34 @@ impl ArchitectureAdapter for LlamaLayerwiseAdapter {
     }
 
     fn static_units(&self, store: &dyn WeightStore) -> Result<Vec<StaticUnitBindings>, Error> {
-        let mut units = vec![
-            StaticUnitBindings::new(
+        self.selected_static_units(store, &|_| true)
+    }
+
+    fn selected_static_units(
+        &self,
+        store: &dyn WeightStore,
+        select: &dyn Fn(&str) -> bool,
+    ) -> Result<Vec<StaticUnitBindings>, Error> {
+        let mut units = Vec::new();
+        if select(EMBEDDING_UNIT) {
+            units.push(StaticUnitBindings::new(
                 EMBEDDING_UNIT,
                 build_module_bindings(&self.embedding, "model.embed_tokens", store)?,
-            )?,
-            StaticUnitBindings::new(
+            )?);
+        }
+        if select(NORM_UNIT) {
+            units.push(StaticUnitBindings::new(
                 NORM_UNIT,
                 build_module_bindings(&self.norm, "model.norm", store)?,
-            )?,
-        ];
-        if let Some(head) = &self.lm_head {
-            units.push(StaticUnitBindings::new(
-                HEAD_UNIT,
-                build_module_bindings(head, "lm_head", store)?,
             )?);
+        }
+        if select(HEAD_UNIT) {
+            if let Some(head) = &self.lm_head {
+                units.push(StaticUnitBindings::new(
+                    HEAD_UNIT,
+                    build_module_bindings(head, "lm_head", store)?,
+                )?);
+            }
         }
         Ok(units)
     }
@@ -1129,18 +1052,18 @@ impl ArchitectureAdapter for LlamaLayerwiseAdapter {
         })
     }
 
-    fn execution_group_count(&self) -> usize {
-        1
-    }
-
-    fn execution_group_id(&self, group: usize) -> Result<String, Error> {
-        (group == 0)
-            .then(|| "text_decoder".into())
-            .ok_or_else(|| Error::UnsupportedArchitecture(format!("Llama has no group {group}")))
+    fn execution_graph(
+        &self,
+    ) -> Result<crate::runtime::execution::layerwise::ExecutionGroupDag, Error> {
+        crate::runtime::execution::layerwise::ExecutionGroupDag::chain(["text_decoder"])
     }
 
     fn layer_count(&self, group: usize) -> Result<usize, Error> {
-        self.execution_group_id(group)?;
+        if group != 0 {
+            return Err(Error::UnsupportedArchitecture(format!(
+                "Llama has no group {group}"
+            )));
+        }
         usize::try_from(self.args.num_hidden_layers).map_err(|_| {
             LlamaModelError::InvalidLayerCount {
                 count: self.args.num_hidden_layers,
@@ -1150,7 +1073,11 @@ impl ArchitectureAdapter for LlamaLayerwiseAdapter {
     }
 
     fn new_layer(&self, group: usize, index: usize, stream: &Stream) -> Result<Self::Layer, Error> {
-        self.execution_group_id(group)?;
+        if group != 0 {
+            return Err(Error::UnsupportedArchitecture(format!(
+                "Llama has no group {group}"
+            )));
+        }
         let index =
             i32::try_from(index).map_err(|_| LlamaModelError::LayerIndexOverflow { index })?;
         Ok(TransformerBlock::new_for_layer(&self.args, index, stream)?)
@@ -1185,7 +1112,12 @@ impl ArchitectureAdapter for LlamaLayerwiseAdapter {
         }
         for index in 0..self.args.num_hidden_layers as usize {
             let layer = TransformerBlock::new_for_layer(&self.args, index as i32, stream)?;
-            register_llama_layer_parallel_plan(planner, &layer, &format!("model.layers.{index}"))?;
+            register_llama_layer_parallel_plan(
+                planner,
+                &layer,
+                &self.args,
+                &format!("model.layers.{index}"),
+            )?;
         }
         Ok(())
     }
@@ -1193,9 +1125,15 @@ impl ArchitectureAdapter for LlamaLayerwiseAdapter {
     fn configure_parallel_static(
         &mut self,
         context: crate::runtime::distributed::parallel::ParallelBuildContext,
-        _layout: &crate::runtime::distributed::parallel::LocalModelLayout,
+        layout: &crate::runtime::distributed::parallel::LocalModelLayout,
         stream: &Stream,
     ) -> Result<(), Error> {
+        self.parallel_kv_heads = Some(planned_kv_head_layout(
+            layout,
+            self.args.num_hidden_layers as usize,
+            self.args.head_dim,
+            "model.layers",
+        )?);
         self.parallel_embedding = Some(VocabParallelEmbedding::unloaded(
             self.args.vocab_size as usize,
             self.args.hidden_size,
@@ -1223,7 +1161,11 @@ impl ArchitectureAdapter for LlamaLayerwiseAdapter {
         layout: &crate::runtime::distributed::parallel::LocalModelLayout,
         stream: &Stream,
     ) -> Result<Self::Layer, Error> {
-        self.execution_group_id(group)?;
+        if group != 0 {
+            return Err(Error::UnsupportedArchitecture(format!(
+                "Llama has no group {group}"
+            )));
+        }
         let prefix = format!("model.layers.{index}");
         let q = layout
             .tensor(&format!("{prefix}.self_attn.q_proj.weight"))
@@ -1238,9 +1180,20 @@ impl ArchitectureAdapter for LlamaLayerwiseAdapter {
             .or_else(|| layout.tensor(&format!("{prefix}.mlp.gate_proj.inner.weight")))
             .ok_or_else(|| Error::Parallel(format!("missing TP layout for {prefix} MLP")))?;
         let mut args = self.args.clone();
-        args.num_attention_heads = q.local_shape()[0] as i32 / args.head_dim;
-        args.num_key_value_heads = k.local_shape()[0] as i32 / args.head_dim;
-        args.intermediate_size = gate.local_shape()[0] as i32;
+        let query_width = i32::try_from(q.local_shape()[0])
+            .map_err(|_| Error::Parallel("local Llama query width exceeds i32".into()))?;
+        let key_width = i32::try_from(k.local_shape()[0])
+            .map_err(|_| Error::Parallel("local Llama key width exceeds i32".into()))?;
+        if query_width % args.head_dim != 0 || key_width % args.head_dim != 0 {
+            return Err(Error::Parallel(format!(
+                "local Llama attention widths q={query_width}, k={key_width} split head dimension {}",
+                args.head_dim
+            )));
+        }
+        args.num_attention_heads = query_width / args.head_dim;
+        args.num_key_value_heads = key_width / args.head_dim;
+        args.intermediate_size = i32::try_from(gate.local_shape()[0])
+            .map_err(|_| Error::Parallel("local Llama MLP width exceeds i32".into()))?;
         Ok(TransformerBlock::new_for_layer(
             &args,
             index as i32,
@@ -1387,6 +1340,120 @@ impl ArchitectureAdapter for LlamaLayerwiseAdapter {
 
     fn ignores_checkpoint_key(&self, key: &str) -> bool {
         key.starts_with("rope_freqs.") || key.ends_with(".rotary_emb.inv_freq")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use safemlx::{Device, DeviceType, ExecutionContext};
+
+    use super::*;
+    use crate::runtime::{
+        attention::LayerSchedule,
+        checkpoint::quantization::AffineQuantization,
+        distributed::{
+            parallel::{ParallelBuildContext, ShardingPolicy},
+            topology::{DeviceAssignment, ParallelTopology},
+        },
+    };
+
+    fn build_context(rank: usize) -> ParallelBuildContext {
+        ParallelBuildContext::new(
+            ParallelTopology::from_rank(
+                2,
+                rank,
+                2,
+                1,
+                1,
+                DeviceAssignment::new(DeviceType::Cpu, 0),
+            )
+            .unwrap(),
+            ShardingPolicy::Require,
+        )
+    }
+
+    #[test]
+    fn quantized_llama_groups_share_uneven_aligned_head_and_mlp_ranges() {
+        let execution = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        let quantization = AffineQuantization::new(32, 4).unwrap().into();
+        let args = ModelArgs {
+            model_type: "llama".into(),
+            hidden_size: 96,
+            num_hidden_layers: 1,
+            intermediate_size: 96,
+            num_attention_heads: 6,
+            rms_norm_eps: 1e-5,
+            vocab_size: 64,
+            num_key_value_heads: 3,
+            max_position_embeddings: 64,
+            rope_theta: 10_000.0,
+            rope_traditional: false,
+            head_dim: 16,
+            tie_word_embeddings: false,
+            attention_bias: false,
+            mlp_bias: false,
+            rope_scaling: None,
+            attention_schedule: LayerSchedule::all_full(1).unwrap(),
+            quantization: None,
+            quantization_config: None,
+            quantized_weights: Some(
+                [
+                    "model.layers.0.self_attn.o_proj.weight".to_string(),
+                    "model.layers.0.mlp.down_proj.weight".to_string(),
+                ]
+                .into_iter()
+                .collect(),
+            ),
+            quantized_weight_configs: Some(HashMap::from([
+                (
+                    "model.layers.0.self_attn.o_proj.weight".into(),
+                    quantization,
+                ),
+                ("model.layers.0.mlp.down_proj.weight".into(), quantization),
+            ])),
+        };
+        let layer = TransformerBlock::new_for_layer(&args, 0, execution.stream()).unwrap();
+
+        for (rank, local_heads, local_intermediate, packed_width, scale_width) in
+            [(0, 2, 64, 8, 2), (1, 1, 32, 4, 1)]
+        {
+            let mut planner = build_context(rank).planner();
+            register_llama_layer_parallel_plan(&mut planner, &layer, &args, "model.layers.0")
+                .unwrap();
+            let (_, layout) = planner.finish().unwrap();
+            assert_eq!(
+                planned_kv_head_layout(&layout, 1, 16, "model.layers").unwrap(),
+                vec![local_heads]
+            );
+            assert_eq!(
+                layout
+                    .tensor("model.layers.0.self_attn.o_proj.inner.weight")
+                    .unwrap()
+                    .local_shape(),
+                &[96, packed_width]
+            );
+            assert_eq!(
+                layout
+                    .tensor("model.layers.0.self_attn.o_proj.scales")
+                    .unwrap()
+                    .local_shape(),
+                &[96, scale_width]
+            );
+            assert_eq!(
+                layout
+                    .tensor("model.layers.0.mlp.gate_proj.weight")
+                    .unwrap()
+                    .local_shape(),
+                &[local_intermediate, 96]
+            );
+            assert_eq!(
+                layout
+                    .tensor("model.layers.0.mlp.down_proj.inner.weight")
+                    .unwrap()
+                    .local_shape(),
+                &[96, packed_width]
+            );
+        }
     }
 }
 

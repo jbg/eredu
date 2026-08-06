@@ -55,6 +55,22 @@ pub trait ActivationObserver {
     }
 }
 
+pub(crate) struct ActivationObserverProxy<'a>(pub &'a mut dyn ActivationObserver);
+
+impl ActivationObserver for ActivationObserverProxy<'_> {
+    fn observe(&mut self, name: &str, value: &Array) -> Result<(), Exception> {
+        self.0.observe(name, value)
+    }
+
+    fn intervene(&mut self, name: &str, value: &Array) -> Result<Option<Array>, Exception> {
+        self.0.intervene(name, value)
+    }
+
+    fn observe_moe_routing(&mut self, routing: MoeRoutingObservation<'_>) -> Result<(), Exception> {
+        self.0.observe_moe_routing(routing)
+    }
+}
+
 impl<F> ActivationObserver for F
 where
     F: FnMut(&str, &Array) -> Result<(), Exception>,

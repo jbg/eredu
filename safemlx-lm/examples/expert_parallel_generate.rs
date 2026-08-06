@@ -46,7 +46,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut cache = model.new_cache();
     let prompt = safemlx::Array::from_slice(&[1u32, 2, 3], &[1, 3]);
-    let mut logits = model.prefill(&prompt, &mut cache, &group, &stream)?;
+    let mut logits = model.forward(&prompt, None, &mut cache, &group, &stream)?;
     let mut sampler = DefaultSampler;
     for _ in 0..8 {
         let synchronized = model.sample_and_synchronize(
@@ -69,7 +69,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if synchronized.finished {
             break;
         }
-        logits = model.decode(&synchronized.token, &mut cache, &group, &stream)?;
+        logits = model.forward(&synchronized.token, None, &mut cache, &group, &stream)?;
     }
     Ok(())
 }

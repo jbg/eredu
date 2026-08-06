@@ -31,7 +31,7 @@ use safemlx_lm::{
         inkling::model as inkling,
         lfm2::model as lfm2,
         nemotron_h::model as nemotron_h,
-        qwen::{dense as dense_qwen, hybrid::qwen3_5 as qwen3_5_moe, vl::model as qwen3_vl},
+        qwen::{dense as dense_qwen, hybrid::qwen3_5, vl::model as qwen3_vl},
     },
     runtime::cache::{ConcatKeyValueCache, SlidingKeyValueCache},
     runtime::checkpoint::quantization::{AffineQuantization, WeightQuantization},
@@ -261,7 +261,8 @@ fn expert_parallel_model_ring_worker() {
     let _profiling = profile_expert_parallel_timings();
     let prompt = Array::from_slice(&[1u32, 2, 3], &[1, 3]);
     let persist_prompt = checkpoint.join(PROMPT_CACHE_MARKER).exists();
-    let paged_prompt = persist_prompt && matches!(architecture.as_str(), "DeepSeekV3" | "GptOss");
+    let paged_prompt =
+        persist_prompt && matches!(architecture.as_str(), "DeepSeekV3" | "GptOss" | "NemotronH");
     let paged = PagedCacheOptions::new(1, 16 * 1024, 16 * 1024, 1)
         .unwrap()
         .with_full_attention(true);
@@ -272,8 +273,15 @@ fn expert_parallel_model_ring_worker() {
     } else {
         model.new_cache()
     };
-    let prefill = model.prefill(&prompt, &mut cache, &group, stream).unwrap();
+    let prefill = model
+        .forward(&prompt, None, &mut cache, &group, stream)
+        .unwrap();
     assert_close(&prefill, &expected["prefill"]);
+    if paged_prompt {
+        let report = model.cache_residency_report(&cache).unwrap().unwrap();
+        assert_eq!(report.logical_cached_tokens, 3);
+        assert!(report.current_device_bytes > 0);
+    }
     assert_eq!(
         model.latest_routing_statistics().total_routes,
         6 * moe_layers
@@ -295,7 +303,7 @@ fn expert_parallel_model_ring_worker() {
     assert!(!first.finished);
 
     let uninterrupted = model
-        .decode(&first.token, &mut cache, &group, stream)
+        .forward(&first.token, None, &mut cache, &group, stream)
         .unwrap();
     let decode = if persist_prompt {
         let uninterrupted_values = uninterrupted.evaluated().unwrap();
@@ -330,7 +338,9 @@ fn expert_parallel_model_ring_worker() {
         let root = checkpoint.join("prompt-cache");
         // Persist the prefix state, not the uninterrupted suffix token.
         cache.reset().unwrap();
-        let _ = model.prefill(&prompt, &mut cache, &group, stream).unwrap();
+        let _ = model
+            .forward(&prompt, None, &mut cache, &group, stream)
+            .unwrap();
         model
             .save_prompt_cache(
                 &mut cache,
@@ -346,7 +356,7 @@ fn expert_parallel_model_ring_worker() {
             .unwrap();
         assert_eq!(manifest.topology, descriptor.topology);
         let restored = model
-            .decode(&first.token, &mut restored, &group, stream)
+            .forward(&first.token, None, &mut restored, &group, stream)
             .map(|restored_logits| (restored, restored_logits))
             .unwrap();
         let restored_values = restored.1.evaluated().unwrap();
@@ -377,7 +387,7 @@ fn expert_parallel_model_ring_worker() {
         &expected["second_token"],
     );
     let decode_second = model
-        .decode(&second.token, &mut cache, &group, stream)
+        .forward(&second.token, None, &mut cache, &group, stream)
         .unwrap();
     assert_close(&decode_second, &expected["decode_second"]);
     assert_eq!(
@@ -455,7 +465,7 @@ fn expert_parallel_model_ring_worker() {
         let paging = PagedCacheOptions::new(1, 1 << 20, 1 << 20, 1).unwrap();
         let mut sliding_cache = model.new_qwen3_sliding_cache(2, paging).unwrap();
         let sliding_prefill = model
-            .prefill(&prompt, &mut sliding_cache, &group, stream)
+            .forward(&prompt, None, &mut sliding_cache, &group, stream)
             .unwrap();
         assert_close(&sliding_prefill, &expected["sliding_prefill"]);
         let sliding_first = model
@@ -475,7 +485,13 @@ fn expert_parallel_model_ring_worker() {
             &expected["sliding_first_token"],
         );
         let sliding_decode = model
-            .decode(&sliding_first.token, &mut sliding_cache, &group, stream)
+            .forward(
+                &sliding_first.token,
+                None,
+                &mut sliding_cache,
+                &group,
+                stream,
+            )
             .unwrap();
         assert_close(&sliding_decode, &expected["sliding_decode"]);
         let sliding_second = model
@@ -495,7 +511,13 @@ fn expert_parallel_model_ring_worker() {
             &expected["sliding_second_token"],
         );
         let sliding_decode_second = model
-            .decode(&sliding_second.token, &mut sliding_cache, &group, stream)
+            .forward(
+                &sliding_second.token,
+                None,
+                &mut sliding_cache,
+                &group,
+                stream,
+            )
             .unwrap();
         assert_close(&sliding_decode_second, &expected["sliding_decode_second"]);
         assert_eq!(sliding_cache.offset(), 5);
@@ -1064,6 +1086,10 @@ fn initialize_zero_fixture(model: &mut impl ModuleParameters, stream: &Stream) {
         let dtype = parameter.dtype();
         *parameter = if name.ends_with("_scales") {
             Array::full::<u8>(&shape, Array::from_slice(&[127u8], &[]), stream).unwrap()
+        } else if name.ends_with("mamba.A_log") {
+            // Nemotron-H checkpoints store the negative transition rate;
+            // streamed binding converts it to the runtime's log-space value.
+            Array::full::<f32>(&shape, Array::from_f32(-1.0), stream).unwrap()
         } else if name.ends_with("norm.weight")
             || name.ends_with("layernorm.weight")
             || name.ends_with("global_scale")
@@ -1216,7 +1242,7 @@ fn write_additional_sparse_fixtures(root: &Path) -> Vec<(&'static str, &'static 
 
     for (next, label, architecture) in [
         (true, "Qwen3-Next sparse expert cache", "Qwen3Next"),
-        (false, "Qwen3.5 sparse expert cache", "Qwen35Moe"),
+        (false, "Qwen3.5 sparse expert cache", "Qwen35"),
     ] {
         let config = serde_json::json!({
             "model_type": if next { "qwen3_next" } else { "qwen3_5_moe_text" },
@@ -1238,8 +1264,8 @@ fn write_additional_sparse_fixtures(root: &Path) -> Vec<(&'static str, &'static 
             "qwen35-sparse"
         });
         std::fs::create_dir_all(&directory).unwrap();
-        let mut model = qwen3_5_moe::Model::new(
-            qwen3_5_moe::model_args_from_config_value(&config).unwrap(),
+        let mut model = qwen3_5::Model::new(
+            qwen3_5::model_args_from_config_value(&config).unwrap(),
             None,
             None,
             None,
@@ -1642,7 +1668,7 @@ fn ring_two_process_paged_prompt_cache_parity() {
     let nemotron = find("NemotronH");
     std::fs::write(nemotron.join(PROMPT_CACHE_MARKER), b"1").unwrap();
     run_ring_fixture(
-        "Nemotron-H replicated Mamba prompt cache",
+        "Nemotron-H live-paged KV and resident Mamba prompt cache",
         "NemotronH",
         "dense",
         "balanced",

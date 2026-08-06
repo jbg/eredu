@@ -1,8 +1,9 @@
 //! Architecture-independent execution of decoder models from resident layers.
 //!
-//! [`LayerwiseModel`] owns checkpoint storage, residency, bounded device
+//! [`crate::runtime::execution::layerwise::LayerwiseModel`] owns checkpoint
+//! storage, residency, bounded device
 //! windows, and synchronization. Model-family behavior is supplied by an
-//! [`ArchitectureAdapter`].
+//! [`crate::runtime::execution::layerwise::ArchitectureAdapter`].
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -21,7 +22,8 @@ use crate::{
     runtime::checkpoint::binding::{
         binding_bytes, build_module_bindings, populate_module_from_lease, ModuleBindingError,
     },
-    runtime::checkpoint::store::{SafetensorsWeightStore, WeightStore},
+    runtime::checkpoint::store::{MemoryWeightStore, SafetensorsWeightStore, WeightStore},
+    runtime::execution::inspection::{ActivationObserver, ActivationObserverProxy},
     runtime::residency::dense_stream::{
         BackgroundLayerPrefetch, BackgroundPrefetchReport, DenseDiskStreamLoadOptions,
     },
@@ -45,6 +47,31 @@ pub(crate) fn open_safetensors_weight_store(
     Ok(Arc::new(
         SafetensorsWeightStore::open_with_max_mapped_shards(model_dir, max_mapped_shards)?,
     ))
+}
+
+/// Captures a completed load-time transformation as an immutable checkpoint.
+///
+/// Quantization changes one dense source tensor into a packed parameter group,
+/// so it cannot be represented as a one-to-one lazy binding. The transformation
+/// is performed once, then this store hands the resulting arrays to the same
+/// generalized residency and execution engine used by native packed artifacts.
+pub(crate) fn transformed_module_weight_store(
+    module: &impl ModuleParameters,
+) -> Result<SharedWeightStore, Error> {
+    let mut arrays = BTreeMap::new();
+    for (parameter_name, value) in module.parameters().flatten() {
+        let checkpoint_name =
+            crate::runtime::checkpoint::binding::canonical_checkpoint_name(&parameter_name);
+        if arrays
+            .insert(checkpoint_name.clone(), value.clone())
+            .is_some()
+        {
+            return Err(Error::Quantization(format!(
+                "load-time transformation produced duplicate checkpoint tensor {checkpoint_name:?}"
+            )));
+        }
+    }
+    Ok(Arc::new(MemoryWeightStore::new(arrays)?))
 }
 
 pub(crate) fn validate_gguf_layerwise_source(
@@ -148,6 +175,19 @@ impl WeightResidency {
                 } else {
                     options.expert_cache.non_expert.max_mapped_shards
                 }
+            }
+        }
+    }
+
+    /// Returns whether whole-artifact admission rejects unrelated tensors.
+    pub(crate) const fn strict_loading(self) -> bool {
+        match self {
+            Self::FullyResident => true,
+            Self::LayerwiseHost(options) => options.strict_loading,
+            Self::DenseDiskStream(options) => options.strict_loading,
+            Self::SparseExpertCache(options) => options.non_expert.strict_loading,
+            Self::SparseExpertCacheWithDenseLayers(options) => {
+                options.expert_cache.non_expert.strict_loading && options.non_expert.strict_loading
             }
         }
     }
@@ -1223,7 +1263,7 @@ pub struct StaticUnitBindings {
 
 impl StaticUnitBindings {
     /// Creates a pinned static unit definition.
-    pub fn new(
+    pub(crate) fn new(
         id: impl Into<String>,
         bindings: Vec<crate::runtime::residency::manager::WeightBinding>,
     ) -> Result<Self, Error> {
@@ -1232,14 +1272,219 @@ impl StaticUnitBindings {
             bindings,
         })
     }
+
+    /// Returns the stable residency identifier for this static module.
+    pub(crate) const fn id(&self) -> &OffloadUnitId {
+        &self.id
+    }
+
+    /// Returns the authoritative checkpoint bindings for this static module.
+    pub(crate) fn bindings(&self) -> &[crate::runtime::residency::manager::WeightBinding] {
+        &self.bindings
+    }
 }
 
 /// Forward state returned by a generalized architecture adapter.
 pub struct LayerwiseForwardState<C> {
-    /// Activation consumed by the first sequential execution group.
+    /// Initial activation made available to root execution groups.
     pub hidden: Array,
     /// Architecture-owned masks, positions, and auxiliary per-forward state.
     pub context: C,
+}
+
+/// One named execution group and the groups whose completed outputs it consumes.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct ExecutionGroupSpec {
+    id: String,
+    dependencies: Vec<String>,
+}
+
+impl ExecutionGroupSpec {
+    /// Declares a root execution group.
+    pub fn root(id: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            dependencies: Vec::new(),
+        }
+    }
+
+    /// Declares a group with named input dependencies.
+    pub fn with_dependencies(
+        id: impl Into<String>,
+        dependencies: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            dependencies: dependencies.into_iter().map(Into::into).collect(),
+        }
+    }
+
+    /// Returns the stable group identifier.
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    /// Returns dependency identifiers in declaration order.
+    pub fn dependencies(&self) -> &[String] {
+        &self.dependencies
+    }
+}
+
+/// Validated execution-group dependency graph with one authoritative output.
+///
+/// Group slots retain declaration order for architecture callbacks. Execution
+/// follows the stable topological order derived here, never numeric adjacency.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct ExecutionGroupDag {
+    groups: Vec<ExecutionGroupSpec>,
+    dependencies: Vec<Vec<usize>>,
+    execution_order: Vec<usize>,
+    output: usize,
+}
+
+impl ExecutionGroupDag {
+    /// Validates unique names, dependency references, acyclicity, and that
+    /// every declared group contributes transitively to `output`.
+    pub fn new(groups: Vec<ExecutionGroupSpec>, output: impl AsRef<str>) -> Result<Self, Error> {
+        if groups.is_empty() {
+            return Err(LayerwiseModelError::EmptyExecutionGraph.into());
+        }
+        let mut by_id = BTreeMap::new();
+        for (index, group) in groups.iter().enumerate() {
+            if group.id.is_empty() {
+                return Err(LayerwiseModelError::EmptyExecutionGroupId.into());
+            }
+            if by_id.insert(group.id.clone(), index).is_some() {
+                return Err(LayerwiseModelError::DuplicateExecutionGroup(group.id.clone()).into());
+            }
+        }
+        let output_name = output.as_ref();
+        let output = by_id.get(output_name).copied().ok_or_else(|| {
+            LayerwiseModelError::UnknownExecutionGraphOutput(output_name.to_string())
+        })?;
+        let mut dependencies = Vec::with_capacity(groups.len());
+        let mut dependents = vec![Vec::new(); groups.len()];
+        let mut indegree = vec![0usize; groups.len()];
+        for (index, group) in groups.iter().enumerate() {
+            let mut seen = BTreeSet::new();
+            let mut resolved = Vec::with_capacity(group.dependencies.len());
+            for dependency in &group.dependencies {
+                let dependency_index = by_id.get(dependency).copied().ok_or_else(|| {
+                    LayerwiseModelError::UnknownExecutionGroupDependency {
+                        group: group.id.clone(),
+                        dependency: dependency.clone(),
+                    }
+                })?;
+                if dependency_index == index {
+                    return Err(
+                        LayerwiseModelError::SelfDependentExecutionGroup(group.id.clone()).into(),
+                    );
+                }
+                if !seen.insert(dependency_index) {
+                    return Err(LayerwiseModelError::DuplicateExecutionGroupDependency {
+                        group: group.id.clone(),
+                        dependency: dependency.clone(),
+                    }
+                    .into());
+                }
+                resolved.push(dependency_index);
+                dependents[dependency_index].push(index);
+            }
+            indegree[index] = resolved.len();
+            dependencies.push(resolved);
+        }
+        let mut ready = indegree
+            .iter()
+            .enumerate()
+            .filter_map(|(index, &degree)| (degree == 0).then_some(index))
+            .collect::<BTreeSet<_>>();
+        let mut execution_order = Vec::with_capacity(groups.len());
+        while let Some(index) = ready.pop_first() {
+            execution_order.push(index);
+            for &dependent in &dependents[index] {
+                indegree[dependent] -= 1;
+                if indegree[dependent] == 0 {
+                    ready.insert(dependent);
+                }
+            }
+        }
+        if execution_order.len() != groups.len() {
+            return Err(LayerwiseModelError::CyclicExecutionGraph.into());
+        }
+        let mut contributes = BTreeSet::new();
+        let mut pending = vec![output];
+        while let Some(index) = pending.pop() {
+            if contributes.insert(index) {
+                pending.extend(dependencies[index].iter().copied());
+            }
+        }
+        if contributes.len() != groups.len() {
+            let disconnected = groups
+                .iter()
+                .enumerate()
+                .filter_map(|(index, group)| {
+                    (!contributes.contains(&index)).then_some(group.id.clone())
+                })
+                .collect();
+            return Err(LayerwiseModelError::DisconnectedExecutionGroups { disconnected }.into());
+        }
+        Ok(Self {
+            groups,
+            dependencies,
+            execution_order,
+            output,
+        })
+    }
+
+    /// Creates a dependency chain in iterator order whose final group is the output.
+    pub fn chain(ids: impl IntoIterator<Item = impl Into<String>>) -> Result<Self, Error> {
+        let ids = ids.into_iter().map(Into::into).collect::<Vec<String>>();
+        let output = ids
+            .last()
+            .cloned()
+            .ok_or(LayerwiseModelError::EmptyExecutionGraph)?;
+        let groups = ids
+            .iter()
+            .enumerate()
+            .map(|(index, id)| match index.checked_sub(1) {
+                Some(previous) => {
+                    ExecutionGroupSpec::with_dependencies(id.clone(), [ids[previous].clone()])
+                }
+                None => ExecutionGroupSpec::root(id.clone()),
+            })
+            .collect();
+        Self::new(groups, output)
+    }
+
+    /// Returns group specifications in stable architecture slot order.
+    pub fn groups(&self) -> &[ExecutionGroupSpec] {
+        &self.groups
+    }
+
+    /// Returns stable topological execution slots.
+    pub fn execution_order(&self) -> &[usize] {
+        &self.execution_order
+    }
+
+    /// Returns dependency slots for an architecture group slot.
+    pub fn dependencies(&self, group: usize) -> Option<&[usize]> {
+        self.dependencies.get(group).map(Vec::as_slice)
+    }
+
+    /// Returns the authoritative output group slot.
+    pub const fn output(&self) -> usize {
+        self.output
+    }
+
+    fn consumer_counts(&self) -> Vec<usize> {
+        let mut counts = vec![0; self.groups.len()];
+        for dependencies in &self.dependencies {
+            for &dependency in dependencies {
+                counts[dependency] += 1;
+            }
+        }
+        counts
+    }
 }
 
 /// Canonical architecture contract for resident, bounded-residency, and future
@@ -1317,6 +1562,22 @@ pub trait ArchitectureAdapter: Sized {
     /// Builds bindings for modules that remain pinned on the execution device.
     fn static_units(&self, store: &dyn WeightStore) -> Result<Vec<StaticUnitBindings>, Error>;
 
+    /// Builds only static units selected by their stable architecture id.
+    ///
+    /// Adapters should override this when binding construction consults a
+    /// sharded store, so distributed stages do not open unowned static shards.
+    fn selected_static_units(
+        &self,
+        store: &dyn WeightStore,
+        select: &dyn Fn(&str) -> bool,
+    ) -> Result<Vec<StaticUnitBindings>, Error> {
+        Ok(self
+            .static_units(store)?
+            .into_iter()
+            .filter(|unit| select(unit.id().as_str()))
+            .collect())
+    }
+
     /// Assigns pinned leases to the adapter's static modules.
     fn populate_static(&mut self, leases: &[ResidentUnitLease]) -> Result<(), Error>;
 
@@ -1341,11 +1602,8 @@ pub trait ArchitectureAdapter: Sized {
         self.begin_forward(input, cache, execution.stream())
     }
 
-    /// Returns the number of named sequential groups used by this adapter.
-    fn execution_group_count(&self) -> usize;
-
-    /// Returns the stable name of one sequential execution group.
-    fn execution_group_id(&self, group: usize) -> Result<String, Error>;
+    /// Declares the complete named execution-group dependency graph.
+    fn execution_graph(&self) -> Result<ExecutionGroupDag, Error>;
 
     /// Returns whether a group is needed for this particular forward pass.
     ///
@@ -1363,8 +1621,7 @@ pub trait ArchitectureAdapter: Sized {
     /// Describes this architecture's physical checkpoint tensors using typed
     /// logical roles for tensor-parallel planning.
     ///
-    /// Existing family adapters deliberately fail here until their dedicated
-    /// tensor-parallel migration is complete.
+    /// Adapters without an exact tensor-parallel parameter plan fail closed.
     fn parallel_parameter_groups(
         &self,
         _context: crate::runtime::distributed::parallel::ParallelBuildContext,
@@ -1485,6 +1742,32 @@ pub trait ArchitectureAdapter: Sized {
         stream: &Stream,
     ) -> Result<Array, Error>;
 
+    /// Executes one populated unit with architecture-specific observation.
+    ///
+    /// The default provides stable unit boundary names. Adapters whose block
+    /// math exposes richer observations override this hook without replacing
+    /// residency, cache, or graph execution.
+    #[allow(clippy::too_many_arguments)]
+    fn forward_layer_with_observer<O: ActivationObserver>(
+        &mut self,
+        group: usize,
+        index: usize,
+        layer: &mut Self::Layer,
+        hidden: &Array,
+        cache: &mut Self::Cache,
+        context: &mut Self::ForwardContext,
+        stream: &Stream,
+        observer: &mut O,
+    ) -> Result<Array, Error> {
+        let prefix = self.layer_checkpoint_prefix(group, index);
+        observer.observe(&format!("{prefix}.input"), hidden)?;
+        let output = self.forward_layer(group, index, layer, hidden, cache, context, stream)?;
+        observer.observe(&format!("{prefix}.output"), &output)?;
+        Ok(observer
+            .intervene(&format!("{prefix}.output"), &output)?
+            .unwrap_or(output))
+    }
+
     /// Executes one unit under an explicit replicated or TP context.
     ///
     /// The default preserves ordinary execution and rejects TP, ensuring a
@@ -1536,11 +1819,57 @@ pub trait ArchitectureAdapter: Sized {
         Vec::new()
     }
 
+    /// Selects or assembles the activation consumed by one ready group.
+    ///
+    /// Root groups receive `initial_hidden`. A group with one dependency uses
+    /// that output by default. Multi-input groups must define an exact merge.
+    #[allow(clippy::too_many_arguments)]
+    fn begin_execution_group(
+        &mut self,
+        group: usize,
+        initial_hidden: &Array,
+        dependency_outputs: &[Array],
+        _cache: &mut Self::Cache,
+        _context: &mut Self::ForwardContext,
+        _stream: &Stream,
+    ) -> Result<Array, Error> {
+        match dependency_outputs {
+            [] => Ok(initial_hidden.clone()),
+            [dependency] => Ok(dependency.clone()),
+            _ => Err(LayerwiseModelError::UnmergedExecutionGroupInputs {
+                group,
+                inputs: dependency_outputs.len(),
+            }
+            .into()),
+        }
+    }
+
+    /// Selects or assembles a ready group under an explicit execution context.
+    #[allow(clippy::too_many_arguments)]
+    fn begin_execution_group_with_execution(
+        &mut self,
+        group: usize,
+        initial_hidden: &Array,
+        dependency_outputs: &[Array],
+        cache: &mut Self::Cache,
+        context: &mut Self::ForwardContext,
+        execution: &crate::runtime::distributed::parallel::ParallelExecutionContext<'_>,
+    ) -> Result<Array, Error> {
+        self.begin_execution_group(
+            group,
+            initial_hidden,
+            dependency_outputs,
+            cache,
+            context,
+            execution.stream(),
+        )
+    }
+
     /// Converts one group's output into the activation consumed by the next group.
     ///
     /// Multimodal adapters use this hook to merge encoded media before entering
     /// a text decoder. Homogeneous adapters keep the activation unchanged.
-    fn finish_execution_group(
+    fn complete_execution_group(
         &mut self,
         _group: usize,
         hidden: &Array,
@@ -1552,7 +1881,7 @@ pub trait ArchitectureAdapter: Sized {
     }
 
     /// Converts group output under an explicit execution context.
-    fn finish_execution_group_with_execution(
+    fn complete_execution_group_with_execution(
         &mut self,
         group: usize,
         hidden: &Array,
@@ -1560,7 +1889,7 @@ pub trait ArchitectureAdapter: Sized {
         context: &mut Self::ForwardContext,
         execution: &crate::runtime::distributed::parallel::ParallelExecutionContext<'_>,
     ) -> Result<Array, Error> {
-        self.finish_execution_group(group, hidden, cache, context, execution.stream())
+        self.complete_execution_group(group, hidden, cache, context, execution.stream())
     }
 
     /// Applies final normalization, projections, or family-specific output assembly.
@@ -1596,6 +1925,7 @@ pub trait ArchitectureAdapter: Sized {
 /// architecture math, cache validation, and runtime-unit construction.
 pub struct LayerwiseModel<A: ArchitectureAdapter> {
     adapter: A,
+    graph: ExecutionGroupDag,
     store: SharedWeightStore,
     residency: ResidencyManager,
     groups: Vec<ResidentLayerGroup>,
@@ -1634,19 +1964,29 @@ impl<A: ArchitectureAdapter> LayerwiseModel<A> {
     /// Creates an engine from a validated residency manager and execution groups.
     pub fn new(
         adapter: A,
+        graph: ExecutionGroupDag,
         store: SharedWeightStore,
         residency: ResidencyManager,
         groups: Vec<ResidentLayerGroup>,
         static_leases: Vec<ResidentUnitLease>,
     ) -> Result<Self, Error> {
-        if groups.len() != adapter.execution_group_count() {
+        if groups.len() != graph.groups().len() {
             return Err(LayerwiseModelError::ExecutionGroupCount {
-                adapter: adapter.execution_group_count(),
+                adapter: graph.groups().len(),
                 configured: groups.len(),
             }
             .into());
         }
         for (group_index, group) in groups.iter().enumerate() {
+            let expected_id = graph.groups()[group_index].id();
+            if group.id() != expected_id {
+                return Err(LayerwiseModelError::ExecutionGroupIdentity {
+                    slot: group_index,
+                    adapter: expected_id.to_string(),
+                    configured: group.id().to_string(),
+                }
+                .into());
+            }
             let expected = adapter.layer_count(group_index)?;
             if expected != group.units().len() {
                 return Err(LayerwiseModelError::ExecutionGroupLength {
@@ -1670,6 +2010,7 @@ impl<A: ArchitectureAdapter> LayerwiseModel<A> {
         };
         Ok(Self {
             adapter,
+            graph,
             store,
             residency,
             groups,
@@ -1836,7 +2177,7 @@ impl<A: ArchitectureAdapter> LayerwiseModel<A> {
     }
 
     /// Returns a shared handle to the persistent checkpoint store.
-    pub(crate) fn weight_store_arc(&self) -> SharedWeightStore {
+    pub(crate) fn checkpoint_store_arc(&self) -> SharedWeightStore {
         Arc::clone(&self.store)
     }
 
@@ -1845,14 +2186,14 @@ impl<A: ArchitectureAdapter> LayerwiseModel<A> {
         self.store.as_ref()
     }
 
-    /// Returns the persistent backend-neutral checkpoint store.
-    pub fn weight_store(&self) -> &(dyn WeightStore + Send + Sync) {
-        self.checkpoint_store()
-    }
-
     /// Returns named execution groups in deterministic order.
     pub fn execution_groups(&self) -> &[ResidentLayerGroup] {
         &self.groups
+    }
+
+    /// Returns the validated dependency graph governing group execution.
+    pub const fn execution_graph(&self) -> &ExecutionGroupDag {
+        &self.graph
     }
 
     /// Returns the reusable residency manager.
@@ -1873,7 +2214,7 @@ impl<A: ArchitectureAdapter> LayerwiseModel<A> {
             .transpose()
     }
 
-    /// Runs every sequential group while centrally enforcing lease safety.
+    /// Runs every graph-ready group while centrally enforcing lease safety.
     pub fn forward<'a>(
         &mut self,
         input: A::Input<'a>,
@@ -1937,12 +2278,12 @@ impl<A: ArchitectureAdapter> LayerwiseModel<A> {
             )?;
         self.adapter.validate_cache(cache)?;
         let LayerwiseForwardState {
-            mut hidden,
+            hidden: initial_hidden,
             mut context,
         } = self
             .adapter
             .begin_forward_with_execution(input, cache, &execution)?;
-        let prefill = hidden.dim(1) > 1;
+        let prefill = initial_hidden.dim(1) > 1;
         let dense_forward = self
             .dense_stream
             .as_ref()
@@ -1952,7 +2293,38 @@ impl<A: ArchitectureAdapter> LayerwiseModel<A> {
             .parallel_layout
             .as_ref()
             .expect("parallel topology has a layout");
-        for (group_index, resident_group) in self.groups.iter().enumerate() {
+        let mut group_outputs: Vec<Option<Array>> = vec![None; self.graph.groups().len()];
+        let mut remaining_consumers = self.graph.consumer_counts();
+        for group_index in self.graph.execution_order().iter().copied() {
+            let resident_group = &self.groups[group_index];
+            let dependency_slots = self
+                .graph
+                .dependencies(group_index)
+                .unwrap_or_default()
+                .to_vec();
+            let dependency_outputs = dependency_slots
+                .iter()
+                .map(|&dependency| {
+                    group_outputs[dependency]
+                        .as_ref()
+                        .expect("validated topological dependency")
+                        .clone()
+                })
+                .collect::<Vec<_>>();
+            let mut hidden = self.adapter.begin_execution_group_with_execution(
+                group_index,
+                &initial_hidden,
+                &dependency_outputs,
+                cache,
+                &mut context,
+                &execution,
+            )?;
+            for dependency in dependency_slots {
+                remaining_consumers[dependency] -= 1;
+                if remaining_consumers[dependency] == 0 {
+                    group_outputs[dependency] = None;
+                }
+            }
             let execute_group = self.adapter.should_execute_group(group_index, &context);
             let dense_guard = execute_group.then(|| {
                 self.dense_stream
@@ -2023,7 +2395,7 @@ impl<A: ArchitectureAdapter> LayerwiseModel<A> {
                     }
                 }
             }
-            hidden = self.adapter.finish_execution_group_with_execution(
+            hidden = self.adapter.complete_execution_group_with_execution(
                 group_index,
                 &hidden,
                 cache,
@@ -2035,7 +2407,11 @@ impl<A: ArchitectureAdapter> LayerwiseModel<A> {
             if let Some(Some(guard)) = dense_guard {
                 guard.complete()?;
             }
+            group_outputs[group_index] = Some(hidden);
         }
+        let hidden = group_outputs[self.graph.output()]
+            .take()
+            .expect("validated execution graph output was executed");
         let output = self
             .adapter
             .finish_with_execution(&hidden, cache, &context, &execution)?;
@@ -2076,6 +2452,41 @@ impl<A: ArchitectureAdapter> LayerwiseModel<A> {
     {
         self.forward_with_hooks(input, cache, stream, executor, |_, _, _| Ok(()))
             .map(|(output, _)| output)
+    }
+
+    /// Runs the canonical execution path while exposing stable per-unit inputs
+    /// and outputs to an activation observer.
+    ///
+    /// Observation is deliberately owned by the shared engine so fully
+    /// resident, host-layerwise, and disk-streamed policies report identical
+    /// names and intervention points.
+    pub fn forward_with_observer<'a>(
+        &mut self,
+        input: A::Input<'a>,
+        cache: &mut A::Cache,
+        stream: &Stream,
+        observer: &mut dyn ActivationObserver,
+    ) -> Result<Array, Error> {
+        let mut observer = ActivationObserverProxy(observer);
+        let output = self.forward_with_layer_executor(
+            input,
+            cache,
+            stream,
+            |adapter, group, index, layer, hidden, cache, context, stream| {
+                adapter.forward_layer_with_observer(
+                    group,
+                    index,
+                    layer,
+                    hidden,
+                    cache,
+                    context,
+                    stream,
+                    &mut observer,
+                )
+            },
+        )?;
+        observer.observe("model.logits", &output)?;
+        Ok(output)
     }
 
     /// Runs a generalized pass with caller-provided populated-layer execution
@@ -2161,19 +2572,50 @@ impl<A: ArchitectureAdapter> LayerwiseModel<A> {
         let execution =
             crate::runtime::distributed::parallel::ParallelExecutionContext::replicated(stream);
         let LayerwiseForwardState {
-            mut hidden,
+            hidden: initial_hidden,
             mut context,
         } = self
             .adapter
             .begin_forward_with_execution(input, cache, &execution)?;
-        let prefill = hidden.dim(1) > 1;
+        let prefill = initial_hidden.dim(1) > 1;
         let dense_forward = self
             .dense_stream
             .as_ref()
             .map(|streamer| streamer.forward_guard(prefill, &self.residency))
             .transpose()?;
 
-        for (group_index, group) in self.groups.iter().enumerate() {
+        let mut group_outputs: Vec<Option<Array>> = vec![None; self.graph.groups().len()];
+        let mut remaining_consumers = self.graph.consumer_counts();
+        for group_index in self.graph.execution_order().iter().copied() {
+            let group = &self.groups[group_index];
+            let dependency_slots = self
+                .graph
+                .dependencies(group_index)
+                .unwrap_or_default()
+                .to_vec();
+            let dependency_outputs = dependency_slots
+                .iter()
+                .map(|&dependency| {
+                    group_outputs[dependency]
+                        .as_ref()
+                        .expect("validated topological dependency")
+                        .clone()
+                })
+                .collect::<Vec<_>>();
+            let mut hidden = self.adapter.begin_execution_group_with_execution(
+                group_index,
+                &initial_hidden,
+                &dependency_outputs,
+                cache,
+                &mut context,
+                &execution,
+            )?;
+            for dependency in dependency_slots {
+                remaining_consumers[dependency] -= 1;
+                if remaining_consumers[dependency] == 0 {
+                    group_outputs[dependency] = None;
+                }
+            }
             let execute_group = self.adapter.should_execute_group(group_index, &context);
             let dense_guard = execute_group.then(|| {
                 self.dense_stream
@@ -2237,7 +2679,7 @@ impl<A: ArchitectureAdapter> LayerwiseModel<A> {
                     }
                 }
             }
-            hidden = self.adapter.finish_execution_group_with_execution(
+            hidden = self.adapter.complete_execution_group_with_execution(
                 group_index,
                 &hidden,
                 cache,
@@ -2252,7 +2694,12 @@ impl<A: ArchitectureAdapter> LayerwiseModel<A> {
             if let Some(Some(guard)) = dense_guard {
                 guard.complete()?;
             }
+            group_outputs[group_index] = Some(hidden);
         }
+
+        let hidden = group_outputs[self.graph.output()]
+            .take()
+            .expect("validated execution graph output was executed");
 
         let output = self
             .adapter
@@ -2351,13 +2798,14 @@ where
         )?;
     }
 
-    let mut groups = Vec::with_capacity(adapter.execution_group_count());
+    let execution_graph = adapter.execution_graph()?;
+    let mut groups = Vec::with_capacity(execution_graph.groups().len());
     let mut layer_parameter_bytes = 0u64;
     let mut device_window_bytes = 0u64;
     let mut host_window_bytes = 0u64;
     let mut planned_layer_count = 0usize;
     let mut maximum_group_depth = 0usize;
-    for group_index in 0..adapter.execution_group_count() {
+    for (group_index, group_spec) in execution_graph.groups().iter().enumerate() {
         let layer_count = adapter.layer_count(group_index)?;
         let depth = options.device_depth(layer_count);
         maximum_group_depth = maximum_group_depth.max(depth);
@@ -2434,7 +2882,7 @@ where
             )?;
         }
         groups.push(ResidentLayerGroup::new(
-            adapter.execution_group_id(group_index)?,
+            group_spec.id().to_string(),
             layer_ids,
             depth,
         )?);
@@ -2474,8 +2922,15 @@ where
         .collect::<Result<Vec<_>, _>>()?;
     adapter.populate_static(&static_leases)?;
 
-    let mut model = LayerwiseModel::new(adapter, store, residency, groups, static_leases)?
-        .with_memory_sampling(options.sample_mlx_memory(), options.sample_process_memory());
+    let mut model = LayerwiseModel::new(
+        adapter,
+        execution_graph,
+        store,
+        residency,
+        groups,
+        static_leases,
+    )?
+    .with_memory_sampling(options.sample_mlx_memory(), options.sample_process_memory());
     if fully_resident {
         model.materialize_resident_layers(stream)?;
     }
@@ -2566,13 +3021,14 @@ where
         )?;
     }
 
-    let mut groups = Vec::with_capacity(adapter.execution_group_count());
+    let execution_graph = adapter.execution_graph()?;
+    let mut groups = Vec::with_capacity(execution_graph.groups().len());
     let mut layer_parameter_bytes = 0u64;
     let mut device_window_bytes = 0u64;
     let mut host_window_bytes = 0u64;
     let mut planned_layer_count = 0usize;
     let mut maximum_group_depth = 0usize;
-    for group_index in 0..adapter.execution_group_count() {
+    for (group_index, group_spec) in execution_graph.groups().iter().enumerate() {
         let layer_count = adapter.layer_count(group_index)?;
         let depth = options.device_depth(layer_count);
         maximum_group_depth = maximum_group_depth.max(depth);
@@ -2664,7 +3120,7 @@ where
             )?;
         }
         groups.push(ResidentLayerGroup::new(
-            adapter.execution_group_id(group_index)?,
+            group_spec.id().to_string(),
             layer_ids,
             depth,
         )?);
@@ -2700,8 +3156,15 @@ where
         .map(|id| residency.acquire(id, MemoryTier::Device))
         .collect::<Result<Vec<_>, _>>()?;
     adapter.populate_static(&static_leases)?;
-    let mut model = LayerwiseModel::new(adapter, store, residency, groups, static_leases)?
-        .with_memory_sampling(options.sample_mlx_memory(), options.sample_process_memory());
+    let mut model = LayerwiseModel::new(
+        adapter,
+        execution_graph,
+        store,
+        residency,
+        groups,
+        static_leases,
+    )?
+    .with_memory_sampling(options.sample_mlx_memory(), options.sample_process_memory());
     model.parallel_layout = Some(layout);
     model.parallel_topology = Some(build.topology());
     if fully_resident {
@@ -2780,8 +3243,21 @@ pub(crate) fn shard_layer_bindings(
         let canonical_name = crate::runtime::checkpoint::binding::canonical_checkpoint_name(
             &format!("{prefix}.{}", binding.name()),
         );
-        let tensor = layout
-            .tensor(binding.checkpoint_key())
+        let logical_target = binding.logical_target();
+        let tensor = logical_target
+            .and_then(|target| layout.tensor(target))
+            .or_else(|| {
+                logical_target.and_then(|logical| {
+                    let canonical_logical =
+                        crate::runtime::checkpoint::binding::canonical_checkpoint_name(logical);
+                    layout.tensors().find_map(|(target, tensor)| {
+                        (crate::runtime::checkpoint::binding::canonical_checkpoint_name(target)
+                            == canonical_logical)
+                            .then_some(tensor)
+                    })
+                })
+            })
+            .or_else(|| layout.tensor(binding.checkpoint_key()))
             .or_else(|| layout.tensor(&canonical_name))
             .or_else(|| {
                 layout.tensors().find_map(|(target, tensor)| {
@@ -3076,6 +3552,56 @@ fn validate_device_budget(
 /// Structured failures produced by the generic layerwise execution engine.
 #[derive(Debug, thiserror::Error)]
 pub enum LayerwiseModelError {
+    /// An adapter declared no execution groups.
+    #[error("execution-group graph must contain at least one group")]
+    EmptyExecutionGraph,
+    /// A group has no stable identity.
+    #[error("execution-group identifiers must not be empty")]
+    EmptyExecutionGroupId,
+    /// Two groups use the same stable identity.
+    #[error("duplicate execution-group identifier {0:?}")]
+    DuplicateExecutionGroup(String),
+    /// The declared graph output does not exist.
+    #[error("execution-group graph output {0:?} does not exist")]
+    UnknownExecutionGraphOutput(String),
+    /// A dependency does not exist.
+    #[error("execution group {group:?} depends on unknown group {dependency:?}")]
+    UnknownExecutionGroupDependency {
+        /// Dependent group.
+        group: String,
+        /// Missing dependency.
+        dependency: String,
+    },
+    /// A group lists itself as an input.
+    #[error("execution group {0:?} cannot depend on itself")]
+    SelfDependentExecutionGroup(String),
+    /// A group repeats one dependency.
+    #[error("execution group {group:?} repeats dependency {dependency:?}")]
+    DuplicateExecutionGroupDependency {
+        /// Dependent group.
+        group: String,
+        /// Repeated dependency.
+        dependency: String,
+    },
+    /// The graph contains a cycle.
+    #[error("execution-group graph contains a dependency cycle")]
+    CyclicExecutionGraph,
+    /// Some groups do not contribute to the declared graph output.
+    #[error("execution groups do not contribute to the graph output: {disconnected:?}")]
+    DisconnectedExecutionGroups {
+        /// Stable disconnected group identifiers.
+        disconnected: Vec<String>,
+    },
+    /// A multi-input group did not define how to combine its dependencies.
+    #[error(
+        "execution group slot {group} has {inputs} dependency outputs but no merge implementation"
+    )]
+    UnmergedExecutionGroupInputs {
+        /// Architecture group slot.
+        group: usize,
+        /// Number of ready dependency outputs.
+        inputs: usize,
+    },
     /// Adapter and configured execution-group counts differ.
     #[error("adapter declares {adapter} execution groups but {configured} were configured")]
     ExecutionGroupCount {
@@ -3083,6 +3609,16 @@ pub enum LayerwiseModelError {
         adapter: usize,
         /// Configured count.
         configured: usize,
+    },
+    /// Adapter and configured group identities differ at one stable slot.
+    #[error("execution group slot {slot} is {configured:?}, expected adapter group {adapter:?}")]
+    ExecutionGroupIdentity {
+        /// Architecture group slot.
+        slot: usize,
+        /// Adapter-declared identity.
+        adapter: String,
+        /// Configured residency identity.
+        configured: String,
     },
     /// Adapter and configured unit counts differ for one execution group.
     #[error("execution group {group:?} has {configured} configured units but adapter declares {adapter}")]
@@ -3190,6 +3726,81 @@ mod tests {
         runtime::residency::policy::TransferDirection,
     };
 
+    #[test]
+    fn execution_group_dag_orders_branching_multimodal_ingress() {
+        let graph = ExecutionGroupDag::new(
+            vec![
+                ExecutionGroupSpec::with_dependencies(
+                    "text_decoder",
+                    ["vision_encoder", "audio_encoder"],
+                ),
+                ExecutionGroupSpec::root("vision_encoder"),
+                ExecutionGroupSpec::root("audio_encoder"),
+            ],
+            "text_decoder",
+        )
+        .unwrap();
+
+        assert_eq!(graph.execution_order(), &[1, 2, 0]);
+        assert_eq!(graph.dependencies(0), Some([1, 2].as_slice()));
+        assert_eq!(graph.dependencies(1), Some([].as_slice()));
+        assert_eq!(graph.consumer_counts(), [0, 1, 1]);
+        assert_eq!(graph.output(), 0);
+        assert_eq!(graph.groups()[graph.output()].id(), "text_decoder");
+    }
+
+    #[test]
+    fn execution_group_dag_rejects_ambiguous_or_invalid_topology() {
+        let duplicate = ExecutionGroupDag::new(
+            vec![
+                ExecutionGroupSpec::root("text"),
+                ExecutionGroupSpec::root("text"),
+            ],
+            "text",
+        )
+        .unwrap_err();
+        assert!(matches!(
+            duplicate,
+            Error::LayerwiseModel(LayerwiseModelError::DuplicateExecutionGroup(_))
+        ));
+
+        let unknown = ExecutionGroupDag::new(
+            vec![ExecutionGroupSpec::with_dependencies("text", ["vision"])],
+            "text",
+        )
+        .unwrap_err();
+        assert!(matches!(
+            unknown,
+            Error::LayerwiseModel(LayerwiseModelError::UnknownExecutionGroupDependency { .. })
+        ));
+
+        let cycle = ExecutionGroupDag::new(
+            vec![
+                ExecutionGroupSpec::with_dependencies("vision", ["text"]),
+                ExecutionGroupSpec::with_dependencies("text", ["vision"]),
+            ],
+            "text",
+        )
+        .unwrap_err();
+        assert!(matches!(
+            cycle,
+            Error::LayerwiseModel(LayerwiseModelError::CyclicExecutionGraph)
+        ));
+
+        let disconnected = ExecutionGroupDag::new(
+            vec![
+                ExecutionGroupSpec::root("text"),
+                ExecutionGroupSpec::root("unused_vision"),
+            ],
+            "text",
+        )
+        .unwrap_err();
+        assert!(matches!(
+            disconnected,
+            Error::LayerwiseModel(LayerwiseModelError::DisconnectedExecutionGroups { .. })
+        ));
+    }
+
     fn load_layerwise_llama(
         model_dir: impl AsRef<Path>,
         offload: OffloadConfig,
@@ -3268,6 +3879,20 @@ mod tests {
                 .unwrap(),
             )
             .unwrap();
+        planner
+            .register(
+                ParameterGroupSpec::new(
+                    "group.physical_source",
+                    ParameterRole::Replicated,
+                    [ParameterMemberSpec::new(
+                        "raw.weight",
+                        [8, 4],
+                        MemberSharding::Replicated,
+                    )],
+                )
+                .unwrap(),
+            )
+            .unwrap();
         let (_, layout) = planner.finish().unwrap();
         let checkpoint = tempfile::tempdir().unwrap();
         let raw = vec![0u8; 8 * 4 * std::mem::size_of::<f32>()];
@@ -3289,10 +3914,12 @@ mod tests {
         )
         .unwrap();
         let derived = WeightBinding::from_recipe(
-            "projection.weight",
+            "checkpoint_alias.weight",
             DerivedWeightRecipe::source("raw.weight", TensorSelection::Full),
             128,
         )
+        .unwrap()
+        .with_logical_target("stack.0.projection.weight")
         .unwrap();
         let direct = shard_layer_bindings(vec![direct], "stack.0", &store, &layout).unwrap();
         assert_eq!(
@@ -3427,7 +4054,10 @@ mod tests {
         )
         .unwrap();
         assert!(fully_resident.is_fully_resident());
-        assert!(fully_resident.residency_report().unwrap().is_none());
+        let resident_report = fully_resident.residency_report().unwrap().unwrap();
+        assert!(layer_reports(&resident_report)
+            .iter()
+            .all(|unit| unit.device_resident() && !unit.host_resident()));
         let config = OffloadConfig::new(None, None, depth).unwrap();
         let mut offloaded = load_layerwise_llama(dir.path(), config, stream, cpu.stream()).unwrap();
         assert!(!offloaded.is_fully_resident());
@@ -3473,10 +4103,7 @@ mod tests {
                 .count()
                 >= 3
         );
-        assert_eq!(
-            offloaded.layerwise_static_lease_count().unwrap(),
-            if tied { 2 } else { 3 }
-        );
+        assert_eq!(offloaded.static_lease_count(), if tied { 2 } else { 3 });
         offloaded.clear_device_layer_window().unwrap();
         let cleared = offloaded.residency_report().unwrap().unwrap();
         assert!(layer_reports(&cleared)
@@ -3577,7 +4204,7 @@ mod tests {
             cpu.stream(),
         )
         .unwrap();
-        let metadata = sizing.layerwise_metadata().unwrap();
+        let metadata = sizing.metadata();
         let device_budget = metadata
             .static_device_bytes()
             .checked_add(metadata.maximum_device_layer_bytes())
@@ -3751,7 +4378,7 @@ mod tests {
             cpu.stream(),
         )
         .unwrap();
-        let metadata = sizing.layerwise_metadata().unwrap();
+        let metadata = sizing.metadata();
         let device_budget = metadata
             .static_device_bytes()
             .checked_add(metadata.maximum_device_layer_bytes())
@@ -3930,11 +4557,7 @@ mod tests {
             cpu.stream(),
         )
         .unwrap();
-        assert!(offloaded
-            .layerwise_metadata()
-            .unwrap()
-            .quantization()
-            .is_some());
+        assert!(offloaded.metadata().quantization().is_some());
         let mut resident_cache = resident.new_cache();
         let mut offloaded_cache = offloaded.new_cache();
         for tokens in [

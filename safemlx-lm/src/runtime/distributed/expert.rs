@@ -1,9 +1,11 @@
 //! Reusable expert-parallel assignment, routing, and exchange infrastructure.
 //!
 //! Pure expert parallelism keeps ordinary model state replicated and partitions
-//! only routed expert banks.  [`dispatch_replicated`] exploits the replicated
+//! only routed expert banks. [`crate::runtime::distributed::expert::dispatch_replicated`]
+//! exploits the replicated
 //! token layout: ranks compact only routes owned by their experts and all-sum
-//! the resulting token buffer.  [`all_to_all_v`] is the general sharded-token
+//! the resulting token buffer. [`crate::runtime::distributed::expert::all_to_all_v`]
+//! is the general sharded-token
 //! transport.  It is intentionally an all-gather fallback and therefore uses
 //! `O(group_size)` temporary replication until MLX exposes native all-to-all.
 

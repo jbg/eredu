@@ -102,10 +102,7 @@ fn main() -> anyhow::Result<()> {
         LlamaLoadOptions::layerwise_host(layerwise)
     };
     let mut model = load_llama_model(&args.model_dir, load_options, stream, weights.stream())?;
-    let metadata = model
-        .layerwise_metadata()
-        .expect("layerwise residency was selected")
-        .clone();
+    let metadata = model.metadata().clone();
     let mut cache = model.new_cache();
 
     if let Some(report) = model.dense_stream_report()? {

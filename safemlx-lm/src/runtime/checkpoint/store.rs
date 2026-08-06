@@ -180,6 +180,8 @@ pub enum WeightStoreBackend {
     Safetensors,
     /// Seekable GGUF payload shards.
     Gguf,
+    /// Immutable arrays produced by an explicit load-time transformation.
+    Memory,
 }
 
 /// Structured failures from checkpoint catalog, mapping, and materialization.
@@ -360,6 +362,143 @@ pub trait WeightStore: Any {
 
     /// Returns a deterministic snapshot of backend cache diagnostics.
     fn diagnostics(&self) -> Result<WeightStoreDiagnostics, WeightStoreError>;
+}
+
+/// Immutable array-backed store used to hand transformed weights to the
+/// generalized execution engine without serializing an intermediate checkpoint.
+#[derive(Clone)]
+pub(crate) struct MemoryWeightStore {
+    arrays: Arc<BTreeMap<String, Array>>,
+    metadata: Arc<BTreeMap<String, WeightMetadata>>,
+    backing: Arc<PathBuf>,
+}
+
+impl MemoryWeightStore {
+    pub(crate) fn new(
+        arrays: impl IntoIterator<Item = (String, Array)>,
+    ) -> Result<Self, WeightStoreError> {
+        let arrays = arrays.into_iter().collect::<BTreeMap<_, _>>();
+        if arrays.is_empty() {
+            return Err(WeightStoreError::Overflow {
+                context: "in-memory checkpoint contains no tensors".into(),
+            });
+        }
+        let backing = Arc::new(PathBuf::from("<load-time-transformed-checkpoint>"));
+        let metadata = arrays
+            .iter()
+            .map(|(name, value)| {
+                let shape = value
+                    .shape()
+                    .iter()
+                    .map(|dimension| usize::try_from(*dimension))
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|_| WeightStoreError::Overflow {
+                        context: format!("in-memory shape for tensor {name:?}"),
+                    })?;
+                Ok((
+                    name.clone(),
+                    WeightMetadata {
+                        name: name.clone(),
+                        shape,
+                        stored_dtype: stored_dtype_for_array(value),
+                        logical_byte_len: value.nbytes(),
+                        backing_shard: Some((*backing).clone()),
+                    },
+                ))
+            })
+            .collect::<Result<BTreeMap<_, _>, WeightStoreError>>()?;
+        Ok(Self {
+            arrays: Arc::new(arrays),
+            metadata: Arc::new(metadata),
+            backing,
+        })
+    }
+}
+
+impl WeightStore for MemoryWeightStore {
+    fn backend(&self) -> WeightStoreBackend {
+        WeightStoreBackend::Memory
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn keys(&self) -> Vec<String> {
+        self.arrays.keys().cloned().collect()
+    }
+
+    fn metadata(&self, key: &str) -> Result<WeightMetadata, WeightStoreError> {
+        self.metadata
+            .get(key)
+            .cloned()
+            .ok_or_else(|| WeightStoreError::UnknownTensor { key: key.into() })
+    }
+
+    fn acquire_with_policy(
+        &self,
+        key: &str,
+        selection: TensorSelection,
+        _policy: WeightReadPolicy,
+    ) -> Result<WeightLease, WeightStoreError> {
+        let metadata = self.metadata(key)?;
+        let output_shape = validate_selection(key, &metadata.shape, &selection)?;
+        let total_elements = metadata.shape.iter().product::<usize>();
+        let selected_elements = output_shape.iter().product::<usize>();
+        let selected_byte_len = metadata
+            .logical_byte_len
+            .checked_mul(selected_elements)
+            .and_then(|bytes| bytes.checked_div(total_elements))
+            .ok_or_else(|| WeightStoreError::Overflow {
+                context: format!("in-memory selection size for tensor {key:?}"),
+            })?;
+        let value = self
+            .arrays
+            .get(key)
+            .cloned()
+            .ok_or_else(|| WeightStoreError::UnknownTensor { key: key.into() })?;
+        Ok(WeightLease {
+            key: key.into(),
+            metadata,
+            selection,
+            output_shape,
+            selected_byte_len,
+            source: WeightLeaseSource::Memory(MemoryLeaseSource {
+                value,
+                backing: Arc::clone(&self.backing),
+            }),
+        })
+    }
+
+    fn diagnostics(&self) -> Result<WeightStoreDiagnostics, WeightStoreError> {
+        Ok(WeightStoreDiagnostics {
+            backend: WeightStoreBackend::Memory,
+            mapping_hits: 0,
+            mapping_misses: 0,
+            evictions: 0,
+            currently_mapped_shards: 0,
+            touched_shard_paths: Vec::new(),
+            physical_reads: 0,
+            physical_read_bytes: 0,
+            coalesced_group_hits: 0,
+        })
+    }
+}
+
+fn stored_dtype_for_array(value: &Array) -> StoredDtype {
+    match value.dtype() {
+        safemlx::Dtype::Bool => StoredDtype::Bool,
+        safemlx::Dtype::Uint8 => StoredDtype::U8,
+        safemlx::Dtype::Int8 => StoredDtype::I8,
+        safemlx::Dtype::Int16 => StoredDtype::I16,
+        safemlx::Dtype::Uint16 => StoredDtype::U16,
+        safemlx::Dtype::Float16 => StoredDtype::F16,
+        safemlx::Dtype::Bfloat16 => StoredDtype::BF16,
+        safemlx::Dtype::Int32 => StoredDtype::I32,
+        safemlx::Dtype::Uint32 => StoredDtype::U32,
+        safemlx::Dtype::Float32 => StoredDtype::F32,
+        other => StoredDtype::Other(format!("{other:?}")),
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1381,6 +1520,13 @@ impl WeightStore for SafetensorsWeightStore {
 enum WeightLeaseSource {
     Safetensors(Arc<MappedShard>),
     Gguf(Box<GgufLeaseSource>),
+    Memory(MemoryLeaseSource),
+}
+
+#[derive(Debug, Clone)]
+struct MemoryLeaseSource {
+    value: Array,
+    backing: Arc<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -1446,6 +1592,7 @@ impl WeightLease {
                 .backing_shard
                 .as_deref()
                 .expect("GGUF catalog entries always identify their shard"),
+            WeightLeaseSource::Memory(source) => source.backing.as_path(),
         }
     }
 
@@ -1453,7 +1600,7 @@ impl WeightLease {
     ///
     /// The returned copy is explicitly evaluated while this lease and its
     /// mmap-derived source array remain live. Batched residency callers use
-    /// [`Self::prepare_materialization`] to evaluate several outputs together.
+    /// `prepare_materialization` internally evaluates several outputs together.
     /// An incomplete pending value synchronizes conservatively during drop.
     pub fn materialize(
         &self,
@@ -1481,7 +1628,52 @@ impl WeightLease {
             WeightLeaseSource::Gguf(source) => {
                 self.prepare_gguf(*source, source_stream, execution_stream)
             }
+            WeightLeaseSource::Memory(source) => {
+                self.prepare_memory(source, source_stream, execution_stream)
+            }
         }
+    }
+
+    fn prepare_memory(
+        self,
+        source: MemoryLeaseSource,
+        source_stream: &Stream,
+        execution_stream: &Stream,
+    ) -> Result<PendingWeightMaterialization, WeightStoreError> {
+        let source_value = source.value;
+        let materialized = match &self.selection {
+            // Transformed stores are created on the execution stream. Keeping
+            // the same immutable array handle avoids a second full model copy
+            // while the residency manager retains its lease.
+            TensorSelection::Full => source_value.clone(),
+            TensorSelection::Range { axis, start, end } => materialize_range(
+                &self.key,
+                source_value.clone(),
+                &self.metadata.shape,
+                *axis,
+                *start,
+                *end,
+                source_stream,
+                execution_stream,
+            )?,
+            TensorSelection::Indices { axis, indices } => materialize_indices(
+                &self.key,
+                &source_value,
+                *axis,
+                indices,
+                source_stream,
+                execution_stream,
+            )?,
+        };
+        Ok(PendingWeightMaterialization {
+            output: materialized,
+            _source: source_value,
+            _gguf_group: None,
+            lease: Some(self),
+            source_stream: source_stream.clone(),
+            execution_stream: execution_stream.clone(),
+            completed: false,
+        })
     }
 
     fn prepare_safetensors(
@@ -2250,10 +2442,46 @@ mod tests {
         Stream::new_with_device(&Device::new(DeviceType::Cpu, 0))
     }
 
+    #[test]
+    fn memory_store_preserves_catalog_and_materializes_bounded_ranges() {
+        let stream = cpu_stream();
+        let source = Array::from_slice(&[0f32, 1.0, 2.0, 3.0, 4.0, 5.0], &[2, 3]);
+        let store = MemoryWeightStore::new([("matrix".to_string(), source)]).unwrap();
+
+        assert_eq!(store.backend(), WeightStoreBackend::Memory);
+        assert_eq!(store.keys(), ["matrix"]);
+        assert_eq!(store.metadata("matrix").unwrap().shape, [2, 3]);
+        let lease = store
+            .acquire(
+                "matrix",
+                TensorSelection::Range {
+                    axis: 1,
+                    start: 1,
+                    end: 3,
+                },
+            )
+            .unwrap();
+        assert_eq!(lease.output_shape(), [2, 2]);
+        assert_eq!(lease.selected_byte_len(), 4 * std::mem::size_of::<f32>());
+        assert_eq!(
+            lease
+                .materialize(&stream, &stream)
+                .unwrap()
+                .evaluated()
+                .unwrap()
+                .as_slice::<f32>(),
+            &[1.0, 2.0, 4.0, 5.0]
+        );
+        let diagnostics = store.diagnostics().unwrap();
+        assert_eq!(diagnostics.backend, WeightStoreBackend::Memory);
+        assert_eq!(diagnostics.physical_reads, 0);
+    }
+
     fn safetensors_shard(lease: &WeightLease) -> &Arc<MappedShard> {
         match &lease.source {
             WeightLeaseSource::Safetensors(shard) => shard,
             WeightLeaseSource::Gguf(_) => panic!("expected safetensors lease"),
+            WeightLeaseSource::Memory(_) => panic!("expected safetensors lease"),
         }
     }
 
@@ -2361,6 +2589,7 @@ mod tests {
         match &lease.source {
             WeightLeaseSource::Gguf(source) => source.physical_selection.clone(),
             WeightLeaseSource::Safetensors(_) => panic!("expected GGUF lease"),
+            WeightLeaseSource::Memory(_) => panic!("expected GGUF lease"),
         }
     }
 

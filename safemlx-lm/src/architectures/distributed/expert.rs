@@ -1,9 +1,11 @@
 //! Reusable expert-parallel assignment, routing, and exchange infrastructure.
 //!
 //! Pure expert parallelism keeps ordinary model state replicated and partitions
-//! only routed expert banks.  [`dispatch_replicated`] exploits the replicated
+//! only routed expert banks. [`crate::runtime::distributed::expert::dispatch_replicated`]
+//! exploits the replicated
 //! token layout: ranks compact only routes owned by their experts and all-sum
-//! the resulting token buffer.  [`all_to_all_v`] is the general sharded-token
+//! the resulting token buffer. [`crate::runtime::distributed::expert::all_to_all_v`]
+//! is the general sharded-token
 //! transport.  It is intentionally an all-gather fallback and therefore uses
 //! `O(group_size)` temporary replication until MLX exposes native all-to-all.
 
@@ -24,7 +26,7 @@ use safemlx::{
 use crate::{
     api::{
         deepseek_v3, gpt_oss, inkling, input as runtime_input, kimi_linear, lfm2, nemotron_h,
-        qwen3_5_moe, qwen3_next, qwen3_vl, ModelKind, ModelLoadOptions,
+        qwen3_5, qwen3_next, qwen3_vl, ModelKind, ModelLoadOptions,
     },
     architectures::distributed::pipeline::{
         assign_module, assign_module_excluding, load_deepseek_experts,
@@ -51,7 +53,7 @@ use crate::{
     runtime::generation::speculative::{MtpCapability, MtpCheckpointKind, MtpConfig, MtpStats},
     runtime::residency::expert_cache::{
         AcquiredExperts, ExpertCache, ExpertCacheError, ExpertCacheLoadOptions, ExpertCacheReport,
-        ExpertCatalogEntry, ExpertPass,
+        ExpertCatalogEntry, ExpertPass, ExpertRouteBatch,
     },
 };
 
@@ -126,7 +128,7 @@ pub enum ExpertParallelCache {
     /// Nemotron-H heterogeneous recurrent/attention cache.
     NemotronH(nemotron_h::Cache),
     /// Qwen3-Next/Qwen3.5 heterogeneous attention cache.
-    QwenHybrid(qwen3_5_moe::Cache),
+    QwenHybrid(qwen3_5::Cache),
     /// Qwen3-VL-MoE multimodal-RoPE text cache.
     Qwen3Vl(qwen3_vl::Cache),
 }
@@ -163,7 +165,7 @@ impl ExpertParallelCache {
             Self::GptOss(cache) => cache.reset()?,
             Self::Inkling(cache) => cache.reset()?,
             Self::Lfm2(cache) => cache.reset(),
-            Self::NemotronH(cache) => cache.reset(),
+            Self::NemotronH(cache) => cache.reset()?,
             Self::QwenHybrid(cache) => cache.reset(),
             Self::Qwen3Vl(cache) => *cache = qwen3_vl::Cache::default(),
         }
@@ -218,7 +220,7 @@ enum ExpertArchitecture {
     Lfm2Layerwise(Box<crate::architectures::lfm2::layerwise::Lfm2LayerwiseModel>),
     NemotronH(Box<nemotron_h::Model>),
     NemotronHLayerwise(Box<crate::architectures::nemotron_h::layerwise::NemotronHLayerwiseModel>),
-    QwenHybrid(Box<qwen3_5_moe::Model>),
+    QwenHybrid(Box<qwen3_5::Model>),
     QwenHybridLayerwise(
         Box<crate::architectures::qwen::hybrid::layerwise::QwenHybridLayerwiseModel>,
     ),
@@ -315,9 +317,9 @@ impl crate::architectures::qwen::hybrid::mtp::QwenMtpTarget for ExpertParallelQw
     fn prefill_mtp_target(
         &mut self,
         input: runtime_input::ModelInput<'_>,
-        cache: &mut qwen3_5_moe::Cache,
+        cache: &mut qwen3_5::Cache,
         stream: &Stream,
-    ) -> Result<qwen3_5_moe::QwenMtpStepOutput, Exception> {
+    ) -> Result<qwen3_5::QwenMtpStepOutput, Exception> {
         let tokens = runtime_input::text_token_ids(input, stream)?;
         cache.reset();
         self.model
@@ -328,9 +330,9 @@ impl crate::architectures::qwen::hybrid::mtp::QwenMtpTarget for ExpertParallelQw
     fn verify_mtp_target(
         &mut self,
         tokens: &Array,
-        cache: &mut qwen3_5_moe::Cache,
+        cache: &mut qwen3_5::Cache,
         stream: &Stream,
-    ) -> Result<qwen3_5_moe::QwenMtpStepOutput, Exception> {
+    ) -> Result<qwen3_5::QwenMtpStepOutput, Exception> {
         self.model
             .forward_qwen_mtp_target(tokens, cache, self.group, stream)
             .map_err(|error| Exception::custom(error.to_string()))
@@ -340,7 +342,7 @@ impl crate::architectures::qwen::hybrid::mtp::QwenMtpTarget for ExpertParallelQw
         &mut self,
         hidden: &Array,
         tokens: &Array,
-        cache: &mut [qwen3_5_moe::LayerCache],
+        cache: &mut [qwen3_5::LayerCache],
         stream: &Stream,
     ) -> Result<Array, Exception> {
         match &mut self.model.architecture {
@@ -465,9 +467,9 @@ impl ExpertParallelModel {
     /// Allocates replicated attention state under an explicit cache policy.
     ///
     /// DeepSeek compressed attention, GPT-OSS scheduled attention, Qwen3 KV,
-    /// and Inkling relative-position attention are supported. Inkling's
-    /// convolution state remains resident; recurrent and multimodal state is
-    /// rejected because it is not represented by paged KV blocks.
+    /// Inkling relative-position attention, and Nemotron-H attention are
+    /// supported. Bounded Inkling convolution and Nemotron-H Mamba state remain
+    /// resident alongside the paged attention blocks.
     pub fn new_cache_with_options(
         &self,
         policy: CacheResidencyPolicy,
@@ -515,27 +517,11 @@ impl ExpertParallelModel {
                         tensor_parallel_rank: None,
                         expert_parallel_rank: Some(self.topology.expert_parallel_rank),
                     });
-                    let caches = model
-                        .args
-                        .attention_schedule
-                        .iter()
-                        .enumerate()
-                        .map(|(layer, policy)| {
-                            PagedKeyValueCache::new_with_layout(
-                                manager.clone(),
-                                layer,
-                                policy.window().map(|window| {
-                                    i32::try_from(window.get()).expect(
-                                        "validated dense-Qwen attention window fits i32",
-                                    )
-                                }),
-                                0,
-                                rank,
-                            )
-                            .map(Some)
-                            .map_err(Error::from)
-                        })
-                        .collect::<Result<Vec<_>, _>>()?;
+                    let caches = dense_qwen::new_paged_cache_with_manager(
+                        &model.args,
+                        manager,
+                        rank,
+                    )?;
                     Ok(ExpertParallelCache::DenseQwenPaged(caches))
                 }
                 ExpertArchitecture::DenseQwenLayerwise(model) => {
@@ -546,27 +532,11 @@ impl ExpertParallelModel {
                         tensor_parallel_rank: None,
                         expert_parallel_rank: Some(self.topology.expert_parallel_rank),
                     });
-                    let caches = model
-                        .args()
-                        .attention_schedule
-                        .iter()
-                        .enumerate()
-                        .map(|(layer, policy)| {
-                            PagedKeyValueCache::new_with_layout(
-                                manager.clone(),
-                                layer,
-                                policy.window().map(|window| {
-                                    i32::try_from(window.get()).expect(
-                                        "validated dense-Qwen attention window fits i32",
-                                    )
-                                }),
-                                0,
-                                rank,
-                            )
-                            .map(Some)
-                            .map_err(Error::from)
-                        })
-                        .collect::<Result<Vec<_>, _>>()?;
+                    let caches = dense_qwen::new_paged_cache_with_manager(
+                        model.args(),
+                        manager,
+                        rank,
+                    )?;
                     Ok(ExpertParallelCache::DenseQwenPaged(caches))
                 }
                 ExpertArchitecture::Inkling(model) => {
@@ -585,6 +555,23 @@ impl ExpertParallelModel {
                 ExpertArchitecture::InklingLayerwise(model) => model
                     .new_cache_with_options(CacheResidencyPolicy::Paged(options))
                     .map(ExpertParallelCache::Inkling),
+                ExpertArchitecture::NemotronH(model) => {
+                    let rank = Some(CacheRankIdentity {
+                        pipeline_rank: None,
+                        tensor_parallel_rank: None,
+                        expert_parallel_rank: Some(self.topology.expert_parallel_rank),
+                    });
+                    nemotron_h::Cache::new_with_options_and_rank(
+                        &model.args,
+                        CacheResidencyPolicy::Paged(options),
+                        rank,
+                    )
+                    .map(ExpertParallelCache::NemotronH)
+                    .map_err(Into::into)
+                }
+                ExpertArchitecture::NemotronHLayerwise(model) => model
+                    .new_cache_with_options(CacheResidencyPolicy::Paged(options))
+                    .map(ExpertParallelCache::NemotronH),
                 _ => Err(Error::Parallel(
                     "paged cache residency is unsupported for this expert-parallel cache representation"
                         .into(),
@@ -609,6 +596,7 @@ impl ExpertParallelModel {
                 .transpose()
                 .map_err(Into::into),
             ExpertParallelCache::Inkling(cache) => cache.residency_report().map_err(Into::into),
+            ExpertParallelCache::NemotronH(cache) => cache.residency_report().map_err(Into::into),
             _ => Ok(None),
         }
     }
@@ -710,24 +698,26 @@ impl ExpertParallelModel {
                 .map_err(Into::into);
             }
             ExpertArchitecture::NemotronH(model) => {
-                return nemotron_h::Model::load_prompt_cache_with_identity(
+                return nemotron_h::Model::load_paged_prompt_cache_with_identity(
                     &model.args,
                     directory,
                     expected,
                     prefix_token_ids,
-                    identity,
+                    &identity,
+                    options,
                     stream,
                 )
                 .map(|(cache, manifest)| (ExpertParallelCache::NemotronH(cache), manifest))
                 .map_err(Into::into);
             }
             ExpertArchitecture::NemotronHLayerwise(model) => {
-                return nemotron_h::Model::load_prompt_cache_with_identity(
+                return nemotron_h::Model::load_paged_prompt_cache_with_identity(
                     model.args(),
                     directory,
                     expected,
                     prefix_token_ids,
-                    identity,
+                    &identity,
+                    options,
                     stream,
                 )
                 .map(|(cache, manifest)| (ExpertParallelCache::NemotronH(cache), manifest))
@@ -1863,10 +1853,10 @@ impl ExpertParallelModel {
     fn forward_qwen_mtp_target(
         &mut self,
         tokens: &Array,
-        cache: &mut qwen3_5_moe::Cache,
+        cache: &mut qwen3_5::Cache,
         group: &Group,
         stream: &Stream,
-    ) -> Result<qwen3_5_moe::QwenMtpStepOutput, Error> {
+    ) -> Result<qwen3_5::QwenMtpStepOutput, Error> {
         let total_started = Instant::now();
         self.validate_group(group)?;
         self.topology.validate_execution_stream(stream)?;
@@ -1963,28 +1953,6 @@ impl ExpertParallelModel {
         self.cumulative_statistics
             .accumulate(&self.latest_statistics);
         Ok(output)
-    }
-
-    /// Prompt forward alias.
-    pub fn prefill(
-        &mut self,
-        tokens: &Array,
-        cache: &mut ExpertParallelCache,
-        group: &Group,
-        stream: &Stream,
-    ) -> Result<Array, Error> {
-        self.forward(tokens, None, cache, group, stream)
-    }
-
-    /// Autoregressive decode alias.
-    pub fn decode(
-        &mut self,
-        tokens: &Array,
-        cache: &mut ExpertParallelCache,
-        group: &Group,
-        stream: &Stream,
-    ) -> Result<Array, Error> {
-        self.forward(tokens, None, cache, group, stream)
     }
 
     /// Generates with replicated Qwen MTP weights and EP target verification.
@@ -2326,7 +2294,7 @@ fn load_expert_parallel_model_impl(
             model_dir, topology, options, assignment, ModelKind::Qwen3VlMoe, stream, weights_stream,
         ),
         Some("qwen3_5" | "qwen3_5_text" | "qwen3_5_moe" | "qwen3_5_moe_text") => load_additional_cached_ep(
-            model_dir, topology, options, assignment, ModelKind::Qwen35Moe, stream, weights_stream,
+            model_dir, topology, options, assignment, ModelKind::Qwen35, stream, weights_stream,
         ),
         Some(model_type) => Err(Error::UnsupportedArchitecture(format!(
             "expert-parallel execution requires a supported safetensors MoE architecture, not {model_type}"
@@ -2454,11 +2422,13 @@ fn execute_cached_deepseek(
     stream: &Stream,
 ) -> Result<Array, Error> {
     Ok(cache.execute_routes_bounded(
-        layer,
-        &routes.hidden,
-        &routes.global_expert_ids,
-        &routes.weights,
-        pass,
+        ExpertRouteBatch::new(
+            layer,
+            &routes.hidden,
+            &routes.global_expert_ids,
+            &routes.weights,
+            pass,
+        ),
         stream,
         |hidden, acquired, _weights, stream| {
             let started = Instant::now();
@@ -2521,11 +2491,13 @@ fn execute_cached_kimi_linear(
     stream: &Stream,
 ) -> Result<Array, Error> {
     Ok(cache.execute_routes_bounded(
-        layer,
-        &routes.hidden,
-        &routes.global_expert_ids,
-        &routes.weights,
-        pass,
+        ExpertRouteBatch::new(
+            layer,
+            &routes.hidden,
+            &routes.global_expert_ids,
+            &routes.weights,
+            pass,
+        ),
         stream,
         |hidden, acquired, _weights, stream| {
             let started = Instant::now();
@@ -2570,11 +2542,13 @@ fn execute_cached_qwen3_at(
     stream: &Stream,
 ) -> Result<Array, Error> {
     Ok(cache.execute_routes_bounded(
-        layer,
-        &routes.hidden,
-        &routes.global_expert_ids,
-        &routes.weights,
-        pass,
+        ExpertRouteBatch::new(
+            layer,
+            &routes.hidden,
+            &routes.global_expert_ids,
+            &routes.weights,
+            pass,
+        ),
         stream,
         |hidden, acquired, _weights, stream| {
             let started = Instant::now();
@@ -2617,11 +2591,13 @@ fn execute_cached_gpt_oss(
     stream: &Stream,
 ) -> Result<Array, Error> {
     Ok(cache.execute_routes_bounded(
-        layer,
-        &routes.hidden,
-        &routes.global_expert_ids,
-        &routes.weights,
-        pass,
+        ExpertRouteBatch::new(
+            layer,
+            &routes.hidden,
+            &routes.global_expert_ids,
+            &routes.weights,
+            pass,
+        ),
         stream,
         |hidden, acquired, _weights, stream| {
             let started = Instant::now();
@@ -2659,11 +2635,13 @@ fn execute_cached_inkling(
     stream: &Stream,
 ) -> Result<Array, Error> {
     Ok(cache.execute_routes_bounded(
-        layer,
-        &routes.hidden,
-        &routes.global_expert_ids,
-        &routes.weights,
-        pass,
+        ExpertRouteBatch::new(
+            layer,
+            &routes.hidden,
+            &routes.global_expert_ids,
+            &routes.weights,
+            pass,
+        ),
         stream,
         |hidden, acquired, _weights, stream| {
             let started = Instant::now();
@@ -2698,11 +2676,13 @@ fn execute_cached_lfm2(
     stream: &Stream,
 ) -> Result<Array, Error> {
     Ok(cache.execute_routes_bounded(
-        layer,
-        &routes.hidden,
-        &routes.global_expert_ids,
-        &routes.weights,
-        pass,
+        ExpertRouteBatch::new(
+            layer,
+            &routes.hidden,
+            &routes.global_expert_ids,
+            &routes.weights,
+            pass,
+        ),
         stream,
         |hidden, acquired, _weights, stream| {
             let started = Instant::now();
@@ -2736,11 +2716,13 @@ fn execute_cached_nemotron_h(
     stream: &Stream,
 ) -> Result<Array, Error> {
     Ok(cache.execute_routes_bounded(
-        layer,
-        &routes.hidden,
-        &routes.global_expert_ids,
-        &routes.weights,
-        pass,
+        ExpertRouteBatch::new(
+            layer,
+            &routes.hidden,
+            &routes.global_expert_ids,
+            &routes.weights,
+            pass,
+        ),
         stream,
         |hidden, acquired, _weights, stream| {
             let started = Instant::now();
@@ -2777,7 +2759,7 @@ fn execute_cached_nemotron_h(
 }
 
 fn execute_cached_qwen_hybrid(
-    args: &qwen3_5_moe::ModelArgs,
+    args: &qwen3_5::ModelArgs,
     layer: usize,
     routes: &DispatchedRoutes,
     pass: ExpertPass,
@@ -2785,17 +2767,19 @@ fn execute_cached_qwen_hybrid(
     stream: &Stream,
 ) -> Result<Array, Error> {
     Ok(cache.execute_routes_bounded(
-        layer,
-        &routes.hidden,
-        &routes.global_expert_ids,
-        &routes.weights,
-        pass,
+        ExpertRouteBatch::new(
+            layer,
+            &routes.hidden,
+            &routes.global_expert_ids,
+            &routes.weights,
+            pass,
+        ),
         stream,
         |hidden, acquired, _weights, stream| {
             let started = Instant::now();
             let mut compact_args = args.clone();
             compact_args.num_experts = acquired.identities().len() as i32;
-            let mut bank = qwen3_5_moe::Experts::new(&compact_args, layer, stream)?;
+            let mut bank = qwen3_5::Experts::new(&compact_args, layer, stream)?;
             bank.gate_up_proj = Param::new(acquired.compact_binding("gate_up_proj", stream)?);
             bank.gate_up_proj_scale_inv =
                 Param::new(acquired.optional_compact_binding("gate_up_proj_scale_inv", stream)?);
@@ -3577,20 +3561,20 @@ fn load_streamed_gguf_ep(
         }
         "qwen35moe" | "qwen3next" => {
             let prepared =
-                qwen3_5_moe::prepare_qwen35_gguf_checkpoint(checkpoint, metadata, weights_stream)?;
+                qwen3_5::prepare_qwen35_gguf_checkpoint(checkpoint, metadata, weights_stream)?;
             let args = prepared.args;
             let is_next = prepared.architecture == "qwen3next";
             let kind = if is_next {
                 ModelKind::Qwen3Next
             } else {
-                ModelKind::Qwen35Moe
+                ModelKind::Qwen35
             };
             let assignment =
                 resolve_model_assignment(assignment, args.num_experts as usize, topology)?;
             let store: std::sync::Arc<dyn WeightStore + Send + Sync> =
                 std::sync::Arc::new(GgufWeightStore::new_with_max_mapped_shards(
                     checkpoint.clone(),
-                    qwen3_5_moe::qwen35_translate_gguf_weight_name,
+                    qwen3_5::qwen35_translate_gguf_weight_name,
                     max_mapped_shards,
                 )?);
             let model =
@@ -4513,7 +4497,7 @@ fn is_routed_expert_key(kind: ModelKind, key: &str) -> bool {
         ModelKind::Lfm2 => key.contains(".feed_forward.experts."),
         ModelKind::NemotronH => key.contains(".experts.") && !key.contains(".shared_experts."),
         ModelKind::Inkling => key.contains(".mlp.experts.") || key.contains(".moe.experts."),
-        ModelKind::Qwen3Next | ModelKind::Qwen35Moe => is_qwen_hybrid_decoder_expert_key(key),
+        ModelKind::Qwen3Next | ModelKind::Qwen35 => is_qwen_hybrid_decoder_expert_key(key),
         _ => key.contains(".mlp.experts."),
     }
 }
@@ -4758,11 +4742,11 @@ fn load_additional_streamed_ep(
                 replicated,
             )
         }
-        ModelKind::Qwen3Next | ModelKind::Qwen35Moe => {
+        ModelKind::Qwen3Next | ModelKind::Qwen35 => {
             let args = if kind == ModelKind::Qwen3Next {
                 qwen3_next::get_qwen3_next_model_args(model_dir)?
             } else {
-                qwen3_5_moe::get_qwen3_5_moe_model_args(model_dir)?.0
+                qwen3_5::get_qwen3_5_model_args(model_dir)?.0
             };
             if !args.is_moe() {
                 return Err(Error::UnsupportedArchitecture(format!(
@@ -5073,7 +5057,7 @@ fn load_additional_cached_ep(
                 opened_checkpoint_shards,
             ))
         }
-        ModelKind::Qwen3Next | ModelKind::Qwen35Moe => {
+        ModelKind::Qwen3Next | ModelKind::Qwen35 => {
             let (args, image_token_id, video_token_id, vision_config) =
                 if kind == ModelKind::Qwen3Next {
                     (
@@ -5083,7 +5067,7 @@ fn load_additional_cached_ep(
                         None,
                     )
                 } else {
-                    qwen3_5_moe::get_qwen3_5_moe_model_args(model_dir)?
+                    qwen3_5::get_qwen3_5_model_args(model_dir)?
                 };
             if !args.is_moe() {
                 return Err(Error::UnsupportedArchitecture(format!(
@@ -5108,11 +5092,11 @@ fn load_additional_cached_ep(
             // Qwen3-Next checkpoints store both banks as split expert tensors,
             // so pack the retained MTP bank before strict assignment.
             let mut tensors = if args.uses_fp8() {
-                qwen3_5_moe::transform_split_qwen_fp8_experts(tensors, args.num_experts, stream)?
+                qwen3_5::transform_split_qwen_fp8_experts(tensors, args.num_experts, stream)?
             } else {
                 transform_split_swiglu_experts(tensors, args.num_experts, stream)?
             };
-            let mut model = qwen3_5_moe::Model::new(
+            let mut model = qwen3_5::Model::new(
                 args.clone(),
                 image_token_id,
                 video_token_id,
@@ -5500,7 +5484,7 @@ mod tests {
             "model.mtp.fc.weight"
         ));
         assert!(!is_auxiliary_checkpoint_key(
-            ModelKind::Qwen35Moe,
+            ModelKind::Qwen35,
             "mtp.fc.weight"
         ));
         assert!(is_auxiliary_checkpoint_key(
@@ -5511,7 +5495,7 @@ mod tests {
             ModelKind::Inkling,
             "mtp.fc.weight"
         ));
-        for kind in [ModelKind::Qwen3Next, ModelKind::Qwen35Moe] {
+        for kind in [ModelKind::Qwen3Next, ModelKind::Qwen35] {
             assert!(is_routed_expert_key(
                 kind,
                 "model.layers.0.mlp.experts.1.down_proj.weight"

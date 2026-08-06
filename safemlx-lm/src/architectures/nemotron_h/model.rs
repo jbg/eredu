@@ -44,14 +44,15 @@ use crate::{
     runtime::attention::{AttentionPolicy, LayerSchedule},
     runtime::cache::{
         residency::{
-            derive_prompt_cache_architecture_fingerprint, open_prompt_cache_snapshot,
-            save_prompt_cache_snapshot, CacheBlockArrays, CacheRankIdentity, LayerCachePolicy,
-            PromptCacheDescriptor, PromptCacheManifest, PromptCacheModelIdentity,
-            PromptCacheOptions, PromptCacheSnapshotBlock, PromptCacheStateArray,
-            StateTensorDimension, StateTensorDtype, StateTensorOwner, StateTensorPolicy,
-            StateTensorRole,
+            derive_prompt_cache_architecture_fingerprint, load_prompt_cache_state_tensors,
+            open_prompt_cache, save_prompt_cache_snapshot, CacheBlockArrays, CacheRankIdentity,
+            CacheResidencyManager, CacheResidencyPolicy, CacheResidencyReport, LayerCachePolicy,
+            PagedCacheOptions, PromptCacheDescriptor, PromptCacheManifest,
+            PromptCacheModelIdentity, PromptCacheOptions, PromptCacheSnapshotBlock,
+            PromptCacheStateArray, StateTensorDimension, StateTensorDtype, StateTensorOwner,
+            StateTensorPolicy, StateTensorRole,
         },
-        ConcatKeyValueCache, KeyValueCache,
+        ConcatKeyValueCache, KeyValueCache, PagedKeyValueCache,
     },
     runtime::checkpoint::load::{
         gguf_metadata, gguf_quantization_configs, load_gguf_strict,
@@ -335,6 +336,30 @@ pub struct ModelArgs {
     pub quantized_weight_configs: Option<HashMap<String, WeightQuantization>>,
 }
 
+/// Rank-local geometry for one Nemotron-H operator.
+///
+/// The tensor-parallel planner produces this descriptor from actual checkpoint
+/// placements. Keeping it per layer avoids reconstructing heterogeneous model
+/// geometry from a global TP divisor.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub(crate) enum ParallelLayerGeometry {
+    Mamba {
+        heads: i32,
+        groups: i32,
+    },
+    Attention {
+        query_heads: i32,
+        kv_heads: i32,
+    },
+    DenseMlp {
+        intermediate: i32,
+    },
+    SparseMoe {
+        routed_intermediate: i32,
+        shared_intermediate: i32,
+    },
+}
+
 impl ModelArgsSource {
     fn into_args(self) -> Result<ModelArgs, Error> {
         let layer_count = usize::try_from(self.num_hidden_layers).map_err(|_| {
@@ -502,6 +527,34 @@ pub(crate) fn prompt_cache_architecture_fingerprint(args: &ModelArgs) -> String 
 pub(crate) fn prompt_cache_layer_layout(
     args: &ModelArgs,
 ) -> Result<LayerSchedule<LayerCachePolicy>, Error> {
+    let geometry = args
+        .layer_schedule
+        .iter()
+        .map(|policy| match policy {
+            LayerPolicy::Mamba => ParallelLayerGeometry::Mamba {
+                heads: args.mamba_num_heads,
+                groups: args.n_groups,
+            },
+            LayerPolicy::SelfAttention(_) => ParallelLayerGeometry::Attention {
+                query_heads: args.num_attention_heads,
+                kv_heads: args.num_key_value_heads,
+            },
+            LayerPolicy::DenseMlp => ParallelLayerGeometry::DenseMlp {
+                intermediate: args.intermediate_size,
+            },
+            LayerPolicy::SparseMoe => ParallelLayerGeometry::SparseMoe {
+                routed_intermediate: args.moe_intermediate_size,
+                shared_intermediate: args.moe_shared_expert_intermediate_size,
+            },
+        })
+        .collect::<Vec<_>>();
+    prompt_cache_layer_layout_with_geometry(args, &geometry)
+}
+
+pub(crate) fn prompt_cache_layer_layout_with_geometry(
+    args: &ModelArgs,
+    geometry: &[ParallelLayerGeometry],
+) -> Result<LayerSchedule<LayerCachePolicy>, Error> {
     let cache_error = |error: crate::runtime::cache::residency::CacheResidencyError| {
         Error::UnsupportedArchitecture(error.to_string())
     };
@@ -510,19 +563,24 @@ pub(crate) fn prompt_cache_layer_layout(
         .conv_kernel
         .checked_sub(1)
         .ok_or_else(|| Error::UnsupportedArchitecture("invalid Nemotron-H kernel width".into()))?;
-    let intermediate = args
-        .mamba_num_heads
-        .checked_mul(args.mamba_head_dim)
-        .ok_or_else(|| Error::UnsupportedArchitecture("Nemotron-H Mamba width overflow".into()))?;
-    let conv_dim = args
-        .n_groups
-        .checked_mul(args.ssm_state_size)
-        .and_then(|grouped| grouped.checked_mul(2))
-        .and_then(|grouped| intermediate.checked_add(grouped))
-        .ok_or_else(|| {
-            Error::UnsupportedArchitecture("Nemotron-H convolution width overflow".into())
+    if geometry.len() != args.layer_schedule.len() {
+        return Err(Error::UnsupportedArchitecture(format!(
+            "Nemotron-H cache geometry has {} layers, expected {}",
+            geometry.len(),
+            args.layer_schedule.len()
+        )));
+    }
+    let mamba_tensors = |heads: i32, groups: i32| -> Result<Vec<StateTensorPolicy>, Error> {
+        let intermediate = heads.checked_mul(args.mamba_head_dim).ok_or_else(|| {
+            Error::UnsupportedArchitecture("Nemotron-H Mamba width overflow".into())
         })?;
-    let mamba_tensors = || -> Result<Vec<StateTensorPolicy>, Error> {
+        let conv_dim = groups
+            .checked_mul(args.ssm_state_size)
+            .and_then(|grouped| grouped.checked_mul(2))
+            .and_then(|grouped| intermediate.checked_add(grouped))
+            .ok_or_else(|| {
+                Error::UnsupportedArchitecture("Nemotron-H convolution width overflow".into())
+            })?;
         let mut tensors = Vec::with_capacity(2);
         if history > 0 {
             tensors.push(
@@ -543,7 +601,7 @@ pub(crate) fn prompt_cache_layer_layout(
                 StateTensorRole::Recurrent,
                 vec![
                     StateTensorDimension::Batch,
-                    fixed(args.mamba_num_heads)?,
+                    fixed(heads)?,
                     fixed(args.mamba_head_dim)?,
                     fixed(args.ssm_state_size)?,
                 ],
@@ -555,15 +613,24 @@ pub(crate) fn prompt_cache_layer_layout(
     };
     args.layer_schedule
         .iter()
-        .map(|layer| match *layer {
-            LayerPolicy::Mamba => {
-                LayerCachePolicy::fixed_only(mamba_tensors()?).map_err(cache_error)
+        .zip(geometry)
+        .map(|(layer, geometry)| match (*layer, *geometry) {
+            (LayerPolicy::Mamba, ParallelLayerGeometry::Mamba { heads, groups }) => {
+                LayerCachePolicy::fixed_only(mamba_tensors(heads, groups)?).map_err(cache_error)
             }
-            LayerPolicy::SelfAttention(attention) => {
-                LayerCachePolicy::key_value(attention, args.num_key_value_heads, args.head_dim)
-                    .map_err(cache_error)
+            (
+                LayerPolicy::SelfAttention(attention),
+                ParallelLayerGeometry::Attention { kv_heads, .. },
+            ) => {
+                LayerCachePolicy::key_value(attention, kv_heads, args.head_dim).map_err(cache_error)
             }
-            LayerPolicy::DenseMlp | LayerPolicy::SparseMoe => Ok(LayerCachePolicy::NoState),
+            (LayerPolicy::DenseMlp, ParallelLayerGeometry::DenseMlp { .. })
+            | (LayerPolicy::SparseMoe, ParallelLayerGeometry::SparseMoe { .. }) => {
+                Ok(LayerCachePolicy::NoState)
+            }
+            (policy, geometry) => Err(Error::UnsupportedArchitecture(format!(
+                "Nemotron-H cache geometry {geometry:?} does not match layer policy {policy:?}"
+            ))),
         })
         .collect::<Result<Vec<_>, _>>()
         .and_then(|policies| {
@@ -1140,6 +1207,22 @@ pub struct SparseMoeBlock {
 impl SparseMoeBlock {
     /// Creates an unloaded sparse MoE block.
     pub fn new(args: &ModelArgs, layer_idx: usize, stream: &Stream) -> Result<Self, Exception> {
+        Self::new_with_widths(
+            args,
+            layer_idx,
+            args.moe_intermediate_size,
+            args.moe_shared_expert_intermediate_size,
+            stream,
+        )
+    }
+
+    fn new_with_widths(
+        args: &ModelArgs,
+        layer_idx: usize,
+        routed_intermediate: i32,
+        shared_intermediate: i32,
+        stream: &Stream,
+    ) -> Result<Self, Exception> {
         let prefix = format!("model.layers.{layer_idx}.moe");
         Ok(Self {
             gate: TopKRouter::new(
@@ -1160,7 +1243,7 @@ impl SparseMoeBlock {
             experts: Experts::new(
                 args.n_routed_experts,
                 args.hidden_size,
-                args.moe_intermediate_size,
+                routed_intermediate,
                 [
                     args.weight_quantization_for(&format!("{prefix}.experts.up_proj")),
                     args.weight_quantization_for(&format!("{prefix}.experts.down_proj")),
@@ -1169,7 +1252,7 @@ impl SparseMoeBlock {
             )?,
             shared_experts: Mlp::new(
                 args.hidden_size,
-                args.moe_shared_expert_intermediate_size,
+                shared_intermediate,
                 args.mlp_bias,
                 [
                     args.weight_quantization_for(&format!(
@@ -1266,6 +1349,22 @@ pub struct Attention {
 impl Attention {
     /// Creates an unloaded attention layer.
     pub fn new(args: &ModelArgs, layer_idx: usize, stream: &Stream) -> Result<Self, Exception> {
+        Self::new_with_heads(
+            args,
+            layer_idx,
+            args.num_attention_heads,
+            args.num_key_value_heads,
+            stream,
+        )
+    }
+
+    fn new_with_heads(
+        args: &ModelArgs,
+        layer_idx: usize,
+        query_heads: i32,
+        kv_heads: i32,
+        stream: &Stream,
+    ) -> Result<Self, Exception> {
         let policy = match args.layer_schedule.get(layer_idx) {
             Some(LayerPolicy::SelfAttention(policy)) => *policy,
             Some(other) => {
@@ -1281,33 +1380,33 @@ impl Attention {
         };
         let prefix = format!("model.layers.{layer_idx}.attention");
         Ok(Self {
-            n_heads: args.num_attention_heads,
-            n_kv_heads: args.num_key_value_heads,
+            n_heads: query_heads,
+            n_kv_heads: kv_heads,
             scale: (args.head_dim as f32).sqrt().recip(),
             policy,
             q_proj: common::linear::unloaded_maybe_quantized_linear(
                 args.hidden_size,
-                args.num_attention_heads * args.head_dim,
+                query_heads * args.head_dim,
                 args.attention_bias,
                 args.weight_quantization_for(&format!("{prefix}.q_proj.weight")),
                 stream,
             )?,
             k_proj: common::linear::unloaded_maybe_quantized_linear(
                 args.hidden_size,
-                args.num_key_value_heads * args.head_dim,
+                kv_heads * args.head_dim,
                 args.attention_bias,
                 args.weight_quantization_for(&format!("{prefix}.k_proj.weight")),
                 stream,
             )?,
             v_proj: common::linear::unloaded_maybe_quantized_linear(
                 args.hidden_size,
-                args.num_key_value_heads * args.head_dim,
+                kv_heads * args.head_dim,
                 args.attention_bias,
                 args.weight_quantization_for(&format!("{prefix}.v_proj.weight")),
                 stream,
             )?,
             o_proj: common::linear::unloaded_maybe_quantized_linear(
-                args.num_attention_heads * args.head_dim,
+                query_heads * args.head_dim,
                 args.hidden_size,
                 args.attention_bias,
                 args.weight_quantization_for(&format!("{prefix}.o_proj.weight")),
@@ -1324,7 +1423,7 @@ pub struct AttentionInput<'a> {
     /// Optional attention mask.
     pub mask: Option<&'a Array>,
     /// Optional key/value cache.
-    pub cache: Option<&'a mut AttentionCache>,
+    pub cache: Option<&'a mut dyn KeyValueCache>,
 }
 
 impl Module<AttentionInput<'_>> for Attention {
@@ -1338,11 +1437,16 @@ impl Module<AttentionInput<'_>> for Attention {
     ) -> Result<Self::Output, Self::Error> {
         let AttentionInput { x, mask, mut cache } = input;
         if let Some(cache) = cache.as_ref() {
-            let cache_policy = cache.policy();
-            if cache_policy != self.policy {
+            let cache_window = cache.max_size();
+            let expected_window = self
+                .policy
+                .window()
+                .map(|window| i32::try_from(window.get()))
+                .transpose()
+                .map_err(|_| Exception::custom("Nemotron-H attention window exceeds i32"))?;
+            if cache_window != expected_window {
                 return Err(Exception::custom(format!(
-                    "Nemotron-H attention cache policy {cache_policy:?} does not match layer policy {:?}",
-                    self.policy
+                    "Nemotron-H attention cache window {cache_window:?} does not match layer policy {:?}", self.policy
                 )));
             }
         }
@@ -1370,35 +1474,45 @@ impl Module<AttentionInput<'_>> for Attention {
         )?;
         let position_offset = cache.as_ref().map_or(0, |cache| cache.offset());
         if let Some(cache) = cache.as_mut() {
-            (keys, values) = cache.update_and_fetch(keys, values, stream)?;
+            (keys, values) = cache.update_for_attention(keys, values, stream)?;
         }
-        let out = match self.policy {
-            AttentionPolicy::Sliding { window } if seq_len > 1 => {
-                common::attention::sliding_window_prefill_attention(
+        let paged = match cache.as_mut() {
+            Some(cache) => cache.paged_attention(&queries, self.scale, mask, None, stream)?,
+            None => None,
+        };
+        let out = if let Some(attended) = paged {
+            attended
+                .transpose_axes(&[0, 2, 1, 3], stream)?
+                .reshape(&[batch, seq_len, -1], stream)?
+        } else {
+            match self.policy {
+                AttentionPolicy::Sliding { window } if seq_len > 1 => {
+                    common::attention::sliding_window_prefill_attention(
+                        queries,
+                        keys,
+                        values,
+                        self.scale,
+                        i32::try_from(window.get()).map_err(|_| {
+                            Exception::custom("Nemotron-H sliding attention window exceeds i32")
+                        })?,
+                        position_offset,
+                        batch,
+                        seq_len,
+                        stream,
+                    )?
+                }
+                _ => finish_attention(
                     queries,
                     keys,
                     values,
+                    None::<&mut ConcatKeyValueCache>,
                     self.scale,
-                    i32::try_from(window.get()).map_err(|_| {
-                        Exception::custom("Nemotron-H sliding attention window exceeds i32")
-                    })?,
-                    position_offset,
+                    mask,
                     batch,
                     seq_len,
                     stream,
-                )?
+                )?,
             }
-            _ => finish_attention(
-                queries,
-                keys,
-                values,
-                None::<&mut ConcatKeyValueCache>,
-                self.scale,
-                mask,
-                batch,
-                seq_len,
-                stream,
-            )?,
         };
         self.o_proj.forward(&out, stream)
     }
@@ -1472,19 +1586,27 @@ pub struct Mamba2Mixer {
 impl Mamba2Mixer {
     /// Creates an unloaded Mamba2 mixer.
     pub fn new(args: &ModelArgs, layer_idx: usize, stream: &Stream) -> Result<Self, Exception> {
-        let intermediate_size = args.mamba_num_heads * args.mamba_head_dim;
-        let conv_dim = intermediate_size + 2 * args.n_groups * args.ssm_state_size;
-        let projection_size = intermediate_size + conv_dim + args.mamba_num_heads;
-        let d_mlp = (projection_size
-            - 2 * intermediate_size
-            - 2 * args.n_groups * args.ssm_state_size
-            - args.mamba_num_heads)
-            / 2;
+        Self::new_with_geometry(args, layer_idx, args.mamba_num_heads, args.n_groups, stream)
+    }
+
+    fn new_with_geometry(
+        args: &ModelArgs,
+        layer_idx: usize,
+        heads: i32,
+        groups: i32,
+        stream: &Stream,
+    ) -> Result<Self, Exception> {
+        let intermediate_size = heads * args.mamba_head_dim;
+        let conv_dim = intermediate_size + 2 * groups * args.ssm_state_size;
+        let projection_size = intermediate_size + conv_dim + heads;
+        let d_mlp =
+            (projection_size - 2 * intermediate_size - 2 * groups * args.ssm_state_size - heads)
+                / 2;
         Ok(Self {
-            num_heads: args.mamba_num_heads,
+            num_heads: heads,
             head_dim: args.mamba_head_dim,
             ssm_state_size: args.ssm_state_size,
-            n_groups: args.n_groups,
+            n_groups: groups,
             intermediate_size,
             conv_dim,
             conv_kernel_size: args.conv_kernel,
@@ -1500,12 +1622,12 @@ impl Mamba2Mixer {
                 stream,
             )?,
             conv1d: DepthwiseConv1d::new(conv_dim, args.conv_kernel, args.use_conv_bias, stream)?,
-            dt_bias: Param::<Array>::unloaded(&[args.mamba_num_heads], Dtype::Float32, stream)?,
-            A_log: Param::<Array>::unloaded(&[args.mamba_num_heads], Dtype::Float32, stream)?,
-            D: Param::<Array>::unloaded(&[args.mamba_num_heads], Dtype::Float32, stream)?,
+            dt_bias: Param::<Array>::unloaded(&[heads], Dtype::Float32, stream)?,
+            A_log: Param::<Array>::unloaded(&[heads], Dtype::Float32, stream)?,
+            D: Param::<Array>::unloaded(&[heads], Dtype::Float32, stream)?,
             norm: MambaRmsNormGated::new(
                 intermediate_size,
-                args.n_groups,
+                groups,
                 args.layer_norm_epsilon,
                 stream,
             )?,
@@ -1832,6 +1954,8 @@ pub enum AttentionCache {
         /// Cache retaining at most `window - 1` past states between calls.
         cache: ConcatKeyValueCache,
     },
+    /// Block-addressable full or sliding attention state.
+    Paged(PagedKeyValueCache),
 }
 
 impl AttentionCache {
@@ -1847,10 +1971,29 @@ impl AttentionCache {
         }
     }
 
+    fn new_paged(
+        policy: AttentionPolicy,
+        manager: CacheResidencyManager,
+        layer: usize,
+        rank: Option<CacheRankIdentity>,
+    ) -> Result<Self, Exception> {
+        PagedKeyValueCache::new_with_layout(
+            manager,
+            layer,
+            policy.window().map(|window| {
+                i32::try_from(window.get()).expect("validated Nemotron-H attention window fits i32")
+            }),
+            0,
+            rank,
+        )
+        .map(Self::Paged)
+    }
+
     fn clear(&mut self) {
         match self {
             Self::Full(cache) => cache.clear(),
             Self::Sliding { cache, .. } => cache.clear(),
+            Self::Paged(cache) => cache.reset_local_after_manager_clear(),
         }
     }
 
@@ -1859,20 +2002,15 @@ impl AttentionCache {
         match self {
             Self::Full(_) => AttentionPolicy::Full,
             Self::Sliding { window, .. } => AttentionPolicy::Sliding { window: *window },
+            Self::Paged(cache) => AttentionPolicy::from_sliding_window(cache.attention_window())
+                .expect("paged cache construction validates its attention window"),
         }
     }
 
     fn snapshot_arrays(&self, stream: &Stream) -> Result<Option<(Array, Array)>, Exception> {
         match self {
             Self::Full(cache) | Self::Sliding { cache, .. } => cache.snapshot_arrays(stream),
-        }
-    }
-
-    fn restore_resident(&mut self, keys: Array, values: Array, end: i32) -> Result<(), Exception> {
-        match self {
-            Self::Full(cache) | Self::Sliding { cache, .. } => {
-                cache.restore_resident(keys, values, end)
-            }
+            Self::Paged(_) => Ok(None),
         }
     }
 }
@@ -1882,6 +2020,7 @@ impl KeyValueCache for AttentionCache {
         match self {
             Self::Full(cache) => cache.offset(),
             Self::Sliding { cache, .. } => cache.offset(),
+            Self::Paged(cache) => cache.offset(),
         }
     }
 
@@ -1889,6 +2028,7 @@ impl KeyValueCache for AttentionCache {
         match self {
             Self::Full(cache) => cache.max_size(),
             Self::Sliding { cache, .. } => cache.max_size(),
+            Self::Paged(cache) => cache.max_size(),
         }
     }
 
@@ -1896,6 +2036,25 @@ impl KeyValueCache for AttentionCache {
         match self {
             Self::Full(cache) => cache.retained_arrays(),
             Self::Sliding { cache, .. } => cache.retained_arrays(),
+            Self::Paged(cache) => cache.retained_arrays(),
+        }
+    }
+
+    fn is_paged(&self) -> bool {
+        matches!(self, Self::Paged(_))
+    }
+
+    fn paged_attention(
+        &mut self,
+        queries: &Array,
+        scale: f32,
+        mask: Option<&Array>,
+        sinks: Option<&Array>,
+        stream: &Stream,
+    ) -> Result<Option<Array>, Exception> {
+        match self {
+            Self::Paged(cache) => cache.paged_attention(queries, scale, mask, sinks, stream),
+            Self::Full(_) | Self::Sliding { .. } => Ok(None),
         }
     }
 
@@ -1908,6 +2067,20 @@ impl KeyValueCache for AttentionCache {
         match self {
             Self::Full(cache) => cache.update_and_fetch(keys, values, stream),
             Self::Sliding { cache, .. } => cache.update_and_fetch(keys, values, stream),
+            Self::Paged(cache) => cache.update_and_fetch(keys, values, stream),
+        }
+    }
+
+    fn update_for_attention(
+        &mut self,
+        keys: Array,
+        values: Array,
+        stream: &Stream,
+    ) -> Result<(Array, Array), Exception> {
+        match self {
+            Self::Full(cache) => cache.update_for_attention(keys, values, stream),
+            Self::Sliding { cache, .. } => cache.update_for_attention(keys, values, stream),
+            Self::Paged(cache) => cache.update_for_attention(keys, values, stream),
         }
     }
 }
@@ -1953,7 +2126,63 @@ pub struct TransformerBlock {
 impl TransformerBlock {
     /// Creates an unloaded block for `layer_idx`.
     pub fn new(args: &ModelArgs, layer_idx: usize, stream: &Stream) -> Result<Self, Error> {
+        let geometry = match args.layer_policy(layer_idx)? {
+            LayerPolicy::Mamba => ParallelLayerGeometry::Mamba {
+                heads: args.mamba_num_heads,
+                groups: args.n_groups,
+            },
+            LayerPolicy::SelfAttention(_) => ParallelLayerGeometry::Attention {
+                query_heads: args.num_attention_heads,
+                kv_heads: args.num_key_value_heads,
+            },
+            LayerPolicy::DenseMlp => ParallelLayerGeometry::DenseMlp {
+                intermediate: args.intermediate_size,
+            },
+            LayerPolicy::SparseMoe => ParallelLayerGeometry::SparseMoe {
+                routed_intermediate: args.moe_intermediate_size,
+                shared_intermediate: args.moe_shared_expert_intermediate_size,
+            },
+        };
+        Self::new_with_geometry(args, layer_idx, geometry, stream)
+    }
+
+    pub(crate) fn new_parallel_layerwise(
+        args: &ModelArgs,
+        layer_idx: usize,
+        geometry: ParallelLayerGeometry,
+        stream: &Stream,
+    ) -> Result<Self, Error> {
+        Self::new_with_geometry(args, layer_idx, geometry, stream)
+    }
+
+    fn new_with_geometry(
+        args: &ModelArgs,
+        layer_idx: usize,
+        geometry: ParallelLayerGeometry,
+        stream: &Stream,
+    ) -> Result<Self, Error> {
         let policy = args.layer_policy(layer_idx)?;
+        let geometry_matches = matches!(
+            (policy, geometry),
+            (LayerPolicy::Mamba, ParallelLayerGeometry::Mamba { .. })
+                | (
+                    LayerPolicy::SelfAttention(_),
+                    ParallelLayerGeometry::Attention { .. }
+                )
+                | (
+                    LayerPolicy::DenseMlp,
+                    ParallelLayerGeometry::DenseMlp { .. }
+                )
+                | (
+                    LayerPolicy::SparseMoe,
+                    ParallelLayerGeometry::SparseMoe { .. }
+                )
+        );
+        if !geometry_matches {
+            return Err(Error::Parallel(format!(
+                "Nemotron-H local geometry {geometry:?} does not match layer {layer_idx} policy {policy:?}"
+            )));
+        }
         Ok(Self {
             policy,
             norm: nn::RmsNorm::unloaded(
@@ -1963,20 +2192,41 @@ impl TransformerBlock {
                 stream,
             )?,
             mamba: if policy == LayerPolicy::Mamba {
-                Some(Mamba2Mixer::new(args, layer_idx, stream)?)
+                let ParallelLayerGeometry::Mamba { heads, groups } = geometry else {
+                    unreachable!()
+                };
+                Some(Mamba2Mixer::new_with_geometry(
+                    args, layer_idx, heads, groups, stream,
+                )?)
             } else {
                 None
             },
             attention: if matches!(policy, LayerPolicy::SelfAttention(_)) {
-                Some(Attention::new(args, layer_idx, stream)?)
+                let ParallelLayerGeometry::Attention {
+                    query_heads,
+                    kv_heads,
+                } = geometry
+                else {
+                    unreachable!()
+                };
+                Some(Attention::new_with_heads(
+                    args,
+                    layer_idx,
+                    query_heads,
+                    kv_heads,
+                    stream,
+                )?)
             } else {
                 None
             },
             mlp: if policy == LayerPolicy::DenseMlp {
+                let ParallelLayerGeometry::DenseMlp { intermediate } = geometry else {
+                    unreachable!()
+                };
                 let prefix = format!("model.layers.{layer_idx}.mlp");
                 Some(Mlp::new(
                     args.hidden_size,
-                    args.intermediate_size,
+                    intermediate,
                     args.mlp_bias,
                     [
                         args.weight_quantization_for(&format!("{prefix}.up_proj.weight")),
@@ -1988,7 +2238,20 @@ impl TransformerBlock {
                 None
             },
             moe: if policy == LayerPolicy::SparseMoe {
-                Some(SparseMoeBlock::new(args, layer_idx, stream)?)
+                let ParallelLayerGeometry::SparseMoe {
+                    routed_intermediate,
+                    shared_intermediate,
+                } = geometry
+                else {
+                    unreachable!()
+                };
+                Some(SparseMoeBlock::new_with_widths(
+                    args,
+                    layer_idx,
+                    routed_intermediate,
+                    shared_intermediate,
+                    stream,
+                )?)
             } else {
                 None
             },
@@ -2154,6 +2417,77 @@ pub struct BlockInput<'a> {
     pub cache: Option<&'a mut LayerCache>,
 }
 
+/// Borrowed operator state used by architecture-independent execution runtimes.
+pub(crate) enum OperatorCache<'a> {
+    /// Mamba convolution and recurrent state.
+    Mamba(&'a mut Mamba2Cache),
+    /// Full or sliding key/value state.
+    Attention(&'a mut dyn KeyValueCache),
+}
+
+impl TransformerBlock {
+    /// Executes this layer from semantic operator state rather than the
+    /// resident model's family-specific cache container.
+    pub(crate) fn forward_with_operator_cache(
+        &mut self,
+        x: &Array,
+        mask: Option<&Array>,
+        cache: Option<OperatorCache<'_>>,
+        stream: &Stream,
+    ) -> Result<Array, Exception> {
+        let residual = x;
+        let h = self.norm.forward(x, stream)?;
+        let h = match (self.policy, cache) {
+            (LayerPolicy::Mamba, Some(OperatorCache::Mamba(cache))) => {
+                self.mamba.as_mut().expect("mamba block").forward(
+                    Mamba2Input {
+                        x: &h,
+                        cache: Some(cache),
+                    },
+                    stream,
+                )?
+            }
+            (LayerPolicy::Mamba, None) => self
+                .mamba
+                .as_mut()
+                .expect("mamba block")
+                .forward(Mamba2Input { x: &h, cache: None }, stream)?,
+            (LayerPolicy::SelfAttention(_), Some(OperatorCache::Attention(cache))) => {
+                self.attention.as_mut().expect("attention block").forward(
+                    AttentionInput {
+                        x: &h,
+                        mask,
+                        cache: Some(cache),
+                    },
+                    stream,
+                )?
+            }
+            (LayerPolicy::SelfAttention(_), None) => {
+                self.attention.as_mut().expect("attention block").forward(
+                    AttentionInput {
+                        x: &h,
+                        mask,
+                        cache: None,
+                    },
+                    stream,
+                )?
+            }
+            (LayerPolicy::DenseMlp, None) => {
+                self.mlp.as_mut().expect("mlp block").forward(&h, stream)?
+            }
+            (LayerPolicy::SparseMoe, None) => {
+                self.moe.as_mut().expect("moe block").forward(&h, stream)?
+            }
+            (policy, Some(_)) => {
+                return Err(Exception::custom(format!(
+                    "Nemotron-H operator cache does not match layer policy {policy:?}"
+                )))
+            }
+        };
+        residual.add(h, stream)
+    }
+}
+
 impl Module<BlockInput<'_>> for TransformerBlock {
     type Output = Array;
     type Error = Exception;
@@ -2243,6 +2577,22 @@ impl LayerCache {
         }
     }
 
+    fn new_paged(
+        policy: LayerPolicy,
+        manager: CacheResidencyManager,
+        layer: usize,
+        rank: Option<CacheRankIdentity>,
+    ) -> Result<Self, Exception> {
+        match policy {
+            LayerPolicy::Mamba => Ok(Self::Mamba(Mamba2Cache::default())),
+            LayerPolicy::SelfAttention(policy) => {
+                AttentionCache::new_paged(policy, manager, layer, rank).map(Self::Attention)
+            }
+            LayerPolicy::DenseMlp => Ok(Self::Mlp),
+            LayerPolicy::SparseMoe => Ok(Self::Moe),
+        }
+    }
+
     pub(crate) fn offset(&self) -> Option<i32> {
         match self {
             Self::Mamba(cache) => Some(cache.offset),
@@ -2284,12 +2634,96 @@ impl Cache {
         }
     }
 
+    /// Creates device-resident state or pages only context-growing attention
+    /// blocks while bounded Mamba state remains device resident.
+    pub fn new_with_options(
+        args: &ModelArgs,
+        policy: CacheResidencyPolicy,
+    ) -> Result<Self, Exception> {
+        Self::new_with_options_and_rank(args, policy, None)
+    }
+
+    pub(crate) fn new_with_options_and_rank(
+        args: &ModelArgs,
+        policy: CacheResidencyPolicy,
+        rank: Option<CacheRankIdentity>,
+    ) -> Result<Self, Exception> {
+        match policy {
+            CacheResidencyPolicy::Device => Ok(Self::new(args)),
+            CacheResidencyPolicy::Paged(options) => {
+                let manager = CacheResidencyManager::new(options)
+                    .map_err(|error| Exception::custom(error.to_string()))?;
+                Self::new_paged_with_manager(args, manager, rank)
+            }
+        }
+    }
+
+    fn new_paged_with_manager(
+        args: &ModelArgs,
+        manager: CacheResidencyManager,
+        rank: Option<CacheRankIdentity>,
+    ) -> Result<Self, Exception> {
+        if !args
+            .layer_schedule
+            .iter()
+            .any(|policy| matches!(policy, LayerPolicy::SelfAttention(_)))
+        {
+            return Err(Exception::custom(
+                "paged Nemotron-H cache residency requires at least one attention layer",
+            ));
+        }
+        let layers = args
+            .layer_schedule
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(layer, policy)| LayerCache::new_paged(policy, manager.clone(), layer, rank))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self { layers })
+    }
+
+    fn residency_manager(&self) -> Result<Option<&CacheResidencyManager>, Exception> {
+        let mut managers = self.layers.iter().filter_map(|layer| match layer {
+            LayerCache::Attention(AttentionCache::Paged(cache)) => Some(cache.manager()),
+            LayerCache::Mamba(_)
+            | LayerCache::Attention(AttentionCache::Full(_))
+            | LayerCache::Attention(AttentionCache::Sliding { .. })
+            | LayerCache::Mlp
+            | LayerCache::Moe => None,
+        });
+        let Some(first) = managers.next() else {
+            return Ok(None);
+        };
+        if managers.any(|manager| manager.session_id() != first.session_id()) {
+            return Err(Exception::custom(
+                "Nemotron-H paged attention layers must share one residency manager",
+            ));
+        }
+        Ok(Some(first))
+    }
+
+    /// Returns aggregate live attention paging observations, if enabled.
+    pub fn residency_report(&self) -> Result<Option<CacheResidencyReport>, Exception> {
+        self.residency_manager()?
+            .map(|manager| {
+                manager
+                    .report()
+                    .map_err(|error| Exception::custom(error.to_string()))
+            })
+            .transpose()
+    }
+
     /// Returns the current sequence offset represented by the first stateful layer.
     pub fn offset(&self) -> i32 {
         self.layers.iter().find_map(LayerCache::offset).unwrap_or(0)
     }
 
-    pub(crate) fn reset(&mut self) {
+    pub(crate) fn reset(&mut self) -> Result<(), Exception> {
+        if let Some(manager) = self.residency_manager()?.cloned() {
+            manager
+                .clear()
+                .map_err(|error| Exception::custom(error.to_string()))?;
+        }
         for layer in &mut self.layers {
             match layer {
                 LayerCache::Mamba(cache) => *cache = Mamba2Cache::default(),
@@ -2297,6 +2731,7 @@ impl Cache {
                 LayerCache::Mlp | LayerCache::Moe => {}
             }
         }
+        Ok(())
     }
 }
 
@@ -2572,27 +3007,22 @@ impl Model {
         Cache::new(&self.args)
     }
 
-    pub(crate) fn save_prompt_cache(
+    /// Creates resident state or blockwise-paged attention state while Mamba
+    /// convolution and recurrent tensors remain device resident.
+    pub fn new_cache_with_options(&self, policy: CacheResidencyPolicy) -> Result<Cache, Exception> {
+        Cache::new_with_options(&self.args, policy)
+    }
+
+    /// Returns aggregate live attention paging observations, if enabled.
+    pub fn cache_residency_report(
+        &self,
         cache: &Cache,
-        destination: impl AsRef<Path>,
-        descriptor: PromptCacheDescriptor,
-        prefix_token_ids: &[u32],
-        options: &PromptCacheOptions,
-        stream: &Stream,
-    ) -> Result<PromptCacheManifest, Exception> {
-        Self::save_prompt_cache_with_rank(
-            cache,
-            destination,
-            descriptor,
-            prefix_token_ids,
-            options,
-            None,
-            stream,
-        )
+    ) -> Result<Option<CacheResidencyReport>, Exception> {
+        cache.residency_report()
     }
 
     pub(crate) fn save_prompt_cache_with_rank(
-        cache: &Cache,
+        cache: &mut Cache,
         destination: impl AsRef<Path>,
         descriptor: PromptCacheDescriptor,
         prefix_token_ids: &[u32],
@@ -2602,6 +3032,40 @@ impl Model {
     ) -> Result<PromptCacheManifest, Exception> {
         let end = i64::try_from(prefix_token_ids.len())
             .map_err(|_| Exception::custom("Nemotron-H prompt length exceeds i64"))?;
+        let paged_attention = cache
+            .layers
+            .iter()
+            .filter(|layer| matches!(layer, LayerCache::Attention(AttentionCache::Paged(_))))
+            .count();
+        let resident_attention = cache
+            .layers
+            .iter()
+            .filter(|layer| {
+                matches!(
+                    layer,
+                    LayerCache::Attention(AttentionCache::Full(_) | AttentionCache::Sliding { .. })
+                )
+            })
+            .count();
+        if paged_attention > 0 && resident_attention > 0 {
+            return Err(Exception::custom(
+                "Nemotron-H prompt caches cannot mix paged and resident attention layers",
+            ));
+        }
+        let paged = paged_attention > 0;
+        let residency_manager = cache.residency_manager()?.cloned();
+        if paged != residency_manager.is_some() {
+            return Err(Exception::custom(
+                "Nemotron-H paged attention cache has inconsistent residency state",
+            ));
+        }
+        if paged {
+            for layer in &mut cache.layers {
+                if let LayerCache::Attention(AttentionCache::Paged(cache)) = layer {
+                    cache.finalize()?;
+                }
+            }
+        }
         let mut blocks = Vec::new();
         let mut state = Vec::new();
         for (layer, cache) in cache.layers.iter().enumerate() {
@@ -2638,6 +3102,9 @@ impl Model {
                     });
                 }
                 LayerCache::Attention(cache) => {
+                    if matches!(cache, AttentionCache::Paged(_)) {
+                        continue;
+                    }
                     let (keys, values) = cache.snapshot_arrays(stream)?.ok_or_else(|| {
                         Exception::custom(format!(
                             "Nemotron-H layer {layer} attention state is missing"
@@ -2659,6 +3126,11 @@ impl Model {
                 LayerCache::Mlp | LayerCache::Moe => {}
             }
         }
+        if let Some(manager) = residency_manager {
+            return manager
+                .save_prompt_cache(destination, descriptor, prefix_token_ids, &state, options)
+                .map_err(|error| Exception::custom(error.to_string()));
+        }
         save_prompt_cache_snapshot(
             destination,
             descriptor,
@@ -2670,11 +3142,33 @@ impl Model {
         .map_err(|error| Exception::custom(error.to_string()))
     }
 
-    pub(crate) fn load_prompt_cache(
+    #[cfg(test)]
+    pub(crate) fn save_prompt_cache(
+        cache: &mut Cache,
+        destination: impl AsRef<Path>,
+        descriptor: PromptCacheDescriptor,
+        prefix_token_ids: &[u32],
+        options: &PromptCacheOptions,
+        stream: &Stream,
+    ) -> Result<PromptCacheManifest, Exception> {
+        Self::save_prompt_cache_with_rank(
+            cache,
+            destination,
+            descriptor,
+            prefix_token_ids,
+            options,
+            None,
+            stream,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn load_paged_prompt_cache(
         args: &ModelArgs,
         directory: impl AsRef<Path>,
         expected: &PromptCacheDescriptor,
         prefix_token_ids: &[u32],
+        options: PagedCacheOptions,
         stream: &Stream,
     ) -> Result<(Cache, PromptCacheManifest), Exception> {
         let layer_count = usize::try_from(args.num_hidden_layers)
@@ -2691,89 +3185,70 @@ impl Model {
             layer_layout: prompt_cache_layer_layout(args)
                 .map_err(|error| Exception::custom(error.to_string()))?,
         };
-        Self::load_prompt_cache_with_identity(
+        Self::load_paged_prompt_cache_with_identity(
             args,
             directory,
             expected,
             prefix_token_ids,
-            identity,
+            &identity,
+            options,
             stream,
         )
     }
 
-    pub(crate) fn load_prompt_cache_with_identity(
+    pub(crate) fn load_paged_prompt_cache_with_identity(
         args: &ModelArgs,
         directory: impl AsRef<Path>,
         expected: &PromptCacheDescriptor,
         prefix_token_ids: &[u32],
-        identity: PromptCacheModelIdentity,
+        identity: &PromptCacheModelIdentity,
+        options: PagedCacheOptions,
         stream: &Stream,
     ) -> Result<(Cache, PromptCacheManifest), Exception> {
-        let (blocks, state, manifest) =
-            open_prompt_cache_snapshot(directory, expected, &identity, prefix_token_ids, stream)
+        let directory = directory.as_ref();
+        let (manager, manifest) =
+            open_prompt_cache(directory, expected, identity, prefix_token_ids, options)
                 .map_err(|error| Exception::custom(error.to_string()))?;
-        let mut blocks = blocks
-            .into_iter()
-            .map(|block| (block.global_layer, block))
-            .collect::<BTreeMap<_, _>>();
-        let mut state = state
+        let mut state = load_prompt_cache_state_tensors(directory, &manifest, stream)
+            .map_err(|error| Exception::custom(error.to_string()))?
             .into_iter()
             .map(|tensor| ((tensor.owner, tensor.role), tensor.array))
             .collect::<BTreeMap<_, _>>();
         let end = i32::try_from(prefix_token_ids.len())
             .map_err(|_| Exception::custom("Nemotron-H prompt length exceeds i32"))?;
-        let mut cache = Cache::new(args);
-        for (layer, cache) in cache.layers.iter_mut().enumerate() {
-            match cache {
-                LayerCache::Mamba(cache) => {
-                    if args.conv_kernel > 1 {
-                        cache.conv_state = Some(
-                            state
-                                .remove(&(
-                                    StateTensorOwner::Layer(layer),
-                                    StateTensorRole::Convolution { slot: 0 },
-                                ))
-                                .ok_or_else(|| {
-                                    Exception::custom(format!(
-                                        "Nemotron-H layer {layer} convolution state is missing"
-                                    ))
-                                })?,
-                        );
-                    }
-                    cache.ssm_state = Some(
+        let mut cache =
+            Cache::new_paged_with_manager(args, manager, identity.topology.cache_rank_identity())?;
+        for (layer, layer_cache) in cache.layers.iter_mut().enumerate() {
+            if let LayerCache::Mamba(cache) = layer_cache {
+                if args.conv_kernel > 1 {
+                    cache.conv_state = Some(
                         state
-                            .remove(&(StateTensorOwner::Layer(layer), StateTensorRole::Recurrent))
+                            .remove(&(
+                                StateTensorOwner::Layer(layer),
+                                StateTensorRole::Convolution { slot: 0 },
+                            ))
                             .ok_or_else(|| {
                                 Exception::custom(format!(
-                                    "Nemotron-H layer {layer} recurrent state is missing"
+                                    "Nemotron-H layer {layer} convolution state is missing"
                                 ))
                             })?,
                     );
-                    cache.offset = end;
                 }
-                LayerCache::Attention(cache) => {
-                    let block = blocks.remove(&layer).ok_or_else(|| {
-                        Exception::custom(format!(
-                            "Nemotron-H layer {layer} attention prompt-cache block is missing"
-                        ))
-                    })?;
-                    match block.arrays {
-                        CacheBlockArrays::KeyValue { keys, values } => {
-                            cache.restore_resident(keys, values, end)?;
-                        }
-                        CacheBlockArrays::CompressedLatentRotary { .. } => {
-                            return Err(Exception::custom(format!(
-                                "Nemotron-H layer {layer} prompt-cache kind mismatch"
-                            )))
-                        }
-                    }
-                }
-                LayerCache::Mlp | LayerCache::Moe => {}
+                cache.ssm_state = Some(
+                    state
+                        .remove(&(StateTensorOwner::Layer(layer), StateTensorRole::Recurrent))
+                        .ok_or_else(|| {
+                            Exception::custom(format!(
+                                "Nemotron-H layer {layer} recurrent state is missing"
+                            ))
+                        })?,
+                );
+                cache.offset = end;
             }
         }
-        if !blocks.is_empty() || !state.is_empty() {
+        if !state.is_empty() {
             return Err(Exception::custom(
-                "Nemotron-H prompt cache has unexpected state",
+                "Nemotron-H paged prompt cache has unexpected fixed state",
             ));
         }
         Ok((cache, manifest))
@@ -2898,7 +3373,6 @@ pub type Generate<'a, S = crate::runtime::generation::sampler::DefaultSampler> =
 
 pub(crate) struct LoadedNemotronHGguf {
     pub(crate) model: Model,
-    pub(crate) eos_token_ids: Vec<u32>,
 }
 
 pub(crate) struct PreparedNemotronHGguf {
@@ -2974,11 +3448,7 @@ pub(crate) fn load_nemotron_h_gguf_checkpoint(
     )?;
     report.finish(&model, &config)?;
     model.copy_to_stream(stream)?;
-    let eos_token_ids = crate::api::gguf_eos_token_ids(&metadata)?;
-    Ok(LoadedNemotronHGguf {
-        model,
-        eos_token_ids,
-    })
+    Ok(LoadedNemotronHGguf { model })
 }
 
 pub(crate) fn prepare_nemotron_h_gguf_checkpoint(
@@ -3751,8 +4221,8 @@ mod tests {
         expand_layer_values, gguf_affine_quantization, hybrid_pattern_from_gguf_layers,
         load_nemotron_h_gguf, load_nemotron_h_model, load_nemotron_h_safetensors_strict,
         model_args_from_config_value, rewrite_nemotron_h_weight_key, translate_gguf_weight_name,
-        unique_nonzero_layer_value, validate_model_config_value, LayerPolicy, Model, ModelArgs,
-        SparseMoeBlock,
+        unique_nonzero_layer_value, validate_model_config_value, AttentionCache, LayerCache,
+        LayerPolicy, Model, ModelArgs, ModelInput, SparseMoeBlock,
     };
     use crate::runtime::checkpoint::load::{StrictLoadConfig, StrictLoadReport};
     use crate::{
@@ -3760,7 +4230,11 @@ mod tests {
         runtime::checkpoint::quantization::AffineQuantization,
         AttentionPolicy, LayerSchedule,
     };
-    use safemlx::{module::ModuleParameters, ops::indexing::TryIndexOp, Array, ExecutionContext};
+    use safemlx::{
+        module::{Module, ModuleParameters},
+        ops::indexing::TryIndexOp,
+        Array, ExecutionContext,
+    };
     use serde_json::json;
     use std::{
         fs,
@@ -4172,9 +4646,238 @@ mod tests {
 
     #[test]
     #[ignore = "requires MLX runtime execution"]
-    fn schema_v4_nemotron_h_save_drop_reload_continue_matches_uninterrupted() {
+    fn heterogeneous_live_paging_matches_resident_mamba_and_attention() {
+        use crate::runtime::cache::residency::{
+            CacheResidencyPolicy, PagedCacheOptions, PromptCacheDescriptor, PromptCacheOptions,
+            PromptCacheTopology,
+        };
+
+        let ctx = ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
+        let stream = ctx.stream();
+        let args = tiny_full_args();
+        let mut resident = Model::new(args, stream).unwrap();
+        for (index, parameter) in resident.parameters_mut().flatten().values_mut().enumerate() {
+            **parameter = Array::full::<f32>(
+                parameter.shape(),
+                Array::from_f32((index + 1) as f32 * 0.001),
+                stream,
+            )
+            .unwrap();
+        }
+        let mut paged = resident.clone();
+        let mut resident_cache = resident.new_cache();
+        let mut paged_cache = paged
+            .new_cache_with_options(CacheResidencyPolicy::Paged(
+                PagedCacheOptions::new(2, 1 << 20, 1 << 20, 1)
+                    .unwrap()
+                    .with_full_attention(true),
+            ))
+            .unwrap();
+        for tokens in [
+            Array::from_slice(&[1_u32, 2, 3], &[1, 3]),
+            Array::from_slice(&[4_u32, 5], &[1, 2]),
+            Array::from_slice(&[6_u32], &[1, 1]),
+        ] {
+            let expected = resident
+                .forward(
+                    ModelInput {
+                        inputs: &tokens,
+                        mask: None,
+                        cache: Some(&mut resident_cache),
+                    },
+                    stream,
+                )
+                .unwrap();
+            let actual = paged
+                .forward(
+                    ModelInput {
+                        inputs: &tokens,
+                        mask: None,
+                        cache: Some(&mut paged_cache),
+                    },
+                    stream,
+                )
+                .unwrap();
+            assert!(expected
+                .all_close(&actual, 1e-5, 1e-5, None, stream)
+                .unwrap()
+                .item::<bool>(stream));
+            assert_eq!(paged_cache.offset(), resident_cache.offset());
+        }
+        match (&resident_cache.layers[0], &paged_cache.layers[0]) {
+            (LayerCache::Mamba(resident), LayerCache::Mamba(paged)) => {
+                assert_eq!(
+                    resident.conv_state.as_ref().unwrap().shape(),
+                    paged.conv_state.as_ref().unwrap().shape()
+                );
+                assert_eq!(
+                    resident.ssm_state.as_ref().unwrap().shape(),
+                    paged.ssm_state.as_ref().unwrap().shape()
+                );
+            }
+            _ => panic!("Nemotron-H layer zero must retain resident Mamba state"),
+        }
+        assert!(matches!(
+            &paged_cache.layers[3],
+            LayerCache::Attention(AttentionCache::Paged(_))
+        ));
+        let report = paged_cache.residency_report().unwrap().unwrap();
+        assert_eq!(report.logical_cached_tokens, 6);
+        assert!(report.key_value_blocks > 0);
+        assert!(report.prefill_full_attention_blocks > 0);
+        assert!(report.decode_full_attention_blocks > 0);
+
+        let prefix_ids = [1_u32, 2, 3, 4, 5, 6];
+        let layout = super::prompt_cache_layer_layout(&paged.args).unwrap();
+        let descriptor = PromptCacheDescriptor {
+            model_family: "nemotron_h".into(),
+            effective_model_type: paged.args.model_type.clone(),
+            checkpoint_fingerprint: "deterministic-paged-fixture".into(),
+            prefix_content_fingerprint: "tokens:1,2,3,4,5,6".into(),
+            architecture_fingerprint: super::prompt_cache_architecture_fingerprint(&paged.args),
+            layer_count: layout.len(),
+            global_layer_start: 0,
+            global_layer_end: layout.len(),
+            batch_size: 1,
+            layer_layout: layout,
+            sink_tokens: 0,
+            topology: PromptCacheTopology::default(),
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let destination = directory.path().join("paged-prompt-cache");
+        Model::save_prompt_cache(
+            &mut paged_cache,
+            &destination,
+            descriptor.clone(),
+            &prefix_ids,
+            &PromptCacheOptions::default(),
+            stream,
+        )
+        .unwrap();
+        drop(paged_cache);
+        let (mut restored, _) = Model::load_paged_prompt_cache(
+            &paged.args,
+            &destination,
+            &descriptor,
+            &prefix_ids,
+            PagedCacheOptions::new(2, 1 << 20, 1 << 20, 1)
+                .unwrap()
+                .with_full_attention(true),
+            stream,
+        )
+        .unwrap();
+        let next = Array::from_slice(&[7_u32], &[1, 1]);
+        let expected = resident
+            .forward(
+                ModelInput {
+                    inputs: &next,
+                    mask: None,
+                    cache: Some(&mut resident_cache),
+                },
+                stream,
+            )
+            .unwrap();
+        let actual = paged
+            .forward(
+                ModelInput {
+                    inputs: &next,
+                    mask: None,
+                    cache: Some(&mut restored),
+                },
+                stream,
+            )
+            .unwrap();
+        assert!(expected
+            .all_close(&actual, 1e-5, 1e-5, None, stream)
+            .unwrap()
+            .item::<bool>(stream));
+    }
+
+    #[test]
+    #[ignore = "requires MLX runtime execution"]
+    fn heterogeneous_sliding_live_paging_matches_resident() {
+        use crate::runtime::cache::residency::{CacheResidencyPolicy, PagedCacheOptions};
+
+        let ctx = ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
+        let stream = ctx.stream();
+        let mut args = tiny_full_args();
+        args.layer_schedule = LayerSchedule::new(
+            args.layer_schedule.len(),
+            args.layer_schedule
+                .iter()
+                .copied()
+                .map(|policy| match policy {
+                    LayerPolicy::SelfAttention(_) => {
+                        LayerPolicy::SelfAttention(AttentionPolicy::sliding(3).unwrap())
+                    }
+                    policy => policy,
+                })
+                .collect(),
+        )
+        .unwrap();
+        let mut resident = Model::new(args, stream).unwrap();
+        for (index, parameter) in resident.parameters_mut().flatten().values_mut().enumerate() {
+            **parameter = Array::full::<f32>(
+                parameter.shape(),
+                Array::from_f32((index + 1) as f32 * 0.001),
+                stream,
+            )
+            .unwrap();
+        }
+        let mut paged = resident.clone();
+        let mut resident_cache = resident.new_cache();
+        let mut paged_cache = paged
+            .new_cache_with_options(CacheResidencyPolicy::Paged(
+                PagedCacheOptions::new(2, 1 << 20, 1 << 20, 1).unwrap(),
+            ))
+            .unwrap();
+        for tokens in [
+            Array::from_slice(&[1_u32, 2, 3, 4, 5], &[1, 5]),
+            Array::from_slice(&[6_u32], &[1, 1]),
+            Array::from_slice(&[7_u32, 8], &[1, 2]),
+        ] {
+            let expected = resident
+                .forward(
+                    ModelInput {
+                        inputs: &tokens,
+                        mask: None,
+                        cache: Some(&mut resident_cache),
+                    },
+                    stream,
+                )
+                .unwrap();
+            let actual = paged
+                .forward(
+                    ModelInput {
+                        inputs: &tokens,
+                        mask: None,
+                        cache: Some(&mut paged_cache),
+                    },
+                    stream,
+                )
+                .unwrap();
+            assert!(expected
+                .all_close(&actual, 1e-5, 1e-5, None, stream)
+                .unwrap()
+                .item::<bool>(stream));
+        }
+        let report = paged_cache.residency_report().unwrap().unwrap();
+        assert_eq!(report.logical_cached_tokens, 8);
+        assert!(report.discarded_sliding_blocks > 0);
+        assert!(matches!(
+            &paged_cache.layers[3],
+            LayerCache::Attention(AttentionCache::Paged(cache))
+                if cache.attention_window() == Some(3)
+        ));
+    }
+
+    #[test]
+    #[ignore = "requires MLX runtime execution"]
+    fn schema_v4_nemotron_h_save_drop_paged_reload_continue_matches_uninterrupted() {
         use crate::runtime::{
-            cache::residency::{PromptCacheDescriptor, PromptCacheOptions, PromptCacheTopology},
+            cache::residency::{
+                PagedCacheOptions, PromptCacheDescriptor, PromptCacheOptions, PromptCacheTopology,
+            },
             media::input::{InputPart, ModelInput as RuntimeModelInput},
         };
 
@@ -4232,7 +4935,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let destination = directory.path().join("prompt-cache");
         Model::save_prompt_cache(
-            &cache,
+            &mut cache,
             &destination,
             descriptor.clone(),
             &prefix_ids,
@@ -4241,9 +4944,17 @@ mod tests {
         )
         .unwrap();
         drop(cache);
-        let (mut restored, _) =
-            Model::load_prompt_cache(&args, &destination, &descriptor, &prefix_ids, stream)
-                .unwrap();
+        let (mut restored, _) = Model::load_paged_prompt_cache(
+            &args,
+            &destination,
+            &descriptor,
+            &prefix_ids,
+            PagedCacheOptions::new(4, 1 << 20, 1 << 20, 1)
+                .unwrap()
+                .with_full_attention(true),
+            stream,
+        )
+        .unwrap();
         assert_eq!(restored.offset(), 4);
         match &restored.layers[0] {
             super::LayerCache::Mamba(cache) => {
@@ -4252,7 +4963,18 @@ mod tests {
             }
             _ => panic!("expected restored Nemotron-H Mamba cache"),
         }
-        assert_eq!(restored.layers[3].retained_arrays()[0].dim(-2), 4);
+        assert!(matches!(
+            &restored.layers[3],
+            LayerCache::Attention(AttentionCache::Paged(_))
+        ));
+        assert_eq!(
+            restored
+                .residency_report()
+                .unwrap()
+                .unwrap()
+                .logical_cached_tokens,
+            4
+        );
         let continued =
             CausalLm::decode_logits(&mut model, &suffix, &mut restored, stream).unwrap();
         assert!(uninterrupted

@@ -124,6 +124,25 @@ pub struct LayerPolicy {
     pub feed_forward: FeedForwardPolicy,
 }
 
+/// Rank-local decoder geometry derived from the canonical parallel plan.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub(crate) struct ParallelLayerGeometry {
+    pub(crate) query_heads: i32,
+    pub(crate) kv_heads: i32,
+    pub(crate) feed_forward: ParallelFeedForwardGeometry,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub(crate) enum ParallelFeedForwardGeometry {
+    Dense {
+        intermediate: i32,
+    },
+    SparseMoe {
+        routed_intermediate: i32,
+        shared_intermediate: i32,
+    },
+}
+
 #[derive(Debug, Clone, Deserialize)]
 struct TextArgsSource {
     /// Dense checkpoint dtype used by the released safetensors model.
@@ -331,6 +350,34 @@ impl TextArgs {
 pub(crate) fn prompt_cache_layer_layout(
     args: &ModelArgs,
 ) -> Result<LayerSchedule<LayerCachePolicy>, Error> {
+    let geometry = args
+        .text_config
+        .layer_schedule
+        .iter()
+        .map(|policy| {
+            let local = policy.attention.window().is_some();
+            ParallelLayerGeometry {
+                query_heads: args.text_config.q_heads(local),
+                kv_heads: args.text_config.kv_heads(local),
+                feed_forward: match policy.feed_forward {
+                    FeedForwardPolicy::Dense => ParallelFeedForwardGeometry::Dense {
+                        intermediate: args.text_config.dense_intermediate_size(),
+                    },
+                    FeedForwardPolicy::SparseMoe => ParallelFeedForwardGeometry::SparseMoe {
+                        routed_intermediate: args.text_config.moe_intermediate_size(),
+                        shared_intermediate: args.text_config.moe_intermediate_size(),
+                    },
+                },
+            }
+        })
+        .collect::<Vec<_>>();
+    prompt_cache_layer_layout_with_geometry(args, &geometry)
+}
+
+pub(crate) fn prompt_cache_layer_layout_with_geometry(
+    args: &ModelArgs,
+    geometry: &[ParallelLayerGeometry],
+) -> Result<LayerSchedule<LayerCachePolicy>, Error> {
     let text = &args.text_config;
     let cache_error = |error: crate::runtime::cache::residency::CacheResidencyError| {
         Error::UnsupportedArchitecture(error.to_string())
@@ -340,6 +387,12 @@ pub(crate) fn prompt_cache_layer_layout(
     })?;
     let fixed = |value| StateTensorDimension::fixed(value).map_err(cache_error);
     let layers = text.num_hidden_layers as usize;
+    if geometry.len() != layers {
+        return Err(Error::UnsupportedArchitecture(format!(
+            "Inkling cache geometry has {} layers, expected {layers}",
+            geometry.len()
+        )));
+    }
     let policies = (0..layers)
         .map(|layer| {
             let policy = *text.layer_policy(layer).ok_or_else(|| {
@@ -347,10 +400,11 @@ pub(crate) fn prompt_cache_layer_layout(
                     "Inkling layer schedule has no decoder layer {layer}"
                 ))
             })?;
-            let local = policy.attention.window().is_some();
-            let kv_width = text
-                .kv_heads(local)
-                .checked_mul(text.attention_head_dim(local))
+            let local = geometry[layer];
+            let sliding = policy.attention.window().is_some();
+            let kv_width = local
+                .kv_heads
+                .checked_mul(text.attention_head_dim(sliding))
                 .ok_or_else(|| {
                     Error::UnsupportedArchitecture("Inkling KV width overflow".into())
                 })?;
@@ -368,8 +422,8 @@ pub(crate) fn prompt_cache_layer_layout(
                 .collect::<Result<Vec<_>, Error>>()?;
             LayerCachePolicy::key_value_with_fixed_state(
                 policy.attention,
-                text.kv_heads(local),
-                text.attention_head_dim(local),
+                local.kv_heads,
+                text.attention_head_dim(policy.attention.window().is_some()),
                 tensors,
             )
             .map_err(cache_error)
@@ -859,8 +913,11 @@ impl InklingAttention {
         let relative = self.r_proj.forward(hidden, stream)?;
 
         if let Some(cache) = cache {
-            k = short_convolution(&self.k_sconv, &k, Some(&mut cache.convolutions[0]), stream)?;
-            v = short_convolution(&self.v_sconv, &v, Some(&mut cache.convolutions[1]), stream)?;
+            let LayerCache { kv, convolutions } = cache;
+            let (k_cache, rest) = convolutions.split_at_mut(1);
+            let (v_cache, _) = rest.split_at_mut(1);
+            k = short_convolution(&self.k_sconv, &k, Some(&mut k_cache[0]), stream)?;
+            v = short_convolution(&self.v_sconv, &v, Some(&mut v_cache[0]), stream)?;
             let q = self
                 .q_norm
                 .forward(
@@ -878,14 +935,14 @@ impl InklingAttention {
             let v = v
                 .reshape(&[batch, seq_len, self.n_kv_heads, self.head_dim], stream)?
                 .transpose_axes(&[0, 2, 1, 3], stream)?;
-            if cache.kv.is_paged() {
-                cache.kv.update_for_attention(k, v, stream)?;
-                let InklingKvCache::Paged(cache) = &cache.kv else {
+            if kv.is_paged() {
+                kv.update_for_attention(k, v, stream)?;
+                let InklingKvCache::Paged(cache) = &*kv else {
                     unreachable!("paged Inkling cache variant checked above")
                 };
                 self.attend_paged(q, &relative, batch, seq_len, q_offset, cache, stream)
             } else {
-                let (k, v) = cache.kv.update_and_fetch(k, v, stream)?;
+                let (k, v) = kv.update_and_fetch(k, v, stream)?;
                 let key_len = k.dim(2);
                 let key_offset = q_offset + seq_len - key_len;
                 self.attend_chunked(
@@ -913,6 +970,64 @@ impl InklingAttention {
                 .reshape(&[batch, seq_len, self.n_kv_heads, self.head_dim], stream)?
                 .transpose_axes(&[0, 2, 1, 3], stream)?;
             self.attend_chunked(q, k, v, &relative, batch, seq_len, 0, 0, stream)
+        }
+    }
+
+    fn forward_with_operator_cache(
+        &mut self,
+        hidden: &Array,
+        kv: &mut PipelineInklingKvCache<'_>,
+        k_cache: &mut CausalConv1dCache,
+        v_cache: &mut CausalConv1dCache,
+        stream: &Stream,
+    ) -> Result<Array, Exception> {
+        let batch = hidden.dim(0);
+        let seq_len = hidden.dim(1);
+        let q_offset = kv.offset();
+        let q = self.q_proj.forward(hidden, stream)?;
+        let mut k = short_convolution(
+            &self.k_sconv,
+            &self.k_proj.forward(hidden, stream)?,
+            Some(k_cache),
+            stream,
+        )?;
+        let mut v = short_convolution(
+            &self.v_sconv,
+            &self.v_proj.forward(hidden, stream)?,
+            Some(v_cache),
+            stream,
+        )?;
+        let relative = self.r_proj.forward(hidden, stream)?;
+        let q = self
+            .q_norm
+            .forward(
+                &q.reshape(&[batch, seq_len, self.n_heads, self.head_dim], stream)?,
+                stream,
+            )?
+            .transpose_axes(&[0, 2, 1, 3], stream)?;
+        k = self
+            .k_norm
+            .forward(
+                &k.reshape(&[batch, seq_len, self.n_kv_heads, self.head_dim], stream)?,
+                stream,
+            )?
+            .transpose_axes(&[0, 2, 1, 3], stream)?;
+        v = v
+            .reshape(&[batch, seq_len, self.n_kv_heads, self.head_dim], stream)?
+            .transpose_axes(&[0, 2, 1, 3], stream)?;
+        match kv {
+            PipelineInklingKvCache::Standard(cache) => {
+                let (k, v) = cache.update_and_fetch(k, v, stream)?;
+                let key_len = k.dim(2);
+                let key_offset = q_offset + seq_len - key_len;
+                self.attend_chunked(
+                    q, k, v, &relative, batch, seq_len, q_offset, key_offset, stream,
+                )
+            }
+            PipelineInklingKvCache::Paged(cache) => {
+                cache.update_for_attention(k, v, stream)?;
+                self.attend_paged(q, &relative, batch, seq_len, q_offset, cache, stream)
+            }
         }
     }
 
@@ -1191,6 +1306,21 @@ impl InklingAttention {
     }
 }
 
+/// Borrowed KV storage for pipeline execution of Inkling relative attention.
+pub(crate) enum PipelineInklingKvCache<'a> {
+    Standard(&'a mut dyn KeyValueCache),
+    Paged(&'a mut PagedKeyValueCache),
+}
+
+impl PipelineInklingKvCache<'_> {
+    fn offset(&self) -> i32 {
+        match self {
+            Self::Standard(cache) => cache.offset(),
+            Self::Paged(cache) => cache.offset(),
+        }
+    }
+}
+
 fn short_convolution(
     convolution: &DepthwiseConv1d,
     input: &Array,
@@ -1351,6 +1481,7 @@ impl InklingMoe {
 
 #[derive(Debug, Clone, ModuleParameters)]
 pub(crate) struct DecoderLayer {
+    intermediate: i32,
     #[param]
     input_layernorm: nn::RmsNorm,
     #[param]
@@ -1375,7 +1506,13 @@ impl DecoderLayer {
             .layer_policy(layer as usize)
             .ok_or_else(|| Exception::custom(format!("Inkling has no policy for layer {layer}")))?;
         let dense = policy.feed_forward == FeedForwardPolicy::Dense;
+        let intermediate = if dense {
+            args.dense_intermediate_size()
+        } else {
+            args.moe_intermediate_size()
+        };
         Ok(Self {
+            intermediate,
             input_layernorm: nn::RmsNorm::unloaded(
                 args.hidden_size,
                 args.rms_norm_eps,
@@ -1445,42 +1582,71 @@ impl DecoderLayer {
         })
     }
 
-    pub(crate) fn new_tensor_parallel(
+    pub(crate) fn new_parallel_layerwise(
         args: &TextArgs,
         layer: i32,
-        parts: usize,
+        geometry: ParallelLayerGeometry,
         stream: &Stream,
     ) -> Result<Self, Exception> {
-        let parts =
-            i32::try_from(parts).map_err(|_| Exception::custom("Inkling TP size exceeds i32"))?;
-        let divide = |name: &str, value: i32| {
-            if value <= 0 || value % parts != 0 {
-                Err(Exception::custom(format!(
-                    "Inkling {name} {value} is not divisible by TP size {parts}"
-                )))
-            } else {
-                Ok(value / parts)
-            }
+        let valid_feed_forward = match geometry.feed_forward {
+            ParallelFeedForwardGeometry::Dense { intermediate } => intermediate > 0,
+            ParallelFeedForwardGeometry::SparseMoe {
+                routed_intermediate,
+                shared_intermediate,
+            } => routed_intermediate > 0 && shared_intermediate > 0,
         };
+        if geometry.query_heads <= 0 || geometry.kv_heads <= 0 || !valid_feed_forward {
+            return Err(Exception::custom(format!(
+                "Inkling layer {layer} has invalid local parallel geometry {geometry:?}"
+            )));
+        }
         let mut local = args.clone();
-        local.num_attention_heads = divide("attention heads", args.num_attention_heads)?;
-        local.num_key_value_heads = divide("KV heads", args.num_key_value_heads)?;
-        local.swa_num_attention_heads = args
-            .swa_num_attention_heads
-            .map(|value| divide("sliding attention heads", value))
-            .transpose()?;
-        local.swa_num_key_value_heads = args
-            .swa_num_key_value_heads
-            .map(|value| divide("sliding KV heads", value))
-            .transpose()?;
-        local.dense_intermediate_size = Some(divide(
-            "dense intermediate width",
-            args.dense_intermediate_size(),
-        )?);
-        local.moe_intermediate_size = Some(divide(
-            "expert intermediate width",
-            args.moe_intermediate_size(),
-        )?);
+        let policy = *args
+            .layer_policy(layer as usize)
+            .ok_or_else(|| Exception::custom(format!("Inkling has no policy for layer {layer}")))?;
+        if policy.attention.window().is_some() {
+            local.swa_num_attention_heads = Some(geometry.query_heads);
+            local.swa_num_key_value_heads = Some(geometry.kv_heads);
+        } else {
+            local.num_attention_heads = geometry.query_heads;
+            local.num_key_value_heads = geometry.kv_heads;
+        }
+        match policy.feed_forward {
+            FeedForwardPolicy::Dense => {
+                let ParallelFeedForwardGeometry::Dense { intermediate } = geometry.feed_forward
+                else {
+                    return Err(Exception::custom(
+                        "Inkling dense layer received sparse parallel geometry",
+                    ));
+                };
+                local.dense_intermediate_size = Some(intermediate);
+            }
+            FeedForwardPolicy::SparseMoe => {
+                let ParallelFeedForwardGeometry::SparseMoe {
+                    routed_intermediate,
+                    shared_intermediate,
+                } = geometry.feed_forward
+                else {
+                    return Err(Exception::custom(
+                        "Inkling sparse layer received dense parallel geometry",
+                    ));
+                };
+                local.moe_intermediate_size = Some(routed_intermediate);
+                let mut result = Self::new(&local, layer, stream)?;
+                let moe = result.moe.as_mut().expect("validated sparse Inkling layer");
+                let prefix = format!("model.layers.{layer}.moe.shared_experts");
+                moe.shared_experts = PackedSwiGluExperts::new_with_dtype(
+                    local.n_shared_experts,
+                    local.hidden_size,
+                    shared_intermediate,
+                    local.weight_quantization_for(&format!("{prefix}.gate_up_proj")),
+                    local.weight_quantization_for(&format!("{prefix}.down_proj")),
+                    local.weight_dtype(),
+                    stream,
+                )?;
+                return Ok(result);
+            }
+        }
         Self::new(&local, layer, stream)
     }
 
@@ -1489,36 +1655,67 @@ impl DecoderLayer {
         planner: &mut crate::runtime::distributed::parallel::ParallelPlanBuilder,
         prefix: &str,
     ) -> Result<(), Error> {
-        use crate::nn::parallel::LinearParallelism;
         use crate::runtime::distributed::parallel::{
-            MemberSharding, ParameterGroupSpec, ParameterMemberSpec, ParameterRole,
+            aligned_partition_units, array_parameter_member, partitioned_projection_members,
+            register_partitioned_projection_group, MemberSharding, ParameterGroupSpec,
+            ParameterMemberSpec, ParameterRole, ProjectionSharding,
         };
-        let register_linear =
-            |planner: &mut crate::runtime::distributed::parallel::ParallelPlanBuilder,
-             projection: &MaybeQuantized<nn::Linear>,
-             name: &str,
-             parallelism| {
-                crate::nn::parallel::register_linear_parameter_group(
-                    planner,
-                    projection,
-                    &format!("{prefix}.{name}"),
-                    parallelism,
-                )
-            };
-        for (name, projection) in [
-            ("self_attn.q_proj", &self.self_attn.q_proj),
-            ("self_attn.k_proj", &self.self_attn.k_proj),
-            ("self_attn.v_proj", &self.self_attn.v_proj),
-            ("self_attn.r_proj", &self.self_attn.r_proj),
-        ] {
-            register_linear(planner, projection, name, LinearParallelism::Column)?;
-        }
-        register_linear(
-            planner,
-            &self.self_attn.o_proj,
-            "self_attn.o_proj",
-            LinearParallelism::Row,
+        let attention_prefix = format!("{prefix}.self_attn");
+        let q = format!("{attention_prefix}.q_proj");
+        let k = format!("{attention_prefix}.k_proj");
+        let v = format!("{attention_prefix}.v_proj");
+        let r = format!("{attention_prefix}.r_proj");
+        let o = format!("{attention_prefix}.o_proj");
+        let (attention_units, mut attention_members) = partitioned_projection_members(
+            &[
+                (
+                    &self.self_attn.q_proj,
+                    q.as_str(),
+                    ProjectionSharding::Column,
+                ),
+                (
+                    &self.self_attn.k_proj,
+                    k.as_str(),
+                    ProjectionSharding::Column,
+                ),
+                (
+                    &self.self_attn.v_proj,
+                    v.as_str(),
+                    ProjectionSharding::Column,
+                ),
+                (
+                    &self.self_attn.r_proj,
+                    r.as_str(),
+                    ProjectionSharding::Column,
+                ),
+                (&self.self_attn.o_proj, o.as_str(), ProjectionSharding::Row),
+            ],
+            usize::try_from(self.self_attn.n_kv_heads)
+                .map_err(|_| Error::Parallel("Inkling KV-head count exceeds usize".into()))?,
         )?;
+        for (name, convolution) in [
+            ("k_sconv", &self.self_attn.k_sconv),
+            ("v_sconv", &self.self_attn.v_sconv),
+        ] {
+            attention_members.push(array_parameter_member(
+                format!("{attention_prefix}.{name}.weight"),
+                convolution.weight.as_ref(),
+                MemberSharding::Partitioned { axis: 0 },
+            )?);
+            if let Some(bias) = convolution.bias.as_ref().as_ref() {
+                attention_members.push(array_parameter_member(
+                    format!("{attention_prefix}.{name}.bias"),
+                    bias,
+                    MemberSharding::Partitioned { axis: 0 },
+                )?);
+            }
+        }
+        planner.register(ParameterGroupSpec::partitioned(
+            format!("{attention_prefix}.gqa"),
+            ParameterRole::AttentionHeads,
+            attention_units,
+            attention_members,
+        )?)?;
         macro_rules! replicated {
             ($name:literal, $module:expr) => {
                 crate::nn::parallel::register_replicated_parameter_group(
@@ -1564,46 +1761,22 @@ impl DecoderLayer {
                 )],
             )?)?;
         }
-        for (name, convolution) in [
-            ("self_attn.k_sconv", &self.self_attn.k_sconv),
-            ("self_attn.v_sconv", &self.self_attn.v_sconv),
-        ] {
-            let mut members = vec![ParameterMemberSpec::new(
-                format!("{prefix}.{name}.weight"),
-                convolution
-                    .weight
-                    .value
-                    .shape()
-                    .iter()
-                    .map(|&value| value as usize)
-                    .collect::<Vec<_>>(),
-                MemberSharding::Equal { axis: 0 },
-            )];
-            if let Some(bias) = &convolution.bias.value {
-                members.push(ParameterMemberSpec::new(
-                    format!("{prefix}.{name}.bias"),
-                    [bias.dim(0) as usize],
-                    MemberSharding::Equal { axis: 0 },
-                ));
-            }
-            planner.register(ParameterGroupSpec::new(
-                format!("{prefix}.{name}"),
-                ParameterRole::Channels,
-                members,
-            )?)?;
-        }
         if let Some(dense) = &self.dense {
-            for (name, projection, parallelism) in [
-                (
-                    "dense.gate_proj",
-                    &dense.gate_proj,
-                    LinearParallelism::Column,
-                ),
-                ("dense.up_proj", &dense.up_proj, LinearParallelism::Column),
-                ("dense.down_proj", &dense.down_proj, LinearParallelism::Row),
-            ] {
-                register_linear(planner, projection, name, parallelism)?;
-            }
+            let gate = format!("{prefix}.dense.gate_proj");
+            let up = format!("{prefix}.dense.up_proj");
+            let down = format!("{prefix}.dense.down_proj");
+            register_partitioned_projection_group(
+                planner,
+                &format!("{prefix}.dense.intermediate"),
+                ParameterRole::FeedForwardIntermediate,
+                &[
+                    (&dense.gate_proj, gate.as_str(), ProjectionSharding::Column),
+                    (&dense.up_proj, up.as_str(), ProjectionSharding::Column),
+                    (&dense.down_proj, down.as_str(), ProjectionSharding::Row),
+                ],
+                usize::try_from(self.intermediate)
+                    .map_err(|_| Error::Parallel("Inkling dense width exceeds usize".into()))?,
+            )?;
         }
         if let Some(moe) = &self.moe {
             crate::nn::parallel::register_replicated_parameter_group(
@@ -1616,7 +1789,9 @@ impl DecoderLayer {
                 ("shared_experts", &moe.shared_experts),
             ] {
                 let bank_prefix = format!("{prefix}.moe.{bank_name}");
-                let mut gate_up = vec![ParameterMemberSpec::new(
+                let intermediate = usize::try_from(bank.intermediate_dim)
+                    .map_err(|_| Error::Parallel("Inkling expert width exceeds usize".into()))?;
+                let mut members = vec![ParameterMemberSpec::new(
                     format!("{bank_prefix}.gate_up_proj"),
                     bank.gate_up_proj
                         .value
@@ -1624,12 +1799,9 @@ impl DecoderLayer {
                         .iter()
                         .map(|&value| value as usize)
                         .collect::<Vec<_>>(),
-                    MemberSharding::Segmented {
+                    MemberSharding::PartitionedSegments {
                         axis: 1,
-                        segments: vec![
-                            0..bank.intermediate_dim as usize,
-                            bank.intermediate_dim as usize..2 * bank.intermediate_dim as usize,
-                        ],
+                        segments: vec![0..intermediate, intermediate..2 * intermediate],
                     },
                 )];
                 for (suffix, value) in [
@@ -1643,59 +1815,66 @@ impl DecoderLayer {
                     ),
                 ] {
                     if let Some(value) = value {
-                        gate_up.push(ParameterMemberSpec::new(
+                        members.push(ParameterMemberSpec::new(
                             format!("{bank_prefix}.{suffix}"),
                             value
                                 .shape()
                                 .iter()
                                 .map(|&value| value as usize)
                                 .collect::<Vec<_>>(),
-                            MemberSharding::Segmented {
+                            MemberSharding::PartitionedSegments {
                                 axis: 1,
-                                segments: vec![
-                                    0..bank.intermediate_dim as usize,
-                                    bank.intermediate_dim as usize
-                                        ..2 * bank.intermediate_dim as usize,
-                                ],
+                                segments: vec![0..intermediate, intermediate..2 * intermediate],
                             },
                         ));
                     }
                 }
-                planner.register(ParameterGroupSpec::new(
-                    format!("{bank_prefix}.gate_up"),
-                    ParameterRole::ExpertIntermediate,
-                    gate_up,
-                )?)?;
-                let mut down = vec![ParameterMemberSpec::new(
+                let down_shape = bank
+                    .down_proj
+                    .value
+                    .shape()
+                    .iter()
+                    .map(|&value| value as usize)
+                    .collect::<Vec<_>>();
+                members.push(ParameterMemberSpec::new(
                     format!("{bank_prefix}.down_proj"),
-                    bank.down_proj
-                        .value
-                        .shape()
-                        .iter()
-                        .map(|&value| value as usize)
-                        .collect::<Vec<_>>(),
-                    MemberSharding::Equal { axis: 2 },
-                )];
+                    down_shape,
+                    MemberSharding::Partitioned { axis: 2 },
+                ));
                 for (suffix, value) in [
                     ("down_proj_scales", bank.down_proj_scales.value.as_ref()),
                     ("down_proj_biases", bank.down_proj_biases.value.as_ref()),
                 ] {
                     if let Some(value) = value {
-                        down.push(ParameterMemberSpec::new(
+                        let shape = value
+                            .shape()
+                            .iter()
+                            .map(|&value| value as usize)
+                            .collect::<Vec<_>>();
+                        members.push(ParameterMemberSpec::new(
                             format!("{bank_prefix}.{suffix}"),
-                            value
-                                .shape()
-                                .iter()
-                                .map(|&value| value as usize)
-                                .collect::<Vec<_>>(),
-                            MemberSharding::Equal { axis: 2 },
+                            shape,
+                            MemberSharding::Partitioned { axis: 2 },
                         ));
                     }
                 }
-                planner.register(ParameterGroupSpec::new(
-                    format!("{bank_prefix}.down"),
+                planner.register(ParameterGroupSpec::partitioned(
+                    format!("{bank_prefix}.intermediate"),
                     ParameterRole::ExpertIntermediate,
-                    down,
+                    aligned_partition_units(
+                        &format!("{bank_prefix}.intermediate"),
+                        intermediate,
+                        1,
+                        usize::try_from(
+                            bank.down_affine
+                                .or(bank.down_iquant)
+                                .map_or(1, |quantization| quantization.group_size()),
+                        )
+                        .map_err(|_| {
+                            Error::Parallel("Inkling expert alignment exceeds usize".into())
+                        })?,
+                    )?,
+                    members,
                 )?)?;
             }
         }
@@ -1740,6 +1919,32 @@ impl DecoderLayer {
                 hidden.add(mlp, stream)
             }
         }
+    }
+
+    pub(crate) fn forward_with_operator_cache(
+        &mut self,
+        hidden: &Array,
+        kv: &mut PipelineInklingKvCache<'_>,
+        convolutions: &mut [CausalConv1dCache; 4],
+        stream: &Stream,
+    ) -> Result<Array, Exception> {
+        let normalized = self.input_layernorm.forward(hidden, stream)?;
+        let (attention_kv, output) = convolutions.split_at_mut(2);
+        let (key_state, value_state) = attention_kv.split_at_mut(1);
+        let attention = self.self_attn.forward_with_operator_cache(
+            &normalized,
+            kv,
+            &mut key_state[0],
+            &mut value_state[0],
+            stream,
+        )?;
+        let attention =
+            short_convolution(&self.attn_sconv, &attention, Some(&mut output[0]), stream)?;
+        let hidden = hidden.add(attention, stream)?;
+        let normalized = self.post_attention_layernorm.forward(&hidden, stream)?;
+        let mlp = self.forward_mlp(&normalized, stream)?;
+        let mlp = short_convolution(&self.mlp_sconv, &mlp, Some(&mut output[1]), stream)?;
+        hidden.add(mlp, stream)
     }
 
     pub(crate) fn forward_tensor_parallel(
@@ -1799,9 +2004,7 @@ impl DecoderLayer {
         let mlp = short_convolution(
             &self.mlp_sconv,
             &mlp,
-            mlp_cache
-                .as_deref_mut()
-                .map(|cache| &mut cache.convolutions[3]),
+            mlp_cache.map(|cache| &mut cache.convolutions[3]),
             stream,
         )?;
         hidden.add(mlp, stream)
@@ -1889,15 +2092,15 @@ impl DecoderLayer {
 }
 
 #[derive(Debug, Clone, ModuleParameters)]
-struct TextModel {
+pub(crate) struct TextModel {
     #[param]
-    embed_tokens: MaybeQuantized<nn::Embedding>,
+    pub(crate) embed_tokens: MaybeQuantized<nn::Embedding>,
     #[param]
-    embed_norm: nn::RmsNorm,
+    pub(crate) embed_norm: nn::RmsNorm,
     #[param]
-    layers: Vec<DecoderLayer>,
+    pub(crate) layers: Vec<DecoderLayer>,
     #[param]
-    norm: nn::RmsNorm,
+    pub(crate) norm: nn::RmsNorm,
 }
 
 impl TextModel {
@@ -1985,6 +2188,52 @@ impl TextModel {
             };
         }
         self.norm.forward(&hidden, stream)
+    }
+}
+
+/// Applies Inkling's authoritative post-decoder output policy around a caller-
+/// supplied vocabulary projection.
+///
+/// Resident, bounded, tensor-parallel, and pipeline execution own different
+/// projection modules, but token selection, muP scaling, and removal of padded
+/// vocabulary rows are architecture semantics and must not diverge by backend.
+pub(crate) fn project_text_logits<E>(
+    hidden: &Array,
+    args: &TextArgs,
+    last_token_only: bool,
+    stream: &Stream,
+    project: impl FnOnce(&Array, &Stream) -> Result<Array, E>,
+) -> Result<Array, E>
+where
+    E: From<Exception>,
+{
+    let hidden = if last_token_only {
+        hidden
+            .try_index_device((.., -1, ..), stream)
+            .map_err(E::from)?
+    } else {
+        hidden.clone()
+    };
+    let hidden = hidden
+        .divide(Array::from_f32(args.logits_mup_width_multiplier), stream)
+        .map_err(E::from)?;
+    let logits = project(&hidden, stream)?;
+    let Some(size) = args
+        .unpadded_vocab_size
+        .filter(|&size| size < logits.dim(-1))
+    else {
+        return Ok(logits);
+    };
+    match logits.ndim() {
+        2 => logits
+            .try_index_device((.., ..size), stream)
+            .map_err(E::from),
+        3 => logits
+            .try_index_device((.., .., ..size), stream)
+            .map_err(E::from),
+        rank => Err(E::from(Exception::custom(format!(
+            "Inkling logits have unsupported rank {rank}"
+        )))),
     }
 }
 
@@ -2210,6 +2459,7 @@ impl AudioModel {
 pub(crate) struct VisionLayer {
     t_fold: i32,
     hw_fold: i32,
+    parallel_input_range: Option<Range<i32>>,
     #[param]
     projection: MaybeQuantized<nn::Linear>,
     #[param]
@@ -2229,6 +2479,7 @@ impl VisionLayer {
         Ok(Self {
             t_fold,
             hw_fold,
+            parallel_input_range: None,
             projection: common::linear::unloaded_maybe_quantized_linear_with_dtype(
                 input_dim,
                 output_dim,
@@ -2241,6 +2492,32 @@ impl VisionLayer {
                 .then(|| nn::RmsNorm::unloaded(output_dim, eps, dense_dtype, stream))
                 .transpose()?,
         })
+    }
+
+    pub(crate) fn new_parallel_layerwise(
+        spec: (i32, i32, i32, i32),
+        input_range: Range<i32>,
+        add_norm: bool,
+        eps: f32,
+        quantization: Option<WeightQuantization>,
+        dense_dtype: Dtype,
+        stream: &Stream,
+    ) -> Result<Self, Exception> {
+        if input_range.start < 0 || input_range.start >= input_range.end {
+            return Err(Exception::custom(format!(
+                "Inkling vision layer has invalid local input range {input_range:?}"
+            )));
+        }
+        let mut layer = Self::new(
+            (input_range.end - input_range.start, spec.1, spec.2, spec.3),
+            add_norm,
+            eps,
+            quantization,
+            dense_dtype,
+            stream,
+        )?;
+        layer.parallel_input_range = Some(input_range);
+        Ok(layer)
     }
 
     pub(crate) fn forward(&mut self, hidden: &Array, stream: &Stream) -> Result<Array, Exception> {
@@ -2305,19 +2582,16 @@ impl VisionLayer {
         stream: &Stream,
     ) -> Result<Array, Exception> {
         let hidden = self.fold(hidden, stream)?;
-        let parts = i32::try_from(group.size())
-            .map_err(|_| Exception::custom("Inkling TP size exceeds i32"))?;
-        if hidden.dim(-1) % parts != 0 {
+        let range = self.parallel_input_range.as_ref().ok_or_else(|| {
+            Exception::custom("Inkling vision TP layer is missing planner-derived input geometry")
+        })?;
+        if range.end > hidden.dim(-1) {
             return Err(Exception::custom(format!(
-                "Inkling vision input width {} is not divisible by TP size {parts}",
+                "Inkling vision input range {range:?} exceeds folded width {}",
                 hidden.dim(-1)
             )));
         }
-        let width = hidden.dim(-1) / parts;
-        let start = i32::try_from(group.rank())
-            .map_err(|_| Exception::custom("Inkling TP rank exceeds i32"))?
-            * width;
-        let local = hidden.try_index_device((.., .., .., .., start..start + width), stream)?;
+        let local = hidden.try_index_device((.., .., .., .., range.clone()), stream)?;
         let partial = self.projection.forward(&local, stream)?;
         let mut hidden = safemlx::distributed::all_sum(&partial, group, stream)?;
         if let Some(norm) = &mut self.layer_norm {
@@ -2404,13 +2678,13 @@ impl VisionModel {
 pub struct Model {
     pub args: ModelArgs,
     #[param]
-    model: TextModel,
+    pub(crate) model: TextModel,
     #[param]
     audio: Option<AudioModel>,
     #[param]
     visual: Option<VisionModel>,
     #[param]
-    lm_head: MaybeQuantized<nn::Linear>,
+    pub(crate) lm_head: MaybeQuantized<nn::Linear>,
 }
 
 impl Model {
@@ -2553,6 +2827,7 @@ impl Model {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn load_prompt_cache(
         args: &ModelArgs,
         directory: impl AsRef<Path>,
@@ -2687,29 +2962,14 @@ impl Model {
                 .validate(&self.args.text_config.layer_schedule)
                 .map_err(|error| Exception::custom(error.to_string()))?;
         }
-        let mut hidden = self.model.forward(tokens, inputs_embeds, cache, stream)?;
-        if last_token_only {
-            hidden = hidden.try_index_device((.., -1, ..), stream)?;
-        }
-        hidden = hidden.divide(
-            Array::from_f32(self.args.text_config.logits_mup_width_multiplier),
+        let hidden = self.model.forward(tokens, inputs_embeds, cache, stream)?;
+        project_text_logits(
+            &hidden,
+            &self.args.text_config,
+            last_token_only,
             stream,
-        )?;
-        let mut logits = self.lm_head.forward(&hidden, stream)?;
-        if let Some(size) = self.args.text_config.unpadded_vocab_size {
-            if size < logits.dim(-1) {
-                logits = match logits.ndim() {
-                    2 => logits.try_index_device((.., ..size), stream)?,
-                    3 => logits.try_index_device((.., .., ..size), stream)?,
-                    rank => {
-                        return Err(Exception::custom(format!(
-                            "Inkling logits have unsupported rank {rank}"
-                        )))
-                    }
-                };
-            }
-        }
-        Ok(logits)
+            |hidden, stream| self.lm_head.forward(hidden, stream),
+        )
     }
 
     pub(crate) fn forward_cached_expert_parallel<F>(
@@ -2722,20 +2982,16 @@ impl Model {
     where
         F: FnMut(usize, &Array, &Array, &Array, &Stream) -> Result<Array, Exception>,
     {
-        let mut hidden = self
+        let hidden = self
             .model
             .forward_with_expert_executor(tokens, cache, execute, stream)?;
-        hidden = hidden.divide(
-            Array::from_f32(self.args.text_config.logits_mup_width_multiplier),
+        project_text_logits(
+            &hidden,
+            &self.args.text_config,
+            false,
             stream,
-        )?;
-        let mut logits = self.lm_head.forward(&hidden, stream)?;
-        if let Some(size) = self.args.text_config.unpadded_vocab_size {
-            if size < logits.dim(-1) {
-                logits = logits.try_index_device((.., .., ..size), stream)?;
-            }
-        }
-        Ok(logits)
+            |hidden, stream| self.lm_head.forward(hidden, stream),
+        )
     }
 
     fn prepare_typed_prefill(
@@ -2827,7 +3083,6 @@ pub type Generate<'a, S = crate::runtime::generation::sampler::DefaultSampler> =
 
 pub(crate) struct LoadedInklingGguf {
     pub(crate) model: Model,
-    pub(crate) eos_token_ids: Vec<u32>,
 }
 
 pub(crate) struct PreparedInklingGguf {
@@ -3026,10 +3281,7 @@ pub(crate) fn load_gguf_checkpoint_with_mmproj(
     }
     report.finish(&model, &config)?;
     model.copy_to_stream(stream)?;
-    Ok(LoadedInklingGguf {
-        model,
-        eos_token_ids: prepared.eos_token_ids,
-    })
+    Ok(LoadedInklingGguf { model })
 }
 
 fn paired_inkling_gguf_component<'a, T>(
@@ -4980,8 +5232,8 @@ mod tests {
             }
         });
         super::validate_model_config_value(&config).unwrap();
-        let support = crate::api::check_model_config(&config);
-        let crate::api::ModelConfigSupport::Supported(support) = support else {
+        let support = crate::api::resolve_model_config(&config);
+        let Ok(support) = support else {
             panic!("released Inkling metadata did not dispatch")
         };
         assert_eq!(support.kind, crate::api::ModelKind::Inkling);

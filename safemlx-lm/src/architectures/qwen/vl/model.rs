@@ -189,13 +189,29 @@ pub(crate) fn prompt_cache_architecture_fingerprint(args: &ModelArgs) -> String 
     )
 }
 
+#[cfg(test)]
 pub(crate) fn prompt_cache_layer_layout(
     args: &ModelArgs,
+) -> Result<LayerSchedule<LayerCachePolicy>, Error> {
+    let kv_heads =
+        vec![args.text_config.num_key_value_heads; args.text_config.num_hidden_layers as usize];
+    prompt_cache_layer_layout_with_kv_heads(args, &kv_heads)
+}
+
+pub(crate) fn prompt_cache_layer_layout_with_kv_heads(
+    args: &ModelArgs,
+    kv_heads: &[i32],
 ) -> Result<LayerSchedule<LayerCachePolicy>, Error> {
     let cache_error = |error: crate::runtime::cache::residency::CacheResidencyError| {
         Error::UnsupportedArchitecture(error.to_string())
     };
     let layers = args.text_config.num_hidden_layers as usize;
+    if kv_heads.len() != layers {
+        return Err(Error::Parallel(format!(
+            "Qwen3-VL cache geometry has {} layers, expected {layers}",
+            kv_heads.len()
+        )));
+    }
     let policies = (0..layers)
         .map(|layer| {
             let attention = *args
@@ -210,7 +226,7 @@ pub(crate) fn prompt_cache_layer_layout(
             if layer == 0 {
                 LayerCachePolicy::key_value_with_fixed_state(
                     attention,
-                    args.text_config.num_key_value_heads,
+                    kv_heads[layer],
                     args.text_config.head_dim,
                     vec![StateTensorPolicy::new(
                         StateTensorRole::PositionDelta,
@@ -221,12 +237,8 @@ pub(crate) fn prompt_cache_layer_layout(
                 )
                 .map_err(cache_error)
             } else {
-                LayerCachePolicy::key_value(
-                    attention,
-                    args.text_config.num_key_value_heads,
-                    args.text_config.head_dim,
-                )
-                .map_err(cache_error)
+                LayerCachePolicy::key_value(attention, kv_heads[layer], args.text_config.head_dim)
+                    .map_err(cache_error)
             }
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -370,6 +382,7 @@ impl Model {
     ) -> Result<PromptCacheManifest, Exception> {
         let end = i64::try_from(prefix_token_ids.len())
             .map_err(|_| Exception::custom("Qwen-VL prompt length exceeds i64"))?;
+        let rank = descriptor.topology.cache_rank_identity();
         let mut blocks = Vec::with_capacity(cache.kv.len());
         for (layer, cache) in cache.kv.iter().enumerate() {
             let cache = cache.as_ref().ok_or_else(|| {
@@ -387,7 +400,7 @@ impl Model {
                 global_layer: layer,
                 start: end - i64::from(keys.dim(-2)),
                 end,
-                rank: None,
+                rank,
                 arrays: CacheBlockArrays::KeyValue { keys, values },
             });
         }
@@ -408,6 +421,7 @@ impl Model {
         .map_err(|error| Exception::custom(error.to_string()))
     }
 
+    #[cfg(test)]
     pub(crate) fn load_prompt_cache(
         args: &ModelArgs,
         directory: impl AsRef<Path>,
@@ -1558,6 +1572,33 @@ mod tests {
         };
         assert_eq!(tensors.len(), 1);
         assert_eq!(tensors[0].role, StateTensorRole::PositionDelta);
+    }
+
+    #[test]
+    fn prompt_cache_layout_accepts_exact_rank_local_kv_geometry() {
+        use crate::runtime::{attention::LayerSchedule, cache::residency::LayerCachePolicy};
+
+        let mut args = tiny_args();
+        args.text_config.num_hidden_layers = 2;
+        args.text_config.attention_schedule = LayerSchedule::all_full(2).unwrap();
+        let layout = super::prompt_cache_layer_layout_with_kv_heads(&args, &[2, 1]).unwrap();
+        let LayerCachePolicy::KeyValueWithFixedState {
+            num_key_value_heads,
+            ..
+        } = layout.get(0).unwrap()
+        else {
+            panic!("Qwen-VL layer zero must carry its position delta");
+        };
+        assert_eq!(num_key_value_heads.get(), 2);
+        let LayerCachePolicy::KeyValue {
+            num_key_value_heads,
+            ..
+        } = layout.get(1).unwrap()
+        else {
+            panic!("Qwen-VL layer one must carry ordinary KV state");
+        };
+        assert_eq!(num_key_value_heads.get(), 1);
+        assert!(super::prompt_cache_layer_layout_with_kv_heads(&args, &[2]).is_err());
     }
 
     #[test]

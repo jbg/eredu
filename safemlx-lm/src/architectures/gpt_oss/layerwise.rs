@@ -23,9 +23,9 @@ use crate::{
         input,
     },
     error::Error,
-    nn::{
-        parallel::{VocabParallelEmbedding, VocabParallelLmHead},
-        tensor::create_causal_mask,
+    nn::parallel::{
+        gqa_projection_members, planned_kv_head_layout, GqaProjectionNames, VocabParallelEmbedding,
+        VocabParallelLmHead,
     },
     runtime::cache::residency::{
         open_prompt_cache, validate_prompt_cache_model_identity, CacheResidencyManager,
@@ -39,19 +39,19 @@ use crate::{
     runtime::checkpoint::recipe::DerivedWeightRecipe,
     runtime::checkpoint::store::{GgufWeightStore, TensorSelection, WeightStore},
     runtime::distributed::parallel::{
-        array_parameter_member, exact_parallel_division, register_projection_module,
+        aligned_partition_units, array_parameter_member, register_projection_module,
         register_replicated_module, MemberSharding, ParallelPlanBuilder, ParameterGroupSpec,
         ParameterRole, ProjectionSharding,
     },
     runtime::execution::layerwise::{
         load_layerwise_model, load_safetensors_layerwise_model,
-        load_tensor_parallel_layerwise_model, open_safetensors_weight_store, ArchitectureAdapter,
-        LayerExecutionLoadOptions, LayerwiseForwardState, LayerwiseModel, StaticUnitBindings,
-        WeightResidency,
+        load_tensor_parallel_layerwise_model, open_safetensors_weight_store,
+        transformed_module_weight_store, ArchitectureAdapter, LayerExecutionLoadOptions,
+        LayerwiseForwardState, LayerwiseModel, StaticUnitBindings, WeightResidency,
     },
     runtime::residency::expert_cache::{
         ExpertCache, ExpertCacheLoadOptions, ExpertCacheReport, ExpertCatalogEntry, ExpertIdentity,
-        ExpertPass,
+        ExpertPass, ExpertRouteBatch,
     },
     runtime::residency::manager::{OffloadUnit, ResidencyReport, ResidentUnitLease, WeightBinding},
     runtime::{
@@ -92,6 +92,11 @@ impl GptOssLayerwiseModel {
         &self,
     ) -> Option<&crate::runtime::execution::layerwise::ParallelModelInfo> {
         self.execution.parallel_info()
+    }
+
+    /// Returns generalized parameter-residency and encoding metadata.
+    pub fn residency_metadata(&self) -> &crate::LayerwiseModelMetadata {
+        self.execution.metadata()
     }
 
     /// Creates caches matching the canonical per-layer attention schedule.
@@ -247,11 +252,6 @@ impl GptOssLayerwiseModel {
             .forward_tensor_parallel(inputs, cache, group, stream)
     }
 
-    /// Backward-compatible alias for [`Self::checkpoint_store`].
-    pub fn weight_store(&self) -> &(dyn WeightStore + Send + Sync) {
-        self.checkpoint_store()
-    }
-
     /// Runs GPT-OSS while preserving its heterogeneous cache schedule.
     pub fn forward(
         &mut self,
@@ -277,23 +277,15 @@ impl GptOssLayerwiseModel {
             inputs,
             cache,
             stream,
-            |_adapter, _group, index, layer, hidden, cache, context, stream| {
+            |adapter, _group, index, layer, hidden, cache, context, stream| {
                 let layer_cache = &mut cache.layers[index];
                 let offset = layer_cache.offset();
-                let window = layer_cache.max_size();
-                let needs_mask =
-                    context.sequence_length > 1 || window.is_some_and(|size| offset >= size);
-                let mask = needs_mask
-                    .then(|| {
-                        create_causal_mask(
-                            context.sequence_length,
-                            Some(offset.min(window.unwrap_or(offset))),
-                            window.map(|size| size - 1),
-                            None,
-                            stream,
-                        )
-                    })
-                    .transpose()?;
+                let policy = adapter
+                    .attention_schedule
+                    .get(index)
+                    .expect("validated GPT-OSS layer index");
+                let mask =
+                    resident::attention_mask(policy, context.sequence_length, offset, stream)?;
                 Ok(layer.forward_with_expert_executor(
                     hidden,
                     mask.as_ref(),
@@ -358,6 +350,24 @@ pub fn load_gpt_oss_layerwise_model(
             model_dir,
             adapter,
             options,
+            stream,
+            weights_stream,
+        )?,
+    })
+}
+
+pub(crate) fn execute_transformed_gpt_oss_model(
+    model: resident::Model,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<GptOssLayerwiseModel, Error> {
+    let adapter = GptOssLayerwiseAdapter::new(model.args.clone(), stream)?;
+    let store = transformed_module_weight_store(&model)?;
+    Ok(GptOssLayerwiseModel {
+        execution: load_layerwise_model(
+            store,
+            adapter,
+            LayerExecutionLoadOptions::FullyResident,
             stream,
             weights_stream,
         )?,
@@ -494,11 +504,13 @@ pub(crate) fn load_gpt_oss_gguf_layerwise_model(
                 prepared.eos_token_ids,
             ));
         }
-        WeightResidency::FullyResident => {
-            return Err(Error::UnsupportedArchitecture(
-                "the bounded GPT-OSS GGUF loader does not accept fully resident policy".into(),
-            ));
-        }
+        WeightResidency::FullyResident => load_layerwise_model(
+            store,
+            GptOssLayerwiseAdapter::new(args, stream)?,
+            LayerExecutionLoadOptions::FullyResident,
+            stream,
+            weights_stream,
+        )?,
     };
     Ok((GptOssLayerwiseModel { execution }, prepared.eos_token_ids))
 }
@@ -514,7 +526,7 @@ fn load_gpt_oss_gguf_sparse_with_store(
     let mut adapter = GptOssLayerwiseAdapter::new(args.clone(), stream)?;
     adapter.sparse_expert_cache = true;
     let mut execution = load_layerwise_model(store, adapter, non_expert, stream, weights_stream)?;
-    let checkpoint_store = execution.weight_store_arc();
+    let checkpoint_store = execution.checkpoint_store_arc();
     let entries = gpt_oss_expert_catalog(&args, checkpoint_store.as_ref())?;
     execution.adapter_mut().expert_cache = Some(ExpertCache::new_shared(
         checkpoint_store,
@@ -577,7 +589,7 @@ fn load_gpt_oss_sparse_expert_cache_model_with_non_expert(
     adapter.sparse_expert_cache = true;
     let mut execution =
         load_safetensors_layerwise_model(model_dir, adapter, non_expert, stream, weights_stream)?;
-    let store = execution.weight_store_arc();
+    let store = execution.checkpoint_store_arc();
     let entries = gpt_oss_expert_catalog(&args, store.as_ref())?;
     execution.adapter_mut().expert_cache = Some(ExpertCache::new_shared(
         store,
@@ -612,6 +624,7 @@ pub struct GptOssLayerwiseAdapter {
     lm_head: MaybeQuantized<nn::Linear>,
     parallel_embedding: Option<VocabParallelEmbedding>,
     parallel_lm_head: Option<VocabParallelLmHead>,
+    parallel_kv_heads: Option<Vec<i32>>,
     sparse_expert_cache: bool,
     expert_cache: Option<ExpertCache>,
 }
@@ -644,6 +657,7 @@ impl GptOssLayerwiseAdapter {
             lm_head,
             parallel_embedding: None,
             parallel_lm_head: None,
+            parallel_kv_heads: None,
             sparse_expert_cache: false,
             expert_cache: None,
         })
@@ -753,36 +767,38 @@ pub struct GptOssForwardContext {
 fn register_gpt_oss_layer_parallel_plan(
     planner: &mut ParallelPlanBuilder,
     layer: &TransformerBlock,
+    args: &ModelArgs,
     index: usize,
 ) -> Result<(), Error> {
     let prefix = format!("model.layers.{index}");
     let attention = &layer.self_attn;
-    for (name, projection) in [
-        ("q_proj", &attention.q_proj),
-        ("k_proj", &attention.k_proj),
-        ("v_proj", &attention.v_proj),
-    ] {
-        register_projection_module(
-            planner,
-            projection,
-            &format!("{prefix}.self_attn.{name}"),
-            ProjectionSharding::Column,
-        )?;
-    }
-    register_projection_module(
-        planner,
+    let attention_prefix = format!("{prefix}.self_attn");
+    let (head_units, mut attention_members) = gqa_projection_members(
+        &attention_prefix,
+        GqaProjectionNames {
+            query: "q_proj",
+            key: "k_proj",
+            value: "v_proj",
+            output: "o_proj",
+        },
+        &attention.q_proj,
+        &attention.k_proj,
+        &attention.v_proj,
         &attention.o_proj,
-        &format!("{prefix}.self_attn.o_proj"),
-        ProjectionSharding::Row,
+        args.num_attention_heads,
+        args.num_key_value_heads,
+        args.head_dim,
     )?;
-    planner.register(ParameterGroupSpec::new(
+    attention_members.push(array_parameter_member(
         format!("{prefix}.self_attn.sinks"),
+        attention.sinks.as_ref(),
+        MemberSharding::Partitioned { axis: 0 },
+    )?);
+    planner.register(ParameterGroupSpec::partitioned(
+        format!("{prefix}.self_attn.heads"),
         ParameterRole::AttentionHeads,
-        [array_parameter_member(
-            format!("{prefix}.self_attn.sinks"),
-            attention.sinks.as_ref(),
-            MemberSharding::Equal { axis: 0 },
-        )?],
+        head_units,
+        attention_members,
     )?)?;
     register_replicated_module(
         planner,
@@ -801,40 +817,43 @@ fn register_gpt_oss_layer_parallel_plan(
         ProjectionSharding::Replicated,
     )?;
     let experts = &layer.mlp.experts;
-    planner.register(ParameterGroupSpec::new(
-        format!("{prefix}.mlp.experts.gate_up"),
+    let intermediate = usize::try_from(args.intermediate_size)
+        .map_err(|_| Error::Parallel("GPT-OSS expert width exceeds usize".into()))?;
+    let intermediate_units = aligned_partition_units(
+        &format!("{prefix}.mlp.experts.intermediate"),
+        intermediate,
+        1,
+        32,
+    )?;
+    planner.register(ParameterGroupSpec::partitioned(
+        format!("{prefix}.mlp.experts.intermediate"),
         ParameterRole::ExpertIntermediate,
+        intermediate_units,
         [
             array_parameter_member(
                 format!("{prefix}.mlp.experts.gate_up_proj_blocks"),
                 experts.gate_up_proj_blocks.as_ref(),
-                MemberSharding::Equal { axis: 1 },
+                MemberSharding::Partitioned { axis: 1 },
             )?,
             array_parameter_member(
                 format!("{prefix}.mlp.experts.gate_up_proj_scales"),
                 experts.gate_up_proj_scales.as_ref(),
-                MemberSharding::Equal { axis: 1 },
+                MemberSharding::Partitioned { axis: 1 },
             )?,
             array_parameter_member(
                 format!("{prefix}.mlp.experts.gate_up_proj_bias"),
                 experts.gate_up_proj_bias.as_ref(),
-                MemberSharding::Equal { axis: 1 },
+                MemberSharding::Partitioned { axis: 1 },
             )?,
-        ],
-    )?)?;
-    planner.register(ParameterGroupSpec::new(
-        format!("{prefix}.mlp.experts.down"),
-        ParameterRole::ExpertIntermediate,
-        [
             array_parameter_member(
                 format!("{prefix}.mlp.experts.down_proj_blocks"),
                 experts.down_proj_blocks.as_ref(),
-                MemberSharding::Equal { axis: 2 },
+                MemberSharding::Partitioned { axis: 2 },
             )?,
             array_parameter_member(
                 format!("{prefix}.mlp.experts.down_proj_scales"),
                 experts.down_proj_scales.as_ref(),
-                MemberSharding::Equal { axis: 2 },
+                MemberSharding::Partitioned { axis: 2 },
             )?,
             array_parameter_member(
                 format!("{prefix}.mlp.experts.down_proj_bias"),
@@ -856,19 +875,36 @@ impl ArchitectureAdapter for GptOssLayerwiseAdapter {
         &self.args.model_type
     }
 
+    fn quantization(&self) -> Option<crate::runtime::checkpoint::quantization::WeightQuantization> {
+        self.args.quantization
+    }
+
     fn prompt_cache_model_identity(
         &self,
         topology: Option<crate::ParallelTopology>,
     ) -> Result<PromptCacheModelIdentity, Error> {
         let layer_count = usize::try_from(self.args.num_hidden_layers)
             .map_err(|_| Exception::custom("invalid GPT-OSS cache layer count"))?;
-        let local_kv_heads = topology.map_or(Ok(self.args.num_key_value_heads), |topology| {
-            exact_parallel_division(
-                "GPT-OSS prompt-cache KV heads",
-                self.args.num_key_value_heads,
-                topology.tensor_parallel_size,
-            )
-        })?;
+        let local_kv_heads = match topology {
+            Some(topology) if topology.tensor_parallel_size > 1 => {
+                let heads = self.parallel_kv_heads.as_ref().ok_or_else(|| {
+                    Error::Parallel(
+                        "GPT-OSS prompt-cache identity requires planner-derived KV geometry".into(),
+                    )
+                })?;
+                let first = *heads.first().ok_or_else(|| {
+                    Error::Parallel("GPT-OSS planner returned no KV-head geometry".into())
+                })?;
+                if heads.iter().any(|heads| *heads != first) {
+                    return Err(Error::Parallel(
+                        "GPT-OSS layers unexpectedly received different local KV-head counts"
+                            .into(),
+                    ));
+                }
+                first
+            }
+            _ => self.args.num_key_value_heads,
+        };
         Ok(PromptCacheModelIdentity {
             model_family: "gpt_oss".into(),
             effective_model_type: self.args.model_type.clone(),
@@ -930,20 +966,34 @@ impl ArchitectureAdapter for GptOssLayerwiseAdapter {
     }
 
     fn static_units(&self, store: &dyn WeightStore) -> Result<Vec<StaticUnitBindings>, Error> {
-        Ok(vec![
-            StaticUnitBindings::new(
+        self.selected_static_units(store, &|_| true)
+    }
+
+    fn selected_static_units(
+        &self,
+        store: &dyn WeightStore,
+        select: &dyn Fn(&str) -> bool,
+    ) -> Result<Vec<StaticUnitBindings>, Error> {
+        let mut units = Vec::new();
+        if select(EMBEDDING_UNIT) {
+            units.push(StaticUnitBindings::new(
                 EMBEDDING_UNIT,
                 build_module_bindings(&self.embedding, "model.embed_tokens", store)?,
-            )?,
-            StaticUnitBindings::new(
+            )?);
+        }
+        if select(NORM_UNIT) {
+            units.push(StaticUnitBindings::new(
                 NORM_UNIT,
                 build_module_bindings(&self.norm, "model.norm", store)?,
-            )?,
-            StaticUnitBindings::new(
+            )?);
+        }
+        if select(HEAD_UNIT) {
+            units.push(StaticUnitBindings::new(
                 HEAD_UNIT,
                 build_module_bindings(&self.lm_head, "lm_head", store)?,
-            )?,
-        ])
+            )?);
+        }
+        Ok(units)
     }
 
     fn populate_static(&mut self, leases: &[ResidentUnitLease]) -> Result<(), Error> {
@@ -1030,18 +1080,10 @@ impl ArchitectureAdapter for GptOssLayerwiseAdapter {
         })
     }
 
-    fn execution_group_count(&self) -> usize {
-        1
-    }
-
-    fn execution_group_id(&self, group: usize) -> Result<String, Error> {
-        if group == 0 {
-            Ok("text_decoder".into())
-        } else {
-            Err(Error::UnsupportedArchitecture(format!(
-                "GPT-OSS has no execution group {group}"
-            )))
-        }
+    fn execution_graph(
+        &self,
+    ) -> Result<crate::runtime::execution::layerwise::ExecutionGroupDag, Error> {
+        crate::runtime::execution::layerwise::ExecutionGroupDag::chain(["text_decoder"])
     }
 
     fn layer_count(&self, group: usize) -> Result<usize, Error> {
@@ -1086,14 +1128,14 @@ impl ArchitectureAdapter for GptOssLayerwiseAdapter {
         )?)?;
         for index in 0..self.args.num_hidden_layers as usize {
             let layer = TransformerBlock::new(&self.args, index, stream)?;
-            register_gpt_oss_layer_parallel_plan(planner, &layer, index)?;
+            register_gpt_oss_layer_parallel_plan(planner, &layer, &self.args, index)?;
         }
         Ok(())
     }
     fn configure_parallel_static(
         &mut self,
         context: crate::runtime::distributed::parallel::ParallelBuildContext,
-        _layout: &crate::runtime::distributed::parallel::LocalModelLayout,
+        layout: &crate::runtime::distributed::parallel::LocalModelLayout,
         stream: &Stream,
     ) -> Result<(), Error> {
         self.parallel_embedding = Some(VocabParallelEmbedding::unloaded(
@@ -1110,6 +1152,12 @@ impl ArchitectureAdapter for GptOssLayerwiseAdapter {
             self.args.weight_quantization_for("lm_head.weight"),
             context,
             stream,
+        )?);
+        self.parallel_kv_heads = Some(planned_kv_head_layout(
+            layout,
+            self.attention_schedule.len(),
+            self.args.head_dim,
+            "model.layers",
         )?);
         Ok(())
     }
@@ -1234,24 +1282,11 @@ impl ArchitectureAdapter for GptOssLayerwiseAdapter {
         self.layer_count(group)?;
         let layer_cache = &mut cache.layers[index];
         let offset = layer_cache.offset();
-        let window = self
+        let policy = self
             .attention_schedule
             .get(index)
-            .expect("validated GPT-OSS layer index")
-            .window()
-            .map(|window| window.get() as i32);
-        let mask = (context.sequence_length > 1)
-            .then(|| {
-                let max_past = window.map(|size| size - 1);
-                create_causal_mask(
-                    context.sequence_length,
-                    Some(offset.min(max_past.unwrap_or(offset))),
-                    max_past,
-                    None,
-                    stream,
-                )
-            })
-            .transpose()?;
+            .expect("validated GPT-OSS layer index");
+        let mask = resident::attention_mask(policy, context.sequence_length, offset, stream)?;
         if self.sparse_expert_cache {
             let expert_cache = self.expert_cache.as_ref().ok_or_else(|| {
                 Error::UnsupportedArchitecture(
@@ -1271,11 +1306,7 @@ impl ArchitectureAdapter for GptOssLayerwiseAdapter {
                 |flat, indices, weights, stream| {
                     expert_cache
                         .execute_routes_bounded(
-                            index,
-                            flat,
-                            indices,
-                            weights,
-                            pass,
+                            ExpertRouteBatch::new(index, flat, indices, weights, pass),
                             stream,
                             |flat, acquired, weights, stream| {
                                 let started = Instant::now();
@@ -1356,24 +1387,12 @@ impl ArchitectureAdapter for GptOssLayerwiseAdapter {
         self.layer_count(group)?;
         let layer_cache = &mut cache.layers[index];
         let offset = layer_cache.offset();
-        let window = self
+        let policy = self
             .attention_schedule
             .get(index)
-            .expect("validated GPT-OSS layer index")
-            .window()
-            .map(|v| v.get() as i32);
-        let mask = (context.sequence_length > 1)
-            .then(|| {
-                let max_past = window.map(|v| v - 1);
-                create_causal_mask(
-                    context.sequence_length,
-                    Some(offset.min(max_past.unwrap_or(offset))),
-                    max_past,
-                    None,
-                    execution.stream(),
-                )
-            })
-            .transpose()?;
+            .expect("validated GPT-OSS layer index");
+        let mask =
+            resident::attention_mask(policy, context.sequence_length, offset, execution.stream())?;
         Ok(layer.forward_tensor_parallel(
             hidden,
             mask.as_ref(),
@@ -1585,10 +1604,17 @@ mod tests {
         }
     }
 
-    fn tensor_parallel_context() -> ParallelBuildContext {
+    fn tensor_parallel_context(rank: usize) -> ParallelBuildContext {
         ParallelBuildContext::new(
-            ParallelTopology::from_rank(2, 0, 2, 1, 1, DeviceAssignment::new(DeviceType::Cpu, 0))
-                .unwrap(),
+            ParallelTopology::from_rank(
+                2,
+                rank,
+                2,
+                1,
+                1,
+                DeviceAssignment::new(DeviceType::Cpu, 0),
+            )
+            .unwrap(),
             ShardingPolicy::Require,
         )
     }
@@ -1682,9 +1708,9 @@ mod tests {
         let weights = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
         let mut model_args = tiny_args();
         model_args.hidden_size = 64;
-        model_args.intermediate_size = 64;
-        model_args.num_attention_heads = 2;
-        model_args.num_key_value_heads = 2;
+        model_args.intermediate_size = 96;
+        model_args.num_attention_heads = 6;
+        model_args.num_key_value_heads = 3;
         model_args.num_hidden_layers = 1;
         model_args.attention_schedule =
             LayerSchedule::new(1, vec![AttentionPolicy::sliding(8).unwrap()]).unwrap();
@@ -1693,36 +1719,65 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         write_fixture(dir.path(), &fixture);
 
-        let model = super::load_gpt_oss_tensor_parallel_model(
-            dir.path(),
-            LayerwiseLoadOptions::default(),
-            tensor_parallel_context(),
-            execution.stream(),
-            weights.stream(),
-        )
-        .unwrap();
-        let layout = model.execution.parallel_layout().unwrap();
-        assert_eq!(
-            layout
-                .tensor("model.layers.0.self_attn.q_proj.weight")
-                .unwrap()
-                .local_shape(),
-            &[32, 64]
-        );
-        assert_eq!(
-            layout
-                .tensor("model.layers.0.mlp.experts.gate_up_proj_blocks")
-                .unwrap()
-                .local_shape(),
-            &[2, 64, 2, 16]
-        );
-        assert_eq!(
-            layout
-                .tensor("model.layers.0.mlp.experts.down_proj_scales")
-                .unwrap()
-                .local_shape(),
-            &[2, 64, 1]
-        );
+        for (rank, query_heads, kv_heads, intermediate) in
+            [(0, 4usize, 2usize, 64usize), (1, 2, 1, 32)]
+        {
+            let model = super::load_gpt_oss_tensor_parallel_model(
+                dir.path(),
+                LayerwiseLoadOptions::default(),
+                tensor_parallel_context(rank),
+                execution.stream(),
+                weights.stream(),
+            )
+            .unwrap();
+            let layout = model.execution.parallel_layout().unwrap();
+            assert_eq!(
+                layout
+                    .tensor("model.layers.0.self_attn.q_proj.weight")
+                    .unwrap()
+                    .local_shape(),
+                &[query_heads * 32, 64]
+            );
+            assert_eq!(
+                layout
+                    .tensor("model.layers.0.self_attn.k_proj.weight")
+                    .unwrap()
+                    .local_shape(),
+                &[kv_heads * 32, 64]
+            );
+            assert_eq!(
+                layout
+                    .tensor("model.layers.0.self_attn.sinks")
+                    .unwrap()
+                    .local_shape(),
+                &[query_heads]
+            );
+            assert_eq!(
+                layout
+                    .tensor("model.layers.0.mlp.experts.gate_up_proj_blocks")
+                    .unwrap()
+                    .local_shape(),
+                &[2, 2 * intermediate, 2, 16]
+            );
+            assert_eq!(
+                layout
+                    .tensor("model.layers.0.mlp.experts.down_proj_scales")
+                    .unwrap()
+                    .local_shape(),
+                &[2, 64, intermediate / 32]
+            );
+            let layout = model.prompt_cache_layer_layout().unwrap();
+            let crate::LayerCachePolicy::KeyValue {
+                num_key_value_heads,
+                head_dim,
+                ..
+            } = layout.get(0).unwrap()
+            else {
+                panic!("GPT-OSS layer must expose KV cache geometry")
+            };
+            assert_eq!(num_key_value_heads.get(), kv_heads as u32);
+            assert_eq!(head_dim.get(), 32);
+        }
     }
 
     fn parity(depth: usize, dense_stream: bool) {
@@ -1805,6 +1860,51 @@ mod tests {
     #[test]
     fn gpt_oss_native_mxfp4_dense_stream_prefill_and_cached_decode_parity() {
         parity(1, true);
+    }
+
+    #[test]
+    fn delegated_experts_keep_sliding_cache_and_mask_aligned_across_window_boundary() {
+        let gpu = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
+        let cpu = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        let mut fixture = Model::new(tiny_args(), gpu.stream()).unwrap();
+        initialize(&mut fixture, gpu.stream());
+        let dir = tempfile::tempdir().unwrap();
+        write_fixture(dir.path(), &fixture);
+
+        let mut expected = resident::load_model(dir.path(), gpu.stream(), cpu.stream()).unwrap();
+        let options = DenseDiskStreamLoadOptions::new(u64::MAX, u64::MAX, 1, 1, 1).unwrap();
+        let mut delegated =
+            load_gpt_oss_layerwise_model(dir.path(), options, gpu.stream(), cpu.stream()).unwrap();
+        let mut expected_cache = Cache::default();
+        let mut delegated_cache = Cache::default();
+
+        for tokens in [
+            Array::from_slice(&[1u32, 2, 3], &[1, 3]),
+            Array::from_slice(&[4u32], &[1, 1]),
+            // Before this call the absolute offset equals the four-token
+            // window, while the sliding cache retains only three past keys.
+            Array::from_slice(&[5u32], &[1, 1]),
+        ] {
+            let expected_logits = expected
+                .forward(&tokens, &mut expected_cache, gpu.stream())
+                .unwrap();
+            let actual_logits = delegated
+                .forward_with_expert_executor(
+                    &tokens,
+                    &mut delegated_cache,
+                    |_layer, flat, _indices, _weights, stream| {
+                        zeros_dtype(flat.shape(), flat.dtype(), stream)
+                    },
+                    gpu.stream(),
+                )
+                .unwrap();
+            assert_close(&actual_logits, &expected_logits);
+        }
+        assert_eq!(delegated_cache.offset(), 5);
+        for (expected, actual) in expected_cache.layers.iter().zip(&delegated_cache.layers) {
+            assert_eq!(expected.offset(), actual.offset());
+            assert_eq!(expected.max_size(), actual.max_size());
+        }
     }
 
     #[test]

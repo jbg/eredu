@@ -32,7 +32,7 @@ use crate::{
 };
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
-#[allow(dead_code)] // Retained so future loader families can fail closed while being migrated.
+#[allow(dead_code)] // Reserved for fail-closed structural policies.
 pub(crate) enum StructuralValidationPolicy {
     Exact,
     Unverified,
@@ -41,6 +41,7 @@ pub(crate) enum StructuralValidationPolicy {
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub(crate) enum StructuralIssueKind {
     MissingTensor,
+    UnexpectedTensor,
     ConflictingLayout,
     ShapeMismatch,
     UnsupportedEncoding,
@@ -82,13 +83,32 @@ impl StructuralValidation {
                 let mut unused = issues
                     .into_iter()
                     .filter(|issue| issue.kind != StructuralIssueKind::MissingTensor)
-                    .map(|issue| issue.detail)
+                    .map(|issue| {
+                        if issue.kind == StructuralIssueKind::UnexpectedTensor {
+                            issue.tensor_name.unwrap_or(issue.detail)
+                        } else {
+                            issue.detail
+                        }
+                    })
                     .collect::<Vec<_>>();
                 missing.sort();
                 missing.dedup();
                 unused.sort();
                 Err(Error::StrictLoadValidation { missing, unused })
             }
+        }
+    }
+
+    fn with_strict_catalog(self, strict: bool) -> Self {
+        if strict {
+            return self;
+        }
+        match self {
+            Self::Invalid(mut issues) => {
+                issues.retain(|issue| issue.kind != StructuralIssueKind::UnexpectedTensor);
+                finish(issues)
+            }
+            validation => validation,
         }
     }
 }
@@ -110,7 +130,7 @@ pub(crate) const fn safetensors_policy(kind: ModelKind) -> StructuralValidationP
         | ModelKind::Qwen3Next
         | ModelKind::Qwen3Vl
         | ModelKind::Qwen3VlMoe
-        | ModelKind::Qwen35Moe => StructuralValidationPolicy::Exact,
+        | ModelKind::Qwen35 => StructuralValidationPolicy::Exact,
     }
 }
 
@@ -144,7 +164,7 @@ pub(crate) fn validate_safetensors(
     store: &SafetensorsWeightStore,
     options: ModelLoadOptions,
 ) -> StructuralValidation {
-    match safetensors_policy(kind) {
+    let validation = match safetensors_policy(kind) {
         StructuralValidationPolicy::Exact => match kind {
             ModelKind::DeepSeekV3 => validate_deepseek_v3_safetensors(config, store, options),
             ModelKind::Gemma4 => validate_gemma4_safetensors(config, store, options),
@@ -155,16 +175,17 @@ pub(crate) fn validate_safetensors(
             ModelKind::Llama => validate_llama_safetensors(config, store),
             ModelKind::NemotronH => validate_nemotron_h_safetensors(config, store),
             ModelKind::PersonaPlex => validate_personaplex_safetensors(config, store),
-            ModelKind::Qwen2 => validate_dense_qwen_safetensors(config, store, options),
-            ModelKind::Qwen3 => validate_dense_qwen_safetensors(config, store, options),
+            ModelKind::Qwen2 => validate_dense_qwen_safetensors(config, store),
+            ModelKind::Qwen3 => validate_dense_qwen_safetensors(config, store),
             ModelKind::Qwen3Next => validate_qwen3_next_safetensors(config, store, options),
             ModelKind::Qwen3Vl | ModelKind::Qwen3VlMoe => {
                 validate_qwen3_vl_safetensors(kind, config, store, options)
             }
-            ModelKind::Qwen35Moe => validate_qwen35_safetensors(config, store, options),
+            ModelKind::Qwen35 => validate_qwen35_safetensors(config, store, options),
         },
         StructuralValidationPolicy::Unverified => unverified(kind.model_type_name()),
-    }
+    };
+    validation.with_strict_catalog(options.weight_residency.strict_loading())
 }
 
 pub(crate) fn validate_safetensors_load_path(
@@ -184,7 +205,7 @@ pub(crate) fn validate_gguf(
     metadata: &HashMap<String, GgufMetadataValue>,
     options: ModelLoadOptions,
 ) -> StructuralValidation {
-    match gguf_policy(architecture) {
+    let validation = match gguf_policy(architecture) {
         StructuralValidationPolicy::Exact => match architecture {
             GgufArchitecture::DeepSeek2 => validate_deepseek2_gguf(checkpoint, metadata),
             GgufArchitecture::GptOss => validate_gpt_oss_gguf(checkpoint, metadata),
@@ -211,7 +232,8 @@ pub(crate) fn validate_gguf(
             }
         },
         StructuralValidationPolicy::Unverified => unverified(architecture.metadata_name()),
-    }
+    };
+    validation.with_strict_catalog(options.weight_residency.strict_loading())
 }
 
 fn unverified(architecture: &str) -> StructuralValidation {
@@ -1156,7 +1178,7 @@ fn lfm2_expected(args: &lfm2::ModelArgs) -> Result<Vec<ExpectedTensor>, Error> {
                 ));
             }
         } else {
-            let intermediate = args.dense_layer_intermediate_size() as usize;
+            let intermediate = args.dense_intermediate_size as usize;
             tensors.extend([
                 expected(
                     format!("{model}.feed_forward.w1.weight"),
@@ -3483,9 +3505,7 @@ fn validate_kimi_linear_safetensors(
         append_structural_issues(
             validate_safetensor_plan_with(store, expert_expected, |raw| {
                 let canonical = raw.replace(".block_sparse_moe.", ".mlp.");
-                if canonical.ends_with("gate_up_proj") {
-                    args.weight_quantization_for(&canonical)
-                } else if canonical.ends_with("down_proj") {
+                if canonical.ends_with("gate_up_proj") || canonical.ends_with("down_proj") {
                     args.weight_quantization_for(&canonical)
                 } else {
                     None
@@ -3659,7 +3679,37 @@ fn validate_llama_safetensors(
             store.keys().len()
         ));
     }
-    validate_safetensor_plan(store, llama_expected(&args), args.weight_quantization())
+    let expected = llama_expected(&args);
+    let quantization = args.weight_quantization();
+    let mut allowed = BTreeSet::new();
+    for tensor in &expected {
+        allowed.insert(tensor.safetensors_name.clone());
+        if tensor.operation == TensorOperation::Matrix {
+            if let Some(quantization) = quantization {
+                add_safetensors_format_companions(
+                    &mut allowed,
+                    &tensor.safetensors_name,
+                    SafetensorsMatrixFormat::Affine(quantization),
+                );
+            }
+        }
+    }
+    let mut issues = match validate_safetensor_plan(store, expected, quantization) {
+        StructuralValidation::Exact => Vec::new(),
+        StructuralValidation::Invalid(issues) => issues,
+        StructuralValidation::Unverified(_) => {
+            unreachable!("pure plan is always exact or invalid")
+        }
+    };
+    for key in store.keys() {
+        if !allowed.contains(&key)
+            && !key.starts_with("rope_freqs.")
+            && !key.ends_with(".rotary_emb.inv_freq")
+        {
+            issues.push(unexpected_layout(&key, "Llama SafeTensors"));
+        }
+    }
+    finish(issues)
 }
 
 fn validate_qwen3_next_safetensors(
@@ -4423,7 +4473,6 @@ fn qwen_hybrid_safetensors_format(
 fn validate_dense_qwen_safetensors(
     config: &Value,
     store: &SafetensorsWeightStore,
-    options: ModelLoadOptions,
 ) -> StructuralValidation {
     let args = match dense_qwen::config_from_hf_value(config) {
         Ok(args) => args,
@@ -4477,7 +4526,6 @@ fn validate_dense_qwen_safetensors(
         }),
         &mut issues,
     );
-    let allow_split = !matches!(options.weight_residency, WeightResidency::FullyResident);
     for layer in 0..args.num_hidden_layers as usize {
         validate_split_or_packed_swiglu_experts(
             store,
@@ -4485,8 +4533,8 @@ fn validate_dense_qwen_safetensors(
             args.num_experts as usize,
             args.hidden_size as usize,
             args.moe_intermediate_size as usize,
-            allow_split,
-            allow_split,
+            true,
+            true,
             args.weight_quantization_for(&format!("model.layers.{layer}.mlp.experts.gate_up_proj")),
             args.weight_quantization_for(&format!("model.layers.{layer}.mlp.experts.down_proj")),
             &mut issues,
@@ -4539,7 +4587,7 @@ fn validate_personaplex_safetensors(
     ] {
         validate_personaplex_matrix(
             store,
-            &[name.clone()],
+            std::slice::from_ref(&name),
             name.trim_end_matches(".weight"),
             &shape,
             quantization,
@@ -4552,7 +4600,7 @@ fn validate_personaplex_safetensors(
         let name = format!("emb.{codebook}.weight");
         validate_personaplex_matrix(
             store,
-            &[name.clone()],
+            std::slice::from_ref(&name),
             name.trim_end_matches(".weight"),
             &[args.card as usize + 1, dim],
             quantization,
@@ -4601,7 +4649,7 @@ fn validate_personaplex_safetensors(
         ] {
             validate_personaplex_matrix(
                 store,
-                &[name.clone()],
+                std::slice::from_ref(&name),
                 name.trim_end_matches(".weight"),
                 &shape,
                 quantization,
@@ -4624,7 +4672,7 @@ fn validate_personaplex_safetensors(
         };
         validate_personaplex_matrix(
             store,
-            &[embedding.clone()],
+            std::slice::from_ref(&embedding),
             embedding.trim_end_matches(".weight"),
             &[input_vocab, depth_dim],
             quantization,
@@ -4640,7 +4688,7 @@ fn validate_personaplex_safetensors(
         ] {
             validate_personaplex_matrix(
                 store,
-                &[name.clone()],
+                std::slice::from_ref(&name),
                 name.trim_end_matches(".weight"),
                 &shape,
                 quantization,
@@ -4678,7 +4726,7 @@ fn validate_personaplex_safetensors(
         let out_proj = format!("{prefix}.self_attn.out_proj.weight");
         validate_personaplex_matrix(
             store,
-            &[out_proj.clone()],
+            std::slice::from_ref(&out_proj),
             out_proj.trim_end_matches(".weight"),
             &[depth_slices * depth_dim, depth_dim],
             quantization,
@@ -4698,7 +4746,7 @@ fn validate_personaplex_safetensors(
             ] {
                 validate_personaplex_matrix(
                     store,
-                    &[name.clone()],
+                    std::slice::from_ref(&name),
                     name.trim_end_matches(".weight"),
                     &shape,
                     quantization,
@@ -4769,7 +4817,10 @@ fn validate_personaplex_matrix(
     let input = *shape.last().expect("PersonaPlex matrix shape");
     let group_size = quantization.group_size() as usize;
     let bits = quantization.bits() as usize;
-    if input % group_size != 0 || input % 32 != 0 || input.saturating_mul(bits) % 32 != 0 {
+    if !input.is_multiple_of(group_size)
+        || !input.is_multiple_of(32)
+        || !input.saturating_mul(bits).is_multiple_of(32)
+    {
         issues.push(StructuralIssue {
             kind: StructuralIssueKind::QuantizationCompanionMismatch,
             detail: format!(
@@ -5458,7 +5509,9 @@ fn validate_quantized_safetensor(
     let input = *tensor.safetensors_shape.last().expect("matrix shape");
     let group_size = quantization.group_size() as usize;
     let bits = quantization.bits() as usize;
-    if input % group_size != 0 || input % 32 != 0 || input.checked_mul(bits).unwrap_or(1) % 32 != 0
+    if !input.is_multiple_of(group_size)
+        || !input.is_multiple_of(32)
+        || !input.checked_mul(bits).unwrap_or(1).is_multiple_of(32)
     {
         issues.push(StructuralIssue {
             kind: StructuralIssueKind::QuantizationCompanionMismatch,
@@ -6484,11 +6537,19 @@ fn validate_llama_gguf(
             checkpoint.catalog().physical_tensor_count()
         ));
     }
-    finish(validate_gguf_plan(
-        checkpoint,
-        llama_expected(&args),
-        "Llama",
-    ))
+    let expected = llama_expected(&args);
+    let allowed = expected
+        .iter()
+        .map(|tensor| tensor.gguf_name.clone())
+        .collect::<BTreeSet<_>>();
+    let mut issues = validate_gguf_plan(checkpoint, expected, "Llama");
+    for tensor in checkpoint.catalog().tensors() {
+        let name = &tensor.descriptor().name;
+        if !allowed.contains(name) && !name.starts_with("rope_freqs.") {
+            issues.push(unexpected_layout(name, "Llama GGUF"));
+        }
+    }
+    finish(issues)
 }
 
 fn nemotron_h_gguf_expected(args: &nemotron_h::ModelArgs) -> Result<Vec<ExpectedTensor>, Error> {
@@ -7264,7 +7325,7 @@ fn validate_qwen35_gguf(
                 let Some((_, group_size)) = tensor.affine() else {
                     continue;
                 };
-                if args.hidden_size as u32 % group_size != 0 {
+                if !(args.hidden_size as u32).is_multiple_of(group_size) {
                     issues.push(StructuralIssue {
                         kind: StructuralIssueKind::QuantizationCompanionMismatch,
                         detail: format!(
@@ -7293,8 +7354,8 @@ fn validate_qwen35_gguf(
         let head = args.linear_value_head_dim as u32;
         if head
             .checked_mul(u32::from(bits))
-            .is_none_or(|width| width % 32 != 0)
-            || head % group_size != 0
+            .is_none_or(|width| !width.is_multiple_of(32))
+            || !head.is_multiple_of(group_size)
         {
             issues.push(StructuralIssue {
                 kind: StructuralIssueKind::QuantizationCompanionMismatch,
@@ -7557,7 +7618,7 @@ fn layout(name: &str, detail: String) -> StructuralIssue {
 
 fn unexpected_layout(name: &str, loader_name: &str) -> StructuralIssue {
     StructuralIssue {
-        kind: StructuralIssueKind::ConflictingLayout,
+        kind: StructuralIssueKind::UnexpectedTensor,
         detail: format!("{loader_name} catalog contains unexpected tensor {name:?}"),
         tensor_name: Some(name.into()),
         tensor_type_code: None,
@@ -7572,6 +7633,31 @@ fn shape_mismatch(name: &str, expected: &[usize], actual: &[usize]) -> Structura
         tensor_name: Some(name.into()),
         tensor_type_code: None,
         metadata_key: None,
+    }
+}
+
+#[cfg(test)]
+mod admission_policy_tests {
+    use super::*;
+
+    #[test]
+    fn non_strict_catalog_ignores_only_unexpected_tensors() {
+        let unexpected = unexpected_layout("unrelated.weight", "test");
+        let malformed = shape_mismatch("model.weight", &[2, 2], &[1]);
+        assert_eq!(
+            StructuralValidation::Invalid(vec![unexpected.clone(), malformed.clone()])
+                .with_strict_catalog(false),
+            StructuralValidation::Invalid(vec![malformed])
+        );
+
+        let error = StructuralValidation::Invalid(vec![unexpected])
+            .into_loader_result()
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            Error::StrictLoadValidation { missing, unused }
+                if missing.is_empty() && unused == ["unrelated.weight"]
+        ));
     }
 }
 

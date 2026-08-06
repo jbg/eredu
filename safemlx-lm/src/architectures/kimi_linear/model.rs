@@ -24,7 +24,7 @@ use tokenizers::Tokenizer;
 use crate::{
     api::{
         input as runtime_input,
-        qwen3_5_moe::{QwenLinear, QwenWeightFormat},
+        qwen3_5::{QwenLinear, QwenWeightFormat},
     },
     architectures::deepseek_v3::model::{
         DeepSeekQuantizationConfig, LayerPolicy as DeepSeekLayerPolicy, ModelArgs as DeepSeekArgs,
@@ -47,12 +47,13 @@ use crate::{
         attention::{AttentionPolicy, LayerSchedule},
         cache::{
             residency::{
-                derive_prompt_cache_architecture_fingerprint, open_prompt_cache_snapshot,
-                save_prompt_cache_snapshot, CacheBlockArrays, LayerCachePolicy,
-                PromptCacheDescriptor, PromptCacheManifest, PromptCacheModelIdentity,
-                PromptCacheOptions, PromptCacheSnapshotBlock, PromptCacheStateArray,
-                StateTensorDimension, StateTensorDtype, StateTensorOwner, StateTensorPolicy,
-                StateTensorRole,
+                derive_prompt_cache_architecture_fingerprint, load_prompt_cache_state_tensors,
+                open_prompt_cache, save_prompt_cache_snapshot, CacheBlockArrays, CacheRankIdentity,
+                CacheResidencyManager, CacheResidencyPolicy, CacheResidencyReport,
+                LayerCachePolicy, PagedCacheOptions, PromptCacheDescriptor, PromptCacheManifest,
+                PromptCacheModelIdentity, PromptCacheOptions, PromptCacheSnapshotBlock,
+                PromptCacheStateArray, StateTensorDimension, StateTensorDtype, StateTensorOwner,
+                StateTensorPolicy, StateTensorRole,
             },
             CompressedLatentCache,
         },
@@ -67,6 +68,9 @@ use crate::{
         execution::inspection::{ActivationObserver, MoeRoutingObservation},
     },
 };
+
+#[cfg(test)]
+use crate::runtime::cache::residency::open_prompt_cache_snapshot;
 
 fn default_model_type() -> String {
     "kimi_linear".into()
@@ -663,11 +667,39 @@ pub fn model_args_from_config_value(value: &Value) -> Result<ModelArgs, Error> {
 pub(crate) fn prompt_cache_layer_layout(
     args: &ModelArgs,
 ) -> Result<LayerSchedule<LayerCachePolicy>, Error> {
-    let heads = args.kda_config.num_heads;
+    prompt_cache_layer_layout_with_geometry(
+        args,
+        &args
+            .layer_schedule
+            .iter()
+            .map(|policy| KimiLayerCacheGeometry {
+                kda_heads: (policy.attention == AttentionKind::Kda)
+                    .then_some(args.kda_config.num_heads),
+            })
+            .collect::<Vec<_>>(),
+    )
+}
+
+/// Rank-local state geometry for one Kimi hybrid layer. MLA stores its
+/// compressed latent before head expansion, while KDA state follows the
+/// planner-owned head partition.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub(crate) struct KimiLayerCacheGeometry {
+    pub kda_heads: Option<i32>,
+}
+
+pub(crate) fn prompt_cache_layer_layout_with_geometry(
+    args: &ModelArgs,
+    geometry: &[KimiLayerCacheGeometry],
+) -> Result<LayerSchedule<LayerCachePolicy>, Error> {
+    if geometry.len() != args.layer_schedule.len() {
+        return Err(Error::UnsupportedArchitecture(format!(
+            "Kimi Linear cache geometry has {} layers, expected {}",
+            geometry.len(),
+            args.layer_schedule.len()
+        )));
+    }
     let head_dim = args.kda_config.head_dim;
-    let projection = heads.checked_mul(head_dim).ok_or_else(|| {
-        Error::UnsupportedArchitecture("Kimi KDA projection width overflow".into())
-    })?;
     let history = args
         .kda_config
         .short_conv_kernel_size
@@ -677,7 +709,10 @@ pub(crate) fn prompt_cache_layer_layout(
         Error::UnsupportedArchitecture(error.to_string())
     };
     let fixed = |value| StateTensorDimension::fixed(value).map_err(cache_error);
-    let kda_tensors = || -> Result<Vec<StateTensorPolicy>, Error> {
+    let kda_tensors = |heads: i32| -> Result<Vec<StateTensorPolicy>, Error> {
+        let projection = heads.checked_mul(head_dim).ok_or_else(|| {
+            Error::UnsupportedArchitecture("Kimi KDA projection width overflow".into())
+        })?;
         let mut tensors = Vec::with_capacity(4);
         for slot in 0..3 {
             tensors.push(
@@ -709,21 +744,24 @@ pub(crate) fn prompt_cache_layer_layout(
         Ok(tensors)
     };
     let layers = args.num_hidden_layers as usize;
-    let policies = (0..layers)
-        .map(|layer| {
-            if matches!(
-                args.layer_policy(layer).map(|policy| policy.attention),
-                Some(AttentionKind::Kda)
-            ) {
-                LayerCachePolicy::fixed_only(kda_tensors()?).map_err(cache_error)
-            } else {
-                LayerCachePolicy::compressed_latent_rotary(
+    let policies = args
+        .layer_schedule
+        .iter()
+        .zip(geometry)
+        .enumerate()
+        .map(|(layer, (policy, geometry))| match (policy.attention, geometry.kda_heads) {
+            (AttentionKind::Kda, Some(heads)) => {
+                LayerCachePolicy::fixed_only(kda_tensors(heads)?).map_err(cache_error)
+            }
+            (AttentionKind::Mla, None) => LayerCachePolicy::compressed_latent_rotary(
                     AttentionPolicy::Full,
                     args.kv_lora_rank,
                     args.qk_rope_head_dim,
                 )
-                .map_err(cache_error)
-            }
+                .map_err(cache_error),
+            (attention, heads) => Err(Error::UnsupportedArchitecture(format!(
+                "Kimi Linear cache geometry mismatch at layer {layer}: {attention:?} with KDA heads {heads:?}"
+            ))),
         })
         .collect::<Result<Vec<_>, _>>()?;
     LayerSchedule::new(layers, policies)
@@ -782,6 +820,14 @@ pub enum LayerCache {
     Mla(CompressedLatentCache),
 }
 
+/// Borrowed hybrid operator state used by generalized execution runtimes.
+pub(crate) enum OperatorCache<'a> {
+    /// KDA convolution and recurrent state.
+    Kda(&'a mut KdaCache),
+    /// MLA compressed latent and rotary-key state.
+    Mla(&'a mut CompressedLatentCache),
+}
+
 impl LayerCache {
     fn offset(&self) -> i32 {
         match self {
@@ -832,6 +878,68 @@ impl Cache {
                 })
                 .collect(),
         }
+    }
+
+    /// Creates device-resident or blockwise-paged MLA state while KDA keeps
+    /// its bounded convolution and recurrent tensors resident.
+    pub fn new_with_options(
+        args: &ModelArgs,
+        policy: CacheResidencyPolicy,
+    ) -> Result<Self, Exception> {
+        Self::new_with_options_and_rank(args, policy, None)
+    }
+
+    pub(crate) fn new_with_options_and_rank(
+        args: &ModelArgs,
+        policy: CacheResidencyPolicy,
+        rank: Option<CacheRankIdentity>,
+    ) -> Result<Self, Exception> {
+        match policy {
+            CacheResidencyPolicy::Device => Ok(Self::new(args)),
+            CacheResidencyPolicy::Paged(options) => {
+                let manager = CacheResidencyManager::new(options)
+                    .map_err(|error| Exception::custom(error.to_string()))?;
+                Self::new_with_manager(args, manager, rank)
+            }
+        }
+    }
+
+    fn new_with_manager(
+        args: &ModelArgs,
+        manager: CacheResidencyManager,
+        rank: Option<CacheRankIdentity>,
+    ) -> Result<Self, Exception> {
+        let layers = args
+            .layer_schedule
+            .iter()
+            .enumerate()
+            .map(|(layer, policy)| match policy.attention {
+                AttentionKind::Kda => Ok(LayerCache::Kda(KdaCache::default())),
+                AttentionKind::Mla => {
+                    CompressedLatentCache::new_paged(manager.clone(), layer, rank)
+                        .map(LayerCache::Mla)
+                }
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self { layers })
+    }
+
+    fn residency_manager(&self) -> Option<&CacheResidencyManager> {
+        self.layers.iter().find_map(|layer| match layer {
+            LayerCache::Kda(_) => None,
+            LayerCache::Mla(cache) => cache.residency_manager(),
+        })
+    }
+
+    /// Returns aggregate live MLA paging observations, if paging is enabled.
+    pub fn residency_report(&self) -> Result<Option<CacheResidencyReport>, Exception> {
+        self.residency_manager()
+            .map(|manager| {
+                manager
+                    .report()
+                    .map_err(|error| Exception::custom(error.to_string()))
+            })
+            .transpose()
     }
 
     /// Returns the common number of consumed tokens.
@@ -938,7 +1046,7 @@ pub struct KimiDeltaAttention {
 }
 
 impl KimiDeltaAttention {
-    pub(super) fn new(args: &ModelArgs, layer: usize, stream: &Stream) -> Result<Self, Exception> {
+    pub(crate) fn new(args: &ModelArgs, layer: usize, stream: &Stream) -> Result<Self, Exception> {
         let heads = args.kda_config.num_heads;
         let head_dim = args.kda_config.head_dim;
         let projection = heads * head_dim;
@@ -1185,7 +1293,13 @@ pub(crate) struct SparseMoe {
 }
 
 impl SparseMoe {
-    fn new(args: &ModelArgs, layer: usize, stream: &Stream) -> Result<Self, Exception> {
+    fn new_with_widths(
+        args: &ModelArgs,
+        layer: usize,
+        routed_intermediate: i32,
+        shared_intermediate: i32,
+        stream: &Stream,
+    ) -> Result<Self, Exception> {
         let prefix = format!("model.layers.{layer}.mlp");
         let router_quantization = args.weight_quantization_for(&format!("{prefix}.gate.weight"));
         let gate_up_quantization =
@@ -1212,14 +1326,14 @@ impl SparseMoe {
             experts: PackedSwiGluExperts::new(
                 args.num_experts,
                 args.hidden_size,
-                args.moe_intermediate_size,
+                routed_intermediate,
                 gate_up_quantization,
                 down_quantization,
                 stream,
             )?,
             shared_experts: args.unloaded_swiglu(
                 &format!("{prefix}.shared_experts"),
-                args.moe_intermediate_size * args.num_shared_experts,
+                shared_intermediate,
                 stream,
             )?,
         })
@@ -1423,7 +1537,25 @@ pub struct DecoderLayer {
 }
 
 impl DecoderLayer {
-    pub(super) fn new(args: &ModelArgs, layer: usize, stream: &Stream) -> Result<Self, Exception> {
+    pub(crate) fn new(args: &ModelArgs, layer: usize, stream: &Stream) -> Result<Self, Exception> {
+        Self::new_with_widths(
+            args,
+            layer,
+            args.intermediate_size,
+            args.moe_intermediate_size,
+            args.moe_intermediate_size * args.num_shared_experts,
+            stream,
+        )
+    }
+
+    pub(super) fn new_with_widths(
+        args: &ModelArgs,
+        layer: usize,
+        dense_intermediate: i32,
+        routed_intermediate: i32,
+        shared_intermediate: i32,
+        stream: &Stream,
+    ) -> Result<Self, Exception> {
         let policy = args.layer_policy(layer).copied().ok_or_else(|| {
             Exception::custom(format!(
                 "Kimi Linear layer schedule has no policy for layer {layer}"
@@ -1443,14 +1575,18 @@ impl DecoderLayer {
             }
         };
         let mlp = match policy.feed_forward {
-            FeedForwardPolicy::SparseMoe => {
-                FeedForward::Moe(Box::new(SparseMoe::new(args, layer, stream)?))
-            }
+            FeedForwardPolicy::SparseMoe => FeedForward::Moe(Box::new(SparseMoe::new_with_widths(
+                args,
+                layer,
+                routed_intermediate,
+                shared_intermediate,
+                stream,
+            )?)),
             FeedForwardPolicy::Dense => {
                 let prefix = format!("model.layers.{layer}.mlp");
                 FeedForward::Dense(Box::new(args.unloaded_swiglu(
                     &prefix,
-                    args.intermediate_size,
+                    dense_intermediate,
                     stream,
                 )?))
             }
@@ -1600,6 +1736,44 @@ impl DecoderLayer {
             observer.observe(&format!("{prefix}.output"), &output)?;
         }
         Ok(output)
+    }
+
+    /// Executes this layer from semantic operator state without requiring the
+    /// resident model's family-specific cache container.
+    pub(crate) fn forward_with_operator_cache(
+        &mut self,
+        input: &Array,
+        mask: Option<&Array>,
+        cache: Option<OperatorCache<'_>>,
+        stream: &Stream,
+    ) -> Result<Array, Exception> {
+        let normalized = self.input_layernorm.forward(input, stream)?;
+        let mut observer = None;
+        let attention = match (&mut self.self_attn, cache) {
+            (Attention::Kda(attention), Some(OperatorCache::Kda(cache))) => {
+                attention.forward_impl(&normalized, Some(cache), stream, "", &mut observer)?
+            }
+            (Attention::Kda(attention), None) => {
+                attention.forward_impl(&normalized, None, stream, "", &mut observer)?
+            }
+            (Attention::Mla(attention), Some(OperatorCache::Mla(cache))) => attention
+                .forward_shared(&normalized, mask, Some(cache), stream, "", &mut observer)?,
+            (Attention::Mla(attention), None) => {
+                attention.forward_shared(&normalized, mask, None, stream, "", &mut observer)?
+            }
+            _ => {
+                return Err(Exception::custom(
+                    "Kimi Linear operator cache does not match decoder layer",
+                ))
+            }
+        };
+        let hidden = input.add(attention, stream)?;
+        let normalized = self.post_attention_layernorm.forward(&hidden, stream)?;
+        let feed_forward = match &mut self.mlp {
+            FeedForward::Dense(mlp) => mlp.forward(&normalized, stream)?,
+            FeedForward::Moe(moe) => moe.forward_impl(&normalized, stream, "", &mut observer)?,
+        };
+        hidden.add(feed_forward, stream)
     }
 
     pub(super) fn forward_sparse_experts<F>(
@@ -1785,17 +1959,24 @@ impl Model {
         Cache::new(&self.args)
     }
 
+    /// Creates device-resident or blockwise-paged MLA state independently of
+    /// parameter residency. Bounded KDA state remains device resident.
+    pub fn new_cache_with_options(&self, policy: CacheResidencyPolicy) -> Result<Cache, Exception> {
+        Cache::new_with_options(&self.args, policy)
+    }
+
     /// Returns the stable model type.
     pub fn model_type(&self) -> &str {
         &self.args.model_type
     }
 
-    pub(crate) fn save_prompt_cache(
-        cache: &Cache,
+    pub(crate) fn save_prompt_cache_with_rank(
+        cache: &mut Cache,
         destination: impl AsRef<Path>,
         descriptor: PromptCacheDescriptor,
         prefix_token_ids: &[u32],
         options: &PromptCacheOptions,
+        rank: Option<CacheRankIdentity>,
     ) -> Result<PromptCacheManifest, Exception> {
         let end = i64::try_from(prefix_token_ids.len())
             .map_err(|_| Exception::custom("Kimi prompt length exceeds i64"))?;
@@ -1803,6 +1984,11 @@ impl Model {
             return Err(Exception::custom(
                 "Kimi cache offset does not match the persisted prefix",
             ));
+        }
+        for layer in &mut cache.layers {
+            if let LayerCache::Mla(cache) = layer {
+                cache.finalize()?;
+            }
         }
         let mut blocks = Vec::new();
         let mut state = Vec::new();
@@ -1830,21 +2016,28 @@ impl Model {
                     });
                 }
                 LayerCache::Mla(cache) => {
-                    let (latent, rotary_key) = cache
-                        .arrays()
-                        .ok_or_else(|| Exception::custom("Kimi MLA cache state is missing"))?;
-                    blocks.push(PromptCacheSnapshotBlock {
-                        global_layer: layer,
-                        start: 0,
-                        end,
-                        rank: None,
-                        arrays: CacheBlockArrays::CompressedLatentRotary {
-                            latent: latent.clone(),
-                            rotary_key: rotary_key.clone(),
-                        },
-                    });
+                    if !cache.is_paged() {
+                        let (latent, rotary_key) = cache
+                            .arrays()
+                            .ok_or_else(|| Exception::custom("Kimi MLA cache state is missing"))?;
+                        blocks.push(PromptCacheSnapshotBlock {
+                            global_layer: layer,
+                            start: 0,
+                            end,
+                            rank,
+                            arrays: CacheBlockArrays::CompressedLatentRotary {
+                                latent: latent.clone(),
+                                rotary_key: rotary_key.clone(),
+                            },
+                        });
+                    }
                 }
             }
+        }
+        if let Some(manager) = cache.residency_manager() {
+            return manager
+                .save_prompt_cache(destination, descriptor, prefix_token_ids, &state, options)
+                .map_err(|error| Exception::custom(error.to_string()));
         }
         save_prompt_cache_snapshot(
             destination,
@@ -1857,6 +2050,25 @@ impl Model {
         .map_err(|error| Exception::custom(error.to_string()))
     }
 
+    #[cfg(test)]
+    pub(crate) fn save_prompt_cache(
+        cache: &mut Cache,
+        destination: impl AsRef<Path>,
+        descriptor: PromptCacheDescriptor,
+        prefix_token_ids: &[u32],
+        options: &PromptCacheOptions,
+    ) -> Result<PromptCacheManifest, Exception> {
+        Self::save_prompt_cache_with_rank(
+            cache,
+            destination,
+            descriptor,
+            prefix_token_ids,
+            options,
+            None,
+        )
+    }
+
+    #[cfg(test)]
     pub(crate) fn load_prompt_cache(
         args: &ModelArgs,
         directory: impl AsRef<Path>,
@@ -1877,26 +2089,8 @@ impl Model {
             layer_layout: prompt_cache_layer_layout(args)
                 .map_err(|error| Exception::custom(error.to_string()))?,
         };
-        Self::load_prompt_cache_with_identity(
-            args,
-            directory,
-            expected,
-            prefix_token_ids,
-            &identity,
-            stream,
-        )
-    }
-
-    pub(crate) fn load_prompt_cache_with_identity(
-        args: &ModelArgs,
-        directory: impl AsRef<Path>,
-        expected: &PromptCacheDescriptor,
-        prefix_token_ids: &[u32],
-        identity: &PromptCacheModelIdentity,
-        stream: &Stream,
-    ) -> Result<(Cache, PromptCacheManifest), Exception> {
         let (blocks, state, manifest) =
-            open_prompt_cache_snapshot(directory, expected, identity, prefix_token_ids, stream)
+            open_prompt_cache_snapshot(directory, expected, &identity, prefix_token_ids, stream)
                 .map_err(|error| Exception::custom(error.to_string()))?;
         let mut cache = Cache::new(args);
         let mut block_map = BTreeMap::new();
@@ -1907,10 +2101,10 @@ impl Model {
                 ));
             }
         }
-        let mut state_map = BTreeMap::new();
-        for tensor in state {
-            state_map.insert((tensor.owner, tensor.role), tensor.array);
-        }
+        let mut state_map = state
+            .into_iter()
+            .map(|tensor| ((tensor.owner, tensor.role), tensor.array))
+            .collect::<BTreeMap<_, _>>();
         let end = i32::try_from(prefix_token_ids.len())
             .map_err(|_| Exception::custom("Kimi prompt length exceeds i32"))?;
         for (layer, layer_cache) in cache.layers.iter_mut().enumerate() {
@@ -1956,6 +2150,62 @@ impl Model {
         }
         if !block_map.is_empty() || !state_map.is_empty() {
             return Err(Exception::custom("Kimi prompt cache has unexpected state"));
+        }
+        Ok((cache, manifest))
+    }
+
+    pub(crate) fn load_paged_prompt_cache_with_identity(
+        args: &ModelArgs,
+        directory: impl AsRef<Path>,
+        expected: &PromptCacheDescriptor,
+        prefix_token_ids: &[u32],
+        identity: &PromptCacheModelIdentity,
+        options: PagedCacheOptions,
+        stream: &Stream,
+    ) -> Result<(Cache, PromptCacheManifest), Exception> {
+        let directory = directory.as_ref();
+        let (manager, manifest) =
+            open_prompt_cache(directory, expected, identity, prefix_token_ids, options)
+                .map_err(|error| Exception::custom(error.to_string()))?;
+        let state = load_prompt_cache_state_tensors(directory, &manifest, stream)
+            .map_err(|error| Exception::custom(error.to_string()))?;
+        let mut state = state
+            .into_iter()
+            .map(|tensor| ((tensor.owner, tensor.role), tensor.array))
+            .collect::<BTreeMap<_, _>>();
+        let end = i32::try_from(prefix_token_ids.len())
+            .map_err(|_| Exception::custom("Kimi prompt length exceeds i32"))?;
+        let mut cache =
+            Cache::new_with_manager(args, manager, identity.topology.cache_rank_identity())?;
+        for (layer, layer_cache) in cache.layers.iter_mut().enumerate() {
+            if let LayerCache::Kda(cache) = layer_cache {
+                for (slot, convolution) in [&mut cache.q_conv, &mut cache.k_conv, &mut cache.v_conv]
+                    .into_iter()
+                    .enumerate()
+                {
+                    convolution.state = Some(
+                        state
+                            .remove(&(
+                                StateTensorOwner::Layer(layer),
+                                StateTensorRole::Convolution { slot: slot as u32 },
+                            ))
+                            .ok_or_else(|| {
+                                Exception::custom("Kimi KDA convolution state is missing")
+                            })?,
+                    );
+                    convolution.offset = end;
+                }
+                cache.recurrent_state = Some(
+                    state
+                        .remove(&(StateTensorOwner::Layer(layer), StateTensorRole::Recurrent))
+                        .ok_or_else(|| Exception::custom("Kimi KDA recurrent state is missing"))?,
+                );
+            }
+        }
+        if !state.is_empty() {
+            return Err(Exception::custom(
+                "Kimi paged prompt cache has unexpected fixed state",
+            ));
         }
         Ok((cache, manifest))
     }
@@ -3155,7 +3405,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let destination = directory.path().join("prompt-cache");
         Model::save_prompt_cache(
-            &cache,
+            &mut cache,
             &destination,
             descriptor.clone(),
             &prefix_ids,

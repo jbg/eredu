@@ -52,7 +52,7 @@ impl Gemma4VisionConfig {
 
 #[derive(Debug, Clone, ModuleParameters)]
 pub(crate) struct VisionPatchEmbedder {
-    pub parallel_parts: usize,
+    pub parallel_widths: Vec<usize>,
     #[param]
     pub input_proj: nn::Linear,
     #[param]
@@ -62,7 +62,7 @@ pub(crate) struct VisionPatchEmbedder {
 impl VisionPatchEmbedder {
     pub(crate) fn new(config: &Gemma4VisionConfig, stream: &Stream) -> Result<Self, Exception> {
         Ok(Self {
-            parallel_parts: 1,
+            parallel_widths: vec![config.hidden_size as usize],
             input_proj: nn::Linear::unloaded(
                 3 * config.patch_size * config.patch_size,
                 config.hidden_size,
@@ -80,24 +80,29 @@ impl VisionPatchEmbedder {
 
     pub(crate) fn new_tensor_parallel(
         config: &Gemma4VisionConfig,
-        context: crate::runtime::distributed::parallel::ParallelBuildContext,
+        local_hidden: i32,
+        parallel_widths: Vec<usize>,
         stream: &Stream,
     ) -> Result<Self, crate::error::Error> {
-        let local = context.equal_local_dimension(
-            "Gemma vision patch hidden size",
-            config.hidden_size as usize,
-        )?;
+        if local_hidden <= 0
+            || parallel_widths.is_empty()
+            || parallel_widths.iter().sum::<usize>() != config.hidden_size as usize
+        {
+            return Err(crate::error::Error::Parallel(
+                "invalid Gemma vision patch tensor-parallel widths".into(),
+            ));
+        }
         Ok(Self {
-            parallel_parts: context.topology().tensor_parallel_size,
+            parallel_widths,
             input_proj: nn::Linear::unloaded(
                 3 * config.patch_size * config.patch_size,
-                local as i32,
+                local_hidden,
                 false,
                 Dtype::Float32,
                 stream,
             )?,
             position_embedding_table: Param::<Array>::unloaded(
-                &[2, config.position_embedding_size, local as i32],
+                &[2, config.position_embedding_size, local_hidden],
                 Dtype::Float32,
                 stream,
             )?,
@@ -152,9 +157,14 @@ impl VisionPatchEmbedder {
         stream: &Stream,
     ) -> Result<(Array, Array), Exception> {
         let (local, padding) = self.forward(pixel_values, position_ids, stream)?;
-        let widths = vec![local.dim(-1) as usize; self.parallel_parts];
         Ok((
-            safemlx::distributed::all_gather_uneven_axis(&local, -1, &widths, group, stream)?,
+            safemlx::distributed::all_gather_uneven_axis(
+                &local,
+                -1,
+                &self.parallel_widths,
+                group,
+                stream,
+            )?,
             padding,
         ))
     }

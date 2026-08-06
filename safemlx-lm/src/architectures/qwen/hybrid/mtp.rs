@@ -5,7 +5,7 @@ use safemlx::{error::Exception, ops::indexing::TryIndexOp, Array, Stream};
 use crate::{
     api::{
         input::{self, ModelInput},
-        qwen3_5_moe::{Cache, LayerCache, Model, QwenMtpStepOutput},
+        qwen3_5::{Cache, LayerCache, Model, QwenMtpStepOutput},
     },
     runtime::generation::sampler::SpeculativeSampler,
     runtime::generation::speculative::{

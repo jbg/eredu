@@ -5,9 +5,15 @@ use safemlx::{
     Array, Device, DeviceType, ExecutionContext, Stream,
 };
 use safemlx_lm::{
-    api::realtime::{RealtimeSampling, RealtimeSpeechModel, RealtimeStepInput},
-    architectures::moshi::{model as moshi, personaplex},
-    runtime::generation::sampler::DefaultSampler,
+    api::realtime::{
+        LoadedRealtimeModel, RealtimeInferenceScheduler, RealtimeSampling, RealtimeStepInput,
+    },
+    architectures::moshi::{layerwise, model as moshi, personaplex},
+    runtime::{
+        generation::sampler::DefaultSampler,
+        scheduler::{RequestId, SchedulerLimits},
+    },
+    LayerExecutionLoadOptions,
 };
 
 fn main() -> anyhow::Result<()> {
@@ -26,9 +32,10 @@ fn main() -> anyhow::Result<()> {
     let stream = gpu.stream();
     let config = std::fs::File::open(model_dir.join("config.json"))?;
     let args: moshi::ModelArgs = serde_json::from_reader(config)?;
-    let mut model = moshi::load_pytorch_safetensors_model(
+    let model = layerwise::load_pytorch_layerwise_model(
         args,
         model_dir.join(personaplex::MODEL_SAFETENSORS),
+        LayerExecutionLoadOptions::FullyResident,
         stream,
         cpu.stream(),
     )?;
@@ -37,24 +44,33 @@ fn main() -> anyhow::Result<()> {
     let expected_sampled = required(&fixture, "expected.sampled")?;
     let expected_output_audio = required(&fixture, "expected.output_audio")?;
 
-    let mut state = model.new_realtime_state();
+    let mut model = LoadedRealtimeModel::PersonaPlex(model);
     let config = model.realtime_config();
     let depth_audio_codebooks = config.depth_audio_codebooks;
     let generated_audio_codebooks = config.generated_audio_codebooks;
-    let mut text_sampler = DefaultSampler;
-    let mut audio_samplers = (0..depth_audio_codebooks)
+    let audio_samplers = (0..depth_audio_codebooks)
         .map(|_| DefaultSampler)
         .collect::<Vec<_>>();
+    let request = RequestId::new(1);
+    let mut scheduler = RealtimeInferenceScheduler::new(&model, SchedulerLimits::new(1, 1)?)?;
+    scheduler.register_request(
+        &model,
+        request,
+        DefaultSampler,
+        audio_samplers,
+        RealtimeSampling::greedy(),
+    )?;
     let mut sampled = Vec::new();
     let mut emitted = Vec::new();
     for step in 0..input_audio.dim(2) {
         let input = input_audio.try_index_device((.., .., step), stream)?;
-        let output = model.step_realtime(
-            &mut state,
-            RealtimeStepInput::encoded_audio(&input),
-            RealtimeSampling::new(&mut text_sampler, &mut audio_samplers, 0.0, 0.0, None),
-            stream,
-        )?;
+        scheduler.enqueue(&model, request, RealtimeStepInput::encoded_audio(&input))?;
+        let output = scheduler
+            .run_queued(&mut model, stream)?
+            .pop()
+            .expect("one queued realtime frame")
+            .into_parts()
+            .1;
         if step > 0 {
             let text = output.text_token.squeeze_axes(&[-1], stream)?;
             let text = text.expand_dims(1, stream)?;

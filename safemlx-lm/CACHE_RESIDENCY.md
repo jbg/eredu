@@ -27,22 +27,23 @@ let cache = model.new_cache_with_options(CacheResidencyPolicy::Paged(options))?;
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
-The ordinary `new_cache()` methods are unchanged. Supported paged construction
-currently covers:
+`new_cache()` constructs device-resident state. Paged construction is exposed
+through these current entry points:
 
-- Llama/Mistral full and sliding attention through resident, layerwise-host,
-  dense-streamed, pipeline, and tensor-parallel execution.
-- DeepSeek compressed latent/rotary state through resident, layerwise-host,
-  dense-streamed, sparse-expert, pipeline, tensor-parallel, and replicated
-  expert-parallel execution.
-- GPT-OSS alternating full/sliding attention, including learned softmax sinks,
-  through resident, layerwise, sparse-expert, and replicated expert-parallel
-  execution.
-- Inkling global and sliding relative-position attention through resident,
-  layerwise-host, sparse-expert, and replicated expert-parallel execution. Its
-  small short-convolution state remains device resident.
-- Qwen3 replicated expert-parallel attention in full-context or explicitly
-  bounded sliding-window mode.
+- High-level `Model::new_cache_with_options`
+  supports Llama/Mistral, DeepSeek, Kimi Linear, GPT-OSS, dense Qwen2/Qwen3,
+  Inkling, and Nemotron-H.
+- `PipelineModel::new_cache_with_options`
+  supports every advertised pipeline stage adapter. It materializes the
+  adapter's canonical per-layer cache descriptors, including heterogeneous
+  fixed-state slots.
+- `ExpertParallelModel::new_cache_with_options`
+  supports DeepSeek, GPT-OSS, dense Qwen, Inkling, and Nemotron-H replicated
+  attention state.
+
+LFM2/LFM2-MoE and Qwen hybrid models can use paged attention through the
+pipeline runtime. Their high-level and tensor-parallel model entry points reject
+paged residency explicitly.
 
 Recurrent linear-attention, Mamba, and convolution state are not block-paged;
 they remain device resident while supported attention KV uses the paged block
@@ -53,6 +54,9 @@ bounded convolution histories plus an F32 recurrent state, while MLA layers
 retain compressed no-RoPE latents. That cache supports resident and
 weight-layerwise execution. Schema-v4 prompt snapshots persist both state kinds;
 KDA itself is not represented as paged KV.
+Nemotron-H uses the same split at a different layer granularity: Mamba layers
+retain bounded convolution/SSM state, attention layers page ordinary KV with
+their exact full or sliding policy, and MLP/MoE layers remain stateless.
 
 ## Sliding and full attention
 
@@ -154,9 +158,8 @@ payload. The digest is checked once against the mapped bytes before the shard is
 converted into MLX arrays, so opening remains mmap-lazy while same-length payload
 corruption cannot be consumed.
 
-Schema version 4 is an intentional break. Version 3 and older manifests are rejected
-with `unsupported prompt cache schema version 3` (or their recorded version); no converter or legacy read
-path is provided.
+Prompt-cache loading accepts schema version 4. Any other schema version is
+rejected before cache tensors are opened.
 
 The manifest records:
 
@@ -187,6 +190,16 @@ under a different topology. Pipeline stages persist only their global layer
 range. Expert-parallel attention state is recorded as replicated, not
 expert-sharded.
 
+The architecture-neutral distributed scheduler owns one isolated program state
+per active request. The decoder adapter stores one complete rank-local
+`PipelineCache` in that state, so device caches add directly across requests. A
+paged cache's limits apply to that request's `CacheResidencyManager`, not to the
+scheduler as an aggregate pool; deployments bound aggregate exposure with
+`max_active_requests` and choose per-request `PagedCacheOptions` accordingly.
+No arrays are shared between request identities. EOS and cancellation drop the
+state and cache, while `release_request_cache` hands an idle decoder cache back
+to the caller for explicit schema-v4 persistence.
+
 `AttentionPolicy::Sliding { window: N }` includes the current token in the `N`
 positions. Ordinary live state therefore needs at most `N - 1` past positions
 between calls. Paged backing is block-granular and may retain an older block
@@ -205,8 +218,12 @@ Qwen3.5 record linear-attention convolution/recurrent state beside full-attentio
 KV; Gemma 4, Inkling, and Qwen3-VL persist the non-transient prefix state needed
 for exact continuation. LFM2 records causal-convolution history beside its
 full-attention KV, while Nemotron-H records Mamba convolution/recurrent state,
-full-attention KV, and explicit `NoState` entries for MLP/MoE-only layers.
+full-attention KV, and empty `StateSlots` entries for MLP/MoE-only layers.
 Resident and bounded-weight execution use these same family helpers and layouts.
+Pure LFM2/LFM2-MoE pipeline stages consume this layout directly: the paged
+residency manager is stage-owned even when a stage has only fixed state, and
+publication/reload validates every state slot's global owner, role, shape,
+dtype, canonical order, and prefix offset.
 
 `PipelineModel`, family-specific generalized tensor-parallel models, and
 `ExpertParallelModel` expose matching `save_prompt_cache` and
@@ -214,8 +231,9 @@ Resident and bounded-weight execution use these same family helpers and layouts.
 publishes `rank-NNNNN` beneath it. Pipeline manifests contain only the stage's
 global layer interval, tensor-parallel manifests retain rank-local KV heads,
 and expert-parallel manifests explicitly record replicated attention state.
-LFM2 and Nemotron-H expert-parallel publication also records their replicated
-convolution/recurrent tensors under the same rank topology. Every load derives
+LFM2 expert-parallel publication records replicated convolution state.
+Nemotron-H expert-parallel publication atomically records resident Mamba state
+and paged attention blocks under the same rank topology. Every load derives
 family, effective type, exact ordered layer ownership and policies, and topology
 from the loaded distributed model before opening its rank directory.
 
@@ -232,9 +250,15 @@ descriptors to match this derived identity. Applications can obtain the exact
 value from `prompt_cache_architecture_fingerprint` on loaded, pipeline,
 tensor-parallel, and expert-parallel model surfaces.
 
-Realtime Moshi/PersonaPlex temporal/depth caches are intentionally deferred
-because a prompt snapshot does not yet encode their continuous timing and
-depth-decoder session state.
+Realtime Moshi/PersonaPlex temporal/depth state is isolated per request by the
+canonical scheduler and can be released as one `RealtimeSession`. Persistent
+publication remains deferred because a prompt-cache snapshot does not yet
+encode continuous timing, delayed streams, sampler/PRNG state, and depth-decoder
+state as one atomic identity. In-process handoff is nevertheless fail-closed:
+the session records the selected checkpoint files' SHA-256 content identity and
+the normalized execution identity, including effective quantization. Resident,
+host-layerwise, and dense-streamed loads of the same artifact are compatible;
+same-shaped models with different weight content are not.
 A loaded prefix contains model state, not logits for an
 empty suffix. Run at least one suffix token before sampling, or persist logits
 separately in the application.
@@ -289,6 +313,12 @@ cargo test -p safemlx-lm --lib 'cache_residency::tests::host_' -- --ignored --te
 cargo test -p safemlx-lm --lib inkling_global_and_sliding_attention_paged_parity
 cargo test -p safemlx-lm --test distributed_pipeline_ring \
   ring_two_process_deepseek_pipeline_persistence -- --ignored --exact --test-threads=1
+cargo test -p safemlx-lm --test distributed_pipeline_ring \
+  ring_two_process_lfm2_pipeline -- --ignored --exact --test-threads=1
+cargo test -p safemlx-lm --test distributed_pipeline_ring \
+  ring_two_process_lfm2_dense_stream_pipeline -- --ignored --exact --test-threads=1
+cargo test -p safemlx-lm --test distributed_pipeline_ring \
+  ring_two_process_lfm2_moe_pipeline -- --ignored --exact --test-threads=1
 cargo test -p safemlx-lm --test distributed_tensor_parallel_ring \
   ring_two_process_deepseek_tensor_parallel_persistence -- --ignored --exact --test-threads=1
 ```

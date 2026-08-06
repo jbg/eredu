@@ -49,10 +49,11 @@ use crate::{
     runtime::cache::{
         residency::{
             open_prompt_cache_snapshot, save_prompt_cache_snapshot, CacheBlockArrays,
-            LayerCachePolicy, PromptCacheDescriptor, PromptCacheManifest, PromptCacheModelIdentity,
-            PromptCacheOptions, PromptCacheSnapshotBlock,
+            CacheRankIdentity, CacheResidencyManager, LayerCachePolicy, PromptCacheDescriptor,
+            PromptCacheManifest, PromptCacheModelIdentity, PromptCacheOptions,
+            PromptCacheSnapshotBlock,
         },
-        ConcatKeyValueCache, KeyValueCache,
+        ConcatKeyValueCache, KeyValueCache, PagedKeyValueCache,
     },
     runtime::checkpoint::load::{
         gguf_metadata, gguf_quantization_configs, load_gguf_strict, load_named_array_strict,
@@ -70,6 +71,25 @@ pub enum Architecture {
     Qwen2,
     /// Qwen3 dense or sparse-MoE text decoders with Q/K normalization.
     Qwen3,
+}
+
+/// Builds the authoritative per-layer paged KV layout for any dense-Qwen
+/// execution route.
+pub(crate) fn new_paged_cache_with_manager(
+    args: &DecoderConfig,
+    manager: CacheResidencyManager,
+    rank: Option<CacheRankIdentity>,
+) -> Result<Vec<Option<PagedKeyValueCache>>, Exception> {
+    args.attention_schedule
+        .iter()
+        .enumerate()
+        .map(|(layer, policy)| {
+            let window = policy.window().map(|window| {
+                i32::try_from(window.get()).expect("validated dense-Qwen attention window fits i32")
+            });
+            PagedKeyValueCache::new_with_layout(manager.clone(), layer, window, 0, rank).map(Some)
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone)]
@@ -2995,9 +3015,9 @@ fn gguf_rope_scaling(
         "linear" => {
             let factor_key = format!("{architecture}.rope.scaling.factor");
             let factor = gguf_optional_f32(metadata, &factor_key)?.ok_or_else(|| {
-                Error::UnsupportedArchitecture(
-                    format!("linear GGUF RoPE scaling is missing {factor_key}").into(),
-                )
+                Error::UnsupportedArchitecture(format!(
+                    "linear GGUF RoPE scaling is missing {factor_key}"
+                ))
             })?;
             Ok(Some(HashMap::from([
                 (
@@ -3580,12 +3600,9 @@ mod tests {
     #[test]
     #[ignore = "requires MLX runtime execution"]
     fn schema_v4_qwen2_paged_save_drop_reload_preserves_distinct_windows() {
-        use crate::{
-            api::{Model as ApiModel, ModelCache},
-            runtime::cache::residency::{
-                CacheResidencyPolicy, PagedCacheOptions, PromptCacheDescriptor, PromptCacheOptions,
-                PromptCacheTopology,
-            },
+        use crate::runtime::cache::residency::{
+            CacheResidencyManager, PagedCacheOptions, PromptCacheDescriptor, PromptCacheOptions,
+            PromptCacheTopology,
         };
 
         let context =
@@ -3634,27 +3651,20 @@ mod tests {
         let options = PagedCacheOptions::new(2, 1 << 20, 1 << 20, 1)
             .unwrap()
             .with_full_attention(true);
-        let mut model = ApiModel::DenseQwen(resident);
-        let mut cache = model
-            .new_cache_with_options(CacheResidencyPolicy::Paged(options.clone()))
-            .unwrap();
-        let (ApiModel::DenseQwen(resident), ModelCache::PagedKeyValue(paged)) =
-            (&mut model, &mut cache)
-        else {
-            panic!("expected resident dense-Qwen model with a paged cache");
-        };
+        let manager = CacheResidencyManager::new(options.clone()).unwrap();
+        let mut paged = super::new_paged_cache_with_manager(&args, manager.clone(), None).unwrap();
         resident
             .forward(
                 super::ModelInput {
                     inputs: &prefix,
                     mask: None,
-                    cache: paged,
+                    cache: &mut paged,
                 },
                 stream,
             )
             .unwrap();
 
-        let layout = model.prompt_cache_layer_layout().unwrap();
+        let layout = super::prompt_cache_layer_layout(&args).unwrap();
         let descriptor = PromptCacheDescriptor {
             model_family: "dense_qwen".into(),
             effective_model_type: args.model_type.clone(),
@@ -3671,26 +3681,32 @@ mod tests {
         };
         let directory = tempfile::tempdir().unwrap();
         let destination = directory.path().join("prompt-cache");
-        let saved = model
+        for cache in paged.iter_mut().flatten() {
+            cache.finalize().unwrap();
+        }
+        let saved = manager
             .save_prompt_cache(
-                &mut cache,
                 &destination,
                 descriptor.clone(),
                 &prefix_ids,
+                &[],
                 &PromptCacheOptions::default(),
-                stream,
             )
             .unwrap();
         assert_eq!(saved.schema_version, 4);
-        drop(cache);
+        drop(paged);
 
-        let (mut restored, manifest) = model
-            .load_prompt_cache(&destination, &descriptor, &prefix_ids, options, stream)
-            .unwrap();
+        let identity = super::prompt_cache_model_identity(&args).unwrap();
+        let (manager, manifest) = crate::runtime::cache::residency::open_prompt_cache(
+            &destination,
+            &descriptor,
+            &identity,
+            &prefix_ids,
+            options,
+        )
+        .unwrap();
         assert_eq!(manifest.schema_version, 4);
-        let ModelCache::PagedKeyValue(restored_paged) = &mut restored else {
-            panic!("expected restored dense-Qwen paged cache");
-        };
+        let mut restored_paged = super::new_paged_cache_with_manager(&args, manager, None).unwrap();
         assert_eq!(
             restored_paged
                 .iter()
@@ -3702,15 +3718,12 @@ mod tests {
             .iter()
             .all(|cache| cache.as_ref().unwrap().offset() == prefix_ids.len() as i32));
 
-        let ApiModel::DenseQwen(resident) = &mut model else {
-            unreachable!("model variant changed after prompt-cache restore")
-        };
         let continued = resident
             .forward(
                 super::ModelInput {
                     inputs: &suffix,
                     mask: None,
-                    cache: restored_paged,
+                    cache: &mut restored_paged,
                 },
                 stream,
             )

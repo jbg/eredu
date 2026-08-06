@@ -3,9 +3,13 @@ use std::{path::PathBuf, time::Instant};
 use safemlx::{transforms::eval, Array, Device, DeviceType, ExecutionContext, Stream};
 use safemlx_codec::mimi::Mimi;
 use safemlx_lm::{
-    api::realtime::{RealtimeSampling, RealtimeSpeechModel, RealtimeStepInput},
+    api::realtime::{RealtimeInferenceScheduler, RealtimeSampling, RealtimeStepInput},
     load_realtime_model,
-    runtime::generation::sampler::DefaultSampler,
+    runtime::{
+        generation::sampler::DefaultSampler,
+        scheduler::{RequestId, SchedulerLimits},
+    },
+    LoadedRealtimeModel,
 };
 
 const SAMPLE_RATE: f64 = 24_000.0;
@@ -83,7 +87,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn warmup(
-    model: &mut impl RealtimeSpeechModel,
+    model: &mut LoadedRealtimeModel,
     mimi: &mut Mimi,
     pcm_frame: &Array,
     depth_audio_codebooks: i32,
@@ -93,22 +97,26 @@ fn warmup(
     Ok(())
 }
 
-fn run_full_path<M>(
-    model: &mut M,
+fn run_full_path(
+    model: &mut LoadedRealtimeModel,
     mimi: &mut Mimi,
     pcm_frame: &Array,
     frames: i32,
     depth_audio_codebooks: i32,
     stream: &Stream,
-) -> Result<(f64, i32, i32), Box<dyn std::error::Error>>
-where
-    M: RealtimeSpeechModel,
-{
-    let mut state = model.new_realtime_state();
-    let mut text_sampler = DefaultSampler;
-    let mut audio_samplers = (0..depth_audio_codebooks)
+) -> Result<(f64, i32, i32), Box<dyn std::error::Error>> {
+    let audio_samplers = (0..depth_audio_codebooks)
         .map(|_| DefaultSampler)
         .collect::<Vec<_>>();
+    let request = RequestId::new(1);
+    let mut scheduler = RealtimeInferenceScheduler::new(model, SchedulerLimits::new(1, 1)?)?;
+    scheduler.register_request(
+        model,
+        request,
+        DefaultSampler,
+        audio_samplers,
+        RealtimeSampling::greedy(),
+    )?;
     mimi.reset_encode_state();
     mimi.reset_decode_state();
 
@@ -120,12 +128,17 @@ where
             continue;
         };
         encoded_frames += 1;
-        let output = model.step_realtime(
-            &mut state,
+        scheduler.enqueue(
+            model,
+            request,
             RealtimeStepInput::encoded_audio(&input_tokens),
-            RealtimeSampling::new(&mut text_sampler, &mut audio_samplers, 0.0, 0.0, None),
-            stream,
         )?;
+        let output = scheduler
+            .run_queued(model, stream)?
+            .pop()
+            .expect("one queued realtime frame")
+            .into_parts()
+            .1;
         if let Some(output_tokens) = output.output_audio_tokens {
             let pcm = mimi.decode_step(&output_tokens, stream)?;
             eval([&output.text_token, &output.sampled_audio_tokens, &pcm])?;

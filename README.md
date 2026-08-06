@@ -86,16 +86,18 @@ dense versus sparse-MoE feed-forward execution, so runtime and bounded expert
 routes support arbitrary internal combinations without a dense-prefix fallback.
 Qwen3.5/Qwen3-Next likewise normalize full self-attention and recurrent linear
 attention into an ordered Qwen hybrid layer schedule before execution.
-Qwen3-VL vision now uses the same generic schedule container with a
+Qwen3-VL vision uses the generic schedule container with a
 vision-specific policy. Every ordered entry records full versus spatial-window
 attention and an optional exact DeepStack merger bank. Qwen3-VL normalizes to
 full attention at every vision block; Qwen3.5 retains its configured
 full/window topology. Resident, bounded, structural, and workspace paths query
-only that schedule, and the old normalized depth and layer-index lists are gone.
+only that schedule.
 Nemotron-H completes the four-operator pilot with an ordered schedule covering
 Mamba, full or sliding self-attention, dense MLP, and sparse MoE layers; the
 same schedule drives cache identity, bounded recurrent/KV state, and stateless
-feed-forward entries.
+feed-forward entries. Its heterogeneous live cache keeps bounded Mamba state
+resident while paging full or sliding attention KV through the shared cache
+residency manager, including tensor- and replicated expert-parallel execution.
 GPT-OSS also uses `LayerSchedule<AttentionPolicy>` as its sole normalized
 attention geometry. Explicit Hugging Face full/sliding layer lists and the
 published alternating fallback normalize once, then drive resident, bounded,
@@ -107,21 +109,21 @@ dense/sparse-MoE feed-forward execution. Hugging Face layer lists or indices
 and GGUF Boolean attention patterns normalize once into that ordered schedule;
 resident, bounded, paged-cache, structural, expert-parallel, fingerprint, and
 memory-accounting paths all consume it without threshold-based fallbacks.
-Kimi Linear now uses the same generic schedule container with a Kimi-specific
+Kimi Linear uses the same generic schedule container with a Kimi-specific
 policy carrying both `AttentionKind::{Kda, Mla}` and
 `FeedForwardPolicy::{Dense, SparseMoe}`. Hugging Face layer lists and
 dense/MoE prefix-frequency metadata, plus GGUF per-layer attention metadata,
 normalize once before execution; resident, bounded, sparse-expert, structural,
 cache, fingerprint, and memory-accounting paths consume only the ordered
 schedule.
-DeepSeek-V3/R1 now normalizes its dense-versus-routed-MoE topology into
+DeepSeek-V3/R1 normalizes its dense-versus-routed-MoE topology into
 `LayerSchedule<architectures::deepseek_v3::model::LayerPolicy>`. Hugging Face
 prefix/frequency fields and GGUF leading-dense metadata are source-only inputs;
 resident, bounded, structural, tensor/pipeline/expert-parallel, cache-identity,
 and fingerprint paths consume the ordered schedule. Internally supplied
 schedules may use arbitrary dense/MoE ordering, while every layer continues to
 use the model-wide compressed MLA cache geometry.
-Gemma 4 text and assistant checkpoints now normalize every decoder-layer choice
+Gemma 4 text and assistant checkpoints normalize every decoder-layer choice
 into `LayerSchedule<architectures::gemma4::model::LayerPolicy>`. Each entry owns
 its attention mode and exact window, head/KV geometry, KV ownership/publication
 and key-as-value topology, dense MLP width, and dense-only versus dense-plus-MoE
@@ -129,9 +131,69 @@ selection. Resident and bounded execution, multimodal masks, shared-KV routing,
 assistant drafting, structural admission, architecture identity, cache
 allocation, and memory reporting consume only that schedule; arbitrary Boolean
 GGUF attention patterns and internally distinct windows or widths are supported.
-Llama and Mistral have also removed their normalized global-window field and
-separate sliding-cache dispatch. Hugging Face and GGUF scalar metadata normalize
-once into `LayerSchedule<AttentionPolicy>`; resident, bounded, paged, tensor,
+Gemma 4 tensor parallelism derives text, vision, and audio execution geometry
+from shared semantic partition plans. Uneven GQA, dense/routed intermediate,
+vision patch/MLP, audio head/convolution, and modality ranges therefore flow
+through layer construction and prompt-cache identity without equal-shard
+reconstruction. Pure Gemma text pipeline execution uses dependency-safe
+contiguous stage units, relays declared per-layer residual inputs as immutable
+auxiliary state, and supports exact SafeTensors and `gemma4` GGUF checkpoints.
+Shared-KV publisher/consumer groups are never split across stages.
+Fully resident Gemma text stages can apply load-time affine or MXFP4
+quantization through the same direct and derived binding plan used for
+checkpoint validation; dense disk-streamed stages require a matching
+checkpoint-native packed encoding.
+Qwen2/Qwen3/Qwen3-MoE and GPT-OSS use that same adapter-driven pipeline runtime
+for SafeTensors and canonical `qwen2`/`qwen3`/`qwen3moe`/`gpt-oss` GGUF
+checkpoints. Qwen stages preserve biased Q/K/V projections or Q/K
+normalization, GQA, tied-head ownership, routed-expert semantics, and the exact
+per-layer full/sliding schedule. GPT-OSS stages retain native MXFP4 experts and
+their alternating or explicit attention schedule.
+Fully resident Qwen stages support aligned affine or MXFP4 requantization;
+GPT-OSS can MXFP4-quantize eligible dense matrices without transcoding its
+expert banks. Dense disk streaming requires checkpoint-native encodings.
+LFM2 and LFM2-MoE use the same runtime for SafeTensors and canonical
+`lfm2`/`lfm2moe` GGUF checkpoints. Their alternating causal-convolution and
+full-attention layers materialize semantic state slots from the canonical
+cache schedule: convolution histories remain fixed state, attention uses the
+shared ordinary or paged KV contract, and both are atomically persisted and
+restored without an LFM2-specific pipeline cache variant. Fully resident and
+dense disk-streamed local layers share the bounded LFM2 binding plan.
+Kimi Linear, Nemotron-H/Nemotron-H-MoE, Qwen3-Next/Qwen3.5, and text-only
+Inkling stages use that same adapter-driven pipeline runtime for
+SafeTensors and their canonical GGUF architectures. KDA, Mamba2, and linear
+attention expose borrowed semantic state to the runtime; MLA and KV storage
+remain the shared compressed/paged implementations. Inkling's KV and four
+short-convolution histories exercise the combined `KeyValueWithFixedState`
+layout without introducing a family cache variant. Fully resident and dense
+disk-streamed stages share each family's bounded binding plan.
+The pipeline runtime stores one type-erased stage shell and derives ordinary,
+paged, and persisted cache state from its canonical semantic layer schedule.
+All decoder families use the same resident/dense-stream layer executor and the
+same architecture-adapter binding plan; family payloads provide only math,
+auxiliary state, and identity. Static bindings are selected lazily by stage
+role, so loading does not build a duplicate source stage or open unowned
+checkpoint shards. Transport and residency do not dispatch on a closed
+architecture enum.
+Request/work identity, bounded fair queues, isolated program state,
+cancellation, backpressure, exact cross-rank descriptor consensus, failure
+poisoning, and telemetry live in one architecture-neutral distributed
+scheduler. The decoder pipeline is a thin program adapter: each request state
+contains its `PipelineCache`, and each work item describes a prefill or decode
+transition. Moshi/PersonaPlex is a second adapter over the same scheduler: its
+request state owns temporal/depth caches, delayed streams, samplers, and PRNG
+state, while encoded and forced prompt frames are work items. The two programs
+share lifecycle and queueing without conflating their execution semantics.
+Realtime session handoff is bound to exact checkpoint-file content plus the
+normalized execution and quantization identity, rather than model geometry.
+The resident/layerwise runtime likewise uses a validated execution-group DAG
+rather than a flat architecture-specific sequence. Gemma vision and audio are
+independent ingress roots feeding text; Qwen-VL, multimodal Qwen3.5, and
+Inkling declare vision-to-text dependencies. Media assembly happens at the
+text-node boundary, and invalid, cyclic, disconnected, or unmerged graphs fail
+before execution.
+Llama and Mistral normalize Hugging Face and GGUF scalar metadata into
+`LayerSchedule<AttentionPolicy>`; resident, bounded, paged, tensor,
 pipeline, cache-identity, and memory paths then use the exact policy at each
 layer. Internally mixed and distinct-window schedules are supported. Prompt-cache
 schema v4 persists the exact ordered per-layer layout, including distinct

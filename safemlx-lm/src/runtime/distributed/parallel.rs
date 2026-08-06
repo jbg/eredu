@@ -100,16 +100,31 @@ pub fn sample_and_synchronize<S: Sampler>(
     })
 }
 
-/// Divides a positive model dimension exactly across tensor-parallel ranks.
-pub(crate) fn exact_parallel_division(name: &str, value: i32, parts: usize) -> Result<i32, Error> {
-    let parts_i32 = i32::try_from(parts)
-        .map_err(|_| Error::Parallel("tensor-parallel size does not fit in i32".into()))?;
-    if value <= 0 || value % parts_i32 != 0 {
+/// Returns the finest legal logical-unit count for an aligned row partition.
+///
+/// `semantic_units` is the number of indivisible semantic groups, while
+/// `elements_per_unit` is their width on the row-sharded axis. The returned
+/// count combines adjacent semantic groups until every boundary is aligned to
+/// `required_alignment` (one for dense tensors, or a quantization block size).
+pub(crate) fn aligned_partition_units(
+    name: &str,
+    semantic_units: usize,
+    elements_per_unit: usize,
+    required_alignment: usize,
+) -> Result<usize, Error> {
+    if semantic_units == 0 || elements_per_unit == 0 || required_alignment == 0 {
         return Err(Error::Parallel(format!(
-            "{name} {value} is not divisible by tensor-parallel size {parts}"
+            "{name} aligned partition dimensions must be positive, got units={semantic_units}, width={elements_per_unit}, alignment={required_alignment}"
         )));
     }
-    Ok(value / parts_i32)
+    let units_per_partition =
+        required_alignment / greatest_common_divisor(elements_per_unit, required_alignment);
+    if !semantic_units.is_multiple_of(units_per_partition) {
+        return Err(Error::Parallel(format!(
+            "{name} has {semantic_units} semantic units of width {elements_per_unit}, which cannot form complete alignment-{required_alignment} partitions"
+        )));
+    }
+    Ok(semantic_units / units_per_partition)
 }
 
 /// Semantic role of a logical parameter group.
@@ -129,6 +144,8 @@ pub enum ParameterRole {
     Vocabulary,
     /// Query, key, or value heads.
     AttentionHeads,
+    /// Dense feed-forward intermediate channels shared by input and output projections.
+    FeedForwardIntermediate,
     /// Routed or shared expert intermediate channels.
     ExpertIntermediate,
     /// State-space, convolution, or recurrent channels.
@@ -151,6 +168,20 @@ pub enum MemberSharding {
     Balanced {
         /// Source tensor axis to partition.
         axis: usize,
+    },
+    /// Map the group's logical partition onto one physical tensor axis.
+    Partitioned {
+        /// Source tensor axis to partition.
+        axis: usize,
+    },
+    /// Map the same group-level logical range into each supplied source
+    /// segment and concatenate the selected indices in segment order.
+    PartitionedSegments {
+        /// Source tensor axis containing the fused segments.
+        axis: usize,
+        /// Ordered, non-overlapping physical source ranges. Every segment
+        /// represents the group's complete logical domain.
+        segments: Vec<Range<usize>>,
     },
     /// Partition each supplied source range independently and concatenate the
     /// rank-local indices in segment order.
@@ -275,6 +306,124 @@ pub(crate) fn register_projection_module(
     )?)
 }
 
+/// Registers projections that must consume the same logical partition.
+///
+/// `preferred_units` expresses the finest semantically legal partition (KV
+/// groups for GQA, intermediate channels for a gated MLP). The planner reduces
+/// it to the greatest unit count represented integrally by every physical
+/// member, including packed weights and quantization companions. This makes
+/// uneven ranges safe without architecture-specific packed-shape arithmetic.
+pub(crate) fn register_partitioned_projection_group<M: ModuleParameters>(
+    planner: &mut ParallelPlanBuilder,
+    logical_name: &str,
+    role: ParameterRole,
+    projections: &[(&M, &str, ProjectionSharding)],
+    preferred_units: usize,
+) -> Result<(), Error> {
+    let (units, members) = partitioned_projection_members(projections, preferred_units)?;
+    planner.register(ParameterGroupSpec::partitioned(
+        logical_name,
+        role,
+        units,
+        members,
+    )?)
+}
+
+/// Builds physical members for projections sharing one logical partition.
+/// Architecture-owned compound groups can add non-linear members such as
+/// depthwise kernels while retaining the same packed-projection rules.
+pub(crate) fn partitioned_projection_members<M: ModuleParameters>(
+    projections: &[(&M, &str, ProjectionSharding)],
+    preferred_units: usize,
+) -> Result<(usize, Vec<ParameterMemberSpec>), Error> {
+    if preferred_units == 0 {
+        return Err(Error::Parallel(
+            "partitioned projection group has zero preferred units".into(),
+        ));
+    }
+
+    let mut raw_members = Vec::new();
+    let mut units = preferred_units;
+    for (module, prefix, placement) in projections {
+        for (name, parameter) in module.parameters().flatten() {
+            let shape = parameter
+                .shape()
+                .iter()
+                .map(|dimension| {
+                    usize::try_from(*dimension).map_err(|_| {
+                        Error::Parallel(format!(
+                            "parameter {prefix}.{name} has negative dimension {dimension}"
+                        ))
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let axis = projection_partition_axis(prefix, &name, &shape, *placement)?;
+            if let Some(axis) = axis {
+                units = greatest_common_divisor(units, shape[axis]);
+            }
+            raw_members.push((format!("{prefix}.{name}"), shape, axis));
+        }
+    }
+    if raw_members.is_empty() {
+        return Err(Error::Parallel(
+            "partitioned projection group contains no parameters".into(),
+        ));
+    }
+
+    Ok((
+        units,
+        raw_members
+            .into_iter()
+            .map(|(target, shape, axis)| {
+                let sharding = axis.map_or(MemberSharding::Replicated, |axis| {
+                    MemberSharding::Partitioned { axis }
+                });
+                ParameterMemberSpec::new(target, shape, sharding)
+            })
+            .collect(),
+    ))
+}
+
+fn projection_partition_axis(
+    prefix: &str,
+    name: &str,
+    shape: &[usize],
+    placement: ProjectionSharding,
+) -> Result<Option<usize>, Error> {
+    match placement {
+        ProjectionSharding::Replicated => Ok(None),
+        ProjectionSharding::Column if shape.is_empty() => Err(Error::Parallel(format!(
+            "column projection member {prefix}.{name} has scalar shape"
+        ))),
+        ProjectionSharding::Column => Ok(Some(0)),
+        ProjectionSharding::Row => match name {
+            "bias" | "inner.bias" => Ok(None),
+            "weight"
+            | "inner.weight"
+            | "weight_scale_inv"
+            | "inner.weight_scale_inv"
+            | "scales"
+            | "biases"
+                if shape.len() >= 2 =>
+            {
+                Ok(Some(1))
+            }
+            _ => Err(Error::Parallel(format!(
+                "unsupported row-projection member {prefix}.{name} with shape {shape:?}"
+            ))),
+        },
+    }
+}
+
+const fn greatest_common_divisor(mut left: usize, mut right: usize) -> usize {
+    while right != 0 {
+        let remainder = left % right;
+        left = right;
+        right = remainder;
+    }
+    left
+}
+
 /// Builds one typed member directly from an array parameter.
 pub(crate) fn array_parameter_member(
     target: impl Into<String>,
@@ -344,6 +493,7 @@ impl ParameterMemberSpec {
 pub struct ParameterGroupSpec {
     logical_name: String,
     role: ParameterRole,
+    partition_units: Option<usize>,
     members: Vec<ParameterMemberSpec>,
 }
 
@@ -354,7 +504,30 @@ impl ParameterGroupSpec {
         role: ParameterRole,
         members: impl IntoIterator<Item = ParameterMemberSpec>,
     ) -> Result<Self, Error> {
-        let logical_name = logical_name.into();
+        Self::build(logical_name.into(), role, None, members)
+    }
+
+    /// Creates a group whose partitioned members share one logical domain.
+    pub fn partitioned(
+        logical_name: impl Into<String>,
+        role: ParameterRole,
+        units: usize,
+        members: impl IntoIterator<Item = ParameterMemberSpec>,
+    ) -> Result<Self, Error> {
+        if units == 0 {
+            return Err(Error::Parallel(
+                "parallel logical partition must contain at least one unit".into(),
+            ));
+        }
+        Self::build(logical_name.into(), role, Some(units), members)
+    }
+
+    fn build(
+        logical_name: String,
+        role: ParameterRole,
+        partition_units: Option<usize>,
+        members: impl IntoIterator<Item = ParameterMemberSpec>,
+    ) -> Result<Self, Error> {
         if logical_name.trim().is_empty() {
             return Err(Error::Parallel(
                 "parallel parameter logical name must not be empty".into(),
@@ -367,6 +540,7 @@ impl ParameterGroupSpec {
             )));
         }
         let mut targets = BTreeSet::new();
+        let mut has_partitioned_member = false;
         for member in &members {
             if member.target.trim().is_empty() {
                 return Err(Error::Parallel(format!(
@@ -379,10 +553,20 @@ impl ParameterGroupSpec {
                     member.target
                 )));
             }
+            has_partitioned_member |= matches!(
+                member.sharding,
+                MemberSharding::Partitioned { .. } | MemberSharding::PartitionedSegments { .. }
+            );
+        }
+        if has_partitioned_member != partition_units.is_some() {
+            return Err(Error::Parallel(format!(
+                "parallel parameter group {logical_name:?} must declare exactly one group-level logical partition for its partitioned members"
+            )));
         }
         Ok(Self {
             logical_name,
             role,
+            partition_units,
             members,
         })
     }
@@ -395,6 +579,11 @@ impl ParameterGroupSpec {
     /// Returns the semantic role.
     pub const fn role(&self) -> ParameterRole {
         self.role
+    }
+
+    /// Returns the shared logical-unit count, when the group is partitioned.
+    pub const fn partition_units(&self) -> Option<usize> {
+        self.partition_units
     }
 
     /// Returns physical checkpoint members.
@@ -421,6 +610,8 @@ pub struct LocalTensorLayout {
     global_shape: Vec<usize>,
     local_shape: Vec<usize>,
     placement: TensorPlacement,
+    logical_units: Option<usize>,
+    logical_range: Option<Range<usize>>,
     fell_back_to_replication: bool,
 }
 
@@ -448,6 +639,21 @@ impl LocalTensorLayout {
     /// Returns the exact checkpoint placement.
     pub const fn placement(&self) -> &TensorPlacement {
         &self.placement
+    }
+
+    /// Returns the rank-local range in the parameter group's semantic domain.
+    ///
+    /// Physical packed weights and their quantization companions can use
+    /// different element ranges while still representing the same heads or
+    /// channels. This range is therefore the authoritative source for local
+    /// execution geometry.
+    pub fn logical_range(&self) -> Option<&Range<usize>> {
+        self.logical_range.as_ref()
+    }
+
+    /// Returns the size of the complete semantic partition domain.
+    pub const fn logical_units(&self) -> Option<usize> {
+        self.logical_units
     }
 
     /// Returns whether permissive planning replicated an unsupported shard.
@@ -525,7 +731,7 @@ impl ParallelPlanBuilder {
         let requested = group
             .members
             .iter()
-            .map(|member| self.resolve_member(member))
+            .map(|member| self.resolve_member(member, group.partition_units))
             .collect::<Result<Vec<_>, _>>();
         let (resolved, fell_back) = match requested {
             Ok(resolved) => (resolved, false),
@@ -544,6 +750,19 @@ impl ParallelPlanBuilder {
                 )))
             }
         };
+        let logical_range = match (group.partition_units, fell_back) {
+            (Some(units), false) => Some(
+                balanced_contiguous_range(
+                    units,
+                    self.topology.tensor_parallel_size,
+                    self.topology.tensor_parallel_rank,
+                    false,
+                )
+                .map_err(|error| Error::Parallel(error.to_string()))?,
+            ),
+            (Some(units), true) => Some(0..units),
+            (None, _) => None,
+        };
 
         for (member, (placement, local_shape)) in group.members.iter().zip(resolved) {
             self.placement.insert_expected(
@@ -559,6 +778,8 @@ impl ParallelPlanBuilder {
                     global_shape: member.global_shape.clone(),
                     local_shape,
                     placement,
+                    logical_units: group.partition_units,
+                    logical_range: logical_range.clone(),
                     fell_back_to_replication: fell_back,
                 },
             );
@@ -575,6 +796,7 @@ impl ParallelPlanBuilder {
     fn resolve_member(
         &self,
         member: &ParameterMemberSpec,
+        partition_units: Option<usize>,
     ) -> Result<(TensorPlacement, Vec<usize>), String> {
         let rank = self.topology.tensor_parallel_rank;
         let parts = self.topology.tensor_parallel_size;
@@ -615,6 +837,89 @@ impl ParallelPlanBuilder {
                         axis: *axis,
                         start: range.start,
                         end: range.end,
+                    },
+                    local_shape,
+                ))
+            }
+            MemberSharding::Partitioned { axis } => {
+                let units = partition_units.ok_or_else(|| {
+                    format!(
+                        "tensor {:?} has no group-level logical partition",
+                        member.target
+                    )
+                })?;
+                let dimension = checked_axis(member, *axis)?;
+                if dimension % units != 0 {
+                    return Err(format!(
+                        "tensor {:?} dimension {dimension} on axis {axis} does not contain {units} integral logical units",
+                        member.target
+                    ));
+                }
+                let logical = balanced_contiguous_range(units, parts, rank, false)
+                    .map_err(|error| error.to_string())?;
+                let elements_per_unit = dimension / units;
+                let range = (logical.start * elements_per_unit)..(logical.end * elements_per_unit);
+                let mut local_shape = member.global_shape.clone();
+                local_shape[*axis] = range.len();
+                Ok((
+                    TensorPlacement::Range {
+                        axis: *axis,
+                        start: range.start,
+                        end: range.end,
+                    },
+                    local_shape,
+                ))
+            }
+            MemberSharding::PartitionedSegments { axis, segments } => {
+                let units = partition_units.ok_or_else(|| {
+                    format!(
+                        "tensor {:?} has no group-level logical partition",
+                        member.target
+                    )
+                })?;
+                let dimension = checked_axis(member, *axis)?;
+                if segments.is_empty() {
+                    return Err(format!(
+                        "tensor {:?} partitioned placement has no segments",
+                        member.target
+                    ));
+                }
+                let logical = balanced_contiguous_range(units, parts, rank, false)
+                    .map_err(|error| error.to_string())?;
+                let mut indices = Vec::new();
+                let mut previous_end = 0usize;
+                for segment in segments {
+                    if segment.start >= segment.end || segment.end > dimension {
+                        return Err(format!(
+                            "tensor {:?} segment {:?} is invalid for axis-{axis} dimension {dimension}",
+                            member.target, segment
+                        ));
+                    }
+                    if segment.start < previous_end {
+                        return Err(format!(
+                            "tensor {:?} partitioned ranges overlap or are out of order",
+                            member.target
+                        ));
+                    }
+                    previous_end = segment.end;
+                    if !segment.len().is_multiple_of(units) {
+                        return Err(format!(
+                            "tensor {:?} segment {:?} does not contain {units} integral logical units",
+                            member.target, segment
+                        ));
+                    }
+                    let elements_per_unit = segment.len() / units;
+                    indices.extend(
+                        (segment.start + logical.start * elements_per_unit)
+                            ..(segment.start + logical.end * elements_per_unit),
+                    );
+                }
+                let mut local_shape = member.global_shape.clone();
+                local_shape[*axis] = indices.len();
+                Ok((
+                    TensorPlacement::Indices {
+                        axis: *axis,
+                        indices,
                     },
                     local_shape,
                 ))
@@ -933,5 +1238,154 @@ mod tests {
             )
             .unwrap_err();
         assert!(error.to_string().contains("not divisible"));
+    }
+
+    #[test]
+    fn aligned_members_share_an_uneven_logical_range() {
+        let expected = [(0..8, 0..4), (8..16, 4..8), (16..20, 8..10)];
+        for (rank, (weight_range, scale_range)) in expected.into_iter().enumerate() {
+            let mut planner = ParallelPlanBuilder::new(topology(rank, 3));
+            planner
+                .register(
+                    ParameterGroupSpec::partitioned(
+                        "aligned.quantized",
+                        ParameterRole::RowProjection,
+                        5,
+                        [
+                            ParameterMemberSpec::new(
+                                "weight",
+                                [8, 20],
+                                MemberSharding::Partitioned { axis: 1 },
+                            ),
+                            ParameterMemberSpec::new(
+                                "scales",
+                                [8, 10],
+                                MemberSharding::Partitioned { axis: 1 },
+                            ),
+                        ],
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+            let (_, local) = planner.finish().unwrap();
+            assert_eq!(local.tensor("weight").unwrap().logical_units(), Some(5));
+            assert_eq!(
+                local.tensor("weight").unwrap().logical_range(),
+                Some(&(rank.min(2) * 2..(rank * 2 + 2).min(5)))
+            );
+            assert_eq!(
+                local.tensor("weight").unwrap().placement(),
+                &TensorPlacement::Range {
+                    axis: 1,
+                    start: weight_range.start,
+                    end: weight_range.end,
+                }
+            );
+            assert_eq!(
+                local.tensor("scales").unwrap().placement(),
+                &TensorPlacement::Range {
+                    axis: 1,
+                    start: scale_range.start,
+                    end: scale_range.end,
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn partitioned_segments_and_packed_axis_share_one_logical_range() {
+        let expected = [
+            (vec![0, 1, 2, 3, 10, 11, 12, 13], 0..6),
+            (vec![4, 5, 6, 7, 14, 15, 16, 17], 6..12),
+            (vec![8, 9, 18, 19], 12..15),
+        ];
+        for (rank, (gate_up_indices, down_range)) in expected.into_iter().enumerate() {
+            let mut planner = ParallelPlanBuilder::new(topology(rank, 3));
+            planner
+                .register(
+                    ParameterGroupSpec::partitioned(
+                        "experts.intermediate",
+                        ParameterRole::ExpertIntermediate,
+                        5,
+                        [
+                            ParameterMemberSpec::new(
+                                "gate_up",
+                                [4, 20, 8],
+                                MemberSharding::PartitionedSegments {
+                                    axis: 1,
+                                    segments: vec![0..10, 10..20],
+                                },
+                            ),
+                            ParameterMemberSpec::new(
+                                "down.packed",
+                                [4, 8, 15],
+                                MemberSharding::Partitioned { axis: 2 },
+                            ),
+                        ],
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+            let (_, local) = planner.finish().unwrap();
+            assert_eq!(
+                local.tensor("gate_up").unwrap().placement(),
+                &TensorPlacement::Indices {
+                    axis: 1,
+                    indices: gate_up_indices,
+                }
+            );
+            assert_eq!(
+                local.tensor("down.packed").unwrap().placement(),
+                &TensorPlacement::Range {
+                    axis: 2,
+                    start: down_range.start,
+                    end: down_range.end,
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn partitioned_members_require_one_group_level_domain() {
+        let error = ParameterGroupSpec::new(
+            "missing-domain",
+            ParameterRole::AttentionHeads,
+            [ParameterMemberSpec::new(
+                "query",
+                [12, 8],
+                MemberSharding::Partitioned { axis: 0 },
+            )],
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("group-level logical partition"));
+    }
+
+    #[test]
+    fn aligned_groups_reject_more_ranks_than_units() {
+        let mut planner = ParallelPlanBuilder::new(topology(0, 3));
+        let error = planner
+            .register(
+                ParameterGroupSpec::partitioned(
+                    "too-few-head-groups",
+                    ParameterRole::AttentionHeads,
+                    2,
+                    [ParameterMemberSpec::new(
+                        "key",
+                        [8, 8],
+                        MemberSharding::Partitioned { axis: 0 },
+                    )],
+                )
+                .unwrap(),
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("non-empty"));
+    }
+
+    #[test]
+    fn quantized_alignment_combines_complete_semantic_units() {
+        assert_eq!(aligned_partition_units("GQA", 6, 16, 32).unwrap(), 3);
+        assert_eq!(aligned_partition_units("SwiGLU", 96, 1, 32).unwrap(), 3);
+        let error = aligned_partition_units("GQA", 3, 16, 32).unwrap_err();
+        assert!(error.to_string().contains("cannot form complete"));
     }
 }

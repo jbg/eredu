@@ -9,7 +9,6 @@ use std::{
 use safemlx::{random::RandomState, Array, Device, DeviceType, Dtype, ExecutionContext, Stream};
 use safemlx_codec::mimi::Mimi;
 use safemlx_lm::{
-    api::realtime::RealtimeSpeechModel,
     architectures::moshi::{model as moshi, personaplex},
     runtime::generation::sampler::{DefaultSampler, GenerationSampler},
 };
@@ -435,7 +434,7 @@ fn encode_pcm(mimi: &mut Mimi, pcm: &[f32], stream: &Stream) -> EvalResult<Vec<V
 }
 
 fn warmup(model: &mut moshi::Model, input: &[i32], stream: &Stream) -> EvalResult<()> {
-    let mut state = model.new_realtime_state();
+    let mut state = moshi::GenerationState::new(model);
     let mut text_sampler = DefaultSampler;
     let mut audio_samplers = (0..model.args.dep_q)
         .map(|_| DefaultSampler)
@@ -468,7 +467,7 @@ fn prompted_state(
     prompt: &PromptConditioning,
     stream: &Stream,
 ) -> EvalResult<moshi::GenerationState> {
-    let mut state = model.new_realtime_state();
+    let mut state = moshi::GenerationState::new(model);
     let mut text_sampler = DefaultSampler;
     let mut audio_samplers = (0..model.args.dep_q)
         .map(|_| DefaultSampler)

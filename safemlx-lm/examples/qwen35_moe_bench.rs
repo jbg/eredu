@@ -6,7 +6,7 @@ use safemlx::{
     Array, ExecutionContext, Stream,
 };
 use safemlx_lm::api::{LoadedModel, ModelLoadOptions};
-use safemlx_lm::architectures::qwen::hybrid::qwen3_5 as qwen3_5_moe;
+use safemlx_lm::architectures::qwen::hybrid::qwen3_5;
 use safemlx_lm::runtime::checkpoint::quantization::AffineQuantization;
 use safemlx_lm::runtime::media::input::{InputPart, ModelInput};
 
@@ -128,7 +128,7 @@ fn main() -> anyhow::Result<()> {
             print_profile(name, "decode", result.decode_s, stats);
         }
     }
-    qwen3_5_moe::set_perf_profiling(false);
+    qwen3_5::set_perf_profiling(false);
 
     Ok(())
 }
@@ -142,8 +142,8 @@ struct BenchResult {
     first_id: u32,
     last_id: u32,
     ids: Vec<u32>,
-    prefill_profile: Option<qwen3_5_moe::PerfStats>,
-    decode_profile: Option<qwen3_5_moe::PerfStats>,
+    prefill_profile: Option<qwen3_5::PerfStats>,
+    decode_profile: Option<qwen3_5::PerfStats>,
 }
 
 fn run_case(
@@ -161,8 +161,8 @@ fn run_case(
     let mut generator = model.generate_input_with_cache(&mut cache, 0.0, input, None, stream);
     let mut ids = Vec::with_capacity(decode_tokens);
 
-    qwen3_5_moe::set_perf_profiling(profile_components);
-    qwen3_5_moe::reset_perf_stats();
+    qwen3_5::set_perf_profiling(profile_components);
+    qwen3_5::reset_perf_stats();
     let prefill_start = Instant::now();
     let Some(first) = generator.next() else {
         anyhow::bail!("generator produced no tokens");
@@ -170,10 +170,10 @@ fn run_case(
     let first = first?;
     eval([&first])?;
     let prefill_s = prefill_start.elapsed().as_secs_f64();
-    let prefill_profile = profile_components.then(qwen3_5_moe::perf_stats).flatten();
+    let prefill_profile = profile_components.then(qwen3_5::perf_stats).flatten();
     ids.push(first.item::<u32>(stream));
 
-    qwen3_5_moe::reset_perf_stats();
+    qwen3_5::reset_perf_stats();
     let decode_start = Instant::now();
     for _ in 1..decode_tokens {
         let Some(token) = generator.next() else {
@@ -184,8 +184,8 @@ fn run_case(
         ids.push(token.item::<u32>(stream));
     }
     let decode_s = decode_start.elapsed().as_secs_f64();
-    let decode_profile = profile_components.then(qwen3_5_moe::perf_stats).flatten();
-    qwen3_5_moe::set_perf_profiling(false);
+    let decode_profile = profile_components.then(qwen3_5::perf_stats).flatten();
+    qwen3_5::set_perf_profiling(false);
 
     let decode_count = ids.len().saturating_sub(1);
     let decode_tok_s = if decode_count == 0 {
@@ -210,7 +210,7 @@ fn run_case(
     })
 }
 
-fn print_profile(case: &str, phase: &str, total_s: f64, stats: &qwen3_5_moe::PerfStats) {
+fn print_profile(case: &str, phase: &str, total_s: f64, stats: &qwen3_5::PerfStats) {
     let component_total_s = stats.component_total_s();
     println!(
         "profile,{case},{phase},{total_s:.6},{component_total_s:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6}",

@@ -26,6 +26,7 @@ use safemlx_lm::{
     runtime::execution::layerwise::LayerwiseLoadOptions,
     runtime::residency::expert_cache::{
         ExpertCache, ExpertCacheLoadOptions, ExpertCatalogEntry, ExpertIdentity, ExpertPass,
+        ExpertRouteBatch,
     },
     runtime::residency::manager::{OffloadUnit, WeightBinding},
     runtime::residency::policy::OffloadConfig,
@@ -149,11 +150,13 @@ fn execute_cached_qwen_routes(
     stream: &Stream,
 ) -> Result<Array, Error> {
     Ok(cache.execute_routes_bounded(
-        0,
-        &routes.hidden,
-        &routes.global_expert_ids,
-        &routes.weights,
-        pass,
+        ExpertRouteBatch::new(
+            0,
+            &routes.hidden,
+            &routes.global_expert_ids,
+            &routes.weights,
+            pass,
+        ),
         stream,
         |hidden, acquired, _weights, stream| {
             let started = Instant::now();

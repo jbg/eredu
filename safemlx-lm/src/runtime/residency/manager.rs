@@ -32,6 +32,7 @@ use crate::{
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct WeightBinding {
     name: String,
+    logical_target: Option<String>,
     checkpoint_key: String,
     selection: TensorSelection,
     recipe: Option<DerivedWeightRecipe>,
@@ -59,6 +60,7 @@ impl WeightBinding {
         }
         Ok(Self {
             name,
+            logical_target: None,
             checkpoint_key,
             selection,
             recipe: None,
@@ -93,6 +95,7 @@ impl WeightBinding {
         }
         Ok(Self {
             name,
+            logical_target: None,
             checkpoint_key,
             selection: TensorSelection::Full,
             recipe: Some(recipe),
@@ -103,6 +106,26 @@ impl WeightBinding {
     /// Returns the stable name used to look up a resident array.
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    /// Returns the architecture-logical parameter target, when it differs
+    /// from the physical checkpoint source selected by this binding.
+    pub(crate) fn logical_target(&self) -> Option<&str> {
+        self.logical_target.as_deref()
+    }
+
+    /// Attaches the architecture-logical destination used by structural and
+    /// distributed placement plans.
+    pub(crate) fn with_logical_target(
+        mut self,
+        target: impl Into<String>,
+    ) -> Result<Self, ResidencyError> {
+        let target = target.into();
+        if target.trim().is_empty() {
+            return Err(ResidencyError::InvalidBindingName);
+        }
+        self.logical_target = Some(target);
+        Ok(self)
     }
 
     /// Returns the source checkpoint key.

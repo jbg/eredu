@@ -224,10 +224,8 @@ impl MetadataValue {
 /// Numeric codes and block geometry are pinned to llama.cpp commit
 /// `c0bc8591e8815c63cb01dd3f051a8b0df02501c9` (`ggml/include/ggml.h`,
 /// `ggml/src/ggml-common.h`, and `ggml/src/ggml.c`). The three
-/// `IQ4_NL_*_*` entries are retained only so their historical numeric codes do
-/// not become [`Unknown`](Self::Unknown): that upstream revision explicitly
-/// marks them as removed runtime-repacking layouts with zero block and type
-/// sizes, not GGUF tensor encodings.
+/// `IQ4_NL_*_*` entries identify diagnostic codes with zero block and type
+/// sizes. They are not accepted as GGUF tensor encodings.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum GgmlType {
     F32,

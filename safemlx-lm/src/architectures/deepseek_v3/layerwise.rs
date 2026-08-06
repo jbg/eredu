@@ -40,19 +40,20 @@ use crate::{
     runtime::checkpoint::recipe::DerivedWeightRecipe,
     runtime::checkpoint::store::{GgufWeightStore, TensorSelection, WeightStore},
     runtime::distributed::parallel::{
-        register_projection_module, register_replicated_module, MemberSharding,
-        ParallelPlanBuilder, ParameterGroupSpec, ParameterMemberSpec, ParameterRole,
-        ProjectionSharding,
+        aligned_partition_units, array_parameter_member, partitioned_projection_members,
+        register_partitioned_projection_group, register_projection_module,
+        register_replicated_module, MemberSharding, ParallelPlanBuilder, ParameterGroupSpec,
+        ParameterRole, ProjectionSharding,
     },
     runtime::execution::layerwise::{
         load_layerwise_model, load_safetensors_layerwise_model,
-        load_tensor_parallel_layerwise_model, open_safetensors_weight_store, ArchitectureAdapter,
-        LayerExecutionLoadOptions, LayerwiseForwardState, LayerwiseModel, StaticUnitBindings,
-        WeightResidency,
+        load_tensor_parallel_layerwise_model, open_safetensors_weight_store,
+        transformed_module_weight_store, ArchitectureAdapter, LayerExecutionLoadOptions,
+        LayerwiseForwardState, LayerwiseModel, StaticUnitBindings, WeightResidency,
     },
     runtime::residency::expert_cache::{
         ExpertCache, ExpertCacheError, ExpertCacheLoadOptions, ExpertCacheReport,
-        ExpertCatalogEntry, ExpertIdentity, ExpertPass,
+        ExpertCatalogEntry, ExpertIdentity, ExpertPass, ExpertRouteBatch,
     },
     runtime::residency::manager::{OffloadUnit, ResidencyReport, ResidentUnitLease, WeightBinding},
 };
@@ -214,11 +215,6 @@ impl DeepSeekV3LayerwiseModel {
             .forward_tensor_parallel(inputs, cache, group, stream)
     }
 
-    /// Backward-compatible alias for [`Self::checkpoint_store`].
-    pub fn weight_store(&self) -> &(dyn WeightStore + Send + Sync) {
-        self.checkpoint_store()
-    }
-
     /// Runs MLA and dense/MoE decoder blocks while preserving compressed state.
     pub fn forward(
         &mut self,
@@ -227,6 +223,18 @@ impl DeepSeekV3LayerwiseModel {
         stream: &Stream,
     ) -> Result<Array, Error> {
         self.execution.forward(inputs, cache, stream)
+    }
+
+    /// Runs the canonical execution path with stable per-layer observation points.
+    pub fn forward_with_observer(
+        &mut self,
+        inputs: &Array,
+        cache: &mut Cache,
+        stream: &Stream,
+        observer: &mut dyn crate::runtime::execution::inspection::ActivationObserver,
+    ) -> Result<Array, Error> {
+        self.execution
+            .forward_with_observer(inputs, cache, stream, observer)
     }
 
     /// Runs streamed layers while delegating routed experts to a caller.
@@ -311,6 +319,24 @@ pub fn load_deepseek_v3_layerwise_model(
             model_dir,
             adapter,
             options,
+            stream,
+            weights_stream,
+        )?,
+    })
+}
+
+pub(crate) fn execute_transformed_deepseek_v3_model(
+    model: resident::Model,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<DeepSeekV3LayerwiseModel, Error> {
+    let adapter = DeepSeekV3LayerwiseAdapter::new(model.args.clone(), stream)?;
+    let store = transformed_module_weight_store(&model)?;
+    Ok(DeepSeekV3LayerwiseModel {
+        execution: load_layerwise_model(
+            store,
+            adapter,
+            LayerExecutionLoadOptions::FullyResident,
             stream,
             weights_stream,
         )?,
@@ -464,11 +490,13 @@ pub(crate) fn load_deepseek_v3_gguf_layerwise_model(
                 prepared.eos_token_ids,
             ));
         }
-        WeightResidency::FullyResident => {
-            return Err(Error::UnsupportedArchitecture(
-                "the bounded GGUF DeepSeek loader does not accept fully resident policy".into(),
-            ));
-        }
+        WeightResidency::FullyResident => load_layerwise_model(
+            store,
+            DeepSeekV3LayerwiseAdapter::new(args, stream)?,
+            LayerExecutionLoadOptions::FullyResident,
+            stream,
+            weights_stream,
+        )?,
     };
     Ok((
         DeepSeekV3LayerwiseModel { execution },
@@ -544,7 +572,7 @@ fn load_deepseek_gguf_sparse_with_store(
 ) -> Result<DeepSeekV3LayerwiseModel, Error> {
     let adapter = DeepSeekV3LayerwiseAdapter::new_sparse(args.clone(), stream)?;
     let mut execution = load_layerwise_model(store, adapter, non_expert, stream, weights_stream)?;
-    let checkpoint_store = execution.weight_store_arc();
+    let checkpoint_store = execution.checkpoint_store_arc();
     let entries = deepseek_expert_catalog(&args, checkpoint_store.as_ref())?;
     execution.adapter_mut().expert_cache = Some(ExpertCache::new_shared(
         checkpoint_store,
@@ -622,7 +650,7 @@ fn load_deepseek_v3_sparse_expert_cache_model_with_non_expert(
     let adapter = DeepSeekV3LayerwiseAdapter::new_sparse(args.clone(), stream)?;
     let mut execution =
         load_safetensors_layerwise_model(model_dir, adapter, non_expert, stream, weights_stream)?;
-    let store = execution.weight_store_arc();
+    let store = execution.checkpoint_store_arc();
     let entries = deepseek_expert_catalog(&args, store.as_ref())?;
     let cache = ExpertCache::new_shared(
         store,
@@ -784,33 +812,62 @@ fn register_deepseek_layer_parallel_plan(
 ) -> Result<(), Error> {
     let prefix = format!("model.layers.{index}");
     let attention = &layer.self_attn;
+    let attention_prefix = format!("{prefix}.self_attn");
+    let mut projection_names = Vec::new();
     for (name, projection) in [
         ("q_proj", attention.q_proj.as_ref()),
         ("q_b_proj", attention.q_b_proj.as_ref()),
         ("kv_b_proj", attention.kv_b_proj.as_ref()),
     ] {
         if let Some(projection) = projection {
-            register_projection_module(
-                planner,
+            projection_names.push((
                 projection,
-                &format!("{prefix}.self_attn.{name}"),
+                format!("{attention_prefix}.{name}"),
                 ProjectionSharding::Column,
-            )?;
+            ));
         }
     }
+    projection_names.push((
+        &attention.o_proj,
+        format!("{attention_prefix}.o_proj"),
+        ProjectionSharding::Row,
+    ));
+    let projections = projection_names
+        .iter()
+        .map(|(projection, name, sharding)| (*projection, name.as_str(), *sharding))
+        .collect::<Vec<_>>();
+    let preferred_heads = usize::try_from(attention.num_heads)
+        .map_err(|_| Error::Parallel("DeepSeek MLA head count exceeds usize".into()))?;
+    let (mut head_units, mut head_members) =
+        partitioned_projection_members(&projections, preferred_heads)?;
+    let mut packed_names = Vec::new();
     for (name, projection) in [
         ("k_b_proj", attention.k_b_proj.as_ref()),
         ("v_b_proj", attention.v_b_proj.as_ref()),
     ] {
         if let Some(projection) = projection {
-            register_projection_module(
-                planner,
+            packed_names.push((
                 projection,
-                &format!("{prefix}.self_attn.{name}"),
+                format!("{attention_prefix}.{name}"),
                 ProjectionSharding::Column,
-            )?;
+            ));
         }
     }
+    if !packed_names.is_empty() {
+        let packed = packed_names
+            .iter()
+            .map(|(projection, name, sharding)| (*projection, name.as_str(), *sharding))
+            .collect::<Vec<_>>();
+        let (packed_units, packed_members) = partitioned_projection_members(&packed, head_units)?;
+        head_units = packed_units;
+        head_members.extend(packed_members);
+    }
+    planner.register(ParameterGroupSpec::partitioned(
+        format!("{attention_prefix}.heads"),
+        ParameterRole::AttentionHeads,
+        head_units,
+        head_members,
+    )?)?;
     for (name, projection) in [
         ("q_a_proj", attention.q_a_proj.as_ref()),
         ("kv_a_proj_with_mqa", Some(&attention.kv_a_proj_with_mqa)),
@@ -824,12 +881,6 @@ fn register_deepseek_layer_parallel_plan(
             )?;
         }
     }
-    register_projection_module(
-        planner,
-        &attention.o_proj,
-        &format!("{prefix}.self_attn.o_proj"),
-        ProjectionSharding::Row,
-    )?;
     for (name, module) in [
         ("q_a_layernorm", attention.q_a_layernorm.as_ref()),
         ("kv_a_layernorm", Some(&attention.kv_a_layernorm)),
@@ -851,110 +902,125 @@ fn register_deepseek_layer_parallel_plan(
     }
     let register_mlp = |planner: &mut ParallelPlanBuilder,
                         mlp: &resident::Mlp,
-                        prefix: &str|
+                        prefix: &str,
+                        intermediate: i32|
      -> Result<(), Error> {
-        for (name, projection, sharding) in [
-            ("gate_proj", &mlp.gate_proj, ProjectionSharding::Column),
-            ("up_proj", &mlp.up_proj, ProjectionSharding::Column),
-            ("down_proj", &mlp.down_proj, ProjectionSharding::Row),
-        ] {
-            register_projection_module(planner, projection, &format!("{prefix}.{name}"), sharding)?;
-        }
-        Ok(())
+        let intermediate = usize::try_from(intermediate)
+            .map_err(|_| Error::Parallel("DeepSeek feed-forward width exceeds usize".into()))?;
+        let gate = format!("{prefix}.gate_proj");
+        let up = format!("{prefix}.up_proj");
+        let down = format!("{prefix}.down_proj");
+        register_partitioned_projection_group(
+            planner,
+            &format!("{prefix}.intermediate"),
+            ParameterRole::FeedForwardIntermediate,
+            &[
+                (&mlp.gate_proj, gate.as_str(), ProjectionSharding::Column),
+                (&mlp.up_proj, up.as_str(), ProjectionSharding::Column),
+                (&mlp.down_proj, down.as_str(), ProjectionSharding::Row),
+            ],
+            intermediate,
+        )
     };
     match &layer.mlp {
-        resident::FeedForward::Dense(mlp) => register_mlp(planner, mlp, &format!("{prefix}.mlp"))?,
+        resident::FeedForward::Dense(mlp) => register_mlp(
+            planner,
+            mlp,
+            &format!("{prefix}.mlp"),
+            mlp.gate_proj.output_dims,
+        )?,
         resident::FeedForward::Moe(moe) => {
             register_replicated_module(planner, &moe.gate, &format!("{prefix}.mlp.gate"))?;
             register_mlp(
                 planner,
                 &moe.shared_experts,
                 &format!("{prefix}.mlp.shared_experts"),
+                moe.shared_experts.gate_proj.output_dims,
             )?;
             let experts = &moe.experts;
-            let banks = [
-                (
-                    "gate_proj",
-                    experts.gate_proj.as_ref().as_ref(),
-                    MemberSharding::Equal { axis: 0 },
-                ),
-                (
-                    "gate_proj.weight_scale_inv",
-                    experts.gate_proj_scale_inv.as_ref().as_ref(),
-                    MemberSharding::Equal { axis: 0 },
-                ),
-                (
-                    "gate_proj.scales",
-                    experts.gate_proj_scales.as_ref().as_ref(),
-                    MemberSharding::Equal { axis: 0 },
-                ),
-                (
-                    "gate_proj.biases",
-                    experts.gate_proj_biases.as_ref().as_ref(),
-                    MemberSharding::Equal { axis: 0 },
-                ),
-                (
-                    "up_proj",
-                    experts.up_proj.as_ref().as_ref(),
-                    MemberSharding::Equal { axis: 0 },
-                ),
-                (
-                    "up_proj.weight_scale_inv",
-                    experts.up_proj_scale_inv.as_ref().as_ref(),
-                    MemberSharding::Equal { axis: 0 },
-                ),
-                (
-                    "up_proj.scales",
-                    experts.up_proj_scales.as_ref().as_ref(),
-                    MemberSharding::Equal { axis: 0 },
-                ),
-                (
-                    "up_proj.biases",
-                    experts.up_proj_biases.as_ref().as_ref(),
-                    MemberSharding::Equal { axis: 0 },
-                ),
-                (
-                    "down_proj",
-                    experts.down_proj.as_ref().as_ref(),
-                    MemberSharding::Equal { axis: 1 },
-                ),
-                (
-                    "down_proj.weight_scale_inv",
-                    experts.down_proj_scale_inv.as_ref().as_ref(),
-                    MemberSharding::Equal { axis: 1 },
-                ),
-                (
-                    "down_proj.scales",
-                    experts.down_proj_scales.as_ref().as_ref(),
-                    MemberSharding::Equal { axis: 1 },
-                ),
-                (
-                    "down_proj.biases",
-                    experts.down_proj_biases.as_ref().as_ref(),
-                    MemberSharding::Equal { axis: 1 },
-                ),
-            ];
-            for expert in 0..experts.num_experts {
-                for (suffix, bank, sharding) in &banks {
-                    let Some(bank) = bank else { continue };
-                    let shape = bank.shape()[1..]
-                        .iter()
-                        .map(|dimension| {
-                            usize::try_from(*dimension).map_err(|_| {
-                                Error::Parallel("DeepSeek expert shape exceeds usize".into())
-                            })
+            let intermediate = usize::try_from(experts.intermediate_size).map_err(|_| {
+                Error::Parallel("DeepSeek routed-expert width exceeds usize".into())
+            })?;
+            let down_alignment = if experts.use_fp8 {
+                128
+            } else {
+                experts
+                    .down_affine
+                    .or(experts.down_iquant)
+                    .map_or(Ok(1usize), |quantization| {
+                        usize::try_from(quantization.group_size()).map_err(|_| {
+                            Error::Parallel(
+                                "DeepSeek expert quantization group exceeds usize".into(),
+                            )
                         })
-                        .collect::<Result<Vec<_>, _>>()?;
-                    let (projection, component) =
-                        suffix.split_once('.').unwrap_or((suffix, "weight"));
-                    let target = format!("{prefix}.mlp.experts.{expert}.{projection}.{component}");
-                    planner.register(ParameterGroupSpec::new(
-                        target.clone(),
-                        ParameterRole::ExpertIntermediate,
-                        [ParameterMemberSpec::new(target, shape, sharding.clone())],
-                    )?)?;
+                    })?
+            };
+            let expert_units = aligned_partition_units(
+                &format!("{prefix}.mlp.experts.intermediate"),
+                intermediate,
+                1,
+                down_alignment,
+            )?;
+            let mut members = Vec::new();
+            for (name, value) in [
+                ("gate_proj", experts.gate_proj.as_ref().as_ref()),
+                (
+                    "gate_proj_scale_inv",
+                    experts.gate_proj_scale_inv.as_ref().as_ref(),
+                ),
+                (
+                    "gate_proj_scales",
+                    experts.gate_proj_scales.as_ref().as_ref(),
+                ),
+                (
+                    "gate_proj_biases",
+                    experts.gate_proj_biases.as_ref().as_ref(),
+                ),
+                ("up_proj", experts.up_proj.as_ref().as_ref()),
+                (
+                    "up_proj_scale_inv",
+                    experts.up_proj_scale_inv.as_ref().as_ref(),
+                ),
+                ("up_proj_scales", experts.up_proj_scales.as_ref().as_ref()),
+                ("up_proj_biases", experts.up_proj_biases.as_ref().as_ref()),
+            ] {
+                if let Some(value) = value {
+                    members.push(array_parameter_member(
+                        format!("{prefix}.mlp.experts.{name}"),
+                        value,
+                        MemberSharding::Partitioned { axis: 1 },
+                    )?);
                 }
             }
+            for (name, value) in [
+                ("down_proj", experts.down_proj.as_ref().as_ref()),
+                (
+                    "down_proj_scale_inv",
+                    experts.down_proj_scale_inv.as_ref().as_ref(),
+                ),
+                (
+                    "down_proj_scales",
+                    experts.down_proj_scales.as_ref().as_ref(),
+                ),
+                (
+                    "down_proj_biases",
+                    experts.down_proj_biases.as_ref().as_ref(),
+                ),
+            ] {
+                if let Some(value) = value {
+                    members.push(array_parameter_member(
+                        format!("{prefix}.mlp.experts.{name}"),
+                        value,
+                        MemberSharding::Partitioned { axis: 2 },
+                    )?);
+                }
+            }
+            planner.register(ParameterGroupSpec::partitioned(
+                format!("{prefix}.mlp.experts.intermediate"),
+                ParameterRole::ExpertIntermediate,
+                expert_units,
+                members,
+            )?)?;
         }
     }
     Ok(())
@@ -1031,8 +1097,17 @@ impl ArchitectureAdapter for DeepSeekV3LayerwiseAdapter {
     }
 
     fn static_units(&self, store: &dyn WeightStore) -> Result<Vec<StaticUnitBindings>, Error> {
-        Ok(vec![
-            StaticUnitBindings::new(
+        self.selected_static_units(store, &|_| true)
+    }
+
+    fn selected_static_units(
+        &self,
+        store: &dyn WeightStore,
+        select: &dyn Fn(&str) -> bool,
+    ) -> Result<Vec<StaticUnitBindings>, Error> {
+        let mut units = Vec::new();
+        if select(EMBEDDING_UNIT) {
+            units.push(StaticUnitBindings::new(
                 EMBEDDING_UNIT,
                 build_module_bindings_with_recipes(
                     &self.embedding,
@@ -1040,8 +1115,10 @@ impl ArchitectureAdapter for DeepSeekV3LayerwiseAdapter {
                     store,
                     BTreeMap::new(),
                 )?,
-            )?,
-            StaticUnitBindings::new(
+            )?);
+        }
+        if select(NORM_UNIT) {
+            units.push(StaticUnitBindings::new(
                 NORM_UNIT,
                 build_module_bindings_with_recipes(
                     &self.norm,
@@ -1049,8 +1126,10 @@ impl ArchitectureAdapter for DeepSeekV3LayerwiseAdapter {
                     store,
                     BTreeMap::new(),
                 )?,
-            )?,
-            StaticUnitBindings::new(
+            )?);
+        }
+        if select(HEAD_UNIT) {
+            units.push(StaticUnitBindings::new(
                 HEAD_UNIT,
                 build_module_bindings_with_recipes(
                     &self.lm_head,
@@ -1058,8 +1137,9 @@ impl ArchitectureAdapter for DeepSeekV3LayerwiseAdapter {
                     store,
                     BTreeMap::new(),
                 )?,
-            )?,
-        ])
+            )?);
+        }
+        Ok(units)
     }
 
     fn populate_static(&mut self, leases: &[ResidentUnitLease]) -> Result<(), Error> {
@@ -1150,18 +1230,10 @@ impl ArchitectureAdapter for DeepSeekV3LayerwiseAdapter {
         })
     }
 
-    fn execution_group_count(&self) -> usize {
-        1
-    }
-
-    fn execution_group_id(&self, group: usize) -> Result<String, Error> {
-        if group == 0 {
-            Ok("text_decoder".into())
-        } else {
-            Err(Error::UnsupportedArchitecture(format!(
-                "DeepSeek-V3 decoder has no execution group {group}"
-            )))
-        }
+    fn execution_graph(
+        &self,
+    ) -> Result<crate::runtime::execution::layerwise::ExecutionGroupDag, Error> {
+        crate::runtime::execution::layerwise::ExecutionGroupDag::chain(["text_decoder"])
     }
 
     fn layer_count(&self, group: usize) -> Result<usize, Error> {
@@ -1256,16 +1328,56 @@ impl ArchitectureAdapter for DeepSeekV3LayerwiseAdapter {
         let attention = tensor("self_attn.q_proj")
             .or_else(|| tensor("self_attn.q_b_proj"))
             .ok_or_else(|| Error::Parallel(format!("missing TP layout for {prefix} MLA query")))?;
-        let mut args = self.args.clone();
-        args.num_attention_heads =
-            attention.local_shape()[0] as i32 / (args.qk_nope_head_dim + args.qk_rope_head_dim);
-        if let Some(gate) = tensor("mlp.gate_proj") {
-            args.intermediate_size = gate.local_shape()[0] as i32;
-        }
-        if let Some(gate) = layout.tensor(&format!("{prefix}.mlp.experts.gate_proj")) {
-            args.moe_intermediate_size = gate.local_shape()[1] as i32;
-        }
-        Ok(DecoderLayer::new_layerwise(&args, index as i32, stream)?)
+        let local_heads = i32::try_from(attention.local_shape()[0])
+            .map_err(|_| Error::Parallel("DeepSeek local query width exceeds i32".into()))?
+            / (self.args.qk_nope_head_dim + self.args.qk_rope_head_dim);
+        let local_width = |suffix: &str, axis: usize, fallback: i32| -> Result<i32, Error> {
+            tensor(suffix)
+                .map(|value| {
+                    value
+                        .local_shape()
+                        .get(axis)
+                        .copied()
+                        .ok_or_else(|| {
+                            Error::Parallel(format!(
+                                "DeepSeek TP layout for {prefix}.{suffix} has no axis {axis}"
+                            ))
+                        })
+                        .and_then(|width| {
+                            i32::try_from(width).map_err(|_| {
+                                Error::Parallel(format!(
+                                    "DeepSeek local width for {prefix}.{suffix} exceeds i32"
+                                ))
+                            })
+                        })
+                })
+                .transpose()
+                .map(|value| value.unwrap_or(fallback))
+        };
+        let dense_intermediate = local_width("mlp.gate_proj", 0, self.args.intermediate_size)?;
+        let routed_intermediate = layout
+            .tensor(&format!("{prefix}.mlp.experts.gate_proj"))
+            .map(|value| {
+                i32::try_from(value.local_shape()[1]).map_err(|_| {
+                    Error::Parallel("DeepSeek local routed-expert width exceeds i32".into())
+                })
+            })
+            .transpose()?
+            .unwrap_or(self.args.moe_intermediate_size);
+        let shared_intermediate = local_width(
+            "mlp.shared_experts.gate_proj",
+            0,
+            self.args.moe_intermediate_size * self.args.n_shared_experts,
+        )?;
+        Ok(DecoderLayer::new_parallel_layerwise(
+            &self.args,
+            index as i32,
+            local_heads,
+            dense_intermediate,
+            routed_intermediate,
+            shared_intermediate,
+            stream,
+        )?)
     }
 
     fn layer_checkpoint_prefix(&self, _group: usize, index: usize) -> String {
@@ -1337,15 +1449,21 @@ impl ArchitectureAdapter for DeepSeekV3LayerwiseAdapter {
     }
 
     fn additional_consumed_checkpoint_keys(&self, store: &dyn WeightStore) -> Vec<String> {
-        if self.sparse_expert_cache {
-            store
-                .keys()
-                .into_iter()
-                .filter(|key| key.contains(".mlp.experts."))
-                .collect()
-        } else {
-            Vec::new()
-        }
+        let prediction_start = self.args.num_hidden_layers;
+        let prediction_end = prediction_start + self.args.num_nextn_predict_layers;
+        store
+            .keys()
+            .into_iter()
+            .filter(|key| {
+                let cached_expert = self.sparse_expert_cache && key.contains(".mlp.experts.");
+                let prediction_layer = key
+                    .strip_prefix("model.layers.")
+                    .and_then(|tail| tail.split_once('.'))
+                    .and_then(|(layer, _)| layer.parse::<i32>().ok())
+                    .is_some_and(|layer| layer >= prediction_start && layer < prediction_end);
+                cached_expert || prediction_layer
+            })
+            .collect()
     }
 
     fn forward_layer(
@@ -1380,11 +1498,7 @@ impl ArchitectureAdapter for DeepSeekV3LayerwiseAdapter {
                 |flat, indices, weights, stream| {
                     expert_cache
                         .execute_routes_bounded(
-                            index,
-                            flat,
-                            indices,
-                            weights,
-                            pass,
+                            ExpertRouteBatch::new(index, flat, indices, weights, pass),
                             stream,
                             |flat, acquired, weights, stream| {
                                 if acquired.is_empty() {
@@ -1482,6 +1596,39 @@ impl ArchitectureAdapter for DeepSeekV3LayerwiseAdapter {
             context.mask.as_ref(),
             Some(&mut cache.layers[index]),
             stream,
+        )?)
+    }
+
+    fn forward_layer_with_observer<O: crate::runtime::execution::inspection::ActivationObserver>(
+        &mut self,
+        group: usize,
+        index: usize,
+        layer: &mut Self::Layer,
+        hidden: &Array,
+        cache: &mut Self::Cache,
+        context: &mut Self::ForwardContext,
+        stream: &Stream,
+        observer: &mut O,
+    ) -> Result<Array, Error> {
+        self.layer_count(group)?;
+        if self.sparse_expert_cache {
+            let prefix = self.layer_checkpoint_prefix(group, index);
+            observer.observe(&format!("{prefix}.input"), hidden)?;
+            let output = <Self as ArchitectureAdapter>::forward_layer(
+                self, group, index, layer, hidden, cache, context, stream,
+            )?;
+            observer.observe(&format!("{prefix}.output"), &output)?;
+            return Ok(observer
+                .intervene(&format!("{prefix}.output"), &output)?
+                .unwrap_or(output));
+        }
+        Ok(layer.forward_stage_with_observer(
+            hidden,
+            context.mask.as_ref(),
+            Some(&mut cache.layers[index]),
+            stream,
+            &self.layer_checkpoint_prefix(group, index),
+            observer,
         )?)
     }
 
@@ -1672,7 +1819,8 @@ mod tests {
 
     use super::{
         load_deepseek_v3_layerwise_model, load_deepseek_v3_sparse_expert_cache_model,
-        DeepSeekV3LayerwiseAdapter, DeepSeekV3LayerwiseModel,
+        register_deepseek_layer_parallel_plan, DeepSeekV3LayerwiseAdapter,
+        DeepSeekV3LayerwiseModel,
     };
     use crate::{
         architectures::deepseek_v3::model::{
@@ -1680,6 +1828,10 @@ mod tests {
         },
         runtime::attention::LayerSchedule,
         runtime::checkpoint::binding::canonical_checkpoint_name,
+        runtime::distributed::{
+            parallel::{ParallelBuildContext, ShardingPolicy},
+            topology::{DeviceAssignment, ParallelTopology},
+        },
         runtime::execution::layerwise::{load_safetensors_layerwise_model, LayerwiseLoadOptions},
         runtime::residency::expert_cache::ExpertCacheLoadOptions,
         runtime::residency::policy::{OffloadConfig, ResidencyPolicy},
@@ -1738,6 +1890,79 @@ mod tests {
 
     fn args(fp8: bool) -> ModelArgs {
         resident::model_args_from_config_value(&config(fp8)).unwrap()
+    }
+
+    #[test]
+    fn tensor_parallel_plan_balances_mla_dense_and_expert_domains() {
+        let execution = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        let mut args = args(false);
+        args.hidden_size = 12;
+        args.intermediate_size = 17;
+        args.moe_intermediate_size = 5;
+        args.num_attention_heads = 3;
+        args.layer_schedule =
+            LayerSchedule::new(2, vec![LayerPolicy::DenseMlp, LayerPolicy::SparseMoe]).unwrap();
+        args.validate().unwrap();
+        for rank in 0..2 {
+            let context = ParallelBuildContext::new(
+                ParallelTopology::from_rank(
+                    2,
+                    rank,
+                    2,
+                    1,
+                    1,
+                    DeviceAssignment::new(DeviceType::Cpu, 0),
+                )
+                .unwrap(),
+                ShardingPolicy::Require,
+            );
+            let mut planner = context.planner();
+            for layer in 0..2 {
+                let block =
+                    resident::DecoderLayer::new_layerwise(&args, layer as i32, execution.stream())
+                        .unwrap();
+                register_deepseek_layer_parallel_plan(&mut planner, &block, layer).unwrap();
+            }
+            let (_, layout) = planner.finish().unwrap();
+            let heads = if rank == 0 { 2 } else { 1 };
+            let dense = if rank == 0 { 9 } else { 8 };
+            let expert = if rank == 0 { 3 } else { 2 };
+            assert_eq!(
+                layout
+                    .tensor("model.layers.0.self_attn.q_b_proj.weight")
+                    .unwrap()
+                    .local_shape(),
+                &[heads * 4, 4]
+            );
+            assert_eq!(
+                layout
+                    .tensor("model.layers.0.mlp.gate_proj.weight")
+                    .unwrap()
+                    .local_shape(),
+                &[dense, 12]
+            );
+            assert_eq!(
+                layout
+                    .tensor("model.layers.1.mlp.experts.gate_proj")
+                    .unwrap()
+                    .local_shape(),
+                &[4, expert, 12]
+            );
+            assert_eq!(
+                layout
+                    .tensor("model.layers.1.mlp.experts.down_proj")
+                    .unwrap()
+                    .local_shape(),
+                &[4, 12, expert]
+            );
+            assert_eq!(
+                layout
+                    .tensor("model.layers.1.mlp.shared_experts.gate_proj.weight")
+                    .unwrap()
+                    .local_shape(),
+                &[expert, 12]
+            );
+        }
     }
 
     fn initialize(model: &mut Model, stream: &Stream) {

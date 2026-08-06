@@ -3124,12 +3124,12 @@ fn resolved_state_shape(
         })
 }
 
-fn state_policy<'a>(
-    layers: &'a LayerSchedule<LayerCachePolicy>,
+fn state_policy(
+    layers: &LayerSchedule<LayerCachePolicy>,
     global_layer_start: usize,
     owner: StateTensorOwner,
     role: StateTensorRole,
-) -> Option<&'a StateTensorPolicy> {
+) -> Option<&StateTensorPolicy> {
     let StateTensorOwner::Layer(layer) = owner;
     let policies = layers
         .get(layer.checked_sub(global_layer_start)?)?
@@ -6497,7 +6497,7 @@ mod tests {
             architectures::{
                 distributed::{
                     expert::ExpertParallelCache,
-                    pipeline::{PipelineCache, PipelineLlamaLayerCache},
+                    pipeline::{PipelineCache, PipelineKeyValueCache, PipelineLayerCache},
                 },
                 llama::layerwise::LlamaCache,
             },
@@ -6512,10 +6512,16 @@ mod tests {
         assert_eq!(manager.lock().unwrap().blocks.len(), 1);
 
         let manager = manager_with_leased_block();
-        let mut pipeline = PipelineCache::Llama(vec![PipelineLlamaLayerCache::Paged {
-            global_layer: 0,
-            cache: PagedKeyValueCache::new(manager.clone(), 0, None).unwrap(),
-        }]);
+        let mut pipeline = PipelineCache::new(
+            crate::api::ModelKind::Llama,
+            vec![PipelineLayerCache::KeyValue {
+                global_layer: 0,
+                cache: PipelineKeyValueCache::Paged(
+                    PagedKeyValueCache::new(manager.clone(), 0, None).unwrap(),
+                ),
+                slots: Vec::new(),
+            }],
+        );
         assert!(pipeline.reset().is_err());
         assert_eq!(manager.lock().unwrap().blocks.len(), 1);
 
