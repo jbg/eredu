@@ -679,6 +679,13 @@ impl GptOssLayerwiseAdapter {
         })
     }
 
+    /// Creates the semantic adapter with routed experts supplied externally.
+    pub(crate) fn new_external_experts(args: ModelArgs, stream: &Stream) -> Result<Self, Error> {
+        let mut adapter = Self::new(args, stream)?;
+        adapter.sparse_expert_cache = true;
+        Ok(adapter)
+    }
+
     /// Returns the validated model arguments.
     pub const fn args(&self) -> &ModelArgs {
         &self.args
@@ -1126,8 +1133,38 @@ impl ArchitectureAdapter for GptOssLayerwiseAdapter {
     ) -> Result<Self::Layer, Error> {
         let mut layer = self.new_layer(group, index, stream)?;
         let mut local_args = self.args.clone();
-        local_args.num_local_experts = i32::try_from(assignment.local_expert_count())
-            .map_err(|_| Error::Parallel("local GPT-OSS expert count exceeds i32".into()))?;
+        local_args.num_local_experts = if self.sparse_expert_cache {
+            0
+        } else {
+            i32::try_from(assignment.local_expert_count())
+                .map_err(|_| Error::Parallel("local GPT-OSS expert count exceeds i32".into()))?
+        };
+        layer.mlp.experts = Experts::new(&local_args, stream)?;
+        Ok(layer)
+    }
+
+    fn new_tensor_expert_parallel_layer(
+        &self,
+        group: usize,
+        index: usize,
+        layout: &crate::runtime::distributed::parallel::LocalModelLayout,
+        assignment: &crate::runtime::distributed::expert::ExpertAssignment,
+        stream: &Stream,
+    ) -> Result<Self::Layer, Error> {
+        let mut layer = self.new_parallel_layer(group, index, layout, stream)?;
+        let prefix = format!("model.layers.{index}");
+        let expert = layout
+            .tensor(&format!("{prefix}.mlp.experts.gate_up_proj_bias"))
+            .ok_or_else(|| Error::Parallel(format!("missing TP layout for {prefix} experts")))?;
+        let mut local_args = self.args.clone();
+        local_args.intermediate_size = i32::try_from(expert.local_shape()[1] / 2)
+            .map_err(|_| Error::Parallel("local GPT-OSS expert width exceeds i32".into()))?;
+        local_args.num_local_experts = if self.sparse_expert_cache {
+            0
+        } else {
+            i32::try_from(assignment.local_expert_count())
+                .map_err(|_| Error::Parallel("local GPT-OSS expert count exceeds i32".into()))?
+        };
         layer.mlp.experts = Experts::new(&local_args, stream)?;
         Ok(layer)
     }
@@ -1136,7 +1173,7 @@ impl ArchitectureAdapter for GptOssLayerwiseAdapter {
         &self,
         topology: crate::runtime::distributed::topology::ParallelTopology,
     ) -> Result<Option<crate::runtime::distributed::expert::ExpertAssignment>, Error> {
-        if topology.expert_parallel_size == 1 {
+        if topology.expert_parallel_size == 1 && !self.sparse_expert_cache {
             return Ok(None);
         }
         Ok(Some(
@@ -1519,6 +1556,18 @@ pub(crate) fn gpt_oss_expert_catalog(
     args: &ModelArgs,
     store: &dyn WeightStore,
 ) -> Result<Vec<ExpertCatalogEntry>, Error> {
+    gpt_oss_expert_catalog_cartesian(args, store, None)
+}
+
+/// Builds expert-granular GPT-OSS bindings under an optional TP layout.
+///
+/// Expert selection is resolved before the shared semantic TP selection so
+/// native MXFP4 blocks, E8M0 scales, and biases remain one atomic cache unit.
+pub(crate) fn gpt_oss_expert_catalog_cartesian(
+    args: &ModelArgs,
+    store: &dyn WeightStore,
+    layout: Option<&crate::runtime::distributed::parallel::LocalModelLayout>,
+) -> Result<Vec<ExpertCatalogEntry>, Error> {
     let mut entries = Vec::new();
     for layer in 0..args.num_hidden_layers as usize {
         let prefix = format!("model.layers.{layer}.mlp.experts");
@@ -1600,6 +1649,12 @@ pub(crate) fn gpt_oss_expert_catalog(
                 let bytes = recipe.infer(store)?.byte_len();
                 bindings.push(WeightBinding::from_recipe(name, recipe, bytes)?);
             }
+            let bindings = match layout {
+                Some(layout) => crate::runtime::execution::layerwise::shard_layer_bindings(
+                    bindings, &prefix, store, layout,
+                )?,
+                None => bindings,
+            };
             let bytes = bindings.iter().try_fold(0u64, |total, binding| {
                 total.checked_add(binding.expected_bytes()).ok_or_else(|| {
                     Error::UnsupportedArchitecture("GPT-OSS expert byte total overflowed".into())

@@ -3016,6 +3016,23 @@ fn execute_cached_gpt_oss(
     cache: &ExpertCache,
     stream: &Stream,
 ) -> Result<Array, Error> {
+    execute_cached_gpt_oss_at(args, layer, routes, pass, cache, 1, stream)
+}
+
+pub(crate) fn execute_cached_gpt_oss_at(
+    args: &gpt_oss::ModelArgs,
+    layer: usize,
+    routes: &DispatchedRoutes,
+    pass: ExpertPass,
+    cache: &ExpertCache,
+    tensor_parallel_size: usize,
+    stream: &Stream,
+) -> Result<Array, Error> {
+    if tensor_parallel_size == 0 {
+        return Err(Error::Parallel(
+            "GPT-OSS cached expert execution requires a positive TP size".into(),
+        ));
+    }
     Ok(cache.execute_routes_bounded(
         ExpertRouteBatch::new(
             layer,
@@ -3027,27 +3044,40 @@ fn execute_cached_gpt_oss(
         stream,
         |hidden, acquired, _weights, stream| {
             let started = Instant::now();
+            let gate_up_proj_blocks = acquired.compact_binding("gate_up_proj_blocks", stream)?;
+            let gate_up_proj_scales = acquired.compact_binding("gate_up_proj_scales", stream)?;
+            let gate_up_proj_bias = acquired.compact_binding("gate_up_proj_bias", stream)?;
+            let down_proj_blocks = acquired.compact_binding("down_proj_blocks", stream)?;
+            let down_proj_scales = acquired.compact_binding("down_proj_scales", stream)?;
+            let down_proj_bias = acquired.compact_binding("down_proj_bias", stream)?;
             let mut compact_args = args.clone();
             compact_args.num_local_experts = acquired.identities().len() as i32;
+            compact_args.intermediate_size = gate_up_proj_bias.dim(-1) / 2;
             let mut bank = gpt_oss::Experts::new(&compact_args, stream)?;
-            bank.gate_up_proj_blocks =
-                Param::new(acquired.compact_binding("gate_up_proj_blocks", stream)?);
-            bank.gate_up_proj_scales =
-                Param::new(acquired.compact_binding("gate_up_proj_scales", stream)?);
-            bank.gate_up_proj_bias =
-                Param::new(acquired.compact_binding("gate_up_proj_bias", stream)?);
-            bank.down_proj_blocks =
-                Param::new(acquired.compact_binding("down_proj_blocks", stream)?);
-            bank.down_proj_scales =
-                Param::new(acquired.compact_binding("down_proj_scales", stream)?);
-            bank.down_proj_bias = Param::new(acquired.compact_binding("down_proj_bias", stream)?);
+            bank.gate_up_proj_blocks = Param::new(gate_up_proj_blocks);
+            bank.gate_up_proj_scales = Param::new(gate_up_proj_scales);
+            bank.gate_up_proj_bias = Param::new(gate_up_proj_bias);
+            bank.down_proj_blocks = Param::new(down_proj_blocks);
+            bank.down_proj_scales = Param::new(down_proj_scales);
+            bank.down_proj_bias = Param::new(down_proj_bias);
             cache.record_compact_bank(
                 acquired.pass(),
                 acquired.scratch_bytes(),
                 started.elapsed(),
             )?;
             let weights = safemlx::ops::ones_dtype(&[hidden.dim(0), 1], hidden.dtype(), stream)?;
-            Ok(bank.forward(hidden, acquired.compact_routes(), &weights, stream)?)
+            let output = bank.forward(hidden, acquired.compact_routes(), &weights, stream)?;
+            if tensor_parallel_size == 1 {
+                return Ok(output);
+            }
+            let bias =
+                bank.down_proj_bias
+                    .as_ref()
+                    .take_axis(acquired.compact_routes(), 0, stream)?;
+            Ok(output.subtract(&bias, stream)?.add(
+                bias.divide(Array::from_f32(tensor_parallel_size as f32), stream)?,
+                stream,
+            )?)
         },
     )?)
 }

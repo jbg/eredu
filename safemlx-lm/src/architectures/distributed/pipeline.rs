@@ -977,6 +977,7 @@ struct GptOssStage {
     parallel_layout: Option<crate::runtime::distributed::parallel::LocalModelLayout>,
     parallel_kv_heads: Option<Vec<i32>>,
     expert_assignment: Option<ExpertAssignment>,
+    expert_cache: Option<ExpertCache>,
     routing_statistics: RoutingStatistics,
 }
 
@@ -2513,6 +2514,10 @@ impl PipelineStageSemantics for GptOssStage {
         self.dense_layers.as_ref()
     }
 
+    fn expert_cache(&self) -> Option<&ExpertCache> {
+        self.expert_cache.as_ref()
+    }
+
     fn prompt_cache_model_identity(
         &self,
         topology: ParallelTopology,
@@ -2566,7 +2571,11 @@ impl PipelineStageSemantics for GptOssStage {
         cache: &mut [PipelineLayerCache],
         stream: &Stream,
     ) -> Result<PipelineStageOutput, Error> {
-        GptOssStage::forward(self, input, step, mask, cache, stream)
+        if self.expert_cache.is_some() {
+            self.forward_external_experts(input, step, mask, cache, None, stream)
+        } else {
+            GptOssStage::forward(self, input, step, mask, cache, stream)
+        }
     }
 
     fn forward_with_execution(
@@ -2580,11 +2589,24 @@ impl PipelineStageSemantics for GptOssStage {
         stream: &Stream,
     ) -> Result<PipelineStageOutput, Error> {
         if let Some(group) = expert_group {
-            return self.forward_expert_parallel(input, step, mask, cache, group, stream);
+            if let Some(execution) = execution.filter(|execution| execution.is_tensor_parallel()) {
+                return self.forward_tensor_parallel(
+                    input,
+                    step,
+                    mask,
+                    cache,
+                    execution,
+                    Some(group),
+                );
+            }
+            return self.forward_external_experts(input, step, mask, cache, Some(group), stream);
         }
         match execution {
             Some(execution) if execution.is_tensor_parallel() => {
-                self.forward_tensor_parallel(input, step, mask, cache, execution)
+                self.forward_tensor_parallel(input, step, mask, cache, execution, None)
+            }
+            _ if self.expert_cache.is_some() => {
+                self.forward_external_experts(input, step, mask, cache, None, stream)
             }
             _ => self.forward(input, step, mask, cache, stream),
         }
@@ -4482,7 +4504,7 @@ pub fn load_pipeline_model(
 /// support fully resident and
 /// dense-disk-streamed layers. Streamed units compose pipeline placement with
 /// the authoritative TP semantic layout or EP assignment before residency
-/// initialization. Qwen3-MoE additionally composes an independent, stage-local
+/// initialization. Qwen3-MoE and GPT-OSS additionally compose an independent, stage-local
 /// expert cache with resident or dense-streamed non-expert parameters for PP,
 /// TP+PP, PP+EP, and TP+PP+EP. With EP inactive each stage owns all experts for
 /// its local layers and executes routes without an expert collective.
@@ -4518,19 +4540,27 @@ pub fn load_pipeline_model_with_options(
         let checkpoint = GgufCheckpoint::open(model_dir)?;
         let metadata = crate::runtime::checkpoint::load::gguf_metadata(&checkpoint);
         let architecture = pipeline_gguf_architecture(&metadata)?;
-        if expert_cache.is_some() && architecture != crate::api::GgufArchitecture::Qwen3Moe {
+        if expert_cache.is_some()
+            && !matches!(
+                architecture,
+                crate::api::GgufArchitecture::Qwen3Moe | crate::api::GgufArchitecture::GptOss
+            )
+        {
             return Err(Error::Parallel(format!(
-                "pipeline independent expert caching currently requires Qwen3-MoE semantic expert recipes; GGUF architecture {} is not yet registered and no checkpoint payload was materialized",
+                "pipeline independent expert caching has registered Qwen3-MoE and GPT-OSS semantic expert recipes; GGUF architecture {} is not yet registered and no checkpoint payload was materialized",
                 architecture.metadata_name()
             )));
         }
         if topology.tensor_parallel_size > 1
             && topology.pipeline_parallel_size > 1
             && topology.expert_parallel_size > 1
-            && architecture != crate::api::GgufArchitecture::Qwen3Moe
+            && !matches!(
+                architecture,
+                crate::api::GgufArchitecture::Qwen3Moe | crate::api::GgufArchitecture::GptOss
+            )
         {
             return Err(Error::Parallel(format!(
-                "TP+PP+EP preflight supports Qwen3-MoE only; GGUF architecture {} has no triple-axis semantic plan and no checkpoint payload was materialized",
+                "TP+PP+EP preflight has registered Qwen3-MoE and GPT-OSS; GGUF architecture {} has no triple-axis semantic plan and no checkpoint payload was materialized",
                 architecture.metadata_name()
             )));
         }
@@ -4731,6 +4761,7 @@ pub fn load_pipeline_model_with_options(
                     topology,
                     options.quantization,
                     dense_stream,
+                    expert_cache,
                     stream,
                     weights_stream,
                 )
@@ -4852,18 +4883,18 @@ pub fn load_pipeline_model_with_options(
     let config: serde_json::Value =
         serde_json::from_reader(std::fs::File::open(model_dir.join("config.json"))?)?;
     let model_type = config.get("model_type").and_then(serde_json::Value::as_str);
-    if expert_cache.is_some() && model_type != Some("qwen3_moe") {
+    if expert_cache.is_some() && !matches!(model_type, Some("qwen3_moe" | "gpt_oss")) {
         return Err(Error::Parallel(format!(
-            "pipeline independent expert caching currently requires Qwen3-MoE semantic expert recipes; SafeTensors model_type {model_type:?} is not yet registered and no checkpoint payload was materialized"
+            "pipeline independent expert caching has registered Qwen3-MoE and GPT-OSS semantic expert recipes; SafeTensors model_type {model_type:?} is not yet registered and no checkpoint payload was materialized"
         )));
     }
     if topology.tensor_parallel_size > 1
         && topology.pipeline_parallel_size > 1
         && topology.expert_parallel_size > 1
-        && model_type != Some("qwen3_moe")
+        && !matches!(model_type, Some("qwen3_moe" | "gpt_oss"))
     {
         return Err(Error::Parallel(format!(
-            "TP+PP+EP preflight supports Qwen3-MoE only; SafeTensors model_type {:?} has no triple-axis semantic plan and no checkpoint payload was materialized",
+            "TP+PP+EP preflight has registered Qwen3-MoE and GPT-OSS; SafeTensors model_type {:?} has no triple-axis semantic plan and no checkpoint payload was materialized",
             model_type
         )));
     }
@@ -5029,6 +5060,7 @@ pub fn load_pipeline_model_with_options(
                 topology,
                 options.quantization,
                 dense_stream,
+                expert_cache,
                 stream,
                 weights_stream,
             )
@@ -7507,19 +7539,74 @@ fn execute_pipeline_cached_qwen3(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn execute_pipeline_cached_gpt_oss(
+    args: &gpt_oss::ModelArgs,
+    global_layer: usize,
+    hidden: &Array,
+    expert_ids: &Array,
+    weights: &Array,
+    pass: ExpertPass,
+    cache: &ExpertCache,
+    assignment: &ExpertAssignment,
+    expert_group: Option<&Group>,
+    tensor_group: Option<&Group>,
+    statistics: &mut RoutingStatistics,
+    stream: &Stream,
+) -> Result<Array, Error> {
+    validate_pipeline_expert_dispatch(assignment, expert_group, true)?;
+    let tensor_parallel_size = tensor_group.map_or(1, Group::size);
+    let execute = |routes: &crate::runtime::distributed::expert::DispatchedRoutes,
+                   stream: &Stream| {
+        super::expert::execute_cached_gpt_oss_at(
+            args,
+            global_layer,
+            routes,
+            pass,
+            cache,
+            tensor_parallel_size,
+            stream,
+        )
+    };
+    let returned = match expert_group {
+        Some(group) => dispatch_replicated_with(
+            hidden, expert_ids, weights, assignment, group, stream, execute,
+        )?,
+        None => dispatch_local_with(hidden, expert_ids, weights, assignment, stream, execute)?,
+    };
+    statistics.accumulate(&returned.statistics);
+    match tensor_group {
+        Some(group) => Ok(distributed::all_sum(
+            &returned.reduced_output,
+            group,
+            stream,
+        )?),
+        None => Ok(returned.reduced_output),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn load_gpt_oss_pipeline(
     source_args: gpt_oss::ModelArgs,
     store: SharedWeightStore,
     topology: ParallelTopology,
     requested_quantization: Option<WeightQuantization>,
     dense_stream: Option<crate::runtime::residency::dense_stream::DenseDiskStreamLoadOptions>,
+    expert_cache_options: Option<ExpertCacheLoadOptions>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<PipelineModel, Error> {
-    let binding_adapter = crate::architectures::gpt_oss::layerwise::GptOssLayerwiseAdapter::new(
-        source_args.clone(),
-        stream,
-    )?;
+    let binding_adapter = if expert_cache_options.is_some() {
+        crate::architectures::gpt_oss::layerwise::GptOssLayerwiseAdapter::new_external_experts(
+            source_args.clone(),
+            stream,
+        )?
+    } else {
+        crate::architectures::gpt_oss::layerwise::GptOssLayerwiseAdapter::new(
+            source_args.clone(),
+            stream,
+        )?
+    };
     let expert_assignment = binding_adapter.expert_parallel_assignment(topology)?;
     topology.preflight(
         Some(source_args.attention_schedule.len()),
@@ -7550,6 +7637,12 @@ fn load_gpt_oss_pipeline(
                 .into(),
         ));
     }
+    if expert_cache_options.is_some() && quantize_on_load.is_some() {
+        return Err(Error::Quantization(
+            "load-time quantization is unsupported for independently cached GPT-OSS pipeline experts; use checkpoint-native MXFP4 weights"
+                .into(),
+        ));
+    }
     let mut target_args = source_args.clone();
     if let Some(quantization) = quantize_on_load {
         target_args.quantization = Some(quantization);
@@ -7562,7 +7655,13 @@ fn load_gpt_oss_pipeline(
         ModelKind::GptOss,
         source_args.hidden_size,
     );
-    let mut stage = GptOssStage::new(target_args.clone(), range, &info, stream)?;
+    let mut stage = GptOssStage::new(
+        target_args.clone(),
+        range,
+        &info,
+        expert_cache_options.is_some(),
+        stream,
+    )?;
     stage.expert_assignment = expert_assignment;
     if let Some(assignment) = stage.expert_assignment.as_ref() {
         info.global_expert_count = Some(assignment.global_expert_count());
@@ -7710,14 +7809,25 @@ fn load_gpt_oss_pipeline(
                 stage.expert_assignment.as_ref(),
                 stream,
             )?;
-            loaded.load(
-                layer,
-                store.as_ref(),
-                &bindings,
-                quantize_on_load,
-                weights_stream,
-                stream,
-            )?;
+            if expert_cache_options.is_some() {
+                loaded.load_excluding(
+                    layer,
+                    store.as_ref(),
+                    &bindings,
+                    weights_stream,
+                    stream,
+                    &|name| name.starts_with("mlp.experts."),
+                )?;
+            } else {
+                loaded.load(
+                    layer,
+                    store.as_ref(),
+                    &bindings,
+                    quantize_on_load,
+                    weights_stream,
+                    stream,
+                )?;
+            }
         }
     }
     let static_bytes = loaded.finish(&mut info)?;
@@ -7755,12 +7865,47 @@ fn load_gpt_oss_pipeline(
                 )
             },
         )?);
+        if expert_cache_options.is_some() {
+            stage.dense_layers = stage
+                .dense_layers
+                .take()
+                .map(PipelineDenseLayers::with_independent_experts);
+        }
         let report = stage.dense_layers.as_ref().unwrap().report()?;
         info.planned_owned_parameter_bytes = static_bytes
             .checked_add(report.planned_layer_bytes())
             .ok_or_else(|| Error::Parallel("GPT-OSS pipeline planned bytes overflowed".into()))?;
     } else {
         info.planned_owned_parameter_bytes = static_bytes;
+    }
+    if let Some(options) = expert_cache_options {
+        let entries = crate::architectures::gpt_oss::layerwise::gpt_oss_expert_catalog_cartesian(
+            &source_args,
+            store.as_ref(),
+            parallel_layout.as_ref(),
+        )?
+        .into_iter()
+        .filter(|entry| stage.range.contains(&entry.identity().layer))
+        .filter(|entry| {
+            stage.expert_assignment.as_ref().is_none_or(|assignment| {
+                assignment.owner(entry.identity().global_expert) == Some(assignment.rank())
+            })
+        })
+        .collect::<Vec<_>>();
+        let cache = ExpertCache::new_shared(
+            Arc::clone(&store),
+            entries,
+            options,
+            weights_stream.clone(),
+            stream.clone(),
+        )?;
+        info.planned_owned_parameter_bytes = info
+            .planned_owned_parameter_bytes
+            .checked_add(cache.report()?.owned_bytes)
+            .ok_or_else(|| {
+                Error::Parallel("GPT-OSS pipeline expert byte total overflowed".into())
+            })?;
+        stage.expert_cache = Some(cache);
     }
     info.opened_checkpoint_shards = materialized_shards;
     info.checkpoint_diagnostics = Some(checkpoint_diagnostics);
@@ -7772,12 +7917,20 @@ impl GptOssStage {
         args: gpt_oss::ModelArgs,
         range: Range<usize>,
         info: &PipelineStageInfo,
+        external_experts: bool,
         stream: &Stream,
     ) -> Result<Self, Error> {
-        let layer_adapter = crate::architectures::gpt_oss::layerwise::GptOssLayerwiseAdapter::new(
-            args.clone(),
-            stream,
-        )?;
+        let layer_adapter = if external_experts {
+            crate::architectures::gpt_oss::layerwise::GptOssLayerwiseAdapter::new_external_experts(
+                args.clone(),
+                stream,
+            )?
+        } else {
+            crate::architectures::gpt_oss::layerwise::GptOssLayerwiseAdapter::new(
+                args.clone(),
+                stream,
+            )?
+        };
         let embedding = info
             .is_first
             .then(|| {
@@ -7825,6 +7978,7 @@ impl GptOssStage {
             parallel_layout: None,
             parallel_kv_heads: None,
             expert_assignment: None,
+            expert_cache: None,
             routing_statistics: RoutingStatistics::default(),
         })
     }
@@ -7927,18 +8081,26 @@ impl GptOssStage {
         Ok(output)
     }
 
-    fn forward_expert_parallel(
+    fn forward_external_experts(
         &mut self,
         input: PipelineStageInput<'_>,
         step: PipelineStep,
         explicit_mask: Option<&Array>,
         caches: &mut [PipelineLayerCache],
-        group: &Group,
+        group: Option<&Group>,
         stream: &Stream,
     ) -> Result<PipelineStageOutput, Error> {
         let assignment = self.expert_assignment.as_ref().ok_or_else(|| {
             Error::Parallel("GPT-OSS PP+EP stage has no rank-local expert assignment".into())
         })?;
+        validate_pipeline_expert_dispatch(assignment, group, self.expert_cache.is_some())?;
+        let resident_group = if self.expert_cache.is_none() {
+            Some(group.ok_or_else(|| {
+                Error::Parallel("resident GPT-OSS pipeline experts require an EP group".into())
+            })?)
+        } else {
+            None
+        };
         validate_scheduled_pipeline_kv_cache(
             "GPT-OSS PP+EP",
             self.range.clone(),
@@ -7962,6 +8124,12 @@ impl GptOssStage {
         let layer_adapter = &self.layer_adapter;
         let parallel_layout = self.parallel_layout.clone();
         let expert_assignment = assignment.clone();
+        let expert_cache = self.expert_cache.as_ref();
+        let pass = if step.sequence_length > 1 {
+            ExpertPass::Prefill
+        } else {
+            ExpertPass::Decode
+        };
         hidden = execute_pipeline_layer_range(
             PipelineLayerExecution {
                 range: self.range.clone(),
@@ -8015,28 +8183,78 @@ impl GptOssStage {
                         global_layer: cached,
                         cache: PipelineKeyValueCache::Standard(cache),
                         ..
-                    } if *cached == global_layer => layer.forward_expert_parallel(
-                        hidden,
-                        mask,
-                        cache,
-                        &expert_assignment,
-                        group,
-                        &mut self.routing_statistics,
-                        stream,
-                    )?,
+                    } if *cached == global_layer => match expert_cache {
+                        Some(expert_cache) => layer.forward_with_expert_executor(
+                            hidden,
+                            mask,
+                            cache,
+                            stream,
+                            |hidden, ids, weights, stream| {
+                                execute_pipeline_cached_gpt_oss(
+                                    &args,
+                                    global_layer,
+                                    hidden,
+                                    ids,
+                                    weights,
+                                    pass,
+                                    expert_cache,
+                                    &expert_assignment,
+                                    group,
+                                    None,
+                                    &mut self.routing_statistics,
+                                    stream,
+                                )
+                                .map_err(|error| Exception::custom(error.to_string()))
+                            },
+                        )?,
+                        None => layer.forward_expert_parallel(
+                            hidden,
+                            mask,
+                            cache,
+                            &expert_assignment,
+                            resident_group.expect("validated resident EP group"),
+                            &mut self.routing_statistics,
+                            stream,
+                        )?,
+                    },
                     PipelineLayerCache::KeyValue {
                         global_layer: cached,
                         cache: PipelineKeyValueCache::Paged(cache),
                         ..
-                    } if *cached == global_layer => layer.forward_expert_parallel(
-                        hidden,
-                        mask,
-                        cache,
-                        &expert_assignment,
-                        group,
-                        &mut self.routing_statistics,
-                        stream,
-                    )?,
+                    } if *cached == global_layer => match expert_cache {
+                        Some(expert_cache) => layer.forward_with_expert_executor(
+                            hidden,
+                            mask,
+                            cache,
+                            stream,
+                            |hidden, ids, weights, stream| {
+                                execute_pipeline_cached_gpt_oss(
+                                    &args,
+                                    global_layer,
+                                    hidden,
+                                    ids,
+                                    weights,
+                                    pass,
+                                    expert_cache,
+                                    &expert_assignment,
+                                    group,
+                                    None,
+                                    &mut self.routing_statistics,
+                                    stream,
+                                )
+                                .map_err(|error| Exception::custom(error.to_string()))
+                            },
+                        )?,
+                        None => layer.forward_expert_parallel(
+                            hidden,
+                            mask,
+                            cache,
+                            &expert_assignment,
+                            resident_group.expect("validated resident EP group"),
+                            &mut self.routing_statistics,
+                            stream,
+                        )?,
+                    },
                     _ => {
                         return Err(Error::Parallel(format!(
                             "GPT-OSS PP+EP cache does not match global layer {global_layer}"
@@ -8071,10 +8289,24 @@ impl GptOssStage {
         explicit_mask: Option<&Array>,
         caches: &mut [PipelineLayerCache],
         execution: &ParallelExecutionContext<'_>,
+        expert_group: Option<&Group>,
     ) -> Result<PipelineStageOutput, Error> {
         let group = execution.group().ok_or_else(|| {
             Error::Parallel("tensor-sharded GPT-OSS pipeline stage has no TP communicator".into())
         })?;
+        let expert_assignment = self.expert_assignment.clone();
+        let expert_cache = self.expert_cache.as_ref();
+        match expert_assignment.as_ref() {
+            Some(assignment) => {
+                validate_pipeline_expert_dispatch(assignment, expert_group, expert_cache.is_some())?
+            }
+            None if expert_group.is_some() || expert_cache.is_some() => {
+                return Err(Error::Parallel(
+                    "GPT-OSS tensor pipeline expert execution has no assignment".into(),
+                ));
+            }
+            None => {}
+        }
         validate_scheduled_pipeline_kv_cache(
             "GPT-OSS TP+PP",
             self.range.clone(),
@@ -8100,6 +8332,11 @@ impl GptOssStage {
         let args = self.args.clone();
         let layer_adapter = &self.layer_adapter;
         let parallel_layout = self.parallel_layout.clone();
+        let pass = if step.sequence_length > 1 {
+            ExpertPass::Prefill
+        } else {
+            ExpertPass::Decode
+        };
         hidden = execute_pipeline_layer_range(
             PipelineLayerExecution {
                 range: self.range.clone(),
@@ -8115,7 +8352,7 @@ impl GptOssStage {
                     0,
                     global_layer,
                     parallel_layout.as_ref(),
-                    None,
+                    expert_assignment.as_ref(),
                     stream,
                 )
             },
@@ -8148,20 +8385,118 @@ impl GptOssStage {
                     })
                     .transpose()?;
                 let mask = explicit_mask.or(generated_mask.as_ref());
+                let forward_standard = |layer: &mut gpt_oss::TransformerBlock,
+                                        cache: &mut ConcatKeyValueCache,
+                                        statistics: &mut RoutingStatistics|
+                 -> Result<Array, Error> {
+                    match (expert_assignment.as_ref(), expert_cache) {
+                        (Some(assignment), Some(expert_cache)) => layer
+                            .forward_tensor_with_expert_executor(
+                                hidden,
+                                mask,
+                                cache,
+                                group,
+                                stream,
+                                |hidden, ids, weights, stream| {
+                                    execute_pipeline_cached_gpt_oss(
+                                        &args,
+                                        global_layer,
+                                        hidden,
+                                        ids,
+                                        weights,
+                                        pass,
+                                        expert_cache,
+                                        assignment,
+                                        expert_group,
+                                        Some(group),
+                                        statistics,
+                                        stream,
+                                    )
+                                    .map_err(|error| Exception::custom(error.to_string()))
+                                },
+                            )
+                            .map_err(Error::from),
+                        (Some(assignment), None) => layer
+                            .forward_tensor_expert_parallel(
+                                hidden,
+                                mask,
+                                cache,
+                                assignment,
+                                group,
+                                expert_group.expect("validated resident EP group"),
+                                statistics,
+                                stream,
+                            )
+                            .map_err(Error::from),
+                        (None, None) => layer
+                            .forward_tensor_parallel(hidden, mask, cache, group, stream)
+                            .map_err(Error::from),
+                        (None, Some(_)) => unreachable!("validated expert assignment"),
+                    }
+                };
+                let forward_paged = |layer: &mut gpt_oss::TransformerBlock,
+                                     cache: &mut PagedKeyValueCache,
+                                     statistics: &mut RoutingStatistics|
+                 -> Result<Array, Error> {
+                    match (expert_assignment.as_ref(), expert_cache) {
+                        (Some(assignment), Some(expert_cache)) => layer
+                            .forward_tensor_with_expert_executor(
+                                hidden,
+                                mask,
+                                cache,
+                                group,
+                                stream,
+                                |hidden, ids, weights, stream| {
+                                    execute_pipeline_cached_gpt_oss(
+                                        &args,
+                                        global_layer,
+                                        hidden,
+                                        ids,
+                                        weights,
+                                        pass,
+                                        expert_cache,
+                                        assignment,
+                                        expert_group,
+                                        Some(group),
+                                        statistics,
+                                        stream,
+                                    )
+                                    .map_err(|error| Exception::custom(error.to_string()))
+                                },
+                            )
+                            .map_err(Error::from),
+                        (Some(assignment), None) => layer
+                            .forward_tensor_expert_parallel(
+                                hidden,
+                                mask,
+                                cache,
+                                assignment,
+                                group,
+                                expert_group.expect("validated resident EP group"),
+                                statistics,
+                                stream,
+                            )
+                            .map_err(Error::from),
+                        (None, None) => layer
+                            .forward_tensor_parallel(hidden, mask, cache, group, stream)
+                            .map_err(Error::from),
+                        (None, Some(_)) => unreachable!("validated expert assignment"),
+                    }
+                };
                 let forwarded = match cache {
                     PipelineLayerCache::KeyValue {
                         global_layer: cached,
                         cache: PipelineKeyValueCache::Standard(cache),
                         ..
                     } if *cached == global_layer => {
-                        layer.forward_tensor_parallel(hidden, mask, cache, group, stream)?
+                        forward_standard(layer, cache, &mut self.routing_statistics)?
                     }
                     PipelineLayerCache::KeyValue {
                         global_layer: cached,
                         cache: PipelineKeyValueCache::Paged(cache),
                         ..
                     } if *cached == global_layer => {
-                        layer.forward_tensor_parallel(hidden, mask, cache, group, stream)?
+                        forward_paged(layer, cache, &mut self.routing_statistics)?
                     }
                     _ => {
                         return Err(Error::Parallel(format!(

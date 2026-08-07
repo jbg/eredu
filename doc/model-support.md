@@ -818,19 +818,23 @@ its [usage guide](../examples/safemlx-lm-cli/README.md) for concrete commands.
 
 The language-model crate contains explicit APIs for pure tensor, pipeline, and
 expert parallelism plus tensor + pipeline, tensor + expert, pipeline + expert,
-and Qwen3-MoE tensor + pipeline + expert execution. A non-replicated topology
+and Qwen3-MoE/GPT-OSS tensor + pipeline + expert execution. A non-replicated topology
 must be loaded through the matching API; the ordinary complete-model loader
 rejects it. One Cartesian topology owns coordinates and subgroup membership
-for every combination. Qwen3-MoE triple-axis execution supports complete-layer
-fully resident and dense-disk-streamed SafeTensors and canonical GGUF. Its
-independent expert path intersects stage-local layers, optional EP ownership,
-and optional TP projection shards. With EP inactive a stage owns every routed
+for every combination. Qwen3-MoE and GPT-OSS triple-axis execution support
+complete-layer fully resident and dense-disk-streamed SafeTensors and canonical
+GGUF. Their independent expert paths intersect stage-local layers, optional EP
+ownership, and optional TP projection shards. With EP inactive a stage owns every routed
 expert for its local layers and uses collective-free route recombination;
 non-experts may be resident or dense disk-streamed, prompt state remains
 rank-local and persistent, and GGUF uses bounded expert reads.
 Other families fail architecture preflight before checkpoint payload
 materialization until their semantic expert recipes are registered with the
 pipeline adapter.
+
+The authoritative family migration backlog and the global versus
+family-specific limitations are maintained in the
+[combined-topology migration ledger](../safemlx-lm/README.md#authoritative-combined-topology-migration-ledger).
 
 Pure pipeline inference uses the architecture-neutral distributed scheduler.
 That canonical runtime owns request/work identity, isolated per-request program

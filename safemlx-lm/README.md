@@ -940,15 +940,17 @@ placement with its rank-local TP shard or EP expert selection. SafeTensors and
 GGUF reads therefore materialize only the local recipe, while residency and
 checkpoint diagnostics distinguish pinned stage-boundary weights from planned
 cold layer bytes.
-Qwen3-MoE also composes all three axes in this runtime. TP collectives remain
-inside the stage and EP coordinate, routed exchange remains inside the stage
-and TP coordinate, and pipeline transport connects equal TP/EP coordinates.
+Qwen3-MoE and GPT-OSS also compose all three axes in this runtime. TP
+collectives remain inside the stage and EP coordinate, routed exchange remains
+inside the stage and TP coordinate, and pipeline transport connects equal
+TP/EP coordinates.
 The triple-axis path supports arbitrary valid Cartesian degrees on native
 subgroup backends and uses topology-planned neighbor routes for stage-local
 Ring fallback collectives. Fully resident and dense-disk-streamed SafeTensors
-and canonical `qwen3moe` GGUF checkpoints share the same layer recipes, cache
-identity, synchronized generation, and failure consensus.
-The same independent expert cache works with PP and TP+PP when EP is inactive.
+and canonical `qwen3moe` or type-39 `gpt-oss` GGUF checkpoints share the same
+layer recipes, cache identity, synchronized generation, and failure consensus.
+The same independent expert cache works with PP and TP+PP when EP is inactive,
+and with PP+EP or TP+PP+EP when EP is active.
 In that geometry every stage owns all routed experts for its local layers; TP
 coordinates retain semantic projection shards, and route execution uses the
 shared collective-free singleton dispatch rather than an artificial EP group.
@@ -965,31 +967,49 @@ payload materialization. The ordinary `Model` loader remains a complete
 single-device API and directs non-replicated requests to the explicit pipeline
 loader.
 
-Combined family coverage is tracked against the constituent execution modes:
+### Authoritative combined-topology migration ledger
 
-| Family | Constituent axes | Pairwise combined status | Remaining limitations |
+This table is the persistent source of truth for family migration status. A
+family is **complete** only when every applicable pairwise topology and the
+generic TP+PP+EP path support prefill, cached decode, synchronized generation,
+prompt-cache persistence, resident parameters, dense-streamed non-experts, and
+independently cached experts in both registered checkpoint formats. **Pairwise**
+means the constituent two-axis modes work but the family has not yet crossed
+that complete triple-axis/cache boundary. Dense families have no EP migration.
+
+| Family | Axes | Status | Remaining family-specific work |
 |---|---|---|---|
-| Qwen2/Qwen3 dense | TP, PP | TP+PP supported | EP does not apply to dense layers |
-| Qwen3 MoE | TP, PP, EP | TP+PP, TP+EP, and PP+EP supported; PP, TP+PP, PP+EP, and TP+PP+EP independent expert caches compose resident or dense-disk-streamed non-experts for SafeTensors, with GGUF bounded-read coverage; complete-layer triple execution supports fully resident and dense streaming | Host-layerwise pipeline residency is not supported |
-| Llama/Mistral | TP, PP | TP+PP supported for SafeTensors and GGUF, resident and dense-streamed | No routed-expert EP axis |
-| Gemma 4 text | TP, PP | TP+PP supported for SafeTensors and GGUF, resident and dense-streamed | Text pipeline only; no routed-expert EP axis |
-| DeepSeek-V3/R1 | TP, PP, EP | TP+PP, TP+EP, and PP+EP support SafeTensors and GGUF, fully resident and dense/sparse-streamed | Triple-axis execution is unavailable |
-| Kimi Linear | TP, PP, EP | TP+PP, TP+EP, and PP+EP support SafeTensors and GGUF, fully resident and dense/sparse-streamed | Triple-axis execution is unavailable |
-| GPT-OSS | TP, PP, EP | TP+PP, TP+EP, and PP+EP support SafeTensors and GGUF, fully resident and dense/sparse-streamed | Triple-axis execution is unavailable |
-| LFM2 dense/MoE | TP, PP; EP for MoE | TP+PP supports SafeTensors and GGUF, resident and dense-streamed; LFM2-MoE TP+EP and PP+EP support resident and sparse/dense-streamed execution | EP applies only to MoE layers; triple-axis execution is unavailable |
-| Nemotron-H dense/MoE | TP, PP; EP for MoE | TP+PP supports SafeTensors and GGUF, resident and dense-streamed; Nemotron-H-MoE TP+EP and PP+EP support resident and sparse/dense-streamed execution | EP applies only to MoE layers; triple-axis execution is unavailable |
-| Qwen3-Next/Qwen3.5 text dense/MoE | TP, PP; EP for MoE | TP+PP supports SafeTensors and GGUF, resident and dense-streamed; MoE TP+EP and PP+EP support resident and sparse/dense-streamed execution | Multimodal Qwen3.5 ingress is outside the text pipeline; triple-axis execution is unavailable |
-| Inkling text | TP, PP, EP | TP+PP, TP+EP, and PP+EP support SafeTensors and GGUF, fully resident and dense/sparse-streamed | Audio/vision ingress is outside combined execution; triple-axis execution is unavailable |
-| Qwen3-VL dense/MoE | TP, PP; EP for MoE | SafeTensors and canonical `qwen3vl`/`qwen3vlmoe` GGUF support PP and TP+PP with typed image/video prefill, cached decode, tied/untied heads, persistence, resident text layers, and dense-streamed text layers; Qwen3-VL-MoE supports pure EP, fully resident or sparse-streamed TP+EP, and stage-local PP+EP experts in both formats | The vision tower is pinned on stage zero rather than layer-streamed; queued microbatches accept token IDs, so typed prefill uses the direct pipeline methods before ordinary decode/generation; triple-axis execution is unavailable |
-| Moshi/PersonaPlex | TP | No pairwise combination applies to its temporal/depth runtime | Its temporal/depth runtime has no PP or EP constituent axis |
+| Qwen2/Qwen3 dense | TP, PP | TP+PP complete | None; EP does not apply |
+| Qwen3 MoE | TP, PP, EP | Complete | None |
+| GPT-OSS | TP, PP, EP | Complete | None; native MXFP4 SafeTensors and canonical type-39 GGUF are covered |
+| Llama/Mistral | TP, PP | TP+PP complete | None; EP does not apply |
+| Gemma 4 text | TP, PP | TP+PP complete | Multimodal tower execution is separate; EP does not apply |
+| DeepSeek-V3/R1 | TP, PP, EP | Pairwise | Compose MLA state, shared-expert ownership, native FP8/affine recipes, triple-axis execution, and pipeline-independent expert caching |
+| Kimi Linear | TP, PP, EP | Pairwise | Compose KDA/MLA recurrent state and shared experts with triple-axis execution and pipeline-independent expert caching |
+| LFM2 dense | TP, PP | TP+PP complete | None; EP does not apply |
+| LFM2-MoE | TP, PP, EP | Pairwise | Compose causal-convolution state and mixed dense/MoE placement with triple-axis execution and pipeline-independent expert caching |
+| Nemotron-H dense | TP, PP | TP+PP complete | None; EP does not apply |
+| Nemotron-H-MoE | TP, PP, EP | Pairwise | Compose Mamba state and mixed dense/MoE placement with triple-axis execution and pipeline-independent expert caching |
+| Qwen3-Next/Qwen3.5 text dense | TP, PP | TP+PP complete | Qwen3.5 multimodal ingress remains outside the text pipeline; EP does not apply |
+| Qwen3-Next/Qwen3.5-MoE text | TP, PP, EP | Pairwise | Compose hybrid recurrent state with triple-axis execution and pipeline-independent expert caching; Qwen3.5 multimodal ingress remains outside the text pipeline |
+| Inkling text | TP, PP, EP | Pairwise | Compose short-convolution state and routed/shared experts with triple-axis execution and pipeline-independent expert caching; audio/vision ingress remains outside combined execution |
+| Qwen3-VL dense | TP, PP | TP+PP complete | Vision is pinned on stage zero; queued microbatches accept token IDs, while typed image/video prefill uses direct pipeline methods; EP does not apply |
+| Qwen3-VL-MoE | TP, PP, EP | Pairwise | Compose vision ownership and multimodal ingress with triple-axis execution and pipeline-independent expert caching; retain the dense-family ingress constraints above |
+| Moshi/PersonaPlex | TP | Not applicable | Its temporal/depth runtime has no PP or EP constituent axis |
 
-TP+PP+EP is executable for Qwen3-MoE. Other families are rejected by
-architecture preflight with the requested axis sizes before checkpoint payload
-materialization; the Cartesian topology itself remains family-neutral. Dense disk-streamed pipeline stages require checkpoint-native
-quantization, and external-expert TP+EP rejects load-time weight conversion because
-it would bypass the semantic sharding recipes. Checkpoint-native affine, FP8,
-MXFP4, and other registered packed expert layouts remain supported. Pairwise support is
-otherwise complete wherever the table lists both constituent axes.
+The remaining global limitations are:
+
+- Pipeline `LayerwiseHost` residency for non-expert decoder layers is not
+  implemented; fully resident and dense disk streaming are supported.
+- Load-time expert requantization is rejected for independently cached or
+  triple-axis experts because it would bypass their semantic sharding recipes.
+  Checkpoint-native affine, FP8, MXFP4, and registered GGUF layouts remain
+  supported.
+- Families marked **Pairwise** fail triple-axis or pipeline-independent expert
+  cache requests during preflight, before checkpoint payload materialization.
+
+TP+PP+EP is executable for Qwen3-MoE and GPT-OSS. The Cartesian topology and
+execution contexts remain family-neutral and accept arbitrary legal axis sizes.
 
 Decoder layers use balanced contiguous placement. Architectures may declare
 unsplittable dependency units; Gemma 4 uses this to keep each shared-KV

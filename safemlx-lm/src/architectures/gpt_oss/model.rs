@@ -811,6 +811,30 @@ impl Experts {
             common::moe::weighted_route_sum(routed_bias, top_k_weights, &plan, tokens, stream)?;
         reduced.add(bias, stream)
     }
+
+    fn execute_local_routes_tensor_partial(
+        &mut self,
+        hidden_states: &Array,
+        local_expert_ids: &Array,
+        tensor_parallel_size: usize,
+        stream: &Stream,
+    ) -> Result<Array, Exception> {
+        let ids = local_expert_ids.reshape(&[-1, 1], stream)?;
+        let weights =
+            safemlx::ops::ones_dtype(&[hidden_states.dim(0), 1], hidden_states.dtype(), stream)?;
+        let output = self.forward(hidden_states, &ids, &weights, stream)?;
+        if tensor_parallel_size == 1 {
+            return Ok(output);
+        }
+        let bias = self
+            .down_proj_bias
+            .as_ref()
+            .take_axis(local_expert_ids, 0, stream)?;
+        output.subtract(&bias, stream)?.add(
+            bias.divide(Array::from_f32(tensor_parallel_size as f32), stream)?,
+            stream,
+        )
+    }
 }
 
 /// GPT-OSS sparse MoE block.
@@ -894,6 +918,45 @@ impl Mlp {
         let (indices, weights) = common::moe::top_k_softmax_routing(&logits, self.top_k, stream)?;
         self.experts
             .forward_tensor_parallel(&flat, &indices, &weights, group, stream)?
+            .reshape(shape, stream)
+    }
+
+    fn forward_tensor_expert_parallel(
+        &mut self,
+        x: &Array,
+        assignment: &crate::architectures::distributed::expert::ExpertAssignment,
+        tensor_group: &safemlx::distributed::Group,
+        expert_group: &safemlx::distributed::Group,
+        statistics: &mut crate::architectures::distributed::expert::RoutingStatistics,
+        stream: &Stream,
+    ) -> Result<Array, Exception> {
+        let shape = x.shape();
+        let flat = x.reshape(&[-1, shape[2]], stream)?;
+        let router_started = std::time::Instant::now();
+        let logits = self.router.forward(&flat, stream)?;
+        let (indices, weights) = common::moe::top_k_softmax_routing(&logits, self.top_k, stream)?;
+        statistics.router_time += router_started.elapsed();
+        let returned = crate::architectures::distributed::expert::dispatch_replicated_with(
+            &flat,
+            &indices,
+            &weights,
+            assignment,
+            expert_group,
+            stream,
+            |routes, stream| {
+                self.experts
+                    .execute_local_routes_tensor_partial(
+                        &routes.hidden,
+                        &routes.local_expert_ids,
+                        tensor_group.size(),
+                        stream,
+                    )
+                    .map_err(Error::from)
+            },
+        )
+        .map_err(|error| Exception::custom(error.to_string()))?;
+        statistics.accumulate(&returned.statistics);
+        safemlx::distributed::all_sum(&returned.reduced_output, tensor_group, stream)?
             .reshape(shape, stream)
     }
 
@@ -1012,11 +1075,43 @@ impl TransformerBlock {
         )
     }
 
-    pub(crate) fn forward_with_expert_executor<F>(
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn forward_tensor_expert_parallel<C: KeyValueCache>(
         &mut self,
         x: &Array,
         mask: Option<&Array>,
-        cache: &mut LayerCache,
+        cache: &mut C,
+        assignment: &crate::architectures::distributed::expert::ExpertAssignment,
+        tensor_group: &safemlx::distributed::Group,
+        expert_group: &safemlx::distributed::Group,
+        statistics: &mut crate::architectures::distributed::expert::RoutingStatistics,
+        stream: &Stream,
+    ) -> Result<Array, Exception> {
+        let normed = self.input_layernorm.forward(x, stream)?;
+        let hidden = x.add(
+            self.self_attn
+                .forward_tensor_parallel(&normed, mask, cache, tensor_group, stream)?,
+            stream,
+        )?;
+        let normed = self.post_attention_layernorm.forward(&hidden, stream)?;
+        hidden.add(
+            self.mlp.forward_tensor_expert_parallel(
+                &normed,
+                assignment,
+                tensor_group,
+                expert_group,
+                statistics,
+                stream,
+            )?,
+            stream,
+        )
+    }
+
+    pub(crate) fn forward_with_expert_executor<C: KeyValueCache, F>(
+        &mut self,
+        x: &Array,
+        mask: Option<&Array>,
+        cache: &mut C,
         stream: &Stream,
         execute: F,
     ) -> Result<Array, Exception>
@@ -1036,11 +1131,11 @@ impl TransformerBlock {
         )
     }
 
-    pub(crate) fn forward_tensor_with_expert_executor<F>(
+    pub(crate) fn forward_tensor_with_expert_executor<C: KeyValueCache, F>(
         &mut self,
         x: &Array,
         mask: Option<&Array>,
-        cache: &mut LayerCache,
+        cache: &mut C,
         tensor_group: &safemlx::distributed::Group,
         stream: &Stream,
         execute: F,

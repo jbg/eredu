@@ -64,6 +64,7 @@ enum FixtureFamily {
     Qwen3MoeTied,
     Qwen3MoeGguf,
     GptOss,
+    GptOssGguf,
     Lfm2,
     Lfm2Moe,
     KimiLinear,
@@ -89,6 +90,7 @@ impl FixtureFamily {
             Self::Qwen3MoeTied => "qwen3-moe-tied",
             Self::Qwen3MoeGguf => "qwen3-moe-gguf",
             Self::GptOss => "gpt-oss",
+            Self::GptOssGguf => "gpt-oss-gguf",
             Self::Lfm2 => "lfm2",
             Self::Lfm2Moe => "lfm2-moe",
             Self::KimiLinear => "kimi-linear",
@@ -114,6 +116,7 @@ impl FixtureFamily {
             Self::Qwen3MoeTied,
             Self::Qwen3MoeGguf,
             Self::GptOss,
+            Self::GptOssGguf,
             Self::Lfm2,
             Self::Lfm2Moe,
             Self::KimiLinear,
@@ -143,6 +146,7 @@ impl FixtureFamily {
             | Self::Qwen3MoeTied
             | Self::Qwen3MoeGguf
             | Self::GptOss
+            | Self::GptOssGguf
             | Self::Lfm2
             | Self::Lfm2Moe
             | Self::KimiLinear
@@ -176,7 +180,7 @@ impl FixtureFamily {
             Self::Qwen2 => ("dense_qwen", "qwen2"),
             Self::Qwen3 => ("dense_qwen", "qwen3"),
             Self::Qwen3Moe | Self::Qwen3MoeTied | Self::Qwen3MoeGguf => ("dense_qwen", "qwen3_moe"),
-            Self::GptOss => ("gpt_oss", "gpt_oss"),
+            Self::GptOss | Self::GptOssGguf => ("gpt_oss", "gpt_oss"),
             Self::Lfm2 => ("lfm2", "lfm2"),
             Self::Lfm2Moe => ("lfm2", "lfm2_moe"),
             Self::KimiLinear | Self::KimiLinearGguf => ("kimi_linear", "kimi_linear"),
@@ -201,7 +205,7 @@ impl FixtureFamily {
     const fn has_gguf_source(self) -> bool {
         matches!(
             self,
-            Self::KimiLinearGguf | Self::InklingGguf | Self::Qwen3MoeGguf
+            Self::KimiLinearGguf | Self::InklingGguf | Self::Qwen3MoeGguf | Self::GptOssGguf
         )
     }
 
@@ -216,6 +220,8 @@ impl FixtureFamily {
                 | Self::Qwen3Moe
                 | Self::Qwen3MoeTied
                 | Self::Qwen3MoeGguf
+                | Self::GptOss
+                | Self::GptOssGguf
                 | Self::Qwen3NextMoe
                 | Self::Qwen35
                 | Self::Qwen35Moe
@@ -271,6 +277,8 @@ fn pipeline_ring_worker() {
                     | FixtureFamily::Qwen3Moe
                     | FixtureFamily::Qwen3MoeTied
                     | FixtureFamily::Qwen3MoeGguf
+                    | FixtureFamily::GptOss
+                    | FixtureFamily::GptOssGguf
             )
             .then_some(2),
             &group,
@@ -354,7 +362,7 @@ fn pipeline_ring_worker() {
         && !family.has_gguf_source()
         && !matches!(
             family,
-            FixtureFamily::Qwen3Moe | FixtureFamily::Qwen3MoeTied
+            FixtureFamily::Qwen3Moe | FixtureFamily::Qwen3MoeTied | FixtureFamily::GptOss
         )
     {
         for layer in 0..family.layer_count() {
@@ -1503,6 +1511,180 @@ fn write_gpt_oss_fixture(directory: &Path) {
     .unwrap();
 }
 
+struct QuantizedGgufFixtureTensor {
+    name: String,
+    dimensions: Vec<u64>,
+    ggml_type: GgmlType,
+    data: Vec<u8>,
+}
+
+fn mxfp4_payload(elements: u64, phase: usize) -> Vec<u8> {
+    assert_eq!(elements % 32, 0);
+    let mut data = Vec::with_capacity((elements / 32) as usize * 17);
+    for block in 0..elements / 32 {
+        data.push(127 + ((block as usize + phase) % 3) as u8);
+        data.extend((0..16).map(|index| {
+            let low = ((index + phase) % 7 + 1) as u8;
+            let high = ((index * 3 + phase) % 7 + 1) as u8;
+            low | (high << 4)
+        }));
+    }
+    data
+}
+
+fn write_gpt_oss_gguf_fixture(path: &Path) {
+    let metadata = BTreeMap::from([
+        (
+            "general.architecture".into(),
+            GgufMetadataValue::String("gpt-oss".into()),
+        ),
+        ("general.file_type".into(), GgufMetadataValue::Uint32(39)),
+        (
+            "gpt-oss.embedding_length".into(),
+            GgufMetadataValue::Uint32(64),
+        ),
+        ("gpt-oss.block_count".into(), GgufMetadataValue::Uint32(2)),
+        (
+            "gpt-oss.expert_feed_forward_length".into(),
+            GgufMetadataValue::Uint32(96),
+        ),
+        (
+            "gpt-oss.attention.head_count".into(),
+            GgufMetadataValue::Uint32(4),
+        ),
+        (
+            "gpt-oss.attention.head_count_kv".into(),
+            GgufMetadataValue::Uint32(2),
+        ),
+        (
+            "gpt-oss.attention.key_length".into(),
+            GgufMetadataValue::Uint32(32),
+        ),
+        (
+            "gpt-oss.attention.layer_norm_rms_epsilon".into(),
+            GgufMetadataValue::Float32(0.00001),
+        ),
+        (
+            "gpt-oss.attention.sliding_window".into(),
+            GgufMetadataValue::Uint32(3),
+        ),
+        (
+            "gpt-oss.context_length".into(),
+            GgufMetadataValue::Uint32(128),
+        ),
+        (
+            "gpt-oss.rope.freq_base".into(),
+            GgufMetadataValue::Float32(150000.0),
+        ),
+        ("gpt-oss.expert_count".into(), GgufMetadataValue::Uint32(2)),
+        (
+            "gpt-oss.expert_used_count".into(),
+            GgufMetadataValue::Uint32(1),
+        ),
+        ("gpt-oss.vocab_size".into(), GgufMetadataValue::Uint32(64)),
+    ]);
+    let f32_tensor = |name: String, dimensions: Vec<u64>, phase: usize| {
+        let values = patterned_values(
+            usize::try_from(dimensions.iter().product::<u64>()).unwrap(),
+            0.003,
+            phase,
+        );
+        QuantizedGgufFixtureTensor {
+            name,
+            dimensions,
+            ggml_type: GgmlType::F32,
+            data: values.into_iter().flat_map(f32::to_le_bytes).collect(),
+        }
+    };
+    let mxfp4_tensor = |name: String, dimensions: Vec<u64>, phase: usize| {
+        let elements = dimensions.iter().product();
+        QuantizedGgufFixtureTensor {
+            name,
+            dimensions,
+            ggml_type: GgmlType::MxFp4,
+            data: mxfp4_payload(elements, phase),
+        }
+    };
+    let mut tensors = vec![f32_tensor("token_embd.weight".into(), vec![64, 64], 0)];
+    for layer in 0..2 {
+        let prefix = format!("blk.{layer}");
+        let phase = layer * 20;
+        tensors.extend([
+            f32_tensor(format!("{prefix}.attn_norm.weight"), vec![64], phase + 1),
+            f32_tensor(
+                format!("{prefix}.attn_post_norm.weight"),
+                vec![64],
+                phase + 2,
+            ),
+            f32_tensor(format!("{prefix}.attn_q.weight"), vec![64, 128], phase + 3),
+            f32_tensor(format!("{prefix}.attn_q.bias"), vec![128], phase + 4),
+            f32_tensor(format!("{prefix}.attn_k.weight"), vec![64, 64], phase + 5),
+            f32_tensor(format!("{prefix}.attn_k.bias"), vec![64], phase + 6),
+            f32_tensor(format!("{prefix}.attn_v.weight"), vec![64, 64], phase + 7),
+            f32_tensor(format!("{prefix}.attn_v.bias"), vec![64], phase + 8),
+            f32_tensor(
+                format!("{prefix}.attn_output.weight"),
+                vec![128, 64],
+                phase + 9,
+            ),
+            f32_tensor(format!("{prefix}.attn_output.bias"), vec![64], phase + 10),
+            f32_tensor(format!("{prefix}.attn_sinks.weight"), vec![4], phase + 11),
+            f32_tensor(
+                format!("{prefix}.ffn_gate_inp.weight"),
+                vec![64, 2],
+                phase + 12,
+            ),
+            f32_tensor(format!("{prefix}.ffn_gate_inp.bias"), vec![2], phase + 13),
+            mxfp4_tensor(
+                format!("{prefix}.ffn_gate_exps.weight"),
+                vec![64, 96, 2],
+                phase + 14,
+            ),
+            f32_tensor(
+                format!("{prefix}.ffn_gate_exps.bias"),
+                vec![96, 2],
+                phase + 15,
+            ),
+            mxfp4_tensor(
+                format!("{prefix}.ffn_up_exps.weight"),
+                vec![64, 96, 2],
+                phase + 16,
+            ),
+            f32_tensor(
+                format!("{prefix}.ffn_up_exps.bias"),
+                vec![96, 2],
+                phase + 17,
+            ),
+            mxfp4_tensor(
+                format!("{prefix}.ffn_down_exps.weight"),
+                vec![96, 64, 2],
+                phase + 18,
+            ),
+            f32_tensor(
+                format!("{prefix}.ffn_down_exps.bias"),
+                vec![64, 2],
+                phase + 19,
+            ),
+        ]);
+    }
+    tensors.extend([
+        f32_tensor("output_norm.weight".into(), vec![64], 41),
+        f32_tensor("output.weight".into(), vec![64, 64], 42),
+    ]);
+    let inputs = tensors
+        .iter()
+        .map(|tensor| TensorInput {
+            name: &tensor.name,
+            dimensions: &tensor.dimensions,
+            ggml_type: tensor.ggml_type,
+            data: &tensor.data,
+        })
+        .collect::<Vec<_>>();
+    Writer::default()
+        .write(std::fs::File::create(path).unwrap(), &metadata, &inputs)
+        .unwrap();
+}
+
 fn write_lfm2_pipeline_fixture(directory: &Path, moe: bool) {
     let config = serde_json::json!({
         "model_type": if moe { "lfm2_moe" } else { "lfm2" },
@@ -2596,6 +2778,56 @@ fn ring_two_process_gpt_oss_pipeline() {
     run_ring_pipeline(false, FixtureFamily::GptOss);
 }
 
+/// Proves GPT-OSS resident TP+PP+EP execution against the single-rank model.
+#[test]
+#[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
+fn ring_eight_process_gpt_oss_triple_axis() {
+    run_ring_cartesian_pipeline(false, FixtureFamily::GptOss, "tp-pp-ep");
+}
+
+/// Exercises GPT-OSS triple-axis dense streaming with independent expert caches.
+#[test]
+#[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
+fn ring_eight_process_gpt_oss_streamed_triple_axis_expert_cache() {
+    run_ring_cartesian_pipeline_mode(
+        true,
+        FixtureFamily::GptOss,
+        "tp-pp-ep",
+        WorkerMode::ExpertCache,
+    );
+}
+
+/// Exercises canonical type-39 GPT-OSS GGUF across all three axes.
+#[test]
+#[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
+fn ring_eight_process_gpt_oss_gguf_triple_axis_expert_cache() {
+    run_ring_cartesian_pipeline_mode(
+        true,
+        FixtureFamily::GptOssGguf,
+        "tp-pp-ep",
+        WorkerMode::ExpertCache,
+    );
+}
+
+/// Covers independent GPT-OSS expert caching when PP is active without EP.
+#[test]
+#[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
+fn ring_two_process_gpt_oss_pipeline_expert_cache() {
+    run_ring_pipeline_mode(false, FixtureFamily::GptOss, WorkerMode::ExpertCache);
+}
+
+/// Verifies failure consensus remains deadlock-free with GPT-OSS cached experts.
+#[test]
+#[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
+fn ring_four_process_gpt_oss_pipeline_expert_cache_mismatch_consensus() {
+    run_ring_cartesian_pipeline_mode(
+        false,
+        FixtureFamily::GptOss,
+        "pp-ep",
+        WorkerMode::ExpertCacheScheduleMismatch,
+    );
+}
+
 /// Verifies descriptor-backed convolution state, paged KV state, and persisted
 /// replay across two LFM2 pipeline ranks.
 #[test]
@@ -2945,6 +3177,10 @@ fn run_ring_cartesian_pipeline_mode(
         let path = checkpoint.path().join("model.gguf");
         write_qwen3_moe_gguf_fixture(&path);
         path
+    } else if family == FixtureFamily::GptOssGguf {
+        let path = checkpoint.path().join("model.gguf");
+        write_gpt_oss_gguf_fixture(&path);
+        path
     } else if family == FixtureFamily::KimiLinearGguf {
         let path = checkpoint.path().join("model.gguf");
         write_kimi_linear_gguf_fixture(&path);
@@ -2973,6 +3209,7 @@ fn run_ring_cartesian_pipeline_mode(
                 write_qwen_hybrid_moe_fixture(checkpoint.path(), "qwen3_5_moe_text")
             }
             FixtureFamily::Inkling => write_inkling_fixture(checkpoint.path()),
+            FixtureFamily::GptOss => write_gpt_oss_fixture(checkpoint.path()),
             _ => panic!("Cartesian pipeline helper received unsupported {family:?}"),
         }
         checkpoint.path().to_path_buf()
@@ -3002,6 +3239,10 @@ fn run_ring_pipeline_mode(dense_stream: bool, family: FixtureFamily, mode: Worke
     let checkpoint_path = if family == FixtureFamily::Qwen3MoeGguf {
         let path = checkpoint.path().join("model.gguf");
         write_qwen3_moe_gguf_fixture(&path);
+        path
+    } else if family == FixtureFamily::GptOssGguf {
+        let path = checkpoint.path().join("model.gguf");
+        write_gpt_oss_gguf_fixture(&path);
         path
     } else if family == FixtureFamily::KimiLinearGguf {
         let path = checkpoint.path().join("model.gguf");
@@ -3037,6 +3278,7 @@ fn run_ring_pipeline_mode(dense_stream: bool, family: FixtureFamily, mode: Worke
             }
             FixtureFamily::Inkling => write_inkling_fixture(checkpoint.path()),
             FixtureFamily::Qwen3MoeGguf
+            | FixtureFamily::GptOssGguf
             | FixtureFamily::KimiLinearGguf
             | FixtureFamily::InklingGguf => unreachable!(),
         }

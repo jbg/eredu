@@ -28,8 +28,10 @@ SafeMLX is independent of Apple and is not an official MLX project.
 - A native Mimi audio codec implementation for codec-token speech models.
 - An example command-line text generator.
 
-See [model and checkpoint support](doc/model-support.md) for the current model
-families, formats, feature gates, and residency limitations.
+See [model and checkpoint support](doc/model-support.md) for current formats
+and feature gates. The language-model crate's
+[combined-topology migration ledger](safemlx-lm/README.md#authoritative-combined-topology-migration-ledger)
+is the persistent family-by-family backlog and limitations source of truth.
 
 ## Workspace
 
@@ -153,11 +155,11 @@ their alternating or explicit attention schedule.
 Fully resident Qwen stages support aligned affine or MXFP4 requantization;
 GPT-OSS can MXFP4-quantize eligible dense matrices without transcoding its
 expert banks. Dense disk streaming requires checkpoint-native encodings.
-Qwen3-MoE additionally supports arbitrary-geometry TP+PP+EP through the same
-Cartesian topology and semantic layer plan for fully resident or dense-streamed
-SafeTensors and canonical `qwen3moe` GGUF checkpoints. Its independent expert
-cache also composes with PP and TP+PP without requiring an EP communicator:
-each stage owns the experts for its local layers, and TP ranks retain only
+Qwen3-MoE and GPT-OSS additionally support arbitrary-geometry TP+PP+EP through
+the same Cartesian topology and semantic layer plan for fully resident or
+dense-streamed SafeTensors and their canonical GGUF checkpoints. Their
+independent expert caches compose with PP, TP+PP, PP+EP, and TP+PP+EP; without
+EP, each stage owns the experts for its local layers and TP ranks retain only
 their semantic projection shards.
 LFM2 and LFM2-MoE use the same runtime for SafeTensors and canonical
 `lfm2`/`lfm2moe` GGUF checkpoints. Their alternating causal-convolution and
