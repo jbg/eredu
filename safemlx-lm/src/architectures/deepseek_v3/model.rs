@@ -2693,6 +2693,48 @@ impl DecoderLayer {
         hidden.add(feed_forward, stream)
     }
 
+    /// Executes TP-sharded MLA and dense/shared projections while delegating
+    /// routed experts to an EP-scoped executor.
+    pub(crate) fn forward_tensor_with_expert_executor<F>(
+        &mut self,
+        x: &Array,
+        mask: Option<&Array>,
+        cache: Option<&mut CompressedLatentCache>,
+        group: &safemlx::distributed::Group,
+        stream: &Stream,
+        execute: F,
+    ) -> Result<Array, Exception>
+    where
+        F: FnOnce(&Array, &Array, &Array, &Stream) -> Result<Array, Exception>,
+    {
+        let normalized = self.input_layernorm.forward(x, stream)?;
+        let mut observer = None;
+        let attention =
+            self.self_attn
+                .forward_impl(&normalized, mask, cache, stream, "", &mut observer)?;
+        let attention = safemlx::distributed::all_sum(&attention, group, stream)?;
+        let hidden = x.add(attention, stream)?;
+        let normalized = self.post_attention_layernorm.forward(&hidden, stream)?;
+        let feed_forward = match &mut self.mlp {
+            FeedForward::Dense(mlp) => {
+                let partial = mlp.forward_impl(&normalized, stream, "", &mut observer)?;
+                safemlx::distributed::all_sum(&partial, group, stream)?
+            }
+            FeedForward::Moe(moe) => {
+                let shape = normalized.shape();
+                let flat = normalized.reshape(&[-1, normalized.dim(-1)], stream)?;
+                let (indices, weights) = moe.gate.forward(&flat, stream)?;
+                let routed = execute(&flat, &indices, &weights, stream)?;
+                let shared_partial =
+                    moe.shared_experts
+                        .forward_impl(&flat, stream, "", &mut observer)?;
+                let shared = safemlx::distributed::all_sum(&shared_partial, group, stream)?;
+                routed.add(shared, stream)?.reshape(shape, stream)?
+            }
+        };
+        hidden.add(feed_forward, stream)
+    }
+
     /// Executes a rank-local tensor-parallel block.
     ///
     /// The layer must have head/intermediate projections constructed with

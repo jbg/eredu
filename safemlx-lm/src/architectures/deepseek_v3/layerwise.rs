@@ -265,6 +265,41 @@ impl DeepSeekV3LayerwiseModel {
         )
     }
 
+    /// Runs TP-sharded MLA and dense/shared projections while delegating
+    /// routed experts to the matching EP subgroup.
+    pub(crate) fn forward_tensor_expert_parallel<F>(
+        &mut self,
+        inputs: &Array,
+        mask: Option<&Array>,
+        cache: &mut Cache,
+        tensor_group: &safemlx::distributed::Group,
+        mut execute: F,
+        stream: &Stream,
+    ) -> Result<Array, Error>
+    where
+        F: FnMut(usize, &Array, &Array, &Array, &Stream) -> Result<Array, Exception>,
+    {
+        self.execution.forward_tensor_parallel_with_layer_executor(
+            inputs,
+            cache,
+            tensor_group,
+            stream,
+            |_adapter, _group, index, layer, hidden, cache, context, execution| {
+                let tp_group = execution.group().ok_or_else(|| {
+                    Error::Parallel("DeepSeek TP+EP execution requires an active TP group".into())
+                })?;
+                Ok(layer.forward_tensor_with_expert_executor(
+                    hidden,
+                    mask.or(context.mask.as_ref()),
+                    Some(&mut cache.layers[index]),
+                    tp_group,
+                    execution.stream(),
+                    |hidden, ids, weights, stream| execute(index, hidden, ids, weights, stream),
+                )?)
+            },
+        )
+    }
+
     /// Clears temporary decoder blocks from the execution device.
     pub fn clear_device_layer_window(&self) -> Result<(), Error> {
         self.execution.clear_device_group("text_decoder")
@@ -588,13 +623,34 @@ fn load_deepseek_gguf_sparse_with_store(
 pub(crate) fn load_deepseek_v3_sparse_ep_base_with_store(
     store: Arc<dyn WeightStore + Send + Sync>,
     args: ModelArgs,
-    non_expert: crate::runtime::residency::dense_stream::DenseDiskStreamLoadOptions,
+    non_expert: impl Into<LayerExecutionLoadOptions>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<DeepSeekV3LayerwiseModel, Error> {
     args.validate()?;
     let adapter = DeepSeekV3LayerwiseAdapter::new_sparse(args, stream)?;
     let execution = load_layerwise_model(store, adapter, non_expert, stream, weights_stream)?;
+    Ok(DeepSeekV3LayerwiseModel { execution })
+}
+
+pub(crate) fn load_deepseek_v3_sparse_tp_ep_base_with_store(
+    store: Arc<dyn WeightStore + Send + Sync>,
+    args: ModelArgs,
+    non_expert: impl Into<LayerExecutionLoadOptions>,
+    build: crate::runtime::distributed::parallel::ParallelBuildContext,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<DeepSeekV3LayerwiseModel, Error> {
+    let mut adapter = DeepSeekV3LayerwiseAdapter::new(args, stream)?;
+    adapter.sparse_expert_cache = true;
+    let execution = load_tensor_parallel_layerwise_model(
+        store,
+        adapter,
+        non_expert,
+        build,
+        stream,
+        weights_stream,
+    )?;
     Ok(DeepSeekV3LayerwiseModel { execution })
 }
 
@@ -1255,6 +1311,54 @@ impl ArchitectureAdapter for DeepSeekV3LayerwiseAdapter {
         )?)
     }
 
+    fn new_expert_parallel_layer(
+        &self,
+        group: usize,
+        index: usize,
+        assignment: &crate::runtime::distributed::expert::ExpertAssignment,
+        stream: &Stream,
+    ) -> Result<Self::Layer, Error> {
+        let mut layer = self.new_layer(group, index, stream)?;
+        if let Some(moe) = layer.mlp.moe_mut() {
+            moe.experts = resident::RoutedExperts::new_compact(
+                &self.args,
+                index as i32,
+                i32::try_from(assignment.local_expert_count()).map_err(|_| {
+                    Error::Parallel("local DeepSeek expert count exceeds i32".into())
+                })?,
+                stream,
+            )?;
+        }
+        Ok(layer)
+    }
+
+    fn expert_parallel_assignment(
+        &self,
+        topology: crate::runtime::distributed::topology::ParallelTopology,
+    ) -> Result<Option<crate::runtime::distributed::expert::ExpertAssignment>, Error> {
+        if topology.expert_parallel_size == 1 {
+            return Ok(None);
+        }
+        if self.args.n_routed_experts <= 0
+            || !self
+                .args
+                .layer_schedule
+                .iter()
+                .any(|policy| *policy == LayerPolicy::SparseMoe)
+        {
+            return Err(Error::Parallel(
+                "DeepSeek PP+EP requires a checkpoint with sparse MoE layers".into(),
+            ));
+        }
+        Ok(Some(
+            crate::runtime::distributed::expert::ExpertAssignment::balanced(
+                self.args.n_routed_experts as usize,
+                topology.expert_parallel_size,
+                topology.expert_parallel_rank,
+            )?,
+        ))
+    }
+
     fn register_parallel_parameters(
         &self,
         _context: crate::runtime::distributed::parallel::ParallelBuildContext,
@@ -1446,6 +1550,38 @@ impl ArchitectureAdapter for DeepSeekV3LayerwiseAdapter {
             store,
             layout,
         )
+    }
+
+    fn expert_parallel_layer_bindings(
+        &self,
+        group: usize,
+        index: usize,
+        _layer: &Self::Layer,
+        store: &dyn WeightStore,
+        assignment: &crate::runtime::distributed::expert::ExpertAssignment,
+        stream: &Stream,
+    ) -> Result<Vec<WeightBinding>, Error> {
+        let global = self.new_layer(group, index, stream)?;
+        let indices = assignment.local_global_expert_ids().to_vec();
+        self.layer_bindings(group, index, &global, store)?
+            .into_iter()
+            .map(|binding| {
+                let target = binding.logical_target().unwrap_or_else(|| binding.name());
+                if target.contains("mlp.experts.") {
+                    binding
+                        .select_bounded_output(
+                            store,
+                            TensorSelection::Indices {
+                                axis: 0,
+                                indices: indices.clone(),
+                            },
+                        )
+                        .map_err(Error::from)
+                } else {
+                    Ok(binding)
+                }
+            })
+            .collect()
     }
 
     fn additional_consumed_checkpoint_keys(&self, store: &dyn WeightStore) -> Vec<String> {

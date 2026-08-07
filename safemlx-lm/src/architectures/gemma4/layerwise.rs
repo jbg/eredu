@@ -1011,6 +1011,53 @@ impl Gemma4LayerwiseAdapter {
         )
     }
 
+    /// Builds one rank-local text block from the configured semantic TP plan.
+    pub(crate) fn new_cartesian_text_layer(
+        &self,
+        index: usize,
+        layout: Option<&crate::runtime::distributed::parallel::LocalModelLayout>,
+        stream: &Stream,
+    ) -> Result<TransformerBlock, Error> {
+        match layout {
+            Some(layout) => match self.new_parallel_layer(0, index, layout, stream)? {
+                Gemma4Layer::Text(layer) => Ok(*layer),
+                _ => Err(Error::Parallel(format!(
+                    "Gemma 4 text planner returned a non-text layer at index {index}"
+                ))),
+            },
+            None => Ok(TransformerBlock::new(
+                &self.args,
+                *self.args.layer_policy(index).ok_or_else(|| {
+                    Error::Parallel(format!("Gemma 4 has no text policy for layer {index}"))
+                })?,
+                index,
+                stream,
+            )?),
+        }
+    }
+
+    /// Resolves ordinary or TP-local bindings for one text block.
+    pub(crate) fn cartesian_text_layer_bindings(
+        &self,
+        index: usize,
+        _layer: &TransformerBlock,
+        store: &dyn WeightStore,
+        layout: Option<&crate::runtime::distributed::parallel::LocalModelLayout>,
+        stream: &Stream,
+    ) -> Result<Vec<WeightBinding>, Error> {
+        let global = self.new_cartesian_text_layer(index, None, stream)?;
+        let bindings = self.text_layer_bindings(index, &global, store)?;
+        let Some(layout) = layout else {
+            return Ok(bindings);
+        };
+        crate::runtime::execution::layerwise::shard_layer_bindings(
+            bindings,
+            &format!("model.language_model.layers.{index}"),
+            store,
+            layout,
+        )
+    }
+
     fn new(
         args: ModelArgs,
         vision_config: Option<Gemma4VisionConfig>,
@@ -1104,6 +1151,16 @@ impl Gemma4LayerwiseAdapter {
     /// Returns normalized Gemma 4 text arguments.
     pub const fn args(&self) -> &ModelArgs {
         &self.args
+    }
+
+    /// Returns the planner-derived text cache geometry after TP configuration.
+    pub(crate) fn parallel_text_cache_layout(
+        &self,
+    ) -> Result<crate::LayerSchedule<crate::LayerCachePolicy>, Error> {
+        let geometry = self.parallel_text_geometry.as_ref().ok_or_else(|| {
+            Error::Parallel("Gemma 4 text TP geometry has not been configured".into())
+        })?;
+        resident::prompt_cache_layer_layout_with_geometry(&self.args, geometry)
     }
 
     fn mtp_embedding_snapshot(

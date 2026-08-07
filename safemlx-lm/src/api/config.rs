@@ -109,8 +109,13 @@ pub(crate) fn ensure_executable_load_options(options: ModelLoadOptions) -> Resul
                 "non-replicated pure expert-parallel loading cannot return the complete Model type; use architectures::distributed::expert::load_expert_parallel_model_with_options"
                     .into()
             } else {
-                "hybrid TP+PP, TP+EP, and PP+EP model loading is unsupported; use a pure tensor-, pipeline-, or expert-parallel topology"
-                    .into()
+                if topology.pipeline_parallel_size > 1 {
+                    "Cartesian pipeline topology cannot return the complete Model type; use architectures::distributed::pipeline::load_pipeline_model_with_options and PipelineModel::forward_cartesian"
+                        .into()
+                } else {
+                    "Cartesian TP+EP topology cannot return the complete Model type; use architectures::distributed::expert::load_expert_parallel_model_with_options and ExpertParallelModel::forward_cartesian"
+                        .into()
+                }
             },
         ))
     } else {
@@ -175,7 +180,7 @@ impl ModelKind {
             "nemotron_h" => Ok(Self::NemotronH),
             "personaplex" => Ok(Self::PersonaPlex),
             "qwen2" => Ok(Self::Qwen2),
-            "qwen3" => Ok(Self::Qwen3),
+            "qwen3" | "qwen3_moe" => Ok(Self::Qwen3),
             "qwen3_next" => Ok(Self::Qwen3Next),
             "qwen3_vl" | "qwen3_vl_text" => Ok(Self::Qwen3Vl),
             "qwen3_vl_moe" | "qwen3_vl_moe_text" => Ok(Self::Qwen3VlMoe),
@@ -208,13 +213,14 @@ pub(crate) enum GgufArchitecture {
     Qwen3,
     Qwen3Moe,
     Qwen3Vl,
+    Qwen3VlMoe,
     Qwen35,
     Qwen35Moe,
     Qwen3Next,
 }
 
 impl GgufArchitecture {
-    pub(crate) const SUPPORTED_NAMES: &'static str = "kimi-linear, deepseek2, gpt-oss, inkling, gemma4, llama, mistral, lfm2, lfm2moe, nemotron_h, nemotron_h_moe, qwen2, qwen3, qwen3moe, qwen3vl, qwen35, qwen35moe, and qwen3next";
+    pub(crate) const SUPPORTED_NAMES: &'static str = "kimi-linear, deepseek2, gpt-oss, inkling, gemma4, llama, mistral, lfm2, lfm2moe, nemotron_h, nemotron_h_moe, qwen2, qwen3, qwen3moe, qwen3vl, qwen3vlmoe, qwen35, qwen35moe, and qwen3next";
 
     pub(crate) fn resolve(name: &str) -> Result<Self, Error> {
         match name {
@@ -233,6 +239,7 @@ impl GgufArchitecture {
             "qwen3" => Ok(Self::Qwen3),
             "qwen3moe" => Ok(Self::Qwen3Moe),
             "qwen3vl" => Ok(Self::Qwen3Vl),
+            "qwen3vlmoe" => Ok(Self::Qwen3VlMoe),
             "qwen35" => Ok(Self::Qwen35),
             "qwen35moe" => Ok(Self::Qwen35Moe),
             "qwen3next" => Ok(Self::Qwen3Next),
@@ -256,6 +263,7 @@ impl GgufArchitecture {
             Self::Qwen2 => ModelKind::Qwen2,
             Self::Qwen3 | Self::Qwen3Moe => ModelKind::Qwen3,
             Self::Qwen3Vl => ModelKind::Qwen3Vl,
+            Self::Qwen3VlMoe => ModelKind::Qwen3VlMoe,
             Self::Qwen35 | Self::Qwen35Moe => ModelKind::Qwen35,
             Self::Qwen3Next => ModelKind::Qwen3Next,
         }
@@ -279,6 +287,7 @@ impl GgufArchitecture {
                     | Self::Lfm2Moe
                     | Self::NemotronHMoe
                     | Self::Qwen3Moe
+                    | Self::Qwen3VlMoe
                     | Self::Qwen35Moe
                     | Self::Qwen3Next
             )
@@ -308,6 +317,7 @@ impl GgufArchitecture {
             Self::Qwen3 => "qwen3",
             Self::Qwen3Moe => "qwen3moe",
             Self::Qwen3Vl => "qwen3vl",
+            Self::Qwen3VlMoe => "qwen3vlmoe",
             Self::Qwen35 => "qwen35",
             Self::Qwen35Moe => "qwen35moe",
             Self::Qwen3Next => "qwen3next",

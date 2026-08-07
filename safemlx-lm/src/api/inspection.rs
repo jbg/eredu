@@ -1034,44 +1034,46 @@ fn inspect_gguf_projector(
     model_metadata: &HashMap<String, GgufMetadataValue>,
 ) {
     match architecture {
-        GgufArchitecture::Qwen3Vl => match qwen3_vl::find_qwen3_vl_mmproj(path) {
-            Ok(projector) => match GgufCheckpoint::open(&projector) {
-                Ok(checkpoint) => {
-                    let metadata = crate::runtime::checkpoint::load::gguf_metadata(&checkpoint);
-                    let validation = structural::validate_qwen3_vl_projector_gguf(
-                        model_checkpoint,
-                        model_metadata,
-                        &checkpoint,
-                        &metadata,
-                    );
-                    let exact = matches!(validation, structural::StructuralValidation::Exact);
-                    apply_structural_validation(report, validation, &projector);
-                    report.multimodal = if !exact {
-                        InspectionReadiness::Invalid
-                    } else if cfg!(feature = "image-processing") {
-                        InspectionReadiness::Ready
-                    } else {
-                        InspectionReadiness::Unsupported
-                    };
-                    report.requirements.push(InspectionRequirement {
-                        code: InspectionIssueCode::MissingMediaProjector,
-                        readiness: if exact {
+        GgufArchitecture::Qwen3Vl | GgufArchitecture::Qwen3VlMoe => {
+            match qwen3_vl::find_qwen3_vl_mmproj(path) {
+                Ok(projector) => match GgufCheckpoint::open(&projector) {
+                    Ok(checkpoint) => {
+                        let metadata = crate::runtime::checkpoint::load::gguf_metadata(&checkpoint);
+                        let validation = structural::validate_qwen3_vl_projector_gguf(
+                            model_checkpoint,
+                            model_metadata,
+                            &checkpoint,
+                            &metadata,
+                        );
+                        let exact = matches!(validation, structural::StructuralValidation::Exact);
+                        apply_structural_validation(report, validation, &projector);
+                        report.multimodal = if !exact {
+                            InspectionReadiness::Invalid
+                        } else if cfg!(feature = "image-processing") {
                             InspectionReadiness::Ready
                         } else {
-                            InspectionReadiness::Invalid
-                        },
-                        detail: if exact {
-                            "validated qwen3vl vision projector".into()
-                        } else {
-                            "qwen3vl vision projector is structurally incompatible".into()
-                        },
-                        path: Some(projector),
-                    });
-                }
-                Err(error) => reject_projector(report, projector, error.to_string(), true),
-            },
-            Err(error) => reject_projector(report, path.to_path_buf(), error.to_string(), true),
-        },
+                            InspectionReadiness::Unsupported
+                        };
+                        report.requirements.push(InspectionRequirement {
+                            code: InspectionIssueCode::MissingMediaProjector,
+                            readiness: if exact {
+                                InspectionReadiness::Ready
+                            } else {
+                                InspectionReadiness::Invalid
+                            },
+                            detail: if exact {
+                                "validated qwen3vl vision projector".into()
+                            } else {
+                                "qwen3vl vision projector is structurally incompatible".into()
+                            },
+                            path: Some(projector),
+                        });
+                    }
+                    Err(error) => reject_projector(report, projector, error.to_string(), true),
+                },
+                Err(error) => reject_projector(report, path.to_path_buf(), error.to_string(), true),
+            }
+        }
         GgufArchitecture::Inkling => match inkling::open_sibling_mmproj(path) {
             Ok(Some(mmproj)) => {
                 let projector_path =
@@ -1232,7 +1234,7 @@ fn modalities_for_gguf(architecture: GgufArchitecture) -> Vec<ArtifactModality> 
             ArtifactModality::Image,
             ArtifactModality::Audio,
         ],
-        GgufArchitecture::Qwen3Vl => vec![
+        GgufArchitecture::Qwen3Vl | GgufArchitecture::Qwen3VlMoe => vec![
             ArtifactModality::Text,
             ArtifactModality::Image,
             ArtifactModality::Video,

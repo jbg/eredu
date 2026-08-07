@@ -49,7 +49,7 @@ use crate::{
         ExecutionResidency, LayerExecutionLoadOptions, LayerwiseForwardState, LayerwiseLoadOptions,
         LayerwiseModel, LayerwiseModelMetadata, StaticUnitBindings, WeightResidency,
     },
-    runtime::residency::manager::{ResidencyReport, ResidentUnitLease},
+    runtime::residency::manager::{ResidencyReport, ResidentUnitLease, WeightBinding},
 };
 
 const EMBEDDING_UNIT: &str = "llama.static.embedding";
@@ -1207,6 +1207,24 @@ impl ArchitectureAdapter for LlamaLayerwiseAdapter {
 
     fn layer_unit_name(&self, _group: usize, index: usize) -> String {
         format!("llama.layer.{index:05}")
+    }
+
+    fn parallel_layer_bindings(
+        &self,
+        group: usize,
+        index: usize,
+        _layer: &Self::Layer,
+        store: &dyn WeightStore,
+        layout: &crate::runtime::distributed::parallel::LocalModelLayout,
+        stream: &Stream,
+    ) -> Result<Vec<WeightBinding>, Error> {
+        let global = self.new_layer(group, index, stream)?;
+        crate::runtime::execution::layerwise::shard_layer_bindings(
+            self.layer_bindings(group, index, &global, store)?,
+            &self.layer_checkpoint_prefix(group, index),
+            store,
+            layout,
+        )
     }
 
     fn forward_layer(

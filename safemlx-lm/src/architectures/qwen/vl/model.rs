@@ -981,9 +981,10 @@ pub fn load_qwen3_vl_model_quantized(
     Ok(model)
 }
 
-/// Loads a Qwen3-VL GGUF language model and its llama.cpp-style vision
-/// projector. The vision projector must use dense F16/BF16/F32 tensors; the
-/// language model may use any GGUF quantization supported by the Qwen3 loader.
+/// Loads a dense or MoE Qwen3-VL GGUF language model and its llama.cpp-style
+/// vision projector. The vision projector must use dense F16/BF16/F32 tensors;
+/// the language model may use any GGUF quantization supported by the shared
+/// Qwen text loader.
 pub fn load_qwen3_vl_gguf(
     gguf_file: impl AsRef<Path>,
     mmproj_file: impl AsRef<Path>,
@@ -1040,6 +1041,7 @@ pub(crate) fn load_qwen3_vl_gguf_checkpoint(
         &vision_metadata,
     )?;
     let mut model_args = prepared.args;
+    let is_moe = model_args.text_config.is_moe();
     if let Some(quantization) = quantization {
         model_args.text_config.quantization = Some(quantization);
         model_args.text_config.quantization_config = None;
@@ -1049,21 +1051,74 @@ pub(crate) fn load_qwen3_vl_gguf_checkpoint(
     let mut model = Model::new(model_args, stream)?;
     let config = StrictLoadConfig::default();
     let mut report = StrictLoadReport::default();
-    for tensor in checkpoint.converted_tensors() {
-        for (name, value) in tensor?.into_arrays() {
-            let name = dense_qwen::translate_gguf_weight_name(&name, false);
-            let name = name
-                .strip_prefix("model.")
-                .map(|name| format!("model.language_model.{name}"))
-                .unwrap_or(name);
+    let text_name = |name: &str| {
+        let name = dense_qwen::translate_gguf_weight_name(name, is_moe);
+        name.strip_prefix("model.")
+            .map(|name| format!("model.language_model.{name}"))
+            .unwrap_or(name)
+    };
+    let mut text_materializer = checkpoint.materializer();
+    for tensor in checkpoint.catalog().tensors() {
+        let physical_name = &tensor.descriptor().name;
+        if is_moe
+            && (physical_name.contains("ffn_gate_exps") || physical_name.contains("ffn_up_exps"))
+        {
+            continue;
+        }
+        for (name, value) in text_materializer
+            .converted_tensor(physical_name)?
+            .into_arrays()
+        {
             load_named_array_strict(
                 &mut model,
-                name,
+                text_name(&name),
                 value,
                 quantization.map(|value| (value, stream)),
                 &config,
                 &mut report,
             )?;
+        }
+    }
+    if is_moe {
+        for layer in 0..model.args.text_config.num_hidden_layers {
+            let source_prefix = format!("blk.{layer}");
+            let target_prefix = format!("model.language_model.layers.{layer}.mlp.experts");
+            let gate = text_materializer
+                .converted_tensor(&format!("{source_prefix}.ffn_gate_exps.weight"))?
+                .into_arrays()
+                .into_iter()
+                .collect::<HashMap<_, _>>();
+            let up = text_materializer
+                .converted_tensor(&format!("{source_prefix}.ffn_up_exps.weight"))?
+                .into_arrays()
+                .into_iter()
+                .collect::<HashMap<_, _>>();
+            for (source_suffix, target_suffix) in
+                [("weight", ""), ("scales", "_scales"), ("biases", "_biases")]
+            {
+                let gate_name = format!("{source_prefix}.ffn_gate_exps.{source_suffix}");
+                let up_name = format!("{source_prefix}.ffn_up_exps.{source_suffix}");
+                match (gate.get(&gate_name), up.get(&up_name)) {
+                    (Some(gate), Some(up)) => {
+                        let value =
+                            concatenate_axis(&[gate.clone(), up.clone()], 1, weights_stream)?;
+                        load_named_array_strict(
+                            &mut model,
+                            format!("{target_prefix}.gate_up_proj{target_suffix}"),
+                            value,
+                            quantization.map(|value| (value, stream)),
+                            &config,
+                            &mut report,
+                        )?;
+                    }
+                    (None, None) if source_suffix != "weight" => {}
+                    _ => {
+                        return Err(Error::UnsupportedArchitecture(format!(
+                            "Qwen3-VL-MoE GGUF has incomplete gate/up expert tensors under {source_prefix}"
+                        )))
+                    }
+                }
+            }
         }
     }
     let mut vision_materializer = vision_checkpoint.materializer();
@@ -1119,11 +1174,15 @@ pub(crate) fn prepare_qwen3_vl_gguf_checkpoint(
     vision_metadata: &HashMap<String, GgufMetadataValue>,
 ) -> Result<PreparedQwen3VlGguf, Error> {
     let architecture = dense_qwen::gguf_string(metadata, "general.architecture")?;
-    if architecture != "qwen3vl" {
-        return Err(Error::UnsupportedArchitecture(format!(
-            "GGUF architecture {architecture:?}; this loader supports dense qwen3vl"
-        )));
-    }
+    let is_moe = match architecture.as_str() {
+        "qwen3vl" => false,
+        "qwen3vlmoe" => true,
+        _ => {
+            return Err(Error::UnsupportedArchitecture(format!(
+                "GGUF architecture {architecture:?}; this loader supports qwen3vl and qwen3vlmoe"
+            )))
+        }
+    };
     crate::api::structural::validate_qwen3_vl_projector_gguf(
         checkpoint,
         metadata,
@@ -1132,8 +1191,13 @@ pub(crate) fn prepare_qwen3_vl_gguf_checkpoint(
     )
     .into_loader_result()?;
     let (mut text_config, eos_token_ids) =
-        dense_qwen::prepare_gguf_checkpoint(checkpoint, metadata, &architecture, false)?;
-    text_config.model_type = "qwen3_vl_text".into();
+        dense_qwen::prepare_gguf_checkpoint(checkpoint, metadata, &architecture, is_moe)?;
+    text_config.model_type = if is_moe {
+        "qwen3_vl_moe_text"
+    } else {
+        "qwen3_vl_text"
+    }
+    .into();
     let args =
         qwen3_vl_args_from_gguf_catalog(text_config, metadata, vision_checkpoint, vision_metadata)?;
     Ok(PreparedQwen3VlGguf {
@@ -1254,7 +1318,14 @@ pub(crate) fn validate_qwen3_vl_text_gguf_catalog(
             "qwen3vl GGUF with an untied output head is not supported".into(),
         ));
     }
-    let mrope_section = gguf_integer_array(metadata, "qwen3vl.rope.dimension_sections", Some(3))?;
+    let architecture = dense_qwen::gguf_string(metadata, "general.architecture")?;
+    if !matches!(architecture.as_str(), "qwen3vl" | "qwen3vlmoe") {
+        return Err(Error::UnsupportedArchitecture(format!(
+            "Qwen3-VL text validation requires qwen3vl or qwen3vlmoe, got {architecture:?}"
+        )));
+    }
+    let mrope_key = format!("{architecture}.rope.dimension_sections");
+    let mrope_section = gguf_integer_array(metadata, &mrope_key, Some(3))?;
     if mrope_section.len() != 3 || mrope_section.iter().any(|&section| section < 0) {
         return Err(Error::UnsupportedArchitecture(format!(
             "qwen3vl GGUF RoPE sections must contain three non-negative values, got {mrope_section:?}"
@@ -1288,11 +1359,13 @@ pub(crate) fn validate_qwen3_vl_vision_geometry(
             "qwen3vl GGUF vision geometry must be positive".into(),
         ));
     }
-    if let Some(value) = metadata.get("qwen3vl.n_deepstack_layers") {
+    let architecture = dense_qwen::gguf_string(metadata, "general.architecture")?;
+    let deepstack_key = format!("{architecture}.n_deepstack_layers");
+    if let Some(value) = metadata.get(&deepstack_key) {
         let expected = value.as_i64().ok_or_else(|| {
-            Error::UnsupportedArchitecture(
-                "GGUF metadata key \"qwen3vl.n_deepstack_layers\" has the wrong type".into(),
-            )
+            Error::UnsupportedArchitecture(format!(
+                "GGUF metadata key {deepstack_key:?} has the wrong type"
+            ))
         })?;
         if expected != vision_config.deepstack_layer_count() as i64 {
             return Err(Error::UnsupportedArchitecture(format!(
@@ -1431,7 +1504,7 @@ pub(crate) fn translate_qwen3_vl_mmproj_name(name: &str, deepstack_layers: &[i32
     name.to_string()
 }
 
-/// Finds the dense sibling mmproj used by the single-path model loader.
+/// Finds the dense sibling mmproj used by the single-path dense or MoE loader.
 pub(crate) fn find_qwen3_vl_mmproj(gguf_file: &Path) -> Result<PathBuf, Error> {
     crate::runtime::checkpoint::gguf::find_sibling_mmproj(gguf_file, "qwen3vl")?.ok_or_else(|| {
         Error::UnsupportedArchitecture(format!(
@@ -1487,7 +1560,7 @@ pub type Generate<'a, S = crate::runtime::generation::sampler::DefaultSampler> =
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::{collections::HashMap, fs};
 
     use safemlx::{
         module::ModuleParameters,
@@ -1810,7 +1883,19 @@ mod tests {
     fn strict_loads_dense_qwen3_vl_from_synthetic_gguf_checkpoints() {
         let context = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
         let stream = context.stream();
-        let source = tiny_model(stream);
+        let mut source_args = tiny_args();
+        source_args.text_config.num_hidden_layers = 2;
+        source_args.text_config.attention_schedule =
+            crate::runtime::attention::LayerSchedule::all_full(2).unwrap();
+        let mut source = super::Model::new(source_args, stream).unwrap();
+        for (name, parameter) in source.parameters_mut().flatten() {
+            let shape = parameter.shape().to_vec();
+            *parameter = if name.ends_with("norm.weight") || name.ends_with("layernorm.weight") {
+                Array::ones::<f32>(&shape, stream).unwrap()
+            } else {
+                Array::full::<f32>(&shape, Array::from_f32(0.001), stream).unwrap()
+            };
+        }
         let mut arrays = HashMap::new();
         let mut vision_arrays = HashMap::new();
         for (name, value) in source.parameters().flatten() {
@@ -1880,7 +1965,7 @@ mod tests {
                 "qwen3vl.embedding_length".into(),
                 GgufMetadataValue::Uint32(12),
             ),
-            ("qwen3vl.block_count".into(), GgufMetadataValue::Uint32(1)),
+            ("qwen3vl.block_count".into(), GgufMetadataValue::Uint32(2)),
             (
                 "qwen3vl.feed_forward_length".into(),
                 GgufMetadataValue::Uint32(24),
@@ -1968,7 +2053,7 @@ mod tests {
         let fixture = crate::test_utils::SyntheticGguf::dense(&arrays, &metadata);
         let vision_fixture =
             crate::test_utils::SyntheticGguf::dense(&vision_arrays, &vision_metadata);
-        let loaded = super::load_qwen3_vl_gguf_with_metadata(
+        let mut loaded = super::load_qwen3_vl_gguf_with_metadata(
             fixture.path(),
             vision_fixture.path(),
             stream,
@@ -1979,6 +2064,93 @@ mod tests {
         assert_eq!(loaded.model.args.video_token_id, 31);
         assert_eq!(loaded.model.args.mrope_section, vec![2, 2, 2]);
         assert_eq!(loaded.eos_token_ids, vec![2]);
+
+        let directory = tempfile::tempdir().unwrap();
+        let model_path = directory.path().join("qwen3vl-f16.gguf");
+        let mmproj_path = directory.path().join("mmproj-Qwen3VL-F16.gguf");
+        fs::copy(fixture.path(), &model_path).unwrap();
+        fs::copy(vision_fixture.path(), mmproj_path).unwrap();
+        let topology = |rank| {
+            crate::ParallelTopology::from_rank(
+                2,
+                rank,
+                1,
+                2,
+                1,
+                crate::DeviceAssignment::new(DeviceType::Cpu, 0),
+            )
+            .unwrap()
+        };
+        let mut first = crate::architectures::distributed::pipeline::load_pipeline_model(
+            &model_path,
+            topology(0),
+            stream,
+            stream,
+        )
+        .unwrap();
+        let mut second = crate::architectures::distributed::pipeline::load_pipeline_model(
+            &model_path,
+            topology(1),
+            stream,
+            stream,
+        )
+        .unwrap();
+        let mut first_cache = first.new_cache().unwrap();
+        let mut second_cache = second.new_cache().unwrap();
+        let before = Array::from_slice(&[1u32], &[1, 1]);
+        let after = Array::from_slice(&[2u32], &[1, 1]);
+        let pixels = Array::from_slice(&[0.01f32; 96], &[4, 24]);
+        let grid = Array::from_slice(&[1i32, 2, 2], &[1, 3]);
+        let parts = [
+            runtime_input::InputPart::text_token_ids(&before),
+            runtime_input::InputPart::image_tensor(
+                &pixels,
+                runtime_input::InputMetadata::qwen_grid_thw(&grid),
+            ),
+            runtime_input::InputPart::text_token_ids(&after),
+        ];
+        let input = runtime_input::ModelInput::new(&parts);
+        let crate::architectures::distributed::pipeline::PipelineStageOutput::Hidden(payload) =
+            first
+                .prefill_stage(
+                    input,
+                    crate::architectures::distributed::pipeline::PipelineStep::new(1, 3).unwrap(),
+                    None,
+                    &mut first_cache,
+                    stream,
+                )
+                .unwrap()
+        else {
+            panic!("first Qwen3-VL GGUF pipeline stage produced logits")
+        };
+        let crate::architectures::distributed::pipeline::PipelineStageOutput::Logits(actual) =
+            second
+                .forward_stage(
+                    crate::architectures::distributed::pipeline::PipelineStageInput::Hidden(
+                        &payload,
+                    ),
+                    crate::architectures::distributed::pipeline::PipelineStep::new(1, 3).unwrap(),
+                    None,
+                    &mut second_cache,
+                    stream,
+                )
+                .unwrap()
+        else {
+            panic!("last Qwen3-VL GGUF pipeline stage did not produce logits")
+        };
+        let mut resident_cache = loaded.model.new_cache();
+        let expected = loaded
+            .model
+            .prefill_input_logits(input, &mut resident_cache, stream)
+            .unwrap();
+        let actual = actual.try_index_device((.., -1, ..), stream).unwrap();
+        let actual = actual.evaluated().unwrap();
+        let expected = expected.evaluated().unwrap();
+        assert!(actual
+            .as_slice::<f32>()
+            .iter()
+            .zip(expected.as_slice::<f32>())
+            .all(|(actual, expected)| (actual - expected).abs() <= 1e-5));
     }
 
     #[test]

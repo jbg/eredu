@@ -155,6 +155,43 @@ impl WeightBinding {
     pub const fn expected_bytes(&self) -> u64 {
         self.expected_bytes
     }
+
+    /// Pushes an output selection through this binding's direct source or
+    /// derived recipe before residency initialization.
+    pub(crate) fn select_bounded_output(
+        mut self,
+        store: &dyn WeightStore,
+        selection: TensorSelection,
+    ) -> Result<Self, ResidencyError> {
+        let recipe = self.recipe.clone().unwrap_or_else(|| {
+            DerivedWeightRecipe::source(self.checkpoint_key.clone(), self.selection.clone())
+        });
+        let recipe =
+            recipe
+                .select_bounded(store, selection)
+                .map_err(|source| ResidencyError::Recipe {
+                    binding: self.name.clone(),
+                    source,
+                })?;
+        let metadata = recipe
+            .infer(store)
+            .map_err(|source| ResidencyError::Recipe {
+                binding: self.name.clone(),
+                source,
+            })?;
+        self.checkpoint_key = recipe
+            .source_keys()
+            .first()
+            .map(|key| (*key).to_string())
+            .ok_or_else(|| ResidencyError::Recipe {
+                binding: self.name.clone(),
+                source: WeightRecipeError::EmptyInputs,
+            })?;
+        self.selection = TensorSelection::Full;
+        self.recipe = Some(recipe);
+        self.expected_bytes = metadata.byte_len();
+        Ok(self)
+    }
 }
 
 /// A deterministic group of weight bindings managed as one atomic unit.

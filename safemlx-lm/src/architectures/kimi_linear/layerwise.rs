@@ -61,7 +61,9 @@ use crate::{
     },
 };
 
-use super::model::{self as resident, Cache, DecoderLayer, FeedForwardPolicy, ModelArgs};
+use super::model::{
+    self as resident, Cache, DecoderLayer, FeedForward, FeedForwardPolicy, ModelArgs,
+};
 
 const EMBEDDING_UNIT: &str = "kimi_linear.static.embedding";
 const NORM_UNIT: &str = "kimi_linear.static.norm";
@@ -433,6 +435,11 @@ impl KimiLinearLayerwiseModel {
         self.execution.prompt_cache_layer_layout()
     }
 
+    /// Returns the exact rank-local prompt-cache identity.
+    pub fn prompt_cache_model_identity(&self) -> Result<PromptCacheModelIdentity, Error> {
+        self.execution.prompt_cache_model_identity()
+    }
+
     /// Returns the cache-relevant architecture fingerprint for this rank.
     pub fn prompt_cache_architecture_fingerprint(&self) -> String {
         resident::prompt_cache_architecture_fingerprint(self.args())
@@ -555,6 +562,43 @@ impl KimiLinearLayerwiseModel {
                     mask.or(context.mask.as_ref()),
                     Some(&mut cache.layers[index]),
                     stream,
+                    |hidden, ids, weights, stream| execute(index, hidden, ids, weights, stream),
+                )?)
+            },
+        )
+    }
+
+    /// Runs TP-sharded KDA/MLA and dense/shared projections while delegating
+    /// sparse routed experts to the matching EP subgroup.
+    pub(crate) fn forward_tensor_expert_parallel<F>(
+        &mut self,
+        inputs: &Array,
+        mask: Option<&Array>,
+        cache: &mut Cache,
+        tensor_group: &safemlx::distributed::Group,
+        mut execute: F,
+        stream: &Stream,
+    ) -> Result<Array, Error>
+    where
+        F: FnMut(usize, &Array, &Array, &Array, &Stream) -> Result<Array, Exception>,
+    {
+        self.execution.forward_tensor_parallel_with_layer_executor(
+            inputs,
+            cache,
+            tensor_group,
+            stream,
+            |_adapter, _group, index, layer, hidden, cache, context, execution| {
+                let tp_group = execution.group().ok_or_else(|| {
+                    Error::Parallel(
+                        "Kimi Linear TP+EP execution requires an active TP group".into(),
+                    )
+                })?;
+                Ok(layer.forward_tensor_with_expert_executor(
+                    hidden,
+                    mask.or(context.mask.as_ref()),
+                    Some(&mut cache.layers[index]),
+                    tp_group,
+                    execution.stream(),
                     |hidden, ids, weights, stream| execute(index, hidden, ids, weights, stream),
                 )?)
             },
@@ -864,7 +908,7 @@ pub fn load_kimi_linear_sparse_expert_cache_model(
 pub fn load_kimi_linear_sparse_expert_cache_model_with_dense_layers(
     model_dir: impl AsRef<Path>,
     options: ExpertCacheLoadOptions,
-    non_expert: crate::runtime::residency::dense_stream::DenseDiskStreamLoadOptions,
+    non_expert: impl Into<LayerExecutionLoadOptions>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<KimiLinearLayerwiseModel, Error> {
@@ -933,13 +977,36 @@ fn load_kimi_linear_sparse_with_store(
 pub(crate) fn load_kimi_linear_sparse_ep_base_with_store(
     store: Arc<dyn WeightStore + Send + Sync>,
     args: ModelArgs,
-    non_expert: crate::runtime::residency::dense_stream::DenseDiskStreamLoadOptions,
+    non_expert: impl Into<LayerExecutionLoadOptions>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<KimiLinearLayerwiseModel, Error> {
     args.validate()?;
     let adapter = KimiLinearLayerwiseAdapter::new_sparse(args, stream)?;
     let execution = load_layerwise_model(store, adapter, non_expert, stream, weights_stream)?;
+    Ok(KimiLinearLayerwiseModel { execution })
+}
+
+/// Builds the shared TP-sharded nonexpert base used by combined TP+EP.
+pub(crate) fn load_kimi_linear_sparse_tp_ep_base_with_store(
+    store: Arc<dyn WeightStore + Send + Sync>,
+    args: ModelArgs,
+    non_expert: impl Into<LayerExecutionLoadOptions>,
+    build: crate::runtime::distributed::parallel::ParallelBuildContext,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<KimiLinearLayerwiseModel, Error> {
+    args.validate()?;
+    let mut adapter = KimiLinearLayerwiseAdapter::new(args, stream)?;
+    adapter.sparse_expert_cache = true;
+    let execution = load_tensor_parallel_layerwise_model(
+        store,
+        adapter,
+        non_expert,
+        build,
+        stream,
+        weights_stream,
+    )?;
     Ok(KimiLinearLayerwiseModel { execution })
 }
 
@@ -1388,6 +1455,58 @@ impl ArchitectureAdapter for KimiLinearLayerwiseAdapter {
         self.layer_count(group)?;
         Ok(DecoderLayer::new(&self.args, index, stream)?)
     }
+
+    fn new_expert_parallel_layer(
+        &self,
+        group: usize,
+        index: usize,
+        assignment: &crate::runtime::distributed::expert::ExpertAssignment,
+        stream: &Stream,
+    ) -> Result<Self::Layer, Error> {
+        let mut layer = self.new_layer(group, index, stream)?;
+        if let FeedForward::Moe(moe) = &mut layer.mlp {
+            let prefix = format!("model.layers.{index}.mlp.experts");
+            moe.experts = crate::nn::moe::PackedSwiGluExperts::new(
+                i32::try_from(assignment.local_expert_count())
+                    .map_err(|_| Error::Parallel("local Kimi expert count exceeds i32".into()))?,
+                self.args.hidden_size,
+                self.args.moe_intermediate_size,
+                self.args
+                    .weight_quantization_for(&format!("{prefix}.gate_up_proj")),
+                self.args
+                    .weight_quantization_for(&format!("{prefix}.down_proj")),
+                stream,
+            )?;
+        }
+        Ok(layer)
+    }
+
+    fn expert_parallel_assignment(
+        &self,
+        topology: crate::runtime::distributed::topology::ParallelTopology,
+    ) -> Result<Option<crate::runtime::distributed::expert::ExpertAssignment>, Error> {
+        if topology.expert_parallel_size == 1 {
+            return Ok(None);
+        }
+        if self.args.num_experts <= 0
+            || !self
+                .args
+                .layer_schedule
+                .iter()
+                .any(|policy| policy.feed_forward == FeedForwardPolicy::SparseMoe)
+        {
+            return Err(Error::Parallel(
+                "Kimi Linear PP+EP requires a checkpoint with sparse MoE layers".into(),
+            ));
+        }
+        Ok(Some(
+            crate::runtime::distributed::expert::ExpertAssignment::balanced(
+                self.args.num_experts as usize,
+                topology.expert_parallel_size,
+                topology.expert_parallel_rank,
+            )?,
+        ))
+    }
     fn register_parallel_parameters(
         &self,
         _context: crate::runtime::distributed::parallel::ParallelBuildContext,
@@ -1602,6 +1721,38 @@ impl ArchitectureAdapter for KimiLinearLayerwiseAdapter {
             store,
             layout,
         )
+    }
+
+    fn expert_parallel_layer_bindings(
+        &self,
+        group: usize,
+        index: usize,
+        _layer: &Self::Layer,
+        store: &dyn WeightStore,
+        assignment: &crate::runtime::distributed::expert::ExpertAssignment,
+        stream: &Stream,
+    ) -> Result<Vec<WeightBinding>, Error> {
+        let global = self.new_layer(group, index, stream)?;
+        let indices = assignment.local_global_expert_ids().to_vec();
+        self.layer_bindings(group, index, &global, store)?
+            .into_iter()
+            .map(|binding| {
+                let target = binding.logical_target().unwrap_or_else(|| binding.name());
+                if target.contains("mlp.experts.") {
+                    binding
+                        .select_bounded_output(
+                            store,
+                            TensorSelection::Indices {
+                                axis: 0,
+                                indices: indices.clone(),
+                            },
+                        )
+                        .map_err(Error::from)
+                } else {
+                    Ok(binding)
+                }
+            })
+            .collect()
     }
 
     fn populate_layer(

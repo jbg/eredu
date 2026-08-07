@@ -124,12 +124,13 @@ quantization alignment.
 Qwen3-Next GGUF validation uses the same metadata and decoder plan while
 requiring its fused QKVZ/BA recurrent projection catalog and validating affine
 input-group alignment before the loader splits those tensors.
-Qwen3-VL GGUF validation combines the exact dense Qwen3 text plan with its
-required sibling projector catalog. It validates multimodal RoPE sections and
-placeholder tokens, vision-block geometry, both physical patch-convolution
+Qwen3-VL GGUF validation combines the shared dense or MoE Qwen3 text plan with
+its required sibling projector catalog. It validates multimodal RoPE sections
+and placeholder tokens, vision-block geometry, both physical patch-convolution
 halves, the merger and DeepStack tensors, projector/text hidden-size agreement,
-and dense-only projector operation encodings. Inspection and the resident and
-bounded loaders consume the same stream-free argument and structural plans.
+paired packed expert encodings for `qwen3vlmoe`, and dense-only projector
+operation encodings. Inspection and the resident, bounded, and expert-parallel
+loaders consume the same stream-free argument and structural plans.
 Kimi Linear GGUF validates pure metadata geometry, translated names, KDA/MLA
 catalogs, convolution and transition tensor element counts, paired expert
 encodings, and per-operation GGML support. The loader's requirement that KDA
@@ -265,12 +266,13 @@ values:
 - `qwen2`
 - `qwen3` and `qwen3moe`
 - `qwen3next`
-- `qwen3vl` (with its companion vision projection checkpoint)
+- `qwen3vl` and `qwen3vlmoe` (with their companion vision projection checkpoint)
 - `qwen35` and `qwen35moe`
 
 The tokenizer and chat template are reconstructed from GGUF metadata when
 possible. A sibling `tokenizer.json` can supply a tokenizer that is absent from
-the file or uses an unsupported embedded tokenizer model. `qwen3vl` requires a
+the file or uses an unsupported embedded tokenizer model. `qwen3vl` and
+`qwen3vlmoe` require a
 validated sibling vision projector; Inkling remains text-loadable without its
 combined audio/vision projector and reports multimodal readiness separately.
 
@@ -293,10 +295,11 @@ tensor encodings are listed in the
 Fully resident loading is the default. SafeTensors and registered GGUF families
 can also use host-backed layer windows or experimental dense disk streaming.
 GGUF bounded loading covers Kimi Linear, DeepSeek2, Gemma 4, Llama/Mistral, LFM2,
-Nemotron-H, Qwen2/Qwen2.5, Qwen3, dense Qwen3-VL with its mmproj, Qwen3.5, and Qwen3-Next.
+Nemotron-H, Qwen2/Qwen2.5, Qwen3, dense or MoE Qwen3-VL with its mmproj,
+Qwen3.5, and Qwen3-Next.
 Supported MoE families can cache routed experts independently; for GGUF these
 are Kimi Linear, DeepSeek2, LFM2-MoE, Nemotron-H-MoE, Qwen3-MoE,
-Qwen3.5-MoE, and MoE Qwen3-Next.
+Qwen3.5-MoE, MoE Qwen3-Next, and Qwen3-VL-MoE.
 
 Qwen2/Qwen2.5 text checkpoints share the canonical `architectures::qwen::dense`
 decoder with Qwen3. SafeTensors and GGUF support fully resident, layerwise-host,
@@ -814,10 +817,13 @@ its [usage guide](../examples/safemlx-lm-cli/README.md) for concrete commands.
 ## Parallel execution
 
 The language-model crate contains explicit APIs for pure tensor, pipeline, and
-expert parallelism. A non-replicated topology must be loaded through the
-matching API; the ordinary complete-model loader rejects it. Hybrid tensor +
-pipeline, tensor + expert, and pipeline + expert topologies are not currently
-supported.
+expert parallelism plus tensor + pipeline, tensor + expert, pipeline + expert,
+and Qwen3-MoE tensor + pipeline + expert execution. A non-replicated topology
+must be loaded through the matching API; the ordinary complete-model loader
+rejects it. One Cartesian topology owns coordinates and subgroup membership
+for every combination. Qwen3-MoE triple-axis execution supports fully resident
+and dense-disk-streamed SafeTensors and canonical GGUF; other families fail
+architecture preflight before checkpoint payload materialization.
 
 Pure pipeline inference uses the architecture-neutral distributed scheduler.
 That canonical runtime owns request/work identity, isolated per-request program
@@ -836,18 +842,22 @@ Kimi Linear supports pure fully resident and sparse-expert-cache expert
 parallelism for SafeTensors: dense/nonexpert weights and the shared expert are
 replicated, routed experts are partitioned or loaded through rank-owned sparse
 caches, and the shared expert is added once after routed reduction. The
-architecture-neutral `SparseExpertCacheWithDenseLayers` EP path is available
-for every registered SafeTensors MoE family: it disk-streams replicated
-decoder units while independently caching rank-owned experts. Tensor
+architecture-neutral external expert executor is available for every
+registered SafeTensors MoE family. `FullyResident` pins TP-sharded nonexpert
+units and every EP-owned routed expert during load;
+`SparseExpertCacheWithDenseLayers` disk-streams nonexpert decoder units while
+independently caching rank-owned experts. Remote experts are not materialized
+under either policy. Tensor
 parallelism and pure pipeline parallelism are supported. Pipeline stages load
 SafeTensors or canonical `kimi-linear` GGUF with fully resident or dense
 disk-streamed local blocks; KDA's three convolution histories plus recurrent
 tensor use fixed semantic slots and MLA uses the shared compressed-latent
 cache, including paged and persisted prompt-cache routes.
 
-Fully resident GGUF expert parallelism is supported for Kimi Linear, DeepSeek2,
-and Qwen3-MoE. Sparse-cache GGUF EP uses the shared type-erased expert cache for
-those families. The combined streamed-dense policy additionally supports
-LFM2-MoE, Nemotron-H-MoE, Qwen3-Next, and Qwen3.5-MoE GGUF checkpoints.
-Dense Qwen3-VL GGUF requires its separate multimodal projection checkpoint and
-does not expose a pure-EP GGUF adapter.
+Fully resident GGUF pure expert parallelism is supported for Kimi Linear,
+DeepSeek2, Qwen3-MoE, and Qwen3-VL-MoE. Fully resident and sparse-streamed GGUF
+TP+EP use the shared catalog and semantic TP plans for Kimi Linear, DeepSeek2,
+Qwen3-MoE, GPT-OSS, Inkling, LFM2-MoE, Nemotron-H-MoE, Qwen3-Next,
+Qwen3.5-MoE, and Qwen3-VL-MoE. Qwen3-VL GGUF requires its separate dense
+multimodal projection checkpoint; the MoE adapter composes that store before
+rank-local layer and expert selection and also supports stage-local PP+EP.

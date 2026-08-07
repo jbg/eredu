@@ -2911,6 +2911,69 @@ impl SparseMoeBlock {
         routed.add(shared, stream)?.reshape(shape, stream)
     }
 
+    pub(crate) fn forward_tensor_with_expert_executor<F>(
+        &mut self,
+        hidden_states: &Array,
+        group: &safemlx::distributed::Group,
+        stream: &Stream,
+        execute: F,
+    ) -> Result<Array, Exception>
+    where
+        F: FnOnce(&Array, &Array, &Array, &Stream) -> Result<Array, Exception>,
+    {
+        let shape = hidden_states.shape();
+        let flat = hidden_states.reshape(&[-1, shape[2]], stream)?;
+        let mut shared = self.shared_expert.forward(&flat, stream)?;
+        if let Some(bias) = self.shared_expert.down_proj.bias.as_ref().as_ref() {
+            shared = shared.subtract(bias, stream)?;
+        }
+        shared = safemlx::distributed::all_sum(&shared, group, stream)?;
+        if let Some(bias) = self.shared_expert.down_proj.bias.as_ref().as_ref() {
+            shared = shared.add(bias, stream)?;
+        }
+        shared = shared.multiply(
+            sigmoid(self.shared_expert_gate.forward(&flat, stream)?, stream)?,
+            stream,
+        )?;
+        let (selected_experts, routing_weights) = self.gate.forward(&flat, stream)?;
+        let routed = execute(&flat, &selected_experts, &routing_weights, stream)?;
+        routed.add(shared, stream)?.reshape(shape, stream)
+    }
+
+    pub(crate) fn forward_expert_parallel(
+        &mut self,
+        hidden_states: &Array,
+        assignment: &crate::architectures::distributed::expert::ExpertAssignment,
+        group: &safemlx::distributed::Group,
+        statistics: &mut crate::architectures::distributed::expert::RoutingStatistics,
+        stream: &Stream,
+    ) -> Result<Array, Exception> {
+        let shape = hidden_states.shape();
+        let flat = hidden_states.reshape(&[-1, shape[2]], stream)?;
+        let shared = self.shared_expert.forward(&flat, stream)?.multiply(
+            sigmoid(self.shared_expert_gate.forward(&flat, stream)?, stream)?,
+            stream,
+        )?;
+        let router_started = std::time::Instant::now();
+        let (selected_experts, routing_weights) = self.gate.forward(&flat, stream)?;
+        statistics.router_time += router_started.elapsed();
+        let returned = crate::architectures::distributed::expert::dispatch_replicated(
+            &flat,
+            &selected_experts,
+            &routing_weights,
+            assignment,
+            &mut self.experts,
+            group,
+            stream,
+        )
+        .map_err(|error| Exception::custom(error.to_string()))?;
+        statistics.accumulate(&returned.statistics);
+        returned
+            .reduced_output
+            .add(shared, stream)?
+            .reshape(shape, stream)
+    }
+
     /// Forward pass that reports router and expert activations to an observer.
     pub fn forward_with_observer(
         &mut self,
@@ -3352,6 +3415,100 @@ impl TransformerBlock {
         hidden.add(feed_forward, stream)
     }
 
+    /// Executes TP-local attention and shared projections while routed
+    /// experts are evaluated by the matching EP subgroup.
+    pub(crate) fn forward_tensor_with_expert_executor<F>(
+        &mut self,
+        input: BlockInput<'_>,
+        group: &safemlx::distributed::Group,
+        stream: &Stream,
+        execute: F,
+    ) -> Result<Array, Exception>
+    where
+        F: FnOnce(&Array, &Array, &Array, &Stream) -> Result<Array, Exception>,
+    {
+        let BlockInput { x, mask, cache } = input;
+        let normalized = self.input_layernorm.forward(x, stream)?;
+        let attention = match (self.layer_policy, cache) {
+            (
+                LayerPolicy::SelfAttention(AttentionPolicy::Full),
+                Some(LayerCache::FullAttention(cache)),
+            ) => self
+                .self_attn
+                .as_mut()
+                .expect("full attention layer")
+                .forward_tensor_parallel(
+                    FullAttentionInput {
+                        x: &normalized,
+                        mask,
+                        cache: Some(cache),
+                    },
+                    group,
+                    stream,
+                )?,
+            (LayerPolicy::SelfAttention(AttentionPolicy::Full), None) => self
+                .self_attn
+                .as_mut()
+                .expect("full attention layer")
+                .forward_tensor_parallel(
+                    FullAttentionInput {
+                        x: &normalized,
+                        mask,
+                        cache: None,
+                    },
+                    group,
+                    stream,
+                )?,
+            (LayerPolicy::LinearAttention, Some(LayerCache::LinearAttention(cache))) => self
+                .linear_attn
+                .as_mut()
+                .expect("linear attention layer")
+                .forward_tensor_parallel(
+                    LinearAttentionInput {
+                        x: &normalized,
+                        cache: Some(cache),
+                    },
+                    group,
+                    stream,
+                )?,
+            (LayerPolicy::LinearAttention, None) => self
+                .linear_attn
+                .as_mut()
+                .expect("linear attention layer")
+                .forward_tensor_parallel(
+                    LinearAttentionInput {
+                        x: &normalized,
+                        cache: None,
+                    },
+                    group,
+                    stream,
+                )?,
+            (policy, Some(_)) => {
+                return Err(Exception::custom(format!(
+                    "Qwen hybrid tensor/expert cache kind does not match layer policy {policy:?}"
+                )))
+            }
+            (LayerPolicy::SelfAttention(AttentionPolicy::Sliding { .. }), _) => {
+                return Err(Exception::custom(
+                    "Qwen hybrid tensor/expert execution does not support sliding attention",
+                ))
+            }
+        };
+        let hidden = x.add(attention, stream)?;
+        let normalized = self.post_attention_layernorm.forward(&hidden, stream)?;
+        let feed_forward = match &mut self.mlp {
+            FeedForward::Moe(moe) => {
+                moe.forward_tensor_with_expert_executor(&normalized, group, stream, execute)?
+            }
+            FeedForward::Dense(_) => {
+                return Err(Exception::custom(
+                    "Qwen hybrid TP+EP requires routed MoE decoder layers",
+                ))
+            }
+        };
+        hidden.add(feed_forward, stream)
+    }
+
     /// Creates an unloaded transformer block.
     pub fn new(args: &ModelArgs, layer_idx: usize, stream: &Stream) -> Result<Self, Exception> {
         Self::new_with_format(
@@ -3532,6 +3689,185 @@ impl TransformerBlock {
         let residual = h.clone();
         let normalized = self.post_attention_layernorm.forward(&h, stream)?;
         residual.add(self.mlp.forward(&normalized, stream)?, stream)
+    }
+
+    pub(crate) fn forward_tensor_parallel_with_operator_cache(
+        &mut self,
+        x: &Array,
+        mask: Option<&Array>,
+        cache: Option<OperatorCache<'_>>,
+        group: &safemlx::distributed::Group,
+        stream: &Stream,
+    ) -> Result<Array, Exception> {
+        let normalized = self.input_layernorm.forward(x, stream)?;
+        let attention = match (self.layer_policy, cache) {
+            (
+                LayerPolicy::SelfAttention(AttentionPolicy::Full),
+                Some(OperatorCache::FullAttention(cache)),
+            ) => self
+                .self_attn
+                .as_mut()
+                .expect("full attention layer")
+                .forward_tensor_parallel(
+                    FullAttentionInput {
+                        x: &normalized,
+                        mask,
+                        cache: Some(cache),
+                    },
+                    group,
+                    stream,
+                )?,
+            (LayerPolicy::SelfAttention(AttentionPolicy::Full), None) => self
+                .self_attn
+                .as_mut()
+                .expect("full attention layer")
+                .forward_tensor_parallel(
+                    FullAttentionInput {
+                        x: &normalized,
+                        mask,
+                        cache: None,
+                    },
+                    group,
+                    stream,
+                )?,
+            (LayerPolicy::LinearAttention, Some(OperatorCache::LinearAttention(cache))) => self
+                .linear_attn
+                .as_mut()
+                .expect("linear attention layer")
+                .forward_tensor_parallel(
+                    LinearAttentionInput {
+                        x: &normalized,
+                        cache: Some(cache),
+                    },
+                    group,
+                    stream,
+                )?,
+            (LayerPolicy::LinearAttention, None) => self
+                .linear_attn
+                .as_mut()
+                .expect("linear attention layer")
+                .forward_tensor_parallel(
+                    LinearAttentionInput {
+                        x: &normalized,
+                        cache: None,
+                    },
+                    group,
+                    stream,
+                )?,
+            (LayerPolicy::SelfAttention(AttentionPolicy::Sliding { .. }), _) => {
+                return Err(Exception::custom(
+                    "Qwen hybrid tensor parallelism does not support sliding attention",
+                ))
+            }
+            (policy, Some(_)) => {
+                return Err(Exception::custom(format!(
+                "Qwen hybrid tensor-parallel operator cache does not match layer policy {policy:?}"
+            )))
+            }
+        };
+        let hidden = x.add(attention, stream)?;
+        let normalized = self.post_attention_layernorm.forward(&hidden, stream)?;
+        let mut partial = self.mlp.forward(&normalized, stream)?;
+        let ordinary_bias = match &self.mlp {
+            FeedForward::Dense(mlp) => mlp.down_proj.bias.as_ref().as_ref(),
+            FeedForward::Moe(_) => None,
+        };
+        if let Some(bias) = ordinary_bias {
+            partial = partial.subtract(bias, stream)?;
+        }
+        let mut feed_forward = safemlx::distributed::all_sum(&partial, group, stream)?;
+        if let Some(bias) = ordinary_bias {
+            feed_forward = feed_forward.add(bias, stream)?;
+        }
+        hidden.add(feed_forward, stream)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn forward_expert_parallel_with_operator_cache(
+        &mut self,
+        x: &Array,
+        mask: Option<&Array>,
+        cache: Option<OperatorCache<'_>>,
+        assignment: &crate::architectures::distributed::expert::ExpertAssignment,
+        group: &safemlx::distributed::Group,
+        statistics: &mut crate::architectures::distributed::expert::RoutingStatistics,
+        stream: &Stream,
+    ) -> Result<Array, Exception> {
+        let normalized = self.input_layernorm.forward(x, stream)?;
+        let attention = match (self.layer_policy, cache) {
+            (
+                LayerPolicy::SelfAttention(AttentionPolicy::Full),
+                Some(OperatorCache::FullAttention(cache)),
+            ) => self
+                .self_attn
+                .as_mut()
+                .expect("full attention layer")
+                .forward(
+                    FullAttentionInput {
+                        x: &normalized,
+                        mask,
+                        cache: Some(cache),
+                    },
+                    stream,
+                )?,
+            (LayerPolicy::SelfAttention(AttentionPolicy::Full), None) => self
+                .self_attn
+                .as_mut()
+                .expect("full attention layer")
+                .forward(
+                    FullAttentionInput {
+                        x: &normalized,
+                        mask,
+                        cache: None,
+                    },
+                    stream,
+                )?,
+            (LayerPolicy::LinearAttention, Some(OperatorCache::LinearAttention(cache))) => self
+                .linear_attn
+                .as_mut()
+                .expect("linear attention layer")
+                .forward(
+                    LinearAttentionInput {
+                        x: &normalized,
+                        cache: Some(cache),
+                    },
+                    stream,
+                )?,
+            (LayerPolicy::LinearAttention, None) => self
+                .linear_attn
+                .as_mut()
+                .expect("linear attention layer")
+                .forward(
+                    LinearAttentionInput {
+                        x: &normalized,
+                        cache: None,
+                    },
+                    stream,
+                )?,
+            (LayerPolicy::SelfAttention(AttentionPolicy::Sliding { .. }), _) => {
+                return Err(Exception::custom(
+                    "Qwen hybrid expert parallelism does not support sliding attention",
+                ))
+            }
+            (policy, Some(_)) => {
+                return Err(Exception::custom(format!(
+                "Qwen hybrid expert-parallel operator cache does not match layer policy {policy:?}"
+            )))
+            }
+        };
+        let hidden = x.add(attention, stream)?;
+        let normalized = self.post_attention_layernorm.forward(&hidden, stream)?;
+        let feed_forward = match &mut self.mlp {
+            FeedForward::Moe(moe) => {
+                moe.forward_expert_parallel(&normalized, assignment, group, statistics, stream)?
+            }
+            FeedForward::Dense(_) => {
+                return Err(Exception::custom(
+                    "Qwen hybrid PP+EP requires routed MoE decoder layers",
+                ))
+            }
+        };
+        hidden.add(feed_forward, stream)
     }
 }
 

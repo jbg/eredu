@@ -496,6 +496,42 @@ impl NemotronHLayerwiseModel {
         )
     }
 
+    /// Runs TP-sharded Mamba, attention, dense, and shared-expert projections
+    /// while delegating routed experts to the matching EP subgroup.
+    pub(crate) fn forward_tensor_expert_parallel<F>(
+        &mut self,
+        inputs: &Array,
+        cache: &mut Cache,
+        tensor_group: &safemlx::distributed::Group,
+        mut execute: F,
+        stream: &Stream,
+    ) -> Result<Array, Error>
+    where
+        F: FnMut(usize, &Array, &Array, &Array, &Stream) -> Result<Array, Exception>,
+    {
+        self.execution.forward_tensor_parallel_with_layer_executor(
+            inputs,
+            cache,
+            tensor_group,
+            stream,
+            |_adapter, _group, index, layer, hidden, cache, context, execution| {
+                let tp_group = execution.group().ok_or_else(|| {
+                    Error::Parallel("Nemotron-H TP+EP execution requires an active TP group".into())
+                })?;
+                Ok(layer.forward_tensor_with_expert_executor(
+                    BlockInput {
+                        x: hidden,
+                        mask: context.mask.as_ref(),
+                        cache: Some(&mut cache.layers[index]),
+                    },
+                    tp_group,
+                    execution.stream(),
+                    |hidden, ids, weights, stream| execute(index, hidden, ids, weights, stream),
+                )?)
+            },
+        )
+    }
+
     /// Clears temporary hybrid blocks from the execution device.
     pub fn clear_device_layer_window(&self) -> Result<(), Error> {
         self.execution.clear_device_group("text_decoder")
@@ -771,13 +807,35 @@ fn load_nemotron_h_gguf_sparse_with_store(
 pub(crate) fn load_nemotron_h_sparse_ep_base_with_store(
     store: Arc<dyn WeightStore + Send + Sync>,
     args: ModelArgs,
-    non_expert: crate::runtime::residency::dense_stream::DenseDiskStreamLoadOptions,
+    non_expert: impl Into<LayerExecutionLoadOptions>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<NemotronHLayerwiseModel, Error> {
     let mut adapter = NemotronHLayerwiseAdapter::new(args, stream)?;
     adapter.sparse_expert_cache = true;
     let execution = load_layerwise_model(store, adapter, non_expert, stream, weights_stream)?;
+    Ok(NemotronHLayerwiseModel { execution })
+}
+
+/// Builds the shared TP-sharded nonexpert base used by combined TP+EP.
+pub(crate) fn load_nemotron_h_sparse_tp_ep_base_with_store(
+    store: Arc<dyn WeightStore + Send + Sync>,
+    args: ModelArgs,
+    non_expert: impl Into<LayerExecutionLoadOptions>,
+    build: crate::runtime::distributed::parallel::ParallelBuildContext,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<NemotronHLayerwiseModel, Error> {
+    let mut adapter = NemotronHLayerwiseAdapter::new(args, stream)?;
+    adapter.sparse_expert_cache = true;
+    let execution = load_tensor_parallel_layerwise_model(
+        store,
+        adapter,
+        non_expert,
+        build,
+        stream,
+        weights_stream,
+    )?;
     Ok(NemotronHLayerwiseModel { execution })
 }
 
@@ -905,6 +963,21 @@ impl NemotronHLayerwiseAdapter {
     /// Returns validated model arguments.
     pub const fn args(&self) -> &ModelArgs {
         &self.args
+    }
+
+    /// Configures rank-local operator geometry for a Cartesian pipeline stage.
+    pub(crate) fn configure_cartesian_layout(
+        &mut self,
+        build: crate::runtime::distributed::parallel::ParallelBuildContext,
+        layout: &crate::runtime::distributed::parallel::LocalModelLayout,
+        stream: &Stream,
+    ) -> Result<(), Error> {
+        self.configure_parallel_static(build, layout, stream)
+    }
+
+    /// Returns the configured rank-local hybrid operator geometry.
+    pub(crate) fn parallel_geometry(&self) -> Option<&[resident::ParallelLayerGeometry]> {
+        self.parallel_geometry.as_deref()
     }
 
     fn new_cache(&self) -> Cache {
@@ -1356,6 +1429,60 @@ impl ArchitectureAdapter for NemotronHLayerwiseAdapter {
         self.layer_count(group)?;
         TransformerBlock::new(&self.args, index, stream)
     }
+
+    fn new_expert_parallel_layer(
+        &self,
+        group: usize,
+        index: usize,
+        assignment: &crate::runtime::distributed::expert::ExpertAssignment,
+        stream: &Stream,
+    ) -> Result<Self::Layer, Error> {
+        let mut layer = self.new_layer(group, index, stream)?;
+        if let Some(moe) = &mut layer.moe {
+            let prefix = format!("model.layers.{index}.moe.experts");
+            moe.experts = Experts::new(
+                i32::try_from(assignment.local_expert_count()).map_err(|_| {
+                    Error::Parallel("local Nemotron-H expert count exceeds i32".into())
+                })?,
+                self.args.hidden_size,
+                self.args.moe_intermediate_size,
+                [
+                    self.args
+                        .weight_quantization_for(&format!("{prefix}.up_proj")),
+                    self.args
+                        .weight_quantization_for(&format!("{prefix}.down_proj")),
+                ],
+                stream,
+            )?;
+        }
+        Ok(layer)
+    }
+
+    fn expert_parallel_assignment(
+        &self,
+        topology: crate::runtime::distributed::topology::ParallelTopology,
+    ) -> Result<Option<crate::runtime::distributed::expert::ExpertAssignment>, Error> {
+        if topology.expert_parallel_size == 1 {
+            return Ok(None);
+        }
+        if !self
+            .args
+            .layer_schedule
+            .iter()
+            .any(|policy| *policy == LayerPolicy::SparseMoe)
+        {
+            return Err(Error::Parallel(
+                "Nemotron-H PP+EP requires a checkpoint with sparse MoE layers".into(),
+            ));
+        }
+        Ok(Some(
+            crate::runtime::distributed::expert::ExpertAssignment::balanced(
+                self.args.n_routed_experts as usize,
+                topology.expert_parallel_size,
+                topology.expert_parallel_rank,
+            )?,
+        ))
+    }
     fn register_parallel_parameters(
         &self,
         _context: crate::runtime::distributed::parallel::ParallelBuildContext,
@@ -1570,6 +1697,38 @@ impl ArchitectureAdapter for NemotronHLayerwiseAdapter {
             store,
             layout,
         )
+    }
+
+    fn expert_parallel_layer_bindings(
+        &self,
+        group: usize,
+        index: usize,
+        _layer: &Self::Layer,
+        store: &dyn WeightStore,
+        assignment: &crate::runtime::distributed::expert::ExpertAssignment,
+        stream: &Stream,
+    ) -> Result<Vec<WeightBinding>, Error> {
+        let global = self.new_layer(group, index, stream)?;
+        let indices = assignment.local_global_expert_ids().to_vec();
+        self.layer_bindings(group, index, &global, store)?
+            .into_iter()
+            .map(|binding| {
+                let target = binding.logical_target().unwrap_or_else(|| binding.name());
+                if target.contains(".moe.experts.") {
+                    binding
+                        .select_bounded_output(
+                            store,
+                            TensorSelection::Indices {
+                                axis: 0,
+                                indices: indices.clone(),
+                            },
+                        )
+                        .map_err(Error::from)
+                } else {
+                    Ok(binding)
+                }
+            })
+            .collect()
     }
 
     fn additional_consumed_checkpoint_keys(&self, store: &dyn WeightStore) -> Vec<String> {

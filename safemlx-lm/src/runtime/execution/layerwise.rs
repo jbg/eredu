@@ -1675,6 +1675,87 @@ pub trait ArchitectureAdapter: Sized {
         )))
     }
 
+    /// Creates a rank-local runtime unit whose routed experts follow an
+    /// authoritative expert assignment.
+    ///
+    /// Architectures supporting PP+EP implement this hook instead of exposing
+    /// expert-bank representation details to the pipeline runtime.
+    fn new_expert_parallel_layer(
+        &self,
+        _group: usize,
+        _index: usize,
+        _assignment: &crate::runtime::distributed::expert::ExpertAssignment,
+        _stream: &Stream,
+    ) -> Result<Self::Layer, Error> {
+        Err(Error::Parallel(format!(
+            "architecture adapter {} has not implemented expert-local layer construction",
+            std::any::type_name::<Self>()
+        )))
+    }
+
+    /// Creates a layer whose ordinary projections follow the TP layout while
+    /// routed experts are restricted to the authoritative EP assignment.
+    ///
+    /// Architectures opt into triple-axis execution by implementing this one
+    /// semantic composition point; pipeline placement remains external.
+    fn new_tensor_expert_parallel_layer(
+        &self,
+        _group: usize,
+        _index: usize,
+        _layout: &crate::runtime::distributed::parallel::LocalModelLayout,
+        _assignment: &crate::runtime::distributed::expert::ExpertAssignment,
+        _stream: &Stream,
+    ) -> Result<Self::Layer, Error> {
+        Err(Error::Parallel(format!(
+            "architecture adapter {} has not implemented combined tensor/expert-local layer construction",
+            std::any::type_name::<Self>()
+        )))
+    }
+
+    /// Derives this rank's expert ownership from architecture metadata and the
+    /// authoritative Cartesian topology.
+    ///
+    /// The default accepts an inactive EP axis and fails closed otherwise.
+    fn expert_parallel_assignment(
+        &self,
+        topology: crate::runtime::distributed::topology::ParallelTopology,
+    ) -> Result<Option<crate::runtime::distributed::expert::ExpertAssignment>, Error> {
+        if topology.expert_parallel_size > 1 {
+            Err(Error::Parallel(format!(
+                "architecture adapter {} has not declared expert ownership for EP size {}",
+                std::any::type_name::<Self>(),
+                topology.expert_parallel_size
+            )))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Creates one runtime unit for replicated, TP-local, or EP-local
+    /// execution from shared semantic inputs.
+    ///
+    /// Architecture adapters own the semantic composition of simultaneous TP
+    /// and EP; PP remains the outer selection of execution units.
+    fn new_cartesian_layer(
+        &self,
+        group: usize,
+        index: usize,
+        layout: Option<&crate::runtime::distributed::parallel::LocalModelLayout>,
+        assignment: Option<&crate::runtime::distributed::expert::ExpertAssignment>,
+        stream: &Stream,
+    ) -> Result<Self::Layer, Error> {
+        match (layout, assignment) {
+            (None, None) => self.new_layer(group, index, stream),
+            (Some(layout), None) => self.new_parallel_layer(group, index, layout, stream),
+            (None, Some(assignment)) => {
+                self.new_expert_parallel_layer(group, index, assignment, stream)
+            }
+            (Some(layout), Some(assignment)) => {
+                self.new_tensor_expert_parallel_layer(group, index, layout, assignment, stream)
+            }
+        }
+    }
+
     /// Returns the checkpoint prefix for one runtime unit.
     fn layer_checkpoint_prefix(&self, group: usize, index: usize) -> String;
 
@@ -1722,6 +1803,86 @@ pub trait ArchitectureAdapter: Sized {
             store,
             layout,
         )
+    }
+
+    /// Builds rank-local bindings for an expert-parallel execution unit.
+    ///
+    /// The adapter owns checkpoint expert layout, packed companions, and the
+    /// mapping from global expert ids to its layer representation.
+    fn expert_parallel_layer_bindings(
+        &self,
+        _group: usize,
+        _index: usize,
+        _layer: &Self::Layer,
+        _store: &dyn WeightStore,
+        _assignment: &crate::runtime::distributed::expert::ExpertAssignment,
+        _stream: &Stream,
+    ) -> Result<Vec<crate::runtime::residency::manager::WeightBinding>, Error> {
+        Err(Error::Parallel(format!(
+            "architecture adapter {} has not implemented expert-local checkpoint bindings",
+            std::any::type_name::<Self>()
+        )))
+    }
+
+    /// Builds bindings for a layer that is simultaneously TP-sharded and
+    /// restricted to EP-owned routed experts.
+    ///
+    /// The default composes the architecture's EP selection recipe with the
+    /// shared semantic TP shard plan. Architectures only need to override this
+    /// when their checkpoint representation requires a different ordering.
+    #[allow(clippy::too_many_arguments)]
+    fn tensor_expert_parallel_layer_bindings(
+        &self,
+        group: usize,
+        index: usize,
+        layer: &Self::Layer,
+        store: &dyn WeightStore,
+        layout: &crate::runtime::distributed::parallel::LocalModelLayout,
+        assignment: &crate::runtime::distributed::expert::ExpertAssignment,
+        stream: &Stream,
+    ) -> Result<Vec<crate::runtime::residency::manager::WeightBinding>, Error> {
+        let bindings =
+            self.expert_parallel_layer_bindings(group, index, layer, store, assignment, stream)?;
+        shard_layer_bindings(
+            bindings,
+            &self.layer_checkpoint_prefix(group, index),
+            store,
+            layout,
+        )
+    }
+
+    /// Builds bindings for the same replicated, TP-local, or EP-local unit
+    /// geometry selected by [`Self::new_cartesian_layer`].
+    #[allow(clippy::too_many_arguments)]
+    fn cartesian_layer_bindings(
+        &self,
+        group: usize,
+        index: usize,
+        layer: &Self::Layer,
+        store: &dyn WeightStore,
+        layout: Option<&crate::runtime::distributed::parallel::LocalModelLayout>,
+        assignment: Option<&crate::runtime::distributed::expert::ExpertAssignment>,
+        stream: &Stream,
+    ) -> Result<Vec<crate::runtime::residency::manager::WeightBinding>, Error> {
+        match (layout, assignment) {
+            (None, None) => {
+                // The execution layer can have transformed target geometry
+                // (for example load-time affine quantization). Bindings must
+                // continue to describe the adapter's source checkpoint
+                // geometry and are transformed only during population.
+                let source = self.new_layer(group, index, stream)?;
+                self.layer_bindings(group, index, &source, store)
+            }
+            (Some(layout), None) => {
+                self.parallel_layer_bindings(group, index, layer, store, layout, stream)
+            }
+            (None, Some(assignment)) => {
+                self.expert_parallel_layer_bindings(group, index, layer, store, assignment, stream)
+            }
+            (Some(layout), Some(assignment)) => self.tensor_expert_parallel_layer_bindings(
+                group, index, layer, store, layout, assignment, stream,
+            ),
+        }
     }
 
     /// Returns checkpoint keys consumed by dependent units outside execution groups.
@@ -2093,6 +2254,13 @@ impl<A: ArchitectureAdapter> LayerwiseModel<A> {
             .clone())
     }
 
+    /// Returns the complete cache identity, including every active parallel
+    /// coordinate and the rank-local cache layout.
+    pub fn prompt_cache_model_identity(&self) -> Result<PromptCacheModelIdentity, Error> {
+        self.adapter
+            .prompt_cache_model_identity(self.parallel_topology)
+    }
+
     /// Returns this execution rank's exact ordered cache-state layout.
     pub fn prompt_cache_layer_layout(
         &self,
@@ -2131,6 +2299,25 @@ impl<A: ArchitectureAdapter> LayerwiseModel<A> {
         )
     }
 
+    pub(crate) fn save_prompt_cache_with_validated_identity(
+        &self,
+        cache: &mut A::Cache,
+        directory: &Path,
+        descriptor: PromptCacheDescriptor,
+        prefix_token_ids: &[u32],
+        options: &PromptCacheOptions,
+        stream: &Stream,
+    ) -> Result<PromptCacheManifest, Error> {
+        self.adapter.save_prompt_cache(
+            cache,
+            directory,
+            descriptor,
+            prefix_token_ids,
+            options,
+            stream,
+        )
+    }
+
     /// Restores a compatible architecture-owned prefix cache from this rank's
     /// deterministic cache directory.
     pub fn load_prompt_cache(
@@ -2150,6 +2337,25 @@ impl<A: ArchitectureAdapter> LayerwiseModel<A> {
             &self.prompt_cache_directory(root.as_ref()),
             expected,
             &identity,
+            prefix_token_ids,
+            options,
+            stream,
+        )
+    }
+
+    pub(crate) fn load_prompt_cache_with_validated_identity(
+        &self,
+        directory: &Path,
+        expected: &PromptCacheDescriptor,
+        identity: &PromptCacheModelIdentity,
+        prefix_token_ids: &[u32],
+        options: PagedCacheOptions,
+        stream: &Stream,
+    ) -> Result<(A::Cache, PromptCacheManifest), Error> {
+        self.adapter.load_prompt_cache(
+            directory,
+            expected,
+            identity,
             prefix_token_ids,
             options,
             stream,
@@ -2264,9 +2470,79 @@ impl<A: ArchitectureAdapter> LayerwiseModel<A> {
         cache: &mut A::Cache,
         group: &safemlx::distributed::Group,
         stream: &Stream,
+        hook: H,
+    ) -> Result<(Array, A::ForwardContext), Error>
+    where
+        H: FnMut(usize, usize, &mut A::ForwardContext) -> Result<(), Error>,
+    {
+        self.forward_tensor_parallel_with_hooks(
+            input,
+            cache,
+            group,
+            stream,
+            |adapter, group, index, layer, hidden, cache, context, execution| {
+                adapter.forward_layer_with_execution(
+                    group, index, layer, hidden, cache, context, execution,
+                )
+            },
+            hook,
+        )
+    }
+
+    /// Runs TP execution while allowing routed-expert evaluation to be replaced.
+    ///
+    /// The embedding, attention, dense/shared projections, cache geometry, and
+    /// output head retain their tensor-parallel execution context. The caller
+    /// replaces only the selected populated-layer operation and receives the
+    /// same TP context, enabling an EP exchange inside a TP-sharded layer.
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn forward_tensor_parallel_with_layer_executor<'a, F>(
+        &mut self,
+        input: A::Input<'a>,
+        cache: &mut A::Cache,
+        group: &safemlx::distributed::Group,
+        stream: &Stream,
+        executor: F,
+    ) -> Result<Array, Error>
+    where
+        F: FnMut(
+            &mut A,
+            usize,
+            usize,
+            &mut A::Layer,
+            &Array,
+            &mut A::Cache,
+            &mut A::ForwardContext,
+            &crate::runtime::distributed::parallel::ParallelExecutionContext<'_>,
+        ) -> Result<Array, Error>,
+    {
+        self.forward_tensor_parallel_with_hooks(input, cache, group, stream, executor, |_, _, _| {
+            Ok(())
+        })
+        .map(|(output, _)| output)
+    }
+
+    #[allow(clippy::too_many_arguments, clippy::type_complexity)]
+    fn forward_tensor_parallel_with_hooks<'a, F, H>(
+        &mut self,
+        input: A::Input<'a>,
+        cache: &mut A::Cache,
+        group: &safemlx::distributed::Group,
+        stream: &Stream,
+        mut executor: F,
         mut hook: H,
     ) -> Result<(Array, A::ForwardContext), Error>
     where
+        F: FnMut(
+            &mut A,
+            usize,
+            usize,
+            &mut A::Layer,
+            &Array,
+            &mut A::Cache,
+            &mut A::ForwardContext,
+            &crate::runtime::distributed::parallel::ParallelExecutionContext<'_>,
+        ) -> Result<Array, Error>,
         H: FnMut(usize, usize, &mut A::ForwardContext) -> Result<(), Error>,
     {
         let topology = self.parallel_topology.ok_or_else(|| {
@@ -2364,7 +2640,8 @@ impl<A: ArchitectureAdapter> LayerwiseModel<A> {
                                 _device: lease,
                             }
                         };
-                        hidden = self.adapter.forward_layer_with_execution(
+                        hidden = executor(
+                            &mut self.adapter,
                             group_index,
                             index,
                             prepared.layer_mut(),

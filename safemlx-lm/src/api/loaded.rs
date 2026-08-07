@@ -1905,7 +1905,7 @@ pub(super) fn load_gguf_model_data(
                     )?;
                 (Model::DenseQwen(model), loaded.eos_token_ids)
             }
-            GgufArchitecture::Qwen3Vl => {
+            GgufArchitecture::Qwen3Vl | GgufArchitecture::Qwen3VlMoe => {
                 let mmproj_file = qwen3_vl::find_qwen3_vl_mmproj(gguf_file)?;
                 let vision_checkpoint = GgufCheckpoint::open(mmproj_file)?;
                 let vision_metadata =
@@ -1925,7 +1925,12 @@ pub(super) fn load_gguf_model_data(
                         stream,
                         weights_stream,
                     )?;
-                (Model::Qwen3Vl(model), loaded.eos_token_ids)
+                let model = if gguf_architecture == GgufArchitecture::Qwen3VlMoe {
+                    Model::Qwen3VlMoe(model)
+                } else {
+                    Model::Qwen3Vl(model)
+                };
+                (model, loaded.eos_token_ids)
             }
             GgufArchitecture::Qwen35
             | GgufArchitecture::Qwen35Moe
@@ -2062,7 +2067,7 @@ pub(super) fn load_gguf_model_data(
                     )?;
                 (Model::DenseQwen(loaded), eos_token_ids)
             }
-            GgufArchitecture::Qwen3Vl => {
+            GgufArchitecture::Qwen3Vl | GgufArchitecture::Qwen3VlMoe => {
                 let mmproj_file = qwen3_vl::find_qwen3_vl_mmproj(gguf_file)?;
                 let vision_checkpoint = GgufCheckpoint::open(mmproj_file)?;
                 let vision_metadata =
@@ -2077,7 +2082,12 @@ pub(super) fn load_gguf_model_data(
                         stream,
                         weights_stream,
                     )?;
-                (Model::Qwen3Vl(loaded), eos_token_ids)
+                let model = if gguf_architecture == GgufArchitecture::Qwen3VlMoe {
+                    Model::Qwen3VlMoe(loaded)
+                } else {
+                    Model::Qwen3Vl(loaded)
+                };
+                (model, eos_token_ids)
             }
             GgufArchitecture::Qwen35
             | GgufArchitecture::Qwen35Moe

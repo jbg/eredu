@@ -255,7 +255,7 @@ pub struct ExpertPassStatistics {
     pub device: ExpertTierStatistics,
 }
 
-/// Point-in-time sparse expert residency and execution report.
+/// Point-in-time expert residency and execution report.
 pub struct ExpertCacheReport {
     /// Owned logical expert count.
     pub owned_experts: usize,
@@ -296,7 +296,7 @@ impl ExpertStatistics {
     }
 }
 
-/// Shared sparse expert catalog, scheduler, residency manager, and telemetry.
+/// Shared expert catalog, scheduler, residency manager, and telemetry.
 pub struct ExpertCache {
     manager: ResidencyManager,
     catalog: BTreeMap<ExpertIdentity, u64>,
@@ -330,6 +330,49 @@ impl ExpertCache {
         store: Arc<dyn WeightStore + Send + Sync>,
         entries: impl IntoIterator<Item = ExpertCatalogEntry>,
         options: ExpertCacheLoadOptions,
+        source_stream: Stream,
+        device_stream: Stream,
+    ) -> Result<Self, ExpertCacheError> {
+        Self::new_shared_with_policy(
+            store,
+            entries,
+            options,
+            ResidencyPolicy::Cacheable,
+            MemoryTier::Disk,
+            source_stream,
+            device_stream,
+        )
+    }
+
+    /// Creates a fully resident store over exactly the supplied owned experts.
+    ///
+    /// Every expert is pinned on the execution device during construction. The
+    /// same route compaction and architecture-neutral binding machinery is used
+    /// by sparse and resident execution, but resident experts cannot be evicted
+    /// and never trigger checkpoint reads during a forward pass.
+    pub fn new_resident_shared(
+        store: Arc<dyn WeightStore + Send + Sync>,
+        entries: impl IntoIterator<Item = ExpertCatalogEntry>,
+        source_stream: Stream,
+        device_stream: Stream,
+    ) -> Result<Self, ExpertCacheError> {
+        Self::new_shared_with_policy(
+            store,
+            entries,
+            ExpertCacheLoadOptions::default(),
+            ResidencyPolicy::Pinned,
+            MemoryTier::Device,
+            source_stream,
+            device_stream,
+        )
+    }
+
+    fn new_shared_with_policy(
+        store: Arc<dyn WeightStore + Send + Sync>,
+        entries: impl IntoIterator<Item = ExpertCatalogEntry>,
+        options: ExpertCacheLoadOptions,
+        policy: ResidencyPolicy,
+        initial_tier: MemoryTier,
         source_stream: Stream,
         device_stream: Stream,
     ) -> Result<Self, ExpertCacheError> {
@@ -370,8 +413,8 @@ impl ExpertCache {
             specs.push(OffloadUnitSpec::new(
                 entry.identity.unit_id(),
                 entry.bytes,
-                ResidencyPolicy::Cacheable,
-                MemoryTier::Disk,
+                policy,
+                initial_tier,
             )?);
             definitions.push(entry.unit);
         }
@@ -388,7 +431,11 @@ impl ExpertCache {
             #[cfg(test)]
             layer_expert_counts,
             layer_global_spans,
-            host_budget: options.experts.host_budget_bytes(),
+            host_budget: if initial_tier == MemoryTier::Device {
+                Some(0)
+            } else {
+                options.experts.host_budget_bytes()
+            },
             scratch_limit: options.compact_bank_scratch_bytes,
             prefill_bank_target: options.prefill_compact_bank_target_bytes,
             statistics: Mutex::new(ExpertStatistics::default()),
@@ -1270,6 +1317,35 @@ mod tests {
         assert_eq!(report.decode.device.hits, 2);
         assert_eq!(report.owned_experts, 3);
         assert_eq!(report.owned_bytes, 48);
+    }
+
+    #[test]
+    fn resident_store_pins_every_expert_and_never_rereads_checkpoint_weights() {
+        let (_dir, store) = fixture();
+        let cache =
+            ExpertCache::new_resident_shared(store.clone(), entries(), stream(), stream()).unwrap();
+        let initialized = cache.report().unwrap();
+        assert_eq!(initialized.owned_experts, 3);
+        assert_eq!(initialized.device_resident_experts, 3);
+        assert_eq!(initialized.device_resident_bytes, initialized.owned_bytes);
+        assert_eq!(initialized.host_resident_experts, 0);
+
+        let reads_after_load = store.diagnostics().unwrap().physical_reads;
+        let acquired = cache
+            .acquire_route_slice(2, &[2, 0, 2], &[3, 1], ExpertPass::Decode, &stream())
+            .unwrap();
+        let compact = acquired.compact_binding("weight", &stream()).unwrap();
+        eval([&compact]).unwrap();
+        acquired.complete_pending().unwrap();
+
+        assert_eq!(
+            store.diagnostics().unwrap().physical_reads,
+            reads_after_load
+        );
+        let executed = cache.report().unwrap();
+        assert_eq!(executed.decode.device.hits, 2);
+        assert_eq!(executed.decode.device.misses, 0);
+        assert_eq!(executed.decode.device.evictions, 0);
     }
 
     #[test]

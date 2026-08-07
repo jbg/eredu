@@ -38,6 +38,73 @@ pub struct DeviceAssignment {
     pub local_index: usize,
 }
 
+/// One coordinate in the Cartesian parallel process grid.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
+pub struct ParallelCoordinates {
+    /// Tensor-parallel coordinate.
+    pub tensor: usize,
+    /// Pipeline-parallel coordinate.
+    pub pipeline: usize,
+    /// Expert-parallel coordinate.
+    pub expert: usize,
+}
+
+/// A communication axis in the Cartesian parallel process grid.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
+pub enum ParallelAxis {
+    /// Tensor-parallel collectives at fixed pipeline and expert coordinates.
+    Tensor,
+    /// Pipeline transport at fixed tensor and expert coordinates.
+    Pipeline,
+    /// Expert exchange at fixed tensor and pipeline coordinates.
+    Expert,
+}
+
+/// Topology-derived membership of one rank in an axis subgroup.
+///
+/// `color` and `key` are the canonical inputs for a backend-native group
+/// split. `global_ranks` remains authoritative for backends which implement a
+/// logical subgroup without native splitting.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct SubgroupMembership {
+    /// Axis represented by this subgroup.
+    pub axis: ParallelAxis,
+    /// Deterministic subgroup color among all groups on this axis.
+    pub color: usize,
+    /// Rank within the subgroup.
+    pub rank: usize,
+    /// Number of ranks in the subgroup.
+    pub size: usize,
+    /// Ordered global ranks, indexed by the changing axis coordinate.
+    pub global_ranks: Vec<usize>,
+}
+
+/// Weight-independent validation and ownership report for one parallel rank.
+///
+/// Loaders construct this report after reading lightweight model metadata and
+/// before opening checkpoint payload shards. Architecture semantic planners
+/// then add their tensor legality and packed-alignment checks before any
+/// execution-device materialization.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct TopologyPreflightReport {
+    /// Complete Cartesian topology.
+    pub topology: ParallelTopology,
+    /// TP collective membership.
+    pub tensor_subgroup: SubgroupMembership,
+    /// Pipeline-lane membership.
+    pub pipeline_subgroup: SubgroupMembership,
+    /// EP exchange membership.
+    pub expert_subgroup: SubgroupMembership,
+    /// Decoder layers owned by this pipeline coordinate, when supplied.
+    pub local_layer_range: Option<Range<usize>>,
+    /// Routed experts owned by this expert coordinate, when supplied.
+    pub local_expert_range: Option<Range<usize>>,
+    /// Whether this rank owns a (possibly TP-sharded) embedding.
+    pub owns_embedding: bool,
+    /// Whether this rank owns a (possibly TP-sharded) output head.
+    pub owns_output_head: bool,
+}
+
 impl DeviceAssignment {
     /// Creates an explicit process-local assignment.
     pub const fn new(device_type: DeviceType, local_index: usize) -> Self {
@@ -82,6 +149,245 @@ pub struct ParallelTopology {
     pub expert_parallel_rank: usize,
     /// Explicit process-local device assignment.
     pub device: DeviceAssignment,
+}
+
+/// Backend communication contexts materialized from one Cartesian topology.
+///
+/// Construction is collective when a non-global subgroup must be split. All
+/// ranks must call [`Self::new`] in the same order. Singleton axes do not own a
+/// communication group, while an axis spanning the complete world borrows the
+/// original group without splitting it.
+pub struct ParallelCommunicators<'a> {
+    topology: ParallelTopology,
+    world: &'a Group,
+    tensor: AxisCommunicator,
+    pipeline: AxisCommunicator,
+    expert: AxisCommunicator,
+}
+
+struct AxisCommunicator {
+    membership: SubgroupMembership,
+    native: Option<Group>,
+}
+
+type LogicalRoutePlan = Vec<(usize, Vec<Option<usize>>)>;
+
+impl std::fmt::Debug for ParallelCommunicators<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ParallelCommunicators")
+            .field("topology", &self.topology)
+            .field("tensor", &self.tensor.membership)
+            .field("pipeline", &self.pipeline.membership)
+            .field("expert", &self.expert.membership)
+            .finish()
+    }
+}
+
+impl<'a> ParallelCommunicators<'a> {
+    /// Validates the world group and materializes every required native subgroup.
+    pub fn new(topology: ParallelTopology, world: &'a Group) -> Result<Self, Error> {
+        if world.rank() != topology.global_rank || world.size() != topology.world_size {
+            return Err(Error::Parallel(format!(
+                "parallel topology expects world rank {}/{} but received {}/{}",
+                topology.global_rank,
+                topology.world_size,
+                world.rank(),
+                world.size()
+            )));
+        }
+        let tensor = Self::materialize(topology, world, ParallelAxis::Tensor)?;
+        let pipeline = Self::materialize(topology, world, ParallelAxis::Pipeline)?;
+        let expert = Self::materialize(topology, world, ParallelAxis::Expert)?;
+        Ok(Self {
+            topology,
+            world,
+            tensor,
+            pipeline,
+            expert,
+        })
+    }
+
+    fn materialize(
+        topology: ParallelTopology,
+        world: &Group,
+        axis: ParallelAxis,
+    ) -> Result<AxisCommunicator, Error> {
+        let membership = topology.subgroup(axis)?;
+        let native = if membership.size == 1 || membership.size == topology.world_size {
+            None
+        } else {
+            let color = i32::try_from(membership.color)
+                .map_err(|_| Error::Parallel(format!("{axis:?} subgroup color exceeds i32")))?;
+            let key = i32::try_from(membership.rank)
+                .map_err(|_| Error::Parallel(format!("{axis:?} subgroup rank exceeds i32")))?;
+            let group = match world.split(color, Some(key)) {
+                Ok(group) => group,
+                Err(_) if axis != ParallelAxis::Pipeline => world
+                    .logical_subgroup_with_routes(
+                        &membership.global_ranks,
+                        logical_stage_axis_routes(topology, axis)?,
+                    )
+                    .map_err(|error| {
+                        Error::Parallel(format!(
+                            "failed to materialize routed logical {axis:?} subgroup color {} with members {:?}: {error}",
+                            membership.color, membership.global_ranks
+                        ))
+                    })?,
+                Err(_) => world
+                    .logical_subgroup(&membership.global_ranks)
+                    .map_err(|error| {
+                        Error::Parallel(format!(
+                            "failed to materialize native or logical {axis:?} subgroup color {} with members {:?}: {error}",
+                            membership.color, membership.global_ranks
+                        ))
+                    })?,
+            };
+            if group.rank() != membership.rank || group.size() != membership.size {
+                return Err(Error::Parallel(format!(
+                    "{axis:?} subgroup expected rank {}/{} but backend produced {}/{}",
+                    membership.rank,
+                    membership.size,
+                    group.rank(),
+                    group.size()
+                )));
+            }
+            Some(group)
+        };
+        Ok(AxisCommunicator { membership, native })
+    }
+
+    /// Returns the complete validated topology.
+    pub const fn topology(&self) -> ParallelTopology {
+        self.topology
+    }
+
+    /// Returns the global communication group.
+    pub const fn world(&self) -> &Group {
+        self.world
+    }
+
+    /// Returns topology membership for `axis`.
+    pub const fn membership(&self, axis: ParallelAxis) -> &SubgroupMembership {
+        match axis {
+            ParallelAxis::Tensor => &self.tensor.membership,
+            ParallelAxis::Pipeline => &self.pipeline.membership,
+            ParallelAxis::Expert => &self.expert.membership,
+        }
+    }
+
+    /// Returns the native group for a non-singleton axis.
+    pub fn group(&self, axis: ParallelAxis) -> Option<&Group> {
+        let communicator = match axis {
+            ParallelAxis::Tensor => &self.tensor,
+            ParallelAxis::Pipeline => &self.pipeline,
+            ParallelAxis::Expert => &self.expert,
+        };
+        if communicator.membership.size == 1 {
+            None
+        } else if communicator.membership.size == self.topology.world_size {
+            Some(self.world)
+        } else {
+            communicator.native.as_ref()
+        }
+    }
+
+    /// Returns the TP collective group, or `None` when TP is inactive.
+    pub fn tensor_group(&self) -> Option<&Group> {
+        self.group(ParallelAxis::Tensor)
+    }
+
+    /// Returns the pipeline-lane consensus group, or `None` when PP is inactive.
+    pub fn pipeline_group(&self) -> Option<&Group> {
+        self.group(ParallelAxis::Pipeline)
+    }
+
+    /// Returns the EP exchange group, or `None` when EP is inactive.
+    pub fn expert_group(&self) -> Option<&Group> {
+        self.group(ParallelAxis::Expert)
+    }
+}
+
+fn logical_stage_axis_routes(
+    topology: ParallelTopology,
+    axis: ParallelAxis,
+) -> Result<LogicalRoutePlan, Error> {
+    let axis_size = match axis {
+        ParallelAxis::Tensor => topology.tensor_parallel_size,
+        ParallelAxis::Expert => topology.expert_parallel_size,
+        ParallelAxis::Pipeline => {
+            return Err(Error::Parallel(
+                "pipeline lanes do not use stage-local logical routes".into(),
+            ))
+        }
+    };
+    let stage_width = topology
+        .tensor_parallel_size
+        .checked_mul(topology.expert_parallel_size)
+        .ok_or_else(|| Error::Parallel("stage-local route width overflowed usize".into()))?;
+    let stage_start = topology
+        .pipeline_parallel_rank
+        .checked_mul(stage_width)
+        .ok_or_else(|| Error::Parallel("stage-local route start overflowed usize".into()))?;
+    let cohort = (stage_start..stage_start + stage_width).collect::<Vec<_>>();
+    let local_axis_rank = match axis {
+        ParallelAxis::Tensor => topology.tensor_parallel_rank,
+        ParallelAxis::Expert => topology.expert_parallel_rank,
+        ParallelAxis::Pipeline => unreachable!(),
+    };
+    let mut routes = Vec::with_capacity(axis_size);
+    for shift in 0..axis_size {
+        let mut destinations = cohort
+            .iter()
+            .map(|&source_rank| {
+                let source = ParallelTopology::from_rank(
+                    topology.world_size,
+                    source_rank,
+                    topology.tensor_parallel_size,
+                    topology.pipeline_parallel_size,
+                    topology.expert_parallel_size,
+                    topology.device,
+                )?;
+                let mut coordinates = source.coordinates();
+                match axis {
+                    ParallelAxis::Tensor => {
+                        coordinates.tensor = (coordinates.tensor + shift) % axis_size;
+                    }
+                    ParallelAxis::Expert => {
+                        coordinates.expert = (coordinates.expert + shift) % axis_size;
+                    }
+                    ParallelAxis::Pipeline => unreachable!(),
+                }
+                topology.global_rank_for(coordinates)
+            })
+            .collect::<Result<Vec<_>, Error>>()?;
+        let mut exchanges = Vec::with_capacity(stage_width);
+        for round in 0..stage_width {
+            let mut local_peer = None;
+            for left in (round % 2..stage_width.saturating_sub(1)).step_by(2) {
+                let right = left + 1;
+                if destinations[left] > destinations[right] {
+                    let left_rank = cohort[left];
+                    let right_rank = cohort[right];
+                    if topology.global_rank == left_rank {
+                        local_peer = Some(right_rank);
+                    } else if topology.global_rank == right_rank {
+                        local_peer = Some(left_rank);
+                    }
+                    destinations.swap(left, right);
+                }
+            }
+            exchanges.push(local_peer);
+        }
+        if destinations != cohort {
+            return Err(Error::Parallel(format!(
+                "failed to construct neighbor route for {axis:?} shift {shift} within stage cohort {cohort:?}"
+            )));
+        }
+        let source_rank = (local_axis_rank + axis_size - shift) % axis_size;
+        routes.push((source_rank, exchanges));
+    }
+    Ok(routes)
 }
 
 impl ParallelTopology {
@@ -169,6 +475,209 @@ impl ParallelTopology {
             && self.tensor_parallel_size == 1
             && self.pipeline_parallel_size == 1
             && self.expert_parallel_size == 1
+    }
+
+    /// Validates combined-axis geometry before checkpoint payloads are opened.
+    ///
+    /// Every Cartesian combination is accepted. Architecture loaders remain
+    /// responsible for declaring whether their semantic layer plans can
+    /// compose all active axes.
+    pub fn preflight(
+        self,
+        decoder_layers: Option<usize>,
+        routed_experts: Option<usize>,
+    ) -> Result<TopologyPreflightReport, Error> {
+        let local_layer_range = match decoder_layers {
+            Some(layers) => Some(self.layer_range(layers)?),
+            None if self.pipeline_parallel_size > 1 => {
+                return Err(Error::Parallel(
+                    "pipeline topology preflight requires the decoder-layer count".into(),
+                ))
+            }
+            None => None,
+        };
+        let local_expert_range = match routed_experts {
+            Some(experts) => Some(self.expert_range(experts)?),
+            None if self.expert_parallel_size > 1 => {
+                return Err(Error::Parallel(
+                    "expert topology preflight requires the routed-expert count".into(),
+                ))
+            }
+            None => None,
+        };
+        Ok(TopologyPreflightReport {
+            topology: self,
+            tensor_subgroup: self.subgroup(ParallelAxis::Tensor)?,
+            pipeline_subgroup: self.subgroup(ParallelAxis::Pipeline)?,
+            expert_subgroup: self.subgroup(ParallelAxis::Expert)?,
+            local_layer_range,
+            local_expert_range,
+            owns_embedding: self.owns_embedding(),
+            owns_output_head: self.owns_output_head(),
+        })
+    }
+
+    /// Returns this rank's complete Cartesian coordinates.
+    pub const fn coordinates(self) -> ParallelCoordinates {
+        ParallelCoordinates {
+            tensor: self.tensor_parallel_rank,
+            pipeline: self.pipeline_parallel_rank,
+            expert: self.expert_parallel_rank,
+        }
+    }
+
+    /// Resolves Cartesian coordinates to the unique global rank.
+    pub fn global_rank_for(self, coordinates: ParallelCoordinates) -> Result<usize, Error> {
+        if coordinates.tensor >= self.tensor_parallel_size
+            || coordinates.pipeline >= self.pipeline_parallel_size
+            || coordinates.expert >= self.expert_parallel_size
+        {
+            return Err(Error::Parallel(format!(
+                "parallel coordinates TP={}, PP={}, EP={} are outside topology TP={}, PP={}, EP={}",
+                coordinates.tensor,
+                coordinates.pipeline,
+                coordinates.expert,
+                self.tensor_parallel_size,
+                self.pipeline_parallel_size,
+                self.expert_parallel_size
+            )));
+        }
+        coordinates
+            .pipeline
+            .checked_mul(self.tensor_parallel_size)
+            .and_then(|rank| rank.checked_add(coordinates.tensor))
+            .and_then(|rank| rank.checked_mul(self.expert_parallel_size))
+            .and_then(|rank| rank.checked_add(coordinates.expert))
+            .ok_or_else(|| {
+                Error::Parallel("parallel global-rank calculation overflowed usize".into())
+            })
+    }
+
+    /// Returns topology-derived membership in one communication axis.
+    pub fn subgroup(self, axis: ParallelAxis) -> Result<SubgroupMembership, Error> {
+        let coordinates = self.coordinates();
+        let (color, rank, size, global_ranks) = match axis {
+            ParallelAxis::Tensor => {
+                let color = coordinates
+                    .pipeline
+                    .checked_mul(self.expert_parallel_size)
+                    .and_then(|value| value.checked_add(coordinates.expert))
+                    .ok_or_else(|| Error::Parallel("TP subgroup color overflowed usize".into()))?;
+                let ranks = (0..self.tensor_parallel_size)
+                    .map(|tensor| {
+                        self.global_rank_for(ParallelCoordinates {
+                            tensor,
+                            ..coordinates
+                        })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                (color, coordinates.tensor, self.tensor_parallel_size, ranks)
+            }
+            ParallelAxis::Pipeline => {
+                let color = coordinates
+                    .tensor
+                    .checked_mul(self.expert_parallel_size)
+                    .and_then(|value| value.checked_add(coordinates.expert))
+                    .ok_or_else(|| Error::Parallel("PP subgroup color overflowed usize".into()))?;
+                let ranks = (0..self.pipeline_parallel_size)
+                    .map(|pipeline| {
+                        self.global_rank_for(ParallelCoordinates {
+                            pipeline,
+                            ..coordinates
+                        })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                (
+                    color,
+                    coordinates.pipeline,
+                    self.pipeline_parallel_size,
+                    ranks,
+                )
+            }
+            ParallelAxis::Expert => {
+                let color = coordinates
+                    .pipeline
+                    .checked_mul(self.tensor_parallel_size)
+                    .and_then(|value| value.checked_add(coordinates.tensor))
+                    .ok_or_else(|| Error::Parallel("EP subgroup color overflowed usize".into()))?;
+                let ranks = (0..self.expert_parallel_size)
+                    .map(|expert| {
+                        self.global_rank_for(ParallelCoordinates {
+                            expert,
+                            ..coordinates
+                        })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                (color, coordinates.expert, self.expert_parallel_size, ranks)
+            }
+        };
+        if global_ranks.get(rank).copied() != Some(self.global_rank) {
+            return Err(Error::Parallel(format!(
+                "{axis:?} subgroup geometry does not map local rank {rank} back to global rank {}",
+                self.global_rank
+            )));
+        }
+        Ok(SubgroupMembership {
+            axis,
+            color,
+            rank,
+            size,
+            global_ranks,
+        })
+    }
+
+    /// Returns the ordered global ranks participating in TP collectives with this rank.
+    pub fn tensor_parallel_peers(self) -> Result<Vec<usize>, Error> {
+        Ok(self.subgroup(ParallelAxis::Tensor)?.global_ranks)
+    }
+
+    /// Returns the ordered global ranks participating in EP exchange with this rank.
+    pub fn expert_parallel_peers(self) -> Result<Vec<usize>, Error> {
+        Ok(self.subgroup(ParallelAxis::Expert)?.global_ranks)
+    }
+
+    /// Returns the preceding pipeline rank with matching TP and EP coordinates.
+    pub fn pipeline_predecessor(self) -> Result<Option<usize>, Error> {
+        if self.pipeline_parallel_rank == 0 {
+            return Ok(None);
+        }
+        self.global_rank_for(ParallelCoordinates {
+            pipeline: self.pipeline_parallel_rank - 1,
+            ..self.coordinates()
+        })
+        .map(Some)
+    }
+
+    /// Returns the succeeding pipeline rank with matching TP and EP coordinates.
+    pub fn pipeline_successor(self) -> Result<Option<usize>, Error> {
+        if self.pipeline_parallel_rank + 1 == self.pipeline_parallel_size {
+            return Ok(None);
+        }
+        self.global_rank_for(ParallelCoordinates {
+            pipeline: self.pipeline_parallel_rank + 1,
+            ..self.coordinates()
+        })
+        .map(Some)
+    }
+
+    /// Returns whether this rank owns the stage-local token embedding shard.
+    pub const fn owns_embedding(self) -> bool {
+        self.pipeline_parallel_rank == 0
+    }
+
+    /// Returns whether this rank owns the stage-local output normalization and head shard.
+    pub const fn owns_output_head(self) -> bool {
+        self.pipeline_parallel_rank + 1 == self.pipeline_parallel_size
+    }
+
+    /// Returns whether this rank owns a decoder layer under balanced PP placement.
+    pub fn owns_layer(self, decoder_layers: usize, layer: usize) -> Result<bool, Error> {
+        Ok(self.layer_range(decoder_layers)?.contains(&layer))
+    }
+
+    /// Returns whether this rank owns a routed expert under balanced EP placement.
+    pub fn owns_expert(self, routed_experts: usize, expert: usize) -> Result<bool, Error> {
+        Ok(self.expert_range(routed_experts)?.contains(&expert))
     }
 
     /// Returns this pipeline stage's balanced contiguous decoder-layer range.
@@ -1036,6 +1545,124 @@ mod tests {
                     assert_eq!(value.device.local_index, 99);
                     assert_ne!(value.device.local_index, value.global_rank);
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn cartesian_subgroups_and_pipeline_lanes_are_authoritative() {
+        let expected_tp = [vec![0, 2, 4], vec![1, 3, 5], vec![6, 8, 10], vec![7, 9, 11]];
+        let expected_ep = [
+            vec![0, 1],
+            vec![2, 3],
+            vec![4, 5],
+            vec![6, 7],
+            vec![8, 9],
+            vec![10, 11],
+        ];
+        for rank in 0..12 {
+            let topology = topology(12, rank, 3, 2, 2);
+            let coordinates = topology.coordinates();
+            assert_eq!(topology.global_rank_for(coordinates).unwrap(), rank);
+
+            let tp = topology.subgroup(ParallelAxis::Tensor).unwrap();
+            assert_eq!(tp.rank, coordinates.tensor);
+            assert_eq!(tp.size, 3);
+            assert_eq!(tp.global_ranks, expected_tp[tp.color]);
+
+            let ep = topology.subgroup(ParallelAxis::Expert).unwrap();
+            assert_eq!(ep.rank, coordinates.expert);
+            assert_eq!(ep.size, 2);
+            assert_eq!(ep.global_ranks, expected_ep[ep.color]);
+
+            let pp = topology.subgroup(ParallelAxis::Pipeline).unwrap();
+            assert_eq!(pp.rank, coordinates.pipeline);
+            assert_eq!(pp.size, 2);
+            assert_eq!(pp.global_ranks[coordinates.pipeline], rank);
+            if coordinates.pipeline == 0 {
+                assert_eq!(topology.pipeline_predecessor().unwrap(), None);
+                assert_eq!(
+                    topology.pipeline_successor().unwrap(),
+                    Some(pp.global_ranks[1])
+                );
+                assert!(topology.owns_embedding());
+                assert!(!topology.owns_output_head());
+            } else {
+                assert_eq!(
+                    topology.pipeline_predecessor().unwrap(),
+                    Some(pp.global_ranks[0])
+                );
+                assert_eq!(topology.pipeline_successor().unwrap(), None);
+                assert!(!topology.owns_embedding());
+                assert!(topology.owns_output_head());
+            }
+        }
+    }
+
+    #[test]
+    fn pairwise_ownership_combines_pipeline_and_expert_coordinates() {
+        for rank in 0..6 {
+            let topology = topology(6, rank, 1, 3, 2);
+            let layers = topology.layer_range(7).unwrap();
+            let experts = topology.expert_range(5).unwrap();
+            for layer in 0..7 {
+                assert_eq!(
+                    topology.owns_layer(7, layer).unwrap(),
+                    layers.contains(&layer)
+                );
+            }
+            for expert in 0..5 {
+                assert_eq!(
+                    topology.owns_expert(5, expert).unwrap(),
+                    experts.contains(&expert)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn preflight_accepts_pairwise_and_triple_axis_geometry() {
+        let tp_pp = topology(4, 3, 2, 2, 1).preflight(Some(5), None).unwrap();
+        assert_eq!(tp_pp.local_layer_range, Some(3..5));
+        assert_eq!(tp_pp.tensor_subgroup.global_ranks, [2, 3]);
+        assert_eq!(tp_pp.pipeline_subgroup.global_ranks, [1, 3]);
+
+        let tp_ep = topology(6, 4, 3, 1, 2).preflight(None, Some(7)).unwrap();
+        assert_eq!(tp_ep.local_expert_range, Some(0..4));
+        assert_eq!(tp_ep.tensor_subgroup.global_ranks, [0, 2, 4]);
+        assert_eq!(tp_ep.expert_subgroup.global_ranks, [4, 5]);
+
+        let pp_ep = topology(6, 5, 1, 3, 2).preflight(Some(7), Some(5)).unwrap();
+        assert_eq!(pp_ep.local_layer_range, Some(5..7));
+        assert_eq!(pp_ep.local_expert_range, Some(3..5));
+        assert_eq!(pp_ep.pipeline_subgroup.global_ranks, [1, 3, 5]);
+
+        let triple = topology(8, 0, 2, 2, 2).preflight(Some(4), Some(4)).unwrap();
+        assert_eq!(triple.local_layer_range, Some(0..2));
+        assert_eq!(triple.local_expert_range, Some(0..2));
+        assert_eq!(triple.tensor_subgroup.global_ranks, [0, 2]);
+        assert_eq!(triple.pipeline_subgroup.global_ranks, [0, 4]);
+        assert_eq!(triple.expert_subgroup.global_ranks, [0, 1]);
+        assert!(topology(4, 0, 1, 4, 1).preflight(None, None).is_err());
+        assert!(topology(4, 0, 1, 1, 4).preflight(None, None).is_err());
+    }
+
+    #[test]
+    fn ring_neighbor_routes_cover_arbitrary_stage_local_axis_degrees() {
+        for rank in 0..18 {
+            let topology = topology(18, rank, 3, 2, 3);
+            for axis in [ParallelAxis::Tensor, ParallelAxis::Expert] {
+                let routes = logical_stage_axis_routes(topology, axis).unwrap();
+                assert_eq!(routes.len(), 3);
+                let mut sources = routes.iter().map(|(source, _)| *source).collect::<Vec<_>>();
+                sources.sort_unstable();
+                assert_eq!(sources, [0, 1, 2]);
+                assert!(routes.iter().flat_map(|(_, rounds)| rounds).all(|peer| {
+                    peer.is_none_or(|peer| {
+                        (rank + 1) % topology.world_size == peer
+                            || (peer + 1) % topology.world_size == rank
+                    })
+                }));
             }
         }
     }

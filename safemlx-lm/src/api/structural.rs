@@ -154,6 +154,7 @@ pub(crate) const fn gguf_policy(architecture: GgufArchitecture) -> StructuralVal
         | GgufArchitecture::Qwen35Moe
         | GgufArchitecture::Qwen3Next
         | GgufArchitecture::Qwen3Vl
+        | GgufArchitecture::Qwen3VlMoe
         | GgufArchitecture::KimiLinear => StructuralValidationPolicy::Exact,
     }
 }
@@ -223,7 +224,9 @@ pub(crate) fn validate_gguf(
             GgufArchitecture::Qwen2 | GgufArchitecture::Qwen3 | GgufArchitecture::Qwen3Moe => {
                 validate_dense_qwen_gguf(architecture, checkpoint, metadata)
             }
-            GgufArchitecture::Qwen3Vl => validate_qwen3_vl_gguf(checkpoint, metadata, options),
+            architecture @ (GgufArchitecture::Qwen3Vl | GgufArchitecture::Qwen3VlMoe) => {
+                validate_qwen3_vl_gguf(architecture, checkpoint, metadata, options)
+            }
             GgufArchitecture::KimiLinear => validate_kimi_linear_gguf(checkpoint, metadata),
             GgufArchitecture::Qwen35
             | GgufArchitecture::Qwen35Moe
@@ -6816,14 +6819,17 @@ fn validate_dense_qwen_gguf(
 }
 
 fn validate_qwen3_vl_gguf(
+    architecture: GgufArchitecture,
     checkpoint: &GgufCheckpoint,
     metadata: &HashMap<String, GgufMetadataValue>,
     options: ModelLoadOptions,
 ) -> StructuralValidation {
-    if let Err(error) = GgufArchitecture::Qwen3Vl.validate_load_policy(options) {
+    if let Err(error) = architecture.validate_load_policy(options) {
         return invalid_geometry(error.to_string());
     }
-    let translate = |name: &str| dense_qwen::translate_gguf_weight_name(name, false);
+    let is_moe = architecture == GgufArchitecture::Qwen3VlMoe;
+    let metadata_name = architecture.metadata_name();
+    let translate = |name: &str| dense_qwen::translate_gguf_weight_name(name, is_moe);
     if let Err(error) = checkpoint.catalog().translated_outputs(translate) {
         return StructuralValidation::Invalid(vec![StructuralIssue {
             kind: StructuralIssueKind::ConflictingLayout,
@@ -6833,10 +6839,11 @@ fn validate_qwen3_vl_gguf(
             metadata_key: None,
         }]);
     }
-    let args = match dense_qwen::config_from_gguf_catalog(checkpoint, metadata, "qwen3vl", false) {
-        Ok(args) => args,
-        Err(error) => return invalid_geometry(error.to_string()),
-    };
+    let args =
+        match dense_qwen::config_from_gguf_catalog(checkpoint, metadata, metadata_name, is_moe) {
+            Ok(args) => args,
+            Err(error) => return invalid_geometry(error.to_string()),
+        };
     if let Err(error) = qwen3_vl::validate_qwen3_vl_text_gguf_catalog(&args, metadata) {
         return invalid_geometry(error.to_string());
     }
@@ -6846,6 +6853,13 @@ fn validate_qwen3_vl_gguf(
         .map(|tensor| tensor.gguf_name.clone())
         .collect::<BTreeSet<_>>();
     let mut issues = validate_gguf_plan(checkpoint, expected, "Qwen3-VL text");
+    if is_moe {
+        issues.extend(validate_paired_expert_encodings(
+            checkpoint,
+            0..args.num_hidden_layers as usize,
+            "Qwen3-VL-MoE",
+        ));
+    }
     for tensor in checkpoint.catalog().tensors() {
         let name = &tensor.descriptor().name;
         if !allowed.contains(name) {
@@ -6861,11 +6875,21 @@ pub(crate) fn validate_qwen3_vl_projector_gguf(
     checkpoint: &GgufCheckpoint,
     metadata: &HashMap<String, GgufMetadataValue>,
 ) -> StructuralValidation {
+    let architecture = match dense_qwen::gguf_string(model_metadata, "general.architecture") {
+        Ok(architecture) => architecture,
+        Err(error) => return invalid_geometry(error.to_string()),
+    };
+    let is_moe = architecture == "qwen3vlmoe";
+    if architecture != "qwen3vl" && !is_moe {
+        return invalid_geometry(format!(
+            "Qwen3-VL projector requires qwen3vl or qwen3vlmoe text, got {architecture:?}"
+        ));
+    }
     let text_args = match dense_qwen::config_from_gguf_catalog(
         model_checkpoint,
         model_metadata,
-        "qwen3vl",
-        false,
+        &architecture,
+        is_moe,
     ) {
         Ok(args) => args,
         Err(error) => return invalid_geometry(error.to_string()),

@@ -289,9 +289,10 @@ fingerprints. Normal and paged caches support every schedule; schema-v4
 persisted prompt caches preserve arbitrary ordered full/sliding policies,
 distinct per-layer windows, and each layer's retained token interval. Qwen2
 SafeTensors and GGUF tensor parallelism use the generalized family adapter.
-Pure pipeline parallelism supports Qwen2/Qwen2.5, Qwen3, and Qwen3 MoE
-SafeTensors and GGUF through the same canonical binding, schedule, and
-routed-expert plans.
+Pipeline parallelism supports Llama/Mistral, Qwen2/Qwen2.5, Qwen3, Qwen3 MoE,
+and GPT-OSS SafeTensors and GGUF through the same canonical binding and
+schedule. Llama/Mistral, Qwen2/Qwen3, GPT-OSS, and Gemma 4 text stages also
+compose with TP, while Qwen3-MoE stages compose with EP.
 
 Dense Qwen callers use `architectures::qwen::dense`; architecture identity comes from
 validated checkpoint metadata rather than the module selected by the caller.
@@ -317,11 +318,13 @@ full layers grow with context. Prompt-cache schema v4 persists the complete
 ordered schedule, exact per-layer windows, tensor geometry, and retained token
 intervals. JSON callers use `model_args_from_config_value`.
 
-Pure GPT-OSS pipeline stages support SafeTensors and canonical `gpt-oss` GGUF,
-including native MXFP4 expert bindings, fully resident or dense disk-streamed
-local layers, ordinary/paged/persisted caches, and rank-synchronized
-generation. Fully resident stages may MXFP4-quantize eligible dense matrices;
-affine transcoding and streamed load-time requantization fail closed.
+GPT-OSS pipeline stages support SafeTensors and canonical `gpt-oss` GGUF,
+including TP+PP with tensor-sharded attention and native MXFP4 expert
+intermediates, rank-local KV caches, sharded embedding and output boundaries,
+fully resident or dense disk-streamed local layers, ordinary/paged/persisted
+caches, and rank-synchronized generation. Fully resident stages may
+MXFP4-quantize eligible dense matrices; affine transcoding and streamed
+load-time requantization fail closed.
 
 ## Gemma 4 and assistant weight residency
 
@@ -368,7 +371,11 @@ and prompt-cache identity records the actual rank-local KV geometry. Gemma
 text pipeline stages use dependency-safe contiguous placement: a shared-KV
 consumer is always colocated with its publisher. Per-layer residual inputs are
 prepared once on the ingress stage and relayed as typed immutable auxiliary
-state. Image/audio encoder execution is not part of the decoder pipeline API.
+state. TP+PP shards the embedding and tied or untied output boundary, per-layer
+embedding and projection inputs, attention heads, dense or routed
+intermediates, and rank-local publisher caches from the same semantic plan.
+SafeTensors and GGUF stages support fully resident and dense-streamed layers.
+Image/audio encoder execution is not part of the decoder pipeline API.
 
 ## LFM2/LFM2.5 weight residency
 
@@ -733,8 +740,8 @@ layout; unsupported GGUF tensor types return an error. Model dispatch uses
 `general.architecture`; the current GGUF adapters support text-only `deepseek2`,
 `gemma4`, `gpt-oss`, `kimi-linear`, `llama`, `mistral`, `lfm2`, `lfm2moe`, `nemotron_h`,
 `nemotron_h_moe`, `qwen2`, `qwen3`, `qwen3moe`, dense `qwen35`, and `qwen35moe`
-architectures, plus multimodal `inkling`, `qwen3next`, and dense `qwen3vl` with separate projectors. For
-Qwen3-VL, put the llama.cpp-style dense F16/BF16/F32
+architectures, plus multimodal `inkling`, `qwen3next`, `qwen3vl`, and
+`qwen3vlmoe` with separate projectors. For Qwen3-VL, put the llama.cpp-style dense F16/BF16/F32
 `mmproj-*.gguf` next to the language-model GGUF. The single-path loaders prefer
 the unique dense projector automatically; callers that need an explicit pair
 can use `architectures::qwen::vl::model::load_qwen3_vl_gguf`.
@@ -766,6 +773,12 @@ tensor parallelism use the generalized family adapter. Pure dense-Qwen
 pipeline stages support Qwen2/Qwen2.5, Qwen3, and Qwen3 MoE in both formats
 with the same schedule, prompt-cache identity, and direct or derived
 layer-binding plan.
+Qwen3-VL SafeTensors and canonical `qwen3vl` or `qwen3vlmoe` GGUF use the same
+pipeline shell for dense and MoE text decoders. GGUF combines the main
+checkpoint and sibling mmproj store before rank-local selection. Stage-zero vision ownership,
+typed ingress, MRoPE/DeepStack payload construction, and TP- or EP-local text
+layers remain adapter-authored semantics rather than format- or
+topology-specific runtimes.
 
 Kimi Linear GGUF accepts split `attn_k_b`/`attn_v_b` and combined
 `attn_kv_b` projections, vector and singleton-ranked convolution tensors, dense
@@ -887,10 +900,82 @@ let output = scheduler.run_queued(&mut model, &group, &stream)?;
 let logits = output[0].logits(); // Some only on the final stage.
 ```
 
-Pure pipeline parallelism currently requires `PP > 1`, `TP = 1`, and `EP = 1`.
-Hybrid TP+PP and PP+EP jobs fail before checkpoint payloads are loaded. The
-ordinary `Model` loader remains a complete single-device API and directs
-non-replicated requests to the explicit pipeline loader.
+Pipeline execution requires `PP > 1`. The Cartesian planner derives TP
+collectives, EP exchanges, and matching-coordinate pipeline lanes from one
+topology. Llama/Mistral, DeepSeek-V3/R1, Kimi Linear, Qwen2/Qwen3, Qwen3-VL,
+GPT-OSS, LFM2, Inkling, Nemotron-H, Qwen3-Next/Qwen3.5, and Gemma 4 text TP+PP
+use tensor-sharded stage layers and vocabulary boundaries; DeepSeek-V3/R1,
+Inkling, Kimi Linear, Qwen3-MoE, Qwen3-VL-MoE, GPT-OSS, LFM2-MoE,
+Nemotron-H-MoE, and Qwen3-Next/Qwen3.5-MoE PP+EP keep only the stage
+rank's assigned routed experts. DeepSeek preserves its compressed MLA cache
+and split, packed-affine, native block-FP8, or GGUF expert recipes. GPT-OSS
+preserves its checkpoint-native MXFP4 expert banks and scheduled full/sliding
+attention cache, LFM2 preserves its alternating convolution/attention state,
+Inkling preserves full/sliding KV state plus all four short-convolution histories,
+Nemotron-H preserves rank-local Mamba
+convolution/recurrent state plus GQA cache, and the Qwen hybrid adapter
+preserves rank-local recurrent convolution/delta-rule state plus full-attention
+KV state when composing stage placement with TP or EP ownership.
+Qwen3-VL pins its vision patch/position modules, mergers, and vision blocks on
+stage zero for every non-PP coordinate. Typed image/video ingress is assembled
+there; explicit MRoPE tensors, the persisted position delta, and
+sequence-aligned DeepStack residuals then use the ordinary immutable pipeline
+payload. Later stages execute only their text-layer ranges.
+`PipelineModel::prefill_pipeline` and `PipelineModel::prefill_cartesian` perform
+typed prefill, after which cached decode, synchronized sampling, cancellation
+consensus, and prompt-cache persistence use the common pipeline APIs.
+Combined pipeline modes accept `DenseDiskStream`. Each cold layer unit is
+built from the same semantic plan as resident execution after composing stage
+placement with its rank-local TP shard or EP expert selection. SafeTensors and
+GGUF reads therefore materialize only the local recipe, while residency and
+checkpoint diagnostics distinguish pinned stage-boundary weights from planned
+cold layer bytes.
+Qwen3-MoE also composes all three axes in this runtime. TP collectives remain
+inside the stage and EP coordinate, routed exchange remains inside the stage
+and TP coordinate, and pipeline transport connects equal TP/EP coordinates.
+The triple-axis path supports arbitrary valid Cartesian degrees on native
+subgroup backends and uses topology-planned neighbor routes for stage-local
+Ring fallback collectives. Fully resident and dense-disk-streamed SafeTensors
+and canonical `qwen3moe` GGUF checkpoints share the same layer recipes, cache
+identity, synchronized generation, and failure consensus.
+`ArchitectureAdapter::expert_parallel_assignment`,
+`ArchitectureAdapter::new_cartesian_layer`, and
+`ArchitectureAdapter::cartesian_layer_bindings` are the shared semantic
+boundary for pipeline-local units. The default composition selects ordinary,
+TP-local, or EP-local hooks from topology inputs; each family owns its expert
+ownership, bank geometry, checkpoint naming, packed companions, and bounded
+expert selection. The pipeline runtime does not inspect family layer enums or
+expert parameter names.
+Unsupported family/policy combinations fail from metadata before checkpoint
+payload materialization. The ordinary `Model` loader remains a complete
+single-device API and directs non-replicated requests to the explicit pipeline
+loader.
+
+Combined family coverage is tracked against the constituent execution modes:
+
+| Family | Constituent axes | Pairwise combined status | Remaining limitations |
+|---|---|---|---|
+| Qwen2/Qwen3 dense | TP, PP | TP+PP supported | EP does not apply to dense layers |
+| Qwen3 MoE | TP, PP, EP | TP+PP, TP+EP, and PP+EP supported; TP+PP+EP supports fully resident and dense-disk-streamed SafeTensors and GGUF | Triple-axis sparse-expert caching and eager host-layer residency are not supported by the pipeline loader |
+| Llama/Mistral | TP, PP | TP+PP supported for SafeTensors and GGUF, resident and dense-streamed | No routed-expert EP axis |
+| Gemma 4 text | TP, PP | TP+PP supported for SafeTensors and GGUF, resident and dense-streamed | Text pipeline only; no routed-expert EP axis |
+| DeepSeek-V3/R1 | TP, PP, EP | TP+PP, TP+EP, and PP+EP support SafeTensors and GGUF, fully resident and dense/sparse-streamed | Triple-axis execution is unavailable |
+| Kimi Linear | TP, PP, EP | TP+PP, TP+EP, and PP+EP support SafeTensors and GGUF, fully resident and dense/sparse-streamed | Triple-axis execution is unavailable |
+| GPT-OSS | TP, PP, EP | TP+PP, TP+EP, and PP+EP support SafeTensors and GGUF, fully resident and dense/sparse-streamed | Triple-axis execution is unavailable |
+| LFM2 dense/MoE | TP, PP; EP for MoE | TP+PP supports SafeTensors and GGUF, resident and dense-streamed; LFM2-MoE TP+EP and PP+EP support resident and sparse/dense-streamed execution | EP applies only to MoE layers; triple-axis execution is unavailable |
+| Nemotron-H dense/MoE | TP, PP; EP for MoE | TP+PP supports SafeTensors and GGUF, resident and dense-streamed; Nemotron-H-MoE TP+EP and PP+EP support resident and sparse/dense-streamed execution | EP applies only to MoE layers; triple-axis execution is unavailable |
+| Qwen3-Next/Qwen3.5 text dense/MoE | TP, PP; EP for MoE | TP+PP supports SafeTensors and GGUF, resident and dense-streamed; MoE TP+EP and PP+EP support resident and sparse/dense-streamed execution | Multimodal Qwen3.5 ingress is outside the text pipeline; triple-axis execution is unavailable |
+| Inkling text | TP, PP, EP | TP+PP, TP+EP, and PP+EP support SafeTensors and GGUF, fully resident and dense/sparse-streamed | Audio/vision ingress is outside combined execution; triple-axis execution is unavailable |
+| Qwen3-VL dense/MoE | TP, PP; EP for MoE | SafeTensors and canonical `qwen3vl`/`qwen3vlmoe` GGUF support PP and TP+PP with typed image/video prefill, cached decode, tied/untied heads, persistence, resident text layers, and dense-streamed text layers; Qwen3-VL-MoE supports pure EP, fully resident or sparse-streamed TP+EP, and stage-local PP+EP experts in both formats | The vision tower is pinned on stage zero rather than layer-streamed; queued microbatches accept token IDs, so typed prefill uses the direct pipeline methods before ordinary decode/generation; triple-axis execution is unavailable |
+| Moshi/PersonaPlex | TP | No pairwise combination applies to its temporal/depth runtime | Its temporal/depth runtime has no PP or EP constituent axis |
+
+TP+PP+EP is executable for Qwen3-MoE. Other families are rejected by
+architecture preflight with the requested axis sizes before checkpoint payload
+materialization; the Cartesian topology itself remains family-neutral. Dense disk-streamed pipeline stages require checkpoint-native
+quantization, and external-expert TP+EP rejects load-time weight conversion because
+it would bypass the semantic sharding recipes. Checkpoint-native affine, FP8,
+MXFP4, and other registered packed expert layouts remain supported. Pairwise support is
+otherwise complete wherever the table lists both constituent axes.
 
 Decoder layers use balanced contiguous placement. Architectures may declare
 unsplittable dependency units; Gemma 4 uses this to keep each shared-KV
@@ -931,10 +1016,11 @@ families support fully resident and dense disk-streamed local stages, ordinary
 and paged live caches, persisted prompt caches, and synchronized generation.
 
 GPT-OSS SafeTensors and GGUF stages use its canonical split/fused expert binding
-recipes; native MXFP4 experts remain packed, while eligible resident dense
-matrices may be quantized to MXFP4 on load. Qwen3 MoE likewise uses the shared
-dense-Qwen stage and canonical expert binding recipes rather than a separate
-pipeline implementation.
+recipes; TP+PP partitions GQA heads and 32-channel-aligned packed expert
+intermediates from the same semantic plan used by pure TP. Native MXFP4 experts
+remain packed, while eligible resident dense matrices may be quantized to
+MXFP4 on load. Qwen3 MoE likewise uses the shared dense-Qwen stage and canonical
+expert binding recipes rather than a separate pipeline implementation.
 
 LFM2 and LFM2-MoE stages accept exact SafeTensors catalogs and canonical
 `lfm2`/`lfm2moe` GGUF checkpoints. Fully resident and dense disk-streamed
@@ -1016,13 +1102,12 @@ drain, callers enqueue the synchronized token or finish the request on every
 rank. A single autoregressive request remains token-dependency limited;
 pipeline utilization comes from multiple requests or teacher-forced chunks.
 
-Pipeline training/backward, Gemma image/audio encoder execution, hybrid
-pipeline/expert dispatch, and hybrid pipeline/tensor execution are not
+Pipeline training/backward and Gemma image/audio encoder execution are not
 supported. Moshi/PersonaPlex uses its coupled temporal/depth program adapter
 over the same generic scheduler rather than the decoder pipeline's
 single-hidden-edge adapter. Pipeline GGUF loading is registered for `llama`,
 `mistral`, `deepseek2`, `gemma4`, `qwen2`, `qwen3`, `qwen3moe`, `gpt-oss`,
-`lfm2`, `lfm2moe`, `nemotron_h`, `nemotron_h_moe`, `qwen3next`, `qwen35`,
+`qwen3vl`, `qwen3vlmoe`, `lfm2`, `lfm2moe`, `nemotron_h`, `nemotron_h_moe`, `qwen3next`, `qwen35`,
 `qwen35moe`, `kimi-linear`, and `inkling`. Support is not inferred for other
 GGUF architectures.
 
@@ -1074,6 +1159,14 @@ cargo test -p safemlx-lm --test distributed_pipeline_ring \
   ring_two_process_qwen35_dense_stream_pipeline -- --ignored --exact --nocapture
 cargo test -p safemlx-lm --test distributed_pipeline_ring \
   ring_two_process_inkling_dense_stream_pipeline -- --ignored --exact --nocapture
+cargo test -p safemlx-lm --test distributed_qwen3_vl_pipeline_ring \
+  ring_qwen3_vl_pipeline_multimodal -- --ignored --exact --nocapture
+cargo test -p safemlx-lm --test distributed_qwen3_vl_pipeline_ring \
+  ring_qwen3_vl_dense_stream_pipeline_multimodal -- --ignored --exact --nocapture
+cargo test -p safemlx-lm --test distributed_qwen3_vl_pipeline_ring \
+  ring_qwen3_vl_tensor_pipeline_multimodal -- --ignored --exact --nocapture
+cargo test -p safemlx-lm --test distributed_qwen3_vl_pipeline_ring \
+  ring_qwen3_vl_moe_pipeline_expert_multimodal -- --ignored --exact --nocapture
 ```
 
 The Kimi command runs both SafeTensors and canonical GGUF fixtures. These
@@ -1118,14 +1211,20 @@ loader and executor.
 
 ### Executable tensor parallelism
 
-Pure tensor parallelism uses `TP > 1`, `PP = 1`, and `EP = 1`. Hybrid TP+PP
-and TP+EP configurations fail before checkpoint payloads are opened because
-Ring and JACCL cannot reliably form the required subgroups in the vendored MLX
-version. Use the selected architecture's `load_*_tensor_parallel_model` entry
+Tensor parallelism uses `TP > 1` and may compose with one other active axis.
+Use the selected architecture's `load_*_tensor_parallel_model` entry
 point (or `load_tensor_parallel_safetensors` for Qwen2/3) with a
-`ParallelBuildContext` whose tensor size equals the world size. Tensor
-parallelism is implemented by the generalized layerwise execution-group
-engine; there is no architecture-dispatching TP model wrapper.
+`ParallelBuildContext`. For TP+EP DeepSeek-V3/R1, Inkling, Kimi Linear, Qwen3,
+Qwen3-VL-MoE, GPT-OSS, LFM2-MoE, Nemotron-H-MoE, or Qwen3-Next/Qwen3.5-MoE,
+use the expert loader and
+`ExpertParallelModel::forward_cartesian`; the shared layerwise plan shards
+nonexpert projections, attention heads or recurrent operators, caches,
+embeddings, and the output head across TP while the EP subgroup owns routed
+expert work. For TP+PP Llama/Mistral, DeepSeek-V3/R1, Kimi Linear, Qwen2/Qwen3,
+Qwen3-VL, GPT-OSS, LFM2, Nemotron-H, Qwen3-Next/Qwen3.5, or Gemma 4 text, use the pipeline loader
+and `PipelineModel::forward_cartesian`. Tensor parallelism is implemented by the
+generalized layerwise execution-group engine; there is no
+architecture-dispatching TP model wrapper.
 
 The generalized engine accepts three explicit parameter policies through
 `LayerExecutionLoadOptions`: `FullyResident`, `LayerwiseHost`, and
@@ -1779,32 +1878,48 @@ fixture.
 Moshi projections preserve their checkpoint dtype and execute with the MLX
 0.32.0 NAX kernels.
 
-## Expert-parallel sparse MoE inference
+## Expert-parallel MoE inference
 
-`expert_parallel` provides executable pure expert parallelism for the
-safetensors MoE families supported by sparse expert caching: DeepSeek-V3/R1,
+`expert_parallel` provides executable expert parallelism for the
+safetensors MoE families supported by expert residency: DeepSeek-V3/R1,
 GPT-OSS, Inkling, Kimi Linear, LFM2,
 Nemotron-H, Qwen3, Qwen3-Next, Qwen3-VL-MoE, and Qwen3.5-MoE. GPT-OSS and the
-other hybrid or multimodal families require a sparse expert policy; every
-listed SafeTensors family accepts either `SparseExpertCache` or
-`SparseExpertCacheWithDenseLayers`. The latter streams replicated decoder
-units through the common bounded layer engine while keeping only rank-owned
-routed experts in the independent cache. DeepSeek, Qwen3, and Kimi Linear
-additionally retain their fully resident EP loaders. The model API requires
-`EP > 1`, `TP = 1`,
-and `PP = 1`; hybrid EP+TP and EP+PP are rejected before checkpoint payloads
-are opened. Dense models and GGUF architectures without a registered EP
-adapter are also rejected. Kimi Linear, DeepSeek2, and Qwen3-MoE provide
-resident GGUF EP; sparse-cache and streamed GGUF EP additionally cover
-GPT-OSS, Inkling, LFM2-MoE, Nemotron-H-MoE, Qwen3-Next, and Qwen3.5-MoE.
+other hybrid or multimodal families. Every listed SafeTensors family accepts
+`FullyResident`, `SparseExpertCache`, or `SparseExpertCacheWithDenseLayers`.
+Fully resident TP+EP uses the same external expert executor as sparse TP+EP:
+the generalized layerwise engine pins TP-sharded nonexpert units, while the
+residency manager eagerly materializes and pins only the experts owned by the
+local EP coordinate. `SparseExpertCacheWithDenseLayers` instead streams
+nonexpert units while independently caching only rank-owned experts. The model API requires
+`EP > 1`. DeepSeek-V3/R1, Inkling, Kimi Linear, Qwen3, GPT-OSS, LFM2-MoE,
+Nemotron-H-MoE, Qwen3-Next/Qwen3.5-MoE, and the Qwen3-VL-MoE text decoder
+support TP+EP through tensor-sharded layerwise adapters with topology-scoped TP
+and EP groups. All use the same resident-or-sparse executor for TP+EP.
+Qwen3-VL-MoE additionally supports SafeTensors and canonical GGUF PP+EP with
+typed image/video prefill through the pipeline loader;
+its routed expert assignment and packed companions come from the same semantic
+adapter as TP+EP. GPT-OSS accepts both SafeTensors and
+canonical type-39 MXFP4 GGUF, while LFM2-MoE and Nemotron-H-MoE accept
+SafeTensors and GGUF expert layouts through their shared packed-expert recipes.
+DeepSeek-V3/R1, Inkling, Kimi Linear, Qwen3-MoE, Qwen3-VL-MoE, GPT-OSS,
+LFM2-MoE, Nemotron-H-MoE, and Qwen3-Next/Qwen3.5-MoE PP+EP use the pipeline
+loader with stage-local expert assignment.
+Dense models and GGUF architectures without a registered EP
+adapter are also rejected. Kimi Linear, DeepSeek2, Qwen3-MoE, and
+Qwen3-VL-MoE provide
+resident GGUF pure EP. Fully resident and sparse-streamed GGUF TP+EP cover
+Kimi Linear, DeepSeek2, Qwen3-MoE, GPT-OSS, Inkling, LFM2-MoE,
+Nemotron-H-MoE, Qwen3-Next, Qwen3.5-MoE, and Qwen3-VL-MoE. The Qwen3-VL-MoE
+adapter composes its sibling dense mmproj with the language catalog before
+rank-local text and expert selection.
 Checkpoint `ep_size`
 describes a stored layout and is not the runtime EP degree.
 
 `ExpertAssignment` supports balanced-contiguous (the model default),
 round-robin, and explicit owner maps. Pass a non-default assignment to
 `load_expert_parallel_model_with_assignment`, or use
-`load_expert_parallel_model_with_options_and_assignment` for sparse caching or
-the fully resident DeepSeek/Qwen3 quantization path. Packed
+`load_expert_parallel_model_with_options_and_assignment` for explicit residency
+or ownership. Packed
 checkpoints select the exact ordered expert rows for non-contiguous policies;
 they do not materialize the enclosing range. Routers and observations always
 use checkpoint-global expert ids. Only immediately before a grouped expert
@@ -1915,6 +2030,37 @@ Useful verification and opt-in probe commands are:
 cargo test -p safemlx-lm expert_parallel --lib
 cargo test -p safemlx-lm --test distributed_expert_exchange_ring -- --ignored --nocapture
 cargo test -p safemlx-lm --test distributed_expert_parallel_ring ring_two_process_model_parity -- --ignored --exact --nocapture
+cargo test -p safemlx-lm --test distributed_expert_parallel_ring ring_four_process_gpt_oss_tensor_expert_parity -- --ignored --exact --nocapture
+cargo test -p safemlx-lm --test distributed_expert_parallel_ring ring_four_process_deepseek_tensor_expert_parity -- --ignored --exact --nocapture
+cargo test -p safemlx-lm --test distributed_pipeline_ring ring_four_process_deepseek_tensor_pipeline -- --ignored --exact --nocapture
+cargo test -p safemlx-lm --test distributed_pipeline_ring ring_four_process_deepseek_pipeline_expert -- --ignored --exact --nocapture
+cargo test -p safemlx-lm --test distributed_expert_parallel_ring ring_four_process_lfm2_tensor_expert_parity -- --ignored --exact --nocapture
+cargo test -p safemlx-lm --test distributed_pipeline_ring ring_four_process_lfm2_tensor_pipeline -- --ignored --exact --nocapture
+cargo test -p safemlx-lm --test distributed_pipeline_ring ring_four_process_lfm2_pipeline_expert -- --ignored --exact --nocapture
+cargo test -p safemlx-lm --test distributed_expert_parallel_ring ring_four_process_inkling_tensor_expert_parity -- --ignored --exact --nocapture
+cargo test -p safemlx-lm --test distributed_pipeline_ring ring_four_process_inkling_tensor_pipeline -- --ignored --exact --nocapture
+cargo test -p safemlx-lm --test distributed_pipeline_ring ring_four_process_inkling_gguf_tensor_pipeline -- --ignored --exact --nocapture
+cargo test -p safemlx-lm --test distributed_pipeline_ring ring_four_process_inkling_pipeline_expert -- --ignored --exact --nocapture
+cargo test -p safemlx-lm --test distributed_pipeline_ring ring_four_process_inkling_gguf_pipeline_expert -- --ignored --exact --nocapture
+cargo test -p safemlx-lm --test distributed_expert_parallel_ring ring_four_process_qwen3_vl_moe_tensor_expert_parity -- --ignored --exact --nocapture
+cargo test -p safemlx-lm --test distributed_expert_parallel_ring ring_qwen3_vl_moe_gguf_expert_parity -- --ignored --exact --nocapture
+cargo test -p safemlx-lm --test distributed_expert_parallel_ring ring_qwen3_vl_moe_gguf_tensor_expert_parity -- --ignored --exact --nocapture
+cargo test -p safemlx-lm --test distributed_expert_parallel_ring qwen3_vl_moe_gguf_pipeline_expert_stages_own_rank_local_layers_and_experts -- --exact --nocapture
+cargo test -p safemlx-lm --test distributed_qwen3_vl_pipeline_ring ring_qwen3_vl_ -- --ignored --nocapture
+cargo test -p safemlx-lm --test distributed_expert_parallel_ring ring_four_process_kimi_linear_tensor_expert_parity -- --ignored --exact --nocapture
+cargo test -p safemlx-lm --test distributed_pipeline_ring ring_four_process_kimi_linear_tensor_pipeline -- --ignored --exact --nocapture
+cargo test -p safemlx-lm --test distributed_pipeline_ring ring_four_process_kimi_linear_gguf_tensor_pipeline -- --ignored --exact --nocapture
+cargo test -p safemlx-lm --test distributed_pipeline_ring ring_four_process_kimi_linear_pipeline_expert -- --ignored --exact --nocapture
+cargo test -p safemlx-lm --test distributed_pipeline_ring ring_four_process_kimi_linear_gguf_pipeline_expert -- --ignored --exact --nocapture
+cargo test -p safemlx-lm --test distributed_expert_parallel_ring ring_four_process_nemotron_h_tensor_expert_parity -- --ignored --exact --nocapture
+cargo test -p safemlx-lm --test distributed_pipeline_ring ring_four_process_nemotron_h_tensor_pipeline -- --ignored --exact --nocapture
+cargo test -p safemlx-lm --test distributed_pipeline_ring ring_four_process_nemotron_h_pipeline_expert -- --ignored --exact --nocapture
+cargo test -p safemlx-lm --test distributed_expert_parallel_ring ring_four_process_qwen3_next_tensor_expert_parity -- --ignored --exact --nocapture
+cargo test -p safemlx-lm --test distributed_expert_parallel_ring ring_four_process_qwen35_tensor_expert_parity -- --ignored --exact --nocapture
+cargo test -p safemlx-lm --test distributed_pipeline_ring ring_four_process_qwen3_next_tensor_pipeline -- --ignored --exact --nocapture
+cargo test -p safemlx-lm --test distributed_pipeline_ring ring_four_process_qwen35_moe_tensor_pipeline -- --ignored --exact --nocapture
+cargo test -p safemlx-lm --test distributed_pipeline_ring ring_four_process_qwen3_next_pipeline_expert -- --ignored --exact --nocapture
+cargo test -p safemlx-lm --test distributed_pipeline_ring ring_four_process_qwen35_pipeline_expert -- --ignored --exact --nocapture
 cargo run --release -p safemlx-lm --example expert_parallel_generate -- /path/to/model
 cargo run --release -p safemlx-lm --example expert_parallel_benchmark -- /path/to/model --backend jaccl
 ```
@@ -1934,6 +2080,38 @@ The separate
 `ring_two_process_streamed_dense_sparse_expert_cache_parity` case runs
 prefill and cached decode with replicated decoder layers streamed and routed
 experts cached independently across the supported text/runtime fixture set.
+`ring_four_process_gpt_oss_tensor_expert_parity` covers the Cartesian TP=2,
+EP=2 path, including tensor-sharded nonexperts, native expert-cache ownership,
+axis-local collectives, cached decode, and rank-synchronized generation.
+The DeepSeek four-process cases cover TP+PP, TP+EP, and PP+EP across a
+dense-to-MoE boundary with tensor-sharded MLA/dense/shared projections,
+compressed-cache persistence, stage-local or cached expert ownership,
+dense-streamed bounded reads, and single-rank numerical parity.
+The LFM2 four-process cases cover TP+PP, TP+EP, and PP+EP with hybrid
+convolution/attention caches, dense-streamed rank-local recipes, prompt-cache
+reload, dense-to-sparse expert placement, and single-rank numerical parity.
+The Kimi Linear four-process cases cover TP+PP, TP+EP, and PP+EP across its KDA
+and MLA state transition, TP-sharded dense and shared projections, stage-local
+or cached routed experts, SafeTensors and GGUF bounded reads, prompt-cache
+reload, synchronized generation, and single-rank numerical parity.
+The Inkling four-process cases cover TP+PP, TP+EP, and PP+EP across full/sliding
+attention and dense/sparse transitions, including rank-local KV and four-way
+convolution state, stage-local or cached routed experts, shared experts,
+dense-streamed bounded reads, prompt-cache reload, synchronized generation,
+and single-rank numerical parity.
+The Qwen3-VL-MoE four-process cases cover SafeTensors and canonical GGUF TP+EP
+text-decoder execution with
+rank-local MRoPE KV geometry, tensor-sharded attention and nonexpert
+projections, EP-scoped cached routed experts, bounded reads, prompt-cache
+reload, synchronized generation, and single-rank numerical parity.
+The GGUF suite additionally exercises two-rank pure EP under resident and
+sparse-cache policies, four-rank TP+EP under resident and dense/sparse-streamed
+policies, sibling-projector telemetry, route-empty participation, and PP+EP
+stage-local layer and expert ownership.
+The Qwen hybrid four-process cases cover both Qwen3-Next and Qwen3.5 identities
+across TP+PP, TP+EP, and PP+EP, including recurrent/full-attention transitions,
+packed routed and shared experts, route-empty collective participation,
+dense-streamed bounded reads, cache persistence, and synchronized generation.
 Its DeepSeek fixture crosses a dense-to-MoE layer boundary, uses two router
 groups, and deliberately gives one rank zero routes to exercise imbalance and
 empty-local-work behavior. GPU FP8 keeps the packed Metal kernels; CPU Ring

@@ -1776,6 +1776,40 @@ impl DecoderLayer {
         hidden.add(feed_forward, stream)
     }
 
+    /// Executes a TP-sharded layer from semantic operator state.
+    pub(crate) fn forward_tensor_parallel_with_operator_cache(
+        &mut self,
+        input: &Array,
+        mask: Option<&Array>,
+        cache: Option<OperatorCache<'_>>,
+        group: &safemlx::distributed::Group,
+        stream: &Stream,
+    ) -> Result<Array, Exception> {
+        let normalized = self.input_layernorm.forward(input, stream)?;
+        let mut observer = None;
+        let attention = match (&mut self.self_attn, cache) {
+            (Attention::Kda(attention), Some(OperatorCache::Kda(cache))) => {
+                attention.forward_impl(&normalized, Some(cache), stream, "", &mut observer)?
+            }
+            (Attention::Mla(attention), Some(OperatorCache::Mla(cache))) => attention
+                .forward_shared(&normalized, mask, Some(cache), stream, "", &mut observer)?,
+            _ => {
+                return Err(Exception::custom(
+                    "Kimi Linear tensor-parallel operator cache does not match decoder layer",
+                ))
+            }
+        };
+        let attention = safemlx::distributed::all_sum(&attention, group, stream)?;
+        let hidden = input.add(attention, stream)?;
+        let normalized = self.post_attention_layernorm.forward(&hidden, stream)?;
+        let partial = match &mut self.mlp {
+            FeedForward::Dense(mlp) => mlp.forward(&normalized, stream)?,
+            FeedForward::Moe(moe) => moe.forward_impl(&normalized, stream, "", &mut observer)?,
+        };
+        let feed_forward = safemlx::distributed::all_sum(&partial, group, stream)?;
+        hidden.add(feed_forward, stream)
+    }
+
     pub(super) fn forward_sparse_experts<F>(
         &mut self,
         input: &Array,
@@ -1813,6 +1847,62 @@ impl DecoderLayer {
         let feed_forward = match &mut self.mlp {
             FeedForward::Dense(mlp) => mlp.forward(&normalized, stream)?,
             FeedForward::Moe(moe) => moe.forward_sparse_experts(&normalized, stream, execute)?,
+        };
+        hidden.add(feed_forward, stream)
+    }
+
+    /// Executes TP-sharded KDA/MLA and dense/shared projections while an
+    /// EP-scoped executor evaluates routed experts.
+    pub(crate) fn forward_tensor_with_expert_executor<F>(
+        &mut self,
+        input: &Array,
+        mask: Option<&Array>,
+        cache: Option<&mut LayerCache>,
+        group: &safemlx::distributed::Group,
+        stream: &Stream,
+        execute: F,
+    ) -> Result<Array, Exception>
+    where
+        F: FnOnce(&Array, &Array, &Array, &Stream) -> Result<Array, Exception>,
+    {
+        let normalized = self.input_layernorm.forward(input, stream)?;
+        let mut observer = None;
+        let attention =
+            match (&mut self.self_attn, cache) {
+                (Attention::Kda(attention), Some(LayerCache::Kda(cache))) => attention
+                    .forward_impl(&normalized, Some(cache), stream, "self_attn", &mut observer)?,
+                (Attention::Mla(attention), Some(LayerCache::Mla(cache))) => attention
+                    .forward_shared(
+                        &normalized,
+                        mask,
+                        Some(cache),
+                        stream,
+                        "self_attn",
+                        &mut observer,
+                    )?,
+                _ => {
+                    return Err(Exception::custom(
+                        "Kimi Linear tensor/expert cache layer kind mismatch",
+                    ))
+                }
+            };
+        let attention = safemlx::distributed::all_sum(&attention, group, stream)?;
+        let hidden = input.add(attention, stream)?;
+        let normalized = self.post_attention_layernorm.forward(&hidden, stream)?;
+        let feed_forward = match &mut self.mlp {
+            FeedForward::Dense(mlp) => {
+                let partial = mlp.forward(&normalized, stream)?;
+                safemlx::distributed::all_sum(&partial, group, stream)?
+            }
+            FeedForward::Moe(moe) => {
+                let shape = normalized.shape().to_vec();
+                let flat = normalized.reshape(&[-1, normalized.dim(-1)], stream)?;
+                let (indices, weights) = moe.gate.forward(&flat, stream)?;
+                let routed = execute(&flat, &indices, &weights, stream)?;
+                let shared_partial = moe.shared_experts.forward(&flat, stream)?;
+                let shared = safemlx::distributed::all_sum(&shared_partial, group, stream)?;
+                routed.add(shared, stream)?.reshape(&shape, stream)?
+            }
         };
         hidden.add(feed_forward, stream)
     }
@@ -1865,6 +1955,49 @@ impl DecoderLayer {
                 stream,
                 observer,
                 &format!("{prefix}.mlp"),
+            )?,
+        };
+        hidden.add(feed_forward, stream)
+    }
+
+    /// Executes EP-local routed experts from semantic operator state.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn forward_expert_parallel_with_operator_cache(
+        &mut self,
+        input: &Array,
+        mask: Option<&Array>,
+        cache: Option<OperatorCache<'_>>,
+        assignment: &crate::architectures::distributed::expert::ExpertAssignment,
+        group: &safemlx::distributed::Group,
+        statistics: &mut crate::architectures::distributed::expert::RoutingStatistics,
+        stream: &Stream,
+    ) -> Result<Array, Exception> {
+        let normalized = self.input_layernorm.forward(input, stream)?;
+        let mut observer = None;
+        let attention = match (&mut self.self_attn, cache) {
+            (Attention::Kda(attention), Some(OperatorCache::Kda(cache))) => {
+                attention.forward_impl(&normalized, Some(cache), stream, "", &mut observer)?
+            }
+            (Attention::Mla(attention), Some(OperatorCache::Mla(cache))) => attention
+                .forward_shared(&normalized, mask, Some(cache), stream, "", &mut observer)?,
+            _ => {
+                return Err(Exception::custom(
+                    "Kimi Linear expert-parallel operator cache does not match decoder layer",
+                ))
+            }
+        };
+        let hidden = input.add(attention, stream)?;
+        let normalized = self.post_attention_layernorm.forward(&hidden, stream)?;
+        let feed_forward = match &mut self.mlp {
+            FeedForward::Dense(mlp) => mlp.forward(&normalized, stream)?,
+            FeedForward::Moe(moe) => moe.forward_expert_parallel(
+                &normalized,
+                assignment,
+                group,
+                statistics,
+                stream,
+                &mut observer,
+                "mlp",
             )?,
         };
         hidden.add(feed_forward, stream)

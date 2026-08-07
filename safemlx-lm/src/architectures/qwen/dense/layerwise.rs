@@ -17,7 +17,7 @@ use safemlx::{
     Array, Dtype, Stream,
 };
 
-use super::{self as resident, DecoderConfig, TransformerBlock};
+use super::{self as resident, DecoderConfig, Experts, FeedForward, TransformerBlock};
 use crate::{
     api::{
         common::{
@@ -171,6 +171,11 @@ impl LayerwiseDecoder {
     /// Returns the architecture identity used to validate persisted prompt caches.
     pub fn prompt_cache_architecture_fingerprint(&self) -> String {
         resident::prompt_cache_architecture_fingerprint(self.args())
+    }
+
+    /// Returns the complete rank-local prompt-cache identity.
+    pub fn prompt_cache_model_identity(&self) -> Result<PromptCacheModelIdentity, Error> {
+        self.execution.prompt_cache_model_identity()
     }
 
     /// Persists a compatible standard prefix cache.
@@ -463,6 +468,149 @@ impl LayerwiseDecoder {
         )
     }
 
+    /// Runs the shared tensor-parallel model while delegating routed experts
+    /// to a topology-scoped expert-parallel executor.
+    pub(crate) fn forward_tensor_expert_parallel<F>(
+        &mut self,
+        inputs: &Array,
+        mask: Option<&Array>,
+        cache: &mut Vec<Option<ConcatKeyValueCache>>,
+        tensor_group: &safemlx::distributed::Group,
+        execute: F,
+        stream: &Stream,
+    ) -> Result<Array, Error>
+    where
+        F: FnMut(usize, &Array, &Array, &Array, &Stream) -> Result<Array, Exception>,
+    {
+        let mut owned = DenseQwenLayerwiseCache::Concat(std::mem::take(cache));
+        let result = self.forward_tensor_expert_parallel_cache(
+            inputs,
+            mask,
+            &mut owned,
+            tensor_group,
+            execute,
+            stream,
+        );
+        let DenseQwenLayerwiseCache::Concat(owned) = owned else {
+            unreachable!("dense-Qwen concat cache wrapper changed variants")
+        };
+        *cache = owned;
+        result
+    }
+
+    pub(crate) fn forward_tensor_expert_parallel_sliding<F>(
+        &mut self,
+        inputs: &Array,
+        mask: Option<&Array>,
+        cache: &mut Vec<Option<SlidingKeyValueCache>>,
+        tensor_group: &safemlx::distributed::Group,
+        execute: F,
+        stream: &Stream,
+    ) -> Result<Array, Error>
+    where
+        F: FnMut(usize, &Array, &Array, &Array, &Stream) -> Result<Array, Exception>,
+    {
+        let mut owned = DenseQwenLayerwiseCache::Sliding(std::mem::take(cache));
+        let result = self.forward_tensor_expert_parallel_cache(
+            inputs,
+            mask,
+            &mut owned,
+            tensor_group,
+            execute,
+            stream,
+        );
+        let DenseQwenLayerwiseCache::Sliding(owned) = owned else {
+            unreachable!("dense-Qwen sliding cache wrapper changed variants")
+        };
+        *cache = owned;
+        result
+    }
+
+    pub(crate) fn forward_tensor_expert_parallel_paged<F>(
+        &mut self,
+        inputs: &Array,
+        mask: Option<&Array>,
+        cache: &mut Vec<Option<PagedKeyValueCache>>,
+        tensor_group: &safemlx::distributed::Group,
+        execute: F,
+        stream: &Stream,
+    ) -> Result<Array, Error>
+    where
+        F: FnMut(usize, &Array, &Array, &Array, &Stream) -> Result<Array, Exception>,
+    {
+        let mut owned = DenseQwenLayerwiseCache::Paged(std::mem::take(cache));
+        let result = self.forward_tensor_expert_parallel_cache(
+            inputs,
+            mask,
+            &mut owned,
+            tensor_group,
+            execute,
+            stream,
+        );
+        let DenseQwenLayerwiseCache::Paged(owned) = owned else {
+            unreachable!("dense-Qwen paged cache wrapper changed variants")
+        };
+        *cache = owned;
+        result
+    }
+
+    fn forward_tensor_expert_parallel_cache<F>(
+        &mut self,
+        inputs: &Array,
+        mask: Option<&Array>,
+        cache: &mut DenseQwenLayerwiseCache,
+        tensor_group: &safemlx::distributed::Group,
+        mut execute: F,
+        stream: &Stream,
+    ) -> Result<Array, Error>
+    where
+        F: FnMut(usize, &Array, &Array, &Array, &Stream) -> Result<Array, Exception>,
+    {
+        self.execution.forward_tensor_parallel_with_layer_executor(
+            DenseQwenAdapterInput { inputs, mask },
+            cache,
+            tensor_group,
+            stream,
+            |_adapter, _group, index, layer, hidden, cache, context, execution| {
+                let tp_group = execution.group().ok_or_else(|| {
+                    Error::Parallel("TP+EP execution requires an active TP group".into())
+                })?;
+                match cache {
+                    DenseQwenLayerwiseCache::Concat(cache) => forward_sparse_tp_with_executor(
+                        layer,
+                        hidden,
+                        cache[index].as_mut(),
+                        context,
+                        index,
+                        tp_group,
+                        &mut execute,
+                        execution.stream(),
+                    ),
+                    DenseQwenLayerwiseCache::Sliding(cache) => forward_sparse_tp_with_executor(
+                        layer,
+                        hidden,
+                        cache[index].as_mut(),
+                        context,
+                        index,
+                        tp_group,
+                        &mut execute,
+                        execution.stream(),
+                    ),
+                    DenseQwenLayerwiseCache::Paged(cache) => forward_sparse_tp_with_executor(
+                        layer,
+                        hidden,
+                        cache[index].as_mut(),
+                        context,
+                        index,
+                        tp_group,
+                        &mut execute,
+                        execution.stream(),
+                    ),
+                }
+            },
+        )
+    }
+
     /// Clears temporary device decoder copies.
     pub fn clear_device_layer_window(&self) -> Result<(), Error> {
         self.execution.clear_device_group("text_decoder")
@@ -488,6 +636,33 @@ where
             mask: context.mask.as_ref(),
             cache,
         },
+        stream,
+        |hidden, ids, weights, stream| execute(index, hidden, ids, weights, stream),
+    )?)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn forward_sparse_tp_with_executor<C, F>(
+    layer: &mut TransformerBlock,
+    hidden: &Array,
+    cache: Option<&mut C>,
+    context: &DenseQwenForwardContext,
+    index: usize,
+    tensor_group: &safemlx::distributed::Group,
+    execute: &mut F,
+    stream: &Stream,
+) -> Result<Array, Error>
+where
+    C: KeyValueCache,
+    F: FnMut(usize, &Array, &Array, &Array, &Stream) -> Result<Array, Exception>,
+{
+    Ok(layer.forward_sparse_experts_tensor_parallel(
+        AttentionInput {
+            x: hidden,
+            mask: context.mask.as_ref(),
+            cache,
+        },
+        tensor_group,
         stream,
         |hidden, ids, weights, stream| execute(index, hidden, ids, weights, stream),
     )?)
@@ -831,7 +1006,7 @@ fn load_qwen3_gguf_sparse_with_store(
 pub(crate) fn load_qwen3_sparse_ep_base_with_store(
     store: Arc<dyn WeightStore + Send + Sync>,
     args: DecoderConfig,
-    non_expert: crate::runtime::residency::dense_stream::DenseDiskStreamLoadOptions,
+    non_expert: impl Into<LayerExecutionLoadOptions>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<LayerwiseDecoder, Error> {
@@ -842,6 +1017,32 @@ pub(crate) fn load_qwen3_sparse_ep_base_with_store(
     }
     let adapter = DenseQwenLayerwiseAdapter::new_sparse(args, stream)?;
     let execution = load_layerwise_model(store, adapter, non_expert, stream, weights_stream)?;
+    Ok(LayerwiseDecoder { execution })
+}
+
+/// Builds the shared TP-sharded nonexpert base used by combined TP+EP.
+pub(crate) fn load_qwen3_sparse_tp_ep_base_with_store(
+    store: Arc<dyn WeightStore + Send + Sync>,
+    args: DecoderConfig,
+    non_expert: impl Into<LayerExecutionLoadOptions>,
+    build: crate::runtime::distributed::parallel::ParallelBuildContext,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<LayerwiseDecoder, Error> {
+    if !args.is_moe() {
+        return Err(Error::UnsupportedArchitecture(
+            "combined tensor/expert parallelism requires Qwen3 MoE".into(),
+        ));
+    }
+    let adapter = DenseQwenLayerwiseAdapter::new_sparse(args, stream)?;
+    let execution = load_tensor_parallel_layerwise_model(
+        store,
+        adapter,
+        non_expert,
+        build,
+        stream,
+        weights_stream,
+    )?;
     Ok(LayerwiseDecoder { execution })
 }
 
@@ -1530,6 +1731,96 @@ impl ArchitectureAdapter for DenseQwenLayerwiseAdapter {
         )?)
     }
 
+    fn new_expert_parallel_layer(
+        &self,
+        group: usize,
+        index: usize,
+        assignment: &crate::runtime::distributed::expert::ExpertAssignment,
+        stream: &Stream,
+    ) -> Result<Self::Layer, Error> {
+        if !self.args.is_moe() {
+            return Err(Error::Parallel(
+                "dense Qwen has no routed experts for expert-local layer construction".into(),
+            ));
+        }
+        let mut layer = self.new_layer(group, index, stream)?;
+        let local_experts = i32::try_from(assignment.local_global_expert_ids().len())
+            .map_err(|_| Error::Parallel("local Qwen expert count exceeds i32".into()))?;
+        let FeedForward::Moe(moe) = &mut layer.mlp else {
+            return Err(Error::Parallel(format!(
+                "dense Qwen layer {index} is not an MoE layer"
+            )));
+        };
+        moe.experts = Experts::new(
+            local_experts,
+            self.args.hidden_size,
+            self.args.moe_intermediate_size,
+            self.args
+                .weight_quantization_for(&format!("model.layers.{index}.mlp.experts.gate_up_proj")),
+            self.args
+                .weight_quantization_for(&format!("model.layers.{index}.mlp.experts.down_proj")),
+            stream,
+        )?;
+        Ok(layer)
+    }
+
+    fn new_tensor_expert_parallel_layer(
+        &self,
+        group: usize,
+        index: usize,
+        layout: &crate::runtime::distributed::parallel::LocalModelLayout,
+        assignment: &crate::runtime::distributed::expert::ExpertAssignment,
+        stream: &Stream,
+    ) -> Result<Self::Layer, Error> {
+        if !self.args.is_moe() {
+            return Err(Error::Parallel(
+                "dense Qwen has no routed experts for combined tensor/expert layer construction"
+                    .into(),
+            ));
+        }
+        let mut layer = self.new_parallel_layer(group, index, layout, stream)?;
+        let local_experts = i32::try_from(assignment.local_global_expert_ids().len())
+            .map_err(|_| Error::Parallel("local Qwen expert count exceeds i32".into()))?;
+        let FeedForward::Moe(moe) = &mut layer.mlp else {
+            return Err(Error::Parallel(format!(
+                "dense Qwen layer {index} is not an MoE layer"
+            )));
+        };
+        let local_intermediate = moe.experts.intermediate_dim;
+        moe.experts = Experts::new(
+            local_experts,
+            self.args.hidden_size,
+            local_intermediate,
+            self.args
+                .weight_quantization_for(&format!("model.layers.{index}.mlp.experts.gate_up_proj")),
+            self.args
+                .weight_quantization_for(&format!("model.layers.{index}.mlp.experts.down_proj")),
+            stream,
+        )?;
+        Ok(layer)
+    }
+
+    fn expert_parallel_assignment(
+        &self,
+        topology: crate::runtime::distributed::topology::ParallelTopology,
+    ) -> Result<Option<crate::runtime::distributed::expert::ExpertAssignment>, Error> {
+        if topology.expert_parallel_size == 1 {
+            return Ok(None);
+        }
+        if !self.args.is_moe() {
+            return Err(Error::Parallel(
+                "dense Qwen has no routed experts for expert-parallel ownership".into(),
+            ));
+        }
+        Ok(Some(
+            crate::runtime::distributed::expert::ExpertAssignment::balanced(
+                self.args.num_experts as usize,
+                topology.expert_parallel_size,
+                topology.expert_parallel_rank,
+            )?,
+        ))
+    }
+
     fn layer_checkpoint_prefix(&self, _group: usize, index: usize) -> String {
         format!("model.layers.{index}")
     }
@@ -1563,91 +1854,13 @@ impl ArchitectureAdapter for DenseQwenLayerwiseAdapter {
         layer: &Self::Layer,
         store: &dyn WeightStore,
     ) -> Result<Vec<WeightBinding>, Error> {
-        if self.sparse_expert_cache {
-            Ok(build_module_bindings_excluding(
-                layer,
-                &format!("model.layers.{index}"),
-                store,
-                |name| name.starts_with("mlp.experts."),
-            )?)
-        } else {
-            let prefix = format!("model.layers.{index}");
-            let expert_prefix = format!("{prefix}.mlp.experts");
-            let keys = store.keys().into_iter().collect::<BTreeSet<_>>();
-            let mut recipes = BTreeMap::new();
-            if keys.contains(&format!("{expert_prefix}.gate_proj"))
-                && keys.contains(&format!("{expert_prefix}.up_proj"))
-            {
-                recipes.insert(
-                    "mlp.experts.gate_up_proj".to_string(),
-                    DerivedWeightRecipe::Concatenate {
-                        axis: 1,
-                        inputs: vec![
-                            DerivedWeightRecipe::source(
-                                format!("{expert_prefix}.gate_proj"),
-                                TensorSelection::Full,
-                            ),
-                            DerivedWeightRecipe::source(
-                                format!("{expert_prefix}.up_proj"),
-                                TensorSelection::Full,
-                            ),
-                        ],
-                    },
-                );
-                for suffix in ["_scales", "_biases"] {
-                    let gate = format!("{expert_prefix}.gate_proj{suffix}");
-                    let up = format!("{expert_prefix}.up_proj{suffix}");
-                    if keys.contains(&gate) && keys.contains(&up) {
-                        recipes.insert(
-                            format!("mlp.experts.gate_up_proj{suffix}"),
-                            DerivedWeightRecipe::Concatenate {
-                                axis: 1,
-                                inputs: vec![
-                                    DerivedWeightRecipe::source(gate, TensorSelection::Full),
-                                    DerivedWeightRecipe::source(up, TensorSelection::Full),
-                                ],
-                            },
-                        );
-                    }
-                }
-            } else if self.args.is_moe() && !keys.contains(&format!("{expert_prefix}.gate_up_proj"))
-            {
-                let mut gate_up = Vec::with_capacity(self.args.num_experts as usize);
-                let mut down = Vec::with_capacity(self.args.num_experts as usize);
-                for expert in 0..self.args.num_experts as usize {
-                    let gate =
-                        split_expert_key(&keys, &expert_prefix, expert, &["gate_proj", "w1"])?;
-                    let up = split_expert_key(&keys, &expert_prefix, expert, &["up_proj", "w3"])?;
-                    let down_key =
-                        split_expert_key(&keys, &expert_prefix, expert, &["down_proj", "w2"])?;
-                    gate_up.push(DerivedWeightRecipe::Concatenate {
-                        axis: 0,
-                        inputs: vec![
-                            DerivedWeightRecipe::source(gate, TensorSelection::Full),
-                            DerivedWeightRecipe::source(up, TensorSelection::Full),
-                        ],
-                    });
-                    down.push(DerivedWeightRecipe::source(down_key, TensorSelection::Full));
-                }
-                recipes.insert(
-                    "mlp.experts.gate_up_proj".to_string(),
-                    DerivedWeightRecipe::Stack {
-                        axis: 0,
-                        inputs: gate_up,
-                    },
-                );
-                recipes.insert(
-                    "mlp.experts.down_proj".to_string(),
-                    DerivedWeightRecipe::Stack {
-                        axis: 0,
-                        inputs: down,
-                    },
-                );
-            }
-            Ok(build_module_bindings_with_recipes(
-                layer, &prefix, store, recipes,
-            )?)
-        }
+        qwen_text_layer_bindings(
+            layer,
+            &self.args,
+            &format!("model.layers.{index}"),
+            store,
+            self.sparse_expert_cache,
+        )
     }
 
     fn parallel_layer_bindings(
@@ -1666,6 +1879,38 @@ impl ArchitectureAdapter for DenseQwenLayerwiseAdapter {
             store,
             layout,
         )
+    }
+
+    fn expert_parallel_layer_bindings(
+        &self,
+        group: usize,
+        index: usize,
+        _layer: &Self::Layer,
+        store: &dyn WeightStore,
+        assignment: &crate::runtime::distributed::expert::ExpertAssignment,
+        stream: &Stream,
+    ) -> Result<Vec<WeightBinding>, Error> {
+        let global = self.new_layer(group, index, stream)?;
+        let indices = assignment.local_global_expert_ids().to_vec();
+        self.layer_bindings(group, index, &global, store)?
+            .into_iter()
+            .map(|binding| {
+                let target = binding.logical_target().unwrap_or_else(|| binding.name());
+                if target.contains(".experts.") {
+                    binding
+                        .select_bounded_output(
+                            store,
+                            TensorSelection::Indices {
+                                axis: 0,
+                                indices: indices.clone(),
+                            },
+                        )
+                        .map_err(Error::from)
+                } else {
+                    Ok(binding)
+                }
+            })
+            .collect()
     }
 
     fn additional_consumed_checkpoint_keys(&self, store: &dyn WeightStore) -> Vec<String> {
@@ -2018,6 +2263,95 @@ fn retained_cache_arrays<C: KeyValueCache>(caches: &[Option<C>], index: usize) -
         .as_ref()
         .map(KeyValueCache::retained_arrays)
         .unwrap_or_default()
+}
+
+pub(crate) fn qwen_text_layer_bindings(
+    layer: &TransformerBlock,
+    args: &DecoderConfig,
+    prefix: &str,
+    store: &dyn WeightStore,
+    external_experts: bool,
+) -> Result<Vec<WeightBinding>, Error> {
+    if external_experts {
+        return Ok(build_module_bindings_excluding(
+            layer,
+            prefix,
+            store,
+            |name| name.starts_with("mlp.experts."),
+        )?);
+    }
+    let expert_prefix = format!("{prefix}.mlp.experts");
+    let keys = store.keys().into_iter().collect::<BTreeSet<_>>();
+    let mut recipes = BTreeMap::new();
+    if keys.contains(&format!("{expert_prefix}.gate_proj"))
+        && keys.contains(&format!("{expert_prefix}.up_proj"))
+    {
+        recipes.insert(
+            "mlp.experts.gate_up_proj".to_string(),
+            DerivedWeightRecipe::Concatenate {
+                axis: 1,
+                inputs: vec![
+                    DerivedWeightRecipe::source(
+                        format!("{expert_prefix}.gate_proj"),
+                        TensorSelection::Full,
+                    ),
+                    DerivedWeightRecipe::source(
+                        format!("{expert_prefix}.up_proj"),
+                        TensorSelection::Full,
+                    ),
+                ],
+            },
+        );
+        for suffix in ["_scales", "_biases"] {
+            let gate = format!("{expert_prefix}.gate_proj{suffix}");
+            let up = format!("{expert_prefix}.up_proj{suffix}");
+            if keys.contains(&gate) && keys.contains(&up) {
+                recipes.insert(
+                    format!("mlp.experts.gate_up_proj{suffix}"),
+                    DerivedWeightRecipe::Concatenate {
+                        axis: 1,
+                        inputs: vec![
+                            DerivedWeightRecipe::source(gate, TensorSelection::Full),
+                            DerivedWeightRecipe::source(up, TensorSelection::Full),
+                        ],
+                    },
+                );
+            }
+        }
+    } else if args.is_moe() && !keys.contains(&format!("{expert_prefix}.gate_up_proj")) {
+        let mut gate_up = Vec::with_capacity(args.num_experts as usize);
+        let mut down = Vec::with_capacity(args.num_experts as usize);
+        for expert in 0..args.num_experts as usize {
+            let gate = split_expert_key(&keys, &expert_prefix, expert, &["gate_proj", "w1"])?;
+            let up = split_expert_key(&keys, &expert_prefix, expert, &["up_proj", "w3"])?;
+            let down_key = split_expert_key(&keys, &expert_prefix, expert, &["down_proj", "w2"])?;
+            gate_up.push(DerivedWeightRecipe::Concatenate {
+                axis: 0,
+                inputs: vec![
+                    DerivedWeightRecipe::source(gate, TensorSelection::Full),
+                    DerivedWeightRecipe::source(up, TensorSelection::Full),
+                ],
+            });
+            down.push(DerivedWeightRecipe::source(down_key, TensorSelection::Full));
+        }
+        recipes.insert(
+            "mlp.experts.gate_up_proj".to_string(),
+            DerivedWeightRecipe::Stack {
+                axis: 0,
+                inputs: gate_up,
+            },
+        );
+        recipes.insert(
+            "mlp.experts.down_proj".to_string(),
+            DerivedWeightRecipe::Stack {
+                axis: 0,
+                inputs: down,
+            },
+        );
+    }
+    Ok(build_module_bindings_with_recipes(
+        layer, prefix, store, recipes,
+    )?)
 }
 
 pub(crate) fn qwen3_expert_catalog(

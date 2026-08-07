@@ -44,13 +44,15 @@ pub use runtime::cache::residency::{
     CACHE_RESIDENCY_LAYER_REPORT_LIMIT,
 };
 pub use runtime::cache::PagedKeyValueCache;
+pub use runtime::distributed::cartesian::CartesianExecution;
 pub use runtime::distributed::parallel::{
     sample_and_synchronize, LocalModelLayout, LocalTensorLayout, MemberSharding,
     ParallelBuildContext, ParallelExecutionContext, ParallelPlanBuilder, ParameterGroupSpec,
     ParameterMemberSpec, ParameterRole, ShardingPolicy, SynchronizedToken,
 };
 pub use runtime::distributed::topology::{
-    DeviceAssignment, ParallelTopology, PlacementPlan, RankPartition, TensorPlacement,
+    DeviceAssignment, ParallelAxis, ParallelCommunicators, ParallelCoordinates, ParallelTopology,
+    PlacementPlan, RankPartition, SubgroupMembership, TensorPlacement, TopologyPreflightReport,
 };
 pub use runtime::execution::layerwise::{
     load_layerwise_model, ArchitectureAdapter, DenseCacheMetrics, DenseDiskStreamReport,

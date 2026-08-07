@@ -545,11 +545,11 @@ impl Attention {
         )
     }
 
-    fn forward_tensor_parallel(
+    fn forward_tensor_parallel<C: KeyValueCache>(
         &mut self,
         x: &Array,
         mask: Option<&Array>,
-        cache: &mut LayerCache,
+        cache: &mut C,
         group: &safemlx::distributed::Group,
         stream: &Stream,
     ) -> Result<Array, Exception> {
@@ -854,6 +854,34 @@ impl Mlp {
             .reshape(shape, stream)
     }
 
+    pub(crate) fn forward_expert_parallel(
+        &mut self,
+        x: &Array,
+        assignment: &crate::architectures::distributed::expert::ExpertAssignment,
+        group: &safemlx::distributed::Group,
+        statistics: &mut crate::architectures::distributed::expert::RoutingStatistics,
+        stream: &Stream,
+    ) -> Result<Array, Exception> {
+        let shape = x.shape();
+        let flat = x.reshape(&[-1, shape[2]], stream)?;
+        let router_started = std::time::Instant::now();
+        let logits = self.router.forward(&flat, stream)?;
+        let (indices, weights) = common::moe::top_k_softmax_routing(&logits, self.top_k, stream)?;
+        statistics.router_time += router_started.elapsed();
+        let returned = crate::architectures::distributed::expert::dispatch_replicated(
+            &flat,
+            &indices,
+            &weights,
+            assignment,
+            &mut self.experts,
+            group,
+            stream,
+        )
+        .map_err(|error| Exception::custom(error.to_string()))?;
+        statistics.accumulate(&returned.statistics);
+        returned.reduced_output.reshape(shape, stream)
+    }
+
     fn forward_tensor_parallel(
         &mut self,
         x: &Array,
@@ -939,11 +967,11 @@ impl TransformerBlock {
         hidden.add(self.mlp.forward(&normed, stream)?, stream)
     }
 
-    pub(crate) fn forward_tensor_parallel(
+    pub(crate) fn forward_tensor_parallel<C: KeyValueCache>(
         &mut self,
         x: &Array,
         mask: Option<&Array>,
-        cache: &mut LayerCache,
+        cache: &mut C,
         group: &safemlx::distributed::Group,
         stream: &Stream,
     ) -> Result<Array, Exception> {
@@ -956,6 +984,30 @@ impl TransformerBlock {
         let normed = self.post_attention_layernorm.forward(&hidden, stream)?;
         hidden.add(
             self.mlp.forward_tensor_parallel(&normed, group, stream)?,
+            stream,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn forward_expert_parallel<C: KeyValueCache>(
+        &mut self,
+        x: &Array,
+        mask: Option<&Array>,
+        cache: &mut C,
+        assignment: &crate::architectures::distributed::expert::ExpertAssignment,
+        group: &safemlx::distributed::Group,
+        statistics: &mut crate::architectures::distributed::expert::RoutingStatistics,
+        stream: &Stream,
+    ) -> Result<Array, Exception> {
+        let normed = self.input_layernorm.forward(x, stream)?;
+        let hidden = x.add(
+            self.self_attn.forward(&normed, mask, cache, stream)?,
+            stream,
+        )?;
+        let normed = self.post_attention_layernorm.forward(&hidden, stream)?;
+        hidden.add(
+            self.mlp
+                .forward_expert_parallel(&normed, assignment, group, statistics, stream)?,
             stream,
         )
     }
@@ -974,6 +1026,32 @@ impl TransformerBlock {
         let normed = self.input_layernorm.forward(x, stream)?;
         let hidden = x.add(
             self.self_attn.forward(&normed, mask, cache, stream)?,
+            stream,
+        )?;
+        let normed = self.post_attention_layernorm.forward(&hidden, stream)?;
+        hidden.add(
+            self.mlp
+                .forward_with_expert_executor(&normed, stream, execute)?,
+            stream,
+        )
+    }
+
+    pub(crate) fn forward_tensor_with_expert_executor<F>(
+        &mut self,
+        x: &Array,
+        mask: Option<&Array>,
+        cache: &mut LayerCache,
+        tensor_group: &safemlx::distributed::Group,
+        stream: &Stream,
+        execute: F,
+    ) -> Result<Array, Exception>
+    where
+        F: FnOnce(&Array, &Array, &Array, &Stream) -> Result<Array, Exception>,
+    {
+        let normed = self.input_layernorm.forward(x, stream)?;
+        let hidden = x.add(
+            self.self_attn
+                .forward_tensor_parallel(&normed, mask, cache, tensor_group, stream)?,
             stream,
         )?;
         let normed = self.post_attention_layernorm.forward(&hidden, stream)?;

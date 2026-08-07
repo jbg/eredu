@@ -614,6 +614,32 @@ impl ParallelLinear {
         self.local_output_dims
     }
 
+    /// Returns every rank's output width for a column-sharded projection.
+    pub fn column_output_widths(&self) -> Result<Vec<usize>, Error> {
+        if self.parallelism != LinearParallelism::Column {
+            return Err(Error::Parallel(format!(
+                "output-width collection requires column parallelism, got {:?}",
+                self.parallelism
+            )));
+        }
+        let global = usize::try_from(self.global_output_dims)
+            .map_err(|_| Error::Parallel("parallel linear output width is invalid".into()))?;
+        let units = self.partition_units.ok_or_else(|| {
+            Error::Parallel("column-parallel projection has no logical partition units".into())
+        })?;
+        if units == 0 || !global.is_multiple_of(units) {
+            return Err(Error::Parallel(format!(
+                "column-parallel output width {global} is incompatible with {units} logical units"
+            )));
+        }
+        (0..self.tensor_parallel_size)
+            .map(|rank| {
+                balanced_contiguous_range(units, self.tensor_parallel_size, rank, false)
+                    .map(|range| range.len() * (global / units))
+            })
+            .collect()
+    }
+
     /// Returns whether construction replicated an unsupported projection.
     pub const fn fell_back_to_replication(&self) -> bool {
         self.fell_back_to_replication

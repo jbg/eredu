@@ -36,9 +36,9 @@ use safemlx_lm::{
         checkpoint::binding::canonical_checkpoint_name,
         scheduler::{RequestId, RequestStatus, SchedulerLimits},
     },
-    CacheResidencyPolicy, DenseDiskStreamLoadOptions, DeviceAssignment, ModelLoadOptions,
-    PagedCacheOptions, ParallelTopology, PromptCacheDescriptor, PromptCacheOptions,
-    PromptCacheTopology, WeightResidency,
+    CacheResidencyPolicy, CartesianExecution, DenseDiskStreamLoadOptions, DeviceAssignment,
+    ModelLoadOptions, PagedCacheOptions, ParallelTopology, PromptCacheDescriptor,
+    PromptCacheOptions, PromptCacheTopology, WeightResidency,
 };
 use safetensors::tensor::{serialize_to_file, Dtype, TensorView};
 
@@ -49,6 +49,7 @@ const DENSE_STREAM: &str = "SAFEMLX_LM_PIPELINE_DENSE_STREAM";
 const PROMPT_CACHE_ROOT: &str = "SAFEMLX_LM_PIPELINE_PROMPT_CACHE";
 const MICROBATCH: &str = "SAFEMLX_LM_PIPELINE_MICROBATCH";
 const SCHEDULE_MISMATCH: &str = "SAFEMLX_LM_PIPELINE_SCHEDULE_MISMATCH";
+const CARTESIAN_AXES: &str = "SAFEMLX_LM_PIPELINE_CARTESIAN_AXES";
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 enum FixtureFamily {
@@ -58,6 +59,8 @@ enum FixtureFamily {
     Qwen2,
     Qwen3,
     Qwen3Moe,
+    Qwen3MoeTied,
+    Qwen3MoeGguf,
     GptOss,
     Lfm2,
     Lfm2Moe,
@@ -65,8 +68,11 @@ enum FixtureFamily {
     KimiLinearGguf,
     NemotronH,
     Qwen3Next,
+    Qwen3NextMoe,
     Qwen35,
+    Qwen35Moe,
     Inkling,
+    InklingGguf,
 }
 
 impl FixtureFamily {
@@ -78,6 +84,8 @@ impl FixtureFamily {
             Self::Qwen2 => "qwen2",
             Self::Qwen3 => "qwen3",
             Self::Qwen3Moe => "qwen3-moe",
+            Self::Qwen3MoeTied => "qwen3-moe-tied",
+            Self::Qwen3MoeGguf => "qwen3-moe-gguf",
             Self::GptOss => "gpt-oss",
             Self::Lfm2 => "lfm2",
             Self::Lfm2Moe => "lfm2-moe",
@@ -85,8 +93,11 @@ impl FixtureFamily {
             Self::KimiLinearGguf => "kimi-linear-gguf",
             Self::NemotronH => "nemotron-h",
             Self::Qwen3Next => "qwen3-next",
+            Self::Qwen3NextMoe => "qwen3-next-moe",
             Self::Qwen35 => "qwen3.5",
+            Self::Qwen35Moe => "qwen3.5-moe",
             Self::Inkling => "inkling",
+            Self::InklingGguf => "inkling-gguf",
         }
     }
 
@@ -98,6 +109,8 @@ impl FixtureFamily {
             Self::Qwen2,
             Self::Qwen3,
             Self::Qwen3Moe,
+            Self::Qwen3MoeTied,
+            Self::Qwen3MoeGguf,
             Self::GptOss,
             Self::Lfm2,
             Self::Lfm2Moe,
@@ -105,8 +118,11 @@ impl FixtureFamily {
             Self::KimiLinearGguf,
             Self::NemotronH,
             Self::Qwen3Next,
+            Self::Qwen3NextMoe,
             Self::Qwen35,
+            Self::Qwen35Moe,
             Self::Inkling,
+            Self::InklingGguf,
         ] {
             if family.name() == value {
                 return family;
@@ -122,15 +138,19 @@ impl FixtureFamily {
             | Self::Qwen2
             | Self::Qwen3
             | Self::Qwen3Moe
+            | Self::Qwen3MoeTied
+            | Self::Qwen3MoeGguf
             | Self::GptOss
             | Self::Lfm2
             | Self::Lfm2Moe
             | Self::KimiLinear
             | Self::KimiLinearGguf
             | Self::Qwen3Next
-            | Self::Qwen35 => 2,
+            | Self::Qwen3NextMoe
+            | Self::Qwen35
+            | Self::Qwen35Moe => 2,
             Self::Gemma | Self::NemotronH => 4,
-            Self::Inkling => 3,
+            Self::Inkling | Self::InklingGguf => 3,
         }
     }
 
@@ -140,8 +160,8 @@ impl FixtureFamily {
             (Self::Gemma, 1) => 1..4,
             (Self::NemotronH, 0) => 0..2,
             (Self::NemotronH, 1) => 2..4,
-            (Self::Inkling, 0) => 0..2,
-            (Self::Inkling, 1) => 2..3,
+            (Self::Inkling | Self::InklingGguf, 0) => 0..2,
+            (Self::Inkling | Self::InklingGguf, 1) => 2..3,
             (_, rank) => rank..rank + 1,
         }
     }
@@ -153,15 +173,17 @@ impl FixtureFamily {
             Self::Gemma => ("gemma4", "gemma4"),
             Self::Qwen2 => ("dense_qwen", "qwen2"),
             Self::Qwen3 => ("dense_qwen", "qwen3"),
-            Self::Qwen3Moe => ("dense_qwen", "qwen3_moe"),
+            Self::Qwen3Moe | Self::Qwen3MoeTied | Self::Qwen3MoeGguf => ("dense_qwen", "qwen3_moe"),
             Self::GptOss => ("gpt_oss", "gpt_oss"),
             Self::Lfm2 => ("lfm2", "lfm2"),
             Self::Lfm2Moe => ("lfm2", "lfm2_moe"),
             Self::KimiLinear | Self::KimiLinearGguf => ("kimi_linear", "kimi_linear"),
             Self::NemotronH => ("nemotron_h", "nemotron_h"),
             Self::Qwen3Next => ("qwen_hybrid", "qwen3_next"),
+            Self::Qwen3NextMoe => ("qwen_hybrid", "qwen3_next"),
             Self::Qwen35 => ("qwen_hybrid", "qwen3_5_text"),
-            Self::Inkling => ("inkling", "inkling_mm_model"),
+            Self::Qwen35Moe => ("qwen_hybrid", "qwen3_5_moe_text"),
+            Self::Inkling | Self::InklingGguf => ("inkling", "inkling_mm_model"),
         }
     }
 
@@ -169,24 +191,34 @@ impl FixtureFamily {
         match self {
             Self::Gemma => "model.language_model.layers.",
             Self::NemotronH => "backbone.layers.",
-            Self::Inkling => "model.llm.layers.",
+            Self::Inkling | Self::InklingGguf => "model.llm.layers.",
             _ => "model.layers.",
         }
     }
 
     const fn has_gguf_source(self) -> bool {
-        matches!(self, Self::KimiLinearGguf)
+        matches!(
+            self,
+            Self::KimiLinearGguf | Self::InklingGguf | Self::Qwen3MoeGguf
+        )
     }
 
     const fn needs_resident_reference(self) -> bool {
         matches!(
             self,
-            Self::KimiLinear
+            Self::DeepSeek
+                | Self::KimiLinear
                 | Self::KimiLinearGguf
                 | Self::NemotronH
                 | Self::Qwen3Next
+                | Self::Qwen3Moe
+                | Self::Qwen3MoeTied
+                | Self::Qwen3MoeGguf
+                | Self::Qwen3NextMoe
                 | Self::Qwen35
+                | Self::Qwen35Moe
                 | Self::Inkling
+                | Self::InklingGguf
         )
     }
 }
@@ -201,13 +233,53 @@ fn pipeline_ring_worker() {
     let family = FixtureFamily::parse(&std::env::var(FIXTURE_FAMILY).unwrap());
     let prompt_cache_root = PathBuf::from(std::env::var_os(PROMPT_CACHE_ROOT).unwrap());
     let group = distributed::init(true, Backend::Ring).unwrap();
-    let topology =
-        ParallelTopology::from_group(&group, 1, 2, 1, DeviceAssignment::new(DeviceType::Cpu, 0))
-            .unwrap();
+    let cartesian_axes = std::env::var(CARTESIAN_AXES).ok();
+    let (tensor_parallel_size, expert_parallel_size) = match cartesian_axes.as_deref() {
+        None => (1, 1),
+        Some("tp-pp") => (2, 1),
+        Some("pp-ep") => (1, 2),
+        Some("tp-pp-ep") => (2, 2),
+        Some(other) => panic!("unexpected Cartesian pipeline axes {other:?}"),
+    };
+    let topology = ParallelTopology::from_group(
+        &group,
+        tensor_parallel_size,
+        2,
+        expert_parallel_size,
+        DeviceAssignment::new(DeviceType::Cpu, 0),
+    )
+    .unwrap();
     assert_eq!(topology.global_rank, expected_rank);
+    let pipeline_rank = topology.pipeline_parallel_rank;
+    let cartesian = cartesian_axes.as_ref().map(|_| {
+        CartesianExecution::new(
+            topology,
+            Some(family.layer_count()),
+            matches!(
+                family,
+                FixtureFamily::DeepSeek
+                    | FixtureFamily::Inkling
+                    | FixtureFamily::InklingGguf
+                    | FixtureFamily::KimiLinear
+                    | FixtureFamily::KimiLinearGguf
+                    | FixtureFamily::Lfm2Moe
+                    | FixtureFamily::NemotronH
+                    | FixtureFamily::Qwen3NextMoe
+                    | FixtureFamily::Qwen35Moe
+                    | FixtureFamily::Qwen3Moe
+                    | FixtureFamily::Qwen3MoeTied
+                    | FixtureFamily::Qwen3MoeGguf
+            )
+            .then_some(2),
+            &group,
+        )
+        .unwrap()
+    });
     let stream = Stream::new_with_device(&topology.device.device().unwrap());
-    let reference = (expected_rank == 1 && family.needs_resident_reference())
-        .then(|| resident_reference(&checkpoint, &stream));
+    let reference = (pipeline_rank == 1
+        && (family.needs_resident_reference()
+            || matches!(family, FixtureFamily::Lfm2 | FixtureFamily::Lfm2Moe)))
+    .then(|| resident_reference(&checkpoint, &stream));
     let dense_stream = std::env::var_os(DENSE_STREAM).is_some();
     let mut model = if dense_stream {
         let dense = DenseDiskStreamLoadOptions::new(u64::MAX, u64::MAX, 1, 1, 1).unwrap();
@@ -223,7 +295,7 @@ fn pipeline_ring_worker() {
         load_pipeline_model(&checkpoint, topology, &stream, &stream).unwrap()
     };
     let info = model.stage_info();
-    let expected_range = family.stage_range(expected_rank);
+    let expected_range = family.stage_range(pipeline_rank);
     assert_eq!(info.global_layer_range, expected_range);
     if !family.has_gguf_source() {
         let prefix = family.layer_prefix();
@@ -258,7 +330,13 @@ fn pipeline_ring_worker() {
             expected_rank == 0
         );
     }
-    if family.needs_resident_reference() && !family.has_gguf_source() {
+    if family.needs_resident_reference()
+        && !family.has_gguf_source()
+        && !matches!(
+            family,
+            FixtureFamily::Qwen3Moe | FixtureFamily::Qwen3MoeTied
+        )
+    {
         for layer in 0..family.layer_count() {
             assert_eq!(
                 opened.contains(&format!("layer-{layer}.safetensors")),
@@ -277,7 +355,7 @@ fn pipeline_ring_worker() {
             .all(|unit| !unit.host_resident() && !unit.device_resident()));
         if family.has_gguf_source() {
             let diagnostics = model.checkpoint_diagnostics().unwrap().unwrap();
-            let global_payload = kimi_linear_gguf_payload_bytes();
+            let global_payload = std::fs::metadata(&checkpoint).unwrap().len();
             assert!(diagnostics.physical_reads > 0);
             assert!(
                 diagnostics.physical_read_bytes < global_payload,
@@ -310,25 +388,24 @@ fn pipeline_ring_worker() {
         .unwrap();
     assert_eq!(
         cache.global_layers(),
-        family.stage_range(expected_rank).collect::<Vec<_>>()
+        family.stage_range(pipeline_rank).collect::<Vec<_>>()
     );
-    assert_family_cache(family, expected_rank, &cache, false);
+    assert_family_cache(family, pipeline_rank, &cache, false);
     let prompt = safemlx::Array::from_slice(&[1u32, 2], &[1, 2]);
-    let mut logits = model
-        .forward_pipeline(
-            (expected_rank == 0).then_some(&prompt),
-            PipelineStep::new(1, 2).unwrap(),
-            None,
-            &mut cache,
-            &group,
-            &stream,
-        )
-        .unwrap();
-    assert_eq!(logits.is_some(), expected_rank == 1);
+    let mut logits = forward_pipeline_model(
+        &mut model,
+        (pipeline_rank == 0).then_some(&prompt),
+        PipelineStep::new(1, 2).unwrap(),
+        &mut cache,
+        &group,
+        cartesian.as_ref(),
+        &stream,
+    );
+    assert_eq!(logits.is_some(), pipeline_rank == 1);
     if let (Some(actual), Some((expected, _))) = (&logits, &reference) {
         assert_final_logits_close(actual, expected, 1e-4);
     }
-    assert_family_cache(family, expected_rank, &cache, true);
+    assert_family_cache(family, pipeline_rank, &cache, true);
     let (model_family, effective_model_type) = family.descriptor_names();
     let descriptor = PromptCacheDescriptor {
         model_family: model_family.into(),
@@ -337,15 +414,17 @@ fn pipeline_ring_worker() {
         prefix_content_fingerprint: "tokens:1,2".into(),
         architecture_fingerprint: model.prompt_cache_architecture_fingerprint().unwrap(),
         layer_count: family.layer_count(),
-        global_layer_start: family.stage_range(expected_rank).start,
-        global_layer_end: family.stage_range(expected_rank).end,
+        global_layer_start: family.stage_range(pipeline_rank).start,
+        global_layer_end: family.stage_range(pipeline_rank).end,
         batch_size: 1,
         layer_layout: model.prompt_cache_layer_layout().unwrap(),
         sink_tokens: 0,
         topology: PromptCacheTopology {
-            pipeline: Some((2, expected_rank)),
-            tensor_parallel: None,
-            expert_parallel: None,
+            pipeline: Some((2, pipeline_rank)),
+            tensor_parallel: (tensor_parallel_size > 1)
+                .then_some((tensor_parallel_size, topology.tensor_parallel_rank)),
+            expert_parallel: (expert_parallel_size > 1)
+                .then_some((expert_parallel_size, topology.expert_parallel_rank)),
             expert_parallel_cache_replicated: true,
         },
     };
@@ -359,16 +438,15 @@ fn pipeline_ring_worker() {
         )
         .unwrap();
     let token = safemlx::Array::from_slice(&[0u32], &[1, 1]);
-    let uninterrupted = model
-        .forward_pipeline(
-            (expected_rank == 0).then_some(&token),
-            PipelineStep::new(1, 1).unwrap(),
-            None,
-            &mut cache,
-            &group,
-            &stream,
-        )
-        .unwrap();
+    let uninterrupted = forward_pipeline_model(
+        &mut model,
+        (pipeline_rank == 0).then_some(&token),
+        PipelineStep::new(1, 1).unwrap(),
+        &mut cache,
+        &group,
+        cartesian.as_ref(),
+        &stream,
+    );
     let uninterrupted_values = uninterrupted.as_ref().map(|value| {
         let value = value.evaluated().unwrap();
         value.as_slice::<f32>().to_vec()
@@ -380,16 +458,15 @@ fn pipeline_ring_worker() {
         .load_prompt_cache(&prompt_cache_root, &descriptor, &[1, 2], paged, &stream)
         .unwrap();
     assert_eq!(manifest.topology, descriptor.topology);
-    let restored = model
-        .forward_pipeline(
-            (expected_rank == 0).then_some(&token),
-            PipelineStep::new(1, 1).unwrap(),
-            None,
-            &mut cache,
-            &group,
-            &stream,
-        )
-        .unwrap();
+    let restored = forward_pipeline_model(
+        &mut model,
+        (pipeline_rank == 0).then_some(&token),
+        PipelineStep::new(1, 1).unwrap(),
+        &mut cache,
+        &group,
+        cartesian.as_ref(),
+        &stream,
+    );
     match (&uninterrupted_values, &restored) {
         (Some(uninterrupted), Some(restored)) => {
             let restored = restored.evaluated().unwrap();
@@ -433,16 +510,15 @@ fn pipeline_ring_worker() {
             }
         }
         drop(token);
-        logits = model
-            .forward_pipeline(
-                (expected_rank == 0).then_some(&synchronized.token),
-                PipelineStep::new(1, 1).unwrap(),
-                None,
-                &mut cache,
-                &group,
-                &stream,
-            )
-            .unwrap();
+        logits = forward_pipeline_model(
+            &mut model,
+            (pipeline_rank == 0).then_some(&synchronized.token),
+            PipelineStep::new(1, 1).unwrap(),
+            &mut cache,
+            &group,
+            cartesian.as_ref(),
+            &stream,
+        );
     }
     if dense_stream {
         let report = model.dense_stream_report().unwrap().unwrap();
@@ -497,6 +573,25 @@ fn assert_final_logits_close(actual: &Array, expected: &[f32], tolerance: f32) {
     );
 }
 
+fn forward_pipeline_model(
+    model: &mut safemlx_lm::architectures::distributed::pipeline::PipelineModel,
+    tokens: Option<&Array>,
+    step: PipelineStep,
+    cache: &mut safemlx_lm::architectures::distributed::pipeline::PipelineCache,
+    group: &safemlx::distributed::Group,
+    cartesian: Option<&CartesianExecution<'_>>,
+    stream: &Stream,
+) -> Option<Array> {
+    match cartesian {
+        Some(cartesian) => model
+            .forward_cartesian(tokens, step, None, cache, cartesian, stream)
+            .unwrap(),
+        None => model
+            .forward_pipeline(tokens, step, None, cache, group, stream)
+            .unwrap(),
+    }
+}
+
 fn assert_family_cache(
     family: FixtureFamily,
     rank: usize,
@@ -544,17 +639,25 @@ fn assert_family_cache(
                 PipelineLayerCache::KeyValue { slots, .. } if slots.is_empty()
             ));
         }
-        FixtureFamily::Qwen3Next | FixtureFamily::Qwen35 if rank == 0 => {
+        FixtureFamily::Qwen3Next
+        | FixtureFamily::Qwen3NextMoe
+        | FixtureFamily::Qwen35
+        | FixtureFamily::Qwen35Moe
+            if rank == 0 =>
+        {
             let PipelineLayerCache::StateSlots { slots, .. } = &cache.layers()[0] else {
                 panic!("Qwen linear-attention layer did not materialize recurrent state")
             };
             assert_slots(slots, 2);
         }
-        FixtureFamily::Qwen3Next | FixtureFamily::Qwen35 => assert!(matches!(
+        FixtureFamily::Qwen3Next
+        | FixtureFamily::Qwen3NextMoe
+        | FixtureFamily::Qwen35
+        | FixtureFamily::Qwen35Moe => assert!(matches!(
             &cache.layers()[0],
             PipelineLayerCache::KeyValue { slots, .. } if slots.is_empty()
         )),
-        FixtureFamily::Inkling => {
+        FixtureFamily::Inkling | FixtureFamily::InklingGguf => {
             for layer in cache.layers() {
                 let PipelineLayerCache::KeyValue { slots, .. } = layer else {
                     panic!("Inkling layer did not materialize KV plus convolution state")
@@ -728,7 +831,7 @@ fn run_schedule_mismatch_worker(
         PipelineInferencePhase::Prefill,
         PipelineStep::new(1, 2).unwrap(),
     );
-    let input = if rank == 0 {
+    let input = if model.stage_info().is_first {
         input.with_tokens(Array::from_slice(&[1u32, 2], &[1, 2]))
     } else {
         input
@@ -923,7 +1026,7 @@ fn write_deepseek_fixture(directory: &Path, layers: i32) {
         "qk_nope_head_dim": 2,
         "qk_rope_head_dim": 2,
         "v_head_dim": 2,
-        "first_k_dense_replace": layers,
+        "first_k_dense_replace": 1,
         "moe_layer_freq": 1,
         "n_routed_experts": 4,
         "n_shared_experts": 1,
@@ -941,7 +1044,45 @@ fn write_deepseek_fixture(directory: &Path, layers: i32) {
     let context = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
     let stream = context.stream();
     let args = deepseek_v3::model_args_from_config_value(&config).unwrap();
-    let mut model = deepseek_v3::Model::new(args, stream).unwrap();
+    let mut model = deepseek_v3::Model::new(args.clone(), stream).unwrap();
+    for layer in &mut model.model.layers {
+        let deepseek_v3::FeedForward::Moe(moe) = &mut layer.mlp else {
+            continue;
+        };
+        moe.experts.gate_proj = safemlx::module::Param::new(Some(
+            Array::zeros::<f32>(
+                &[
+                    args.n_routed_experts,
+                    args.moe_intermediate_size,
+                    args.hidden_size,
+                ],
+                stream,
+            )
+            .unwrap(),
+        ));
+        moe.experts.up_proj = safemlx::module::Param::new(Some(
+            Array::zeros::<f32>(
+                &[
+                    args.n_routed_experts,
+                    args.moe_intermediate_size,
+                    args.hidden_size,
+                ],
+                stream,
+            )
+            .unwrap(),
+        ));
+        moe.experts.down_proj = safemlx::module::Param::new(Some(
+            Array::zeros::<f32>(
+                &[
+                    args.n_routed_experts,
+                    args.hidden_size,
+                    args.moe_intermediate_size,
+                ],
+                stream,
+            )
+            .unwrap(),
+        ));
+    }
     for (name, parameter) in model.parameters_mut().flatten() {
         let shape = parameter.shape().to_vec();
         *parameter = if name.ends_with("norm.weight") {
@@ -950,12 +1091,23 @@ fn write_deepseek_fixture(directory: &Path, layers: i32) {
             Array::full::<f32>(&shape, Array::from_f32(0.01), stream).unwrap()
         };
     }
-    let arrays = model
-        .parameters()
-        .flatten()
-        .into_iter()
-        .map(|(name, value)| (canonical_checkpoint_name(&name), value.clone()))
-        .collect::<Vec<_>>();
+    let mut arrays = Vec::new();
+    for (name, value) in model.parameters().flatten() {
+        let projection = ["gate_proj", "up_proj", "down_proj"]
+            .into_iter()
+            .find(|projection| name.ends_with(&format!(".mlp.experts.{projection}")));
+        if let Some(projection) = projection {
+            let prefix = name.strip_suffix(&format!(".{projection}")).unwrap();
+            for expert in 0..args.n_routed_experts {
+                arrays.push((
+                    format!("{prefix}.{expert}.{projection}.weight"),
+                    value.try_index_device(expert, stream).unwrap(),
+                ));
+            }
+        } else {
+            arrays.push((canonical_checkpoint_name(&name), value.clone()));
+        }
+    }
     Array::save_safetensors(
         arrays.iter().map(|(name, value)| (name.as_str(), value)),
         None,
@@ -1080,7 +1232,12 @@ fn qwen_config(model_type: &str) -> serde_json::Value {
 }
 
 fn write_qwen_fixture(directory: &Path, model_type: &str) {
-    let config = qwen_config(model_type);
+    write_qwen_fixture_with_tied_head(directory, model_type, false);
+}
+
+fn write_qwen_fixture_with_tied_head(directory: &Path, model_type: &str, tied: bool) {
+    let mut config = qwen_config(model_type);
+    config["tie_word_embeddings"] = serde_json::json!(tied);
     std::fs::write(
         directory.join("config.json"),
         serde_json::to_vec_pretty(&config).unwrap(),
@@ -1116,6 +1273,135 @@ fn write_qwen_fixture(directory: &Path, model_type: &str) {
         directory.join("model.safetensors"),
     )
     .unwrap();
+}
+
+fn write_qwen3_moe_gguf_fixture(path: &Path) {
+    let config = qwen_config("qwen3_moe");
+    std::fs::write(
+        path.parent().unwrap().join("config.json"),
+        serde_json::to_vec_pretty(&config).unwrap(),
+    )
+    .unwrap();
+    let execution = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+    let stream = execution.stream();
+    let args = dense_qwen::load_config(path.parent().unwrap()).unwrap();
+    let mut model = dense_qwen::Model::new(args.clone(), stream).unwrap();
+    initialize_fixture(&mut model, stream);
+    let mut specs = Vec::new();
+    for (runtime_name, value) in model.parameters().flatten() {
+        let runtime_name = canonical_checkpoint_name(&runtime_name);
+        if let Some(prefix) = runtime_name.strip_suffix(".mlp.experts.gate_up_proj") {
+            let gate = value
+                .try_index_device((.., ..args.moe_intermediate_size, ..), stream)
+                .unwrap();
+            let up = value
+                .try_index_device((.., args.moe_intermediate_size.., ..), stream)
+                .unwrap();
+            let prefix = prefix.replace("model.layers.", "blk.");
+            specs.push(gguf_tensor_from_array(
+                format!("{prefix}.ffn_gate_exps.weight"),
+                &gate,
+            ));
+            specs.push(gguf_tensor_from_array(
+                format!("{prefix}.ffn_up_exps.weight"),
+                &up,
+            ));
+            continue;
+        }
+        if let Some(prefix) = runtime_name.strip_suffix(".mlp.experts.down_proj") {
+            specs.push(gguf_tensor_from_array(
+                format!(
+                    "{}.ffn_down_exps.weight",
+                    prefix.replace("model.layers.", "blk.")
+                ),
+                value,
+            ));
+            continue;
+        }
+        let name = runtime_name
+            .replace("model.layers.", "blk.")
+            .replace("self_attn.q_norm", "attn_q_norm")
+            .replace("self_attn.k_norm", "attn_k_norm")
+            .replace("self_attn.q_proj", "attn_q")
+            .replace("self_attn.k_proj", "attn_k")
+            .replace("self_attn.v_proj", "attn_v")
+            .replace("self_attn.o_proj", "attn_output")
+            .replace("input_layernorm", "attn_norm")
+            .replace("post_attention_layernorm", "ffn_norm")
+            .replace("mlp.gate.weight", "ffn_gate_inp.weight")
+            .replace("model.embed_tokens", "token_embd")
+            .replace("model.norm", "output_norm")
+            .replace("lm_head", "output");
+        specs.push(gguf_tensor_from_array(name, value));
+    }
+    let key = |suffix: &str| format!("qwen3moe.{suffix}");
+    let metadata = BTreeMap::from([
+        (
+            "general.architecture".into(),
+            GgufMetadataValue::String("qwen3moe".into()),
+        ),
+        ("general.file_type".into(), GgufMetadataValue::Uint32(0)),
+        (
+            key("embedding_length"),
+            GgufMetadataValue::Uint32(args.hidden_size as u32),
+        ),
+        (
+            key("block_count"),
+            GgufMetadataValue::Uint32(args.num_hidden_layers as u32),
+        ),
+        (
+            key("expert_feed_forward_length"),
+            GgufMetadataValue::Uint32(args.moe_intermediate_size as u32),
+        ),
+        (
+            key("expert_count"),
+            GgufMetadataValue::Uint32(args.num_experts as u32),
+        ),
+        (
+            key("expert_used_count"),
+            GgufMetadataValue::Uint32(args.num_experts_per_tok as u32),
+        ),
+        (
+            key("attention.head_count"),
+            GgufMetadataValue::Uint32(args.num_attention_heads as u32),
+        ),
+        (
+            key("attention.head_count_kv"),
+            GgufMetadataValue::Uint32(args.num_key_value_heads as u32),
+        ),
+        (
+            key("attention.key_length"),
+            GgufMetadataValue::Uint32(args.head_dim as u32),
+        ),
+        (
+            key("attention.layer_norm_rms_epsilon"),
+            GgufMetadataValue::Float32(args.rms_norm_eps),
+        ),
+        (
+            key("context_length"),
+            GgufMetadataValue::Uint32(args.max_position_embeddings as u32),
+        ),
+        (
+            key("rope.freq_base"),
+            GgufMetadataValue::Float32(args.rope_theta),
+        ),
+        (
+            key("vocab_size"),
+            GgufMetadataValue::Uint32(args.vocab_size as u32),
+        ),
+    ]);
+    let tensors = specs
+        .iter()
+        .map(|tensor| TensorInput {
+            name: &tensor.name,
+            dimensions: &tensor.dimensions,
+            ggml_type: GgmlType::F32,
+            data: &tensor.data,
+        })
+        .collect::<Vec<_>>();
+    Writer::default()
+        .write(std::fs::File::create(path).unwrap(), &metadata, &tensors)
+        .unwrap();
 }
 
 fn write_gpt_oss_fixture(directory: &Path) {
@@ -1552,7 +1838,7 @@ fn qwen_hybrid_config(model_type: &str) -> serde_json::Value {
         "num_hidden_layers": 2,
         "mtp_num_hidden_layers": 0,
         "num_attention_heads": 2,
-        "num_key_value_heads": 1,
+        "num_key_value_heads": 2,
         "head_dim": 8,
         "max_position_embeddings": 128,
         "rms_norm_eps": 0.00001,
@@ -1568,8 +1854,34 @@ fn qwen_hybrid_config(model_type: &str) -> serde_json::Value {
     })
 }
 
+fn qwen_hybrid_moe_config(model_type: &str) -> serde_json::Value {
+    let mut config = qwen_hybrid_config(model_type);
+    config["architectures"] = serde_json::json!([if model_type == "qwen3_next" {
+        "Qwen3NextForCausalLM"
+    } else {
+        "Qwen3_5MoeForCausalLM"
+    }]);
+    config["intermediate_size"] = serde_json::json!(0);
+    config["moe_intermediate_size"] = serde_json::json!(8);
+    config["shared_expert_intermediate_size"] = serde_json::json!(8);
+    config["num_experts"] = serde_json::json!(2);
+    config["num_experts_per_tok"] = serde_json::json!(1);
+    config["norm_topk_prob"] = serde_json::json!(true);
+    config
+}
+
 fn write_qwen_hybrid_fixture(directory: &Path, model_type: &str) {
     let config = qwen_hybrid_config(model_type);
+    let execution = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+    let stream = execution.stream();
+    let args = qwen_hybrid::model_args_from_config_value(&config).unwrap();
+    let mut model = qwen_hybrid::Model::new(args, None, None, None, stream).unwrap();
+    initialize_fixture(&mut model, stream);
+    save_parameter_fixture(directory, &config, &model);
+}
+
+fn write_qwen_hybrid_moe_fixture(directory: &Path, model_type: &str) {
+    let config = qwen_hybrid_moe_config(model_type);
     let execution = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
     let stream = execution.stream();
     let args = qwen_hybrid::model_args_from_config_value(&config).unwrap();
@@ -1587,12 +1899,12 @@ fn inkling_config() -> serde_json::Value {
             "hidden_size": 16,
             "num_hidden_layers": 3,
             "vocab_size": 32,
-            "num_attention_heads": 2,
-            "num_key_value_heads": 1,
-            "head_dim": 8,
-            "swa_num_attention_heads": 2,
-            "swa_num_key_value_heads": 1,
-            "swa_head_dim": 8,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 2,
+            "head_dim": 4,
+            "swa_num_attention_heads": 4,
+            "swa_num_key_value_heads": 2,
+            "swa_head_dim": 4,
             "sliding_window_size": 4,
             "layer_types": ["full_attention", "sliding_attention", "full_attention"],
             "dense_mlp_idx": 1,
@@ -1731,6 +2043,210 @@ fn write_inkling_fixture(directory: &Path) {
         serde_json::to_vec_pretty(&config).unwrap(),
     )
     .unwrap();
+}
+
+fn inkling_gguf_metadata() -> BTreeMap<String, GgufMetadataValue> {
+    use safemlx::ops::GgufMetadataArray;
+    BTreeMap::from([
+        (
+            "general.architecture".into(),
+            GgufMetadataValue::String("inkling".into()),
+        ),
+        ("general.file_type".into(), GgufMetadataValue::Uint32(0)),
+        ("inkling.block_count".into(), GgufMetadataValue::Uint32(3)),
+        (
+            "inkling.embedding_length".into(),
+            GgufMetadataValue::Uint32(16),
+        ),
+        (
+            "inkling.attention.head_count".into(),
+            GgufMetadataValue::Uint32(4),
+        ),
+        (
+            "inkling.attention.head_count_kv".into(),
+            GgufMetadataValue::Array(GgufMetadataArray::Uint32(vec![2, 2, 2])),
+        ),
+        (
+            "inkling.attention.sliding_window_pattern".into(),
+            GgufMetadataValue::Array(GgufMetadataArray::Bool(vec![false, true, false])),
+        ),
+        (
+            "inkling.attention.key_length".into(),
+            GgufMetadataValue::Uint32(4),
+        ),
+        ("inkling.vocab_size".into(), GgufMetadataValue::Uint32(32)),
+        (
+            "inkling.attention.sliding_window".into(),
+            GgufMetadataValue::Uint32(4),
+        ),
+        (
+            "inkling.dense_block_count".into(),
+            GgufMetadataValue::Uint32(1),
+        ),
+        (
+            "inkling.shortconv_kernel".into(),
+            GgufMetadataValue::Uint32(3),
+        ),
+        ("inkling.rel_extent".into(), GgufMetadataValue::Uint32(8)),
+        ("inkling.d_rel".into(), GgufMetadataValue::Uint32(4)),
+        (
+            "inkling.attention.layer_norm_rms_epsilon".into(),
+            GgufMetadataValue::Float32(1e-6),
+        ),
+        (
+            "inkling.unpadded_vocab_size".into(),
+            GgufMetadataValue::Uint32(30),
+        ),
+        (
+            "inkling.logit_scale_denom".into(),
+            GgufMetadataValue::Float32(2.0),
+        ),
+        (
+            "inkling.expert_feed_forward_length".into(),
+            GgufMetadataValue::Uint32(8),
+        ),
+        (
+            "inkling.feed_forward_length".into(),
+            GgufMetadataValue::Uint32(16),
+        ),
+        ("inkling.expert_count".into(), GgufMetadataValue::Uint32(2)),
+        (
+            "inkling.expert_used_count".into(),
+            GgufMetadataValue::Uint32(1),
+        ),
+        (
+            "inkling.expert_shared_count".into(),
+            GgufMetadataValue::Uint32(1),
+        ),
+        (
+            "inkling.expert_weights_scale".into(),
+            GgufMetadataValue::Float32(1.0),
+        ),
+        (
+            "inkling.context_length".into(),
+            GgufMetadataValue::Uint32(64),
+        ),
+    ])
+}
+
+fn inkling_gguf_layer_name(runtime: &str) -> Option<String> {
+    for (source, target) in [
+        ("model.embed_tokens.weight", "token_embd.weight"),
+        ("model.embed_norm.weight", "token_embd_norm.weight"),
+        ("model.norm.weight", "output_norm.weight"),
+        ("lm_head.weight", "output.weight"),
+    ] {
+        if runtime == source {
+            return Some(target.into());
+        }
+    }
+    let rest = runtime.strip_prefix("model.layers.")?;
+    let (layer, parameter) = rest.split_once('.')?;
+    let target = match parameter {
+        "input_layernorm.weight" => "attn_norm.weight",
+        "self_attn.q_proj.weight" => "attn_q.weight",
+        "self_attn.k_proj.weight" => "attn_k.weight",
+        "self_attn.v_proj.weight" => "attn_v.weight",
+        "self_attn.r_proj.weight" => "attn_r.weight",
+        "self_attn.o_proj.weight" => "attn_output.weight",
+        "self_attn.q_norm.weight" => "attn_q_norm.weight",
+        "self_attn.k_norm.weight" => "attn_k_norm.weight",
+        "self_attn.rel_proj" => "attn_rel_proj",
+        "self_attn.k_sconv.weight" => "shortconv_k.weight",
+        "self_attn.v_sconv.weight" => "shortconv_v.weight",
+        "attn_sconv.weight" => "shortconv_attn.weight",
+        "post_attention_layernorm.weight" => "ffn_norm.weight",
+        "dense.gate_proj.weight" => "ffn_gate.weight",
+        "dense.up_proj.weight" => "ffn_up.weight",
+        "dense.down_proj.weight" => "ffn_down.weight",
+        "dense_global_scale" | "moe.router.global_scale" => "ffn_gscale",
+        "moe.router.weight" => "ffn_gate_inp.weight",
+        "moe.router.bias" => "exp_probs_b.bias",
+        "moe.experts.down_proj" => "ffn_down_exps.weight",
+        "moe.shared_experts.down_proj" => "ffn_down_shexp.weight",
+        "mlp_sconv.weight" => "shortconv_mlp.weight",
+        _ => return None,
+    };
+    Some(format!("blk.{layer}.{target}"))
+}
+
+fn gguf_tensor_from_array(name: impl Into<String>, array: &Array) -> GgufFixtureTensor {
+    let evaluated = array.evaluated().unwrap();
+    let mut dimensions = array
+        .shape()
+        .iter()
+        .rev()
+        .map(|&dimension| dimension as u64)
+        .collect::<Vec<_>>();
+    if dimensions.is_empty() {
+        dimensions.push(1);
+    }
+    f32_gguf_tensor(name, dimensions, evaluated.as_slice::<f32>().to_vec())
+}
+
+fn write_inkling_gguf_fixture(path: &Path) {
+    let config = inkling_config();
+    let execution = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+    let stream = execution.stream();
+    let args = inkling::model_args_from_config_value(&config).unwrap();
+    let mut model = inkling::Model::new(args, stream).unwrap();
+    initialize_fixture(&mut model, stream);
+    let parameters = model.parameters().flatten();
+    let mut specs = Vec::new();
+    for (runtime, value) in &parameters {
+        let runtime = runtime.as_ref();
+        for (suffix, gate_name, up_name) in [
+            (
+                ".moe.experts.gate_up_proj",
+                "ffn_gate_exps.weight",
+                "ffn_up_exps.weight",
+            ),
+            (
+                ".moe.shared_experts.gate_up_proj",
+                "ffn_gate_shexp.weight",
+                "ffn_up_shexp.weight",
+            ),
+        ] {
+            if let Some(prefix) = runtime.strip_suffix(suffix) {
+                let layer = prefix.strip_prefix("model.layers.").unwrap();
+                let gate = value.try_index_device((.., ..8, ..), stream).unwrap();
+                let up = value.try_index_device((.., 8.., ..), stream).unwrap();
+                specs.push(gguf_tensor_from_array(
+                    format!("blk.{layer}.{gate_name}"),
+                    &gate,
+                ));
+                specs.push(gguf_tensor_from_array(
+                    format!("blk.{layer}.{up_name}"),
+                    &up,
+                ));
+                break;
+            }
+        }
+        if runtime.ends_with(".moe.experts.gate_up_proj")
+            || runtime.ends_with(".moe.shared_experts.gate_up_proj")
+        {
+            continue;
+        }
+        let name = inkling_gguf_layer_name(runtime)
+            .unwrap_or_else(|| panic!("missing Inkling GGUF name for {runtime}"));
+        specs.push(gguf_tensor_from_array(name, value));
+    }
+    let tensors = specs
+        .iter()
+        .map(|tensor| TensorInput {
+            name: &tensor.name,
+            dimensions: &tensor.dimensions,
+            ggml_type: GgmlType::F32,
+            data: &tensor.data,
+        })
+        .collect::<Vec<_>>();
+    Writer::default()
+        .write(
+            std::fs::File::create(path).unwrap(),
+            &inkling_gguf_metadata(),
+            &tensors,
+        )
+        .unwrap();
 }
 
 struct GgufFixtureTensor {
@@ -1912,13 +2428,6 @@ fn kimi_linear_gguf_specs() -> Vec<GgufFixtureTensor> {
     specs
 }
 
-fn kimi_linear_gguf_payload_bytes() -> u64 {
-    kimi_linear_gguf_specs()
-        .iter()
-        .map(|tensor| tensor.data.len() as u64)
-        .sum()
-}
-
 fn write_kimi_linear_gguf_fixture(path: &Path) {
     let specs = kimi_linear_gguf_specs();
     let tensors = specs
@@ -1937,14 +2446,6 @@ fn write_kimi_linear_gguf_fixture(path: &Path) {
             &tensors,
         )
         .unwrap();
-}
-
-fn reserve_two_ports() -> (TcpListener, TcpListener, u16, u16) {
-    let first = TcpListener::bind(("127.0.0.1", 0)).unwrap();
-    let second = TcpListener::bind(("127.0.0.1", 0)).unwrap();
-    let first_port = first.local_addr().unwrap().port();
-    let second_port = second.local_addr().unwrap().port();
-    (first, second, first_port, second_port)
 }
 
 fn render_failure(rank: usize, output: &Output) -> String {
@@ -2000,6 +2501,22 @@ fn ring_two_process_dense_stream_pipeline() {
 #[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
 fn ring_two_process_deepseek_pipeline_persistence() {
     run_ring_pipeline(false, FixtureFamily::DeepSeek);
+}
+
+/// Verifies DeepSeek TP=2 + PP=2 across dense and routed-MoE stages with
+/// tensor-sharded MLA, compressed caches, bounded reads, and generation.
+#[test]
+#[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
+fn ring_four_process_deepseek_tensor_pipeline() {
+    run_ring_cartesian_pipeline(true, FixtureFamily::DeepSeek, "tp-pp");
+}
+
+/// Verifies DeepSeek PP=2 + EP=2 across a dense-to-MoE stage boundary with
+/// stage-local expert ownership, compressed cache persistence, and generation.
+#[test]
+#[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
+fn ring_four_process_deepseek_pipeline_expert() {
+    run_ring_cartesian_pipeline(true, FixtureFamily::DeepSeek, "pp-ep");
 }
 
 /// Verifies dependency-safe Gemma placement, auxiliary-state transport, shared
@@ -2063,6 +2580,22 @@ fn ring_two_process_lfm2_moe_pipeline() {
     run_ring_pipeline(false, FixtureFamily::Lfm2Moe);
 }
 
+/// Verifies LFM2 TP=2 + PP=2 with tensor-sharded convolution/attention state,
+/// corresponding-coordinate stage transport, persistence, and generation.
+#[test]
+#[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
+fn ring_four_process_lfm2_tensor_pipeline() {
+    run_ring_cartesian_pipeline(true, FixtureFamily::Lfm2, "tp-pp");
+}
+
+/// Verifies LFM2-MoE PP=2 + EP=2 across a dense-to-sparse stage boundary,
+/// including stage-local expert exchange, persistence, and generation.
+#[test]
+#[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
+fn ring_four_process_lfm2_pipeline_expert() {
+    run_ring_cartesian_pipeline(true, FixtureFamily::Lfm2Moe, "pp-ep");
+}
+
 /// Verifies Kimi's KDA and compressed-latent stages against resident prefill
 /// and decode while keeping each rank's layer reads bounded.
 #[test]
@@ -2079,12 +2612,60 @@ fn ring_two_process_kimi_linear_gguf_pipeline() {
     run_ring_pipeline(true, FixtureFamily::KimiLinearGguf);
 }
 
+/// Verifies Kimi Linear TP=2 + PP=2 across KDA and MLA stages with TP-local
+/// recurrent state, shared/routed projections, persistence, and generation.
+#[test]
+#[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
+fn ring_four_process_kimi_linear_tensor_pipeline() {
+    run_ring_cartesian_pipeline(true, FixtureFamily::KimiLinear, "tp-pp");
+}
+
+/// Exercises Kimi Linear TP+PP rank-local recipes from a representative GGUF
+/// artifact, including bounded streaming reads.
+#[test]
+#[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
+fn ring_four_process_kimi_linear_gguf_tensor_pipeline() {
+    run_ring_cartesian_pipeline(true, FixtureFamily::KimiLinearGguf, "tp-pp");
+}
+
+/// Verifies Kimi Linear PP=2 + EP=2 across the dense KDA to sparse MLA stage
+/// transition with stage-local expert ownership, persistence, and generation.
+#[test]
+#[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
+fn ring_four_process_kimi_linear_pipeline_expert() {
+    run_ring_cartesian_pipeline(true, FixtureFamily::KimiLinear, "pp-ep");
+}
+
+/// Exercises Kimi Linear PP+EP stage-local expert selection and bounded reads
+/// from the representative GGUF fixture.
+#[test]
+#[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
+fn ring_four_process_kimi_linear_gguf_pipeline_expert() {
+    run_ring_cartesian_pipeline(true, FixtureFamily::KimiLinearGguf, "pp-ep");
+}
+
 /// Verifies Mamba, dense, sparse, and sliding-attention Nemotron operators over
 /// the two balanced stage ranges.
 #[test]
 #[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
 fn ring_two_process_nemotron_h_dense_stream_pipeline() {
     run_ring_pipeline(true, FixtureFamily::NemotronH);
+}
+
+/// Verifies Nemotron-H TP=2 + PP=2 across Mamba, dense, sparse-MoE, and
+/// sliding-attention stages with rank-local cache geometry and persistence.
+#[test]
+#[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
+fn ring_four_process_nemotron_h_tensor_pipeline() {
+    run_ring_cartesian_pipeline(true, FixtureFamily::NemotronH, "tp-pp");
+}
+
+/// Verifies Nemotron-H-MoE PP=2 + EP=2 with stage-local routed experts,
+/// matching-EP pipeline transport, cached decode, persistence, and generation.
+#[test]
+#[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
+fn ring_four_process_nemotron_h_pipeline_expert() {
+    run_ring_cartesian_pipeline(true, FixtureFamily::NemotronH, "pp-ep");
 }
 
 /// Verifies Qwen3-Next linear and full-attention state through distributed
@@ -2103,6 +2684,89 @@ fn ring_two_process_qwen35_dense_stream_pipeline() {
     run_ring_pipeline(true, FixtureFamily::Qwen35);
 }
 
+/// Verifies Qwen3-Next TP=2 + PP=2 across recurrent and full-attention stages,
+/// including rank-local state, persistence, and synchronized generation.
+#[test]
+#[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
+fn ring_four_process_qwen3_next_tensor_pipeline() {
+    run_ring_cartesian_pipeline(true, FixtureFamily::Qwen3Next, "tp-pp");
+}
+
+/// Verifies Qwen3.5-MoE TP=2 + PP=2 with tensor-sharded routed/shared
+/// intermediates and corresponding-coordinate pipeline transport.
+#[test]
+#[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
+fn ring_four_process_qwen35_moe_tensor_pipeline() {
+    run_ring_cartesian_pipeline(true, FixtureFamily::Qwen35Moe, "tp-pp");
+}
+
+/// Verifies Qwen3.5-MoE PP=2 + EP=2 with stage-local packed experts,
+/// recurrent/full-attention state, persistence, and generation.
+#[test]
+#[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
+fn ring_four_process_qwen35_pipeline_expert() {
+    run_ring_cartesian_pipeline(true, FixtureFamily::Qwen35Moe, "pp-ep");
+}
+
+/// Verifies the Qwen3-Next checkpoint specialization uses the same PP+EP
+/// ownership and transport contract as Qwen3.5-MoE.
+#[test]
+#[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
+fn ring_four_process_qwen3_next_pipeline_expert() {
+    run_ring_cartesian_pipeline(true, FixtureFamily::Qwen3NextMoe, "pp-ep");
+}
+
+/// Verifies arbitrary Cartesian composition with TP-sharded Qwen3-MoE
+/// projections, stage-local EP ownership, corresponding-coordinate pipeline
+/// transport, cache persistence, and globally synchronized generation.
+#[test]
+#[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
+fn ring_qwen3_moe_tensor_pipeline_expert() {
+    run_ring_cartesian_pipeline(false, FixtureFamily::Qwen3Moe, "tp-pp-ep");
+}
+
+/// Verifies triple-axis ownership and generation with a tied output head.
+#[test]
+#[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
+fn ring_qwen3_moe_tied_tensor_pipeline_expert() {
+    run_ring_cartesian_pipeline(false, FixtureFamily::Qwen3MoeTied, "tp-pp-ep");
+}
+
+/// Exercises the same triple-axis semantics with bounded rank-local layer
+/// materialization.
+#[test]
+#[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
+fn ring_qwen3_moe_streamed_tensor_pipeline_expert() {
+    run_ring_cartesian_pipeline(true, FixtureFamily::Qwen3Moe, "tp-pp-ep");
+}
+
+/// Executes the Qwen3-MoE triple-axis path from a canonical GGUF and verifies
+/// rank-local ownership, bounded reads, cache persistence, and parity.
+#[test]
+#[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
+fn ring_qwen3_moe_gguf_tensor_pipeline_expert() {
+    run_ring_cartesian_pipeline(false, FixtureFamily::Qwen3MoeGguf, "tp-pp-ep");
+}
+
+/// Exercises the canonical GGUF path with rank-local dense disk streaming.
+#[test]
+#[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
+fn ring_qwen3_moe_gguf_streamed_tensor_pipeline_expert() {
+    run_ring_cartesian_pipeline(true, FixtureFamily::Qwen3MoeGguf, "tp-pp-ep");
+}
+
+/// Verifies global descriptor mismatch consensus across every triple-axis rank.
+#[test]
+#[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
+fn ring_qwen3_moe_tensor_pipeline_expert_mismatch_consensus() {
+    run_ring_cartesian_pipeline_mode(
+        false,
+        FixtureFamily::Qwen3Moe,
+        "tp-pp-ep",
+        WorkerMode::ScheduleMismatch,
+    );
+}
+
 /// Verifies Inkling's uneven 2+1 stage placement and combined KV/convolution
 /// state against the resident text decoder.
 #[test]
@@ -2111,8 +2775,98 @@ fn ring_two_process_inkling_dense_stream_pipeline() {
     run_ring_pipeline(true, FixtureFamily::Inkling);
 }
 
+/// Verifies Inkling TP=2 + PP=2 across full/sliding attention, dense/sparse
+/// transitions, rank-local KV/convolution state, persistence, and generation.
+#[test]
+#[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
+fn ring_four_process_inkling_tensor_pipeline() {
+    run_ring_cartesian_pipeline(true, FixtureFamily::Inkling, "tp-pp");
+}
+
+/// Exercises Inkling TP+PP rank-local recipes and bounded reads from a
+/// representative canonical text GGUF.
+#[test]
+#[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
+fn ring_four_process_inkling_gguf_tensor_pipeline() {
+    run_ring_cartesian_pipeline(true, FixtureFamily::InklingGguf, "tp-pp");
+}
+
+/// Verifies Inkling PP=2 + EP=2 with stage-local routed experts, shared
+/// experts, matching-EP transport, persistence, and bounded layer reads.
+#[test]
+#[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
+fn ring_four_process_inkling_pipeline_expert() {
+    run_ring_cartesian_pipeline(true, FixtureFamily::Inkling, "pp-ep");
+}
+
+/// Exercises Inkling PP+EP expert selection and stage-local state from a
+/// representative canonical text GGUF.
+#[test]
+#[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
+fn ring_four_process_inkling_gguf_pipeline_expert() {
+    run_ring_cartesian_pipeline(true, FixtureFamily::InklingGguf, "pp-ep");
+}
+
 fn run_ring_pipeline(dense_stream: bool, family: FixtureFamily) {
     run_ring_pipeline_mode(dense_stream, family, WorkerMode::Standard);
+}
+
+fn run_ring_cartesian_pipeline(dense_stream: bool, family: FixtureFamily, axes: &'static str) {
+    run_ring_cartesian_pipeline_mode(dense_stream, family, axes, WorkerMode::Standard);
+}
+
+fn run_ring_cartesian_pipeline_mode(
+    dense_stream: bool,
+    family: FixtureFamily,
+    axes: &'static str,
+    mode: WorkerMode,
+) {
+    assert!(distributed::is_available(Backend::Ring));
+    let checkpoint = tempfile::tempdir().unwrap();
+    let checkpoint_path = if family == FixtureFamily::Qwen3MoeGguf {
+        let path = checkpoint.path().join("model.gguf");
+        write_qwen3_moe_gguf_fixture(&path);
+        path
+    } else if family == FixtureFamily::KimiLinearGguf {
+        let path = checkpoint.path().join("model.gguf");
+        write_kimi_linear_gguf_fixture(&path);
+        path
+    } else if family == FixtureFamily::InklingGguf {
+        let path = checkpoint.path().join("model.gguf");
+        write_inkling_gguf_fixture(&path);
+        path
+    } else {
+        match family {
+            FixtureFamily::Qwen3Moe => write_qwen_fixture(checkpoint.path(), "qwen3_moe"),
+            FixtureFamily::Qwen3MoeTied => {
+                write_qwen_fixture_with_tied_head(checkpoint.path(), "qwen3_moe", true)
+            }
+            FixtureFamily::DeepSeek => write_deepseek_fixture(checkpoint.path(), 2),
+            FixtureFamily::Lfm2 => write_lfm2_pipeline_fixture(checkpoint.path(), false),
+            FixtureFamily::Lfm2Moe => write_lfm2_pipeline_fixture(checkpoint.path(), true),
+            FixtureFamily::KimiLinear => write_kimi_linear_fixture(checkpoint.path()),
+            FixtureFamily::NemotronH => write_nemotron_fixture(checkpoint.path()),
+            FixtureFamily::Qwen3Next => write_qwen_hybrid_fixture(checkpoint.path(), "qwen3_next"),
+            FixtureFamily::Qwen3NextMoe => {
+                write_qwen_hybrid_moe_fixture(checkpoint.path(), "qwen3_next")
+            }
+            FixtureFamily::Qwen35 => write_qwen_hybrid_fixture(checkpoint.path(), "qwen3_5_text"),
+            FixtureFamily::Qwen35Moe => {
+                write_qwen_hybrid_moe_fixture(checkpoint.path(), "qwen3_5_moe_text")
+            }
+            FixtureFamily::Inkling => write_inkling_fixture(checkpoint.path()),
+            _ => panic!("Cartesian pipeline helper received unsupported {family:?}"),
+        }
+        checkpoint.path().to_path_buf()
+    };
+    run_ring_pipeline_processes(
+        dense_stream,
+        family,
+        mode,
+        checkpoint,
+        checkpoint_path,
+        Some(axes),
+    );
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -2125,9 +2879,17 @@ enum WorkerMode {
 fn run_ring_pipeline_mode(dense_stream: bool, family: FixtureFamily, mode: WorkerMode) {
     assert!(distributed::is_available(Backend::Ring));
     let checkpoint = tempfile::tempdir().unwrap();
-    let checkpoint_path = if family == FixtureFamily::KimiLinearGguf {
+    let checkpoint_path = if family == FixtureFamily::Qwen3MoeGguf {
+        let path = checkpoint.path().join("model.gguf");
+        write_qwen3_moe_gguf_fixture(&path);
+        path
+    } else if family == FixtureFamily::KimiLinearGguf {
         let path = checkpoint.path().join("model.gguf");
         write_kimi_linear_gguf_fixture(&path);
+        path
+    } else if family == FixtureFamily::InklingGguf {
+        let path = checkpoint.path().join("model.gguf");
+        write_inkling_gguf_fixture(&path);
         path
     } else {
         match family {
@@ -2137,19 +2899,37 @@ fn run_ring_pipeline_mode(dense_stream: bool, family: FixtureFamily, mode: Worke
             FixtureFamily::Qwen2 => write_qwen_fixture(checkpoint.path(), "qwen2"),
             FixtureFamily::Qwen3 => write_qwen_fixture(checkpoint.path(), "qwen3"),
             FixtureFamily::Qwen3Moe => write_qwen_fixture(checkpoint.path(), "qwen3_moe"),
+            FixtureFamily::Qwen3MoeTied => {
+                write_qwen_fixture_with_tied_head(checkpoint.path(), "qwen3_moe", true)
+            }
             FixtureFamily::GptOss => write_gpt_oss_fixture(checkpoint.path()),
             FixtureFamily::Lfm2 => write_lfm2_pipeline_fixture(checkpoint.path(), false),
             FixtureFamily::Lfm2Moe => write_lfm2_pipeline_fixture(checkpoint.path(), true),
             FixtureFamily::KimiLinear => write_kimi_linear_fixture(checkpoint.path()),
             FixtureFamily::NemotronH => write_nemotron_fixture(checkpoint.path()),
             FixtureFamily::Qwen3Next => write_qwen_hybrid_fixture(checkpoint.path(), "qwen3_next"),
+            FixtureFamily::Qwen3NextMoe => {
+                write_qwen_hybrid_moe_fixture(checkpoint.path(), "qwen3_next")
+            }
             FixtureFamily::Qwen35 => write_qwen_hybrid_fixture(checkpoint.path(), "qwen3_5_text"),
+            FixtureFamily::Qwen35Moe => {
+                write_qwen_hybrid_moe_fixture(checkpoint.path(), "qwen3_5_moe_text")
+            }
             FixtureFamily::Inkling => write_inkling_fixture(checkpoint.path()),
-            FixtureFamily::KimiLinearGguf => unreachable!(),
+            FixtureFamily::Qwen3MoeGguf
+            | FixtureFamily::KimiLinearGguf
+            | FixtureFamily::InklingGguf => unreachable!(),
         }
         checkpoint.path().to_path_buf()
     };
-    run_ring_pipeline_processes(dense_stream, family, mode, checkpoint, checkpoint_path);
+    run_ring_pipeline_processes(
+        dense_stream,
+        family,
+        mode,
+        checkpoint,
+        checkpoint_path,
+        None,
+    );
 }
 
 fn run_ring_pipeline_processes(
@@ -2158,23 +2938,30 @@ fn run_ring_pipeline_processes(
     mode: WorkerMode,
     _checkpoint: tempfile::TempDir,
     checkpoint_path: PathBuf,
+    cartesian_axes: Option<&'static str>,
 ) {
     let prompt_cache = tempfile::tempdir().unwrap();
-    let (first_socket, second_socket, first_port, second_port) = reserve_two_ports();
+    let world_size = match cartesian_axes {
+        Some("tp-pp-ep") => 8,
+        Some(_) => 4,
+        None => 2,
+    };
+    let sockets = (0..world_size)
+        .map(|_| TcpListener::bind(("127.0.0.1", 0)).unwrap())
+        .collect::<Vec<_>>();
+    let hosts = sockets
+        .iter()
+        .map(|socket| vec![format!("127.0.0.1:{}", socket.local_addr().unwrap().port())])
+        .collect::<Vec<_>>();
     let ring = tempfile::tempdir().unwrap();
     let hostfile = ring.path().join("ring-hosts.json");
-    std::fs::write(
-        &hostfile,
-        format!("[[\"127.0.0.1:{first_port}\"],[\"127.0.0.1:{second_port}\"]]"),
-    )
-    .unwrap();
+    std::fs::write(&hostfile, serde_json::to_vec(&hosts).unwrap()).unwrap();
+    drop(sockets);
     let executable = std::env::current_exe().unwrap();
     let mut children = ChildGuard {
-        children: Vec::with_capacity(2),
+        children: Vec::with_capacity(world_size),
     };
-    let mut reservations = [Some(first_socket), Some(second_socket)];
-    for (rank, reservation) in reservations.iter_mut().enumerate() {
-        drop(reservation.take());
+    for rank in 0..world_size {
         let mut command = Command::new(&executable);
         command
             .args(["--exact", "pipeline_ring_worker", "--nocapture"])
@@ -2185,8 +2972,11 @@ fn run_ring_pipeline_processes(
             .env("MLX_RANK", rank.to_string())
             .env("MLX_HOSTFILE", &hostfile)
             .env_remove("MLX_RING_VERBOSE")
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+            .stdout(Stdio::piped());
+        command.stderr(Stdio::piped());
+        if let Some(axes) = cartesian_axes {
+            command.env(CARTESIAN_AXES, axes);
+        }
         if dense_stream {
             command.env(DENSE_STREAM, "1");
         }
@@ -2201,7 +2991,12 @@ fn run_ring_pipeline_processes(
         }
         children.children.push(command.spawn().unwrap());
     }
-    let deadline = Instant::now() + Duration::from_secs(45);
+    let deadline = Instant::now()
+        + Duration::from_secs(match world_size {
+            8 => 180,
+            4 => 90,
+            _ => 45,
+        });
     let mut timed_out = false;
     loop {
         let statuses = children
@@ -2232,9 +3027,12 @@ fn run_ring_pipeline_processes(
         .collect::<Vec<_>>();
     assert!(
         failures.is_empty() && !timed_out,
-        "two-process pipeline Ring test failed:\n{}",
+        "{world_size}-process pipeline Ring test failed:\n{}",
         if timed_out {
-            format!("timed out after 45 seconds\n\n{}", failures.join("\n\n"))
+            format!(
+                "timed out waiting for Ring workers\n\n{}",
+                failures.join("\n\n")
+            )
         } else {
             failures.join("\n\n")
         }

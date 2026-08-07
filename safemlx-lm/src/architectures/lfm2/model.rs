@@ -1066,6 +1066,40 @@ impl FeedForward {
             .forward_with_selection_bias(&flat, self.expert_bias.as_ref().as_ref(), stream)?;
         execute(&flat, &indices, &weights, stream)?.reshape(shape, stream)
     }
+
+    pub(crate) fn forward_expert_parallel(
+        &mut self,
+        x: &Array,
+        assignment: &crate::architectures::distributed::expert::ExpertAssignment,
+        group: &safemlx::distributed::Group,
+        statistics: &mut crate::architectures::distributed::expert::RoutingStatistics,
+        stream: &Stream,
+    ) -> Result<Array, Exception> {
+        if !self.is_moe {
+            return self.forward(x, stream);
+        }
+        let shape = x.shape();
+        let flat = x.reshape(&[-1, shape[2]], stream)?;
+        let router_started = std::time::Instant::now();
+        let (indices, weights) = self
+            .gate
+            .as_mut()
+            .expect("MoE gate")
+            .forward_with_selection_bias(&flat, self.expert_bias.as_ref().as_ref(), stream)?;
+        statistics.router_time += router_started.elapsed();
+        let returned = crate::architectures::distributed::expert::dispatch_replicated(
+            &flat,
+            &indices,
+            &weights,
+            assignment,
+            self.experts.as_mut().expect("MoE experts"),
+            group,
+            stream,
+        )
+        .map_err(|error| Exception::custom(error.to_string()))?;
+        statistics.accumulate(&returned.statistics);
+        returned.reduced_output.reshape(shape, stream)
+    }
 }
 
 impl Module<&Array> for FeedForward {
@@ -1370,9 +1404,24 @@ impl DecoderLayer {
         group: &safemlx::distributed::Group,
         stream: &Stream,
     ) -> Result<Array, Exception> {
+        let cache = cache.map(|cache| match cache {
+            LayerCache::Attention(cache) => OperatorCache::Attention(cache),
+            LayerCache::Conv(cache) => OperatorCache::Convolution(cache),
+        });
+        self.forward_tensor_parallel_with_operator_cache(x, mask, cache, group, stream)
+    }
+
+    pub(crate) fn forward_tensor_parallel_with_operator_cache(
+        &mut self,
+        x: &Array,
+        mask: Option<&Array>,
+        cache: Option<OperatorCache<'_>>,
+        group: &safemlx::distributed::Group,
+        stream: &Stream,
+    ) -> Result<Array, Exception> {
         let normalized = self.operator_norm.forward(x, stream)?;
         let operator = match (self.layer_policy.operator, cache) {
-            (OperatorPolicy::SelfAttention(_), Some(LayerCache::Attention(cache))) => {
+            (OperatorPolicy::SelfAttention(_), Some(OperatorCache::Attention(cache))) => {
                 let partial = self.self_attn.as_mut().expect("attention layer").forward(
                     AttentionInput {
                         x: &normalized,
@@ -1394,7 +1443,7 @@ impl DecoderLayer {
                 )?;
                 safemlx::distributed::all_sum(&partial, group, stream)?
             }
-            (OperatorPolicy::CausalConvolution, Some(LayerCache::Conv(cache))) => self
+            (OperatorPolicy::CausalConvolution, Some(OperatorCache::Convolution(cache))) => self
                 .conv
                 .as_mut()
                 .expect("conv layer")
@@ -1428,9 +1477,27 @@ impl DecoderLayer {
     where
         F: FnOnce(&Array, &Array, &Array, &Stream) -> Result<Array, Exception>,
     {
+        let cache = cache.map(|cache| match cache {
+            LayerCache::Attention(cache) => OperatorCache::Attention(cache),
+            LayerCache::Conv(cache) => OperatorCache::Convolution(cache),
+        });
+        self.forward_with_operator_cache_and_expert_executor(x, mask, cache, stream, execute)
+    }
+
+    pub(crate) fn forward_with_operator_cache_and_expert_executor<F>(
+        &mut self,
+        x: &Array,
+        mask: Option<&Array>,
+        cache: Option<OperatorCache<'_>>,
+        stream: &Stream,
+        execute: F,
+    ) -> Result<Array, Exception>
+    where
+        F: FnOnce(&Array, &Array, &Array, &Stream) -> Result<Array, Exception>,
+    {
         let normalized = self.operator_norm.forward(x, stream)?;
         let operator = match (self.layer_policy.operator, cache) {
-            (OperatorPolicy::SelfAttention(_), Some(LayerCache::Attention(cache))) => {
+            (OperatorPolicy::SelfAttention(_), Some(OperatorCache::Attention(cache))) => {
                 self.self_attn.as_mut().expect("attention layer").forward(
                     AttentionInput {
                         x: &normalized,
@@ -1450,7 +1517,7 @@ impl DecoderLayer {
                     stream,
                 )?
             }
-            (OperatorPolicy::CausalConvolution, Some(LayerCache::Conv(cache))) => self
+            (OperatorPolicy::CausalConvolution, Some(OperatorCache::Convolution(cache))) => self
                 .conv
                 .as_mut()
                 .expect("conv layer")
@@ -1472,6 +1539,137 @@ impl DecoderLayer {
             self.feed_forward
                 .forward_with_expert_executor(&normalized, stream, execute)?;
         h.add(feed_forward, stream)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn forward_expert_parallel_with_operator_cache(
+        &mut self,
+        x: &Array,
+        mask: Option<&Array>,
+        cache: Option<OperatorCache<'_>>,
+        assignment: &crate::architectures::distributed::expert::ExpertAssignment,
+        group: &safemlx::distributed::Group,
+        statistics: &mut crate::architectures::distributed::expert::RoutingStatistics,
+        stream: &Stream,
+    ) -> Result<Array, Exception> {
+        let normalized = self.operator_norm.forward(x, stream)?;
+        let operator = match (self.layer_policy.operator, cache) {
+            (OperatorPolicy::SelfAttention(_), Some(OperatorCache::Attention(cache))) => {
+                self.self_attn.as_mut().expect("attention layer").forward(
+                    AttentionInput {
+                        x: &normalized,
+                        mask,
+                        cache: Some(cache),
+                    },
+                    stream,
+                )?
+            }
+            (OperatorPolicy::SelfAttention(_), None) => {
+                self.self_attn.as_mut().expect("attention layer").forward(
+                    AttentionInput {
+                        x: &normalized,
+                        mask,
+                        cache: None,
+                    },
+                    stream,
+                )?
+            }
+            (OperatorPolicy::CausalConvolution, Some(OperatorCache::Convolution(cache))) => self
+                .conv
+                .as_mut()
+                .expect("conv layer")
+                .forward(&normalized, Some(cache), stream)?,
+            (OperatorPolicy::CausalConvolution, None) => self
+                .conv
+                .as_mut()
+                .expect("conv layer")
+                .forward(&normalized, None, stream)?,
+            (policy, Some(_)) => {
+                return Err(Exception::custom(format!(
+                    "LFM2 expert-parallel cache kind does not match layer policy {policy:?}"
+                )))
+            }
+        };
+        let hidden = x.add(operator, stream)?;
+        let normalized = self.ffn_norm.forward(&hidden, stream)?;
+        let feed_forward = self.feed_forward.forward_expert_parallel(
+            &normalized,
+            assignment,
+            group,
+            statistics,
+            stream,
+        )?;
+        hidden.add(feed_forward, stream)
+    }
+
+    /// Executes TP-sharded hybrid operators and dense feed-forward blocks while
+    /// delegating sparse routed experts to an EP-scoped executor.
+    pub(crate) fn forward_tensor_with_expert_executor<F>(
+        &mut self,
+        x: &Array,
+        mask: Option<&Array>,
+        cache: Option<&mut LayerCache>,
+        group: &safemlx::distributed::Group,
+        stream: &Stream,
+        execute: F,
+    ) -> Result<Array, Exception>
+    where
+        F: FnOnce(&Array, &Array, &Array, &Stream) -> Result<Array, Exception>,
+    {
+        let cache = cache.map(|cache| match cache {
+            LayerCache::Attention(cache) => OperatorCache::Attention(cache),
+            LayerCache::Conv(cache) => OperatorCache::Convolution(cache),
+        });
+        let normalized = self.operator_norm.forward(x, stream)?;
+        let operator = match (self.layer_policy.operator, cache) {
+            (OperatorPolicy::SelfAttention(_), Some(OperatorCache::Attention(cache))) => {
+                let partial = self.self_attn.as_mut().expect("attention layer").forward(
+                    AttentionInput {
+                        x: &normalized,
+                        mask,
+                        cache: Some(cache),
+                    },
+                    stream,
+                )?;
+                safemlx::distributed::all_sum(&partial, group, stream)?
+            }
+            (OperatorPolicy::SelfAttention(_), None) => {
+                let partial = self.self_attn.as_mut().expect("attention layer").forward(
+                    AttentionInput {
+                        x: &normalized,
+                        mask,
+                        cache: None,
+                    },
+                    stream,
+                )?;
+                safemlx::distributed::all_sum(&partial, group, stream)?
+            }
+            (OperatorPolicy::CausalConvolution, Some(OperatorCache::Convolution(cache))) => self
+                .conv
+                .as_mut()
+                .expect("conv layer")
+                .forward_tensor_parallel(&normalized, Some(cache), group, stream)?,
+            (OperatorPolicy::CausalConvolution, None) => self
+                .conv
+                .as_mut()
+                .expect("conv layer")
+                .forward_tensor_parallel(&normalized, None, group, stream)?,
+            (policy, Some(_)) => {
+                return Err(Exception::custom(format!(
+                    "LFM2 tensor/expert cache kind does not match layer policy {policy:?}"
+                )))
+            }
+        };
+        let hidden = x.add(operator, stream)?;
+        let normalized = self.ffn_norm.forward(&hidden, stream)?;
+        let feed_forward = if self.feed_forward.is_moe {
+            self.feed_forward
+                .forward_with_expert_executor(&normalized, stream, execute)?
+        } else {
+            let partial = self.feed_forward.forward(&normalized, stream)?;
+            safemlx::distributed::all_sum(&partial, group, stream)?
+        };
+        hidden.add(feed_forward, stream)
     }
 }
 

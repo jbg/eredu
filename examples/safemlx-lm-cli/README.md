@@ -268,8 +268,9 @@ cargo run --release -p safemlx-lm-cli -- \
 ```
 
 For GGUF, sparse expert caching is available for DeepSeek2, LFM2-MoE,
-Nemotron-H-MoE, Qwen3-MoE, Qwen3.5-MoE, and MoE Qwen3-Next. Other GGUF
-families still support the host-layerwise and dense-stream modes listed above.
+Nemotron-H-MoE, Qwen3-MoE, Qwen3-VL-MoE with its sibling mmproj,
+Qwen3.5-MoE, and MoE Qwen3-Next. Other GGUF families still support the
+host-layerwise and dense-stream modes listed above.
 
 The ordinary device and host budgets govern non-expert layerwise weights; the
 `--expert-cache-*` budgets govern hot and warm expert copies. A zero expert host

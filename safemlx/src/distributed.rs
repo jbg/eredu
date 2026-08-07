@@ -22,8 +22,9 @@ use std::{ffi::c_char, marker::PhantomData, rc::Rc, str::FromStr};
 
 use crate::{
     error::{Exception, Result},
-    ops::indexing::TryIndexOp,
-    ops::{concatenate_axis, zeros_dtype},
+    ops::indexing::{TryIndexMutOp, TryIndexOp},
+    ops::{concatenate_axis, stack_axis, zeros_dtype},
+    transforms::eval,
     utils::{guard::Guarded, runtime_lock, SUCCESS},
     Array, Device, DeviceType, Dtype, Stream,
 };
@@ -112,22 +113,64 @@ impl std::fmt::Display for Backend {
     }
 }
 
-/// An owned MLX distributed group.
+/// An owned MLX distributed group or a logical view of an owned world group.
 ///
-/// The group frees its native handle on drop. It is intentionally neither
-/// `Clone`, `Send`, nor `Sync`: the C API exposes no group-retain operation and
-/// not every communication backend documents cross-thread group access.
+/// The final related group frees the native handle on drop. The type is
+/// intentionally neither `Clone`, `Send`, nor `Sync`: not every communication
+/// backend documents cross-thread group access.
 pub struct Group {
-    pub(crate) c_group: safemlx_sys::mlx_distributed_group,
+    native: Rc<NativeGroup>,
+    logical: Option<LogicalSubgroup>,
     _not_send_or_sync: PhantomData<Rc<()>>,
+}
+
+struct NativeGroup {
+    c_group: safemlx_sys::mlx_distributed_group,
+}
+
+#[derive(Debug)]
+struct LogicalSubgroup {
+    global_ranks: Vec<usize>,
+    rank: usize,
+    routes: Option<Vec<LogicalRoute>>,
+}
+
+#[derive(Debug)]
+struct LogicalRoute {
+    source_rank: usize,
+    exchanges: Vec<Option<usize>>,
+}
+
+impl Drop for NativeGroup {
+    fn drop(&mut self) {
+        let _guard = runtime_lock::enter();
+        // SAFETY: this is the sole owner of the native group handle.
+        let status = unsafe { safemlx_sys::mlx_distributed_group_free(self.c_group) };
+        debug_assert_eq!(status, SUCCESS);
+    }
 }
 
 impl Group {
     pub(crate) fn from_owned_ptr(c_group: safemlx_sys::mlx_distributed_group) -> Self {
         Self {
-            c_group,
+            native: Rc::new(NativeGroup { c_group }),
+            logical: None,
             _not_send_or_sync: PhantomData,
         }
+    }
+
+    fn native_rank(&self) -> usize {
+        let _guard = runtime_lock::enter();
+        // SAFETY: `self.native` owns a successfully initialized, non-empty group.
+        let rank = unsafe { safemlx_sys::mlx_distributed_group_rank(self.native.c_group) };
+        usize::try_from(rank).expect("MLX returned a negative distributed rank")
+    }
+
+    fn native_size(&self) -> usize {
+        let _guard = runtime_lock::enter();
+        // SAFETY: `self.native` owns a successfully initialized, non-empty group.
+        let size = unsafe { safemlx_sys::mlx_distributed_group_size(self.native.c_group) };
+        usize::try_from(size).expect("MLX returned a negative distributed group size")
     }
 
     /// Initialize and own the process's group for `backend`.
@@ -141,18 +184,16 @@ impl Group {
 
     /// Return this process's zero-based rank within the group.
     pub fn rank(&self) -> usize {
-        let _guard = runtime_lock::enter();
-        // SAFETY: `self` owns a successfully initialized, non-empty group.
-        let rank = unsafe { safemlx_sys::mlx_distributed_group_rank(self.c_group) };
-        usize::try_from(rank).expect("MLX returned a negative distributed rank")
+        self.logical
+            .as_ref()
+            .map_or_else(|| self.native_rank(), |logical| logical.rank)
     }
 
     /// Return the number of processes in the group.
     pub fn size(&self) -> usize {
-        let _guard = runtime_lock::enter();
-        // SAFETY: `self` owns a successfully initialized, non-empty group.
-        let size = unsafe { safemlx_sys::mlx_distributed_group_size(self.c_group) };
-        usize::try_from(size).expect("MLX returned a negative distributed group size")
+        self.logical
+            .as_ref()
+            .map_or_else(|| self.native_size(), |logical| logical.global_ranks.len())
     }
 
     /// Split the group by `color`, optionally ordering new ranks by `key`.
@@ -161,6 +202,11 @@ impl Group {
     /// support varies: MLX 0.32 supports splitting with MPI and NCCL, while its
     /// singleton, Ring, and JACCL groups return an error.
     pub fn split(&self, color: i32, key: Option<i32>) -> Result<Self> {
+        if self.logical.is_some() {
+            return Err(Exception::custom(
+                "backend-native splitting of a logical subgroup is unsupported",
+            ));
+        }
         let _guard = runtime_lock::enter();
         Self::try_from_op(|res| {
             // SAFETY: `res` is an initialized output guard and `self.c_group`
@@ -168,21 +214,115 @@ impl Group {
             unsafe {
                 safemlx_sys::mlx_distributed_group_split(
                     res,
-                    self.c_group,
+                    self.native.c_group,
                     color,
                     key.unwrap_or(-1),
                 )
             }
         })
     }
-}
 
-impl Drop for Group {
-    fn drop(&mut self) {
-        let _guard = runtime_lock::enter();
-        // SAFETY: this is the sole Rust owner of the native group handle.
-        let status = unsafe { safemlx_sys::mlx_distributed_group_free(self.c_group) };
-        debug_assert_eq!(status, SUCCESS);
+    /// Creates a logical subgroup over the same native world group.
+    ///
+    /// Logical subgroups are the correctness fallback for backends such as
+    /// Ring and JACCL which do not implement native group splitting. Two-rank
+    /// neighbor or antipodal groups use ordered peer exchange. Callers with an
+    /// authoritative topology can instead install neighbor routes through
+    /// [`Self::logical_subgroup_with_routes`] so arbitrary-degree independent
+    /// subgroups progress without world-wide collective participation. Other
+    /// layouts pack values by subgroup identity into native-world collectives.
+    pub fn logical_subgroup(&self, global_ranks: &[usize]) -> Result<Self> {
+        if self.logical.is_some() {
+            return Err(Exception::custom(
+                "logical subgroups must be derived from a native world group",
+            ));
+        }
+        if global_ranks.is_empty() {
+            return Err(Exception::custom("logical subgroup cannot be empty"));
+        }
+        let native_size = self.native_size();
+        let mut seen = vec![false; native_size];
+        for &rank in global_ranks {
+            if rank >= native_size {
+                return Err(Exception::custom(format!(
+                    "logical subgroup rank {rank} is outside native world size {native_size}"
+                )));
+            }
+            if std::mem::replace(&mut seen[rank], true) {
+                return Err(Exception::custom(format!(
+                    "logical subgroup repeats global rank {rank}"
+                )));
+            }
+        }
+        let native_rank = self.native_rank();
+        let rank = global_ranks
+            .iter()
+            .position(|rank| *rank == native_rank)
+            .ok_or_else(|| {
+                Exception::custom(format!(
+                    "native rank {native_rank} is not a member of logical subgroup {global_ranks:?}"
+                ))
+            })?;
+        Ok(Self {
+            native: Rc::clone(&self.native),
+            logical: Some(LogicalSubgroup {
+                global_ranks: global_ranks.to_vec(),
+                rank,
+                routes: None,
+            }),
+            _not_send_or_sync: PhantomData,
+        })
+    }
+
+    /// Creates a logical subgroup with topology-planned neighbor routes.
+    ///
+    /// Each route identifies the subgroup rank whose original value arrives
+    /// locally after the listed rounds. A round either exchanges the current
+    /// value with one native-world neighbor or remains idle. This lets Ring
+    /// execute independent stage-local collectives without requiring every
+    /// world rank to enter a packed fallback collective.
+    pub fn logical_subgroup_with_routes(
+        &self,
+        global_ranks: &[usize],
+        routes: Vec<(usize, Vec<Option<usize>>)>,
+    ) -> Result<Self> {
+        let mut group = self.logical_subgroup(global_ranks)?;
+        let native_rank = group.native_rank();
+        let native_size = group.native_size();
+        let mut seen = vec![false; global_ranks.len()];
+        let routes = routes
+            .into_iter()
+            .map(|(source_rank, exchanges)| {
+                if source_rank >= global_ranks.len() || std::mem::replace(&mut seen[source_rank], true)
+                {
+                    return Err(Exception::custom(format!(
+                        "logical route source rank {source_rank} is missing or repeated for subgroup size {}",
+                        global_ranks.len()
+                    )));
+                }
+                for peer in exchanges.iter().flatten() {
+                    if *peer >= native_size
+                        || !((native_rank + 1) % native_size == *peer
+                            || (*peer + 1) % native_size == native_rank)
+                    {
+                        return Err(Exception::custom(format!(
+                            "logical route from native rank {native_rank} uses non-neighbor peer {peer}"
+                        )));
+                    }
+                }
+                Ok(LogicalRoute {
+                    source_rank,
+                    exchanges,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        if seen.iter().any(|present| !present) {
+            return Err(Exception::custom(
+                "logical routes do not cover every subgroup source rank",
+            ));
+        }
+        group.logical.as_mut().expect("logical subgroup").routes = Some(routes);
+        Ok(group)
     }
 }
 
@@ -233,12 +373,216 @@ fn collective(
     Array::try_from_op(|res| {
         // SAFETY: all borrowed handles remain alive for the call and `res` is
         // an owned array output guard.
-        unsafe { op(res, input.as_ptr(), group.c_group, stream.as_ptr()) }
+        unsafe { op(res, input.as_ptr(), group.native.c_group, stream.as_ptr()) }
     })
+}
+
+fn pack_logical_value(
+    input: &Array,
+    slot: usize,
+    native_size: usize,
+    stream: &Stream,
+) -> Result<Array> {
+    let mut shape = Vec::with_capacity(input.ndim() + 1);
+    shape.push(
+        i32::try_from(native_size)
+            .map_err(|_| Exception::custom("native world size does not fit in i32"))?,
+    );
+    shape.extend_from_slice(input.shape());
+    let mut packed = zeros_dtype(&shape, input.dtype(), stream)?;
+    packed.try_index_mut_device(
+        i32::try_from(slot).map_err(|_| Exception::custom("logical slot does not fit in i32"))?,
+        input,
+        stream,
+    )?;
+    Ok(packed)
+}
+
+fn logical_pair_peer(group: &Group) -> Option<usize> {
+    let logical = group.logical.as_ref()?;
+    if logical.global_ranks.len() != 2 {
+        return None;
+    }
+    Some(logical.global_ranks[1 - logical.rank])
+}
+
+fn native_send(input: &Array, destination: usize, group: &Group, stream: &Stream) -> Result<Array> {
+    let destination = i32::try_from(destination)
+        .map_err(|_| Exception::custom("destination rank does not fit in i32"))?;
+    let _guard = runtime_lock::enter();
+    Array::try_from_op(|res| {
+        // SAFETY: all input handles remain alive and `destination` is a native
+        // group rank validated by the caller.
+        unsafe {
+            safemlx_sys::mlx_distributed_send(
+                res,
+                input.as_ptr(),
+                destination,
+                group.native.c_group,
+                stream.as_ptr(),
+            )
+        }
+    })
+}
+
+fn native_recv_like(like: &Array, source: usize, group: &Group, stream: &Stream) -> Result<Array> {
+    let source =
+        i32::try_from(source).map_err(|_| Exception::custom("source rank does not fit in i32"))?;
+    let _guard = runtime_lock::enter();
+    Array::try_from_op(|res| {
+        // SAFETY: all borrowed handles remain alive and `source` is a native
+        // group rank validated by the caller.
+        unsafe {
+            safemlx_sys::mlx_distributed_recv_like(
+                res,
+                like.as_ptr(),
+                source,
+                group.native.c_group,
+                stream.as_ptr(),
+            )
+        }
+    })
+}
+
+fn logical_direct_exchange(input: &Array, group: &Group, stream: &Stream) -> Result<Option<Array>> {
+    let Some(peer) = logical_pair_peer(group) else {
+        return Ok(None);
+    };
+    let native_rank = group.native_rank();
+    let native_size = group.native_size();
+    let direct = (native_rank + 1) % native_size == peer || (peer + 1) % native_size == native_rank;
+    let rounds = if direct {
+        1
+    } else if native_size.is_multiple_of(2) && (native_rank + native_size / 2) % native_size == peer
+    {
+        native_size / 2
+    } else {
+        return Ok(None);
+    };
+    let zero = zeros_dtype(&[], input.dtype(), stream)?;
+    let mut exchanged = input.clone();
+    for _ in 0..rounds {
+        let (destination, source) = if direct {
+            (peer, peer)
+        } else {
+            (
+                (native_rank + 1) % native_size,
+                (native_rank + native_size - 1) % native_size,
+            )
+        };
+        let sent = native_send(&exchanged, destination, group, stream)?;
+        let received = native_recv_like(&exchanged, source, group, stream)?;
+        // Preserve the lazy send as an explicit dependency of the returned
+        // value. Without it, evaluating only the receive side can leave both
+        // peers waiting.
+        exchanged = received.add(sent.multiply(&zero, stream)?, stream)?;
+        eval([&exchanged])?;
+        stream.synchronize()?;
+    }
+    Ok(Some(exchanged))
+}
+
+fn logical_routed_values(
+    input: &Array,
+    group: &Group,
+    stream: &Stream,
+) -> Result<Option<Vec<(usize, Array)>>> {
+    let Some(routes) = group
+        .logical
+        .as_ref()
+        .and_then(|logical| logical.routes.as_ref())
+    else {
+        return Ok(None);
+    };
+    let zero = zeros_dtype(&[], input.dtype(), stream)?;
+    let mut values = Vec::with_capacity(routes.len());
+    for route in routes {
+        let mut routed = input.clone();
+        for peer in &route.exchanges {
+            let Some(peer) = peer else {
+                continue;
+            };
+            let sent = native_send(&routed, *peer, group, stream)?;
+            let received = native_recv_like(&routed, *peer, group, stream)?;
+            routed = received.add(sent.multiply(&zero, stream)?, stream)?;
+            eval([&routed])?;
+            stream.synchronize()?;
+        }
+        values.push((route.source_rank, routed));
+    }
+    Ok(Some(values))
+}
+
+fn logical_all_sum(input: &Array, group: &Group, stream: &Stream) -> Result<Array> {
+    if let Some(values) = logical_routed_values(input, group, stream)? {
+        let mut values = values.into_iter();
+        let (_, mut reduced) = values
+            .next()
+            .ok_or_else(|| Exception::custom("logical routes cannot be empty"))?;
+        for (_, value) in values {
+            reduced = reduced.add(value, stream)?;
+        }
+        return Ok(reduced);
+    }
+    if let Some(peer) = logical_direct_exchange(input, group, stream)? {
+        return input.add(peer, stream);
+    }
+    let logical = group
+        .logical
+        .as_ref()
+        .expect("logical collective requires logical membership");
+    let representative = logical.global_ranks[0];
+    let packed = pack_logical_value(input, representative, group.native_size(), stream)?;
+    let reduced = collective(&packed, group, stream, safemlx_sys::mlx_distributed_all_sum)?;
+    reduced.try_index_device(
+        i32::try_from(representative)
+            .map_err(|_| Exception::custom("logical representative does not fit in i32"))?,
+        stream,
+    )
+}
+
+fn logical_all_gather_stacked(input: &Array, group: &Group, stream: &Stream) -> Result<Array> {
+    if let Some(mut values) = logical_routed_values(input, group, stream)? {
+        values.sort_unstable_by_key(|(source_rank, _)| *source_rank);
+        let values = values
+            .into_iter()
+            .map(|(_, value)| value)
+            .collect::<Vec<_>>();
+        return stack_axis(&values, 0, stream);
+    }
+    if let Some(peer) = logical_direct_exchange(input, group, stream)? {
+        let values = if group.rank() == 0 {
+            [input.clone(), peer]
+        } else {
+            [peer, input.clone()]
+        };
+        return stack_axis(&values, 0, stream);
+    }
+    let logical = group
+        .logical
+        .as_ref()
+        .expect("logical collective requires logical membership");
+    let native_rank = group.native_rank();
+    let packed = pack_logical_value(input, native_rank, group.native_size(), stream)?;
+    let gathered = collective(&packed, group, stream, safemlx_sys::mlx_distributed_all_sum)?;
+    let indices = logical
+        .global_ranks
+        .iter()
+        .map(|rank| {
+            i32::try_from(*rank)
+                .map_err(|_| Exception::custom("logical member rank does not fit in i32"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let length = i32::try_from(indices.len())
+        .map_err(|_| Exception::custom("logical subgroup size does not fit in i32"))?;
+    gathered.take_axis(Array::from_slice(&indices, &[length]), 0, stream)
 }
 
 /// Sum `input` element-wise across `group` on `stream`.
 pub fn all_sum(input: &Array, group: &Group, stream: impl AsRef<Stream>) -> Result<Array> {
+    if group.logical.is_some() {
+        return logical_all_sum(input, group, stream.as_ref());
+    }
     collective(
         input,
         group,
@@ -249,6 +593,13 @@ pub fn all_sum(input: &Array, group: &Group, stream: impl AsRef<Stream>) -> Resu
 
 /// Take the element-wise maximum of `input` across `group` on `stream`.
 pub fn all_max(input: &Array, group: &Group, stream: impl AsRef<Stream>) -> Result<Array> {
+    if group.logical.is_some() {
+        return logical_all_gather_stacked(input, group, stream.as_ref())?.max_axis(
+            0,
+            Some(false),
+            stream,
+        );
+    }
     collective(
         input,
         group,
@@ -259,6 +610,13 @@ pub fn all_max(input: &Array, group: &Group, stream: impl AsRef<Stream>) -> Resu
 
 /// Take the element-wise minimum of `input` across `group` on `stream`.
 pub fn all_min(input: &Array, group: &Group, stream: impl AsRef<Stream>) -> Result<Array> {
+    if group.logical.is_some() {
+        return logical_all_gather_stacked(input, group, stream.as_ref())?.min_axis(
+            0,
+            Some(false),
+            stream,
+        );
+    }
     collective(
         input,
         group,
@@ -279,6 +637,20 @@ pub fn all_gather(input: &Array, group: &Group, stream: impl AsRef<Stream>) -> R
                 Exception::custom("all-gather output's first dimension exceeds i32")
             })?;
         }
+    }
+    if group.logical.is_some() {
+        let stacked = logical_all_gather_stacked(input, group, stream.as_ref())?;
+        if input.ndim() == 0 {
+            return Ok(stacked);
+        }
+        let mut shape = input.shape().to_vec();
+        shape[0] = shape[0]
+            .checked_mul(
+                i32::try_from(group.size())
+                    .map_err(|_| Exception::custom("logical group size does not fit in i32"))?,
+            )
+            .ok_or_else(|| Exception::custom("logical all-gather shape exceeds i32"))?;
+        return stacked.reshape(&shape, stream);
     }
     collective(
         input,
@@ -441,6 +813,19 @@ pub fn sum_scatter(input: &Array, group: &Group, stream: impl AsRef<Stream>) -> 
             )));
         }
     }
+    if group.logical.is_some() {
+        let reduced = logical_all_sum(input, group, stream.as_ref())?;
+        return reduced
+            .split(
+                i32::try_from(group_size)
+                    .map_err(|_| Exception::custom("logical group size does not fit in i32"))?,
+                Some(0),
+                stream,
+            )?
+            .into_iter()
+            .nth(group.rank())
+            .ok_or_else(|| Exception::custom("logical sum-scatter rank is missing"));
+    }
     collective(
         input,
         group,
@@ -476,6 +861,23 @@ pub fn send(
 ) -> Result<Array> {
     let destination = checked_peer(destination, group, "destination")?;
     let stream = stream.as_ref();
+    if let Some(logical) = &group.logical {
+        if let Some(exchanged) = logical_direct_exchange(input, group, stream)? {
+            return Ok(exchanged);
+        }
+        let destination =
+            usize::try_from(destination).expect("checked non-negative logical destination rank");
+        let _destination_global = logical.global_ranks[destination];
+        let source_global = logical.global_ranks[logical.rank];
+        let packed = pack_logical_value(input, source_global, group.native_size(), stream)?;
+        let exchanged = collective(&packed, group, stream, safemlx_sys::mlx_distributed_all_sum)?;
+        let sent = exchanged.try_index_device(
+            i32::try_from(source_global)
+                .map_err(|_| Exception::custom("logical source rank does not fit in i32"))?,
+            stream,
+        )?;
+        return Ok(sent);
+    }
     let _guard = runtime_lock::enter();
     Array::try_from_op(|res| {
         // SAFETY: all input handles remain alive and `res` is an owned output
@@ -485,7 +887,7 @@ pub fn send(
                 res,
                 input.as_ptr(),
                 destination,
-                group.c_group,
+                group.native.c_group,
                 stream.as_ptr(),
             )
         }
@@ -507,6 +909,21 @@ pub fn recv(
     }
     let source = checked_peer(source, group, "source")?;
     let stream = stream.as_ref();
+    if let Some(logical) = &group.logical {
+        let empty = zeros_dtype(shape, dtype, stream)?;
+        if let Some(exchanged) = logical_direct_exchange(&empty, group, stream)? {
+            return Ok(exchanged);
+        }
+        let source = usize::try_from(source).expect("checked non-negative logical source rank");
+        let source_global = logical.global_ranks[source];
+        let packed = pack_logical_value(&empty, source_global, group.native_size(), stream)?;
+        let exchanged = collective(&packed, group, stream, safemlx_sys::mlx_distributed_all_sum)?;
+        return exchanged.try_index_device(
+            i32::try_from(source_global)
+                .map_err(|_| Exception::custom("logical source rank does not fit in i32"))?,
+            stream,
+        );
+    }
     let _guard = runtime_lock::enter();
     Array::try_from_op(|res| {
         // SAFETY: `shape` and all borrowed handles remain alive for this call;
@@ -518,7 +935,7 @@ pub fn recv(
                 shape.len(),
                 dtype.into(),
                 source,
-                group.c_group,
+                group.native.c_group,
                 stream.as_ptr(),
             )
         }
@@ -534,6 +951,21 @@ pub fn recv_like(
 ) -> Result<Array> {
     let source = checked_peer(source, group, "source")?;
     let stream = stream.as_ref();
+    if let Some(logical) = &group.logical {
+        let empty = zeros_dtype(like.shape(), like.dtype(), stream)?;
+        if let Some(exchanged) = logical_direct_exchange(&empty, group, stream)? {
+            return Ok(exchanged);
+        }
+        let source = usize::try_from(source).expect("checked non-negative logical source rank");
+        let source_global = logical.global_ranks[source];
+        let packed = pack_logical_value(&empty, source_global, group.native_size(), stream)?;
+        let exchanged = collective(&packed, group, stream, safemlx_sys::mlx_distributed_all_sum)?;
+        return exchanged.try_index_device(
+            i32::try_from(source_global)
+                .map_err(|_| Exception::custom("logical source rank does not fit in i32"))?,
+            stream,
+        );
+    }
     let _guard = runtime_lock::enter();
     Array::try_from_op(|res| {
         // SAFETY: all borrowed handles remain alive and `source` was checked.
@@ -542,7 +974,7 @@ pub fn recv_like(
                 res,
                 like.as_ptr(),
                 source,
-                group.c_group,
+                group.native.c_group,
                 stream.as_ptr(),
             )
         }

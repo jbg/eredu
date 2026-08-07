@@ -587,6 +587,49 @@ impl QwenHybridLayerwiseModel {
         )
     }
 
+    /// Runs TP-sharded hybrid operators while routed experts execute in the
+    /// matching EP subgroup.
+    pub(crate) fn forward_tensor_expert_parallel<F>(
+        &mut self,
+        inputs: &Array,
+        cache: &mut Cache,
+        tensor_group: &safemlx::distributed::Group,
+        mut execute: F,
+        stream: &Stream,
+    ) -> Result<Array, Error>
+    where
+        F: FnMut(usize, &Array, &Array, &Array, &Stream) -> Result<Array, Exception>,
+    {
+        self.execution.forward_tensor_parallel_with_layer_executor(
+            QwenHybridInput::Decode(inputs),
+            cache,
+            tensor_group,
+            stream,
+            |_adapter, _group, index, layer, hidden, cache, context, execution| match layer {
+                QwenHybridLayer::Text(block) => {
+                    let tp_group = execution.group().ok_or_else(|| {
+                        Error::Parallel(
+                            "Qwen hybrid TP+EP execution requires an active TP group".into(),
+                        )
+                    })?;
+                    Ok(block.forward_tensor_with_expert_executor(
+                        BlockInput {
+                            x: hidden,
+                            mask: context.mask.as_ref(),
+                            cache: Some(&mut cache.layers[index]),
+                        },
+                        tp_group,
+                        execution.stream(),
+                        |hidden, ids, weights, stream| execute(index, hidden, ids, weights, stream),
+                    )?)
+                }
+                QwenHybridLayer::Vision(_) => Err(Error::Parallel(
+                    "token-only Qwen hybrid TP+EP received a vision unit".into(),
+                )),
+            },
+        )
+    }
+
     /// Runs streamed text layers while delegating routed experts to a caller.
     pub(crate) fn forward_with_expert_executor<F>(
         &mut self,
@@ -1198,7 +1241,7 @@ pub fn load_qwen3_next_sparse_expert_cache_model(
 pub fn load_qwen3_next_sparse_expert_cache_model_with_dense_layers(
     model_dir: impl AsRef<Path>,
     options: ExpertCacheLoadOptions,
-    non_expert: crate::runtime::residency::dense_stream::DenseDiskStreamLoadOptions,
+    non_expert: impl Into<LayerExecutionLoadOptions>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<QwenHybridLayerwiseModel, Error> {
@@ -1344,7 +1387,7 @@ pub(crate) fn load_qwen_hybrid_sparse_ep_base_with_store(
     store: Arc<dyn WeightStore + Send + Sync>,
     args: ModelArgs,
     is_qwen3_next: bool,
-    non_expert: crate::runtime::residency::dense_stream::DenseDiskStreamLoadOptions,
+    non_expert: impl Into<LayerExecutionLoadOptions>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<QwenHybridLayerwiseModel, Error> {
@@ -1356,6 +1399,34 @@ pub(crate) fn load_qwen_hybrid_sparse_ep_base_with_store(
     let mut adapter = QwenHybridLayerwiseAdapter::new(args, family, None, None, None, stream)?;
     adapter.sparse_expert_cache = true;
     let execution = load_layerwise_model(store, adapter, non_expert, stream, weights_stream)?;
+    Ok(QwenHybridLayerwiseModel { execution })
+}
+
+/// Builds the TP-sharded nonexpert base used by combined Qwen hybrid TP+EP.
+pub(crate) fn load_qwen_hybrid_sparse_tp_ep_base_with_store(
+    store: Arc<dyn WeightStore + Send + Sync>,
+    args: ModelArgs,
+    is_qwen3_next: bool,
+    non_expert: impl Into<LayerExecutionLoadOptions>,
+    build: crate::runtime::distributed::parallel::ParallelBuildContext,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<QwenHybridLayerwiseModel, Error> {
+    let family = if is_qwen3_next {
+        QwenHybridFamily::Qwen3Next
+    } else {
+        QwenHybridFamily::Qwen35
+    };
+    let mut adapter = QwenHybridLayerwiseAdapter::new(args, family, None, None, None, stream)?;
+    adapter.sparse_expert_cache = true;
+    let execution = load_tensor_parallel_layerwise_model(
+        store,
+        adapter,
+        non_expert,
+        build,
+        stream,
+        weights_stream,
+    )?;
     Ok(QwenHybridLayerwiseModel { execution })
 }
 
@@ -1498,6 +1569,21 @@ impl QwenHybridLayerwiseAdapter {
     /// Returns normalized text-model arguments.
     pub const fn args(&self) -> &ModelArgs {
         &self.args
+    }
+
+    /// Configures rank-local hybrid operator geometry for a Cartesian stage.
+    pub(crate) fn configure_cartesian_layout(
+        &mut self,
+        build: crate::runtime::distributed::parallel::ParallelBuildContext,
+        layout: &crate::runtime::distributed::parallel::LocalModelLayout,
+        stream: &Stream,
+    ) -> Result<(), Error> {
+        self.configure_parallel_static(build, layout, stream)
+    }
+
+    /// Returns configured rank-local attention, recurrent, and MLP geometry.
+    pub(crate) fn parallel_geometry(&self) -> Option<&[resident::ParallelLayerGeometry]> {
+        self.parallel_geometry.as_deref()
     }
 
     fn execution_group_name(&self, group: usize) -> Result<&'static str, Error> {
@@ -2893,6 +2979,54 @@ impl ArchitectureAdapter for QwenHybridLayerwiseAdapter {
             )?)))
         }
     }
+
+    fn new_expert_parallel_layer(
+        &self,
+        group: usize,
+        index: usize,
+        assignment: &crate::runtime::distributed::expert::ExpertAssignment,
+        stream: &Stream,
+    ) -> Result<Self::Layer, Error> {
+        let mut layer = self.new_layer(group, index, stream)?;
+        let QwenHybridLayer::Text(block) = &mut layer else {
+            return Err(Error::Parallel(
+                "Qwen hybrid expert ownership applies only to text decoder layers".into(),
+            ));
+        };
+        let resident::FeedForward::Moe(moe) = &mut block.mlp else {
+            return Err(Error::Parallel(
+                "Qwen hybrid PP+EP requires routed MoE decoder layers".into(),
+            ));
+        };
+        let mut local_args = self.args.clone();
+        local_args.num_experts = i32::try_from(assignment.local_expert_count())
+            .map_err(|_| Error::Parallel("local Qwen hybrid expert count exceeds i32".into()))?;
+        moe.experts = Experts::new(&local_args, index, stream)?;
+        Ok(layer)
+    }
+
+    fn expert_parallel_assignment(
+        &self,
+        topology: crate::runtime::distributed::topology::ParallelTopology,
+    ) -> Result<Option<crate::runtime::distributed::expert::ExpertAssignment>, Error> {
+        if topology.expert_parallel_size == 1 {
+            return Ok(None);
+        }
+        if !self.args.is_moe() {
+            return Err(Error::Parallel(format!(
+                "{} PP+EP requires a routed MoE text checkpoint",
+                self.args.model_type
+            )));
+        }
+        Ok(Some(
+            crate::runtime::distributed::expert::ExpertAssignment::balanced(
+                self.args.num_experts as usize,
+                topology.expert_parallel_size,
+                topology.expert_parallel_rank,
+            )?,
+        ))
+    }
+
     fn register_parallel_parameters(
         &self,
         _context: crate::runtime::distributed::parallel::ParallelBuildContext,
@@ -3121,6 +3255,38 @@ impl ArchitectureAdapter for QwenHybridLayerwiseAdapter {
             store,
             layout,
         )
+    }
+
+    fn expert_parallel_layer_bindings(
+        &self,
+        group: usize,
+        index: usize,
+        _layer: &Self::Layer,
+        store: &dyn WeightStore,
+        assignment: &crate::runtime::distributed::expert::ExpertAssignment,
+        stream: &Stream,
+    ) -> Result<Vec<WeightBinding>, Error> {
+        let global = self.new_layer(group, index, stream)?;
+        let indices = assignment.local_global_expert_ids().to_vec();
+        self.layer_bindings(group, index, &global, store)?
+            .into_iter()
+            .map(|binding| {
+                let target = binding.logical_target().unwrap_or_else(|| binding.name());
+                if target.contains("mlp.experts.") {
+                    binding
+                        .select_bounded_output(
+                            store,
+                            TensorSelection::Indices {
+                                axis: 0,
+                                indices: indices.clone(),
+                            },
+                        )
+                        .map_err(Error::from)
+                } else {
+                    Ok(binding)
+                }
+            })
+            .collect()
     }
 
     fn populate_layer(

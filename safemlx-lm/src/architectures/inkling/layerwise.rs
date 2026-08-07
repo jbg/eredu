@@ -92,6 +92,11 @@ impl InklingLayerwiseModel {
         self.execution.prompt_cache_layer_layout()
     }
 
+    /// Returns the complete rank-local prompt-cache identity.
+    pub fn prompt_cache_model_identity(&self) -> Result<PromptCacheModelIdentity, Error> {
+        self.execution.prompt_cache_model_identity()
+    }
+
     /// Persists a compatible multimodal prefix cache.
     pub fn save_prompt_cache(
         &self,
@@ -260,6 +265,49 @@ impl InklingLayerwiseModel {
                     stream,
                     |hidden, ids, weights, stream| execute(index, hidden, ids, weights, stream),
                 )?),
+            },
+        )
+    }
+
+    /// Runs TP-sharded attention, dense/shared projections, and rank-local
+    /// cache state while delegating routed experts to the matching EP group.
+    pub(crate) fn forward_tensor_expert_parallel<F>(
+        &mut self,
+        inputs: &Array,
+        cache: &mut Cache,
+        tensor_group: &safemlx::distributed::Group,
+        mut execute: F,
+        stream: &Stream,
+    ) -> Result<Array, Error>
+    where
+        F: FnMut(usize, &Array, &Array, &Array, &Stream) -> Result<Array, Exception>,
+    {
+        self.execution.forward_tensor_parallel_with_layer_executor(
+            InklingExecutionInput {
+                input: InklingInput::Decode(inputs),
+                last_token_only: false,
+            },
+            cache,
+            tensor_group,
+            stream,
+            |_adapter, _group, index, layer, hidden, cache, _context, execution| match layer {
+                InklingLayer::Vision(_) => Err(Error::Parallel(
+                    "Inkling TP+EP execution is restricted to the text decoder group".into(),
+                )),
+                InklingLayer::Text(layer) => {
+                    let tp_group = execution.group().ok_or_else(|| {
+                        Error::Parallel(
+                            "Inkling TP+EP execution requires an active TP group".into(),
+                        )
+                    })?;
+                    Ok(layer.forward_tensor_with_expert_executor(
+                        hidden,
+                        Some(&mut cache.layers[index]),
+                        tp_group,
+                        execution.stream(),
+                        |hidden, ids, weights, stream| execute(index, hidden, ids, weights, stream),
+                    )?)
+                }
             },
         )
     }
@@ -544,7 +592,7 @@ pub fn load_inkling_sparse_expert_cache_model(
 pub fn load_inkling_sparse_expert_cache_model_with_dense_layers(
     model_dir: impl AsRef<Path>,
     options: ExpertCacheLoadOptions,
-    non_expert: crate::runtime::residency::dense_stream::DenseDiskStreamLoadOptions,
+    non_expert: impl Into<LayerExecutionLoadOptions>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<InklingLayerwiseModel, Error> {
@@ -610,6 +658,28 @@ pub(crate) fn load_inkling_sparse_ep_base_with_store(
     let mut adapter = InklingLayerwiseAdapter::new(args, stream)?;
     adapter.sparse_expert_cache = true;
     let execution = load_layerwise_model(store, adapter, non_expert, stream, weights_stream)?;
+    Ok(InklingLayerwiseModel { execution })
+}
+
+/// Builds the TP-sharded nonexpert Inkling base used by combined TP+EP.
+pub(crate) fn load_inkling_sparse_tp_ep_base_with_store(
+    store: Arc<dyn WeightStore + Send + Sync>,
+    args: ModelArgs,
+    non_expert: impl Into<LayerExecutionLoadOptions>,
+    build: crate::runtime::distributed::parallel::ParallelBuildContext,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<InklingLayerwiseModel, Error> {
+    let mut adapter = InklingLayerwiseAdapter::new(args, stream)?;
+    adapter.sparse_expert_cache = true;
+    let execution = load_tensor_parallel_layerwise_model(
+        store,
+        adapter,
+        non_expert,
+        build,
+        stream,
+        weights_stream,
+    )?;
     Ok(InklingLayerwiseModel { execution })
 }
 
@@ -1686,6 +1756,56 @@ impl ArchitectureAdapter for InklingLayerwiseAdapter {
         }
     }
 
+    fn new_expert_parallel_layer(
+        &self,
+        group: usize,
+        index: usize,
+        assignment: &crate::runtime::distributed::expert::ExpertAssignment,
+        stream: &Stream,
+    ) -> Result<Self::Layer, Error> {
+        if self.execution_group_name(group)? == "vision_encoder" {
+            return self.new_layer(group, index, stream);
+        }
+        Ok(InklingLayer::Text(Box::new(
+            DecoderLayer::new_expert_parallel(
+                &self.args.text_config,
+                index as i32,
+                i32::try_from(assignment.local_expert_count()).map_err(|_| {
+                    Error::Parallel("local Inkling expert count exceeds i32".into())
+                })?,
+                stream,
+            )?,
+        )))
+    }
+
+    fn expert_parallel_assignment(
+        &self,
+        topology: crate::runtime::distributed::topology::ParallelTopology,
+    ) -> Result<Option<crate::runtime::distributed::expert::ExpertAssignment>, Error> {
+        if topology.expert_parallel_size == 1 {
+            return Ok(None);
+        }
+        if self.args.text_config.n_routed_experts <= 0
+            || !self
+                .args
+                .text_config
+                .layer_schedule
+                .iter()
+                .any(|policy| policy.feed_forward == resident::FeedForwardPolicy::SparseMoe)
+        {
+            return Err(Error::Parallel(
+                "Inkling PP+EP requires a checkpoint with sparse MoE text layers".into(),
+            ));
+        }
+        Ok(Some(
+            crate::runtime::distributed::expert::ExpertAssignment::balanced(
+                self.args.text_config.n_routed_experts as usize,
+                topology.expert_parallel_size,
+                topology.expert_parallel_rank,
+            )?,
+        ))
+    }
+
     fn parallel_parameter_groups(
         &self,
         _context: crate::runtime::distributed::parallel::ParallelBuildContext,
@@ -2046,6 +2166,38 @@ impl ArchitectureAdapter for InklingLayerwiseAdapter {
         )
     }
 
+    fn expert_parallel_layer_bindings(
+        &self,
+        group: usize,
+        index: usize,
+        _layer: &Self::Layer,
+        store: &dyn WeightStore,
+        assignment: &crate::runtime::distributed::expert::ExpertAssignment,
+        stream: &Stream,
+    ) -> Result<Vec<WeightBinding>, Error> {
+        let global = self.new_layer(group, index, stream)?;
+        let indices = assignment.local_global_expert_ids().to_vec();
+        self.layer_bindings(group, index, &global, store)?
+            .into_iter()
+            .map(|binding| {
+                let target = binding.logical_target().unwrap_or_else(|| binding.name());
+                if target.contains("moe.experts.") {
+                    binding
+                        .select_bounded_output(
+                            store,
+                            TensorSelection::Indices {
+                                axis: 0,
+                                indices: indices.clone(),
+                            },
+                        )
+                        .map_err(Error::from)
+                } else {
+                    Ok(binding)
+                }
+            })
+            .collect()
+    }
+
     fn populate_layer(
         &self,
         _group: usize,
@@ -2169,11 +2321,42 @@ impl ArchitectureAdapter for InklingLayerwiseAdapter {
                 return Ok(context.vision_jobs[0].hidden.clone());
             }
         } else if let InklingLayer::Text(layer) = layer {
-            if self.sparse_expert_cache {
-                return Err(Error::Parallel(
-                    "Inkling tensor parallelism cannot be combined with sparse expert caching"
-                        .into(),
-                ));
+            if self.sparse_expert_cache
+                && self
+                    .args
+                    .text_config
+                    .layer_policy(index)
+                    .is_some_and(|policy| {
+                        policy.feed_forward == resident::FeedForwardPolicy::SparseMoe
+                    })
+            {
+                let expert_cache = self.expert_cache.as_ref().ok_or_else(|| {
+                    Error::Parallel("Inkling sparse expert cache was not initialized".into())
+                })?;
+                let pass = if hidden.dim(1) > 1 {
+                    ExpertPass::Prefill
+                } else {
+                    ExpertPass::Decode
+                };
+                return Ok(layer.forward_tensor_with_expert_executor(
+                    hidden,
+                    Some(&mut cache.layers[index]),
+                    tp_group,
+                    execution.stream(),
+                    |flat, indices, weights, stream| {
+                        expert_cache
+                            .execute_routes_bounded(
+                                ExpertRouteBatch::new(index, flat, indices, weights, pass),
+                                stream,
+                                |flat, acquired, weights, stream| {
+                                    self.forward_cached_expert_bank(
+                                        index, flat, acquired, weights, stream,
+                                    )
+                                },
+                            )
+                            .map_err(|error| Exception::custom(error.to_string()))
+                    },
+                )?);
             }
             return Ok(layer.forward_tensor_parallel(
                 hidden,

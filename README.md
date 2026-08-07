@@ -152,6 +152,9 @@ their alternating or explicit attention schedule.
 Fully resident Qwen stages support aligned affine or MXFP4 requantization;
 GPT-OSS can MXFP4-quantize eligible dense matrices without transcoding its
 expert banks. Dense disk streaming requires checkpoint-native encodings.
+Qwen3-MoE additionally supports arbitrary-geometry TP+PP+EP through the same
+Cartesian topology and semantic layer plan for fully resident or dense-streamed
+SafeTensors and canonical `qwen3moe` GGUF checkpoints.
 LFM2 and LFM2-MoE use the same runtime for SafeTensors and canonical
 `lfm2`/`lfm2moe` GGUF checkpoints. Their alternating causal-convolution and
 full-attention layers materialize semantic state slots from the canonical
