@@ -589,10 +589,7 @@ pub(crate) fn load_gemma4_assistant_gguf_with_options(
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<Gemma4AssistantDraftModel, Error> {
-    if !matches!(
-        options.weight_residency,
-        crate::runtime::execution::layerwise::WeightResidency::FullyResident
-    ) {
+    if !options.weight_residency.is_fully_resident() {
         return Err(Error::UnsupportedArchitecture(
             "Gemma 4 assistant GGUF loading supports fully resident weights only".into(),
         ));

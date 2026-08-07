@@ -747,9 +747,6 @@ mod tests {
         )
         .unwrap();
         let options = crate::runtime::residency::expert_cache::ExpertCacheLoadOptions::new(
-            crate::runtime::execution::layerwise::LayerwiseLoadOptions::new(
-                crate::runtime::residency::policy::OffloadConfig::new(None, None, 1).unwrap(),
-            ),
             crate::runtime::residency::policy::OffloadConfig::new(None, None, 1).unwrap(),
             u64::MAX,
             1 << 30,

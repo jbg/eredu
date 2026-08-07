@@ -70,7 +70,9 @@ use crate::{
     },
     runtime::checkpoint::quantization::{quantize_tensor, WeightQuantization},
     runtime::checkpoint::store::{GgufWeightStore, WeightStore, WeightStoreDiagnostics},
-    runtime::distributed::expert::{ExpertAssignment, RoutingStatistics},
+    runtime::distributed::expert::{
+        dispatch_local_with, dispatch_replicated_with, ExpertAssignment, RoutingStatistics,
+    },
     runtime::distributed::parallel::{
         sample_and_synchronize, ParallelBuildContext, ParallelExecutionContext, ShardingPolicy,
         SynchronizedToken,
@@ -79,10 +81,13 @@ use crate::{
     runtime::execution::inspection::ActivationObserver,
     runtime::execution::layerwise::{
         open_safetensors_weight_store, shard_layer_bindings, ArchitectureAdapter,
-        DenseDiskStreamReport, DenseStreamController, SharedWeightStore, StaticUnitBindings,
-        WeightResidency,
+        DenseDiskStreamReport, DenseStreamController, LayerWeightResidency, SharedWeightStore,
+        StaticUnitBindings,
     },
     runtime::generation::sampler::Sampler,
+    runtime::residency::expert_cache::{
+        ExpertCache, ExpertCacheLoadOptions, ExpertCacheReport, ExpertPass,
+    },
     runtime::residency::manager::{OffloadUnit, ResidencyManager},
     runtime::residency::policy::{
         MemoryTier, OffloadConfig, OffloadPlan, OffloadUnitId, OffloadUnitSpec, ResidencyPolicy,
@@ -92,6 +97,9 @@ use crate::{
         WorkId,
     },
 };
+
+#[cfg(test)]
+use crate::runtime::execution::layerwise::WeightResidency;
 
 use safemlx::ops::indexing::TryIndexOp;
 
@@ -937,6 +945,7 @@ struct DenseQwenStage {
     parallel_lm_head: Option<crate::nn::parallel::VocabParallelLmHead>,
     parallel_layout: Option<crate::runtime::distributed::parallel::LocalModelLayout>,
     expert_assignment: Option<ExpertAssignment>,
+    expert_cache: Option<ExpertCache>,
     routing_statistics: RoutingStatistics,
 }
 
@@ -1079,6 +1088,7 @@ trait PipelineStageAdapter {
     /// Returns dense-stream observations when this stage uses bounded loading.
     fn dense_stream_report(&self) -> Result<Option<DenseDiskStreamReport>, Error>;
     fn checkpoint_diagnostics(&self) -> Result<Option<WeightStoreDiagnostics>, Error>;
+    fn expert_cache_report(&self) -> Result<Option<ExpertCacheReport>, Error>;
 
     /// Returns the exact cache identity and local semantic state schedule.
     fn prompt_cache_model_identity(
@@ -1126,6 +1136,9 @@ trait PipelineStageSemantics {
     fn model_kind(&self) -> ModelKind;
     fn auxiliary_shapes(&self, step: PipelineStep) -> Vec<Vec<i32>>;
     fn dense_layers(&self) -> Option<&PipelineDenseLayers>;
+    fn expert_cache(&self) -> Option<&ExpertCache> {
+        None
+    }
     fn prompt_cache_model_identity(
         &self,
         topology: ParallelTopology,
@@ -1200,10 +1213,31 @@ impl<S: PipelineStageSemantics> PipelineStageAdapter for PipelineStage<S> {
     }
 
     fn checkpoint_diagnostics(&self) -> Result<Option<WeightStoreDiagnostics>, Error> {
-        self.0
+        if let Some(diagnostics) = self
+            .0
             .dense_layers()
             .map(PipelineDenseLayers::checkpoint_diagnostics)
+            .transpose()?
+        {
+            return Ok(Some(diagnostics));
+        }
+        self.0
+            .expert_cache()
+            .map(|cache| {
+                cache
+                    .report()
+                    .map(|report| report.residency.weight_store().clone())
+                    .map_err(Error::from)
+            })
             .transpose()
+    }
+
+    fn expert_cache_report(&self) -> Result<Option<ExpertCacheReport>, Error> {
+        self.0
+            .expert_cache()
+            .map(ExpertCache::report)
+            .transpose()
+            .map_err(Error::from)
     }
 
     fn prompt_cache_model_identity(
@@ -1259,9 +1293,14 @@ struct PipelineDenseLayers {
     residency: ResidencyManager,
     controller: DenseStreamController,
     units: Vec<OffloadUnitId>,
+    independent_experts: bool,
 }
 
 impl PipelineDenseLayers {
+    fn with_independent_experts(mut self) -> Self {
+        self.independent_experts = true;
+        self
+    }
     fn prepare(
         &self,
         local_index: usize,
@@ -1372,7 +1411,15 @@ where
         if let Some(dense) = dense_layers {
             let (_host, lease) = dense.prepare(local_index, prefill)?;
             let mut layer = new_layer(global_layer, stream)?;
-            populate_module_from_lease(&mut layer, &lease)?;
+            if dense.independent_experts {
+                crate::runtime::checkpoint::binding::populate_module_from_lease_excluding(
+                    &mut layer,
+                    &lease,
+                    |name| name.starts_with("mlp.experts."),
+                )?;
+            } else {
+                populate_module_from_lease(&mut layer, &lease)?;
+            }
             let forwarded = forward_layer(global_layer, &mut layer, &hidden, cache, stream)?
                 .into_pipeline_layer_forward();
             hidden = forwarded.hidden;
@@ -1913,6 +1960,10 @@ impl PipelineStageSemantics for DenseQwenStage {
         self.dense_layers.as_ref()
     }
 
+    fn expert_cache(&self) -> Option<&ExpertCache> {
+        self.expert_cache.as_ref()
+    }
+
     fn prompt_cache_model_identity(
         &self,
         topology: ParallelTopology,
@@ -1969,7 +2020,11 @@ impl PipelineStageSemantics for DenseQwenStage {
         cache: &mut [PipelineLayerCache],
         stream: &Stream,
     ) -> Result<PipelineStageOutput, Error> {
-        DenseQwenStage::forward(self, input, step, mask, cache, stream)
+        if self.expert_cache.is_some() {
+            self.forward_external_experts(input, step, mask, cache, None, stream)
+        } else {
+            DenseQwenStage::forward(self, input, step, mask, cache, stream)
+        }
     }
 
     fn forward_with_execution(
@@ -1993,11 +2048,14 @@ impl PipelineStageSemantics for DenseQwenStage {
                     Some(group),
                 );
             }
-            return self.forward_expert_parallel(input, step, mask, cache, group, stream);
+            return self.forward_external_experts(input, step, mask, cache, Some(group), stream);
         }
         match execution {
             Some(execution) if execution.is_tensor_parallel() => {
                 self.forward_tensor_parallel(input, step, mask, cache, execution, None)
+            }
+            _ if self.expert_cache.is_some() => {
+                self.forward_external_experts(input, step, mask, cache, None, stream)
             }
             _ => self.forward(input, step, mask, cache, stream),
         }
@@ -3029,6 +3087,11 @@ impl PipelineModel {
             .stage
             .checkpoint_diagnostics()?
             .or_else(|| self.info.checkpoint_diagnostics.clone()))
+    }
+
+    /// Returns stage-local independent expert-cache telemetry when enabled.
+    pub fn expert_cache_report(&self) -> Result<Option<ExpertCacheReport>, Error> {
+        self.stage.expert_cache_report()
     }
 
     /// Allocates cache entries only for locally owned decoder layers.
@@ -4071,21 +4134,54 @@ fn load_bound_module(
     weights_stream: &Stream,
     stream: &Stream,
 ) -> Result<(u64, Vec<String>, Option<Dtype>), Error> {
+    load_bound_module_excluding(
+        module,
+        store,
+        bindings,
+        quantize_on_load,
+        weights_stream,
+        stream,
+        &|_| false,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn load_bound_module_excluding(
+    module: &mut impl ModuleParameters,
+    store: &dyn WeightStore,
+    bindings: &[crate::runtime::residency::manager::WeightBinding],
+    quantize_on_load: Option<WeightQuantization>,
+    weights_stream: &Stream,
+    stream: &Stream,
+    excluded: &dyn Fn(&str) -> bool,
+) -> Result<(u64, Vec<String>, Option<Dtype>), Error> {
     let arrays = materialize_module_bindings(store, bindings, weights_stream, stream)?;
     let dtype = arrays
         .values()
         .find(|value| value.dtype().is_float())
         .map(Array::dtype);
     if let Some(quantization) = quantize_on_load {
+        if module
+            .parameters()
+            .flatten()
+            .keys()
+            .any(|name| excluded(name))
+        {
+            return Err(Error::Quantization(
+                "pipeline load-time quantization cannot exclude independent expert parameters"
+                    .into(),
+            ));
+        }
         populate_module_from_dense_arrays_quantized(module, &arrays, quantization, stream)?;
     } else {
-        populate_module_from_arrays_excluding(module, &arrays, |_| false)?;
+        populate_module_from_arrays_excluding(module, &arrays, excluded)?;
     }
     let bytes = module
         .parameters()
         .flatten()
-        .values()
-        .try_fold(0u64, |total, value| {
+        .into_iter()
+        .filter(|(name, _)| !excluded(name))
+        .try_fold(0u64, |total, (_, value)| {
             total
                 .checked_add(value.nbytes() as u64)
                 .ok_or_else(|| Error::Parallel("pipeline module byte total overflowed".into()))
@@ -4137,6 +4233,33 @@ impl PipelineLoadAccumulator {
             quantize_on_load,
             weights_stream,
             stream,
+        )?;
+        self.bytes = self.bytes.checked_add(bytes).ok_or_else(|| {
+            Error::Parallel(format!("{} pipeline byte total overflowed", self.family))
+        })?;
+        self.activation_dtype = self.activation_dtype.or(dtype);
+        self.owned_tensors.extend(names);
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn load_excluding<M: ModuleParameters>(
+        &mut self,
+        module: &mut M,
+        store: &dyn WeightStore,
+        bindings: &[crate::runtime::residency::manager::WeightBinding],
+        weights_stream: &Stream,
+        stream: &Stream,
+        excluded: &dyn Fn(&str) -> bool,
+    ) -> Result<(), Error> {
+        let (bytes, names, dtype) = load_bound_module_excluding(
+            module,
+            store,
+            bindings,
+            None,
+            weights_stream,
+            stream,
+            excluded,
         )?;
         self.bytes = self.bytes.checked_add(bytes).ok_or_else(|| {
             Error::Parallel(format!("{} pipeline byte total overflowed", self.family))
@@ -4331,6 +4454,7 @@ where
         residency,
         controller,
         units,
+        independent_experts: false,
     })
 }
 
@@ -4358,7 +4482,10 @@ pub fn load_pipeline_model(
 /// support fully resident and
 /// dense-disk-streamed layers. Streamed units compose pipeline placement with
 /// the authoritative TP semantic layout or EP assignment before residency
-/// initialization.
+/// initialization. Qwen3-MoE additionally composes an independent, stage-local
+/// expert cache with resident or dense-streamed non-expert parameters for PP,
+/// TP+PP, PP+EP, and TP+PP+EP. With EP inactive each stage owns all experts for
+/// its local layers and executes routes without an expert collective.
 pub fn load_pipeline_model_with_options(
     model_dir: impl AsRef<Path>,
     options: ModelLoadOptions,
@@ -4371,19 +4498,14 @@ pub fn load_pipeline_model_with_options(
     })?;
     validate_pipeline_topology(topology)?;
     topology.validate_execution_stream(stream)?;
-    let dense_stream = match options.weight_residency {
-        WeightResidency::FullyResident => None,
-        WeightResidency::DenseDiskStream(options) => Some(options),
-        WeightResidency::LayerwiseHost(_) => {
+    let expert_cache = options.weight_residency.expert_cache();
+    let dense_stream = match options.weight_residency.layers() {
+        LayerWeightResidency::FullyResident => None,
+        LayerWeightResidency::DenseDiskStream(options) => Some(options),
+        LayerWeightResidency::LayerwiseHost(_) => {
             return Err(Error::Parallel(
                 "pipeline loading does not support eager host-layer residency; select fully resident or dense disk streaming"
                     .into(),
-            ));
-        }
-        WeightResidency::SparseExpertCache(_)
-        | WeightResidency::SparseExpertCacheWithDenseLayers(_) => {
-            return Err(Error::Parallel(
-                "pipeline loading does not combine with sparse expert caching".into(),
             ));
         }
     };
@@ -4396,6 +4518,12 @@ pub fn load_pipeline_model_with_options(
         let checkpoint = GgufCheckpoint::open(model_dir)?;
         let metadata = crate::runtime::checkpoint::load::gguf_metadata(&checkpoint);
         let architecture = pipeline_gguf_architecture(&metadata)?;
+        if expert_cache.is_some() && architecture != crate::api::GgufArchitecture::Qwen3Moe {
+            return Err(Error::Parallel(format!(
+                "pipeline independent expert caching currently requires Qwen3-MoE semantic expert recipes; GGUF architecture {} is not yet registered and no checkpoint payload was materialized",
+                architecture.metadata_name()
+            )));
+        }
         if topology.tensor_parallel_size > 1
             && topology.pipeline_parallel_size > 1
             && topology.expert_parallel_size > 1
@@ -4556,6 +4684,7 @@ pub fn load_pipeline_model_with_options(
                     topology,
                     options.quantization,
                     dense_stream,
+                    expert_cache,
                     stream,
                     weights_stream,
                 )
@@ -4723,6 +4852,11 @@ pub fn load_pipeline_model_with_options(
     let config: serde_json::Value =
         serde_json::from_reader(std::fs::File::open(model_dir.join("config.json"))?)?;
     let model_type = config.get("model_type").and_then(serde_json::Value::as_str);
+    if expert_cache.is_some() && model_type != Some("qwen3_moe") {
+        return Err(Error::Parallel(format!(
+            "pipeline independent expert caching currently requires Qwen3-MoE semantic expert recipes; SafeTensors model_type {model_type:?} is not yet registered and no checkpoint payload was materialized"
+        )));
+    }
     if topology.tensor_parallel_size > 1
         && topology.pipeline_parallel_size > 1
         && topology.expert_parallel_size > 1
@@ -4860,6 +4994,7 @@ pub fn load_pipeline_model_with_options(
                 topology,
                 options.quantization,
                 dense_stream,
+                expert_cache,
                 stream,
                 weights_stream,
             )
@@ -5285,7 +5420,7 @@ fn load_llama_pipeline(
     if let Some(dense_stream) = dense_stream {
         let streamed_layout = parallel_layout.clone();
         let streamed_adapter = &stage.layer_adapter;
-        stage.dense_layers = Some(build_pipeline_dense_layers(
+        let dense_layers = build_pipeline_dense_layers(
             Arc::clone(&store),
             stage.range.clone(),
             dense_stream,
@@ -5312,7 +5447,8 @@ fn load_llama_pipeline(
                     stream,
                 )
             },
-        )?);
+        )?;
+        stage.dense_layers = Some(dense_layers);
         let report = stage.dense_layers.as_ref().unwrap().report()?;
         info.planned_owned_parameter_bytes = static_device_bytes
             .checked_add(report.planned_layer_bytes())
@@ -5901,17 +6037,30 @@ impl LlamaStage {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn load_dense_qwen_pipeline(
     source_args: dense_qwen::DecoderConfig,
     store: SharedWeightStore,
     topology: ParallelTopology,
     requested_quantization: Option<WeightQuantization>,
     dense_stream: Option<crate::runtime::residency::dense_stream::DenseDiskStreamLoadOptions>,
+    expert_cache_options: Option<ExpertCacheLoadOptions>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<PipelineModel, Error> {
-    let binding_adapter =
-        dense_qwen::layerwise::DenseQwenLayerwiseAdapter::new(source_args.clone(), stream)?;
+    if expert_cache_options.is_some() && !source_args.is_moe() {
+        return Err(Error::Parallel(
+            "pipeline independent expert caching requires a Qwen3-MoE checkpoint".into(),
+        ));
+    }
+    let binding_adapter = if expert_cache_options.is_some() {
+        dense_qwen::layerwise::DenseQwenLayerwiseAdapter::new_external_experts(
+            source_args.clone(),
+            stream,
+        )?
+    } else {
+        dense_qwen::layerwise::DenseQwenLayerwiseAdapter::new(source_args.clone(), stream)?
+    };
     let expert_assignment = binding_adapter.expert_parallel_assignment(topology)?;
     topology.preflight(
         Some(source_args.attention_schedule.len()),
@@ -5936,6 +6085,12 @@ fn load_dense_qwen_pipeline(
                 .into(),
         ));
     }
+    if expert_cache_options.is_some() && quantize_on_load.is_some() {
+        return Err(Error::Quantization(
+            "load-time quantization is unsupported for independently cached pipeline experts; use checkpoint-native packed expert weights"
+                .into(),
+        ));
+    }
     let mut target_args = source_args.clone();
     if let Some(quantization) = quantize_on_load {
         target_args.quantization = Some(quantization);
@@ -5949,7 +6104,13 @@ fn load_dense_qwen_pipeline(
         source_args.model_kind(),
         source_args.hidden_size,
     );
-    let mut stage = DenseQwenStage::new(target_args.clone(), range, &info, stream)?;
+    let mut stage = DenseQwenStage::new(
+        target_args.clone(),
+        range,
+        &info,
+        expert_cache_options.is_some(),
+        stream,
+    )?;
     stage.expert_assignment = expert_assignment;
     if let Some(assignment) = stage.expert_assignment.as_ref() {
         info.global_expert_count = Some(assignment.global_expert_count());
@@ -6131,24 +6292,33 @@ fn load_dense_qwen_pipeline(
                 stage.expert_assignment.as_ref(),
                 stream,
             )?;
-            loaded.load(
-                layer,
-                store.as_ref(),
-                &bindings,
-                quantize_on_load,
-                weights_stream,
-                stream,
-            )?;
+            if expert_cache_options.is_some() {
+                loaded.load_excluding(
+                    layer,
+                    store.as_ref(),
+                    &bindings,
+                    weights_stream,
+                    stream,
+                    &|name| name.starts_with("mlp.experts."),
+                )?;
+            } else {
+                loaded.load(
+                    layer,
+                    store.as_ref(),
+                    &bindings,
+                    quantize_on_load,
+                    weights_stream,
+                    stream,
+                )?;
+            }
         }
     }
     let static_bytes = loaded.finish(&mut info)?;
-    let checkpoint_diagnostics = store.diagnostics()?;
-    let materialized_shards = checkpoint_diagnostics.touched_shard_paths.clone();
     if let Some(options) = dense_stream {
         let streamed_layout = parallel_layout.clone();
         let streamed_assignment = stage.expert_assignment.clone();
         let streamed_adapter = &stage.layer_adapter;
-        stage.dense_layers = Some(build_pipeline_dense_layers(
+        let dense_layers = build_pipeline_dense_layers(
             Arc::clone(&store),
             stage.range.clone(),
             options,
@@ -6175,7 +6345,12 @@ fn load_dense_qwen_pipeline(
                     stream,
                 )
             },
-        )?);
+        )?;
+        stage.dense_layers = Some(if expert_cache_options.is_some() {
+            dense_layers.with_independent_experts()
+        } else {
+            dense_layers
+        });
         let report = stage.dense_layers.as_ref().unwrap().report()?;
         info.planned_owned_parameter_bytes = static_bytes
             .checked_add(report.planned_layer_bytes())
@@ -6185,6 +6360,39 @@ fn load_dense_qwen_pipeline(
     } else {
         info.planned_owned_parameter_bytes = static_bytes;
     }
+    if let Some(options) = expert_cache_options {
+        let entries = dense_qwen::layerwise::qwen3_expert_catalog_cartesian(
+            &source_args,
+            store.as_ref(),
+            "model.layers",
+            parallel_layout.as_ref(),
+        )?
+        .into_iter()
+        .filter(|entry| stage.range.contains(&entry.identity().layer))
+        .filter(|entry| {
+            stage.expert_assignment.as_ref().is_none_or(|assignment| {
+                assignment.owner(entry.identity().global_expert) == Some(assignment.rank())
+            })
+        })
+        .collect::<Vec<_>>();
+        let cache = ExpertCache::new_shared(
+            Arc::clone(&store),
+            entries,
+            options,
+            weights_stream.clone(),
+            stream.clone(),
+        )?;
+        let owned_expert_bytes = cache.report()?.owned_bytes;
+        info.planned_owned_parameter_bytes = info
+            .planned_owned_parameter_bytes
+            .checked_add(owned_expert_bytes)
+            .ok_or_else(|| {
+                Error::Parallel("dense-Qwen pipeline expert byte total overflowed".into())
+            })?;
+        stage.expert_cache = Some(cache);
+    }
+    let checkpoint_diagnostics = store.diagnostics()?;
+    let materialized_shards = checkpoint_diagnostics.touched_shard_paths.clone();
     info.opened_checkpoint_shards = materialized_shards;
     info.checkpoint_diagnostics = Some(checkpoint_diagnostics);
     PipelineModel::from_adapter(topology, info, PipelineStage(stage))
@@ -6560,10 +6768,17 @@ impl DenseQwenStage {
         args: dense_qwen::DecoderConfig,
         range: Range<usize>,
         info: &PipelineStageInfo,
+        external_experts: bool,
         stream: &Stream,
     ) -> Result<Self, Error> {
-        let layer_adapter =
-            dense_qwen::layerwise::DenseQwenLayerwiseAdapter::new(args.clone(), stream)?;
+        let layer_adapter = if external_experts {
+            dense_qwen::layerwise::DenseQwenLayerwiseAdapter::new_external_experts(
+                args.clone(),
+                stream,
+            )?
+        } else {
+            dense_qwen::layerwise::DenseQwenLayerwiseAdapter::new(args.clone(), stream)?
+        };
         let make_embedding = || {
             linear::unloaded_maybe_quantized_embedding(
                 args.vocab_size,
@@ -6611,6 +6826,7 @@ impl DenseQwenStage {
             parallel_lm_head: None,
             parallel_layout: None,
             expert_assignment: None,
+            expert_cache: None,
             routing_statistics: RoutingStatistics::default(),
         })
     }
@@ -6778,10 +6994,23 @@ impl DenseQwenStage {
         let layer_adapter = &self.layer_adapter;
         let parallel_layout = self.parallel_layout.clone();
         let expert_assignment = self.expert_assignment.clone();
-        if expert_group.is_some() != expert_assignment.is_some() {
-            return Err(Error::Parallel(
-                "dense-Qwen Cartesian stage has inconsistent EP communicator and assignment".into(),
-            ));
+        let expert_cache = self.expert_cache.as_ref();
+        let pass = if step.sequence_length > 1 {
+            ExpertPass::Prefill
+        } else {
+            ExpertPass::Decode
+        };
+        match expert_assignment.as_ref() {
+            Some(assignment) => {
+                validate_pipeline_expert_dispatch(assignment, expert_group, expert_cache.is_some())?
+            }
+            None if expert_group.is_some() || expert_cache.is_some() => {
+                return Err(Error::Parallel(
+                    "dense-Qwen Cartesian stage has an expert communicator or cache without an ownership assignment"
+                        .into(),
+                ));
+            }
+            None => {}
         }
         self.routing_statistics = RoutingStatistics::default();
         hidden = execute_pipeline_layer_range(
@@ -6818,10 +7047,44 @@ impl DenseQwenStage {
                         global_layer: cached,
                         cache: PipelineKeyValueCache::Standard(cache),
                         ..
-                    } if *cached == global_layer => {
-                        match (expert_assignment.as_ref(), expert_group) {
-                            (Some(assignment), Some(expert_group)) => layer
-                                .forward_tensor_expert_parallel(
+                    } if *cached == global_layer => match expert_assignment.as_ref() {
+                        Some(assignment) => match expert_cache {
+                            Some(expert_cache) => {
+                                let expert_args = qwen_pipeline_local_expert_args(
+                                    &args,
+                                    parallel_layout.as_ref(),
+                                    global_layer,
+                                )?;
+                                layer.forward_sparse_experts_tensor_parallel(
+                                    AttentionInput {
+                                        x: hidden,
+                                        mask,
+                                        cache: Some(cache),
+                                    },
+                                    group,
+                                    stream,
+                                    |hidden, ids, weights, stream| {
+                                        execute_pipeline_cached_qwen3(
+                                            &expert_args,
+                                            global_layer,
+                                            hidden,
+                                            ids,
+                                            weights,
+                                            pass,
+                                            expert_cache,
+                                            assignment,
+                                            expert_group,
+                                            Some(group),
+                                            &mut self.routing_statistics,
+                                            stream,
+                                        )
+                                        .map_err(|error| Exception::custom(error.to_string()))
+                                    },
+                                )?
+                            }
+                            None => {
+                                let expert_group = expert_group.expect("validated EP group");
+                                layer.forward_tensor_expert_parallel(
                                     hidden,
                                     mask,
                                     Some(cache),
@@ -6830,25 +7093,59 @@ impl DenseQwenStage {
                                     expert_group,
                                     &mut self.routing_statistics,
                                     stream,
-                                )?,
-                            (None, None) => layer.forward_tensor_parallel(
-                                hidden,
-                                mask,
-                                Some(cache),
-                                group,
-                                stream,
-                            )?,
-                            _ => unreachable!("validated Cartesian Qwen stage EP state"),
-                        }
-                    }
+                                )?
+                            }
+                        },
+                        None => layer.forward_tensor_parallel(
+                            hidden,
+                            mask,
+                            Some(cache),
+                            group,
+                            stream,
+                        )?,
+                    },
                     PipelineLayerCache::KeyValue {
                         global_layer: cached,
                         cache: PipelineKeyValueCache::Paged(cache),
                         ..
-                    } if *cached == global_layer => {
-                        match (expert_assignment.as_ref(), expert_group) {
-                            (Some(assignment), Some(expert_group)) => layer
-                                .forward_tensor_expert_parallel(
+                    } if *cached == global_layer => match expert_assignment.as_ref() {
+                        Some(assignment) => match expert_cache {
+                            Some(expert_cache) => {
+                                let expert_args = qwen_pipeline_local_expert_args(
+                                    &args,
+                                    parallel_layout.as_ref(),
+                                    global_layer,
+                                )?;
+                                layer.forward_sparse_experts_tensor_parallel(
+                                    AttentionInput {
+                                        x: hidden,
+                                        mask,
+                                        cache: Some(cache),
+                                    },
+                                    group,
+                                    stream,
+                                    |hidden, ids, weights, stream| {
+                                        execute_pipeline_cached_qwen3(
+                                            &expert_args,
+                                            global_layer,
+                                            hidden,
+                                            ids,
+                                            weights,
+                                            pass,
+                                            expert_cache,
+                                            assignment,
+                                            expert_group,
+                                            Some(group),
+                                            &mut self.routing_statistics,
+                                            stream,
+                                        )
+                                        .map_err(|error| Exception::custom(error.to_string()))
+                                    },
+                                )?
+                            }
+                            None => {
+                                let expert_group = expert_group.expect("validated EP group");
+                                layer.forward_tensor_expert_parallel(
                                     hidden,
                                     mask,
                                     Some(cache),
@@ -6857,17 +7154,17 @@ impl DenseQwenStage {
                                     expert_group,
                                     &mut self.routing_statistics,
                                     stream,
-                                )?,
-                            (None, None) => layer.forward_tensor_parallel(
-                                hidden,
-                                mask,
-                                Some(cache),
-                                group,
-                                stream,
-                            )?,
-                            _ => unreachable!("validated Cartesian Qwen stage EP state"),
-                        }
-                    }
+                                )?
+                            }
+                        },
+                        None => layer.forward_tensor_parallel(
+                            hidden,
+                            mask,
+                            Some(cache),
+                            group,
+                            stream,
+                        )?,
+                    },
                     _ => {
                         return Err(Error::Parallel(format!(
                             "dense-Qwen TP+PP cache does not match global layer {global_layer}"
@@ -6903,18 +7200,28 @@ impl DenseQwenStage {
         }
     }
 
-    fn forward_expert_parallel(
+    fn forward_external_experts(
         &mut self,
         input: PipelineStageInput<'_>,
         step: PipelineStep,
         explicit_mask: Option<&Array>,
         caches: &mut [PipelineLayerCache],
-        group: &Group,
+        group: Option<&Group>,
         stream: &Stream,
     ) -> Result<PipelineStageOutput, Error> {
         let assignment = self.expert_assignment.as_ref().ok_or_else(|| {
-            Error::Parallel("PP+EP stage has no rank-local expert assignment".into())
+            Error::Parallel("cached/EP pipeline stage has no rank-local expert assignment".into())
         })?;
+        validate_pipeline_expert_dispatch(assignment, group, self.expert_cache.is_some())?;
+        let resident_group = if self.expert_cache.is_none() {
+            Some(group.ok_or_else(|| {
+                Error::Parallel(
+                    "resident expert-local pipeline execution requires an EP communicator".into(),
+                )
+            })?)
+        } else {
+            None
+        };
         validate_scheduled_pipeline_kv_cache(
             "dense-Qwen PP+EP",
             self.range.clone(),
@@ -6940,6 +7247,12 @@ impl DenseQwenStage {
         let full_mask = explicit_mask.or(generated_mask.as_ref());
         self.routing_statistics = RoutingStatistics::default();
         let args = self.args.clone();
+        let expert_cache = self.expert_cache.as_ref();
+        let pass = if step.sequence_length > 1 {
+            ExpertPass::Prefill
+        } else {
+            ExpertPass::Decode
+        };
         let layer_adapter = &self.layer_adapter;
         let parallel_layout = self.parallel_layout.clone();
         let expert_assignment = assignment.clone();
@@ -6977,36 +7290,90 @@ impl DenseQwenStage {
                         global_layer: cached,
                         cache: PipelineKeyValueCache::Standard(cache),
                         ..
-                    } if *cached == global_layer => layer.forward_expert_parallel(
-                        AttentionInput {
-                            x: hidden,
-                            mask,
-                            cache: Some(cache),
-                        },
-                        &expert_assignment,
-                        group,
-                        &mut self.routing_statistics,
-                        &format!("model.layers.{global_layer}"),
-                        None,
-                        stream,
-                    )?,
+                    } if *cached == global_layer => match expert_cache {
+                        Some(expert_cache) => layer.forward_sparse_experts(
+                            AttentionInput {
+                                x: hidden,
+                                mask,
+                                cache: Some(cache),
+                            },
+                            stream,
+                            |hidden, ids, weights, stream| {
+                                execute_pipeline_cached_qwen3(
+                                    &args,
+                                    global_layer,
+                                    hidden,
+                                    ids,
+                                    weights,
+                                    pass,
+                                    expert_cache,
+                                    &expert_assignment,
+                                    group,
+                                    None,
+                                    &mut self.routing_statistics,
+                                    stream,
+                                )
+                                .map_err(|error| Exception::custom(error.to_string()))
+                            },
+                        )?,
+                        None => layer.forward_expert_parallel(
+                            AttentionInput {
+                                x: hidden,
+                                mask,
+                                cache: Some(cache),
+                            },
+                            &expert_assignment,
+                            resident_group.expect("validated resident EP group"),
+                            &mut self.routing_statistics,
+                            &format!("model.layers.{global_layer}"),
+                            None,
+                            stream,
+                        )?,
+                    },
                     PipelineLayerCache::KeyValue {
                         global_layer: cached,
                         cache: PipelineKeyValueCache::Paged(cache),
                         ..
-                    } if *cached == global_layer => layer.forward_expert_parallel(
-                        AttentionInput {
-                            x: hidden,
-                            mask,
-                            cache: Some(cache),
-                        },
-                        &expert_assignment,
-                        group,
-                        &mut self.routing_statistics,
-                        &format!("model.layers.{global_layer}"),
-                        None,
-                        stream,
-                    )?,
+                    } if *cached == global_layer => match expert_cache {
+                        Some(expert_cache) => layer.forward_sparse_experts(
+                            AttentionInput {
+                                x: hidden,
+                                mask,
+                                cache: Some(cache),
+                            },
+                            stream,
+                            |hidden, ids, weights, stream| {
+                                execute_pipeline_cached_qwen3(
+                                    &args,
+                                    global_layer,
+                                    hidden,
+                                    ids,
+                                    weights,
+                                    pass,
+                                    expert_cache,
+                                    &expert_assignment,
+                                    group,
+                                    None,
+                                    &mut self.routing_statistics,
+                                    stream,
+                                )
+                                .map_err(|error| Exception::custom(error.to_string()))
+                            },
+                        )?,
+                        None => layer.forward_expert_parallel(
+                            AttentionInput {
+                                x: hidden,
+                                mask,
+                                cache: Some(cache),
+                            },
+                            &expert_assignment,
+                            resident_group.expect("validated resident EP group"),
+                            &mut self.routing_statistics,
+                            &format!("model.layers.{global_layer}"),
+                            None,
+                            stream,
+                        )?,
+                    },
                     _ => {
                         return Err(Error::Parallel(format!(
                             "dense-Qwen PP+EP cache does not match global layer {global_layer}"
@@ -7040,6 +7407,103 @@ impl DenseQwenStage {
                 auxiliary,
             }))
         }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn qwen_pipeline_local_expert_args(
+    args: &dense_qwen::DecoderConfig,
+    layout: Option<&crate::runtime::distributed::parallel::LocalModelLayout>,
+    global_layer: usize,
+) -> Result<dense_qwen::DecoderConfig, Error> {
+    let mut local = args.clone();
+    if let Some(layout) = layout {
+        let name = format!("model.layers.{global_layer}.mlp.experts.gate_up_proj");
+        let tensor = layout.tensor(&name).ok_or_else(|| {
+            Error::Parallel(format!(
+                "missing TP semantic layout for cached pipeline experts at {name}"
+            ))
+        })?;
+        local.moe_intermediate_size = i32::try_from(tensor.local_shape()[1] / 2)
+            .map_err(|_| Error::Parallel("local Qwen expert width exceeds i32".into()))?;
+    }
+    Ok(local)
+}
+
+fn validate_pipeline_expert_dispatch(
+    assignment: &ExpertAssignment,
+    expert_group: Option<&Group>,
+    independent_cache: bool,
+) -> Result<(), Error> {
+    match expert_group {
+        Some(group)
+            if group.rank() == assignment.rank() && group.size() == assignment.group_size() =>
+        {
+            Ok(())
+        }
+        Some(group) => Err(Error::Parallel(format!(
+            "pipeline expert assignment rank {}/{} does not match EP communicator rank {}/{}",
+            assignment.rank(),
+            assignment.group_size(),
+            group.rank(),
+            group.size()
+        ))),
+        None if independent_cache && assignment.rank() == 0 && assignment.group_size() == 1 => {
+            Ok(())
+        }
+        None if independent_cache => Err(Error::Parallel(format!(
+            "collective-free pipeline expert caching requires a singleton assignment, got rank {}/{}",
+            assignment.rank(),
+            assignment.group_size()
+        ))),
+        None => Err(Error::Parallel(
+            "expert-local pipeline execution requires an EP communicator".into(),
+        )),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_pipeline_cached_qwen3(
+    args: &dense_qwen::DecoderConfig,
+    global_layer: usize,
+    hidden: &Array,
+    expert_ids: &Array,
+    weights: &Array,
+    pass: ExpertPass,
+    cache: &ExpertCache,
+    assignment: &ExpertAssignment,
+    expert_group: Option<&Group>,
+    tensor_group: Option<&Group>,
+    statistics: &mut RoutingStatistics,
+    stream: &Stream,
+) -> Result<Array, Error> {
+    validate_pipeline_expert_dispatch(assignment, expert_group, true)?;
+    let execute = |routes: &crate::runtime::distributed::expert::DispatchedRoutes,
+                   stream: &Stream| {
+        super::expert::execute_cached_qwen3_at(
+            args,
+            global_layer,
+            "model.layers",
+            routes,
+            pass,
+            cache,
+            stream,
+        )
+    };
+    let returned = match expert_group {
+        Some(group) => dispatch_replicated_with(
+            hidden, expert_ids, weights, assignment, group, stream, execute,
+        )?,
+        None => dispatch_local_with(hidden, expert_ids, weights, assignment, stream, execute)?,
+    };
+    statistics.accumulate(&returned.statistics);
+    match tensor_group {
+        Some(group) => Ok(distributed::all_sum(
+            &returned.reduced_output,
+            group,
+            stream,
+        )?),
+        None => Ok(returned.reduced_output),
     }
 }
 
@@ -14625,7 +15089,7 @@ mod tests {
                     load_pipeline_model_with_options(
                         directory.path(),
                         ModelLoadOptions::with_parallel(tp_pp_gpu_topology(rank))
-                            .with_weight_residency(WeightResidency::DenseDiskStream(
+                            .with_weight_residency(WeightResidency::dense_disk_stream(
                                 dense_stream_options(),
                             )),
                         stream,
@@ -14735,7 +15199,7 @@ mod tests {
             let streamed = load_pipeline_model_with_options(
                 directory.path(),
                 ModelLoadOptions::with_parallel(pp_ep_gpu_topology(rank)).with_weight_residency(
-                    WeightResidency::DenseDiskStream(dense_stream_options()),
+                    WeightResidency::dense_disk_stream(dense_stream_options()),
                 ),
                 stream,
                 cpu.stream(),
@@ -14802,7 +15266,7 @@ mod tests {
                 let load = |rank, dense_stream| {
                     let options = ModelLoadOptions::with_parallel(gpu_topology(rank));
                     let options = if dense_stream {
-                        options.with_weight_residency(WeightResidency::DenseDiskStream(
+                        options.with_weight_residency(WeightResidency::dense_disk_stream(
                             dense_stream_options(),
                         ))
                     } else {
@@ -14885,8 +15349,9 @@ mod tests {
         let load = |rank, streamed| {
             let options = ModelLoadOptions::with_parallel(gpu_topology(rank));
             let options = if streamed {
-                options
-                    .with_weight_residency(WeightResidency::DenseDiskStream(dense_stream_options()))
+                options.with_weight_residency(WeightResidency::dense_disk_stream(
+                    dense_stream_options(),
+                ))
             } else {
                 options
             };
@@ -14941,8 +15406,9 @@ mod tests {
         let load = |rank, dense_stream| {
             let options = ModelLoadOptions::with_parallel(gpu_topology(rank));
             let options = if dense_stream {
-                options
-                    .with_weight_residency(WeightResidency::DenseDiskStream(dense_stream_options()))
+                options.with_weight_residency(WeightResidency::dense_disk_stream(
+                    dense_stream_options(),
+                ))
             } else {
                 options
             };
@@ -15090,7 +15556,7 @@ mod tests {
             let streamed = load_pipeline_model_with_options(
                 fixture.path(),
                 ModelLoadOptions::with_parallel(tp_pp_gpu_topology(rank)).with_weight_residency(
-                    WeightResidency::DenseDiskStream(dense_stream_options()),
+                    WeightResidency::dense_disk_stream(dense_stream_options()),
                 ),
                 stream,
                 cpu.stream(),
@@ -15137,7 +15603,7 @@ mod tests {
                 let streamed = load_pipeline_model_with_options(
                     path,
                     ModelLoadOptions::with_parallel(topology).with_weight_residency(
-                        WeightResidency::DenseDiskStream(dense_stream_options()),
+                        WeightResidency::dense_disk_stream(dense_stream_options()),
                     ),
                     stream,
                     cpu.stream(),
@@ -15222,7 +15688,7 @@ mod tests {
                 let streamed = load_pipeline_model_with_options(
                     path,
                     ModelLoadOptions::with_parallel(topology).with_weight_residency(
-                        WeightResidency::DenseDiskStream(dense_stream_options()),
+                        WeightResidency::dense_disk_stream(dense_stream_options()),
                     ),
                     stream,
                     cpu.stream(),
@@ -15279,11 +15745,9 @@ mod tests {
                 DeviceAssignment::new(DeviceType::Gpu, 0),
             )
             .unwrap();
-            let residency = WeightResidency::SparseExpertCacheWithDenseLayers(
-                crate::runtime::residency::expert_cache::SparseExpertDenseStreamLoadOptions::new(
-                    crate::runtime::residency::expert_cache::ExpertCacheLoadOptions::default(),
-                    dense_stream_options(),
-                ),
+            let residency = WeightResidency::with_expert_cache(
+                crate::NonExpertWeightResidency::DenseDiskStream(dense_stream_options()),
+                crate::runtime::residency::expert_cache::ExpertCacheLoadOptions::default(),
             );
             let loaded =
                 crate::architectures::distributed::expert::load_expert_parallel_model_with_options(
@@ -15334,8 +15798,8 @@ mod tests {
                     tp_pp_gpu_topology(rank)
                 };
                 for residency in [
-                    WeightResidency::FullyResident,
-                    WeightResidency::DenseDiskStream(dense_stream_options()),
+                    WeightResidency::fully_resident(),
+                    WeightResidency::dense_disk_stream(dense_stream_options()),
                 ] {
                     let loaded = load_pipeline_model_with_options(
                         fixture.path(),
@@ -15400,7 +15864,7 @@ mod tests {
             let streamed = load_pipeline_model_with_options(
                 fixture.path(),
                 ModelLoadOptions::with_parallel(pp_ep_gpu_topology(rank)).with_weight_residency(
-                    WeightResidency::DenseDiskStream(dense_stream_options()),
+                    WeightResidency::dense_disk_stream(dense_stream_options()),
                 ),
                 stream,
                 cpu.stream(),
@@ -15622,7 +16086,7 @@ mod tests {
                 let mut streamed = load_pipeline_model_with_options(
                     &path,
                     ModelLoadOptions::with_parallel(topology).with_weight_residency(
-                        WeightResidency::DenseDiskStream(dense_stream_options()),
+                        WeightResidency::dense_disk_stream(dense_stream_options()),
                     ),
                     stream,
                     stream,
@@ -15888,7 +16352,7 @@ mod tests {
             let load = |rank| {
                 let options = ModelLoadOptions::with_parallel(gpu_topology(rank));
                 let options = if streamed {
-                    options.with_weight_residency(WeightResidency::DenseDiskStream(
+                    options.with_weight_residency(WeightResidency::dense_disk_stream(
                         dense_stream_options(),
                     ))
                 } else {
@@ -15982,7 +16446,7 @@ mod tests {
                 let loaded = load_pipeline_model_with_options(
                     fixture,
                     ModelLoadOptions::with_parallel(topology).with_weight_residency(
-                        WeightResidency::DenseDiskStream(dense_stream_options()),
+                        WeightResidency::dense_disk_stream(dense_stream_options()),
                     ),
                     stream,
                     cpu.stream(),
@@ -16625,7 +17089,7 @@ mod tests {
                 let streamed = load_pipeline_model_with_options(
                     path,
                     ModelLoadOptions::with_parallel(topology).with_weight_residency(
-                        WeightResidency::DenseDiskStream(dense_stream_options()),
+                        WeightResidency::dense_disk_stream(dense_stream_options()),
                     ),
                     stream,
                     cpu.stream(),
@@ -16772,7 +17236,7 @@ mod tests {
         let mut dense_first = load_pipeline_model_with_options(
             dir.path(),
             ModelLoadOptions::with_parallel(gpu_topology(0))
-                .with_weight_residency(WeightResidency::DenseDiskStream(dense_options())),
+                .with_weight_residency(WeightResidency::dense_disk_stream(dense_options())),
             stream,
             cpu.stream(),
         )
@@ -16780,7 +17244,7 @@ mod tests {
         let mut dense_last = load_pipeline_model_with_options(
             dir.path(),
             ModelLoadOptions::with_parallel(gpu_topology(1))
-                .with_weight_residency(WeightResidency::DenseDiskStream(dense_options())),
+                .with_weight_residency(WeightResidency::dense_disk_stream(dense_options())),
             stream,
             cpu.stream(),
         )
@@ -16968,7 +17432,7 @@ mod tests {
                 dir.path(),
                 ModelLoadOptions::with_quantization(quantization)
                     .with_parallel_topology(gpu_topology(0))
-                    .with_weight_residency(WeightResidency::DenseDiskStream(dense_stream)),
+                    .with_weight_residency(WeightResidency::dense_disk_stream(dense_stream)),
                 stream,
                 cpu.stream(),
             )
@@ -17323,8 +17787,8 @@ mod tests {
             for rank in 0..4 {
                 let topology = tp_pp_gpu_topology(rank);
                 for residency in [
-                    WeightResidency::FullyResident,
-                    WeightResidency::DenseDiskStream(dense_stream_options()),
+                    WeightResidency::fully_resident(),
+                    WeightResidency::dense_disk_stream(dense_stream_options()),
                 ] {
                     let model = load_pipeline_model_with_options(
                         path,
@@ -17356,7 +17820,7 @@ mod tests {
                     ));
                     assert_eq!(
                         model.dense_stream_report().unwrap().is_some(),
-                        matches!(residency, WeightResidency::DenseDiskStream(_))
+                        matches!(residency.layers(), LayerWeightResidency::DenseDiskStream(_))
                     );
                     if info.is_first {
                         assert!(info
@@ -17384,7 +17848,7 @@ mod tests {
         let sizing = load_pipeline_model_with_options(
             model_dir,
             ModelLoadOptions::with_parallel(topology).with_weight_residency(
-                WeightResidency::DenseDiskStream(
+                WeightResidency::dense_disk_stream(
                     crate::runtime::residency::dense_stream::DenseDiskStreamLoadOptions::new(
                         u64::MAX,
                         u64::MAX,
@@ -17444,7 +17908,7 @@ mod tests {
         let strict_error = load_pipeline_model_with_options(
             dir.path(),
             ModelLoadOptions::with_parallel(gpu_topology(0))
-                .with_weight_residency(WeightResidency::DenseDiskStream(dense)),
+                .with_weight_residency(WeightResidency::dense_disk_stream(dense)),
             stream,
             cpu.stream(),
         )
@@ -17464,7 +17928,7 @@ mod tests {
         let model = load_pipeline_model_with_options(
             dir.path(),
             ModelLoadOptions::with_parallel(gpu_topology(0))
-                .with_weight_residency(WeightResidency::DenseDiskStream(dense)),
+                .with_weight_residency(WeightResidency::dense_disk_stream(dense)),
             stream,
             cpu.stream(),
         )
@@ -17488,7 +17952,7 @@ mod tests {
         let mut first = load_pipeline_model_with_options(
             dir.path(),
             ModelLoadOptions::with_parallel(gpu_topology(0)).with_weight_residency(
-                WeightResidency::DenseDiskStream(sampled_dense_options(
+                WeightResidency::dense_disk_stream(sampled_dense_options(
                     first_requirements.0,
                     first_requirements.1,
                 )),
@@ -17500,7 +17964,7 @@ mod tests {
         let mut last = load_pipeline_model_with_options(
             dir.path(),
             ModelLoadOptions::with_parallel(gpu_topology(1)).with_weight_residency(
-                WeightResidency::DenseDiskStream(sampled_dense_options(
+                WeightResidency::dense_disk_stream(sampled_dense_options(
                     last_requirements.0,
                     last_requirements.1,
                 )),
@@ -17608,7 +18072,10 @@ mod tests {
         let host_error = load_pipeline_model_with_options(
             dir.path(),
             ModelLoadOptions::with_parallel(gpu_topology(0)).with_weight_residency(
-                WeightResidency::DenseDiskStream(sampled_dense_options(device_bytes, host_budget)),
+                WeightResidency::dense_disk_stream(sampled_dense_options(
+                    device_bytes,
+                    host_budget,
+                )),
             ),
             stream,
             cpu.stream(),
@@ -17626,7 +18093,10 @@ mod tests {
         let device_error = load_pipeline_model_with_options(
             dir.path(),
             ModelLoadOptions::with_parallel(gpu_topology(0)).with_weight_residency(
-                WeightResidency::DenseDiskStream(sampled_dense_options(device_budget, layer_bytes)),
+                WeightResidency::dense_disk_stream(sampled_dense_options(
+                    device_budget,
+                    layer_bytes,
+                )),
             ),
             stream,
             cpu.stream(),
@@ -18044,7 +18514,7 @@ mod tests {
         let mut first = load_pipeline_model_with_options(
             dir.path(),
             ModelLoadOptions::with_parallel(gpu_topology(0))
-                .with_weight_residency(WeightResidency::DenseDiskStream(dense)),
+                .with_weight_residency(WeightResidency::dense_disk_stream(dense)),
             stream,
             cpu.stream(),
         )
@@ -18052,7 +18522,7 @@ mod tests {
         let mut last = load_pipeline_model_with_options(
             dir.path(),
             ModelLoadOptions::with_parallel(gpu_topology(1))
-                .with_weight_residency(WeightResidency::DenseDiskStream(dense)),
+                .with_weight_residency(WeightResidency::dense_disk_stream(dense)),
             stream,
             cpu.stream(),
         )

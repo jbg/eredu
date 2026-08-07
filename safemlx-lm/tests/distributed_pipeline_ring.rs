@@ -37,8 +37,9 @@ use safemlx_lm::{
         scheduler::{RequestId, RequestStatus, SchedulerLimits},
     },
     CacheResidencyPolicy, CartesianExecution, DenseDiskStreamLoadOptions, DeviceAssignment,
-    ModelLoadOptions, PagedCacheOptions, ParallelTopology, PromptCacheDescriptor,
-    PromptCacheOptions, PromptCacheTopology, WeightResidency,
+    ExpertCacheLoadOptions, ModelLoadOptions, NonExpertWeightResidency, PagedCacheOptions,
+    ParallelTopology, PromptCacheDescriptor, PromptCacheOptions, PromptCacheTopology,
+    WeightResidency,
 };
 use safetensors::tensor::{serialize_to_file, Dtype, TensorView};
 
@@ -50,6 +51,7 @@ const PROMPT_CACHE_ROOT: &str = "SAFEMLX_LM_PIPELINE_PROMPT_CACHE";
 const MICROBATCH: &str = "SAFEMLX_LM_PIPELINE_MICROBATCH";
 const SCHEDULE_MISMATCH: &str = "SAFEMLX_LM_PIPELINE_SCHEDULE_MISMATCH";
 const CARTESIAN_AXES: &str = "SAFEMLX_LM_PIPELINE_CARTESIAN_AXES";
+const EXPERT_CACHE: &str = "SAFEMLX_LM_PIPELINE_EXPERT_CACHE";
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 enum FixtureFamily {
@@ -281,12 +283,30 @@ fn pipeline_ring_worker() {
             || matches!(family, FixtureFamily::Lfm2 | FixtureFamily::Lfm2Moe)))
     .then(|| resident_reference(&checkpoint, &stream));
     let dense_stream = std::env::var_os(DENSE_STREAM).is_some();
-    let mut model = if dense_stream {
+    let expert_cache = std::env::var_os(EXPERT_CACHE).is_some();
+    let mut model = if expert_cache {
+        let non_experts = if dense_stream {
+            NonExpertWeightResidency::DenseDiskStream(
+                DenseDiskStreamLoadOptions::new(u64::MAX, u64::MAX, 1, 1, 1).unwrap(),
+            )
+        } else {
+            NonExpertWeightResidency::FullyResident
+        };
+        load_pipeline_model_with_options(
+            &checkpoint,
+            ModelLoadOptions::with_parallel(topology).with_weight_residency(
+                WeightResidency::with_expert_cache(non_experts, ExpertCacheLoadOptions::default()),
+            ),
+            &stream,
+            &stream,
+        )
+        .unwrap()
+    } else if dense_stream {
         let dense = DenseDiskStreamLoadOptions::new(u64::MAX, u64::MAX, 1, 1, 1).unwrap();
         load_pipeline_model_with_options(
             &checkpoint,
             ModelLoadOptions::with_parallel(topology)
-                .with_weight_residency(WeightResidency::DenseDiskStream(dense)),
+                .with_weight_residency(WeightResidency::dense_disk_stream(dense)),
             &stream,
             &stream,
         )
@@ -363,6 +383,15 @@ fn pipeline_ring_worker() {
                 diagnostics.physical_read_bytes
             );
         }
+    }
+    if expert_cache {
+        let report = model.expert_cache_report().unwrap().unwrap();
+        assert_eq!(
+            report.owned_experts,
+            expected_range.len() * info.local_expert_ids.len()
+        );
+        assert!(report.owned_bytes > 0);
+        assert_eq!(report.device_resident_experts, 0);
     }
     if family == FixtureFamily::Llama {
         assert_eq!(
@@ -524,6 +553,15 @@ fn pipeline_ring_worker() {
         let report = model.dense_stream_report().unwrap().unwrap();
         assert!(report.prefill_forwards() >= 1);
         assert!(report.decode_forwards() >= 2);
+    }
+    if expert_cache {
+        let report = model.expert_cache_report().unwrap().unwrap();
+        let requests = report.prefill.device.requests + report.decode.device.requests;
+        if requests > 0 {
+            assert!(report.device_resident_experts > 0);
+        } else {
+            assert_eq!(report.device_resident_experts, 0);
+        }
     }
 }
 
@@ -2740,6 +2778,86 @@ fn ring_qwen3_moe_streamed_tensor_pipeline_expert() {
     run_ring_cartesian_pipeline(true, FixtureFamily::Qwen3Moe, "tp-pp-ep");
 }
 
+/// Verifies resident non-expert parameters plus stage/EP-local independent
+/// expert caches across PP=2 x EP=2, including persistence and generation.
+#[test]
+#[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
+fn ring_qwen3_moe_resident_nonexpert_pipeline_expert_cache() {
+    run_ring_cartesian_pipeline_mode(
+        false,
+        FixtureFamily::Qwen3Moe,
+        "pp-ep",
+        WorkerMode::ExpertCache,
+    );
+}
+
+/// Verifies TP-sharded cached experts compose with dense-streamed non-experts
+/// and corresponding-coordinate pipeline lanes in an eight-rank topology.
+#[test]
+#[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
+fn ring_qwen3_moe_streamed_tensor_pipeline_expert_cache() {
+    run_ring_cartesian_pipeline_mode(
+        true,
+        FixtureFamily::Qwen3Moe,
+        "tp-pp-ep",
+        WorkerMode::ExpertCache,
+    );
+}
+
+/// Exercises stage-local cached expert selections and bounded reads from GGUF.
+#[test]
+#[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
+fn ring_qwen3_moe_gguf_pipeline_expert_cache() {
+    run_ring_cartesian_pipeline_mode(
+        true,
+        FixtureFamily::Qwen3MoeGguf,
+        "pp-ep",
+        WorkerMode::ExpertCache,
+    );
+}
+
+/// Verifies global descriptor mismatch consensus remains deadlock-free while
+/// every stage also owns an independent expert cache.
+#[test]
+#[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
+fn ring_qwen3_moe_pipeline_expert_cache_mismatch_consensus() {
+    run_ring_cartesian_pipeline_mode(
+        false,
+        FixtureFamily::Qwen3Moe,
+        "pp-ep",
+        WorkerMode::ExpertCacheScheduleMismatch,
+    );
+}
+
+/// Verifies PP-only stages cache all of their local layers' experts without
+/// constructing an EP communicator. Prefill, decode, prompt persistence, and
+/// synchronized generation are exercised by the shared worker.
+#[test]
+#[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
+fn ring_qwen3_moe_pipeline_expert_cache_without_ep() {
+    run_ring_pipeline_mode(false, FixtureFamily::Qwen3Moe, WorkerMode::ExpertCache);
+}
+
+/// Verifies TP-sharded cached experts and dense-streamed non-experts compose
+/// across TP=2 x PP=2 while EP remains inactive.
+#[test]
+#[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
+fn ring_qwen3_moe_streamed_tensor_pipeline_expert_cache_without_ep() {
+    run_ring_cartesian_pipeline_mode(
+        true,
+        FixtureFamily::Qwen3Moe,
+        "tp-pp",
+        WorkerMode::ExpertCache,
+    );
+}
+
+/// Exercises PP-only cache ownership and bounded reads from canonical GGUF.
+#[test]
+#[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
+fn ring_qwen3_moe_gguf_pipeline_expert_cache_without_ep() {
+    run_ring_pipeline_mode(true, FixtureFamily::Qwen3MoeGguf, WorkerMode::ExpertCache);
+}
+
 /// Executes the Qwen3-MoE triple-axis path from a canonical GGUF and verifies
 /// rank-local ownership, bounded reads, cache persistence, and parity.
 #[test]
@@ -2872,6 +2990,8 @@ fn run_ring_cartesian_pipeline_mode(
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 enum WorkerMode {
     Standard,
+    ExpertCache,
+    ExpertCacheScheduleMismatch,
     Microbatch,
     ScheduleMismatch,
 }
@@ -2982,6 +3102,13 @@ fn run_ring_pipeline_processes(
         }
         match mode {
             WorkerMode::Standard => {}
+            WorkerMode::ExpertCache => {
+                command.env(EXPERT_CACHE, "1");
+            }
+            WorkerMode::ExpertCacheScheduleMismatch => {
+                command.env(EXPERT_CACHE, "1");
+                command.env(SCHEDULE_MISMATCH, "1");
+            }
             WorkerMode::Microbatch => {
                 command.env(MICROBATCH, "1");
             }

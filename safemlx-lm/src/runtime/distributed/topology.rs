@@ -477,6 +477,15 @@ impl ParallelTopology {
             && self.expert_parallel_size == 1
     }
 
+    /// Returns whether the selected Cartesian axis has more than one member.
+    pub const fn is_axis_active(self, axis: ParallelAxis) -> bool {
+        match axis {
+            ParallelAxis::Tensor => self.tensor_parallel_size > 1,
+            ParallelAxis::Pipeline => self.pipeline_parallel_size > 1,
+            ParallelAxis::Expert => self.expert_parallel_size > 1,
+        }
+    }
+
     /// Validates combined-axis geometry before checkpoint payloads are opened.
     ///
     /// Every Cartesian combination is accepted. Architecture loaders remain

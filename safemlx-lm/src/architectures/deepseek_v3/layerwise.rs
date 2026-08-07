@@ -33,8 +33,7 @@ use crate::{
         PromptCacheTopology,
     },
     runtime::checkpoint::binding::{
-        build_module_bindings_with_recipes, canonical_checkpoint_name, materialize_module_bindings,
-        populate_module_from_arrays_excluding, populate_module_from_lease,
+        build_module_bindings_with_recipes, canonical_checkpoint_name, populate_module_from_lease,
         populate_module_from_lease_excluding,
     },
     runtime::checkpoint::recipe::DerivedWeightRecipe,
@@ -48,8 +47,9 @@ use crate::{
     runtime::execution::layerwise::{
         load_layerwise_model, load_safetensors_layerwise_model,
         load_tensor_parallel_layerwise_model, open_safetensors_weight_store,
-        transformed_module_weight_store, ArchitectureAdapter, LayerExecutionLoadOptions,
-        LayerwiseForwardState, LayerwiseModel, StaticUnitBindings, WeightResidency,
+        transformed_module_weight_store, ArchitectureAdapter, LayerWeightResidency,
+        LayerwiseForwardState, LayerwiseModel, NonExpertWeightResidency, StaticUnitBindings,
+        WeightResidency,
     },
     runtime::residency::expert_cache::{
         ExpertCache, ExpertCacheError, ExpertCacheLoadOptions, ExpertCacheReport,
@@ -71,6 +71,10 @@ impl DeepSeekV3LayerwiseModel {
     /// Returns the validated architecture arguments.
     pub fn args(&self) -> &ModelArgs {
         self.execution.adapter().args()
+    }
+
+    pub(crate) fn bind_parallel_topology(&mut self, topology: crate::ParallelTopology) {
+        self.execution.bind_parallel_topology(topology);
     }
 
     /// Returns the canonical cache-relevant architecture identity.
@@ -334,7 +338,7 @@ impl CausalLm<Cache> for DeepSeekV3LayerwiseModel {
 /// Loads DeepSeek-V3/R1 through the generalized execution engine.
 pub fn load_deepseek_v3_layerwise_model(
     model_dir: impl AsRef<Path>,
-    options: impl Into<LayerExecutionLoadOptions>,
+    options: impl Into<LayerWeightResidency>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<DeepSeekV3LayerwiseModel, Error> {
@@ -371,7 +375,7 @@ pub(crate) fn execute_transformed_deepseek_v3_model(
         execution: load_layerwise_model(
             store,
             adapter,
-            LayerExecutionLoadOptions::FullyResident,
+            LayerWeightResidency::FullyResident,
             stream,
             weights_stream,
         )?,
@@ -381,7 +385,7 @@ pub(crate) fn execute_transformed_deepseek_v3_model(
 /// Loads DeepSeek-V3/R1 through the generalized tensor-parallel engine.
 pub fn load_deepseek_v3_tensor_parallel_model(
     model_dir: impl AsRef<Path>,
-    options: impl Into<LayerExecutionLoadOptions>,
+    options: impl Into<LayerWeightResidency>,
     build: crate::runtime::distributed::parallel::ParallelBuildContext,
     stream: &Stream,
     weights_stream: &Stream,
@@ -428,7 +432,7 @@ pub fn load_deepseek_v3_tensor_parallel_model(
 pub(crate) fn load_deepseek_v3_gguf_tensor_parallel_model(
     checkpoint: &GgufCheckpoint,
     metadata: &HashMap<String, GgufMetadataValue>,
-    options: LayerExecutionLoadOptions,
+    options: LayerWeightResidency,
     build: crate::runtime::distributed::parallel::ParallelBuildContext,
     stream: &Stream,
     weights_stream: &Stream,
@@ -484,55 +488,26 @@ pub(crate) fn load_deepseek_v3_gguf_layerwise_model(
             resident::translate_gguf_weight_name,
             residency.max_mapped_shards(),
         )?);
-    let execution = match residency {
-        WeightResidency::LayerwiseHost(options) => load_layerwise_model(
-            store,
-            DeepSeekV3LayerwiseAdapter::new(args, stream)?,
-            options,
-            stream,
-            weights_stream,
-        )?,
-        WeightResidency::DenseDiskStream(options) => load_layerwise_model(
-            store,
-            DeepSeekV3LayerwiseAdapter::new(args, stream)?,
-            options,
-            stream,
-            weights_stream,
-        )?,
-        WeightResidency::SparseExpertCache(options) => {
-            return Ok((
-                load_deepseek_gguf_sparse_with_store(
-                    store,
-                    args,
-                    options,
-                    options.non_expert,
-                    stream,
-                    weights_stream,
-                )?,
-                prepared.eos_token_ids,
-            ));
-        }
-        WeightResidency::SparseExpertCacheWithDenseLayers(options) => {
-            return Ok((
-                load_deepseek_gguf_sparse_with_store(
-                    store,
-                    args,
-                    options.expert_cache,
-                    options.non_expert,
-                    stream,
-                    weights_stream,
-                )?,
-                prepared.eos_token_ids,
-            ));
-        }
-        WeightResidency::FullyResident => load_layerwise_model(
-            store,
-            DeepSeekV3LayerwiseAdapter::new(args, stream)?,
-            LayerExecutionLoadOptions::FullyResident,
-            stream,
-            weights_stream,
-        )?,
-    };
+    if let Some(expert_options) = residency.expert_cache() {
+        return Ok((
+            load_deepseek_gguf_sparse_with_store(
+                store,
+                args,
+                expert_options,
+                residency.layers(),
+                stream,
+                weights_stream,
+            )?,
+            prepared.eos_token_ids,
+        ));
+    }
+    let execution = load_layerwise_model(
+        store,
+        DeepSeekV3LayerwiseAdapter::new(args, stream)?,
+        residency.layers(),
+        stream,
+        weights_stream,
+    )?;
     Ok((
         DeepSeekV3LayerwiseModel { execution },
         prepared.eos_token_ids,
@@ -541,67 +516,11 @@ pub(crate) fn load_deepseek_v3_gguf_layerwise_model(
 
 /// Loads replicated DeepSeek GGUF parameters for sparse expert-parallel
 /// execution without materializing any routed-expert bank.
-pub(crate) fn load_deepseek_v3_gguf_sparse_ep_base(
-    checkpoint: &GgufCheckpoint,
-    metadata: &HashMap<String, GgufMetadataValue>,
-    max_mapped_shards: usize,
-    stream: &Stream,
-    weights_stream: &Stream,
-) -> Result<(resident::Model, Arc<dyn WeightStore + Send + Sync>), Error> {
-    let prepared = resident::prepare_gguf_checkpoint(checkpoint, metadata, None, weights_stream)?;
-    let args = prepared.args;
-    let store: Arc<dyn WeightStore + Send + Sync> =
-        Arc::new(GgufWeightStore::new_with_max_mapped_shards(
-            checkpoint.clone(),
-            resident::translate_gguf_weight_name,
-            max_mapped_shards,
-        )?);
-    let adapter = DeepSeekV3LayerwiseAdapter::new_sparse(args.clone(), stream)?;
-    let mut model = resident::Model::new(args, stream)?;
-
-    let bindings = build_module_bindings_with_recipes(
-        &model.model.embed_tokens,
-        "model.embed_tokens",
-        store.as_ref(),
-        BTreeMap::new(),
-    )?;
-    let arrays = materialize_module_bindings(store.as_ref(), &bindings, weights_stream, stream)?;
-    populate_module_from_arrays_excluding(&mut model.model.embed_tokens, &arrays, |_| false)?;
-
-    let bindings = build_module_bindings_with_recipes(
-        &model.model.norm,
-        "model.norm",
-        store.as_ref(),
-        BTreeMap::new(),
-    )?;
-    let arrays = materialize_module_bindings(store.as_ref(), &bindings, weights_stream, stream)?;
-    populate_module_from_arrays_excluding(&mut model.model.norm, &arrays, |_| false)?;
-
-    let bindings = build_module_bindings_with_recipes(
-        &model.lm_head,
-        "lm_head",
-        store.as_ref(),
-        BTreeMap::new(),
-    )?;
-    let arrays = materialize_module_bindings(store.as_ref(), &bindings, weights_stream, stream)?;
-    populate_module_from_arrays_excluding(&mut model.lm_head, &arrays, |_| false)?;
-
-    for (index, layer) in model.model.layers.iter_mut().enumerate() {
-        let bindings = adapter.layer_bindings(0, index, layer, store.as_ref())?;
-        let arrays =
-            materialize_module_bindings(store.as_ref(), &bindings, weights_stream, stream)?;
-        populate_module_from_arrays_excluding(layer, &arrays, |name| {
-            name.starts_with("mlp.experts.")
-        })?;
-    }
-    Ok((model, store))
-}
-
 fn load_deepseek_gguf_sparse_with_store(
     store: Arc<dyn WeightStore + Send + Sync>,
     args: ModelArgs,
     options: ExpertCacheLoadOptions,
-    non_expert: impl Into<LayerExecutionLoadOptions>,
+    non_expert: impl Into<LayerWeightResidency>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<DeepSeekV3LayerwiseModel, Error> {
@@ -623,7 +542,7 @@ fn load_deepseek_gguf_sparse_with_store(
 pub(crate) fn load_deepseek_v3_sparse_ep_base_with_store(
     store: Arc<dyn WeightStore + Send + Sync>,
     args: ModelArgs,
-    non_expert: impl Into<LayerExecutionLoadOptions>,
+    non_expert: impl Into<LayerWeightResidency>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<DeepSeekV3LayerwiseModel, Error> {
@@ -636,7 +555,7 @@ pub(crate) fn load_deepseek_v3_sparse_ep_base_with_store(
 pub(crate) fn load_deepseek_v3_sparse_tp_ep_base_with_store(
     store: Arc<dyn WeightStore + Send + Sync>,
     args: ModelArgs,
-    non_expert: impl Into<LayerExecutionLoadOptions>,
+    non_expert: impl Into<LayerWeightResidency>,
     build: crate::runtime::distributed::parallel::ParallelBuildContext,
     stream: &Stream,
     weights_stream: &Stream,
@@ -654,43 +573,11 @@ pub(crate) fn load_deepseek_v3_sparse_tp_ep_base_with_store(
     Ok(DeepSeekV3LayerwiseModel { execution })
 }
 
-/// Loads DeepSeek-V3/R1 with layerwise non-expert weights and expert-granular caching.
-pub fn load_deepseek_v3_sparse_expert_cache_model(
+/// Loads DeepSeek-V3/R1 with independently cached experts and bounded non-expert units.
+pub fn load_deepseek_v3_expert_cache_model(
     model_dir: impl AsRef<Path>,
+    non_expert: NonExpertWeightResidency,
     options: ExpertCacheLoadOptions,
-    stream: &Stream,
-    weights_stream: &Stream,
-) -> Result<DeepSeekV3LayerwiseModel, Error> {
-    load_deepseek_v3_sparse_expert_cache_model_with_non_expert(
-        model_dir,
-        options,
-        options.non_expert,
-        stream,
-        weights_stream,
-    )
-}
-
-/// Loads DeepSeek-V3/R1 with expert caching and disk-streamed non-expert units.
-pub fn load_deepseek_v3_sparse_expert_cache_model_with_dense_layers(
-    model_dir: impl AsRef<Path>,
-    options: ExpertCacheLoadOptions,
-    non_expert: crate::runtime::residency::dense_stream::DenseDiskStreamLoadOptions,
-    stream: &Stream,
-    weights_stream: &Stream,
-) -> Result<DeepSeekV3LayerwiseModel, Error> {
-    load_deepseek_v3_sparse_expert_cache_model_with_non_expert(
-        model_dir,
-        options,
-        non_expert,
-        stream,
-        weights_stream,
-    )
-}
-
-fn load_deepseek_v3_sparse_expert_cache_model_with_non_expert(
-    model_dir: impl AsRef<Path>,
-    options: ExpertCacheLoadOptions,
-    non_expert: impl Into<LayerExecutionLoadOptions>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<DeepSeekV3LayerwiseModel, Error> {
@@ -699,7 +586,7 @@ fn load_deepseek_v3_sparse_expert_cache_model_with_non_expert(
         crate::api::ModelKind::DeepSeekV3,
         model_dir,
         crate::api::ModelLoadOptions::default()
-            .with_weight_residency(WeightResidency::SparseExpertCache(options)),
+            .with_weight_residency(WeightResidency::with_expert_cache(non_expert, options)),
     )?;
     let args = resident::get_model_args(model_dir)?;
     args.validate()?;
@@ -1954,7 +1841,7 @@ mod tests {
     };
 
     use super::{
-        load_deepseek_v3_layerwise_model, load_deepseek_v3_sparse_expert_cache_model,
+        load_deepseek_v3_expert_cache_model, load_deepseek_v3_layerwise_model,
         register_deepseek_layer_parallel_plan, DeepSeekV3LayerwiseAdapter,
         DeepSeekV3LayerwiseModel,
     };
@@ -2351,15 +2238,14 @@ mod tests {
         } else {
             fixture
         };
-        let expert_options = ExpertCacheLoadOptions::new(
-            LayerwiseLoadOptions::new(OffloadConfig::new(None, None, 1).unwrap()),
-            OffloadConfig::new(None, None, 1).unwrap(),
-            1 << 20,
-            1,
-        )
-        .unwrap();
-        let mut cached = load_deepseek_v3_sparse_expert_cache_model(
+        let expert_options =
+            ExpertCacheLoadOptions::new(OffloadConfig::new(None, None, 1).unwrap(), 1 << 20, 1)
+                .unwrap();
+        let mut cached = load_deepseek_v3_expert_cache_model(
             dir.path(),
+            crate::NonExpertWeightResidency::LayerwiseHost(LayerwiseLoadOptions::new(
+                OffloadConfig::new(None, None, 1).unwrap(),
+            )),
             expert_options,
             gpu.stream(),
             cpu.stream(),

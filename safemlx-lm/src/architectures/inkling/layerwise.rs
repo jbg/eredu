@@ -47,7 +47,7 @@ use crate::{
     runtime::execution::layerwise::{
         load_layerwise_model, load_safetensors_layerwise_model,
         load_tensor_parallel_layerwise_model, open_safetensors_weight_store, ArchitectureAdapter,
-        ExecutionGroupDag, LayerExecutionLoadOptions, LayerwiseForwardState, LayerwiseModel,
+        ExecutionGroupDag, LayerWeightResidency, LayerwiseForwardState, LayerwiseModel,
         StaticUnitBindings, WeightResidency,
     },
     runtime::residency::expert_cache::{
@@ -73,6 +73,10 @@ impl InklingLayerwiseModel {
     /// Returns the parsed Inkling configuration.
     pub fn args(&self) -> &ModelArgs {
         self.execution.adapter().args()
+    }
+
+    pub(crate) fn bind_parallel_topology(&mut self, topology: crate::ParallelTopology) {
+        self.execution.bind_parallel_topology(topology);
     }
 
     /// Creates global/sliding KV and short-convolution state for every layer.
@@ -359,7 +363,7 @@ impl CausalLm<Cache> for InklingLayerwiseModel {
 /// Loads Inkling's multimodal model through the generalized execution engine.
 pub fn load_inkling_layerwise_model(
     model_dir: impl AsRef<Path>,
-    options: impl Into<LayerExecutionLoadOptions>,
+    options: impl Into<LayerWeightResidency>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<InklingLayerwiseModel, Error> {
@@ -387,7 +391,7 @@ pub fn load_inkling_layerwise_model(
 /// Loads Inkling with a rank-local hierarchical vision execution group.
 pub fn load_inkling_tensor_parallel_layerwise_model(
     model_dir: impl AsRef<Path>,
-    options: impl Into<LayerExecutionLoadOptions>,
+    options: impl Into<LayerWeightResidency>,
     build: crate::runtime::distributed::parallel::ParallelBuildContext,
     stream: &Stream,
     weights_stream: &Stream,
@@ -436,7 +440,7 @@ pub(crate) fn load_inkling_gguf_tensor_parallel_model(
     checkpoint: &GgufCheckpoint,
     metadata: &HashMap<String, GgufMetadataValue>,
     mmproj: Option<&resident::InklingMmprojGguf>,
-    options: LayerExecutionLoadOptions,
+    options: LayerWeightResidency,
     build: crate::runtime::distributed::parallel::ParallelBuildContext,
     stream: &Stream,
     weights_stream: &Stream,
@@ -480,55 +484,26 @@ pub(crate) fn load_inkling_gguf_layerwise_model(
     let prepared = resident::prepare_gguf_checkpoint_with_mmproj(checkpoint, metadata, mmproj)?;
     let store = inkling_gguf_store(checkpoint, mmproj, residency.max_mapped_shards())?;
     let args = prepared.args;
-    let execution = match residency {
-        WeightResidency::LayerwiseHost(options) => load_layerwise_model(
-            store,
-            InklingLayerwiseAdapter::new(args, stream)?,
-            options,
-            stream,
-            weights_stream,
-        )?,
-        WeightResidency::DenseDiskStream(options) => load_layerwise_model(
-            store,
-            InklingLayerwiseAdapter::new(args, stream)?,
-            options,
-            stream,
-            weights_stream,
-        )?,
-        WeightResidency::SparseExpertCache(options) => {
-            return Ok((
-                load_inkling_gguf_sparse_with_store(
-                    store,
-                    args,
-                    options,
-                    options.non_expert,
-                    stream,
-                    weights_stream,
-                )?,
-                prepared.eos_token_ids,
-            ));
-        }
-        WeightResidency::SparseExpertCacheWithDenseLayers(options) => {
-            return Ok((
-                load_inkling_gguf_sparse_with_store(
-                    store,
-                    args,
-                    options.expert_cache,
-                    options.non_expert,
-                    stream,
-                    weights_stream,
-                )?,
-                prepared.eos_token_ids,
-            ));
-        }
-        WeightResidency::FullyResident => load_layerwise_model(
-            store,
-            InklingLayerwiseAdapter::new(args, stream)?,
-            LayerExecutionLoadOptions::FullyResident,
-            stream,
-            weights_stream,
-        )?,
-    };
+    if let Some(expert_options) = residency.expert_cache() {
+        return Ok((
+            load_inkling_gguf_sparse_with_store(
+                store,
+                args,
+                expert_options,
+                residency.layers(),
+                stream,
+                weights_stream,
+            )?,
+            prepared.eos_token_ids,
+        ));
+    }
+    let execution = load_layerwise_model(
+        store,
+        InklingLayerwiseAdapter::new(args, stream)?,
+        residency.layers(),
+        stream,
+        weights_stream,
+    )?;
     Ok((InklingLayerwiseModel { execution }, prepared.eos_token_ids))
 }
 
@@ -553,7 +528,7 @@ fn load_inkling_gguf_sparse_with_store(
     store: Arc<dyn WeightStore + Send + Sync>,
     args: ModelArgs,
     options: ExpertCacheLoadOptions,
-    non_expert: impl Into<LayerExecutionLoadOptions>,
+    non_expert: impl Into<LayerWeightResidency>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<InklingLayerwiseModel, Error> {
@@ -572,43 +547,11 @@ fn load_inkling_gguf_sparse_with_store(
     Ok(InklingLayerwiseModel { execution })
 }
 
-/// Loads Inkling with expert-granular sparse caching for routed text experts.
-pub fn load_inkling_sparse_expert_cache_model(
+/// Loads Inkling with independently cached experts and bounded non-expert units.
+pub fn load_inkling_expert_cache_model(
     model_dir: impl AsRef<Path>,
+    non_expert: crate::NonExpertWeightResidency,
     options: ExpertCacheLoadOptions,
-    stream: &Stream,
-    weights_stream: &Stream,
-) -> Result<InklingLayerwiseModel, Error> {
-    load_inkling_sparse_expert_cache_model_with_non_expert(
-        model_dir,
-        options,
-        options.non_expert,
-        stream,
-        weights_stream,
-    )
-}
-
-/// Loads Inkling with expert caching and disk-streamed non-expert units.
-pub fn load_inkling_sparse_expert_cache_model_with_dense_layers(
-    model_dir: impl AsRef<Path>,
-    options: ExpertCacheLoadOptions,
-    non_expert: impl Into<LayerExecutionLoadOptions>,
-    stream: &Stream,
-    weights_stream: &Stream,
-) -> Result<InklingLayerwiseModel, Error> {
-    load_inkling_sparse_expert_cache_model_with_non_expert(
-        model_dir,
-        options,
-        non_expert,
-        stream,
-        weights_stream,
-    )
-}
-
-fn load_inkling_sparse_expert_cache_model_with_non_expert(
-    model_dir: impl AsRef<Path>,
-    options: ExpertCacheLoadOptions,
-    non_expert: impl Into<LayerExecutionLoadOptions>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<InklingLayerwiseModel, Error> {
@@ -617,7 +560,7 @@ fn load_inkling_sparse_expert_cache_model_with_non_expert(
         crate::api::ModelKind::Inkling,
         model_dir,
         crate::api::ModelLoadOptions::default()
-            .with_weight_residency(WeightResidency::SparseExpertCache(options)),
+            .with_weight_residency(WeightResidency::with_expert_cache(non_expert, options)),
     )?;
     let args = resident::get_model_args(model_dir)?;
     if args.text_config.n_routed_experts <= 0
@@ -651,7 +594,7 @@ fn load_inkling_sparse_expert_cache_model_with_non_expert(
 pub(crate) fn load_inkling_sparse_ep_base_with_store(
     store: Arc<dyn WeightStore + Send + Sync>,
     args: ModelArgs,
-    non_expert: impl Into<LayerExecutionLoadOptions>,
+    non_expert: impl Into<LayerWeightResidency>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<InklingLayerwiseModel, Error> {
@@ -665,7 +608,7 @@ pub(crate) fn load_inkling_sparse_ep_base_with_store(
 pub(crate) fn load_inkling_sparse_tp_ep_base_with_store(
     store: Arc<dyn WeightStore + Send + Sync>,
     args: ModelArgs,
-    non_expert: impl Into<LayerExecutionLoadOptions>,
+    non_expert: impl Into<LayerWeightResidency>,
     build: crate::runtime::distributed::parallel::ParallelBuildContext,
     stream: &Stream,
     weights_stream: &Stream,
@@ -1192,8 +1135,8 @@ impl ArchitectureAdapter for InklingLayerwiseAdapter {
         topology: Option<crate::ParallelTopology>,
     ) -> Result<PromptCacheModelIdentity, Error> {
         let layer_layout = match topology {
-            None => resident::prompt_cache_layer_layout(&self.args),
-            Some(_) => resident::prompt_cache_layer_layout_with_geometry(
+            Some(topology) if topology.is_axis_active(crate::ParallelAxis::Tensor) => {
+                resident::prompt_cache_layer_layout_with_geometry(
                 &self.args,
                 self.parallel_text_geometry.as_ref().ok_or_else(|| {
                     Error::Parallel(
@@ -1201,7 +1144,9 @@ impl ArchitectureAdapter for InklingLayerwiseAdapter {
                             .into(),
                     )
                 })?,
-            ),
+            )
+            }
+            _ => resident::prompt_cache_layer_layout(&self.args),
         }?;
         let layer_count = self.args.text_config.num_hidden_layers as usize;
         Ok(PromptCacheModelIdentity {
@@ -2698,7 +2643,7 @@ mod tests {
     };
 
     use super::{
-        load_inkling_layerwise_model, load_inkling_sparse_expert_cache_model,
+        load_inkling_expert_cache_model, load_inkling_layerwise_model,
         load_inkling_tensor_parallel_layerwise_model, InklingLayerwiseAdapter,
     };
     use crate::{
@@ -2714,7 +2659,7 @@ mod tests {
             topology::{DeviceAssignment, ParallelTopology},
         },
         runtime::execution::layerwise::{
-            ArchitectureAdapter, LayerExecutionLoadOptions, LayerwiseLoadOptions,
+            ArchitectureAdapter, LayerWeightResidency, LayerwiseLoadOptions,
         },
         runtime::residency::dense_stream::DenseDiskStreamLoadOptions,
         runtime::residency::expert_cache::ExpertCacheLoadOptions,
@@ -3235,7 +3180,7 @@ mod tests {
         let options = DenseDiskStreamLoadOptions::new(u64::MAX, u64::MAX, 1, 1, 1).unwrap();
         let model = load_inkling_tensor_parallel_layerwise_model(
             dir.path(),
-            LayerExecutionLoadOptions::DenseDiskStream(options),
+            LayerWeightResidency::DenseDiskStream(options),
             build,
             gpu.stream(),
             cpu.stream(),
@@ -3342,16 +3287,19 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         write_fixture(dir.path(), &fixture, gpu.stream());
         let mut resident = resident::load_model(dir.path(), gpu.stream(), cpu.stream()).unwrap();
-        let options = ExpertCacheLoadOptions::new(
-            LayerwiseLoadOptions::new(OffloadConfig::new(None, None, 1).unwrap()),
-            OffloadConfig::new(None, None, 1).unwrap(),
-            768,
-            768,
+        let options =
+            ExpertCacheLoadOptions::new(OffloadConfig::new(None, None, 1).unwrap(), 768, 768)
+                .unwrap();
+        let mut cached = load_inkling_expert_cache_model(
+            dir.path(),
+            crate::NonExpertWeightResidency::LayerwiseHost(LayerwiseLoadOptions::new(
+                OffloadConfig::new(None, None, 1).unwrap(),
+            )),
+            options,
+            gpu.stream(),
+            cpu.stream(),
         )
         .unwrap();
-        let mut cached =
-            load_inkling_sparse_expert_cache_model(dir.path(), options, gpu.stream(), cpu.stream())
-                .unwrap();
         let mut resident_cache = resident.new_cache();
         let mut cached_cache = resident::Cache { layers: Vec::new() };
         for tokens in [

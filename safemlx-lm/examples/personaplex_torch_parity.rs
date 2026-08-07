@@ -13,7 +13,7 @@ use safemlx_lm::{
         generation::sampler::DefaultSampler,
         scheduler::{RequestId, SchedulerLimits},
     },
-    LayerExecutionLoadOptions,
+    LayerWeightResidency,
 };
 
 fn main() -> anyhow::Result<()> {
@@ -35,7 +35,7 @@ fn main() -> anyhow::Result<()> {
     let model = layerwise::load_pytorch_layerwise_model(
         args,
         model_dir.join(personaplex::MODEL_SAFETENSORS),
-        LayerExecutionLoadOptions::FullyResident,
+        LayerWeightResidency::FullyResident,
         stream,
         cpu.stream(),
     )?;

@@ -18,7 +18,6 @@ use crate::{
     architectures::moshi::layerwise::MoshiLayerwiseModel,
     error::Error,
     runtime::checkpoint::artifact::{fingerprint_artifact, ArtifactFile, LoadedArtifactIdentity},
-    runtime::execution::layerwise::{LayerExecutionLoadOptions, WeightResidency},
     runtime::generation::sampler::{DefaultSampler, Sampler},
     runtime::scheduler::{
         FairScheduler, RequestId, RequestStatus, SchedulerLimits, SchedulerReport, WorkDescriptor,
@@ -282,18 +281,13 @@ pub fn load_model_with_options(
     ensure_executable_load_options(options)?;
     let model_dir = model_dir.as_ref();
     let kind = realtime_model_kind(model_dir)?;
-    let execution = match options.weight_residency {
-        WeightResidency::FullyResident => LayerExecutionLoadOptions::FullyResident,
-        WeightResidency::LayerwiseHost(options) => options.into(),
-        WeightResidency::DenseDiskStream(options) => options.into(),
-        WeightResidency::SparseExpertCache(_)
-        | WeightResidency::SparseExpertCacheWithDenseLayers(_) => {
-            return Err(Error::UnsupportedArchitecture(format!(
-                "{} does not contain routed experts",
-                kind.model_type()
-            )));
-        }
-    };
+    if options.weight_residency.expert_cache().is_some() {
+        return Err(Error::UnsupportedArchitecture(format!(
+            "{} does not contain routed experts",
+            kind.model_type()
+        )));
+    }
+    let execution = options.weight_residency.layers();
     let model = if let Some(quantization) = options.quantization {
         let transformed = match kind {
             RealtimeModelKind::Moshi => {

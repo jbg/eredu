@@ -18,8 +18,6 @@ use safemlx::{
 
 use crate::{
     runtime::checkpoint::store::WeightStore,
-    runtime::execution::layerwise::LayerwiseLoadOptions,
-    runtime::residency::dense_stream::DenseDiskStreamLoadOptions,
     runtime::residency::manager::{
         OffloadUnit, ResidencyError, ResidencyManager, ResidencyReport, ResidentUnitLease,
     },
@@ -35,28 +33,6 @@ pub struct ExpertIdentity {
     pub layer: usize,
     /// Global expert identity from the model router.
     pub global_expert: usize,
-}
-
-/// Sparse expert-cache controls with dense disk streaming for non-expert units.
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub struct SparseExpertDenseStreamLoadOptions {
-    /// Existing expert-granular budgets and compact-bank controls.
-    pub expert_cache: ExpertCacheLoadOptions,
-    /// Finite streaming controls for attention, routers, norms, and dense weights.
-    pub non_expert: DenseDiskStreamLoadOptions,
-}
-
-impl SparseExpertDenseStreamLoadOptions {
-    /// Combines existing expert controls with dense non-expert streaming.
-    pub const fn new(
-        expert_cache: ExpertCacheLoadOptions,
-        non_expert: DenseDiskStreamLoadOptions,
-    ) -> Self {
-        Self {
-            expert_cache,
-            non_expert,
-        }
-    }
 }
 
 impl ExpertIdentity {
@@ -81,8 +57,6 @@ impl ExpertIdentity {
 /// Public controls for sparse routed-expert residency.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub struct ExpertCacheLoadOptions {
-    /// Residency controls for router, attention, normalization, and dense weights.
-    pub non_expert: LayerwiseLoadOptions,
     /// Independent host/device budgets and eviction policy for expert units.
     pub experts: OffloadConfig,
     /// Hard maximum bytes for one materialized temporary compact bank.
@@ -94,7 +68,6 @@ pub struct ExpertCacheLoadOptions {
 impl ExpertCacheLoadOptions {
     /// Creates strict sparse expert caching options.
     pub fn new(
-        non_expert: LayerwiseLoadOptions,
         experts: OffloadConfig,
         compact_bank_scratch_bytes: u64,
         prefill_compact_bank_target_bytes: u64,
@@ -112,7 +85,6 @@ impl ExpertCacheLoadOptions {
             });
         }
         Ok(Self {
-            non_expert,
             experts,
             compact_bank_scratch_bytes,
             prefill_compact_bank_target_bytes,
@@ -123,7 +95,6 @@ impl ExpertCacheLoadOptions {
 impl Default for ExpertCacheLoadOptions {
     fn default() -> Self {
         Self {
-            non_expert: LayerwiseLoadOptions::default(),
             experts: OffloadConfig::default(),
             compact_bank_scratch_bytes: u64::MAX,
             prefill_compact_bank_target_bytes: 1 << 30,
@@ -1269,13 +1240,7 @@ mod tests {
         ExpertCache::new(
             store,
             entries(),
-            ExpertCacheLoadOptions::new(
-                LayerwiseLoadOptions::default(),
-                experts,
-                scratch,
-                prefill_target,
-            )
-            .unwrap(),
+            ExpertCacheLoadOptions::new(experts, scratch, prefill_target).unwrap(),
             stream(),
             stream(),
         )
@@ -1368,11 +1333,11 @@ mod tests {
     fn prefill_target_is_required_and_cannot_exceed_scratch() {
         let experts = OffloadConfig::new(Some(48), Some(0), 1).unwrap();
         assert!(matches!(
-            ExpertCacheLoadOptions::new(LayerwiseLoadOptions::default(), experts, 64, 0),
+            ExpertCacheLoadOptions::new(experts, 64, 0),
             Err(ExpertCacheError::ZeroPrefillBankTarget)
         ));
         assert!(matches!(
-            ExpertCacheLoadOptions::new(LayerwiseLoadOptions::default(), experts, 64, 65),
+            ExpertCacheLoadOptions::new(experts, 64, 65),
             Err(ExpertCacheError::PrefillBankTargetExceedsScratch { .. })
         ));
     }

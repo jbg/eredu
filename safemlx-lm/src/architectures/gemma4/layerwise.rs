@@ -57,7 +57,7 @@ use crate::{
     runtime::execution::layerwise::{
         load_layerwise_model, load_safetensors_layerwise_model,
         load_tensor_parallel_layerwise_model, open_safetensors_weight_store,
-        transformed_module_weight_store, ArchitectureAdapter, LayerExecutionLoadOptions,
+        transformed_module_weight_store, ArchitectureAdapter, LayerWeightResidency,
         LayerwiseForwardState, LayerwiseModel, StaticUnitBindings, WeightResidency,
     },
     runtime::residency::manager::{ResidencyReport, ResidentUnitLease, WeightBinding},
@@ -750,7 +750,7 @@ impl CausalLm<Cache> for Gemma4LayerwiseModel {
 /// Loads Gemma 4 text and configured media towers through generalized residency.
 pub fn load_gemma4_layerwise_model(
     model_dir: impl AsRef<Path>,
-    options: impl Into<LayerExecutionLoadOptions>,
+    options: impl Into<LayerWeightResidency>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<Gemma4LayerwiseModel, Error> {
@@ -805,7 +805,7 @@ pub(crate) fn execute_transformed_gemma4_model(
         execution: load_layerwise_model(
             store,
             adapter,
-            LayerExecutionLoadOptions::FullyResident,
+            LayerWeightResidency::FullyResident,
             stream,
             weights_stream,
         )?,
@@ -823,7 +823,7 @@ pub(crate) fn execute_transformed_gemma4_text_model(
         execution: load_layerwise_model(
             store,
             adapter,
-            LayerExecutionLoadOptions::FullyResident,
+            LayerWeightResidency::FullyResident,
             stream,
             weights_stream,
         )?,
@@ -833,7 +833,7 @@ pub(crate) fn execute_transformed_gemma4_text_model(
 /// Loads Gemma 4 with rank-local vision and audio execution groups.
 pub fn load_gemma4_tensor_parallel_layerwise_model(
     model_dir: impl AsRef<Path>,
-    options: impl Into<LayerExecutionLoadOptions>,
+    options: impl Into<LayerWeightResidency>,
     build: crate::runtime::distributed::parallel::ParallelBuildContext,
     stream: &Stream,
     weights_stream: &Stream,
@@ -888,7 +888,7 @@ pub fn load_gemma4_tensor_parallel_layerwise_model(
 pub(crate) fn load_gemma4_gguf_tensor_parallel_model(
     checkpoint: &GgufCheckpoint,
     metadata: &HashMap<String, GgufMetadataValue>,
-    options: LayerExecutionLoadOptions,
+    options: LayerWeightResidency,
     build: crate::runtime::distributed::parallel::ParallelBuildContext,
     stream: &Stream,
     weights_stream: &Stream,
@@ -941,27 +941,13 @@ pub(crate) fn load_gemma4_gguf_layerwise_model(
             resident::translate_gguf_weight_name,
             residency.max_mapped_shards(),
         )?);
-    let execution = match residency {
-        WeightResidency::LayerwiseHost(options) => {
-            load_layerwise_model(store, adapter, options, stream, weights_stream)?
-        }
-        WeightResidency::DenseDiskStream(options) => {
-            load_layerwise_model(store, adapter, options, stream, weights_stream)?
-        }
-        WeightResidency::SparseExpertCache(_)
-        | WeightResidency::SparseExpertCacheWithDenseLayers(_) => {
-            return Err(Error::UnsupportedArchitecture(
-                "sparse expert caching is not supported for Gemma 4 GGUF checkpoints".into(),
-            ));
-        }
-        WeightResidency::FullyResident => load_layerwise_model(
-            store,
-            adapter,
-            LayerExecutionLoadOptions::FullyResident,
-            stream,
-            weights_stream,
-        )?,
-    };
+    if residency.expert_cache().is_some() {
+        return Err(Error::UnsupportedArchitecture(
+            "independent expert caching is not supported for Gemma 4 GGUF checkpoints".into(),
+        ));
+    }
+    let execution =
+        load_layerwise_model(store, adapter, residency.layers(), stream, weights_stream)?;
     Ok((Gemma4LayerwiseModel { execution }, prepared.eos_token_ids))
 }
 
@@ -3440,7 +3426,7 @@ mod tests {
                 parallel::{ParallelBuildContext, ShardingPolicy},
                 topology::{DeviceAssignment, ParallelTopology},
             },
-            execution::layerwise::{LayerExecutionLoadOptions, LayerwiseLoadOptions},
+            execution::layerwise::{LayerWeightResidency, LayerwiseLoadOptions},
             residency::{
                 dense_stream::DenseDiskStreamLoadOptions,
                 policy::{MemoryTier, OffloadConfig},
@@ -3617,7 +3603,7 @@ mod tests {
         let options = DenseDiskStreamLoadOptions::new(u64::MAX, u64::MAX, 1, 1, 1).unwrap();
         let model = load_gemma4_tensor_parallel_layerwise_model(
             dir.path(),
-            LayerExecutionLoadOptions::DenseDiskStream(options),
+            LayerWeightResidency::DenseDiskStream(options),
             build,
             gpu.stream(),
             cpu.stream(),
@@ -4037,7 +4023,7 @@ mod tests {
         let options = DenseDiskStreamLoadOptions::new(u64::MAX, u64::MAX, 1, 1, 1).unwrap();
         let tp = load_gemma4_tensor_parallel_layerwise_model(
             dir.path(),
-            LayerExecutionLoadOptions::DenseDiskStream(options),
+            LayerWeightResidency::DenseDiskStream(options),
             build,
             gpu.stream(),
             cpu.stream(),

@@ -46,7 +46,7 @@ use crate::{
     runtime::execution::layerwise::{
         load_layerwise_model, load_safetensors_layerwise_model,
         load_tensor_parallel_layerwise_model, open_safetensors_weight_store,
-        transformed_module_weight_store, ArchitectureAdapter, LayerExecutionLoadOptions,
+        transformed_module_weight_store, ArchitectureAdapter, LayerWeightResidency,
         LayerwiseForwardState, LayerwiseModel, StaticUnitBindings, WeightResidency,
     },
     runtime::residency::expert_cache::{
@@ -73,6 +73,10 @@ impl GptOssLayerwiseModel {
     /// Returns the validated model arguments.
     pub fn args(&self) -> &ModelArgs {
         self.execution.adapter().args()
+    }
+
+    pub(crate) fn bind_parallel_topology(&mut self, topology: crate::ParallelTopology) {
+        self.execution.bind_parallel_topology(topology);
     }
 
     /// Returns the canonical cache-relevant architecture identity.
@@ -381,7 +385,7 @@ impl CausalLm<Cache> for GptOssLayerwiseModel {
 /// Loads GPT-OSS through the generalized execution engine.
 pub fn load_gpt_oss_layerwise_model(
     model_dir: impl AsRef<Path>,
-    options: impl Into<LayerExecutionLoadOptions>,
+    options: impl Into<LayerWeightResidency>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<GptOssLayerwiseModel, Error> {
@@ -417,7 +421,7 @@ pub(crate) fn execute_transformed_gpt_oss_model(
         execution: load_layerwise_model(
             store,
             adapter,
-            LayerExecutionLoadOptions::FullyResident,
+            LayerWeightResidency::FullyResident,
             stream,
             weights_stream,
         )?,
@@ -427,7 +431,7 @@ pub(crate) fn execute_transformed_gpt_oss_model(
 /// Loads GPT-OSS through the generalized tensor-parallel execution engine.
 pub fn load_gpt_oss_tensor_parallel_model(
     model_dir: impl AsRef<Path>,
-    options: impl Into<LayerExecutionLoadOptions>,
+    options: impl Into<LayerWeightResidency>,
     build: crate::runtime::distributed::parallel::ParallelBuildContext,
     stream: &Stream,
     weights_stream: &Stream,
@@ -472,7 +476,7 @@ pub fn load_gpt_oss_tensor_parallel_model(
 pub(crate) fn load_gpt_oss_gguf_tensor_parallel_model(
     checkpoint: &GgufCheckpoint,
     metadata: &HashMap<String, GgufMetadataValue>,
-    options: LayerExecutionLoadOptions,
+    options: LayerWeightResidency,
     build: crate::runtime::distributed::parallel::ParallelBuildContext,
     stream: &Stream,
     weights_stream: &Stream,
@@ -513,55 +517,26 @@ pub(crate) fn load_gpt_oss_gguf_layerwise_model(
             residency.max_mapped_shards(),
         )?);
     let args = prepared.args;
-    let execution = match residency {
-        WeightResidency::LayerwiseHost(options) => load_layerwise_model(
-            store,
-            GptOssLayerwiseAdapter::new(args, stream)?,
-            options,
-            stream,
-            weights_stream,
-        )?,
-        WeightResidency::DenseDiskStream(options) => load_layerwise_model(
-            store,
-            GptOssLayerwiseAdapter::new(args, stream)?,
-            options,
-            stream,
-            weights_stream,
-        )?,
-        WeightResidency::SparseExpertCache(options) => {
-            return Ok((
-                load_gpt_oss_gguf_sparse_with_store(
-                    store,
-                    args,
-                    options,
-                    options.non_expert,
-                    stream,
-                    weights_stream,
-                )?,
-                prepared.eos_token_ids,
-            ));
-        }
-        WeightResidency::SparseExpertCacheWithDenseLayers(options) => {
-            return Ok((
-                load_gpt_oss_gguf_sparse_with_store(
-                    store,
-                    args,
-                    options.expert_cache,
-                    options.non_expert,
-                    stream,
-                    weights_stream,
-                )?,
-                prepared.eos_token_ids,
-            ));
-        }
-        WeightResidency::FullyResident => load_layerwise_model(
-            store,
-            GptOssLayerwiseAdapter::new(args, stream)?,
-            LayerExecutionLoadOptions::FullyResident,
-            stream,
-            weights_stream,
-        )?,
-    };
+    if let Some(expert_options) = residency.expert_cache() {
+        return Ok((
+            load_gpt_oss_gguf_sparse_with_store(
+                store,
+                args,
+                expert_options,
+                residency.layers(),
+                stream,
+                weights_stream,
+            )?,
+            prepared.eos_token_ids,
+        ));
+    }
+    let execution = load_layerwise_model(
+        store,
+        GptOssLayerwiseAdapter::new(args, stream)?,
+        residency.layers(),
+        stream,
+        weights_stream,
+    )?;
     Ok((GptOssLayerwiseModel { execution }, prepared.eos_token_ids))
 }
 
@@ -569,7 +544,7 @@ fn load_gpt_oss_gguf_sparse_with_store(
     store: Arc<dyn WeightStore + Send + Sync>,
     args: ModelArgs,
     options: ExpertCacheLoadOptions,
-    non_expert: impl Into<LayerExecutionLoadOptions>,
+    non_expert: impl Into<LayerWeightResidency>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<GptOssLayerwiseModel, Error> {
@@ -588,43 +563,11 @@ fn load_gpt_oss_gguf_sparse_with_store(
     Ok(GptOssLayerwiseModel { execution })
 }
 
-/// Loads GPT-OSS with expert-granular sparse caching.
-pub fn load_gpt_oss_sparse_expert_cache_model(
+/// Loads GPT-OSS with independently cached experts and bounded non-expert units.
+pub fn load_gpt_oss_expert_cache_model(
     model_dir: impl AsRef<Path>,
+    non_expert: crate::NonExpertWeightResidency,
     options: ExpertCacheLoadOptions,
-    stream: &Stream,
-    weights_stream: &Stream,
-) -> Result<GptOssLayerwiseModel, Error> {
-    load_gpt_oss_sparse_expert_cache_model_with_non_expert(
-        model_dir,
-        options,
-        options.non_expert,
-        stream,
-        weights_stream,
-    )
-}
-
-/// Loads GPT-OSS with expert caching and disk-streamed non-expert units.
-pub fn load_gpt_oss_sparse_expert_cache_model_with_dense_layers(
-    model_dir: impl AsRef<Path>,
-    options: ExpertCacheLoadOptions,
-    non_expert: impl Into<LayerExecutionLoadOptions>,
-    stream: &Stream,
-    weights_stream: &Stream,
-) -> Result<GptOssLayerwiseModel, Error> {
-    load_gpt_oss_sparse_expert_cache_model_with_non_expert(
-        model_dir,
-        options,
-        non_expert,
-        stream,
-        weights_stream,
-    )
-}
-
-fn load_gpt_oss_sparse_expert_cache_model_with_non_expert(
-    model_dir: impl AsRef<Path>,
-    options: ExpertCacheLoadOptions,
-    non_expert: impl Into<LayerExecutionLoadOptions>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<GptOssLayerwiseModel, Error> {
@@ -632,7 +575,8 @@ fn load_gpt_oss_sparse_expert_cache_model_with_non_expert(
     crate::api::structural::validate_safetensors_load_path(
         crate::api::ModelKind::GptOss,
         model_dir,
-        crate::api::ModelLoadOptions::default(),
+        crate::api::ModelLoadOptions::default()
+            .with_weight_residency(WeightResidency::with_expert_cache(non_expert, options)),
     )?;
     let args = resident::get_model_args(model_dir)?;
     let mut adapter = GptOssLayerwiseAdapter::new(args.clone(), stream)?;
@@ -655,7 +599,7 @@ fn load_gpt_oss_sparse_expert_cache_model_with_non_expert(
 pub(crate) fn load_gpt_oss_sparse_ep_base_with_store(
     store: Arc<dyn WeightStore + Send + Sync>,
     args: ModelArgs,
-    non_expert: impl Into<LayerExecutionLoadOptions>,
+    non_expert: impl Into<LayerWeightResidency>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<GptOssLayerwiseModel, Error> {
@@ -669,7 +613,7 @@ pub(crate) fn load_gpt_oss_sparse_ep_base_with_store(
 pub(crate) fn load_gpt_oss_sparse_tp_ep_base_with_store(
     store: Arc<dyn WeightStore + Send + Sync>,
     args: ModelArgs,
-    non_expert: impl Into<LayerExecutionLoadOptions>,
+    non_expert: impl Into<LayerWeightResidency>,
     build: crate::runtime::distributed::parallel::ParallelBuildContext,
     stream: &Stream,
     weights_stream: &Stream,
@@ -1685,7 +1629,7 @@ mod tests {
         Array, Device, DeviceType, ExecutionContext, Stream,
     };
 
-    use super::{load_gpt_oss_layerwise_model, load_gpt_oss_sparse_expert_cache_model};
+    use super::{load_gpt_oss_expert_cache_model, load_gpt_oss_layerwise_model};
     use crate::{
         architectures::gpt_oss::model::{self as resident, Cache, Model, ModelArgs, MxFp4Config},
         runtime::residency::dense_stream::DenseDiskStreamLoadOptions,
@@ -1700,7 +1644,7 @@ mod tests {
                 parallel::{ParallelBuildContext, ShardingPolicy},
                 topology::{DeviceAssignment, ParallelTopology},
             },
-            execution::layerwise::{LayerExecutionLoadOptions, LayerwiseLoadOptions},
+            execution::layerwise::{LayerWeightResidency, LayerwiseLoadOptions},
         },
     };
 
@@ -1925,11 +1869,11 @@ mod tests {
 
         let mut resident = resident::load_model(dir.path(), gpu.stream(), cpu.stream()).unwrap();
         let options = if dense_stream {
-            LayerExecutionLoadOptions::DenseDiskStream(
+            LayerWeightResidency::DenseDiskStream(
                 DenseDiskStreamLoadOptions::new(u64::MAX, u64::MAX, depth, depth, depth).unwrap(),
             )
         } else {
-            LayerExecutionLoadOptions::LayerwiseHost(LayerwiseLoadOptions::new(
+            LayerWeightResidency::LayerwiseHost(LayerwiseLoadOptions::new(
                 OffloadConfig::new(None, None, depth).unwrap(),
             ))
         };
@@ -2051,16 +1995,19 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         write_fixture(dir.path(), &fixture);
         let mut resident = resident::load_model(dir.path(), gpu.stream(), cpu.stream()).unwrap();
-        let options = ExpertCacheLoadOptions::new(
-            LayerwiseLoadOptions::new(OffloadConfig::new(None, None, 1).unwrap()),
-            OffloadConfig::new(None, None, 1).unwrap(),
-            1 << 20,
-            1,
+        let options =
+            ExpertCacheLoadOptions::new(OffloadConfig::new(None, None, 1).unwrap(), 1 << 20, 1)
+                .unwrap();
+        let mut cached = load_gpt_oss_expert_cache_model(
+            dir.path(),
+            crate::NonExpertWeightResidency::LayerwiseHost(LayerwiseLoadOptions::new(
+                OffloadConfig::new(None, None, 1).unwrap(),
+            )),
+            options,
+            gpu.stream(),
+            cpu.stream(),
         )
         .unwrap();
-        let mut cached =
-            load_gpt_oss_sparse_expert_cache_model(dir.path(), options, gpu.stream(), cpu.stream())
-                .unwrap();
         let mut resident_cache = Cache::default();
         let mut cached_cache = Cache::default();
         for tokens in [

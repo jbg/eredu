@@ -589,12 +589,69 @@ pub fn dispatch_replicated_with<F>(
 where
     F: FnOnce(&DispatchedRoutes, &Stream) -> Result<Array, Error>,
 {
-    let total_started = Instant::now();
     if group.rank() != assignment.rank || group.size() != assignment.group_size {
         return Err(Error::Parallel(
             "expert assignment does not match the supplied group".into(),
         ));
     }
+    dispatch_owned_with(
+        hidden_states,
+        expert_ids,
+        weights,
+        assignment,
+        Some(group),
+        stream,
+        execute,
+    )
+}
+
+/// Dispatches routes to a singleton expert owner without creating a collective.
+///
+/// This is the EP-degree-one specialization of [`dispatch_replicated_with`].
+/// It retains the same validation, route compaction, cache callback, weighted
+/// recombination, and telemetry while making the absence of an EP communicator
+/// explicit.
+pub fn dispatch_local_with<F>(
+    hidden_states: &Array,
+    expert_ids: &Array,
+    weights: &Array,
+    assignment: &ExpertAssignment,
+    stream: &Stream,
+    execute: F,
+) -> Result<ReturnedRoutes, Error>
+where
+    F: FnOnce(&DispatchedRoutes, &Stream) -> Result<Array, Error>,
+{
+    if assignment.rank != 0 || assignment.group_size != 1 {
+        return Err(Error::Parallel(
+            "collective-free expert dispatch requires a singleton rank-zero assignment".into(),
+        ));
+    }
+    dispatch_owned_with(
+        hidden_states,
+        expert_ids,
+        weights,
+        assignment,
+        None,
+        stream,
+        execute,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn dispatch_owned_with<F>(
+    hidden_states: &Array,
+    expert_ids: &Array,
+    weights: &Array,
+    assignment: &ExpertAssignment,
+    group: Option<&Group>,
+    stream: &Stream,
+    execute: F,
+) -> Result<ReturnedRoutes, Error>
+where
+    F: FnOnce(&DispatchedRoutes, &Stream) -> Result<Array, Error>,
+{
+    let total_started = Instant::now();
     let compaction_started = Instant::now();
     let (routes, mut statistics) =
         compact_local_routes(hidden_states, expert_ids, weights, assignment, stream)?;
@@ -629,10 +686,16 @@ where
     };
     materialize_timing_phase([&local_output])?;
     statistics.expert_time += expert_started.elapsed();
-    let reduction_started = Instant::now();
-    let reduced_output = distributed::all_sum(&local_output, group, stream)?;
-    materialize_timing_phase([&reduced_output])?;
-    statistics.reduction_time += reduction_started.elapsed();
+    let reduced_output = match group {
+        Some(group) => {
+            let reduction_started = Instant::now();
+            let output = distributed::all_sum(&local_output, group, stream)?;
+            materialize_timing_phase([&output])?;
+            statistics.reduction_time += reduction_started.elapsed();
+            output
+        }
+        None => local_output.clone(),
+    };
     statistics.total_time = total_started.elapsed();
     Ok(ReturnedRoutes {
         local_output,

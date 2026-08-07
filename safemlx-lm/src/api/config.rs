@@ -1,6 +1,7 @@
 //! Model-family detection and architecture-independent load options.
 
 use super::*;
+use crate::runtime::execution::layerwise::WeightResidency;
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 /// Supported model-family dispatch target.
@@ -62,7 +63,7 @@ impl ModelLoadOptions {
         Self {
             quantization: Some(quantization.into()),
             parallel: None,
-            weight_residency: WeightResidency::FullyResident,
+            weight_residency: WeightResidency::fully_resident(),
         }
     }
 
@@ -272,11 +273,7 @@ impl GgufArchitecture {
     pub(crate) fn validate_load_policy(self, options: ModelLoadOptions) -> Result<(), Error> {
         let kind = self.model_kind();
         validate_load_policy(kind, ArtifactLoadKind::Gguf, options)?;
-        let sparse = matches!(
-            options.weight_residency,
-            WeightResidency::SparseExpertCache(_)
-                | WeightResidency::SparseExpertCacheWithDenseLayers(_)
-        );
+        let sparse = options.weight_residency.expert_cache().is_some();
         if sparse
             && !matches!(
                 self,
@@ -394,9 +391,7 @@ pub(crate) fn validate_load_policy(
         ));
     }
 
-    if options.quantization.is_some()
-        && !matches!(options.weight_residency, WeightResidency::FullyResident)
-    {
+    if options.quantization.is_some() && !options.weight_residency.is_fully_resident() {
         return Err(Error::Quantization(match artifact {
             ArtifactLoadKind::Safetensors => format!(
                 "load-time quantization is unsupported for {} nonresident loading; use a matching checkpoint-native packed format",
@@ -414,11 +409,7 @@ pub(crate) fn validate_load_policy(
         }));
     }
 
-    let sparse = matches!(
-        options.weight_residency,
-        WeightResidency::SparseExpertCache(_)
-            | WeightResidency::SparseExpertCacheWithDenseLayers(_)
-    );
+    let sparse = options.weight_residency.expert_cache().is_some();
     if artifact == ArtifactLoadKind::Safetensors
         && sparse
         && !matches!(

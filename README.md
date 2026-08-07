@@ -19,8 +19,9 @@ SafeMLX is independent of Apple and is not an official MLX project.
 - High-level loading and generation for supported text, multimodal, and
   realtime speech model families.
 - SafeTensors and bounded, streaming GGUF checkpoint readers.
-- Fully resident, layerwise, dense disk-streaming, and sparse expert-cache
-  weight-loading policies for supported SafeTensors models.
+- Composable ordinary-layer and routed-expert residency: complete layers may
+  be fully resident, host-layerwise, or dense disk-streamed; independent expert
+  caches compose with resident, host-layerwise, or streamed non-expert units.
 - Schema-v4 prompt-cache persistence with exact ordered per-layer attention,
   compressed-MLA, recurrent/convolution, and multimodal prefix state, distinct
   windows, processed-prefix identity, and distributed layer identity.
@@ -154,7 +155,10 @@ GPT-OSS can MXFP4-quantize eligible dense matrices without transcoding its
 expert banks. Dense disk streaming requires checkpoint-native encodings.
 Qwen3-MoE additionally supports arbitrary-geometry TP+PP+EP through the same
 Cartesian topology and semantic layer plan for fully resident or dense-streamed
-SafeTensors and canonical `qwen3moe` GGUF checkpoints.
+SafeTensors and canonical `qwen3moe` GGUF checkpoints. Its independent expert
+cache also composes with PP and TP+PP without requiring an EP communicator:
+each stage owns the experts for its local layers, and TP ranks retain only
+their semantic projection shards.
 LFM2 and LFM2-MoE use the same runtime for SafeTensors and canonical
 `lfm2`/`lfm2moe` GGUF checkpoints. Their alternating causal-convolution and
 full-attention layers materialize semantic state slots from the canonical

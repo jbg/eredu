@@ -43,12 +43,11 @@ use safemlx_lm::{
     runtime::generation::speculative::{MtpCapability, MtpCheckpointKind, MtpConfig},
     runtime::media::input as runtime_input,
     runtime::residency::{
-        dense_stream::DenseDiskStreamLoadOptions,
-        expert_cache::{ExpertCacheLoadOptions, SparseExpertDenseStreamLoadOptions},
+        dense_stream::DenseDiskStreamLoadOptions, expert_cache::ExpertCacheLoadOptions,
     },
-    CacheResidencyPolicy, CartesianExecution, DeviceAssignment, PagedCacheOptions,
-    ParallelTopology, PromptCacheDescriptor, PromptCacheOptions, PromptCacheTopology,
-    WeightResidency,
+    CacheResidencyPolicy, CartesianExecution, DeviceAssignment, NonExpertWeightResidency,
+    PagedCacheOptions, ParallelTopology, PromptCacheDescriptor, PromptCacheOptions,
+    PromptCacheTopology, WeightResidency,
 };
 
 const WORKER_RANK: &str = "SAFEMLX_LM_EXPERT_MODEL_RING_WORKER";
@@ -202,14 +201,17 @@ fn expert_parallel_model_ring_worker() {
             residency.as_str(),
             "streamed-cache" | "tensor-expert-streamed"
         ) {
-            WeightResidency::SparseExpertCacheWithDenseLayers(
-                SparseExpertDenseStreamLoadOptions::new(
-                    experts,
+            WeightResidency::with_expert_cache(
+                NonExpertWeightResidency::DenseDiskStream(
                     DenseDiskStreamLoadOptions::new(u64::MAX, u64::MAX, 1, 1, 1).unwrap(),
                 ),
+                experts,
             )
         } else {
-            WeightResidency::SparseExpertCache(experts)
+            WeightResidency::with_expert_cache(
+                NonExpertWeightResidency::LayerwiseHost(Default::default()),
+                experts,
+            )
         };
     }
     let assignment = match assignment_kind.as_str() {

@@ -59,7 +59,6 @@ use crate::{
         PromptCacheModelIdentity, PromptCacheOptions,
     },
     runtime::cache::{ConcatKeyValueCache, PagedKeyValueCache},
-    runtime::execution::layerwise::{LayerExecutionLoadOptions, WeightResidency},
     runtime::generation::speculative::{
         LoadedDrafter, MtpBatchOutput, MtpCache, MtpCapability, MtpCheckpointKind, MtpConfig,
         MtpExecutionStreams, MtpScheduler, MtpSchedulerOptions, MtpSchedulerStats,
@@ -331,178 +330,77 @@ fn load_model_for_kind(
 ) -> Result<Model, Error> {
     validate_load_policy(kind, ArtifactLoadKind::Safetensors, options)?;
     structural::validate_safetensors_load_path(kind, model_dir, options)?;
-    if let WeightResidency::SparseExpertCacheWithDenseLayers(combined) = options.weight_residency {
+    if let (Some(expert_cache), Some(non_expert)) = (
+        options.weight_residency.expert_cache(),
+        options.weight_residency.non_experts(),
+    ) {
         if options.quantization.is_some() {
             return Err(Error::Quantization(format!(
-                "load-time quantization is unsupported for {} sparse expert caching with dense disk streaming; use a matching checkpoint-native packed format",
+                "load-time quantization is unsupported for {} independent expert caching; use a matching checkpoint-native packed format",
                 kind.model_type_name()
             )));
         }
-        let expert_cache = combined.expert_cache;
-        let non_expert = combined.non_expert;
         return match kind {
             ModelKind::KimiLinear => Ok(Model::KimiLinear(
-                crate::architectures::kimi_linear::layerwise::load_kimi_linear_sparse_expert_cache_model_with_dense_layers(
-                    model_dir, expert_cache, non_expert, stream, weights_stream,
+                crate::architectures::kimi_linear::layerwise::load_kimi_linear_expert_cache_model(
+                    model_dir, non_expert, expert_cache, stream, weights_stream,
                 )?,
             )),
             ModelKind::DeepSeekV3 => Ok(Model::DeepSeekV3(
-                crate::architectures::deepseek_v3::layerwise::load_deepseek_v3_sparse_expert_cache_model_with_dense_layers(
-                    model_dir, expert_cache, non_expert, stream, weights_stream,
+                crate::architectures::deepseek_v3::layerwise::load_deepseek_v3_expert_cache_model(
+                    model_dir, non_expert, expert_cache, stream, weights_stream,
                 )?,
             )),
             ModelKind::GptOss => Ok(Model::GptOss(
-                crate::architectures::gpt_oss::layerwise::load_gpt_oss_sparse_expert_cache_model_with_dense_layers(
-                    model_dir, expert_cache, non_expert, stream, weights_stream,
+                crate::architectures::gpt_oss::layerwise::load_gpt_oss_expert_cache_model(
+                    model_dir, non_expert, expert_cache, stream, weights_stream,
                 )?,
             )),
             ModelKind::Inkling => Ok(Model::Inkling(
-                crate::architectures::inkling::layerwise::load_inkling_sparse_expert_cache_model_with_dense_layers(
-                    model_dir, expert_cache, non_expert, stream, weights_stream,
+                crate::architectures::inkling::layerwise::load_inkling_expert_cache_model(
+                    model_dir, non_expert, expert_cache, stream, weights_stream,
                 )?,
             )),
             ModelKind::Lfm2 => Ok(Model::Lfm2(
-                crate::architectures::lfm2::layerwise::load_lfm2_sparse_expert_cache_model_with_dense_layers(
-                    model_dir, expert_cache, non_expert, stream, weights_stream,
+                crate::architectures::lfm2::layerwise::load_lfm2_expert_cache_model(
+                    model_dir, non_expert, expert_cache, stream, weights_stream,
                 )?,
             )),
             ModelKind::NemotronH => Ok(Model::NemotronH(
-                crate::architectures::nemotron_h::layerwise::load_nemotron_h_sparse_expert_cache_model_with_dense_layers(
-                    model_dir, expert_cache, non_expert, stream, weights_stream,
+                crate::architectures::nemotron_h::layerwise::load_nemotron_h_expert_cache_model(
+                    model_dir, non_expert, expert_cache, stream, weights_stream,
                 )?,
             )),
             ModelKind::Qwen2 => Err(Error::UnsupportedArchitecture(
                 "Qwen2 is dense and does not support sparse expert-cache residency".into(),
             )),
             ModelKind::Qwen3 => Ok(Model::DenseQwen(
-                crate::architectures::qwen::dense::layerwise::load_qwen3_sparse_expert_cache_model_with_dense_layers(
-                    model_dir, expert_cache, non_expert, stream, weights_stream,
+                crate::architectures::qwen::dense::layerwise::load_qwen3_expert_cache_model(
+                    model_dir, non_expert, expert_cache, stream, weights_stream,
                 )?,
             )),
             ModelKind::Qwen3Next => Ok(Model::Qwen3Next(
-                crate::architectures::qwen::hybrid::layerwise::load_qwen3_next_sparse_expert_cache_model_with_dense_layers(
-                    model_dir, expert_cache, non_expert, stream, weights_stream,
+                crate::architectures::qwen::hybrid::layerwise::load_qwen3_next_expert_cache_model(
+                    model_dir, non_expert, expert_cache, stream, weights_stream,
                 )?,
             )),
             ModelKind::Qwen3VlMoe => Ok(Model::Qwen3VlMoe(
-                crate::architectures::qwen::vl::layerwise::load_qwen3_vl_sparse_expert_cache_model_with_dense_layers(
-                    model_dir, expert_cache, non_expert, stream, weights_stream,
+                crate::architectures::qwen::vl::layerwise::load_qwen3_vl_expert_cache_model(
+                    model_dir, non_expert, expert_cache, stream, weights_stream,
                 )?,
             )),
             ModelKind::Qwen35 => Ok(Model::Qwen35(
-                crate::architectures::qwen::hybrid::layerwise::load_qwen35_sparse_expert_cache_model_with_dense_layers(
-                    model_dir, expert_cache, non_expert, stream, weights_stream,
+                crate::architectures::qwen::hybrid::layerwise::load_qwen35_expert_cache_model(
+                    model_dir, non_expert, expert_cache, stream, weights_stream,
                 )?,
             )),
             _ => Err(Error::UnsupportedArchitecture(format!(
-                "sparse expert caching with dense disk streaming requires a supported safetensors MoE architecture, not {}",
+                "independent expert caching requires a supported safetensors MoE architecture, not {}",
                 kind.model_type_name()
             ))),
         };
     }
-    if let WeightResidency::SparseExpertCache(expert_cache) = options.weight_residency {
-        if options.quantization.is_some() {
-            return Err(Error::Quantization(format!(
-                "load-time quantization is unsupported for {} sparse expert caching; use a matching checkpoint-native packed format",
-                kind.model_type_name()
-            )));
-        }
-        return match kind {
-            ModelKind::KimiLinear => Ok(Model::KimiLinear(
-                crate::architectures::kimi_linear::layerwise::load_kimi_linear_sparse_expert_cache_model(
-                    model_dir, expert_cache, stream, weights_stream,
-                )?,
-            )),
-            ModelKind::DeepSeekV3 => Ok(Model::DeepSeekV3(
-                crate::architectures::deepseek_v3::layerwise::load_deepseek_v3_sparse_expert_cache_model(
-                    model_dir,
-                    expert_cache,
-                    stream,
-                    weights_stream,
-                )?,
-            )),
-            ModelKind::GptOss => Ok(Model::GptOss(
-                crate::architectures::gpt_oss::layerwise::load_gpt_oss_sparse_expert_cache_model(
-                    model_dir,
-                    expert_cache,
-                    stream,
-                    weights_stream,
-                )?,
-            )),
-            ModelKind::Inkling => Ok(Model::Inkling(
-                crate::architectures::inkling::layerwise::load_inkling_sparse_expert_cache_model(
-                    model_dir,
-                    expert_cache,
-                    stream,
-                    weights_stream,
-                )?,
-            )),
-            ModelKind::Lfm2 => Ok(Model::Lfm2(
-                crate::architectures::lfm2::layerwise::load_lfm2_sparse_expert_cache_model(
-                    model_dir,
-                    expert_cache,
-                    stream,
-                    weights_stream,
-                )?,
-            )),
-            ModelKind::NemotronH => Ok(Model::NemotronH(
-                crate::architectures::nemotron_h::layerwise::load_nemotron_h_sparse_expert_cache_model(
-                    model_dir,
-                    expert_cache,
-                    stream,
-                    weights_stream,
-                )?,
-            )),
-            ModelKind::Qwen2 => Err(Error::UnsupportedArchitecture(
-                "Qwen2 is dense and does not support sparse expert-cache residency".into(),
-            )),
-            ModelKind::Qwen3 => Ok(Model::DenseQwen(
-                crate::architectures::qwen::dense::layerwise::load_qwen3_sparse_expert_cache_model(
-                    model_dir,
-                    expert_cache,
-                    stream,
-                    weights_stream,
-                )?,
-            )),
-            ModelKind::Qwen3Next => Ok(Model::Qwen3Next(
-                crate::architectures::qwen::hybrid::layerwise::load_qwen3_next_sparse_expert_cache_model(
-                    model_dir,
-                    expert_cache,
-                    stream,
-                    weights_stream,
-                )?,
-            )),
-            ModelKind::Qwen3VlMoe => Ok(Model::Qwen3VlMoe(
-                crate::architectures::qwen::vl::layerwise::load_qwen3_vl_sparse_expert_cache_model(
-                    model_dir,
-                    expert_cache,
-                    stream,
-                    weights_stream,
-                )?,
-            )),
-            ModelKind::Qwen35 => Ok(Model::Qwen35(
-                crate::architectures::qwen::hybrid::layerwise::load_qwen35_sparse_expert_cache_model(
-                    model_dir,
-                    expert_cache,
-                    stream,
-                    weights_stream,
-                )?,
-            )),
-            _ => Err(Error::UnsupportedArchitecture(format!(
-                "sparse expert caching requires a supported safetensors MoE architecture, not {}",
-                kind.model_type_name()
-            ))),
-        };
-    }
-    let execution = match options.weight_residency {
-        WeightResidency::FullyResident => LayerExecutionLoadOptions::FullyResident,
-        WeightResidency::LayerwiseHost(options) => options.into(),
-        WeightResidency::DenseDiskStream(options) => options.into(),
-        WeightResidency::SparseExpertCache(_)
-        | WeightResidency::SparseExpertCacheWithDenseLayers(_) => {
-            unreachable!("sparse residency policies returned above")
-        }
-    };
+    let execution = options.weight_residency.layers();
     if let Some(quantization) = options.quantization {
         quantization.validate()?;
         return match kind {

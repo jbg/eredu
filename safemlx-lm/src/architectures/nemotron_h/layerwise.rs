@@ -55,7 +55,7 @@ use crate::{
     runtime::execution::layerwise::{
         load_layerwise_model, load_safetensors_layerwise_model,
         load_tensor_parallel_layerwise_model, open_safetensors_weight_store, ArchitectureAdapter,
-        LayerExecutionLoadOptions, LayerwiseForwardState, LayerwiseModel, StaticUnitBindings,
+        LayerWeightResidency, LayerwiseForwardState, LayerwiseModel, StaticUnitBindings,
         WeightResidency,
     },
     runtime::residency::expert_cache::{
@@ -345,6 +345,10 @@ impl NemotronHLayerwiseModel {
         self.execution.adapter().args()
     }
 
+    pub(crate) fn bind_parallel_topology(&mut self, topology: crate::ParallelTopology) {
+        self.execution.bind_parallel_topology(topology);
+    }
+
     /// Creates cache/state matching the hybrid block pattern.
     pub fn new_cache(&self) -> Cache {
         self.execution.adapter().new_cache()
@@ -566,7 +570,7 @@ impl CausalLm<Cache> for NemotronHLayerwiseModel {
 /// Loads Nemotron-H through the generalized execution engine.
 pub fn load_nemotron_h_layerwise_model(
     model_dir: impl AsRef<Path>,
-    options: impl Into<LayerExecutionLoadOptions>,
+    options: impl Into<LayerWeightResidency>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<NemotronHLayerwiseModel, Error> {
@@ -593,7 +597,7 @@ pub fn load_nemotron_h_layerwise_model(
 /// Loads Nemotron-H through the generalized tensor-parallel engine.
 pub fn load_nemotron_h_tensor_parallel_model(
     model_dir: impl AsRef<Path>,
-    options: impl Into<LayerExecutionLoadOptions>,
+    options: impl Into<LayerWeightResidency>,
     build: crate::runtime::distributed::parallel::ParallelBuildContext,
     stream: &Stream,
     weights_stream: &Stream,
@@ -640,7 +644,7 @@ pub fn load_nemotron_h_tensor_parallel_model(
 pub(crate) fn load_nemotron_h_gguf_tensor_parallel_model(
     checkpoint: &GgufCheckpoint,
     metadata: &HashMap<String, GgufMetadataValue>,
-    options: LayerExecutionLoadOptions,
+    options: LayerWeightResidency,
     build: crate::runtime::distributed::parallel::ParallelBuildContext,
     stream: &Stream,
     weights_stream: &Stream,
@@ -716,55 +720,26 @@ pub(crate) fn load_nemotron_h_gguf_layerwise_model(
             resident::translate_gguf_weight_name,
             residency.max_mapped_shards(),
         )?);
-    let execution = match residency {
-        WeightResidency::LayerwiseHost(options) => load_layerwise_model(
-            store,
-            NemotronHLayerwiseAdapter::new(args, stream)?,
-            options,
-            stream,
-            weights_stream,
-        )?,
-        WeightResidency::DenseDiskStream(options) => load_layerwise_model(
-            store,
-            NemotronHLayerwiseAdapter::new(args, stream)?,
-            options,
-            stream,
-            weights_stream,
-        )?,
-        WeightResidency::SparseExpertCache(options) => {
-            return Ok((
-                load_nemotron_h_gguf_sparse_with_store(
-                    store,
-                    args,
-                    options,
-                    options.non_expert,
-                    stream,
-                    weights_stream,
-                )?,
-                prepared.eos_token_ids,
-            ));
-        }
-        WeightResidency::SparseExpertCacheWithDenseLayers(options) => {
-            return Ok((
-                load_nemotron_h_gguf_sparse_with_store(
-                    store,
-                    args,
-                    options.expert_cache,
-                    options.non_expert,
-                    stream,
-                    weights_stream,
-                )?,
-                prepared.eos_token_ids,
-            ));
-        }
-        WeightResidency::FullyResident => load_layerwise_model(
-            store,
-            NemotronHLayerwiseAdapter::new(args, stream)?,
-            LayerExecutionLoadOptions::FullyResident,
-            stream,
-            weights_stream,
-        )?,
-    };
+    if let Some(expert_options) = residency.expert_cache() {
+        return Ok((
+            load_nemotron_h_gguf_sparse_with_store(
+                store,
+                args,
+                expert_options,
+                residency.layers(),
+                stream,
+                weights_stream,
+            )?,
+            prepared.eos_token_ids,
+        ));
+    }
+    let execution = load_layerwise_model(
+        store,
+        NemotronHLayerwiseAdapter::new(args, stream)?,
+        residency.layers(),
+        stream,
+        weights_stream,
+    )?;
     Ok((
         NemotronHLayerwiseModel { execution },
         prepared.eos_token_ids,
@@ -775,7 +750,7 @@ fn load_nemotron_h_gguf_sparse_with_store(
     store: Arc<dyn WeightStore + Send + Sync>,
     args: ModelArgs,
     options: ExpertCacheLoadOptions,
-    non_expert: impl Into<LayerExecutionLoadOptions>,
+    non_expert: impl Into<LayerWeightResidency>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<NemotronHLayerwiseModel, Error> {
@@ -807,7 +782,7 @@ fn load_nemotron_h_gguf_sparse_with_store(
 pub(crate) fn load_nemotron_h_sparse_ep_base_with_store(
     store: Arc<dyn WeightStore + Send + Sync>,
     args: ModelArgs,
-    non_expert: impl Into<LayerExecutionLoadOptions>,
+    non_expert: impl Into<LayerWeightResidency>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<NemotronHLayerwiseModel, Error> {
@@ -821,7 +796,7 @@ pub(crate) fn load_nemotron_h_sparse_ep_base_with_store(
 pub(crate) fn load_nemotron_h_sparse_tp_ep_base_with_store(
     store: Arc<dyn WeightStore + Send + Sync>,
     args: ModelArgs,
-    non_expert: impl Into<LayerExecutionLoadOptions>,
+    non_expert: impl Into<LayerWeightResidency>,
     build: crate::runtime::distributed::parallel::ParallelBuildContext,
     stream: &Stream,
     weights_stream: &Stream,
@@ -839,43 +814,11 @@ pub(crate) fn load_nemotron_h_sparse_tp_ep_base_with_store(
     Ok(NemotronHLayerwiseModel { execution })
 }
 
-/// Loads Nemotron-H with expert-granular sparse caching.
-pub fn load_nemotron_h_sparse_expert_cache_model(
+/// Loads Nemotron-H with independently cached experts and bounded non-expert units.
+pub fn load_nemotron_h_expert_cache_model(
     model_dir: impl AsRef<Path>,
+    non_expert: crate::NonExpertWeightResidency,
     options: ExpertCacheLoadOptions,
-    stream: &Stream,
-    weights_stream: &Stream,
-) -> Result<NemotronHLayerwiseModel, Error> {
-    load_nemotron_h_sparse_expert_cache_model_with_non_expert(
-        model_dir,
-        options,
-        options.non_expert,
-        stream,
-        weights_stream,
-    )
-}
-
-/// Loads Nemotron-H with expert caching and disk-streamed non-expert units.
-pub fn load_nemotron_h_sparse_expert_cache_model_with_dense_layers(
-    model_dir: impl AsRef<Path>,
-    options: ExpertCacheLoadOptions,
-    non_expert: crate::runtime::residency::dense_stream::DenseDiskStreamLoadOptions,
-    stream: &Stream,
-    weights_stream: &Stream,
-) -> Result<NemotronHLayerwiseModel, Error> {
-    load_nemotron_h_sparse_expert_cache_model_with_non_expert(
-        model_dir,
-        options,
-        non_expert,
-        stream,
-        weights_stream,
-    )
-}
-
-fn load_nemotron_h_sparse_expert_cache_model_with_non_expert(
-    model_dir: impl AsRef<Path>,
-    options: ExpertCacheLoadOptions,
-    non_expert: impl Into<LayerExecutionLoadOptions>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<NemotronHLayerwiseModel, Error> {
@@ -884,7 +827,7 @@ fn load_nemotron_h_sparse_expert_cache_model_with_non_expert(
         crate::api::ModelKind::NemotronH,
         model_dir,
         crate::api::ModelLoadOptions::default()
-            .with_weight_residency(WeightResidency::SparseExpertCache(options)),
+            .with_weight_residency(WeightResidency::with_expert_cache(non_expert, options)),
     )?;
     let args = resident::get_nemotron_h_model_args(model_dir)?;
     if !args
@@ -1176,8 +1119,7 @@ impl ArchitectureAdapter for NemotronHLayerwiseAdapter {
         let layer_count = usize::try_from(self.args.num_hidden_layers)
             .map_err(|_| Exception::custom("invalid Nemotron-H cache layer count"))?;
         let layer_layout = match topology {
-            None => resident::prompt_cache_layer_layout(&self.args),
-            Some(_) => {
+            Some(topology) if topology.is_axis_active(crate::ParallelAxis::Tensor) => {
                 let geometry = self.parallel_geometry.as_ref().ok_or_else(|| {
                     Error::Parallel(
                         "Nemotron-H parallel cache identity requested before local layout configuration"
@@ -1186,6 +1128,7 @@ impl ArchitectureAdapter for NemotronHLayerwiseAdapter {
                 })?;
                 resident::prompt_cache_layer_layout_with_geometry(&self.args, geometry)
             }
+            _ => resident::prompt_cache_layer_layout(&self.args),
         }?;
         Ok(PromptCacheModelIdentity {
             model_family: "nemotron_h".into(),
@@ -2019,7 +1962,7 @@ mod tests {
     };
 
     use super::{
-        load_nemotron_h_layerwise_model, load_nemotron_h_sparse_expert_cache_model,
+        load_nemotron_h_expert_cache_model, load_nemotron_h_layerwise_model,
         NemotronHLayerwiseAdapter,
     };
     use crate::{
@@ -2581,15 +2524,14 @@ mod tests {
         write_fixture(dir.path(), &fixture, gpu.stream());
         let mut resident =
             resident::load_nemotron_h_model(dir.path(), gpu.stream(), cpu.stream()).unwrap();
-        let options = ExpertCacheLoadOptions::new(
-            LayerwiseLoadOptions::new(OffloadConfig::new(None, None, 1).unwrap()),
-            OffloadConfig::new(None, None, 1).unwrap(),
-            1 << 20,
-            1,
-        )
-        .unwrap();
-        let mut cached = load_nemotron_h_sparse_expert_cache_model(
+        let options =
+            ExpertCacheLoadOptions::new(OffloadConfig::new(None, None, 1).unwrap(), 1 << 20, 1)
+                .unwrap();
+        let mut cached = load_nemotron_h_expert_cache_model(
             dir.path(),
+            crate::NonExpertWeightResidency::LayerwiseHost(LayerwiseLoadOptions::new(
+                OffloadConfig::new(None, None, 1).unwrap(),
+            )),
             options,
             gpu.stream(),
             cpu.stream(),

@@ -27,7 +27,7 @@ use crate::{
     runtime::execution::layerwise::{
         load_layerwise_model, load_safetensors_layerwise_model,
         load_tensor_parallel_layerwise_model, open_safetensors_weight_store,
-        transformed_module_weight_store, ArchitectureAdapter, LayerExecutionLoadOptions,
+        transformed_module_weight_store, ArchitectureAdapter, LayerWeightResidency,
         LayerwiseForwardState, LayerwiseModel, StaticUnitBindings,
     },
     runtime::generation::sampler::Sampler,
@@ -870,7 +870,7 @@ fn token_position(
 /// Loads a native MLX-layout Moshi checkpoint through bounded layer residency.
 pub fn load_moshi_layerwise_model(
     model_dir: impl AsRef<Path>,
-    options: impl Into<crate::runtime::execution::layerwise::LayerExecutionLoadOptions>,
+    options: impl Into<crate::runtime::execution::layerwise::LayerWeightResidency>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<MoshiLayerwiseModel, Error> {
@@ -901,7 +901,7 @@ pub fn load_moshi_layerwise_model(
 /// Loads native Moshi with rank-local temporal and depth transformers.
 pub fn load_moshi_tensor_parallel_layerwise_model(
     model_dir: impl AsRef<Path>,
-    options: impl Into<crate::runtime::execution::layerwise::LayerExecutionLoadOptions>,
+    options: impl Into<crate::runtime::execution::layerwise::LayerWeightResidency>,
     build: crate::runtime::distributed::parallel::ParallelBuildContext,
     stream: &Stream,
     weights_stream: &Stream,
@@ -937,7 +937,7 @@ pub fn load_moshi_tensor_parallel_layerwise_model(
 /// Loads the released PersonaPlex PyTorch checkpoint through bounded layer residency.
 pub fn load_personaplex_layerwise_model(
     model_dir: impl AsRef<Path>,
-    options: impl Into<crate::runtime::execution::layerwise::LayerExecutionLoadOptions>,
+    options: impl Into<crate::runtime::execution::layerwise::LayerWeightResidency>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<MoshiLayerwiseModel, Error> {
@@ -966,7 +966,7 @@ pub fn load_personaplex_layerwise_model(
 pub fn load_pytorch_layerwise_model(
     args: ModelArgs,
     checkpoint: impl AsRef<Path>,
-    options: impl Into<LayerExecutionLoadOptions>,
+    options: impl Into<LayerWeightResidency>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<MoshiLayerwiseModel, Error> {
@@ -993,7 +993,7 @@ pub(crate) fn execute_transformed_model(
         execution: load_layerwise_model(
             store,
             adapter,
-            LayerExecutionLoadOptions::FullyResident,
+            LayerWeightResidency::FullyResident,
             stream,
             weights_stream,
         )?,
@@ -1004,7 +1004,7 @@ pub(crate) fn execute_transformed_model(
 /// Loads PersonaPlex with rank-local temporal and depth transformers.
 pub fn load_personaplex_tensor_parallel_layerwise_model(
     model_dir: impl AsRef<Path>,
-    options: impl Into<crate::runtime::execution::layerwise::LayerExecutionLoadOptions>,
+    options: impl Into<crate::runtime::execution::layerwise::LayerWeightResidency>,
     build: crate::runtime::distributed::parallel::ParallelBuildContext,
     stream: &Stream,
     weights_stream: &Stream,
@@ -1037,7 +1037,7 @@ fn load_with_layout(
     source: impl AsRef<Path>,
     args: ModelArgs,
     layout: CheckpointLayout,
-    options: impl Into<crate::runtime::execution::layerwise::LayerExecutionLoadOptions>,
+    options: impl Into<crate::runtime::execution::layerwise::LayerWeightResidency>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<MoshiLayerwiseModel, Error> {
@@ -2113,7 +2113,7 @@ mod tests {
             topology::{DeviceAssignment, ParallelTopology},
         },
         runtime::execution::layerwise::{
-            LayerExecutionLoadOptions, LayerwiseLoadOptions, WeightResidency,
+            LayerWeightResidency, LayerwiseLoadOptions, WeightResidency,
         },
         runtime::generation::sampler::DefaultSampler,
         runtime::residency::dense_stream::DenseDiskStreamLoadOptions,
@@ -2307,7 +2307,7 @@ mod tests {
             crate::api::realtime::load_model(source.path(), gpu.stream(), cpu.stream()).unwrap();
         let layerwise = crate::api::realtime::load_model_with_options(
             source.path(),
-            ModelLoadOptions::default().with_weight_residency(WeightResidency::LayerwiseHost(
+            ModelLoadOptions::default().with_weight_residency(WeightResidency::layerwise_host(
                 LayerwiseLoadOptions::new(OffloadConfig::new(None, None, 1).unwrap()),
             )),
             gpu.stream(),
@@ -2377,7 +2377,7 @@ mod tests {
         let options = DenseDiskStreamLoadOptions::new(u64::MAX, u64::MAX, 1, 1, 1).unwrap();
         let model = load_moshi_tensor_parallel_layerwise_model(
             dir.path(),
-            LayerExecutionLoadOptions::DenseDiskStream(options),
+            LayerWeightResidency::DenseDiskStream(options),
             build,
             gpu.stream(),
             cpu.stream(),
@@ -2511,7 +2511,7 @@ mod tests {
         let loaded = crate::api::realtime::load_model_with_options(
             dir.path(),
             crate::api::ModelLoadOptions::default().with_weight_residency(
-                crate::runtime::execution::layerwise::WeightResidency::LayerwiseHost(
+                crate::runtime::execution::layerwise::WeightResidency::layerwise_host(
                     LayerwiseLoadOptions::new(OffloadConfig::new(None, None, 1).unwrap()),
                 ),
             ),
@@ -2536,7 +2536,7 @@ mod tests {
         let dense = DenseDiskStreamLoadOptions::new(u64::MAX, u64::MAX, 1, 1, 1).unwrap();
         let mut streamed = load_moshi_layerwise_model(
             dir.path(),
-            LayerExecutionLoadOptions::DenseDiskStream(dense),
+            LayerWeightResidency::DenseDiskStream(dense),
             gpu.stream(),
             cpu.stream(),
         )
@@ -2624,7 +2624,7 @@ mod tests {
         let loaded = crate::api::realtime::load_model_with_options(
             dir.path(),
             crate::api::ModelLoadOptions::default().with_weight_residency(
-                crate::runtime::execution::layerwise::WeightResidency::DenseDiskStream(dense),
+                crate::runtime::execution::layerwise::WeightResidency::dense_disk_stream(dense),
             ),
             gpu.stream(),
             cpu.stream(),
@@ -2645,7 +2645,7 @@ mod tests {
         let dir = fixture(&gpu);
         let resident = load_moshi_layerwise_model(
             dir.path(),
-            LayerExecutionLoadOptions::FullyResident,
+            LayerWeightResidency::FullyResident,
             gpu.stream(),
             cpu.stream(),
         )

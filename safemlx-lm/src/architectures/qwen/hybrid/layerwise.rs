@@ -56,7 +56,7 @@ use crate::{
         load_layerwise_model, load_safetensors_layerwise_model,
         load_tensor_parallel_layerwise_model, open_safetensors_weight_store,
         transformed_module_weight_store, ArchitectureAdapter, ExecutionGroupDag,
-        LayerExecutionLoadOptions, LayerwiseForwardState, LayerwiseModel, StaticUnitBindings,
+        LayerWeightResidency, LayerwiseForwardState, LayerwiseModel, StaticUnitBindings,
         WeightResidency,
     },
     runtime::residency::expert_cache::{
@@ -431,6 +431,10 @@ impl QwenHybridLayerwiseModel {
     /// Returns normalized text-model arguments.
     pub fn args(&self) -> &ModelArgs {
         self.execution.adapter().args()
+    }
+
+    pub(crate) fn bind_parallel_topology(&mut self, topology: crate::ParallelTopology) {
+        self.execution.bind_parallel_topology(topology);
     }
 
     pub(crate) fn vision_spatial_merge_size(&self) -> Option<i32> {
@@ -811,7 +815,7 @@ impl CausalLm<Cache> for QwenHybridLayerwiseModel {
 /// Loads a text-only Qwen3-Next model through generalized parameter residency.
 pub fn load_qwen3_next_layerwise_model(
     model_dir: impl AsRef<Path>,
-    options: impl Into<LayerExecutionLoadOptions>,
+    options: impl Into<LayerWeightResidency>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<QwenHybridLayerwiseModel, Error> {
@@ -840,7 +844,7 @@ pub fn load_qwen3_next_layerwise_model(
 /// Loads text-only Qwen3-Next through the generalized tensor-parallel engine.
 pub fn load_qwen3_next_tensor_parallel_model(
     model_dir: impl AsRef<Path>,
-    options: impl Into<LayerExecutionLoadOptions>,
+    options: impl Into<LayerWeightResidency>,
     build: crate::runtime::distributed::parallel::ParallelBuildContext,
     stream: &Stream,
     weights_stream: &Stream,
@@ -892,7 +896,7 @@ pub fn load_qwen3_next_tensor_parallel_model(
 /// Loads a text-only or multimodal dense/MoE Qwen3.5 model through generalized residency.
 pub fn load_qwen35_layerwise_model(
     model_dir: impl AsRef<Path>,
-    options: impl Into<LayerExecutionLoadOptions>,
+    options: impl Into<LayerWeightResidency>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<QwenHybridLayerwiseModel, Error> {
@@ -945,7 +949,7 @@ pub(crate) fn execute_transformed_qwen_hybrid_model(
         execution: load_layerwise_model(
             store,
             adapter,
-            LayerExecutionLoadOptions::FullyResident,
+            LayerWeightResidency::FullyResident,
             stream,
             weights_stream,
         )?,
@@ -955,7 +959,7 @@ pub(crate) fn execute_transformed_qwen_hybrid_model(
 /// Loads a text-only Qwen3.5 dense or MoE checkpoint through the generalized tensor-parallel engine.
 pub fn load_qwen35_tensor_parallel_model(
     model_dir: impl AsRef<Path>,
-    options: impl Into<LayerExecutionLoadOptions>,
+    options: impl Into<LayerWeightResidency>,
     build: crate::runtime::distributed::parallel::ParallelBuildContext,
     stream: &Stream,
     weights_stream: &Stream,
@@ -1008,7 +1012,7 @@ fn load_qwen_hybrid_tensor_parallel_model(
     model_dir: &Path,
     args: ModelArgs,
     family: QwenHybridFamily,
-    options: LayerExecutionLoadOptions,
+    options: LayerWeightResidency,
     build: crate::runtime::distributed::parallel::ParallelBuildContext,
     stream: &Stream,
     weights_stream: &Stream,
@@ -1034,7 +1038,7 @@ fn load_qwen_hybrid_tensor_parallel_model(
 pub(crate) fn load_qwen_hybrid_gguf_tensor_parallel_model(
     checkpoint: &GgufCheckpoint,
     metadata: &HashMap<String, GgufMetadataValue>,
-    options: LayerExecutionLoadOptions,
+    options: LayerWeightResidency,
     build: crate::runtime::distributed::parallel::ParallelBuildContext,
     stream: &Stream,
     weights_stream: &Stream,
@@ -1110,59 +1114,28 @@ pub(crate) fn load_qwen_hybrid_gguf_layerwise_model(
             resident::qwen35_translate_gguf_weight_name,
             residency.max_mapped_shards(),
         )?);
-    let execution = match residency {
-        WeightResidency::LayerwiseHost(options) => load_layerwise_model(
-            store,
-            QwenHybridLayerwiseAdapter::new(args, family, None, None, None, stream)?,
-            options,
-            stream,
-            weights_stream,
-        )?,
-        WeightResidency::DenseDiskStream(options) => load_layerwise_model(
-            store,
-            QwenHybridLayerwiseAdapter::new(args, family, None, None, None, stream)?,
-            options,
-            stream,
-            weights_stream,
-        )?,
-        WeightResidency::SparseExpertCache(options) => {
-            return Ok((
-                load_qwen_hybrid_gguf_sparse_with_store(
-                    store,
-                    args,
-                    family,
-                    options,
-                    options.non_expert,
-                    stream,
-                    weights_stream,
-                )?,
-                prepared.eos_token_ids,
-                is_next,
-            ));
-        }
-        WeightResidency::SparseExpertCacheWithDenseLayers(options) => {
-            return Ok((
-                load_qwen_hybrid_gguf_sparse_with_store(
-                    store,
-                    args,
-                    family,
-                    options.expert_cache,
-                    options.non_expert,
-                    stream,
-                    weights_stream,
-                )?,
-                prepared.eos_token_ids,
-                is_next,
-            ));
-        }
-        WeightResidency::FullyResident => load_layerwise_model(
-            store,
-            QwenHybridLayerwiseAdapter::new(args, family, None, None, None, stream)?,
-            LayerExecutionLoadOptions::FullyResident,
-            stream,
-            weights_stream,
-        )?,
-    };
+    if let Some(expert_options) = residency.expert_cache() {
+        return Ok((
+            load_qwen_hybrid_gguf_sparse_with_store(
+                store,
+                args,
+                family,
+                expert_options,
+                residency.layers(),
+                stream,
+                weights_stream,
+            )?,
+            prepared.eos_token_ids,
+            is_next,
+        ));
+    }
+    let execution = load_layerwise_model(
+        store,
+        QwenHybridLayerwiseAdapter::new(args, family, None, None, None, stream)?,
+        residency.layers(),
+        stream,
+        weights_stream,
+    )?;
     Ok((
         QwenHybridLayerwiseModel { execution },
         prepared.eos_token_ids,
@@ -1175,7 +1148,7 @@ fn load_qwen_hybrid_gguf_sparse_with_store(
     args: ModelArgs,
     family: QwenHybridFamily,
     options: ExpertCacheLoadOptions,
-    non_expert: impl Into<LayerExecutionLoadOptions>,
+    non_expert: impl Into<LayerWeightResidency>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<QwenHybridLayerwiseModel, Error> {
@@ -1200,9 +1173,10 @@ fn load_qwen_hybrid_gguf_sparse_with_store(
     Ok(QwenHybridLayerwiseModel { execution })
 }
 
-/// Loads Qwen3-Next with expert-granular sparse caching.
-pub fn load_qwen3_next_sparse_expert_cache_model(
+/// Loads Qwen3-Next with independently cached experts and bounded non-expert units.
+pub fn load_qwen3_next_expert_cache_model(
     model_dir: impl AsRef<Path>,
+    non_expert: crate::NonExpertWeightResidency,
     options: ExpertCacheLoadOptions,
     stream: &Stream,
     weights_stream: &Stream,
@@ -1212,45 +1186,7 @@ pub fn load_qwen3_next_sparse_expert_cache_model(
         crate::api::ModelKind::Qwen3Next,
         model_dir,
         crate::api::ModelLoadOptions::default()
-            .with_weight_residency(WeightResidency::SparseExpertCache(options)),
-    )?;
-    let args = qwen3_next::get_qwen3_next_model_args(model_dir)?;
-    if let Some(config) = &args.quantization_config {
-        config.validate_supported()?;
-    }
-    if !args.is_moe() {
-        return Err(Error::UnsupportedArchitecture(
-            "sparse expert caching requires a Qwen3-Next MoE checkpoint".into(),
-        ));
-    }
-    load_qwen_hybrid_sparse_model(
-        model_dir,
-        args,
-        QwenHybridFamily::Qwen3Next,
-        None,
-        None,
-        None,
-        options,
-        options.non_expert,
-        stream,
-        weights_stream,
-    )
-}
-
-/// Loads Qwen3-Next with expert caching and disk-streamed non-expert units.
-pub fn load_qwen3_next_sparse_expert_cache_model_with_dense_layers(
-    model_dir: impl AsRef<Path>,
-    options: ExpertCacheLoadOptions,
-    non_expert: impl Into<LayerExecutionLoadOptions>,
-    stream: &Stream,
-    weights_stream: &Stream,
-) -> Result<QwenHybridLayerwiseModel, Error> {
-    let model_dir = model_dir.as_ref();
-    crate::api::structural::validate_safetensors_load_path(
-        crate::api::ModelKind::Qwen3Next,
-        model_dir,
-        crate::api::ModelLoadOptions::default()
-            .with_weight_residency(WeightResidency::SparseExpertCache(options)),
+            .with_weight_residency(WeightResidency::with_expert_cache(non_expert, options)),
     )?;
     let args = qwen3_next::get_qwen3_next_model_args(model_dir)?;
     if let Some(config) = &args.quantization_config {
@@ -1275,9 +1211,10 @@ pub fn load_qwen3_next_sparse_expert_cache_model_with_dense_layers(
     )
 }
 
-/// Loads Qwen3.5 MoE with expert-granular sparse caching.
-pub fn load_qwen35_sparse_expert_cache_model(
+/// Loads Qwen3.5 MoE with independently cached experts and bounded non-expert units.
+pub fn load_qwen35_expert_cache_model(
     model_dir: impl AsRef<Path>,
+    non_expert: crate::NonExpertWeightResidency,
     options: ExpertCacheLoadOptions,
     stream: &Stream,
     weights_stream: &Stream,
@@ -1287,43 +1224,7 @@ pub fn load_qwen35_sparse_expert_cache_model(
         crate::api::ModelKind::Qwen35,
         model_dir,
         crate::api::ModelLoadOptions::default()
-            .with_weight_residency(WeightResidency::SparseExpertCache(options)),
-    )?;
-    let (args, image_token_id, video_token_id, vision) =
-        resident::get_qwen3_5_model_args(model_dir)?;
-    if !args.is_moe() {
-        return Err(Error::UnsupportedArchitecture(
-            "sparse expert caching requires a Qwen3.5 MoE checkpoint".into(),
-        ));
-    }
-    load_qwen_hybrid_sparse_model(
-        model_dir,
-        args,
-        QwenHybridFamily::Qwen35,
-        image_token_id,
-        video_token_id,
-        vision,
-        options,
-        options.non_expert,
-        stream,
-        weights_stream,
-    )
-}
-
-/// Loads Qwen3.5 MoE with expert caching and disk-streamed non-expert units.
-pub fn load_qwen35_sparse_expert_cache_model_with_dense_layers(
-    model_dir: impl AsRef<Path>,
-    options: ExpertCacheLoadOptions,
-    non_expert: crate::runtime::residency::dense_stream::DenseDiskStreamLoadOptions,
-    stream: &Stream,
-    weights_stream: &Stream,
-) -> Result<QwenHybridLayerwiseModel, Error> {
-    let model_dir = model_dir.as_ref();
-    crate::api::structural::validate_safetensors_load_path(
-        crate::api::ModelKind::Qwen35,
-        model_dir,
-        crate::api::ModelLoadOptions::default()
-            .with_weight_residency(WeightResidency::SparseExpertCache(options)),
+            .with_weight_residency(WeightResidency::with_expert_cache(non_expert, options)),
     )?;
     let (args, image_token_id, video_token_id, vision) =
         resident::get_qwen3_5_model_args(model_dir)?;
@@ -1355,7 +1256,7 @@ fn load_qwen_hybrid_sparse_model(
     video_token_id: Option<i32>,
     vision_config: Option<VisionConfig>,
     options: ExpertCacheLoadOptions,
-    non_expert: impl Into<LayerExecutionLoadOptions>,
+    non_expert: impl Into<LayerWeightResidency>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<QwenHybridLayerwiseModel, Error> {
@@ -1387,7 +1288,7 @@ pub(crate) fn load_qwen_hybrid_sparse_ep_base_with_store(
     store: Arc<dyn WeightStore + Send + Sync>,
     args: ModelArgs,
     is_qwen3_next: bool,
-    non_expert: impl Into<LayerExecutionLoadOptions>,
+    non_expert: impl Into<LayerWeightResidency>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<QwenHybridLayerwiseModel, Error> {
@@ -1407,7 +1308,7 @@ pub(crate) fn load_qwen_hybrid_sparse_tp_ep_base_with_store(
     store: Arc<dyn WeightStore + Send + Sync>,
     args: ModelArgs,
     is_qwen3_next: bool,
-    non_expert: impl Into<LayerExecutionLoadOptions>,
+    non_expert: impl Into<LayerWeightResidency>,
     build: crate::runtime::distributed::parallel::ParallelBuildContext,
     stream: &Stream,
     weights_stream: &Stream,
@@ -1434,7 +1335,7 @@ fn load_qwen_hybrid_layerwise_model(
     model_dir: &Path,
     args: ModelArgs,
     family: QwenHybridFamily,
-    options: impl Into<LayerExecutionLoadOptions>,
+    options: impl Into<LayerWeightResidency>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<QwenHybridLayerwiseModel, Error> {
@@ -1459,7 +1360,7 @@ fn load_qwen_hybrid_layerwise_model_with_vision(
     image_token_id: Option<i32>,
     video_token_id: Option<i32>,
     vision_config: Option<VisionConfig>,
-    options: impl Into<LayerExecutionLoadOptions>,
+    options: impl Into<LayerWeightResidency>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<QwenHybridLayerwiseModel, Error> {
@@ -2542,8 +2443,7 @@ impl ArchitectureAdapter for QwenHybridLayerwiseAdapter {
     ) -> Result<PromptCacheModelIdentity, Error> {
         let layer_count = self.args.num_hidden_layers as usize;
         let layer_layout = match topology {
-            None => resident::prompt_cache_layer_layout(&self.args),
-            Some(_) => {
+            Some(topology) if topology.is_axis_active(crate::ParallelAxis::Tensor) => {
                 let geometry = self.parallel_geometry.as_ref().ok_or_else(|| {
                     Error::Parallel(
                         "Qwen hybrid parallel cache identity requested before local layout configuration"
@@ -2552,6 +2452,7 @@ impl ArchitectureAdapter for QwenHybridLayerwiseAdapter {
                 })?;
                 resident::prompt_cache_layer_layout_with_geometry(&self.args, geometry)
             }
+            _ => resident::prompt_cache_layer_layout(&self.args),
         }?;
         Ok(PromptCacheModelIdentity {
             model_family: "qwen_hybrid".into(),
@@ -3687,9 +3588,9 @@ mod tests {
     };
 
     use super::{
-        load_qwen35_layerwise_model, load_qwen35_sparse_expert_cache_model,
-        load_qwen3_next_layerwise_model, load_qwen3_next_sparse_expert_cache_model,
-        QwenHybridFamily, QwenHybridLayer, QwenHybridLayerwiseAdapter,
+        load_qwen35_expert_cache_model, load_qwen35_layerwise_model,
+        load_qwen3_next_expert_cache_model, load_qwen3_next_layerwise_model, QwenHybridFamily,
+        QwenHybridLayer, QwenHybridLayerwiseAdapter,
     };
     use crate::{
         api::{
@@ -4196,24 +4097,31 @@ mod tests {
         } else {
             resident::load_qwen3_5_model(dir.path(), gpu.stream(), cpu.stream()).unwrap()
         };
-        let options = ExpertCacheLoadOptions::new(
-            LayerwiseLoadOptions::new(OffloadConfig::new(None, None, 1).unwrap()),
-            OffloadConfig::new(None, None, 1).unwrap(),
-            1 << 20,
-            1,
-        )
-        .unwrap();
+        let options =
+            ExpertCacheLoadOptions::new(OffloadConfig::new(None, None, 1).unwrap(), 1 << 20, 1)
+                .unwrap();
         let mut cached = if next {
-            load_qwen3_next_sparse_expert_cache_model(
+            load_qwen3_next_expert_cache_model(
                 dir.path(),
+                crate::NonExpertWeightResidency::LayerwiseHost(LayerwiseLoadOptions::new(
+                    OffloadConfig::new(None, None, 1).unwrap(),
+                )),
                 options,
                 gpu.stream(),
                 cpu.stream(),
             )
             .unwrap()
         } else {
-            load_qwen35_sparse_expert_cache_model(dir.path(), options, gpu.stream(), cpu.stream())
-                .unwrap()
+            load_qwen35_expert_cache_model(
+                dir.path(),
+                crate::NonExpertWeightResidency::LayerwiseHost(LayerwiseLoadOptions::new(
+                    OffloadConfig::new(None, None, 1).unwrap(),
+                )),
+                options,
+                gpu.stream(),
+                cpu.stream(),
+            )
+            .unwrap()
         };
         let mut resident_cache = resident.new_cache();
         let mut cached_cache = Cache {

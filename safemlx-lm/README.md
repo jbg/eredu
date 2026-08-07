@@ -51,8 +51,16 @@ contain only remote tensors remain untouched. Cache hits and memory-mapped page
 faults are not reported as known physical disk transfers because logical
 materialization and storage I/O are different measurements.
 
-`ModelLoadOptions` selects a parameter-residency policy inside one generalized
-execution engine. `FullyResident`, `LayerwiseHost`, and `DenseDiskStream` all
+`ModelLoadOptions` selects a compositional parameter-residency policy inside
+one generalized execution engine. `LayerWeightResidency` chooses
+`FullyResident`, `LayerwiseHost`, or `DenseDiskStream` for ordinary execution
+units. `WeightResidency` then either keeps routed experts with those units or
+combines `NonExpertWeightResidency` with an independent
+`ExpertCacheLoadOptions`. The latter can pin every non-expert parameter, use a
+host-backed layer window, or stream non-expert units from disk while routed
+experts retain their own cache and budgets. The sum-of-products representation
+keeps complete-layer residency distinct from split non-expert/expert ownership.
+All ordinary-layer policies
 return the same architecture variant and use the same cache, forward,
 generation, observation, and capability dispatch. DeepSeek-V3/R1, Gemma 4,
 Inkling, Kimi Linear, Llama,
@@ -111,7 +119,7 @@ is released.
 
 ## Experimental dense disk streaming
 
-`WeightResidency::DenseDiskStream(DenseDiskStreamLoadOptions)` keeps ordinary
+`WeightResidency::dense_disk_stream(DenseDiskStreamLoadOptions)` keeps ordinary
 decoder and execution-stack layers disk planned and array-free at model load.
 Its device and host parameter budgets are always finite. Protected host and
 device lookahead depths are independent; older cacheable copies remain resident
@@ -144,11 +152,13 @@ mapping hits and misses, known logical transfer bytes, and minor/major page
 faults are distinct observations.
 
 Direct dense streaming of an MoE checkpoint streams the complete layer,
-including its expert bank. Use
-`WeightResidency::SparseExpertCacheWithDenseLayers` when expert-granular reuse
-is desired while non-expert layer weights remain disk streamed. Existing
-`ExpertCacheLoadOptions::non_expert` continues to select eager host-backed
-non-expert semantics for `SparseExpertCache`.
+including its expert bank. To cache experts independently, use
+`WeightResidency::with_expert_cache`: select
+`NonExpertWeightResidency::FullyResident`, `LayerwiseHost`, or
+`DenseDiskStream` for nonexpert units and pass
+`ExpertCacheLoadOptions` separately. The expert options contain only expert
+budgets and compact-bank scratch controls; they do not duplicate the ordinary
+layer policy.
 
 Pure Llama/Mistral and DeepSeek-V3/R1 pipeline stages stream locally: each rank
 catalogs its contiguous global layer range and owns a separate worker and
@@ -938,6 +948,10 @@ subgroup backends and uses topology-planned neighbor routes for stage-local
 Ring fallback collectives. Fully resident and dense-disk-streamed SafeTensors
 and canonical `qwen3moe` GGUF checkpoints share the same layer recipes, cache
 identity, synchronized generation, and failure consensus.
+The same independent expert cache works with PP and TP+PP when EP is inactive.
+In that geometry every stage owns all routed experts for its local layers; TP
+coordinates retain semantic projection shards, and route execution uses the
+shared collective-free singleton dispatch rather than an artificial EP group.
 `ArchitectureAdapter::expert_parallel_assignment`,
 `ArchitectureAdapter::new_cartesian_layer`, and
 `ArchitectureAdapter::cartesian_layer_bindings` are the shared semantic
@@ -956,7 +970,7 @@ Combined family coverage is tracked against the constituent execution modes:
 | Family | Constituent axes | Pairwise combined status | Remaining limitations |
 |---|---|---|---|
 | Qwen2/Qwen3 dense | TP, PP | TP+PP supported | EP does not apply to dense layers |
-| Qwen3 MoE | TP, PP, EP | TP+PP, TP+EP, and PP+EP supported; TP+PP+EP supports fully resident and dense-disk-streamed SafeTensors and GGUF | Triple-axis sparse-expert caching and eager host-layer residency are not supported by the pipeline loader |
+| Qwen3 MoE | TP, PP, EP | TP+PP, TP+EP, and PP+EP supported; PP, TP+PP, PP+EP, and TP+PP+EP independent expert caches compose resident or dense-disk-streamed non-experts for SafeTensors, with GGUF bounded-read coverage; complete-layer triple execution supports fully resident and dense streaming | Host-layerwise pipeline residency is not supported |
 | Llama/Mistral | TP, PP | TP+PP supported for SafeTensors and GGUF, resident and dense-streamed | No routed-expert EP axis |
 | Gemma 4 text | TP, PP | TP+PP supported for SafeTensors and GGUF, resident and dense-streamed | Text pipeline only; no routed-expert EP axis |
 | DeepSeek-V3/R1 | TP, PP, EP | TP+PP, TP+EP, and PP+EP support SafeTensors and GGUF, fully resident and dense/sparse-streamed | Triple-axis execution is unavailable |
@@ -1226,8 +1240,8 @@ and `PipelineModel::forward_cartesian`. Tensor parallelism is implemented by the
 generalized layerwise execution-group engine; there is no
 architecture-dispatching TP model wrapper.
 
-The generalized engine accepts three explicit parameter policies through
-`LayerExecutionLoadOptions`: `FullyResident`, `LayerwiseHost`, and
+The generalized engine accepts three explicit ordinary-parameter policies
+through `LayerWeightResidency`: `FullyResident`, `LayerwiseHost`, and
 `DenseDiskStream`. `FullyResident` uses the same rank-local planner, cache
 layout, collectives, and logits gathering as the bounded policies, but creates
 and populates every locally owned layer module once during loading and pins all
@@ -1750,7 +1764,7 @@ if let Some(codec_tokens) = output.output_audio_tokens {
 }
 ```
 
-Pass `ModelLoadOptions::default().with_weight_residency(WeightResidency::LayerwiseHost(...))`
+Pass `ModelLoadOptions::default().with_weight_residency(WeightResidency::layerwise_host(...))`
 to `load_realtime_model_with_options` to keep temporal layers and Moshi-family
 depth-codebook slices on the host. Text/audio embeddings and temporal output
 modules remain pinned, and `residency_report()` exposes the two execution groups.
@@ -1883,14 +1897,15 @@ Moshi projections preserve their checkpoint dtype and execute with the MLX
 `expert_parallel` provides executable expert parallelism for the
 safetensors MoE families supported by expert residency: DeepSeek-V3/R1,
 GPT-OSS, Inkling, Kimi Linear, LFM2,
-Nemotron-H, Qwen3, Qwen3-Next, Qwen3-VL-MoE, and Qwen3.5-MoE. GPT-OSS and the
-other hybrid or multimodal families. Every listed SafeTensors family accepts
-`FullyResident`, `SparseExpertCache`, or `SparseExpertCacheWithDenseLayers`.
+Nemotron-H, Qwen3, Qwen3-Next, Qwen3-VL-MoE, and Qwen3.5-MoE. Every listed SafeTensors family accepts
+fully resident execution, or independent expert caching composed with either
+host-layerwise or dense disk-streamed nonexpert units.
 Fully resident TP+EP uses the same external expert executor as sparse TP+EP:
 the generalized layerwise engine pins TP-sharded nonexpert units, while the
 residency manager eagerly materializes and pins only the experts owned by the
-local EP coordinate. `SparseExpertCacheWithDenseLayers` instead streams
-nonexpert units while independently caching only rank-owned experts. The model API requires
+local EP coordinate. Independent expert caching instead retains or streams
+nonexpert units according to its `NonExpertWeightResidency` while caching
+only rank-owned experts. The model API requires
 `EP > 1`. DeepSeek-V3/R1, Inkling, Kimi Linear, Qwen3, GPT-OSS, LFM2-MoE,
 Nemotron-H-MoE, Qwen3-Next/Qwen3.5-MoE, and the Qwen3-VL-MoE text decoder
 support TP+EP through tensor-sharded layerwise adapters with topology-scoped TP

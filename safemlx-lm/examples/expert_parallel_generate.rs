@@ -31,7 +31,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let stream = Stream::new_with_device(&topology.device.device()?);
     let weights_stream = Stream::new_with_device(&topology.device.device()?);
     let options = ModelLoadOptions::with_parallel(topology).with_weight_residency(
-        WeightResidency::SparseExpertCache(ExpertCacheLoadOptions::default()),
+        WeightResidency::with_expert_cache(
+            safemlx_lm::NonExpertWeightResidency::LayerwiseHost(Default::default()),
+            ExpertCacheLoadOptions::default(),
+        ),
     );
     let mut model =
         load_expert_parallel_model_with_options(&model_dir, options, &stream, &weights_stream)?;

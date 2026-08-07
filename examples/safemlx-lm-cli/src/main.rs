@@ -30,7 +30,9 @@ use safemlx_lm::{
         ChatTemplateRequest, NativeToolSupport, ParallelToolCallPolicy, SemanticSupport, ToolChoice,
     },
     runtime::checkpoint::quantization::AffineQuantization,
-    runtime::execution::layerwise::{LayerwiseLoadOptions, WeightResidency},
+    runtime::execution::layerwise::{
+        LayerwiseLoadOptions, NonExpertWeightResidency, WeightResidency,
+    },
     runtime::generation::sampler::{
         DefaultSampler, GenerationSampler, MirostatV2Sampler, Sampler, SpeculativeSampler,
     },
@@ -42,7 +44,6 @@ use safemlx_lm::{
     runtime::residency::dense_stream::DenseDiskStreamLoadOptions,
     runtime::residency::expert_cache::{
         ExpertCacheLoadOptions, ExpertPassStatistics, ExpertTierStatistics,
-        SparseExpertDenseStreamLoadOptions,
     },
     runtime::residency::policy::{
         CacheEvictionPolicy, MemoryTier, OffloadConfig, TransferDirection,
@@ -742,28 +743,31 @@ fn main() -> Result<()> {
         )?
         .with_eviction_policy(args.expert_cache_eviction.into());
         let expert_options = ExpertCacheLoadOptions::new(
-            non_expert,
             experts,
             args.expert_cache_scratch_bytes,
             args.expert_cache_prefill_bank_bytes,
         )?;
-        load_options = if args.dense_disk_stream {
-            load_options.with_weight_residency(WeightResidency::SparseExpertCacheWithDenseLayers(
-                SparseExpertDenseStreamLoadOptions::new(expert_options, dense_options()?),
-            ))
+        let non_experts = if args.dense_disk_stream {
+            NonExpertWeightResidency::DenseDiskStream(dense_options()?)
+        } else if args.layerwise_host {
+            NonExpertWeightResidency::LayerwiseHost(non_expert)
         } else {
-            load_options.with_weight_residency(WeightResidency::SparseExpertCache(expert_options))
+            NonExpertWeightResidency::FullyResident
         };
+        load_options = load_options.with_weight_residency(WeightResidency::with_expert_cache(
+            non_experts,
+            expert_options,
+        ));
     } else if args.dense_disk_stream {
-        load_options =
-            load_options.with_weight_residency(WeightResidency::DenseDiskStream(dense_options()?));
+        load_options = load_options
+            .with_weight_residency(WeightResidency::dense_disk_stream(dense_options()?));
     } else if args.layerwise_host {
         let offload = OffloadConfig::new(
             args.device_budget_bytes,
             args.host_budget_bytes,
             args.device_layer_window,
         )?;
-        load_options = load_options.with_weight_residency(WeightResidency::LayerwiseHost(
+        load_options = load_options.with_weight_residency(WeightResidency::layerwise_host(
             LayerwiseLoadOptions {
                 offload,
                 max_mapped_shards: args.mapped_shards,
@@ -1597,9 +1601,6 @@ fn validate_args(args: &Cli) -> Result<()> {
     }
     if args.dense_disk_stream && args.quantize.is_some() {
         bail!("--quantize is not supported with --dense-disk-stream; use matching checkpoint-native weights");
-    }
-    if args.expert_cache && args.layerwise_host {
-        bail!("--expert-cache conflicts with --layerwise-host");
     }
     if args.dense_disk_stream && args.layerwise_host {
         bail!("--dense-disk-stream conflicts with --layerwise-host");

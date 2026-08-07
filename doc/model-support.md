@@ -821,9 +821,16 @@ expert parallelism plus tensor + pipeline, tensor + expert, pipeline + expert,
 and Qwen3-MoE tensor + pipeline + expert execution. A non-replicated topology
 must be loaded through the matching API; the ordinary complete-model loader
 rejects it. One Cartesian topology owns coordinates and subgroup membership
-for every combination. Qwen3-MoE triple-axis execution supports fully resident
-and dense-disk-streamed SafeTensors and canonical GGUF; other families fail
-architecture preflight before checkpoint payload materialization.
+for every combination. Qwen3-MoE triple-axis execution supports complete-layer
+fully resident and dense-disk-streamed SafeTensors and canonical GGUF. Its
+independent expert path intersects stage-local layers, optional EP ownership,
+and optional TP projection shards. With EP inactive a stage owns every routed
+expert for its local layers and uses collective-free route recombination;
+non-experts may be resident or dense disk-streamed, prompt state remains
+rank-local and persistent, and GGUF uses bounded expert reads.
+Other families fail architecture preflight before checkpoint payload
+materialization until their semantic expert recipes are registered with the
+pipeline adapter.
 
 Pure pipeline inference uses the architecture-neutral distributed scheduler.
 That canonical runtime owns request/work identity, isolated per-request program
@@ -845,9 +852,9 @@ caches, and the shared expert is added once after routed reduction. The
 architecture-neutral external expert executor is available for every
 registered SafeTensors MoE family. `FullyResident` pins TP-sharded nonexpert
 units and every EP-owned routed expert during load;
-`SparseExpertCacheWithDenseLayers` disk-streams nonexpert decoder units while
-independently caching rank-owned experts. Remote experts are not materialized
-under either policy. Tensor
+`WeightResidency::with_expert_cache` composes dense disk-streamed nonexpert
+decoder units with an independent rank-owned expert cache. Remote experts are
+not materialized under either policy. Tensor
 parallelism and pure pipeline parallelism are supported. Pipeline stages load
 SafeTensors or canonical `kimi-linear` GGUF with fully resident or dense
 disk-streamed local blocks; KDA's three convolution histories plus recurrent

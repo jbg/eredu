@@ -4750,7 +4750,7 @@ mod tests {
         let generalized =
             crate::architectures::deepseek_v3::layerwise::load_deepseek_v3_layerwise_model(
                 &directory,
-                crate::LayerExecutionLoadOptions::FullyResident,
+                crate::LayerWeightResidency::FullyResident,
                 stream,
                 weights.stream(),
             )

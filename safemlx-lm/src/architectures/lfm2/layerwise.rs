@@ -56,7 +56,7 @@ use crate::{
     runtime::execution::layerwise::{
         load_layerwise_model, load_safetensors_layerwise_model,
         load_tensor_parallel_layerwise_model, open_safetensors_weight_store,
-        transformed_module_weight_store, ArchitectureAdapter, LayerExecutionLoadOptions,
+        transformed_module_weight_store, ArchitectureAdapter, LayerWeightResidency,
         LayerwiseForwardState, LayerwiseModel, StaticUnitBindings, WeightResidency,
     },
     runtime::residency::expert_cache::{
@@ -262,6 +262,10 @@ impl Lfm2LayerwiseModel {
         self.execution.adapter().args()
     }
 
+    pub(crate) fn bind_parallel_topology(&mut self, topology: crate::ParallelTopology) {
+        self.execution.bind_parallel_topology(topology);
+    }
+
     /// Creates heterogeneous attention and convolution state.
     pub fn new_cache(&self) -> Cache {
         self.execution.adapter().new_cache()
@@ -465,7 +469,7 @@ impl CausalLm<Cache> for Lfm2LayerwiseModel {
 /// Loads dense or MoE LFM2 through generalized parameter residency.
 pub fn load_lfm2_layerwise_model(
     model_dir: impl AsRef<Path>,
-    options: impl Into<LayerExecutionLoadOptions>,
+    options: impl Into<LayerWeightResidency>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<Lfm2LayerwiseModel, Error> {
@@ -501,7 +505,7 @@ pub(crate) fn execute_transformed_lfm2_model(
         execution: load_layerwise_model(
             store,
             adapter,
-            LayerExecutionLoadOptions::FullyResident,
+            LayerWeightResidency::FullyResident,
             stream,
             weights_stream,
         )?,
@@ -511,7 +515,7 @@ pub(crate) fn execute_transformed_lfm2_model(
 /// Loads dense or MoE LFM2 through the generalized tensor-parallel engine.
 pub fn load_lfm2_tensor_parallel_model(
     model_dir: impl AsRef<Path>,
-    options: impl Into<LayerExecutionLoadOptions>,
+    options: impl Into<LayerWeightResidency>,
     build: crate::runtime::distributed::parallel::ParallelBuildContext,
     stream: &Stream,
     weights_stream: &Stream,
@@ -555,7 +559,7 @@ pub fn load_lfm2_tensor_parallel_model(
 pub(crate) fn load_lfm2_gguf_tensor_parallel_model(
     checkpoint: &GgufCheckpoint,
     metadata: &HashMap<String, GgufMetadataValue>,
-    options: LayerExecutionLoadOptions,
+    options: LayerWeightResidency,
     build: crate::runtime::distributed::parallel::ParallelBuildContext,
     stream: &Stream,
     weights_stream: &Stream,
@@ -598,55 +602,26 @@ pub(crate) fn load_lfm2_gguf_layerwise_model(
             |name| resident::translate_gguf_weight_name(name, is_moe),
             residency.max_mapped_shards(),
         )?);
-    let execution = match residency {
-        WeightResidency::LayerwiseHost(options) => load_layerwise_model(
-            store,
-            Lfm2LayerwiseAdapter::new(args, stream)?,
-            options,
-            stream,
-            weights_stream,
-        )?,
-        WeightResidency::DenseDiskStream(options) => load_layerwise_model(
-            store,
-            Lfm2LayerwiseAdapter::new(args, stream)?,
-            options,
-            stream,
-            weights_stream,
-        )?,
-        WeightResidency::SparseExpertCache(options) => {
-            return Ok((
-                load_lfm2_gguf_sparse_with_store(
-                    store,
-                    args,
-                    options,
-                    options.non_expert,
-                    stream,
-                    weights_stream,
-                )?,
-                prepared.eos_token_ids,
-            ));
-        }
-        WeightResidency::SparseExpertCacheWithDenseLayers(options) => {
-            return Ok((
-                load_lfm2_gguf_sparse_with_store(
-                    store,
-                    args,
-                    options.expert_cache,
-                    options.non_expert,
-                    stream,
-                    weights_stream,
-                )?,
-                prepared.eos_token_ids,
-            ));
-        }
-        WeightResidency::FullyResident => load_layerwise_model(
-            store,
-            Lfm2LayerwiseAdapter::new(args, stream)?,
-            LayerExecutionLoadOptions::FullyResident,
-            stream,
-            weights_stream,
-        )?,
-    };
+    if let Some(expert_options) = residency.expert_cache() {
+        return Ok((
+            load_lfm2_gguf_sparse_with_store(
+                store,
+                args,
+                expert_options,
+                residency.layers(),
+                stream,
+                weights_stream,
+            )?,
+            prepared.eos_token_ids,
+        ));
+    }
+    let execution = load_layerwise_model(
+        store,
+        Lfm2LayerwiseAdapter::new(args, stream)?,
+        residency.layers(),
+        stream,
+        weights_stream,
+    )?;
     Ok((Lfm2LayerwiseModel { execution }, prepared.eos_token_ids))
 }
 
@@ -654,7 +629,7 @@ fn load_lfm2_gguf_sparse_with_store(
     store: Arc<dyn WeightStore + Send + Sync>,
     args: ModelArgs,
     options: ExpertCacheLoadOptions,
-    non_expert: impl Into<LayerExecutionLoadOptions>,
+    non_expert: impl Into<LayerWeightResidency>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<Lfm2LayerwiseModel, Error> {
@@ -682,7 +657,7 @@ fn load_lfm2_gguf_sparse_with_store(
 pub(crate) fn load_lfm2_sparse_ep_base_with_store(
     store: Arc<dyn WeightStore + Send + Sync>,
     args: ModelArgs,
-    non_expert: impl Into<LayerExecutionLoadOptions>,
+    non_expert: impl Into<LayerWeightResidency>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<Lfm2LayerwiseModel, Error> {
@@ -696,7 +671,7 @@ pub(crate) fn load_lfm2_sparse_ep_base_with_store(
 pub(crate) fn load_lfm2_sparse_tp_ep_base_with_store(
     store: Arc<dyn WeightStore + Send + Sync>,
     args: ModelArgs,
-    non_expert: impl Into<LayerExecutionLoadOptions>,
+    non_expert: impl Into<LayerWeightResidency>,
     build: crate::runtime::distributed::parallel::ParallelBuildContext,
     stream: &Stream,
     weights_stream: &Stream,
@@ -714,43 +689,11 @@ pub(crate) fn load_lfm2_sparse_tp_ep_base_with_store(
     Ok(Lfm2LayerwiseModel { execution })
 }
 
-/// Loads MoE LFM2 with expert-granular sparse caching.
-pub fn load_lfm2_sparse_expert_cache_model(
+/// Loads MoE LFM2 with independently cached experts and bounded non-expert units.
+pub fn load_lfm2_expert_cache_model(
     model_dir: impl AsRef<Path>,
+    non_expert: crate::NonExpertWeightResidency,
     options: ExpertCacheLoadOptions,
-    stream: &Stream,
-    weights_stream: &Stream,
-) -> Result<Lfm2LayerwiseModel, Error> {
-    load_lfm2_sparse_expert_cache_model_with_non_expert(
-        model_dir,
-        options,
-        options.non_expert,
-        stream,
-        weights_stream,
-    )
-}
-
-/// Loads LFM2 with expert caching and disk-streamed non-expert units.
-pub fn load_lfm2_sparse_expert_cache_model_with_dense_layers(
-    model_dir: impl AsRef<Path>,
-    options: ExpertCacheLoadOptions,
-    non_expert: crate::runtime::residency::dense_stream::DenseDiskStreamLoadOptions,
-    stream: &Stream,
-    weights_stream: &Stream,
-) -> Result<Lfm2LayerwiseModel, Error> {
-    load_lfm2_sparse_expert_cache_model_with_non_expert(
-        model_dir,
-        options,
-        non_expert,
-        stream,
-        weights_stream,
-    )
-}
-
-fn load_lfm2_sparse_expert_cache_model_with_non_expert(
-    model_dir: impl AsRef<Path>,
-    options: ExpertCacheLoadOptions,
-    non_expert: impl Into<LayerExecutionLoadOptions>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<Lfm2LayerwiseModel, Error> {
@@ -990,7 +933,15 @@ impl ArchitectureAdapter for Lfm2LayerwiseAdapter {
         let layer_count = usize::try_from(self.args.num_hidden_layers)
             .map_err(|_| Exception::custom("invalid LFM2 cache layer count"))?;
         let geometry = match topology {
-            None => self
+            Some(topology) if topology.is_axis_active(crate::ParallelAxis::Tensor) => {
+                self.parallel_cache_geometry.clone().ok_or_else(|| {
+                    Error::Parallel(
+                        "LFM2 parallel cache identity requested before local layout configuration"
+                            .into(),
+                    )
+                })?
+            }
+            _ => self
                 .args
                 .layer_schedule
                 .iter()
@@ -1005,12 +956,6 @@ impl ArchitectureAdapter for Lfm2LayerwiseAdapter {
                     },
                 })
                 .collect(),
-            Some(_) => self.parallel_cache_geometry.clone().ok_or_else(|| {
-                Error::Parallel(
-                    "LFM2 parallel cache identity requested before local layout configuration"
-                        .into(),
-                )
-            })?,
         };
         Ok(PromptCacheModelIdentity {
             model_family: "lfm2".into(),
@@ -1942,7 +1887,7 @@ mod tests {
     };
 
     use super::{
-        load_lfm2_layerwise_model, load_lfm2_sparse_expert_cache_model, Lfm2LayerwiseAdapter,
+        load_lfm2_expert_cache_model, load_lfm2_layerwise_model, Lfm2LayerwiseAdapter,
         Lfm2LayerwiseModel,
     };
     use crate::{
@@ -1961,7 +1906,7 @@ mod tests {
                 topology::{DeviceAssignment, ParallelTopology},
             },
             execution::layerwise::{
-                load_safetensors_layerwise_model, ArchitectureAdapter, LayerExecutionLoadOptions,
+                load_safetensors_layerwise_model, ArchitectureAdapter, LayerWeightResidency,
                 LayerwiseLoadOptions,
             },
         },
@@ -2296,11 +2241,11 @@ mod tests {
 
         let mut resident = resident::load_model(dir.path(), gpu.stream(), cpu.stream()).unwrap();
         let options = if dense_stream {
-            LayerExecutionLoadOptions::DenseDiskStream(
+            LayerWeightResidency::DenseDiskStream(
                 DenseDiskStreamLoadOptions::new(u64::MAX, u64::MAX, depth, depth, depth).unwrap(),
             )
         } else {
-            LayerExecutionLoadOptions::LayerwiseHost(LayerwiseLoadOptions::new(
+            LayerWeightResidency::LayerwiseHost(LayerwiseLoadOptions::new(
                 OffloadConfig::new(None, None, depth).unwrap(),
             ))
         };
@@ -2451,16 +2396,19 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         write_fixture(dir.path(), &fixture, gpu.stream());
         let mut resident = resident::load_model(dir.path(), gpu.stream(), cpu.stream()).unwrap();
-        let options = ExpertCacheLoadOptions::new(
-            LayerwiseLoadOptions::new(OffloadConfig::new(None, None, 1).unwrap()),
-            OffloadConfig::new(None, None, 1).unwrap(),
-            1 << 20,
-            1,
+        let options =
+            ExpertCacheLoadOptions::new(OffloadConfig::new(None, None, 1).unwrap(), 1 << 20, 1)
+                .unwrap();
+        let mut cached = load_lfm2_expert_cache_model(
+            dir.path(),
+            crate::NonExpertWeightResidency::LayerwiseHost(LayerwiseLoadOptions::new(
+                OffloadConfig::new(None, None, 1).unwrap(),
+            )),
+            options,
+            gpu.stream(),
+            cpu.stream(),
         )
         .unwrap();
-        let mut cached =
-            load_lfm2_sparse_expert_cache_model(dir.path(), options, gpu.stream(), cpu.stream())
-                .unwrap();
         let mut resident_cache = resident.new_cache();
         let mut cached_cache = Cache { layers: Vec::new() };
         for tokens in [

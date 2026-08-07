@@ -175,11 +175,11 @@ fn qwen3_vl_pipeline_ring_worker() {
         .as_ref()
         .map(|_| CartesianExecution::new(topology, Some(2), moe.then_some(4), &group).unwrap());
     let residency = if std::env::var_os(STREAMED).is_some() {
-        WeightResidency::DenseDiskStream(
+        WeightResidency::dense_disk_stream(
             DenseDiskStreamLoadOptions::new(u64::MAX, u64::MAX, 1, 1, 1).unwrap(),
         )
     } else {
-        WeightResidency::FullyResident
+        WeightResidency::fully_resident()
     };
     let mut model = load_pipeline_model_with_options(
         &checkpoint,

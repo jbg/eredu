@@ -57,13 +57,14 @@ pub use runtime::distributed::topology::{
 pub use runtime::execution::layerwise::{
     load_layerwise_model, ArchitectureAdapter, DenseCacheMetrics, DenseDiskStreamReport,
     DenseExecutionGroupReport, DensePassReport, DenseTierResidencyReport, ExecutionResidency,
-    LayerExecutionLoadOptions, LayerwiseForwardState, LayerwiseLoadOptions, LayerwiseModel,
-    LayerwiseModelMetadata, ParallelModelInfo, SharedWeightStore, WeightResidency,
+    ExpertWeightResidency, LayerWeightResidency, LayerwiseForwardState, LayerwiseLoadOptions,
+    LayerwiseModel, LayerwiseModelMetadata, NonExpertWeightResidency, ParallelModelInfo,
+    SharedWeightStore, WeightResidency,
 };
 pub use runtime::residency::dense_stream::{
     BackgroundPrefetchReport, DenseDiskStreamLoadOptions, DenseStreamError,
 };
-pub use runtime::residency::expert_cache::SparseExpertDenseStreamLoadOptions;
+pub use runtime::residency::expert_cache::{ExpertCacheLoadOptions, ExpertCacheReport};
 
 use safemlx::Array;
 

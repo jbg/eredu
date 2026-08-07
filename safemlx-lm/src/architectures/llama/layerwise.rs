@@ -46,7 +46,7 @@ use crate::{
         load_layerwise_model, load_safetensors_layerwise_model,
         load_tensor_parallel_layerwise_model, open_safetensors_weight_store,
         transformed_module_weight_store, ArchitectureAdapter, DenseDiskStreamReport,
-        ExecutionResidency, LayerExecutionLoadOptions, LayerwiseForwardState, LayerwiseLoadOptions,
+        ExecutionResidency, LayerWeightResidency, LayerwiseForwardState, LayerwiseLoadOptions,
         LayerwiseModel, LayerwiseModelMetadata, StaticUnitBindings, WeightResidency,
     },
     runtime::residency::manager::{ResidencyReport, ResidentUnitLease, WeightBinding},
@@ -67,14 +67,14 @@ impl LlamaLoadOptions {
     /// Selects the eager engine with every parameter on the execution device.
     pub const fn fully_resident() -> Self {
         Self {
-            weight_residency: WeightResidency::FullyResident,
+            weight_residency: WeightResidency::fully_resident(),
         }
     }
 
     /// Selects host-backed decoder layers with a bounded device window.
     pub const fn layerwise_host(options: LayerwiseLoadOptions) -> Self {
         Self {
-            weight_residency: WeightResidency::LayerwiseHost(options),
+            weight_residency: WeightResidency::layerwise_host(options),
         }
     }
 
@@ -83,7 +83,7 @@ impl LlamaLoadOptions {
         options: crate::runtime::residency::dense_stream::DenseDiskStreamLoadOptions,
     ) -> Self {
         Self {
-            weight_residency: WeightResidency::DenseDiskStream(options),
+            weight_residency: WeightResidency::dense_disk_stream(options),
         }
     }
 }
@@ -496,21 +496,12 @@ pub fn load_llama_model(
         model_dir,
         crate::api::ModelLoadOptions::default().with_weight_residency(options.weight_residency),
     )?;
-    let execution_options = match options.weight_residency {
-        WeightResidency::FullyResident => LayerExecutionLoadOptions::FullyResident,
-        WeightResidency::LayerwiseHost(options) => {
-            LayerExecutionLoadOptions::LayerwiseHost(options)
-        }
-        WeightResidency::DenseDiskStream(options) => {
-            LayerExecutionLoadOptions::DenseDiskStream(options)
-        }
-        WeightResidency::SparseExpertCache(_)
-        | WeightResidency::SparseExpertCacheWithDenseLayers(_) => {
-            return Err(Error::UnsupportedArchitecture(
-                "sparse expert caching is not supported for Llama checkpoints".into(),
-            ));
-        }
-    };
+    if options.weight_residency.expert_cache().is_some() {
+        return Err(Error::UnsupportedArchitecture(
+            "independent expert caching is not supported for Llama checkpoints".into(),
+        ));
+    }
+    let execution_options = options.weight_residency.layers();
     let args = resident::get_llama_model_args(model_dir)?;
     let adapter = LlamaLayerwiseAdapter::new(args, stream)?;
     Ok(LlamaModel {
@@ -535,7 +526,7 @@ pub(crate) fn execute_transformed_llama_model(
         execution: Box::new(load_layerwise_model(
             store,
             adapter,
-            LayerExecutionLoadOptions::FullyResident,
+            LayerWeightResidency::FullyResident,
             stream,
             weights_stream,
         )?),
@@ -545,7 +536,7 @@ pub(crate) fn execute_transformed_llama_model(
 /// Loads Llama/Mistral through the generalized tensor-parallel execution engine.
 pub fn load_llama_tensor_parallel_model(
     model_dir: impl AsRef<Path>,
-    options: impl Into<LayerExecutionLoadOptions>,
+    options: impl Into<LayerWeightResidency>,
     build: crate::runtime::distributed::parallel::ParallelBuildContext,
     stream: &Stream,
     weights_stream: &Stream,
@@ -591,7 +582,7 @@ pub fn load_llama_tensor_parallel_model(
 pub(crate) fn load_llama_gguf_tensor_parallel_model(
     checkpoint: &GgufCheckpoint,
     metadata: &HashMap<String, GgufMetadataValue>,
-    options: LayerExecutionLoadOptions,
+    options: LayerWeightResidency,
     build: crate::runtime::distributed::parallel::ParallelBuildContext,
     stream: &Stream,
     weights_stream: &Stream,
@@ -641,21 +632,12 @@ pub(crate) fn load_llama_gguf_model(
             residency.max_mapped_shards(),
         )?);
     let adapter = LlamaLayerwiseAdapter::new(prepared.args, stream)?;
-    let execution_options = match residency {
-        WeightResidency::FullyResident => LayerExecutionLoadOptions::FullyResident,
-        WeightResidency::LayerwiseHost(options) => {
-            LayerExecutionLoadOptions::LayerwiseHost(options)
-        }
-        WeightResidency::DenseDiskStream(options) => {
-            LayerExecutionLoadOptions::DenseDiskStream(options)
-        }
-        WeightResidency::SparseExpertCache(_)
-        | WeightResidency::SparseExpertCacheWithDenseLayers(_) => {
-            return Err(Error::UnsupportedArchitecture(
-                "sparse expert caching is not supported for Llama GGUF checkpoints".into(),
-            ));
-        }
-    };
+    if residency.expert_cache().is_some() {
+        return Err(Error::UnsupportedArchitecture(
+            "independent expert caching is not supported for Llama GGUF checkpoints".into(),
+        ));
+    }
+    let execution_options = residency.layers();
     Ok((
         LlamaModel {
             execution: Box::new(load_layerwise_model(

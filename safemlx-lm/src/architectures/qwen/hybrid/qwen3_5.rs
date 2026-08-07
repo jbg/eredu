@@ -6311,6 +6311,7 @@ where
     Ok(())
 }
 
+#[cfg(test)]
 pub(crate) fn transform_split_qwen_fp8_experts(
     loaded: HashMap<String, Array>,
     num_experts: i32,

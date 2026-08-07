@@ -23,7 +23,6 @@ use safemlx_lm::{
     error::Error,
     nn::moe::{PackedRelu2Experts, PackedSwiGluExperts},
     runtime::checkpoint::store::{SafetensorsWeightStore, TensorSelection},
-    runtime::execution::layerwise::LayerwiseLoadOptions,
     runtime::residency::expert_cache::{
         ExpertCache, ExpertCacheLoadOptions, ExpertCatalogEntry, ExpertIdentity, ExpertPass,
         ExpertRouteBatch,
@@ -365,13 +364,8 @@ fn expert_exchange_ring_worker() {
     let cache = ExpertCache::new(
         store,
         entries,
-        ExpertCacheLoadOptions::new(
-            LayerwiseLoadOptions::default(),
-            OffloadConfig::new(Some(24), Some(24), 1).unwrap(),
-            24,
-            24,
-        )
-        .unwrap(),
+        ExpertCacheLoadOptions::new(OffloadConfig::new(Some(24), Some(24), 1).unwrap(), 24, 24)
+            .unwrap(),
         stream.clone(),
         stream.clone(),
     )

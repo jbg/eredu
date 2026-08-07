@@ -77,7 +77,7 @@ pub(crate) fn transformed_module_weight_store(
 pub(crate) fn validate_gguf_layerwise_source(
     checkpoint: &safemlx::ops::GgufCheckpoint,
     metadata: &std::collections::HashMap<String, safemlx::ops::GgufMetadataValue>,
-    options: LayerExecutionLoadOptions,
+    options: LayerWeightResidency,
 ) -> Result<crate::api::GgufArchitecture, Error> {
     let architecture_name = match metadata.get("general.architecture") {
         Some(safemlx::ops::GgufMetadataValue::String(name)) => name,
@@ -141,41 +141,25 @@ impl Default for LayerwiseLoadOptions {
     }
 }
 
-/// Weight placement choices exposed by architecture-level model loaders.
+/// Placement policy for ordinary architecture execution units.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Default)]
-pub enum WeightResidency {
-    /// Construct every module once and keep all parameters on the execution device.
+pub enum LayerWeightResidency {
+    /// Construct every rank-local module once and retain it on the execution device.
     #[default]
     FullyResident,
-    /// Keep decoder weights on a host stream and execute through a bounded device window.
+    /// Eagerly materialize units on a host stream and use a bounded device window.
     LayerwiseHost(LayerwiseLoadOptions),
-    /// Experimentally stream ordinary execution layers through finite host and device caches.
+    /// Leave units cold on disk and use finite host and device caches.
     DenseDiskStream(DenseDiskStreamLoadOptions),
-    /// Keep non-expert decoder weights layerwise while caching routed experts independently.
-    SparseExpertCache(crate::runtime::residency::expert_cache::ExpertCacheLoadOptions),
-    /// Cache experts independently while disk-streaming non-expert execution units.
-    SparseExpertCacheWithDenseLayers(
-        crate::runtime::residency::expert_cache::SparseExpertDenseStreamLoadOptions,
-    ),
 }
 
-impl WeightResidency {
+impl LayerWeightResidency {
     /// Returns the backend shard/reader cache bound carried by this policy.
     pub(crate) const fn max_mapped_shards(self) -> usize {
         match self {
             Self::FullyResident => crate::runtime::checkpoint::store::DEFAULT_MAX_MAPPED_SHARDS,
             Self::LayerwiseHost(options) => options.max_mapped_shards,
             Self::DenseDiskStream(options) => options.max_mapped_shards,
-            Self::SparseExpertCache(options) => options.non_expert.max_mapped_shards,
-            Self::SparseExpertCacheWithDenseLayers(options) => {
-                if options.non_expert.max_mapped_shards
-                    < options.expert_cache.non_expert.max_mapped_shards
-                {
-                    options.non_expert.max_mapped_shards
-                } else {
-                    options.expert_cache.non_expert.max_mapped_shards
-                }
-            }
         }
     }
 
@@ -185,24 +169,171 @@ impl WeightResidency {
             Self::FullyResident => true,
             Self::LayerwiseHost(options) => options.strict_loading,
             Self::DenseDiskStream(options) => options.strict_loading,
-            Self::SparseExpertCache(options) => options.non_expert.strict_loading,
-            Self::SparseExpertCacheWithDenseLayers(options) => {
-                options.expert_cache.non_expert.strict_loading && options.non_expert.strict_loading
-            }
         }
     }
 }
 
-/// Loader controls accepted by the shared generalized execution engine.
+/// Routed-expert placement relative to ordinary layer units.
 #[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
-pub enum LayerExecutionLoadOptions {
-    /// Materialize every rank-local module once and retain it on the execution device.
+pub enum ExpertWeightResidency {
+    /// Keep routed experts in the ordinary layer residency unit.
     #[default]
+    WithLayer,
+    /// Catalog routed experts as independent atomic residency units.
+    IndependentCache(crate::runtime::residency::expert_cache::ExpertCacheLoadOptions),
+}
+
+/// Placement of non-expert parameters when routed experts are independent units.
+///
+/// This is distinct from [`LayerWeightResidency`]: `FullyResident` here pins
+/// attention, routers, shared experts, norms, and other non-routed parameters,
+/// while routed expert banks remain governed by their independent cache.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum NonExpertWeightResidency {
+    /// Keep every non-expert parameter resident on the execution device.
     FullyResident,
-    /// Preserve eager host materialization and a bounded device window.
+    /// Eagerly materialize non-expert units on host behind a device window.
     LayerwiseHost(LayerwiseLoadOptions),
-    /// Keep execution units cold on disk and use finite retained tier caches.
+    /// Leave non-expert units cold on disk behind finite tier caches.
     DenseDiskStream(DenseDiskStreamLoadOptions),
+}
+
+impl NonExpertWeightResidency {
+    /// Returns the corresponding generalized layer policy.
+    pub const fn layers(self) -> LayerWeightResidency {
+        match self {
+            Self::FullyResident => LayerWeightResidency::FullyResident,
+            Self::LayerwiseHost(options) => LayerWeightResidency::LayerwiseHost(options),
+            Self::DenseDiskStream(options) => LayerWeightResidency::DenseDiskStream(options),
+        }
+    }
+}
+
+/// Composable weight placement selected before checkpoint materialization.
+///
+/// Its sum-of-products shape distinguishes complete layer residency from
+/// non-expert residency plus independently managed routed experts. Whether
+/// independent experts apply to a checkpoint is necessarily validated after
+/// architecture metadata is read.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum WeightResidency {
+    /// Routed experts share the ordinary layer residency unit.
+    Layers(LayerWeightResidency),
+    /// Routed experts are independent units beside bounded ordinary layers.
+    IndependentExperts {
+        /// Bounded ordinary-layer policy.
+        non_experts: NonExpertWeightResidency,
+        /// Expert-granular cache controls.
+        cache: crate::runtime::residency::expert_cache::ExpertCacheLoadOptions,
+    },
+}
+
+impl WeightResidency {
+    /// Keeps every rank-owned parameter on the execution device.
+    pub const fn fully_resident() -> Self {
+        Self::with_layers(LayerWeightResidency::FullyResident)
+    }
+
+    /// Eagerly materializes ordinary units on host behind a bounded device window.
+    pub const fn layerwise_host(options: LayerwiseLoadOptions) -> Self {
+        Self::with_layers(LayerWeightResidency::LayerwiseHost(options))
+    }
+
+    /// Leaves ordinary units cold on disk behind finite host/device caches.
+    pub const fn dense_disk_stream(options: DenseDiskStreamLoadOptions) -> Self {
+        Self::with_layers(LayerWeightResidency::DenseDiskStream(options))
+    }
+
+    /// Keeps every owned parameter in its ordinary layer residency unit.
+    pub const fn with_layers(layers: LayerWeightResidency) -> Self {
+        Self::Layers(layers)
+    }
+
+    /// Gives routed experts an independent cache beside the selected ordinary-layer policy.
+    pub const fn with_expert_cache(
+        non_experts: NonExpertWeightResidency,
+        experts: crate::runtime::residency::expert_cache::ExpertCacheLoadOptions,
+    ) -> Self {
+        Self::IndependentExperts {
+            non_experts,
+            cache: experts,
+        }
+    }
+
+    /// Returns the ordinary-layer placement policy.
+    pub const fn layers(self) -> LayerWeightResidency {
+        match self {
+            Self::Layers(layers) => layers,
+            Self::IndependentExperts { non_experts, .. } => non_experts.layers(),
+        }
+    }
+
+    /// Returns routed-expert placement relative to ordinary layers.
+    pub const fn experts(self) -> ExpertWeightResidency {
+        match self {
+            Self::Layers(_) => ExpertWeightResidency::WithLayer,
+            Self::IndependentExperts { cache, .. } => {
+                ExpertWeightResidency::IndependentCache(cache)
+            }
+        }
+    }
+
+    /// Returns independently cached expert controls, when selected.
+    pub const fn expert_cache(
+        self,
+    ) -> Option<crate::runtime::residency::expert_cache::ExpertCacheLoadOptions> {
+        match self {
+            Self::Layers(_) => None,
+            Self::IndependentExperts { cache, .. } => Some(cache),
+        }
+    }
+
+    /// Returns non-expert placement paired with an independent expert cache.
+    pub const fn non_experts(self) -> Option<NonExpertWeightResidency> {
+        match self {
+            Self::Layers(_) => None,
+            Self::IndependentExperts { non_experts, .. } => Some(non_experts),
+        }
+    }
+
+    /// Returns whether every non-expert parameter remains resident.
+    pub const fn non_experts_are_fully_resident(self) -> bool {
+        matches!(
+            self,
+            Self::Layers(LayerWeightResidency::FullyResident)
+                | Self::IndependentExperts {
+                    non_experts: NonExpertWeightResidency::FullyResident,
+                    ..
+                }
+        )
+    }
+
+    /// Returns whether every ordinary layer remains resident.
+    pub const fn is_fully_resident(self) -> bool {
+        matches!(self, Self::Layers(LayerWeightResidency::FullyResident))
+    }
+
+    /// Returns the common backend shard/reader cache bound.
+    pub(crate) const fn max_mapped_shards(self) -> usize {
+        self.layers().max_mapped_shards()
+    }
+
+    /// Returns whether whole-artifact admission rejects unrelated tensors.
+    pub(crate) const fn strict_loading(self) -> bool {
+        self.layers().strict_loading()
+    }
+}
+
+impl From<NonExpertWeightResidency> for LayerWeightResidency {
+    fn from(value: NonExpertWeightResidency) -> Self {
+        value.layers()
+    }
+}
+
+impl Default for WeightResidency {
+    fn default() -> Self {
+        Self::fully_resident()
+    }
 }
 
 /// Static-parameter placement used by the generalized execution engine.
@@ -216,35 +347,19 @@ pub enum ExecutionResidency {
     DenseDiskStream,
 }
 
-impl From<LayerwiseLoadOptions> for LayerExecutionLoadOptions {
+impl From<LayerwiseLoadOptions> for LayerWeightResidency {
     fn from(value: LayerwiseLoadOptions) -> Self {
         Self::LayerwiseHost(value)
     }
 }
 
-impl From<DenseDiskStreamLoadOptions> for LayerExecutionLoadOptions {
+impl From<DenseDiskStreamLoadOptions> for LayerWeightResidency {
     fn from(value: DenseDiskStreamLoadOptions) -> Self {
         Self::DenseDiskStream(value)
     }
 }
 
-impl LayerExecutionLoadOptions {
-    pub(crate) fn max_mapped_shards(self) -> usize {
-        match self {
-            Self::FullyResident => crate::runtime::checkpoint::store::DEFAULT_MAX_MAPPED_SHARDS,
-            Self::LayerwiseHost(options) => options.max_mapped_shards,
-            Self::DenseDiskStream(options) => options.max_mapped_shards,
-        }
-    }
-
-    fn strict_loading(self) -> bool {
-        match self {
-            Self::FullyResident => true,
-            Self::LayerwiseHost(options) => options.strict_loading,
-            Self::DenseDiskStream(options) => options.strict_loading,
-        }
-    }
-
+impl LayerWeightResidency {
     fn sample_mlx_memory(self) -> bool {
         match self {
             Self::FullyResident => false,
@@ -293,11 +408,7 @@ impl LayerExecutionLoadOptions {
     }
 
     pub(crate) const fn weight_residency(self) -> WeightResidency {
-        match self {
-            Self::FullyResident => WeightResidency::FullyResident,
-            Self::LayerwiseHost(options) => WeightResidency::LayerwiseHost(options),
-            Self::DenseDiskStream(options) => WeightResidency::DenseDiskStream(options),
-        }
+        WeightResidency::with_layers(self)
     }
 
     const fn is_fully_resident(self) -> bool {
@@ -2377,6 +2488,14 @@ impl<A: ArchitectureAdapter> LayerwiseModel<A> {
             .and_then(|topology| topology.cache_rank_identity())
     }
 
+    /// Binds state and persistence identity to an enclosing Cartesian runtime.
+    pub(crate) fn bind_parallel_topology(
+        &mut self,
+        topology: crate::runtime::distributed::topology::ParallelTopology,
+    ) {
+        self.parallel_topology = Some(topology);
+    }
+
     /// Returns the mutable adapter for loader-time dependent-unit setup.
     pub(crate) fn adapter_mut(&mut self) -> &mut A {
         &mut self.adapter
@@ -3033,7 +3152,7 @@ pub(crate) fn load_safetensors_layerwise_model<A, O>(
 ) -> Result<LayerwiseModel<A>, Error>
 where
     A: ArchitectureAdapter,
-    O: Into<LayerExecutionLoadOptions>,
+    O: Into<LayerWeightResidency>,
 {
     let options = options.into();
     let store = open_safetensors_weight_store(model_dir.as_ref(), options.max_mapped_shards())?;
@@ -3050,7 +3169,7 @@ pub fn load_layerwise_model<A, O>(
 ) -> Result<LayerwiseModel<A>, Error>
 where
     A: ArchitectureAdapter,
-    O: Into<LayerExecutionLoadOptions>,
+    O: Into<LayerWeightResidency>,
 {
     let options = options.into();
     let fully_resident = options.is_fully_resident();
@@ -3253,7 +3372,7 @@ pub(crate) fn load_tensor_parallel_layerwise_model<A, O>(
 ) -> Result<LayerwiseModel<A>, Error>
 where
     A: ArchitectureAdapter,
-    O: Into<LayerExecutionLoadOptions>,
+    O: Into<LayerWeightResidency>,
 {
     let options = options.into();
     let fully_resident = options.is_fully_resident();
@@ -3984,6 +4103,53 @@ pub enum LayerwiseModelError {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn weight_residency_decomposes_layers_and_experts() {
+        let host = LayerwiseLoadOptions::default();
+        let experts = crate::runtime::residency::expert_cache::ExpertCacheLoadOptions::default();
+        let residency = WeightResidency::with_expert_cache(
+            NonExpertWeightResidency::LayerwiseHost(host),
+            experts,
+        );
+
+        assert_eq!(
+            residency.layers(),
+            LayerWeightResidency::LayerwiseHost(host)
+        );
+        assert_eq!(
+            residency.experts(),
+            ExpertWeightResidency::IndependentCache(experts)
+        );
+        assert_eq!(residency.expert_cache(), Some(experts));
+        assert_eq!(
+            residency.non_experts(),
+            Some(NonExpertWeightResidency::LayerwiseHost(host))
+        );
+        assert!(!residency.is_fully_resident());
+        assert!(!residency.non_experts_are_fully_resident());
+
+        let resident_non_experts =
+            WeightResidency::with_expert_cache(NonExpertWeightResidency::FullyResident, experts);
+        assert_eq!(
+            resident_non_experts.layers(),
+            LayerWeightResidency::FullyResident
+        );
+        assert_eq!(
+            resident_non_experts.experts(),
+            ExpertWeightResidency::IndependentCache(experts)
+        );
+        assert!(resident_non_experts.non_experts_are_fully_resident());
+        assert!(!resident_non_experts.is_fully_resident());
+
+        let resident = WeightResidency::fully_resident();
+        assert_eq!(resident.layers(), LayerWeightResidency::FullyResident);
+        assert_eq!(resident.experts(), ExpertWeightResidency::WithLayer);
+        assert!(resident.is_fully_resident());
+        assert!(resident.non_experts_are_fully_resident());
+        assert_eq!(resident.expert_cache(), None);
+        assert_eq!(resident.non_experts(), None);
+    }
+
     use std::fs;
 
     use safemlx::{

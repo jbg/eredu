@@ -6,7 +6,7 @@ use std::path::Path;
 use safemlx::ops::{GgufCheckpoint, GgufMetadataValue, GgufType};
 use serde_json::Value;
 
-use super::{GgufArchitecture, ModelKind, ModelLoadOptions, WeightResidency};
+use super::{GgufArchitecture, ModelKind, ModelLoadOptions};
 use crate::{
     architectures::{
         deepseek_v3::model as deepseek_v3,
@@ -1672,11 +1672,7 @@ fn validate_gemma4_safetensors(
         Ok(config) => config,
         Err(error) => return invalid_geometry(error.to_string()),
     };
-    if matches!(
-        options.weight_residency,
-        WeightResidency::SparseExpertCache(_)
-            | WeightResidency::SparseExpertCacheWithDenseLayers(_)
-    ) {
+    if options.weight_residency.expert_cache().is_some() {
         return invalid_geometry(
             "Gemma 4 SafeTensors does not expose a sparse-expert-cache load route".into(),
         );
@@ -1686,10 +1682,7 @@ fn validate_gemma4_safetensors(
     let layers = args.num_hidden_layers as usize;
     let vocab = args.vocab_size as usize;
     let quantization = args.weight_quantization();
-    let bounded = matches!(
-        options.weight_residency,
-        WeightResidency::LayerwiseHost(_) | WeightResidency::DenseDiskStream(_)
-    );
+    let bounded = !options.weight_residency.is_fully_resident();
     let keys = store.keys().into_iter().collect::<BTreeSet<_>>();
     let mut allowed = BTreeSet::new();
     let mut issues = Vec::new();
@@ -3053,7 +3046,7 @@ fn validate_deepseek_v3_safetensors(
         validate_safetensor_format_plan(store, expected, deepseek_format),
         &mut issues,
     );
-    let allow_packed = !matches!(options.weight_residency, WeightResidency::FullyResident);
+    let allow_packed = !options.weight_residency.is_fully_resident();
     for (layer, policy) in args.layer_schedule.iter().enumerate() {
         if *policy != deepseek_v3::LayerPolicy::SparseMoe {
             continue;
@@ -3199,7 +3192,7 @@ fn validate_lfm2_safetensors(
         }),
         &mut issues,
     );
-    let allow_derived_packed = !matches!(options.weight_residency, WeightResidency::FullyResident);
+    let allow_derived_packed = !options.weight_residency.is_fully_resident();
     for (layer, _) in args
         .layer_schedule
         .iter()
@@ -3836,13 +3829,7 @@ fn validate_qwen_hybrid_safetensors(
     options: ModelLoadOptions,
     variant: QwenHybridSafetensorsVariant,
 ) -> StructuralValidation {
-    if !args.is_moe()
-        && matches!(
-            options.weight_residency,
-            WeightResidency::SparseExpertCache(_)
-                | WeightResidency::SparseExpertCacheWithDenseLayers(_)
-        )
-    {
+    if !args.is_moe() && options.weight_residency.expert_cache().is_some() {
         return invalid_geometry(format!(
             "sparse expert caching requires a {} MoE checkpoint",
             variant.label()
@@ -4959,7 +4946,7 @@ fn validate_qwen3_vl_safetensors(
         let experts = args.text_config.num_experts as usize;
         let hidden = args.text_config.hidden_size as usize;
         let intermediate = args.text_config.moe_intermediate_size as usize;
-        let allow_split = !matches!(options.weight_residency, WeightResidency::FullyResident);
+        let allow_split = !options.weight_residency.is_fully_resident();
         for layer in 0..args.text_config.num_hidden_layers as usize {
             let prefix = format!("model.language_model.layers.{layer}.mlp.experts");
             validate_split_or_packed_swiglu_experts(
@@ -7275,13 +7262,7 @@ fn validate_qwen35_gguf(
         Ok(args) => args,
         Err(error) => return invalid_geometry(error.to_string()),
     };
-    if !args.is_moe()
-        && matches!(
-            options.weight_residency,
-            WeightResidency::SparseExpertCache(_)
-                | WeightResidency::SparseExpertCacheWithDenseLayers(_)
-        )
-    {
+    if !args.is_moe() && options.weight_residency.expert_cache().is_some() {
         return invalid_geometry(format!(
             "sparse expert caching requires a {loader_name} MoE GGUF checkpoint"
         ));

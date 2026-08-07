@@ -58,7 +58,7 @@ use crate::{
     runtime::execution::layerwise::{
         load_layerwise_model, load_safetensors_layerwise_model,
         load_tensor_parallel_layerwise_model, open_safetensors_weight_store,
-        transformed_module_weight_store, ArchitectureAdapter, LayerExecutionLoadOptions,
+        transformed_module_weight_store, ArchitectureAdapter, LayerWeightResidency,
         LayerwiseForwardState, LayerwiseModel, StaticUnitBindings, WeightResidency,
     },
     runtime::residency::expert_cache::{
@@ -81,6 +81,10 @@ impl Qwen3VlLayerwiseModel {
     /// Returns the parsed multimodal model arguments.
     pub fn args(&self) -> &ModelArgs {
         self.execution.adapter().args()
+    }
+
+    pub(crate) fn bind_parallel_topology(&mut self, topology: crate::ParallelTopology) {
+        self.execution.bind_parallel_topology(topology);
     }
 
     /// Returns sparse expert-cache telemetry when enabled.
@@ -420,7 +424,7 @@ impl CausalLm<Cache> for Qwen3VlLayerwiseModel {
 /// Loads either Qwen3-VL architecture through shared generalized residency.
 pub fn load_qwen3_vl_layerwise_model(
     model_dir: impl AsRef<Path>,
-    options: impl Into<LayerExecutionLoadOptions>,
+    options: impl Into<LayerWeightResidency>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<Qwen3VlLayerwiseModel, Error> {
@@ -461,7 +465,7 @@ pub(crate) fn execute_transformed_qwen3_vl_model(
         execution: load_layerwise_model(
             store,
             adapter,
-            LayerExecutionLoadOptions::FullyResident,
+            LayerWeightResidency::FullyResident,
             stream,
             weights_stream,
         )?,
@@ -471,7 +475,7 @@ pub(crate) fn execute_transformed_qwen3_vl_model(
 /// Loads Qwen3-VL with rank-local vision execution groups.
 pub fn load_qwen3_vl_tensor_parallel_layerwise_model(
     model_dir: impl AsRef<Path>,
-    options: impl Into<LayerExecutionLoadOptions>,
+    options: impl Into<LayerWeightResidency>,
     build: crate::runtime::distributed::parallel::ParallelBuildContext,
     stream: &Stream,
     weights_stream: &Stream,
@@ -527,7 +531,7 @@ pub(crate) fn load_qwen3_vl_gguf_tensor_parallel_model(
     checkpoint: &GgufCheckpoint,
     metadata: &HashMap<String, GgufMetadataValue>,
     vision: (&GgufCheckpoint, &HashMap<String, GgufMetadataValue>),
-    options: LayerExecutionLoadOptions,
+    options: LayerWeightResidency,
     build: crate::runtime::distributed::parallel::ParallelBuildContext,
     stream: &Stream,
     weights_stream: &Stream,
@@ -581,39 +585,23 @@ pub(crate) fn load_qwen3_vl_gguf_layerwise_model(
         residency.max_mapped_shards(),
     )?;
     let args = prepared.args;
-    let adapter = Qwen3VlLayerwiseAdapter::new(args.clone(), stream)?;
-    let execution = match residency {
-        WeightResidency::LayerwiseHost(options) => {
-            load_layerwise_model(store, adapter, options, stream, weights_stream)?
-        }
-        WeightResidency::DenseDiskStream(options) => {
-            load_layerwise_model(store, adapter, options, stream, weights_stream)?
-        }
-        WeightResidency::SparseExpertCache(options) => load_qwen3_vl_gguf_sparse_execution(
+    let execution = if let Some(expert_options) = residency.expert_cache() {
+        load_qwen3_vl_gguf_sparse_execution(
             store,
             args,
-            options,
-            options.non_expert.into(),
+            expert_options,
+            residency.layers(),
             stream,
             weights_stream,
-        )?,
-        WeightResidency::SparseExpertCacheWithDenseLayers(options) => {
-            load_qwen3_vl_gguf_sparse_execution(
-                store,
-                args,
-                options.expert_cache,
-                options.non_expert.into(),
-                stream,
-                weights_stream,
-            )?
-        }
-        WeightResidency::FullyResident => load_layerwise_model(
+        )?
+    } else {
+        load_layerwise_model(
             store,
-            adapter,
-            LayerExecutionLoadOptions::FullyResident,
+            Qwen3VlLayerwiseAdapter::new(args, stream)?,
+            residency.layers(),
             stream,
             weights_stream,
-        )?,
+        )?
     };
     Ok((Qwen3VlLayerwiseModel { execution }, prepared.eos_token_ids))
 }
@@ -622,7 +610,7 @@ fn load_qwen3_vl_gguf_sparse_execution(
     store: Arc<dyn WeightStore + Send + Sync>,
     args: resident::ModelArgs,
     options: ExpertCacheLoadOptions,
-    non_expert: LayerExecutionLoadOptions,
+    non_expert: LayerWeightResidency,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<LayerwiseModel<Qwen3VlLayerwiseAdapter>, Error> {
@@ -675,43 +663,11 @@ pub(crate) fn qwen3_vl_gguf_store(
     ))
 }
 
-/// Loads Qwen3-VL-MoE with expert-granular sparse caching.
-pub fn load_qwen3_vl_sparse_expert_cache_model(
+/// Loads Qwen3-VL-MoE with independently cached experts and bounded non-expert units.
+pub fn load_qwen3_vl_expert_cache_model(
     model_dir: impl AsRef<Path>,
+    non_expert: crate::NonExpertWeightResidency,
     options: ExpertCacheLoadOptions,
-    stream: &Stream,
-    weights_stream: &Stream,
-) -> Result<Qwen3VlLayerwiseModel, Error> {
-    load_qwen3_vl_sparse_expert_cache_model_with_non_expert(
-        model_dir,
-        options,
-        options.non_expert,
-        stream,
-        weights_stream,
-    )
-}
-
-/// Loads Qwen3-VL-MoE with expert caching and disk-streamed non-expert units.
-pub fn load_qwen3_vl_sparse_expert_cache_model_with_dense_layers(
-    model_dir: impl AsRef<Path>,
-    options: ExpertCacheLoadOptions,
-    non_expert: impl Into<LayerExecutionLoadOptions>,
-    stream: &Stream,
-    weights_stream: &Stream,
-) -> Result<Qwen3VlLayerwiseModel, Error> {
-    load_qwen3_vl_sparse_expert_cache_model_with_non_expert(
-        model_dir,
-        options,
-        non_expert,
-        stream,
-        weights_stream,
-    )
-}
-
-fn load_qwen3_vl_sparse_expert_cache_model_with_non_expert(
-    model_dir: impl AsRef<Path>,
-    options: ExpertCacheLoadOptions,
-    non_expert: impl Into<LayerExecutionLoadOptions>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<Qwen3VlLayerwiseModel, Error> {
@@ -720,7 +676,7 @@ fn load_qwen3_vl_sparse_expert_cache_model_with_non_expert(
         crate::api::ModelKind::Qwen3VlMoe,
         model_dir,
         crate::api::ModelLoadOptions::default()
-            .with_weight_residency(WeightResidency::SparseExpertCache(options)),
+            .with_weight_residency(WeightResidency::with_expert_cache(non_expert, options)),
     )?;
     let args = resident::get_qwen3_vl_model_args(model_dir)?;
     if !args.text_config.is_moe() {
@@ -752,7 +708,7 @@ fn load_qwen3_vl_sparse_expert_cache_model_with_non_expert(
 pub(crate) fn load_qwen3_vl_sparse_ep_base_with_store(
     store: Arc<dyn WeightStore + Send + Sync>,
     args: ModelArgs,
-    non_expert: impl Into<LayerExecutionLoadOptions>,
+    non_expert: impl Into<LayerWeightResidency>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<Qwen3VlLayerwiseModel, Error> {
@@ -771,7 +727,7 @@ pub(crate) fn load_qwen3_vl_sparse_ep_base_with_store(
 pub(crate) fn load_qwen3_vl_sparse_tp_ep_base_with_store(
     store: Arc<dyn WeightStore + Send + Sync>,
     args: ModelArgs,
-    non_expert: impl Into<LayerExecutionLoadOptions>,
+    non_expert: impl Into<LayerWeightResidency>,
     build: crate::runtime::distributed::parallel::ParallelBuildContext,
     stream: &Stream,
     weights_stream: &Stream,
@@ -1277,13 +1233,15 @@ impl ArchitectureAdapter for Qwen3VlLayerwiseAdapter {
     ) -> Result<PromptCacheModelIdentity, Error> {
         let layer_count = self.args.text_config.num_hidden_layers as usize;
         let local_kv_heads = match topology {
-            None => vec![self.args.text_config.num_key_value_heads; layer_count],
-            Some(_) => self.parallel_kv_heads.clone().ok_or_else(|| {
-                Error::Parallel(
+            Some(topology) if topology.is_axis_active(crate::ParallelAxis::Tensor) => {
+                self.parallel_kv_heads.clone().ok_or_else(|| {
+                    Error::Parallel(
                     "Qwen3-VL parallel cache identity requested before local layout configuration"
                         .into(),
                 )
-            })?,
+                })?
+            }
+            _ => vec![self.args.text_config.num_key_value_heads; layer_count],
         };
         Ok(PromptCacheModelIdentity {
             model_family: "qwen3_vl".into(),
@@ -2441,7 +2399,7 @@ mod tests {
             parallel::{ParallelBuildContext, ShardingPolicy},
             topology::{DeviceAssignment, ParallelTopology},
         },
-        runtime::execution::layerwise::{LayerExecutionLoadOptions, LayerwiseLoadOptions},
+        runtime::execution::layerwise::{LayerWeightResidency, LayerwiseLoadOptions},
         runtime::residency::dense_stream::DenseDiskStreamLoadOptions,
         runtime::residency::expert_cache::ExpertCacheLoadOptions,
         runtime::residency::policy::{MemoryTier, OffloadConfig},
@@ -2572,11 +2530,11 @@ mod tests {
         let mut resident =
             eager::load_qwen3_vl_model(dir.path(), gpu.stream(), cpu.stream()).unwrap();
         let options = if dense_stream {
-            LayerExecutionLoadOptions::DenseDiskStream(
+            LayerWeightResidency::DenseDiskStream(
                 DenseDiskStreamLoadOptions::new(u64::MAX, u64::MAX, depth, depth, depth).unwrap(),
             )
         } else {
-            LayerExecutionLoadOptions::LayerwiseHost(LayerwiseLoadOptions::new(
+            LayerWeightResidency::LayerwiseHost(LayerwiseLoadOptions::new(
                 OffloadConfig::new(None, None, depth).unwrap(),
             ))
         };
@@ -2698,7 +2656,7 @@ mod tests {
         let options = DenseDiskStreamLoadOptions::new(u64::MAX, u64::MAX, 1, 1, 1).unwrap();
         let model = load_qwen3_vl_tensor_parallel_layerwise_model(
             dir.path(),
-            LayerExecutionLoadOptions::DenseDiskStream(options),
+            LayerWeightResidency::DenseDiskStream(options),
             build,
             gpu.stream(),
             cpu.stream(),
@@ -2864,15 +2822,14 @@ mod tests {
         write_fixture(dir.path(), &fixture, true);
         let mut resident =
             eager::load_qwen3_vl_model(dir.path(), gpu.stream(), cpu.stream()).unwrap();
-        let options = ExpertCacheLoadOptions::new(
-            LayerwiseLoadOptions::new(OffloadConfig::new(None, None, 1).unwrap()),
-            OffloadConfig::new(None, None, 1).unwrap(),
-            1 << 20,
-            1,
-        )
-        .unwrap();
-        let mut cached = load_qwen3_vl_sparse_expert_cache_model(
+        let options =
+            ExpertCacheLoadOptions::new(OffloadConfig::new(None, None, 1).unwrap(), 1 << 20, 1)
+                .unwrap();
+        let mut cached = load_qwen3_vl_expert_cache_model(
             dir.path(),
+            crate::NonExpertWeightResidency::LayerwiseHost(LayerwiseLoadOptions::new(
+                OffloadConfig::new(None, None, 1).unwrap(),
+            )),
             options,
             gpu.stream(),
             cpu.stream(),

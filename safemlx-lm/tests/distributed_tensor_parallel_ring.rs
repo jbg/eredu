@@ -56,7 +56,7 @@ use safemlx_lm::{
     runtime::checkpoint::binding::canonical_checkpoint_name,
     runtime::generation::sampler::DefaultSampler,
     sample_and_synchronize, CacheResidencyPolicy, DenseDiskStreamLoadOptions, DeviceAssignment,
-    LayerCachePolicy, LayerExecutionLoadOptions, LayerwiseLoadOptions, PagedCacheOptions,
+    LayerCachePolicy, LayerWeightResidency, LayerwiseLoadOptions, PagedCacheOptions,
     ParallelBuildContext, ParallelModelInfo, ParallelTopology, PromptCacheDescriptor,
     PromptCacheManifest, PromptCacheOptions, PromptCacheTopology, ShardingPolicy,
 };
@@ -94,13 +94,13 @@ impl TensorParameterResidency {
         }
     }
 
-    fn load_options(self) -> LayerExecutionLoadOptions {
+    fn load_options(self) -> LayerWeightResidency {
         match self {
             Self::LayerwiseHost => {
-                LayerExecutionLoadOptions::LayerwiseHost(LayerwiseLoadOptions::default())
+                LayerWeightResidency::LayerwiseHost(LayerwiseLoadOptions::default())
             }
-            Self::FullyResident => LayerExecutionLoadOptions::FullyResident,
-            Self::DenseDiskStream => LayerExecutionLoadOptions::DenseDiskStream(
+            Self::FullyResident => LayerWeightResidency::FullyResident,
+            Self::DenseDiskStream => LayerWeightResidency::DenseDiskStream(
                 DenseDiskStreamLoadOptions::new(u64::MAX, u64::MAX, 1, 1, 1).unwrap(),
             ),
         }

@@ -1321,6 +1321,7 @@ mod tests {
     };
 
     use super::*;
+    use crate::{NonExpertWeightResidency, WeightResidency};
 
     fn llama_config() -> Value {
         json!({
@@ -6199,7 +6200,7 @@ mod tests {
         }));
 
         let load = ModelLoadOptions::default()
-            .with_weight_residency(WeightResidency::LayerwiseHost(Default::default()));
+            .with_weight_residency(WeightResidency::layerwise_host(Default::default()));
         let bounded = inspect_model(
             directory.path(),
             ModelInspectionOptions {
@@ -7055,7 +7056,7 @@ mod tests {
         let resident = inspect_model(directory.path(), ModelInspectionOptions::default()).unwrap();
         assert!(!resident.is_loadable());
         let load =
-            ModelLoadOptions::default().with_weight_residency(WeightResidency::LayerwiseHost(
+            ModelLoadOptions::default().with_weight_residency(WeightResidency::layerwise_host(
                 crate::runtime::execution::layerwise::LayerwiseLoadOptions::default(),
             ));
         let bounded = inspect_model(
@@ -7180,7 +7181,7 @@ mod tests {
             for load in [
                 ModelLoadOptions::default(),
                 ModelLoadOptions::default()
-                    .with_weight_residency(WeightResidency::LayerwiseHost(Default::default())),
+                    .with_weight_residency(WeightResidency::layerwise_host(Default::default())),
             ] {
                 let report = inspect_model(
                     directory.path(),
@@ -7328,8 +7329,11 @@ mod tests {
         assert!(report.is_loadable());
 
         let dense = write_complete_qwen35_safetensors_dir(false, false, |_| {});
-        let load = ModelLoadOptions::default()
-            .with_weight_residency(WeightResidency::SparseExpertCache(Default::default()));
+        let load =
+            ModelLoadOptions::default().with_weight_residency(WeightResidency::with_expert_cache(
+                NonExpertWeightResidency::LayerwiseHost(Default::default()),
+                Default::default(),
+            ));
         let report = inspect_model(
             dense.path(),
             ModelInspectionOptions {
@@ -7477,7 +7481,7 @@ mod tests {
             directory.path(),
             ModelInspectionOptions {
                 load: ModelLoadOptions::default()
-                    .with_weight_residency(WeightResidency::LayerwiseHost(Default::default())),
+                    .with_weight_residency(WeightResidency::layerwise_host(Default::default())),
                 chat_request: None,
             },
         )
@@ -7508,7 +7512,7 @@ mod tests {
             directory.path(),
             ModelInspectionOptions {
                 load: ModelLoadOptions::default()
-                    .with_weight_residency(WeightResidency::LayerwiseHost(Default::default())),
+                    .with_weight_residency(WeightResidency::layerwise_host(Default::default())),
                 chat_request: None,
             },
         )
@@ -7710,7 +7714,7 @@ mod tests {
             directory.path(),
             ModelInspectionOptions {
                 load: ModelLoadOptions::default()
-                    .with_weight_residency(WeightResidency::LayerwiseHost(Default::default())),
+                    .with_weight_residency(WeightResidency::layerwise_host(Default::default())),
                 chat_request: None,
             },
         )
@@ -7735,7 +7739,7 @@ mod tests {
             directory.path(),
             ModelInspectionOptions {
                 load: ModelLoadOptions::default()
-                    .with_weight_residency(WeightResidency::LayerwiseHost(Default::default())),
+                    .with_weight_residency(WeightResidency::layerwise_host(Default::default())),
                 chat_request: None,
             },
         )
@@ -7768,7 +7772,7 @@ mod tests {
             packed.path(),
             ModelInspectionOptions {
                 load: ModelLoadOptions::default()
-                    .with_weight_residency(WeightResidency::LayerwiseHost(Default::default())),
+                    .with_weight_residency(WeightResidency::layerwise_host(Default::default())),
                 chat_request: None,
             },
         )
@@ -8985,7 +8989,10 @@ mod tests {
             safetensors.path(),
             ModelInspectionOptions {
                 load: ModelLoadOptions::default().with_weight_residency(
-                    WeightResidency::SparseExpertCache(ExpertCacheLoadOptions::default()),
+                    WeightResidency::with_expert_cache(
+                        NonExpertWeightResidency::LayerwiseHost(Default::default()),
+                        ExpertCacheLoadOptions::default(),
+                    ),
                 ),
                 chat_request: None,
             },
@@ -9001,7 +9008,10 @@ mod tests {
             &gguf,
             ModelInspectionOptions {
                 load: ModelLoadOptions::default().with_weight_residency(
-                    WeightResidency::SparseExpertCache(ExpertCacheLoadOptions::default()),
+                    WeightResidency::with_expert_cache(
+                        NonExpertWeightResidency::LayerwiseHost(Default::default()),
+                        ExpertCacheLoadOptions::default(),
+                    ),
                 ),
                 chat_request: None,
             },
