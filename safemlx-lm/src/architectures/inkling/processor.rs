@@ -186,7 +186,7 @@ impl InklingProcessor {
         Ok(PreparedInputPart::media_tensor(
             Modality::Audio,
             tensor,
-            OwnedInputMetadata::AudioMask(mask),
+            OwnedInputMetadata::audio_mask(mask),
         ))
     }
 }
@@ -274,7 +274,7 @@ fn process_image(
     Ok(PreparedInputPart::media_tensor(
         Modality::Image,
         Array::from_slice(&output, &[(rows * cols) as i32, 2, 40, 40, 3]),
-        OwnedInputMetadata::None,
+        OwnedInputMetadata::default(),
     ))
 }
 

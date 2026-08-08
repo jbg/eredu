@@ -911,6 +911,17 @@ let output = scheduler.run_queued(&mut model, &group, &stream)?;
 let logits = output[0].logits(); // Some only on the final stage.
 ```
 
+Scheduled multimodal prefill uses the same queue. Convert borrowed typed input
+with `PreparedModelInput::from_model_input`, or use the owned value returned by
+a model processor. Every first-stage TP/EP coordinate submits
+`with_prepared_input`; later pipeline stages submit the matching
+`with_prepared_input_identity`. The scheduler owns the stage-zero payload until
+execution, while downstream queues retain only ordered modality, payload-kind,
+dtype, shape, and metadata-shape identity. These identities participate in the
+same global work consensus before any pipeline send or receive. Combined modes
+drain with `run_queued_cartesian`; decode continues to use rank-local token
+ingress through the same request cache.
+
 Pipeline execution requires `PP > 1`. The Cartesian planner derives TP
 collectives, EP exchanges, and matching-coordinate pipeline lanes from one
 topology. Llama/Mistral, DeepSeek-V3/R1, Kimi Linear, Qwen2/Qwen3, Qwen3-VL,
@@ -1007,8 +1018,8 @@ formats. Dense families have no EP migration.
 | Qwen3-Next/Qwen3.5 text dense | TP, PP | TP+PP complete | Qwen3.5 multimodal ingress remains outside the text pipeline; EP does not apply |
 | Qwen3-Next/Qwen3.5-MoE text | TP, PP, EP | Complete | Qwen3.5 multimodal ingress remains outside the text pipeline |
 | Inkling text | TP, PP, EP | Complete | Audio/vision ingress remains outside combined execution |
-| Qwen3-VL dense | TP, PP | TP+PP complete | Vision is pinned on stage zero; queued microbatches accept token IDs, while typed image/video prefill uses direct pipeline methods; EP does not apply |
-| Qwen3-VL-MoE | TP, PP, EP | Complete | None; vision remains pinned on stage zero, direct typed image/video prefill composes with arbitrary legal TP/PP/EP degrees, and queued microbatches retain the dense-family token-ID ingress constraint above |
+| Qwen3-VL dense | TP, PP | TP+PP complete | None; vision is pinned on stage zero and direct or queued typed image/video ingress composes with arbitrary legal TP/PP degrees; EP does not apply |
+| Qwen3-VL-MoE | TP, PP, EP | Complete | None; vision is pinned on stage zero and direct or queued typed image/video ingress composes with arbitrary legal TP/PP/EP degrees |
 | Moshi/PersonaPlex | TP | Not applicable | Its temporal/depth runtime has no PP or EP constituent axis |
 
 The remaining global limitations are:
@@ -2218,10 +2229,11 @@ The GGUF suite additionally exercises two-rank pure EP under resident and
 sparse-cache policies, four-rank TP+EP under resident and dense/sparse-streamed
 policies, sibling-projector telemetry, route-empty participation, and PP+EP
 stage-local layer and expert ownership.
-The Qwen3-VL-MoE eight-process cases compose stage-zero vision and DeepStack
-ingress with TP-sharded MRoPE attention, matching-coordinate pipeline lanes,
-EP-scoped routed experts, prompt-cache reload, route-empty ranks, and
-synchronized sampling plus mismatched-work failure consensus. SafeTensors
+The Qwen3-VL-MoE eight-process cases compose scheduler-owned stage-zero vision
+and DeepStack ingress with TP-sharded MRoPE attention, matching-coordinate
+pipeline lanes, EP-scoped routed experts, prompt-cache reload, route-empty
+ranks, and synchronized sampling. Mismatched prepared-input modality or shape
+identity fails global work consensus before pipeline transport. SafeTensors
 covers resident experts and independently
 cached experts with fully resident, host-layerwise, or dense-streamed
 nonexperts; canonical GGUF covers dense-streamed nonexperts, bounded read

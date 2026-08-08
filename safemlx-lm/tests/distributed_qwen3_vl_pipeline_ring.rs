@@ -28,6 +28,7 @@ use safemlx_lm::{
     nn::generation::CausalLm,
     runtime::generation::sampler::DefaultSampler,
     runtime::media::input::{InputMetadata, InputPart, ModelInput},
+    runtime::media::PreparedModelInput,
     runtime::scheduler::{RequestId, RequestStatus, SchedulerLimits},
     CartesianExecution, DenseDiskStreamLoadOptions, DeviceAssignment, ExpertCacheLoadOptions,
     LayerwiseLoadOptions, ModelLoadOptions, NonExpertWeightResidency, PagedCacheOptions,
@@ -524,24 +525,40 @@ fn qwen3_vl_pipeline_ring_worker() {
         assert!(report.owned_bytes > 0);
     }
     if std::env::var_os(SCHEDULE_MISMATCH).is_some() {
-        let request = RequestId::new(if expected_rank == 0 { 101 } else { 999 });
+        let request = RequestId::new(101);
         let mut scheduler =
             PipelineInferenceScheduler::new(&model, SchedulerLimits::new(1, 1).unwrap()).unwrap();
         scheduler.register_request(&model, request).unwrap();
-        let input = PipelineMicrobatchInput::new(
+        let before = Array::from_slice(&[1u32], &[1, 1]);
+        let after = Array::from_slice(&[2u32], &[1, 1]);
+        let pixel_shape = if expected_rank == 0 { [4, 24] } else { [2, 48] };
+        let pixels = Array::from_slice(&[0.01f32; 96], &pixel_shape);
+        let grid = Array::from_slice(&[1i32, 2, 2], &[1, 3]);
+        let mut parts = [InputPart::text_token_ids(&before); 3];
+        let prepared = PreparedModelInput::from_model_input(multimodal_input(
+            &before, &pixels, &grid, &after, &mut parts,
+        ))
+        .unwrap();
+        let identity = prepared.identity();
+        let work = PipelineMicrobatchInput::new(
             request,
             PipelineInferencePhase::Prefill,
-            PipelineStep::new(1, 2).unwrap(),
+            PipelineStep::new(1, 3).unwrap(),
         );
-        let input = if model.stage_info().is_first {
-            input.with_tokens(Array::from_slice(&[1u32, 2], &[1, 2]))
+        let work = if model.stage_info().is_first {
+            work.with_prepared_input(prepared)
         } else {
-            input
+            work.with_prepared_input_identity(identity)
         };
-        scheduler.enqueue(input).unwrap();
-        let error = scheduler
-            .run_queued(&mut model, &group, &stream)
-            .unwrap_err();
+        scheduler.enqueue(work).unwrap();
+        let error = match &cartesian {
+            Some(cartesian) => scheduler
+                .run_queued_cartesian(&mut model, cartesian, &stream)
+                .unwrap_err(),
+            None => scheduler
+                .run_queued(&mut model, &group, &stream)
+                .unwrap_err(),
+        };
         assert!(error.to_string().contains("work descriptors differ"));
         assert!(scheduler.report().poisoned);
         assert_eq!(
@@ -557,37 +574,44 @@ fn qwen3_vl_pipeline_ring_worker() {
     let paged = PagedCacheOptions::new(1, 4096, 4096, 1)
         .unwrap()
         .with_full_attention(true);
-    let mut cache = model
-        .new_cache_with_options(safemlx_lm::CacheResidencyPolicy::Paged(paged.clone()))
-        .unwrap();
     let before = Array::from_slice(&[1u32], &[1, 1]);
     let after = Array::from_slice(&[2u32], &[1, 1]);
     let pixels = Array::from_slice(&[0.01f32; 96], &[4, 24]);
     let grid = Array::from_slice(&[1i32, 2, 2], &[1, 3]);
     let mut parts = [InputPart::text_token_ids(&before); 3];
     let input = multimodal_input(&before, &pixels, &grid, &after, &mut parts);
-    let logits = match &cartesian {
-        Some(cartesian) => model
-            .prefill_cartesian(
-                (topology.pipeline_parallel_rank == 0).then_some(input),
-                PipelineStep::new(1, 3).unwrap(),
-                None,
-                &mut cache,
-                cartesian,
-                &stream,
-            )
-            .unwrap(),
-        None => model
-            .prefill_pipeline(
-                (topology.pipeline_parallel_rank == 0).then_some(input),
-                PipelineStep::new(1, 3).unwrap(),
-                None,
-                &mut cache,
-                &group,
-                &stream,
-            )
-            .unwrap(),
+    let prepared = PreparedModelInput::from_model_input(input).unwrap();
+    let identity = prepared.identity();
+    let request = RequestId::new(7);
+    let mut scheduler =
+        PipelineInferenceScheduler::new(&model, SchedulerLimits::new(1, 1).unwrap()).unwrap();
+    scheduler
+        .register_request_with_options(
+            &model,
+            request,
+            safemlx_lm::CacheResidencyPolicy::Paged(paged.clone()),
+        )
+        .unwrap();
+    let work = PipelineMicrobatchInput::new(
+        request,
+        PipelineInferencePhase::Prefill,
+        PipelineStep::new(1, 3).unwrap(),
+    );
+    let work = if model.stage_info().is_first {
+        work.with_prepared_input(prepared)
+    } else {
+        work.with_prepared_input_identity(identity)
     };
+    scheduler.enqueue(work).unwrap();
+    let mut completed = match &cartesian {
+        Some(cartesian) => scheduler
+            .run_queued_cartesian(&mut model, cartesian, &stream)
+            .unwrap(),
+        None => scheduler.run_queued(&mut model, &group, &stream).unwrap(),
+    };
+    assert_eq!(completed.len(), 1);
+    let logits = completed.pop().unwrap().into_logits();
+    let mut cache = scheduler.release_request_cache(request).unwrap();
     assert_eq!(logits.is_some(), topology.pipeline_parallel_rank == 1);
     let synchronized = model
         .sample_and_synchronize(

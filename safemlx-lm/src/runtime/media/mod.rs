@@ -5,7 +5,7 @@ pub mod input;
 
 use std::{fs, path::Path};
 
-use safemlx::Array;
+use safemlx::{Array, Dtype};
 
 use crate::{
     error::Error,
@@ -159,27 +159,56 @@ pub enum MediaPayload<'a> {
     _Lifetime(std::marker::PhantomData<&'a ()>),
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum OwnedInputPayload {
     TokenIds(Array),
-    #[cfg(any(feature = "image-processing", feature = "audio-processing"))]
     Tensor(Array),
+    Embeddings(Array),
 }
 
-#[derive(Debug, Default)]
-pub(crate) enum OwnedInputMetadata {
-    #[default]
-    None,
+#[derive(Debug, Clone, Default)]
+pub(crate) struct OwnedInputMetadata {
+    qwen_grid_thw: Option<Array>,
+    patch_position_ids: Option<Array>,
+    audio_mask: Option<Array>,
+}
+
+impl OwnedInputMetadata {
     #[cfg(feature = "image-processing")]
-    GridThw(Array),
+    pub(crate) fn qwen_grid_thw(value: Array) -> Self {
+        Self {
+            qwen_grid_thw: Some(value),
+            ..Self::default()
+        }
+    }
+
     #[cfg(feature = "image-processing")]
-    PatchPositionIds(Array),
+    pub(crate) fn patch_position_ids(value: Array) -> Self {
+        Self {
+            patch_position_ids: Some(value),
+            ..Self::default()
+        }
+    }
+
     #[cfg(feature = "audio-processing")]
-    AudioMask(Array),
+    pub(crate) fn audio_mask(value: Array) -> Self {
+        Self {
+            audio_mask: Some(value),
+            ..Self::default()
+        }
+    }
+
+    fn from_input_metadata(metadata: InputMetadata<'_>) -> Self {
+        Self {
+            qwen_grid_thw: metadata.qwen_grid_thw.cloned(),
+            patch_position_ids: metadata.patch_position_ids.cloned(),
+            audio_mask: metadata.audio_mask.cloned(),
+        }
+    }
 }
 
 /// One owned part of a prepared model input.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct PreparedInputPart {
     modality: Modality,
     payload: OwnedInputPayload,
@@ -212,35 +241,176 @@ impl PreparedInputPart {
     pub fn as_input_part(&self) -> InputPart<'_> {
         let payload = match &self.payload {
             OwnedInputPayload::TokenIds(value) => InputPayload::TokenIds(value),
-            #[cfg(any(feature = "image-processing", feature = "audio-processing"))]
             OwnedInputPayload::Tensor(value) => InputPayload::Tensor(value),
+            OwnedInputPayload::Embeddings(value) => InputPayload::Embeddings(value),
         };
         InputPart {
             modality: self.modality,
             payload,
             metadata: InputMetadata {
-                qwen_grid_thw: match &self.metadata {
-                    #[cfg(feature = "image-processing")]
-                    OwnedInputMetadata::GridThw(value) => Some(value),
-                    _ => None,
-                },
-                patch_position_ids: match &self.metadata {
-                    #[cfg(feature = "image-processing")]
-                    OwnedInputMetadata::PatchPositionIds(value) => Some(value),
-                    _ => None,
-                },
-                audio_mask: match &self.metadata {
-                    #[cfg(feature = "audio-processing")]
-                    OwnedInputMetadata::AudioMask(value) => Some(value),
-                    _ => None,
-                },
+                qwen_grid_thw: self.metadata.qwen_grid_thw.as_ref(),
+                patch_position_ids: self.metadata.patch_position_ids.as_ref(),
+                audio_mask: self.metadata.audio_mask.as_ref(),
             },
         }
     }
 }
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum PreparedPayloadKind {
+    TokenIds,
+    Tensor,
+    Embeddings,
+}
+
+impl PreparedPayloadKind {
+    const fn wire_tag(self) -> u32 {
+        match self {
+            Self::TokenIds => 0,
+            Self::Tensor => 1,
+            Self::Embeddings => 2,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+struct PreparedArrayIdentity {
+    dtype: Dtype,
+    shape: Vec<i32>,
+}
+
+impl PreparedArrayIdentity {
+    fn new(array: &Array) -> Self {
+        Self {
+            dtype: array.dtype(),
+            shape: array.shape().to_vec(),
+        }
+    }
+
+    fn encode_descriptor(&self, output: &mut Vec<u32>) -> Result<(), Error> {
+        output.extend_from_slice(&[self.dtype as u32, self.shape.len() as u32]);
+        for dimension in &self.shape {
+            output.push(u32::try_from(*dimension).map_err(|_| {
+                Error::Parallel(format!(
+                    "prepared model input dimension {dimension} exceeds descriptor range"
+                ))
+            })?);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+struct PreparedInputPartIdentity {
+    modality: Modality,
+    payload_kind: PreparedPayloadKind,
+    payload: PreparedArrayIdentity,
+    qwen_grid_thw: Option<PreparedArrayIdentity>,
+    patch_position_ids: Option<PreparedArrayIdentity>,
+    audio_mask: Option<PreparedArrayIdentity>,
+}
+
+impl PreparedInputPartIdentity {
+    fn from_input_part(part: InputPart<'_>) -> Self {
+        let (payload_kind, payload) = match part.payload {
+            InputPayload::TokenIds(array) => (PreparedPayloadKind::TokenIds, array),
+            InputPayload::Tensor(array) => (PreparedPayloadKind::Tensor, array),
+            InputPayload::Embeddings(array) => (PreparedPayloadKind::Embeddings, array),
+        };
+        Self {
+            modality: part.modality,
+            payload_kind,
+            payload: PreparedArrayIdentity::new(payload),
+            qwen_grid_thw: part.metadata.qwen_grid_thw.map(PreparedArrayIdentity::new),
+            patch_position_ids: part
+                .metadata
+                .patch_position_ids
+                .map(PreparedArrayIdentity::new),
+            audio_mask: part.metadata.audio_mask.map(PreparedArrayIdentity::new),
+        }
+    }
+
+    fn encode_descriptor(&self, output: &mut Vec<u32>) -> Result<(), Error> {
+        output.extend_from_slice(&[
+            match self.modality {
+                Modality::Text => 0,
+                Modality::Image => 1,
+                Modality::Audio => 2,
+                Modality::Video => 3,
+            },
+            self.payload_kind.wire_tag(),
+        ]);
+        self.payload.encode_descriptor(output)?;
+        encode_optional_identity(self.qwen_grid_thw.as_ref(), output)?;
+        encode_optional_identity(self.patch_position_ids.as_ref(), output)?;
+        encode_optional_identity(self.audio_mask.as_ref(), output)
+    }
+}
+
+fn encode_optional_identity(
+    identity: Option<&PreparedArrayIdentity>,
+    output: &mut Vec<u32>,
+) -> Result<(), Error> {
+    match identity {
+        Some(identity) => {
+            output.push(1);
+            identity.encode_descriptor(output)
+        }
+        None => {
+            output.push(0);
+            Ok(())
+        }
+    }
+}
+
+/// Exact, payload-free identity for one prepared multimodal model input.
+///
+/// Pipeline stage zero owns the corresponding [`PreparedModelInput`]. Later
+/// stages retain only this identity so distributed schedule consensus can
+/// compare ordered modalities, payload kinds, dtypes, shapes, and metadata
+/// shapes without retaining image, video, or audio tensors.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct PreparedModelInputIdentity {
+    parts: Vec<PreparedInputPartIdentity>,
+}
+
+impl PreparedModelInputIdentity {
+    /// Builds an identity from borrowed typed input without retaining tensors.
+    pub fn from_model_input(input: ModelInput<'_>) -> Result<Self, Error> {
+        input::validate(input)?;
+        Ok(Self {
+            parts: input
+                .parts
+                .iter()
+                .copied()
+                .map(PreparedInputPartIdentity::from_input_part)
+                .collect(),
+        })
+    }
+
+    /// Returns the number of ordered input parts represented by this identity.
+    pub fn len(&self) -> usize {
+        self.parts.len()
+    }
+
+    /// Returns true when this identity has no input parts.
+    pub fn is_empty(&self) -> bool {
+        self.parts.is_empty()
+    }
+
+    pub(crate) fn encode_descriptor(&self, output: &mut Vec<u32>) -> Result<(), Error> {
+        output.push(u32::try_from(self.parts.len()).map_err(|_| {
+            Error::Parallel("prepared model input has too many parts for consensus".into())
+        })?);
+        for part in &self.parts {
+            part.encode_descriptor(output)?;
+        }
+        Ok(())
+    }
+}
+
 /// Owned runtime input produced by a media processor.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct PreparedModelInput {
     parts: Vec<PreparedInputPart>,
 }
@@ -248,6 +418,36 @@ pub struct PreparedModelInput {
 impl PreparedModelInput {
     fn new(parts: Vec<PreparedInputPart>) -> Self {
         Self { parts }
+    }
+
+    /// Copies borrowed typed input into scheduler-safe owned storage.
+    pub fn from_model_input(input: ModelInput<'_>) -> Result<Self, Error> {
+        input::validate(input)?;
+        let parts = input
+            .parts
+            .iter()
+            .map(|part| PreparedInputPart {
+                modality: part.modality,
+                payload: match part.payload {
+                    InputPayload::TokenIds(array) => OwnedInputPayload::TokenIds(array.clone()),
+                    InputPayload::Tensor(array) => OwnedInputPayload::Tensor(array.clone()),
+                    InputPayload::Embeddings(array) => OwnedInputPayload::Embeddings(array.clone()),
+                },
+                metadata: OwnedInputMetadata::from_input_metadata(part.metadata),
+            })
+            .collect();
+        Ok(Self::new(parts))
+    }
+
+    /// Returns the payload-free collective identity of this prepared input.
+    pub fn identity(&self) -> PreparedModelInputIdentity {
+        let parts = self.input_parts();
+        PreparedModelInputIdentity {
+            parts: parts
+                .into_iter()
+                .map(PreparedInputPartIdentity::from_input_part)
+                .collect(),
+        }
     }
 
     /// Returns the number of ordered runtime parts.
@@ -517,5 +717,79 @@ pub(crate) fn prepared_model_input(
 pub(crate) fn push_text_token_ids(parts: &mut Vec<PreparedInputPart>, token_ids: &[u32]) {
     if !token_ids.is_empty() {
         parts.push(PreparedInputPart::text_token_ids(token_ids));
+    }
+}
+
+#[cfg(test)]
+mod prepared_input_identity_tests {
+    use super::{
+        input::{InputMetadata, InputPart, InputPayload, Modality, ModelInput},
+        PreparedModelInput, PreparedModelInputIdentity,
+    };
+    use safemlx::Array;
+
+    fn descriptor(input: ModelInput<'_>) -> Vec<u32> {
+        let identity = PreparedModelInputIdentity::from_model_input(input).unwrap();
+        let mut words = Vec::new();
+        identity.encode_descriptor(&mut words).unwrap();
+        words
+    }
+
+    #[test]
+    fn identity_covers_modality_payload_shape_and_metadata() {
+        let image = Array::from_slice(&[0.0_f32; 8], &[2, 4]);
+        let differently_shaped = Array::from_slice(&[0.0_f32; 8], &[1, 8]);
+        let grid = Array::from_slice(&[1_i32, 1, 2], &[1, 3]);
+        let other_grid = Array::from_slice(&[1_i32, 1, 2], &[3, 1]);
+
+        let image_part = [InputPart::image_tensor(
+            &image,
+            InputMetadata::qwen_grid_thw(&grid),
+        )];
+        let video_part = [InputPart::video_tensor(
+            &image,
+            InputMetadata::qwen_grid_thw(&grid),
+        )];
+        let shaped_part = [InputPart::image_tensor(
+            &differently_shaped,
+            InputMetadata::qwen_grid_thw(&grid),
+        )];
+        let metadata_part = [InputPart::image_tensor(
+            &image,
+            InputMetadata::qwen_grid_thw(&other_grid),
+        )];
+
+        let baseline = descriptor(ModelInput::new(&image_part));
+        assert_ne!(baseline, descriptor(ModelInput::new(&video_part)));
+        assert_ne!(baseline, descriptor(ModelInput::new(&shaped_part)));
+        assert_ne!(baseline, descriptor(ModelInput::new(&metadata_part)));
+    }
+
+    #[test]
+    fn borrowed_input_round_trips_into_owned_scheduler_payload() {
+        let tokens = Array::from_slice(&[1_u32, 2], &[1, 2]);
+        let embeddings = Array::from_slice(&[0.0_f32; 12], &[1, 2, 6]);
+        let positions = Array::from_slice(&[0_i32, 1, 2, 3], &[1, 2, 2]);
+        let parts = [
+            InputPart::text_token_ids(&tokens),
+            InputPart {
+                modality: Modality::Image,
+                payload: InputPayload::Embeddings(&embeddings),
+                metadata: InputMetadata::patch_position_ids(&positions),
+            },
+        ];
+        let borrowed = ModelInput::new(&parts);
+        let expected = PreparedModelInputIdentity::from_model_input(borrowed).unwrap();
+        let prepared = PreparedModelInput::from_model_input(borrowed).unwrap();
+
+        assert_eq!(prepared.len(), 2);
+        assert_eq!(prepared.identity(), expected);
+        prepared.with_model_input(|round_tripped| {
+            assert!(matches!(
+                round_tripped.parts[1].payload,
+                InputPayload::Embeddings(_)
+            ));
+            assert!(round_tripped.parts[1].metadata.patch_position_ids.is_some());
+        });
     }
 }

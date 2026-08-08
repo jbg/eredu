@@ -336,7 +336,7 @@ impl Gemma4Processor {
         Ok(PreparedInputPart::media_tensor(
             Modality::Image,
             patches,
-            OwnedInputMetadata::PatchPositionIds(positions),
+            OwnedInputMetadata::patch_position_ids(positions),
         ))
     }
 
@@ -406,7 +406,7 @@ impl Gemma4Processor {
             replacement.push(PreparedInputPart::media_tensor(
                 Modality::Video,
                 patches,
-                OwnedInputMetadata::PatchPositionIds(positions),
+                OwnedInputMetadata::patch_position_ids(positions),
             ));
             replacement.push(PreparedInputPart::text_token_ids(&[eoi_token_id]));
         }
@@ -441,7 +441,7 @@ impl Gemma4Processor {
         Ok(PreparedInputPart::media_tensor(
             Modality::Audio,
             tensor,
-            OwnedInputMetadata::AudioMask(mask),
+            OwnedInputMetadata::audio_mask(mask),
         ))
     }
 }

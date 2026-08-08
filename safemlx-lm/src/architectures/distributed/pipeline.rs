@@ -85,6 +85,7 @@ use crate::{
         SharedWeightStore, StaticUnitBindings,
     },
     runtime::generation::sampler::Sampler,
+    runtime::media::{PreparedModelInput, PreparedModelInputIdentity},
     runtime::residency::expert_cache::{
         ExpertCache, ExpertCacheLoadOptions, ExpertCacheReport, ExpertPass,
     },
@@ -210,16 +211,55 @@ impl PipelineInferencePhase {
 
 /// Rank-local input for one scheduled pipeline cache transition.
 ///
-/// Stage zero supplies token ids. Later stages leave `tokens` absent and
-/// receive hidden activations from their predecessor. An architecture-specific
+/// For token ingress, stage zero supplies token ids and later stages retain an
+/// empty token ingress. For typed multimodal ingress, every first-stage TP/EP
+/// coordinate owns a [`PreparedModelInput`], while later stages retain its
+/// payload-free [`PreparedModelInputIdentity`]. An architecture-specific
 /// additive mask, when supported, is supplied independently on every rank.
 #[derive(Debug, Clone)]
 pub struct PipelineMicrobatchInput {
     request: RequestId,
     phase: PipelineInferencePhase,
     step: PipelineStep,
-    tokens: Option<Array>,
+    ingress: ScheduledPipelineIngress,
     mask: Option<Array>,
+}
+
+#[derive(Debug, Clone)]
+enum ScheduledPipelineIngress {
+    Tokens(Option<Array>),
+    Prepared(PreparedPipelineIngress),
+}
+
+#[derive(Debug, Clone)]
+enum PreparedPipelineIngress {
+    Payload(PreparedModelInput),
+    Identity(PreparedModelInputIdentity),
+}
+
+impl ScheduledPipelineIngress {
+    fn prepared_identity(&self) -> Option<PreparedModelInputIdentity> {
+        match self {
+            Self::Prepared(PreparedPipelineIngress::Payload(input)) => Some(input.identity()),
+            Self::Prepared(PreparedPipelineIngress::Identity(identity)) => Some(identity.clone()),
+            Self::Tokens(_) => None,
+        }
+    }
+
+    fn encode_descriptor(&self, output: &mut Vec<u32>) -> Result<(), Error> {
+        match self {
+            Self::Tokens(_) => output.push(0),
+            Self::Prepared(PreparedPipelineIngress::Payload(input)) => {
+                output.push(1);
+                input.identity().encode_descriptor(output)?;
+            }
+            Self::Prepared(PreparedPipelineIngress::Identity(identity)) => {
+                output.push(1);
+                identity.encode_descriptor(output)?;
+            }
+        }
+        Ok(())
+    }
 }
 
 impl PipelineMicrobatchInput {
@@ -233,14 +273,31 @@ impl PipelineMicrobatchInput {
             request,
             phase,
             step,
-            tokens: None,
+            ingress: ScheduledPipelineIngress::Tokens(None),
             mask: None,
         }
     }
 
     /// Supplies stage-zero token ids.
     pub fn with_tokens(mut self, tokens: Array) -> Self {
-        self.tokens = Some(tokens);
+        self.ingress = ScheduledPipelineIngress::Tokens(Some(tokens));
+        self
+    }
+
+    /// Supplies an owned prepared input on a first-stage TP/EP coordinate.
+    ///
+    /// Build the matching identity with [`PreparedModelInput::identity`] before
+    /// moving the payload, then submit it with
+    /// [`Self::with_prepared_input_identity`] on every later stage.
+    pub fn with_prepared_input(mut self, input: PreparedModelInput) -> Self {
+        self.ingress = ScheduledPipelineIngress::Prepared(PreparedPipelineIngress::Payload(input));
+        self
+    }
+
+    /// Supplies only the matching prepared-input identity on a later stage.
+    pub fn with_prepared_input_identity(mut self, identity: PreparedModelInputIdentity) -> Self {
+        self.ingress =
+            ScheduledPipelineIngress::Prepared(PreparedPipelineIngress::Identity(identity));
         self
     }
 
@@ -267,7 +324,15 @@ impl PipelineMicrobatchInput {
 
     /// Returns stage-zero token ids when present on this rank.
     pub const fn tokens(&self) -> Option<&Array> {
-        self.tokens.as_ref()
+        match &self.ingress {
+            ScheduledPipelineIngress::Tokens(tokens) => tokens.as_ref(),
+            ScheduledPipelineIngress::Prepared(_) => None,
+        }
+    }
+
+    /// Returns the collective identity for typed prepared ingress, when used.
+    pub fn prepared_input_identity(&self) -> Option<PreparedModelInputIdentity> {
+        self.ingress.prepared_identity()
     }
 
     /// Returns the rank-local additive mask when present.
@@ -539,7 +604,7 @@ struct PipelineRequestState {
 struct ScheduledPipelineMicrobatch {
     phase: PipelineInferencePhase,
     step: PipelineStep,
-    tokens: Option<Array>,
+    ingress: ScheduledPipelineIngress,
     mask: Option<Array>,
 }
 
@@ -550,6 +615,7 @@ impl WorkDescriptor for ScheduledPipelineMicrobatch {
             self.step.batch_size() as u32,
             self.step.sequence_length() as u32,
         ]);
+        self.ingress.encode_descriptor(output)?;
         match &self.mask {
             Some(mask) => {
                 output.extend_from_slice(&[1, mask.dtype() as u32, mask.ndim() as u32]);
@@ -663,25 +729,56 @@ impl PipelineInferenceScheduler {
     /// prefill work is rejected. Decode work always has sequence length one and
     /// every transition for a request must retain its original batch size.
     pub fn enqueue(&mut self, input: PipelineMicrobatchInput) -> Result<WorkId, Error> {
-        if self.topology.pipeline_parallel_rank == 0 {
-            let tokens = input.tokens.as_ref().ok_or_else(|| {
-                Error::Parallel("pipeline stage zero microbatch requires token ids".into())
-            })?;
-            if tokens.ndim() != 2
-                || tokens.shape() != [input.step.batch_size(), input.step.sequence_length()]
-            {
+        let first_stage = self.topology.pipeline_parallel_rank == 0;
+        match &input.ingress {
+            ScheduledPipelineIngress::Tokens(Some(tokens)) if first_stage => {
+                if tokens.ndim() != 2
+                    || tokens.shape() != [input.step.batch_size(), input.step.sequence_length()]
+                {
+                    return Err(Error::Parallel(format!(
+                        "pipeline stage zero microbatch expected token ids shaped [{}, {}], got {:?}",
+                        input.step.batch_size(),
+                        input.step.sequence_length(),
+                        tokens.shape()
+                    )));
+                }
+            }
+            ScheduledPipelineIngress::Tokens(None) if first_stage => {
+                return Err(Error::Parallel(
+                    "pipeline stage zero microbatch requires token ids or prepared typed ingress"
+                        .into(),
+                ));
+            }
+            ScheduledPipelineIngress::Tokens(Some(_)) => {
                 return Err(Error::Parallel(format!(
-                    "pipeline stage zero microbatch expected token ids shaped [{}, {}], got {:?}",
-                    input.step.batch_size(),
-                    input.step.sequence_length(),
-                    tokens.shape()
+                    "pipeline stage {} microbatch must receive hidden activations rather than token ids",
+                    self.topology.pipeline_parallel_rank
                 )));
             }
-        } else if input.tokens.is_some() {
-            return Err(Error::Parallel(format!(
-                "pipeline stage {} microbatch must receive hidden activations rather than token ids",
-                self.topology.pipeline_parallel_rank
-            )));
+            ScheduledPipelineIngress::Prepared(PreparedPipelineIngress::Payload(_))
+                if !first_stage =>
+            {
+                return Err(Error::Parallel(format!(
+                    "pipeline stage {} must retain only the prepared-input identity, not its payload",
+                    self.topology.pipeline_parallel_rank
+                )));
+            }
+            ScheduledPipelineIngress::Prepared(PreparedPipelineIngress::Identity(_))
+                if first_stage =>
+            {
+                return Err(Error::Parallel(
+                    "pipeline stage zero requires the owned prepared-input payload, not only its identity"
+                        .into(),
+                ));
+            }
+            ScheduledPipelineIngress::Prepared(_)
+                if input.phase != PipelineInferencePhase::Prefill =>
+            {
+                return Err(Error::Parallel(
+                    "prepared typed ingress is valid only for pipeline prefill work".into(),
+                ));
+            }
+            ScheduledPipelineIngress::Tokens(None) | ScheduledPipelineIngress::Prepared(_) => {}
         }
         if input.phase == PipelineInferencePhase::Decode && input.step.sequence_length() != 1 {
             return Err(Error::Parallel(format!(
@@ -721,7 +818,7 @@ impl PipelineInferenceScheduler {
             ScheduledPipelineMicrobatch {
                 phase: input.phase,
                 step: input.step,
-                tokens: input.tokens,
+                ingress: input.ingress,
                 mask: input.mask,
             },
         )?;
@@ -745,18 +842,116 @@ impl PipelineInferenceScheduler {
     ) -> Result<Vec<PipelineMicrobatchOutput>, Error> {
         self.validate_model(model)?;
         model.validate_group(group)?;
-        let protocol = 0x5049_5045_0001_0000u64 | self.model_kind as u64;
+        let protocol = 0x5049_5045_0002_0000u64 | self.model_kind as u64;
         self.scheduler
             .drain_distributed(protocol, group, stream, |_, work, request| {
-                model.forward_pipeline(
-                    work.tokens.as_ref(),
-                    work.step,
-                    work.mask.as_ref(),
-                    &mut request.cache,
-                    group,
-                    stream,
-                )
+                match &work.ingress {
+                    ScheduledPipelineIngress::Tokens(tokens) => model.forward_pipeline(
+                        tokens.as_ref(),
+                        work.step,
+                        work.mask.as_ref(),
+                        &mut request.cache,
+                        group,
+                        stream,
+                    ),
+                    ScheduledPipelineIngress::Prepared(PreparedPipelineIngress::Payload(input)) => {
+                        input.with_model_input(|input| {
+                            model.prefill_pipeline(
+                                Some(input),
+                                work.step,
+                                work.mask.as_ref(),
+                                &mut request.cache,
+                                group,
+                                stream,
+                            )
+                        })
+                    }
+                    ScheduledPipelineIngress::Prepared(PreparedPipelineIngress::Identity(_)) => {
+                        model.prefill_pipeline(
+                            None,
+                            work.step,
+                            work.mask.as_ref(),
+                            &mut request.cache,
+                            group,
+                            stream,
+                        )
+                    }
+                }
             })
+            .map(|completed| {
+                completed
+                    .into_iter()
+                    .map(|completed| {
+                        let (work, input, logits) = completed.into_parts();
+                        PipelineMicrobatchOutput {
+                            work,
+                            phase: input.phase,
+                            step: input.step,
+                            logits,
+                        }
+                    })
+                    .collect()
+            })
+    }
+
+    /// Drains the current queue over topology-derived Cartesian subgroups.
+    ///
+    /// Global schedule consensus uses [`crate::CartesianExecution::world`],
+    /// pipeline payloads use matching-coordinate PP lanes, and stage-local TP
+    /// and EP work uses the corresponding Cartesian subgroups.
+    pub fn run_queued_cartesian(
+        &mut self,
+        model: &mut PipelineModel,
+        cartesian: &crate::CartesianExecution<'_>,
+        stream: &Stream,
+    ) -> Result<Vec<PipelineMicrobatchOutput>, Error> {
+        self.validate_model(model)?;
+        if cartesian.topology() != self.topology {
+            return Err(Error::Parallel(format!(
+                "pipeline scheduler topology {:?} does not match Cartesian execution topology {:?}",
+                self.topology,
+                cartesian.topology()
+            )));
+        }
+        let protocol = 0x5049_5045_0003_0000u64 | self.model_kind as u64;
+        self.scheduler
+            .drain_distributed(
+                protocol,
+                cartesian.world(),
+                stream,
+                |_, work, request| match &work.ingress {
+                    ScheduledPipelineIngress::Tokens(tokens) => model.forward_cartesian(
+                        tokens.as_ref(),
+                        work.step,
+                        work.mask.as_ref(),
+                        &mut request.cache,
+                        cartesian,
+                        stream,
+                    ),
+                    ScheduledPipelineIngress::Prepared(PreparedPipelineIngress::Payload(input)) => {
+                        input.with_model_input(|input| {
+                            model.prefill_cartesian(
+                                Some(input),
+                                work.step,
+                                work.mask.as_ref(),
+                                &mut request.cache,
+                                cartesian,
+                                stream,
+                            )
+                        })
+                    }
+                    ScheduledPipelineIngress::Prepared(PreparedPipelineIngress::Identity(_)) => {
+                        model.prefill_cartesian(
+                            None,
+                            work.step,
+                            work.mask.as_ref(),
+                            &mut request.cache,
+                            cartesian,
+                            stream,
+                        )
+                    }
+                },
+            )
             .map(|completed| {
                 completed
                     .into_iter()
