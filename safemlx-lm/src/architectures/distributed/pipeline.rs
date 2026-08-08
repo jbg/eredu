@@ -1039,6 +1039,7 @@ struct NemotronHStage {
     parallel_layout: Option<crate::runtime::distributed::parallel::LocalModelLayout>,
     parallel_geometry: Option<Vec<nemotron_h::ParallelLayerGeometry>>,
     expert_assignment: Option<ExpertAssignment>,
+    expert_storage: PipelineExpertStorage,
     routing_statistics: RoutingStatistics,
 }
 
@@ -2851,6 +2852,10 @@ impl PipelineStageSemantics for NemotronHStage {
         self.dense_layers.as_ref()
     }
 
+    fn expert_cache(&self) -> Option<&ExpertCache> {
+        self.expert_storage.cache()
+    }
+
     fn prompt_cache_model_identity(
         &self,
         topology: ParallelTopology,
@@ -2891,7 +2896,11 @@ impl PipelineStageSemantics for NemotronHStage {
         cache: &mut [PipelineLayerCache],
         stream: &Stream,
     ) -> Result<PipelineStageOutput, Error> {
-        NemotronHStage::forward(self, input, step, mask, cache, stream)
+        if self.expert_storage.is_external() {
+            self.forward_expert_parallel(input, step, mask, cache, None, stream)
+        } else {
+            NemotronHStage::forward(self, input, step, mask, cache, stream)
+        }
     }
 
     fn forward_with_execution(
@@ -2905,11 +2914,24 @@ impl PipelineStageSemantics for NemotronHStage {
         stream: &Stream,
     ) -> Result<PipelineStageOutput, Error> {
         if let Some(group) = expert_group {
-            return self.forward_expert_parallel(input, step, mask, cache, group, stream);
+            if let Some(execution) = execution.filter(|execution| execution.is_tensor_parallel()) {
+                return self.forward_tensor_parallel(
+                    input,
+                    step,
+                    mask,
+                    cache,
+                    execution,
+                    Some(group),
+                );
+            }
+            return self.forward_expert_parallel(input, step, mask, cache, Some(group), stream);
         }
         match execution {
             Some(execution) if execution.is_tensor_parallel() => {
-                self.forward_tensor_parallel(input, step, mask, cache, execution)
+                self.forward_tensor_parallel(input, step, mask, cache, execution, None)
+            }
+            _ if self.expert_storage.is_external() => {
+                self.forward_expert_parallel(input, step, mask, cache, None, stream)
             }
             _ => self.forward(input, step, mask, cache, stream),
         }
@@ -4698,7 +4720,7 @@ pub fn load_pipeline_model(
 /// support fully resident, host-layerwise, and dense-disk-streamed layers.
 /// Non-resident units compose pipeline placement with the authoritative TP
 /// semantic layout or EP assignment before residency initialization. Qwen3-MoE,
-/// GPT-OSS, and LFM2-MoE additionally compose an independent, stage-local expert cache
+/// GPT-OSS, LFM2-MoE, and Nemotron-H-MoE additionally compose an independent, stage-local expert cache
 /// with resident, host-layerwise, or dense-streamed non-expert parameters for
 /// PP, TP+PP, PP+EP, and TP+PP+EP. With EP inactive each stage owns all experts
 /// for its local layers and executes routes without an expert collective.
@@ -4739,10 +4761,11 @@ pub fn load_pipeline_model_with_options(
                 crate::api::GgufArchitecture::Qwen3Moe
                     | crate::api::GgufArchitecture::GptOss
                     | crate::api::GgufArchitecture::Lfm2Moe
+                    | crate::api::GgufArchitecture::NemotronHMoe
             )
         {
             return Err(Error::Parallel(format!(
-                "pipeline independent expert caching has registered Qwen3-MoE, GPT-OSS, and LFM2-MoE semantic expert recipes; GGUF architecture {} is not yet registered and no checkpoint payload was materialized",
+                "pipeline independent expert caching has registered Qwen3-MoE, GPT-OSS, LFM2-MoE, and Nemotron-H-MoE semantic expert recipes; GGUF architecture {} is not yet registered and no checkpoint payload was materialized",
                 architecture.metadata_name()
             )));
         }
@@ -4754,10 +4777,11 @@ pub fn load_pipeline_model_with_options(
                 crate::api::GgufArchitecture::Qwen3Moe
                     | crate::api::GgufArchitecture::GptOss
                     | crate::api::GgufArchitecture::Lfm2Moe
+                    | crate::api::GgufArchitecture::NemotronHMoe
             )
         {
             return Err(Error::Parallel(format!(
-                "TP+PP+EP preflight has registered Qwen3-MoE, GPT-OSS, and LFM2-MoE; GGUF architecture {} has no triple-axis semantic plan and no checkpoint payload was materialized",
+                "TP+PP+EP preflight has registered Qwen3-MoE, GPT-OSS, LFM2-MoE, and Nemotron-H-MoE; GGUF architecture {} has no triple-axis semantic plan and no checkpoint payload was materialized",
                 architecture.metadata_name()
             )));
         }
@@ -5005,6 +5029,7 @@ pub fn load_pipeline_model_with_options(
                     topology,
                     options.quantization,
                     dense_stream,
+                    expert_cache,
                     stream,
                     weights_stream,
                 )
@@ -5081,18 +5106,26 @@ pub fn load_pipeline_model_with_options(
     let config: serde_json::Value =
         serde_json::from_reader(std::fs::File::open(model_dir.join("config.json"))?)?;
     let model_type = config.get("model_type").and_then(serde_json::Value::as_str);
-    if expert_cache.is_some() && !matches!(model_type, Some("qwen3_moe" | "gpt_oss" | "lfm2_moe")) {
+    if expert_cache.is_some()
+        && !matches!(
+            model_type,
+            Some("qwen3_moe" | "gpt_oss" | "lfm2_moe" | "nemotron_h")
+        )
+    {
         return Err(Error::Parallel(format!(
-            "pipeline independent expert caching has registered Qwen3-MoE, GPT-OSS, and LFM2-MoE semantic expert recipes; SafeTensors model_type {model_type:?} is not yet registered and no checkpoint payload was materialized"
+            "pipeline independent expert caching has registered Qwen3-MoE, GPT-OSS, LFM2-MoE, and Nemotron-H-MoE semantic expert recipes; SafeTensors model_type {model_type:?} is not yet registered and no checkpoint payload was materialized"
         )));
     }
     if topology.tensor_parallel_size > 1
         && topology.pipeline_parallel_size > 1
         && topology.expert_parallel_size > 1
-        && !matches!(model_type, Some("qwen3_moe" | "gpt_oss" | "lfm2_moe"))
+        && !matches!(
+            model_type,
+            Some("qwen3_moe" | "gpt_oss" | "lfm2_moe" | "nemotron_h")
+        )
     {
         return Err(Error::Parallel(format!(
-            "TP+PP+EP preflight has registered Qwen3-MoE, GPT-OSS, and LFM2-MoE; SafeTensors model_type {:?} has no triple-axis semantic plan and no checkpoint payload was materialized",
+            "TP+PP+EP preflight has registered Qwen3-MoE, GPT-OSS, LFM2-MoE, and Nemotron-H-MoE; SafeTensors model_type {:?} has no triple-axis semantic plan and no checkpoint payload was materialized",
             model_type
         )));
     }
@@ -5292,6 +5325,7 @@ pub fn load_pipeline_model_with_options(
                 topology,
                 options.quantization,
                 dense_stream,
+                expert_cache,
                 stream,
                 weights_stream,
             )
@@ -7767,6 +7801,35 @@ fn execute_pipeline_cached_lfm2(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn execute_pipeline_cached_nemotron_h(
+    args: &nemotron_h::ModelArgs,
+    global_layer: usize,
+    hidden: &Array,
+    expert_ids: &Array,
+    weights: &Array,
+    pass: ExpertPass,
+    cache: &ExpertCache,
+    assignment: &ExpertAssignment,
+    expert_group: Option<&Group>,
+    statistics: &mut RoutingStatistics,
+    stream: &Stream,
+) -> Result<Array, Error> {
+    validate_pipeline_expert_dispatch(assignment, expert_group, true)?;
+    let execute = |routes: &crate::runtime::distributed::expert::DispatchedRoutes,
+                   stream: &Stream| {
+        super::expert::execute_cached_nemotron_h(args, global_layer, routes, pass, cache, stream)
+    };
+    let returned = match expert_group {
+        Some(group) => dispatch_replicated_with(
+            hidden, expert_ids, weights, assignment, group, stream, execute,
+        )?,
+        None => dispatch_local_with(hidden, expert_ids, weights, assignment, stream, execute)?,
+    };
+    statistics.accumulate(&returned.statistics);
+    Ok(returned.reduced_output)
+}
+
+#[allow(clippy::too_many_arguments)]
 fn execute_pipeline_cached_gpt_oss(
     args: &gpt_oss::ModelArgs,
     global_layer: usize,
@@ -10180,16 +10243,22 @@ impl GemmaStage {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn load_nemotron_h_pipeline(
     source_args: nemotron_h::ModelArgs,
     store: SharedWeightStore,
     topology: ParallelTopology,
     requested_quantization: Option<WeightQuantization>,
     dense_stream: Option<PipelineLayerLoadOptions>,
+    expert_cache_options: Option<ExpertCacheLoadOptions>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<PipelineModel, Error> {
-    let mut binding_adapter = NemotronHLayerwiseAdapter::new(source_args.clone(), stream)?;
+    let mut binding_adapter = if expert_cache_options.is_some() {
+        NemotronHLayerwiseAdapter::new_external_experts(source_args.clone(), stream)?
+    } else {
+        NemotronHLayerwiseAdapter::new(source_args.clone(), stream)?
+    };
     let expert_assignment = binding_adapter.expert_parallel_assignment(topology)?;
     topology.preflight(
         Some(source_args.num_hidden_layers as usize),
@@ -10221,6 +10290,12 @@ fn load_nemotron_h_pipeline(
                 .into(),
         ));
     }
+    if expert_cache_options.is_some() && quantize_on_load.is_some() {
+        return Err(Error::Quantization(
+            "load-time quantization is unsupported for independently cached Nemotron-H pipeline experts; use checkpoint-native packed weights"
+                .into(),
+        ));
+    }
     let mut target_args = source_args.clone();
     if let Some(affine) = quantize_on_load {
         target_args.quantization = Some(affine);
@@ -10234,7 +10309,13 @@ fn load_nemotron_h_pipeline(
         ModelKind::NemotronH,
         source_args.hidden_size,
     );
-    let mut stage = NemotronHStage::new(target_args.clone(), range, &info, stream)?;
+    let mut stage = NemotronHStage::new(
+        target_args.clone(),
+        range,
+        &info,
+        expert_cache_options.is_some(),
+        stream,
+    )?;
     stage.expert_assignment = expert_assignment;
     if let Some(assignment) = stage.expert_assignment.as_ref() {
         info.global_expert_count = Some(assignment.global_expert_count());
@@ -10426,19 +10507,28 @@ fn load_nemotron_h_pipeline(
                 stage.expert_assignment.as_ref(),
                 stream,
             )?;
-            loaded.load(
-                layer,
-                store.as_ref(),
-                &bindings,
-                requested,
-                weights_stream,
-                stream,
-            )?;
+            if expert_cache_options.is_some() {
+                loaded.load_excluding(
+                    layer,
+                    store.as_ref(),
+                    &bindings,
+                    weights_stream,
+                    stream,
+                    &|name| name.starts_with("moe.experts."),
+                )?;
+            } else {
+                loaded.load(
+                    layer,
+                    store.as_ref(),
+                    &bindings,
+                    requested,
+                    weights_stream,
+                    stream,
+                )?;
+            }
         }
     }
     let static_bytes = loaded.finish(&mut info)?;
-    let checkpoint_diagnostics = store.diagnostics()?;
-    let materialized_shards = checkpoint_diagnostics.touched_shard_paths.clone();
     if let Some(options) = dense_stream {
         let streamed_layout = parallel_layout.clone();
         let streamed_assignment = stage.expert_assignment.clone();
@@ -10471,6 +10561,12 @@ fn load_nemotron_h_pipeline(
                 )
             },
         )?);
+        if expert_cache_options.is_some() {
+            stage.dense_layers = stage
+                .dense_layers
+                .take()
+                .map(|storage| storage.with_independent_experts("moe.experts."));
+        }
         let layer_bytes = stage.dense_layers.as_ref().unwrap().planned_layer_bytes()?;
         info.planned_owned_parameter_bytes =
             static_bytes.checked_add(layer_bytes).ok_or_else(|| {
@@ -10479,7 +10575,39 @@ fn load_nemotron_h_pipeline(
     } else {
         info.planned_owned_parameter_bytes = static_bytes;
     }
-    info.opened_checkpoint_shards = materialized_shards;
+    if let Some(options) = expert_cache_options {
+        let entries =
+            crate::architectures::nemotron_h::layerwise::nemotron_h_expert_catalog_for_layers(
+                &source_args,
+                store.as_ref(),
+                stage.range.clone(),
+            )?
+            .into_iter()
+            .filter(|entry| {
+                stage.expert_assignment.as_ref().is_none_or(|assignment| {
+                    assignment.owner(entry.identity().global_expert) == Some(assignment.rank())
+                })
+            })
+            .collect::<Vec<_>>();
+        if !entries.is_empty() {
+            let cache = ExpertCache::new_shared(
+                Arc::clone(&store),
+                entries,
+                options,
+                weights_stream.clone(),
+                stream.clone(),
+            )?;
+            info.planned_owned_parameter_bytes = info
+                .planned_owned_parameter_bytes
+                .checked_add(cache.report()?.owned_bytes)
+                .ok_or_else(|| {
+                    Error::Parallel("Nemotron-H pipeline expert byte total overflowed".into())
+                })?;
+            stage.expert_storage = PipelineExpertStorage::External(Box::new(cache));
+        }
+    }
+    let checkpoint_diagnostics = store.diagnostics()?;
+    info.opened_checkpoint_shards = checkpoint_diagnostics.touched_shard_paths.clone();
     info.checkpoint_diagnostics = Some(checkpoint_diagnostics);
     PipelineModel::from_adapter(topology, info, PipelineStage(stage))
 }
@@ -10653,14 +10781,202 @@ fn forward_nemotron_expert_layer(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn forward_nemotron_tensor_expert_layer(
+    layer: &mut nemotron_h::TransformerBlock,
+    global_layer: usize,
+    hidden: &Array,
+    mask: Option<&Array>,
+    cache: &mut PipelineLayerCache,
+    tensor_group: &Group,
+    assignment: &ExpertAssignment,
+    expert_group: &Group,
+    statistics: &mut RoutingStatistics,
+    stream: &Stream,
+) -> Result<Array, Error> {
+    let forward = |layer: &mut nemotron_h::TransformerBlock,
+                   cache: Option<nemotron_h::OperatorCache<'_>>,
+                   statistics: &mut RoutingStatistics| {
+        layer.forward_tensor_expert_parallel_with_operator_cache(
+            hidden,
+            mask,
+            cache,
+            tensor_group,
+            assignment,
+            expert_group,
+            statistics,
+            stream,
+        )
+    };
+    match cache {
+        PipelineLayerCache::KeyValue {
+            global_layer: cached,
+            cache,
+            slots,
+        } if *cached == global_layer && slots.is_empty() => {
+            let cache: &mut dyn KeyValueCache = match cache {
+                PipelineKeyValueCache::Standard(cache) => cache,
+                PipelineKeyValueCache::Paged(cache) => cache,
+            };
+            Ok(forward(
+                layer,
+                Some(nemotron_h::OperatorCache::Attention(cache)),
+                statistics,
+            )?)
+        }
+        PipelineLayerCache::StateSlots {
+            global_layer: cached,
+            slots,
+        } if *cached == global_layer && slots.is_empty() => Ok(forward(layer, None, statistics)?),
+        PipelineLayerCache::StateSlots {
+            global_layer: cached,
+            slots,
+        } if *cached == global_layer
+            && slots.len() == 2
+            && slots[0].policy.role == (StateTensorRole::Convolution { slot: 0 })
+            && slots[1].policy.role == StateTensorRole::Recurrent =>
+        {
+            let (conv, recurrent) = slots.split_at_mut(1);
+            let mut local = nemotron_h::Mamba2Cache {
+                conv_state: conv[0].value.take(),
+                ssm_state: recurrent[0].value.take(),
+                offset: conv[0].offset,
+            };
+            if recurrent[0].offset != local.offset {
+                return Err(Error::Parallel(format!(
+                    "Nemotron-H TP+PP+EP Mamba state offsets disagree at global layer {global_layer}"
+                )));
+            }
+            let output = forward(
+                layer,
+                Some(nemotron_h::OperatorCache::Mamba(&mut local)),
+                statistics,
+            )?;
+            conv[0].value = local.conv_state;
+            conv[0].offset = local.offset;
+            recurrent[0].value = local.ssm_state;
+            recurrent[0].offset = local.offset;
+            Ok(output)
+        }
+        _ => Err(Error::Parallel(format!(
+            "Nemotron-H TP+PP+EP cache does not match global layer {global_layer}"
+        ))),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn forward_nemotron_external_expert_layer(
+    args: &nemotron_h::ModelArgs,
+    layer: &mut nemotron_h::TransformerBlock,
+    global_layer: usize,
+    hidden: &Array,
+    mask: Option<&Array>,
+    cache: &mut PipelineLayerCache,
+    tensor_group: Option<&Group>,
+    assignment: &ExpertAssignment,
+    expert_group: Option<&Group>,
+    pass: ExpertPass,
+    expert_cache: &ExpertCache,
+    statistics: &mut RoutingStatistics,
+    stream: &Stream,
+) -> Result<Array, Error> {
+    let forward = |layer: &mut nemotron_h::TransformerBlock,
+                   cache: Option<nemotron_h::OperatorCache<'_>>,
+                   statistics: &mut RoutingStatistics| {
+        let execute = |hidden: &Array, ids: &Array, weights: &Array, stream: &Stream| {
+            execute_pipeline_cached_nemotron_h(
+                args,
+                global_layer,
+                hidden,
+                ids,
+                weights,
+                pass,
+                expert_cache,
+                assignment,
+                expert_group,
+                statistics,
+                stream,
+            )
+            .map_err(|error| Exception::custom(error.to_string()))
+        };
+        match tensor_group {
+            Some(group) => layer.forward_tensor_with_operator_cache_and_expert_executor(
+                hidden, mask, cache, group, stream, execute,
+            ),
+            None => layer.forward_with_operator_cache_and_expert_executor(
+                hidden, mask, cache, stream, execute,
+            ),
+        }
+    };
+    match cache {
+        PipelineLayerCache::KeyValue {
+            global_layer: cached,
+            cache,
+            slots,
+        } if *cached == global_layer && slots.is_empty() => {
+            let cache: &mut dyn KeyValueCache = match cache {
+                PipelineKeyValueCache::Standard(cache) => cache,
+                PipelineKeyValueCache::Paged(cache) => cache,
+            };
+            Ok(forward(
+                layer,
+                Some(nemotron_h::OperatorCache::Attention(cache)),
+                statistics,
+            )?)
+        }
+        PipelineLayerCache::StateSlots {
+            global_layer: cached,
+            slots,
+        } if *cached == global_layer && slots.is_empty() => Ok(forward(layer, None, statistics)?),
+        PipelineLayerCache::StateSlots {
+            global_layer: cached,
+            slots,
+        } if *cached == global_layer
+            && slots.len() == 2
+            && slots[0].policy.role == (StateTensorRole::Convolution { slot: 0 })
+            && slots[1].policy.role == StateTensorRole::Recurrent =>
+        {
+            let (conv, recurrent) = slots.split_at_mut(1);
+            let mut local = nemotron_h::Mamba2Cache {
+                conv_state: conv[0].value.take(),
+                ssm_state: recurrent[0].value.take(),
+                offset: conv[0].offset,
+            };
+            if recurrent[0].offset != local.offset {
+                return Err(Error::Parallel(format!(
+                    "Nemotron-H external-expert Mamba state offsets disagree at global layer {global_layer}"
+                )));
+            }
+            let output = forward(
+                layer,
+                Some(nemotron_h::OperatorCache::Mamba(&mut local)),
+                statistics,
+            )?;
+            conv[0].value = local.conv_state;
+            conv[0].offset = local.offset;
+            recurrent[0].value = local.ssm_state;
+            recurrent[0].offset = local.offset;
+            Ok(output)
+        }
+        _ => Err(Error::Parallel(format!(
+            "Nemotron-H pipeline external-expert cache does not match global layer {global_layer}"
+        ))),
+    }
+}
+
 impl NemotronHStage {
     fn new(
         args: nemotron_h::ModelArgs,
         range: Range<usize>,
         info: &PipelineStageInfo,
+        external_experts: bool,
         stream: &Stream,
     ) -> Result<Self, Error> {
-        let layer_adapter = NemotronHLayerwiseAdapter::new(args.clone(), stream)?;
+        let layer_adapter = if external_experts {
+            NemotronHLayerwiseAdapter::new_external_experts(args.clone(), stream)?
+        } else {
+            NemotronHLayerwiseAdapter::new(args.clone(), stream)?
+        };
         let complete = nemotron_h::Model::new(args.clone(), stream)?;
         let nemotron_h::Model { model, lm_head, .. } = complete;
         let nemotron_h::NemotronHModel {
@@ -10697,6 +11013,11 @@ impl NemotronHStage {
             parallel_layout: None,
             parallel_geometry: None,
             expert_assignment: None,
+            expert_storage: if external_experts {
+                PipelineExpertStorage::ExternalEmpty
+            } else {
+                PipelineExpertStorage::LayerLocal
+            },
             routing_statistics: RoutingStatistics::default(),
         })
     }
@@ -10855,6 +11176,7 @@ impl NemotronHStage {
         explicit_mask: Option<&Array>,
         caches: &mut [PipelineLayerCache],
         execution: &ParallelExecutionContext<'_>,
+        expert_group: Option<&Group>,
     ) -> Result<PipelineStageOutput, Error> {
         let group = execution.group().ok_or_else(|| {
             Error::Parallel(
@@ -10890,6 +11212,22 @@ impl NemotronHStage {
             .then(|| create_causal_mask(step.sequence_length, Some(offset), None, None, stream))
             .transpose()?;
         let mask = explicit_mask.or(generated_mask.as_ref());
+        let expert_assignment = self.expert_assignment.clone();
+        if let Some(assignment) = expert_assignment.as_ref() {
+            validate_pipeline_expert_dispatch(
+                assignment,
+                expert_group,
+                self.expert_storage.is_external(),
+            )?;
+        }
+        self.routing_statistics = RoutingStatistics::default();
+        let pass = if step.sequence_length > 1 {
+            ExpertPass::Prefill
+        } else {
+            ExpertPass::Decode
+        };
+        let args = self.args.clone();
+        let expert_cache = self.expert_storage.cache();
         let layer_adapter = &self.layer_adapter;
         let parallel_layout = self.parallel_layout.clone();
         hidden = execute_pipeline_layer_range(
@@ -10907,20 +11245,69 @@ impl NemotronHStage {
                     0,
                     global_layer,
                     parallel_layout.as_ref(),
-                    None,
+                    expert_assignment.as_ref(),
                     stream,
                 )
             },
             |global_layer, layer, hidden, cache, stream| {
-                let forwarded = forward_nemotron_tensor_layer(
-                    layer,
-                    global_layer,
-                    hidden,
-                    mask,
-                    cache,
-                    group,
-                    stream,
-                )?;
+                let forwarded = match (
+                    expert_assignment.as_ref(),
+                    self.expert_storage.is_external(),
+                    expert_cache,
+                ) {
+                    (Some(assignment), true, Some(expert_cache)) => {
+                        forward_nemotron_external_expert_layer(
+                            &args,
+                            layer,
+                            global_layer,
+                            hidden,
+                            mask,
+                            cache,
+                            Some(group),
+                            assignment,
+                            expert_group,
+                            pass,
+                            expert_cache,
+                            &mut self.routing_statistics,
+                            stream,
+                        )?
+                    }
+                    (Some(_), true, None) | (None, true, None) => forward_nemotron_tensor_layer(
+                        layer,
+                        global_layer,
+                        hidden,
+                        mask,
+                        cache,
+                        group,
+                        stream,
+                    )?,
+                    (Some(assignment), false, None) => forward_nemotron_tensor_expert_layer(
+                        layer,
+                        global_layer,
+                        hidden,
+                        mask,
+                        cache,
+                        group,
+                        assignment,
+                        expert_group.expect("validated resident Nemotron-H EP group"),
+                        &mut self.routing_statistics,
+                        stream,
+                    )?,
+                    (None, false, _) => forward_nemotron_tensor_layer(
+                        layer,
+                        global_layer,
+                        hidden,
+                        mask,
+                        cache,
+                        group,
+                        stream,
+                    )?,
+                    (None, true, Some(_)) | (Some(_), false, Some(_)) => {
+                        unreachable!(
+                            "Nemotron-H expert storage and assignment are internally coherent"
+                        )
+                    }
+                };
                 eval([&forwarded])?;
                 stream.synchronize()?;
                 Ok(forwarded)
@@ -10956,12 +11343,13 @@ impl NemotronHStage {
         step: PipelineStep,
         explicit_mask: Option<&Array>,
         caches: &mut [PipelineLayerCache],
-        group: &Group,
+        group: Option<&Group>,
         stream: &Stream,
     ) -> Result<PipelineStageOutput, Error> {
         let assignment = self.expert_assignment.as_ref().ok_or_else(|| {
             Error::Parallel("Nemotron-H PP+EP stage has no rank-local expert assignment".into())
         })?;
+        validate_pipeline_expert_dispatch(assignment, group, self.expert_storage.is_external())?;
         if caches.len() != self.layers.len() {
             return Err(Error::Parallel(format!(
                 "Nemotron-H PP+EP stage cache has {} entries, expected {}",
@@ -10989,6 +11377,13 @@ impl NemotronHStage {
         self.routing_statistics = RoutingStatistics::default();
         let layer_adapter = &self.layer_adapter;
         let expert_assignment = assignment.clone();
+        let expert_cache = self.expert_storage.cache();
+        let pass = if step.sequence_length > 1 {
+            ExpertPass::Prefill
+        } else {
+            ExpertPass::Decode
+        };
+        let args = self.args.clone();
         hidden = execute_pipeline_layer_range(
             PipelineLayerExecution {
                 range: self.range.clone(),
@@ -11009,17 +11404,40 @@ impl NemotronHStage {
                 )
             },
             |global_layer, layer, hidden, cache, stream| {
-                let forwarded = forward_nemotron_expert_layer(
-                    layer,
-                    global_layer,
-                    hidden,
-                    mask,
-                    cache,
-                    &expert_assignment,
-                    group,
-                    &mut self.routing_statistics,
-                    stream,
-                )?;
+                let forwarded = match (self.expert_storage.is_external(), expert_cache) {
+                    (true, Some(expert_cache)) => forward_nemotron_external_expert_layer(
+                        &args,
+                        layer,
+                        global_layer,
+                        hidden,
+                        mask,
+                        cache,
+                        None,
+                        &expert_assignment,
+                        group,
+                        pass,
+                        expert_cache,
+                        &mut self.routing_statistics,
+                        stream,
+                    )?,
+                    (true, None) => {
+                        Self::forward_layer(layer, global_layer, hidden, mask, cache, stream)?
+                    }
+                    (false, None) => forward_nemotron_expert_layer(
+                        layer,
+                        global_layer,
+                        hidden,
+                        mask,
+                        cache,
+                        &expert_assignment,
+                        group.expect("validated resident Nemotron-H EP group"),
+                        &mut self.routing_statistics,
+                        stream,
+                    )?,
+                    (false, Some(_)) => {
+                        unreachable!("resident Nemotron-H stage cannot own expert cache")
+                    }
+                };
                 eval([&forwarded])?;
                 stream.synchronize()?;
                 Ok(forwarded)

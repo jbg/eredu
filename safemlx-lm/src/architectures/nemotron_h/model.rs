@@ -1339,6 +1339,43 @@ impl SparseMoeBlock {
         let shared = self.shared_experts.forward(hidden_states, stream)?;
         routed.add(shared, stream)
     }
+
+    pub(crate) fn forward_tensor_expert_parallel(
+        &mut self,
+        hidden_states: &Array,
+        tensor_group: &safemlx::distributed::Group,
+        assignment: &crate::architectures::distributed::expert::ExpertAssignment,
+        expert_group: &safemlx::distributed::Group,
+        statistics: &mut crate::architectures::distributed::expert::RoutingStatistics,
+        stream: &Stream,
+    ) -> Result<Array, Exception> {
+        let shape = hidden_states.shape();
+        let flat = hidden_states.reshape(&[-1, shape[2]], stream)?;
+        let router_started = std::time::Instant::now();
+        let (indices, weights) = self.gate.forward(&flat, stream)?;
+        statistics.router_time += router_started.elapsed();
+        let returned = crate::architectures::distributed::expert::dispatch_replicated(
+            &flat,
+            &indices,
+            &weights,
+            assignment,
+            &mut self.experts,
+            expert_group,
+            stream,
+        )
+        .map_err(|error| Exception::custom(error.to_string()))?;
+        statistics.accumulate(&returned.statistics);
+        let routed_partial = returned.reduced_output.reshape(shape, stream)?;
+        let routed = safemlx::distributed::all_sum(&routed_partial, tensor_group, stream)?;
+        let shared_partial = self.shared_experts.forward(hidden_states, stream)?;
+        let shared = reduce_row_parallel_output(
+            shared_partial,
+            &self.shared_experts.down_proj,
+            tensor_group,
+            stream,
+        )?;
+        routed.add(shared, stream)
+    }
 }
 
 impl Module<&Array> for SparseMoeBlock {
@@ -2177,6 +2214,154 @@ pub struct TransformerBlock {
 }
 
 impl TransformerBlock {
+    pub(crate) fn forward_with_operator_cache_and_expert_executor<F>(
+        &mut self,
+        x: &Array,
+        mask: Option<&Array>,
+        cache: Option<OperatorCache<'_>>,
+        stream: &Stream,
+        execute: F,
+    ) -> Result<Array, Exception>
+    where
+        F: FnOnce(&Array, &Array, &Array, &Stream) -> Result<Array, Exception>,
+    {
+        let residual = x;
+        let normalized = self.norm.forward(x, stream)?;
+        let output = match (self.policy, cache) {
+            (LayerPolicy::Mamba, Some(OperatorCache::Mamba(cache))) => {
+                self.mamba.as_mut().expect("mamba block").forward(
+                    Mamba2Input {
+                        x: &normalized,
+                        cache: Some(cache),
+                    },
+                    stream,
+                )?
+            }
+            (LayerPolicy::Mamba, None) => self.mamba.as_mut().expect("mamba block").forward(
+                Mamba2Input {
+                    x: &normalized,
+                    cache: None,
+                },
+                stream,
+            )?,
+            (LayerPolicy::SelfAttention(_), Some(OperatorCache::Attention(cache))) => {
+                self.attention.as_mut().expect("attention block").forward(
+                    AttentionInput {
+                        x: &normalized,
+                        mask,
+                        cache: Some(cache),
+                    },
+                    stream,
+                )?
+            }
+            (LayerPolicy::SelfAttention(_), None) => {
+                self.attention.as_mut().expect("attention block").forward(
+                    AttentionInput {
+                        x: &normalized,
+                        mask,
+                        cache: None,
+                    },
+                    stream,
+                )?
+            }
+            (LayerPolicy::DenseMlp, None) => self
+                .mlp
+                .as_mut()
+                .expect("mlp block")
+                .forward(&normalized, stream)?,
+            (LayerPolicy::SparseMoe, None) => self
+                .moe
+                .as_mut()
+                .expect("moe block")
+                .forward_with_expert_executor(&normalized, stream, execute)?,
+            (policy, Some(_)) => {
+                return Err(Exception::custom(format!(
+                "Nemotron-H external-expert operator cache does not match layer policy {policy:?}"
+            )))
+            }
+        };
+        residual.add(output, stream)
+    }
+
+    pub(crate) fn forward_tensor_with_operator_cache_and_expert_executor<F>(
+        &mut self,
+        x: &Array,
+        mask: Option<&Array>,
+        cache: Option<OperatorCache<'_>>,
+        group: &safemlx::distributed::Group,
+        stream: &Stream,
+        execute: F,
+    ) -> Result<Array, Exception>
+    where
+        F: FnOnce(&Array, &Array, &Array, &Stream) -> Result<Array, Exception>,
+    {
+        let normalized = self.norm.forward(x, stream)?;
+        let output = match (self.policy, cache) {
+            (LayerPolicy::Mamba, Some(OperatorCache::Mamba(cache))) => {
+                let mamba = self.mamba.as_mut().expect("mamba block");
+                let partial = mamba.forward(
+                    Mamba2Input {
+                        x: &normalized,
+                        cache: Some(cache),
+                    },
+                    stream,
+                )?;
+                reduce_row_parallel_output(partial, &mamba.out_proj, group, stream)?
+            }
+            (LayerPolicy::Mamba, None) => {
+                let mamba = self.mamba.as_mut().expect("mamba block");
+                let partial = mamba.forward(
+                    Mamba2Input {
+                        x: &normalized,
+                        cache: None,
+                    },
+                    stream,
+                )?;
+                reduce_row_parallel_output(partial, &mamba.out_proj, group, stream)?
+            }
+            (LayerPolicy::SelfAttention(_), Some(OperatorCache::Attention(cache))) => {
+                let attention = self.attention.as_mut().expect("attention block");
+                let partial = attention.forward(
+                    AttentionInput {
+                        x: &normalized,
+                        mask,
+                        cache: Some(cache),
+                    },
+                    stream,
+                )?;
+                reduce_row_parallel_output(partial, &attention.o_proj, group, stream)?
+            }
+            (LayerPolicy::SelfAttention(_), None) => {
+                let attention = self.attention.as_mut().expect("attention block");
+                let partial = attention.forward(
+                    AttentionInput {
+                        x: &normalized,
+                        mask,
+                        cache: None,
+                    },
+                    stream,
+                )?;
+                reduce_row_parallel_output(partial, &attention.o_proj, group, stream)?
+            }
+            (LayerPolicy::DenseMlp, None) => {
+                let mlp = self.mlp.as_mut().expect("mlp block");
+                let partial = mlp.forward(&normalized, stream)?;
+                reduce_row_parallel_output(partial, &mlp.down_proj, group, stream)?
+            }
+            (LayerPolicy::SparseMoe, None) => self
+                .moe
+                .as_mut()
+                .expect("moe block")
+                .forward_tensor_with_expert_executor(&normalized, group, stream, execute)?,
+            (policy, Some(_)) => {
+                return Err(Exception::custom(format!(
+                    "Nemotron-H tensor/external-expert operator cache does not match layer policy {policy:?}"
+                )))
+            }
+        };
+        x.add(output, stream)
+    }
+
     /// Creates an unloaded block for `layer_idx`.
     pub fn new(args: &ModelArgs, layer_idx: usize, stream: &Stream) -> Result<Self, Error> {
         let geometry = match args.layer_policy(layer_idx)? {
@@ -2766,6 +2951,92 @@ impl TransformerBlock {
                 return Err(Exception::custom(format!(
                 "Nemotron-H expert-parallel operator cache does not match layer policy {policy:?}"
             )))
+            }
+        };
+        x.add(output, stream)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn forward_tensor_expert_parallel_with_operator_cache(
+        &mut self,
+        x: &Array,
+        mask: Option<&Array>,
+        cache: Option<OperatorCache<'_>>,
+        tensor_group: &safemlx::distributed::Group,
+        assignment: &crate::architectures::distributed::expert::ExpertAssignment,
+        expert_group: &safemlx::distributed::Group,
+        statistics: &mut crate::architectures::distributed::expert::RoutingStatistics,
+        stream: &Stream,
+    ) -> Result<Array, Exception> {
+        let normalized = self.norm.forward(x, stream)?;
+        let output = match (self.policy, cache) {
+            (LayerPolicy::Mamba, Some(OperatorCache::Mamba(cache))) => {
+                let mamba = self.mamba.as_mut().expect("mamba block");
+                let partial = mamba.forward(
+                    Mamba2Input {
+                        x: &normalized,
+                        cache: Some(cache),
+                    },
+                    stream,
+                )?;
+                reduce_row_parallel_output(partial, &mamba.out_proj, tensor_group, stream)?
+            }
+            (LayerPolicy::Mamba, None) => {
+                let mamba = self.mamba.as_mut().expect("mamba block");
+                let partial = mamba.forward(
+                    Mamba2Input {
+                        x: &normalized,
+                        cache: None,
+                    },
+                    stream,
+                )?;
+                reduce_row_parallel_output(partial, &mamba.out_proj, tensor_group, stream)?
+            }
+            (LayerPolicy::SelfAttention(_), Some(OperatorCache::Attention(cache))) => {
+                let attention = self.attention.as_mut().expect("attention block");
+                let partial = attention.forward(
+                    AttentionInput {
+                        x: &normalized,
+                        mask,
+                        cache: Some(cache),
+                    },
+                    stream,
+                )?;
+                reduce_row_parallel_output(partial, &attention.o_proj, tensor_group, stream)?
+            }
+            (LayerPolicy::SelfAttention(_), None) => {
+                let attention = self.attention.as_mut().expect("attention block");
+                let partial = attention.forward(
+                    AttentionInput {
+                        x: &normalized,
+                        mask,
+                        cache: None,
+                    },
+                    stream,
+                )?;
+                reduce_row_parallel_output(partial, &attention.o_proj, tensor_group, stream)?
+            }
+            (LayerPolicy::DenseMlp, None) => {
+                let mlp = self.mlp.as_mut().expect("mlp block");
+                let partial = mlp.forward(&normalized, stream)?;
+                reduce_row_parallel_output(partial, &mlp.down_proj, tensor_group, stream)?
+            }
+            (LayerPolicy::SparseMoe, None) => self
+                .moe
+                .as_mut()
+                .expect("moe block")
+                .forward_tensor_expert_parallel(
+                    &normalized,
+                    tensor_group,
+                    assignment,
+                    expert_group,
+                    statistics,
+                    stream,
+                )?,
+            (policy, Some(_)) => {
+                return Err(Exception::custom(format!(
+                    "Nemotron-H tensor/expert operator cache does not match layer policy {policy:?}"
+                )))
             }
         };
         x.add(output, stream)

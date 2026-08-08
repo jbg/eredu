@@ -903,6 +903,14 @@ impl NemotronHLayerwiseAdapter {
         })
     }
 
+    /// Creates a metadata-only adapter whose routed experts are supplied by
+    /// the independent expert residency manager.
+    pub(crate) fn new_external_experts(args: ModelArgs, stream: &Stream) -> Result<Self, Error> {
+        let mut adapter = Self::new(args, stream)?;
+        adapter.sparse_expert_cache = true;
+        Ok(adapter)
+    }
+
     /// Returns validated model arguments.
     pub const fn args(&self) -> &ModelArgs {
         &self.args
@@ -1384,11 +1392,49 @@ impl ArchitectureAdapter for NemotronHLayerwiseAdapter {
         if let Some(moe) = &mut layer.moe {
             let prefix = format!("model.layers.{index}.moe.experts");
             moe.experts = Experts::new(
-                i32::try_from(assignment.local_expert_count()).map_err(|_| {
-                    Error::Parallel("local Nemotron-H expert count exceeds i32".into())
-                })?,
+                if self.sparse_expert_cache {
+                    0
+                } else {
+                    i32::try_from(assignment.local_expert_count()).map_err(|_| {
+                        Error::Parallel("local Nemotron-H expert count exceeds i32".into())
+                    })?
+                },
                 self.args.hidden_size,
                 self.args.moe_intermediate_size,
+                [
+                    self.args
+                        .weight_quantization_for(&format!("{prefix}.up_proj")),
+                    self.args
+                        .weight_quantization_for(&format!("{prefix}.down_proj")),
+                ],
+                stream,
+            )?;
+        }
+        Ok(layer)
+    }
+
+    fn new_tensor_expert_parallel_layer(
+        &self,
+        group: usize,
+        index: usize,
+        layout: &crate::runtime::distributed::parallel::LocalModelLayout,
+        assignment: &crate::runtime::distributed::expert::ExpertAssignment,
+        stream: &Stream,
+    ) -> Result<Self::Layer, Error> {
+        let mut layer = self.new_parallel_layer(group, index, layout, stream)?;
+        if let Some(moe) = &mut layer.moe {
+            let prefix = format!("model.layers.{index}.moe.experts");
+            let intermediate = moe.experts.intermediate_size;
+            moe.experts = Experts::new(
+                if self.sparse_expert_cache {
+                    0
+                } else {
+                    i32::try_from(assignment.local_expert_count()).map_err(|_| {
+                        Error::Parallel("local Nemotron-H expert count exceeds i32".into())
+                    })?
+                },
+                self.args.hidden_size,
+                intermediate,
                 [
                     self.args
                         .weight_quantization_for(&format!("{prefix}.up_proj")),
@@ -1405,7 +1451,7 @@ impl ArchitectureAdapter for NemotronHLayerwiseAdapter {
         &self,
         topology: crate::runtime::distributed::topology::ParallelTopology,
     ) -> Result<Option<crate::runtime::distributed::expert::ExpertAssignment>, Error> {
-        if topology.expert_parallel_size == 1 {
+        if topology.expert_parallel_size == 1 && !self.sparse_expert_cache {
             return Ok(None);
         }
         if !self
@@ -1872,9 +1918,17 @@ pub(crate) fn nemotron_h_expert_catalog(
     args: &ModelArgs,
     store: &dyn WeightStore,
 ) -> Result<Vec<ExpertCatalogEntry>, Error> {
+    nemotron_h_expert_catalog_for_layers(args, store, 0..args.num_hidden_layers as usize)
+}
+
+pub(crate) fn nemotron_h_expert_catalog_for_layers(
+    args: &ModelArgs,
+    store: &dyn WeightStore,
+    layers: impl IntoIterator<Item = usize>,
+) -> Result<Vec<ExpertCatalogEntry>, Error> {
     let normalized = normalized_checkpoint_keys(store, args)?;
     let mut entries = Vec::new();
-    for layer in 0..args.num_hidden_layers as usize {
+    for layer in layers {
         if args.layer_schedule.get(layer) != Some(&LayerPolicy::SparseMoe) {
             continue;
         }

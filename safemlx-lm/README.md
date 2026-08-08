@@ -949,7 +949,7 @@ placement, transfer, eviction, and active-window telemetry for either
 non-resident policy; `dense_stream_report` adds disk-stream pass and cache
 statistics only when that policy is active. `PipelineStageInfo` carries the
 same report's global rank and TP/PP/EP coordinates and stage ownership.
-Qwen3-MoE, GPT-OSS, and LFM2-MoE also compose all three axes in this runtime. TP
+Qwen3-MoE, GPT-OSS, LFM2-MoE, and Nemotron-H-MoE also compose all three axes in this runtime. TP
 collectives remain inside the stage and EP coordinate, routed exchange remains
 inside the stage and TP coordinate, and pipeline transport connects equal
 TP/EP coordinates.
@@ -957,10 +957,11 @@ The triple-axis path supports arbitrary valid Cartesian degrees on native
 subgroup backends and uses topology-planned neighbor routes for stage-local
 Ring fallback collectives. Fully resident, host-layerwise, and
 dense-disk-streamed SafeTensors and canonical `qwen3moe`, type-39 `gpt-oss`,
-or `lfm2moe` GGUF checkpoints share the same layer recipes, cache identity,
-synchronized generation, and failure consensus. LFM2-MoE carries its
+`lfm2moe`, or `nemotron_h_moe` GGUF checkpoints share the same layer recipes,
+cache identity, synchronized generation, and failure consensus. LFM2-MoE carries its
 TP-local causal-convolution state and attention KV state through that same
-stage cache, including prompt-cache persistence and reload.
+stage cache, while Nemotron-H-MoE carries TP-local Mamba convolution/SSM state
+alongside attention KV state, including prompt-cache persistence and reload.
 The same independent expert cache works with PP and TP+PP when EP is inactive,
 and with PP+EP or TP+PP+EP when EP is active.
 In that geometry every stage owns all routed experts for its local layers; TP
@@ -1002,7 +1003,7 @@ that complete triple-axis/cache boundary. Dense families have no EP migration.
 | LFM2 dense | TP, PP | TP+PP complete | None; EP does not apply |
 | LFM2-MoE | TP, PP, EP | Complete | None |
 | Nemotron-H dense | TP, PP | TP+PP complete | None; EP does not apply |
-| Nemotron-H-MoE | TP, PP, EP | Pairwise | Compose Mamba state and mixed dense/MoE placement with triple-axis execution and pipeline-independent expert caching |
+| Nemotron-H-MoE | TP, PP, EP | Complete | None |
 | Qwen3-Next/Qwen3.5 text dense | TP, PP | TP+PP complete | Qwen3.5 multimodal ingress remains outside the text pipeline; EP does not apply |
 | Qwen3-Next/Qwen3.5-MoE text | TP, PP, EP | Pairwise | Compose hybrid recurrent state with triple-axis execution and pipeline-independent expert caching; Qwen3.5 multimodal ingress remains outside the text pipeline |
 | Inkling text | TP, PP, EP | Pairwise | Compose short-convolution state and routed/shared experts with triple-axis execution and pipeline-independent expert caching; audio/vision ingress remains outside combined execution |
@@ -1019,7 +1020,7 @@ The remaining global limitations are:
 - Families marked **Pairwise** fail triple-axis or pipeline-independent expert
   cache requests during preflight, before checkpoint payload materialization.
 
-TP+PP+EP is executable for Qwen3-MoE, GPT-OSS, and LFM2-MoE. The Cartesian
+TP+PP+EP is executable for Qwen3-MoE, GPT-OSS, LFM2-MoE, and Nemotron-H-MoE. The Cartesian
 topology and execution contexts remain family-neutral and accept arbitrary
 legal axis sizes.
 
@@ -1080,6 +1081,16 @@ same ordinary or paged KV implementation as other decoders, and paged prompt
 publication saves both representations atomically. A stage containing only
 convolution layers still owns a residency manager, so fixed-state-only stage
 snapshots are valid and reload with their exact prefix offset.
+
+Nemotron-H-MoE composes the same Cartesian execution and expert-storage
+contracts across its ordered Mamba, dense, sparse-MoE, and attention schedule.
+Resident routed experts combine EP exchange with TP-sharded expert widths;
+independently cached experts remain complete execution units while shared
+experts and nonexpert projections retain their TP shards. SafeTensors and
+canonical `nemotron_h_moe` GGUF use stage-local expert catalogs, so host and
+dense-streamed policies do not inspect or materialize remote-stage expert
+payloads. Empty-route coordinates, prompt-cache reload, synchronized
+generation, and failure consensus use the shared pipeline runtime.
 
 `PipelineCache` contains only the local global-layer range: standard or
 sliding-window KV entries for Llama, dense Qwen, and GPT-OSS;

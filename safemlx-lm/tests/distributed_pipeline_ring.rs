@@ -73,6 +73,7 @@ enum FixtureFamily {
     KimiLinear,
     KimiLinearGguf,
     NemotronH,
+    NemotronHGguf,
     Qwen3Next,
     Qwen3NextMoe,
     Qwen35,
@@ -100,6 +101,7 @@ impl FixtureFamily {
             Self::KimiLinear => "kimi-linear",
             Self::KimiLinearGguf => "kimi-linear-gguf",
             Self::NemotronH => "nemotron-h",
+            Self::NemotronHGguf => "nemotron-h-gguf",
             Self::Qwen3Next => "qwen3-next",
             Self::Qwen3NextMoe => "qwen3-next-moe",
             Self::Qwen35 => "qwen3.5",
@@ -127,6 +129,7 @@ impl FixtureFamily {
             Self::KimiLinear,
             Self::KimiLinearGguf,
             Self::NemotronH,
+            Self::NemotronHGguf,
             Self::Qwen3Next,
             Self::Qwen3NextMoe,
             Self::Qwen35,
@@ -161,7 +164,7 @@ impl FixtureFamily {
             | Self::Qwen3NextMoe
             | Self::Qwen35
             | Self::Qwen35Moe => 2,
-            Self::Gemma | Self::NemotronH => 4,
+            Self::Gemma | Self::NemotronH | Self::NemotronHGguf => 4,
             Self::Inkling | Self::InklingGguf => 3,
         }
     }
@@ -170,11 +173,19 @@ impl FixtureFamily {
         match (self, rank) {
             (Self::Gemma, 0) => 0..1,
             (Self::Gemma, 1) => 1..4,
-            (Self::NemotronH, 0) => 0..2,
-            (Self::NemotronH, 1) => 2..4,
+            (Self::NemotronH | Self::NemotronHGguf, 0) => 0..2,
+            (Self::NemotronH | Self::NemotronHGguf, 1) => 2..4,
             (Self::Inkling | Self::InklingGguf, 0) => 0..2,
             (Self::Inkling | Self::InklingGguf, 1) => 2..3,
             (_, rank) => rank..rank + 1,
+        }
+    }
+
+    fn expert_layer_count(self, range: std::ops::Range<usize>) -> usize {
+        match self {
+            Self::NemotronH => range.filter(|index| *index == 2).count(),
+            Self::NemotronHGguf => range.filter(|index| matches!(*index, 1 | 2)).count(),
+            _ => range.len(),
         }
     }
 
@@ -190,7 +201,7 @@ impl FixtureFamily {
             Self::Lfm2 => ("lfm2", "lfm2"),
             Self::Lfm2Moe | Self::Lfm2MoeGguf => ("lfm2", "lfm2_moe"),
             Self::KimiLinear | Self::KimiLinearGguf => ("kimi_linear", "kimi_linear"),
-            Self::NemotronH => ("nemotron_h", "nemotron_h"),
+            Self::NemotronH | Self::NemotronHGguf => ("nemotron_h", "nemotron_h"),
             Self::Qwen3Next => ("qwen_hybrid", "qwen3_next"),
             Self::Qwen3NextMoe => ("qwen_hybrid", "qwen3_next"),
             Self::Qwen35 => ("qwen_hybrid", "qwen3_5_text"),
@@ -202,7 +213,7 @@ impl FixtureFamily {
     const fn layer_prefix(self) -> &'static str {
         match self {
             Self::Gemma => "model.language_model.layers.",
-            Self::NemotronH => "backbone.layers.",
+            Self::NemotronH | Self::NemotronHGguf => "backbone.layers.",
             Self::Inkling | Self::InklingGguf => "model.llm.layers.",
             _ => "model.layers.",
         }
@@ -216,6 +227,7 @@ impl FixtureFamily {
                 | Self::Qwen3MoeGguf
                 | Self::GptOssGguf
                 | Self::Lfm2MoeGguf
+                | Self::NemotronHGguf
         )
     }
 
@@ -226,6 +238,7 @@ impl FixtureFamily {
                 | Self::KimiLinear
                 | Self::KimiLinearGguf
                 | Self::NemotronH
+                | Self::NemotronHGguf
                 | Self::Qwen3Next
                 | Self::Qwen3Moe
                 | Self::Qwen3MoeTied
@@ -284,6 +297,7 @@ fn pipeline_ring_worker() {
                     | FixtureFamily::Lfm2Moe
                     | FixtureFamily::Lfm2MoeGguf
                     | FixtureFamily::NemotronH
+                    | FixtureFamily::NemotronHGguf
                     | FixtureFamily::Qwen3NextMoe
                     | FixtureFamily::Qwen35Moe
                     | FixtureFamily::Qwen3Moe
@@ -441,7 +455,8 @@ fn pipeline_ring_worker() {
     }
     if expert_cache {
         let report = model.expert_cache_report().unwrap();
-        let expected_experts = expected_range.len() * info.local_expert_ids.len();
+        let expected_experts =
+            family.expert_layer_count(expected_range.clone()) * info.local_expert_ids.len();
         assert_eq!(report.is_some(), expected_experts > 0);
         if let Some(report) = report {
             assert_eq!(report.owned_experts, expected_experts);
@@ -2242,6 +2257,126 @@ fn write_nemotron_fixture(directory: &Path) {
     .unwrap();
 }
 
+fn write_nemotron_h_moe_gguf_fixture(path: &Path) {
+    let mut config = nemotron_config();
+    config["hybrid_override_pattern"] = serde_json::json!("MEE*");
+    let execution = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+    let stream = execution.stream();
+    let args = nemotron_model::model_args_from_config_value(&config).unwrap();
+    let mut model = nemotron_model::Model::new(args, stream).unwrap();
+    initialize_fixture(&mut model, stream);
+    let mut specs = Vec::new();
+    for (runtime_name, value) in model.parameters().flatten() {
+        let runtime_name = canonical_checkpoint_name(&runtime_name);
+        let gguf_name = if runtime_name == "model.embeddings.weight" {
+            "token_embd.weight".to_string()
+        } else if runtime_name == "model.norm_f.weight" {
+            "output_norm.weight".to_string()
+        } else if runtime_name == "lm_head.weight" {
+            "output.weight".to_string()
+        } else if let Some(rest) = runtime_name.strip_prefix("model.layers.") {
+            let (layer, parameter) = rest.split_once('.').unwrap();
+            let parameter = parameter
+                .strip_prefix("norm.")
+                .map_or_else(|| parameter.to_string(), |rest| format!("attn_norm.{rest}"));
+            let parameter = parameter
+                .replace("mamba.norm.", "ssm_norm.")
+                .replace("mamba.in_proj.", "ssm_in.")
+                .replace("mamba.conv1d.", "ssm_conv1d.")
+                .replace("mamba.dt_bias", "ssm_dt.bias")
+                .replace("mamba.A_log", "ssm_a")
+                .replace("mamba.D", "ssm_d")
+                .replace("mamba.out_proj.", "ssm_out.")
+                .replace("attention.q_proj.", "attn_q.")
+                .replace("attention.k_proj.", "attn_k.")
+                .replace("attention.v_proj.", "attn_v.")
+                .replace("attention.o_proj.", "attn_output.")
+                .replace("moe.gate.e_score_correction_bias", "exp_probs_b.bias")
+                .replace("moe.gate.", "ffn_gate_inp.")
+                .replace("moe.experts.up_proj", "ffn_up_exps.weight")
+                .replace("moe.experts.down_proj", "ffn_down_exps.weight")
+                .replace("moe.shared_experts.up_proj.", "ffn_up_shexp.")
+                .replace("moe.shared_experts.down_proj.", "ffn_down_shexp.");
+            format!("blk.{layer}.{parameter}")
+        } else {
+            panic!("unmapped Nemotron-H GGUF fixture tensor {runtime_name}")
+        };
+        if gguf_name.ends_with(".ssm_conv1d.weight") {
+            let reshaped = value
+                .reshape(&[value.shape()[0], value.shape()[2]], stream)
+                .unwrap();
+            specs.push(gguf_tensor_from_array(gguf_name, &reshaped));
+        } else if gguf_name.ends_with(".ssm_a") {
+            let negative =
+                Array::full::<f32>(value.shape(), Array::from_f32(-0.8), stream).unwrap();
+            specs.push(gguf_tensor_from_array(gguf_name, &negative));
+        } else {
+            specs.push(gguf_tensor_from_array(gguf_name, value));
+        }
+    }
+    let key = |suffix: &str| format!("nemotron_h_moe.{suffix}");
+    let metadata = BTreeMap::from([
+        (
+            "general.architecture".into(),
+            GgufMetadataValue::String("nemotron_h_moe".into()),
+        ),
+        ("general.file_type".into(), GgufMetadataValue::Uint32(0)),
+        (key("block_count"), GgufMetadataValue::Uint32(4)),
+        (key("embedding_length"), GgufMetadataValue::Uint32(12)),
+        (
+            key("feed_forward_length"),
+            GgufMetadataValue::Array(safemlx::ops::GgufMetadataArray::Uint32(vec![0, 17, 17, 0])),
+        ),
+        (
+            key("attention.head_count_kv"),
+            GgufMetadataValue::Array(safemlx::ops::GgufMetadataArray::Uint32(vec![0, 0, 0, 3])),
+        ),
+        (key("attention.head_count"), GgufMetadataValue::Uint32(6)),
+        (key("attention.key_length"), GgufMetadataValue::Uint32(2)),
+        (
+            key("attention.layer_norm_rms_epsilon"),
+            GgufMetadataValue::Float32(0.00001),
+        ),
+        (
+            key("attention.sliding_window"),
+            GgufMetadataValue::Uint32(3),
+        ),
+        (key("context_length"), GgufMetadataValue::Uint32(64)),
+        (key("ssm.inner_size"), GgufMetadataValue::Uint32(12)),
+        (key("ssm.time_step_rank"), GgufMetadataValue::Uint32(6)),
+        (key("ssm.state_size"), GgufMetadataValue::Uint32(2)),
+        (key("ssm.group_count"), GgufMetadataValue::Uint32(3)),
+        (key("ssm.conv_kernel"), GgufMetadataValue::Uint32(3)),
+        (key("expert_count"), GgufMetadataValue::Uint32(2)),
+        (key("expert_shared_count"), GgufMetadataValue::Uint32(1)),
+        (
+            key("expert_feed_forward_length"),
+            GgufMetadataValue::Uint32(5),
+        ),
+        (
+            key("expert_shared_feed_forward_length"),
+            GgufMetadataValue::Uint32(7),
+        ),
+        (key("expert_used_count"), GgufMetadataValue::Uint32(2)),
+        (key("expert_weights_norm"), GgufMetadataValue::Uint32(1)),
+        (key("expert_group_count"), GgufMetadataValue::Uint32(1)),
+        (key("expert_group_used_count"), GgufMetadataValue::Uint32(1)),
+        (key("vocab_size"), GgufMetadataValue::Uint32(13)),
+    ]);
+    let tensors = specs
+        .iter()
+        .map(|tensor| TensorInput {
+            name: &tensor.name,
+            dimensions: &tensor.dimensions,
+            ggml_type: GgmlType::F32,
+            data: &tensor.data,
+        })
+        .collect::<Vec<_>>();
+    Writer::default()
+        .write(std::fs::File::create(path).unwrap(), &metadata, &tensors)
+        .unwrap();
+}
+
 fn qwen_hybrid_config(model_type: &str) -> serde_json::Value {
     serde_json::json!({
         "architectures": [if model_type == "qwen3_next" { "Qwen3NextForCausalLM" } else { "Qwen3_5ForCausalLM" }],
@@ -3220,6 +3355,72 @@ fn ring_four_process_nemotron_h_pipeline_expert() {
     run_ring_cartesian_pipeline(true, FixtureFamily::NemotronH, "pp-ep");
 }
 
+/// Proves resident Nemotron-H-MoE TP=2 x PP=2 x EP=2 execution across Mamba,
+/// dense, sparse, and attention layers with rank-local state and experts.
+#[test]
+#[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
+fn ring_eight_process_nemotron_h_moe_triple_axis() {
+    run_ring_cartesian_pipeline(false, FixtureFamily::NemotronH, "tp-pp-ep");
+}
+
+/// Exercises dense-streamed non-experts and independently cached
+/// Nemotron-H routed experts across all three Cartesian axes.
+#[test]
+#[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
+fn ring_eight_process_nemotron_h_moe_streamed_triple_axis_expert_cache() {
+    run_ring_cartesian_pipeline_mode(
+        true,
+        FixtureFamily::NemotronH,
+        "tp-pp-ep",
+        WorkerMode::ExpertCache,
+    );
+}
+
+/// Exercises host-layerwise non-experts and independently cached
+/// Nemotron-H routed experts across all three Cartesian axes.
+#[test]
+#[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
+fn ring_eight_process_nemotron_h_moe_layerwise_host_triple_axis_expert_cache() {
+    run_ring_layerwise_host_cartesian_pipeline_mode(
+        FixtureFamily::NemotronH,
+        "tp-pp-ep",
+        WorkerMode::ExpertCache,
+    );
+}
+
+/// Exercises canonical Nemotron-H-MoE GGUF bindings, bounded non-expert
+/// reads, and independent expert caching across all three axes.
+#[test]
+#[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
+fn ring_eight_process_nemotron_h_moe_gguf_triple_axis_expert_cache() {
+    run_ring_cartesian_pipeline_mode(
+        true,
+        FixtureFamily::NemotronHGguf,
+        "tp-pp-ep",
+        WorkerMode::ExpertCache,
+    );
+}
+
+/// Covers independent Nemotron-H expert caching when PP is active without EP.
+#[test]
+#[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
+fn ring_two_process_nemotron_h_moe_pipeline_expert_cache() {
+    run_ring_pipeline_mode(false, FixtureFamily::NemotronH, WorkerMode::ExpertCache);
+}
+
+/// Verifies cached-expert failure consensus remains deadlock-free for
+/// Nemotron-H stateful pipeline stages.
+#[test]
+#[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
+fn ring_four_process_nemotron_h_moe_pipeline_expert_cache_mismatch_consensus() {
+    run_ring_cartesian_pipeline_mode(
+        false,
+        FixtureFamily::NemotronH,
+        "pp-ep",
+        WorkerMode::ExpertCacheScheduleMismatch,
+    );
+}
+
 /// Verifies Qwen3-Next linear and full-attention state through distributed
 /// prefill, decode, persistence, and bounded streaming.
 #[test]
@@ -3491,6 +3692,10 @@ fn run_ring_cartesian_pipeline_mode(
         let path = checkpoint.path().join("model.gguf");
         write_lfm2_moe_gguf_fixture(&path);
         path
+    } else if family == FixtureFamily::NemotronHGguf {
+        let path = checkpoint.path().join("model.gguf");
+        write_nemotron_h_moe_gguf_fixture(&path);
+        path
     } else if family == FixtureFamily::KimiLinearGguf {
         let path = checkpoint.path().join("model.gguf");
         write_kimi_linear_gguf_fixture(&path);
@@ -3551,6 +3756,7 @@ fn run_ring_layerwise_host_cartesian_pipeline_mode(
             FixtureFamily::Qwen3Moe => write_qwen_fixture(checkpoint.path(), "qwen3_moe"),
             FixtureFamily::GptOss => write_gpt_oss_fixture(checkpoint.path()),
             FixtureFamily::Lfm2Moe => write_lfm2_pipeline_fixture(checkpoint.path(), true),
+            FixtureFamily::NemotronH => write_nemotron_fixture(checkpoint.path()),
             _ => panic!("host-layerwise Cartesian helper received unsupported {family:?}"),
         }
         checkpoint.path().to_path_buf()
@@ -3606,6 +3812,10 @@ fn run_ring_pipeline_mode(dense_stream: bool, family: FixtureFamily, mode: Worke
         let path = checkpoint.path().join("model.gguf");
         write_lfm2_moe_gguf_fixture(&path);
         path
+    } else if family == FixtureFamily::NemotronHGguf {
+        let path = checkpoint.path().join("model.gguf");
+        write_nemotron_h_moe_gguf_fixture(&path);
+        path
     } else if family == FixtureFamily::KimiLinearGguf {
         let path = checkpoint.path().join("model.gguf");
         write_kimi_linear_gguf_fixture(&path);
@@ -3642,6 +3852,7 @@ fn run_ring_pipeline_mode(dense_stream: bool, family: FixtureFamily, mode: Worke
             FixtureFamily::Qwen3MoeGguf
             | FixtureFamily::GptOssGguf
             | FixtureFamily::Lfm2MoeGguf
+            | FixtureFamily::NemotronHGguf
             | FixtureFamily::KimiLinearGguf
             | FixtureFamily::InklingGguf => unreachable!(),
         }

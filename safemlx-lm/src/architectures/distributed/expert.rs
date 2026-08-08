@@ -3163,7 +3163,7 @@ pub(crate) fn execute_cached_lfm2(
     )?)
 }
 
-fn execute_cached_nemotron_h(
+pub(crate) fn execute_cached_nemotron_h(
     args: &nemotron_h::ModelArgs,
     layer: usize,
     routes: &DispatchedRoutes,
