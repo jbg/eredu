@@ -768,8 +768,10 @@ impl GgufReaderCache {
         self.last_used[checkpoint] = self.tick;
         let materializer = &mut self.materializers[checkpoint];
         let converted = match selection {
-            Some(selection) => materializer.converted_tensor_selected(physical_name, selection),
-            None => materializer.converted_tensor(physical_name),
+            Some(selection) => {
+                materializer.converted_tensor_selected_host(physical_name, selection)
+            }
+            None => materializer.converted_tensor_host(physical_name),
         }
         .map_err(|error| WeightStoreError::Gguf {
             key: logical_key.to_string(),
@@ -1634,6 +1636,28 @@ impl WeightLease {
         }
     }
 
+    /// Schedules a host-only materialization that may borrow bounded
+    /// SafeTensors bytes until a containing derived output is evaluated.
+    ///
+    /// Callers must not return `output()` after completing this pending value;
+    /// use it only as an input to an evaluated dependent graph.
+    pub(crate) fn prepare_borrowed_materialization(
+        self,
+        source_stream: &Stream,
+    ) -> Result<PendingWeightMaterialization, WeightStoreError> {
+        match self.source.clone() {
+            WeightLeaseSource::Safetensors(shard) => {
+                self.prepare_borrowed_safetensors(shard, source_stream)
+            }
+            WeightLeaseSource::Gguf(source) => {
+                self.prepare_gguf(*source, source_stream, source_stream)
+            }
+            WeightLeaseSource::Memory(source) => {
+                self.prepare_memory(source, source_stream, source_stream)
+            }
+        }
+    }
+
     fn prepare_memory(
         self,
         source: MemoryLeaseSource,
@@ -1672,6 +1696,114 @@ impl WeightLease {
             lease: Some(self),
             source_stream: source_stream.clone(),
             execution_stream: execution_stream.clone(),
+            borrowed_source: false,
+            completed: false,
+        })
+    }
+
+    fn prepare_borrowed_safetensors(
+        self,
+        shard: Arc<MappedShard>,
+        source_stream: &Stream,
+    ) -> Result<PendingWeightMaterialization, WeightStoreError> {
+        let info = shard.metadata.info(&self.key).ok_or_else(|| {
+            WeightStoreError::ContradictoryIndexMapping {
+                key: self.key.clone(),
+                path: shard.path.clone(),
+            }
+        })?;
+        if !is_supported_execution_dtype(info.dtype) {
+            return Err(WeightStoreError::UnsupportedStoredDtype {
+                key: self.key.clone(),
+                dtype: info.dtype.into(),
+            });
+        }
+        let payload_start = shard
+            .payload_offset
+            .checked_add(info.data_offsets.0)
+            .ok_or_else(|| WeightStoreError::Overflow {
+                context: format!("payload start for tensor {:?}", self.key),
+            })?;
+        let payload_end = shard
+            .payload_offset
+            .checked_add(info.data_offsets.1)
+            .ok_or_else(|| WeightStoreError::Overflow {
+                context: format!("payload end for tensor {:?}", self.key),
+            })?;
+        let data = shard.mmap.get(payload_start..payload_end).ok_or_else(|| {
+            WeightStoreError::MalformedSafetensors {
+                path: shard.path.clone(),
+                message: format!("tensor {:?} payload is outside the mapped shard", self.key),
+            }
+        })?;
+        let (shape, selected_data) = match &self.selection {
+            TensorSelection::Full => (info.shape.clone(), data),
+            TensorSelection::Range {
+                axis: 0,
+                start,
+                end,
+            } => {
+                let outer = info.shape[0];
+                let row_bytes = data
+                    .len()
+                    .checked_div(outer)
+                    .filter(|_| data.len() % outer == 0)
+                    .ok_or_else(|| WeightStoreError::MalformedSafetensors {
+                        path: shard.path.clone(),
+                        message: format!(
+                            "tensor {:?} payload is not divisible by its outer dimension",
+                            self.key
+                        ),
+                    })?;
+                let start = start.checked_mul(row_bytes).ok_or_else(|| {
+                    WeightStoreError::Overflow {
+                        context: format!("borrowed byte start for tensor {:?}", self.key),
+                    }
+                })?;
+                let end = end.checked_mul(row_bytes).ok_or_else(|| WeightStoreError::Overflow {
+                    context: format!("borrowed byte end for tensor {:?}", self.key),
+                })?;
+                let selected = data.get(start..end).ok_or_else(|| {
+                    WeightStoreError::MalformedSafetensors {
+                        path: shard.path.clone(),
+                        message: format!(
+                            "borrowed selection for tensor {:?} is outside its payload",
+                            self.key
+                        ),
+                    }
+                })?;
+                (self.output_shape.clone(), selected)
+            }
+            selection => {
+                return Err(WeightStoreError::BoundedSelectionUnavailable {
+                    key: self.key.clone(),
+                    message: format!(
+                        "zero-copy conversion requires a full tensor or contiguous axis-zero range, got {selection:?}"
+                    ),
+                })
+            }
+        };
+        let view = TensorView::new(info.dtype, shape, selected_data).map_err(|error| {
+            WeightStoreError::MalformedSafetensors {
+                path: shard.path.clone(),
+                message: format!("tensor {:?}: {error}", self.key),
+            }
+        })?;
+        let source_value =
+            unsafe { Array::try_from_borrowed_safetensors(view) }.map_err(|source| {
+                WeightStoreError::MlxConversion {
+                    key: self.key.clone(),
+                    source,
+                }
+            })?;
+        Ok(PendingWeightMaterialization {
+            output: source_value.clone(),
+            _source: source_value,
+            _gguf_group: None,
+            lease: Some(self),
+            source_stream: source_stream.clone(),
+            execution_stream: source_stream.clone(),
+            borrowed_source: true,
             completed: false,
         })
     }
@@ -1778,6 +1910,7 @@ impl WeightLease {
                 lease: Some(self),
                 source_stream: source_stream.clone(),
                 execution_stream: execution_stream.clone(),
+                borrowed_source: false,
                 completed: false,
             });
         }
@@ -1826,6 +1959,7 @@ impl WeightLease {
             lease: Some(self),
             source_stream: source_stream.clone(),
             execution_stream: execution_stream.clone(),
+            borrowed_source: false,
             completed: false,
         })
     }
@@ -1897,7 +2031,9 @@ impl WeightLease {
                     entry.physical_name, entry.original_name
                 ),
             })?;
-        let materialized = if selection_is_materialized {
+        let materialized = if selection_is_materialized && source_stream == execution_stream {
+            source_value.clone()
+        } else if selection_is_materialized {
             source_value
                 .copy(execution_stream)
                 .map_err(|source| self.mlx_error("copy", source))?
@@ -1931,6 +2067,7 @@ impl WeightLease {
             lease: Some(self),
             source_stream: source_stream.clone(),
             execution_stream: execution_stream.clone(),
+            borrowed_source: false,
             completed: false,
         })
     }
@@ -1965,6 +2102,7 @@ pub(crate) struct PendingWeightMaterialization {
     lease: Option<WeightLease>,
     source_stream: Stream,
     execution_stream: Stream,
+    borrowed_source: bool,
     completed: bool,
 }
 
@@ -1976,7 +2114,17 @@ impl PendingWeightMaterialization {
 
     /// Evaluates this output and releases its source dependencies.
     pub(crate) fn finish(mut self) -> Result<Array, WeightStoreError> {
-        eval([&self.output]).map_err(|source| {
+        let output = if self.borrowed_source {
+            self.output.copy(&self.source_stream).map_err(|source| {
+                self.lease
+                    .as_ref()
+                    .expect("pending materialization retains its lease")
+                    .mlx_error("borrowed source copy", source)
+            })?
+        } else {
+            self.output.clone()
+        };
+        eval([&output]).map_err(|source| {
             self.lease
                 .as_ref()
                 .expect("pending materialization retains its lease")
@@ -1984,7 +2132,7 @@ impl PendingWeightMaterialization {
         })?;
         self.completed = true;
         self.lease.take();
-        Ok(self.output.clone())
+        Ok(output)
     }
 
     /// Marks a batch member complete after a containing output was evaluated.

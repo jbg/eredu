@@ -258,9 +258,11 @@ impl Iterator for GgufTensorIter<'_> {
     type Item = Result<GgufTensor, IoError>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.inner
-            .next()
-            .map(|result| result.map_err(IoError::from).and_then(convert_tensor))
+        self.inner.next().map(|result| {
+            result
+                .map_err(IoError::from)
+                .and_then(|tensor| convert_tensor(tensor, false))
+        })
     }
 }
 
@@ -341,7 +343,15 @@ impl GgufMaterializer {
 
     /// Materialize one physical tensor by its GGUF name.
     pub fn converted_tensor(&mut self, name: &str) -> Result<GgufTensor, IoError> {
-        convert_tensor(self.inner.converted_tensor(name)?)
+        convert_tensor(self.inner.converted_tensor(name)?, false)
+    }
+
+    /// Materialize one physical tensor as owned host-backed arrays.
+    ///
+    /// Converted buffers transfer directly into MLX instead of being copied
+    /// through the process-default device.
+    pub fn converted_tensor_host(&mut self, name: &str) -> Result<GgufTensor, IoError> {
+        convert_tensor(self.inner.converted_tensor(name)?, true)
     }
 
     /// Materialize a bounded selection along one MLX tensor axis.
@@ -350,7 +360,22 @@ impl GgufMaterializer {
         name: &str,
         selection: &GgufTensorSelection,
     ) -> Result<GgufTensor, IoError> {
-        convert_tensor(self.inner.converted_tensor_selected(name, selection)?)
+        convert_tensor(
+            self.inner.converted_tensor_selected(name, selection)?,
+            false,
+        )
+    }
+
+    /// Materialize a bounded tensor selection as owned host-backed arrays.
+    ///
+    /// Converted buffers transfer directly into MLX instead of being copied
+    /// through the process-default device.
+    pub fn converted_tensor_selected_host(
+        &mut self,
+        name: &str,
+        selection: &GgufTensorSelection,
+    ) -> Result<GgufTensor, IoError> {
+        convert_tensor(self.inner.converted_tensor_selected(name, selection)?, true)
     }
 
     /// Materialize one physical tensor without converting its GGUF blocks.
@@ -361,7 +386,10 @@ impl GgufMaterializer {
     }
 }
 
-fn convert_tensor(tensor: safemlx_gguf::ConvertedCheckpointTensor) -> Result<GgufTensor, IoError> {
+fn convert_tensor(
+    tensor: safemlx_gguf::ConvertedCheckpointTensor,
+    host_owned: bool,
+) -> Result<GgufTensor, IoError> {
     let descriptor = tensor.descriptor().clone();
     match tensor.into_converted() {
         safemlx_gguf::ConvertedTensor::Dense(dense) => {
@@ -376,7 +404,7 @@ fn convert_tensor(tensor: safemlx_gguf::ConvertedCheckpointTensor) -> Result<Ggu
                 safemlx_gguf::DenseDtype::I64 => Dtype::Int64,
                 safemlx_gguf::DenseDtype::F64 => Dtype::Float64,
             };
-            let array = unsafe { Array::from_raw_data(dense.data.as_ptr().cast(), &shape, dtype) };
+            let array = array_from_owned_data(dense.data, &shape, dtype, host_owned)?;
             Ok(GgufTensor::Dense(GgufArray {
                 name: descriptor.name,
                 array,
@@ -385,9 +413,8 @@ fn convert_tensor(tensor: safemlx_gguf::ConvertedCheckpointTensor) -> Result<Ggu
         safemlx_gguf::ConvertedTensor::IQuant(iquant) => {
             let packed_shape = mlx_shape_i32(&descriptor.name, &iquant.packed_shape()?)?;
             let logical_shape = mlx_shape_i32(&descriptor.name, &iquant.shape)?;
-            let array = unsafe {
-                Array::from_raw_data(iquant.data.as_ptr().cast(), &packed_shape, Dtype::Uint8)
-            };
+            let array =
+                array_from_owned_data(iquant.data, &packed_shape, Dtype::Uint8, host_owned)?;
             Ok(GgufTensor::IQuant(GgufIQuantTensor {
                 physical_name: descriptor.name.clone(),
                 ggml_type: iquant.ggml_type,
@@ -402,15 +429,12 @@ fn convert_tensor(tensor: safemlx_gguf::ConvertedCheckpointTensor) -> Result<Ggu
         safemlx_gguf::ConvertedTensor::Affine(affine) => {
             let weight_shape = mlx_shape_i32(&descriptor.name, &affine.weight_shape)?;
             let scale_shape = mlx_shape_i32(&descriptor.name, &affine.scale_shape)?;
-            let weight = unsafe {
-                Array::from_raw_data(affine.weights.as_ptr().cast(), &weight_shape, Dtype::Uint32)
-            };
-            let scales = unsafe {
-                Array::from_raw_data(affine.scales.as_ptr().cast(), &scale_shape, Dtype::Float16)
-            };
-            let biases = unsafe {
-                Array::from_raw_data(affine.biases.as_ptr().cast(), &scale_shape, Dtype::Float16)
-            };
+            let weight =
+                array_from_owned_data(affine.weights, &weight_shape, Dtype::Uint32, host_owned)?;
+            let scales =
+                array_from_owned_data(affine.scales, &scale_shape, Dtype::Float16, host_owned)?;
+            let biases =
+                array_from_owned_data(affine.biases, &scale_shape, Dtype::Float16, host_owned)?;
             let prefix = descriptor
                 .name
                 .strip_suffix(".weight")
@@ -442,12 +466,10 @@ fn convert_tensor(tensor: safemlx_gguf::ConvertedCheckpointTensor) -> Result<Ggu
         safemlx_gguf::ConvertedTensor::MxFp4(mxfp4) => {
             let weight_shape = mlx_shape_i32(&descriptor.name, &mxfp4.weight_shape)?;
             let scale_shape = mlx_shape_i32(&descriptor.name, &mxfp4.scale_shape)?;
-            let weight = unsafe {
-                Array::from_raw_data(mxfp4.weights.as_ptr().cast(), &weight_shape, Dtype::Uint32)
-            };
-            let scales = unsafe {
-                Array::from_raw_data(mxfp4.scales.as_ptr().cast(), &scale_shape, Dtype::Uint8)
-            };
+            let weight =
+                array_from_owned_data(mxfp4.weights, &weight_shape, Dtype::Uint32, host_owned)?;
+            let scales =
+                array_from_owned_data(mxfp4.scales, &scale_shape, Dtype::Uint8, host_owned)?;
             let prefix = descriptor
                 .name
                 .strip_suffix(".weight")
@@ -471,6 +493,21 @@ fn convert_tensor(tensor: safemlx_gguf::ConvertedCheckpointTensor) -> Result<Ggu
             }))
         }
     }
+}
+
+fn array_from_owned_data<T: 'static>(
+    values: Vec<T>,
+    shape: &[i32],
+    dtype: Dtype,
+    host_owned: bool,
+) -> Result<Array, IoError> {
+    Ok(unsafe {
+        if host_owned {
+            Array::try_from_owned_host_data(values, shape, dtype)?
+        } else {
+            Array::from_raw_data(values.as_ptr().cast(), shape, dtype)
+        }
+    })
 }
 
 fn mlx_shape_i32(name: &str, shape: &[u64]) -> Result<Vec<i32>, IoError> {

@@ -44,6 +44,24 @@ unsafe impl Send for Array {}
 // guards where MLX requires them, and stress-tested in safemlx-tests.
 unsafe impl Sync for Array {}
 
+unsafe extern "C" fn drop_owned_vec<T>(payload: *mut c_void) {
+    unsafe {
+        drop(Box::from_raw(payload.cast::<Vec<T>>()));
+    }
+}
+
+#[cfg(feature = "safetensors")]
+unsafe extern "C" fn retain_borrowed_data(_: *mut c_void) {}
+
+const fn dtype_byte_width(dtype: Dtype) -> usize {
+    match dtype {
+        Dtype::Bool | Dtype::Uint8 | Dtype::Int8 => 1,
+        Dtype::Uint16 | Dtype::Int16 | Dtype::Float16 | Dtype::Bfloat16 => 2,
+        Dtype::Uint32 | Dtype::Int32 | Dtype::Float32 => 4,
+        Dtype::Uint64 | Dtype::Int64 | Dtype::Float64 | Dtype::Complex64 => 8,
+    }
+}
+
 /// An evaluated array with materialized storage available for host reads.
 pub struct EvaluatedArray<'a> {
     storage: EvaluatedArrayStorage<'a>,
@@ -193,6 +211,94 @@ impl Array {
 
         let c_array = safemlx_sys::mlx_array_new_data(data, shape.as_ptr(), dim, dtype.into());
         Array { c_array }
+    }
+
+    /// Transfers an owned host allocation into an MLX array without copying it.
+    ///
+    /// # Safety
+    ///
+    /// The byte representation of `values` must match `dtype`. The checked byte
+    /// count and alignment must match the supplied shape.
+    pub(crate) unsafe fn try_from_owned_host_data<T: 'static>(
+        mut values: Vec<T>,
+        shape: &[i32],
+        dtype: Dtype,
+    ) -> crate::error::Result<Self> {
+        if shape.len() > i32::MAX as usize {
+            return Err(crate::error::Exception::custom("shape is too large"));
+        }
+        let elements = shape.iter().try_fold(1usize, |count, dimension| {
+            usize::try_from(*dimension)
+                .ok()
+                .and_then(|dimension| count.checked_mul(dimension))
+                .ok_or_else(|| crate::error::Exception::custom("invalid or overflowing shape"))
+        })?;
+        let expected = elements
+            .checked_mul(dtype_byte_width(dtype))
+            .ok_or_else(|| crate::error::Exception::custom("array byte count overflow"))?;
+        if std::mem::size_of_val(values.as_slice()) != expected {
+            return Err(crate::error::Exception::custom(
+                "owned array byte count does not match shape and dtype",
+            ));
+        }
+        let alignment = dtype_byte_width(dtype).min(8);
+        if !(values.as_ptr() as usize).is_multiple_of(alignment) {
+            return Err(crate::error::Exception::custom(
+                "owned array storage is not aligned for its dtype",
+            ));
+        }
+        let data = values.as_mut_ptr().cast::<c_void>();
+        let payload = Box::into_raw(Box::new(values)).cast::<c_void>();
+        let _guard = runtime_lock::enter();
+        let c_array = unsafe {
+            safemlx_sys::mlx_array_new_data_managed_payload(
+                data,
+                shape.as_ptr(),
+                shape.len() as i32,
+                dtype.into(),
+                payload,
+                Some(drop_owned_vec::<T>),
+            )
+        };
+        Ok(Array { c_array })
+    }
+
+    /// Creates a host array that borrows caller-owned storage without copying.
+    ///
+    /// # Safety
+    ///
+    /// `data` must remain valid, immutable, and aligned for `dtype` until every
+    /// clone of the returned array has been dropped or fully evaluated by a
+    /// dependent operation.
+    #[cfg(feature = "safetensors")]
+    pub(crate) unsafe fn try_from_borrowed_host_data(
+        data: *const c_void,
+        shape: &[i32],
+        dtype: Dtype,
+    ) -> crate::error::Result<Self> {
+        if data.is_null() || shape.len() > i32::MAX as usize {
+            return Err(crate::error::Exception::custom(
+                "borrowed array data or shape is invalid",
+            ));
+        }
+        let alignment = dtype_byte_width(dtype).min(8);
+        if !(data as usize).is_multiple_of(alignment) {
+            return Err(crate::error::Exception::custom(
+                "borrowed array storage is not aligned for its dtype",
+            ));
+        }
+        let _guard = runtime_lock::enter();
+        let c_array = unsafe {
+            safemlx_sys::mlx_array_new_data_managed_payload(
+                data.cast_mut(),
+                shape.as_ptr(),
+                shape.len() as i32,
+                dtype.into(),
+                std::ptr::null_mut(),
+                Some(retain_borrowed_data),
+            )
+        };
+        Ok(Array { c_array })
     }
 
     /// New array from an iterator.

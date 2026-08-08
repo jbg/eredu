@@ -51,6 +51,26 @@ contain only remote tensors remain untouched. Cache hits and memory-mapped page
 faults are not reported as known physical disk transfers because logical
 materialization and storage I/O are different measurements.
 
+`runtime::checkpoint::bounded_quantization` provides the shared out-of-core
+materialisation path for load-time affine and MXFP4 conversion. A
+`BoundedQuantizationPlan` names semantic source recipes and an explicit maximum
+conversion working set. Each source is read in bounded row tiles on a CPU
+stream, quantized immediately, and written directly into a temporary indexed
+SafeTensors store. The store overlays only the final packed `weight`, `scales`,
+and optional `biases` tensors; untransformed keys continue to use the original
+SafeTensors or GGUF store. A complete dense source tensor and a complete packed
+destination tensor are therefore not required in active memory at the same
+time.
+
+Admission counts the conservative peak of the selected semantic recipe plus
+the packed outputs for that tile. It fails before payload materialization when
+even one row does not fit, when the source cannot perform the requested bounded
+selection, or when packed geometry and alignment are illegal. Conversion
+telemetry reports selected dense bytes, packed output bytes, tile count, and
+the largest admitted source, output, and combined working sets. Downstream
+residency planning reads metadata from the packed overlay, so host and device
+budgets count the quantized bytes rather than the original dense bytes.
+
 `ModelLoadOptions` selects a compositional parameter-residency policy inside
 one generalized execution engine. `LayerWeightResidency` chooses
 `FullyResident`, `LayerwiseHost`, or `DenseDiskStream` for ordinary execution
@@ -1067,10 +1087,14 @@ formats. Dense families have no EP migration.
 
 The remaining global limitations are:
 
-- Load-time expert requantization is rejected for independently cached or
-  triple-axis experts because it would bypass their semantic sharding recipes.
-  Checkpoint-native affine, FP8, MXFP4, and registered GGUF layouts remain
-  supported.
+- The shared bounded materialisation store now supports out-of-core affine and
+  MXFP4 conversion from row-bounded SafeTensors or dense GGUF semantic recipes.
+  Independently cached and triple-axis expert loaders do not yet feed their
+  rank-local expert recipes through that store, so those public load requests
+  remain rejected rather than bypassing semantic sharding. Banked sources that
+  cannot express the owned expert and row tile through the storage selection
+  contract also fail during bounded preflight. Checkpoint-native affine, FP8,
+  MXFP4, and registered GGUF layouts remain supported.
 
 TP+PP+EP is executable for DeepSeek-V3/R1, Qwen3-MoE, Qwen3-VL-MoE, Kimi
 Linear, Inkling, GPT-OSS, Gemma 4 MoE, LFM2-MoE, Nemotron-H-MoE, and
@@ -1952,6 +1976,16 @@ config when the model directory has no `config.json`.
 
 ## Checkpoint quantization
 
+For memory-constrained load-time conversion, use the public
+`runtime::checkpoint::bounded_quantization` plan and overlay store described
+under persistent checkpoint storage. Its conversion budget can be set to the
+final quantized model footprint: for example, the deterministic tests convert
+a 2,048-byte F32 matrix under a 320-byte working-set ceiling, equal to that
+matrix's complete affine 4-bit weight, scale, and bias representation. The
+result then enters `ResidencyManager` as a 320-byte unit. Conversion uses a CPU
+stream and clears released MLX allocator cache entries between tiles, so source
+tiles do not accumulate in device or host allocator residency.
+
 The generic checkpoint converter quantizes eligible two-dimensional
 `*.weight` tensors one at a time, writes bounded-size safetensors shards, and
 copies tokenizer and other model assets. Affine output has packed `weight`, `scales`, and
@@ -1988,7 +2022,10 @@ and direct loading use the same numerical transform.
 Direct loading materializes each packed weight/scale/bias triple before reading
 the next dense tensor. This prevents MLX's lazy graphs from retaining the whole
 dense checkpoint during conversion while preserving exact parity with a saved
-quantized checkpoint.
+quantized checkpoint. This older complete-tensor path bounds accumulation
+across the checkpoint but still requires one complete dense matrix; use the
+bounded overlay store when peak load-time memory must fit inside the final
+quantized footprint.
 
 To include direct Q4 conversion in a PersonaPlex load/step benchmark, use the
 dense checkpoint with `--quantize-on-load`:

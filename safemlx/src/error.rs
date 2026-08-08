@@ -160,6 +160,10 @@ cfg_safetensors! {
         /// Error with creating a `safetensors::tensor::TensorView`.
         #[error(transparent)]
         SafeTensorError(#[from] safetensors::tensor::SafeTensorError),
+
+        /// MLX rejected construction of an externally backed array.
+        #[error(transparent)]
+        Exception(#[from] Exception),
     }
 }
 

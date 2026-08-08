@@ -4,6 +4,8 @@
 pub(crate) mod artifact;
 /// Canonical unloaded-module checkpoint binding.
 pub mod binding;
+/// Out-of-core transformation of dense bindings into packed weight stores.
+pub mod bounded_quantization;
 /// GGUF tokenizer metadata conversion.
 pub(crate) mod gguf;
 /// Strict checkpoint loading and validation.

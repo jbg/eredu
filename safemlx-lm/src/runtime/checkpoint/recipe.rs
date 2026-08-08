@@ -289,6 +289,54 @@ impl DerivedWeightRecipe {
         Ok(())
     }
 
+    /// Returns a conservative bound for simultaneously live materialized
+    /// arrays while evaluating this recipe.
+    ///
+    /// The bound includes retained inputs and the operation output. It is
+    /// intentionally conservative for view-like operations so callers can use
+    /// it as a hard admission input for out-of-core transformations without
+    /// relying on MLX aliasing optimizations.
+    pub(crate) fn peak_materialization_bytes(
+        &self,
+        store: &dyn WeightStore,
+    ) -> Result<u64, WeightRecipeError> {
+        let output_bytes = self.infer(store)?.byte_len();
+        match self {
+            Self::Source { .. } => Ok(output_bytes),
+            Self::Select { input, .. }
+            | Self::Reshape { input, .. }
+            | Self::Transpose { input, .. }
+            | Self::Cast { input, .. }
+            | Self::View { input, .. }
+            | Self::NegLog { input }
+            | Self::SubtractOne { input } => {
+                let input_bytes = input.infer(store)?.byte_len();
+                let child_peak = input.peak_materialization_bytes(store)?;
+                Ok(child_peak.max(input_bytes.checked_add(output_bytes).ok_or(
+                    WeightRecipeError::ArithmeticOverflow(
+                        "unary recipe peak materialization bytes",
+                    ),
+                )?))
+            }
+            Self::Concatenate { inputs, .. } | Self::Stack { inputs, .. } => {
+                let mut retained = 0u64;
+                let mut peak = 0u64;
+                for input in inputs {
+                    let child_peak = input.peak_materialization_bytes(store)?;
+                    peak = peak.max(retained.checked_add(child_peak).ok_or(
+                        WeightRecipeError::ArithmeticOverflow("joined recipe child peak bytes"),
+                    )?);
+                    retained = retained.checked_add(input.infer(store)?.byte_len()).ok_or(
+                        WeightRecipeError::ArithmeticOverflow("joined recipe retained input bytes"),
+                    )?;
+                }
+                Ok(peak.max(retained.checked_add(output_bytes).ok_or(
+                    WeightRecipeError::ArithmeticOverflow("joined recipe output peak bytes"),
+                )?))
+            }
+        }
+    }
+
     fn collect_source_keys<'a>(&'a self, keys: &mut BTreeSet<&'a str>) {
         match self {
             Self::Source { key, .. } => {
@@ -397,9 +445,28 @@ impl DerivedWeightRecipe {
         store: &dyn WeightStore,
         source_stream: &Stream,
     ) -> Result<PendingWeightRecipe, WeightRecipeError> {
+        self.prepare_materialization_mode(store, source_stream, false)
+    }
+
+    /// Schedules a recipe whose bounded checkpoint sources may remain borrowed
+    /// until the containing output is evaluated.
+    pub(crate) fn prepare_borrowed_materialization(
+        &self,
+        store: &dyn WeightStore,
+        source_stream: &Stream,
+    ) -> Result<PendingWeightRecipe, WeightRecipeError> {
+        self.prepare_materialization_mode(store, source_stream, true)
+    }
+
+    fn prepare_materialization_mode(
+        &self,
+        store: &dyn WeightStore,
+        source_stream: &Stream,
+        borrow_sources: bool,
+    ) -> Result<PendingWeightRecipe, WeightRecipeError> {
         self.infer(store)?;
         let mut sources = Vec::new();
-        let output = self.materialize_inner(store, source_stream, &mut sources)?;
+        let output = self.materialize_inner(store, source_stream, &mut sources, borrow_sources)?;
         Ok(PendingWeightRecipe { output, sources })
     }
 
@@ -408,6 +475,7 @@ impl DerivedWeightRecipe {
         store: &dyn WeightStore,
         stream: &Stream,
         sources: &mut Vec<PendingWeightMaterialization>,
+        borrow_sources: bool,
     ) -> Result<Array, WeightRecipeError> {
         match self {
             Self::Source { key, selection } => {
@@ -416,13 +484,17 @@ impl DerivedWeightRecipe {
                     selection.clone(),
                     WeightReadPolicy::RequireBounded,
                 )?;
-                let pending = lease.prepare_materialization(stream, stream)?;
+                let pending = if borrow_sources {
+                    lease.prepare_borrowed_materialization(stream)?
+                } else {
+                    lease.prepare_materialization(stream, stream)?
+                };
                 let array = pending.output().clone();
                 sources.push(pending);
                 Ok(array)
             }
             Self::Select { input, selection } => {
-                let array = input.materialize_inner(store, stream, sources)?;
+                let array = input.materialize_inner(store, stream, sources, borrow_sources)?;
                 match selection {
                     TensorSelection::Full => Ok(array),
                     TensorSelection::Range { axis, start, end } => {
@@ -449,7 +521,7 @@ impl DerivedWeightRecipe {
                 }
             }
             Self::Concatenate { axis, inputs } => {
-                let arrays = materialize_inputs(inputs, store, stream, sources)?;
+                let arrays = materialize_inputs(inputs, store, stream, sources, borrow_sources)?;
                 let references = arrays.iter().collect::<Vec<_>>();
                 Ok(concatenate_axis(
                     &references,
@@ -458,7 +530,7 @@ impl DerivedWeightRecipe {
                 )?)
             }
             Self::Stack { axis, inputs } => {
-                let arrays = materialize_inputs(inputs, store, stream, sources)?;
+                let arrays = materialize_inputs(inputs, store, stream, sources, borrow_sources)?;
                 let references = arrays.iter().collect::<Vec<_>>();
                 Ok(stack_axis(
                     &references,
@@ -467,7 +539,7 @@ impl DerivedWeightRecipe {
                 )?)
             }
             Self::Reshape { input, shape } => {
-                let array = input.materialize_inner(store, stream, sources)?;
+                let array = input.materialize_inner(store, stream, sources, borrow_sources)?;
                 let shape = shape
                     .iter()
                     .map(|dimension| usize_to_i32(*dimension, "reshape dimension"))
@@ -475,7 +547,7 @@ impl DerivedWeightRecipe {
                 Ok(array.reshape(&shape, stream)?)
             }
             Self::Transpose { input, axes } => {
-                let array = input.materialize_inner(store, stream, sources)?;
+                let array = input.materialize_inner(store, stream, sources, borrow_sources)?;
                 let axes = axes
                     .iter()
                     .map(|axis| usize_to_i32(*axis, "transpose axis"))
@@ -483,7 +555,7 @@ impl DerivedWeightRecipe {
                 Ok(array.transpose_axes(&axes, stream)?)
             }
             Self::Cast { input, dtype } => {
-                let array = input.materialize_inner(store, stream, sources)?;
+                let array = input.materialize_inner(store, stream, sources, borrow_sources)?;
                 Ok(array.as_dtype(*dtype, stream)?)
             }
             Self::View {
@@ -491,7 +563,7 @@ impl DerivedWeightRecipe {
                 dtype,
                 shape,
             } => {
-                let array = input.materialize_inner(store, stream, sources)?;
+                let array = input.materialize_inner(store, stream, sources, borrow_sources)?;
                 let shape = shape
                     .iter()
                     .map(|dimension| usize_to_i32(*dimension, "view dimension"))
@@ -499,7 +571,7 @@ impl DerivedWeightRecipe {
                 Ok(array.view_dtype(*dtype, stream)?.reshape(&shape, stream)?)
             }
             Self::NegLog { input } => {
-                let array = input.materialize_inner(store, stream, sources)?;
+                let array = input.materialize_inner(store, stream, sources, borrow_sources)?;
                 let all_negative = array
                     .lt(Array::from_f32(0.0), stream)?
                     .all(false, stream)?
@@ -510,7 +582,7 @@ impl DerivedWeightRecipe {
                 Ok(array.multiply(Array::from_f32(-1.0), stream)?.log(stream)?)
             }
             Self::SubtractOne { input } => {
-                let array = input.materialize_inner(store, stream, sources)?;
+                let array = input.materialize_inner(store, stream, sources, borrow_sources)?;
                 Ok(array.subtract(Array::from_f32(1.0), stream)?)
             }
         }
@@ -1020,6 +1092,7 @@ fn materialize_inputs(
     store: &dyn WeightStore,
     stream: &Stream,
     sources: &mut Vec<PendingWeightMaterialization>,
+    borrow_sources: bool,
 ) -> Result<Vec<Array>, WeightRecipeError> {
     let mut pending =
         Vec::<(Array, Vec<PendingWeightMaterialization>)>::with_capacity(inputs.len());
@@ -1027,7 +1100,7 @@ fn materialize_inputs(
     for input in inputs {
         loop {
             let mut input_sources = Vec::new();
-            match input.materialize_inner(store, stream, &mut input_sources) {
+            match input.materialize_inner(store, stream, &mut input_sources, borrow_sources) {
                 Ok(array) => {
                     if detach_remaining && !input_sources.is_empty() {
                         eval([&array])?;
@@ -1039,7 +1112,8 @@ fn materialize_inputs(
                     break;
                 }
                 Err(error)
-                    if !detach_remaining
+                    if !borrow_sources
+                        && !detach_remaining
                         && !pending.is_empty()
                         && matches!(
                             &error,
@@ -1430,6 +1504,30 @@ mod tests {
 
     fn source(key: &str) -> DerivedWeightRecipe {
         DerivedWeightRecipe::source(key, TensorSelection::Full)
+    }
+
+    #[test]
+    fn conservative_peak_counts_retained_inputs_and_outputs() {
+        let (_directory, store) = fixture();
+        let reshape = DerivedWeightRecipe::Reshape {
+            input: Box::new(source("left")),
+            shape: vec![4],
+        };
+        assert_eq!(
+            reshape.peak_materialization_bytes(store.as_ref()).unwrap(),
+            32
+        );
+
+        let concatenate = DerivedWeightRecipe::Concatenate {
+            axis: 0,
+            inputs: vec![source("left"), source("right")],
+        };
+        assert_eq!(
+            concatenate
+                .peak_materialization_bytes(store.as_ref())
+                .unwrap(),
+            64
+        );
     }
 
     #[test]

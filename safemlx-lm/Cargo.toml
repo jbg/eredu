@@ -45,6 +45,7 @@ serde_json = "1"
 minijinja = "2"
 safetensors = "0.8"
 memmap2 = "0.9"
+tempfile.workspace = true
 sha2 = "0.11"
 llguidance = { version = "=1.7.6", default-features = false, features = ["ahash", "lark"] }
 toktrie_hf_tokenizers = "=1.7.6"
@@ -58,4 +59,3 @@ windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
 [dev-dependencies]
 lazy_static = "1"
 safemlx-gguf.workspace = true
-tempfile.workspace = true

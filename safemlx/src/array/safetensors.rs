@@ -42,6 +42,35 @@ impl<'data> TryFrom<TensorView<'data>> for Array {
     }
 }
 
+impl Array {
+    /// Creates a host array that borrows a SafeTensors view without copying.
+    ///
+    /// # Safety
+    ///
+    /// The view's backing bytes must remain valid and immutable until every
+    /// clone of the returned array has been dropped or every dependent graph
+    /// has completed evaluation.
+    pub unsafe fn try_from_borrowed_safetensors(
+        value: TensorView<'_>,
+    ) -> Result<Self, ConversionError> {
+        let dtype = match value.dtype() {
+            safetensors::Dtype::F8_E4M3 => Dtype::Uint8,
+            dtype => dtype.try_into()?,
+        };
+        let shape = value
+            .shape()
+            .iter()
+            .map(|dimension| {
+                i32::try_from(*dimension)
+                    .map_err(|_| crate::error::Exception::custom("shape is too large").into())
+            })
+            .collect::<Result<Vec<_>, ConversionError>>()?;
+        Ok(unsafe {
+            Self::try_from_borrowed_host_data(value.data().as_ptr().cast(), &shape, dtype)?
+        })
+    }
+}
+
 #[cfg(test)]
 pub(crate) fn tensor_view_from_array<'a>(
     value: &'a EvaluatedArray<'a>,
