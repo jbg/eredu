@@ -331,10 +331,10 @@ intervals. JSON callers use `model_args_from_config_value`.
 GPT-OSS pipeline stages support SafeTensors and canonical `gpt-oss` GGUF,
 including TP+PP with tensor-sharded attention and native MXFP4 expert
 intermediates, rank-local KV caches, sharded embedding and output boundaries,
-fully resident or dense disk-streamed local layers, ordinary/paged/persisted
-caches, and rank-synchronized generation. Fully resident stages may
-MXFP4-quantize eligible dense matrices; affine transcoding and streamed
-load-time requantization fail closed.
+fully resident, host-layerwise, or dense disk-streamed local layers,
+ordinary/paged/persisted caches, and rank-synchronized generation. Fully
+resident stages may MXFP4-quantize eligible dense matrices; affine transcoding
+and non-resident load-time requantization fail closed.
 
 ## Gemma 4 and assistant weight residency
 
@@ -384,7 +384,8 @@ prepared once on the ingress stage and relayed as typed immutable auxiliary
 state. TP+PP shards the embedding and tied or untied output boundary, per-layer
 embedding and projection inputs, attention heads, dense or routed
 intermediates, and rank-local publisher caches from the same semantic plan.
-SafeTensors and GGUF stages support fully resident and dense-streamed layers.
+SafeTensors and GGUF stages support fully resident, host-layerwise, and
+dense-streamed layers.
 Image/audio encoder execution is not part of the decoder pipeline API.
 
 ## LFM2/LFM2.5 weight residency
@@ -513,9 +514,9 @@ all four short-convolution histories using the shared heterogeneous-state
 schema. Tensor parallelism covers the text decoder, dMel vocabulary, and hMLP
 folded inputs. Pure text pipeline stages support SafeTensors and canonical
 `inkling` GGUF through the shared KV-plus-fixed-state cache descriptor, with
-fully resident or dense disk-streamed local layers. Image/audio ingress must
-be folded before decoder pipeline execution. Expert parallelism derives sparse
-layers and cache policies from the same schedule.
+fully resident, host-layerwise, or dense disk-streamed local layers. Image/audio
+ingress must be folded before decoder pipeline execution. Expert parallelism
+derives sparse layers and cache policies from the same schedule.
 
 ## Nemotron-H weight residency
 
@@ -934,21 +935,30 @@ payload. Later stages execute only their text-layer ranges.
 `PipelineModel::prefill_pipeline` and `PipelineModel::prefill_cartesian` perform
 typed prefill, after which cached decode, synchronized sampling, cancellation
 consensus, and prompt-cache persistence use the common pipeline APIs.
-Combined pipeline modes accept `DenseDiskStream`. Each cold layer unit is
-built from the same semantic plan as resident execution after composing stage
-placement with its rank-local TP shard or EP expert selection. SafeTensors and
-GGUF reads therefore materialize only the local recipe, while residency and
-checkpoint diagnostics distinguish pinned stage-boundary weights from planned
-cold layer bytes.
+Combined pipeline modes accept `LayerwiseHost` and `DenseDiskStream`. Each
+non-resident layer unit is built from the same semantic plan as resident
+execution after composing stage placement with its rank-local TP shard or EP
+expert selection. `LayerwiseHost` eagerly materializes every rank-local layer
+on the host and promotes a bounded ordered window to the execution device;
+`DenseDiskStream` leaves those units cold behind independent host and device
+caches. SafeTensors and GGUF reads therefore materialize only the local recipe,
+while residency and checkpoint diagnostics distinguish pinned stage-boundary
+weights from planned non-resident layer bytes.
+`PipelineModel::parameter_residency_report` exposes rank-local host/device
+placement, transfer, eviction, and active-window telemetry for either
+non-resident policy; `dense_stream_report` adds disk-stream pass and cache
+statistics only when that policy is active. `PipelineStageInfo` carries the
+same report's global rank and TP/PP/EP coordinates and stage ownership.
 Qwen3-MoE and GPT-OSS also compose all three axes in this runtime. TP
 collectives remain inside the stage and EP coordinate, routed exchange remains
 inside the stage and TP coordinate, and pipeline transport connects equal
 TP/EP coordinates.
 The triple-axis path supports arbitrary valid Cartesian degrees on native
 subgroup backends and uses topology-planned neighbor routes for stage-local
-Ring fallback collectives. Fully resident and dense-disk-streamed SafeTensors
-and canonical `qwen3moe` or type-39 `gpt-oss` GGUF checkpoints share the same
-layer recipes, cache identity, synchronized generation, and failure consensus.
+Ring fallback collectives. Fully resident, host-layerwise, and
+dense-disk-streamed SafeTensors and canonical `qwen3moe` or type-39 `gpt-oss`
+GGUF checkpoints share the same layer recipes, cache identity, synchronized
+generation, and failure consensus.
 The same independent expert cache works with PP and TP+PP when EP is inactive,
 and with PP+EP or TP+PP+EP when EP is active.
 In that geometry every stage owns all routed experts for its local layers; TP
@@ -972,8 +982,9 @@ loader.
 This table is the persistent source of truth for family migration status. A
 family is **complete** only when every applicable pairwise topology and the
 generic TP+PP+EP path support prefill, cached decode, synchronized generation,
-prompt-cache persistence, resident parameters, dense-streamed non-experts, and
-independently cached experts in both registered checkpoint formats. **Pairwise**
+prompt-cache persistence, resident, host-layerwise, and dense-streamed
+non-experts, plus independently cached experts in both registered checkpoint
+formats. **Pairwise**
 means the constituent two-axis modes work but the family has not yet crossed
 that complete triple-axis/cache boundary. Dense families have no EP migration.
 
@@ -999,8 +1010,6 @@ that complete triple-axis/cache boundary. Dense families have no EP migration.
 
 The remaining global limitations are:
 
-- Pipeline `LayerwiseHost` residency for non-expert decoder layers is not
-  implemented; fully resident and dense disk streaming are supported.
 - Load-time expert requantization is rejected for independently cached or
   triple-axis experts because it would bypass their semantic sharding recipes.
   Checkpoint-native affine, FP8, MXFP4, and registered GGUF layouts remain
@@ -1046,8 +1055,9 @@ Kimi Linear, Nemotron-H/Nemotron-H-MoE, and text-only Qwen3-Next/Qwen3.5 also
 use the generalized pipeline runtime for SafeTensors and canonical GGUF. KDA,
 Mamba2, and linear-attention state is represented by semantic fixed slots; MLA
 and full/sliding attention use the shared compressed or KV cache. These
-families support fully resident and dense disk-streamed local stages, ordinary
-and paged live caches, persisted prompt caches, and synchronized generation.
+families support fully resident, host-layerwise, and dense disk-streamed local
+stages, ordinary and paged live caches, persisted prompt caches, and
+synchronized generation.
 
 GPT-OSS SafeTensors and GGUF stages use its canonical split/fused expert binding
 recipes; TP+PP partitions GQA heads and 32-channel-aligned packed expert
@@ -1057,8 +1067,8 @@ MXFP4 on load. Qwen3 MoE likewise uses the shared dense-Qwen stage and canonical
 expert binding recipes rather than a separate pipeline implementation.
 
 LFM2 and LFM2-MoE stages accept exact SafeTensors catalogs and canonical
-`lfm2`/`lfm2moe` GGUF checkpoints. Fully resident and dense disk-streamed
-stages use the shared LFM2 binding plan. Causal-convolution histories are
+`lfm2`/`lfm2moe` GGUF checkpoints. Fully resident, host-layerwise, and dense
+disk-streamed stages use the shared LFM2 binding plan. Causal-convolution histories are
 materialized as descriptor-backed state slots, full-attention layers use the
 same ordinary or paged KV implementation as other decoders, and paged prompt
 publication saves both representations atomically. A stage containing only

@@ -144,8 +144,8 @@ auxiliary state, and supports exact SafeTensors and `gemma4` GGUF checkpoints.
 Shared-KV publisher/consumer groups are never split across stages.
 Fully resident Gemma text stages can apply load-time affine or MXFP4
 quantization through the same direct and derived binding plan used for
-checkpoint validation; dense disk-streamed stages require a matching
-checkpoint-native packed encoding.
+checkpoint validation; host-layerwise and dense disk-streamed stages require a
+matching checkpoint-native packed encoding.
 Qwen2/Qwen3/Qwen3-MoE and GPT-OSS use that same adapter-driven pipeline runtime
 for SafeTensors and canonical `qwen2`/`qwen3`/`qwen3moe`/`gpt-oss` GGUF
 checkpoints. Qwen stages preserve biased Q/K/V projections or Q/K
@@ -154,10 +154,12 @@ per-layer full/sliding schedule. GPT-OSS stages retain native MXFP4 experts and
 their alternating or explicit attention schedule.
 Fully resident Qwen stages support aligned affine or MXFP4 requantization;
 GPT-OSS can MXFP4-quantize eligible dense matrices without transcoding its
-expert banks. Dense disk streaming requires checkpoint-native encodings.
+expert banks. Host-layerwise and dense disk streaming require checkpoint-native
+encodings.
 Qwen3-MoE and GPT-OSS additionally support arbitrary-geometry TP+PP+EP through
-the same Cartesian topology and semantic layer plan for fully resident or
-dense-streamed SafeTensors and their canonical GGUF checkpoints. Their
+the same Cartesian topology and semantic layer plan for fully resident,
+host-layerwise, or dense-streamed SafeTensors and their canonical GGUF
+checkpoints. Their
 independent expert caches compose with PP, TP+PP, PP+EP, and TP+PP+EP; without
 EP, each stage owns the experts for its local layers and TP ranks retain only
 their semantic projection shards.
@@ -166,19 +168,21 @@ LFM2 and LFM2-MoE use the same runtime for SafeTensors and canonical
 full-attention layers materialize semantic state slots from the canonical
 cache schedule: convolution histories remain fixed state, attention uses the
 shared ordinary or paged KV contract, and both are atomically persisted and
-restored without an LFM2-specific pipeline cache variant. Fully resident and
-dense disk-streamed local layers share the bounded LFM2 binding plan.
+restored without an LFM2-specific pipeline cache variant. Fully resident,
+host-layerwise, and dense disk-streamed local layers share the bounded LFM2
+binding plan.
 Kimi Linear, Nemotron-H/Nemotron-H-MoE, Qwen3-Next/Qwen3.5, and text-only
 Inkling stages use that same adapter-driven pipeline runtime for
 SafeTensors and their canonical GGUF architectures. KDA, Mamba2, and linear
 attention expose borrowed semantic state to the runtime; MLA and KV storage
 remain the shared compressed/paged implementations. Inkling's KV and four
 short-convolution histories exercise the combined `KeyValueWithFixedState`
-layout without introducing a family cache variant. Fully resident and dense
-disk-streamed stages share each family's bounded binding plan.
+layout without introducing a family cache variant. Fully resident,
+host-layerwise, and dense disk-streamed stages share each family's bounded
+binding plan.
 The pipeline runtime stores one type-erased stage shell and derives ordinary,
 paged, and persisted cache state from its canonical semantic layer schedule.
-All decoder families use the same resident/dense-stream layer executor and the
+All decoder families use the same resident/non-resident layer executor and the
 same architecture-adapter binding plan; family payloads provide only math,
 auxiliary state, and identity. Static bindings are selected lazily by stage
 role, so loading does not build a duplicate source stage or open unowned

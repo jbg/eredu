@@ -34,12 +34,13 @@ use safemlx_lm::{
     runtime::generation::sampler::DefaultSampler,
     runtime::{
         checkpoint::binding::canonical_checkpoint_name,
+        residency::policy::OffloadConfig,
         scheduler::{RequestId, RequestStatus, SchedulerLimits},
     },
     CacheResidencyPolicy, CartesianExecution, DenseDiskStreamLoadOptions, DeviceAssignment,
-    ExpertCacheLoadOptions, ModelLoadOptions, NonExpertWeightResidency, PagedCacheOptions,
-    ParallelTopology, PromptCacheDescriptor, PromptCacheOptions, PromptCacheTopology,
-    WeightResidency,
+    ExpertCacheLoadOptions, LayerwiseLoadOptions, ModelLoadOptions, NonExpertWeightResidency,
+    PagedCacheOptions, ParallelTopology, PromptCacheDescriptor, PromptCacheOptions,
+    PromptCacheTopology, WeightResidency,
 };
 use safetensors::tensor::{serialize_to_file, Dtype, TensorView};
 
@@ -47,6 +48,7 @@ const WORKER_RANK: &str = "SAFEMLX_LM_PIPELINE_RING_WORKER";
 const CHECKPOINT_DIR: &str = "SAFEMLX_LM_PIPELINE_CHECKPOINT";
 const FIXTURE_FAMILY: &str = "SAFEMLX_LM_PIPELINE_FIXTURE_FAMILY";
 const DENSE_STREAM: &str = "SAFEMLX_LM_PIPELINE_DENSE_STREAM";
+const LAYERWISE_HOST: &str = "SAFEMLX_LM_PIPELINE_LAYERWISE_HOST";
 const PROMPT_CACHE_ROOT: &str = "SAFEMLX_LM_PIPELINE_PROMPT_CACHE";
 const MICROBATCH: &str = "SAFEMLX_LM_PIPELINE_MICROBATCH";
 const SCHEDULE_MISMATCH: &str = "SAFEMLX_LM_PIPELINE_SCHEDULE_MISMATCH";
@@ -291,12 +293,18 @@ fn pipeline_ring_worker() {
             || matches!(family, FixtureFamily::Lfm2 | FixtureFamily::Lfm2Moe)))
     .then(|| resident_reference(&checkpoint, &stream));
     let dense_stream = std::env::var_os(DENSE_STREAM).is_some();
+    let layerwise_host = std::env::var_os(LAYERWISE_HOST).is_some();
+    assert!(!(dense_stream && layerwise_host));
     let expert_cache = std::env::var_os(EXPERT_CACHE).is_some();
+    let layerwise_options =
+        || LayerwiseLoadOptions::new(OffloadConfig::new(None, None, 1).unwrap());
     let mut model = if expert_cache {
         let non_experts = if dense_stream {
             NonExpertWeightResidency::DenseDiskStream(
                 DenseDiskStreamLoadOptions::new(u64::MAX, u64::MAX, 1, 1, 1).unwrap(),
             )
+        } else if layerwise_host {
+            NonExpertWeightResidency::LayerwiseHost(layerwise_options())
         } else {
             NonExpertWeightResidency::FullyResident
         };
@@ -305,6 +313,15 @@ fn pipeline_ring_worker() {
             ModelLoadOptions::with_parallel(topology).with_weight_residency(
                 WeightResidency::with_expert_cache(non_experts, ExpertCacheLoadOptions::default()),
             ),
+            &stream,
+            &stream,
+        )
+        .unwrap()
+    } else if layerwise_host {
+        load_pipeline_model_with_options(
+            &checkpoint,
+            ModelLoadOptions::with_parallel(topology)
+                .with_weight_residency(WeightResidency::layerwise_host(layerwise_options())),
             &stream,
             &stream,
         )
@@ -331,7 +348,7 @@ fn pipeline_ring_worker() {
             info.owned_tensors.iter().any(|name| expected_range
                 .clone()
                 .any(|layer| name.starts_with(&format!("{prefix}{layer}.")))),
-            !dense_stream
+            !dense_stream && !layerwise_host
         );
         assert!(!info.owned_tensors.iter().any(|name| {
             (0..family.layer_count()).any(|layer| {
@@ -388,6 +405,26 @@ fn pipeline_ring_worker() {
             assert!(
                 diagnostics.physical_read_bytes < global_payload,
                 "rank {expected_rank} read {} GGUF bytes while loading static modules from a {global_payload}-byte global tensor payload",
+                diagnostics.physical_read_bytes
+            );
+        }
+    }
+    if layerwise_host {
+        assert!(model.dense_stream_report().unwrap().is_none());
+        let report = model.parameter_residency_report().unwrap().unwrap();
+        assert!(report.initialized());
+        assert_eq!(report.units().len(), expected_range.len());
+        assert!(report
+            .units()
+            .iter()
+            .all(|unit| unit.host_resident() && !unit.device_resident()));
+        if family.has_gguf_source() {
+            let diagnostics = model.checkpoint_diagnostics().unwrap().unwrap();
+            let global_payload = std::fs::metadata(&checkpoint).unwrap().len();
+            assert!(diagnostics.physical_reads > 0);
+            assert!(
+                diagnostics.physical_read_bytes < global_payload,
+                "rank {expected_rank} read {} GGUF bytes while loading a host-layerwise stage from a {global_payload}-byte global tensor payload",
                 diagnostics.physical_read_bytes
             );
         }
@@ -561,6 +598,18 @@ fn pipeline_ring_worker() {
         let report = model.dense_stream_report().unwrap().unwrap();
         assert!(report.prefill_forwards() >= 1);
         assert!(report.decode_forwards() >= 2);
+    }
+    if layerwise_host {
+        let report = model.parameter_residency_report().unwrap().unwrap();
+        assert!(report.units().iter().all(|unit| unit.host_resident()));
+        assert!(
+            report
+                .units()
+                .iter()
+                .filter(|unit| unit.device_resident())
+                .count()
+                <= 1
+        );
     }
     if expert_cache {
         let report = model.expert_cache_report().unwrap().unwrap();
@@ -2716,6 +2765,18 @@ fn ring_two_process_dense_stream_pipeline() {
     run_ring_pipeline(true, FixtureFamily::Llama);
 }
 
+/// Verifies host-resident stage layers and bounded device promotion compose
+/// with TP-sharded attention, cache state, and pipeline transport.
+#[test]
+#[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
+fn ring_four_process_qwen3_layerwise_host_tensor_pipeline() {
+    run_ring_layerwise_host_cartesian_pipeline_mode(
+        FixtureFamily::Qwen3,
+        "tp-pp",
+        WorkerMode::Standard,
+    );
+}
+
 /// Verifies DeepSeek MLA paged-prefix persistence across two pipeline stages.
 #[test]
 #[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
@@ -2791,6 +2852,18 @@ fn ring_eight_process_gpt_oss_triple_axis() {
 fn ring_eight_process_gpt_oss_streamed_triple_axis_expert_cache() {
     run_ring_cartesian_pipeline_mode(
         true,
+        FixtureFamily::GptOss,
+        "tp-pp-ep",
+        WorkerMode::ExpertCache,
+    );
+}
+
+/// Exercises GPT-OSS host-backed non-expert layers with independent expert
+/// caching across TP=2 x PP=2 x EP=2.
+#[test]
+#[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
+fn ring_eight_process_gpt_oss_layerwise_host_triple_axis_expert_cache() {
+    run_ring_layerwise_host_cartesian_pipeline_mode(
         FixtureFamily::GptOss,
         "tp-pp-ep",
         WorkerMode::ExpertCache,
@@ -3036,6 +3109,30 @@ fn ring_qwen3_moe_streamed_tensor_pipeline_expert_cache() {
     );
 }
 
+/// Exercises host-backed non-expert layers, bounded device windows, and
+/// independent expert caching for Qwen3-MoE across all three axes.
+#[test]
+#[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
+fn ring_qwen3_moe_layerwise_host_tensor_pipeline_expert_cache() {
+    run_ring_layerwise_host_cartesian_pipeline_mode(
+        FixtureFamily::Qwen3Moe,
+        "tp-pp-ep",
+        WorkerMode::ExpertCache,
+    );
+}
+
+/// Proves the same host-layerwise path reads canonical GGUF and preserves
+/// stage-local ownership in a PP=2 x EP=2 topology.
+#[test]
+#[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
+fn ring_qwen3_moe_gguf_layerwise_host_pipeline_expert_cache() {
+    run_ring_layerwise_host_cartesian_pipeline_mode(
+        FixtureFamily::Qwen3MoeGguf,
+        "pp-ep",
+        WorkerMode::ExpertCache,
+    );
+}
+
 /// Exercises stage-local cached expert selections and bounded reads from GGUF.
 #[test]
 #[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
@@ -3215,7 +3312,37 @@ fn run_ring_cartesian_pipeline_mode(
         checkpoint.path().to_path_buf()
     };
     run_ring_pipeline_processes(
-        dense_stream,
+        WorkerResidency::from_dense_stream(dense_stream),
+        family,
+        mode,
+        checkpoint,
+        checkpoint_path,
+        Some(axes),
+    );
+}
+
+fn run_ring_layerwise_host_cartesian_pipeline_mode(
+    family: FixtureFamily,
+    axes: &'static str,
+    mode: WorkerMode,
+) {
+    assert!(distributed::is_available(Backend::Ring));
+    let checkpoint = tempfile::tempdir().unwrap();
+    let checkpoint_path = if family == FixtureFamily::Qwen3MoeGguf {
+        let path = checkpoint.path().join("model.gguf");
+        write_qwen3_moe_gguf_fixture(&path);
+        path
+    } else {
+        match family {
+            FixtureFamily::Qwen3 => write_qwen_fixture(checkpoint.path(), "qwen3"),
+            FixtureFamily::Qwen3Moe => write_qwen_fixture(checkpoint.path(), "qwen3_moe"),
+            FixtureFamily::GptOss => write_gpt_oss_fixture(checkpoint.path()),
+            _ => panic!("host-layerwise Cartesian helper received unsupported {family:?}"),
+        }
+        checkpoint.path().to_path_buf()
+    };
+    run_ring_pipeline_processes(
+        WorkerResidency::LayerwiseHost,
         family,
         mode,
         checkpoint,
@@ -3231,6 +3358,23 @@ enum WorkerMode {
     ExpertCacheScheduleMismatch,
     Microbatch,
     ScheduleMismatch,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum WorkerResidency {
+    FullyResident,
+    LayerwiseHost,
+    DenseDiskStream,
+}
+
+impl WorkerResidency {
+    const fn from_dense_stream(enabled: bool) -> Self {
+        if enabled {
+            Self::DenseDiskStream
+        } else {
+            Self::FullyResident
+        }
+    }
 }
 
 fn run_ring_pipeline_mode(dense_stream: bool, family: FixtureFamily, mode: WorkerMode) {
@@ -3285,7 +3429,7 @@ fn run_ring_pipeline_mode(dense_stream: bool, family: FixtureFamily, mode: Worke
         checkpoint.path().to_path_buf()
     };
     run_ring_pipeline_processes(
-        dense_stream,
+        WorkerResidency::from_dense_stream(dense_stream),
         family,
         mode,
         checkpoint,
@@ -3295,7 +3439,7 @@ fn run_ring_pipeline_mode(dense_stream: bool, family: FixtureFamily, mode: Worke
 }
 
 fn run_ring_pipeline_processes(
-    dense_stream: bool,
+    residency: WorkerResidency,
     family: FixtureFamily,
     mode: WorkerMode,
     _checkpoint: tempfile::TempDir,
@@ -3339,8 +3483,14 @@ fn run_ring_pipeline_processes(
         if let Some(axes) = cartesian_axes {
             command.env(CARTESIAN_AXES, axes);
         }
-        if dense_stream {
-            command.env(DENSE_STREAM, "1");
+        match residency {
+            WorkerResidency::FullyResident => {}
+            WorkerResidency::LayerwiseHost => {
+                command.env(LAYERWISE_HOST, "1");
+            }
+            WorkerResidency::DenseDiskStream => {
+                command.env(DENSE_STREAM, "1");
+            }
         }
         match mode {
             WorkerMode::Standard => {}

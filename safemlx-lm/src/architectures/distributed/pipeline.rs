@@ -81,14 +81,16 @@ use crate::{
     runtime::execution::inspection::ActivationObserver,
     runtime::execution::layerwise::{
         open_safetensors_weight_store, shard_layer_bindings, ArchitectureAdapter,
-        DenseDiskStreamReport, DenseStreamController, LayerWeightResidency, SharedWeightStore,
-        StaticUnitBindings,
+        DenseDiskStreamReport, DenseStreamController, LayerWeightResidency, LayerwiseLoadOptions,
+        SharedWeightStore, StaticUnitBindings,
     },
     runtime::generation::sampler::Sampler,
     runtime::residency::expert_cache::{
         ExpertCache, ExpertCacheLoadOptions, ExpertCacheReport, ExpertPass,
     },
-    runtime::residency::manager::{OffloadUnit, ResidencyManager},
+    runtime::residency::manager::{
+        OffloadUnit, ResidencyManager, ResidencyReport, ResidentLayerGroup,
+    },
     runtime::residency::policy::{
         MemoryTier, OffloadConfig, OffloadPlan, OffloadUnitId, OffloadUnitSpec, ResidencyPolicy,
     },
@@ -138,10 +140,11 @@ pub struct PipelineStageInfo {
     pub owned_tensors: Vec<String>,
     /// Parameter bytes materialized while loading this stage.
     ///
-    /// For dense disk streaming this contains only pinned static weights;
-    /// cold layer bytes are included in `planned_owned_parameter_bytes`.
+    /// For host-layerwise or dense-disk execution this contains only pinned
+    /// static weights; non-resident layer bytes are included in
+    /// `planned_owned_parameter_bytes`.
     pub local_parameter_bytes: usize,
-    /// Total logical bytes owned by this stage, including cold streamed layers.
+    /// Total logical bytes owned by this stage, including non-resident layers.
     pub planned_owned_parameter_bytes: u64,
     /// Payload shards actually opened for this rank.
     pub opened_checkpoint_shards: Vec<PathBuf>,
@@ -881,7 +884,7 @@ struct LlamaStage {
     embedding: Option<MaybeQuantized<nn::Embedding>>,
     output_embedding: Option<MaybeQuantized<nn::Embedding>>,
     layers: Vec<llama::TransformerBlock>,
-    dense_layers: Option<PipelineDenseLayers>,
+    dense_layers: Option<PipelineLayerStorage>,
     norm: Option<nn::RmsNorm>,
     lm_head: Option<MaybeQuantized<nn::Linear>>,
     parallel_embedding: Option<crate::nn::parallel::VocabParallelEmbedding>,
@@ -897,7 +900,7 @@ struct DeepSeekStage {
     range: Range<usize>,
     embedding: Option<MaybeQuantized<nn::Embedding>>,
     layers: Vec<deepseek_v3::DecoderLayer>,
-    dense_layers: Option<PipelineDenseLayers>,
+    dense_layers: Option<PipelineLayerStorage>,
     norm: Option<nn::RmsNorm>,
     lm_head: Option<MaybeQuantized<nn::Linear>>,
     parallel_embedding: Option<crate::nn::parallel::VocabParallelEmbedding>,
@@ -917,7 +920,7 @@ struct GemmaStage {
     per_layer_projection: Option<MaybeQuantized<nn::Linear>>,
     per_layer_norm: Option<nn::RmsNorm>,
     layers: Vec<gemma4::TransformerBlock>,
-    dense_layers: Option<PipelineDenseLayers>,
+    dense_layers: Option<PipelineLayerStorage>,
     norm: Option<nn::RmsNorm>,
     lm_head: Option<MaybeQuantized<nn::Linear>>,
     parallel_embedding: Option<gemma4::Gemma4Embedding>,
@@ -937,7 +940,7 @@ struct DenseQwenStage {
     embedding: Option<MaybeQuantized<nn::Embedding>>,
     output_embedding: Option<MaybeQuantized<nn::Embedding>>,
     layers: Vec<dense_qwen::TransformerBlock>,
-    dense_layers: Option<PipelineDenseLayers>,
+    dense_layers: Option<PipelineLayerStorage>,
     norm: Option<nn::RmsNorm>,
     lm_head: Option<MaybeQuantized<nn::Linear>>,
     parallel_embedding: Option<crate::nn::parallel::VocabParallelEmbedding>,
@@ -955,7 +958,7 @@ struct Qwen3VlStage {
     range: Range<usize>,
     vision_layers: Vec<Qwen3VlLayer>,
     layers: Vec<Qwen3VlLayer>,
-    dense_layers: Option<PipelineDenseLayers>,
+    dense_layers: Option<PipelineLayerStorage>,
     output_embedding: Option<MaybeQuantized<nn::Embedding>>,
     parallel_output_embedding: Option<crate::nn::parallel::VocabParallelEmbedding>,
     parallel_layout: Option<crate::runtime::distributed::parallel::LocalModelLayout>,
@@ -969,7 +972,7 @@ struct GptOssStage {
     range: Range<usize>,
     embedding: Option<MaybeQuantized<nn::Embedding>>,
     layers: Vec<gpt_oss::TransformerBlock>,
-    dense_layers: Option<PipelineDenseLayers>,
+    dense_layers: Option<PipelineLayerStorage>,
     norm: Option<nn::RmsNorm>,
     lm_head: Option<MaybeQuantized<nn::Linear>>,
     parallel_embedding: Option<crate::nn::parallel::VocabParallelEmbedding>,
@@ -988,7 +991,7 @@ struct Lfm2Stage {
     embedding: Option<MaybeQuantized<nn::Embedding>>,
     output_embedding: Option<MaybeQuantized<nn::Embedding>>,
     layers: Vec<lfm2::DecoderLayer>,
-    dense_layers: Option<PipelineDenseLayers>,
+    dense_layers: Option<PipelineLayerStorage>,
     norm: Option<nn::RmsNorm>,
     lm_head: Option<MaybeQuantized<nn::Linear>>,
     parallel_embedding: Option<crate::nn::parallel::VocabParallelEmbedding>,
@@ -1007,7 +1010,7 @@ struct NemotronHStage {
     embedding: Option<MaybeQuantized<nn::Embedding>>,
     output_embedding: Option<MaybeQuantized<nn::Embedding>>,
     layers: Vec<nemotron_h::TransformerBlock>,
-    dense_layers: Option<PipelineDenseLayers>,
+    dense_layers: Option<PipelineLayerStorage>,
     norm: Option<nn::RmsNorm>,
     lm_head: Option<MaybeQuantized<nn::Linear>>,
     parallel_embedding: Option<crate::nn::parallel::VocabParallelEmbedding>,
@@ -1026,7 +1029,7 @@ struct QwenHybridStage {
     embedding: Option<MaybeQuantized<nn::Embedding>>,
     output_embedding: Option<MaybeQuantized<nn::Embedding>>,
     layers: Vec<qwen_hybrid::TransformerBlock>,
-    dense_layers: Option<PipelineDenseLayers>,
+    dense_layers: Option<PipelineLayerStorage>,
     norm: Option<qwen_hybrid::Qwen3NextRmsNorm>,
     lm_head: Option<MaybeQuantized<nn::Linear>>,
     parallel_embedding: Option<crate::nn::parallel::VocabParallelEmbedding>,
@@ -1045,7 +1048,7 @@ struct KimiLinearStage {
     embedding: Option<MaybeQuantized<nn::Embedding>>,
     output_embedding: Option<MaybeQuantized<nn::Embedding>>,
     layers: Vec<kimi_linear::DecoderLayer>,
-    dense_layers: Option<PipelineDenseLayers>,
+    dense_layers: Option<PipelineLayerStorage>,
     norm: Option<nn::RmsNorm>,
     lm_head: Option<MaybeQuantized<nn::Linear>>,
     parallel_embedding: Option<crate::nn::parallel::VocabParallelEmbedding>,
@@ -1064,7 +1067,7 @@ struct InklingStage {
     embedding: Option<MaybeQuantized<nn::Embedding>>,
     embed_norm: Option<nn::RmsNorm>,
     layers: Vec<inkling::DecoderLayer>,
-    dense_layers: Option<PipelineDenseLayers>,
+    dense_layers: Option<PipelineLayerStorage>,
     norm: Option<nn::RmsNorm>,
     lm_head: Option<MaybeQuantized<nn::Linear>>,
     parallel_embedding: Option<crate::nn::parallel::VocabParallelEmbedding>,
@@ -1086,8 +1089,10 @@ trait PipelineStageAdapter {
     /// Returns immutable auxiliary tensor shapes in wire order for one step.
     fn auxiliary_shapes(&self, step: PipelineStep) -> Vec<Vec<i32>>;
 
-    /// Returns dense-stream observations when this stage uses bounded loading.
+    /// Returns disk-stream observations when this stage uses bounded disk loading.
     fn dense_stream_report(&self) -> Result<Option<DenseDiskStreamReport>, Error>;
+    /// Returns non-resident layer placement telemetry for host or disk-backed stages.
+    fn parameter_residency_report(&self) -> Result<Option<ResidencyReport>, Error>;
     fn checkpoint_diagnostics(&self) -> Result<Option<WeightStoreDiagnostics>, Error>;
     fn expert_cache_report(&self) -> Result<Option<ExpertCacheReport>, Error>;
 
@@ -1136,7 +1141,7 @@ trait PipelineStageAdapter {
 trait PipelineStageSemantics {
     fn model_kind(&self) -> ModelKind;
     fn auxiliary_shapes(&self, step: PipelineStep) -> Vec<Vec<i32>>;
-    fn dense_layers(&self) -> Option<&PipelineDenseLayers>;
+    fn dense_layers(&self) -> Option<&PipelineLayerStorage>;
     fn expert_cache(&self) -> Option<&ExpertCache> {
         None
     }
@@ -1209,7 +1214,15 @@ impl<S: PipelineStageSemantics> PipelineStageAdapter for PipelineStage<S> {
     fn dense_stream_report(&self) -> Result<Option<DenseDiskStreamReport>, Error> {
         self.0
             .dense_layers()
-            .map(PipelineDenseLayers::report)
+            .map(PipelineLayerStorage::dense_stream_report)
+            .transpose()
+            .map(Option::flatten)
+    }
+
+    fn parameter_residency_report(&self) -> Result<Option<ResidencyReport>, Error> {
+        self.0
+            .dense_layers()
+            .map(PipelineLayerStorage::residency_report)
             .transpose()
     }
 
@@ -1217,7 +1230,7 @@ impl<S: PipelineStageSemantics> PipelineStageAdapter for PipelineStage<S> {
         if let Some(diagnostics) = self
             .0
             .dense_layers()
-            .map(PipelineDenseLayers::checkpoint_diagnostics)
+            .map(PipelineLayerStorage::checkpoint_diagnostics)
             .transpose()?
         {
             return Ok(Some(diagnostics));
@@ -1289,15 +1302,28 @@ impl<S: PipelineStageSemantics> PipelineStageAdapter for PipelineStage<S> {
     }
 }
 
-struct PipelineDenseLayers {
-    store: SharedWeightStore,
-    residency: ResidencyManager,
-    controller: DenseStreamController,
-    units: Vec<OffloadUnitId>,
-    independent_experts: bool,
+#[derive(Debug, Clone, Copy)]
+enum PipelineLayerLoadOptions {
+    LayerwiseHost(LayerwiseLoadOptions),
+    DenseDiskStream(crate::runtime::residency::dense_stream::DenseDiskStreamLoadOptions),
 }
 
-impl PipelineDenseLayers {
+enum PipelineLayerController {
+    LayerwiseHost(ResidentLayerGroup),
+    DenseDiskStream(Box<DenseStreamController>),
+}
+
+struct PipelineLayerStorage {
+    store: SharedWeightStore,
+    residency: ResidencyManager,
+    controller: PipelineLayerController,
+    units: Vec<OffloadUnitId>,
+    independent_experts: bool,
+    sample_mlx_memory: bool,
+    sample_process_memory: bool,
+}
+
+impl PipelineLayerStorage {
     fn with_independent_experts(mut self) -> Self {
         self.independent_experts = true;
         self
@@ -1313,17 +1339,71 @@ impl PipelineDenseLayers {
         ),
         Error,
     > {
-        self.controller.prepare(
-            &self.residency,
-            "pipeline_stage",
-            &self.units,
-            local_index,
-            prefill,
-        )
+        match &self.controller {
+            PipelineLayerController::LayerwiseHost(group) => {
+                group.prepare(&self.residency, local_index)?;
+                Ok((
+                    None,
+                    self.residency
+                        .acquire(&self.units[local_index], MemoryTier::Device)?,
+                ))
+            }
+            PipelineLayerController::DenseDiskStream(controller) => controller.prepare(
+                &self.residency,
+                "pipeline_stage",
+                &self.units,
+                local_index,
+                prefill,
+            ),
+        }
     }
 
-    fn report(&self) -> Result<DenseDiskStreamReport, Error> {
-        self.controller.report(&self.residency)
+    fn trim_after(&self, local_index: usize) -> Result<(), Error> {
+        if let PipelineLayerController::LayerwiseHost(group) = &self.controller {
+            let end = local_index
+                .saturating_add(group.depth())
+                .min(self.units.len());
+            group.trim_to(&self.residency, &self.units[local_index..end])?;
+        }
+        Ok(())
+    }
+
+    fn complete_forward(&self) -> Result<(), Error> {
+        if matches!(&self.controller, PipelineLayerController::LayerwiseHost(_))
+            && (self.sample_mlx_memory || self.sample_process_memory)
+        {
+            self.residency
+                .sample_memory(self.sample_mlx_memory, self.sample_process_memory)?;
+        }
+        Ok(())
+    }
+
+    fn dense_stream_report(&self) -> Result<Option<DenseDiskStreamReport>, Error> {
+        match &self.controller {
+            PipelineLayerController::LayerwiseHost(_) => Ok(None),
+            PipelineLayerController::DenseDiskStream(controller) => {
+                Ok(Some(controller.report(&self.residency)?))
+            }
+        }
+    }
+
+    fn residency_report(&self) -> Result<ResidencyReport, Error> {
+        Ok(self.residency.report()?)
+    }
+
+    fn planned_layer_bytes(&self) -> Result<u64, Error> {
+        match &self.controller {
+            PipelineLayerController::LayerwiseHost(_) => self
+                .residency
+                .report()?
+                .units()
+                .iter()
+                .try_fold(0u64, |total, unit| total.checked_add(unit.expected_bytes()))
+                .ok_or_else(|| Error::Parallel("pipeline layer byte total overflowed".into())),
+            PipelineLayerController::DenseDiskStream(controller) => {
+                Ok(controller.report(&self.residency)?.planned_layer_bytes())
+            }
+        }
     }
 
     fn checkpoint_diagnostics(&self) -> Result<WeightStoreDiagnostics, Error> {
@@ -1362,7 +1442,7 @@ impl IntoPipelineLayerForward for PipelineLayerForward {
 struct PipelineLayerExecution<'a, L> {
     range: Range<usize>,
     resident_layers: &'a mut [L],
-    dense_layers: Option<&'a PipelineDenseLayers>,
+    dense_layers: Option<&'a PipelineLayerStorage>,
     step: PipelineStep,
     caches: &'a mut [PipelineLayerCache],
     hidden: Array,
@@ -1401,12 +1481,18 @@ where
     }
     let prefill = step.sequence_length > 1;
     let forward_guard = dense_layers
-        .map(|dense| dense.controller.forward_guard(prefill, &dense.residency))
+        .and_then(|layers| match &layers.controller {
+            PipelineLayerController::LayerwiseHost(_) => None,
+            PipelineLayerController::DenseDiskStream(controller) => {
+                Some(controller.forward_guard(prefill, &layers.residency))
+            }
+        })
         .transpose()?;
-    let group_guard = dense_layers.map(|dense| {
-        dense
-            .controller
-            .group_guard(&dense.residency, "pipeline_stage")
+    let group_guard = dense_layers.and_then(|layers| match &layers.controller {
+        PipelineLayerController::LayerwiseHost(_) => None,
+        PipelineLayerController::DenseDiskStream(controller) => {
+            Some(controller.group_guard(&layers.residency, "pipeline_stage"))
+        }
     });
     for (local_index, (global_layer, cache)) in range.zip(caches.iter_mut()).enumerate() {
         if let Some(dense) = dense_layers {
@@ -1430,6 +1516,7 @@ where
                     .chain(forwarded.retained.iter()),
             )?;
             stream.synchronize()?;
+            dense.trim_after(local_index)?;
         } else {
             hidden = forward_layer(
                 global_layer,
@@ -1441,6 +1528,9 @@ where
             .into_pipeline_layer_forward()
             .hidden;
         }
+    }
+    if let Some(layers) = dense_layers {
+        layers.complete_forward()?;
     }
     if let Some(guard) = group_guard {
         guard.complete()?;
@@ -1705,7 +1795,7 @@ impl PipelineStageSemantics for LlamaStage {
         Vec::new()
     }
 
-    fn dense_layers(&self) -> Option<&PipelineDenseLayers> {
+    fn dense_layers(&self) -> Option<&PipelineLayerStorage> {
         self.dense_layers.as_ref()
     }
 
@@ -1799,7 +1889,7 @@ impl PipelineStageSemantics for DeepSeekStage {
         Vec::new()
     }
 
-    fn dense_layers(&self) -> Option<&PipelineDenseLayers> {
+    fn dense_layers(&self) -> Option<&PipelineLayerStorage> {
         self.dense_layers.as_ref()
     }
 
@@ -1878,7 +1968,7 @@ impl PipelineStageSemantics for GemmaStage {
         }
     }
 
-    fn dense_layers(&self) -> Option<&PipelineDenseLayers> {
+    fn dense_layers(&self) -> Option<&PipelineLayerStorage> {
         self.dense_layers.as_ref()
     }
 
@@ -1957,7 +2047,7 @@ impl PipelineStageSemantics for DenseQwenStage {
         Vec::new()
     }
 
-    fn dense_layers(&self) -> Option<&PipelineDenseLayers> {
+    fn dense_layers(&self) -> Option<&PipelineLayerStorage> {
         self.dense_layers.as_ref()
     }
 
@@ -2090,7 +2180,7 @@ impl PipelineStageSemantics for Qwen3VlStage {
         shapes
     }
 
-    fn dense_layers(&self) -> Option<&PipelineDenseLayers> {
+    fn dense_layers(&self) -> Option<&PipelineLayerStorage> {
         self.dense_layers.as_ref()
     }
 
@@ -2510,7 +2600,7 @@ impl PipelineStageSemantics for GptOssStage {
         Vec::new()
     }
 
-    fn dense_layers(&self) -> Option<&PipelineDenseLayers> {
+    fn dense_layers(&self) -> Option<&PipelineLayerStorage> {
         self.dense_layers.as_ref()
     }
 
@@ -2622,7 +2712,7 @@ impl PipelineStageSemantics for Lfm2Stage {
         Vec::new()
     }
 
-    fn dense_layers(&self) -> Option<&PipelineDenseLayers> {
+    fn dense_layers(&self) -> Option<&PipelineLayerStorage> {
         self.dense_layers.as_ref()
     }
 
@@ -2716,7 +2806,7 @@ impl PipelineStageSemantics for NemotronHStage {
         Vec::new()
     }
 
-    fn dense_layers(&self) -> Option<&PipelineDenseLayers> {
+    fn dense_layers(&self) -> Option<&PipelineLayerStorage> {
         self.dense_layers.as_ref()
     }
 
@@ -2798,7 +2888,7 @@ impl PipelineStageSemantics for QwenHybridStage {
         Vec::new()
     }
 
-    fn dense_layers(&self) -> Option<&PipelineDenseLayers> {
+    fn dense_layers(&self) -> Option<&PipelineLayerStorage> {
         self.dense_layers.as_ref()
     }
 
@@ -2880,7 +2970,7 @@ impl PipelineStageSemantics for KimiLinearStage {
         Vec::new()
     }
 
-    fn dense_layers(&self) -> Option<&PipelineDenseLayers> {
+    fn dense_layers(&self) -> Option<&PipelineLayerStorage> {
         self.dense_layers.as_ref()
     }
 
@@ -2957,7 +3047,7 @@ impl PipelineStageSemantics for InklingStage {
         Vec::new()
     }
 
-    fn dense_layers(&self) -> Option<&PipelineDenseLayers> {
+    fn dense_layers(&self) -> Option<&PipelineLayerStorage> {
         self.dense_layers.as_ref()
     }
 
@@ -3098,12 +3188,17 @@ impl PipelineModel {
         &self.info
     }
 
-    /// Returns stage-local dense-stream observations when enabled.
+    /// Returns stage-local disk-stream observations when enabled.
     pub fn dense_stream_report(&self) -> Result<Option<DenseDiskStreamReport>, Error> {
         self.stage.dense_stream_report()
     }
 
-    /// Returns physical checkpoint-read telemetry for a streamed local stage.
+    /// Returns stage-local non-resident parameter placement and transfer telemetry.
+    pub fn parameter_residency_report(&self) -> Result<Option<ResidencyReport>, Error> {
+        self.stage.parameter_residency_report()
+    }
+
+    /// Returns physical checkpoint-read telemetry for a non-resident local stage.
     pub fn checkpoint_diagnostics(&self) -> Result<Option<WeightStoreDiagnostics>, Error> {
         Ok(self
             .stage
@@ -4357,16 +4452,16 @@ fn pipeline_binding_units<A: ArchitectureAdapter>(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn build_pipeline_dense_layers<L, F, B>(
+fn build_pipeline_layer_storage<L, F, B>(
     store: SharedWeightStore,
     range: Range<usize>,
-    options: crate::runtime::residency::dense_stream::DenseDiskStreamLoadOptions,
+    options: PipelineLayerLoadOptions,
     static_device_bytes: u64,
     stream: &Stream,
     weights_stream: &Stream,
     mut make_layer: F,
     mut make_bindings: B,
-) -> Result<PipelineDenseLayers, Error>
+) -> Result<PipelineLayerStorage, Error>
 where
     L: ModuleParameters,
     F: FnMut(usize, &Stream) -> Result<L, Error>,
@@ -4376,21 +4471,29 @@ where
         &dyn WeightStore,
     ) -> Result<Vec<crate::runtime::residency::manager::WeightBinding>, Error>,
 {
-    options.validate()?;
     let layer_count = range.len();
-    if options.device_lookahead == 0 || options.device_lookahead > layer_count {
-        return Err(Error::Parallel(format!(
-            "pipeline device lookahead {} cannot fit the {layer_count} local layers",
+    let device_depth = match options {
+        PipelineLayerLoadOptions::LayerwiseHost(options) => options.offload.prefetch_depth(),
+        PipelineLayerLoadOptions::DenseDiskStream(options) => {
+            options.validate()?;
             options.device_lookahead
+        }
+    };
+    if device_depth == 0 || device_depth > layer_count {
+        return Err(Error::Parallel(format!(
+            "pipeline device window depth {} cannot fit the {layer_count} local layers",
+            device_depth
         )));
     }
-    if options.host_budget_bytes > 0
-        && (options.host_lookahead == 0 || options.host_lookahead > layer_count)
-    {
-        return Err(Error::Parallel(format!(
-            "pipeline host lookahead {} cannot fit the {layer_count} local layers",
-            options.host_lookahead
-        )));
+    if let PipelineLayerLoadOptions::DenseDiskStream(options) = options {
+        if options.host_budget_bytes > 0
+            && (options.host_lookahead == 0 || options.host_lookahead > layer_count)
+        {
+            return Err(Error::Parallel(format!(
+                "pipeline host lookahead {} cannot fit the {layer_count} local layers",
+                options.host_lookahead
+            )));
+        }
     }
     let mut definitions = Vec::with_capacity(layer_count);
     let mut specs = Vec::with_capacity(layer_count);
@@ -4408,12 +4511,15 @@ where
             })?;
         let id = OffloadUnitId::new(format!("pipeline.layer.{global_layer:05}"))?;
         definitions.push(OffloadUnit::new(id.clone(), bindings)?);
-        specs.push(OffloadUnitSpec::new(
-            id.clone(),
-            layer_bytes,
-            ResidencyPolicy::Cacheable,
-            MemoryTier::Disk,
-        )?);
+        let (policy, tier) = match options {
+            PipelineLayerLoadOptions::LayerwiseHost(_) => {
+                (ResidencyPolicy::Windowed, MemoryTier::Host)
+            }
+            PipelineLayerLoadOptions::DenseDiskStream(_) => {
+                (ResidencyPolicy::Cacheable, MemoryTier::Disk)
+            }
+        };
+        specs.push(OffloadUnitSpec::new(id.clone(), layer_bytes, policy, tier)?);
         units.push(id);
         bytes.push(layer_bytes);
     }
@@ -4428,32 +4534,62 @@ where
             })
             .ok_or_else(|| Error::Parallel("pipeline layer-window byte total overflowed".into()))
     };
-    let device_window_bytes = largest(options.device_lookahead)?;
+    let device_window_bytes = largest(device_depth)?;
     let required_device = static_device_bytes
         .checked_add(device_window_bytes)
         .ok_or_else(|| Error::Parallel("pipeline device parameter total overflowed".into()))?;
-    if required_device > options.device_budget_bytes {
-        return Err(Error::Parallel(format!(
-            "pipeline device budget {} cannot hold {static_device_bytes} pinned static bytes plus the largest local layer window ({device_window_bytes} bytes, {required_device} total)",
-            options.device_budget_bytes
-        )));
-    }
-    let device_layer_budget = options.device_budget_bytes - static_device_bytes;
-    if options.host_budget_bytes > 0 {
-        let host_window_bytes = largest(options.host_lookahead)?;
-        if host_window_bytes > options.host_budget_bytes {
-            return Err(Error::Parallel(format!(
-                "pipeline host budget {} cannot hold the largest protected local layer window ({host_window_bytes} bytes)",
-                options.host_budget_bytes
-            )));
+    let config = match options {
+        PipelineLayerLoadOptions::LayerwiseHost(options) => {
+            if let Some(budget) = options.offload.device_budget_bytes() {
+                if required_device > budget {
+                    return Err(Error::Parallel(format!(
+                        "pipeline device budget {budget} cannot hold {static_device_bytes} pinned static bytes plus the largest local layer window ({device_window_bytes} bytes, {required_device} total)"
+                    )));
+                }
+            }
+            if let Some(budget) = options.offload.host_budget_bytes() {
+                if planned_layer_bytes > budget {
+                    return Err(Error::Parallel(format!(
+                        "pipeline host budget {budget} cannot eagerly hold all {planned_layer_bytes} rank-local layer bytes"
+                    )));
+                }
+            }
+            let device_layer_budget = options
+                .offload
+                .device_budget_bytes()
+                .map(|budget| budget - static_device_bytes);
+            OffloadConfig::new(
+                device_layer_budget,
+                options.offload.host_budget_bytes(),
+                device_depth,
+            )?
+            .with_eviction_policy(options.offload.eviction_policy())
         }
-    }
-    let config = OffloadConfig::new(
-        Some(device_layer_budget),
-        Some(options.host_budget_bytes),
-        options.host_lookahead.max(options.device_lookahead),
-    )?
-    .with_eviction_policy(options.eviction_policy);
+        PipelineLayerLoadOptions::DenseDiskStream(options) => {
+            if required_device > options.device_budget_bytes {
+                return Err(Error::Parallel(format!(
+                    "pipeline device budget {} cannot hold {static_device_bytes} pinned static bytes plus the largest local layer window ({device_window_bytes} bytes, {required_device} total)",
+                    options.device_budget_bytes
+                )));
+            }
+            let device_layer_budget = options.device_budget_bytes - static_device_bytes;
+            if options.host_budget_bytes > 0 {
+                let host_window_bytes = largest(options.host_lookahead)?;
+                if host_window_bytes > options.host_budget_bytes {
+                    return Err(Error::Parallel(format!(
+                        "pipeline host budget {} cannot hold the largest protected local layer window ({host_window_bytes} bytes)",
+                        options.host_budget_bytes
+                    )));
+                }
+            }
+            OffloadConfig::new(
+                Some(device_layer_budget),
+                Some(options.host_budget_bytes),
+                options.host_lookahead.max(options.device_lookahead),
+            )?
+            .with_eviction_policy(options.eviction_policy)
+        }
+    };
     let plan = OffloadPlan::new(config, specs)?;
     let residency = ResidencyManager::new_shared(
         Arc::clone(&store),
@@ -4463,20 +4599,37 @@ where
         stream.clone(),
     )?;
     residency.initialize()?;
-    let controller = DenseStreamController::new(
-        &residency,
-        options,
-        units.len(),
-        planned_layer_bytes,
-        static_device_bytes,
-        [("pipeline_stage".to_string(), units.clone())],
-    )?;
-    Ok(PipelineDenseLayers {
+    let (sample_mlx_memory, sample_process_memory) = match options {
+        PipelineLayerLoadOptions::LayerwiseHost(options) => {
+            (options.sample_mlx_memory, options.sample_process_memory)
+        }
+        PipelineLayerLoadOptions::DenseDiskStream(options) => {
+            (options.sample_mlx_memory, options.sample_process_memory)
+        }
+    };
+    let controller = match options {
+        PipelineLayerLoadOptions::LayerwiseHost(_) => PipelineLayerController::LayerwiseHost(
+            ResidentLayerGroup::new("pipeline_stage", units.clone(), device_depth)?,
+        ),
+        PipelineLayerLoadOptions::DenseDiskStream(options) => {
+            PipelineLayerController::DenseDiskStream(Box::new(DenseStreamController::new(
+                &residency,
+                options,
+                units.len(),
+                planned_layer_bytes,
+                static_device_bytes,
+                [("pipeline_stage".to_string(), units.clone())],
+            )?))
+        }
+    };
+    Ok(PipelineLayerStorage {
         store,
         residency,
         controller,
         units,
         independent_experts: false,
+        sample_mlx_memory,
+        sample_process_memory,
     })
 }
 
@@ -4501,13 +4654,13 @@ pub fn load_pipeline_model(
 /// LFM2, Nemotron-H, Qwen3-Next/Qwen3.5, and Gemma 4 text TP+PP stages, plus
 /// DeepSeek-V3/R1, Inkling, Kimi Linear, Qwen, Qwen3-VL-MoE, GPT-OSS, LFM2-MoE,
 /// Nemotron-H-MoE, and Qwen3-Next/Qwen3.5-MoE PP+EP stages,
-/// support fully resident and
-/// dense-disk-streamed layers. Streamed units compose pipeline placement with
-/// the authoritative TP semantic layout or EP assignment before residency
-/// initialization. Qwen3-MoE and GPT-OSS additionally compose an independent, stage-local
-/// expert cache with resident or dense-streamed non-expert parameters for PP,
-/// TP+PP, PP+EP, and TP+PP+EP. With EP inactive each stage owns all experts for
-/// its local layers and executes routes without an expert collective.
+/// support fully resident, host-layerwise, and dense-disk-streamed layers.
+/// Non-resident units compose pipeline placement with the authoritative TP
+/// semantic layout or EP assignment before residency initialization. Qwen3-MoE
+/// and GPT-OSS additionally compose an independent, stage-local expert cache
+/// with resident, host-layerwise, or dense-streamed non-expert parameters for
+/// PP, TP+PP, PP+EP, and TP+PP+EP. With EP inactive each stage owns all experts
+/// for its local layers and executes routes without an expert collective.
 pub fn load_pipeline_model_with_options(
     model_dir: impl AsRef<Path>,
     options: ModelLoadOptions,
@@ -4523,12 +4676,11 @@ pub fn load_pipeline_model_with_options(
     let expert_cache = options.weight_residency.expert_cache();
     let dense_stream = match options.weight_residency.layers() {
         LayerWeightResidency::FullyResident => None,
-        LayerWeightResidency::DenseDiskStream(options) => Some(options),
-        LayerWeightResidency::LayerwiseHost(_) => {
-            return Err(Error::Parallel(
-                "pipeline loading does not support eager host-layer residency; select fully resident or dense disk streaming"
-                    .into(),
-            ));
+        LayerWeightResidency::LayerwiseHost(options) => {
+            Some(PipelineLayerLoadOptions::LayerwiseHost(options))
+        }
+        LayerWeightResidency::DenseDiskStream(options) => {
+            Some(PipelineLayerLoadOptions::DenseDiskStream(options))
         }
     };
     let max_mapped_shards = options.weight_residency.max_mapped_shards();
@@ -5215,14 +5367,14 @@ fn load_llama_pipeline(
     store: SharedWeightStore,
     topology: ParallelTopology,
     requested_quantization: Option<WeightQuantization>,
-    dense_stream: Option<crate::runtime::residency::dense_stream::DenseDiskStreamLoadOptions>,
+    dense_stream: Option<PipelineLayerLoadOptions>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<PipelineModel, Error> {
     topology.preflight(Some(source_args.attention_schedule.len()), None)?;
     if dense_stream.is_some() && requested_quantization.is_some() {
         return Err(Error::Quantization(
-            "load-time quantization is unsupported for pipeline dense disk streaming; use checkpoint-native packed weights"
+            "load-time quantization is unsupported for non-resident pipeline layers; use checkpoint-native packed weights"
                 .into(),
         ));
     }
@@ -5452,7 +5604,7 @@ fn load_llama_pipeline(
     if let Some(dense_stream) = dense_stream {
         let streamed_layout = parallel_layout.clone();
         let streamed_adapter = &stage.layer_adapter;
-        let dense_layers = build_pipeline_dense_layers(
+        let dense_layers = build_pipeline_layer_storage(
             Arc::clone(&store),
             stage.range.clone(),
             dense_stream,
@@ -5481,9 +5633,9 @@ fn load_llama_pipeline(
             },
         )?;
         stage.dense_layers = Some(dense_layers);
-        let report = stage.dense_layers.as_ref().unwrap().report()?;
+        let layer_bytes = stage.dense_layers.as_ref().unwrap().planned_layer_bytes()?;
         info.planned_owned_parameter_bytes = static_device_bytes
-            .checked_add(report.planned_layer_bytes())
+            .checked_add(layer_bytes)
             .ok_or_else(|| {
                 Error::Parallel("pipeline planned-owned byte total overflowed".into())
             })?;
@@ -6075,7 +6227,7 @@ fn load_dense_qwen_pipeline(
     store: SharedWeightStore,
     topology: ParallelTopology,
     requested_quantization: Option<WeightQuantization>,
-    dense_stream: Option<crate::runtime::residency::dense_stream::DenseDiskStreamLoadOptions>,
+    dense_stream: Option<PipelineLayerLoadOptions>,
     expert_cache_options: Option<ExpertCacheLoadOptions>,
     stream: &Stream,
     weights_stream: &Stream,
@@ -6113,7 +6265,7 @@ fn load_dense_qwen_pipeline(
         .flatten();
     if dense_stream.is_some() && quantize_on_load.is_some() {
         return Err(Error::Quantization(
-            "load-time quantization is unsupported for dense-Qwen pipeline dense disk streaming; use checkpoint-native packed weights"
+            "load-time quantization is unsupported for non-resident dense-Qwen pipeline layers; use checkpoint-native packed weights"
                 .into(),
         ));
     }
@@ -6350,7 +6502,7 @@ fn load_dense_qwen_pipeline(
         let streamed_layout = parallel_layout.clone();
         let streamed_assignment = stage.expert_assignment.clone();
         let streamed_adapter = &stage.layer_adapter;
-        let dense_layers = build_pipeline_dense_layers(
+        let dense_layers = build_pipeline_layer_storage(
             Arc::clone(&store),
             stage.range.clone(),
             options,
@@ -6383,10 +6535,9 @@ fn load_dense_qwen_pipeline(
         } else {
             dense_layers
         });
-        let report = stage.dense_layers.as_ref().unwrap().report()?;
-        info.planned_owned_parameter_bytes = static_bytes
-            .checked_add(report.planned_layer_bytes())
-            .ok_or_else(|| {
+        let layer_bytes = stage.dense_layers.as_ref().unwrap().planned_layer_bytes()?;
+        info.planned_owned_parameter_bytes =
+            static_bytes.checked_add(layer_bytes).ok_or_else(|| {
                 Error::Parallel("dense-Qwen pipeline planned bytes overflowed".into())
             })?;
     } else {
@@ -6435,7 +6586,7 @@ fn load_qwen3_vl_pipeline(
     store: SharedWeightStore,
     topology: ParallelTopology,
     requested_quantization: Option<WeightQuantization>,
-    dense_stream: Option<crate::runtime::residency::dense_stream::DenseDiskStreamLoadOptions>,
+    dense_stream: Option<PipelineLayerLoadOptions>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<PipelineModel, Error> {
@@ -6464,7 +6615,7 @@ fn load_qwen3_vl_pipeline(
         .flatten();
     if dense_stream.is_some() && quantize_on_load.is_some() {
         return Err(Error::Quantization(
-            "load-time quantization is unsupported for Qwen3-VL pipeline dense disk streaming; use checkpoint-native packed weights"
+            "load-time quantization is unsupported for non-resident Qwen3-VL pipeline layers; use checkpoint-native packed weights"
                 .into(),
         ));
     }
@@ -6721,7 +6872,7 @@ fn load_qwen3_vl_pipeline(
         let streamed_layout = parallel_layout.clone();
         let streamed_assignment = stage.expert_assignment.clone();
         let streamed_adapter = &stage.layer_adapter;
-        stage.dense_layers = Some(build_pipeline_dense_layers(
+        stage.dense_layers = Some(build_pipeline_layer_storage(
             Arc::clone(&store),
             stage.range.clone(),
             options,
@@ -6749,9 +6900,9 @@ fn load_qwen3_vl_pipeline(
                 )
             },
         )?);
-        let report = stage.dense_layers.as_ref().unwrap().report()?;
+        let layer_bytes = stage.dense_layers.as_ref().unwrap().planned_layer_bytes()?;
         info.planned_owned_parameter_bytes = static_bytes
-            .checked_add(report.planned_layer_bytes())
+            .checked_add(layer_bytes)
             .ok_or_else(|| Error::Parallel("Qwen3-VL pipeline planned bytes overflowed".into()))?;
     } else {
         info.planned_owned_parameter_bytes = static_bytes;
@@ -7591,7 +7742,7 @@ fn load_gpt_oss_pipeline(
     store: SharedWeightStore,
     topology: ParallelTopology,
     requested_quantization: Option<WeightQuantization>,
-    dense_stream: Option<crate::runtime::residency::dense_stream::DenseDiskStreamLoadOptions>,
+    dense_stream: Option<PipelineLayerLoadOptions>,
     expert_cache_options: Option<ExpertCacheLoadOptions>,
     stream: &Stream,
     weights_stream: &Stream,
@@ -7633,7 +7784,7 @@ fn load_gpt_oss_pipeline(
         .flatten();
     if dense_stream.is_some() && quantize_on_load.is_some() {
         return Err(Error::Quantization(
-            "load-time quantization is unsupported for GPT-OSS pipeline dense disk streaming; use checkpoint-native packed weights"
+            "load-time quantization is unsupported for non-resident GPT-OSS pipeline layers; use checkpoint-native packed weights"
                 .into(),
         ));
     }
@@ -7837,7 +7988,7 @@ fn load_gpt_oss_pipeline(
         let streamed_layout = parallel_layout.clone();
         let streamed_assignment = stage.expert_assignment.clone();
         let streamed_adapter = &stage.layer_adapter;
-        stage.dense_layers = Some(build_pipeline_dense_layers(
+        stage.dense_layers = Some(build_pipeline_layer_storage(
             Arc::clone(&store),
             stage.range.clone(),
             options,
@@ -7869,11 +8020,11 @@ fn load_gpt_oss_pipeline(
             stage.dense_layers = stage
                 .dense_layers
                 .take()
-                .map(PipelineDenseLayers::with_independent_experts);
+                .map(PipelineLayerStorage::with_independent_experts);
         }
-        let report = stage.dense_layers.as_ref().unwrap().report()?;
+        let layer_bytes = stage.dense_layers.as_ref().unwrap().planned_layer_bytes()?;
         info.planned_owned_parameter_bytes = static_bytes
-            .checked_add(report.planned_layer_bytes())
+            .checked_add(layer_bytes)
             .ok_or_else(|| Error::Parallel("GPT-OSS pipeline planned bytes overflowed".into()))?;
     } else {
         info.planned_owned_parameter_bytes = static_bytes;
@@ -8533,7 +8684,7 @@ fn load_lfm2_pipeline(
     store: SharedWeightStore,
     topology: ParallelTopology,
     requested_quantization: Option<WeightQuantization>,
-    dense_stream: Option<crate::runtime::residency::dense_stream::DenseDiskStreamLoadOptions>,
+    dense_stream: Option<PipelineLayerLoadOptions>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<PipelineModel, Error> {
@@ -8558,7 +8709,7 @@ fn load_lfm2_pipeline(
         .flatten();
     if dense_stream.is_some() && quantize_on_load.is_some() {
         return Err(Error::Quantization(
-            "load-time quantization is unsupported for LFM2 pipeline dense disk streaming; use checkpoint-native packed weights"
+            "load-time quantization is unsupported for non-resident LFM2 pipeline layers; use checkpoint-native packed weights"
                 .into(),
         ));
     }
@@ -8812,7 +8963,7 @@ fn load_lfm2_pipeline(
         let streamed_layout = parallel_layout.clone();
         let streamed_assignment = stage.expert_assignment.clone();
         let streamed_adapter = &stage.layer_adapter;
-        stage.dense_layers = Some(build_pipeline_dense_layers(
+        stage.dense_layers = Some(build_pipeline_layer_storage(
             Arc::clone(&store),
             stage.range.clone(),
             options,
@@ -8840,9 +8991,9 @@ fn load_lfm2_pipeline(
                 )
             },
         )?);
-        let report = stage.dense_layers.as_ref().unwrap().report()?;
+        let layer_bytes = stage.dense_layers.as_ref().unwrap().planned_layer_bytes()?;
         info.planned_owned_parameter_bytes = static_bytes
-            .checked_add(report.planned_layer_bytes())
+            .checked_add(layer_bytes)
             .ok_or_else(|| Error::Parallel("LFM2 pipeline planned bytes overflowed".into()))?;
     } else {
         info.planned_owned_parameter_bytes = static_bytes;
@@ -9619,7 +9770,7 @@ fn load_nemotron_h_pipeline(
     store: SharedWeightStore,
     topology: ParallelTopology,
     requested_quantization: Option<WeightQuantization>,
-    dense_stream: Option<crate::runtime::residency::dense_stream::DenseDiskStreamLoadOptions>,
+    dense_stream: Option<PipelineLayerLoadOptions>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<PipelineModel, Error> {
@@ -9651,7 +9802,7 @@ fn load_nemotron_h_pipeline(
         .flatten();
     if dense_stream.is_some() && quantize_on_load.is_some() {
         return Err(Error::Quantization(
-            "load-time quantization is unsupported for Nemotron-H pipeline dense disk streaming; use checkpoint-native packed weights"
+            "load-time quantization is unsupported for non-resident Nemotron-H pipeline layers; use checkpoint-native packed weights"
                 .into(),
         ));
     }
@@ -9877,7 +10028,7 @@ fn load_nemotron_h_pipeline(
         let streamed_layout = parallel_layout.clone();
         let streamed_assignment = stage.expert_assignment.clone();
         let streamed_adapter = &stage.layer_adapter;
-        stage.dense_layers = Some(build_pipeline_dense_layers(
+        stage.dense_layers = Some(build_pipeline_layer_storage(
             Arc::clone(&store),
             stage.range.clone(),
             options,
@@ -9905,10 +10056,9 @@ fn load_nemotron_h_pipeline(
                 )
             },
         )?);
-        let report = stage.dense_layers.as_ref().unwrap().report()?;
-        info.planned_owned_parameter_bytes = static_bytes
-            .checked_add(report.planned_layer_bytes())
-            .ok_or_else(|| {
+        let layer_bytes = stage.dense_layers.as_ref().unwrap().planned_layer_bytes()?;
+        info.planned_owned_parameter_bytes =
+            static_bytes.checked_add(layer_bytes).ok_or_else(|| {
                 Error::Parallel("Nemotron-H pipeline planned bytes overflowed".into())
             })?;
     } else {
@@ -10490,7 +10640,7 @@ fn load_qwen_hybrid_pipeline(
     store: SharedWeightStore,
     topology: ParallelTopology,
     requested_quantization: Option<WeightQuantization>,
-    dense_stream: Option<crate::runtime::residency::dense_stream::DenseDiskStreamLoadOptions>,
+    dense_stream: Option<PipelineLayerLoadOptions>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<PipelineModel, Error> {
@@ -10520,7 +10670,7 @@ fn load_qwen_hybrid_pipeline(
         .flatten();
     if dense_stream.is_some() && quantize_on_load.is_some() {
         return Err(Error::Quantization(
-            "load-time quantization is unsupported for Qwen hybrid pipeline dense disk streaming; use checkpoint-native packed weights"
+            "load-time quantization is unsupported for non-resident Qwen hybrid pipeline layers; use checkpoint-native packed weights"
                 .into(),
         ));
     }
@@ -10747,7 +10897,7 @@ fn load_qwen_hybrid_pipeline(
         let streamed_layout = parallel_layout.clone();
         let streamed_assignment = stage.expert_assignment.clone();
         let streamed_adapter = &stage.layer_adapter;
-        stage.dense_layers = Some(build_pipeline_dense_layers(
+        stage.dense_layers = Some(build_pipeline_layer_storage(
             Arc::clone(&store),
             stage.range.clone(),
             options,
@@ -10779,10 +10929,9 @@ fn load_qwen_hybrid_pipeline(
                 )
             },
         )?);
-        let report = stage.dense_layers.as_ref().unwrap().report()?;
-        info.planned_owned_parameter_bytes = static_bytes
-            .checked_add(report.planned_layer_bytes())
-            .ok_or_else(|| {
+        let layer_bytes = stage.dense_layers.as_ref().unwrap().planned_layer_bytes()?;
+        info.planned_owned_parameter_bytes =
+            static_bytes.checked_add(layer_bytes).ok_or_else(|| {
                 Error::Parallel("Qwen hybrid pipeline planned bytes overflowed".into())
             })?;
     } else {
@@ -11341,7 +11490,7 @@ fn load_kimi_linear_pipeline(
     store: SharedWeightStore,
     topology: ParallelTopology,
     requested_quantization: Option<WeightQuantization>,
-    dense_stream: Option<crate::runtime::residency::dense_stream::DenseDiskStreamLoadOptions>,
+    dense_stream: Option<PipelineLayerLoadOptions>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<PipelineModel, Error> {
@@ -11366,7 +11515,7 @@ fn load_kimi_linear_pipeline(
         .flatten();
     if dense_stream.is_some() && quantize_on_load.is_some() {
         return Err(Error::Quantization(
-            "load-time quantization is unsupported for Kimi Linear pipeline dense disk streaming; use checkpoint-native packed weights"
+            "load-time quantization is unsupported for non-resident Kimi Linear pipeline layers; use checkpoint-native packed weights"
                 .into(),
         ));
     }
@@ -11603,7 +11752,7 @@ fn load_kimi_linear_pipeline(
         let streamed_layout = parallel_layout.clone();
         let streamed_assignment = stage.expert_assignment.clone();
         let streamed_adapter = &stage.layer_adapter;
-        stage.dense_layers = Some(build_pipeline_dense_layers(
+        stage.dense_layers = Some(build_pipeline_layer_storage(
             Arc::clone(&store),
             stage.range.clone(),
             options,
@@ -11631,10 +11780,9 @@ fn load_kimi_linear_pipeline(
                 )
             },
         )?);
-        let report = stage.dense_layers.as_ref().unwrap().report()?;
-        info.planned_owned_parameter_bytes = static_bytes
-            .checked_add(report.planned_layer_bytes())
-            .ok_or_else(|| {
+        let layer_bytes = stage.dense_layers.as_ref().unwrap().planned_layer_bytes()?;
+        info.planned_owned_parameter_bytes =
+            static_bytes.checked_add(layer_bytes).ok_or_else(|| {
                 Error::Parallel("Kimi Linear pipeline planned bytes overflowed".into())
             })?;
     } else {
@@ -12174,7 +12322,7 @@ fn load_inkling_pipeline(
     store: SharedWeightStore,
     topology: ParallelTopology,
     requested_quantization: Option<WeightQuantization>,
-    dense_stream: Option<crate::runtime::residency::dense_stream::DenseDiskStreamLoadOptions>,
+    dense_stream: Option<PipelineLayerLoadOptions>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<PipelineModel, Error> {
@@ -12392,7 +12540,7 @@ fn load_inkling_pipeline(
         let streamed_layout = parallel_layout.clone();
         let streamed_assignment = stage.expert_assignment.clone();
         let streamed_adapter = &stage.layer_adapter;
-        stage.dense_layers = Some(build_pipeline_dense_layers(
+        stage.dense_layers = Some(build_pipeline_layer_storage(
             Arc::clone(&store),
             stage.range.clone(),
             options,
@@ -12428,9 +12576,9 @@ fn load_inkling_pipeline(
                 )
             },
         )?);
-        let report = stage.dense_layers.as_ref().unwrap().report()?;
+        let layer_bytes = stage.dense_layers.as_ref().unwrap().planned_layer_bytes()?;
         info.planned_owned_parameter_bytes = static_bytes
-            .checked_add(report.planned_layer_bytes())
+            .checked_add(layer_bytes)
             .ok_or_else(|| Error::Parallel("Inkling pipeline planned bytes overflowed".into()))?;
     } else {
         info.planned_owned_parameter_bytes = static_bytes;
@@ -12945,7 +13093,7 @@ fn load_gemma_pipeline(
     store: SharedWeightStore,
     topology: ParallelTopology,
     requested_quantization: Option<WeightQuantization>,
-    dense_stream: Option<crate::runtime::residency::dense_stream::DenseDiskStreamLoadOptions>,
+    dense_stream: Option<PipelineLayerLoadOptions>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<PipelineModel, Error> {
@@ -12963,7 +13111,7 @@ fn load_gemma_pipeline(
         .flatten();
     if dense_stream.is_some() && quantize_on_load.is_some() {
         return Err(Error::Quantization(
-            "load-time quantization is unsupported for Gemma pipeline dense disk streaming; use checkpoint-native packed weights"
+            "load-time quantization is unsupported for non-resident Gemma pipeline layers; use checkpoint-native packed weights"
                 .into(),
         ));
     }
@@ -13293,7 +13441,7 @@ fn load_gemma_pipeline(
     if let Some(options) = dense_stream {
         let streamed_layout = parallel_layout.clone();
         let streamed_adapter = &stage.layer_adapter;
-        stage.dense_layers = Some(build_pipeline_dense_layers(
+        stage.dense_layers = Some(build_pipeline_layer_storage(
             Arc::clone(&store),
             stage.range.clone(),
             options,
@@ -13317,9 +13465,9 @@ fn load_gemma_pipeline(
                 )
             },
         )?);
-        let report = stage.dense_layers.as_ref().unwrap().report()?;
+        let layer_bytes = stage.dense_layers.as_ref().unwrap().planned_layer_bytes()?;
         info.planned_owned_parameter_bytes = static_bytes
-            .checked_add(report.planned_layer_bytes())
+            .checked_add(layer_bytes)
             .ok_or_else(|| Error::Parallel("Gemma pipeline planned bytes overflowed".into()))?;
     } else {
         info.planned_owned_parameter_bytes = static_bytes;
@@ -13671,7 +13819,7 @@ fn load_deepseek_pipeline(
     store: SharedWeightStore,
     topology: ParallelTopology,
     requested_quantization: Option<WeightQuantization>,
-    dense_stream: Option<crate::runtime::residency::dense_stream::DenseDiskStreamLoadOptions>,
+    dense_stream: Option<PipelineLayerLoadOptions>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<PipelineModel, Error> {
@@ -13689,7 +13837,7 @@ fn load_deepseek_pipeline(
     )?;
     if dense_stream.is_some() && requested_quantization.is_some() {
         return Err(Error::Quantization(
-            "load-time quantization is unsupported for pipeline dense disk streaming; use checkpoint-native packed weights"
+            "load-time quantization is unsupported for non-resident pipeline layers; use checkpoint-native packed weights"
                 .into(),
         ));
     }
@@ -13884,7 +14032,7 @@ fn load_deepseek_pipeline(
         let streamed_layout = parallel_layout.clone();
         let streamed_assignment = stage.expert_assignment.clone();
         let streamed_adapter = &stage.layer_adapter;
-        stage.dense_layers = Some(build_pipeline_dense_layers(
+        stage.dense_layers = Some(build_pipeline_layer_storage(
             Arc::clone(&store),
             stage.range.clone(),
             dense_stream,
@@ -13912,9 +14060,9 @@ fn load_deepseek_pipeline(
                 )
             },
         )?);
-        let report = stage.dense_layers.as_ref().unwrap().report()?;
+        let layer_bytes = stage.dense_layers.as_ref().unwrap().planned_layer_bytes()?;
         info.planned_owned_parameter_bytes = static_device_bytes
-            .checked_add(report.planned_layer_bytes())
+            .checked_add(layer_bytes)
             .ok_or_else(|| {
                 Error::Parallel("pipeline planned-owned byte total overflowed".into())
             })?;
@@ -14626,11 +14774,13 @@ mod tests {
         }
     }
 
-    fn assert_streamed_qwen_layer_recipe_parity(
+    #[allow(clippy::too_many_arguments)]
+    fn assert_nonresident_qwen_layer_recipe_parity(
         args: dense_qwen::DecoderConfig,
         store: SharedWeightStore,
         topology: ParallelTopology,
         assignment: Option<ExpertAssignment>,
+        residency: PipelineLayerLoadOptions,
         global_layer: usize,
         stream: &Stream,
         weights_stream: &Stream,
@@ -14677,10 +14827,10 @@ mod tests {
         )
         .unwrap();
 
-        let dense = build_pipeline_dense_layers(
+        let dense = build_pipeline_layer_storage(
             Arc::clone(&store),
             global_layer..global_layer + 1,
-            dense_stream_options(),
+            residency,
             0,
             stream,
             weights_stream,
@@ -14700,13 +14850,13 @@ mod tests {
             },
         )
         .unwrap();
-        let forward = dense
-            .controller
-            .forward_guard(true, &dense.residency)
-            .unwrap();
-        let group = dense
-            .controller
-            .group_guard(&dense.residency, "pipeline_stage");
+        let (forward, group) = match &dense.controller {
+            PipelineLayerController::LayerwiseHost(_) => (None, None),
+            PipelineLayerController::DenseDiskStream(controller) => (
+                Some(controller.forward_guard(true, &dense.residency).unwrap()),
+                Some(controller.group_guard(&dense.residency, "pipeline_stage")),
+            ),
+        };
         let (_host, lease) = dense.prepare(0, true).unwrap();
         let mut streamed = adapter
             .new_cartesian_layer(
@@ -14720,8 +14870,13 @@ mod tests {
         populate_module_from_lease(&mut streamed, &lease).unwrap();
         assert_module_parameter_parity(&resident, &streamed);
         drop(lease);
-        group.complete().unwrap();
-        forward.complete().unwrap();
+        dense.trim_after(0).unwrap();
+        if let Some(group) = group {
+            group.complete().unwrap();
+        }
+        if let Some(forward) = forward {
+            forward.complete().unwrap();
+        }
     }
 
     fn write_parameter_fixture(
@@ -16237,11 +16392,24 @@ mod tests {
         initialize_parameters(&mut dense_source, stream);
         let dense_directory = tempfile::tempdir().unwrap();
         write_parameter_fixture(dense_directory.path(), &dense_config, &dense_source);
-        assert_streamed_qwen_layer_recipe_parity(
+        assert_nonresident_qwen_layer_recipe_parity(
             dense_args.clone(),
             open_safetensors_weight_store(dense_directory.path(), 1).unwrap(),
             tp_pp_gpu_topology(3),
             None,
+            PipelineLayerLoadOptions::DenseDiskStream(dense_stream_options()),
+            1,
+            stream,
+            cpu.stream(),
+        );
+        assert_nonresident_qwen_layer_recipe_parity(
+            dense_args.clone(),
+            open_safetensors_weight_store(dense_directory.path(), 1).unwrap(),
+            tp_pp_gpu_topology(3),
+            None,
+            PipelineLayerLoadOptions::LayerwiseHost(LayerwiseLoadOptions::new(
+                OffloadConfig::new(None, None, 1).unwrap(),
+            )),
             1,
             stream,
             cpu.stream(),
@@ -16260,11 +16428,12 @@ mod tests {
             )
             .unwrap(),
         );
-        assert_streamed_qwen_layer_recipe_parity(
+        assert_nonresident_qwen_layer_recipe_parity(
             gguf_dense_args,
             dense_store,
             tp_pp_gpu_topology(3),
             None,
+            PipelineLayerLoadOptions::DenseDiskStream(dense_stream_options()),
             1,
             stream,
             cpu.stream(),
@@ -16277,11 +16446,12 @@ mod tests {
         let moe_directory = tempfile::tempdir().unwrap();
         write_split_qwen3_moe_fixture(moe_directory.path(), &moe_config, &moe_source, stream);
         let assignment = ExpertAssignment::balanced(4, 2, 1).unwrap();
-        assert_streamed_qwen_layer_recipe_parity(
+        assert_nonresident_qwen_layer_recipe_parity(
             moe_args.clone(),
             open_safetensors_weight_store(moe_directory.path(), 1).unwrap(),
             pp_ep_gpu_topology(3),
             Some(assignment.clone()),
+            PipelineLayerLoadOptions::DenseDiskStream(dense_stream_options()),
             1,
             stream,
             cpu.stream(),
@@ -16300,11 +16470,12 @@ mod tests {
             )
             .unwrap(),
         );
-        assert_streamed_qwen_layer_recipe_parity(
+        assert_nonresident_qwen_layer_recipe_parity(
             gguf_moe_args,
             moe_store,
             pp_ep_gpu_topology(3),
             Some(assignment),
+            PipelineLayerLoadOptions::DenseDiskStream(dense_stream_options()),
             1,
             stream,
             cpu.stream(),
@@ -17774,7 +17945,7 @@ mod tests {
             .expect_err("dense streaming must reject on-load Gemma quantization");
             assert!(error
                 .to_string()
-                .contains("Gemma pipeline dense disk streaming"));
+                .contains("non-resident Gemma pipeline layers"));
         }
     }
 
@@ -18123,6 +18294,9 @@ mod tests {
                 let topology = tp_pp_gpu_topology(rank);
                 for residency in [
                     WeightResidency::fully_resident(),
+                    WeightResidency::layerwise_host(LayerwiseLoadOptions::new(
+                        OffloadConfig::new(None, None, 1).unwrap(),
+                    )),
                     WeightResidency::dense_disk_stream(dense_stream_options()),
                 ] {
                     let model = load_pipeline_model_with_options(
@@ -18157,6 +18331,19 @@ mod tests {
                         model.dense_stream_report().unwrap().is_some(),
                         matches!(residency.layers(), LayerWeightResidency::DenseDiskStream(_))
                     );
+                    assert_eq!(
+                        model.parameter_residency_report().unwrap().is_some(),
+                        !matches!(residency.layers(), LayerWeightResidency::FullyResident)
+                    );
+                    if matches!(residency.layers(), LayerWeightResidency::LayerwiseHost(_)) {
+                        let report = model.parameter_residency_report().unwrap().unwrap();
+                        assert!(report.initialized());
+                        assert!(report.units().iter().all(|unit| {
+                            unit.planned_tier() == MemoryTier::Host
+                                && unit.host_resident()
+                                && !unit.device_resident()
+                        }));
+                    }
                     if info.is_first {
                         assert!(info
                             .owned_tensors
@@ -18392,7 +18579,7 @@ mod tests {
     }
 
     #[test]
-    fn llama_pipeline_dense_stream_rejects_undersized_local_budgets() {
+    fn llama_pipeline_nonresident_layers_reject_undersized_local_budgets() {
         let gpu = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
         let cpu = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
         let stream = gpu.stream();
@@ -18437,6 +18624,44 @@ mod tests {
             cpu.stream(),
         )
         .expect_err("an undersized local device budget must fail");
+        assert!(matches!(
+            device_error,
+            Error::Parallel(message)
+                if message == format!(
+                    "pipeline device budget {device_budget} cannot hold {static_bytes} pinned static bytes plus the largest local layer window ({layer_bytes} bytes, {device_bytes} total)"
+                )
+        ));
+
+        let host_error = load_pipeline_model_with_options(
+            dir.path(),
+            ModelLoadOptions::with_parallel(gpu_topology(0)).with_weight_residency(
+                WeightResidency::layerwise_host(LayerwiseLoadOptions::new(
+                    OffloadConfig::new(Some(device_bytes), Some(host_budget), 1).unwrap(),
+                )),
+            ),
+            stream,
+            cpu.stream(),
+        )
+        .expect_err("host-layerwise residency must hold every rank-local layer on host");
+        assert!(matches!(
+            host_error,
+            Error::Parallel(message)
+                if message == format!(
+                    "pipeline host budget {host_budget} cannot eagerly hold all {layer_bytes} rank-local layer bytes"
+                )
+        ));
+
+        let device_error = load_pipeline_model_with_options(
+            dir.path(),
+            ModelLoadOptions::with_parallel(gpu_topology(0)).with_weight_residency(
+                WeightResidency::layerwise_host(LayerwiseLoadOptions::new(
+                    OffloadConfig::new(Some(device_budget), Some(layer_bytes), 1).unwrap(),
+                )),
+            ),
+            stream,
+            cpu.stream(),
+        )
+        .expect_err("host-layerwise residency must fit static weights and its device window");
         assert!(matches!(
             device_error,
             Error::Parallel(message)
