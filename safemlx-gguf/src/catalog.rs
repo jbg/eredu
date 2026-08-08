@@ -2,8 +2,8 @@ use crate::convert::{
     affine_shapes, conversion_kind, iquant_packed_shape, mxfp4_shapes, ConversionKind,
 };
 use crate::{
-    ConvertedTensor, DenseDtype, Endian, Error, Limits, MetadataValue, Reader, Result,
-    TensorDescriptor, TensorSelection, TensorSelectionPlan,
+    ConvertedTensor, DenseDtype, DenseTensorSpan, DenseTensorSpanPlan, Endian, Error, Limits,
+    MetadataValue, Reader, Result, TensorDescriptor, TensorSelection, TensorSelectionPlan,
 };
 use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
@@ -619,6 +619,32 @@ impl TensorMaterializer {
             shard_index: location.shard_index,
             tensor_index: location.tensor_index,
             descriptor,
+            converted,
+        })
+    }
+
+    /// Materialize one bounded contiguous span from an unquantized dense tensor.
+    pub fn converted_dense_tensor_span(
+        &mut self,
+        name: &str,
+        selection: &DenseTensorSpan,
+    ) -> Result<ConvertedCheckpointTensor> {
+        let (location, descriptor, _) = self.location_and_reader(name)?;
+        let plan = DenseTensorSpanPlan::new(&descriptor, selection.clone())?;
+        let converted = self
+            .reader
+            .as_mut()
+            .expect("requested shard reader opened above")
+            .1
+            .read_dense_tensor_span(&plan)
+            .map_err(|source| Error::Shard {
+                path: self.checkpoint.shards[location.shard_index].path.clone(),
+                source: Box::new(source),
+            })?;
+        Ok(ConvertedCheckpointTensor {
+            shard_index: location.shard_index,
+            tensor_index: location.tensor_index,
+            descriptor: plan.selected_descriptor().clone(),
             converted,
         })
     }

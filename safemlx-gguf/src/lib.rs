@@ -31,6 +31,7 @@ pub use format::{
     Endian, GgmlType, MetadataArray, MetadataValue, TensorDescriptor, DEFAULT_ALIGNMENT,
 };
 pub use reader::{
-    EncodedSpan, Limits, Reader, SelectionAlignment, TensorSelection, TensorSelectionPlan,
+    DenseTensorSpan, DenseTensorSpanPlan, EncodedSpan, Limits, Reader, SelectionAlignment,
+    TensorSelection, TensorSelectionPlan,
 };
 pub use writer::{TensorInput, Writer, WriterOptions};

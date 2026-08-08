@@ -4757,7 +4757,7 @@ fn reject_external_gguf_ep_quantization(
 ) -> Result<(), Error> {
     if quantization.is_some() {
         return Err(Error::Quantization(
-            "GGUF expert-parallel load-time conversion requires a rank-local semantic span that the GGUF reader cannot represent; use matching checkpoint-native packed weights"
+            "GGUF expert-parallel load-time conversion is not yet connected to the bounded dense-span reader; use matching checkpoint-native packed weights"
                 .into(),
         ));
     }

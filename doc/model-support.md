@@ -800,9 +800,11 @@ Important boundaries:
   with fully resident, layerwise-host, or dense-streamed weights. Supported MoE
   families use the same ordinary-layer overlay together with an independent
   packed expert overlay. Pipeline stages use the same overlay for SafeTensors
-  and compatible dense GGUF recipes before host/device planning. Standalone
-  nonresident GGUF loading and packed GGUF transcoding still require a
-  checkpoint-native encoding.
+  and dense F32/F16/BF16 GGUF recipes before host/device planning. The GGUF
+  reader bounds native-axis and reshaped contiguous spans, including composed
+  expert and row selections over fused banks. Packed GGUF input is excluded by
+  the span type and is never requantized. Standalone nonresident GGUF conversion
+  is not yet connected to the shared overlay.
 - Transfers and route inspection are synchronous because the pinned MLX C API
   does not expose the events or fences required for safe cross-stream overlap.
 - On Apple silicon, reported host and device residency are logical tiers over

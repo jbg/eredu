@@ -20,8 +20,9 @@ use std::{
 use memmap2::{Mmap, MmapOptions};
 use safemlx::{
     ops::{
-        indexing::TryIndexOp, GgufCheckpoint, GgufLogicalDtype, GgufMaterializer, GgufTensor,
-        GgufTensorDescriptor, GgufTensorSelection, GgufTensorSelectionPlan,
+        indexing::TryIndexOp, GgufCheckpoint, GgufDenseTensorSpan, GgufDenseTensorSpanPlan,
+        GgufLogicalDtype, GgufMaterializer, GgufTensor, GgufTensorDescriptor, GgufTensorSelection,
+        GgufTensorSelectionPlan,
     },
     transforms::eval,
     Array, Stream,
@@ -535,7 +536,13 @@ struct GgufStoreStatistics {
 struct GgufGroupCacheKey {
     checkpoint: usize,
     physical_name: String,
-    selection: Option<GgufTensorSelection>,
+    selection: Option<GgufPhysicalSelection>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd)]
+enum GgufPhysicalSelection {
+    Axis(GgufTensorSelection),
+    DenseSpan(GgufDenseTensorSpan),
 }
 
 #[derive(Debug)]
@@ -731,7 +738,7 @@ impl GgufReaderCache {
         &mut self,
         checkpoint: usize,
         physical_name: &str,
-        selection: Option<&GgufTensorSelection>,
+        selection: Option<&GgufPhysicalSelection>,
         max_cached_readers: usize,
         logical_key: &str,
     ) -> Result<GgufTensor, WeightStoreError> {
@@ -781,8 +788,11 @@ impl GgufReaderCache {
         self.last_used[checkpoint] = self.tick;
         let materializer = &mut self.materializers[checkpoint];
         let converted = match selection {
-            Some(selection) => {
+            Some(GgufPhysicalSelection::Axis(selection)) => {
                 materializer.converted_tensor_selected_host(physical_name, selection)
+            }
+            Some(GgufPhysicalSelection::DenseSpan(selection)) => {
+                materializer.converted_dense_tensor_span_host(physical_name, selection)
             }
             None => materializer.converted_tensor_host(physical_name),
         }
@@ -893,7 +903,7 @@ impl WeightStore for GgufWeightStore {
 }
 
 struct GgufReadPlan {
-    physical_selection: Option<GgufTensorSelection>,
+    physical_selection: Option<GgufPhysicalSelection>,
     physical_byte_len: u64,
     selection_is_materialized: bool,
 }
@@ -910,10 +920,38 @@ fn plan_bounded_gguf_selection(
             selection_is_materialized: true,
         });
     }
-    if matches!(selection, TensorSelection::Contiguous { .. }) {
-        return Err(WeightStoreError::BoundedSelectionUnavailable {
-            key: key.to_string(),
-            message: "GGUF readers cannot yet express a reshaped contiguous scalar span".into(),
+    if let TensorSelection::Contiguous {
+        offset_elements,
+        shape,
+    } = selection
+    {
+        let offset_elements =
+            u64::try_from(*offset_elements).map_err(|_| WeightStoreError::Overflow {
+                context: format!("GGUF contiguous offset for tensor {key:?}"),
+            })?;
+        let shape = shape
+            .iter()
+            .map(|dimension| {
+                u64::try_from(*dimension).map_err(|_| WeightStoreError::Overflow {
+                    context: format!("GGUF contiguous shape for tensor {key:?}"),
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let selection = GgufDenseTensorSpan::new(offset_elements, shape).map_err(|error| {
+            WeightStoreError::BoundedSelectionUnavailable {
+                key: key.to_string(),
+                message: error.to_string(),
+            }
+        })?;
+        let plan = GgufDenseTensorSpanPlan::new(&entry.physical_descriptor, selection.clone())
+            .map_err(|error| WeightStoreError::BoundedSelectionUnavailable {
+                key: key.to_string(),
+                message: error.to_string(),
+            })?;
+        return Ok(GgufReadPlan {
+            physical_selection: Some(GgufPhysicalSelection::DenseSpan(selection)),
+            physical_byte_len: plan.encoded_byte_len(),
+            selection_is_materialized: true,
         });
     }
     let rank = entry.metadata.shape.len();
@@ -945,7 +983,7 @@ fn plan_bounded_gguf_selection(
             message: error.to_string(),
         })?;
     Ok(GgufReadPlan {
-        physical_selection: Some(physical_selection),
+        physical_selection: Some(GgufPhysicalSelection::Axis(physical_selection)),
         physical_byte_len: plan.encoded_byte_len(),
         selection_is_materialized: true,
     })
@@ -1559,7 +1597,7 @@ struct MemoryLeaseSource {
 struct GgufLeaseSource {
     store: Arc<GgufStoreInner>,
     entry: GgufCatalogEntry,
-    physical_selection: Option<GgufTensorSelection>,
+    physical_selection: Option<GgufPhysicalSelection>,
     physical_byte_len: u64,
     selection_is_materialized: bool,
 }
@@ -2943,6 +2981,27 @@ mod tests {
             .unwrap();
     }
 
+    fn write_dense_bank_gguf(path: &Path) -> Vec<f32> {
+        let values = (0..24).map(|value| value as f32).collect::<Vec<_>>();
+        let bytes = values
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect::<Vec<_>>();
+        Writer::default()
+            .write(
+                std::fs::File::create(path).unwrap(),
+                &BTreeMap::new(),
+                &[TensorInput {
+                    name: "bank.weight",
+                    dimensions: &[4, 3, 2],
+                    ggml_type: GgmlType::F32,
+                    data: &bytes,
+                }],
+            )
+            .unwrap();
+        values
+    }
+
     fn write_wide_affine_gguf(path: &Path) {
         let blocks = [[0x00u8; 18], [0x11u8; 18], [0x22u8; 18], [0x33u8; 18]];
         let bytes = blocks.into_iter().flatten().collect::<Vec<_>>();
@@ -2994,7 +3053,17 @@ mod tests {
 
     fn gguf_physical_selection(lease: &WeightLease) -> Option<GgufTensorSelection> {
         match &lease.source {
-            WeightLeaseSource::Gguf(source) => source.physical_selection.clone(),
+            WeightLeaseSource::Gguf(source) => {
+                source
+                    .physical_selection
+                    .as_ref()
+                    .map(|selection| match selection {
+                        GgufPhysicalSelection::Axis(selection) => selection.clone(),
+                        GgufPhysicalSelection::DenseSpan(_) => {
+                            panic!("expected single-axis GGUF selection")
+                        }
+                    })
+            }
             WeightLeaseSource::Safetensors(_) => panic!("expected GGUF lease"),
             WeightLeaseSource::Memory(_) => panic!("expected GGUF lease"),
         }
@@ -3034,6 +3103,73 @@ mod tests {
         assert_eq!(diagnostics.currently_mapped_shards, 0);
         assert!(diagnostics.touched_shard_paths.is_empty());
         assert_eq!(diagnostics.physical_reads, 0);
+    }
+
+    #[test]
+    fn gguf_dense_contiguous_span_reads_only_the_reshaped_interval() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("model.gguf");
+        let values = write_dense_bank_gguf(&path);
+        let store =
+            GgufWeightStore::new(GgufCheckpoint::open(path).unwrap(), |name| name.to_string())
+                .unwrap();
+        let lease = store
+            .acquire(
+                "bank.weight",
+                TensorSelection::Contiguous {
+                    offset_elements: 8,
+                    shape: vec![1, 2, 4],
+                },
+            )
+            .unwrap();
+        assert_eq!(lease.output_shape(), [1, 2, 4]);
+        assert_eq!(lease.selected_byte_len(), 32);
+        let WeightLeaseSource::Gguf(source) = &lease.source else {
+            panic!("expected GGUF lease");
+        };
+        assert!(matches!(
+            source.physical_selection.as_ref(),
+            Some(GgufPhysicalSelection::DenseSpan(_))
+        ));
+
+        let stream = cpu_stream();
+        let selected = lease.materialize(&stream, &stream).unwrap();
+        assert_eq!(selected.shape(), [1, 2, 4]);
+        assert_eq!(
+            selected.evaluated().unwrap().as_slice::<f32>(),
+            &values[8..16]
+        );
+        let diagnostics = store.diagnostics().unwrap();
+        assert_eq!(diagnostics.physical_reads, 1);
+        assert_eq!(diagnostics.physical_read_bytes, 32);
+    }
+
+    #[test]
+    fn gguf_dense_contiguous_span_rejects_packed_input_before_payload_io() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("model.gguf");
+        write_affine_gguf(&path);
+        let store =
+            GgufWeightStore::new(GgufCheckpoint::open(path).unwrap(), |name| name.to_string())
+                .unwrap();
+        let error = store
+            .acquire(
+                "bank.weight",
+                TensorSelection::Contiguous {
+                    offset_elements: 0,
+                    shape: vec![1, 4],
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            WeightStoreError::BoundedSelectionUnavailable { .. }
+        ));
+        assert!(error.to_string().contains("unquantized F32, F16, or BF16"));
+        let diagnostics = store.diagnostics().unwrap();
+        assert_eq!(diagnostics.physical_reads, 0);
+        assert_eq!(diagnostics.physical_read_bytes, 0);
+        assert!(diagnostics.touched_shard_paths.is_empty());
     }
 
     #[test]

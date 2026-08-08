@@ -63,6 +63,169 @@ pub struct EncodedSpan {
     byte_len: u64,
 }
 
+/// A non-empty row-major scalar span exposed with a new logical shape.
+///
+/// This selection is intentionally distinct from [`TensorSelection`]: it is
+/// legal only for unquantized F32, F16, and BF16 tensors. Packed GGUF blocks
+/// therefore cannot enter a dequantize/requantize path accidentally.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct DenseTensorSpan {
+    offset_elements: u64,
+    shape: Vec<u64>,
+}
+
+impl DenseTensorSpan {
+    /// Describes a contiguous scalar interval and its row-major output shape.
+    pub fn new(offset_elements: u64, shape: Vec<u64>) -> Result<Self> {
+        if shape.is_empty() || shape.contains(&0) {
+            return Err(Error::InvalidHeader(
+                "dense tensor span shape must be non-empty and nonzero".into(),
+            ));
+        }
+        shape.iter().try_fold(1u64, |elements, dimension| {
+            elements
+                .checked_mul(*dimension)
+                .ok_or(Error::Overflow("dense tensor span element count"))
+        })?;
+        Ok(Self {
+            offset_elements,
+            shape,
+        })
+    }
+
+    /// Scalar offset from the beginning of the logical row-major tensor.
+    pub const fn offset_elements(&self) -> u64 {
+        self.offset_elements
+    }
+
+    /// Row-major shape exposed by the selected interval.
+    pub fn shape(&self) -> &[u64] {
+        &self.shape
+    }
+
+    fn element_count(&self) -> Result<u64> {
+        self.shape.iter().try_fold(1u64, |elements, dimension| {
+            elements
+                .checked_mul(*dimension)
+                .ok_or(Error::Overflow("dense tensor span element count"))
+        })
+    }
+}
+
+/// Metadata-only physical read plan for one dense contiguous tensor span.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DenseTensorSpanPlan {
+    selection: DenseTensorSpan,
+    selected_descriptor: TensorDescriptor,
+    encoded_span: EncodedSpan,
+}
+
+impl DenseTensorSpanPlan {
+    /// Validates a fixed-width dense span without reading its payload.
+    pub fn new(tensor: &TensorDescriptor, selection: DenseTensorSpan) -> Result<Self> {
+        if !matches!(
+            tensor.ggml_type,
+            GgmlType::F32 | GgmlType::F16 | GgmlType::Bf16
+        ) {
+            return Err(Error::tensor(
+                &tensor.name,
+                format!(
+                    "contiguous scalar spans require an unquantized F32, F16, or BF16 tensor, got {:?}",
+                    tensor.ggml_type
+                ),
+            ));
+        }
+        let tensor_elements = tensor.element_count()?;
+        let (_, element_bytes) = tensor.ggml_type.block_and_bytes()?;
+        let expected_source_bytes = tensor_elements
+            .checked_mul(element_bytes)
+            .ok_or(Error::Overflow("dense tensor byte length"))?;
+        if expected_source_bytes != tensor.byte_len {
+            return Err(Error::tensor(
+                &tensor.name,
+                format!(
+                    "descriptor declares {} encoded bytes but its dense shape and type require {expected_source_bytes}",
+                    tensor.byte_len
+                ),
+            ));
+        }
+        let selected_elements = selection.element_count()?;
+        let selected_end = selection
+            .offset_elements
+            .checked_add(selected_elements)
+            .ok_or(Error::Overflow("dense tensor span end"))?;
+        if selected_end > tensor_elements {
+            return Err(Error::tensor(
+                &tensor.name,
+                format!(
+                    "contiguous scalar span {}..{selected_end} exceeds tensor element count {tensor_elements}",
+                    selection.offset_elements
+                ),
+            ));
+        }
+        let (block_values, _) = tensor.ggml_type.block_and_bytes()?;
+        debug_assert_eq!(block_values, 1);
+        let byte_offset = selection
+            .offset_elements
+            .checked_mul(element_bytes)
+            .ok_or(Error::Overflow("dense tensor span byte offset"))?;
+        let byte_len = selected_elements
+            .checked_mul(element_bytes)
+            .ok_or(Error::Overflow("dense tensor span byte length"))?;
+        let offset = tensor
+            .data_offset
+            .checked_add(byte_offset)
+            .ok_or(Error::Overflow("dense tensor span file offset"))?;
+        let end = offset
+            .checked_add(byte_len)
+            .ok_or(Error::Overflow("dense tensor span file end"))?;
+        let tensor_end = tensor
+            .data_offset
+            .checked_add(tensor.byte_len)
+            .ok_or(Error::Overflow("tensor end offset"))?;
+        if end > tensor_end {
+            return Err(Error::tensor(
+                &tensor.name,
+                "contiguous scalar span exceeds the encoded tensor payload",
+            ));
+        }
+
+        let mut selected_descriptor = tensor.clone();
+        selected_descriptor.dimensions = selection.shape.iter().rev().copied().collect();
+        selected_descriptor.relative_offset = selected_descriptor
+            .relative_offset
+            .checked_add(byte_offset)
+            .ok_or(Error::Overflow("dense tensor span relative offset"))?;
+        selected_descriptor.data_offset = offset;
+        selected_descriptor.byte_len = byte_len;
+        Ok(Self {
+            selection,
+            selected_descriptor,
+            encoded_span: EncodedSpan { offset, byte_len },
+        })
+    }
+
+    /// Original logical span represented by this plan.
+    pub const fn selection(&self) -> &DenseTensorSpan {
+        &self.selection
+    }
+
+    /// Descriptor used to convert the compact selected payload.
+    pub const fn selected_descriptor(&self) -> &TensorDescriptor {
+        &self.selected_descriptor
+    }
+
+    /// Exact physical file range read by the plan.
+    pub const fn encoded_span(&self) -> EncodedSpan {
+        self.encoded_span
+    }
+
+    /// Exact number of encoded bytes read by the plan.
+    pub const fn encoded_byte_len(&self) -> u64 {
+        self.encoded_span.byte_len
+    }
+}
+
 impl EncodedSpan {
     /// Absolute byte offset in the GGUF shard.
     pub const fn offset(&self) -> u64 {
@@ -710,6 +873,35 @@ impl<R: Read + Seek> Reader<R> {
                     source,
                 })?;
         }
+        crate::convert::convert(plan.selected_descriptor(), &raw, self.endian)
+    }
+
+    /// Execute a validated fixed-width dense contiguous-span plan.
+    pub fn read_dense_tensor_span(
+        &mut self,
+        plan: &DenseTensorSpanPlan,
+    ) -> Result<ConvertedTensor> {
+        check_limit(
+            "tensor allocation",
+            plan.encoded_byte_len(),
+            self.limits.max_allocation_bytes,
+        )?;
+        let span = plan.encoded_span();
+        self.inner
+            .seek(SeekFrom::Start(span.offset()))
+            .map_err(|source| Error::Io {
+                offset: span.offset(),
+                source,
+            })?;
+        let len = usize::try_from(span.byte_len())
+            .map_err(|_| Error::Overflow("dense tensor span allocation"))?;
+        let mut raw = vec![0; len];
+        self.inner
+            .read_exact(&mut raw)
+            .map_err(|source| Error::Io {
+                offset: span.offset(),
+                source,
+            })?;
         crate::convert::convert(plan.selected_descriptor(), &raw, self.endian)
     }
 }

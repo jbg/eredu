@@ -1,6 +1,7 @@
 use safemlx_gguf::{
-    Checkpoint, ConvertedTensor, Endian, Error, GgmlType, LogicalDtype, MetadataValue,
-    TensorDescriptor, TensorInput, TensorSelection, TensorSelectionPlan, Writer, WriterOptions,
+    Checkpoint, ConvertedTensor, DenseTensorSpan, DenseTensorSpanPlan, Endian, Error, GgmlType,
+    LogicalDtype, MetadataValue, TensorDescriptor, TensorInput, TensorSelection,
+    TensorSelectionPlan, Writer, WriterOptions,
 };
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -71,6 +72,86 @@ fn selects_dense_outer_ranges_and_reordered_indices_without_full_conversion() {
     ]
     .concat();
     assert_eq!(reordered.data, expected);
+}
+
+#[test]
+fn reads_one_reshaped_contiguous_span_from_a_dense_bank() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("dense-span.gguf");
+    let values = (0..24).map(|value| value as f32).collect::<Vec<_>>();
+    let bytes = values
+        .iter()
+        .flat_map(|value| value.to_le_bytes())
+        .collect::<Vec<_>>();
+    write_file(
+        &path,
+        None,
+        "dense contiguous span",
+        &[FixtureTensor {
+            name: "bank.weight",
+            dimensions: &[4, 3, 2],
+            ty: GgmlType::F32,
+            data: &bytes,
+        }],
+    );
+
+    let checkpoint = Checkpoint::open(path).unwrap();
+    let descriptor = checkpoint.shards()[0].tensors()[0].descriptor();
+    let selection = DenseTensorSpan::new(8, vec![1, 2, 4]).unwrap();
+    let plan = DenseTensorSpanPlan::new(descriptor, selection.clone()).unwrap();
+    assert_eq!(plan.selected_descriptor().mlx_shape(), [1, 2, 4]);
+    assert_eq!(plan.encoded_byte_len(), 32);
+    assert_eq!(plan.encoded_span().offset(), descriptor.data_offset + 8 * 4);
+
+    let selected = checkpoint
+        .materializer()
+        .converted_dense_tensor_span("bank.weight", &selection)
+        .unwrap();
+    let ConvertedTensor::Dense(selected) = selected.converted() else {
+        panic!("expected dense selection");
+    };
+    assert_eq!(selected.shape, [1, 2, 4]);
+    let selected = selected
+        .data
+        .chunks_exact(4)
+        .map(|bytes| f32::from_ne_bytes(bytes.try_into().unwrap()))
+        .collect::<Vec<_>>();
+    assert_eq!(selected, values[8..16]);
+}
+
+#[test]
+fn dense_span_type_rejects_packed_and_out_of_bounds_sources() {
+    let dense = TensorDescriptor {
+        name: "dense.weight".into(),
+        dimensions: vec![4, 3, 2],
+        ggml_type: GgmlType::Bf16,
+        relative_offset: 0,
+        data_offset: 128,
+        byte_len: 48,
+    };
+    assert!(
+        DenseTensorSpanPlan::new(&dense, DenseTensorSpan::new(20, vec![1, 2, 4]).unwrap()).is_err()
+    );
+    let mut malformed = dense.clone();
+    malformed.byte_len -= 1;
+    assert!(
+        DenseTensorSpanPlan::new(&malformed, DenseTensorSpan::new(0, vec![1, 2, 4]).unwrap())
+            .is_err()
+    );
+
+    let packed = TensorDescriptor {
+        name: "packed.weight".into(),
+        dimensions: vec![32, 2],
+        ggml_type: GgmlType::Q4_0,
+        relative_offset: 0,
+        data_offset: 128,
+        byte_len: 36,
+    };
+    let error = DenseTensorSpanPlan::new(&packed, DenseTensorSpan::new(0, vec![1, 32]).unwrap())
+        .unwrap_err();
+    assert!(error.to_string().contains("unquantized F32, F16, or BF16"));
+    assert!(DenseTensorSpan::new(0, vec![]).is_err());
+    assert!(DenseTensorSpan::new(0, vec![1, 0, 4]).is_err());
 }
 
 #[test]

@@ -9,7 +9,10 @@ deterministic seekable GGUF files.
 set, exposes converted logical tensor layouts without reading payload bytes, and
 materializes one dense tensor, atomic affine group, or packed IQ tensor at a time.
 For bounded out-of-order access, `Checkpoint::materializer` indexes physical
-names once and reuses the current shard reader across named requests.
+names once and reuses the current shard reader across named requests. It can
+read native-axis selections from every supported encoding and reshaped
+contiguous scalar spans from F32, F16, or BF16 tensors. The dense-span type is
+not constructible for packed encodings.
 
 ```rust,no_run
 use safemlx_gguf::Checkpoint;

@@ -1107,15 +1107,15 @@ The remaining global limitations are:
   `PipelineStageInfo::materialization`, `ResidencyReport::materialization`, and
   `ExpertCacheReport::materialization` expose selected source bytes, output
   bytes, tile counts, and the peak admitted working set.
-- A reshaped contiguous scalar span is currently a SafeTensors storage
-  selection. GGUF load-time conversion remains available when its semantic
-  recipe reduces to the reader's native row/range selection, but a fused GGUF
-  bank requiring that reshaped span fails bounded preflight. Compatible dense
-  GGUF pipeline recipes now use the stage-local overlay, while standalone
-  nonresident GGUF loading and packed GGUF transcoding remain unsupported. This
-  restriction no longer applies merely because routed experts use an
-  independent cache. Inkling and Nemotron-H load-time expert conversion remains
-  unavailable until their grouped rank-3 kernels accept affine packed banks.
+- Fixed-width F32/F16/BF16 GGUF tensors support bounded row/range, indexed, and
+  reshaped contiguous-span reads. EP ownership, TP row placement, and
+  conversion tiles may therefore compose over a fused dense bank without
+  reading the complete bank. The contiguous-span type cannot be constructed
+  for packed GGUF encodings, and quantizing an already quantized checkpoint is
+  intentionally unsupported. Standalone nonresident GGUF conversion is not yet
+  connected to this shared store. Inkling and Nemotron-H load-time expert
+  conversion remains unavailable until their grouped rank-3 kernels accept
+  affine packed banks.
 
 TP+PP+EP is executable for DeepSeek-V3/R1, Qwen3-MoE, Qwen3-VL-MoE, Kimi
 Linear, Inkling, GPT-OSS, Gemma 4 MoE, LFM2-MoE, Nemotron-H-MoE, and

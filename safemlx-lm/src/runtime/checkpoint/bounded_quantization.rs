@@ -1079,6 +1079,65 @@ mod tests {
     }
 
     #[test]
+    fn dense_gguf_expert_and_row_selections_compose_without_full_bank_reads() {
+        let values = matrix_values(2, 4, 64);
+        let dense = Array::from_slice(&values, &[2, 4, 64]);
+        let fixture = SyntheticGguf::dense(
+            &HashMap::from([("checkpoint.experts.weight".to_string(), dense)]),
+            &HashMap::new(),
+        );
+        let source = Arc::new(
+            GgufWeightStore::new(GgufCheckpoint::open(fixture.path()).unwrap(), |name| {
+                name.to_string()
+            })
+            .unwrap(),
+        );
+        let context = cpu_context();
+        let recipe = DerivedWeightRecipe::Select {
+            input: Box::new(DerivedWeightRecipe::source(
+                "checkpoint.experts.weight",
+                TensorSelection::Range {
+                    axis: 0,
+                    start: 1,
+                    end: 2,
+                },
+            )),
+            selection: TensorSelection::Range {
+                axis: 1,
+                start: 1,
+                end: 3,
+            },
+        };
+        let target = BoundedQuantizationTarget::from_recipe("rank.expert.weight", recipe).unwrap();
+        let plan =
+            BoundedQuantizationPlan::new(AffineQuantization::default(), 296, [target]).unwrap();
+        let transformed =
+            BoundedQuantizedWeightStore::create(source.clone(), plan, context.stream()).unwrap();
+
+        assert_eq!(transformed.report().source_tiles, 2);
+        assert_eq!(transformed.report().source_bytes_read, 512);
+        assert_eq!(transformed.report().output_bytes, 80);
+        assert_eq!(transformed.report().peak_planned_working_set_bytes, 296);
+        let diagnostics = source.diagnostics().unwrap();
+        assert_eq!(diagnostics.physical_reads, 2);
+        assert_eq!(diagnostics.physical_read_bytes, 512);
+
+        let selected = &values[(4 + 1) * 64..(4 + 3) * 64];
+        let expected = quantize_tensor(
+            &Array::from_slice(selected, &[1, 2, 64]),
+            AffineQuantization::default(),
+            context.stream(),
+        )
+        .unwrap();
+        let actual = materialize(&transformed, "rank.expert.weight", context.stream());
+        assert_eq!(actual.shape(), &[1, 2, 8]);
+        assert_eq!(
+            actual.evaluated().unwrap().as_slice::<u32>(),
+            expected.weight.evaluated().unwrap().as_slice::<u32>()
+        );
+    }
+
+    #[test]
     fn mxfp4_layout_has_byte_scales_and_no_biases() {
         let (_directory, source, values) = direct_fixture();
         let context = cpu_context();

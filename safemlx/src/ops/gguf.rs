@@ -6,6 +6,7 @@ use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
 
 pub use safemlx_gguf::{
+    DenseTensorSpan as GgufDenseTensorSpan, DenseTensorSpanPlan as GgufDenseTensorSpanPlan,
     EncodedSpan as GgufEncodedSpan, Endian as GgufEndian, GgmlType as GgufType,
     LogicalDtype as GgufLogicalDtype, MetadataArray as GgufMetadataArray,
     MetadataValue as GgufMetadataValue, SelectionAlignment as GgufSelectionAlignment,
@@ -376,6 +377,30 @@ impl GgufMaterializer {
         selection: &GgufTensorSelection,
     ) -> Result<GgufTensor, IoError> {
         convert_tensor(self.inner.converted_tensor_selected(name, selection)?, true)
+    }
+
+    /// Materialize a bounded contiguous span from an unquantized dense tensor.
+    pub fn converted_dense_tensor_span(
+        &mut self,
+        name: &str,
+        selection: &GgufDenseTensorSpan,
+    ) -> Result<GgufTensor, IoError> {
+        convert_tensor(
+            self.inner.converted_dense_tensor_span(name, selection)?,
+            false,
+        )
+    }
+
+    /// Materialize a bounded dense contiguous span as owned host-backed data.
+    pub fn converted_dense_tensor_span_host(
+        &mut self,
+        name: &str,
+        selection: &GgufDenseTensorSpan,
+    ) -> Result<GgufTensor, IoError> {
+        convert_tensor(
+            self.inner.converted_dense_tensor_span(name, selection)?,
+            true,
+        )
     }
 
     /// Materialize one physical tensor without converting its GGUF blocks.
