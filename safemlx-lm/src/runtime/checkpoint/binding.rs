@@ -137,7 +137,7 @@ pub(crate) fn materialize_module_bindings(
 /// Populates an unloaded module from materialized local-name bindings while
 /// permitting an independently managed parameter class to remain unloaded.
 pub(crate) fn populate_module_from_arrays_excluding<F>(
-    module: &mut impl ModuleParameters,
+    module: &mut (impl ModuleParameters + ?Sized),
     arrays: &BTreeMap<String, Array>,
     excluded: F,
 ) -> Result<(), ModuleBindingError>
@@ -188,7 +188,7 @@ where
 /// expert banks, biases, and non-quantizable parameters follow the same target
 /// module contract as a conventional SafeTensors load.
 pub(crate) fn populate_module_from_dense_arrays_quantized(
-    module: &mut impl ModuleParameters,
+    module: &mut (impl ModuleParameters + ?Sized),
     arrays: &BTreeMap<String, Array>,
     quantization: WeightQuantization,
     stream: &Stream,

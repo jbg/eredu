@@ -7,6 +7,9 @@
 //! drains bounded, round-robin microbatch queues so different requests can
 //! occupy different pipeline stages concurrently. Communication groups are
 //! borrowed for each operation and are never retained by model state.
+//! Multimodal families place their semantic encoder roots on stage zero and
+//! transport only adapter-declared decoder ingress tensors to later stages;
+//! tower and decoder units share the same rank-local residency plan.
 
 use std::{
     collections::{BTreeMap, HashMap},
@@ -33,6 +36,7 @@ use crate::{
         ModelKind, ModelLoadOptions,
     },
     architectures::{
+        gemma4::layerwise::{Gemma4Layer, Gemma4LayerwiseAdapter},
         inkling::layerwise::{InklingLayer, InklingLayerwiseAdapter},
         kimi_linear::layerwise::KimiLinearLayerwiseAdapter,
         lfm2::layerwise::Lfm2LayerwiseAdapter,
@@ -1108,8 +1112,13 @@ struct DeepSeekStage {
 
 struct GemmaStage {
     args: gemma4::ModelArgs,
-    layer_adapter: crate::architectures::gemma4::layerwise::Gemma4LayerwiseAdapter,
+    layer_adapter: Gemma4LayerwiseAdapter,
     range: Range<usize>,
+    has_multimodal_ingress: bool,
+    media_units: Vec<GemmaPipelineMediaUnit>,
+    media_layers: Vec<Gemma4Layer>,
+    media_layer_count: usize,
+    multimodal_mask_windows: Vec<std::num::NonZeroU32>,
     embedding: Option<gemma4::Gemma4Embedding>,
     output_embedding: Option<gemma4::Gemma4Embedding>,
     per_layer_embedding: Option<gemma4::Gemma4Embedding>,
@@ -1127,6 +1136,12 @@ struct GemmaStage {
     parallel_per_layer_projection: Option<crate::nn::parallel::ParallelLinear>,
     parallel_lm_head: Option<crate::nn::parallel::VocabParallelLmHead>,
     parallel_layout: Option<crate::runtime::distributed::parallel::LocalModelLayout>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct GemmaPipelineMediaUnit {
+    group: usize,
+    index: usize,
 }
 
 struct DenseQwenStage {
@@ -1539,12 +1554,24 @@ struct PipelineLayerStorage {
     residency: ResidencyManager,
     controller: PipelineLayerController,
     units: Vec<OffloadUnitId>,
+    execution_offset: usize,
     independent_expert_prefix: Option<&'static str>,
     sample_mlx_memory: bool,
     sample_process_memory: bool,
 }
 
 impl PipelineLayerStorage {
+    fn with_execution_offset(mut self, execution_offset: usize) -> Result<Self, Error> {
+        if execution_offset > self.units.len() {
+            return Err(Error::Parallel(format!(
+                "pipeline execution offset {execution_offset} exceeds {} planned units",
+                self.units.len()
+            )));
+        }
+        self.execution_offset = execution_offset;
+        Ok(self)
+    }
+
     fn with_independent_experts(mut self, parameter_prefix: &'static str) -> Self {
         self.independent_expert_prefix = Some(parameter_prefix);
         self
@@ -1560,31 +1587,55 @@ impl PipelineLayerStorage {
         ),
         Error,
     > {
+        self.prepare_absolute(self.execution_offset + local_index, prefill)
+    }
+
+    fn prepare_absolute(
+        &self,
+        unit_index: usize,
+        prefill: bool,
+    ) -> Result<
+        (
+            Option<crate::runtime::residency::manager::ResidentUnitLease>,
+            crate::runtime::residency::manager::ResidentUnitLease,
+        ),
+        Error,
+    > {
+        if unit_index >= self.units.len() {
+            return Err(Error::Parallel(format!(
+                "pipeline unit index {unit_index} exceeds {} planned units",
+                self.units.len()
+            )));
+        }
         match &self.controller {
             PipelineLayerController::LayerwiseHost(group) => {
-                group.prepare(&self.residency, local_index)?;
+                group.prepare(&self.residency, unit_index)?;
                 Ok((
                     None,
                     self.residency
-                        .acquire(&self.units[local_index], MemoryTier::Device)?,
+                        .acquire(&self.units[unit_index], MemoryTier::Device)?,
                 ))
             }
             PipelineLayerController::DenseDiskStream(controller) => controller.prepare(
                 &self.residency,
                 "pipeline_stage",
                 &self.units,
-                local_index,
+                unit_index,
                 prefill,
             ),
         }
     }
 
     fn trim_after(&self, local_index: usize) -> Result<(), Error> {
+        self.trim_after_absolute(self.execution_offset + local_index)
+    }
+
+    fn trim_after_absolute(&self, unit_index: usize) -> Result<(), Error> {
         if let PipelineLayerController::LayerwiseHost(group) = &self.controller {
-            let end = local_index
+            let end = unit_index
                 .saturating_add(group.depth())
                 .min(self.units.len());
-            group.trim_to(&self.residency, &self.units[local_index..end])?;
+            group.trim_to(&self.residency, &self.units[unit_index..end])?;
         }
         Ok(())
     }
@@ -2198,16 +2249,22 @@ impl PipelineStageSemantics for GemmaStage {
     }
 
     fn auxiliary_shapes(&self, step: PipelineStep) -> Vec<Vec<i32>> {
+        let mut shapes = Vec::new();
         if self.args.hidden_size_per_layer_input > 0 {
-            vec![vec![
+            shapes.push(vec![
                 step.batch_size,
                 step.sequence_length,
                 self.args.num_hidden_layers,
                 self.args.hidden_size_per_layer_input,
-            ]]
-        } else {
-            Vec::new()
+            ]);
         }
+        if self.has_multimodal_ingress && step.sequence_length > 1 {
+            shapes.extend(std::iter::repeat_n(
+                vec![1, 1, step.sequence_length, step.sequence_length],
+                1 + self.multimodal_mask_windows.len(),
+            ));
+        }
+        shapes
     }
 
     fn dense_layers(&self) -> Option<&PipelineLayerStorage> {
@@ -2254,6 +2311,42 @@ impl PipelineStageSemantics for GemmaStage {
         stream: &Stream,
     ) -> Result<PipelineStageOutput, Error> {
         GemmaStage::forward(self, input, step, mask, cache, stream)
+    }
+
+    fn prefill(
+        &mut self,
+        input: crate::api::input::ModelInput<'_>,
+        step: PipelineStep,
+        mask: Option<&Array>,
+        cache: &mut [PipelineLayerCache],
+        execution: Option<&ParallelExecutionContext<'_>>,
+        expert_group: Option<&Group>,
+        stream: &Stream,
+    ) -> Result<PipelineStageOutput, Error> {
+        if expert_group.is_some() {
+            return Err(Error::Parallel(
+                "Gemma 4 multimodal pipeline ingress does not activate expert exchange".into(),
+            ));
+        }
+        let (hidden, auxiliary) =
+            self.prepare_multimodal_ingress(input, step, execution, stream)?;
+        let payload = PipelinePayload { hidden, auxiliary };
+        match execution {
+            Some(execution) if execution.is_tensor_parallel() => self.forward_tensor_parallel(
+                PipelineStageInput::Hidden(&payload),
+                step,
+                mask,
+                cache,
+                execution,
+            ),
+            _ => self.forward(
+                PipelineStageInput::Hidden(&payload),
+                step,
+                mask,
+                cache,
+                stream,
+            ),
+        }
     }
 
     fn forward_with_execution(
@@ -4691,7 +4784,7 @@ where
 }
 
 fn load_bound_module(
-    module: &mut impl ModuleParameters,
+    module: &mut (impl ModuleParameters + ?Sized),
     store: &dyn WeightStore,
     bindings: &[crate::runtime::residency::manager::WeightBinding],
     quantize_on_load: Option<WeightQuantization>,
@@ -4711,7 +4804,7 @@ fn load_bound_module(
 
 #[allow(clippy::too_many_arguments)]
 fn load_bound_module_excluding(
-    module: &mut impl ModuleParameters,
+    module: &mut (impl ModuleParameters + ?Sized),
     store: &dyn WeightStore,
     bindings: &[crate::runtime::residency::manager::WeightBinding],
     quantize_on_load: Option<WeightQuantization>,
@@ -4781,7 +4874,7 @@ impl PipelineLoadAccumulator {
         }
     }
 
-    fn load<M: ModuleParameters>(
+    fn load<M: ModuleParameters + ?Sized>(
         &mut self,
         module: &mut M,
         store: &dyn WeightStore,
@@ -4870,6 +4963,19 @@ fn pipeline_static_bindings<'a>(
                 "pipeline architecture adapter did not declare static role {role:?}"
             ))
         })
+}
+
+fn pipeline_cartesian_static_bindings(
+    units: &[StaticUnitBindings],
+    role: &str,
+    store: &dyn WeightStore,
+    layout: Option<&crate::runtime::distributed::parallel::LocalModelLayout>,
+) -> Result<Vec<crate::runtime::residency::manager::WeightBinding>, Error> {
+    let bindings = pipeline_static_bindings(units, role)?.to_vec();
+    match layout {
+        Some(layout) => shard_layer_bindings(bindings, "", store, layout),
+        None => Ok(bindings),
+    }
 }
 
 fn selected_pipeline_static_roles(
@@ -5074,6 +5180,7 @@ where
         residency,
         controller,
         units,
+        execution_offset: 0,
         independent_expert_prefix: None,
         sample_mlx_memory,
         sample_process_memory,
@@ -5302,7 +5409,14 @@ pub fn load_pipeline_model_with_options(
                         max_mapped_shards,
                     )?);
                 load_gemma_pipeline(
-                    prepared.args,
+                    GemmaPipelineConfig {
+                        args: prepared.args,
+                        vision_config: None,
+                        image_token_id: None,
+                        video_token_id: None,
+                        audio_config: None,
+                        audio_token_id: None,
+                    },
                     store,
                     topology,
                     options.quantization,
@@ -5662,9 +5776,17 @@ pub fn load_pipeline_model_with_options(
                 model_dir,
                 options,
             )?;
-            let (args, _, _, _, _, _) = gemma4::get_gemma4_model_config(model_dir)?;
+            let (args, vision, image_token_id, video_token_id, audio, audio_token_id) =
+                gemma4::get_gemma4_model_config(model_dir)?;
             load_gemma_pipeline(
-                args,
+                GemmaPipelineConfig {
+                    args,
+                    vision_config: vision,
+                    image_token_id,
+                    video_token_id,
+                    audio_config: audio,
+                    audio_token_id,
+                },
                 store,
                 topology,
                 options.quantization,
@@ -10865,6 +10987,23 @@ impl GemmaStage {
             )));
         }
         let stream = execution.stream();
+        let prepared_ingress = match input {
+            PipelineStageInput::Tokens(tokens) if self.has_multimodal_ingress => {
+                let parts = [crate::api::input::InputPart::text_token_ids(tokens)];
+                Some(self.prepare_multimodal_ingress(
+                    crate::api::input::ModelInput::new(&parts),
+                    step,
+                    Some(execution),
+                    stream,
+                )?)
+            }
+            _ => None,
+        };
+        let prepared_payload =
+            prepared_ingress.map(|(hidden, auxiliary)| PipelinePayload { hidden, auxiliary });
+        let input = prepared_payload
+            .as_ref()
+            .map_or(input, PipelineStageInput::Hidden);
         let (mut hidden, auxiliary) = match input {
             PipelineStageInput::Hidden(payload) => {
                 (payload.hidden.clone(), payload.auxiliary.clone())
@@ -10957,12 +11096,26 @@ impl GemmaStage {
         let generated_mask = (explicit_mask.is_none() && step.sequence_length > 1)
             .then(|| create_causal_mask(step.sequence_length, Some(offset), None, None, stream))
             .transpose()?;
-        let mask = explicit_mask.or(generated_mask.as_ref());
-        let per_layer_inputs = auxiliary.tensors().first();
+        let ordinary_mask = explicit_mask.or(generated_mask.as_ref());
+        let layer_masks = self
+            .range
+            .clone()
+            .map(|global_layer| {
+                let policy = self
+                    .args
+                    .layer_policy(global_layer)
+                    .expect("validated Gemma TP+PP range");
+                self.multimodal_mask(&auxiliary, step, policy.attention)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let per_layer_inputs = (self.args.hidden_size_per_layer_input > 0)
+            .then(|| auxiliary.tensors().first())
+            .flatten();
         let mut shared_kv = HashMap::new();
         let args = self.args.clone();
         let layer_adapter = &self.layer_adapter;
         let parallel_layout = self.parallel_layout.clone();
+        let range_start = self.range.start;
         hidden = execute_pipeline_layer_range(
             PipelineLayerExecution {
                 range: self.range.clone(),
@@ -10984,6 +11137,7 @@ impl GemmaStage {
                 let policy = *args
                     .layer_policy(global_layer)
                     .expect("validated Gemma TP+PP range");
+                let mask = layer_masks[global_layer - range_start].or(ordinary_mask);
                 let per_layer_input = per_layer_inputs
                     .map(|inputs| {
                         inputs.try_index_device((.., .., global_layer as i32, ..), stream)
@@ -15546,8 +15700,17 @@ impl InklingStage {
     }
 }
 
+struct GemmaPipelineConfig {
+    args: gemma4::ModelArgs,
+    vision_config: Option<crate::api::gemma4_vision::Gemma4VisionConfig>,
+    image_token_id: Option<i32>,
+    video_token_id: Option<i32>,
+    audio_config: Option<crate::api::gemma4_audio::Gemma4AudioConfig>,
+    audio_token_id: Option<i32>,
+}
+
 fn load_gemma_pipeline(
-    source_args: gemma4::ModelArgs,
+    source: GemmaPipelineConfig,
     store: SharedWeightStore,
     topology: ParallelTopology,
     requested_quantization: Option<WeightQuantization>,
@@ -15555,6 +15718,14 @@ fn load_gemma_pipeline(
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<PipelineModel, Error> {
+    let GemmaPipelineConfig {
+        args: source_args,
+        vision_config,
+        image_token_id,
+        video_token_id,
+        audio_config,
+        audio_token_id,
+    } = source;
     topology.preflight(Some(source_args.layer_schedule.len()), None)?;
     let quantize_on_load = requested_quantization
         .map(|requested| {
@@ -15593,12 +15764,26 @@ fn load_gemma_pipeline(
         ModelKind::Gemma4,
         source_args.hidden_size,
     );
-    let mut stage = GemmaStage::new(target_args.clone(), range, &info, stream)?;
-    let binding_adapter =
-        crate::architectures::gemma4::layerwise::Gemma4LayerwiseAdapter::new_text(
-            source_args.clone(),
-            stream,
-        )?;
+    let mut stage = GemmaStage::new(
+        target_args.clone(),
+        vision_config.clone(),
+        image_token_id,
+        video_token_id,
+        audio_config.clone(),
+        audio_token_id,
+        range,
+        &info,
+        stream,
+    )?;
+    let binding_adapter = Gemma4LayerwiseAdapter::new_pipeline(
+        source_args.clone(),
+        vision_config,
+        image_token_id,
+        video_token_id,
+        audio_config,
+        audio_token_id,
+        stream,
+    )?;
     let parallel_layout = if topology.tensor_parallel_size > 1 {
         let build = ParallelBuildContext::new(topology, ShardingPolicy::Require);
         let mut planner = build.planner();
@@ -15614,8 +15799,7 @@ fn load_gemma_pipeline(
             topology.tensor_parallel_rank,
             false,
         )?;
-        stage.parallel_embedding = info
-            .is_first
+        stage.parallel_embedding = (info.is_first && !stage.has_multimodal_ingress)
             .then(|| {
                 gemma4::Gemma4Embedding::unloaded(
                     vocabulary.len() as i32,
@@ -15637,7 +15821,10 @@ fn load_gemma_pipeline(
             .transpose()?;
         stage.parallel_vocabulary = Some(vocabulary);
 
-        if info.is_first && target_args.hidden_size_per_layer_input > 0 {
+        if info.is_first
+            && !stage.has_multimodal_ingress
+            && target_args.hidden_size_per_layer_input > 0
+        {
             let global = target_args
                 .vocab_size_per_layer_input
                 .unwrap_or(target_args.vocab_size) as usize;
@@ -15704,30 +15891,86 @@ fn load_gemma_pipeline(
         &selected_pipeline_static_roles([
             (
                 "embedding",
-                stage.embedding.is_some()
+                (info.is_first && stage.has_multimodal_ingress)
+                    || stage.embedding.is_some()
                     || stage.output_embedding.is_some()
                     || stage.parallel_embedding.is_some()
                     || stage.parallel_output_embedding.is_some(),
             ),
             (
                 "per_layer_embedding",
-                stage.per_layer_embedding.is_some() || stage.parallel_per_layer_embedding.is_some(),
+                (info.is_first
+                    && stage.has_multimodal_ingress
+                    && target_args.hidden_size_per_layer_input > 0)
+                    || stage.per_layer_embedding.is_some()
+                    || stage.parallel_per_layer_embedding.is_some(),
             ),
             (
                 "per_layer_projection",
-                stage.per_layer_projection.is_some()
+                (info.is_first
+                    && stage.has_multimodal_ingress
+                    && target_args.hidden_size_per_layer_input > 0)
+                    || stage.per_layer_projection.is_some()
                     || stage.parallel_per_layer_projection.is_some(),
             ),
-            ("per_layer_norm", stage.per_layer_norm.is_some()),
+            (
+                "per_layer_norm",
+                (info.is_first
+                    && stage.has_multimodal_ingress
+                    && target_args.hidden_size_per_layer_input > 0)
+                    || stage.per_layer_norm.is_some(),
+            ),
             ("norm", stage.norm.is_some()),
             (
                 "output",
                 stage.lm_head.is_some() || stage.parallel_lm_head.is_some(),
             ),
+            (
+                "vision",
+                info.is_first && stage.layer_adapter.pipeline_static_mut("vision").is_some(),
+            ),
+            (
+                "vision_embed",
+                info.is_first
+                    && stage
+                        .layer_adapter
+                        .pipeline_static_mut("vision_embed")
+                        .is_some(),
+            ),
+            (
+                "audio",
+                info.is_first && stage.layer_adapter.pipeline_static_mut("audio").is_some(),
+            ),
+            (
+                "audio_embed",
+                info.is_first
+                    && stage
+                        .layer_adapter
+                        .pipeline_static_mut("audio_embed")
+                        .is_some(),
+            ),
         ]),
     )?;
     let mut loaded = PipelineLoadAccumulator::new("Gemma");
-    if let Some(module) = &mut stage.parallel_embedding {
+    if info.is_first && stage.has_multimodal_ingress {
+        let bindings = pipeline_cartesian_static_bindings(
+            &static_units,
+            "embedding",
+            store.as_ref(),
+            parallel_layout.as_ref(),
+        )?;
+        loaded.load(
+            stage
+                .layer_adapter
+                .pipeline_static_mut("embedding")
+                .expect("Gemma multimodal ingress embedding"),
+            store.as_ref(),
+            &bindings,
+            quantize_on_load,
+            weights_stream,
+            stream,
+        )?;
+    } else if let Some(module) = &mut stage.parallel_embedding {
         let bindings = shard_layer_bindings(
             pipeline_static_bindings(&static_units, "embedding")?.to_vec(),
             "",
@@ -15777,7 +16020,26 @@ fn load_gemma_pipeline(
             stream,
         )?;
     }
-    if let Some(module) = &mut stage.parallel_per_layer_embedding {
+    if info.is_first && stage.has_multimodal_ingress && target_args.hidden_size_per_layer_input > 0
+    {
+        let bindings = pipeline_cartesian_static_bindings(
+            &static_units,
+            "per_layer_embedding",
+            store.as_ref(),
+            parallel_layout.as_ref(),
+        )?;
+        loaded.load(
+            stage
+                .layer_adapter
+                .pipeline_static_mut("per_layer_embedding")
+                .expect("Gemma multimodal per-layer embedding"),
+            store.as_ref(),
+            &bindings,
+            quantize_on_load,
+            weights_stream,
+            stream,
+        )?;
+    } else if let Some(module) = &mut stage.parallel_per_layer_embedding {
         let bindings = shard_layer_bindings(
             pipeline_static_bindings(&static_units, "per_layer_embedding")?.to_vec(),
             "",
@@ -15802,7 +16064,26 @@ fn load_gemma_pipeline(
             stream,
         )?;
     }
-    if let Some(module) = &mut stage.parallel_per_layer_projection {
+    if info.is_first && stage.has_multimodal_ingress && target_args.hidden_size_per_layer_input > 0
+    {
+        let bindings = pipeline_cartesian_static_bindings(
+            &static_units,
+            "per_layer_projection",
+            store.as_ref(),
+            parallel_layout.as_ref(),
+        )?;
+        loaded.load(
+            stage
+                .layer_adapter
+                .pipeline_static_mut("per_layer_projection")
+                .expect("Gemma multimodal per-layer projection"),
+            store.as_ref(),
+            &bindings,
+            quantize_on_load,
+            weights_stream,
+            stream,
+        )?;
+    } else if let Some(module) = &mut stage.parallel_per_layer_projection {
         let bindings = shard_layer_bindings(
             pipeline_static_bindings(&static_units, "per_layer_projection")?.to_vec(),
             "",
@@ -15827,7 +16108,26 @@ fn load_gemma_pipeline(
             stream,
         )?;
     }
-    if let Some(module) = &mut stage.per_layer_norm {
+    if info.is_first && stage.has_multimodal_ingress && target_args.hidden_size_per_layer_input > 0
+    {
+        let bindings = pipeline_cartesian_static_bindings(
+            &static_units,
+            "per_layer_norm",
+            store.as_ref(),
+            parallel_layout.as_ref(),
+        )?;
+        loaded.load(
+            stage
+                .layer_adapter
+                .pipeline_static_mut("per_layer_norm")
+                .expect("Gemma multimodal per-layer norm"),
+            store.as_ref(),
+            &bindings,
+            quantize_on_load,
+            weights_stream,
+            stream,
+        )?;
+    } else if let Some(module) = &mut stage.per_layer_norm {
         loaded.load(
             module,
             store.as_ref(),
@@ -15873,7 +16173,71 @@ fn load_gemma_pipeline(
         )?;
     }
 
+    if info.is_first && stage.has_multimodal_ingress {
+        for role in ["vision", "vision_embed", "audio", "audio_embed"] {
+            if stage.layer_adapter.pipeline_static_mut(role).is_none() {
+                continue;
+            }
+            let bindings = pipeline_cartesian_static_bindings(
+                &static_units,
+                role,
+                store.as_ref(),
+                parallel_layout.as_ref(),
+            )?;
+            loaded.load(
+                stage
+                    .layer_adapter
+                    .pipeline_static_mut(role)
+                    .expect("selected Gemma media static target"),
+                store.as_ref(),
+                &bindings,
+                if matches!(role, "vision_embed" | "audio_embed") {
+                    quantize_on_load
+                } else {
+                    None
+                },
+                weights_stream,
+                stream,
+            )?;
+        }
+    }
+
     if dense_stream.is_none() {
+        for unit in stage.media_units.iter().copied() {
+            let mut layer = match parallel_layout.as_ref() {
+                Some(layout) => stage
+                    .layer_adapter
+                    .new_parallel_layer(unit.group, unit.index, layout, stream)?,
+                None => stage
+                    .layer_adapter
+                    .new_layer(unit.group, unit.index, stream)?,
+            };
+            let bindings = match parallel_layout.as_ref() {
+                Some(layout) => binding_adapter.parallel_layer_bindings(
+                    unit.group,
+                    unit.index,
+                    &layer,
+                    store.as_ref(),
+                    layout,
+                    stream,
+                )?,
+                None => binding_adapter.layer_bindings(
+                    unit.group,
+                    unit.index,
+                    &layer,
+                    store.as_ref(),
+                )?,
+            };
+            loaded.load(
+                &mut layer,
+                store.as_ref(),
+                &bindings,
+                None,
+                weights_stream,
+                stream,
+            )?;
+            stage.media_layers.push(layer);
+        }
         for (global_layer, layer) in stage.range.clone().zip(&mut stage.layers) {
             let bindings = binding_adapter.cartesian_text_layer_bindings(
                 global_layer,
@@ -15899,30 +16263,65 @@ fn load_gemma_pipeline(
     if let Some(options) = dense_stream {
         let streamed_layout = parallel_layout.clone();
         let streamed_adapter = &stage.layer_adapter;
-        stage.dense_layers = Some(build_pipeline_layer_storage(
-            Arc::clone(&store),
-            stage.range.clone(),
-            options,
-            static_bytes,
-            stream,
-            weights_stream,
-            |global_layer, stream| {
-                streamed_adapter.new_cartesian_text_layer(
-                    global_layer,
-                    streamed_layout.as_ref(),
-                    stream,
-                )
-            },
-            |global_layer, layer, store| {
-                binding_adapter.cartesian_text_layer_bindings(
-                    global_layer,
-                    layer,
-                    store,
-                    streamed_layout.as_ref(),
-                    stream,
-                )
-            },
-        )?);
+        let media_units = stage.media_units.clone();
+        let media_count = media_units.len();
+        let text_start = stage.range.start;
+        let unit_count = media_count + stage.range.len();
+        stage.dense_layers = Some(
+            build_pipeline_layer_storage::<Gemma4Layer, _, _>(
+                Arc::clone(&store),
+                0..unit_count,
+                options,
+                static_bytes,
+                stream,
+                weights_stream,
+                |ordinal, stream| {
+                    if let Some(unit) = media_units.get(ordinal) {
+                        match streamed_layout.as_ref() {
+                            Some(layout) => streamed_adapter
+                                .new_parallel_layer(unit.group, unit.index, layout, stream),
+                            None => streamed_adapter.new_layer(unit.group, unit.index, stream),
+                        }
+                    } else {
+                        let global_layer = text_start + (ordinal - media_count);
+                        streamed_adapter
+                            .new_cartesian_text_layer(
+                                global_layer,
+                                streamed_layout.as_ref(),
+                                stream,
+                            )
+                            .map(|layer| Gemma4Layer::Text(Box::new(layer)))
+                    }
+                },
+                |ordinal, layer, store| {
+                    if let Some(unit) = media_units.get(ordinal) {
+                        match streamed_layout.as_ref() {
+                            Some(layout) => binding_adapter.parallel_layer_bindings(
+                                unit.group, unit.index, layer, store, layout, stream,
+                            ),
+                            None => {
+                                binding_adapter.layer_bindings(unit.group, unit.index, layer, store)
+                            }
+                        }
+                    } else {
+                        let global_layer = text_start + (ordinal - media_count);
+                        let Gemma4Layer::Text(layer) = layer else {
+                            return Err(Error::Parallel(format!(
+                                "Gemma pipeline unit {ordinal} is not a text block"
+                            )));
+                        };
+                        binding_adapter.cartesian_text_layer_bindings(
+                            global_layer,
+                            layer,
+                            store,
+                            streamed_layout.as_ref(),
+                            stream,
+                        )
+                    }
+                },
+            )?
+            .with_execution_offset(media_count)?,
+        );
         let layer_bytes = stage.dense_layers.as_ref().unwrap().planned_layer_bytes()?;
         info.planned_owned_parameter_bytes = static_bytes
             .checked_add(layer_bytes)
@@ -15936,17 +16335,51 @@ fn load_gemma_pipeline(
 }
 
 impl GemmaStage {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         args: gemma4::ModelArgs,
+        vision_config: Option<crate::api::gemma4_vision::Gemma4VisionConfig>,
+        image_token_id: Option<i32>,
+        video_token_id: Option<i32>,
+        audio_config: Option<crate::api::gemma4_audio::Gemma4AudioConfig>,
+        audio_token_id: Option<i32>,
         range: Range<usize>,
         info: &PipelineStageInfo,
         stream: &Stream,
     ) -> Result<Self, Error> {
-        let layer_adapter =
-            crate::architectures::gemma4::layerwise::Gemma4LayerwiseAdapter::new_text(
+        let has_multimodal_ingress = vision_config.is_some() || audio_config.is_some();
+        let layer_adapter = if info.is_first && has_multimodal_ingress {
+            Gemma4LayerwiseAdapter::new_pipeline(
                 args.clone(),
+                vision_config,
+                image_token_id,
+                video_token_id,
+                audio_config,
+                audio_token_id,
                 stream,
-            )?;
+            )?
+        } else {
+            Gemma4LayerwiseAdapter::new_text(args.clone(), stream)?
+        };
+        let media_units = layer_adapter
+            .pipeline_media_groups()
+            .into_iter()
+            .flat_map(|(group, depth)| {
+                (0..depth).map(move |index| GemmaPipelineMediaUnit { group, index })
+            })
+            .collect::<Vec<_>>();
+        let media_layer_count = media_units.len();
+        let multimodal_mask_windows = if has_multimodal_ingress {
+            args.layer_schedule
+                .iter()
+                .filter_map(|policy| policy.attention.window())
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let adapter_owns_ingress = info.is_first && has_multimodal_ingress;
         let make_embedding = || {
             gemma4::Gemma4Embedding::unloaded(
                 args.vocab_size,
@@ -15955,21 +16388,26 @@ impl GemmaStage {
                 stream,
             )
         };
-        let embedding = info.is_first.then(make_embedding).transpose()?;
+        let embedding = (info.is_first && !adapter_owns_ingress)
+            .then(make_embedding)
+            .transpose()?;
         let output_embedding = (info.is_last && !info.is_first && args.tie_word_embeddings)
             .then(make_embedding)
             .transpose()?;
-        let per_layer_embedding = (info.is_first && args.hidden_size_per_layer_input > 0)
-            .then(|| {
-                gemma4::Gemma4Embedding::unloaded(
-                    args.vocab_size_per_layer_input.unwrap_or(args.vocab_size),
-                    args.num_hidden_layers * args.hidden_size_per_layer_input,
-                    args.quantization_for("model.language_model.embed_tokens_per_layer.weight"),
-                    stream,
-                )
-            })
-            .transpose()?;
-        let per_layer_projection = (info.is_first && args.hidden_size_per_layer_input > 0)
+        let per_layer_embedding =
+            (info.is_first && !adapter_owns_ingress && args.hidden_size_per_layer_input > 0)
+                .then(|| {
+                    gemma4::Gemma4Embedding::unloaded(
+                        args.vocab_size_per_layer_input.unwrap_or(args.vocab_size),
+                        args.num_hidden_layers * args.hidden_size_per_layer_input,
+                        args.quantization_for("model.language_model.embed_tokens_per_layer.weight"),
+                        stream,
+                    )
+                })
+                .transpose()?;
+        let per_layer_projection = (info.is_first
+            && !adapter_owns_ingress
+            && args.hidden_size_per_layer_input > 0)
             .then(|| {
                 linear::unloaded_maybe_quantized_linear(
                     args.hidden_size,
@@ -15980,16 +16418,17 @@ impl GemmaStage {
                 )
             })
             .transpose()?;
-        let per_layer_norm = (info.is_first && args.hidden_size_per_layer_input > 0)
-            .then(|| {
-                nn::RmsNorm::unloaded(
-                    args.hidden_size_per_layer_input,
-                    args.rms_norm_eps,
-                    Dtype::Float32,
-                    stream,
-                )
-            })
-            .transpose()?;
+        let per_layer_norm =
+            (info.is_first && !adapter_owns_ingress && args.hidden_size_per_layer_input > 0)
+                .then(|| {
+                    nn::RmsNorm::unloaded(
+                        args.hidden_size_per_layer_input,
+                        args.rms_norm_eps,
+                        Dtype::Float32,
+                        stream,
+                    )
+                })
+                .transpose()?;
         let layers = range
             .clone()
             .map(|layer| {
@@ -16024,6 +16463,11 @@ impl GemmaStage {
             args,
             layer_adapter,
             range,
+            has_multimodal_ingress,
+            media_units,
+            media_layers: Vec::new(),
+            media_layer_count,
+            multimodal_mask_windows,
             embedding,
             output_embedding,
             per_layer_embedding,
@@ -16042,6 +16486,157 @@ impl GemmaStage {
             parallel_lm_head: None,
             parallel_layout: None,
         })
+    }
+
+    fn prepare_multimodal_ingress(
+        &mut self,
+        input: crate::api::input::ModelInput<'_>,
+        step: PipelineStep,
+        execution: Option<&ParallelExecutionContext<'_>>,
+        stream: &Stream,
+    ) -> Result<(Array, PipelineAuxiliaryState), Error> {
+        if !self.has_multimodal_ingress || self.media_layer_count != self.media_units.len() {
+            return Err(Error::UnsupportedArchitecture(
+                "Gemma 4 pipeline typed ingress requires configured stage-zero media semantics"
+                    .into(),
+            ));
+        }
+        let mut state = self
+            .layer_adapter
+            .begin_pipeline_ingress(input, execution, stream)?;
+        let active_indices = self
+            .media_units
+            .iter()
+            .enumerate()
+            .filter_map(|(ordinal, unit)| {
+                self.layer_adapter
+                    .should_execute_pipeline_group(unit.group, &state)
+                    .then_some(ordinal)
+            })
+            .collect::<Vec<_>>();
+        let prefill = step.sequence_length > 1;
+        let forward_guard = self
+            .dense_layers
+            .as_ref()
+            .and_then(|layers| match &layers.controller {
+                PipelineLayerController::LayerwiseHost(_) => None,
+                PipelineLayerController::DenseDiskStream(controller) => {
+                    Some(controller.forward_guard(prefill, &layers.residency))
+                }
+            })
+            .transpose()?;
+        let group_guard = self
+            .dense_layers
+            .as_ref()
+            .and_then(|layers| match &layers.controller {
+                PipelineLayerController::LayerwiseHost(_) => None,
+                PipelineLayerController::DenseDiskStream(controller) => {
+                    Some(controller.group_guard(&layers.residency, "pipeline_stage"))
+                }
+            });
+        for ordinal in active_indices {
+            let unit = self.media_units[ordinal];
+            let retained = if let Some(storage) = self.dense_layers.as_ref() {
+                let (_host, lease) = storage.prepare_absolute(ordinal, prefill)?;
+                let mut layer = match self.parallel_layout.as_ref() {
+                    Some(layout) => self
+                        .layer_adapter
+                        .new_parallel_layer(unit.group, unit.index, layout, stream)?,
+                    None => self
+                        .layer_adapter
+                        .new_layer(unit.group, unit.index, stream)?,
+                };
+                populate_module_from_lease(&mut layer, &lease)?;
+                let retained = self.layer_adapter.forward_pipeline_media_layer(
+                    unit.group, unit.index, &mut layer, &mut state, execution, stream,
+                )?;
+                storage.trim_after_absolute(ordinal)?;
+                retained
+            } else {
+                let layer = self.media_layers.get_mut(ordinal).ok_or_else(|| {
+                    Error::Parallel(format!(
+                        "Gemma pipeline media unit {ordinal} was not materialized"
+                    ))
+                })?;
+                self.layer_adapter.forward_pipeline_media_layer(
+                    unit.group, unit.index, layer, &mut state, execution, stream,
+                )?
+            };
+            eval(retained.iter())?;
+            if self.dense_layers.is_some() {
+                stream.synchronize()?;
+            }
+        }
+        if let Some(storage) = self.dense_layers.as_ref() {
+            storage.complete_forward()?;
+        }
+        if let Some(guard) = group_guard {
+            guard.complete()?;
+        }
+        if let Some(guard) = forward_guard {
+            guard.complete()?;
+        }
+        let prepared = self
+            .layer_adapter
+            .finish_pipeline_ingress(state, execution, stream)?;
+        if prepared.hidden.dim(0) != step.batch_size
+            || prepared.hidden.dim(1) != step.sequence_length
+        {
+            return Err(Error::Parallel(format!(
+                "Gemma multimodal pipeline ingress produced [{}, {}] batch/sequence geometry, scheduled [{}, {}]",
+                prepared.hidden.dim(0),
+                prepared.hidden.dim(1),
+                step.batch_size,
+                step.sequence_length
+            )));
+        }
+        let mut auxiliary = Vec::new();
+        if let Some(per_layer) = prepared.per_layer_inputs {
+            auxiliary.push(per_layer);
+        }
+        if step.sequence_length > 1 {
+            auxiliary.push(prepared.full_mask.ok_or_else(|| {
+                Error::Parallel("Gemma multimodal ingress did not produce a full mask".into())
+            })?);
+            if prepared.sliding_masks.len() != self.multimodal_mask_windows.len() {
+                return Err(Error::Parallel(format!(
+                    "Gemma multimodal ingress produced {} sliding masks, expected {}",
+                    prepared.sliding_masks.len(),
+                    self.multimodal_mask_windows.len()
+                )));
+            }
+            auxiliary.extend(prepared.sliding_masks);
+        }
+        Ok((prepared.hidden, PipelineAuxiliaryState::new(auxiliary)))
+    }
+
+    fn multimodal_mask<'a>(
+        &self,
+        auxiliary: &'a PipelineAuxiliaryState,
+        step: PipelineStep,
+        policy: crate::runtime::attention::AttentionPolicy,
+    ) -> Result<Option<&'a Array>, Error> {
+        if !self.has_multimodal_ingress || step.sequence_length <= 1 {
+            return Ok(None);
+        }
+        let base = usize::from(self.args.hidden_size_per_layer_input > 0);
+        let expected = base + 1 + self.multimodal_mask_windows.len();
+        if auxiliary.tensors().len() != expected {
+            return Err(Error::Parallel(format!(
+                "Gemma multimodal pipeline payload has {} auxiliary tensors, expected {expected}",
+                auxiliary.tensors().len()
+            )));
+        }
+        let index = policy
+            .window()
+            .and_then(|window| {
+                self.multimodal_mask_windows
+                    .iter()
+                    .position(|candidate| *candidate == window)
+                    .map(|index| base + 1 + index)
+            })
+            .unwrap_or(base);
+        Ok(Some(&auxiliary.tensors()[index]))
     }
 
     fn prepare_input(
@@ -16128,6 +16723,23 @@ impl GemmaStage {
                 self.layers.len()
             )));
         }
+        let prepared_ingress = match input {
+            PipelineStageInput::Tokens(tokens) if self.has_multimodal_ingress => {
+                let parts = [crate::api::input::InputPart::text_token_ids(tokens)];
+                Some(self.prepare_multimodal_ingress(
+                    crate::api::input::ModelInput::new(&parts),
+                    step,
+                    None,
+                    stream,
+                )?)
+            }
+            _ => None,
+        };
+        let prepared_payload =
+            prepared_ingress.map(|(hidden, auxiliary)| PipelinePayload { hidden, auxiliary });
+        let input = prepared_payload
+            .as_ref()
+            .map_or(input, PipelineStageInput::Hidden);
         let (mut hidden, auxiliary) = self.prepare_input(input, stream)?;
         let offset = caches
             .iter()
@@ -16148,10 +16760,24 @@ impl GemmaStage {
         let generated_mask = (explicit_mask.is_none() && step.sequence_length > 1)
             .then(|| create_causal_mask(step.sequence_length, Some(offset), None, None, stream))
             .transpose()?;
-        let mask = explicit_mask.or(generated_mask.as_ref());
-        let per_layer_inputs = auxiliary.tensors().first();
+        let ordinary_mask = explicit_mask.or(generated_mask.as_ref());
+        let layer_masks = self
+            .range
+            .clone()
+            .map(|global_layer| {
+                let policy = self
+                    .args
+                    .layer_policy(global_layer)
+                    .expect("validated Gemma pipeline range");
+                self.multimodal_mask(&auxiliary, step, policy.attention)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let per_layer_inputs = (self.args.hidden_size_per_layer_input > 0)
+            .then(|| auxiliary.tensors().first())
+            .flatten();
         let mut shared_kv = HashMap::new();
         let args = &self.args;
+        let range_start = self.range.start;
         hidden = execute_pipeline_layer_range(
             PipelineLayerExecution {
                 range: self.range.clone(),
@@ -16177,6 +16803,7 @@ impl GemmaStage {
                 let policy = *args
                     .layer_policy(global_layer)
                     .expect("validated Gemma pipeline range");
+                let mask = layer_masks[global_layer - range_start].or(ordinary_mask);
                 let per_layer_input = per_layer_inputs
                     .map(|inputs| {
                         inputs.try_index_device((.., .., global_layer as i32, ..), stream)

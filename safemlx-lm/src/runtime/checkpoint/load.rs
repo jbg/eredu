@@ -413,7 +413,7 @@ impl StrictLoadReport {
     }
 
     /// Validates the report against the model parameters and load configuration.
-    pub fn finish<M: ModuleParameters>(
+    pub fn finish<M: ModuleParameters + ?Sized>(
         self,
         model: &M,
         config: &StrictLoadConfig,

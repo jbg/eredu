@@ -138,9 +138,11 @@ Gemma 4 tensor parallelism derives text, vision, and audio execution geometry
 from shared semantic partition plans. Uneven GQA, dense/routed intermediate,
 vision patch/MLP, audio head/convolution, and modality ranges therefore flow
 through layer construction and prompt-cache identity without equal-shard
-reconstruction. Pure Gemma text pipeline execution uses dependency-safe
-contiguous stage units, relays declared per-layer residual inputs as immutable
-auxiliary state, and supports exact SafeTensors and `gemma4` GGUF checkpoints.
+reconstruction. Gemma pipeline execution uses dependency-safe contiguous text
+stages and, for multimodal SafeTensors checkpoints, stage-zero vision/audio
+roots. It relays per-layer residual inputs and exact multimodal full/sliding
+masks as immutable auxiliary state. Text execution also supports exact
+`gemma4` GGUF checkpoints.
 Shared-KV publisher/consumer groups are never split across stages.
 Fully resident Gemma text stages can apply load-time affine or MXFP4
 quantization through the same direct and derived binding plan used for

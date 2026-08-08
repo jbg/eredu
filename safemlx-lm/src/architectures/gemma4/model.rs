@@ -3801,6 +3801,25 @@ impl Model {
         })
     }
 
+    /// Creates an unloaded text or multimodal model from a complete Gemma 4
+    /// `config.json` value.
+    pub fn new_from_config_value(
+        config: &Value,
+        stream: &Stream,
+    ) -> Result<Self, crate::error::Error> {
+        let (args, vision, image_token_id, video_token_id, audio, audio_token_id) =
+            model_config_from_value(config)?;
+        Ok(Self::new_with_modalities(
+            args,
+            image_token_id,
+            vision,
+            video_token_id,
+            audio_token_id,
+            audio,
+            stream,
+        )?)
+    }
+
     pub(crate) fn new_with_modalities(
         args: ModelArgs,
         image_token_id: Option<i32>,

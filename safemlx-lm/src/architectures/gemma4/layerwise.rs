@@ -978,9 +978,97 @@ pub struct Gemma4LayerwiseAdapter {
 }
 
 impl Gemma4LayerwiseAdapter {
-    /// Creates the text-only adapter used by pipeline stages.
+    /// Creates the text-only adapter used by text pipeline stages.
     pub(crate) fn new_text(args: ModelArgs, stream: &Stream) -> Result<Self, Error> {
         Self::new(args, None, None, None, None, None, stream)
+    }
+
+    /// Creates the semantic adapter used by a Gemma pipeline ingress stage.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new_pipeline(
+        args: ModelArgs,
+        vision_config: Option<Gemma4VisionConfig>,
+        image_token_id: Option<i32>,
+        video_token_id: Option<i32>,
+        audio_config: Option<Gemma4AudioConfig>,
+        audio_token_id: Option<i32>,
+        stream: &Stream,
+    ) -> Result<Self, Error> {
+        Self::new(
+            args,
+            vision_config,
+            image_token_id,
+            video_token_id,
+            audio_config,
+            audio_token_id,
+            stream,
+        )
+    }
+
+    /// Returns the execution-group coordinates of configured media towers.
+    pub(crate) fn pipeline_media_groups(&self) -> Vec<(usize, usize)> {
+        let mut groups = Vec::new();
+        let mut group = 0;
+        if self.vision_depth > 0 {
+            groups.push((group, self.vision_depth));
+            group += 1;
+        }
+        if self.audio_depth > 0 {
+            groups.push((group, self.audio_depth));
+        }
+        groups
+    }
+
+    /// Returns the unique sliding-window mask order used in pipeline payloads.
+    pub(crate) fn pipeline_mask_windows(&self) -> Vec<std::num::NonZeroU32> {
+        self.args
+            .layer_schedule
+            .iter()
+            .filter_map(|policy| policy.attention.window())
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect()
+    }
+
+    /// Selects one configured static target for pipeline-owned materialization.
+    pub(crate) fn pipeline_static_mut(&mut self, role: &str) -> Option<&mut dyn ModuleParameters> {
+        match role {
+            "embedding" => Some(&mut self.embedding),
+            "per_layer_embedding" => self
+                .per_layer_embedding
+                .as_mut()
+                .map(|module| module as &mut dyn ModuleParameters),
+            "per_layer_projection" => {
+                if let Some(module) = &mut self.parallel_per_layer_projection {
+                    Some(module.inner_mut())
+                } else {
+                    self.per_layer_projection
+                        .as_mut()
+                        .map(|module| module as &mut dyn ModuleParameters)
+                }
+            }
+            "per_layer_norm" => self
+                .per_layer_norm
+                .as_mut()
+                .map(|module| module as &mut dyn ModuleParameters),
+            "vision" => self
+                .vision
+                .as_mut()
+                .map(|module| module as &mut dyn ModuleParameters),
+            "vision_embed" => self
+                .embed_vision
+                .as_mut()
+                .map(|module| module as &mut dyn ModuleParameters),
+            "audio" => self
+                .audio
+                .as_mut()
+                .map(|module| module as &mut dyn ModuleParameters),
+            "audio_embed" => self
+                .embed_audio
+                .as_mut()
+                .map(|module| module as &mut dyn ModuleParameters),
+            _ => None,
+        }
     }
 
     /// Builds exact direct or derived bindings for one text decoder block.
@@ -1005,12 +1093,14 @@ impl Gemma4LayerwiseAdapter {
         stream: &Stream,
     ) -> Result<TransformerBlock, Error> {
         match layout {
-            Some(layout) => match self.new_parallel_layer(0, index, layout, stream)? {
-                Gemma4Layer::Text(layer) => Ok(*layer),
-                _ => Err(Error::Parallel(format!(
-                    "Gemma 4 text planner returned a non-text layer at index {index}"
-                ))),
-            },
+            Some(layout) => {
+                match self.new_parallel_layer(self.pipeline_text_group(), index, layout, stream)? {
+                    Gemma4Layer::Text(layer) => Ok(*layer),
+                    _ => Err(Error::Parallel(format!(
+                        "Gemma 4 text planner returned a non-text layer at index {index}"
+                    ))),
+                }
+            }
             None => Ok(TransformerBlock::new(
                 &self.args,
                 *self.args.layer_policy(index).ok_or_else(|| {
@@ -1491,6 +1581,21 @@ pub struct Gemma4ForwardContext {
     draft_hidden: Option<Array>,
 }
 
+/// Opaque semantic state retained while a pipeline ingress stage executes its
+/// configured media roots.
+pub(crate) struct Gemma4PipelineIngressState {
+    cache: Cache,
+    forward: LayerwiseForwardState<Gemma4ForwardContext>,
+}
+
+/// Decoder-ready tensors produced by Gemma's shared multimodal semantics.
+pub(crate) struct Gemma4PipelineIngressOutput {
+    pub(crate) hidden: Array,
+    pub(crate) per_layer_inputs: Option<Array>,
+    pub(crate) full_mask: Option<Array>,
+    pub(crate) sliding_masks: Vec<Array>,
+}
+
 impl Gemma4LayerwiseAdapter {
     fn execution_group_name(&self, group: usize) -> Result<&'static str, Error> {
         let mut index = 0;
@@ -1513,6 +1618,124 @@ impl Gemma4LayerwiseAdapter {
                 "Gemma 4 has no execution group {group}"
             )))
         }
+    }
+
+    fn pipeline_text_group(&self) -> usize {
+        usize::from(self.vision_depth > 0) + usize::from(self.audio_depth > 0)
+    }
+
+    /// Starts typed pipeline ingress through the same adapter lifecycle used
+    /// by resident and bounded layerwise execution.
+    pub(crate) fn begin_pipeline_ingress(
+        &mut self,
+        input: input::ModelInput<'_>,
+        execution: Option<&crate::runtime::distributed::parallel::ParallelExecutionContext<'_>>,
+        stream: &Stream,
+    ) -> Result<Gemma4PipelineIngressState, Error> {
+        let mut cache = Cache::new(&self.args);
+        let forward = match execution {
+            Some(execution) if execution.is_tensor_parallel() => self
+                .begin_forward_with_execution(Gemma4Input::Prefill(input), &mut cache, execution)?,
+            _ => self.begin_forward(Gemma4Input::Prefill(input), &mut cache, stream)?,
+        };
+        Ok(Gemma4PipelineIngressState { cache, forward })
+    }
+
+    /// Returns whether a configured media group has work for this input.
+    pub(crate) fn should_execute_pipeline_group(
+        &self,
+        group: usize,
+        state: &Gemma4PipelineIngressState,
+    ) -> bool {
+        self.should_execute_group(group, &state.forward.context)
+    }
+
+    /// Executes one resident or leased media block using the canonical Gemma
+    /// layerwise hooks.
+    pub(crate) fn forward_pipeline_media_layer(
+        &mut self,
+        group: usize,
+        index: usize,
+        layer: &mut Gemma4Layer,
+        state: &mut Gemma4PipelineIngressState,
+        execution: Option<&crate::runtime::distributed::parallel::ParallelExecutionContext<'_>>,
+        stream: &Stream,
+    ) -> Result<Vec<Array>, Error> {
+        state.forward.hidden = match execution {
+            Some(execution) if execution.is_tensor_parallel() => self
+                .forward_layer_with_execution(
+                    group,
+                    index,
+                    layer,
+                    &state.forward.hidden,
+                    &mut state.cache,
+                    &mut state.forward.context,
+                    execution,
+                )?,
+            _ => self.forward_layer(
+                group,
+                index,
+                layer,
+                &state.forward.hidden,
+                &mut state.cache,
+                &mut state.forward.context,
+                stream,
+            )?,
+        };
+        Ok(std::iter::once(state.forward.hidden.clone())
+            .chain(
+                self.retained_context_arrays(&state.forward.context, group, index)
+                    .into_iter()
+                    .cloned(),
+            )
+            .collect())
+    }
+
+    /// Completes media roots and assembles the exact decoder ingress tensors.
+    pub(crate) fn finish_pipeline_ingress(
+        &mut self,
+        mut state: Gemma4PipelineIngressState,
+        execution: Option<&crate::runtime::distributed::parallel::ParallelExecutionContext<'_>>,
+        stream: &Stream,
+    ) -> Result<Gemma4PipelineIngressOutput, Error> {
+        let text_group = self.pipeline_text_group();
+        state.forward.hidden = match execution {
+            Some(execution) if execution.is_tensor_parallel() => self
+                .begin_execution_group_with_execution(
+                    text_group,
+                    &state.forward.hidden,
+                    &[],
+                    &mut state.cache,
+                    &mut state.forward.context,
+                    execution,
+                )?,
+            _ => self.begin_execution_group(
+                text_group,
+                &state.forward.hidden,
+                &[],
+                &mut state.cache,
+                &mut state.forward.context,
+                stream,
+            )?,
+        };
+        let sliding_masks = self
+            .pipeline_mask_windows()
+            .into_iter()
+            .filter_map(|window| {
+                state
+                    .forward
+                    .context
+                    .sliding_masks
+                    .as_ref()
+                    .and_then(|masks| masks.get(&AttentionPolicy::Sliding { window }).cloned())
+            })
+            .collect();
+        Ok(Gemma4PipelineIngressOutput {
+            hidden: state.forward.hidden,
+            per_layer_inputs: state.forward.context.per_layer_inputs,
+            full_mask: state.forward.context.mask,
+            sliding_masks,
+        })
     }
 }
 

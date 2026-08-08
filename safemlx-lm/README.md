@@ -925,7 +925,7 @@ ingress through the same request cache.
 Pipeline execution requires `PP > 1`. The Cartesian planner derives TP
 collectives, EP exchanges, and matching-coordinate pipeline lanes from one
 topology. Llama/Mistral, DeepSeek-V3/R1, Kimi Linear, Qwen2/Qwen3, Qwen3-VL,
-GPT-OSS, LFM2, Inkling, Nemotron-H, Qwen3-Next/Qwen3.5, and Gemma 4 text TP+PP
+GPT-OSS, LFM2, Inkling, Nemotron-H, Qwen3-Next/Qwen3.5, and Gemma 4 TP+PP
 use tensor-sharded stage layers and vocabulary boundaries; DeepSeek-V3/R1,
 Inkling, Kimi Linear, Qwen3-MoE, Qwen3-VL-MoE, GPT-OSS, LFM2-MoE,
 Nemotron-H-MoE, and Qwen3-Next/Qwen3.5-MoE PP+EP keep only the stage
@@ -943,6 +943,12 @@ stage zero for every non-PP coordinate. Typed image/video ingress is assembled
 there; explicit MRoPE tensors, the persisted position delta, and
 sequence-aligned DeepStack residuals then use the ordinary immutable pipeline
 payload. Later stages execute only their text-layer ranges.
+Gemma 4 likewise places configured vision and audio roots on stage zero for
+every TP coordinate. Pooled image/video and subsampled audio outputs are
+assembled through the shared Gemma execution-group adapter; per-layer inputs
+and exact full/sliding multimodal masks then travel as declared immutable
+pipeline auxiliary tensors. Tower and decoder blocks share one resident,
+host-layerwise, or dense-streamed rank-local plan.
 `PipelineModel::prefill_pipeline` and `PipelineModel::prefill_cartesian` perform
 typed prefill, after which cached decode, synchronized sampling, cancellation
 consensus, and prompt-cache persistence use the common pipeline APIs.
@@ -1008,7 +1014,7 @@ formats. Dense families have no EP migration.
 | Qwen3 MoE | TP, PP, EP | Complete | None |
 | GPT-OSS | TP, PP, EP | Complete | None; native MXFP4 SafeTensors and canonical type-39 GGUF are covered |
 | Llama/Mistral | TP, PP | TP+PP complete | None; EP does not apply |
-| Gemma 4 text | TP, PP | TP+PP complete | Multimodal tower execution is separate; EP does not apply |
+| Gemma 4 | TP, PP | TP+PP complete | SafeTensors typed text/image/video/audio ingress, both media towers, cached decode, queued scheduling, and all non-expert residency policies share the pipeline path; GGUF remains text-only until a Gemma media-projector artifact binding contract is added; EP does not apply |
 | DeepSeek-V3/R1 | TP, PP, EP | Complete | None; split, packed-affine, native block-FP8 SafeTensors and canonical DeepSeek2 GGUF recipes share the Cartesian path |
 | Kimi Linear | TP, PP, EP | Complete | None |
 | LFM2 dense | TP, PP | TP+PP complete | None; EP does not apply |
@@ -1215,6 +1221,12 @@ cargo test -p safemlx-lm --test distributed_pipeline_ring \
   ring_two_process_deepseek_pipeline_persistence -- --ignored --exact --nocapture
 cargo test -p safemlx-lm --test distributed_pipeline_ring \
   ring_two_process_gemma_pipeline -- --ignored --exact --nocapture
+cargo test -p safemlx-lm --test distributed_gemma4_multimodal_pipeline_ring \
+  ring_gemma4_multimodal_pipeline -- --ignored --exact --nocapture
+cargo test -p safemlx-lm --test distributed_gemma4_multimodal_pipeline_ring \
+  ring_gemma4_multimodal_dense_stream_pipeline -- --ignored --exact --nocapture
+cargo test -p safemlx-lm --test distributed_gemma4_multimodal_pipeline_ring \
+  ring_gemma4_multimodal_host_tensor_pipeline -- --ignored --exact --nocapture
 cargo test -p safemlx-lm --test distributed_pipeline_ring \
   ring_two_process_qwen2_pipeline -- --ignored --exact --nocapture
 cargo test -p safemlx-lm --test distributed_pipeline_ring \
@@ -1302,7 +1314,7 @@ use the expert loader and
 nonexpert projections, attention heads or recurrent operators, caches,
 embeddings, and the output head across TP while the EP subgroup owns routed
 expert work. For TP+PP Llama/Mistral, DeepSeek-V3/R1, Kimi Linear, Qwen2/Qwen3,
-Qwen3-VL, GPT-OSS, LFM2, Nemotron-H, Qwen3-Next/Qwen3.5, or Gemma 4 text, use the pipeline loader
+Qwen3-VL, GPT-OSS, LFM2, Nemotron-H, Qwen3-Next/Qwen3.5, or Gemma 4, use the pipeline loader
 and `PipelineModel::forward_cartesian`. Tensor parallelism is implemented by the
 generalized layerwise execution-group engine; there is no
 architecture-dispatching TP model wrapper.
