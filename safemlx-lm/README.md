@@ -1074,9 +1074,9 @@ The remaining global limitations are:
 
 TP+PP+EP is executable for DeepSeek-V3/R1, Qwen3-MoE, Qwen3-VL-MoE, Kimi
 Linear, Inkling, GPT-OSS, Gemma 4 MoE, LFM2-MoE, Nemotron-H-MoE, and
-Qwen3-Next/Qwen3.5-MoE, including Qwen3.5 multimodal SafeTensors. The Cartesian
-topology and execution contexts remain family-neutral and accept arbitrary
-legal axis sizes.
+Qwen3-Next/Qwen3.5-MoE, including Qwen3.5 multimodal SafeTensors and canonical
+text-plus-projector GGUF. The Cartesian topology and execution contexts remain
+family-neutral and accept arbitrary legal axis sizes.
 
 Decoder layers use balanced contiguous placement. Architectures may declare
 unsplittable dependency units; Gemma 4 uses this to keep each shared-KV
