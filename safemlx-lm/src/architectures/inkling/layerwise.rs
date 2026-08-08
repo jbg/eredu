@@ -974,6 +974,185 @@ pub(crate) struct InklingForwardContext {
     last_token_only: bool,
 }
 
+/// Opaque semantic state retained while a pipeline ingress stage executes its
+/// configured Inkling vision root.
+pub(crate) struct InklingPipelineIngressState {
+    cache: Cache,
+    forward: LayerwiseForwardState<InklingForwardContext>,
+}
+
+impl InklingLayerwiseAdapter {
+    /// Embeds a decoder token step with the same stage-zero static ownership
+    /// used by typed multimodal ingress.
+    pub(crate) fn embed_pipeline_tokens(
+        &mut self,
+        tokens: &Array,
+        execution: Option<&crate::runtime::distributed::parallel::ParallelExecutionContext<'_>>,
+        stream: &Stream,
+    ) -> Result<Array, Error> {
+        let embedded = match execution {
+            Some(execution) if execution.is_tensor_parallel() => self
+                .parallel_embedding
+                .as_mut()
+                .ok_or_else(|| {
+                    Error::Parallel("Inkling pipeline adapter has no TP embedding shard".into())
+                })?
+                .forward(tokens, execution)?,
+            _ => self.embedding.forward(tokens, stream)?,
+        };
+        self.embed_norm
+            .forward(&embedded, stream)
+            .map_err(Into::into)
+    }
+
+    /// Returns the execution-group coordinates of configured media towers.
+    pub(crate) fn pipeline_media_groups(&self) -> Vec<(usize, usize)> {
+        (self.vision_depth > 0)
+            .then_some((0, self.vision_depth))
+            .into_iter()
+            .collect()
+    }
+
+    /// Returns the decoder execution group after any configured vision root.
+    pub(crate) fn pipeline_text_group(&self) -> usize {
+        usize::from(self.vision_depth > 0)
+    }
+
+    /// Selects one configured media static target for pipeline ownership.
+    pub(crate) fn pipeline_static_mut(&mut self, role: &str) -> Option<&mut dyn ModuleParameters> {
+        match role {
+            "embedding" => {
+                if let Some(module) = &mut self.parallel_embedding {
+                    Some(module.inner_mut())
+                } else {
+                    Some(&mut self.embedding)
+                }
+            }
+            "embed_norm" => Some(&mut self.embed_norm),
+            "audio" => self
+                .audio
+                .as_mut()
+                .map(|module| module as &mut dyn ModuleParameters),
+            "vision_norm" => self
+                .vision_norm
+                .as_mut()
+                .map(|module| module as &mut dyn ModuleParameters),
+            _ => None,
+        }
+    }
+
+    /// Starts typed pipeline ingress through the same adapter lifecycle used
+    /// by resident and bounded layerwise execution.
+    pub(crate) fn begin_pipeline_ingress(
+        &mut self,
+        input: input::ModelInput<'_>,
+        execution: Option<&crate::runtime::distributed::parallel::ParallelExecutionContext<'_>>,
+        stream: &Stream,
+    ) -> Result<InklingPipelineIngressState, Error> {
+        let mut cache = Cache::new(&self.args.text_config);
+        let forward = match execution {
+            Some(execution) if execution.is_tensor_parallel() => self
+                .begin_forward_with_execution(
+                    InklingExecutionInput {
+                        input: InklingInput::Prefill(input),
+                        last_token_only: false,
+                    },
+                    &mut cache,
+                    execution,
+                )?,
+            _ => self.begin_forward(
+                InklingExecutionInput {
+                    input: InklingInput::Prefill(input),
+                    last_token_only: false,
+                },
+                &mut cache,
+                stream,
+            )?,
+        };
+        Ok(InklingPipelineIngressState { cache, forward })
+    }
+
+    /// Returns whether a configured media group has work for this input.
+    pub(crate) fn should_execute_pipeline_group(
+        &self,
+        group: usize,
+        state: &InklingPipelineIngressState,
+    ) -> bool {
+        self.should_execute_group(group, &state.forward.context)
+    }
+
+    /// Executes one resident or leased hMLP block using the canonical Inkling
+    /// layerwise hooks.
+    pub(crate) fn forward_pipeline_media_layer(
+        &mut self,
+        group: usize,
+        index: usize,
+        layer: &mut InklingLayer,
+        state: &mut InklingPipelineIngressState,
+        execution: Option<&crate::runtime::distributed::parallel::ParallelExecutionContext<'_>>,
+        stream: &Stream,
+    ) -> Result<Vec<Array>, Error> {
+        state.forward.hidden = match execution {
+            Some(execution) if execution.is_tensor_parallel() => self
+                .forward_layer_with_execution(
+                    group,
+                    index,
+                    layer,
+                    &state.forward.hidden,
+                    &mut state.cache,
+                    &mut state.forward.context,
+                    execution,
+                )?,
+            _ => self.forward_layer(
+                group,
+                index,
+                layer,
+                &state.forward.hidden,
+                &mut state.cache,
+                &mut state.forward.context,
+                stream,
+            )?,
+        };
+        Ok(std::iter::once(state.forward.hidden.clone())
+            .chain(
+                self.retained_context_arrays(&state.forward.context, group, index)
+                    .into_iter()
+                    .cloned(),
+            )
+            .collect())
+    }
+
+    /// Completes media roots and assembles the exact decoder ingress tensor.
+    pub(crate) fn finish_pipeline_ingress(
+        &mut self,
+        mut state: InklingPipelineIngressState,
+        execution: Option<&crate::runtime::distributed::parallel::ParallelExecutionContext<'_>>,
+        stream: &Stream,
+    ) -> Result<Array, Error> {
+        let text_group = self.pipeline_text_group();
+        state.forward.hidden = match execution {
+            Some(execution) if execution.is_tensor_parallel() => self
+                .begin_execution_group_with_execution(
+                    text_group,
+                    &state.forward.hidden,
+                    &[],
+                    &mut state.cache,
+                    &mut state.forward.context,
+                    execution,
+                )?,
+            _ => self.begin_execution_group(
+                text_group,
+                &state.forward.hidden,
+                &[],
+                &mut state.cache,
+                &mut state.forward.context,
+                stream,
+            )?,
+        };
+        Ok(state.forward.hidden)
+    }
+}
+
 /// One leased Inkling hMLP or decoder unit.
 pub(crate) enum InklingLayer {
     /// One hMLP projection/fold layer.

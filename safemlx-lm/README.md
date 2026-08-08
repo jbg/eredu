@@ -964,6 +964,15 @@ assembled through the shared Gemma execution-group adapter; per-layer inputs
 and exact full/sliding multimodal masks then travel as declared immutable
 pipeline auxiliary tensors. Tower and decoder blocks share one resident,
 host-layerwise, or dense-streamed rank-local plan.
+Inkling places its folded hMLP vision root, dMel embedding and normalization,
+text embedding, and media final normalization on stage zero for every TP/EP
+coordinate. Ordered text/image/audio input can be submitted directly or as a
+scheduler-owned `PreparedModelInput`; downstream stages retain only its exact
+modality and shape identity. Matching-coordinate pipeline lanes carry the
+assembled decoder hidden state, while full/sliding KV and all four
+short-convolution histories remain stage-local. SafeTensors and canonical
+`inkling` GGUF plus a sibling combined hMLP/dMel mmproj use the same resident,
+host-layerwise, or dense-streamed semantic plan.
 `PipelineModel::prefill_pipeline` and `PipelineModel::prefill_cartesian` perform
 typed prefill, after which cached decode, synchronized sampling, cancellation
 consensus, and prompt-cache persistence use the common pipeline APIs.
@@ -981,7 +990,7 @@ placement, transfer, eviction, and active-window telemetry for either
 non-resident policy; `dense_stream_report` adds disk-stream pass and cache
 statistics only when that policy is active. `PipelineStageInfo` carries the
 same report's global rank and TP/PP/EP coordinates and stage ownership.
-DeepSeek-V3/R1, Qwen3-MoE, Qwen3-VL-MoE, Kimi Linear, Inkling text, GPT-OSS,
+DeepSeek-V3/R1, Qwen3-MoE, Qwen3-VL-MoE, Kimi Linear, Inkling, GPT-OSS,
 LFM2-MoE, Nemotron-H-MoE, Gemma 4 MoE, and text-only Qwen3-Next/Qwen3.5-MoE also compose all
 three axes in this runtime. TP
 collectives remain inside the stage and EP coordinate, routed exchange remains
@@ -1038,7 +1047,7 @@ formats. Dense families have no EP migration.
 | Nemotron-H-MoE | TP, PP, EP | Complete | None |
 | Qwen3-Next/Qwen3.5 text dense | TP, PP | TP+PP complete | Qwen3.5 multimodal ingress remains outside the text pipeline; EP does not apply |
 | Qwen3-Next/Qwen3.5-MoE text | TP, PP, EP | Complete | Qwen3.5 multimodal ingress remains outside the text pipeline |
-| Inkling text | TP, PP, EP | Complete | Audio/vision ingress remains outside combined execution |
+| Inkling multimodal | TP, PP, EP | Complete | None; direct or queued text/image/audio ingress, stage-zero hMLP and dMel ownership, SafeTensors and canonical text-plus-mmproj GGUF, cached decode, synchronized generation, prompt-cache persistence, and resident, host-layerwise, dense-streamed, or independently cached expert policies share the Cartesian runtime |
 | Qwen3-VL dense | TP, PP | TP+PP complete | None; vision is pinned on stage zero and direct or queued typed image/video ingress composes with arbitrary legal TP/PP degrees; EP does not apply |
 | Qwen3-VL-MoE | TP, PP, EP | Complete | None; vision is pinned on stage zero and direct or queued typed image/video ingress composes with arbitrary legal TP/PP/EP degrees |
 | Moshi/PersonaPlex | TP | Not applicable | Its temporal/depth runtime has no PP or EP constituent axis |
@@ -1051,7 +1060,7 @@ The remaining global limitations are:
   supported.
 
 TP+PP+EP is executable for DeepSeek-V3/R1, Qwen3-MoE, Qwen3-VL-MoE, Kimi
-Linear, Inkling text, GPT-OSS, Gemma 4 MoE, LFM2-MoE, Nemotron-H-MoE, and
+Linear, Inkling, GPT-OSS, Gemma 4 MoE, LFM2-MoE, Nemotron-H-MoE, and
 Qwen3-Next/Qwen3.5-MoE text. The Cartesian
 topology and execution contexts remain family-neutral and accept arbitrary
 legal axis sizes.
@@ -1087,7 +1096,7 @@ for SafeTensors and canonical GGUF. Fully resident stages support aligned
 affine or MXFP4 load-time quantization, exact Qwen2 Q/K/V biases, Qwen3 Q/K
 norms, GQA, tied or untied heads, routed experts, and every normalized
 full/sliding layer policy.
-Kimi Linear, Nemotron-H/Nemotron-H-MoE, and text-only Qwen3-Next/Qwen3.5 also
+Kimi Linear, Nemotron-H/Nemotron-H-MoE, Inkling, and text-only Qwen3-Next/Qwen3.5 also
 use the generalized pipeline runtime for SafeTensors and canonical GGUF. KDA,
 Mamba2, and linear-attention state is represented by semantic fixed slots; MLA
 and full/sliding attention use the shared compressed or KV cache. These
@@ -2130,16 +2139,15 @@ the rank-local cache. The architecture-neutral GGUF EP dispatcher and
 type-erased expert cache also serve the registered DeepSeek2, Qwen3-MoE, LFM2-MoE,
 Nemotron-H-MoE, Qwen3-Next, and Qwen3.5-MoE streamed adapters.
 
-Inkling text uses the same Cartesian composition for full/sliding relative
-attention, four fixed short-convolution states, dense transitions, and routed
-plus shared experts. Resident execution shards attention and dense/shared
-expert intermediates over TP while EP owns routed banks. Independent caches
-retain replicated TP geometry for EP-owned routed banks and remain lazy under
-fully resident, host-layerwise, and dense-streamed nonexpert policies. Both
-SafeTensors and canonical `inkling` GGUF preserve stage-local KV/convolution
-state, bounded reads, prompt-cache identity, synchronized generation, and
-failure consensus. Audio and vision ingress remain outside combined pipeline
-execution.
+Inkling uses the same Cartesian composition for stage-zero hMLP/dMel ingress,
+full/sliding relative attention, four fixed short-convolution states, dense
+transitions, and routed plus shared experts. Resident execution shards media,
+attention, and dense/shared expert intermediates over TP while EP owns routed
+banks. Independent caches retain replicated TP geometry for EP-owned routed
+banks and remain lazy under fully resident, host-layerwise, and dense-streamed
+nonexpert policies. SafeTensors and canonical `inkling` GGUF with a sibling
+combined media mmproj preserve stage-local KV/convolution state, bounded reads,
+prompt-cache identity, synchronized generation, and failure consensus.
 
 Run a two-process Ring generation probe with the usual MLX Ring host file and
 rank environment:
@@ -2198,6 +2206,11 @@ cargo test -p safemlx-lm --test distributed_pipeline_ring ring_four_process_inkl
 cargo test -p safemlx-lm --test distributed_pipeline_ring ring_four_process_inkling_gguf_tensor_pipeline -- --ignored --exact --nocapture
 cargo test -p safemlx-lm --test distributed_pipeline_ring ring_four_process_inkling_pipeline_expert -- --ignored --exact --nocapture
 cargo test -p safemlx-lm --test distributed_pipeline_ring ring_four_process_inkling_gguf_pipeline_expert -- --ignored --exact --nocapture
+cargo test -p safemlx-lm --test distributed_pipeline_ring ring_four_process_inkling_multimodal_tensor_pipeline -- --ignored --exact --nocapture
+cargo test -p safemlx-lm --test distributed_pipeline_ring ring_four_process_inkling_multimodal_pipeline_expert -- --ignored --exact --nocapture
+cargo test -p safemlx-lm --test distributed_pipeline_ring ring_eight_process_inkling_multimodal_triple_axis -- --ignored --exact --nocapture
+cargo test -p safemlx-lm --test distributed_pipeline_ring ring_eight_process_inkling_multimodal_streamed_triple_axis_expert_cache -- --ignored --exact --nocapture
+cargo test -p safemlx-lm --test distributed_pipeline_ring ring_eight_process_inkling_multimodal_layerwise_host_triple_axis_expert_cache -- --ignored --exact --nocapture
 cargo test -p safemlx-lm --test distributed_expert_parallel_ring ring_four_process_qwen3_vl_moe_tensor_expert_parity -- --ignored --exact --nocapture
 cargo test -p safemlx-lm --test distributed_expert_parallel_ring ring_qwen3_vl_moe_gguf_expert_parity -- --ignored --exact --nocapture
 cargo test -p safemlx-lm --test distributed_expert_parallel_ring ring_qwen3_vl_moe_gguf_tensor_expert_parity -- --ignored --exact --nocapture
@@ -2258,15 +2271,18 @@ The eight-process cases add resident TP+PP+EP plus dense-streamed,
 host-layerwise, and canonical-GGUF non-experts with independently cached routed
 experts. They also cover EP-inactive TP+PP caching and cached-expert schedule
 failure consensus.
-The Inkling four-process cases cover TP+PP, TP+EP, and PP+EP across full/sliding
-attention and dense/sparse transitions, including rank-local KV and four-way
+The Inkling four-process cases cover TP+PP, TP+EP, and PP+EP across scheduled
+text/image/audio ingress, stage-zero dMel projection, full/sliding attention,
+and dense/sparse transitions. They include rank-local KV and four-way
 convolution state, stage-local or cached routed experts, shared experts,
 dense-streamed bounded reads, prompt-cache reload, synchronized generation,
 and single-rank numerical parity.
 The eight-process cases add resident TP+PP+EP plus dense-streamed,
 host-layerwise, and canonical-GGUF nonexperts with independently cached routed
-experts. They also cover EP-inactive TP+PP caching, uneven stage placement, and
-cached-expert schedule failure consensus.
+experts. The multimodal cases repeat resident, streamed, and host-layerwise
+triple-axis execution with scheduler-owned payload/identity consensus. They
+also cover EP-inactive TP+PP caching, uneven stage placement, and cached-expert
+schedule failure consensus.
 The Qwen3-VL-MoE four-process cases cover SafeTensors and canonical GGUF TP+EP
 text-decoder execution with
 rank-local MRoPE KV geometry, tensor-sharded attention and nonexpert

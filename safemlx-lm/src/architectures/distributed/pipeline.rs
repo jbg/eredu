@@ -1115,7 +1115,7 @@ struct GemmaStage {
     layer_adapter: Gemma4LayerwiseAdapter,
     range: Range<usize>,
     has_multimodal_ingress: bool,
-    media_units: Vec<GemmaPipelineMediaUnit>,
+    media_units: Vec<PipelineMediaUnit>,
     media_layers: Vec<Gemma4Layer>,
     media_layer_count: usize,
     multimodal_mask_windows: Vec<std::num::NonZeroU32>,
@@ -1142,7 +1142,7 @@ struct GemmaStage {
 }
 
 #[derive(Debug, Clone, Copy)]
-struct GemmaPipelineMediaUnit {
+struct PipelineMediaUnit {
     group: usize,
     index: usize,
 }
@@ -1302,6 +1302,10 @@ struct InklingStage {
     args: inkling::ModelArgs,
     layer_adapter: InklingLayerwiseAdapter,
     range: Range<usize>,
+    has_multimodal_ingress: bool,
+    media_units: Vec<PipelineMediaUnit>,
+    media_layers: Vec<InklingLayer>,
+    media_layer_count: usize,
     embedding: Option<MaybeQuantized<nn::Embedding>>,
     embed_norm: Option<nn::RmsNorm>,
     layers: Vec<inkling::DecoderLayer>,
@@ -3632,6 +3636,37 @@ impl PipelineStageSemantics for InklingStage {
         }
     }
 
+    fn prefill(
+        &mut self,
+        input: crate::api::input::ModelInput<'_>,
+        step: PipelineStep,
+        mask: Option<&Array>,
+        cache: &mut [PipelineLayerCache],
+        execution: Option<&ParallelExecutionContext<'_>>,
+        expert_group: Option<&Group>,
+        stream: &Stream,
+    ) -> Result<PipelineStageOutput, Error> {
+        if mask.is_some() {
+            return Err(Error::Parallel(
+                "Inkling relative attention does not accept an external additive mask".into(),
+            ));
+        }
+        let hidden = self.prepare_multimodal_ingress(input, step, execution, stream)?;
+        let payload = PipelinePayload {
+            hidden,
+            auxiliary: PipelineAuxiliaryState::default(),
+        };
+        self.forward_with_execution(
+            PipelineStageInput::Hidden(&payload),
+            step,
+            None,
+            cache,
+            execution,
+            expert_group,
+            stream,
+        )
+    }
+
     fn forward_with_execution(
         &mut self,
         input: PipelineStageInput<'_>,
@@ -5605,14 +5640,17 @@ pub fn load_pipeline_model_with_options(
                 )
             }
             crate::api::GgufArchitecture::Inkling => {
-                let prepared =
-                    inkling::prepare_gguf_checkpoint_with_mmproj(&checkpoint, &metadata, None)?;
-                let store: SharedWeightStore =
-                    Arc::new(GgufWeightStore::new_with_max_mapped_shards(
-                        checkpoint,
-                        inkling::translate_gguf_weight_name,
-                        max_mapped_shards,
-                    )?);
+                let mmproj = inkling::open_sibling_mmproj(model_dir)?;
+                let prepared = inkling::prepare_gguf_checkpoint_with_mmproj(
+                    &checkpoint,
+                    &metadata,
+                    mmproj.as_ref(),
+                )?;
+                let store = crate::architectures::inkling::layerwise::inkling_gguf_store(
+                    &checkpoint,
+                    mmproj.as_ref(),
+                    max_mapped_shards,
+                )?;
                 load_inkling_pipeline(
                     prepared.args,
                     store,
@@ -5971,12 +6009,6 @@ pub fn load_pipeline_model_with_options(
                 options,
             )?;
             let args = inkling::get_model_args(model_dir)?;
-            if args.audio_config.is_some() || args.vision_config.is_some() {
-                return Err(Error::UnsupportedArchitecture(
-                    "Inkling pipeline execution accepts text-only checkpoints; image/audio ingress must be folded before the decoder pipeline"
-                        .into(),
-                ));
-            }
             load_inkling_pipeline(
                 args,
                 store,
@@ -5993,7 +6025,7 @@ pub fn load_pipeline_model_with_options(
                 .into(),
         )),
         Some(model_type) => Err(Error::UnsupportedArchitecture(format!(
-            "pipeline execution supports Llama-compatible, DeepSeek-V3/R1, Gemma 4 text, Qwen2/Qwen3/Qwen3-MoE, Qwen3-VL/Qwen3-VL-MoE, GPT-OSS, LFM2/LFM2-MoE, Nemotron-H, Kimi Linear, Qwen3-Next/Qwen3.5 text, and Inkling text models, not {model_type}"
+            "pipeline execution supports Llama-compatible, DeepSeek-V3/R1, Gemma 4, Qwen2/Qwen3/Qwen3-MoE, Qwen3-VL/Qwen3-VL-MoE, GPT-OSS, LFM2/LFM2-MoE, Nemotron-H, Kimi Linear, Qwen3-Next/Qwen3.5 text, and Inkling models, not {model_type}"
         ))),
         None => Err(Error::UnsupportedArchitecture(
             "pipeline model config is missing model_type".into(),
@@ -14878,12 +14910,16 @@ fn load_inkling_pipeline(
         None
     };
     stage.parallel_layout = parallel_layout.clone();
+    if stage.has_multimodal_ingress {
+        stage.parallel_embedding = None;
+    }
+    let text_group = stage.layer_adapter.pipeline_text_group();
     stage.layers = stage
         .range
         .clone()
         .map(|global_layer| {
             stage.layer_adapter.new_cartesian_layer(
-                0,
+                text_group,
                 global_layer,
                 parallel_layout.as_ref(),
                 stage.expert_assignment.as_ref(),
@@ -14900,19 +14936,26 @@ fn load_inkling_pipeline(
         })
         .collect::<Result<Vec<_>, _>>()?;
     let static_units = pipeline_binding_units(
-        &stage.layer_adapter,
+        &binding_adapter,
         store.as_ref(),
         &selected_pipeline_static_roles([
             (
                 "embedding",
-                stage.embedding.is_some() || stage.parallel_embedding.is_some(),
+                stage.embedding.is_some()
+                    || stage.parallel_embedding.is_some()
+                    || (info.is_first && stage.has_multimodal_ingress),
             ),
-            ("embed_norm", stage.embed_norm.is_some()),
+            (
+                "embed_norm",
+                stage.embed_norm.is_some() || (info.is_first && stage.has_multimodal_ingress),
+            ),
             ("norm", stage.norm.is_some()),
             (
                 "output",
                 stage.lm_head.is_some() || stage.parallel_lm_head.is_some(),
             ),
+            ("audio", info.is_first && args.audio_config.is_some()),
+            ("vision_norm", info.is_first && args.vision_config.is_some()),
         ]),
     )?;
     let mut loaded = PipelineLoadAccumulator::new("Inkling");
@@ -14986,11 +15029,66 @@ fn load_inkling_pipeline(
             stream,
         )?;
     }
+    if info.is_first && stage.has_multimodal_ingress {
+        for role in ["embedding", "embed_norm", "audio", "vision_norm"] {
+            if stage.layer_adapter.pipeline_static_mut(role).is_none() {
+                continue;
+            }
+            let bindings = pipeline_static_bindings(&static_units, role)?.to_vec();
+            let bindings = match parallel_layout.as_ref() {
+                Some(layout) => shard_layer_bindings(
+                    bindings,
+                    if role == "audio" { "audio" } else { "" },
+                    store.as_ref(),
+                    layout,
+                )?,
+                None => bindings,
+            };
+            loaded.load(
+                stage
+                    .layer_adapter
+                    .pipeline_static_mut(role)
+                    .expect("selected Inkling media ingress static target"),
+                store.as_ref(),
+                &bindings,
+                None,
+                weights_stream,
+                stream,
+            )?;
+        }
+    }
     if dense_stream.is_none() {
+        for unit in stage.media_units.iter().copied() {
+            let mut layer = stage.layer_adapter.new_cartesian_layer(
+                unit.group,
+                unit.index,
+                parallel_layout.as_ref(),
+                stage.expert_assignment.as_ref(),
+                stream,
+            )?;
+            let bindings = stage.layer_adapter.cartesian_layer_bindings(
+                unit.group,
+                unit.index,
+                &layer,
+                store.as_ref(),
+                parallel_layout.as_ref(),
+                stage.expert_assignment.as_ref(),
+                stream,
+            )?;
+            loaded.load(
+                &mut layer,
+                store.as_ref(),
+                &bindings,
+                None,
+                weights_stream,
+                stream,
+            )?;
+            stage.media_layers.push(layer);
+        }
         for (global_layer, layer) in stage.range.clone().zip(&mut stage.layers) {
             let runtime_layer = InklingLayer::Text(Box::new(layer.clone()));
             let bindings = stage.layer_adapter.cartesian_layer_bindings(
-                0,
+                text_group,
                 global_layer,
                 &runtime_layer,
                 store.as_ref(),
@@ -15026,42 +15124,63 @@ fn load_inkling_pipeline(
         let streamed_layout = parallel_layout.clone();
         let streamed_assignment = stage.expert_assignment.clone();
         let streamed_adapter = &stage.layer_adapter;
-        stage.dense_layers = Some(build_pipeline_layer_storage(
-            Arc::clone(&store),
-            stage.range.clone(),
-            options,
-            static_bytes,
-            stream,
-            weights_stream,
-            |global_layer, stream| {
-                streamed_adapter
-                    .new_cartesian_layer(
-                        0,
-                        global_layer,
-                        streamed_layout.as_ref(),
-                        streamed_assignment.as_ref(),
-                        stream,
-                    )
-                    .and_then(|layer| match layer {
-                        InklingLayer::Text(layer) => Ok(*layer),
-                        InklingLayer::Vision(_) => Err(Error::Parallel(
-                            "Inkling text pipeline constructed a vision layer".into(),
-                        )),
-                    })
-            },
-            |global_layer, layer, store| {
-                let runtime_layer = InklingLayer::Text(Box::new(layer.clone()));
-                streamed_adapter.cartesian_layer_bindings(
-                    0,
-                    global_layer,
-                    &runtime_layer,
-                    store,
-                    streamed_layout.as_ref(),
-                    streamed_assignment.as_ref(),
-                    stream,
-                )
-            },
-        )?);
+        let media_units = stage.media_units.clone();
+        let media_count = media_units.len();
+        let text_start = stage.range.start;
+        let unit_count = media_count + stage.range.len();
+        stage.dense_layers = Some(
+            build_pipeline_layer_storage::<InklingLayer, _, _>(
+                Arc::clone(&store),
+                0..unit_count,
+                options,
+                static_bytes,
+                stream,
+                weights_stream,
+                |ordinal, stream| {
+                    if let Some(unit) = media_units.get(ordinal) {
+                        streamed_adapter.new_cartesian_layer(
+                            unit.group,
+                            unit.index,
+                            streamed_layout.as_ref(),
+                            streamed_assignment.as_ref(),
+                            stream,
+                        )
+                    } else {
+                        streamed_adapter.new_cartesian_layer(
+                            text_group,
+                            text_start + (ordinal - media_count),
+                            streamed_layout.as_ref(),
+                            streamed_assignment.as_ref(),
+                            stream,
+                        )
+                    }
+                },
+                |ordinal, layer, store| {
+                    if let Some(unit) = media_units.get(ordinal) {
+                        streamed_adapter.cartesian_layer_bindings(
+                            unit.group,
+                            unit.index,
+                            layer,
+                            store,
+                            streamed_layout.as_ref(),
+                            streamed_assignment.as_ref(),
+                            stream,
+                        )
+                    } else {
+                        streamed_adapter.cartesian_layer_bindings(
+                            text_group,
+                            text_start + (ordinal - media_count),
+                            layer,
+                            store,
+                            streamed_layout.as_ref(),
+                            streamed_assignment.as_ref(),
+                            stream,
+                        )
+                    }
+                },
+            )?
+            .with_execution_offset(media_count)?,
+        );
         if expert_cache_options.is_some() {
             stage.dense_layers = stage
                 .dense_layers
@@ -15290,6 +15409,108 @@ fn forward_inkling_cartesian_layer(
 }
 
 impl InklingStage {
+    fn prepare_multimodal_ingress(
+        &mut self,
+        input: crate::api::input::ModelInput<'_>,
+        step: PipelineStep,
+        execution: Option<&ParallelExecutionContext<'_>>,
+        stream: &Stream,
+    ) -> Result<Array, Error> {
+        if !self.has_multimodal_ingress || self.media_layer_count != self.media_units.len() {
+            return Err(Error::UnsupportedArchitecture(
+                "Inkling pipeline typed ingress requires configured stage-zero media semantics"
+                    .into(),
+            ));
+        }
+        let mut state = self
+            .layer_adapter
+            .begin_pipeline_ingress(input, execution, stream)?;
+        let active_indices = self
+            .media_units
+            .iter()
+            .enumerate()
+            .filter_map(|(ordinal, unit)| {
+                self.layer_adapter
+                    .should_execute_pipeline_group(unit.group, &state)
+                    .then_some(ordinal)
+            })
+            .collect::<Vec<_>>();
+        let prefill = step.sequence_length > 1;
+        let forward_guard = self
+            .dense_layers
+            .as_ref()
+            .and_then(|layers| match &layers.controller {
+                PipelineLayerController::LayerwiseHost(_) => None,
+                PipelineLayerController::DenseDiskStream(controller) => {
+                    Some(controller.forward_guard(prefill, &layers.residency))
+                }
+            })
+            .transpose()?;
+        let group_guard = self
+            .dense_layers
+            .as_ref()
+            .and_then(|layers| match &layers.controller {
+                PipelineLayerController::LayerwiseHost(_) => None,
+                PipelineLayerController::DenseDiskStream(controller) => {
+                    Some(controller.group_guard(&layers.residency, "pipeline_stage"))
+                }
+            });
+        for ordinal in active_indices {
+            let unit = self.media_units[ordinal];
+            let retained = if let Some(storage) = self.dense_layers.as_ref() {
+                let (_host, lease) = storage.prepare_absolute(ordinal, prefill)?;
+                let mut layer = self.layer_adapter.new_cartesian_layer(
+                    unit.group,
+                    unit.index,
+                    self.parallel_layout.as_ref(),
+                    self.expert_assignment.as_ref(),
+                    stream,
+                )?;
+                populate_module_from_lease(&mut layer, &lease)?;
+                let retained = self.layer_adapter.forward_pipeline_media_layer(
+                    unit.group, unit.index, &mut layer, &mut state, execution, stream,
+                )?;
+                storage.trim_after_absolute(ordinal)?;
+                retained
+            } else {
+                let layer = self.media_layers.get_mut(ordinal).ok_or_else(|| {
+                    Error::Parallel(format!(
+                        "Inkling pipeline media unit {ordinal} was not materialized"
+                    ))
+                })?;
+                self.layer_adapter.forward_pipeline_media_layer(
+                    unit.group, unit.index, layer, &mut state, execution, stream,
+                )?
+            };
+            eval(retained.iter())?;
+            if self.dense_layers.is_some() {
+                stream.synchronize()?;
+            }
+        }
+        if let Some(storage) = self.dense_layers.as_ref() {
+            storage.complete_forward()?;
+        }
+        if let Some(guard) = group_guard {
+            guard.complete()?;
+        }
+        if let Some(guard) = forward_guard {
+            guard.complete()?;
+        }
+        let hidden = self
+            .layer_adapter
+            .finish_pipeline_ingress(state, execution, stream)?;
+        if hidden.dim(0) != step.batch_size || hidden.dim(1) != step.sequence_length {
+            return Err(Error::Parallel(format!(
+                "Inkling multimodal pipeline ingress produced [{}, {}] batch/sequence geometry, scheduled [{}, {}]",
+                hidden.dim(0),
+                hidden.dim(1),
+                step.batch_size,
+                step.sequence_length
+            )));
+        }
+        Ok(hidden)
+    }
+
     fn new(
         args: inkling::ModelArgs,
         range: Range<usize>,
@@ -15297,11 +15518,25 @@ impl InklingStage {
         external_experts: bool,
         stream: &Stream,
     ) -> Result<Self, Error> {
+        let has_multimodal_ingress = args.vision_config.is_some() || args.audio_config.is_some();
         let layer_adapter = if external_experts {
             InklingLayerwiseAdapter::new_external_experts(args.clone(), stream)?
         } else {
             InklingLayerwiseAdapter::new(args.clone(), stream)?
         };
+        let media_units = if info.is_first {
+            layer_adapter
+                .pipeline_media_groups()
+                .into_iter()
+                .flat_map(|(group, depth)| {
+                    (0..depth).map(move |index| PipelineMediaUnit { group, index })
+                })
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        let media_layer_count = media_units.len();
+        let adapter_owns_ingress = info.is_first && has_multimodal_ingress;
         let complete = inkling::Model::new(args.clone(), stream)?;
         let inkling::Model { model, lm_head, .. } = complete;
         let inkling::TextModel {
@@ -15319,8 +15554,12 @@ impl InklingStage {
             args,
             layer_adapter,
             range,
-            embedding: info.is_first.then_some(embed_tokens),
-            embed_norm: info.is_first.then_some(embed_norm),
+            has_multimodal_ingress,
+            media_units,
+            media_layers: Vec::new(),
+            media_layer_count,
+            embedding: (info.is_first && !adapter_owns_ingress).then_some(embed_tokens),
+            embed_norm: (info.is_first && !adapter_owns_ingress).then_some(embed_norm),
             layers,
             dense_layers: None,
             norm: info.is_last.then_some(norm),
@@ -15429,18 +15668,26 @@ impl InklingStage {
         }
         let (mut hidden, auxiliary) = match input {
             PipelineStageInput::Tokens(tokens) => {
-                let embedded = self
-                    .embedding
-                    .as_mut()
-                    .expect("first Inkling stage embedding")
-                    .forward(tokens, stream)?;
-                (
-                    self.embed_norm
+                if self.has_multimodal_ingress {
+                    (
+                        self.layer_adapter
+                            .embed_pipeline_tokens(tokens, None, stream)?,
+                        PipelineAuxiliaryState::default(),
+                    )
+                } else {
+                    let embedded = self
+                        .embedding
                         .as_mut()
-                        .expect("first Inkling stage embedding norm")
-                        .forward(&embedded, stream)?,
-                    PipelineAuxiliaryState::default(),
-                )
+                        .expect("first Inkling stage embedding")
+                        .forward(tokens, stream)?;
+                    (
+                        self.embed_norm
+                            .as_mut()
+                            .expect("first Inkling stage embedding norm")
+                            .forward(&embedded, stream)?,
+                        PipelineAuxiliaryState::default(),
+                    )
+                }
             }
             PipelineStageInput::Hidden(payload) => {
                 (payload.hidden.clone(), payload.auxiliary.clone())
@@ -15508,20 +15755,33 @@ impl InklingStage {
         let stream = execution.stream();
         let (mut hidden, auxiliary) = match input {
             PipelineStageInput::Tokens(tokens) => {
-                let embedded = self
-                    .parallel_embedding
-                    .as_mut()
-                    .ok_or_else(|| {
-                        Error::Parallel("first Inkling TP+PP stage has no embedding shard".into())
-                    })?
-                    .forward(tokens, execution)?;
-                (
-                    self.embed_norm
+                if self.has_multimodal_ingress {
+                    (
+                        self.layer_adapter.embed_pipeline_tokens(
+                            tokens,
+                            Some(execution),
+                            stream,
+                        )?,
+                        PipelineAuxiliaryState::default(),
+                    )
+                } else {
+                    let embedded = self
+                        .parallel_embedding
                         .as_mut()
-                        .expect("first Inkling TP+PP stage embedding norm")
-                        .forward(&embedded, stream)?,
-                    PipelineAuxiliaryState::default(),
-                )
+                        .ok_or_else(|| {
+                            Error::Parallel(
+                                "first Inkling TP+PP stage has no embedding shard".into(),
+                            )
+                        })?
+                        .forward(tokens, execution)?;
+                    (
+                        self.embed_norm
+                            .as_mut()
+                            .expect("first Inkling TP+PP stage embedding norm")
+                            .forward(&embedded, stream)?,
+                        PipelineAuxiliaryState::default(),
+                    )
+                }
             }
             PipelineStageInput::Hidden(payload) => {
                 (payload.hidden.clone(), payload.auxiliary.clone())
@@ -15545,6 +15805,7 @@ impl InklingStage {
         let args = self.args.clone();
         let expert_cache = self.expert_storage.cache();
         let layer_adapter = &self.layer_adapter;
+        let text_group = layer_adapter.pipeline_text_group();
         let parallel_layout = self.parallel_layout.clone();
         hidden = execute_pipeline_layer_range(
             PipelineLayerExecution {
@@ -15559,7 +15820,7 @@ impl InklingStage {
             |global_layer, stream| {
                 layer_adapter
                     .new_cartesian_layer(
-                        0,
+                        text_group,
                         global_layer,
                         parallel_layout.as_ref(),
                         expert_assignment.as_ref(),
@@ -15668,18 +15929,26 @@ impl InklingStage {
         }
         let (mut hidden, auxiliary) = match input {
             PipelineStageInput::Tokens(tokens) => {
-                let embedded = self
-                    .embedding
-                    .as_mut()
-                    .expect("first Inkling PP+EP stage embedding")
-                    .forward(tokens, stream)?;
-                (
-                    self.embed_norm
+                if self.has_multimodal_ingress {
+                    (
+                        self.layer_adapter
+                            .embed_pipeline_tokens(tokens, None, stream)?,
+                        PipelineAuxiliaryState::default(),
+                    )
+                } else {
+                    let embedded = self
+                        .embedding
                         .as_mut()
-                        .expect("first Inkling PP+EP stage embedding norm")
-                        .forward(&embedded, stream)?,
-                    PipelineAuxiliaryState::default(),
-                )
+                        .expect("first Inkling PP+EP stage embedding")
+                        .forward(tokens, stream)?;
+                    (
+                        self.embed_norm
+                            .as_mut()
+                            .expect("first Inkling PP+EP stage embedding norm")
+                            .forward(&embedded, stream)?,
+                        PipelineAuxiliaryState::default(),
+                    )
+                }
             }
             PipelineStageInput::Hidden(payload) => {
                 (payload.hidden.clone(), payload.auxiliary.clone())
@@ -15696,6 +15965,7 @@ impl InklingStage {
             ExpertPass::Decode
         };
         let args = self.args.clone();
+        let text_group = layer_adapter.pipeline_text_group();
         hidden = execute_pipeline_layer_range(
             PipelineLayerExecution {
                 range: self.range.clone(),
@@ -15708,7 +15978,13 @@ impl InklingStage {
             },
             |global_layer, stream| {
                 layer_adapter
-                    .new_cartesian_layer(0, global_layer, None, Some(&expert_assignment), stream)
+                    .new_cartesian_layer(
+                        text_group,
+                        global_layer,
+                        None,
+                        Some(&expert_assignment),
+                        stream,
+                    )
                     .and_then(|layer| match layer {
                         InklingLayer::Text(layer) => Ok(*layer),
                         InklingLayer::Vision(_) => Err(Error::Parallel(
@@ -16558,7 +16834,7 @@ impl GemmaStage {
             .pipeline_media_groups()
             .into_iter()
             .flat_map(|(group, depth)| {
-                (0..depth).map(move |index| GemmaPipelineMediaUnit { group, index })
+                (0..depth).map(move |index| PipelineMediaUnit { group, index })
             })
             .collect::<Vec<_>>();
         let media_layer_count = media_units.len();
@@ -17874,6 +18150,75 @@ mod tests {
             DeviceAssignment::new(DeviceType::Cpu, 0),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn inkling_pipeline_places_the_vision_root_only_on_stage_zero() {
+        let execution = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        let config = serde_json::json!({
+            "model_type": "inkling_mm_model",
+            "image_token_id": 20,
+            "text_config": {
+                "torch_dtype": "float32",
+                "hidden_size": 16,
+                "num_hidden_layers": 3,
+                "vocab_size": 32,
+                "num_attention_heads": 4,
+                "num_key_value_heads": 2,
+                "head_dim": 4,
+                "swa_num_attention_heads": 4,
+                "swa_num_key_value_heads": 2,
+                "swa_head_dim": 4,
+                "sliding_window_size": 4,
+                "layer_types": ["full_attention", "sliding_attention", "full_attention"],
+                "dense_mlp_idx": 1,
+                "sconv_kernel_size": 3,
+                "d_rel": 4,
+                "rel_extent": 8,
+                "intermediate_size": 8,
+                "dense_intermediate_size": 16,
+                "moe_intermediate_size": 8,
+                "n_routed_experts": 2,
+                "num_experts_per_tok": 1,
+                "n_shared_experts": 1,
+                "route_scale": 1.0,
+                "use_sconv": true,
+                "use_embed_norm": true,
+                "shared_expert_sink": true,
+                "use_gate_bias": true,
+                "norm_after_topk": true,
+                "use_global_scale": true,
+                "gate_activation": "sigmoid",
+                "hidden_act": "silu",
+                "unpadded_vocab_size": 30
+            },
+            "vision_config": {
+                "decoder_dmodel": 16,
+                "patch_size": 40,
+                "temporal_patch_size": 2,
+                "n_channels": 3,
+                "n_layers": 4
+            }
+        });
+        let args = inkling::model_args_from_config_value(&config).unwrap();
+
+        for rank in 0..2 {
+            let topology = topology(2, rank, 2);
+            let range = topology.layer_range(3).unwrap();
+            let info = base_info(
+                topology,
+                range.clone(),
+                ModelKind::Inkling,
+                args.text_config.hidden_size,
+            );
+            let stage =
+                InklingStage::new(args.clone(), range, &info, false, execution.stream()).unwrap();
+            assert!(stage.has_multimodal_ingress);
+            assert_eq!(stage.media_units.len(), if rank == 0 { 4 } else { 0 });
+            assert_eq!(stage.media_layer_count, stage.media_units.len());
+            assert!(stage.embedding.is_none());
+            assert!(stage.embed_norm.is_none());
+        }
     }
 
     #[test]

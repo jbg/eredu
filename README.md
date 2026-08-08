@@ -159,7 +159,7 @@ Fully resident Qwen stages support aligned affine or MXFP4 requantization;
 GPT-OSS can MXFP4-quantize eligible dense matrices without transcoding its
 expert banks. Host-layerwise and dense disk streaming require checkpoint-native
 encodings.
-Qwen3-MoE, Kimi Linear, Inkling text, GPT-OSS, Gemma 4 MoE, LFM2-MoE, Nemotron-H-MoE, and text-only
+Qwen3-MoE, Kimi Linear, Inkling, GPT-OSS, Gemma 4 MoE, LFM2-MoE, Nemotron-H-MoE, and text-only
 Qwen3-Next/Qwen3.5-MoE additionally support arbitrary-geometry
 TP+PP+EP through the same Cartesian topology and semantic layer plan for fully
 resident, host-layerwise, or dense-streamed SafeTensors and their canonical
@@ -186,15 +186,17 @@ Nemotron-H-MoE likewise composes TP+PP+EP for its mixed Mamba, dense, routed,
 and attention schedule. Rank-local Mamba convolution/SSM state, attention KV,
 resident or independently cached experts, and canonical `nemotron_h_moe` GGUF
 all use the shared stage, cache, residency, and failure-consensus machinery.
-Kimi Linear, Nemotron-H/Nemotron-H-MoE, Qwen3-Next/Qwen3.5, and text-only
-Inkling stages use that same adapter-driven pipeline runtime for
+Kimi Linear, Nemotron-H/Nemotron-H-MoE, Qwen3-Next/Qwen3.5, and Inkling stages
+use that same adapter-driven pipeline runtime for
 SafeTensors and their canonical GGUF architectures. KDA, Mamba2, and linear
 attention expose borrowed semantic state to the runtime; MLA and KV storage
 remain the shared compressed/paged implementations. Inkling's KV and four
 short-convolution histories exercise the combined `KeyValueWithFixedState`
 layout without introducing a family cache variant. Fully resident,
 host-layerwise, and dense disk-streamed stages share each family's bounded
-binding plan.
+binding plan. Inkling pins its hMLP vision root, dMel audio projection, and
+media normalization on stage zero; scheduled typed ingress, cached decode,
+generation, and persistence then use the ordinary Cartesian pipeline path.
 The pipeline runtime stores one type-erased stage shell and derives ordinary,
 paged, and persisted cache state from its canonical semantic layer schedule.
 All decoder families use the same resident/non-resident layer executor and the

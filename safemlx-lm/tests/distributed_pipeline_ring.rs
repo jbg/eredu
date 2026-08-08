@@ -34,6 +34,7 @@ use safemlx_lm::{
     runtime::generation::sampler::DefaultSampler,
     runtime::{
         checkpoint::binding::canonical_checkpoint_name,
+        media::{input::InputPayload, PreparedModelInput},
         residency::policy::OffloadConfig,
         scheduler::{RequestId, RequestStatus, SchedulerLimits},
     },
@@ -80,6 +81,7 @@ enum FixtureFamily {
     Qwen35,
     Qwen35Moe,
     Inkling,
+    InklingMultimodal,
     InklingGguf,
 }
 
@@ -109,6 +111,7 @@ impl FixtureFamily {
             Self::Qwen35 => "qwen3.5",
             Self::Qwen35Moe => "qwen3.5-moe",
             Self::Inkling => "inkling",
+            Self::InklingMultimodal => "inkling-multimodal",
             Self::InklingGguf => "inkling-gguf",
         }
     }
@@ -138,6 +141,7 @@ impl FixtureFamily {
             Self::Qwen35,
             Self::Qwen35Moe,
             Self::Inkling,
+            Self::InklingMultimodal,
             Self::InklingGguf,
         ] {
             if family.name() == value {
@@ -169,7 +173,7 @@ impl FixtureFamily {
             | Self::Qwen35
             | Self::Qwen35Moe => 2,
             Self::Gemma | Self::NemotronH | Self::NemotronHGguf => 4,
-            Self::Inkling | Self::InklingGguf => 3,
+            Self::Inkling | Self::InklingMultimodal | Self::InklingGguf => 3,
         }
     }
 
@@ -179,8 +183,8 @@ impl FixtureFamily {
             (Self::Gemma, 1) => 1..4,
             (Self::NemotronH | Self::NemotronHGguf, 0) => 0..2,
             (Self::NemotronH | Self::NemotronHGguf, 1) => 2..4,
-            (Self::Inkling | Self::InklingGguf, 0) => 0..2,
-            (Self::Inkling | Self::InklingGguf, 1) => 2..3,
+            (Self::Inkling | Self::InklingMultimodal | Self::InklingGguf, 0) => 0..2,
+            (Self::Inkling | Self::InklingMultimodal | Self::InklingGguf, 1) => 2..3,
             (_, rank) => rank..rank + 1,
         }
     }
@@ -190,7 +194,7 @@ impl FixtureFamily {
             Self::DeepSeek | Self::DeepSeekGguf | Self::KimiLinear | Self::KimiLinearGguf => {
                 range.filter(|index| *index == 1).count()
             }
-            Self::Inkling | Self::InklingGguf => {
+            Self::Inkling | Self::InklingMultimodal | Self::InklingGguf => {
                 range.filter(|index| matches!(*index, 1 | 2)).count()
             }
             Self::NemotronH => range.filter(|index| *index == 2).count(),
@@ -216,7 +220,9 @@ impl FixtureFamily {
             Self::Qwen3NextMoe => ("qwen_hybrid", "qwen3_next"),
             Self::Qwen35 => ("qwen_hybrid", "qwen3_5_text"),
             Self::Qwen35Moe => ("qwen_hybrid", "qwen3_5_moe_text"),
-            Self::Inkling | Self::InklingGguf => ("inkling", "inkling_mm_model"),
+            Self::Inkling | Self::InklingMultimodal | Self::InklingGguf => {
+                ("inkling", "inkling_mm_model")
+            }
         }
     }
 
@@ -224,7 +230,7 @@ impl FixtureFamily {
         match self {
             Self::Gemma => "model.language_model.layers.",
             Self::NemotronH | Self::NemotronHGguf => "backbone.layers.",
-            Self::Inkling | Self::InklingGguf => "model.llm.layers.",
+            Self::Inkling | Self::InklingMultimodal | Self::InklingGguf => "model.llm.layers.",
             _ => "model.layers.",
         }
     }
@@ -262,8 +268,13 @@ impl FixtureFamily {
                 | Self::Qwen35
                 | Self::Qwen35Moe
                 | Self::Inkling
+                | Self::InklingMultimodal
                 | Self::InklingGguf
         )
+    }
+
+    const fn is_multimodal(self) -> bool {
+        matches!(self, Self::InklingMultimodal)
     }
 }
 
@@ -304,6 +315,7 @@ fn pipeline_ring_worker() {
                 FixtureFamily::DeepSeek
                     | FixtureFamily::DeepSeekGguf
                     | FixtureFamily::Inkling
+                    | FixtureFamily::InklingMultimodal
                     | FixtureFamily::InklingGguf
                     | FixtureFamily::KimiLinear
                     | FixtureFamily::KimiLinearGguf
@@ -328,7 +340,13 @@ fn pipeline_ring_worker() {
     let reference = (pipeline_rank == 1
         && (family.needs_resident_reference()
             || matches!(family, FixtureFamily::Lfm2 | FixtureFamily::Lfm2Moe)))
-    .then(|| resident_reference(&checkpoint, &stream));
+    .then(|| {
+        if family.is_multimodal() {
+            inkling_multimodal_resident_reference(&checkpoint, &stream)
+        } else {
+            resident_reference(&checkpoint, &stream)
+        }
+    });
     let dense_stream = std::env::var_os(DENSE_STREAM).is_some();
     let layerwise_host = std::env::var_os(LAYERWISE_HOST).is_some();
     assert!(!(dense_stream && layerwise_host));
@@ -427,7 +445,12 @@ fn pipeline_ring_worker() {
                 opened.contains(&format!("layer-{layer}.safetensors")),
                 ((!dense_stream && !layerwise_host)
                     || (expert_cache
-                        && !matches!(family, FixtureFamily::KimiLinear | FixtureFamily::Inkling)))
+                        && !matches!(
+                            family,
+                            FixtureFamily::KimiLinear
+                                | FixtureFamily::Inkling
+                                | FixtureFamily::InklingMultimodal
+                        )))
                     && expected_range.contains(&layer),
                 "rank {expected_rank} opened the wrong SafeTensors layer shard for {family:?}"
             );
@@ -509,28 +532,69 @@ fn pipeline_ring_worker() {
         cache.global_layers(),
         family.stage_range(pipeline_rank).collect::<Vec<_>>()
     );
-    assert_family_cache(family, pipeline_rank, &cache, false);
-    let prompt = safemlx::Array::from_slice(&[1u32, 2], &[1, 2]);
-    let mut logits = forward_pipeline_model(
-        &mut model,
-        (pipeline_rank == 0).then_some(&prompt),
-        PipelineStep::new(1, 2).unwrap(),
-        &mut cache,
-        &group,
-        cartesian.as_ref(),
-        &stream,
-    );
+    assert_family_cache(family, pipeline_rank, &cache, 0);
+    let prefix_ids = if family.is_multimodal() {
+        vec![1, 2, 21, 20, 20]
+    } else {
+        vec![1, 2]
+    };
+    let prompt_length = prefix_ids.len() as i32;
+    let mut logits = if family.is_multimodal() {
+        let prepared = inkling_multimodal_prepared_input();
+        let identity = prepared.identity();
+        let request = RequestId::new(404);
+        let mut scheduler =
+            PipelineInferenceScheduler::new(&model, SchedulerLimits::new(1, 1).unwrap()).unwrap();
+        scheduler
+            .register_request_with_options(
+                &model,
+                request,
+                CacheResidencyPolicy::Paged(paged.clone()),
+            )
+            .unwrap();
+        let work = PipelineMicrobatchInput::new(
+            request,
+            PipelineInferencePhase::Prefill,
+            PipelineStep::new(1, prompt_length).unwrap(),
+        );
+        scheduler
+            .enqueue(if model.stage_info().is_first {
+                work.with_prepared_input(prepared)
+            } else {
+                work.with_prepared_input_identity(identity)
+            })
+            .unwrap();
+        let mut completed = match cartesian.as_ref() {
+            Some(cartesian) => scheduler
+                .run_queued_cartesian(&mut model, cartesian, &stream)
+                .unwrap(),
+            None => scheduler.run_queued(&mut model, &group, &stream).unwrap(),
+        };
+        cache = scheduler.release_request_cache(request).unwrap();
+        completed.pop().unwrap().into_logits()
+    } else {
+        let prompt = safemlx::Array::from_slice(&prefix_ids, &[1, prompt_length]);
+        forward_pipeline_model(
+            &mut model,
+            (pipeline_rank == 0).then_some(&prompt),
+            PipelineStep::new(1, prompt_length).unwrap(),
+            &mut cache,
+            &group,
+            cartesian.as_ref(),
+            &stream,
+        )
+    };
     assert_eq!(logits.is_some(), pipeline_rank == 1);
     if let (Some(actual), Some((expected, _))) = (&logits, &reference) {
         assert_final_logits_close(actual, expected, 1e-4);
     }
-    assert_family_cache(family, pipeline_rank, &cache, true);
+    assert_family_cache(family, pipeline_rank, &cache, prompt_length);
     let (model_family, effective_model_type) = family.descriptor_names();
     let descriptor = PromptCacheDescriptor {
         model_family: model_family.into(),
         effective_model_type: effective_model_type.into(),
         checkpoint_fingerprint: "pipeline-ring-fixture".into(),
-        prefix_content_fingerprint: "tokens:1,2".into(),
+        prefix_content_fingerprint: format!("tokens:{prefix_ids:?}"),
         architecture_fingerprint: model.prompt_cache_architecture_fingerprint().unwrap(),
         layer_count: family.layer_count(),
         global_layer_start: family.stage_range(pipeline_rank).start,
@@ -552,7 +616,7 @@ fn pipeline_ring_worker() {
             &mut cache,
             &prompt_cache_root,
             descriptor.clone(),
-            &[1, 2],
+            &prefix_ids,
             &PromptCacheOptions::default(),
         )
         .unwrap();
@@ -574,7 +638,7 @@ fn pipeline_ring_worker() {
         assert_final_logits_close(actual, expected, 1e-4);
     }
     let (mut cache, manifest) = model
-        .load_prompt_cache(&prompt_cache_root, &descriptor, &[1, 2], paged, &stream)
+        .load_prompt_cache(&prompt_cache_root, &descriptor, &prefix_ids, paged, &stream)
         .unwrap();
     assert_eq!(manifest.topology, descriptor.topology);
     let restored = forward_pipeline_model(
@@ -700,6 +764,60 @@ fn resident_reference(checkpoint: &Path, stream: &Stream) -> (Vec<f32>, Vec<f32>
     (prefill, decode)
 }
 
+fn inkling_multimodal_prepared_input() -> PreparedModelInput {
+    use safemlx_lm::runtime::media::input::{InputMetadata, InputPart, Modality, ModelInput};
+
+    let text = Array::from_slice(&[1u32, 2], &[1, 2]);
+    let image = Array::from_slice(&[0.01f32; 16], &[1, 1, 16]);
+    let audio = Array::from_slice(&[0u32, 1, 2, 3, 4, 5], &[3, 2]);
+    let audio_mask = Array::from_slice(&[true, true, false], &[1, 3]);
+    let parts = [
+        InputPart::text_token_ids(&text),
+        InputPart {
+            modality: Modality::Image,
+            payload: InputPayload::Embeddings(&image),
+            metadata: InputMetadata::empty(),
+        },
+        InputPart::audio_tensor(&audio, InputMetadata::audio_mask(&audio_mask)),
+    ];
+    PreparedModelInput::from_model_input(ModelInput::new(&parts)).unwrap()
+}
+
+fn inkling_multimodal_resident_reference(
+    checkpoint: &Path,
+    stream: &Stream,
+) -> (Vec<f32>, Vec<f32>) {
+    let mut model = safemlx_lm::api::load_model(checkpoint, stream, stream).unwrap();
+    let mut cache = model.new_cache();
+    let prepared = inkling_multimodal_prepared_input();
+    let parts = prepared.input_parts();
+    let prefill = model
+        .prefill_input_with_cache(
+            safemlx_lm::runtime::media::input::ModelInput::new(&parts),
+            &mut cache,
+            stream,
+        )
+        .unwrap()
+        .evaluated()
+        .unwrap()
+        .as_slice::<f32>()
+        .to_vec();
+    let token = Array::from_slice(&[0u32], &[1, 1]);
+    let parts = [safemlx_lm::runtime::media::input::InputPart::text_token_ids(&token)];
+    let decode = model
+        .prefill_input_with_cache(
+            safemlx_lm::runtime::media::input::ModelInput::new(&parts),
+            &mut cache,
+            stream,
+        )
+        .unwrap()
+        .evaluated()
+        .unwrap()
+        .as_slice::<f32>()
+        .to_vec();
+    (prefill, decode)
+}
+
 fn assert_final_logits_close(actual: &Array, expected: &[f32], tolerance: f32) {
     let actual = actual.evaluated().unwrap();
     let values = actual.as_slice::<f32>();
@@ -737,14 +855,15 @@ fn assert_family_cache(
     family: FixtureFamily,
     rank: usize,
     cache: &safemlx_lm::architectures::distributed::pipeline::PipelineCache,
-    populated: bool,
+    expected_offset: i32,
 ) {
+    let populated = expected_offset > 0;
     let assert_slots =
         |slots: &[safemlx_lm::architectures::distributed::pipeline::PipelineStateSlot], count| {
             assert_eq!(slots.len(), count);
             for slot in slots {
                 assert_eq!(slot.value().is_some(), populated);
-                assert_eq!(slot.offset(), if populated { 2 } else { 0 });
+                assert_eq!(slot.offset(), expected_offset);
             }
         };
     match family {
@@ -798,7 +917,7 @@ fn assert_family_cache(
             &cache.layers()[0],
             PipelineLayerCache::KeyValue { slots, .. } if slots.is_empty()
         )),
-        FixtureFamily::Inkling | FixtureFamily::InklingGguf => {
+        FixtureFamily::Inkling | FixtureFamily::InklingMultimodal | FixtureFamily::InklingGguf => {
             for layer in cache.layers() {
                 let PipelineLayerCache::KeyValue { slots, .. } = layer else {
                     panic!("Inkling layer did not materialize KV plus convolution state")
@@ -2505,9 +2624,31 @@ fn inkling_config() -> serde_json::Value {
     })
 }
 
+fn inkling_multimodal_config() -> serde_json::Value {
+    let mut config = inkling_config();
+    config["audio_config"] = serde_json::json!({
+        "text_hidden_size": 16,
+        "num_codebooks": 2,
+        "codebook_size": 8,
+        "bias": false,
+        "use_audio_norm": true,
+        "audio_mode": "dmel",
+        "rms_norm_eps": 1e-6
+    });
+    config["image_token_id"] = serde_json::json!(21);
+    config["audio_token_id"] = serde_json::json!(20);
+    config
+}
+
 fn inkling_released_name(runtime: &str) -> String {
     if runtime == "lm_head.weight" {
         return "model.llm.unembed.weight".into();
+    }
+    if let Some(rest) = runtime.strip_prefix("audio.") {
+        return format!("model.audio.{rest}");
+    }
+    if let Some(rest) = runtime.strip_prefix("visual.") {
+        return format!("model.visual.{rest}");
     }
     let rest = runtime.strip_prefix("model.").unwrap();
     let mut raw = format!("model.llm.{rest}");
@@ -2547,7 +2688,14 @@ fn interleave(gate: &Array, up: &Array, axis: i32, stream: &Stream) -> Array {
 }
 
 fn write_inkling_fixture(directory: &Path) {
-    let config = inkling_config();
+    write_inkling_fixture_with_config(directory, inkling_config());
+}
+
+fn write_inkling_multimodal_fixture(directory: &Path) {
+    write_inkling_fixture_with_config(directory, inkling_multimodal_config());
+}
+
+fn write_inkling_fixture_with_config(directory: &Path, config: serde_json::Value) {
     let execution = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
     let stream = execution.stream();
     let args = inkling::model_args_from_config_value(&config).unwrap();
@@ -4148,6 +4296,54 @@ fn ring_four_process_inkling_expert_cache_mismatch_consensus() {
     );
 }
 
+/// Runs scheduled Inkling audio/image ingress through TP-sharded stage zero,
+/// matching-TP pipeline transport, persistence, decode, and generation.
+#[test]
+#[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
+fn ring_four_process_inkling_multimodal_tensor_pipeline() {
+    run_ring_cartesian_pipeline(true, FixtureFamily::InklingMultimodal, "tp-pp");
+}
+
+/// Runs scheduled Inkling audio/image ingress through stage-local expert
+/// ownership and matching-EP pipeline lanes.
+#[test]
+#[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
+fn ring_four_process_inkling_multimodal_pipeline_expert() {
+    run_ring_cartesian_pipeline(false, FixtureFamily::InklingMultimodal, "pp-ep");
+}
+
+/// Proves scheduled multimodal ingress composes with all three Cartesian axes.
+#[test]
+#[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
+fn ring_eight_process_inkling_multimodal_triple_axis() {
+    run_ring_cartesian_pipeline(false, FixtureFamily::InklingMultimodal, "tp-pp-ep");
+}
+
+/// Proves multimodal ingress composes with streamed non-experts and stage-local
+/// independent expert caches across all three Cartesian axes.
+#[test]
+#[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
+fn ring_eight_process_inkling_multimodal_streamed_triple_axis_expert_cache() {
+    run_ring_cartesian_pipeline_mode(
+        true,
+        FixtureFamily::InklingMultimodal,
+        "tp-pp-ep",
+        WorkerMode::ExpertCache,
+    );
+}
+
+/// Proves multimodal ingress composes with host-layerwise non-experts and
+/// independent expert caches across all three Cartesian axes.
+#[test]
+#[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
+fn ring_eight_process_inkling_multimodal_layerwise_host_triple_axis_expert_cache() {
+    run_ring_layerwise_host_cartesian_pipeline_mode(
+        FixtureFamily::InklingMultimodal,
+        "tp-pp-ep",
+        WorkerMode::ExpertCache,
+    );
+}
+
 fn run_ring_pipeline(dense_stream: bool, family: FixtureFamily) {
     run_ring_pipeline_mode(dense_stream, family, WorkerMode::Standard);
 }
@@ -4212,6 +4408,7 @@ fn run_ring_cartesian_pipeline_mode(
                 write_qwen_hybrid_moe_fixture(checkpoint.path(), "qwen3_5_moe_text")
             }
             FixtureFamily::Inkling => write_inkling_fixture(checkpoint.path()),
+            FixtureFamily::InklingMultimodal => write_inkling_multimodal_fixture(checkpoint.path()),
             FixtureFamily::GptOss => write_gpt_oss_fixture(checkpoint.path()),
             _ => panic!("Cartesian pipeline helper received unsupported {family:?}"),
         }
@@ -4252,6 +4449,7 @@ fn run_ring_layerwise_host_cartesian_pipeline_mode(
             FixtureFamily::KimiLinear => write_kimi_linear_fixture(checkpoint.path()),
             FixtureFamily::NemotronH => write_nemotron_fixture(checkpoint.path()),
             FixtureFamily::Inkling => write_inkling_fixture(checkpoint.path()),
+            FixtureFamily::InklingMultimodal => write_inkling_multimodal_fixture(checkpoint.path()),
             FixtureFamily::Qwen3NextMoe => {
                 write_qwen_hybrid_moe_fixture(checkpoint.path(), "qwen3_next")
             }
@@ -4354,6 +4552,7 @@ fn run_ring_pipeline_mode(dense_stream: bool, family: FixtureFamily, mode: Worke
                 write_qwen_hybrid_moe_fixture(checkpoint.path(), "qwen3_5_moe_text")
             }
             FixtureFamily::Inkling => write_inkling_fixture(checkpoint.path()),
+            FixtureFamily::InklingMultimodal => write_inkling_multimodal_fixture(checkpoint.path()),
             FixtureFamily::DeepSeekGguf
             | FixtureFamily::Qwen3MoeGguf
             | FixtureFamily::GptOssGguf
