@@ -26,7 +26,8 @@ use crate::{
         input,
         qwen3_vl::{self as resident, Cache, ModelArgs},
         qwen_vl::{
-            grid_thw_from_array, QwenVisionBlock, QwenVisionLayerwiseState,
+            configure_vision_parallel_static, grid_thw_from_array, new_parallel_vision_block,
+            vision_parallel_parameter_groups, QwenVisionBlock, QwenVisionLayerwiseState,
             QwenVisionLayerwiseStatic, QwenVisionTransformer,
         },
     },
@@ -1461,12 +1462,6 @@ impl ArchitectureAdapter for Qwen3VlLayerwiseAdapter {
         &self,
         _context: crate::runtime::distributed::parallel::ParallelBuildContext,
     ) -> Result<Vec<crate::runtime::distributed::parallel::ParameterGroupSpec>, Error> {
-        use crate::runtime::distributed::parallel::{
-            MemberSharding, ParameterGroupSpec, ParameterMemberSpec, ParameterRole,
-        };
-        let config = &self.args.vision_config;
-        let hidden = config.hidden_size as usize;
-        let intermediate = config.intermediate_size as usize;
         let mut groups = vec![vocab_embedding_parameter_group(
             &self.embedding,
             "model.language_model.embed_tokens",
@@ -1483,120 +1478,10 @@ impl ArchitectureAdapter for Qwen3VlLayerwiseAdapter {
                 false,
             )?);
         }
-        for index in 0..config.layer_count() {
-            let prefix = format!("model.visual.blocks.{index}");
-            groups.push(ParameterGroupSpec::new(
-                format!("{prefix}.attention.qkv"),
-                ParameterRole::Segmented,
-                [
-                    ParameterMemberSpec::new(
-                        format!("{prefix}.attn.qkv.weight"),
-                        [3 * hidden, hidden],
-                        MemberSharding::Segmented {
-                            axis: 0,
-                            segments: vec![0..hidden, hidden..2 * hidden, 2 * hidden..3 * hidden],
-                        },
-                    ),
-                    ParameterMemberSpec::new(
-                        format!("{prefix}.attn.qkv.bias"),
-                        [3 * hidden],
-                        MemberSharding::Segmented {
-                            axis: 0,
-                            segments: vec![0..hidden, hidden..2 * hidden, 2 * hidden..3 * hidden],
-                        },
-                    ),
-                ],
-            )?);
-            groups.push(ParameterGroupSpec::new(
-                format!("{prefix}.attention.output"),
-                ParameterRole::RowProjection,
-                [
-                    ParameterMemberSpec::new(
-                        format!("{prefix}.attn.proj.weight"),
-                        [hidden, hidden],
-                        MemberSharding::Equal { axis: 1 },
-                    ),
-                    ParameterMemberSpec::new(
-                        format!("{prefix}.attn.proj.bias"),
-                        [hidden],
-                        MemberSharding::Replicated,
-                    ),
-                ],
-            )?);
-            groups.push(ParameterGroupSpec::new(
-                format!("{prefix}.mlp.input"),
-                ParameterRole::ColumnProjection,
-                [
-                    ParameterMemberSpec::new(
-                        format!("{prefix}.mlp.linear_fc1.weight"),
-                        [intermediate, hidden],
-                        MemberSharding::Equal { axis: 0 },
-                    ),
-                    ParameterMemberSpec::new(
-                        format!("{prefix}.mlp.linear_fc1.bias"),
-                        [intermediate],
-                        MemberSharding::Equal { axis: 0 },
-                    ),
-                ],
-            )?);
-            groups.push(ParameterGroupSpec::new(
-                format!("{prefix}.mlp.output"),
-                ParameterRole::RowProjection,
-                [
-                    ParameterMemberSpec::new(
-                        format!("{prefix}.mlp.linear_fc2.weight"),
-                        [hidden, intermediate],
-                        MemberSharding::Equal { axis: 1 },
-                    ),
-                    ParameterMemberSpec::new(
-                        format!("{prefix}.mlp.linear_fc2.bias"),
-                        [hidden],
-                        MemberSharding::Replicated,
-                    ),
-                ],
-            )?);
-        }
-        let merger_hidden =
-            (config.hidden_size * config.spatial_merge_size * config.spatial_merge_size) as usize;
-        let mut register_merger = |prefix: String| -> Result<(), Error> {
-            groups.push(ParameterGroupSpec::new(
-                format!("{prefix}.input"),
-                ParameterRole::ColumnProjection,
-                [
-                    ParameterMemberSpec::new(
-                        format!("{prefix}.linear_fc1.weight"),
-                        [merger_hidden, merger_hidden],
-                        MemberSharding::Equal { axis: 0 },
-                    ),
-                    ParameterMemberSpec::new(
-                        format!("{prefix}.linear_fc1.bias"),
-                        [merger_hidden],
-                        MemberSharding::Equal { axis: 0 },
-                    ),
-                ],
-            )?);
-            groups.push(ParameterGroupSpec::new(
-                format!("{prefix}.output"),
-                ParameterRole::RowProjection,
-                [
-                    ParameterMemberSpec::new(
-                        format!("{prefix}.linear_fc2.weight"),
-                        [config.out_hidden_size as usize, merger_hidden],
-                        MemberSharding::Equal { axis: 1 },
-                    ),
-                    ParameterMemberSpec::new(
-                        format!("{prefix}.linear_fc2.bias"),
-                        [config.out_hidden_size as usize],
-                        MemberSharding::Replicated,
-                    ),
-                ],
-            )?);
-            Ok(())
-        };
-        register_merger("model.visual.merger".into())?;
-        for index in 0..config.deepstack_layer_count() {
-            register_merger(format!("model.visual.deepstack_merger_list.{index}"))?;
-        }
+        groups.extend(vision_parallel_parameter_groups(
+            &self.args.vision_config,
+            "model.visual",
+        )?);
         Ok(groups)
     }
 
@@ -1629,39 +1514,7 @@ impl ArchitectureAdapter for Qwen3VlLayerwiseAdapter {
                 stream,
             )?);
         }
-        let vision = &self.args.vision_config;
-        let merger_target = "model.visual.merger.linear_fc1.weight";
-        let local_hidden = i32::try_from(
-            layout
-                .tensor(merger_target)
-                .ok_or_else(|| Error::Parallel(format!("missing TP layout for {merger_target}")))?
-                .local_shape()[0],
-        )
-        .map_err(|_| Error::Parallel("Qwen merger local width exceeds i32".into()))?;
-        self.vision.merger = crate::api::qwen_vl::QwenVisionPatchMerger::new_tensor_parallel(
-            vision,
-            false,
-            false,
-            local_hidden,
-            stream,
-        )?;
-        for (index, merger) in self.vision.deepstack_merger_list.iter_mut().enumerate() {
-            let target = format!("model.visual.deepstack_merger_list.{index}.linear_fc1.weight");
-            let local_hidden = i32::try_from(
-                layout
-                    .tensor(&target)
-                    .ok_or_else(|| Error::Parallel(format!("missing TP layout for {target}")))?
-                    .local_shape()[0],
-            )
-            .map_err(|_| Error::Parallel("Qwen DeepStack local width exceeds i32".into()))?;
-            *merger = crate::api::qwen_vl::QwenVisionPatchMerger::new_tensor_parallel(
-                vision,
-                true,
-                false,
-                local_hidden,
-                stream,
-            )?;
-        }
+        configure_vision_parallel_static(&mut self.vision, "model.visual", layout, stream)?;
         Ok(())
     }
 
@@ -1729,22 +1582,13 @@ impl ArchitectureAdapter for Qwen3VlLayerwiseAdapter {
             )));
         }
         let config = &self.args.vision_config;
-        let prefix = format!("model.visual.blocks.{index}");
-        let qkv = layout
-            .tensor(&format!("{prefix}.attn.qkv.weight"))
-            .ok_or_else(|| Error::Parallel(format!("missing TP layout for {prefix} QKV")))?;
-        let fc1 = layout
-            .tensor(&format!("{prefix}.mlp.linear_fc1.weight"))
-            .ok_or_else(|| Error::Parallel(format!("missing TP layout for {prefix} MLP")))?;
-        let head_dim = config.hidden_size / config.num_heads;
-        let local_heads = i32::try_from(qkv.local_shape()[0] / 3)
-            .map_err(|_| Error::Parallel("Qwen vision local head width exceeds i32".into()))?
-            / head_dim;
-        let local_intermediate = i32::try_from(fc1.local_shape()[0])
-            .map_err(|_| Error::Parallel("Qwen vision local MLP width exceeds i32".into()))?;
-        Ok(Qwen3VlLayer::Vision(Box::new(
-            QwenVisionBlock::new_tensor_parallel(config, local_heads, local_intermediate, stream)?,
-        )))
+        Ok(Qwen3VlLayer::Vision(Box::new(new_parallel_vision_block(
+            config,
+            "model.visual",
+            index,
+            layout,
+            stream,
+        )?)))
     }
 
     fn new_expert_parallel_layer(

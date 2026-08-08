@@ -1262,6 +1262,10 @@ struct QwenHybridStage {
     args: qwen_hybrid::ModelArgs,
     layer_adapter: QwenHybridLayerwiseAdapter,
     range: Range<usize>,
+    has_multimodal_ingress: bool,
+    media_units: Vec<PipelineMediaUnit>,
+    media_layers: Vec<QwenHybridLayer>,
+    media_layer_count: usize,
     embedding: Option<MaybeQuantized<nn::Embedding>>,
     output_embedding: Option<MaybeQuantized<nn::Embedding>>,
     layers: Vec<qwen_hybrid::TransformerBlock>,
@@ -3432,6 +3436,37 @@ impl PipelineStageSemantics for QwenHybridStage {
         stream: &Stream,
     ) -> Result<PipelineStageOutput, Error> {
         QwenHybridStage::forward(self, input, step, mask, cache, stream)
+    }
+
+    fn prefill(
+        &mut self,
+        input: crate::api::input::ModelInput<'_>,
+        step: PipelineStep,
+        mask: Option<&Array>,
+        cache: &mut [PipelineLayerCache],
+        execution: Option<&ParallelExecutionContext<'_>>,
+        expert_group: Option<&Group>,
+        stream: &Stream,
+    ) -> Result<PipelineStageOutput, Error> {
+        if pipeline_state_offset("Qwen3.5 multimodal", cache)? != 0 {
+            return Err(Error::Parallel(
+                "Qwen3.5 multimodal pipeline prefill requires an empty stage cache".into(),
+            ));
+        }
+        let hidden = self.prepare_multimodal_ingress(input, step, execution, stream)?;
+        let payload = PipelinePayload {
+            hidden,
+            auxiliary: PipelineAuxiliaryState::default(),
+        };
+        self.forward_with_execution(
+            PipelineStageInput::Hidden(&payload),
+            step,
+            mask,
+            cache,
+            execution,
+            expert_group,
+            stream,
+        )
     }
 
     fn forward_with_execution(
@@ -5606,6 +5641,9 @@ pub fn load_pipeline_model_with_options(
                     )?);
                 load_qwen_hybrid_pipeline(
                     prepared.args,
+                    None,
+                    None,
+                    None,
                     store,
                     topology,
                     options.quantization,
@@ -5951,6 +5989,9 @@ pub fn load_pipeline_model_with_options(
                 crate::architectures::qwen::hybrid::qwen3_next::get_qwen3_next_model_args(
                     model_dir,
                 )?,
+                None,
+                None,
+                None,
                 store,
                 topology,
                 options.quantization,
@@ -5968,14 +6009,11 @@ pub fn load_pipeline_model_with_options(
             )?;
             let (args, image_token, video_token, vision) =
                 qwen_hybrid::get_qwen3_5_model_args(model_dir)?;
-            if image_token.is_some() || video_token.is_some() || vision.is_some() {
-                return Err(Error::UnsupportedArchitecture(
-                    "Qwen3.5 pipeline execution accepts text-only checkpoints; multimodal ingress must be folded before the decoder pipeline"
-                        .into(),
-                ));
-            }
             load_qwen_hybrid_pipeline(
                 args,
+                image_token,
+                video_token,
+                vision,
                 store,
                 topology,
                 options.quantization,
@@ -12596,6 +12634,9 @@ impl NemotronHStage {
 #[allow(clippy::too_many_arguments)]
 fn load_qwen_hybrid_pipeline(
     source_args: qwen_hybrid::ModelArgs,
+    image_token_id: Option<i32>,
+    video_token_id: Option<i32>,
+    vision_config: Option<crate::api::qwen_vl::VisionConfig>,
     store: SharedWeightStore,
     topology: ParallelTopology,
     requested_quantization: Option<WeightQuantization>,
@@ -12604,7 +12645,16 @@ fn load_qwen_hybrid_pipeline(
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<PipelineModel, Error> {
-    let mut binding_adapter = if expert_cache_options.is_some() {
+    let binding_adapter = if vision_config.is_some() {
+        QwenHybridLayerwiseAdapter::new_pipeline(
+            source_args.clone(),
+            image_token_id,
+            video_token_id,
+            vision_config.clone(),
+            expert_cache_options.is_some(),
+            stream,
+        )?
+    } else if expert_cache_options.is_some() {
         QwenHybridLayerwiseAdapter::new_text_external_experts(source_args.clone(), stream)?
     } else {
         QwenHybridLayerwiseAdapter::new_text(source_args.clone(), stream)?
@@ -12653,6 +12703,9 @@ fn load_qwen_hybrid_pipeline(
     let mut info = base_info(topology, range.clone(), kind, source_args.hidden_size);
     let mut stage = QwenHybridStage::new(
         target_args.clone(),
+        image_token_id,
+        video_token_id,
+        vision_config,
         range,
         &info,
         expert_cache_options.is_some(),
@@ -12668,13 +12721,11 @@ fn load_qwen_hybrid_pipeline(
         let mut planner = build.planner();
         binding_adapter.register_parallel_parameters(build, &mut planner, stream)?;
         let (_, layout) = planner.finish()?;
-        binding_adapter.configure_cartesian_layout(build, &layout, stream)?;
         stage
             .layer_adapter
             .configure_cartesian_layout(build, &layout, stream)?;
         stage.parallel_geometry = stage.layer_adapter.parallel_geometry().map(<[_]>::to_vec);
-        stage.parallel_embedding = info
-            .is_first
+        stage.parallel_embedding = (info.is_first && !stage.has_multimodal_ingress)
             .then(|| {
                 crate::nn::parallel::VocabParallelEmbedding::unloaded(
                     target_args.vocab_size as usize,
@@ -12716,12 +12767,13 @@ fn load_qwen_hybrid_pipeline(
         None
     };
     stage.parallel_layout = parallel_layout.clone();
+    let text_group = stage.layer_adapter.pipeline_text_group();
     stage.layers = stage
         .range
         .clone()
         .map(|global_layer| {
             match stage.layer_adapter.new_cartesian_layer(
-                0,
+                text_group,
                 global_layer,
                 parallel_layout.as_ref(),
                 stage.expert_assignment.as_ref(),
@@ -12743,17 +12795,40 @@ fn load_qwen_hybrid_pipeline(
                 stage.embedding.is_some()
                     || stage.output_embedding.is_some()
                     || stage.parallel_embedding.is_some()
-                    || stage.parallel_output_embedding.is_some(),
+                    || stage.parallel_output_embedding.is_some()
+                    || (info.is_first && stage.has_multimodal_ingress),
             ),
             ("norm", stage.norm.is_some()),
             (
                 "output",
                 stage.lm_head.is_some() || stage.parallel_lm_head.is_some(),
             ),
+            (
+                "vision",
+                info.is_first && stage.layer_adapter.pipeline_static_mut("vision").is_some(),
+            ),
         ]),
     )?;
     let mut loaded = PipelineLoadAccumulator::new("Qwen hybrid");
-    if let Some(module) = &mut stage.parallel_embedding {
+    if info.is_first && stage.has_multimodal_ingress {
+        let bindings = pipeline_cartesian_static_bindings(
+            &static_units,
+            "embedding",
+            store.as_ref(),
+            parallel_layout.as_ref(),
+        )?;
+        loaded.load(
+            stage
+                .layer_adapter
+                .pipeline_static_mut("embedding")
+                .expect("Qwen3.5 multimodal ingress embedding"),
+            store.as_ref(),
+            &bindings,
+            quantize_on_load,
+            weights_stream,
+            stream,
+        )?;
+    } else if let Some(module) = &mut stage.parallel_embedding {
         let bindings = shard_layer_bindings(
             pipeline_static_bindings(&static_units, "embedding")?.to_vec(),
             "",
@@ -12838,11 +12913,57 @@ fn load_qwen_hybrid_pipeline(
             stream,
         )?;
     }
+    if info.is_first && stage.has_multimodal_ingress {
+        let bindings = pipeline_cartesian_static_bindings(
+            &static_units,
+            "vision",
+            store.as_ref(),
+            parallel_layout.as_ref(),
+        )?;
+        loaded.load(
+            stage
+                .layer_adapter
+                .pipeline_static_mut("vision")
+                .expect("Qwen3.5 vision static module"),
+            store.as_ref(),
+            &bindings,
+            None,
+            weights_stream,
+            stream,
+        )?;
+    }
     if dense_stream.is_none() {
+        for unit in stage.media_units.iter().copied() {
+            let mut layer = stage.layer_adapter.new_cartesian_layer(
+                unit.group,
+                unit.index,
+                parallel_layout.as_ref(),
+                stage.expert_assignment.as_ref(),
+                stream,
+            )?;
+            let bindings = binding_adapter.cartesian_layer_bindings(
+                unit.group,
+                unit.index,
+                &layer,
+                store.as_ref(),
+                parallel_layout.as_ref(),
+                stage.expert_assignment.as_ref(),
+                stream,
+            )?;
+            loaded.load(
+                &mut layer,
+                store.as_ref(),
+                &bindings,
+                None,
+                weights_stream,
+                stream,
+            )?;
+            stage.media_layers.push(layer);
+        }
         for (global_layer, layer) in stage.range.clone().zip(&mut stage.layers) {
             let descriptor = QwenHybridLayer::Text(Box::new(layer.clone()));
             let bindings = binding_adapter.cartesian_layer_bindings(
-                0,
+                text_group,
                 global_layer,
                 &descriptor,
                 store.as_ref(),
@@ -12876,38 +12997,63 @@ fn load_qwen_hybrid_pipeline(
         let streamed_layout = parallel_layout.clone();
         let streamed_assignment = stage.expert_assignment.clone();
         let streamed_adapter = &stage.layer_adapter;
-        stage.dense_layers = Some(build_pipeline_layer_storage(
-            Arc::clone(&store),
-            stage.range.clone(),
-            options,
-            static_bytes,
-            stream,
-            weights_stream,
-            |global_layer, stream| match streamed_adapter.new_cartesian_layer(
-                0,
-                global_layer,
-                streamed_layout.as_ref(),
-                streamed_assignment.as_ref(),
+        let media_units = stage.media_units.clone();
+        let media_count = media_units.len();
+        let text_start = stage.range.start;
+        let unit_count = media_count + stage.range.len();
+        stage.dense_layers = Some(
+            build_pipeline_layer_storage::<QwenHybridLayer, _, _>(
+                Arc::clone(&store),
+                0..unit_count,
+                options,
+                static_bytes,
                 stream,
-            )? {
-                QwenHybridLayer::Text(block) => Ok(*block),
-                QwenHybridLayer::Vision(_) => Err(Error::Parallel(
-                    "Qwen hybrid pipeline received a streamed vision unit".into(),
-                )),
-            },
-            |global_layer, layer, store| {
-                let descriptor = QwenHybridLayer::Text(Box::new(layer.clone()));
-                binding_adapter.cartesian_layer_bindings(
-                    0,
-                    global_layer,
-                    &descriptor,
-                    store,
-                    streamed_layout.as_ref(),
-                    streamed_assignment.as_ref(),
-                    stream,
-                )
-            },
-        )?);
+                weights_stream,
+                |ordinal, stream| {
+                    if let Some(unit) = media_units.get(ordinal) {
+                        streamed_adapter.new_cartesian_layer(
+                            unit.group,
+                            unit.index,
+                            streamed_layout.as_ref(),
+                            streamed_assignment.as_ref(),
+                            stream,
+                        )
+                    } else {
+                        streamed_adapter.new_cartesian_layer(
+                            text_group,
+                            text_start + (ordinal - media_count),
+                            streamed_layout.as_ref(),
+                            streamed_assignment.as_ref(),
+                            stream,
+                        )
+                    }
+                },
+                |ordinal, layer, store| {
+                    if let Some(unit) = media_units.get(ordinal) {
+                        binding_adapter.cartesian_layer_bindings(
+                            unit.group,
+                            unit.index,
+                            layer,
+                            store,
+                            streamed_layout.as_ref(),
+                            streamed_assignment.as_ref(),
+                            stream,
+                        )
+                    } else {
+                        binding_adapter.cartesian_layer_bindings(
+                            text_group,
+                            text_start + (ordinal - media_count),
+                            layer,
+                            store,
+                            streamed_layout.as_ref(),
+                            streamed_assignment.as_ref(),
+                            stream,
+                        )
+                    }
+                },
+            )?
+            .with_execution_offset(media_count)?,
+        );
         if expert_cache_options.is_some() {
             stage.dense_layers = stage
                 .dense_layers
@@ -13249,18 +13395,147 @@ fn forward_qwen_hybrid_external_expert_layer(
 }
 
 impl QwenHybridStage {
+    fn prepare_multimodal_ingress(
+        &mut self,
+        input: crate::api::input::ModelInput<'_>,
+        step: PipelineStep,
+        execution: Option<&ParallelExecutionContext<'_>>,
+        stream: &Stream,
+    ) -> Result<Array, Error> {
+        if !self.has_multimodal_ingress || self.media_layer_count != self.media_units.len() {
+            return Err(Error::UnsupportedArchitecture(
+                "Qwen3.5 pipeline typed ingress requires configured stage-zero vision semantics"
+                    .into(),
+            ));
+        }
+        let mut state = self
+            .layer_adapter
+            .begin_pipeline_ingress(input, execution, stream)?;
+        let active_indices = self
+            .media_units
+            .iter()
+            .enumerate()
+            .filter_map(|(ordinal, unit)| {
+                self.layer_adapter
+                    .should_execute_pipeline_group(unit.group, &state)
+                    .then_some(ordinal)
+            })
+            .collect::<Vec<_>>();
+        let prefill = step.sequence_length > 1;
+        let forward_guard = self
+            .dense_layers
+            .as_ref()
+            .and_then(|layers| match &layers.controller {
+                PipelineLayerController::LayerwiseHost(_) => None,
+                PipelineLayerController::DenseDiskStream(controller) => {
+                    Some(controller.forward_guard(prefill, &layers.residency))
+                }
+            })
+            .transpose()?;
+        let group_guard = self
+            .dense_layers
+            .as_ref()
+            .and_then(|layers| match &layers.controller {
+                PipelineLayerController::LayerwiseHost(_) => None,
+                PipelineLayerController::DenseDiskStream(controller) => {
+                    Some(controller.group_guard(&layers.residency, "pipeline_stage"))
+                }
+            });
+        for ordinal in active_indices {
+            let unit = self.media_units[ordinal];
+            let retained = if let Some(storage) = self.dense_layers.as_ref() {
+                let (_host, lease) = storage.prepare_absolute(ordinal, prefill)?;
+                let mut layer = self.layer_adapter.new_cartesian_layer(
+                    unit.group,
+                    unit.index,
+                    self.parallel_layout.as_ref(),
+                    self.expert_assignment.as_ref(),
+                    stream,
+                )?;
+                populate_module_from_lease(&mut layer, &lease)?;
+                let retained = self.layer_adapter.forward_pipeline_media_layer(
+                    unit.group, unit.index, &mut layer, &mut state, execution, stream,
+                )?;
+                storage.trim_after_absolute(ordinal)?;
+                retained
+            } else {
+                let layer = self.media_layers.get_mut(ordinal).ok_or_else(|| {
+                    Error::Parallel(format!(
+                        "Qwen3.5 pipeline media unit {ordinal} was not materialized"
+                    ))
+                })?;
+                self.layer_adapter.forward_pipeline_media_layer(
+                    unit.group, unit.index, layer, &mut state, execution, stream,
+                )?
+            };
+            eval(retained.iter())?;
+            if self.dense_layers.is_some() {
+                stream.synchronize()?;
+            }
+        }
+        if let Some(storage) = self.dense_layers.as_ref() {
+            storage.complete_forward()?;
+        }
+        if let Some(guard) = group_guard {
+            guard.complete()?;
+        }
+        if let Some(guard) = forward_guard {
+            guard.complete()?;
+        }
+        let hidden = self
+            .layer_adapter
+            .finish_pipeline_ingress(state, execution, stream)?;
+        if hidden.dim(0) != step.batch_size || hidden.dim(1) != step.sequence_length {
+            return Err(Error::Parallel(format!(
+                "Qwen3.5 multimodal pipeline ingress produced [{}, {}] batch/sequence geometry, scheduled [{}, {}]",
+                hidden.dim(0),
+                hidden.dim(1),
+                step.batch_size,
+                step.sequence_length
+            )));
+        }
+        Ok(hidden)
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn new(
         args: qwen_hybrid::ModelArgs,
+        image_token_id: Option<i32>,
+        video_token_id: Option<i32>,
+        vision_config: Option<crate::api::qwen_vl::VisionConfig>,
         range: Range<usize>,
         info: &PipelineStageInfo,
         external_experts: bool,
         stream: &Stream,
     ) -> Result<Self, Error> {
-        let layer_adapter = if external_experts {
+        let has_multimodal_ingress = vision_config.is_some();
+        let layer_adapter = if has_multimodal_ingress {
+            QwenHybridLayerwiseAdapter::new_pipeline(
+                args.clone(),
+                image_token_id,
+                video_token_id,
+                vision_config,
+                external_experts,
+                stream,
+            )?
+        } else if external_experts {
             QwenHybridLayerwiseAdapter::new_text_external_experts(args.clone(), stream)?
         } else {
             QwenHybridLayerwiseAdapter::new_text(args.clone(), stream)?
         };
+        let media_units = if info.is_first {
+            layer_adapter
+                .pipeline_media_groups()
+                .into_iter()
+                .flat_map(|(group, depth)| {
+                    (0..depth).map(move |index| PipelineMediaUnit { group, index })
+                })
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        let media_layer_count = media_units.len();
+        let adapter_owns_ingress = info.is_first && has_multimodal_ingress;
         let complete = qwen_hybrid::Model::new(args.clone(), None, None, None, stream)?;
         let qwen_hybrid::Model { model, lm_head, .. } = complete;
         let qwen_hybrid::Qwen35TextModel {
@@ -13271,7 +13546,7 @@ impl QwenHybridStage {
         } = model;
         let mut embedding = None;
         let mut output_embedding = None;
-        if info.is_first {
+        if info.is_first && !adapter_owns_ingress {
             embedding = Some(embed_tokens);
         } else if info.is_last && args.tie_word_embeddings {
             output_embedding = Some(embed_tokens);
@@ -13285,6 +13560,10 @@ impl QwenHybridStage {
             args,
             layer_adapter,
             range,
+            has_multimodal_ingress,
+            media_units,
+            media_layers: Vec::new(),
+            media_layer_count,
             embedding,
             output_embedding,
             layers,
@@ -13390,6 +13669,11 @@ impl QwenHybridStage {
             )));
         }
         let (mut hidden, auxiliary) = match input {
+            PipelineStageInput::Tokens(tokens) if self.has_multimodal_ingress => (
+                self.layer_adapter
+                    .embed_pipeline_tokens(tokens, None, stream)?,
+                PipelineAuxiliaryState::default(),
+            ),
             PipelineStageInput::Tokens(tokens) => (
                 self.embedding
                     .as_mut()
@@ -13467,6 +13751,11 @@ impl QwenHybridStage {
         }
         let stream = execution.stream();
         let (mut hidden, auxiliary) = match input {
+            PipelineStageInput::Tokens(tokens) if self.has_multimodal_ingress => (
+                self.layer_adapter
+                    .embed_pipeline_tokens(tokens, Some(execution), stream)?,
+                PipelineAuxiliaryState::default(),
+            ),
             PipelineStageInput::Tokens(tokens) => (
                 self.parallel_embedding
                     .as_mut()
@@ -13516,7 +13805,7 @@ impl QwenHybridStage {
                 stream,
             },
             |global_layer, stream| match layer_adapter.new_cartesian_layer(
-                0,
+                layer_adapter.pipeline_text_group(),
                 global_layer,
                 parallel_layout.as_ref(),
                 expert_assignment.as_ref(),
@@ -13634,6 +13923,11 @@ impl QwenHybridStage {
             )));
         }
         let (mut hidden, auxiliary) = match input {
+            PipelineStageInput::Tokens(tokens) if self.has_multimodal_ingress => (
+                self.layer_adapter
+                    .embed_pipeline_tokens(tokens, None, stream)?,
+                PipelineAuxiliaryState::default(),
+            ),
             PipelineStageInput::Tokens(tokens) => (
                 self.embedding
                     .as_mut()
@@ -13671,7 +13965,7 @@ impl QwenHybridStage {
                 stream,
             },
             |global_layer, stream| match layer_adapter.new_cartesian_layer(
-                0,
+                layer_adapter.pipeline_text_group(),
                 global_layer,
                 None,
                 Some(&expert_assignment),

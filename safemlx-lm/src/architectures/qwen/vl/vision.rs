@@ -1251,6 +1251,206 @@ impl QwenVisionLayerwiseStatic {
     }
 }
 
+/// Builds the shared semantic TP plan for a Qwen vision root.
+pub(crate) fn vision_parallel_parameter_groups(
+    config: &VisionConfig,
+    prefix: &str,
+) -> Result<Vec<crate::runtime::distributed::parallel::ParameterGroupSpec>, Error> {
+    use crate::runtime::distributed::parallel::{
+        MemberSharding, ParameterGroupSpec, ParameterMemberSpec, ParameterRole,
+    };
+    let hidden = usize::try_from(config.hidden_size)
+        .map_err(|_| Error::Parallel("Qwen vision hidden size is invalid".into()))?;
+    let intermediate = usize::try_from(config.intermediate_size)
+        .map_err(|_| Error::Parallel("Qwen vision intermediate size is invalid".into()))?;
+    let mut groups = Vec::new();
+    for index in 0..config.layer_count() {
+        let block = format!("{prefix}.blocks.{index}");
+        groups.push(ParameterGroupSpec::new(
+            format!("{block}.attention.qkv"),
+            ParameterRole::Segmented,
+            [
+                ParameterMemberSpec::new(
+                    format!("{block}.attn.qkv.weight"),
+                    [3 * hidden, hidden],
+                    MemberSharding::Segmented {
+                        axis: 0,
+                        segments: vec![0..hidden, hidden..2 * hidden, 2 * hidden..3 * hidden],
+                    },
+                ),
+                ParameterMemberSpec::new(
+                    format!("{block}.attn.qkv.bias"),
+                    [3 * hidden],
+                    MemberSharding::Segmented {
+                        axis: 0,
+                        segments: vec![0..hidden, hidden..2 * hidden, 2 * hidden..3 * hidden],
+                    },
+                ),
+            ],
+        )?);
+        groups.push(ParameterGroupSpec::new(
+            format!("{block}.attention.output"),
+            ParameterRole::RowProjection,
+            [
+                ParameterMemberSpec::new(
+                    format!("{block}.attn.proj.weight"),
+                    [hidden, hidden],
+                    MemberSharding::Equal { axis: 1 },
+                ),
+                ParameterMemberSpec::new(
+                    format!("{block}.attn.proj.bias"),
+                    [hidden],
+                    MemberSharding::Replicated,
+                ),
+            ],
+        )?);
+        groups.push(ParameterGroupSpec::new(
+            format!("{block}.mlp.input"),
+            ParameterRole::ColumnProjection,
+            [
+                ParameterMemberSpec::new(
+                    format!("{block}.mlp.linear_fc1.weight"),
+                    [intermediate, hidden],
+                    MemberSharding::Equal { axis: 0 },
+                ),
+                ParameterMemberSpec::new(
+                    format!("{block}.mlp.linear_fc1.bias"),
+                    [intermediate],
+                    MemberSharding::Equal { axis: 0 },
+                ),
+            ],
+        )?);
+        groups.push(ParameterGroupSpec::new(
+            format!("{block}.mlp.output"),
+            ParameterRole::RowProjection,
+            [
+                ParameterMemberSpec::new(
+                    format!("{block}.mlp.linear_fc2.weight"),
+                    [hidden, intermediate],
+                    MemberSharding::Equal { axis: 1 },
+                ),
+                ParameterMemberSpec::new(
+                    format!("{block}.mlp.linear_fc2.bias"),
+                    [hidden],
+                    MemberSharding::Replicated,
+                ),
+            ],
+        )?);
+    }
+    let merge = usize::try_from(config.spatial_merge_size)
+        .map_err(|_| Error::Parallel("Qwen vision merge size is invalid".into()))?;
+    let merger_hidden = hidden
+        .checked_mul(merge.pow(2))
+        .ok_or_else(|| Error::Parallel("Qwen vision merger width overflowed".into()))?;
+    let output = usize::try_from(config.out_hidden_size)
+        .map_err(|_| Error::Parallel("Qwen vision output width is invalid".into()))?;
+    for merger in std::iter::once(format!("{prefix}.merger")).chain(
+        (0..config.deepstack_layer_count())
+            .map(|index| format!("{prefix}.deepstack_merger_list.{index}")),
+    ) {
+        groups.push(ParameterGroupSpec::new(
+            format!("{merger}.input"),
+            ParameterRole::ColumnProjection,
+            [
+                ParameterMemberSpec::new(
+                    format!("{merger}.linear_fc1.weight"),
+                    [merger_hidden, merger_hidden],
+                    MemberSharding::Equal { axis: 0 },
+                ),
+                ParameterMemberSpec::new(
+                    format!("{merger}.linear_fc1.bias"),
+                    [merger_hidden],
+                    MemberSharding::Equal { axis: 0 },
+                ),
+            ],
+        )?);
+        groups.push(ParameterGroupSpec::new(
+            format!("{merger}.output"),
+            ParameterRole::RowProjection,
+            [
+                ParameterMemberSpec::new(
+                    format!("{merger}.linear_fc2.weight"),
+                    [output, merger_hidden],
+                    MemberSharding::Equal { axis: 1 },
+                ),
+                ParameterMemberSpec::new(
+                    format!("{merger}.linear_fc2.bias"),
+                    [output],
+                    MemberSharding::Replicated,
+                ),
+            ],
+        )?);
+    }
+    Ok(groups)
+}
+
+/// Rebuilds merger projections for one rank-local Qwen vision TP layout.
+pub(crate) fn configure_vision_parallel_static(
+    vision: &mut QwenVisionLayerwiseStatic,
+    prefix: &str,
+    layout: &crate::runtime::distributed::parallel::LocalModelLayout,
+    stream: &Stream,
+) -> Result<(), Error> {
+    let target = format!("{prefix}.merger.linear_fc1.weight");
+    let local_hidden = i32::try_from(
+        layout
+            .tensor(&target)
+            .ok_or_else(|| Error::Parallel(format!("missing Qwen TP layout for {target}")))?
+            .local_shape()[0],
+    )
+    .map_err(|_| Error::Parallel("Qwen vision merger width exceeds i32".into()))?;
+    vision.merger = QwenVisionPatchMerger::new_tensor_parallel(
+        &vision.config,
+        false,
+        false,
+        local_hidden,
+        stream,
+    )?;
+    for (index, merger) in vision.deepstack_merger_list.iter_mut().enumerate() {
+        let target = format!("{prefix}.deepstack_merger_list.{index}.linear_fc1.weight");
+        let local_hidden = i32::try_from(
+            layout
+                .tensor(&target)
+                .ok_or_else(|| Error::Parallel(format!("missing Qwen TP layout for {target}")))?
+                .local_shape()[0],
+        )
+        .map_err(|_| Error::Parallel("Qwen DeepStack width exceeds i32".into()))?;
+        *merger = QwenVisionPatchMerger::new_tensor_parallel(
+            &vision.config,
+            true,
+            false,
+            local_hidden,
+            stream,
+        )?;
+    }
+    Ok(())
+}
+
+/// Constructs one rank-local Qwen vision transformer block from its plan.
+pub(crate) fn new_parallel_vision_block(
+    config: &VisionConfig,
+    prefix: &str,
+    index: usize,
+    layout: &crate::runtime::distributed::parallel::LocalModelLayout,
+    stream: &Stream,
+) -> Result<QwenVisionBlock, Error> {
+    let block = format!("{prefix}.blocks.{index}");
+    let qkv = layout
+        .tensor(&format!("{block}.attn.qkv.weight"))
+        .ok_or_else(|| Error::Parallel(format!("missing TP layout for {block} QKV")))?;
+    let fc1 = layout
+        .tensor(&format!("{block}.mlp.linear_fc1.weight"))
+        .ok_or_else(|| Error::Parallel(format!("missing TP layout for {block} MLP")))?;
+    let head_dim = config.hidden_size / config.num_heads;
+    let local_heads = i32::try_from(qkv.local_shape()[0] / 3)
+        .map_err(|_| Error::Parallel("Qwen vision local width exceeds i32".into()))?
+        / head_dim;
+    let local_intermediate = i32::try_from(fc1.local_shape()[0])
+        .map_err(|_| Error::Parallel("Qwen vision local MLP exceeds i32".into()))?;
+    QwenVisionBlock::new_tensor_parallel(config, local_heads, local_intermediate, stream)
+        .map_err(Into::into)
+}
+
 #[derive(Debug, Clone, ModuleParameters)]
 /// Qwen VL vision transformer used to encode image tensors.
 pub struct QwenVisionTransformer {

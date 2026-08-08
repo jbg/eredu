@@ -80,6 +80,8 @@ enum FixtureFamily {
     Qwen3NextMoe,
     Qwen35,
     Qwen35Moe,
+    Qwen35Multimodal,
+    Qwen35MoeMultimodal,
     Inkling,
     InklingMultimodal,
     InklingGguf,
@@ -110,6 +112,8 @@ impl FixtureFamily {
             Self::Qwen3NextMoe => "qwen3-next-moe",
             Self::Qwen35 => "qwen3.5",
             Self::Qwen35Moe => "qwen3.5-moe",
+            Self::Qwen35Multimodal => "qwen3.5-multimodal",
+            Self::Qwen35MoeMultimodal => "qwen3.5-moe-multimodal",
             Self::Inkling => "inkling",
             Self::InklingMultimodal => "inkling-multimodal",
             Self::InklingGguf => "inkling-gguf",
@@ -140,6 +144,8 @@ impl FixtureFamily {
             Self::Qwen3NextMoe,
             Self::Qwen35,
             Self::Qwen35Moe,
+            Self::Qwen35Multimodal,
+            Self::Qwen35MoeMultimodal,
             Self::Inkling,
             Self::InklingMultimodal,
             Self::InklingGguf,
@@ -171,7 +177,9 @@ impl FixtureFamily {
             | Self::Qwen3Next
             | Self::Qwen3NextMoe
             | Self::Qwen35
-            | Self::Qwen35Moe => 2,
+            | Self::Qwen35Moe
+            | Self::Qwen35Multimodal => 2,
+            Self::Qwen35MoeMultimodal => 2,
             Self::Gemma | Self::NemotronH | Self::NemotronHGguf => 4,
             Self::Inkling | Self::InklingMultimodal | Self::InklingGguf => 3,
         }
@@ -220,6 +228,8 @@ impl FixtureFamily {
             Self::Qwen3NextMoe => ("qwen_hybrid", "qwen3_next"),
             Self::Qwen35 => ("qwen_hybrid", "qwen3_5_text"),
             Self::Qwen35Moe => ("qwen_hybrid", "qwen3_5_moe_text"),
+            Self::Qwen35Multimodal => ("qwen_hybrid", "qwen3_5_text"),
+            Self::Qwen35MoeMultimodal => ("qwen_hybrid", "qwen3_5_moe_text"),
             Self::Inkling | Self::InklingMultimodal | Self::InklingGguf => {
                 ("inkling", "inkling_mm_model")
             }
@@ -267,6 +277,8 @@ impl FixtureFamily {
                 | Self::Qwen3NextMoe
                 | Self::Qwen35
                 | Self::Qwen35Moe
+                | Self::Qwen35Multimodal
+                | Self::Qwen35MoeMultimodal
                 | Self::Inkling
                 | Self::InklingMultimodal
                 | Self::InklingGguf
@@ -274,7 +286,10 @@ impl FixtureFamily {
     }
 
     const fn is_multimodal(self) -> bool {
-        matches!(self, Self::InklingMultimodal)
+        matches!(
+            self,
+            Self::InklingMultimodal | Self::Qwen35Multimodal | Self::Qwen35MoeMultimodal
+        )
     }
 }
 
@@ -325,6 +340,7 @@ fn pipeline_ring_worker() {
                     | FixtureFamily::NemotronHGguf
                     | FixtureFamily::Qwen3NextMoe
                     | FixtureFamily::Qwen35Moe
+                    | FixtureFamily::Qwen35MoeMultimodal
                     | FixtureFamily::Qwen3Moe
                     | FixtureFamily::Qwen3MoeTied
                     | FixtureFamily::Qwen3MoeGguf
@@ -342,7 +358,7 @@ fn pipeline_ring_worker() {
             || matches!(family, FixtureFamily::Lfm2 | FixtureFamily::Lfm2Moe)))
     .then(|| {
         if family.is_multimodal() {
-            inkling_multimodal_resident_reference(&checkpoint, &stream)
+            multimodal_resident_reference(family, &checkpoint, &stream)
         } else {
             resident_reference(&checkpoint, &stream)
         }
@@ -458,7 +474,9 @@ fn pipeline_ring_worker() {
     }
     if dense_stream {
         let report = model.dense_stream_report().unwrap().unwrap();
-        assert_eq!(report.planned_layer_count(), expected_range.len());
+        let expected_units =
+            expected_range.len() + usize::from(family.is_multimodal() && pipeline_rank == 0);
+        assert_eq!(report.planned_layer_count(), expected_units);
         assert!(report
             .residency()
             .units()
@@ -479,7 +497,9 @@ fn pipeline_ring_worker() {
         assert!(model.dense_stream_report().unwrap().is_none());
         let report = model.parameter_residency_report().unwrap().unwrap();
         assert!(report.initialized());
-        assert_eq!(report.units().len(), expected_range.len());
+        let expected_units =
+            expected_range.len() + usize::from(family.is_multimodal() && pipeline_rank == 0);
+        assert_eq!(report.units().len(), expected_units);
         assert!(report
             .units()
             .iter()
@@ -533,14 +553,16 @@ fn pipeline_ring_worker() {
         family.stage_range(pipeline_rank).collect::<Vec<_>>()
     );
     assert_family_cache(family, pipeline_rank, &cache, 0);
-    let prefix_ids = if family.is_multimodal() {
-        vec![1, 2, 21, 20, 20]
-    } else {
-        vec![1, 2]
+    let prefix_ids = match family {
+        FixtureFamily::InklingMultimodal => vec![1, 2, 21, 20, 20],
+        FixtureFamily::Qwen35Multimodal | FixtureFamily::Qwen35MoeMultimodal => {
+            vec![1, 2, 42, 42]
+        }
+        _ => vec![1, 2],
     };
     let prompt_length = prefix_ids.len() as i32;
     let mut logits = if family.is_multimodal() {
-        let prepared = inkling_multimodal_prepared_input();
+        let prepared = multimodal_prepared_input(family);
         let identity = prepared.identity();
         let request = RequestId::new(404);
         let mut scheduler =
@@ -586,7 +608,8 @@ fn pipeline_ring_worker() {
     };
     assert_eq!(logits.is_some(), pipeline_rank == 1);
     if let (Some(actual), Some((expected, _))) = (&logits, &reference) {
-        assert_final_logits_close(actual, expected, 1e-4);
+        let tolerance = if family.is_multimodal() { 5e-4 } else { 1e-4 };
+        assert_final_logits_close(actual, expected, tolerance);
     }
     assert_family_cache(family, pipeline_rank, &cache, prompt_length);
     let (model_family, effective_model_type) = family.descriptor_names();
@@ -635,7 +658,8 @@ fn pipeline_ring_worker() {
         value.as_slice::<f32>().to_vec()
     });
     if let (Some(actual), Some((_, expected))) = (&uninterrupted, &reference) {
-        assert_final_logits_close(actual, expected, 1e-4);
+        let tolerance = if family.is_multimodal() { 5e-4 } else { 1e-4 };
+        assert_final_logits_close(actual, expected, tolerance);
     }
     let (mut cache, manifest) = model
         .load_prompt_cache(&prompt_cache_root, &descriptor, &prefix_ids, paged, &stream)
@@ -783,13 +807,37 @@ fn inkling_multimodal_prepared_input() -> PreparedModelInput {
     PreparedModelInput::from_model_input(ModelInput::new(&parts)).unwrap()
 }
 
-fn inkling_multimodal_resident_reference(
+fn qwen35_multimodal_prepared_input() -> PreparedModelInput {
+    use safemlx_lm::runtime::media::input::{InputMetadata, InputPart, ModelInput};
+
+    let text = Array::from_slice(&[1u32, 2], &[1, 2]);
+    let grid = Array::from_slice(&[1i32, 2, 4], &[1, 3]);
+    let pixels = Array::from_slice(&[0.01f32; 96], &[8, 12]);
+    let parts = [
+        InputPart::text_token_ids(&text),
+        InputPart::image_tensor(&pixels, InputMetadata::qwen_grid_thw(&grid)),
+    ];
+    PreparedModelInput::from_model_input(ModelInput::new(&parts)).unwrap()
+}
+
+fn multimodal_prepared_input(family: FixtureFamily) -> PreparedModelInput {
+    match family {
+        FixtureFamily::InklingMultimodal => inkling_multimodal_prepared_input(),
+        FixtureFamily::Qwen35Multimodal | FixtureFamily::Qwen35MoeMultimodal => {
+            qwen35_multimodal_prepared_input()
+        }
+        _ => panic!("{family:?} is not a multimodal fixture"),
+    }
+}
+
+fn multimodal_resident_reference(
+    family: FixtureFamily,
     checkpoint: &Path,
     stream: &Stream,
 ) -> (Vec<f32>, Vec<f32>) {
     let mut model = safemlx_lm::api::load_model(checkpoint, stream, stream).unwrap();
     let mut cache = model.new_cache();
-    let prepared = inkling_multimodal_prepared_input();
+    let prepared = multimodal_prepared_input(family);
     let parts = prepared.input_parts();
     let prefill = model
         .prefill_input_with_cache(
@@ -903,6 +951,8 @@ fn assert_family_cache(
         | FixtureFamily::Qwen3NextMoe
         | FixtureFamily::Qwen35
         | FixtureFamily::Qwen35Moe
+        | FixtureFamily::Qwen35Multimodal
+        | FixtureFamily::Qwen35MoeMultimodal
             if rank == 0 =>
         {
             let PipelineLayerCache::StateSlots { slots, .. } = &cache.layers()[0] else {
@@ -913,7 +963,9 @@ fn assert_family_cache(
         FixtureFamily::Qwen3Next
         | FixtureFamily::Qwen3NextMoe
         | FixtureFamily::Qwen35
-        | FixtureFamily::Qwen35Moe => assert!(matches!(
+        | FixtureFamily::Qwen35Moe
+        | FixtureFamily::Qwen35Multimodal
+        | FixtureFamily::Qwen35MoeMultimodal => assert!(matches!(
             &cache.layers()[0],
             PipelineLayerCache::KeyValue { slots, .. } if slots.is_empty()
         )),
@@ -2579,6 +2631,51 @@ fn write_qwen_hybrid_moe_fixture(directory: &Path, model_type: &str) {
     save_parameter_fixture(directory, &config, &model);
 }
 
+fn write_qwen35_multimodal_fixture(directory: &Path, moe: bool) {
+    let text_config = if moe {
+        qwen_hybrid_moe_config("qwen3_5_moe_text")
+    } else {
+        qwen_hybrid_config("qwen3_5_text")
+    };
+    let config = serde_json::json!({
+        "architectures": [if moe { "Qwen3_5MoeForConditionalGeneration" } else { "Qwen3_5ForConditionalGeneration" }],
+        "model_type": if moe { "qwen3_5_moe" } else { "qwen3_5" },
+        "image_token_id": 42,
+        "video_token_id": 43,
+        "text_config": text_config,
+        "vision_config": {
+            "depth": 1,
+            "hidden_size": 8,
+            "hidden_act": "silu",
+            "intermediate_size": 8,
+            "num_heads": 2,
+            "num_position_embeddings": 16,
+            "in_channels": 3,
+            "patch_size": 2,
+            "spatial_merge_size": 2,
+            "temporal_patch_size": 1,
+            "window_size": 8,
+            "out_hidden_size": 16,
+            "fullatt_block_indexes": [0],
+            "deepstack_visual_indexes": []
+        }
+    });
+    std::fs::create_dir_all(directory).unwrap();
+    std::fs::write(
+        directory.join("config.json"),
+        serde_json::to_vec(&config).unwrap(),
+    )
+    .unwrap();
+    let execution = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+    let stream = execution.stream();
+    let (args, image_token_id, video_token_id, vision) =
+        qwen_hybrid::get_qwen3_5_model_args(directory).unwrap();
+    let mut model =
+        qwen_hybrid::Model::new(args, image_token_id, video_token_id, vision, stream).unwrap();
+    initialize_fixture(&mut model, stream);
+    save_parameter_fixture(directory, &config, &model);
+}
+
 fn inkling_config() -> serde_json::Value {
     serde_json::json!({
         "model_type": "inkling_mm_model",
@@ -3959,6 +4056,39 @@ fn ring_four_process_qwen35_moe_tensor_pipeline() {
     run_ring_cartesian_pipeline(true, FixtureFamily::Qwen35Moe, "tp-pp");
 }
 
+/// Verifies scheduled typed image ingress, TP-sharded vision/text blocks,
+/// corresponding-coordinate PP transport, cached decode, and persistence.
+#[test]
+#[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
+fn ring_four_process_qwen35_multimodal_tensor_pipeline() {
+    run_ring_cartesian_pipeline(false, FixtureFamily::Qwen35Multimodal, "tp-pp");
+}
+
+/// Verifies multimodal Qwen3.5-MoE across all Cartesian axes with bounded
+/// media/decoder reads and independently cached routed experts.
+#[test]
+#[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
+fn ring_eight_process_qwen35_moe_multimodal_streamed_triple_axis() {
+    run_ring_cartesian_pipeline_mode(
+        true,
+        FixtureFamily::Qwen35MoeMultimodal,
+        "tp-pp-ep",
+        WorkerMode::ExpertCache,
+    );
+}
+
+/// Verifies the same typed ingress and expert-storage semantics with host-backed
+/// vision and decoder windows.
+#[test]
+#[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
+fn ring_eight_process_qwen35_moe_multimodal_layerwise_host_triple_axis() {
+    run_ring_layerwise_host_cartesian_pipeline_mode(
+        FixtureFamily::Qwen35MoeMultimodal,
+        "tp-pp-ep",
+        WorkerMode::ExpertCache,
+    );
+}
+
 /// Verifies Qwen3.5-MoE PP=2 + EP=2 with stage-local packed experts,
 /// recurrent/full-attention state, persistence, and generation.
 #[test]
@@ -4407,6 +4537,12 @@ fn run_ring_cartesian_pipeline_mode(
             FixtureFamily::Qwen35Moe => {
                 write_qwen_hybrid_moe_fixture(checkpoint.path(), "qwen3_5_moe_text")
             }
+            FixtureFamily::Qwen35Multimodal => {
+                write_qwen35_multimodal_fixture(checkpoint.path(), false)
+            }
+            FixtureFamily::Qwen35MoeMultimodal => {
+                write_qwen35_multimodal_fixture(checkpoint.path(), true)
+            }
             FixtureFamily::Inkling => write_inkling_fixture(checkpoint.path()),
             FixtureFamily::InklingMultimodal => write_inkling_multimodal_fixture(checkpoint.path()),
             FixtureFamily::GptOss => write_gpt_oss_fixture(checkpoint.path()),
@@ -4455,6 +4591,12 @@ fn run_ring_layerwise_host_cartesian_pipeline_mode(
             }
             FixtureFamily::Qwen35Moe => {
                 write_qwen_hybrid_moe_fixture(checkpoint.path(), "qwen3_5_moe_text")
+            }
+            FixtureFamily::Qwen35Multimodal => {
+                write_qwen35_multimodal_fixture(checkpoint.path(), false)
+            }
+            FixtureFamily::Qwen35MoeMultimodal => {
+                write_qwen35_multimodal_fixture(checkpoint.path(), true)
             }
             _ => panic!("host-layerwise Cartesian helper received unsupported {family:?}"),
         }
@@ -4550,6 +4692,12 @@ fn run_ring_pipeline_mode(dense_stream: bool, family: FixtureFamily, mode: Worke
             FixtureFamily::Qwen35 => write_qwen_hybrid_fixture(checkpoint.path(), "qwen3_5_text"),
             FixtureFamily::Qwen35Moe => {
                 write_qwen_hybrid_moe_fixture(checkpoint.path(), "qwen3_5_moe_text")
+            }
+            FixtureFamily::Qwen35Multimodal => {
+                write_qwen35_multimodal_fixture(checkpoint.path(), false)
+            }
+            FixtureFamily::Qwen35MoeMultimodal => {
+                write_qwen35_multimodal_fixture(checkpoint.path(), true)
             }
             FixtureFamily::Inkling => write_inkling_fixture(checkpoint.path()),
             FixtureFamily::InklingMultimodal => write_inkling_multimodal_fixture(checkpoint.path()),

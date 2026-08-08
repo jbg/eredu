@@ -159,7 +159,7 @@ Fully resident Qwen stages support aligned affine or MXFP4 requantization;
 GPT-OSS can MXFP4-quantize eligible dense matrices without transcoding its
 expert banks. Host-layerwise and dense disk streaming require checkpoint-native
 encodings.
-Qwen3-MoE, Kimi Linear, Inkling, GPT-OSS, Gemma 4 MoE, LFM2-MoE, Nemotron-H-MoE, and text-only
+Qwen3-MoE, Kimi Linear, Inkling, GPT-OSS, Gemma 4 MoE, LFM2-MoE, Nemotron-H-MoE, and
 Qwen3-Next/Qwen3.5-MoE additionally support arbitrary-geometry
 TP+PP+EP through the same Cartesian topology and semantic layer plan for fully
 resident, host-layerwise, or dense-streamed SafeTensors and their canonical
@@ -172,6 +172,11 @@ Qwen hybrid stages retain rank-local recurrent convolution/delta-rule state
 alongside full-attention KV state through resident, host-layerwise, and
 dense-streamed execution; independently cached experts use the same
 SafeTensors or canonical GGUF semantic catalog.
+Qwen3.5 SafeTensors can additionally place its TP-sharded vision root on stage
+zero and submit direct or scheduler-owned image/video tensors through that same
+Cartesian path. Vision and decoder blocks share the selected residency policy;
+canonical Qwen3.5 GGUF remains a text artifact because the registered GGUF
+metadata does not define a media-projector binding.
 LFM2 and LFM2-MoE use the same runtime for SafeTensors and canonical
 `lfm2`/`lfm2moe` GGUF checkpoints. Their alternating causal-convolution and
 full-attention layers materialize semantic state slots from the canonical

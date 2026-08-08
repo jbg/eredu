@@ -958,6 +958,13 @@ stage zero for every non-PP coordinate. Typed image/video ingress is assembled
 there; explicit MRoPE tensors, the persisted position delta, and
 sequence-aligned DeepStack residuals then use the ordinary immutable pipeline
 payload. Later stages execute only their text-layer ranges.
+Qwen3.5 uses the same ownership rule through the shared hybrid semantic
+adapter: stage zero owns its patch/position modules, merger banks, and vision
+blocks, then sends the assembled text-width sequence through matching TP/EP
+pipeline lanes. Vision and recurrent/full-attention decoder units share one
+resident, host-layerwise, or dense-streamed plan; dense and MoE decoders use
+the same scheduled `PreparedModelInput`, cached decode, generation, and
+prompt-cache lifecycle.
 Gemma 4 likewise places configured vision and audio roots on stage zero for
 every TP/EP coordinate. Pooled image/video and subsampled audio outputs are
 assembled through the shared Gemma execution-group adapter; per-layer inputs
@@ -991,7 +998,7 @@ non-resident policy; `dense_stream_report` adds disk-stream pass and cache
 statistics only when that policy is active. `PipelineStageInfo` carries the
 same report's global rank and TP/PP/EP coordinates and stage ownership.
 DeepSeek-V3/R1, Qwen3-MoE, Qwen3-VL-MoE, Kimi Linear, Inkling, GPT-OSS,
-LFM2-MoE, Nemotron-H-MoE, Gemma 4 MoE, and text-only Qwen3-Next/Qwen3.5-MoE also compose all
+LFM2-MoE, Nemotron-H-MoE, Gemma 4 MoE, and Qwen3-Next/Qwen3.5-MoE also compose all
 three axes in this runtime. TP
 collectives remain inside the stage and EP coordinate, routed exchange remains
 inside the stage and TP coordinate, and pipeline transport connects equal
@@ -1045,8 +1052,8 @@ formats. Dense families have no EP migration.
 | LFM2-MoE | TP, PP, EP | Complete | None |
 | Nemotron-H dense | TP, PP | TP+PP complete | None; EP does not apply |
 | Nemotron-H-MoE | TP, PP, EP | Complete | None |
-| Qwen3-Next/Qwen3.5 text dense | TP, PP | TP+PP complete | Qwen3.5 multimodal ingress remains outside the text pipeline; EP does not apply |
-| Qwen3-Next/Qwen3.5-MoE text | TP, PP, EP | Complete | Qwen3.5 multimodal ingress remains outside the text pipeline |
+| Qwen3-Next/Qwen3.5 dense | TP, PP | TP+PP complete | None; Qwen3.5 SafeTensors supports direct or queued typed image/video ingress with stage-zero TP-sharded vision ownership and all three non-expert residency policies; EP does not apply |
+| Qwen3-Next/Qwen3.5-MoE | TP, PP, EP | Complete | None; Qwen3.5 SafeTensors multimodal ingress composes with TP+PP, PP+EP, and TP+PP+EP plus resident or independently cached experts |
 | Inkling multimodal | TP, PP, EP | Complete | None; direct or queued text/image/audio ingress, stage-zero hMLP and dMel ownership, SafeTensors and canonical text-plus-mmproj GGUF, cached decode, synchronized generation, prompt-cache persistence, and resident, host-layerwise, dense-streamed, or independently cached expert policies share the Cartesian runtime |
 | Qwen3-VL dense | TP, PP | TP+PP complete | None; vision is pinned on stage zero and direct or queued typed image/video ingress composes with arbitrary legal TP/PP degrees; EP does not apply |
 | Qwen3-VL-MoE | TP, PP, EP | Complete | None; vision is pinned on stage zero and direct or queued typed image/video ingress composes with arbitrary legal TP/PP/EP degrees |
@@ -1061,7 +1068,7 @@ The remaining global limitations are:
 
 TP+PP+EP is executable for DeepSeek-V3/R1, Qwen3-MoE, Qwen3-VL-MoE, Kimi
 Linear, Inkling, GPT-OSS, Gemma 4 MoE, LFM2-MoE, Nemotron-H-MoE, and
-Qwen3-Next/Qwen3.5-MoE text. The Cartesian
+Qwen3-Next/Qwen3.5-MoE, including Qwen3.5 multimodal SafeTensors. The Cartesian
 topology and execution contexts remain family-neutral and accept arbitrary
 legal axis sizes.
 
@@ -1096,7 +1103,7 @@ for SafeTensors and canonical GGUF. Fully resident stages support aligned
 affine or MXFP4 load-time quantization, exact Qwen2 Q/K/V biases, Qwen3 Q/K
 norms, GQA, tied or untied heads, routed experts, and every normalized
 full/sliding layer policy.
-Kimi Linear, Nemotron-H/Nemotron-H-MoE, Inkling, and text-only Qwen3-Next/Qwen3.5 also
+Kimi Linear, Nemotron-H/Nemotron-H-MoE, Inkling, and Qwen3-Next/Qwen3.5 text artifacts also
 use the generalized pipeline runtime for SafeTensors and canonical GGUF. KDA,
 Mamba2, and linear-attention state is represented by semantic fixed slots; MLA
 and full/sliding attention use the shared compressed or KV cache. These
@@ -1133,13 +1140,16 @@ dense-streamed policies do not inspect or materialize remote-stage expert
 payloads. Empty-route coordinates, prompt-cache reload, synchronized
 generation, and failure consensus use the shared pipeline runtime.
 
-Qwen3-Next/Qwen3.5-MoE text uses that same Cartesian and expert-storage
+Qwen3-Next/Qwen3.5-MoE uses that same Cartesian and expert-storage
 contract. Full-attention KV and recurrent convolution/delta-rule state remain
 ordinary rank-local stage cache entries; resident experts combine TP-sharded
 intermediates with EP ownership, while independent expert caches compose with
 fully resident, host-layerwise, or dense-streamed non-experts. SafeTensors and
-canonical GGUF use the shared packed/split expert catalog. Multimodal Qwen3.5
-ingress remains outside this text pipeline.
+canonical GGUF use the shared packed/split expert catalog. Qwen3.5 multimodal
+SafeTensors add stage-zero vision units to that same residency schedule and
+accept direct or scheduler-owned image/video tensors. Canonical Qwen3.5 GGUF
+remains a text artifact because its registered metadata has no media-projector
+binding; it continues to use the identical text decoder path.
 
 `PipelineCache` contains only the local global-layer range: standard or
 sliding-window KV entries for Llama, dense Qwen, and GPT-OSS;

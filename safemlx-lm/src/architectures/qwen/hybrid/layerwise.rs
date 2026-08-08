@@ -25,7 +25,8 @@ use crate::{
         },
         qwen3_next,
         qwen_vl::{
-            grid_thw_from_array, QwenVisionBlock, QwenVisionLayerwiseState,
+            configure_vision_parallel_static, grid_thw_from_array, new_parallel_vision_block,
+            vision_parallel_parameter_groups, QwenVisionBlock, QwenVisionLayerwiseState,
             QwenVisionLayerwiseStatic, QwenVisionTransformer, VisionConfig,
         },
     },
@@ -1422,6 +1423,27 @@ impl QwenHybridLayerwiseAdapter {
         Ok(adapter)
     }
 
+    /// Creates the shared stage-zero adapter for Qwen3.5 typed visual ingress.
+    pub(crate) fn new_pipeline(
+        args: ModelArgs,
+        image_token_id: Option<i32>,
+        video_token_id: Option<i32>,
+        vision_config: Option<VisionConfig>,
+        external_experts: bool,
+        stream: &Stream,
+    ) -> Result<Self, Error> {
+        let mut adapter = Self::new(
+            args,
+            QwenHybridFamily::Qwen35,
+            image_token_id,
+            video_token_id,
+            vision_config,
+            stream,
+        )?;
+        adapter.sparse_expert_cache = external_experts;
+        Ok(adapter)
+    }
+
     fn new(
         args: ModelArgs,
         family: QwenHybridFamily,
@@ -1494,6 +1516,56 @@ impl QwenHybridLayerwiseAdapter {
     /// Returns configured rank-local attention, recurrent, and MLP geometry.
     pub(crate) fn parallel_geometry(&self) -> Option<&[resident::ParallelLayerGeometry]> {
         self.parallel_geometry.as_deref()
+    }
+
+    /// Embeds a decoder token step through the static module owned by stage zero.
+    pub(crate) fn embed_pipeline_tokens(
+        &mut self,
+        tokens: &Array,
+        execution: Option<&crate::runtime::distributed::parallel::ParallelExecutionContext<'_>>,
+        stream: &Stream,
+    ) -> Result<Array, Error> {
+        match execution {
+            Some(execution) if execution.is_tensor_parallel() => self
+                .parallel_embedding
+                .as_mut()
+                .ok_or_else(|| {
+                    Error::Parallel("Qwen3.5 pipeline adapter has no TP embedding shard".into())
+                })?
+                .forward(tokens, execution),
+            _ => self.embedding.forward(tokens, stream).map_err(Into::into),
+        }
+    }
+
+    /// Returns the configured media execution groups and their depths.
+    pub(crate) fn pipeline_media_groups(&self) -> Vec<(usize, usize)> {
+        self.vision
+            .as_ref()
+            .map(|vision| vec![(0, vision.config.layer_count())])
+            .unwrap_or_default()
+    }
+
+    /// Returns the text execution group after any configured vision root.
+    pub(crate) fn pipeline_text_group(&self) -> usize {
+        usize::from(self.vision.is_some())
+    }
+
+    /// Selects a stage-owned static module without exposing its concrete type.
+    pub(crate) fn pipeline_static_mut(&mut self, role: &str) -> Option<&mut dyn ModuleParameters> {
+        match role {
+            "embedding" => {
+                if let Some(module) = &mut self.parallel_embedding {
+                    Some(module.inner_mut())
+                } else {
+                    Some(&mut self.embedding)
+                }
+            }
+            "vision" => self
+                .vision
+                .as_mut()
+                .map(|module| module as &mut dyn ModuleParameters),
+            _ => None,
+        }
     }
 
     fn execution_group_name(&self, group: usize) -> Result<&'static str, Error> {
@@ -2353,6 +2425,187 @@ pub struct QwenHybridForwardContext {
     draft_hidden: Option<Array>,
 }
 
+/// Opaque state retained while stage zero executes the Qwen3.5 vision root.
+pub(crate) struct QwenHybridPipelineIngressState {
+    parts: Vec<QwenHybridPreparedPart>,
+    vision_jobs: Vec<QwenHybridVisionJob>,
+}
+
+impl QwenHybridLayerwiseAdapter {
+    /// Starts typed visual ingress using the same semantic preparation as the
+    /// bounded execution-group path.
+    pub(crate) fn begin_pipeline_ingress(
+        &mut self,
+        input: input::ModelInput<'_>,
+        execution: Option<&crate::runtime::distributed::parallel::ParallelExecutionContext<'_>>,
+        stream: &Stream,
+    ) -> Result<QwenHybridPipelineIngressState, Error> {
+        input::validate(input)?;
+        let mut parts = Vec::with_capacity(input.parts.len());
+        let mut vision_jobs = Vec::new();
+        for part in input.parts {
+            match (part.modality, part.payload) {
+                (input::Modality::Text, input::InputPayload::TokenIds(tokens)) => {
+                    parts.push(QwenHybridPreparedPart::Ready(
+                        self.embed_pipeline_tokens(tokens, execution, stream)?,
+                    ));
+                }
+                (
+                    input::Modality::Image | input::Modality::Video,
+                    input::InputPayload::Tensor(pixels),
+                ) => {
+                    let grid = part.metadata.qwen_grid_thw.ok_or_else(|| {
+                        Error::UnsupportedArchitecture(format!(
+                            "Qwen3.5 {} input requires qwen_grid_thw metadata",
+                            part.modality.as_str()
+                        ))
+                    })?;
+                    let vision = self.vision.as_mut().ok_or_else(|| {
+                        Error::UnsupportedArchitecture(
+                            "Qwen3.5 visual tensor input requires vision_config and visual weights"
+                                .into(),
+                        )
+                    })?;
+                    let token_id = if part.modality == input::Modality::Image {
+                        self.image_token_id
+                    } else {
+                        self.video_token_id
+                    };
+                    if token_id.is_none() {
+                        return Err(Error::UnsupportedArchitecture(format!(
+                            "Qwen3.5 config does not define a {} token ID",
+                            part.modality.as_str()
+                        )));
+                    }
+                    let merge = vision.config.spatial_merge_size;
+                    let merged = grid_thw_from_array(grid, stream)?
+                        .into_iter()
+                        .map(|(t, h, w)| t * (h / merge) * (w / merge))
+                        .sum::<i32>();
+                    if merged <= 0 {
+                        return Err(Error::UnsupportedArchitecture(
+                            "Qwen3.5 visual grid produced no merged tokens".into(),
+                        ));
+                    }
+                    let (hidden, state) = vision.begin(pixels, grid, stream)?;
+                    let job = vision_jobs.len();
+                    vision_jobs.push(QwenHybridVisionJob { hidden, state });
+                    parts.push(QwenHybridPreparedPart::Vision(job));
+                }
+                (
+                    input::Modality::Image | input::Modality::Video,
+                    input::InputPayload::Embeddings(embeddings),
+                ) => {
+                    input::ensure_hidden_size(
+                        embeddings,
+                        self.args.hidden_size,
+                        "Qwen3.5 visual embeddings",
+                    )?;
+                    parts.push(QwenHybridPreparedPart::Ready(embeddings.clone()));
+                }
+                (modality, _) => {
+                    return Err(Error::UnsupportedArchitecture(format!(
+                        "Qwen3.5 pipeline input does not support {} payloads of this kind",
+                        modality.as_str()
+                    )));
+                }
+            }
+        }
+        Ok(QwenHybridPipelineIngressState { parts, vision_jobs })
+    }
+
+    /// Returns whether one configured media group has work for this input.
+    pub(crate) fn should_execute_pipeline_group(
+        &self,
+        group: usize,
+        state: &QwenHybridPipelineIngressState,
+    ) -> bool {
+        self.execution_group_name(group)
+            .is_ok_and(|name| name != "vision_encoder" || !state.vision_jobs.is_empty())
+    }
+
+    /// Executes one resident or leased vision block.
+    pub(crate) fn forward_pipeline_media_layer(
+        &mut self,
+        group: usize,
+        index: usize,
+        layer: &mut QwenHybridLayer,
+        state: &mut QwenHybridPipelineIngressState,
+        execution: Option<&crate::runtime::distributed::parallel::ParallelExecutionContext<'_>>,
+        stream: &Stream,
+    ) -> Result<Vec<Array>, Error> {
+        if self.execution_group_name(group)? != "vision_encoder" {
+            return Err(Error::Parallel(format!(
+                "Qwen3.5 pipeline media unit {group}:{index} is not a vision block"
+            )));
+        }
+        let QwenHybridLayer::Vision(block) = layer else {
+            return Err(Error::Parallel(format!(
+                "Qwen3.5 pipeline media unit {group}:{index} has text storage"
+            )));
+        };
+        let vision = self.vision.as_mut().expect("configured vision group");
+        for job in &mut state.vision_jobs {
+            job.hidden = match execution.and_then(|execution| execution.group()) {
+                Some(tp_group) => vision.forward_block_tensor_parallel(
+                    block,
+                    index,
+                    job.hidden.clone(),
+                    &job.state,
+                    tp_group,
+                    execution.expect("TP execution").stream(),
+                )?,
+                None => {
+                    vision.forward_block(block, index, job.hidden.clone(), &job.state, stream)?
+                }
+            };
+            match execution.and_then(|execution| execution.group()) {
+                Some(tp_group) => vision.capture_deepstack_tensor_parallel(
+                    index,
+                    &job.hidden,
+                    &mut job.state,
+                    tp_group,
+                    execution.expect("TP execution").stream(),
+                )?,
+                None => vision.capture_deepstack(index, &job.hidden, &mut job.state, stream)?,
+            }
+        }
+        Ok(state
+            .vision_jobs
+            .iter()
+            .flat_map(|job| {
+                std::iter::once(job.hidden.clone())
+                    .chain(job.state.retained_arrays().into_iter().cloned())
+            })
+            .collect())
+    }
+
+    /// Finishes all media roots and assembles exact decoder ingress embeddings.
+    pub(crate) fn finish_pipeline_ingress(
+        &mut self,
+        mut state: QwenHybridPipelineIngressState,
+        _execution: Option<&crate::runtime::distributed::parallel::ParallelExecutionContext<'_>>,
+        stream: &Stream,
+    ) -> Result<Array, Error> {
+        if let Some(vision) = &mut self.vision {
+            for job in &mut state.vision_jobs {
+                job.hidden = vision
+                    .finish(&job.hidden, &mut job.state, stream)?
+                    .embeddings;
+            }
+        }
+        let assembled = state
+            .parts
+            .iter()
+            .map(|part| match part {
+                QwenHybridPreparedPart::Ready(value) => value,
+                QwenHybridPreparedPart::Vision(job) => &state.vision_jobs[*job].hidden,
+            })
+            .collect::<Vec<_>>();
+        concatenate_axis(&assembled, 1, stream).map_err(Into::into)
+    }
+}
+
 /// One leased vision or hybrid text block.
 pub enum QwenHybridLayer {
     /// Qwen vision transformer block.
@@ -2906,10 +3159,11 @@ impl ArchitectureAdapter for QwenHybridLayerwiseAdapter {
         stream: &Stream,
     ) -> Result<Self::Layer, Error> {
         let mut layer = self.new_layer(group, index, stream)?;
+        if matches!(layer, QwenHybridLayer::Vision(_)) {
+            return Ok(layer);
+        }
         let QwenHybridLayer::Text(block) = &mut layer else {
-            return Err(Error::Parallel(
-                "Qwen hybrid expert ownership applies only to text decoder layers".into(),
-            ));
+            unreachable!();
         };
         let resident::FeedForward::Moe(moe) = &mut block.mlp else {
             return Err(Error::Parallel(
@@ -2936,10 +3190,11 @@ impl ArchitectureAdapter for QwenHybridLayerwiseAdapter {
         stream: &Stream,
     ) -> Result<Self::Layer, Error> {
         let mut layer = self.new_parallel_layer(group, index, layout, stream)?;
+        if matches!(layer, QwenHybridLayer::Vision(_)) {
+            return Ok(layer);
+        }
         let QwenHybridLayer::Text(block) = &mut layer else {
-            return Err(Error::Parallel(
-                "Qwen hybrid expert ownership applies only to text decoder layers".into(),
-            ));
+            unreachable!();
         };
         let resident::FeedForward::Moe(moe) = &mut block.mlp else {
             return Err(Error::Parallel(
@@ -2986,10 +3241,9 @@ impl ArchitectureAdapter for QwenHybridLayerwiseAdapter {
         planner: &mut crate::runtime::distributed::parallel::ParallelPlanBuilder,
         stream: &Stream,
     ) -> Result<(), Error> {
-        if self.vision.is_some() || self.mtp.is_some() {
+        if self.mtp.is_some() {
             return Err(Error::Parallel(
-                "token-only Qwen hybrid TP requires vision and MTP execution groups to be absent"
-                    .into(),
+                "Qwen hybrid TP requires MTP execution groups to be absent".into(),
             ));
         }
         planner.register(crate::nn::parallel::vocab_embedding_parameter_group(
@@ -3016,6 +3270,11 @@ impl ArchitectureAdapter for QwenHybridLayerwiseAdapter {
         for index in 0..self.args.num_hidden_layers as usize {
             let layer = TransformerBlock::new(&self.args, index, stream)?;
             register_qwen_hybrid_layer_parallel_plan(planner, &layer, index, &self.args)?;
+        }
+        if let Some(vision) = &self.vision {
+            for group in vision_parallel_parameter_groups(&vision.config, "visual")? {
+                planner.register(group)?;
+            }
         }
         Ok(())
     }
@@ -3116,6 +3375,9 @@ impl ArchitectureAdapter for QwenHybridLayerwiseAdapter {
                 stream,
             )?);
         }
+        if let Some(vision) = &mut self.vision {
+            configure_vision_parallel_static(vision, "visual", layout, stream)?;
+        }
         Ok(())
     }
     fn new_parallel_layer(
@@ -3125,10 +3387,11 @@ impl ArchitectureAdapter for QwenHybridLayerwiseAdapter {
         layout: &crate::runtime::distributed::parallel::LocalModelLayout,
         stream: &Stream,
     ) -> Result<Self::Layer, Error> {
-        if self.execution_group_name(group)? != "text_decoder" {
-            return Err(Error::Parallel(
-                "token-only Qwen TP has no vision execution group".into(),
-            ));
+        if self.execution_group_name(group)? == "vision_encoder" {
+            let vision = &self.vision.as_ref().expect("vision group").config;
+            return Ok(QwenHybridLayer::Vision(Box::new(
+                new_parallel_vision_block(vision, "visual", index, layout, stream)?,
+            )));
         }
         let _ = layout;
         let geometry = self
@@ -3220,6 +3483,9 @@ impl ArchitectureAdapter for QwenHybridLayerwiseAdapter {
         stream: &Stream,
     ) -> Result<Vec<WeightBinding>, Error> {
         let global = self.new_layer(group, index, stream)?;
+        if self.execution_group_name(group)? == "vision_encoder" {
+            return self.layer_bindings(group, index, &global, store);
+        }
         let indices = assignment.local_global_expert_ids().to_vec();
         self.layer_bindings(group, index, &global, store)?
             .into_iter()
