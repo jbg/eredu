@@ -60,7 +60,7 @@ use crate::{
         recipe::DerivedWeightRecipe,
     },
     runtime::execution::layerwise::{
-        load_layerwise_model, load_safetensors_layerwise_model,
+        load_layerwise_model, load_layerwise_model_quantized, load_safetensors_layerwise_model,
         load_tensor_parallel_layerwise_model, open_safetensors_weight_store,
         transformed_module_weight_store, ArchitectureAdapter, LayerWeightResidency,
         LayerwiseForwardState, LayerwiseModel, StaticUnitBindings, WeightResidency,
@@ -689,16 +689,6 @@ pub fn load_qwen3_vl_expert_cache_model(
             "sparse expert caching requires a Qwen3-VL-MoE checkpoint".into(),
         ));
     }
-    let mut adapter = Qwen3VlLayerwiseAdapter::new(args.clone(), stream)?;
-    adapter.sparse_expert_cache = true;
-    let mut execution =
-        load_safetensors_layerwise_model(model_dir, adapter, non_expert, stream, weights_stream)?;
-    let store = execution.checkpoint_store_arc();
-    let entries = crate::architectures::qwen::dense::layerwise::qwen3_expert_catalog_at(
-        &args.text_config,
-        store.as_ref(),
-        "model.language_model.layers",
-    )?;
     let quantize_on_load = quantization
         .map(|requested| {
             should_quantize_on_load(
@@ -710,6 +700,35 @@ pub fn load_qwen3_vl_expert_cache_model(
         })
         .transpose()?
         .flatten();
+    let mut source_adapter = Qwen3VlLayerwiseAdapter::new(args.clone(), stream)?;
+    source_adapter.sparse_expert_cache = true;
+    let store = open_safetensors_weight_store(model_dir, non_expert.layers().max_mapped_shards())?;
+    let mut execution = match quantize_on_load {
+        Some(quantization) => {
+            let mut target_args = args.clone();
+            target_args.text_config.quantization = Some(quantization);
+            target_args.text_config.quantization_config = None;
+            target_args.text_config.quantized_weight_configs = None;
+            let mut target_adapter = Qwen3VlLayerwiseAdapter::new(target_args, stream)?;
+            target_adapter.sparse_expert_cache = true;
+            load_layerwise_model_quantized(
+                store,
+                source_adapter,
+                target_adapter,
+                non_expert,
+                quantization,
+                stream,
+                weights_stream,
+            )?
+        }
+        None => load_layerwise_model(store, source_adapter, non_expert, stream, weights_stream)?,
+    };
+    let store = execution.checkpoint_store_arc();
+    let entries = crate::architectures::qwen::dense::layerwise::qwen3_expert_catalog_at(
+        &args.text_config,
+        store.as_ref(),
+        "model.language_model.layers",
+    )?;
     execution.adapter_mut().expert_cache = Some(match quantize_on_load {
         Some(quantization) => ExpertCache::new_quantized_shared(
             store,
@@ -1257,6 +1276,11 @@ impl ArchitectureAdapter for Qwen3VlLayerwiseAdapter {
             .text_config
             .quantization
             .or(self.args.text_config.quantization_config)
+    }
+
+    fn quantizes_static_binding(&self, binding: &WeightBinding) -> bool {
+        let target = binding.logical_target().unwrap_or(binding.checkpoint_key());
+        !target.starts_with("visual.") && !target.contains(".visual.")
     }
 
     fn prompt_cache_model_identity(

@@ -61,7 +61,7 @@ use crate::{
         MemberSharding, ParallelPlanBuilder, ParameterGroupSpec, ParameterRole,
     },
     runtime::execution::layerwise::{
-        load_layerwise_model, load_safetensors_layerwise_model,
+        load_layerwise_model, load_layerwise_model_quantized, load_safetensors_layerwise_model,
         load_tensor_parallel_layerwise_model, open_safetensors_weight_store,
         transformed_module_weight_store, ArchitectureAdapter, LayerWeightResidency,
         LayerwiseForwardState, LayerwiseModel, StaticUnitBindings, WeightResidency,
@@ -752,6 +752,57 @@ pub fn load_safetensors(
     })
 }
 
+pub(crate) fn load_safetensors_quantized_residency(
+    model_dir: impl AsRef<Path>,
+    options: impl Into<LayerWeightResidency>,
+    quantization: WeightQuantization,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<LayerwiseDecoder, Error> {
+    let model_dir = model_dir.as_ref();
+    let options = options.into();
+    let args = resident::load_config(model_dir)?;
+    let store = open_safetensors_weight_store(model_dir, options.max_mapped_shards())?;
+    if !should_quantize_on_load(
+        "dense Qwen residency",
+        args.weight_quantization(),
+        quantization,
+    )? {
+        return Ok(LayerwiseDecoder {
+            execution: load_layerwise_model(
+                store,
+                DenseQwenLayerwiseAdapter::new(args, stream)?,
+                options,
+                stream,
+                weights_stream,
+            )?,
+        });
+    }
+    if args.is_moe() {
+        return Err(Error::Quantization(
+            "Qwen3-MoE load-time quantization requires independent expert residency so routed rank-3 banks can be materialized one expert at a time"
+                .into(),
+        ));
+    }
+    let source_adapter = DenseQwenLayerwiseAdapter::new(args.clone(), stream)?;
+    let mut target_args = args;
+    target_args.quantization = Some(quantization);
+    target_args.quantization_config = None;
+    target_args.quantized_weight_configs = None;
+    let target_adapter = DenseQwenLayerwiseAdapter::new(target_args, stream)?;
+    Ok(LayerwiseDecoder {
+        execution: load_layerwise_model_quantized(
+            store,
+            source_adapter,
+            target_adapter,
+            options,
+            quantization,
+            stream,
+            weights_stream,
+        )?,
+    })
+}
+
 pub(crate) fn execute_transformed_model(
     model: resident::Model,
     stream: &Stream,
@@ -993,11 +1044,6 @@ pub fn load_qwen3_expert_cache_model(
             "sparse expert caching requires a Qwen3 sparse-MoE checkpoint".into(),
         ));
     }
-    let adapter = DenseQwenLayerwiseAdapter::new_external_experts(args.clone(), stream)?;
-    let mut execution =
-        load_safetensors_layerwise_model(model_dir, adapter, non_expert, stream, weights_stream)?;
-    let store = execution.checkpoint_store_arc();
-    let entries = qwen3_expert_catalog(&args, store.as_ref())?;
     let quantize_on_load = quantization
         .map(|requested| {
             should_quantize_on_load(
@@ -1009,6 +1055,30 @@ pub fn load_qwen3_expert_cache_model(
         })
         .transpose()?
         .flatten();
+    let source_adapter = DenseQwenLayerwiseAdapter::new_external_experts(args.clone(), stream)?;
+    let store = open_safetensors_weight_store(model_dir, non_expert.layers().max_mapped_shards())?;
+    let mut execution = match quantize_on_load {
+        Some(quantization) => {
+            let mut target_args = args.clone();
+            target_args.quantization = Some(quantization);
+            target_args.quantization_config = None;
+            target_args.quantized_weight_configs = None;
+            let target_adapter =
+                DenseQwenLayerwiseAdapter::new_external_experts(target_args, stream)?;
+            load_layerwise_model_quantized(
+                store,
+                source_adapter,
+                target_adapter,
+                non_expert,
+                quantization,
+                stream,
+                weights_stream,
+            )?
+        }
+        None => load_layerwise_model(store, source_adapter, non_expert, stream, weights_stream)?,
+    };
+    let store = execution.checkpoint_store_arc();
+    let entries = qwen3_expert_catalog(&args, store.as_ref())?;
     let cache = match quantize_on_load {
         Some(quantization) => ExpertCache::new_quantized_shared(
             store,
@@ -3207,6 +3277,117 @@ mod tests {
             assert_close(&actual, &expected);
         }
         assert!(cached.expert_cache_report().unwrap().is_some());
+    }
+
+    #[test]
+    fn qwen3_load_time_quantization_packs_static_layers_and_cached_experts() {
+        use crate::runtime::checkpoint::quantization::AffineQuantization;
+
+        let gpu = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
+        let cpu = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        let mut model_args = args(true);
+        model_args.hidden_size = 32;
+        model_args.vocab_size = 32;
+        model_args.num_attention_heads = 4;
+        model_args.num_key_value_heads = 4;
+        model_args.head_dim = 8;
+        model_args.moe_intermediate_size = 32;
+        let mut fixture = dense_qwen::Model::new(model_args, gpu.stream()).unwrap();
+        initialize(&mut fixture, gpu.stream());
+        let dir = tempfile::tempdir().unwrap();
+        write_fixture(dir.path(), &fixture, false, gpu.stream());
+
+        let quantization = WeightQuantization::Affine(AffineQuantization::new(32, 4).unwrap());
+        let expert_options =
+            ExpertCacheLoadOptions::new(OffloadConfig::new(None, None, 1).unwrap(), 1 << 20, 1)
+                .unwrap();
+        let dense = crate::runtime::residency::dense_stream::DenseDiskStreamLoadOptions::new(
+            u64::MAX,
+            u64::MAX,
+            1,
+            1,
+            1,
+        )
+        .unwrap();
+        let mut loaded = load_qwen3_expert_cache_model(
+            dir.path(),
+            crate::NonExpertWeightResidency::DenseDiskStream(dense),
+            expert_options,
+            Some(quantization),
+            gpu.stream(),
+            cpu.stream(),
+        )
+        .unwrap();
+
+        let ordinary = loaded.residency_metadata().materialization().unwrap();
+        assert!(ordinary.transformed_weights > 0);
+        assert!(ordinary.output_bytes < ordinary.source_bytes_read);
+        assert!(ordinary.peak_planned_working_set_bytes <= ordinary.output_bytes);
+        let experts = loaded.expert_cache_report().unwrap().unwrap();
+        let expert_materialization = experts.materialization.unwrap();
+        assert!(expert_materialization.transformed_weights > 0);
+        assert!(expert_materialization.output_bytes < expert_materialization.source_bytes_read);
+        assert!(loaded
+            .dense_stream_report()
+            .unwrap()
+            .unwrap()
+            .residency()
+            .units()
+            .iter()
+            .filter(|unit| unit.id().as_str().starts_with("dense_qwen.layer."))
+            .all(|unit| unit.planned_tier() == MemoryTier::Disk));
+
+        let tokens = Array::from_slice(&[1u32, 2], &[1, 2]);
+        let mut cache = loaded.new_cache();
+        let logits = loaded
+            .forward(&tokens, None, &mut cache, gpu.stream())
+            .unwrap();
+        safemlx::transforms::eval([&logits]).unwrap();
+        gpu.stream().synchronize().unwrap();
+        assert_eq!(logits.shape(), &[1, 2, 32]);
+    }
+
+    #[test]
+    fn qwen3_dense_disk_load_time_quantization_accounts_only_packed_bytes() {
+        use crate::runtime::checkpoint::quantization::AffineQuantization;
+
+        let gpu = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
+        let cpu = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        let mut model_args = args(false);
+        model_args.hidden_size = 32;
+        model_args.vocab_size = 32;
+        model_args.num_attention_heads = 4;
+        model_args.num_key_value_heads = 4;
+        model_args.head_dim = 8;
+        model_args.intermediate_size = 32;
+        let mut fixture = dense_qwen::Model::new(model_args, gpu.stream()).unwrap();
+        initialize(&mut fixture, gpu.stream());
+        let dir = tempfile::tempdir().unwrap();
+        write_fixture(dir.path(), &fixture, false, gpu.stream());
+        let dense = crate::runtime::residency::dense_stream::DenseDiskStreamLoadOptions::new(
+            u64::MAX,
+            u64::MAX,
+            1,
+            1,
+            1,
+        )
+        .unwrap();
+        let loaded = load_safetensors_quantized_residency(
+            dir.path(),
+            dense,
+            WeightQuantization::Affine(AffineQuantization::new(32, 4).unwrap()),
+            gpu.stream(),
+            cpu.stream(),
+        )
+        .unwrap();
+        let materialization = loaded.residency_metadata().materialization().unwrap();
+        assert!(materialization.output_bytes < materialization.source_bytes_read);
+        let report = loaded.dense_stream_report().unwrap().unwrap();
+        assert_eq!(
+            report.planned_layer_bytes(),
+            loaded.residency_metadata().layer_parameter_bytes()
+        );
+        assert!(report.planned_layer_bytes() < materialization.source_bytes_read);
     }
 
     fn sparse_expert_cache_parity(split_experts: bool) {

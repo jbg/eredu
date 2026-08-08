@@ -796,8 +796,11 @@ Important boundaries:
 - GGUF remains fully resident by default. `LayerwiseHost`, `DenseDiskStream`,
   and supported sparse-expert policies use header-only logical catalogs and
   bounded payload materialization.
-- Load-time quantization is incompatible with streamed or sparse-cache loading;
-  use a checkpoint-native packed format for those policies.
+- Dense Qwen SafeTensors support out-of-core load-time affine/MXFP4 conversion
+  with fully resident, layerwise-host, or dense-streamed weights. Supported MoE
+  families use the same ordinary-layer overlay together with an independent
+  packed expert overlay. Nonresident GGUF and pipeline-layer conversion still
+  require checkpoint-native packing.
 - Transfers and route inspection are synchronous because the pinned MLX C API
   does not expose the events or fences required for safe cross-stream overlap.
 - On Apple silicon, reported host and device residency are logical tiers over

@@ -442,8 +442,10 @@ fn load_model_for_kind(
                 )?,
             )),
             ModelKind::Qwen2 | ModelKind::Qwen3 => Ok(Model::DenseQwen(
-                crate::architectures::qwen::dense::layerwise::execute_transformed_model(
-                    dense_qwen::load_safetensors_quantized(model_dir, quantization, stream, weights_stream)?,
+                crate::architectures::qwen::dense::layerwise::load_safetensors_quantized_residency(
+                    model_dir,
+                    execution,
+                    quantization,
                     stream,
                     weights_stream,
                 )?,

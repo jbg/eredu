@@ -301,7 +301,13 @@ metadata parsing: each ordered `AttentionPolicy` is either `Full` or
 `Sliding { window: NonZeroU32 }`. The schedule accepts arbitrary ordering and
 internally supports different windows per layer. Standard KV caches remain
 device resident. Matching checkpoint-native affine and MXFP4 parameter trees
-load directly; load-time conversion in the layerwise path is rejected.
+load directly. Dense Qwen SafeTensors can also be converted into a disk-backed
+packed overlay before residency initialization. Fully resident,
+layerwise-host, and dense disk-streamed execution therefore retain only packed
+static and layer parameters, and all reported host/device budgets use packed
+byte counts. Qwen3-MoE applies the same conversion to non-expert and shared
+projections when routed experts use independent residency; routed projections
+are converted one expert at a time by the expert overlay.
 
 Hugging Face Qwen2 normalization follows the upstream threshold semantics:
 `use_sliding_window=false` produces an all-full schedule; when it is `true`,
@@ -1089,18 +1095,23 @@ The remaining global limitations are:
 
 - The shared bounded materialisation store supports out-of-core affine and
   MXFP4 conversion from row-bounded SafeTensors or dense GGUF semantic recipes.
-  Independent expert caches, TP+EP, and TP+PP+EP now transform the authoritative
+  Static modules, ordinary layers, shared experts, independent expert caches,
+  TP+EP, and TP+PP+EP now transform the authoritative
   rank-local expert catalog rather than rebuilding topology arithmetic: EP
   ownership, TP projection ranges, and the conversion row tile compose into
   one bounded source span. The conversion budget is capped by the final packed
-  local expert catalog, residency accounts only packed bindings, and
-  `ExpertCacheReport::materialization` exposes selected source bytes, output
+  local semantic recipes. Ordinary residency plans are constructed only after
+  the packed overlay exists, so pinned static bytes, layerwise-host budgets,
+  dense-stream host/device windows, and expert-cache budgets all count packed
+  bindings. `LayerwiseModelMetadata::materialization` and
+  `ExpertCacheReport::materialization` expose selected source bytes, output
   bytes, tile counts, and the peak admitted working set.
 - A reshaped contiguous scalar span is currently a SafeTensors storage
   selection. GGUF load-time conversion remains available when its semantic
   recipe reduces to the reader's native row/range selection, but a fused GGUF
   bank requiring that reshaped span fails bounded preflight. Non-resident
-  ordinary pipeline layers still require checkpoint-native quantization; this
+  ordinary pipeline layers and nonresident GGUF models still require
+  checkpoint-native quantization; this
   restriction no longer applies merely because routed experts use an
   independent cache. Inkling and Nemotron-H load-time expert conversion remains
   unavailable until their grouped rank-3 kernels accept affine packed banks.

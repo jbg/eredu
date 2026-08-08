@@ -22,6 +22,12 @@ use crate::{
     runtime::checkpoint::binding::{
         binding_bytes, build_module_bindings, populate_module_from_lease, ModuleBindingError,
     },
+    runtime::checkpoint::bounded_quantization::{
+        BoundedQuantizationPlan, BoundedQuantizationReport, BoundedQuantizationTarget,
+        BoundedQuantizedWeightStore,
+    },
+    runtime::checkpoint::quantization::WeightQuantization,
+    runtime::checkpoint::recipe::RecipeDtype,
     runtime::checkpoint::store::{MemoryWeightStore, SafetensorsWeightStore, WeightStore},
     runtime::execution::inspection::{ActivationObserver, ActivationObserverProxy},
     runtime::residency::dense_stream::{
@@ -1278,6 +1284,7 @@ pub struct LayerwiseModelMetadata {
     layer_parameter_bytes: u64,
     maximum_device_layer_bytes: u64,
     device_layer_capacity: usize,
+    materialization: Option<BoundedQuantizationReport>,
 }
 
 /// Architecture-neutral information for a rank-local parallel model.
@@ -1363,6 +1370,12 @@ impl LayerwiseModelMetadata {
     /// Returns the maximum number of decoder layers retained on device.
     pub const fn device_layer_capacity(&self) -> usize {
         self.device_layer_capacity
+    }
+
+    /// Returns bounded load-time materialization telemetry when dense semantic
+    /// weights were converted into a packed disk overlay.
+    pub const fn materialization(&self) -> Option<&BoundedQuantizationReport> {
+        self.materialization.as_ref()
     }
 }
 
@@ -1622,6 +1635,16 @@ pub trait ArchitectureAdapter: Sized {
     /// Model-wide checkpoint quantization, when one uniform encoding exists.
     fn quantization(&self) -> Option<crate::runtime::checkpoint::quantization::WeightQuantization> {
         None
+    }
+
+    /// Returns whether a floating static matrix is represented by a packed
+    /// parameter group in this adapter. Multimodal adapters override this for
+    /// checkpoint components whose target modules intentionally stay dense.
+    fn quantizes_static_binding(
+        &self,
+        _binding: &crate::runtime::residency::manager::WeightBinding,
+    ) -> bool {
+        true
     }
 
     /// Returns the exact cache compatibility identity for replicated or
@@ -2279,6 +2302,7 @@ impl<A: ArchitectureAdapter> LayerwiseModel<A> {
             layer_parameter_bytes: 0,
             maximum_device_layer_bytes: 0,
             device_layer_capacity: 0,
+            materialization: None,
         };
         Ok(Self {
             adapter,
@@ -2528,7 +2552,10 @@ impl<A: ArchitectureAdapter> LayerwiseModel<A> {
 
     /// Returns a current residency and transfer report.
     pub fn residency_report(&self) -> Result<ResidencyReport, Error> {
-        Ok(self.residency.report()?)
+        Ok(self
+            .residency
+            .report()?
+            .with_materialization(self.metadata.materialization.clone()))
     }
 
     /// Returns dense-stream observations when that experimental policy is active.
@@ -3159,6 +3186,187 @@ where
     load_layerwise_model(store, adapter, options, stream, weights_stream)
 }
 
+/// Builds a packed, disk-backed overlay for every quantizable static and
+/// execution-unit binding declared by `source_adapter`, then loads the
+/// quantized target adapter through the ordinary residency engine.
+///
+/// The source adapter is used only for semantic checkpoint recipes. No dense
+/// module is populated. The target adapter is therefore free to expose packed
+/// parameter trees, while every residency budget is computed from the packed
+/// store metadata seen by [`load_layerwise_model`].
+pub(crate) fn load_layerwise_model_quantized<A, O>(
+    store: SharedWeightStore,
+    source_adapter: A,
+    target_adapter: A,
+    options: O,
+    quantization: WeightQuantization,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<LayerwiseModel<A>, Error>
+where
+    A: ArchitectureAdapter,
+    O: Into<LayerWeightResidency>,
+{
+    let mut recipes = BTreeMap::new();
+    let mut collect = |bindings: &[crate::runtime::residency::manager::WeightBinding],
+                       selected_local_weights: Option<&BTreeSet<String>>| {
+        for binding in bindings {
+            let recipe = binding.source_recipe();
+            let metadata = recipe.infer(store.as_ref())?;
+            if !matches!(
+                metadata.dtype(),
+                RecipeDtype::F16 | RecipeDtype::BF16 | RecipeDtype::F32
+            ) || metadata.shape().len() != 2
+            {
+                continue;
+            }
+            let target = binding.logical_target().unwrap_or(binding.checkpoint_key());
+            if !target.ends_with(".weight") {
+                continue;
+            }
+            let canonical_local =
+                crate::runtime::checkpoint::binding::canonical_checkpoint_name(binding.name());
+            if selected_local_weights.is_some_and(|selected| !selected.contains(&canonical_local)) {
+                continue;
+            }
+            match recipes.entry(target.to_string()) {
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    entry.insert(recipe);
+                }
+                std::collections::btree_map::Entry::Occupied(entry) if entry.get() != &recipe => {
+                    return Err(Error::Quantization(format!(
+                        "load-time quantization target {target:?} has conflicting semantic recipes"
+                    )));
+                }
+                std::collections::btree_map::Entry::Occupied(_) => {}
+            }
+        }
+        Ok::<(), Error>(())
+    };
+    for unit in source_adapter.static_units(store.as_ref())? {
+        let selected = unit
+            .bindings()
+            .iter()
+            .filter(|binding| target_adapter.quantizes_static_binding(binding))
+            .map(|binding| {
+                crate::runtime::checkpoint::binding::canonical_checkpoint_name(binding.name())
+            })
+            .collect::<BTreeSet<_>>();
+        collect(unit.bindings(), Some(&selected))?;
+    }
+    let graph = source_adapter.execution_graph()?;
+    for group in 0..graph.groups().len() {
+        for index in 0..source_adapter.layer_count(group)? {
+            let layer = source_adapter.new_layer(group, index, stream)?;
+            let target_layer = target_adapter.new_layer(group, index, stream)?;
+            let selected = target_layer
+                .parameters()
+                .flatten()
+                .keys()
+                .filter(|name| name.contains(".inner.weight") || name.as_ref() == "inner.weight")
+                .map(|name| crate::runtime::checkpoint::binding::canonical_checkpoint_name(name))
+                .collect::<BTreeSet<_>>();
+            collect(
+                &source_adapter.layer_bindings(group, index, &layer, store.as_ref())?,
+                Some(&selected),
+            )?;
+        }
+    }
+    if recipes.is_empty() {
+        return Err(Error::Quantization(format!(
+            "architecture adapter {} declared no floating matrix bindings for load-time quantization",
+            source_adapter.model_type()
+        )));
+    }
+    let targets = recipes
+        .into_iter()
+        .map(|(target, recipe)| BoundedQuantizationTarget::from_recipe(target, recipe))
+        .collect::<Result<Vec<_>, _>>()?;
+    let working_set_bytes =
+        bounded_quantization_working_set(store.as_ref(), &targets, quantization)?;
+    let transformed = Arc::new(BoundedQuantizedWeightStore::create(
+        Arc::clone(&store),
+        BoundedQuantizationPlan::new(quantization, working_set_bytes, targets)?,
+        weights_stream,
+    )?);
+    let report = transformed.report().clone();
+    let transformed: SharedWeightStore = transformed;
+    let mut model =
+        load_layerwise_model(transformed, target_adapter, options, stream, weights_stream)?;
+    model.metadata.materialization = Some(report);
+    Ok(model)
+}
+
+fn bounded_quantization_working_set(
+    store: &dyn WeightStore,
+    targets: &[BoundedQuantizationTarget],
+    quantization: WeightQuantization,
+) -> Result<u64, Error> {
+    use crate::runtime::checkpoint::store::TensorSelection;
+
+    let mut output_bytes = 0u64;
+    let mut minimum_tile_bytes = 0u64;
+    for target in targets {
+        let metadata = target.source().infer(store)?;
+        let shape = metadata.shape();
+        let rows = shape[0] as u64;
+        let columns = shape[1];
+        let group_size = usize::try_from(quantization.group_size())
+            .map_err(|_| Error::Quantization("quantization group size is invalid".into()))?;
+        if columns % group_size != 0 || columns % 32 != 0 {
+            return Err(Error::Quantization(format!(
+                "load-time quantization target {:?} input dimension {columns} must be divisible by group_size {group_size} and 32",
+                target.weight_name()
+            )));
+        }
+        let groups = (columns / group_size) as u64;
+        let packed_row = (columns as u64)
+            .checked_mul(quantization.bits() as u64)
+            .and_then(|bits| bits.checked_div(8))
+            .ok_or_else(|| Error::Quantization("packed row size overflowed".into()))?;
+        let companion_row = if matches!(quantization, WeightQuantization::MxFp4) {
+            groups
+        } else {
+            groups
+                .checked_mul(4)
+                .ok_or_else(|| Error::Quantization("packed scale row size overflowed".into()))?
+        };
+        let bias_row = if quantization.has_biases() {
+            groups
+                .checked_mul(4)
+                .ok_or_else(|| Error::Quantization("packed bias row size overflowed".into()))?
+        } else {
+            0
+        };
+        let output_row = packed_row
+            .checked_add(companion_row)
+            .and_then(|bytes| bytes.checked_add(bias_row))
+            .ok_or_else(|| Error::Quantization("packed output row size overflowed".into()))?;
+        output_bytes = output_bytes
+            .checked_add(
+                rows.checked_mul(output_row)
+                    .ok_or_else(|| Error::Quantization("packed target size overflowed".into()))?,
+            )
+            .ok_or_else(|| Error::Quantization("packed model size overflowed".into()))?;
+        let one_row = target.source().select_bounded(
+            store,
+            TensorSelection::Range {
+                axis: 0,
+                start: 0,
+                end: 1,
+            },
+        )?;
+        one_row.preflight_bounded(store)?;
+        minimum_tile_bytes = minimum_tile_bytes.max(
+            one_row
+                .peak_materialization_bytes(store)?
+                .checked_add(output_row)
+                .ok_or_else(|| Error::Quantization("conversion tile size overflowed".into()))?,
+        );
+    }
+    Ok(output_bytes.max(minimum_tile_bytes))
+}
+
 /// Builds a generalized layerwise model from an already cataloged checkpoint.
 pub fn load_layerwise_model<A, O>(
     store: SharedWeightStore,
@@ -3343,6 +3551,7 @@ where
         } else {
             maximum_group_depth
         },
+        materialization: None,
     };
     if let Some(dense) = dense {
         let execution_groups = model
@@ -3579,6 +3788,7 @@ where
         } else {
             maximum_group_depth
         },
+        materialization: None,
     };
     let local_parameter_bytes = static_device_bytes
         .checked_add(layer_parameter_bytes)

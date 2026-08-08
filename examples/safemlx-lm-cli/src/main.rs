@@ -1364,6 +1364,16 @@ fn main() -> Result<()> {
                 }
             }
             eprintln!("weight_store: {:?}", report.weight_store());
+            if let Some(materialization) = report.materialization() {
+                eprintln!(
+                    "ordinary_weight_quantization: {} weights, {} tiles, {} source bytes -> {} packed bytes, {} peak working-set bytes",
+                    materialization.transformed_weights,
+                    materialization.source_tiles,
+                    materialization.source_bytes_read,
+                    materialization.output_bytes,
+                    materialization.peak_planned_working_set_bytes
+                );
+            }
         }
         if let Some(report) = model.expert_cache_report()? {
             eprintln!(

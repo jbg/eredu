@@ -393,7 +393,9 @@ pub(crate) fn validate_load_policy(
 
     if options.quantization.is_some()
         && !options.weight_residency.is_fully_resident()
-        && (artifact == ArtifactLoadKind::Gguf || options.weight_residency.expert_cache().is_none())
+        && (artifact == ArtifactLoadKind::Gguf
+            || (options.weight_residency.expert_cache().is_none()
+                && !matches!(kind, ModelKind::Qwen2 | ModelKind::Qwen3)))
     {
         return Err(Error::Quantization(match artifact {
             ArtifactLoadKind::Safetensors => format!(

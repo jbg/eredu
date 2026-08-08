@@ -46,7 +46,7 @@ use crate::{
             ParallelPlanBuilder, ParameterGroupSpec, ParameterRole, ProjectionSharding,
         },
         execution::layerwise::{
-            load_layerwise_model, load_safetensors_layerwise_model,
+            load_layerwise_model, load_layerwise_model_quantized, load_safetensors_layerwise_model,
             load_tensor_parallel_layerwise_model, open_safetensors_weight_store,
             transformed_module_weight_store, ArchitectureAdapter, LayerWeightResidency,
             LayerwiseForwardState, LayerwiseModel, StaticUnitBindings, WeightResidency,
@@ -825,11 +825,6 @@ pub fn load_kimi_linear_expert_cache_model(
     )?;
     let args = resident::get_model_args(model_dir)?;
     args.validate()?;
-    let adapter = KimiLinearLayerwiseAdapter::new_sparse(args.clone(), stream)?;
-    let mut execution =
-        load_safetensors_layerwise_model(model_dir, adapter, non_expert, stream, weights_stream)?;
-    let store = execution.checkpoint_store_arc();
-    let entries = kimi_expert_catalog(&args, store.as_ref())?;
     let quantize_on_load = quantization
         .map(|requested| {
             should_quantize_on_load(
@@ -841,6 +836,27 @@ pub fn load_kimi_linear_expert_cache_model(
         })
         .transpose()?
         .flatten();
+    let source_adapter = KimiLinearLayerwiseAdapter::new_sparse(args.clone(), stream)?;
+    let store = open_safetensors_weight_store(model_dir, non_expert.layers().max_mapped_shards())?;
+    let mut execution = match quantize_on_load {
+        Some(quantization) => {
+            let mut target_args = args.clone();
+            target_args.quantization = Some(quantization);
+            target_args.quantized_weight_configs = None;
+            load_layerwise_model_quantized(
+                store,
+                source_adapter,
+                KimiLinearLayerwiseAdapter::new_sparse(target_args, stream)?,
+                non_expert,
+                quantization,
+                stream,
+                weights_stream,
+            )?
+        }
+        None => load_layerwise_model(store, source_adapter, non_expert, stream, weights_stream)?,
+    };
+    let store = execution.checkpoint_store_arc();
+    let entries = kimi_expert_catalog(&args, store.as_ref())?;
     execution.adapter_mut().expert_cache = Some(match quantize_on_load {
         Some(quantization) => ExpertCache::new_quantized_shared(
             store,

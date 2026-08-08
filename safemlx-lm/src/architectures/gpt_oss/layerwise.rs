@@ -47,7 +47,7 @@ use crate::{
         ParameterRole, ProjectionSharding,
     },
     runtime::execution::layerwise::{
-        load_layerwise_model, load_safetensors_layerwise_model,
+        load_layerwise_model, load_layerwise_model_quantized, load_safetensors_layerwise_model,
         load_tensor_parallel_layerwise_model, open_safetensors_weight_store,
         transformed_module_weight_store, ArchitectureAdapter, LayerWeightResidency,
         LayerwiseForwardState, LayerwiseModel, StaticUnitBindings, WeightResidency,
@@ -583,12 +583,6 @@ pub fn load_gpt_oss_expert_cache_model(
             .with_weight_residency(WeightResidency::with_expert_cache(non_expert, options)),
     )?;
     let args = resident::get_model_args(model_dir)?;
-    let mut adapter = GptOssLayerwiseAdapter::new(args.clone(), stream)?;
-    adapter.sparse_expert_cache = true;
-    let mut execution =
-        load_safetensors_layerwise_model(model_dir, adapter, non_expert, stream, weights_stream)?;
-    let store = execution.checkpoint_store_arc();
-    let entries = gpt_oss_expert_catalog(&args, store.as_ref())?;
     let quantize_on_load = quantization
         .map(|requested| {
             should_quantize_on_load(
@@ -600,6 +594,30 @@ pub fn load_gpt_oss_expert_cache_model(
         })
         .transpose()?
         .flatten();
+    let mut source_adapter = GptOssLayerwiseAdapter::new(args.clone(), stream)?;
+    source_adapter.sparse_expert_cache = true;
+    let store = open_safetensors_weight_store(model_dir, non_expert.layers().max_mapped_shards())?;
+    let mut execution = match quantize_on_load {
+        Some(quantization) => {
+            let mut target_args = args.clone();
+            target_args.quantization = Some(quantization);
+            target_args.quantized_weight_configs = None;
+            let mut target_adapter = GptOssLayerwiseAdapter::new(target_args, stream)?;
+            target_adapter.sparse_expert_cache = true;
+            load_layerwise_model_quantized(
+                store,
+                source_adapter,
+                target_adapter,
+                non_expert,
+                quantization,
+                stream,
+                weights_stream,
+            )?
+        }
+        None => load_layerwise_model(store, source_adapter, non_expert, stream, weights_stream)?,
+    };
+    let store = execution.checkpoint_store_arc();
+    let entries = gpt_oss_expert_catalog(&args, store.as_ref())?;
     execution.adapter_mut().expert_cache = Some(match quantize_on_load {
         Some(quantization) => ExpertCache::new_quantized_shared(
             store,

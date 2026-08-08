@@ -238,8 +238,10 @@ cargo run --release -p safemlx-lm-cli -- \
 `--verbose` also prints logical current/peak host and device parameter bytes,
 synchronous transfer counts, and backend-tagged shard/reader diagnostics. Apple
 CPU and GPU tiers share unified physical memory, so these logical tiers do not
-increase total capacity. Load-time quantization and KV cache offload are not
-supported by this path; checkpoint-native GGUF quantization is.
+increase total capacity. Dense Qwen SafeTensors can combine load-time
+quantization with bounded ordinary-layer residency; nonresident GGUF and KV
+cache offload are not supported by this path, while checkpoint-native GGUF
+quantization is.
 
 Stream dense layers from either backend with finite tier controls:
 
@@ -295,8 +297,10 @@ locality can substantially change later runs.
 Route inspection and transfers are synchronous. Unified memory does not create
 additional physical capacity, and useful disk-backed performance depends on
 expert-routing locality. Mapped-shard and logical-transfer counters do not
-measure exact physical disk I/O. Checkpoint-native packed formats are preserved;
-load-time conversion and unsupported model families fail explicitly.
+measure exact physical disk I/O. Checkpoint-native packed formats are preserved.
+Supported dense Qwen SafeTensors and independently cached MoE routes use
+bounded load-time conversion; unsupported artifact/family combinations fail
+explicitly.
 
 When the positional prompt is omitted, the binary reads it from stdin. Generated
 text is decoded and flushed to stdout incrementally, including when MTP is in

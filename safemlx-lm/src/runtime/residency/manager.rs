@@ -628,6 +628,8 @@ pub struct ResidencyReport {
     units: Vec<UnitResidencyReport>,
     active_window: Vec<OffloadUnitId>,
     weight_store: WeightStoreDiagnostics,
+    materialization:
+        Option<crate::runtime::checkpoint::bounded_quantization::BoundedQuantizationReport>,
 }
 
 impl ResidencyReport {
@@ -650,6 +652,22 @@ impl ResidencyReport {
     /// Returns storage diagnostics, distinct from logical residency telemetry.
     pub const fn weight_store(&self) -> &WeightStoreDiagnostics {
         &self.weight_store
+    }
+    /// Returns bounded load-time materialization telemetry for these units.
+    pub const fn materialization(
+        &self,
+    ) -> Option<&crate::runtime::checkpoint::bounded_quantization::BoundedQuantizationReport> {
+        self.materialization.as_ref()
+    }
+
+    pub(crate) fn with_materialization(
+        mut self,
+        materialization: Option<
+            crate::runtime::checkpoint::bounded_quantization::BoundedQuantizationReport,
+        >,
+    ) -> Self {
+        self.materialization = materialization;
+        self
     }
 }
 
@@ -1347,6 +1365,7 @@ impl ResidencyManager {
             units,
             active_window,
             weight_store: self.inner.store.diagnostics()?,
+            materialization: None,
         })
     }
 
