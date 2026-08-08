@@ -1304,8 +1304,17 @@ pub(crate) fn execute_acquired_gemma_experts(
     let intermediate = args
         .moe_intermediate_size
         .ok_or_else(|| Exception::custom("Gemma 4 MoE config has no expert width"))?;
+    let mut packed_args = args.clone();
+    if let Some(quantization) = cache.weight_quantization() {
+        packed_args.quantized = true;
+        packed_args.weight_quantization = Some(quantization);
+        packed_args.quantization_group_size = quantization.group_size();
+        packed_args.quantization_bits = quantization.bits();
+        packed_args.quantized_weights = None;
+        packed_args.quantized_weight_configs = None;
+    }
     let mut bank = resident::GemmaExperts::new(
-        args,
+        &packed_args,
         layer,
         acquired.identities().len() as i32,
         intermediate,

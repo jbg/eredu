@@ -334,26 +334,20 @@ fn load_model_for_kind(
         options.weight_residency.expert_cache(),
         options.weight_residency.non_experts(),
     ) {
-        if options.quantization.is_some() {
-            return Err(Error::Quantization(format!(
-                "load-time quantization is unsupported for {} independent expert caching; use a matching checkpoint-native packed format",
-                kind.model_type_name()
-            )));
-        }
         return match kind {
             ModelKind::KimiLinear => Ok(Model::KimiLinear(
                 crate::architectures::kimi_linear::layerwise::load_kimi_linear_expert_cache_model(
-                    model_dir, non_expert, expert_cache, stream, weights_stream,
+                    model_dir, non_expert, expert_cache, options.quantization, stream, weights_stream,
                 )?,
             )),
             ModelKind::DeepSeekV3 => Ok(Model::DeepSeekV3(
                 crate::architectures::deepseek_v3::layerwise::load_deepseek_v3_expert_cache_model(
-                    model_dir, non_expert, expert_cache, stream, weights_stream,
+                    model_dir, non_expert, expert_cache, options.quantization, stream, weights_stream,
                 )?,
             )),
             ModelKind::GptOss => Ok(Model::GptOss(
                 crate::architectures::gpt_oss::layerwise::load_gpt_oss_expert_cache_model(
-                    model_dir, non_expert, expert_cache, stream, weights_stream,
+                    model_dir, non_expert, expert_cache, options.quantization, stream, weights_stream,
                 )?,
             )),
             ModelKind::Inkling => Ok(Model::Inkling(
@@ -363,7 +357,7 @@ fn load_model_for_kind(
             )),
             ModelKind::Lfm2 => Ok(Model::Lfm2(
                 crate::architectures::lfm2::layerwise::load_lfm2_expert_cache_model(
-                    model_dir, non_expert, expert_cache, stream, weights_stream,
+                    model_dir, non_expert, expert_cache, options.quantization, stream, weights_stream,
                 )?,
             )),
             ModelKind::NemotronH => Ok(Model::NemotronH(
@@ -376,22 +370,22 @@ fn load_model_for_kind(
             )),
             ModelKind::Qwen3 => Ok(Model::DenseQwen(
                 crate::architectures::qwen::dense::layerwise::load_qwen3_expert_cache_model(
-                    model_dir, non_expert, expert_cache, stream, weights_stream,
+                    model_dir, non_expert, expert_cache, options.quantization, stream, weights_stream,
                 )?,
             )),
             ModelKind::Qwen3Next => Ok(Model::Qwen3Next(
                 crate::architectures::qwen::hybrid::layerwise::load_qwen3_next_expert_cache_model(
-                    model_dir, non_expert, expert_cache, stream, weights_stream,
+                    model_dir, non_expert, expert_cache, options.quantization, stream, weights_stream,
                 )?,
             )),
             ModelKind::Qwen3VlMoe => Ok(Model::Qwen3VlMoe(
                 crate::architectures::qwen::vl::layerwise::load_qwen3_vl_expert_cache_model(
-                    model_dir, non_expert, expert_cache, stream, weights_stream,
+                    model_dir, non_expert, expert_cache, options.quantization, stream, weights_stream,
                 )?,
             )),
             ModelKind::Qwen35 => Ok(Model::Qwen35(
                 crate::architectures::qwen::hybrid::layerwise::load_qwen35_expert_cache_model(
-                    model_dir, non_expert, expert_cache, stream, weights_stream,
+                    model_dir, non_expert, expert_cache, options.quantization, stream, weights_stream,
                 )?,
             )),
             _ => Err(Error::UnsupportedArchitecture(format!(

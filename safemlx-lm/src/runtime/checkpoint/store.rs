@@ -135,6 +135,19 @@ pub enum TensorSelection {
         /// Non-empty ordered source indices.
         indices: Vec<usize>,
     },
+    /// Select one physically contiguous row-major scalar span and expose it
+    /// with an explicit logical shape.
+    ///
+    /// Semantic recipe pushdown constructs this form when independent axis
+    /// ranges (for example one expert and a subset of its rows) collapse to a
+    /// single storage interval. Callers do not need to calculate checkpoint
+    /// byte offsets.
+    Contiguous {
+        /// Scalar offset from the start of the logical tensor.
+        offset_elements: usize,
+        /// Non-empty output geometry for the selected scalar span.
+        shape: Vec<usize>,
+    },
 }
 
 /// Whether a selected tensor may be obtained by decoding its complete source.
@@ -897,10 +910,17 @@ fn plan_bounded_gguf_selection(
             selection_is_materialized: true,
         });
     }
+    if matches!(selection, TensorSelection::Contiguous { .. }) {
+        return Err(WeightStoreError::BoundedSelectionUnavailable {
+            key: key.to_string(),
+            message: "GGUF readers cannot yet express a reshaped contiguous scalar span".into(),
+        });
+    }
     let rank = entry.metadata.shape.len();
     let logical_axis = match selection {
         TensorSelection::Full => unreachable!("full selections returned above"),
         TensorSelection::Range { axis, .. } | TensorSelection::Indices { axis, .. } => *axis,
+        TensorSelection::Contiguous { .. } => unreachable!("rejected above"),
     };
     let physical_selection = if logical_axis + 1 != rank {
         match selection {
@@ -914,6 +934,7 @@ fn plan_bounded_gguf_selection(
                 axis: *axis,
                 indices: indices.clone(),
             },
+            TensorSelection::Contiguous { .. } => unreachable!("rejected above"),
         }
     } else {
         map_gguf_innermost_selection(key, entry, selection)?
@@ -1029,6 +1050,9 @@ fn map_gguf_innermost_selection(
             })
         }
         TensorSelection::Full => unreachable!("full selections are not mapped"),
+        TensorSelection::Contiguous { .. } => {
+            unreachable!("contiguous selections are rejected before innermost mapping")
+        }
     }
 }
 
@@ -1688,6 +1712,17 @@ impl WeightLease {
                 source_stream,
                 execution_stream,
             )?,
+            TensorSelection::Contiguous {
+                offset_elements,
+                shape,
+            } => materialize_contiguous(
+                &self.key,
+                &source_value,
+                *offset_elements,
+                shape,
+                source_stream,
+                execution_stream,
+            )?,
         };
         Ok(PendingWeightMaterialization {
             output: materialized,
@@ -1774,11 +1809,18 @@ impl WeightLease {
                 })?;
                 (self.output_shape.clone(), selected)
             }
+            TensorSelection::Contiguous {
+                offset_elements,
+                shape,
+            } => (
+                shape.clone(),
+                contiguous_safetensors_data(&self.key, &shard.path, &info.shape, data, *offset_elements, shape)?,
+            ),
             selection => {
                 return Err(WeightStoreError::BoundedSelectionUnavailable {
                     key: self.key.clone(),
                     message: format!(
-                        "zero-copy conversion requires a full tensor or contiguous axis-zero range, got {selection:?}"
+                        "zero-copy conversion requires a full tensor, contiguous axis-zero range, or contiguous scalar span, got {selection:?}"
                     ),
                 })
             }
@@ -1789,13 +1831,20 @@ impl WeightLease {
                 message: format!("tensor {:?}: {error}", self.key),
             }
         })?;
-        let source_value =
-            unsafe { Array::try_from_borrowed_safetensors(view) }.map_err(|source| {
-                WeightStoreError::MlxConversion {
-                    key: self.key.clone(),
-                    source,
-                }
-            })?;
+        let aligned = (selected_data.as_ptr() as usize)
+            .is_multiple_of(safetensors_dtype_alignment(info.dtype));
+        let source_value = if aligned {
+            unsafe { Array::try_from_borrowed_safetensors(view) }
+        } else {
+            // SafeTensors permits tensor payloads whose offset is not aligned
+            // for their scalar dtype. Keep conversion bounded to this selected
+            // tile by using MLX's copying constructor in that case.
+            Array::try_from(view)
+        }
+        .map_err(|source| WeightStoreError::MlxConversion {
+            key: self.key.clone(),
+            source,
+        })?;
         Ok(PendingWeightMaterialization {
             output: source_value.clone(),
             _source: source_value,
@@ -1803,7 +1852,7 @@ impl WeightLease {
             lease: Some(self),
             source_stream: source_stream.clone(),
             execution_stream: source_stream.clone(),
-            borrowed_source: true,
+            borrowed_source: aligned,
             completed: false,
         })
     }
@@ -1847,6 +1896,46 @@ impl WeightLease {
                     path: shard.path.clone(),
                     message: format!("tensor {:?} payload is outside the mapped shard", self.key),
                 })?;
+
+        if let TensorSelection::Contiguous {
+            offset_elements,
+            shape,
+        } = &self.selection
+        {
+            let selected_data = contiguous_safetensors_data(
+                &self.key,
+                &shard.path,
+                &info.shape,
+                data,
+                *offset_elements,
+                shape,
+            )?;
+            let view =
+                TensorView::new(info.dtype, shape.clone(), selected_data).map_err(|error| {
+                    WeightStoreError::MalformedSafetensors {
+                        path: shard.path.clone(),
+                        message: format!("tensor {:?}: {error}", self.key),
+                    }
+                })?;
+            let source_value =
+                Array::try_from(view).map_err(|source| WeightStoreError::MlxConversion {
+                    key: self.key.clone(),
+                    source,
+                })?;
+            let materialized = source_value
+                .copy(execution_stream)
+                .map_err(|source| self.mlx_error("copy", source))?;
+            return Ok(PendingWeightMaterialization {
+                output: materialized,
+                _source: source_value,
+                _gguf_group: None,
+                lease: Some(self),
+                source_stream: source_stream.clone(),
+                execution_stream: execution_stream.clone(),
+                borrowed_source: false,
+                completed: false,
+            });
+        }
 
         // Axis-zero ranges are contiguous in safetensors storage. Slice the
         // mmap bytes before constructing an MLX array: `Array::try_from` copies
@@ -1948,6 +2037,17 @@ impl WeightLease {
                 &source_value,
                 *axis,
                 indices,
+                source_stream,
+                execution_stream,
+            ),
+            TensorSelection::Contiguous {
+                offset_elements,
+                shape,
+            } => materialize_contiguous(
+                &self.key,
+                &source_value,
+                *offset_elements,
+                shape,
                 source_stream,
                 execution_stream,
             ),
@@ -2058,6 +2158,17 @@ impl WeightLease {
                     execution_stream,
                 )?,
                 TensorSelection::Full => unreachable!("handled above"),
+                TensorSelection::Contiguous {
+                    offset_elements,
+                    shape,
+                } => materialize_contiguous(
+                    &self.key,
+                    &source_value,
+                    *offset_elements,
+                    shape,
+                    source_stream,
+                    execution_stream,
+                )?,
             }
         };
         Ok(PendingWeightMaterialization {
@@ -2396,6 +2507,45 @@ fn validate_selection(
             }
             output[*axis] = indices.len();
         }
+        TensorSelection::Contiguous {
+            offset_elements,
+            shape: selected,
+        } => {
+            if selected.is_empty() || selected.contains(&0) {
+                return Err(WeightStoreError::InvalidSelection {
+                    key: key.to_string(),
+                    message: "contiguous selection shape must be non-empty and nonzero".into(),
+                });
+            }
+            let full_elements = shape.iter().try_fold(1usize, |count, dimension| {
+                count
+                    .checked_mul(*dimension)
+                    .ok_or_else(|| WeightStoreError::Overflow {
+                        context: format!("element count for tensor {key:?}"),
+                    })
+            })?;
+            let selected_elements = selected.iter().try_fold(1usize, |count, dimension| {
+                count
+                    .checked_mul(*dimension)
+                    .ok_or_else(|| WeightStoreError::Overflow {
+                        context: format!("contiguous selection size for tensor {key:?}"),
+                    })
+            })?;
+            let end = offset_elements
+                .checked_add(selected_elements)
+                .ok_or_else(|| WeightStoreError::Overflow {
+                    context: format!("contiguous selection end for tensor {key:?}"),
+                })?;
+            if end > full_elements {
+                return Err(WeightStoreError::InvalidSelection {
+                    key: key.to_string(),
+                    message: format!(
+                        "contiguous scalar span {offset_elements}..{end} exceeds {full_elements} elements"
+                    ),
+                });
+            }
+            output = selected.clone();
+        }
     }
     output.iter().try_fold(1usize, |count, dimension| {
         count
@@ -2443,6 +2593,106 @@ fn selected_byte_len(
         });
     }
     Ok(scaled / full_elements)
+}
+
+fn contiguous_safetensors_data<'a>(
+    key: &str,
+    path: &Path,
+    full_shape: &[usize],
+    data: &'a [u8],
+    offset_elements: usize,
+    selected_shape: &[usize],
+) -> Result<&'a [u8], WeightStoreError> {
+    let full_elements = full_shape.iter().try_fold(1usize, |count, dimension| {
+        count
+            .checked_mul(*dimension)
+            .ok_or_else(|| WeightStoreError::Overflow {
+                context: format!("safetensors element count for tensor {key:?}"),
+            })
+    })?;
+    let scalar_bytes = data
+        .len()
+        .checked_div(full_elements)
+        .filter(|_| full_elements > 0 && data.len().is_multiple_of(full_elements))
+        .ok_or_else(|| WeightStoreError::MalformedSafetensors {
+            path: path.to_path_buf(),
+            message: format!("tensor {key:?} payload has no integral scalar width"),
+        })?;
+    let selected_elements = selected_shape.iter().try_fold(1usize, |count, dimension| {
+        count
+            .checked_mul(*dimension)
+            .ok_or_else(|| WeightStoreError::Overflow {
+                context: format!("contiguous selection size for tensor {key:?}"),
+            })
+    })?;
+    let byte_start =
+        offset_elements
+            .checked_mul(scalar_bytes)
+            .ok_or_else(|| WeightStoreError::Overflow {
+                context: format!("contiguous byte start for tensor {key:?}"),
+            })?;
+    let byte_end = selected_elements
+        .checked_mul(scalar_bytes)
+        .and_then(|bytes| byte_start.checked_add(bytes))
+        .ok_or_else(|| WeightStoreError::Overflow {
+            context: format!("contiguous byte end for tensor {key:?}"),
+        })?;
+    data.get(byte_start..byte_end)
+        .ok_or_else(|| WeightStoreError::MalformedSafetensors {
+            path: path.to_path_buf(),
+            message: format!("contiguous selection for tensor {key:?} is outside its payload"),
+        })
+}
+
+fn materialize_contiguous(
+    key: &str,
+    source: &Array,
+    offset_elements: usize,
+    shape: &[usize],
+    source_stream: &Stream,
+    execution_stream: &Stream,
+) -> Result<Array, WeightStoreError> {
+    let elements = shape.iter().try_fold(1usize, |count, dimension| {
+        count
+            .checked_mul(*dimension)
+            .ok_or_else(|| WeightStoreError::Overflow {
+                context: format!("contiguous materialization size for tensor {key:?}"),
+            })
+    })?;
+    let end = offset_elements
+        .checked_add(elements)
+        .ok_or_else(|| WeightStoreError::Overflow {
+            context: format!("contiguous materialization end for tensor {key:?}"),
+        })?;
+    let flattened =
+        source
+            .reshape(&[-1], source_stream)
+            .map_err(|source| WeightStoreError::Mlx {
+                key: key.to_string(),
+                operation: "flatten contiguous selection",
+                source,
+            })?;
+    let selected = materialize_range(
+        key,
+        flattened,
+        &[source.size()],
+        0,
+        offset_elements,
+        end,
+        source_stream,
+        execution_stream,
+    )?;
+    let shape = shape
+        .iter()
+        .map(|dimension| to_i32(key, "contiguous output dimension", *dimension))
+        .collect::<Result<Vec<_>, _>>()?;
+    selected
+        .reshape(&shape, execution_stream)
+        .map_err(|source| WeightStoreError::Mlx {
+            key: key.to_string(),
+            operation: "reshape contiguous selection",
+            source,
+        })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2559,6 +2809,15 @@ fn is_supported_execution_dtype(dtype: Dtype) -> bool {
             | Dtype::U64
             | Dtype::F8_E4M3
     )
+}
+
+fn safetensors_dtype_alignment(dtype: Dtype) -> usize {
+    match dtype {
+        Dtype::I64 | Dtype::U64 | Dtype::F64 => 8,
+        Dtype::I32 | Dtype::U32 | Dtype::F32 => 4,
+        Dtype::I16 | Dtype::U16 | Dtype::F16 | Dtype::BF16 => 2,
+        _ => 1,
+    }
 }
 
 #[cfg(test)]

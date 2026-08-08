@@ -143,6 +143,13 @@ impl WeightBinding {
         self.recipe.as_ref()
     }
 
+    /// Returns the complete semantic source recipe represented by this binding.
+    pub(crate) fn source_recipe(&self) -> DerivedWeightRecipe {
+        self.recipe.clone().unwrap_or_else(|| {
+            DerivedWeightRecipe::source(self.checkpoint_key.clone(), self.selection.clone())
+        })
+    }
+
     /// Returns every checkpoint key consumed by this binding.
     pub fn checkpoint_keys(&self) -> Vec<&str> {
         match &self.recipe {

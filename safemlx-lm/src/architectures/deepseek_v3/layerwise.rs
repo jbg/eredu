@@ -36,8 +36,11 @@ use crate::{
         build_module_bindings_with_recipes, canonical_checkpoint_name, populate_module_from_lease,
         populate_module_from_lease_excluding,
     },
-    runtime::checkpoint::recipe::DerivedWeightRecipe,
     runtime::checkpoint::store::{GgufWeightStore, TensorSelection, WeightStore},
+    runtime::checkpoint::{
+        quantization::{should_quantize_on_load, WeightQuantization},
+        recipe::DerivedWeightRecipe,
+    },
     runtime::distributed::parallel::{
         aligned_partition_units, array_parameter_member, partitioned_projection_members,
         register_partitioned_projection_group, register_projection_module,
@@ -578,6 +581,7 @@ pub fn load_deepseek_v3_expert_cache_model(
     model_dir: impl AsRef<Path>,
     non_expert: NonExpertWeightResidency,
     options: ExpertCacheLoadOptions,
+    quantization: Option<WeightQuantization>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<DeepSeekV3LayerwiseModel, Error> {
@@ -595,13 +599,34 @@ pub fn load_deepseek_v3_expert_cache_model(
         load_safetensors_layerwise_model(model_dir, adapter, non_expert, stream, weights_stream)?;
     let store = execution.checkpoint_store_arc();
     let entries = deepseek_expert_catalog(&args, store.as_ref())?;
-    let cache = ExpertCache::new_shared(
-        store,
-        entries,
-        options,
-        weights_stream.clone(),
-        stream.clone(),
-    )?;
+    let quantize_on_load = quantization
+        .map(|requested| {
+            should_quantize_on_load(
+                "DeepSeek independent expert cache",
+                args.quantization,
+                requested,
+            )
+            .map(|required| required.then_some(requested))
+        })
+        .transpose()?
+        .flatten();
+    let cache = match quantize_on_load {
+        Some(quantization) => ExpertCache::new_quantized_shared(
+            store,
+            entries,
+            options,
+            quantization,
+            weights_stream.clone(),
+            stream.clone(),
+        )?,
+        None => ExpertCache::new_shared(
+            store,
+            entries,
+            options,
+            weights_stream.clone(),
+            stream.clone(),
+        )?,
+    };
     execution.adapter_mut().expert_cache = Some(cache);
     Ok(DeepSeekV3LayerwiseModel { execution })
 }
@@ -1572,6 +1597,15 @@ impl ArchitectureAdapter for DeepSeekV3LayerwiseAdapter {
                                     acquired.identities().len() as i32,
                                     stream,
                                 )?;
+                                if let Some(quantization) = expert_cache.weight_quantization() {
+                                    bank.use_fp8 = false;
+                                    bank.gate_affine = Some(quantization);
+                                    bank.up_affine = Some(quantization);
+                                    bank.down_affine = Some(quantization);
+                                    bank.gate_iquant = None;
+                                    bank.up_iquant = None;
+                                    bank.down_iquant = None;
+                                }
                                 bank.gate_proj = Param::new(Some(
                                     acquired
                                         .compact_binding("gate_proj", stream)
@@ -2283,6 +2317,7 @@ mod tests {
                 OffloadConfig::new(None, None, 1).unwrap(),
             )),
             expert_options,
+            None,
             gpu.stream(),
             cpu.stream(),
         )

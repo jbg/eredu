@@ -391,7 +391,10 @@ pub(crate) fn validate_load_policy(
         ));
     }
 
-    if options.quantization.is_some() && !options.weight_residency.is_fully_resident() {
+    if options.quantization.is_some()
+        && !options.weight_residency.is_fully_resident()
+        && (artifact == ArtifactLoadKind::Gguf || options.weight_residency.expert_cache().is_none())
+    {
         return Err(Error::Quantization(match artifact {
             ArtifactLoadKind::Safetensors => format!(
                 "load-time quantization is unsupported for {} nonresident loading; use a matching checkpoint-native packed format",

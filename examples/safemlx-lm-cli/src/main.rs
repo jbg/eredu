@@ -1379,6 +1379,16 @@ fn main() -> Result<()> {
             );
             eprintln!("expert_cache_prefill: {:?}", report.prefill);
             eprintln!("expert_cache_decode: {:?}", report.decode);
+            if let Some(materialization) = &report.materialization {
+                eprintln!(
+                    "expert_cache_quantization: {} weights, {} tiles, {} source bytes -> {} packed bytes, {} peak working-set bytes",
+                    materialization.transformed_weights,
+                    materialization.source_tiles,
+                    materialization.source_bytes_read,
+                    materialization.output_bytes,
+                    materialization.peak_planned_working_set_bytes
+                );
+            }
         }
         if eos_token_ids.is_empty() {
             eprintln!("warning: the model config contains no EOS token id");
@@ -1595,9 +1605,6 @@ fn validate_args(args: &Cli) -> Result<()> {
     }
     if args.layerwise_host && args.quantize.is_some() {
         bail!("--quantize is not supported with --layerwise-host; use matching checkpoint-native quantization");
-    }
-    if args.expert_cache && args.quantize.is_some() {
-        bail!("--quantize is not supported with --expert-cache; use checkpoint-native weights");
     }
     if args.dense_disk_stream && args.quantize.is_some() {
         bail!("--quantize is not supported with --dense-disk-stream; use matching checkpoint-native weights");
@@ -2619,6 +2626,21 @@ mod tests {
             "model-id",
             "--expert-cache",
             "--dense-disk-stream",
+            "prompt",
+        ])
+        .unwrap();
+        validate_args(&arguments).unwrap();
+    }
+
+    #[test]
+    fn accepts_load_time_quantization_with_a_resident_expert_cache() {
+        let arguments = Cli::try_parse_from([
+            "safemlx-lm",
+            "--model",
+            "model-id",
+            "--expert-cache",
+            "--quantize",
+            "4",
             "prompt",
         ])
         .unwrap();

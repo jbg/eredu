@@ -21,7 +21,9 @@ SafeMLX is independent of Apple and is not an official MLX project.
 - SafeTensors and bounded, streaming GGUF checkpoint readers.
 - Out-of-core load-time affine and MXFP4 quantization that reads dense
   SafeTensors or GGUF weights in admitted row tiles and exposes the packed
-  result through the ordinary residency store.
+  result through the ordinary residency store. Rank-owned expert catalogs use
+  that same transformation for independent caches, TP+EP, and TP+PP+EP without
+  materializing remote experts or complete dense expert banks.
 - Composable ordinary-layer and routed-expert residency: complete layers may
   be fully resident, host-layerwise, or dense disk-streamed; independent expert
   caches compose with resident, host-layerwise, or streamed non-expert units.

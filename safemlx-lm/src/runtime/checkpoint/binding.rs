@@ -180,19 +180,18 @@ where
     Ok(())
 }
 
-/// Populates a quantized target module from dense direct or derived bindings.
-///
-/// Binding materialization uses the dense source module's local parameter
-/// names. This operation applies the ordinary strict-loader quantization rules
-/// to those arrays one at a time, so embeddings, linear projections, packed
-/// expert banks, biases, and non-quantizable parameters follow the same target
-/// module contract as a conventional SafeTensors load.
-pub(crate) fn populate_module_from_dense_arrays_quantized(
+/// Populates a quantized target from dense direct or derived bindings while an
+/// independent residency manager may own an excluded parameter class.
+pub(crate) fn populate_module_from_dense_arrays_quantized_excluding<F>(
     module: &mut (impl ModuleParameters + ?Sized),
     arrays: &BTreeMap<String, Array>,
     quantization: WeightQuantization,
     stream: &Stream,
-) -> Result<(), Error> {
+    excluded: F,
+) -> Result<(), Error>
+where
+    F: Fn(&str) -> bool,
+{
     quantization.validate()?;
     let config = StrictLoadConfig::default();
     let mut report = StrictLoadReport::default();
@@ -210,7 +209,7 @@ pub(crate) fn populate_module_from_dense_arrays_quantized(
             )?;
         }
     }
-    report.finish(module, &config)
+    report.finish_excluding(module, &config, excluded)
 }
 
 fn build_module_bindings_with_recipes_excluding<F>(

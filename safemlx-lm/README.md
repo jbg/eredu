@@ -1087,14 +1087,23 @@ formats. Dense families have no EP migration.
 
 The remaining global limitations are:
 
-- The shared bounded materialisation store now supports out-of-core affine and
+- The shared bounded materialisation store supports out-of-core affine and
   MXFP4 conversion from row-bounded SafeTensors or dense GGUF semantic recipes.
-  Independently cached and triple-axis expert loaders do not yet feed their
-  rank-local expert recipes through that store, so those public load requests
-  remain rejected rather than bypassing semantic sharding. Banked sources that
-  cannot express the owned expert and row tile through the storage selection
-  contract also fail during bounded preflight. Checkpoint-native affine, FP8,
-  MXFP4, and registered GGUF layouts remain supported.
+  Independent expert caches, TP+EP, and TP+PP+EP now transform the authoritative
+  rank-local expert catalog rather than rebuilding topology arithmetic: EP
+  ownership, TP projection ranges, and the conversion row tile compose into
+  one bounded source span. The conversion budget is capped by the final packed
+  local expert catalog, residency accounts only packed bindings, and
+  `ExpertCacheReport::materialization` exposes selected source bytes, output
+  bytes, tile counts, and the peak admitted working set.
+- A reshaped contiguous scalar span is currently a SafeTensors storage
+  selection. GGUF load-time conversion remains available when its semantic
+  recipe reduces to the reader's native row/range selection, but a fused GGUF
+  bank requiring that reshaped span fails bounded preflight. Non-resident
+  ordinary pipeline layers still require checkpoint-native quantization; this
+  restriction no longer applies merely because routed experts use an
+  independent cache. Inkling and Nemotron-H load-time expert conversion remains
+  unavailable until their grouped rank-3 kernels accept affine packed banks.
 
 TP+PP+EP is executable for DeepSeek-V3/R1, Qwen3-MoE, Qwen3-VL-MoE, Kimi
 Linear, Inkling, GPT-OSS, Gemma 4 MoE, LFM2-MoE, Nemotron-H-MoE, and
@@ -2169,8 +2178,13 @@ physical kernels behind the common replicated dispatch. With sparse caching,
 `routed_expert_bytes` is zero and `owned_expert_bytes` describes the rank's
 cold, warm, or hot catalog; with fully resident DeepSeek/Qwen3 it scales
 approximately with `1 / EP`. `replicated_parameter_bytes` remains constant.
-Load-time conversion is rejected for sparse-cache EP because it would require
-eager expert materialization.
+Load-time affine or MXFP4 conversion for sparse-cache EP uses the same
+rank-owned semantic catalog as checkpoint-native loading. Each projection is
+converted in admitted CPU row tiles into a temporary packed SafeTensors
+overlay; remote experts are never read, route-empty ranks do not materialize a
+bank, and the retained cache footprint is the packed footprint. Matching
+checkpoint-native encodings continue to load directly and implicit packed
+transcoding fails closed.
 
 DeepSeek's Cartesian resident path independently shards MLA heads, dense and
 shared projections, embeddings, and the output head over TP while assigning

@@ -17,9 +17,19 @@ use safemlx::{
 };
 
 use crate::{
-    runtime::checkpoint::store::WeightStore,
+    error::Error,
+    runtime::checkpoint::{
+        bounded_quantization::{
+            BoundedQuantizationPlan, BoundedQuantizationReport, BoundedQuantizationTarget,
+            BoundedQuantizedWeightStore,
+        },
+        quantization::WeightQuantization,
+        recipe::RecipeDtype,
+        store::{TensorSelection, WeightStore},
+    },
     runtime::residency::manager::{
         OffloadUnit, ResidencyError, ResidencyManager, ResidencyReport, ResidentUnitLease,
+        WeightBinding,
     },
     runtime::residency::policy::{
         MemoryTier, OffloadConfig, OffloadPlan, OffloadUnitId, OffloadUnitSpec, ResidencyPolicy,
@@ -181,6 +191,201 @@ impl ExpertCatalogEntry {
     pub const fn bytes(&self) -> u64 {
         self.bytes
     }
+
+    fn into_parts(self) -> (ExpertIdentity, OffloadUnit) {
+        (self.identity, self.unit)
+    }
+}
+
+/// Result of replacing dense expert bindings with a disk-backed packed overlay.
+pub(crate) struct QuantizedExpertCatalog {
+    /// Store supplying synthetic packed bindings and delegating all other keys.
+    pub store: Arc<dyn WeightStore + Send + Sync>,
+    /// Expert units rebuilt against the packed store.
+    pub entries: Vec<ExpertCatalogEntry>,
+    /// Deterministic bounded-materialisation telemetry.
+    pub report: BoundedQuantizationReport,
+}
+
+/// Quantizes every floating expert projection through its authoritative
+/// rank-local semantic recipe and rebuilds the catalog against packed keys.
+pub(crate) fn quantize_expert_catalog(
+    source: Arc<dyn WeightStore + Send + Sync>,
+    entries: Vec<ExpertCatalogEntry>,
+    quantization: WeightQuantization,
+    max_working_set_bytes: u64,
+    source_stream: &Stream,
+) -> Result<QuantizedExpertCatalog, Error> {
+    let mut units = Vec::with_capacity(entries.len());
+    let mut targets = Vec::new();
+    let mut target_by_binding = BTreeMap::new();
+    let mut packed_catalog_bytes = 0u64;
+    for entry in entries {
+        let (identity, unit) = entry.into_parts();
+        for binding in unit.bindings() {
+            let recipe = binding.source_recipe();
+            let metadata = recipe.infer(source.as_ref())?;
+            if !quantizable_expert_binding(binding.name(), metadata.dtype(), metadata.shape()) {
+                continue;
+            }
+            let stem = binding
+                .name()
+                .strip_suffix(".weight")
+                .unwrap_or(binding.name());
+            let target_name = format!(
+                "__safemlx.expert.layer.{:05}.global.{:05}.{stem}.weight",
+                identity.layer, identity.global_expert
+            );
+            let target = BoundedQuantizationTarget::from_recipe(target_name, recipe)?;
+            packed_catalog_bytes = packed_catalog_bytes
+                .checked_add(packed_projection_bytes(metadata.shape(), quantization)?)
+                .ok_or_else(|| {
+                    Error::Quantization("packed expert catalog size overflowed".into())
+                })?;
+            target_by_binding.insert((identity, binding.name().to_string()), target.clone());
+            targets.push(target);
+        }
+        units.push((identity, unit));
+    }
+    if targets.is_empty() {
+        return Err(Error::Quantization(
+            "expert catalog contains no floating projection bindings to quantize".into(),
+        ));
+    }
+    let plan = BoundedQuantizationPlan::new(
+        quantization,
+        max_working_set_bytes.min(packed_catalog_bytes),
+        targets,
+    )?;
+    let transformed = Arc::new(BoundedQuantizedWeightStore::create(
+        Arc::clone(&source),
+        plan,
+        source_stream,
+    )?);
+    let report = transformed.report().clone();
+    let store: Arc<dyn WeightStore + Send + Sync> = transformed;
+    let mut rebuilt = Vec::with_capacity(units.len());
+    for (identity, unit) in units {
+        let mut bindings = Vec::new();
+        for binding in unit.bindings() {
+            let Some(target) = target_by_binding.get(&(identity, binding.name().to_string()))
+            else {
+                bindings.push(binding.clone());
+                continue;
+            };
+            bindings.push(packed_binding(
+                binding.name(),
+                target.weight_name(),
+                store.as_ref(),
+            )?);
+            let (scales_name, biases_name) = local_companion_names(binding.name());
+            bindings.push(packed_binding(
+                &scales_name,
+                &target.scales_name(),
+                store.as_ref(),
+            )?);
+            if quantization.has_biases() {
+                bindings.push(packed_binding(
+                    &biases_name,
+                    &target.biases_name(),
+                    store.as_ref(),
+                )?);
+            }
+        }
+        let bytes = bindings.iter().try_fold(0u64, |total, binding| {
+            total.checked_add(binding.expected_bytes()).ok_or_else(|| {
+                Error::Quantization("quantized expert catalog byte total overflowed".into())
+            })
+        })?;
+        rebuilt.push(ExpertCatalogEntry::new(
+            identity,
+            OffloadUnit::new(identity.unit_id(), bindings)?,
+            bytes,
+        )?);
+    }
+    Ok(QuantizedExpertCatalog {
+        store,
+        entries: rebuilt,
+        report,
+    })
+}
+
+fn quantizable_expert_binding(name: &str, dtype: &RecipeDtype, shape: &[usize]) -> bool {
+    matches!(
+        dtype,
+        RecipeDtype::F16 | RecipeDtype::BF16 | RecipeDtype::F32
+    ) && shape.len() >= 2
+        && !name.contains("scale")
+        && !name.contains("bias")
+        && !name.ends_with("_blocks")
+}
+
+fn packed_projection_bytes(
+    shape: &[usize],
+    quantization: WeightQuantization,
+) -> Result<u64, Error> {
+    let (&columns, rows) = shape
+        .split_last()
+        .ok_or_else(|| Error::Quantization("expert projection has no input dimension".into()))?;
+    let rows = rows.iter().try_fold(1u64, |count, dimension| {
+        count
+            .checked_mul(*dimension as u64)
+            .ok_or_else(|| Error::Quantization("expert projection row count overflowed".into()))
+    })?;
+    let packed = (columns as u64)
+        .checked_mul(quantization.bits() as u64)
+        .and_then(|bits| bits.checked_div(8))
+        .ok_or_else(|| Error::Quantization("packed expert row size overflowed".into()))?;
+    let groups = columns
+        .checked_div(quantization.group_size() as usize)
+        .ok_or_else(|| Error::Quantization("expert group geometry is invalid".into()))?
+        as u64;
+    let scale_bytes = if matches!(quantization, WeightQuantization::MxFp4) {
+        groups
+    } else {
+        groups
+            .checked_mul(4)
+            .ok_or_else(|| Error::Quantization("expert scale row size overflowed".into()))?
+    };
+    let bias_bytes = if quantization.has_biases() {
+        groups
+            .checked_mul(4)
+            .ok_or_else(|| Error::Quantization("expert bias row size overflowed".into()))?
+    } else {
+        0
+    };
+    let row_bytes = packed
+        .checked_add(scale_bytes)
+        .and_then(|bytes| bytes.checked_add(bias_bytes))
+        .ok_or_else(|| Error::Quantization("packed expert row total overflowed".into()))?;
+    rows.checked_mul(row_bytes)
+        .ok_or_else(|| Error::Quantization("packed expert projection size overflowed".into()))
+}
+
+fn local_companion_names(weight_name: &str) -> (String, String) {
+    weight_name.strip_suffix(".weight").map_or_else(
+        || {
+            (
+                format!("{weight_name}_scales"),
+                format!("{weight_name}_biases"),
+            )
+        },
+        |prefix| (format!("{prefix}.scales"), format!("{prefix}.biases")),
+    )
+}
+
+fn packed_binding(
+    local_name: &str,
+    checkpoint_key: &str,
+    store: &dyn WeightStore,
+) -> Result<WeightBinding, Error> {
+    let metadata = store.metadata(checkpoint_key)?;
+    Ok(WeightBinding::new(
+        local_name,
+        checkpoint_key,
+        TensorSelection::Full,
+        metadata.logical_byte_len as u64,
+    )?)
 }
 
 /// Tier-local cache request counters.
@@ -250,6 +455,9 @@ pub struct ExpertCacheReport {
     pub decode: ExpertPassStatistics,
     /// Underlying logical transfer and checkpoint diagnostics.
     pub residency: ResidencyReport,
+    /// Bounded load-time expert materialisation telemetry, when the catalog
+    /// was transformed from floating checkpoint weights.
+    pub materialization: Option<BoundedQuantizationReport>,
 }
 
 #[derive(Default)]
@@ -278,6 +486,8 @@ pub struct ExpertCache {
     scratch_limit: u64,
     prefill_bank_target: u64,
     statistics: Mutex<ExpertStatistics>,
+    weight_quantization: Option<WeightQuantization>,
+    materialization: Option<BoundedQuantizationReport>,
 }
 
 impl ExpertCache {
@@ -312,6 +522,42 @@ impl ExpertCache {
             MemoryTier::Disk,
             source_stream,
             device_stream,
+            None,
+            None,
+        )
+    }
+
+    /// Creates a cache after boundedly transforming its rank-local semantic
+    /// expert recipes into packed checkpoint bindings.
+    pub(crate) fn new_quantized_shared(
+        store: Arc<dyn WeightStore + Send + Sync>,
+        entries: Vec<ExpertCatalogEntry>,
+        options: ExpertCacheLoadOptions,
+        quantization: WeightQuantization,
+        source_stream: Stream,
+        device_stream: Stream,
+    ) -> Result<Self, ExpertCacheError> {
+        let transformed = quantize_expert_catalog(
+            store,
+            entries,
+            quantization,
+            options.compact_bank_scratch_bytes,
+            &source_stream,
+        )
+        .map_err(|source| ExpertCacheError::Transformation {
+            source: Box::new(source),
+        })?;
+        let report = transformed.report;
+        Self::new_shared_with_policy(
+            transformed.store,
+            transformed.entries,
+            options,
+            ResidencyPolicy::Cacheable,
+            MemoryTier::Disk,
+            source_stream,
+            device_stream,
+            Some(quantization),
+            Some(report),
         )
     }
 
@@ -335,9 +581,46 @@ impl ExpertCache {
             MemoryTier::Device,
             source_stream,
             device_stream,
+            None,
+            None,
         )
     }
 
+    /// Creates a fully resident cache after boundedly transforming the exact
+    /// rank-local expert catalog into its requested packed representation.
+    pub(crate) fn new_quantized_resident_shared(
+        store: Arc<dyn WeightStore + Send + Sync>,
+        entries: Vec<ExpertCatalogEntry>,
+        quantization: WeightQuantization,
+        source_stream: Stream,
+        device_stream: Stream,
+    ) -> Result<Self, ExpertCacheError> {
+        let options = ExpertCacheLoadOptions::default();
+        let transformed = quantize_expert_catalog(
+            store,
+            entries,
+            quantization,
+            options.compact_bank_scratch_bytes,
+            &source_stream,
+        )
+        .map_err(|source| ExpertCacheError::Transformation {
+            source: Box::new(source),
+        })?;
+        let report = transformed.report;
+        Self::new_shared_with_policy(
+            transformed.store,
+            transformed.entries,
+            options,
+            ResidencyPolicy::Pinned,
+            MemoryTier::Device,
+            source_stream,
+            device_stream,
+            Some(quantization),
+            Some(report),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn new_shared_with_policy(
         store: Arc<dyn WeightStore + Send + Sync>,
         entries: impl IntoIterator<Item = ExpertCatalogEntry>,
@@ -346,6 +629,8 @@ impl ExpertCache {
         initial_tier: MemoryTier,
         source_stream: Stream,
         device_stream: Stream,
+        weight_quantization: Option<WeightQuantization>,
+        materialization: Option<BoundedQuantizationReport>,
     ) -> Result<Self, ExpertCacheError> {
         if options.compact_bank_scratch_bytes == 0 {
             return Err(ExpertCacheError::ZeroScratchLimit);
@@ -410,7 +695,14 @@ impl ExpertCache {
             scratch_limit: options.compact_bank_scratch_bytes,
             prefill_bank_target: options.prefill_compact_bank_target_bytes,
             statistics: Mutex::new(ExpertStatistics::default()),
+            weight_quantization,
+            materialization,
         })
+    }
+
+    /// Returns the load-time encoding of transformed expert bindings.
+    pub const fn weight_quantization(&self) -> Option<WeightQuantization> {
+        self.weight_quantization
     }
 
     /// Returns the underlying reusable residency manager.
@@ -843,6 +1135,7 @@ impl ExpertCache {
             prefill: statistics.prefill,
             decode: statistics.decode,
             residency,
+            materialization: self.materialization.clone(),
         })
     }
 
@@ -981,6 +1274,13 @@ impl AcquiredExperts {
 /// Structured sparse expert cache failures.
 #[derive(Debug, thiserror::Error)]
 pub enum ExpertCacheError {
+    /// Bounded expert materialisation failed before cache construction.
+    #[error("bounded expert materialisation failed: {source}")]
+    Transformation {
+        /// Shared checkpoint transformation failure.
+        #[source]
+        source: Box<Error>,
+    },
     /// No expert definitions were supplied.
     #[error("sparse expert cache requires at least one owned expert")]
     EmptyCatalog,
@@ -1155,7 +1455,10 @@ mod tests {
 
     use super::*;
     use crate::{
-        runtime::checkpoint::store::{SafetensorsWeightStore, TensorSelection},
+        runtime::checkpoint::{
+            recipe::DerivedWeightRecipe,
+            store::{SafetensorsWeightStore, TensorSelection},
+        },
         runtime::residency::manager::WeightBinding,
         runtime::residency::policy::CacheEvictionPolicy,
     };
@@ -1245,6 +1548,115 @@ mod tests {
             stream(),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn quantized_cache_materializes_only_rank_local_expert_and_tp_recipes() {
+        let dir = tempfile::tempdir().unwrap();
+        let gate = (0..2 * 4 * 64)
+            .map(|index| (index as f32 - 127.0) / 32.0)
+            .collect::<Vec<_>>();
+        let down = gate.iter().map(|value| value * 0.5).collect::<Vec<_>>();
+        let gate_bytes = gate
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect::<Vec<_>>();
+        let down_bytes = down
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect::<Vec<_>>();
+        serialize_to_file(
+            [
+                (
+                    "experts.gate",
+                    TensorView::new(StoredDtype::F32, vec![2, 4, 64], &gate_bytes).unwrap(),
+                ),
+                (
+                    "experts.down",
+                    TensorView::new(StoredDtype::F32, vec![2, 4, 64], &down_bytes).unwrap(),
+                ),
+            ],
+            None,
+            &dir.path().join("model.safetensors"),
+        )
+        .unwrap();
+        let store: Arc<dyn WeightStore + Send + Sync> =
+            Arc::new(SafetensorsWeightStore::open(dir.path()).unwrap());
+        let entries = (0..2)
+            .map(|expert| {
+                let identity = ExpertIdentity::new(3, expert);
+                let bindings = ["gate", "down"].map(|projection| {
+                    let owned = DerivedWeightRecipe::source(
+                        format!("experts.{projection}"),
+                        TensorSelection::Range {
+                            axis: 0,
+                            start: expert,
+                            end: expert + 1,
+                        },
+                    );
+                    let tp = DerivedWeightRecipe::Select {
+                        input: Box::new(owned),
+                        selection: TensorSelection::Range {
+                            axis: 1,
+                            start: expert * 2,
+                            end: expert * 2 + 2,
+                        },
+                    };
+                    WeightBinding::from_recipe(format!("{projection}_proj"), tp, 512).unwrap()
+                });
+                let unit = OffloadUnit::new(identity.unit_id(), bindings).unwrap();
+                ExpertCatalogEntry::new(identity, unit, 1_024).unwrap()
+            })
+            .collect::<Vec<_>>();
+        let options =
+            ExpertCacheLoadOptions::new(OffloadConfig::new(None, None, 1).unwrap(), 1_024, 1_024)
+                .unwrap();
+        let cache = ExpertCache::new_quantized_shared(
+            store,
+            entries,
+            options,
+            WeightQuantization::Affine(Default::default()),
+            stream(),
+            stream(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            cache.weight_quantization(),
+            Some(WeightQuantization::Affine(Default::default()))
+        );
+        let report = cache.report().unwrap();
+        assert_eq!(report.owned_experts, 2);
+        assert_eq!(report.owned_bytes, 320);
+        assert_eq!(
+            report.materialization,
+            Some(BoundedQuantizationReport {
+                transformed_weights: 4,
+                source_tiles: 8,
+                source_bytes_read: 2_048,
+                output_bytes: 320,
+                peak_planned_working_set_bytes: 296,
+                largest_source_tile_bytes: 256,
+                largest_output_tile_bytes: 40,
+            })
+        );
+        let acquired = cache
+            .acquire_route_slice(3, &[1], &[1, 1], ExpertPass::Decode, &stream())
+            .unwrap();
+        assert_eq!(
+            acquired
+                .compact_binding("gate_proj", &stream())
+                .unwrap()
+                .shape(),
+            &[1, 2, 8]
+        );
+        assert_eq!(
+            acquired
+                .compact_binding("gate_proj_scales", &stream())
+                .unwrap()
+                .shape(),
+            &[1, 2, 1]
+        );
     }
 
     #[test]

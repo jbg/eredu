@@ -3605,7 +3605,7 @@ fn load_kimi_linear_ep(
             topology,
             options,
             options.weight_residency.layers(),
-            ExternalExpertResidency::SparseCache(expert_options),
+            ExternalExpertResidency::SparseCache(expert_options, options.quantization),
             options.weight_residency.max_mapped_shards(),
             assignment,
             stream,
@@ -3624,7 +3624,7 @@ fn load_kimi_linear_ep(
             topology,
             options,
             LayerWeightResidency::FullyResident,
-            ExternalExpertResidency::FullyResident,
+            ExternalExpertResidency::FullyResident(options.quantization),
             crate::runtime::checkpoint::store::DEFAULT_MAX_MAPPED_SHARDS,
             assignment,
             stream,
@@ -3729,7 +3729,7 @@ fn load_gguf_ep(
         None
     };
     if let Some(expert_options) = options.weight_residency.expert_cache() {
-        reject_external_ep_quantization(options.quantization)?;
+        reject_external_gguf_ep_quantization(options.quantization)?;
         return load_external_gguf_ep(
             architecture,
             checkpoint,
@@ -3740,7 +3740,7 @@ fn load_gguf_ep(
             topology,
             assignment,
             options.weight_residency.layers(),
-            ExternalExpertResidency::SparseCache(expert_options),
+            ExternalExpertResidency::SparseCache(expert_options, options.quantization),
             options.weight_residency.max_mapped_shards(),
             stream,
             weights_stream,
@@ -3753,7 +3753,7 @@ fn load_gguf_ep(
         ));
     }
     if topology.tensor_parallel_size > 1 || matches!(architecture, "qwen3vlmoe" | "gemma4") {
-        reject_external_ep_quantization(options.quantization)?;
+        reject_external_gguf_ep_quantization(options.quantization)?;
         return load_external_gguf_ep(
             architecture,
             checkpoint,
@@ -3764,7 +3764,7 @@ fn load_gguf_ep(
             topology,
             assignment,
             LayerWeightResidency::FullyResident,
-            ExternalExpertResidency::FullyResident,
+            ExternalExpertResidency::FullyResident(options.quantization),
             crate::runtime::checkpoint::store::DEFAULT_MAX_MAPPED_SHARDS,
             stream,
             weights_stream,
@@ -4539,18 +4539,20 @@ fn finish_external_ep(
     architecture.bind_parallel_topology(topology);
     let routed_expert_residency = residency.kind();
     let (expert_cache, owned_expert_bytes) = match residency {
-        ExternalExpertResidency::FullyResident => rank_owned_resident_experts(
+        ExternalExpertResidency::FullyResident(quantization) => rank_owned_resident_experts(
             store.clone(),
             entries,
             &assignment,
+            quantization,
             stream,
             weights_stream,
         )?,
-        ExternalExpertResidency::SparseCache(options) => rank_owned_expert_cache(
+        ExternalExpertResidency::SparseCache(options, quantization) => rank_owned_expert_cache(
             store.clone(),
             entries,
             &assignment,
             options,
+            quantization,
             stream,
             weights_stream,
         )?,
@@ -4571,15 +4573,15 @@ fn finish_external_ep(
 
 #[derive(Debug, Clone, Copy)]
 enum ExternalExpertResidency {
-    FullyResident,
-    SparseCache(ExpertCacheLoadOptions),
+    FullyResident(Option<WeightQuantization>),
+    SparseCache(ExpertCacheLoadOptions, Option<WeightQuantization>),
 }
 
 impl ExternalExpertResidency {
     const fn kind(self) -> RoutedExpertResidency {
         match self {
-            Self::FullyResident => RoutedExpertResidency::FullyResident,
-            Self::SparseCache(_) => RoutedExpertResidency::SparseCache,
+            Self::FullyResident(_) => RoutedExpertResidency::FullyResident,
+            Self::SparseCache(_, _) => RoutedExpertResidency::SparseCache,
         }
     }
 }
@@ -4588,7 +4590,7 @@ impl ExternalExpertResidency {
 fn load_kimi_linear_external_ep(
     model_dir: &Path,
     topology: ParallelTopology,
-    options: ModelLoadOptions,
+    _options: ModelLoadOptions,
     non_expert: LayerWeightResidency,
     expert_residency: ExternalExpertResidency,
     max_mapped_shards: usize,
@@ -4596,7 +4598,6 @@ fn load_kimi_linear_external_ep(
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<ExpertParallelModel, Error> {
-    reject_external_ep_quantization(options.quantization)?;
     let args = kimi_linear::get_model_args(model_dir)?;
     args.validate()?;
     let assignment = resolve_model_assignment(assignment, args.num_experts as usize, topology)?;
@@ -4642,7 +4643,7 @@ fn load_kimi_linear_external_ep(
 fn load_deepseek_external_ep(
     model_dir: &Path,
     topology: ParallelTopology,
-    options: ModelLoadOptions,
+    _options: ModelLoadOptions,
     non_expert: LayerWeightResidency,
     expert_residency: ExternalExpertResidency,
     max_mapped_shards: usize,
@@ -4650,7 +4651,6 @@ fn load_deepseek_external_ep(
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<ExpertParallelModel, Error> {
-    reject_external_ep_quantization(options.quantization)?;
     let args = deepseek_v3::get_model_args(model_dir)?;
     args.validate()?;
     let assignment =
@@ -4699,7 +4699,7 @@ fn load_deepseek_external_ep(
 fn load_qwen3_external_ep(
     model_dir: &Path,
     topology: ParallelTopology,
-    options: ModelLoadOptions,
+    _options: ModelLoadOptions,
     non_expert: LayerWeightResidency,
     expert_residency: ExternalExpertResidency,
     max_mapped_shards: usize,
@@ -4707,7 +4707,6 @@ fn load_qwen3_external_ep(
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<ExpertParallelModel, Error> {
-    reject_external_ep_quantization(options.quantization)?;
     let args = dense_qwen::load_config(model_dir)?;
     if !args.is_moe() {
         return Err(Error::Parallel(
@@ -4753,10 +4752,12 @@ fn load_qwen3_external_ep(
     )
 }
 
-fn reject_external_ep_quantization(quantization: Option<WeightQuantization>) -> Result<(), Error> {
+fn reject_external_gguf_ep_quantization(
+    quantization: Option<WeightQuantization>,
+) -> Result<(), Error> {
     if quantization.is_some() {
         return Err(Error::Quantization(
-            "load-time quantization is unsupported with external-expert parallelism; use checkpoint-native weights"
+            "GGUF expert-parallel load-time conversion requires a rank-local semantic span that the GGUF reader cannot represent; use matching checkpoint-native packed weights"
                 .into(),
         ));
     }
@@ -4777,7 +4778,7 @@ fn load_deepseek_ep(
             topology,
             options,
             options.weight_residency.layers(),
-            ExternalExpertResidency::SparseCache(expert_options),
+            ExternalExpertResidency::SparseCache(expert_options, options.quantization),
             options.weight_residency.max_mapped_shards(),
             assignment,
             stream,
@@ -4796,7 +4797,7 @@ fn load_deepseek_ep(
             topology,
             options,
             LayerWeightResidency::FullyResident,
-            ExternalExpertResidency::FullyResident,
+            ExternalExpertResidency::FullyResident(options.quantization),
             crate::runtime::checkpoint::store::DEFAULT_MAX_MAPPED_SHARDS,
             assignment,
             stream,
@@ -4938,7 +4939,7 @@ fn load_qwen3_ep(
             topology,
             options,
             options.weight_residency.layers(),
-            ExternalExpertResidency::SparseCache(expert_options),
+            ExternalExpertResidency::SparseCache(expert_options, options.quantization),
             options.weight_residency.max_mapped_shards(),
             assignment,
             stream,
@@ -4957,7 +4958,7 @@ fn load_qwen3_ep(
             topology,
             options,
             LayerWeightResidency::FullyResident,
-            ExternalExpertResidency::FullyResident,
+            ExternalExpertResidency::FullyResident(options.quantization),
             crate::runtime::checkpoint::store::DEFAULT_MAX_MAPPED_SHARDS,
             assignment,
             stream,
@@ -5110,6 +5111,7 @@ fn rank_owned_expert_cache(
     entries: Vec<ExpertCatalogEntry>,
     assignment: &ExpertAssignment,
     options: ExpertCacheLoadOptions,
+    quantization: Option<WeightQuantization>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<(ExpertCache, usize), Error> {
@@ -5117,16 +5119,25 @@ fn rank_owned_expert_cache(
         .into_iter()
         .filter(|entry| assignment.owner(entry.identity().global_expert) == Some(assignment.rank()))
         .collect::<Vec<_>>();
-    let owned_expert_bytes =
-        usize::try_from(entries.iter().map(ExpertCatalogEntry::bytes).sum::<u64>())
-            .map_err(|_| Error::Parallel("owned expert bytes exceed usize".into()))?;
-    let cache = ExpertCache::new_shared(
-        store,
-        entries,
-        options,
-        weights_stream.clone(),
-        stream.clone(),
-    )?;
+    let cache = match quantization {
+        Some(quantization) => ExpertCache::new_quantized_shared(
+            store,
+            entries,
+            options,
+            quantization,
+            weights_stream.clone(),
+            stream.clone(),
+        )?,
+        None => ExpertCache::new_shared(
+            store,
+            entries,
+            options,
+            weights_stream.clone(),
+            stream.clone(),
+        )?,
+    };
+    let owned_expert_bytes = usize::try_from(cache.report()?.owned_bytes)
+        .map_err(|_| Error::Parallel("owned expert bytes exceed usize".into()))?;
     Ok((cache, owned_expert_bytes))
 }
 
@@ -5134,6 +5145,7 @@ fn rank_owned_resident_experts(
     store: std::sync::Arc<dyn WeightStore + Send + Sync>,
     entries: Vec<ExpertCatalogEntry>,
     assignment: &ExpertAssignment,
+    quantization: Option<WeightQuantization>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<(ExpertCache, usize), Error> {
@@ -5141,11 +5153,23 @@ fn rank_owned_resident_experts(
         .into_iter()
         .filter(|entry| assignment.owner(entry.identity().global_expert) == Some(assignment.rank()))
         .collect::<Vec<_>>();
-    let owned_expert_bytes =
-        usize::try_from(entries.iter().map(ExpertCatalogEntry::bytes).sum::<u64>())
-            .map_err(|_| Error::Parallel("owned expert bytes exceed usize".into()))?;
-    let resident =
-        ExpertCache::new_resident_shared(store, entries, weights_stream.clone(), stream.clone())?;
+    let resident = match quantization {
+        Some(quantization) => ExpertCache::new_quantized_resident_shared(
+            store,
+            entries,
+            quantization,
+            weights_stream.clone(),
+            stream.clone(),
+        )?,
+        None => ExpertCache::new_resident_shared(
+            store,
+            entries,
+            weights_stream.clone(),
+            stream.clone(),
+        )?,
+    };
+    let owned_expert_bytes = usize::try_from(resident.report()?.owned_bytes)
+        .map_err(|_| Error::Parallel("owned expert bytes exceed usize".into()))?;
     Ok((resident, owned_expert_bytes))
 }
 
@@ -5202,7 +5226,7 @@ fn open_external_safetensors_store(
 fn load_additional_external_ep(
     model_dir: &Path,
     topology: ParallelTopology,
-    options: ModelLoadOptions,
+    _options: ModelLoadOptions,
     non_expert: LayerWeightResidency,
     expert_residency: ExternalExpertResidency,
     max_mapped_shards: usize,
@@ -5211,7 +5235,6 @@ fn load_additional_external_ep(
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<ExpertParallelModel, Error> {
-    reject_external_ep_quantization(options.quantization)?;
     let store = open_external_safetensors_store(model_dir, max_mapped_shards)?;
     let (assignment, architecture, entries, replicated_parameter_bytes) = match kind {
         ModelKind::Gemma4 => {
@@ -5574,13 +5597,13 @@ fn load_additional_ep(
     {
         (
             options.weight_residency.layers(),
-            ExternalExpertResidency::SparseCache(expert_options),
+            ExternalExpertResidency::SparseCache(expert_options, options.quantization),
             options.weight_residency.max_mapped_shards(),
         )
     } else if options.weight_residency.is_fully_resident() {
         (
             LayerWeightResidency::FullyResident,
-            ExternalExpertResidency::FullyResident,
+            ExternalExpertResidency::FullyResident(options.quantization),
             crate::runtime::checkpoint::store::DEFAULT_MAX_MAPPED_SHARDS,
         )
     } else {
@@ -6399,6 +6422,24 @@ mod tests {
                 "expert.layer.00000.global.00003"
             ]
         );
+
+        let quantized = load_expert_parallel_model_with_options_and_assignment(
+            fixture.path(),
+            ModelLoadOptions::with_quantization(WeightQuantization::MxFp4)
+                .with_parallel_topology(rank_one_topology())
+                .with_weight_residency(host_expert_residency(expert_options)),
+            ExpertAssignment::round_robin(4, 2, 1).unwrap(),
+            stream,
+            weights_stream,
+        )
+        .unwrap();
+        let report = quantized.expert_cache_report().unwrap().unwrap();
+        assert_eq!(report.owned_experts, 2);
+        let materialization = report.materialization.unwrap();
+        assert_eq!(materialization.transformed_weights, 4);
+        assert!(materialization.source_bytes_read > materialization.output_bytes);
+        assert!(materialization.peak_planned_working_set_bytes <= materialization.output_bytes);
+        assert!(quantized.info.owned_expert_bytes < cached.info.owned_expert_bytes);
     }
 
     #[test]

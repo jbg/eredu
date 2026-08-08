@@ -43,9 +43,12 @@ use crate::{
         build_module_bindings_with_recipes, canonical_checkpoint_name, populate_module_from_lease,
         populate_module_from_lease_excluding,
     },
-    runtime::checkpoint::recipe::DerivedWeightRecipe,
     runtime::checkpoint::store::{
         GgufWeightStore, TensorSelection, WeightStore, WeightStoreBackend,
+    },
+    runtime::checkpoint::{
+        quantization::{should_quantize_on_load, WeightQuantization},
+        recipe::DerivedWeightRecipe,
     },
     runtime::distributed::parallel::{
         aligned_partition_units, array_parameter_member, partitioned_projection_members,
@@ -1243,6 +1246,7 @@ pub fn load_qwen3_next_expert_cache_model(
     model_dir: impl AsRef<Path>,
     non_expert: crate::NonExpertWeightResidency,
     options: ExpertCacheLoadOptions,
+    quantization: Option<WeightQuantization>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<QwenHybridLayerwiseModel, Error> {
@@ -1270,6 +1274,7 @@ pub fn load_qwen3_next_expert_cache_model(
         None,
         None,
         options,
+        quantization,
         non_expert,
         stream,
         weights_stream,
@@ -1281,6 +1286,7 @@ pub fn load_qwen35_expert_cache_model(
     model_dir: impl AsRef<Path>,
     non_expert: crate::NonExpertWeightResidency,
     options: ExpertCacheLoadOptions,
+    quantization: Option<WeightQuantization>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<QwenHybridLayerwiseModel, Error> {
@@ -1306,6 +1312,7 @@ pub fn load_qwen35_expert_cache_model(
         video_token_id,
         vision,
         options,
+        quantization,
         non_expert,
         stream,
         weights_stream,
@@ -1321,6 +1328,7 @@ fn load_qwen_hybrid_sparse_model(
     video_token_id: Option<i32>,
     vision_config: Option<VisionConfig>,
     options: ExpertCacheLoadOptions,
+    quantization: Option<WeightQuantization>,
     non_expert: impl Into<LayerWeightResidency>,
     stream: &Stream,
     weights_stream: &Stream,
@@ -1338,13 +1346,34 @@ fn load_qwen_hybrid_sparse_model(
         load_safetensors_layerwise_model(model_dir, adapter, non_expert, stream, weights_stream)?;
     let store = execution.checkpoint_store_arc();
     let entries = qwen_hybrid_expert_catalog(&args, store.as_ref())?;
-    execution.adapter_mut().expert_cache = Some(ExpertCache::new_shared(
-        store,
-        entries,
-        options,
-        weights_stream.clone(),
-        stream.clone(),
-    )?);
+    let quantize_on_load = quantization
+        .map(|requested| {
+            should_quantize_on_load(
+                "Qwen hybrid independent expert cache",
+                args.quantization,
+                requested,
+            )
+            .map(|required| required.then_some(requested))
+        })
+        .transpose()?
+        .flatten();
+    execution.adapter_mut().expert_cache = Some(match quantize_on_load {
+        Some(quantization) => ExpertCache::new_quantized_shared(
+            store,
+            entries,
+            options,
+            quantization,
+            weights_stream.clone(),
+            stream.clone(),
+        )?,
+        None => ExpertCache::new_shared(
+            store,
+            entries,
+            options,
+            weights_stream.clone(),
+            stream.clone(),
+        )?,
+    });
     Ok(QwenHybridLayerwiseModel { execution })
 }
 
@@ -3672,6 +3701,11 @@ impl ArchitectureAdapter for QwenHybridLayerwiseAdapter {
                                     let started = Instant::now();
                                     let mut compact_args = self.args.clone();
                                     compact_args.num_experts = acquired.identities().len() as i32;
+                                    if let Some(quantization) = expert_cache.weight_quantization() {
+                                        compact_args.quantization = Some(quantization);
+                                        compact_args.quantization_config = None;
+                                        compact_args.quantized_weight_configs = None;
+                                    }
                                     let mut bank = Experts::new(&compact_args, index, stream)?;
                                     bank.gate_up_proj = Param::new(
                                         acquired.compact_binding("gate_up_proj", stream).map_err(
@@ -4507,6 +4541,7 @@ mod tests {
                     OffloadConfig::new(None, None, 1).unwrap(),
                 )),
                 options,
+                None,
                 gpu.stream(),
                 cpu.stream(),
             )
@@ -4518,6 +4553,7 @@ mod tests {
                     OffloadConfig::new(None, None, 1).unwrap(),
                 )),
                 options,
+                None,
                 gpu.stream(),
                 cpu.stream(),
             )

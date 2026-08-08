@@ -429,11 +429,27 @@ impl StrictLoadReport {
         model: &M,
         config: &StrictLoadConfig,
     ) -> Result<(), Error> {
+        self.finish_excluding(model, config, |_| false)
+    }
+
+    /// Validates a partial strict load while leaving an independently managed
+    /// parameter class untouched.
+    pub(crate) fn finish_excluding<M, F>(
+        self,
+        model: &M,
+        config: &StrictLoadConfig,
+        excluded: F,
+    ) -> Result<(), Error>
+    where
+        M: ModuleParameters + ?Sized,
+        F: Fn(&str) -> bool,
+    {
         let mut missing = model
             .parameters()
             .flatten()
             .keys()
             .map(|key| key.to_string())
+            .filter(|key| !excluded(key))
             .filter(|key| !self.loaded.contains(key))
             .filter(|key| !config.is_missing_allowed(key))
             .collect::<Vec<_>>();

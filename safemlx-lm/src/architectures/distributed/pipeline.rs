@@ -70,7 +70,7 @@ use crate::{
     },
     runtime::checkpoint::binding::{
         binding_bytes, materialize_module_bindings, populate_module_from_arrays_excluding,
-        populate_module_from_dense_arrays_quantized, populate_module_from_lease,
+        populate_module_from_dense_arrays_quantized_excluding, populate_module_from_lease,
     },
     runtime::checkpoint::quantization::{quantize_tensor, WeightQuantization},
     runtime::checkpoint::store::{GgufWeightStore, WeightStore, WeightStoreDiagnostics},
@@ -91,7 +91,7 @@ use crate::{
     runtime::generation::sampler::Sampler,
     runtime::media::{PreparedModelInput, PreparedModelInputIdentity},
     runtime::residency::expert_cache::{
-        ExpertCache, ExpertCacheLoadOptions, ExpertCacheReport, ExpertPass,
+        ExpertCache, ExpertCacheLoadOptions, ExpertCacheReport, ExpertCatalogEntry, ExpertPass,
     },
     runtime::residency::manager::{
         OffloadUnit, ResidencyManager, ResidencyReport, ResidentLayerGroup,
@@ -109,6 +109,46 @@ use crate::{
 use crate::runtime::execution::layerwise::WeightResidency;
 
 use safemlx::ops::indexing::TryIndexOp;
+
+fn build_pipeline_expert_cache(
+    store: SharedWeightStore,
+    entries: Vec<ExpertCatalogEntry>,
+    options: Option<ExpertCacheLoadOptions>,
+    quantization: Option<WeightQuantization>,
+    weights_stream: &Stream,
+    stream: &Stream,
+) -> Result<ExpertCache, Error> {
+    Ok(match (options, quantization) {
+        (Some(options), Some(quantization)) => ExpertCache::new_quantized_shared(
+            store,
+            entries,
+            options,
+            quantization,
+            weights_stream.clone(),
+            stream.clone(),
+        )?,
+        (Some(options), None) => ExpertCache::new_shared(
+            store,
+            entries,
+            options,
+            weights_stream.clone(),
+            stream.clone(),
+        )?,
+        (None, Some(quantization)) => ExpertCache::new_quantized_resident_shared(
+            store,
+            entries,
+            quantization,
+            weights_stream.clone(),
+            stream.clone(),
+        )?,
+        (None, None) => ExpertCache::new_resident_shared(
+            store,
+            entries,
+            weights_stream.clone(),
+            stream.clone(),
+        )?,
+    })
+}
 
 /// Immutable, inspectable description of the local pipeline stage.
 #[derive(Debug, Clone)]
@@ -4887,18 +4927,13 @@ fn load_bound_module_excluding(
         .find(|value| value.dtype().is_float())
         .map(Array::dtype);
     if let Some(quantization) = quantize_on_load {
-        if module
-            .parameters()
-            .flatten()
-            .keys()
-            .any(|name| excluded(name))
-        {
-            return Err(Error::Quantization(
-                "pipeline load-time quantization cannot exclude independent expert parameters"
-                    .into(),
-            ));
-        }
-        populate_module_from_dense_arrays_quantized(module, &arrays, quantization, stream)?;
+        populate_module_from_dense_arrays_quantized_excluding(
+            module,
+            &arrays,
+            quantization,
+            stream,
+            excluded,
+        )?;
     } else {
         populate_module_from_arrays_excluding(module, &arrays, excluded)?;
     }
@@ -4974,6 +5009,7 @@ impl PipelineLoadAccumulator {
         module: &mut M,
         store: &dyn WeightStore,
         bindings: &[crate::runtime::residency::manager::WeightBinding],
+        quantize_on_load: Option<WeightQuantization>,
         weights_stream: &Stream,
         stream: &Stream,
         excluded: &dyn Fn(&str) -> bool,
@@ -4982,7 +5018,7 @@ impl PipelineLoadAccumulator {
             module,
             store,
             bindings,
-            None,
+            quantize_on_load,
             weights_stream,
             stream,
             excluded,
@@ -7213,12 +7249,6 @@ fn load_dense_qwen_pipeline(
                 .into(),
         ));
     }
-    if expert_cache_options.is_some() && quantize_on_load.is_some() {
-        return Err(Error::Quantization(
-            "load-time quantization is unsupported for independently cached pipeline experts; use checkpoint-native packed expert weights"
-                .into(),
-        ));
-    }
     let mut target_args = source_args.clone();
     if let Some(quantization) = quantize_on_load {
         target_args.quantization = Some(quantization);
@@ -7425,6 +7455,7 @@ fn load_dense_qwen_pipeline(
                     layer,
                     store.as_ref(),
                     &bindings,
+                    quantize_on_load,
                     weights_stream,
                     stream,
                     &|name| name.starts_with("mlp.experts."),
@@ -7502,12 +7533,13 @@ fn load_dense_qwen_pipeline(
             })
         })
         .collect::<Vec<_>>();
-        let cache = ExpertCache::new_shared(
+        let cache = build_pipeline_expert_cache(
             Arc::clone(&store),
             entries,
-            options,
-            weights_stream.clone(),
-            stream.clone(),
+            Some(options),
+            quantize_on_load,
+            weights_stream,
+            stream,
         )?;
         let owned_expert_bytes = cache.report()?.owned_bytes;
         info.planned_owned_parameter_bytes = info
@@ -7571,12 +7603,6 @@ fn load_qwen3_vl_pipeline(
     if dense_stream.is_some() && quantize_on_load.is_some() {
         return Err(Error::Quantization(
             "load-time quantization is unsupported for non-resident Qwen3-VL pipeline layers; use checkpoint-native packed weights"
-                .into(),
-        ));
-    }
-    if expert_cache_options.is_some() && quantize_on_load.is_some() {
-        return Err(Error::Quantization(
-            "load-time quantization is unsupported for independently cached Qwen3-VL pipeline experts; use checkpoint-native packed expert weights"
                 .into(),
         ));
     }
@@ -7827,6 +7853,7 @@ fn load_qwen3_vl_pipeline(
                     layer,
                     store.as_ref(),
                     &bindings,
+                    quantize_on_load,
                     weights_stream,
                     stream,
                     &|name| name.starts_with("mlp.experts."),
@@ -7905,12 +7932,13 @@ fn load_qwen3_vl_pipeline(
             })
         })
         .collect::<Vec<_>>();
-        let cache = ExpertCache::new_shared(
+        let cache = build_pipeline_expert_cache(
             Arc::clone(&store),
             entries,
-            options,
-            weights_stream.clone(),
-            stream.clone(),
+            Some(options),
+            quantize_on_load,
+            weights_stream,
+            stream,
         )?;
         let owned_expert_bytes = cache.report()?.owned_bytes;
         info.planned_owned_parameter_bytes = info
@@ -9024,12 +9052,6 @@ fn load_gpt_oss_pipeline(
                 .into(),
         ));
     }
-    if expert_cache_options.is_some() && quantize_on_load.is_some() {
-        return Err(Error::Quantization(
-            "load-time quantization is unsupported for independently cached GPT-OSS pipeline experts; use checkpoint-native MXFP4 weights"
-                .into(),
-        ));
-    }
     let mut target_args = source_args.clone();
     if let Some(quantization) = quantize_on_load {
         target_args.quantization = Some(quantization);
@@ -9201,6 +9223,7 @@ fn load_gpt_oss_pipeline(
                     layer,
                     store.as_ref(),
                     &bindings,
+                    quantize_on_load,
                     weights_stream,
                     stream,
                     &|name| name.starts_with("mlp.experts."),
@@ -9279,12 +9302,13 @@ fn load_gpt_oss_pipeline(
             })
         })
         .collect::<Vec<_>>();
-        let cache = ExpertCache::new_shared(
+        let cache = build_pipeline_expert_cache(
             Arc::clone(&store),
             entries,
-            options,
-            weights_stream.clone(),
-            stream.clone(),
+            Some(options),
+            quantize_on_load,
+            weights_stream,
+            stream,
         )?;
         info.planned_owned_parameter_bytes = info
             .planned_owned_parameter_bytes
@@ -9955,12 +9979,6 @@ fn load_lfm2_pipeline(
                 .into(),
         ));
     }
-    if expert_cache_options.is_some() && quantize_on_load.is_some() {
-        return Err(Error::Quantization(
-            "load-time quantization is unsupported for independently cached LFM2 pipeline experts; use checkpoint-native packed weights"
-                .into(),
-        ));
-    }
     let mut target_args = source_args.clone();
     if let Some(quantization) = quantize_on_load {
         target_args.weight_quantization = Some(quantization);
@@ -10205,6 +10223,7 @@ fn load_lfm2_pipeline(
                     layer,
                     store.as_ref(),
                     &bindings,
+                    quantize_on_load,
                     weights_stream,
                     stream,
                     &|name| name.starts_with("feed_forward.experts."),
@@ -10283,12 +10302,13 @@ fn load_lfm2_pipeline(
         })
         .collect::<Vec<_>>();
         if !entries.is_empty() {
-            let cache = ExpertCache::new_shared(
+            let cache = build_pipeline_expert_cache(
                 Arc::clone(&store),
                 entries,
-                options,
-                weights_stream.clone(),
-                stream.clone(),
+                Some(options),
+                quantize_on_load,
+                weights_stream,
+                stream,
             )?;
             info.planned_owned_parameter_bytes = info
                 .planned_owned_parameter_bytes
@@ -11459,12 +11479,6 @@ fn load_nemotron_h_pipeline(
                 .into(),
         ));
     }
-    if expert_cache_options.is_some() && quantize_on_load.is_some() {
-        return Err(Error::Quantization(
-            "load-time quantization is unsupported for independently cached Nemotron-H pipeline experts; use checkpoint-native packed weights"
-                .into(),
-        ));
-    }
     let mut target_args = source_args.clone();
     if let Some(affine) = quantize_on_load {
         target_args.quantization = Some(affine);
@@ -11681,6 +11695,7 @@ fn load_nemotron_h_pipeline(
                     layer,
                     store.as_ref(),
                     &bindings,
+                    requested,
                     weights_stream,
                     stream,
                     &|name| name.starts_with("moe.experts."),
@@ -11759,12 +11774,13 @@ fn load_nemotron_h_pipeline(
             })
             .collect::<Vec<_>>();
         if !entries.is_empty() {
-            let cache = ExpertCache::new_shared(
+            let cache = build_pipeline_expert_cache(
                 Arc::clone(&store),
                 entries,
-                options,
-                weights_stream.clone(),
-                stream.clone(),
+                Some(options),
+                quantize_on_load.map(WeightQuantization::Affine),
+                weights_stream,
+                stream,
             )?;
             info.planned_owned_parameter_bytes = info
                 .planned_owned_parameter_bytes
@@ -12688,7 +12704,7 @@ fn load_qwen_hybrid_pipeline(
         })
         .transpose()?
         .flatten();
-    if (dense_stream.is_some() || expert_cache_options.is_some()) && quantize_on_load.is_some() {
+    if dense_stream.is_some() && quantize_on_load.is_some() {
         return Err(Error::Quantization(
             "load-time quantization is unsupported for non-resident Qwen hybrid pipeline weights; use checkpoint-native packed weights"
                 .into(),
@@ -12982,6 +12998,7 @@ fn load_qwen_hybrid_pipeline(
                     layer,
                     store.as_ref(),
                     &bindings,
+                    quantize_on_load,
                     weights_stream,
                     stream,
                     &|name| name.starts_with("mlp.experts."),
@@ -13089,12 +13106,13 @@ fn load_qwen_hybrid_pipeline(
             })
             .collect::<Vec<_>>();
         if !entries.is_empty() {
-            let cache = ExpertCache::new_shared(
+            let cache = build_pipeline_expert_cache(
                 Arc::clone(&store),
                 entries,
-                options,
-                weights_stream.clone(),
-                stream.clone(),
+                Some(options),
+                quantize_on_load,
+                weights_stream,
+                stream,
             )?;
             info.planned_owned_parameter_bytes = info
                 .planned_owned_parameter_bytes
@@ -14081,7 +14099,7 @@ fn load_kimi_linear_pipeline(
         })
         .transpose()?
         .flatten();
-    if (dense_stream.is_some() || expert_cache_options.is_some()) && quantize_on_load.is_some() {
+    if dense_stream.is_some() && quantize_on_load.is_some() {
         return Err(Error::Quantization(
             "load-time quantization is unsupported for non-resident Kimi Linear pipeline layers; use checkpoint-native packed weights"
                 .into(),
@@ -14318,6 +14336,7 @@ fn load_kimi_linear_pipeline(
                     layer,
                     store.as_ref(),
                     &bindings,
+                    quantize_on_load,
                     weights_stream,
                     stream,
                     &|name| name.starts_with("mlp.experts."),
@@ -14397,12 +14416,13 @@ fn load_kimi_linear_pipeline(
         })
         .collect::<Vec<_>>();
         if !entries.is_empty() {
-            let cache = ExpertCache::new_shared(
+            let cache = build_pipeline_expert_cache(
                 Arc::clone(&store),
                 entries,
-                options,
-                weights_stream.clone(),
-                stream.clone(),
+                Some(options),
+                quantize_on_load,
+                weights_stream,
+                stream,
             )?;
             info.planned_owned_parameter_bytes = info
                 .planned_owned_parameter_bytes
@@ -15401,6 +15421,7 @@ fn load_inkling_pipeline(
                     layer,
                     store.as_ref(),
                     &bindings,
+                    None,
                     weights_stream,
                     stream,
                     &|name| name.starts_with("moe.experts."),
@@ -15508,12 +15529,13 @@ fn load_inkling_pipeline(
         })
         .collect::<Vec<_>>();
         if !entries.is_empty() {
-            let cache = ExpertCache::new_shared(
+            let cache = build_pipeline_expert_cache(
                 Arc::clone(&store),
                 entries,
-                options,
-                weights_stream.clone(),
-                stream.clone(),
+                Some(options),
+                None,
+                weights_stream,
+                stream,
             )?;
             info.planned_owned_parameter_bytes = info
                 .planned_owned_parameter_bytes
@@ -16433,12 +16455,6 @@ fn load_gemma_pipeline(
         })
         .transpose()?
         .flatten();
-    if external_experts && quantize_on_load.is_some() {
-        return Err(Error::Quantization(
-            "load-time expert requantization is unsupported for Gemma 4 Cartesian execution; use checkpoint-native packed expert weights"
-                .into(),
-        ));
-    }
     if dense_stream.is_some() && quantize_on_load.is_some() {
         return Err(Error::Quantization(
             "load-time quantization is unsupported for non-resident Gemma pipeline layers; use checkpoint-native packed weights"
@@ -16956,6 +16972,7 @@ fn load_gemma_pipeline(
                     layer,
                     store.as_ref(),
                     &bindings,
+                    quantize_on_load,
                     weights_stream,
                     stream,
                     &|name| name.starts_with("experts."),
@@ -17063,21 +17080,14 @@ fn load_gemma_pipeline(
         .into_iter()
         .filter(|entry| assignment.owner(entry.identity().global_expert) == Some(assignment.rank()))
         .collect::<Vec<_>>();
-        let cache = match expert_cache_options {
-            Some(options) => ExpertCache::new_shared(
-                Arc::clone(&store),
-                entries,
-                options,
-                weights_stream.clone(),
-                stream.clone(),
-            )?,
-            None => ExpertCache::new_resident_shared(
-                Arc::clone(&store),
-                entries,
-                weights_stream.clone(),
-                stream.clone(),
-            )?,
-        };
+        let cache = build_pipeline_expert_cache(
+            Arc::clone(&store),
+            entries,
+            expert_cache_options,
+            quantize_on_load,
+            weights_stream,
+            stream,
+        )?;
         let owned = cache.report()?.owned_bytes;
         info.planned_owned_parameter_bytes = info
             .planned_owned_parameter_bytes
@@ -17994,6 +18004,7 @@ fn load_deepseek_pipeline(
                     layer,
                     store.as_ref(),
                     &bindings,
+                    quantize_on_load,
                     weights_stream,
                     stream,
                     &|name| name.starts_with("mlp.experts."),
@@ -18074,12 +18085,13 @@ fn load_deepseek_pipeline(
         })
         .collect::<Vec<_>>();
         if !entries.is_empty() {
-            let cache = ExpertCache::new_shared(
+            let cache = build_pipeline_expert_cache(
                 Arc::clone(&store),
                 entries,
-                options,
-                weights_stream.clone(),
-                stream.clone(),
+                Some(options),
+                quantize_on_load,
+                weights_stream,
+                stream,
             )?;
             info.planned_owned_parameter_bytes = info
                 .planned_owned_parameter_bytes
@@ -21384,6 +21396,58 @@ mod tests {
             .all_close(&expected[0], Some(2e-3), Some(2e-3), None, stream)
             .unwrap()
             .item::<bool>(stream));
+    }
+
+    #[test]
+    fn qwen3_moe_triple_axis_requantizes_rank_local_cached_experts() {
+        let gpu = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
+        let cpu = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        let stream = gpu.stream();
+        let mut config = dense_qwen_config("qwen3_moe", false);
+        // Keep every TP-local input partition aligned to the minimum affine
+        // packing group so this fixture exercises execution, not rejection.
+        config["hidden_size"] = serde_json::json!(64);
+        config["num_attention_heads"] = serde_json::json!(8);
+        config["num_key_value_heads"] = serde_json::json!(4);
+        config["vocab_size"] = serde_json::json!(64);
+        config["moe_intermediate_size"] = serde_json::json!(64);
+        let args = dense_qwen::config_from_hf_value(&config).unwrap();
+        let mut source = dense_qwen::Model::new(args, stream).unwrap();
+        initialize_parameters(&mut source, stream);
+        let dir = tempfile::tempdir().unwrap();
+        write_parameter_fixture(dir.path(), &config, &source);
+        let affine: WeightQuantization =
+            crate::runtime::checkpoint::quantization::AffineQuantization::new(32, 4)
+                .unwrap()
+                .into();
+
+        for rank in 0..8 {
+            let topology = tp_pp_ep_gpu_topology(rank);
+            let residency = WeightResidency::with_expert_cache(
+                crate::NonExpertWeightResidency::FullyResident,
+                crate::runtime::residency::expert_cache::ExpertCacheLoadOptions::default(),
+            );
+            let loaded = load_pipeline_model_with_options(
+                dir.path(),
+                ModelLoadOptions::with_quantization(affine)
+                    .with_parallel_topology(topology)
+                    .with_weight_residency(residency),
+                stream,
+                cpu.stream(),
+            )
+            .unwrap();
+            let info = loaded.stage_info();
+            assert_eq!(info.topology, topology);
+            assert_eq!(info.local_expert_ids.len(), 2);
+            let report = loaded.expert_cache_report().unwrap().unwrap();
+            assert_eq!(report.owned_experts, 2);
+            assert!(report.owned_bytes > 0);
+            let materialization = report.materialization.unwrap();
+            assert_eq!(materialization.transformed_weights, 4);
+            assert!(materialization.source_tiles > 0);
+            assert!(materialization.source_bytes_read > materialization.output_bytes);
+            assert!(materialization.peak_planned_working_set_bytes <= materialization.output_bytes);
+        }
     }
 
     fn llama_args(tied: bool) -> llama::ModelArgs {

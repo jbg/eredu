@@ -51,8 +51,11 @@ use crate::{
         build_module_bindings, build_module_bindings_excluding, build_module_bindings_with_recipes,
         populate_module_from_lease, populate_module_from_lease_excluding,
     },
-    runtime::checkpoint::recipe::DerivedWeightRecipe,
     runtime::checkpoint::store::{GgufWeightStore, TensorSelection, WeightStore},
+    runtime::checkpoint::{
+        quantization::{should_quantize_on_load, WeightQuantization},
+        recipe::DerivedWeightRecipe,
+    },
     runtime::distributed::parallel::{
         aligned_partition_units, array_parameter_member, register_replicated_module,
         MemberSharding, ParallelPlanBuilder, ParameterGroupSpec, ParameterRole,
@@ -979,6 +982,7 @@ pub fn load_qwen3_expert_cache_model(
     model_dir: impl AsRef<Path>,
     non_expert: crate::NonExpertWeightResidency,
     options: ExpertCacheLoadOptions,
+    quantization: Option<WeightQuantization>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<LayerwiseDecoder, Error> {
@@ -994,13 +998,34 @@ pub fn load_qwen3_expert_cache_model(
         load_safetensors_layerwise_model(model_dir, adapter, non_expert, stream, weights_stream)?;
     let store = execution.checkpoint_store_arc();
     let entries = qwen3_expert_catalog(&args, store.as_ref())?;
-    let cache = ExpertCache::new_shared(
-        store,
-        entries,
-        options,
-        weights_stream.clone(),
-        stream.clone(),
-    )?;
+    let quantize_on_load = quantization
+        .map(|requested| {
+            should_quantize_on_load(
+                "Qwen3 independent expert cache",
+                args.weight_quantization(),
+                requested,
+            )
+            .map(|required| required.then_some(requested))
+        })
+        .transpose()?
+        .flatten();
+    let cache = match quantize_on_load {
+        Some(quantization) => ExpertCache::new_quantized_shared(
+            store,
+            entries,
+            options,
+            quantization,
+            weights_stream.clone(),
+            stream.clone(),
+        )?,
+        None => ExpertCache::new_shared(
+            store,
+            entries,
+            options,
+            weights_stream.clone(),
+            stream.clone(),
+        )?,
+    };
     execution.adapter_mut().expert_cache = Some(cache);
     Ok(LayerwiseDecoder { execution })
 }
@@ -2098,14 +2123,20 @@ impl DenseQwenLayerwiseAdapter {
                                 }
                                 let started = Instant::now();
                                 let prefix = format!("model.layers.{index}.mlp.experts");
+                                let load_time = expert_cache.weight_quantization();
                                 let mut bank = resident::Experts::new(
                                     acquired.identities().len() as i32,
                                     self.args.hidden_size,
                                     self.args.moe_intermediate_size,
-                                    self.args
-                                        .weight_quantization_for(&format!("{prefix}.gate_up_proj")),
-                                    self.args
-                                        .weight_quantization_for(&format!("{prefix}.down_proj")),
+                                    load_time.or_else(|| {
+                                        self.args.weight_quantization_for(&format!(
+                                            "{prefix}.gate_up_proj"
+                                        ))
+                                    }),
+                                    load_time.or_else(|| {
+                                        self.args
+                                            .weight_quantization_for(&format!("{prefix}.down_proj"))
+                                    }),
                                     stream,
                                 )?;
                                 bank.gate_up_proj = Param::new(
@@ -3135,6 +3166,7 @@ mod tests {
             dir.path(),
             crate::NonExpertWeightResidency::DenseDiskStream(dense),
             expert_options,
+            None,
             gpu.stream(),
             cpu.stream(),
         )
@@ -3198,6 +3230,7 @@ mod tests {
             dir.path(),
             crate::NonExpertWeightResidency::LayerwiseHost(non_expert),
             expert_options,
+            None,
             gpu.stream(),
             cpu.stream(),
         )

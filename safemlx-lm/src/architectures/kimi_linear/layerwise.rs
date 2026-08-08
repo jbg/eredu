@@ -36,6 +36,7 @@ use crate::{
                 build_module_bindings_with_recipes, canonical_checkpoint_name,
                 populate_module_from_lease, populate_module_from_lease_excluding,
             },
+            quantization::{should_quantize_on_load, WeightQuantization},
             recipe::DerivedWeightRecipe,
             store::{GgufWeightStore, TensorSelection, WeightStore, WeightStoreBackend},
         },
@@ -811,6 +812,7 @@ pub fn load_kimi_linear_expert_cache_model(
     model_dir: impl AsRef<Path>,
     non_expert: crate::NonExpertWeightResidency,
     options: ExpertCacheLoadOptions,
+    quantization: Option<WeightQuantization>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<KimiLinearLayerwiseModel, Error> {
@@ -828,13 +830,34 @@ pub fn load_kimi_linear_expert_cache_model(
         load_safetensors_layerwise_model(model_dir, adapter, non_expert, stream, weights_stream)?;
     let store = execution.checkpoint_store_arc();
     let entries = kimi_expert_catalog(&args, store.as_ref())?;
-    execution.adapter_mut().expert_cache = Some(ExpertCache::new_shared(
-        store,
-        entries,
-        options,
-        weights_stream.clone(),
-        stream.clone(),
-    )?);
+    let quantize_on_load = quantization
+        .map(|requested| {
+            should_quantize_on_load(
+                "Kimi Linear independent expert cache",
+                args.quantization,
+                requested,
+            )
+            .map(|required| required.then_some(requested))
+        })
+        .transpose()?
+        .flatten();
+    execution.adapter_mut().expert_cache = Some(match quantize_on_load {
+        Some(quantization) => ExpertCache::new_quantized_shared(
+            store,
+            entries,
+            options,
+            quantization,
+            weights_stream.clone(),
+            stream.clone(),
+        )?,
+        None => ExpertCache::new_shared(
+            store,
+            entries,
+            options,
+            weights_stream.clone(),
+            stream.clone(),
+        )?,
+    });
     Ok(KimiLinearLayerwiseModel { execution })
 }
 
@@ -1756,12 +1779,17 @@ impl ArchitectureAdapter for KimiLinearLayerwiseAdapter {
                             stream,
                             |flat, acquired, weights, stream| {
                                 let started = Instant::now();
-                                let gate_up_quantization = self.args.weight_quantization_for(
-                                    &format!("model.layers.{index}.mlp.experts.gate_up_proj"),
-                                );
-                                let down_quantization = self.args.weight_quantization_for(
-                                    &format!("model.layers.{index}.mlp.experts.down_proj"),
-                                );
+                                let load_time = expert_cache.weight_quantization();
+                                let gate_up_quantization = load_time.or_else(|| {
+                                    self.args.weight_quantization_for(&format!(
+                                        "model.layers.{index}.mlp.experts.gate_up_proj"
+                                    ))
+                                });
+                                let down_quantization = load_time.or_else(|| {
+                                    self.args.weight_quantization_for(&format!(
+                                        "model.layers.{index}.mlp.experts.down_proj"
+                                    ))
+                                });
                                 let mut bank = crate::nn::moe::PackedSwiGluExperts::new(
                                     acquired.identities().len() as i32,
                                     self.args.hidden_size,
@@ -2662,6 +2690,7 @@ mod tests {
                 OffloadConfig::new(None, None, 1).unwrap(),
             )),
             options,
+            None,
             gpu.stream(),
             cpu.stream(),
         )

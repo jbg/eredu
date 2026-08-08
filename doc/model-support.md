@@ -468,7 +468,12 @@ GGUF, with fully resident or dense disk-streamed local layers,
 ordinary/paged/persisted caches,
 and rank-synchronized generation. Qwen3 MoE routed experts are materialized
 from the same direct or derived binding plan as bounded execution; no
-MoE-specific pipeline decoder exists.
+MoE-specific pipeline decoder exists. Independent expert caches and
+TP+PP+EP pass their stage-, EP-, and TP-local semantic recipes to the shared
+bounded affine/MXFP4 materializer. SafeTensors expert ownership and projection
+ranges collapse to bounded contiguous spans, conversion scratch is capped by
+the final packed local catalog, and expert-cache telemetry reports the exact
+selected and written bytes.
 
 GPT-OSS uses the same architecture-neutral
 `LayerSchedule<AttentionPolicy>` representation. Hugging Face `layer_types`

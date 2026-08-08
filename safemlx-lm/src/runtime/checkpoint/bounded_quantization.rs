@@ -80,6 +80,20 @@ impl BoundedQuantizationTarget {
     pub fn source(&self) -> &DerivedWeightRecipe {
         &self.source
     }
+
+    /// Returns the packed scale tensor name derived from this target.
+    pub fn scales_name(&self) -> String {
+        companion_names(&self.weight_name)
+            .expect("validated bounded target")
+            .0
+    }
+
+    /// Returns the packed affine-bias tensor name derived from this target.
+    pub fn biases_name(&self) -> String {
+        companion_names(&self.weight_name)
+            .expect("validated bounded target")
+            .1
+    }
 }
 
 /// A validated collection of out-of-core weight transformations.
@@ -425,15 +439,40 @@ fn transform_target(
             target.weight_name, one_row_peak, plan.max_working_set_bytes
         )));
     }
-    let rows_per_tile = usize::try_from(plan.max_working_set_bytes / one_row_peak)
-        .unwrap_or(usize::MAX)
-        .clamp(1, rows);
-
     let payload_offset = create_shard(path, &layouts)?;
     let mut file = OpenOptions::new().write(true).open(path)?;
     let mut start = 0usize;
     while start < rows {
-        let end = start.saturating_add(rows_per_tile).min(rows);
+        // TP segmented placements can have discontinuities in their compact
+        // row space. Admit each tile at its actual start so no tile crosses a
+        // semantic segment boundary with a larger peak than the first tile.
+        let mut end = start + 1;
+        let mut rejected_end = rows.saturating_add(1);
+        while end + 1 < rejected_end {
+            let candidate_end = end + (rejected_end - end) / 2;
+            let candidate = target.source.select_bounded(
+                source,
+                TensorSelection::Range {
+                    axis: row_axis,
+                    start,
+                    end: candidate_end,
+                },
+            )?;
+            candidate.preflight_bounded(source)?;
+            let candidate_rows = candidate_end - start;
+            let output_bytes = output_row_bytes
+                .checked_mul(candidate_rows as u64)
+                .ok_or_else(|| quantization_error("candidate tile output size overflow"))?;
+            let peak = candidate
+                .peak_materialization_bytes(source)?
+                .checked_add(output_bytes)
+                .ok_or_else(|| quantization_error("candidate tile working-set overflow"))?;
+            if peak <= plan.max_working_set_bytes {
+                end = candidate_end;
+            } else {
+                rejected_end = candidate_end;
+            }
+        }
         let tile_rows = end - start;
         let tile_recipe = target.source.select_bounded(
             source,
@@ -979,6 +1018,60 @@ mod tests {
         let expected =
             quantize_tensor(&dense, AffineQuantization::default(), context.stream()).unwrap();
         let actual = materialize(&transformed, "local.expert.weight", context.stream());
+        assert_eq!(
+            actual.evaluated().unwrap().as_slice::<u32>(),
+            expected.weight.evaluated().unwrap().as_slice::<u32>()
+        );
+    }
+
+    #[test]
+    fn expert_ownership_and_tp_row_tile_compose_into_bounded_reads() {
+        let directory = tempfile::tempdir().unwrap();
+        let values = matrix_values(2, 4, 64);
+        let bytes = float_bytes(&values);
+        serialize_to_file(
+            [(
+                "checkpoint.experts.weight",
+                TensorView::new(SafeDtype::F32, vec![2, 4, 64], &bytes).unwrap(),
+            )],
+            None,
+            &directory.path().join("model.safetensors"),
+        )
+        .unwrap();
+        let source = Arc::new(SafetensorsWeightStore::open(directory.path()).unwrap());
+        let context = cpu_context();
+        let recipe = DerivedWeightRecipe::Select {
+            input: Box::new(DerivedWeightRecipe::source(
+                "checkpoint.experts.weight",
+                TensorSelection::Range {
+                    axis: 0,
+                    start: 1,
+                    end: 2,
+                },
+            )),
+            selection: TensorSelection::Range {
+                axis: 1,
+                start: 1,
+                end: 3,
+            },
+        };
+        let target = BoundedQuantizationTarget::from_recipe("rank.expert.weight", recipe).unwrap();
+        let plan =
+            BoundedQuantizationPlan::new(AffineQuantization::default(), 296, [target]).unwrap();
+        let transformed =
+            BoundedQuantizedWeightStore::create(source, plan, context.stream()).unwrap();
+
+        assert_eq!(transformed.report().source_tiles, 2);
+        assert_eq!(transformed.report().source_bytes_read, 512);
+        assert_eq!(transformed.report().output_bytes, 80);
+        assert_eq!(transformed.report().peak_planned_working_set_bytes, 296);
+
+        let selected = &values[(4 + 1) * 64..(4 + 3) * 64];
+        let dense = Array::from_slice(selected, &[1, 2, 64]);
+        let expected =
+            quantize_tensor(&dense, AffineQuantization::default(), context.stream()).unwrap();
+        let actual = materialize(&transformed, "rank.expert.weight", context.stream());
+        assert_eq!(actual.shape(), &[1, 2, 8]);
         assert_eq!(
             actual.evaluated().unwrap().as_slice::<u32>(),
             expected.weight.evaluated().unwrap().as_slice::<u32>()

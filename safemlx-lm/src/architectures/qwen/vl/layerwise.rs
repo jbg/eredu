@@ -54,8 +54,11 @@ use crate::{
         build_module_bindings, build_module_bindings_with_recipes, populate_module_from_lease,
         populate_module_from_lease_excluding,
     },
-    runtime::checkpoint::recipe::DerivedWeightRecipe,
     runtime::checkpoint::store::{GgufWeightStore, TensorSelection, WeightStore},
+    runtime::checkpoint::{
+        quantization::{should_quantize_on_load, WeightQuantization},
+        recipe::DerivedWeightRecipe,
+    },
     runtime::execution::layerwise::{
         load_layerwise_model, load_safetensors_layerwise_model,
         load_tensor_parallel_layerwise_model, open_safetensors_weight_store,
@@ -669,6 +672,7 @@ pub fn load_qwen3_vl_expert_cache_model(
     model_dir: impl AsRef<Path>,
     non_expert: crate::NonExpertWeightResidency,
     options: ExpertCacheLoadOptions,
+    quantization: Option<WeightQuantization>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<Qwen3VlLayerwiseModel, Error> {
@@ -695,13 +699,34 @@ pub fn load_qwen3_vl_expert_cache_model(
         store.as_ref(),
         "model.language_model.layers",
     )?;
-    execution.adapter_mut().expert_cache = Some(ExpertCache::new_shared(
-        store,
-        entries,
-        options,
-        weights_stream.clone(),
-        stream.clone(),
-    )?);
+    let quantize_on_load = quantization
+        .map(|requested| {
+            should_quantize_on_load(
+                "Qwen3-VL independent expert cache",
+                args.text_config.weight_quantization(),
+                requested,
+            )
+            .map(|required| required.then_some(requested))
+        })
+        .transpose()?
+        .flatten();
+    execution.adapter_mut().expert_cache = Some(match quantize_on_load {
+        Some(quantization) => ExpertCache::new_quantized_shared(
+            store,
+            entries,
+            options,
+            quantization,
+            weights_stream.clone(),
+            stream.clone(),
+        )?,
+        None => ExpertCache::new_shared(
+            store,
+            entries,
+            options,
+            weights_stream.clone(),
+            stream.clone(),
+        )?,
+    });
     Ok(Qwen3VlLayerwiseModel { execution })
 }
 
@@ -1883,16 +1908,21 @@ impl ArchitectureAdapter for Qwen3VlLayerwiseAdapter {
                                             "model.language_model.layers.{index}.mlp.experts"
                                         );
                                         let args = &self.args.text_config;
+                                        let load_time = expert_cache.weight_quantization();
                                         let mut bank = QwenExperts::new(
                                             acquired.identities().len() as i32,
                                             args.hidden_size,
                                             args.moe_intermediate_size,
-                                            args.weight_quantization_for(&format!(
-                                                "{prefix}.gate_up_proj"
-                                            )),
-                                            args.weight_quantization_for(&format!(
-                                                "{prefix}.down_proj"
-                                            )),
+                                            load_time.or_else(|| {
+                                                args.weight_quantization_for(&format!(
+                                                    "{prefix}.gate_up_proj"
+                                                ))
+                                            }),
+                                            load_time.or_else(|| {
+                                                args.weight_quantization_for(&format!(
+                                                    "{prefix}.down_proj"
+                                                ))
+                                            }),
                                             stream,
                                         )?;
                                         bank.gate_up_proj = Param::new(
@@ -2732,6 +2762,7 @@ mod tests {
                 OffloadConfig::new(None, None, 1).unwrap(),
             )),
             options,
+            None,
             gpu.stream(),
             cpu.stream(),
         )

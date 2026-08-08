@@ -518,6 +518,32 @@ impl DerivedWeightRecipe {
                             stream,
                         )?)
                     }
+                    TensorSelection::Contiguous {
+                        offset_elements,
+                        shape,
+                    } => {
+                        let elements = shape.iter().try_fold(1usize, |count, dimension| {
+                            count.checked_mul(*dimension).ok_or(
+                                WeightRecipeError::ArithmeticOverflow(
+                                    "contiguous recipe selection size",
+                                ),
+                            )
+                        })?;
+                        let indices = (*offset_elements..offset_elements + elements)
+                            .map(|index| usize_to_i32(index, "contiguous selection index"))
+                            .collect::<Result<Vec<_>, _>>()?;
+                        let flattened = array.reshape(&[-1], stream)?;
+                        let selected = flattened.take_axis(
+                            Array::from_slice(&indices, &[indices.len() as i32]),
+                            0,
+                            stream,
+                        )?;
+                        let shape = shape
+                            .iter()
+                            .map(|dimension| usize_to_i32(*dimension, "contiguous selection shape"))
+                            .collect::<Result<Vec<_>, _>>()?;
+                        Ok(selected.reshape(&shape, stream)?)
+                    }
                 }
             }
             Self::Concatenate { axis, inputs } => {
@@ -604,7 +630,7 @@ fn push_selection(
         } => {
             let source_shape = store.metadata(key)?.shape;
             let source_selection = normalize_selection(source_selection.clone(), &source_shape)?;
-            let selected_source_shape = selected_shape(source_shape, &source_selection)?;
+            let selected_source_shape = selected_shape(source_shape.clone(), &source_selection)?;
             let selection = normalize_selection(selection, &selected_source_shape)?;
             if matches!(selection, TensorSelection::Full) {
                 return Ok(DerivedWeightRecipe::source(key.clone(), source_selection));
@@ -612,11 +638,19 @@ fn push_selection(
             if matches!(source_selection, TensorSelection::Full) {
                 return Ok(DerivedWeightRecipe::source(key.clone(), selection));
             }
+            if let Some(selection) = select_from_contiguous_span(&source_selection, &selection)? {
+                return Ok(DerivedWeightRecipe::source(key.clone(), selection));
+            }
             if selection_axis(&source_selection) == selection_axis(&selection) {
                 return Ok(DerivedWeightRecipe::source(
                     key.clone(),
                     compose_same_axis_selection(&source_selection, &selection)?,
                 ));
+            }
+            if let Some(contiguous) =
+                combine_independent_ranges(&source_shape, &source_selection, &selection)?
+            {
+                return Ok(DerivedWeightRecipe::source(key.clone(), contiguous));
             }
             Ok(DerivedWeightRecipe::Select {
                 input: Box::new(DerivedWeightRecipe::source(key.clone(), source_selection)),
@@ -630,18 +664,6 @@ fn push_selection(
             if matches!(existing, TensorSelection::Full) {
                 return push_selection(input, store, selection);
             }
-            if select_chain_has_bounded_source(recipe) {
-                if selection_axis(existing) == selection_axis(&selection) {
-                    return Ok(DerivedWeightRecipe::Select {
-                        input: input.clone(),
-                        selection: compose_same_axis_selection(existing, &selection)?,
-                    });
-                }
-                return Ok(DerivedWeightRecipe::Select {
-                    input: Box::new(recipe.clone()),
-                    selection,
-                });
-            }
             if selection_axis(existing) == selection_axis(&selection) {
                 return push_selection(
                     input,
@@ -649,8 +671,10 @@ fn push_selection(
                     compose_same_axis_selection(existing, &selection)?,
                 );
             }
-            // Independent axis selections commute. Push the new selection
-            // first, then push the pre-existing selection through that result.
+            // Independent axis selections commute. Push the newest selection
+            // toward the source first so a dynamic row tile can combine with
+            // an expert range into one contiguous checkpoint span before the
+            // pre-existing TP column selection is reapplied.
             let selected_input = push_selection(input, store, selection)?;
             push_selection(&selected_input, store, existing.clone())
         }
@@ -810,6 +834,12 @@ fn push_concatenate_selection(
             }
         }
         TensorSelection::Full => unreachable!(),
+        TensorSelection::Contiguous { .. } => {
+            return Err(WeightRecipeError::SelectionPushdownUnsupported {
+                operation: "concatenate",
+                reason: "a storage-contiguous span has no concatenate-axis semantics".into(),
+            })
+        }
     }
     match rewritten.len() {
         0 => Err(WeightRecipeError::SelectionPushdownUnsupported {
@@ -839,6 +869,12 @@ fn push_stack_selection(
                 .map(|index| inputs[index].clone())
                 .collect(),
             TensorSelection::Full => unreachable!(),
+            TensorSelection::Contiguous { .. } => {
+                return Err(WeightRecipeError::SelectionPushdownUnsupported {
+                    operation: "stack",
+                    reason: "a storage-contiguous span has no stack-axis semantics".into(),
+                })
+            }
         };
         return Ok(DerivedWeightRecipe::Stack {
             axis,
@@ -958,6 +994,7 @@ fn map_selection_units(
             }))
         }
         TensorSelection::Full => Ok(Some(TensorSelection::Full)),
+        TensorSelection::Contiguous { .. } => Ok(None),
     }
 }
 
@@ -979,16 +1016,7 @@ fn selection_axis(selection: &TensorSelection) -> Option<usize> {
     match selection {
         TensorSelection::Full => None,
         TensorSelection::Range { axis, .. } | TensorSelection::Indices { axis, .. } => Some(*axis),
-    }
-}
-
-fn select_chain_has_bounded_source(recipe: &DerivedWeightRecipe) -> bool {
-    match recipe {
-        DerivedWeightRecipe::Source { selection, .. } => {
-            !matches!(selection, TensorSelection::Full)
-        }
-        DerivedWeightRecipe::Select { input, .. } => select_chain_has_bounded_source(input),
-        _ => false,
+        TensorSelection::Contiguous { .. } => None,
     }
 }
 
@@ -997,6 +1025,7 @@ fn selection_with_axis(selection: TensorSelection, axis: usize) -> TensorSelecti
         TensorSelection::Full => TensorSelection::Full,
         TensorSelection::Range { start, end, .. } => TensorSelection::Range { axis, start, end },
         TensorSelection::Indices { indices, .. } => TensorSelection::Indices { axis, indices },
+        selection @ TensorSelection::Contiguous { .. } => selection,
     }
 }
 
@@ -1012,9 +1041,15 @@ fn normalize_selection(
             end,
         } if end == shape[axis] => Ok(TensorSelection::Full),
         TensorSelection::Indices { axis, indices }
-            if indices.len() == shape[axis] && indices.iter().copied().eq(0..shape[axis]) =>
+            if indices.windows(2).all(|pair| pair[1] == pair[0] + 1) =>
         {
-            Ok(TensorSelection::Full)
+            let start = indices[0];
+            let end = indices[indices.len() - 1] + 1;
+            if start == 0 && end == shape[axis] {
+                Ok(TensorSelection::Full)
+            } else {
+                Ok(TensorSelection::Range { axis, start, end })
+            }
         }
         selection => Ok(selection),
     }
@@ -1065,6 +1100,125 @@ fn compose_same_axis_selection(
             reason: "full selections must be normalized before composition".into(),
         }),
     }
+}
+
+fn combine_independent_ranges(
+    source_shape: &[usize],
+    existing: &TensorSelection,
+    requested: &TensorSelection,
+) -> Result<Option<TensorSelection>, WeightRecipeError> {
+    let (
+        TensorSelection::Range {
+            axis: existing_axis,
+            start: existing_start,
+            end: existing_end,
+        },
+        TensorSelection::Range {
+            axis: requested_axis,
+            start: requested_start,
+            end: requested_end,
+        },
+    ) = (existing, requested)
+    else {
+        return Ok(None);
+    };
+    if existing_axis == requested_axis {
+        return Ok(None);
+    }
+    let mut starts = vec![0usize; source_shape.len()];
+    let mut ends = source_shape.to_vec();
+    starts[*existing_axis] = *existing_start;
+    ends[*existing_axis] = *existing_end;
+    starts[*requested_axis] = *requested_start;
+    ends[*requested_axis] = *requested_end;
+    let selected_shape = starts
+        .iter()
+        .zip(&ends)
+        .map(|(start, end)| end - start)
+        .collect::<Vec<_>>();
+    let Some(last_partial) = (0..source_shape.len())
+        .rev()
+        .find(|axis| starts[*axis] != 0 || ends[*axis] != source_shape[*axis])
+    else {
+        return Ok(Some(TensorSelection::Full));
+    };
+    if selected_shape[..last_partial]
+        .iter()
+        .any(|dimension| *dimension != 1)
+        || (last_partial + 1..source_shape.len())
+            .any(|axis| starts[axis] != 0 || ends[axis] != source_shape[axis])
+    {
+        return Ok(None);
+    }
+    let mut offset_elements = 0usize;
+    let mut stride = 1usize;
+    for axis in (0..source_shape.len()).rev() {
+        offset_elements = offset_elements
+            .checked_add(starts[axis].checked_mul(stride).ok_or(
+                WeightRecipeError::ArithmeticOverflow("contiguous selection offset"),
+            )?)
+            .ok_or(WeightRecipeError::ArithmeticOverflow(
+                "contiguous selection offset",
+            ))?;
+        stride =
+            stride
+                .checked_mul(source_shape[axis])
+                .ok_or(WeightRecipeError::ArithmeticOverflow(
+                    "contiguous selection stride",
+                ))?;
+    }
+    Ok(Some(TensorSelection::Contiguous {
+        offset_elements,
+        shape: selected_shape,
+    }))
+}
+
+fn select_from_contiguous_span(
+    existing: &TensorSelection,
+    requested: &TensorSelection,
+) -> Result<Option<TensorSelection>, WeightRecipeError> {
+    let TensorSelection::Contiguous {
+        offset_elements,
+        shape,
+    } = existing
+    else {
+        return Ok(None);
+    };
+    let (axis, start, end) = match requested {
+        TensorSelection::Range { axis, start, end } => (*axis, *start, *end),
+        TensorSelection::Indices { axis, indices }
+            if indices.windows(2).all(|pair| pair[1] == pair[0] + 1) =>
+        {
+            (*axis, indices[0], indices[indices.len() - 1] + 1)
+        }
+        _ => return Ok(None),
+    };
+    if shape[..axis].iter().product::<usize>() != 1 {
+        return Ok(None);
+    }
+    let trailing = shape[axis + 1..]
+        .iter()
+        .try_fold(1usize, |count, dimension| {
+            count
+                .checked_mul(*dimension)
+                .ok_or(WeightRecipeError::ArithmeticOverflow(
+                    "contiguous selection trailing span",
+                ))
+        })?;
+    let offset_elements =
+        offset_elements
+            .checked_add(start.checked_mul(trailing).ok_or(
+                WeightRecipeError::ArithmeticOverflow("contiguous selection offset"),
+            )?)
+            .ok_or(WeightRecipeError::ArithmeticOverflow(
+                "contiguous selection offset",
+            ))?;
+    let mut selected_shape = shape.clone();
+    selected_shape[axis] = end - start;
+    Ok(Some(TensorSelection::Contiguous {
+        offset_elements,
+        shape: selected_shape,
+    }))
 }
 
 /// Lazy recipe output and the source mappings required to evaluate it safely.
@@ -1195,6 +1349,43 @@ fn selected_shape(
                 });
             }
             *dimension = indices.len();
+        }
+        TensorSelection::Contiguous {
+            offset_elements,
+            shape: selected,
+        } => {
+            if selected.is_empty() || selected.contains(&0) {
+                return Err(WeightRecipeError::SelectionPushdownUnsupported {
+                    operation: "contiguous source selection",
+                    reason: "output shape must be non-empty and nonzero".into(),
+                });
+            }
+            let full_elements = shape.iter().try_fold(1usize, |count, dimension| {
+                count
+                    .checked_mul(*dimension)
+                    .ok_or(WeightRecipeError::ArithmeticOverflow(
+                        "contiguous source element count",
+                    ))
+            })?;
+            let selected_elements = selected.iter().try_fold(1usize, |count, dimension| {
+                count
+                    .checked_mul(*dimension)
+                    .ok_or(WeightRecipeError::ArithmeticOverflow(
+                        "contiguous selected element count",
+                    ))
+            })?;
+            let end = offset_elements.checked_add(selected_elements).ok_or(
+                WeightRecipeError::ArithmeticOverflow("contiguous selection end"),
+            )?;
+            if end > full_elements {
+                return Err(WeightRecipeError::SelectionPushdownUnsupported {
+                    operation: "contiguous source selection",
+                    reason: format!(
+                        "scalar span {offset_elements}..{end} exceeds {full_elements} elements"
+                    ),
+                });
+            }
+            shape = selected.clone();
         }
     }
     Ok(shape)
@@ -1663,7 +1854,7 @@ mod tests {
     }
 
     #[test]
-    fn independent_axis_selections_remain_local_to_an_already_bounded_source() {
+    fn independent_axis_selections_collapse_to_one_contiguous_source_span() {
         let (_dir, store) = fixture();
         let recipe = DerivedWeightRecipe::Select {
             input: Box::new(DerivedWeightRecipe::source(
@@ -1691,7 +1882,16 @@ mod tests {
             )
             .unwrap();
         assert_eq!(rewritten.infer(store.as_ref()).unwrap().shape(), &[1, 1, 1]);
-        assert!(matches!(rewritten, DerivedWeightRecipe::Select { .. }));
+        assert_eq!(
+            rewritten,
+            DerivedWeightRecipe::source(
+                "cube",
+                TensorSelection::Contiguous {
+                    offset_elements: 0,
+                    shape: vec![1, 1, 1],
+                }
+            )
+        );
     }
 
     #[test]
@@ -1718,23 +1918,26 @@ mod tests {
                 inputs: vec![
                     DerivedWeightRecipe::source(
                         "right",
-                        TensorSelection::Indices {
+                        TensorSelection::Range {
                             axis: 0,
-                            indices: vec![1],
+                            start: 1,
+                            end: 2,
                         },
                     ),
                     DerivedWeightRecipe::source(
                         "left",
-                        TensorSelection::Indices {
+                        TensorSelection::Range {
                             axis: 0,
-                            indices: vec![0],
+                            start: 0,
+                            end: 1,
                         },
                     ),
                     DerivedWeightRecipe::source(
                         "right",
-                        TensorSelection::Indices {
+                        TensorSelection::Range {
                             axis: 0,
-                            indices: vec![0],
+                            start: 0,
+                            end: 1,
                         },
                     ),
                 ],

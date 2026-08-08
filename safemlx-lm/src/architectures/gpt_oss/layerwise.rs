@@ -36,8 +36,11 @@ use crate::{
         build_module_bindings, build_module_bindings_with_recipes, populate_module_from_lease,
         populate_module_from_lease_excluding,
     },
-    runtime::checkpoint::recipe::DerivedWeightRecipe,
     runtime::checkpoint::store::{GgufWeightStore, TensorSelection, WeightStore},
+    runtime::checkpoint::{
+        quantization::{should_quantize_on_load, WeightQuantization},
+        recipe::DerivedWeightRecipe,
+    },
     runtime::distributed::parallel::{
         aligned_partition_units, array_parameter_member, register_projection_module,
         register_replicated_module, MemberSharding, ParallelPlanBuilder, ParameterGroupSpec,
@@ -568,6 +571,7 @@ pub fn load_gpt_oss_expert_cache_model(
     model_dir: impl AsRef<Path>,
     non_expert: crate::NonExpertWeightResidency,
     options: ExpertCacheLoadOptions,
+    quantization: Option<WeightQuantization>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<GptOssLayerwiseModel, Error> {
@@ -585,13 +589,34 @@ pub fn load_gpt_oss_expert_cache_model(
         load_safetensors_layerwise_model(model_dir, adapter, non_expert, stream, weights_stream)?;
     let store = execution.checkpoint_store_arc();
     let entries = gpt_oss_expert_catalog(&args, store.as_ref())?;
-    execution.adapter_mut().expert_cache = Some(ExpertCache::new_shared(
-        store,
-        entries,
-        options,
-        weights_stream.clone(),
-        stream.clone(),
-    )?);
+    let quantize_on_load = quantization
+        .map(|requested| {
+            should_quantize_on_load(
+                "GPT-OSS independent expert cache",
+                args.quantization,
+                requested,
+            )
+            .map(|required| required.then_some(requested))
+        })
+        .transpose()?
+        .flatten();
+    execution.adapter_mut().expert_cache = Some(match quantize_on_load {
+        Some(quantization) => ExpertCache::new_quantized_shared(
+            store,
+            entries,
+            options,
+            quantization,
+            weights_stream.clone(),
+            stream.clone(),
+        )?,
+        None => ExpertCache::new_shared(
+            store,
+            entries,
+            options,
+            weights_stream.clone(),
+            stream.clone(),
+        )?,
+    });
     Ok(GptOssLayerwiseModel { execution })
 }
 
@@ -2059,6 +2084,7 @@ mod tests {
                 OffloadConfig::new(None, None, 1).unwrap(),
             )),
             options,
+            None,
             gpu.stream(),
             cpu.stream(),
         )
