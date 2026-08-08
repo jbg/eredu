@@ -1,6 +1,7 @@
 #![cfg(unix)]
 
 use std::{
+    collections::{BTreeMap, HashMap},
     net::TcpListener,
     path::{Path, PathBuf},
     process::{Child, Command, Output, Stdio},
@@ -11,9 +12,10 @@ use std::{
 use safemlx::{
     distributed::{self, Backend},
     module::ModuleParameters,
-    ops::indexing::TryIndexOp,
+    ops::{indexing::TryIndexOp, GgufMetadataArray, GgufMetadataValue},
     Array, Device, DeviceType, ExecutionContext, Stream,
 };
+use safemlx_gguf::{GgmlType, TensorInput, Writer};
 use safemlx_lm::{
     architectures::{
         distributed::pipeline::{
@@ -154,6 +156,362 @@ fn write_fixture(directory: &Path) {
     .unwrap();
 }
 
+struct OwnedGgufTensor {
+    name: String,
+    dimensions: Vec<u64>,
+    data: Vec<u8>,
+}
+
+fn write_dense_gguf(
+    path: &Path,
+    arrays: &HashMap<String, Array>,
+    metadata: HashMap<String, GgufMetadataValue>,
+) {
+    let mut names = arrays.keys().collect::<Vec<_>>();
+    names.sort_unstable();
+    let tensors = names
+        .into_iter()
+        .map(|name| {
+            let evaluated = arrays[name].evaluated().unwrap();
+            OwnedGgufTensor {
+                name: name.clone(),
+                dimensions: evaluated
+                    .as_array()
+                    .shape()
+                    .iter()
+                    .rev()
+                    .map(|&dimension| u64::try_from(dimension).unwrap())
+                    .collect(),
+                data: evaluated
+                    .as_slice::<f32>()
+                    .iter()
+                    .flat_map(|value| value.to_le_bytes())
+                    .collect(),
+            }
+        })
+        .collect::<Vec<_>>();
+    let inputs = tensors
+        .iter()
+        .map(|tensor| TensorInput {
+            name: &tensor.name,
+            dimensions: &tensor.dimensions,
+            ggml_type: GgmlType::F32,
+            data: &tensor.data,
+        })
+        .collect::<Vec<_>>();
+    Writer::default()
+        .write(
+            std::fs::File::create(path).unwrap(),
+            &metadata.into_iter().collect::<BTreeMap<_, _>>(),
+            &inputs,
+        )
+        .unwrap();
+}
+
+fn text_gguf_name(name: &str) -> String {
+    for (target, source) in [
+        (
+            "model.language_model.embed_tokens_per_layer",
+            "per_layer_token_embd",
+        ),
+        (
+            "model.language_model.per_layer_model_projection",
+            "per_layer_model_proj",
+        ),
+        (
+            "model.language_model.per_layer_projection_norm",
+            "per_layer_proj_norm",
+        ),
+        ("model.language_model.embed_tokens", "token_embd"),
+        ("model.language_model.norm", "output_norm"),
+        ("lm_head", "output"),
+    ] {
+        if name == target || name.starts_with(&format!("{target}.")) {
+            return name.replacen(target, source, 1);
+        }
+    }
+    let rest = name
+        .strip_prefix("model.language_model.layers.")
+        .unwrap_or_else(|| panic!("unmapped Gemma 4 text tensor {name}"));
+    let (layer, parameter) = rest.split_once('.').unwrap();
+    if parameter == "layer_scalar" {
+        return format!("blk.{layer}.layer_output_scale.weight");
+    }
+    for (target, source) in [
+        ("self_attn.q_norm", "attn_q_norm"),
+        ("self_attn.k_norm", "attn_k_norm"),
+        ("self_attn.q_proj", "attn_q"),
+        ("self_attn.k_proj", "attn_k"),
+        ("self_attn.v_proj", "attn_v"),
+        ("self_attn.o_proj", "attn_output"),
+        ("input_layernorm", "attn_norm"),
+        ("post_attention_layernorm", "post_attention_norm"),
+        ("pre_feedforward_layernorm", "ffn_norm"),
+        ("post_feedforward_layernorm", "post_ffw_norm"),
+        ("mlp.gate_proj", "ffn_gate"),
+        ("mlp.down_proj", "ffn_down"),
+        ("mlp.up_proj", "ffn_up"),
+        ("per_layer_input_gate", "inp_gate"),
+        ("per_layer_projection", "proj"),
+        ("post_per_layer_input_norm", "post_norm"),
+    ] {
+        if parameter == target || parameter.starts_with(&format!("{target}.")) {
+            return format!("blk.{layer}.{}", parameter.replacen(target, source, 1));
+        }
+    }
+    panic!("unmapped Gemma 4 text layer tensor {name}")
+}
+
+fn projector_metadata() -> HashMap<String, GgufMetadataValue> {
+    HashMap::from([
+        (
+            "general.architecture".into(),
+            GgufMetadataValue::String("clip".into()),
+        ),
+        (
+            "clip.has_vision_encoder".into(),
+            GgufMetadataValue::Bool(true),
+        ),
+        (
+            "clip.has_audio_encoder".into(),
+            GgufMetadataValue::Bool(true),
+        ),
+        (
+            "clip.vision.projector_type".into(),
+            GgufMetadataValue::String("gemma4".into()),
+        ),
+        (
+            "clip.audio.projector_type".into(),
+            GgufMetadataValue::String("gemma4".into()),
+        ),
+        (
+            "clip.vision.embedding_length".into(),
+            GgufMetadataValue::Uint32(8),
+        ),
+        (
+            "clip.vision.feed_forward_length".into(),
+            GgufMetadataValue::Uint32(16),
+        ),
+        (
+            "clip.vision.block_count".into(),
+            GgufMetadataValue::Uint32(1),
+        ),
+        (
+            "clip.vision.attention.head_count".into(),
+            GgufMetadataValue::Uint32(2),
+        ),
+        (
+            "clip.vision.attention.head_count_kv".into(),
+            GgufMetadataValue::Uint32(2),
+        ),
+        (
+            "clip.vision.attention.key_length".into(),
+            GgufMetadataValue::Uint32(4),
+        ),
+        (
+            "clip.vision.patch_size".into(),
+            GgufMetadataValue::Uint32(2),
+        ),
+        (
+            "clip.vision.pooling_kernel_size".into(),
+            GgufMetadataValue::Uint32(2),
+        ),
+        (
+            "clip.vision.position_embedding_size".into(),
+            GgufMetadataValue::Uint32(4),
+        ),
+        (
+            "clip.vision.attention.layer_norm_rms_epsilon".into(),
+            GgufMetadataValue::Float32(1e-6),
+        ),
+        (
+            "clip.vision.hidden_activation".into(),
+            GgufMetadataValue::String("gelu_pytorch_tanh".into()),
+        ),
+        (
+            "clip.vision.standardize".into(),
+            GgufMetadataValue::Bool(false),
+        ),
+        (
+            "clip.vision.rope.freq_base".into(),
+            GgufMetadataValue::Float32(100.0),
+        ),
+        (
+            "clip.audio.embedding_length".into(),
+            GgufMetadataValue::Uint32(8),
+        ),
+        (
+            "clip.audio.block_count".into(),
+            GgufMetadataValue::Uint32(1),
+        ),
+        (
+            "clip.audio.attention.head_count".into(),
+            GgufMetadataValue::Uint32(2),
+        ),
+        (
+            "clip.audio.projection_dim".into(),
+            GgufMetadataValue::Uint32(8),
+        ),
+        (
+            "clip.audio.conv_kernel_size".into(),
+            GgufMetadataValue::Uint32(3),
+        ),
+        (
+            "clip.audio.attention.chunk_size".into(),
+            GgufMetadataValue::Uint32(4),
+        ),
+        (
+            "clip.audio.attention.context_left".into(),
+            GgufMetadataValue::Uint32(4),
+        ),
+        (
+            "clip.audio.attention.context_right".into(),
+            GgufMetadataValue::Uint32(0),
+        ),
+        (
+            "clip.audio.attention.invalid_logits_value".into(),
+            GgufMetadataValue::Float32(-1.0e9),
+        ),
+        (
+            "clip.audio.attention.logit_cap".into(),
+            GgufMetadataValue::Float32(10.0),
+        ),
+        (
+            "clip.audio.residual_weight".into(),
+            GgufMetadataValue::Float32(0.5),
+        ),
+        (
+            "clip.audio.attention.layer_norm_rms_epsilon".into(),
+            GgufMetadataValue::Float32(1e-6),
+        ),
+        (
+            "clip.audio.subsampling_conv_channels".into(),
+            GgufMetadataValue::Array(GgufMetadataArray::Uint32(vec![2, 2])),
+        ),
+    ])
+}
+
+fn write_gguf_fixture(directory: &Path) -> PathBuf {
+    let execution = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+    let stream = execution.stream();
+    let mut model = Model::new_from_config_value(&config(), stream).unwrap();
+    let mut names = model
+        .parameters()
+        .flatten()
+        .keys()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    names.sort();
+    let mut parameters = model.parameters_mut().flatten();
+    for (ordinal, name) in names.iter().enumerate() {
+        let parameter = parameters.get_mut(name.as_str()).unwrap();
+        let shape = parameter.shape().to_vec();
+        **parameter = if name.ends_with("norm.weight") || name.ends_with("layernorm.weight") {
+            Array::ones::<f32>(&shape, stream).unwrap()
+        } else if name.ends_with(".bias") {
+            Array::zeros::<f32>(&shape, stream).unwrap()
+        } else {
+            Array::full::<f32>(
+                &shape,
+                Array::from_f32(0.0002 * (ordinal + 1) as f32),
+                stream,
+            )
+            .unwrap()
+        };
+    }
+    let mut text = HashMap::new();
+    let mut projector = HashMap::new();
+    for (name, value) in model.parameters().flatten() {
+        let name = safemlx_lm::runtime::checkpoint::binding::canonical_checkpoint_name(&name);
+        if name.starts_with("model.language_model.") || name.starts_with("lm_head.") {
+            text.insert(text_gguf_name(&name), value.clone());
+        } else {
+            let physical = name.strip_prefix("model.").unwrap_or(&name).to_string();
+            projector.insert(physical, value.clone());
+        }
+    }
+    let text_metadata = HashMap::from([
+        (
+            "general.architecture".into(),
+            GgufMetadataValue::String("gemma4".into()),
+        ),
+        ("gemma4.block_count".into(), GgufMetadataValue::Uint32(2)),
+        (
+            "gemma4.embedding_length".into(),
+            GgufMetadataValue::Uint32(8),
+        ),
+        (
+            "gemma4.feed_forward_length".into(),
+            GgufMetadataValue::Uint32(16),
+        ),
+        (
+            "gemma4.attention.head_count".into(),
+            GgufMetadataValue::Uint32(2),
+        ),
+        (
+            "gemma4.attention.head_count_kv".into(),
+            GgufMetadataValue::Uint32(2),
+        ),
+        (
+            "gemma4.attention.key_length".into(),
+            GgufMetadataValue::Uint32(4),
+        ),
+        (
+            "gemma4.attention.key_length_swa".into(),
+            GgufMetadataValue::Uint32(4),
+        ),
+        (
+            "gemma4.attention.sliding_window_pattern".into(),
+            GgufMetadataValue::Array(GgufMetadataArray::Bool(vec![true, false])),
+        ),
+        (
+            "gemma4.attention.shared_kv_layers".into(),
+            GgufMetadataValue::Uint32(0),
+        ),
+        (
+            "gemma4.attention.layer_norm_rms_epsilon".into(),
+            GgufMetadataValue::Float32(1e-6),
+        ),
+        (
+            "gemma4.attention.sliding_window".into(),
+            GgufMetadataValue::Uint32(8),
+        ),
+        (
+            "gemma4.context_length".into(),
+            GgufMetadataValue::Uint32(128),
+        ),
+        ("gemma4.vocab_size".into(), GgufMetadataValue::Uint32(32)),
+        (
+            "gemma4.embedding_length_per_layer_input".into(),
+            GgufMetadataValue::Uint32(4),
+        ),
+        (
+            "gemma4.final_logit_softcapping".into(),
+            GgufMetadataValue::Float32(4.0),
+        ),
+        (
+            "gemma4.image_token_id".into(),
+            GgufMetadataValue::Uint32(20),
+        ),
+        (
+            "gemma4.video_token_id".into(),
+            GgufMetadataValue::Uint32(21),
+        ),
+        (
+            "gemma4.audio_token_id".into(),
+            GgufMetadataValue::Uint32(22),
+        ),
+    ]);
+    let model_path = directory.join("gemma4-f32.gguf");
+    write_dense_gguf(&model_path, &text, text_metadata);
+    write_dense_gguf(
+        &directory.join("mmproj-gemma4-f32.gguf"),
+        &projector,
+        projector_metadata(),
+    );
+    model_path
+}
+
 fn typed_input<'a>(
     text: &'a Array,
     pixels: &'a Array,
@@ -168,6 +526,60 @@ fn typed_input<'a>(
         InputPart::audio_tensor(audio, InputMetadata::audio_mask(audio_mask)),
     ];
     ModelInput::new(parts)
+}
+
+#[test]
+fn gemma4_gguf_mmproj_rejects_wrong_identity_before_materialization() {
+    let directory = tempfile::tempdir().unwrap();
+    let model_path = write_gguf_fixture(directory.path());
+    let projector_path = directory.path().join("wrong-projector.gguf");
+    let stream = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+    let array = Array::zeros::<f32>(&[1], stream.stream()).unwrap();
+    let mut metadata = projector_metadata();
+    metadata.insert(
+        "clip.vision.projector_type".into(),
+        GgufMetadataValue::String("other".into()),
+    );
+    write_dense_gguf(
+        &projector_path,
+        &HashMap::from([("dummy".into(), array)]),
+        metadata,
+    );
+    let error = gemma4::load_gemma4_gguf_with_mmproj(
+        model_path,
+        projector_path,
+        stream.stream(),
+        stream.stream(),
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("projector type \"gemma4\""));
+}
+
+#[test]
+fn gemma4_gguf_mmproj_rejects_incomplete_catalog_before_materialization() {
+    let directory = tempfile::tempdir().unwrap();
+    let model_path = write_gguf_fixture(directory.path());
+    let projector_path = directory.path().join("incomplete-projector.gguf");
+    let stream = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+    let array = Array::zeros::<f32>(&[1], stream.stream()).unwrap();
+    write_dense_gguf(
+        &projector_path,
+        &HashMap::from([("vision_tower.unexpected".into(), array)]),
+        projector_metadata(),
+    );
+    let error = gemma4::load_gemma4_gguf_with_mmproj(
+        model_path,
+        projector_path,
+        stream.stream(),
+        stream.stream(),
+    )
+    .unwrap_err();
+    let detail = error.to_string();
+    assert!(
+        detail.contains("missing") || detail.contains("Missing"),
+        "{detail}"
+    );
+    assert!(detail.contains("audio_tower.layers.0"), "{detail}");
 }
 
 fn assert_close(actual: &Array, expected: &Array, stream: &Stream) {
@@ -287,8 +699,13 @@ fn gemma4_multimodal_pipeline_ring_worker() {
     assert_eq!(logits.is_some(), topology.pipeline_parallel_rank == 1);
 
     let mut resident_cache = Cache::default();
-    let mut resident = (topology.pipeline_parallel_rank == 1)
-        .then(|| gemma4::load_gemma4_model(&checkpoint, &stream, &stream).unwrap());
+    let mut resident = (topology.pipeline_parallel_rank == 1).then(|| {
+        if checkpoint.extension().is_some_and(|value| value == "gguf") {
+            gemma4::load_gemma4_gguf(&checkpoint, &stream, &stream).unwrap()
+        } else {
+            gemma4::load_gemma4_model(&checkpoint, &stream, &stream).unwrap()
+        }
+    });
     if let (Some(logits), Some(resident)) = (&logits, &mut resident) {
         let expected = resident
             .prefill_input_logits(input, &mut resident_cache, &stream)
@@ -347,10 +764,15 @@ fn failure(rank: usize, output: &Output) -> String {
     )
 }
 
-fn run_ring(tp: bool, dense: bool, host: bool) {
+fn run_ring(tp: bool, dense: bool, host: bool, gguf: bool) {
     assert!(distributed::is_available(Backend::Ring));
     let checkpoint = tempfile::tempdir().unwrap();
-    write_fixture(checkpoint.path());
+    let checkpoint_path = if gguf {
+        write_gguf_fixture(checkpoint.path())
+    } else {
+        write_fixture(checkpoint.path());
+        checkpoint.path().to_path_buf()
+    };
     let world = if tp { 4 } else { 2 };
     let sockets = (0..world)
         .map(|_| TcpListener::bind(("127.0.0.1", 0)).unwrap())
@@ -374,7 +796,7 @@ fn run_ring(tp: bool, dense: bool, host: bool) {
                 "--nocapture",
             ])
             .env(WORKER, rank.to_string())
-            .env(CHECKPOINT, checkpoint.path())
+            .env(CHECKPOINT, &checkpoint_path)
             .env("MLX_RANK", rank.to_string())
             .env("MLX_HOSTFILE", &hostfile)
             .env_remove("MLX_RING_VERBOSE")
@@ -439,17 +861,35 @@ fn run_ring(tp: bool, dense: bool, host: bool) {
 #[test]
 #[ignore = "spawns local Ring processes"]
 fn ring_gemma4_multimodal_pipeline() {
-    run_ring(false, false, false);
+    run_ring(false, false, false, false);
 }
 
 #[test]
 #[ignore = "spawns local Ring processes"]
 fn ring_gemma4_multimodal_dense_stream_pipeline() {
-    run_ring(false, true, false);
+    run_ring(false, true, false, false);
 }
 
 #[test]
 #[ignore = "spawns local Ring processes"]
 fn ring_gemma4_multimodal_host_tensor_pipeline() {
-    run_ring(true, false, true);
+    run_ring(true, false, true, false);
+}
+
+#[test]
+#[ignore = "spawns local Ring processes"]
+fn ring_gemma4_multimodal_gguf_pipeline() {
+    run_ring(false, false, false, true);
+}
+
+#[test]
+#[ignore = "spawns local Ring processes"]
+fn ring_gemma4_multimodal_gguf_dense_stream_pipeline() {
+    run_ring(false, true, false, true);
+}
+
+#[test]
+#[ignore = "spawns local Ring processes"]
+fn ring_gemma4_multimodal_gguf_host_tensor_pipeline() {
+    run_ring(true, false, true, true);
 }

@@ -139,10 +139,11 @@ from shared semantic partition plans. Uneven GQA, dense/routed intermediate,
 vision patch/MLP, audio head/convolution, and modality ranges therefore flow
 through layer construction and prompt-cache identity without equal-shard
 reconstruction. Gemma pipeline execution uses dependency-safe contiguous text
-stages and, for multimodal SafeTensors checkpoints, stage-zero vision/audio
-roots. It relays per-layer residual inputs and exact multimodal full/sliding
-masks as immutable auxiliary state. Text execution also supports exact
-`gemma4` GGUF checkpoints.
+stages and stage-zero vision/audio roots for multimodal SafeTensors or
+text-plus-projector GGUF checkpoints. It relays per-layer residual inputs and
+exact multimodal full/sliding masks as immutable auxiliary state. GGUF combines
+the language file and sibling dense media projector in the same bounded-read
+residency plan.
 Shared-KV publisher/consumer groups are never split across stages.
 Fully resident Gemma text stages can apply load-time affine or MXFP4
 quantization through the same direct and derived binding plan used for

@@ -1,4 +1,4 @@
-//! Gemma 4 text model implementation and loader.
+//! Gemma 4 text and multimodal model implementation and SafeTensors/GGUF loaders.
 
 use std::{
     cell::RefCell,
@@ -4049,19 +4049,46 @@ pub fn load_gemma4_tokenizer(model_dir: impl AsRef<Path>) -> Result<Tokenizer, E
 
 pub(crate) struct LoadedGemma4Gguf {
     pub(crate) model: Model,
+    pub(crate) vision_config: Option<Gemma4VisionConfig>,
+    pub(crate) audio_config: Option<Gemma4AudioConfig>,
     pub(crate) eos_token_ids: Vec<u32>,
 }
 
 pub(crate) struct PreparedGemma4Gguf {
     pub(crate) args: ModelArgs,
+    pub(crate) vision_config: Option<Gemma4VisionConfig>,
+    pub(crate) image_token_id: Option<i32>,
+    pub(crate) video_token_id: Option<i32>,
+    pub(crate) audio_config: Option<Gemma4AudioConfig>,
+    pub(crate) audio_token_id: Option<i32>,
     pub(crate) eos_token_ids: Vec<u32>,
 }
 
-/// Loads the text model from a Gemma 4 GGUF checkpoint.
+/// Optional sibling GGUF containing Gemma 4's vision and audio towers.
+pub(crate) struct Gemma4MmprojGguf {
+    pub(crate) checkpoint: GgufCheckpoint,
+    pub(crate) metadata: HashMap<String, GgufMetadataValue>,
+}
+
+pub(crate) fn open_sibling_mmproj(gguf_file: &Path) -> Result<Option<Gemma4MmprojGguf>, Error> {
+    let Some(path) = crate::runtime::checkpoint::gguf::find_sibling_mmproj(gguf_file, "gemma4")?
+    else {
+        return Ok(None);
+    };
+    let checkpoint = GgufCheckpoint::open(path)?;
+    let metadata = gguf_metadata(&checkpoint);
+    validate_mmproj_metadata(&metadata)?;
+    Ok(Some(Gemma4MmprojGguf {
+        checkpoint,
+        metadata,
+    }))
+}
+
+/// Loads a Gemma 4 GGUF and its optional sibling multimodal projector.
 ///
 /// Dense tensors and every GGUF quantization supported by the shared backend are
-/// accepted for both dense and MoE text checkpoints. Vision, audio, assistant-drafter,
-/// and separate multimodal projector GGUF files use their dedicated loaders.
+/// accepted for both dense and MoE text checkpoints. A unique nearby
+/// `mmproj-*.gguf` supplies the vision/audio towers when present.
 pub fn load_gemma4_gguf(
     gguf_file: impl AsRef<Path>,
     stream: &Stream,
@@ -4070,25 +4097,71 @@ pub fn load_gemma4_gguf(
     Ok(load_gemma4_gguf_with_metadata(gguf_file, stream, weights_stream)?.model)
 }
 
+/// Loads a Gemma 4 text GGUF with an explicit vision/audio projector GGUF.
+pub fn load_gemma4_gguf_with_mmproj(
+    gguf_file: impl AsRef<Path>,
+    mmproj_file: impl AsRef<Path>,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<Model, Error> {
+    let checkpoint = GgufCheckpoint::open(gguf_file)?;
+    let metadata = gguf_metadata(&checkpoint);
+    let projector_checkpoint = GgufCheckpoint::open(mmproj_file)?;
+    let projector = Gemma4MmprojGguf {
+        metadata: gguf_metadata(&projector_checkpoint),
+        checkpoint: projector_checkpoint,
+    };
+    validate_mmproj_metadata(&projector.metadata)?;
+    Ok(load_gemma4_gguf_checkpoint(
+        &checkpoint,
+        metadata,
+        Some(&projector),
+        None,
+        stream,
+        weights_stream,
+    )?
+    .model)
+}
+
 pub(crate) fn load_gemma4_gguf_with_metadata(
     gguf_file: impl AsRef<Path>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<LoadedGemma4Gguf, Error> {
+    let gguf_file = gguf_file.as_ref();
     let checkpoint = GgufCheckpoint::open(gguf_file)?;
     let metadata = gguf_metadata(&checkpoint);
-    load_gemma4_gguf_checkpoint(&checkpoint, metadata, None, stream, weights_stream)
+    let projector = open_sibling_mmproj(gguf_file)?;
+    load_gemma4_gguf_checkpoint(
+        &checkpoint,
+        metadata,
+        projector.as_ref(),
+        None,
+        stream,
+        weights_stream,
+    )
 }
 
 pub(crate) fn load_gemma4_gguf_checkpoint(
     checkpoint: &GgufCheckpoint,
     metadata: HashMap<String, GgufMetadataValue>,
+    projector: Option<&Gemma4MmprojGguf>,
     quantization: Option<WeightQuantization>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<LoadedGemma4Gguf, Error> {
-    let prepared = prepare_gemma4_gguf_checkpoint(checkpoint, &metadata, quantization)?;
-    let mut model = Model::new(prepared.args, stream)?;
+    let prepared = prepare_gemma4_gguf_checkpoint(checkpoint, &metadata, projector, quantization)?;
+    let vision_config = prepared.vision_config.clone();
+    let audio_config = prepared.audio_config.clone();
+    let mut model = Model::new_with_modalities(
+        prepared.args,
+        prepared.image_token_id,
+        prepared.vision_config,
+        prepared.video_token_id,
+        prepared.audio_token_id,
+        prepared.audio_config,
+        stream,
+    )?;
     if quantization.is_none() {
         for tensor in checkpoint
             .catalog()
@@ -4123,11 +4196,23 @@ pub(crate) fn load_gemma4_gguf_checkpoint(
         &config,
         &mut report,
     )?;
+    if let Some(projector) = projector {
+        load_gemma4_mmproj_weights(
+            &mut model,
+            projector,
+            quantization,
+            stream,
+            &config,
+            &mut report,
+        )?;
+    }
     report.finish(&model, &config)?;
     model.copy_to_stream(stream)?;
 
     Ok(LoadedGemma4Gguf {
         model,
+        vision_config,
+        audio_config,
         eos_token_ids: prepared.eos_token_ids,
     })
 }
@@ -4135,6 +4220,7 @@ pub(crate) fn load_gemma4_gguf_checkpoint(
 pub(crate) fn prepare_gemma4_gguf_checkpoint(
     checkpoint: &GgufCheckpoint,
     metadata: &HashMap<String, GgufMetadataValue>,
+    projector: Option<&Gemma4MmprojGguf>,
     quantization: Option<WeightQuantization>,
 ) -> Result<PreparedGemma4Gguf, Error> {
     let architecture = gguf_string(metadata, "general.architecture")?;
@@ -4192,11 +4278,392 @@ pub(crate) fn prepare_gemma4_gguf_checkpoint(
         }
     }
 
+    let (vision_config, image_token_id, video_token_id, audio_config, audio_token_id) =
+        if let Some(projector) = projector {
+            crate::api::structural::validate_gemma4_mmproj_gguf(checkpoint, metadata, projector)
+                .into_loader_result()?;
+            apply_mmproj_args(&mut args, metadata, projector)?
+        } else {
+            (None, None, None, None, None)
+        };
     let eos_token_ids = crate::api::gguf_eos_token_ids(metadata)?;
     Ok(PreparedGemma4Gguf {
         args,
+        vision_config,
+        image_token_id,
+        video_token_id,
+        audio_config,
+        audio_token_id,
         eos_token_ids,
     })
+}
+
+pub(crate) fn validate_mmproj_metadata(
+    metadata: &HashMap<String, GgufMetadataValue>,
+) -> Result<(), Error> {
+    let architecture = gguf_string(metadata, "general.architecture")?;
+    if architecture != "clip" {
+        return Err(Error::UnsupportedArchitecture(format!(
+            "expected a Gemma 4 media projector with GGUF architecture \"clip\", got {architecture:?}"
+        )));
+    }
+    let has_vision = gguf_optional_bool(metadata, "clip.has_vision_encoder")?.unwrap_or(false);
+    let has_audio = gguf_optional_bool(metadata, "clip.has_audio_encoder")?.unwrap_or(false);
+    if !has_vision && !has_audio {
+        return Err(Error::UnsupportedArchitecture(
+            "Gemma 4 mmproj must contain a vision encoder, an audio encoder, or both".into(),
+        ));
+    }
+    for (enabled, key, description) in [
+        (has_vision, "clip.vision.projector_type", "vision"),
+        (has_audio, "clip.audio.projector_type", "audio"),
+    ] {
+        if enabled {
+            let projector = gguf_string(metadata, key)?;
+            if projector != "gemma4" {
+                return Err(Error::UnsupportedArchitecture(format!(
+                    "Gemma 4 {description} mmproj requires projector type \"gemma4\", got {projector:?}"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+pub(crate) type Gemma4MmprojConfigParts = (
+    Option<Gemma4VisionConfig>,
+    Option<i32>,
+    Option<i32>,
+    Option<Gemma4AudioConfig>,
+    Option<i32>,
+);
+
+pub(crate) fn apply_mmproj_args(
+    args: &mut ModelArgs,
+    model_metadata: &HashMap<String, GgufMetadataValue>,
+    projector: &Gemma4MmprojGguf,
+) -> Result<Gemma4MmprojConfigParts, Error> {
+    validate_mmproj_metadata(&projector.metadata)?;
+    projector
+        .checkpoint
+        .catalog()
+        .translated_outputs(translate_mmproj_weight_name)
+        .map_err(safemlx::error::IoError::from)?;
+    let configs = gguf_quantization_configs(&projector.checkpoint, translate_mmproj_weight_name)?;
+    if !configs.is_empty() {
+        return Err(Error::UnsupportedArchitecture(
+            "Gemma 4 mmproj towers must use dense F16, BF16, or F32 tensors".into(),
+        ));
+    }
+
+    let has_vision =
+        gguf_optional_bool(&projector.metadata, "clip.has_vision_encoder")?.unwrap_or(false);
+    let has_audio =
+        gguf_optional_bool(&projector.metadata, "clip.has_audio_encoder")?.unwrap_or(false);
+    let vision_config = has_vision
+        .then(|| {
+            let hidden_size = gguf_i32(&projector.metadata, "clip.vision.embedding_length")?;
+            let num_attention_heads =
+                gguf_i32(&projector.metadata, "clip.vision.attention.head_count")?;
+            let head_dim =
+                gguf_optional_i64(&projector.metadata, "clip.vision.attention.key_length")?
+                    .map(i32::try_from)
+                    .transpose()
+                    .map_err(|_| {
+                        Error::UnsupportedArchitecture(
+                            "Gemma 4 vision head width exceeds i32".into(),
+                        )
+                    })?
+                    .unwrap_or_else(|| hidden_size / num_attention_heads.max(1));
+            let num_key_value_heads =
+                gguf_optional_i64(&projector.metadata, "clip.vision.attention.head_count_kv")?
+                    .map(i32::try_from)
+                    .transpose()
+                    .map_err(|_| {
+                        Error::UnsupportedArchitecture(
+                            "Gemma 4 vision KV-head count exceeds i32".into(),
+                        )
+                    })?
+                    .unwrap_or(num_attention_heads);
+            let hidden_activation = projector
+                .metadata
+                .get("clip.vision.hidden_activation")
+                .and_then(GgufMetadataValue::as_str)
+                .unwrap_or("gelu_pytorch_tanh")
+                .to_string();
+            let rope_theta = gguf_optional_f32(&projector.metadata, "clip.vision.rope.freq_base")?
+                .unwrap_or(100.0);
+            Ok::<Gemma4VisionConfig, Error>(Gemma4VisionConfig {
+                hidden_size,
+                intermediate_size: gguf_i32(
+                    &projector.metadata,
+                    "clip.vision.feed_forward_length",
+                )?,
+                num_hidden_layers: gguf_i32(&projector.metadata, "clip.vision.block_count")?,
+                num_attention_heads,
+                num_key_value_heads,
+                head_dim,
+                patch_size: gguf_i32(&projector.metadata, "clip.vision.patch_size")?,
+                pooling_kernel_size: gguf_i32(
+                    &projector.metadata,
+                    "clip.vision.pooling_kernel_size",
+                )?,
+                position_embedding_size: gguf_i32(
+                    &projector.metadata,
+                    "clip.vision.position_embedding_size",
+                )?,
+                rms_norm_eps: gguf_f32(
+                    &projector.metadata,
+                    "clip.vision.attention.layer_norm_rms_epsilon",
+                )?,
+                hidden_activation,
+                standardize: gguf_optional_bool(&projector.metadata, "clip.vision.standardize")?
+                    .unwrap_or(false),
+                rope_parameters: Some(HashMap::from([(
+                    "rope_theta".into(),
+                    FloatOrString::Float(rope_theta),
+                )])),
+            })
+        })
+        .transpose()?;
+    let audio_config = has_audio
+        .then(|| {
+            let channels =
+                gguf_i64_values(&projector.metadata, "clip.audio.subsampling_conv_channels")?
+                    .into_iter()
+                    .map(|value| {
+                        i32::try_from(value).map_err(|_| {
+                            Error::UnsupportedArchitecture(
+                                "Gemma 4 audio subsampling channel exceeds i32".into(),
+                            )
+                        })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+            Ok::<Gemma4AudioConfig, Error>(Gemma4AudioConfig {
+                hidden_size: gguf_i32(&projector.metadata, "clip.audio.embedding_length")?,
+                num_hidden_layers: gguf_i32(&projector.metadata, "clip.audio.block_count")?,
+                num_attention_heads: gguf_i32(
+                    &projector.metadata,
+                    "clip.audio.attention.head_count",
+                )?,
+                output_proj_dims: gguf_i32(&projector.metadata, "clip.audio.projection_dim")?,
+                conv_kernel_size: gguf_i32(&projector.metadata, "clip.audio.conv_kernel_size")?,
+                attention_chunk_size: gguf_i32(
+                    &projector.metadata,
+                    "clip.audio.attention.chunk_size",
+                )?,
+                attention_context_left: gguf_i32(
+                    &projector.metadata,
+                    "clip.audio.attention.context_left",
+                )?,
+                attention_context_right: gguf_i32(
+                    &projector.metadata,
+                    "clip.audio.attention.context_right",
+                )?,
+                attention_invalid_logits_value: gguf_f32(
+                    &projector.metadata,
+                    "clip.audio.attention.invalid_logits_value",
+                )?,
+                attention_logit_cap: gguf_f32(
+                    &projector.metadata,
+                    "clip.audio.attention.logit_cap",
+                )?,
+                residual_weight: gguf_f32(&projector.metadata, "clip.audio.residual_weight")?,
+                rms_norm_eps: gguf_f32(
+                    &projector.metadata,
+                    "clip.audio.attention.layer_norm_rms_epsilon",
+                )?,
+                subsampling_conv_channels: channels,
+            })
+        })
+        .transpose()?;
+    if let Some(config) = &vision_config {
+        for (name, value) in [
+            ("embedding_length", config.hidden_size),
+            ("feed_forward_length", config.intermediate_size),
+            ("block_count", config.num_hidden_layers),
+            ("attention.head_count", config.num_attention_heads),
+            ("attention.head_count_kv", config.num_key_value_heads),
+            ("attention.key_length", config.head_dim),
+            ("patch_size", config.patch_size),
+            ("pooling_kernel_size", config.pooling_kernel_size),
+            ("position_embedding_size", config.position_embedding_size),
+        ] {
+            if value <= 0 {
+                return Err(Error::UnsupportedArchitecture(format!(
+                    "Gemma 4 vision mmproj {name} must be positive, got {value}"
+                )));
+            }
+        }
+        if config.num_attention_heads % config.num_key_value_heads != 0 {
+            return Err(Error::UnsupportedArchitecture(format!(
+                "Gemma 4 vision query heads ({}) must be divisible by KV heads ({})",
+                config.num_attention_heads, config.num_key_value_heads
+            )));
+        }
+        if config.hidden_activation != "gelu_pytorch_tanh" {
+            return Err(Error::UnsupportedArchitecture(format!(
+                "Gemma 4 vision mmproj activation must be gelu_pytorch_tanh, got {:?}",
+                config.hidden_activation
+            )));
+        }
+        if !config.rms_norm_eps.is_finite()
+            || config.rms_norm_eps <= 0.0
+            || !config.rope_theta().is_finite()
+            || config.rope_theta() <= 0.0
+        {
+            return Err(Error::UnsupportedArchitecture(
+                "Gemma 4 vision mmproj requires positive finite normalization epsilon and RoPE base"
+                    .into(),
+            ));
+        }
+    }
+    if let Some(config) = &audio_config {
+        for (name, value) in [
+            ("embedding_length", config.hidden_size),
+            ("block_count", config.num_hidden_layers),
+            ("attention.head_count", config.num_attention_heads),
+            ("projection_dim", config.output_proj_dims),
+            ("conv_kernel_size", config.conv_kernel_size),
+            ("attention.chunk_size", config.attention_chunk_size),
+        ] {
+            if value <= 0 {
+                return Err(Error::UnsupportedArchitecture(format!(
+                    "Gemma 4 audio mmproj {name} must be positive, got {value}"
+                )));
+            }
+        }
+        if config.hidden_size % config.num_attention_heads != 0 {
+            return Err(Error::UnsupportedArchitecture(format!(
+                "Gemma 4 audio hidden width {} must be divisible by {} attention heads",
+                config.hidden_size, config.num_attention_heads
+            )));
+        }
+        if config.attention_context_right != 0 || config.attention_context_left <= 1 {
+            return Err(Error::UnsupportedArchitecture(format!(
+                "Gemma 4 audio mmproj requires context_right 0 and context_left greater than one, got {} and {}",
+                config.attention_context_right, config.attention_context_left
+            )));
+        }
+        if config.subsampling_conv_channels.len() != 2
+            || config
+                .subsampling_conv_channels
+                .iter()
+                .any(|&channel| channel <= 0)
+        {
+            return Err(Error::UnsupportedArchitecture(format!(
+                "Gemma 4 audio mmproj requires exactly two positive subsampling channels, got {:?}",
+                config.subsampling_conv_channels
+            )));
+        }
+        for (name, value) in [
+            (
+                "attention.invalid_logits_value",
+                config.attention_invalid_logits_value,
+            ),
+            ("attention.logit_cap", config.attention_logit_cap),
+            ("residual_weight", config.residual_weight),
+            ("attention.layer_norm_rms_epsilon", config.rms_norm_eps),
+        ] {
+            if !value.is_finite() || (name.ends_with("epsilon") && value <= 0.0) {
+                return Err(Error::UnsupportedArchitecture(format!(
+                    "Gemma 4 audio mmproj {name} must be finite, got {value}"
+                )));
+            }
+        }
+    }
+    let token_id = |key: &str| -> Result<Option<i32>, Error> {
+        gguf_optional_i64(model_metadata, key)?
+            .map(|value| {
+                i32::try_from(value).map_err(|_| {
+                    Error::UnsupportedArchitecture(format!(
+                        "Gemma 4 metadata value {key:?} exceeds i32"
+                    ))
+                })
+            })
+            .transpose()
+    };
+    let image_token_id = token_id("gemma4.image_token_id")?;
+    let video_token_id = token_id("gemma4.video_token_id")?;
+    let audio_token_id = token_id("gemma4.audio_token_id")?;
+    for (name, token) in [
+        ("image", image_token_id),
+        ("video", video_token_id),
+        ("audio", audio_token_id),
+    ] {
+        if token.is_some_and(|token| token < 0 || token >= args.vocab_size) {
+            return Err(Error::UnsupportedArchitecture(format!(
+                "Gemma 4 {name} placeholder id {token:?} is outside vocabulary size {}",
+                args.vocab_size
+            )));
+        }
+    }
+    Ok((
+        vision_config,
+        image_token_id,
+        video_token_id,
+        audio_config,
+        audio_token_id,
+    ))
+}
+
+pub(crate) fn translate_mmproj_weight_name(name: &str) -> String {
+    for (source, target) in [
+        ("vision_tower", "model.vision_tower"),
+        ("embed_vision", "model.embed_vision"),
+        ("audio_tower", "model.audio_tower"),
+        ("embed_audio", "model.embed_audio"),
+    ] {
+        if name == source || name.starts_with(&format!("{source}.")) {
+            return name.replacen(source, target, 1);
+        }
+    }
+    name.to_string()
+}
+
+fn load_gemma4_mmproj_weights(
+    model: &mut Model,
+    projector: &Gemma4MmprojGguf,
+    quantization: Option<WeightQuantization>,
+    stream: &Stream,
+    config: &StrictLoadConfig,
+    report: &mut StrictLoadReport,
+) -> Result<(), Error> {
+    let mut materializer = projector.checkpoint.materializer();
+    for tensor in projector.checkpoint.catalog().tensors() {
+        let physical = &tensor.descriptor().name;
+        for (name, value) in materializer.converted_tensor(physical)?.into_arrays() {
+            let target = translate_mmproj_weight_name(&name);
+            let quantization = quantization
+                .filter(|_| target.starts_with("model.embed_vision.embedding_projection."))
+                .or_else(|| {
+                    quantization
+                        .filter(|_| target.starts_with("model.embed_audio.embedding_projection."))
+                });
+            load_named_array_strict(
+                model,
+                target,
+                value,
+                quantization.map(|value| (value, stream)),
+                config,
+                report,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn gguf_optional_bool(
+    metadata: &HashMap<String, GgufMetadataValue>,
+    key: &str,
+) -> Result<Option<bool>, Error> {
+    match metadata.get(key) {
+        Some(GgufMetadataValue::Bool(value)) => Ok(Some(*value)),
+        Some(_) => Err(Error::UnsupportedArchitecture(format!(
+            "GGUF metadata key {key:?} must be boolean"
+        ))),
+        None => Ok(None),
+    }
 }
 
 fn load_gemma4_gguf_weights(

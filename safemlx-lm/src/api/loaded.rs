@@ -1843,16 +1843,27 @@ pub(super) fn load_gguf_model_data(
                 (Model::GptOss(model), loaded.eos_token_ids)
             }
             GgufArchitecture::Gemma4 => {
+                let mmproj = gemma4::open_sibling_mmproj(gguf_file)?;
+                #[cfg(any(feature = "image-processing", feature = "audio-processing"))]
+                if let Some(mmproj) = &mmproj {
+                    processor = Some(ModelProcessor::load_gemma4_gguf(
+                        &metadata,
+                        &mmproj.metadata,
+                    )?);
+                }
                 let loaded = gemma4::load_gemma4_gguf_checkpoint(
                     &checkpoint,
                     metadata.clone(),
+                    mmproj.as_ref(),
                     Some(quantization),
                     stream,
                     weights_stream,
                 )?;
                 let model =
-                    crate::architectures::gemma4::layerwise::execute_transformed_gemma4_text_model(
+                    crate::architectures::gemma4::layerwise::execute_transformed_gemma4_model_with_modalities(
                         loaded.model,
+                        loaded.vision_config,
+                        loaded.audio_config,
                         stream,
                         weights_stream,
                     )?;
@@ -2012,10 +2023,19 @@ pub(super) fn load_gguf_model_data(
                 (Model::Inkling(loaded), eos_token_ids)
             }
             GgufArchitecture::Gemma4 => {
+                let mmproj = gemma4::open_sibling_mmproj(gguf_file)?;
+                #[cfg(any(feature = "image-processing", feature = "audio-processing"))]
+                if let Some(mmproj) = &mmproj {
+                    processor = Some(ModelProcessor::load_gemma4_gguf(
+                        &metadata,
+                        &mmproj.metadata,
+                    )?);
+                }
                 let (loaded, eos_token_ids) =
                     crate::architectures::gemma4::layerwise::load_gemma4_gguf_layerwise_model(
                         &checkpoint,
                         &metadata,
+                        mmproj.as_ref(),
                         options.weight_residency,
                         stream,
                         weights_stream,

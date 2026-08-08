@@ -749,9 +749,9 @@ without expanding matrix weights to float16.
 Q5_0 and Q5_1 tensors are losslessly repacked into MLX's five-bit affine
 layout; unsupported GGUF tensor types return an error. Model dispatch uses
 `general.architecture`; the current GGUF adapters support text-only `deepseek2`,
-`gemma4`, `gpt-oss`, `kimi-linear`, `llama`, `mistral`, `lfm2`, `lfm2moe`, `nemotron_h`,
+`gpt-oss`, `kimi-linear`, `llama`, `mistral`, `lfm2`, `lfm2moe`, `nemotron_h`,
 `nemotron_h_moe`, `qwen2`, `qwen3`, `qwen3moe`, dense `qwen35`, and `qwen35moe`
-architectures, plus multimodal `inkling`, `qwen3next`, `qwen3vl`, and
+architectures, plus multimodal `gemma4`, `inkling`, `qwen3next`, `qwen3vl`, and
 `qwen3vlmoe` with separate projectors. For Qwen3-VL, put the llama.cpp-style dense F16/BF16/F32
 `mmproj-*.gguf` next to the language-model GGUF. The single-path loaders prefer
 the unique dense projector automatically; callers that need an explicit pair
@@ -763,8 +763,8 @@ settings. Dense Qwen3.5 uses the hybrid linear/full-attention runtime with
 conventional SwiGLU layers; Qwen3.5 MoE keeps its
 Q2_K/Q3_K/Q4_0/Q4_1/Q4_K/Q5_K/Q6_K/Q8_0 routed expert banks packed while loading mixed
 quantization types. Gemma 4 dense and MoE text weights support fused or separate
-GGUF expert projections, native packed affine execution, and external MTP assistant
-files. Multimodal projector files remain separate formats. Nemotron-H latent-space MoE and
+GGUF expert projections, native packed affine execution, external MTP assistant
+files, and a sibling dense media-projector GGUF. Nemotron-H latent-space MoE and
 Omni/multimodal checkpoints remain separate formats. Quantized Qwen3-VL language
 GGUFs retain their supported packed affine weights while the vision projector
 remains dense; quantized Qwen3-VL projectors and Qwen3.5-VL GGUF files are not
@@ -790,6 +790,21 @@ checkpoint and sibling mmproj store before rank-local selection. Stage-zero visi
 typed ingress, MRoPE/DeepStack payload construction, and TP- or EP-local text
 layers remain adapter-authored semantics rather than format- or
 topology-specific runtimes.
+
+Gemma 4 GGUF discovers a unique nearby `mmproj-*.gguf`, preferring a filename
+marked F16, BF16, or F32, or accepts an explicit pair through
+`architectures::gemma4::model::load_gemma4_gguf_with_mmproj`. The projector uses
+`general.architecture = clip`, Boolean `clip.has_vision_encoder` and
+`clip.has_audio_encoder`, and `gemma4` vision/audio projector types. Typed
+`clip.vision.*` and `clip.audio.*` geometry reconstructs the native tower
+configuration; placeholder and media-boundary token IDs remain `gemma4.*`
+metadata in the language GGUF. Projector tensors retain the released
+`vision_tower.*`, `embed_vision.*`, `audio_tower.*`, and `embed_audio.*` names.
+The loader translates these into the ordinary Gemma module tree, validates the
+complete catalog and dense F16/BF16/F32 encoding before materialization, and
+combines both files in one bounded-read store. Resident, host-layerwise,
+dense-streamed, TP, PP, cached decode, and queued multimodal execution therefore
+use the same semantic adapter as SafeTensors.
 
 Kimi Linear GGUF accepts split `attn_k_b`/`attn_v_b` and combined
 `attn_kv_b` projections, vector and singleton-ranked convolution tensors, dense
@@ -1014,7 +1029,7 @@ formats. Dense families have no EP migration.
 | Qwen3 MoE | TP, PP, EP | Complete | None |
 | GPT-OSS | TP, PP, EP | Complete | None; native MXFP4 SafeTensors and canonical type-39 GGUF are covered |
 | Llama/Mistral | TP, PP | TP+PP complete | None; EP does not apply |
-| Gemma 4 | TP, PP | TP+PP complete | SafeTensors typed text/image/video/audio ingress, both media towers, cached decode, queued scheduling, and all non-expert residency policies share the pipeline path; GGUF remains text-only until a Gemma media-projector artifact binding contract is added; EP does not apply |
+| Gemma 4 | TP, PP | TP+PP complete | None; SafeTensors and text-plus-projector GGUF support typed text/image/video/audio ingress, both media towers, cached decode, queued scheduling, and all non-expert residency policies; EP does not apply |
 | DeepSeek-V3/R1 | TP, PP, EP | Complete | None; split, packed-affine, native block-FP8 SafeTensors and canonical DeepSeek2 GGUF recipes share the Cartesian path |
 | Kimi Linear | TP, PP, EP | Complete | None |
 | LFM2 dense | TP, PP | TP+PP complete | None; EP does not apply |
@@ -1227,6 +1242,12 @@ cargo test -p safemlx-lm --test distributed_gemma4_multimodal_pipeline_ring \
   ring_gemma4_multimodal_dense_stream_pipeline -- --ignored --exact --nocapture
 cargo test -p safemlx-lm --test distributed_gemma4_multimodal_pipeline_ring \
   ring_gemma4_multimodal_host_tensor_pipeline -- --ignored --exact --nocapture
+cargo test -p safemlx-lm --test distributed_gemma4_multimodal_pipeline_ring \
+  ring_gemma4_multimodal_gguf_pipeline -- --ignored --exact --nocapture
+cargo test -p safemlx-lm --test distributed_gemma4_multimodal_pipeline_ring \
+  ring_gemma4_multimodal_gguf_dense_stream_pipeline -- --ignored --exact --nocapture
+cargo test -p safemlx-lm --test distributed_gemma4_multimodal_pipeline_ring \
+  ring_gemma4_multimodal_gguf_host_tensor_pipeline -- --ignored --exact --nocapture
 cargo test -p safemlx-lm --test distributed_pipeline_ring \
   ring_two_process_qwen2_pipeline -- --ignored --exact --nocapture
 cargo test -p safemlx-lm --test distributed_pipeline_ring \

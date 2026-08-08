@@ -6223,6 +6223,213 @@ pub(crate) fn validate_inkling_mmproj_gguf(
     finish(issues)
 }
 
+pub(crate) fn validate_gemma4_mmproj_gguf(
+    model_checkpoint: &GgufCheckpoint,
+    model_metadata: &HashMap<String, GgufMetadataValue>,
+    mmproj: &gemma4::Gemma4MmprojGguf,
+) -> StructuralValidation {
+    if let Err(error) = gemma4::validate_mmproj_metadata(&mmproj.metadata) {
+        return invalid_geometry(error.to_string());
+    }
+    if let Err(error) = mmproj
+        .checkpoint
+        .catalog()
+        .translated_outputs(gemma4::translate_mmproj_weight_name)
+    {
+        return invalid_geometry(error.to_string());
+    }
+    let mut args = match gemma4::gemma4_args_from_gguf_catalog(model_checkpoint, model_metadata) {
+        Ok(args) => args,
+        Err(error) => return invalid_geometry(error.to_string()),
+    };
+    let (vision, _, _, audio, _) =
+        match gemma4::apply_mmproj_args(&mut args, model_metadata, mmproj) {
+            Ok(parts) => parts,
+            Err(error) => return invalid_geometry(error.to_string()),
+        };
+    let plan = std::cell::RefCell::new(Vec::new());
+    let push = |physical: String, shape: Vec<usize>| {
+        let logical = gemma4::translate_mmproj_weight_name(&physical);
+        plan.borrow_mut().push(expected_dense_with_gguf_shape(
+            logical,
+            physical,
+            shape.clone(),
+            shape,
+        ));
+    };
+    let clipped = |prefix: String, shape: Vec<usize>| {
+        push(format!("{prefix}.linear.weight"), shape);
+        for suffix in ["input_min", "input_max", "output_min", "output_max"] {
+            push(format!("{prefix}.{suffix}"), vec![]);
+        }
+    };
+    if let Some(config) = vision {
+        let hidden = config.hidden_size as usize;
+        let intermediate = config.intermediate_size as usize;
+        let query = config.num_attention_heads as usize * config.head_dim as usize;
+        let key_value = config.num_key_value_heads as usize * config.head_dim as usize;
+        push(
+            "vision_tower.patch_embedder.input_proj.weight".into(),
+            vec![hidden, 3 * (config.patch_size as usize).pow(2)],
+        );
+        push(
+            "vision_tower.patch_embedder.position_embedding_table".into(),
+            vec![2, config.position_embedding_size as usize, hidden],
+        );
+        if config.standardize {
+            push("vision_tower.std_bias".into(), vec![hidden]);
+            push("vision_tower.std_scale".into(), vec![hidden]);
+        }
+        for layer in 0..config.num_hidden_layers as usize {
+            let root = format!("vision_tower.encoder.layers.{layer}");
+            for name in [
+                "input_layernorm.weight",
+                "post_attention_layernorm.weight",
+                "pre_feedforward_layernorm.weight",
+                "post_feedforward_layernorm.weight",
+                "self_attn.q_norm.weight",
+                "self_attn.k_norm.weight",
+            ] {
+                let width = if name.contains("q_norm") || name.contains("k_norm") {
+                    config.head_dim as usize
+                } else {
+                    hidden
+                };
+                push(format!("{root}.{name}"), vec![width]);
+            }
+            for (name, shape) in [
+                ("self_attn.q_proj", vec![query, hidden]),
+                ("self_attn.k_proj", vec![key_value, hidden]),
+                ("self_attn.v_proj", vec![key_value, hidden]),
+                ("self_attn.o_proj", vec![hidden, query]),
+                ("mlp.gate_proj", vec![intermediate, hidden]),
+                ("mlp.up_proj", vec![intermediate, hidden]),
+                ("mlp.down_proj", vec![hidden, intermediate]),
+            ] {
+                clipped(format!("{root}.{name}"), shape);
+            }
+        }
+        push(
+            "embed_vision.embedding_projection.weight".into(),
+            vec![args.hidden_size as usize, hidden],
+        );
+    }
+    if let Some(config) = audio {
+        let hidden = config.hidden_size as usize;
+        let head = hidden / config.num_attention_heads as usize;
+        let [first, second] = config.subsampling_conv_channels.as_slice() else {
+            return invalid_geometry(
+                "Gemma 4 audio requires exactly two subsampling convolution channels".into(),
+            );
+        };
+        let first = *first as usize;
+        let second = *second as usize;
+        for (name, shape) in [
+            (
+                "audio_tower.subsample_conv_projection.layer0.conv.weight",
+                vec![first, 3, 3, 1],
+            ),
+            (
+                "audio_tower.subsample_conv_projection.layer0.norm.weight",
+                vec![first],
+            ),
+            (
+                "audio_tower.subsample_conv_projection.layer1.conv.weight",
+                vec![second, 3, 3, first],
+            ),
+            (
+                "audio_tower.subsample_conv_projection.layer1.norm.weight",
+                vec![second],
+            ),
+            (
+                "audio_tower.subsample_conv_projection.input_proj_linear.weight",
+                vec![hidden, 32 * second],
+            ),
+            (
+                "audio_tower.output_proj.weight",
+                vec![config.output_proj_dims as usize, hidden],
+            ),
+            (
+                "audio_tower.output_proj.bias",
+                vec![config.output_proj_dims as usize],
+            ),
+        ] {
+            push(name.into(), shape);
+        }
+        for layer in 0..config.num_hidden_layers as usize {
+            let root = format!("audio_tower.layers.{layer}");
+            for name in [
+                "feed_forward1.pre_layer_norm.weight",
+                "feed_forward1.post_layer_norm.weight",
+                "norm_pre_attn.weight",
+                "norm_post_attn.weight",
+                "lconv1d.pre_layer_norm.weight",
+                "lconv1d.conv_norm.weight",
+                "feed_forward2.pre_layer_norm.weight",
+                "feed_forward2.post_layer_norm.weight",
+                "norm_out.weight",
+            ] {
+                push(format!("{root}.{name}"), vec![hidden]);
+            }
+            for (name, shape) in [
+                ("feed_forward1.ffw_layer_1", vec![4 * hidden, hidden]),
+                ("feed_forward1.ffw_layer_2", vec![hidden, 4 * hidden]),
+                ("self_attn.q_proj", vec![hidden, hidden]),
+                ("self_attn.k_proj", vec![hidden, hidden]),
+                ("self_attn.v_proj", vec![hidden, hidden]),
+                ("self_attn.post", vec![hidden, hidden]),
+                ("lconv1d.linear_start", vec![2 * hidden, hidden]),
+                ("lconv1d.linear_end", vec![hidden, hidden]),
+                ("feed_forward2.ffw_layer_1", vec![4 * hidden, hidden]),
+                ("feed_forward2.ffw_layer_2", vec![hidden, 4 * hidden]),
+            ] {
+                clipped(format!("{root}.{name}"), shape);
+            }
+            for (name, shape) in [
+                ("self_attn.relative_k_proj.weight", vec![hidden, hidden]),
+                ("self_attn.per_dim_scale", vec![head]),
+                (
+                    "lconv1d.depthwise_conv1d.weight",
+                    vec![hidden, config.conv_kernel_size as usize, 1],
+                ),
+            ] {
+                push(format!("{root}.{name}"), shape);
+            }
+        }
+        push(
+            "embed_audio.embedding_projection.weight".into(),
+            vec![args.hidden_size as usize, config.output_proj_dims as usize],
+        );
+    }
+    let plan = plan.into_inner();
+    let allowed = plan
+        .iter()
+        .map(|tensor| tensor.gguf_name.clone())
+        .collect::<BTreeSet<_>>();
+    let mut issues = validate_gguf_plan(&mmproj.checkpoint, plan, "Gemma 4 mmproj");
+    for tensor in mmproj.checkpoint.catalog().tensors() {
+        let descriptor = tensor.descriptor();
+        if !allowed.contains(&descriptor.name) {
+            issues.push(unexpected_layout(&descriptor.name, "Gemma 4 mmproj GGUF"));
+        } else if !matches!(
+            descriptor.ggml_type,
+            GgufType::F32 | GgufType::F16 | GgufType::Bf16
+        ) {
+            issues.push(StructuralIssue {
+                kind: StructuralIssueKind::UnsupportedEncoding,
+                detail: format!(
+                    "Gemma 4 mmproj tensor {:?} must be dense F16, BF16, or F32, got {:?}",
+                    descriptor.name, descriptor.ggml_type
+                ),
+                tensor_name: Some(descriptor.name.clone()),
+                tensor_type_code: Some(descriptor.ggml_type.code()),
+                metadata_key: None,
+            });
+        }
+    }
+    finish(issues)
+}
+
 fn gemma4_gguf_expected(
     args: &gemma4::ModelArgs,
     checkpoint: &GgufCheckpoint,

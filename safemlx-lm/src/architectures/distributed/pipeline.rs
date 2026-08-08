@@ -5400,22 +5400,26 @@ pub fn load_pipeline_model_with_options(
                 )
             }
             crate::api::GgufArchitecture::Gemma4 => {
-                let prepared =
-                    gemma4::prepare_gemma4_gguf_checkpoint(&checkpoint, &metadata, None)?;
-                let store: SharedWeightStore =
-                    Arc::new(GgufWeightStore::new_with_max_mapped_shards(
-                        checkpoint,
-                        gemma4::translate_gguf_weight_name,
-                        max_mapped_shards,
-                    )?);
+                let mmproj = gemma4::open_sibling_mmproj(model_dir)?;
+                let prepared = gemma4::prepare_gemma4_gguf_checkpoint(
+                    &checkpoint,
+                    &metadata,
+                    mmproj.as_ref(),
+                    None,
+                )?;
+                let store = crate::architectures::gemma4::layerwise::gemma4_gguf_store(
+                    &checkpoint,
+                    mmproj.as_ref(),
+                    max_mapped_shards,
+                )?;
                 load_gemma_pipeline(
                     GemmaPipelineConfig {
                         args: prepared.args,
-                        vision_config: None,
-                        image_token_id: None,
-                        video_token_id: None,
-                        audio_config: None,
-                        audio_token_id: None,
+                        vision_config: prepared.vision_config,
+                        image_token_id: prepared.image_token_id,
+                        video_token_id: prepared.video_token_id,
+                        audio_config: prepared.audio_config,
+                        audio_token_id: prepared.audio_token_id,
                     },
                     store,
                     topology,

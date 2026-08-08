@@ -1112,6 +1112,62 @@ fn inspect_gguf_projector(
             }
             Err(error) => reject_projector(report, path.to_path_buf(), error.to_string(), true),
         },
+        GgufArchitecture::Gemma4 => match gemma4::open_sibling_mmproj(path) {
+            Ok(Some(mmproj)) => {
+                let projector_path =
+                    crate::runtime::checkpoint::gguf::find_sibling_mmproj(path, "gemma4")
+                        .ok()
+                        .flatten()
+                        .unwrap_or_else(|| path.to_path_buf());
+                let validation = structural::validate_gemma4_mmproj_gguf(
+                    model_checkpoint,
+                    model_metadata,
+                    &mmproj,
+                );
+                let exact = matches!(validation, structural::StructuralValidation::Exact);
+                apply_structural_validation(report, validation, &projector_path);
+                report.multimodal = if !exact {
+                    InspectionReadiness::Invalid
+                } else if cfg!(any(
+                    feature = "image-processing",
+                    feature = "audio-processing"
+                )) {
+                    InspectionReadiness::Ready
+                } else {
+                    InspectionReadiness::Unsupported
+                };
+                report.requirements.push(InspectionRequirement {
+                    code: InspectionIssueCode::MissingMediaProjector,
+                    readiness: if exact {
+                        InspectionReadiness::Ready
+                    } else {
+                        InspectionReadiness::Invalid
+                    },
+                    detail: if exact {
+                        "validated Gemma 4 vision/audio projector".into()
+                    } else {
+                        "Gemma 4 media projector is structurally incompatible".into()
+                    },
+                    path: Some(projector_path),
+                });
+            }
+            Ok(None) => {
+                report.multimodal = InspectionReadiness::Missing;
+                report.requirements.push(InspectionRequirement {
+                    code: InspectionIssueCode::MissingMediaProjector,
+                    readiness: InspectionReadiness::Missing,
+                    detail: "Gemma 4 text loading is available, but image/audio input requires a sibling mmproj GGUF".into(),
+                    path: None,
+                });
+                report.issue(
+                    InspectionIssueCode::MissingMediaProjector,
+                    InspectionSeverity::Warning,
+                    "Gemma 4 has no sibling multimodal projector; text loading remains available",
+                    Some(path.to_path_buf()),
+                );
+            }
+            Err(error) => reject_projector(report, path.to_path_buf(), error.to_string(), true),
+        },
         _ => report.multimodal = InspectionReadiness::NotApplicable,
     }
 }
@@ -7962,6 +8018,7 @@ mod tests {
             crate::architectures::gemma4::model::prepare_gemma4_gguf_checkpoint(
                 &checkpoint,
                 &metadata,
+                None,
                 None,
             )
             .unwrap();

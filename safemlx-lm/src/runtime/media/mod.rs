@@ -501,6 +501,19 @@ impl ModelProcessor {
         })
     }
 
+    #[cfg(any(feature = "image-processing", feature = "audio-processing"))]
+    pub(crate) fn load_gemma4_gguf(
+        model_metadata: &std::collections::HashMap<String, safemlx::ops::GgufMetadataValue>,
+        projector_metadata: &std::collections::HashMap<String, safemlx::ops::GgufMetadataValue>,
+    ) -> Result<Self, Error> {
+        Ok(Self {
+            kind: ProcessorKind::Gemma4(gemma4::Gemma4Processor::from_gguf(
+                model_metadata,
+                projector_metadata,
+            )?),
+        })
+    }
+
     pub(crate) fn load_inkling(model_dir: &Path) -> Result<Option<Self>, Error> {
         inkling::InklingProcessor::load(model_dir).map(|processor| {
             processor.map(|processor| Self {

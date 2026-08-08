@@ -234,6 +234,84 @@ impl Gemma4Processor {
         }))
     }
 
+    #[cfg(any(feature = "image-processing", feature = "audio-processing"))]
+    pub(crate) fn from_gguf(
+        model_metadata: &std::collections::HashMap<String, safemlx::ops::GgufMetadataValue>,
+        projector_metadata: &std::collections::HashMap<String, safemlx::ops::GgufMetadataValue>,
+    ) -> Result<Self, Error> {
+        use safemlx::ops::GgufMetadataValue;
+
+        let optional_u32 = |metadata: &std::collections::HashMap<String, GgufMetadataValue>,
+                            key: &str|
+         -> Result<Option<u32>, Error> {
+            super::model::gguf_optional_i64(metadata, key)?
+                .map(|value| {
+                    u32::try_from(value).map_err(|_| {
+                        Error::Processor(format!("Gemma 4 GGUF metadata key {key:?} must fit u32"))
+                    })
+                })
+                .transpose()
+        };
+        #[cfg(feature = "image-processing")]
+        let patch_size = optional_u32(projector_metadata, "clip.vision.patch_size")?
+            .unwrap_or(default_patch_size() as u32) as usize;
+        #[cfg(feature = "image-processing")]
+        let pooling_kernel_size =
+            optional_u32(projector_metadata, "clip.vision.pooling_kernel_size")?
+                .unwrap_or(default_pooling_kernel_size() as u32) as usize;
+        #[cfg(feature = "image-processing")]
+        let max_soft_tokens = optional_u32(projector_metadata, "clip.vision.max_soft_tokens")?
+            .unwrap_or(default_soft_tokens() as u32) as usize;
+        #[cfg(feature = "image-processing")]
+        if !matches!(max_soft_tokens, 70 | 140 | 280 | 560 | 1120) {
+            return Err(Error::Processor(format!(
+                "Gemma 4 GGUF max_soft_tokens must be one of 70, 140, 280, 560, or 1120, got {max_soft_tokens}"
+            )));
+        }
+        #[cfg(feature = "image-processing")]
+        let video_max_soft_tokens =
+            optional_u32(projector_metadata, "clip.vision.video.max_soft_tokens")?
+                .unwrap_or(default_video_soft_tokens() as u32) as usize;
+        #[cfg(feature = "image-processing")]
+        let video_num_frames = optional_u32(projector_metadata, "clip.vision.video.frame_count")?
+            .unwrap_or(default_video_frames() as u32) as usize;
+        #[cfg(feature = "image-processing")]
+        if !matches!(video_max_soft_tokens, 70 | 140 | 280 | 560 | 1120) || video_num_frames == 0 {
+            return Err(Error::Processor(format!(
+                "Gemma 4 GGUF video processor requires a supported soft-token budget and positive frame count, got {video_max_soft_tokens} tokens and {video_num_frames} frames"
+            )));
+        }
+        Ok(Self {
+            #[cfg(feature = "image-processing")]
+            patch_size,
+            #[cfg(feature = "image-processing")]
+            pooling_kernel_size,
+            #[cfg(feature = "image-processing")]
+            max_soft_tokens,
+            #[cfg(feature = "image-processing")]
+            boi_token_id: optional_u32(model_metadata, "gemma4.boi_token_id")?,
+            #[cfg(feature = "image-processing")]
+            eoi_token_id: optional_u32(model_metadata, "gemma4.eoi_token_id")?,
+            #[cfg(feature = "image-processing")]
+            video_patch_size: optional_u32(projector_metadata, "clip.vision.video.patch_size")?
+                .unwrap_or(patch_size as u32) as usize,
+            #[cfg(feature = "image-processing")]
+            video_pooling_kernel_size: optional_u32(
+                projector_metadata,
+                "clip.vision.video.pooling_kernel_size",
+            )?
+            .unwrap_or(pooling_kernel_size as u32) as usize,
+            #[cfg(feature = "image-processing")]
+            video_max_soft_tokens,
+            #[cfg(feature = "image-processing")]
+            video_num_frames,
+            #[cfg(feature = "audio-processing")]
+            boa_token_id: optional_u32(model_metadata, "gemma4.boa_token_id")?,
+            #[cfg(feature = "audio-processing")]
+            eoa_token_id: optional_u32(model_metadata, "gemma4.eoa_token_id")?,
+        })
+    }
+
     pub(crate) fn prepare_input(
         &self,
         input: &[ProcessorInput<'_>],
@@ -539,6 +617,10 @@ fn pack_patches(
 
 #[cfg(all(test, feature = "image-processing"))]
 mod tests {
+    use std::collections::HashMap;
+
+    use safemlx::ops::GgufMetadataValue;
+
     use super::{aspect_ratio_preserving_size, Gemma4Processor};
     use crate::{
         runtime::media::input::{InputPayload, Modality},
@@ -552,6 +634,34 @@ mod tests {
         assert_eq!(height % 48, 0);
         assert_eq!(width % 48, 0);
         assert!(height * width <= 2520 * 16 * 16);
+    }
+
+    #[test]
+    fn gguf_processor_uses_projector_geometry_and_language_boundaries() {
+        let model = HashMap::from([
+            ("gemma4.boi_token_id".into(), GgufMetadataValue::Uint32(43)),
+            ("gemma4.eoi_token_id".into(), GgufMetadataValue::Uint32(44)),
+        ]);
+        let projector = HashMap::from([
+            (
+                "clip.vision.patch_size".into(),
+                GgufMetadataValue::Uint32(2),
+            ),
+            (
+                "clip.vision.pooling_kernel_size".into(),
+                GgufMetadataValue::Uint32(2),
+            ),
+            (
+                "clip.vision.max_soft_tokens".into(),
+                GgufMetadataValue::Uint32(280),
+            ),
+        ]);
+        let processor = Gemma4Processor::from_gguf(&model, &projector).unwrap();
+        assert_eq!(processor.patch_size, 2);
+        assert_eq!(processor.pooling_kernel_size, 2);
+        assert_eq!(processor.max_soft_tokens, 280);
+        assert_eq!(processor.boi_token_id, Some(43));
+        assert_eq!(processor.eoi_token_id, Some(44));
     }
 
     #[test]

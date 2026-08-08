@@ -791,6 +791,16 @@ pub(crate) fn execute_transformed_gemma4_model(
     weights_stream: &Stream,
 ) -> Result<Gemma4LayerwiseModel, Error> {
     let (_, vision, _, _, audio, _) = resident::get_gemma4_model_config(model_dir)?;
+    execute_transformed_gemma4_model_with_modalities(model, vision, audio, stream, weights_stream)
+}
+
+pub(crate) fn execute_transformed_gemma4_model_with_modalities(
+    model: resident::Model,
+    vision: Option<Gemma4VisionConfig>,
+    audio: Option<Gemma4AudioConfig>,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<Gemma4LayerwiseModel, Error> {
     let adapter = Gemma4LayerwiseAdapter::new(
         model.args.clone(),
         vision,
@@ -800,24 +810,6 @@ pub(crate) fn execute_transformed_gemma4_model(
         model.audio_token_id,
         stream,
     )?;
-    let store = transformed_module_weight_store(&model)?;
-    Ok(Gemma4LayerwiseModel {
-        execution: load_layerwise_model(
-            store,
-            adapter,
-            LayerWeightResidency::FullyResident,
-            stream,
-            weights_stream,
-        )?,
-    })
-}
-
-pub(crate) fn execute_transformed_gemma4_text_model(
-    model: resident::Model,
-    stream: &Stream,
-    weights_stream: &Stream,
-) -> Result<Gemma4LayerwiseModel, Error> {
-    let adapter = Gemma4LayerwiseAdapter::new_text(model.args.clone(), stream)?;
     let store = transformed_module_weight_store(&model)?;
     Ok(Gemma4LayerwiseModel {
         execution: load_layerwise_model(
@@ -847,9 +839,11 @@ pub fn load_gemma4_tensor_parallel_layerwise_model(
     {
         let checkpoint = GgufCheckpoint::open(model_dir)?;
         let metadata = crate::runtime::checkpoint::load::gguf_metadata(&checkpoint);
+        let mmproj = resident::open_sibling_mmproj(model_dir)?;
         return load_gemma4_gguf_tensor_parallel_model(
             &checkpoint,
             &metadata,
+            mmproj.as_ref(),
             options,
             build,
             stream,
@@ -888,6 +882,7 @@ pub fn load_gemma4_tensor_parallel_layerwise_model(
 pub(crate) fn load_gemma4_gguf_tensor_parallel_model(
     checkpoint: &GgufCheckpoint,
     metadata: &HashMap<String, GgufMetadataValue>,
+    mmproj: Option<&resident::Gemma4MmprojGguf>,
     options: LayerWeightResidency,
     build: crate::runtime::distributed::parallel::ParallelBuildContext,
     stream: &Stream,
@@ -901,16 +896,19 @@ pub(crate) fn load_gemma4_gguf_tensor_parallel_model(
         crate::api::ModelLoadOptions::default().with_weight_residency(residency),
     )
     .into_loader_result()?;
-    let prepared = resident::prepare_gemma4_gguf_checkpoint(checkpoint, metadata, None)?;
-    let store: Arc<dyn WeightStore + Send + Sync> =
-        Arc::new(GgufWeightStore::new_with_max_mapped_shards(
-            checkpoint.clone(),
-            resident::translate_gguf_weight_name,
-            options.max_mapped_shards(),
-        )?);
+    let prepared = resident::prepare_gemma4_gguf_checkpoint(checkpoint, metadata, mmproj, None)?;
+    let store = gemma4_gguf_store(checkpoint, mmproj, options.max_mapped_shards())?;
     let execution = load_tensor_parallel_layerwise_model(
         store,
-        Gemma4LayerwiseAdapter::new(prepared.args, None, None, None, None, None, stream)?,
+        Gemma4LayerwiseAdapter::new(
+            prepared.args,
+            prepared.vision_config,
+            prepared.image_token_id,
+            prepared.video_token_id,
+            prepared.audio_config,
+            prepared.audio_token_id,
+            stream,
+        )?,
         options,
         build,
         stream,
@@ -922,6 +920,7 @@ pub(crate) fn load_gemma4_gguf_tensor_parallel_model(
 pub(crate) fn load_gemma4_gguf_layerwise_model(
     checkpoint: &GgufCheckpoint,
     metadata: &HashMap<String, GgufMetadataValue>,
+    mmproj: Option<&resident::Gemma4MmprojGguf>,
     residency: WeightResidency,
     stream: &Stream,
     weights_stream: &Stream,
@@ -933,14 +932,17 @@ pub(crate) fn load_gemma4_gguf_layerwise_model(
         crate::api::ModelLoadOptions::default().with_weight_residency(residency),
     )
     .into_loader_result()?;
-    let prepared = resident::prepare_gemma4_gguf_checkpoint(checkpoint, metadata, None)?;
-    let adapter = Gemma4LayerwiseAdapter::new(prepared.args, None, None, None, None, None, stream)?;
-    let store: Arc<dyn WeightStore + Send + Sync> =
-        Arc::new(GgufWeightStore::new_with_max_mapped_shards(
-            checkpoint.clone(),
-            resident::translate_gguf_weight_name,
-            residency.max_mapped_shards(),
-        )?);
+    let prepared = resident::prepare_gemma4_gguf_checkpoint(checkpoint, metadata, mmproj, None)?;
+    let adapter = Gemma4LayerwiseAdapter::new(
+        prepared.args,
+        prepared.vision_config,
+        prepared.image_token_id,
+        prepared.video_token_id,
+        prepared.audio_config,
+        prepared.audio_token_id,
+        stream,
+    )?;
+    let store = gemma4_gguf_store(checkpoint, mmproj, residency.max_mapped_shards())?;
     if residency.expert_cache().is_some() {
         return Err(Error::UnsupportedArchitecture(
             "independent expert caching is not supported for Gemma 4 GGUF checkpoints".into(),
@@ -949,6 +951,23 @@ pub(crate) fn load_gemma4_gguf_layerwise_model(
     let execution =
         load_layerwise_model(store, adapter, residency.layers(), stream, weights_stream)?;
     Ok((Gemma4LayerwiseModel { execution }, prepared.eos_token_ids))
+}
+
+pub(crate) fn gemma4_gguf_store(
+    checkpoint: &GgufCheckpoint,
+    mmproj: Option<&resident::Gemma4MmprojGguf>,
+    max_mapped_shards: usize,
+) -> Result<Arc<dyn WeightStore + Send + Sync>, Error> {
+    let mut builder = GgufWeightStore::builder()
+        .max_cached_readers(max_mapped_shards)?
+        .add_checkpoint(checkpoint.clone(), resident::translate_gguf_weight_name)?;
+    if let Some(mmproj) = mmproj {
+        builder = builder.add_checkpoint(
+            mmproj.checkpoint.clone(),
+            resident::translate_mmproj_weight_name,
+        )?;
+    }
+    Ok(Arc::new(builder.build()?))
 }
 
 /// Adapter for Gemma 4 per-layer inputs and shared-KV attention blocks.
