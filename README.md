@@ -150,19 +150,22 @@ exact multimodal full/sliding masks as immutable auxiliary state. GGUF combines
 the language file and sibling dense media projector in the same bounded-read
 residency plan.
 Shared-KV publisher/consumer groups are never split across stages.
-Fully resident Gemma text stages can apply load-time affine or MXFP4
-quantization through the same direct and derived binding plan used for
-checkpoint validation; host-layerwise and dense disk-streamed stages require a
-matching checkpoint-native packed encoding.
+Gemma text stages can apply load-time affine or MXFP4 quantization through the
+same direct and derived binding plan used for checkpoint validation. Fully
+resident execution materializes the selected stage directly; host-layerwise
+and dense disk-streamed execution first creates a bounded packed stage overlay,
+so residency windows count packed bytes for dense SafeTensors and compatible
+dense GGUF recipes.
 Qwen2/Qwen3/Qwen3-MoE and GPT-OSS use that same adapter-driven pipeline runtime
 for SafeTensors and canonical `qwen2`/`qwen3`/`qwen3moe`/`gpt-oss` GGUF
 checkpoints. Qwen stages preserve biased Q/K/V projections or Q/K
 normalization, GQA, tied-head ownership, routed-expert semantics, and the exact
 per-layer full/sliding schedule. GPT-OSS stages retain native MXFP4 experts and
 their alternating or explicit attention schedule.
-Fully resident Qwen stages support aligned affine or MXFP4 requantization;
-GPT-OSS can MXFP4-quantize eligible dense matrices without transcoding its
-expert banks. Host-layerwise and dense disk streaming require checkpoint-native
+Qwen stages support aligned affine or MXFP4 requantization across resident,
+host-layerwise, and dense disk-streamed policies. GPT-OSS can MXFP4-quantize
+eligible dense matrices without transcoding its expert banks. Packed input
+formats still require checkpoint-native
 encodings.
 Qwen3-MoE, Kimi Linear, Inkling, GPT-OSS, Gemma 4 MoE, LFM2-MoE, Nemotron-H-MoE, and
 Qwen3-Next/Qwen3.5-MoE additionally support arbitrary-geometry

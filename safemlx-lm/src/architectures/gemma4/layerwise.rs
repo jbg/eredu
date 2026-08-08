@@ -2050,7 +2050,7 @@ impl Gemma4LayerwiseAdapter {
         }
     }
 
-    fn pipeline_text_group(&self) -> usize {
+    pub(crate) fn pipeline_text_group(&self) -> usize {
         usize::from(self.vision_depth > 0) + usize::from(self.audio_depth > 0)
     }
 

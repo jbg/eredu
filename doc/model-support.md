@@ -497,8 +497,9 @@ Pure GPT-OSS pipeline execution uses the same binding and schedule plans for
 SafeTensors and canonical `gpt-oss` GGUF. It supports fully resident and dense
 disk-streamed local layers, ordinary/paged/schema-v4 persisted caches, and
 rank-synchronized generation. Native MXFP4 expert banks remain packed;
-fully resident stages may MXFP4-quantize eligible dense matrices, while affine
-transcoding and streamed load-time requantization are rejected.
+eligible dense matrices may be MXFP4-quantized before resident,
+host-layerwise, or dense-streamed stage planning, while affine and packed-input
+transcoding are rejected.
 
 Gemma 4 text and assistant models use
 `LayerSchedule<architectures::gemma4::model::LayerPolicy>` as their authoritative
@@ -542,15 +543,14 @@ All supported decoder payloads share one resident/dense-stream layer executor
 and consume the generalized architecture adapter's binding plan; stage-role
 selection is lazy and does not construct a second source model. There is no
 family enum in transport, cache, residency, or persistence paths.
-Fully resident Gemma text stages can requantize dense SafeTensors or dense GGUF
+Gemma text stages can requantize dense SafeTensors or compatible dense GGUF
 weights to affine or MXFP4 storage when every selected operation satisfies the
 requested group alignment. Direct tensors and derived bindings, including
 fused GGUF expert gate/up banks, use the same authoritative binding plan before
-quantization. A matching checkpoint-native encoding is loaded directly;
-implicit transcoding between packed encodings fails closed. Dense disk-streamed
-pipeline stages still require checkpoint-native packed weights because
-requantization would violate their bounded-residency contract. Gemma image and
-audio encoders are not pipeline capabilities.
+quantization. Host-layerwise and dense disk-streamed stages create their packed
+overlay before residency planning, and matching checkpoint-native encodings
+load directly. Implicit transcoding between packed encodings fails closed.
+Gemma image and audio encoders are not pipeline capabilities.
 
 Resident, layerwise-host, and tensor-parallel Gemma multimodal execution uses
 the common validated execution-group DAG: vision and audio are independent
@@ -799,8 +799,10 @@ Important boundaries:
 - Dense Qwen SafeTensors support out-of-core load-time affine/MXFP4 conversion
   with fully resident, layerwise-host, or dense-streamed weights. Supported MoE
   families use the same ordinary-layer overlay together with an independent
-  packed expert overlay. Nonresident GGUF and pipeline-layer conversion still
-  require checkpoint-native packing.
+  packed expert overlay. Pipeline stages use the same overlay for SafeTensors
+  and compatible dense GGUF recipes before host/device planning. Standalone
+  nonresident GGUF loading and packed GGUF transcoding still require a
+  checkpoint-native encoding.
 - Transfers and route inspection are synchronous because the pinned MLX C API
   does not expose the events or fences required for safe cross-stream overlap.
 - On Apple silicon, reported host and device residency are logical tiers over

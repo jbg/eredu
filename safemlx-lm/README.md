@@ -358,9 +358,9 @@ GPT-OSS pipeline stages support SafeTensors and canonical `gpt-oss` GGUF,
 including TP+PP with tensor-sharded attention and native MXFP4 expert
 intermediates, rank-local KV caches, sharded embedding and output boundaries,
 fully resident, host-layerwise, or dense disk-streamed local layers,
-ordinary/paged/persisted caches, and rank-synchronized generation. Fully
-resident stages may MXFP4-quantize eligible dense matrices; affine transcoding
-and non-resident load-time requantization fail closed.
+ordinary/paged/persisted caches, and rank-synchronized generation. Eligible
+dense matrices may be MXFP4-quantized before resident, host-layerwise, or
+dense-streamed stage planning; affine and packed-input transcoding fail closed.
 
 ## Gemma 4 and assistant weight residency
 
@@ -1096,22 +1096,23 @@ The remaining global limitations are:
 - The shared bounded materialisation store supports out-of-core affine and
   MXFP4 conversion from row-bounded SafeTensors or dense GGUF semantic recipes.
   Static modules, ordinary layers, shared experts, independent expert caches,
-  TP+EP, and TP+PP+EP now transform the authoritative
+  pipeline stages, TP+EP, and TP+PP+EP now transform the authoritative
   rank-local expert catalog rather than rebuilding topology arithmetic: EP
   ownership, TP projection ranges, and the conversion row tile compose into
   one bounded source span. The conversion budget is capped by the final packed
   local semantic recipes. Ordinary residency plans are constructed only after
   the packed overlay exists, so pinned static bytes, layerwise-host budgets,
   dense-stream host/device windows, and expert-cache budgets all count packed
-  bindings. `LayerwiseModelMetadata::materialization` and
+  bindings. `LayerwiseModelMetadata::materialization`,
+  `PipelineStageInfo::materialization`, `ResidencyReport::materialization`, and
   `ExpertCacheReport::materialization` expose selected source bytes, output
   bytes, tile counts, and the peak admitted working set.
 - A reshaped contiguous scalar span is currently a SafeTensors storage
   selection. GGUF load-time conversion remains available when its semantic
   recipe reduces to the reader's native row/range selection, but a fused GGUF
-  bank requiring that reshaped span fails bounded preflight. Non-resident
-  ordinary pipeline layers and nonresident GGUF models still require
-  checkpoint-native quantization; this
+  bank requiring that reshaped span fails bounded preflight. Compatible dense
+  GGUF pipeline recipes now use the stage-local overlay, while standalone
+  nonresident GGUF loading and packed GGUF transcoding remain unsupported. This
   restriction no longer applies merely because routed experts use an
   independent cache. Inkling and Nemotron-H load-time expert conversion remains
   unavailable until their grouped rank-3 kernels accept affine packed banks.
@@ -1140,17 +1141,17 @@ official split-expert safetensors, native block-FP8 and affine layouts, and
 local expert-bank packing. Requested on-load quantization is applied only to
 selected local tensors. Gemma 4 accepts exact SafeTensors catalogs and dense or
 checkpoint-native quantized GGUF text tensors through the same derived-binding
-plan used by bounded execution. Fully resident Gemma text stages can requantize
-dense SafeTensors and dense GGUF tensors to affine or MXFP4 storage, including
-derived fused-expert bindings, when operation dimensions satisfy the requested
-group alignment. Matching checkpoint-native encodings load directly and packed
-formats are never implicitly transcoded. Dense disk-streamed stages require
-checkpoint-native quantization because load-time requantization is incompatible
-with their bounded-residency contract.
+plan used by bounded execution. Gemma text stages can requantize dense
+SafeTensors and compatible dense GGUF tensors to affine or MXFP4 storage,
+including derived fused-expert bindings, when operation dimensions satisfy the
+requested group alignment. Nonresident pipeline stages build the packed overlay
+before host/device budgets are planned. Matching checkpoint-native encodings
+load directly and packed formats are never implicitly transcoded.
 
 Qwen2/Qwen2.5, Qwen3, and Qwen3 MoE use their shared structural binding plan
-for SafeTensors and canonical GGUF. Fully resident stages support aligned
-affine or MXFP4 load-time quantization, exact Qwen2 Q/K/V biases, Qwen3 Q/K
+for SafeTensors and canonical GGUF. Resident, host-layerwise, and dense-streamed
+stages support aligned affine or MXFP4 load-time quantization, exact Qwen2 Q/K/V
+biases, Qwen3 Q/K
 norms, GQA, tied or untied heads, routed experts, and every normalized
 full/sliding layer policy.
 Kimi Linear, Nemotron-H/Nemotron-H-MoE, Inkling, and Qwen3-Next/Qwen3.5 artifacts also

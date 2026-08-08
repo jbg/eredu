@@ -7,6 +7,7 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
+    ops::Range,
     path::Path,
     sync::{Arc, Mutex},
 };
@@ -668,6 +669,14 @@ impl DensePassReport {
 }
 
 impl DenseDiskStreamReport {
+    pub(crate) fn with_materialization(
+        mut self,
+        materialization: Option<BoundedQuantizationReport>,
+    ) -> Self {
+        self.residency = self.residency.with_materialization(materialization);
+        self
+    }
+
     /// Returns the number of disk-planned execution units.
     pub const fn planned_layer_count(&self) -> usize {
         self.planned_layer_count
@@ -3297,6 +3306,143 @@ where
     Ok(model)
 }
 
+/// Builds a PP-stage-local packed overlay before pipeline residency planning.
+///
+/// The source adapter contributes semantic recipes for only the stage-owned
+/// static roles and decoder range. The target adapter identifies projections
+/// whose runtime parameter tree is packed. Routed rank-3 expert banks remain
+/// outside this overlay and continue through the independent expert store.
+pub(crate) struct PipelineStageQuantizationSelection<'a> {
+    static_roles: &'a [&'a str],
+    layer_group: usize,
+    layer_range: Range<usize>,
+}
+
+impl<'a> PipelineStageQuantizationSelection<'a> {
+    pub(crate) fn new(
+        static_roles: &'a [&'a str],
+        layer_group: usize,
+        layer_range: Range<usize>,
+    ) -> Self {
+        Self {
+            static_roles,
+            layer_group,
+            layer_range,
+        }
+    }
+}
+
+pub(crate) fn quantize_pipeline_stage_store<A>(
+    store: SharedWeightStore,
+    source_adapter: &A,
+    target_adapter: &A,
+    selection: PipelineStageQuantizationSelection<'_>,
+    quantization: WeightQuantization,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<(SharedWeightStore, BoundedQuantizationReport), Error>
+where
+    A: ArchitectureAdapter,
+{
+    let mut recipes = BTreeMap::new();
+    let mut collect = |bindings: &[crate::runtime::residency::manager::WeightBinding],
+                       selected_local_weights: Option<&BTreeSet<String>>| {
+        for binding in bindings {
+            let recipe = binding.source_recipe();
+            let metadata = recipe.infer(store.as_ref())?;
+            if !matches!(
+                metadata.dtype(),
+                RecipeDtype::F16 | RecipeDtype::BF16 | RecipeDtype::F32
+            ) || metadata.shape().len() != 2
+            {
+                continue;
+            }
+            let target = binding.logical_target().unwrap_or(binding.checkpoint_key());
+            if !target.ends_with(".weight") {
+                continue;
+            }
+            let canonical_local =
+                crate::runtime::checkpoint::binding::canonical_checkpoint_name(binding.name());
+            if selected_local_weights.is_some_and(|selected| !selected.contains(&canonical_local)) {
+                continue;
+            }
+            match recipes.entry(target.to_string()) {
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    entry.insert(recipe);
+                }
+                std::collections::btree_map::Entry::Occupied(entry) if entry.get() != &recipe => {
+                    return Err(Error::Quantization(format!(
+                        "pipeline load-time quantization target {target:?} has conflicting semantic recipes"
+                    )));
+                }
+                std::collections::btree_map::Entry::Occupied(_) => {}
+            }
+        }
+        Ok::<(), Error>(())
+    };
+
+    for unit in source_adapter.static_units(store.as_ref())? {
+        if !selection
+            .static_roles
+            .iter()
+            .any(|role| unit.id().as_str().ends_with(&format!(".static.{role}")))
+        {
+            continue;
+        }
+        let selected = unit
+            .bindings()
+            .iter()
+            .filter(|binding| target_adapter.quantizes_static_binding(binding))
+            .map(|binding| {
+                crate::runtime::checkpoint::binding::canonical_checkpoint_name(binding.name())
+            })
+            .collect::<BTreeSet<_>>();
+        collect(unit.bindings(), Some(&selected))?;
+    }
+
+    for index in selection.layer_range {
+        let source_layer = source_adapter.new_layer(selection.layer_group, index, stream)?;
+        let target_layer = target_adapter.new_layer(selection.layer_group, index, stream)?;
+        let selected = target_layer
+            .parameters()
+            .flatten()
+            .keys()
+            .filter(|name| name.contains(".inner.weight") || name.as_ref() == "inner.weight")
+            .map(|name| crate::runtime::checkpoint::binding::canonical_checkpoint_name(name))
+            .collect::<BTreeSet<_>>();
+        collect(
+            &source_adapter.layer_bindings(
+                selection.layer_group,
+                index,
+                &source_layer,
+                store.as_ref(),
+            )?,
+            Some(&selected),
+        )?;
+    }
+
+    if recipes.is_empty() {
+        return Err(Error::Quantization(format!(
+            "pipeline architecture adapter {} declared no floating matrix bindings for stage-local load-time quantization",
+            source_adapter.model_type()
+        )));
+    }
+    let targets = recipes
+        .into_iter()
+        .map(|(target, recipe)| BoundedQuantizationTarget::from_recipe(target, recipe))
+        .collect::<Result<Vec<_>, _>>()?;
+    let working_set_bytes =
+        bounded_quantization_working_set(store.as_ref(), &targets, quantization)?;
+    let transformed = Arc::new(BoundedQuantizedWeightStore::create(
+        store,
+        BoundedQuantizationPlan::new(quantization, working_set_bytes, targets)?,
+        weights_stream,
+    )?);
+    let report = transformed.report().clone();
+    let transformed: SharedWeightStore = transformed;
+    Ok((transformed, report))
+}
+
 fn bounded_quantization_working_set(
     store: &dyn WeightStore,
     targets: &[BoundedQuantizationTarget],
@@ -3836,6 +3982,78 @@ where
     Ok(model)
 }
 
+fn packed_semantic_weight_name(name: &str) -> Option<String> {
+    name.strip_suffix(".scales")
+        .or_else(|| name.strip_suffix(".biases"))
+        .map(|prefix| format!("{prefix}.weight"))
+}
+
+fn stored_tensor_selection(
+    tensor: &crate::runtime::distributed::parallel::LocalTensorLayout,
+    stored_shape: &[usize],
+) -> Result<crate::runtime::checkpoint::store::TensorSelection, Error> {
+    use crate::runtime::checkpoint::store::TensorSelection;
+    use crate::runtime::distributed::topology::TensorPlacement;
+
+    let scale_boundary = |axis: usize, boundary: usize| -> Result<usize, Error> {
+        let semantic = tensor.global_shape()[axis];
+        let stored = stored_shape[axis];
+        boundary
+            .checked_mul(stored)
+            .and_then(|value| value.checked_div(semantic))
+            .filter(|scaled| scaled * semantic == boundary * stored)
+            .ok_or_else(|| {
+                Error::Parallel(format!(
+                    "semantic shard boundary {boundary} on axis {axis} is not aligned to packed storage shape {stored_shape:?} derived from {:?}",
+                    tensor.global_shape()
+                ))
+            })
+    };
+
+    Ok(match tensor.placement() {
+        TensorPlacement::Replicated | TensorPlacement::Local => TensorSelection::Full,
+        TensorPlacement::Shard { axis, index, parts } => {
+            let stored = stored_shape[*axis];
+            if !stored.is_multiple_of(*parts) {
+                return Err(Error::Parallel(format!(
+                    "packed storage axis {axis} width {stored} cannot be divided among {parts} TP ranks"
+                )));
+            }
+            let width = stored / *parts;
+            TensorSelection::Range {
+                axis: *axis,
+                start: index * width,
+                end: (index + 1) * width,
+            }
+        }
+        TensorPlacement::Range { axis, start, end } => TensorSelection::Range {
+            axis: *axis,
+            start: scale_boundary(*axis, *start)?,
+            end: scale_boundary(*axis, *end)?,
+        },
+        TensorPlacement::Indices { axis, indices } => {
+            if stored_shape[*axis] != tensor.global_shape()[*axis] {
+                return Err(Error::Parallel(format!(
+                    "indexed TP placement on semantic axis {axis} cannot address packed storage shape {stored_shape:?} derived from {:?}",
+                    tensor.global_shape()
+                )));
+            }
+            TensorSelection::Indices {
+                axis: *axis,
+                indices: indices.clone(),
+            }
+        }
+        TensorPlacement::Omit
+        | TensorPlacement::Rank { .. }
+        | TensorPlacement::PipelineStage { .. } => {
+            return Err(Error::Parallel(format!(
+                "execution-group binding has non-TP placement {:?}",
+                tensor.placement()
+            )))
+        }
+    })
+}
+
 pub(crate) fn shard_layer_bindings(
     bindings: Vec<crate::runtime::residency::manager::WeightBinding>,
     prefix: &str,
@@ -3843,7 +4061,8 @@ pub(crate) fn shard_layer_bindings(
     layout: &crate::runtime::distributed::parallel::LocalModelLayout,
 ) -> Result<Vec<crate::runtime::residency::manager::WeightBinding>, Error> {
     use crate::runtime::checkpoint::store::TensorSelection;
-    use crate::runtime::distributed::topology::TensorPlacement;
+
+    let store_keys = store.keys().into_iter().collect::<BTreeSet<_>>();
     let mut output = Vec::with_capacity(bindings.len());
     for binding in bindings {
         let canonical_name = crate::runtime::checkpoint::binding::canonical_checkpoint_name(
@@ -3873,69 +4092,74 @@ pub(crate) fn shard_layer_bindings(
                         || canonical_target == canonical_name)
                         .then_some(tensor)
                 })
+            })
+            .or_else(|| {
+                [
+                    logical_target.map(str::to_string),
+                    Some(binding.checkpoint_key().to_string()),
+                    Some(canonical_name.clone()),
+                ]
+                .into_iter()
+                .flatten()
+                .filter_map(|name| packed_semantic_weight_name(&name))
+                .find_map(|weight| {
+                    layout.tensor(&weight).or_else(|| {
+                        let canonical =
+                            crate::runtime::checkpoint::binding::canonical_checkpoint_name(&weight);
+                        layout.tensor(&canonical)
+                    })
+                })
             });
         let Some(tensor) = tensor else {
             output.push(binding);
             continue;
         };
-        let selection = match tensor.placement() {
-            TensorPlacement::Replicated | TensorPlacement::Local => {
+        // Direct bindings created by callers can describe a logical checkpoint
+        // target that is deliberately absent from this physical store. Preserve
+        // that contract by deriving its selection and byte count from semantic
+        // layout alone. Physical and derived bindings use store metadata below,
+        // which is required when packed storage geometry differs from the
+        // semantic weight geometry.
+        if binding.recipe().is_none() && !store_keys.contains(binding.checkpoint_key()) {
+            let selection = stored_tensor_selection(tensor, tensor.global_shape())?;
+            if selection == TensorSelection::Full {
                 output.push(binding);
                 continue;
             }
-            TensorPlacement::Shard { axis, index, parts } => {
-                let width = tensor.global_shape()[*axis] / *parts;
-                TensorSelection::Range {
-                    axis: *axis,
-                    start: index * width,
-                    end: (index + 1) * width,
-                }
-            }
-            TensorPlacement::Range { axis, start, end } => TensorSelection::Range {
-                axis: *axis,
-                start: *start,
-                end: *end,
-            },
-            TensorPlacement::Indices { axis, indices } => TensorSelection::Indices {
-                axis: *axis,
-                indices: indices.clone(),
-            },
-            TensorPlacement::Omit
-            | TensorPlacement::Rank { .. }
-            | TensorPlacement::PipelineStage { .. } => {
-                return Err(Error::Parallel(format!(
-                    "execution-group binding {:?} has non-TP placement {:?}",
-                    binding.name(),
-                    tensor.placement()
-                )))
-            }
-        };
-        let global_elements = tensor.global_shape().iter().product::<usize>();
-        let local_elements = tensor.local_shape().iter().product::<usize>();
-        let expected_bytes = binding
-            .expected_bytes()
-            .checked_mul(local_elements as u64)
-            .and_then(|bytes| bytes.checked_div(global_elements as u64))
-            .ok_or_else(|| {
-                Error::Parallel(format!(
-                    "cannot size rank-local binding {:?}",
-                    binding.name()
-                ))
-            })?;
-        let sharded = if let Some(recipe) = binding.recipe() {
-            crate::runtime::residency::manager::WeightBinding::from_recipe(
-                binding.name(),
-                recipe.select_bounded(store, selection)?,
-                expected_bytes,
-            )?
-        } else {
-            crate::runtime::residency::manager::WeightBinding::new(
+            let global_elements = tensor.global_shape().iter().product::<usize>();
+            let local_elements = tensor.local_shape().iter().product::<usize>();
+            let expected_bytes = binding
+                .expected_bytes()
+                .checked_mul(local_elements as u64)
+                .and_then(|bytes| bytes.checked_div(global_elements as u64))
+                .ok_or_else(|| {
+                    Error::Parallel(format!(
+                        "cannot size rank-local binding {:?}",
+                        binding.name()
+                    ))
+                })?;
+            output.push(crate::runtime::residency::manager::WeightBinding::new(
                 binding.name(),
                 binding.checkpoint_key(),
                 selection,
                 expected_bytes,
-            )?
-        };
+            )?);
+            continue;
+        }
+        let recipe = binding.source_recipe();
+        let metadata = recipe.infer(store)?;
+        let selection = stored_tensor_selection(tensor, metadata.shape())?;
+        if selection == crate::runtime::checkpoint::store::TensorSelection::Full {
+            output.push(binding);
+            continue;
+        }
+        let recipe = recipe.select_bounded(store, selection)?;
+        let expected_bytes = recipe.infer(store)?.byte_len();
+        let sharded = crate::runtime::residency::manager::WeightBinding::from_recipe(
+            binding.name(),
+            recipe,
+            expected_bytes,
+        )?;
         output.push(sharded);
     }
     Ok(output)
@@ -3948,7 +4172,6 @@ fn build_parallel_module_bindings(
     layout: &crate::runtime::distributed::parallel::LocalModelLayout,
 ) -> Result<Vec<crate::runtime::residency::manager::WeightBinding>, Error> {
     use crate::runtime::checkpoint::store::TensorSelection;
-    use crate::runtime::distributed::topology::TensorPlacement;
     let keys = store.keys().into_iter().collect::<BTreeSet<_>>();
     let params = module.parameters().flatten();
     let mut names = params.keys().map(ToString::to_string).collect::<Vec<_>>();
@@ -3978,7 +4201,20 @@ fn build_parallel_module_bindings(
         let metadata = store.metadata(&checkpoint_key)?;
         let tensor = layout
             .tensor(&checkpoint_key)
-            .or_else(|| layout.tensor(&canonical));
+            .or_else(|| layout.tensor(&canonical))
+            .or_else(|| {
+                packed_semantic_weight_name(&checkpoint_key)
+                    .or_else(|| packed_semantic_weight_name(&canonical))
+                    .and_then(|weight| {
+                        layout.tensor(&weight).or_else(|| {
+                            let canonical =
+                                crate::runtime::checkpoint::binding::canonical_checkpoint_name(
+                                    &weight,
+                                );
+                            layout.tensor(&canonical)
+                        })
+                    })
+            });
         let (selection, expected_bytes) = if let Some(tensor) = tensor {
             let local_shape = parameter
                 .shape()
@@ -3986,44 +4222,31 @@ fn build_parallel_module_bindings(
                 .map(|&dim| usize::try_from(dim))
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(|_| Error::Parallel(format!("invalid local shape for {destination}")))?;
-            if tensor.local_shape() != local_shape {
+            let selection = stored_tensor_selection(tensor, &metadata.shape)?;
+            let mut selected_shape = metadata.shape.clone();
+            match &selection {
+                TensorSelection::Full => {}
+                TensorSelection::Range { axis, start, end } => {
+                    selected_shape[*axis] = end - start;
+                }
+                TensorSelection::Indices { axis, indices } => {
+                    selected_shape[*axis] = indices.len();
+                }
+                TensorSelection::Contiguous { .. } => {
+                    unreachable!("TP packed placement never emits a reshaped contiguous span")
+                }
+            }
+            if selected_shape != local_shape {
                 return Err(Error::Parallel(format!(
-                    "planned local shape {:?} for {destination} does not match runtime {:?}",
-                    tensor.local_shape(),
-                    local_shape
+                    "planned packed local shape {:?} for {destination} does not match runtime {:?}",
+                    selected_shape, local_shape
                 )));
             }
-            let selection = match tensor.placement() {
-                TensorPlacement::Replicated | TensorPlacement::Local => TensorSelection::Full,
-                TensorPlacement::Shard { axis, index, parts } => {
-                    let width = tensor.global_shape()[*axis] / *parts;
-                    TensorSelection::Range {
-                        axis: *axis,
-                        start: index * width,
-                        end: (index + 1) * width,
-                    }
-                }
-                TensorPlacement::Range { axis, start, end } => TensorSelection::Range {
-                    axis: *axis,
-                    start: *start,
-                    end: *end,
-                },
-                TensorPlacement::Indices { axis, indices } => TensorSelection::Indices {
-                    axis: *axis,
-                    indices: indices.clone(),
-                },
-                other => {
-                    return Err(Error::Parallel(format!(
-                        "unsupported execution-group placement {other:?} for {destination}"
-                    )))
-                }
-            };
-            let global_elements = tensor.global_shape().iter().product::<usize>();
-            let local_elements = tensor.local_shape().iter().product::<usize>();
-            let bytes = (metadata.logical_byte_len as u64)
-                .checked_mul(local_elements as u64)
-                .and_then(|value| value.checked_div(global_elements as u64))
-                .ok_or_else(|| Error::Parallel(format!("cannot size {destination}")))?;
+            let recipe = crate::runtime::checkpoint::recipe::DerivedWeightRecipe::source(
+                checkpoint_key.clone(),
+                selection.clone(),
+            );
+            let bytes = recipe.infer(store)?.byte_len();
             (selection, bytes)
         } else {
             let expected = parameter

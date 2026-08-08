@@ -18,8 +18,8 @@ use safemlx::{
 use safemlx_gguf::{GgmlType, TensorInput, Writer};
 use safemlx_lm::{
     architectures::distributed::pipeline::{
-        load_pipeline_model, load_pipeline_model_with_options, PipelineInferencePhase,
-        PipelineInferenceScheduler, PipelineLayerCache, PipelineMicrobatchInput, PipelineStep,
+        load_pipeline_model_with_options, PipelineInferencePhase, PipelineInferenceScheduler,
+        PipelineLayerCache, PipelineMicrobatchInput, PipelineStep,
     },
     architectures::{
         deepseek_v3::model as deepseek_v3,
@@ -34,6 +34,7 @@ use safemlx_lm::{
     runtime::generation::sampler::DefaultSampler,
     runtime::{
         checkpoint::binding::canonical_checkpoint_name,
+        checkpoint::quantization::AffineQuantization,
         media::{input::InputPayload, PreparedModelInput},
         residency::policy::OffloadConfig,
         scheduler::{RequestId, RequestStatus, SchedulerLimits},
@@ -55,6 +56,7 @@ const MICROBATCH: &str = "SAFEMLX_LM_PIPELINE_MICROBATCH";
 const SCHEDULE_MISMATCH: &str = "SAFEMLX_LM_PIPELINE_SCHEDULE_MISMATCH";
 const CARTESIAN_AXES: &str = "SAFEMLX_LM_PIPELINE_CARTESIAN_AXES";
 const EXPERT_CACHE: &str = "SAFEMLX_LM_PIPELINE_EXPERT_CACHE";
+const REQUANTIZE: &str = "SAFEMLX_LM_PIPELINE_REQUANTIZE";
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 enum FixtureFamily {
@@ -367,6 +369,15 @@ fn pipeline_ring_worker() {
     let layerwise_host = std::env::var_os(LAYERWISE_HOST).is_some();
     assert!(!(dense_stream && layerwise_host));
     let expert_cache = std::env::var_os(EXPERT_CACHE).is_some();
+    let requantize = std::env::var_os(REQUANTIZE).is_some();
+    let base_options = || {
+        if requantize {
+            ModelLoadOptions::with_quantization(AffineQuantization::new(32, 4).unwrap())
+                .with_parallel_topology(topology)
+        } else {
+            ModelLoadOptions::with_parallel(topology)
+        }
+    };
     let layerwise_options =
         || LayerwiseLoadOptions::new(OffloadConfig::new(None, None, 1).unwrap());
     let mut model = if expert_cache {
@@ -381,9 +392,10 @@ fn pipeline_ring_worker() {
         };
         load_pipeline_model_with_options(
             &checkpoint,
-            ModelLoadOptions::with_parallel(topology).with_weight_residency(
-                WeightResidency::with_expert_cache(non_experts, ExpertCacheLoadOptions::default()),
-            ),
+            base_options().with_weight_residency(WeightResidency::with_expert_cache(
+                non_experts,
+                ExpertCacheLoadOptions::default(),
+            )),
             &stream,
             &stream,
         )
@@ -391,7 +403,7 @@ fn pipeline_ring_worker() {
     } else if layerwise_host {
         load_pipeline_model_with_options(
             &checkpoint,
-            ModelLoadOptions::with_parallel(topology)
+            base_options()
                 .with_weight_residency(WeightResidency::layerwise_host(layerwise_options())),
             &stream,
             &stream,
@@ -401,14 +413,13 @@ fn pipeline_ring_worker() {
         let dense = DenseDiskStreamLoadOptions::new(u64::MAX, u64::MAX, 1, 1, 1).unwrap();
         load_pipeline_model_with_options(
             &checkpoint,
-            ModelLoadOptions::with_parallel(topology)
-                .with_weight_residency(WeightResidency::dense_disk_stream(dense)),
+            base_options().with_weight_residency(WeightResidency::dense_disk_stream(dense)),
             &stream,
             &stream,
         )
         .unwrap()
     } else {
-        load_pipeline_model(&checkpoint, topology, &stream, &stream).unwrap()
+        load_pipeline_model_with_options(&checkpoint, base_options(), &stream, &stream).unwrap()
     };
     let info = model.stage_info();
     let expected_range = family.stage_range(pipeline_rank);
@@ -482,6 +493,12 @@ fn pipeline_ring_worker() {
             .units()
             .iter()
             .all(|unit| !unit.host_resident() && !unit.device_resident()));
+        if requantize {
+            let materialization = report.residency().materialization().unwrap();
+            assert!(materialization.transformed_weights > 0);
+            assert!(materialization.output_bytes < materialization.source_bytes_read);
+            assert!(info.materialization.is_some());
+        }
         if family.has_gguf_source() {
             let diagnostics = model.checkpoint_diagnostics().unwrap().unwrap();
             let global_payload = std::fs::metadata(&checkpoint).unwrap().len();
@@ -504,6 +521,12 @@ fn pipeline_ring_worker() {
             .units()
             .iter()
             .all(|unit| unit.host_resident() && !unit.device_resident()));
+        if requantize {
+            let materialization = report.materialization().unwrap();
+            assert!(materialization.transformed_weights > 0);
+            assert!(materialization.output_bytes < materialization.source_bytes_read);
+            assert!(info.materialization.is_some());
+        }
         if family.has_gguf_source() {
             let diagnostics = model.checkpoint_diagnostics().unwrap().unwrap();
             let global_payload = std::fs::metadata(&checkpoint).unwrap().len();
@@ -1553,6 +1576,20 @@ fn write_qwen_fixture(directory: &Path, model_type: &str) {
 fn write_qwen_fixture_with_tied_head(directory: &Path, model_type: &str, tied: bool) {
     let mut config = qwen_config(model_type);
     config["tie_word_embeddings"] = serde_json::json!(tied);
+    write_qwen_config_fixture(directory, config);
+}
+
+fn write_qwen_requantized_tp_fixture(directory: &Path) {
+    let mut config = qwen_config("qwen3");
+    config["hidden_size"] = serde_json::json!(64);
+    config["num_attention_heads"] = serde_json::json!(8);
+    config["num_key_value_heads"] = serde_json::json!(4);
+    config["intermediate_size"] = serde_json::json!(128);
+    config["vocab_size"] = serde_json::json!(64);
+    write_qwen_config_fixture(directory, config);
+}
+
+fn write_qwen_config_fixture(directory: &Path, config: serde_json::Value) {
     std::fs::write(
         directory.join("config.json"),
         serde_json::to_vec_pretty(&config).unwrap(),
@@ -3492,6 +3529,26 @@ fn ring_two_process_dense_stream_pipeline() {
     run_ring_pipeline(true, FixtureFamily::Llama);
 }
 
+/// Verifies stage-local 4-bit materialization precedes TP+PP dense-stream
+/// residency and preserves synchronized prefill, decode, and generation.
+#[test]
+#[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
+fn ring_four_process_qwen3_requantized_dense_stream_tensor_pipeline() {
+    run_ring_cartesian_pipeline_mode(true, FixtureFamily::Qwen3, "tp-pp", WorkerMode::Requantize);
+}
+
+/// Verifies the same packed stage overlay feeds host-layerwise residency before
+/// bounded device promotion under TP+PP.
+#[test]
+#[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
+fn ring_four_process_qwen3_requantized_layerwise_host_tensor_pipeline() {
+    run_ring_layerwise_host_cartesian_pipeline_mode(
+        FixtureFamily::Qwen3,
+        "tp-pp",
+        WorkerMode::Requantize,
+    );
+}
+
 /// Verifies host-resident stage layers and bounded device promotion compose
 /// with TP-sharded attention, cache state, and pipeline transport.
 #[test]
@@ -4520,6 +4577,10 @@ fn run_ring_cartesian_pipeline_mode(
         path
     } else {
         match family {
+            FixtureFamily::Qwen3 if mode == WorkerMode::Requantize => {
+                write_qwen_requantized_tp_fixture(checkpoint.path())
+            }
+            FixtureFamily::Qwen3 => write_qwen_fixture(checkpoint.path(), "qwen3"),
             FixtureFamily::Qwen3Moe => write_qwen_fixture(checkpoint.path(), "qwen3_moe"),
             FixtureFamily::Qwen3MoeTied => {
                 write_qwen_fixture_with_tied_head(checkpoint.path(), "qwen3_moe", true)
@@ -4577,6 +4638,9 @@ fn run_ring_layerwise_host_cartesian_pipeline_mode(
         path
     } else {
         match family {
+            FixtureFamily::Qwen3 if mode == WorkerMode::Requantize => {
+                write_qwen_requantized_tp_fixture(checkpoint.path())
+            }
             FixtureFamily::Qwen3 => write_qwen_fixture(checkpoint.path(), "qwen3"),
             FixtureFamily::DeepSeek => write_deepseek_fixture(checkpoint.path(), 2),
             FixtureFamily::Qwen3Moe => write_qwen_fixture(checkpoint.path(), "qwen3_moe"),
@@ -4619,6 +4683,7 @@ enum WorkerMode {
     ExpertCacheScheduleMismatch,
     Microbatch,
     ScheduleMismatch,
+    Requantize,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -4789,6 +4854,9 @@ fn run_ring_pipeline_processes(
             }
             WorkerMode::ScheduleMismatch => {
                 command.env(SCHEDULE_MISMATCH, "1");
+            }
+            WorkerMode::Requantize => {
+                command.env(REQUANTIZE, "1");
             }
         }
         children.children.push(command.spawn().unwrap());

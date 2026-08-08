@@ -72,6 +72,7 @@ use crate::{
         binding_bytes, materialize_module_bindings, populate_module_from_arrays_excluding,
         populate_module_from_dense_arrays_quantized_excluding, populate_module_from_lease,
     },
+    runtime::checkpoint::bounded_quantization::BoundedQuantizationReport,
     runtime::checkpoint::quantization::{quantize_tensor, WeightQuantization},
     runtime::checkpoint::store::{GgufWeightStore, WeightStore, WeightStoreDiagnostics},
     runtime::distributed::expert::{
@@ -84,9 +85,10 @@ use crate::{
     runtime::distributed::topology::{ParallelCoordinates, ParallelTopology},
     runtime::execution::inspection::ActivationObserver,
     runtime::execution::layerwise::{
-        open_safetensors_weight_store, shard_layer_bindings, ArchitectureAdapter,
-        DenseDiskStreamReport, DenseStreamController, LayerWeightResidency, LayerwiseLoadOptions,
-        SharedWeightStore, StaticUnitBindings,
+        open_safetensors_weight_store, quantize_pipeline_stage_store, shard_layer_bindings,
+        ArchitectureAdapter, DenseDiskStreamReport, DenseStreamController, LayerWeightResidency,
+        LayerwiseLoadOptions, PipelineStageQuantizationSelection, SharedWeightStore,
+        StaticUnitBindings,
     },
     runtime::generation::sampler::Sampler,
     runtime::media::{PreparedModelInput, PreparedModelInputIdentity},
@@ -195,6 +197,9 @@ pub struct PipelineStageInfo {
     pub opened_checkpoint_shards: Vec<PathBuf>,
     /// Checkpoint backend reads observed after rank-local materialization.
     pub checkpoint_diagnostics: Option<WeightStoreDiagnostics>,
+    /// Bounded stage-local load-time materialization telemetry, when dense
+    /// semantic weights were converted into a packed overlay.
+    pub materialization: Option<BoundedQuantizationReport>,
 }
 
 /// Shape metadata shared by every rank for one pipeline operation.
@@ -1607,6 +1612,7 @@ struct PipelineLayerStorage {
     units: Vec<OffloadUnitId>,
     execution_offset: usize,
     independent_expert_prefix: Option<&'static str>,
+    materialization: Option<BoundedQuantizationReport>,
     sample_mlx_memory: bool,
     sample_process_memory: bool,
 }
@@ -1704,14 +1710,19 @@ impl PipelineLayerStorage {
     fn dense_stream_report(&self) -> Result<Option<DenseDiskStreamReport>, Error> {
         match &self.controller {
             PipelineLayerController::LayerwiseHost(_) => Ok(None),
-            PipelineLayerController::DenseDiskStream(controller) => {
-                Ok(Some(controller.report(&self.residency)?))
-            }
+            PipelineLayerController::DenseDiskStream(controller) => Ok(Some(
+                controller
+                    .report(&self.residency)?
+                    .with_materialization(self.materialization.clone()),
+            )),
         }
     }
 
     fn residency_report(&self) -> Result<ResidencyReport, Error> {
-        Ok(self.residency.report()?)
+        Ok(self
+            .residency
+            .report()?
+            .with_materialization(self.materialization.clone()))
     }
 
     fn planned_layer_bytes(&self) -> Result<u64, Error> {
@@ -4687,6 +4698,7 @@ fn base_info(
         planned_owned_parameter_bytes: 0,
         opened_checkpoint_shards: Vec::new(),
         checkpoint_diagnostics: None,
+        materialization: None,
     }
 }
 
@@ -5115,6 +5127,7 @@ fn build_pipeline_layer_storage<L, F, B>(
     range: Range<usize>,
     options: PipelineLayerLoadOptions,
     static_device_bytes: u64,
+    materialization: Option<BoundedQuantizationReport>,
     stream: &Stream,
     weights_stream: &Stream,
     mut make_layer: F,
@@ -5287,6 +5300,7 @@ where
         units,
         execution_offset: 0,
         independent_expert_prefix: None,
+        materialization,
         sample_mlx_memory,
         sample_process_memory,
     })
@@ -5452,6 +5466,12 @@ pub fn load_pipeline_model_with_options(
         // The explicit pipeline loader has already validated its topology;
         // complete-model structural policy must not reject the PP coordinate.
         structural_options.parallel = None;
+        // Stage-local residency and bounded materialization are validated by
+        // the pipeline planner below. Whole-model GGUF policy must therefore
+        // validate the artifact geometry without reapplying the standalone
+        // nonresident-loader restriction.
+        structural_options.weight_residency =
+            crate::runtime::execution::layerwise::WeightResidency::fully_resident();
         crate::api::structural::validate_gguf(
             architecture,
             &checkpoint,
@@ -6142,12 +6162,6 @@ fn load_llama_pipeline(
     weights_stream: &Stream,
 ) -> Result<PipelineModel, Error> {
     topology.preflight(Some(source_args.attention_schedule.len()), None)?;
-    if dense_stream.is_some() && requested_quantization.is_some() {
-        return Err(Error::Quantization(
-            "load-time quantization is unsupported for non-resident pipeline layers; use checkpoint-native packed weights"
-                .into(),
-        ));
-    }
     let quantize_on_load = requested_quantization
         .map(|requested| {
             crate::runtime::checkpoint::quantization::should_quantize_on_load(
@@ -6243,24 +6257,50 @@ fn load_llama_pipeline(
             )
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let static_units = pipeline_binding_units(
-        &binding_adapter,
-        store.as_ref(),
-        &selected_pipeline_static_roles([
-            (
-                "embedding",
-                stage.embedding.is_some()
-                    || stage.output_embedding.is_some()
-                    || stage.parallel_embedding.is_some()
-                    || stage.parallel_output_embedding.is_some(),
-            ),
-            ("norm", stage.norm.is_some()),
-            (
-                "output",
-                stage.lm_head.is_some() || stage.parallel_lm_head.is_some(),
-            ),
-        ]),
-    )?;
+    let static_roles = selected_pipeline_static_roles([
+        (
+            "embedding",
+            stage.embedding.is_some()
+                || stage.output_embedding.is_some()
+                || stage.parallel_embedding.is_some()
+                || stage.parallel_output_embedding.is_some(),
+        ),
+        ("norm", stage.norm.is_some()),
+        (
+            "output",
+            stage.lm_head.is_some() || stage.parallel_lm_head.is_some(),
+        ),
+    ]);
+    let (store, materialization) = if dense_stream.is_some() {
+        match quantize_on_load {
+            Some(quantization) => {
+                let (store, report) = quantize_pipeline_stage_store(
+                    store,
+                    &binding_adapter,
+                    &stage.layer_adapter,
+                    PipelineStageQuantizationSelection::new(&static_roles, 0, stage.range.clone()),
+                    quantization,
+                    stream,
+                    weights_stream,
+                )?;
+                (store, Some(report))
+            }
+            None => (store, None),
+        }
+    } else {
+        (store, None)
+    };
+    let quantize_on_load = materialization
+        .is_none()
+        .then_some(quantize_on_load)
+        .flatten();
+    let binding_adapter = if materialization.is_some() {
+        &stage.layer_adapter
+    } else {
+        &binding_adapter
+    };
+    info.materialization = materialization;
+    let static_units = pipeline_binding_units(binding_adapter, store.as_ref(), &static_roles)?;
     let mut loaded = PipelineLoadAccumulator::new("Llama");
     if let Some(module) = &mut stage.parallel_embedding {
         let bindings = shard_layer_bindings(
@@ -6379,6 +6419,7 @@ fn load_llama_pipeline(
             stage.range.clone(),
             dense_stream,
             static_device_bytes,
+            info.materialization.clone(),
             stream,
             weights_stream,
             |global_layer, stream| {
@@ -7243,18 +7284,13 @@ fn load_dense_qwen_pipeline(
         })
         .transpose()?
         .flatten();
-    if dense_stream.is_some() && quantize_on_load.is_some() {
-        return Err(Error::Quantization(
-            "load-time quantization is unsupported for non-resident dense-Qwen pipeline layers; use checkpoint-native packed weights"
-                .into(),
-        ));
-    }
     let mut target_args = source_args.clone();
     if let Some(quantization) = quantize_on_load {
         target_args.quantization = Some(quantization);
         target_args.quantization_config = None;
         target_args.quantized_weight_configs = None;
     }
+    let expert_quantization = quantize_on_load;
     let range = topology.layer_range(source_args.attention_schedule.len())?;
     let mut info = base_info(
         topology,
@@ -7335,24 +7371,50 @@ fn load_dense_qwen_pipeline(
             )
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let static_units = pipeline_binding_units(
-        &binding_adapter,
-        store.as_ref(),
-        &selected_pipeline_static_roles([
-            (
-                "embedding",
-                stage.embedding.is_some()
-                    || stage.output_embedding.is_some()
-                    || stage.parallel_embedding.is_some()
-                    || stage.parallel_output_embedding.is_some(),
-            ),
-            ("norm", stage.norm.is_some()),
-            (
-                "output",
-                stage.lm_head.is_some() || stage.parallel_lm_head.is_some(),
-            ),
-        ]),
-    )?;
+    let static_roles = selected_pipeline_static_roles([
+        (
+            "embedding",
+            stage.embedding.is_some()
+                || stage.output_embedding.is_some()
+                || stage.parallel_embedding.is_some()
+                || stage.parallel_output_embedding.is_some(),
+        ),
+        ("norm", stage.norm.is_some()),
+        (
+            "output",
+            stage.lm_head.is_some() || stage.parallel_lm_head.is_some(),
+        ),
+    ]);
+    let (store, materialization) = if dense_stream.is_some() {
+        match quantize_on_load {
+            Some(quantization) => {
+                let (store, report) = quantize_pipeline_stage_store(
+                    store,
+                    &binding_adapter,
+                    &stage.layer_adapter,
+                    PipelineStageQuantizationSelection::new(&static_roles, 0, stage.range.clone()),
+                    quantization,
+                    stream,
+                    weights_stream,
+                )?;
+                (store, Some(report))
+            }
+            None => (store, None),
+        }
+    } else {
+        (store, None)
+    };
+    let quantize_on_load = materialization
+        .is_none()
+        .then_some(quantize_on_load)
+        .flatten();
+    let binding_adapter = if materialization.is_some() {
+        &stage.layer_adapter
+    } else {
+        &binding_adapter
+    };
+    info.materialization = materialization;
+    let static_units = pipeline_binding_units(binding_adapter, store.as_ref(), &static_roles)?;
     let mut loaded = PipelineLoadAccumulator::new("dense-Qwen");
     if let Some(module) = &mut stage.parallel_embedding {
         let bindings = shard_layer_bindings(
@@ -7482,6 +7544,7 @@ fn load_dense_qwen_pipeline(
             stage.range.clone(),
             options,
             static_bytes,
+            info.materialization.clone(),
             stream,
             weights_stream,
             |global_layer, stream| {
@@ -7537,7 +7600,7 @@ fn load_dense_qwen_pipeline(
             Arc::clone(&store),
             entries,
             Some(options),
-            quantize_on_load,
+            expert_quantization,
             weights_stream,
             stream,
         )?;
@@ -7600,18 +7663,18 @@ fn load_qwen3_vl_pipeline(
         })
         .transpose()?
         .flatten();
-    if dense_stream.is_some() && quantize_on_load.is_some() {
-        return Err(Error::Quantization(
-            "load-time quantization is unsupported for non-resident Qwen3-VL pipeline layers; use checkpoint-native packed weights"
-                .into(),
-        ));
-    }
     let mut target_args = source_args.clone();
     if let Some(quantization) = quantize_on_load {
         target_args.text_config.quantization = Some(quantization);
         target_args.text_config.quantization_config = None;
         target_args.text_config.quantized_weight_configs = None;
     }
+    let expert_quantization = quantize_on_load;
+    let target_binding_adapter = if expert_cache_options.is_some() {
+        Qwen3VlLayerwiseAdapter::new_external_experts(target_args.clone(), stream)?
+    } else {
+        Qwen3VlLayerwiseAdapter::new(target_args.clone(), stream)?
+    };
     let range = topology.layer_range(source_args.text_config.num_hidden_layers as usize)?;
     let kind = if source_args.text_config.is_moe() {
         ModelKind::Qwen3VlMoe
@@ -7690,24 +7753,50 @@ fn load_qwen3_vl_pipeline(
             )
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let static_units = pipeline_binding_units(
-        &binding_adapter,
-        store.as_ref(),
-        &selected_pipeline_static_roles([
-            ("vision", info.is_first),
-            (
-                "embedding",
-                info.is_first
-                    || stage.output_embedding.is_some()
-                    || stage.parallel_output_embedding.is_some(),
-            ),
-            ("norm", info.is_last),
-            (
-                "output",
-                info.is_last && !target_args.text_config.tie_word_embeddings,
-            ),
-        ]),
-    )?;
+    let static_roles = selected_pipeline_static_roles([
+        ("vision", info.is_first),
+        (
+            "embedding",
+            info.is_first
+                || stage.output_embedding.is_some()
+                || stage.parallel_output_embedding.is_some(),
+        ),
+        ("norm", info.is_last),
+        (
+            "output",
+            info.is_last && !target_args.text_config.tie_word_embeddings,
+        ),
+    ]);
+    let (store, materialization) = if dense_stream.is_some() {
+        match quantize_on_load {
+            Some(quantization) => {
+                let (store, report) = quantize_pipeline_stage_store(
+                    store,
+                    &binding_adapter,
+                    &target_binding_adapter,
+                    PipelineStageQuantizationSelection::new(&static_roles, 1, stage.range.clone()),
+                    quantization,
+                    stream,
+                    weights_stream,
+                )?;
+                (store, Some(report))
+            }
+            None => (store, None),
+        }
+    } else {
+        (store, None)
+    };
+    let quantize_on_load = materialization
+        .is_none()
+        .then_some(quantize_on_load)
+        .flatten();
+    let binding_adapter = if materialization.is_some() {
+        &target_binding_adapter
+    } else {
+        &binding_adapter
+    };
+    info.materialization = materialization;
+    let static_units = pipeline_binding_units(binding_adapter, store.as_ref(), &static_roles)?;
     let mut loaded = PipelineLoadAccumulator::new("Qwen3-VL");
     if info.is_first {
         let bindings = if let Some(layout) = parallel_layout.as_ref() {
@@ -7882,6 +7971,7 @@ fn load_qwen3_vl_pipeline(
             stage.range.clone(),
             options,
             static_bytes,
+            info.materialization.clone(),
             stream,
             weights_stream,
             |global_layer, stream| {
@@ -7936,7 +8026,7 @@ fn load_qwen3_vl_pipeline(
             Arc::clone(&store),
             entries,
             Some(options),
-            quantize_on_load,
+            expert_quantization,
             weights_stream,
             stream,
         )?;
@@ -9046,17 +9136,23 @@ fn load_gpt_oss_pipeline(
         })
         .transpose()?
         .flatten();
-    if dense_stream.is_some() && quantize_on_load.is_some() {
-        return Err(Error::Quantization(
-            "load-time quantization is unsupported for non-resident GPT-OSS pipeline layers; use checkpoint-native packed weights"
-                .into(),
-        ));
-    }
     let mut target_args = source_args.clone();
     if let Some(quantization) = quantize_on_load {
         target_args.quantization = Some(quantization);
         target_args.quantized_weight_configs = None;
     }
+    let expert_quantization = quantize_on_load;
+    let target_binding_adapter = if expert_cache_options.is_some() {
+        crate::architectures::gpt_oss::layerwise::GptOssLayerwiseAdapter::new_external_experts(
+            target_args.clone(),
+            stream,
+        )?
+    } else {
+        crate::architectures::gpt_oss::layerwise::GptOssLayerwiseAdapter::new(
+            target_args.clone(),
+            stream,
+        )?
+    };
     let range = topology.layer_range(source_args.attention_schedule.len())?;
     let mut info = base_info(
         topology,
@@ -9131,21 +9227,47 @@ fn load_gpt_oss_pipeline(
             )
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let static_units = pipeline_binding_units(
-        &binding_adapter,
-        store.as_ref(),
-        &selected_pipeline_static_roles([
-            (
-                "embedding",
-                stage.embedding.is_some() || stage.parallel_embedding.is_some(),
-            ),
-            ("norm", stage.norm.is_some()),
-            (
-                "output",
-                stage.lm_head.is_some() || stage.parallel_lm_head.is_some(),
-            ),
-        ]),
-    )?;
+    let static_roles = selected_pipeline_static_roles([
+        (
+            "embedding",
+            stage.embedding.is_some() || stage.parallel_embedding.is_some(),
+        ),
+        ("norm", stage.norm.is_some()),
+        (
+            "output",
+            stage.lm_head.is_some() || stage.parallel_lm_head.is_some(),
+        ),
+    ]);
+    let (store, materialization) = if dense_stream.is_some() {
+        match quantize_on_load {
+            Some(quantization) => {
+                let (store, report) = quantize_pipeline_stage_store(
+                    store,
+                    &binding_adapter,
+                    &target_binding_adapter,
+                    PipelineStageQuantizationSelection::new(&static_roles, 0, stage.range.clone()),
+                    quantization,
+                    stream,
+                    weights_stream,
+                )?;
+                (store, Some(report))
+            }
+            None => (store, None),
+        }
+    } else {
+        (store, None)
+    };
+    let quantize_on_load = materialization
+        .is_none()
+        .then_some(quantize_on_load)
+        .flatten();
+    let binding_adapter = if materialization.is_some() {
+        &target_binding_adapter
+    } else {
+        &binding_adapter
+    };
+    info.materialization = materialization;
+    let static_units = pipeline_binding_units(binding_adapter, store.as_ref(), &static_roles)?;
     let mut loaded = PipelineLoadAccumulator::new("GPT-OSS");
     if let Some(module) = &mut stage.parallel_embedding {
         let bindings = shard_layer_bindings(
@@ -9252,6 +9374,7 @@ fn load_gpt_oss_pipeline(
             stage.range.clone(),
             options,
             static_bytes,
+            info.materialization.clone(),
             stream,
             weights_stream,
             |global_layer, stream| {
@@ -9306,7 +9429,7 @@ fn load_gpt_oss_pipeline(
             Arc::clone(&store),
             entries,
             Some(options),
-            quantize_on_load,
+            expert_quantization,
             weights_stream,
             stream,
         )?;
@@ -9973,17 +10096,17 @@ fn load_lfm2_pipeline(
         })
         .transpose()?
         .flatten();
-    if dense_stream.is_some() && quantize_on_load.is_some() {
-        return Err(Error::Quantization(
-            "load-time quantization is unsupported for non-resident LFM2 pipeline layers; use checkpoint-native packed weights"
-                .into(),
-        ));
-    }
     let mut target_args = source_args.clone();
     if let Some(quantization) = quantize_on_load {
         target_args.weight_quantization = Some(quantization);
         target_args.quantized_weight_configs = None;
     }
+    let expert_quantization = quantize_on_load;
+    let target_binding_adapter = if expert_cache_options.is_some() {
+        Lfm2LayerwiseAdapter::new_external_experts(target_args.clone(), stream)?
+    } else {
+        Lfm2LayerwiseAdapter::new(target_args.clone(), stream)?
+    };
     let range = topology.layer_range(source_args.layer_schedule.len())?;
     let mut info = base_info(
         topology,
@@ -10103,24 +10226,50 @@ fn load_lfm2_pipeline(
             )
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let static_units = pipeline_binding_units(
-        &binding_adapter,
-        store.as_ref(),
-        &selected_pipeline_static_roles([
-            (
-                "embedding",
-                stage.embedding.is_some()
-                    || stage.output_embedding.is_some()
-                    || stage.parallel_embedding.is_some()
-                    || stage.parallel_output_embedding.is_some(),
-            ),
-            ("norm", stage.norm.is_some()),
-            (
-                "output",
-                stage.lm_head.is_some() || stage.parallel_lm_head.is_some(),
-            ),
-        ]),
-    )?;
+    let static_roles = selected_pipeline_static_roles([
+        (
+            "embedding",
+            stage.embedding.is_some()
+                || stage.output_embedding.is_some()
+                || stage.parallel_embedding.is_some()
+                || stage.parallel_output_embedding.is_some(),
+        ),
+        ("norm", stage.norm.is_some()),
+        (
+            "output",
+            stage.lm_head.is_some() || stage.parallel_lm_head.is_some(),
+        ),
+    ]);
+    let (store, materialization) = if dense_stream.is_some() {
+        match quantize_on_load {
+            Some(quantization) => {
+                let (store, report) = quantize_pipeline_stage_store(
+                    store,
+                    &binding_adapter,
+                    &target_binding_adapter,
+                    PipelineStageQuantizationSelection::new(&static_roles, 0, stage.range.clone()),
+                    quantization,
+                    stream,
+                    weights_stream,
+                )?;
+                (store, Some(report))
+            }
+            None => (store, None),
+        }
+    } else {
+        (store, None)
+    };
+    let quantize_on_load = materialization
+        .is_none()
+        .then_some(quantize_on_load)
+        .flatten();
+    let binding_adapter = if materialization.is_some() {
+        &target_binding_adapter
+    } else {
+        &binding_adapter
+    };
+    info.materialization = materialization;
+    let static_units = pipeline_binding_units(binding_adapter, store.as_ref(), &static_roles)?;
     let mut loaded = PipelineLoadAccumulator::new("LFM2");
     if let Some(module) = &mut stage.parallel_embedding {
         let bindings = shard_layer_bindings(
@@ -10252,6 +10401,7 @@ fn load_lfm2_pipeline(
             stage.range.clone(),
             options,
             static_bytes,
+            info.materialization.clone(),
             stream,
             weights_stream,
             |global_layer, stream| {
@@ -10306,7 +10456,7 @@ fn load_lfm2_pipeline(
                 Arc::clone(&store),
                 entries,
                 Some(options),
-                quantize_on_load,
+                expert_quantization,
                 weights_stream,
                 stream,
             )?;
@@ -11473,18 +11623,18 @@ fn load_nemotron_h_pipeline(
         })
         .transpose()?
         .flatten();
-    if dense_stream.is_some() && quantize_on_load.is_some() {
-        return Err(Error::Quantization(
-            "load-time quantization is unsupported for non-resident Nemotron-H pipeline layers; use checkpoint-native packed weights"
-                .into(),
-        ));
-    }
     let mut target_args = source_args.clone();
     if let Some(affine) = quantize_on_load {
         target_args.quantization = Some(affine);
         target_args.quantized_weights = None;
         target_args.quantized_weight_configs = None;
     }
+    let expert_quantization = quantize_on_load.map(WeightQuantization::Affine);
+    let mut target_binding_adapter = if expert_cache_options.is_some() {
+        NemotronHLayerwiseAdapter::new_external_experts(target_args.clone(), stream)?
+    } else {
+        NemotronHLayerwiseAdapter::new(target_args.clone(), stream)?
+    };
     let range = topology.layer_range(source_args.num_hidden_layers as usize)?;
     let mut info = base_info(
         topology,
@@ -11514,6 +11664,7 @@ fn load_nemotron_h_pipeline(
         binding_adapter.register_parallel_parameters(build, &mut planner, stream)?;
         let (_, layout) = planner.finish()?;
         binding_adapter.configure_cartesian_layout(build, &layout, stream)?;
+        target_binding_adapter.configure_cartesian_layout(build, &layout, stream)?;
         stage
             .layer_adapter
             .configure_cartesian_layout(build, &layout, stream)?;
@@ -11575,24 +11726,47 @@ fn load_nemotron_h_pipeline(
         })
         .collect::<Result<Vec<_>, _>>()?;
     let requested = quantize_on_load.map(WeightQuantization::Affine);
-    let static_units = pipeline_binding_units(
-        &binding_adapter,
-        store.as_ref(),
-        &selected_pipeline_static_roles([
-            (
-                "embedding",
-                stage.embedding.is_some()
-                    || stage.output_embedding.is_some()
-                    || stage.parallel_embedding.is_some()
-                    || stage.parallel_output_embedding.is_some(),
-            ),
-            ("norm", stage.norm.is_some()),
-            (
-                "output",
-                stage.lm_head.is_some() || stage.parallel_lm_head.is_some(),
-            ),
-        ]),
-    )?;
+    let static_roles = selected_pipeline_static_roles([
+        (
+            "embedding",
+            stage.embedding.is_some()
+                || stage.output_embedding.is_some()
+                || stage.parallel_embedding.is_some()
+                || stage.parallel_output_embedding.is_some(),
+        ),
+        ("norm", stage.norm.is_some()),
+        (
+            "output",
+            stage.lm_head.is_some() || stage.parallel_lm_head.is_some(),
+        ),
+    ]);
+    let (store, materialization) = if dense_stream.is_some() {
+        match requested {
+            Some(quantization) => {
+                let (store, report) = quantize_pipeline_stage_store(
+                    store,
+                    &binding_adapter,
+                    &target_binding_adapter,
+                    PipelineStageQuantizationSelection::new(&static_roles, 0, stage.range.clone()),
+                    quantization,
+                    stream,
+                    weights_stream,
+                )?;
+                (store, Some(report))
+            }
+            None => (store, None),
+        }
+    } else {
+        (store, None)
+    };
+    let requested = materialization.is_none().then_some(requested).flatten();
+    let binding_adapter = if materialization.is_some() {
+        &target_binding_adapter
+    } else {
+        &binding_adapter
+    };
+    info.materialization = materialization;
+    let static_units = pipeline_binding_units(binding_adapter, store.as_ref(), &static_roles)?;
     let mut loaded = PipelineLoadAccumulator::new("Nemotron-H");
     if let Some(module) = &mut stage.parallel_embedding {
         let bindings = shard_layer_bindings(
@@ -11722,6 +11896,7 @@ fn load_nemotron_h_pipeline(
             stage.range.clone(),
             options,
             static_bytes,
+            info.materialization.clone(),
             stream,
             weights_stream,
             |global_layer, stream| {
@@ -11778,7 +11953,7 @@ fn load_nemotron_h_pipeline(
                 Arc::clone(&store),
                 entries,
                 Some(options),
-                quantize_on_load.map(WeightQuantization::Affine),
+                expert_quantization,
                 weights_stream,
                 stream,
             )?;
@@ -12704,18 +12879,26 @@ fn load_qwen_hybrid_pipeline(
         })
         .transpose()?
         .flatten();
-    if dense_stream.is_some() && quantize_on_load.is_some() {
-        return Err(Error::Quantization(
-            "load-time quantization is unsupported for non-resident Qwen hybrid pipeline weights; use checkpoint-native packed weights"
-                .into(),
-        ));
-    }
     let mut target_args = source_args.clone();
     if let Some(quantization) = quantize_on_load {
         target_args.quantization = Some(quantization);
         target_args.quantization_config = None;
         target_args.quantized_weight_configs = None;
     }
+    let mut target_binding_adapter = if vision_config.is_some() {
+        QwenHybridLayerwiseAdapter::new_pipeline(
+            target_args.clone(),
+            image_token_id,
+            video_token_id,
+            vision_config.clone(),
+            expert_cache_options.is_some(),
+            stream,
+        )?
+    } else if expert_cache_options.is_some() {
+        QwenHybridLayerwiseAdapter::new_text_external_experts(target_args.clone(), stream)?
+    } else {
+        QwenHybridLayerwiseAdapter::new_text(target_args.clone(), stream)?
+    };
     let range = topology.layer_range(source_args.num_hidden_layers as usize)?;
     let kind = if source_args.model_type == "qwen3_next" {
         ModelKind::Qwen3Next
@@ -12746,6 +12929,7 @@ fn load_qwen_hybrid_pipeline(
         stage
             .layer_adapter
             .configure_cartesian_layout(build, &layout, stream)?;
+        target_binding_adapter.configure_cartesian_layout(build, &layout, stream)?;
         stage.parallel_geometry = stage.layer_adapter.parallel_geometry().map(<[_]>::to_vec);
         stage.parallel_embedding = (info.is_first && !stage.has_multimodal_ingress)
             .then(|| {
@@ -12808,29 +12992,59 @@ fn load_qwen_hybrid_pipeline(
             }
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let static_units = pipeline_binding_units(
-        &binding_adapter,
-        store.as_ref(),
-        &selected_pipeline_static_roles([
-            (
-                "embedding",
-                stage.embedding.is_some()
-                    || stage.output_embedding.is_some()
-                    || stage.parallel_embedding.is_some()
-                    || stage.parallel_output_embedding.is_some()
-                    || (info.is_first && stage.has_multimodal_ingress),
-            ),
-            ("norm", stage.norm.is_some()),
-            (
-                "output",
-                stage.lm_head.is_some() || stage.parallel_lm_head.is_some(),
-            ),
-            (
-                "vision",
-                info.is_first && stage.layer_adapter.pipeline_static_mut("vision").is_some(),
-            ),
-        ]),
-    )?;
+    let has_vision_static =
+        info.is_first && stage.layer_adapter.pipeline_static_mut("vision").is_some();
+    let static_roles = selected_pipeline_static_roles([
+        (
+            "embedding",
+            stage.embedding.is_some()
+                || stage.output_embedding.is_some()
+                || stage.parallel_embedding.is_some()
+                || stage.parallel_output_embedding.is_some()
+                || (info.is_first && stage.has_multimodal_ingress),
+        ),
+        ("norm", stage.norm.is_some()),
+        (
+            "output",
+            stage.lm_head.is_some() || stage.parallel_lm_head.is_some(),
+        ),
+        ("vision", has_vision_static),
+    ]);
+    let (store, materialization) = if dense_stream.is_some() {
+        match quantize_on_load {
+            Some(quantization) => {
+                let (store, report) = quantize_pipeline_stage_store(
+                    store,
+                    &binding_adapter,
+                    &target_binding_adapter,
+                    PipelineStageQuantizationSelection::new(
+                        &static_roles,
+                        text_group,
+                        stage.range.clone(),
+                    ),
+                    quantization,
+                    stream,
+                    weights_stream,
+                )?;
+                (store, Some(report))
+            }
+            None => (store, None),
+        }
+    } else {
+        (store, None)
+    };
+    let expert_quantization = quantize_on_load;
+    let quantize_on_load = materialization
+        .is_none()
+        .then_some(quantize_on_load)
+        .flatten();
+    let binding_adapter = if materialization.is_some() {
+        &target_binding_adapter
+    } else {
+        &binding_adapter
+    };
+    info.materialization = materialization;
+    let static_units = pipeline_binding_units(binding_adapter, store.as_ref(), &static_roles)?;
     let mut loaded = PipelineLoadAccumulator::new("Qwen hybrid");
     if info.is_first && stage.has_multimodal_ingress {
         let bindings = pipeline_cartesian_static_bindings(
@@ -13030,6 +13244,7 @@ fn load_qwen_hybrid_pipeline(
                 0..unit_count,
                 options,
                 static_bytes,
+                info.materialization.clone(),
                 stream,
                 weights_stream,
                 |ordinal, stream| {
@@ -13110,7 +13325,7 @@ fn load_qwen_hybrid_pipeline(
                 Arc::clone(&store),
                 entries,
                 Some(options),
-                quantize_on_load,
+                expert_quantization,
                 weights_stream,
                 stream,
             )?;
@@ -14099,17 +14314,16 @@ fn load_kimi_linear_pipeline(
         })
         .transpose()?
         .flatten();
-    if dense_stream.is_some() && quantize_on_load.is_some() {
-        return Err(Error::Quantization(
-            "load-time quantization is unsupported for non-resident Kimi Linear pipeline layers; use checkpoint-native packed weights"
-                .into(),
-        ));
-    }
     let mut target_args = source_args.clone();
     if let Some(quantization) = quantize_on_load {
         target_args.quantization = Some(quantization);
         target_args.quantized_weight_configs = None;
     }
+    let target_binding_adapter = if expert_cache_options.is_some() {
+        KimiLinearLayerwiseAdapter::new_external_experts(target_args.clone(), stream)?
+    } else {
+        KimiLinearLayerwiseAdapter::new(target_args.clone(), stream)?
+    };
     let range = topology.layer_range(source_args.num_hidden_layers as usize)?;
     let mut info = base_info(
         topology,
@@ -14216,24 +14430,51 @@ fn load_kimi_linear_pipeline(
             )
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let static_units = pipeline_binding_units(
-        &binding_adapter,
-        store.as_ref(),
-        &selected_pipeline_static_roles([
-            (
-                "embedding",
-                stage.embedding.is_some()
-                    || stage.output_embedding.is_some()
-                    || stage.parallel_embedding.is_some()
-                    || stage.parallel_output_embedding.is_some(),
-            ),
-            ("norm", stage.norm.is_some()),
-            (
-                "output",
-                stage.lm_head.is_some() || stage.parallel_lm_head.is_some(),
-            ),
-        ]),
-    )?;
+    let static_roles = selected_pipeline_static_roles([
+        (
+            "embedding",
+            stage.embedding.is_some()
+                || stage.output_embedding.is_some()
+                || stage.parallel_embedding.is_some()
+                || stage.parallel_output_embedding.is_some(),
+        ),
+        ("norm", stage.norm.is_some()),
+        (
+            "output",
+            stage.lm_head.is_some() || stage.parallel_lm_head.is_some(),
+        ),
+    ]);
+    let (store, materialization) = if dense_stream.is_some() {
+        match quantize_on_load {
+            Some(quantization) => {
+                let (store, report) = quantize_pipeline_stage_store(
+                    store,
+                    &binding_adapter,
+                    &target_binding_adapter,
+                    PipelineStageQuantizationSelection::new(&static_roles, 0, stage.range.clone()),
+                    quantization,
+                    stream,
+                    weights_stream,
+                )?;
+                (store, Some(report))
+            }
+            None => (store, None),
+        }
+    } else {
+        (store, None)
+    };
+    let expert_quantization = quantize_on_load;
+    let quantize_on_load = materialization
+        .is_none()
+        .then_some(quantize_on_load)
+        .flatten();
+    let binding_adapter = if materialization.is_some() {
+        &target_binding_adapter
+    } else {
+        &binding_adapter
+    };
+    info.materialization = materialization;
+    let static_units = pipeline_binding_units(binding_adapter, store.as_ref(), &static_roles)?;
     let mut loaded = PipelineLoadAccumulator::new("Kimi Linear");
     if let Some(module) = &mut stage.parallel_embedding {
         let bindings = shard_layer_bindings(
@@ -14365,6 +14606,7 @@ fn load_kimi_linear_pipeline(
             stage.range.clone(),
             options,
             static_bytes,
+            info.materialization.clone(),
             stream,
             weights_stream,
             |global_layer, stream| {
@@ -14420,7 +14662,7 @@ fn load_kimi_linear_pipeline(
                 Arc::clone(&store),
                 entries,
                 Some(options),
-                quantize_on_load,
+                expert_quantization,
                 weights_stream,
                 stream,
             )?;
@@ -15455,6 +15697,7 @@ fn load_inkling_pipeline(
                 0..unit_count,
                 options,
                 static_bytes,
+                info.materialization.clone(),
                 stream,
                 weights_stream,
                 |ordinal, stream| {
@@ -16455,12 +16698,6 @@ fn load_gemma_pipeline(
         })
         .transpose()?
         .flatten();
-    if dense_stream.is_some() && quantize_on_load.is_some() {
-        return Err(Error::Quantization(
-            "load-time quantization is unsupported for non-resident Gemma pipeline layers; use checkpoint-native packed weights"
-                .into(),
-        ));
-    }
     let mut target_args = source_args.clone();
     if let Some(quantization) = quantize_on_load {
         target_args.quantized = true;
@@ -16470,6 +16707,27 @@ fn load_gemma_pipeline(
         target_args.quantized_weights = None;
         target_args.quantized_weight_configs = None;
     }
+    let mut target_binding_adapter = if external_experts {
+        Gemma4LayerwiseAdapter::new_pipeline_external_experts(
+            target_args.clone(),
+            vision_config.clone(),
+            image_token_id,
+            video_token_id,
+            audio_config.clone(),
+            audio_token_id,
+            stream,
+        )?
+    } else {
+        Gemma4LayerwiseAdapter::new_pipeline(
+            target_args.clone(),
+            vision_config.clone(),
+            image_token_id,
+            video_token_id,
+            audio_config.clone(),
+            audio_token_id,
+            stream,
+        )?
+    };
     let ranges = gemma_pipeline_ranges(&source_args, topology.pipeline_parallel_size)?;
     let range = ranges
         .get(topology.pipeline_parallel_rank)
@@ -16512,6 +16770,7 @@ fn load_gemma_pipeline(
         stage
             .layer_adapter
             .configure_parallel_static(build, &layout, stream)?;
+        target_binding_adapter.configure_parallel_static(build, &layout, stream)?;
 
         let vocabulary = crate::runtime::distributed::topology::balanced_contiguous_range(
             target_args.vocab_size as usize,
@@ -16606,72 +16865,97 @@ fn load_gemma_pipeline(
             )
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let static_units = pipeline_binding_units(
-        &binding_adapter,
-        store.as_ref(),
-        &selected_pipeline_static_roles([
-            (
-                "embedding",
-                (info.is_first && stage.has_multimodal_ingress)
-                    || stage.embedding.is_some()
-                    || stage.output_embedding.is_some()
-                    || stage.parallel_embedding.is_some()
-                    || stage.parallel_output_embedding.is_some(),
-            ),
-            (
-                "per_layer_embedding",
-                (info.is_first
-                    && stage.has_multimodal_ingress
-                    && target_args.hidden_size_per_layer_input > 0)
-                    || stage.per_layer_embedding.is_some()
-                    || stage.parallel_per_layer_embedding.is_some(),
-            ),
-            (
-                "per_layer_projection",
-                (info.is_first
-                    && stage.has_multimodal_ingress
-                    && target_args.hidden_size_per_layer_input > 0)
-                    || stage.per_layer_projection.is_some()
-                    || stage.parallel_per_layer_projection.is_some(),
-            ),
-            (
-                "per_layer_norm",
-                (info.is_first
-                    && stage.has_multimodal_ingress
-                    && target_args.hidden_size_per_layer_input > 0)
-                    || stage.per_layer_norm.is_some(),
-            ),
-            ("norm", stage.norm.is_some()),
-            (
-                "output",
-                stage.lm_head.is_some() || stage.parallel_lm_head.is_some(),
-            ),
-            (
-                "vision",
-                info.is_first && stage.layer_adapter.pipeline_static_mut("vision").is_some(),
-            ),
-            (
-                "vision_embed",
-                info.is_first
-                    && stage
-                        .layer_adapter
-                        .pipeline_static_mut("vision_embed")
-                        .is_some(),
-            ),
-            (
-                "audio",
-                info.is_first && stage.layer_adapter.pipeline_static_mut("audio").is_some(),
-            ),
-            (
-                "audio_embed",
-                info.is_first
-                    && stage
-                        .layer_adapter
-                        .pipeline_static_mut("audio_embed")
-                        .is_some(),
-            ),
-        ]),
-    )?;
+    let has_vision_static =
+        info.is_first && stage.layer_adapter.pipeline_static_mut("vision").is_some();
+    let has_vision_embed_static = info.is_first
+        && stage
+            .layer_adapter
+            .pipeline_static_mut("vision_embed")
+            .is_some();
+    let has_audio_static =
+        info.is_first && stage.layer_adapter.pipeline_static_mut("audio").is_some();
+    let has_audio_embed_static = info.is_first
+        && stage
+            .layer_adapter
+            .pipeline_static_mut("audio_embed")
+            .is_some();
+    let static_roles = selected_pipeline_static_roles([
+        (
+            "embedding",
+            (info.is_first && stage.has_multimodal_ingress)
+                || stage.embedding.is_some()
+                || stage.output_embedding.is_some()
+                || stage.parallel_embedding.is_some()
+                || stage.parallel_output_embedding.is_some(),
+        ),
+        (
+            "per_layer_embedding",
+            (info.is_first
+                && stage.has_multimodal_ingress
+                && target_args.hidden_size_per_layer_input > 0)
+                || stage.per_layer_embedding.is_some()
+                || stage.parallel_per_layer_embedding.is_some(),
+        ),
+        (
+            "per_layer_projection",
+            (info.is_first
+                && stage.has_multimodal_ingress
+                && target_args.hidden_size_per_layer_input > 0)
+                || stage.per_layer_projection.is_some()
+                || stage.parallel_per_layer_projection.is_some(),
+        ),
+        (
+            "per_layer_norm",
+            (info.is_first
+                && stage.has_multimodal_ingress
+                && target_args.hidden_size_per_layer_input > 0)
+                || stage.per_layer_norm.is_some(),
+        ),
+        ("norm", stage.norm.is_some()),
+        (
+            "output",
+            stage.lm_head.is_some() || stage.parallel_lm_head.is_some(),
+        ),
+        ("vision", has_vision_static),
+        ("vision_embed", has_vision_embed_static),
+        ("audio", has_audio_static),
+        ("audio_embed", has_audio_embed_static),
+    ]);
+    let (store, materialization) = if dense_stream.is_some() {
+        match quantize_on_load {
+            Some(quantization) => {
+                let (store, report) = quantize_pipeline_stage_store(
+                    store,
+                    &binding_adapter,
+                    &target_binding_adapter,
+                    PipelineStageQuantizationSelection::new(
+                        &static_roles,
+                        stage.layer_adapter.pipeline_text_group(),
+                        stage.range.clone(),
+                    ),
+                    quantization,
+                    stream,
+                    weights_stream,
+                )?;
+                (store, Some(report))
+            }
+            None => (store, None),
+        }
+    } else {
+        (store, None)
+    };
+    let expert_quantization = quantize_on_load;
+    let quantize_on_load = materialization
+        .is_none()
+        .then_some(quantize_on_load)
+        .flatten();
+    let binding_adapter = if materialization.is_some() {
+        &target_binding_adapter
+    } else {
+        &binding_adapter
+    };
+    info.materialization = materialization;
+    let static_units = pipeline_binding_units(binding_adapter, store.as_ref(), &static_roles)?;
     let mut loaded = PipelineLoadAccumulator::new("Gemma");
     if info.is_first && stage.has_multimodal_ingress {
         let bindings = pipeline_cartesian_static_bindings(
@@ -17006,6 +17290,7 @@ fn load_gemma_pipeline(
             0..unit_count,
             options,
             static_bytes,
+            info.materialization.clone(),
             stream,
             weights_stream,
             |ordinal, stream| {
@@ -17084,7 +17369,7 @@ fn load_gemma_pipeline(
             Arc::clone(&store),
             entries,
             expert_cache_options,
-            quantize_on_load,
+            expert_quantization,
             weights_stream,
             stream,
         )?;
@@ -17811,14 +18096,6 @@ fn load_deepseek_pipeline(
             .as_ref()
             .map(ExpertAssignment::global_expert_count),
     )?;
-    if (dense_stream.is_some() || expert_cache_options.is_some())
-        && requested_quantization.is_some()
-    {
-        return Err(Error::Quantization(
-            "load-time quantization is unsupported for non-resident pipeline layers; use checkpoint-native packed weights"
-                .into(),
-        ));
-    }
     if requested_quantization.is_some() && source_args.native_fp8_config().is_some() {
         return Err(Error::Quantization(
             "native DeepSeek block-FP8 pipeline weights cannot be implicitly requantized".into(),
@@ -17840,6 +18117,17 @@ fn load_deepseek_pipeline(
         target_args.quantization_config = None;
         target_args.quantization = Some(quantization);
     }
+    let target_binding_adapter = if expert_cache_options.is_some() {
+        crate::architectures::deepseek_v3::layerwise::DeepSeekV3LayerwiseAdapter::new_external_experts(
+            target_args.clone(),
+            stream,
+        )?
+    } else {
+        crate::architectures::deepseek_v3::layerwise::DeepSeekV3LayerwiseAdapter::new(
+            target_args.clone(),
+            stream,
+        )?
+    };
     let range = topology.layer_range(source_args.layer_schedule.len())?;
     let mut info = base_info(
         topology,
@@ -17912,21 +18200,48 @@ fn load_deepseek_pipeline(
             )
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let static_units = pipeline_binding_units(
-        &binding_adapter,
-        store.as_ref(),
-        &selected_pipeline_static_roles([
-            (
-                "embedding",
-                stage.embedding.is_some() || stage.parallel_embedding.is_some(),
-            ),
-            ("norm", stage.norm.is_some()),
-            (
-                "output",
-                stage.lm_head.is_some() || stage.parallel_lm_head.is_some(),
-            ),
-        ]),
-    )?;
+    let static_roles = selected_pipeline_static_roles([
+        (
+            "embedding",
+            stage.embedding.is_some() || stage.parallel_embedding.is_some(),
+        ),
+        ("norm", stage.norm.is_some()),
+        (
+            "output",
+            stage.lm_head.is_some() || stage.parallel_lm_head.is_some(),
+        ),
+    ]);
+    let (store, materialization) = if dense_stream.is_some() {
+        match quantize_on_load {
+            Some(quantization) => {
+                let (store, report) = quantize_pipeline_stage_store(
+                    store,
+                    &binding_adapter,
+                    &target_binding_adapter,
+                    PipelineStageQuantizationSelection::new(&static_roles, 0, stage.range.clone()),
+                    quantization,
+                    stream,
+                    weights_stream,
+                )?;
+                (store, Some(report))
+            }
+            None => (store, None),
+        }
+    } else {
+        (store, None)
+    };
+    let expert_quantization = quantize_on_load;
+    let quantize_on_load = materialization
+        .is_none()
+        .then_some(quantize_on_load)
+        .flatten();
+    let binding_adapter = if materialization.is_some() {
+        &target_binding_adapter
+    } else {
+        &binding_adapter
+    };
+    info.materialization = materialization;
+    let static_units = pipeline_binding_units(binding_adapter, store.as_ref(), &static_roles)?;
     let mut loaded = PipelineLoadAccumulator::new("DeepSeek");
     if let Some(module) = &mut stage.parallel_embedding {
         let bindings = shard_layer_bindings(
@@ -18033,6 +18348,7 @@ fn load_deepseek_pipeline(
             stage.range.clone(),
             dense_stream,
             static_device_bytes,
+            info.materialization.clone(),
             stream,
             weights_stream,
             |global_layer, stream| {
@@ -18089,7 +18405,7 @@ fn load_deepseek_pipeline(
                 Arc::clone(&store),
                 entries,
                 Some(options),
-                quantize_on_load,
+                expert_quantization,
                 weights_stream,
                 stream,
             )?;
@@ -18951,6 +19267,7 @@ mod tests {
             global_layer..global_layer + 1,
             residency,
             0,
+            None,
             stream,
             weights_stream,
             |layer, stream| {
@@ -21354,6 +21671,81 @@ mod tests {
     }
 
     #[test]
+    fn dense_qwen_nonresident_pipeline_requantization_is_packed_before_residency() {
+        let gpu = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
+        let cpu = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        let stream = gpu.stream();
+        let tokens = [Array::from_slice(&[1u32, 2], &[1, 2])];
+        let config = dense_qwen_config("qwen2", false);
+        let args = dense_qwen::config_from_hf_value(&config).unwrap();
+        let mut source = dense_qwen::Model::new(args, stream).unwrap();
+        initialize_parameters(&mut source, stream);
+        let dir = tempfile::tempdir().unwrap();
+        write_parameter_fixture(dir.path(), &config, &source);
+        let affine: WeightQuantization =
+            crate::runtime::checkpoint::quantization::AffineQuantization::new(32, 4)
+                .unwrap()
+                .into();
+
+        let mut dense_first = load_pipeline_model_with_options(
+            dir.path(),
+            ModelLoadOptions::with_parallel(gpu_topology(0)),
+            stream,
+            cpu.stream(),
+        )
+        .unwrap();
+        let mut dense_last = load_pipeline_model_with_options(
+            dir.path(),
+            ModelLoadOptions::with_parallel(gpu_topology(1)),
+            stream,
+            cpu.stream(),
+        )
+        .unwrap();
+        let expected = run_pipeline_sequence(&mut dense_first, &mut dense_last, &tokens, stream);
+
+        for residency in [
+            WeightResidency::layerwise_host(LayerwiseLoadOptions::new(
+                OffloadConfig::new(None, None, 1).unwrap(),
+            )),
+            WeightResidency::dense_disk_stream(dense_stream_options()),
+        ] {
+            let load = |rank| {
+                load_pipeline_model_with_options(
+                    dir.path(),
+                    ModelLoadOptions::with_quantization(affine)
+                        .with_parallel_topology(gpu_topology(rank))
+                        .with_weight_residency(residency),
+                    stream,
+                    cpu.stream(),
+                )
+                .unwrap()
+            };
+            let mut first = load(0);
+            let mut last = load(1);
+            for model in [&first, &last] {
+                let report = model.stage_info().materialization.as_ref().unwrap();
+                assert!(report.transformed_weights > 0);
+                assert!(report.source_tiles > 0);
+                assert!(report.output_bytes < report.source_bytes_read);
+                assert!(
+                    report.peak_planned_working_set_bytes <= report.output_bytes,
+                    "tiny fixture should fit one conversion row inside its final packed stage footprint"
+                );
+                let residency = model.parameter_residency_report().unwrap().unwrap();
+                assert!(residency.initialized());
+                assert!(residency.units().iter().all(|unit| {
+                    unit.expected_bytes() < report.source_bytes_read && unit.expected_bytes() > 0
+                }));
+            }
+            let actual = run_pipeline_sequence(&mut first, &mut last, &tokens, stream);
+            assert!(actual[0]
+                .all_close(&expected[0], Some(2e-3), Some(2e-3), None, stream)
+                .unwrap()
+                .item::<bool>(stream));
+        }
+    }
+
+    #[test]
     fn qwen3_moe_pipeline_requantization_uses_shared_expert_bindings() {
         let gpu = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
         let cpu = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
@@ -21447,6 +21839,31 @@ mod tests {
             assert!(materialization.source_tiles > 0);
             assert!(materialization.source_bytes_read > materialization.output_bytes);
             assert!(materialization.peak_planned_working_set_bytes <= materialization.output_bytes);
+
+            let streamed = load_pipeline_model_with_options(
+                dir.path(),
+                ModelLoadOptions::with_quantization(affine)
+                    .with_parallel_topology(topology)
+                    .with_weight_residency(WeightResidency::with_expert_cache(
+                        crate::NonExpertWeightResidency::DenseDiskStream(dense_stream_options()),
+                        crate::runtime::residency::expert_cache::ExpertCacheLoadOptions::default(),
+                    )),
+                stream,
+                cpu.stream(),
+            )
+            .unwrap();
+            let ordinary = streamed.stage_info().materialization.as_ref().unwrap();
+            assert!(ordinary.transformed_weights > 0);
+            assert!(ordinary.output_bytes < ordinary.source_bytes_read);
+            assert!(streamed
+                .parameter_residency_report()
+                .unwrap()
+                .unwrap()
+                .materialization()
+                .is_some());
+            let experts = streamed.expert_cache_report().unwrap().unwrap();
+            assert_eq!(experts.owned_experts, 2);
+            assert!(experts.materialization.is_some());
         }
     }
 
@@ -22267,18 +22684,41 @@ mod tests {
                     1,
                 )
                 .unwrap();
-            let error = load_pipeline_model_with_options(
-                dir.path(),
-                ModelLoadOptions::with_quantization(quantization)
-                    .with_parallel_topology(gpu_topology(0))
-                    .with_weight_residency(WeightResidency::dense_disk_stream(dense_stream)),
-                stream,
-                cpu.stream(),
-            )
-            .expect_err("dense streaming must reject on-load Gemma quantization");
-            assert!(error
-                .to_string()
-                .contains("non-resident Gemma pipeline layers"));
+            for path in [dir.path(), gguf.path()] {
+                let load_streamed = |rank| {
+                    load_pipeline_model_with_options(
+                        path,
+                        ModelLoadOptions::with_quantization(quantization)
+                            .with_parallel_topology(gpu_topology(rank))
+                            .with_weight_residency(WeightResidency::dense_disk_stream(
+                                dense_stream,
+                            )),
+                        stream,
+                        cpu.stream(),
+                    )
+                    .unwrap()
+                };
+                let mut streamed_first = load_streamed(0);
+                let mut streamed_last = load_streamed(1);
+                for model in [&streamed_first, &streamed_last] {
+                    let materialization = model.stage_info().materialization.as_ref().unwrap();
+                    assert!(materialization.transformed_weights > 0);
+                    assert!(materialization.output_bytes < materialization.source_bytes_read);
+                    assert!(model
+                        .parameter_residency_report()
+                        .unwrap()
+                        .unwrap()
+                        .materialization()
+                        .is_some());
+                }
+                let actual = run(&mut streamed_first, &mut streamed_last);
+                for (actual, expected) in actual.iter().zip(&expected) {
+                    assert!(actual
+                        .all_close(expected, Some(2e-3), Some(2e-3), None, stream)
+                        .unwrap()
+                        .item::<bool>(stream));
+                }
+            }
         }
     }
 
