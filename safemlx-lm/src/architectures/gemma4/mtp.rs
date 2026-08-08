@@ -52,6 +52,34 @@ pub(crate) trait Gemma4MtpTarget {
     ) -> Result<Gemma4Embedding, Exception>;
 }
 
+impl<T: Gemma4MtpTarget + ?Sized> Gemma4MtpTarget for Box<T> {
+    fn prefill_mtp_target(
+        &mut self,
+        input: RuntimeInput<'_>,
+        cache: &mut Cache,
+        stream: &Stream,
+    ) -> Result<Gemma4StepOutput, Exception> {
+        (**self).prefill_mtp_target(input, cache, stream)
+    }
+
+    fn verify_mtp_target(
+        &mut self,
+        tokens: &Array,
+        cache: &mut Cache,
+        stream: &Stream,
+    ) -> Result<Gemma4StepOutput, Exception> {
+        (**self).verify_mtp_target(tokens, cache, stream)
+    }
+
+    fn mtp_embedding_snapshot(
+        &self,
+        stream: &Stream,
+        copy: bool,
+    ) -> Result<Gemma4Embedding, Exception> {
+        (**self).mtp_embedding_snapshot(stream, copy)
+    }
+}
+
 impl Gemma4MtpTarget for Gemma4Model {
     fn prefill_mtp_target(
         &mut self,

@@ -2189,7 +2189,7 @@ pub struct GemmaExperts {
 }
 
 impl GemmaExperts {
-    fn new(
+    pub(crate) fn new(
         args: &ModelArgs,
         layer_idx: usize,
         num_experts: i32,
@@ -2253,7 +2253,7 @@ impl GemmaExperts {
         weighted_route_sum(output, top_k_weights, &plan, num_tokens, stream)
     }
 
-    fn forward(
+    pub(crate) fn forward(
         &self,
         hidden_states: &Array,
         top_k_index: &Array,
@@ -2876,6 +2876,152 @@ impl TransformerBlock {
             } else {
                 dense
             };
+        let mlp = self.post_feedforward_layernorm.forward(&mlp, stream)?;
+        output = output.add(mlp, stream)?;
+
+        if let (Some(per_layer_input), Some(gate), Some(projection), Some(norm)) = (
+            per_layer_input,
+            self.per_layer_input_gate.as_mut(),
+            self.per_layer_projection.as_mut(),
+            self.post_per_layer_input_norm.as_mut(),
+        ) {
+            let residual = output.clone();
+            let projected = nn::gelu_approximate(gate.forward(&output, stream)?, stream)?
+                .multiply(per_layer_input, stream)?;
+            let projected = norm.forward(&projection.forward(&projected, stream)?, stream)?;
+            output = residual.add(projected, stream)?;
+        }
+        self.apply_layer_scalar(output, stream)
+    }
+
+    /// Runs one block while delegating its routed expert bank to a caller.
+    pub(crate) fn forward_with_expert_executor<C, F>(
+        &mut self,
+        input: AttentionInput<'_, C>,
+        stream: &Stream,
+        execute: F,
+    ) -> Result<Array, Exception>
+    where
+        C: KeyValueCache,
+        F: FnOnce(&Array, &Array, &Array, &Stream) -> Result<Array, Exception>,
+    {
+        self.forward_with_cartesian_expert_executor(input, None, stream, execute)
+    }
+
+    /// Runs TP-sharded ordinary projections while delegating routed experts.
+    pub(crate) fn forward_tensor_with_expert_executor<C, F>(
+        &mut self,
+        input: AttentionInput<'_, C>,
+        tensor_group: &safemlx::distributed::Group,
+        stream: &Stream,
+        execute: F,
+    ) -> Result<Array, Exception>
+    where
+        C: KeyValueCache,
+        F: FnOnce(&Array, &Array, &Array, &Stream) -> Result<Array, Exception>,
+    {
+        self.forward_with_cartesian_expert_executor(input, Some(tensor_group), stream, execute)
+    }
+
+    fn forward_with_cartesian_expert_executor<C, F>(
+        &mut self,
+        input: AttentionInput<'_, C>,
+        tensor_group: Option<&safemlx::distributed::Group>,
+        stream: &Stream,
+        execute: F,
+    ) -> Result<Array, Exception>
+    where
+        C: KeyValueCache,
+        F: FnOnce(&Array, &Array, &Array, &Stream) -> Result<Array, Exception>,
+    {
+        let AttentionInput {
+            x,
+            mask,
+            cache,
+            position_offset,
+            per_layer_input,
+            shared_kv,
+            disable_generated_mask,
+            generated_sliding_window: _,
+        } = input;
+        let sliding_window = self.sliding_window();
+        let generated = if disable_generated_mask
+            || !needs_generated_sliding_mask(x.dim(1), position_offset, sliding_window)
+        {
+            None
+        } else {
+            Some(create_causal_mask(
+                x.dim(1),
+                Some(position_offset),
+                sliding_window.map(|window| window - 1),
+                None,
+                stream,
+            )?)
+        };
+        let normalized = self.input_layernorm.forward(x, stream)?;
+        let attention = match tensor_group {
+            Some(group) => self.self_attn.forward_tensor_parallel(
+                &normalized,
+                generated.as_ref().or(mask),
+                cache,
+                position_offset,
+                shared_kv.expect("Gemma 4 TP block requires shared-KV state"),
+                group,
+                stream,
+            )?,
+            None => self.self_attn.forward(
+                AttentionInput {
+                    x: &normalized,
+                    mask: generated.as_ref().or(mask),
+                    cache,
+                    position_offset,
+                    per_layer_input: None,
+                    shared_kv,
+                    disable_generated_mask: true,
+                    generated_sliding_window: generated.as_ref().and(sliding_window),
+                },
+                stream,
+            )?,
+        };
+        let attention = self.post_attention_layernorm.forward(&attention, stream)?;
+        let mut output = x.add(attention, stream)?;
+
+        let normalized = self.pre_feedforward_layernorm.forward(&output, stream)?;
+        let dense = match tensor_group {
+            Some(group) => self
+                .mlp
+                .forward_tensor_parallel(&normalized, group, stream)?,
+            None => self.mlp.forward(&normalized, stream)?,
+        };
+        let mlp = if let Some(router) = self.router.as_mut() {
+            let dense = self
+                .post_feedforward_layernorm_1
+                .as_mut()
+                .expect("MoE dense output norm")
+                .forward(&dense, stream)?;
+            let shape = output.shape().to_vec();
+            let flat = output.reshape(&[-1, self.hidden_size], stream)?;
+            let routed_input = self
+                .pre_feedforward_layernorm_2
+                .as_mut()
+                .expect("MoE routed input norm")
+                .forward(&flat, stream)?;
+            let (indices, weights) = router.forward(&flat, stream)?;
+            let routed = execute(&routed_input, &indices, &weights, stream)?;
+            let routed = match tensor_group {
+                Some(group) => safemlx::distributed::all_sum(&routed, group, stream)?,
+                None => routed,
+            }
+            .reshape(&shape, stream)?;
+            let routed = self
+                .post_feedforward_layernorm_2
+                .as_mut()
+                .expect("MoE routed output norm")
+                .forward(&routed, stream)?;
+            dense.add(routed, stream)?
+        } else {
+            dense
+        };
         let mlp = self.post_feedforward_layernorm.forward(&mlp, stream)?;
         output = output.add(mlp, stream)?;
 
@@ -5989,12 +6135,13 @@ where
 }
 
 /// Gemma 4 generation cache.
-#[derive(Clone, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct Cache {
     pub(crate) kv: Vec<Option<ConcatKeyValueCache>>,
     pub(crate) token_ids: Vec<u32>,
     prefix_embeddings: Option<Array>,
     prefix_len: usize,
+    pub(crate) rank: Option<crate::runtime::cache::residency::CacheRankIdentity>,
 }
 
 impl Cache {
@@ -6017,6 +6164,24 @@ impl Cache {
                     .then(|| ConcatKeyValueCache::new_with_step(Self::KV_GROWTH_STEP))
             })
             .collect();
+    }
+
+    pub(crate) fn clear(&mut self) -> Result<(), Exception> {
+        for cache in self.kv.iter_mut().flatten() {
+            cache.clear();
+        }
+        self.token_ids.clear();
+        self.prefix_embeddings = None;
+        self.prefix_len = 0;
+        Ok(())
+    }
+
+    pub(crate) fn offset(&self) -> i32 {
+        self.kv
+            .iter()
+            .flatten()
+            .next()
+            .map_or(0, KeyValueCache::offset)
     }
 
     /// Returns the committed logical sequence length.
@@ -6061,6 +6226,7 @@ impl Model {
         }
         let end = i64::try_from(prefix_token_ids.len())
             .map_err(|_| Exception::custom("Gemma 4 prompt length exceeds i64"))?;
+        let rank = cache.rank;
         let mut blocks = Vec::with_capacity(cache.kv.len());
         for (layer, cache) in cache.kv.iter().enumerate() {
             let cache = cache.as_ref().ok_or_else(|| {
@@ -6078,7 +6244,7 @@ impl Model {
                 global_layer: layer,
                 start: 0,
                 end,
-                rank: None,
+                rank,
                 arrays: CacheBlockArrays::KeyValue { keys, values },
             });
         }
@@ -6156,6 +6322,7 @@ impl Model {
         let prefix_embeddings =
             state.remove(&(StateTensorOwner::Layer(0), StateTensorRole::PrefixEmbedding));
         let mut cache = Cache::new(args);
+        cache.rank = identity.topology.cache_rank_identity();
         cache.token_ids = prefix_token_ids.to_vec();
         cache.prefix_len = prefix_embeddings
             .as_ref()

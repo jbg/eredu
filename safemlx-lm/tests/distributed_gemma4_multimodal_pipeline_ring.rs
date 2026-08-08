@@ -34,7 +34,8 @@ use safemlx_lm::{
         scheduler::{RequestId, SchedulerLimits},
     },
     CartesianExecution, DenseDiskStreamLoadOptions, DeviceAssignment, LayerwiseLoadOptions,
-    ModelLoadOptions, ParallelTopology, WeightResidency,
+    ModelLoadOptions, PagedCacheOptions, ParallelTopology, PromptCacheDescriptor,
+    PromptCacheOptions, PromptCacheTopology, WeightResidency,
 };
 
 const WORKER: &str = "SAFEMLX_GEMMA4_MM_PIPELINE_WORKER";
@@ -42,6 +43,8 @@ const CHECKPOINT: &str = "SAFEMLX_GEMMA4_MM_PIPELINE_CHECKPOINT";
 const TENSOR_PARALLEL: &str = "SAFEMLX_GEMMA4_MM_PIPELINE_TP";
 const DENSE_STREAM: &str = "SAFEMLX_GEMMA4_MM_PIPELINE_STREAM";
 const LAYERWISE_HOST: &str = "SAFEMLX_GEMMA4_MM_PIPELINE_HOST";
+const AXES: &str = "SAFEMLX_GEMMA4_MM_PIPELINE_AXES";
+const CACHE_ROOT: &str = "SAFEMLX_GEMMA4_MM_PIPELINE_CACHE_ROOT";
 
 fn config() -> serde_json::Value {
     serde_json::json!({
@@ -103,10 +106,28 @@ fn config() -> serde_json::Value {
     })
 }
 
+fn moe_config() -> serde_json::Value {
+    let mut config = config();
+    let text = config["text_config"].as_object_mut().unwrap();
+    text.insert("enable_moe_block".into(), serde_json::json!(true));
+    text.insert("num_experts".into(), serde_json::json!(4));
+    text.insert("top_k_experts".into(), serde_json::json!(2));
+    text.insert("moe_intermediate_size".into(), serde_json::json!(8));
+    config
+}
+
 fn write_fixture(directory: &Path) {
+    write_safetensors_fixture(directory, config());
+}
+
+fn write_moe_fixture(directory: &Path) {
+    write_safetensors_fixture(directory, moe_config());
+}
+
+fn write_safetensors_fixture(directory: &Path, config: serde_json::Value) {
     let execution = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
     let stream = execution.stream();
-    let mut model = Model::new_from_config_value(&config(), stream).unwrap();
+    let mut model = Model::new_from_config_value(&config, stream).unwrap();
     let mut names = model
         .parameters()
         .flatten()
@@ -151,7 +172,7 @@ fn write_fixture(directory: &Path) {
     .unwrap();
     std::fs::write(
         directory.join("config.json"),
-        serde_json::to_vec_pretty(&config()).unwrap(),
+        serde_json::to_vec_pretty(&config).unwrap(),
     )
     .unwrap();
 }
@@ -237,6 +258,12 @@ fn text_gguf_name(name: &str) -> String {
     if parameter == "layer_scalar" {
         return format!("blk.{layer}.layer_output_scale.weight");
     }
+    if parameter == "router.per_expert_scale" {
+        return format!("blk.{layer}.ffn_down_exps.scale");
+    }
+    if parameter == "router.scale" {
+        return format!("blk.{layer}.ffn_gate_inp.scale");
+    }
     for (target, source) in [
         ("self_attn.q_norm", "attn_q_norm"),
         ("self_attn.k_norm", "attn_k_norm"),
@@ -251,6 +278,13 @@ fn text_gguf_name(name: &str) -> String {
         ("mlp.gate_proj", "ffn_gate"),
         ("mlp.down_proj", "ffn_down"),
         ("mlp.up_proj", "ffn_up"),
+        ("router.proj", "ffn_gate_inp"),
+        ("experts.switch_glu.gate_proj", "ffn_gate_exps"),
+        ("experts.switch_glu.up_proj", "ffn_up_exps"),
+        ("experts.switch_glu.down_proj", "ffn_down_exps"),
+        ("pre_feedforward_layernorm_2", "pre_ffw_norm_2"),
+        ("post_feedforward_layernorm_1", "post_ffw_norm_1"),
+        ("post_feedforward_layernorm_2", "post_ffw_norm_2"),
         ("per_layer_input_gate", "inp_gate"),
         ("per_layer_projection", "proj"),
         ("post_per_layer_input_norm", "post_norm"),
@@ -392,9 +426,18 @@ fn projector_metadata() -> HashMap<String, GgufMetadataValue> {
 }
 
 fn write_gguf_fixture(directory: &Path) -> PathBuf {
+    write_gguf_fixture_kind(directory, false)
+}
+
+fn write_moe_gguf_fixture(directory: &Path) -> PathBuf {
+    write_gguf_fixture_kind(directory, true)
+}
+
+fn write_gguf_fixture_kind(directory: &Path, moe: bool) -> PathBuf {
     let execution = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
     let stream = execution.stream();
-    let mut model = Model::new_from_config_value(&config(), stream).unwrap();
+    let source_config = if moe { moe_config() } else { config() };
+    let mut model = Model::new_from_config_value(&source_config, stream).unwrap();
     let mut names = model
         .parameters()
         .flatten()
@@ -430,7 +473,7 @@ fn write_gguf_fixture(directory: &Path) -> PathBuf {
             projector.insert(physical, value.clone());
         }
     }
-    let text_metadata = HashMap::from([
+    let mut text_metadata = HashMap::from([
         (
             "general.architecture".into(),
             GgufMetadataValue::String("gemma4".into()),
@@ -502,7 +545,22 @@ fn write_gguf_fixture(directory: &Path) -> PathBuf {
             GgufMetadataValue::Uint32(22),
         ),
     ]);
-    let model_path = directory.join("gemma4-f32.gguf");
+    if moe {
+        text_metadata.insert("gemma4.expert_count".into(), GgufMetadataValue::Uint32(4));
+        text_metadata.insert(
+            "gemma4.expert_used_count".into(),
+            GgufMetadataValue::Uint32(2),
+        );
+        text_metadata.insert(
+            "gemma4.expert_feed_forward_length".into(),
+            GgufMetadataValue::Uint32(8),
+        );
+    }
+    let model_path = directory.join(if moe {
+        "gemma4-moe-f32.gguf"
+    } else {
+        "gemma4-f32.gguf"
+    });
     write_dense_gguf(&model_path, &text, text_metadata);
     write_dense_gguf(
         &directory.join("mmproj-gemma4-f32.gguf"),
@@ -607,14 +665,15 @@ fn gemma4_multimodal_pipeline_ring_worker() {
     };
     let rank = rank.to_string_lossy().parse::<usize>().unwrap();
     let checkpoint = PathBuf::from(std::env::var_os(CHECKPOINT).unwrap());
-    let tp = if std::env::var_os(TENSOR_PARALLEL).is_some() {
-        2
-    } else {
-        1
-    };
+    let cache_root = PathBuf::from(std::env::var_os(CACHE_ROOT).unwrap());
+    let axes = std::env::var(AXES).ok();
+    let tp = usize::from(
+        std::env::var_os(TENSOR_PARALLEL).is_some() || axes.as_deref() == Some("tp-pp-ep"),
+    ) + 1;
+    let ep = if axes.is_some() { 2 } else { 1 };
     let group = distributed::init(true, Backend::Ring).unwrap();
     let topology =
-        ParallelTopology::from_group(&group, tp, 2, 1, DeviceAssignment::new(DeviceType::Cpu, 0))
+        ParallelTopology::from_group(&group, tp, 2, ep, DeviceAssignment::new(DeviceType::Cpu, 0))
             .unwrap();
     assert_eq!(topology.global_rank, rank);
     let stream = Stream::new_with_device(&topology.device.device().unwrap());
@@ -636,12 +695,17 @@ fn gemma4_multimodal_pipeline_ring_worker() {
         &stream,
     )
     .unwrap();
-    let cartesian =
-        (tp > 1).then(|| CartesianExecution::new(topology, Some(2), None, &group).unwrap());
+    let cartesian = (tp > 1 || ep > 1).then(|| {
+        CartesianExecution::new(topology, Some(2), (ep > 1).then_some(4), &group).unwrap()
+    });
     assert_eq!(
         model.stage_info().global_layer_range,
         topology.pipeline_parallel_rank..topology.pipeline_parallel_rank + 1
     );
+    if ep > 1 {
+        assert_eq!(model.stage_info().global_expert_count, Some(4));
+        assert_eq!(model.stage_info().local_expert_ids.len(), 2);
+    }
     if std::env::var_os(DENSE_STREAM).is_some() {
         let report = model.dense_stream_report().unwrap().unwrap();
         assert_eq!(
@@ -675,9 +739,18 @@ fn gemma4_multimodal_pipeline_ring_worker() {
     let prepared = PreparedModelInput::from_model_input(input).unwrap();
     let identity = prepared.identity();
     let request = RequestId::new(44);
+    let paged = PagedCacheOptions::new(1, 1 << 20, 1 << 20, 1)
+        .unwrap()
+        .with_full_attention(true);
     let mut scheduler =
         PipelineInferenceScheduler::new(&model, SchedulerLimits::new(1, 1).unwrap()).unwrap();
-    scheduler.register_request(&model, request).unwrap();
+    scheduler
+        .register_request_with_options(
+            &model,
+            request,
+            safemlx_lm::CacheResidencyPolicy::Paged(paged.clone()),
+        )
+        .unwrap();
     // Two text tokens, one pooled image token, and two audio tokens.
     let step = PipelineStep::new(1, 5).unwrap();
     let work = PipelineMicrobatchInput::new(request, PipelineInferencePhase::Prefill, step);
@@ -713,6 +786,36 @@ fn gemma4_multimodal_pipeline_ring_worker() {
         assert_close(logits, &expected, &stream);
     }
 
+    let descriptor = PromptCacheDescriptor {
+        model_family: "gemma4".into(),
+        effective_model_type: "gemma4".into(),
+        checkpoint_fingerprint: "gemma4-moe-pipeline-ring".into(),
+        prefix_content_fingerprint: "typed:text+image+audio".into(),
+        architecture_fingerprint: model.prompt_cache_architecture_fingerprint().unwrap(),
+        layer_count: 2,
+        global_layer_start: topology.pipeline_parallel_rank,
+        global_layer_end: topology.pipeline_parallel_rank + 1,
+        batch_size: 1,
+        layer_layout: model.prompt_cache_layer_layout().unwrap(),
+        sink_tokens: 0,
+        topology: PromptCacheTopology {
+            pipeline: Some((2, topology.pipeline_parallel_rank)),
+            tensor_parallel: (tp > 1).then_some((tp, topology.tensor_parallel_rank)),
+            expert_parallel: (ep > 1).then_some((ep, topology.expert_parallel_rank)),
+            expert_parallel_cache_replicated: true,
+        },
+    };
+    let prefix_ids = [1u32, 2, 20, 22, 22];
+    model
+        .save_prompt_cache(
+            &mut cache,
+            &cache_root,
+            descriptor.clone(),
+            &prefix_ids,
+            &PromptCacheOptions::default(),
+        )
+        .unwrap();
+
     let token = Array::from_slice(&[3u32], &[1, 1]);
     let decoded = match &cartesian {
         Some(cartesian) => model
@@ -736,6 +839,36 @@ fn gemma4_multimodal_pipeline_ring_worker() {
             )
             .unwrap(),
     };
+    let (mut restored_cache, _) = model
+        .load_prompt_cache(&cache_root, &descriptor, &prefix_ids, paged, &stream)
+        .unwrap();
+    let restored = match &cartesian {
+        Some(cartesian) => model
+            .forward_cartesian(
+                model.stage_info().is_first.then_some(&token),
+                PipelineStep::new(1, 1).unwrap(),
+                None,
+                &mut restored_cache,
+                cartesian,
+                &stream,
+            )
+            .unwrap(),
+        None => model
+            .forward_pipeline(
+                model.stage_info().is_first.then_some(&token),
+                PipelineStep::new(1, 1).unwrap(),
+                None,
+                &mut restored_cache,
+                &group,
+                &stream,
+            )
+            .unwrap(),
+    };
+    match (&decoded, &restored) {
+        (Some(decoded), Some(restored)) => assert_close(decoded, restored, &stream),
+        (None, None) => {}
+        _ => panic!("prompt-cache reload changed Gemma 4 pipeline output ownership"),
+    }
     if let (Some(decoded), Some(resident)) = (&decoded, &mut resident) {
         let expected = resident
             .decode_logits(&token, &mut resident_cache, &stream)
@@ -765,15 +898,30 @@ fn failure(rank: usize, output: &Output) -> String {
 }
 
 fn run_ring(tp: bool, dense: bool, host: bool, gguf: bool) {
+    run_ring_axes(tp, dense, host, gguf, None);
+}
+
+fn run_ring_axes(tp: bool, dense: bool, host: bool, gguf: bool, axes: Option<&str>) {
     assert!(distributed::is_available(Backend::Ring));
     let checkpoint = tempfile::tempdir().unwrap();
-    let checkpoint_path = if gguf {
+    let checkpoint_path = if gguf && axes.is_some() {
+        write_moe_gguf_fixture(checkpoint.path())
+    } else if gguf {
         write_gguf_fixture(checkpoint.path())
+    } else if axes.is_some() {
+        write_moe_fixture(checkpoint.path());
+        checkpoint.path().to_path_buf()
     } else {
         write_fixture(checkpoint.path());
         checkpoint.path().to_path_buf()
     };
-    let world = if tp { 4 } else { 2 };
+    let world = if axes == Some("tp-pp-ep") {
+        8
+    } else if axes.is_some() || tp {
+        4
+    } else {
+        2
+    };
     let sockets = (0..world)
         .map(|_| TcpListener::bind(("127.0.0.1", 0)).unwrap())
         .collect::<Vec<_>>();
@@ -782,6 +930,7 @@ fn run_ring(tp: bool, dense: bool, host: bool, gguf: bool) {
         .map(|socket| vec![format!("127.0.0.1:{}", socket.local_addr().unwrap().port())])
         .collect::<Vec<_>>();
     let ring = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
     let hostfile = ring.path().join("hosts.json");
     std::fs::write(&hostfile, serde_json::to_vec(&hosts).unwrap()).unwrap();
     drop(sockets);
@@ -797,6 +946,7 @@ fn run_ring(tp: bool, dense: bool, host: bool, gguf: bool) {
             ])
             .env(WORKER, rank.to_string())
             .env(CHECKPOINT, &checkpoint_path)
+            .env(CACHE_ROOT, cache.path())
             .env("MLX_RANK", rank.to_string())
             .env("MLX_HOSTFILE", &hostfile)
             .env_remove("MLX_RING_VERBOSE")
@@ -811,9 +961,12 @@ fn run_ring(tp: bool, dense: bool, host: bool, gguf: bool) {
         if host {
             command.env(LAYERWISE_HOST, "1");
         }
+        if let Some(axes) = axes {
+            command.env(AXES, axes);
+        }
         children.0.push(command.spawn().unwrap());
     }
-    let deadline = Instant::now() + Duration::from_secs(if tp { 90 } else { 60 });
+    let deadline = Instant::now() + Duration::from_secs(if world > 4 { 180 } else { 120 });
     let mut timed_out = false;
     loop {
         let statuses = children
@@ -892,4 +1045,34 @@ fn ring_gemma4_multimodal_gguf_dense_stream_pipeline() {
 #[ignore = "spawns local Ring processes"]
 fn ring_gemma4_multimodal_gguf_host_tensor_pipeline() {
     run_ring(true, false, true, true);
+}
+
+#[test]
+#[ignore = "spawns local Ring processes"]
+fn ring_gemma4_moe_pipeline_expert_multimodal() {
+    run_ring_axes(false, false, false, false, Some("pp-ep"));
+}
+
+#[test]
+#[ignore = "spawns local Ring processes"]
+fn ring_gemma4_moe_triple_axis_multimodal() {
+    run_ring_axes(false, false, false, false, Some("tp-pp-ep"));
+}
+
+#[test]
+#[ignore = "spawns local Ring processes"]
+fn ring_gemma4_moe_streamed_pipeline_expert_multimodal() {
+    run_ring_axes(false, true, false, false, Some("pp-ep"));
+}
+
+#[test]
+#[ignore = "spawns local Ring processes"]
+fn ring_gemma4_moe_host_triple_axis_multimodal() {
+    run_ring_axes(false, false, true, false, Some("tp-pp-ep"));
+}
+
+#[test]
+#[ignore = "spawns local Ring processes"]
+fn ring_gemma4_moe_gguf_triple_axis_multimodal() {
+    run_ring_axes(false, true, false, true, Some("tp-pp-ep"));
 }

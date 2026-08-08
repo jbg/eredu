@@ -1867,7 +1867,7 @@ pub(super) fn load_gguf_model_data(
                         stream,
                         weights_stream,
                     )?;
-                (Model::Gemma4(model), loaded.eos_token_ids)
+                (Model::Gemma4(Box::new(model)), loaded.eos_token_ids)
             }
             GgufArchitecture::Llama | GgufArchitecture::Mistral => {
                 let loaded = llama::load_llama_gguf_checkpoint(
@@ -2040,7 +2040,7 @@ pub(super) fn load_gguf_model_data(
                         stream,
                         weights_stream,
                     )?;
-                (Model::Gemma4(loaded), eos_token_ids)
+                (Model::Gemma4(Box::new(loaded)), eos_token_ids)
             }
             GgufArchitecture::Llama | GgufArchitecture::Mistral => {
                 let (loaded, eos_token_ids) =

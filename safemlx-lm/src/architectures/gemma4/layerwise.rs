@@ -1,10 +1,16 @@
 //! Text-decoder bounded layer execution for Gemma 4 checkpoints.
 
-use std::{collections::BTreeMap, collections::HashMap, ops::Range, path::Path, sync::Arc};
+use std::{
+    collections::{BTreeMap, BTreeSet, HashMap},
+    ops::Range,
+    path::Path,
+    sync::Arc,
+    time::Instant,
+};
 
 use safemlx::{
     error::Exception,
-    module::{Module, ModuleParameters, ModuleParametersExt},
+    module::{Module, ModuleParameters, ModuleParametersExt, Param},
     nn,
     ops::{
         concatenate_axis, indexing::TryIndexOp, r#where, tanh, GgufCheckpoint, GgufMetadataValue,
@@ -45,6 +51,7 @@ use crate::{
     },
     runtime::checkpoint::binding::{
         build_module_bindings_with_recipes, canonical_checkpoint_name, populate_module_from_lease,
+        populate_module_from_lease_excluding,
     },
     runtime::checkpoint::recipe::DerivedWeightRecipe,
     runtime::checkpoint::store::{GgufWeightStore, TensorSelection, WeightStore},
@@ -60,7 +67,10 @@ use crate::{
         transformed_module_weight_store, ArchitectureAdapter, LayerWeightResidency,
         LayerwiseForwardState, LayerwiseModel, StaticUnitBindings, WeightResidency,
     },
-    runtime::residency::manager::{ResidencyReport, ResidentUnitLease, WeightBinding},
+    runtime::residency::expert_cache::{
+        AcquiredExperts, ExpertCache, ExpertCacheError, ExpertCatalogEntry, ExpertIdentity,
+    },
+    runtime::residency::manager::{OffloadUnit, ResidencyReport, ResidentUnitLease, WeightBinding},
 };
 
 const EMBEDDING_UNIT: &str = "gemma4.static.embedding";
@@ -524,6 +534,10 @@ impl Gemma4LayerwiseModel {
         self.execution.adapter().args()
     }
 
+    pub(crate) fn bind_parallel_topology(&mut self, topology: crate::ParallelTopology) {
+        self.execution.bind_parallel_topology(topology);
+    }
+
     pub(crate) fn media_accounting(
         &self,
     ) -> (
@@ -545,7 +559,9 @@ impl Gemma4LayerwiseModel {
 
     /// Creates an empty Gemma 4 generation cache.
     pub fn new_cache(&self) -> Cache {
-        Cache::new(self.args())
+        let mut cache = Cache::new(self.args());
+        cache.rank = self.execution.prompt_cache_rank_identity();
+        cache
     }
 
     /// Returns rank-local generalized parallel information when applicable.
@@ -558,6 +574,10 @@ impl Gemma4LayerwiseModel {
         &self,
     ) -> Result<crate::LayerSchedule<crate::LayerCachePolicy>, Error> {
         self.execution.prompt_cache_layer_layout()
+    }
+
+    pub(crate) fn prompt_cache_model_identity(&self) -> Result<PromptCacheModelIdentity, Error> {
+        self.execution.prompt_cache_model_identity()
     }
 
     /// Persists a compatible prefix cache.
@@ -666,6 +686,138 @@ impl Gemma4LayerwiseModel {
     ) -> Result<Array, Error> {
         self.execution
             .forward_tensor_parallel(Gemma4Input::Decode(tokens), cache, group, stream)
+    }
+
+    /// Runs text decode while delegating routed experts to a topology-scoped executor.
+    pub(crate) fn decode_with_expert_executor<F>(
+        &mut self,
+        tokens: &Array,
+        cache: &mut Cache,
+        mut execute: F,
+        stream: &Stream,
+    ) -> Result<Array, Error>
+    where
+        F: FnMut(usize, &Array, &Array, &Array, &Stream) -> Result<Array, Exception>,
+    {
+        self.forward_with_expert_executor_input(
+            Gemma4Input::Decode(tokens),
+            cache,
+            &mut execute,
+            stream,
+        )
+    }
+
+    fn forward_with_expert_executor_input<F>(
+        &mut self,
+        input: Gemma4Input<'_>,
+        cache: &mut Cache,
+        execute: &mut F,
+        stream: &Stream,
+    ) -> Result<Array, Error>
+    where
+        F: FnMut(usize, &Array, &Array, &Array, &Stream) -> Result<Array, Exception>,
+    {
+        self.execution.forward_with_layer_executor(
+            input,
+            cache,
+            stream,
+            |adapter, group, index, layer, hidden, cache, context, stream| {
+                if adapter.execution_group_name(group)? != "text_decoder" {
+                    return adapter
+                        .forward_layer(group, index, layer, hidden, cache, context, stream);
+                }
+                let Gemma4Layer::Text(layer) = layer else {
+                    return Err(Error::Parallel(format!(
+                        "Gemma 4 external-expert unit does not match text layer {index}"
+                    )));
+                };
+                let per_layer_input = context
+                    .per_layer_inputs
+                    .as_ref()
+                    .map(|inputs| inputs.try_index_device((.., .., index as i32, ..), stream))
+                    .transpose()?;
+                let mask = context
+                    .sliding_masks
+                    .as_ref()
+                    .and_then(|masks| masks.get(&layer.layer_policy.attention))
+                    .or(context.mask.as_ref());
+                Ok(layer.forward_with_expert_executor(
+                    AttentionInput {
+                        x: hidden,
+                        mask,
+                        cache: cache.kv[index].as_mut(),
+                        position_offset: context.position_offset,
+                        per_layer_input: per_layer_input.as_ref(),
+                        shared_kv: Some(&mut context.shared_kv),
+                        disable_generated_mask: false,
+                        generated_sliding_window: None,
+                    },
+                    stream,
+                    |hidden, ids, weights, stream| execute(index, hidden, ids, weights, stream),
+                )?)
+            },
+        )
+    }
+
+    /// Runs TP-sharded decode while delegating routed experts to EP.
+    pub(crate) fn decode_tensor_expert_parallel<F>(
+        &mut self,
+        tokens: &Array,
+        cache: &mut Cache,
+        tensor_group: &safemlx::distributed::Group,
+        mut execute: F,
+        stream: &Stream,
+    ) -> Result<Array, Error>
+    where
+        F: FnMut(usize, &Array, &Array, &Array, &Stream) -> Result<Array, Exception>,
+    {
+        self.execution.forward_tensor_parallel_with_layer_executor(
+            Gemma4Input::Decode(tokens),
+            cache,
+            tensor_group,
+            stream,
+            |adapter, group, index, layer, hidden, cache, context, execution| {
+                if adapter.execution_group_name(group)? != "text_decoder" {
+                    return adapter.forward_layer_with_execution(
+                        group, index, layer, hidden, cache, context, execution,
+                    );
+                }
+                let Gemma4Layer::Text(layer) = layer else {
+                    return Err(Error::Parallel(format!(
+                        "Gemma 4 TP+EP unit does not match text layer {index}"
+                    )));
+                };
+                let stream = execution.stream();
+                let per_layer_input = context
+                    .per_layer_inputs
+                    .as_ref()
+                    .map(|inputs| inputs.try_index_device((.., .., index as i32, ..), stream))
+                    .transpose()?;
+                let mask = context
+                    .sliding_masks
+                    .as_ref()
+                    .and_then(|masks| masks.get(&layer.layer_policy.attention))
+                    .or(context.mask.as_ref());
+                let group = execution.group().ok_or_else(|| {
+                    Error::Parallel("Gemma 4 TP+EP execution has no TP subgroup".into())
+                })?;
+                Ok(layer.forward_tensor_with_expert_executor(
+                    AttentionInput {
+                        x: hidden,
+                        mask,
+                        cache: cache.kv[index].as_mut(),
+                        position_offset: context.position_offset,
+                        per_layer_input: per_layer_input.as_ref(),
+                        shared_kv: Some(&mut context.shared_kv),
+                        disable_generated_mask: false,
+                        generated_sliding_window: None,
+                    },
+                    group,
+                    stream,
+                    |hidden, ids, weights, stream| execute(index, hidden, ids, weights, stream),
+                )?)
+            },
+        )
     }
 
     pub(crate) fn prefill_mtp(
@@ -970,6 +1122,224 @@ pub(crate) fn gemma4_gguf_store(
     Ok(Arc::new(builder.build()?))
 }
 
+/// Builds the non-expert Gemma execution base used by EP and TP+EP.
+pub(crate) fn load_gemma4_sparse_ep_base_with_store(
+    store: Arc<dyn WeightStore + Send + Sync>,
+    args: ModelArgs,
+    non_expert: impl Into<LayerWeightResidency>,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<Gemma4LayerwiseModel, Error> {
+    let adapter = Gemma4LayerwiseAdapter::new_external_experts(args, stream)?;
+    Ok(Gemma4LayerwiseModel {
+        execution: load_layerwise_model(store, adapter, non_expert.into(), stream, weights_stream)?,
+    })
+}
+
+/// Builds TP-sharded non-expert Gemma execution with external routed experts.
+pub(crate) fn load_gemma4_sparse_tp_ep_base_with_store(
+    store: Arc<dyn WeightStore + Send + Sync>,
+    args: ModelArgs,
+    non_expert: impl Into<LayerWeightResidency>,
+    build: crate::runtime::distributed::parallel::ParallelBuildContext,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<Gemma4LayerwiseModel, Error> {
+    let adapter = Gemma4LayerwiseAdapter::new_external_experts(args, stream)?;
+    Ok(Gemma4LayerwiseModel {
+        execution: load_tensor_parallel_layerwise_model(
+            store,
+            adapter,
+            non_expert.into(),
+            build,
+            stream,
+            weights_stream,
+        )?,
+    })
+}
+
+/// Returns one independently leasable unit for every Gemma routed expert.
+pub(crate) fn gemma4_expert_catalog(
+    args: &ModelArgs,
+    store: &dyn WeightStore,
+) -> Result<Vec<ExpertCatalogEntry>, Error> {
+    gemma4_expert_catalog_for_layers(args, store, 0..args.num_hidden_layers as usize, None)
+}
+
+/// Builds stage-local Gemma expert recipes under an optional TP layout.
+pub(crate) fn gemma4_expert_catalog_for_layers(
+    args: &ModelArgs,
+    store: &dyn WeightStore,
+    layers: impl IntoIterator<Item = usize>,
+    layout: Option<&crate::runtime::distributed::parallel::LocalModelLayout>,
+) -> Result<Vec<ExpertCatalogEntry>, Error> {
+    let global_experts = usize::try_from(args.num_experts.ok_or_else(|| {
+        Error::UnsupportedArchitecture("Gemma 4 MoE config has no expert count".into())
+    })?)
+    .map_err(|_| Error::UnsupportedArchitecture("Gemma 4 expert count is negative".into()))?;
+    let intermediate = usize::try_from(args.moe_intermediate_size.ok_or_else(|| {
+        Error::UnsupportedArchitecture("Gemma 4 MoE config has no expert width".into())
+    })?)
+    .map_err(|_| Error::UnsupportedArchitecture("Gemma 4 expert width is negative".into()))?;
+    let keys = store.keys().into_iter().collect::<BTreeSet<_>>();
+    let mut entries = Vec::new();
+    for layer in layers {
+        if args.layer_policy(layer).is_none_or(|policy| {
+            policy.feed_forward != resident::FeedForwardPolicy::DenseWithSparseMoe
+        }) {
+            continue;
+        }
+        let logical_prefix = format!("model.language_model.layers.{layer}.experts.switch_glu");
+        let alternate_prefix = format!("language_model.model.layers.{layer}.experts.switch_glu");
+        let source_prefix = if keys.iter().any(|key| key.starts_with(&logical_prefix)) {
+            logical_prefix.as_str()
+        } else if keys.iter().any(|key| key.starts_with(&alternate_prefix)) {
+            alternate_prefix.as_str()
+        } else {
+            logical_prefix.as_str()
+        };
+        let fused = format!("{source_prefix}.gate_up_proj");
+        for expert in 0..global_experts {
+            let selection = TensorSelection::Range {
+                axis: 0,
+                start: expert,
+                end: expert + 1,
+            };
+            let mut bindings = Vec::new();
+            for (projection, half) in [("gate_proj", Some(0usize)), ("up_proj", Some(1usize))] {
+                for suffix in ["weight", "scales", "biases"] {
+                    let separate = format!("{source_prefix}.{projection}.{suffix}");
+                    let recipe = if keys.contains(&separate) {
+                        Some(DerivedWeightRecipe::source(separate, selection.clone()))
+                    } else {
+                        let source = format!("{fused}.{suffix}");
+                        keys.contains(&source).then(|| DerivedWeightRecipe::Select {
+                            input: Box::new(DerivedWeightRecipe::source(source, selection.clone())),
+                            selection: TensorSelection::Range {
+                                axis: 1,
+                                start: half.expect("gate/up half") * intermediate,
+                                end: (half.expect("gate/up half") + 1) * intermediate,
+                            },
+                        })
+                    };
+                    if let Some(recipe) = recipe {
+                        bindings.push(gemma_expert_recipe_binding(
+                            &format!("{projection}.{suffix}"),
+                            recipe,
+                            store,
+                        )?);
+                    } else if suffix == "weight" {
+                        return Err(Error::UnsupportedArchitecture(format!(
+                            "Gemma 4 checkpoint is missing {projection} for expert {expert} in layer {layer}"
+                        )));
+                    }
+                }
+            }
+            for suffix in ["weight", "scales", "biases"] {
+                let source = format!("{source_prefix}.down_proj.{suffix}");
+                if keys.contains(&source) {
+                    bindings.push(gemma_expert_recipe_binding(
+                        &format!("down_proj.{suffix}"),
+                        DerivedWeightRecipe::source(source, selection.clone()),
+                        store,
+                    )?);
+                } else if suffix == "weight" {
+                    return Err(Error::UnsupportedArchitecture(format!(
+                        "Gemma 4 checkpoint is missing down_proj for expert {expert} in layer {layer}"
+                    )));
+                }
+            }
+            let bindings = match layout {
+                Some(layout) => crate::runtime::execution::layerwise::shard_layer_bindings(
+                    bindings,
+                    &logical_prefix,
+                    store,
+                    layout,
+                )?,
+                None => bindings,
+            };
+            let bytes = bindings.iter().try_fold(0u64, |total, binding| {
+                total.checked_add(binding.expected_bytes()).ok_or_else(|| {
+                    Error::UnsupportedArchitecture("Gemma 4 expert byte total overflowed".into())
+                })
+            })?;
+            let identity = ExpertIdentity::new(layer, expert);
+            entries.push(ExpertCatalogEntry::new(
+                identity,
+                OffloadUnit::new(identity.unit_id(), bindings)?,
+                bytes,
+            )?);
+        }
+    }
+    Ok(entries)
+}
+
+fn gemma_expert_recipe_binding(
+    name: &str,
+    recipe: DerivedWeightRecipe,
+    store: &dyn WeightStore,
+) -> Result<WeightBinding, Error> {
+    let bytes = recipe.infer(store)?.byte_len();
+    Ok(WeightBinding::from_recipe(name, recipe, bytes)?)
+}
+
+pub(crate) fn execute_acquired_gemma_experts(
+    args: &ModelArgs,
+    layer: usize,
+    hidden: &Array,
+    acquired: &AcquiredExperts,
+    _weights: &Array,
+    cache: &ExpertCache,
+    stream: &Stream,
+) -> Result<Array, Exception> {
+    if acquired.is_empty() {
+        return Err(Exception::custom(
+            ExpertCacheError::EmptyRoutedBank {
+                architecture: "Gemma 4",
+            }
+            .to_string(),
+        ));
+    }
+    let started = Instant::now();
+    let intermediate = args
+        .moe_intermediate_size
+        .ok_or_else(|| Exception::custom("Gemma 4 MoE config has no expert width"))?;
+    let mut bank = resident::GemmaExperts::new(
+        args,
+        layer,
+        acquired.identities().len() as i32,
+        intermediate,
+        stream,
+    )?;
+    for (projection, target) in [
+        ("gate_proj", &mut bank.switch_glu.gate_proj),
+        ("up_proj", &mut bank.switch_glu.up_proj),
+        ("down_proj", &mut bank.switch_glu.down_proj),
+    ] {
+        target.weight = Param::new(
+            acquired
+                .compact_binding(&format!("{projection}.weight"), stream)
+                .map_err(|error| Exception::custom(error.to_string()))?,
+        );
+        target.scales = Param::new(
+            acquired
+                .optional_compact_binding(&format!("{projection}.scales"), stream)
+                .map_err(|error| Exception::custom(error.to_string()))?,
+        );
+        target.biases = Param::new(
+            acquired
+                .optional_compact_binding(&format!("{projection}.biases"), stream)
+                .map_err(|error| Exception::custom(error.to_string()))?,
+        );
+    }
+    cache
+        .record_compact_bank(acquired.pass(), acquired.scratch_bytes(), started.elapsed())
+        .map_err(|error| Exception::custom(error.to_string()))?;
+    let routes = acquired.compact_routes().reshape(&[-1, 1], stream)?;
+    let unit_weights = safemlx::ops::ones_dtype(&[hidden.dim(0), 1], hidden.dtype(), stream)?;
+    bank.forward(hidden, &routes, &unit_weights, stream)
+}
+
 /// Adapter for Gemma 4 per-layer inputs and shared-KV attention blocks.
 pub struct Gemma4LayerwiseAdapter {
     args: ModelArgs,
@@ -994,12 +1364,20 @@ pub struct Gemma4LayerwiseAdapter {
     parallel_lm_head: Option<VocabParallelLmHead>,
     parallel_per_layer_projection: Option<ParallelLinear>,
     parallel_text_geometry: Option<Vec<resident::ParallelLayerGeometry>>,
+    external_experts: bool,
 }
 
 impl Gemma4LayerwiseAdapter {
     /// Creates the text-only adapter used by text pipeline stages.
     pub(crate) fn new_text(args: ModelArgs, stream: &Stream) -> Result<Self, Error> {
         Self::new(args, None, None, None, None, None, stream)
+    }
+
+    /// Creates a text adapter whose routed expert payloads live outside layers.
+    pub(crate) fn new_external_experts(args: ModelArgs, stream: &Stream) -> Result<Self, Error> {
+        let mut adapter = Self::new_text(args, stream)?;
+        adapter.external_experts = true;
+        Ok(adapter)
     }
 
     /// Creates the semantic adapter used by a Gemma pipeline ingress stage.
@@ -1022,6 +1400,30 @@ impl Gemma4LayerwiseAdapter {
             audio_token_id,
             stream,
         )
+    }
+
+    /// Creates a multimodal pipeline adapter with independently managed experts.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new_pipeline_external_experts(
+        args: ModelArgs,
+        vision_config: Option<Gemma4VisionConfig>,
+        image_token_id: Option<i32>,
+        video_token_id: Option<i32>,
+        audio_config: Option<Gemma4AudioConfig>,
+        audio_token_id: Option<i32>,
+        stream: &Stream,
+    ) -> Result<Self, Error> {
+        let mut adapter = Self::new_pipeline(
+            args,
+            vision_config,
+            image_token_id,
+            video_token_id,
+            audio_config,
+            audio_token_id,
+            stream,
+        )?;
+        adapter.external_experts = true;
+        Ok(adapter)
     }
 
     /// Returns the execution-group coordinates of configured media towers.
@@ -1109,25 +1511,20 @@ impl Gemma4LayerwiseAdapter {
         &self,
         index: usize,
         layout: Option<&crate::runtime::distributed::parallel::LocalModelLayout>,
+        assignment: Option<&crate::runtime::distributed::expert::ExpertAssignment>,
         stream: &Stream,
     ) -> Result<TransformerBlock, Error> {
-        match layout {
-            Some(layout) => {
-                match self.new_parallel_layer(self.pipeline_text_group(), index, layout, stream)? {
-                    Gemma4Layer::Text(layer) => Ok(*layer),
-                    _ => Err(Error::Parallel(format!(
-                        "Gemma 4 text planner returned a non-text layer at index {index}"
-                    ))),
-                }
-            }
-            None => Ok(TransformerBlock::new(
-                &self.args,
-                *self.args.layer_policy(index).ok_or_else(|| {
-                    Error::Parallel(format!("Gemma 4 has no text policy for layer {index}"))
-                })?,
-                index,
-                stream,
-            )?),
+        match self.new_cartesian_layer(
+            self.pipeline_text_group(),
+            index,
+            layout,
+            assignment,
+            stream,
+        )? {
+            Gemma4Layer::Text(layer) => Ok(*layer),
+            _ => Err(Error::Parallel(format!(
+                "Gemma 4 text planner returned a non-text layer at index {index}"
+            ))),
         }
     }
 
@@ -1140,7 +1537,7 @@ impl Gemma4LayerwiseAdapter {
         layout: Option<&crate::runtime::distributed::parallel::LocalModelLayout>,
         stream: &Stream,
     ) -> Result<Vec<WeightBinding>, Error> {
-        let global = self.new_cartesian_text_layer(index, None, stream)?;
+        let global = self.new_cartesian_text_layer(index, None, None, stream)?;
         let bindings = self.text_layer_bindings(index, &global, store)?;
         let Some(layout) = layout else {
             return Ok(bindings);
@@ -1240,6 +1637,7 @@ impl Gemma4LayerwiseAdapter {
             parallel_lm_head: None,
             parallel_per_layer_projection: None,
             parallel_text_geometry: None,
+            external_experts: false,
         })
     }
 
@@ -1352,12 +1750,16 @@ impl Gemma4LayerwiseAdapter {
         prefix: &str,
         store: &dyn WeightStore,
     ) -> Result<Vec<WeightBinding>, Error> {
-        Ok(build_module_bindings_with_recipes(
+        let mut bindings = build_module_bindings_with_recipes(
             module,
             prefix,
             store,
             self.recipes_for(module, prefix, store),
-        )?)
+        )?;
+        if self.external_experts && prefix.starts_with("model.language_model.layers.") {
+            bindings.retain(|binding| !binding.name().starts_with("experts."));
+        }
+        Ok(bindings)
     }
 
     fn prepare_per_layer_inputs_with_execution(
@@ -1778,8 +2180,7 @@ impl ArchitectureAdapter for Gemma4LayerwiseAdapter {
     ) -> Result<PromptCacheModelIdentity, Error> {
         let layer_count = self.args.num_hidden_layers as usize;
         let layer_layout = match topology {
-            None => resident::prompt_cache_layer_layout(&self.args),
-            Some(_) => {
+            Some(topology) if topology.tensor_parallel_size > 1 => {
                 let geometry = self.parallel_text_geometry.as_ref().ok_or_else(|| {
                     Error::Parallel(
                         "Gemma 4 parallel cache identity requested before local layout configuration"
@@ -1788,6 +2189,7 @@ impl ArchitectureAdapter for Gemma4LayerwiseAdapter {
                 })?;
                 resident::prompt_cache_layer_layout_with_geometry(&self.args, geometry)
             }
+            _ => resident::prompt_cache_layer_layout(&self.args),
         }?;
         Ok(PromptCacheModelIdentity {
             model_family: "gemma4".into(),
@@ -3086,6 +3488,118 @@ impl ArchitectureAdapter for Gemma4LayerwiseAdapter {
         }
     }
 
+    fn new_expert_parallel_layer(
+        &self,
+        group: usize,
+        index: usize,
+        assignment: &crate::runtime::distributed::expert::ExpertAssignment,
+        stream: &Stream,
+    ) -> Result<Self::Layer, Error> {
+        let mut layer = self.new_layer(group, index, stream)?;
+        if self.execution_group_name(group)? != "text_decoder" {
+            return Ok(layer);
+        }
+        let Gemma4Layer::Text(text) = &mut layer else {
+            unreachable!("validated Gemma text execution group")
+        };
+        if text.experts.is_some() {
+            let local_experts = if self.external_experts {
+                0
+            } else {
+                i32::try_from(assignment.local_expert_count())
+                    .map_err(|_| Error::Parallel("local Gemma expert count exceeds i32".into()))?
+            };
+            let intermediate = self.args.moe_intermediate_size.ok_or_else(|| {
+                Error::Parallel(format!("Gemma 4 MoE layer {index} has no expert width"))
+            })?;
+            text.experts = Some(resident::GemmaExperts::new(
+                &self.args,
+                index,
+                local_experts,
+                intermediate,
+                stream,
+            )?);
+        }
+        Ok(layer)
+    }
+
+    fn new_tensor_expert_parallel_layer(
+        &self,
+        group: usize,
+        index: usize,
+        layout: &crate::runtime::distributed::parallel::LocalModelLayout,
+        assignment: &crate::runtime::distributed::expert::ExpertAssignment,
+        stream: &Stream,
+    ) -> Result<Self::Layer, Error> {
+        let mut layer = self.new_parallel_layer(group, index, layout, stream)?;
+        if self.execution_group_name(group)? != "text_decoder" {
+            return Ok(layer);
+        }
+        let Gemma4Layer::Text(text) = &mut layer else {
+            unreachable!("validated Gemma text execution group")
+        };
+        if let Some(experts) = &text.experts {
+            let local_experts = if self.external_experts {
+                0
+            } else {
+                i32::try_from(assignment.local_expert_count())
+                    .map_err(|_| Error::Parallel("local Gemma expert count exceeds i32".into()))?
+            };
+            let intermediate = experts.switch_glu.gate_proj.output_dim;
+            text.experts = Some(resident::GemmaExperts::new(
+                &self.args,
+                index,
+                local_experts,
+                intermediate,
+                stream,
+            )?);
+        }
+        Ok(layer)
+    }
+
+    fn expert_parallel_assignment(
+        &self,
+        topology: crate::runtime::distributed::topology::ParallelTopology,
+    ) -> Result<Option<crate::runtime::distributed::expert::ExpertAssignment>, Error> {
+        if topology.expert_parallel_size == 1 && !self.external_experts {
+            return Ok(None);
+        }
+        if !self
+            .args
+            .layer_schedule
+            .iter()
+            .any(|policy| policy.feed_forward == resident::FeedForwardPolicy::DenseWithSparseMoe)
+        {
+            return Err(Error::Parallel(
+                "Gemma 4 expert parallelism requires routed MoE text layers".into(),
+            ));
+        }
+        let experts = self.args.num_experts.ok_or_else(|| {
+            Error::Parallel("Gemma 4 MoE config has no global expert count".into())
+        })?;
+        Ok(Some(
+            crate::runtime::distributed::expert::ExpertAssignment::balanced(
+                usize::try_from(experts)
+                    .map_err(|_| Error::Parallel("Gemma 4 expert count is negative".into()))?,
+                topology.expert_parallel_size,
+                topology.expert_parallel_rank,
+            )?,
+        ))
+    }
+
+    fn expert_parallel_layer_bindings(
+        &self,
+        group: usize,
+        index: usize,
+        _layer: &Self::Layer,
+        store: &dyn WeightStore,
+        _assignment: &crate::runtime::distributed::expert::ExpertAssignment,
+        stream: &Stream,
+    ) -> Result<Vec<WeightBinding>, Error> {
+        let source = self.new_layer(group, index, stream)?;
+        self.layer_bindings(group, index, &source, store)
+    }
+
     fn layer_checkpoint_prefix(&self, group: usize, index: usize) -> String {
         match self.execution_group_name(group).ok() {
             Some("vision_encoder") => format!("model.vision_tower.encoder.layers.{index}"),
@@ -3110,6 +3624,39 @@ impl ArchitectureAdapter for Gemma4LayerwiseAdapter {
         store: &dyn WeightStore,
     ) -> Result<Vec<WeightBinding>, Error> {
         self.bindings(layer, &self.layer_checkpoint_prefix(group, index), store)
+    }
+
+    fn populate_layer(
+        &self,
+        group: usize,
+        _index: usize,
+        layer: &mut Self::Layer,
+        lease: &ResidentUnitLease,
+    ) -> Result<(), Error> {
+        if self.external_experts && self.execution_group_name(group)? == "text_decoder" {
+            Ok(populate_module_from_lease_excluding(
+                layer,
+                lease,
+                |name| name.starts_with("experts."),
+            )?)
+        } else {
+            Ok(populate_module_from_lease(layer, lease)?)
+        }
+    }
+
+    fn additional_consumed_checkpoint_keys(&self, store: &dyn WeightStore) -> Vec<String> {
+        if self.external_experts {
+            store
+                .keys()
+                .into_iter()
+                .filter(|key| {
+                    key.starts_with("model.language_model.layers.")
+                        && key.contains(".experts.switch_glu.")
+                })
+                .collect()
+        } else {
+            Vec::new()
+        }
     }
 
     fn parallel_layer_bindings(
@@ -3170,19 +3717,23 @@ impl ArchitectureAdapter for Gemma4LayerwiseAdapter {
                     .as_ref()
                     .and_then(|masks| masks.get(&layer.layer_policy.attention))
                     .or(context.mask.as_ref());
-                Ok(layer.forward(
-                    AttentionInput {
-                        x: hidden,
-                        mask,
-                        cache: cache.kv[index].as_mut(),
-                        position_offset: context.position_offset,
-                        per_layer_input: per_layer_input.as_ref(),
-                        shared_kv: Some(&mut context.shared_kv),
-                        disable_generated_mask: false,
-                        generated_sliding_window: None,
-                    },
-                    stream,
-                )?)
+                let input = AttentionInput {
+                    x: hidden,
+                    mask,
+                    cache: cache.kv[index].as_mut(),
+                    position_offset: context.position_offset,
+                    per_layer_input: per_layer_input.as_ref(),
+                    shared_kv: Some(&mut context.shared_kv),
+                    disable_generated_mask: false,
+                    generated_sliding_window: None,
+                };
+                if self.external_experts {
+                    return Err(Error::Parallel(
+                        "Gemma 4 external experts require the topology-scoped execution hook"
+                            .into(),
+                    ));
+                }
+                Ok(layer.forward(input, stream)?)
             }
             _ => Err(Error::UnsupportedArchitecture(format!(
                 "Gemma 4 execution unit does not match group {group}"

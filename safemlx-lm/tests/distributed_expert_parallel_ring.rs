@@ -29,6 +29,7 @@ use safemlx_lm::{
     architectures::distributed::pipeline::load_pipeline_model_with_options,
     architectures::{
         deepseek_v3::model as deepseek_v3,
+        gemma4::model as gemma4,
         gpt_oss::model as gpt_oss,
         inkling::model as inkling,
         kimi_linear::model as kimi_linear,
@@ -134,6 +135,10 @@ fn forward_parallel_model(
             .unwrap(),
         None => model.forward(tokens, None, cache, group, stream).unwrap(),
     }
+}
+
+fn uses_external_expert_bank(architecture: &str) -> bool {
+    matches!(architecture, "Qwen3VlMoe" | "Gemma4")
 }
 
 #[test]
@@ -386,7 +391,7 @@ fn expert_parallel_model_ring_worker() {
     } else if assignment_kind == "balanced"
         && !sparse_cached
         && !tensor_expert
-        && architecture != "Qwen3VlMoe"
+        && !uses_external_expert_bank(&architecture)
     {
         assert!(model.latest_routing_statistics().local_routes > 0);
     }
@@ -422,6 +427,7 @@ fn expert_parallel_model_ring_worker() {
                 "Lfm2" => "lfm2",
                 "NemotronH" => "nemotron_h",
                 "Qwen3VlMoe" => "qwen3_vl",
+                "Gemma4" => "gemma4",
                 other => panic!("unexpected prompt-cache architecture {other}"),
             }
             .into(),
@@ -508,7 +514,7 @@ fn expert_parallel_model_ring_worker() {
     } else if assignment_kind == "balanced"
         && !sparse_cached
         && !tensor_expert
-        && architecture != "Qwen3VlMoe"
+        && !uses_external_expert_bank(&architecture)
     {
         assert!(model.latest_routing_statistics().local_routes > 0);
     }
@@ -542,7 +548,7 @@ fn expert_parallel_model_ring_worker() {
     } else if assignment_kind == "balanced"
         && !sparse_cached
         && !tensor_expert
-        && architecture != "Qwen3VlMoe"
+        && !uses_external_expert_bank(&architecture)
     {
         assert!(model.latest_routing_statistics().local_routes > 0);
     }
@@ -564,7 +570,7 @@ fn expert_parallel_model_ring_worker() {
     );
     assert_eq!(cache.offset(), 5);
 
-    if !sparse_cached && !tensor_expert && architecture != "Qwen3VlMoe" {
+    if !sparse_cached && !tensor_expert && !uses_external_expert_bank(&architecture) {
         let mut observed_cache = model.new_cache();
         let mut observer = EpObserver {
             names: Vec::new(),
@@ -600,7 +606,7 @@ fn expert_parallel_model_ring_worker() {
     assert!(timings.expert_time > Duration::ZERO);
     assert!(timings.reduction_time > Duration::ZERO);
     assert_eq!(timings.exchange_time, Duration::ZERO);
-    if !sparse_cached && !tensor_expert && architecture != "Qwen3VlMoe" {
+    if !sparse_cached && !tensor_expert && !uses_external_expert_bank(&architecture) {
         assert!(timings.router_time > Duration::ZERO);
         assert_eq!(
             timings.shared_expert_time > Duration::ZERO,
@@ -1486,6 +1492,27 @@ fn write_additional_sparse_fixtures(root: &Path) -> Vec<(&'static str, &'static 
     std::fs::write(directory.join(PROMPT_CACHE_MARKER), []).unwrap();
     fixtures.push(("Qwen3-VL-MoE sparse expert cache", "Qwen3VlMoe", directory));
 
+    let config = serde_json::json!({
+        "model_type": "gemma4", "hidden_size": 8, "moe_intermediate_size": 8,
+        "num_hidden_layers": 2, "test_moe_layers": 2, "num_experts": 4,
+        "tie_word_embeddings": true,
+        "text_config": {
+            "model_type": "gemma4", "hidden_size": 8, "num_hidden_layers": 2,
+            "intermediate_size": 16, "num_attention_heads": 2, "rms_norm_eps": 1e-6,
+            "vocab_size": 32, "pad_token_id": 0, "num_key_value_heads": 2,
+            "max_position_embeddings": 128, "rope_theta": 10000.0, "head_dim": 4,
+            "attention_bias": false, "layer_types": ["sliding_attention", "full_attention"],
+            "sliding_window": 8, "enable_moe_block": true, "num_experts": 4,
+            "top_k_experts": 2, "moe_intermediate_size": 8
+        }
+    });
+    let directory = root.join("gemma4-moe-sparse");
+    std::fs::create_dir_all(&directory).unwrap();
+    let mut model = gemma4::Model::new_from_config_value(&config, stream).unwrap();
+    save_zero_fixture(&mut model, &config, &directory, stream, 32);
+    std::fs::write(directory.join(PROMPT_CACHE_MARKER), []).unwrap();
+    fixtures.push(("Gemma 4 MoE sparse expert cache", "Gemma4", directory));
+
     fixtures
 }
 
@@ -2294,6 +2321,63 @@ fn ring_four_process_qwen3_vl_moe_tensor_expert_parity() {
         "expected.safetensors",
         4,
     );
+}
+
+/// Verifies Gemma 4 MoE pure EP with eagerly resident and sparse-cached
+/// expert banks, including prompt-cache replay, cached decode, and generation.
+#[test]
+#[ignore = "spawns local Ring workers and opens loopback sockets"]
+fn ring_gemma4_moe_expert_parity() {
+    assert!(distributed::is_available(Backend::Ring));
+    for (label, residency) in [
+        ("Gemma 4 MoE resident EP", "resident"),
+        ("Gemma 4 MoE sparse EP", "sparse-cache"),
+    ] {
+        let fixture = tempfile::tempdir().unwrap();
+        let checkpoint = write_additional_sparse_fixtures(fixture.path())
+            .into_iter()
+            .find(|(_, architecture, _)| *architecture == "Gemma4")
+            .map(|(_, _, directory)| directory)
+            .unwrap();
+        run_ring_fixture(
+            label,
+            "Gemma4",
+            "dense",
+            "balanced",
+            residency,
+            &checkpoint,
+            "expected.safetensors",
+        );
+    }
+}
+
+/// Verifies Gemma 4 MoE TP=2 + EP=2 with resident and streamed nonexpert
+/// weights through the shared Cartesian executor.
+#[test]
+#[ignore = "spawns local Ring workers and opens loopback sockets"]
+fn ring_gemma4_moe_tensor_expert_parity() {
+    assert!(distributed::is_available(Backend::Ring));
+    for (label, residency) in [
+        ("Gemma 4 MoE resident TP+EP", "tensor-expert-resident"),
+        ("Gemma 4 MoE streamed TP+EP", "tensor-expert-streamed"),
+    ] {
+        let fixture = tempfile::tempdir().unwrap();
+        let checkpoint = write_additional_sparse_fixtures(fixture.path())
+            .into_iter()
+            .find(|(_, architecture, _)| *architecture == "Gemma4")
+            .map(|(_, _, directory)| directory)
+            .unwrap();
+        run_ring_fixture_with_world_size(
+            label,
+            "Gemma4",
+            "dense",
+            "balanced",
+            residency,
+            &checkpoint,
+            "expected.safetensors",
+            4,
+        );
+    }
 }
 
 /// Verifies canonical `qwen3vlmoe` GGUF pure EP with both eager rank-owned

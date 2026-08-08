@@ -943,7 +943,7 @@ topology. Llama/Mistral, DeepSeek-V3/R1, Kimi Linear, Qwen2/Qwen3, Qwen3-VL,
 GPT-OSS, LFM2, Inkling, Nemotron-H, Qwen3-Next/Qwen3.5, and Gemma 4 TP+PP
 use tensor-sharded stage layers and vocabulary boundaries; DeepSeek-V3/R1,
 Inkling, Kimi Linear, Qwen3-MoE, Qwen3-VL-MoE, GPT-OSS, LFM2-MoE,
-Nemotron-H-MoE, and Qwen3-Next/Qwen3.5-MoE PP+EP keep only the stage
+Nemotron-H-MoE, Gemma 4 MoE, and Qwen3-Next/Qwen3.5-MoE PP+EP keep only the stage
 rank's assigned routed experts. DeepSeek preserves its compressed MLA cache
 and split, packed-affine, native block-FP8, or GGUF expert recipes. GPT-OSS
 preserves its checkpoint-native MXFP4 expert banks and scheduled full/sliding
@@ -959,7 +959,7 @@ there; explicit MRoPE tensors, the persisted position delta, and
 sequence-aligned DeepStack residuals then use the ordinary immutable pipeline
 payload. Later stages execute only their text-layer ranges.
 Gemma 4 likewise places configured vision and audio roots on stage zero for
-every TP coordinate. Pooled image/video and subsampled audio outputs are
+every TP/EP coordinate. Pooled image/video and subsampled audio outputs are
 assembled through the shared Gemma execution-group adapter; per-layer inputs
 and exact full/sliding multimodal masks then travel as declared immutable
 pipeline auxiliary tensors. Tower and decoder blocks share one resident,
@@ -982,7 +982,7 @@ non-resident policy; `dense_stream_report` adds disk-stream pass and cache
 statistics only when that policy is active. `PipelineStageInfo` carries the
 same report's global rank and TP/PP/EP coordinates and stage ownership.
 DeepSeek-V3/R1, Qwen3-MoE, Qwen3-VL-MoE, Kimi Linear, Inkling text, GPT-OSS,
-LFM2-MoE, Nemotron-H-MoE, and text-only Qwen3-Next/Qwen3.5-MoE also compose all
+LFM2-MoE, Nemotron-H-MoE, Gemma 4 MoE, and text-only Qwen3-Next/Qwen3.5-MoE also compose all
 three axes in this runtime. TP
 collectives remain inside the stage and EP coordinate, routed exchange remains
 inside the stage and TP coordinate, and pipeline transport connects equal
@@ -991,7 +991,7 @@ The triple-axis path supports arbitrary valid Cartesian degrees on native
 subgroup backends and uses topology-planned neighbor routes for stage-local
 Ring fallback collectives. Fully resident, host-layerwise, and
 dense-disk-streamed SafeTensors and canonical `deepseek2`, `qwen3moe`, `qwen3vlmoe`, `kimi_linear`, `inkling`,
-type-39 `gpt-oss`, `lfm2moe`, `nemotron_h_moe`, `qwen3next`, or `qwen35moe` GGUF checkpoints share the same layer recipes,
+type-39 `gpt-oss`, `gemma4`, `lfm2moe`, `nemotron_h_moe`, `qwen3next`, or `qwen35moe` GGUF checkpoints share the same layer recipes,
 cache identity, synchronized generation, and failure consensus. LFM2-MoE carries its
 TP-local causal-convolution state and attention KV state through that same
 stage cache, while Nemotron-H-MoE carries TP-local Mamba convolution/SSM state
@@ -1029,7 +1029,7 @@ formats. Dense families have no EP migration.
 | Qwen3 MoE | TP, PP, EP | Complete | None |
 | GPT-OSS | TP, PP, EP | Complete | None; native MXFP4 SafeTensors and canonical type-39 GGUF are covered |
 | Llama/Mistral | TP, PP | TP+PP complete | None; EP does not apply |
-| Gemma 4 | TP, PP | TP+PP complete | None; SafeTensors and text-plus-projector GGUF support typed text/image/video/audio ingress, both media towers, cached decode, queued scheduling, and all non-expert residency policies; EP does not apply |
+| Gemma 4 dense / MoE | TP, PP, EP | Complete | None; routed MoE layers support EP, TP+EP, PP+EP, and TP+PP+EP for SafeTensors and text-plus-projector GGUF, with typed text/image/video/audio ingress, both media towers, cached decode, synchronized generation, prompt-cache persistence, and resident, host-layerwise, or dense-streamed non-experts |
 | DeepSeek-V3/R1 | TP, PP, EP | Complete | None; split, packed-affine, native block-FP8 SafeTensors and canonical DeepSeek2 GGUF recipes share the Cartesian path |
 | Kimi Linear | TP, PP, EP | Complete | None |
 | LFM2 dense | TP, PP | TP+PP complete | None; EP does not apply |
@@ -1051,7 +1051,7 @@ The remaining global limitations are:
   supported.
 
 TP+PP+EP is executable for DeepSeek-V3/R1, Qwen3-MoE, Qwen3-VL-MoE, Kimi
-Linear, Inkling text, GPT-OSS, LFM2-MoE, Nemotron-H-MoE, and
+Linear, Inkling text, GPT-OSS, Gemma 4 MoE, LFM2-MoE, Nemotron-H-MoE, and
 Qwen3-Next/Qwen3.5-MoE text. The Cartesian
 topology and execution contexts remain family-neutral and accept arbitrary
 legal axis sizes.
@@ -1203,8 +1203,8 @@ drain, callers enqueue the synchronized token or finish the request on every
 rank. A single autoregressive request remains token-dependency limited;
 pipeline utilization comes from multiple requests or teacher-forced chunks.
 
-Pipeline training/backward and Gemma image/audio encoder execution are not
-supported. Moshi/PersonaPlex uses its coupled temporal/depth program adapter
+Pipeline training/backward is not supported. Moshi/PersonaPlex uses its
+coupled temporal/depth program adapter
 over the same generic scheduler rather than the decoder pipeline's
 single-hidden-edge adapter. Pipeline GGUF loading is registered for `llama`,
 `mistral`, `deepseek2`, `gemma4`, `qwen2`, `qwen3`, `qwen3moe`, `gpt-oss`,
@@ -1248,6 +1248,20 @@ cargo test -p safemlx-lm --test distributed_gemma4_multimodal_pipeline_ring \
   ring_gemma4_multimodal_gguf_dense_stream_pipeline -- --ignored --exact --nocapture
 cargo test -p safemlx-lm --test distributed_gemma4_multimodal_pipeline_ring \
   ring_gemma4_multimodal_gguf_host_tensor_pipeline -- --ignored --exact --nocapture
+cargo test -p safemlx-lm --test distributed_expert_parallel_ring \
+  ring_gemma4_moe_expert_parity -- --ignored --exact --nocapture
+cargo test -p safemlx-lm --test distributed_expert_parallel_ring \
+  ring_gemma4_moe_tensor_expert_parity -- --ignored --exact --nocapture
+cargo test -p safemlx-lm --test distributed_gemma4_multimodal_pipeline_ring \
+  ring_gemma4_moe_pipeline_expert_multimodal -- --ignored --exact --nocapture
+cargo test -p safemlx-lm --test distributed_gemma4_multimodal_pipeline_ring \
+  ring_gemma4_moe_triple_axis_multimodal -- --ignored --exact --nocapture
+cargo test -p safemlx-lm --test distributed_gemma4_multimodal_pipeline_ring \
+  ring_gemma4_moe_streamed_pipeline_expert_multimodal -- --ignored --exact --nocapture
+cargo test -p safemlx-lm --test distributed_gemma4_multimodal_pipeline_ring \
+  ring_gemma4_moe_host_triple_axis_multimodal -- --ignored --exact --nocapture
+cargo test -p safemlx-lm --test distributed_gemma4_multimodal_pipeline_ring \
+  ring_gemma4_moe_gguf_triple_axis_multimodal -- --ignored --exact --nocapture
 cargo test -p safemlx-lm --test distributed_pipeline_ring \
   ring_two_process_qwen2_pipeline -- --ignored --exact --nocapture
 cargo test -p safemlx-lm --test distributed_pipeline_ring \

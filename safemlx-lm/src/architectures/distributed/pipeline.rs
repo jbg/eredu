@@ -1136,6 +1136,9 @@ struct GemmaStage {
     parallel_per_layer_projection: Option<crate::nn::parallel::ParallelLinear>,
     parallel_lm_head: Option<crate::nn::parallel::VocabParallelLmHead>,
     parallel_layout: Option<crate::runtime::distributed::parallel::LocalModelLayout>,
+    expert_assignment: Option<ExpertAssignment>,
+    expert_cache: Option<ExpertCache>,
+    routing_statistics: RoutingStatistics,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2271,6 +2274,10 @@ impl PipelineStageSemantics for GemmaStage {
         self.dense_layers.as_ref()
     }
 
+    fn expert_cache(&self) -> Option<&ExpertCache> {
+        self.expert_cache.as_ref()
+    }
+
     fn prompt_cache_model_identity(
         &self,
         topology: ParallelTopology,
@@ -2310,7 +2317,7 @@ impl PipelineStageSemantics for GemmaStage {
         cache: &mut [PipelineLayerCache],
         stream: &Stream,
     ) -> Result<PipelineStageOutput, Error> {
-        GemmaStage::forward(self, input, step, mask, cache, stream)
+        self.forward_cartesian(input, step, mask, cache, None, stream)
     }
 
     fn prefill(
@@ -2323,11 +2330,6 @@ impl PipelineStageSemantics for GemmaStage {
         expert_group: Option<&Group>,
         stream: &Stream,
     ) -> Result<PipelineStageOutput, Error> {
-        if expert_group.is_some() {
-            return Err(Error::Parallel(
-                "Gemma 4 multimodal pipeline ingress does not activate expert exchange".into(),
-            ));
-        }
         let (hidden, auxiliary) =
             self.prepare_multimodal_ingress(input, step, execution, stream)?;
         let payload = PipelinePayload { hidden, auxiliary };
@@ -2338,12 +2340,14 @@ impl PipelineStageSemantics for GemmaStage {
                 mask,
                 cache,
                 execution,
+                expert_group,
             ),
-            _ => self.forward(
+            _ => self.forward_cartesian(
                 PipelineStageInput::Hidden(&payload),
                 step,
                 mask,
                 cache,
+                expert_group,
                 stream,
             ),
         }
@@ -2359,16 +2363,11 @@ impl PipelineStageSemantics for GemmaStage {
         expert_group: Option<&Group>,
         stream: &Stream,
     ) -> Result<PipelineStageOutput, Error> {
-        if expert_group.is_some() {
-            return Err(Error::Parallel(
-                "Gemma 4 text TP+PP does not activate expert exchange".into(),
-            ));
-        }
         match execution {
             Some(execution) if execution.is_tensor_parallel() => {
-                self.forward_tensor_parallel(input, step, mask, cache, execution)
+                self.forward_tensor_parallel(input, step, mask, cache, execution, expert_group)
             }
-            _ => self.forward(input, step, mask, cache, stream),
+            _ => self.forward_cartesian(input, step, mask, cache, expert_group, stream),
         }
     }
 }
@@ -5206,12 +5205,12 @@ pub fn load_pipeline_model(
 ///
 /// Llama/Mistral, DeepSeek-V3/R1, Inkling, Kimi Linear, Qwen, Qwen3-VL, GPT-OSS,
 /// LFM2, Nemotron-H, Qwen3-Next/Qwen3.5, and Gemma 4 text TP+PP stages, plus
-/// DeepSeek-V3/R1, Inkling, Kimi Linear, Qwen, Qwen3-VL-MoE, GPT-OSS, LFM2-MoE,
-/// Nemotron-H-MoE, and Qwen3-Next/Qwen3.5-MoE PP+EP stages,
+/// DeepSeek-V3/R1, Inkling, Kimi Linear, Qwen, Qwen3-VL-MoE, GPT-OSS, Gemma 4
+/// MoE, LFM2-MoE, Nemotron-H-MoE, and Qwen3-Next/Qwen3.5-MoE PP+EP stages,
 /// support fully resident, host-layerwise, and dense-disk-streamed layers.
 /// Non-resident units compose pipeline placement with the authoritative TP
 /// semantic layout or EP assignment before residency initialization. Qwen3-MoE,
-/// Kimi Linear, Inkling, Qwen3-VL-MoE, GPT-OSS, LFM2-MoE, Nemotron-H-MoE,
+/// Kimi Linear, Inkling, Qwen3-VL-MoE, GPT-OSS, Gemma 4 MoE, LFM2-MoE, Nemotron-H-MoE,
 /// and Qwen3-Next/Qwen3.5-MoE additionally compose an independent, stage-local
 /// expert cache
 /// with resident, host-layerwise, or dense-streamed non-expert parameters for
@@ -5257,6 +5256,7 @@ pub fn load_pipeline_model_with_options(
                     | crate::api::GgufArchitecture::KimiLinear
                     | crate::api::GgufArchitecture::Inkling
                     | crate::api::GgufArchitecture::GptOss
+                    | crate::api::GgufArchitecture::Gemma4
                     | crate::api::GgufArchitecture::Lfm2Moe
                     | crate::api::GgufArchitecture::NemotronHMoe
                     | crate::api::GgufArchitecture::Qwen35Moe
@@ -5279,6 +5279,7 @@ pub fn load_pipeline_model_with_options(
                     | crate::api::GgufArchitecture::KimiLinear
                     | crate::api::GgufArchitecture::Inkling
                     | crate::api::GgufArchitecture::GptOss
+                    | crate::api::GgufArchitecture::Gemma4
                     | crate::api::GgufArchitecture::Lfm2Moe
                     | crate::api::GgufArchitecture::NemotronHMoe
                     | crate::api::GgufArchitecture::Qwen35Moe
@@ -5300,6 +5301,7 @@ pub fn load_pipeline_model_with_options(
                     | crate::api::GgufArchitecture::Qwen3Vl
                     | crate::api::GgufArchitecture::Qwen3VlMoe
                     | crate::api::GgufArchitecture::GptOss
+                    | crate::api::GgufArchitecture::Gemma4
                     | crate::api::GgufArchitecture::Lfm2Moe
                     | crate::api::GgufArchitecture::NemotronHMoe
                     | crate::api::GgufArchitecture::Qwen35Moe
@@ -5425,6 +5427,7 @@ pub fn load_pipeline_model_with_options(
                     topology,
                     options.quantization,
                     dense_stream,
+                    expert_cache,
                     stream,
                     weights_stream,
                 )
@@ -5638,6 +5641,10 @@ pub fn load_pipeline_model_with_options(
                     | "kimi_linear"
                     | "inkling_mm_model"
                     | "gpt_oss"
+                    | "gemma4"
+                    | "gemma4_text"
+                    | "gemma4_unified"
+                    | "gemma4_unified_text"
                     | "lfm2_moe"
                     | "nemotron_h"
                     | "qwen3_next"
@@ -5663,6 +5670,10 @@ pub fn load_pipeline_model_with_options(
                     | "kimi_linear"
                     | "inkling_mm_model"
                     | "gpt_oss"
+                    | "gemma4"
+                    | "gemma4_text"
+                    | "gemma4_unified"
+                    | "gemma4_unified_text"
                     | "lfm2_moe"
                     | "nemotron_h"
                     | "qwen3_next"
@@ -5687,6 +5698,10 @@ pub fn load_pipeline_model_with_options(
                     | "qwen3_vl_moe"
                     | "qwen3_vl_moe_text"
                     | "gpt_oss"
+                    | "gemma4"
+                    | "gemma4_text"
+                    | "gemma4_unified"
+                    | "gemma4_unified_text"
                     | "lfm2_moe"
                     | "nemotron_h"
                     | "qwen3_next"
@@ -5795,6 +5810,7 @@ pub fn load_pipeline_model_with_options(
                 topology,
                 options.quantization,
                 dense_stream,
+                expert_cache,
                 stream,
                 weights_stream,
             )
@@ -8632,6 +8648,35 @@ fn execute_pipeline_cached_qwen3(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn execute_pipeline_cached_gemma4(
+    args: &gemma4::ModelArgs,
+    global_layer: usize,
+    hidden: &Array,
+    expert_ids: &Array,
+    weights: &Array,
+    pass: ExpertPass,
+    cache: &ExpertCache,
+    assignment: &ExpertAssignment,
+    expert_group: Option<&Group>,
+    statistics: &mut RoutingStatistics,
+    stream: &Stream,
+) -> Result<Array, Error> {
+    validate_pipeline_expert_dispatch(assignment, expert_group, true)?;
+    let execute = |routes: &crate::runtime::distributed::expert::DispatchedRoutes,
+                   stream: &Stream| {
+        super::expert::execute_cached_gemma4(args, global_layer, routes, pass, cache, stream)
+    };
+    let returned = match expert_group {
+        Some(group) => dispatch_replicated_with(
+            hidden, expert_ids, weights, assignment, group, stream, execute,
+        )?,
+        None => dispatch_local_with(hidden, expert_ids, weights, assignment, stream, execute)?,
+    };
+    statistics.accumulate(&returned.statistics);
+    Ok(returned.reduced_output)
+}
+
+#[allow(clippy::too_many_arguments)]
 fn execute_pipeline_cached_deepseek(
     args: &deepseek_v3::ModelArgs,
     global_layer: usize,
@@ -10979,6 +11024,7 @@ impl GemmaStage {
         explicit_mask: Option<&Array>,
         caches: &mut [PipelineLayerCache],
         execution: &ParallelExecutionContext<'_>,
+        expert_group: Option<&Group>,
     ) -> Result<PipelineStageOutput, Error> {
         let group = execution.group().ok_or_else(|| {
             Error::Parallel("tensor-sharded Gemma pipeline stage has no TP communicator".into())
@@ -11117,6 +11163,17 @@ impl GemmaStage {
             .flatten();
         let mut shared_kv = HashMap::new();
         let args = self.args.clone();
+        let assignment = self.expert_assignment.clone();
+        if let Some(assignment) = assignment.as_ref() {
+            validate_pipeline_expert_dispatch(assignment, expert_group, true)?;
+        }
+        self.routing_statistics = RoutingStatistics::default();
+        let pass = if step.sequence_length > 1 {
+            ExpertPass::Prefill
+        } else {
+            ExpertPass::Decode
+        };
+        let expert_cache = self.expert_cache.as_ref();
         let layer_adapter = &self.layer_adapter;
         let parallel_layout = self.parallel_layout.clone();
         let range_start = self.range.start;
@@ -11134,6 +11191,7 @@ impl GemmaStage {
                 layer_adapter.new_cartesian_text_layer(
                     global_layer,
                     parallel_layout.as_ref(),
+                    assignment.as_ref(),
                     stream,
                 )
             },
@@ -11151,47 +11209,74 @@ impl GemmaStage {
                     PipelineLayerCache::StateSlots {
                         global_layer: cached,
                         ..
-                    } if *cached == global_layer && !policy.key_value.owns_state() => layer
-                        .forward_tensor_parallel(
+                    } if *cached == global_layer && !policy.key_value.owns_state() => {
+                        Self::forward_text_layer_cartesian(
+                            &args,
+                            global_layer,
+                            layer,
                             hidden,
                             mask,
                             Option::<&mut ConcatKeyValueCache>::None,
                             offset,
                             per_layer_input.as_ref(),
                             &mut shared_kv,
-                            group,
+                            Some(group),
+                            assignment.as_ref(),
+                            expert_group,
+                            expert_cache,
+                            pass,
+                            &mut self.routing_statistics,
                             stream,
-                        )?,
+                        )?
+                    }
                     PipelineLayerCache::KeyValue {
                         global_layer: cached,
                         cache: PipelineKeyValueCache::Standard(cache),
                         ..
-                    } if *cached == global_layer && policy.key_value.owns_state() => layer
-                        .forward_tensor_parallel(
+                    } if *cached == global_layer && policy.key_value.owns_state() => {
+                        Self::forward_text_layer_cartesian(
+                            &args,
+                            global_layer,
+                            layer,
                             hidden,
                             mask,
                             Some(cache),
                             offset,
                             per_layer_input.as_ref(),
                             &mut shared_kv,
-                            group,
+                            Some(group),
+                            assignment.as_ref(),
+                            expert_group,
+                            expert_cache,
+                            pass,
+                            &mut self.routing_statistics,
                             stream,
-                        )?,
+                        )?
+                    }
                     PipelineLayerCache::KeyValue {
                         global_layer: cached,
                         cache: PipelineKeyValueCache::Paged(cache),
                         ..
-                    } if *cached == global_layer && policy.key_value.owns_state() => layer
-                        .forward_tensor_parallel(
+                    } if *cached == global_layer && policy.key_value.owns_state() => {
+                        Self::forward_text_layer_cartesian(
+                            &args,
+                            global_layer,
+                            layer,
                             hidden,
                             mask,
                             Some(cache),
                             offset,
                             per_layer_input.as_ref(),
                             &mut shared_kv,
-                            group,
+                            Some(group),
+                            assignment.as_ref(),
+                            expert_group,
+                            expert_cache,
+                            pass,
+                            &mut self.routing_statistics,
                             stream,
-                        )?,
+                        )?
+                    }
                     _ => {
                         return Err(Error::Parallel(format!(
                             "Gemma TP+PP cache does not match global layer {global_layer}"
@@ -15713,12 +15798,14 @@ struct GemmaPipelineConfig {
     audio_token_id: Option<i32>,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn load_gemma_pipeline(
     source: GemmaPipelineConfig,
     store: SharedWeightStore,
     topology: ParallelTopology,
     requested_quantization: Option<WeightQuantization>,
     dense_stream: Option<PipelineLayerLoadOptions>,
+    expert_cache_options: Option<ExpertCacheLoadOptions>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<PipelineModel, Error> {
@@ -15730,7 +15817,35 @@ fn load_gemma_pipeline(
         audio_config,
         audio_token_id,
     } = source;
-    topology.preflight(Some(source_args.layer_schedule.len()), None)?;
+    let external_experts = topology.expert_parallel_size > 1 || expert_cache_options.is_some();
+    let binding_adapter = if external_experts {
+        Gemma4LayerwiseAdapter::new_pipeline_external_experts(
+            source_args.clone(),
+            vision_config.clone(),
+            image_token_id,
+            video_token_id,
+            audio_config.clone(),
+            audio_token_id,
+            stream,
+        )?
+    } else {
+        Gemma4LayerwiseAdapter::new_pipeline(
+            source_args.clone(),
+            vision_config.clone(),
+            image_token_id,
+            video_token_id,
+            audio_config.clone(),
+            audio_token_id,
+            stream,
+        )?
+    };
+    let expert_assignment = binding_adapter.expert_parallel_assignment(topology)?;
+    topology.preflight(
+        Some(source_args.layer_schedule.len()),
+        expert_assignment
+            .as_ref()
+            .map(ExpertAssignment::global_expert_count),
+    )?;
     let quantize_on_load = requested_quantization
         .map(|requested| {
             crate::runtime::checkpoint::quantization::should_quantize_on_load(
@@ -15742,6 +15857,12 @@ fn load_gemma_pipeline(
         })
         .transpose()?
         .flatten();
+    if external_experts && quantize_on_load.is_some() {
+        return Err(Error::Quantization(
+            "load-time expert requantization is unsupported for Gemma 4 Cartesian execution; use checkpoint-native packed expert weights"
+                .into(),
+        ));
+    }
     if dense_stream.is_some() && quantize_on_load.is_some() {
         return Err(Error::Quantization(
             "load-time quantization is unsupported for non-resident Gemma pipeline layers; use checkpoint-native packed weights"
@@ -15777,17 +15898,20 @@ fn load_gemma_pipeline(
         audio_token_id,
         range,
         &info,
+        external_experts,
         stream,
     )?;
-    let binding_adapter = Gemma4LayerwiseAdapter::new_pipeline(
-        source_args.clone(),
-        vision_config,
-        image_token_id,
-        video_token_id,
-        audio_config,
-        audio_token_id,
-        stream,
-    )?;
+    stage.expert_assignment = expert_assignment;
+    if let Some(assignment) = stage.expert_assignment.as_ref() {
+        info.global_expert_count = Some(assignment.global_expert_count());
+        if stage.range.clone().any(|layer| {
+            source_args.layer_policy(layer).is_some_and(|policy| {
+                policy.feed_forward == gemma4::FeedForwardPolicy::DenseWithSparseMoe
+            })
+        }) {
+            info.local_expert_ids = assignment.local_global_expert_ids().to_vec();
+        }
+    }
     let parallel_layout = if topology.tensor_parallel_size > 1 {
         let build = ParallelBuildContext::new(topology, ShardingPolicy::Require);
         let mut planner = build.planner();
@@ -15885,6 +16009,7 @@ fn load_gemma_pipeline(
             stage.layer_adapter.new_cartesian_text_layer(
                 global_layer,
                 parallel_layout.as_ref(),
+                stage.expert_assignment.as_ref(),
                 stream,
             )
         })
@@ -16250,14 +16375,25 @@ fn load_gemma_pipeline(
                 parallel_layout.as_ref(),
                 stream,
             )?;
-            loaded.load(
-                layer,
-                store.as_ref(),
-                &bindings,
-                quantize_on_load,
-                weights_stream,
-                stream,
-            )?;
+            if external_experts {
+                loaded.load_excluding(
+                    layer,
+                    store.as_ref(),
+                    &bindings,
+                    weights_stream,
+                    stream,
+                    &|name| name.starts_with("experts."),
+                )?;
+            } else {
+                loaded.load(
+                    layer,
+                    store.as_ref(),
+                    &bindings,
+                    quantize_on_load,
+                    weights_stream,
+                    stream,
+                )?;
+            }
         }
     }
 
@@ -16266,72 +16402,112 @@ fn load_gemma_pipeline(
     let materialized_shards = checkpoint_diagnostics.touched_shard_paths.clone();
     if let Some(options) = dense_stream {
         let streamed_layout = parallel_layout.clone();
+        let streamed_assignment = stage.expert_assignment.clone();
         let streamed_adapter = &stage.layer_adapter;
         let media_units = stage.media_units.clone();
         let media_count = media_units.len();
         let text_start = stage.range.start;
         let unit_count = media_count + stage.range.len();
-        stage.dense_layers = Some(
-            build_pipeline_layer_storage::<Gemma4Layer, _, _>(
-                Arc::clone(&store),
-                0..unit_count,
-                options,
-                static_bytes,
-                stream,
-                weights_stream,
-                |ordinal, stream| {
-                    if let Some(unit) = media_units.get(ordinal) {
-                        match streamed_layout.as_ref() {
-                            Some(layout) => streamed_adapter
-                                .new_parallel_layer(unit.group, unit.index, layout, stream),
-                            None => streamed_adapter.new_layer(unit.group, unit.index, stream),
-                        }
-                    } else {
-                        let global_layer = text_start + (ordinal - media_count);
-                        streamed_adapter
-                            .new_cartesian_text_layer(
-                                global_layer,
-                                streamed_layout.as_ref(),
-                                stream,
-                            )
-                            .map(|layer| Gemma4Layer::Text(Box::new(layer)))
+        let dense_layers = build_pipeline_layer_storage::<Gemma4Layer, _, _>(
+            Arc::clone(&store),
+            0..unit_count,
+            options,
+            static_bytes,
+            stream,
+            weights_stream,
+            |ordinal, stream| {
+                if let Some(unit) = media_units.get(ordinal) {
+                    match streamed_layout.as_ref() {
+                        Some(layout) => streamed_adapter
+                            .new_parallel_layer(unit.group, unit.index, layout, stream),
+                        None => streamed_adapter.new_layer(unit.group, unit.index, stream),
                     }
-                },
-                |ordinal, layer, store| {
-                    if let Some(unit) = media_units.get(ordinal) {
-                        match streamed_layout.as_ref() {
-                            Some(layout) => binding_adapter.parallel_layer_bindings(
-                                unit.group, unit.index, layer, store, layout, stream,
-                            ),
-                            None => {
-                                binding_adapter.layer_bindings(unit.group, unit.index, layer, store)
-                            }
-                        }
-                    } else {
-                        let global_layer = text_start + (ordinal - media_count);
-                        let Gemma4Layer::Text(layer) = layer else {
-                            return Err(Error::Parallel(format!(
-                                "Gemma pipeline unit {ordinal} is not a text block"
-                            )));
-                        };
-                        binding_adapter.cartesian_text_layer_bindings(
+                } else {
+                    let global_layer = text_start + (ordinal - media_count);
+                    streamed_adapter
+                        .new_cartesian_text_layer(
                             global_layer,
-                            layer,
-                            store,
                             streamed_layout.as_ref(),
+                            streamed_assignment.as_ref(),
                             stream,
                         )
+                        .map(|layer| Gemma4Layer::Text(Box::new(layer)))
+                }
+            },
+            |ordinal, layer, store| {
+                if let Some(unit) = media_units.get(ordinal) {
+                    match streamed_layout.as_ref() {
+                        Some(layout) => binding_adapter.parallel_layer_bindings(
+                            unit.group, unit.index, layer, store, layout, stream,
+                        ),
+                        None => {
+                            binding_adapter.layer_bindings(unit.group, unit.index, layer, store)
+                        }
                     }
-                },
-            )?
-            .with_execution_offset(media_count)?,
-        );
+                } else {
+                    let global_layer = text_start + (ordinal - media_count);
+                    let Gemma4Layer::Text(layer) = layer else {
+                        return Err(Error::Parallel(format!(
+                            "Gemma pipeline unit {ordinal} is not a text block"
+                        )));
+                    };
+                    binding_adapter.cartesian_text_layer_bindings(
+                        global_layer,
+                        layer,
+                        store,
+                        streamed_layout.as_ref(),
+                        stream,
+                    )
+                }
+            },
+        )?
+        .with_execution_offset(media_count)?;
+        stage.dense_layers = Some(if external_experts {
+            dense_layers.with_independent_experts("experts.")
+        } else {
+            dense_layers
+        });
         let layer_bytes = stage.dense_layers.as_ref().unwrap().planned_layer_bytes()?;
         info.planned_owned_parameter_bytes = static_bytes
             .checked_add(layer_bytes)
             .ok_or_else(|| Error::Parallel("Gemma pipeline planned bytes overflowed".into()))?;
     } else {
         info.planned_owned_parameter_bytes = static_bytes;
+    }
+    if external_experts {
+        let assignment = stage.expert_assignment.as_ref().ok_or_else(|| {
+            Error::Parallel("Gemma 4 external expert storage has no assignment".into())
+        })?;
+        let entries = crate::architectures::gemma4::layerwise::gemma4_expert_catalog_for_layers(
+            &source_args,
+            store.as_ref(),
+            stage.range.clone(),
+            parallel_layout.as_ref(),
+        )?
+        .into_iter()
+        .filter(|entry| assignment.owner(entry.identity().global_expert) == Some(assignment.rank()))
+        .collect::<Vec<_>>();
+        let cache = match expert_cache_options {
+            Some(options) => ExpertCache::new_shared(
+                Arc::clone(&store),
+                entries,
+                options,
+                weights_stream.clone(),
+                stream.clone(),
+            )?,
+            None => ExpertCache::new_resident_shared(
+                Arc::clone(&store),
+                entries,
+                weights_stream.clone(),
+                stream.clone(),
+            )?,
+        };
+        let owned = cache.report()?.owned_bytes;
+        info.planned_owned_parameter_bytes = info
+            .planned_owned_parameter_bytes
+            .checked_add(owned)
+            .ok_or_else(|| Error::Parallel("Gemma 4 expert byte total overflowed".into()))?;
+        stage.expert_cache = Some(cache);
     }
     info.opened_checkpoint_shards = materialized_shards;
     info.checkpoint_diagnostics = Some(checkpoint_diagnostics);
@@ -16349,10 +16525,21 @@ impl GemmaStage {
         audio_token_id: Option<i32>,
         range: Range<usize>,
         info: &PipelineStageInfo,
+        external_experts: bool,
         stream: &Stream,
     ) -> Result<Self, Error> {
         let has_multimodal_ingress = vision_config.is_some() || audio_config.is_some();
-        let layer_adapter = if info.is_first && has_multimodal_ingress {
+        let layer_adapter = if info.is_first && has_multimodal_ingress && external_experts {
+            Gemma4LayerwiseAdapter::new_pipeline_external_experts(
+                args.clone(),
+                vision_config,
+                image_token_id,
+                video_token_id,
+                audio_config,
+                audio_token_id,
+                stream,
+            )?
+        } else if info.is_first && has_multimodal_ingress {
             Gemma4LayerwiseAdapter::new_pipeline(
                 args.clone(),
                 vision_config,
@@ -16362,6 +16549,8 @@ impl GemmaStage {
                 audio_token_id,
                 stream,
             )?
+        } else if external_experts {
+            Gemma4LayerwiseAdapter::new_external_experts(args.clone(), stream)?
         } else {
             Gemma4LayerwiseAdapter::new_text(args.clone(), stream)?
         };
@@ -16489,6 +16678,9 @@ impl GemmaStage {
             parallel_per_layer_projection: None,
             parallel_lm_head: None,
             parallel_layout: None,
+            expert_assignment: None,
+            expert_cache: None,
+            routing_statistics: RoutingStatistics::default(),
         })
     }
 
@@ -16712,12 +16904,86 @@ impl GemmaStage {
         }
     }
 
-    fn forward(
+    #[allow(clippy::too_many_arguments)]
+    fn forward_text_layer_cartesian<C: KeyValueCache>(
+        args: &gemma4::ModelArgs,
+        global_layer: usize,
+        layer: &mut gemma4::TransformerBlock,
+        hidden: &Array,
+        mask: Option<&Array>,
+        cache: Option<&mut C>,
+        offset: i32,
+        per_layer_input: Option<&Array>,
+        shared_kv: &mut HashMap<crate::runtime::attention::AttentionPolicy, (Array, Array)>,
+        tensor_group: Option<&Group>,
+        assignment: Option<&ExpertAssignment>,
+        expert_group: Option<&Group>,
+        expert_cache: Option<&ExpertCache>,
+        pass: ExpertPass,
+        statistics: &mut RoutingStatistics,
+        stream: &Stream,
+    ) -> Result<Array, Error> {
+        let input = gemma4::AttentionInput {
+            x: hidden,
+            mask,
+            cache,
+            position_offset: offset,
+            per_layer_input,
+            shared_kv: Some(shared_kv),
+            disable_generated_mask: false,
+            generated_sliding_window: None,
+        };
+        let Some(assignment) = assignment else {
+            return match tensor_group {
+                Some(group) => Ok(layer.forward_tensor_parallel(
+                    hidden,
+                    mask,
+                    input.cache,
+                    offset,
+                    per_layer_input,
+                    input.shared_kv.expect("Gemma shared-KV state"),
+                    group,
+                    stream,
+                )?),
+                None => Ok(layer.forward(input, stream)?),
+            };
+        };
+        let expert_cache = expert_cache.ok_or_else(|| {
+            Error::Parallel(format!(
+                "Gemma 4 Cartesian layer {global_layer} has no external expert store"
+            ))
+        })?;
+        let execute = |flat: &Array, ids: &Array, weights: &Array, stream: &Stream| {
+            execute_pipeline_cached_gemma4(
+                args,
+                global_layer,
+                flat,
+                ids,
+                weights,
+                pass,
+                expert_cache,
+                assignment,
+                expert_group,
+                statistics,
+                stream,
+            )
+            .map_err(|error| Exception::custom(error.to_string()))
+        };
+        match tensor_group {
+            Some(group) => {
+                Ok(layer.forward_tensor_with_expert_executor(input, group, stream, execute)?)
+            }
+            None => Ok(layer.forward_with_expert_executor(input, stream, execute)?),
+        }
+    }
+
+    fn forward_cartesian(
         &mut self,
         input: PipelineStageInput<'_>,
         step: PipelineStep,
         explicit_mask: Option<&Array>,
         caches: &mut [PipelineLayerCache],
+        expert_group: Option<&Group>,
         stream: &Stream,
     ) -> Result<PipelineStageOutput, Error> {
         if caches.len() != self.layers.len() {
@@ -16780,7 +17046,19 @@ impl GemmaStage {
             .then(|| auxiliary.tensors().first())
             .flatten();
         let mut shared_kv = HashMap::new();
-        let args = &self.args;
+        let args = self.args.clone();
+        let assignment = self.expert_assignment.clone();
+        if let Some(assignment) = assignment.as_ref() {
+            validate_pipeline_expert_dispatch(assignment, expert_group, true)?;
+        }
+        self.routing_statistics = RoutingStatistics::default();
+        let pass = if step.sequence_length > 1 {
+            ExpertPass::Prefill
+        } else {
+            ExpertPass::Decode
+        };
+        let expert_cache = self.expert_cache.as_ref();
+        let layer_adapter = &self.layer_adapter;
         let range_start = self.range.start;
         hidden = execute_pipeline_layer_range(
             PipelineLayerExecution {
@@ -16793,15 +17071,12 @@ impl GemmaStage {
                 stream,
             },
             |global_layer, stream| {
-                let policy = *args
-                    .layer_policy(global_layer)
-                    .expect("validated Gemma pipeline range");
-                Ok(gemma4::TransformerBlock::new(
-                    args,
-                    policy,
+                layer_adapter.new_cartesian_text_layer(
                     global_layer,
+                    None,
+                    assignment.as_ref(),
                     stream,
-                )?)
+                )
             },
             |global_layer, layer, hidden, cache, stream| {
                 let policy = *args
@@ -16817,56 +17092,74 @@ impl GemmaStage {
                     PipelineLayerCache::StateSlots {
                         global_layer: cached,
                         ..
-                    } if *cached == global_layer && !policy.key_value.owns_state() => layer
-                        .forward(
-                            gemma4::AttentionInput {
-                                x: hidden,
-                                mask,
-                                cache: Option::<&mut ConcatKeyValueCache>::None,
-                                position_offset: offset,
-                                per_layer_input: per_layer_input.as_ref(),
-                                shared_kv: Some(&mut shared_kv),
-                                disable_generated_mask: false,
-                                generated_sliding_window: None,
-                            },
+                    } if *cached == global_layer && !policy.key_value.owns_state() => {
+                        Self::forward_text_layer_cartesian(
+                            &args,
+                            global_layer,
+                            layer,
+                            hidden,
+                            mask,
+                            Option::<&mut ConcatKeyValueCache>::None,
+                            offset,
+                            per_layer_input.as_ref(),
+                            &mut shared_kv,
+                            None,
+                            assignment.as_ref(),
+                            expert_group,
+                            expert_cache,
+                            pass,
+                            &mut self.routing_statistics,
                             stream,
-                        )?,
+                        )?
+                    }
                     PipelineLayerCache::KeyValue {
                         global_layer: cached,
                         cache: PipelineKeyValueCache::Standard(cache),
                         ..
-                    } if *cached == global_layer && policy.key_value.owns_state() => layer
-                        .forward(
-                            gemma4::AttentionInput {
-                                x: hidden,
-                                mask,
-                                cache: Some(cache),
-                                position_offset: offset,
-                                per_layer_input: per_layer_input.as_ref(),
-                                shared_kv: Some(&mut shared_kv),
-                                disable_generated_mask: false,
-                                generated_sliding_window: None,
-                            },
+                    } if *cached == global_layer && policy.key_value.owns_state() => {
+                        Self::forward_text_layer_cartesian(
+                            &args,
+                            global_layer,
+                            layer,
+                            hidden,
+                            mask,
+                            Some(cache),
+                            offset,
+                            per_layer_input.as_ref(),
+                            &mut shared_kv,
+                            None,
+                            assignment.as_ref(),
+                            expert_group,
+                            expert_cache,
+                            pass,
+                            &mut self.routing_statistics,
                             stream,
-                        )?,
+                        )?
+                    }
                     PipelineLayerCache::KeyValue {
                         global_layer: cached,
                         cache: PipelineKeyValueCache::Paged(cache),
                         ..
-                    } if *cached == global_layer && policy.key_value.owns_state() => layer
-                        .forward(
-                            gemma4::AttentionInput {
-                                x: hidden,
-                                mask,
-                                cache: Some(cache),
-                                position_offset: offset,
-                                per_layer_input: per_layer_input.as_ref(),
-                                shared_kv: Some(&mut shared_kv),
-                                disable_generated_mask: false,
-                                generated_sliding_window: None,
-                            },
+                    } if *cached == global_layer && policy.key_value.owns_state() => {
+                        Self::forward_text_layer_cartesian(
+                            &args,
+                            global_layer,
+                            layer,
+                            hidden,
+                            mask,
+                            Some(cache),
+                            offset,
+                            per_layer_input.as_ref(),
+                            &mut shared_kv,
+                            None,
+                            assignment.as_ref(),
+                            expert_group,
+                            expert_cache,
+                            pass,
+                            &mut self.routing_statistics,
                             stream,
-                        )?,
+                        )?
+                    }
                     _ => {
                         return Err(Error::Parallel(format!(
                             "Gemma stage cache does not match global layer {global_layer}"

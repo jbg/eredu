@@ -7,7 +7,7 @@ pub enum Model {
     /// DeepSeek-V3/R1 model.
     DeepSeekV3(crate::architectures::deepseek_v3::layerwise::DeepSeekV3LayerwiseModel),
     /// Gemma 4 text and multimodal model.
-    Gemma4(crate::architectures::gemma4::layerwise::Gemma4LayerwiseModel),
+    Gemma4(Box<crate::architectures::gemma4::layerwise::Gemma4LayerwiseModel>),
     /// OpenAI GPT-OSS model.
     GptOss(crate::architectures::gpt_oss::layerwise::GptOssLayerwiseModel),
     /// Moonshot Kimi Linear hybrid KDA/MLA sparse decoder.

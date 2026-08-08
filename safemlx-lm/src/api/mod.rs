@@ -411,14 +411,14 @@ fn load_model_for_kind(
                     weights_stream,
                 )?,
             )),
-            ModelKind::Gemma4 => Ok(Model::Gemma4(
+            ModelKind::Gemma4 => Ok(Model::Gemma4(Box::new(
                 crate::architectures::gemma4::layerwise::execute_transformed_gemma4_model(
                     model_dir,
                     gemma4::load_gemma4_model_quantized(model_dir, quantization, stream, weights_stream)?,
                     stream,
                     weights_stream,
                 )?,
-            )),
+            ))),
             ModelKind::GptOss => Ok(Model::GptOss(
                 crate::architectures::gpt_oss::layerwise::execute_transformed_gpt_oss_model(
                     gpt_oss::load_model_quantized(model_dir, quantization, stream, weights_stream)?,
@@ -498,14 +498,14 @@ fn load_model_for_kind(
                 weights_stream,
             )?,
         )),
-        ModelKind::Gemma4 => Ok(Model::Gemma4(
+        ModelKind::Gemma4 => Ok(Model::Gemma4(Box::new(
             crate::architectures::gemma4::layerwise::load_gemma4_layerwise_model(
                 model_dir,
                 execution,
                 stream,
                 weights_stream,
             )?,
-        )),
+        ))),
         ModelKind::Inkling => Ok(Model::Inkling(
             crate::architectures::inkling::layerwise::load_inkling_layerwise_model(
                 model_dir,
