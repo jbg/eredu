@@ -952,6 +952,10 @@ impl KimiLinearLayerwiseAdapter {
         Ok(adapter)
     }
 
+    pub(crate) fn new_external_experts(args: ModelArgs, stream: &Stream) -> Result<Self, Error> {
+        Self::new_sparse(args, stream)
+    }
+
     /// Returns the architecture configuration.
     pub const fn args(&self) -> &ModelArgs {
         &self.args
@@ -1356,10 +1360,47 @@ impl ArchitectureAdapter for KimiLinearLayerwiseAdapter {
         if let FeedForward::Moe(moe) = &mut layer.mlp {
             let prefix = format!("model.layers.{index}.mlp.experts");
             moe.experts = crate::nn::moe::PackedSwiGluExperts::new(
-                i32::try_from(assignment.local_expert_count())
-                    .map_err(|_| Error::Parallel("local Kimi expert count exceeds i32".into()))?,
+                if self.sparse_expert_cache {
+                    0
+                } else {
+                    i32::try_from(assignment.local_expert_count()).map_err(|_| {
+                        Error::Parallel("local Kimi expert count exceeds i32".into())
+                    })?
+                },
                 self.args.hidden_size,
                 self.args.moe_intermediate_size,
+                self.args
+                    .weight_quantization_for(&format!("{prefix}.gate_up_proj")),
+                self.args
+                    .weight_quantization_for(&format!("{prefix}.down_proj")),
+                stream,
+            )?;
+        }
+        Ok(layer)
+    }
+
+    fn new_tensor_expert_parallel_layer(
+        &self,
+        group: usize,
+        index: usize,
+        layout: &crate::runtime::distributed::parallel::LocalModelLayout,
+        assignment: &crate::runtime::distributed::expert::ExpertAssignment,
+        stream: &Stream,
+    ) -> Result<Self::Layer, Error> {
+        let mut layer = self.new_parallel_layer(group, index, layout, stream)?;
+        if let FeedForward::Moe(moe) = &mut layer.mlp {
+            let prefix = format!("model.layers.{index}.mlp.experts");
+            let intermediate = moe.experts.intermediate_dim;
+            moe.experts = crate::nn::moe::PackedSwiGluExperts::new(
+                if self.sparse_expert_cache {
+                    0
+                } else {
+                    i32::try_from(assignment.local_expert_count()).map_err(|_| {
+                        Error::Parallel("local Kimi expert count exceeds i32".into())
+                    })?
+                },
+                self.args.hidden_size,
+                intermediate,
                 self.args
                     .weight_quantization_for(&format!("{prefix}.gate_up_proj")),
                 self.args
@@ -1374,7 +1415,7 @@ impl ArchitectureAdapter for KimiLinearLayerwiseAdapter {
         &self,
         topology: crate::runtime::distributed::topology::ParallelTopology,
     ) -> Result<Option<crate::runtime::distributed::expert::ExpertAssignment>, Error> {
-        if topology.expert_parallel_size == 1 {
+        if topology.expert_parallel_size == 1 && !self.sparse_expert_cache {
             return Ok(None);
         }
         if self.args.num_experts <= 0
@@ -1868,10 +1909,18 @@ pub(crate) fn kimi_expert_catalog(
     args: &ModelArgs,
     store: &dyn WeightStore,
 ) -> Result<Vec<ExpertCatalogEntry>, Error> {
+    kimi_expert_catalog_for_layers(args, store, 0..args.layer_schedule.len())
+}
+
+pub(crate) fn kimi_expert_catalog_for_layers(
+    args: &ModelArgs,
+    store: &dyn WeightStore,
+    layers: std::ops::Range<usize>,
+) -> Result<Vec<ExpertCatalogEntry>, Error> {
     let normalized = normalized_checkpoint_keys(store);
     let mut entries = Vec::new();
     for (layer, policy) in args.layer_schedule.iter().enumerate() {
-        if policy.feed_forward != FeedForwardPolicy::SparseMoe {
+        if !layers.contains(&layer) || policy.feed_forward != FeedForwardPolicy::SparseMoe {
             continue;
         }
         let prefix = format!("model.layers.{layer}.mlp.experts");
@@ -2163,6 +2212,60 @@ mod tests {
                 .local_shape(),
             &[4, 8, 4]
         );
+    }
+
+    #[test]
+    fn cartesian_layer_composes_uneven_ep_ownership_with_tp_geometry() {
+        let execution = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        let args = model_args_from_config_value(&tiny_config()).unwrap();
+
+        for rank in 0..12 {
+            let topology = ParallelTopology::from_rank(
+                12,
+                rank,
+                2,
+                2,
+                3,
+                DeviceAssignment::new(DeviceType::Cpu, 0),
+            )
+            .unwrap();
+            let adapter =
+                KimiLinearLayerwiseAdapter::new(args.clone(), execution.stream()).unwrap();
+            let context = ParallelBuildContext::new(topology, ShardingPolicy::Require);
+            let mut planner = context.planner();
+            adapter
+                .register_parallel_parameters(context, &mut planner, execution.stream())
+                .unwrap();
+            let (_, layout) = planner.finish().unwrap();
+            let assignment = adapter
+                .expert_parallel_assignment(topology)
+                .unwrap()
+                .unwrap();
+            let layer = adapter
+                .new_cartesian_layer(0, 1, Some(&layout), Some(&assignment), execution.stream())
+                .unwrap();
+            let crate::architectures::kimi_linear::model::FeedForward::Moe(moe) = layer.mlp else {
+                panic!("Kimi sparse layer lost its routed expert bank")
+            };
+            assert_eq!(
+                moe.experts.num_experts as usize,
+                assignment.local_expert_count()
+            );
+            assert_eq!(moe.experts.intermediate_dim, 4);
+            assert_eq!(assignment.group_size(), 3);
+        }
+
+        let topology =
+            ParallelTopology::from_rank(4, 0, 2, 2, 1, DeviceAssignment::new(DeviceType::Cpu, 0))
+                .unwrap();
+        let adapter =
+            KimiLinearLayerwiseAdapter::new_external_experts(args, execution.stream()).unwrap();
+        let assignment = adapter
+            .expert_parallel_assignment(topology)
+            .unwrap()
+            .unwrap();
+        assert_eq!(assignment.group_size(), 1);
+        assert_eq!(assignment.local_expert_count(), 4);
     }
 
     #[test]

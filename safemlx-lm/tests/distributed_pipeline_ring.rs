@@ -183,6 +183,7 @@ impl FixtureFamily {
 
     fn expert_layer_count(self, range: std::ops::Range<usize>) -> usize {
         match self {
+            Self::KimiLinear | Self::KimiLinearGguf => range.filter(|index| *index == 1).count(),
             Self::NemotronH => range.filter(|index| *index == 2).count(),
             Self::NemotronHGguf => range.filter(|index| matches!(*index, 1 | 2)).count(),
             _ => range.len(),
@@ -409,7 +410,8 @@ fn pipeline_ring_worker() {
         for layer in 0..family.layer_count() {
             assert_eq!(
                 opened.contains(&format!("layer-{layer}.safetensors")),
-                ((!dense_stream && !layerwise_host) || expert_cache)
+                ((!dense_stream && !layerwise_host)
+                    || (expert_cache && !matches!(family, FixtureFamily::KimiLinear)))
                     && expected_range.contains(&layer),
                 "rank {expected_rank} opened the wrong SafeTensors layer shard for {family:?}"
             );
@@ -3332,6 +3334,77 @@ fn ring_four_process_kimi_linear_gguf_pipeline_expert() {
     run_ring_cartesian_pipeline(true, FixtureFamily::KimiLinearGguf, "pp-ep");
 }
 
+/// Proves resident Kimi Linear TP=2 x PP=2 x EP=2 execution across KDA and
+/// MLA state, TP-sharded shared experts, and EP-owned routed experts.
+#[test]
+#[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
+fn ring_eight_process_kimi_linear_triple_axis() {
+    run_ring_cartesian_pipeline(false, FixtureFamily::KimiLinear, "tp-pp-ep");
+}
+
+/// Exercises dense-streamed Kimi non-experts and a stage-local independent
+/// expert cache across all three Cartesian axes.
+#[test]
+#[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
+fn ring_eight_process_kimi_linear_streamed_triple_axis_expert_cache() {
+    run_ring_cartesian_pipeline_mode(
+        true,
+        FixtureFamily::KimiLinear,
+        "tp-pp-ep",
+        WorkerMode::ExpertCache,
+    );
+}
+
+/// Exercises host-layerwise Kimi KDA/MLA state with independently cached
+/// routed experts across TP, PP, and EP.
+#[test]
+#[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
+fn ring_eight_process_kimi_linear_layerwise_host_triple_axis_expert_cache() {
+    run_ring_layerwise_host_cartesian_pipeline_mode(
+        FixtureFamily::KimiLinear,
+        "tp-pp-ep",
+        WorkerMode::ExpertCache,
+    );
+}
+
+/// Exercises representative Kimi Linear GGUF recipes, bounded reads, and an
+/// independent expert cache across all three axes.
+#[test]
+#[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
+fn ring_eight_process_kimi_linear_gguf_triple_axis_expert_cache() {
+    run_ring_cartesian_pipeline_mode(
+        true,
+        FixtureFamily::KimiLinearGguf,
+        "tp-pp-ep",
+        WorkerMode::ExpertCache,
+    );
+}
+
+/// Covers independent Kimi expert caching for TP+PP with EP inactive.
+#[test]
+#[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
+fn ring_four_process_kimi_linear_tensor_pipeline_expert_cache_without_ep() {
+    run_ring_cartesian_pipeline_mode(
+        true,
+        FixtureFamily::KimiLinear,
+        "tp-pp",
+        WorkerMode::ExpertCache,
+    );
+}
+
+/// Verifies cached-expert schedule failure reaches consensus without leaving
+/// Kimi's recurrent or compressed-latent state reusable.
+#[test]
+#[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
+fn ring_four_process_kimi_linear_expert_cache_mismatch_consensus() {
+    run_ring_cartesian_pipeline_mode(
+        false,
+        FixtureFamily::KimiLinear,
+        "pp-ep",
+        WorkerMode::ExpertCacheScheduleMismatch,
+    );
+}
+
 /// Verifies Mamba, dense, sparse, and sliding-attention Nemotron operators over
 /// the two balanced stage ranges.
 #[test]
@@ -3810,6 +3883,7 @@ fn run_ring_layerwise_host_cartesian_pipeline_mode(
             FixtureFamily::Qwen3Moe => write_qwen_fixture(checkpoint.path(), "qwen3_moe"),
             FixtureFamily::GptOss => write_gpt_oss_fixture(checkpoint.path()),
             FixtureFamily::Lfm2Moe => write_lfm2_pipeline_fixture(checkpoint.path(), true),
+            FixtureFamily::KimiLinear => write_kimi_linear_fixture(checkpoint.path()),
             FixtureFamily::NemotronH => write_nemotron_fixture(checkpoint.path()),
             FixtureFamily::Qwen3NextMoe => {
                 write_qwen_hybrid_moe_fixture(checkpoint.path(), "qwen3_next")

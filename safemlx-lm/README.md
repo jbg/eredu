@@ -949,7 +949,7 @@ placement, transfer, eviction, and active-window telemetry for either
 non-resident policy; `dense_stream_report` adds disk-stream pass and cache
 statistics only when that policy is active. `PipelineStageInfo` carries the
 same report's global rank and TP/PP/EP coordinates and stage ownership.
-Qwen3-MoE, GPT-OSS, LFM2-MoE, Nemotron-H-MoE, and text-only
+Qwen3-MoE, Kimi Linear, GPT-OSS, LFM2-MoE, Nemotron-H-MoE, and text-only
 Qwen3-Next/Qwen3.5-MoE also compose all three axes in this runtime. TP
 collectives remain inside the stage and EP coordinate, routed exchange remains
 inside the stage and TP coordinate, and pipeline transport connects equal
@@ -957,7 +957,7 @@ TP/EP coordinates.
 The triple-axis path supports arbitrary valid Cartesian degrees on native
 subgroup backends and uses topology-planned neighbor routes for stage-local
 Ring fallback collectives. Fully resident, host-layerwise, and
-dense-disk-streamed SafeTensors and canonical `qwen3moe`, type-39 `gpt-oss`,
+dense-disk-streamed SafeTensors and canonical `qwen3moe`, `kimi_linear`, type-39 `gpt-oss`,
 `lfm2moe`, `nemotron_h_moe`, `qwen3next`, or `qwen35moe` GGUF checkpoints share the same layer recipes,
 cache identity, synchronized generation, and failure consensus. LFM2-MoE carries its
 TP-local causal-convolution state and attention KV state through that same
@@ -1000,7 +1000,7 @@ that complete triple-axis/cache boundary. Dense families have no EP migration.
 | Llama/Mistral | TP, PP | TP+PP complete | None; EP does not apply |
 | Gemma 4 text | TP, PP | TP+PP complete | Multimodal tower execution is separate; EP does not apply |
 | DeepSeek-V3/R1 | TP, PP, EP | Pairwise | Compose MLA state, shared-expert ownership, native FP8/affine recipes, triple-axis execution, and pipeline-independent expert caching |
-| Kimi Linear | TP, PP, EP | Pairwise | Compose KDA/MLA recurrent state and shared experts with triple-axis execution and pipeline-independent expert caching |
+| Kimi Linear | TP, PP, EP | Complete | None |
 | LFM2 dense | TP, PP | TP+PP complete | None; EP does not apply |
 | LFM2-MoE | TP, PP, EP | Complete | None |
 | Nemotron-H dense | TP, PP | TP+PP complete | None; EP does not apply |
@@ -1021,7 +1021,7 @@ The remaining global limitations are:
 - Families marked **Pairwise** fail triple-axis or pipeline-independent expert
   cache requests during preflight, before checkpoint payload materialization.
 
-TP+PP+EP is executable for Qwen3-MoE, GPT-OSS, LFM2-MoE, Nemotron-H-MoE, and
+TP+PP+EP is executable for Qwen3-MoE, Kimi Linear, GPT-OSS, LFM2-MoE, Nemotron-H-MoE, and
 Qwen3-Next/Qwen3.5-MoE text. The Cartesian
 topology and execution contexts remain family-neutral and accept arbitrary
 legal axis sizes.
@@ -2049,16 +2049,19 @@ approximately with `1 / EP`. `replicated_parameter_bytes` remains constant.
 Load-time conversion is rejected for sparse-cache EP because it would require
 eager expert materialization.
 
-Kimi Linear replicates KDA/MLA, dense MLP, router, shared-expert, embedding,
-normalization, and output parameters. Only routed expert banks are
-partitioned; their contribution is all-summed before the shared expert is
-added once. Sparse-cache EP materializes only rank-owned expert payloads.
+Kimi Linear's Cartesian resident path independently shards KDA/MLA heads,
+dense and shared projections, embeddings, and the output head over TP while
+assigning routed expert banks over EP. The routed contribution is exchanged
+within its stage-local EP group and TP-sharded shared projections are reduced
+once. Independent expert caches retain replicated TP geometry for each
+EP-owned routed bank, so cached routed results do not enter a second TP
+reduction. Sparse-cache EP materializes only rank-owned expert payloads.
 Kimi GGUF checkpoints use the same partitioning and execution path for dense,
 affine, IQ, and MXFP4-MoE expert banks in resident or either sparse-cache mode.
-The combined streamed policy keeps replicated nonexpert layers cold, keeps
-every owned expert cold until routed, and never adds remote experts to the
-rank-local cache. The architecture-neutral GGUF EP dispatcher and type-erased
-expert cache also serve the registered DeepSeek2, Qwen3-MoE, LFM2-MoE,
+The combined streamed policy keeps rank-local nonexpert layer shards cold,
+keeps every owned expert cold until routed, and never adds remote experts to
+the rank-local cache. The architecture-neutral GGUF EP dispatcher and
+type-erased expert cache also serve the registered DeepSeek2, Qwen3-MoE, LFM2-MoE,
 Nemotron-H-MoE, Qwen3-Next, and Qwen3.5-MoE streamed adapters.
 
 Run a two-process Ring generation probe with the usual MLX Ring host file and
@@ -2166,6 +2169,10 @@ The Kimi Linear four-process cases cover TP+PP, TP+EP, and PP+EP across its KDA
 and MLA state transition, TP-sharded dense and shared projections, stage-local
 or cached routed experts, SafeTensors and GGUF bounded reads, prompt-cache
 reload, synchronized generation, and single-rank numerical parity.
+The eight-process cases add resident TP+PP+EP plus dense-streamed,
+host-layerwise, and canonical-GGUF non-experts with independently cached routed
+experts. They also cover EP-inactive TP+PP caching and cached-expert schedule
+failure consensus.
 The Inkling four-process cases cover TP+PP, TP+EP, and PP+EP across full/sliding
 attention and dense/sparse transitions, including rank-local KV and four-way
 convolution state, stage-local or cached routed experts, shared experts,

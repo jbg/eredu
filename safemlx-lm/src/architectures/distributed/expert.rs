@@ -2908,7 +2908,7 @@ fn execute_cached_qwen3(
     execute_cached_qwen3_at(args, layer, "model.layers", routes, pass, cache, stream)
 }
 
-fn execute_cached_kimi_linear(
+pub(crate) fn execute_cached_kimi_linear(
     args: &kimi_linear::ModelArgs,
     layer: usize,
     routes: &DispatchedRoutes,

@@ -1079,6 +1079,7 @@ struct KimiLinearStage {
     parallel_layout: Option<crate::runtime::distributed::parallel::LocalModelLayout>,
     parallel_cache_geometry: Option<Vec<kimi_linear::KimiLayerCacheGeometry>>,
     expert_assignment: Option<ExpertAssignment>,
+    expert_storage: PipelineExpertStorage,
     routing_statistics: RoutingStatistics,
 }
 
@@ -3055,6 +3056,10 @@ impl PipelineStageSemantics for KimiLinearStage {
         self.dense_layers.as_ref()
     }
 
+    fn expert_cache(&self) -> Option<&ExpertCache> {
+        self.expert_storage.cache()
+    }
+
     fn prompt_cache_model_identity(
         &self,
         topology: ParallelTopology,
@@ -3094,7 +3099,11 @@ impl PipelineStageSemantics for KimiLinearStage {
         cache: &mut [PipelineLayerCache],
         stream: &Stream,
     ) -> Result<PipelineStageOutput, Error> {
-        KimiLinearStage::forward(self, input, step, mask, cache, stream)
+        if self.expert_storage.is_external() {
+            self.forward_expert_parallel(input, step, mask, cache, None, stream)
+        } else {
+            KimiLinearStage::forward(self, input, step, mask, cache, stream)
+        }
     }
 
     fn forward_with_execution(
@@ -3108,11 +3117,24 @@ impl PipelineStageSemantics for KimiLinearStage {
         stream: &Stream,
     ) -> Result<PipelineStageOutput, Error> {
         if let Some(group) = expert_group {
-            return self.forward_expert_parallel(input, step, mask, cache, group, stream);
+            if let Some(execution) = execution.filter(|execution| execution.is_tensor_parallel()) {
+                return self.forward_tensor_parallel(
+                    input,
+                    step,
+                    mask,
+                    cache,
+                    execution,
+                    Some(group),
+                );
+            }
+            return self.forward_expert_parallel(input, step, mask, cache, Some(group), stream);
         }
         match execution {
             Some(execution) if execution.is_tensor_parallel() => {
-                self.forward_tensor_parallel(input, step, mask, cache, execution)
+                self.forward_tensor_parallel(input, step, mask, cache, execution, None)
+            }
+            _ if self.expert_storage.is_external() => {
+                self.forward_expert_parallel(input, step, mask, cache, None, stream)
             }
             _ => self.forward(input, step, mask, cache, stream),
         }
@@ -4738,7 +4760,7 @@ pub fn load_pipeline_model(
 /// support fully resident, host-layerwise, and dense-disk-streamed layers.
 /// Non-resident units compose pipeline placement with the authoritative TP
 /// semantic layout or EP assignment before residency initialization. Qwen3-MoE,
-/// GPT-OSS, LFM2-MoE, Nemotron-H-MoE, and Qwen3-Next/Qwen3.5-MoE additionally
+/// Kimi Linear, GPT-OSS, LFM2-MoE, Nemotron-H-MoE, and Qwen3-Next/Qwen3.5-MoE additionally
 /// compose an independent, stage-local expert cache
 /// with resident, host-layerwise, or dense-streamed non-expert parameters for
 /// PP, TP+PP, PP+EP, and TP+PP+EP. With EP inactive each stage owns all experts
@@ -4778,6 +4800,7 @@ pub fn load_pipeline_model_with_options(
             && !matches!(
                 architecture,
                 crate::api::GgufArchitecture::Qwen3Moe
+                    | crate::api::GgufArchitecture::KimiLinear
                     | crate::api::GgufArchitecture::GptOss
                     | crate::api::GgufArchitecture::Lfm2Moe
                     | crate::api::GgufArchitecture::NemotronHMoe
@@ -4786,7 +4809,7 @@ pub fn load_pipeline_model_with_options(
             )
         {
             return Err(Error::Parallel(format!(
-                "pipeline independent expert caching has registered Qwen3-MoE, GPT-OSS, LFM2-MoE, Nemotron-H-MoE, Qwen3-Next-MoE, and Qwen3.5-MoE semantic expert recipes; GGUF architecture {} is not yet registered and no checkpoint payload was materialized",
+                "pipeline independent expert caching has registered Qwen3-MoE, Kimi Linear, GPT-OSS, LFM2-MoE, Nemotron-H-MoE, Qwen3-Next-MoE, and Qwen3.5-MoE semantic expert recipes; GGUF architecture {} is not yet registered and no checkpoint payload was materialized",
                 architecture.metadata_name()
             )));
         }
@@ -4796,6 +4819,7 @@ pub fn load_pipeline_model_with_options(
             && !matches!(
                 architecture,
                 crate::api::GgufArchitecture::Qwen3Moe
+                    | crate::api::GgufArchitecture::KimiLinear
                     | crate::api::GgufArchitecture::GptOss
                     | crate::api::GgufArchitecture::Lfm2Moe
                     | crate::api::GgufArchitecture::NemotronHMoe
@@ -4804,7 +4828,7 @@ pub fn load_pipeline_model_with_options(
             )
         {
             return Err(Error::Parallel(format!(
-                "TP+PP+EP preflight has registered Qwen3-MoE, GPT-OSS, LFM2-MoE, Nemotron-H-MoE, Qwen3-Next-MoE, and Qwen3.5-MoE; GGUF architecture {} has no triple-axis semantic plan and no checkpoint payload was materialized",
+                "TP+PP+EP preflight has registered Qwen3-MoE, Kimi Linear, GPT-OSS, LFM2-MoE, Nemotron-H-MoE, Qwen3-Next-MoE, and Qwen3.5-MoE; GGUF architecture {} has no triple-axis semantic plan and no checkpoint payload was materialized",
                 architecture.metadata_name()
             )));
         }
@@ -5101,6 +5125,7 @@ pub fn load_pipeline_model_with_options(
                     topology,
                     options.quantization,
                     dense_stream,
+                    expert_cache,
                     stream,
                     weights_stream,
                 )
@@ -5135,6 +5160,7 @@ pub fn load_pipeline_model_with_options(
             model_type,
             Some(
                 "qwen3_moe"
+                    | "kimi_linear"
                     | "gpt_oss"
                     | "lfm2_moe"
                     | "nemotron_h"
@@ -5145,7 +5171,7 @@ pub fn load_pipeline_model_with_options(
         )
     {
         return Err(Error::Parallel(format!(
-            "pipeline independent expert caching has registered Qwen3-MoE, GPT-OSS, LFM2-MoE, Nemotron-H-MoE, Qwen3-Next-MoE, and Qwen3.5-MoE semantic expert recipes; SafeTensors model_type {model_type:?} is not yet registered and no checkpoint payload was materialized"
+            "pipeline independent expert caching has registered Qwen3-MoE, Kimi Linear, GPT-OSS, LFM2-MoE, Nemotron-H-MoE, Qwen3-Next-MoE, and Qwen3.5-MoE semantic expert recipes; SafeTensors model_type {model_type:?} is not yet registered and no checkpoint payload was materialized"
         )));
     }
     if topology.tensor_parallel_size > 1
@@ -5155,6 +5181,7 @@ pub fn load_pipeline_model_with_options(
             model_type,
             Some(
                 "qwen3_moe"
+                    | "kimi_linear"
                     | "gpt_oss"
                     | "lfm2_moe"
                     | "nemotron_h"
@@ -5165,7 +5192,7 @@ pub fn load_pipeline_model_with_options(
         )
     {
         return Err(Error::Parallel(format!(
-            "TP+PP+EP preflight has registered Qwen3-MoE, GPT-OSS, LFM2-MoE, Nemotron-H-MoE, Qwen3-Next-MoE, and Qwen3.5-MoE; SafeTensors model_type {:?} has no triple-axis semantic plan and no checkpoint payload was materialized",
+            "TP+PP+EP preflight has registered Qwen3-MoE, Kimi Linear, GPT-OSS, LFM2-MoE, Nemotron-H-MoE, Qwen3-Next-MoE, and Qwen3.5-MoE; SafeTensors model_type {:?} has no triple-axis semantic plan and no checkpoint payload was materialized",
             model_type
         )));
     }
@@ -5426,6 +5453,7 @@ pub fn load_pipeline_model_with_options(
                 topology,
                 options.quantization,
                 dense_stream,
+                expert_cache,
                 stream,
                 weights_stream,
             )
@@ -7860,6 +7888,35 @@ fn execute_pipeline_cached_qwen_hybrid(
     let execute = |routes: &crate::runtime::distributed::expert::DispatchedRoutes,
                    stream: &Stream| {
         super::expert::execute_cached_qwen_hybrid(args, global_layer, routes, pass, cache, stream)
+    };
+    let returned = match expert_group {
+        Some(group) => dispatch_replicated_with(
+            hidden, expert_ids, weights, assignment, group, stream, execute,
+        )?,
+        None => dispatch_local_with(hidden, expert_ids, weights, assignment, stream, execute)?,
+    };
+    statistics.accumulate(&returned.statistics);
+    Ok(returned.reduced_output)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_pipeline_cached_kimi_linear(
+    args: &kimi_linear::ModelArgs,
+    global_layer: usize,
+    hidden: &Array,
+    expert_ids: &Array,
+    weights: &Array,
+    pass: ExpertPass,
+    cache: &ExpertCache,
+    assignment: &ExpertAssignment,
+    expert_group: Option<&Group>,
+    statistics: &mut RoutingStatistics,
+    stream: &Stream,
+) -> Result<Array, Error> {
+    validate_pipeline_expert_dispatch(assignment, expert_group, true)?;
+    let execute = |routes: &crate::runtime::distributed::expert::DispatchedRoutes,
+                   stream: &Stream| {
+        super::expert::execute_cached_kimi_linear(args, global_layer, routes, pass, cache, stream)
     };
     let returned = match expert_group {
         Some(group) => dispatch_replicated_with(
@@ -12693,16 +12750,22 @@ impl QwenHybridStage {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn load_kimi_linear_pipeline(
     source_args: kimi_linear::ModelArgs,
     store: SharedWeightStore,
     topology: ParallelTopology,
     requested_quantization: Option<WeightQuantization>,
     dense_stream: Option<PipelineLayerLoadOptions>,
+    expert_cache_options: Option<ExpertCacheLoadOptions>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<PipelineModel, Error> {
-    let binding_adapter = KimiLinearLayerwiseAdapter::new(source_args.clone(), stream)?;
+    let binding_adapter = if expert_cache_options.is_some() {
+        KimiLinearLayerwiseAdapter::new_external_experts(source_args.clone(), stream)?
+    } else {
+        KimiLinearLayerwiseAdapter::new(source_args.clone(), stream)?
+    };
     let expert_assignment = binding_adapter.expert_parallel_assignment(topology)?;
     topology.preflight(
         Some(source_args.num_hidden_layers as usize),
@@ -12721,7 +12784,7 @@ fn load_kimi_linear_pipeline(
         })
         .transpose()?
         .flatten();
-    if dense_stream.is_some() && quantize_on_load.is_some() {
+    if (dense_stream.is_some() || expert_cache_options.is_some()) && quantize_on_load.is_some() {
         return Err(Error::Quantization(
             "load-time quantization is unsupported for non-resident Kimi Linear pipeline layers; use checkpoint-native packed weights"
                 .into(),
@@ -12739,7 +12802,17 @@ fn load_kimi_linear_pipeline(
         ModelKind::KimiLinear,
         source_args.hidden_size,
     );
-    let mut stage = KimiLinearStage::new(target_args.clone(), range, &info, stream)?;
+    let mut stage = KimiLinearStage::new(
+        target_args.clone(),
+        range,
+        &info,
+        expert_cache_options.is_some(),
+        stream,
+    )?;
+    if expert_cache_options.is_some() {
+        stage.layer_adapter =
+            KimiLinearLayerwiseAdapter::new_external_experts(target_args.clone(), stream)?;
+    }
     stage.expert_assignment = expert_assignment;
     if let Some(assignment) = stage.expert_assignment.as_ref() {
         info.global_expert_count = Some(assignment.global_expert_count());
@@ -12943,14 +13016,25 @@ fn load_kimi_linear_pipeline(
                 stage.expert_assignment.as_ref(),
                 stream,
             )?;
-            loaded.load(
-                layer,
-                store.as_ref(),
-                &bindings,
-                quantize_on_load,
-                weights_stream,
-                stream,
-            )?;
+            if expert_cache_options.is_some() {
+                loaded.load_excluding(
+                    layer,
+                    store.as_ref(),
+                    &bindings,
+                    weights_stream,
+                    stream,
+                    &|name| name.starts_with("mlp.experts."),
+                )?;
+            } else {
+                loaded.load(
+                    layer,
+                    store.as_ref(),
+                    &bindings,
+                    quantize_on_load,
+                    weights_stream,
+                    stream,
+                )?;
+            }
         }
     }
     let static_bytes = loaded.finish(&mut info)?;
@@ -12988,6 +13072,12 @@ fn load_kimi_linear_pipeline(
                 )
             },
         )?);
+        if expert_cache_options.is_some() {
+            stage.dense_layers = stage
+                .dense_layers
+                .take()
+                .map(|storage| storage.with_independent_experts("mlp.experts."));
+        }
         let layer_bytes = stage.dense_layers.as_ref().unwrap().planned_layer_bytes()?;
         info.planned_owned_parameter_bytes =
             static_bytes.checked_add(layer_bytes).ok_or_else(|| {
@@ -12995,6 +13085,36 @@ fn load_kimi_linear_pipeline(
             })?;
     } else {
         info.planned_owned_parameter_bytes = static_bytes;
+    }
+    if let Some(options) = expert_cache_options {
+        let entries = crate::architectures::kimi_linear::layerwise::kimi_expert_catalog_for_layers(
+            &source_args,
+            store.as_ref(),
+            stage.range.clone(),
+        )?
+        .into_iter()
+        .filter(|entry| {
+            stage.expert_assignment.as_ref().is_none_or(|assignment| {
+                assignment.owner(entry.identity().global_expert) == Some(assignment.rank())
+            })
+        })
+        .collect::<Vec<_>>();
+        if !entries.is_empty() {
+            let cache = ExpertCache::new_shared(
+                Arc::clone(&store),
+                entries,
+                options,
+                weights_stream.clone(),
+                stream.clone(),
+            )?;
+            info.planned_owned_parameter_bytes = info
+                .planned_owned_parameter_bytes
+                .checked_add(cache.report()?.owned_bytes)
+                .ok_or_else(|| {
+                    Error::Parallel("Kimi Linear pipeline expert byte total overflowed".into())
+                })?;
+            stage.expert_storage = PipelineExpertStorage::External(Box::new(cache));
+        }
     }
     info.opened_checkpoint_shards = materialized_shards;
     info.checkpoint_diagnostics = Some(checkpoint_diagnostics);
@@ -13006,6 +13126,22 @@ enum KimiCartesianLayerExecution<'a> {
     Expert {
         assignment: &'a ExpertAssignment,
         group: &'a Group,
+        statistics: &'a mut RoutingStatistics,
+    },
+    TensorExpert {
+        tensor_group: &'a Group,
+        assignment: &'a ExpertAssignment,
+        expert_group: &'a Group,
+        statistics: &'a mut RoutingStatistics,
+    },
+    External {
+        args: &'a kimi_linear::ModelArgs,
+        global_layer: usize,
+        tensor_group: Option<&'a Group>,
+        assignment: &'a ExpertAssignment,
+        expert_group: Option<&'a Group>,
+        pass: ExpertPass,
+        cache: &'a ExpertCache,
         statistics: &'a mut RoutingStatistics,
     },
 }
@@ -13040,6 +13176,67 @@ fn forward_kimi_cartesian_operator(
             statistics,
             stream,
         )?),
+        KimiCartesianLayerExecution::TensorExpert {
+            tensor_group,
+            assignment,
+            expert_group,
+            statistics,
+        } => Ok(layer.forward_tensor_expert_parallel_with_operator_cache(
+            hidden,
+            mask,
+            Some(cache),
+            tensor_group,
+            assignment,
+            expert_group,
+            statistics,
+            stream,
+        )?),
+        KimiCartesianLayerExecution::External {
+            args,
+            global_layer,
+            tensor_group,
+            assignment,
+            expert_group,
+            pass,
+            cache: expert_cache,
+            statistics,
+        } => {
+            let execute = |hidden: &Array, ids: &Array, weights: &Array, stream: &Stream| {
+                execute_pipeline_cached_kimi_linear(
+                    args,
+                    *global_layer,
+                    hidden,
+                    ids,
+                    weights,
+                    *pass,
+                    expert_cache,
+                    assignment,
+                    *expert_group,
+                    statistics,
+                    stream,
+                )
+                .map_err(|error| Exception::custom(error.to_string()))
+            };
+            match tensor_group {
+                Some(group) => Ok(
+                    layer.forward_tensor_with_expert_executor_and_operator_cache(
+                        hidden,
+                        mask,
+                        Some(cache),
+                        group,
+                        stream,
+                        execute,
+                    )?,
+                ),
+                None => Ok(layer.forward_with_expert_executor_and_operator_cache(
+                    hidden,
+                    mask,
+                    Some(cache),
+                    stream,
+                    execute,
+                )?),
+            }
+        }
     }
 }
 
@@ -13131,6 +13328,7 @@ impl KimiLinearStage {
         args: kimi_linear::ModelArgs,
         range: Range<usize>,
         info: &PipelineStageInfo,
+        external_experts: bool,
         stream: &Stream,
     ) -> Result<Self, Error> {
         let layer_adapter = KimiLinearLayerwiseAdapter::new(args.clone(), stream)?;
@@ -13169,6 +13367,11 @@ impl KimiLinearStage {
             parallel_layout: None,
             parallel_cache_geometry: None,
             expert_assignment: None,
+            expert_storage: if external_experts {
+                PipelineExpertStorage::ExternalEmpty
+            } else {
+                PipelineExpertStorage::LayerLocal
+            },
             routing_statistics: RoutingStatistics::default(),
         })
     }
@@ -13328,6 +13531,7 @@ impl KimiLinearStage {
         explicit_mask: Option<&Array>,
         caches: &mut [PipelineLayerCache],
         execution: &ParallelExecutionContext<'_>,
+        expert_group: Option<&Group>,
     ) -> Result<PipelineStageOutput, Error> {
         let group = execution.group().ok_or_else(|| {
             Error::Parallel("tensor-sharded Kimi Linear stage has no TP communicator".into())
@@ -13361,6 +13565,22 @@ impl KimiLinearStage {
             .then(|| create_causal_mask(step.sequence_length, Some(offset), None, None, stream))
             .transpose()?;
         let mask = explicit_mask.or(generated_mask.as_ref());
+        let expert_assignment = self.expert_assignment.clone();
+        if let Some(assignment) = expert_assignment.as_ref() {
+            validate_pipeline_expert_dispatch(
+                assignment,
+                expert_group,
+                self.expert_storage.is_external(),
+            )?;
+        }
+        self.routing_statistics = RoutingStatistics::default();
+        let pass = if step.sequence_length > 1 {
+            ExpertPass::Prefill
+        } else {
+            ExpertPass::Decode
+        };
+        let args = self.args.clone();
+        let expert_cache = self.expert_storage.cache();
         let layer_adapter = &self.layer_adapter;
         let parallel_layout = self.parallel_layout.clone();
         hidden = execute_pipeline_layer_range(
@@ -13378,12 +13598,43 @@ impl KimiLinearStage {
                     0,
                     global_layer,
                     parallel_layout.as_ref(),
-                    None,
+                    expert_assignment.as_ref(),
                     stream,
                 )
             },
             |global_layer, layer, hidden, cache, stream| {
-                let mut mode = KimiCartesianLayerExecution::Tensor(group);
+                let mut mode = match (
+                    expert_assignment.as_ref(),
+                    self.expert_storage.is_external(),
+                    expert_cache,
+                ) {
+                    (Some(assignment), true, Some(expert_cache)) => {
+                        KimiCartesianLayerExecution::External {
+                            args: &args,
+                            global_layer,
+                            tensor_group: Some(group),
+                            assignment,
+                            expert_group,
+                            pass,
+                            cache: expert_cache,
+                            statistics: &mut self.routing_statistics,
+                        }
+                    }
+                    (Some(_), true, None) | (None, true, None) => {
+                        KimiCartesianLayerExecution::Tensor(group)
+                    }
+                    (Some(assignment), false, None) => KimiCartesianLayerExecution::TensorExpert {
+                        tensor_group: group,
+                        assignment,
+                        expert_group: expert_group
+                            .expect("validated resident Kimi Linear EP group"),
+                        statistics: &mut self.routing_statistics,
+                    },
+                    (None, false, _) => KimiCartesianLayerExecution::Tensor(group),
+                    (None, true, Some(_)) | (Some(_), false, Some(_)) => unreachable!(
+                        "Kimi Linear expert storage and assignment are internally coherent"
+                    ),
+                };
                 let forwarded = forward_kimi_cartesian_layer(
                     layer,
                     global_layer,
@@ -13428,12 +13679,13 @@ impl KimiLinearStage {
         step: PipelineStep,
         explicit_mask: Option<&Array>,
         caches: &mut [PipelineLayerCache],
-        group: &Group,
+        group: Option<&Group>,
         stream: &Stream,
     ) -> Result<PipelineStageOutput, Error> {
         let assignment = self.expert_assignment.as_ref().ok_or_else(|| {
             Error::Parallel("Kimi Linear PP+EP stage has no rank-local expert assignment".into())
         })?;
+        validate_pipeline_expert_dispatch(assignment, group, self.expert_storage.is_external())?;
         if caches.len() != self.layers.len() {
             return Err(Error::Parallel(format!(
                 "Kimi Linear PP+EP stage cache has {} entries, expected {}",
@@ -13461,6 +13713,13 @@ impl KimiLinearStage {
         self.routing_statistics = RoutingStatistics::default();
         let layer_adapter = &self.layer_adapter;
         let expert_assignment = assignment.clone();
+        let expert_cache = self.expert_storage.cache();
+        let pass = if step.sequence_length > 1 {
+            ExpertPass::Prefill
+        } else {
+            ExpertPass::Decode
+        };
+        let args = self.args.clone();
         hidden = execute_pipeline_layer_range(
             PipelineLayerExecution {
                 range: self.range.clone(),
@@ -13481,20 +13740,51 @@ impl KimiLinearStage {
                 )
             },
             |global_layer, layer, hidden, cache, stream| {
-                let mut mode = KimiCartesianLayerExecution::Expert {
-                    assignment: &expert_assignment,
-                    group,
-                    statistics: &mut self.routing_statistics,
+                let forwarded = match (self.expert_storage.is_external(), expert_cache) {
+                    (true, Some(expert_cache)) => {
+                        let mut mode = KimiCartesianLayerExecution::External {
+                            args: &args,
+                            global_layer,
+                            tensor_group: None,
+                            assignment: &expert_assignment,
+                            expert_group: group,
+                            pass,
+                            cache: expert_cache,
+                            statistics: &mut self.routing_statistics,
+                        };
+                        forward_kimi_cartesian_layer(
+                            layer,
+                            global_layer,
+                            hidden,
+                            mask,
+                            cache,
+                            &mut mode,
+                            stream,
+                        )?
+                    }
+                    (true, None) => {
+                        Self::forward_layer(layer, global_layer, hidden, mask, cache, stream)?
+                    }
+                    (false, None) => {
+                        let mut mode = KimiCartesianLayerExecution::Expert {
+                            assignment: &expert_assignment,
+                            group: group.expect("validated resident Kimi Linear EP group"),
+                            statistics: &mut self.routing_statistics,
+                        };
+                        forward_kimi_cartesian_layer(
+                            layer,
+                            global_layer,
+                            hidden,
+                            mask,
+                            cache,
+                            &mut mode,
+                            stream,
+                        )?
+                    }
+                    (false, Some(_)) => {
+                        unreachable!("resident Kimi Linear stage cannot own expert cache")
+                    }
                 };
-                let forwarded = forward_kimi_cartesian_layer(
-                    layer,
-                    global_layer,
-                    hidden,
-                    mask,
-                    cache,
-                    &mut mode,
-                    stream,
-                )?;
                 eval([&forwarded])?;
                 stream.synchronize()?;
                 Ok(forwarded)
