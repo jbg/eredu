@@ -767,6 +767,14 @@ impl Lfm2LayerwiseAdapter {
         })
     }
 
+    /// Creates an adapter whose routed expert banks are supplied by an
+    /// independent residency component rather than layer payloads.
+    pub(crate) fn new_external_experts(args: ModelArgs, stream: &Stream) -> Result<Self, Error> {
+        let mut adapter = Self::new(args, stream)?;
+        adapter.sparse_expert_cache = true;
+        Ok(adapter)
+    }
+
     /// Returns the validated model arguments.
     pub const fn args(&self) -> &ModelArgs {
         &self.args
@@ -1193,10 +1201,52 @@ impl ArchitectureAdapter for Lfm2LayerwiseAdapter {
         if layer.feed_forward.is_moe {
             let prefix = format!("model.layers.{index}.feed_forward.experts");
             layer.feed_forward.experts = Some(PackedSwiGluExperts::new(
-                i32::try_from(assignment.local_expert_count())
-                    .map_err(|_| Error::Parallel("local LFM2 expert count exceeds i32".into()))?,
+                if self.sparse_expert_cache {
+                    0
+                } else {
+                    i32::try_from(assignment.local_expert_count()).map_err(|_| {
+                        Error::Parallel("local LFM2 expert count exceeds i32".into())
+                    })?
+                },
                 self.args.hidden_size,
                 self.args.moe_intermediate_size,
+                self.args
+                    .weight_quantization_for(&format!("{prefix}.gate_up_proj")),
+                self.args
+                    .weight_quantization_for(&format!("{prefix}.down_proj")),
+                stream,
+            )?);
+        }
+        Ok(layer)
+    }
+
+    fn new_tensor_expert_parallel_layer(
+        &self,
+        group: usize,
+        index: usize,
+        layout: &crate::runtime::distributed::parallel::LocalModelLayout,
+        assignment: &crate::runtime::distributed::expert::ExpertAssignment,
+        stream: &Stream,
+    ) -> Result<Self::Layer, Error> {
+        let mut layer = self.new_parallel_layer(group, index, layout, stream)?;
+        if layer.feed_forward.is_moe {
+            let prefix = format!("model.layers.{index}.feed_forward.experts");
+            let intermediate = layer
+                .feed_forward
+                .experts
+                .as_ref()
+                .ok_or_else(|| Error::Parallel(format!("LFM2 layer {index} has no expert bank")))?
+                .intermediate_dim;
+            layer.feed_forward.experts = Some(PackedSwiGluExperts::new(
+                if self.sparse_expert_cache {
+                    0
+                } else {
+                    i32::try_from(assignment.local_expert_count()).map_err(|_| {
+                        Error::Parallel("local LFM2 expert count exceeds i32".into())
+                    })?
+                },
+                self.args.hidden_size,
+                intermediate,
                 self.args
                     .weight_quantization_for(&format!("{prefix}.gate_up_proj")),
                 self.args
@@ -1211,7 +1261,7 @@ impl ArchitectureAdapter for Lfm2LayerwiseAdapter {
         &self,
         topology: crate::runtime::distributed::topology::ParallelTopology,
     ) -> Result<Option<crate::runtime::distributed::expert::ExpertAssignment>, Error> {
-        if topology.expert_parallel_size == 1 {
+        if topology.expert_parallel_size == 1 && !self.sparse_expert_cache {
             return Ok(None);
         }
         if !self.args.has_sparse_moe_layers() {

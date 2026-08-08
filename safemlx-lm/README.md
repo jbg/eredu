@@ -949,16 +949,18 @@ placement, transfer, eviction, and active-window telemetry for either
 non-resident policy; `dense_stream_report` adds disk-stream pass and cache
 statistics only when that policy is active. `PipelineStageInfo` carries the
 same report's global rank and TP/PP/EP coordinates and stage ownership.
-Qwen3-MoE and GPT-OSS also compose all three axes in this runtime. TP
+Qwen3-MoE, GPT-OSS, and LFM2-MoE also compose all three axes in this runtime. TP
 collectives remain inside the stage and EP coordinate, routed exchange remains
 inside the stage and TP coordinate, and pipeline transport connects equal
 TP/EP coordinates.
 The triple-axis path supports arbitrary valid Cartesian degrees on native
 subgroup backends and uses topology-planned neighbor routes for stage-local
 Ring fallback collectives. Fully resident, host-layerwise, and
-dense-disk-streamed SafeTensors and canonical `qwen3moe` or type-39 `gpt-oss`
-GGUF checkpoints share the same layer recipes, cache identity, synchronized
-generation, and failure consensus.
+dense-disk-streamed SafeTensors and canonical `qwen3moe`, type-39 `gpt-oss`,
+or `lfm2moe` GGUF checkpoints share the same layer recipes, cache identity,
+synchronized generation, and failure consensus. LFM2-MoE carries its
+TP-local causal-convolution state and attention KV state through that same
+stage cache, including prompt-cache persistence and reload.
 The same independent expert cache works with PP and TP+PP when EP is inactive,
 and with PP+EP or TP+PP+EP when EP is active.
 In that geometry every stage owns all routed experts for its local layers; TP
@@ -998,7 +1000,7 @@ that complete triple-axis/cache boundary. Dense families have no EP migration.
 | DeepSeek-V3/R1 | TP, PP, EP | Pairwise | Compose MLA state, shared-expert ownership, native FP8/affine recipes, triple-axis execution, and pipeline-independent expert caching |
 | Kimi Linear | TP, PP, EP | Pairwise | Compose KDA/MLA recurrent state and shared experts with triple-axis execution and pipeline-independent expert caching |
 | LFM2 dense | TP, PP | TP+PP complete | None; EP does not apply |
-| LFM2-MoE | TP, PP, EP | Pairwise | Compose causal-convolution state and mixed dense/MoE placement with triple-axis execution and pipeline-independent expert caching |
+| LFM2-MoE | TP, PP, EP | Complete | None |
 | Nemotron-H dense | TP, PP | TP+PP complete | None; EP does not apply |
 | Nemotron-H-MoE | TP, PP, EP | Pairwise | Compose Mamba state and mixed dense/MoE placement with triple-axis execution and pipeline-independent expert caching |
 | Qwen3-Next/Qwen3.5 text dense | TP, PP | TP+PP complete | Qwen3.5 multimodal ingress remains outside the text pipeline; EP does not apply |
@@ -1017,8 +1019,9 @@ The remaining global limitations are:
 - Families marked **Pairwise** fail triple-axis or pipeline-independent expert
   cache requests during preflight, before checkpoint payload materialization.
 
-TP+PP+EP is executable for Qwen3-MoE and GPT-OSS. The Cartesian topology and
-execution contexts remain family-neutral and accept arbitrary legal axis sizes.
+TP+PP+EP is executable for Qwen3-MoE, GPT-OSS, and LFM2-MoE. The Cartesian
+topology and execution contexts remain family-neutral and accept arbitrary
+legal axis sizes.
 
 Decoder layers use balanced contiguous placement. Architectures may declare
 unsplittable dependency units; Gemma 4 uses this to keep each shared-KV
@@ -1068,7 +1071,10 @@ expert binding recipes rather than a separate pipeline implementation.
 
 LFM2 and LFM2-MoE stages accept exact SafeTensors catalogs and canonical
 `lfm2`/`lfm2moe` GGUF checkpoints. Fully resident, host-layerwise, and dense
-disk-streamed stages use the shared LFM2 binding plan. Causal-convolution histories are
+disk-streamed stages use the shared LFM2 binding plan. LFM2-MoE additionally
+composes independently resident/cached stage-local experts with PP, TP+PP,
+PP+EP, or TP+PP+EP; a dense-only stage represents external expert ownership
+without manufacturing an empty cache. Causal-convolution histories are
 materialized as descriptor-backed state slots, full-attention layers use the
 same ordinary or paged KV implementation as other decoders, and paged prompt
 publication saves both representations atomically. A stage containing only

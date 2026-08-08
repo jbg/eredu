@@ -1620,6 +1620,26 @@ impl DecoderLayer {
             LayerCache::Attention(cache) => OperatorCache::Attention(cache),
             LayerCache::Conv(cache) => OperatorCache::Convolution(cache),
         });
+        self.forward_tensor_with_operator_cache_and_expert_executor(
+            x, mask, cache, group, stream, execute,
+        )
+    }
+
+    /// Executes TP-sharded hybrid operators while delegating full-width routed
+    /// experts to a caller. The expert result is already complete for this TP
+    /// lane and therefore does not participate in the TP reduction.
+    pub(crate) fn forward_tensor_with_operator_cache_and_expert_executor<F>(
+        &mut self,
+        x: &Array,
+        mask: Option<&Array>,
+        cache: Option<OperatorCache<'_>>,
+        group: &safemlx::distributed::Group,
+        stream: &Stream,
+        execute: F,
+    ) -> Result<Array, Exception>
+    where
+        F: FnOnce(&Array, &Array, &Array, &Stream) -> Result<Array, Exception>,
+    {
         let normalized = self.operator_norm.forward(x, stream)?;
         let operator = match (self.layer_policy.operator, cache) {
             (OperatorPolicy::SelfAttention(_), Some(OperatorCache::Attention(cache))) => {
@@ -1669,6 +1689,77 @@ impl DecoderLayer {
             let partial = self.feed_forward.forward(&normalized, stream)?;
             safemlx::distributed::all_sum(&partial, group, stream)?
         };
+        hidden.add(feed_forward, stream)
+    }
+
+    /// Executes one layer whose operators and expert intermediates are TP
+    /// sharded while routed expert ownership is partitioned by EP.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn forward_tensor_expert_parallel_with_operator_cache(
+        &mut self,
+        x: &Array,
+        mask: Option<&Array>,
+        cache: Option<OperatorCache<'_>>,
+        tensor_group: &safemlx::distributed::Group,
+        assignment: &crate::architectures::distributed::expert::ExpertAssignment,
+        expert_group: &safemlx::distributed::Group,
+        statistics: &mut crate::architectures::distributed::expert::RoutingStatistics,
+        stream: &Stream,
+    ) -> Result<Array, Exception> {
+        let normalized = self.operator_norm.forward(x, stream)?;
+        let operator = match (self.layer_policy.operator, cache) {
+            (OperatorPolicy::SelfAttention(_), Some(OperatorCache::Attention(cache))) => {
+                let partial = self.self_attn.as_mut().expect("attention layer").forward(
+                    AttentionInput {
+                        x: &normalized,
+                        mask,
+                        cache: Some(cache),
+                    },
+                    stream,
+                )?;
+                safemlx::distributed::all_sum(&partial, tensor_group, stream)?
+            }
+            (OperatorPolicy::SelfAttention(_), None) => {
+                let partial = self.self_attn.as_mut().expect("attention layer").forward(
+                    AttentionInput {
+                        x: &normalized,
+                        mask,
+                        cache: None,
+                    },
+                    stream,
+                )?;
+                safemlx::distributed::all_sum(&partial, tensor_group, stream)?
+            }
+            (OperatorPolicy::CausalConvolution, Some(OperatorCache::Convolution(cache))) => self
+                .conv
+                .as_mut()
+                .expect("conv layer")
+                .forward_tensor_parallel(&normalized, Some(cache), tensor_group, stream)?,
+            (OperatorPolicy::CausalConvolution, None) => self
+                .conv
+                .as_mut()
+                .expect("conv layer")
+                .forward_tensor_parallel(&normalized, None, tensor_group, stream)?,
+            (policy, Some(_)) => {
+                return Err(Exception::custom(format!(
+                    "LFM2 tensor/expert cache kind does not match layer policy {policy:?}"
+                )))
+            }
+        };
+        let hidden = x.add(operator, stream)?;
+        let normalized = self.ffn_norm.forward(&hidden, stream)?;
+        let partial = if self.feed_forward.is_moe {
+            self.feed_forward.forward_expert_parallel(
+                &normalized,
+                assignment,
+                expert_group,
+                statistics,
+                stream,
+            )?
+        } else {
+            self.feed_forward.forward(&normalized, stream)?
+        };
+        let feed_forward = safemlx::distributed::all_sum(&partial, tensor_group, stream)?;
         hidden.add(feed_forward, stream)
     }
 }

@@ -3123,7 +3123,7 @@ fn execute_cached_inkling(
     )?)
 }
 
-fn execute_cached_lfm2(
+pub(crate) fn execute_cached_lfm2(
     args: &lfm2::ModelArgs,
     layer: usize,
     routes: &DispatchedRoutes,

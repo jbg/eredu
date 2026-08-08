@@ -984,6 +984,25 @@ struct GptOssStage {
     routing_statistics: RoutingStatistics,
 }
 
+enum PipelineExpertStorage {
+    LayerLocal,
+    ExternalEmpty,
+    External(Box<ExpertCache>),
+}
+
+impl PipelineExpertStorage {
+    const fn is_external(&self) -> bool {
+        !matches!(self, Self::LayerLocal)
+    }
+
+    fn cache(&self) -> Option<&ExpertCache> {
+        match self {
+            Self::External(cache) => Some(cache.as_ref()),
+            Self::LayerLocal | Self::ExternalEmpty => None,
+        }
+    }
+}
+
 struct Lfm2Stage {
     args: lfm2::ModelArgs,
     layer_adapter: Lfm2LayerwiseAdapter,
@@ -1000,6 +1019,7 @@ struct Lfm2Stage {
     parallel_layout: Option<crate::runtime::distributed::parallel::LocalModelLayout>,
     parallel_cache_geometry: Option<Vec<lfm2::Lfm2LayerCacheGeometry>>,
     expert_assignment: Option<ExpertAssignment>,
+    expert_storage: PipelineExpertStorage,
     routing_statistics: RoutingStatistics,
 }
 
@@ -1318,14 +1338,14 @@ struct PipelineLayerStorage {
     residency: ResidencyManager,
     controller: PipelineLayerController,
     units: Vec<OffloadUnitId>,
-    independent_experts: bool,
+    independent_expert_prefix: Option<&'static str>,
     sample_mlx_memory: bool,
     sample_process_memory: bool,
 }
 
 impl PipelineLayerStorage {
-    fn with_independent_experts(mut self) -> Self {
-        self.independent_experts = true;
+    fn with_independent_experts(mut self, parameter_prefix: &'static str) -> Self {
+        self.independent_expert_prefix = Some(parameter_prefix);
         self
     }
     fn prepare(
@@ -1498,11 +1518,11 @@ where
         if let Some(dense) = dense_layers {
             let (_host, lease) = dense.prepare(local_index, prefill)?;
             let mut layer = new_layer(global_layer, stream)?;
-            if dense.independent_experts {
+            if let Some(prefix) = dense.independent_expert_prefix {
                 crate::runtime::checkpoint::binding::populate_module_from_lease_excluding(
                     &mut layer,
                     &lease,
-                    |name| name.starts_with("mlp.experts."),
+                    |name| name.starts_with(prefix),
                 )?;
             } else {
                 populate_module_from_lease(&mut layer, &lease)?;
@@ -2716,6 +2736,10 @@ impl PipelineStageSemantics for Lfm2Stage {
         self.dense_layers.as_ref()
     }
 
+    fn expert_cache(&self) -> Option<&ExpertCache> {
+        self.expert_storage.cache()
+    }
+
     fn prompt_cache_model_identity(
         &self,
         topology: ParallelTopology,
@@ -2772,7 +2796,11 @@ impl PipelineStageSemantics for Lfm2Stage {
         cache: &mut [PipelineLayerCache],
         stream: &Stream,
     ) -> Result<PipelineStageOutput, Error> {
-        Lfm2Stage::forward(self, input, step, mask, cache, stream)
+        if self.expert_storage.is_external() {
+            self.forward_expert_parallel(input, step, mask, cache, None, stream)
+        } else {
+            Lfm2Stage::forward(self, input, step, mask, cache, stream)
+        }
     }
 
     fn forward_with_execution(
@@ -2786,11 +2814,24 @@ impl PipelineStageSemantics for Lfm2Stage {
         stream: &Stream,
     ) -> Result<PipelineStageOutput, Error> {
         if let Some(group) = expert_group {
-            return self.forward_expert_parallel(input, step, mask, cache, group, stream);
+            if let Some(execution) = execution.filter(|execution| execution.is_tensor_parallel()) {
+                return self.forward_tensor_parallel(
+                    input,
+                    step,
+                    mask,
+                    cache,
+                    execution,
+                    Some(group),
+                );
+            }
+            return self.forward_expert_parallel(input, step, mask, cache, Some(group), stream);
         }
         match execution {
             Some(execution) if execution.is_tensor_parallel() => {
-                self.forward_tensor_parallel(input, step, mask, cache, execution)
+                self.forward_tensor_parallel(input, step, mask, cache, execution, None)
+            }
+            _ if self.expert_storage.is_external() => {
+                self.forward_expert_parallel(input, step, mask, cache, None, stream)
             }
             _ => self.forward(input, step, mask, cache, stream),
         }
@@ -4627,7 +4668,7 @@ where
         residency,
         controller,
         units,
-        independent_experts: false,
+        independent_expert_prefix: None,
         sample_mlx_memory,
         sample_process_memory,
     })
@@ -4656,8 +4697,8 @@ pub fn load_pipeline_model(
 /// Nemotron-H-MoE, and Qwen3-Next/Qwen3.5-MoE PP+EP stages,
 /// support fully resident, host-layerwise, and dense-disk-streamed layers.
 /// Non-resident units compose pipeline placement with the authoritative TP
-/// semantic layout or EP assignment before residency initialization. Qwen3-MoE
-/// and GPT-OSS additionally compose an independent, stage-local expert cache
+/// semantic layout or EP assignment before residency initialization. Qwen3-MoE,
+/// GPT-OSS, and LFM2-MoE additionally compose an independent, stage-local expert cache
 /// with resident, host-layerwise, or dense-streamed non-expert parameters for
 /// PP, TP+PP, PP+EP, and TP+PP+EP. With EP inactive each stage owns all experts
 /// for its local layers and executes routes without an expert collective.
@@ -4695,11 +4736,13 @@ pub fn load_pipeline_model_with_options(
         if expert_cache.is_some()
             && !matches!(
                 architecture,
-                crate::api::GgufArchitecture::Qwen3Moe | crate::api::GgufArchitecture::GptOss
+                crate::api::GgufArchitecture::Qwen3Moe
+                    | crate::api::GgufArchitecture::GptOss
+                    | crate::api::GgufArchitecture::Lfm2Moe
             )
         {
             return Err(Error::Parallel(format!(
-                "pipeline independent expert caching has registered Qwen3-MoE and GPT-OSS semantic expert recipes; GGUF architecture {} is not yet registered and no checkpoint payload was materialized",
+                "pipeline independent expert caching has registered Qwen3-MoE, GPT-OSS, and LFM2-MoE semantic expert recipes; GGUF architecture {} is not yet registered and no checkpoint payload was materialized",
                 architecture.metadata_name()
             )));
         }
@@ -4708,11 +4751,13 @@ pub fn load_pipeline_model_with_options(
             && topology.expert_parallel_size > 1
             && !matches!(
                 architecture,
-                crate::api::GgufArchitecture::Qwen3Moe | crate::api::GgufArchitecture::GptOss
+                crate::api::GgufArchitecture::Qwen3Moe
+                    | crate::api::GgufArchitecture::GptOss
+                    | crate::api::GgufArchitecture::Lfm2Moe
             )
         {
             return Err(Error::Parallel(format!(
-                "TP+PP+EP preflight has registered Qwen3-MoE and GPT-OSS; GGUF architecture {} has no triple-axis semantic plan and no checkpoint payload was materialized",
+                "TP+PP+EP preflight has registered Qwen3-MoE, GPT-OSS, and LFM2-MoE; GGUF architecture {} has no triple-axis semantic plan and no checkpoint payload was materialized",
                 architecture.metadata_name()
             )));
         }
@@ -4935,6 +4980,7 @@ pub fn load_pipeline_model_with_options(
                     topology,
                     options.quantization,
                     dense_stream,
+                    expert_cache,
                     stream,
                     weights_stream,
                 )
@@ -5035,18 +5081,18 @@ pub fn load_pipeline_model_with_options(
     let config: serde_json::Value =
         serde_json::from_reader(std::fs::File::open(model_dir.join("config.json"))?)?;
     let model_type = config.get("model_type").and_then(serde_json::Value::as_str);
-    if expert_cache.is_some() && !matches!(model_type, Some("qwen3_moe" | "gpt_oss")) {
+    if expert_cache.is_some() && !matches!(model_type, Some("qwen3_moe" | "gpt_oss" | "lfm2_moe")) {
         return Err(Error::Parallel(format!(
-            "pipeline independent expert caching has registered Qwen3-MoE and GPT-OSS semantic expert recipes; SafeTensors model_type {model_type:?} is not yet registered and no checkpoint payload was materialized"
+            "pipeline independent expert caching has registered Qwen3-MoE, GPT-OSS, and LFM2-MoE semantic expert recipes; SafeTensors model_type {model_type:?} is not yet registered and no checkpoint payload was materialized"
         )));
     }
     if topology.tensor_parallel_size > 1
         && topology.pipeline_parallel_size > 1
         && topology.expert_parallel_size > 1
-        && !matches!(model_type, Some("qwen3_moe" | "gpt_oss"))
+        && !matches!(model_type, Some("qwen3_moe" | "gpt_oss" | "lfm2_moe"))
     {
         return Err(Error::Parallel(format!(
-            "TP+PP+EP preflight has registered Qwen3-MoE and GPT-OSS; SafeTensors model_type {:?} has no triple-axis semantic plan and no checkpoint payload was materialized",
+            "TP+PP+EP preflight has registered Qwen3-MoE, GPT-OSS, and LFM2-MoE; SafeTensors model_type {:?} has no triple-axis semantic plan and no checkpoint payload was materialized",
             model_type
         )));
     }
@@ -5229,6 +5275,7 @@ pub fn load_pipeline_model_with_options(
                 topology,
                 options.quantization,
                 dense_stream,
+                expert_cache,
                 stream,
                 weights_stream,
             )
@@ -6531,7 +6578,7 @@ fn load_dense_qwen_pipeline(
             },
         )?;
         stage.dense_layers = Some(if expert_cache_options.is_some() {
-            dense_layers.with_independent_experts()
+            dense_layers.with_independent_experts("mlp.experts.")
         } else {
             dense_layers
         });
@@ -7691,6 +7738,35 @@ fn execute_pipeline_cached_qwen3(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn execute_pipeline_cached_lfm2(
+    args: &lfm2::ModelArgs,
+    global_layer: usize,
+    hidden: &Array,
+    expert_ids: &Array,
+    weights: &Array,
+    pass: ExpertPass,
+    cache: &ExpertCache,
+    assignment: &ExpertAssignment,
+    expert_group: Option<&Group>,
+    statistics: &mut RoutingStatistics,
+    stream: &Stream,
+) -> Result<Array, Error> {
+    validate_pipeline_expert_dispatch(assignment, expert_group, true)?;
+    let execute = |routes: &crate::runtime::distributed::expert::DispatchedRoutes,
+                   stream: &Stream| {
+        super::expert::execute_cached_lfm2(args, global_layer, routes, pass, cache, stream)
+    };
+    let returned = match expert_group {
+        Some(group) => dispatch_replicated_with(
+            hidden, expert_ids, weights, assignment, group, stream, execute,
+        )?,
+        None => dispatch_local_with(hidden, expert_ids, weights, assignment, stream, execute)?,
+    };
+    statistics.accumulate(&returned.statistics);
+    Ok(returned.reduced_output)
+}
+
+#[allow(clippy::too_many_arguments)]
 fn execute_pipeline_cached_gpt_oss(
     args: &gpt_oss::ModelArgs,
     global_layer: usize,
@@ -8020,7 +8096,7 @@ fn load_gpt_oss_pipeline(
             stage.dense_layers = stage
                 .dense_layers
                 .take()
-                .map(PipelineLayerStorage::with_independent_experts);
+                .map(|storage| storage.with_independent_experts("mlp.experts."));
         }
         let layer_bytes = stage.dense_layers.as_ref().unwrap().planned_layer_bytes()?;
         info.planned_owned_parameter_bytes = static_bytes
@@ -8679,16 +8755,22 @@ impl GptOssStage {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn load_lfm2_pipeline(
     source_args: lfm2::ModelArgs,
     store: SharedWeightStore,
     topology: ParallelTopology,
     requested_quantization: Option<WeightQuantization>,
     dense_stream: Option<PipelineLayerLoadOptions>,
+    expert_cache_options: Option<ExpertCacheLoadOptions>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<PipelineModel, Error> {
-    let binding_adapter = Lfm2LayerwiseAdapter::new(source_args.clone(), stream)?;
+    let binding_adapter = if expert_cache_options.is_some() {
+        Lfm2LayerwiseAdapter::new_external_experts(source_args.clone(), stream)?
+    } else {
+        Lfm2LayerwiseAdapter::new(source_args.clone(), stream)?
+    };
     let expert_assignment = binding_adapter.expert_parallel_assignment(topology)?;
     topology.preflight(
         Some(source_args.layer_schedule.len()),
@@ -8713,6 +8795,12 @@ fn load_lfm2_pipeline(
                 .into(),
         ));
     }
+    if expert_cache_options.is_some() && quantize_on_load.is_some() {
+        return Err(Error::Quantization(
+            "load-time quantization is unsupported for independently cached LFM2 pipeline experts; use checkpoint-native packed weights"
+                .into(),
+        ));
+    }
     let mut target_args = source_args.clone();
     if let Some(quantization) = quantize_on_load {
         target_args.weight_quantization = Some(quantization);
@@ -8725,7 +8813,13 @@ fn load_lfm2_pipeline(
         ModelKind::Lfm2,
         source_args.hidden_size,
     );
-    let mut stage = Lfm2Stage::new(target_args.clone(), range, &info, stream)?;
+    let mut stage = Lfm2Stage::new(
+        target_args.clone(),
+        range,
+        &info,
+        expert_cache_options.is_some(),
+        stream,
+    )?;
     stage.expert_assignment = expert_assignment;
     if let Some(assignment) = stage.expert_assignment.as_ref() {
         info.global_expert_count = Some(assignment.global_expert_count());
@@ -8946,14 +9040,25 @@ fn load_lfm2_pipeline(
                 stage.expert_assignment.as_ref(),
                 stream,
             )?;
-            loaded.load(
-                layer,
-                store.as_ref(),
-                &bindings,
-                quantize_on_load,
-                weights_stream,
-                stream,
-            )?;
+            if expert_cache_options.is_some() {
+                loaded.load_excluding(
+                    layer,
+                    store.as_ref(),
+                    &bindings,
+                    weights_stream,
+                    stream,
+                    &|name| name.starts_with("feed_forward.experts."),
+                )?;
+            } else {
+                loaded.load(
+                    layer,
+                    store.as_ref(),
+                    &bindings,
+                    quantize_on_load,
+                    weights_stream,
+                    stream,
+                )?;
+            }
         }
     }
     let static_bytes = loaded.finish(&mut info)?;
@@ -8991,12 +9096,48 @@ fn load_lfm2_pipeline(
                 )
             },
         )?);
+        if expert_cache_options.is_some() {
+            stage.dense_layers = stage
+                .dense_layers
+                .take()
+                .map(|storage| storage.with_independent_experts("feed_forward.experts."));
+        }
         let layer_bytes = stage.dense_layers.as_ref().unwrap().planned_layer_bytes()?;
         info.planned_owned_parameter_bytes = static_bytes
             .checked_add(layer_bytes)
             .ok_or_else(|| Error::Parallel("LFM2 pipeline planned bytes overflowed".into()))?;
     } else {
         info.planned_owned_parameter_bytes = static_bytes;
+    }
+    if let Some(options) = expert_cache_options {
+        let entries = crate::architectures::lfm2::layerwise::lfm2_expert_catalog(
+            &source_args,
+            store.as_ref(),
+        )?
+        .into_iter()
+        .filter(|entry| stage.range.contains(&entry.identity().layer))
+        .filter(|entry| {
+            stage.expert_assignment.as_ref().is_none_or(|assignment| {
+                assignment.owner(entry.identity().global_expert) == Some(assignment.rank())
+            })
+        })
+        .collect::<Vec<_>>();
+        if !entries.is_empty() {
+            let cache = ExpertCache::new_shared(
+                Arc::clone(&store),
+                entries,
+                options,
+                weights_stream.clone(),
+                stream.clone(),
+            )?;
+            info.planned_owned_parameter_bytes = info
+                .planned_owned_parameter_bytes
+                .checked_add(cache.report()?.owned_bytes)
+                .ok_or_else(|| {
+                    Error::Parallel("LFM2 pipeline expert byte total overflowed".into())
+                })?;
+            stage.expert_storage = PipelineExpertStorage::External(Box::new(cache));
+        }
     }
     info.opened_checkpoint_shards = materialized_shards;
     info.checkpoint_diagnostics = Some(checkpoint_diagnostics);
@@ -9008,9 +9149,14 @@ impl Lfm2Stage {
         args: lfm2::ModelArgs,
         range: Range<usize>,
         info: &PipelineStageInfo,
+        external_experts: bool,
         stream: &Stream,
     ) -> Result<Self, Error> {
-        let layer_adapter = Lfm2LayerwiseAdapter::new(args.clone(), stream)?;
+        let layer_adapter = if external_experts {
+            Lfm2LayerwiseAdapter::new_external_experts(args.clone(), stream)?
+        } else {
+            Lfm2LayerwiseAdapter::new(args.clone(), stream)?
+        };
         let complete = lfm2::Model::new(args.clone(), stream)?;
         let lfm2::Model { model, lm_head, .. } = complete;
         let lfm2::Lfm2Model {
@@ -9046,6 +9192,11 @@ impl Lfm2Stage {
             parallel_layout: None,
             parallel_cache_geometry: None,
             expert_assignment: None,
+            expert_storage: if external_experts {
+                PipelineExpertStorage::ExternalEmpty
+            } else {
+                PipelineExpertStorage::LayerLocal
+            },
             routing_statistics: RoutingStatistics::default(),
         })
     }
@@ -9251,6 +9402,175 @@ impl Lfm2Stage {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn forward_layer_tensor_expert_parallel(
+        layer: &mut lfm2::DecoderLayer,
+        global_layer: usize,
+        hidden: &Array,
+        mask: Option<&Array>,
+        cache: &mut PipelineLayerCache,
+        tensor_group: &Group,
+        assignment: &ExpertAssignment,
+        expert_group: &Group,
+        statistics: &mut RoutingStatistics,
+        stream: &Stream,
+    ) -> Result<Array, Error> {
+        let forward = |layer: &mut lfm2::DecoderLayer,
+                       cache: Option<lfm2::OperatorCache<'_>>,
+                       statistics: &mut RoutingStatistics| {
+            layer.forward_tensor_expert_parallel_with_operator_cache(
+                hidden,
+                mask,
+                cache,
+                tensor_group,
+                assignment,
+                expert_group,
+                statistics,
+                stream,
+            )
+        };
+        match cache {
+            PipelineLayerCache::KeyValue {
+                global_layer: cached,
+                cache,
+                slots,
+            } if *cached == global_layer && slots.is_empty() => {
+                let cache: &mut dyn KeyValueCache = match cache {
+                    PipelineKeyValueCache::Standard(cache) => cache,
+                    PipelineKeyValueCache::Paged(cache) => cache,
+                };
+                Ok(forward(
+                    layer,
+                    Some(lfm2::OperatorCache::Attention(cache)),
+                    statistics,
+                )?)
+            }
+            PipelineLayerCache::StateSlots {
+                global_layer: cached,
+                slots,
+            } if *cached == global_layer && slots.is_empty() => {
+                Ok(forward(layer, None, statistics)?)
+            }
+            PipelineLayerCache::StateSlots {
+                global_layer: cached,
+                slots,
+            } if *cached == global_layer
+                && slots.len() == 1
+                && slots[0].policy.role == (StateTensorRole::Convolution { slot: 0 }) =>
+            {
+                let slot = &mut slots[0];
+                let mut local = crate::nn::convolution::CausalConv1dCache {
+                    state: slot.value.take(),
+                    offset: slot.offset,
+                };
+                let output = forward(
+                    layer,
+                    Some(lfm2::OperatorCache::Convolution(&mut local)),
+                    statistics,
+                )?;
+                slot.value = local.state;
+                slot.offset = local.offset;
+                Ok(output)
+            }
+            _ => Err(Error::Parallel(format!(
+                "LFM2 TP+PP+EP cache does not match global layer {global_layer}"
+            ))),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn forward_layer_external_experts(
+        args: &lfm2::ModelArgs,
+        layer: &mut lfm2::DecoderLayer,
+        global_layer: usize,
+        hidden: &Array,
+        mask: Option<&Array>,
+        cache: &mut PipelineLayerCache,
+        tensor_group: Option<&Group>,
+        assignment: &ExpertAssignment,
+        expert_group: Option<&Group>,
+        pass: ExpertPass,
+        expert_cache: &ExpertCache,
+        statistics: &mut RoutingStatistics,
+        stream: &Stream,
+    ) -> Result<Array, Error> {
+        let forward = |layer: &mut lfm2::DecoderLayer,
+                       cache: Option<lfm2::OperatorCache<'_>>,
+                       statistics: &mut RoutingStatistics| {
+            let execute = |hidden: &Array, ids: &Array, weights: &Array, stream: &Stream| {
+                execute_pipeline_cached_lfm2(
+                    args,
+                    global_layer,
+                    hidden,
+                    ids,
+                    weights,
+                    pass,
+                    expert_cache,
+                    assignment,
+                    expert_group,
+                    statistics,
+                    stream,
+                )
+                .map_err(|error| Exception::custom(error.to_string()))
+            };
+            match tensor_group {
+                Some(group) => layer.forward_tensor_with_operator_cache_and_expert_executor(
+                    hidden, mask, cache, group, stream, execute,
+                ),
+                None => layer.forward_with_operator_cache_and_expert_executor(
+                    hidden, mask, cache, stream, execute,
+                ),
+            }
+        };
+        match cache {
+            PipelineLayerCache::KeyValue {
+                global_layer: cached,
+                cache,
+                slots,
+            } if *cached == global_layer && slots.is_empty() => {
+                let cache: &mut dyn KeyValueCache = match cache {
+                    PipelineKeyValueCache::Standard(cache) => cache,
+                    PipelineKeyValueCache::Paged(cache) => cache,
+                };
+                Ok(forward(
+                    layer,
+                    Some(lfm2::OperatorCache::Attention(cache)),
+                    statistics,
+                )?)
+            }
+            PipelineLayerCache::StateSlots {
+                global_layer: cached,
+                slots,
+            } if *cached == global_layer && slots.is_empty() => {
+                Ok(forward(layer, None, statistics)?)
+            }
+            PipelineLayerCache::StateSlots {
+                global_layer: cached,
+                slots,
+            } if *cached == global_layer
+                && slots.len() == 1
+                && slots[0].policy.role == (StateTensorRole::Convolution { slot: 0 }) =>
+            {
+                let slot = &mut slots[0];
+                let mut local = crate::nn::convolution::CausalConv1dCache {
+                    state: slot.value.take(),
+                    offset: slot.offset,
+                };
+                let output = forward(
+                    layer,
+                    Some(lfm2::OperatorCache::Convolution(&mut local)),
+                    statistics,
+                )?;
+                slot.value = local.state;
+                slot.offset = local.offset;
+                Ok(output)
+            }
+            _ => Err(Error::Parallel(format!(
+                "LFM2 pipeline external-expert cache does not match global layer {global_layer}"
+            ))),
+        }
+    }
+
     fn forward(
         &mut self,
         input: PipelineStageInput<'_>,
@@ -9328,6 +9648,7 @@ impl Lfm2Stage {
         explicit_mask: Option<&Array>,
         caches: &mut [PipelineLayerCache],
         execution: &ParallelExecutionContext<'_>,
+        expert_group: Option<&Group>,
     ) -> Result<PipelineStageOutput, Error> {
         let group = execution.group().ok_or_else(|| {
             Error::Parallel("tensor-sharded LFM2 pipeline stage has no TP communicator".into())
@@ -9359,6 +9680,22 @@ impl Lfm2Stage {
             .then(|| create_causal_mask(step.sequence_length, Some(offset), None, None, stream))
             .transpose()?;
         let mask = explicit_mask.or(generated_mask.as_ref());
+        let expert_assignment = self.expert_assignment.clone();
+        if let Some(assignment) = expert_assignment.as_ref() {
+            validate_pipeline_expert_dispatch(
+                assignment,
+                expert_group,
+                self.expert_storage.is_external(),
+            )?;
+        }
+        self.routing_statistics = RoutingStatistics::default();
+        let pass = if step.sequence_length > 1 {
+            ExpertPass::Prefill
+        } else {
+            ExpertPass::Decode
+        };
+        let args = self.args.clone();
+        let expert_cache = self.expert_storage.cache();
         let layer_adapter = &self.layer_adapter;
         let parallel_layout = self.parallel_layout.clone();
         hidden = execute_pipeline_layer_range(
@@ -9376,20 +9713,69 @@ impl Lfm2Stage {
                     0,
                     global_layer,
                     parallel_layout.as_ref(),
-                    None,
+                    expert_assignment.as_ref(),
                     stream,
                 )
             },
             |global_layer, layer, hidden, cache, stream| {
-                let forwarded = Self::forward_layer_tensor_parallel(
-                    layer,
-                    global_layer,
-                    hidden,
-                    mask,
-                    cache,
-                    group,
-                    stream,
-                )?;
+                let forwarded = match (
+                    expert_assignment.as_ref(),
+                    self.expert_storage.is_external(),
+                    expert_cache,
+                ) {
+                    (Some(assignment), true, Some(expert_cache)) => {
+                        Self::forward_layer_external_experts(
+                            &args,
+                            layer,
+                            global_layer,
+                            hidden,
+                            mask,
+                            cache,
+                            Some(group),
+                            assignment,
+                            expert_group,
+                            pass,
+                            expert_cache,
+                            &mut self.routing_statistics,
+                            stream,
+                        )?
+                    }
+                    (Some(_), true, None) | (None, true, None) => {
+                        Self::forward_layer_tensor_parallel(
+                            layer,
+                            global_layer,
+                            hidden,
+                            mask,
+                            cache,
+                            group,
+                            stream,
+                        )?
+                    }
+                    (Some(assignment), false, None) => Self::forward_layer_tensor_expert_parallel(
+                        layer,
+                        global_layer,
+                        hidden,
+                        mask,
+                        cache,
+                        group,
+                        assignment,
+                        expert_group.expect("validated resident LFM2 EP group"),
+                        &mut self.routing_statistics,
+                        stream,
+                    )?,
+                    (None, false, _) => Self::forward_layer_tensor_parallel(
+                        layer,
+                        global_layer,
+                        hidden,
+                        mask,
+                        cache,
+                        group,
+                        stream,
+                    )?,
+                    (None, true, Some(_)) | (Some(_), false, Some(_)) => {
+                        unreachable!("LFM2 expert storage and assignment are internally coherent")
+                    }
+                };
                 eval([&forwarded])?;
                 stream.synchronize()?;
                 Ok(forwarded)
@@ -9423,12 +9809,13 @@ impl Lfm2Stage {
         step: PipelineStep,
         explicit_mask: Option<&Array>,
         caches: &mut [PipelineLayerCache],
-        group: &Group,
+        group: Option<&Group>,
         stream: &Stream,
     ) -> Result<PipelineStageOutput, Error> {
         let assignment = self.expert_assignment.as_ref().ok_or_else(|| {
             Error::Parallel("LFM2 PP+EP stage has no rank-local expert assignment".into())
         })?;
+        validate_pipeline_expert_dispatch(assignment, group, self.expert_storage.is_external())?;
         if caches.len() != self.layers.len() {
             return Err(Error::Parallel(format!(
                 "LFM2 PP+EP stage cache has {} entries, expected {}",
@@ -9456,6 +9843,13 @@ impl Lfm2Stage {
         self.routing_statistics = RoutingStatistics::default();
         let layer_adapter = &self.layer_adapter;
         let expert_assignment = assignment.clone();
+        let expert_cache = self.expert_storage.cache();
+        let pass = if step.sequence_length > 1 {
+            ExpertPass::Prefill
+        } else {
+            ExpertPass::Decode
+        };
+        let args = self.args.clone();
         hidden = execute_pipeline_layer_range(
             PipelineLayerExecution {
                 range: self.range.clone(),
@@ -9476,17 +9870,38 @@ impl Lfm2Stage {
                 )
             },
             |global_layer, layer, hidden, cache, stream| {
-                let forwarded = Self::forward_layer_expert_parallel(
-                    layer,
-                    global_layer,
-                    hidden,
-                    mask,
-                    cache,
-                    &expert_assignment,
-                    group,
-                    &mut self.routing_statistics,
-                    stream,
-                )?;
+                let forwarded = match (self.expert_storage.is_external(), expert_cache) {
+                    (true, Some(expert_cache)) => Self::forward_layer_external_experts(
+                        &args,
+                        layer,
+                        global_layer,
+                        hidden,
+                        mask,
+                        cache,
+                        None,
+                        &expert_assignment,
+                        group,
+                        pass,
+                        expert_cache,
+                        &mut self.routing_statistics,
+                        stream,
+                    )?,
+                    (true, None) => {
+                        Self::forward_layer(layer, global_layer, hidden, mask, cache, stream)?
+                    }
+                    (false, None) => Self::forward_layer_expert_parallel(
+                        layer,
+                        global_layer,
+                        hidden,
+                        mask,
+                        cache,
+                        &expert_assignment,
+                        group.expect("validated resident LFM2 EP group"),
+                        &mut self.routing_statistics,
+                        stream,
+                    )?,
+                    (false, Some(_)) => unreachable!("resident LFM2 stage cannot own expert cache"),
+                };
                 eval([&forwarded])?;
                 stream.synchronize()?;
                 Ok(forwarded)
@@ -14730,6 +15145,11 @@ mod tests {
             .unwrap()
     }
 
+    fn tp_pp_ep_gpu_topology(rank: usize) -> ParallelTopology {
+        ParallelTopology::from_rank(8, rank, 2, 2, 2, DeviceAssignment::new(DeviceType::Gpu, 0))
+            .unwrap()
+    }
+
     fn initialize_parameters(module: &mut impl ModuleParameters, stream: &Stream) {
         for (name, parameter) in module.parameters_mut().flatten() {
             let shape = parameter.shape().to_vec();
@@ -16333,6 +16753,59 @@ mod tests {
     }
 
     #[test]
+    fn lfm2_moe_triple_axis_preflight_composes_resident_and_cached_ownership() {
+        let gpu = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
+        let cpu = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        let stream = gpu.stream();
+        let config = lfm2_config(true);
+        let args = lfm2::model_args_from_config_value(&config).unwrap();
+        let mut source = lfm2::Model::new(args, stream).unwrap();
+        initialize_parameters(&mut source, stream);
+        let fixture = tempfile::tempdir().unwrap();
+        write_parameter_fixture(fixture.path(), &config, &source);
+
+        for rank in 0..8 {
+            let topology = tp_pp_ep_gpu_topology(rank);
+            for residency in [
+                WeightResidency::fully_resident(),
+                WeightResidency::with_expert_cache(
+                    crate::NonExpertWeightResidency::DenseDiskStream(dense_stream_options()),
+                    crate::runtime::residency::expert_cache::ExpertCacheLoadOptions::default(),
+                ),
+            ] {
+                let loaded = load_pipeline_model_with_options(
+                    fixture.path(),
+                    ModelLoadOptions::with_parallel(topology).with_weight_residency(residency),
+                    stream,
+                    cpu.stream(),
+                )
+                .unwrap();
+                let info = loaded.stage_info();
+                assert_eq!(info.topology, topology);
+                assert_eq!(
+                    info.global_layer_range,
+                    topology.pipeline_parallel_rank..topology.pipeline_parallel_rank + 1
+                );
+                let expected_experts = if topology.pipeline_parallel_rank == 1 {
+                    vec![topology.expert_parallel_rank]
+                } else {
+                    Vec::new()
+                };
+                assert_eq!(info.local_expert_ids, expected_experts);
+                assert_eq!(loaded.prompt_cache_layer_layout().unwrap().len(), 1);
+                if residency.expert_cache().is_some() {
+                    let report = loaded.expert_cache_report().unwrap();
+                    assert_eq!(report.is_some(), !expected_experts.is_empty());
+                    if let Some(report) = report {
+                        assert_eq!(report.owned_experts, expected_experts.len());
+                    }
+                    assert!(loaded.dense_stream_report().unwrap().is_some());
+                }
+            }
+        }
+    }
+
+    #[test]
     fn qwen3_moe_gguf_pp_ep_streams_only_stage_local_experts() {
         let gpu = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
         let cpu = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
@@ -16968,6 +17441,29 @@ mod tests {
                 let diagnostics = loaded.checkpoint_diagnostics().unwrap().unwrap();
                 assert!(diagnostics.physical_reads > 0);
             }
+        }
+
+        for rank in 0..8 {
+            let topology = tp_pp_ep_gpu_topology(rank);
+            let loaded = load_pipeline_model_with_options(
+                moe.path(),
+                ModelLoadOptions::with_parallel(topology).with_weight_residency(
+                    WeightResidency::with_expert_cache(
+                        crate::NonExpertWeightResidency::DenseDiskStream(dense_stream_options()),
+                        crate::runtime::residency::expert_cache::ExpertCacheLoadOptions::default(),
+                    ),
+                ),
+                stream,
+                cpu.stream(),
+            )
+            .unwrap();
+            assert_eq!(loaded.stage_info().topology, topology);
+            assert!(loaded.dense_stream_report().unwrap().is_some());
+            let report = loaded.expert_cache_report().unwrap();
+            assert_eq!(
+                report.as_ref().map(|report| report.owned_experts),
+                (topology.pipeline_parallel_rank == 1).then_some(1)
+            );
         }
     }
 

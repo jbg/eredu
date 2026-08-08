@@ -69,6 +69,7 @@ enum FixtureFamily {
     GptOssGguf,
     Lfm2,
     Lfm2Moe,
+    Lfm2MoeGguf,
     KimiLinear,
     KimiLinearGguf,
     NemotronH,
@@ -95,6 +96,7 @@ impl FixtureFamily {
             Self::GptOssGguf => "gpt-oss-gguf",
             Self::Lfm2 => "lfm2",
             Self::Lfm2Moe => "lfm2-moe",
+            Self::Lfm2MoeGguf => "lfm2-moe-gguf",
             Self::KimiLinear => "kimi-linear",
             Self::KimiLinearGguf => "kimi-linear-gguf",
             Self::NemotronH => "nemotron-h",
@@ -121,6 +123,7 @@ impl FixtureFamily {
             Self::GptOssGguf,
             Self::Lfm2,
             Self::Lfm2Moe,
+            Self::Lfm2MoeGguf,
             Self::KimiLinear,
             Self::KimiLinearGguf,
             Self::NemotronH,
@@ -151,6 +154,7 @@ impl FixtureFamily {
             | Self::GptOssGguf
             | Self::Lfm2
             | Self::Lfm2Moe
+            | Self::Lfm2MoeGguf
             | Self::KimiLinear
             | Self::KimiLinearGguf
             | Self::Qwen3Next
@@ -184,7 +188,7 @@ impl FixtureFamily {
             Self::Qwen3Moe | Self::Qwen3MoeTied | Self::Qwen3MoeGguf => ("dense_qwen", "qwen3_moe"),
             Self::GptOss | Self::GptOssGguf => ("gpt_oss", "gpt_oss"),
             Self::Lfm2 => ("lfm2", "lfm2"),
-            Self::Lfm2Moe => ("lfm2", "lfm2_moe"),
+            Self::Lfm2Moe | Self::Lfm2MoeGguf => ("lfm2", "lfm2_moe"),
             Self::KimiLinear | Self::KimiLinearGguf => ("kimi_linear", "kimi_linear"),
             Self::NemotronH => ("nemotron_h", "nemotron_h"),
             Self::Qwen3Next => ("qwen_hybrid", "qwen3_next"),
@@ -207,7 +211,11 @@ impl FixtureFamily {
     const fn has_gguf_source(self) -> bool {
         matches!(
             self,
-            Self::KimiLinearGguf | Self::InklingGguf | Self::Qwen3MoeGguf | Self::GptOssGguf
+            Self::KimiLinearGguf
+                | Self::InklingGguf
+                | Self::Qwen3MoeGguf
+                | Self::GptOssGguf
+                | Self::Lfm2MoeGguf
         )
     }
 
@@ -224,6 +232,7 @@ impl FixtureFamily {
                 | Self::Qwen3MoeGguf
                 | Self::GptOss
                 | Self::GptOssGguf
+                | Self::Lfm2MoeGguf
                 | Self::Qwen3NextMoe
                 | Self::Qwen35
                 | Self::Qwen35Moe
@@ -273,6 +282,7 @@ fn pipeline_ring_worker() {
                     | FixtureFamily::KimiLinear
                     | FixtureFamily::KimiLinearGguf
                     | FixtureFamily::Lfm2Moe
+                    | FixtureFamily::Lfm2MoeGguf
                     | FixtureFamily::NemotronH
                     | FixtureFamily::Qwen3NextMoe
                     | FixtureFamily::Qwen35Moe
@@ -430,13 +440,14 @@ fn pipeline_ring_worker() {
         }
     }
     if expert_cache {
-        let report = model.expert_cache_report().unwrap().unwrap();
-        assert_eq!(
-            report.owned_experts,
-            expected_range.len() * info.local_expert_ids.len()
-        );
-        assert!(report.owned_bytes > 0);
-        assert_eq!(report.device_resident_experts, 0);
+        let report = model.expert_cache_report().unwrap();
+        let expected_experts = expected_range.len() * info.local_expert_ids.len();
+        assert_eq!(report.is_some(), expected_experts > 0);
+        if let Some(report) = report {
+            assert_eq!(report.owned_experts, expected_experts);
+            assert!(report.owned_bytes > 0);
+            assert_eq!(report.device_resident_experts, 0);
+        }
     }
     if family == FixtureFamily::Llama {
         assert_eq!(
@@ -612,12 +623,13 @@ fn pipeline_ring_worker() {
         );
     }
     if expert_cache {
-        let report = model.expert_cache_report().unwrap().unwrap();
-        let requests = report.prefill.device.requests + report.decode.device.requests;
-        if requests > 0 {
-            assert!(report.device_resident_experts > 0);
-        } else {
-            assert_eq!(report.device_resident_experts, 0);
+        if let Some(report) = model.expert_cache_report().unwrap() {
+            let requests = report.prefill.device.requests + report.decode.device.requests;
+            if requests > 0 {
+                assert!(report.device_resident_experts > 0);
+            } else {
+                assert_eq!(report.device_resident_experts, 0);
+            }
         }
     }
 }
@@ -1795,6 +1807,138 @@ fn write_lfm2_pipeline_fixture(directory: &Path, moe: bool) {
     .unwrap();
 }
 
+fn write_lfm2_moe_gguf_fixture(path: &Path) {
+    let config = serde_json::json!({
+        "model_type": "lfm2_moe",
+        "architectures": ["Lfm2MoeForCausalLM"],
+        "vocab_size": 16,
+        "hidden_size": 12,
+        "intermediate_size": 17,
+        "num_hidden_layers": 2,
+        "num_attention_heads": 6,
+        "num_key_value_heads": 3,
+        "max_position_embeddings": 64,
+        "norm_eps": 0.00001,
+        "layer_types": ["conv", "full_attention"],
+        "conv_L_cache": 3,
+        "conv_bias": true,
+        "block_auto_adjust_ff_dim": false,
+        "tie_word_embeddings": false,
+        "moe_intermediate_size": 9,
+        "num_dense_layers": 1,
+        "num_experts": 2,
+        "num_experts_per_tok": 1,
+        "norm_topk_prob": true,
+        "use_expert_bias": true
+    });
+    let execution = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+    let stream = execution.stream();
+    let args = lfm2::model_args_from_config_value(&config).unwrap();
+    let mut model = lfm2::Model::new(args.clone(), stream).unwrap();
+    initialize_fixture(&mut model, stream);
+    let mut specs = Vec::new();
+    for (runtime_name, value) in model.parameters().flatten() {
+        let runtime_name = canonical_checkpoint_name(&runtime_name);
+        let layer_name = |name: &str| {
+            name.replace("model.layers.", "blk.")
+                .replace(".conv.conv.", ".shortconv.conv.")
+                .replace(".conv.in_proj.", ".shortconv.in_proj.")
+                .replace(".conv.out_proj.", ".shortconv.out_proj.")
+                .replace(".self_attn.q_layernorm.", ".attn_q_norm.")
+                .replace(".self_attn.k_layernorm.", ".attn_k_norm.")
+                .replace(".self_attn.q_proj.", ".attn_q.")
+                .replace(".self_attn.k_proj.", ".attn_k.")
+                .replace(".self_attn.v_proj.", ".attn_v.")
+                .replace(".self_attn.out_proj.", ".attn_output.")
+                .replace(".operator_norm.", ".attn_norm.")
+                .replace(".feed_forward.gate.", ".ffn_gate_inp.")
+                .replace(".feed_forward.experts.down_proj", ".ffn_down_exps.weight")
+                .replace(".feed_forward.w1.", ".ffn_gate.")
+                .replace(".feed_forward.w2.", ".ffn_down.")
+                .replace(".feed_forward.w3.", ".ffn_up.")
+        };
+        if runtime_name == "model.embed_tokens.weight" {
+            specs.push(gguf_tensor_from_array("token_embd.weight", value));
+        } else if runtime_name == "model.embedding_norm.weight" {
+            specs.push(gguf_tensor_from_array("token_embd_norm.weight", value));
+        } else if runtime_name == "lm_head.weight" {
+            specs.push(gguf_tensor_from_array("output.weight", value));
+        } else if let Some(prefix) = runtime_name.strip_suffix("feed_forward.experts.gate_up_proj")
+        {
+            let width = value.dim(1) / 2;
+            let gate = value.try_index_device((.., ..width, ..), stream).unwrap();
+            let up = value.try_index_device((.., width.., ..), stream).unwrap();
+            specs.push(gguf_tensor_from_array(
+                layer_name(&format!("{prefix}ffn_gate_exps.weight")),
+                &gate,
+            ));
+            specs.push(gguf_tensor_from_array(
+                layer_name(&format!("{prefix}ffn_up_exps.weight")),
+                &up,
+            ));
+        } else if let Some(prefix) = runtime_name.strip_suffix("feed_forward.expert_bias") {
+            specs.push(gguf_tensor_from_array(
+                layer_name(&format!("{prefix}ffn_exp_probs_b.bias")),
+                value,
+            ));
+        } else if runtime_name.ends_with(".conv.conv.weight") {
+            let reshaped = value
+                .reshape(&[value.shape()[0], value.shape()[2]], stream)
+                .unwrap();
+            specs.push(gguf_tensor_from_array(layer_name(&runtime_name), &reshaped));
+        } else {
+            specs.push(gguf_tensor_from_array(layer_name(&runtime_name), value));
+        }
+    }
+    let key = |suffix: &str| format!("lfm2moe.{suffix}");
+    let metadata = BTreeMap::from([
+        (
+            "general.architecture".into(),
+            GgufMetadataValue::String("lfm2moe".into()),
+        ),
+        ("general.file_type".into(), GgufMetadataValue::Uint32(0)),
+        (key("block_count"), GgufMetadataValue::Uint32(2)),
+        (key("embedding_length"), GgufMetadataValue::Uint32(12)),
+        (key("feed_forward_length"), GgufMetadataValue::Uint32(17)),
+        (
+            key("expert_feed_forward_length"),
+            GgufMetadataValue::Uint32(9),
+        ),
+        (
+            key("leading_dense_block_count"),
+            GgufMetadataValue::Uint32(1),
+        ),
+        (key("expert_count"), GgufMetadataValue::Uint32(2)),
+        (key("expert_used_count"), GgufMetadataValue::Uint32(1)),
+        (key("expert_weights_norm"), GgufMetadataValue::Uint32(1)),
+        (key("attention.head_count"), GgufMetadataValue::Uint32(6)),
+        (
+            key("attention.head_count_kv"),
+            GgufMetadataValue::Array(safemlx::ops::GgufMetadataArray::Uint32(vec![0, 3])),
+        ),
+        (
+            key("attention.layer_norm_rms_epsilon"),
+            GgufMetadataValue::Float32(0.00001),
+        ),
+        (key("context_length"), GgufMetadataValue::Uint32(64)),
+        (key("shortconv.l_cache"), GgufMetadataValue::Uint32(3)),
+        (key("rope.freq_base"), GgufMetadataValue::Float32(10_000.0)),
+        (key("vocab_size"), GgufMetadataValue::Uint32(16)),
+    ]);
+    let tensors = specs
+        .iter()
+        .map(|tensor| TensorInput {
+            name: &tensor.name,
+            dimensions: &tensor.dimensions,
+            ggml_type: GgmlType::F32,
+            data: &tensor.data,
+        })
+        .collect::<Vec<_>>();
+    Writer::default()
+        .write(std::fs::File::create(path).unwrap(), &metadata, &tensors)
+        .unwrap();
+}
+
 fn initialize_fixture(model: &mut impl ModuleParameters, stream: &Stream) {
     for (name, parameter) in model.parameters_mut().flatten() {
         let shape = parameter.shape().to_vec();
@@ -2939,6 +3083,71 @@ fn ring_four_process_lfm2_pipeline_expert() {
     run_ring_cartesian_pipeline(true, FixtureFamily::Lfm2Moe, "pp-ep");
 }
 
+/// Proves resident LFM2-MoE TP=2 x PP=2 x EP=2 execution, including
+/// convolution/KV state, expert ownership, persistence, and generation.
+#[test]
+#[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
+fn ring_eight_process_lfm2_moe_triple_axis() {
+    run_ring_cartesian_pipeline(false, FixtureFamily::Lfm2Moe, "tp-pp-ep");
+}
+
+/// Exercises dense-streamed non-experts and independently cached LFM2 experts
+/// across all three Cartesian axes.
+#[test]
+#[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
+fn ring_eight_process_lfm2_moe_streamed_triple_axis_expert_cache() {
+    run_ring_cartesian_pipeline_mode(
+        true,
+        FixtureFamily::Lfm2Moe,
+        "tp-pp-ep",
+        WorkerMode::ExpertCache,
+    );
+}
+
+/// Exercises host-layerwise non-experts and independently cached LFM2 experts
+/// across all three Cartesian axes.
+#[test]
+#[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
+fn ring_eight_process_lfm2_moe_layerwise_host_triple_axis_expert_cache() {
+    run_ring_layerwise_host_cartesian_pipeline_mode(
+        FixtureFamily::Lfm2Moe,
+        "tp-pp-ep",
+        WorkerMode::ExpertCache,
+    );
+}
+
+/// Exercises representative LFM2-MoE GGUF bindings, bounded non-expert reads,
+/// and independent expert caching across all three axes.
+#[test]
+#[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
+fn ring_eight_process_lfm2_moe_gguf_triple_axis_expert_cache() {
+    run_ring_cartesian_pipeline_mode(
+        true,
+        FixtureFamily::Lfm2MoeGguf,
+        "tp-pp-ep",
+        WorkerMode::ExpertCache,
+    );
+}
+
+/// Covers independent LFM2 expert caching when PP is active without EP.
+#[test]
+#[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
+fn ring_two_process_lfm2_moe_pipeline_expert_cache() {
+    run_ring_pipeline_mode(false, FixtureFamily::Lfm2Moe, WorkerMode::ExpertCache);
+}
+
+/// Verifies failure consensus remains deadlock-free with LFM2 cached experts.
+#[test]
+#[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
+fn ring_four_process_lfm2_moe_pipeline_expert_cache_mismatch_consensus() {
+    run_ring_cartesian_pipeline_mode(
+        false,
+        FixtureFamily::Lfm2Moe,
+        "pp-ep",
+        WorkerMode::ExpertCacheScheduleMismatch,
+    );
+}
+
 /// Verifies Kimi's KDA and compressed-latent stages against resident prefill
 /// and decode while keeping each rank's layer reads bounded.
 #[test]
@@ -3278,6 +3487,10 @@ fn run_ring_cartesian_pipeline_mode(
         let path = checkpoint.path().join("model.gguf");
         write_gpt_oss_gguf_fixture(&path);
         path
+    } else if family == FixtureFamily::Lfm2MoeGguf {
+        let path = checkpoint.path().join("model.gguf");
+        write_lfm2_moe_gguf_fixture(&path);
+        path
     } else if family == FixtureFamily::KimiLinearGguf {
         let path = checkpoint.path().join("model.gguf");
         write_kimi_linear_gguf_fixture(&path);
@@ -3337,6 +3550,7 @@ fn run_ring_layerwise_host_cartesian_pipeline_mode(
             FixtureFamily::Qwen3 => write_qwen_fixture(checkpoint.path(), "qwen3"),
             FixtureFamily::Qwen3Moe => write_qwen_fixture(checkpoint.path(), "qwen3_moe"),
             FixtureFamily::GptOss => write_gpt_oss_fixture(checkpoint.path()),
+            FixtureFamily::Lfm2Moe => write_lfm2_pipeline_fixture(checkpoint.path(), true),
             _ => panic!("host-layerwise Cartesian helper received unsupported {family:?}"),
         }
         checkpoint.path().to_path_buf()
@@ -3388,6 +3602,10 @@ fn run_ring_pipeline_mode(dense_stream: bool, family: FixtureFamily, mode: Worke
         let path = checkpoint.path().join("model.gguf");
         write_gpt_oss_gguf_fixture(&path);
         path
+    } else if family == FixtureFamily::Lfm2MoeGguf {
+        let path = checkpoint.path().join("model.gguf");
+        write_lfm2_moe_gguf_fixture(&path);
+        path
     } else if family == FixtureFamily::KimiLinearGguf {
         let path = checkpoint.path().join("model.gguf");
         write_kimi_linear_gguf_fixture(&path);
@@ -3423,6 +3641,7 @@ fn run_ring_pipeline_mode(dense_stream: bool, family: FixtureFamily, mode: Worke
             FixtureFamily::Inkling => write_inkling_fixture(checkpoint.path()),
             FixtureFamily::Qwen3MoeGguf
             | FixtureFamily::GptOssGguf
+            | FixtureFamily::Lfm2MoeGguf
             | FixtureFamily::KimiLinearGguf
             | FixtureFamily::InklingGguf => unreachable!(),
         }
