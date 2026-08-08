@@ -1632,6 +1632,53 @@ impl TransformerBlock {
         hidden.add(feed_forward, stream)
     }
 
+    /// Executes TP-sharded MRoPE attention and EP-local routed experts.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn forward_tensor_expert_parallel_with_rotary<C: KeyValueCache>(
+        &mut self,
+        hidden: &Array,
+        mask: Option<&Array>,
+        cache: Option<&mut C>,
+        cos: &Array,
+        sin: &Array,
+        assignment: &crate::architectures::distributed::expert::ExpertAssignment,
+        tensor_group: &safemlx::distributed::Group,
+        expert_group: &safemlx::distributed::Group,
+        statistics: &mut crate::architectures::distributed::expert::RoutingStatistics,
+        stream: &Stream,
+    ) -> Result<Array, Exception> {
+        let normalized = self.input_layernorm.forward(hidden, stream)?;
+        let attention = self
+            .self_attn
+            .forward_with_rotary_embeddings_tensor_parallel(
+                AttentionInput {
+                    x: &normalized,
+                    mask,
+                    cache,
+                },
+                cos,
+                sin,
+                tensor_group,
+                stream,
+            )?;
+        let hidden = hidden.add(attention, stream)?;
+        let normalized = self.post_attention_layernorm.forward(&hidden, stream)?;
+        let FeedForward::Moe(moe) = &mut self.mlp else {
+            return Err(Exception::custom(
+                "tensor+expert MRoPE execution requires a Qwen3-MoE layer",
+            ));
+        };
+        let feed_forward = moe.forward_tensor_expert_parallel(
+            &normalized,
+            assignment,
+            tensor_group,
+            expert_group,
+            statistics,
+            stream,
+        )?;
+        hidden.add(feed_forward, stream)
+    }
+
     pub(crate) fn forward_with_rotary_embeddings_tensor_parallel<C>(
         &mut self,
         input: AttentionInput<'_, C>,

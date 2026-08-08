@@ -964,6 +964,7 @@ struct Qwen3VlStage {
     parallel_output_embedding: Option<crate::nn::parallel::VocabParallelEmbedding>,
     parallel_layout: Option<crate::runtime::distributed::parallel::LocalModelLayout>,
     expert_assignment: Option<ExpertAssignment>,
+    expert_storage: PipelineExpertStorage,
     routing_statistics: RoutingStatistics,
 }
 
@@ -2230,6 +2231,10 @@ impl PipelineStageSemantics for Qwen3VlStage {
         self.dense_layers.as_ref()
     }
 
+    fn expert_cache(&self) -> Option<&ExpertCache> {
+        self.expert_storage.cache()
+    }
+
     fn prompt_cache_model_identity(
         &self,
         topology: ParallelTopology,
@@ -2400,9 +2405,29 @@ impl Qwen3VlStage {
         let cos = &auxiliary.tensors()[0];
         let sin = &auxiliary.tensors()[1];
         let deepstack = &auxiliary.tensors()[3..];
+        let pass = if step.sequence_length > 1 {
+            ExpertPass::Prefill
+        } else {
+            ExpertPass::Decode
+        };
         self.routing_statistics = RoutingStatistics::default();
         let layout = self.parallel_layout.clone();
         let assignment = self.expert_assignment.clone();
+        let expert_cache = self.expert_storage.cache();
+        match assignment.as_ref() {
+            Some(assignment) => validate_pipeline_expert_dispatch(
+                assignment,
+                expert_group,
+                self.expert_storage.is_external(),
+            )?,
+            None if expert_group.is_some() || self.expert_storage.is_external() => {
+                return Err(Error::Parallel(
+                    "Qwen3-VL Cartesian stage has expert execution without an ownership assignment"
+                        .into(),
+                ));
+            }
+            None => {}
+        }
         let adapter = &self.layer_adapter;
         let mut hidden = execute_pipeline_layer_range(
             PipelineLayerExecution {
@@ -2444,6 +2469,10 @@ impl Qwen3VlStage {
                         execution,
                         expert_group,
                         assignment.as_ref(),
+                        expert_cache,
+                        &self.args.text_config,
+                        layout.as_ref(),
+                        pass,
                         &mut self.routing_statistics,
                         global_layer,
                         stream,
@@ -2462,6 +2491,10 @@ impl Qwen3VlStage {
                         execution,
                         expert_group,
                         assignment.as_ref(),
+                        expert_cache,
+                        &self.args.text_config,
+                        layout.as_ref(),
+                        pass,
                         &mut self.routing_statistics,
                         global_layer,
                         stream,
@@ -2536,10 +2569,92 @@ fn qwen3_vl_forward_pipeline_block<C: KeyValueCache>(
     execution: Option<&ParallelExecutionContext<'_>>,
     expert_group: Option<&Group>,
     assignment: Option<&ExpertAssignment>,
+    expert_cache: Option<&ExpertCache>,
+    args: &dense_qwen::DecoderConfig,
+    layout: Option<&crate::runtime::distributed::parallel::LocalModelLayout>,
+    pass: ExpertPass,
     statistics: &mut RoutingStatistics,
     global_layer: usize,
     stream: &Stream,
 ) -> Result<Array, Error> {
+    let tensor_group = execution
+        .filter(|execution| execution.is_tensor_parallel())
+        .map(|execution| {
+            execution.group().ok_or_else(|| {
+                Error::Parallel("Qwen3-VL tensor-sharded stage has no TP communicator".into())
+            })
+        })
+        .transpose()?;
+    if let Some(expert_cache) = expert_cache {
+        let assignment = assignment.ok_or_else(|| {
+            Error::Parallel("cached Qwen3-VL experts have no ownership assignment".into())
+        })?;
+        let expert_args = qwen_pipeline_local_expert_args(
+            args,
+            layout,
+            global_layer,
+            "model.language_model.layers",
+        )?;
+        let execute = |hidden: &Array, ids: &Array, weights: &Array, stream: &Stream| {
+            execute_pipeline_cached_qwen3(
+                &expert_args,
+                global_layer,
+                "model.language_model.layers",
+                hidden,
+                ids,
+                weights,
+                pass,
+                expert_cache,
+                assignment,
+                expert_group,
+                tensor_group,
+                statistics,
+                stream,
+            )
+            .map_err(|error| Exception::custom(error.to_string()))
+        };
+        return match tensor_group {
+            Some(group) => Ok(block.forward_sparse_experts_with_rotary_tensor_parallel(
+                AttentionInput {
+                    x: hidden,
+                    mask,
+                    cache: Some(cache),
+                },
+                cos,
+                sin,
+                group,
+                stream,
+                execute,
+            )?),
+            None => Ok(block.forward_sparse_experts_with_rotary(
+                AttentionInput {
+                    x: hidden,
+                    mask,
+                    cache: Some(cache),
+                },
+                cos,
+                sin,
+                stream,
+                execute,
+            )?),
+        };
+    }
+    if let (Some(tensor_group), Some(assignment), Some(expert_group)) =
+        (tensor_group, assignment, expert_group)
+    {
+        return Ok(block.forward_tensor_expert_parallel_with_rotary(
+            hidden,
+            mask,
+            Some(cache),
+            cos,
+            sin,
+            assignment,
+            tensor_group,
+            expert_group,
+            statistics,
+            stream,
+        )?);
+    }
     if let Some(group) = expert_group {
         return Ok(block.forward_expert_parallel_with_rotary(
             AttentionInput {
@@ -2559,10 +2674,7 @@ fn qwen3_vl_forward_pipeline_block<C: KeyValueCache>(
             stream,
         )?);
     }
-    if let Some(execution) = execution.filter(|execution| execution.is_tensor_parallel()) {
-        let group = execution
-            .group()
-            .ok_or_else(|| Error::Parallel("Qwen3-VL TP+PP stage has no TP communicator".into()))?;
+    if let Some(group) = tensor_group {
         return Ok(block.forward_with_rotary_embeddings_tensor_parallel(
             AttentionInput {
                 x: hidden,
@@ -4797,8 +4909,9 @@ pub fn load_pipeline_model(
 /// support fully resident, host-layerwise, and dense-disk-streamed layers.
 /// Non-resident units compose pipeline placement with the authoritative TP
 /// semantic layout or EP assignment before residency initialization. Qwen3-MoE,
-/// Kimi Linear, Inkling, GPT-OSS, LFM2-MoE, Nemotron-H-MoE, and
-/// Qwen3-Next/Qwen3.5-MoE additionally compose an independent, stage-local expert cache
+/// Kimi Linear, Inkling, Qwen3-VL-MoE, GPT-OSS, LFM2-MoE, Nemotron-H-MoE,
+/// and Qwen3-Next/Qwen3.5-MoE additionally compose an independent, stage-local
+/// expert cache
 /// with resident, host-layerwise, or dense-streamed non-expert parameters for
 /// PP, TP+PP, PP+EP, and TP+PP+EP. With EP inactive each stage owns all experts
 /// for its local layers and executes routes without an expert collective.
@@ -4838,6 +4951,7 @@ pub fn load_pipeline_model_with_options(
                 architecture,
                 crate::api::GgufArchitecture::DeepSeek2
                     | crate::api::GgufArchitecture::Qwen3Moe
+                    | crate::api::GgufArchitecture::Qwen3VlMoe
                     | crate::api::GgufArchitecture::KimiLinear
                     | crate::api::GgufArchitecture::Inkling
                     | crate::api::GgufArchitecture::GptOss
@@ -4848,7 +4962,7 @@ pub fn load_pipeline_model_with_options(
             )
         {
             return Err(Error::Parallel(format!(
-                "pipeline independent expert caching has registered DeepSeek-V3/R1, Qwen3-MoE, Kimi Linear, Inkling, GPT-OSS, LFM2-MoE, Nemotron-H-MoE, Qwen3-Next-MoE, and Qwen3.5-MoE semantic expert recipes; GGUF architecture {} is not yet registered and no checkpoint payload was materialized",
+                "pipeline independent expert caching has registered DeepSeek-V3/R1, Qwen3-MoE, Qwen3-VL-MoE, Kimi Linear, Inkling, GPT-OSS, LFM2-MoE, Nemotron-H-MoE, Qwen3-Next-MoE, and Qwen3.5-MoE semantic expert recipes; GGUF architecture {} is not yet registered and no checkpoint payload was materialized",
                 architecture.metadata_name()
             )));
         }
@@ -4859,6 +4973,7 @@ pub fn load_pipeline_model_with_options(
                 architecture,
                 crate::api::GgufArchitecture::DeepSeek2
                     | crate::api::GgufArchitecture::Qwen3Moe
+                    | crate::api::GgufArchitecture::Qwen3VlMoe
                     | crate::api::GgufArchitecture::KimiLinear
                     | crate::api::GgufArchitecture::Inkling
                     | crate::api::GgufArchitecture::GptOss
@@ -4869,7 +4984,7 @@ pub fn load_pipeline_model_with_options(
             )
         {
             return Err(Error::Parallel(format!(
-                "TP+PP+EP preflight has registered DeepSeek-V3/R1, Qwen3-MoE, Kimi Linear, Inkling, GPT-OSS, LFM2-MoE, Nemotron-H-MoE, Qwen3-Next-MoE, and Qwen3.5-MoE; GGUF architecture {} has no triple-axis semantic plan and no checkpoint payload was materialized",
+                "TP+PP+EP preflight has registered DeepSeek-V3/R1, Qwen3-MoE, Qwen3-VL-MoE, Kimi Linear, Inkling, GPT-OSS, LFM2-MoE, Nemotron-H-MoE, Qwen3-Next-MoE, and Qwen3.5-MoE; GGUF architecture {} has no triple-axis semantic plan and no checkpoint payload was materialized",
                 architecture.metadata_name()
             )));
         }
@@ -5052,6 +5167,7 @@ pub fn load_pipeline_model_with_options(
                     topology,
                     options.quantization,
                     dense_stream,
+                    expert_cache,
                     stream,
                     weights_stream,
                 )
@@ -5204,6 +5320,8 @@ pub fn load_pipeline_model_with_options(
             Some(
                 "deepseek_v3"
                     | "qwen3_moe"
+                    | "qwen3_vl_moe"
+                    | "qwen3_vl_moe_text"
                     | "kimi_linear"
                     | "inkling_mm_model"
                     | "gpt_oss"
@@ -5216,7 +5334,7 @@ pub fn load_pipeline_model_with_options(
         )
     {
         return Err(Error::Parallel(format!(
-            "pipeline independent expert caching has registered DeepSeek-V3/R1, Qwen3-MoE, Kimi Linear, Inkling, GPT-OSS, LFM2-MoE, Nemotron-H-MoE, Qwen3-Next-MoE, and Qwen3.5-MoE semantic expert recipes; SafeTensors model_type {model_type:?} is not yet registered and no checkpoint payload was materialized"
+            "pipeline independent expert caching has registered DeepSeek-V3/R1, Qwen3-MoE, Qwen3-VL-MoE, Kimi Linear, Inkling, GPT-OSS, LFM2-MoE, Nemotron-H-MoE, Qwen3-Next-MoE, and Qwen3.5-MoE semantic expert recipes; SafeTensors model_type {model_type:?} is not yet registered and no checkpoint payload was materialized"
         )));
     }
     if topology.tensor_parallel_size > 1
@@ -5227,6 +5345,8 @@ pub fn load_pipeline_model_with_options(
             Some(
                 "deepseek_v3"
                     | "qwen3_moe"
+                    | "qwen3_vl_moe"
+                    | "qwen3_vl_moe_text"
                     | "kimi_linear"
                     | "inkling_mm_model"
                     | "gpt_oss"
@@ -5239,7 +5359,7 @@ pub fn load_pipeline_model_with_options(
         )
     {
         return Err(Error::Parallel(format!(
-            "TP+PP+EP preflight has registered DeepSeek-V3/R1, Qwen3-MoE, Kimi Linear, Inkling, GPT-OSS, LFM2-MoE, Nemotron-H-MoE, Qwen3-Next-MoE, and Qwen3.5-MoE; SafeTensors model_type {:?} has no triple-axis semantic plan and no checkpoint payload was materialized",
+            "TP+PP+EP preflight has registered DeepSeek-V3/R1, Qwen3-MoE, Qwen3-VL-MoE, Kimi Linear, Inkling, GPT-OSS, LFM2-MoE, Nemotron-H-MoE, Qwen3-Next-MoE, and Qwen3.5-MoE; SafeTensors model_type {:?} has no triple-axis semantic plan and no checkpoint payload was materialized",
             model_type
         )));
     }
@@ -5390,6 +5510,7 @@ pub fn load_pipeline_model_with_options(
                 topology,
                 options.quantization,
                 dense_stream,
+                expert_cache,
                 stream,
                 weights_stream,
             )
@@ -6991,16 +7112,27 @@ fn load_dense_qwen_pipeline(
     PipelineModel::from_adapter(topology, info, PipelineStage(stage))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn load_qwen3_vl_pipeline(
     source_args: qwen3_vl::ModelArgs,
     store: SharedWeightStore,
     topology: ParallelTopology,
     requested_quantization: Option<WeightQuantization>,
     dense_stream: Option<PipelineLayerLoadOptions>,
+    expert_cache_options: Option<ExpertCacheLoadOptions>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<PipelineModel, Error> {
-    let binding_adapter = Qwen3VlLayerwiseAdapter::new(source_args.clone(), stream)?;
+    if expert_cache_options.is_some() && !source_args.text_config.is_moe() {
+        return Err(Error::Parallel(
+            "pipeline independent expert caching requires a Qwen3-VL-MoE checkpoint".into(),
+        ));
+    }
+    let binding_adapter = if expert_cache_options.is_some() {
+        Qwen3VlLayerwiseAdapter::new_external_experts(source_args.clone(), stream)?
+    } else {
+        Qwen3VlLayerwiseAdapter::new(source_args.clone(), stream)?
+    };
     let expert_assignment = binding_adapter.expert_parallel_assignment(topology)?;
     topology.preflight(
         Some(source_args.text_config.num_hidden_layers as usize),
@@ -7029,6 +7161,12 @@ fn load_qwen3_vl_pipeline(
                 .into(),
         ));
     }
+    if expert_cache_options.is_some() && quantize_on_load.is_some() {
+        return Err(Error::Quantization(
+            "load-time quantization is unsupported for independently cached Qwen3-VL pipeline experts; use checkpoint-native packed expert weights"
+                .into(),
+        ));
+    }
     let mut target_args = source_args.clone();
     if let Some(quantization) = quantize_on_load {
         target_args.text_config.quantization = Some(quantization);
@@ -7047,7 +7185,13 @@ fn load_qwen3_vl_pipeline(
         kind,
         source_args.text_config.hidden_size,
     );
-    let mut stage = Qwen3VlStage::new(target_args.clone(), range, &info, stream)?;
+    let mut stage = Qwen3VlStage::new(
+        target_args.clone(),
+        range,
+        &info,
+        expert_cache_options.is_some(),
+        stream,
+    )?;
     stage.expert_assignment = expert_assignment;
     if let Some(assignment) = stage.expert_assignment.as_ref() {
         info.global_expert_count = Some(assignment.global_expert_count());
@@ -7265,14 +7409,25 @@ fn load_qwen3_vl_pipeline(
                 stage.expert_assignment.as_ref(),
                 stream,
             )?;
-            loaded.load(
-                layer,
-                store.as_ref(),
-                &bindings,
-                quantize_on_load,
-                weights_stream,
-                stream,
-            )?;
+            if expert_cache_options.is_some() {
+                loaded.load_excluding(
+                    layer,
+                    store.as_ref(),
+                    &bindings,
+                    weights_stream,
+                    stream,
+                    &|name| name.starts_with("mlp.experts."),
+                )?;
+            } else {
+                loaded.load(
+                    layer,
+                    store.as_ref(),
+                    &bindings,
+                    quantize_on_load,
+                    weights_stream,
+                    stream,
+                )?;
+            }
         }
     }
     let static_bytes = loaded.finish(&mut info)?;
@@ -7282,7 +7437,7 @@ fn load_qwen3_vl_pipeline(
         let streamed_layout = parallel_layout.clone();
         let streamed_assignment = stage.expert_assignment.clone();
         let streamed_adapter = &stage.layer_adapter;
-        stage.dense_layers = Some(build_pipeline_layer_storage(
+        let dense_layers = build_pipeline_layer_storage(
             Arc::clone(&store),
             stage.range.clone(),
             options,
@@ -7309,13 +7464,49 @@ fn load_qwen3_vl_pipeline(
                     stream,
                 )
             },
-        )?);
+        )?;
+        stage.dense_layers = Some(if expert_cache_options.is_some() {
+            dense_layers.with_independent_experts("mlp.experts.")
+        } else {
+            dense_layers
+        });
         let layer_bytes = stage.dense_layers.as_ref().unwrap().planned_layer_bytes()?;
         info.planned_owned_parameter_bytes = static_bytes
             .checked_add(layer_bytes)
             .ok_or_else(|| Error::Parallel("Qwen3-VL pipeline planned bytes overflowed".into()))?;
     } else {
         info.planned_owned_parameter_bytes = static_bytes;
+    }
+    if let Some(options) = expert_cache_options {
+        let entries = dense_qwen::layerwise::qwen3_expert_catalog_cartesian(
+            &source_args.text_config,
+            store.as_ref(),
+            "model.language_model.layers",
+            parallel_layout.as_ref(),
+        )?
+        .into_iter()
+        .filter(|entry| stage.range.contains(&entry.identity().layer))
+        .filter(|entry| {
+            stage.expert_assignment.as_ref().is_none_or(|assignment| {
+                assignment.owner(entry.identity().global_expert) == Some(assignment.rank())
+            })
+        })
+        .collect::<Vec<_>>();
+        let cache = ExpertCache::new_shared(
+            Arc::clone(&store),
+            entries,
+            options,
+            weights_stream.clone(),
+            stream.clone(),
+        )?;
+        let owned_expert_bytes = cache.report()?.owned_bytes;
+        info.planned_owned_parameter_bytes = info
+            .planned_owned_parameter_bytes
+            .checked_add(owned_expert_bytes)
+            .ok_or_else(|| {
+                Error::Parallel("Qwen3-VL pipeline expert byte total overflowed".into())
+            })?;
+        stage.expert_storage = PipelineExpertStorage::External(Box::new(cache));
     }
     info.opened_checkpoint_shards = materialized_shards;
     info.checkpoint_diagnostics = Some(checkpoint_diagnostics);
@@ -7327,6 +7518,7 @@ impl Qwen3VlStage {
         args: qwen3_vl::ModelArgs,
         range: Range<usize>,
         info: &PipelineStageInfo,
+        external_experts: bool,
         stream: &Stream,
     ) -> Result<Self, Error> {
         let output_embedding = (info.is_last && args.text_config.tie_word_embeddings)
@@ -7340,8 +7532,13 @@ impl Qwen3VlStage {
                 )
             })
             .transpose()?;
+        let layer_adapter = if external_experts {
+            Qwen3VlLayerwiseAdapter::new_external_experts(args.clone(), stream)?
+        } else {
+            Qwen3VlLayerwiseAdapter::new(args.clone(), stream)?
+        };
         Ok(Self {
-            layer_adapter: Qwen3VlLayerwiseAdapter::new(args.clone(), stream)?,
+            layer_adapter,
             args,
             range,
             vision_layers: Vec::new(),
@@ -7351,6 +7548,11 @@ impl Qwen3VlStage {
             parallel_output_embedding: None,
             parallel_layout: None,
             expert_assignment: None,
+            expert_storage: if external_experts {
+                PipelineExpertStorage::ExternalEmpty
+            } else {
+                PipelineExpertStorage::LayerLocal
+            },
             routing_statistics: RoutingStatistics::default(),
         })
     }
@@ -7647,6 +7849,7 @@ impl DenseQwenStage {
                                     &args,
                                     parallel_layout.as_ref(),
                                     global_layer,
+                                    "model.layers",
                                 )?;
                                 layer.forward_sparse_experts_tensor_parallel(
                                     AttentionInput {
@@ -7660,6 +7863,7 @@ impl DenseQwenStage {
                                         execute_pipeline_cached_qwen3(
                                             &expert_args,
                                             global_layer,
+                                            "model.layers",
                                             hidden,
                                             ids,
                                             weights,
@@ -7708,6 +7912,7 @@ impl DenseQwenStage {
                                     &args,
                                     parallel_layout.as_ref(),
                                     global_layer,
+                                    "model.layers",
                                 )?;
                                 layer.forward_sparse_experts_tensor_parallel(
                                     AttentionInput {
@@ -7721,6 +7926,7 @@ impl DenseQwenStage {
                                         execute_pipeline_cached_qwen3(
                                             &expert_args,
                                             global_layer,
+                                            "model.layers",
                                             hidden,
                                             ids,
                                             weights,
@@ -7895,6 +8101,7 @@ impl DenseQwenStage {
                                 execute_pipeline_cached_qwen3(
                                     &args,
                                     global_layer,
+                                    "model.layers",
                                     hidden,
                                     ids,
                                     weights,
@@ -7939,6 +8146,7 @@ impl DenseQwenStage {
                                 execute_pipeline_cached_qwen3(
                                     &args,
                                     global_layer,
+                                    "model.layers",
                                     hidden,
                                     ids,
                                     weights,
@@ -8008,10 +8216,11 @@ fn qwen_pipeline_local_expert_args(
     args: &dense_qwen::DecoderConfig,
     layout: Option<&crate::runtime::distributed::parallel::LocalModelLayout>,
     global_layer: usize,
+    layer_root: &str,
 ) -> Result<dense_qwen::DecoderConfig, Error> {
     let mut local = args.clone();
     if let Some(layout) = layout {
-        let name = format!("model.layers.{global_layer}.mlp.experts.gate_up_proj");
+        let name = format!("{layer_root}.{global_layer}.mlp.experts.gate_up_proj");
         let tensor = layout.tensor(&name).ok_or_else(|| {
             Error::Parallel(format!(
                 "missing TP semantic layout for cached pipeline experts at {name}"
@@ -8059,6 +8268,7 @@ fn validate_pipeline_expert_dispatch(
 fn execute_pipeline_cached_qwen3(
     args: &dense_qwen::DecoderConfig,
     global_layer: usize,
+    layer_root: &str,
     hidden: &Array,
     expert_ids: &Array,
     weights: &Array,
@@ -8076,7 +8286,7 @@ fn execute_pipeline_cached_qwen3(
         super::expert::execute_cached_qwen3_at(
             args,
             global_layer,
-            "model.layers",
+            layer_root,
             routes,
             pass,
             cache,

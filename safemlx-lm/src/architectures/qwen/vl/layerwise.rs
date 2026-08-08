@@ -900,6 +900,12 @@ impl Qwen3VlLayerwiseAdapter {
         })
     }
 
+    pub(crate) fn new_external_experts(args: ModelArgs, stream: &Stream) -> Result<Self, Error> {
+        let mut adapter = Self::new(args, stream)?;
+        adapter.sparse_expert_cache = true;
+        Ok(adapter)
+    }
+
     /// Returns parsed multimodal arguments.
     pub const fn args(&self) -> &ModelArgs {
         &self.args
@@ -1762,8 +1768,12 @@ impl ArchitectureAdapter for Qwen3VlLayerwiseAdapter {
                 "Qwen3-VL text layer {index} is not an MoE layer"
             )));
         };
-        let local_experts = i32::try_from(assignment.local_global_expert_ids().len())
-            .map_err(|_| Error::Parallel("local Qwen3-VL expert count exceeds i32".into()))?;
+        let local_experts = if self.sparse_expert_cache {
+            0
+        } else {
+            i32::try_from(assignment.local_global_expert_ids().len())
+                .map_err(|_| Error::Parallel("local Qwen3-VL expert count exceeds i32".into()))?
+        };
         let prefix = format!("model.language_model.layers.{index}.mlp.experts");
         moe.experts = QwenExperts::new(
             local_experts,
@@ -1780,11 +1790,56 @@ impl ArchitectureAdapter for Qwen3VlLayerwiseAdapter {
         Ok(layer)
     }
 
+    fn new_tensor_expert_parallel_layer(
+        &self,
+        group: usize,
+        index: usize,
+        layout: &crate::runtime::distributed::parallel::LocalModelLayout,
+        assignment: &crate::runtime::distributed::expert::ExpertAssignment,
+        stream: &Stream,
+    ) -> Result<Self::Layer, Error> {
+        if group != 1 || !self.args.text_config.is_moe() {
+            return Err(Error::Parallel(format!(
+                "Qwen3-VL combined tensor/expert construction requires an MoE text layer, got group {group}"
+            )));
+        }
+        let mut layer = self.new_parallel_layer(group, index, layout, stream)?;
+        let Qwen3VlLayer::Text(block) = &mut layer else {
+            unreachable!("validated text group")
+        };
+        let FeedForward::Moe(moe) = &mut block.mlp else {
+            return Err(Error::Parallel(format!(
+                "Qwen3-VL text layer {index} is not an MoE layer"
+            )));
+        };
+        let local_experts = if self.sparse_expert_cache {
+            0
+        } else {
+            i32::try_from(assignment.local_global_expert_ids().len())
+                .map_err(|_| Error::Parallel("local Qwen3-VL expert count exceeds i32".into()))?
+        };
+        let local_intermediate = moe.experts.intermediate_dim;
+        let prefix = format!("model.language_model.layers.{index}.mlp.experts");
+        moe.experts = QwenExperts::new(
+            local_experts,
+            self.args.text_config.hidden_size,
+            local_intermediate,
+            self.args
+                .text_config
+                .weight_quantization_for(&format!("{prefix}.gate_up_proj")),
+            self.args
+                .text_config
+                .weight_quantization_for(&format!("{prefix}.down_proj")),
+            stream,
+        )?;
+        Ok(layer)
+    }
+
     fn expert_parallel_assignment(
         &self,
         topology: crate::runtime::distributed::topology::ParallelTopology,
     ) -> Result<Option<crate::runtime::distributed::expert::ExpertAssignment>, Error> {
-        if topology.expert_parallel_size == 1 {
+        if topology.expert_parallel_size == 1 && !self.sparse_expert_cache {
             return Ok(None);
         }
         if !self.args.text_config.is_moe() {
