@@ -907,6 +907,7 @@ struct DeepSeekStage {
     parallel_lm_head: Option<crate::nn::parallel::VocabParallelLmHead>,
     parallel_layout: Option<crate::runtime::distributed::parallel::LocalModelLayout>,
     expert_assignment: Option<ExpertAssignment>,
+    expert_storage: PipelineExpertStorage,
     routing_statistics: RoutingStatistics,
 }
 
@@ -1917,6 +1918,10 @@ impl PipelineStageSemantics for DeepSeekStage {
         self.dense_layers.as_ref()
     }
 
+    fn expert_cache(&self) -> Option<&ExpertCache> {
+        self.expert_storage.cache()
+    }
+
     fn prompt_cache_model_identity(
         &self,
         topology: ParallelTopology,
@@ -1949,7 +1954,11 @@ impl PipelineStageSemantics for DeepSeekStage {
         cache: &mut [PipelineLayerCache],
         stream: &Stream,
     ) -> Result<PipelineStageOutput, Error> {
-        DeepSeekStage::forward(self, input, step, mask, cache, stream)
+        if self.expert_storage.is_external() {
+            self.forward_expert_parallel(input, step, mask, cache, None, stream)
+        } else {
+            DeepSeekStage::forward(self, input, step, mask, cache, stream)
+        }
     }
 
     fn forward_with_execution(
@@ -1963,11 +1972,24 @@ impl PipelineStageSemantics for DeepSeekStage {
         stream: &Stream,
     ) -> Result<PipelineStageOutput, Error> {
         if let Some(group) = expert_group {
-            return self.forward_expert_parallel(input, step, mask, cache, group, stream);
+            if let Some(execution) = execution.filter(|execution| execution.is_tensor_parallel()) {
+                return self.forward_tensor_parallel(
+                    input,
+                    step,
+                    mask,
+                    cache,
+                    execution,
+                    Some(group),
+                );
+            }
+            return self.forward_expert_parallel(input, step, mask, cache, Some(group), stream);
         }
         match execution {
             Some(execution) if execution.is_tensor_parallel() => {
-                self.forward_tensor_parallel(input, step, mask, cache, execution)
+                self.forward_tensor_parallel(input, step, mask, cache, execution, None)
+            }
+            _ if self.expert_storage.is_external() => {
+                self.forward_expert_parallel(input, step, mask, cache, None, stream)
             }
             _ => self.forward(input, step, mask, cache, stream),
         }
@@ -4814,7 +4836,8 @@ pub fn load_pipeline_model_with_options(
         if expert_cache.is_some()
             && !matches!(
                 architecture,
-                crate::api::GgufArchitecture::Qwen3Moe
+                crate::api::GgufArchitecture::DeepSeek2
+                    | crate::api::GgufArchitecture::Qwen3Moe
                     | crate::api::GgufArchitecture::KimiLinear
                     | crate::api::GgufArchitecture::Inkling
                     | crate::api::GgufArchitecture::GptOss
@@ -4825,7 +4848,7 @@ pub fn load_pipeline_model_with_options(
             )
         {
             return Err(Error::Parallel(format!(
-                "pipeline independent expert caching has registered Qwen3-MoE, Kimi Linear, Inkling, GPT-OSS, LFM2-MoE, Nemotron-H-MoE, Qwen3-Next-MoE, and Qwen3.5-MoE semantic expert recipes; GGUF architecture {} is not yet registered and no checkpoint payload was materialized",
+                "pipeline independent expert caching has registered DeepSeek-V3/R1, Qwen3-MoE, Kimi Linear, Inkling, GPT-OSS, LFM2-MoE, Nemotron-H-MoE, Qwen3-Next-MoE, and Qwen3.5-MoE semantic expert recipes; GGUF architecture {} is not yet registered and no checkpoint payload was materialized",
                 architecture.metadata_name()
             )));
         }
@@ -4834,7 +4857,8 @@ pub fn load_pipeline_model_with_options(
             && topology.expert_parallel_size > 1
             && !matches!(
                 architecture,
-                crate::api::GgufArchitecture::Qwen3Moe
+                crate::api::GgufArchitecture::DeepSeek2
+                    | crate::api::GgufArchitecture::Qwen3Moe
                     | crate::api::GgufArchitecture::KimiLinear
                     | crate::api::GgufArchitecture::Inkling
                     | crate::api::GgufArchitecture::GptOss
@@ -4845,7 +4869,7 @@ pub fn load_pipeline_model_with_options(
             )
         {
             return Err(Error::Parallel(format!(
-                "TP+PP+EP preflight has registered Qwen3-MoE, Kimi Linear, Inkling, GPT-OSS, LFM2-MoE, Nemotron-H-MoE, Qwen3-Next-MoE, and Qwen3.5-MoE; GGUF architecture {} has no triple-axis semantic plan and no checkpoint payload was materialized",
+                "TP+PP+EP preflight has registered DeepSeek-V3/R1, Qwen3-MoE, Kimi Linear, Inkling, GPT-OSS, LFM2-MoE, Nemotron-H-MoE, Qwen3-Next-MoE, and Qwen3.5-MoE; GGUF architecture {} has no triple-axis semantic plan and no checkpoint payload was materialized",
                 architecture.metadata_name()
             )));
         }
@@ -4953,6 +4977,7 @@ pub fn load_pipeline_model_with_options(
                     topology,
                     options.quantization,
                     dense_stream,
+                    expert_cache,
                     stream,
                     weights_stream,
                 )
@@ -5177,7 +5202,8 @@ pub fn load_pipeline_model_with_options(
         && !matches!(
             model_type,
             Some(
-                "qwen3_moe"
+                "deepseek_v3"
+                    | "qwen3_moe"
                     | "kimi_linear"
                     | "inkling_mm_model"
                     | "gpt_oss"
@@ -5190,7 +5216,7 @@ pub fn load_pipeline_model_with_options(
         )
     {
         return Err(Error::Parallel(format!(
-            "pipeline independent expert caching has registered Qwen3-MoE, Kimi Linear, Inkling, GPT-OSS, LFM2-MoE, Nemotron-H-MoE, Qwen3-Next-MoE, and Qwen3.5-MoE semantic expert recipes; SafeTensors model_type {model_type:?} is not yet registered and no checkpoint payload was materialized"
+            "pipeline independent expert caching has registered DeepSeek-V3/R1, Qwen3-MoE, Kimi Linear, Inkling, GPT-OSS, LFM2-MoE, Nemotron-H-MoE, Qwen3-Next-MoE, and Qwen3.5-MoE semantic expert recipes; SafeTensors model_type {model_type:?} is not yet registered and no checkpoint payload was materialized"
         )));
     }
     if topology.tensor_parallel_size > 1
@@ -5199,7 +5225,8 @@ pub fn load_pipeline_model_with_options(
         && !matches!(
             model_type,
             Some(
-                "qwen3_moe"
+                "deepseek_v3"
+                    | "qwen3_moe"
                     | "kimi_linear"
                     | "inkling_mm_model"
                     | "gpt_oss"
@@ -5212,7 +5239,7 @@ pub fn load_pipeline_model_with_options(
         )
     {
         return Err(Error::Parallel(format!(
-            "TP+PP+EP preflight has registered Qwen3-MoE, Kimi Linear, Inkling, GPT-OSS, LFM2-MoE, Nemotron-H-MoE, Qwen3-Next-MoE, and Qwen3.5-MoE; SafeTensors model_type {:?} has no triple-axis semantic plan and no checkpoint payload was materialized",
+            "TP+PP+EP preflight has registered DeepSeek-V3/R1, Qwen3-MoE, Kimi Linear, Inkling, GPT-OSS, LFM2-MoE, Nemotron-H-MoE, Qwen3-Next-MoE, and Qwen3.5-MoE; SafeTensors model_type {:?} has no triple-axis semantic plan and no checkpoint payload was materialized",
             model_type
         )));
     }
@@ -5309,6 +5336,7 @@ pub fn load_pipeline_model_with_options(
                 topology,
                 options.quantization,
                 dense_stream,
+                expert_cache,
                 stream,
                 weights_stream,
             )
@@ -6033,6 +6061,132 @@ impl LlamaStage {
     }
 }
 
+enum DeepSeekCartesianLayerExecution<'a> {
+    Tensor(&'a Group),
+    Expert {
+        assignment: &'a ExpertAssignment,
+        group: &'a Group,
+        statistics: &'a mut RoutingStatistics,
+    },
+    TensorExpert {
+        tensor_group: &'a Group,
+        assignment: &'a ExpertAssignment,
+        expert_group: &'a Group,
+        statistics: &'a mut RoutingStatistics,
+    },
+    External {
+        args: &'a deepseek_v3::ModelArgs,
+        global_layer: usize,
+        tensor_group: Option<&'a Group>,
+        assignment: &'a ExpertAssignment,
+        expert_group: Option<&'a Group>,
+        pass: ExpertPass,
+        cache: &'a ExpertCache,
+        statistics: &'a mut RoutingStatistics,
+    },
+}
+
+fn forward_deepseek_cartesian_layer(
+    layer: &mut deepseek_v3::DecoderLayer,
+    global_layer: usize,
+    hidden: &Array,
+    mask: Option<&Array>,
+    cache: &mut PipelineLayerCache,
+    execution: &mut DeepSeekCartesianLayerExecution<'_>,
+    stream: &Stream,
+) -> Result<Array, Error> {
+    let PipelineLayerCache::CompressedLatent {
+        global_layer: cached,
+        cache,
+        slots,
+    } = cache
+    else {
+        return Err(Error::Parallel(format!(
+            "DeepSeek Cartesian cache is not compressed-latent state at global layer {global_layer}"
+        )));
+    };
+    if *cached != global_layer || !slots.is_empty() {
+        return Err(Error::Parallel(format!(
+            "DeepSeek Cartesian cache does not match global layer {global_layer}"
+        )));
+    }
+    match execution {
+        DeepSeekCartesianLayerExecution::Tensor(group) => {
+            Ok(layer.forward_tensor_parallel(hidden, mask, Some(cache), group, stream)?)
+        }
+        DeepSeekCartesianLayerExecution::Expert {
+            assignment,
+            group,
+            statistics,
+        } => Ok(layer.forward_expert_parallel(
+            hidden,
+            mask,
+            Some(cache),
+            assignment,
+            group,
+            statistics,
+            &format!("model.layers.{global_layer}"),
+            None,
+            stream,
+        )?),
+        DeepSeekCartesianLayerExecution::TensorExpert {
+            tensor_group,
+            assignment,
+            expert_group,
+            statistics,
+        } => Ok(layer.forward_tensor_expert_parallel(
+            hidden,
+            mask,
+            Some(cache),
+            tensor_group,
+            assignment,
+            expert_group,
+            statistics,
+            stream,
+        )?),
+        DeepSeekCartesianLayerExecution::External {
+            args,
+            global_layer,
+            tensor_group,
+            assignment,
+            expert_group,
+            pass,
+            cache: expert_cache,
+            statistics,
+        } => {
+            let execute = |hidden: &Array, ids: &Array, weights: &Array, stream: &Stream| {
+                execute_pipeline_cached_deepseek(
+                    args,
+                    *global_layer,
+                    hidden,
+                    ids,
+                    weights,
+                    *pass,
+                    expert_cache,
+                    assignment,
+                    *expert_group,
+                    statistics,
+                    stream,
+                )
+                .map_err(|error| Exception::custom(error.to_string()))
+            };
+            match tensor_group {
+                Some(group) => Ok(layer.forward_tensor_with_expert_executor(
+                    hidden,
+                    mask,
+                    Some(cache),
+                    group,
+                    stream,
+                    execute,
+                )?),
+                None => {
+                    Ok(layer.forward_sparse_experts(hidden, mask, Some(cache), stream, execute)?)
+                }
+            }
+        }
+    }
+}
+
 impl DeepSeekStage {
     fn forward_tensor_parallel(
         &mut self,
@@ -6041,6 +6195,7 @@ impl DeepSeekStage {
         explicit_mask: Option<&Array>,
         caches: &mut [PipelineLayerCache],
         execution: &ParallelExecutionContext<'_>,
+        expert_group: Option<&Group>,
     ) -> Result<PipelineStageOutput, Error> {
         let group = execution.group().ok_or_else(|| {
             Error::Parallel("tensor-sharded DeepSeek pipeline stage has no TP communicator".into())
@@ -6075,6 +6230,22 @@ impl DeepSeekStage {
             .then(|| create_causal_mask(step.sequence_length, Some(offset), None, None, stream))
             .transpose()?;
         let mask = explicit_mask.or(generated_mask.as_ref());
+        let expert_assignment = self.expert_assignment.clone();
+        if let Some(assignment) = expert_assignment.as_ref() {
+            validate_pipeline_expert_dispatch(
+                assignment,
+                expert_group,
+                self.expert_storage.is_external(),
+            )?;
+        }
+        self.routing_statistics = RoutingStatistics::default();
+        let pass = if step.sequence_length > 1 {
+            ExpertPass::Prefill
+        } else {
+            ExpertPass::Decode
+        };
+        let args = self.args.clone();
+        let expert_cache = self.expert_storage.cache();
         let layer_adapter = &self.layer_adapter;
         let parallel_layout = self.parallel_layout.clone();
         hidden = execute_pipeline_layer_range(
@@ -6092,28 +6263,54 @@ impl DeepSeekStage {
                     0,
                     global_layer,
                     parallel_layout.as_ref(),
-                    None,
+                    expert_assignment.as_ref(),
                     stream,
                 )
             },
             |global_layer, layer, hidden, cache, stream| {
-                let PipelineLayerCache::CompressedLatent {
-                    global_layer: cached_layer,
-                    cache,
-                    ..
-                } = cache
-                else {
-                    return Err(Error::Parallel(format!(
-                        "DeepSeek TP+PP cache is not compressed-latent state at global layer {global_layer}"
-                    )));
+                let mut mode = match (
+                    expert_assignment.as_ref(),
+                    self.expert_storage.is_external(),
+                    expert_cache,
+                ) {
+                    (Some(assignment), true, Some(expert_cache)) => {
+                        DeepSeekCartesianLayerExecution::External {
+                            args: &args,
+                            global_layer,
+                            tensor_group: Some(group),
+                            assignment,
+                            expert_group,
+                            pass,
+                            cache: expert_cache,
+                            statistics: &mut self.routing_statistics,
+                        }
+                    }
+                    (Some(_), true, None) | (None, true, None) => {
+                        DeepSeekCartesianLayerExecution::Tensor(group)
+                    }
+                    (Some(assignment), false, None) => {
+                        DeepSeekCartesianLayerExecution::TensorExpert {
+                            tensor_group: group,
+                            assignment,
+                            expert_group: expert_group
+                                .expect("validated resident DeepSeek EP group"),
+                            statistics: &mut self.routing_statistics,
+                        }
+                    }
+                    (None, false, _) => DeepSeekCartesianLayerExecution::Tensor(group),
+                    (None, true, Some(_)) | (Some(_), false, Some(_)) => unreachable!(
+                        "DeepSeek expert storage and assignment are internally coherent"
+                    ),
                 };
-                if *cached_layer != global_layer {
-                    return Err(Error::Parallel(format!(
-                        "DeepSeek TP+PP cache does not match global layer {global_layer}"
-                    )));
-                }
-                let forwarded =
-                    layer.forward_tensor_parallel(hidden, mask, Some(cache), group, stream)?;
+                let forwarded = forward_deepseek_cartesian_layer(
+                    layer,
+                    global_layer,
+                    hidden,
+                    mask,
+                    cache,
+                    &mut mode,
+                    stream,
+                )?;
                 eval([&forwarded])?;
                 stream.synchronize()?;
                 Ok(forwarded)
@@ -6143,12 +6340,13 @@ impl DeepSeekStage {
         step: PipelineStep,
         explicit_mask: Option<&Array>,
         caches: &mut [PipelineLayerCache],
-        group: &Group,
+        group: Option<&Group>,
         stream: &Stream,
     ) -> Result<PipelineStageOutput, Error> {
         let assignment = self.expert_assignment.as_ref().ok_or_else(|| {
             Error::Parallel("DeepSeek PP+EP stage has no rank-local expert assignment".into())
         })?;
+        validate_pipeline_expert_dispatch(assignment, group, self.expert_storage.is_external())?;
         if caches.len() != self.layers.len() {
             return Err(Error::Parallel(format!(
                 "DeepSeek PP+EP stage cache has {} entries, expected {}",
@@ -6179,6 +6377,13 @@ impl DeepSeekStage {
         self.routing_statistics = RoutingStatistics::default();
         let layer_adapter = &self.layer_adapter;
         let expert_assignment = assignment.clone();
+        let expert_cache = self.expert_storage.cache();
+        let pass = if step.sequence_length > 1 {
+            ExpertPass::Prefill
+        } else {
+            ExpertPass::Decode
+        };
+        let args = self.args.clone();
         hidden = execute_pipeline_layer_range(
             PipelineLayerExecution {
                 range: self.range.clone(),
@@ -6199,32 +6404,65 @@ impl DeepSeekStage {
                 )
             },
             |global_layer, layer, hidden, cache, stream| {
-                let PipelineLayerCache::CompressedLatent {
-                    global_layer: cached_layer,
-                    cache,
-                    ..
-                } = cache
-                else {
-                    return Err(Error::Parallel(format!(
-                        "DeepSeek PP+EP cache is not compressed-latent state at global layer {global_layer}"
-                    )));
+                let forwarded = match (self.expert_storage.is_external(), expert_cache) {
+                    (true, Some(expert_cache)) => {
+                        let mut mode = DeepSeekCartesianLayerExecution::External {
+                            args: &args,
+                            global_layer,
+                            tensor_group: None,
+                            assignment: &expert_assignment,
+                            expert_group: group,
+                            pass,
+                            cache: expert_cache,
+                            statistics: &mut self.routing_statistics,
+                        };
+                        forward_deepseek_cartesian_layer(
+                            layer,
+                            global_layer,
+                            hidden,
+                            mask,
+                            cache,
+                            &mut mode,
+                            stream,
+                        )?
+                    }
+                    (true, None) => layer.forward_stage(
+                        hidden,
+                        mask,
+                        match cache {
+                            PipelineLayerCache::CompressedLatent {
+                                global_layer: cached,
+                                cache,
+                                slots,
+                            } if *cached == global_layer && slots.is_empty() => Some(cache),
+                            _ => {
+                                return Err(Error::Parallel(format!(
+                                    "DeepSeek external-expert cache does not match global layer {global_layer}"
+                                )))
+                            }
+                        },
+                        stream,
+                    )?,
+                    (false, None) => {
+                        let mut mode = DeepSeekCartesianLayerExecution::Expert {
+                            assignment: &expert_assignment,
+                            group: group.expect("validated resident DeepSeek EP group"),
+                            statistics: &mut self.routing_statistics,
+                        };
+                        forward_deepseek_cartesian_layer(
+                            layer,
+                            global_layer,
+                            hidden,
+                            mask,
+                            cache,
+                            &mut mode,
+                            stream,
+                        )?
+                    }
+                    (false, Some(_)) => {
+                        unreachable!("resident DeepSeek stage cannot own expert cache")
+                    }
                 };
-                if *cached_layer != global_layer {
-                    return Err(Error::Parallel(format!(
-                        "DeepSeek PP+EP cache does not match global layer {global_layer}"
-                    )));
-                }
-                let forwarded = layer.forward_expert_parallel(
-                    hidden,
-                    mask,
-                    Some(cache),
-                    &expert_assignment,
-                    group,
-                    &mut self.routing_statistics,
-                    &format!("model.layers.{global_layer}"),
-                    None,
-                    stream,
-                )?;
                 eval([&forwarded])?;
                 stream.synchronize()?;
                 Ok(forwarded)
@@ -7860,6 +8098,35 @@ fn execute_pipeline_cached_qwen3(
         )?),
         None => Ok(returned.reduced_output),
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_pipeline_cached_deepseek(
+    args: &deepseek_v3::ModelArgs,
+    global_layer: usize,
+    hidden: &Array,
+    expert_ids: &Array,
+    weights: &Array,
+    pass: ExpertPass,
+    cache: &ExpertCache,
+    assignment: &ExpertAssignment,
+    expert_group: Option<&Group>,
+    statistics: &mut RoutingStatistics,
+    stream: &Stream,
+) -> Result<Array, Error> {
+    validate_pipeline_expert_dispatch(assignment, expert_group, true)?;
+    let execute = |routes: &crate::runtime::distributed::expert::DispatchedRoutes,
+                   stream: &Stream| {
+        super::expert::execute_cached_deepseek(args, global_layer, routes, pass, cache, stream)
+    };
+    let returned = match expert_group {
+        Some(group) => dispatch_replicated_with(
+            hidden, expert_ids, weights, assignment, group, stream, execute,
+        )?,
+        None => dispatch_local_with(hidden, expert_ids, weights, assignment, stream, execute)?,
+    };
+    statistics.accumulate(&returned.statistics);
+    Ok(returned.reduced_output)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -15600,20 +15867,28 @@ impl GemmaStage {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn load_deepseek_pipeline(
     source_args: deepseek_v3::ModelArgs,
     store: SharedWeightStore,
     topology: ParallelTopology,
     requested_quantization: Option<WeightQuantization>,
     dense_stream: Option<PipelineLayerLoadOptions>,
+    expert_cache_options: Option<ExpertCacheLoadOptions>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<PipelineModel, Error> {
-    let binding_adapter =
+    let binding_adapter = if expert_cache_options.is_some() {
+        crate::architectures::deepseek_v3::layerwise::DeepSeekV3LayerwiseAdapter::new_external_experts(
+            source_args.clone(),
+            stream,
+        )?
+    } else {
         crate::architectures::deepseek_v3::layerwise::DeepSeekV3LayerwiseAdapter::new(
             source_args.clone(),
             stream,
-        )?;
+        )?
+    };
     let expert_assignment = binding_adapter.expert_parallel_assignment(topology)?;
     topology.preflight(
         Some(source_args.layer_schedule.len()),
@@ -15621,7 +15896,9 @@ fn load_deepseek_pipeline(
             .as_ref()
             .map(ExpertAssignment::global_expert_count),
     )?;
-    if dense_stream.is_some() && requested_quantization.is_some() {
+    if (dense_stream.is_some() || expert_cache_options.is_some())
+        && requested_quantization.is_some()
+    {
         return Err(Error::Quantization(
             "load-time quantization is unsupported for non-resident pipeline layers; use checkpoint-native packed weights"
                 .into(),
@@ -15655,7 +15932,13 @@ fn load_deepseek_pipeline(
         ModelKind::DeepSeekV3,
         source_args.hidden_size,
     );
-    let mut stage = DeepSeekStage::new(target_args.clone(), range, &info, stream)?;
+    let mut stage = DeepSeekStage::new(
+        target_args.clone(),
+        range,
+        &info,
+        expert_cache_options.is_some(),
+        stream,
+    )?;
     stage.expert_assignment = expert_assignment;
     if let Some(assignment) = stage.expert_assignment.as_ref() {
         info.global_expert_count = Some(assignment.global_expert_count());
@@ -15801,14 +16084,25 @@ fn load_deepseek_pipeline(
                 stage.expert_assignment.as_ref(),
                 stream,
             )?;
-            loaded.load(
-                layer,
-                store.as_ref(),
-                &bindings,
-                quantize_on_load,
-                weights_stream,
-                stream,
-            )?;
+            if expert_cache_options.is_some() {
+                loaded.load_excluding(
+                    layer,
+                    store.as_ref(),
+                    &bindings,
+                    weights_stream,
+                    stream,
+                    &|name| name.starts_with("mlp.experts."),
+                )?;
+            } else {
+                loaded.load(
+                    layer,
+                    store.as_ref(),
+                    &bindings,
+                    quantize_on_load,
+                    weights_stream,
+                    stream,
+                )?;
+            }
         }
     }
     let static_device_bytes = loaded.finish(&mut info)?;
@@ -15846,6 +16140,12 @@ fn load_deepseek_pipeline(
                 )
             },
         )?);
+        if expert_cache_options.is_some() {
+            stage.dense_layers = stage
+                .dense_layers
+                .take()
+                .map(|storage| storage.with_independent_experts("mlp.experts."));
+        }
         let layer_bytes = stage.dense_layers.as_ref().unwrap().planned_layer_bytes()?;
         info.planned_owned_parameter_bytes = static_device_bytes
             .checked_add(layer_bytes)
@@ -15854,6 +16154,36 @@ fn load_deepseek_pipeline(
             })?;
     } else {
         info.planned_owned_parameter_bytes = static_device_bytes;
+    }
+    if let Some(options) = expert_cache_options {
+        let entries = crate::architectures::deepseek_v3::layerwise::deepseek_expert_catalog(
+            &source_args,
+            store.as_ref(),
+        )?
+        .into_iter()
+        .filter(|entry| stage.range.contains(&entry.identity().layer))
+        .filter(|entry| {
+            stage.expert_assignment.as_ref().is_none_or(|assignment| {
+                assignment.owner(entry.identity().global_expert) == Some(assignment.rank())
+            })
+        })
+        .collect::<Vec<_>>();
+        if !entries.is_empty() {
+            let cache = ExpertCache::new_shared(
+                Arc::clone(&store),
+                entries,
+                options,
+                weights_stream.clone(),
+                stream.clone(),
+            )?;
+            info.planned_owned_parameter_bytes = info
+                .planned_owned_parameter_bytes
+                .checked_add(cache.report()?.owned_bytes)
+                .ok_or_else(|| {
+                    Error::Parallel("DeepSeek pipeline expert byte total overflowed".into())
+                })?;
+            stage.expert_storage = PipelineExpertStorage::External(Box::new(cache));
+        }
     }
     info.opened_checkpoint_shards = materialized_shards;
     info.checkpoint_diagnostics = Some(checkpoint_diagnostics);
@@ -15865,13 +16195,20 @@ impl DeepSeekStage {
         args: deepseek_v3::ModelArgs,
         range: Range<usize>,
         info: &PipelineStageInfo,
+        external_experts: bool,
         stream: &Stream,
     ) -> Result<Self, Error> {
-        let layer_adapter =
+        let layer_adapter = if external_experts {
+            crate::architectures::deepseek_v3::layerwise::DeepSeekV3LayerwiseAdapter::new_external_experts(
+                args.clone(),
+                stream,
+            )?
+        } else {
             crate::architectures::deepseek_v3::layerwise::DeepSeekV3LayerwiseAdapter::new(
                 args.clone(),
                 stream,
-            )?;
+            )?
+        };
         let embedding = info
             .is_first
             .then(|| {
@@ -15918,6 +16255,11 @@ impl DeepSeekStage {
             parallel_lm_head: None,
             parallel_layout: None,
             expert_assignment: None,
+            expert_storage: if external_experts {
+                PipelineExpertStorage::ExternalEmpty
+            } else {
+                PipelineExpertStorage::LayerLocal
+            },
             routing_statistics: RoutingStatistics::default(),
         })
     }
@@ -21140,6 +21482,7 @@ mod tests {
                 parallel_lm_head: None,
                 parallel_layout: None,
                 expert_assignment: None,
+                expert_storage: PipelineExpertStorage::LayerLocal,
                 routing_statistics: RoutingStatistics::default(),
             }),
         )
@@ -21165,6 +21508,7 @@ mod tests {
                 parallel_lm_head: None,
                 parallel_layout: None,
                 expert_assignment: None,
+                expert_storage: PipelineExpertStorage::LayerLocal,
                 routing_statistics: RoutingStatistics::default(),
             }),
         )

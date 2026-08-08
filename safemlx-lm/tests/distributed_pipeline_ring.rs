@@ -59,6 +59,7 @@ const EXPERT_CACHE: &str = "SAFEMLX_LM_PIPELINE_EXPERT_CACHE";
 enum FixtureFamily {
     Llama,
     DeepSeek,
+    DeepSeekGguf,
     Gemma,
     Qwen2,
     Qwen3,
@@ -87,6 +88,7 @@ impl FixtureFamily {
         match self {
             Self::Llama => "llama",
             Self::DeepSeek => "deepseek",
+            Self::DeepSeekGguf => "deepseek-gguf",
             Self::Gemma => "gemma",
             Self::Qwen2 => "qwen2",
             Self::Qwen3 => "qwen3",
@@ -115,6 +117,7 @@ impl FixtureFamily {
         for family in [
             Self::Llama,
             Self::DeepSeek,
+            Self::DeepSeekGguf,
             Self::Gemma,
             Self::Qwen2,
             Self::Qwen3,
@@ -148,6 +151,7 @@ impl FixtureFamily {
         match self {
             Self::Llama
             | Self::DeepSeek
+            | Self::DeepSeekGguf
             | Self::Qwen2
             | Self::Qwen3
             | Self::Qwen3Moe
@@ -183,7 +187,9 @@ impl FixtureFamily {
 
     fn expert_layer_count(self, range: std::ops::Range<usize>) -> usize {
         match self {
-            Self::KimiLinear | Self::KimiLinearGguf => range.filter(|index| *index == 1).count(),
+            Self::DeepSeek | Self::DeepSeekGguf | Self::KimiLinear | Self::KimiLinearGguf => {
+                range.filter(|index| *index == 1).count()
+            }
             Self::Inkling | Self::InklingGguf => {
                 range.filter(|index| matches!(*index, 1 | 2)).count()
             }
@@ -196,7 +202,7 @@ impl FixtureFamily {
     fn descriptor_names(self) -> (&'static str, &'static str) {
         match self {
             Self::Llama => ("llama", "llama"),
-            Self::DeepSeek => ("deepseek_v3", "deepseek_v3"),
+            Self::DeepSeek | Self::DeepSeekGguf => ("deepseek_v3", "deepseek_v3"),
             Self::Gemma => ("gemma4", "gemma4"),
             Self::Qwen2 => ("dense_qwen", "qwen2"),
             Self::Qwen3 => ("dense_qwen", "qwen3"),
@@ -226,7 +232,8 @@ impl FixtureFamily {
     const fn has_gguf_source(self) -> bool {
         matches!(
             self,
-            Self::KimiLinearGguf
+            Self::DeepSeekGguf
+                | Self::KimiLinearGguf
                 | Self::InklingGguf
                 | Self::Qwen3MoeGguf
                 | Self::GptOssGguf
@@ -239,6 +246,7 @@ impl FixtureFamily {
         matches!(
             self,
             Self::DeepSeek
+                | Self::DeepSeekGguf
                 | Self::KimiLinear
                 | Self::KimiLinearGguf
                 | Self::NemotronH
@@ -294,6 +302,7 @@ fn pipeline_ring_worker() {
             matches!(
                 family,
                 FixtureFamily::DeepSeek
+                    | FixtureFamily::DeepSeekGguf
                     | FixtureFamily::Inkling
                     | FixtureFamily::InklingGguf
                     | FixtureFamily::KimiLinear
@@ -407,7 +416,10 @@ fn pipeline_ring_worker() {
         && !family.has_gguf_source()
         && !matches!(
             family,
-            FixtureFamily::Qwen3Moe | FixtureFamily::Qwen3MoeTied | FixtureFamily::GptOss
+            FixtureFamily::DeepSeek
+                | FixtureFamily::Qwen3Moe
+                | FixtureFamily::Qwen3MoeTied
+                | FixtureFamily::GptOss
         )
     {
         for layer in 0..family.layer_count() {
@@ -1179,34 +1191,37 @@ fn write_deepseek_fixture(directory: &Path, layers: i32) {
             continue;
         };
         moe.experts.gate_proj = safemlx::module::Param::new(Some(
-            Array::zeros::<f32>(
+            Array::full::<f32>(
                 &[
                     args.n_routed_experts,
                     args.moe_intermediate_size,
                     args.hidden_size,
                 ],
+                Array::from_f32(0.01),
                 stream,
             )
             .unwrap(),
         ));
         moe.experts.up_proj = safemlx::module::Param::new(Some(
-            Array::zeros::<f32>(
+            Array::full::<f32>(
                 &[
                     args.n_routed_experts,
                     args.moe_intermediate_size,
                     args.hidden_size,
                 ],
+                Array::from_f32(0.01),
                 stream,
             )
             .unwrap(),
         ));
         moe.experts.down_proj = safemlx::module::Param::new(Some(
-            Array::zeros::<f32>(
+            Array::full::<f32>(
                 &[
                     args.n_routed_experts,
                     args.hidden_size,
                     args.moe_intermediate_size,
                 ],
+                Array::from_f32(0.01),
                 stream,
             )
             .unwrap(),
@@ -2835,6 +2850,187 @@ fn f32_gguf_tensor(
     }
 }
 
+fn deepseek_gguf_metadata() -> BTreeMap<String, GgufMetadataValue> {
+    BTreeMap::from([
+        (
+            "general.architecture".into(),
+            GgufMetadataValue::String("deepseek2".into()),
+        ),
+        ("general.file_type".into(), GgufMetadataValue::Uint32(0)),
+        ("deepseek2.block_count".into(), GgufMetadataValue::Uint32(2)),
+        (
+            "deepseek2.context_length".into(),
+            GgufMetadataValue::Uint32(64),
+        ),
+        (
+            "deepseek2.embedding_length".into(),
+            GgufMetadataValue::Uint32(12),
+        ),
+        (
+            "deepseek2.feed_forward_length".into(),
+            GgufMetadataValue::Uint32(17),
+        ),
+        (
+            "deepseek2.attention.head_count".into(),
+            GgufMetadataValue::Uint32(3),
+        ),
+        (
+            "deepseek2.attention.layer_norm_rms_epsilon".into(),
+            GgufMetadataValue::Float32(0.000001),
+        ),
+        (
+            "deepseek2.rope.freq_base".into(),
+            GgufMetadataValue::Float32(10_000.0),
+        ),
+        (
+            "deepseek2.rope.dimension_count".into(),
+            GgufMetadataValue::Uint32(2),
+        ),
+        (
+            "deepseek2.attention.q_lora_rank".into(),
+            GgufMetadataValue::Uint32(4),
+        ),
+        (
+            "deepseek2.attention.kv_lora_rank".into(),
+            GgufMetadataValue::Uint32(4),
+        ),
+        (
+            "deepseek2.attention.key_length_mla".into(),
+            GgufMetadataValue::Uint32(4),
+        ),
+        (
+            "deepseek2.attention.value_length_mla".into(),
+            GgufMetadataValue::Uint32(2),
+        ),
+        (
+            "deepseek2.leading_dense_block_count".into(),
+            GgufMetadataValue::Uint32(1),
+        ),
+        (
+            "deepseek2.expert_count".into(),
+            GgufMetadataValue::Uint32(4),
+        ),
+        (
+            "deepseek2.expert_shared_count".into(),
+            GgufMetadataValue::Uint32(1),
+        ),
+        (
+            "deepseek2.expert_feed_forward_length".into(),
+            GgufMetadataValue::Uint32(5),
+        ),
+        (
+            "deepseek2.expert_used_count".into(),
+            GgufMetadataValue::Uint32(2),
+        ),
+        (
+            "deepseek2.expert_group_count".into(),
+            GgufMetadataValue::Uint32(2),
+        ),
+        (
+            "deepseek2.expert_group_used_count".into(),
+            GgufMetadataValue::Uint32(1),
+        ),
+        (
+            "deepseek2.expert_gating_func".into(),
+            GgufMetadataValue::Uint32(2),
+        ),
+        (
+            "deepseek2.expert_weights_norm".into(),
+            GgufMetadataValue::Bool(true),
+        ),
+        (
+            "deepseek2.expert_weights_scale".into(),
+            GgufMetadataValue::Float32(1.0),
+        ),
+        ("deepseek2.vocab_size".into(), GgufMetadataValue::Uint32(13)),
+    ])
+}
+
+fn deepseek_gguf_tensors() -> Vec<GgufFixtureTensor> {
+    let tensor = |name: &str, mlx_shape: &[u64], phase: usize| {
+        let mut dimensions = mlx_shape.to_vec();
+        dimensions.reverse();
+        let elements = dimensions.iter().product::<u64>() as usize;
+        f32_gguf_tensor(name, dimensions, patterned_values(elements, 0.003, phase))
+    };
+    let norm =
+        |name: &str, width: u64| f32_gguf_tensor(name, vec![width], vec![1.0; width as usize]);
+    let mut tensors = vec![
+        tensor("token_embd.weight", &[13, 12], 1),
+        norm("output_norm.weight", 12),
+        tensor("output.weight", &[13, 12], 2),
+    ];
+    for layer in 0..2 {
+        let phase = 3 + layer * 9;
+        tensors.extend([
+            norm(&format!("blk.{layer}.attn_norm.weight"), 12),
+            norm(&format!("blk.{layer}.ffn_norm.weight"), 12),
+            tensor(&format!("blk.{layer}.attn_q_a.weight"), &[4, 12], phase),
+            norm(&format!("blk.{layer}.attn_q_a_norm.weight"), 4),
+            tensor(&format!("blk.{layer}.attn_q_b.weight"), &[12, 4], phase + 1),
+            tensor(
+                &format!("blk.{layer}.attn_kv_a_mqa.weight"),
+                &[6, 12],
+                phase + 2,
+            ),
+            norm(&format!("blk.{layer}.attn_kv_a_norm.weight"), 4),
+            tensor(
+                &format!("blk.{layer}.attn_k_b.weight"),
+                &[3, 4, 2],
+                phase + 3,
+            ),
+            tensor(
+                &format!("blk.{layer}.attn_v_b.weight"),
+                &[3, 2, 4],
+                phase + 4,
+            ),
+            tensor(
+                &format!("blk.{layer}.attn_output.weight"),
+                &[12, 6],
+                phase + 5,
+            ),
+        ]);
+    }
+    tensors.extend([
+        tensor("blk.0.ffn_gate.weight", &[17, 12], 21),
+        tensor("blk.0.ffn_up.weight", &[17, 12], 22),
+        tensor("blk.0.ffn_down.weight", &[12, 17], 23),
+        tensor("blk.1.ffn_gate_inp.weight", &[4, 12], 24),
+        f32_gguf_tensor(
+            "blk.1.exp_probs_b.bias",
+            vec![4],
+            patterned_values(4, 0.001, 25),
+        ),
+        tensor("blk.1.ffn_gate_shexp.weight", &[5, 12], 26),
+        tensor("blk.1.ffn_up_shexp.weight", &[5, 12], 27),
+        tensor("blk.1.ffn_down_shexp.weight", &[12, 5], 28),
+        tensor("blk.1.ffn_gate_exps.weight", &[4, 5, 12], 29),
+        tensor("blk.1.ffn_up_exps.weight", &[4, 5, 12], 30),
+        tensor("blk.1.ffn_down_exps.weight", &[4, 12, 5], 31),
+    ]);
+    tensors
+}
+
+fn write_deepseek_gguf_fixture(path: &Path) {
+    let tensors = deepseek_gguf_tensors();
+    let inputs = tensors
+        .iter()
+        .map(|tensor| TensorInput {
+            name: &tensor.name,
+            dimensions: &tensor.dimensions,
+            ggml_type: GgmlType::F32,
+            data: &tensor.data,
+        })
+        .collect::<Vec<_>>();
+    Writer::default()
+        .write(
+            std::fs::File::create(path).unwrap(),
+            &deepseek_gguf_metadata(),
+            &inputs,
+        )
+        .unwrap();
+}
+
 fn kimi_linear_gguf_metadata() -> BTreeMap<String, GgufMetadataValue> {
     BTreeMap::from([
         (
@@ -3084,6 +3280,90 @@ fn ring_four_process_deepseek_tensor_pipeline() {
 #[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
 fn ring_four_process_deepseek_pipeline_expert() {
     run_ring_cartesian_pipeline(true, FixtureFamily::DeepSeek, "pp-ep");
+}
+
+/// Proves resident DeepSeek TP=2 x PP=2 x EP=2 execution across compressed
+/// MLA state, TP-sharded shared projections, and EP-owned routed experts.
+#[test]
+#[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
+fn ring_eight_process_deepseek_triple_axis() {
+    run_ring_cartesian_pipeline(false, FixtureFamily::DeepSeek, "tp-pp-ep");
+}
+
+/// Keeps DeepSeek non-expert stage units resident while routed experts remain
+/// independently cached across TP, PP, and EP.
+#[test]
+#[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
+fn ring_eight_process_deepseek_resident_nonexpert_triple_axis_expert_cache() {
+    run_ring_cartesian_pipeline_mode(
+        false,
+        FixtureFamily::DeepSeek,
+        "tp-pp-ep",
+        WorkerMode::ExpertCache,
+    );
+}
+
+/// Exercises dense-streamed DeepSeek non-experts and independent expert
+/// caching across all three Cartesian axes.
+#[test]
+#[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
+fn ring_eight_process_deepseek_streamed_triple_axis_expert_cache() {
+    run_ring_cartesian_pipeline_mode(
+        true,
+        FixtureFamily::DeepSeek,
+        "tp-pp-ep",
+        WorkerMode::ExpertCache,
+    );
+}
+
+/// Exercises host-layerwise DeepSeek MLA blocks and independent expert caches
+/// across all three axes.
+#[test]
+#[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
+fn ring_eight_process_deepseek_layerwise_host_triple_axis_expert_cache() {
+    run_ring_layerwise_host_cartesian_pipeline_mode(
+        FixtureFamily::DeepSeek,
+        "tp-pp-ep",
+        WorkerMode::ExpertCache,
+    );
+}
+
+/// Covers DeepSeek2 GGUF recipes, bounded reads, and independent expert
+/// caching across TP, PP, and EP.
+#[test]
+#[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
+fn ring_eight_process_deepseek_gguf_triple_axis_expert_cache() {
+    run_ring_cartesian_pipeline_mode(
+        true,
+        FixtureFamily::DeepSeekGguf,
+        "tp-pp-ep",
+        WorkerMode::ExpertCache,
+    );
+}
+
+/// Covers independent DeepSeek expert caching for TP+PP with EP inactive.
+#[test]
+#[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
+fn ring_four_process_deepseek_tensor_pipeline_expert_cache_without_ep() {
+    run_ring_cartesian_pipeline_mode(
+        true,
+        FixtureFamily::DeepSeek,
+        "tp-pp",
+        WorkerMode::ExpertCache,
+    );
+}
+
+/// Verifies cached DeepSeek schedule failure reaches consensus without leaving
+/// compressed MLA state reusable.
+#[test]
+#[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
+fn ring_four_process_deepseek_expert_cache_mismatch_consensus() {
+    run_ring_cartesian_pipeline_mode(
+        false,
+        FixtureFamily::DeepSeek,
+        "pp-ep",
+        WorkerMode::ExpertCacheScheduleMismatch,
+    );
 }
 
 /// Verifies dependency-safe Gemma placement, auxiliary-state transport, shared
@@ -3884,7 +4164,11 @@ fn run_ring_cartesian_pipeline_mode(
 ) {
     assert!(distributed::is_available(Backend::Ring));
     let checkpoint = tempfile::tempdir().unwrap();
-    let checkpoint_path = if family == FixtureFamily::Qwen3MoeGguf {
+    let checkpoint_path = if family == FixtureFamily::DeepSeekGguf {
+        let path = checkpoint.path().join("model.gguf");
+        write_deepseek_gguf_fixture(&path);
+        path
+    } else if family == FixtureFamily::Qwen3MoeGguf {
         let path = checkpoint.path().join("model.gguf");
         write_qwen3_moe_gguf_fixture(&path);
         path
@@ -3950,13 +4234,18 @@ fn run_ring_layerwise_host_cartesian_pipeline_mode(
 ) {
     assert!(distributed::is_available(Backend::Ring));
     let checkpoint = tempfile::tempdir().unwrap();
-    let checkpoint_path = if family == FixtureFamily::Qwen3MoeGguf {
+    let checkpoint_path = if family == FixtureFamily::DeepSeekGguf {
+        let path = checkpoint.path().join("model.gguf");
+        write_deepseek_gguf_fixture(&path);
+        path
+    } else if family == FixtureFamily::Qwen3MoeGguf {
         let path = checkpoint.path().join("model.gguf");
         write_qwen3_moe_gguf_fixture(&path);
         path
     } else {
         match family {
             FixtureFamily::Qwen3 => write_qwen_fixture(checkpoint.path(), "qwen3"),
+            FixtureFamily::DeepSeek => write_deepseek_fixture(checkpoint.path(), 2),
             FixtureFamily::Qwen3Moe => write_qwen_fixture(checkpoint.path(), "qwen3_moe"),
             FixtureFamily::GptOss => write_gpt_oss_fixture(checkpoint.path()),
             FixtureFamily::Lfm2Moe => write_lfm2_pipeline_fixture(checkpoint.path(), true),
@@ -4012,7 +4301,11 @@ impl WorkerResidency {
 fn run_ring_pipeline_mode(dense_stream: bool, family: FixtureFamily, mode: WorkerMode) {
     assert!(distributed::is_available(Backend::Ring));
     let checkpoint = tempfile::tempdir().unwrap();
-    let checkpoint_path = if family == FixtureFamily::Qwen3MoeGguf {
+    let checkpoint_path = if family == FixtureFamily::DeepSeekGguf {
+        let path = checkpoint.path().join("model.gguf");
+        write_deepseek_gguf_fixture(&path);
+        path
+    } else if family == FixtureFamily::Qwen3MoeGguf {
         let path = checkpoint.path().join("model.gguf");
         write_qwen3_moe_gguf_fixture(&path);
         path
@@ -4061,7 +4354,8 @@ fn run_ring_pipeline_mode(dense_stream: bool, family: FixtureFamily, mode: Worke
                 write_qwen_hybrid_moe_fixture(checkpoint.path(), "qwen3_5_moe_text")
             }
             FixtureFamily::Inkling => write_inkling_fixture(checkpoint.path()),
-            FixtureFamily::Qwen3MoeGguf
+            FixtureFamily::DeepSeekGguf
+            | FixtureFamily::Qwen3MoeGguf
             | FixtureFamily::GptOssGguf
             | FixtureFamily::Lfm2MoeGguf
             | FixtureFamily::NemotronHGguf

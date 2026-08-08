@@ -1937,8 +1937,20 @@ impl RoutedExperts {
         num_experts: i32,
         stream: &Stream,
     ) -> Result<Self, Exception> {
+        Self::new_compact_with_width(args, layer, num_experts, args.moe_intermediate_size, stream)
+    }
+
+    /// Creates an unloaded compact bank with a rank-local expert width.
+    pub(crate) fn new_compact_with_width(
+        args: &ModelArgs,
+        layer: i32,
+        num_experts: i32,
+        intermediate_size: i32,
+        stream: &Stream,
+    ) -> Result<Self, Exception> {
         let mut compact_args = args.clone();
         compact_args.n_routed_experts = num_experts;
+        compact_args.moe_intermediate_size = intermediate_size;
         let mut bank = Self::new(&compact_args, layer)?;
         bank.initialize_unloaded_banks(&compact_args, stream)?;
         Ok(bank)
@@ -2760,6 +2772,41 @@ impl DecoderLayer {
             .mlp
             .forward_impl(&normalized, stream, "", &mut observer)?;
         let feed_forward = safemlx::distributed::all_sum(&feed_forward, group, stream)?;
+        hidden.add(feed_forward, stream)
+    }
+
+    /// Executes TP-sharded MLA and feed-forward projections while EP owns the
+    /// rank-local routed expert banks.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn forward_tensor_expert_parallel(
+        &mut self,
+        x: &Array,
+        mask: Option<&Array>,
+        cache: Option<&mut CompressedLatentCache>,
+        tensor_group: &safemlx::distributed::Group,
+        assignment: &crate::architectures::distributed::expert::ExpertAssignment,
+        expert_group: &safemlx::distributed::Group,
+        statistics: &mut crate::architectures::distributed::expert::RoutingStatistics,
+        stream: &Stream,
+    ) -> Result<Array, Exception> {
+        let normalized = self.input_layernorm.forward(x, stream)?;
+        let mut observer = None;
+        let attention =
+            self.self_attn
+                .forward_impl(&normalized, mask, cache, stream, "", &mut observer)?;
+        let attention = safemlx::distributed::all_sum(&attention, tensor_group, stream)?;
+        let hidden = x.add(attention, stream)?;
+        let normalized = self.post_attention_layernorm.forward(&hidden, stream)?;
+        let partial = self.mlp.forward_expert_parallel(
+            &normalized,
+            assignment,
+            expert_group,
+            statistics,
+            "",
+            None,
+            stream,
+        )?;
+        let feed_forward = safemlx::distributed::all_sum(&partial, tensor_group, stream)?;
         hidden.add(feed_forward, stream)
     }
 

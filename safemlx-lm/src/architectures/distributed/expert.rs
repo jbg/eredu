@@ -2839,7 +2839,7 @@ fn parameter_bytes(module: &impl ModuleParameters) -> usize {
         .sum()
 }
 
-fn execute_cached_deepseek(
+pub(crate) fn execute_cached_deepseek(
     args: &deepseek_v3::ModelArgs,
     layer: usize,
     routes: &DispatchedRoutes,

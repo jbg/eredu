@@ -949,7 +949,7 @@ placement, transfer, eviction, and active-window telemetry for either
 non-resident policy; `dense_stream_report` adds disk-stream pass and cache
 statistics only when that policy is active. `PipelineStageInfo` carries the
 same report's global rank and TP/PP/EP coordinates and stage ownership.
-Qwen3-MoE, Kimi Linear, Inkling text, GPT-OSS, LFM2-MoE, Nemotron-H-MoE, and text-only
+DeepSeek-V3/R1, Qwen3-MoE, Kimi Linear, Inkling text, GPT-OSS, LFM2-MoE, Nemotron-H-MoE, and text-only
 Qwen3-Next/Qwen3.5-MoE also compose all three axes in this runtime. TP
 collectives remain inside the stage and EP coordinate, routed exchange remains
 inside the stage and TP coordinate, and pipeline transport connects equal
@@ -957,7 +957,7 @@ TP/EP coordinates.
 The triple-axis path supports arbitrary valid Cartesian degrees on native
 subgroup backends and uses topology-planned neighbor routes for stage-local
 Ring fallback collectives. Fully resident, host-layerwise, and
-dense-disk-streamed SafeTensors and canonical `qwen3moe`, `kimi_linear`, `inkling`,
+dense-disk-streamed SafeTensors and canonical `deepseek2`, `qwen3moe`, `kimi_linear`, `inkling`,
 type-39 `gpt-oss`, `lfm2moe`, `nemotron_h_moe`, `qwen3next`, or `qwen35moe` GGUF checkpoints share the same layer recipes,
 cache identity, synchronized generation, and failure consensus. LFM2-MoE carries its
 TP-local causal-convolution state and attention KV state through that same
@@ -999,7 +999,7 @@ that complete triple-axis/cache boundary. Dense families have no EP migration.
 | GPT-OSS | TP, PP, EP | Complete | None; native MXFP4 SafeTensors and canonical type-39 GGUF are covered |
 | Llama/Mistral | TP, PP | TP+PP complete | None; EP does not apply |
 | Gemma 4 text | TP, PP | TP+PP complete | Multimodal tower execution is separate; EP does not apply |
-| DeepSeek-V3/R1 | TP, PP, EP | Pairwise | Compose MLA state, shared-expert ownership, native FP8/affine recipes, triple-axis execution, and pipeline-independent expert caching |
+| DeepSeek-V3/R1 | TP, PP, EP | Complete | None; split, packed-affine, native block-FP8 SafeTensors and canonical DeepSeek2 GGUF recipes share the Cartesian path |
 | Kimi Linear | TP, PP, EP | Complete | None |
 | LFM2 dense | TP, PP | TP+PP complete | None; EP does not apply |
 | LFM2-MoE | TP, PP, EP | Complete | None |
@@ -1021,7 +1021,7 @@ The remaining global limitations are:
 - Families marked **Pairwise** fail triple-axis or pipeline-independent expert
   cache requests during preflight, before checkpoint payload materialization.
 
-TP+PP+EP is executable for Qwen3-MoE, Kimi Linear, Inkling text, GPT-OSS, LFM2-MoE, Nemotron-H-MoE, and
+TP+PP+EP is executable for DeepSeek-V3/R1, Qwen3-MoE, Kimi Linear, Inkling text, GPT-OSS, LFM2-MoE, Nemotron-H-MoE, and
 Qwen3-Next/Qwen3.5-MoE text. The Cartesian
 topology and execution contexts remain family-neutral and accept arbitrary
 legal axis sizes.
@@ -2049,6 +2049,15 @@ approximately with `1 / EP`. `replicated_parameter_bytes` remains constant.
 Load-time conversion is rejected for sparse-cache EP because it would require
 eager expert materialization.
 
+DeepSeek's Cartesian resident path independently shards MLA heads, dense and
+shared projections, embeddings, and the output head over TP while assigning
+routed expert banks over EP. Its compressed latent and rotary-key cache remains
+stage-local. Independent caches keep the routed banks in their checkpoint-native
+split, packed-affine, block-FP8, or DeepSeek2 GGUF representation and compose
+with fully resident, host-layerwise, and dense-streamed non-experts. Cached
+routed results are complete across TP, while only the TP-sharded shared result
+is reduced.
+
 Kimi Linear's Cartesian resident path independently shards KDA/MLA heads,
 dense and shared projections, embeddings, and the output head over TP while
 assigning routed expert banks over EP. The routed contribution is exchanged
@@ -2120,6 +2129,10 @@ cargo test -p safemlx-lm --test distributed_expert_parallel_ring ring_four_proce
 cargo test -p safemlx-lm --test distributed_expert_parallel_ring ring_four_process_deepseek_tensor_expert_parity -- --ignored --exact --nocapture
 cargo test -p safemlx-lm --test distributed_pipeline_ring ring_four_process_deepseek_tensor_pipeline -- --ignored --exact --nocapture
 cargo test -p safemlx-lm --test distributed_pipeline_ring ring_four_process_deepseek_pipeline_expert -- --ignored --exact --nocapture
+cargo test -p safemlx-lm --test distributed_pipeline_ring ring_eight_process_deepseek_triple_axis -- --ignored --exact --nocapture
+cargo test -p safemlx-lm --test distributed_pipeline_ring ring_eight_process_deepseek_streamed_triple_axis_expert_cache -- --ignored --exact --nocapture
+cargo test -p safemlx-lm --test distributed_pipeline_ring ring_eight_process_deepseek_layerwise_host_triple_axis_expert_cache -- --ignored --exact --nocapture
+cargo test -p safemlx-lm --test distributed_pipeline_ring ring_eight_process_deepseek_gguf_triple_axis_expert_cache -- --ignored --exact --nocapture
 cargo test -p safemlx-lm --test distributed_expert_parallel_ring ring_four_process_lfm2_tensor_expert_parity -- --ignored --exact --nocapture
 cargo test -p safemlx-lm --test distributed_pipeline_ring ring_four_process_lfm2_tensor_pipeline -- --ignored --exact --nocapture
 cargo test -p safemlx-lm --test distributed_pipeline_ring ring_four_process_lfm2_pipeline_expert -- --ignored --exact --nocapture
@@ -2173,6 +2186,10 @@ The DeepSeek four-process cases cover TP+PP, TP+EP, and PP+EP across a
 dense-to-MoE boundary with tensor-sharded MLA/dense/shared projections,
 compressed-cache persistence, stage-local or cached expert ownership,
 dense-streamed bounded reads, and single-rank numerical parity.
+The DeepSeek eight-process cases add resident TP+PP+EP plus dense-streamed,
+host-layerwise, and canonical DeepSeek2 GGUF non-experts with independently
+cached routed experts. They also cover EP-inactive TP+PP caching and cached
+expert schedule failure consensus.
 The LFM2 four-process cases cover TP+PP, TP+EP, and PP+EP with hybrid
 convolution/attention caches, dense-streamed rank-local recipes, prompt-cache
 reload, dense-to-sparse expert placement, and single-rank numerical parity.
