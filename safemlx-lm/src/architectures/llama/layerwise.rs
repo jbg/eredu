@@ -40,14 +40,18 @@ use crate::{
     },
     runtime::cache::{ConcatKeyValueCache, KeyValueCache, PagedKeyValueCache},
     runtime::checkpoint::binding::{build_module_bindings, populate_module_from_lease},
-    runtime::checkpoint::store::{GgufWeightStore, WeightStore},
+    runtime::checkpoint::{
+        quantization::WeightQuantization,
+        store::{GgufWeightStore, WeightStore},
+    },
     runtime::distributed::parallel::{register_replicated_module, ParallelPlanBuilder},
     runtime::execution::layerwise::{
-        load_layerwise_model, load_safetensors_layerwise_model,
-        load_tensor_parallel_layerwise_model, open_safetensors_weight_store,
-        transformed_module_weight_store, ArchitectureAdapter, DenseDiskStreamReport,
-        ExecutionResidency, LayerWeightResidency, LayerwiseForwardState, LayerwiseLoadOptions,
-        LayerwiseModel, LayerwiseModelMetadata, StaticUnitBindings, WeightResidency,
+        load_layerwise_model, load_layerwise_model_with_quantization,
+        load_safetensors_layerwise_model, load_tensor_parallel_layerwise_model,
+        open_safetensors_weight_store, transformed_module_weight_store, ArchitectureAdapter,
+        DenseDiskStreamReport, ExecutionResidency, LayerWeightResidency, LayerwiseForwardState,
+        LayerwiseLoadOptions, LayerwiseModel, LayerwiseModelMetadata, LoadTimeQuantizableAdapter,
+        StaticUnitBindings, WeightResidency,
     },
     runtime::residency::manager::{ResidencyReport, ResidentUnitLease, WeightBinding},
 };
@@ -620,6 +624,7 @@ pub(crate) fn load_llama_gguf_model(
     checkpoint: &GgufCheckpoint,
     metadata: &HashMap<String, GgufMetadataValue>,
     residency: WeightResidency,
+    quantization: Option<WeightQuantization>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<(LlamaModel, Vec<u32>), Error> {
@@ -640,10 +645,11 @@ pub(crate) fn load_llama_gguf_model(
     let execution_options = residency.layers();
     Ok((
         LlamaModel {
-            execution: Box::new(load_layerwise_model(
+            execution: Box::new(load_layerwise_model_with_quantization(
                 store,
                 adapter,
                 execution_options,
+                quantization,
                 stream,
                 weights_stream,
             )?),
@@ -698,6 +704,21 @@ impl LlamaLayerwiseAdapter {
     /// Returns normalized Llama arguments.
     pub const fn args(&self) -> &ModelArgs {
         &self.args
+    }
+}
+
+impl LoadTimeQuantizableAdapter for LlamaLayerwiseAdapter {
+    fn load_time_quantized(
+        &self,
+        quantization: WeightQuantization,
+        stream: &Stream,
+    ) -> Result<Self, Error> {
+        let mut args = self.args.clone();
+        args.quantization = Some(quantization);
+        args.quantization_config = None;
+        args.quantized_weights = None;
+        args.quantized_weight_configs = None;
+        Self::new(args, stream)
     }
 }
 

@@ -802,9 +802,11 @@ Important boundaries:
   packed expert overlay. Pipeline stages use the same overlay for SafeTensors
   and dense F32/F16/BF16 GGUF recipes before host/device planning. The GGUF
   reader bounds native-axis and reshaped contiguous spans, including composed
-  expert and row selections over fused banks. Packed GGUF input is excluded by
-  the span type and is never requantized. Standalone nonresident GGUF conversion
-  is not yet connected to the shared overlay.
+  expert and row selections over fused banks. Standalone host-layerwise and
+  dense disk-streamed GGUF loads use the same packed overlay before residency
+  planning; supported independent expert caches quantize their selected routed
+  experts through the same source store. Packed GGUF input is excluded by the
+  span type and is never requantized.
 - Transfers and route inspection are synchronous because the pinned MLX C API
   does not expose the events or fences required for safe cross-stream overlap.
 - On Apple silicon, reported host and device residency are logical tiers over

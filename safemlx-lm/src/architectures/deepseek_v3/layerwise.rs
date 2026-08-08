@@ -48,11 +48,11 @@ use crate::{
         ParameterRole, ProjectionSharding,
     },
     runtime::execution::layerwise::{
-        load_layerwise_model, load_layerwise_model_quantized, load_safetensors_layerwise_model,
-        load_tensor_parallel_layerwise_model, open_safetensors_weight_store,
-        transformed_module_weight_store, ArchitectureAdapter, LayerWeightResidency,
-        LayerwiseForwardState, LayerwiseModel, NonExpertWeightResidency, StaticUnitBindings,
-        WeightResidency,
+        load_layerwise_model, load_layerwise_model_with_quantization,
+        load_safetensors_layerwise_model, load_tensor_parallel_layerwise_model,
+        open_safetensors_weight_store, transformed_module_weight_store, ArchitectureAdapter,
+        LayerWeightResidency, LayerwiseForwardState, LayerwiseModel, LoadTimeQuantizableAdapter,
+        NonExpertWeightResidency, StaticUnitBindings, WeightResidency,
     },
     runtime::residency::expert_cache::{
         ExpertCache, ExpertCacheError, ExpertCacheLoadOptions, ExpertCacheReport,
@@ -473,6 +473,7 @@ pub(crate) fn load_deepseek_v3_gguf_layerwise_model(
     checkpoint: &GgufCheckpoint,
     metadata: &HashMap<String, GgufMetadataValue>,
     residency: WeightResidency,
+    quantization: Option<WeightQuantization>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<(DeepSeekV3LayerwiseModel, Vec<u32>), Error> {
@@ -498,16 +499,24 @@ pub(crate) fn load_deepseek_v3_gguf_layerwise_model(
                 args,
                 expert_options,
                 residency.layers(),
+                quantization,
                 stream,
                 weights_stream,
             )?,
             prepared.eos_token_ids,
         ));
     }
-    let execution = load_layerwise_model(
+    if quantization.is_some() {
+        return Err(Error::Quantization(
+            "DeepSeek bounded GGUF load-time quantization requires independent expert residency so routed rank-3 banks can be materialized one expert at a time"
+                .into(),
+        ));
+    }
+    let execution = load_layerwise_model_with_quantization(
         store,
         DeepSeekV3LayerwiseAdapter::new(args, stream)?,
         residency.layers(),
+        quantization,
         stream,
         weights_stream,
     )?;
@@ -524,20 +533,38 @@ fn load_deepseek_gguf_sparse_with_store(
     args: ModelArgs,
     options: ExpertCacheLoadOptions,
     non_expert: impl Into<LayerWeightResidency>,
+    quantization: Option<WeightQuantization>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<DeepSeekV3LayerwiseModel, Error> {
     let adapter = DeepSeekV3LayerwiseAdapter::new_sparse(args.clone(), stream)?;
-    let mut execution = load_layerwise_model(store, adapter, non_expert, stream, weights_stream)?;
+    let mut execution = load_layerwise_model_with_quantization(
+        store,
+        adapter,
+        non_expert,
+        quantization,
+        stream,
+        weights_stream,
+    )?;
     let checkpoint_store = execution.checkpoint_store_arc();
     let entries = deepseek_expert_catalog(&args, checkpoint_store.as_ref())?;
-    execution.adapter_mut().expert_cache = Some(ExpertCache::new_shared(
-        checkpoint_store,
-        entries,
-        options,
-        weights_stream.clone(),
-        stream.clone(),
-    )?);
+    execution.adapter_mut().expert_cache = Some(match quantization {
+        Some(quantization) => ExpertCache::new_quantized_shared(
+            checkpoint_store,
+            entries,
+            options,
+            quantization,
+            weights_stream.clone(),
+            stream.clone(),
+        )?,
+        None => ExpertCache::new_shared(
+            checkpoint_store,
+            entries,
+            options,
+            weights_stream.clone(),
+            stream.clone(),
+        )?,
+    });
     Ok(DeepSeekV3LayerwiseModel { execution })
 }
 
@@ -607,24 +634,14 @@ pub fn load_deepseek_v3_expert_cache_model(
         .flatten();
     let source_adapter = DeepSeekV3LayerwiseAdapter::new_sparse(args.clone(), stream)?;
     let store = open_safetensors_weight_store(model_dir, non_expert.layers().max_mapped_shards())?;
-    let mut execution = match quantize_on_load {
-        Some(quantization) => {
-            let mut target_args = args.clone();
-            target_args.quantization_config = None;
-            target_args.quantization = Some(quantization);
-            target_args.quantized_weight_configs = None;
-            load_layerwise_model_quantized(
-                store,
-                source_adapter,
-                DeepSeekV3LayerwiseAdapter::new_sparse(target_args, stream)?,
-                non_expert,
-                quantization,
-                stream,
-                weights_stream,
-            )?
-        }
-        None => load_layerwise_model(store, source_adapter, non_expert, stream, weights_stream)?,
-    };
+    let mut execution = load_layerwise_model_with_quantization(
+        store,
+        source_adapter,
+        non_expert,
+        quantize_on_load,
+        stream,
+        weights_stream,
+    )?;
     let store = execution.checkpoint_store_arc();
     let entries = deepseek_expert_catalog(&args, store.as_ref())?;
     let cache = match quantize_on_load {
@@ -1013,6 +1030,24 @@ fn register_deepseek_layer_parallel_plan(
         }
     }
     Ok(())
+}
+
+impl LoadTimeQuantizableAdapter for DeepSeekV3LayerwiseAdapter {
+    fn load_time_quantized(
+        &self,
+        quantization: WeightQuantization,
+        stream: &Stream,
+    ) -> Result<Self, Error> {
+        let mut args = self.args.clone();
+        args.quantization_config = None;
+        args.quantization = Some(quantization);
+        args.quantized_weight_configs = None;
+        if self.sparse_expert_cache {
+            Self::new_sparse(args, stream)
+        } else {
+            Self::new(args, stream)
+        }
+    }
 }
 
 impl ArchitectureAdapter for DeepSeekV3LayerwiseAdapter {

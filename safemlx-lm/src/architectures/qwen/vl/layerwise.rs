@@ -60,10 +60,11 @@ use crate::{
         recipe::DerivedWeightRecipe,
     },
     runtime::execution::layerwise::{
-        load_layerwise_model, load_layerwise_model_quantized, load_safetensors_layerwise_model,
-        load_tensor_parallel_layerwise_model, open_safetensors_weight_store,
-        transformed_module_weight_store, ArchitectureAdapter, LayerWeightResidency,
-        LayerwiseForwardState, LayerwiseModel, StaticUnitBindings, WeightResidency,
+        load_layerwise_model, load_layerwise_model_with_quantization,
+        load_safetensors_layerwise_model, load_tensor_parallel_layerwise_model,
+        open_safetensors_weight_store, transformed_module_weight_store, ArchitectureAdapter,
+        LayerWeightResidency, LayerwiseForwardState, LayerwiseModel, LoadTimeQuantizableAdapter,
+        StaticUnitBindings, WeightResidency,
     },
     runtime::residency::expert_cache::{
         ExpertCache, ExpertCacheLoadOptions, ExpertCacheReport, ExpertPass, ExpertRouteBatch,
@@ -567,12 +568,14 @@ pub(crate) fn load_qwen3_vl_gguf_tensor_parallel_model(
     Ok((Qwen3VlLayerwiseModel { execution }, prepared.eos_token_ids))
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn load_qwen3_vl_gguf_layerwise_model(
     checkpoint: &GgufCheckpoint,
     metadata: &HashMap<String, GgufMetadataValue>,
     vision_checkpoint: &GgufCheckpoint,
     vision_metadata: &HashMap<String, GgufMetadataValue>,
     residency: WeightResidency,
+    quantization: Option<WeightQuantization>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<(Qwen3VlLayerwiseModel, Vec<u32>), Error> {
@@ -595,14 +598,22 @@ pub(crate) fn load_qwen3_vl_gguf_layerwise_model(
             args,
             expert_options,
             residency.layers(),
+            quantization,
             stream,
             weights_stream,
         )?
     } else {
-        load_layerwise_model(
+        if args.text_config.is_moe() && quantization.is_some() {
+            return Err(Error::Quantization(
+                "Qwen3-VL-MoE bounded GGUF load-time quantization requires independent expert residency so routed rank-3 banks can be materialized one expert at a time"
+                    .into(),
+            ));
+        }
+        load_layerwise_model_with_quantization(
             store,
             Qwen3VlLayerwiseAdapter::new(args, stream)?,
             residency.layers(),
+            quantization,
             stream,
             weights_stream,
         )?
@@ -615,6 +626,7 @@ fn load_qwen3_vl_gguf_sparse_execution(
     args: resident::ModelArgs,
     options: ExpertCacheLoadOptions,
     non_expert: LayerWeightResidency,
+    quantization: Option<WeightQuantization>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<LayerwiseModel<Qwen3VlLayerwiseAdapter>, Error> {
@@ -625,20 +637,37 @@ fn load_qwen3_vl_gguf_sparse_execution(
     }
     let mut adapter = Qwen3VlLayerwiseAdapter::new(args.clone(), stream)?;
     adapter.sparse_expert_cache = true;
-    let mut execution =
-        load_layerwise_model(store.clone(), adapter, non_expert, stream, weights_stream)?;
+    let mut execution = load_layerwise_model_with_quantization(
+        store,
+        adapter,
+        non_expert,
+        quantization,
+        stream,
+        weights_stream,
+    )?;
+    let store = execution.checkpoint_store_arc();
     let entries = crate::architectures::qwen::dense::layerwise::qwen3_expert_catalog_at(
         &args.text_config,
         store.as_ref(),
         "model.language_model.layers",
     )?;
-    execution.adapter_mut().expert_cache = Some(ExpertCache::new_shared(
-        store,
-        entries,
-        options,
-        weights_stream.clone(),
-        stream.clone(),
-    )?);
+    execution.adapter_mut().expert_cache = Some(match quantization {
+        Some(quantization) => ExpertCache::new_quantized_shared(
+            store,
+            entries,
+            options,
+            quantization,
+            weights_stream.clone(),
+            stream.clone(),
+        )?,
+        None => ExpertCache::new_shared(
+            store,
+            entries,
+            options,
+            weights_stream.clone(),
+            stream.clone(),
+        )?,
+    });
     Ok(execution)
 }
 
@@ -703,26 +732,14 @@ pub fn load_qwen3_vl_expert_cache_model(
     let mut source_adapter = Qwen3VlLayerwiseAdapter::new(args.clone(), stream)?;
     source_adapter.sparse_expert_cache = true;
     let store = open_safetensors_weight_store(model_dir, non_expert.layers().max_mapped_shards())?;
-    let mut execution = match quantize_on_load {
-        Some(quantization) => {
-            let mut target_args = args.clone();
-            target_args.text_config.quantization = Some(quantization);
-            target_args.text_config.quantization_config = None;
-            target_args.text_config.quantized_weight_configs = None;
-            let mut target_adapter = Qwen3VlLayerwiseAdapter::new(target_args, stream)?;
-            target_adapter.sparse_expert_cache = true;
-            load_layerwise_model_quantized(
-                store,
-                source_adapter,
-                target_adapter,
-                non_expert,
-                quantization,
-                stream,
-                weights_stream,
-            )?
-        }
-        None => load_layerwise_model(store, source_adapter, non_expert, stream, weights_stream)?,
-    };
+    let mut execution = load_layerwise_model_with_quantization(
+        store,
+        source_adapter,
+        non_expert,
+        quantize_on_load,
+        stream,
+        weights_stream,
+    )?;
     let store = execution.checkpoint_store_arc();
     let entries = crate::architectures::qwen::dense::layerwise::qwen3_expert_catalog_at(
         &args.text_config,
@@ -1254,6 +1271,22 @@ impl Qwen3VlLayerwiseAdapter {
                 deepstack_features: Vec::new(),
             },
         })
+    }
+}
+
+impl LoadTimeQuantizableAdapter for Qwen3VlLayerwiseAdapter {
+    fn load_time_quantized(
+        &self,
+        quantization: WeightQuantization,
+        stream: &Stream,
+    ) -> Result<Self, Error> {
+        let mut args = self.args.clone();
+        args.text_config.quantization = Some(quantization);
+        args.text_config.quantization_config = None;
+        args.text_config.quantized_weight_configs = None;
+        let mut adapter = Self::new(args, stream)?;
+        adapter.sparse_expert_cache = self.sparse_expert_cache;
+        Ok(adapter)
     }
 }
 

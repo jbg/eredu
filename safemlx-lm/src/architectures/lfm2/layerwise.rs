@@ -57,10 +57,11 @@ use crate::{
         MemberSharding, ParallelPlanBuilder, ParameterGroupSpec, ParameterRole,
     },
     runtime::execution::layerwise::{
-        load_layerwise_model, load_layerwise_model_quantized, load_safetensors_layerwise_model,
-        load_tensor_parallel_layerwise_model, open_safetensors_weight_store,
-        transformed_module_weight_store, ArchitectureAdapter, LayerWeightResidency,
-        LayerwiseForwardState, LayerwiseModel, StaticUnitBindings, WeightResidency,
+        load_layerwise_model, load_layerwise_model_with_quantization,
+        load_safetensors_layerwise_model, load_tensor_parallel_layerwise_model,
+        open_safetensors_weight_store, transformed_module_weight_store, ArchitectureAdapter,
+        LayerWeightResidency, LayerwiseForwardState, LayerwiseModel, LoadTimeQuantizableAdapter,
+        StaticUnitBindings, WeightResidency,
     },
     runtime::residency::expert_cache::{
         ExpertCache, ExpertCacheLoadOptions, ExpertCacheReport, ExpertCatalogEntry, ExpertIdentity,
@@ -593,6 +594,7 @@ pub(crate) fn load_lfm2_gguf_layerwise_model(
     checkpoint: &GgufCheckpoint,
     metadata: &HashMap<String, GgufMetadataValue>,
     residency: WeightResidency,
+    quantization: Option<WeightQuantization>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<(Lfm2LayerwiseModel, Vec<u32>), Error> {
@@ -612,16 +614,24 @@ pub(crate) fn load_lfm2_gguf_layerwise_model(
                 args,
                 expert_options,
                 residency.layers(),
+                quantization,
                 stream,
                 weights_stream,
             )?,
             prepared.eos_token_ids,
         ));
     }
-    let execution = load_layerwise_model(
+    if args.has_sparse_moe_layers() && quantization.is_some() {
+        return Err(Error::Quantization(
+            "LFM2-MoE bounded GGUF load-time quantization requires independent expert residency so routed rank-3 banks can be materialized one expert at a time"
+                .into(),
+        ));
+    }
+    let execution = load_layerwise_model_with_quantization(
         store,
         Lfm2LayerwiseAdapter::new(args, stream)?,
         residency.layers(),
+        quantization,
         stream,
         weights_stream,
     )?;
@@ -633,6 +643,7 @@ fn load_lfm2_gguf_sparse_with_store(
     args: ModelArgs,
     options: ExpertCacheLoadOptions,
     non_expert: impl Into<LayerWeightResidency>,
+    quantization: Option<WeightQuantization>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<Lfm2LayerwiseModel, Error> {
@@ -643,16 +654,33 @@ fn load_lfm2_gguf_sparse_with_store(
     }
     let mut adapter = Lfm2LayerwiseAdapter::new(args.clone(), stream)?;
     adapter.sparse_expert_cache = true;
-    let mut execution = load_layerwise_model(store, adapter, non_expert, stream, weights_stream)?;
+    let mut execution = load_layerwise_model_with_quantization(
+        store,
+        adapter,
+        non_expert,
+        quantization,
+        stream,
+        weights_stream,
+    )?;
     let checkpoint_store = execution.checkpoint_store_arc();
     let entries = lfm2_expert_catalog(&args, checkpoint_store.as_ref())?;
-    execution.adapter_mut().expert_cache = Some(ExpertCache::new_shared(
-        checkpoint_store,
-        entries,
-        options,
-        weights_stream.clone(),
-        stream.clone(),
-    )?);
+    execution.adapter_mut().expert_cache = Some(match quantization {
+        Some(quantization) => ExpertCache::new_quantized_shared(
+            checkpoint_store,
+            entries,
+            options,
+            quantization,
+            weights_stream.clone(),
+            stream.clone(),
+        )?,
+        None => ExpertCache::new_shared(
+            checkpoint_store,
+            entries,
+            options,
+            weights_stream.clone(),
+            stream.clone(),
+        )?,
+    });
     Ok(Lfm2LayerwiseModel { execution })
 }
 
@@ -722,26 +750,14 @@ pub fn load_lfm2_expert_cache_model(
     let mut source_adapter = Lfm2LayerwiseAdapter::new(args.clone(), stream)?;
     source_adapter.sparse_expert_cache = true;
     let store = open_safetensors_weight_store(model_dir, non_expert.layers().max_mapped_shards())?;
-    let mut execution = match quantize_on_load {
-        Some(quantization) => {
-            let mut target_args = args.clone();
-            target_args.weight_quantization = Some(quantization);
-            target_args.quantized_weights = None;
-            target_args.quantized_weight_configs = None;
-            let mut target_adapter = Lfm2LayerwiseAdapter::new(target_args, stream)?;
-            target_adapter.sparse_expert_cache = true;
-            load_layerwise_model_quantized(
-                store,
-                source_adapter,
-                target_adapter,
-                non_expert,
-                quantization,
-                stream,
-                weights_stream,
-            )?
-        }
-        None => load_layerwise_model(store, source_adapter, non_expert, stream, weights_stream)?,
-    };
+    let mut execution = load_layerwise_model_with_quantization(
+        store,
+        source_adapter,
+        non_expert,
+        quantize_on_load,
+        stream,
+        weights_stream,
+    )?;
     let store = execution.checkpoint_store_arc();
     let entries = lfm2_expert_catalog(&args, store.as_ref())?;
     execution.adapter_mut().expert_cache = Some(match quantize_on_load {
@@ -961,6 +977,22 @@ impl KeyValueCache for OffsetOnlyCache {
         _stream: &Stream,
     ) -> Result<(Array, Array), Exception> {
         Ok((keys, values))
+    }
+}
+
+impl LoadTimeQuantizableAdapter for Lfm2LayerwiseAdapter {
+    fn load_time_quantized(
+        &self,
+        quantization: WeightQuantization,
+        stream: &Stream,
+    ) -> Result<Self, Error> {
+        let mut args = self.args.clone();
+        args.weight_quantization = Some(quantization);
+        args.quantized_weights = None;
+        args.quantized_weight_configs = None;
+        let mut adapter = Self::new(args, stream)?;
+        adapter.sparse_expert_cache = self.sparse_expert_cache;
+        Ok(adapter)
     }
 }
 

@@ -57,11 +57,11 @@ use crate::{
         ProjectionSharding,
     },
     runtime::execution::layerwise::{
-        load_layerwise_model, load_layerwise_model_quantized, load_safetensors_layerwise_model,
-        load_tensor_parallel_layerwise_model, open_safetensors_weight_store,
-        transformed_module_weight_store, ArchitectureAdapter, ExecutionGroupDag,
-        LayerWeightResidency, LayerwiseForwardState, LayerwiseModel, StaticUnitBindings,
-        WeightResidency,
+        load_layerwise_model, load_layerwise_model_with_quantization,
+        load_safetensors_layerwise_model, load_tensor_parallel_layerwise_model,
+        open_safetensors_weight_store, transformed_module_weight_store, ArchitectureAdapter,
+        ExecutionGroupDag, LayerWeightResidency, LayerwiseForwardState, LayerwiseModel,
+        LoadTimeQuantizableAdapter, StaticUnitBindings, WeightResidency,
     },
     runtime::residency::expert_cache::{
         ExpertCache, ExpertCacheLoadOptions, ExpertCacheReport, ExpertCatalogEntry, ExpertIdentity,
@@ -1106,6 +1106,7 @@ pub(crate) fn load_qwen_hybrid_gguf_layerwise_model(
     metadata: &HashMap<String, GgufMetadataValue>,
     mmproj: Option<&resident::Qwen35MmprojGguf>,
     residency: WeightResidency,
+    quantization: Option<WeightQuantization>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<(QwenHybridLayerwiseModel, Vec<u32>, bool), Error> {
@@ -1142,6 +1143,7 @@ pub(crate) fn load_qwen_hybrid_gguf_layerwise_model(
                 modalities,
                 expert_options,
                 residency.layers(),
+                quantization,
                 stream,
                 weights_stream,
             )?,
@@ -1149,7 +1151,13 @@ pub(crate) fn load_qwen_hybrid_gguf_layerwise_model(
             is_next,
         ));
     }
-    let execution = load_layerwise_model(
+    if args.is_moe() && quantization.is_some() {
+        return Err(Error::Quantization(
+            "Qwen hybrid MoE bounded GGUF load-time quantization requires independent expert residency so routed rank-3 banks can be materialized one expert at a time"
+                .into(),
+        ));
+    }
+    let execution = load_layerwise_model_with_quantization(
         store,
         QwenHybridLayerwiseAdapter::new(
             args,
@@ -1160,6 +1168,7 @@ pub(crate) fn load_qwen_hybrid_gguf_layerwise_model(
             stream,
         )?,
         residency.layers(),
+        quantization,
         stream,
         weights_stream,
     )?;
@@ -1211,6 +1220,7 @@ fn load_qwen_hybrid_gguf_sparse_with_store(
     modalities: resident::Qwen35Modalities,
     options: ExpertCacheLoadOptions,
     non_expert: impl Into<LayerWeightResidency>,
+    quantization: Option<WeightQuantization>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<QwenHybridLayerwiseModel, Error> {
@@ -1228,16 +1238,33 @@ fn load_qwen_hybrid_gguf_sparse_with_store(
         stream,
     )?;
     adapter.sparse_expert_cache = true;
-    let mut execution = load_layerwise_model(store, adapter, non_expert, stream, weights_stream)?;
+    let mut execution = load_layerwise_model_with_quantization(
+        store,
+        adapter,
+        non_expert,
+        quantization,
+        stream,
+        weights_stream,
+    )?;
     let checkpoint_store = execution.checkpoint_store_arc();
     let entries = qwen_hybrid_expert_catalog(&args, checkpoint_store.as_ref())?;
-    execution.adapter_mut().expert_cache = Some(ExpertCache::new_shared(
-        checkpoint_store,
-        entries,
-        options,
-        weights_stream.clone(),
-        stream.clone(),
-    )?);
+    execution.adapter_mut().expert_cache = Some(match quantization {
+        Some(quantization) => ExpertCache::new_quantized_shared(
+            checkpoint_store,
+            entries,
+            options,
+            quantization,
+            weights_stream.clone(),
+            stream.clone(),
+        )?,
+        None => ExpertCache::new_shared(
+            checkpoint_store,
+            entries,
+            options,
+            weights_stream.clone(),
+            stream.clone(),
+        )?,
+    });
     Ok(QwenHybridLayerwiseModel { execution })
 }
 
@@ -1355,33 +1382,14 @@ fn load_qwen_hybrid_sparse_model(
         .transpose()?
         .flatten();
     let store = open_safetensors_weight_store(model_dir, non_expert.max_mapped_shards())?;
-    let mut execution = match quantize_on_load {
-        Some(quantization) => {
-            let mut target_args = args.clone();
-            target_args.quantization = Some(quantization);
-            target_args.quantization_config = None;
-            target_args.quantized_weight_configs = None;
-            let mut target_adapter = QwenHybridLayerwiseAdapter::new(
-                target_args,
-                family,
-                image_token_id,
-                video_token_id,
-                vision_config,
-                stream,
-            )?;
-            target_adapter.sparse_expert_cache = true;
-            load_layerwise_model_quantized(
-                store,
-                source_adapter,
-                target_adapter,
-                non_expert,
-                quantization,
-                stream,
-                weights_stream,
-            )?
-        }
-        None => load_layerwise_model(store, source_adapter, non_expert, stream, weights_stream)?,
-    };
+    let mut execution = load_layerwise_model_with_quantization(
+        store,
+        source_adapter,
+        non_expert,
+        quantize_on_load,
+        stream,
+        weights_stream,
+    )?;
     let store = execution.checkpoint_store_arc();
     let entries = qwen_hybrid_expert_catalog(&args, store.as_ref())?;
     execution.adapter_mut().expert_cache = Some(match quantize_on_load {
@@ -1532,6 +1540,7 @@ pub struct QwenHybridLayerwiseAdapter {
     parallel_lm_head: Option<VocabParallelLmHead>,
     mtp: Option<MtpModule>,
     vision: Option<QwenVisionLayerwiseStatic>,
+    vision_config: Option<VisionConfig>,
     image_token_id: Option<i32>,
     video_token_id: Option<i32>,
     sparse_expert_cache: bool,
@@ -1614,6 +1623,7 @@ impl QwenHybridLayerwiseAdapter {
             })
             .transpose()?;
         let vision = vision_config
+            .clone()
             .map(|config| QwenVisionTransformer::new(config, stream))
             .transpose()?
             .map(QwenVisionLayerwiseStatic::from_transformer);
@@ -1627,6 +1637,7 @@ impl QwenHybridLayerwiseAdapter {
             parallel_lm_head: None,
             mtp,
             vision,
+            vision_config,
             image_token_id,
             video_token_id,
             sparse_expert_cache: false,
@@ -2827,6 +2838,29 @@ impl KeyValueCache for OffsetOnlyCache {
         _stream: &Stream,
     ) -> Result<(Array, Array), Exception> {
         Ok((keys, values))
+    }
+}
+
+impl LoadTimeQuantizableAdapter for QwenHybridLayerwiseAdapter {
+    fn load_time_quantized(
+        &self,
+        quantization: WeightQuantization,
+        stream: &Stream,
+    ) -> Result<Self, Error> {
+        let mut args = self.args.clone();
+        args.quantization = Some(quantization);
+        args.quantization_config = None;
+        args.quantized_weight_configs = None;
+        let mut adapter = Self::new(
+            args,
+            self.family,
+            self.image_token_id,
+            self.video_token_id,
+            self.vision_config.clone(),
+            stream,
+        )?;
+        adapter.sparse_expert_cache = self.sparse_expert_cache;
+        Ok(adapter)
     }
 }
 

@@ -53,8 +53,11 @@ use crate::{
         build_module_bindings_with_recipes, canonical_checkpoint_name, populate_module_from_lease,
         populate_module_from_lease_excluding,
     },
-    runtime::checkpoint::recipe::DerivedWeightRecipe,
-    runtime::checkpoint::store::{GgufWeightStore, TensorSelection, WeightStore},
+    runtime::checkpoint::{
+        quantization::WeightQuantization,
+        recipe::DerivedWeightRecipe,
+        store::{GgufWeightStore, TensorSelection, WeightStore},
+    },
     runtime::distributed::parallel::{
         aligned_partition_units, array_parameter_member, partitioned_projection_members,
         register_partitioned_projection_group, register_projection_module,
@@ -62,13 +65,15 @@ use crate::{
         ParameterMemberSpec, ParameterRole, ProjectionSharding,
     },
     runtime::execution::layerwise::{
-        load_layerwise_model, load_safetensors_layerwise_model,
-        load_tensor_parallel_layerwise_model, open_safetensors_weight_store,
-        transformed_module_weight_store, ArchitectureAdapter, LayerWeightResidency,
-        LayerwiseForwardState, LayerwiseModel, StaticUnitBindings, WeightResidency,
+        load_layerwise_model, load_layerwise_model_with_quantization,
+        load_safetensors_layerwise_model, load_tensor_parallel_layerwise_model,
+        open_safetensors_weight_store, transformed_module_weight_store, ArchitectureAdapter,
+        LayerWeightResidency, LayerwiseForwardState, LayerwiseModel, LoadTimeQuantizableAdapter,
+        StaticUnitBindings, WeightResidency,
     },
     runtime::residency::expert_cache::{
-        AcquiredExperts, ExpertCache, ExpertCacheError, ExpertCatalogEntry, ExpertIdentity,
+        AcquiredExperts, ExpertCache, ExpertCacheError, ExpertCacheReport, ExpertCatalogEntry,
+        ExpertIdentity, ExpertPass, ExpertRouteBatch,
     },
     runtime::residency::manager::{OffloadUnit, ResidencyReport, ResidentUnitLease, WeightBinding},
 };
@@ -534,6 +539,11 @@ impl Gemma4LayerwiseModel {
         self.execution.adapter().args()
     }
 
+    /// Returns canonical parameter and residency metadata.
+    pub fn metadata(&self) -> &crate::LayerwiseModelMetadata {
+        self.execution.metadata()
+    }
+
     pub(crate) fn bind_parallel_topology(&mut self, topology: crate::ParallelTopology) {
         self.execution.bind_parallel_topology(topology);
     }
@@ -622,6 +632,17 @@ impl Gemma4LayerwiseModel {
         &self,
     ) -> Result<Option<crate::runtime::execution::layerwise::DenseDiskStreamReport>, Error> {
         self.execution.dense_stream_report()
+    }
+
+    /// Returns independent routed-expert cache telemetry when enabled.
+    pub fn expert_cache_report(&self) -> Result<Option<ExpertCacheReport>, Error> {
+        self.execution
+            .adapter()
+            .expert_cache
+            .as_ref()
+            .map(ExpertCache::report)
+            .transpose()
+            .map_err(Error::from)
     }
 
     /// Returns the persistent checkpoint store.
@@ -1074,6 +1095,7 @@ pub(crate) fn load_gemma4_gguf_layerwise_model(
     metadata: &HashMap<String, GgufMetadataValue>,
     mmproj: Option<&resident::Gemma4MmprojGguf>,
     residency: WeightResidency,
+    quantization: Option<WeightQuantization>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<(Gemma4LayerwiseModel, Vec<u32>), Error> {
@@ -1085,6 +1107,7 @@ pub(crate) fn load_gemma4_gguf_layerwise_model(
     )
     .into_loader_result()?;
     let prepared = resident::prepare_gemma4_gguf_checkpoint(checkpoint, metadata, mmproj, None)?;
+    let has_routed_experts = prepared.args.num_experts.is_some();
     let adapter = Gemma4LayerwiseAdapter::new(
         prepared.args,
         prepared.vision_config,
@@ -1095,13 +1118,57 @@ pub(crate) fn load_gemma4_gguf_layerwise_model(
         stream,
     )?;
     let store = gemma4_gguf_store(checkpoint, mmproj, residency.max_mapped_shards())?;
-    if residency.expert_cache().is_some() {
-        return Err(Error::UnsupportedArchitecture(
-            "independent expert caching is not supported for Gemma 4 GGUF checkpoints".into(),
+    if let Some(options) = residency.expert_cache() {
+        if !has_routed_experts {
+            return Err(Error::UnsupportedArchitecture(
+                "independent expert caching requires a Gemma 4 MoE GGUF checkpoint".into(),
+            ));
+        }
+        let mut adapter = adapter;
+        adapter.external_experts = true;
+        let mut execution = load_layerwise_model_with_quantization(
+            store,
+            adapter,
+            residency.layers(),
+            quantization,
+            stream,
+            weights_stream,
+        )?;
+        let store = execution.checkpoint_store_arc();
+        let entries = gemma4_expert_catalog(execution.adapter().args(), store.as_ref())?;
+        execution.adapter_mut().expert_cache = Some(match quantization {
+            Some(quantization) => ExpertCache::new_quantized_shared(
+                store,
+                entries,
+                options,
+                quantization,
+                weights_stream.clone(),
+                stream.clone(),
+            )?,
+            None => ExpertCache::new_shared(
+                store,
+                entries,
+                options,
+                weights_stream.clone(),
+                stream.clone(),
+            )?,
+        });
+        return Ok((Gemma4LayerwiseModel { execution }, prepared.eos_token_ids));
+    }
+    if has_routed_experts && quantization.is_some() {
+        return Err(Error::Quantization(
+            "Gemma 4 MoE bounded GGUF load-time quantization requires independent expert residency so routed rank-3 banks can be materialized one expert at a time"
+                .into(),
         ));
     }
-    let execution =
-        load_layerwise_model(store, adapter, residency.layers(), stream, weights_stream)?;
+    let execution = load_layerwise_model_with_quantization(
+        store,
+        adapter,
+        residency.layers(),
+        quantization,
+        stream,
+        weights_stream,
+    )?;
     Ok((Gemma4LayerwiseModel { execution }, prepared.eos_token_ids))
 }
 
@@ -1359,6 +1426,7 @@ pub struct Gemma4LayerwiseAdapter {
     norm: nn::RmsNorm,
     lm_head: Option<MaybeQuantized<nn::Linear>>,
     vision: Option<Gemma4VisionLayerwiseStatic>,
+    vision_config: Option<Gemma4VisionConfig>,
     embed_vision: Option<Gemma4ModalityEmbedder>,
     audio: Option<Gemma4AudioLayerwiseStatic>,
     embed_audio: Option<Gemma4ModalityEmbedder>,
@@ -1374,6 +1442,7 @@ pub struct Gemma4LayerwiseAdapter {
     parallel_per_layer_projection: Option<ParallelLinear>,
     parallel_text_geometry: Option<Vec<resident::ParallelLayerGeometry>>,
     external_experts: bool,
+    expert_cache: Option<ExpertCache>,
 }
 
 impl Gemma4LayerwiseAdapter {
@@ -1632,6 +1701,7 @@ impl Gemma4LayerwiseAdapter {
             norm: text.norm,
             lm_head,
             vision,
+            vision_config,
             embed_vision,
             audio,
             embed_audio,
@@ -1647,6 +1717,7 @@ impl Gemma4LayerwiseAdapter {
             parallel_per_layer_projection: None,
             parallel_text_geometry: None,
             external_experts: false,
+            expert_cache: None,
         })
     }
 
@@ -1759,12 +1830,12 @@ impl Gemma4LayerwiseAdapter {
         prefix: &str,
         store: &dyn WeightStore,
     ) -> Result<Vec<WeightBinding>, Error> {
-        let mut bindings = build_module_bindings_with_recipes(
-            module,
-            prefix,
-            store,
-            self.recipes_for(module, prefix, store),
-        )?;
+        let mut recipes = self.recipes_for(module, prefix, store);
+        if self.external_experts && prefix.starts_with("model.language_model.layers.") {
+            let parameters = module.parameters().flatten();
+            recipes.retain(|name, _| parameters.contains_key(name.as_str()));
+        }
+        let mut bindings = build_module_bindings_with_recipes(module, prefix, store, recipes)?;
         if self.external_experts && prefix.starts_with("model.language_model.layers.") {
             bindings.retain(|binding| !binding.name().starts_with("experts."));
         }
@@ -2166,6 +2237,33 @@ impl Gemma4LayerwiseAdapter {
             full_mask: state.forward.context.mask,
             sliding_masks,
         })
+    }
+}
+
+impl LoadTimeQuantizableAdapter for Gemma4LayerwiseAdapter {
+    fn load_time_quantized(
+        &self,
+        quantization: WeightQuantization,
+        stream: &Stream,
+    ) -> Result<Self, Error> {
+        let mut args = self.args.clone();
+        args.quantized = true;
+        args.weight_quantization = Some(quantization);
+        args.quantization_group_size = quantization.group_size();
+        args.quantization_bits = quantization.bits();
+        args.quantized_weights = None;
+        args.quantized_weight_configs = None;
+        let mut adapter = Self::new(
+            args,
+            self.vision_config.clone(),
+            self.image_token_id,
+            self.video_token_id,
+            self.audio_config.clone(),
+            self.audio_token_id,
+            stream,
+        )?;
+        adapter.external_experts = self.external_experts;
+        Ok(adapter)
     }
 }
 
@@ -2950,16 +3048,22 @@ impl ArchitectureAdapter for Gemma4LayerwiseAdapter {
                 self.audio_config.as_ref().expect("audio group"),
                 stream,
             )?))),
-            "text_decoder" => Ok(Gemma4Layer::Text(Box::new(TransformerBlock::new(
-                &self.args,
-                *self.args.layer_policy(index).ok_or_else(|| {
-                    Error::UnsupportedArchitecture(format!(
-                        "Gemma 4 has no attention policy for layer {index}"
-                    ))
-                })?,
-                index,
-                stream,
-            )?))),
+            "text_decoder" => {
+                let mut layer = TransformerBlock::new(
+                    &self.args,
+                    *self.args.layer_policy(index).ok_or_else(|| {
+                        Error::UnsupportedArchitecture(format!(
+                            "Gemma 4 has no attention policy for layer {index}"
+                        ))
+                    })?,
+                    index,
+                    stream,
+                )?;
+                if self.external_experts {
+                    layer.experts = None;
+                }
+                Ok(Gemma4Layer::Text(Box::new(layer)))
+            }
             _ => unreachable!(),
         }
     }
@@ -3737,10 +3841,40 @@ impl ArchitectureAdapter for Gemma4LayerwiseAdapter {
                     generated_sliding_window: None,
                 };
                 if self.external_experts {
-                    return Err(Error::Parallel(
-                        "Gemma 4 external experts require the topology-scoped execution hook"
-                            .into(),
-                    ));
+                    let expert_cache = self.expert_cache.as_ref().ok_or_else(|| {
+                        Error::Parallel(
+                            "Gemma 4 external experts require topology execution or an initialized independent expert cache"
+                                .into(),
+                        )
+                    })?;
+                    let pass = if hidden.dim(1) > 1 {
+                        ExpertPass::Prefill
+                    } else {
+                        ExpertPass::Decode
+                    };
+                    return Ok(layer.forward_with_expert_executor(
+                        input,
+                        stream,
+                        |flat, indices, weights, stream| {
+                            expert_cache
+                                .execute_routes_bounded(
+                                    ExpertRouteBatch::new(index, flat, indices, weights, pass),
+                                    stream,
+                                    |flat, acquired, weights, stream| {
+                                        Ok(execute_acquired_gemma_experts(
+                                            &self.args,
+                                            index,
+                                            flat,
+                                            acquired,
+                                            weights,
+                                            expert_cache,
+                                            stream,
+                                        )?)
+                                    },
+                                )
+                                .map_err(|error| Exception::custom(error.to_string()))
+                        },
+                    )?);
                 }
                 Ok(layer.forward(input, stream)?)
             }
@@ -3762,6 +3896,14 @@ impl ArchitectureAdapter for Gemma4LayerwiseAdapter {
         observer: &mut O,
     ) -> Result<Array, Error> {
         let prefix = self.layer_checkpoint_prefix(group, index);
+        if self.external_experts && self.expert_cache.is_some() {
+            observer.observe(&format!("{prefix}.input"), hidden)?;
+            let output = self.forward_layer(group, index, layer, hidden, cache, context, stream)?;
+            observer.observe(&format!("{prefix}.output"), &output)?;
+            return Ok(observer
+                .intervene(&format!("{prefix}.output"), &output)?
+                .unwrap_or(output));
+        }
         if self.execution_group_name(group)? == "text_decoder" {
             let Gemma4Layer::Text(layer) = layer else {
                 return Err(Error::UnsupportedArchitecture(format!(

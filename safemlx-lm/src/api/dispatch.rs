@@ -401,6 +401,7 @@ impl Model {
     ) -> Result<Option<crate::runtime::residency::expert_cache::ExpertCacheReport>, Error> {
         match self {
             Self::DeepSeekV3(model) => model.expert_cache_report(),
+            Self::Gemma4(model) => model.expert_cache_report(),
             Self::KimiLinear(model) => model.expert_cache_report(),
             Self::GptOss(model) => model.expert_cache_report(),
             Self::Inkling(model) => model.expert_cache_report(),

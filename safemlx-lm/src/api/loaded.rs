@@ -1798,7 +1798,10 @@ pub(super) fn load_gguf_model_data(
     #[cfg(feature = "media-processing")]
     let mut processor = None;
 
-    let (model, architecture_eos_token_ids) = if let Some(quantization) = options.quantization {
+    let (model, architecture_eos_token_ids) = if let Some(quantization) = options
+        .quantization
+        .filter(|_| options.weight_residency.is_fully_resident())
+    {
         match gguf_architecture {
             GgufArchitecture::KimiLinear => {
                 let loaded = kimi_linear::load_gguf_checkpoint(
@@ -1988,6 +1991,7 @@ pub(super) fn load_gguf_model_data(
                         &checkpoint,
                         &metadata,
                         options.weight_residency,
+                        options.quantization,
                         stream,
                         weights_stream,
                     )?;
@@ -1999,6 +2003,7 @@ pub(super) fn load_gguf_model_data(
                         &checkpoint,
                         &metadata,
                         options.weight_residency,
+                        options.quantization,
                         stream,
                         weights_stream,
                     )?;
@@ -2010,6 +2015,7 @@ pub(super) fn load_gguf_model_data(
                         &checkpoint,
                         &metadata,
                         options.weight_residency,
+                        options.quantization,
                         stream,
                         weights_stream,
                     )?;
@@ -2047,6 +2053,7 @@ pub(super) fn load_gguf_model_data(
                         &metadata,
                         mmproj.as_ref(),
                         options.weight_residency,
+                        options.quantization,
                         stream,
                         weights_stream,
                     )?;
@@ -2058,6 +2065,7 @@ pub(super) fn load_gguf_model_data(
                         &checkpoint,
                         &metadata,
                         options.weight_residency,
+                        options.quantization,
                         stream,
                         weights_stream,
                     )?;
@@ -2069,6 +2077,7 @@ pub(super) fn load_gguf_model_data(
                         &checkpoint,
                         &metadata,
                         options.weight_residency,
+                        options.quantization,
                         stream,
                         weights_stream,
                     )?;
@@ -2092,6 +2101,7 @@ pub(super) fn load_gguf_model_data(
                         &metadata,
                         &architecture,
                         options.weight_residency,
+                        options.quantization,
                         stream,
                         weights_stream,
                     )?;
@@ -2109,6 +2119,7 @@ pub(super) fn load_gguf_model_data(
                         &vision_checkpoint,
                         &vision_metadata,
                         options.weight_residency,
+                        options.quantization,
                         stream,
                         weights_stream,
                     )?;
@@ -2137,6 +2148,7 @@ pub(super) fn load_gguf_model_data(
                         &metadata,
                         mmproj.as_ref(),
                         options.weight_residency,
+                        options.quantization,
                         stream,
                         weights_stream,
                     )?;

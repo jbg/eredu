@@ -23,9 +23,10 @@ SafeMLX is independent of Apple and is not an official MLX project.
   SafeTensors or GGUF weights in admitted row tiles and exposes the packed
   result through the ordinary residency store. Rank-owned expert catalogs use
   that same transformation for independent caches, TP+EP, and TP+PP+EP without
-  materializing remote experts or complete dense expert banks. Dense GGUF
-  fused-bank selections use bounded reshaped spans; packed GGUF inputs remain
-  checkpoint-native and are never requantized.
+  materializing remote experts or complete dense expert banks. Standalone
+  host-layerwise and dense disk-streamed GGUF loads use that packed overlay as
+  well. Dense GGUF fused-bank selections use bounded reshaped spans; packed
+  GGUF inputs remain checkpoint-native and are never requantized.
 - Composable ordinary-layer and routed-expert residency: complete layers may
   be fully resident, host-layerwise, or dense disk-streamed; independent expert
   caches compose with resident, host-layerwise, or streamed non-expert units.

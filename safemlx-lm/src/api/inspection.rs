@@ -4344,6 +4344,69 @@ mod tests {
             .unwrap();
     }
 
+    fn write_quantizable_gemma4_moe_gguf(path: &Path) {
+        let mut metadata = gemma4_gguf_metadata(true);
+        metadata.insert("gemma4.embedding_length".into(), MetadataValue::Uint32(32));
+        metadata.insert(
+            "gemma4.feed_forward_length".into(),
+            MetadataValue::Array(MetadataArray::Uint32(vec![32, 32, 32])),
+        );
+        metadata.insert(
+            "gemma4.attention.key_length".into(),
+            MetadataValue::Uint32(16),
+        );
+        metadata.insert(
+            "gemma4.attention.key_length_swa".into(),
+            MetadataValue::Uint32(16),
+        );
+        metadata.insert(
+            "gemma4.expert_feed_forward_length".into(),
+            MetadataValue::Uint32(32),
+        );
+        let mut specs = gemma4_gguf_specs(true);
+        for (name, dimensions, _) in &mut specs {
+            *dimensions = if name.ends_with("layer_output_scale.weight") {
+                vec![1]
+            } else if name.ends_with("ffn_down_exps.scale") {
+                vec![2]
+            } else if name.ends_with("attn_q_norm.weight") || name.ends_with("attn_k_norm.weight") {
+                vec![16]
+            } else if name.ends_with("ffn_gate_inp.weight") {
+                vec![32, 2]
+            } else if name.ends_with("ffn_gate_up_exps.weight") {
+                vec![32, 64, 2]
+            } else if name.contains("_exps.weight") {
+                vec![32, 32, 2]
+            } else if name.ends_with("attn_k.weight") || name.ends_with("attn_v.weight") {
+                let output = if name.starts_with("blk.0.") { 16 } else { 32 };
+                vec![32, output]
+            } else if name == "token_embd.weight" || name == "output.weight" {
+                vec![32, 16]
+            } else if dimensions.len() == 2 {
+                vec![32, 32]
+            } else {
+                vec![32]
+            };
+        }
+        let payloads = specs
+            .iter()
+            .map(|(_, dimensions, _)| vec![0u8; dimensions.iter().product::<u64>() as usize * 4])
+            .collect::<Vec<_>>();
+        let tensors = specs
+            .iter()
+            .zip(&payloads)
+            .map(|((name, dimensions, ggml_type), data)| TensorInput {
+                name,
+                dimensions,
+                ggml_type: *ggml_type,
+                data,
+            })
+            .collect::<Vec<_>>();
+        Writer::default()
+            .write(std::fs::File::create(path).unwrap(), &metadata, &tensors)
+            .unwrap();
+    }
+
     fn inkling_gguf_metadata() -> BTreeMap<String, MetadataValue> {
         BTreeMap::from([
             (
@@ -8117,6 +8180,66 @@ mod tests {
                 structural::StructuralValidation::Exact
             );
         }
+    }
+
+    #[test]
+    fn gemma4_moe_gguf_initializes_standalone_independent_expert_cache() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("gemma4-moe.gguf");
+        write_quantizable_gemma4_moe_gguf(&path);
+        let execution =
+            safemlx::ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
+        let weights =
+            safemlx::ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
+        let quantization = crate::runtime::checkpoint::quantization::WeightQuantization::Affine(
+            crate::runtime::checkpoint::quantization::AffineQuantization::new(32, 4).unwrap(),
+        );
+        let options = ModelLoadOptions::with_quantization(quantization).with_weight_residency(
+            WeightResidency::with_expert_cache(
+                NonExpertWeightResidency::FullyResident,
+                crate::runtime::residency::expert_cache::ExpertCacheLoadOptions::default(),
+            ),
+        );
+        let mut loaded = crate::api::load_model_with_options(
+            &path,
+            options,
+            execution.stream(),
+            weights.stream(),
+        )
+        .unwrap();
+        let crate::api::Model::Gemma4(model) = &loaded else {
+            panic!("expected Gemma 4 model");
+        };
+        let ordinary = model.metadata().materialization().unwrap();
+        assert!(ordinary.transformed_weights > 0);
+        assert!(ordinary.output_bytes < ordinary.source_bytes_read);
+        let report = loaded.expert_cache_report().unwrap().unwrap();
+        assert_eq!(report.owned_experts, 6);
+        assert_eq!(report.host_resident_experts, 0);
+        assert_eq!(report.device_resident_experts, 0);
+        let experts = report.materialization.unwrap();
+        assert_eq!(experts.transformed_weights, 18);
+        assert!(experts.output_bytes < experts.source_bytes_read);
+        let tokens = safemlx::Array::from_slice(&[1u32, 2], &[1, 2]);
+        let parts = [crate::api::input::InputPart::text_token_ids(&tokens)];
+        let mut cache = loaded.new_cache();
+        let logits = loaded
+            .prefill_input_with_cache(
+                crate::api::input::ModelInput::new(&parts),
+                &mut cache,
+                execution.stream(),
+            )
+            .unwrap();
+        assert_eq!(logits.shape(), &[1, 16]);
+        assert!(
+            loaded
+                .expert_cache_report()
+                .unwrap()
+                .unwrap()
+                .prefill
+                .compact_banks
+                > 0
+        );
     }
 
     #[test]

@@ -61,10 +61,11 @@ use crate::{
         MemberSharding, ParallelPlanBuilder, ParameterGroupSpec, ParameterRole,
     },
     runtime::execution::layerwise::{
-        load_layerwise_model, load_layerwise_model_quantized, load_safetensors_layerwise_model,
-        load_tensor_parallel_layerwise_model, open_safetensors_weight_store,
-        transformed_module_weight_store, ArchitectureAdapter, LayerWeightResidency,
-        LayerwiseForwardState, LayerwiseModel, StaticUnitBindings, WeightResidency,
+        load_layerwise_model, load_layerwise_model_with_quantization,
+        load_safetensors_layerwise_model, load_tensor_parallel_layerwise_model,
+        open_safetensors_weight_store, transformed_module_weight_store, ArchitectureAdapter,
+        LayerWeightResidency, LayerwiseForwardState, LayerwiseModel, LoadTimeQuantizableAdapter,
+        StaticUnitBindings, WeightResidency,
     },
     runtime::residency::expert_cache::{
         ExpertCache, ExpertCacheError, ExpertCacheLoadOptions, ExpertCacheReport,
@@ -784,19 +785,13 @@ pub(crate) fn load_safetensors_quantized_residency(
                 .into(),
         ));
     }
-    let source_adapter = DenseQwenLayerwiseAdapter::new(args.clone(), stream)?;
-    let mut target_args = args;
-    target_args.quantization = Some(quantization);
-    target_args.quantization_config = None;
-    target_args.quantized_weight_configs = None;
-    let target_adapter = DenseQwenLayerwiseAdapter::new(target_args, stream)?;
+    let source_adapter = DenseQwenLayerwiseAdapter::new(args, stream)?;
     Ok(LayerwiseDecoder {
-        execution: load_layerwise_model_quantized(
+        execution: load_layerwise_model_with_quantization(
             store,
             source_adapter,
-            target_adapter,
             options,
-            quantization,
+            Some(quantization),
             stream,
             weights_stream,
         )?,
@@ -919,6 +914,7 @@ pub(crate) fn load_gguf_checkpoint(
     metadata: &HashMap<String, GgufMetadataValue>,
     architecture: &str,
     residency: WeightResidency,
+    quantization: Option<WeightQuantization>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<(LayerwiseDecoder, Vec<u32>), Error> {
@@ -939,16 +935,24 @@ pub(crate) fn load_gguf_checkpoint(
                 args,
                 expert_options,
                 residency.layers(),
+                quantization,
                 stream,
                 weights_stream,
             )?,
             eos_token_ids,
         ));
     }
-    let execution = load_layerwise_model(
+    if args.is_moe() && quantization.is_some() {
+        return Err(Error::Quantization(
+            "Qwen3-MoE bounded GGUF load-time quantization requires independent expert residency so routed rank-3 banks can be materialized one expert at a time"
+                .into(),
+        ));
+    }
+    let execution = load_layerwise_model_with_quantization(
         store,
         DenseQwenLayerwiseAdapter::new(args, stream)?,
         residency.layers(),
+        quantization,
         stream,
         weights_stream,
     )?;
@@ -962,6 +966,7 @@ fn load_qwen3_gguf_sparse_with_store(
     args: DecoderConfig,
     options: ExpertCacheLoadOptions,
     non_expert: impl Into<LayerWeightResidency>,
+    quantization: Option<WeightQuantization>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<LayerwiseDecoder, Error> {
@@ -971,16 +976,33 @@ fn load_qwen3_gguf_sparse_with_store(
         ));
     }
     let adapter = DenseQwenLayerwiseAdapter::new_external_experts(args.clone(), stream)?;
-    let mut execution = load_layerwise_model(store, adapter, non_expert, stream, weights_stream)?;
+    let mut execution = load_layerwise_model_with_quantization(
+        store,
+        adapter,
+        non_expert,
+        quantization,
+        stream,
+        weights_stream,
+    )?;
     let checkpoint_store = execution.checkpoint_store_arc();
     let entries = qwen3_expert_catalog(&args, checkpoint_store.as_ref())?;
-    execution.adapter_mut().expert_cache = Some(ExpertCache::new_shared(
-        checkpoint_store,
-        entries,
-        options,
-        weights_stream.clone(),
-        stream.clone(),
-    )?);
+    execution.adapter_mut().expert_cache = Some(match quantization {
+        Some(quantization) => ExpertCache::new_quantized_shared(
+            checkpoint_store,
+            entries,
+            options,
+            quantization,
+            weights_stream.clone(),
+            stream.clone(),
+        )?,
+        None => ExpertCache::new_shared(
+            checkpoint_store,
+            entries,
+            options,
+            weights_stream.clone(),
+            stream.clone(),
+        )?,
+    });
     Ok(LayerwiseDecoder { execution })
 }
 
@@ -1057,26 +1079,14 @@ pub fn load_qwen3_expert_cache_model(
         .flatten();
     let source_adapter = DenseQwenLayerwiseAdapter::new_external_experts(args.clone(), stream)?;
     let store = open_safetensors_weight_store(model_dir, non_expert.layers().max_mapped_shards())?;
-    let mut execution = match quantize_on_load {
-        Some(quantization) => {
-            let mut target_args = args.clone();
-            target_args.quantization = Some(quantization);
-            target_args.quantization_config = None;
-            target_args.quantized_weight_configs = None;
-            let target_adapter =
-                DenseQwenLayerwiseAdapter::new_external_experts(target_args, stream)?;
-            load_layerwise_model_quantized(
-                store,
-                source_adapter,
-                target_adapter,
-                non_expert,
-                quantization,
-                stream,
-                weights_stream,
-            )?
-        }
-        None => load_layerwise_model(store, source_adapter, non_expert, stream, weights_stream)?,
-    };
+    let mut execution = load_layerwise_model_with_quantization(
+        store,
+        source_adapter,
+        non_expert,
+        quantize_on_load,
+        stream,
+        weights_stream,
+    )?;
     let store = execution.checkpoint_store_arc();
     let entries = qwen3_expert_catalog(&args, store.as_ref())?;
     let cache = match quantize_on_load {
@@ -1340,6 +1350,24 @@ pub(crate) fn register_qwen_layer_parallel_plan(
         &layer.post_attention_layernorm,
         &format!("{prefix}.post_attention_layernorm"),
     )
+}
+
+impl LoadTimeQuantizableAdapter for DenseQwenLayerwiseAdapter {
+    fn load_time_quantized(
+        &self,
+        quantization: WeightQuantization,
+        stream: &Stream,
+    ) -> Result<Self, Error> {
+        let mut args = self.args.clone();
+        args.quantization = Some(quantization);
+        args.quantization_config = None;
+        args.quantized_weight_configs = None;
+        if self.sparse_expert_cache {
+            Self::new_external_experts(args, stream)
+        } else {
+            Self::new(args, stream)
+        }
+    }
 }
 
 impl ArchitectureAdapter for DenseQwenLayerwiseAdapter {

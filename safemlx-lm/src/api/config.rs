@@ -281,6 +281,7 @@ impl GgufArchitecture {
                     | Self::DeepSeek2
                     | Self::GptOss
                     | Self::Inkling
+                    | Self::Gemma4
                     | Self::Lfm2Moe
                     | Self::NemotronHMoe
                     | Self::Qwen3Moe
@@ -393,17 +394,14 @@ pub(crate) fn validate_load_policy(
 
     if options.quantization.is_some()
         && !options.weight_residency.is_fully_resident()
-        && (artifact == ArtifactLoadKind::Gguf
-            || (options.weight_residency.expert_cache().is_none()
-                && !matches!(kind, ModelKind::Qwen2 | ModelKind::Qwen3)))
+        && artifact == ArtifactLoadKind::Safetensors
+        && options.weight_residency.expert_cache().is_none()
+        && !matches!(kind, ModelKind::Qwen2 | ModelKind::Qwen3)
     {
-        return Err(Error::Quantization(match artifact {
-            ArtifactLoadKind::Safetensors => format!(
-                "load-time quantization is unsupported for {} nonresident loading; use a matching checkpoint-native packed format",
-                kind.model_type_name()
-            ),
-            ArtifactLoadKind::Gguf => "load-time quantization is incompatible with nonresident GGUF policies; use checkpoint-native GGUF quantization".into(),
-        }));
+        return Err(Error::Quantization(format!(
+            "load-time quantization is unsupported for {} nonresident loading; use a matching checkpoint-native packed format",
+            kind.model_type_name()
+        )));
     }
 
     if options.quantization.is_some() && matches!(kind, ModelKind::Inkling | ModelKind::NemotronH) {

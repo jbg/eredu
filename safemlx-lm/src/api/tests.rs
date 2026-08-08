@@ -27,6 +27,7 @@ use safemlx::{
     ops::{zeros_dtype, GgufMetadataArray, GgufMetadataValue},
     Array, Device, DeviceType, ExecutionContext, Stream,
 };
+use safemlx_gguf::{GgmlType, MetadataValue as GgufWriterMetadata, TensorInput, Writer};
 use safemlx_lm_utils::tokenizer::Tokenizer as ChatTokenizer;
 use safemlx_lm_utils::tokenizer::{ChatTemplateIdentity, ModelChatTemplate};
 use serde_json::json;
@@ -4309,6 +4310,129 @@ fn load_time_quantization_accepts_only_unquantized_gguf_sources() {
     )
     .unwrap_err();
     assert!(error.to_string().contains("packed GGUF tensors"));
+}
+
+fn write_zero_llama_gguf(path: &std::path::Path) {
+    let metadata = BTreeMap::from([
+        (
+            "general.architecture".into(),
+            GgufWriterMetadata::String("llama".into()),
+        ),
+        ("general.file_type".into(), GgufWriterMetadata::Uint32(0)),
+        ("llama.block_count".into(), GgufWriterMetadata::Uint32(1)),
+        (
+            "llama.embedding_length".into(),
+            GgufWriterMetadata::Uint32(32),
+        ),
+        (
+            "llama.attention.head_count".into(),
+            GgufWriterMetadata::Uint32(4),
+        ),
+        (
+            "llama.attention.head_count_kv".into(),
+            GgufWriterMetadata::Uint32(2),
+        ),
+        (
+            "llama.attention.key_length".into(),
+            GgufWriterMetadata::Uint32(8),
+        ),
+        (
+            "llama.feed_forward_length".into(),
+            GgufWriterMetadata::Uint32(64),
+        ),
+        (
+            "llama.attention.layer_norm_rms_epsilon".into(),
+            GgufWriterMetadata::Float32(0.00001),
+        ),
+        (
+            "llama.context_length".into(),
+            GgufWriterMetadata::Uint32(128),
+        ),
+        ("llama.vocab_size".into(), GgufWriterMetadata::Uint32(32)),
+    ]);
+    let specs = [
+        ("token_embd.weight", vec![32, 32]),
+        ("output_norm.weight", vec![32]),
+        ("blk.0.attn_norm.weight", vec![32]),
+        ("blk.0.ffn_norm.weight", vec![32]),
+        ("blk.0.attn_q.weight", vec![32, 32]),
+        ("blk.0.attn_k.weight", vec![32, 16]),
+        ("blk.0.attn_v.weight", vec![32, 16]),
+        ("blk.0.attn_output.weight", vec![32, 32]),
+        ("blk.0.ffn_gate.weight", vec![32, 64]),
+        ("blk.0.ffn_up.weight", vec![32, 64]),
+        ("blk.0.ffn_down.weight", vec![64, 32]),
+    ];
+    let payloads = specs
+        .iter()
+        .map(|(_, dimensions)| vec![0u8; dimensions.iter().product::<u64>() as usize * 4])
+        .collect::<Vec<_>>();
+    let tensors = specs
+        .iter()
+        .zip(&payloads)
+        .map(|((name, dimensions), data)| TensorInput {
+            name,
+            dimensions,
+            ggml_type: GgmlType::F32,
+            data,
+        })
+        .collect::<Vec<_>>();
+    Writer::default()
+        .write(std::fs::File::create(path).unwrap(), &metadata, &tensors)
+        .unwrap();
+}
+
+#[test]
+fn dense_gguf_uses_shared_packed_overlay_for_nonresident_execution() {
+    let context = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
+    let weights_context = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+    let stream = context.stream();
+    let weights_stream = weights_context.stream();
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("llama-f32.gguf");
+    write_zero_llama_gguf(&path);
+    let quantization = WeightQuantization::Affine(AffineQuantization::new(32, 4).unwrap());
+    let policies = [
+        crate::WeightResidency::layerwise_host(crate::LayerwiseLoadOptions::default()),
+        crate::WeightResidency::dense_disk_stream(
+            crate::DenseDiskStreamLoadOptions::new(1 << 20, 1 << 20, 1, 1, 1).unwrap(),
+        ),
+    ];
+
+    let mut tokens_by_policy = Vec::new();
+    for residency in policies {
+        let options =
+            ModelLoadOptions::with_quantization(quantization).with_weight_residency(residency);
+        let mut loaded = load_model_with_options(&path, options, stream, weights_stream).unwrap();
+        let super::Model::Llama(model) = &loaded else {
+            panic!("expected Llama GGUF model");
+        };
+        let materialization = model.metadata().materialization().unwrap();
+        assert!(materialization.transformed_weights > 0);
+        assert!(materialization.output_bytes < materialization.source_bytes_read);
+        let diagnostics = model.checkpoint_store().diagnostics().unwrap();
+        assert!(diagnostics.physical_reads > 0);
+        assert!(
+            diagnostics.physical_read_bytes
+                <= materialization
+                    .source_bytes_read
+                    .saturating_add(materialization.output_bytes)
+                    .saturating_add(4096)
+        );
+
+        let tokens = Array::from_slice(&[1u32, 2], &[1, 2]);
+        let parts = [super::input::InputPart::text_token_ids(&tokens)];
+        let mut cache = loaded.new_cache();
+        let logits = loaded
+            .prefill_input_with_cache(super::input::ModelInput::new(&parts), &mut cache, stream)
+            .unwrap();
+        tokens_by_policy.push(
+            argmax_axis!(&logits, -1, stream = stream)
+                .unwrap()
+                .item::<u32>(stream),
+        );
+    }
+    assert_eq!(tokens_by_policy[0], tokens_by_policy[1]);
 }
 
 fn save_zero_checkpoint<M: ModuleParameters>(model: &M, dir: &std::path::Path, stream: &Stream) {

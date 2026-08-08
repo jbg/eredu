@@ -1,4 +1,4 @@
-//! Model-agnostic load-time quantization for safetensors checkpoints.
+//! Model-agnostic load-time quantization for dense SafeTensors and GGUF checkpoints.
 //!
 //! The serialized representation follows the MLX-LM convention: a dense
 //! `name.weight` tensor becomes a packed `name.weight` tensor plus

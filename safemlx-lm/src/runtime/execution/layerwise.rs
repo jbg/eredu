@@ -2222,6 +2222,23 @@ pub trait ArchitectureAdapter: Sized {
     }
 }
 
+/// Semantic adapter capability required by bounded load-time quantization.
+///
+/// Implementations rebuild the same architecture with packed matrix modules
+/// while preserving architecture-owned execution choices such as multimodal
+/// towers and externally resident experts. Checkpoint format is deliberately
+/// absent from this contract: SafeTensors and dense GGUF use the same packed
+/// overlay once their stores expose the adapter's semantic recipes.
+pub(crate) trait LoadTimeQuantizableAdapter: ArchitectureAdapter {
+    /// Rebuilds this adapter with `quantization` as its uniform packed matrix
+    /// representation.
+    fn load_time_quantized(
+        &self,
+        quantization: WeightQuantization,
+        stream: &Stream,
+    ) -> Result<Self, Error>;
+}
+
 /// Residency-owned execution engine for generalized adapters.
 ///
 /// Group windows, lease lifetime, retained-state evaluation, stream
@@ -3304,6 +3321,42 @@ where
         load_layerwise_model(transformed, target_adapter, options, stream, weights_stream)?;
     model.metadata.materialization = Some(report);
     Ok(model)
+}
+
+/// Loads an adapter directly or through the shared bounded packed overlay.
+///
+/// This is the authoritative standalone materialization route for both
+/// SafeTensors and dense GGUF stores. Architecture code supplies semantic
+/// bindings through the adapter; residency sees only the resulting packed
+/// store and therefore budgets packed bytes rather than dense source bytes.
+pub(crate) fn load_layerwise_model_with_quantization<A, O>(
+    store: SharedWeightStore,
+    source_adapter: A,
+    options: O,
+    quantization: Option<WeightQuantization>,
+    stream: &Stream,
+    weights_stream: &Stream,
+) -> Result<LayerwiseModel<A>, Error>
+where
+    A: LoadTimeQuantizableAdapter,
+    O: Into<LayerWeightResidency>,
+{
+    let options = options.into();
+    match quantization {
+        Some(quantization) => {
+            let target_adapter = source_adapter.load_time_quantized(quantization, stream)?;
+            load_layerwise_model_quantized(
+                store,
+                source_adapter,
+                target_adapter,
+                options,
+                quantization,
+                stream,
+                weights_stream,
+            )
+        }
+        None => load_layerwise_model(store, source_adapter, options, stream, weights_stream),
+    }
 }
 
 /// Builds a PP-stage-local packed overlay before pipeline residency planning.
