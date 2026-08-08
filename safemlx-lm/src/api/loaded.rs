@@ -1946,9 +1946,19 @@ pub(super) fn load_gguf_model_data(
             GgufArchitecture::Qwen35
             | GgufArchitecture::Qwen35Moe
             | GgufArchitecture::Qwen3Next => {
+                let mmproj = if gguf_architecture == GgufArchitecture::Qwen3Next {
+                    None
+                } else {
+                    qwen3_5::open_sibling_mmproj(gguf_file)?
+                };
+                #[cfg(feature = "image-processing")]
+                if mmproj.is_some() {
+                    processor = ModelProcessor::load_qwen(gguf_sidecar_dir(gguf_file))?;
+                }
                 let loaded = qwen3_5::load_qwen3_5_gguf_checkpoint(
                     &checkpoint,
                     metadata.clone(),
+                    mmproj.as_ref(),
                     Some(quantization),
                     stream,
                     weights_stream,
@@ -2112,10 +2122,20 @@ pub(super) fn load_gguf_model_data(
             GgufArchitecture::Qwen35
             | GgufArchitecture::Qwen35Moe
             | GgufArchitecture::Qwen3Next => {
+                let mmproj = if gguf_architecture == GgufArchitecture::Qwen3Next {
+                    None
+                } else {
+                    qwen3_5::open_sibling_mmproj(gguf_file)?
+                };
+                #[cfg(feature = "image-processing")]
+                if mmproj.is_some() {
+                    processor = ModelProcessor::load_qwen(gguf_sidecar_dir(gguf_file))?;
+                }
                 let (loaded, eos_token_ids, is_next) =
                     crate::architectures::qwen::hybrid::layerwise::load_qwen_hybrid_gguf_layerwise_model(
                         &checkpoint,
                         &metadata,
+                        mmproj.as_ref(),
                         options.weight_residency,
                         stream,
                         weights_stream,

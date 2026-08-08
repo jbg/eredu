@@ -1074,6 +1074,62 @@ fn inspect_gguf_projector(
                 Err(error) => reject_projector(report, path.to_path_buf(), error.to_string(), true),
             }
         }
+        GgufArchitecture::Qwen35 | GgufArchitecture::Qwen35Moe => {
+            match crate::architectures::qwen::hybrid::qwen3_5::open_sibling_mmproj(path) {
+                Ok(Some(mmproj)) => {
+                    let projector_path =
+                        crate::runtime::checkpoint::gguf::find_sibling_mmproj(path, "qwen35")
+                            .ok()
+                            .flatten()
+                            .unwrap_or_else(|| path.to_path_buf());
+                    let validation = structural::validate_qwen35_projector_gguf(
+                        model_checkpoint,
+                        model_metadata,
+                        &mmproj.checkpoint,
+                        &mmproj.metadata,
+                    );
+                    let exact = matches!(validation, structural::StructuralValidation::Exact);
+                    apply_structural_validation(report, validation, &projector_path);
+                    report.multimodal = if !exact {
+                        InspectionReadiness::Invalid
+                    } else if cfg!(feature = "image-processing") {
+                        InspectionReadiness::Ready
+                    } else {
+                        InspectionReadiness::Unsupported
+                    };
+                    report.requirements.push(InspectionRequirement {
+                        code: InspectionIssueCode::MissingMediaProjector,
+                        readiness: if exact {
+                            InspectionReadiness::Ready
+                        } else {
+                            InspectionReadiness::Invalid
+                        },
+                        detail: if exact {
+                            "validated Qwen3.5 vision projector".into()
+                        } else {
+                            "Qwen3.5 vision projector is structurally incompatible".into()
+                        },
+                        path: Some(projector_path),
+                    });
+                }
+                Ok(None) => {
+                    report.multimodal = InspectionReadiness::Missing;
+                    report.requirements.push(InspectionRequirement {
+                        code: InspectionIssueCode::MissingMediaProjector,
+                        readiness: InspectionReadiness::Missing,
+                        detail: "Qwen3.5 text loading is available, but image/video input requires a sibling qwen35 mmproj GGUF".into(),
+                        path: None,
+                    });
+                    report.issue(
+                        InspectionIssueCode::MissingMediaProjector,
+                        InspectionSeverity::Warning,
+                        "Qwen3.5 has no sibling multimodal projector; text loading remains available",
+                        Some(path.to_path_buf()),
+                    );
+                }
+                Err(error) => reject_projector(report, path.to_path_buf(), error.to_string(), true),
+            }
+        }
         GgufArchitecture::Inkling => match inkling::open_sibling_mmproj(path) {
             Ok(Some(mmproj)) => {
                 let projector_path =
@@ -5048,6 +5104,24 @@ mod tests {
             (key("ssm.state_size"), MetadataValue::Uint32(8)),
             (key("ssm.group_count"), MetadataValue::Uint32(2)),
             (key("ssm.time_step_rank"), MetadataValue::Uint32(4)),
+            (
+                "tokenizer.ggml.tokens".into(),
+                MetadataValue::Array(MetadataArray::String(
+                    (0..28)
+                        .map(|index| format!("token-{index}"))
+                        .chain([
+                            "<|vision_start|>".into(),
+                            "<|vision_end|>".into(),
+                            "<|image_pad|>".into(),
+                            "<|video_pad|>".into(),
+                        ])
+                        .collect(),
+                )),
+            ),
+            (
+                "tokenizer.ggml.eos_token_id".into(),
+                MetadataValue::Uint32(2),
+            ),
         ]);
         if is_moe {
             metadata.extend([
@@ -5063,6 +5137,62 @@ mod tests {
             metadata.insert(key("feed_forward_length"), MetadataValue::Uint32(64));
         }
         metadata
+    }
+
+    fn qwen35_mmproj_metadata() -> BTreeMap<String, MetadataValue> {
+        let mut metadata = qwen3_vl_mmproj_metadata();
+        metadata.insert(
+            "clip.vision.embedding_length".into(),
+            MetadataValue::Uint32(32),
+        );
+        metadata.insert(
+            "clip.vision.feed_forward_length".into(),
+            MetadataValue::Uint32(64),
+        );
+        metadata.insert(
+            "clip.vision.attention.head_count".into(),
+            MetadataValue::Uint32(4),
+        );
+        metadata.insert(
+            "clip.vision.is_deepstack_layers".into(),
+            MetadataValue::Array(MetadataArray::Bool(vec![false])),
+        );
+        metadata
+    }
+
+    fn qwen35_mmproj_specs() -> Vec<(String, Vec<u64>, GgmlType)> {
+        let mut specs = qwen3_vl_mmproj_specs();
+        specs.retain(|(name, _, _)| !name.starts_with("v.deepstack."));
+        for (name, dimensions, encoding) in &mut specs {
+            *dimensions = match name.as_str() {
+                "v.position_embd.weight" => vec![32, 16],
+                "v.patch_embd.weight" | "v.patch_embd.weight.1" => vec![2, 2, 3, 32],
+                "v.blk.0.attn_qkv.weight" => vec![32, 96],
+                "v.blk.0.attn_qkv.bias" => vec![96],
+                "v.blk.0.ffn_up.weight" => vec![32, 64],
+                "v.blk.0.ffn_up.bias" => vec![64],
+                "v.blk.0.ffn_down.weight" => vec![64, 32],
+                "mm.0.weight" => vec![128, 128],
+                "mm.0.bias" => vec![128],
+                "mm.2.weight" => vec![128, 32],
+                _ => dimensions
+                    .iter()
+                    .map(|dimension| if *dimension == 8 { 32 } else { *dimension })
+                    .collect(),
+            };
+            if matches!(
+                name.as_str(),
+                "v.blk.0.attn_qkv.weight"
+                    | "v.blk.0.attn_out.weight"
+                    | "v.blk.0.ffn_up.weight"
+                    | "v.blk.0.ffn_down.weight"
+                    | "mm.0.weight"
+                    | "mm.2.weight"
+            ) {
+                *encoding = GgmlType::Q8_0;
+            }
+        }
+        specs
     }
 
     fn qwen35_gguf_specs(is_moe: bool) -> Vec<(String, Vec<u64>, GgmlType)> {
@@ -8381,6 +8511,89 @@ mod tests {
     }
 
     #[test]
+    fn qwen35_q8_sibling_projector_is_bound_and_validated() {
+        let directory = tempfile::tempdir().unwrap();
+        let model = directory.path().join("Qwen3.5-model-F16.gguf");
+        let projector = directory.path().join("mmproj-Qwen3.5-Q8_0.gguf");
+        write_complete_qwen35_gguf(&model, false, |_| {});
+        write_gguf_specs(
+            &projector,
+            &qwen35_mmproj_metadata(),
+            &qwen35_mmproj_specs(),
+        );
+
+        let report = inspect_model(&model, ModelInspectionOptions::default()).unwrap();
+        assert_eq!(report.structural_binding, InspectionReadiness::Ready);
+        assert_eq!(
+            report.multimodal,
+            if cfg!(feature = "image-processing") {
+                InspectionReadiness::Ready
+            } else {
+                InspectionReadiness::Unsupported
+            }
+        );
+        assert!(report.requirements.iter().any(|requirement| {
+            requirement.code == InspectionIssueCode::MissingMediaProjector
+                && requirement.readiness == InspectionReadiness::Ready
+                && requirement.path.as_deref() == Some(projector.as_path())
+        }));
+
+        let checkpoint = GgufCheckpoint::open(&model).unwrap();
+        let metadata = crate::runtime::checkpoint::load::gguf_metadata(&checkpoint);
+        let mmproj = crate::architectures::qwen::hybrid::qwen3_5::open_sibling_mmproj(&model)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            structural::validate_qwen35_projector_gguf(
+                &checkpoint,
+                &metadata,
+                &mmproj.checkpoint,
+                &mmproj.metadata,
+            ),
+            structural::StructuralValidation::Exact
+        );
+        let execution =
+            safemlx::ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
+        let prepared = crate::architectures::qwen::hybrid::qwen3_5::prepare_qwen35_gguf_checkpoint(
+            &checkpoint,
+            &metadata,
+            Some(&mmproj),
+            execution.stream(),
+        )
+        .unwrap();
+        assert_eq!(prepared.modalities.image_token_id, Some(30));
+        assert_eq!(prepared.modalities.video_token_id, Some(31));
+        let vision = prepared.modalities.vision_config.as_ref().unwrap();
+        assert_eq!(vision.quantized_weight_configs.len(), 6);
+        let store = crate::architectures::qwen::hybrid::layerwise::qwen_hybrid_gguf_store(
+            &checkpoint,
+            Some(&mmproj),
+            Some(vision),
+            1,
+        )
+        .unwrap();
+        assert!(store.keys().contains(&"model.embed_tokens.weight".into()));
+        assert!(store
+            .keys()
+            .contains(&"visual.blocks.0.attn.qkv.weight".into()));
+        assert_eq!(store.diagnostics().unwrap().physical_reads, 0);
+
+        let invalid_directory = tempfile::tempdir().unwrap();
+        let invalid_model = invalid_directory.path().join("Qwen3.5-model-F16.gguf");
+        let invalid_projector = invalid_directory.path().join("mmproj-Qwen3.5-Q8_0.gguf");
+        write_complete_qwen35_gguf(&invalid_model, false, |_| {});
+        let mut specs = qwen35_mmproj_specs();
+        specs.retain(|(name, _, _)| name != "mm.2.weight");
+        write_gguf_specs(&invalid_projector, &qwen35_mmproj_metadata(), &specs);
+        let report = inspect_model(&invalid_model, ModelInspectionOptions::default()).unwrap();
+        assert_eq!(report.multimodal, InspectionReadiness::Invalid);
+        assert!(report.issues.iter().any(|issue| {
+            issue.code == InspectionIssueCode::MissingRequiredTensor
+                && issue.tensor_name.as_deref() == Some("mm.2.weight")
+        }));
+    }
+
+    #[test]
     fn qwen35_gguf_missing_tensor_and_shape_mismatch_are_structured() {
         let directory = tempfile::tempdir().unwrap();
         let missing = directory.path().join("missing-qkv.gguf");
@@ -8995,9 +9208,12 @@ mod tests {
             |specs| {
                 specs
                     .iter_mut()
-                    .find(|(name, _, _)| name == "mm.0.weight")
-                    .unwrap()
-                    .2 = GgmlType::Q4_0;
+                    .find(|(name, _, _)| name == "v.post_ln.weight")
+                    .map(|(_, shape, encoding)| {
+                        *shape = vec![32];
+                        *encoding = GgmlType::Q4_0;
+                    })
+                    .unwrap();
             },
         );
         let encoding_report =
@@ -9007,7 +9223,7 @@ mod tests {
             .iter()
             .find(|issue| issue.code == InspectionIssueCode::UnsupportedTensorEncoding)
             .unwrap();
-        assert_eq!(issue.tensor_name.as_deref(), Some("mm.0.weight"));
+        assert_eq!(issue.tensor_name.as_deref(), Some("v.post_ln.weight"));
         assert_eq!(issue.tensor_type_code, Some(GgmlType::Q4_0.code()));
         assert!(!encoding_report.is_loadable());
     }

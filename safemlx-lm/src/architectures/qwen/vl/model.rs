@@ -13,7 +13,7 @@ use safemlx::{
     ops::{
         concatenate_axis,
         indexing::{masked_scatter, TryIndexOp},
-        stack_axis, zeros_dtype, GgufCheckpoint, GgufMetadataArray, GgufMetadataValue,
+        stack_axis, zeros_dtype, GgufCheckpoint, GgufMetadataArray, GgufMetadataValue, GgufTensor,
     },
     quantization::MaybeQuantized,
     Array, Stream,
@@ -46,7 +46,8 @@ use crate::{
         ConcatKeyValueCache, KeyValueCache,
     },
     runtime::checkpoint::load::{
-        gguf_metadata, load_named_array_strict, load_safetensors_dir_quantized_strict,
+        gguf_metadata, gguf_quantization_configs, load_named_array_strict,
+        load_named_iq_array_strict, load_safetensors_dir_quantized_strict,
         load_safetensors_dir_strict, StrictLoadConfig, StrictLoadReport,
     },
     runtime::checkpoint::quantization::WeightQuantization,
@@ -1121,43 +1122,15 @@ pub(crate) fn load_qwen3_vl_gguf_checkpoint(
             }
         }
     }
-    let mut vision_materializer = vision_checkpoint.materializer();
-    for tensor in vision_checkpoint.catalog().tensors() {
-        let name = &tensor.descriptor().name;
-        if matches!(
-            name.as_str(),
-            "v.patch_embd.weight" | "v.patch_embd.weight.1"
-        ) {
-            continue;
-        }
-        for (name, value) in vision_materializer.converted_tensor(name)?.into_arrays() {
-            let name =
-                translate_qwen3_vl_mmproj_name(&name, &model.args.vision_config.deepstack_layers());
-            load_named_array_strict(&mut model, name, value, None, &config, &mut report)?;
-        }
-    }
-    let first = vision_materializer
-        .converted_tensor("v.patch_embd.weight")?
-        .into_arrays()
-        .into_iter()
-        .next()
-        .ok_or_else(|| Error::UnsupportedArchitecture("empty patch embedding tensor".into()))?
-        .1;
-    let second = vision_materializer
-        .converted_tensor("v.patch_embd.weight.1")?
-        .into_arrays()
-        .into_iter()
-        .next()
-        .ok_or_else(|| Error::UnsupportedArchitecture("empty patch embedding tensor".into()))?
-        .1;
-    let patch = stack_axis(&[first, second], 2, weights_stream)?;
-    load_named_array_strict(
+    let deepstack = model.args.vision_config.deepstack_layers();
+    load_qwen_vision_mmproj_weights(
         &mut model,
-        "model.visual.patch_embed.proj.weight".into(),
-        patch,
-        None,
+        vision_checkpoint,
+        "model.visual",
+        &deepstack,
         &config,
         &mut report,
+        weights_stream,
     )?;
     report.finish(&model, &config)?;
     model.copy_to_stream(stream)?;
@@ -1216,31 +1189,50 @@ pub(crate) fn qwen3_vl_args_from_gguf_catalog(
     validate_qwen3_vl_mmproj(vision_metadata)?;
     let (mrope_section, image_token_id, video_token_id) =
         validate_qwen3_vl_text_gguf_catalog(&text_config, metadata)?;
-    let deepstack_visual_indexes = gguf_deepstack_layers(vision_metadata)?;
-    let hidden_size =
-        dense_qwen::gguf_i32_catalog(vision_metadata, "clip.vision.embedding_length")?;
-    let position_layout = vision_checkpoint
+    let vision_config =
+        qwen_vision_config_from_gguf_catalog(vision_checkpoint, vision_metadata, "Qwen3-VL")?;
+    validate_qwen3_vl_vision_geometry(&text_config, metadata, &vision_config)?;
+    Ok(ModelArgs {
+        text_config,
+        vision_config,
+        image_token_id,
+        video_token_id,
+        mrope_section,
+    })
+}
+
+/// Builds the shared Qwen vision geometry and checkpoint-native projection
+/// formats from a llama.cpp-style `clip` projector catalog.
+pub(crate) fn qwen_vision_config_from_gguf_catalog(
+    checkpoint: &GgufCheckpoint,
+    metadata: &HashMap<String, GgufMetadataValue>,
+    family: &str,
+) -> Result<VisionConfig, Error> {
+    validate_qwen3_vl_mmproj(metadata)?;
+    let deepstack_visual_indexes = gguf_deepstack_layers(metadata)?;
+    let hidden_size = dense_qwen::gguf_i32_catalog(metadata, "clip.vision.embedding_length")?;
+    let position_layout = checkpoint
         .catalog()
         .tensors()
         .find(|tensor| tensor.descriptor().name == "v.position_embd.weight")
         .and_then(|tensor| tensor.outputs().first())
         .ok_or_else(|| {
-            Error::UnsupportedArchitecture(
-                "qwen3vl mmproj is missing v.position_embd.weight".into(),
-            )
+            Error::UnsupportedArchitecture(format!(
+                "{family} mmproj is missing v.position_embd.weight"
+            ))
         })?;
     if position_layout.shape.len() != 2 || position_layout.shape[1] != hidden_size as u64 {
         return Err(Error::UnsupportedArchitecture(format!(
-            "unexpected qwen3vl position embedding shape {:?}",
+            "unexpected {family} position embedding shape {:?}",
             position_layout.shape
         )));
     }
-    let depth = dense_qwen::gguf_i32_catalog(vision_metadata, "clip.vision.block_count")?;
+    let depth = dense_qwen::gguf_i32_catalog(metadata, "clip.vision.block_count")?;
     let depth = usize::try_from(depth)
         .ok()
         .filter(|depth| *depth > 0)
         .ok_or_else(|| {
-            Error::UnsupportedArchitecture("qwen3vl GGUF vision depth must be positive".into())
+            Error::UnsupportedArchitecture(format!("{family} GGUF vision depth must be positive"))
         })?;
     let mut layer_policies = vec![
         VisionLayerPolicy {
@@ -1256,56 +1248,59 @@ pub(crate) fn qwen3_vl_args_from_gguf_catalog(
             .filter(|index| *index < depth)
             .ok_or_else(|| {
                 Error::UnsupportedArchitecture(format!(
-                    "qwen3vl GGUF DeepStack layer {layer} is outside vision depth {depth}"
+                    "{family} GGUF DeepStack layer {layer} is outside vision depth {depth}"
                 ))
             })?;
         if !seen.insert(index) {
             return Err(Error::UnsupportedArchitecture(format!(
-                "qwen3vl GGUF DeepStack layer {layer} is duplicated"
+                "{family} GGUF DeepStack layer {layer} is duplicated"
             )));
         }
         layer_policies[index].deepstack_merger = Some(u32::try_from(merger).map_err(|_| {
-            Error::UnsupportedArchitecture("qwen3vl GGUF has too many DeepStack layers".into())
+            Error::UnsupportedArchitecture(format!("{family} GGUF has too many DeepStack layers"))
         })?);
     }
-    let vision_config = VisionConfig {
-        layer_schedule: crate::runtime::attention::LayerSchedule::new(depth, layer_policies)
-            .map_err(|error| {
-                Error::UnsupportedArchitecture(format!("qwen3vl GGUF vision {error}"))
-            })?,
+    let deepstack = layer_policies
+        .iter()
+        .enumerate()
+        .filter_map(|(layer, policy)| policy.deepstack_merger.map(|order| (order, layer as i32)))
+        .collect::<BTreeMap<_, _>>()
+        .into_values()
+        .collect::<Vec<_>>();
+    let quantized_weight_configs = gguf_quantization_configs(checkpoint, |name| {
+        let translated = translate_qwen3_vl_mmproj_name(name, &deepstack);
+        translated
+            .strip_prefix("model.visual.")
+            .unwrap_or(&translated)
+            .to_string()
+    })?;
+    for format in quantized_weight_configs.values() {
+        format.validate()?;
+    }
+    Ok(VisionConfig {
+        layer_schedule: LayerSchedule::new(depth, layer_policies).map_err(|error| {
+            Error::UnsupportedArchitecture(format!("{family} GGUF vision {error}"))
+        })?,
         hidden_size,
         hidden_act: "gelu_pytorch_tanh".into(),
         intermediate_size: dense_qwen::gguf_i32_catalog(
-            vision_metadata,
+            metadata,
             "clip.vision.feed_forward_length",
         )?,
-        num_heads: dense_qwen::gguf_i32_catalog(
-            vision_metadata,
-            "clip.vision.attention.head_count",
-        )?,
+        num_heads: dense_qwen::gguf_i32_catalog(metadata, "clip.vision.attention.head_count")?,
         num_position_embeddings: i32::try_from(position_layout.shape[0]).map_err(|_| {
-            Error::UnsupportedArchitecture("qwen3vl position count exceeds i32".into())
+            Error::UnsupportedArchitecture(format!("{family} position count exceeds i32"))
         })?,
         in_channels: 3,
-        patch_size: dense_qwen::gguf_i32_catalog(vision_metadata, "clip.vision.patch_size")?,
+        patch_size: dense_qwen::gguf_i32_catalog(metadata, "clip.vision.patch_size")?,
         spatial_merge_size: dense_qwen::gguf_i32_catalog(
-            vision_metadata,
+            metadata,
             "clip.vision.spatial_merge_size",
         )?,
         temporal_patch_size: 2,
         window_size: 112,
-        out_hidden_size: dense_qwen::gguf_i32_catalog(
-            vision_metadata,
-            "clip.vision.projection_dim",
-        )?,
-    };
-    validate_qwen3_vl_vision_geometry(&text_config, metadata, &vision_config)?;
-    Ok(ModelArgs {
-        text_config,
-        vision_config,
-        image_token_id,
-        video_token_id,
-        mrope_section,
+        out_hidden_size: dense_qwen::gguf_i32_catalog(metadata, "clip.vision.projection_dim")?,
+        quantized_weight_configs,
     })
 }
 
@@ -1447,7 +1442,10 @@ fn gguf_deepstack_layers(metadata: &HashMap<String, GgufMetadataValue>) -> Resul
         .map_err(|_| Error::UnsupportedArchitecture("DeepStack layer index exceeds i32".into()))
 }
 
-fn gguf_token_id(metadata: &HashMap<String, GgufMetadataValue>, token: &str) -> Result<u32, Error> {
+pub(crate) fn gguf_token_id(
+    metadata: &HashMap<String, GgufMetadataValue>,
+    token: &str,
+) -> Result<u32, Error> {
     let tokens = metadata
         .get("tokenizer.ggml.tokens")
         .and_then(GgufMetadataValue::as_strings)
@@ -1502,6 +1500,69 @@ pub(crate) fn translate_qwen3_vl_mmproj_name(name: &str, deepstack_layers: &[i32
         }
     }
     name.to_string()
+}
+
+/// Loads one shared Qwen vision projector into an architecture-selected root.
+pub(crate) fn load_qwen_vision_mmproj_weights<M: safemlx::module::ModuleParameters>(
+    model: &mut M,
+    checkpoint: &GgufCheckpoint,
+    root: &str,
+    deepstack_layers: &[i32],
+    config: &StrictLoadConfig,
+    report: &mut StrictLoadReport,
+    weights_stream: &Stream,
+) -> Result<(), Error> {
+    let translate = |name: &str| {
+        let translated = translate_qwen3_vl_mmproj_name(name, deepstack_layers);
+        translated
+            .strip_prefix("model.visual")
+            .map(|suffix| format!("{root}{suffix}"))
+            .unwrap_or(translated)
+    };
+    let mut materializer = checkpoint.materializer();
+    for tensor in checkpoint.catalog().tensors() {
+        let name = &tensor.descriptor().name;
+        if matches!(
+            name.as_str(),
+            "v.patch_embd.weight" | "v.patch_embd.weight.1"
+        ) {
+            continue;
+        }
+        let converted = materializer.converted_tensor(name)?;
+        let native = matches!(converted, GgufTensor::IQuant(_));
+        for (name, value) in converted.into_arrays() {
+            let name = translate(&name);
+            if native {
+                load_named_iq_array_strict(model, name, value, config, report);
+            } else {
+                load_named_array_strict(model, name, value, None, config, report)?;
+            }
+        }
+    }
+    let first = materializer
+        .converted_tensor("v.patch_embd.weight")?
+        .into_arrays()
+        .into_iter()
+        .next()
+        .ok_or_else(|| Error::UnsupportedArchitecture("empty patch embedding tensor".into()))?
+        .1;
+    let second = materializer
+        .converted_tensor("v.patch_embd.weight.1")?
+        .into_arrays()
+        .into_iter()
+        .next()
+        .ok_or_else(|| Error::UnsupportedArchitecture("empty patch embedding tensor".into()))?
+        .1;
+    let patch = stack_axis(&[first, second], 2, weights_stream)?;
+    load_named_array_strict(
+        model,
+        format!("{root}.patch_embed.proj.weight"),
+        patch,
+        None,
+        config,
+        report,
+    )?;
+    Ok(())
 }
 
 /// Finds the dense sibling mmproj used by the single-path dense or MoE loader.
@@ -1620,6 +1681,7 @@ mod tests {
             temporal_patch_size: 2,
             window_size: 8,
             out_hidden_size: 12,
+            quantized_weight_configs: Default::default(),
         };
         super::ModelArgs {
             text_config,
@@ -1880,13 +1942,16 @@ mod tests {
     }
 
     #[test]
-    fn strict_loads_dense_qwen3_vl_from_synthetic_gguf_checkpoints() {
+    fn strict_loads_q8_qwen_vision_from_synthetic_gguf_checkpoints() {
         let context = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
         let stream = context.stream();
         let mut source_args = tiny_args();
         source_args.text_config.num_hidden_layers = 2;
         source_args.text_config.attention_schedule =
             crate::runtime::attention::LayerSchedule::all_full(2).unwrap();
+        source_args.vision_config.hidden_size = 32;
+        source_args.vision_config.intermediate_size = 32;
+        source_args.vision_config.num_heads = 4;
         let mut source = super::Model::new(source_args, stream).unwrap();
         for (name, parameter) in source.parameters_mut().flatten() {
             let shape = parameter.shape().to_vec();
@@ -2018,7 +2083,7 @@ mod tests {
             ),
             (
                 "clip.vision.embedding_length".into(),
-                GgufMetadataValue::Uint32(8),
+                GgufMetadataValue::Uint32(32),
             ),
             (
                 "clip.vision.block_count".into(),
@@ -2026,11 +2091,11 @@ mod tests {
             ),
             (
                 "clip.vision.feed_forward_length".into(),
-                GgufMetadataValue::Uint32(16),
+                GgufMetadataValue::Uint32(32),
             ),
             (
                 "clip.vision.attention.head_count".into(),
-                GgufMetadataValue::Uint32(2),
+                GgufMetadataValue::Uint32(4),
             ),
             (
                 "clip.vision.patch_size".into(),
@@ -2051,8 +2116,21 @@ mod tests {
         ]);
 
         let fixture = crate::test_utils::SyntheticGguf::dense(&arrays, &metadata);
-        let vision_fixture =
-            crate::test_utils::SyntheticGguf::dense(&vision_arrays, &vision_metadata);
+        let vision_fixture = crate::test_utils::SyntheticGguf::with_packed_tensors(
+            &vision_arrays,
+            &vision_metadata,
+            |name, _| {
+                (name.ends_with("attn_qkv.weight")
+                    || name.ends_with("attn_out.weight")
+                    || name.ends_with("ffn_up.weight")
+                    || name.ends_with("ffn_down.weight")
+                    || name == "mm.0.weight"
+                    || name == "mm.2.weight"
+                    || name.ends_with("fc1.weight")
+                    || name.ends_with("fc2.weight"))
+                .then_some(safemlx_gguf::GgmlType::Q8_0)
+            },
+        );
         let mut loaded = super::load_qwen3_vl_gguf_with_metadata(
             fixture.path(),
             vision_fixture.path(),

@@ -1,5 +1,7 @@
 //! Shared Qwen vision-language encoder building blocks.
 
+use std::collections::HashMap;
+
 use safemlx::{
     error::Exception,
     macros::ModuleParameters,
@@ -10,14 +12,18 @@ use safemlx::{
         indexing::{NewAxis, TryIndexOp},
         matmul,
     },
+    quantization::MaybeQuantized,
     Array, Dtype, Stream,
 };
 use serde::Deserialize;
 
 use crate::{
     error::Error,
-    nn::layers::silu,
-    runtime::{attention::LayerSchedule, cache::ConcatKeyValueCache},
+    nn::{layers::silu, linear::unloaded_maybe_quantized_linear},
+    runtime::{
+        attention::LayerSchedule, cache::ConcatKeyValueCache,
+        checkpoint::quantization::WeightQuantization,
+    },
 };
 
 #[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
@@ -74,6 +80,9 @@ pub struct VisionConfig {
     pub window_size: i32,
     /// Output hidden size projected into the language model space.
     pub out_hidden_size: i32,
+    /// Checkpoint-native projection formats keyed by the canonical relative
+    /// vision parameter name.
+    pub quantized_weight_configs: HashMap<String, WeightQuantization>,
 }
 
 impl VisionConfig {
@@ -125,6 +134,10 @@ impl VisionConfig {
             })
             .collect::<Vec<_>>()
             .join(",")
+    }
+
+    fn weight_format(&self, name: &str) -> Option<WeightQuantization> {
+        self.quantized_weight_configs.get(name).copied()
     }
 
     fn validate_for_mode(&self, mode: VisionMode) -> Result<(), Exception> {
@@ -220,13 +233,14 @@ impl VisionConfigSource {
 
     pub(crate) fn normalize_qwen3_5(self) -> Result<VisionConfig, Error> {
         let depth = positive_depth(self.depth, "Qwen3.5")?;
-        let full = self
-            .fullatt_block_indexes
-            .clone()
-            .unwrap_or_else(default_vision_fullatt_block_indexes);
-        let mut attention = vec![VisionAttentionPolicy::Windowed; depth];
+        let explicit_full = self.fullatt_block_indexes.clone();
+        let mut attention = if explicit_full.is_some() {
+            vec![VisionAttentionPolicy::Windowed; depth]
+        } else {
+            vec![VisionAttentionPolicy::Full; depth]
+        };
         let mut seen = std::collections::BTreeSet::new();
-        for layer in full {
+        for layer in explicit_full.unwrap_or_default() {
             let index = checked_layer_index(layer, depth, "Qwen3.5 full-attention")?;
             if !seen.insert(index) {
                 return Err(Error::UnsupportedArchitecture(format!(
@@ -287,6 +301,7 @@ impl VisionConfigSource {
             temporal_patch_size: self.temporal_patch_size,
             window_size,
             out_hidden_size: self.out_hidden_size,
+            quantized_weight_configs: HashMap::new(),
         })
     }
 }
@@ -347,10 +362,6 @@ fn default_vision_window_size() -> i32 {
 fn default_vision_out_hidden_size() -> i32 {
     3584
 }
-fn default_vision_fullatt_block_indexes() -> Vec<i32> {
-    vec![7, 15, 23, 31]
-}
-
 #[derive(Debug, Clone, ModuleParameters)]
 /// Layer normalization used by Qwen vision encoders.
 ///
@@ -483,28 +494,29 @@ pub struct QwenVisionMlp {
     pub hidden_act: String,
     #[param]
     /// First projection.
-    pub linear_fc1: nn::Linear,
+    pub linear_fc1: MaybeQuantized<nn::Linear>,
     #[param]
     /// Second projection.
-    pub linear_fc2: nn::Linear,
+    pub linear_fc2: MaybeQuantized<nn::Linear>,
 }
 
 impl QwenVisionMlp {
-    fn new(config: &VisionConfig, stream: &Stream) -> Result<Self, Exception> {
+    fn new(config: &VisionConfig, index: usize, stream: &Stream) -> Result<Self, Exception> {
+        let prefix = format!("blocks.{index}.mlp");
         Ok(Self {
             hidden_act: config.hidden_act.clone(),
-            linear_fc1: nn::Linear::unloaded(
+            linear_fc1: unloaded_maybe_quantized_linear(
                 config.hidden_size,
                 config.intermediate_size,
                 true,
-                Dtype::Float32,
+                config.weight_format(&format!("{prefix}.linear_fc1.weight")),
                 stream,
             )?,
-            linear_fc2: nn::Linear::unloaded(
+            linear_fc2: unloaded_maybe_quantized_linear(
                 config.intermediate_size,
                 config.hidden_size,
                 true,
-                Dtype::Float32,
+                config.weight_format(&format!("{prefix}.linear_fc2.weight")),
                 stream,
             )?,
         })
@@ -544,11 +556,11 @@ impl QwenVisionMlp {
             stream,
         )?;
         let mut partial = self.linear_fc2.forward(&hidden, stream)?;
-        if let Some(bias) = self.linear_fc2.bias.as_ref() {
+        if let Some(bias) = maybe_quantized_linear_bias(&self.linear_fc2) {
             partial = partial.subtract(bias, stream)?;
         }
         let mut output = safemlx::distributed::all_sum(&partial, group, stream)?;
-        if let Some(bias) = self.linear_fc2.bias.as_ref() {
+        if let Some(bias) = maybe_quantized_linear_bias(&self.linear_fc2) {
             output = output.add(bias, stream)?;
         }
         Ok(output)
@@ -557,6 +569,13 @@ impl QwenVisionMlp {
     fn training_mode(&mut self, mode: bool) {
         self.linear_fc1.training_mode(mode);
         self.linear_fc2.training_mode(mode);
+    }
+}
+
+fn maybe_quantized_linear_bias(linear: &MaybeQuantized<nn::Linear>) -> Option<&Array> {
+    match linear {
+        MaybeQuantized::Original(linear) => linear.bias.as_ref().as_ref(),
+        MaybeQuantized::Quantized(linear) => linear.inner.bias.as_ref().as_ref(),
     }
 }
 
@@ -571,14 +590,14 @@ pub struct QwenVisionAttention {
     pub scale: f32,
     #[param]
     /// Packed query/key/value projection.
-    pub qkv: nn::Linear,
+    pub qkv: MaybeQuantized<nn::Linear>,
     #[param]
     /// Output projection.
-    pub proj: nn::Linear,
+    pub proj: MaybeQuantized<nn::Linear>,
 }
 
 impl QwenVisionAttention {
-    fn new(config: &VisionConfig, stream: &Stream) -> Result<Self, Exception> {
+    fn new(config: &VisionConfig, index: usize, stream: &Stream) -> Result<Self, Exception> {
         if config.hidden_size % config.num_heads != 0 {
             return Err(Exception::custom(format!(
                 "Qwen VL vision hidden_size {} is not divisible by num_heads {}",
@@ -586,22 +605,23 @@ impl QwenVisionAttention {
             )));
         }
         let head_dim = config.hidden_size / config.num_heads;
+        let prefix = format!("blocks.{index}.attn");
         Ok(Self {
             num_heads: config.num_heads,
             head_dim,
             scale: (head_dim as f32).sqrt().recip(),
-            qkv: nn::Linear::unloaded(
+            qkv: unloaded_maybe_quantized_linear(
                 config.hidden_size,
                 config.hidden_size * 3,
                 true,
-                Dtype::Float32,
+                config.weight_format(&format!("{prefix}.qkv.weight")),
                 stream,
             )?,
-            proj: nn::Linear::unloaded(
+            proj: unloaded_maybe_quantized_linear(
                 config.hidden_size,
                 config.hidden_size,
                 true,
-                Dtype::Float32,
+                config.weight_format(&format!("{prefix}.proj.weight")),
                 stream,
             )?,
         })
@@ -609,6 +629,7 @@ impl QwenVisionAttention {
 
     pub(crate) fn new_tensor_parallel(
         config: &VisionConfig,
+        index: usize,
         local_heads: i32,
         stream: &Stream,
     ) -> Result<Self, Exception> {
@@ -619,22 +640,23 @@ impl QwenVisionAttention {
         }
         let head_dim = config.hidden_size / config.num_heads;
         let local_width = local_heads * head_dim;
+        let prefix = format!("blocks.{index}.attn");
         Ok(Self {
             num_heads: local_heads,
             head_dim,
             scale: (head_dim as f32).sqrt().recip(),
-            qkv: nn::Linear::unloaded(
+            qkv: unloaded_maybe_quantized_linear(
                 config.hidden_size,
                 3 * local_width,
                 true,
-                Dtype::Float32,
+                config.weight_format(&format!("{prefix}.qkv.weight")),
                 stream,
             )?,
-            proj: nn::Linear::unloaded(
+            proj: unloaded_maybe_quantized_linear(
                 local_width,
                 config.hidden_size,
                 true,
-                Dtype::Float32,
+                config.weight_format(&format!("{prefix}.proj.weight")),
                 stream,
             )?,
         })
@@ -703,11 +725,11 @@ impl QwenVisionAttention {
         stream: &Stream,
     ) -> Result<Array, Exception> {
         let mut partial = self.forward(hidden_states, chunk_lengths, cos, sin, stream)?;
-        if let Some(bias) = self.proj.bias.as_ref() {
+        if let Some(bias) = maybe_quantized_linear_bias(&self.proj) {
             partial = partial.subtract(bias, stream)?;
         }
         let mut output = safemlx::distributed::all_sum(&partial, group, stream)?;
-        if let Some(bias) = self.proj.bias.as_ref() {
+        if let Some(bias) = maybe_quantized_linear_bias(&self.proj) {
             output = output.add(bias, stream)?;
         }
         Ok(output)
@@ -737,35 +759,41 @@ pub struct QwenVisionBlock {
 }
 
 impl QwenVisionBlock {
-    pub(crate) fn new(config: &VisionConfig, stream: &Stream) -> Result<Self, Exception> {
+    pub(crate) fn new(
+        config: &VisionConfig,
+        index: usize,
+        stream: &Stream,
+    ) -> Result<Self, Exception> {
         Ok(Self {
             norm1: QwenVisionRmsNorm::new(config.hidden_size, 1e-6, stream)?,
-            attn: QwenVisionAttention::new(config, stream)?,
+            attn: QwenVisionAttention::new(config, index, stream)?,
             norm2: QwenVisionRmsNorm::new(config.hidden_size, 1e-6, stream)?,
-            mlp: QwenVisionMlp::new(config, stream)?,
+            mlp: QwenVisionMlp::new(config, index, stream)?,
         })
     }
 
     pub(crate) fn new_tensor_parallel(
         config: &VisionConfig,
+        index: usize,
         local_heads: i32,
         local_intermediate: i32,
         stream: &Stream,
     ) -> Result<Self, Exception> {
-        let mut block = Self::new(config, stream)?;
-        block.attn = QwenVisionAttention::new_tensor_parallel(config, local_heads, stream)?;
-        block.mlp.linear_fc1 = nn::Linear::unloaded(
+        let mut block = Self::new(config, index, stream)?;
+        block.attn = QwenVisionAttention::new_tensor_parallel(config, index, local_heads, stream)?;
+        let prefix = format!("blocks.{index}.mlp");
+        block.mlp.linear_fc1 = unloaded_maybe_quantized_linear(
             config.hidden_size,
             local_intermediate,
             true,
-            Dtype::Float32,
+            config.weight_format(&format!("{prefix}.linear_fc1.weight")),
             stream,
         )?;
-        block.mlp.linear_fc2 = nn::Linear::unloaded(
+        block.mlp.linear_fc2 = unloaded_maybe_quantized_linear(
             local_intermediate,
             config.hidden_size,
             true,
-            Dtype::Float32,
+            config.weight_format(&format!("{prefix}.linear_fc2.weight")),
             stream,
         )?;
         Ok(block)
@@ -834,15 +862,16 @@ pub struct QwenVisionPatchMerger {
     pub norm: QwenVisionRmsNorm,
     #[param]
     /// First merger projection.
-    pub linear_fc1: nn::Linear,
+    pub linear_fc1: MaybeQuantized<nn::Linear>,
     #[param]
     /// Final projection into language hidden size.
-    pub linear_fc2: nn::Linear,
+    pub linear_fc2: MaybeQuantized<nn::Linear>,
 }
 
 impl QwenVisionPatchMerger {
     fn new(
         config: &VisionConfig,
+        parameter_prefix: &str,
         use_postshuffle_norm: bool,
         approximate_gelu: bool,
         stream: &Stream,
@@ -864,18 +893,18 @@ impl QwenVisionPatchMerger {
                 1e-6,
                 stream,
             )?,
-            linear_fc1: nn::Linear::unloaded(
+            linear_fc1: unloaded_maybe_quantized_linear(
                 hidden_size,
                 hidden_size,
                 true,
-                Dtype::Float32,
+                config.weight_format(&format!("{parameter_prefix}.linear_fc1.weight")),
                 stream,
             )?,
-            linear_fc2: nn::Linear::unloaded(
+            linear_fc2: unloaded_maybe_quantized_linear(
                 hidden_size,
                 config.out_hidden_size,
                 true,
-                Dtype::Float32,
+                config.weight_format(&format!("{parameter_prefix}.linear_fc2.weight")),
                 stream,
             )?,
         })
@@ -883,6 +912,7 @@ impl QwenVisionPatchMerger {
 
     pub(crate) fn new_tensor_parallel(
         config: &VisionConfig,
+        parameter_prefix: &str,
         use_postshuffle_norm: bool,
         approximate_gelu: bool,
         local_hidden_size: i32,
@@ -905,18 +935,18 @@ impl QwenVisionPatchMerger {
                 1e-6,
                 stream,
             )?,
-            linear_fc1: nn::Linear::unloaded(
+            linear_fc1: unloaded_maybe_quantized_linear(
                 hidden_size,
                 local_hidden_size,
                 true,
-                Dtype::Float32,
+                config.weight_format(&format!("{parameter_prefix}.linear_fc1.weight")),
                 stream,
             )?,
-            linear_fc2: nn::Linear::unloaded(
+            linear_fc2: unloaded_maybe_quantized_linear(
                 local_hidden_size,
                 config.out_hidden_size,
                 true,
-                Dtype::Float32,
+                config.weight_format(&format!("{parameter_prefix}.linear_fc2.weight")),
                 stream,
             )?,
         })
@@ -972,13 +1002,12 @@ impl QwenVisionPatchMerger {
         } else {
             nn::gelu(hidden_states, stream)?
         };
-        let partial = safemlx::ops::matmul(
-            &hidden_states,
-            self.linear_fc2.weight.value.transpose(stream)?,
-            stream,
-        )?;
+        let mut partial = self.linear_fc2.forward(&hidden_states, stream)?;
+        if let Some(bias) = maybe_quantized_linear_bias(&self.linear_fc2) {
+            partial = partial.subtract(bias, stream)?;
+        }
         let mut output = safemlx::distributed::all_sum(&partial, group, stream)?;
-        if let Some(bias) = self.linear_fc2.bias.as_ref() {
+        if let Some(bias) = maybe_quantized_linear_bias(&self.linear_fc2) {
             output = output.add(bias, stream)?;
         }
         Ok(output)
@@ -1255,86 +1284,98 @@ impl QwenVisionLayerwiseStatic {
 pub(crate) fn vision_parallel_parameter_groups(
     config: &VisionConfig,
     prefix: &str,
+    stream: &Stream,
 ) -> Result<Vec<crate::runtime::distributed::parallel::ParameterGroupSpec>, Error> {
     use crate::runtime::distributed::parallel::{
-        MemberSharding, ParameterGroupSpec, ParameterMemberSpec, ParameterRole,
+        partitioned_projection_members, MemberSharding, ParameterGroupSpec, ParameterMemberSpec,
+        ParameterRole, ProjectionSharding,
     };
-    let hidden = usize::try_from(config.hidden_size)
-        .map_err(|_| Error::Parallel("Qwen vision hidden size is invalid".into()))?;
     let intermediate = usize::try_from(config.intermediate_size)
         .map_err(|_| Error::Parallel("Qwen vision intermediate size is invalid".into()))?;
+    let hidden = usize::try_from(config.hidden_size)
+        .map_err(|_| Error::Parallel("Qwen vision hidden size is invalid".into()))?;
+    let heads = usize::try_from(config.num_heads)
+        .map_err(|_| Error::Parallel("Qwen vision head count is invalid".into()))?;
     let mut groups = Vec::new();
     for index in 0..config.layer_count() {
         let block = format!("{prefix}.blocks.{index}");
-        groups.push(ParameterGroupSpec::new(
-            format!("{block}.attention.qkv"),
-            ParameterRole::Segmented,
-            [
-                ParameterMemberSpec::new(
-                    format!("{block}.attn.qkv.weight"),
-                    [3 * hidden, hidden],
-                    MemberSharding::Segmented {
+        let module = QwenVisionBlock::new(config, index, stream)?;
+        let qkv_prefix = format!("{block}.attn.qkv");
+        let output_prefix = format!("{block}.attn.proj");
+        let (attention_units, attention_members) = partitioned_projection_members(
+            &[
+                (
+                    &module.attn.qkv,
+                    qkv_prefix.as_str(),
+                    ProjectionSharding::Column,
+                ),
+                (
+                    &module.attn.proj,
+                    output_prefix.as_str(),
+                    ProjectionSharding::Row,
+                ),
+            ],
+            heads,
+        )?;
+        let attention_members = attention_members
+            .into_iter()
+            .map(|member| {
+                if !member.target().starts_with(&qkv_prefix) {
+                    return Ok(member);
+                }
+                let shape = member.global_shape();
+                let rows = *shape.first().ok_or_else(|| {
+                    Error::Parallel(format!(
+                        "Qwen vision QKV member {:?} is scalar",
+                        member.target()
+                    ))
+                })?;
+                if !rows.is_multiple_of(3) {
+                    return Err(Error::Parallel(format!(
+                        "Qwen vision QKV member {:?} has non-segmented shape {shape:?}",
+                        member.target()
+                    )));
+                }
+                let segment = rows / 3;
+                Ok(ParameterMemberSpec::new(
+                    member.target(),
+                    shape.to_vec(),
+                    MemberSharding::PartitionedSegments {
                         axis: 0,
-                        segments: vec![0..hidden, hidden..2 * hidden, 2 * hidden..3 * hidden],
+                        segments: vec![0..segment, segment..2 * segment, 2 * segment..3 * segment],
                     },
-                ),
-                ParameterMemberSpec::new(
-                    format!("{block}.attn.qkv.bias"),
-                    [3 * hidden],
-                    MemberSharding::Segmented {
-                        axis: 0,
-                        segments: vec![0..hidden, hidden..2 * hidden, 2 * hidden..3 * hidden],
-                    },
-                ),
-            ],
+                ))
+            })
+            .collect::<Result<Vec<_>, Error>>()?;
+        groups.push(ParameterGroupSpec::partitioned(
+            format!("{block}.attention.heads"),
+            ParameterRole::AttentionHeads,
+            attention_units,
+            attention_members,
         )?);
-        groups.push(ParameterGroupSpec::new(
-            format!("{block}.attention.output"),
-            ParameterRole::RowProjection,
-            [
-                ParameterMemberSpec::new(
-                    format!("{block}.attn.proj.weight"),
-                    [hidden, hidden],
-                    MemberSharding::Equal { axis: 1 },
+
+        let fc1_prefix = format!("{block}.mlp.linear_fc1");
+        let fc2_prefix = format!("{block}.mlp.linear_fc2");
+        let (mlp_units, mlp_members) = partitioned_projection_members(
+            &[
+                (
+                    &module.mlp.linear_fc1,
+                    fc1_prefix.as_str(),
+                    ProjectionSharding::Column,
                 ),
-                ParameterMemberSpec::new(
-                    format!("{block}.attn.proj.bias"),
-                    [hidden],
-                    MemberSharding::Replicated,
-                ),
-            ],
-        )?);
-        groups.push(ParameterGroupSpec::new(
-            format!("{block}.mlp.input"),
-            ParameterRole::ColumnProjection,
-            [
-                ParameterMemberSpec::new(
-                    format!("{block}.mlp.linear_fc1.weight"),
-                    [intermediate, hidden],
-                    MemberSharding::Equal { axis: 0 },
-                ),
-                ParameterMemberSpec::new(
-                    format!("{block}.mlp.linear_fc1.bias"),
-                    [intermediate],
-                    MemberSharding::Equal { axis: 0 },
+                (
+                    &module.mlp.linear_fc2,
+                    fc2_prefix.as_str(),
+                    ProjectionSharding::Row,
                 ),
             ],
-        )?);
-        groups.push(ParameterGroupSpec::new(
-            format!("{block}.mlp.output"),
-            ParameterRole::RowProjection,
-            [
-                ParameterMemberSpec::new(
-                    format!("{block}.mlp.linear_fc2.weight"),
-                    [hidden, intermediate],
-                    MemberSharding::Equal { axis: 1 },
-                ),
-                ParameterMemberSpec::new(
-                    format!("{block}.mlp.linear_fc2.bias"),
-                    [hidden],
-                    MemberSharding::Replicated,
-                ),
-            ],
+            intermediate,
+        )?;
+        groups.push(ParameterGroupSpec::partitioned(
+            format!("{block}.mlp.intermediate"),
+            ParameterRole::FeedForwardIntermediate,
+            mlp_units,
+            mlp_members,
         )?);
     }
     let merge = usize::try_from(config.spatial_merge_size)
@@ -1342,43 +1383,36 @@ pub(crate) fn vision_parallel_parameter_groups(
     let merger_hidden = hidden
         .checked_mul(merge.pow(2))
         .ok_or_else(|| Error::Parallel("Qwen vision merger width overflowed".into()))?;
-    let output = usize::try_from(config.out_hidden_size)
-        .map_err(|_| Error::Parallel("Qwen vision output width is invalid".into()))?;
     for merger in std::iter::once(format!("{prefix}.merger")).chain(
         (0..config.deepstack_layer_count())
             .map(|index| format!("{prefix}.deepstack_merger_list.{index}")),
     ) {
-        groups.push(ParameterGroupSpec::new(
-            format!("{merger}.input"),
-            ParameterRole::ColumnProjection,
-            [
-                ParameterMemberSpec::new(
-                    format!("{merger}.linear_fc1.weight"),
-                    [merger_hidden, merger_hidden],
-                    MemberSharding::Equal { axis: 0 },
+        let relative = merger.strip_prefix(&format!("{prefix}.")).ok_or_else(|| {
+            Error::Parallel(format!("invalid Qwen vision merger prefix {merger}"))
+        })?;
+        let module = QwenVisionPatchMerger::new(config, relative, false, false, stream)?;
+        let fc1_prefix = format!("{merger}.linear_fc1");
+        let fc2_prefix = format!("{merger}.linear_fc2");
+        let (units, members) = partitioned_projection_members(
+            &[
+                (
+                    &module.linear_fc1,
+                    fc1_prefix.as_str(),
+                    ProjectionSharding::Column,
                 ),
-                ParameterMemberSpec::new(
-                    format!("{merger}.linear_fc1.bias"),
-                    [merger_hidden],
-                    MemberSharding::Equal { axis: 0 },
-                ),
-            ],
-        )?);
-        groups.push(ParameterGroupSpec::new(
-            format!("{merger}.output"),
-            ParameterRole::RowProjection,
-            [
-                ParameterMemberSpec::new(
-                    format!("{merger}.linear_fc2.weight"),
-                    [output, merger_hidden],
-                    MemberSharding::Equal { axis: 1 },
-                ),
-                ParameterMemberSpec::new(
-                    format!("{merger}.linear_fc2.bias"),
-                    [output],
-                    MemberSharding::Replicated,
+                (
+                    &module.linear_fc2,
+                    fc2_prefix.as_str(),
+                    ProjectionSharding::Row,
                 ),
             ],
+            merger_hidden,
+        )?;
+        groups.push(ParameterGroupSpec::partitioned(
+            format!("{merger}.intermediate"),
+            ParameterRole::FeedForwardIntermediate,
+            units,
+            members,
         )?);
     }
     Ok(groups)
@@ -1391,32 +1425,36 @@ pub(crate) fn configure_vision_parallel_static(
     layout: &crate::runtime::distributed::parallel::LocalModelLayout,
     stream: &Stream,
 ) -> Result<(), Error> {
-    let target = format!("{prefix}.merger.linear_fc1.weight");
+    let target = format!("{prefix}.merger.linear_fc1");
     let local_hidden = i32::try_from(
         layout
-            .tensor(&target)
+            .tensor(&format!("{target}.weight"))
+            .or_else(|| layout.tensor(&format!("{target}.inner.weight")))
             .ok_or_else(|| Error::Parallel(format!("missing Qwen TP layout for {target}")))?
             .local_shape()[0],
     )
     .map_err(|_| Error::Parallel("Qwen vision merger width exceeds i32".into()))?;
     vision.merger = QwenVisionPatchMerger::new_tensor_parallel(
         &vision.config,
+        "merger",
         false,
         false,
         local_hidden,
         stream,
     )?;
     for (index, merger) in vision.deepstack_merger_list.iter_mut().enumerate() {
-        let target = format!("{prefix}.deepstack_merger_list.{index}.linear_fc1.weight");
+        let target = format!("{prefix}.deepstack_merger_list.{index}.linear_fc1");
         let local_hidden = i32::try_from(
             layout
-                .tensor(&target)
+                .tensor(&format!("{target}.weight"))
+                .or_else(|| layout.tensor(&format!("{target}.inner.weight")))
                 .ok_or_else(|| Error::Parallel(format!("missing Qwen TP layout for {target}")))?
                 .local_shape()[0],
         )
         .map_err(|_| Error::Parallel("Qwen DeepStack width exceeds i32".into()))?;
         *merger = QwenVisionPatchMerger::new_tensor_parallel(
             &vision.config,
+            &format!("deepstack_merger_list.{index}"),
             true,
             false,
             local_hidden,
@@ -1437,9 +1475,11 @@ pub(crate) fn new_parallel_vision_block(
     let block = format!("{prefix}.blocks.{index}");
     let qkv = layout
         .tensor(&format!("{block}.attn.qkv.weight"))
+        .or_else(|| layout.tensor(&format!("{block}.attn.qkv.inner.weight")))
         .ok_or_else(|| Error::Parallel(format!("missing TP layout for {block} QKV")))?;
     let fc1 = layout
         .tensor(&format!("{block}.mlp.linear_fc1.weight"))
+        .or_else(|| layout.tensor(&format!("{block}.mlp.linear_fc1.inner.weight")))
         .ok_or_else(|| Error::Parallel(format!("missing TP layout for {block} MLP")))?;
     let head_dim = config.hidden_size / config.num_heads;
     let local_heads = i32::try_from(qkv.local_shape()[0] / 3)
@@ -1447,7 +1487,7 @@ pub(crate) fn new_parallel_vision_block(
         / head_dim;
     let local_intermediate = i32::try_from(fc1.local_shape()[0])
         .map_err(|_| Error::Parallel("Qwen vision local MLP exceeds i32".into()))?;
-    QwenVisionBlock::new_tensor_parallel(config, local_heads, local_intermediate, stream)
+    QwenVisionBlock::new_tensor_parallel(config, index, local_heads, local_intermediate, stream)
         .map_err(Into::into)
 }
 
@@ -1502,13 +1542,26 @@ impl QwenVisionTransformer {
         )?;
         let patch_embed = QwenVisionPatchEmbed::new(&config, stream)?;
         let mut blocks = Vec::with_capacity(config.layer_count());
-        for _ in 0..config.layer_count() {
-            blocks.push(QwenVisionBlock::new(&config, stream)?);
+        for index in 0..config.layer_count() {
+            blocks.push(QwenVisionBlock::new(&config, index, stream)?);
         }
-        let merger =
-            QwenVisionPatchMerger::new(&config, false, mode == VisionMode::Windowed, stream)?;
+        let merger = QwenVisionPatchMerger::new(
+            &config,
+            "merger",
+            false,
+            mode == VisionMode::Windowed,
+            stream,
+        )?;
         let deepstack_merger_list = (0..config.deepstack_layer_count())
-            .map(|_| QwenVisionPatchMerger::new(&config, true, false, stream))
+            .map(|index| {
+                QwenVisionPatchMerger::new(
+                    &config,
+                    &format!("deepstack_merger_list.{index}"),
+                    true,
+                    false,
+                    stream,
+                )
+            })
             .collect::<Result<Vec<_>, _>>()?;
         Ok(Self {
             config,
@@ -2023,6 +2076,44 @@ mod tests {
             .unwrap();
         assert_eq!(config.layer_schedule_fingerprint(), "w,f,wd0,f");
         assert_eq!(config.deepstack_layers(), vec![2]);
+    }
+
+    #[test]
+    fn qwen3_5_without_window_metadata_uses_full_attention_at_every_depth() {
+        let config = source(27, None, Vec::new()).normalize_qwen3_5().unwrap();
+        assert_eq!(config.layer_count(), 27);
+        assert!(config
+            .layer_schedule
+            .iter()
+            .all(|policy| policy.attention == VisionAttentionPolicy::Full));
+    }
+
+    #[test]
+    #[ignore = "requires native MLX Metal quantization construction"]
+    fn q8_projection_plan_uses_shared_vision_semantics() {
+        let mut config = source(1, None, Vec::new()).normalize_qwen3_5().unwrap();
+        config.hidden_size = 32;
+        config.intermediate_size = 32;
+        config.num_heads = 4;
+        config.out_hidden_size = 32;
+        let format = crate::runtime::checkpoint::quantization::WeightQuantization::Affine(
+            crate::runtime::checkpoint::quantization::AffineQuantization::new(32, 8).unwrap(),
+        );
+        for name in [
+            "blocks.0.attn.qkv.weight",
+            "blocks.0.attn.proj.weight",
+            "blocks.0.mlp.linear_fc1.weight",
+            "blocks.0.mlp.linear_fc2.weight",
+            "merger.linear_fc1.weight",
+            "merger.linear_fc2.weight",
+        ] {
+            config.quantized_weight_configs.insert(name.into(), format);
+        }
+        let execution =
+            safemlx::ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
+        let groups =
+            vision_parallel_parameter_groups(&config, "visual", execution.stream()).unwrap();
+        assert_eq!(groups.len(), 3);
     }
 
     #[test]

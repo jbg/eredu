@@ -750,12 +750,13 @@ Q5_0 and Q5_1 tensors are losslessly repacked into MLX's five-bit affine
 layout; unsupported GGUF tensor types return an error. Model dispatch uses
 `general.architecture`; the current GGUF adapters support text-only `deepseek2`,
 `gpt-oss`, `kimi-linear`, `llama`, `mistral`, `lfm2`, `lfm2moe`, `nemotron_h`,
-`nemotron_h_moe`, `qwen2`, `qwen3`, `qwen3moe`, dense `qwen35`, and `qwen35moe`
-architectures, plus multimodal `gemma4`, `inkling`, `qwen3next`, `qwen3vl`, and
-`qwen3vlmoe` with separate projectors. For Qwen3-VL, put the llama.cpp-style dense F16/BF16/F32
-`mmproj-*.gguf` next to the language-model GGUF. The single-path loaders prefer
-the unique dense projector automatically; callers that need an explicit pair
-can use `architectures::qwen::vl::model::load_qwen3_vl_gguf`.
+`nemotron_h_moe`, `qwen2`, `qwen3`, and `qwen3moe` architectures, plus
+multimodal `gemma4`, `inkling`, `qwen35`, `qwen35moe`, `qwen3vl`, and
+`qwen3vlmoe` with separate projectors; `qwen3next` remains text-only. For
+Qwen3-VL or Qwen3.5, put the llama.cpp-style `mmproj-*.gguf` next to the
+language-model GGUF. The single-path loaders discover the unique
+family-matching projector automatically; explicit Qwen3-VL pairs can use
+`architectures::qwen::vl::model::load_qwen3_vl_gguf`.
 Nemotron-H routed expert banks retain Q2_K/Q3_K/Q4_0/Q4_1/Q4_K/Q5_K/Q6_K/Q8_0 packed weights
 and execute through selected-expert quantized matrix multiplication. Qwen3 MoE
 uses the same packed expert-major execution with per-tensor mixed Q2/Q3/Q4/Q5/Q6/Q8
@@ -765,10 +766,11 @@ Q2_K/Q3_K/Q4_0/Q4_1/Q4_K/Q5_K/Q6_K/Q8_0 routed expert banks packed while loading
 quantization types. Gemma 4 dense and MoE text weights support fused or separate
 GGUF expert projections, native packed affine execution, external MTP assistant
 files, and a sibling dense media-projector GGUF. Nemotron-H latent-space MoE and
-Omni/multimodal checkpoints remain separate formats. Quantized Qwen3-VL language
-GGUFs retain their supported packed affine weights while the vision projector
-remains dense; quantized Qwen3-VL projectors and Qwen3.5-VL GGUF files are not
-currently handled. Qwen2-VL, Qwen2.5-VL, Qwen2 MoE, and older custom-code Qwen
+Omni/multimodal checkpoints remain separate formats. Quantized Qwen3-VL and
+Qwen3.5 language GGUFs retain their supported packed weights; their shared Qwen
+vision semantic plan accepts dense projector tensors and canonical GGUF Q8
+projection matrices, including TP-sharded stage-zero execution. Qwen2-VL,
+Qwen2.5-VL, Qwen2 MoE, and older custom-code Qwen
 architectures are intentionally unsupported.
 
 Qwen2 GGUF follows GGUF's absence-means-full-attention rule and consumes an
@@ -790,6 +792,10 @@ checkpoint and sibling mmproj store before rank-local selection. Stage-zero visi
 typed ingress, MRoPE/DeepStack payload construction, and TP- or EP-local text
 layers remain adapter-authored semantics rather than format- or
 topology-specific runtimes.
+Qwen3.5 uses the same Qwen vision groups with its hybrid decoder. Canonical
+`qwen35`/`qwen35moe` GGUF discovers and structurally validates an optional
+sibling `clip`/`qwen3vl_merger` projector, then adds it to the same bounded
+weight store before resident or rank-local selection.
 
 Gemma 4 GGUF discovers a unique nearby `mmproj-*.gguf`, preferring a filename
 marked F16, BF16, or F32, or accepts an explicit pair through
@@ -1052,8 +1058,8 @@ formats. Dense families have no EP migration.
 | LFM2-MoE | TP, PP, EP | Complete | None |
 | Nemotron-H dense | TP, PP | TP+PP complete | None; EP does not apply |
 | Nemotron-H-MoE | TP, PP, EP | Complete | None |
-| Qwen3-Next/Qwen3.5 dense | TP, PP | TP+PP complete | None; Qwen3.5 SafeTensors supports direct or queued typed image/video ingress with stage-zero TP-sharded vision ownership and all three non-expert residency policies; EP does not apply |
-| Qwen3-Next/Qwen3.5-MoE | TP, PP, EP | Complete | None; Qwen3.5 SafeTensors multimodal ingress composes with TP+PP, PP+EP, and TP+PP+EP plus resident or independently cached experts |
+| Qwen3-Next/Qwen3.5 dense | TP, PP | TP+PP complete | None; Qwen3.5 SafeTensors and canonical text-plus-projector GGUF support direct or queued typed image/video ingress with stage-zero TP-sharded vision ownership and all three non-expert residency policies; EP does not apply |
+| Qwen3-Next/Qwen3.5-MoE | TP, PP, EP | Complete | None; Qwen3.5 SafeTensors and canonical text-plus-projector GGUF multimodal ingress compose with TP+PP, PP+EP, and TP+PP+EP plus resident or independently cached experts |
 | Inkling multimodal | TP, PP, EP | Complete | None; direct or queued text/image/audio ingress, stage-zero hMLP and dMel ownership, SafeTensors and canonical text-plus-mmproj GGUF, cached decode, synchronized generation, prompt-cache persistence, and resident, host-layerwise, dense-streamed, or independently cached expert policies share the Cartesian runtime |
 | Qwen3-VL dense | TP, PP | TP+PP complete | None; vision is pinned on stage zero and direct or queued typed image/video ingress composes with arbitrary legal TP/PP degrees; EP does not apply |
 | Qwen3-VL-MoE | TP, PP, EP | Complete | None; vision is pinned on stage zero and direct or queued typed image/video ingress composes with arbitrary legal TP/PP/EP degrees |
@@ -1103,7 +1109,7 @@ for SafeTensors and canonical GGUF. Fully resident stages support aligned
 affine or MXFP4 load-time quantization, exact Qwen2 Q/K/V biases, Qwen3 Q/K
 norms, GQA, tied or untied heads, routed experts, and every normalized
 full/sliding layer policy.
-Kimi Linear, Nemotron-H/Nemotron-H-MoE, Inkling, and Qwen3-Next/Qwen3.5 text artifacts also
+Kimi Linear, Nemotron-H/Nemotron-H-MoE, Inkling, and Qwen3-Next/Qwen3.5 artifacts also
 use the generalized pipeline runtime for SafeTensors and canonical GGUF. KDA,
 Mamba2, and linear-attention state is represented by semantic fixed slots; MLA
 and full/sliding attention use the shared compressed or KV cache. These
@@ -1146,10 +1152,13 @@ ordinary rank-local stage cache entries; resident experts combine TP-sharded
 intermediates with EP ownership, while independent expert caches compose with
 fully resident, host-layerwise, or dense-streamed non-experts. SafeTensors and
 canonical GGUF use the shared packed/split expert catalog. Qwen3.5 multimodal
-SafeTensors add stage-zero vision units to that same residency schedule and
-accept direct or scheduler-owned image/video tensors. Canonical Qwen3.5 GGUF
-remains a text artifact because its registered metadata has no media-projector
-binding; it continues to use the identical text decoder path.
+SafeTensors and canonical GGUF add stage-zero vision units to that same
+residency schedule and accept direct or scheduler-owned image/video tensors.
+GGUF discovers a unique sibling Qwen3.5 projector, verifies its family,
+geometry, complete catalog, and packed alignment before materialization, then
+combines it with the language artifact in one bounded-read store. Dense and
+canonical GGUF Q8 projector matrices use the same semantic TP recipes; optional
+local processor sidecars provide decoded image/video preprocessing.
 
 `PipelineCache` contains only the local global-layer range: standard or
 sliding-window KV entries for Llama, dense Qwen, and GPT-OSS;
@@ -2058,8 +2067,9 @@ Qwen3-VL-MoE provide
 resident GGUF pure EP. Fully resident and sparse-streamed GGUF TP+EP cover
 Kimi Linear, DeepSeek2, Qwen3-MoE, GPT-OSS, Inkling, LFM2-MoE,
 Nemotron-H-MoE, Qwen3-Next, Qwen3.5-MoE, and Qwen3-VL-MoE. The Qwen3-VL-MoE
-adapter composes its sibling dense mmproj with the language catalog before
-rank-local text and expert selection.
+adapter composes its sibling mmproj with the language catalog before rank-local
+text and expert selection. Qwen3.5-MoE applies the same composition to its
+optional sibling projector.
 Checkpoint `ep_size`
 describes a stored layout and is not the runtime EP degree.
 

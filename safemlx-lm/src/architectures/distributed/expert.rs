@@ -3723,6 +3723,11 @@ fn load_gguf_ep(
     } else {
         None
     };
+    let qwen35_mmproj = if architecture == "qwen35moe" {
+        qwen3_5::open_sibling_mmproj(gguf_file)?
+    } else {
+        None
+    };
     if let Some(expert_options) = options.weight_residency.expert_cache() {
         reject_external_ep_quantization(options.quantization)?;
         return load_external_gguf_ep(
@@ -3731,6 +3736,7 @@ fn load_gguf_ep(
             &metadata,
             inkling_mmproj.as_ref(),
             qwen3_vl_mmproj.as_deref(),
+            qwen35_mmproj.as_ref(),
             topology,
             assignment,
             options.weight_residency.layers(),
@@ -3754,6 +3760,7 @@ fn load_gguf_ep(
             &metadata,
             inkling_mmproj.as_ref(),
             qwen3_vl_mmproj.as_deref(),
+            qwen35_mmproj.as_ref(),
             topology,
             assignment,
             LayerWeightResidency::FullyResident,
@@ -3877,6 +3884,7 @@ fn load_external_gguf_ep(
     metadata: &std::collections::HashMap<String, GgufMetadataValue>,
     inkling_mmproj: Option<&inkling::InklingMmprojGguf>,
     qwen3_vl_mmproj: Option<&Path>,
+    qwen35_mmproj: Option<&qwen3_5::Qwen35MmprojGguf>,
     topology: ParallelTopology,
     assignment: Option<ExpertAssignment>,
     non_expert: LayerWeightResidency,
@@ -4399,8 +4407,12 @@ fn load_external_gguf_ep(
             )
         }
         "qwen35moe" | "qwen3next" => {
-            let prepared =
-                qwen3_5::prepare_qwen35_gguf_checkpoint(checkpoint, metadata, weights_stream)?;
+            let prepared = qwen3_5::prepare_qwen35_gguf_checkpoint(
+                checkpoint,
+                metadata,
+                qwen35_mmproj,
+                weights_stream,
+            )?;
             let args = prepared.args;
             let is_next = prepared.architecture == "qwen3next";
             let kind = if is_next {
@@ -4410,18 +4422,19 @@ fn load_external_gguf_ep(
             };
             let assignment =
                 resolve_model_assignment(assignment, args.num_experts as usize, topology)?;
-            let store: std::sync::Arc<dyn WeightStore + Send + Sync> =
-                std::sync::Arc::new(GgufWeightStore::new_with_max_mapped_shards(
-                    checkpoint.clone(),
-                    qwen3_5::qwen35_translate_gguf_weight_name,
-                    max_mapped_shards,
-                )?);
+            let store = crate::architectures::qwen::hybrid::layerwise::qwen_hybrid_gguf_store(
+                checkpoint,
+                qwen35_mmproj,
+                prepared.modalities.vision_config.as_ref(),
+                max_mapped_shards,
+            )?;
             let model = if topology.tensor_parallel_size > 1 {
                 crate::architectures::qwen::hybrid::layerwise::
                     load_qwen_hybrid_sparse_tp_ep_base_with_store(
                         store.clone(),
                         args.clone(),
                         is_next,
+                        prepared.modalities.clone(),
                         non_expert,
                         ParallelBuildContext::new(topology, ShardingPolicy::Require),
                         stream,
@@ -4433,6 +4446,7 @@ fn load_external_gguf_ep(
                         store.clone(),
                         args.clone(),
                         is_next,
+                        prepared.modalities.clone(),
                         non_expert,
                         stream,
                         weights_stream,
@@ -5415,10 +5429,22 @@ fn load_additional_external_ep(
             )
         }
         ModelKind::Qwen3Next | ModelKind::Qwen35 => {
-            let args = if kind == ModelKind::Qwen3Next {
-                qwen3_next::get_qwen3_next_model_args(model_dir)?
+            let (args, modalities) = if kind == ModelKind::Qwen3Next {
+                (
+                    qwen3_next::get_qwen3_next_model_args(model_dir)?,
+                    qwen3_5::Qwen35Modalities::default(),
+                )
             } else {
-                qwen3_5::get_qwen3_5_model_args(model_dir)?.0
+                let (args, image_token_id, video_token_id, vision_config) =
+                    qwen3_5::get_qwen3_5_model_args(model_dir)?;
+                (
+                    args,
+                    qwen3_5::Qwen35Modalities {
+                        image_token_id,
+                        video_token_id,
+                        vision_config,
+                    },
+                )
             };
             if !args.is_moe() {
                 return Err(Error::UnsupportedArchitecture(format!(
@@ -5437,6 +5463,7 @@ fn load_additional_external_ep(
                         store.clone(),
                         args.clone(),
                         kind == ModelKind::Qwen3Next,
+                        modalities.clone(),
                         non_expert,
                         ParallelBuildContext::new(topology, ShardingPolicy::Require),
                         stream,
@@ -5448,6 +5475,7 @@ fn load_additional_external_ep(
                         store.clone(),
                         args.clone(),
                         kind == ModelKind::Qwen3Next,
+                        modalities.clone(),
                         non_expert,
                         stream,
                         weights_stream,

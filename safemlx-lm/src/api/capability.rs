@@ -3525,6 +3525,7 @@ mod tests {
             temporal_patch_size: 1,
             window_size: 4,
             out_hidden_size: 8,
+            quantized_weight_configs: Default::default(),
         };
         let payload = Array::from_slice(&[0.0f32; 12], &[4, 3]);
         let grid = Array::from_slice(&[1, 2, 2], &[1, 3]);

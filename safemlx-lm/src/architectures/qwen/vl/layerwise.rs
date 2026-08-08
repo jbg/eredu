@@ -1447,6 +1447,7 @@ impl ArchitectureAdapter for Qwen3VlLayerwiseAdapter {
         match group {
             0 => Ok(Qwen3VlLayer::Vision(Box::new(QwenVisionBlock::new(
                 &self.args.vision_config,
+                index,
                 stream,
             )?))),
             1 => Ok(Qwen3VlLayer::Text(Box::new(
@@ -1478,10 +1479,6 @@ impl ArchitectureAdapter for Qwen3VlLayerwiseAdapter {
                 false,
             )?);
         }
-        groups.extend(vision_parallel_parameter_groups(
-            &self.args.vision_config,
-            "model.visual",
-        )?);
         Ok(groups)
     }
 
@@ -1525,6 +1522,11 @@ impl ArchitectureAdapter for Qwen3VlLayerwiseAdapter {
         stream: &Stream,
     ) -> Result<(), Error> {
         for group in self.parallel_parameter_groups(context)? {
+            planner.register(group)?;
+        }
+        for group in
+            vision_parallel_parameter_groups(&self.args.vision_config, "model.visual", stream)?
+        {
             planner.register(group)?;
         }
         for index in 0..self.args.text_config.num_hidden_layers as usize {

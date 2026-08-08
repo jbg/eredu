@@ -862,6 +862,7 @@ pub fn load_qwen3_next_tensor_parallel_model(
         let (model, _, is_next) = load_qwen_hybrid_gguf_tensor_parallel_model(
             &checkpoint,
             &metadata,
+            None,
             options,
             build,
             stream,
@@ -957,7 +958,7 @@ pub(crate) fn execute_transformed_qwen_hybrid_model(
     })
 }
 
-/// Loads a text-only Qwen3.5 dense or MoE checkpoint through the generalized tensor-parallel engine.
+/// Loads a Qwen3.5 dense or MoE checkpoint through the generalized tensor-parallel engine.
 pub fn load_qwen35_tensor_parallel_model(
     model_dir: impl AsRef<Path>,
     options: impl Into<LayerWeightResidency>,
@@ -974,9 +975,11 @@ pub fn load_qwen35_tensor_parallel_model(
     {
         let checkpoint = GgufCheckpoint::open(model_dir)?;
         let metadata = crate::runtime::checkpoint::load::gguf_metadata(&checkpoint);
+        let mmproj = resident::open_sibling_mmproj(model_dir)?;
         let (model, _, is_next) = load_qwen_hybrid_gguf_tensor_parallel_model(
             &checkpoint,
             &metadata,
+            mmproj.as_ref(),
             options,
             build,
             stream,
@@ -1039,12 +1042,14 @@ fn load_qwen_hybrid_tensor_parallel_model(
 pub(crate) fn load_qwen_hybrid_gguf_tensor_parallel_model(
     checkpoint: &GgufCheckpoint,
     metadata: &HashMap<String, GgufMetadataValue>,
+    mmproj: Option<&resident::Qwen35MmprojGguf>,
     options: LayerWeightResidency,
     build: crate::runtime::distributed::parallel::ParallelBuildContext,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<(QwenHybridLayerwiseModel, Vec<u32>, bool), Error> {
-    let prepared = resident::prepare_qwen35_gguf_checkpoint(checkpoint, metadata, weights_stream)?;
+    let prepared =
+        resident::prepare_qwen35_gguf_checkpoint(checkpoint, metadata, mmproj, weights_stream)?;
     let architecture = crate::api::GgufArchitecture::resolve(&prepared.architecture)?;
     let residency = options.weight_residency();
     crate::api::structural::validate_gguf(
@@ -1065,15 +1070,22 @@ pub(crate) fn load_qwen_hybrid_gguf_tensor_parallel_model(
             "the token-only Qwen hybrid TP loader does not execute embedded MTP layers".into(),
         ));
     }
-    let store: Arc<dyn WeightStore + Send + Sync> =
-        Arc::new(GgufWeightStore::new_with_max_mapped_shards(
-            checkpoint.clone(),
-            resident::qwen35_translate_gguf_weight_name,
-            options.max_mapped_shards(),
-        )?);
+    let store = qwen_hybrid_gguf_store(
+        checkpoint,
+        mmproj,
+        prepared.modalities.vision_config.as_ref(),
+        options.max_mapped_shards(),
+    )?;
     let execution = load_tensor_parallel_layerwise_model(
         store,
-        QwenHybridLayerwiseAdapter::new(prepared.args, family, None, None, None, stream)?,
+        QwenHybridLayerwiseAdapter::new(
+            prepared.args,
+            family,
+            prepared.modalities.image_token_id,
+            prepared.modalities.video_token_id,
+            prepared.modalities.vision_config,
+            stream,
+        )?,
         options,
         build,
         stream,
@@ -1089,11 +1101,13 @@ pub(crate) fn load_qwen_hybrid_gguf_tensor_parallel_model(
 pub(crate) fn load_qwen_hybrid_gguf_layerwise_model(
     checkpoint: &GgufCheckpoint,
     metadata: &HashMap<String, GgufMetadataValue>,
+    mmproj: Option<&resident::Qwen35MmprojGguf>,
     residency: WeightResidency,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<(QwenHybridLayerwiseModel, Vec<u32>, bool), Error> {
-    let prepared = resident::prepare_qwen35_gguf_checkpoint(checkpoint, metadata, weights_stream)?;
+    let prepared =
+        resident::prepare_qwen35_gguf_checkpoint(checkpoint, metadata, mmproj, weights_stream)?;
     let architecture = crate::api::GgufArchitecture::resolve(&prepared.architecture)?;
     crate::api::structural::validate_gguf(
         architecture,
@@ -1103,24 +1117,26 @@ pub(crate) fn load_qwen_hybrid_gguf_layerwise_model(
     )
     .into_loader_result()?;
     let args = prepared.args;
+    let modalities = prepared.modalities;
     let is_next = prepared.architecture == "qwen3next";
     let family = if is_next {
         QwenHybridFamily::Qwen3Next
     } else {
         QwenHybridFamily::Qwen35
     };
-    let store: Arc<dyn WeightStore + Send + Sync> =
-        Arc::new(GgufWeightStore::new_with_max_mapped_shards(
-            checkpoint.clone(),
-            resident::qwen35_translate_gguf_weight_name,
-            residency.max_mapped_shards(),
-        )?);
+    let store = qwen_hybrid_gguf_store(
+        checkpoint,
+        mmproj,
+        modalities.vision_config.as_ref(),
+        residency.max_mapped_shards(),
+    )?;
     if let Some(expert_options) = residency.expert_cache() {
         return Ok((
             load_qwen_hybrid_gguf_sparse_with_store(
                 store,
                 args,
                 family,
+                modalities,
                 expert_options,
                 residency.layers(),
                 stream,
@@ -1132,7 +1148,14 @@ pub(crate) fn load_qwen_hybrid_gguf_layerwise_model(
     }
     let execution = load_layerwise_model(
         store,
-        QwenHybridLayerwiseAdapter::new(args, family, None, None, None, stream)?,
+        QwenHybridLayerwiseAdapter::new(
+            args,
+            family,
+            modalities.image_token_id,
+            modalities.video_token_id,
+            modalities.vision_config,
+            stream,
+        )?,
         residency.layers(),
         stream,
         weights_stream,
@@ -1144,10 +1167,45 @@ pub(crate) fn load_qwen_hybrid_gguf_layerwise_model(
     ))
 }
 
+pub(crate) fn qwen_hybrid_gguf_store(
+    checkpoint: &GgufCheckpoint,
+    mmproj: Option<&resident::Qwen35MmprojGguf>,
+    vision_config: Option<&VisionConfig>,
+    max_mapped_shards: usize,
+) -> Result<Arc<dyn WeightStore + Send + Sync>, Error> {
+    let mut builder = GgufWeightStore::builder()
+        .max_cached_readers(max_mapped_shards)?
+        .add_checkpoint(
+            checkpoint.clone(),
+            resident::qwen35_translate_gguf_weight_name,
+        )?;
+    if let Some(mmproj) = mmproj {
+        let deepstack = vision_config
+            .ok_or_else(|| {
+                Error::UnsupportedArchitecture(
+                    "Qwen3.5 GGUF projector is present without validated vision geometry".into(),
+                )
+            })?
+            .deepstack_layers();
+        builder = builder.add_checkpoint(mmproj.checkpoint.clone(), move |name| {
+            let translated = crate::architectures::qwen::vl::model::translate_qwen3_vl_mmproj_name(
+                name, &deepstack,
+            );
+            translated
+                .strip_prefix("model.")
+                .unwrap_or(&translated)
+                .to_string()
+        })?;
+    }
+    Ok(Arc::new(builder.build()?))
+}
+
+#[allow(clippy::too_many_arguments)]
 fn load_qwen_hybrid_gguf_sparse_with_store(
     store: Arc<dyn WeightStore + Send + Sync>,
     args: ModelArgs,
     family: QwenHybridFamily,
+    modalities: resident::Qwen35Modalities,
     options: ExpertCacheLoadOptions,
     non_expert: impl Into<LayerWeightResidency>,
     stream: &Stream,
@@ -1158,8 +1216,14 @@ fn load_qwen_hybrid_gguf_sparse_with_store(
             "sparse expert caching requires a Qwen hybrid MoE GGUF checkpoint".into(),
         ));
     }
-    let mut adapter =
-        QwenHybridLayerwiseAdapter::new(args.clone(), family, None, None, None, stream)?;
+    let mut adapter = QwenHybridLayerwiseAdapter::new(
+        args.clone(),
+        family,
+        modalities.image_token_id,
+        modalities.video_token_id,
+        modalities.vision_config,
+        stream,
+    )?;
     adapter.sparse_expert_cache = true;
     let mut execution = load_layerwise_model(store, adapter, non_expert, stream, weights_stream)?;
     let checkpoint_store = execution.checkpoint_store_arc();
@@ -1289,6 +1353,7 @@ pub(crate) fn load_qwen_hybrid_sparse_ep_base_with_store(
     store: Arc<dyn WeightStore + Send + Sync>,
     args: ModelArgs,
     is_qwen3_next: bool,
+    modalities: resident::Qwen35Modalities,
     non_expert: impl Into<LayerWeightResidency>,
     stream: &Stream,
     weights_stream: &Stream,
@@ -1298,17 +1363,26 @@ pub(crate) fn load_qwen_hybrid_sparse_ep_base_with_store(
     } else {
         QwenHybridFamily::Qwen35
     };
-    let mut adapter = QwenHybridLayerwiseAdapter::new(args, family, None, None, None, stream)?;
+    let mut adapter = QwenHybridLayerwiseAdapter::new(
+        args,
+        family,
+        modalities.image_token_id,
+        modalities.video_token_id,
+        modalities.vision_config,
+        stream,
+    )?;
     adapter.sparse_expert_cache = true;
     let execution = load_layerwise_model(store, adapter, non_expert, stream, weights_stream)?;
     Ok(QwenHybridLayerwiseModel { execution })
 }
 
 /// Builds the TP-sharded nonexpert base used by combined Qwen hybrid TP+EP.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn load_qwen_hybrid_sparse_tp_ep_base_with_store(
     store: Arc<dyn WeightStore + Send + Sync>,
     args: ModelArgs,
     is_qwen3_next: bool,
+    modalities: resident::Qwen35Modalities,
     non_expert: impl Into<LayerWeightResidency>,
     build: crate::runtime::distributed::parallel::ParallelBuildContext,
     stream: &Stream,
@@ -1319,7 +1393,14 @@ pub(crate) fn load_qwen_hybrid_sparse_tp_ep_base_with_store(
     } else {
         QwenHybridFamily::Qwen35
     };
-    let mut adapter = QwenHybridLayerwiseAdapter::new(args, family, None, None, None, stream)?;
+    let mut adapter = QwenHybridLayerwiseAdapter::new(
+        args,
+        family,
+        modalities.image_token_id,
+        modalities.video_token_id,
+        modalities.vision_config,
+        stream,
+    )?;
     adapter.sparse_expert_cache = true;
     let execution = load_tensor_parallel_layerwise_model(
         store,
@@ -3142,6 +3223,7 @@ impl ArchitectureAdapter for QwenHybridLayerwiseAdapter {
         if self.execution_group_name(group)? == "vision_encoder" {
             Ok(QwenHybridLayer::Vision(Box::new(QwenVisionBlock::new(
                 &self.vision.as_ref().expect("vision group").config,
+                index,
                 stream,
             )?)))
         } else {
@@ -3272,7 +3354,7 @@ impl ArchitectureAdapter for QwenHybridLayerwiseAdapter {
             register_qwen_hybrid_layer_parallel_plan(planner, &layer, index, &self.args)?;
         }
         if let Some(vision) = &self.vision {
-            for group in vision_parallel_parameter_groups(&vision.config, "visual")? {
+            for group in vision_parallel_parameter_groups(&vision.config, "visual", stream)? {
                 planner.register(group)?;
             }
         }
@@ -4516,6 +4598,7 @@ mod tests {
             temporal_patch_size: 1,
             window_size: 8,
             out_hidden_size: 16,
+            quantized_weight_configs: Default::default(),
         };
         let mut fixture = Model::new(
             args(false, false),

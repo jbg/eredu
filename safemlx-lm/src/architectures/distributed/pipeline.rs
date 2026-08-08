@@ -5628,22 +5628,28 @@ pub fn load_pipeline_model_with_options(
             crate::api::GgufArchitecture::Qwen35
             | crate::api::GgufArchitecture::Qwen35Moe
             | crate::api::GgufArchitecture::Qwen3Next => {
+                let mmproj = if architecture == crate::api::GgufArchitecture::Qwen3Next {
+                    None
+                } else {
+                    qwen_hybrid::open_sibling_mmproj(model_dir)?
+                };
                 let prepared = qwen_hybrid::prepare_qwen35_gguf_checkpoint(
                     &checkpoint,
                     &metadata,
+                    mmproj.as_ref(),
                     weights_stream,
                 )?;
-                let store: SharedWeightStore =
-                    Arc::new(GgufWeightStore::new_with_max_mapped_shards(
-                        checkpoint,
-                        qwen_hybrid::qwen35_translate_gguf_weight_name,
-                        max_mapped_shards,
-                    )?);
+                let store = crate::architectures::qwen::hybrid::layerwise::qwen_hybrid_gguf_store(
+                    &checkpoint,
+                    mmproj.as_ref(),
+                    prepared.modalities.vision_config.as_ref(),
+                    max_mapped_shards,
+                )?;
                 load_qwen_hybrid_pipeline(
                     prepared.args,
-                    None,
-                    None,
-                    None,
+                    prepared.modalities.image_token_id,
+                    prepared.modalities.video_token_id,
+                    prepared.modalities.vision_config,
                     store,
                     topology,
                     options.quantization,

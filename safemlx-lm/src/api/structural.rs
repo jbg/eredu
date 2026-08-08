@@ -7110,7 +7110,7 @@ pub(crate) fn validate_qwen3_vl_projector_gguf(
             metadata_key: None,
         }]);
     }
-    let expected = qwen3_vl_gguf_expected(&args);
+    let expected = qwen_vision_gguf_expected(&args.vision_config, args.text_config.hidden_size);
     let allowed = expected
         .iter()
         .map(|tensor| tensor.gguf_name.clone())
@@ -7125,15 +7125,101 @@ pub(crate) fn validate_qwen3_vl_projector_gguf(
     finish(issues)
 }
 
-fn qwen3_vl_gguf_expected(args: &qwen3_vl::ModelArgs) -> Vec<ExpectedTensor> {
-    let vision = &args.vision_config;
+pub(crate) fn validate_qwen35_projector_gguf(
+    model_checkpoint: &GgufCheckpoint,
+    model_metadata: &HashMap<String, GgufMetadataValue>,
+    checkpoint: &GgufCheckpoint,
+    metadata: &HashMap<String, GgufMetadataValue>,
+) -> StructuralValidation {
+    let architecture = match model_metadata.get("general.architecture") {
+        Some(GgufMetadataValue::String(architecture)) => architecture.clone(),
+        Some(_) => {
+            return invalid_geometry(
+                "GGUF metadata key \"general.architecture\" has the wrong type".into(),
+            )
+        }
+        None => {
+            return invalid_geometry(
+                "GGUF metadata is missing required key \"general.architecture\"".into(),
+            )
+        }
+    };
+    if !matches!(architecture.as_str(), "qwen35" | "qwen35moe") {
+        return invalid_geometry(format!(
+            "Qwen3.5 projector requires qwen35 or qwen35moe text, got {architecture:?}"
+        ));
+    }
+    let text = match qwen35::qwen35_args_from_gguf_catalog(
+        model_checkpoint,
+        model_metadata,
+        &architecture,
+    ) {
+        Ok(args) => args,
+        Err(error) => return invalid_geometry(error.to_string()),
+    };
+    let vision =
+        match qwen3_vl::qwen_vision_config_from_gguf_catalog(checkpoint, metadata, "Qwen3.5") {
+            Ok(vision) => vision,
+            Err(error) => return invalid_geometry(error.to_string()),
+        };
+    if vision.out_hidden_size != text.hidden_size {
+        return invalid_geometry(format!(
+            "Qwen3.5 projector output {} does not match language hidden size {}",
+            vision.out_hidden_size, text.hidden_size
+        ));
+    }
+    if vision.deepstack_layer_count() != 0 {
+        return invalid_geometry(format!(
+            "Qwen3.5 projector declares {} DeepStack outputs; the decoder accepts only the primary merger output",
+            vision.deepstack_layer_count()
+        ));
+    }
+    let deepstack = vision.deepstack_layers();
+    if let Err(error) = checkpoint
+        .catalog()
+        .translated_outputs(|name| qwen3_vl::translate_qwen3_vl_mmproj_name(name, &deepstack))
+    {
+        return StructuralValidation::Invalid(vec![StructuralIssue {
+            kind: StructuralIssueKind::ConflictingLayout,
+            detail: error.to_string(),
+            tensor_name: None,
+            tensor_type_code: None,
+            metadata_key: None,
+        }]);
+    }
+    let expected = qwen_vision_gguf_expected(&vision, text.hidden_size);
+    let allowed = expected
+        .iter()
+        .map(|tensor| tensor.gguf_name.clone())
+        .collect::<BTreeSet<_>>();
+    let mut issues = validate_gguf_plan(checkpoint, expected, "Qwen3.5 projector");
+    for tensor in checkpoint.catalog().tensors() {
+        let name = &tensor.descriptor().name;
+        if !allowed.contains(name) {
+            issues.push(unexpected_layout(name, "Qwen3.5 projector GGUF"));
+        }
+    }
+    finish(issues)
+}
+
+fn qwen_vision_gguf_expected(
+    vision: &qwen3_vl::VisionConfig,
+    text_hidden_size: i32,
+) -> Vec<ExpectedTensor> {
     let hidden = vision.hidden_size as usize;
     let intermediate = vision.intermediate_size as usize;
-    let text_hidden = args.text_config.hidden_size as usize;
+    let text_hidden = text_hidden_size as usize;
     let patch = vision.patch_size as usize;
     let merger_hidden = hidden * (vision.spatial_merge_size as usize).pow(2);
     let dense = |name: String, shape: Vec<usize>| {
         expected_dense_with_gguf_shape("", name, shape.clone(), shape)
+    };
+    let matrix = |name: String, shape: Vec<usize>| ExpectedTensor {
+        safetensors_name: String::new(),
+        gguf_name: name,
+        safetensors_shape: shape.clone(),
+        gguf_shape: shape,
+        operation: TensorOperation::Matrix,
     };
     let mut tensors = vec![
         dense(
@@ -7152,21 +7238,21 @@ fn qwen3_vl_gguf_expected(args: &qwen3_vl::ModelArgs) -> Vec<ExpectedTensor> {
         tensors.extend([
             dense(format!("{prefix}.ln1.weight"), vec![hidden]),
             dense(format!("{prefix}.ln1.bias"), vec![hidden]),
-            dense(
+            matrix(
                 format!("{prefix}.attn_qkv.weight"),
                 vec![3 * hidden, hidden],
             ),
             dense(format!("{prefix}.attn_qkv.bias"), vec![3 * hidden]),
-            dense(format!("{prefix}.attn_out.weight"), vec![hidden, hidden]),
+            matrix(format!("{prefix}.attn_out.weight"), vec![hidden, hidden]),
             dense(format!("{prefix}.attn_out.bias"), vec![hidden]),
             dense(format!("{prefix}.ln2.weight"), vec![hidden]),
             dense(format!("{prefix}.ln2.bias"), vec![hidden]),
-            dense(
+            matrix(
                 format!("{prefix}.ffn_up.weight"),
                 vec![intermediate, hidden],
             ),
             dense(format!("{prefix}.ffn_up.bias"), vec![intermediate]),
-            dense(
+            matrix(
                 format!("{prefix}.ffn_down.weight"),
                 vec![hidden, intermediate],
             ),
@@ -7176,9 +7262,9 @@ fn qwen3_vl_gguf_expected(args: &qwen3_vl::ModelArgs) -> Vec<ExpectedTensor> {
     tensors.extend([
         dense("v.post_ln.weight".into(), vec![hidden]),
         dense("v.post_ln.bias".into(), vec![hidden]),
-        dense("mm.0.weight".into(), vec![merger_hidden, merger_hidden]),
+        matrix("mm.0.weight".into(), vec![merger_hidden, merger_hidden]),
         dense("mm.0.bias".into(), vec![merger_hidden]),
-        dense("mm.2.weight".into(), vec![text_hidden, merger_hidden]),
+        matrix("mm.2.weight".into(), vec![text_hidden, merger_hidden]),
         dense("mm.2.bias".into(), vec![text_hidden]),
     ]);
     for layer in vision.deepstack_layers() {
@@ -7186,12 +7272,12 @@ fn qwen3_vl_gguf_expected(args: &qwen3_vl::ModelArgs) -> Vec<ExpectedTensor> {
         tensors.extend([
             dense(format!("{prefix}.norm.weight"), vec![merger_hidden]),
             dense(format!("{prefix}.norm.bias"), vec![merger_hidden]),
-            dense(
+            matrix(
                 format!("{prefix}.fc1.weight"),
                 vec![merger_hidden, merger_hidden],
             ),
             dense(format!("{prefix}.fc1.bias"), vec![merger_hidden]),
-            dense(
+            matrix(
                 format!("{prefix}.fc2.weight"),
                 vec![text_hidden, merger_hidden],
             ),

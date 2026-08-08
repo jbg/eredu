@@ -105,9 +105,9 @@ layers, checkpoint aliases, and packed or public split expert layouts. Native
 FP8 inverse-scale and affine scale/bias catalogs use the same fused-projection
 and expert transforms as the loader, including the dense FP8 BA exception.
 Qwen3-VL and Qwen3-VL-MoE SafeTensors validation combines the prefixed Qwen3
-text plan with the complete dense vision tower. It validates Conv3D patch and
+text plan with the complete vision tower. It validates Conv3D patch and
 position embeddings, every vision block, merger and DeepStack parameters,
-text/vision geometry, dense-only vision dtypes, tied or untied text heads, and
+text/vision geometry, supported vision dtypes, tied or untied text heads, and
 route-specific packed or split MoE experts. Checkpoint-native affine text and
 expert catalogs are validated without quantizing the vision tower.
 Qwen3.5 SafeTensors validation covers dense and MoE hybrid decoders,
@@ -120,7 +120,11 @@ Qwen3.5 and Qwen3.5-MoE GGUF validation shares the loader's pure metadata
 geometry and name-translation plan. It validates split recurrent projections,
 full-attention layers, dense or routed/shared experts, paired expert encodings,
 operation-specific dense recurrent state tensors, and grouped value-head
-quantization alignment.
+quantization alignment. An optional sibling `clip`/`qwen3vl_merger` projector
+is validated as a second artifact: exact geometry, complete tensor catalog,
+decoder output width, absence of unsupported DeepStack outputs, and dense or
+canonical GGUF Q8 projection alignment is checked before either payload is
+read.
 Qwen3-Next GGUF validation uses the same metadata and decoder plan while
 requiring its fused QKVZ/BA recurrent projection catalog and validating affine
 input-group alignment before the loader splits those tensors.
@@ -128,9 +132,10 @@ Qwen3-VL GGUF validation combines the shared dense or MoE Qwen3 text plan with
 its required sibling projector catalog. It validates multimodal RoPE sections
 and placeholder tokens, vision-block geometry, both physical patch-convolution
 halves, the merger and DeepStack tensors, projector/text hidden-size agreement,
-paired packed expert encodings for `qwen3vlmoe`, and dense-only projector
-operation encodings. Inspection and the resident, bounded, and expert-parallel
-loaders consume the same stream-free argument and structural plans.
+paired packed expert encodings for `qwen3vlmoe`, and dense or canonical GGUF Q8
+projector operation encodings. Inspection and the resident, bounded, and
+expert-parallel loaders consume the same stream-free argument and structural
+plans.
 Kimi Linear GGUF validates pure metadata geometry, translated names, KDA/MLA
 catalogs, convolution and transition tensor element counts, paired expert
 encodings, and per-operation GGML support. The loader's requirement that KDA
@@ -267,7 +272,7 @@ values:
 - `qwen3` and `qwen3moe`
 - `qwen3next`
 - `qwen3vl` and `qwen3vlmoe` (with their companion vision projection checkpoint)
-- `qwen35` and `qwen35moe`
+- `qwen35` and `qwen35moe` (with an optional sibling Qwen3.5 vision projector)
 
 The tokenizer and chat template are reconstructed from GGUF metadata when
 possible. A sibling `tokenizer.json` can supply a tokenizer that is absent from
@@ -681,12 +686,13 @@ zero interval values fail during normalization. JSON callers use the
 architecture module's `model_args_from_config_value` function. Execution uses
 `TransformerBlock::layer_policy`, and `Cache::new` returns a validation result.
 
-Text-only Qwen3-Next and Qwen3.5 dense/MoE pipeline stages support exact
+Qwen3-Next and Qwen3.5 dense/MoE pipeline stages support exact
 SafeTensors and canonical `qwen3next`/`qwen35`/`qwen35moe` GGUF with fully
 resident or dense disk-streamed local blocks. Linear-attention convolution and
 recurrent arrays become fixed semantic slots while full-attention layers use
-the shared ordinary or paged KV implementation. Multimodal ingress is not
-accepted by this decoder-only adapter.
+the shared ordinary or paged KV implementation. Qwen3.5 SafeTensors and
+canonical GGUF with a validated sibling projector add a stage-zero vision
+execution group and accept direct or scheduler-owned image/video ingress.
 
 Qwen3-VL and Qwen3.5 vision blocks use
 `LayerSchedule<architectures::qwen::vl::vision::VisionLayerPolicy>`. Each entry
@@ -697,7 +703,9 @@ validated for exact range and uniqueness, and its source order is preserved as
 the merger-bank mapping. Qwen3-VL rejects the Qwen3.5-only `window_size` and
 `fullatt_block_indexes` fields instead of silently ignoring them. Qwen3.5
 normalizes its positive window and exact full-attention block list into the same
-policy type.
+policy type. Qwen3.5 configs that omit both window metadata fields normalize to
+full attention at every vision block; an explicit full-attention list selects
+the remaining blocks as windowed.
 
 The schedule length is the sole vision depth after normalization. Resident and
 bounded vision execution, DeepStack capture, SafeTensors/GGUF structural plans,
@@ -869,6 +877,7 @@ Fully resident GGUF pure expert parallelism is supported for Kimi Linear,
 DeepSeek2, Qwen3-MoE, and Qwen3-VL-MoE. Fully resident and sparse-streamed GGUF
 TP+EP use the shared catalog and semantic TP plans for Kimi Linear, DeepSeek2,
 Qwen3-MoE, GPT-OSS, Inkling, LFM2-MoE, Nemotron-H-MoE, Qwen3-Next,
-Qwen3.5-MoE, and Qwen3-VL-MoE. Qwen3-VL GGUF requires its separate dense
-multimodal projection checkpoint; the MoE adapter composes that store before
-rank-local layer and expert selection and also supports stage-local PP+EP.
+Qwen3.5-MoE, and Qwen3-VL-MoE. Qwen3-VL GGUF requires its separate multimodal
+projection checkpoint; Qwen3.5 discovers an optional family-matching projector.
+Both adapters compose language and vision stores before rank-local layer and
+expert selection and support stage-local PP+EP where MoE applies.

@@ -1,4 +1,4 @@
-//! Dense and MoE Qwen3.5 text model implementation and loader.
+//! Dense and MoE Qwen3.5 text and vision-language implementation and loader.
 
 use safemlx::{
     builder::Builder,
@@ -27,7 +27,6 @@ use std::{
 };
 use tokenizers::Tokenizer;
 
-use crate::architectures::qwen::vl::vision::grid_thw_from_array;
 use crate::architectures::qwen::vl::vision::VisionConfigSource;
 #[cfg(test)]
 pub(crate) use crate::architectures::qwen::vl::vision::{reverse_permutation, vision_window_index};
@@ -36,6 +35,7 @@ pub use crate::architectures::qwen::vl::vision::{
     QwenVisionPatchMerger, QwenVisionPatchProjection, QwenVisionRmsNorm, QwenVisionTransformer,
     VisionConfig,
 };
+use crate::architectures::qwen::vl::{model as qwen_vl, vision::grid_thw_from_array};
 pub use crate::nn::generation::sample;
 
 use crate::{
@@ -5320,9 +5320,90 @@ pub(crate) struct PreparedQwen35Gguf {
     pub(crate) args: ModelArgs,
     pub(crate) eos_token_ids: Vec<u32>,
     pub(crate) architecture: String,
+    pub(crate) modalities: Qwen35Modalities,
 }
 
-/// Loads a text-only dense or MoE Qwen3.5 model from a GGUF checkpoint.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct Qwen35Modalities {
+    pub(crate) image_token_id: Option<i32>,
+    pub(crate) video_token_id: Option<i32>,
+    pub(crate) vision_config: Option<VisionConfig>,
+}
+
+#[derive(Debug)]
+pub(crate) struct Qwen35MmprojGguf {
+    pub(crate) metadata: HashMap<String, GgufMetadataValue>,
+    pub(crate) checkpoint: GgufCheckpoint,
+}
+
+/// Opens and validates the optional sibling Qwen3.5 vision projector.
+pub(crate) fn open_sibling_mmproj(gguf_file: &Path) -> Result<Option<Qwen35MmprojGguf>, Error> {
+    let Some(path) = crate::runtime::checkpoint::gguf::find_sibling_mmproj(gguf_file, "qwen35")?
+    else {
+        return Ok(None);
+    };
+    let checkpoint = GgufCheckpoint::open(path)?;
+    let metadata = gguf_metadata(&checkpoint);
+    qwen_vl::validate_qwen3_vl_mmproj(&metadata)?;
+    Ok(Some(Qwen35MmprojGguf {
+        metadata,
+        checkpoint,
+    }))
+}
+
+fn qwen35_gguf_multimodal_geometry(
+    checkpoint: &GgufCheckpoint,
+    args: &ModelArgs,
+    architecture: &str,
+    metadata: &HashMap<String, GgufMetadataValue>,
+    mmproj: Option<&Qwen35MmprojGguf>,
+) -> Result<Qwen35Modalities, Error> {
+    let Some(mmproj) = mmproj else {
+        return Ok(Qwen35Modalities::default());
+    };
+    if architecture == "qwen3next" {
+        return Err(Error::UnsupportedArchitecture(
+            "Qwen3-Next GGUF does not define multimodal projector semantics".into(),
+        ));
+    }
+    crate::api::structural::validate_qwen35_projector_gguf(
+        checkpoint,
+        metadata,
+        &mmproj.checkpoint,
+        &mmproj.metadata,
+    )
+    .into_loader_result()?;
+    let vision = qwen_vl::qwen_vision_config_from_gguf_catalog(
+        &mmproj.checkpoint,
+        &mmproj.metadata,
+        "Qwen3.5",
+    )?;
+    if vision.out_hidden_size != args.hidden_size {
+        return Err(Error::UnsupportedArchitecture(format!(
+            "Qwen3.5 GGUF projector output {} does not match language hidden size {}",
+            vision.out_hidden_size, args.hidden_size
+        )));
+    }
+    if vision.deepstack_layer_count() != 0 {
+        return Err(Error::UnsupportedArchitecture(format!(
+            "Qwen3.5 GGUF projector declares {} DeepStack outputs, but the Qwen3.5 decoder accepts only the primary merger output",
+            vision.deepstack_layer_count()
+        )));
+    }
+    let image = qwen_vl::gguf_token_id(metadata, "<|image_pad|>")?;
+    let video = qwen_vl::gguf_token_id(metadata, "<|video_pad|>")?;
+    Ok(Qwen35Modalities {
+        image_token_id: Some(i32::try_from(image).map_err(|_| {
+            Error::UnsupportedArchitecture("Qwen3.5 image token exceeds i32".into())
+        })?),
+        video_token_id: Some(i32::try_from(video).map_err(|_| {
+            Error::UnsupportedArchitecture("Qwen3.5 video token exceeds i32".into())
+        })?),
+        vision_config: Some(vision),
+    })
+}
+
+/// Loads a dense or MoE Qwen3.5 model and an optional sibling vision projector.
 pub fn load_qwen3_5_gguf(
     gguf_file: impl AsRef<Path>,
     stream: &Stream,
@@ -5336,14 +5417,28 @@ pub(crate) fn load_qwen3_5_gguf_with_metadata(
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<LoadedQwen35Gguf, Error> {
+    let gguf_file = gguf_file.as_ref();
     let checkpoint = GgufCheckpoint::open(gguf_file)?;
     let metadata = gguf_metadata(&checkpoint);
-    load_qwen3_5_gguf_checkpoint(&checkpoint, metadata, None, stream, weights_stream)
+    let architecture = qwen35_gguf_string(&metadata, "general.architecture")?;
+    let mmproj = matches!(architecture.as_str(), "qwen35" | "qwen35moe")
+        .then(|| open_sibling_mmproj(gguf_file))
+        .transpose()?
+        .flatten();
+    load_qwen3_5_gguf_checkpoint(
+        &checkpoint,
+        metadata,
+        mmproj.as_ref(),
+        None,
+        stream,
+        weights_stream,
+    )
 }
 
 pub(crate) fn load_qwen3_5_gguf_checkpoint(
     checkpoint: &GgufCheckpoint,
     metadata: HashMap<String, GgufMetadataValue>,
+    mmproj: Option<&Qwen35MmprojGguf>,
     quantization: Option<WeightQuantization>,
     stream: &Stream,
     weights_stream: &Stream,
@@ -5414,8 +5509,16 @@ pub(crate) fn load_qwen3_5_gguf_checkpoint(
         args.quantized_weight_configs = Some(configs);
     }
 
-    let mut model = Model::new(args, None, None, None, stream)?;
-    let config = qwen3_5_strict_load_config(false).allow_unused_prefix("rope_freqs.");
+    let modalities =
+        qwen35_gguf_multimodal_geometry(checkpoint, &args, &architecture, &metadata, mmproj)?;
+    let mut model = Model::new(
+        args,
+        modalities.image_token_id,
+        modalities.video_token_id,
+        modalities.vision_config,
+        stream,
+    )?;
+    let config = qwen3_5_strict_load_config(mmproj.is_some()).allow_unused_prefix("rope_freqs.");
     let mut report = StrictLoadReport::default();
     let mut materializer = checkpoint.materializer();
     for tensor in checkpoint.catalog().tensors() {
@@ -5507,6 +5610,22 @@ pub(crate) fn load_qwen3_5_gguf_checkpoint(
             }
         }
     }
+    if let Some(mmproj) = mmproj {
+        let deepstack = model
+            .vision_args
+            .as_ref()
+            .expect("Qwen3.5 mmproj constructed vision geometry")
+            .deepstack_layers();
+        qwen_vl::load_qwen_vision_mmproj_weights(
+            &mut model,
+            &mmproj.checkpoint,
+            "visual",
+            &deepstack,
+            &config,
+            &mut report,
+            weights_stream,
+        )?;
+    }
     report.finish(&model, &config)?;
     model.copy_to_stream(stream)?;
     let eos_token_ids = crate::api::gguf_eos_token_ids(&metadata)?;
@@ -5519,6 +5638,7 @@ pub(crate) fn load_qwen3_5_gguf_checkpoint(
 pub(crate) fn prepare_qwen35_gguf_checkpoint(
     checkpoint: &GgufCheckpoint,
     metadata: &HashMap<String, GgufMetadataValue>,
+    mmproj: Option<&Qwen35MmprojGguf>,
     weights_stream: &Stream,
 ) -> Result<PreparedQwen35Gguf, Error> {
     let architecture = qwen35_gguf_string(metadata, "general.architecture")?;
@@ -5571,11 +5691,14 @@ pub(crate) fn prepare_qwen35_gguf_checkpoint(
         super::qwen3_next::split_fused_projection_configs(&mut configs)?;
     }
     args.quantized_weight_configs = Some(configs);
+    let modalities =
+        qwen35_gguf_multimodal_geometry(checkpoint, &args, &architecture, metadata, mmproj)?;
     let eos_token_ids = crate::api::gguf_eos_token_ids(metadata)?;
     Ok(PreparedQwen35Gguf {
         args,
         eos_token_ids,
         architecture,
+        modalities,
     })
 }
 
@@ -7245,6 +7368,7 @@ mod tests {
             temporal_patch_size: 1,
             window_size: 8,
             out_hidden_size,
+            quantized_weight_configs: Default::default(),
         }
     }
 
