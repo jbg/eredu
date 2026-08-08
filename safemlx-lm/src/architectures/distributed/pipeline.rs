@@ -1097,6 +1097,7 @@ struct InklingStage {
     parallel_lm_head: Option<crate::nn::parallel::VocabParallelLmHead>,
     parallel_layout: Option<crate::runtime::distributed::parallel::LocalModelLayout>,
     expert_assignment: Option<ExpertAssignment>,
+    expert_storage: PipelineExpertStorage,
     routing_statistics: RoutingStatistics,
 }
 
@@ -3154,6 +3155,10 @@ impl PipelineStageSemantics for InklingStage {
         self.dense_layers.as_ref()
     }
 
+    fn expert_cache(&self) -> Option<&ExpertCache> {
+        self.expert_storage.cache()
+    }
+
     fn prompt_cache_model_identity(
         &self,
         topology: ParallelTopology,
@@ -3199,7 +3204,11 @@ impl PipelineStageSemantics for InklingStage {
                 "Inkling relative attention does not accept an external additive mask".into(),
             ));
         }
-        InklingStage::forward(self, input, step, cache, stream)
+        if self.expert_storage.is_external() {
+            self.forward_expert_parallel(input, step, cache, None, stream)
+        } else {
+            InklingStage::forward(self, input, step, cache, stream)
+        }
     }
 
     fn forward_with_execution(
@@ -3218,11 +3227,17 @@ impl PipelineStageSemantics for InklingStage {
             ));
         }
         if let Some(group) = expert_group {
-            return self.forward_expert_parallel(input, step, cache, group, stream);
+            if let Some(execution) = execution.filter(|execution| execution.is_tensor_parallel()) {
+                return self.forward_tensor_parallel(input, step, cache, execution, Some(group));
+            }
+            return self.forward_expert_parallel(input, step, cache, Some(group), stream);
         }
         match execution {
             Some(execution) if execution.is_tensor_parallel() => {
-                self.forward_tensor_parallel(input, step, cache, execution)
+                self.forward_tensor_parallel(input, step, cache, execution, None)
+            }
+            _ if self.expert_storage.is_external() => {
+                self.forward_expert_parallel(input, step, cache, None, stream)
             }
             _ => self.forward(input, step, cache, stream),
         }
@@ -4760,8 +4775,8 @@ pub fn load_pipeline_model(
 /// support fully resident, host-layerwise, and dense-disk-streamed layers.
 /// Non-resident units compose pipeline placement with the authoritative TP
 /// semantic layout or EP assignment before residency initialization. Qwen3-MoE,
-/// Kimi Linear, GPT-OSS, LFM2-MoE, Nemotron-H-MoE, and Qwen3-Next/Qwen3.5-MoE additionally
-/// compose an independent, stage-local expert cache
+/// Kimi Linear, Inkling, GPT-OSS, LFM2-MoE, Nemotron-H-MoE, and
+/// Qwen3-Next/Qwen3.5-MoE additionally compose an independent, stage-local expert cache
 /// with resident, host-layerwise, or dense-streamed non-expert parameters for
 /// PP, TP+PP, PP+EP, and TP+PP+EP. With EP inactive each stage owns all experts
 /// for its local layers and executes routes without an expert collective.
@@ -4801,6 +4816,7 @@ pub fn load_pipeline_model_with_options(
                 architecture,
                 crate::api::GgufArchitecture::Qwen3Moe
                     | crate::api::GgufArchitecture::KimiLinear
+                    | crate::api::GgufArchitecture::Inkling
                     | crate::api::GgufArchitecture::GptOss
                     | crate::api::GgufArchitecture::Lfm2Moe
                     | crate::api::GgufArchitecture::NemotronHMoe
@@ -4809,7 +4825,7 @@ pub fn load_pipeline_model_with_options(
             )
         {
             return Err(Error::Parallel(format!(
-                "pipeline independent expert caching has registered Qwen3-MoE, Kimi Linear, GPT-OSS, LFM2-MoE, Nemotron-H-MoE, Qwen3-Next-MoE, and Qwen3.5-MoE semantic expert recipes; GGUF architecture {} is not yet registered and no checkpoint payload was materialized",
+                "pipeline independent expert caching has registered Qwen3-MoE, Kimi Linear, Inkling, GPT-OSS, LFM2-MoE, Nemotron-H-MoE, Qwen3-Next-MoE, and Qwen3.5-MoE semantic expert recipes; GGUF architecture {} is not yet registered and no checkpoint payload was materialized",
                 architecture.metadata_name()
             )));
         }
@@ -4820,6 +4836,7 @@ pub fn load_pipeline_model_with_options(
                 architecture,
                 crate::api::GgufArchitecture::Qwen3Moe
                     | crate::api::GgufArchitecture::KimiLinear
+                    | crate::api::GgufArchitecture::Inkling
                     | crate::api::GgufArchitecture::GptOss
                     | crate::api::GgufArchitecture::Lfm2Moe
                     | crate::api::GgufArchitecture::NemotronHMoe
@@ -4828,7 +4845,7 @@ pub fn load_pipeline_model_with_options(
             )
         {
             return Err(Error::Parallel(format!(
-                "TP+PP+EP preflight has registered Qwen3-MoE, Kimi Linear, GPT-OSS, LFM2-MoE, Nemotron-H-MoE, Qwen3-Next-MoE, and Qwen3.5-MoE; GGUF architecture {} has no triple-axis semantic plan and no checkpoint payload was materialized",
+                "TP+PP+EP preflight has registered Qwen3-MoE, Kimi Linear, Inkling, GPT-OSS, LFM2-MoE, Nemotron-H-MoE, Qwen3-Next-MoE, and Qwen3.5-MoE; GGUF architecture {} has no triple-axis semantic plan and no checkpoint payload was materialized",
                 architecture.metadata_name()
             )));
         }
@@ -5145,6 +5162,7 @@ pub fn load_pipeline_model_with_options(
                     topology,
                     options.quantization,
                     dense_stream,
+                    expert_cache,
                     stream,
                     weights_stream,
                 )
@@ -5161,6 +5179,7 @@ pub fn load_pipeline_model_with_options(
             Some(
                 "qwen3_moe"
                     | "kimi_linear"
+                    | "inkling_mm_model"
                     | "gpt_oss"
                     | "lfm2_moe"
                     | "nemotron_h"
@@ -5171,7 +5190,7 @@ pub fn load_pipeline_model_with_options(
         )
     {
         return Err(Error::Parallel(format!(
-            "pipeline independent expert caching has registered Qwen3-MoE, Kimi Linear, GPT-OSS, LFM2-MoE, Nemotron-H-MoE, Qwen3-Next-MoE, and Qwen3.5-MoE semantic expert recipes; SafeTensors model_type {model_type:?} is not yet registered and no checkpoint payload was materialized"
+            "pipeline independent expert caching has registered Qwen3-MoE, Kimi Linear, Inkling, GPT-OSS, LFM2-MoE, Nemotron-H-MoE, Qwen3-Next-MoE, and Qwen3.5-MoE semantic expert recipes; SafeTensors model_type {model_type:?} is not yet registered and no checkpoint payload was materialized"
         )));
     }
     if topology.tensor_parallel_size > 1
@@ -5182,6 +5201,7 @@ pub fn load_pipeline_model_with_options(
             Some(
                 "qwen3_moe"
                     | "kimi_linear"
+                    | "inkling_mm_model"
                     | "gpt_oss"
                     | "lfm2_moe"
                     | "nemotron_h"
@@ -5192,7 +5212,7 @@ pub fn load_pipeline_model_with_options(
         )
     {
         return Err(Error::Parallel(format!(
-            "TP+PP+EP preflight has registered Qwen3-MoE, Kimi Linear, GPT-OSS, LFM2-MoE, Nemotron-H-MoE, Qwen3-Next-MoE, and Qwen3.5-MoE; SafeTensors model_type {:?} has no triple-axis semantic plan and no checkpoint payload was materialized",
+            "TP+PP+EP preflight has registered Qwen3-MoE, Kimi Linear, Inkling, GPT-OSS, LFM2-MoE, Nemotron-H-MoE, Qwen3-Next-MoE, and Qwen3.5-MoE; SafeTensors model_type {:?} has no triple-axis semantic plan and no checkpoint payload was materialized",
             model_type
         )));
     }
@@ -5477,6 +5497,7 @@ pub fn load_pipeline_model_with_options(
                 topology,
                 options.quantization,
                 dense_stream,
+                expert_cache,
                 stream,
                 weights_stream,
             )
@@ -7917,6 +7938,35 @@ fn execute_pipeline_cached_kimi_linear(
     let execute = |routes: &crate::runtime::distributed::expert::DispatchedRoutes,
                    stream: &Stream| {
         super::expert::execute_cached_kimi_linear(args, global_layer, routes, pass, cache, stream)
+    };
+    let returned = match expert_group {
+        Some(group) => dispatch_replicated_with(
+            hidden, expert_ids, weights, assignment, group, stream, execute,
+        )?,
+        None => dispatch_local_with(hidden, expert_ids, weights, assignment, stream, execute)?,
+    };
+    statistics.accumulate(&returned.statistics);
+    Ok(returned.reduced_output)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_pipeline_cached_inkling(
+    args: &inkling::ModelArgs,
+    global_layer: usize,
+    hidden: &Array,
+    expert_ids: &Array,
+    weights: &Array,
+    pass: ExpertPass,
+    cache: &ExpertCache,
+    assignment: &ExpertAssignment,
+    expert_group: Option<&Group>,
+    statistics: &mut RoutingStatistics,
+    stream: &Stream,
+) -> Result<Array, Error> {
+    validate_pipeline_expert_dispatch(assignment, expert_group, true)?;
+    let execute = |routes: &crate::runtime::distributed::expert::DispatchedRoutes,
+                   stream: &Stream| {
+        super::expert::execute_cached_inkling(args, global_layer, routes, pass, cache, stream)
     };
     let returned = match expert_group {
         Some(group) => dispatch_replicated_with(
@@ -13815,12 +13865,14 @@ impl KimiLinearStage {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn load_inkling_pipeline(
     args: inkling::ModelArgs,
     store: SharedWeightStore,
     topology: ParallelTopology,
     requested_quantization: Option<WeightQuantization>,
     dense_stream: Option<PipelineLayerLoadOptions>,
+    expert_cache_options: Option<ExpertCacheLoadOptions>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<PipelineModel, Error> {
@@ -13830,7 +13882,11 @@ fn load_inkling_pipeline(
                 .into(),
         ));
     }
-    let binding_adapter = InklingLayerwiseAdapter::new(args.clone(), stream)?;
+    let binding_adapter = if expert_cache_options.is_some() {
+        InklingLayerwiseAdapter::new_external_experts(args.clone(), stream)?
+    } else {
+        InklingLayerwiseAdapter::new(args.clone(), stream)?
+    };
     let expert_assignment = binding_adapter.expert_parallel_assignment(topology)?;
     topology.preflight(
         Some(args.text_config.num_hidden_layers as usize),
@@ -13845,7 +13901,13 @@ fn load_inkling_pipeline(
         ModelKind::Inkling,
         args.text_config.hidden_size,
     );
-    let mut stage = InklingStage::new(args.clone(), range, &info, stream)?;
+    let mut stage = InklingStage::new(
+        args.clone(),
+        range,
+        &info,
+        expert_cache_options.is_some(),
+        stream,
+    )?;
     stage.expert_assignment = expert_assignment;
     if let Some(assignment) = stage.expert_assignment.as_ref() {
         info.global_expert_count = Some(assignment.global_expert_count());
@@ -14021,14 +14083,25 @@ fn load_inkling_pipeline(
                 stage.expert_assignment.as_ref(),
                 stream,
             )?;
-            loaded.load(
-                layer,
-                store.as_ref(),
-                &bindings,
-                None,
-                weights_stream,
-                stream,
-            )?;
+            if expert_cache_options.is_some() {
+                loaded.load_excluding(
+                    layer,
+                    store.as_ref(),
+                    &bindings,
+                    weights_stream,
+                    stream,
+                    &|name| name.starts_with("moe.experts."),
+                )?;
+            } else {
+                loaded.load(
+                    layer,
+                    store.as_ref(),
+                    &bindings,
+                    None,
+                    weights_stream,
+                    stream,
+                )?;
+            }
         }
     }
     let static_bytes = loaded.finish_with_default(&mut info, args.text_config.weight_dtype())?;
@@ -14074,12 +14147,48 @@ fn load_inkling_pipeline(
                 )
             },
         )?);
+        if expert_cache_options.is_some() {
+            stage.dense_layers = stage
+                .dense_layers
+                .take()
+                .map(|storage| storage.with_independent_experts("moe.experts."));
+        }
         let layer_bytes = stage.dense_layers.as_ref().unwrap().planned_layer_bytes()?;
         info.planned_owned_parameter_bytes = static_bytes
             .checked_add(layer_bytes)
             .ok_or_else(|| Error::Parallel("Inkling pipeline planned bytes overflowed".into()))?;
     } else {
         info.planned_owned_parameter_bytes = static_bytes;
+    }
+    if let Some(options) = expert_cache_options {
+        let entries = crate::architectures::inkling::layerwise::inkling_expert_catalog(
+            &args,
+            store.as_ref(),
+        )?
+        .into_iter()
+        .filter(|entry| stage.range.contains(&entry.identity().layer))
+        .filter(|entry| {
+            stage.expert_assignment.as_ref().is_none_or(|assignment| {
+                assignment.owner(entry.identity().global_expert) == Some(assignment.rank())
+            })
+        })
+        .collect::<Vec<_>>();
+        if !entries.is_empty() {
+            let cache = ExpertCache::new_shared(
+                Arc::clone(&store),
+                entries,
+                options,
+                weights_stream.clone(),
+                stream.clone(),
+            )?;
+            info.planned_owned_parameter_bytes = info
+                .planned_owned_parameter_bytes
+                .checked_add(cache.report()?.owned_bytes)
+                .ok_or_else(|| {
+                    Error::Parallel("Inkling pipeline expert byte total overflowed".into())
+                })?;
+            stage.expert_storage = PipelineExpertStorage::External(Box::new(cache));
+        }
     }
     info.opened_checkpoint_shards = materialized_shards;
     info.checkpoint_diagnostics = Some(checkpoint_diagnostics);
@@ -14091,6 +14200,22 @@ enum InklingCartesianLayerExecution<'a> {
     Expert {
         assignment: &'a ExpertAssignment,
         group: &'a Group,
+        statistics: &'a mut RoutingStatistics,
+    },
+    TensorExpert {
+        tensor_group: &'a Group,
+        assignment: &'a ExpertAssignment,
+        expert_group: &'a Group,
+        statistics: &'a mut RoutingStatistics,
+    },
+    External {
+        args: &'a inkling::ModelArgs,
+        global_layer: usize,
+        tensor_group: Option<&'a Group>,
+        assignment: &'a ExpertAssignment,
+        expert_group: Option<&'a Group>,
+        pass: ExpertPass,
+        cache: &'a ExpertCache,
         statistics: &'a mut RoutingStatistics,
     },
 }
@@ -14173,6 +14298,65 @@ fn forward_inkling_cartesian_layer(
             statistics,
             stream,
         )?,
+        InklingCartesianLayerExecution::TensorExpert {
+            tensor_group,
+            assignment,
+            expert_group,
+            statistics,
+        } => layer.forward_tensor_expert_parallel_with_operator_cache(
+            hidden,
+            &mut kv,
+            &mut convolutions,
+            tensor_group,
+            assignment,
+            expert_group,
+            statistics,
+            stream,
+        )?,
+        InklingCartesianLayerExecution::External {
+            args,
+            global_layer,
+            tensor_group,
+            assignment,
+            expert_group,
+            pass,
+            cache,
+            statistics,
+        } => {
+            let execute = |hidden: &Array, ids: &Array, weights: &Array, stream: &Stream| {
+                execute_pipeline_cached_inkling(
+                    args,
+                    *global_layer,
+                    hidden,
+                    ids,
+                    weights,
+                    *pass,
+                    cache,
+                    assignment,
+                    *expert_group,
+                    statistics,
+                    stream,
+                )
+                .map_err(|error| Exception::custom(error.to_string()))
+            };
+            match tensor_group {
+                Some(group) => layer.forward_tensor_with_expert_executor_and_operator_cache(
+                    hidden,
+                    &mut kv,
+                    &mut convolutions,
+                    group,
+                    stream,
+                    execute,
+                )?,
+                None => layer.forward_with_expert_executor_and_operator_cache(
+                    hidden,
+                    &mut kv,
+                    &mut convolutions,
+                    stream,
+                    execute,
+                )?,
+            }
+        }
     };
     let kv_offset = match &kv {
         inkling::PipelineInklingKvCache::Standard(cache) => cache.offset(),
@@ -14195,9 +14379,14 @@ impl InklingStage {
         args: inkling::ModelArgs,
         range: Range<usize>,
         info: &PipelineStageInfo,
+        external_experts: bool,
         stream: &Stream,
     ) -> Result<Self, Error> {
-        let layer_adapter = InklingLayerwiseAdapter::new(args.clone(), stream)?;
+        let layer_adapter = if external_experts {
+            InklingLayerwiseAdapter::new_external_experts(args.clone(), stream)?
+        } else {
+            InklingLayerwiseAdapter::new(args.clone(), stream)?
+        };
         let complete = inkling::Model::new(args.clone(), stream)?;
         let inkling::Model { model, lm_head, .. } = complete;
         let inkling::TextModel {
@@ -14225,6 +14414,11 @@ impl InklingStage {
             parallel_lm_head: None,
             parallel_layout: None,
             expert_assignment: None,
+            expert_storage: if external_experts {
+                PipelineExpertStorage::ExternalEmpty
+            } else {
+                PipelineExpertStorage::LayerLocal
+            },
             routing_statistics: RoutingStatistics::default(),
         })
     }
@@ -14384,6 +14578,7 @@ impl InklingStage {
         step: PipelineStep,
         caches: &mut [PipelineLayerCache],
         execution: &ParallelExecutionContext<'_>,
+        expert_group: Option<&Group>,
     ) -> Result<PipelineStageOutput, Error> {
         let group = execution.group().ok_or_else(|| {
             Error::Parallel("tensor-sharded Inkling stage has no TP communicator".into())
@@ -14418,6 +14613,22 @@ impl InklingStage {
             }
         };
         let _ = pipeline_state_offset("Inkling TP+PP", caches)?;
+        let expert_assignment = self.expert_assignment.clone();
+        if let Some(assignment) = expert_assignment.as_ref() {
+            validate_pipeline_expert_dispatch(
+                assignment,
+                expert_group,
+                self.expert_storage.is_external(),
+            )?;
+        }
+        self.routing_statistics = RoutingStatistics::default();
+        let pass = if step.sequence_length > 1 {
+            ExpertPass::Prefill
+        } else {
+            ExpertPass::Decode
+        };
+        let args = self.args.clone();
+        let expert_cache = self.expert_storage.cache();
         let layer_adapter = &self.layer_adapter;
         let parallel_layout = self.parallel_layout.clone();
         hidden = execute_pipeline_layer_range(
@@ -14432,7 +14643,13 @@ impl InklingStage {
             },
             |global_layer, stream| {
                 layer_adapter
-                    .new_cartesian_layer(0, global_layer, parallel_layout.as_ref(), None, stream)
+                    .new_cartesian_layer(
+                        0,
+                        global_layer,
+                        parallel_layout.as_ref(),
+                        expert_assignment.as_ref(),
+                        stream,
+                    )
                     .and_then(|layer| match layer {
                         InklingLayer::Text(layer) => Ok(*layer),
                         InklingLayer::Vision(_) => Err(Error::Parallel(
@@ -14441,7 +14658,40 @@ impl InklingStage {
                     })
             },
             |global_layer, layer, hidden, cache, stream| {
-                let mut mode = InklingCartesianLayerExecution::Tensor(group);
+                let mut mode = match (
+                    expert_assignment.as_ref(),
+                    self.expert_storage.is_external(),
+                    expert_cache,
+                ) {
+                    (Some(assignment), true, Some(expert_cache)) => {
+                        InklingCartesianLayerExecution::External {
+                            args: &args,
+                            global_layer,
+                            tensor_group: Some(group),
+                            assignment,
+                            expert_group,
+                            pass,
+                            cache: expert_cache,
+                            statistics: &mut self.routing_statistics,
+                        }
+                    }
+                    (Some(_), true, None) | (None, true, None) => {
+                        InklingCartesianLayerExecution::Tensor(group)
+                    }
+                    (Some(assignment), false, None) => {
+                        InklingCartesianLayerExecution::TensorExpert {
+                            tensor_group: group,
+                            assignment,
+                            expert_group: expert_group
+                                .expect("validated resident Inkling EP group"),
+                            statistics: &mut self.routing_statistics,
+                        }
+                    }
+                    (None, false, _) => InklingCartesianLayerExecution::Tensor(group),
+                    (None, true, Some(_)) | (Some(_), false, Some(_)) => unreachable!(
+                        "Inkling expert storage and assignment are internally coherent"
+                    ),
+                };
                 let forwarded = forward_inkling_cartesian_layer(
                     layer,
                     global_layer,
@@ -14487,12 +14737,13 @@ impl InklingStage {
         input: PipelineStageInput<'_>,
         step: PipelineStep,
         caches: &mut [PipelineLayerCache],
-        group: &Group,
+        group: Option<&Group>,
         stream: &Stream,
     ) -> Result<PipelineStageOutput, Error> {
         let assignment = self.expert_assignment.as_ref().ok_or_else(|| {
             Error::Parallel("Inkling PP+EP stage has no rank-local expert assignment".into())
         })?;
+        validate_pipeline_expert_dispatch(assignment, group, self.expert_storage.is_external())?;
         if caches.len() != self.layers.len() {
             return Err(Error::Parallel(format!(
                 "Inkling PP+EP stage cache has {} entries, expected {}",
@@ -14523,6 +14774,13 @@ impl InklingStage {
         self.routing_statistics = RoutingStatistics::default();
         let layer_adapter = &self.layer_adapter;
         let expert_assignment = assignment.clone();
+        let expert_cache = self.expert_storage.cache();
+        let pass = if step.sequence_length > 1 {
+            ExpertPass::Prefill
+        } else {
+            ExpertPass::Decode
+        };
+        let args = self.args.clone();
         hidden = execute_pipeline_layer_range(
             PipelineLayerExecution {
                 range: self.range.clone(),
@@ -14544,19 +14802,49 @@ impl InklingStage {
                     })
             },
             |global_layer, layer, hidden, cache, stream| {
-                let mut mode = InklingCartesianLayerExecution::Expert {
-                    assignment: &expert_assignment,
-                    group,
-                    statistics: &mut self.routing_statistics,
+                let forwarded = match (self.expert_storage.is_external(), expert_cache) {
+                    (true, Some(expert_cache)) => {
+                        let mut mode = InklingCartesianLayerExecution::External {
+                            args: &args,
+                            global_layer,
+                            tensor_group: None,
+                            assignment: &expert_assignment,
+                            expert_group: group,
+                            pass,
+                            cache: expert_cache,
+                            statistics: &mut self.routing_statistics,
+                        };
+                        forward_inkling_cartesian_layer(
+                            layer,
+                            global_layer,
+                            hidden,
+                            cache,
+                            &mut mode,
+                            stream,
+                        )?
+                    }
+                    (true, None) => {
+                        Self::forward_layer(layer, global_layer, hidden, cache, stream)?
+                    }
+                    (false, None) => {
+                        let mut mode = InklingCartesianLayerExecution::Expert {
+                            assignment: &expert_assignment,
+                            group: group.expect("validated resident Inkling EP group"),
+                            statistics: &mut self.routing_statistics,
+                        };
+                        forward_inkling_cartesian_layer(
+                            layer,
+                            global_layer,
+                            hidden,
+                            cache,
+                            &mut mode,
+                            stream,
+                        )?
+                    }
+                    (false, Some(_)) => {
+                        unreachable!("resident Inkling stage cannot own expert cache")
+                    }
                 };
-                let forwarded = forward_inkling_cartesian_layer(
-                    layer,
-                    global_layer,
-                    hidden,
-                    cache,
-                    &mut mode,
-                    stream,
-                )?;
                 eval([&forwarded])?;
                 stream.synchronize()?;
                 Ok(forwarded)

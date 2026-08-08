@@ -949,7 +949,7 @@ placement, transfer, eviction, and active-window telemetry for either
 non-resident policy; `dense_stream_report` adds disk-stream pass and cache
 statistics only when that policy is active. `PipelineStageInfo` carries the
 same report's global rank and TP/PP/EP coordinates and stage ownership.
-Qwen3-MoE, Kimi Linear, GPT-OSS, LFM2-MoE, Nemotron-H-MoE, and text-only
+Qwen3-MoE, Kimi Linear, Inkling text, GPT-OSS, LFM2-MoE, Nemotron-H-MoE, and text-only
 Qwen3-Next/Qwen3.5-MoE also compose all three axes in this runtime. TP
 collectives remain inside the stage and EP coordinate, routed exchange remains
 inside the stage and TP coordinate, and pipeline transport connects equal
@@ -957,8 +957,8 @@ TP/EP coordinates.
 The triple-axis path supports arbitrary valid Cartesian degrees on native
 subgroup backends and uses topology-planned neighbor routes for stage-local
 Ring fallback collectives. Fully resident, host-layerwise, and
-dense-disk-streamed SafeTensors and canonical `qwen3moe`, `kimi_linear`, type-39 `gpt-oss`,
-`lfm2moe`, `nemotron_h_moe`, `qwen3next`, or `qwen35moe` GGUF checkpoints share the same layer recipes,
+dense-disk-streamed SafeTensors and canonical `qwen3moe`, `kimi_linear`, `inkling`,
+type-39 `gpt-oss`, `lfm2moe`, `nemotron_h_moe`, `qwen3next`, or `qwen35moe` GGUF checkpoints share the same layer recipes,
 cache identity, synchronized generation, and failure consensus. LFM2-MoE carries its
 TP-local causal-convolution state and attention KV state through that same
 stage cache, while Nemotron-H-MoE carries TP-local Mamba convolution/SSM state
@@ -1007,7 +1007,7 @@ that complete triple-axis/cache boundary. Dense families have no EP migration.
 | Nemotron-H-MoE | TP, PP, EP | Complete | None |
 | Qwen3-Next/Qwen3.5 text dense | TP, PP | TP+PP complete | Qwen3.5 multimodal ingress remains outside the text pipeline; EP does not apply |
 | Qwen3-Next/Qwen3.5-MoE text | TP, PP, EP | Complete | Qwen3.5 multimodal ingress remains outside the text pipeline |
-| Inkling text | TP, PP, EP | Pairwise | Compose short-convolution state and routed/shared experts with triple-axis execution and pipeline-independent expert caching; audio/vision ingress remains outside combined execution |
+| Inkling text | TP, PP, EP | Complete | Audio/vision ingress remains outside combined execution |
 | Qwen3-VL dense | TP, PP | TP+PP complete | Vision is pinned on stage zero; queued microbatches accept token IDs, while typed image/video prefill uses direct pipeline methods; EP does not apply |
 | Qwen3-VL-MoE | TP, PP, EP | Pairwise | Compose vision ownership and multimodal ingress with triple-axis execution and pipeline-independent expert caching; retain the dense-family ingress constraints above |
 | Moshi/PersonaPlex | TP | Not applicable | Its temporal/depth runtime has no PP or EP constituent axis |
@@ -1021,7 +1021,7 @@ The remaining global limitations are:
 - Families marked **Pairwise** fail triple-axis or pipeline-independent expert
   cache requests during preflight, before checkpoint payload materialization.
 
-TP+PP+EP is executable for Qwen3-MoE, Kimi Linear, GPT-OSS, LFM2-MoE, Nemotron-H-MoE, and
+TP+PP+EP is executable for Qwen3-MoE, Kimi Linear, Inkling text, GPT-OSS, LFM2-MoE, Nemotron-H-MoE, and
 Qwen3-Next/Qwen3.5-MoE text. The Cartesian
 topology and execution contexts remain family-neutral and accept arbitrary
 legal axis sizes.
@@ -2064,6 +2064,17 @@ the rank-local cache. The architecture-neutral GGUF EP dispatcher and
 type-erased expert cache also serve the registered DeepSeek2, Qwen3-MoE, LFM2-MoE,
 Nemotron-H-MoE, Qwen3-Next, and Qwen3.5-MoE streamed adapters.
 
+Inkling text uses the same Cartesian composition for full/sliding relative
+attention, four fixed short-convolution states, dense transitions, and routed
+plus shared experts. Resident execution shards attention and dense/shared
+expert intermediates over TP while EP owns routed banks. Independent caches
+retain replicated TP geometry for EP-owned routed banks and remain lazy under
+fully resident, host-layerwise, and dense-streamed nonexpert policies. Both
+SafeTensors and canonical `inkling` GGUF preserve stage-local KV/convolution
+state, bounded reads, prompt-cache identity, synchronized generation, and
+failure consensus. Audio and vision ingress remain outside combined pipeline
+execution.
+
 Run a two-process Ring generation probe with the usual MLX Ring host file and
 rank environment:
 
@@ -2178,6 +2189,10 @@ attention and dense/sparse transitions, including rank-local KV and four-way
 convolution state, stage-local or cached routed experts, shared experts,
 dense-streamed bounded reads, prompt-cache reload, synchronized generation,
 and single-rank numerical parity.
+The eight-process cases add resident TP+PP+EP plus dense-streamed,
+host-layerwise, and canonical-GGUF nonexperts with independently cached routed
+experts. They also cover EP-inactive TP+PP caching, uneven stage placement, and
+cached-expert schedule failure consensus.
 The Qwen3-VL-MoE four-process cases cover SafeTensors and canonical GGUF TP+EP
 text-decoder execution with
 rank-local MRoPE KV geometry, tensor-sharded attention and nonexpert

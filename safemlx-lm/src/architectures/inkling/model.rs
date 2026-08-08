@@ -1563,6 +1563,21 @@ impl InklingMoe {
             .add(shared, stream)?
             .reshape(&shape, stream)
     }
+
+    #[allow(clippy::too_many_arguments)]
+    fn forward_tensor_expert_parallel(
+        &mut self,
+        hidden: &Array,
+        tensor_group: &safemlx::distributed::Group,
+        assignment: &crate::architectures::distributed::expert::ExpertAssignment,
+        expert_group: &safemlx::distributed::Group,
+        statistics: &mut crate::architectures::distributed::expert::RoutingStatistics,
+        stream: &Stream,
+    ) -> Result<Array, Exception> {
+        let partial =
+            self.forward_expert_parallel(hidden, assignment, expert_group, statistics, stream)?;
+        safemlx::distributed::all_sum(&partial, tensor_group, stream)
+    }
 }
 
 #[derive(Debug, Clone, ModuleParameters)]
@@ -1756,6 +1771,29 @@ impl DecoderLayer {
             }
         }
         Self::new(&local, layer, stream)
+    }
+
+    pub(crate) fn new_tensor_expert_parallel(
+        args: &TextArgs,
+        layer: i32,
+        geometry: ParallelLayerGeometry,
+        local_experts: i32,
+        stream: &Stream,
+    ) -> Result<Self, Exception> {
+        let mut result = Self::new_parallel_layerwise(args, layer, geometry, stream)?;
+        if let Some(moe) = &mut result.moe {
+            let prefix = format!("model.layers.{layer}.moe.experts");
+            moe.experts = PackedSwiGluExperts::new_with_dtype(
+                local_experts,
+                args.hidden_size,
+                result.intermediate,
+                args.weight_quantization_for(&format!("{prefix}.gate_up_proj")),
+                args.weight_quantization_for(&format!("{prefix}.down_proj")),
+                args.weight_dtype(),
+                stream,
+            )?;
+        }
+        Ok(result)
     }
 
     pub(crate) fn register_tensor_parallel_parameters(
@@ -2227,6 +2265,158 @@ impl DecoderLayer {
                 .as_mut()
                 .expect("validated sparse layer")
                 .forward_tensor_parallel(&normalized, group, stream)?
+        };
+        let mlp = short_convolution(&self.mlp_sconv, &mlp, Some(&mut output[1]), stream)?;
+        hidden.add(mlp, stream)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn forward_tensor_with_expert_executor_and_operator_cache<F>(
+        &mut self,
+        hidden: &Array,
+        kv: &mut PipelineInklingKvCache<'_>,
+        convolutions: &mut [CausalConv1dCache; 4],
+        group: &safemlx::distributed::Group,
+        stream: &Stream,
+        execute: F,
+    ) -> Result<Array, Exception>
+    where
+        F: FnOnce(&Array, &Array, &Array, &Stream) -> Result<Array, Exception>,
+    {
+        let normalized = self.input_layernorm.forward(hidden, stream)?;
+        let (attention_kv, output) = convolutions.split_at_mut(2);
+        let (key_state, value_state) = attention_kv.split_at_mut(1);
+        let attention = self.self_attn.forward_tensor_parallel_with_operator_cache(
+            &normalized,
+            kv,
+            &mut key_state[0],
+            &mut value_state[0],
+            group,
+            stream,
+        )?;
+        let attention =
+            short_convolution(&self.attn_sconv, &attention, Some(&mut output[0]), stream)?;
+        let hidden = hidden.add(attention, stream)?;
+        let normalized = self.post_attention_layernorm.forward(&hidden, stream)?;
+        let mlp = if let Some(dense) = &mut self.dense {
+            let gate =
+                crate::nn::layers::silu(dense.gate_proj.forward(&normalized, stream)?, stream)?;
+            let up = dense.up_proj.forward(&normalized, stream)?;
+            let partial = crate::nn::parallel::forward_row_parallel(
+                &mut dense.down_proj,
+                &gate.multiply(up, stream)?,
+                group,
+                stream,
+            )?;
+            match self.dense_global_scale.as_ref() {
+                Some(scale) => partial.multiply(scale, stream)?,
+                None => partial,
+            }
+        } else {
+            self.moe
+                .as_mut()
+                .expect("validated sparse layer")
+                .forward_tensor_with_expert_executor(&normalized, group, stream, execute)?
+        };
+        let mlp = short_convolution(&self.mlp_sconv, &mlp, Some(&mut output[1]), stream)?;
+        hidden.add(mlp, stream)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn forward_with_expert_executor_and_operator_cache<F>(
+        &mut self,
+        hidden: &Array,
+        kv: &mut PipelineInklingKvCache<'_>,
+        convolutions: &mut [CausalConv1dCache; 4],
+        stream: &Stream,
+        execute: F,
+    ) -> Result<Array, Exception>
+    where
+        F: FnOnce(&Array, &Array, &Array, &Stream) -> Result<Array, Exception>,
+    {
+        let normalized = self.input_layernorm.forward(hidden, stream)?;
+        let (attention_kv, output) = convolutions.split_at_mut(2);
+        let (key_state, value_state) = attention_kv.split_at_mut(1);
+        let attention = self.self_attn.forward_with_operator_cache(
+            &normalized,
+            kv,
+            &mut key_state[0],
+            &mut value_state[0],
+            stream,
+        )?;
+        let attention =
+            short_convolution(&self.attn_sconv, &attention, Some(&mut output[0]), stream)?;
+        let hidden = hidden.add(attention, stream)?;
+        let normalized = self.post_attention_layernorm.forward(&hidden, stream)?;
+        let mlp = if let Some(dense) = &mut self.dense {
+            let output = dense.forward(&normalized, stream)?;
+            match self.dense_global_scale.as_ref() {
+                Some(scale) => output.multiply(scale, stream)?,
+                None => output,
+            }
+        } else {
+            self.moe
+                .as_mut()
+                .expect("validated sparse layer")
+                .forward_with_expert_executor(&normalized, stream, execute)?
+        };
+        let mlp = short_convolution(&self.mlp_sconv, &mlp, Some(&mut output[1]), stream)?;
+        hidden.add(mlp, stream)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn forward_tensor_expert_parallel_with_operator_cache(
+        &mut self,
+        hidden: &Array,
+        kv: &mut PipelineInklingKvCache<'_>,
+        convolutions: &mut [CausalConv1dCache; 4],
+        tensor_group: &safemlx::distributed::Group,
+        assignment: &crate::architectures::distributed::expert::ExpertAssignment,
+        expert_group: &safemlx::distributed::Group,
+        statistics: &mut crate::architectures::distributed::expert::RoutingStatistics,
+        stream: &Stream,
+    ) -> Result<Array, Exception> {
+        let normalized = self.input_layernorm.forward(hidden, stream)?;
+        let (attention_kv, output) = convolutions.split_at_mut(2);
+        let (key_state, value_state) = attention_kv.split_at_mut(1);
+        let attention = self.self_attn.forward_tensor_parallel_with_operator_cache(
+            &normalized,
+            kv,
+            &mut key_state[0],
+            &mut value_state[0],
+            tensor_group,
+            stream,
+        )?;
+        let attention =
+            short_convolution(&self.attn_sconv, &attention, Some(&mut output[0]), stream)?;
+        let hidden = hidden.add(attention, stream)?;
+        let normalized = self.post_attention_layernorm.forward(&hidden, stream)?;
+        let mlp = if let Some(dense) = &mut self.dense {
+            let gate =
+                crate::nn::layers::silu(dense.gate_proj.forward(&normalized, stream)?, stream)?;
+            let up = dense.up_proj.forward(&normalized, stream)?;
+            let partial = crate::nn::parallel::forward_row_parallel(
+                &mut dense.down_proj,
+                &gate.multiply(up, stream)?,
+                tensor_group,
+                stream,
+            )?;
+            match self.dense_global_scale.as_ref() {
+                Some(scale) => partial.multiply(scale, stream)?,
+                None => partial,
+            }
+        } else {
+            self.moe
+                .as_mut()
+                .expect("validated sparse layer")
+                .forward_tensor_expert_parallel(
+                    &normalized,
+                    tensor_group,
+                    assignment,
+                    expert_group,
+                    statistics,
+                    stream,
+                )?
         };
         let mlp = short_convolution(&self.mlp_sconv, &mlp, Some(&mut output[1]), stream)?;
         hidden.add(mlp, stream)

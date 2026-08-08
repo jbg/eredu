@@ -702,6 +702,12 @@ impl InklingLayerwiseAdapter {
         })
     }
 
+    pub(crate) fn new_external_experts(args: ModelArgs, stream: &Stream) -> Result<Self, Error> {
+        let mut adapter = Self::new(args, stream)?;
+        adapter.sparse_expert_cache = true;
+        Ok(adapter)
+    }
+
     /// Returns the parsed Inkling configuration.
     pub const fn args(&self) -> &ModelArgs {
         &self.args
@@ -1715,9 +1721,51 @@ impl ArchitectureAdapter for InklingLayerwiseAdapter {
             DecoderLayer::new_expert_parallel(
                 &self.args.text_config,
                 index as i32,
-                i32::try_from(assignment.local_expert_count()).map_err(|_| {
-                    Error::Parallel("local Inkling expert count exceeds i32".into())
-                })?,
+                if self.sparse_expert_cache {
+                    0
+                } else {
+                    i32::try_from(assignment.local_expert_count()).map_err(|_| {
+                        Error::Parallel("local Inkling expert count exceeds i32".into())
+                    })?
+                },
+                stream,
+            )?,
+        )))
+    }
+
+    fn new_tensor_expert_parallel_layer(
+        &self,
+        group: usize,
+        index: usize,
+        layout: &crate::runtime::distributed::parallel::LocalModelLayout,
+        assignment: &crate::runtime::distributed::expert::ExpertAssignment,
+        stream: &Stream,
+    ) -> Result<Self::Layer, Error> {
+        if self.execution_group_name(group)? == "vision_encoder" {
+            return self.new_parallel_layer(group, index, layout, stream);
+        }
+        let geometry = self
+            .parallel_text_geometry
+            .as_ref()
+            .and_then(|geometry| geometry.get(index))
+            .copied()
+            .ok_or_else(|| {
+                Error::Parallel(format!(
+                    "Inkling local geometry is unavailable for decoder layer {index}"
+                ))
+            })?;
+        let local_experts = if self.sparse_expert_cache {
+            0
+        } else {
+            i32::try_from(assignment.local_expert_count())
+                .map_err(|_| Error::Parallel("local Inkling expert count exceeds i32".into()))?
+        };
+        Ok(InklingLayer::Text(Box::new(
+            DecoderLayer::new_tensor_expert_parallel(
+                &self.args.text_config,
+                index as i32,
+                geometry,
+                local_experts,
                 stream,
             )?,
         )))
@@ -1727,7 +1775,7 @@ impl ArchitectureAdapter for InklingLayerwiseAdapter {
         &self,
         topology: crate::runtime::distributed::topology::ParallelTopology,
     ) -> Result<Option<crate::runtime::distributed::expert::ExpertAssignment>, Error> {
-        if topology.expert_parallel_size == 1 {
+        if topology.expert_parallel_size == 1 && !self.sparse_expert_cache {
             return Ok(None);
         }
         if self.args.text_config.n_routed_experts <= 0
@@ -2836,6 +2884,68 @@ mod tests {
                 policy => panic!("unexpected Inkling cache policy {policy:?}"),
             }
         }
+    }
+
+    #[test]
+    fn cartesian_layer_composes_uneven_ep_ownership_with_tp_geometry() {
+        let execution = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        let mut value = config();
+        value["text_config"]["n_routed_experts"] = 5.into();
+        value["text_config"]["num_attention_heads"] = 4.into();
+        value["text_config"]["num_key_value_heads"] = 2.into();
+        value["text_config"]["head_dim"] = 4.into();
+        value["text_config"]["swa_num_attention_heads"] = 4.into();
+        value["text_config"]["swa_num_key_value_heads"] = 2.into();
+        value["text_config"]["swa_head_dim"] = 4.into();
+        let args = resident::model_args_from_config_value(&value).unwrap();
+
+        for rank in 0..12 {
+            let topology = ParallelTopology::from_rank(
+                12,
+                rank,
+                2,
+                2,
+                3,
+                DeviceAssignment::new(DeviceType::Cpu, 0),
+            )
+            .unwrap();
+            let mut adapter =
+                InklingLayerwiseAdapter::new(args.clone(), execution.stream()).unwrap();
+            let context = ParallelBuildContext::new(topology, ShardingPolicy::Require);
+            let mut planner = context.planner();
+            adapter
+                .register_parallel_parameters(context, &mut planner, execution.stream())
+                .unwrap();
+            let (_, layout) = planner.finish().unwrap();
+            adapter
+                .configure_parallel_static(context, &layout, execution.stream())
+                .unwrap();
+            let assignment = adapter
+                .expert_parallel_assignment(topology)
+                .unwrap()
+                .unwrap();
+            let layer = adapter
+                .new_cartesian_layer(0, 1, Some(&layout), Some(&assignment), execution.stream())
+                .unwrap();
+            let parameters = layer.parameters().flatten();
+            assert_eq!(
+                parameters["moe.experts.gate_up_proj"].shape(),
+                &[assignment.local_expert_count() as i32, 8, 16]
+            );
+            assert_eq!(assignment.group_size(), 3);
+        }
+
+        let topology =
+            ParallelTopology::from_rank(4, 0, 2, 2, 1, DeviceAssignment::new(DeviceType::Cpu, 0))
+                .unwrap();
+        let adapter =
+            InklingLayerwiseAdapter::new_external_experts(args, execution.stream()).unwrap();
+        let assignment = adapter
+            .expert_parallel_assignment(topology)
+            .unwrap()
+            .unwrap();
+        assert_eq!(assignment.group_size(), 1);
+        assert_eq!(assignment.local_expert_count(), 5);
     }
 
     #[test]

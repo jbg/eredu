@@ -3082,7 +3082,7 @@ pub(crate) fn execute_cached_gpt_oss_at(
     )?)
 }
 
-fn execute_cached_inkling(
+pub(crate) fn execute_cached_inkling(
     args: &inkling::ModelArgs,
     layer: usize,
     routes: &DispatchedRoutes,
@@ -3102,16 +3102,26 @@ fn execute_cached_inkling(
         |hidden, acquired, _weights, stream| {
             let started = Instant::now();
             let text = &args.text_config;
-            let mut bank = PackedSwiGluExperts::new(
+            let prefix = format!("model.layers.{layer}.moe.experts");
+            let mut bank = PackedSwiGluExperts::new_with_dtype(
                 acquired.identities().len() as i32,
                 text.hidden_size,
                 text.moe_intermediate_size(),
-                None,
-                None,
+                text.weight_quantization_for(&format!("{prefix}.gate_up_proj")),
+                text.weight_quantization_for(&format!("{prefix}.down_proj")),
+                text.weight_dtype(),
                 stream,
             )?;
             bank.gate_up_proj = Param::new(acquired.compact_binding("gate_up_proj", stream)?);
+            bank.gate_up_proj_scales =
+                Param::new(acquired.optional_compact_binding("gate_up_proj_scales", stream)?);
+            bank.gate_up_proj_biases =
+                Param::new(acquired.optional_compact_binding("gate_up_proj_biases", stream)?);
             bank.down_proj = Param::new(acquired.compact_binding("down_proj", stream)?);
+            bank.down_proj_scales =
+                Param::new(acquired.optional_compact_binding("down_proj_scales", stream)?);
+            bank.down_proj_biases =
+                Param::new(acquired.optional_compact_binding("down_proj_biases", stream)?);
             cache.record_compact_bank(
                 acquired.pass(),
                 acquired.scratch_bytes(),

@@ -184,6 +184,9 @@ impl FixtureFamily {
     fn expert_layer_count(self, range: std::ops::Range<usize>) -> usize {
         match self {
             Self::KimiLinear | Self::KimiLinearGguf => range.filter(|index| *index == 1).count(),
+            Self::Inkling | Self::InklingGguf => {
+                range.filter(|index| matches!(*index, 1 | 2)).count()
+            }
             Self::NemotronH => range.filter(|index| *index == 2).count(),
             Self::NemotronHGguf => range.filter(|index| matches!(*index, 1 | 2)).count(),
             _ => range.len(),
@@ -411,7 +414,8 @@ fn pipeline_ring_worker() {
             assert_eq!(
                 opened.contains(&format!("layer-{layer}.safetensors")),
                 ((!dense_stream && !layerwise_host)
-                    || (expert_cache && !matches!(family, FixtureFamily::KimiLinear)))
+                    || (expert_cache
+                        && !matches!(family, FixtureFamily::KimiLinear | FixtureFamily::Inkling)))
                     && expected_range.contains(&layer),
                 "rank {expected_rank} opened the wrong SafeTensors layer shard for {family:?}"
             );
@@ -3791,6 +3795,79 @@ fn ring_four_process_inkling_gguf_pipeline_expert() {
     run_ring_cartesian_pipeline(true, FixtureFamily::InklingGguf, "pp-ep");
 }
 
+/// Proves resident Inkling TP=2 x PP=2 x EP=2 execution across uneven stage
+/// placement, full/sliding attention, short-convolution state, and routed/shared
+/// expert ownership.
+#[test]
+#[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
+fn ring_eight_process_inkling_triple_axis() {
+    run_ring_cartesian_pipeline(false, FixtureFamily::Inkling, "tp-pp-ep");
+}
+
+/// Exercises dense-streamed Inkling non-experts and stage-local independent
+/// expert caches across all three Cartesian axes.
+#[test]
+#[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
+fn ring_eight_process_inkling_streamed_triple_axis_expert_cache() {
+    run_ring_cartesian_pipeline_mode(
+        true,
+        FixtureFamily::Inkling,
+        "tp-pp-ep",
+        WorkerMode::ExpertCache,
+    );
+}
+
+/// Exercises host-layerwise Inkling attention/convolution state with
+/// independently cached routed experts across TP, PP, and EP.
+#[test]
+#[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
+fn ring_eight_process_inkling_layerwise_host_triple_axis_expert_cache() {
+    run_ring_layerwise_host_cartesian_pipeline_mode(
+        FixtureFamily::Inkling,
+        "tp-pp-ep",
+        WorkerMode::ExpertCache,
+    );
+}
+
+/// Exercises canonical Inkling GGUF recipes, bounded reads, and independent
+/// expert caching across all three axes.
+#[test]
+#[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
+fn ring_eight_process_inkling_gguf_triple_axis_expert_cache() {
+    run_ring_cartesian_pipeline_mode(
+        true,
+        FixtureFamily::InklingGguf,
+        "tp-pp-ep",
+        WorkerMode::ExpertCache,
+    );
+}
+
+/// Proves TP+PP can independently cache every stage-local Inkling expert bank
+/// without constructing an EP communicator.
+#[test]
+#[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
+fn ring_four_process_inkling_tensor_pipeline_expert_cache_without_ep() {
+    run_ring_cartesian_pipeline_mode(
+        true,
+        FixtureFamily::Inkling,
+        "tp-pp",
+        WorkerMode::ExpertCache,
+    );
+}
+
+/// Verifies descriptor mismatch consensus remains deadlock-free while every
+/// Inkling stage owns an independent expert cache.
+#[test]
+#[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
+fn ring_four_process_inkling_expert_cache_mismatch_consensus() {
+    run_ring_cartesian_pipeline_mode(
+        false,
+        FixtureFamily::Inkling,
+        "pp-ep",
+        WorkerMode::ExpertCacheScheduleMismatch,
+    );
+}
+
 fn run_ring_pipeline(dense_stream: bool, family: FixtureFamily) {
     run_ring_pipeline_mode(dense_stream, family, WorkerMode::Standard);
 }
@@ -3885,6 +3962,7 @@ fn run_ring_layerwise_host_cartesian_pipeline_mode(
             FixtureFamily::Lfm2Moe => write_lfm2_pipeline_fixture(checkpoint.path(), true),
             FixtureFamily::KimiLinear => write_kimi_linear_fixture(checkpoint.path()),
             FixtureFamily::NemotronH => write_nemotron_fixture(checkpoint.path()),
+            FixtureFamily::Inkling => write_inkling_fixture(checkpoint.path()),
             FixtureFamily::Qwen3NextMoe => {
                 write_qwen_hybrid_moe_fixture(checkpoint.path(), "qwen3_next")
             }
