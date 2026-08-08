@@ -409,7 +409,8 @@ fn pipeline_ring_worker() {
         for layer in 0..family.layer_count() {
             assert_eq!(
                 opened.contains(&format!("layer-{layer}.safetensors")),
-                !dense_stream && expected_range.contains(&layer),
+                ((!dense_stream && !layerwise_host) || expert_cache)
+                    && expected_range.contains(&layer),
                 "rank {expected_rank} opened the wrong SafeTensors layer shard for {family:?}"
             );
         }
@@ -3469,6 +3470,59 @@ fn ring_four_process_qwen3_next_pipeline_expert() {
     run_ring_cartesian_pipeline(true, FixtureFamily::Qwen3NextMoe, "pp-ep");
 }
 
+/// Verifies resident Qwen3-Next-MoE execution across all Cartesian axes,
+/// including recurrent state, routed/shared TP projections, and generation.
+#[test]
+#[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
+fn ring_eight_process_qwen3_next_moe_triple_axis() {
+    run_ring_cartesian_pipeline(false, FixtureFamily::Qwen3NextMoe, "tp-pp-ep");
+}
+
+/// Verifies Qwen3.5-MoE dense streaming composes with stage/EP-local expert
+/// caches, bounded reads, prompt-cache reload, and synchronized decode.
+#[test]
+#[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
+fn ring_eight_process_qwen35_moe_streamed_triple_axis_expert_cache() {
+    run_ring_cartesian_pipeline_mode(
+        true,
+        FixtureFamily::Qwen35Moe,
+        "tp-pp-ep",
+        WorkerMode::ExpertCache,
+    );
+}
+
+/// Exercises host-backed hybrid non-expert layers with independent expert
+/// caching across TP, PP, and EP.
+#[test]
+#[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
+fn ring_eight_process_qwen3_next_moe_layerwise_host_triple_axis_expert_cache() {
+    run_ring_layerwise_host_cartesian_pipeline_mode(
+        FixtureFamily::Qwen3NextMoe,
+        "tp-pp-ep",
+        WorkerMode::ExpertCache,
+    );
+}
+
+/// Covers independent hybrid expert caching when PP is active without EP.
+#[test]
+#[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
+fn ring_two_process_qwen35_moe_pipeline_expert_cache() {
+    run_ring_pipeline_mode(false, FixtureFamily::Qwen35Moe, WorkerMode::ExpertCache);
+}
+
+/// Verifies failure consensus for cached Qwen hybrid experts without leaving a
+/// recurrent stage blocked in an EP collective.
+#[test]
+#[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
+fn ring_four_process_qwen35_moe_pipeline_expert_cache_mismatch_consensus() {
+    run_ring_cartesian_pipeline_mode(
+        false,
+        FixtureFamily::Qwen35Moe,
+        "pp-ep",
+        WorkerMode::ExpertCacheScheduleMismatch,
+    );
+}
+
 /// Verifies arbitrary Cartesian composition with TP-sharded Qwen3-MoE
 /// projections, stage-local EP ownership, corresponding-coordinate pipeline
 /// transport, cache persistence, and globally synchronized generation.
@@ -3757,6 +3811,12 @@ fn run_ring_layerwise_host_cartesian_pipeline_mode(
             FixtureFamily::GptOss => write_gpt_oss_fixture(checkpoint.path()),
             FixtureFamily::Lfm2Moe => write_lfm2_pipeline_fixture(checkpoint.path(), true),
             FixtureFamily::NemotronH => write_nemotron_fixture(checkpoint.path()),
+            FixtureFamily::Qwen3NextMoe => {
+                write_qwen_hybrid_moe_fixture(checkpoint.path(), "qwen3_next")
+            }
+            FixtureFamily::Qwen35Moe => {
+                write_qwen_hybrid_moe_fixture(checkpoint.path(), "qwen3_5_moe_text")
+            }
             _ => panic!("host-layerwise Cartesian helper received unsupported {family:?}"),
         }
         checkpoint.path().to_path_buf()

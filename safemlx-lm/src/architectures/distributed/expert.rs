@@ -3214,7 +3214,7 @@ pub(crate) fn execute_cached_nemotron_h(
     )?)
 }
 
-fn execute_cached_qwen_hybrid(
+pub(crate) fn execute_cached_qwen_hybrid(
     args: &qwen3_5::ModelArgs,
     layer: usize,
     routes: &DispatchedRoutes,

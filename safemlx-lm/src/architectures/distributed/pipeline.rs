@@ -1059,6 +1059,7 @@ struct QwenHybridStage {
     parallel_layout: Option<crate::runtime::distributed::parallel::LocalModelLayout>,
     parallel_geometry: Option<Vec<qwen_hybrid::ParallelLayerGeometry>>,
     expert_assignment: Option<ExpertAssignment>,
+    expert_storage: PipelineExpertStorage,
     routing_statistics: RoutingStatistics,
 }
 
@@ -2955,6 +2956,10 @@ impl PipelineStageSemantics for QwenHybridStage {
         self.dense_layers.as_ref()
     }
 
+    fn expert_cache(&self) -> Option<&ExpertCache> {
+        self.expert_storage.cache()
+    }
+
     fn prompt_cache_model_identity(
         &self,
         topology: ParallelTopology,
@@ -3013,11 +3018,24 @@ impl PipelineStageSemantics for QwenHybridStage {
         stream: &Stream,
     ) -> Result<PipelineStageOutput, Error> {
         if let Some(group) = expert_group {
-            return self.forward_expert_parallel(input, step, mask, cache, group, stream);
+            if let Some(execution) = execution.filter(|execution| execution.is_tensor_parallel()) {
+                return self.forward_tensor_parallel(
+                    input,
+                    step,
+                    mask,
+                    cache,
+                    execution,
+                    Some(group),
+                );
+            }
+            return self.forward_expert_parallel(input, step, mask, cache, Some(group), stream);
         }
         match execution {
             Some(execution) if execution.is_tensor_parallel() => {
-                self.forward_tensor_parallel(input, step, mask, cache, execution)
+                self.forward_tensor_parallel(input, step, mask, cache, execution, None)
+            }
+            _ if self.expert_storage.is_external() => {
+                self.forward_expert_parallel(input, step, mask, cache, None, stream)
             }
             _ => self.forward(input, step, mask, cache, stream),
         }
@@ -4720,7 +4738,8 @@ pub fn load_pipeline_model(
 /// support fully resident, host-layerwise, and dense-disk-streamed layers.
 /// Non-resident units compose pipeline placement with the authoritative TP
 /// semantic layout or EP assignment before residency initialization. Qwen3-MoE,
-/// GPT-OSS, LFM2-MoE, and Nemotron-H-MoE additionally compose an independent, stage-local expert cache
+/// GPT-OSS, LFM2-MoE, Nemotron-H-MoE, and Qwen3-Next/Qwen3.5-MoE additionally
+/// compose an independent, stage-local expert cache
 /// with resident, host-layerwise, or dense-streamed non-expert parameters for
 /// PP, TP+PP, PP+EP, and TP+PP+EP. With EP inactive each stage owns all experts
 /// for its local layers and executes routes without an expert collective.
@@ -4762,10 +4781,12 @@ pub fn load_pipeline_model_with_options(
                     | crate::api::GgufArchitecture::GptOss
                     | crate::api::GgufArchitecture::Lfm2Moe
                     | crate::api::GgufArchitecture::NemotronHMoe
+                    | crate::api::GgufArchitecture::Qwen35Moe
+                    | crate::api::GgufArchitecture::Qwen3Next
             )
         {
             return Err(Error::Parallel(format!(
-                "pipeline independent expert caching has registered Qwen3-MoE, GPT-OSS, LFM2-MoE, and Nemotron-H-MoE semantic expert recipes; GGUF architecture {} is not yet registered and no checkpoint payload was materialized",
+                "pipeline independent expert caching has registered Qwen3-MoE, GPT-OSS, LFM2-MoE, Nemotron-H-MoE, Qwen3-Next-MoE, and Qwen3.5-MoE semantic expert recipes; GGUF architecture {} is not yet registered and no checkpoint payload was materialized",
                 architecture.metadata_name()
             )));
         }
@@ -4778,10 +4799,12 @@ pub fn load_pipeline_model_with_options(
                     | crate::api::GgufArchitecture::GptOss
                     | crate::api::GgufArchitecture::Lfm2Moe
                     | crate::api::GgufArchitecture::NemotronHMoe
+                    | crate::api::GgufArchitecture::Qwen35Moe
+                    | crate::api::GgufArchitecture::Qwen3Next
             )
         {
             return Err(Error::Parallel(format!(
-                "TP+PP+EP preflight has registered Qwen3-MoE, GPT-OSS, LFM2-MoE, and Nemotron-H-MoE; GGUF architecture {} has no triple-axis semantic plan and no checkpoint payload was materialized",
+                "TP+PP+EP preflight has registered Qwen3-MoE, GPT-OSS, LFM2-MoE, Nemotron-H-MoE, Qwen3-Next-MoE, and Qwen3.5-MoE; GGUF architecture {} has no triple-axis semantic plan and no checkpoint payload was materialized",
                 architecture.metadata_name()
             )));
         }
@@ -5054,6 +5077,7 @@ pub fn load_pipeline_model_with_options(
                     topology,
                     options.quantization,
                     dense_stream,
+                    expert_cache,
                     stream,
                     weights_stream,
                 )
@@ -5109,11 +5133,19 @@ pub fn load_pipeline_model_with_options(
     if expert_cache.is_some()
         && !matches!(
             model_type,
-            Some("qwen3_moe" | "gpt_oss" | "lfm2_moe" | "nemotron_h")
+            Some(
+                "qwen3_moe"
+                    | "gpt_oss"
+                    | "lfm2_moe"
+                    | "nemotron_h"
+                    | "qwen3_next"
+                    | "qwen3_5_moe"
+                    | "qwen3_5_moe_text"
+            )
         )
     {
         return Err(Error::Parallel(format!(
-            "pipeline independent expert caching has registered Qwen3-MoE, GPT-OSS, LFM2-MoE, and Nemotron-H-MoE semantic expert recipes; SafeTensors model_type {model_type:?} is not yet registered and no checkpoint payload was materialized"
+            "pipeline independent expert caching has registered Qwen3-MoE, GPT-OSS, LFM2-MoE, Nemotron-H-MoE, Qwen3-Next-MoE, and Qwen3.5-MoE semantic expert recipes; SafeTensors model_type {model_type:?} is not yet registered and no checkpoint payload was materialized"
         )));
     }
     if topology.tensor_parallel_size > 1
@@ -5121,11 +5153,19 @@ pub fn load_pipeline_model_with_options(
         && topology.expert_parallel_size > 1
         && !matches!(
             model_type,
-            Some("qwen3_moe" | "gpt_oss" | "lfm2_moe" | "nemotron_h")
+            Some(
+                "qwen3_moe"
+                    | "gpt_oss"
+                    | "lfm2_moe"
+                    | "nemotron_h"
+                    | "qwen3_next"
+                    | "qwen3_5_moe"
+                    | "qwen3_5_moe_text"
+            )
         )
     {
         return Err(Error::Parallel(format!(
-            "TP+PP+EP preflight has registered Qwen3-MoE, GPT-OSS, LFM2-MoE, and Nemotron-H-MoE; SafeTensors model_type {:?} has no triple-axis semantic plan and no checkpoint payload was materialized",
+            "TP+PP+EP preflight has registered Qwen3-MoE, GPT-OSS, LFM2-MoE, Nemotron-H-MoE, Qwen3-Next-MoE, and Qwen3.5-MoE; SafeTensors model_type {:?} has no triple-axis semantic plan and no checkpoint payload was materialized",
             model_type
         )));
     }
@@ -5344,6 +5384,7 @@ pub fn load_pipeline_model_with_options(
                 topology,
                 options.quantization,
                 dense_stream,
+                expert_cache,
                 stream,
                 weights_stream,
             )
@@ -5368,6 +5409,7 @@ pub fn load_pipeline_model_with_options(
                 topology,
                 options.quantization,
                 dense_stream,
+                expert_cache,
                 stream,
                 weights_stream,
             )
@@ -7789,6 +7831,35 @@ fn execute_pipeline_cached_lfm2(
     let execute = |routes: &crate::runtime::distributed::expert::DispatchedRoutes,
                    stream: &Stream| {
         super::expert::execute_cached_lfm2(args, global_layer, routes, pass, cache, stream)
+    };
+    let returned = match expert_group {
+        Some(group) => dispatch_replicated_with(
+            hidden, expert_ids, weights, assignment, group, stream, execute,
+        )?,
+        None => dispatch_local_with(hidden, expert_ids, weights, assignment, stream, execute)?,
+    };
+    statistics.accumulate(&returned.statistics);
+    Ok(returned.reduced_output)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_pipeline_cached_qwen_hybrid(
+    args: &qwen_hybrid::ModelArgs,
+    global_layer: usize,
+    hidden: &Array,
+    expert_ids: &Array,
+    weights: &Array,
+    pass: ExpertPass,
+    cache: &ExpertCache,
+    assignment: &ExpertAssignment,
+    expert_group: Option<&Group>,
+    statistics: &mut RoutingStatistics,
+    stream: &Stream,
+) -> Result<Array, Error> {
+    validate_pipeline_expert_dispatch(assignment, expert_group, true)?;
+    let execute = |routes: &crate::runtime::distributed::expert::DispatchedRoutes,
+                   stream: &Stream| {
+        super::expert::execute_cached_qwen_hybrid(args, global_layer, routes, pass, cache, stream)
     };
     let returned = match expert_group {
         Some(group) => dispatch_replicated_with(
@@ -11468,16 +11539,22 @@ impl NemotronHStage {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn load_qwen_hybrid_pipeline(
     source_args: qwen_hybrid::ModelArgs,
     store: SharedWeightStore,
     topology: ParallelTopology,
     requested_quantization: Option<WeightQuantization>,
     dense_stream: Option<PipelineLayerLoadOptions>,
+    expert_cache_options: Option<ExpertCacheLoadOptions>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<PipelineModel, Error> {
-    let mut binding_adapter = QwenHybridLayerwiseAdapter::new_text(source_args.clone(), stream)?;
+    let mut binding_adapter = if expert_cache_options.is_some() {
+        QwenHybridLayerwiseAdapter::new_text_external_experts(source_args.clone(), stream)?
+    } else {
+        QwenHybridLayerwiseAdapter::new_text(source_args.clone(), stream)?
+    };
     let expert_assignment = binding_adapter.expert_parallel_assignment(topology)?;
     topology.preflight(
         Some(source_args.num_hidden_layers as usize),
@@ -11501,9 +11578,9 @@ fn load_qwen_hybrid_pipeline(
         })
         .transpose()?
         .flatten();
-    if dense_stream.is_some() && quantize_on_load.is_some() {
+    if (dense_stream.is_some() || expert_cache_options.is_some()) && quantize_on_load.is_some() {
         return Err(Error::Quantization(
-            "load-time quantization is unsupported for non-resident Qwen hybrid pipeline layers; use checkpoint-native packed weights"
+            "load-time quantization is unsupported for non-resident Qwen hybrid pipeline weights; use checkpoint-native packed weights"
                 .into(),
         ));
     }
@@ -11520,7 +11597,13 @@ fn load_qwen_hybrid_pipeline(
         ModelKind::Qwen35
     };
     let mut info = base_info(topology, range.clone(), kind, source_args.hidden_size);
-    let mut stage = QwenHybridStage::new(target_args.clone(), range, &info, stream)?;
+    let mut stage = QwenHybridStage::new(
+        target_args.clone(),
+        range,
+        &info,
+        expert_cache_options.is_some(),
+        stream,
+    )?;
     stage.expert_assignment = expert_assignment;
     if let Some(assignment) = stage.expert_assignment.as_ref() {
         info.global_expert_count = Some(assignment.global_expert_count());
@@ -11713,19 +11796,28 @@ fn load_qwen_hybrid_pipeline(
                 stage.expert_assignment.as_ref(),
                 stream,
             )?;
-            loaded.load(
-                layer,
-                store.as_ref(),
-                &bindings,
-                quantize_on_load,
-                weights_stream,
-                stream,
-            )?;
+            if expert_cache_options.is_some() {
+                loaded.load_excluding(
+                    layer,
+                    store.as_ref(),
+                    &bindings,
+                    weights_stream,
+                    stream,
+                    &|name| name.starts_with("mlp.experts."),
+                )?;
+            } else {
+                loaded.load(
+                    layer,
+                    store.as_ref(),
+                    &bindings,
+                    quantize_on_load,
+                    weights_stream,
+                    stream,
+                )?;
+            }
         }
     }
     let static_bytes = loaded.finish(&mut info)?;
-    let checkpoint_diagnostics = store.diagnostics()?;
-    let materialized_shards = checkpoint_diagnostics.touched_shard_paths.clone();
     if let Some(options) = dense_stream {
         let streamed_layout = parallel_layout.clone();
         let streamed_assignment = stage.expert_assignment.clone();
@@ -11762,6 +11854,12 @@ fn load_qwen_hybrid_pipeline(
                 )
             },
         )?);
+        if expert_cache_options.is_some() {
+            stage.dense_layers = stage
+                .dense_layers
+                .take()
+                .map(|storage| storage.with_independent_experts("mlp.experts."));
+        }
         let layer_bytes = stage.dense_layers.as_ref().unwrap().planned_layer_bytes()?;
         info.planned_owned_parameter_bytes =
             static_bytes.checked_add(layer_bytes).ok_or_else(|| {
@@ -11770,6 +11868,39 @@ fn load_qwen_hybrid_pipeline(
     } else {
         info.planned_owned_parameter_bytes = static_bytes;
     }
+    if let Some(options) = expert_cache_options {
+        let entries =
+            crate::architectures::qwen::hybrid::layerwise::qwen_hybrid_expert_catalog_for_layers(
+                &source_args,
+                store.as_ref(),
+                stage.range.clone(),
+            )?
+            .into_iter()
+            .filter(|entry| {
+                stage.expert_assignment.as_ref().is_none_or(|assignment| {
+                    assignment.owner(entry.identity().global_expert) == Some(assignment.rank())
+                })
+            })
+            .collect::<Vec<_>>();
+        if !entries.is_empty() {
+            let cache = ExpertCache::new_shared(
+                Arc::clone(&store),
+                entries,
+                options,
+                weights_stream.clone(),
+                stream.clone(),
+            )?;
+            info.planned_owned_parameter_bytes = info
+                .planned_owned_parameter_bytes
+                .checked_add(cache.report()?.owned_bytes)
+                .ok_or_else(|| {
+                    Error::Parallel("Qwen hybrid pipeline expert byte total overflowed".into())
+                })?;
+            stage.expert_storage = PipelineExpertStorage::External(Box::new(cache));
+        }
+    }
+    let checkpoint_diagnostics = store.diagnostics()?;
+    let materialized_shards = checkpoint_diagnostics.touched_shard_paths.clone();
     info.opened_checkpoint_shards = materialized_shards;
     info.checkpoint_diagnostics = Some(checkpoint_diagnostics);
     PipelineModel::from_adapter(topology, info, PipelineStage(stage))
@@ -11924,14 +12055,158 @@ fn forward_qwen_hybrid_expert_layer(
     }
 }
 
+fn forward_qwen_hybrid_operator_layer<F>(
+    layer: &mut qwen_hybrid::TransformerBlock,
+    global_layer: usize,
+    cache: &mut PipelineLayerCache,
+    mut forward: F,
+) -> Result<Array, Error>
+where
+    F: for<'a> FnMut(
+        &mut qwen_hybrid::TransformerBlock,
+        Option<qwen_hybrid::OperatorCache<'a>>,
+    ) -> Result<Array, Exception>,
+{
+    match (layer.layer_policy, cache) {
+        (
+            qwen_hybrid::LayerPolicy::SelfAttention(crate::AttentionPolicy::Full),
+            PipelineLayerCache::KeyValue {
+                global_layer: cached,
+                cache,
+                slots,
+            },
+        ) if *cached == global_layer && slots.is_empty() => {
+            let cache: &mut dyn KeyValueCache = match cache {
+                PipelineKeyValueCache::Standard(cache) => cache,
+                PipelineKeyValueCache::Paged(cache) => cache,
+            };
+            Ok(forward(
+                layer,
+                Some(qwen_hybrid::OperatorCache::FullAttention(cache)),
+            )?)
+        }
+        (
+            qwen_hybrid::LayerPolicy::LinearAttention,
+            PipelineLayerCache::StateSlots {
+                global_layer: cached,
+                slots,
+            },
+        ) if *cached == global_layer
+            && slots.len() == 2
+            && slots[0].policy.role == (StateTensorRole::Convolution { slot: 0 })
+            && slots[1].policy.role == StateTensorRole::Recurrent =>
+        {
+            let (conv, recurrent) = slots.split_at_mut(1);
+            if conv[0].offset != recurrent[0].offset {
+                return Err(Error::Parallel(format!(
+                    "Qwen hybrid Cartesian state offsets disagree at global layer {global_layer}"
+                )));
+            }
+            let mut local = qwen_hybrid::LinearAttentionCache {
+                conv_state: conv[0].value.take(),
+                recurrent_state: recurrent[0].value.take(),
+                offset: conv[0].offset,
+            };
+            let output = forward(
+                layer,
+                Some(qwen_hybrid::OperatorCache::LinearAttention(&mut local)),
+            )?;
+            conv[0].value = local.conv_state;
+            conv[0].offset = local.offset;
+            recurrent[0].value = local.recurrent_state;
+            recurrent[0].offset = local.offset;
+            Ok(output)
+        }
+        _ => Err(Error::Parallel(format!(
+            "Qwen hybrid Cartesian cache does not match global layer {global_layer}"
+        ))),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn forward_qwen_hybrid_tensor_expert_layer(
+    layer: &mut qwen_hybrid::TransformerBlock,
+    global_layer: usize,
+    hidden: &Array,
+    mask: Option<&Array>,
+    cache: &mut PipelineLayerCache,
+    tensor_group: &Group,
+    assignment: &ExpertAssignment,
+    expert_group: &Group,
+    statistics: &mut RoutingStatistics,
+    stream: &Stream,
+) -> Result<Array, Error> {
+    forward_qwen_hybrid_operator_layer(layer, global_layer, cache, |layer, cache| {
+        layer.forward_tensor_expert_parallel_with_operator_cache(
+            hidden,
+            mask,
+            cache,
+            tensor_group,
+            assignment,
+            expert_group,
+            statistics,
+            stream,
+        )
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn forward_qwen_hybrid_external_expert_layer(
+    args: &qwen_hybrid::ModelArgs,
+    layer: &mut qwen_hybrid::TransformerBlock,
+    global_layer: usize,
+    hidden: &Array,
+    mask: Option<&Array>,
+    cache: &mut PipelineLayerCache,
+    tensor_group: Option<&Group>,
+    assignment: &ExpertAssignment,
+    expert_group: Option<&Group>,
+    pass: ExpertPass,
+    expert_cache: &ExpertCache,
+    statistics: &mut RoutingStatistics,
+    stream: &Stream,
+) -> Result<Array, Error> {
+    forward_qwen_hybrid_operator_layer(layer, global_layer, cache, |layer, cache| {
+        let execute = |hidden: &Array, ids: &Array, weights: &Array, stream: &Stream| {
+            execute_pipeline_cached_qwen_hybrid(
+                args,
+                global_layer,
+                hidden,
+                ids,
+                weights,
+                pass,
+                expert_cache,
+                assignment,
+                expert_group,
+                statistics,
+                stream,
+            )
+            .map_err(|error| Exception::custom(error.to_string()))
+        };
+        match tensor_group {
+            Some(group) => layer.forward_tensor_with_operator_cache_and_expert_executor(
+                hidden, mask, cache, group, stream, execute,
+            ),
+            None => layer.forward_with_operator_cache_and_expert_executor(
+                hidden, mask, cache, stream, execute,
+            ),
+        }
+    })
+}
+
 impl QwenHybridStage {
     fn new(
         args: qwen_hybrid::ModelArgs,
         range: Range<usize>,
         info: &PipelineStageInfo,
+        external_experts: bool,
         stream: &Stream,
     ) -> Result<Self, Error> {
-        let layer_adapter = QwenHybridLayerwiseAdapter::new_text(args.clone(), stream)?;
+        let layer_adapter = if external_experts {
+            QwenHybridLayerwiseAdapter::new_text_external_experts(args.clone(), stream)?
+        } else {
+            QwenHybridLayerwiseAdapter::new_text(args.clone(), stream)?
+        };
         let complete = qwen_hybrid::Model::new(args.clone(), None, None, None, stream)?;
         let qwen_hybrid::Model { model, lm_head, .. } = complete;
         let qwen_hybrid::Qwen35TextModel {
@@ -11968,6 +12243,11 @@ impl QwenHybridStage {
             parallel_layout: None,
             parallel_geometry: None,
             expert_assignment: None,
+            expert_storage: if external_experts {
+                PipelineExpertStorage::ExternalEmpty
+            } else {
+                PipelineExpertStorage::LayerLocal
+            },
             routing_statistics: RoutingStatistics::default(),
         })
     }
@@ -12119,6 +12399,7 @@ impl QwenHybridStage {
         explicit_mask: Option<&Array>,
         caches: &mut [PipelineLayerCache],
         execution: &ParallelExecutionContext<'_>,
+        expert_group: Option<&Group>,
     ) -> Result<PipelineStageOutput, Error> {
         let group = execution.group().ok_or_else(|| {
             Error::Parallel("tensor-sharded Qwen hybrid stage has no TP communicator".into())
@@ -12152,6 +12433,22 @@ impl QwenHybridStage {
             .then(|| create_causal_mask(step.sequence_length, Some(offset), None, None, stream))
             .transpose()?;
         let mask = explicit_mask.or(generated_mask.as_ref());
+        let expert_assignment = self.expert_assignment.clone();
+        if let Some(assignment) = expert_assignment.as_ref() {
+            validate_pipeline_expert_dispatch(
+                assignment,
+                expert_group,
+                self.expert_storage.is_external(),
+            )?;
+        }
+        self.routing_statistics = RoutingStatistics::default();
+        let pass = if step.sequence_length > 1 {
+            ExpertPass::Prefill
+        } else {
+            ExpertPass::Decode
+        };
+        let args = self.args.clone();
+        let expert_cache = self.expert_storage.cache();
         let layer_adapter = &self.layer_adapter;
         let parallel_layout = self.parallel_layout.clone();
         hidden = execute_pipeline_layer_range(
@@ -12168,7 +12465,7 @@ impl QwenHybridStage {
                 0,
                 global_layer,
                 parallel_layout.as_ref(),
-                None,
+                expert_assignment.as_ref(),
                 stream,
             )? {
                 QwenHybridLayer::Text(block) => Ok(*block),
@@ -12177,15 +12474,62 @@ impl QwenHybridStage {
                 )),
             },
             |global_layer, layer, hidden, cache, stream| {
-                let forwarded = forward_qwen_hybrid_tensor_layer(
-                    layer,
-                    global_layer,
-                    hidden,
-                    mask,
-                    cache,
-                    group,
-                    stream,
-                )?;
+                let forwarded = match (
+                    expert_assignment.as_ref(),
+                    self.expert_storage.is_external(),
+                    expert_cache,
+                ) {
+                    (Some(assignment), true, Some(expert_cache)) => {
+                        forward_qwen_hybrid_external_expert_layer(
+                            &args,
+                            layer,
+                            global_layer,
+                            hidden,
+                            mask,
+                            cache,
+                            Some(group),
+                            assignment,
+                            expert_group,
+                            pass,
+                            expert_cache,
+                            &mut self.routing_statistics,
+                            stream,
+                        )?
+                    }
+                    (Some(_), true, None) | (None, true, None) => forward_qwen_hybrid_tensor_layer(
+                        layer,
+                        global_layer,
+                        hidden,
+                        mask,
+                        cache,
+                        group,
+                        stream,
+                    )?,
+                    (Some(assignment), false, None) => forward_qwen_hybrid_tensor_expert_layer(
+                        layer,
+                        global_layer,
+                        hidden,
+                        mask,
+                        cache,
+                        group,
+                        assignment,
+                        expert_group.expect("validated resident Qwen hybrid EP group"),
+                        &mut self.routing_statistics,
+                        stream,
+                    )?,
+                    (None, false, _) => forward_qwen_hybrid_tensor_layer(
+                        layer,
+                        global_layer,
+                        hidden,
+                        mask,
+                        cache,
+                        group,
+                        stream,
+                    )?,
+                    (None, true, Some(_)) | (Some(_), false, Some(_)) => unreachable!(
+                        "Qwen hybrid expert storage and assignment are internally coherent"
+                    ),
+                };
                 eval([&forwarded])?;
                 stream.synchronize()?;
                 Ok(forwarded)
@@ -12221,12 +12565,13 @@ impl QwenHybridStage {
         step: PipelineStep,
         explicit_mask: Option<&Array>,
         caches: &mut [PipelineLayerCache],
-        group: &Group,
+        group: Option<&Group>,
         stream: &Stream,
     ) -> Result<PipelineStageOutput, Error> {
         let assignment = self.expert_assignment.as_ref().ok_or_else(|| {
             Error::Parallel("Qwen hybrid PP+EP stage has no rank-local expert assignment".into())
         })?;
+        validate_pipeline_expert_dispatch(assignment, group, self.expert_storage.is_external())?;
         if caches.len() != self.layers.len() {
             return Err(Error::Parallel(format!(
                 "Qwen hybrid PP+EP stage cache has {} entries, expected {}",
@@ -12254,6 +12599,13 @@ impl QwenHybridStage {
         self.routing_statistics = RoutingStatistics::default();
         let layer_adapter = &self.layer_adapter;
         let expert_assignment = assignment.clone();
+        let expert_cache = self.expert_storage.cache();
+        let pass = if step.sequence_length > 1 {
+            ExpertPass::Prefill
+        } else {
+            ExpertPass::Decode
+        };
+        let args = self.args.clone();
         hidden = execute_pipeline_layer_range(
             PipelineLayerExecution {
                 range: self.range.clone(),
@@ -12277,17 +12629,40 @@ impl QwenHybridStage {
                 )),
             },
             |global_layer, layer, hidden, cache, stream| {
-                let forwarded = forward_qwen_hybrid_expert_layer(
-                    layer,
-                    global_layer,
-                    hidden,
-                    mask,
-                    cache,
-                    &expert_assignment,
-                    group,
-                    &mut self.routing_statistics,
-                    stream,
-                )?;
+                let forwarded = match (self.expert_storage.is_external(), expert_cache) {
+                    (true, Some(expert_cache)) => forward_qwen_hybrid_external_expert_layer(
+                        &args,
+                        layer,
+                        global_layer,
+                        hidden,
+                        mask,
+                        cache,
+                        None,
+                        &expert_assignment,
+                        group,
+                        pass,
+                        expert_cache,
+                        &mut self.routing_statistics,
+                        stream,
+                    )?,
+                    (true, None) => {
+                        Self::forward_layer(layer, global_layer, hidden, mask, cache, stream)?
+                    }
+                    (false, None) => forward_qwen_hybrid_expert_layer(
+                        layer,
+                        global_layer,
+                        hidden,
+                        mask,
+                        cache,
+                        &expert_assignment,
+                        group.expect("validated resident Qwen hybrid EP group"),
+                        &mut self.routing_statistics,
+                        stream,
+                    )?,
+                    (false, Some(_)) => {
+                        unreachable!("resident Qwen hybrid stage cannot own expert cache")
+                    }
+                };
                 eval([&forwarded])?;
                 stream.synchronize()?;
                 Ok(forwarded)
@@ -15904,6 +16279,24 @@ mod tests {
         })
     }
 
+    fn qwen_hybrid_moe_config(model_type: &str) -> serde_json::Value {
+        let mut config = qwen_hybrid_config();
+        config["model_type"] = serde_json::json!(model_type);
+        config["architectures"] = serde_json::json!([if model_type == "qwen3_next" {
+            "Qwen3NextForCausalLM"
+        } else {
+            "Qwen3_5MoeForCausalLM"
+        }]);
+        config["num_key_value_heads"] = serde_json::json!(2);
+        config["intermediate_size"] = serde_json::json!(0);
+        config["moe_intermediate_size"] = serde_json::json!(8);
+        config["shared_expert_intermediate_size"] = serde_json::json!(8);
+        config["num_experts"] = serde_json::json!(3);
+        config["num_experts_per_tok"] = serde_json::json!(1);
+        config["norm_topk_prob"] = serde_json::json!(true);
+        config
+    }
+
     fn gpt_oss_config() -> serde_json::Value {
         serde_json::json!({
             "model_type": "gpt_oss",
@@ -17218,6 +17611,74 @@ mod tests {
                         assert_eq!(report.owned_experts, expected_experts.len());
                     }
                     assert!(loaded.dense_stream_report().unwrap().is_some());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn qwen_hybrid_moe_triple_axis_preflight_composes_state_and_expert_residency() {
+        let gpu = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
+        let cpu = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        let stream = gpu.stream();
+
+        for model_type in ["qwen3_next", "qwen3_5_moe_text"] {
+            let config = qwen_hybrid_moe_config(model_type);
+            let args = qwen_hybrid::model_args_from_config_value(&config).unwrap();
+            let mut source = qwen_hybrid::Model::new(args, None, None, None, stream).unwrap();
+            initialize_parameters(&mut source, stream);
+            let fixture = tempfile::tempdir().unwrap();
+            write_parameter_fixture(fixture.path(), &config, &source);
+
+            for rank in 0..12 {
+                let topology = ParallelTopology::from_rank(
+                    12,
+                    rank,
+                    2,
+                    2,
+                    3,
+                    DeviceAssignment::new(DeviceType::Gpu, 0),
+                )
+                .unwrap();
+                for residency in [
+                    WeightResidency::fully_resident(),
+                    WeightResidency::with_expert_cache(
+                        crate::NonExpertWeightResidency::DenseDiskStream(dense_stream_options()),
+                        crate::runtime::residency::expert_cache::ExpertCacheLoadOptions::default(),
+                    ),
+                ] {
+                    let loaded = load_pipeline_model_with_options(
+                        fixture.path(),
+                        ModelLoadOptions::with_parallel(topology).with_weight_residency(residency),
+                        stream,
+                        cpu.stream(),
+                    )
+                    .unwrap();
+                    let info = loaded.stage_info();
+                    assert_eq!(info.topology, topology);
+                    assert_eq!(
+                        info.global_layer_range,
+                        topology.pipeline_parallel_rank..topology.pipeline_parallel_rank + 1
+                    );
+                    assert_eq!(info.local_expert_ids, vec![topology.expert_parallel_rank]);
+                    let layout = loaded.prompt_cache_layer_layout().unwrap();
+                    assert_eq!(layout.len(), 1);
+                    if topology.pipeline_parallel_rank == 0 {
+                        assert!(matches!(
+                            layout.get(0),
+                            Some(crate::LayerCachePolicy::FixedState { tensors }) if tensors.len() == 2
+                        ));
+                    } else {
+                        assert!(matches!(
+                            layout.get(0),
+                            Some(crate::LayerCachePolicy::KeyValue { .. })
+                        ));
+                    }
+                    if residency.expert_cache().is_some() {
+                        let report = loaded.expert_cache_report().unwrap().unwrap();
+                        assert_eq!(report.owned_experts, 1);
+                        assert!(loaded.dense_stream_report().unwrap().is_some());
+                    }
                 }
             }
         }

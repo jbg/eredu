@@ -1413,6 +1413,15 @@ impl QwenHybridLayerwiseAdapter {
         Self::new(args, family, None, None, None, stream)
     }
 
+    pub(crate) fn new_text_external_experts(
+        args: ModelArgs,
+        stream: &Stream,
+    ) -> Result<Self, Error> {
+        let mut adapter = Self::new_text(args, stream)?;
+        adapter.sparse_expert_cache = true;
+        Ok(adapter)
+    }
+
     fn new(
         args: ModelArgs,
         family: QwenHybridFamily,
@@ -2099,9 +2108,17 @@ pub(crate) fn qwen_hybrid_expert_catalog(
     args: &ModelArgs,
     store: &dyn WeightStore,
 ) -> Result<Vec<ExpertCatalogEntry>, Error> {
+    qwen_hybrid_expert_catalog_for_layers(args, store, 0..args.num_hidden_layers as usize)
+}
+
+pub(crate) fn qwen_hybrid_expert_catalog_for_layers(
+    args: &ModelArgs,
+    store: &dyn WeightStore,
+    layers: impl IntoIterator<Item = usize>,
+) -> Result<Vec<ExpertCatalogEntry>, Error> {
     let normalized = normalized_checkpoint_keys(store);
     let mut entries = Vec::new();
-    for layer in 0..args.num_hidden_layers as usize {
+    for layer in layers {
         let prefix = format!("model.layers.{layer}.mlp.experts");
         let packed = normalized.contains_key(&format!("{prefix}.gate_up_proj"));
         let split_banks = normalized.contains_key(&format!("{prefix}.gate_proj"))
@@ -2900,8 +2917,43 @@ impl ArchitectureAdapter for QwenHybridLayerwiseAdapter {
             ));
         };
         let mut local_args = self.args.clone();
-        local_args.num_experts = i32::try_from(assignment.local_expert_count())
-            .map_err(|_| Error::Parallel("local Qwen hybrid expert count exceeds i32".into()))?;
+        local_args.num_experts = if self.sparse_expert_cache {
+            0
+        } else {
+            i32::try_from(assignment.local_expert_count())
+                .map_err(|_| Error::Parallel("local Qwen hybrid expert count exceeds i32".into()))?
+        };
+        moe.experts = Experts::new(&local_args, index, stream)?;
+        Ok(layer)
+    }
+
+    fn new_tensor_expert_parallel_layer(
+        &self,
+        group: usize,
+        index: usize,
+        layout: &crate::runtime::distributed::parallel::LocalModelLayout,
+        assignment: &crate::runtime::distributed::expert::ExpertAssignment,
+        stream: &Stream,
+    ) -> Result<Self::Layer, Error> {
+        let mut layer = self.new_parallel_layer(group, index, layout, stream)?;
+        let QwenHybridLayer::Text(block) = &mut layer else {
+            return Err(Error::Parallel(
+                "Qwen hybrid expert ownership applies only to text decoder layers".into(),
+            ));
+        };
+        let resident::FeedForward::Moe(moe) = &mut block.mlp else {
+            return Err(Error::Parallel(
+                "Qwen hybrid TP+PP+EP requires routed MoE decoder layers".into(),
+            ));
+        };
+        let mut local_args = self.args.clone();
+        local_args.moe_intermediate_size = moe.experts.intermediate_dim;
+        local_args.num_experts = if self.sparse_expert_cache {
+            0
+        } else {
+            i32::try_from(assignment.local_expert_count())
+                .map_err(|_| Error::Parallel("local Qwen hybrid expert count exceeds i32".into()))?
+        };
         moe.experts = Experts::new(&local_args, index, stream)?;
         Ok(layer)
     }
@@ -2910,7 +2962,7 @@ impl ArchitectureAdapter for QwenHybridLayerwiseAdapter {
         &self,
         topology: crate::runtime::distributed::topology::ParallelTopology,
     ) -> Result<Option<crate::runtime::distributed::expert::ExpertAssignment>, Error> {
-        if topology.expert_parallel_size == 1 {
+        if topology.expert_parallel_size == 1 && !self.sparse_expert_cache {
             return Ok(None);
         }
         if !self.args.is_moe() {
