@@ -210,7 +210,7 @@ fn expert_parallel_model_ring_worker() {
         ) {
             WeightResidency::with_expert_cache(
                 NonExpertWeightResidency::DenseDiskStream(
-                    DenseDiskStreamLoadOptions::new(u64::MAX, u64::MAX, 1, 1, 1).unwrap(),
+                    DenseDiskStreamLoadOptions::new(u64::MAX, u64::MAX, 1, 1).unwrap(),
                 ),
                 experts,
             )

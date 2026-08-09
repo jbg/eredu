@@ -28,10 +28,13 @@ and is kept separate from MLX-C and Rust wrapper changes so it can be proposed
 upstream. The patch is applied idempotently to pinned MLX 0.32.0 by the vendored
 MLX-C CMake build.
 
-This change does not adopt events in `safemlx-lm`. Cache and weight residency,
-residency leases, layer prefetch, expert caches, and buffer handoff remain
-synchronous. SafeMLX does not yet claim transfer/compute overlap, expert
-prefetch overlap, or double buffering.
+`safemlx-lm` immutable weight residency and expert acquisition use the event
+API through caller-owned `ResidentTransfer` guards. Dense layerwise and
+pipeline execution additionally use a dedicated same-device transfer stream
+and a fixed current-plus-next completion-lease window. This permits the next
+weight transfer to overlap current layer computation. Paged attention-cache
+residency, MTP handoff, predictive expert prefetch, and broader activation
+double buffering have not yet adopted events.
 
 CUDA compilation is expected in Linux and Windows CUDA CI. Runtime tests remain
 opt-in and require a CUDA-capable runner. The explicit Metal two-stream test is

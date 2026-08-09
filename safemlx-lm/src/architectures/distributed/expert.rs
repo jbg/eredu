@@ -6239,7 +6239,7 @@ pub(crate) fn assert_rank_owned_sparse_ep_load(
         expected_owned_experts
     );
 
-    let dense = DenseDiskStreamLoadOptions::new(u64::MAX, u64::MAX, 1, 1, 1).unwrap();
+    let dense = DenseDiskStreamLoadOptions::new(u64::MAX, u64::MAX, 1, 1).unwrap();
     let streamed = load_expert_parallel_model_with_options(
         model_dir,
         ModelLoadOptions {
@@ -6806,7 +6806,6 @@ mod tests {
             u64::MAX,
             1,
             1,
-            1,
         )
         .unwrap();
         let residency = dense_expert_residency(ExpertCacheLoadOptions::default(), dense);
@@ -6847,7 +6846,6 @@ mod tests {
             let dense = crate::runtime::residency::dense_stream::DenseDiskStreamLoadOptions::new(
                 u64::MAX,
                 u64::MAX,
-                1,
                 1,
                 1,
             )
@@ -7060,7 +7058,6 @@ mod tests {
             u64::MAX,
             1,
             1,
-            1,
         )
         .unwrap();
         let residency = dense_expert_residency(ExpertCacheLoadOptions::default(), dense);
@@ -7125,7 +7122,6 @@ mod tests {
         let dense = crate::runtime::residency::dense_stream::DenseDiskStreamLoadOptions::new(
             u64::MAX,
             u64::MAX,
-            1,
             1,
             1,
         )
@@ -7203,7 +7199,6 @@ mod tests {
         let dense = crate::runtime::residency::dense_stream::DenseDiskStreamLoadOptions::new(
             u64::MAX,
             u64::MAX,
-            1,
             1,
             1,
         )

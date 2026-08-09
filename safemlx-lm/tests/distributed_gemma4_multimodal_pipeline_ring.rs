@@ -679,7 +679,7 @@ fn gemma4_multimodal_pipeline_ring_worker() {
     let stream = Stream::new_with_device(&topology.device.device().unwrap());
     let residency = if std::env::var_os(DENSE_STREAM).is_some() {
         WeightResidency::dense_disk_stream(
-            DenseDiskStreamLoadOptions::new(u64::MAX, u64::MAX, 1, 1, 1).unwrap(),
+            DenseDiskStreamLoadOptions::new(u64::MAX, u64::MAX, 1, 1).unwrap(),
         )
     } else if std::env::var_os(LAYERWISE_HOST).is_some() {
         WeightResidency::layerwise_host(LayerwiseLoadOptions::new(

@@ -370,10 +370,6 @@ struct Cli {
     #[arg(long, default_value_t = 2, value_name = "LAYERS")]
     dense_host_lookahead: usize,
 
-    /// Dense-stream device lookahead.
-    #[arg(long, default_value_t = 1, value_name = "LAYERS")]
-    dense_device_lookahead: usize,
-
     /// Maximum queued dense-stream background host materializations.
     #[arg(long, default_value_t = 2, value_name = "REQUESTS")]
     dense_background_queue: usize,
@@ -716,7 +712,6 @@ fn main() -> Result<()> {
                 .unwrap_or(defaults.device_budget_bytes),
             args.host_budget_bytes.unwrap_or(defaults.host_budget_bytes),
             args.dense_host_lookahead,
-            args.dense_device_lookahead,
             args.dense_background_queue,
         )?;
         options.max_mapped_shards = args.mapped_shards;

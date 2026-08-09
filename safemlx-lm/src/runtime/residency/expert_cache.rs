@@ -28,8 +28,8 @@ use crate::{
         store::{TensorSelection, WeightStore},
     },
     runtime::residency::manager::{
-        OffloadUnit, ResidencyError, ResidencyManager, ResidencyReport, ResidentUnitLease,
-        WeightBinding,
+        OffloadUnit, ResidencyError, ResidencyManager, ResidencyReport, ResidentTransfer,
+        ResidentUnitLease, WeightBinding,
     },
     runtime::residency::policy::{
         MemoryTier, OffloadConfig, OffloadPlan, OffloadUnitId, OffloadUnitSpec, ResidencyPolicy,
@@ -782,7 +782,7 @@ impl ExpertCache {
             let hidden = routed_hidden.try_index_device(start..end, stream)?;
             let routes = routed_ids.try_index_device(start..end, stream)?;
             let weights = route_weights.try_index_device(start..end, stream)?;
-            let acquired = self.acquire_routes(layer, &routes, pass, stream)?;
+            let mut acquired = self.acquire_routes(layer, &routes, pass, stream)?;
             let output = execute_bank(&hidden, &acquired, &weights, stream)?;
             if output.ndim() == 0 || output.dim(0) != end - start {
                 return Err(ExpertCacheError::CompactBankOutputShapeMismatch {
@@ -791,12 +791,12 @@ impl ExpertCache {
                 });
             }
             eval([&output])?;
-            acquired.complete_pending()?;
+            acquired.transfer.synchronize()?;
             outputs.push(output);
             start = end;
         }
         if outputs.is_empty() {
-            let acquired = self.acquire_routes(layer, routed_ids, pass, stream)?;
+            let mut acquired = self.acquire_routes(layer, routed_ids, pass, stream)?;
             let output = execute_bank(routed_hidden, &acquired, route_weights, stream)?;
             if output.ndim() == 0 || output.dim(0) != row_count {
                 return Err(ExpertCacheError::CompactBankOutputShapeMismatch {
@@ -805,7 +805,7 @@ impl ExpertCache {
                 });
             }
             eval([&output])?;
-            acquired.complete_pending()?;
+            acquired.transfer.synchronize()?;
             return Ok(output);
         }
         Ok(concatenate_axis(&outputs, 0, stream)?)
@@ -896,6 +896,7 @@ impl ExpertCache {
             compact_routes,
             routed_ids.size() as u64,
             pass,
+            stream,
         )
     }
 
@@ -960,6 +961,7 @@ impl ExpertCache {
             compact_routes,
             routed_ids.len() as u64,
             pass,
+            stream,
         )
     }
 
@@ -970,6 +972,7 @@ impl ExpertCache {
         compact_routes: Array,
         route_count: u64,
         pass: ExpertPass,
+        stream: &Stream,
     ) -> Result<AcquiredExperts, ExpertCacheError> {
         let scratch_bytes = demand.keys().try_fold(0u64, |total, identity| {
             total
@@ -1024,9 +1027,10 @@ impl ExpertCache {
                 Err(error) => return Err(error.into()),
             }
         }
-        let leases = self
+        let transfer = self
             .manager
-            .acquire_many_deferred_with_demand(&requests, MemoryTier::Device)?;
+            .acquire_many_with_transfer(&requests, MemoryTier::Device)?;
+        transfer.wait_on(stream)?;
         let wait = started.elapsed();
         let after = self.resident_snapshot()?;
         let (host_evictions, host_eviction_bytes) = before.evicted(&after, MemoryTier::Host);
@@ -1068,7 +1072,7 @@ impl ExpertCache {
             compact_routes,
             scratch_bytes,
             pass,
-            leases,
+            transfer,
         })
     }
 
@@ -1189,7 +1193,7 @@ pub struct AcquiredExperts {
     compact_routes: Array,
     scratch_bytes: u64,
     pass: ExpertPass,
-    leases: Vec<ResidentUnitLease>,
+    transfer: ResidentTransfer,
 }
 
 impl AcquiredExperts {
@@ -1220,21 +1224,14 @@ impl AcquiredExperts {
 
     /// Returns source leases in the same order as [`Self::identities`].
     pub fn leases(&self) -> &[ResidentUnitLease] {
-        &self.leases
-    }
-
-    /// Releases pending transfer sources after compact expert output evaluation.
-    pub fn complete_pending(&self) -> Result<(), ExpertCacheError> {
-        for lease in &self.leases {
-            lease.complete_pending()?;
-        }
-        Ok(())
+        self.transfer.leases()
     }
 
     /// Concatenates one required per-expert binding along its leading axis.
     pub fn compact_binding(&self, name: &str, stream: &Stream) -> Result<Array, ExpertCacheError> {
         let values = self
-            .leases
+            .transfer
+            .leases()
             .iter()
             .map(|lease| lease.array(name).cloned())
             .collect::<Result<Vec<_>, _>>()?;
@@ -1253,7 +1250,8 @@ impl AcquiredExperts {
         stream: &Stream,
     ) -> Result<Option<Array>, ExpertCacheError> {
         let present = self
-            .leases
+            .transfer
+            .leases()
             .iter()
             .map(|lease| lease.binding_names().any(|binding| binding == name))
             .collect::<Vec<_>>();
@@ -1717,7 +1715,6 @@ mod tests {
             .unwrap();
         let compact = acquired.compact_binding("weight", &stream()).unwrap();
         eval([&compact]).unwrap();
-        acquired.complete_pending().unwrap();
 
         assert_eq!(
             store.diagnostics().unwrap().physical_reads,

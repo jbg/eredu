@@ -4395,7 +4395,7 @@ fn dense_gguf_uses_shared_packed_overlay_for_nonresident_execution() {
     let policies = [
         crate::WeightResidency::layerwise_host(crate::LayerwiseLoadOptions::default()),
         crate::WeightResidency::dense_disk_stream(
-            crate::DenseDiskStreamLoadOptions::new(1 << 20, 1 << 20, 1, 1, 1).unwrap(),
+            crate::DenseDiskStreamLoadOptions::new(1 << 20, 1 << 20, 1, 1).unwrap(),
         ),
     ];
 

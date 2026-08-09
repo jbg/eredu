@@ -4863,7 +4863,7 @@ mod tests {
             ParallelTopology::from_rank(1, 0, 1, 1, 1, DeviceAssignment::new(DeviceType::Gpu, 0))
                 .unwrap();
         let build = ParallelBuildContext::new(topology, ShardingPolicy::Require);
-        let options = DenseDiskStreamLoadOptions::new(u64::MAX, u64::MAX, 1, 1, 1).unwrap();
+        let options = DenseDiskStreamLoadOptions::new(u64::MAX, u64::MAX, 1, 1).unwrap();
         let model = load_inkling_tensor_parallel_layerwise_model(
             dir.path(),
             LayerWeightResidency::DenseDiskStream(options),

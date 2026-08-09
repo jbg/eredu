@@ -2391,7 +2391,7 @@ mod tests {
         let mut resident = resident::load_model(dir.path(), gpu.stream(), cpu.stream()).unwrap();
         let options = if dense_stream {
             LayerWeightResidency::DenseDiskStream(
-                DenseDiskStreamLoadOptions::new(u64::MAX, u64::MAX, depth, depth, depth).unwrap(),
+                DenseDiskStreamLoadOptions::new(u64::MAX, u64::MAX, depth, depth).unwrap(),
             )
         } else {
             LayerWeightResidency::LayerwiseHost(LayerwiseLoadOptions::new(

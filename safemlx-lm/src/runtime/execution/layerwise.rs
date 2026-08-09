@@ -6,7 +6,7 @@
 //! [`crate::runtime::execution::layerwise::ArchitectureAdapter`].
 
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     ops::Range,
     path::Path,
     sync::{Arc, Mutex},
@@ -33,10 +33,11 @@ use crate::{
     runtime::execution::inspection::{ActivationObserver, ActivationObserverProxy},
     runtime::residency::dense_stream::{
         BackgroundLayerPrefetch, BackgroundPrefetchReport, DenseDiskStreamLoadOptions,
+        DENSE_TRANSFER_WINDOW,
     },
     runtime::residency::manager::{
         OffloadUnit, ResidencyError, ResidencyManager, ResidencyReport, ResidentLayerGroup,
-        ResidentUnitLease,
+        ResidentTransfer, ResidentUnitLease,
     },
     runtime::residency::policy::{
         MemoryTier, OffloadConfig, OffloadPlan, OffloadReport, OffloadUnitId, OffloadUnitSpec,
@@ -387,7 +388,7 @@ impl LayerWeightResidency {
         match self {
             Self::FullyResident => layer_count,
             Self::LayerwiseHost(options) => options.offload.prefetch_depth(),
-            Self::DenseDiskStream(options) => options.device_lookahead,
+            Self::DenseDiskStream(_) => layer_count.min(DENSE_TRANSFER_WINDOW),
         }
     }
 
@@ -400,7 +401,7 @@ impl LayerWeightResidency {
                 Ok(OffloadConfig::new(
                     Some(options.device_budget_bytes),
                     Some(options.host_budget_bytes),
-                    options.host_lookahead.max(options.device_lookahead),
+                    options.host_lookahead.max(DENSE_TRANSFER_WINDOW),
                 )?
                 .with_eviction_policy(options.eviction_policy))
             }
@@ -437,6 +438,7 @@ pub struct DenseDiskStreamReport {
     planned_layer_count: usize,
     planned_layer_bytes: u64,
     pinned_static_device_bytes: u64,
+    transfer_stream_index: i32,
     residency: ResidencyReport,
     background: BackgroundPrefetchReport,
     host_layers: DenseTierResidencyReport,
@@ -689,6 +691,10 @@ impl DenseDiskStreamReport {
     pub const fn pinned_static_device_bytes(&self) -> u64 {
         self.pinned_static_device_bytes
     }
+    /// Returns the distinct MLX stream used for device weight transfers.
+    pub const fn transfer_stream_index(&self) -> i32 {
+        self.transfer_stream_index
+    }
     /// Returns the complete logical tier and checkpoint-store report.
     pub const fn residency(&self) -> &ResidencyReport {
         &self.residency
@@ -825,6 +831,7 @@ pub(crate) struct DenseStreamController {
     planned_layer_count: usize,
     planned_layer_bytes: u64,
     pinned_static_device_bytes: u64,
+    transfer_stream_index: i32,
     groups: Vec<DenseExecutionGroupPlan>,
     group_activity: Mutex<BTreeMap<String, DenseExecutionGroupState>>,
     pass: Mutex<DensePassState>,
@@ -858,6 +865,7 @@ impl DenseStreamController {
             planned_layer_count,
             planned_layer_bytes,
             pinned_static_device_bytes,
+            transfer_stream_index: manager.device_stream_index()?,
             groups,
             group_activity: Mutex::new(group_activity),
             pass: Mutex::new(DensePassState {
@@ -868,49 +876,37 @@ impl DenseStreamController {
         })
     }
 
-    pub(crate) fn prepare(
-        &self,
-        manager: &ResidencyManager,
-        group: &str,
-        units: &[OffloadUnitId],
-        current: usize,
+    pub(crate) fn transfer_window<'a>(
+        &'a self,
+        manager: &'a ResidencyManager,
+        group: impl Into<String>,
+        units: &'a [OffloadUnitId],
+        indices: impl IntoIterator<Item = usize>,
         prefill: bool,
-    ) -> Result<(Option<ResidentUnitLease>, ResidentUnitLease), Error> {
-        let host_end = current
-            .saturating_add(self.options.host_lookahead)
-            .min(units.len());
-        let device_end = current
-            .saturating_add(self.options.device_lookahead)
-            .min(units.len());
-        let host_window = &units[current..host_end];
-        let device_window = &units[current..device_end];
-        manager.protect_group_window(
-            &format!("dense:{group}:host"),
-            host_window,
-            MemoryTier::Host,
-        )?;
-        manager.protect_group_window(
-            &format!("dense:{group}:device"),
-            device_window,
-            MemoryTier::Device,
-        )?;
-
-        let mut host_leases = Vec::new();
-        if let Some(background) = &self.background {
-            for id in host_window {
-                background.submit(id)?;
+    ) -> Result<DenseTransferWindow<'a>, Error> {
+        let indices = indices.into_iter().collect::<VecDeque<_>>();
+        let mut prior = None;
+        for &index in &indices {
+            if index >= units.len() || prior.is_some_and(|prior| prior >= index) {
+                return Err(LayerwiseModelError::InvalidDenseTransferWindow {
+                    index,
+                    unit_count: units.len(),
+                }
+                .into());
             }
-            for id in device_window.iter().filter(|id| host_window.contains(id)) {
-                host_leases.push(background.acquire(id)?);
-            }
+            prior = Some(index);
         }
-        for id in device_window {
-            manager.prefetch(id, MemoryTier::Device)?;
-        }
-        let current_host = host_leases.into_iter().next();
-        let current_device = manager.acquire(&units[current], MemoryTier::Device)?;
-        self.observe_group(manager, group, prefill)?;
-        Ok((current_host, current_device))
+        let mut window = DenseTransferWindow {
+            controller: self,
+            manager,
+            group: group.into(),
+            units,
+            pending: indices,
+            ready: VecDeque::new(),
+            prefill,
+        };
+        window.refill()?;
+        Ok(window)
     }
 
     fn observe_group(
@@ -1216,6 +1212,7 @@ impl DenseStreamController {
             planned_layer_count: self.planned_layer_count,
             planned_layer_bytes: self.planned_layer_bytes,
             pinned_static_device_bytes: self.pinned_static_device_bytes,
+            transfer_stream_index: self.transfer_stream_index,
             host_layers: tier_report(MemoryTier::Host),
             device_layers: tier_report(MemoryTier::Device),
             groups,
@@ -1229,6 +1226,127 @@ impl DenseStreamController {
                 .transpose()?
                 .unwrap_or_default(),
         })
+    }
+}
+
+/// Caller-thread transfer window retaining the current and next dense unit.
+///
+/// Entries own [`ResidentTransfer`] guards and therefore remain on the host
+/// thread supported by MLX events. A window submits at most two device copies.
+/// Callers consume one entry, evaluate and synchronize its compute work, drop
+/// that entry, and then call [`Self::refill`] to submit the following layer.
+pub(crate) struct DenseTransferWindow<'a> {
+    controller: &'a DenseStreamController,
+    manager: &'a ResidencyManager,
+    group: String,
+    units: &'a [OffloadUnitId],
+    pending: VecDeque<usize>,
+    ready: VecDeque<DensePreparedTransfer>,
+    prefill: bool,
+}
+
+impl DenseTransferWindow<'_> {
+    /// Takes the next transfer after ordering `consumer` behind its event.
+    pub(crate) fn next(&mut self, consumer: &Stream) -> Result<DensePreparedTransfer, Error> {
+        let transfer = self.ready.pop_front().ok_or({
+            LayerwiseModelError::InvalidDenseTransferWindow {
+                index: self.units.len(),
+                unit_count: self.units.len(),
+            }
+        })?;
+        transfer.transfer.wait_on(consumer)?;
+        Ok(transfer)
+    }
+
+    /// Reprotects the current/next units and submits one replacement transfer.
+    ///
+    /// The completed [`DensePreparedTransfer`] must be dropped before this is
+    /// called so the fixed two-layer device budget can admit the replacement.
+    pub(crate) fn refill(&mut self) -> Result<(), Error> {
+        let device_indices = self
+            .ready
+            .iter()
+            .map(DensePreparedTransfer::index)
+            .chain(self.pending.iter().copied())
+            .take(DENSE_TRANSFER_WINDOW)
+            .collect::<Vec<_>>();
+        let host_indices = if self.controller.background.is_some() {
+            self.ready
+                .iter()
+                .map(DensePreparedTransfer::index)
+                .chain(self.pending.iter().copied())
+                .take(self.controller.options.host_lookahead)
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        let device_units = device_indices
+            .iter()
+            .map(|&index| self.units[index].clone())
+            .collect::<Vec<_>>();
+        let host_units = host_indices
+            .iter()
+            .map(|&index| self.units[index].clone())
+            .collect::<Vec<_>>();
+        self.manager.protect_group_window(
+            &format!("dense:{}:host", self.group),
+            &host_units,
+            MemoryTier::Host,
+        )?;
+        self.manager.protect_group_window(
+            &format!("dense:{}:device", self.group),
+            &device_units,
+            MemoryTier::Device,
+        )?;
+        if let Some(background) = &self.controller.background {
+            for id in &host_units {
+                background.submit(id)?;
+            }
+        }
+        while self.ready.len() < DENSE_TRANSFER_WINDOW {
+            let Some(index) = self.pending.pop_front() else {
+                break;
+            };
+            let id = &self.units[index];
+            let _host = if host_indices.contains(&index) {
+                self.controller
+                    .background
+                    .as_ref()
+                    .map(|background| background.acquire(id))
+                    .transpose()?
+            } else {
+                None
+            };
+            let transfer = self
+                .manager
+                .acquire_many_with_transfer(&[(id.clone(), 1)], MemoryTier::Device)?;
+            self.ready
+                .push_back(DensePreparedTransfer { index, transfer });
+        }
+        self.controller
+            .observe_group(self.manager, &self.group, self.prefill)?;
+        Ok(())
+    }
+}
+
+/// One populated-unit dependency taken from a [`DenseTransferWindow`].
+pub(crate) struct DensePreparedTransfer {
+    index: usize,
+    transfer: ResidentTransfer,
+}
+
+impl DensePreparedTransfer {
+    /// Returns the index in the group's authoritative unit list.
+    pub(crate) const fn index(&self) -> usize {
+        self.index
+    }
+
+    /// Returns the single resident lease protected by this transfer.
+    pub(crate) fn lease(&self) -> &ResidentUnitLease {
+        self.transfer
+            .leases()
+            .first()
+            .expect("dense transfer always acquires one unit")
     }
 }
 
@@ -2267,8 +2385,11 @@ enum PreparedExecutionLayer<'a, L> {
     Resident(&'a mut L),
     Leased {
         layer: L,
-        _host: Option<ResidentUnitLease>,
         _device: ResidentUnitLease,
+    },
+    Transferred {
+        layer: L,
+        _transfer: DensePreparedTransfer,
     },
 }
 
@@ -2276,7 +2397,7 @@ impl<L> PreparedExecutionLayer<'_, L> {
     fn layer_mut(&mut self) -> &mut L {
         match self {
             Self::Resident(layer) => layer,
-            Self::Leased { layer, .. } => layer,
+            Self::Leased { layer, .. } | Self::Transferred { layer, .. } => layer,
         }
     }
 }
@@ -2836,24 +2957,46 @@ impl<A: ArchitectureAdapter> LayerwiseModel<A> {
                     .map(|streamer| streamer.group_guard(&self.residency, resident_group.id()))
             });
             if execute_group {
+                let mut dense_window = self
+                    .dense_stream
+                    .as_ref()
+                    .map(|streamer| {
+                        streamer.transfer_window(
+                            &self.residency,
+                            resident_group.id(),
+                            resident_group.units(),
+                            0..resident_group.units().len(),
+                            prefill,
+                        )
+                    })
+                    .transpose()?;
                 for index in 0..resident_group.units().len() {
                     let id = &resident_group.units()[index];
                     {
                         let mut prepared = if let Some(layers) = &mut self.resident_layers {
                             PreparedExecutionLayer::Resident(&mut layers[group_index][index])
+                        } else if let Some(window) = &mut dense_window {
+                            let transfer = window.next(stream)?;
+                            debug_assert_eq!(transfer.index(), index);
+                            let mut layer = self.adapter.new_parallel_layer(
+                                group_index,
+                                index,
+                                layout,
+                                stream,
+                            )?;
+                            self.adapter.populate_layer(
+                                group_index,
+                                index,
+                                &mut layer,
+                                transfer.lease(),
+                            )?;
+                            PreparedExecutionLayer::Transferred {
+                                layer,
+                                _transfer: transfer,
+                            }
                         } else {
-                            let (host, lease) = if let Some(streamer) = &self.dense_stream {
-                                streamer.prepare(
-                                    &self.residency,
-                                    resident_group.id(),
-                                    resident_group.units(),
-                                    index,
-                                    prefill,
-                                )?
-                            } else {
-                                resident_group.prepare(&self.residency, index)?;
-                                (None, self.residency.acquire(id, MemoryTier::Device)?)
-                            };
+                            resident_group.prepare(&self.residency, index)?;
+                            let lease = self.residency.acquire(id, MemoryTier::Device)?;
                             let mut layer = self.adapter.new_parallel_layer(
                                 group_index,
                                 index,
@@ -2864,7 +3007,6 @@ impl<A: ArchitectureAdapter> LayerwiseModel<A> {
                                 .populate_layer(group_index, index, &mut layer, &lease)?;
                             PreparedExecutionLayer::Leased {
                                 layer,
-                                _host: host,
                                 _device: lease,
                             }
                         };
@@ -2891,7 +3033,9 @@ impl<A: ArchitectureAdapter> LayerwiseModel<A> {
                         stream.synchronize()?;
                         hook_result?;
                     }
-                    if self.dense_stream.is_none() && self.resident_layers.is_none() {
+                    if let Some(window) = &mut dense_window {
+                        window.refill()?;
+                    } else if self.resident_layers.is_none() {
                         let end = index
                             .saturating_add(resident_group.depth())
                             .min(resident_group.units().len());
@@ -3128,30 +3272,46 @@ impl<A: ArchitectureAdapter> LayerwiseModel<A> {
                     .map(|streamer| streamer.group_guard(&self.residency, group.id()))
             });
             if execute_group {
+                let mut dense_window = self
+                    .dense_stream
+                    .as_ref()
+                    .map(|streamer| {
+                        streamer.transfer_window(
+                            &self.residency,
+                            group.id(),
+                            group.units(),
+                            0..group.units().len(),
+                            prefill,
+                        )
+                    })
+                    .transpose()?;
                 for index in 0..group.units().len() {
                     let id = &group.units()[index];
                     {
                         let mut prepared = if let Some(layers) = &mut self.resident_layers {
                             PreparedExecutionLayer::Resident(&mut layers[group_index][index])
+                        } else if let Some(window) = &mut dense_window {
+                            let transfer = window.next(stream)?;
+                            debug_assert_eq!(transfer.index(), index);
+                            let mut layer = self.adapter.new_layer(group_index, index, stream)?;
+                            self.adapter.populate_layer(
+                                group_index,
+                                index,
+                                &mut layer,
+                                transfer.lease(),
+                            )?;
+                            PreparedExecutionLayer::Transferred {
+                                layer,
+                                _transfer: transfer,
+                            }
                         } else {
-                            let (host, lease) = if let Some(streamer) = &self.dense_stream {
-                                streamer.prepare(
-                                    &self.residency,
-                                    group.id(),
-                                    group.units(),
-                                    index,
-                                    prefill,
-                                )?
-                            } else {
-                                group.prepare(&self.residency, index)?;
-                                (None, self.residency.acquire(id, MemoryTier::Device)?)
-                            };
+                            group.prepare(&self.residency, index)?;
+                            let lease = self.residency.acquire(id, MemoryTier::Device)?;
                             let mut layer = self.adapter.new_layer(group_index, index, stream)?;
                             self.adapter
                                 .populate_layer(group_index, index, &mut layer, &lease)?;
                             PreparedExecutionLayer::Leased {
                                 layer,
-                                _host: host,
                                 _device: lease,
                             }
                         };
@@ -3178,7 +3338,9 @@ impl<A: ArchitectureAdapter> LayerwiseModel<A> {
                         stream.synchronize()?;
                         hook_result?;
                     }
-                    if self.dense_stream.is_none() && self.resident_layers.is_none() {
+                    if let Some(window) = &mut dense_window {
+                        window.refill()?;
+                    } else if self.resident_layers.is_none() {
                         let end = index.saturating_add(group.depth()).min(group.units().len());
                         group.trim_to(&self.residency, &group.units()[index..end])?;
                     }
@@ -3832,12 +3994,17 @@ where
     )?;
 
     let plan = OffloadPlan::new(offload, specs)?;
+    let residency_stream = if dense.is_some() {
+        Stream::new_with_device(&stream.get_device()?)
+    } else {
+        stream.clone()
+    };
     let residency = ResidencyManager::new_shared(
         Arc::clone(&store),
         plan,
         definitions,
         weights_stream.clone(),
-        stream.clone(),
+        residency_stream,
     )?;
     residency.initialize()?;
     let static_leases = static_ids
@@ -4069,12 +4236,17 @@ where
         maximum_group_depth,
     )?;
     let plan = OffloadPlan::new(offload, specs)?;
+    let residency_stream = if dense.is_some() {
+        Stream::new_with_device(&stream.get_device()?)
+    } else {
+        stream.clone()
+    };
     let residency = ResidencyManager::new_shared(
         Arc::clone(&store),
         plan,
         definitions,
         weights_stream.clone(),
-        stream.clone(),
+        residency_stream,
     )?;
     residency.initialize()?;
     let static_leases = static_ids
@@ -4652,6 +4824,16 @@ pub enum LayerwiseModelError {
         depth: usize,
         /// Available ordered units.
         layer_count: usize,
+    },
+    /// A dense transfer window contained an invalid or unordered unit index.
+    #[error(
+        "dense transfer window index {index} is out of order or outside {unit_count} planned units"
+    )]
+    InvalidDenseTransferWindow {
+        /// Invalid unit index.
+        index: usize,
+        /// Available units.
+        unit_count: usize,
     },
     /// Strict loading found unrelated checkpoint tensors.
     #[error("strict layerwise loading found unexpected checkpoint parameters: {unused:?}")]
@@ -5258,12 +5440,17 @@ mod tests {
         let metadata = sizing.metadata();
         let device_budget = metadata
             .static_device_bytes()
-            .checked_add(metadata.maximum_device_layer_bytes())
+            .checked_add(
+                metadata
+                    .maximum_device_layer_bytes()
+                    .checked_mul(DENSE_TRANSFER_WINDOW as u64)
+                    .unwrap(),
+            )
             .unwrap();
         let host_budget = metadata.maximum_device_layer_bytes();
         drop(sizing);
 
-        let options = DenseDiskStreamLoadOptions::new(device_budget, host_budget, 1, 1, 1).unwrap();
+        let options = DenseDiskStreamLoadOptions::new(device_budget, host_budget, 1, 1).unwrap();
         let mut streamed = load_llama_model(
             dir.path(),
             LlamaLoadOptions::dense_disk_stream(options),
@@ -5272,6 +5459,10 @@ mod tests {
         )
         .unwrap();
         let initial = streamed.dense_stream_report().unwrap().unwrap();
+        assert_ne!(
+            initial.transfer_stream_index(),
+            gpu.stream().get_index().unwrap()
+        );
         assert_eq!(initial.planned_layer_count(), 3);
         assert_eq!(initial.host_layers().current_layer_count(), 0);
         assert_eq!(initial.device_layers().current_layer_count(), 0);
@@ -5332,9 +5523,12 @@ mod tests {
         let report = streamed.dense_stream_report().unwrap().unwrap();
         assert!(report.background().submitted >= 3);
         assert!(report.host_layers().current_layer_count() <= 1);
-        assert!(report.device_layers().current_layer_count() <= 1);
+        assert!(report.device_layers().current_layer_count() <= DENSE_TRANSFER_WINDOW);
         assert_eq!(report.host_layers().peak_layer_count(), 1);
-        assert_eq!(report.device_layers().peak_layer_count(), 1);
+        assert_eq!(
+            report.device_layers().peak_layer_count(),
+            DENSE_TRANSFER_WINDOW
+        );
         assert!(report.host_layers().peak_layer_bytes() <= host_budget);
         assert!(
             report.device_layers().peak_layer_bytes()
@@ -5351,9 +5545,9 @@ mod tests {
         assert_eq!(report.prefill().forwards(), 1);
         assert_eq!(report.decode().forwards(), 2);
         assert_eq!(report.prefill().peak_host_layers(), 1);
-        assert_eq!(report.prefill().peak_device_layers(), 1);
+        assert_eq!(report.prefill().peak_device_layers(), DENSE_TRANSFER_WINDOW);
         assert_eq!(report.decode().peak_host_layers(), 1);
-        assert_eq!(report.decode().peak_device_layers(), 1);
+        assert_eq!(report.decode().peak_device_layers(), DENSE_TRANSFER_WINDOW);
         assert!(report.prefill().peak_host_bytes() <= host_budget);
         assert!(report.prefill().peak_device_bytes() <= report.device_layers().peak_layer_bytes());
         assert!(report.prefill().host_cache().requests() >= 3);
@@ -5363,7 +5557,7 @@ mod tests {
         let group = &report.execution_groups()[0];
         assert_eq!(group.completed_executions(), 3);
         assert_eq!(group.peak_host_layers(), 1);
-        assert_eq!(group.peak_device_layers(), 1);
+        assert_eq!(group.peak_device_layers(), DENSE_TRANSFER_WINDOW);
         assert!(group.peak_host_bytes() <= host_budget);
         assert!(group.peak_device_bytes() <= report.device_layers().peak_layer_bytes());
         assert!(
@@ -5375,7 +5569,7 @@ mod tests {
                 >= 3
         );
 
-        let direct_options = DenseDiskStreamLoadOptions::new(device_budget, 0, 0, 1, 0).unwrap();
+        let direct_options = DenseDiskStreamLoadOptions::new(device_budget, 0, 0, 0).unwrap();
         let mut direct = load_llama_model(
             dir.path(),
             LlamaLoadOptions::dense_disk_stream(direct_options),
@@ -5390,7 +5584,10 @@ mod tests {
             .unwrap();
         let report = direct.dense_stream_report().unwrap().unwrap();
         assert_eq!(report.host_layers().peak_layer_count(), 0);
-        assert_eq!(report.device_layers().peak_layer_count(), 1);
+        assert_eq!(
+            report.device_layers().peak_layer_count(),
+            DENSE_TRANSFER_WINDOW
+        );
         assert_eq!(report.prefill().forwards(), 1);
         assert!(report.prefill().disk_to_device_bytes() > 0);
         assert_eq!(report.prefill().host_to_device_bytes(), 0);
@@ -5432,12 +5629,17 @@ mod tests {
         let metadata = sizing.metadata();
         let device_budget = metadata
             .static_device_bytes()
-            .checked_add(metadata.maximum_device_layer_bytes())
+            .checked_add(
+                metadata
+                    .maximum_device_layer_bytes()
+                    .checked_mul(DENSE_TRANSFER_WINDOW as u64)
+                    .unwrap(),
+            )
             .unwrap();
         let host_budget = metadata.maximum_device_layer_bytes();
         drop(sizing);
 
-        let options = DenseDiskStreamLoadOptions::new(device_budget, host_budget, 1, 1, 1).unwrap();
+        let options = DenseDiskStreamLoadOptions::new(device_budget, host_budget, 1, 1).unwrap();
         let adapter = crate::architectures::llama::layerwise::LlamaLayerwiseAdapter::new(
             args("llama", true, None),
             gpu.stream(),
@@ -5458,12 +5660,12 @@ mod tests {
             let layer_group = &streamed.groups[0];
             let group = controller.group_guard(&streamed.residency, layer_group.id());
             {
-                let _leases = controller
-                    .prepare(
+                let _window = controller
+                    .transfer_window(
                         &streamed.residency,
                         layer_group.id(),
                         layer_group.units(),
-                        0,
+                        0..layer_group.units().len(),
                         true,
                     )
                     .unwrap();
@@ -5494,7 +5696,7 @@ mod tests {
         assert_eq!(report.prefill(), DensePassReport::default());
         assert_eq!(report.decode().forwards(), 1);
         assert_eq!(report.decode().peak_host_layers(), 1);
-        assert_eq!(report.decode().peak_device_layers(), 1);
+        assert_eq!(report.decode().peak_device_layers(), DENSE_TRANSFER_WINDOW);
         let expected =
             DenseCounterSnapshot::from_report(report.residency().offload()).delta(successful_start);
         assert_eq!(report.decode().host_cache(), expected.host_cache);

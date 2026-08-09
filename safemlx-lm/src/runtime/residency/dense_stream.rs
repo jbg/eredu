@@ -1,9 +1,9 @@
 //! Experimental bounded streaming of dense execution units from safetensors.
 //!
-//! The worker in this module performs only disk-to-host materialization. Device
-//! promotion remains on the caller's ordered execution path because MLX does
-//! not currently expose the cross-stream fences needed for arbitrary transfer
-//! overlap.
+//! The worker in this module performs disk-to-host materialization. Device
+//! promotion uses a dedicated MLX stream and a caller-owned two-layer transfer
+//! window. The current layer's completion orders its compute stream while the
+//! next layer may continue transferring independently.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -18,7 +18,14 @@ use crate::{
     runtime::residency::policy::{CacheEvictionPolicy, MemoryTier, OffloadUnitId},
 };
 
+/// Current plus next layer retained by dense streamed execution.
+pub(crate) const DENSE_TRANSFER_WINDOW: usize = 2;
+
 /// Public controls for experimental dense disk streaming.
+///
+/// Device residency always uses a fixed current-plus-next layer window. The
+/// device budget must therefore accommodate the largest adjacent pair of
+/// execution units plus pinned static weights. One-unit groups use one slot.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub struct DenseDiskStreamLoadOptions {
     /// Finite logical device parameter budget, including pinned static weights.
@@ -27,8 +34,6 @@ pub struct DenseDiskStreamLoadOptions {
     pub host_budget_bytes: u64,
     /// Number of current and imminent layer host copies protected from eviction.
     pub host_lookahead: usize,
-    /// Number of current and imminent layer device copies protected from eviction.
-    pub device_lookahead: usize,
     /// Maximum number of pending background host materializations.
     pub background_queue_capacity: usize,
     /// Deterministic ordering used when unprotected cached copies must be evicted.
@@ -45,18 +50,19 @@ pub struct DenseDiskStreamLoadOptions {
 
 impl DenseDiskStreamLoadOptions {
     /// Creates strict streaming options with finite tier budgets.
+    ///
+    /// `host_lookahead` controls background disk-to-host work. Device
+    /// lookahead is deliberately fixed at two and is not separately tunable.
     pub fn new(
         device_budget_bytes: u64,
         host_budget_bytes: u64,
         host_lookahead: usize,
-        device_lookahead: usize,
         background_queue_capacity: usize,
     ) -> Result<Self, DenseStreamError> {
         let options = Self {
             device_budget_bytes,
             host_budget_bytes,
             host_lookahead,
-            device_lookahead,
             background_queue_capacity,
             eviction_policy: CacheEvictionPolicy::LeastRecentlyUsed,
             max_mapped_shards: crate::runtime::checkpoint::store::DEFAULT_MAX_MAPPED_SHARDS,
@@ -70,9 +76,6 @@ impl DenseDiskStreamLoadOptions {
 
     /// Revalidates public fields after caller customization.
     pub fn validate(self) -> Result<(), DenseStreamError> {
-        if self.device_lookahead == 0 {
-            return Err(DenseStreamError::ZeroDeviceLookahead);
-        }
         if self.host_budget_bytes == 0 {
             if self.host_lookahead != 0 || self.background_queue_capacity != 0 {
                 return Err(DenseStreamError::HostDisabledControls);
@@ -97,8 +100,7 @@ impl DenseDiskStreamLoadOptions {
 
 impl Default for DenseDiskStreamLoadOptions {
     fn default() -> Self {
-        Self::new(4 << 30, 16 << 30, 2, 1, 2)
-            .expect("default dense disk streaming controls are valid")
+        Self::new(4 << 30, 16 << 30, 2, 2).expect("default dense disk streaming controls are valid")
     }
 }
 
@@ -448,9 +450,6 @@ fn worker_loop(
 /// Structured validation and worker failures for dense disk streaming.
 #[derive(Debug, thiserror::Error)]
 pub enum DenseStreamError {
-    /// Device lookahead must include the current execution unit.
-    #[error("dense disk streaming device lookahead must be nonzero")]
-    ZeroDeviceLookahead,
     /// Enabled host caching needs a protected current unit.
     #[error("dense disk streaming host lookahead must be nonzero when the host budget is enabled")]
     ZeroHostLookahead,
@@ -614,22 +613,18 @@ mod tests {
     #[test]
     fn configuration_requires_meaningful_finite_controls() {
         assert!(matches!(
-            DenseDiskStreamLoadOptions::new(1, 1, 1, 0, 1),
-            Err(DenseStreamError::ZeroDeviceLookahead)
-        ));
-        assert!(matches!(
-            DenseDiskStreamLoadOptions::new(1, 1, 0, 1, 1),
+            DenseDiskStreamLoadOptions::new(1, 1, 0, 1),
             Err(DenseStreamError::ZeroHostLookahead)
         ));
         assert!(matches!(
-            DenseDiskStreamLoadOptions::new(1, 1, 1, 1, 0),
+            DenseDiskStreamLoadOptions::new(1, 1, 1, 0),
             Err(DenseStreamError::ZeroQueueCapacity)
         ));
         assert!(matches!(
-            DenseDiskStreamLoadOptions::new(1, 0, 1, 1, 0),
+            DenseDiskStreamLoadOptions::new(1, 0, 1, 0),
             Err(DenseStreamError::HostDisabledControls)
         ));
-        assert!(DenseDiskStreamLoadOptions::new(1, 0, 0, 1, 0).is_ok());
+        assert!(DenseDiskStreamLoadOptions::new(1, 0, 0, 0).is_ok());
     }
 
     #[test]

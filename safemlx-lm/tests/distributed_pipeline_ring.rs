@@ -395,7 +395,7 @@ fn pipeline_ring_worker() {
     let mut model = if expert_cache {
         let non_experts = if dense_stream {
             NonExpertWeightResidency::DenseDiskStream(
-                DenseDiskStreamLoadOptions::new(u64::MAX, u64::MAX, 1, 1, 1).unwrap(),
+                DenseDiskStreamLoadOptions::new(u64::MAX, u64::MAX, 1, 1).unwrap(),
             )
         } else if layerwise_host {
             NonExpertWeightResidency::LayerwiseHost(layerwise_options())
@@ -422,7 +422,7 @@ fn pipeline_ring_worker() {
         )
         .unwrap()
     } else if dense_stream {
-        let dense = DenseDiskStreamLoadOptions::new(u64::MAX, u64::MAX, 1, 1, 1).unwrap();
+        let dense = DenseDiskStreamLoadOptions::new(u64::MAX, u64::MAX, 1, 1).unwrap();
         load_pipeline_model_with_options(
             &checkpoint,
             base_options().with_weight_residency(WeightResidency::dense_disk_stream(dense)),

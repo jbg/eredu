@@ -11,62 +11,39 @@ weights.
 Cold and warm acquisitions are processed as one residency batch. Capacity for
 every missing unit is reserved before materialization, requested units are
 temporarily protected from eviction, and mmap leases plus source arrays remain
-owned by pending materializations. Host copies are evaluated together before
-publication. Device copies are published with a shared pending-completion token
-and pinned leases; they become ordinary ready residents only after evaluation
-of the dependent expert output. A concurrent synchronous acquisition evaluates
-and completes an existing pending copy before returning it. Early drop or
-unwinding conservatively synchronizes before releasing mmap storage.
-Host-to-device copies, compact-bank operations, and grouped expert execution
-use the same execution stream, so normal stream ordering carries their
-dependencies without an additional whole-stream barrier between each
-operation.
+owned by a caller-owned `ResidentTransfer`. MLX submits all missing copies with
+one backend-independent completion event. The execution stream waits on that
+event before compact-bank construction, without synchronizing the host. The
+transfer retains mmap leases, source arrays, and promoted host arrays until
+exact event completion; dropping it early waits for that event rather than
+synchronizing either entire stream.
+
+The shared residency state records only an in-flight generation, not an MLX
+event or source handles. This keeps the event on its supported host thread and
+removes the former unsafe shared pending-source object. A concurrent
+synchronous acquisition waits on a condition variable until the caller-owned
+transfer publishes success or rolls back failure. Event errors propagate from
+explicit synchronization and poison dependent stream work through MLX's normal
+completion semantics.
 
 The remaining waits are synchronous array evaluations:
 
 - the host must observe the bounded route-demand metadata before it can select
   checkpoint ranges and make eviction decisions;
-- pending mmap-backed materializations must complete before their mappings can
-  be released safely; and
+- event-backed materializations must complete before their mappings can be
+  released safely; and
 - the final expert output is evaluated before its expert leases are released.
 
 MLX documents lazy computation and recommends evaluating related outputs
 together because every evaluation has fixed overhead:
 [MLX lazy evaluation](https://ml-explore.github.io/mlx/build/html/usage/lazy_evaluation.html).
-The public MLX C API exposes synchronous `mlx_eval`, asynchronous submission via
-`mlx_async_eval`, and whole-stream `mlx_synchronize`:
+SafeMLX's patched MLX C API exposes asynchronous evaluation with an owning
+completion event, exact host query/wait, and same-device stream waits:
 [MLX C transforms](https://ml-explore.github.io/mlx-c/build/html/transforms.html)
 and [MLX C streams](https://ml-explore.github.io/mlx-c/build/html/stream.html).
-It does not currently expose an event object that can be recorded on one stream,
-waited on by another stream, queried by the host, and used to prove when source
-storage may be released.
 
-## Event-backed completion design
-
-True transfer/compute overlap requires an upstream or vendored MLX C extension
-with these semantics:
-
-- Create and destroy an opaque completion event.
-- Record the event after asynchronous evaluation on a producer stream.
-- Enqueue a nonblocking wait for that event on a consumer stream.
-- Query or wait for completion on the host and report execution errors.
-- Define event behavior for both Metal and CUDA streams.
-
-The Rust layer would wrap the object in an owned `CompletionFence`. A pending
-expert batch would retain mmap leases, source arrays, host arrays, and its byte
-reservations until the fence completes. The device-residency record could then
-move from pending to ready without blocking the router thread. The execution
-stream would wait on the fence before compact-bank construction, while
-independent work such as the DeepSeek shared-expert branch could proceed.
-
-`mlx_async_eval` alone is insufficient because it returns no completion handle
-through MLX C. Upstream discussion of nonblocking bindings likewise identifies
-the need for a returned synchronizer event, while noting that a host worker
-thread only moves the blocking wait and does not provide a device-side
-cross-stream dependency:
-[MLX nonblocking API discussion](https://github.com/ml-explore/mlx/issues/1251).
-
-Until such an API exists, the cache deliberately prefers bounded batched
-evaluation and conservative source lifetime over unsafe overlap. Predictive
-prefetch may be added independently, but it can only warm likely experts; exact
-routing must still load every selected expert and never substitute another.
+This ownership refactor does not yet add predictive expert prefetch or schedule
+independent shared-expert computation during transfer. Exact routing must still
+load every selected expert and never substitute another. Those scheduling
+optimizations can now use the existing event-backed transfer contract without
+reintroducing a second pending-source path.

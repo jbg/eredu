@@ -3245,7 +3245,6 @@ mod tests {
             u64::MAX,
             1,
             1,
-            1,
         )
         .unwrap();
         let mut cached = load_qwen3_expert_cache_model(
@@ -3320,7 +3319,6 @@ mod tests {
         let dense = crate::runtime::residency::dense_stream::DenseDiskStreamLoadOptions::new(
             u64::MAX,
             u64::MAX,
-            1,
             1,
             1,
         )
@@ -3441,7 +3439,6 @@ mod tests {
         let dense = crate::runtime::residency::dense_stream::DenseDiskStreamLoadOptions::new(
             u64::MAX,
             u64::MAX,
-            1,
             1,
             1,
         )

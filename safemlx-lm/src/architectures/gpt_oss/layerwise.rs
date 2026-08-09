@@ -1994,7 +1994,7 @@ mod tests {
         let mut resident = resident::load_model(dir.path(), gpu.stream(), cpu.stream()).unwrap();
         let options = if dense_stream {
             LayerWeightResidency::DenseDiskStream(
-                DenseDiskStreamLoadOptions::new(u64::MAX, u64::MAX, depth, depth, depth).unwrap(),
+                DenseDiskStreamLoadOptions::new(u64::MAX, u64::MAX, depth, depth).unwrap(),
             )
         } else {
             LayerWeightResidency::LayerwiseHost(LayerwiseLoadOptions::new(
@@ -2075,7 +2075,7 @@ mod tests {
         write_fixture(dir.path(), &fixture);
 
         let mut expected = resident::load_model(dir.path(), gpu.stream(), cpu.stream()).unwrap();
-        let options = DenseDiskStreamLoadOptions::new(u64::MAX, u64::MAX, 1, 1, 1).unwrap();
+        let options = DenseDiskStreamLoadOptions::new(u64::MAX, u64::MAX, 1, 1).unwrap();
         let mut delegated =
             load_gpt_oss_layerwise_model(dir.path(), options, gpu.stream(), cpu.stream()).unwrap();
         let mut expected_cache = Cache::default();

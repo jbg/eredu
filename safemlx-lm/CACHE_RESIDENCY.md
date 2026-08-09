@@ -85,12 +85,12 @@ No throughput improvement is promised.
 Apple unified memory means logical host/device placement does not create
 additional physical capacity. Residency reports describe the runtime's logical
 tiers and requested transfer bytes. They do not claim physical disk bytes:
-mapped pages may be served by the operating-system cache. SafeMLX now exposes MLX
-completion events and cross-stream waits, but the `safemlx-lm` residency
-managers have not adopted them. Cache evaluation and device-to-host completion
-therefore still use conservative synchronization. Residency leases, layer
-prefetch, expert caches, and buffer handoff remain synchronous; no
-transfer/compute overlap or double buffering is claimed. Disk reads and
+mapped pages may be served by the operating-system cache. SafeMLX's immutable
+weight residency manager and expert cache now use caller-owned MLX completion
+events to retain transfer sources and order compatible execution streams. The
+paged attention-cache manager in this document has not yet adopted events:
+cache promotion, demotion, and block-lease handoff remain synchronous, and no
+KV transfer/compute overlap or double buffering is claimed. Disk reads and
 writes use a bounded manager-owned worker queue. Duplicate block operations
 join one shared completion, capacity waits occur without holding cache state,
 and reset or truncation cancels queued work from the prior generation. The

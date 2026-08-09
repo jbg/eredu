@@ -251,7 +251,7 @@ Stream dense layers from either backend with finite tier controls:
 cargo run --release -p safemlx-lm-cli -- \
   --model /path/to/model.gguf --dense-disk-stream \
   --device-budget-bytes 8000000000 --host-budget-bytes 16000000000 \
-  --dense-host-lookahead 2 --dense-device-lookahead 1 \
+  --dense-host-lookahead 2 \
   --dense-background-queue 2 "Explain bounded GGUF loading."
 ```
 

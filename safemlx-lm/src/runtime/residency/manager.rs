@@ -2,19 +2,23 @@
 //!
 //! A [`crate::runtime::residency::manager::ResidencyManager`] moves caller-defined groups of
 //! checkpoint selections from a [`crate::runtime::checkpoint::store::WeightStore`] into
-//! evaluated host or execution-stream arrays. The
-//! manager accounts for logical host and device copies independently, even on
-//! unified-memory systems. Missing units can be reserved and evaluated as one
-//! batch. Completion remains host-synchronous because the pinned MLX C API has
-//! no event or fence primitive.
+//! evaluated host or execution-stream arrays. The manager accounts for logical
+//! host and device copies independently, even on unified-memory systems.
+//! Missing units can be reserved and submitted as one batch. Caller-owned
+//! [`crate::runtime::residency::manager::ResidentTransfer`] values retain
+//! source mappings until MLX reports exact completion of the submitted
+//! transfer.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    sync::{Arc, Mutex, MutexGuard, Weak},
+    sync::{Arc, Condvar, Mutex, MutexGuard, Weak},
     time::Instant,
 };
 
-use safemlx::{transforms::eval, Array, DeviceType, Stream};
+use safemlx::{
+    transforms::{async_eval_with_event, eval},
+    Array, DeviceType, Event, Stream,
+};
 
 use crate::{
     runtime::checkpoint::recipe::{DerivedWeightRecipe, WeightRecipeError},
@@ -247,7 +251,6 @@ pub struct ResidentUnitLease {
     id: OffloadUnitId,
     tier: MemoryTier,
     arrays: Arc<ResidentArrays>,
-    pending: Option<Arc<PendingResidentSources>>,
     manager: Weak<ManagerInner>,
 }
 
@@ -281,53 +284,10 @@ impl ResidentUnitLease {
     pub fn binding_names(&self) -> impl Iterator<Item = &str> {
         self.arrays.arrays.keys().map(String::as_str)
     }
-
-    /// Releases deferred source dependencies after a dependent output was evaluated.
-    pub fn complete_pending(&self) -> Result<(), ResidencyError> {
-        if let Some(pending) = &self.pending {
-            pending.complete_after_evaluation()?;
-            self.clear_completed_pending(pending)?;
-        }
-        Ok(())
-    }
-
-    fn clear_completed_pending(
-        &self,
-        pending: &Arc<PendingResidentSources>,
-    ) -> Result<(), ResidencyError> {
-        if pending.is_pending() {
-            return Ok(());
-        }
-        let Some(manager) = self.manager.upgrade() else {
-            return Ok(());
-        };
-        let mut state = manager
-            .state
-            .lock()
-            .map_err(|_| ResidencyError::StatePoisoned)?;
-        let Some(copy) = state
-            .units
-            .get_mut(&self.id)
-            .and_then(|unit| unit.copy_mut(self.tier))
-        else {
-            return Ok(());
-        };
-        if copy
-            .pending
-            .as_ref()
-            .is_some_and(|current| Arc::ptr_eq(current, pending))
-        {
-            copy.pending = None;
-        }
-        Ok(())
-    }
 }
 
 impl Drop for ResidentUnitLease {
     fn drop(&mut self) {
-        if let Some(pending) = &self.pending {
-            pending.abort();
-        }
         let Some(manager) = self.manager.upgrade() else {
             return;
         };
@@ -338,17 +298,157 @@ impl Drop for ResidentUnitLease {
             return;
         };
         if let Some(copy) = unit.copy_mut(self.tier) {
-            if self.pending.as_ref().is_some_and(|pending| {
-                !pending.is_pending()
-                    && copy
-                        .pending
-                        .as_ref()
-                        .is_some_and(|current| Arc::ptr_eq(current, pending))
-            }) {
-                copy.pending = None;
-            }
             copy.pins = copy.pins.saturating_sub(1);
         }
+    }
+}
+
+/// Caller-owned completion and source-lifetime guard for one residency batch.
+///
+/// Missing copies are submitted together. This value owns both the resident
+/// unit leases and the transfer completion, so pins cannot be released before
+/// the submitted copy is safe. Its unit leases may be used to construct
+/// dependent work after [`Self::wait_on`] orders the consumer stream. The guard
+/// retains mmap leases, source arrays, and promoted host arrays until the event
+/// completes. Dropping an unfinished guard waits for that exact event; it never
+/// synchronizes an entire MLX stream.
+///
+/// `ResidentTransfer` is intentionally neither `Send` nor `Sync`, matching the
+/// underlying [`Event`] contract. The shared [`ResidencyManager`] remains safe
+/// to use from multiple host threads; a competing synchronous acquisition
+/// waits for the caller which owns the in-flight transfer to publish it.
+pub struct ResidentTransfer {
+    leases: Vec<ResidentUnitLease>,
+    event: Option<Event>,
+    retained: Option<ResidentTransferResources>,
+    manager: Weak<ManagerInner>,
+    ids: Vec<OffloadUnitId>,
+    tier: MemoryTier,
+    generation: u64,
+}
+
+impl ResidentTransfer {
+    /// Returns the resident unit leases protected by this transfer.
+    pub fn leases(&self) -> &[ResidentUnitLease] {
+        &self.leases
+    }
+
+    /// Returns whether this transfer contains no resident units.
+    pub fn is_empty(&self) -> bool {
+        self.leases.is_empty()
+    }
+
+    /// Orders subsequently evaluated work on a compatible stream after this transfer.
+    ///
+    /// MLX operations remain lazy: call this before evaluating the consumer
+    /// graph. This inserts a backend dependency and does not block the host.
+    pub fn wait_on(&self, stream: &Stream) -> Result<(), ResidencyError> {
+        if let Some(event) = &self.event {
+            event
+                .wait_on(stream)
+                .map_err(|source| ResidencyError::Mlx {
+                    id: self.ids.first().cloned().unwrap_or_else(internal_id),
+                    operation: "resident transfer stream wait",
+                    source,
+                })?;
+        }
+        Ok(())
+    }
+
+    /// Blocks for this exact transfer and publishes its copies as ready.
+    ///
+    /// An asynchronous failure rolls the submitted copies back and remains
+    /// observable on repeated calls.
+    pub fn synchronize(&mut self) -> Result<(), ResidencyError> {
+        self.finish(true)
+    }
+
+    /// Returns whether the transfer has completed without blocking.
+    pub fn is_complete(&self) -> Result<bool, ResidencyError> {
+        self.event.as_ref().map_or(Ok(true), |event| {
+            event.is_complete().map_err(|source| ResidencyError::Mlx {
+                id: self.ids.first().cloned().unwrap_or_else(internal_id),
+                operation: "resident transfer query",
+                source,
+            })
+        })
+    }
+
+    fn finish(&mut self, report_error: bool) -> Result<(), ResidencyError> {
+        let result = self.event.as_ref().map_or(Ok(()), Event::synchronize);
+        let succeeded = result.is_ok();
+        if let Some(resources) = self.retained.take() {
+            if succeeded {
+                for source in resources.sources {
+                    source.complete();
+                }
+                drop(resources.retained_arrays);
+                drop(resources.retained_host);
+            } else {
+                // Preserve PendingWeightMaterialization's conservative failure
+                // cleanup: it synchronizes the involved streams and retains a
+                // mapping permanently if backend state is unknowable.
+                drop(resources);
+            }
+        }
+        // Retain a failed event so repeated synchronization and queries keep
+        // reporting the original asynchronous backend error. Successful
+        // events can release their backend resource after publication.
+        if succeeded {
+            self.event = None;
+        }
+        self.publish(succeeded)?;
+        match result {
+            Ok(()) => Ok(()),
+            Err(source) if report_error => Err(ResidencyError::Mlx {
+                id: self.ids.first().cloned().unwrap_or_else(internal_id),
+                operation: "resident transfer completion",
+                source,
+            }),
+            Err(_) => Ok(()),
+        }
+    }
+
+    fn publish(&mut self, succeeded: bool) -> Result<(), ResidencyError> {
+        if self.generation == 0 {
+            return Ok(());
+        }
+        let generation = std::mem::take(&mut self.generation);
+        let Some(manager) = self.manager.upgrade() else {
+            return Ok(());
+        };
+        let mut state = manager
+            .state
+            .lock()
+            .map_err(|_| ResidencyError::StatePoisoned)?;
+        for id in &self.ids {
+            let matches = state
+                .units
+                .get(id)
+                .and_then(|unit| unit.copy(self.tier))
+                .is_some_and(|copy| copy.in_flight == Some(generation));
+            if !matches {
+                continue;
+            }
+            if succeeded {
+                state
+                    .units
+                    .get_mut(id)
+                    .and_then(|unit| unit.copy_mut(self.tier))
+                    .expect("validated in-flight resident copy")
+                    .in_flight = None;
+            } else {
+                remove_copy_impl(&mut state, id, self.tier, false)?;
+            }
+        }
+        manager.changed.notify_all();
+        Ok(())
+    }
+}
+
+impl Drop for ResidentTransfer {
+    fn drop(&mut self) {
+        let _ = self.finish(false);
     }
 }
 
@@ -921,6 +1021,18 @@ impl DeviceLayerWindow {
 }
 
 impl ResidencyManager {
+    /// Returns the MLX stream index used for device residency transfers.
+    pub(crate) fn device_stream_index(&self) -> Result<i32, ResidencyError> {
+        self.lock()?
+            .device_stream
+            .get_index()
+            .map_err(|source| ResidencyError::Mlx {
+                id: internal_id(),
+                operation: "device residency stream index",
+                source,
+            })
+    }
+
     /// Validates plan/unit identity, binding sizes, selections, and streams.
     ///
     /// Construction does not create MLX arrays. Call [`Self::initialize`] to
@@ -1018,8 +1130,10 @@ impl ResidencyManager {
                     host_bytes: 0,
                     device_bytes: 0,
                     tick: 0,
+                    next_transfer_generation: 1,
                     initialized: false,
                 }),
+                changed: Condvar::new(),
             }),
         })
     }
@@ -1059,7 +1173,22 @@ impl ResidencyManager {
     ) -> Result<PrefetchOutcome, ResidencyError> {
         validate_target(tier, "prefetch")?;
         let mut state = self.lock()?;
-        require_initialized(&state)?;
+        loop {
+            require_initialized(&state)?;
+            let copy = state
+                .units
+                .get(id)
+                .ok_or_else(|| ResidencyError::UnknownUnit { id: id.clone() })?
+                .copy(tier);
+            if !copy.is_some_and(|copy| copy.in_flight.is_some()) {
+                break;
+            }
+            state = self
+                .inner
+                .changed
+                .wait(state)
+                .map_err(|_| ResidencyError::StatePoisoned)?;
+        }
         prefetch_locked(&mut state, self.inner.store.as_ref(), id, tier)
     }
 
@@ -1099,38 +1228,77 @@ impl ResidencyManager {
         tier: MemoryTier,
     ) -> Result<Vec<ResidentUnitLease>, ResidencyError> {
         self.acquire_many_with_mode(requests, tier, false)
+            .map(|(leases, _)| leases)
     }
 
-    /// Acquires device copies without evaluating their lazy transfer graphs.
+    /// Submits one residency batch and returns its owning completion lease.
     ///
-    /// Callers must evaluate a dependent output and then invoke
-    /// [`ResidentUnitLease::complete_pending`] on every returned lease. Early
-    /// lease drop takes the conservative synchronized cleanup path.
-    pub(crate) fn acquire_many_deferred_with_demand(
+    /// Missing copies are submitted to MLX for asynchronous evaluation, but
+    /// this method does not block the host for their completion. Call
+    /// [`ResidentTransfer::wait_on`] before evaluating work on another
+    /// compatible stream. The transfer guard owns every source dependency
+    /// until it is synchronized or dropped.
+    pub fn acquire_many_with_transfer(
         &self,
         requests: &[(OffloadUnitId, u64)],
         tier: MemoryTier,
-    ) -> Result<Vec<ResidentUnitLease>, ResidencyError> {
-        self.acquire_many_with_mode(requests, tier, true)
+    ) -> Result<ResidentTransfer, ResidencyError> {
+        let (leases, submitted) = self.acquire_many_with_mode(requests, tier, true)?;
+        let transfer = match submitted {
+            None => ResidentTransfer {
+                leases,
+                event: None,
+                retained: None,
+                manager: Weak::new(),
+                ids: Vec::new(),
+                tier,
+                generation: 0,
+            },
+            Some(submitted) => ResidentTransfer {
+                leases,
+                event: Some(submitted.event),
+                retained: Some(submitted.retained),
+                manager: Arc::downgrade(&self.inner),
+                ids: submitted.ids,
+                tier,
+                generation: submitted.generation,
+            },
+        };
+        Ok(transfer)
     }
 
     fn acquire_many_with_mode(
         &self,
         requests: &[(OffloadUnitId, u64)],
         tier: MemoryTier,
-        defer_evaluation: bool,
-    ) -> Result<Vec<ResidentUnitLease>, ResidencyError> {
+        return_transfer: bool,
+    ) -> Result<(Vec<ResidentUnitLease>, Option<SubmittedResidentTransfer>), ResidencyError> {
         validate_target(tier, "acquire")?;
         let mut seen = BTreeSet::new();
         if requests.iter().any(|(id, _)| !seen.insert(id.clone())) {
             return Err(ResidencyError::DuplicateBatchUnit);
         }
         let mut state = self.lock()?;
-        require_initialized(&state)?;
-        for (id, _) in requests {
-            if !state.units.contains_key(id) {
-                return Err(ResidencyError::UnknownUnit { id: id.clone() });
+        loop {
+            require_initialized(&state)?;
+            for (id, _) in requests {
+                if !state.units.contains_key(id) {
+                    return Err(ResidencyError::UnknownUnit { id: id.clone() });
+                }
             }
+            let waiting = requests.iter().any(|(id, _)| {
+                state.units[id]
+                    .copy(tier)
+                    .is_some_and(|copy| copy.in_flight.is_some())
+            });
+            if !waiting {
+                break;
+            }
+            state = self
+                .inner
+                .changed
+                .wait(state)
+                .map_err(|_| ResidencyError::StatePoisoned)?;
         }
         let missing = requests
             .iter()
@@ -1146,13 +1314,13 @@ impl ResidencyManager {
             self.inner.store.as_ref(),
             &ids,
             tier,
-            defer_evaluation,
+            return_transfer,
         );
         if missing > 0 {
             state.telemetry.record_prefetch_stall(started.elapsed());
         }
-        residency?;
-        requests
+        let (_, submitted) = residency?;
+        let leases = requests
             .iter()
             .map(|(id, demand)| {
                 let tick = next_tick(&mut state)?;
@@ -1173,11 +1341,11 @@ impl ResidencyManager {
                     id: id.clone(),
                     tier,
                     arrays: Arc::clone(&copy.arrays),
-                    pending: copy.pending.as_ref().map(Arc::clone),
                     manager: Arc::downgrade(&self.inner),
                 })
             })
-            .collect()
+            .collect::<Result<Vec<_>, ResidencyError>>()?;
+        Ok((leases, submitted))
     }
 
     /// Returns whether a logical copy currently resides in a memory tier.
@@ -1225,11 +1393,26 @@ impl ResidencyManager {
         }
         validate_target(tier, "prepare_group_window")?;
         let mut state = self.lock()?;
-        require_initialized(&state)?;
-        for id in active.iter().chain(upcoming) {
-            if !state.units.contains_key(id) {
-                return Err(ResidencyError::UnknownUnit { id: id.clone() });
+        loop {
+            require_initialized(&state)?;
+            for id in active.iter().chain(upcoming) {
+                if !state.units.contains_key(id) {
+                    return Err(ResidencyError::UnknownUnit { id: id.clone() });
+                }
             }
+            let waiting = active.iter().chain(upcoming).any(|id| {
+                state.units[id]
+                    .copy(tier)
+                    .is_some_and(|copy| copy.in_flight.is_some())
+            });
+            if !waiting {
+                break;
+            }
+            state = self
+                .inner
+                .changed
+                .wait(state)
+                .map_err(|_| ResidencyError::StatePoisoned)?;
         }
         let key = (group.to_string(), tier);
         if active.is_empty() {
@@ -1420,6 +1603,7 @@ impl ResidencyManager {
 struct ManagerInner {
     store: Arc<dyn WeightStore + Send + Sync>,
     state: Mutex<ManagerState>,
+    changed: Condvar,
 }
 
 struct ManagerState {
@@ -1433,6 +1617,7 @@ struct ManagerState {
     host_bytes: u64,
     device_bytes: u64,
     tick: u64,
+    next_transfer_generation: u64,
     initialized: bool,
 }
 
@@ -1472,7 +1657,7 @@ impl UnitRecord {
 
 struct ResidentCopy {
     arrays: Arc<ResidentArrays>,
-    pending: Option<Arc<PendingResidentSources>>,
+    in_flight: Option<u64>,
     bytes: u64,
     pins: u64,
     last_used: u64,
@@ -1483,49 +1668,17 @@ struct ResidentArrays {
     arrays: BTreeMap<String, Array>,
 }
 
-struct PendingResidentDependencies {
+struct ResidentTransferResources {
     sources: Vec<PendingWeightMaterialization>,
     retained_arrays: Vec<Array>,
-    retained_host: Option<Arc<ResidentArrays>>,
+    retained_host: Vec<Arc<ResidentArrays>>,
 }
 
-struct PendingResidentSources {
-    dependencies: Mutex<Option<PendingResidentDependencies>>,
-}
-
-// SAFETY: the mutex gives exactly one thread ownership of the retained MLX
-// handles and mmap leases for completion or cleanup. MLX array handles are
-// Send + Sync, and stream operations use safemlx's runtime guard internally.
-unsafe impl Send for PendingResidentSources {}
-unsafe impl Sync for PendingResidentSources {}
-
-impl PendingResidentSources {
-    fn complete_after_evaluation(&self) -> Result<(), ResidencyError> {
-        let mut dependencies = self
-            .dependencies
-            .lock()
-            .map_err(|_| ResidencyError::StatePoisoned)?;
-        if let Some(dependencies) = dependencies.take() {
-            for source in dependencies.sources {
-                source.complete();
-            }
-            drop(dependencies.retained_arrays);
-            drop(dependencies.retained_host);
-        }
-        Ok(())
-    }
-
-    fn abort(&self) {
-        if let Ok(mut dependencies) = self.dependencies.lock() {
-            drop(dependencies.take());
-        }
-    }
-
-    fn is_pending(&self) -> bool {
-        self.dependencies
-            .lock()
-            .map_or(true, |dependencies| dependencies.is_some())
-    }
+struct SubmittedResidentTransfer {
+    event: Event,
+    retained: ResidentTransferResources,
+    ids: Vec<OffloadUnitId>,
+    generation: u64,
 }
 
 fn validate_unit_bytes(
@@ -1636,7 +1789,7 @@ fn ensure_resident(
     tier: MemoryTier,
 ) -> Result<bool, ResidencyError> {
     ensure_many_resident(state, store, std::slice::from_ref(id), tier, false)
-        .map(|created| created[0])
+        .map(|(created, _)| created[0])
 }
 
 fn ensure_many_resident(
@@ -1644,11 +1797,11 @@ fn ensure_many_resident(
     store: &dyn WeightStore,
     ids: &[OffloadUnitId],
     tier: MemoryTier,
-    defer_evaluation: bool,
-) -> Result<Vec<bool>, ResidencyError> {
+    return_transfer: bool,
+) -> Result<(Vec<bool>, Option<SubmittedResidentTransfer>), ResidencyError> {
     validate_target(tier, "residency transition")?;
     if ids.is_empty() {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), None));
     }
     let mut unique = BTreeSet::new();
     for id in ids {
@@ -1664,7 +1817,6 @@ fn ensure_many_resident(
         .map(|id| !state.units[id].is_resident(tier))
         .collect::<Vec<_>>();
     if created.iter().all(|value| !value) {
-        complete_existing_pending(state, ids, tier, defer_evaluation, false)?;
         for id in ids {
             let tick = next_tick(state)?;
             state
@@ -1674,7 +1826,7 @@ fn ensure_many_resident(
                 .ok_or(ResidencyError::StatePoisoned)?
                 .last_used = tick;
         }
-        return Ok(created);
+        return Ok((created, None));
     }
 
     let temporary_protection = ids
@@ -1781,31 +1933,6 @@ fn ensure_many_resident(
             prepared.push((id.clone(), item));
         }
 
-        if !defer_evaluation {
-            let existing = ids
-                .iter()
-                .zip(&created)
-                .filter(|(_, is_missing)| !**is_missing)
-                .filter_map(|(id, _)| state.units[id].copy(tier))
-                .filter(|copy| {
-                    copy.pending
-                        .as_ref()
-                        .is_some_and(|pending| pending.is_pending())
-                });
-            eval(
-                prepared
-                    .iter()
-                    .flat_map(|(_, item)| item.arrays.values())
-                    .chain(existing.flat_map(|copy| copy.arrays.arrays.values())),
-            )
-            .map_err(|source| ResidencyError::Mlx {
-                id: internal_id(),
-                operation: "batched residency evaluation",
-                source,
-            })?;
-            complete_existing_pending(state, ids, tier, false, true)?;
-        }
-
         for (id, item) in &prepared {
             let actual = arrays_nbytes(&item.arrays)?;
             let required = state.units[id].spec.bytes();
@@ -1818,28 +1945,63 @@ fn ensure_many_resident(
             }
         }
 
-        for (id, mut item) in prepared {
-            let pending = if defer_evaluation {
-                Some(Arc::new(PendingResidentSources {
-                    dependencies: Mutex::new(Some(PendingResidentDependencies {
-                        sources: std::mem::take(&mut item.pending_sources),
-                        retained_arrays: std::mem::take(&mut item.retained_arrays),
-                        retained_host: item.retained_host.take(),
-                    })),
-                }))
-            } else {
+        let event =
+            async_eval_with_event(prepared.iter().flat_map(|(_, item)| item.arrays.values()))
+                .map_err(|source| ResidencyError::Mlx {
+                    id: internal_id(),
+                    operation: "batched residency submission",
+                    source,
+                })?;
+        let generation = if return_transfer {
+            let generation = state.next_transfer_generation;
+            state.next_transfer_generation = state.next_transfer_generation.checked_add(1).ok_or(
+                ResidencyError::ArithmeticOverflow {
+                    context: "resident transfer generation",
+                },
+            )?;
+            generation
+        } else {
+            let completion = event.synchronize();
+            for (_, item) in &mut prepared {
                 for source in item.pending_sources.drain(..) {
                     source.complete();
                 }
-                None
-            };
+                item.retained_arrays.clear();
+                item.retained_host = None;
+            }
+            completion.map_err(|source| ResidencyError::Mlx {
+                id: internal_id(),
+                operation: "batched residency completion",
+                source,
+            })?;
+            0
+        };
+
+        let submitted_ids = prepared
+            .iter()
+            .map(|(id, _)| id.clone())
+            .collect::<Vec<_>>();
+        let mut retained = ResidentTransferResources {
+            sources: Vec::new(),
+            retained_arrays: Vec::new(),
+            retained_host: Vec::new(),
+        };
+
+        for (id, mut item) in prepared {
+            if return_transfer {
+                retained.sources.append(&mut item.pending_sources);
+                retained.retained_arrays.append(&mut item.retained_arrays);
+                if let Some(host) = item.retained_host.take() {
+                    retained.retained_host.push(host);
+                }
+            }
             let actual = arrays_nbytes(&item.arrays)?;
             let tick = next_tick(state)?;
             let copy = ResidentCopy {
                 arrays: Arc::new(ResidentArrays {
                     arrays: item.arrays,
                 }),
-                pending,
+                in_flight: return_transfer.then_some(generation),
                 bytes: actual,
                 pins: 0,
                 last_used: tick,
@@ -1870,7 +2032,13 @@ fn ensure_many_resident(
             }
         }
         update_resident_telemetry(state, tier);
-        Ok(created.clone())
+        let submitted = return_transfer.then_some(SubmittedResidentTransfer {
+            event,
+            retained,
+            ids: submitted_ids,
+            generation,
+        });
+        Ok((created.clone(), submitted))
     })();
 
     if result.is_err() && reserved > 0 {
@@ -1884,60 +2052,6 @@ fn ensure_many_resident(
         }
     }
     result
-}
-
-fn complete_existing_pending(
-    state: &mut ManagerState,
-    ids: &[OffloadUnitId],
-    tier: MemoryTier,
-    defer_evaluation: bool,
-    already_evaluated: bool,
-) -> Result<(), ResidencyError> {
-    if defer_evaluation {
-        return Ok(());
-    }
-    let pending = ids
-        .iter()
-        .filter_map(|id| state.units[id].copy(tier))
-        .filter_map(|copy| copy.pending.as_ref().map(Arc::clone))
-        .filter(|pending| pending.is_pending())
-        .collect::<Vec<_>>();
-    if pending.is_empty() {
-        return Ok(());
-    }
-    if !already_evaluated {
-        eval(ids.iter().flat_map(|id| {
-            state.units[id]
-                .copy(tier)
-                .into_iter()
-                .filter(|copy| {
-                    copy.pending
-                        .as_ref()
-                        .is_some_and(|pending| pending.is_pending())
-                })
-                .flat_map(|copy| copy.arrays.arrays.values())
-        }))
-        .map_err(|source| ResidencyError::Mlx {
-            id: internal_id(),
-            operation: "pending residency evaluation",
-            source,
-        })?;
-    }
-    for completion in pending {
-        completion.complete_after_evaluation()?;
-    }
-    for id in ids {
-        if let Some(copy) = state.units.get_mut(id).and_then(|unit| unit.copy_mut(tier)) {
-            if copy
-                .pending
-                .as_ref()
-                .is_some_and(|pending| !pending.is_pending())
-            {
-                copy.pending = None;
-            }
-        }
-    }
-    Ok(())
 }
 
 struct PreparedResidentArrays {
@@ -2178,6 +2292,15 @@ fn remove_copy(
     id: &OffloadUnitId,
     tier: MemoryTier,
 ) -> Result<(), ResidencyError> {
+    remove_copy_impl(state, id, tier, true)
+}
+
+fn remove_copy_impl(
+    state: &mut ManagerState,
+    id: &OffloadUnitId,
+    tier: MemoryTier,
+    record_eviction: bool,
+) -> Result<(), ResidencyError> {
     let bytes = state
         .units
         .get(id)
@@ -2196,7 +2319,9 @@ fn remove_copy(
     debug_assert_eq!(copy.bytes, bytes);
     set_tier_bytes(state, tier, total);
     update_resident_telemetry(state, tier);
-    state.telemetry.record_tier_eviction(tier, copy.bytes);
+    if record_eviction {
+        state.telemetry.record_tier_eviction(tier, copy.bytes);
+    }
     Ok(())
 }
 
@@ -2245,7 +2370,10 @@ fn next_tick(state: &mut ManagerState) -> Result<u64, ResidencyError> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Barrier};
+    use std::{
+        sync::{mpsc, Arc, Barrier},
+        time::Duration,
+    };
 
     use safemlx::{Device, DeviceType};
     use safetensors::tensor::{serialize_to_file, Dtype, TensorView};
@@ -2483,7 +2611,7 @@ mod tests {
     }
 
     #[test]
-    fn deferred_acquisition_stays_pending_until_dependent_output_completes() {
+    fn caller_owned_transfer_publishes_only_after_exact_completion() {
         let (_dir, store) = fixture_store();
         let manager = manager(
             store,
@@ -2493,30 +2621,42 @@ mod tests {
         );
         manager.initialize().unwrap();
 
-        let mut leases = manager
-            .acquire_many_deferred_with_demand(&[(id("a"), 2)], MemoryTier::Device)
+        let mut transfer = manager
+            .acquire_many_with_transfer(&[(id("a"), 2)], MemoryTier::Device)
             .unwrap();
-        let lease = leases.pop().unwrap();
+        let lease = &transfer.leases()[0];
         {
             let state = manager.lock().unwrap();
             let copy = state.units[&id("a")].device.as_ref().unwrap();
             assert_eq!(copy.pins, 1);
-            assert!(copy.pending.as_ref().unwrap().is_pending());
+            assert!(copy.in_flight.is_some());
         }
 
-        eval([lease.array("weight").unwrap()]).unwrap();
-        lease.complete_pending().unwrap();
+        let consumer = cpu_stream();
+        transfer.wait_on(&consumer).unwrap();
+        let dependent = lease
+            .array("weight")
+            .unwrap()
+            .add(Array::from_int(1), &consumer)
+            .unwrap();
+        eval([&dependent]).unwrap();
+        transfer.synchronize().unwrap();
         {
             let state = manager.lock().unwrap();
             let copy = state.units[&id("a")].device.as_ref().unwrap();
-            assert!(copy.pending.is_none());
+            assert!(copy.in_flight.is_none());
         }
-        drop(lease);
+        let ready = manager
+            .acquire_many_with_transfer(&[(id("a"), 1)], MemoryTier::Device)
+            .unwrap();
+        assert!(ready.is_complete().unwrap());
+        drop(ready);
+        drop(transfer);
         assert_eq!(state(&manager.report().unwrap(), "a").device_pins(), 0);
     }
 
     #[test]
-    fn synchronous_acquisition_completes_an_existing_pending_copy() {
+    fn empty_caller_owned_transfer_is_immediately_complete() {
         let (_dir, store) = fixture_store();
         let manager = manager(
             store,
@@ -2526,26 +2666,90 @@ mod tests {
         );
         manager.initialize().unwrap();
 
-        let deferred = manager
-            .acquire_many_deferred_with_demand(&[(id("a"), 1)], MemoryTier::Device)
+        let mut transfer = manager
+            .acquire_many_with_transfer(&[], MemoryTier::Device)
             .unwrap();
-        let synchronous = manager.acquire(&id("a"), MemoryTier::Device).unwrap();
-        assert_eq!(
-            synchronous
-                .array("weight")
-                .unwrap()
-                .evaluated()
-                .unwrap()
-                .as_slice::<i32>(),
-            &[1, 2]
+        assert!(transfer.is_empty());
+        assert!(transfer.is_complete().unwrap());
+        transfer.wait_on(&cpu_stream()).unwrap();
+        transfer.synchronize().unwrap();
+        assert!(!manager.is_resident(&id("a"), MemoryTier::Device).unwrap());
+    }
+
+    #[test]
+    fn dropping_transfer_retains_queued_consumer_and_publishes_copy() {
+        let (_dir, store) = fixture_store();
+        let manager = manager(
+            store,
+            OffloadConfig::new(Some(8), Some(0), 1).unwrap(),
+            [spec("a", 8, ResidencyPolicy::Cacheable, MemoryTier::Disk)],
+            [single("a", "a")],
         );
+        manager.initialize().unwrap();
+
+        let transfer = manager
+            .acquire_many_with_transfer(&[(id("a"), 1)], MemoryTier::Device)
+            .unwrap();
+        let consumer = cpu_stream();
+        transfer.wait_on(&consumer).unwrap();
+        let dependent = transfer.leases()[0]
+            .array("weight")
+            .unwrap()
+            .add(Array::from_int(1), &consumer)
+            .unwrap();
+        drop(transfer);
         assert!(manager.lock().unwrap().units[&id("a")]
             .device
             .as_ref()
             .unwrap()
-            .pending
+            .in_flight
             .is_none());
-        drop(deferred);
+        assert_eq!(dependent.evaluated().unwrap().as_slice::<i32>(), &[2, 3]);
+    }
+
+    #[test]
+    fn synchronous_acquisition_waits_for_caller_owned_transfer() {
+        let (_dir, store) = fixture_store();
+        let manager = manager(
+            store,
+            OffloadConfig::new(Some(8), Some(0), 1).unwrap(),
+            [spec("a", 8, ResidencyPolicy::Cacheable, MemoryTier::Disk)],
+            [single("a", "a")],
+        );
+        manager.initialize().unwrap();
+
+        let mut transfer = manager
+            .acquire_many_with_transfer(&[(id("a"), 1)], MemoryTier::Device)
+            .unwrap();
+        let waiting_manager = manager.clone();
+        let (sender, receiver) = mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            let result = waiting_manager
+                .acquire(&id("a"), MemoryTier::Device)
+                .map(|lease| {
+                    lease
+                        .array("weight")
+                        .unwrap()
+                        .evaluated()
+                        .unwrap()
+                        .as_slice::<i32>()
+                        .to_vec()
+                });
+            sender.send(result).unwrap();
+        });
+        assert!(matches!(
+            receiver.recv_timeout(Duration::from_millis(20)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+        transfer.synchronize().unwrap();
+        assert_eq!(
+            receiver
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap()
+                .unwrap(),
+            vec![1, 2]
+        );
+        waiter.join().unwrap();
     }
 
     #[test]

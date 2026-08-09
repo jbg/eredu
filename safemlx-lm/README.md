@@ -122,11 +122,12 @@ a lease when authoritative residency accounting is required.
 Ordinary `LayerwiseHost` prefetch and execution-window lookahead honor
 `OffloadConfig::prefetch_depth`, but run synchronously. Experimental dense disk
 streaming adds a bounded, joined CPU worker for disk-to-host layer warming.
-Device promotion remains on the ordered execution path because MLX does not
-expose the cross-stream events or fences needed for arbitrary transfer/compute
-overlap. Transfer, stall, eviction, current, and peak residency observations
-feed the offload telemetry, while mapped-shard and process page-fault
-diagnostics remain separate.
+Dense-stream device promotion uses SafeMLX completion events. A dedicated
+same-device transfer stream owns a fixed current-plus-next layer window; the
+compute stream waits only on the current layer's completion while the next
+transfer may proceed independently. Transfer, stall, eviction, current, and
+peak residency observations feed the offload telemetry, while mapped-shard and
+process page-fault diagnostics remain separate.
 
 `ResidentLayerGroup` adds named, deterministic ordered-unit preparation and
 explicit trimming even under an unlimited device budget. Independent groups
@@ -141,12 +142,15 @@ is released.
 
 `WeightResidency::dense_disk_stream(DenseDiskStreamLoadOptions)` keeps ordinary
 decoder and execution-stack layers disk planned and array-free at model load.
-Its device and host parameter budgets are always finite. Protected host and
-device lookahead depths are independent; older cacheable copies remain resident
-until deterministic LRU or LFU eviction is needed. A zero host budget is an
-explicit direct disk-to-device mode and requires zero host lookahead and queue
-capacity. The persistent `SafetensorsWeightStore` remains the canonical cold
-source and its mapped-shard cache stays independently bounded. GGUF uses the
+Its device and host parameter budgets are always finite. Device execution uses
+a fixed two-layer transfer window (or one layer for a one-unit execution
+group), so the device budget must hold the largest adjacent pair plus pinned
+static weights. Host lookahead remains configurable; older cacheable copies
+remain resident until deterministic LRU or LFU eviction is needed. A zero host
+budget is an explicit direct disk-to-device mode and requires zero host
+lookahead and queue capacity. The persistent `SafetensorsWeightStore` remains
+the canonical cold source and its mapped-shard cache stays independently
+bounded. GGUF uses the
 same policy and budget accounting through `GgufWeightStore`; checkpoint-native
 affine triples remain packed, outer-axis expert selections issue bounded payload
 reads, and the shard control also bounds cached GGUF readers.
@@ -187,8 +191,7 @@ stage alone owns final normalization and output projection weights.
 
 The `llama_residency` example accepts `--dense-disk-stream` together with
 `--stream-host-budget`, `--stream-device-budget`,
-`--stream-host-lookahead`, `--stream-device-lookahead`, and
-`--stream-queue-capacity`. It reports load-time residency, first-process and
+`--stream-host-lookahead`, and `--stream-queue-capacity`. It reports load-time residency, first-process and
 repeated-process prefill latency, decode latency, cache occupancy, logical
 transfers, queue waits, mappings, and available process page-fault samples.
 Those labels do not imply physically cold or warm storage, and the example
@@ -205,9 +208,10 @@ make discrete-memory capacity or performance claims.
 
 The `safemlx::memory` controls affect process-global MLX-managed allocations.
 They do not directly constrain process RSS, checkpoint mappings, or unrelated
-native allocations. The pinned MLX 0.32.0 C surface has whole-stream
-synchronization but no event/fence primitive, so residency execution uses
-conservative stream synchronization until an event-backed API is available.
+native allocations. SafeMLX's patched MLX 0.32.0 surface provides completion
+events. Immutable weight residency batches retain their source mappings in a
+caller-owned `ResidentTransfer`, and compatible consumer streams use an MLX
+event wait rather than a whole-stream handoff.
 
 ## Llama-compatible weight residency
 
@@ -1104,12 +1108,12 @@ formats. Dense families have no EP migration.
 
 The remaining global limitations are:
 
-- Host-to-device promotion and route inspection remain synchronous. The pinned
-  MLX 0.32.0 C surface exposes whole-stream synchronization and asynchronous
-  evaluation, but no public completion event that can be recorded on one
-  stream and awaited by another. Background disk-to-host warming is bounded;
-  device promotion cannot yet overlap computation through GPU-ordered
-  residency leases.
+- Route inspection remains a necessary host synchronization. Dense layerwise
+  and pipeline execution now use a dedicated transfer stream and a two-layer
+  completion-lease window, allowing the next weight transfer to overlap current
+  layer computation. Background disk-to-host warming remains bounded and may
+  still stall demand. Expert prefetch, paged-cache transfers, MTP handoff, and
+  broader activation double buffering have not adopted this scheduler.
 - Load-time affine/MXFP4 conversion applies to semantically eligible grouped
   matrix projections. Convolution kernels, normalization vectors, position
   tables, and projection geometries that do not meet the selected group and

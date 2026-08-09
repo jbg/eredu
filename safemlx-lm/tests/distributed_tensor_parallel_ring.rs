@@ -101,7 +101,7 @@ impl TensorParameterResidency {
             }
             Self::FullyResident => LayerWeightResidency::FullyResident,
             Self::DenseDiskStream => LayerWeightResidency::DenseDiskStream(
-                DenseDiskStreamLoadOptions::new(u64::MAX, u64::MAX, 1, 1, 1).unwrap(),
+                DenseDiskStreamLoadOptions::new(u64::MAX, u64::MAX, 1, 1).unwrap(),
             ),
         }
     }

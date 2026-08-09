@@ -86,9 +86,9 @@ use crate::{
     runtime::execution::inspection::ActivationObserver,
     runtime::execution::layerwise::{
         open_safetensors_weight_store, quantize_pipeline_stage_store, shard_layer_bindings,
-        ArchitectureAdapter, DenseDiskStreamReport, DenseStreamController, LayerWeightResidency,
-        LayerwiseLoadOptions, LoadTimeQuantizableAdapter, PipelineStageQuantizationSelection,
-        SharedWeightStore, StaticUnitBindings,
+        ArchitectureAdapter, DenseDiskStreamReport, DenseStreamController, DenseTransferWindow,
+        LayerWeightResidency, LayerwiseLoadOptions, LoadTimeQuantizableAdapter,
+        PipelineStageQuantizationSelection, SharedWeightStore, StaticUnitBindings,
     },
     runtime::generation::{
         embedded_mtp::{DistributedEmbeddedMtpSampler, EmbeddedMtpOutput, EmbeddedMtpTarget},
@@ -96,6 +96,7 @@ use crate::{
         speculative::{MtpCapability, MtpCheckpointKind, MtpConfig, MtpStats},
     },
     runtime::media::{PreparedModelInput, PreparedModelInputIdentity},
+    runtime::residency::dense_stream::DENSE_TRANSFER_WINDOW,
     runtime::residency::expert_cache::{
         ExpertCache, ExpertCacheLoadOptions, ExpertCacheReport, ExpertCatalogEntry, ExpertPass,
     },
@@ -1729,31 +1730,17 @@ impl PipelineLayerStorage {
         self.independent_expert_prefix = Some(parameter_prefix);
         self
     }
-    fn prepare(
+    fn prepare_layerwise(
         &self,
         local_index: usize,
-        prefill: bool,
-    ) -> Result<
-        (
-            Option<crate::runtime::residency::manager::ResidentUnitLease>,
-            crate::runtime::residency::manager::ResidentUnitLease,
-        ),
-        Error,
-    > {
-        self.prepare_absolute(self.execution_offset + local_index, prefill)
+    ) -> Result<crate::runtime::residency::manager::ResidentUnitLease, Error> {
+        self.prepare_layerwise_absolute(self.execution_offset + local_index)
     }
 
-    fn prepare_absolute(
+    fn prepare_layerwise_absolute(
         &self,
         unit_index: usize,
-        prefill: bool,
-    ) -> Result<
-        (
-            Option<crate::runtime::residency::manager::ResidentUnitLease>,
-            crate::runtime::residency::manager::ResidentUnitLease,
-        ),
-        Error,
-    > {
+    ) -> Result<crate::runtime::residency::manager::ResidentUnitLease, Error> {
         if unit_index >= self.units.len() {
             return Err(Error::Parallel(format!(
                 "pipeline unit index {unit_index} exceeds {} planned units",
@@ -1763,19 +1750,32 @@ impl PipelineLayerStorage {
         match &self.controller {
             PipelineLayerController::LayerwiseHost(group) => {
                 group.prepare(&self.residency, unit_index)?;
-                Ok((
-                    None,
-                    self.residency
-                        .acquire(&self.units[unit_index], MemoryTier::Device)?,
-                ))
+                Ok(self
+                    .residency
+                    .acquire(&self.units[unit_index], MemoryTier::Device)?)
             }
-            PipelineLayerController::DenseDiskStream(controller) => controller.prepare(
-                &self.residency,
-                "pipeline_stage",
-                &self.units,
-                unit_index,
-                prefill,
-            ),
+            PipelineLayerController::DenseDiskStream(_) => Err(Error::Parallel(
+                "dense pipeline layers require a caller-owned transfer window".into(),
+            )),
+        }
+    }
+
+    fn transfer_window(
+        &self,
+        indices: impl IntoIterator<Item = usize>,
+        prefill: bool,
+    ) -> Result<Option<DenseTransferWindow<'_>>, Error> {
+        match &self.controller {
+            PipelineLayerController::LayerwiseHost(_) => Ok(None),
+            PipelineLayerController::DenseDiskStream(controller) => controller
+                .transfer_window(
+                    &self.residency,
+                    "pipeline_stage",
+                    &self.units,
+                    indices,
+                    prefill,
+                )
+                .map(Some),
         }
     }
 
@@ -1924,9 +1924,43 @@ where
             Some(controller.group_guard(&layers.residency, "pipeline_stage"))
         }
     });
+    let mut transfer_window = dense_layers
+        .map(|layers| {
+            let start = layers.execution_offset;
+            layers.transfer_window(start..start + range.len(), prefill)
+        })
+        .transpose()?
+        .flatten();
     for (local_index, (global_layer, cache)) in range.zip(caches.iter_mut()).enumerate() {
-        if let Some(dense) = dense_layers {
-            let (_host, lease) = dense.prepare(local_index, prefill)?;
+        if let Some(window) = &mut transfer_window {
+            let transfer = window.next(stream)?;
+            debug_assert_eq!(
+                transfer.index(),
+                local_index + dense_layers.unwrap().execution_offset
+            );
+            let mut layer = new_layer(global_layer, stream)?;
+            if let Some(prefix) = dense_layers.unwrap().independent_expert_prefix {
+                crate::runtime::checkpoint::binding::populate_module_from_lease_excluding(
+                    &mut layer,
+                    transfer.lease(),
+                    |name| name.starts_with(prefix),
+                )?;
+            } else {
+                populate_module_from_lease(&mut layer, transfer.lease())?;
+            }
+            let forwarded = forward_layer(global_layer, &mut layer, &hidden, cache, stream)?
+                .into_pipeline_layer_forward();
+            hidden = forwarded.hidden;
+            eval(
+                std::iter::once(&hidden)
+                    .chain(cache.retained_arrays())
+                    .chain(forwarded.retained.iter()),
+            )?;
+            stream.synchronize()?;
+            drop(transfer);
+            window.refill()?;
+        } else if let Some(dense) = dense_layers {
+            let lease = dense.prepare_layerwise(local_index)?;
             let mut layer = new_layer(global_layer, stream)?;
             if let Some(prefix) = dense.independent_expert_prefix {
                 crate::runtime::checkpoint::binding::populate_module_from_lease_excluding(
@@ -5877,7 +5911,7 @@ where
         PipelineLayerLoadOptions::LayerwiseHost(options) => options.offload.prefetch_depth(),
         PipelineLayerLoadOptions::DenseDiskStream(options) => {
             options.validate()?;
-            options.device_lookahead
+            layer_count.min(DENSE_TRANSFER_WINDOW)
         }
     };
     if device_depth == 0 || device_depth > layer_count {
@@ -5986,18 +6020,23 @@ where
             OffloadConfig::new(
                 Some(device_layer_budget),
                 Some(options.host_budget_bytes),
-                options.host_lookahead.max(options.device_lookahead),
+                options.host_lookahead.max(DENSE_TRANSFER_WINDOW),
             )?
             .with_eviction_policy(options.eviction_policy)
         }
     };
     let plan = OffloadPlan::new(config, specs)?;
+    let residency_stream = if matches!(options, PipelineLayerLoadOptions::DenseDiskStream(_)) {
+        Stream::new_with_device(&stream.get_device()?)
+    } else {
+        stream.clone()
+    };
     let residency = ResidencyManager::new_shared(
         Arc::clone(&store),
         plan,
         definitions,
         weights_stream.clone(),
-        stream.clone(),
+        residency_stream,
     )?;
     residency.initialize()?;
     let (sample_mlx_memory, sample_process_memory) = match options {
@@ -14489,10 +14528,24 @@ impl QwenHybridStage {
                     Some(controller.group_guard(&layers.residency, "pipeline_stage"))
                 }
             });
+        let mut transfer_window = self
+            .dense_layers
+            .as_ref()
+            .map(|storage| storage.transfer_window(active_indices.iter().copied(), prefill))
+            .transpose()?
+            .flatten();
         for ordinal in active_indices {
             let unit = self.media_units[ordinal];
             let retained = if let Some(storage) = self.dense_layers.as_ref() {
-                let (_host, lease) = storage.prepare_absolute(ordinal, prefill)?;
+                let transfer = transfer_window
+                    .as_mut()
+                    .map(|window| window.next(stream))
+                    .transpose()?;
+                let lease = if transfer.is_none() {
+                    Some(storage.prepare_layerwise_absolute(ordinal)?)
+                } else {
+                    None
+                };
                 let mut layer = self.layer_adapter.new_cartesian_layer(
                     unit.group,
                     unit.index,
@@ -14500,11 +14553,26 @@ impl QwenHybridStage {
                     self.expert_assignment.as_ref(),
                     stream,
                 )?;
-                populate_module_from_lease(&mut layer, &lease)?;
+                populate_module_from_lease(
+                    &mut layer,
+                    transfer
+                        .as_ref()
+                        .map(|transfer| transfer.lease())
+                        .or(lease.as_ref())
+                        .expect("pipeline storage provides a residency lease"),
+                )?;
                 let retained = self.layer_adapter.forward_pipeline_media_layer(
                     unit.group, unit.index, &mut layer, &mut state, execution, stream,
                 )?;
-                storage.trim_after_absolute(ordinal)?;
+                eval(retained.iter())?;
+                stream.synchronize()?;
+                drop(transfer);
+                drop(lease);
+                if let Some(window) = &mut transfer_window {
+                    window.refill()?;
+                } else {
+                    storage.trim_after_absolute(ordinal)?;
+                }
                 retained
             } else {
                 let layer = self.media_layers.get_mut(ordinal).ok_or_else(|| {
@@ -14516,9 +14584,8 @@ impl QwenHybridStage {
                     unit.group, unit.index, layer, &mut state, execution, stream,
                 )?
             };
-            eval(retained.iter())?;
-            if self.dense_layers.is_some() {
-                stream.synchronize()?;
+            if self.dense_layers.is_none() {
+                eval(retained.iter())?;
             }
         }
         if let Some(storage) = self.dense_layers.as_ref() {
@@ -16915,10 +16982,24 @@ impl InklingStage {
                     Some(controller.group_guard(&layers.residency, "pipeline_stage"))
                 }
             });
+        let mut transfer_window = self
+            .dense_layers
+            .as_ref()
+            .map(|storage| storage.transfer_window(active_indices.iter().copied(), prefill))
+            .transpose()?
+            .flatten();
         for ordinal in active_indices {
             let unit = self.media_units[ordinal];
             let retained = if let Some(storage) = self.dense_layers.as_ref() {
-                let (_host, lease) = storage.prepare_absolute(ordinal, prefill)?;
+                let transfer = transfer_window
+                    .as_mut()
+                    .map(|window| window.next(stream))
+                    .transpose()?;
+                let lease = if transfer.is_none() {
+                    Some(storage.prepare_layerwise_absolute(ordinal)?)
+                } else {
+                    None
+                };
                 let mut layer = self.layer_adapter.new_cartesian_layer(
                     unit.group,
                     unit.index,
@@ -16926,11 +17007,26 @@ impl InklingStage {
                     self.expert_assignment.as_ref(),
                     stream,
                 )?;
-                populate_module_from_lease(&mut layer, &lease)?;
+                populate_module_from_lease(
+                    &mut layer,
+                    transfer
+                        .as_ref()
+                        .map(|transfer| transfer.lease())
+                        .or(lease.as_ref())
+                        .expect("pipeline storage provides a residency lease"),
+                )?;
                 let retained = self.layer_adapter.forward_pipeline_media_layer(
                     unit.group, unit.index, &mut layer, &mut state, execution, stream,
                 )?;
-                storage.trim_after_absolute(ordinal)?;
+                eval(retained.iter())?;
+                stream.synchronize()?;
+                drop(transfer);
+                drop(lease);
+                if let Some(window) = &mut transfer_window {
+                    window.refill()?;
+                } else {
+                    storage.trim_after_absolute(ordinal)?;
+                }
                 retained
             } else {
                 let layer = self.media_layers.get_mut(ordinal).ok_or_else(|| {
@@ -16942,9 +17038,8 @@ impl InklingStage {
                     unit.group, unit.index, layer, &mut state, execution, stream,
                 )?
             };
-            eval(retained.iter())?;
-            if self.dense_layers.is_some() {
-                stream.synchronize()?;
+            if self.dense_layers.is_none() {
+                eval(retained.iter())?;
             }
         }
         if let Some(storage) = self.dense_layers.as_ref() {
@@ -18504,10 +18599,24 @@ impl GemmaStage {
                     Some(controller.group_guard(&layers.residency, "pipeline_stage"))
                 }
             });
+        let mut transfer_window = self
+            .dense_layers
+            .as_ref()
+            .map(|storage| storage.transfer_window(active_indices.iter().copied(), prefill))
+            .transpose()?
+            .flatten();
         for ordinal in active_indices {
             let unit = self.media_units[ordinal];
             let retained = if let Some(storage) = self.dense_layers.as_ref() {
-                let (_host, lease) = storage.prepare_absolute(ordinal, prefill)?;
+                let transfer = transfer_window
+                    .as_mut()
+                    .map(|window| window.next(stream))
+                    .transpose()?;
+                let lease = if transfer.is_none() {
+                    Some(storage.prepare_layerwise_absolute(ordinal)?)
+                } else {
+                    None
+                };
                 let mut layer = match self.parallel_layout.as_ref() {
                     Some(layout) => self
                         .layer_adapter
@@ -18516,11 +18625,26 @@ impl GemmaStage {
                         .layer_adapter
                         .new_layer(unit.group, unit.index, stream)?,
                 };
-                populate_module_from_lease(&mut layer, &lease)?;
+                populate_module_from_lease(
+                    &mut layer,
+                    transfer
+                        .as_ref()
+                        .map(|transfer| transfer.lease())
+                        .or(lease.as_ref())
+                        .expect("pipeline storage provides a residency lease"),
+                )?;
                 let retained = self.layer_adapter.forward_pipeline_media_layer(
                     unit.group, unit.index, &mut layer, &mut state, execution, stream,
                 )?;
-                storage.trim_after_absolute(ordinal)?;
+                eval(retained.iter())?;
+                stream.synchronize()?;
+                drop(transfer);
+                drop(lease);
+                if let Some(window) = &mut transfer_window {
+                    window.refill()?;
+                } else {
+                    storage.trim_after_absolute(ordinal)?;
+                }
                 retained
             } else {
                 let layer = self.media_layers.get_mut(ordinal).ok_or_else(|| {
@@ -18532,9 +18656,8 @@ impl GemmaStage {
                     unit.group, unit.index, layer, &mut state, execution, stream,
                 )?
             };
-            eval(retained.iter())?;
-            if self.dense_layers.is_some() {
-                stream.synchronize()?;
+            if self.dense_layers.is_none() {
+                eval(retained.iter())?;
             }
         }
         if let Some(storage) = self.dense_layers.as_ref() {
@@ -20244,7 +20367,15 @@ mod tests {
                 Some(controller.group_guard(&dense.residency, "pipeline_stage")),
             ),
         };
-        let (_host, lease) = dense.prepare(0, true).unwrap();
+        let mut window = dense.transfer_window(0..1, true).unwrap();
+        let transfer = window
+            .as_mut()
+            .map(|window| window.next(stream))
+            .transpose()
+            .unwrap();
+        let lease = transfer
+            .is_none()
+            .then(|| dense.prepare_layerwise(0).unwrap());
         let mut streamed = adapter
             .new_cartesian_layer(
                 0,
@@ -20254,10 +20385,23 @@ mod tests {
                 stream,
             )
             .unwrap();
-        populate_module_from_lease(&mut streamed, &lease).unwrap();
+        populate_module_from_lease(
+            &mut streamed,
+            transfer
+                .as_ref()
+                .map(|transfer| transfer.lease())
+                .or(lease.as_ref())
+                .unwrap(),
+        )
+        .unwrap();
         assert_module_parameter_parity(&resident, &streamed);
+        drop(transfer);
         drop(lease);
-        dense.trim_after(0).unwrap();
+        if let Some(window) = &mut window {
+            window.refill().unwrap();
+        } else {
+            dense.trim_after(0).unwrap();
+        }
         if let Some(group) = group {
             group.complete().unwrap();
         }
@@ -20391,7 +20535,6 @@ mod tests {
         crate::runtime::residency::dense_stream::DenseDiskStreamLoadOptions::new(
             u64::MAX,
             u64::MAX,
-            1,
             1,
             1,
         )
@@ -23445,7 +23588,6 @@ mod tests {
                 u64::MAX,
                 1,
                 1,
-                1,
             )
             .unwrap()
         };
@@ -23661,7 +23803,6 @@ mod tests {
                 crate::runtime::residency::dense_stream::DenseDiskStreamLoadOptions::new(
                     u64::MAX,
                     u64::MAX,
-                    1,
                     1,
                     1,
                 )
@@ -24144,7 +24285,6 @@ mod tests {
                         u64::MAX,
                         1,
                         1,
-                        1,
                     )
                     .unwrap(),
                 ),
@@ -24169,7 +24309,6 @@ mod tests {
             host_budget_bytes,
             1,
             1,
-            1,
         )
         .unwrap();
         options.sample_mlx_memory = true;
@@ -24190,7 +24329,6 @@ mod tests {
         let mut dense = crate::runtime::residency::dense_stream::DenseDiskStreamLoadOptions::new(
             u64::MAX,
             u64::MAX,
-            1,
             1,
             1,
         )
@@ -24274,6 +24412,7 @@ mod tests {
             assert_eq!(layers[0].planned_tier(), MemoryTier::Disk);
             assert!(!layers[0].host_resident());
             assert!(!layers[0].device_resident());
+            assert_ne!(report.transfer_stream_index(), stream.get_index().unwrap());
             assert!(report.residency().offload().mlx_memory().is_none());
             assert!(!report.residency().offload().process_sampled());
         }
@@ -24842,7 +24981,6 @@ mod tests {
         let dense = crate::runtime::residency::dense_stream::DenseDiskStreamLoadOptions::new(
             u64::MAX,
             u64::MAX,
-            1,
             1,
             1,
         )

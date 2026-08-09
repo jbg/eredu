@@ -49,9 +49,6 @@ struct Args {
     /// Protected host-layer lookahead for dense disk streaming.
     #[arg(long, default_value_t = 2)]
     stream_host_lookahead: usize,
-    /// Protected device-layer lookahead for dense disk streaming.
-    #[arg(long, default_value_t = 1)]
-    stream_device_lookahead: usize,
     /// Bounded background host-prefetch queue capacity.
     #[arg(long, default_value_t = 2)]
     stream_queue_capacity: usize,
@@ -79,7 +76,6 @@ fn main() -> anyhow::Result<()> {
             args.stream_device_budget,
             args.stream_host_budget,
             args.stream_host_lookahead,
-            args.stream_device_lookahead,
             args.stream_queue_capacity,
         )?;
         dense.max_mapped_shards = args.mapped_shards;

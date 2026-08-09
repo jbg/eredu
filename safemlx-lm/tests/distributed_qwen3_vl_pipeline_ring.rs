@@ -488,7 +488,7 @@ fn qwen3_vl_pipeline_ring_worker() {
     let residency = if expert_cache {
         let non_expert = if streamed {
             NonExpertWeightResidency::DenseDiskStream(
-                DenseDiskStreamLoadOptions::new(u64::MAX, u64::MAX, 1, 1, 1).unwrap(),
+                DenseDiskStreamLoadOptions::new(u64::MAX, u64::MAX, 1, 1).unwrap(),
             )
         } else if layerwise_host {
             NonExpertWeightResidency::LayerwiseHost(LayerwiseLoadOptions::new(
@@ -500,7 +500,7 @@ fn qwen3_vl_pipeline_ring_worker() {
         WeightResidency::with_expert_cache(non_expert, ExpertCacheLoadOptions::default())
     } else if streamed {
         WeightResidency::dense_disk_stream(
-            DenseDiskStreamLoadOptions::new(u64::MAX, u64::MAX, 1, 1, 1).unwrap(),
+            DenseDiskStreamLoadOptions::new(u64::MAX, u64::MAX, 1, 1).unwrap(),
         )
     } else if layerwise_host {
         WeightResidency::layerwise_host(LayerwiseLoadOptions::new(

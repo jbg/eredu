@@ -2665,7 +2665,7 @@ mod tests {
             eager::load_qwen3_vl_model(dir.path(), gpu.stream(), cpu.stream()).unwrap();
         let options = if dense_stream {
             LayerWeightResidency::DenseDiskStream(
-                DenseDiskStreamLoadOptions::new(u64::MAX, u64::MAX, depth, depth, depth).unwrap(),
+                DenseDiskStreamLoadOptions::new(u64::MAX, u64::MAX, depth, depth).unwrap(),
             )
         } else {
             LayerWeightResidency::LayerwiseHost(LayerwiseLoadOptions::new(
@@ -2787,7 +2787,7 @@ mod tests {
             ParallelTopology::from_rank(1, 0, 1, 1, 1, DeviceAssignment::new(DeviceType::Gpu, 0))
                 .unwrap();
         let build = ParallelBuildContext::new(topology, ShardingPolicy::Require);
-        let options = DenseDiskStreamLoadOptions::new(u64::MAX, u64::MAX, 1, 1, 1).unwrap();
+        let options = DenseDiskStreamLoadOptions::new(u64::MAX, u64::MAX, 1, 1).unwrap();
         let model = load_qwen3_vl_tensor_parallel_layerwise_model(
             dir.path(),
             LayerWeightResidency::DenseDiskStream(options),
