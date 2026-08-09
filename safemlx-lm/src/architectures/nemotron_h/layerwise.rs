@@ -44,8 +44,8 @@ use crate::{
         build_module_bindings_with_recipes, canonical_checkpoint_name, populate_module_from_lease,
         populate_module_from_lease_excluding,
     },
-    runtime::checkpoint::recipe::DerivedWeightRecipe,
     runtime::checkpoint::store::{GgufWeightStore, TensorSelection, WeightStore},
+    runtime::checkpoint::{quantization::WeightQuantization, recipe::DerivedWeightRecipe},
     runtime::distributed::parallel::{
         aligned_partition_units, array_parameter_member, partitioned_projection_members,
         register_partitioned_projection_group, register_replicated_module, MemberSharding,
@@ -55,8 +55,8 @@ use crate::{
     runtime::execution::layerwise::{
         load_layerwise_model, load_safetensors_layerwise_model,
         load_tensor_parallel_layerwise_model, open_safetensors_weight_store, ArchitectureAdapter,
-        LayerWeightResidency, LayerwiseForwardState, LayerwiseModel, StaticUnitBindings,
-        WeightResidency,
+        LayerWeightResidency, LayerwiseForwardState, LayerwiseModel, LoadTimeQuantizableAdapter,
+        StaticUnitBindings, WeightResidency,
     },
     runtime::residency::expert_cache::{
         ExpertCache, ExpertCacheLoadOptions, ExpertCacheReport, ExpertCatalogEntry, ExpertIdentity,
@@ -1110,6 +1110,27 @@ impl KeyValueCache for OffsetOnlyCache {
     }
 }
 
+impl LoadTimeQuantizableAdapter for NemotronHLayerwiseAdapter {
+    fn load_time_quantized(
+        &self,
+        quantization: WeightQuantization,
+        stream: &Stream,
+    ) -> Result<Self, Error> {
+        let WeightQuantization::Affine(affine) = quantization else {
+            return Err(Error::Quantization(format!(
+                "Nemotron-H routed ReLU2 experts support affine load-time quantization, not {quantization:?}"
+            )));
+        };
+        let mut args = self.args.clone();
+        args.quantization = Some(affine);
+        args.quantized_weights = None;
+        args.quantized_weight_configs = None;
+        let mut adapter = Self::new(args, stream)?;
+        adapter.sparse_expert_cache = self.sparse_expert_cache;
+        Ok(adapter)
+    }
+}
+
 impl ArchitectureAdapter for NemotronHLayerwiseAdapter {
     type Input<'a> = &'a Array;
     type Cache = Cache;
@@ -1118,6 +1139,10 @@ impl ArchitectureAdapter for NemotronHLayerwiseAdapter {
 
     fn model_type(&self) -> &str {
         &self.args.model_type
+    }
+
+    fn quantization(&self) -> Option<WeightQuantization> {
+        self.args.quantization.map(Into::into)
     }
 
     fn prompt_cache_model_identity(
@@ -2012,7 +2037,7 @@ mod tests {
     use safemlx::{
         module::ModuleParameters,
         ops::{indexing::TryIndexOp, ones_dtype, zeros_dtype},
-        Array, Device, DeviceType, ExecutionContext, Stream,
+        Array, Device, DeviceType, Dtype, ExecutionContext, Stream,
     };
 
     use super::{
@@ -2027,7 +2052,7 @@ mod tests {
         runtime::residency::policy::{OffloadConfig, ResidencyPolicy},
         runtime::{
             cache::KeyValueCache,
-            checkpoint::quantization::AffineQuantization,
+            checkpoint::quantization::{AffineQuantization, WeightQuantization},
             distributed::{
                 parallel::{ParallelBuildContext, ShardingPolicy},
                 topology::{DeviceAssignment, ParallelTopology},
@@ -2067,6 +2092,63 @@ mod tests {
 
     fn args() -> ModelArgs {
         resident::model_args_from_config_value(&config()).unwrap()
+    }
+
+    #[test]
+    #[ignore = "requires an MLX Metal device"]
+    fn load_time_adapter_packs_every_operator_and_preserves_external_experts() {
+        use crate::runtime::execution::layerwise::LoadTimeQuantizableAdapter;
+
+        let execution = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        let mut value = config();
+        value["vocab_size"] = 64.into();
+        value["hidden_size"] = 32.into();
+        value["intermediate_size"] = 32.into();
+        value["num_attention_heads"] = 4.into();
+        value["num_key_value_heads"] = 2.into();
+        value["head_dim"] = 8.into();
+        value["mamba_num_heads"] = 4.into();
+        value["mamba_head_dim"] = 8.into();
+        value["n_groups"] = 2.into();
+        value["moe_intermediate_size"] = 32.into();
+        value["moe_shared_expert_intermediate_size"] = 32.into();
+        let mut args = resident::model_args_from_config_value(&value).unwrap();
+        args.quantized_weight_configs = Some(HashMap::from([(
+            "model.layers.1.mlp.down_proj.weight".into(),
+            WeightQuantization::MxFp4,
+        )]));
+        let source =
+            NemotronHLayerwiseAdapter::new_external_experts(args, execution.stream()).unwrap();
+        let affine = AffineQuantization::new(32, 4).unwrap();
+        let target = source
+            .load_time_quantized(affine.into(), execution.stream())
+            .unwrap();
+
+        assert_eq!(target.quantization(), Some(affine.into()));
+        assert_eq!(target.args.quantization, Some(affine));
+        assert!(target.args.quantized_weights.is_none());
+        assert!(target.args.quantized_weight_configs.is_none());
+        assert!(target.sparse_expert_cache);
+        for index in 0..4 {
+            let layer = target.new_layer(0, index, execution.stream()).unwrap();
+            assert!(
+                layer
+                    .parameters()
+                    .flatten()
+                    .values()
+                    .any(|parameter| parameter.dtype() == Dtype::Uint32),
+                "Nemotron-H layer {index} has no packed matrix"
+            );
+        }
+
+        let error = source
+            .load_time_quantized(WeightQuantization::MxFp4, execution.stream())
+            .err()
+            .expect("Nemotron-H MXFP4 target must fail before materialization");
+        assert!(
+            error.to_string().contains("routed ReLU2 experts"),
+            "{error}"
+        );
     }
 
     fn output_width_for_test(

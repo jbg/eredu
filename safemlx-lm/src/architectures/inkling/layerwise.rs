@@ -42,13 +42,13 @@ use crate::{
         build_module_bindings_with_recipes, populate_module_from_lease,
         populate_module_from_lease_excluding,
     },
-    runtime::checkpoint::recipe::DerivedWeightRecipe,
     runtime::checkpoint::store::{GgufWeightStore, TensorSelection, WeightStore},
+    runtime::checkpoint::{quantization::WeightQuantization, recipe::DerivedWeightRecipe},
     runtime::execution::layerwise::{
         load_layerwise_model, load_safetensors_layerwise_model,
         load_tensor_parallel_layerwise_model, open_safetensors_weight_store, ArchitectureAdapter,
         ExecutionGroupDag, LayerWeightResidency, LayerwiseForwardState, LayerwiseModel,
-        StaticUnitBindings, WeightResidency,
+        LoadTimeQuantizableAdapter, StaticUnitBindings, WeightResidency,
     },
     runtime::residency::expert_cache::{
         AcquiredExperts, ExpertCache, ExpertCacheError, ExpertCacheLoadOptions, ExpertCacheReport,
@@ -1305,6 +1305,21 @@ fn inkling_w13_recipe(
     }))
 }
 
+impl LoadTimeQuantizableAdapter for InklingLayerwiseAdapter {
+    fn load_time_quantized(
+        &self,
+        quantization: WeightQuantization,
+        stream: &Stream,
+    ) -> Result<Self, Error> {
+        let mut args = self.args.clone();
+        args.text_config.weight_quantization = Some(quantization);
+        args.text_config.quantized_weight_configs = None;
+        let mut adapter = Self::new(args, stream)?;
+        adapter.sparse_expert_cache = self.sparse_expert_cache;
+        Ok(adapter)
+    }
+}
+
 impl ArchitectureAdapter for InklingLayerwiseAdapter {
     type Input<'a> = InklingExecutionInput<'a>;
     type Cache = Cache;
@@ -1313,6 +1328,18 @@ impl ArchitectureAdapter for InklingLayerwiseAdapter {
 
     fn model_type(&self) -> &str {
         &self.args.model_type
+    }
+
+    fn quantization(&self) -> Option<WeightQuantization> {
+        self.args.text_config.weight_quantization
+    }
+
+    fn quantizes_static_binding(&self, binding: &WeightBinding) -> bool {
+        let target = binding.logical_target().unwrap_or(binding.checkpoint_key());
+        !target.starts_with("visual.")
+            && !target.contains(".visual.")
+            && !target.starts_with("audio.")
+            && !target.contains(".audio.")
     }
 
     fn prompt_cache_model_identity(
@@ -2871,7 +2898,7 @@ mod tests {
 
     use super::{
         load_inkling_expert_cache_model, load_inkling_layerwise_model,
-        load_inkling_tensor_parallel_layerwise_model, InklingLayerwiseAdapter,
+        load_inkling_tensor_parallel_layerwise_model, InklingLayer, InklingLayerwiseAdapter,
     };
     use crate::{
         api::{
@@ -2880,13 +2907,14 @@ mod tests {
             input as runtime_input,
         },
         runtime::cache::KeyValueCache,
-        runtime::checkpoint::quantization::AffineQuantization,
+        runtime::checkpoint::quantization::{AffineQuantization, WeightQuantization},
         runtime::distributed::{
             parallel::{ParallelBuildContext, ShardingPolicy},
             topology::{DeviceAssignment, ParallelTopology},
         },
         runtime::execution::layerwise::{
             ArchitectureAdapter, LayerWeightResidency, LayerwiseLoadOptions,
+            LoadTimeQuantizableAdapter,
         },
         runtime::residency::dense_stream::DenseDiskStreamLoadOptions,
         runtime::residency::expert_cache::ExpertCacheLoadOptions,
@@ -2941,6 +2969,104 @@ mod tests {
 
     fn args() -> ModelArgs {
         resident::model_args_from_config_value(&config()).unwrap()
+    }
+
+    #[test]
+    #[ignore = "requires an MLX Metal device"]
+    fn load_time_adapter_packs_text_and_preserves_media_and_external_experts() {
+        let execution = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        let mut value = config();
+        value["text_config"]["hidden_size"] = 32.into();
+        value["text_config"]["vocab_size"] = 64.into();
+        value["text_config"]["num_attention_heads"] = 4.into();
+        value["text_config"]["num_key_value_heads"] = 2.into();
+        value["text_config"]["head_dim"] = 8.into();
+        value["text_config"]["swa_num_attention_heads"] = 4.into();
+        value["text_config"]["swa_num_key_value_heads"] = 2.into();
+        value["text_config"]["swa_head_dim"] = 8.into();
+        value["text_config"]["intermediate_size"] = 32.into();
+        value["text_config"]["dense_intermediate_size"] = 32.into();
+        value["text_config"]["moe_intermediate_size"] = 32.into();
+        value["vision_config"] = serde_json::json!({
+            "decoder_dmodel": 32,
+            "patch_size": 40,
+            "temporal_patch_size": 2,
+            "n_channels": 3,
+            "n_layers": 4
+        });
+        value["audio_config"] = serde_json::json!({
+            "text_hidden_size": 32,
+            "num_codebooks": 2,
+            "codebook_size": 8,
+            "bias": false,
+            "use_audio_norm": true,
+            "audio_mode": "dmel",
+            "rms_norm_eps": 1e-6
+        });
+        let mut args = resident::model_args_from_config_value(&value).unwrap();
+        args.text_config.quantized_weight_configs = Some(HashMap::from([(
+            "model.layers.0.dense.down_proj.weight".into(),
+            WeightQuantization::MxFp4,
+        )]));
+        let source =
+            InklingLayerwiseAdapter::new_external_experts(args, execution.stream()).unwrap();
+        let quantization = AffineQuantization::new(32, 4).unwrap().into();
+        let target = source
+            .load_time_quantized(quantization, execution.stream())
+            .unwrap();
+
+        assert_eq!(target.quantization(), Some(quantization));
+        assert_eq!(
+            target.args.text_config.weight_quantization,
+            Some(quantization)
+        );
+        assert!(target.args.text_config.quantized_weight_configs.is_none());
+        assert!(target.sparse_expert_cache);
+        assert!(target.audio.is_some());
+        assert_eq!(target.vision_depth, 4);
+        assert!(matches!(
+            target.embedding,
+            safemlx::quantization::MaybeQuantized::Quantized(_)
+        ));
+        assert!(target
+            .audio
+            .as_ref()
+            .unwrap()
+            .parameters()
+            .flatten()
+            .values()
+            .all(|parameter| parameter.dtype() != Dtype::Uint32));
+
+        let InklingLayer::Text(text) = target.new_layer(1, 0, execution.stream()).unwrap() else {
+            panic!("Inkling decoder group must build a text layer")
+        };
+        assert!(text
+            .parameters()
+            .flatten()
+            .values()
+            .any(|parameter| parameter.dtype() == Dtype::Uint32));
+        let InklingLayer::Vision(vision) = target.new_layer(0, 0, execution.stream()).unwrap()
+        else {
+            panic!("Inkling vision group must build a vision layer")
+        };
+        assert!(vision
+            .parameters()
+            .flatten()
+            .values()
+            .all(|parameter| parameter.dtype() != Dtype::Uint32));
+
+        let mxfp4 = source
+            .load_time_quantized(WeightQuantization::MxFp4, execution.stream())
+            .unwrap();
+        assert_eq!(mxfp4.quantization(), Some(WeightQuantization::MxFp4));
+        let InklingLayer::Text(text) = mxfp4.new_layer(1, 1, execution.stream()).unwrap() else {
+            panic!("Inkling MXFP4 target must build a text layer")
+        };
+        assert!(text
+            .parameters()
+            .flatten()
+            .values()
+            .any(|parameter| parameter.dtype() == Dtype::Uint32));
     }
 
     #[test]

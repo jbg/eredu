@@ -271,6 +271,8 @@ pub struct TextArgs {
     pub q_bias: bool,
     pub o_bias: bool,
     pub model_max_length: Option<i32>,
+    /// Uniform packed representation requested by bounded load-time conversion.
+    pub weight_quantization: Option<WeightQuantization>,
     /// Exact per-weight formats for mixed GGUF checkpoints.
     pub quantized_weight_configs: Option<HashMap<String, WeightQuantization>>,
 }
@@ -305,6 +307,7 @@ impl TextArgs {
         self.quantized_weight_configs
             .as_ref()
             .and_then(|configs| configs.get(name).copied())
+            .or(self.weight_quantization)
     }
     pub(crate) fn dense_intermediate_size(&self) -> i32 {
         self.dense_intermediate_size
@@ -4128,6 +4131,7 @@ pub(crate) fn args_from_gguf_catalog(
             q_bias: false,
             o_bias: false,
             model_max_length: Some(gguf_i32_catalog(metadata, &key("context_length"))?),
+            weight_quantization: None,
             quantized_weight_configs: None,
         },
         audio_config: None,
@@ -4573,6 +4577,7 @@ impl TextArgsSource {
             q_bias: self.q_bias,
             o_bias: self.o_bias,
             model_max_length: self.model_max_length,
+            weight_quantization: None,
             quantized_weight_configs: None,
         }
     }
