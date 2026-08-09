@@ -62,6 +62,35 @@ Add this to your `Cargo.toml`:
 safemlx = "0.1"
 ```
 
+## Asynchronous completion events
+
+MLX graphs are lazy. `async_eval_with_event` is the point which submits the
+requested outputs; graph construction by itself does not record work in an
+event. A compatible consumer stream can wait without blocking the host:
+
+```rust
+use safemlx::{
+    transforms::async_eval_with_event, Array, Device, DeviceType, Stream,
+};
+
+let device = Device::new(DeviceType::Cpu, 0);
+let producer = Stream::new_with_device(&device);
+let consumer = Stream::new_with_device(&device);
+let output = Array::ones::<f32>(&[16], &producer)?.square(&producer)?;
+let completion = async_eval_with_event([&output])?;
+
+consumer.wait_event(&completion)?;
+let consumed = output.add(&Array::from(1.0f32), &consumer)?;
+async_eval_with_event([&consumed])?.synchronize()?;
+# Ok::<(), safemlx::error::Exception>(())
+```
+
+Events are single-shot but support repeated query/host waits and multiple
+consumer waits. Producer and consumer devices must match. Dropping the public
+handle is safe after a wait is queued because MLX retains the backend event.
+Asynchronous failures are retained and returned by host observation or later
+consumer synchronization.
+
 ## Distributed MLX
 
 The `distributed` module wraps MLX groups, collectives, and point-to-point

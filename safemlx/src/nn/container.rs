@@ -149,7 +149,7 @@ mod tests {
     #[test]
     fn test_sgd_update_sequential_linear_params() {
         let stream = crate::test_stream();
-        let lr = 1e-2;
+        let lr = 1e-2_f32;
         let input_dim = 2;
         let hidden_dim = 3;
         let output_dim = 2;

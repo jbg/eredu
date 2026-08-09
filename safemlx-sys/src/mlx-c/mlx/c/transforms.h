@@ -13,6 +13,7 @@
 #include "mlx/c/array.h"
 #include "mlx/c/closure.h"
 #include "mlx/c/distributed_group.h"
+#include "mlx/c/event.h"
 #include "mlx/c/io_types.h"
 #include "mlx/c/map.h"
 #include "mlx/c/stream.h"
@@ -29,6 +30,15 @@ extern "C" {
 /**@{*/
 
 int mlx_async_eval(const mlx_vector_array outputs);
+/**
+ * Submit evaluation of `outputs` and set `event` to its completion token.
+ *
+ * This is the operation which records lazy graphs for execution. The existing
+ * `mlx_async_eval` API is preserved for callers which do not need a token.
+ */
+int mlx_async_eval_with_event(
+    mlx_event* event,
+    const mlx_vector_array outputs);
 int mlx_checkpoint(mlx_closure* res, const mlx_closure fun);
 int mlx_custom_function(
     mlx_closure* res,

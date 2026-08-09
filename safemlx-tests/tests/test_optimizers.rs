@@ -86,7 +86,7 @@ fn test_sgd_converges() {
     let stream = test_stream();
     let mut total_loss = 0.0;
     for _ in 0..NUM_TRIALS {
-        let loss = train(|| Sgd::new(0.1), 30).unwrap();
+        let loss = train(|| Sgd::new(0.1_f32), 30).unwrap();
         total_loss += loss.item::<f32>(&stream);
     }
     // It sometimes doesn't converge that fast, so we take the average loss
@@ -101,7 +101,7 @@ fn test_rmsprop_converges() {
     let mut total_loss = 0.0;
     for _ in 0..NUM_TRIALS {
         // RMSProp doesn't seem to converge as fast as SGD
-        let loss = train(|| RmsProp::new(0.1).unwrap(), 100).unwrap();
+        let loss = train(|| RmsProp::new(0.1_f32).unwrap(), 100).unwrap();
         total_loss += loss.item::<f32>(&stream);
     }
     // It sometimes doesn't converge that fast, so we take the average loss
@@ -254,7 +254,7 @@ fn test_ada_delta() {
     let mut a_grad_params = FlattenedModuleParam::new();
     a_grad_params.insert("a".into(), a_grad.clone());
 
-    let mut optimizer = AdaDelta::new(0.1).unwrap();
+    let mut optimizer = AdaDelta::new(0.1_f32).unwrap();
 
     optimizer
         .update(&mut a_model, a_grad_params, stream)
@@ -275,7 +275,7 @@ fn test_ada_delta() {
         stream = stream
     );
 
-    assert_save_and_load(optimizer, AdaDelta::new(0.1).unwrap()).unwrap();
+    assert_save_and_load(optimizer, AdaDelta::new(0.1_f32).unwrap()).unwrap();
 }
 
 // This unit test is adapted from the swift binding unit test `testAdaGrad` in
@@ -322,7 +322,7 @@ fn test_adagrad() {
     let mut a_grad_params = FlattenedModuleParam::new();
     a_grad_params.insert("a".into(), a_grad.clone());
 
-    let mut optimizer = AdaGrad::new(0.1);
+    let mut optimizer = AdaGrad::new(0.1_f32);
 
     optimizer
         .update(&mut a_model, a_grad_params, stream)
@@ -342,7 +342,7 @@ fn test_adagrad() {
         stream = stream
     );
 
-    assert_save_and_load(optimizer, AdaGrad::new(0.1)).unwrap();
+    assert_save_and_load(optimizer, AdaGrad::new(0.1_f32)).unwrap();
 }
 
 // This unit test is adapted from the swift binding unit test `testAdam` in
@@ -389,7 +389,7 @@ fn test_adam() {
     let mut a_grad_params = FlattenedModuleParam::new();
     a_grad_params.insert("a".into(), a_grad.clone());
 
-    let mut optimizer = Adam::new(0.1);
+    let mut optimizer = Adam::new(0.1_f32);
 
     optimizer
         .update(&mut a_model, a_grad_params, stream)
@@ -409,7 +409,7 @@ fn test_adam() {
         stream = stream
     );
 
-    assert_save_and_load(optimizer, Adam::new(0.1)).unwrap();
+    assert_save_and_load(optimizer, Adam::new(0.1_f32)).unwrap();
 }
 
 // This unit test is adapted from the swift binding unit test `testAdamW` in
@@ -456,7 +456,7 @@ fn test_adamw() {
     let mut a_grad_params = FlattenedModuleParam::new();
     a_grad_params.insert("a".into(), a_grad.clone());
 
-    let mut optimizer = AdamW::new(0.1);
+    let mut optimizer = AdamW::new(0.1_f32);
 
     optimizer
         .update(&mut a_model, a_grad_params, stream)
@@ -476,7 +476,7 @@ fn test_adamw() {
         stream = stream
     );
 
-    assert_save_and_load(optimizer, AdamW::new(0.1)).unwrap();
+    assert_save_and_load(optimizer, AdamW::new(0.1_f32)).unwrap();
 }
 
 // This unit test is adapted from the python unit test `test_adamax` in
@@ -523,7 +523,7 @@ fn test_adamax() {
     let mut a_grad_params = FlattenedModuleParam::new();
     a_grad_params.insert("a".into(), a_grad.clone());
 
-    let mut optimizer = Adamax::new(0.1);
+    let mut optimizer = Adamax::new(0.1_f32);
 
     optimizer
         .update(&mut a_model, a_grad_params, stream)
@@ -543,7 +543,7 @@ fn test_adamax() {
         stream = stream
     );
 
-    assert_save_and_load(optimizer, Adamax::new(0.1)).unwrap();
+    assert_save_and_load(optimizer, Adamax::new(0.1_f32)).unwrap();
 }
 
 // This unit test is adapted from the python unit test `test_rmsprop` in
@@ -615,7 +615,7 @@ fn test_sgd() {
     let stream = test_stream();
     let (mut model, gradients) = create_default_test_model_and_grads(stream);
 
-    let mut optim = SgdBuilder::new(1e-2).momentum(0.9).build().unwrap();
+    let mut optim = SgdBuilder::new(1e-2_f32).momentum(0.9_f32).build().unwrap();
     optim.update(&mut model, gradients, stream).unwrap();
 
     let expected_first_a = constant(&[10], -0.01, stream);
@@ -709,7 +709,7 @@ fn test_lion() {
     let mut a_grad_params = FlattenedModuleParam::new();
     a_grad_params.insert("a".into(), a_grad.clone());
 
-    let mut optimizer = Lion::new(0.1);
+    let mut optimizer = Lion::new(0.1_f32);
 
     optimizer
         .update(&mut a_model, a_grad_params, stream)
@@ -729,7 +729,7 @@ fn test_lion() {
         stream = stream
     );
 
-    assert_save_and_load(optimizer, Lion::new(0.1)).unwrap();
+    assert_save_and_load(optimizer, Lion::new(0.1_f32)).unwrap();
 }
 
 // This unit test is adapted from the swift binding unit test `testLion1` in
@@ -776,7 +776,10 @@ fn test_lion1() {
     let mut a_grad_params = FlattenedModuleParam::new();
     a_grad_params.insert("a".into(), a_grad.clone());
 
-    let mut optimizer = LionBuilder::new(0.1).weight_decay(0.1).build().unwrap();
+    let mut optimizer = LionBuilder::new(0.1_f32)
+        .weight_decay(0.1_f32)
+        .build()
+        .unwrap();
 
     optimizer
         .update(&mut a_model, a_grad_params, stream)
@@ -798,7 +801,10 @@ fn test_lion1() {
 
     assert_save_and_load(
         optimizer,
-        LionBuilder::new(0.1).weight_decay(0.1).build().unwrap(),
+        LionBuilder::new(0.1_f32)
+            .weight_decay(0.1_f32)
+            .build()
+            .unwrap(),
     )
     .unwrap();
 }

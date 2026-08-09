@@ -1027,7 +1027,7 @@ mod tests {
         let indices = array!([0, 1]);
         let expected = array!([0.498587, 0.498587]);
         let cross_entropy = CrossEntropyBuilder::new()
-            .label_smoothing(0.3)
+            .label_smoothing(0.3_f32)
             .reduction(LossReduction::None)
             .build()
             .unwrap();
@@ -1036,7 +1036,7 @@ mod tests {
 
         let probs = array!([[1.0, 0.0], [0.0, 1.0]]);
         let cross_entropy = CrossEntropyBuilder::new()
-            .label_smoothing(0.3)
+            .label_smoothing(0.3_f32)
             .reduction(LossReduction::None)
             .build()
             .unwrap();
@@ -1050,7 +1050,7 @@ mod tests {
         let expected = array!([0.49858734, 0.9971747]);
         let cross_entropy = CrossEntropyBuilder::new()
             .weights(&weights)
-            .label_smoothing(0.3)
+            .label_smoothing(0.3_f32)
             .reduction(LossReduction::None)
             .build()
             .unwrap();
@@ -1060,7 +1060,7 @@ mod tests {
         let probs = array!([[1.0, 0.0], [0.0, 1.0]]);
         let cross_entropy = CrossEntropyBuilder::new()
             .weights(&weights)
-            .label_smoothing(0.3)
+            .label_smoothing(0.3_f32)
             .reduction(LossReduction::None)
             .build()
             .unwrap();
@@ -1277,7 +1277,7 @@ mod tests {
         let stream = crate::test_stream();
         let predictions = array!([1.5, 2.5, 0.5, 3.5]);
         let targets = array!([1.0, 2.0, 0.5, 2.5]);
-        let beta = 1.0;
+        let beta = 1.0_f32;
 
         let expected_none = array!([0.125, 0.125, 0.0, 0.5]);
         let expected_sum = expected_none.sum(None, stream).unwrap();
@@ -1613,7 +1613,7 @@ mod tests {
 
         // Test with margin
         let margin_ranking_loss = MarginRankingLossBuilder::new()
-            .margin(0.5)
+            .margin(0.5_f32)
             .reduction(LossReduction::None)
             .build()
             .unwrap();

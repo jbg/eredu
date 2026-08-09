@@ -31,6 +31,7 @@ bindings to MLX.
 
    array
    device
+   event
    stream
    string
    vector

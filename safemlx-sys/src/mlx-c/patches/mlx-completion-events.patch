@@ -1,0 +1,676 @@
+diff --git a/mlx/backend/cpu/encoder.h b/mlx/backend/cpu/encoder.h
+index cd015623..ec088997 100644
+--- a/mlx/backend/cpu/encoder.h
++++ b/mlx/backend/cpu/encoder.h
+@@ -47,7 +47,12 @@ struct MLX_API CommandEncoder {
+     if (num_ops_ == 0) {
+       scheduler::notify_new_task(stream_);
+       auto task_wrap = [s = stream_, task = std::move(task)]() mutable {
+-        task();
++        try {
++          task();
++        } catch (...) {
++          scheduler::notify_task_completion(s);
++          throw;
++        }
+         scheduler::notify_task_completion(s);
+       };
+       scheduler::enqueue(stream_, std::move(task_wrap));
+diff --git a/mlx/backend/cuda/event.cu b/mlx/backend/cuda/event.cu
+index b73937ec..74ae70b5 100644
+--- a/mlx/backend/cuda/event.cu
++++ b/mlx/backend/cuda/event.cu
+@@ -90,22 +90,27 @@ CudaEvent::~CudaEvent() {
+ void CudaEvent::wait() {
+   nvtx3::scoped_range r("cu::CudaEvent::wait");
+   event_.device.make_current();
+-  cudaEventSynchronize(event_);
++  CHECK_CUDA_ERROR(cudaEventSynchronize(event_));
+ }
+ 
+ void CudaEvent::wait(cudaStream_t stream) {
+   event_.device.make_current();
+-  cudaStreamWaitEvent(stream, event_);
++  CHECK_CUDA_ERROR(cudaStreamWaitEvent(stream, event_));
+ }
+ 
+ void CudaEvent::record(cudaStream_t stream) {
+   event_.device.make_current();
+-  cudaEventRecord(event_, stream);
++  CHECK_CUDA_ERROR(cudaEventRecord(event_, stream));
+ }
+ 
+ bool CudaEvent::completed() const {
+   // Note: cudaEventQuery can be safely called from any device.
+-  return cudaEventQuery(event_) == cudaSuccess;
++  auto status = cudaEventQuery(event_);
++  if (status == cudaErrorNotReady) {
++    return false;
++  }
++  CHECK_CUDA_ERROR(status);
++  return true;
+ }
+ 
+ // static
+@@ -339,6 +344,7 @@ struct EventImpl {
+   // 2. signal value other than 1 has been specified.
+   std::unique_ptr<cu::CopyableCudaEvent> cuda;
+   std::unique_ptr<cu::AtomicEvent> atomic;
++  std::shared_ptr<std::string> error;
+ 
+   bool is_created() const {
+     return cuda || atomic;
+@@ -365,9 +371,12 @@ Event::Event(Stream s) : stream_(s) {
+       new EventImpl(), [](void* ptr) { delete static_cast<EventImpl*>(ptr); });
+ }
+ 
+-void Event::wait() {
+-  auto* event = static_cast<EventImpl*>(event_.get());
++void Event::wait() const {
++  auto event = std::static_pointer_cast<EventImpl>(event_);
+   assert(event->is_created());
++  if (auto error = std::atomic_load(&event->error)) {
++    throw std::runtime_error(*error);
++  }
+   if (event->cuda) {
+     assert(value() == 1);
+     event->cuda->wait();
+@@ -375,11 +384,21 @@ void Event::wait() {
+     event->atomic->wait(value());
+   }
+   CHECK_CUDA_ERROR(cudaPeekAtLastError());
++  if (auto error = std::atomic_load(&event->error)) {
++    throw std::runtime_error(*error);
++  }
+ }
+ 
+-void Event::wait(Stream s) {
+-  auto* event = static_cast<EventImpl*>(event_.get());
++void Event::wait(Stream s) const {
++  if (s.device == mlx::core::Device::cpu) {
++    scheduler::enqueue(s, [event = *this]() { event.wait(); });
++    return;
++  }
++  auto event = std::static_pointer_cast<EventImpl>(event_);
+   assert(event->is_created());
++  if (auto error = std::atomic_load(&event->error)) {
++    throw std::runtime_error(*error);
++  }
+   if (event->cuda) {
+     assert(value() == 1);
+     event->cuda->wait(s);
+@@ -389,9 +408,16 @@ void Event::wait(Stream s) {
+ }
+ 
+ void Event::signal(Stream s) {
+-  auto* event = static_cast<EventImpl*>(event_.get());
++  auto event = std::static_pointer_cast<EventImpl>(event_);
+   event->ensure_created(s, value());
+-  if (event->cuda) {
++  if (s.device == mlx::core::Device::cpu) {
++    scheduler::enqueue(s, [event = std::move(event), s, value = value()]() {
++      if (auto error = scheduler::stream_error(s)) {
++        std::atomic_store(&event->error, std::move(error));
++      }
++      event->atomic->signal(value);
++    });
++  } else if (event->cuda) {
+     assert(value() == 1);
+     event->cuda->record(s);
+   } else {
+@@ -404,12 +430,19 @@ bool Event::is_signaled() const {
+   if (!event->is_created()) {
+     return false;
+   }
++  bool signaled;
+   if (event->cuda) {
+     assert(value() == 1);
+-    return event->cuda->is_signaled();
++    signaled = event->cuda->is_signaled();
+   } else {
+-    return event->atomic->is_signaled(value());
++    signaled = event->atomic->is_signaled(value());
++  }
++  if (signaled) {
++    if (auto error = std::atomic_load(&event->error)) {
++      throw std::runtime_error(*error);
++    }
+   }
++  return signaled;
+ }
+ 
+ } // namespace mlx::core
+diff --git a/mlx/backend/metal/event.cpp b/mlx/backend/metal/event.cpp
+index 77f48f08..483d1a5d 100644
+--- a/mlx/backend/metal/event.cpp
++++ b/mlx/backend/metal/event.cpp
+@@ -40,7 +40,7 @@ void EventImpl::set_error(std::shared_ptr<std::string> error) {
+ }
+ 
+ void EventImpl::check_error() {
+-  auto error = std::atomic_exchange(&error_, {});
++  auto error = std::atomic_load(&error_);
+   if (error) {
+     throw std::runtime_error(*error);
+   }
+@@ -56,11 +56,11 @@ Event::Event(Stream stream) : stream_(stream) {
+   event_ = std::make_shared<metal::EventImpl>(metal::device(stream.device));
+ }
+ 
+-void Event::wait() {
++void Event::wait() const {
+   static_cast<metal::EventImpl*>(event_.get())->wait(value());
+ }
+ 
+-void Event::wait(Stream stream) {
++void Event::wait(Stream stream) const {
+   auto impl = std::static_pointer_cast<metal::EventImpl>(event_);
+   if (stream.device == Device::cpu) {
+     scheduler::enqueue(stream, [impl = std::move(impl), value = value()]() {
+@@ -75,7 +75,10 @@ void Event::wait(Stream stream) {
+ void Event::signal(Stream stream) {
+   auto impl = std::static_pointer_cast<metal::EventImpl>(event_);
+   if (stream.device == Device::cpu) {
+-    scheduler::enqueue(stream, [impl = std::move(impl), value = value()]() {
++    scheduler::enqueue(stream, [impl = std::move(impl), stream, value = value()]() {
++      if (auto error = scheduler::stream_error(stream)) {
++        impl->set_error(std::move(error));
++      }
+       impl->signal(value);
+     });
+   } else {
+@@ -85,8 +88,13 @@ void Event::signal(Stream stream) {
+ }
+ 
+ bool Event::is_signaled() const {
+-  auto* mtl_event = static_cast<metal::EventImpl*>(event_.get())->mtl_event();
+-  return mtl_event->signaledValue() >= value();
++  auto* impl = static_cast<metal::EventImpl*>(event_.get());
++  impl->check_error();
++  auto signaled = impl->mtl_event()->signaledValue() >= value();
++  if (signaled) {
++    impl->check_error();
++  }
++  return signaled;
+ }
+ 
+ } // namespace mlx::core
+diff --git a/mlx/backend/no_gpu/event.cpp b/mlx/backend/no_gpu/event.cpp
+index 6dde047a..c6df8ad6 100644
+--- a/mlx/backend/no_gpu/event.cpp
++++ b/mlx/backend/no_gpu/event.cpp
+@@ -10,6 +10,7 @@ namespace mlx::core {
+ 
+ struct EventCounter {
+   uint64_t value{0};
++  std::shared_ptr<std::string> error;
+   std::mutex mtx;
+   std::condition_variable cv;
+ };
+@@ -19,24 +20,27 @@ Event::Event(Stream stream) : stream_(stream) {
+   event_ = std::shared_ptr<void>(new EventCounter{}, dtor);
+ }
+ 
+-void Event::wait() {
++void Event::wait() const {
+   auto ec = static_cast<EventCounter*>(event_.get());
+   std::unique_lock<std::mutex> lk(ec->mtx);
+-  if (ec->value >= value()) {
+-    return;
++  if (ec->value < value()) {
++    ec->cv.wait(lk, [value = value(), ec] { return ec->value >= value; });
++  }
++  if (ec->error) {
++    throw std::runtime_error(*ec->error);
+   }
+-  ec->cv.wait(lk, [value = value(), ec] { return ec->value >= value; });
+ }
+ 
+-void Event::wait(Stream stream) {
++void Event::wait(Stream stream) const {
+   scheduler::enqueue(stream, [*this]() mutable { wait(); });
+ }
+ 
+ void Event::signal(Stream stream) {
+-  scheduler::enqueue(stream, [*this]() mutable {
++  scheduler::enqueue(stream, [*this, stream]() mutable {
+     auto ec = static_cast<EventCounter*>(event_.get());
+     {
+       std::lock_guard<std::mutex> lk(ec->mtx);
++      ec->error = scheduler::stream_error(stream);
+       ec->value = value();
+     }
+     ec->cv.notify_all();
+@@ -47,7 +51,11 @@ bool Event::is_signaled() const {
+   auto ec = static_cast<EventCounter*>(event_.get());
+   {
+     std::lock_guard<std::mutex> lk(ec->mtx);
+-    return (ec->value >= value());
++    auto signaled = ec->value >= value();
++    if (signaled && ec->error) {
++      throw std::runtime_error(*ec->error);
++    }
++    return signaled;
+   }
+ }
+ } // namespace mlx::core
+diff --git a/mlx/completion.h b/mlx/completion.h
+new file mode 100644
+index 00000000..1b002a68
+--- /dev/null
++++ b/mlx/completion.h
+@@ -0,0 +1,76 @@
++// Copyright © 2026 Apple Inc.
++#pragma once
++
++#include <optional>
++#include <vector>
++
++#include "mlx/api.h"
++#include "mlx/array.h"
++#include "mlx/device.h"
++#include "mlx/event.h"
++#include "mlx/stream.h"
++
++namespace mlx::core {
++
++/** The execution backend which owns a completion token. */
++enum class CompletionBackend {
++  none,
++  cpu,
++  metal,
++  cuda,
++};
++
++/**
++ * A single-shot completion token for an asynchronous evaluation.
++ *
++ * A completion is reusable for observation: it may be queried or host-waited
++ * repeatedly and may order any number of compatible consumer streams. It is
++ * not a timeline and cannot be re-recorded. Copies of its internal event are
++ * retained by queued stream waits, so destroying this public object does not
++ * invalidate outstanding work.
++ */
++class MLX_API Completion {
++ public:
++  /** Construct an already-complete token with no device identity. */
++  Completion() = default;
++
++  Completion(const Completion&) = delete;
++  Completion& operator=(const Completion&) = delete;
++  Completion(Completion&&) noexcept = default;
++  Completion& operator=(Completion&&) noexcept = default;
++  ~Completion() = default;
++
++  /** Block the host until evaluation completes, rethrowing async errors. */
++  void wait() const;
++
++  /**
++   * Order later work on `stream` after this completion.
++   *
++   * The consumer must be on the same logical device as the producer. The
++   * dependency is enqueued in the backend; this call does not synchronize the
++   * host. An identity-free, already-complete token accepts every stream.
++   */
++  void wait(Stream stream) const;
++
++  /** Return true when complete, or rethrow a retained asynchronous error. */
++  bool is_complete() const;
++
++  /** The producer device, absent for an identity-free completed token. */
++  const std::optional<Device>& device() const {
++    return device_;
++  }
++
++  /** The producer execution backend. */
++  CompletionBackend backend() const;
++
++ private:
++  explicit Completion(Event event)
++      : event_(std::move(event)), device_(event_->stream().device) {}
++
++  std::optional<Event> event_;
++  std::optional<Device> device_;
++
++  friend Completion async_eval_with_completion(std::vector<array> outputs);
++};
++
++} // namespace mlx::core
+diff --git a/mlx/event.h b/mlx/event.h
+index 66a6a75d..7cfa08a7 100644
+--- a/mlx/event.h
++++ b/mlx/event.h
+@@ -9,16 +9,16 @@
+ 
+ namespace mlx::core {
+ 
+-class Event {
++class MLX_API Event {
+  public:
+   Event() {};
+   explicit Event(Stream stream);
+ 
+   // Wait for the event to be signaled at its current value
+-  void wait();
++  void wait() const;
+ 
+   // Wait in the given stream for the event to be signaled at its current value
+-  void wait(Stream stream);
++  void wait(Stream stream) const;
+ 
+   // Signal the event at its current value in the given stream
+   void signal(Stream stream);
+diff --git a/mlx/scheduler.cpp b/mlx/scheduler.cpp
+index 7507917f..c6de4d38 100644
+--- a/mlx/scheduler.cpp
++++ b/mlx/scheduler.cpp
+@@ -13,6 +13,9 @@ void synchronize(Stream s) {
+     std::future<void> f = p->get_future();
+     scheduler::enqueue(s, [p = std::move(p)]() { p->set_value(); });
+     f.wait();
++    if (auto error = scheduler::take_stream_error(s)) {
++      throw std::runtime_error(*error);
++    }
+   } else {
+     gpu::synchronize(s);
+   }
+@@ -57,7 +60,35 @@ void Scheduler::enqueue(Stream s, std::function<void()> task) {
+     }
+     st = it->second.get();
+   }
+-  st->enqueue(std::move(task));
++  st->enqueue([this, s, task = std::move(task)]() mutable {
++    try {
++      task();
++    } catch (const std::exception& e) {
++      std::lock_guard lk(mtx);
++      stream_errors_.try_emplace(
++          s.index, std::make_shared<std::string>(e.what()));
++    } catch (...) {
++      std::lock_guard lk(mtx);
++      stream_errors_.try_emplace(
++          s.index,
++          std::make_shared<std::string>(
++              "Unknown exception in asynchronous CPU stream work."));
++    }
++  });
++}
++
++std::shared_ptr<std::string> Scheduler::stream_error(
++    const Stream& stream) const {
++  std::lock_guard lk(mtx);
++  auto it = stream_errors_.find(stream.index);
++  return it == stream_errors_.end() ? nullptr : it->second;
++}
++
++std::shared_ptr<std::string> Scheduler::take_stream_error(
++    const Stream& stream) {
++  std::lock_guard lk(mtx);
++  auto node = stream_errors_.extract(stream.index);
++  return node.empty() ? nullptr : std::move(node.mapped());
+ }
+ 
+ // Leak the scheduler singleton on all platforms. During static destruction,
+diff --git a/mlx/scheduler.h b/mlx/scheduler.h
+index c84ab628..fe82b252 100644
+--- a/mlx/scheduler.h
++++ b/mlx/scheduler.h
+@@ -6,6 +6,7 @@
+ #include <future>
+ #include <queue>
+ #include <shared_mutex>
++#include <string>
+ #include <thread>
+ #include <unordered_map>
+ 
+@@ -77,6 +78,10 @@ class MLX_API Scheduler {
+ 
+   void enqueue(Stream s, std::function<void()> task);
+ 
++  std::shared_ptr<std::string> stream_error(const Stream& stream) const;
++
++  std::shared_ptr<std::string> take_stream_error(const Stream& stream);
++
+   void notify_new_task(const Stream& stream) {
+     {
+       std::lock_guard<std::mutex> lk(mtx);
+@@ -114,7 +119,8 @@ class MLX_API Scheduler {
+   std::unordered_map<int, std::unique_ptr<StreamThread>> threads_;
+   std::shared_mutex threads_mtx_;
+   std::condition_variable completion_cv;
+-  std::mutex mtx;
++  mutable std::mutex mtx;
++  std::unordered_map<int, std::shared_ptr<std::string>> stream_errors_;
+ };
+ 
+ MLX_API Scheduler& scheduler();
+@@ -140,4 +146,12 @@ inline void wait_for_one() {
+   scheduler().wait_for_one();
+ }
+ 
++inline std::shared_ptr<std::string> stream_error(const Stream& stream) {
++  return scheduler().stream_error(stream);
++}
++
++inline std::shared_ptr<std::string> take_stream_error(const Stream& stream) {
++  return scheduler().take_stream_error(stream);
++}
++
+ } // namespace mlx::core::scheduler
+diff --git a/mlx/transforms.cpp b/mlx/transforms.cpp
+index 9a820733..e75ac5f8 100644
+--- a/mlx/transforms.cpp
++++ b/mlx/transforms.cpp
+@@ -11,6 +11,7 @@
+ 
+ #include "mlx/backend/cpu/eval.h"
+ #include "mlx/backend/gpu/eval.h"
++#include "mlx/completion.h"
+ #include "mlx/fence.h"
+ #include "mlx/memory.h"
+ #include "mlx/ops.h"
+@@ -86,6 +87,9 @@ array eval_impl(std::vector<array> outputs, bool async) {
+     if (o.status() == array::Status::unscheduled && o.has_primitive()) {
+       stream = o.primitive().stream();
+       break;
++    } else if (o.event().valid()) {
++      stream = o.event().stream();
++      break;
+     }
+   }
+ 
+@@ -333,6 +337,65 @@ void async_eval(std::vector<array> outputs) {
+   eval_impl(std::move(outputs), true);
+ }
+ 
++Completion async_eval_with_completion(std::vector<array> outputs) {
++  if (outputs.empty()) {
++    return Completion{};
++  }
++
++  bool needs_evaluation = false;
++  for (auto& output : outputs) {
++    if (output.status() == array::Status::unscheduled ||
++        !output.is_available()) {
++      needs_evaluation = true;
++    }
++  }
++  if (!needs_evaluation) {
++    return Completion{};
++  }
++
++  auto synchronizer = eval_impl(std::move(outputs), true);
++  return Completion{synchronizer.event()};
++}
++
++void Completion::wait() const {
++  if (event_) {
++    event_->wait();
++  }
++}
++
++void Completion::wait(Stream stream) const {
++  if (!event_) {
++    return;
++  }
++  if (stream.device != *device_) {
++    std::ostringstream message;
++    message << "[Completion::wait] Incompatible producer and consumer "
++               "devices: completion is for "
++            << *device_ << ", but the consumer stream is on " << stream.device
++            << ".";
++    throw std::invalid_argument(message.str());
++  }
++  event_->wait(stream);
++}
++
++bool Completion::is_complete() const {
++  return !event_ || event_->is_signaled();
++}
++
++CompletionBackend Completion::backend() const {
++  if (!device_) {
++    return CompletionBackend::none;
++  }
++  if (*device_ == Device::cpu) {
++    return CompletionBackend::cpu;
++  }
++#if defined(MLX_USE_CUDA)
++  return CompletionBackend::cuda;
++#else
++  return CompletionBackend::metal;
++#endif
++}
++
+ void eval(std::vector<array> outputs) {
+   if (outputs.empty()) {
+     return;
+diff --git a/mlx/transforms.h b/mlx/transforms.h
+index 1848be79..896ff595 100644
+--- a/mlx/transforms.h
++++ b/mlx/transforms.h
+@@ -6,11 +6,22 @@
+ 
+ #include "mlx/api.h"
+ #include "mlx/array.h"
++#include "mlx/completion.h"
+ 
+ namespace mlx::core {
+ 
+ MLX_API void async_eval(std::vector<array> outputs);
+ 
++/**
++ * Asynchronously evaluate `outputs` and return a single-shot completion token.
++ *
++ * Unlike constructing lazy array operations, this function submits evaluation
++ * work. The returned completion covers every dependency needed to materialize
++ * the requested outputs. Empty output sets and sets which are already fully
++ * available return an already-complete token without a device identity.
++ */
++MLX_API Completion async_eval_with_completion(std::vector<array> outputs);
++
+ template <typename... Arrays, typename = enable_for_arrays_t<Arrays...>>
+ void async_eval(Arrays&&... outputs) {
+   async_eval(std::vector<array>{std::forward<Arrays>(outputs)...});
+diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
+index 2a4a41c6..27c73cbb 100644
+--- a/tests/CMakeLists.txt
++++ b/tests/CMakeLists.txt
+@@ -20,6 +20,7 @@ target_sources(
+           autograd_tests.cpp
+           blas_tests.cpp
+           compile_tests.cpp
++          completion_tests.cpp
+           custom_vjp_tests.cpp
+           creations_tests.cpp
+           device_tests.cpp
+diff --git a/tests/completion_tests.cpp b/tests/completion_tests.cpp
+new file mode 100644
+index 00000000..ef7f688e
+--- /dev/null
++++ b/tests/completion_tests.cpp
+@@ -0,0 +1,84 @@
++// Copyright © 2026 Apple Inc.
++
++#include "doctest/doctest.h"
++
++#include "mlx/event.h"
++#include "mlx/mlx.h"
++#include "mlx/scheduler.h"
++
++using namespace mlx::core;
++
++TEST_CASE("test completion empty and already available") {
++  auto empty = async_eval_with_completion({});
++  CHECK(empty.is_complete());
++  CHECK_FALSE(empty.device().has_value());
++  empty.wait();
++  empty.wait();
++
++  auto available = array(1.0f);
++  auto ready = async_eval_with_completion({available});
++  CHECK(ready.is_complete());
++  CHECK_FALSE(ready.device().has_value());
++}
++
++TEST_CASE("test CPU completion host and stream waits") {
++  auto producer = new_thread_unsafe_stream(Device::cpu);
++  auto first_consumer = new_thread_unsafe_stream(Device::cpu);
++  auto second_consumer = new_thread_unsafe_stream(Device::cpu);
++
++  auto output = add(array(1.0f), array(2.0f), producer);
++  auto completion = async_eval_with_completion({output});
++  CHECK(completion.device() == Device(Device::cpu, 0));
++  CHECK(completion.backend() == CompletionBackend::cpu);
++
++  completion.wait(first_consumer);
++  completion.wait(second_consumer);
++  synchronize(first_consumer);
++  synchronize(second_consumer);
++  completion.wait();
++  completion.wait();
++  CHECK(completion.is_complete());
++  CHECK(completion.is_complete());
++}
++
++TEST_CASE("test CPU completion retains asynchronous failures") {
++  auto producer = new_thread_unsafe_stream(Device::cpu);
++  Event event(producer);
++  event.set_value(1);
++
++  scheduler::enqueue(producer, []() {
++    throw std::runtime_error("deterministic async producer failure");
++  });
++  event.signal(producer);
++
++  CHECK_THROWS_WITH_AS(
++      event.wait(),
++      "deterministic async producer failure",
++      std::runtime_error);
++  CHECK_THROWS_WITH_AS(
++      event.wait(),
++      "deterministic async producer failure",
++      std::runtime_error);
++  CHECK_THROWS_WITH_AS(
++      event.is_signaled(),
++      "deterministic async producer failure",
++      std::runtime_error);
++}
++
++TEST_CASE("test failed CPU event poisons consumer stream") {
++  auto producer = new_thread_unsafe_stream(Device::cpu);
++  auto consumer = new_thread_unsafe_stream(Device::cpu);
++  Event event(producer);
++  event.set_value(1);
++
++  scheduler::enqueue(producer, []() {
++    throw std::runtime_error("producer poisoned completion");
++  });
++  event.signal(producer);
++  event.wait(consumer);
++
++  CHECK_THROWS_WITH_AS(
++      synchronize(consumer),
++      "producer poisoned completion",
++      std::runtime_error);
++}

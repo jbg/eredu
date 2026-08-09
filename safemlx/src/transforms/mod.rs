@@ -53,7 +53,7 @@ use crate::{
     error::{get_and_clear_closure_error, Result},
     module::ModuleParamRef,
     utils::{guard::Guarded, runtime_lock, Closure, VectorArray, SUCCESS},
-    Array,
+    Array, Event,
 };
 
 pub mod compile;
@@ -87,6 +87,26 @@ pub fn async_eval<'a>(outputs: impl IntoIterator<Item = &'a Array>) -> Result<()
     let vec = VectorArray::try_from_iter(outputs.into_iter())?;
     let _guard = runtime_lock::enter();
     <() as Guarded>::try_from_op(|_| unsafe { safemlx_sys::mlx_async_eval(vec.as_ptr()) })
+}
+
+/// Submit evaluation of `outputs` and return its completion [`Event`].
+///
+/// This function reconciles events with MLX's lazy execution model: it is this
+/// call, not construction of the output graphs, which submits their work. The
+/// event covers every dependency required to materialize the outputs. Empty
+/// sets and sets whose outputs are already fully available produce an
+/// already-complete event with no device identity.
+///
+/// The returned single-shot event may be queried or host-waited repeatedly and
+/// may order multiple consumer streams on the same logical device. Use
+/// [`Stream::wait_event`](crate::Stream::wait_event) before submitting a
+/// consumer graph to create a backend-side dependency.
+pub fn async_eval_with_event<'a>(outputs: impl IntoIterator<Item = &'a Array>) -> Result<Event> {
+    let vec = VectorArray::try_from_iter(outputs.into_iter())?;
+    let _guard = runtime_lock::enter();
+    Event::try_from_op(|event| unsafe {
+        safemlx_sys::mlx_async_eval_with_event(event, vec.as_ptr())
+    })
 }
 
 /// Asynchronously evaluate a module's parameters.

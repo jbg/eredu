@@ -16,6 +16,10 @@ SafeMLX is independent of Apple and is not an official MLX project.
 
 - An idiomatic Rust API for MLX arrays, operations, transforms, neural-network
   modules, optimizers, quantization, streams, and distributed execution.
+- Backend-independent single-shot completion events for CPU, Metal, and CUDA
+  asynchronous evaluation, including host query/wait and backend-ordered
+  same-device stream dependencies. See the [ordering contract and current
+  adoption state](doc/completion-events.md).
 - High-level loading and generation for supported text, multimodal, and
   realtime speech model families.
 - SafeTensors and bounded, streaming GGUF checkpoint readers.

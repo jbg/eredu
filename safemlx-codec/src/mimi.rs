@@ -768,7 +768,7 @@ impl MimiSelfAttention {
             out_proj: nn::Linear::unloaded(512, 512, false, Dtype::Float32, stream)?,
             rope: nn::RopeBuilder::new(head_dim)
                 .traditional(true)
-                .base(10_000.0)
+                .base(10_000.0_f32)
                 .build()
                 .expect("RopeBuilder is infallible"),
             num_heads: 8,

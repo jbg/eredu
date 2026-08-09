@@ -88,6 +88,19 @@ impl Stream {
         <() as Guarded>::try_from_op(|_| unsafe { safemlx_sys::mlx_synchronize(self.c_stream) })
     }
 
+    /// Order subsequently submitted work on this stream after `event`.
+    ///
+    /// This is a backend-ordered dependency and does not block the host. The
+    /// event's producer device must equal this stream's device. Since MLX is
+    /// lazy, the dependency applies to consumer work submitted after this call;
+    /// constructing a graph alone does not submit it.
+    pub fn wait_event(&self, event: &crate::Event) -> Result<()> {
+        let _guard = runtime_lock::enter();
+        <() as Guarded>::try_from_op(|_| unsafe {
+            safemlx_sys::mlx_stream_wait_event(self.c_stream, event.c_event)
+        })
+    }
+
     /// Get the device associated with the stream.
     pub fn get_device(&self) -> Result<Device> {
         Device::try_from_op(|res| unsafe { safemlx_sys::mlx_stream_get_device(res, self.c_stream) })

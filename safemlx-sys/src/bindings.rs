@@ -1570,6 +1570,58 @@ extern "C" {
         dtor: ::std::option::Option<unsafe extern "C" fn(arg1: *mut ::std::os::raw::c_void)>,
     );
 }
+#[doc = " An owning opaque completion event."]
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct mlx_event_ {
+    pub ctx: *mut ::std::os::raw::c_void,
+}
+#[doc = " An owning opaque completion event."]
+pub type mlx_event = mlx_event_;
+pub const mlx_event_backend__MLX_EVENT_BACKEND_NONE: mlx_event_backend_ = 0;
+pub const mlx_event_backend__MLX_EVENT_BACKEND_CPU: mlx_event_backend_ = 1;
+pub const mlx_event_backend__MLX_EVENT_BACKEND_METAL: mlx_event_backend_ = 2;
+pub const mlx_event_backend__MLX_EVENT_BACKEND_CUDA: mlx_event_backend_ = 3;
+#[doc = " Backend identity of a completion event."]
+pub type mlx_event_backend_ = ::std::os::raw::c_uint;
+#[doc = " Backend identity of a completion event."]
+pub use self::mlx_event_backend_ as mlx_event_backend;
+extern "C" {
+    #[doc = " Return a new, already-complete event without a device identity."]
+    pub fn mlx_event_new() -> mlx_event;
+}
+extern "C" {
+    #[doc = " Free an event handle. Queued producer and consumer work retains it."]
+    pub fn mlx_event_free(event: mlx_event) -> ::std::os::raw::c_int;
+}
+extern "C" {
+    #[doc = " Block the host until completion and report retained async errors."]
+    pub fn mlx_event_synchronize(event: mlx_event) -> ::std::os::raw::c_int;
+}
+extern "C" {
+    #[doc = " Nonblocking completion query.\n\n On success, writes a monotonic completion value to `complete`. A completed\n event with a retained asynchronous error returns failure instead."]
+    pub fn mlx_event_query(complete: *mut bool, event: mlx_event) -> ::std::os::raw::c_int;
+}
+extern "C" {
+    #[doc = " Order later work on `stream` after `event` without blocking the host.\n\n Producer and consumer devices must match. This orders backend work which is\n subsequently submitted on the stream; constructing lazy MLX operations does\n not itself submit them."]
+    pub fn mlx_stream_wait_event(stream: mlx_stream, event: mlx_event) -> ::std::os::raw::c_int;
+}
+extern "C" {
+    #[doc = " Return whether this event has a producer device identity."]
+    pub fn mlx_event_has_device(has_device: *mut bool, event: mlx_event) -> ::std::os::raw::c_int;
+}
+extern "C" {
+    #[doc = " Return the producer device.\n\n Fails for identity-free events, such as events produced for empty or\n already-available output sets."]
+    pub fn mlx_event_get_device(device: *mut mlx_device, event: mlx_event)
+        -> ::std::os::raw::c_int;
+}
+extern "C" {
+    #[doc = " Return the producer backend."]
+    pub fn mlx_event_get_backend(
+        backend: *mut mlx_event_backend,
+        event: mlx_event,
+    ) -> ::std::os::raw::c_int;
+}
 extern "C" {
     #[doc = " \\defgroup export Function serialization\n/\n/**@{"]
     pub fn mlx_export_function(
@@ -2349,7 +2401,9 @@ extern "C" {
     pub fn mlx_metal_is_available(res: *mut bool) -> ::std::os::raw::c_int;
 }
 extern "C" {
-    pub fn mlx_metal_set_metallib_path(path: *const ::std::os::raw::c_char) -> ::std::os::raw::c_int;
+    pub fn mlx_metal_set_metallib_path(
+        path: *const ::std::os::raw::c_char,
+    ) -> ::std::os::raw::c_int;
 }
 extern "C" {
     pub fn mlx_metal_start_capture(path: *const ::std::os::raw::c_char) -> ::std::os::raw::c_int;
@@ -4524,6 +4578,13 @@ extern "C" {
 extern "C" {
     #[doc = " \\defgroup transforms Transform operations\n/\n/**@{"]
     pub fn mlx_async_eval(outputs: mlx_vector_array) -> ::std::os::raw::c_int;
+}
+extern "C" {
+    #[doc = " Submit evaluation of `outputs` and set `event` to its completion token.\n\n This is the operation which records lazy graphs for execution. The existing\n `mlx_async_eval` API is preserved for callers which do not need a token."]
+    pub fn mlx_async_eval_with_event(
+        event: *mut mlx_event,
+        outputs: mlx_vector_array,
+    ) -> ::std::os::raw::c_int;
 }
 extern "C" {
     pub fn mlx_checkpoint(res: *mut mlx_closure, fun: mlx_closure) -> ::std::os::raw::c_int;

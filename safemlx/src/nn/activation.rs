@@ -1258,7 +1258,7 @@ mod tests {
         assert_eq!(y.dtype(), Dtype::Float32);
 
         let y = CeluBuilder::new()
-            .alpha(1.1)
+            .alpha(1.1_f32)
             .build()
             .unwrap()
             .forward(&x, stream)

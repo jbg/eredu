@@ -337,6 +337,51 @@ impl Guarded for crate::Device {
     type Guard = MaybeUninitDevice;
 }
 
+pub(crate) struct MaybeUninitEvent {
+    pub(crate) ptr: safemlx_sys::mlx_event,
+    pub(crate) init_success: bool,
+}
+
+impl Default for MaybeUninitEvent {
+    fn default() -> Self {
+        Self {
+            ptr: unsafe { safemlx_sys::mlx_event_new() },
+            init_success: false,
+        }
+    }
+}
+
+impl Drop for MaybeUninitEvent {
+    fn drop(&mut self) {
+        if !self.init_success {
+            unsafe {
+                safemlx_sys::mlx_event_free(self.ptr);
+            }
+        }
+    }
+}
+
+impl Guard<crate::Event> for MaybeUninitEvent {
+    type MutRawPtr = *mut safemlx_sys::mlx_event;
+
+    fn as_mut_raw_ptr(&mut self) -> Self::MutRawPtr {
+        &mut self.ptr
+    }
+
+    fn set_init_success(&mut self, success: bool) {
+        self.init_success = success;
+    }
+
+    fn try_into_guarded(self) -> Result<crate::Event, Exception> {
+        debug_assert!(self.init_success);
+        Ok(crate::Event { c_event: self.ptr })
+    }
+}
+
+impl Guarded for crate::Event {
+    type Guard = MaybeUninitEvent;
+}
+
 pub(crate) struct MaybeUninitStream {
     pub(crate) ptr: safemlx_sys::mlx_stream,
     pub(crate) init_success: bool,

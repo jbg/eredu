@@ -100,7 +100,7 @@ fn test_compile_module_and_adafactor_works() {
 fn test_compile_module_and_sgd_consistency() {
     // Use a learning rate of 0.0 so that the parameters don't change
     // and we can check that the compiled function produces the same result
-    let optimizer = Sgd::new(0.0);
+    let optimizer = Sgd::new(0.0_f32);
     let (original, result) = compile_module_and_optimizer(optimizer);
     let stream = test_stream();
     assert_array_eq!(&original, &result, stream = &stream);
@@ -110,7 +110,7 @@ fn test_compile_module_and_sgd_consistency() {
 fn test_compile_module_and_adam_consistency() {
     // Use a learning rate of 0.0 so that the parameters don't change
     // and we can check that the compiled function produces the same result
-    let optimizer = safemlx::optimizers::Adam::new(0.0);
+    let optimizer = safemlx::optimizers::Adam::new(0.0_f32);
     let (original, result) = compile_module_and_optimizer(optimizer);
     let stream = test_stream();
     assert_array_eq!(&original, &result, stream = &stream);
@@ -120,7 +120,7 @@ fn test_compile_module_and_adam_consistency() {
 fn test_compile_module_and_rmsprop_consistency() {
     // Use a learning rate of 0.0 so that the parameters don't change
     // and we can check that the compiled function produces the same result
-    let optimizer = safemlx::optimizers::RmsProp::new(0.0).unwrap();
+    let optimizer = safemlx::optimizers::RmsProp::new(0.0_f32).unwrap();
     let (original, result) = compile_module_and_optimizer(optimizer);
     let stream = test_stream();
     assert_array_eq!(&original, &result, stream = &stream);
@@ -130,7 +130,7 @@ fn test_compile_module_and_rmsprop_consistency() {
 fn test_compile_module_and_adagrad_consistency() {
     // Use a learning rate of 0.0 so that the parameters don't change
     // and we can check that the compiled function produces the same result
-    let optimizer = safemlx::optimizers::AdaGrad::new(0.0);
+    let optimizer = safemlx::optimizers::AdaGrad::new(0.0_f32);
     let (original, result) = compile_module_and_optimizer(optimizer);
     let stream = test_stream();
     assert_array_eq!(&original, &result, stream = &stream);
@@ -140,7 +140,7 @@ fn test_compile_module_and_adagrad_consistency() {
 fn test_compile_module_and_adadelta_consistency() {
     // Use a learning rate of 0.0 so that the parameters don't change
     // and we can check that the compiled function produces the same result
-    let optimizer = safemlx::optimizers::AdaDelta::new(0.0).unwrap();
+    let optimizer = safemlx::optimizers::AdaDelta::new(0.0_f32).unwrap();
     let (original, result) = compile_module_and_optimizer(optimizer);
     let stream = test_stream();
     assert_array_eq!(&original, &result, stream = &stream);
@@ -150,7 +150,7 @@ fn test_compile_module_and_adadelta_consistency() {
 fn test_compile_module_and_adamw_consistency() {
     // Use a learning rate of 0.0 so that the parameters don't change
     // and we can check that the compiled function produces the same result
-    let optimizer = safemlx::optimizers::AdamW::new(0.0);
+    let optimizer = safemlx::optimizers::AdamW::new(0.0_f32);
     let (original, result) = compile_module_and_optimizer(optimizer);
     let stream = test_stream();
     assert_array_eq!(&original, &result, stream = &stream);
@@ -160,7 +160,7 @@ fn test_compile_module_and_adamw_consistency() {
 fn test_compile_module_and_adamax_consistency() {
     // Use a learning rate of 0.0 so that the parameters don't change
     // and we can check that the compiled function produces the same result
-    let optimizer = safemlx::optimizers::Adamax::new(0.0);
+    let optimizer = safemlx::optimizers::Adamax::new(0.0_f32);
     let (original, result) = compile_module_and_optimizer(optimizer);
     let stream = test_stream();
     assert_array_eq!(&original, &result, stream = &stream);
@@ -170,7 +170,7 @@ fn test_compile_module_and_adamax_consistency() {
 fn test_compile_module_and_lion_consistency() {
     // Use a learning rate of 0.0 so that the parameters don't change
     // and we can check that the compiled function produces the same result
-    let optimizer = safemlx::optimizers::Lion::new(0.0);
+    let optimizer = safemlx::optimizers::Lion::new(0.0_f32);
     let (original, result) = compile_module_and_optimizer(optimizer);
     let stream = test_stream();
     assert_array_eq!(&original, &result, stream = &stream);
@@ -234,7 +234,7 @@ fn test_compile_module_and_optimizer_with_error() {
     let model = LinearFunctionModel::new(&[10], stream).unwrap();
     // Use a learning rate of 0.0 so that the parameters don't change
     // and we can check that the compiled function produces the same result
-    let optimizer = Sgd::new(0.0);
+    let optimizer = Sgd::new(0.0_f32);
 
     let step_stream = stream;
     let step = move |(model, optimizer): &mut (LinearFunctionModel, Sgd),

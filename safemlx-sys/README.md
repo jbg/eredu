@@ -2,6 +2,28 @@
 
 Rust bindings to the mlx-c API. Generated using bindgen.
 
+## Vendored MLX completion patch
+
+The vendored MLX-C build pins MLX 0.32.0 and applies
+`src/mlx-c/patches/mlx-completion-events.patch` after the existing platform and
+kernel patches. This reviewable patch exposes a move-only C++ `Completion`
+around MLX's existing internal `Event`; it does not introduce a SafeMLX-side
+backend runtime or modify FetchContent output. It also makes CPU scheduler and
+backend event errors persistent for repeated completion observation.
+
+The MLX-C headers expose opaque `mlx_event` ownership, async evaluation with an
+event, stream wait, host synchronize, query, and identity accessors. The
+checked-in `src/bindings.rs` is regenerated from those headers with:
+
+```console
+SAFEMLX_SYS_GENERATE_BINDINGS=1 \
+  cargo check -p safemlx-sys --features generate-bindings
+```
+
+CPU-only builds exercise the no-GPU event implementation. Metal runtime tests
+are explicit and opt-in; CUDA builds are expected to compile in Linux/Windows
+CUDA CI, with runtime event tests on optional GPU runners.
+
 ## Linux and CUDA
 
 CPU-only Linux builds require Git, a C++20 compiler, CMake 3.25 or newer, and
