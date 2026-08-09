@@ -270,7 +270,7 @@ fn register_nemotron_layer_parallel_plan(
             })?;
             let alignment = experts
                 .down_quantization
-                .map(|quantization| quantization.group_size)
+                .map(WeightQuantization::group_size)
                 .or_else(|| {
                     experts
                         .down_iquant
@@ -594,12 +594,8 @@ pub fn load_nemotron_h_layerwise_model(
     let args = resident::get_nemotron_h_model_args(model_dir)?;
     let quantize_on_load = quantization
         .map(|requested| {
-            should_quantize_on_load(
-                "Nemotron-H layerwise model",
-                args.quantization.map(WeightQuantization::Affine),
-                requested,
-            )
-            .map(|required| required.then_some(requested))
+            should_quantize_on_load("Nemotron-H layerwise model", args.quantization, requested)
+                .map(|required| required.then_some(requested))
         })
         .transpose()?
         .flatten();
@@ -886,7 +882,7 @@ pub fn load_nemotron_h_expert_cache_model(
         .map(|requested| {
             should_quantize_on_load(
                 "Nemotron-H independent expert cache",
-                args.quantization.map(WeightQuantization::Affine),
+                args.quantization,
                 requested,
             )
             .map(|required| required.then_some(requested))
@@ -1212,13 +1208,8 @@ impl LoadTimeQuantizableAdapter for NemotronHLayerwiseAdapter {
         quantization: WeightQuantization,
         stream: &Stream,
     ) -> Result<Self, Error> {
-        let WeightQuantization::Affine(affine) = quantization else {
-            return Err(Error::Quantization(format!(
-                "Nemotron-H routed ReLU2 experts support affine load-time quantization, not {quantization:?}"
-            )));
-        };
         let mut args = self.args.clone();
-        args.quantization = Some(affine);
+        args.quantization = Some(quantization);
         args.quantized_weights = None;
         args.quantized_weight_configs = None;
         let mut adapter = Self::new(args, stream)?;
@@ -1238,7 +1229,7 @@ impl ArchitectureAdapter for NemotronHLayerwiseAdapter {
     }
 
     fn quantization(&self) -> Option<WeightQuantization> {
-        self.args.quantization.map(Into::into)
+        self.args.quantization
     }
 
     fn prompt_cache_model_identity(
@@ -2248,7 +2239,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(target.quantization(), Some(affine.into()));
-        assert_eq!(target.args.quantization, Some(affine));
+        assert_eq!(target.args.quantization, Some(affine.into()));
         assert!(target.args.quantized_weights.is_none());
         assert!(target.args.quantized_weight_configs.is_none());
         assert!(target.sparse_expert_cache);
@@ -2264,14 +2255,18 @@ mod tests {
             );
         }
 
-        let error = source
+        let mxfp4 = source
             .load_time_quantized(WeightQuantization::MxFp4, execution.stream())
-            .err()
-            .expect("Nemotron-H MXFP4 target must fail before materialization");
-        assert!(
-            error.to_string().contains("routed ReLU2 experts"),
-            "{error}"
+            .unwrap();
+        assert_eq!(mxfp4.quantization(), Some(WeightQuantization::MxFp4));
+        let layer = mxfp4.new_layer(0, 2, execution.stream()).unwrap();
+        let experts = &layer.moe.as_ref().unwrap().experts;
+        assert_eq!(experts.up_quantization, Some(WeightQuantization::MxFp4));
+        assert_eq!(
+            experts.up_proj_scales.as_ref().as_ref().unwrap().dtype(),
+            Dtype::Uint8
         );
+        assert!(experts.up_proj_biases.as_ref().is_none());
     }
 
     #[test]
@@ -2285,59 +2280,60 @@ mod tests {
         initialize(&mut fixture, gpu.stream());
         let dir = tempfile::tempdir().unwrap();
         write_fixture_with_config(dir.path(), &fixture, &config, gpu.stream());
-        let quantization: WeightQuantization = AffineQuantization::new(32, 4).unwrap().into();
-        let expert_options = ExpertCacheLoadOptions::new(
-            OffloadConfig::new(Some(1 << 20), Some(1 << 20), 1).unwrap(),
-            1 << 16,
-            1 << 16,
-        )
-        .unwrap();
-        let mut cached = load_nemotron_h_expert_cache_model(
-            dir.path(),
-            crate::NonExpertWeightResidency::FullyResident,
-            expert_options,
-            Some(quantization),
-            gpu.stream(),
-            cpu.stream(),
-        )
-        .unwrap();
-        let loaded = crate::api::load_model_with_options(
-            dir.path(),
-            crate::api::ModelLoadOptions::with_quantization(quantization),
-            gpu.stream(),
-            cpu.stream(),
-        )
-        .unwrap();
-        let crate::api::Model::NemotronH(mut quantized) = loaded else {
-            panic!("high-level dispatch did not return a Nemotron-H model")
-        };
-
-        assert_eq!(
-            quantized.args().quantization.map(Into::into),
-            Some(quantization)
-        );
-        assert!(quantized.expert_cache_report().unwrap().is_none());
-        let report = quantized.residency_report().unwrap();
-        assert!(report.initialized());
-        assert!(report.units().iter().all(|unit| unit.device_resident()));
-        let materialization = report.materialization().unwrap();
-        assert!(materialization.transformed_weights > 0);
-        assert!(materialization.source_bytes_read > materialization.output_bytes);
-        assert!(materialization.peak_planned_working_set_bytes <= materialization.output_bytes);
-
-        let mut cached_cache = cached.new_cache();
-        let mut quantized_cache = quantized.new_cache();
-        for tokens in [
-            Array::from_slice(&[1u32, 2], &[1, 2]),
-            Array::from_slice(&[3u32], &[1, 1]),
+        for quantization in [
+            WeightQuantization::Affine(AffineQuantization::new(32, 4).unwrap()),
+            WeightQuantization::MxFp4,
         ] {
-            let expected = cached
-                .forward(&tokens, &mut cached_cache, gpu.stream())
-                .unwrap();
-            let actual = quantized
-                .forward(&tokens, &mut quantized_cache, gpu.stream())
-                .unwrap();
-            assert_close(&actual, &expected);
+            let expert_options = ExpertCacheLoadOptions::new(
+                OffloadConfig::new(Some(1 << 20), Some(1 << 20), 1).unwrap(),
+                1 << 16,
+                1 << 16,
+            )
+            .unwrap();
+            let mut cached = load_nemotron_h_expert_cache_model(
+                dir.path(),
+                crate::NonExpertWeightResidency::FullyResident,
+                expert_options,
+                Some(quantization),
+                gpu.stream(),
+                cpu.stream(),
+            )
+            .unwrap();
+            let loaded = crate::api::load_model_with_options(
+                dir.path(),
+                crate::api::ModelLoadOptions::with_quantization(quantization),
+                gpu.stream(),
+                cpu.stream(),
+            )
+            .unwrap();
+            let crate::api::Model::NemotronH(mut quantized) = loaded else {
+                panic!("high-level dispatch did not return a Nemotron-H model")
+            };
+
+            assert_eq!(quantized.args().quantization, Some(quantization));
+            assert!(quantized.expert_cache_report().unwrap().is_none());
+            let report = quantized.residency_report().unwrap();
+            assert!(report.initialized());
+            assert!(report.units().iter().all(|unit| unit.device_resident()));
+            let materialization = report.materialization().unwrap();
+            assert!(materialization.transformed_weights > 0);
+            assert!(materialization.source_bytes_read > materialization.output_bytes);
+            assert!(materialization.peak_planned_working_set_bytes <= materialization.output_bytes);
+
+            let mut cached_cache = cached.new_cache();
+            let mut quantized_cache = quantized.new_cache();
+            for tokens in [
+                Array::from_slice(&[1u32, 2], &[1, 2]),
+                Array::from_slice(&[3u32], &[1, 1]),
+            ] {
+                let expected = cached
+                    .forward(&tokens, &mut cached_cache, gpu.stream())
+                    .unwrap();
+                let actual = quantized
+                    .forward(&tokens, &mut quantized_cache, gpu.stream())
+                    .unwrap();
+                assert_close(&actual, &expected);
+            }
         }
     }
 

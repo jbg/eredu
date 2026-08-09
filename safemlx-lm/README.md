@@ -1119,7 +1119,7 @@ The remaining global limitations are:
   admission and runtime windows count only the final packed bytes. The
   contiguous-span type cannot be constructed for packed GGUF
   encodings, and quantizing an already quantized checkpoint is intentionally
-  unsupported. Inkling and Nemotron-H now share the affine grouped rank-3
+  unsupported. Inkling and Nemotron-H now share the affine/MXFP4 grouped rank-3
   expert primitive with the other MoE implementations. Their packed semantic
   adapters, high-level load dispatch, independent expert-cache construction,
   and pipeline-stage construction use the shared packed materialization
@@ -1136,9 +1136,10 @@ The remaining global limitations are:
   host-layerwise, and dense-streamed execution without selecting independent
   expert residency. This includes DeepSeek-V3/R1, Kimi Linear,
   Qwen3-Next/Qwen3.5-MoE, Qwen3-VL-MoE, LFM2-MoE, Gemma 4 MoE, and GPT-OSS.
-  Inkling supports affine and MXFP4 conversion for every eligible text target;
-  Nemotron-H conversion remains affine-only because its ReLU2 grouped-expert
-  kernel has no MXFP4 target representation.
+  Inkling and Nemotron-H support affine and MXFP4 conversion for every eligible
+  text target. Nemotron-H applies ReLU2 between two shared packed grouped
+  projections; MXFP4 scale-only banks use the same route ordering, empty-route,
+  cache, and Cartesian ownership contracts as affine weight/scale/bias banks.
 
 TP+PP+EP is executable for DeepSeek-V3/R1, Qwen3-MoE, Qwen3-VL-MoE, Kimi
 Linear, Inkling, GPT-OSS, Gemma 4 MoE, LFM2-MoE, Nemotron-H-MoE, and
@@ -1796,7 +1797,7 @@ weights.
 | Gemma 4 assistant | yes | MLX affine/MXFP4 and uniform packed GGUF affine | yes / yes | `LoadedDrafter` with `ModelLoadOptions` | Transformer/projection/head targets; ordered masked-embedding heads return a capability error |
 | GPT-OSS | dense attention, MXFP4 experts | checkpoint-native MXFP4 experts plus `gpt-oss` GGUF | no / yes | `LoadedModel` | Canonical GGUF type-39 experts stay packed; mixed dense projections use their exact GGUF formats |
 | Inkling | yes | packed GGUF affine/IQ/MXFP4 | yes / yes | `LoadedModel` | `inkling` text GGUF plus sibling combined hMLP/dMel mmproj; hMLP/dMel stay dense while every eligible text projection and complete shared/routed expert bank uses the packed overlay across fully resident, bounded nonresident, independent-cache, and Cartesian execution |
-| Nemotron-H | yes | checkpoint-native packed GGUF affine/IQ | yes / no | `LoadedModel` | ReLU2 routed experts execute through the shared affine grouped rank-3 primitive; complete expert banks and ordinary targets use the affine packed overlay across fully resident, bounded nonresident, independent-cache, and Cartesian execution |
+| Nemotron-H | yes | MLX affine/MXFP4 and checkpoint-native packed GGUF affine/IQ | yes / yes | `LoadedModel` | ReLU2 routed experts execute through the shared packed grouped rank-3 primitive; complete expert banks and ordinary targets use the affine/MXFP4 overlay across fully resident, bounded nonresident, independent-cache, and Cartesian execution |
 | Qwen3.5/3.6-MoE | yes | block FP8, MLX affine/MXFP4 | yes / yes, from dense checkpoints | `LoadedModel` | Rank-3 expert banks are quantized row-wise and executed with routed `gather_qmm`; native FP8 checkpoints are never implicitly transcoded |
 | Qwen3-Next | yes | native block FP8, MLX affine/MXFP4 | yes / yes, from dense checkpoints | `LoadedModel` | Official dynamic E4M3 128 x 128 checkpoints work with resident, layerwise, sparse expert-cache, and expert-parallel policies; fused weights/scales are split while streaming and native FP8 is never implicitly transcoded |
 | Moshi | yes | MLX affine/MXFP4 | yes / yes | realtime loader | Temporal/depth projections and embeddings; no codec dependency |
@@ -2349,6 +2350,9 @@ The model-parity Ring test uses tiny deterministic complete-model references
 and checks prefill, two cached decode steps, and three synchronized tokens for
 dense and affine-packed Qwen3/DeepSeek banks, native DeepSeek block-FP8, and
 sparse expert-cache EP for every supported MoE family.
+The Nemotron-H PP+EP requantization cases select MXFP4 for both fully resident
+rank-local expert banks and independent expert caches, and cover prompt-cache
+reload plus synchronized decode/generation.
 It also runs packed Qwen with round-robin placement and split DeepSeek with an
 explicit non-contiguous owner map.
 The separate

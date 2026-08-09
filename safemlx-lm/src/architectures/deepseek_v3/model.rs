@@ -959,7 +959,7 @@ impl PackedHeadProjection {
         let group_ids = Array::from_slice(&ids, &[routes]);
         let input = input.reshape(&[routes, input.dim(-1)], stream)?;
         let output = if let Some(affine) = self.affine {
-            common::moe::affine_grouped_linear_with_transpose(
+            common::moe::packed_grouped_linear_with_transpose(
                 &input,
                 self.weight.as_ref(),
                 self.scales.as_ref().as_ref().expect("packed head scales"),
@@ -1979,7 +1979,7 @@ impl RoutedExperts {
             )?;
             native_grouped_linear(input, &native, group_ids, stream)
         } else if let Some(affine) = affine {
-            common::moe::affine_grouped_linear(
+            common::moe::packed_grouped_linear(
                 input,
                 weight,
                 affine_scales.expect("affine routed-expert scales loaded"),

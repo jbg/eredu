@@ -23,12 +23,12 @@ use crate::{
 
 use super::layers::{relu2, silu};
 
-/// Applies one affine-quantized packed expert projection to expert-major rows.
+/// Applies one affine- or MXFP4-packed expert projection to expert-major rows.
 ///
 /// The packed weight and its metadata keep the expert dimension leading, so
 /// this is usable by any checkpoint layout once split experts have been
 /// assembled into `[experts, output, input]` banks.
-pub fn affine_grouped_linear(
+pub fn packed_grouped_linear(
     input: &Array,
     weight: &Array,
     scales: &Array,
@@ -37,7 +37,7 @@ pub fn affine_grouped_linear(
     quantization: WeightQuantization,
     stream: &Stream,
 ) -> Result<Array, Exception> {
-    affine_grouped_linear_with_transpose(
+    packed_grouped_linear_with_transpose(
         input,
         weight,
         scales,
@@ -49,9 +49,9 @@ pub fn affine_grouped_linear(
     )
 }
 
-/// Applies an affine packed grouped projection in either matrix direction.
+/// Applies a packed grouped projection in either matrix direction.
 #[allow(clippy::too_many_arguments)]
-pub fn affine_grouped_linear_with_transpose(
+pub fn packed_grouped_linear_with_transpose(
     input: &Array,
     weight: &Array,
     scales: &Array,
@@ -61,7 +61,7 @@ pub fn affine_grouped_linear_with_transpose(
     transpose: bool,
     stream: &Stream,
 ) -> Result<Array, Exception> {
-    affine_grouped_linear_with_options(
+    packed_grouped_linear_with_options(
         input,
         weight,
         scales,
@@ -74,9 +74,9 @@ pub fn affine_grouped_linear_with_transpose(
     )
 }
 
-/// Applies an affine packed grouped projection with explicit route-order metadata.
+/// Applies a packed grouped projection with explicit route-order metadata.
 #[allow(clippy::too_many_arguments)]
-pub fn affine_grouped_linear_with_options(
+pub fn packed_grouped_linear_with_options(
     input: &Array,
     weight: &Array,
     scales: &Array,
@@ -904,7 +904,7 @@ impl PackedSwiGluExperts {
             )?;
             native_grouped_linear(&hidden, &native, &plan.sorted_group_ids, stream)?
         } else if let Some(quantization) = self.gate_up_affine {
-            affine_grouped_linear(
+            packed_grouped_linear(
                 &hidden,
                 self.gate_up_proj.as_ref(),
                 self.gate_up_proj_scales
@@ -938,7 +938,7 @@ impl PackedSwiGluExperts {
             )?;
             native_grouped_linear(&activated, &native, &plan.sorted_group_ids, stream)?
         } else if let Some(quantization) = self.down_affine {
-            affine_grouped_linear(
+            packed_grouped_linear(
                 &activated,
                 self.down_proj.as_ref(),
                 self.down_proj_scales

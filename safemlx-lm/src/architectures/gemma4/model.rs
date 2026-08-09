@@ -49,7 +49,7 @@ use crate::{
                 attention_probabilities, batch_seq, finish_attention, reshape_attention_projection,
             },
             generation::CausalLm,
-            moe::{affine_grouped_linear_with_options, top_k_softmax_routing, weighted_route_sum},
+            moe::{packed_grouped_linear_with_options, top_k_softmax_routing, weighted_route_sum},
         },
         input,
     },
@@ -2136,7 +2136,7 @@ impl ExpertProjection {
             return native_grouped_linear(hidden_states, &native, group_ids, stream);
         }
         if let Some(quantization) = self.quantization {
-            affine_grouped_linear_with_options(
+            packed_grouped_linear_with_options(
                 hidden_states,
                 self.weight.as_ref(),
                 self.scales

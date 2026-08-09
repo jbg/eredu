@@ -34,7 +34,7 @@ use safemlx_lm::{
     runtime::generation::sampler::DefaultSampler,
     runtime::{
         checkpoint::binding::canonical_checkpoint_name,
-        checkpoint::quantization::AffineQuantization,
+        checkpoint::quantization::{AffineQuantization, WeightQuantization},
         media::{input::InputPayload, PreparedModelInput},
         residency::policy::OffloadConfig,
         scheduler::{RequestId, RequestStatus, SchedulerLimits},
@@ -361,6 +361,8 @@ fn pipeline_ring_worker() {
     .then(|| {
         if family.is_multimodal() {
             multimodal_resident_reference(family, &checkpoint, &stream)
+        } else if family == FixtureFamily::NemotronH && std::env::var_os(REQUANTIZE).is_some() {
+            resident_reference_quantized(&checkpoint, Some(WeightQuantization::MxFp4), &stream)
         } else {
             resident_reference(&checkpoint, &stream)
         }
@@ -370,9 +372,14 @@ fn pipeline_ring_worker() {
     assert!(!(dense_stream && layerwise_host));
     let expert_cache = std::env::var_os(EXPERT_CACHE).is_some();
     let requantize = std::env::var_os(REQUANTIZE).is_some();
+    let requested_quantization = if family == FixtureFamily::NemotronH {
+        WeightQuantization::MxFp4
+    } else {
+        AffineQuantization::new(32, 4).unwrap().into()
+    };
     let base_options = || {
         if requantize {
-            ModelLoadOptions::with_quantization(AffineQuantization::new(32, 4).unwrap())
+            ModelLoadOptions::with_quantization(requested_quantization)
                 .with_parallel_topology(topology)
         } else {
             ModelLoadOptions::with_parallel(topology)
@@ -570,10 +577,7 @@ fn pipeline_ring_worker() {
             assert!(report.owned_bytes > 0);
             assert_eq!(report.device_resident_experts, 0);
             if requantize {
-                assert_eq!(
-                    report.weight_quantization,
-                    Some(AffineQuantization::new(32, 4).unwrap().into())
-                );
+                assert_eq!(report.weight_quantization, Some(requested_quantization));
                 let materialization = report.materialization.as_ref().unwrap();
                 assert!(materialization.transformed_weights > 0);
                 assert!(materialization.source_tiles > 0);
@@ -812,7 +816,19 @@ fn pipeline_ring_worker() {
 }
 
 fn resident_reference(checkpoint: &Path, stream: &Stream) -> (Vec<f32>, Vec<f32>) {
-    let mut model = safemlx_lm::api::load_model(checkpoint, stream, stream).unwrap();
+    resident_reference_quantized(checkpoint, None, stream)
+}
+
+fn resident_reference_quantized(
+    checkpoint: &Path,
+    quantization: Option<WeightQuantization>,
+    stream: &Stream,
+) -> (Vec<f32>, Vec<f32>) {
+    let options = quantization
+        .map(ModelLoadOptions::with_quantization)
+        .unwrap_or_default();
+    let mut model =
+        safemlx_lm::api::load_model_with_options(checkpoint, options, stream, stream).unwrap();
     let mut cache = model.new_cache();
     let prompt = Array::from_slice(&[1u32, 2], &[1, 2]);
     let parts = [safemlx_lm::runtime::media::input::InputPart::text_token_ids(&prompt)];
@@ -2457,16 +2473,16 @@ fn nemotron_config() -> serde_json::Value {
 fn nemotron_quantizable_config() -> serde_json::Value {
     let mut value = nemotron_config();
     value["vocab_size"] = 64.into();
-    value["hidden_size"] = 32.into();
-    value["intermediate_size"] = 32.into();
-    value["num_attention_heads"] = 4.into();
-    value["num_key_value_heads"] = 2.into();
+    value["hidden_size"] = 64.into();
+    value["intermediate_size"] = 64.into();
+    value["num_attention_heads"] = 8.into();
+    value["num_key_value_heads"] = 4.into();
     value["head_dim"] = 8.into();
-    value["mamba_num_heads"] = 4.into();
+    value["mamba_num_heads"] = 8.into();
     value["mamba_head_dim"] = 8.into();
     value["n_groups"] = 2.into();
-    value["moe_intermediate_size"] = 32.into();
-    value["moe_shared_expert_intermediate_size"] = 32.into();
+    value["moe_intermediate_size"] = 64.into();
+    value["moe_shared_expert_intermediate_size"] = 64.into();
     value
 }
 
@@ -4100,7 +4116,7 @@ fn ring_eight_process_nemotron_h_moe_triple_axis() {
     run_ring_cartesian_pipeline(false, FixtureFamily::NemotronH, "tp-pp-ep");
 }
 
-/// Exercises dense-streamed non-experts and independently cached
+/// Exercises bounded MXFP4 dense-streamed non-experts and independently cached
 /// Nemotron-H routed experts across all three Cartesian axes.
 #[test]
 #[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
@@ -4109,7 +4125,7 @@ fn ring_eight_process_nemotron_h_moe_streamed_triple_axis_expert_cache() {
         true,
         FixtureFamily::NemotronH,
         "tp-pp-ep",
-        WorkerMode::ExpertCache,
+        WorkerMode::ExpertCacheRequantize,
     );
 }
 
@@ -4158,7 +4174,7 @@ fn ring_four_process_nemotron_h_moe_pipeline_expert_cache_mismatch_consensus() {
     );
 }
 
-/// Proves bounded affine materialization feeds stage-local Nemotron-H expert
+/// Proves bounded MXFP4 materialization feeds stage-local Nemotron-H expert
 /// caches under PP+EP, including persistence and synchronized decode.
 #[test]
 #[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
@@ -4171,7 +4187,7 @@ fn ring_four_process_nemotron_h_quantized_pipeline_expert_cache() {
     );
 }
 
-/// Proves a PP+EP stage can bounded-quantize and pin its complete rank-local
+/// Proves a PP+EP stage can bounded-MXFP4-quantize and pin its complete rank-local
 /// Nemotron-H expert banks without introducing an independent expert cache.
 #[test]
 #[ignore = "spawns local processes and opens loopback sockets; run explicitly"]

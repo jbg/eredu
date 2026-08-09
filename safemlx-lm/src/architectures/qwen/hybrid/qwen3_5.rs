@@ -2603,7 +2603,7 @@ impl Experts {
             )?;
             native_grouped_linear(&hidden, &native, &plan.sorted_group_ids, stream)?
         } else if let Some(affine) = self.gate_up_affine {
-            common::moe::affine_grouped_linear(
+            common::moe::packed_grouped_linear(
                 &hidden,
                 self.gate_up_proj.as_ref(),
                 self.gate_up_proj_scales
@@ -2647,7 +2647,7 @@ impl Experts {
             )?;
             native_grouped_linear(&current, &native, &plan.sorted_group_ids, stream)?
         } else if let Some(affine) = self.down_affine {
-            common::moe::affine_grouped_linear(
+            common::moe::packed_grouped_linear(
                 &current,
                 self.down_proj.as_ref(),
                 self.down_proj_scales
@@ -2710,7 +2710,7 @@ impl Experts {
             )?;
             native_grouped_linear(&hidden, &native, &plan.sorted_group_ids, stream)?
         } else if let Some(affine) = self.gate_up_affine {
-            common::moe::affine_grouped_linear(
+            common::moe::packed_grouped_linear(
                 &hidden,
                 self.gate_up_proj.as_ref(),
                 self.gate_up_proj_scales
@@ -2763,7 +2763,7 @@ impl Experts {
             )?;
             native_grouped_linear(&current, &native, &plan.sorted_group_ids, stream)?
         } else if let Some(affine) = self.down_affine {
-            common::moe::affine_grouped_linear(
+            common::moe::packed_grouped_linear(
                 &current,
                 self.down_proj.as_ref(),
                 self.down_proj_scales

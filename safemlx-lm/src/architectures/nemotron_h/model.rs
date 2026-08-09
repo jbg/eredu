@@ -34,7 +34,7 @@ use crate::{
             generation::CausalLm,
             layers::relu2,
             linear::project_logits_maybe_quantized,
-            moe::{affine_grouped_linear, weighted_route_sum, TopKRouterScoreFunction},
+            moe::{packed_grouped_linear, weighted_route_sum, TopKRouterScoreFunction},
         },
         input,
     },
@@ -327,9 +327,9 @@ pub struct ModelArgs {
     pub norm_topk_prob: bool,
     /// Source checkpoint dtype label.
     pub torch_dtype: Option<String>,
-    /// Optional MLX affine quantization settings.
-    pub quantization: Option<AffineQuantization>,
-    /// Exact affine-quantized weight names.
+    /// Optional uniform MLX affine or MXFP4 quantization settings.
+    pub quantization: Option<WeightQuantization>,
+    /// Exact quantized weight names.
     pub quantized_weights: Option<HashSet<String>>,
     /// Per-weight GGUF quantization layouts.
     pub quantized_weight_configs: Option<HashMap<String, WeightQuantization>>,
@@ -435,7 +435,7 @@ impl ModelArgsSource {
             topk_group: self.topk_group,
             norm_topk_prob: self.norm_topk_prob,
             torch_dtype: self.torch_dtype,
-            quantization: self.quantization,
+            quantization: self.quantization.map(Into::into),
             quantized_weights: self.quantized_weights,
             quantized_weight_configs: self.quantized_weight_configs,
         })
@@ -460,25 +460,15 @@ impl ModelArgs {
             .join(",")
     }
 
-    pub(crate) fn affine_quantization_for(&self, weight_name: &str) -> Option<AffineQuantization> {
+    pub(crate) fn weight_quantization_for(&self, weight_name: &str) -> Option<WeightQuantization> {
         if let Some(configs) = &self.quantized_weight_configs {
-            return match configs.get(weight_name).copied() {
-                Some(WeightQuantization::Affine(affine)) => Some(affine),
-                _ => None,
-            };
+            return configs.get(weight_name).copied();
         }
         let quantization = self.quantization?;
         match &self.quantized_weights {
             Some(names) if !names.contains(weight_name) => None,
             _ => Some(quantization),
         }
-    }
-
-    pub(crate) fn weight_quantization_for(&self, weight_name: &str) -> Option<WeightQuantization> {
-        if let Some(configs) = &self.quantized_weight_configs {
-            return configs.get(weight_name).copied();
-        }
-        self.affine_quantization_for(weight_name).map(Into::into)
     }
 
     fn layer_policy(&self, index: usize) -> Result<LayerPolicy, Error> {
@@ -929,10 +919,10 @@ pub struct Experts {
     pub hidden_size: i32,
     /// Per-expert intermediate dimension.
     pub intermediate_size: i32,
-    /// Optional affine settings for the up-projection bank.
-    pub up_quantization: Option<AffineQuantization>,
-    /// Optional affine settings for the down-projection bank.
-    pub down_quantization: Option<AffineQuantization>,
+    /// Optional affine or MXFP4 settings for the up-projection bank.
+    pub up_quantization: Option<WeightQuantization>,
+    /// Optional affine or MXFP4 settings for the down-projection bank.
+    pub down_quantization: Option<WeightQuantization>,
     /// Optional checkpoint-native IQ settings for the up-projection bank.
     pub up_iquant: Option<WeightQuantization>,
     /// Optional checkpoint-native IQ settings for the down-projection bank.
@@ -941,26 +931,26 @@ pub struct Experts {
     /// Expert up-projection weights.
     pub up_proj: Param<Array>,
     #[param]
-    /// Expert up-projection affine scales.
+    /// Expert up-projection packed scales.
     pub up_proj_scales: Param<Option<Array>>,
     #[param]
-    /// Expert up-projection affine biases.
+    /// Expert up-projection affine biases, absent for MXFP4.
     pub up_proj_biases: Param<Option<Array>>,
     #[param]
     /// Expert down-projection weights.
     pub down_proj: Param<Array>,
     #[param]
-    /// Expert down-projection affine scales.
+    /// Expert down-projection packed scales.
     pub down_proj_scales: Param<Option<Array>>,
     #[param]
-    /// Expert down-projection affine biases.
+    /// Expert down-projection affine biases, absent for MXFP4.
     pub down_proj_biases: Param<Option<Array>>,
 }
 
 type ExpertProjectionParams = (Param<Array>, Param<Option<Array>>, Param<Option<Array>>);
 
 impl Experts {
-    /// Creates an unloaded dense or affine-quantized expert bank.
+    /// Creates an unloaded dense, packed, or checkpoint-native IQ expert bank.
     pub fn new(
         num_experts: i32,
         hidden_size: i32,
@@ -968,23 +958,17 @@ impl Experts {
         quantization: [Option<WeightQuantization>; 2],
         stream: &Stream,
     ) -> Result<Self, Exception> {
-        let split = |quantization| -> Result<_, Exception> {
-            Ok(match quantization {
-                Some(WeightQuantization::Affine(affine)) => (Some(affine), None),
+        let split = |quantization| {
+            Ok::<_, Exception>(match quantization {
                 Some(iq @ WeightQuantization::GgufIQuant { .. }) => (None, Some(iq)),
-                None => (None, None),
-                Some(other) => {
-                    return Err(Exception::custom(format!(
-                        "unsupported Nemotron-H routed expert quantization {other:?}"
-                    )))
-                }
+                packed => (packed, None),
             })
         };
         let (up_quantization, up_iquant) = split(quantization[0])?;
         let (down_quantization, down_iquant) = split(quantization[1])?;
         let projection = |out_features: i32,
                           in_features: i32,
-                          quantization: Option<AffineQuantization>,
+                          quantization: Option<WeightQuantization>,
                           iquant: Option<WeightQuantization>|
          -> Result<ExpertProjectionParams, Exception> {
             if let Some(iquant) = iquant {
@@ -1012,7 +996,7 @@ impl Experts {
                         &[
                             num_experts,
                             out_features,
-                            quantized_packed_dimension(in_features, quantization.bits),
+                            quantized_packed_dimension(in_features, quantization.bits()),
                         ],
                         Dtype::Uint32,
                         stream,
@@ -1021,20 +1005,28 @@ impl Experts {
                         &[
                             num_experts,
                             out_features,
-                            in_features / quantization.group_size,
+                            in_features / quantization.group_size(),
                         ],
-                        Dtype::Float16,
+                        if quantization == WeightQuantization::MxFp4 {
+                            Dtype::Uint8
+                        } else {
+                            Dtype::Float16
+                        },
                         stream,
                     )?,
-                    Param::<Option<Array>>::unloaded_some(
-                        &[
-                            num_experts,
-                            out_features,
-                            in_features / quantization.group_size,
-                        ],
-                        Dtype::Float16,
-                        stream,
-                    )?,
+                    if quantization.has_biases() {
+                        Param::<Option<Array>>::unloaded_some(
+                            &[
+                                num_experts,
+                                out_features,
+                                in_features / quantization.group_size(),
+                            ],
+                            Dtype::Float16,
+                            stream,
+                        )?
+                    } else {
+                        Param::new(None)
+                    },
                 )),
                 None => Ok((
                     Param::<Array>::unloaded(
@@ -1094,7 +1086,7 @@ impl Experts {
             native_grouped_linear(&hidden, &native, &plan.sorted_group_ids, stream)?
         } else {
             match self.up_quantization {
-                Some(quantization) => affine_grouped_linear(
+                Some(quantization) => packed_grouped_linear(
                     &hidden,
                     &self.up_proj,
                     self.up_proj_scales
@@ -1103,7 +1095,7 @@ impl Experts {
                         .expect("quantized expert scales"),
                     self.up_proj_biases.as_ref().as_ref(),
                     &plan.sorted_group_ids,
-                    WeightQuantization::Affine(quantization),
+                    quantization,
                     stream,
                 )?,
                 None => grouped_matmul(
@@ -1127,7 +1119,7 @@ impl Experts {
             native_grouped_linear(&hidden, &native, &plan.sorted_group_ids, stream)?
         } else {
             match self.down_quantization {
-                Some(quantization) => affine_grouped_linear(
+                Some(quantization) => packed_grouped_linear(
                     &hidden,
                     &self.down_proj,
                     self.down_proj_scales
@@ -1136,7 +1128,7 @@ impl Experts {
                         .expect("quantized expert scales"),
                     self.down_proj_biases.as_ref().as_ref(),
                     &plan.sorted_group_ids,
-                    WeightQuantization::Affine(quantization),
+                    quantization,
                     stream,
                 )?,
                 None => grouped_matmul(
@@ -4750,13 +4742,13 @@ mod tests {
             generation::CausalLm,
             moe::{quantize_expert_bank, TopKRouterScoreFunction},
         },
-        runtime::checkpoint::quantization::AffineQuantization,
+        runtime::checkpoint::quantization::{AffineQuantization, WeightQuantization},
         AttentionPolicy, LayerSchedule,
     };
     use safemlx::{
         module::{Module, ModuleParameters, Param},
-        ops::{dequantize, indexing::TryIndexOp},
-        Array, Device, DeviceType, Dtype, ExecutionContext,
+        ops::{dequantize_with_mode, indexing::TryIndexOp},
+        Array, Device, DeviceType, ExecutionContext,
     };
     use serde_json::json;
     use std::{
@@ -5056,10 +5048,9 @@ mod tests {
 
     #[test]
     #[ignore = "requires an MLX Metal device"]
-    fn affine_nemotron_experts_match_dequantized_reference_with_empty_routes() {
+    fn packed_nemotron_experts_match_dequantized_reference_with_empty_routes() {
         let context = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
         let stream = context.stream();
-        let quantization = AffineQuantization::new(32, 4).unwrap();
         let bank_values = |offset: usize| {
             (0..3 * 32 * 32)
                 .map(|index| {
@@ -5068,78 +5059,83 @@ mod tests {
                 })
                 .collect::<Vec<_>>()
         };
-        let up = Array::from_slice(&bank_values(0), &[3, 32, 32]);
-        let down = Array::from_slice(&bank_values(17), &[3, 32, 32]);
-        let up = quantize_expert_bank(&up, quantization.into(), stream).unwrap();
-        let down = quantize_expert_bank(&down, quantization.into(), stream).unwrap();
-        let up_scales = up.scales.as_dtype(Dtype::Float16, stream).unwrap();
-        let up_biases = up.biases.unwrap().as_dtype(Dtype::Float16, stream).unwrap();
-        let down_scales = down.scales.as_dtype(Dtype::Float16, stream).unwrap();
-        let down_biases = down
-            .biases
-            .unwrap()
-            .as_dtype(Dtype::Float16, stream)
-            .unwrap();
+        for quantization in [
+            WeightQuantization::Affine(AffineQuantization::new(32, 4).unwrap()),
+            WeightQuantization::MxFp4,
+        ] {
+            let up = Array::from_slice(&bank_values(0), &[3, 32, 32]);
+            let down = Array::from_slice(&bank_values(17), &[3, 32, 32]);
+            let up = quantize_expert_bank(&up, quantization, stream).unwrap();
+            let down = quantize_expert_bank(&down, quantization, stream).unwrap();
+            let up_scales = up.scales.clone();
+            let up_biases = up.biases.clone();
+            let down_scales = down.scales.clone();
+            let down_biases = down.biases.clone();
 
-        let mut packed = Experts::new(
-            3,
-            32,
-            32,
-            [Some(quantization.into()), Some(quantization.into())],
-            stream,
-        )
-        .unwrap();
-        packed.up_proj = Param::new(up.weight.clone());
-        packed.up_proj_scales = Param::new(Some(up_scales.clone()));
-        packed.up_proj_biases = Param::new(Some(up_biases.clone()));
-        packed.down_proj = Param::new(down.weight.clone());
-        packed.down_proj_scales = Param::new(Some(down_scales.clone()));
-        packed.down_proj_biases = Param::new(Some(down_biases.clone()));
+            let mut packed =
+                Experts::new(3, 32, 32, [Some(quantization), Some(quantization)], stream).unwrap();
+            packed.up_proj = Param::new(up.weight.clone());
+            packed.up_proj_scales = Param::new(Some(up_scales.clone()));
+            packed.up_proj_biases = Param::new(up_biases.clone());
+            packed.down_proj = Param::new(down.weight.clone());
+            packed.down_proj_scales = Param::new(Some(down_scales.clone()));
+            packed.down_proj_biases = Param::new(down_biases.clone());
 
-        let mut reference = Experts::new(3, 32, 32, [None, None], stream).unwrap();
-        reference.up_proj = Param::new(
-            dequantize(
-                &up.weight,
-                &up_scales,
-                &up_biases,
-                quantization.group_size,
-                quantization.bits,
-                stream,
-            )
-            .unwrap(),
-        );
-        reference.down_proj = Param::new(
-            dequantize(
-                &down.weight,
-                &down_scales,
-                &down_biases,
-                quantization.group_size,
-                quantization.bits,
-                stream,
-            )
-            .unwrap(),
-        );
+            let mut reference = Experts::new(3, 32, 32, [None, None], stream).unwrap();
+            reference.up_proj = Param::new(
+                dequantize_with_mode(
+                    &up.weight,
+                    &up_scales,
+                    up_biases.as_ref(),
+                    quantization.group_size(),
+                    quantization.bits(),
+                    quantization.mode(),
+                    stream,
+                )
+                .unwrap(),
+            );
+            reference.down_proj = Param::new(
+                dequantize_with_mode(
+                    &down.weight,
+                    &down_scales,
+                    down_biases.as_ref(),
+                    quantization.group_size(),
+                    quantization.bits(),
+                    quantization.mode(),
+                    stream,
+                )
+                .unwrap(),
+            );
 
-        let input_values = (0..3 * 32)
-            .map(|index| ((index * 7 % 29) as f32 - 14.0) / 16.0)
-            .collect::<Vec<_>>();
-        let hidden = Array::from_slice(&input_values, &[3, 32]);
-        // Expert 1 deliberately receives no routes.
-        let indices = Array::from_slice(&[2i32, 0, 2, 0, 2, 0], &[3, 2]);
-        let weights = Array::from_slice(&[0.75f32, 0.25, 0.6, 0.4, 0.9, 0.1], &[3, 2]);
-        let actual = packed.forward(&hidden, &indices, &weights, stream).unwrap();
-        let actual = actual.evaluated().unwrap();
-        let expected = reference
-            .forward(&hidden, &indices, &weights, stream)
-            .unwrap();
-        let expected = expected.evaluated().unwrap();
-        let maximum_error = actual
-            .as_slice::<f32>()
-            .iter()
-            .zip(expected.as_slice::<f32>())
-            .map(|(actual, expected)| (actual - expected).abs())
-            .fold(0.0f32, f32::max);
-        assert!(maximum_error < 2e-2, "maximum error {maximum_error}");
+            let input_values = (0..3 * 32)
+                .map(|index| ((index * 7 % 29) as f32 - 14.0) / 16.0)
+                .collect::<Vec<_>>();
+            let hidden = Array::from_slice(&input_values, &[3, 32]);
+            // Expert 1 deliberately receives no routes.
+            let indices = Array::from_slice(&[2i32, 0, 2, 0, 2, 0], &[3, 2]);
+            let weights = Array::from_slice(&[0.75f32, 0.25, 0.6, 0.4, 0.9, 0.1], &[3, 2]);
+            let actual = packed.forward(&hidden, &indices, &weights, stream).unwrap();
+            let actual = actual.evaluated().unwrap();
+            let expected = reference
+                .forward(&hidden, &indices, &weights, stream)
+                .unwrap();
+            let expected = expected.evaluated().unwrap();
+            let maximum_error = actual
+                .as_slice::<f32>()
+                .iter()
+                .zip(expected.as_slice::<f32>())
+                .map(|(actual, expected)| (actual - expected).abs())
+                .fold(0.0f32, f32::max);
+            let tolerance = if quantization == WeightQuantization::MxFp4 {
+                0.4
+            } else {
+                2e-2
+            };
+            assert!(
+                maximum_error < tolerance,
+                "{quantization:?} maximum error {maximum_error}"
+            );
+        }
     }
 
     #[test]

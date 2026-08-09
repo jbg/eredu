@@ -4788,17 +4788,22 @@ fn load_tokenizer_accepts_top_level_qwen3_5_moe_metadata() {
 
 #[test]
 fn load_policy_admits_fully_resident_inkling_and_nemotron_materialization() {
-    let options = ModelLoadOptions::with_quantization(AffineQuantization::default());
-    for kind in [
-        super::config::ModelKind::Inkling,
-        super::config::ModelKind::NemotronH,
+    for quantization in [
+        WeightQuantization::Affine(AffineQuantization::default()),
+        WeightQuantization::MxFp4,
     ] {
-        super::config::validate_load_policy(
-            kind,
-            super::config::ArtifactLoadKind::Safetensors,
-            options,
-        )
-        .unwrap();
+        let options = ModelLoadOptions::with_quantization(quantization);
+        for kind in [
+            super::config::ModelKind::Inkling,
+            super::config::ModelKind::NemotronH,
+        ] {
+            super::config::validate_load_policy(
+                kind,
+                super::config::ArtifactLoadKind::Safetensors,
+                options,
+            )
+            .unwrap();
+        }
     }
 }
 

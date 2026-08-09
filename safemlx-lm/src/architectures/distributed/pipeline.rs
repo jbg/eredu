@@ -11588,7 +11588,7 @@ fn load_nemotron_h_pipeline(
             .as_ref()
             .map(ExpertAssignment::global_expert_count),
     )?;
-    let existing = source_args.quantization.map(WeightQuantization::Affine);
+    let existing = source_args.quantization;
     let quantize_on_load = requested_quantization
         .map(|requested| {
             crate::runtime::checkpoint::quantization::should_quantize_on_load(
@@ -11596,23 +11596,17 @@ fn load_nemotron_h_pipeline(
                 existing,
                 requested,
             )
-            .and_then(|required| match (required, requested) {
-                (false, _) => Ok(None),
-                (true, WeightQuantization::Affine(affine)) => Ok(Some(affine)),
-                (true, _) => Err(Error::Quantization(
-                    "Nemotron-H pipeline load-time quantization supports MLX affine weights".into(),
-                )),
-            })
+            .map(|required| required.then_some(requested))
         })
         .transpose()?
         .flatten();
     let mut target_args = source_args.clone();
-    if let Some(affine) = quantize_on_load {
-        target_args.quantization = Some(affine);
+    if let Some(quantization) = quantize_on_load {
+        target_args.quantization = Some(quantization);
         target_args.quantized_weights = None;
         target_args.quantized_weight_configs = None;
     }
-    let expert_quantization = quantize_on_load.map(WeightQuantization::Affine);
+    let expert_quantization = quantize_on_load;
     let mut target_binding_adapter = if expert_cache_options.is_some() {
         NemotronHLayerwiseAdapter::new_external_experts(target_args.clone(), stream)?
     } else {
@@ -11708,7 +11702,7 @@ fn load_nemotron_h_pipeline(
             )
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let requested = quantize_on_load.map(WeightQuantization::Affine);
+    let requested = quantize_on_load;
     let static_roles = selected_pipeline_static_roles([
         (
             "embedding",
