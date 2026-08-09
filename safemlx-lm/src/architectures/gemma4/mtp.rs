@@ -15,7 +15,7 @@ use crate::{
     runtime::generation::sampler::SpeculativeSampler,
     runtime::generation::speculative::{
         self as mtp, MtpBackend, MtpCommit, MtpConfig, MtpExecutionStreams, MtpPrefill,
-        MtpSchedulerOptions, MtpSemanticState,
+        MtpSchedulerOptions, MtpSemanticState, MtpStreamTopology,
     },
     runtime::generation::streaming::{FinishReason, GenerationCancellationToken, SemanticEvent},
 };
@@ -190,6 +190,18 @@ impl<'a, T> Gemma4MtpBackend<'a, T> {
             return Ok(state.clone());
         }
 
+        if !streams.crosses_devices() {
+            let _completion = streams.wait_for_target_outputs(
+                std::iter::once(&state.hidden).chain(
+                    state
+                        .shared_kv
+                        .values()
+                        .flat_map(|(keys, values)| [keys, values]),
+                ),
+            )?;
+            return Ok(state.clone());
+        }
+
         eval(
             std::iter::once(&state.hidden).chain(
                 state
@@ -199,10 +211,6 @@ impl<'a, T> Gemma4MtpBackend<'a, T> {
             ),
         )?;
         streams.target().synchronize()?;
-
-        if !streams.crosses_devices() {
-            return Ok(state.clone());
-        }
 
         let hidden = state.hidden.copy(streams.draft())?;
         let shared_kv = state
@@ -284,13 +292,17 @@ impl<T: Gemma4MtpTarget> MtpBackend for Gemma4MtpBackend<'_, T> {
     ) -> Result<Self::DraftState, Exception> {
         let state = Self::state_on_draft_stream(state, streams)?;
         if self.draft_embedding.is_none() {
-            if streams.is_split() {
+            if streams.crosses_devices() {
                 streams.target().synchronize()?;
             }
-            self.draft_embedding = Some(
-                self.target
-                    .mtp_embedding_snapshot(streams.draft(), streams.crosses_devices())?,
-            );
+            let embedding = self
+                .target
+                .mtp_embedding_snapshot(streams.draft(), streams.crosses_devices())?;
+            if streams.topology() == MtpStreamTopology::SameDeviceSplit {
+                let _completion =
+                    streams.wait_for_target_outputs(embedding.materialization_arrays())?;
+            }
+            self.draft_embedding = Some(embedding);
         }
         let offset = i32::try_from(state.cache_len)
             .map_err(|_| Exception::custom("Gemma 4 MTP cache offset exceeds i32"))?;

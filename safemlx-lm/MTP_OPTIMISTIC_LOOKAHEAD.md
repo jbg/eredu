@@ -11,20 +11,23 @@ promoted only when every invariant below holds.
 - `Single`: target and draft operations use one ordered stream; same-request
   lookahead is not submitted because it cannot overlap target work.
 - `SameDeviceSplit`: distinct streams use the same device. Target-produced
-  arrays are evaluated and the producing stream is synchronized at a true
-  dependency boundary, then draft execution reuses their MLX array handles and
-  physical storage. No `Array::copy` is performed.
+  arrays are submitted with a completion event and the consuming stream waits
+  on that event at the true dependency boundary. The host is not synchronized;
+  draft execution reuses the same MLX array handles and physical storage. No
+  `Array::copy` is performed.
 - `CrossDeviceSplit`: target and draft streams use different devices. The same
-  dependency synchronization is followed by the physical copies required to
-  move target state, draft distributions, and stochastic draft roots.
+  dependency boundary remains host-synchronized because backend events reject
+  incompatible devices, then physical copies move target state, draft
+  distributions, and stochastic draft roots.
 
 For either split topology, target verification is submitted with `async_eval`
 before optional draft work. The scheduler is deliberately single-threaded:
 MLX operations are enqueued sequentially by the host onto distinct streams,
 while the device runtimes may execute independent command queues concurrently.
-The target stream is observed only during verification resolution. The draft
-stream is synchronized before its distributions are consumed by the target or
-its branch state is promoted.
+The target stream is observed only during verification resolution. On a
+same-device split, proposal distributions are event-ordered onto the target
+stream; cross-device distribution transfer still synchronizes the draft host
+boundary before copying.
 
 Two streams on one GPU do not imply a performance win. Target and assistant
 kernels contend for the same compute and memory bandwidth, so same-device

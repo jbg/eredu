@@ -78,7 +78,9 @@ Draft and optimistic branches never publish events.
 `MtpExecutionStreams::new(target, draft)` supports CPU drafting with a GPU
 target, different GPUs, and two distinct streams on the same GPU. A same-GPU
 split is an explicit experiment: it enables eligible lookahead but can contend
-for the same compute and memory bandwidth. `MtpSchedulerOptions` bounds
+for the same compute and memory bandwidth. Same-device target/draft handoffs
+are backend-ordered with completion events and do not block the host;
+cross-device handoffs synchronize before copying. `MtpSchedulerOptions` bounds
 in-flight verification and optimistic branches; `.with_lookahead(false)`
 provides the canonical equivalence baseline.
 

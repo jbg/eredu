@@ -2368,6 +2368,18 @@ pub struct Gemma4Embedding {
 }
 
 impl Gemma4Embedding {
+    /// Arrays whose materialization makes this embedding safe to consume from
+    /// another stream on the same device.
+    pub(crate) fn materialization_arrays(&self) -> Vec<&Array> {
+        if let Some(native) = &self.native {
+            return vec![native.storage().bytes()];
+        }
+        std::iter::once(self.weight.as_ref())
+            .chain(self.scales.as_ref().as_ref())
+            .chain(self.biases.as_ref().as_ref())
+            .collect()
+    }
+
     /// Creates an unloaded embedding table.
     pub fn unloaded(
         vocab_size: i32,

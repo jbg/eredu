@@ -9,8 +9,8 @@ use safemlx::{
     error::Exception,
     ops::{indexing::TryIndexOp, maximum, softmax_axis},
     random::{self, RandomState},
-    transforms::{async_eval, eval},
-    Array, Stream,
+    transforms::{async_eval, async_eval_with_event, eval},
+    Array, Event, Stream,
 };
 
 use crate::{
@@ -43,7 +43,8 @@ enum DrafterModel {
 /// distinct streams places target prefill/verification and accepted-token
 /// sampling on `target`, while proposal generation runs on `draft`. Submitted
 /// target verification remains unresolved while eligible draft work runs;
-/// explicit synchronization is retained at state/data dependency boundaries.
+/// same-device dependencies use backend-ordered completion events, while
+/// cross-device copies retain host synchronization at transfer boundaries.
 #[derive(Debug, Clone, Copy)]
 pub struct MtpExecutionStreams<'a> {
     target: &'a Stream,
@@ -122,6 +123,43 @@ impl<'a> MtpExecutionStreams<'a> {
     /// Returns whether arrays must be physically transferred between devices.
     pub const fn crosses_devices(self) -> bool {
         matches!(self.topology, MtpStreamTopology::CrossDeviceSplit)
+    }
+
+    /// Submits target outputs and orders subsequent draft work after them.
+    ///
+    /// This is only valid for distinct streams on the same device. The
+    /// returned event may be dropped after this call: MLX retains it for the
+    /// queued consumer wait.
+    pub(crate) fn wait_for_target_outputs<'b>(
+        self,
+        outputs: impl IntoIterator<Item = &'b Array>,
+    ) -> Result<Event, Exception> {
+        self.wait_for_same_device_outputs(outputs, self.draft, "target-to-draft")
+    }
+
+    /// Submits draft outputs and orders subsequent target work after them.
+    pub(crate) fn wait_for_draft_outputs<'b>(
+        self,
+        outputs: impl IntoIterator<Item = &'b Array>,
+    ) -> Result<Event, Exception> {
+        self.wait_for_same_device_outputs(outputs, self.target, "draft-to-target")
+    }
+
+    fn wait_for_same_device_outputs<'b>(
+        self,
+        outputs: impl IntoIterator<Item = &'b Array>,
+        consumer: &Stream,
+        direction: &str,
+    ) -> Result<Event, Exception> {
+        if self.topology != MtpStreamTopology::SameDeviceSplit {
+            return Err(Exception::custom(format!(
+                "MTP {direction} event handoff requires distinct streams on one device, got {}",
+                self.topology
+            )));
+        }
+        let completion = async_eval_with_event(outputs)?;
+        completion.wait_on(consumer)?;
+        Ok(completion)
     }
 }
 
@@ -1514,12 +1552,16 @@ where
         }
 
         if request.config.temperature != 0.0 && self.streams.is_split() {
-            eval(proposals.iter().map(|proposal| &proposal.distribution))?;
-            self.streams.draft().synchronize()?;
             if self.streams.crosses_devices() {
+                eval(proposals.iter().map(|proposal| &proposal.distribution))?;
+                self.streams.draft().synchronize()?;
                 for proposal in &mut proposals {
                     proposal.distribution = proposal.distribution.copy(self.streams.target())?;
                 }
+            } else {
+                let _completion = self.streams.wait_for_draft_outputs(
+                    proposals.iter().map(|proposal| &proposal.distribution),
+                )?;
             }
         }
         let target_raw = B::verification_logits(&flight.verification);
@@ -1931,14 +1973,15 @@ fn split_random_states(
     let target_key = root.next_key(streams.target())?;
     let draft_key = root.next_key(streams.target())?;
     let draft_key = if streams.is_split() {
-        eval([&draft_key])?;
-        streams.target().synchronize()?;
         if streams.crosses_devices() {
+            eval([&draft_key])?;
+            streams.target().synchronize()?;
             let copied = draft_key.copy(streams.draft())?;
             eval([&copied])?;
             streams.draft().synchronize()?;
             copied
         } else {
+            let _completion = streams.wait_for_target_outputs([&draft_key])?;
             draft_key
         }
     } else {
@@ -3469,6 +3512,44 @@ mod tests {
     }
 
     #[test]
+    fn same_device_event_handoffs_order_both_cpu_stream_directions() {
+        let target = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        let draft = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        let streams = MtpExecutionStreams::new(target.stream(), draft.stream()).unwrap();
+        assert_eq!(streams.topology(), MtpStreamTopology::SameDeviceSplit);
+
+        let lhs = Array::ones::<f32>(&[1024, 1024], target.stream()).unwrap();
+        let rhs = Array::ones::<f32>(&[1024, 1024], target.stream()).unwrap();
+        let target_output = lhs.matmul(&rhs, target.stream()).unwrap();
+        let target_handoff = streams.wait_for_target_outputs([&target_output]).unwrap();
+        assert!(
+            !target_handoff.is_complete().unwrap(),
+            "the MTP target-to-draft handoff blocked the host"
+        );
+
+        let draft_output = target_output
+            .add(Array::from_f32(1.0), draft.stream())
+            .unwrap();
+        let draft_handoff = streams.wait_for_draft_outputs([&draft_output]).unwrap();
+        let consumed = draft_output
+            .add(Array::from_f32(1.0), target.stream())
+            .unwrap();
+        let consumed_completion = async_eval_with_event([&consumed]).unwrap();
+
+        // Queued waits retain both handoffs after their public handles drop.
+        drop(target_handoff);
+        drop(draft_handoff);
+        consumed_completion.synchronize().unwrap();
+        assert_eq!(
+            consumed
+                .try_index_device((0, 0), target.stream())
+                .unwrap()
+                .item::<f32>(target.stream()),
+            1026.0
+        );
+    }
+
+    #[test]
     #[ignore = "requires an MLX Metal device"]
     fn execution_streams_classify_single_same_device_and_cross_device_topologies() {
         let target = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
@@ -3567,6 +3648,33 @@ mod tests {
             .position(|(operation, _)| *operation == "commit_target")
             .unwrap();
         assert!(verify < optimistic_draft && optimistic_draft < resolve);
+    }
+
+    #[test]
+    #[ignore = "explicit Metal MTP event handoff test; run on a Metal host"]
+    fn same_gpu_mtp_handoff_does_not_synchronize_the_producer_stream() {
+        let target = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
+        let draft = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
+        let streams = MtpExecutionStreams::new(target.stream(), draft.stream()).unwrap();
+        assert_eq!(streams.topology(), MtpStreamTopology::SameDeviceSplit);
+        assert_ne!(
+            target.stream().get_index().unwrap(),
+            draft.stream().get_index().unwrap()
+        );
+
+        let lhs = Array::ones::<f32>(&[4096, 4096], target.stream()).unwrap();
+        let rhs = Array::ones::<f32>(&[4096, 4096], target.stream()).unwrap();
+        let produced = lhs.matmul(&rhs, target.stream()).unwrap();
+        let handoff = streams.wait_for_target_outputs([&produced]).unwrap();
+        assert!(
+            !handoff.is_complete().unwrap(),
+            "the same-device MTP handoff waited for target completion on the host"
+        );
+
+        let consumed = produced.square(draft.stream()).unwrap();
+        let completion = async_eval_with_event([&consumed]).unwrap();
+        drop(handoff);
+        completion.synchronize().unwrap();
     }
 
     #[test]

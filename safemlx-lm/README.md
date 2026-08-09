@@ -1746,13 +1746,15 @@ External Gemma assistants may execute through `MtpExecutionStreams` on the
 target stream, a second stream on the same GPU, or a stream on another device.
 The constructor classifies these as `Single`, `SameDeviceSplit`, or
 `CrossDeviceSplit`. Distinct same-device streams share immutable MLX array
-storage after explicit dependency synchronization; only cross-device topology
-performs physical array copies. `MtpScheduler` is the canonical engine:
-requests move through explicit prefill, draft, verification-submission,
-in-flight lookahead, resolution, and terminal phases. Verification submission
-leaves the lazy target graph unresolved. On a distinct stream the scheduler
-then drafts one optimistic continuation block, or gives a round-robin turn to
-another ready request, before reading target results.
+storage through backend-ordered completion-event waits without blocking the
+host; only cross-device topology performs host-synchronized physical array
+copies. Target state, stochastic draft roots, embedding snapshots, and draft
+distributions all use that same-device event contract. `MtpScheduler` is the
+canonical engine: requests move through explicit prefill, draft,
+verification-submission, in-flight lookahead, resolution, and terminal phases.
+Verification submission leaves the lazy target graph unresolved. On a distinct
+stream the scheduler then drafts one optimistic continuation block, or gives a
+round-robin turn to another ready request, before reading target results.
 `MtpSchedulerOptions` bounds retained verifications and branches; both default
 to one. `MtpSchedulerOptions::with_lookahead(false)` disables all same-request
 branch work while leaving the canonical verification, sampler, and target-PRNG
