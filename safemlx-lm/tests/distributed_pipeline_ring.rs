@@ -676,7 +676,7 @@ fn pipeline_ring_worker() {
             None => scheduler.run_queued(&mut model, &group, &stream).unwrap(),
         };
         cache = scheduler.release_request_cache(request).unwrap();
-        completed.pop().unwrap().into_logits()
+        completed.pop().unwrap().into_logits().unwrap()
     } else {
         let prompt = safemlx::Array::from_slice(&prefix_ids, &[1, prompt_length]);
         forward_pipeline_model(
@@ -1041,9 +1041,13 @@ fn forward_pipeline_model(
     match cartesian {
         Some(cartesian) => model
             .forward_cartesian(tokens, step, None, cache, cartesian, stream)
+            .unwrap()
+            .into_logits()
             .unwrap(),
         None => model
             .forward_pipeline(tokens, step, None, cache, group, stream)
+            .unwrap()
+            .into_logits()
             .unwrap(),
     }
 }
@@ -1187,6 +1191,8 @@ fn run_microbatch_worker(
                 group,
                 stream,
             )
+            .unwrap()
+            .into_logits()
             .unwrap();
         reference.push(logits.map(|logits| {
             let logits = logits.evaluated().unwrap();

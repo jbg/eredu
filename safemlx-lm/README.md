@@ -980,8 +980,28 @@ scheduler.enqueue(if group.rank() == 0 {
     input
 })?;
 let output = scheduler.run_queued(&mut model, &group, &stream)?;
-let logits = output[0].logits(); // Some only on the final stage.
+let completion = &output[0];
+completion.synchronize()?; // Exact microbatch event, not the whole stream.
+let logits = completion.logits(); // Some only on the final stage.
 ```
+
+Pipeline execution is explicitly asynchronous. `forward_pipeline`,
+`prefill_pipeline`, their Cartesian variants, and scheduler microbatch outputs
+return owning completions which submit the relevant lazy MLX graphs. A
+completion covers receives, declared auxiliary payloads, stage cache updates,
+sends, lane barriers, final logits, and embedded-MTP hidden state for that one
+transition. It does not capture unrelated lazy graphs or work submitted later.
+Call `wait_on` before evaluating dependent work on another compatible stream,
+`is_complete` for a nonblocking query, or `synchronize`/`into_logits` for an
+exact host wait. Multiple compatible stream waits are supported. Dropping a
+completion while producer work or consumer waits remain outstanding is safe;
+host synchronization is required to observe asynchronous backend errors.
+
+The architecture-independent `DistributedCompletion<T>` applies the same
+contract to direct Cartesian pipeline sends and receives. This replaces the
+former duplicated `eval` plus whole-stream synchronization paths. Pipeline
+events are local backend completions: cross-process timing and cross-backend or
+incompatible-device waits are not supported.
 
 Scheduled multimodal prefill uses the same queue. Convert borrowed typed input
 with `PreparedModelInput::from_model_input`, or use the owned value returned by

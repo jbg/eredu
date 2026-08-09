@@ -13,14 +13,14 @@ use safemlx::{
     distributed::{self, Group},
     module::ModuleParameters,
     ops::{indexing::TryIndexOp, ones, zeros},
-    transforms::eval,
     Array, Stream,
 };
 
 use crate::{
     error::Error,
-    runtime::distributed::topology::{
-        balanced_contiguous_range, ParallelTopology, PlacementPlan, TensorPlacement,
+    runtime::distributed::{
+        completion::synchronize_outputs,
+        topology::{balanced_contiguous_range, ParallelTopology, PlacementPlan, TensorPlacement},
     },
     runtime::generation::sampler::Sampler,
 };
@@ -92,8 +92,7 @@ pub fn sample_and_synchronize<S: Sampler>(
         zeros::<i32>(&[], stream)?
     };
     let finished = distributed::all_sum(&local_finished, group, stream)?;
-    eval([&token, &finished])?;
-    stream.synchronize()?;
+    synchronize_outputs([&token, &finished])?;
     Ok(SynchronizedToken {
         token,
         finished: finished.try_item::<i32>(stream)? != 0,

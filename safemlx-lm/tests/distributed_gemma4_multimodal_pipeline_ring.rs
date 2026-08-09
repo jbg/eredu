@@ -767,7 +767,7 @@ fn gemma4_multimodal_pipeline_ring_worker() {
             .unwrap(),
         None => scheduler.run_queued(&mut model, &group, &stream).unwrap(),
     };
-    let logits = completed.pop().unwrap().into_logits();
+    let logits = completed.pop().unwrap().into_logits().unwrap();
     let mut cache = scheduler.release_request_cache(request).unwrap();
     assert_eq!(logits.is_some(), topology.pipeline_parallel_rank == 1);
 
@@ -827,6 +827,8 @@ fn gemma4_multimodal_pipeline_ring_worker() {
                 cartesian,
                 &stream,
             )
+            .unwrap()
+            .into_logits()
             .unwrap(),
         None => model
             .forward_pipeline(
@@ -837,6 +839,8 @@ fn gemma4_multimodal_pipeline_ring_worker() {
                 &group,
                 &stream,
             )
+            .unwrap()
+            .into_logits()
             .unwrap(),
     };
     let (mut restored_cache, _) = model
@@ -852,6 +856,8 @@ fn gemma4_multimodal_pipeline_ring_worker() {
                 cartesian,
                 &stream,
             )
+            .unwrap()
+            .into_logits()
             .unwrap(),
         None => model
             .forward_pipeline(
@@ -862,6 +868,8 @@ fn gemma4_multimodal_pipeline_ring_worker() {
                 &group,
                 &stream,
             )
+            .unwrap()
+            .into_logits()
             .unwrap(),
     };
     match (&decoded, &restored) {

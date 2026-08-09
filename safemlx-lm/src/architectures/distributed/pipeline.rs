@@ -75,6 +75,7 @@ use crate::{
     runtime::checkpoint::bounded_quantization::BoundedQuantizationReport,
     runtime::checkpoint::quantization::{quantize_tensor, WeightQuantization},
     runtime::checkpoint::store::{GgufWeightStore, WeightStore, WeightStoreDiagnostics},
+    runtime::distributed::completion::{synchronize_outputs, DistributedCompletion},
     runtime::distributed::expert::{
         dispatch_local_with, dispatch_replicated_with, ExpertAssignment, RoutingStatistics,
     },
@@ -399,13 +400,14 @@ impl PipelineMicrobatchInput {
     }
 }
 
-/// Result metadata for one completed microbatch.
+/// Result metadata and exact backend completion for one submitted microbatch.
 #[derive(Debug)]
+#[must_use = "pipeline work has been submitted; retain, wait on, or synchronize its completion"]
 pub struct PipelineMicrobatchOutput {
     work: WorkId,
     phase: PipelineInferencePhase,
     step: PipelineStep,
-    logits: Option<Array>,
+    completion: PipelineStageCompletion,
 }
 
 impl PipelineMicrobatchOutput {
@@ -414,7 +416,7 @@ impl PipelineMicrobatchOutput {
         self.work
     }
 
-    /// Returns the completed cache transition phase.
+    /// Returns the submitted cache transition phase.
     pub const fn phase(&self) -> PipelineInferencePhase {
         self.phase
     }
@@ -425,13 +427,105 @@ impl PipelineMicrobatchOutput {
     }
 
     /// Returns vocabulary logits on the final rank and `None` elsewhere.
+    ///
+    /// The array has been submitted but may still be executing. Host access
+    /// requires [`Self::synchronize`]; a different compatible stream must call
+    /// [`Self::wait_on`] before evaluating dependent work.
     pub const fn logits(&self) -> Option<&Array> {
-        self.logits.as_ref()
+        self.completion.logits()
     }
 
-    /// Consumes the record and returns final-rank logits when present.
-    pub fn into_logits(self) -> Option<Array> {
-        self.logits
+    /// Orders later evaluation on `stream` after this microbatch.
+    pub fn wait_on(&self, stream: &Stream) -> Result<(), Error> {
+        self.completion.wait_on(stream)
+    }
+
+    /// Returns whether this microbatch's exact backend completion has finished.
+    pub fn is_complete(&self) -> Result<bool, Error> {
+        self.completion.is_complete()
+    }
+
+    /// Blocks for this microbatch's exact completion.
+    pub fn synchronize(&self) -> Result<(), Error> {
+        self.completion.synchronize()
+    }
+
+    /// Consumes the completion and returns final-rank logits when present.
+    pub fn into_logits(self) -> Result<Option<Array>, Error> {
+        self.completion.into_logits()
+    }
+}
+
+/// Submitted execution of one rank-local pipeline stage.
+///
+/// Pipeline transport and stage outputs are lazy MLX graphs. Construction of
+/// this value explicitly submits every endpoint and returns immediately with
+/// an exact backend event. The completion owns transport endpoints, cache
+/// updates, final logits, and embedded-MTP hidden state until MLX has retained
+/// them. It can order multiple compatible consumer streams without a host
+/// synchronization.
+///
+/// Dropping the value while work or consumer waits remain outstanding is safe.
+/// Asynchronous errors are observable through query or synchronization. The
+/// type is neither `Send` nor `Sync`, because its SafeMLX event is host-thread
+/// affine.
+#[derive(Debug)]
+#[must_use = "pipeline work has been submitted; retain, wait on, or synchronize its completion"]
+pub struct PipelineStageCompletion {
+    inner: DistributedCompletion<Option<Array>>,
+}
+
+impl PipelineStageCompletion {
+    fn submit(logits: Option<Array>, retained: Vec<Array>) -> Result<Self, Error> {
+        let mut outputs = retained;
+        outputs.extend(logits.iter().cloned());
+        Ok(Self {
+            inner: DistributedCompletion::submit(logits, outputs.iter())?,
+        })
+    }
+
+    /// Returns submitted final-rank logits without waiting for host access.
+    pub const fn logits(&self) -> Option<&Array> {
+        self.inner.value().as_ref()
+    }
+
+    /// Orders later evaluation on a compatible stream after this stage.
+    pub fn wait_on(&self, stream: &Stream) -> Result<(), Error> {
+        self.inner.wait_on(stream)
+    }
+
+    /// Returns whether the exact stage completion has finished.
+    pub fn is_complete(&self) -> Result<bool, Error> {
+        self.inner.is_complete()
+    }
+
+    /// Blocks the host for the exact stage completion.
+    pub fn synchronize(&self) -> Result<(), Error> {
+        self.inner.synchronize()
+    }
+
+    /// Waits for completion and returns final-rank logits when present.
+    pub fn into_logits(self) -> Result<Option<Array>, Error> {
+        self.inner.into_value()
+    }
+
+    fn into_submitted_logits(self) -> Option<Array> {
+        self.inner.value().clone()
+    }
+}
+
+struct PendingPipelineStageCompletion {
+    logits: Option<Array>,
+    retained: Vec<Array>,
+}
+
+impl PendingPipelineStageCompletion {
+    fn retain(&mut self, array: Array) {
+        self.retained.push(array);
+    }
+
+    fn submit(self) -> Result<PipelineStageCompletion, Error> {
+        PipelineStageCompletion::submit(self.logits, self.retained)
     }
 }
 
@@ -963,12 +1057,12 @@ impl PipelineInferenceScheduler {
                 completed
                     .into_iter()
                     .map(|completed| {
-                        let (work, input, logits) = completed.into_parts();
+                        let (work, input, completion) = completed.into_parts();
                         PipelineMicrobatchOutput {
                             work,
                             phase: input.phase,
                             step: input.step,
-                            logits,
+                            completion,
                         }
                     })
                     .collect()
@@ -1037,12 +1131,12 @@ impl PipelineInferenceScheduler {
                 completed
                     .into_iter()
                     .map(|completed| {
-                        let (work, input, logits) = completed.into_parts();
+                        let (work, input, completion) = completed.into_parts();
                         PipelineMicrobatchOutput {
                             work,
                             phase: input.phase,
                             step: input.step,
-                            logits,
+                            completion,
                         }
                     })
                     .collect()
@@ -1951,12 +2045,11 @@ where
             let forwarded = forward_layer(global_layer, &mut layer, &hidden, cache, stream)?
                 .into_pipeline_layer_forward();
             hidden = forwarded.hidden;
-            eval(
+            synchronize_outputs(
                 std::iter::once(&hidden)
                     .chain(cache.retained_arrays())
                     .chain(forwarded.retained.iter()),
             )?;
-            stream.synchronize()?;
             drop(transfer);
             window.refill()?;
         } else if let Some(dense) = dense_layers {
@@ -1974,12 +2067,11 @@ where
             let forwarded = forward_layer(global_layer, &mut layer, &hidden, cache, stream)?
                 .into_pipeline_layer_forward();
             hidden = forwarded.hidden;
-            eval(
+            synchronize_outputs(
                 std::iter::once(&hidden)
                     .chain(cache.retained_arrays())
                     .chain(forwarded.retained.iter()),
             )?;
-            stream.synchronize()?;
             dense.trim_after(local_index)?;
         } else {
             hidden = forward_layer(
@@ -3058,12 +3150,11 @@ impl Qwen3VlStage {
                 } else {
                     forwarded
                 };
-                eval([&forwarded])?;
-                stream.synchronize()?;
+                synchronize_outputs([&forwarded])?;
                 Ok(forwarded)
             },
         )?;
-        qwen3_vl_set_pipeline_rope_delta(caches, prepared.rope_delta, stream)?;
+        qwen3_vl_set_pipeline_rope_delta(caches, prepared.rope_delta)?;
         if self.range.end == self.args.text_config.num_hidden_layers as usize {
             hidden = self.layer_adapter.norm_mut().forward(&hidden, stream)?;
             let logits = if let Some(execution) =
@@ -3274,7 +3365,6 @@ fn qwen3_vl_pipeline_rope_delta(
 fn qwen3_vl_set_pipeline_rope_delta(
     caches: &mut [PipelineLayerCache],
     rope_delta: i32,
-    stream: &Stream,
 ) -> Result<(), Error> {
     let offset = pipeline_kv_offset(caches);
     for cache in caches {
@@ -3289,8 +3379,7 @@ fn qwen3_vl_set_pipeline_rope_delta(
         {
             slot.value = Some(Array::from_slice(&[rope_delta], &[1]));
             slot.offset = offset;
-            eval(slot.value.iter())?;
-            stream.synchronize()?;
+            synchronize_outputs(slot.value.iter())?;
             break;
         }
     }
@@ -4602,8 +4691,9 @@ impl PipelineModel {
     ///
     /// Stage zero embeds and sends, intermediate stages receive/execute/send,
     /// and the final stage receives and returns logits. Every lazy point-to-
-    /// point operation is evaluated and synchronized before the operation
-    /// returns. Multi-request inference should normally use
+    /// point operation is explicitly submitted before the operation returns.
+    /// The returned completion owns its exact backend event and must be waited
+    /// before host access. Multi-request inference should normally use
     /// [`PipelineInferenceScheduler::run_queued`], which calls this primitive
     /// in a collectively validated order that can fill different stages.
     pub fn forward_pipeline(
@@ -4614,7 +4704,7 @@ impl PipelineModel {
         cache: &mut PipelineCache,
         group: &Group,
         stream: &Stream,
-    ) -> Result<Option<Array>, Error> {
+    ) -> Result<PipelineStageCompletion, Error> {
         self.validate_group(group)?;
         self.forward_pipeline_on_group(
             tokens.map(PipelineIngress::Tokens),
@@ -4627,7 +4717,8 @@ impl PipelineModel {
             None,
             None,
             stream,
-        )
+        )?
+        .submit()
     }
 
     /// Runs a microbatch over topology-derived pipeline lanes while executing
@@ -4640,7 +4731,7 @@ impl PipelineModel {
         cache: &mut PipelineCache,
         cartesian: &crate::CartesianExecution<'_>,
         stream: &Stream,
-    ) -> Result<Option<Array>, Error> {
+    ) -> Result<PipelineStageCompletion, Error> {
         if cartesian.topology() != self.topology {
             return Err(Error::Parallel(format!(
                 "pipeline model topology {:?} does not match Cartesian execution topology {:?}",
@@ -4654,7 +4745,7 @@ impl PipelineModel {
         let tensor = (self.topology.tensor_parallel_size > 1)
             .then(|| cartesian.tensor_context(stream))
             .transpose()?;
-        let output = self.forward_pipeline_on_group(
+        let mut output = self.forward_pipeline_on_group(
             tokens.map(PipelineIngress::Tokens),
             step,
             mask,
@@ -4675,9 +4766,8 @@ impl PipelineModel {
         // pipeline stage. This is particularly important for backends whose
         // subgroup support is implemented with topology-routed peer exchange.
         let barrier = distributed::all_sum(&Array::from_int(0), pipeline, stream)?;
-        eval([&barrier])?;
-        stream.synchronize()?;
-        Ok(output)
+        output.retain(barrier);
+        output.submit()
     }
 
     /// Runs typed multimodal prefill over the world pipeline group.
@@ -4692,7 +4782,7 @@ impl PipelineModel {
         cache: &mut PipelineCache,
         group: &Group,
         stream: &Stream,
-    ) -> Result<Option<Array>, Error> {
+    ) -> Result<PipelineStageCompletion, Error> {
         self.validate_group(group)?;
         self.forward_pipeline_on_group(
             input.map(PipelineIngress::ModelInput),
@@ -4705,7 +4795,8 @@ impl PipelineModel {
             None,
             None,
             stream,
-        )
+        )?
+        .submit()
     }
 
     /// Runs typed multimodal prefill over topology-derived PP lanes while TP
@@ -4718,7 +4809,7 @@ impl PipelineModel {
         cache: &mut PipelineCache,
         cartesian: &crate::CartesianExecution<'_>,
         stream: &Stream,
-    ) -> Result<Option<Array>, Error> {
+    ) -> Result<PipelineStageCompletion, Error> {
         if cartesian.topology() != self.topology {
             return Err(Error::Parallel(format!(
                 "pipeline model topology {:?} does not match Cartesian execution topology {:?}",
@@ -4732,7 +4823,7 @@ impl PipelineModel {
         let tensor = (self.topology.tensor_parallel_size > 1)
             .then(|| cartesian.tensor_context(stream))
             .transpose()?;
-        let output = self.forward_pipeline_on_group(
+        let mut output = self.forward_pipeline_on_group(
             input.map(PipelineIngress::ModelInput),
             step,
             mask,
@@ -4749,9 +4840,8 @@ impl PipelineModel {
             stream,
         )?;
         let barrier = distributed::all_sum(&Array::from_int(0), pipeline, stream)?;
-        eval([&barrier])?;
-        stream.synchronize()?;
-        Ok(output)
+        output.retain(barrier);
+        output.submit()
     }
 
     /// Reports whether this pipeline stage participates in checkpoint-embedded
@@ -4797,8 +4887,7 @@ impl PipelineModel {
             0
         });
         let vocabulary = distributed::all_sum(&vocabulary, execution.world(), stream)?;
-        eval([&vocabulary])?;
-        stream.synchronize()?;
+        synchronize_outputs([&vocabulary])?;
         let vocabulary = vocabulary.try_item::<i32>(stream)?;
         if vocabulary <= 0 {
             return Err(Exception::custom(
@@ -4823,8 +4912,7 @@ impl PipelineModel {
         };
         let logits = distributed::all_sum(&logits, execution.world(), stream)?;
         let hidden = distributed::all_sum(&hidden, execution.world(), stream)?;
-        eval([&logits, &hidden])?;
-        stream.synchronize()?;
+        synchronize_outputs([&logits, &hidden])?;
         Ok(EmbeddedMtpOutput {
             logits,
             hidden,
@@ -4903,7 +4991,7 @@ impl PipelineModel {
         tensor: Option<&ParallelExecutionContext<'_>>,
         expert_group: Option<&Group>,
         stream: &Stream,
-    ) -> Result<Option<Array>, Error> {
+    ) -> Result<PendingPipelineStageCompletion, Error> {
         let mut received_payload = None;
         let stage_input = if self.info.is_first {
             Some(
@@ -4933,8 +5021,6 @@ impl PipelineModel {
                     self.info.activation_dtype
                 ))
             })?;
-            eval([&received])?;
-            stream.synchronize()?;
             let received_auxiliary = self
                     .auxiliary_shapes(step)
                     .into_iter()
@@ -4952,11 +5038,9 @@ impl PipelineModel {
                                 self.info.pipeline_stage
                             ))
                         })?;
-                        eval([&value])?;
                         Ok(value)
                     })
                     .collect::<Result<Vec<_>, Error>>()?;
-            stream.synchronize()?;
             received_payload = Some(PipelinePayload {
                 hidden: received,
                 auxiliary: PipelineAuxiliaryState::new(received_auxiliary),
@@ -5016,6 +5100,12 @@ impl PipelineModel {
                 stream,
             )?
         };
+        let mut retained = cache
+            .layers
+            .iter()
+            .flat_map(PipelineLayerCache::retained_arrays)
+            .cloned()
+            .collect::<Vec<_>>();
         match output {
             PipelineStageOutput::Hidden(payload) => {
                 let hidden = &payload.hidden;
@@ -5038,7 +5128,7 @@ impl PipelineModel {
                         hidden.dtype()
                     ))
                 })?;
-                eval([&sent])?;
+                retained.push(sent);
                 for auxiliary in payload.auxiliary.tensors() {
                     let sent =
                         distributed::send(auxiliary, peer, group, stream).map_err(|error| {
@@ -5049,18 +5139,27 @@ impl PipelineModel {
                             auxiliary.dtype()
                         ))
                         })?;
-                    eval([&sent])?;
+                    retained.push(sent);
                 }
-                stream.synchronize()?;
-                Ok(None)
+                Ok(PendingPipelineStageCompletion {
+                    logits: None,
+                    retained,
+                })
             }
             PipelineStageOutput::Logits(logits) => {
                 self.last_mtp_hidden = None;
-                Ok(Some(logits))
+                Ok(PendingPipelineStageCompletion {
+                    logits: Some(logits),
+                    retained,
+                })
             }
             PipelineStageOutput::EmbeddedMtpLogits { logits, hidden } => {
+                retained.push(hidden.clone());
                 self.last_mtp_hidden = Some(hidden);
-                Ok(Some(logits))
+                Ok(PendingPipelineStageCompletion {
+                    logits: Some(logits),
+                    retained,
+                })
             }
         }
     }
@@ -5169,7 +5268,9 @@ impl EmbeddedMtpTarget for PipelineEmbeddedMtpTarget<'_> {
                 |_| Exception::custom("a peer failed pipeline embedded MTP prefill"),
             ));
         }
-        let logits = local.map_err(|error| Exception::custom(error.to_string()))?;
+        let logits = local
+            .map_err(|error| Exception::custom(error.to_string()))?
+            .into_submitted_logits();
         let hidden = self.model.last_mtp_hidden.take();
         self.model
             .synchronize_embedded_mtp_output(logits, hidden, tokens, self.execution, stream)
@@ -5201,7 +5302,9 @@ impl EmbeddedMtpTarget for PipelineEmbeddedMtpTarget<'_> {
                 |_| Exception::custom("a peer failed pipeline embedded MTP verification"),
             ));
         }
-        let logits = local.map_err(|error| Exception::custom(error.to_string()))?;
+        let logits = local
+            .map_err(|error| Exception::custom(error.to_string()))?
+            .into_submitted_logits();
         let hidden = self.model.last_mtp_hidden.take();
         self.model.synchronize_embedded_mtp_output(
             logits,
@@ -5618,12 +5721,11 @@ where
             )));
         };
         let quantized = quantize_tensor(&value, quantization, stream)?;
-        eval(
+        synchronize_outputs(
             [&quantized.weight, &quantized.scales]
                 .into_iter()
                 .chain(quantized.biases.as_ref()),
         )?;
-        stream.synchronize()?;
         loaded.insert(destination.clone(), quantized.weight);
         let base = destination
             .strip_suffix(".inner.weight")
@@ -7690,8 +7792,7 @@ impl DeepSeekStage {
                     &mut mode,
                     stream,
                 )?;
-                eval([&forwarded])?;
-                stream.synchronize()?;
+                synchronize_outputs([&forwarded])?;
                 Ok(forwarded)
             },
         )?;
@@ -7846,8 +7947,7 @@ impl DeepSeekStage {
                         unreachable!("resident DeepSeek stage cannot own expert cache")
                     }
                 };
-                eval([&forwarded])?;
-                stream.synchronize()?;
+                synchronize_outputs([&forwarded])?;
                 Ok(forwarded)
             },
         )?;
@@ -7987,8 +8087,7 @@ impl LlamaStage {
                         )))
                     }
                 };
-                eval([&forwarded])?;
-                stream.synchronize()?;
+                synchronize_outputs([&forwarded])?;
                 Ok(forwarded)
             },
         )?;
@@ -9268,8 +9367,7 @@ impl DenseQwenStage {
                         )))
                     }
                 };
-                eval([&forwarded])?;
-                stream.synchronize()?;
+                synchronize_outputs([&forwarded])?;
                 Ok(forwarded)
             },
         )?;
@@ -9479,8 +9577,7 @@ impl DenseQwenStage {
                         )))
                     }
                 };
-                eval([&forwarded])?;
-                stream.synchronize()?;
+                synchronize_outputs([&forwarded])?;
                 Ok(forwarded)
             },
         )?;
@@ -10558,8 +10655,7 @@ impl GptOssStage {
                         )))
                     }
                 };
-                eval([&forwarded])?;
-                stream.synchronize()?;
+                synchronize_outputs([&forwarded])?;
                 Ok(forwarded)
             },
         )?;
@@ -10801,8 +10897,7 @@ impl GptOssStage {
                         )))
                     }
                 };
-                eval([&forwarded])?;
-                stream.synchronize()?;
+                synchronize_outputs([&forwarded])?;
                 Ok(forwarded)
             },
         )?;
@@ -11865,8 +11960,7 @@ impl Lfm2Stage {
                         unreachable!("LFM2 expert storage and assignment are internally coherent")
                     }
                 };
-                eval([&forwarded])?;
-                stream.synchronize()?;
+                synchronize_outputs([&forwarded])?;
                 Ok(forwarded)
             },
         )?;
@@ -11991,8 +12085,7 @@ impl Lfm2Stage {
                     )?,
                     (false, Some(_)) => unreachable!("resident LFM2 stage cannot own expert cache"),
                 };
-                eval([&forwarded])?;
-                stream.synchronize()?;
+                synchronize_outputs([&forwarded])?;
                 Ok(forwarded)
             },
         )?;
@@ -12288,8 +12381,7 @@ impl GemmaStage {
                         )))
                     }
                 };
-                eval([&forwarded])?;
-                stream.synchronize()?;
+                synchronize_outputs([&forwarded])?;
                 let retained = shared_kv
                     .values()
                     .flat_map(|(keys, values)| [keys.clone(), values.clone()])
@@ -13464,8 +13556,7 @@ impl NemotronHStage {
                         )
                     }
                 };
-                eval([&forwarded])?;
-                stream.synchronize()?;
+                synchronize_outputs([&forwarded])?;
                 Ok(forwarded)
             },
         )?;
@@ -13598,8 +13689,7 @@ impl NemotronHStage {
                         unreachable!("resident Nemotron-H stage cannot own expert cache")
                     }
                 };
-                eval([&forwarded])?;
-                stream.synchronize()?;
+                synchronize_outputs([&forwarded])?;
                 Ok(forwarded)
             },
         )?;
@@ -14564,8 +14654,7 @@ impl QwenHybridStage {
                 let retained = self.layer_adapter.forward_pipeline_media_layer(
                     unit.group, unit.index, &mut layer, &mut state, execution, stream,
                 )?;
-                eval(retained.iter())?;
-                stream.synchronize()?;
+                synchronize_outputs(retained.iter())?;
                 drop(transfer);
                 drop(lease);
                 if let Some(window) = &mut transfer_window {
@@ -14992,8 +15081,7 @@ impl QwenHybridStage {
                         "Qwen hybrid expert storage and assignment are internally coherent"
                     ),
                 };
-                eval([&forwarded])?;
-                stream.synchronize()?;
+                synchronize_outputs([&forwarded])?;
                 Ok(forwarded)
             },
         )?;
@@ -15134,8 +15222,7 @@ impl QwenHybridStage {
                         unreachable!("resident Qwen hybrid stage cannot own expert cache")
                     }
                 };
-                eval([&forwarded])?;
-                stream.synchronize()?;
+                synchronize_outputs([&forwarded])?;
                 Ok(forwarded)
             },
         )?;
@@ -16087,8 +16174,7 @@ impl KimiLinearStage {
                     &mut mode,
                     stream,
                 )?;
-                eval([&forwarded])?;
-                stream.synchronize()?;
+                synchronize_outputs([&forwarded])?;
                 Ok(forwarded)
             },
         )?;
@@ -16228,8 +16314,7 @@ impl KimiLinearStage {
                         unreachable!("resident Kimi Linear stage cannot own expert cache")
                     }
                 };
-                eval([&forwarded])?;
-                stream.synchronize()?;
+                synchronize_outputs([&forwarded])?;
                 Ok(forwarded)
             },
         )?;
@@ -17018,8 +17103,7 @@ impl InklingStage {
                 let retained = self.layer_adapter.forward_pipeline_media_layer(
                     unit.group, unit.index, &mut layer, &mut state, execution, stream,
                 )?;
-                eval(retained.iter())?;
-                stream.synchronize()?;
+                synchronize_outputs(retained.iter())?;
                 drop(transfer);
                 drop(lease);
                 if let Some(window) = &mut transfer_window {
@@ -17435,8 +17519,7 @@ impl InklingStage {
                     &mut mode,
                     stream,
                 )?;
-                eval([&forwarded])?;
-                stream.synchronize()?;
+                synchronize_outputs([&forwarded])?;
                 Ok(forwarded)
             },
         )?;
@@ -17599,8 +17682,7 @@ impl InklingStage {
                         unreachable!("resident Inkling stage cannot own expert cache")
                     }
                 };
-                eval([&forwarded])?;
-                stream.synchronize()?;
+                synchronize_outputs([&forwarded])?;
                 Ok(forwarded)
             },
         )?;
@@ -18636,8 +18718,7 @@ impl GemmaStage {
                 let retained = self.layer_adapter.forward_pipeline_media_layer(
                     unit.group, unit.index, &mut layer, &mut state, execution, stream,
                 )?;
-                eval(retained.iter())?;
-                stream.synchronize()?;
+                synchronize_outputs(retained.iter())?;
                 drop(transfer);
                 drop(lease);
                 if let Some(window) = &mut transfer_window {
@@ -19744,14 +19825,13 @@ pub(crate) fn load_deepseek_experts(
         } else {
             weight
         };
-        eval(
+        synchronize_outputs(
             [&weight]
                 .into_iter()
                 .chain(fp8_scale.as_ref())
                 .chain(scales.as_ref())
                 .chain(biases.as_ref()),
         )?;
-        stream.synchronize()?;
         match projection {
             "gate_proj" => {
                 experts.gate_proj = safemlx::module::Param::new(Some(weight));

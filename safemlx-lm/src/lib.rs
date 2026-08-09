@@ -45,6 +45,7 @@ pub use runtime::cache::residency::{
 };
 pub use runtime::cache::PagedKeyValueCache;
 pub use runtime::distributed::cartesian::CartesianExecution;
+pub use runtime::distributed::completion::DistributedCompletion;
 pub use runtime::distributed::parallel::{
     sample_and_synchronize, LocalModelLayout, LocalTensorLayout, MemberSharding,
     ParallelBuildContext, ParallelExecutionContext, ParallelPlanBuilder, ParameterGroupSpec,

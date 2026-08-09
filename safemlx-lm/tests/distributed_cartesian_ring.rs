@@ -65,10 +65,14 @@ fn cartesian_ring_worker() {
         if execution.topology().pipeline_parallel_rank == 0 {
             execution
                 .send_pipeline(&scalar(expected_rank as i32 + 10), &stream)
+                .unwrap()
+                .synchronize()
                 .unwrap();
         } else {
             let received = execution
                 .receive_pipeline(&[1], safemlx::Dtype::Int32, &stream)
+                .unwrap()
+                .into_value()
                 .unwrap();
             assert_eq!(values(&received), vec![expected_rank as i32 + 8]);
         }
@@ -122,10 +126,14 @@ fn cartesian_ring_worker() {
         if execution.topology().pipeline_parallel_rank == 0 {
             execution
                 .send_pipeline(&scalar(expected_rank as i32 + 20), &stream)
+                .unwrap()
+                .synchronize()
                 .unwrap();
         } else {
             let received = execution
                 .receive_pipeline(&[1], safemlx::Dtype::Int32, &stream)
+                .unwrap()
+                .into_value()
                 .unwrap();
             assert_eq!(values(&received), vec![expected_rank as i32 + 18]);
         }
@@ -185,10 +193,14 @@ fn cartesian_triple_ring_worker() {
     if topology.pipeline_parallel_rank == 0 {
         execution
             .send_pipeline(&scalar(expected_rank as i32 + 100), &stream)
+            .unwrap()
+            .synchronize()
             .unwrap();
     } else {
         let received = execution
             .receive_pipeline(&[1], safemlx::Dtype::Int32, &stream)
+            .unwrap()
+            .into_value()
             .unwrap();
         assert_eq!(values(&received), vec![expected_rank as i32 + 96]);
     }

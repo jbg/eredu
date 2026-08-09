@@ -610,7 +610,7 @@ fn qwen3_vl_pipeline_ring_worker() {
         None => scheduler.run_queued(&mut model, &group, &stream).unwrap(),
     };
     assert_eq!(completed.len(), 1);
-    let logits = completed.pop().unwrap().into_logits();
+    let logits = completed.pop().unwrap().into_logits().unwrap();
     let mut cache = scheduler.release_request_cache(request).unwrap();
     assert_eq!(logits.is_some(), topology.pipeline_parallel_rank == 1);
     let synchronized = model
@@ -707,11 +707,17 @@ fn qwen3_vl_pipeline_ring_worker() {
                 ),
             }
         };
-    let uninterrupted = decode(&mut model, &mut cache).unwrap();
+    let uninterrupted = decode(&mut model, &mut cache)
+        .unwrap()
+        .into_logits()
+        .unwrap();
     let (mut restored_cache, _) = model
         .load_prompt_cache(&cache_root, &descriptor, &[1, 30, 2], paged, &stream)
         .unwrap();
-    let restored = decode(&mut model, &mut restored_cache).unwrap();
+    let restored = decode(&mut model, &mut restored_cache)
+        .unwrap()
+        .into_logits()
+        .unwrap();
     match (uninterrupted, restored) {
         (Some(left), Some(right)) => assert_close(&left, &right),
         (None, None) => {}

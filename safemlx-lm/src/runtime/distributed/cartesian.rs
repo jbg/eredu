@@ -8,7 +8,6 @@
 use safemlx::{
     distributed::{self, Group},
     ops::{ones, zeros},
-    transforms::eval,
     Array, Dtype, Stream,
 };
 
@@ -16,6 +15,7 @@ use crate::{
     error::Error,
     runtime::{
         distributed::{
+            completion::{synchronize_outputs, DistributedCompletion},
             parallel::{sample_and_synchronize, ParallelExecutionContext, SynchronizedToken},
             topology::{
                 ParallelCommunicators, ParallelCoordinates, ParallelTopology,
@@ -91,13 +91,17 @@ impl<'a> CartesianExecution<'a> {
         self.communicators.pipeline_group()
     }
 
-    /// Receives hidden activations from the preceding matching-coordinate stage.
+    /// Submits a receive from the preceding matching-coordinate stage.
+    ///
+    /// The returned value owns both the received array and its exact completion.
+    /// Reading it on the host requires `into_value` or `synchronize`; dependent
+    /// work on another compatible stream must first call `wait_on`.
     pub fn receive_pipeline(
         &self,
         shape: &[i32],
         dtype: Dtype,
         stream: &Stream,
-    ) -> Result<Array, Error> {
+    ) -> Result<DistributedCompletion<Array>, Error> {
         let topology = self.topology();
         if topology.pipeline_parallel_rank == 0 {
             return Err(Error::Parallel(
@@ -114,13 +118,18 @@ impl<'a> CartesianExecution<'a> {
             group,
             stream,
         )?;
-        eval([&received])?;
-        stream.synchronize()?;
-        Ok(received)
+        DistributedCompletion::submit(received.clone(), [&received])
     }
 
-    /// Sends hidden activations to the succeeding matching-coordinate stage.
-    pub fn send_pipeline(&self, hidden: &Array, stream: &Stream) -> Result<(), Error> {
+    /// Submits hidden activations to the succeeding matching-coordinate stage.
+    ///
+    /// The returned completion retains the send endpoint. Callers may wait on
+    /// it from a compatible stream or synchronize it before host-visible reuse.
+    pub fn send_pipeline(
+        &self,
+        hidden: &Array,
+        stream: &Stream,
+    ) -> Result<DistributedCompletion<()>, Error> {
         let topology = self.topology();
         if topology.pipeline_parallel_rank + 1 == topology.pipeline_parallel_size {
             return Err(Error::Parallel(
@@ -131,9 +140,7 @@ impl<'a> CartesianExecution<'a> {
             Error::Parallel("pipeline send requires an active PP communicator".into())
         })?;
         let sent = distributed::send(hidden, topology.pipeline_parallel_rank + 1, group, stream)?;
-        eval([&sent])?;
-        stream.synchronize()?;
-        Ok(())
+        DistributedCompletion::submit((), [&sent])
     }
 
     /// Samples on the canonical final-stage rank and synchronizes generation globally.
@@ -189,8 +196,7 @@ impl<'a> CartesianExecution<'a> {
         };
         let failed = distributed::all_sum(&failed, self.world(), stream)?;
         let cancelled = distributed::all_sum(&cancelled, self.world(), stream)?;
-        eval([&failed, &cancelled])?;
-        stream.synchronize()?;
+        synchronize_outputs([&failed, &cancelled])?;
         Ok((
             failed.try_item::<i32>(stream)? != 0,
             cancelled.try_item::<i32>(stream)? != 0,

@@ -31,10 +31,18 @@ MLX-C CMake build.
 `safemlx-lm` immutable weight residency and expert acquisition use the event
 API through caller-owned `ResidentTransfer` guards. Dense layerwise and
 pipeline execution additionally use a dedicated same-device transfer stream
-and a fixed current-plus-next completion-lease window. This permits the next
-weight transfer to overlap current layer computation. Paged attention-cache
-residency, MTP handoff, predictive expert prefetch, and broader activation
-double buffering have not yet adopted events.
+and a fixed current-plus-next completion-lease window. Paged cache movement,
+MTP same-device handoffs, expert-cache acquisition, checkpoint materialization,
+and bounded conversion tiles likewise retain their exact event ownership.
+
+Distributed execution exposes `DistributedCompletion<T>`. Direct Cartesian
+pipeline sends and receives return this value, while `PipelineStageCompletion`
+and `PipelineMicrobatchOutput` delegate to it for stage transport, cache
+updates, final logits, and lane barriers. These are rank-local backend events;
+they submit and observe MLX distributed operations but are not cross-process
+event handles. Distributed pipeline code contains no whole-stream completion
+waits. Host boundaries use exact events, while downstream compatible streams
+use backend-ordered waits.
 
 CUDA compilation is expected in Linux and Windows CUDA CI. Runtime tests remain
 opt-in and require a CUDA-capable runner. The explicit Metal two-stream test is
@@ -43,5 +51,13 @@ ignored in the ordinary suite and must be run on a Metal host with:
 ```console
 cargo test -p safemlx --test events \
   metal_two_stream_handoff_is_gpu_ordered_without_host_synchronization \
+  -- --ignored --exact --nocapture
+```
+
+The safemlx-lm distributed handoff test is also explicit:
+
+```console
+cargo test -p safemlx-lm \
+  distributed_completion_metal_wait_does_not_block_the_host \
   -- --ignored --exact --nocapture
 ```
