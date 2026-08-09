@@ -406,8 +406,8 @@ pub(crate) fn validate_load_policy(
 
     if options.quantization.is_some() && matches!(kind, ModelKind::Inkling | ModelKind::NemotronH) {
         return Err(Error::Quantization(match kind {
-            ModelKind::Inkling => "Inkling load-time requantization is unsupported because routed experts use packed rank-3 grouped-matmul weights without a matching quantized grouped-matmul implementation".into(),
-            ModelKind::NemotronH => "Nemotron-H load-time quantization is unavailable because routed experts use packed rank-3 grouped-matmul weights without an affine grouped-matmul implementation".into(),
+            ModelKind::Inkling => "Inkling load-time quantization is unavailable until its semantic adapter and independent expert-cache loader use the shared packed materialization overlay".into(),
+            ModelKind::NemotronH => "Nemotron-H load-time quantization is unavailable until its semantic adapter and independent expert-cache loader use the shared packed materialization overlay".into(),
             _ => unreachable!("matched above"),
         }));
     }

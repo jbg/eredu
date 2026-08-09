@@ -1116,8 +1116,10 @@ The remaining global limitations are:
   admission and runtime windows count only the final packed bytes. The
   contiguous-span type cannot be constructed for packed GGUF
   encodings, and quantizing an already quantized checkpoint is intentionally
-  unsupported. Inkling and Nemotron-H load-time expert conversion remains
-  unavailable until their grouped rank-3 kernels accept affine packed banks.
+  unsupported. Inkling and Nemotron-H now share the affine grouped rank-3
+  expert primitive with the other MoE implementations; load-time conversion
+  remains unavailable until their semantic adapters and independent
+  expert-cache loaders use the shared packed materialization overlay.
 
 TP+PP+EP is executable for DeepSeek-V3/R1, Qwen3-MoE, Qwen3-VL-MoE, Kimi
 Linear, Inkling, GPT-OSS, Gemma 4 MoE, LFM2-MoE, Nemotron-H-MoE, and
@@ -1774,8 +1776,8 @@ weights.
 | Gemma 4 dense / MoE | yes | MLX affine/MXFP4 and packed GGUF affine | yes / yes | `LoadedModel` | Dense plus routed gated-GELU branches share resident, layerwise, and external-MTP execution; specialized vision/audio components remain dense |
 | Gemma 4 assistant | yes | MLX affine/MXFP4 and uniform packed GGUF affine | yes / yes | `LoadedDrafter` with `ModelLoadOptions` | Transformer/projection/head targets; ordered masked-embedding heads return a capability error |
 | GPT-OSS | dense attention, MXFP4 experts | checkpoint-native MXFP4 experts plus `gpt-oss` GGUF | no / yes | `LoadedModel` | Canonical GGUF type-39 experts stay packed; mixed dense projections use their exact GGUF formats |
-| Inkling | yes | packed GGUF affine/IQ/MXFP4 | GGUF requantization unavailable | `LoadedModel` | `inkling` text GGUF plus sibling combined hMLP/dMel mmproj; local/global relative-bias attention and routed plus shared experts work across resident and streamed policies |
-| Nemotron-H | yes | no | capability error | `LoadedModel` (dense) | Packed rank-3 routed experts require an affine grouped-matmul kernel |
+| Inkling | yes | packed GGUF affine/IQ/MXFP4 | load-time conversion pending shared materialization integration | `LoadedModel` | `inkling` text GGUF plus sibling combined hMLP/dMel mmproj; local/global relative-bias attention and routed plus shared experts work across resident and streamed policies |
+| Nemotron-H | yes | checkpoint-native packed GGUF affine/IQ | load-time conversion pending shared materialization integration | `LoadedModel` (dense) | ReLU2 routed experts execute through the shared affine grouped rank-3 primitive; the adapter and independent cache loader still need bounded packed-overlay integration |
 | Qwen3.5/3.6-MoE | yes | block FP8, MLX affine/MXFP4 | yes / yes, from dense checkpoints | `LoadedModel` | Rank-3 expert banks are quantized row-wise and executed with routed `gather_qmm`; native FP8 checkpoints are never implicitly transcoded |
 | Qwen3-Next | yes | native block FP8, MLX affine/MXFP4 | yes / yes, from dense checkpoints | `LoadedModel` | Official dynamic E4M3 128 x 128 checkpoints work with resident, layerwise, sparse expert-cache, and expert-parallel policies; fused weights/scales are split while streaming and native FP8 is never implicitly transcoded |
 | Moshi | yes | MLX affine/MXFP4 | yes / yes | realtime loader | Temporal/depth projections and embeddings; no codec dependency |

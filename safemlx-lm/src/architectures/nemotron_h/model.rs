@@ -13,8 +13,7 @@ use safemlx::{
     native_quantization::{native_grouped_linear, NativeQuantizedTensor},
     nn,
     ops::{
-        arange, broadcast_to, concatenate_axis, exp, gather_grouped_rows, gather_qmm,
-        grouped_matmul,
+        broadcast_to, concatenate_axis, exp, gather_grouped_rows, grouped_matmul,
         indexing::{NewAxis, TryIndexOp},
         quantized_packed_dimension, sigmoid, sum_axis, topk_route_plan, zeros, GgufCheckpoint,
         GgufMetadataValue,
@@ -35,7 +34,7 @@ use crate::{
             generation::CausalLm,
             layers::relu2,
             linear::project_logits_maybe_quantized,
-            moe::{weighted_route_sum, TopKRouterScoreFunction},
+            moe::{affine_grouped_linear, weighted_route_sum, TopKRouterScoreFunction},
         },
         input,
     },
@@ -1073,34 +1072,6 @@ impl Experts {
         })
     }
 
-    fn quantized_grouped_matmul(
-        inputs: &Array,
-        weights: &Array,
-        scales: &Array,
-        biases: &Array,
-        group_ids: &Array,
-        quantization: AffineQuantization,
-        stream: &Stream,
-    ) -> Result<Array, Exception> {
-        let routes = inputs.dim(0);
-        let out_features = weights.dim(-2);
-        let lhs_indices = arange::<i32, u32>(0, routes, 1, stream)?;
-        gather_qmm(
-            inputs.reshape(&[routes, 1, inputs.dim(-1)], stream)?,
-            weights,
-            scales,
-            biases,
-            &lhs_indices,
-            group_ids,
-            true,
-            quantization.group_size,
-            quantization.bits,
-            true,
-            stream,
-        )?
-        .reshape(&[routes, out_features], stream)
-    }
-
     /// Evaluates routed experts and reduces route outputs back to tokens.
     pub fn forward(
         &mut self,
@@ -1123,19 +1094,16 @@ impl Experts {
             native_grouped_linear(&hidden, &native, &plan.sorted_group_ids, stream)?
         } else {
             match self.up_quantization {
-                Some(quantization) => Self::quantized_grouped_matmul(
+                Some(quantization) => affine_grouped_linear(
                     &hidden,
                     &self.up_proj,
                     self.up_proj_scales
                         .as_ref()
                         .as_ref()
                         .expect("quantized expert scales"),
-                    self.up_proj_biases
-                        .as_ref()
-                        .as_ref()
-                        .expect("quantized expert biases"),
+                    self.up_proj_biases.as_ref().as_ref(),
                     &plan.sorted_group_ids,
-                    quantization,
+                    WeightQuantization::Affine(quantization),
                     stream,
                 )?,
                 None => grouped_matmul(
@@ -1159,19 +1127,16 @@ impl Experts {
             native_grouped_linear(&hidden, &native, &plan.sorted_group_ids, stream)?
         } else {
             match self.down_quantization {
-                Some(quantization) => Self::quantized_grouped_matmul(
+                Some(quantization) => affine_grouped_linear(
                     &hidden,
                     &self.down_proj,
                     self.down_proj_scales
                         .as_ref()
                         .as_ref()
                         .expect("quantized expert scales"),
-                    self.down_proj_biases
-                        .as_ref()
-                        .as_ref()
-                        .expect("quantized expert biases"),
+                    self.down_proj_biases.as_ref().as_ref(),
                     &plan.sorted_group_ids,
-                    quantization,
+                    WeightQuantization::Affine(quantization),
                     stream,
                 )?,
                 None => grouped_matmul(
@@ -4776,19 +4741,22 @@ mod tests {
         expand_layer_values, gguf_affine_quantization, hybrid_pattern_from_gguf_layers,
         load_nemotron_h_gguf, load_nemotron_h_model, load_nemotron_h_safetensors_strict,
         model_args_from_config_value, rewrite_nemotron_h_weight_key, translate_gguf_weight_name,
-        unique_nonzero_layer_value, validate_model_config_value, AttentionCache, LayerCache,
-        LayerPolicy, Model, ModelArgs, ModelInput, SparseMoeBlock,
+        unique_nonzero_layer_value, validate_model_config_value, AttentionCache, Experts,
+        LayerCache, LayerPolicy, Model, ModelArgs, ModelInput, SparseMoeBlock,
     };
     use crate::runtime::checkpoint::load::{StrictLoadConfig, StrictLoadReport};
     use crate::{
-        nn::{generation::CausalLm, moe::TopKRouterScoreFunction},
+        nn::{
+            generation::CausalLm,
+            moe::{quantize_expert_bank, TopKRouterScoreFunction},
+        },
         runtime::checkpoint::quantization::AffineQuantization,
         AttentionPolicy, LayerSchedule,
     };
     use safemlx::{
-        module::{Module, ModuleParameters},
-        ops::indexing::TryIndexOp,
-        Array, ExecutionContext,
+        module::{Module, ModuleParameters, Param},
+        ops::{dequantize, indexing::TryIndexOp},
+        Array, Device, DeviceType, Dtype, ExecutionContext,
     };
     use serde_json::json;
     use std::{
@@ -5084,6 +5052,94 @@ mod tests {
             AffineQuantization::new(32, 8).unwrap()
         );
         assert!(gguf_affine_quantization(&[16, 196], &[16, 98], "bad.weight").is_err());
+    }
+
+    #[test]
+    #[ignore = "requires an MLX Metal device"]
+    fn affine_nemotron_experts_match_dequantized_reference_with_empty_routes() {
+        let context = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
+        let stream = context.stream();
+        let quantization = AffineQuantization::new(32, 4).unwrap();
+        let bank_values = |offset: usize| {
+            (0..3 * 32 * 32)
+                .map(|index| {
+                    let value = (index + offset) % 41;
+                    (value as f32 - 20.0) / 32.0
+                })
+                .collect::<Vec<_>>()
+        };
+        let up = Array::from_slice(&bank_values(0), &[3, 32, 32]);
+        let down = Array::from_slice(&bank_values(17), &[3, 32, 32]);
+        let up = quantize_expert_bank(&up, quantization.into(), stream).unwrap();
+        let down = quantize_expert_bank(&down, quantization.into(), stream).unwrap();
+        let up_scales = up.scales.as_dtype(Dtype::Float16, stream).unwrap();
+        let up_biases = up.biases.unwrap().as_dtype(Dtype::Float16, stream).unwrap();
+        let down_scales = down.scales.as_dtype(Dtype::Float16, stream).unwrap();
+        let down_biases = down
+            .biases
+            .unwrap()
+            .as_dtype(Dtype::Float16, stream)
+            .unwrap();
+
+        let mut packed = Experts::new(
+            3,
+            32,
+            32,
+            [Some(quantization.into()), Some(quantization.into())],
+            stream,
+        )
+        .unwrap();
+        packed.up_proj = Param::new(up.weight.clone());
+        packed.up_proj_scales = Param::new(Some(up_scales.clone()));
+        packed.up_proj_biases = Param::new(Some(up_biases.clone()));
+        packed.down_proj = Param::new(down.weight.clone());
+        packed.down_proj_scales = Param::new(Some(down_scales.clone()));
+        packed.down_proj_biases = Param::new(Some(down_biases.clone()));
+
+        let mut reference = Experts::new(3, 32, 32, [None, None], stream).unwrap();
+        reference.up_proj = Param::new(
+            dequantize(
+                &up.weight,
+                &up_scales,
+                &up_biases,
+                quantization.group_size,
+                quantization.bits,
+                stream,
+            )
+            .unwrap(),
+        );
+        reference.down_proj = Param::new(
+            dequantize(
+                &down.weight,
+                &down_scales,
+                &down_biases,
+                quantization.group_size,
+                quantization.bits,
+                stream,
+            )
+            .unwrap(),
+        );
+
+        let input_values = (0..3 * 32)
+            .map(|index| ((index * 7 % 29) as f32 - 14.0) / 16.0)
+            .collect::<Vec<_>>();
+        let hidden = Array::from_slice(&input_values, &[3, 32]);
+        // Expert 1 deliberately receives no routes.
+        let indices = Array::from_slice(&[2i32, 0, 2, 0, 2, 0], &[3, 2]);
+        let weights = Array::from_slice(&[0.75f32, 0.25, 0.6, 0.4, 0.9, 0.1], &[3, 2]);
+        let actual = packed.forward(&hidden, &indices, &weights, stream).unwrap();
+        let actual = actual.evaluated().unwrap();
+        let expected = reference
+            .forward(&hidden, &indices, &weights, stream)
+            .unwrap();
+        let expected = expected.evaluated().unwrap();
+        let maximum_error = actual
+            .as_slice::<f32>()
+            .iter()
+            .zip(expected.as_slice::<f32>())
+            .map(|(actual, expected)| (actual - expected).abs())
+            .fold(0.0f32, f32::max);
+        assert!(maximum_error < 2e-2, "maximum error {maximum_error}");
     }
 
     #[test]
