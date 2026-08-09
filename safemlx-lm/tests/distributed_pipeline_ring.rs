@@ -4342,6 +4342,19 @@ fn ring_qwen3_moe_streamed_tensor_pipeline_expert() {
     run_ring_cartesian_pipeline(true, FixtureFamily::Qwen3Moe, "tp-pp-ep");
 }
 
+/// Proves complete Qwen3-MoE expert banks use the shared atomic packed overlay
+/// under PP+EP without constructing an independent expert cache.
+#[test]
+#[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
+fn ring_four_process_qwen3_moe_fully_resident_load_time_quantization() {
+    run_ring_cartesian_pipeline_mode(
+        false,
+        FixtureFamily::Qwen3Moe,
+        "pp-ep",
+        WorkerMode::Requantize,
+    );
+}
+
 /// Verifies resident non-expert parameters plus stage/EP-local independent
 /// expert caches across PP=2 x EP=2, including persistence and generation.
 #[test]

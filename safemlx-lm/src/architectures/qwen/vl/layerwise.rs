@@ -603,12 +603,6 @@ pub(crate) fn load_qwen3_vl_gguf_layerwise_model(
             weights_stream,
         )?
     } else {
-        if args.text_config.is_moe() && quantization.is_some() {
-            return Err(Error::Quantization(
-                "Qwen3-VL-MoE bounded GGUF load-time quantization requires independent expert residency so routed rank-3 banks can be materialized one expert at a time"
-                    .into(),
-            ));
-        }
         load_layerwise_model_with_quantization(
             store,
             Qwen3VlLayerwiseAdapter::new(args, stream)?,

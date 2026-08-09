@@ -506,12 +506,6 @@ pub(crate) fn load_deepseek_v3_gguf_layerwise_model(
             prepared.eos_token_ids,
         ));
     }
-    if quantization.is_some() {
-        return Err(Error::Quantization(
-            "DeepSeek bounded GGUF load-time quantization requires independent expert residency so routed rank-3 banks can be materialized one expert at a time"
-                .into(),
-        ));
-    }
     let execution = load_layerwise_model_with_quantization(
         store,
         DeepSeekV3LayerwiseAdapter::new(args, stream)?,

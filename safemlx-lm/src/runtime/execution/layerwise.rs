@@ -3267,10 +3267,6 @@ where
                 {
                     continue;
                 }
-                let target = binding.logical_target().unwrap_or(binding.checkpoint_key());
-                if !target.ends_with(".weight") {
-                    continue;
-                }
                 let canonical_local =
                     crate::runtime::checkpoint::binding::canonical_checkpoint_name(binding.name());
                 if selected_local_weights
@@ -3278,6 +3274,7 @@ where
                 {
                     continue;
                 }
+                let target = binding.logical_target().unwrap_or(binding.checkpoint_key());
                 let companion_dtype = selected_local_weights
                     .and_then(|selected| selected.get(&canonical_local))
                     .cloned()
@@ -3449,10 +3446,6 @@ where
                 {
                     continue;
                 }
-                let target = binding.logical_target().unwrap_or(binding.checkpoint_key());
-                if !target.ends_with(".weight") {
-                    continue;
-                }
                 let canonical_local =
                     crate::runtime::checkpoint::binding::canonical_checkpoint_name(binding.name());
                 if selected_local_weights
@@ -3460,6 +3453,7 @@ where
                 {
                     continue;
                 }
+                let target = binding.logical_target().unwrap_or(binding.checkpoint_key());
                 let companion_dtype = selected_local_weights
                     .and_then(|selected| selected.get(&canonical_local))
                     .cloned()

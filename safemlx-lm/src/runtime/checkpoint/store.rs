@@ -367,6 +367,13 @@ pub trait WeightStore: Any {
         Vec::new()
     }
 
+    /// Returns whether `key` is an authoritative output synthesized by this
+    /// store and must supersede any source-side semantic recipe for the same
+    /// logical parameter.
+    fn is_authoritative_materialized_key(&self, _key: &str) -> bool {
+        false
+    }
+
     /// Returns metadata, loading only the required backend metadata if needed.
     fn metadata(&self, key: &str) -> Result<WeightMetadata, WeightStoreError>;
 

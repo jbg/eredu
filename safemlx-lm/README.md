@@ -1093,15 +1093,6 @@ formats. Dense families have no EP migration.
 
 The remaining global limitations are:
 
-- Complete rank-3 expert-bank conversion is implemented by the shared bounded
-  materialisation store, but several ordinary residency adapters have not yet
-  adopted it. Qwen3-MoE still requires independent expert residency for
-  SafeTensors and dense-GGUF load-time conversion; DeepSeek-V3/R1, Kimi Linear,
-  Qwen3-Next/Qwen3.5-MoE, Qwen3-VL-MoE, LFM2-MoE, Gemma 4 MoE, and GPT-OSS
-  retain that restriction for dense GGUF input. Their checkpoint-native packed
-  execution, pipeline-local conversion, and independent expert-cache paths are
-  supported. Removing these guards is shared materialisation integration work,
-  not a combined-topology or family-runtime migration.
 - The shared bounded materialisation store supports out-of-core affine and
   MXFP4 conversion from row-bounded SafeTensors or dense GGUF semantic recipes.
   Static modules, ordinary layers, shared experts, independent expert caches,
@@ -1138,6 +1129,13 @@ The remaining global limitations are:
   Complete rank-3 routed and shared banks are visited one matrix and bounded
   row tile at a time while their expert-major output geometry is retained, so
   fully resident conversion no longer requires an independent expert cache.
+  The packed overlay derives one atomic weight/scale/bias naming layout from
+  each target runtime binding, including the underscore companions used by
+  grouped expert banks. Qwen3-MoE SafeTensors and every registered dense-GGUF
+  MoE adapter therefore use the same complete-bank path for fully resident,
+  host-layerwise, and dense-streamed execution without selecting independent
+  expert residency. This includes DeepSeek-V3/R1, Kimi Linear,
+  Qwen3-Next/Qwen3.5-MoE, Qwen3-VL-MoE, LFM2-MoE, Gemma 4 MoE, and GPT-OSS.
   Inkling supports affine and MXFP4 conversion for every eligible text target;
   Nemotron-H conversion remains affine-only because its ReLU2 grouped-expert
   kernel has no MXFP4 target representation.

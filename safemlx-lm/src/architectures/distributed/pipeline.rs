@@ -5336,6 +5336,9 @@ pub fn load_pipeline_model(
 /// with resident, host-layerwise, or dense-streamed non-expert parameters for
 /// PP, TP+PP, PP+EP, and TP+PP+EP. With EP inactive each stage owns all experts
 /// for its local layers and executes routes without an expert collective.
+/// Load-time conversion from a dense checkpoint always constructs the same
+/// stage-local bounded packed overlay before parameter residency is selected;
+/// fully resident stages never fall back to eager complete-matrix conversion.
 pub fn load_pipeline_model_with_options(
     model_dir: impl AsRef<Path>,
     options: ModelLoadOptions,
@@ -6271,24 +6274,20 @@ fn load_llama_pipeline(
             stage.lm_head.is_some() || stage.parallel_lm_head.is_some(),
         ),
     ]);
-    let (store, materialization) = if dense_stream.is_some() {
-        match quantize_on_load {
-            Some(quantization) => {
-                let (store, report) = quantize_pipeline_stage_store(
-                    store,
-                    &binding_adapter,
-                    &stage.layer_adapter,
-                    PipelineStageQuantizationSelection::new(&static_roles, 0, stage.range.clone()),
-                    quantization,
-                    stream,
-                    weights_stream,
-                )?;
-                (store, Some(report))
-            }
-            None => (store, None),
+    let (store, materialization) = match quantize_on_load {
+        Some(quantization) => {
+            let (store, report) = quantize_pipeline_stage_store(
+                store,
+                &binding_adapter,
+                &stage.layer_adapter,
+                PipelineStageQuantizationSelection::new(&static_roles, 0, stage.range.clone()),
+                quantization,
+                stream,
+                weights_stream,
+            )?;
+            (store, Some(report))
         }
-    } else {
-        (store, None)
+        None => (store, None),
     };
     let quantize_on_load = materialization
         .is_none()
@@ -7385,24 +7384,20 @@ fn load_dense_qwen_pipeline(
             stage.lm_head.is_some() || stage.parallel_lm_head.is_some(),
         ),
     ]);
-    let (store, materialization) = if dense_stream.is_some() {
-        match quantize_on_load {
-            Some(quantization) => {
-                let (store, report) = quantize_pipeline_stage_store(
-                    store,
-                    &binding_adapter,
-                    &stage.layer_adapter,
-                    PipelineStageQuantizationSelection::new(&static_roles, 0, stage.range.clone()),
-                    quantization,
-                    stream,
-                    weights_stream,
-                )?;
-                (store, Some(report))
-            }
-            None => (store, None),
+    let (store, materialization) = match quantize_on_load {
+        Some(quantization) => {
+            let (store, report) = quantize_pipeline_stage_store(
+                store,
+                &binding_adapter,
+                &stage.layer_adapter,
+                PipelineStageQuantizationSelection::new(&static_roles, 0, stage.range.clone()),
+                quantization,
+                stream,
+                weights_stream,
+            )?;
+            (store, Some(report))
         }
-    } else {
-        (store, None)
+        None => (store, None),
     };
     let quantize_on_load = materialization
         .is_none()
@@ -7767,24 +7762,20 @@ fn load_qwen3_vl_pipeline(
             info.is_last && !target_args.text_config.tie_word_embeddings,
         ),
     ]);
-    let (store, materialization) = if dense_stream.is_some() {
-        match quantize_on_load {
-            Some(quantization) => {
-                let (store, report) = quantize_pipeline_stage_store(
-                    store,
-                    &binding_adapter,
-                    &target_binding_adapter,
-                    PipelineStageQuantizationSelection::new(&static_roles, 1, stage.range.clone()),
-                    quantization,
-                    stream,
-                    weights_stream,
-                )?;
-                (store, Some(report))
-            }
-            None => (store, None),
+    let (store, materialization) = match quantize_on_load {
+        Some(quantization) => {
+            let (store, report) = quantize_pipeline_stage_store(
+                store,
+                &binding_adapter,
+                &target_binding_adapter,
+                PipelineStageQuantizationSelection::new(&static_roles, 1, stage.range.clone()),
+                quantization,
+                stream,
+                weights_stream,
+            )?;
+            (store, Some(report))
         }
-    } else {
-        (store, None)
+        None => (store, None),
     };
     let quantize_on_load = materialization
         .is_none()
@@ -9238,24 +9229,20 @@ fn load_gpt_oss_pipeline(
             stage.lm_head.is_some() || stage.parallel_lm_head.is_some(),
         ),
     ]);
-    let (store, materialization) = if dense_stream.is_some() {
-        match quantize_on_load {
-            Some(quantization) => {
-                let (store, report) = quantize_pipeline_stage_store(
-                    store,
-                    &binding_adapter,
-                    &target_binding_adapter,
-                    PipelineStageQuantizationSelection::new(&static_roles, 0, stage.range.clone()),
-                    quantization,
-                    stream,
-                    weights_stream,
-                )?;
-                (store, Some(report))
-            }
-            None => (store, None),
+    let (store, materialization) = match quantize_on_load {
+        Some(quantization) => {
+            let (store, report) = quantize_pipeline_stage_store(
+                store,
+                &binding_adapter,
+                &target_binding_adapter,
+                PipelineStageQuantizationSelection::new(&static_roles, 0, stage.range.clone()),
+                quantization,
+                stream,
+                weights_stream,
+            )?;
+            (store, Some(report))
         }
-    } else {
-        (store, None)
+        None => (store, None),
     };
     let quantize_on_load = materialization
         .is_none()
@@ -10240,24 +10227,20 @@ fn load_lfm2_pipeline(
             stage.lm_head.is_some() || stage.parallel_lm_head.is_some(),
         ),
     ]);
-    let (store, materialization) = if dense_stream.is_some() {
-        match quantize_on_load {
-            Some(quantization) => {
-                let (store, report) = quantize_pipeline_stage_store(
-                    store,
-                    &binding_adapter,
-                    &target_binding_adapter,
-                    PipelineStageQuantizationSelection::new(&static_roles, 0, stage.range.clone()),
-                    quantization,
-                    stream,
-                    weights_stream,
-                )?;
-                (store, Some(report))
-            }
-            None => (store, None),
+    let (store, materialization) = match quantize_on_load {
+        Some(quantization) => {
+            let (store, report) = quantize_pipeline_stage_store(
+                store,
+                &binding_adapter,
+                &target_binding_adapter,
+                PipelineStageQuantizationSelection::new(&static_roles, 0, stage.range.clone()),
+                quantization,
+                stream,
+                weights_stream,
+            )?;
+            (store, Some(report))
         }
-    } else {
-        (store, None)
+        None => (store, None),
     };
     let quantize_on_load = materialization
         .is_none()
@@ -13006,28 +12989,24 @@ fn load_qwen_hybrid_pipeline(
         ),
         ("vision", has_vision_static),
     ]);
-    let (store, materialization) = if dense_stream.is_some() {
-        match quantize_on_load {
-            Some(quantization) => {
-                let (store, report) = quantize_pipeline_stage_store(
-                    store,
-                    &binding_adapter,
-                    &target_binding_adapter,
-                    PipelineStageQuantizationSelection::new(
-                        &static_roles,
-                        text_group,
-                        stage.range.clone(),
-                    ),
-                    quantization,
-                    stream,
-                    weights_stream,
-                )?;
-                (store, Some(report))
-            }
-            None => (store, None),
+    let (store, materialization) = match quantize_on_load {
+        Some(quantization) => {
+            let (store, report) = quantize_pipeline_stage_store(
+                store,
+                &binding_adapter,
+                &target_binding_adapter,
+                PipelineStageQuantizationSelection::new(
+                    &static_roles,
+                    text_group,
+                    stage.range.clone(),
+                ),
+                quantization,
+                stream,
+                weights_stream,
+            )?;
+            (store, Some(report))
         }
-    } else {
-        (store, None)
+        None => (store, None),
     };
     let expert_quantization = quantize_on_load;
     let quantize_on_load = materialization
@@ -14440,24 +14419,20 @@ fn load_kimi_linear_pipeline(
             stage.lm_head.is_some() || stage.parallel_lm_head.is_some(),
         ),
     ]);
-    let (store, materialization) = if dense_stream.is_some() {
-        match quantize_on_load {
-            Some(quantization) => {
-                let (store, report) = quantize_pipeline_stage_store(
-                    store,
-                    &binding_adapter,
-                    &target_binding_adapter,
-                    PipelineStageQuantizationSelection::new(&static_roles, 0, stage.range.clone()),
-                    quantization,
-                    stream,
-                    weights_stream,
-                )?;
-                (store, Some(report))
-            }
-            None => (store, None),
+    let (store, materialization) = match quantize_on_load {
+        Some(quantization) => {
+            let (store, report) = quantize_pipeline_stage_store(
+                store,
+                &binding_adapter,
+                &target_binding_adapter,
+                PipelineStageQuantizationSelection::new(&static_roles, 0, stage.range.clone()),
+                quantization,
+                stream,
+                weights_stream,
+            )?;
+            (store, Some(report))
         }
-    } else {
-        (store, None)
+        None => (store, None),
     };
     let expert_quantization = quantize_on_load;
     let quantize_on_load = materialization
@@ -16963,28 +16938,24 @@ fn load_gemma_pipeline(
         ("audio", has_audio_static),
         ("audio_embed", has_audio_embed_static),
     ]);
-    let (store, materialization) = if dense_stream.is_some() {
-        match quantize_on_load {
-            Some(quantization) => {
-                let (store, report) = quantize_pipeline_stage_store(
-                    store,
-                    &binding_adapter,
-                    &target_binding_adapter,
-                    PipelineStageQuantizationSelection::new(
-                        &static_roles,
-                        stage.layer_adapter.pipeline_text_group(),
-                        stage.range.clone(),
-                    ),
-                    quantization,
-                    stream,
-                    weights_stream,
-                )?;
-                (store, Some(report))
-            }
-            None => (store, None),
+    let (store, materialization) = match quantize_on_load {
+        Some(quantization) => {
+            let (store, report) = quantize_pipeline_stage_store(
+                store,
+                &binding_adapter,
+                &target_binding_adapter,
+                PipelineStageQuantizationSelection::new(
+                    &static_roles,
+                    stage.layer_adapter.pipeline_text_group(),
+                    stage.range.clone(),
+                ),
+                quantization,
+                stream,
+                weights_stream,
+            )?;
+            (store, Some(report))
         }
-    } else {
-        (store, None)
+        None => (store, None),
     };
     let expert_quantization = quantize_on_load;
     let quantize_on_load = materialization
@@ -18253,24 +18224,20 @@ fn load_deepseek_pipeline(
             stage.lm_head.is_some() || stage.parallel_lm_head.is_some(),
         ),
     ]);
-    let (store, materialization) = if dense_stream.is_some() {
-        match quantize_on_load {
-            Some(quantization) => {
-                let (store, report) = quantize_pipeline_stage_store(
-                    store,
-                    &binding_adapter,
-                    &target_binding_adapter,
-                    PipelineStageQuantizationSelection::new(&static_roles, 0, stage.range.clone()),
-                    quantization,
-                    stream,
-                    weights_stream,
-                )?;
-                (store, Some(report))
-            }
-            None => (store, None),
+    let (store, materialization) = match quantize_on_load {
+        Some(quantization) => {
+            let (store, report) = quantize_pipeline_stage_store(
+                store,
+                &binding_adapter,
+                &target_binding_adapter,
+                PipelineStageQuantizationSelection::new(&static_roles, 0, stage.range.clone()),
+                quantization,
+                stream,
+                weights_stream,
+            )?;
+            (store, Some(report))
         }
-    } else {
-        (store, None)
+        None => (store, None),
     };
     let expert_quantization = quantize_on_load;
     let quantize_on_load = materialization
@@ -21823,6 +21790,16 @@ mod tests {
             quantized_last.stage_info().local_parameter_bytes
                 < dense_last.stage_info().local_parameter_bytes
         );
+        for model in [&quantized_first, &quantized_last] {
+            let materialization = model.stage_info().materialization.as_ref().unwrap();
+            assert!(materialization.transformed_weights > 0);
+            assert!(materialization.source_tiles > 0);
+            assert!(materialization.output_bytes < materialization.source_bytes_read);
+            assert!(
+                materialization.peak_planned_working_set_bytes
+                    <= materialization.admitted_working_set_bytes
+            );
+        }
         let expected = run_pipeline_sequence(&mut dense_first, &mut dense_last, &tokens, stream);
         let actual =
             run_pipeline_sequence(&mut quantized_first, &mut quantized_last, &tokens, stream);
@@ -22811,15 +22788,20 @@ mod tests {
                 < dense_first.stage_info().local_parameter_bytes
         );
         for stage in [&quantized_first, &quantized_last] {
-            assert!(
-                stage
-                    .stage_info()
-                    .owned_tensors
-                    .iter()
-                    .any(|name| name.contains("gate_up")),
-                "missing fused expert binding in {:?}",
-                stage.stage_info().owned_tensors
-            );
+            let info = stage.stage_info();
+            for projection in ["gate_proj", "up_proj", "down_proj"] {
+                assert!(
+                    info.owned_tensors
+                        .iter()
+                        .any(|name| name.contains(projection)),
+                    "missing materialized {projection} expert binding in {:?}",
+                    info.owned_tensors
+                );
+            }
+            let materialization = info.materialization.as_ref().unwrap();
+            assert!(materialization.transformed_weights > 0);
+            assert!(materialization.source_tiles > 0);
+            assert!(materialization.output_bytes < materialization.source_bytes_read);
         }
 
         let run = |first: &mut PipelineModel, last: &mut PipelineModel| {

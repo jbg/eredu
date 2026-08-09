@@ -1155,12 +1155,6 @@ pub(crate) fn load_gemma4_gguf_layerwise_model(
         });
         return Ok((Gemma4LayerwiseModel { execution }, prepared.eos_token_ids));
     }
-    if has_routed_experts && quantization.is_some() {
-        return Err(Error::Quantization(
-            "Gemma 4 MoE bounded GGUF load-time quantization requires independent expert residency so routed rank-3 banks can be materialized one expert at a time"
-                .into(),
-        ));
-    }
     let execution = load_layerwise_model_with_quantization(
         store,
         adapter,

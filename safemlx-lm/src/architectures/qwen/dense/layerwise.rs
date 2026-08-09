@@ -779,12 +779,6 @@ pub(crate) fn load_safetensors_quantized_residency(
             )?,
         });
     }
-    if args.is_moe() {
-        return Err(Error::Quantization(
-            "Qwen3-MoE load-time quantization requires independent expert residency so routed rank-3 banks can be materialized one expert at a time"
-                .into(),
-        ));
-    }
     let source_adapter = DenseQwenLayerwiseAdapter::new(args, stream)?;
     Ok(LayerwiseDecoder {
         execution: load_layerwise_model_with_quantization(
@@ -940,12 +934,6 @@ pub(crate) fn load_gguf_checkpoint(
                 weights_stream,
             )?,
             eos_token_ids,
-        ));
-    }
-    if args.is_moe() && quantization.is_some() {
-        return Err(Error::Quantization(
-            "Qwen3-MoE bounded GGUF load-time quantization requires independent expert residency so routed rank-3 banks can be materialized one expert at a time"
-                .into(),
         ));
     }
     let execution = load_layerwise_model_with_quantization(
@@ -3308,7 +3296,7 @@ mod tests {
     }
 
     #[test]
-    fn qwen3_load_time_quantization_packs_static_layers_and_cached_experts() {
+    fn qwen3_load_time_quantization_packs_complete_and_cached_expert_banks() {
         use crate::runtime::checkpoint::quantization::AffineQuantization;
 
         let gpu = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
@@ -3346,6 +3334,30 @@ mod tests {
             cpu.stream(),
         )
         .unwrap();
+        let mut complete = load_safetensors_quantized_residency(
+            dir.path(),
+            crate::LayerWeightResidency::FullyResident,
+            quantization,
+            gpu.stream(),
+            cpu.stream(),
+        )
+        .unwrap();
+        let mut streamed = load_safetensors_quantized_residency(
+            dir.path(),
+            dense,
+            quantization,
+            gpu.stream(),
+            cpu.stream(),
+        )
+        .unwrap();
+        let mut layerwise = load_safetensors_quantized_residency(
+            dir.path(),
+            LayerwiseLoadOptions::new(OffloadConfig::new(None, None, 1).unwrap()),
+            quantization,
+            gpu.stream(),
+            cpu.stream(),
+        )
+        .unwrap();
 
         let ordinary = loaded.residency_metadata().materialization().unwrap();
         assert!(ordinary.transformed_weights > 0);
@@ -3364,12 +3376,46 @@ mod tests {
             .iter()
             .filter(|unit| unit.id().as_str().starts_with("dense_qwen.layer."))
             .all(|unit| unit.planned_tier() == MemoryTier::Disk));
+        let complete_materialization = complete.residency_metadata().materialization().unwrap();
+        assert!(complete_materialization.transformed_weights > 0);
+        assert!(complete_materialization.output_bytes < complete_materialization.source_bytes_read);
+        assert!(
+            complete_materialization.peak_planned_working_set_bytes
+                <= complete_materialization.output_bytes
+        );
+        assert!(complete.expert_cache_report().unwrap().is_none());
+        assert!(streamed.expert_cache_report().unwrap().is_none());
+        assert!(streamed
+            .dense_stream_report()
+            .unwrap()
+            .unwrap()
+            .residency()
+            .units()
+            .iter()
+            .filter(|unit| unit.id().as_str().starts_with("dense_qwen.layer."))
+            .all(|unit| unit.planned_tier() == MemoryTier::Disk));
+        assert!(layerwise.expert_cache_report().unwrap().is_none());
 
         let tokens = Array::from_slice(&[1u32, 2], &[1, 2]);
         let mut cache = loaded.new_cache();
+        let mut complete_cache = complete.new_cache();
+        let mut streamed_cache = streamed.new_cache();
+        let mut layerwise_cache = layerwise.new_cache();
         let logits = loaded
             .forward(&tokens, None, &mut cache, gpu.stream())
             .unwrap();
+        let complete_logits = complete
+            .forward(&tokens, None, &mut complete_cache, gpu.stream())
+            .unwrap();
+        let streamed_logits = streamed
+            .forward(&tokens, None, &mut streamed_cache, gpu.stream())
+            .unwrap();
+        let layerwise_logits = layerwise
+            .forward(&tokens, None, &mut layerwise_cache, gpu.stream())
+            .unwrap();
+        assert_close(&complete_logits, &logits);
+        assert_close(&streamed_logits, &logits);
+        assert_close(&layerwise_logits, &logits);
         safemlx::transforms::eval([&logits]).unwrap();
         gpu.stream().synchronize().unwrap();
         assert_eq!(logits.shape(), &[1, 2, 32]);

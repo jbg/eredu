@@ -249,42 +249,54 @@ where
         let parameter = params
             .get(local_name.as_str())
             .expect("parameter name came from the same flattened tree");
-        if let Some(recipe) = recipes.remove(&local_name) {
-            let destination = qualify(prefix, &local_name);
-            let metadata = recipe.infer(store)?;
-            let expected_shape = parameter
-                .shape()
-                .iter()
-                .map(|&dimension| usize::try_from(dimension))
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|_| ModuleBindingError::InvalidModuleShape {
-                    parameter: qualify(prefix, &local_name),
-                    shape: parameter.shape().to_vec(),
-                })?;
-            if metadata.shape() != expected_shape {
-                return Err(ModuleBindingError::RecipeShapeMismatch {
-                    parameter: qualify(prefix, &local_name),
-                    expected: expected_shape,
-                    actual: metadata.shape().to_vec(),
-                });
-            }
-            let expected_dtype = RecipeDtype::from(parameter.dtype());
-            if !recipe_dtype_matches(&expected_dtype, metadata.dtype()) {
-                return Err(ModuleBindingError::RecipeDtypeMismatch {
-                    parameter: qualify(prefix, &local_name),
-                    expected: expected_dtype,
-                    actual: metadata.dtype().clone(),
-                });
-            }
-            bindings.push(
-                WeightBinding::from_recipe(local_name, recipe, metadata.byte_len())?
-                    .with_logical_target(destination)?,
-            );
-            continue;
-        }
         let destination = qualify(prefix, &local_name);
         let canonical = canonical_checkpoint_name(&destination);
-        let checkpoint_key = if keys.contains(&destination) {
+        let authoritative_key = if store.is_authoritative_materialized_key(&destination) {
+            Some(destination.clone())
+        } else if store.is_authoritative_materialized_key(&canonical) {
+            Some(canonical.clone())
+        } else {
+            None
+        };
+        if authoritative_key.is_none() {
+            if let Some(recipe) = recipes.remove(&local_name) {
+                let metadata = recipe.infer(store)?;
+                let expected_shape = parameter
+                    .shape()
+                    .iter()
+                    .map(|&dimension| usize::try_from(dimension))
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|_| ModuleBindingError::InvalidModuleShape {
+                        parameter: qualify(prefix, &local_name),
+                        shape: parameter.shape().to_vec(),
+                    })?;
+                if metadata.shape() != expected_shape {
+                    return Err(ModuleBindingError::RecipeShapeMismatch {
+                        parameter: qualify(prefix, &local_name),
+                        expected: expected_shape,
+                        actual: metadata.shape().to_vec(),
+                    });
+                }
+                let expected_dtype = RecipeDtype::from(parameter.dtype());
+                if !recipe_dtype_matches(&expected_dtype, metadata.dtype()) {
+                    return Err(ModuleBindingError::RecipeDtypeMismatch {
+                        parameter: qualify(prefix, &local_name),
+                        expected: expected_dtype,
+                        actual: metadata.dtype().clone(),
+                    });
+                }
+                bindings.push(
+                    WeightBinding::from_recipe(local_name, recipe, metadata.byte_len())?
+                        .with_logical_target(destination)?,
+                );
+                continue;
+            }
+        } else {
+            recipes.remove(&local_name);
+        }
+        let checkpoint_key = if let Some(authoritative_key) = authoritative_key {
+            authoritative_key
+        } else if keys.contains(&destination) {
             destination.clone()
         } else if keys.contains(&canonical) {
             canonical

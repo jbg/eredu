@@ -621,12 +621,6 @@ pub(crate) fn load_lfm2_gguf_layerwise_model(
             prepared.eos_token_ids,
         ));
     }
-    if args.has_sparse_moe_layers() && quantization.is_some() {
-        return Err(Error::Quantization(
-            "LFM2-MoE bounded GGUF load-time quantization requires independent expert residency so routed rank-3 banks can be materialized one expert at a time"
-                .into(),
-        ));
-    }
     let execution = load_layerwise_model_with_quantization(
         store,
         Lfm2LayerwiseAdapter::new(args, stream)?,

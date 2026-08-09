@@ -1151,12 +1151,6 @@ pub(crate) fn load_qwen_hybrid_gguf_layerwise_model(
             is_next,
         ));
     }
-    if args.is_moe() && quantization.is_some() {
-        return Err(Error::Quantization(
-            "Qwen hybrid MoE bounded GGUF load-time quantization requires independent expert residency so routed rank-3 banks can be materialized one expert at a time"
-                .into(),
-        ));
-    }
     let execution = load_layerwise_model_with_quantization(
         store,
         QwenHybridLayerwiseAdapter::new(

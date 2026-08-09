@@ -42,6 +42,8 @@ use crate::{
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct BoundedQuantizationTarget {
     weight_name: String,
+    scales_name: String,
+    biases_name: String,
     source: DerivedWeightRecipe,
     affine_companion_dtype: RecipeDtype,
 }
@@ -56,18 +58,24 @@ impl BoundedQuantizationTarget {
         )
     }
 
-    /// Quantizes a semantic recipe under a canonical packed weight name.
+    /// Quantizes a semantic recipe under its packed runtime weight name.
     ///
     /// Distributed planners can use a bounded selection recipe here to encode
-    /// rank-local TP or EP ownership before the conversion runs.
+    /// rank-local TP or EP ownership before the conversion runs. Conventional
+    /// module weights use `.weight`, `.scales`, and `.biases`; packed matrix
+    /// banks use the same runtime weight name plus `_scales` and `_biases`.
+    /// Deriving the complete output triplet here prevents a target from
+    /// describing an incoherent mixture of the two layouts.
     pub fn from_recipe(
         weight_name: impl Into<String>,
         source: DerivedWeightRecipe,
     ) -> Result<Self, Error> {
         let weight_name = weight_name.into();
-        companion_names(&weight_name)?;
+        let (scales_name, biases_name) = companion_names(&weight_name)?;
         Ok(Self {
             weight_name,
+            scales_name,
+            biases_name,
             source,
             affine_companion_dtype: RecipeDtype::F32,
         })
@@ -108,16 +116,12 @@ impl BoundedQuantizationTarget {
 
     /// Returns the packed scale tensor name derived from this target.
     pub fn scales_name(&self) -> String {
-        companion_names(&self.weight_name)
-            .expect("validated bounded target")
-            .0
+        self.scales_name.clone()
     }
 
     /// Returns the packed affine-bias tensor name derived from this target.
     pub fn biases_name(&self) -> String {
-        companion_names(&self.weight_name)
-            .expect("validated bounded target")
-            .1
+        self.biases_name.clone()
     }
 }
 
@@ -343,6 +347,10 @@ impl WeightStore for BoundedQuantizedWeightStore {
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect()
+    }
+
+    fn is_authoritative_materialized_key(&self, key: &str) -> bool {
+        self.is_transformed(key)
     }
 
     fn metadata(&self, key: &str) -> Result<WeightMetadata, WeightStoreError> {
@@ -633,7 +641,8 @@ fn output_layouts(
     columns: usize,
     bits: usize,
 ) -> Result<Vec<OutputLayout>, Error> {
-    let (scales_name, biases_name) = companion_names(&target.weight_name)?;
+    let scales_name = target.scales_name.clone();
+    let biases_name = target.biases_name.clone();
     let packed_columns = columns
         .checked_mul(bits)
         .and_then(|bits| bits.checked_div(32))
@@ -857,8 +866,7 @@ fn preflight_source_collisions(
 ) -> Result<(), Error> {
     let source_keys = source.keys().into_iter().collect::<BTreeSet<_>>();
     for target in &plan.targets {
-        let (scales, biases) = companion_names(&target.weight_name)?;
-        if source_keys.contains(&scales) || source_keys.contains(&biases) {
+        if source_keys.contains(&target.scales_name) || source_keys.contains(&target.biases_name) {
             return Err(quantization_error(format!(
                 "bounded quantization target {:?} already has checkpoint quantization companions; implicit transcoding is unsupported",
                 target.weight_name
@@ -872,26 +880,33 @@ fn output_names_for(
     target: &BoundedQuantizationTarget,
     quantization: WeightQuantization,
 ) -> Result<Vec<String>, Error> {
-    let (scales, biases) = companion_names(&target.weight_name)?;
-    let mut names = vec![target.weight_name.clone(), scales];
+    let mut names = vec![target.weight_name.clone(), target.scales_name.clone()];
     if quantization.has_biases() {
-        names.push(biases);
+        names.push(target.biases_name.clone());
     }
     Ok(names)
 }
 
 fn companion_names(weight_name: &str) -> Result<(String, String), Error> {
-    let prefix = weight_name.strip_suffix(".weight").ok_or_else(|| {
-        quantization_error(format!(
-            "bounded quantization target name must end in .weight: {weight_name:?}"
-        ))
-    })?;
-    if prefix.is_empty() {
+    if weight_name.trim().is_empty() {
+        return Err(quantization_error(
+            "bounded quantization target name must not be empty",
+        ));
+    }
+    if weight_name == ".weight" {
         return Err(quantization_error(
             "bounded quantization target prefix must not be empty",
         ));
     }
-    Ok((format!("{prefix}.scales"), format!("{prefix}.biases")))
+    Ok(weight_name.strip_suffix(".weight").map_or_else(
+        || {
+            (
+                format!("{weight_name}_scales"),
+                format!("{weight_name}_biases"),
+            )
+        },
+        |prefix| (format!("{prefix}.scales"), format!("{prefix}.biases")),
+    ))
 }
 
 fn checked_product(dimensions: &[usize], context: &'static str) -> Result<usize, Error> {
@@ -1210,6 +1225,59 @@ mod tests {
             actual.evaluated().unwrap().as_slice::<u32>(),
             expected.weight.evaluated().unwrap().as_slice::<u32>()
         );
+    }
+
+    #[test]
+    fn complete_rank_three_bank_uses_atomic_runtime_companion_names() {
+        let values = matrix_values(2, 4, 64);
+        let dense = Array::from_slice(&values, &[2, 4, 64]);
+        let fixture = SyntheticGguf::dense(
+            &HashMap::from([("checkpoint.experts.weight".to_string(), dense)]),
+            &HashMap::new(),
+        );
+        let source = Arc::new(
+            GgufWeightStore::new(GgufCheckpoint::open(fixture.path()).unwrap(), |name| {
+                name.to_string()
+            })
+            .unwrap(),
+        );
+        let context = cpu_context();
+        let target = BoundedQuantizationTarget::from_recipe(
+            "model.experts.down_proj",
+            DerivedWeightRecipe::source("checkpoint.experts.weight", TensorSelection::Full),
+        )
+        .unwrap();
+        assert_eq!(target.scales_name(), "model.experts.down_proj_scales");
+        assert_eq!(target.biases_name(), "model.experts.down_proj_biases");
+        let plan =
+            BoundedQuantizationPlan::new(AffineQuantization::default(), 296, [target]).unwrap();
+        let transformed =
+            BoundedQuantizedWeightStore::create(source.clone(), plan, context.stream()).unwrap();
+
+        assert_eq!(
+            transformed
+                .metadata("model.experts.down_proj")
+                .unwrap()
+                .shape,
+            vec![2, 4, 8]
+        );
+        assert_eq!(
+            transformed
+                .metadata("model.experts.down_proj_scales")
+                .unwrap()
+                .shape,
+            vec![2, 4, 1]
+        );
+        assert_eq!(
+            transformed
+                .metadata("model.experts.down_proj_biases")
+                .unwrap()
+                .shape,
+            vec![2, 4, 1]
+        );
+        let diagnostics = source.diagnostics().unwrap();
+        assert_eq!(diagnostics.physical_reads, 8);
+        assert_eq!(diagnostics.physical_read_bytes, 2_048);
     }
 
     #[test]
