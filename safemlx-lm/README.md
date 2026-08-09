@@ -1093,6 +1093,15 @@ formats. Dense families have no EP migration.
 
 The remaining global limitations are:
 
+- Complete rank-3 expert-bank conversion is implemented by the shared bounded
+  materialisation store, but several ordinary residency adapters have not yet
+  adopted it. Qwen3-MoE still requires independent expert residency for
+  SafeTensors and dense-GGUF load-time conversion; DeepSeek-V3/R1, Kimi Linear,
+  Qwen3-Next/Qwen3.5-MoE, Qwen3-VL-MoE, LFM2-MoE, Gemma 4 MoE, and GPT-OSS
+  retain that restriction for dense GGUF input. Their checkpoint-native packed
+  execution, pipeline-local conversion, and independent expert-cache paths are
+  supported. Removing these guards is shared materialisation integration work,
+  not a combined-topology or family-runtime migration.
 - The shared bounded materialisation store supports out-of-core affine and
   MXFP4 conversion from row-bounded SafeTensors or dense GGUF semantic recipes.
   Static modules, ordinary layers, shared experts, independent expert caches,
