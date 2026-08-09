@@ -3414,8 +3414,10 @@ mod tests {
         assert_close(&complete_logits, &logits);
         assert_close(&streamed_logits, &logits);
         assert_close(&layerwise_logits, &logits);
-        safemlx::transforms::eval([&logits]).unwrap();
-        gpu.stream().synchronize().unwrap();
+        safemlx::transforms::async_eval_with_event([&logits])
+            .unwrap()
+            .synchronize()
+            .unwrap();
         assert_eq!(logits.shape(), &[1, 2, 32]);
     }
 

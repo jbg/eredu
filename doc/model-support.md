@@ -828,8 +828,11 @@ Important boundaries:
   planning; supported independent expert caches quantize their selected routed
   experts through the same source store. Packed GGUF input is excluded by the
   span type and is never requantized.
-- Transfers and route inspection are synchronous because the pinned MLX C API
-  does not expose the events or fences required for safe cross-stream overlap.
+- Transfers, cache movement, distributed handoffs, and bounded conversion use
+  SafeMLX completion events for exact same-device stream ordering. Host-visible
+  route metadata remains an inherently synchronous decision boundary, but its
+  readback waits only for the arrays that produce that metadata rather than
+  draining an entire stream.
 - On Apple silicon, reported host and device residency are logical tiers over
   the same physical unified memory. They do not create additional capacity.
 - Parameter budgets do not include activations, KV or recurrent state, kernels,

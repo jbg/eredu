@@ -10,7 +10,7 @@ use std::collections::{BTreeMap, VecDeque};
 
 use safemlx::{
     distributed::{self, Group},
-    transforms::eval,
+    transforms::async_eval_with_event,
     Array, Stream,
 };
 
@@ -696,8 +696,7 @@ fn validate_schedule_consensus(
                 "distributed scheduler failed to gather schedule headers: {error}"
             ))
         })?;
-    eval([&gathered_header])?;
-    stream.synchronize()?;
+    async_eval_with_event([&gathered_header])?.synchronize()?;
     let evaluated_header = gathered_header.evaluated()?;
     let gathered_header = evaluated_header.as_slice::<u32>();
     for (rank, candidate) in gathered_header.chunks_exact(header.len()).enumerate() {
@@ -714,8 +713,7 @@ fn validate_schedule_consensus(
             "distributed scheduler failed to gather work descriptors: {error}"
         ))
     })?;
-    eval([&gathered])?;
-    stream.synchronize()?;
+    async_eval_with_event([&gathered])?.synchronize()?;
     let evaluated = gathered.evaluated()?;
     let gathered = evaluated.as_slice::<u32>();
     for rank in 0..group.size() {

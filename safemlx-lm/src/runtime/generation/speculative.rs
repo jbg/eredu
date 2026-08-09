@@ -1553,8 +1553,8 @@ where
 
         if request.config.temperature != 0.0 && self.streams.is_split() {
             if self.streams.crosses_devices() {
-                eval(proposals.iter().map(|proposal| &proposal.distribution))?;
-                self.streams.draft().synchronize()?;
+                async_eval_with_event(proposals.iter().map(|proposal| &proposal.distribution))?
+                    .synchronize()?;
                 for proposal in &mut proposals {
                     proposal.distribution = proposal.distribution.copy(self.streams.target())?;
                 }
@@ -1974,11 +1974,9 @@ fn split_random_states(
     let draft_key = root.next_key(streams.target())?;
     let draft_key = if streams.is_split() {
         if streams.crosses_devices() {
-            eval([&draft_key])?;
-            streams.target().synchronize()?;
+            async_eval_with_event([&draft_key])?.synchronize()?;
             let copied = draft_key.copy(streams.draft())?;
-            eval([&copied])?;
-            streams.draft().synchronize()?;
+            async_eval_with_event([&copied])?.synchronize()?;
             copied
         } else {
             let _completion = streams.wait_for_target_outputs([&draft_key])?;

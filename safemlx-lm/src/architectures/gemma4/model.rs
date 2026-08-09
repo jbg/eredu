@@ -27,7 +27,7 @@ use safemlx::{
         topk_route_plan, GgufCheckpoint, GgufEndian, GgufMetadataValue, GgufType, QuantizationMode,
     },
     quantization::MaybeQuantized,
-    transforms::eval,
+    transforms::{async_eval_with_event, eval},
     Array, Dtype, Stream,
 };
 use serde::{Deserialize, Deserializer};
@@ -6084,13 +6084,14 @@ impl Model {
     ) -> Result<Gemma4Embedding, Exception> {
         let mut embedding = self.model.language_model.embed_tokens.clone();
         if copy {
+            async_eval_with_event(embedding.materialization_arrays())?.synchronize()?;
             embedding.copy_to_stream(stream)?;
             embedding.native = embedding
                 .native
                 .as_ref()
                 .map(|native| native.copy_to_stream(stream))
                 .transpose()?;
-            stream.synchronize()?;
+            async_eval_with_event(embedding.materialization_arrays())?.synchronize()?;
         }
         Ok(embedding)
     }

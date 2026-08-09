@@ -22,7 +22,7 @@ use safemlx::{
         GgufCheckpoint, GgufMetadataValue,
     },
     quantization::MaybeQuantized,
-    transforms::eval,
+    transforms::{async_eval_with_event, eval},
     Array, Dtype, Stream,
 };
 use serde::Deserialize;
@@ -3725,8 +3725,7 @@ fn load_model_impl(
                     if let Some(biases) = &quantized.biases {
                         arrays.push(biases);
                     }
-                    eval(arrays)?;
-                    stream.synchronize()?;
+                    async_eval_with_event(arrays)?.synchronize()?;
                     pending
                         .entry(bank)
                         .or_insert_with(|| PendingExpertBank::new(args.n_routed_experts))
@@ -3775,8 +3774,7 @@ fn load_model_impl(
                 .remove(&key)
                 .expect("ready expert bank")
                 .stack(stream)?;
-            eval([&packed])?;
-            stream.synchronize()?;
+            async_eval_with_event([&packed])?.synchronize()?;
             assign_expert_bank(&mut model, key, packed)?;
             report.record_loaded(target_expert_key(key));
             completed.insert(key);
@@ -3903,8 +3901,7 @@ pub(crate) fn load_gguf_checkpoint(
                     if let Some(biases) = &quantized.biases {
                         evaluated.push(biases);
                     }
-                    eval(evaluated)?;
-                    stream.synchronize()?;
+                    async_eval_with_event(evaluated)?.synchronize()?;
                     assign_expert_bank(&mut model, key, quantized.weight)?;
                     assign_expert_bank(&mut model, scales_key, quantized.scales)?;
                     report.record_loaded(name);

@@ -2,7 +2,9 @@
 
 use std::{collections::HashMap, sync::Arc};
 
-use safemlx::{error::Exception, ops::indexing::TryIndexOp, transforms::eval, Array, Stream};
+use safemlx::{
+    error::Exception, ops::indexing::TryIndexOp, transforms::async_eval_with_event, Array, Stream,
+};
 
 use crate::{
     api::{
@@ -202,15 +204,15 @@ impl<'a, T> Gemma4MtpBackend<'a, T> {
             return Ok(state.clone());
         }
 
-        eval(
+        async_eval_with_event(
             std::iter::once(&state.hidden).chain(
                 state
                     .shared_kv
                     .values()
                     .flat_map(|(keys, values)| [keys, values]),
             ),
-        )?;
-        streams.target().synchronize()?;
+        )?
+        .synchronize()?;
 
         let hidden = state.hidden.copy(streams.draft())?;
         let shared_kv = state
@@ -223,11 +225,11 @@ impl<'a, T> Gemma4MtpBackend<'a, T> {
                 ))
             })
             .collect::<Result<HashMap<_, _>, Exception>>()?;
-        eval(
+        async_eval_with_event(
             std::iter::once(&hidden)
                 .chain(shared_kv.values().flat_map(|(keys, values)| [keys, values])),
-        )?;
-        streams.draft().synchronize()?;
+        )?
+        .synchronize()?;
         Ok(Gemma4TargetState {
             hidden,
             shared_kv: Arc::new(shared_kv),
@@ -292,9 +294,6 @@ impl<T: Gemma4MtpTarget> MtpBackend for Gemma4MtpBackend<'_, T> {
     ) -> Result<Self::DraftState, Exception> {
         let state = Self::state_on_draft_stream(state, streams)?;
         if self.draft_embedding.is_none() {
-            if streams.crosses_devices() {
-                streams.target().synchronize()?;
-            }
             let embedding = self
                 .target
                 .mtp_embedding_snapshot(streams.draft(), streams.crosses_devices())?;
@@ -549,8 +548,10 @@ mod tests {
         let values = Array::from_slice(&[5.0f32, 6.0], &[1, 1, 1, 2])
             .copy(target.stream())
             .unwrap();
-        eval([&hidden, &keys, &values]).unwrap();
-        target.stream().synchronize().unwrap();
+        async_eval_with_event([&hidden, &keys, &values])
+            .unwrap()
+            .synchronize()
+            .unwrap();
         let hidden_ptr = hidden.evaluated().unwrap().as_slice::<f32>().as_ptr();
         let keys_ptr = keys.evaluated().unwrap().as_slice::<f32>().as_ptr();
         let values_ptr = values.evaluated().unwrap().as_slice::<f32>().as_ptr();

@@ -12,7 +12,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use safemlx::{module::ModuleParameters, transforms::eval, Array, Stream};
+use safemlx::{module::ModuleParameters, transforms::async_eval_with_event, Array, Stream};
 
 use crate::{
     error::Error,
@@ -3025,12 +3025,12 @@ impl<A: ArchitectureAdapter> LayerwiseModel<A> {
                         let retained_context =
                             self.adapter
                                 .retained_context_arrays(&context, group_index, index);
-                        eval(
+                        async_eval_with_event(
                             std::iter::once(&hidden)
                                 .chain(retained)
                                 .chain(retained_context),
-                        )?;
-                        stream.synchronize()?;
+                        )?
+                        .synchronize()?;
                         hook_result?;
                     }
                     if let Some(window) = &mut dense_window {
@@ -3051,8 +3051,7 @@ impl<A: ArchitectureAdapter> LayerwiseModel<A> {
                 &mut context,
                 &execution,
             )?;
-            eval([&hidden])?;
-            stream.synchronize()?;
+            async_eval_with_event([&hidden])?.synchronize()?;
             if let Some(Some(guard)) = dense_guard {
                 guard.complete()?;
             }
@@ -3064,8 +3063,7 @@ impl<A: ArchitectureAdapter> LayerwiseModel<A> {
         let output = self
             .adapter
             .finish_with_execution(&hidden, cache, &context, &execution)?;
-        eval([&output])?;
-        stream.synchronize()?;
+        async_eval_with_event([&output])?.synchronize()?;
         if let Some(guard) = dense_forward {
             guard.complete()?;
         }
@@ -3330,12 +3328,12 @@ impl<A: ArchitectureAdapter> LayerwiseModel<A> {
                         let retained_context =
                             self.adapter
                                 .retained_context_arrays(&context, group_index, index);
-                        eval(
+                        async_eval_with_event(
                             std::iter::once(&hidden)
                                 .chain(retained)
                                 .chain(retained_context),
-                        )?;
-                        stream.synchronize()?;
+                        )?
+                        .synchronize()?;
                         hook_result?;
                     }
                     if let Some(window) = &mut dense_window {
@@ -3356,8 +3354,8 @@ impl<A: ArchitectureAdapter> LayerwiseModel<A> {
             let retained_context =
                 self.adapter
                     .retained_context_arrays(&context, group_index, group.units().len());
-            eval(std::iter::once(&hidden).chain(retained_context))?;
-            stream.synchronize()?;
+            async_eval_with_event(std::iter::once(&hidden).chain(retained_context))?
+                .synchronize()?;
             if let Some(Some(guard)) = dense_guard {
                 guard.complete()?;
             }
@@ -3371,8 +3369,7 @@ impl<A: ArchitectureAdapter> LayerwiseModel<A> {
         let output = self
             .adapter
             .finish_with_execution(&hidden, cache, &context, &execution)?;
-        eval([&output])?;
-        stream.synchronize()?;
+        async_eval_with_event([&output])?.synchronize()?;
         if self.dense_stream.is_none() && (self.sample_mlx_memory || self.sample_process_memory) {
             self.residency
                 .sample_memory(self.sample_mlx_memory, self.sample_process_memory)?;

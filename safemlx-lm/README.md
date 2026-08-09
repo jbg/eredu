@@ -1318,8 +1318,10 @@ dispatch. `PipelineModel::new_cache` is fallible so a future adapter cannot
 silently coerce an unsupported semantic state layout.
 
 Each individual microbatch receives from its predecessor, executes local
-layers, and sends to its successor. Lazy point-to-point arrays are evaluated
-and their stream synchronized at each boundary. The canonical
+layers, and sends to its successor. Lazy point-to-point arrays are submitted
+with exact completion events at each boundary; host observations wait only for
+the associated arrays, while compatible downstream streams use backend-ordered
+event waits. The canonical
 `runtime::scheduler::FairScheduler` owns request/work identity,
 bounded stable round-robin queues, isolated program state, lifecycle,
 cross-rank consensus, poisoning, and telemetry. `PipelineInferenceScheduler`

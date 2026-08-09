@@ -11,7 +11,7 @@ use std::{
 use safemlx::{
     distributed::{self, Backend},
     module::Param,
-    transforms::eval,
+    transforms::{async_eval_with_event, eval},
     Array, Device, DeviceType, Stream,
 };
 use safemlx_lm::{
@@ -380,8 +380,10 @@ fn expert_exchange_ring_worker() {
         |routes, stream| execute_cached_qwen_routes(&cache, routes, ExpertPass::Prefill, stream),
     )
     .unwrap();
-    eval([&expected_qwen, &cached_qwen.reduced_output]).unwrap();
-    stream.synchronize().unwrap();
+    async_eval_with_event([&expected_qwen, &cached_qwen.reduced_output])
+        .unwrap()
+        .synchronize()
+        .unwrap();
     let expected_qwen = expected_qwen.evaluated().unwrap();
     assert_f32_close(&cached_qwen.reduced_output, expected_qwen.as_slice::<f32>());
 

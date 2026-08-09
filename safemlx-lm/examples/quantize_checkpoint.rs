@@ -76,7 +76,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &options,
         stream,
     )?;
-    stream.synchronize()?;
     println!("quantized_tensors={}", report.quantized_tensors);
     println!("copied_tensors={}", report.copied_tensors);
     println!("shards={}", report.shards);

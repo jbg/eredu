@@ -679,8 +679,7 @@ impl PagedCompressedLatentCache {
                     ));
                 }
             };
-            safemlx::transforms::eval([&latent, &rotary_key])?;
-            stream.synchronize()?;
+            safemlx::transforms::async_eval_with_event([&latent, &rotary_key])?.synchronize()?;
             let latent = latent.deep_clone()?;
             let rotary_key = rotary_key.deep_clone()?;
             crossing_lease = Some(lease);
@@ -1259,8 +1258,7 @@ impl PagedKeyValueCache {
                     ))
                 }
             };
-            safemlx::transforms::eval([&keys, &values])?;
-            stream.synchronize()?;
+            safemlx::transforms::async_eval_with_event([&keys, &values])?.synchronize()?;
             let keys = keys.deep_clone()?;
             let values = values.deep_clone()?;
             crossing_lease = Some(lease);

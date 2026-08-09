@@ -2426,6 +2426,12 @@ impl Drop for PendingWeightMaterialization {
         if self.completed {
             return;
         }
+        // Submission creates the exact completion event and moves this value's
+        // mapping lease into `WeightMaterialization`. If submission itself is
+        // abandoned or fails before that event exists, draining both candidate
+        // streams is the only conservative way to prove that no lazy copy still
+        // references the mmap. This error-cleanup path is intentionally the sole
+        // whole-stream wait in the safemlx-lm runtime.
         let source = self.source_stream.synchronize();
         let execution = self.execution_stream.synchronize();
         if source.is_err() || execution.is_err() {

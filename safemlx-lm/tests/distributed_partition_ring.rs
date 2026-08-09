@@ -10,7 +10,7 @@ use std::{
 
 use safemlx::{
     distributed::{self, Backend},
-    Device, DeviceType, Stream,
+    DeviceType, Stream,
 };
 use safemlx_lm::{
     runtime::checkpoint::load::StrictLoadConfig,
@@ -115,7 +115,6 @@ fn ring_two_process_partition_load() {
     assert!(distributed::is_available(Backend::Ring));
 
     let checkpoint = tempfile::tempdir().unwrap();
-    let stream = Stream::new_with_device(&Device::new(DeviceType::Cpu, 0));
     let bytes = [0i32, 1, 2, 3, 10, 11, 12, 13]
         .into_iter()
         .flat_map(i32::to_le_bytes)
@@ -211,6 +210,4 @@ fn ring_two_process_partition_load() {
         "two-process rank-aware loading failed (timed_out={timed_out}):\n{}",
         failures.join("\n\n")
     );
-
-    stream.synchronize().unwrap();
 }

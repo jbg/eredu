@@ -44,6 +44,15 @@ event handles. Distributed pipeline code contains no whole-stream completion
 waits. Host boundaries use exact events, while downstream compatible streams
 use backend-ordered waits.
 
+The same rule now applies to runtime scheduler consensus, paged-cache
+truncation, dense layerwise lease boundaries, model/expert materialization,
+MTP and speculative same-device handoffs, and logical distributed exchange.
+The only runtime whole-stream drain is the conservative destructor fallback for
+a checkpoint materialization abandoned before submission can create its exact
+event; both possible streams must finish before its mmap lease can be released.
+Benchmark timing barriers intentionally continue to drain their measured
+streams, because the whole-stream boundary is the quantity being timed.
+
 CUDA compilation is expected in Linux and Windows CUDA CI. Runtime tests remain
 opt-in and require a CUDA-capable runner. The explicit Metal two-stream test is
 ignored in the ordinary suite and must be run on a Metal host with:

@@ -3,7 +3,7 @@
 use std::path::PathBuf;
 
 use clap::Parser;
-use safemlx::{Array, Device, DeviceType, ExecutionContext};
+use safemlx::{transforms::async_eval_with_event, Array, Device, DeviceType, ExecutionContext};
 use safemlx_lm::{
     api::{LoadedModel, ModelCache},
     runtime::media::input::{InputPart, ModelInput},
@@ -81,7 +81,7 @@ fn main() -> anyhow::Result<()> {
         let mut cache = model.new_cache();
         let _ = input_for_tokens(&prefix, &mut cache, &mut model, stream)?;
         let logits = input_for_tokens(&suffix, &mut cache, &mut model, stream)?;
-        stream.synchronize()?;
+        async_eval_with_event([&logits])?.synchronize()?;
         println!(
             "ordinary device cache suffix logits shape: {:?}",
             logits.shape()
@@ -110,7 +110,7 @@ fn main() -> anyhow::Result<()> {
         model.new_cache_with_options(CacheResidencyPolicy::Paged(paged.clone()))?;
     let _ = input_for_tokens(&prefix, &mut uninterrupted, &mut model, stream)?;
     let uninterrupted_logits = input_for_tokens(&suffix, &mut uninterrupted, &mut model, stream)?;
-    stream.synchronize()?;
+    async_eval_with_event([&uninterrupted_logits])?.synchronize()?;
     println!(
         "uninterrupted report: {:#?}",
         uninterrupted.residency_report()?
@@ -163,7 +163,7 @@ fn main() -> anyhow::Result<()> {
     println!("cataloged blocks: {}", inspected.blocks.len());
     println!("load report: {:#?}", restored.residency_report()?);
     let restored_logits = input_for_tokens(&suffix, &mut restored, &mut model, stream)?;
-    stream.synchronize()?;
+    async_eval_with_event([&restored_logits])?.synchronize()?;
     let equal = restored_logits
         .all_close(&uninterrupted_logits, 1e-4, 1e-4, None, stream)?
         .item::<bool>(stream);

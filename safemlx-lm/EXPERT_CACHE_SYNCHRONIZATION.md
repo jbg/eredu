@@ -26,7 +26,7 @@ transfer publishes success or rolls back failure. Event errors propagate from
 explicit synchronization and poison dependent stream work through MLX's normal
 completion semantics.
 
-The remaining waits are synchronous array evaluations:
+The remaining host waits are exact completion-event observations:
 
 - the host must observe the bounded route-demand metadata before it can select
   checkpoint ranges and make eviction decisions;

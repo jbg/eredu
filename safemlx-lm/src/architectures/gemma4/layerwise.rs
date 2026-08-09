@@ -16,6 +16,7 @@ use safemlx::{
         concatenate_axis, indexing::TryIndexOp, r#where, tanh, GgufCheckpoint, GgufMetadataValue,
     },
     quantization::MaybeQuantized,
+    transforms::async_eval_with_event,
     Array, Stream,
 };
 
@@ -1737,13 +1738,14 @@ impl Gemma4LayerwiseAdapter {
     ) -> Result<Gemma4Embedding, Exception> {
         let mut embedding = self.embedding.clone();
         if copy {
+            async_eval_with_event(embedding.materialization_arrays())?.synchronize()?;
             embedding.copy_to_stream(stream)?;
             embedding.native = embedding
                 .native
                 .as_ref()
                 .map(|native| native.copy_to_stream(stream))
                 .transpose()?;
-            stream.synchronize()?;
+            async_eval_with_event(embedding.materialization_arrays())?.synchronize()?;
         }
         Ok(embedding)
     }

@@ -5844,10 +5844,7 @@ mod tests {
         CACHE_RESIDENCY_LAYER_REPORT_LIMIT, MAX_PROMPT_CACHE_SHARD_HEADER_BYTES,
         PROMPT_CACHE_GENERATIONS_DIRECTORY, PROMPT_CACHE_SCHEMA_VERSION,
     };
-    use safemlx::{
-        transforms::{async_eval_with_event, eval},
-        Array, Device, DeviceType, Stream,
-    };
+    use safemlx::{transforms::async_eval_with_event, Array, Device, DeviceType, Stream};
     use safetensors::tensor::{serialize_to_file, Dtype as StoredDtype, TensorView};
     use std::{
         fs,
@@ -7376,8 +7373,10 @@ mod tests {
     fn execution_key_value_block(stream: &Stream) -> CacheBlockArrays {
         let keys = Array::zeros::<f32>(&[1, 1, 2, 1], stream).unwrap();
         let values = Array::ones::<f32>(&[1, 1, 2, 1], stream).unwrap();
-        eval([&keys, &values]).unwrap();
-        stream.synchronize().unwrap();
+        async_eval_with_event([&keys, &values])
+            .unwrap()
+            .synchronize()
+            .unwrap();
         CacheBlockArrays::KeyValue { keys, values }
     }
 

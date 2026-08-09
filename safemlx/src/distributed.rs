@@ -24,7 +24,6 @@ use crate::{
     error::{Exception, Result},
     ops::indexing::{TryIndexMutOp, TryIndexOp},
     ops::{concatenate_axis, stack_axis, zeros_dtype},
-    transforms::eval,
     utils::{guard::Guarded, runtime_lock, SUCCESS},
     Array, Device, DeviceType, Dtype, Stream,
 };
@@ -476,8 +475,7 @@ fn logical_direct_exchange(input: &Array, group: &Group, stream: &Stream) -> Res
         // value. Without it, evaluating only the receive side can leave both
         // peers waiting.
         exchanged = received.add(sent.multiply(&zero, stream)?, stream)?;
-        eval([&exchanged])?;
-        stream.synchronize()?;
+        crate::transforms::async_eval_with_event([&exchanged])?.synchronize()?;
     }
     Ok(Some(exchanged))
 }
@@ -505,8 +503,7 @@ fn logical_routed_values(
             let sent = native_send(&routed, *peer, group, stream)?;
             let received = native_recv_like(&routed, *peer, group, stream)?;
             routed = received.add(sent.multiply(&zero, stream)?, stream)?;
-            eval([&routed])?;
-            stream.synchronize()?;
+            crate::transforms::async_eval_with_event([&routed])?.synchronize()?;
         }
         values.push((route.source_rank, routed));
     }
