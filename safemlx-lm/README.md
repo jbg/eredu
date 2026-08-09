@@ -1112,8 +1112,11 @@ The remaining global limitations are:
   and pipeline execution now use a dedicated transfer stream and a two-layer
   completion-lease window, allowing the next weight transfer to overlap current
   layer computation. Background disk-to-host warming remains bounded and may
-  still stall demand. Expert prefetch, paged-cache transfers, MTP handoff, and
-  broader activation double buffering have not adopted this scheduler.
+  still stall demand. Paged-cache attention now uses a dedicated transfer
+  stream and a fixed current-plus-next block window; same-device promotions are
+  event-ordered while CPU-owned demotions wait only for their exact completion.
+  Expert prediction/prefetch and broader activation double buffering remain
+  future work. MTP same-device handoffs are event-ordered independently.
 - Load-time affine/MXFP4 conversion applies to semantically eligible grouped
   matrix projections. Convolution kernels, normalization vectors, position
   tables, and projection geometries that do not meet the selected group and

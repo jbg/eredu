@@ -86,12 +86,19 @@ Apple unified memory means logical host/device placement does not create
 additional physical capacity. Residency reports describe the runtime's logical
 tiers and requested transfer bytes. They do not claim physical disk bytes:
 mapped pages may be served by the operating-system cache. SafeMLX's immutable
-weight residency manager and expert cache now use caller-owned MLX completion
-events to retain transfer sources and order compatible execution streams. The
-paged attention-cache manager in this document has not yet adopted events:
-cache promotion, demotion, and block-lease handoff remain synchronous, and no
-KV transfer/compute overlap or double buffering is claimed. Disk reads and
-writes use a bounded manager-owned worker queue. Duplicate block operations
+weight residency manager, expert cache, and paged attention cache use MLX
+completion events to retain transfer sources and order compatible execution
+streams. Paged host-to-device promotion runs on a dedicated same-device
+transfer stream. Blockwise key/value and compressed-MLA attention keep a fixed
+two-block window (current plus next), submit each completed recurrence before
+waiting on the next block, and thereby permit the next promotion to overlap
+current-block attention. A one-block device budget falls back to demand
+promotion rather than exceeding the configured limit. Device-to-host demotion
+must establish independent CPU ownership, so it host-waits only for the exact
+demotion completion before cloning storage; it no longer synchronizes the
+whole transfer stream. This is cache-block pipelining, not general activation
+double buffering. Disk reads and writes use a bounded manager-owned worker
+queue. Duplicate block operations
 join one shared completion, capacity waits occur without holding cache state,
 and reset or truncation cancels queued work from the prior generation. The
 worker is stopped and joined on drop. Host-to-disk demotion returns after queue
@@ -287,7 +294,10 @@ residency. Do not flush privileged operating-system caches when measuring.
 `CacheResidencyReport::per_layer` provides current token, representation,
 tier, byte, protection, and in-flight-write observations plus cumulative
 layer-attributable promotions, demotions, transfer bytes and waits, demand
-hits and misses, failures, and prefill/decode attention scans. It contains at
+hits and misses, failures, and prefill/decode attention scans. GPU promotion
+completion is reported asynchronously through dependent execution;
+`transfer_wait` measures host-visible disk and CPU ownership boundaries rather
+than time behind a same-device event wait. The report contains at
 most 128 identified entries and retains no per-block or per-call event
 history. Once the identified-row limit is reached, activity for every later
 layer is accumulated directly into `per_layer_overflow`; current observations
@@ -304,7 +314,8 @@ counters and every current block and byte with the global totals.
 MLX execution tests remain opt-in so the default test suite can run on hosts
 without a Metal device. On a Metal host, the ignored cache suite covers paged
 append/truncate transactions, blockwise masks, tier budgets, asynchronous disk
-writeback, and physical host/device storage replacement. Inkling has an
+writeback, event-ordered two-block promotion, and physical host/device storage
+replacement. Inkling has an
 uninterrupted-versus-paged parity test for both global and sliding attention.
 The two-process Ring tests exercise DeepSeek compressed-latent prompt-cache
 save, rank-local topology validation, reload, and restored decode for pipeline

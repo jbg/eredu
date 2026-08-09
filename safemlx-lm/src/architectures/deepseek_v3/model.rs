@@ -1450,10 +1450,14 @@ impl MultiHeadLatentAttention {
             let mut reconstructed_scratch = 0u64;
             let mut scanned_blocks = 0u64;
             let mut scanned_bytes = 0u64;
-            for id in block_ids {
-                let lease = manager
-                    .lease_block(&id, stream)
-                    .map_err(|error| Exception::custom(error.to_string()))?;
+            let mut blocks = manager
+                .prefetch_blocks(block_ids, stream)
+                .map_err(|error| Exception::custom(error.to_string()))?;
+            while let Some(lease) = blocks
+                .next_block()
+                .map_err(|error| Exception::custom(error.to_string()))?
+            {
+                let id = lease.id();
                 let (latent, rotary_key) = match lease.arrays() {
                     CacheBlockArrays::CompressedLatentRotary { latent, rotary_key } => {
                         (latent.clone(), rotary_key.clone())
@@ -1478,6 +1482,7 @@ impl MultiHeadLatentAttention {
                 scanned_blocks += 1;
                 scanned_bytes += lease.bytes();
                 accumulator.accumulate(&block, stream)?;
+                accumulator.submit()?;
                 drop(lease);
             }
             if let Some(block) = paged_tail {

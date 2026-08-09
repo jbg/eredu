@@ -5,7 +5,7 @@
 //! are immutable inputs with a different ownership and persistence model.
 
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
     fs::{self, File},
     io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write},
     num::NonZeroU32,
@@ -21,7 +21,11 @@ use std::{
 };
 
 use memmap2::{Mmap, MmapOptions};
-use safemlx::{transforms::eval, Array, Device, DeviceType, Dtype, Stream};
+use safemlx::{
+    ops::zeros_dtype,
+    transforms::{async_eval_with_event, eval},
+    Array, Device, DeviceType, Dtype, Event, Stream,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -34,6 +38,7 @@ const PROMPT_CACHE_SCHEMA_VERSION: u32 = 4;
 const MAX_PROMPT_CACHE_SHARD_HEADER_BYTES: u64 = 1024 * 1024;
 const PROMPT_CACHE_GENERATIONS_DIRECTORY: &str = ".generations";
 const PROMPT_CACHE_CURRENT_FILE: &str = "CURRENT";
+pub(crate) const PAGED_CACHE_PREFETCH_BLOCKS: usize = 2;
 static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(1);
 static NEXT_LIVE_SHARD_ID: AtomicU64 = AtomicU64::new(1);
 static NEXT_HOST_WRITE_RESERVATION_ID: AtomicU64 = AtomicU64::new(1);
@@ -331,37 +336,40 @@ impl CacheBlockArrays {
         [dtype_name(arrays[0].dtype()), dtype_name(arrays[1].dtype())]
     }
 
-    fn copy_to_stream(
+    fn copy_to_stream_with_event(
+        &self,
+        stream: &Stream,
+        operation: &'static str,
+    ) -> Result<(Self, Event), CacheResidencyError> {
+        let copy = match self {
+            Self::KeyValue { keys, values } => Self::KeyValue {
+                keys: independent_stream_copy(keys, stream, operation)?,
+                values: independent_stream_copy(values, stream, operation)?,
+            },
+            Self::CompressedLatentRotary { latent, rotary_key } => Self::CompressedLatentRotary {
+                latent: independent_stream_copy(latent, stream, operation)?,
+                rotary_key: independent_stream_copy(rotary_key, stream, operation)?,
+            },
+        };
+        let completion = async_eval_with_event(copy.arrays())
+            .map_err(|source| transfer_error(operation, source))?;
+        Ok((copy, completion))
+    }
+
+    fn copy_to_stream_synchronized(
         &self,
         stream: &Stream,
         operation: &'static str,
     ) -> Result<Self, CacheResidencyError> {
-        let copy = match self {
-            Self::KeyValue { keys, values } => Self::KeyValue {
-                keys: keys
-                    .copy(stream)
-                    .map_err(|source| transfer_error(operation, source))?,
-                values: values
-                    .copy(stream)
-                    .map_err(|source| transfer_error(operation, source))?,
-            },
-            Self::CompressedLatentRotary { latent, rotary_key } => Self::CompressedLatentRotary {
-                latent: latent
-                    .copy(stream)
-                    .map_err(|source| transfer_error(operation, source))?,
-                rotary_key: rotary_key
-                    .copy(stream)
-                    .map_err(|source| transfer_error(operation, source))?,
-            },
-        };
-        eval(copy.arrays()).map_err(|source| transfer_error(operation, source))?;
-        stream
+        let (copy, completion) = self.copy_to_stream_with_event(stream, operation)?;
+        completion
             .synchronize()
             .map_err(|source| transfer_error(operation, source))?;
         // MLX may implement `copy` as an alias when memory is accessible from
         // both streams (notably with Metal's unified memory). Residency tier
-        // transitions must own independent storage so replacing the record
-        // actually releases the allocation held by the previous tier.
+        // demotions must own independent CPU storage so replacing the record
+        // releases the execution allocation. Promotions stay asynchronous and
+        // retain their source arrays through `CacheBlockLease`.
         match copy {
             Self::KeyValue { keys, values } => Ok(Self::KeyValue {
                 keys: keys
@@ -383,6 +391,21 @@ impl CacheBlockArrays {
             }
         }
     }
+}
+
+fn independent_stream_copy(
+    source: &Array,
+    stream: &Stream,
+    operation: &'static str,
+) -> Result<Array, CacheResidencyError> {
+    let copied = source
+        .copy(stream)
+        .map_err(|source| transfer_error(operation, source))?;
+    let zeros = zeros_dtype(copied.shape(), copied.dtype(), stream)
+        .map_err(|source| transfer_error(operation, source))?;
+    copied
+        .add(zeros, stream)
+        .map_err(|source| transfer_error(operation, source))
 }
 
 fn transfer_error(
@@ -1142,17 +1165,17 @@ pub struct CacheLayerResidencyStats {
     pub protected_recent_blocks: u64,
     /// Prefix or sink blocks protected for attention.
     pub protected_prefix_blocks: u64,
-    /// Cumulative promotions from host memory to the execution device.
+    /// Cumulative host promotions submitted through completion events.
     pub host_promotions: u64,
-    /// Cumulative promotions from disk to the execution device.
+    /// Cumulative disk promotions submitted after their host read completes.
     pub disk_promotions: u64,
-    /// Cumulative demotions from the execution device to host memory.
+    /// Cumulative device demotions completed through exact-output event waits.
     pub host_demotions: u64,
     /// Cumulative demotions to disk.
     pub disk_demotions: u64,
     /// Cumulative logical bytes transferred between tiers.
     pub transfer_bytes: u64,
-    /// Cumulative time spent waiting for layer-attributable transfers.
+    /// Cumulative host time at layer-attributable disk and CPU ownership boundaries.
     pub transfer_wait: Duration,
     /// Cumulative demand accesses already resident on the execution device.
     pub demand_hits: u64,
@@ -1293,17 +1316,17 @@ pub struct CacheResidencyReport {
     /// Exact current aggregate of active omitted layers plus cumulative
     /// activity for every layer without an identified row.
     pub per_layer_overflow: CacheLayerResidencyStats,
-    /// Completed synchronized host-to-device promotions.
+    /// Host-to-device promotions submitted through completion events.
     pub host_promotions: u64,
-    /// Completed synchronized disk-to-device promotions.
+    /// Disk-to-device promotions submitted after their host read completes.
     pub disk_promotions: u64,
-    /// Completed synchronized device-to-host demotions.
+    /// Device-to-host demotions completed through exact-output event waits.
     pub host_demotions: u64,
     /// Completed resident-to-disk demotions using existing or newly written backing.
     pub disk_demotions: u64,
     /// Logical bytes copied by promotion and demotion operations.
     pub transfer_bytes: u64,
-    /// Time inference waited for cache transfers.
+    /// Host time spent on disk operations and CPU ownership boundaries.
     pub transfer_wait: Duration,
     /// Blocks evicted because all configured tiers were exhausted.
     pub evictions: u64,
@@ -1486,7 +1509,7 @@ impl CacheResidencyManager {
             state.counters.report.tail_allocations += 1;
         }
         drop(state);
-        if let Err(error) = self.rebalance(None) {
+        if let Err(error) = self.rebalance(None, false) {
             let mut state = self.lock()?;
             match previous {
                 Some(previous) => {
@@ -1552,7 +1575,7 @@ impl CacheResidencyManager {
         };
         state.blocks.insert(id.clone(), record);
         drop(state);
-        if let Err(error) = self.rebalance(Some(&id)) {
+        if let Err(error) = self.rebalance(Some(&id), false) {
             let mut state = self.lock()?;
             if let Some(record) = state.blocks.remove(&id) {
                 cancel_record_operation(&record, &mut state.counters.report);
@@ -1756,6 +1779,26 @@ impl CacheResidencyManager {
         id: &CacheBlockId,
         stream: &Stream,
     ) -> Result<CacheBlockLease, CacheResidencyError> {
+        let lease = self.prepare_block_transfer(id, stream)?;
+        lease.wait_on(stream)?;
+        Ok(lease)
+    }
+
+    /// Creates a fixed two-block promotion window on a dedicated stream for
+    /// the execution stream's device.
+    pub(crate) fn prefetch_blocks(
+        &self,
+        ids: Vec<CacheBlockId>,
+        execution_stream: &Stream,
+    ) -> Result<CacheBlockPrefetch, CacheResidencyError> {
+        CacheBlockPrefetch::new(self.clone(), ids, execution_stream)
+    }
+
+    fn prepare_block_transfer(
+        &self,
+        id: &CacheBlockId,
+        transfer_stream: &Stream,
+    ) -> Result<CacheBlockLease, CacheResidencyError> {
         let started = Instant::now();
         let mut loaded_from_disk = false;
         loop {
@@ -1886,6 +1929,15 @@ impl CacheResidencyManager {
             let source_arrays = source_arrays
                 .ok_or_else(|| CacheResidencyError::MissingResidentArrays(id.clone()))?;
             if tier == CacheTier::Device {
+                drop(state);
+                let completion =
+                    async_eval_with_event(source_arrays.arrays()).map_err(|source| {
+                        transfer_error("submit resident cache block completion", source)
+                    })?;
+                let mut state = self.lock()?;
+                if state.generation != generation {
+                    return Err(CacheResidencyError::DiskOperationCancelled { generation });
+                }
                 state.access_clock += 1;
                 let access_clock = state.access_clock;
                 let record = state
@@ -1902,7 +1954,7 @@ impl CacheResidencyManager {
                 activity.demand_hits += 1;
                 activity.transfer_wait += transfer_wait;
                 drop(state);
-                if let Err(error) = self.rebalance(Some(id)) {
+                if let Err(error) = self.rebalance(Some(id), true) {
                     if let Ok(mut state) = self.lock() {
                         if let Some(record) = state.blocks.get_mut(id) {
                             record.leases = record.leases.saturating_sub(1);
@@ -1915,13 +1967,17 @@ impl CacheResidencyManager {
                     id: id.clone(),
                     arrays: source_arrays,
                     manager: self.clone(),
+                    completion: Some(completion),
+                    _retained_source: None,
                     released: false,
                 });
             }
 
             drop(state);
-            let device_arrays =
-                source_arrays.copy_to_stream(stream, "copy cache block from host to device")?;
+            let (device_arrays, completion) = source_arrays.copy_to_stream_with_event(
+                transfer_stream,
+                "copy cache block from host to device",
+            )?;
             let mut state = self.lock()?;
             if state.generation != generation {
                 return Err(CacheResidencyError::DiskOperationCancelled { generation });
@@ -1959,7 +2015,7 @@ impl CacheResidencyManager {
             activity.transfer_bytes += bytes;
             activity.transfer_wait += transfer_wait;
             drop(state);
-            if let Err(error) = self.rebalance(Some(id)) {
+            if let Err(error) = self.rebalance(Some(id), true) {
                 let mut state = self.lock()?;
                 if state.generation == generation {
                     if let Some(record) = state.blocks.get_mut(id) {
@@ -1975,6 +2031,8 @@ impl CacheResidencyManager {
                 id: id.clone(),
                 arrays: device_arrays,
                 manager: self.clone(),
+                completion: Some(completion),
+                _retained_source: Some(source_arrays),
                 released: false,
             });
         }
@@ -2106,7 +2164,7 @@ impl CacheResidencyManager {
             background_failed = state.background_disk_error.is_some();
         }
         if !background_failed {
-            let _ = self.rebalance(None);
+            let _ = self.rebalance(None, false);
         }
     }
 
@@ -2291,7 +2349,11 @@ impl CacheResidencyManager {
         }
     }
 
-    fn rebalance(&self, required: Option<&CacheBlockId>) -> Result<(), CacheResidencyError> {
+    fn rebalance(
+        &self,
+        required: Option<&CacheBlockId>,
+        allow_recent_eviction: bool,
+    ) -> Result<(), CacheResidencyError> {
         loop {
             let mut state = self.lock()?;
             if let Some(error) = state.background_disk_error.take() {
@@ -2307,7 +2369,22 @@ impl CacheResidencyManager {
                     required,
                     self.options.recent_device_blocks,
                     self.options.eviction_policy,
-                );
+                )
+                .or_else(|| {
+                    // Recent protection remains strict for mutation capacity,
+                    // but may yield to an existing block demanded by attention.
+                    if allow_recent_eviction {
+                        eviction_candidate(
+                            &state,
+                            CacheTier::Device,
+                            required,
+                            0,
+                            self.options.eviction_policy,
+                        )
+                    } else {
+                        None
+                    }
+                });
                 let Some(id) = candidate else {
                     state.counters.report.failures += 1;
                     if let Some(required) = required {
@@ -2408,8 +2485,10 @@ impl CacheResidencyManager {
                     .get(&id)
                     .and_then(|record| record.arrays.clone())
                     .ok_or_else(|| CacheResidencyError::MissingResidentArrays(id.clone()))?;
-                let host_arrays = device_arrays
-                    .copy_to_stream(&state.host_stream, "copy cache block from device to host")?;
+                let host_arrays = device_arrays.copy_to_stream_synchronized(
+                    &state.host_stream,
+                    "copy cache block from device to host",
+                )?;
                 let record = state.blocks.get_mut(&id).expect("candidate exists");
                 record.arrays = Some(host_arrays);
                 record.tier = CacheTier::Host;
@@ -2754,20 +2833,134 @@ impl Drop for CacheResidencyManager {
     }
 }
 
+/// Fixed current-plus-next cache-block promotion window.
+pub(crate) struct CacheBlockPrefetch {
+    manager: CacheResidencyManager,
+    ids: VecDeque<CacheBlockId>,
+    pending: VecDeque<CacheBlockLease>,
+    transfer_stream: Stream,
+    execution_stream: Stream,
+}
+
+impl CacheBlockPrefetch {
+    fn new(
+        manager: CacheResidencyManager,
+        ids: Vec<CacheBlockId>,
+        execution_stream: &Stream,
+    ) -> Result<Self, CacheResidencyError> {
+        let device = execution_stream
+            .get_device()
+            .map_err(|source| transfer_error("inspect cache execution stream", source))?;
+        Ok(Self {
+            manager,
+            ids: ids.into(),
+            pending: VecDeque::with_capacity(PAGED_CACHE_PREFETCH_BLOCKS),
+            transfer_stream: Stream::new_with_device(&device),
+            execution_stream: execution_stream.clone(),
+        })
+    }
+
+    /// Returns the next ordered block. At most the current and following block
+    /// hold leases; a one-block device budget falls back to demand promotion.
+    pub(crate) fn next_block(&mut self) -> Result<Option<CacheBlockLease>, CacheResidencyError> {
+        while self.pending.len() < PAGED_CACHE_PREFETCH_BLOCKS {
+            let Some(id) = self.ids.front() else {
+                break;
+            };
+            if !self.pending.is_empty() && !self.window_has_capacity_for(id)? {
+                break;
+            }
+            match self
+                .manager
+                .prepare_block_transfer(id, &self.transfer_stream)
+            {
+                Ok(lease) => {
+                    self.ids.pop_front();
+                    self.pending.push_back(lease);
+                }
+                Err(CacheResidencyError::BudgetExceeded {
+                    tier: CacheTier::Device,
+                    ..
+                }) if !self.pending.is_empty() => break,
+                Err(error) => return Err(error),
+            }
+        }
+        let Some(lease) = self.pending.pop_front() else {
+            return Ok(None);
+        };
+        lease.wait_on(&self.execution_stream)?;
+        Ok(Some(lease))
+    }
+
+    fn window_has_capacity_for(&self, id: &CacheBlockId) -> Result<bool, CacheResidencyError> {
+        let pending_bytes = self
+            .pending
+            .iter()
+            .fold(0u64, |total, lease| total.saturating_add(lease.bytes()));
+        let state = self.manager.lock()?;
+        let next_bytes = state
+            .blocks
+            .get(id)
+            .ok_or_else(|| CacheResidencyError::MissingBlock(id.clone()))?
+            .bytes;
+        Ok(pending_bytes.saturating_add(next_bytes) <= self.manager.options.device_budget_bytes)
+    }
+
+    #[cfg(test)]
+    fn pending_len(&self) -> usize {
+        self.pending.len()
+    }
+
+    #[cfg(test)]
+    fn stream_indices(&self) -> Result<(i32, i32), CacheResidencyError> {
+        Ok((
+            self.execution_stream
+                .get_index()
+                .map_err(|source| transfer_error("inspect cache execution stream", source))?,
+            self.transfer_stream
+                .get_index()
+                .map_err(|source| transfer_error("inspect cache transfer stream", source))?,
+        ))
+    }
+}
+
+/// One device-cataloged block and its single-shot promotion completion.
+///
+/// The lease inserts its event dependency before exposing arrays to a consumer.
+/// Dropping it after that wait is safe: MLX retains the event for queued work,
+/// while lazy consumer graphs retain the arrays they reference. Asynchronous
+/// promotion failures poison the consumer stream and surface when that work is
+/// evaluated. The lease is intentionally neither `Send` nor `Sync` because it
+/// owns SafeMLX's thread-affine [`Event`].
 pub(crate) struct CacheBlockLease {
     id: CacheBlockId,
     arrays: CacheBlockArrays,
     manager: CacheResidencyManager,
+    completion: Option<Event>,
+    _retained_source: Option<CacheBlockArrays>,
     released: bool,
 }
 
 impl CacheBlockLease {
+    pub(crate) fn id(&self) -> &CacheBlockId {
+        &self.id
+    }
+
     pub(crate) fn arrays(&self) -> &CacheBlockArrays {
         &self.arrays
     }
 
     pub(crate) fn bytes(&self) -> u64 {
         self.arrays.bytes()
+    }
+
+    fn wait_on(&self, stream: &Stream) -> Result<(), CacheResidencyError> {
+        if let Some(completion) = &self.completion {
+            completion
+                .wait_on(stream)
+                .map_err(|source| transfer_error("wait for cache block promotion", source))?;
+        }
+        Ok(())
     }
 }
 
@@ -5651,7 +5844,10 @@ mod tests {
         CACHE_RESIDENCY_LAYER_REPORT_LIMIT, MAX_PROMPT_CACHE_SHARD_HEADER_BYTES,
         PROMPT_CACHE_GENERATIONS_DIRECTORY, PROMPT_CACHE_SCHEMA_VERSION,
     };
-    use safemlx::{transforms::eval, Array, Device, DeviceType, Stream};
+    use safemlx::{
+        transforms::{async_eval_with_event, eval},
+        Array, Device, DeviceType, Stream,
+    };
     use safetensors::tensor::{serialize_to_file, Dtype as StoredDtype, TensorView};
     use std::{
         fs,
@@ -6992,7 +7188,7 @@ mod tests {
             }
         }
 
-        manager.rebalance(None).unwrap();
+        manager.rebalance(None, false).unwrap();
         let state = manager.lock().unwrap();
         assert_eq!(state.blocks.get(&older).unwrap().tier, CacheTier::Disk);
         assert_eq!(state.blocks.get(&recent).unwrap().tier, CacheTier::Device);
@@ -7189,6 +7385,160 @@ mod tests {
         arrays
             .arrays()
             .map(|array| array.evaluated().unwrap().as_slice::<f32>().as_ptr() as usize)
+    }
+
+    #[test]
+    fn two_block_prefetch_uses_a_dedicated_cpu_stream_and_bounds_leases() {
+        let stream = Stream::new_with_device(&Device::new(DeviceType::Cpu, 0));
+        let manager =
+            CacheResidencyManager::new(PagedCacheOptions::new(2, 32, 32, 1).unwrap()).unwrap();
+        let ids = (0..3)
+            .map(|index| {
+                manager
+                    .seal_block(
+                        0,
+                        index * 2,
+                        index * 2 + 2,
+                        None,
+                        execution_key_value_block(&stream),
+                        false,
+                    )
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let ids = vec![ids[0].clone(), ids[2].clone(), ids[1].clone()];
+
+        let mut blocks = manager.prefetch_blocks(ids, &stream).unwrap();
+        let (execution_index, transfer_index) = blocks.stream_indices().unwrap();
+        assert_ne!(execution_index, transfer_index);
+
+        let first = blocks.next_block().unwrap().unwrap();
+        assert_eq!(blocks.pending_len(), 1);
+        let consumed = first.arrays().arrays()[0].square(&stream).unwrap();
+        let consumed = async_eval_with_event([&consumed]).unwrap();
+        drop(first);
+
+        let second = blocks.next_block().unwrap().unwrap();
+        assert_eq!(blocks.pending_len(), 1);
+        drop(second);
+        let third = blocks.next_block().unwrap().unwrap();
+        assert_eq!(blocks.pending_len(), 0);
+        drop(third);
+        assert!(blocks.next_block().unwrap().is_none());
+
+        // The submitted consumer and queued waits retain their cache arrays
+        // after every public lease has been released.
+        consumed.synchronize().unwrap();
+    }
+
+    #[test]
+    fn two_block_prefetch_falls_back_under_a_one_block_device_budget() {
+        let stream = Stream::new_with_device(&Device::new(DeviceType::Cpu, 0));
+        let manager =
+            CacheResidencyManager::new(PagedCacheOptions::new(2, 16, 32, 1).unwrap()).unwrap();
+        let ids = (0..3)
+            .map(|index| {
+                manager
+                    .seal_block(
+                        0,
+                        index * 2,
+                        index * 2 + 2,
+                        None,
+                        execution_key_value_block(&stream),
+                        false,
+                    )
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let mut blocks = manager.prefetch_blocks(ids, &stream).unwrap();
+        for _ in 0..3 {
+            let lease = blocks.next_block().unwrap().unwrap();
+            assert_eq!(blocks.pending_len(), 0);
+            drop(lease);
+        }
+        assert!(blocks.next_block().unwrap().is_none());
+        let report = manager.report().unwrap();
+        assert!(report.current_device_bytes <= 16);
+        assert_eq!(report.failures, 0);
+    }
+
+    #[test]
+    #[ignore = "explicit Metal paged-cache prefetch test; run on a Metal host"]
+    fn two_block_metal_prefetch_is_gpu_ordered_without_host_synchronization() {
+        let stream = Stream::new_with_device(&Device::new(DeviceType::Gpu, 0));
+        let block_bytes = 2 * 1024 * 1024 * std::mem::size_of::<f32>() as u64;
+        let manager = CacheResidencyManager::new(
+            PagedCacheOptions::new(1024, block_bytes * 3, block_bytes, 1).unwrap(),
+        )
+        .unwrap();
+        let ids = (0..3)
+            .map(|index| {
+                let keys = Array::ones::<f32>(&[1024, 1024], &stream).unwrap();
+                let values = Array::ones::<f32>(&[1024, 1024], &stream).unwrap();
+                manager
+                    .seal_block(
+                        0,
+                        index * 1024,
+                        index * 1024 + 1024,
+                        None,
+                        CacheBlockArrays::KeyValue { keys, values },
+                        false,
+                    )
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        // Stage one exact host block without creating device-budget pressure;
+        // the promotion assertion below then observes only the async copy.
+        let host_stream = Stream::new_with_device(&Device::new(DeviceType::Cpu, 0));
+        let device_arrays = manager
+            .lock()
+            .unwrap()
+            .blocks
+            .get(&ids[0])
+            .unwrap()
+            .arrays
+            .clone()
+            .unwrap();
+        let host_arrays = device_arrays
+            .copy_to_stream_synchronized(&host_stream, "stage Metal prefetch test block")
+            .unwrap();
+        {
+            let mut state = manager.lock().unwrap();
+            let record = state.blocks.get_mut(&ids[0]).unwrap();
+            record.arrays = Some(host_arrays);
+            record.tier = CacheTier::Host;
+            super::update_report_totals(&mut state);
+        }
+        let ids = vec![ids[0].clone(), ids[2].clone(), ids[1].clone()];
+
+        let transfer = Stream::new_with_device(&Device::new(DeviceType::Gpu, 0));
+        let blocker_lhs = Array::ones::<f32>(&[4096, 4096], &transfer).unwrap();
+        let blocker_rhs = Array::ones::<f32>(&[4096, 4096], &transfer).unwrap();
+        let blocker = blocker_lhs.matmul(&blocker_rhs, &transfer).unwrap();
+        safemlx::transforms::async_eval([&blocker]).unwrap();
+        let direct = manager.prepare_block_transfer(&ids[0], &transfer).unwrap();
+        assert!(
+            !direct
+                .completion
+                .as_ref()
+                .expect("prefetched block has a completion")
+                .is_complete()
+                .unwrap(),
+            "paged-cache promotion blocked the host"
+        );
+        direct.wait_on(&stream).unwrap();
+        let consumed = direct.arrays().arrays()[0].square(&stream).unwrap();
+        let completion = async_eval_with_event([&consumed]).unwrap();
+        drop(direct);
+        completion.synchronize().unwrap();
+
+        let mut blocks = manager.prefetch_blocks(ids, &stream).unwrap();
+        let (execution_index, transfer_index) = blocks.stream_indices().unwrap();
+        assert_ne!(execution_index, transfer_index);
+        let first = blocks.next_block().unwrap().unwrap();
+        assert_eq!(blocks.pending_len(), 1);
+        drop(first);
+        drop(blocks);
     }
 
     #[test]

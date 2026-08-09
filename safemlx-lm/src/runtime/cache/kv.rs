@@ -1124,11 +1124,12 @@ impl PagedKeyValueCache {
             .map_err(cache_residency_exception)?;
         let mut scanned_blocks = 0;
         let mut scanned_bytes = 0;
-        for id in ids {
-            let lease = self
-                .manager
-                .lease_block(&id, stream)
-                .map_err(cache_residency_exception)?;
+        let mut blocks = self
+            .manager
+            .prefetch_blocks(ids, stream)
+            .map_err(cache_residency_exception)?;
+        while let Some(lease) = blocks.next_block().map_err(cache_residency_exception)? {
+            let id = lease.id();
             let (keys, values) = match lease.arrays() {
                 CacheBlockArrays::KeyValue { keys, values } => (keys.clone(), values.clone()),
                 _ => {
@@ -1545,11 +1546,12 @@ impl PagedKeyValueCache {
             .map_err(cache_residency_exception)?;
         let mut key_parts = Vec::new();
         let mut value_parts = Vec::new();
-        for id in ids {
-            let lease = self
-                .manager
-                .lease_block(&id, stream)
-                .map_err(cache_residency_exception)?;
+        let mut blocks = self
+            .manager
+            .prefetch_blocks(ids, stream)
+            .map_err(cache_residency_exception)?;
+        while let Some(lease) = blocks.next_block().map_err(cache_residency_exception)? {
+            let id = lease.id();
             let slice_start = i32::try_from(start.max(id.start) - id.start)
                 .map_err(|_| Exception::custom("paged cache visible range overflow"))?;
             let slice_end = i32::try_from(end.min(id.end) - id.start)
@@ -1677,11 +1679,12 @@ impl KeyValueCache for PagedKeyValueCache {
         let mut scanned_blocks = 0u64;
         let mut scanned_bytes = 0u64;
         let mut scratch = 0u64;
-        for id in ids {
-            let lease = self
-                .manager
-                .lease_block(&id, stream)
-                .map_err(cache_residency_exception)?;
+        let mut blocks = self
+            .manager
+            .prefetch_blocks(ids, stream)
+            .map_err(cache_residency_exception)?;
+        while let Some(lease) = blocks.next_block().map_err(cache_residency_exception)? {
+            let id = lease.id();
             let (keys, values) = match lease.arrays() {
                 CacheBlockArrays::KeyValue { keys, values } => (keys.clone(), values.clone()),
                 _ => {
@@ -1701,6 +1704,7 @@ impl KeyValueCache for PagedKeyValueCache {
             scanned_blocks += 1;
             scanned_bytes += lease.bytes();
             accumulator.accumulate(&block, stream)?;
+            accumulator.submit()?;
             drop(lease);
         }
         if let (Some(keys), Some(values)) = (&self.tail_keys, &self.tail_values) {
@@ -1868,6 +1872,18 @@ impl BlockwiseAttentionAccumulator {
         stream: &Stream,
     ) -> Result<(), Exception> {
         self.accumulate_with_bias(block, None, stream)
+    }
+
+    /// Submits the current recurrence before the next cache-block dependency
+    /// is inserted, allowing the dedicated transfer stream to prefetch the
+    /// following block while this block's attention executes.
+    pub(crate) fn submit(&self) -> Result<(), Exception> {
+        safemlx::transforms::async_eval(
+            self.running_max
+                .iter()
+                .chain(self.running_sum.iter())
+                .chain(self.accumulator.iter()),
+        )
     }
 
     pub(crate) fn accumulate_with_bias(
