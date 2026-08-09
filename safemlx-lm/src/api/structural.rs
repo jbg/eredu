@@ -1580,8 +1580,97 @@ fn validate_inkling_safetensors(
         );
     }
 
+    if let Some(mtp) = &args.mtp_config {
+        let count = mtp.num_nextn_predict_layers as usize;
+        for depth in 0..count {
+            for (suffix, shape) in [
+                ("hidden_norm.weight", vec![hidden]),
+                ("embed_norm.weight", vec![hidden]),
+                ("input_proj.weight", vec![hidden, hidden * 2]),
+            ] {
+                let key = format!("model.mtp.layers.{depth}.{suffix}");
+                allowed.insert(key.clone());
+                validate_safetensor(store, &key, &shape, false, &mut issues);
+            }
+            let local = mtp.local_layer_ids.contains(&depth);
+            let query_heads = if local {
+                mtp.swa_num_attention_heads
+                    .or(text.swa_num_attention_heads)
+                    .unwrap_or(mtp.num_attention_heads.unwrap_or(text.num_attention_heads))
+            } else {
+                mtp.num_attention_heads.unwrap_or(text.num_attention_heads)
+            } as usize;
+            let key_value_heads = if local {
+                mtp.swa_num_key_value_heads
+                    .or(text.swa_num_key_value_heads)
+                    .unwrap_or(mtp.num_key_value_heads.unwrap_or(text.num_key_value_heads))
+            } else {
+                mtp.num_key_value_heads.unwrap_or(text.num_key_value_heads)
+            } as usize;
+            let head = if local {
+                mtp.swa_head_dim
+                    .or(text.swa_head_dim)
+                    .unwrap_or(mtp.head_dim.unwrap_or(text.head_dim))
+            } else {
+                mtp.head_dim.unwrap_or(text.head_dim)
+            } as usize;
+            let d_rel = mtp.d_rel.unwrap_or(text.d_rel) as usize;
+            let relative = if local {
+                text.layer_schedule
+                    .iter()
+                    .find_map(|policy| policy.attention.window())
+                    .map_or(
+                        mtp.rel_extent.unwrap_or(text.rel_extent) as usize,
+                        |window| window.get() as usize,
+                    )
+            } else {
+                mtp.rel_extent.unwrap_or(text.rel_extent) as usize
+            };
+            let convolution = mtp.sconv_kernel_size.unwrap_or(text.sconv_kernel_size) as usize;
+            let intermediate = mtp
+                .dense_intermediate_size
+                .or(text.dense_intermediate_size)
+                .unwrap_or(mtp.intermediate_size.unwrap_or(text.intermediate_size))
+                as usize;
+            let prefix = format!("model.mtp.layers.{depth}.transformer_block");
+            for (suffix, shape) in [
+                ("attn_norm.weight", vec![hidden]),
+                ("mlp_norm.weight", vec![hidden]),
+                ("attn.wq_du.weight", vec![query_heads * head, hidden]),
+                ("attn.wk_dv.weight", vec![key_value_heads * head, hidden]),
+                ("attn.wv_dv.weight", vec![key_value_heads * head, hidden]),
+                ("attn.wr_du.weight", vec![query_heads * d_rel, hidden]),
+                ("attn.wo_ud.weight", vec![hidden, query_heads * head]),
+                ("attn.q_norm.weight", vec![head]),
+                ("attn.k_norm.weight", vec![head]),
+                ("attn.rel_logits_proj.proj", vec![d_rel, relative]),
+                (
+                    "attn.k_sconv.weight",
+                    vec![key_value_heads * head, 1, convolution],
+                ),
+                (
+                    "attn.v_sconv.weight",
+                    vec![key_value_heads * head, 1, convolution],
+                ),
+                ("attn_sconv.weight", vec![hidden, 1, convolution]),
+                ("mlp_sconv.weight", vec![hidden, 1, convolution]),
+                ("mlp.w13_dn.weight", vec![intermediate * 2, hidden]),
+                ("mlp.w2_md.weight", vec![hidden, intermediate]),
+                ("mlp.global_scale", vec![1]),
+            ] {
+                let key = format!("{prefix}.{suffix}");
+                allowed.insert(key.clone());
+                validate_safetensor(store, &key, &shape, false, &mut issues);
+            }
+        }
+        if mtp.chain_hidden_post_norm {
+            let key = "model.mtp.chain_norm.weight".to_string();
+            allowed.insert(key.clone());
+            validate_safetensor(store, &key, &[hidden], false, &mut issues);
+        }
+    }
     for key in keys {
-        if !allowed.contains(&key) && !key.starts_with("model.mtp.") {
+        if !allowed.contains(&key) {
             issues.push(unexpected_layout(&key, "Inkling SafeTensors"));
         }
     }
@@ -2798,6 +2887,145 @@ fn validate_nemotron_h_safetensors(
             }
         }
     }
+    if args.num_nextn_predict_layers > 0 {
+        let policies = match args.mtp_policies() {
+            Ok(policies) => policies,
+            Err(error) => return invalid_geometry(error.to_string()),
+        };
+        let pattern_len = policies.len() / args.num_nextn_predict_layers as usize;
+        for (layer, policy) in policies.iter().copied().enumerate() {
+            let official = format!("mtp.layers.{layer}");
+            let canonical = format!("model.mtp.layers.{layer}");
+            validate_nemotron_alias(
+                store,
+                &args,
+                &keys,
+                &mut allowed,
+                &mut issues,
+                format!("{official}.norm.weight"),
+                format!("{canonical}.norm.weight"),
+                vec![hidden],
+            );
+            match policy {
+                nemotron_h::LayerPolicy::SelfAttention(_) => {
+                    let query = (args.num_attention_heads * args.head_dim) as usize;
+                    let key_value = (args.num_key_value_heads * args.head_dim) as usize;
+                    for (projection, output, input) in [
+                        ("q_proj", query, hidden),
+                        ("k_proj", key_value, hidden),
+                        ("v_proj", key_value, hidden),
+                        ("o_proj", hidden, query),
+                    ] {
+                        validate_nemotron_alias(
+                            store,
+                            &args,
+                            &keys,
+                            &mut allowed,
+                            &mut issues,
+                            format!("{official}.mixer.{projection}.weight"),
+                            format!("{canonical}.mixer.{projection}.weight"),
+                            vec![output, input],
+                        );
+                        if args.attention_bias {
+                            validate_nemotron_alias(
+                                store,
+                                &args,
+                                &keys,
+                                &mut allowed,
+                                &mut issues,
+                                format!("{official}.mixer.{projection}.bias"),
+                                format!("{canonical}.mixer.{projection}.bias"),
+                                vec![output],
+                            );
+                        }
+                    }
+                }
+                nemotron_h::LayerPolicy::SparseMoe => {
+                    let experts = args.n_routed_experts as usize;
+                    let intermediate = args.moe_intermediate_size as usize;
+                    for (suffix, shape) in [
+                        ("gate.weight", vec![experts, hidden]),
+                        ("gate.e_score_correction_bias", vec![experts]),
+                        (
+                            "shared_experts.up_proj.weight",
+                            vec![args.moe_shared_expert_intermediate_size as usize, hidden],
+                        ),
+                        (
+                            "shared_experts.down_proj.weight",
+                            vec![hidden, args.moe_shared_expert_intermediate_size as usize],
+                        ),
+                    ] {
+                        validate_nemotron_alias(
+                            store,
+                            &args,
+                            &keys,
+                            &mut allowed,
+                            &mut issues,
+                            format!("{official}.mixer.{suffix}"),
+                            format!("{canonical}.mixer.{suffix}"),
+                            shape,
+                        );
+                    }
+                    if args.mlp_bias {
+                        for (projection, size) in [
+                            ("up_proj", args.moe_shared_expert_intermediate_size as usize),
+                            ("down_proj", hidden),
+                        ] {
+                            validate_nemotron_alias(
+                                store,
+                                &args,
+                                &keys,
+                                &mut allowed,
+                                &mut issues,
+                                format!("{official}.mixer.shared_experts.{projection}.bias"),
+                                format!("{canonical}.mixer.shared_experts.{projection}.bias"),
+                                vec![size],
+                            );
+                        }
+                    }
+                    validate_nemotron_experts_at(
+                        store,
+                        &args,
+                        &keys,
+                        &mut allowed,
+                        &mut issues,
+                        &format!("MTP physical layer {layer}"),
+                        &format!("{official}.mixer.experts"),
+                        &format!("{canonical}.mixer.experts"),
+                        experts,
+                        hidden,
+                        intermediate,
+                    );
+                }
+                _ => unreachable!("validated Nemotron-H MTP policy"),
+            }
+        }
+        for step in 0..args.num_nextn_predict_layers as usize {
+            let start = step * pattern_len;
+            let end = start + pattern_len - 1;
+            for (layer, suffix, shape) in [
+                (start, "enorm.weight", vec![hidden]),
+                (start, "hnorm.weight", vec![hidden]),
+                (start, "eh_proj.weight", vec![hidden, hidden * 2]),
+                (end, "final_layernorm.weight", vec![hidden]),
+            ] {
+                let candidates = [
+                    format!("mtp.layers.{layer}.{suffix}"),
+                    format!("model.mtp.layers.{layer}.{suffix}"),
+                ];
+                let present = candidates
+                    .iter()
+                    .find(|candidate| keys.contains(*candidate));
+                match present {
+                    Some(key) => {
+                        allowed.insert(key.clone());
+                        validate_safetensor(store, key, &shape, false, &mut issues);
+                    }
+                    None => issues.push(missing(&candidates[0])),
+                }
+            }
+        }
+    }
     for key in keys {
         if !allowed.contains(&key) {
             issues.push(unexpected_layout(&key, "Nemotron-H SafeTensors"));
@@ -2907,6 +3135,35 @@ fn validate_nemotron_experts(
 ) {
     let official = format!("backbone.layers.{layer}.mixer.experts");
     let canonical = format!("model.layers.{layer}.moe.experts");
+    validate_nemotron_experts_at(
+        store,
+        args,
+        keys,
+        allowed,
+        issues,
+        &format!("layer {layer}"),
+        &official,
+        &canonical,
+        experts,
+        hidden,
+        intermediate,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_nemotron_experts_at(
+    store: &SafetensorsWeightStore,
+    args: &nemotron_h::ModelArgs,
+    keys: &BTreeSet<String>,
+    allowed: &mut BTreeSet<String>,
+    issues: &mut Vec<StructuralIssue>,
+    label: &str,
+    official: &str,
+    canonical: &str,
+    experts: usize,
+    hidden: usize,
+    intermediate: usize,
+) {
     let packed_names = [
         format!("{official}.up_proj"),
         format!("{canonical}.up_proj"),
@@ -2934,9 +3191,7 @@ fn validate_nemotron_experts(
             .cloned();
         issues.push(StructuralIssue {
             kind: StructuralIssueKind::ConflictingLayout,
-            detail: format!(
-                "Nemotron-H layer {layer} mixes packed and split routed expert tensors"
-            ),
+            detail: format!("Nemotron-H {label} mixes packed and split routed expert tensors"),
             tensor_name: name,
             tensor_type_code: None,
             metadata_key: None,
@@ -2947,9 +3202,12 @@ fn validate_nemotron_experts(
         issues.push(StructuralIssue {
             kind: StructuralIssueKind::ConflictingLayout,
             detail: format!(
-                "checkpoint-native quantized Nemotron-H layer {layer} requires packed routed expert banks"
+                "checkpoint-native quantized Nemotron-H {label} requires packed routed expert banks"
             ),
-            tensor_name: split_names.iter().find(|name| keys.contains(*name)).cloned(),
+            tensor_name: split_names
+                .iter()
+                .find(|name| keys.contains(*name))
+                .cloned(),
             tensor_type_code: None,
             metadata_key: Some("quantization".into()),
         });
@@ -3014,7 +3272,51 @@ fn validate_deepseek_v3_safetensors(
         Ok(affine) => affine,
         Err(error) => return invalid_geometry(error.to_string()),
     };
-    let expected = deepseek_v3_expected(&args);
+    let mtp_count = args.num_nextn_predict_layers as usize;
+    let mut validation_args = args.clone();
+    if mtp_count > 0 {
+        let mut policies = args.layer_schedule.iter().copied().collect::<Vec<_>>();
+        policies.extend(std::iter::repeat_n(
+            deepseek_v3::LayerPolicy::SparseMoe,
+            mtp_count,
+        ));
+        validation_args.layer_schedule = match crate::LayerSchedule::new(policies.len(), policies) {
+            Ok(schedule) => schedule,
+            Err(error) => return invalid_geometry(error.to_string()),
+        };
+    }
+    let mut expected_tensors = deepseek_v3_expected(&validation_args);
+    for index in 0..mtp_count {
+        let global = args.num_hidden_layers as usize + index;
+        let prefix = format!("model.layers.{global}");
+        expected_tensors.extend([
+            expected_vector(
+                format!("{prefix}.enorm.weight"),
+                "",
+                args.hidden_size as usize,
+            ),
+            expected_vector(
+                format!("{prefix}.hnorm.weight"),
+                "",
+                args.hidden_size as usize,
+            ),
+            expected(
+                format!("{prefix}.eh_proj.weight"),
+                "",
+                [args.hidden_size as usize, args.hidden_size as usize * 2],
+            ),
+            expected_vector(
+                format!("{prefix}.shared_head.norm.weight"),
+                "",
+                args.hidden_size as usize,
+            ),
+            expected(
+                format!("{prefix}.shared_head.head.weight"),
+                "",
+                [args.vocab_size as usize, args.hidden_size as usize],
+            ),
+        ]);
+    }
     let native_fp8 = args.native_fp8_config().is_some();
     let deepseek_format = |name: &str| {
         if name.ends_with(".mlp.gate.weight") {
@@ -3033,7 +3335,7 @@ fn validate_deepseek_v3_safetensors(
         }
     };
     let mut allowed = BTreeSet::new();
-    for tensor in &expected {
+    for tensor in &expected_tensors {
         allowed.insert(tensor.safetensors_name.clone());
         add_safetensors_format_companions(
             &mut allowed,
@@ -3043,11 +3345,11 @@ fn validate_deepseek_v3_safetensors(
     }
     let mut issues = Vec::new();
     append_structural_issues(
-        validate_safetensor_format_plan(store, expected, deepseek_format),
+        validate_safetensor_format_plan(store, expected_tensors, deepseek_format),
         &mut issues,
     );
     let allow_packed = !options.weight_residency.is_fully_resident();
-    for (layer, policy) in args.layer_schedule.iter().enumerate() {
+    for (layer, policy) in validation_args.layer_schedule.iter().enumerate() {
         if *policy != deepseek_v3::LayerPolicy::SparseMoe {
             continue;
         }
@@ -3070,11 +3372,8 @@ fn validate_deepseek_v3_safetensors(
         );
     }
 
-    let mtp_prefixes = (0..args.num_nextn_predict_layers)
-        .map(|index| format!("model.layers.{}.", args.num_hidden_layers + index))
-        .collect::<Vec<_>>();
     for key in store.keys() {
-        if !allowed.contains(&key) && !mtp_prefixes.iter().any(|prefix| key.starts_with(prefix)) {
+        if !allowed.contains(&key) {
             issues.push(unexpected_layout(&key, "DeepSeek-V3 SafeTensors"));
         }
     }

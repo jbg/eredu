@@ -451,7 +451,11 @@ impl GeneralizedTensorModel {
             Self::Qwen(model) => {
                 GeneralizedTensorCache::Qwen(DenseQwenLayerwiseCache::Concat(model.new_cache()))
             }
-            Self::Lfm2(model) => GeneralizedTensorCache::Lfm2(model.new_cache()),
+            Self::Lfm2(model) => GeneralizedTensorCache::Lfm2(
+                model
+                    .new_cache_with_options(CacheResidencyPolicy::Paged(options))
+                    .unwrap(),
+            ),
             Self::GptOss(model) => GeneralizedTensorCache::GptOss(
                 model
                     .new_cache_with_options(CacheResidencyPolicy::Paged(options))
@@ -735,10 +739,17 @@ impl GeneralizedTensorCache {
         let lfm2_model::LayerCache::Attention(attention) = &cache.layers[1] else {
             panic!("LFM2 layer 1 must retain KV state")
         };
+        assert!(matches!(
+            attention,
+            safemlx_lm::runtime::cache::LiveKeyValueCache::Paged(_)
+        ));
         assert_eq!(attention.offset(), sequence);
         for array in attention.retained_arrays() {
             assert_eq!(array.shape(), &[1, local_kv_heads, 256, head_dim]);
         }
+        let report = cache.residency_report().unwrap().unwrap();
+        assert_eq!(report.logical_cached_tokens, sequence as u64);
+        assert!(report.current_device_bytes > 0);
     }
 
     fn assert_gpt_oss_local_cache_geometry(&self, local_kv_heads: i32, sequence: i32) {

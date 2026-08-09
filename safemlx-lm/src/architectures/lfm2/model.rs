@@ -47,13 +47,13 @@ use crate::{
     runtime::cache::{
         residency::{
             derive_prompt_cache_architecture_fingerprint, open_prompt_cache_snapshot,
-            save_prompt_cache_snapshot, CacheBlockArrays, CacheRankIdentity, LayerCachePolicy,
-            PromptCacheDescriptor, PromptCacheManifest, PromptCacheModelIdentity,
-            PromptCacheOptions, PromptCacheSnapshotBlock, PromptCacheStateArray,
-            StateTensorDimension, StateTensorDtype, StateTensorOwner, StateTensorPolicy,
-            StateTensorRole,
+            save_prompt_cache_snapshot, CacheBlockArrays, CacheRankIdentity, CacheResidencyManager,
+            CacheResidencyReport, LayerCachePolicy, PagedCacheOptions, PromptCacheDescriptor,
+            PromptCacheManifest, PromptCacheModelIdentity, PromptCacheOptions,
+            PromptCacheSnapshotBlock, PromptCacheStateArray, StateTensorDimension,
+            StateTensorDtype, StateTensorOwner, StateTensorPolicy, StateTensorRole,
         },
-        ConcatKeyValueCache, KeyValueCache,
+        ConcatKeyValueCache, KeyValueCache, LiveKeyValueCache,
     },
     runtime::checkpoint::load::{
         gguf_metadata, gguf_quantization_configs, load_named_array_strict,
@@ -1141,7 +1141,7 @@ impl Module<&Array> for FeedForward {
 /// Cache for one LFM2 operator layer.
 pub enum LayerCache {
     /// Full-attention KV cache.
-    Attention(ConcatKeyValueCache),
+    Attention(LiveKeyValueCache),
     /// Short-convolution state.
     Conv(CausalConv1dCache),
 }
@@ -1164,9 +1164,9 @@ impl LayerCache {
             OperatorPolicy::CausalConvolution => Self::Conv(CausalConv1dCache::default()),
             // Match mlx-lm's KVCache growth policy. Chunked backing arrays
             // avoid concatenating the complete cache for every decode token.
-            OperatorPolicy::SelfAttention(AttentionPolicy::Full) => {
-                Self::Attention(ConcatKeyValueCache::new_with_step(256))
-            }
+            OperatorPolicy::SelfAttention(AttentionPolicy::Full) => Self::Attention(
+                LiveKeyValueCache::resident(ConcatKeyValueCache::new_with_step(256)),
+            ),
             OperatorPolicy::SelfAttention(AttentionPolicy::Sliding { .. }) => {
                 unreachable!("validated LFM2 schedules contain only full self-attention")
             }
@@ -1207,18 +1207,67 @@ impl Cache {
         })
     }
 
+    pub(crate) fn new_paged(
+        args: &ModelArgs,
+        options: PagedCacheOptions,
+        rank: Option<CacheRankIdentity>,
+    ) -> Result<Self, Exception> {
+        let manager = CacheResidencyManager::new(options)
+            .map_err(|error| Exception::custom(error.to_string()))?;
+        Ok(Self {
+            layers: args
+                .layer_schedule
+                .iter()
+                .copied()
+                .enumerate()
+                .map(|(layer, policy)| match policy.operator {
+                    OperatorPolicy::CausalConvolution => {
+                        Ok(LayerCache::Conv(CausalConv1dCache::default()))
+                    }
+                    OperatorPolicy::SelfAttention(AttentionPolicy::Full) => {
+                        LiveKeyValueCache::paged(manager.clone(), layer, None, 0, rank)
+                            .map(LayerCache::Attention)
+                    }
+                    OperatorPolicy::SelfAttention(AttentionPolicy::Sliding { .. }) => {
+                        unreachable!("validated LFM2 schedules contain only full self-attention")
+                    }
+                })
+                .collect::<Result<Vec<_>, Exception>>()?,
+        })
+    }
+
+    /// Returns aggregate live KV paging observations, if enabled.
+    pub fn residency_report(&self) -> Result<Option<CacheResidencyReport>, Exception> {
+        self.layers
+            .iter()
+            .find_map(|layer| match layer {
+                LayerCache::Attention(cache) => cache.residency_report().transpose(),
+                LayerCache::Conv(_) => None,
+            })
+            .transpose()
+    }
+
     /// Returns the consumed-token offset.
     pub fn offset(&self) -> i32 {
         self.layers.first().map(LayerCache::offset).unwrap_or(0)
     }
 
-    pub(crate) fn reset(&mut self) {
+    pub(crate) fn reset(&mut self) -> Result<(), Exception> {
+        if let Some(manager) = self.layers.iter().find_map(|layer| match layer {
+            LayerCache::Attention(cache) => cache.manager().cloned(),
+            LayerCache::Conv(_) => None,
+        }) {
+            manager
+                .clear()
+                .map_err(|error| Exception::custom(error.to_string()))?;
+        }
         for layer in &mut self.layers {
             match layer {
-                LayerCache::Attention(cache) => cache.clear(),
+                LayerCache::Attention(cache) => cache.reset_local_after_manager_clear(),
                 LayerCache::Conv(cache) => *cache = CausalConv1dCache::default(),
             }
         }
+        Ok(())
     }
 }
 
@@ -1953,7 +2002,7 @@ impl Model {
     }
 
     pub(crate) fn save_prompt_cache_with_rank(
-        cache: &Cache,
+        cache: &mut Cache,
         destination: impl AsRef<Path>,
         descriptor: PromptCacheDescriptor,
         prefix_token_ids: &[u32],
@@ -1965,6 +2014,17 @@ impl Model {
             .map_err(|_| Exception::custom("LFM2 prompt length exceeds i64"))?;
         let mut blocks = Vec::new();
         let mut state = Vec::new();
+        let paged_manager = cache.layers.iter().find_map(|layer| match layer {
+            LayerCache::Attention(cache) => cache.manager().cloned(),
+            LayerCache::Conv(_) => None,
+        });
+        if paged_manager.is_some() {
+            for layer in &mut cache.layers {
+                if let LayerCache::Attention(cache) = layer {
+                    cache.finalize()?;
+                }
+            }
+        }
         for (layer, cache) in cache.layers.iter().enumerate() {
             if i64::from(cache.offset()) != end {
                 return Err(Exception::custom(format!(
@@ -1973,6 +2033,9 @@ impl Model {
             }
             match cache {
                 LayerCache::Attention(cache) => {
+                    if paged_manager.is_some() {
+                        continue;
+                    }
                     let (keys, values) = cache.snapshot_arrays(stream)?.ok_or_else(|| {
                         Exception::custom(format!("LFM2 layer {layer} attention state is missing"))
                     })?;
@@ -2000,6 +2063,11 @@ impl Model {
                 }
             }
         }
+        if let Some(manager) = paged_manager {
+            return manager
+                .save_prompt_cache(destination, descriptor, prefix_token_ids, &state, options)
+                .map_err(|error| Exception::custom(error.to_string()));
+        }
         save_prompt_cache_snapshot(
             destination,
             descriptor,
@@ -2013,7 +2081,7 @@ impl Model {
 
     #[cfg(test)]
     pub(crate) fn save_prompt_cache(
-        cache: &Cache,
+        cache: &mut Cache,
         destination: impl AsRef<Path>,
         descriptor: PromptCacheDescriptor,
         prefix_token_ids: &[u32],
@@ -2074,10 +2142,14 @@ impl Model {
         let (blocks, state, manifest) =
             open_prompt_cache_snapshot(directory, expected, &identity, prefix_token_ids, stream)
                 .map_err(|error| Exception::custom(error.to_string()))?;
-        let mut blocks = blocks
-            .into_iter()
-            .map(|block| (block.global_layer, block))
-            .collect::<BTreeMap<_, _>>();
+        let mut grouped_blocks: BTreeMap<usize, Vec<_>> = BTreeMap::new();
+        for block in blocks {
+            grouped_blocks
+                .entry(block.global_layer)
+                .or_default()
+                .push(block);
+        }
+        let mut blocks = grouped_blocks;
         let mut state = state
             .into_iter()
             .map(|tensor| ((tensor.owner, tensor.role), tensor.array))
@@ -2088,21 +2160,45 @@ impl Model {
         for (layer, cache) in cache.layers.iter_mut().enumerate() {
             match cache {
                 LayerCache::Attention(cache) => {
-                    let block = blocks.remove(&layer).ok_or_else(|| {
+                    let mut layer_blocks = blocks.remove(&layer).ok_or_else(|| {
                         Exception::custom(format!(
                             "LFM2 layer {layer} attention prompt-cache block is missing"
                         ))
                     })?;
-                    match block.arrays {
-                        CacheBlockArrays::KeyValue { keys, values } => {
-                            cache.restore_resident(keys, values, end)?;
-                        }
-                        CacheBlockArrays::CompressedLatentRotary { .. } => {
+                    layer_blocks.sort_by_key(|block| block.start);
+                    let mut expected_start = 0;
+                    let mut keys = Vec::with_capacity(layer_blocks.len());
+                    let mut values = Vec::with_capacity(layer_blocks.len());
+                    for block in layer_blocks {
+                        if block.start != expected_start {
                             return Err(Exception::custom(format!(
-                                "LFM2 layer {layer} prompt-cache kind mismatch"
-                            )))
+                                "LFM2 layer {layer} prompt-cache blocks are not contiguous"
+                            )));
+                        }
+                        expected_start = block.end;
+                        match block.arrays {
+                            CacheBlockArrays::KeyValue {
+                                keys: block_keys,
+                                values: block_values,
+                            } => {
+                                keys.push(block_keys);
+                                values.push(block_values);
+                            }
+                            CacheBlockArrays::CompressedLatentRotary { .. } => {
+                                return Err(Exception::custom(format!(
+                                    "LFM2 layer {layer} prompt-cache kind mismatch"
+                                )));
+                            }
                         }
                     }
+                    if expected_start != i64::from(end) {
+                        return Err(Exception::custom(format!(
+                            "LFM2 layer {layer} prompt-cache blocks end at {expected_start}, expected {end}"
+                        )));
+                    }
+                    let keys = concatenate_axis(&keys, -2, stream)?;
+                    let values = concatenate_axis(&values, -2, stream)?;
+                    cache.restore_resident(keys, values, end)?;
                 }
                 LayerCache::Conv(cache) => {
                     if args.conv_l_cache > 1 {
@@ -3383,7 +3479,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let destination = directory.path().join("prompt-cache");
         super::Model::save_prompt_cache(
-            &cache,
+            &mut cache,
             &destination,
             descriptor.clone(),
             &prefix_ids,

@@ -680,6 +680,22 @@ uses the shared full/sliding ordinary or paged KV cache, and MLP/MoE-only
 layers use the one stateless representation. Prompt-cache persistence and
 offset validation consume the same local schedule.
 
+Embedded multi-token prediction is one scheduler contract across
+DeepSeek-V3/R1, Inkling, Nemotron-H, Qwen3-Next, and Qwen3.5/3.6. Each adapter
+owns only its checkpoint-specific fusion and prediction blocks. Draft cache
+clone, verification, partial-accept rollback/replay, cancellation, semantic
+streaming, prepared-chat batching, and stochastic acceptance live in the
+shared backend. DeepSeek prediction layers use compressed MLA state; Inkling
+uses its configured per-depth full/sliding KV plus short-convolution state;
+Nemotron-H executes every physical operator in
+`mtp_hybrid_override_pattern`. Resident and paged caches include these draft
+owners under the same rank identity as the target cache. DeepSeek and
+Nemotron-H prediction experts use the ordinary independent expert catalog and
+bounded route executor when that residency is selected. Embedded prediction
+heads are currently admitted only for single-model execution; parallel model
+instances reject the capability until prediction modules have Cartesian
+TP/PP/EP ownership plans.
+
 Qwen3.5 and Qwen3-Next normalize Hugging Face `layer_types`, the Qwen3-Next
 `full_attention_interval` fallback, and GGUF full-attention intervals into
 `LayerSchedule<architectures::qwen::hybrid::qwen3_5::LayerPolicy>`. The ordered

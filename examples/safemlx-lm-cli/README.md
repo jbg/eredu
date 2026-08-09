@@ -174,7 +174,8 @@ distinct target/draft streams, and a draft processor with exact clone/discard
 semantics derived only from explicit history, immutable configuration, and the
 supplied PRNG state. Mirostat V2 still uses scheduled, lossless MTP but waits
 for target resolution because its adaptive state depends on committed target
-probabilities. Embedded Qwen uses the scheduler without optimistic lookahead.
+probabilities. Native embedded predictors use the scheduler without optimistic
+lookahead.
 Any explicit `--mtp-draft-device cpu|gpu:N` requires `--draft-model`; embedded
 MTP uses `--mtp-draft-device target`.
 
@@ -204,10 +205,10 @@ opportunities. The first
 optimistic token matched by a target bonus counts as consumed rather than
 reused or proposed.
 
-Qwen3-Next and Qwen3.5/3.6 safetensors checkpoints with native MTP weights use
-those embedded weights automatically; no `--draft-model` is needed. Their
-native head proposes one token per verification round, so larger
-`--mtp-draft-tokens` values are safely capped by the model.
+DeepSeek-V3/R1, Inkling, Nemotron-H, Qwen3-Next, and Qwen3.5/3.6 safetensors
+checkpoints with native MTP weights use those embedded weights automatically;
+no `--draft-model` is needed. `--mtp-draft-tokens` is safely capped by the
+checkpoint's executable prediction depth.
 
 Dense checkpoints can be quantized while loading. For example, 4-bit affine
 weights substantially reduce decode-time weight traffic and memory use:

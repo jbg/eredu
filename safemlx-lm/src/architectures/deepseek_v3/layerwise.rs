@@ -9,9 +9,10 @@ use std::{
 
 use safemlx::{
     error::Exception,
+    macros::ModuleParameters,
     module::{Module, ModuleParameters, Param},
     nn,
-    ops::{indexing::TryIndexOp, GgufCheckpoint, GgufMetadataValue},
+    ops::{concatenate_axis, indexing::TryIndexOp, GgufCheckpoint, GgufMetadataValue},
     quantization::MaybeQuantized,
     Array, Dtype, Stream,
 };
@@ -33,7 +34,8 @@ use crate::{
         PromptCacheTopology,
     },
     runtime::checkpoint::binding::{
-        build_module_bindings_with_recipes, canonical_checkpoint_name, populate_module_from_lease,
+        build_module_bindings_with_recipes, build_module_bindings_with_recipes_excluding,
+        canonical_checkpoint_name, populate_module_from_lease,
         populate_module_from_lease_excluding,
     },
     runtime::checkpoint::store::{GgufWeightStore, TensorSelection, WeightStore},
@@ -64,6 +66,163 @@ use crate::{
 const EMBEDDING_UNIT: &str = "deepseek_v3.static.embedding";
 const NORM_UNIT: &str = "deepseek_v3.static.norm";
 const HEAD_UNIT: &str = "deepseek_v3.static.output";
+const MTP_UNIT: &str = "deepseek_v3.static.mtp";
+
+#[derive(Debug, Clone, ModuleParameters)]
+struct DeepSeekMtpLayer {
+    #[param]
+    enorm: nn::RmsNorm,
+    #[param]
+    hnorm: nn::RmsNorm,
+    #[param]
+    eh_proj: MaybeQuantized<nn::Linear>,
+    #[param]
+    decoder: DecoderLayer,
+    #[param]
+    shared_norm: nn::RmsNorm,
+    #[param]
+    shared_head: MaybeQuantized<nn::Linear>,
+}
+
+#[derive(Debug, Clone, ModuleParameters)]
+struct DeepSeekMtpModule {
+    #[param]
+    layers: Vec<DeepSeekMtpLayer>,
+}
+
+impl DeepSeekMtpModule {
+    fn new(args: &ModelArgs, stream: &Stream) -> Result<Option<Self>, Error> {
+        let count = usize::try_from(args.num_nextn_predict_layers).map_err(|_| {
+            Error::UnsupportedArchitecture("DeepSeek MTP layer count is negative".into())
+        })?;
+        if count == 0 {
+            return Ok(None);
+        }
+        let mut policies = args.layer_schedule.iter().cloned().collect::<Vec<_>>();
+        policies.extend(std::iter::repeat_n(LayerPolicy::SparseMoe, count));
+        let mut mtp_args = args.clone();
+        mtp_args.layer_schedule = crate::LayerSchedule::new(policies.len(), policies)
+            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        let layers = (0..count)
+            .map(|index| {
+                let global = args.num_hidden_layers + index as i32;
+                Ok(DeepSeekMtpLayer {
+                    enorm: nn::RmsNorm::unloaded(
+                        args.hidden_size,
+                        args.rms_norm_eps,
+                        Dtype::Float32,
+                        stream,
+                    )?,
+                    hnorm: nn::RmsNorm::unloaded(
+                        args.hidden_size,
+                        args.rms_norm_eps,
+                        Dtype::Float32,
+                        stream,
+                    )?,
+                    eh_proj: common::linear::unloaded_maybe_quantized_linear(
+                        args.hidden_size * 2,
+                        args.hidden_size,
+                        false,
+                        args.weight_quantization_for(&format!(
+                            "model.layers.{global}.eh_proj.weight"
+                        )),
+                        stream,
+                    )?,
+                    decoder: DecoderLayer::new_layerwise(&mtp_args, global, stream)?,
+                    shared_norm: nn::RmsNorm::unloaded(
+                        args.hidden_size,
+                        args.rms_norm_eps,
+                        Dtype::Float32,
+                        stream,
+                    )?,
+                    shared_head: common::linear::unloaded_maybe_quantized_linear(
+                        args.hidden_size,
+                        args.vocab_size,
+                        false,
+                        args.weight_quantization_for(&format!(
+                            "model.layers.{global}.shared_head.head.weight"
+                        )),
+                        stream,
+                    )?,
+                })
+            })
+            .collect::<Result<Vec<_>, Error>>()?;
+        Ok(Some(Self { layers }))
+    }
+
+    fn len(&self) -> usize {
+        self.layers.len()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn forward_step(
+        &mut self,
+        hidden: &Array,
+        embeddings: &Array,
+        tokens: &Array,
+        depth: usize,
+        cache: &mut [crate::runtime::cache::CompressedLatentCache],
+        expert_cache: Option<&ExpertCache>,
+        args: &ModelArgs,
+        stream: &Stream,
+    ) -> Result<crate::runtime::generation::embedded_mtp::EmbeddedMtpOutput, Exception> {
+        let layer_count = self.layers.len();
+        let cache_count = cache.len();
+        let layer = self
+            .layers
+            .get_mut(depth % layer_count)
+            .ok_or_else(|| Exception::custom("DeepSeek checkpoint does not contain MTP layers"))?;
+        let cache = cache.get_mut(depth % cache_count).ok_or_else(|| {
+            Exception::custom("DeepSeek MTP cache does not match prediction layers")
+        })?;
+        let embeddings = layer.enorm.forward(embeddings, stream)?;
+        let hidden = layer.hnorm.forward(hidden, stream)?;
+        let fused = concatenate_axis(&[&embeddings, &hidden], -1, stream)?;
+        let fused = layer.eh_proj.forward(&fused, stream)?;
+        let mask = (fused.dim(1) > 1)
+            .then(|| create_causal_mask(fused.dim(1), Some(cache.offset()), None, None, stream))
+            .transpose()?;
+        let hidden = if let Some(expert_cache) = expert_cache {
+            let global = args.num_hidden_layers as usize + depth % layer_count;
+            let pass = if fused.dim(1) > 1 {
+                ExpertPass::Prefill
+            } else {
+                ExpertPass::Decode
+            };
+            layer.decoder.forward_sparse_experts(
+                &fused,
+                mask.as_ref(),
+                Some(cache),
+                stream,
+                |flat, indices, weights, stream| {
+                    execute_cached_deepseek_experts(
+                        args,
+                        expert_cache,
+                        global,
+                        flat,
+                        indices,
+                        weights,
+                        pass,
+                        stream,
+                    )
+                },
+            )?
+        } else {
+            layer
+                .decoder
+                .forward_stage(&fused, mask.as_ref(), Some(cache), stream)?
+        };
+        let normalized = layer.shared_norm.forward(&hidden, stream)?;
+        let logits = layer.shared_head.forward(&normalized, stream)?;
+        Ok(
+            crate::runtime::generation::embedded_mtp::EmbeddedMtpOutput {
+                logits,
+                hidden,
+                tokens: tokens.clone(),
+            },
+        )
+    }
+}
 
 /// DeepSeek-V3/R1 causal LM using bounded residency for decoder blocks.
 pub struct DeepSeekV3LayerwiseModel {
@@ -104,14 +263,73 @@ impl DeepSeekV3LayerwiseModel {
         self.execution.adapter().new_cache()
     }
 
+    pub(crate) fn mtp_len(&self) -> usize {
+        self.execution
+            .adapter()
+            .mtp
+            .as_ref()
+            .map_or(0, DeepSeekMtpModule::len)
+    }
+
+    fn forward_mtp_target(
+        &mut self,
+        tokens: &Array,
+        cache: &mut Cache,
+        stream: &Stream,
+    ) -> Result<crate::runtime::generation::embedded_mtp::EmbeddedMtpOutput, Exception> {
+        let (logits, context) = self
+            .execution
+            .forward_with_context_hook(tokens, cache, stream, |_, _, _| Ok(()))
+            .map_err(|error| Exception::custom(error.to_string()))?;
+        let hidden = context.draft_hidden.ok_or_else(|| {
+            Exception::custom("DeepSeek layerwise pass did not retain MTP hidden state")
+        })?;
+        Ok(
+            crate::runtime::generation::embedded_mtp::EmbeddedMtpOutput {
+                logits,
+                hidden,
+                tokens: tokens.clone(),
+            },
+        )
+    }
+
+    fn forward_mtp_draft(
+        &mut self,
+        hidden: &Array,
+        tokens: &Array,
+        depth: usize,
+        cache: &mut [crate::runtime::cache::CompressedLatentCache],
+        stream: &Stream,
+    ) -> Result<crate::runtime::generation::embedded_mtp::EmbeddedMtpOutput, Exception> {
+        let adapter = self.execution.adapter_mut();
+        let embeddings = adapter.embedding.forward(tokens, stream)?;
+        let expert_cache = adapter.expert_cache.as_ref();
+        let args = &adapter.args;
+        adapter
+            .mtp
+            .as_mut()
+            .ok_or_else(|| Exception::custom("DeepSeek checkpoint does not contain MTP layers"))?
+            .forward_step(
+                hidden,
+                &embeddings,
+                tokens,
+                depth,
+                cache,
+                expert_cache,
+                args,
+                stream,
+            )
+    }
+
     /// Creates ordinary or paged compressed attention state independently of weight residency.
     pub fn new_cache_with_options(&self, policy: CacheResidencyPolicy) -> Result<Cache, Error> {
-        Cache::new_with_options_and_rank(
-            &self.args().layer_schedule,
-            policy,
-            self.execution.prompt_cache_rank_identity(),
-        )
-        .map_err(Into::into)
+        let rank = self.execution.prompt_cache_rank_identity();
+        Cache::new_with_options_and_rank(&self.args().layer_schedule, policy.clone(), rank)
+            .and_then(|cache| match policy {
+                CacheResidencyPolicy::Device => Ok(cache.with_mtp_layers(self.mtp_len())),
+                CacheResidencyPolicy::Paged(_) => cache.with_paged_mtp_layers(self.mtp_len(), rank),
+            })
+            .map_err(Into::into)
     }
 
     /// Lazily catalogs a compatible persisted compressed prefix.
@@ -335,6 +553,99 @@ impl CausalLm<Cache> for DeepSeekV3LayerwiseModel {
         self.forward(input_tokens, cache, stream)
             .map_err(|error| Exception::custom(error.to_string()))?
             .try_index_device((.., -1, ..), stream)
+    }
+}
+
+impl crate::runtime::generation::embedded_mtp::EmbeddedMtpTarget for DeepSeekV3LayerwiseModel {
+    type Cache = Cache;
+    type DraftCache = Vec<crate::runtime::cache::CompressedLatentCache>;
+
+    fn prefill_target(
+        &mut self,
+        input: input::ModelInput<'_>,
+        cache: &mut Cache,
+        stream: &Stream,
+    ) -> Result<crate::runtime::generation::embedded_mtp::EmbeddedMtpOutput, Exception> {
+        let tokens = input::text_token_ids(input, stream)?;
+        cache.reset()?;
+        self.forward_mtp_target(&tokens, cache, stream)
+    }
+
+    fn verify_target(
+        &mut self,
+        tokens: &Array,
+        cache: &mut Cache,
+        stream: &Stream,
+    ) -> Result<crate::runtime::generation::embedded_mtp::EmbeddedMtpOutput, Exception> {
+        self.forward_mtp_target(tokens, cache, stream)
+    }
+
+    fn prefill_draft_cache(
+        &mut self,
+        output: &crate::runtime::generation::embedded_mtp::EmbeddedMtpOutput,
+        tokens: &Array,
+        cache: &mut Cache,
+        stream: &Stream,
+    ) -> Result<(), Exception> {
+        let sequence = tokens.dim(1);
+        if sequence <= 1 {
+            return Ok(());
+        }
+        let hidden = output
+            .hidden
+            .try_index_device((.., ..sequence - 1, ..), stream)?;
+        let next = tokens.try_index_device((.., 1..), stream)?;
+        let count = cache.mtp_layers.len();
+        for depth in 0..count {
+            let _ = self.forward_mtp_draft(&hidden, &next, depth, &mut cache.mtp_layers, stream)?;
+        }
+        Ok(())
+    }
+
+    fn draft_cache(cache: &Cache) -> Self::DraftCache {
+        cache.mtp_layers.clone()
+    }
+
+    fn commit_draft_cache(cache: &mut Cache, draft: &Self::DraftCache) {
+        cache.mtp_layers.clone_from(draft);
+    }
+
+    fn restore_target_checkpoint(
+        cache: &mut Cache,
+        checkpoint: &Cache,
+        stream: &Stream,
+    ) -> Result<(), Exception> {
+        cache.restore_target_checkpoint(checkpoint, stream)
+    }
+
+    fn draft_logits(
+        &mut self,
+        hidden: &Array,
+        last_token: u32,
+        draft_index: usize,
+        cache: &mut Self::DraftCache,
+        stream: &Stream,
+    ) -> Result<(Array, Array), Exception> {
+        let token = Array::from_slice(&[last_token], &[1, 1]);
+        let output = self.forward_mtp_draft(hidden, &token, draft_index, cache, stream)?;
+        Ok((output.logits, output.hidden))
+    }
+
+    fn advance_draft_cache(
+        &mut self,
+        hidden: &Array,
+        tokens: &Array,
+        cache: &mut Self::DraftCache,
+        stream: &Stream,
+    ) -> Result<(), Exception> {
+        for depth in 0..cache.len() {
+            let _ = self.forward_mtp_draft(hidden, tokens, depth, cache, stream)?;
+        }
+        Ok(())
+    }
+
+    fn max_draft_tokens(&self) -> usize {
+        self.mtp_len()
     }
 }
 
@@ -665,6 +976,7 @@ pub struct DeepSeekV3LayerwiseAdapter {
     embedding: MaybeQuantized<nn::Embedding>,
     norm: nn::RmsNorm,
     lm_head: MaybeQuantized<nn::Linear>,
+    mtp: Option<DeepSeekMtpModule>,
     parallel_embedding: Option<VocabParallelEmbedding>,
     parallel_lm_head: Option<VocabParallelLmHead>,
     sparse_expert_cache: bool,
@@ -673,6 +985,7 @@ pub struct DeepSeekV3LayerwiseAdapter {
 
 impl DeepSeekV3LayerwiseAdapter {
     pub(crate) fn new(args: ModelArgs, stream: &Stream) -> Result<Self, Error> {
+        let mtp = DeepSeekMtpModule::new(&args, stream)?;
         Ok(Self {
             embedding: common::linear::unloaded_maybe_quantized_embedding(
                 args.vocab_size,
@@ -693,6 +1006,7 @@ impl DeepSeekV3LayerwiseAdapter {
                 args.weight_quantization_for("lm_head.weight"),
                 stream,
             )?,
+            mtp,
             parallel_embedding: None,
             parallel_lm_head: None,
             sparse_expert_cache: false,
@@ -718,6 +1032,7 @@ impl DeepSeekV3LayerwiseAdapter {
 
     fn new_cache(&self) -> Cache {
         Cache::new(&self.args.layer_schedule)
+            .with_mtp_layers(self.mtp.as_ref().map_or(0, DeepSeekMtpModule::len))
     }
 
     fn recipes_for_layer(
@@ -732,9 +1047,23 @@ impl DeepSeekV3LayerwiseAdapter {
         let mut recipes = BTreeMap::new();
 
         for local_name in layer.parameters().flatten().keys() {
+            if self.sparse_expert_cache && expert_destination(local_name.as_ref()).is_some() {
+                continue;
+            }
             let destination = format!("{prefix}.{local_name}");
             let canonical = canonical_checkpoint_name(&destination);
-            if keys.contains(&destination) || keys.contains(&canonical) {
+            if keys.contains(&destination) {
+                recipes.insert(
+                    local_name.to_string(),
+                    DerivedWeightRecipe::source(destination, TensorSelection::Full),
+                );
+                continue;
+            }
+            if keys.contains(&canonical) {
+                recipes.insert(
+                    local_name.to_string(),
+                    DerivedWeightRecipe::source(canonical, TensorSelection::Full),
+                );
                 continue;
             }
             if let Some((projection, component)) = expert_destination(local_name.as_ref()) {
@@ -772,6 +1101,111 @@ impl DeepSeekV3LayerwiseAdapter {
         }
         Ok(recipes)
     }
+
+    fn mtp_recipes(
+        &self,
+        store: &dyn WeightStore,
+    ) -> Result<BTreeMap<String, DerivedWeightRecipe>, Error> {
+        let mtp = self.mtp.as_ref().ok_or_else(|| {
+            Error::UnsupportedArchitecture("DeepSeek model has no MTP module".into())
+        })?;
+        let normalized = normalized_checkpoint_keys(store);
+        let mut recipes = BTreeMap::new();
+        for (index, layer) in mtp.layers.iter().enumerate() {
+            let global = self.args.num_hidden_layers as usize + index;
+            for (name, recipe) in self.recipes_for_layer(&layer.decoder, global, store)? {
+                recipes.insert(format!("layers.{index}.decoder.{name}"), recipe);
+            }
+            for (local, remote) in [
+                ("enorm.weight", "enorm.weight"),
+                ("hnorm.weight", "hnorm.weight"),
+                ("eh_proj.weight", "eh_proj.weight"),
+                ("shared_norm.weight", "shared_head.norm.weight"),
+                ("shared_head.weight", "shared_head.head.weight"),
+            ] {
+                let destination = format!("model.layers.{global}.{remote}");
+                let raw = normalized.get(&destination).ok_or_else(|| {
+                    Error::UnsupportedArchitecture(format!(
+                        "DeepSeek MTP checkpoint is missing {destination}"
+                    ))
+                })?;
+                recipes.insert(
+                    format!("layers.{index}.{local}"),
+                    DerivedWeightRecipe::source(raw.clone(), TensorSelection::Full),
+                );
+            }
+        }
+        Ok(recipes)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_cached_deepseek_experts(
+    args: &ModelArgs,
+    expert_cache: &ExpertCache,
+    layer: usize,
+    flat: &Array,
+    indices: &Array,
+    weights: &Array,
+    pass: ExpertPass,
+    stream: &Stream,
+) -> Result<Array, Exception> {
+    expert_cache
+        .execute_routes_bounded(
+            ExpertRouteBatch::new(layer, flat, indices, weights, pass),
+            stream,
+            |flat, acquired, weights, stream| {
+                if acquired.is_empty() {
+                    return Err(ExpertCacheError::EmptyRoutedBank {
+                        architecture: "DeepSeek-V3",
+                    });
+                }
+                let started = Instant::now();
+                let mut bank = resident::RoutedExperts::new_compact(
+                    args,
+                    layer as i32,
+                    acquired.identities().len() as i32,
+                    stream,
+                )?;
+                if let Some(quantization) = expert_cache.weight_quantization() {
+                    bank.use_fp8 = false;
+                    bank.gate_affine = Some(quantization);
+                    bank.up_affine = Some(quantization);
+                    bank.down_affine = Some(quantization);
+                    bank.gate_iquant = None;
+                    bank.up_iquant = None;
+                    bank.down_iquant = None;
+                }
+                bank.gate_proj = Param::new(Some(acquired.compact_binding("gate_proj", stream)?));
+                bank.gate_proj_scale_inv =
+                    Param::new(acquired.optional_compact_binding("gate_proj_scale_inv", stream)?);
+                bank.gate_proj_scales =
+                    Param::new(acquired.optional_compact_binding("gate_proj_scales", stream)?);
+                bank.gate_proj_biases =
+                    Param::new(acquired.optional_compact_binding("gate_proj_biases", stream)?);
+                bank.up_proj = Param::new(Some(acquired.compact_binding("up_proj", stream)?));
+                bank.up_proj_scale_inv =
+                    Param::new(acquired.optional_compact_binding("up_proj_scale_inv", stream)?);
+                bank.up_proj_scales =
+                    Param::new(acquired.optional_compact_binding("up_proj_scales", stream)?);
+                bank.up_proj_biases =
+                    Param::new(acquired.optional_compact_binding("up_proj_biases", stream)?);
+                bank.down_proj = Param::new(Some(acquired.compact_binding("down_proj", stream)?));
+                bank.down_proj_scale_inv =
+                    Param::new(acquired.optional_compact_binding("down_proj_scale_inv", stream)?);
+                bank.down_proj_scales =
+                    Param::new(acquired.optional_compact_binding("down_proj_scales", stream)?);
+                bank.down_proj_biases =
+                    Param::new(acquired.optional_compact_binding("down_proj_biases", stream)?);
+                expert_cache.record_compact_bank(
+                    pass,
+                    acquired.scratch_bytes(),
+                    started.elapsed(),
+                )?;
+                Ok(bank.forward_local(flat, acquired.compact_routes(), weights, stream)?)
+            },
+        )
+        .map_err(|error| Exception::custom(error.to_string()))
 }
 
 fn normalized_checkpoint_keys(store: &dyn WeightStore) -> BTreeMap<String, String> {
@@ -803,6 +1237,7 @@ fn expert_destination(local_name: &str) -> Option<(&'static str, &'static str)> 
 /// Per-forward causal mask shared by all MLA blocks.
 pub struct DeepSeekV3ForwardContext {
     mask: Option<Array>,
+    draft_hidden: Option<Array>,
 }
 
 fn register_deepseek_layer_parallel_plan(
@@ -1157,14 +1592,29 @@ impl ArchitectureAdapter for DeepSeekV3LayerwiseAdapter {
                 )?,
             )?);
         }
+        if select(MTP_UNIT) {
+            if let Some(mtp) = &self.mtp {
+                units.push(StaticUnitBindings::new(
+                    MTP_UNIT,
+                    build_module_bindings_with_recipes_excluding(
+                        mtp,
+                        "",
+                        store,
+                        self.mtp_recipes(store)?,
+                        |name| self.sparse_expert_cache && name.contains(".decoder.mlp.experts."),
+                    )?,
+                )?);
+            }
+        }
         Ok(units)
     }
 
     fn populate_static(&mut self, leases: &[ResidentUnitLease]) -> Result<(), Error> {
-        if leases.len() != 3 {
+        let expected = 3 + usize::from(self.mtp.is_some());
+        if leases.len() != expected {
             return Err(Error::UnsupportedArchitecture(format!(
-                "DeepSeek-V3 adapter received {} static leases, expected 3",
-                leases.len()
+                "DeepSeek-V3 adapter received {} static leases, expected {expected}",
+                leases.len(),
             )));
         }
         if let Some(embedding) = &mut self.parallel_embedding {
@@ -1177,6 +1627,15 @@ impl ArchitectureAdapter for DeepSeekV3LayerwiseAdapter {
             populate_module_from_lease(head.inner_mut(), &leases[2])?;
         } else {
             populate_module_from_lease(&mut self.lm_head, &leases[2])?;
+        }
+        if let Some(mtp) = &mut self.mtp {
+            if self.sparse_expert_cache {
+                populate_module_from_lease_excluding(mtp, &leases[3], |name| {
+                    name.contains(".decoder.mlp.experts.")
+                })?;
+            } else {
+                populate_module_from_lease(mtp, &leases[3])?;
+            }
         }
         Ok(())
     }
@@ -1216,7 +1675,10 @@ impl ArchitectureAdapter for DeepSeekV3LayerwiseAdapter {
         };
         Ok(LayerwiseForwardState {
             hidden,
-            context: DeepSeekV3ForwardContext { mask },
+            context: DeepSeekV3ForwardContext {
+                mask,
+                draft_hidden: None,
+            },
         })
     }
 
@@ -1244,7 +1706,10 @@ impl ArchitectureAdapter for DeepSeekV3LayerwiseAdapter {
         };
         Ok(LayerwiseForwardState {
             hidden,
-            context: DeepSeekV3ForwardContext { mask },
+            context: DeepSeekV3ForwardContext {
+                mask,
+                draft_hidden: None,
+            },
         })
     }
 
@@ -1512,20 +1977,14 @@ impl ArchitectureAdapter for DeepSeekV3LayerwiseAdapter {
         store: &dyn WeightStore,
     ) -> Result<Vec<WeightBinding>, Error> {
         let prefix = format!("model.layers.{index}");
-        let bindings = build_module_bindings_with_recipes(
+        build_module_bindings_with_recipes_excluding(
             layer,
             &prefix,
             store,
             self.recipes_for_layer(layer, index, store)?,
-        )?;
-        if self.sparse_expert_cache {
-            Ok(bindings
-                .into_iter()
-                .filter(|binding| !binding.name().starts_with("mlp.experts."))
-                .collect())
-        } else {
-            Ok(bindings)
-        }
+            |name| self.sparse_expert_cache && name.starts_with("mlp.experts."),
+        )
+        .map_err(Into::into)
     }
 
     fn parallel_layer_bindings(
@@ -1579,20 +2038,10 @@ impl ArchitectureAdapter for DeepSeekV3LayerwiseAdapter {
     }
 
     fn additional_consumed_checkpoint_keys(&self, store: &dyn WeightStore) -> Vec<String> {
-        let prediction_start = self.args.num_hidden_layers;
-        let prediction_end = prediction_start + self.args.num_nextn_predict_layers;
         store
             .keys()
             .into_iter()
-            .filter(|key| {
-                let cached_expert = self.sparse_expert_cache && key.contains(".mlp.experts.");
-                let prediction_layer = key
-                    .strip_prefix("model.layers.")
-                    .and_then(|tail| tail.split_once('.'))
-                    .and_then(|(layer, _)| layer.parse::<i32>().ok())
-                    .is_some_and(|layer| layer >= prediction_start && layer < prediction_end);
-                cached_expert || prediction_layer
-            })
+            .filter(|key| self.sparse_expert_cache && key.contains(".mlp.experts."))
             .collect()
     }
 
@@ -1626,106 +2075,16 @@ impl ArchitectureAdapter for DeepSeekV3LayerwiseAdapter {
                 Some(&mut cache.layers[index]),
                 stream,
                 |flat, indices, weights, stream| {
-                    expert_cache
-                        .execute_routes_bounded(
-                            ExpertRouteBatch::new(index, flat, indices, weights, pass),
-                            stream,
-                            |flat, acquired, weights, stream| {
-                                if acquired.is_empty() {
-                                    return Err(ExpertCacheError::EmptyRoutedBank {
-                                        architecture: "DeepSeek-V3",
-                                    });
-                                }
-                                let started = Instant::now();
-                                let mut bank = resident::RoutedExperts::new_compact(
-                                    &self.args,
-                                    index as i32,
-                                    acquired.identities().len() as i32,
-                                    stream,
-                                )?;
-                                if let Some(quantization) = expert_cache.weight_quantization() {
-                                    bank.use_fp8 = false;
-                                    bank.gate_affine = Some(quantization);
-                                    bank.up_affine = Some(quantization);
-                                    bank.down_affine = Some(quantization);
-                                    bank.gate_iquant = None;
-                                    bank.up_iquant = None;
-                                    bank.down_iquant = None;
-                                }
-                                bank.gate_proj = Param::new(Some(
-                                    acquired
-                                        .compact_binding("gate_proj", stream)
-                                        .map_err(|error| Exception::custom(error.to_string()))?,
-                                ));
-                                bank.gate_proj_scale_inv = Param::new(
-                                    acquired
-                                        .optional_compact_binding("gate_proj_scale_inv", stream)
-                                        .map_err(|error| Exception::custom(error.to_string()))?,
-                                );
-                                bank.gate_proj_scales = Param::new(
-                                    acquired
-                                        .optional_compact_binding("gate_proj_scales", stream)
-                                        .map_err(|error| Exception::custom(error.to_string()))?,
-                                );
-                                bank.gate_proj_biases = Param::new(
-                                    acquired
-                                        .optional_compact_binding("gate_proj_biases", stream)
-                                        .map_err(|error| Exception::custom(error.to_string()))?,
-                                );
-                                bank.up_proj = Param::new(Some(
-                                    acquired
-                                        .compact_binding("up_proj", stream)
-                                        .map_err(|error| Exception::custom(error.to_string()))?,
-                                ));
-                                bank.up_proj_scale_inv = Param::new(
-                                    acquired
-                                        .optional_compact_binding("up_proj_scale_inv", stream)
-                                        .map_err(|error| Exception::custom(error.to_string()))?,
-                                );
-                                bank.up_proj_scales = Param::new(
-                                    acquired
-                                        .optional_compact_binding("up_proj_scales", stream)
-                                        .map_err(|error| Exception::custom(error.to_string()))?,
-                                );
-                                bank.up_proj_biases = Param::new(
-                                    acquired
-                                        .optional_compact_binding("up_proj_biases", stream)
-                                        .map_err(|error| Exception::custom(error.to_string()))?,
-                                );
-                                bank.down_proj = Param::new(Some(
-                                    acquired
-                                        .compact_binding("down_proj", stream)
-                                        .map_err(|error| Exception::custom(error.to_string()))?,
-                                ));
-                                bank.down_proj_scale_inv = Param::new(
-                                    acquired
-                                        .optional_compact_binding("down_proj_scale_inv", stream)
-                                        .map_err(|error| Exception::custom(error.to_string()))?,
-                                );
-                                bank.down_proj_scales = Param::new(
-                                    acquired
-                                        .optional_compact_binding("down_proj_scales", stream)
-                                        .map_err(|error| Exception::custom(error.to_string()))?,
-                                );
-                                bank.down_proj_biases = Param::new(
-                                    acquired
-                                        .optional_compact_binding("down_proj_biases", stream)
-                                        .map_err(|error| Exception::custom(error.to_string()))?,
-                                );
-                                expert_cache.record_compact_bank(
-                                    pass,
-                                    acquired.scratch_bytes(),
-                                    started.elapsed(),
-                                )?;
-                                Ok(bank.forward_local(
-                                    flat,
-                                    acquired.compact_routes(),
-                                    weights,
-                                    stream,
-                                )?)
-                            },
-                        )
-                        .map_err(|error| Exception::custom(error.to_string()))
+                    execute_cached_deepseek_experts(
+                        &self.args,
+                        expert_cache,
+                        index,
+                        flat,
+                        indices,
+                        weights,
+                        pass,
+                        stream,
+                    )
                 },
             )?;
             return Ok(output);
@@ -1814,6 +2173,19 @@ impl ArchitectureAdapter for DeepSeekV3LayerwiseAdapter {
             .unwrap_or_default()
     }
 
+    fn complete_execution_group(
+        &mut self,
+        group: usize,
+        hidden: &Array,
+        _cache: &mut Self::Cache,
+        context: &mut Self::ForwardContext,
+        _stream: &Stream,
+    ) -> Result<Array, Error> {
+        self.layer_count(group)?;
+        context.draft_hidden = Some(hidden.clone());
+        Ok(hidden.clone())
+    }
+
     fn finish(
         &mut self,
         hidden: &Array,
@@ -1838,15 +2210,6 @@ impl ArchitectureAdapter for DeepSeekV3LayerwiseAdapter {
         let hidden = self.norm.forward(hidden, execution.stream())?;
         head.forward(&hidden, execution)?.all_gather(execution)
     }
-
-    fn ignores_checkpoint_key(&self, key: &str) -> bool {
-        (0..self.args.num_nextn_predict_layers).any(|index| {
-            key.starts_with(&format!(
-                "model.layers.{}.",
-                self.args.num_hidden_layers + index
-            ))
-        })
-    }
 }
 
 pub(crate) fn deepseek_expert_catalog(
@@ -1855,10 +2218,17 @@ pub(crate) fn deepseek_expert_catalog(
 ) -> Result<Vec<ExpertCatalogEntry>, Error> {
     let normalized = normalized_checkpoint_keys(store);
     let mut entries = Vec::new();
-    for (layer, policy) in args.layer_schedule.iter().enumerate() {
-        if *policy != LayerPolicy::SparseMoe {
-            continue;
-        }
+    let mut expert_layers = args
+        .layer_schedule
+        .iter()
+        .enumerate()
+        .filter_map(|(layer, policy)| (*policy == LayerPolicy::SparseMoe).then_some(layer))
+        .collect::<Vec<_>>();
+    expert_layers.extend(
+        (0..args.num_nextn_predict_layers as usize)
+            .map(|index| args.num_hidden_layers as usize + index),
+    );
+    for layer in expert_layers {
         let prefix = format!("model.layers.{layer}.mlp.experts");
         for expert in 0..usize::try_from(args.n_routed_experts).map_err(|_| {
             Error::UnsupportedArchitecture("DeepSeek-V3 expert count is negative".into())
@@ -1974,6 +2344,7 @@ mod tests {
         runtime::execution::layerwise::{load_safetensors_layerwise_model, LayerwiseLoadOptions},
         runtime::residency::expert_cache::ExpertCacheLoadOptions,
         runtime::residency::policy::{OffloadConfig, ResidencyPolicy},
+        CacheResidencyPolicy, PagedCacheOptions,
     };
 
     fn config(fp8: bool) -> serde_json::Value {
@@ -2006,7 +2377,7 @@ mod tests {
             "scoring_func": "sigmoid",
             "norm_topk_prob": true,
             "routed_scaling_factor": 1.5,
-            "num_nextn_predict_layers": 1,
+            "num_nextn_predict_layers": 0,
             "tie_word_embeddings": false,
             "attention_bias": false,
             "attention_dropout": 0.0,
@@ -2104,6 +2475,16 @@ mod tests {
         }
     }
 
+    #[test]
+    fn embedded_mtp_geometry_owns_one_draft_cache_per_prediction_layer() {
+        let execution = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        let mut args = args(false);
+        args.num_nextn_predict_layers = 2;
+        let adapter = DeepSeekV3LayerwiseAdapter::new(args, execution.stream()).unwrap();
+        assert_eq!(adapter.mtp.as_ref().unwrap().len(), 2);
+        assert_eq!(adapter.new_cache().mtp_layers.len(), 2);
+    }
+
     fn initialize(model: &mut Model, stream: &Stream) {
         for layer in &mut model.model.layers {
             if let FeedForward::Moe(moe) = &mut layer.mlp {
@@ -2149,7 +2530,14 @@ mod tests {
         }
     }
 
-    fn write_fixture(dir: &Path, model: &Model, fp8: bool, split_experts: bool, stream: &Stream) {
+    fn write_fixture(
+        dir: &Path,
+        model: &Model,
+        fp8: bool,
+        split_experts: bool,
+        mtp: bool,
+        stream: &Stream,
+    ) {
         let mut arrays = Vec::<(String, Array)>::new();
         for (name, value) in model.parameters().flatten() {
             let name = canonical_checkpoint_name(&name);
@@ -2183,15 +2571,50 @@ mod tests {
                 arrays.push((name, value.clone()));
             }
         }
+        if mtp {
+            assert!(!fp8, "the deterministic MTP fixture uses dense weights");
+            let decoder = arrays
+                .iter()
+                .filter_map(|(name, value)| {
+                    name.strip_prefix("model.layers.1.")
+                        .map(|suffix| (format!("model.layers.2.{suffix}"), value.clone()))
+                })
+                .collect::<Vec<_>>();
+            arrays.extend(decoder);
+            arrays.extend([
+                (
+                    "model.layers.2.enorm.weight".into(),
+                    ones_dtype(&[8], Dtype::Float32, stream).unwrap(),
+                ),
+                (
+                    "model.layers.2.hnorm.weight".into(),
+                    ones_dtype(&[8], Dtype::Float32, stream).unwrap(),
+                ),
+                (
+                    "model.layers.2.eh_proj.weight".into(),
+                    Array::full::<f32>(&[8, 16], Array::from_f32(0.01), stream).unwrap(),
+                ),
+                (
+                    "model.layers.2.shared_head.norm.weight".into(),
+                    ones_dtype(&[8], Dtype::Float32, stream).unwrap(),
+                ),
+                (
+                    "model.layers.2.shared_head.head.weight".into(),
+                    Array::full::<f32>(&[32, 8], Array::from_f32(0.01), stream).unwrap(),
+                ),
+            ]);
+        }
         Array::save_safetensors(
             arrays.iter().map(|(name, value)| (name.as_str(), value)),
             None,
             dir.join("model.safetensors"),
         )
         .unwrap();
+        let mut fixture_config = config(fp8);
+        fixture_config["num_nextn_predict_layers"] = i32::from(mtp).into();
         fs::write(
             dir.join("config.json"),
-            serde_json::to_vec(&config(fp8)).unwrap(),
+            serde_json::to_vec(&fixture_config).unwrap(),
         )
         .unwrap();
     }
@@ -2211,7 +2634,7 @@ mod tests {
         let mut fixture = Model::new(args(fp8), gpu.stream()).unwrap();
         initialize(&mut fixture, gpu.stream());
         let dir = tempfile::tempdir().unwrap();
-        write_fixture(dir.path(), &fixture, fp8, true, gpu.stream());
+        write_fixture(dir.path(), &fixture, fp8, true, false, gpu.stream());
 
         let mut resident = resident::load_model(dir.path(), gpu.stream(), cpu.stream()).unwrap();
         let options = LayerwiseLoadOptions::new(OffloadConfig::new(None, None, depth).unwrap());
@@ -2219,7 +2642,10 @@ mod tests {
             load_deepseek_v3_layerwise_model(dir.path(), options, gpu.stream(), cpu.stream())
                 .unwrap();
         let mut resident_cache = resident.new_cache();
-        let mut layerwise_cache = resident::Cache { layers: Vec::new() };
+        let mut layerwise_cache = resident::Cache {
+            layers: Vec::new(),
+            mtp_layers: Vec::new(),
+        };
         for tokens in [
             Array::from_slice(&[1u32, 2], &[1, 2]),
             Array::from_slice(&[3u32], &[1, 1]),
@@ -2276,7 +2702,14 @@ mod tests {
         let mut resident = Model::new(custom_args.clone(), gpu.stream()).unwrap();
         initialize(&mut resident, gpu.stream());
         let directory = tempfile::tempdir().unwrap();
-        write_fixture(directory.path(), &resident, false, true, gpu.stream());
+        write_fixture(
+            directory.path(),
+            &resident,
+            false,
+            true,
+            false,
+            gpu.stream(),
+        );
 
         let options = LayerwiseLoadOptions::new(OffloadConfig::new(None, None, 1).unwrap());
         let adapter = DeepSeekV3LayerwiseAdapter::new(custom_args, gpu.stream()).unwrap();
@@ -2290,7 +2723,10 @@ mod tests {
         .unwrap();
         let mut layerwise = DeepSeekV3LayerwiseModel { execution };
         let mut resident_cache = resident.new_cache();
-        let mut layerwise_cache = resident::Cache { layers: Vec::new() };
+        let mut layerwise_cache = resident::Cache {
+            layers: Vec::new(),
+            mtp_layers: Vec::new(),
+        };
         for tokens in [
             Array::from_slice(&[1u32, 2], &[1, 2]),
             Array::from_slice(&[3u32], &[1, 1]),
@@ -2335,6 +2771,87 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires an MLX Metal device"]
+    fn deepseek_embedded_mtp_is_lossless_with_resident_and_paged_draft_state() {
+        let gpu = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
+        let cpu = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        let mut fixture = Model::new(args(false), gpu.stream()).unwrap();
+        initialize(&mut fixture, gpu.stream());
+        let directory = tempfile::tempdir().unwrap();
+        write_fixture(directory.path(), &fixture, false, true, true, gpu.stream());
+
+        let prompt = Array::from_slice(&[1_u32, 2, 3], &[1, 3]);
+        let parts = [crate::api::input::InputPart::text_token_ids(&prompt)];
+        let input = crate::api::input::ModelInput::new(&parts);
+        let options = LayerwiseLoadOptions::new(OffloadConfig::new(None, None, 1).unwrap());
+        let mut ordinary =
+            load_deepseek_v3_layerwise_model(directory.path(), options, gpu.stream(), cpu.stream())
+                .unwrap();
+        assert_eq!(ordinary.mtp_len(), 1);
+        let mut ordinary_cache = ordinary.new_cache();
+        let expected = crate::nn::generation::Generate::new(
+            &mut ordinary,
+            &mut ordinary_cache,
+            0.0,
+            input,
+            None,
+            gpu.stream(),
+        )
+        .take(4)
+        .map(|token| {
+            let token = token.unwrap();
+            let token = token.evaluated().unwrap();
+            token.as_slice::<u32>()[0]
+        })
+        .collect::<Vec<_>>();
+
+        let mtp_config = crate::runtime::generation::speculative::MtpConfig {
+            max_tokens: 4,
+            max_draft_tokens: 1,
+            temperature: 0.0,
+            eos_token_ids: Vec::new(),
+        };
+        for paged in [false, true] {
+            let mut model = load_deepseek_v3_layerwise_model(
+                directory.path(),
+                options,
+                gpu.stream(),
+                cpu.stream(),
+            )
+            .unwrap();
+            let mut cache = if paged {
+                model
+                    .new_cache_with_options(CacheResidencyPolicy::Paged(
+                        PagedCacheOptions::new(1, 1 << 20, 1 << 20, 1)
+                            .unwrap()
+                            .with_full_attention(true),
+                    ))
+                    .unwrap()
+            } else {
+                model.new_cache()
+            };
+            let (actual, stats) = crate::runtime::generation::embedded_mtp::generate_with_callback(
+                &mut model,
+                &mut cache,
+                input,
+                &mtp_config,
+                None,
+                &mut crate::runtime::generation::sampler::DefaultSampler,
+                gpu.stream(),
+                |_| Ok(()),
+            )
+            .unwrap();
+            assert_eq!(actual, expected);
+            assert!(stats.rounds > 0);
+            assert!(stats.draft_tokens > 0);
+            if paged {
+                let report = cache.residency_report().unwrap().unwrap();
+                assert!(report.block_seals > 0);
+            }
+        }
+    }
+
+    #[test]
     fn deepseek_v3_sparse_expert_cache_layout_parity_and_telemetry() {
         sparse_expert_cache_parity(false, true);
         sparse_expert_cache_parity(false, false);
@@ -2347,7 +2864,14 @@ mod tests {
         let mut fixture = Model::new(args(fp8), gpu.stream()).unwrap();
         initialize(&mut fixture, gpu.stream());
         let dir = tempfile::tempdir().unwrap();
-        write_fixture(dir.path(), &fixture, fp8, split_experts, gpu.stream());
+        write_fixture(
+            dir.path(),
+            &fixture,
+            fp8,
+            split_experts,
+            false,
+            gpu.stream(),
+        );
 
         let mut resident = if split_experts {
             resident::load_model(dir.path(), gpu.stream(), cpu.stream()).unwrap()
@@ -2369,7 +2893,10 @@ mod tests {
         )
         .unwrap();
         let mut resident_cache = resident.new_cache();
-        let mut cached_cache = resident::Cache { layers: Vec::new() };
+        let mut cached_cache = resident::Cache {
+            layers: Vec::new(),
+            mtp_layers: Vec::new(),
+        };
         for tokens in [
             Array::from_slice(&[1u32, 2], &[1, 2]),
             Array::from_slice(&[3u32], &[1, 1]),

@@ -233,9 +233,9 @@ impl ExpertParallelCache {
             }
             Self::GptOss(cache) => cache.reset()?,
             Self::Inkling(cache) => cache.reset()?,
-            Self::Lfm2(cache) => cache.reset(),
+            Self::Lfm2(cache) => cache.reset()?,
             Self::NemotronH(cache) => cache.reset()?,
-            Self::QwenHybrid(cache) => cache.reset(),
+            Self::QwenHybrid(cache) => cache.reset()?,
             Self::Qwen3Vl(cache) => *cache = qwen3_vl::Cache::default(),
             Self::Gemma4(cache) => cache.clear()?,
         }
@@ -412,7 +412,7 @@ impl crate::architectures::qwen::hybrid::mtp::QwenMtpTarget for ExpertParallelQw
         stream: &Stream,
     ) -> Result<qwen3_5::QwenMtpStepOutput, Exception> {
         let tokens = runtime_input::text_token_ids(input, stream)?;
-        cache.reset();
+        cache.reset()?;
         self.model
             .forward_qwen_mtp_target(&tokens, cache, self.group, stream)
             .map_err(|error| Exception::custom(error.to_string()))
@@ -692,6 +692,34 @@ impl ExpertParallelModel {
                 ExpertArchitecture::NemotronHLayerwise(model) => model
                     .new_cache_with_options(CacheResidencyPolicy::Paged(options))
                     .map(ExpertParallelCache::NemotronH),
+                ExpertArchitecture::Lfm2(model) => {
+                    let rank = Some(CacheRankIdentity {
+                        pipeline_rank: None,
+                        tensor_parallel_rank: (self.topology.tensor_parallel_size > 1)
+                            .then_some(self.topology.tensor_parallel_rank),
+                        expert_parallel_rank: Some(self.topology.expert_parallel_rank),
+                    });
+                    lfm2::Cache::new_paged(&model.args, options, rank)
+                        .map(ExpertParallelCache::Lfm2)
+                        .map_err(Into::into)
+                }
+                ExpertArchitecture::Lfm2Layerwise(model) => model
+                    .new_cache_with_options(CacheResidencyPolicy::Paged(options))
+                    .map(ExpertParallelCache::Lfm2),
+                ExpertArchitecture::QwenHybrid(model) => {
+                    let rank = Some(CacheRankIdentity {
+                        pipeline_rank: None,
+                        tensor_parallel_rank: (self.topology.tensor_parallel_size > 1)
+                            .then_some(self.topology.tensor_parallel_rank),
+                        expert_parallel_rank: Some(self.topology.expert_parallel_rank),
+                    });
+                    qwen3_5::Cache::new_paged(&model.args, options, rank)
+                        .map(ExpertParallelCache::QwenHybrid)
+                        .map_err(Into::into)
+                }
+                ExpertArchitecture::QwenHybridLayerwise(model) => model
+                    .new_cache_with_options(CacheResidencyPolicy::Paged(options))
+                    .map(ExpertParallelCache::QwenHybrid),
                 _ => Err(Error::Parallel(
                     "paged cache residency is unsupported for this expert-parallel cache representation"
                         .into(),
@@ -718,6 +746,8 @@ impl ExpertParallelModel {
                 .map_err(Into::into),
             ExpertParallelCache::Inkling(cache) => cache.residency_report().map_err(Into::into),
             ExpertParallelCache::NemotronH(cache) => cache.residency_report().map_err(Into::into),
+            ExpertParallelCache::Lfm2(cache) => cache.residency_report().map_err(Into::into),
+            ExpertParallelCache::QwenHybrid(cache) => cache.residency_report().map_err(Into::into),
             _ => Ok(None),
         }
     }

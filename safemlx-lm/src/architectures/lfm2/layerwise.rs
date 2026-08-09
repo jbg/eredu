@@ -38,8 +38,8 @@ use crate::{
     },
     runtime::cache::{
         residency::{
-            PagedCacheOptions, PromptCacheDescriptor, PromptCacheManifest,
-            PromptCacheModelIdentity, PromptCacheOptions, PromptCacheTopology,
+            CacheResidencyPolicy, CacheResidencyReport, PagedCacheOptions, PromptCacheDescriptor,
+            PromptCacheManifest, PromptCacheModelIdentity, PromptCacheOptions, PromptCacheTopology,
         },
         KeyValueCache,
     },
@@ -273,6 +273,28 @@ impl Lfm2LayerwiseModel {
     /// Creates heterogeneous attention and convolution state.
     pub fn new_cache(&self) -> Cache {
         self.execution.adapter().new_cache()
+    }
+
+    /// Creates resident heterogeneous state or pages only growing attention
+    /// blocks while convolution history remains rank-local on device.
+    pub fn new_cache_with_options(&self, policy: CacheResidencyPolicy) -> Result<Cache, Error> {
+        match policy {
+            CacheResidencyPolicy::Device => Ok(self.new_cache()),
+            CacheResidencyPolicy::Paged(options) => Cache::new_paged(
+                self.args(),
+                options,
+                self.execution.prompt_cache_rank_identity(),
+            )
+            .map_err(Into::into),
+        }
+    }
+
+    /// Returns aggregate live attention paging telemetry, if enabled.
+    pub fn cache_residency_report(
+        &self,
+        cache: &Cache,
+    ) -> Result<Option<CacheResidencyReport>, Error> {
+        cache.residency_report().map_err(Into::into)
     }
 
     /// Returns rank-local generalized parallel information when applicable.
@@ -2036,6 +2058,7 @@ mod tests {
                 LayerwiseLoadOptions,
             },
         },
+        CacheResidencyPolicy, PagedCacheOptions,
     };
 
     fn args(moe: bool) -> ModelArgs {
@@ -2392,6 +2415,12 @@ mod tests {
         }
         let mut resident_cache = resident.new_cache();
         let mut layerwise_cache = Cache { layers: Vec::new() };
+        let paged_options = PagedCacheOptions::new(1, 1 << 20, 1 << 20, 1)
+            .unwrap()
+            .with_full_attention(true);
+        let mut paged_cache = layerwise
+            .new_cache_with_options(CacheResidencyPolicy::Paged(paged_options))
+            .unwrap();
         for tokens in [
             Array::from_slice(&[1u32, 2], &[1, 2]),
             Array::from_slice(&[3u32], &[1, 1]),
@@ -2404,7 +2433,11 @@ mod tests {
             let actual = layerwise
                 .forward(&tokens, &mut layerwise_cache, gpu.stream())
                 .unwrap();
+            let paged = layerwise
+                .forward(&tokens, &mut paged_cache, gpu.stream())
+                .unwrap();
             assert_close(&actual, &expected);
+            assert_close(&paged, &expected);
             for (expected, actual) in resident_cache.layers.iter().zip(&layerwise_cache.layers) {
                 let expected_offset = match expected {
                     LayerCache::Attention(cache) => {
@@ -2436,6 +2469,12 @@ mod tests {
                     .all(|unit| unit.policy() == ResidencyPolicy::Pinned));
             }
         }
+        let report = layerwise
+            .cache_residency_report(&paged_cache)
+            .unwrap()
+            .expect("LFM2 paged cache report");
+        assert_eq!(report.logical_cached_tokens, 5);
+        assert!(report.block_seals > 0);
     }
 
     #[test]

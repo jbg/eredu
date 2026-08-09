@@ -56,12 +56,13 @@ use crate::{
     runtime::cache::{
         residency::{
             derive_prompt_cache_architecture_fingerprint, open_prompt_cache_snapshot,
-            save_prompt_cache_snapshot, CacheBlockArrays, LayerCachePolicy, PromptCacheDescriptor,
+            save_prompt_cache_snapshot, CacheBlockArrays, CacheRankIdentity, CacheResidencyManager,
+            CacheResidencyReport, LayerCachePolicy, PagedCacheOptions, PromptCacheDescriptor,
             PromptCacheManifest, PromptCacheModelIdentity, PromptCacheOptions,
             PromptCacheSnapshotBlock, PromptCacheStateArray, StateTensorDimension,
             StateTensorDtype, StateTensorOwner, StateTensorPolicy, StateTensorRole,
         },
-        ConcatKeyValueCache, KeyValueCache,
+        ConcatKeyValueCache, KeyValueCache, LiveKeyValueCache,
     },
     runtime::checkpoint::load::{
         for_each_safetensor_array, gguf_metadata, gguf_quantization_configs, load_array_strict,
@@ -1177,9 +1178,9 @@ impl Cache {
                 .layer_schedule
                 .iter()
                 .map(|policy| match policy {
-                    LayerPolicy::SelfAttention(AttentionPolicy::Full) => {
-                        LayerCache::FullAttention(ConcatKeyValueCache::new())
-                    }
+                    LayerPolicy::SelfAttention(AttentionPolicy::Full) => LayerCache::FullAttention(
+                        LiveKeyValueCache::resident(ConcatKeyValueCache::new()),
+                    ),
                     LayerPolicy::SelfAttention(AttentionPolicy::Sliding { .. }) => unreachable!(),
                     LayerPolicy::LinearAttention => {
                         LayerCache::LinearAttention(LinearAttentionCache::default())
@@ -1187,9 +1188,62 @@ impl Cache {
                 })
                 .collect(),
             mtp_layers: (0..args.mtp_num_hidden_layers)
-                .map(|_| LayerCache::FullAttention(ConcatKeyValueCache::new()))
+                .map(|_| {
+                    LayerCache::FullAttention(LiveKeyValueCache::resident(
+                        ConcatKeyValueCache::new(),
+                    ))
+                })
                 .collect(),
         })
+    }
+
+    pub(crate) fn new_paged(
+        args: &ModelArgs,
+        options: PagedCacheOptions,
+        rank: Option<CacheRankIdentity>,
+    ) -> Result<Self, Exception> {
+        validate_text_model_args(args, "Qwen hybrid paged cache")
+            .map_err(|error| Exception::custom(error.to_string()))?;
+        let manager = CacheResidencyManager::new(options)
+            .map_err(|error| Exception::custom(error.to_string()))?;
+        let layers = args
+            .layer_schedule
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(layer, policy)| match policy {
+                LayerPolicy::SelfAttention(AttentionPolicy::Full) => {
+                    LiveKeyValueCache::paged(manager.clone(), layer, None, 0, rank)
+                        .map(LayerCache::FullAttention)
+                }
+                LayerPolicy::LinearAttention => {
+                    Ok(LayerCache::LinearAttention(LinearAttentionCache::default()))
+                }
+                LayerPolicy::SelfAttention(AttentionPolicy::Sliding { .. }) => {
+                    unreachable!("validated Qwen hybrid schedules use full attention")
+                }
+            })
+            .collect::<Result<Vec<_>, Exception>>()?;
+        let mtp_start = args.num_hidden_layers as usize;
+        let mtp_layers = (0..args.mtp_num_hidden_layers as usize)
+            .map(|index| {
+                LiveKeyValueCache::paged(manager.clone(), mtp_start + index, None, 0, rank)
+                    .map(LayerCache::FullAttention)
+            })
+            .collect::<Result<Vec<_>, Exception>>()?;
+        Ok(Self { layers, mtp_layers })
+    }
+
+    /// Returns aggregate live full-attention paging observations, if enabled.
+    pub fn residency_report(&self) -> Result<Option<CacheResidencyReport>, Exception> {
+        self.layers
+            .iter()
+            .chain(&self.mtp_layers)
+            .find_map(|layer| match layer {
+                LayerCache::FullAttention(cache) => cache.residency_report().transpose(),
+                LayerCache::LinearAttention(_) => None,
+            })
+            .transpose()
     }
 
     pub(crate) fn offset(&self) -> i32 {
@@ -1203,18 +1257,32 @@ impl Cache {
             .unwrap_or(0)
     }
 
-    pub(crate) fn reset(&mut self) {
+    pub(crate) fn reset(&mut self) -> Result<(), Exception> {
+        if let Some(manager) = self
+            .layers
+            .iter()
+            .chain(&self.mtp_layers)
+            .find_map(|layer| match layer {
+                LayerCache::FullAttention(cache) => cache.manager().cloned(),
+                LayerCache::LinearAttention(_) => None,
+            })
+        {
+            manager
+                .clear()
+                .map_err(|error| Exception::custom(error.to_string()))?;
+        }
         for layer in &mut self.layers {
             match layer {
-                LayerCache::FullAttention(cache) => cache.clear(),
+                LayerCache::FullAttention(cache) => cache.reset_local_after_manager_clear(),
                 LayerCache::LinearAttention(cache) => *cache = LinearAttentionCache::default(),
             }
         }
         for cache in &mut self.mtp_layers {
             if let LayerCache::FullAttention(cache) = cache {
-                cache.clear();
+                cache.reset_local_after_manager_clear();
             }
         }
+        Ok(())
     }
 
     fn prefill_state_dependency(&self, stream: &Stream) -> Result<Option<Array>, Exception> {
@@ -1222,7 +1290,7 @@ impl Cache {
         for layer in &self.layers {
             match layer {
                 LayerCache::FullAttention(cache) => {
-                    for array in cache.arrays() {
+                    for array in cache.retained_arrays() {
                         let term = array.sum(None, stream)?;
                         dependency = Some(match dependency {
                             Some(acc) => acc.add(term, stream)?,
@@ -1258,7 +1326,7 @@ impl Cache {
 /// Per-layer cache for a Qwen3.5 MoE layer.
 pub enum LayerCache {
     /// Full-attention key/value cache.
-    FullAttention(ConcatKeyValueCache),
+    FullAttention(LiveKeyValueCache),
     /// Linear-attention convolution and recurrent cache.
     LinearAttention(LinearAttentionCache),
 }
@@ -1526,17 +1594,15 @@ impl Module<FullAttentionInput<'_>> for FullAttention {
                 nn::RopeInputBuilder::new(&key).offset(offset).build()?,
                 stream,
             )?;
-            (key, value) = cache.update_and_fetch(key, value, stream)?;
+            (key, value) = cache.update_for_attention(key, value, stream)?;
         } else {
             query = self.rope.forward(nn::RopeInput::new(&query), stream)?;
             key = self.rope.forward(nn::RopeInput::new(&key), stream)?;
         }
 
-        let out = crate::nn::tensor::scaled_dot_product_attention(
-            query, key, value, cache, self.scale, mask, stream,
+        let out = crate::nn::attention::finish_attention(
+            query, key, value, cache, self.scale, mask, B, L, stream,
         )?
-        .transpose_axes(&[0, 2, 1, 3], stream)?
-        .reshape(&[B, L, -1], stream)?
         .multiply(sigmoid(gate, stream)?, stream)?;
         self.o_proj.forward(&out, stream)
     }
@@ -4939,7 +5005,7 @@ impl Model {
     }
 
     pub(crate) fn save_prompt_cache(
-        cache: &Cache,
+        cache: &mut Cache,
         destination: impl AsRef<Path>,
         descriptor: PromptCacheDescriptor,
         prefix_token_ids: &[u32],
@@ -4955,9 +5021,23 @@ impl Model {
         }
         let mut blocks = Vec::new();
         let mut state = Vec::new();
+        let paged_manager = cache.layers.iter().find_map(|layer| match layer {
+            LayerCache::FullAttention(cache) => cache.manager().cloned(),
+            LayerCache::LinearAttention(_) => None,
+        });
+        if paged_manager.is_some() {
+            for layer in &mut cache.layers {
+                if let LayerCache::FullAttention(cache) = layer {
+                    cache.finalize()?;
+                }
+            }
+        }
         for (layer, cache) in cache.layers.iter().enumerate() {
             match cache {
                 LayerCache::FullAttention(cache) => {
+                    if paged_manager.is_some() {
+                        continue;
+                    }
                     let (keys, values) = cache.snapshot_arrays(stream)?.ok_or_else(|| {
                         Exception::custom("Qwen full-attention cache state is missing")
                     })?;
@@ -4986,6 +5066,11 @@ impl Model {
                     });
                 }
             }
+        }
+        if let Some(manager) = paged_manager {
+            return manager
+                .save_prompt_cache(destination, descriptor, prefix_token_ids, &state, options)
+                .map_err(|error| Exception::custom(error.to_string()));
         }
         save_prompt_cache_snapshot(
             destination,
@@ -5040,10 +5125,14 @@ impl Model {
         let (blocks, state, manifest) =
             open_prompt_cache_snapshot(directory, expected, identity, prefix_token_ids, stream)
                 .map_err(|error| Exception::custom(error.to_string()))?;
-        let mut blocks = blocks
-            .into_iter()
-            .map(|block| (block.global_layer, block))
-            .collect::<BTreeMap<_, _>>();
+        let mut grouped_blocks: BTreeMap<usize, Vec<_>> = BTreeMap::new();
+        for block in blocks {
+            grouped_blocks
+                .entry(block.global_layer)
+                .or_default()
+                .push(block);
+        }
+        let mut blocks = grouped_blocks;
         let mut state = state
             .into_iter()
             .map(|state| ((state.owner, state.role), state.array))
@@ -5054,15 +5143,41 @@ impl Model {
         for (layer, cache) in cache.layers.iter_mut().enumerate() {
             match cache {
                 LayerCache::FullAttention(cache) => {
-                    let block = blocks.remove(&layer).ok_or_else(|| {
+                    let mut layer_blocks = blocks.remove(&layer).ok_or_else(|| {
                         Exception::custom("Qwen full-attention prompt-cache block is missing")
                     })?;
-                    match block.arrays {
-                        CacheBlockArrays::KeyValue { keys, values } => {
-                            cache.restore_resident(keys, values, end)?;
+                    layer_blocks.sort_by_key(|block| block.start);
+                    let mut expected_start = 0;
+                    let mut keys = Vec::with_capacity(layer_blocks.len());
+                    let mut values = Vec::with_capacity(layer_blocks.len());
+                    for block in layer_blocks {
+                        if block.start != expected_start {
+                            return Err(Exception::custom(
+                                "Qwen full-attention prompt-cache blocks are not contiguous",
+                            ));
                         }
-                        _ => return Err(Exception::custom("Qwen prompt-cache kind mismatch")),
+                        expected_start = block.end;
+                        match block.arrays {
+                            CacheBlockArrays::KeyValue {
+                                keys: block_keys,
+                                values: block_values,
+                            } => {
+                                keys.push(block_keys);
+                                values.push(block_values);
+                            }
+                            _ => {
+                                return Err(Exception::custom("Qwen prompt-cache kind mismatch"));
+                            }
+                        }
                     }
+                    if expected_start != i64::from(end) {
+                        return Err(Exception::custom(format!(
+                            "Qwen full-attention prompt-cache blocks end at {expected_start}, expected {end}"
+                        )));
+                    }
+                    let keys = concatenate_axis(&keys, -2, stream)?;
+                    let values = concatenate_axis(&values, -2, stream)?;
+                    cache.restore_resident(keys, values, end)?;
                 }
                 LayerCache::LinearAttention(cache) => {
                     cache.conv_state = Some(
@@ -5151,7 +5266,7 @@ impl Model {
         stream: &Stream,
     ) -> Result<QwenMtpStepOutput, Exception> {
         let tokens = runtime_input::text_token_ids(input, stream)?;
-        cache.reset();
+        cache.reset()?;
         self.forward_mtp_tokens(&tokens, cache, stream)
     }
 
@@ -7488,6 +7603,21 @@ mod tests {
         let suffix = Array::from_slice(&[5_u32], &[1, 1]);
         let uninterrupted =
             CausalLm::decode_logits(&mut model, &suffix, &mut uninterrupted_cache, stream).unwrap();
+        let mut paged_cache = super::Cache::new_paged(
+            &args,
+            crate::PagedCacheOptions::new(1, 1 << 20, 1 << 20, 1)
+                .unwrap()
+                .with_full_attention(true),
+            None,
+        )
+        .unwrap();
+        CausalLm::prefill_input_logits(
+            &mut model,
+            runtime_input::ModelInput::new(&parts),
+            &mut paged_cache,
+            stream,
+        )
+        .unwrap();
         let layout = super::prompt_cache_layer_layout(&args).unwrap();
         let descriptor = PromptCacheDescriptor {
             model_family: "qwen_hybrid".into(),
@@ -7506,7 +7636,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let destination = directory.path().join("prompt-cache");
         Model::save_prompt_cache(
-            &cache,
+            &mut paged_cache,
             &destination,
             descriptor.clone(),
             &prefix_ids,
@@ -7515,6 +7645,7 @@ mod tests {
         )
         .unwrap();
         drop(cache);
+        drop(paged_cache);
         let (mut restored, _) =
             Model::load_prompt_cache(&args, &destination, &descriptor, &prefix_ids, stream)
                 .unwrap();

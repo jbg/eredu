@@ -1,9 +1,8 @@
 //! Thinking Machines Lab Inkling multimodal model support.
 //!
 //! The released checkpoint is a multimodal conditional-generation model.  This
-//! module owns the decoder, the native dMel audio and hMLP vision towers, and
-//! the native safetensors loader. Multi-token-prediction draft layers are not
-//! needed for ordinary autoregressive generation and are skipped by the loader.
+//! module owns the decoder, the native dMel audio and hMLP vision towers, the
+//! embedded multi-token predictor, and the native safetensors loader.
 
 #![allow(missing_docs)]
 
@@ -442,6 +441,8 @@ struct ModelArgsSource {
     model_type: String,
     text_config: TextArgsSource,
     #[serde(default)]
+    mtp_config: Option<InklingMtpConfig>,
+    #[serde(default)]
     audio_config: Option<AudioArgs>,
     #[serde(default)]
     vision_config: Option<VisionArgs>,
@@ -458,11 +459,45 @@ struct ModelArgsSource {
 pub struct ModelArgs {
     pub model_type: String,
     pub text_config: TextArgs,
+    /// Checkpoint-embedded multi-token prediction geometry.
+    pub mtp_config: Option<InklingMtpConfig>,
     pub audio_config: Option<AudioArgs>,
     pub vision_config: Option<VisionArgs>,
     pub image_token_id: u32,
     pub audio_token_id: u32,
     pub eos_token_id: Option<u32>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct InklingMtpConfig {
+    #[serde(default)]
+    pub num_nextn_predict_layers: i32,
+    #[serde(default)]
+    pub chain_hidden_post_norm: bool,
+    #[serde(default)]
+    pub local_layer_ids: Vec<usize>,
+    #[serde(default)]
+    pub num_attention_heads: Option<i32>,
+    #[serde(default)]
+    pub num_key_value_heads: Option<i32>,
+    #[serde(default)]
+    pub head_dim: Option<i32>,
+    #[serde(default)]
+    pub swa_num_attention_heads: Option<i32>,
+    #[serde(default)]
+    pub swa_num_key_value_heads: Option<i32>,
+    #[serde(default)]
+    pub swa_head_dim: Option<i32>,
+    #[serde(default)]
+    pub dense_intermediate_size: Option<i32>,
+    #[serde(default)]
+    pub intermediate_size: Option<i32>,
+    #[serde(default)]
+    pub sconv_kernel_size: Option<i32>,
+    #[serde(default)]
+    pub rel_extent: Option<i32>,
+    #[serde(default)]
+    pub d_rel: Option<i32>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -603,6 +638,24 @@ impl KeyValueCache for InklingKvCache {
     }
 }
 
+impl InklingKvCache {
+    fn restore_checkpoint(&mut self, checkpoint: &Self, stream: &Stream) -> Result<(), Exception> {
+        match (self, checkpoint) {
+            (Self::Global(cache), Self::Global(previous))
+            | (Self::Sliding(cache), Self::Sliding(previous)) => {
+                cache.clone_from(previous);
+                Ok(())
+            }
+            (Self::Paged(cache), Self::Paged(previous)) => {
+                cache.restore_checkpoint(previous, stream)
+            }
+            _ => Err(Exception::custom(
+                "Inkling cache checkpoint changed attention residency mode",
+            )),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 /// Incremental state for one Inkling decoder layer.
 pub struct LayerCache {
@@ -652,6 +705,7 @@ impl LayerCache {
 /// Heterogeneous Inkling generation cache.
 pub struct Cache {
     pub layers: Vec<LayerCache>,
+    pub(crate) mtp_layers: Vec<LayerCache>,
 }
 
 impl Cache {
@@ -662,7 +716,55 @@ impl Cache {
                 .iter()
                 .map(|policy| LayerCache::new(policy.attention))
                 .collect(),
+            mtp_layers: Vec::new(),
         }
+    }
+
+    pub(crate) fn with_mtp_policies(mut self, policies: &[AttentionPolicy]) -> Self {
+        self.mtp_layers = policies
+            .iter()
+            .map(|policy| LayerCache::new(*policy))
+            .collect();
+        self
+    }
+
+    pub(crate) fn with_paged_mtp_policies(
+        mut self,
+        policies: &[AttentionPolicy],
+        rank: Option<CacheRankIdentity>,
+    ) -> Result<Self, Exception> {
+        if policies.is_empty() {
+            return Ok(self);
+        }
+        let manager = self
+            .layers
+            .iter()
+            .find_map(|layer| match &layer.kv {
+                InklingKvCache::Paged(cache) => Some(cache.manager().clone()),
+                _ => None,
+            })
+            .ok_or_else(|| {
+                Exception::custom("Inkling paged MTP requires a shared cache manager")
+            })?;
+        let start = self.layers.len();
+        self.mtp_layers = policies
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(index, attention)| {
+                Ok::<LayerCache, Exception>(LayerCache {
+                    kv: InklingKvCache::Paged(PagedKeyValueCache::new_with_layout(
+                        manager.clone(),
+                        start + index,
+                        attention.window().map(|window| window.get() as i32),
+                        0,
+                        rank,
+                    )?),
+                    convolutions: std::array::from_fn(|_| CausalConv1dCache::default()),
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(self)
     }
 
     pub(crate) fn new_paged(
@@ -686,6 +788,7 @@ impl Cache {
             layers: (0..layer_count)
                 .map(|layer| LayerCache::new_paged(args, layer, manager.clone(), rank))
                 .collect::<Result<Vec<_>, _>>()?,
+            mtp_layers: Vec::new(),
         })
     }
 
@@ -704,22 +807,43 @@ impl Cache {
     }
 
     pub(crate) fn reset(&mut self) -> Result<(), Exception> {
-        let paged_manager = self.layers.iter().find_map(|layer| match &layer.kv {
-            InklingKvCache::Paged(cache) => Some(cache.manager().clone()),
-            _ => None,
-        });
+        let paged_manager =
+            self.layers
+                .iter()
+                .chain(&self.mtp_layers)
+                .find_map(|layer| match &layer.kv {
+                    InklingKvCache::Paged(cache) => Some(cache.manager().clone()),
+                    _ => None,
+                });
         if let Some(manager) = paged_manager {
             manager
                 .clear()
                 .map_err(|error| Exception::custom(error.to_string()))?;
         }
-        for layer in &mut self.layers {
+        for layer in self.layers.iter_mut().chain(&mut self.mtp_layers) {
             match &mut layer.kv {
                 InklingKvCache::Global(cache) => cache.clear(),
                 InklingKvCache::Sliding(cache) => cache.clear(),
                 InklingKvCache::Paged(cache) => cache.reset_local_after_manager_clear(),
             }
             layer.convolutions = std::array::from_fn(|_| CausalConv1dCache::default());
+        }
+        Ok(())
+    }
+
+    pub(crate) fn restore_target_checkpoint(
+        &mut self,
+        checkpoint: &Self,
+        stream: &Stream,
+    ) -> Result<(), Exception> {
+        if self.layers.len() != checkpoint.layers.len() {
+            return Err(Exception::custom(
+                "Inkling target cache checkpoint has a different layer count",
+            ));
+        }
+        for (cache, previous) in self.layers.iter_mut().zip(&checkpoint.layers) {
+            cache.kv.restore_checkpoint(&previous.kv, stream)?;
+            cache.convolutions.clone_from(&previous.convolutions);
         }
         Ok(())
     }
@@ -4084,6 +4208,7 @@ pub(crate) fn args_from_gguf_catalog(
     .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
     let args = ModelArgs {
         model_type: "inkling_mm_model".into(),
+        mtp_config: None,
         text_config: TextArgs {
             torch_dtype: None,
             hidden_size,
@@ -4593,6 +4718,7 @@ pub fn model_args_from_config_value(value: &Value) -> Result<ModelArgs, Error> {
     let args = ModelArgs {
         model_type: source.model_type,
         text_config: source.text_config.into_args(layer_schedule),
+        mtp_config: source.mtp_config,
         audio_config: source.audio_config,
         vision_config: source.vision_config,
         image_token_id: source.image_token_id,
@@ -4609,6 +4735,19 @@ pub fn validate_model_config_value(value: &Value) -> Result<(), Error> {
 
 fn validate_args(args: &ModelArgs) -> Result<(), Error> {
     let text = &args.text_config;
+    if let Some(mtp) = &args.mtp_config {
+        if mtp.num_nextn_predict_layers < 0 {
+            return Err(Error::UnsupportedArchitecture(
+                "Inkling MTP layer count cannot be negative".into(),
+            ));
+        }
+        let count = mtp.num_nextn_predict_layers as usize;
+        if let Some(layer) = mtp.local_layer_ids.iter().find(|&&layer| layer >= count) {
+            return Err(Error::UnsupportedArchitecture(format!(
+                "Inkling MTP local layer id {layer} is outside 0..{count}"
+            )));
+        }
+    }
     if args.model_type != "inkling_mm_model" {
         return Err(Error::UnsupportedArchitecture(format!(
             "expected Inkling model_type inkling_mm_model, got {:?}",

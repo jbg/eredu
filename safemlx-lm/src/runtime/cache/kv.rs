@@ -129,6 +129,18 @@ impl CompressedLatentCache {
         Self::default()
     }
 
+    /// Clears local arrays after the shared paging manager has been cleared.
+    pub(crate) fn reset_local_after_manager_clear(&mut self) {
+        if let Some(paged) = self.paged.as_deref_mut() {
+            paged.tail_latent = None;
+            paged.tail_rotary = None;
+            paged.tail_start = 0;
+            paged.offset = 0;
+        } else {
+            *self = Self::default();
+        }
+    }
+
     /// Creates compressed-latent paging under a shared model-wide manager.
     pub fn new_paged(
         manager: CacheResidencyManager,
@@ -245,6 +257,35 @@ impl CompressedLatentCache {
         self.offset = 0;
         self.length = 0;
         self.capacity = 0;
+        Ok(())
+    }
+
+    /// Restores an earlier speculative frontier without leaving paged blocks
+    /// written after that frontier visible to the shared residency manager.
+    pub(crate) fn restore_checkpoint(
+        &mut self,
+        checkpoint: &Self,
+        stream: &Stream,
+    ) -> Result<(), Exception> {
+        match (&mut self.paged, &checkpoint.paged) {
+            (Some(current), Some(previous)) => {
+                if current.global_layer != previous.global_layer
+                    || current.manager.session_id() != previous.manager.session_id()
+                {
+                    return Err(Exception::custom(
+                        "compressed cache checkpoint does not belong to the same paged layer",
+                    ));
+                }
+                current.truncate(previous.offset, stream)?;
+            }
+            (None, None) => {}
+            _ => {
+                return Err(Exception::custom(
+                    "compressed cache checkpoint changed residency mode",
+                ));
+            }
+        }
+        self.clone_from(checkpoint);
         Ok(())
     }
 
@@ -569,6 +610,104 @@ impl PagedCompressedLatentCache {
         }
     }
 
+    fn truncate(&mut self, len: i64, stream: &Stream) -> Result<(), Exception> {
+        if len < 0 || len > self.offset {
+            return Err(Exception::custom(format!(
+                "paged compressed cache truncate length {len} is outside 0..{}",
+                self.offset
+            )));
+        }
+        if len >= self.tail_start {
+            let retained = i32::try_from(len - self.tail_start)
+                .map_err(|_| Exception::custom("paged compressed cache truncate overflow"))?;
+            let candidate_latent = self
+                .tail_latent
+                .as_ref()
+                .map(|latent| latent.try_index_device((.., ..retained, ..), stream))
+                .transpose()?;
+            let candidate_rotary = self
+                .tail_rotary
+                .as_ref()
+                .map(|rotary| rotary.try_index_device((.., ..retained, ..), stream))
+                .transpose()?;
+            let (candidate_latent, candidate_rotary) = if retained == 0 {
+                (None, None)
+            } else {
+                (candidate_latent, candidate_rotary)
+            };
+            let candidate_bytes = candidate_latent
+                .iter()
+                .chain(candidate_rotary.iter())
+                .map(|array| array.nbytes() as u64)
+                .sum();
+            self.manager
+                .set_tail_state(self.global_layer, candidate_bytes, len)
+                .map_err(cache_residency_exception)?;
+            self.tail_latent = candidate_latent;
+            self.tail_rotary = candidate_rotary;
+            self.offset = len;
+            return Ok(());
+        }
+
+        let ids = self
+            .manager
+            .layer_block_ids(
+                self.global_layer,
+                CacheRepresentation::CompressedLatentRotary,
+                0,
+                self.offset,
+                0,
+            )
+            .map_err(cache_residency_exception)?;
+        let crossing = ids.into_iter().find(|id| id.start < len && id.end > len);
+        let mut crossing_lease = None;
+        let replacement = if let Some(id) = crossing {
+            let lease = self
+                .manager
+                .lease_block(&id, stream)
+                .map_err(cache_residency_exception)?;
+            let retained = i32::try_from(len - id.start)
+                .map_err(|_| Exception::custom("paged compressed cache truncate overflow"))?;
+            let (latent, rotary_key) = match lease.arrays() {
+                CacheBlockArrays::CompressedLatentRotary { latent, rotary_key } => (
+                    latent.try_index_device((.., ..retained, ..), stream)?,
+                    rotary_key.try_index_device((.., ..retained, ..), stream)?,
+                ),
+                _ => {
+                    return Err(Exception::custom(
+                        "paged compressed cache found an incompatible block representation",
+                    ));
+                }
+            };
+            safemlx::transforms::eval([&latent, &rotary_key])?;
+            stream.synchronize()?;
+            let latent = latent.deep_clone()?;
+            let rotary_key = rotary_key.deep_clone()?;
+            crossing_lease = Some(lease);
+            Some((
+                id,
+                CacheBlockArrays::CompressedLatentRotary { latent, rotary_key },
+            ))
+        } else {
+            None
+        };
+        self.manager
+            .truncate_layer_transaction(
+                self.global_layer,
+                CacheRepresentation::CompressedLatentRotary,
+                len,
+                replacement,
+                0,
+            )
+            .map_err(cache_residency_exception)?;
+        drop(crossing_lease);
+        self.tail_latent = None;
+        self.tail_rotary = None;
+        self.offset = len;
+        self.tail_start = len;
+        Ok(())
+    }
+
     fn seal_tail(&mut self) -> Result<(), Exception> {
         let Some(latent) = self.tail_latent.take() else {
             return Ok(());
@@ -727,6 +866,169 @@ pub struct PagedKeyValueCache {
     tail_values: Option<Array>,
     tail_start: i64,
     offset: i64,
+}
+
+/// A live key/value cache whose residency is selected independently from the
+/// model's parameter residency.
+///
+/// Hybrid architecture caches use this value beside their fixed-size
+/// convolution or recurrent state. Call sites continue to consume the shared
+/// [`KeyValueCache`] contract and therefore do not need architecture-specific
+/// paged-attention dispatch.
+#[derive(Debug, Clone)]
+pub enum LiveKeyValueCache {
+    /// Chunked key/value arrays retained on the execution device.
+    Resident(ConcatKeyValueCache),
+    /// Block-addressable key/value arrays under explicit finite budgets.
+    Paged(PagedKeyValueCache),
+}
+
+impl LiveKeyValueCache {
+    /// Wraps an architecture-selected resident cache growth policy.
+    pub const fn resident(cache: ConcatKeyValueCache) -> Self {
+        Self::Resident(cache)
+    }
+
+    /// Creates a block-addressable cache with exact global-layer and rank
+    /// identity.
+    pub fn paged(
+        manager: CacheResidencyManager,
+        global_layer: usize,
+        sliding_window: Option<i32>,
+        prefix_tokens: i32,
+        rank: Option<CacheRankIdentity>,
+    ) -> Result<Self, Exception> {
+        PagedKeyValueCache::new_with_layout(
+            manager,
+            global_layer,
+            sliding_window,
+            prefix_tokens,
+            rank,
+        )
+        .map(Self::Paged)
+    }
+
+    /// Returns a current paging report, or `None` for resident state.
+    pub fn residency_report(&self) -> Result<Option<CacheResidencyReport>, Exception> {
+        match self {
+            Self::Resident(_) => Ok(None),
+            Self::Paged(cache) => cache.report().map(Some),
+        }
+    }
+
+    /// Snapshots resident state. Paged state is persisted through its manager
+    /// and deliberately has no monolithic array snapshot.
+    pub fn snapshot_arrays(&self, stream: &Stream) -> Result<Option<(Array, Array)>, Exception> {
+        match self {
+            Self::Resident(cache) => cache.snapshot_arrays(stream),
+            Self::Paged(_) => Ok(None),
+        }
+    }
+
+    /// Seals a paged mutable tail before persistence. Resident state requires
+    /// no preparation.
+    pub fn finalize(&mut self) -> Result<(), Exception> {
+        match self {
+            Self::Resident(_) => Ok(()),
+            Self::Paged(cache) => cache.finalize(),
+        }
+    }
+
+    /// Clears this layer after a model-wide paging manager clear.
+    pub fn reset_local_after_manager_clear(&mut self) {
+        match self {
+            Self::Resident(cache) => cache.clear(),
+            Self::Paged(cache) => cache.reset_local_after_manager_clear(),
+        }
+    }
+
+    /// Returns the paging manager when paging is active.
+    pub const fn manager(&self) -> Option<&CacheResidencyManager> {
+        match self {
+            Self::Resident(_) => None,
+            Self::Paged(cache) => Some(cache.manager()),
+        }
+    }
+
+    /// Restores a contiguous snapshot into resident state.
+    pub fn restore_resident(
+        &mut self,
+        keys: Array,
+        values: Array,
+        offset: i32,
+    ) -> Result<(), Exception> {
+        match self {
+            Self::Resident(cache) => cache.restore_resident(keys, values, offset),
+            Self::Paged(_) => Err(Exception::custom(
+                "cannot restore a monolithic snapshot into a paged live cache",
+            )),
+        }
+    }
+}
+
+impl KeyValueCache for LiveKeyValueCache {
+    fn offset(&self) -> i32 {
+        match self {
+            Self::Resident(cache) => cache.offset(),
+            Self::Paged(cache) => cache.offset(),
+        }
+    }
+
+    fn max_size(&self) -> Option<i32> {
+        match self {
+            Self::Resident(cache) => cache.max_size(),
+            Self::Paged(cache) => cache.max_size(),
+        }
+    }
+
+    fn retained_arrays(&self) -> Vec<&Array> {
+        match self {
+            Self::Resident(cache) => cache.retained_arrays(),
+            Self::Paged(cache) => cache.retained_arrays(),
+        }
+    }
+
+    fn is_paged(&self) -> bool {
+        matches!(self, Self::Paged(_))
+    }
+
+    fn paged_attention(
+        &mut self,
+        queries: &Array,
+        scale: f32,
+        mask: Option<&Array>,
+        sinks: Option<&Array>,
+        stream: &Stream,
+    ) -> Result<Option<Array>, Exception> {
+        match self {
+            Self::Resident(_) => Ok(None),
+            Self::Paged(cache) => cache.paged_attention(queries, scale, mask, sinks, stream),
+        }
+    }
+
+    fn update_for_attention(
+        &mut self,
+        keys: Array,
+        values: Array,
+        stream: &Stream,
+    ) -> Result<(Array, Array), Exception> {
+        match self {
+            Self::Resident(cache) => cache.update_for_attention(keys, values, stream),
+            Self::Paged(cache) => cache.update_for_attention(keys, values, stream),
+        }
+    }
+
+    fn update_and_fetch(
+        &mut self,
+        keys: Array,
+        values: Array,
+        stream: &Stream,
+    ) -> Result<(Array, Array), Exception> {
+        match self {
+            Self::Resident(cache) => cache.update_and_fetch(keys, values, stream),
+            Self::Paged(cache) => cache.update_and_fetch(keys, values, stream),
+        }
+    }
 }
 
 impl PagedKeyValueCache {
@@ -979,6 +1281,25 @@ impl PagedKeyValueCache {
         self.tail_values = None;
         self.offset = len;
         self.tail_start = len;
+        Ok(())
+    }
+
+    /// Restores an earlier speculative frontier and atomically removes blocks
+    /// sealed after it.
+    pub(crate) fn restore_checkpoint(
+        &mut self,
+        checkpoint: &Self,
+        stream: &Stream,
+    ) -> Result<(), Exception> {
+        if self.global_layer != checkpoint.global_layer
+            || self.manager.session_id() != checkpoint.manager.session_id()
+        {
+            return Err(Exception::custom(
+                "key/value cache checkpoint does not belong to the same paged layer",
+            ));
+        }
+        self.truncate(checkpoint.offset, stream)?;
+        self.clone_from(checkpoint);
         Ok(())
     }
 

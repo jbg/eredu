@@ -9,9 +9,10 @@ use std::{
 
 use safemlx::{
     error::Exception,
+    macros::ModuleParameters,
     module::{Module, ModuleParameters, Param},
     nn,
-    ops::{indexing::TryIndexOp, GgufCheckpoint, GgufMetadataValue},
+    ops::{concatenate_axis, indexing::TryIndexOp, GgufCheckpoint, GgufMetadataValue},
     quantization::MaybeQuantized,
     Array, Dtype, Stream,
 };
@@ -72,6 +73,189 @@ use crate::{
 const EMBEDDING_UNIT: &str = "nemotron_h.static.embedding";
 const NORM_UNIT: &str = "nemotron_h.static.norm";
 const HEAD_UNIT: &str = "nemotron_h.static.output";
+const MTP_UNIT: &str = "nemotron_h.static.mtp";
+
+#[derive(Debug, Clone, ModuleParameters)]
+struct NemotronMtpModule {
+    #[param]
+    enorm: Vec<nn::RmsNorm>,
+    #[param]
+    hnorm: Vec<nn::RmsNorm>,
+    #[param]
+    eh_proj: Vec<MaybeQuantized<nn::Linear>>,
+    #[param]
+    blocks: Vec<TransformerBlock>,
+    #[param]
+    final_norms: Vec<nn::RmsNorm>,
+    pattern_len: usize,
+    steps: usize,
+    policies: Vec<LayerPolicy>,
+}
+
+impl NemotronMtpModule {
+    fn new(args: &ModelArgs, stream: &Stream) -> Result<Option<Self>, Error> {
+        let policies = args.mtp_policies()?;
+        if policies.is_empty() {
+            return Ok(None);
+        }
+        let steps = usize::try_from(args.num_nextn_predict_layers).map_err(|_| {
+            Error::UnsupportedArchitecture("Nemotron-H MTP layer count is negative".into())
+        })?;
+        let pattern_len = policies.len() / steps;
+        let mut block_args = args.clone();
+        let mut complete = args.layer_schedule.iter().copied().collect::<Vec<_>>();
+        complete.extend(policies.iter().copied());
+        block_args.layer_schedule = crate::LayerSchedule::new(complete.len(), complete)
+            .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+        let blocks = policies
+            .iter()
+            .enumerate()
+            .map(|(index, _)| {
+                TransformerBlock::new(&block_args, args.num_hidden_layers as usize + index, stream)
+            })
+            .collect::<Result<Vec<_>, Error>>()?;
+        let final_norms = (0..steps)
+            .map(|_| {
+                nn::RmsNorm::unloaded(
+                    args.hidden_size,
+                    args.layer_norm_epsilon,
+                    Dtype::Float32,
+                    stream,
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Some(Self {
+            enorm: (0..steps)
+                .map(|_| {
+                    nn::RmsNorm::unloaded(
+                        args.hidden_size,
+                        args.layer_norm_epsilon,
+                        Dtype::Float32,
+                        stream,
+                    )
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+            hnorm: (0..steps)
+                .map(|_| {
+                    nn::RmsNorm::unloaded(
+                        args.hidden_size,
+                        args.layer_norm_epsilon,
+                        Dtype::Float32,
+                        stream,
+                    )
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+            eh_proj: (0..steps)
+                .map(|step| {
+                    common::linear::unloaded_maybe_quantized_linear(
+                        args.hidden_size * 2,
+                        args.hidden_size,
+                        false,
+                        args.weight_quantization_for(&format!(
+                            "mtp.layers.{}.eh_proj.weight",
+                            step * pattern_len
+                        )),
+                        stream,
+                    )
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+            blocks,
+            final_norms,
+            pattern_len,
+            steps,
+            policies,
+        }))
+    }
+
+    fn len(&self) -> usize {
+        self.steps
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn forward_step(
+        &mut self,
+        hidden: &Array,
+        embeddings: &Array,
+        depth: usize,
+        cache: &mut [LayerCache],
+        expert_cache: Option<&ExpertCache>,
+        args: &ModelArgs,
+        stream: &Stream,
+    ) -> Result<Array, Exception> {
+        if cache.len() != self.blocks.len() || depth >= self.steps {
+            return Err(Exception::custom(
+                "Nemotron-H MTP cache does not match prediction geometry",
+            ));
+        }
+        let embeddings = self.enorm[depth].forward(embeddings, stream)?;
+        let hidden = self.hnorm[depth].forward(hidden, stream)?;
+        let fused = concatenate_axis(&[&embeddings, &hidden], -1, stream)?;
+        let mut hidden = self.eh_proj[depth].forward(&fused, stream)?;
+        let start = depth * self.pattern_len;
+        let end = start + self.pattern_len;
+        let mask = if hidden.dim(1) > 1 {
+            let offset = cache[start..end]
+                .iter()
+                .find_map(LayerCache::offset)
+                .unwrap_or(0);
+            let offset_cache = vec![Some(OffsetOnlyCache(offset))];
+            match create_attention_mask(&hidden, &offset_cache, Some(true), stream)? {
+                Some(AttentionMask::Array(mask)) => Some(mask),
+                Some(AttentionMask::Causal) => {
+                    return Err(Exception::custom(
+                        "Nemotron-H MTP requires an array causal mask",
+                    ))
+                }
+                None => None,
+            }
+        } else {
+            None
+        };
+        for (relative, (block, layer_cache)) in self.blocks[start..end]
+            .iter_mut()
+            .zip(&mut cache[start..end])
+            .enumerate()
+        {
+            let index = start + relative;
+            let input = BlockInput {
+                x: &hidden,
+                mask: mask.as_ref(),
+                cache: Some(layer_cache),
+            };
+            hidden = if self.policies[index] == LayerPolicy::SparseMoe {
+                if let Some(expert_cache) = expert_cache {
+                    let global = args.num_hidden_layers as usize + index;
+                    let pass = if hidden.dim(1) > 1 {
+                        ExpertPass::Prefill
+                    } else {
+                        ExpertPass::Decode
+                    };
+                    block.forward_sparse_experts(
+                        input,
+                        stream,
+                        |flat, indices, weights, stream| {
+                            execute_cached_nemotron_experts(
+                                args,
+                                expert_cache,
+                                global,
+                                flat,
+                                indices,
+                                weights,
+                                pass,
+                                stream,
+                            )
+                        },
+                    )?
+                } else {
+                    block.forward(input, stream)?
+                }
+            } else {
+                block.forward(input, stream)?
+            };
+        }
+        self.final_norms[depth].forward(&hidden, stream)
+    }
+}
 
 fn register_nemotron_layer_parallel_plan(
     planner: &mut ParallelPlanBuilder,
@@ -358,15 +542,88 @@ impl NemotronHLayerwiseModel {
         self.execution.adapter().new_cache()
     }
 
+    pub(crate) fn mtp_len(&self) -> usize {
+        self.execution
+            .adapter()
+            .mtp
+            .as_ref()
+            .map_or(0, NemotronMtpModule::len)
+    }
+
+    fn forward_mtp_target(
+        &mut self,
+        tokens: &Array,
+        cache: &mut Cache,
+        stream: &Stream,
+    ) -> Result<crate::runtime::generation::embedded_mtp::EmbeddedMtpOutput, Exception> {
+        let (logits, context) = self
+            .execution
+            .forward_with_context_hook(tokens, cache, stream, |_, _, _| Ok(()))
+            .map_err(|error| Exception::custom(error.to_string()))?;
+        let hidden = context.draft_hidden.ok_or_else(|| {
+            Exception::custom("Nemotron-H layerwise pass did not retain MTP hidden state")
+        })?;
+        Ok(
+            crate::runtime::generation::embedded_mtp::EmbeddedMtpOutput {
+                logits,
+                hidden,
+                tokens: tokens.clone(),
+            },
+        )
+    }
+
+    fn forward_mtp_draft(
+        &mut self,
+        hidden: &Array,
+        tokens: &Array,
+        depth: usize,
+        cache: &mut [LayerCache],
+        stream: &Stream,
+    ) -> Result<crate::runtime::generation::embedded_mtp::EmbeddedMtpOutput, Exception> {
+        let adapter = self.execution.adapter_mut();
+        let embeddings = adapter.embeddings.forward(tokens, stream)?;
+        let expert_cache = adapter.expert_cache.as_ref();
+        let args = &adapter.args;
+        let hidden = adapter
+            .mtp
+            .as_mut()
+            .ok_or_else(|| Exception::custom("Nemotron-H checkpoint does not contain MTP layers"))?
+            .forward_step(
+                hidden,
+                &embeddings,
+                depth,
+                cache,
+                expert_cache,
+                args,
+                stream,
+            )?;
+        let logits = project_logits_maybe_quantized(
+            &mut adapter.lm_head,
+            &mut adapter.embeddings,
+            &hidden,
+            stream,
+        )?;
+        Ok(
+            crate::runtime::generation::embedded_mtp::EmbeddedMtpOutput {
+                logits,
+                hidden,
+                tokens: tokens.clone(),
+            },
+        )
+    }
+
     /// Creates resident state or pages attention blocks while bounded Mamba
     /// convolution and recurrent tensors remain device resident.
     pub fn new_cache_with_options(&self, policy: CacheResidencyPolicy) -> Result<Cache, Error> {
-        Cache::new_with_options_and_rank(
-            self.args(),
-            policy,
-            self.execution.prompt_cache_rank_identity(),
-        )
-        .map_err(Into::into)
+        let rank = self.execution.prompt_cache_rank_identity();
+        let cache = Cache::new_with_options_and_rank(self.args(), policy.clone(), rank)?;
+        match (&self.execution.adapter().mtp, policy) {
+            (Some(mtp), CacheResidencyPolicy::Device) => Ok(cache.with_mtp_policies(&mtp.policies)),
+            (Some(mtp), CacheResidencyPolicy::Paged(_)) => cache
+                .with_paged_mtp_policies(&mtp.policies, rank)
+                .map_err(Into::into),
+            (None, _) => Ok(cache),
+        }
     }
 
     /// Returns aggregate live attention paging observations, if enabled.
@@ -568,6 +825,90 @@ impl CausalLm<Cache> for NemotronHLayerwiseModel {
         self.forward(input_tokens, cache, stream)
             .map_err(|error| Exception::custom(error.to_string()))?
             .try_index_device((.., -1, ..), stream)
+    }
+}
+
+impl crate::runtime::generation::embedded_mtp::EmbeddedMtpTarget for NemotronHLayerwiseModel {
+    type Cache = Cache;
+    type DraftCache = Vec<LayerCache>;
+
+    fn prefill_target(
+        &mut self,
+        input: input::ModelInput<'_>,
+        cache: &mut Cache,
+        stream: &Stream,
+    ) -> Result<crate::runtime::generation::embedded_mtp::EmbeddedMtpOutput, Exception> {
+        let tokens = input::text_token_ids(input, stream)?;
+        cache.reset()?;
+        self.forward_mtp_target(&tokens, cache, stream)
+    }
+    fn verify_target(
+        &mut self,
+        tokens: &Array,
+        cache: &mut Cache,
+        stream: &Stream,
+    ) -> Result<crate::runtime::generation::embedded_mtp::EmbeddedMtpOutput, Exception> {
+        self.forward_mtp_target(tokens, cache, stream)
+    }
+    fn prefill_draft_cache(
+        &mut self,
+        output: &crate::runtime::generation::embedded_mtp::EmbeddedMtpOutput,
+        tokens: &Array,
+        cache: &mut Cache,
+        stream: &Stream,
+    ) -> Result<(), Exception> {
+        let sequence = tokens.dim(1);
+        if sequence <= 1 {
+            return Ok(());
+        }
+        let hidden = output
+            .hidden
+            .try_index_device((.., ..sequence - 1, ..), stream)?;
+        let next = tokens.try_index_device((.., 1..), stream)?;
+        for depth in 0..self.mtp_len() {
+            let _ = self.forward_mtp_draft(&hidden, &next, depth, &mut cache.mtp_layers, stream)?;
+        }
+        Ok(())
+    }
+    fn draft_cache(cache: &Cache) -> Self::DraftCache {
+        cache.mtp_layers.clone()
+    }
+    fn commit_draft_cache(cache: &mut Cache, draft: &Self::DraftCache) {
+        cache.mtp_layers.clone_from(draft);
+    }
+    fn restore_target_checkpoint(
+        cache: &mut Cache,
+        checkpoint: &Cache,
+        stream: &Stream,
+    ) -> Result<(), Exception> {
+        cache.restore_target_checkpoint(checkpoint, stream)
+    }
+    fn draft_logits(
+        &mut self,
+        hidden: &Array,
+        last_token: u32,
+        draft_index: usize,
+        cache: &mut Self::DraftCache,
+        stream: &Stream,
+    ) -> Result<(Array, Array), Exception> {
+        let token = Array::from_slice(&[last_token], &[1, 1]);
+        let output = self.forward_mtp_draft(hidden, &token, draft_index, cache, stream)?;
+        Ok((output.logits, output.hidden))
+    }
+    fn advance_draft_cache(
+        &mut self,
+        hidden: &Array,
+        tokens: &Array,
+        cache: &mut Self::DraftCache,
+        stream: &Stream,
+    ) -> Result<(), Exception> {
+        for depth in 0..self.mtp_len() {
+            let _ = self.forward_mtp_draft(hidden, tokens, depth, cache, stream)?;
+        }
+        Ok(())
+    }
+    fn max_draft_tokens(&self) -> usize {
+        self.mtp_len()
     }
 }
 
@@ -928,6 +1269,7 @@ pub struct NemotronHLayerwiseAdapter {
     embeddings: MaybeQuantized<nn::Embedding>,
     norm: nn::RmsNorm,
     lm_head: Option<MaybeQuantized<nn::Linear>>,
+    mtp: Option<NemotronMtpModule>,
     parallel_embedding: Option<VocabParallelEmbedding>,
     parallel_lm_head: Option<VocabParallelLmHead>,
     parallel_geometry: Option<Vec<resident::ParallelLayerGeometry>>,
@@ -939,6 +1281,7 @@ impl NemotronHLayerwiseAdapter {
     /// Creates metadata-only pinned modules.
     pub fn new(args: ModelArgs, stream: &Stream) -> Result<Self, Error> {
         resident::validate_model_args(&args)?;
+        let mtp = NemotronMtpModule::new(&args, stream)?;
         let embeddings = common::linear::unloaded_maybe_quantized_embedding(
             args.vocab_size,
             args.hidden_size,
@@ -962,6 +1305,7 @@ impl NemotronHLayerwiseAdapter {
             embeddings,
             norm,
             lm_head,
+            mtp,
             parallel_embedding: None,
             parallel_lm_head: None,
             parallel_geometry: None,
@@ -999,7 +1343,11 @@ impl NemotronHLayerwiseAdapter {
     }
 
     fn new_cache(&self) -> Cache {
-        Cache::new(&self.args)
+        let cache = Cache::new(&self.args);
+        match &self.mtp {
+            Some(mtp) => cache.with_mtp_policies(&mtp.policies),
+            None => cache,
+        }
     }
 
     fn recipes_for_module(
@@ -1013,10 +1361,26 @@ impl NemotronHLayerwiseAdapter {
         let keys = store.keys();
         let mut recipes = BTreeMap::new();
 
-        if let Some(index) = layer_index
+        let mtp_index = prefix
+            .strip_prefix("mtp.layers.")
+            .and_then(|tail| tail.split('.').next())
+            .and_then(|index| index.parse::<usize>().ok());
+        let sparse_prefix = if let Some(index) = layer_index
             .filter(|index| self.args.layer_schedule.get(*index) == Some(&LayerPolicy::SparseMoe))
         {
-            let packed_prefix = format!("model.layers.{index}.moe.experts");
+            Some(format!("model.layers.{index}.moe.experts"))
+        } else {
+            mtp_index
+                .filter(|index| {
+                    self.args
+                        .mtp_policies()
+                        .ok()
+                        .and_then(|p| p.get(*index).copied())
+                        == Some(LayerPolicy::SparseMoe)
+                })
+                .map(|index| format!("mtp.layers.{index}.moe.experts"))
+        };
+        if let Some(packed_prefix) = sparse_prefix {
             let complete_up = format!("{packed_prefix}.up_proj");
             let packed_up = format!("{complete_up}.weight");
             if !keys.contains(&complete_up)
@@ -1140,6 +1504,133 @@ impl NemotronHLayerwiseAdapter {
         }
         Ok(recipes)
     }
+
+    fn mtp_recipes(
+        &self,
+        store: &dyn WeightStore,
+    ) -> Result<BTreeMap<String, DerivedWeightRecipe>, Error> {
+        let mtp = self.mtp.as_ref().ok_or_else(|| {
+            Error::UnsupportedArchitecture("Nemotron-H model has no MTP module".into())
+        })?;
+        let normalized = normalized_checkpoint_keys(store, &self.args)?;
+        let mut recipes = BTreeMap::new();
+        for (index, block) in mtp.blocks.iter().enumerate() {
+            for (name, recipe) in
+                self.recipes_for_module(block, &format!("mtp.layers.{index}"), store, None)?
+            {
+                recipes.insert(format!("blocks.{index}.{name}"), recipe);
+            }
+        }
+        for step in 0..mtp.steps {
+            let start = step * mtp.pattern_len;
+            let end = start + mtp.pattern_len - 1;
+            for (local, remote) in [
+                (
+                    format!("enorm.{step}.weight"),
+                    format!("mtp.layers.{start}.enorm.weight"),
+                ),
+                (
+                    format!("hnorm.{step}.weight"),
+                    format!("mtp.layers.{start}.hnorm.weight"),
+                ),
+                (
+                    format!("eh_proj.{step}.weight"),
+                    format!("mtp.layers.{start}.eh_proj.weight"),
+                ),
+                (
+                    format!("final_norms.{step}.weight"),
+                    format!("mtp.layers.{end}.final_layernorm.weight"),
+                ),
+            ] {
+                let raw = normalized.get(&remote).ok_or_else(|| {
+                    Error::UnsupportedArchitecture(format!(
+                        "Nemotron-H MTP checkpoint is missing {remote}"
+                    ))
+                })?;
+                recipes.insert(
+                    local,
+                    DerivedWeightRecipe::source(raw.clone(), TensorSelection::Full),
+                );
+            }
+        }
+        Ok(recipes)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_cached_nemotron_experts(
+    args: &ModelArgs,
+    expert_cache: &ExpertCache,
+    layer: usize,
+    flat: &Array,
+    indices: &Array,
+    weights: &Array,
+    pass: ExpertPass,
+    stream: &Stream,
+) -> Result<Array, Exception> {
+    expert_cache
+        .execute_routes_bounded(
+            ExpertRouteBatch::new(layer, flat, indices, weights, pass),
+            stream,
+            |flat, acquired, weights, stream| {
+                let started = Instant::now();
+                let prefix = if layer < args.num_hidden_layers as usize {
+                    format!("model.layers.{layer}.moe.experts")
+                } else {
+                    format!(
+                        "mtp.layers.{}.moe.experts",
+                        layer - args.num_hidden_layers as usize
+                    )
+                };
+                let mut bank = Experts::new(
+                    acquired.identities().len() as i32,
+                    args.hidden_size,
+                    args.moe_intermediate_size,
+                    [
+                        args.weight_quantization_for(&format!("{prefix}.up_proj")),
+                        args.weight_quantization_for(&format!("{prefix}.down_proj")),
+                    ],
+                    stream,
+                )?;
+                bank.up_proj = Param::new(
+                    acquired
+                        .compact_binding("up_proj", stream)
+                        .map_err(|error| Exception::custom(error.to_string()))?,
+                );
+                bank.up_proj_scales = Param::new(
+                    acquired
+                        .optional_compact_binding("up_proj_scales", stream)
+                        .map_err(|error| Exception::custom(error.to_string()))?,
+                );
+                bank.up_proj_biases = Param::new(
+                    acquired
+                        .optional_compact_binding("up_proj_biases", stream)
+                        .map_err(|error| Exception::custom(error.to_string()))?,
+                );
+                bank.down_proj = Param::new(
+                    acquired
+                        .compact_binding("down_proj", stream)
+                        .map_err(|error| Exception::custom(error.to_string()))?,
+                );
+                bank.down_proj_scales = Param::new(
+                    acquired
+                        .optional_compact_binding("down_proj_scales", stream)
+                        .map_err(|error| Exception::custom(error.to_string()))?,
+                );
+                bank.down_proj_biases = Param::new(
+                    acquired
+                        .optional_compact_binding("down_proj_biases", stream)
+                        .map_err(|error| Exception::custom(error.to_string()))?,
+                );
+                expert_cache.record_compact_bank(
+                    pass,
+                    acquired.scratch_bytes(),
+                    started.elapsed(),
+                )?;
+                Ok(bank.forward(flat, acquired.compact_routes(), weights, stream)?)
+            },
+        )
+        .map_err(|error| Exception::custom(error.to_string()))
 }
 
 fn normalized_checkpoint_keys(
@@ -1147,7 +1638,35 @@ fn normalized_checkpoint_keys(
     args: &ModelArgs,
 ) -> Result<BTreeMap<String, String>, Error> {
     let mut normalized = BTreeMap::new();
+    let mtp_policies = args.mtp_policies()?;
     for raw in store.keys() {
+        if let Some(rest) = raw
+            .strip_prefix("mtp.layers.")
+            .or_else(|| raw.strip_prefix("model.mtp.layers."))
+        {
+            if let Some((index, suffix)) = rest.split_once('.') {
+                let index = index.parse::<usize>().map_err(|error| {
+                    Error::UnsupportedArchitecture(format!(
+                        "invalid Nemotron-H MTP layer index in {raw:?}: {error}"
+                    ))
+                })?;
+                let policy = mtp_policies.get(index).ok_or_else(|| {
+                    Error::UnsupportedArchitecture(format!(
+                        "Nemotron-H checkpoint MTP layer {index} is outside configured geometry"
+                    ))
+                })?;
+                let field = match policy {
+                    LayerPolicy::SelfAttention(_) => "attention",
+                    LayerPolicy::SparseMoe => "moe",
+                    _ => unreachable!("validated Nemotron-H MTP policies"),
+                };
+                let suffix = suffix
+                    .strip_prefix("mixer.")
+                    .map_or_else(|| suffix.to_string(), |suffix| format!("{field}.{suffix}"));
+                normalized.insert(format!("mtp.layers.{index}.{suffix}"), raw);
+                continue;
+            }
+        }
         let rewritten = resident::rewrite_nemotron_h_weight_key(&raw, args)?;
         let runtime = if let Some(rest) = rewritten.strip_prefix("model.backbone.") {
             format!("model.{rest}")
@@ -1179,6 +1698,7 @@ fn source_for_normalized(
 /// Per-forward causal mask shared by attention blocks.
 pub struct NemotronHForwardContext {
     mask: Option<Array>,
+    draft_hidden: Option<Array>,
 }
 
 struct OffsetOnlyCache(i32);
@@ -1354,11 +1874,19 @@ impl ArchitectureAdapter for NemotronHLayerwiseAdapter {
                 )?);
             }
         }
+        if select(MTP_UNIT) {
+            if let Some(mtp) = &self.mtp {
+                units.push(StaticUnitBindings::new(
+                    MTP_UNIT,
+                    build_module_bindings_with_recipes(mtp, "", store, self.mtp_recipes(store)?)?,
+                )?);
+            }
+        }
         Ok(units)
     }
 
     fn populate_static(&mut self, leases: &[ResidentUnitLease]) -> Result<(), Error> {
-        let expected = if self.lm_head.is_some() { 3 } else { 2 };
+        let expected = 2 + usize::from(self.lm_head.is_some()) + usize::from(self.mtp.is_some());
         if leases.len() != expected {
             return Err(Error::UnsupportedArchitecture(format!(
                 "Nemotron-H adapter received {} static leases, expected {expected}",
@@ -1371,10 +1899,16 @@ impl ArchitectureAdapter for NemotronHLayerwiseAdapter {
             populate_module_from_lease(&mut self.embeddings, &leases[0])?;
         }
         populate_module_from_lease(&mut self.norm, &leases[1])?;
+        let mut index = 2;
         if let Some(v) = &mut self.parallel_lm_head {
-            populate_module_from_lease(v.inner_mut(), &leases[2])?;
+            populate_module_from_lease(v.inner_mut(), &leases[index])?;
+            index += 1;
         } else if let Some(head) = &mut self.lm_head {
-            populate_module_from_lease(head, &leases[2])?;
+            populate_module_from_lease(head, &leases[index])?;
+            index += 1;
+        }
+        if let Some(mtp) = &mut self.mtp {
+            populate_module_from_lease(mtp, &leases[index])?;
         }
         Ok(())
     }
@@ -1439,7 +1973,10 @@ impl ArchitectureAdapter for NemotronHLayerwiseAdapter {
         };
         Ok(LayerwiseForwardState {
             hidden,
-            context: NemotronHForwardContext { mask },
+            context: NemotronHForwardContext {
+                mask,
+                draft_hidden: None,
+            },
         })
     }
     fn begin_forward_with_execution<'a>(
@@ -1468,7 +2005,10 @@ impl ArchitectureAdapter for NemotronHLayerwiseAdapter {
         };
         Ok(LayerwiseForwardState {
             hidden,
-            context: NemotronHForwardContext { mask },
+            context: NemotronHForwardContext {
+                mask,
+                draft_hidden: None,
+            },
         })
     }
 
@@ -1882,70 +2422,16 @@ impl ArchitectureAdapter for NemotronHLayerwiseAdapter {
                 },
                 stream,
                 |flat, indices, weights, stream| {
-                    expert_cache
-                        .execute_routes_bounded(
-                            ExpertRouteBatch::new(index, flat, indices, weights, pass),
-                            stream,
-                            |flat, acquired, weights, stream| {
-                                let started = Instant::now();
-                                let prefix = format!("model.layers.{index}.moe.experts");
-                                let mut bank = Experts::new(
-                                    acquired.identities().len() as i32,
-                                    self.args.hidden_size,
-                                    self.args.moe_intermediate_size,
-                                    [
-                                        self.args
-                                            .weight_quantization_for(&format!("{prefix}.up_proj")),
-                                        self.args.weight_quantization_for(&format!(
-                                            "{prefix}.down_proj"
-                                        )),
-                                    ],
-                                    stream,
-                                )?;
-                                bank.up_proj = Param::new(
-                                    acquired
-                                        .compact_binding("up_proj", stream)
-                                        .map_err(|error| Exception::custom(error.to_string()))?,
-                                );
-                                bank.up_proj_scales = Param::new(
-                                    acquired
-                                        .optional_compact_binding("up_proj_scales", stream)
-                                        .map_err(|error| Exception::custom(error.to_string()))?,
-                                );
-                                bank.up_proj_biases = Param::new(
-                                    acquired
-                                        .optional_compact_binding("up_proj_biases", stream)
-                                        .map_err(|error| Exception::custom(error.to_string()))?,
-                                );
-                                bank.down_proj = Param::new(
-                                    acquired
-                                        .compact_binding("down_proj", stream)
-                                        .map_err(|error| Exception::custom(error.to_string()))?,
-                                );
-                                bank.down_proj_scales = Param::new(
-                                    acquired
-                                        .optional_compact_binding("down_proj_scales", stream)
-                                        .map_err(|error| Exception::custom(error.to_string()))?,
-                                );
-                                bank.down_proj_biases = Param::new(
-                                    acquired
-                                        .optional_compact_binding("down_proj_biases", stream)
-                                        .map_err(|error| Exception::custom(error.to_string()))?,
-                                );
-                                expert_cache.record_compact_bank(
-                                    pass,
-                                    acquired.scratch_bytes(),
-                                    started.elapsed(),
-                                )?;
-                                Ok(bank.forward(
-                                    flat,
-                                    acquired.compact_routes(),
-                                    weights,
-                                    stream,
-                                )?)
-                            },
-                        )
-                        .map_err(|error| Exception::custom(error.to_string()))
+                    execute_cached_nemotron_experts(
+                        &self.args,
+                        expert_cache,
+                        index,
+                        flat,
+                        indices,
+                        weights,
+                        pass,
+                        stream,
+                    )
                 },
             )?);
         }
@@ -2000,6 +2486,19 @@ impl ArchitectureAdapter for NemotronHLayerwiseAdapter {
         cache.layers[index].retained_arrays()
     }
 
+    fn complete_execution_group(
+        &mut self,
+        group: usize,
+        hidden: &Array,
+        _cache: &mut Self::Cache,
+        context: &mut Self::ForwardContext,
+        _stream: &Stream,
+    ) -> Result<Array, Error> {
+        self.layer_count(group)?;
+        context.draft_hidden = Some(hidden.clone());
+        Ok(hidden.clone())
+    }
+
     fn finish(
         &mut self,
         hidden: &Array,
@@ -2038,7 +2537,23 @@ pub(crate) fn nemotron_h_expert_catalog(
     args: &ModelArgs,
     store: &dyn WeightStore,
 ) -> Result<Vec<ExpertCatalogEntry>, Error> {
-    nemotron_h_expert_catalog_for_layers(args, store, 0..args.num_hidden_layers as usize)
+    let mut entries =
+        nemotron_h_expert_catalog_for_layers(args, store, 0..args.num_hidden_layers as usize)?;
+    let normalized = normalized_checkpoint_keys(store, args)?;
+    for (physical, policy) in args.mtp_policies()?.into_iter().enumerate() {
+        if policy != LayerPolicy::SparseMoe {
+            continue;
+        }
+        let global = args.num_hidden_layers as usize + physical;
+        entries.extend(nemotron_expert_entries(
+            args,
+            &normalized,
+            store,
+            global,
+            &format!("mtp.layers.{physical}.moe.experts"),
+        )?);
+    }
+    Ok(entries)
 }
 
 pub(crate) fn nemotron_h_expert_catalog_for_layers(
@@ -2052,10 +2567,28 @@ pub(crate) fn nemotron_h_expert_catalog_for_layers(
         if args.layer_schedule.get(layer) != Some(&LayerPolicy::SparseMoe) {
             continue;
         }
-        let prefix = format!("model.layers.{layer}.moe.experts");
-        let packed = normalized.contains_key(&format!("{prefix}.up_proj"));
-        for expert in 0..args.n_routed_experts as usize {
-            let identity = ExpertIdentity::new(layer, expert);
+        entries.extend(nemotron_expert_entries(
+            args,
+            &normalized,
+            store,
+            layer,
+            &format!("model.layers.{layer}.moe.experts"),
+        )?);
+    }
+    Ok(entries)
+}
+
+fn nemotron_expert_entries(
+    args: &ModelArgs,
+    normalized: &BTreeMap<String, String>,
+    store: &dyn WeightStore,
+    identity_layer: usize,
+    prefix: &str,
+) -> Result<Vec<ExpertCatalogEntry>, Error> {
+    let packed = normalized.contains_key(&format!("{prefix}.up_proj"));
+    (0..args.n_routed_experts as usize)
+        .map(|expert| -> Result<ExpertCatalogEntry, Error> {
+            let identity = ExpertIdentity::new(identity_layer, expert);
             let mut bindings = Vec::new();
             for projection in ["up_proj", "down_proj"] {
                 let weight_recipe = if packed {
@@ -2071,7 +2604,7 @@ pub(crate) fn nemotron_h_expert_catalog_for_layers(
                     DerivedWeightRecipe::Stack {
                         axis: 0,
                         inputs: vec![source_for_normalized(
-                            &normalized,
+                            normalized,
                             &format!("{prefix}.{expert}.{projection}.weight"),
                         )?],
                     }
@@ -2102,14 +2635,13 @@ pub(crate) fn nemotron_h_expert_catalog_for_layers(
                     Error::UnsupportedArchitecture("Nemotron-H expert byte total overflowed".into())
                 })
             })?;
-            entries.push(ExpertCatalogEntry::new(
+            Ok(ExpertCatalogEntry::new(
                 identity,
                 OffloadUnit::new(identity.unit_id(), bindings)?,
                 bytes,
-            )?);
-        }
-    }
-    Ok(entries)
+            )?)
+        })
+        .collect()
 }
 
 fn nemotron_recipe_binding(
@@ -2190,6 +2722,20 @@ mod tests {
 
     fn args() -> ModelArgs {
         resident::model_args_from_config_value(&config()).unwrap()
+    }
+
+    #[test]
+    fn embedded_mtp_pattern_builds_step_fusion_and_physical_operator_state() {
+        let execution = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        let mut args = args();
+        args.num_nextn_predict_layers = 2;
+        args.mtp_hybrid_override_pattern = Some("*E".into());
+        let adapter = NemotronHLayerwiseAdapter::new(args, execution.stream()).unwrap();
+        let mtp = adapter.mtp.as_ref().unwrap();
+        assert_eq!(mtp.len(), 2);
+        assert_eq!(mtp.pattern_len, 2);
+        assert_eq!(mtp.blocks.len(), 4);
+        assert_eq!(adapter.new_cache().mtp_layers.len(), 4);
     }
 
     fn quantizable_config() -> serde_json::Value {
@@ -2765,7 +3311,10 @@ mod tests {
         )
         .unwrap();
         let mut resident_cache = resident.new_cache();
-        let mut layerwise_cache = Cache { layers: Vec::new() };
+        let mut layerwise_cache = Cache {
+            layers: Vec::new(),
+            mtp_layers: Vec::new(),
+        };
         for tokens in [
             Array::from_slice(&[1u32, 2], &[1, 2]),
             Array::from_slice(&[3u32], &[1, 1]),
@@ -2867,7 +3416,10 @@ mod tests {
         )
         .unwrap();
         let mut resident_cache = resident.new_cache();
-        let mut cached_cache = Cache { layers: Vec::new() };
+        let mut cached_cache = Cache {
+            layers: Vec::new(),
+            mtp_layers: Vec::new(),
+        };
         for tokens in [
             Array::from_slice(&[1u32, 2], &[1, 2]),
             Array::from_slice(&[3u32], &[1, 1]),

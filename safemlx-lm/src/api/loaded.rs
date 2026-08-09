@@ -217,11 +217,32 @@ fn qwen35_mtp_cache(cache: &mut ModelCache) -> Option<&mut qwen3_5::Cache> {
     }
 }
 
+fn deepseek_mtp_cache(cache: &mut ModelCache) -> Option<&mut deepseek_v3::Cache> {
+    match cache {
+        ModelCache::DeepSeekV3(cache) => Some(cache),
+        _ => None,
+    }
+}
+
+fn inkling_mtp_cache(cache: &mut ModelCache) -> Option<&mut inkling::Cache> {
+    match cache {
+        ModelCache::Inkling(cache) => Some(cache),
+        _ => None,
+    }
+}
+
+fn nemotron_mtp_cache(cache: &mut ModelCache) -> Option<&mut nemotron_h::Cache> {
+    match cache {
+        ModelCache::NemotronH(cache) => Some(cache),
+        _ => None,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
-fn run_embedded_mtp_batch<'a, B, S>(
+fn run_embedded_mtp_batch<'a, B, C, S>(
     backend: &'a mut B,
     lanes: &'a mut [ModelCache],
-    cache_for_lane: fn(&mut ModelCache) -> Option<&mut qwen3_5::Cache>,
+    cache_for_lane: fn(&mut ModelCache) -> Option<&mut C>,
     prompt_tokens: &Array,
     config: &MtpConfig,
     prng_key: Option<Array>,
@@ -229,7 +250,7 @@ fn run_embedded_mtp_batch<'a, B, S>(
     stream: &'a Stream,
 ) -> Result<MtpBatchOutput, Exception>
 where
-    B: crate::runtime::generation::speculative::MtpBackend<Cache = qwen3_5::Cache>,
+    B: crate::runtime::generation::speculative::MtpBackend<Cache = C>,
     S: SpeculativeSampler + Clone + 'a,
 {
     let streams = MtpExecutionStreams::single(stream);
@@ -463,6 +484,45 @@ impl LoadedModel {
         let prepared_lanes = self.prepare_chat_mtp_batch_lanes(lanes, stream)?;
         let streams = MtpExecutionStreams::single(stream);
         match &mut self.model {
+            Model::DeepSeekV3(target) => {
+                let mut backend =
+                    crate::runtime::generation::embedded_mtp::EmbeddedMtpBackend::new(target);
+                run_prepared_chat_mtp_batch(
+                    &mut backend,
+                    prepared_lanes,
+                    deepseek_mtp_cache,
+                    "DeepSeek embedded",
+                    streams,
+                    scheduler,
+                )
+                .map_err(|error| Error::PreparedChatGeneration(error.to_string()))
+            }
+            Model::Inkling(target) => {
+                let mut backend =
+                    crate::runtime::generation::embedded_mtp::EmbeddedMtpBackend::new(target);
+                run_prepared_chat_mtp_batch(
+                    &mut backend,
+                    prepared_lanes,
+                    inkling_mtp_cache,
+                    "Inkling embedded",
+                    streams,
+                    scheduler,
+                )
+                .map_err(|error| Error::PreparedChatGeneration(error.to_string()))
+            }
+            Model::NemotronH(target) => {
+                let mut backend =
+                    crate::runtime::generation::embedded_mtp::EmbeddedMtpBackend::new(target);
+                run_prepared_chat_mtp_batch(
+                    &mut backend,
+                    prepared_lanes,
+                    nemotron_mtp_cache,
+                    "Nemotron-H embedded",
+                    streams,
+                    scheduler,
+                )
+                .map_err(|error| Error::PreparedChatGeneration(error.to_string()))
+            }
             Model::Qwen3Next(target) => {
                 let mut backend = crate::architectures::qwen::hybrid::mtp::QwenMtpBackend::new(target);
                 run_prepared_chat_mtp_batch(
@@ -1195,6 +1255,48 @@ impl LoadedModel {
             config.eos_token_ids.clone_from(&self.eos_token_ids);
         }
         match &mut self.model {
+            Model::DeepSeekV3(target) => {
+                let mut backend =
+                    crate::runtime::generation::embedded_mtp::EmbeddedMtpBackend::new(target);
+                run_embedded_mtp_batch(
+                    &mut backend,
+                    &mut cache.lanes,
+                    deepseek_mtp_cache,
+                    prompt_tokens,
+                    &config,
+                    prng_key,
+                    sampler,
+                    stream,
+                )
+            }
+            Model::Inkling(target) => {
+                let mut backend =
+                    crate::runtime::generation::embedded_mtp::EmbeddedMtpBackend::new(target);
+                run_embedded_mtp_batch(
+                    &mut backend,
+                    &mut cache.lanes,
+                    inkling_mtp_cache,
+                    prompt_tokens,
+                    &config,
+                    prng_key,
+                    sampler,
+                    stream,
+                )
+            }
+            Model::NemotronH(target) => {
+                let mut backend =
+                    crate::runtime::generation::embedded_mtp::EmbeddedMtpBackend::new(target);
+                run_embedded_mtp_batch(
+                    &mut backend,
+                    &mut cache.lanes,
+                    nemotron_mtp_cache,
+                    prompt_tokens,
+                    &config,
+                    prng_key,
+                    sampler,
+                    stream,
+                )
+            }
             Model::Qwen3Next(target) => {
                 let mut backend =
                     crate::architectures::qwen::hybrid::mtp::QwenMtpBackend::new(target);

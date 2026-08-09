@@ -36,8 +36,8 @@ use crate::{
         tensor::{create_attention_mask, AttentionMask},
     },
     runtime::cache::residency::{
-        PagedCacheOptions, PromptCacheDescriptor, PromptCacheManifest, PromptCacheModelIdentity,
-        PromptCacheOptions, PromptCacheTopology,
+        CacheResidencyPolicy, CacheResidencyReport, PagedCacheOptions, PromptCacheDescriptor,
+        PromptCacheManifest, PromptCacheModelIdentity, PromptCacheOptions, PromptCacheTopology,
     },
     runtime::checkpoint::binding::{
         build_module_bindings_with_recipes, canonical_checkpoint_name, populate_module_from_lease,
@@ -460,6 +460,28 @@ impl QwenHybridLayerwiseModel {
         self.execution.adapter().new_cache()
     }
 
+    /// Creates resident hybrid state or pages full-attention blocks while
+    /// recurrent convolution and transition state remains rank-local on device.
+    pub fn new_cache_with_options(&self, policy: CacheResidencyPolicy) -> Result<Cache, Error> {
+        match policy {
+            CacheResidencyPolicy::Device => Ok(self.new_cache()),
+            CacheResidencyPolicy::Paged(options) => Cache::new_paged(
+                self.args(),
+                options,
+                self.execution.prompt_cache_rank_identity(),
+            )
+            .map_err(Into::into),
+        }
+    }
+
+    /// Returns aggregate live full-attention paging telemetry, if enabled.
+    pub fn cache_residency_report(
+        &self,
+        cache: &Cache,
+    ) -> Result<Option<CacheResidencyReport>, Error> {
+        cache.residency_report().map_err(Into::into)
+    }
+
     /// Returns rank-local generalized parallel information when applicable.
     pub fn parallel_info(&self) -> Option<&crate::ParallelModelInfo> {
         self.execution.parallel_info()
@@ -736,7 +758,7 @@ impl QwenHybridLayerwiseModel {
         cache: &mut Cache,
         stream: &Stream,
     ) -> Result<QwenMtpStepOutput, Exception> {
-        cache.reset();
+        cache.reset()?;
         self.forward_mtp(QwenHybridInput::Prefill(input), cache, stream)
     }
 
@@ -4101,6 +4123,7 @@ mod tests {
         runtime::execution::layerwise::{ArchitectureAdapter, LayerwiseLoadOptions},
         runtime::residency::expert_cache::ExpertCacheLoadOptions,
         runtime::residency::policy::{OffloadConfig, ResidencyPolicy},
+        CacheResidencyPolicy, PagedCacheOptions,
     };
 
     fn config(next: bool, moe: bool) -> serde_json::Value {
@@ -4479,6 +4502,12 @@ mod tests {
             layers: Vec::new(),
             mtp_layers: Vec::new(),
         };
+        let paged_options = PagedCacheOptions::new(1, 1 << 20, 1 << 20, 1)
+            .unwrap()
+            .with_full_attention(true);
+        let mut paged_cache = layerwise
+            .new_cache_with_options(CacheResidencyPolicy::Paged(paged_options))
+            .unwrap();
         for tokens in [
             Array::from_slice(&[1u32, 2], &[1, 2]),
             Array::from_slice(&[3u32], &[1, 1]),
@@ -4500,7 +4529,11 @@ mod tests {
             let actual = layerwise
                 .forward(&tokens, &mut layerwise_cache, gpu.stream())
                 .unwrap();
+            let paged = layerwise
+                .forward(&tokens, &mut paged_cache, gpu.stream())
+                .unwrap();
             assert_close(&actual, &expected);
+            assert_close(&paged, &expected);
             for (expected, actual) in resident_cache.layers.iter().zip(&layerwise_cache.layers) {
                 let expected_offset = match expected {
                     LayerCache::FullAttention(cache) => {
@@ -4530,6 +4563,12 @@ mod tests {
                 .filter(|unit| unit.device_resident() && !layers.contains(unit))
                 .all(|unit| unit.policy() == ResidencyPolicy::Pinned));
         }
+        let report = layerwise
+            .cache_residency_report(&paged_cache)
+            .unwrap()
+            .expect("Qwen hybrid paged cache report");
+        assert_eq!(report.logical_cached_tokens, 5);
+        assert!(report.block_seals > 0);
 
         let prompt = Array::from_slice(&[1u32, 2], &[1, 2]);
         let parts = [runtime_input::InputPart::text_token_ids(&prompt)];

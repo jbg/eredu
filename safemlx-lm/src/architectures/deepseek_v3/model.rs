@@ -758,6 +758,8 @@ pub(crate) fn prompt_cache_architecture_fingerprint(args: &ModelArgs) -> String 
 pub struct Cache {
     /// Per-layer compressed latent state.
     pub layers: Vec<CompressedLatentCache>,
+    /// Compressed latent state owned by checkpoint-embedded prediction layers.
+    pub(crate) mtp_layers: Vec<CompressedLatentCache>,
 }
 
 impl Cache {
@@ -767,7 +769,36 @@ impl Cache {
                 .iter()
                 .map(|_| CompressedLatentCache::new())
                 .collect(),
+            mtp_layers: Vec::new(),
         }
+    }
+
+    pub(crate) fn with_mtp_layers(mut self, count: usize) -> Self {
+        self.mtp_layers = (0..count).map(|_| CompressedLatentCache::new()).collect();
+        self
+    }
+
+    pub(crate) fn with_paged_mtp_layers(
+        mut self,
+        count: usize,
+        rank: Option<CacheRankIdentity>,
+    ) -> Result<Self, Exception> {
+        if count == 0 {
+            return Ok(self);
+        }
+        let manager = self
+            .layers
+            .iter()
+            .find_map(CompressedLatentCache::residency_manager)
+            .cloned()
+            .ok_or_else(|| {
+                Exception::custom("DeepSeek paged MTP requires a shared cache manager")
+            })?;
+        let start = self.layers.len();
+        self.mtp_layers = (0..count)
+            .map(|index| CompressedLatentCache::new_paged(manager.clone(), start + index, rank))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(self)
     }
 
     pub(crate) fn new_with_options(
@@ -800,12 +831,49 @@ impl Cache {
         let layers = (0..layer_schedule.len())
             .map(|layer| CompressedLatentCache::new_paged(manager.clone(), layer, rank))
             .collect::<Result<Vec<_>, _>>()?;
-        Ok(Self { layers })
+        Ok(Self {
+            layers,
+            mtp_layers: Vec::new(),
+        })
     }
 
     /// Returns the common token offset.
     pub fn offset(&self) -> i32 {
         self.layers.first().map_or(0, CompressedLatentCache::offset)
+    }
+
+    pub(crate) fn reset(&mut self) -> Result<(), Exception> {
+        if let Some(manager) = self
+            .layers
+            .iter()
+            .chain(&self.mtp_layers)
+            .find_map(CompressedLatentCache::residency_manager)
+            .cloned()
+        {
+            manager
+                .clear()
+                .map_err(|error| Exception::custom(error.to_string()))?;
+        }
+        for cache in self.layers.iter_mut().chain(&mut self.mtp_layers) {
+            cache.reset_local_after_manager_clear();
+        }
+        Ok(())
+    }
+
+    pub(crate) fn restore_target_checkpoint(
+        &mut self,
+        checkpoint: &Self,
+        stream: &Stream,
+    ) -> Result<(), Exception> {
+        if self.layers.len() != checkpoint.layers.len() {
+            return Err(Exception::custom(
+                "DeepSeek target cache checkpoint has a different layer count",
+            ));
+        }
+        for (cache, previous) in self.layers.iter_mut().zip(&checkpoint.layers) {
+            cache.restore_checkpoint(previous, stream)?;
+        }
+        Ok(())
     }
 
     /// Returns aggregate compressed-cache residency observations.
@@ -4222,7 +4290,7 @@ mod tests {
             "scoring_func": "sigmoid",
             "norm_topk_prob": true,
             "routed_scaling_factor": 1.5,
-            "num_nextn_predict_layers": 1,
+            "num_nextn_predict_layers": 0,
             "tie_word_embeddings": false,
             "eos_token_id": 1
         })
@@ -5103,7 +5171,7 @@ mod tests {
     }
 
     #[test]
-    fn strict_loading_accepts_only_configured_mtp_prefix_and_dispatches_loaded_model() {
+    fn strict_loading_rejects_unconfigured_mtp_prefix_and_dispatches_loaded_model() {
         let context = test_context();
         let weights_context = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
         let stream = context.stream();
@@ -5111,16 +5179,7 @@ mod tests {
         let mut source = Model::new(tiny_args(Some(4)), stream).unwrap();
         initialize_dense_model(&mut source, stream);
         let dir = temp_dir();
-        save_fixture(
-            &dir,
-            &source,
-            stream,
-            None,
-            vec![(
-                "model.layers.2.eh_proj.weight".into(),
-                Array::zeros::<f32>(&[8, 16], stream).unwrap(),
-            )],
-        );
+        save_fixture(&dir, &source, stream, None, Vec::new());
         fs::write(
             dir.join("tokenizer.json"),
             r#"{"version":"1.0","truncation":null,"padding":null,"added_tokens":[],"normalizer":null,"pre_tokenizer":null,"post_processor":null,"decoder":null,"model":{"type":"WordLevel","vocab":{"<unk>":0,"hello":1},"unk_token":"<unk>"}}"#,

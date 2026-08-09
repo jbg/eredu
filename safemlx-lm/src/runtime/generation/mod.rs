@@ -1,5 +1,7 @@
 //! Sampling, semantic streaming, and speculative decoding.
 
+pub(crate) mod embedded_mtp;
+
 /// Token sampling policies.
 pub mod sampler;
 /// Multi-token prediction and speculative decoding.

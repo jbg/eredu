@@ -10,6 +10,7 @@ use std::{
 
 use safemlx::{
     error::Exception,
+    macros::ModuleParameters,
     module::{Module, ModuleParameters, Param},
     nn,
     ops::{
@@ -67,6 +68,178 @@ const NORM_UNIT: &str = "inkling.static.norm";
 const HEAD_UNIT: &str = "inkling.static.output";
 const AUDIO_UNIT: &str = "inkling.static.audio";
 const VISION_NORM_UNIT: &str = "inkling.static.vision_norm";
+const MTP_UNIT: &str = "inkling.static.mtp";
+
+#[derive(Debug, Clone, ModuleParameters)]
+struct InklingMtpDepth {
+    #[param]
+    hidden_norm: nn::RmsNorm,
+    #[param]
+    embed_norm: nn::RmsNorm,
+    #[param]
+    input_proj: MaybeQuantized<nn::Linear>,
+    #[param]
+    transformer_block: DecoderLayer,
+}
+
+#[derive(Debug, Clone, ModuleParameters)]
+struct InklingMtpModule {
+    #[param]
+    layers: Vec<InklingMtpDepth>,
+    #[param]
+    chain_norm: Option<nn::RmsNorm>,
+    policies: Vec<crate::AttentionPolicy>,
+}
+
+impl InklingMtpModule {
+    fn new(args: &ModelArgs, stream: &Stream) -> Result<Option<Self>, Error> {
+        let Some(config) = args.mtp_config.as_ref() else {
+            return Ok(None);
+        };
+        let count = usize::try_from(config.num_nextn_predict_layers).map_err(|_| {
+            Error::UnsupportedArchitecture("Inkling MTP layer count is negative".into())
+        })?;
+        if count == 0 {
+            return Ok(None);
+        }
+        let sliding = args
+            .text_config
+            .layer_schedule
+            .iter()
+            .find_map(|policy| policy.attention.window())
+            .map(|window| crate::AttentionPolicy::Sliding { window });
+        if !config.local_layer_ids.is_empty() && sliding.is_none() {
+            return Err(Error::UnsupportedArchitecture(
+                "Inkling MTP local layers require a backbone sliding-attention window".into(),
+            ));
+        }
+        let policies = (0..count)
+            .map(|depth| {
+                if config.local_layer_ids.contains(&depth) {
+                    sliding.expect("validated MTP sliding policy")
+                } else {
+                    crate::AttentionPolicy::Full
+                }
+            })
+            .collect::<Vec<_>>();
+        let layers = policies
+            .iter()
+            .copied()
+            .map(|attention| {
+                let mut text = args.text_config.clone();
+                text.num_attention_heads = config
+                    .num_attention_heads
+                    .unwrap_or(text.num_attention_heads);
+                text.num_key_value_heads = config
+                    .num_key_value_heads
+                    .unwrap_or(text.num_key_value_heads);
+                text.head_dim = config.head_dim.unwrap_or(text.head_dim);
+                text.swa_num_attention_heads = config
+                    .swa_num_attention_heads
+                    .or(text.swa_num_attention_heads);
+                text.swa_num_key_value_heads = config
+                    .swa_num_key_value_heads
+                    .or(text.swa_num_key_value_heads);
+                text.swa_head_dim = config.swa_head_dim.or(text.swa_head_dim);
+                text.dense_intermediate_size = config
+                    .dense_intermediate_size
+                    .or(text.dense_intermediate_size);
+                text.intermediate_size = config.intermediate_size.unwrap_or(text.intermediate_size);
+                text.sconv_kernel_size = config.sconv_kernel_size.unwrap_or(text.sconv_kernel_size);
+                text.rel_extent = config.rel_extent.unwrap_or(text.rel_extent);
+                text.d_rel = config.d_rel.unwrap_or(text.d_rel);
+                text.layer_schedule = crate::LayerSchedule::new(
+                    1,
+                    vec![resident::LayerPolicy {
+                        attention,
+                        feed_forward: resident::FeedForwardPolicy::Dense,
+                    }],
+                )
+                .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+                text.num_hidden_layers = 1;
+                Ok(InklingMtpDepth {
+                    hidden_norm: nn::RmsNorm::unloaded(
+                        text.hidden_size,
+                        text.rms_norm_eps,
+                        text.weight_dtype(),
+                        stream,
+                    )?,
+                    embed_norm: nn::RmsNorm::unloaded(
+                        text.hidden_size,
+                        text.rms_norm_eps,
+                        text.weight_dtype(),
+                        stream,
+                    )?,
+                    input_proj: common::linear::unloaded_maybe_quantized_linear_with_dtype(
+                        text.hidden_size * 2,
+                        text.hidden_size,
+                        false,
+                        None,
+                        text.weight_dtype(),
+                        stream,
+                    )?,
+                    transformer_block: DecoderLayer::new(&text, 0, stream)?,
+                })
+            })
+            .collect::<Result<Vec<_>, Error>>()?;
+        let chain_norm = config
+            .chain_hidden_post_norm
+            .then(|| {
+                nn::RmsNorm::unloaded(
+                    args.text_config.hidden_size,
+                    args.text_config.rms_norm_eps,
+                    args.text_config.weight_dtype(),
+                    stream,
+                )
+            })
+            .transpose()?;
+        Ok(Some(Self {
+            layers,
+            chain_norm,
+            policies,
+        }))
+    }
+
+    fn len(&self) -> usize {
+        self.layers.len()
+    }
+
+    fn forward_step(
+        &mut self,
+        hidden: &Array,
+        embeddings: &Array,
+        tokens: &Array,
+        depth: usize,
+        cache: &mut [resident::LayerCache],
+        stream: &Stream,
+    ) -> Result<crate::runtime::generation::embedded_mtp::EmbeddedMtpOutput, Exception> {
+        if self.layers.is_empty() || cache.len() != self.layers.len() {
+            return Err(Exception::custom(
+                "Inkling MTP cache does not match prediction layers",
+            ));
+        }
+        let depth = depth % self.layers.len();
+        let layer = &mut self.layers[depth];
+        let hidden = layer.hidden_norm.forward(hidden, stream)?;
+        let embeddings = layer.embed_norm.forward(embeddings, stream)?;
+        let combined = concatenate_axis(&[&hidden, &embeddings], -1, stream)?;
+        let fused = layer.input_proj.forward(&combined, stream)?;
+        let mut hidden =
+            layer
+                .transformer_block
+                .forward(&fused, Some(&mut cache[depth]), stream)?;
+        if let Some(norm) = &mut self.chain_norm {
+            hidden = norm.forward(&hidden, stream)?;
+        }
+        Ok(
+            crate::runtime::generation::embedded_mtp::EmbeddedMtpOutput {
+                logits: hidden.clone(),
+                hidden,
+                tokens: tokens.clone(),
+            },
+        )
+    }
+}
 
 /// Inkling multimodal model using bounded residency for hMLP and decoder blocks.
 pub struct InklingLayerwiseModel {
@@ -86,6 +259,73 @@ impl InklingLayerwiseModel {
     /// Creates global/sliding KV and short-convolution state for every layer.
     pub fn new_cache(&self) -> Cache {
         self.execution.adapter().new_cache()
+    }
+
+    pub(crate) fn mtp_len(&self) -> usize {
+        self.execution
+            .adapter()
+            .mtp
+            .as_ref()
+            .map_or(0, InklingMtpModule::len)
+    }
+
+    fn forward_mtp_target(
+        &mut self,
+        input: InklingInput<'_>,
+        cache: &mut Cache,
+        stream: &Stream,
+    ) -> Result<crate::runtime::generation::embedded_mtp::EmbeddedMtpOutput, Exception> {
+        let (logits, context) = self
+            .execution
+            .forward_with_context_hook(
+                InklingExecutionInput {
+                    input,
+                    last_token_only: false,
+                },
+                cache,
+                stream,
+                |_, _, _| Ok(()),
+            )
+            .map_err(|error| Exception::custom(error.to_string()))?;
+        let hidden = context.draft_hidden.ok_or_else(|| {
+            Exception::custom("Inkling layerwise pass did not retain MTP hidden state")
+        })?;
+        let tokens = context.draft_tokens.ok_or_else(|| {
+            Exception::custom("Inkling layerwise pass did not retain MTP token identity")
+        })?;
+        Ok(
+            crate::runtime::generation::embedded_mtp::EmbeddedMtpOutput {
+                logits,
+                hidden,
+                tokens,
+            },
+        )
+    }
+
+    fn forward_mtp_draft(
+        &mut self,
+        hidden: &Array,
+        tokens: &Array,
+        depth: usize,
+        cache: &mut [resident::LayerCache],
+        stream: &Stream,
+    ) -> Result<crate::runtime::generation::embedded_mtp::EmbeddedMtpOutput, Exception> {
+        let adapter = self.execution.adapter_mut();
+        let embeddings = adapter.embedding.forward(tokens, stream)?;
+        let embeddings = adapter.embed_norm.forward(&embeddings, stream)?;
+        let mut output = adapter
+            .mtp
+            .as_mut()
+            .ok_or_else(|| Exception::custom("Inkling checkpoint does not contain MTP layers"))?
+            .forward_step(hidden, &embeddings, tokens, depth, cache, stream)?;
+        output.logits = resident::project_text_logits(
+            &output.hidden,
+            &adapter.args.text_config,
+            false,
+            stream,
+            |hidden, stream| adapter.lm_head.forward(hidden, stream),
+        )?;
+        Ok(output)
     }
 
     /// Returns rank-local generalized parallel information when applicable.
@@ -143,12 +383,16 @@ impl InklingLayerwiseModel {
     pub fn new_cache_with_options(&self, policy: CacheResidencyPolicy) -> Result<Cache, Error> {
         match policy {
             CacheResidencyPolicy::Device => Ok(self.new_cache()),
-            CacheResidencyPolicy::Paged(options) => Cache::new_paged(
-                &self.args().text_config,
-                options,
-                self.execution.prompt_cache_rank_identity(),
-            )
-            .map_err(Into::into),
+            CacheResidencyPolicy::Paged(options) => {
+                let rank = self.execution.prompt_cache_rank_identity();
+                let cache = Cache::new_paged(&self.args().text_config, options, rank)?;
+                match &self.execution.adapter().mtp {
+                    Some(mtp) => cache
+                        .with_paged_mtp_policies(&mtp.policies, rank)
+                        .map_err(Into::into),
+                    None => Ok(cache),
+                }
+            }
         }
     }
 
@@ -361,6 +605,92 @@ impl CausalLm<Cache> for InklingLayerwiseModel {
                 stream,
             )
             .map_err(|error| Exception::custom(error.to_string()))
+    }
+}
+
+impl crate::runtime::generation::embedded_mtp::EmbeddedMtpTarget for InklingLayerwiseModel {
+    type Cache = Cache;
+    type DraftCache = Vec<resident::LayerCache>;
+
+    fn prefill_target(
+        &mut self,
+        input: input::ModelInput<'_>,
+        cache: &mut Cache,
+        stream: &Stream,
+    ) -> Result<crate::runtime::generation::embedded_mtp::EmbeddedMtpOutput, Exception> {
+        cache.reset()?;
+        self.forward_mtp_target(InklingInput::Prefill(input), cache, stream)
+    }
+
+    fn verify_target(
+        &mut self,
+        tokens: &Array,
+        cache: &mut Cache,
+        stream: &Stream,
+    ) -> Result<crate::runtime::generation::embedded_mtp::EmbeddedMtpOutput, Exception> {
+        self.forward_mtp_target(InklingInput::Decode(tokens), cache, stream)
+    }
+
+    fn prefill_draft_cache(
+        &mut self,
+        output: &crate::runtime::generation::embedded_mtp::EmbeddedMtpOutput,
+        tokens: &Array,
+        cache: &mut Cache,
+        stream: &Stream,
+    ) -> Result<(), Exception> {
+        let sequence = tokens.dim(1);
+        if sequence <= 1 {
+            return Ok(());
+        }
+        let hidden = output
+            .hidden
+            .try_index_device((.., ..sequence - 1, ..), stream)?;
+        let next = tokens.try_index_device((.., 1..), stream)?;
+        for depth in 0..cache.mtp_layers.len() {
+            let _ = self.forward_mtp_draft(&hidden, &next, depth, &mut cache.mtp_layers, stream)?;
+        }
+        Ok(())
+    }
+
+    fn draft_cache(cache: &Cache) -> Self::DraftCache {
+        cache.mtp_layers.clone()
+    }
+    fn commit_draft_cache(cache: &mut Cache, draft: &Self::DraftCache) {
+        cache.mtp_layers.clone_from(draft);
+    }
+    fn restore_target_checkpoint(
+        cache: &mut Cache,
+        checkpoint: &Cache,
+        stream: &Stream,
+    ) -> Result<(), Exception> {
+        cache.restore_target_checkpoint(checkpoint, stream)
+    }
+    fn draft_logits(
+        &mut self,
+        hidden: &Array,
+        last_token: u32,
+        draft_index: usize,
+        cache: &mut Self::DraftCache,
+        stream: &Stream,
+    ) -> Result<(Array, Array), Exception> {
+        let token = Array::from_slice(&[last_token], &[1, 1]);
+        let output = self.forward_mtp_draft(hidden, &token, draft_index, cache, stream)?;
+        Ok((output.logits, output.hidden))
+    }
+    fn advance_draft_cache(
+        &mut self,
+        hidden: &Array,
+        tokens: &Array,
+        cache: &mut Self::DraftCache,
+        stream: &Stream,
+    ) -> Result<(), Exception> {
+        for depth in 0..cache.len() {
+            let _ = self.forward_mtp_draft(hidden, tokens, depth, cache, stream)?;
+        }
+        Ok(())
+    }
+    fn max_draft_tokens(&self) -> usize {
+        self.mtp_len()
     }
 }
 
@@ -711,6 +1041,7 @@ pub(crate) struct InklingLayerwiseAdapter {
     norm: nn::RmsNorm,
     lm_head: MaybeQuantized<nn::Linear>,
     parallel_lm_head: Option<VocabParallelLmHead>,
+    mtp: Option<InklingMtpModule>,
     audio: Option<AudioModel>,
     vision_norm: Option<nn::RmsNorm>,
     vision_depth: usize,
@@ -722,6 +1053,7 @@ pub(crate) struct InklingLayerwiseAdapter {
 
 impl InklingLayerwiseAdapter {
     pub(crate) fn new(args: ModelArgs, stream: &Stream) -> Result<Self, Error> {
+        let mtp = InklingMtpModule::new(&args, stream)?;
         let text = &args.text_config;
         let audio = args
             .audio_config
@@ -767,6 +1099,7 @@ impl InklingLayerwiseAdapter {
                 stream,
             )?,
             parallel_lm_head: None,
+            mtp,
             audio,
             vision_norm,
             vision_depth,
@@ -800,7 +1133,11 @@ impl InklingLayerwiseAdapter {
     }
 
     fn new_cache(&self) -> Cache {
-        Cache::new(&self.args.text_config)
+        let cache = Cache::new(&self.args.text_config);
+        match &self.mtp {
+            Some(mtp) => cache.with_mtp_policies(&mtp.policies),
+            None => cache,
+        }
     }
 
     fn forward_cached_expert_bank(
@@ -989,8 +1326,66 @@ fn normalized_checkpoint_keys(store: &dyn WeightStore) -> BTreeMap<String, Strin
 }
 
 fn normalize_checkpoint_key(raw: &str) -> Option<String> {
-    if raw.starts_with("model.mtp.") {
-        return None;
+    if let Some(suffix) = raw.strip_prefix("model.mtp.") {
+        let mut key = format!("mtp.{suffix}");
+        key = key
+            .replace(
+                ".transformer_block.attn_norm.weight",
+                ".transformer_block.input_layernorm.weight",
+            )
+            .replace(
+                ".transformer_block.mlp_norm.weight",
+                ".transformer_block.post_attention_layernorm.weight",
+            )
+            .replace(
+                ".transformer_block.attn.wq_du.weight",
+                ".transformer_block.self_attn.q_proj.weight",
+            )
+            .replace(
+                ".transformer_block.attn.wk_dv.weight",
+                ".transformer_block.self_attn.k_proj.weight",
+            )
+            .replace(
+                ".transformer_block.attn.wv_dv.weight",
+                ".transformer_block.self_attn.v_proj.weight",
+            )
+            .replace(
+                ".transformer_block.attn.wr_du.weight",
+                ".transformer_block.self_attn.r_proj.weight",
+            )
+            .replace(
+                ".transformer_block.attn.wo_ud.weight",
+                ".transformer_block.self_attn.o_proj.weight",
+            )
+            .replace(
+                ".transformer_block.attn.q_norm.weight",
+                ".transformer_block.self_attn.q_norm.weight",
+            )
+            .replace(
+                ".transformer_block.attn.k_norm.weight",
+                ".transformer_block.self_attn.k_norm.weight",
+            )
+            .replace(
+                ".transformer_block.attn.rel_logits_proj.proj",
+                ".transformer_block.self_attn.rel_proj",
+            )
+            .replace(
+                ".transformer_block.attn.k_sconv.weight",
+                ".transformer_block.self_attn.k_sconv.weight",
+            )
+            .replace(
+                ".transformer_block.attn.v_sconv.weight",
+                ".transformer_block.self_attn.v_sconv.weight",
+            )
+            .replace(
+                ".transformer_block.mlp.w2_md.weight",
+                ".transformer_block.dense.down_proj.weight",
+            )
+            .replace(
+                ".transformer_block.mlp.global_scale",
+                ".transformer_block.dense_global_scale",
+            );
+        return Some(key);
     }
     if let Some(suffix) = raw.strip_prefix("model.audio.") {
         return Some(format!("audio.{suffix}"));
@@ -1070,6 +1465,8 @@ pub(crate) struct InklingForwardContext {
     vision_jobs: Vec<VisionJob>,
     needs_assembly: bool,
     last_token_only: bool,
+    draft_hidden: Option<Array>,
+    draft_tokens: Option<Array>,
 }
 
 /// Opaque semantic state retained while a pipeline ingress stage executes its
@@ -1569,6 +1966,19 @@ impl ArchitectureAdapter for InklingLayerwiseAdapter {
                 )?,
             )?);
         }
+        if select(MTP_UNIT) {
+            if let Some(mtp) = &self.mtp {
+                units.push(StaticUnitBindings::new(
+                    MTP_UNIT,
+                    build_module_bindings_with_recipes(
+                        mtp,
+                        "mtp",
+                        store,
+                        self.recipes_for_module(mtp, "mtp", store)?,
+                    )?,
+                )?);
+            }
+        }
         if select(AUDIO_UNIT) {
             if let Some(audio) = &self.audio {
                 units.push(StaticUnitBindings::new(
@@ -1599,8 +2009,10 @@ impl ArchitectureAdapter for InklingLayerwiseAdapter {
     }
 
     fn populate_static(&mut self, leases: &[ResidentUnitLease]) -> Result<(), Error> {
-        let expected =
-            4 + usize::from(self.audio.is_some()) + usize::from(self.vision_norm.is_some());
+        let expected = 4
+            + usize::from(self.mtp.is_some())
+            + usize::from(self.audio.is_some())
+            + usize::from(self.vision_norm.is_some());
         if leases.len() != expected {
             return Err(Error::UnsupportedArchitecture(format!(
                 "Inkling adapter received {} static leases, expected {expected}",
@@ -1620,6 +2032,10 @@ impl ArchitectureAdapter for InklingLayerwiseAdapter {
             populate_module_from_lease(&mut self.lm_head, &leases[3])?;
         }
         let mut index = 4;
+        if let Some(mtp) = &mut self.mtp {
+            populate_module_from_lease(mtp, &leases[index])?;
+            index += 1;
+        }
         if let Some(audio) = &mut self.audio {
             populate_module_from_lease(audio, &leases[index])?;
             index += 1;
@@ -1658,6 +2074,8 @@ impl ArchitectureAdapter for InklingLayerwiseAdapter {
                     vision_jobs: Vec::new(),
                     needs_assembly: false,
                     last_token_only,
+                    draft_hidden: None,
+                    draft_tokens: Some(tokens.clone()),
                 },
             });
         }
@@ -1761,7 +2179,7 @@ impl ArchitectureAdapter for InklingLayerwiseAdapter {
                     PreparedPart::Vision { .. } => unreachable!(),
                 })
                 .collect::<Vec<_>>();
-            let _tokens = concatenate_axis(&token_parts, 1, stream)?;
+            let tokens = concatenate_axis(&token_parts, 1, stream)?;
             let hidden = concatenate_axis(&embedding_parts, 1, stream)?;
             return Ok(LayerwiseForwardState {
                 hidden,
@@ -1770,6 +2188,8 @@ impl ArchitectureAdapter for InklingLayerwiseAdapter {
                     vision_jobs,
                     needs_assembly: false,
                     last_token_only,
+                    draft_hidden: None,
+                    draft_tokens: Some(tokens),
                 },
             });
         }
@@ -1792,6 +2212,8 @@ impl ArchitectureAdapter for InklingLayerwiseAdapter {
                 vision_jobs,
                 needs_assembly: true,
                 last_token_only,
+                draft_hidden: None,
+                draft_tokens: None,
             },
         })
     }
@@ -1821,6 +2243,8 @@ impl ArchitectureAdapter for InklingLayerwiseAdapter {
                     vision_jobs: Vec::new(),
                     needs_assembly: false,
                     last_token_only,
+                    draft_hidden: None,
+                    draft_tokens: Some(tokens.clone()),
                 },
             });
         }
@@ -1930,7 +2354,7 @@ impl ArchitectureAdapter for InklingLayerwiseAdapter {
                     PreparedPart::Vision { .. } => unreachable!(),
                 })
                 .collect::<Vec<_>>();
-            let _tokens = concatenate_axis(&token_parts, 1, stream)?;
+            let tokens = concatenate_axis(&token_parts, 1, stream)?;
             let hidden = concatenate_axis(&embedding_parts, 1, stream)?;
             return Ok(LayerwiseForwardState {
                 hidden,
@@ -1939,6 +2363,8 @@ impl ArchitectureAdapter for InklingLayerwiseAdapter {
                     vision_jobs,
                     needs_assembly: false,
                     last_token_only,
+                    draft_hidden: None,
+                    draft_tokens: Some(tokens),
                 },
             });
         }
@@ -1959,6 +2385,8 @@ impl ArchitectureAdapter for InklingLayerwiseAdapter {
                 vision_jobs,
                 needs_assembly: true,
                 last_token_only,
+                draft_hidden: None,
+                draft_tokens: None,
             },
         })
     }
@@ -2763,9 +3191,24 @@ impl ArchitectureAdapter for InklingLayerwiseAdapter {
                 }
             }
         }
-        let _tokens = concatenate_axis(&tokens, 1, stream)?;
+        let tokens = concatenate_axis(&tokens, 1, stream)?;
+        context.draft_tokens = Some(tokens);
         context.needs_assembly = false;
         Ok(concatenate_axis(&embeddings, 1, stream)?)
+    }
+
+    fn complete_execution_group(
+        &mut self,
+        group: usize,
+        hidden: &Array,
+        _cache: &mut Self::Cache,
+        context: &mut Self::ForwardContext,
+        _stream: &Stream,
+    ) -> Result<Array, Error> {
+        if self.execution_group_name(group)? == "text_decoder" {
+            context.draft_hidden = Some(hidden.clone());
+        }
+        Ok(hidden.clone())
     }
 
     fn finish(
@@ -2803,10 +3246,6 @@ impl ArchitectureAdapter for InklingLayerwiseAdapter {
             execution.stream(),
             |hidden, _| head.forward(hidden, execution)?.all_gather(execution),
         )
-    }
-
-    fn ignores_checkpoint_key(&self, key: &str) -> bool {
-        key.starts_with("model.mtp.")
     }
 }
 
@@ -3081,6 +3520,34 @@ mod tests {
 
     fn args() -> ModelArgs {
         resident::model_args_from_config_value(&config()).unwrap()
+    }
+
+    #[test]
+    fn published_mtp_geometry_builds_distinct_full_and_local_draft_state() {
+        let execution = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        let mut value = config();
+        value["mtp_config"] = serde_json::json!({
+            "num_nextn_predict_layers": 3,
+            "chain_hidden_post_norm": true,
+            "local_layer_ids": [1],
+            "num_attention_heads": 4,
+            "num_key_value_heads": 2,
+            "head_dim": 8,
+            "intermediate_size": 32,
+            "sconv_kernel_size": 3,
+            "rel_extent": 32,
+            "d_rel": 32
+        });
+        let args = resident::model_args_from_config_value(&value).unwrap();
+        let adapter = InklingLayerwiseAdapter::new(args, execution.stream()).unwrap();
+        let mtp = adapter.mtp.as_ref().unwrap();
+        assert_eq!(mtp.len(), 3);
+        assert_eq!(mtp.policies[0], crate::AttentionPolicy::Full);
+        assert!(matches!(
+            mtp.policies[1],
+            crate::AttentionPolicy::Sliding { .. }
+        ));
+        assert_eq!(adapter.new_cache().mtp_layers.len(), 3);
     }
 
     fn quantizable_config() -> serde_json::Value {
@@ -3737,7 +4204,10 @@ mod tests {
             load_inkling_layerwise_model(dir.path(), options, None, gpu.stream(), cpu.stream())
                 .unwrap();
         let mut resident_cache = resident.new_cache();
-        let mut layerwise_cache = resident::Cache { layers: Vec::new() };
+        let mut layerwise_cache = resident::Cache {
+            layers: Vec::new(),
+            mtp_layers: Vec::new(),
+        };
         for tokens in [
             Array::from_slice(&[1u32, 2, 3], &[1, 3]),
             Array::from_slice(&[4u32], &[1, 1]),
@@ -3924,7 +4394,10 @@ mod tests {
         )
         .unwrap();
         let mut resident_cache = resident.new_cache();
-        let mut cached_cache = resident::Cache { layers: Vec::new() };
+        let mut cached_cache = resident::Cache {
+            layers: Vec::new(),
+            mtp_layers: Vec::new(),
+        };
         for tokens in [
             Array::from_slice(&[1u32, 2, 3], &[1, 3]),
             Array::from_slice(&[4u32], &[1, 1]),

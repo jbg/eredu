@@ -450,8 +450,10 @@ complete MLA blocks move through the `text_decoder` window. Compressed latent an
 rotary-key cache arrays are evaluated before each block lease is released. The
 dense and routed-plus-shared MoE layers use the same adapter; official
 per-expert tensors are stacked per layer for dense, affine, and native 128-by-128
-block-FP8 checkpoints. Appended multi-token-prediction weights remain explicitly
-ignored just as they are by the eager text-model loader.
+block-FP8 checkpoints. Appended multi-token-prediction non-expert weights are a
+pinned static unit with independent compressed caches and execute through the
+shared embedded-MTP scheduler; under independent expert residency their routed
+banks use the same bounded catalog and route executor as backbone MoE layers.
 
 Dense/MoE topology is represented only by
 `LayerSchedule<architectures::deepseek_v3::model::LayerPolicy>`, whose entries
@@ -1093,6 +1095,11 @@ formats. Dense families have no EP migration.
 
 The remaining global limitations are:
 
+- Embedded MTP is currently exposed by single-model execution. Parallel model
+  instances fail capability dispatch before generation until prediction-layer
+  TP sharding, EP exchange, and pipeline ownership are registered in the
+  Cartesian planner; target-model TP/PP/EP inference itself is unaffected.
+
 - The shared bounded materialisation store supports out-of-core affine and
   MXFP4 conversion from row-bounded SafeTensors or dense GGUF semantic recipes.
   Static modules, ordinary layers, shared experts, independent expert caches,
@@ -1477,8 +1484,9 @@ Family-specific generalized loaders cover Llama/Mistral, Qwen2/Qwen3
 (including Qwen3 MoE), Gemma 4 text and multimodal towers, GPT-OSS,
 DeepSeek-V3/R1, Kimi Linear, LFM2
 dense/MoE, Nemotron-H, and the text decoders of Qwen3-Next and Qwen3.5
-dense/MoE. Qwen vision towers and embedded multi-token-prediction layers use
-their own execution groups through the same generalized engine.
+dense/MoE. Qwen vision towers use their own execution groups. DeepSeek,
+Inkling, Nemotron-H, and Qwen embedded multi-token-prediction modules retain
+family-specific layer math while sharing one transactional draft scheduler.
 
 `load_tensor_parallel_layerwise_model` applies the same typed parameter-role
 planner and rank-local checkpoint selection to named layerwise execution
@@ -1617,10 +1625,11 @@ support heterogeneous live paging: growing MLA blocks and Nemotron attention
 KV blocks use the shared paging manager, while bounded KDA or Mamba
 convolution/recurrent tensors remain device resident. The same per-layer
 descriptors persist fixed state and lazily reopen paged blocks with exact
-rank-local topology. Paged live-cache residency remains unavailable for the
-LFM2 and Qwen hybrid TP adapters; requesting it returns a structured error
-instead of silently dropping their state. LFM2 supports rank-aware persisted
-prompt-cache snapshots and restores them into its heterogeneous resident cache.
+rank-local topology. LFM2 and Qwen hybrid TP adapters use the same manager for
+their attention state while retaining bounded convolution and recurrent state
+locally. Embedded attention-bearing draft caches join that manager. LFM2
+supports rank-aware persisted prompt-cache snapshots and restores them into its
+heterogeneous resident cache.
 
 Embedding and output rows use balanced contiguous vocabulary ranges, including
 uneven vocabulary sizes. Embedding masks out non-local ids then all-sums hidden
@@ -1770,16 +1779,18 @@ regress. Cross-device execution can instead overlap otherwise independent
 devices but pays synchronization and transfer costs. `MtpStats::stream_topology`
 and `MtpBatchOutput::scheduler.stream_topology` report the active assignment.
 Mirostat V2 remains lossless and reproducible but does not look ahead because
-its next truncation depends on target-committed adaptive state. Embedded Qwen
-uses the same request scheduler and independent lane semantics without
-same-request lookahead.
-Qwen3-Next and Qwen3.5/3.6 safetensors checkpoints execute their native MTP
-head through `generate_embedded_mtp_input`; resident and bounded-layer loading
-are both supported, including dense, block-FP8, affine, and MXFP4 weights. Text
-batches use independent backbone and MTP caches, so acceptance lengths and EOS
-positions may diverge safely. DeepSeek-V3/R1, Inkling, and Nemotron-H still
-report their embedded-checkpoint capability without executing the skipped MTP
-weights.
+its next truncation depends on target-committed adaptive state. Embedded
+predictors use the same request scheduler and independent lane semantics
+without same-request lookahead. DeepSeek-V3/R1, Inkling, Nemotron-H,
+Qwen3-Next, and Qwen3.5/3.6 safetensors checkpoints execute their native heads
+through `generate_embedded_mtp_input`; resident and bounded-layer loading are
+supported, attention-bearing draft caches participate in live paging, and
+DeepSeek/Nemotron routed prediction experts participate in independent bounded
+expert residency.
+Inkling preserves per-depth full/sliding attention and optional chain
+normalization; Nemotron-H repeats its configured physical MTP pattern without
+assuming a particular number of steps. Text batches use independent backbone
+and draft caches, so acceptance lengths and EOS positions may diverge safely.
 
 ### Quantized loading coverage
 

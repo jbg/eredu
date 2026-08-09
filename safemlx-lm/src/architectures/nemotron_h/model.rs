@@ -108,6 +108,12 @@ struct ModelArgsSource {
     /// Number of hybrid layers.
     #[serde(default = "default_num_hidden_layers")]
     pub num_hidden_layers: i32,
+    #[serde(default)]
+    pub num_nextn_predict_layers: i32,
+    #[serde(default)]
+    pub mtp_hybrid_override_pattern: Option<String>,
+    #[serde(default)]
+    pub mtp_layers_block_type: Option<Vec<String>>,
     /// Per-layer block pattern: `M` Mamba2, `*` attention, `-` MLP, `E` MoE.
     #[serde(default = "default_hybrid_override_pattern")]
     pub hybrid_override_pattern: String,
@@ -251,6 +257,10 @@ pub struct ModelArgs {
     pub intermediate_size: i32,
     /// Decoder layer count.
     pub num_hidden_layers: i32,
+    /// Number of checkpoint-embedded prediction steps.
+    pub num_nextn_predict_layers: i32,
+    /// Physical operator pattern executed by each prediction step.
+    pub mtp_hybrid_override_pattern: Option<String>,
     /// Authoritative operator and attention policy in decoder-layer order.
     pub layer_schedule: LayerSchedule<LayerPolicy>,
     /// Query-head count.
@@ -390,6 +400,23 @@ impl ModelArgsSource {
         let layer_schedule = LayerSchedule::new(layer_count, policies).map_err(|error| {
             Error::UnsupportedArchitecture(format!("Nemotron-H hybrid_override_pattern {error}"))
         })?;
+        let mtp_hybrid_override_pattern =
+            match (self.mtp_hybrid_override_pattern, self.mtp_layers_block_type) {
+                (Some(pattern), _) => Some(pattern),
+                (None, Some(layers)) => Some(
+                    layers
+                        .iter()
+                        .map(|layer| match layer.as_str() {
+                            "attention" | "full_attention" => Ok('*'),
+                            "moe" => Ok('E'),
+                            other => Err(Error::UnsupportedArchitecture(format!(
+                                "Nemotron-H MTP block type {other:?} is unsupported"
+                            ))),
+                        })
+                        .collect::<Result<String, Error>>()?,
+                ),
+                (None, None) => None,
+            };
         Ok(ModelArgs {
             model_type: self.model_type,
             vocab_size: self.vocab_size,
@@ -397,6 +424,8 @@ impl ModelArgsSource {
             hidden_size: self.hidden_size,
             intermediate_size: self.intermediate_size,
             num_hidden_layers: self.num_hidden_layers,
+            num_nextn_predict_layers: self.num_nextn_predict_layers,
+            mtp_hybrid_override_pattern,
             layer_schedule,
             num_attention_heads: self.num_attention_heads,
             head_dim: self.head_dim,
@@ -443,6 +472,51 @@ impl ModelArgsSource {
 }
 
 impl ModelArgs {
+    pub(crate) fn mtp_policies(&self) -> Result<Vec<LayerPolicy>, Error> {
+        if self.num_nextn_predict_layers == 0 {
+            return Ok(Vec::new());
+        }
+        if self.num_nextn_predict_layers < 0 {
+            return Err(Error::UnsupportedArchitecture(
+                "Nemotron-H MTP layer count cannot be negative".into(),
+            ));
+        }
+        let pattern = self.mtp_hybrid_override_pattern.as_deref().ok_or_else(|| {
+            Error::UnsupportedArchitecture(
+                "Nemotron-H MTP weights require mtp_hybrid_override_pattern".into(),
+            )
+        })?;
+        if pattern.is_empty() {
+            return Err(Error::UnsupportedArchitecture(
+                "Nemotron-H MTP operator pattern cannot be empty".into(),
+            ));
+        }
+        let attention = self
+            .layer_schedule
+            .iter()
+            .find_map(|policy| match policy {
+                LayerPolicy::SelfAttention(policy) => Some(*policy),
+                _ => None,
+            })
+            .unwrap_or(AttentionPolicy::Full);
+        let mut policies = Vec::new();
+        for _ in 0..self.num_nextn_predict_layers {
+            for marker in pattern.chars() {
+                let policy = LayerPolicy::from_pattern_char(marker, attention)?;
+                if !matches!(
+                    policy,
+                    LayerPolicy::SelfAttention(_) | LayerPolicy::SparseMoe
+                ) {
+                    return Err(Error::UnsupportedArchitecture(format!(
+                        "Nemotron-H MTP pattern supports only '*' and 'E', got {marker:?}"
+                    )));
+                }
+                policies.push(policy);
+            }
+        }
+        Ok(policies)
+    }
+
     /// Returns a stable ordered representation of all layer operators and attention windows.
     pub fn layer_schedule_fingerprint(&self) -> String {
         self.layer_schedule
@@ -2060,6 +2134,31 @@ impl AttentionCache {
             Self::Paged(_) => Ok(None),
         }
     }
+
+    fn restore_checkpoint(&mut self, checkpoint: &Self, stream: &Stream) -> Result<(), Exception> {
+        match (self, checkpoint) {
+            (Self::Full(cache), Self::Full(previous)) => {
+                cache.clone_from(previous);
+                Ok(())
+            }
+            (
+                Self::Sliding { cache, window },
+                Self::Sliding {
+                    cache: previous,
+                    window: previous_window,
+                },
+            ) if window == previous_window => {
+                cache.clone_from(previous);
+                Ok(())
+            }
+            (Self::Paged(cache), Self::Paged(previous)) => {
+                cache.restore_checkpoint(previous, stream)
+            }
+            _ => Err(Exception::custom(
+                "Nemotron-H cache checkpoint changed attention policy or residency",
+            )),
+        }
+    }
 }
 
 impl KeyValueCache for AttentionCache {
@@ -3131,6 +3230,8 @@ impl LayerCache {
 pub struct Cache {
     /// Per-layer cache state.
     pub layers: Vec<LayerCache>,
+    /// State owned by checkpoint-embedded prediction operators.
+    pub(crate) mtp_layers: Vec<LayerCache>,
 }
 
 impl Cache {
@@ -3143,7 +3244,65 @@ impl Cache {
                 .copied()
                 .map(LayerCache::new)
                 .collect(),
+            mtp_layers: Vec::new(),
         }
+    }
+
+    pub(crate) fn with_mtp_policies(mut self, policies: &[LayerPolicy]) -> Self {
+        self.mtp_layers = policies.iter().copied().map(LayerCache::new).collect();
+        self
+    }
+
+    pub(crate) fn with_paged_mtp_policies(
+        mut self,
+        policies: &[LayerPolicy],
+        rank: Option<CacheRankIdentity>,
+    ) -> Result<Self, Exception> {
+        if policies.is_empty() {
+            return Ok(self);
+        }
+        let manager = self.residency_manager()?.cloned().ok_or_else(|| {
+            Exception::custom("Nemotron-H paged MTP requires a shared cache manager")
+        })?;
+        let start = self.layers.len();
+        self.mtp_layers = policies
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(index, policy)| {
+                LayerCache::new_paged(policy, manager.clone(), start + index, rank)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(self)
+    }
+
+    pub(crate) fn restore_target_checkpoint(
+        &mut self,
+        checkpoint: &Self,
+        stream: &Stream,
+    ) -> Result<(), Exception> {
+        if self.layers.len() != checkpoint.layers.len() {
+            return Err(Exception::custom(
+                "Nemotron-H target cache checkpoint has a different layer count",
+            ));
+        }
+        for (cache, previous) in self.layers.iter_mut().zip(&checkpoint.layers) {
+            match (cache, previous) {
+                (LayerCache::Attention(cache), LayerCache::Attention(previous)) => {
+                    cache.restore_checkpoint(previous, stream)?;
+                }
+                (LayerCache::Mamba(cache), LayerCache::Mamba(previous)) => {
+                    cache.clone_from(previous);
+                }
+                (LayerCache::Mlp, LayerCache::Mlp) | (LayerCache::Moe, LayerCache::Moe) => {}
+                _ => {
+                    return Err(Exception::custom(
+                        "Nemotron-H target cache checkpoint changed layer policy",
+                    ));
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Creates device-resident state or pages only context-growing attention
@@ -3191,18 +3350,25 @@ impl Cache {
             .enumerate()
             .map(|(layer, policy)| LayerCache::new_paged(policy, manager.clone(), layer, rank))
             .collect::<Result<Vec<_>, _>>()?;
-        Ok(Self { layers })
+        Ok(Self {
+            layers,
+            mtp_layers: Vec::new(),
+        })
     }
 
     fn residency_manager(&self) -> Result<Option<&CacheResidencyManager>, Exception> {
-        let mut managers = self.layers.iter().filter_map(|layer| match layer {
-            LayerCache::Attention(AttentionCache::Paged(cache)) => Some(cache.manager()),
-            LayerCache::Mamba(_)
-            | LayerCache::Attention(AttentionCache::Full(_))
-            | LayerCache::Attention(AttentionCache::Sliding { .. })
-            | LayerCache::Mlp
-            | LayerCache::Moe => None,
-        });
+        let mut managers =
+            self.layers
+                .iter()
+                .chain(&self.mtp_layers)
+                .filter_map(|layer| match layer {
+                    LayerCache::Attention(AttentionCache::Paged(cache)) => Some(cache.manager()),
+                    LayerCache::Mamba(_)
+                    | LayerCache::Attention(AttentionCache::Full(_))
+                    | LayerCache::Attention(AttentionCache::Sliding { .. })
+                    | LayerCache::Mlp
+                    | LayerCache::Moe => None,
+                });
         let Some(first) = managers.next() else {
             return Ok(None);
         };
@@ -3236,7 +3402,7 @@ impl Cache {
                 .clear()
                 .map_err(|error| Exception::custom(error.to_string()))?;
         }
-        for layer in &mut self.layers {
+        for layer in self.layers.iter_mut().chain(&mut self.mtp_layers) {
             match layer {
                 LayerCache::Mamba(cache) => *cache = Mamba2Cache::default(),
                 LayerCache::Attention(cache) => cache.clear(),
@@ -4120,6 +4286,9 @@ pub(crate) fn model_args_from_gguf_catalog(
         hidden_size,
         intermediate_size,
         num_hidden_layers,
+        num_nextn_predict_layers: 0,
+        mtp_hybrid_override_pattern: None,
+        mtp_layers_block_type: None,
         hybrid_override_pattern,
         num_attention_heads,
         head_dim,

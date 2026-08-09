@@ -57,26 +57,27 @@ impl Model {
             Self::Gemma4(_) => MtpCapability::Ready {
                 checkpoint: MtpCheckpointKind::Separate,
             },
-            Self::DeepSeekV3(model) if model.args().num_nextn_predict_layers > 0 => {
-                MtpCapability::Unsupported {
+            Self::DeepSeekV3(model) if model.mtp_len() > 0 && model.parallel_info().is_none() => {
+                MtpCapability::Ready {
                     checkpoint: MtpCheckpointKind::Embedded,
-                    architecture: "deepseek_v3".into(),
                 }
             }
-            Self::Inkling(_) => MtpCapability::Unsupported {
-                checkpoint: MtpCheckpointKind::Embedded,
-                architecture: "inkling".into(),
-            },
+            Self::Inkling(model) if model.mtp_len() > 0 && model.parallel_info().is_none() => {
+                MtpCapability::Ready {
+                    checkpoint: MtpCheckpointKind::Embedded,
+                }
+            }
             Self::Qwen3Next(model) if model.mtp_len() > 0 => MtpCapability::Ready {
                 checkpoint: MtpCheckpointKind::Embedded,
             },
             Self::Qwen35(model) if model.mtp_len() > 0 => MtpCapability::Ready {
                 checkpoint: MtpCheckpointKind::Embedded,
             },
-            Self::NemotronH(_) => MtpCapability::Unsupported {
-                checkpoint: MtpCheckpointKind::Embedded,
-                architecture: "nemotron_h".into(),
-            },
+            Self::NemotronH(model) if model.mtp_len() > 0 && model.parallel_info().is_none() => {
+                MtpCapability::Ready {
+                    checkpoint: MtpCheckpointKind::Embedded,
+                }
+            }
             _ => MtpCapability::Unavailable,
         }
     }
@@ -300,6 +301,21 @@ impl Model {
         F: FnMut(u32) -> Result<(), Exception>,
     {
         match (self, cache) {
+            (Self::DeepSeekV3(target), ModelCache::DeepSeekV3(cache)) => {
+                crate::runtime::generation::embedded_mtp::generate_with_callback(
+                    target, cache, input, config, prng_key, sampler, stream, on_token,
+                )
+            }
+            (Self::Inkling(target), ModelCache::Inkling(cache)) => {
+                crate::runtime::generation::embedded_mtp::generate_with_callback(
+                    target, cache, input, config, prng_key, sampler, stream, on_token,
+                )
+            }
+            (Self::NemotronH(target), ModelCache::NemotronH(cache)) => {
+                crate::runtime::generation::embedded_mtp::generate_with_callback(
+                    target, cache, input, config, prng_key, sampler, stream, on_token,
+                )
+            }
             (Self::Qwen3Next(target), ModelCache::Qwen3Next(cache))
             | (Self::Qwen35(target), ModelCache::Qwen35(cache)) => {
                 crate::architectures::qwen::hybrid::mtp::generate_with_callback(
@@ -333,6 +349,51 @@ impl Model {
         F: FnMut(SemanticEvent),
     {
         match (self, cache) {
+            (Self::DeepSeekV3(target), ModelCache::DeepSeekV3(cache)) => {
+                crate::runtime::generation::embedded_mtp::generate_with_semantics_and_options(
+                    target,
+                    cache,
+                    input,
+                    config,
+                    prng_key,
+                    sampler,
+                    semantic,
+                    cancellation,
+                    stream,
+                    scheduler_options,
+                    on_event,
+                )
+            }
+            (Self::Inkling(target), ModelCache::Inkling(cache)) => {
+                crate::runtime::generation::embedded_mtp::generate_with_semantics_and_options(
+                    target,
+                    cache,
+                    input,
+                    config,
+                    prng_key,
+                    sampler,
+                    semantic,
+                    cancellation,
+                    stream,
+                    scheduler_options,
+                    on_event,
+                )
+            }
+            (Self::NemotronH(target), ModelCache::NemotronH(cache)) => {
+                crate::runtime::generation::embedded_mtp::generate_with_semantics_and_options(
+                    target,
+                    cache,
+                    input,
+                    config,
+                    prng_key,
+                    sampler,
+                    semantic,
+                    cancellation,
+                    stream,
+                    scheduler_options,
+                    on_event,
+                )
+            }
             (Self::Qwen3Next(target), ModelCache::Qwen3Next(cache))
             | (Self::Qwen35(target), ModelCache::Qwen35(cache)) => {
                 crate::architectures::qwen::hybrid::mtp::generate_with_semantics_and_options(
@@ -639,6 +700,18 @@ impl Model {
                 Self::NemotronH(model) => model
                     .new_cache_with_options(CacheResidencyPolicy::Paged(options))
                     .map(ModelCache::NemotronH)
+                    .map_err(|error| Exception::custom(error.to_string())),
+                Self::Lfm2(model) => model
+                    .new_cache_with_options(CacheResidencyPolicy::Paged(options))
+                    .map(ModelCache::Lfm2)
+                    .map_err(|error| Exception::custom(error.to_string())),
+                Self::Qwen3Next(model) => model
+                    .new_cache_with_options(CacheResidencyPolicy::Paged(options))
+                    .map(ModelCache::Qwen3Next)
+                    .map_err(|error| Exception::custom(error.to_string())),
+                Self::Qwen35(model) => model
+                    .new_cache_with_options(CacheResidencyPolicy::Paged(options))
+                    .map(ModelCache::Qwen35)
                     .map_err(|error| Exception::custom(error.to_string())),
                 _ => Err(Exception::custom(format!(
                     "paged cache residency is unsupported for model type {}",

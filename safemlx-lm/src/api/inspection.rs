@@ -2377,7 +2377,7 @@ mod tests {
             "scoring_func": "sigmoid",
             "norm_topk_prob": true,
             "routed_scaling_factor": 1.5,
-            "num_nextn_predict_layers": 1,
+            "num_nextn_predict_layers": 0,
             "tie_word_embeddings": false,
             "attention_bias": false,
             "attention_dropout": 0.0,
@@ -2477,6 +2477,52 @@ mod tests {
         )
         .unwrap();
         let mut specs = deepseek_v3_safetensor_specs(packed_experts);
+        mutate(&mut specs);
+        let payloads = specs
+            .iter()
+            .map(|(_, shape)| vec![0xff; shape.iter().product::<usize>() * 4])
+            .collect::<Vec<_>>();
+        let views = specs
+            .iter()
+            .zip(&payloads)
+            .map(|((name, shape), payload)| {
+                (
+                    name.as_str(),
+                    TensorView::new(Dtype::F32, shape.clone(), payload).unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        serialize_to_file(views, None, &directory.path().join("model.safetensors")).unwrap();
+        directory
+    }
+
+    fn write_complete_deepseek_v3_mtp_safetensors_dir(
+        mutate: impl FnOnce(&mut Vec<(String, Vec<usize>)>),
+    ) -> tempfile::TempDir {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = deepseek_v3_config(false);
+        config["num_nextn_predict_layers"] = 1.into();
+        std::fs::write(
+            directory.path().join("config.json"),
+            serde_json::to_vec(&config).unwrap(),
+        )
+        .unwrap();
+        let mut specs = deepseek_v3_safetensor_specs(true);
+        let decoder = specs
+            .iter()
+            .filter_map(|(name, shape)| {
+                name.strip_prefix("model.layers.1.")
+                    .map(|suffix| (format!("model.layers.2.{suffix}"), shape.clone()))
+            })
+            .collect::<Vec<_>>();
+        specs.extend(decoder);
+        specs.extend([
+            ("model.layers.2.enorm.weight".into(), vec![8]),
+            ("model.layers.2.hnorm.weight".into(), vec![8]),
+            ("model.layers.2.eh_proj.weight".into(), vec![8, 16]),
+            ("model.layers.2.shared_head.norm.weight".into(), vec![8]),
+            ("model.layers.2.shared_head.head.weight".into(), vec![32, 8]),
+        ]);
         mutate(&mut specs);
         let payloads = specs
             .iter()
@@ -6689,10 +6735,8 @@ mod tests {
     }
 
     #[test]
-    fn complete_poisoned_inkling_safetensors_headers_are_exactly_loadable() {
-        let directory = write_complete_inkling_safetensors_dir(|specs| {
-            specs.push(("model.mtp.poison.weight".into(), vec![1]));
-        });
+    fn complete_inkling_safetensors_headers_are_exactly_loadable() {
+        let directory = write_complete_inkling_safetensors_dir(|_| {});
         let report = inspect_model(directory.path(), ModelInspectionOptions::default()).unwrap();
         assert_eq!(report.structural_binding, InspectionReadiness::Ready);
         assert_eq!(report.model_loadability, InspectionReadiness::Ready);
@@ -7892,14 +7936,53 @@ mod tests {
 
     #[test]
     fn deepseek_v3_split_safetensors_route_is_exact() {
-        let directory = write_complete_deepseek_v3_safetensors_dir(false, |specs| {
-            specs.push(("model.layers.2.poison.weight".into(), vec![1]));
-        });
+        let directory = write_complete_deepseek_v3_safetensors_dir(false, |_| {});
         let report = inspect_model(directory.path(), ModelInspectionOptions::default()).unwrap();
         assert_eq!(report.architecture_support, InspectionReadiness::Ready);
         assert_eq!(report.structural_binding, InspectionReadiness::Ready);
         assert_eq!(report.model_loadability, InspectionReadiness::Ready);
         assert!(report.is_loadable());
+    }
+
+    #[test]
+    fn deepseek_embedded_mtp_catalog_is_exact_and_missing_fusion_fails_preflight() {
+        let options = ModelInspectionOptions {
+            load: ModelLoadOptions::default()
+                .with_weight_residency(WeightResidency::layerwise_host(Default::default())),
+            chat_request: None,
+        };
+        let complete = write_complete_deepseek_v3_mtp_safetensors_dir(|_| {});
+        let report = inspect_model(complete.path(), options.clone()).unwrap();
+        assert_eq!(
+            report.structural_binding,
+            InspectionReadiness::Ready,
+            "{:#?}",
+            report.issues
+        );
+        assert!(report.is_loadable());
+
+        let missing = write_complete_deepseek_v3_mtp_safetensors_dir(|specs| {
+            specs.retain(|(name, _)| name != "model.layers.2.eh_proj.weight");
+        });
+        let report = inspect_model(missing.path(), options).unwrap();
+        assert_eq!(report.structural_binding, InspectionReadiness::Invalid);
+        assert!(report.issues.iter().any(|issue| {
+            issue.code == InspectionIssueCode::MissingRequiredTensor
+                && issue.tensor_name.as_deref() == Some("model.layers.2.eh_proj.weight")
+        }));
+    }
+
+    #[test]
+    fn unconfigured_deepseek_mtp_tensors_are_not_silently_ignored() {
+        let directory = write_complete_deepseek_v3_safetensors_dir(false, |specs| {
+            specs.push(("model.layers.2.eh_proj.weight".into(), vec![8, 16]));
+        });
+        let report = inspect_model(directory.path(), ModelInspectionOptions::default()).unwrap();
+        assert_eq!(report.structural_binding, InspectionReadiness::Invalid);
+        assert!(report.issues.iter().any(|issue| {
+            issue.code == InspectionIssueCode::ConflictingTensorLayout
+                && issue.tensor_name.as_deref() == Some("model.layers.2.eh_proj.weight")
+        }));
     }
 
     #[test]
