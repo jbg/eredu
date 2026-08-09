@@ -8,11 +8,13 @@ use safemlx::{
         indexing::{NewAxis, TryIndexOp},
         matmul, pad, softmax_axis, stack_axis, tanh, PadWidth,
     },
+    quantization::MaybeQuantized,
     Array, Dtype, Stream,
 };
 use serde::Deserialize;
 
-use super::multimodal::Gemma4ClippedLinear;
+use super::multimodal::{maybe_quantized_linear_bias, Gemma4ClippedLinear};
+use crate::runtime::checkpoint::quantization::WeightQuantization;
 
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) struct Gemma4AudioConfig {
@@ -29,11 +31,19 @@ pub(crate) struct Gemma4AudioConfig {
     pub residual_weight: f32,
     pub rms_norm_eps: f32,
     pub subsampling_conv_channels: Vec<i32>,
+    #[serde(skip)]
+    pub weight_quantization: Option<WeightQuantization>,
 }
 
 impl Gemma4AudioConfig {
     fn head_dim(&self) -> i32 {
         self.hidden_size / self.num_attention_heads
+    }
+
+    fn projection_quantization(&self, input: i32) -> Option<WeightQuantization> {
+        self.weight_quantization.filter(|quantization| {
+            input > 0 && input % quantization.group_size() == 0 && input % 32 == 0
+        })
     }
 }
 
@@ -98,7 +108,7 @@ pub(crate) struct AudioSubsampleConvProjection {
     #[param]
     pub layer1: AudioSubsampleLayer,
     #[param]
-    pub input_proj_linear: nn::Linear,
+    pub input_proj_linear: MaybeQuantized<nn::Linear>,
 }
 
 impl AudioSubsampleConvProjection {
@@ -125,11 +135,11 @@ impl AudioSubsampleConvProjection {
             parallel_widths: vec![config.hidden_size as usize],
             layer0: AudioSubsampleLayer::new(1, first, config.rms_norm_eps, stream)?,
             layer1: AudioSubsampleLayer::new(first, second, config.rms_norm_eps, stream)?,
-            input_proj_linear: nn::Linear::unloaded(
+            input_proj_linear: super::model::maybe_quantized_linear_with_bias(
+                config.projection_quantization(32 * second),
                 32 * second,
                 config.hidden_size,
                 false,
-                Dtype::Float32,
                 stream,
             )?,
         })
@@ -152,11 +162,11 @@ impl AudioSubsampleConvProjection {
         }
         output.global_hidden_size = config.hidden_size;
         output.parallel_widths = parallel_widths;
-        output.input_proj_linear = nn::Linear::unloaded(
+        output.input_proj_linear = super::model::maybe_quantized_linear_with_bias(
+            config.projection_quantization(32 * config.subsampling_conv_channels[1]),
             32 * config.subsampling_conv_channels[1],
             local_hidden,
             false,
-            Dtype::Float32,
             stream,
         )?;
         Ok(output)
@@ -238,16 +248,18 @@ impl AudioFeedForward {
                 Dtype::Float32,
                 stream,
             )?,
-            ffw_layer_1: Gemma4ClippedLinear::new(
+            ffw_layer_1: Gemma4ClippedLinear::new_quantized(
                 config.hidden_size,
                 4 * config.hidden_size,
                 false,
+                config.projection_quantization(config.hidden_size),
                 stream,
             )?,
-            ffw_layer_2: Gemma4ClippedLinear::new(
+            ffw_layer_2: Gemma4ClippedLinear::new_quantized(
                 4 * config.hidden_size,
                 config.hidden_size,
                 false,
+                config.projection_quantization(4 * config.hidden_size),
                 stream,
             )?,
             post_layer_norm: nn::RmsNorm::unloaded(
@@ -266,10 +278,20 @@ impl AudioFeedForward {
         stream: &Stream,
     ) -> Result<Self, Exception> {
         let mut block = Self::new(config, stream)?;
-        block.ffw_layer_1 =
-            Gemma4ClippedLinear::new(config.hidden_size, local_intermediate, false, stream)?;
-        block.ffw_layer_2 =
-            Gemma4ClippedLinear::new(local_intermediate, config.hidden_size, false, stream)?;
+        block.ffw_layer_1 = Gemma4ClippedLinear::new_quantized(
+            config.hidden_size,
+            local_intermediate,
+            false,
+            config.projection_quantization(config.hidden_size),
+            stream,
+        )?;
+        block.ffw_layer_2 = Gemma4ClippedLinear::new_quantized(
+            local_intermediate,
+            config.hidden_size,
+            false,
+            config.projection_quantization(local_intermediate),
+            stream,
+        )?;
         Ok(block)
     }
 
@@ -329,7 +351,13 @@ impl AudioLightConv1d {
                 Dtype::Float32,
                 stream,
             )?,
-            linear_start: Gemma4ClippedLinear::new(hidden, 2 * hidden, false, stream)?,
+            linear_start: Gemma4ClippedLinear::new_quantized(
+                hidden,
+                2 * hidden,
+                false,
+                config.projection_quantization(hidden),
+                stream,
+            )?,
             depthwise_conv1d: AudioConvWeight {
                 weight: Param::<Array>::unloaded(
                     &[hidden, config.conv_kernel_size, 1],
@@ -338,7 +366,13 @@ impl AudioLightConv1d {
                 )?,
             },
             conv_norm: nn::RmsNorm::unloaded(hidden, config.rms_norm_eps, Dtype::Float32, stream)?,
-            linear_end: Gemma4ClippedLinear::new(hidden, hidden, false, stream)?,
+            linear_end: Gemma4ClippedLinear::new_quantized(
+                hidden,
+                hidden,
+                false,
+                config.projection_quantization(hidden),
+                stream,
+            )?,
             kernel_size: config.conv_kernel_size,
             global_hidden_size: hidden,
         })
@@ -356,10 +390,11 @@ impl AudioLightConv1d {
                 Dtype::Float32,
                 stream,
             )?,
-            linear_start: Gemma4ClippedLinear::new(
+            linear_start: Gemma4ClippedLinear::new_quantized(
                 config.hidden_size,
                 2 * local_hidden,
                 false,
+                config.projection_quantization(config.hidden_size),
                 stream,
             )?,
             depthwise_conv1d: AudioConvWeight {
@@ -375,7 +410,13 @@ impl AudioLightConv1d {
                 Dtype::Float32,
                 stream,
             )?,
-            linear_end: Gemma4ClippedLinear::new(local_hidden, config.hidden_size, false, stream)?,
+            linear_end: Gemma4ClippedLinear::new_quantized(
+                local_hidden,
+                config.hidden_size,
+                false,
+                config.projection_quantization(local_hidden),
+                stream,
+            )?,
             kernel_size: config.conv_kernel_size,
             global_hidden_size: config.hidden_size,
         })
@@ -472,7 +513,7 @@ pub(crate) struct AudioAttention {
     #[param]
     pub post: Gemma4ClippedLinear,
     #[param]
-    pub relative_k_proj: nn::Linear,
+    pub relative_k_proj: MaybeQuantized<nn::Linear>,
     #[param]
     pub per_dim_scale: Param<Array>,
     pub heads: i32,
@@ -481,17 +522,48 @@ pub(crate) struct AudioAttention {
     pub past: i32,
     pub logit_cap: f32,
     pub invalid_logits: f32,
+    pub relative_input_size: i32,
 }
 
 impl AudioAttention {
     fn new(config: &Gemma4AudioConfig, stream: &Stream) -> Result<Self, Exception> {
         let hidden = config.hidden_size;
         Ok(Self {
-            q_proj: Gemma4ClippedLinear::new(hidden, hidden, false, stream)?,
-            k_proj: Gemma4ClippedLinear::new(hidden, hidden, false, stream)?,
-            v_proj: Gemma4ClippedLinear::new(hidden, hidden, false, stream)?,
-            post: Gemma4ClippedLinear::new(hidden, hidden, false, stream)?,
-            relative_k_proj: nn::Linear::unloaded(hidden, hidden, false, Dtype::Float32, stream)?,
+            q_proj: Gemma4ClippedLinear::new_quantized(
+                hidden,
+                hidden,
+                false,
+                config.projection_quantization(hidden),
+                stream,
+            )?,
+            k_proj: Gemma4ClippedLinear::new_quantized(
+                hidden,
+                hidden,
+                false,
+                config.projection_quantization(hidden),
+                stream,
+            )?,
+            v_proj: Gemma4ClippedLinear::new_quantized(
+                hidden,
+                hidden,
+                false,
+                config.projection_quantization(hidden),
+                stream,
+            )?,
+            post: Gemma4ClippedLinear::new_quantized(
+                hidden,
+                hidden,
+                false,
+                config.projection_quantization(hidden),
+                stream,
+            )?,
+            relative_k_proj: super::model::maybe_quantized_linear_with_bias(
+                config.projection_quantization(hidden),
+                hidden,
+                hidden,
+                false,
+                stream,
+            )?,
             per_dim_scale: Param::<Array>::unloaded(&[config.head_dim()], Dtype::Float32, stream)?,
             heads: config.num_attention_heads,
             head_dim: config.head_dim(),
@@ -499,6 +571,7 @@ impl AudioAttention {
             past: config.attention_context_left - 1,
             logit_cap: config.attention_logit_cap,
             invalid_logits: config.attention_invalid_logits_value,
+            relative_input_size: hidden,
         })
     }
 
@@ -510,15 +583,39 @@ impl AudioAttention {
         let head_dim = config.head_dim();
         let local_hidden = local_heads * head_dim;
         Ok(Self {
-            q_proj: Gemma4ClippedLinear::new(config.hidden_size, local_hidden, false, stream)?,
-            k_proj: Gemma4ClippedLinear::new(config.hidden_size, local_hidden, false, stream)?,
-            v_proj: Gemma4ClippedLinear::new(config.hidden_size, local_hidden, false, stream)?,
-            post: Gemma4ClippedLinear::new(local_hidden, config.hidden_size, false, stream)?,
-            relative_k_proj: nn::Linear::unloaded(
+            q_proj: Gemma4ClippedLinear::new_quantized(
                 config.hidden_size,
                 local_hidden,
                 false,
-                Dtype::Float32,
+                config.projection_quantization(config.hidden_size),
+                stream,
+            )?,
+            k_proj: Gemma4ClippedLinear::new_quantized(
+                config.hidden_size,
+                local_hidden,
+                false,
+                config.projection_quantization(config.hidden_size),
+                stream,
+            )?,
+            v_proj: Gemma4ClippedLinear::new_quantized(
+                config.hidden_size,
+                local_hidden,
+                false,
+                config.projection_quantization(config.hidden_size),
+                stream,
+            )?,
+            post: Gemma4ClippedLinear::new_quantized(
+                local_hidden,
+                config.hidden_size,
+                false,
+                config.projection_quantization(local_hidden),
+                stream,
+            )?,
+            relative_k_proj: super::model::maybe_quantized_linear_with_bias(
+                config.projection_quantization(config.hidden_size),
+                config.hidden_size,
+                local_hidden,
+                false,
                 stream,
             )?,
             per_dim_scale: Param::<Array>::unloaded(&[head_dim], Dtype::Float32, stream)?,
@@ -528,13 +625,14 @@ impl AudioAttention {
             past: config.attention_context_left - 1,
             logit_cap: config.attention_logit_cap,
             invalid_logits: config.attention_invalid_logits_value,
+            relative_input_size: config.hidden_size,
         })
     }
 
     fn relative_embeddings(&self) -> Array {
         let mut values =
             Vec::with_capacity(((self.past + 1) * self.heads * self.head_dim) as usize);
-        let hidden = self.relative_k_proj.weight.dim(1);
+        let hidden = self.relative_input_size;
         let timescales = hidden / 2;
         let increment = 10_000.0_f32.ln() / (timescales - 1).max(1) as f32;
         for position in (0..=self.past).rev() {
@@ -807,7 +905,7 @@ pub(crate) struct Gemma4AudioLayerwiseStatic {
     #[param]
     pub(crate) subsample_conv_projection: AudioSubsampleConvProjection,
     #[param]
-    pub(crate) output_proj: nn::Linear,
+    pub(crate) output_proj: MaybeQuantized<nn::Linear>,
 }
 
 impl Gemma4AudioLayerwiseStatic {
@@ -833,11 +931,11 @@ impl Gemma4AudioLayerwiseStatic {
                 input_widths,
                 stream,
             )?,
-            output_proj: nn::Linear::unloaded(
+            output_proj: super::model::maybe_quantized_linear_with_bias(
+                config.projection_quantization(config.hidden_size),
                 config.hidden_size,
                 local_output,
-                tower.output_proj.bias.value.is_some(),
-                Dtype::Float32,
+                maybe_quantized_linear_bias(&tower.output_proj).is_some(),
                 stream,
             )?,
         })
@@ -926,7 +1024,7 @@ pub(crate) struct Gemma4AudioTower {
     #[param]
     pub layers: Vec<AudioLayer>,
     #[param]
-    pub output_proj: nn::Linear,
+    pub output_proj: MaybeQuantized<nn::Linear>,
 }
 
 impl Gemma4AudioTower {
@@ -936,11 +1034,11 @@ impl Gemma4AudioTower {
             layers: (0..config.num_hidden_layers)
                 .map(|_| AudioLayer::new(config, stream))
                 .collect::<Result<Vec<_>, _>>()?,
-            output_proj: nn::Linear::unloaded(
+            output_proj: super::model::maybe_quantized_linear_with_bias(
+                config.projection_quantization(config.hidden_size),
                 config.hidden_size,
                 config.output_proj_dims,
                 true,
-                Dtype::Float32,
                 stream,
             )?,
         })

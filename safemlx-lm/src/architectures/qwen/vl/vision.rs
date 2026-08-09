@@ -140,6 +140,41 @@ impl VisionConfig {
         self.quantized_weight_configs.get(name).copied()
     }
 
+    pub(crate) fn apply_load_time_quantization(&mut self, quantization: WeightQuantization) {
+        let aligned =
+            |input: i32| input > 0 && input % quantization.group_size() == 0 && input % 32 == 0;
+        self.quantized_weight_configs.clear();
+        for index in 0..self.layer_count() {
+            for (name, input) in [
+                (format!("blocks.{index}.attn.qkv.weight"), self.hidden_size),
+                (format!("blocks.{index}.attn.proj.weight"), self.hidden_size),
+                (
+                    format!("blocks.{index}.mlp.linear_fc1.weight"),
+                    self.hidden_size,
+                ),
+                (
+                    format!("blocks.{index}.mlp.linear_fc2.weight"),
+                    self.intermediate_size,
+                ),
+            ] {
+                if aligned(input) {
+                    self.quantized_weight_configs.insert(name, quantization);
+                }
+            }
+        }
+        let merger_input = self.hidden_size * self.spatial_merge_size * self.spatial_merge_size;
+        for prefix in std::iter::once("merger".to_string()).chain(
+            (0..self.deepstack_layer_count()).map(|index| format!("deepstack_merger_list.{index}")),
+        ) {
+            for name in ["linear_fc1", "linear_fc2"] {
+                if aligned(merger_input) {
+                    self.quantized_weight_configs
+                        .insert(format!("{prefix}.{name}.weight"), quantization);
+                }
+            }
+        }
+    }
+
     fn validate_for_mode(&self, mode: VisionMode) -> Result<(), Exception> {
         let mut mergers = self
             .layer_schedule

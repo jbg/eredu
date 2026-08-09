@@ -930,10 +930,8 @@ pub fn load_qwen3_vl_model(
     Ok(model)
 }
 
-/// Loads a dense Qwen3-VL checkpoint while affine-quantizing its language model.
-///
-/// The shared Qwen vision tower remains dense so its parameter and checkpoint
-/// layout stays identical for Qwen3-VL and Qwen3.5 multimodal models.
+/// Loads a dense Qwen3-VL checkpoint while quantizing its language model and
+/// every aligned vision transformer or merger projection.
 pub fn load_qwen3_vl_model_quantized(
     model_dir: impl AsRef<Path>,
     quantization: WeightQuantization,
@@ -965,6 +963,8 @@ pub fn load_qwen3_vl_model_quantized(
     }
     args.text_config.quantization = Some(quantization);
     args.text_config.quantization_config = None;
+    args.vision_config
+        .apply_load_time_quantization(quantization);
     let mut model = Model::new(args, stream)?;
     let config = StrictLoadConfig::default();
     let mut report = StrictLoadReport::default();
@@ -983,9 +983,10 @@ pub fn load_qwen3_vl_model_quantized(
 }
 
 /// Loads a dense or MoE Qwen3-VL GGUF language model and its llama.cpp-style
-/// vision projector. The vision projector must use dense F16/BF16/F32 tensors;
-/// the language model may use any GGUF quantization supported by the shared
-/// Qwen text loader.
+/// vision projector. Dense projector tensors can be converted through the
+/// shared load-time packed overlay; supported checkpoint-native projector
+/// encodings load directly. The language model may use any GGUF quantization
+/// supported by the shared Qwen text loader.
 pub fn load_qwen3_vl_gguf(
     gguf_file: impl AsRef<Path>,
     mmproj_file: impl AsRef<Path>,

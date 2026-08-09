@@ -2231,6 +2231,30 @@ impl LoadTimeQuantizableAdapter for InklingLayerwiseAdapter {
         let mut args = self.args.clone();
         args.text_config.weight_quantization = Some(quantization);
         args.text_config.quantized_weight_configs = None;
+        let aligned =
+            |input: i32| input > 0 && input % quantization.group_size() == 0 && input % 32 == 0;
+        if let Some(audio) = &mut args.audio_config {
+            let mut formats = HashMap::new();
+            if aligned(audio.text_hidden_size) {
+                formats.insert("audio.encoder.weight".into(), quantization);
+            }
+            audio.quantized_weight_configs = Some(formats);
+        }
+        if let Some(vision) = &mut args.vision_config {
+            let formats = vision
+                .layer_specs()
+                .into_iter()
+                .enumerate()
+                .filter(|(_, (input, _, _, _))| aligned(*input))
+                .map(|(index, _)| {
+                    (
+                        format!("visual.layers.{index}.projection.weight"),
+                        quantization,
+                    )
+                })
+                .collect();
+            vision.quantized_weight_configs = Some(formats);
+        }
         let mut adapter = Self::new(args, stream)?;
         adapter.sparse_expert_cache = self.sparse_expert_cache;
         Ok(adapter)
@@ -2253,10 +2277,26 @@ impl ArchitectureAdapter for InklingLayerwiseAdapter {
 
     fn quantizes_static_binding(&self, binding: &WeightBinding) -> bool {
         let target = binding.logical_target().unwrap_or(binding.checkpoint_key());
-        !target.starts_with("visual.")
-            && !target.contains(".visual.")
-            && !target.starts_with("audio.")
-            && !target.contains(".audio.")
+        if target.starts_with("visual.") || target.contains(".visual.") {
+            return false;
+        }
+        let audio = target
+            .strip_prefix("audio.")
+            .map(|suffix| format!("audio.{suffix}"))
+            .or_else(|| {
+                target
+                    .split_once(".audio.")
+                    .map(|(_, suffix)| format!("audio.{suffix}"))
+            });
+        match audio {
+            Some(target) => self
+                .args
+                .audio_config
+                .as_ref()
+                .and_then(|args| args.quantized_weight_configs.as_ref())
+                .is_some_and(|formats| formats.contains_key(&target)),
+            None => true,
+        }
     }
 
     fn prompt_cache_model_identity(
@@ -3930,6 +3970,7 @@ mod tests {
     use super::{
         load_inkling_expert_cache_model, load_inkling_layerwise_model,
         load_inkling_tensor_parallel_layerwise_model, InklingLayer, InklingLayerwiseAdapter,
+        InklingLayerwiseModel,
     };
     use crate::{
         api::{
@@ -3947,6 +3988,7 @@ mod tests {
             topology::{DeviceAssignment, ParallelTopology},
         },
         runtime::execution::layerwise::{
+            load_layerwise_model_with_quantization, transformed_module_weight_store,
             ArchitectureAdapter, LayerWeightResidency, LayerwiseLoadOptions,
             LoadTimeQuantizableAdapter,
         },
@@ -4053,7 +4095,7 @@ mod tests {
 
     #[test]
     #[ignore = "requires an MLX Metal device"]
-    fn load_time_adapter_packs_text_and_preserves_media_and_external_experts() {
+    fn load_time_adapter_packs_text_and_aligned_media_with_external_experts() {
         let execution = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
         let mut value = config();
         value["text_config"]["hidden_size"] = 32.into();
@@ -4089,7 +4131,8 @@ mod tests {
             WeightQuantization::MxFp4,
         )]));
         let source =
-            InklingLayerwiseAdapter::new_external_experts(args, execution.stream()).unwrap();
+            InklingLayerwiseAdapter::new_external_experts(args.clone(), execution.stream())
+                .unwrap();
         let quantization = AffineQuantization::new(32, 4).unwrap().into();
         let target = source
             .load_time_quantized(quantization, execution.stream())
@@ -4115,7 +4158,7 @@ mod tests {
             .parameters()
             .flatten()
             .values()
-            .all(|parameter| parameter.dtype() != Dtype::Uint32));
+            .any(|parameter| parameter.dtype() == Dtype::Uint32));
 
         let InklingLayer::Text(text) = target.new_layer(1, 0, execution.stream()).unwrap() else {
             panic!("Inkling decoder group must build a text layer")
@@ -4134,6 +4177,15 @@ mod tests {
             .flatten()
             .values()
             .all(|parameter| parameter.dtype() != Dtype::Uint32));
+        let InklingLayer::Vision(vision) = target.new_layer(0, 1, execution.stream()).unwrap()
+        else {
+            panic!("Inkling vision group must build a vision layer")
+        };
+        assert!(vision
+            .parameters()
+            .flatten()
+            .values()
+            .any(|parameter| parameter.dtype() == Dtype::Uint32));
 
         let mxfp4 = source
             .load_time_quantized(WeightQuantization::MxFp4, execution.stream())
@@ -4147,6 +4199,65 @@ mod tests {
             .flatten()
             .values()
             .any(|parameter| parameter.dtype() == Dtype::Uint32));
+
+        let gpu = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
+        let cpu = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        args.text_config.quantized_weight_configs = None;
+        let mut fixture = Model::new(args.clone(), gpu.stream()).unwrap();
+        initialize(&mut fixture, gpu.stream());
+        let store = transformed_module_weight_store(&fixture).unwrap();
+        let execution = load_layerwise_model_with_quantization(
+            store,
+            InklingLayerwiseAdapter::new(args, gpu.stream()).unwrap(),
+            LayerWeightResidency::FullyResident,
+            Some(quantization),
+            gpu.stream(),
+            cpu.stream(),
+        )
+        .unwrap();
+        let keys = execution.checkpoint_store_arc().keys();
+        assert!(keys.iter().any(|key| key == "audio.encoder.scales"));
+        assert!(keys
+            .iter()
+            .any(|key| key == "visual.layers.1.projection.scales"));
+        assert!(!keys
+            .iter()
+            .any(|key| key == "visual.layers.0.projection.scales"));
+        let report = execution.residency_report().unwrap();
+        let materialization = report.materialization().unwrap();
+        assert!(materialization.transformed_weights > 20);
+        assert!(materialization.output_bytes < materialization.source_bytes_read);
+        assert!(materialization.peak_planned_working_set_bytes <= materialization.output_bytes);
+
+        let mut quantized = InklingLayerwiseModel { execution };
+        let text = runtime_input::token_ids_array(&[1, 2], gpu.stream()).unwrap();
+        let pixels = Array::zeros::<f32>(&[1, 2, 40, 40, 3], gpu.stream()).unwrap();
+        let audio_ids = Array::from_slice(&[0u32, 1, 2, 3, 4, 5], &[3, 2]);
+        let audio_mask = Array::from_slice(&[true, true, false], &[1, 3]);
+        let parts = [
+            runtime_input::InputPart::text_token_ids(&text),
+            runtime_input::InputPart::image_tensor(
+                &pixels,
+                runtime_input::InputMetadata::default(),
+            ),
+            runtime_input::InputPart::audio_tensor(
+                &audio_ids,
+                runtime_input::InputMetadata::audio_mask(&audio_mask),
+            ),
+        ];
+        let typed = runtime_input::ModelInput::new(&parts);
+        let mut dense_cache = fixture.new_cache();
+        let mut quantized_cache = quantized.new_cache();
+        let expected = fixture
+            .prefill_input_logits(typed, &mut dense_cache, gpu.stream())
+            .unwrap();
+        let actual = quantized
+            .prefill_input_logits(typed, &mut quantized_cache, gpu.stream())
+            .unwrap();
+        assert!(actual
+            .all_close(&expected, Some(2e-2), Some(2e-2), None, gpu.stream())
+            .unwrap()
+            .item::<bool>(gpu.stream()));
     }
 
     #[test]

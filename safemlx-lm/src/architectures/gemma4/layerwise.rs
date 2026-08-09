@@ -358,7 +358,7 @@ fn register_gemma_vision_layer_parallel_plan(
             (&mlp.up_proj, up.as_str(), ProjectionSharding::Column),
             (&mlp.down_proj, down.as_str(), ProjectionSharding::Row),
         ],
-        mlp.gate_proj.linear.weight.dim(0) as usize,
+        mlp.gate_proj.output_dim as usize,
     )?;
     for (name, norm) in [
         ("input_layernorm", &layer.input_layernorm),
@@ -427,7 +427,7 @@ fn register_gemma_audio_layer_parallel_plan(
         )?],
     )?)?;
 
-    let intermediate = layer.feed_forward1.ffw_layer_1.linear.weight.dim(0) as usize;
+    let intermediate = layer.feed_forward1.ffw_layer_1.output_dim as usize;
     let mut ff_names = Vec::new();
     for (block_name, block) in [
         ("feed_forward1", &layer.feed_forward1),
@@ -474,7 +474,7 @@ fn register_gemma_audio_layer_parallel_plan(
             end.as_str(),
             ProjectionSharding::Row,
         )],
-        convolution.linear_end.linear.weight.dim(1) as usize,
+        convolution.linear_end.input_dim as usize,
     )?;
     for (name, parameter) in convolution.linear_start.parameters().flatten() {
         let shape = parameter
@@ -2247,12 +2247,20 @@ impl LoadTimeQuantizableAdapter for Gemma4LayerwiseAdapter {
         args.quantization_bits = quantization.bits();
         args.quantized_weights = None;
         args.quantized_weight_configs = None;
+        let mut vision_config = self.vision_config.clone();
+        if let Some(config) = &mut vision_config {
+            config.weight_quantization = Some(quantization);
+        }
+        let mut audio_config = self.audio_config.clone();
+        if let Some(config) = &mut audio_config {
+            config.weight_quantization = Some(quantization);
+        }
         let mut adapter = Self::new(
             args,
-            self.vision_config.clone(),
+            vision_config,
             self.image_token_id,
             self.video_token_id,
-            self.audio_config.clone(),
+            audio_config,
             self.audio_token_id,
             stream,
         )?;
@@ -2273,6 +2281,44 @@ impl ArchitectureAdapter for Gemma4LayerwiseAdapter {
 
     fn quantization(&self) -> Option<crate::runtime::checkpoint::quantization::WeightQuantization> {
         self.args.weight_quantization()
+    }
+
+    fn quantizes_static_binding(&self, binding: &WeightBinding) -> bool {
+        let target = binding.logical_target().unwrap_or(binding.checkpoint_key());
+        if target.contains("vision_tower.") {
+            return target.ends_with("patch_embedder.input_proj.weight")
+                && self
+                    .vision_config
+                    .as_ref()
+                    .and_then(|config| {
+                        config.weight_quantization.filter(|quantization| {
+                            let input = 3 * config.patch_size * config.patch_size;
+                            input % quantization.group_size() == 0 && input % 32 == 0
+                        })
+                    })
+                    .is_some();
+        }
+        if target.contains("audio_tower.") {
+            let input = if target.ends_with("subsample_conv_projection.input_proj_linear.weight") {
+                self.audio_config
+                    .as_ref()
+                    .map(|config| 32 * config.subsampling_conv_channels[1])
+            } else if target.ends_with("output_proj.weight") {
+                self.audio_config.as_ref().map(|config| config.hidden_size)
+            } else {
+                None
+            };
+            return input
+                .zip(
+                    self.audio_config
+                        .as_ref()
+                        .and_then(|config| config.weight_quantization),
+                )
+                .is_some_and(|(input, quantization)| {
+                    input % quantization.group_size() == 0 && input % 32 == 0
+                });
+        }
+        true
     }
 
     fn prompt_cache_model_identity(
@@ -4346,7 +4392,7 @@ mod tests {
         distributed::{Backend, Group},
         module::ModuleParameters,
         ops::ones_dtype,
-        Array, Device, DeviceType, ExecutionContext, Stream,
+        Array, Device, DeviceType, Dtype, ExecutionContext, Stream,
     };
 
     use super::*;
@@ -4360,11 +4406,15 @@ mod tests {
         },
         runtime::{
             cache::ConcatKeyValueCache,
+            checkpoint::quantization::{AffineQuantization, WeightQuantization},
             distributed::{
                 parallel::{ParallelBuildContext, ShardingPolicy},
                 topology::{DeviceAssignment, ParallelTopology},
             },
-            execution::layerwise::{LayerWeightResidency, LayerwiseLoadOptions},
+            execution::layerwise::{
+                ArchitectureAdapter, LayerWeightResidency, LayerwiseLoadOptions,
+                LoadTimeQuantizableAdapter,
+            },
             residency::{
                 dense_stream::DenseDiskStreamLoadOptions,
                 policy::{MemoryTier, OffloadConfig},
@@ -4398,6 +4448,263 @@ mod tests {
                 "final_logit_softcapping": 4.0
             }
         })
+    }
+
+    #[test]
+    #[ignore = "requires an MLX Metal device"]
+    fn load_time_adapter_packs_aligned_gemma4_media_projections() {
+        let gpu = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
+        let cpu = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        let mut value = config();
+        value["text_config"]["hidden_size"] = 32.into();
+        value["text_config"]["intermediate_size"] = 64.into();
+        value["text_config"]["num_attention_heads"] = 4.into();
+        value["text_config"]["num_key_value_heads"] = 2.into();
+        value["text_config"]["head_dim"] = 8.into();
+        value["text_config"]["hidden_size_per_layer_input"] = 0.into();
+        value["text_config"]["num_kv_shared_layers"] = 0.into();
+        let args = resident::model_args_from_config_value(&value["text_config"]).unwrap();
+        let vision = Gemma4VisionConfig {
+            hidden_size: 32,
+            intermediate_size: 64,
+            num_hidden_layers: 1,
+            num_attention_heads: 4,
+            num_key_value_heads: 2,
+            head_dim: 8,
+            patch_size: 2,
+            pooling_kernel_size: 2,
+            position_embedding_size: 4,
+            rms_norm_eps: 1e-6,
+            hidden_activation: "gelu_pytorch_tanh".into(),
+            standardize: false,
+            rope_parameters: None,
+            weight_quantization: None,
+        };
+        let audio = Gemma4AudioConfig {
+            hidden_size: 32,
+            num_hidden_layers: 1,
+            num_attention_heads: 4,
+            output_proj_dims: 32,
+            conv_kernel_size: 3,
+            attention_chunk_size: 4,
+            attention_context_left: 4,
+            attention_context_right: 0,
+            attention_invalid_logits_value: -1.0e9,
+            attention_logit_cap: 10.0,
+            residual_weight: 0.5,
+            rms_norm_eps: 1e-6,
+            subsampling_conv_channels: vec![4, 4],
+            weight_quantization: None,
+        };
+        let source = Gemma4LayerwiseAdapter::new(
+            args.clone(),
+            Some(vision.clone()),
+            Some(20),
+            Some(21),
+            Some(audio.clone()),
+            Some(22),
+            gpu.stream(),
+        )
+        .unwrap();
+        let quantization = WeightQuantization::Affine(AffineQuantization::new(32, 4).unwrap());
+        let target = source
+            .load_time_quantized(quantization, gpu.stream())
+            .unwrap();
+
+        assert_eq!(target.quantization(), Some(quantization));
+        assert!(matches!(
+            target.vision.as_ref().unwrap().patch_embedder.input_proj,
+            MaybeQuantized::Original(_)
+        ));
+        assert!(target
+            .audio
+            .as_ref()
+            .unwrap()
+            .parameters()
+            .flatten()
+            .values()
+            .any(|parameter| parameter.dtype() == Dtype::Uint32));
+        let Gemma4Layer::Vision(vision_layer) = target.new_layer(0, 0, gpu.stream()).unwrap()
+        else {
+            panic!("Gemma 4 vision group must build a vision layer")
+        };
+        assert!(vision_layer
+            .parameters()
+            .flatten()
+            .values()
+            .any(|parameter| parameter.dtype() == Dtype::Uint32));
+        let Gemma4Layer::Audio(audio_layer) = target.new_layer(1, 0, gpu.stream()).unwrap() else {
+            panic!("Gemma 4 audio group must build an audio layer")
+        };
+        assert!(audio_layer
+            .parameters()
+            .flatten()
+            .values()
+            .any(|parameter| parameter.dtype() == Dtype::Uint32));
+
+        let mut fixture = Model::new_with_modalities(
+            args.clone(),
+            Some(20),
+            Some(vision.clone()),
+            Some(21),
+            Some(22),
+            Some(audio.clone()),
+            gpu.stream(),
+        )
+        .unwrap();
+        initialize(&mut fixture, gpu.stream());
+        let store = transformed_module_weight_store(&fixture).unwrap();
+        let execution = load_layerwise_model_with_quantization(
+            store,
+            Gemma4LayerwiseAdapter::new(
+                args,
+                Some(vision),
+                Some(20),
+                Some(21),
+                Some(audio),
+                Some(22),
+                gpu.stream(),
+            )
+            .unwrap(),
+            LayerWeightResidency::FullyResident,
+            Some(quantization),
+            gpu.stream(),
+            cpu.stream(),
+        )
+        .unwrap();
+        let keys = execution.checkpoint_store_arc().keys();
+        assert!(
+            keys.iter()
+                .any(|key| key
+                    == "model.vision_tower.encoder.layers.0.self_attn.q_proj.linear.scales")
+        );
+        assert!(keys
+            .iter()
+            .any(|key| key == "model.audio_tower.layers.0.self_attn.q_proj.linear.scales"));
+        assert!(keys.iter().any(
+            |key| key == "model.audio_tower.subsample_conv_projection.input_proj_linear.scales"
+        ));
+        assert!(!keys
+            .iter()
+            .any(|key| key == "model.vision_tower.patch_embedder.input_proj.scales"));
+        let report = execution.residency_report().unwrap();
+        let materialization = report.materialization().unwrap();
+        assert!(materialization.transformed_weights > 20);
+        assert!(materialization.output_bytes < materialization.source_bytes_read);
+        assert!(materialization.peak_planned_working_set_bytes <= materialization.output_bytes);
+
+        let mut quantized = Gemma4LayerwiseModel { execution };
+        let text = runtime_input::token_ids_array(&[1, 2], gpu.stream()).unwrap();
+        let pixels = Array::zeros::<f32>(&[1, 4, 12], gpu.stream()).unwrap();
+        let positions = Array::from_slice(&[0i32, 0, 0, 1, 1, 0, 1, 1], &[1, 4, 2]);
+        let audio_features = Array::zeros::<f32>(&[1, 8, 128], gpu.stream()).unwrap();
+        let audio_mask = Array::from_slice(&[true; 8], &[1, 8]);
+        let parts = [
+            runtime_input::InputPart::text_token_ids(&text),
+            runtime_input::InputPart::image_tensor(
+                &pixels,
+                runtime_input::InputMetadata::patch_position_ids(&positions),
+            ),
+            runtime_input::InputPart::audio_tensor(
+                &audio_features,
+                runtime_input::InputMetadata::audio_mask(&audio_mask),
+            ),
+        ];
+        let typed = runtime_input::ModelInput::new(&parts);
+        let mut dense_cache = Cache::default();
+        let mut quantized_cache = quantized.new_cache();
+        let expected = fixture
+            .prefill_input_logits(typed, &mut dense_cache, gpu.stream())
+            .unwrap();
+        let actual = quantized
+            .prefill_input_logits(typed, &mut quantized_cache, gpu.stream())
+            .unwrap();
+        assert!(actual
+            .all_close(&expected, Some(2e-2), Some(2e-2), None, gpu.stream())
+            .unwrap()
+            .item::<bool>(gpu.stream()));
+
+        value["image_token_id"] = serde_json::json!(20);
+        value["video_token_id"] = serde_json::json!(21);
+        value["audio_token_id"] = serde_json::json!(22);
+        value["tie_word_embeddings"] = serde_json::json!(true);
+        value["text_config"]["tie_word_embeddings"] = serde_json::json!(true);
+        value["vision_config"] = serde_json::json!({
+            "hidden_size": 32,
+            "intermediate_size": 64,
+            "num_hidden_layers": 1,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 2,
+            "head_dim": 8,
+            "patch_size": 2,
+            "pooling_kernel_size": 2,
+            "position_embedding_size": 4,
+            "rms_norm_eps": 1e-6,
+            "hidden_activation": "gelu_pytorch_tanh",
+            "standardize": false
+        });
+        value["audio_config"] = serde_json::json!({
+            "hidden_size": 32,
+            "num_hidden_layers": 1,
+            "num_attention_heads": 4,
+            "output_proj_dims": 32,
+            "conv_kernel_size": 3,
+            "attention_chunk_size": 4,
+            "attention_context_left": 4,
+            "attention_context_right": 0,
+            "attention_invalid_logits_value": -1.0e9,
+            "attention_logit_cap": 10.0,
+            "residual_weight": 0.5,
+            "rms_norm_eps": 1e-6,
+            "subsampling_conv_channels": [4, 4]
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let arrays = fixture
+            .parameters()
+            .flatten()
+            .iter()
+            .map(|(name, value)| {
+                let name = crate::runtime::checkpoint::binding::canonical_checkpoint_name(name)
+                    .replacen("model.language_model.", "language_model.model.", 1);
+                (name, *value)
+            })
+            .collect::<Vec<_>>();
+        Array::save_safetensors(
+            arrays.iter().map(|(name, value)| (name.as_str(), *value)),
+            None,
+            dir.path().join("model.safetensors"),
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("config.json"),
+            serde_json::to_vec(&value).unwrap(),
+        )
+        .unwrap();
+        let eager_quantized = resident::load_gemma4_model_quantized(
+            dir.path(),
+            quantization,
+            gpu.stream(),
+            cpu.stream(),
+        )
+        .unwrap();
+        assert!(eager_quantized
+            .model
+            .vision_tower
+            .as_ref()
+            .unwrap()
+            .parameters()
+            .flatten()
+            .values()
+            .any(|parameter| parameter.dtype() == Dtype::Uint32));
+        assert!(eager_quantized
+            .model
+            .audio_tower
+            .as_ref()
+            .unwrap()
+            .parameters()
+            .flatten()
+            .values()
+            .any(|parameter| parameter.dtype() == Dtype::Uint32));
     }
 
     fn initialize(model: &mut Model, stream: &Stream) {
@@ -4585,6 +4892,7 @@ mod tests {
             hidden_activation: "gelu_pytorch_tanh".into(),
             standardize: false,
             rope_parameters: None,
+            weight_quantization: None,
         };
         let audio = Gemma4AudioConfig {
             hidden_size: 12,
@@ -4600,6 +4908,7 @@ mod tests {
             residual_weight: 0.5,
             rms_norm_eps: 1e-6,
             subsampling_conv_channels: vec![2, 2],
+            weight_quantization: None,
         };
 
         for (rank, query_heads, kv_heads, dense, expert, vision_hidden, vision_mlp, audio_heads) in
@@ -4682,7 +4991,7 @@ mod tests {
             };
             assert_eq!(layer.self_attn.num_heads, query_heads);
             assert_eq!(layer.self_attn.num_kv_heads, kv_heads);
-            assert_eq!(layer.mlp.gate_proj.linear.weight.dim(0), vision_mlp);
+            assert_eq!(layer.mlp.gate_proj.output_dim, vision_mlp);
 
             let Gemma4Layer::Audio(layer) = adapter
                 .new_parallel_layer(1, 0, &layout, execution.stream())
@@ -4828,6 +5137,7 @@ mod tests {
             hidden_activation: "gelu_pytorch_tanh".into(),
             standardize: false,
             rope_parameters: None,
+            weight_quantization: None,
         };
         let audio = Gemma4AudioConfig {
             hidden_size: 8,
@@ -4843,6 +5153,7 @@ mod tests {
             residual_weight: 0.5,
             rms_norm_eps: 1e-6,
             subsampling_conv_channels: vec![2, 2],
+            weight_quantization: None,
         };
         let mut fixture = Model::new_with_modalities(
             args,

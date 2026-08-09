@@ -1278,6 +1278,8 @@ impl LoadTimeQuantizableAdapter for Qwen3VlLayerwiseAdapter {
         args.text_config.quantization = Some(quantization);
         args.text_config.quantization_config = None;
         args.text_config.quantized_weight_configs = None;
+        args.vision_config
+            .apply_load_time_quantization(quantization);
         let mut adapter = Self::new(args, stream)?;
         adapter.sparse_expert_cache = self.sparse_expert_cache;
         Ok(adapter)
@@ -1307,7 +1309,17 @@ impl ArchitectureAdapter for Qwen3VlLayerwiseAdapter {
 
     fn quantizes_static_binding(&self, binding: &WeightBinding) -> bool {
         let target = binding.logical_target().unwrap_or(binding.checkpoint_key());
-        !target.starts_with("visual.") && !target.contains(".visual.")
+        let vision = target
+            .strip_prefix("model.visual.")
+            .or_else(|| target.split_once(".visual.").map(|(_, suffix)| suffix));
+        match vision {
+            Some(target) => self
+                .args
+                .vision_config
+                .quantized_weight_configs
+                .contains_key(target),
+            None => true,
+        }
     }
 
     fn prompt_cache_model_identity(
@@ -2371,20 +2383,26 @@ mod tests {
         distributed::{Backend, Group},
         module::ModuleParameters,
         ops::{ones_dtype, zeros_dtype},
-        Array, Device, DeviceType, ExecutionContext, Stream,
+        Array, Device, DeviceType, Dtype, ExecutionContext, Stream,
     };
 
     use super::*;
     use crate::{
         api::qwen3_vl as eager,
-        runtime::distributed::{
-            parallel::{ParallelBuildContext, ShardingPolicy},
-            topology::{DeviceAssignment, ParallelTopology},
+        runtime::{
+            checkpoint::quantization::{AffineQuantization, WeightQuantization},
+            distributed::{
+                parallel::{ParallelBuildContext, ShardingPolicy},
+                topology::{DeviceAssignment, ParallelTopology},
+            },
+            execution::layerwise::{
+                ArchitectureAdapter, LayerWeightResidency, LayerwiseLoadOptions,
+                LoadTimeQuantizableAdapter,
+            },
+            residency::dense_stream::DenseDiskStreamLoadOptions,
+            residency::expert_cache::ExpertCacheLoadOptions,
+            residency::policy::{MemoryTier, OffloadConfig},
         },
-        runtime::execution::layerwise::{LayerWeightResidency, LayerwiseLoadOptions},
-        runtime::residency::dense_stream::DenseDiskStreamLoadOptions,
-        runtime::residency::expert_cache::ExpertCacheLoadOptions,
-        runtime::residency::policy::{MemoryTier, OffloadConfig},
     };
 
     fn config(moe: bool) -> serde_json::Value {
@@ -2432,6 +2450,140 @@ mod tests {
                 "deepstack_visual_indexes": [0]
             }
         })
+    }
+
+    #[test]
+    #[ignore = "requires an MLX Metal device"]
+    fn load_time_adapter_packs_qwen3_vl_vision_projections() {
+        let gpu = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
+        let cpu = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        let mut value = config(false);
+        value["text_config"]["hidden_size"] = 32.into();
+        value["text_config"]["intermediate_size"] = 64.into();
+        value["text_config"]["num_attention_heads"] = 4.into();
+        value["text_config"]["num_key_value_heads"] = 2.into();
+        value["text_config"]["head_dim"] = 8.into();
+        value["text_config"]["rope_scaling"]["mrope_section"] = serde_json::json!([2, 1, 1]);
+        value["vision_config"]["hidden_size"] = 32.into();
+        value["vision_config"]["intermediate_size"] = 64.into();
+        value["vision_config"]["num_heads"] = 4.into();
+        value["vision_config"]["out_hidden_size"] = 32.into();
+        let args = eager::model_args_from_config_value(&value).unwrap();
+        let source = Qwen3VlLayerwiseAdapter::new(args.clone(), gpu.stream()).unwrap();
+        let quantization = WeightQuantization::Affine(AffineQuantization::new(32, 4).unwrap());
+        let target = source
+            .load_time_quantized(quantization, gpu.stream())
+            .unwrap();
+
+        assert_eq!(target.quantization(), Some(quantization));
+        assert_eq!(
+            target.vision.patch_embed.proj.weight.dtype(),
+            Dtype::Float32
+        );
+        assert!(target
+            .vision
+            .parameters()
+            .flatten()
+            .values()
+            .any(|parameter| parameter.dtype() == Dtype::Uint32));
+        let Qwen3VlLayer::Vision(layer) = target.new_layer(0, 0, gpu.stream()).unwrap() else {
+            panic!("Qwen3-VL vision group must build a vision layer")
+        };
+        assert!(layer
+            .parameters()
+            .flatten()
+            .values()
+            .any(|parameter| parameter.dtype() == Dtype::Uint32));
+
+        let mut fixture = eager::Model::new(args.clone(), gpu.stream()).unwrap();
+        initialize(&mut fixture, gpu.stream());
+        let store = transformed_module_weight_store(&fixture).unwrap();
+        let execution = load_layerwise_model_with_quantization(
+            store,
+            Qwen3VlLayerwiseAdapter::new(args, gpu.stream()).unwrap(),
+            LayerWeightResidency::FullyResident,
+            Some(quantization),
+            gpu.stream(),
+            cpu.stream(),
+        )
+        .unwrap();
+        let keys = execution.checkpoint_store_arc().keys();
+        assert!(keys
+            .iter()
+            .any(|key| key == "model.visual.blocks.0.attn.qkv.scales"));
+        assert!(keys
+            .iter()
+            .any(|key| key == "model.visual.merger.linear_fc1.scales"));
+        assert!(!keys
+            .iter()
+            .any(|key| key == "model.visual.patch_embed.proj.scales"));
+        let report = execution.residency_report().unwrap();
+        let materialization = report.materialization().unwrap();
+        assert!(materialization.transformed_weights >= 12);
+        assert!(materialization.output_bytes < materialization.source_bytes_read);
+        assert!(materialization.peak_planned_working_set_bytes <= materialization.output_bytes);
+
+        let mut quantized = Qwen3VlLayerwiseModel { execution };
+        let before = Array::from_slice(&[1u32], &[1, 1]);
+        let after = Array::from_slice(&[2u32], &[1, 1]);
+        let pixels = Array::from_slice(&[0.01f32; 96], &[4, 24]);
+        let grid = Array::from_slice(&[1i32, 2, 2], &[1, 3]);
+        let parts = [
+            input::InputPart::text_token_ids(&before),
+            input::InputPart::image_tensor(&pixels, input::InputMetadata::qwen_grid_thw(&grid)),
+            input::InputPart::text_token_ids(&after),
+        ];
+        let prompt = input::ModelInput::new(&parts);
+        let mut dense_cache = fixture.new_cache();
+        let mut quantized_cache = quantized.new_cache();
+        let expected = fixture
+            .prefill_input_logits(prompt, &mut dense_cache, gpu.stream())
+            .unwrap();
+        let actual = quantized
+            .prefill_input_logits(prompt, &mut quantized_cache, gpu.stream())
+            .unwrap();
+        assert!(actual
+            .all_close(&expected, Some(2e-2), Some(2e-2), None, gpu.stream())
+            .unwrap()
+            .item::<bool>(gpu.stream()));
+
+        let dir = tempfile::tempdir().unwrap();
+        let arrays = fixture
+            .parameters()
+            .flatten()
+            .iter()
+            .map(|(name, value)| {
+                (
+                    crate::runtime::checkpoint::binding::canonical_checkpoint_name(name),
+                    *value,
+                )
+            })
+            .collect::<Vec<_>>();
+        Array::save_safetensors(
+            arrays.iter().map(|(name, value)| (name.as_str(), *value)),
+            None,
+            dir.path().join("model.safetensors"),
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("config.json"),
+            serde_json::to_vec(&value).unwrap(),
+        )
+        .unwrap();
+        let eager_quantized = eager::load_qwen3_vl_model_quantized(
+            dir.path(),
+            quantization,
+            gpu.stream(),
+            cpu.stream(),
+        )
+        .unwrap();
+        assert!(eager_quantized
+            .model
+            .visual
+            .parameters()
+            .flatten()
+            .values()
+            .any(|parameter| parameter.dtype() == Dtype::Uint32));
     }
 
     fn initialize(model: &mut eager::Model, stream: &Stream) {

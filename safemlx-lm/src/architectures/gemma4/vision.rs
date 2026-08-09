@@ -5,12 +5,13 @@ use safemlx::{
     module::{Module, Param},
     nn,
     ops::{concatenate_axis, indexing::NewAxis, indexing::TryIndexOp, maximum, mean_axes},
+    quantization::MaybeQuantized,
     Array, Dtype, Stream,
 };
 use serde::Deserialize;
 
 use super::{model::rms_norm_without_scale, multimodal::Gemma4ClippedLinear};
-use crate::nn::rope::FloatOrString;
+use crate::{nn::rope::FloatOrString, runtime::checkpoint::quantization::WeightQuantization};
 
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) struct Gemma4VisionConfig {
@@ -30,6 +31,8 @@ pub(crate) struct Gemma4VisionConfig {
     pub standardize: bool,
     #[serde(default)]
     pub rope_parameters: Option<std::collections::HashMap<String, FloatOrString>>,
+    #[serde(skip)]
+    pub weight_quantization: Option<WeightQuantization>,
 }
 
 fn default_hidden_activation() -> String {
@@ -48,13 +51,19 @@ impl Gemma4VisionConfig {
             })
             .unwrap_or(100.0)
     }
+
+    fn projection_quantization(&self, input: i32) -> Option<WeightQuantization> {
+        self.weight_quantization.filter(|quantization| {
+            input > 0 && input % quantization.group_size() == 0 && input % 32 == 0
+        })
+    }
 }
 
 #[derive(Debug, Clone, ModuleParameters)]
 pub(crate) struct VisionPatchEmbedder {
     pub parallel_widths: Vec<usize>,
     #[param]
-    pub input_proj: nn::Linear,
+    pub input_proj: MaybeQuantized<nn::Linear>,
     #[param]
     pub position_embedding_table: Param<Array>,
 }
@@ -63,11 +72,11 @@ impl VisionPatchEmbedder {
     pub(crate) fn new(config: &Gemma4VisionConfig, stream: &Stream) -> Result<Self, Exception> {
         Ok(Self {
             parallel_widths: vec![config.hidden_size as usize],
-            input_proj: nn::Linear::unloaded(
+            input_proj: super::model::maybe_quantized_linear_with_bias(
+                config.projection_quantization(3 * config.patch_size * config.patch_size),
                 3 * config.patch_size * config.patch_size,
                 config.hidden_size,
                 false,
-                Dtype::Float32,
                 stream,
             )?,
             position_embedding_table: Param::<Array>::unloaded(
@@ -94,11 +103,11 @@ impl VisionPatchEmbedder {
         }
         Ok(Self {
             parallel_widths,
-            input_proj: nn::Linear::unloaded(
+            input_proj: super::model::maybe_quantized_linear_with_bias(
+                config.projection_quantization(3 * config.patch_size * config.patch_size),
                 3 * config.patch_size * config.patch_size,
                 local_hidden,
                 false,
-                Dtype::Float32,
                 stream,
             )?,
             position_embedding_table: Param::<Array>::unloaded(
@@ -140,7 +149,7 @@ impl VisionPatchEmbedder {
         let scaled_pixels = pixel_values
             .multiply(Array::from_f32(2.0), stream)?
             .subtract(Array::from_f32(1.0), stream)?
-            .as_dtype(self.input_proj.weight.dtype(), stream)?;
+            .as_dtype(Dtype::Float32, stream)?;
         Ok((
             self.input_proj
                 .forward(&scaled_pixels, stream)?
@@ -196,28 +205,32 @@ impl VisionAttention {
             num_heads: config.num_attention_heads,
             num_kv_heads: config.num_key_value_heads,
             head_dim: config.head_dim,
-            q_proj: Gemma4ClippedLinear::new(
+            q_proj: Gemma4ClippedLinear::new_quantized(
                 config.hidden_size,
                 config.num_attention_heads * config.head_dim,
                 false,
+                config.projection_quantization(config.hidden_size),
                 stream,
             )?,
-            k_proj: Gemma4ClippedLinear::new(
+            k_proj: Gemma4ClippedLinear::new_quantized(
                 config.hidden_size,
                 config.num_key_value_heads * config.head_dim,
                 false,
+                config.projection_quantization(config.hidden_size),
                 stream,
             )?,
-            v_proj: Gemma4ClippedLinear::new(
+            v_proj: Gemma4ClippedLinear::new_quantized(
                 config.hidden_size,
                 config.num_key_value_heads * config.head_dim,
                 false,
+                config.projection_quantization(config.hidden_size),
                 stream,
             )?,
-            o_proj: Gemma4ClippedLinear::new(
+            o_proj: Gemma4ClippedLinear::new_quantized(
                 config.num_attention_heads * config.head_dim,
                 config.hidden_size,
                 false,
+                config.projection_quantization(config.num_attention_heads * config.head_dim),
                 stream,
             )?,
             q_norm: nn::RmsNorm::unloaded(
@@ -246,28 +259,32 @@ impl VisionAttention {
             num_heads: local_heads,
             num_kv_heads: local_kv_heads,
             head_dim: config.head_dim,
-            q_proj: Gemma4ClippedLinear::new(
+            q_proj: Gemma4ClippedLinear::new_quantized(
                 config.hidden_size,
                 local_heads * config.head_dim,
                 false,
+                config.projection_quantization(config.hidden_size),
                 stream,
             )?,
-            k_proj: Gemma4ClippedLinear::new(
+            k_proj: Gemma4ClippedLinear::new_quantized(
                 config.hidden_size,
                 local_kv_heads * config.head_dim,
                 false,
+                config.projection_quantization(config.hidden_size),
                 stream,
             )?,
-            v_proj: Gemma4ClippedLinear::new(
+            v_proj: Gemma4ClippedLinear::new_quantized(
                 config.hidden_size,
                 local_kv_heads * config.head_dim,
                 false,
+                config.projection_quantization(config.hidden_size),
                 stream,
             )?,
-            o_proj: Gemma4ClippedLinear::new(
+            o_proj: Gemma4ClippedLinear::new_quantized(
                 local_heads * config.head_dim,
                 config.hidden_size,
                 false,
+                config.projection_quantization(local_heads * config.head_dim),
                 stream,
             )?,
             q_norm: nn::RmsNorm::unloaded(
@@ -411,22 +428,25 @@ impl VisionMlp {
     fn new(config: &Gemma4VisionConfig, stream: &Stream) -> Result<Self, Exception> {
         Ok(Self {
             activation: config.hidden_activation.clone(),
-            gate_proj: Gemma4ClippedLinear::new(
+            gate_proj: Gemma4ClippedLinear::new_quantized(
                 config.hidden_size,
                 config.intermediate_size,
                 false,
+                config.projection_quantization(config.hidden_size),
                 stream,
             )?,
-            up_proj: Gemma4ClippedLinear::new(
+            up_proj: Gemma4ClippedLinear::new_quantized(
                 config.hidden_size,
                 config.intermediate_size,
                 false,
+                config.projection_quantization(config.hidden_size),
                 stream,
             )?,
-            down_proj: Gemma4ClippedLinear::new(
+            down_proj: Gemma4ClippedLinear::new_quantized(
                 config.intermediate_size,
                 config.hidden_size,
                 false,
+                config.projection_quantization(config.intermediate_size),
                 stream,
             )?,
         })
@@ -439,22 +459,25 @@ impl VisionMlp {
     ) -> Result<Self, Exception> {
         Ok(Self {
             activation: config.hidden_activation.clone(),
-            gate_proj: Gemma4ClippedLinear::new(
+            gate_proj: Gemma4ClippedLinear::new_quantized(
                 config.hidden_size,
                 local_intermediate,
                 false,
+                config.projection_quantization(config.hidden_size),
                 stream,
             )?,
-            up_proj: Gemma4ClippedLinear::new(
+            up_proj: Gemma4ClippedLinear::new_quantized(
                 config.hidden_size,
                 local_intermediate,
                 false,
+                config.projection_quantization(config.hidden_size),
                 stream,
             )?,
-            down_proj: Gemma4ClippedLinear::new(
+            down_proj: Gemma4ClippedLinear::new_quantized(
                 local_intermediate,
                 config.hidden_size,
                 false,
+                config.projection_quantization(local_intermediate),
                 stream,
             )?,
         })

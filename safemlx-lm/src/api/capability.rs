@@ -3451,6 +3451,7 @@ mod tests {
             hidden_activation: "gelu_pytorch_tanh".into(),
             standardize: false,
             rope_parameters: None,
+            weight_quantization: None,
         };
         let vision = Array::from_slice(&[0.0f32; 15], &[1, 5, 3]);
         let patch_positions = Array::from_slice(&[0, 0, 1, 0, 0, 1, 1, 1, -1, -1], &[1, 5, 2]);
@@ -3479,6 +3480,7 @@ mod tests {
             residual_weight: 1.0,
             rms_norm_eps: 1e-5,
             subsampling_conv_channels: vec![4, 8],
+            weight_quantization: None,
         };
         let audio = Array::from_slice(&[0.0f32; 8 * 128], &[1, 8, 128]);
         let audio_mask =

@@ -4498,7 +4498,7 @@ pub(crate) fn apply_mmproj_args(
     let configs = gguf_quantization_configs(&projector.checkpoint, translate_mmproj_weight_name)?;
     if !configs.is_empty() {
         return Err(Error::UnsupportedArchitecture(
-            "Gemma 4 mmproj towers must use dense F16, BF16, or F32 tensors".into(),
+            "Gemma 4 load-time media quantization requires unquantized F16, BF16, or F32 mmproj source tensors".into(),
         ));
     }
 
@@ -4569,6 +4569,7 @@ pub(crate) fn apply_mmproj_args(
                     "rope_theta".into(),
                     FloatOrString::Float(rope_theta),
                 )])),
+                weight_quantization: None,
             })
         })
         .transpose()?;
@@ -4620,6 +4621,7 @@ pub(crate) fn apply_mmproj_args(
                     "clip.audio.attention.layer_norm_rms_epsilon",
                 )?,
                 subsampling_conv_channels: channels,
+                weight_quantization: None,
             })
         })
         .transpose()?;
@@ -5853,11 +5855,9 @@ pub fn load_gemma4_model(
 
 /// Loads a Gemma 4 checkpoint while affine-quantizing supported weights.
 ///
-/// Transformer weights and modality bridge projections use affine storage.
-/// Vision and audio towers remain dense because their convolutional and
-/// specialized implementations do not expose MLX affine parameter layouts. A
-/// checkpoint already carrying matching affine metadata is loaded directly
-/// without requantization.
+/// Transformer weights and every aligned modality projection use affine
+/// storage. Convolution kernels, normalization vectors, and position tables
+/// retain their native dense representation.
 pub fn load_gemma4_model_quantized(
     model_dir: impl AsRef<Path>,
     quantization: WeightQuantization,
@@ -5872,10 +5872,10 @@ pub fn load_gemma4_model_quantized(
     )?;
     let (
         mut model_args,
-        vision_config,
+        mut vision_config,
         image_token_id,
         video_token_id,
-        audio_config,
+        mut audio_config,
         audio_token_id,
     ) = get_gemma4_model_config(model_dir)?;
     if !crate::runtime::checkpoint::quantization::should_quantize_on_load(
@@ -5889,6 +5889,12 @@ pub fn load_gemma4_model_quantized(
     model_args.weight_quantization = Some(quantization);
     model_args.quantization_group_size = quantization.group_size();
     model_args.quantization_bits = quantization.bits();
+    if let Some(config) = &mut vision_config {
+        config.weight_quantization = Some(quantization);
+    }
+    if let Some(config) = &mut audio_config {
+        config.weight_quantization = Some(quantization);
+    }
     let mut model = Model::new_with_modalities(
         model_args,
         image_token_id,

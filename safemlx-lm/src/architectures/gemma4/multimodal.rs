@@ -15,8 +15,10 @@ use crate::runtime::checkpoint::quantization::WeightQuantization;
 
 #[derive(Debug, Clone, ModuleParameters)]
 pub(crate) struct Gemma4ClippedLinear {
+    pub input_dim: i32,
+    pub output_dim: i32,
     #[param]
-    pub linear: nn::Linear,
+    pub linear: MaybeQuantized<nn::Linear>,
     #[param]
     pub input_min: Param<Array>,
     #[param]
@@ -28,14 +30,17 @@ pub(crate) struct Gemma4ClippedLinear {
 }
 
 impl Gemma4ClippedLinear {
-    pub(crate) fn new(
+    pub(crate) fn new_quantized(
         input: i32,
         output: i32,
         bias: bool,
+        quantization: Option<WeightQuantization>,
         stream: &Stream,
     ) -> Result<Self, Exception> {
         Ok(Self {
-            linear: nn::Linear::unloaded(input, output, bias, Dtype::Float32, stream)?,
+            input_dim: input,
+            output_dim: output,
+            linear: maybe_quantized_linear_with_bias(quantization, input, output, bias, stream)?,
             input_min: Param::<Array>::unloaded(&[], Dtype::Float32, stream)?,
             input_max: Param::<Array>::unloaded(&[], Dtype::Float32, stream)?,
             output_min: Param::<Array>::unloaded(&[], Dtype::Float32, stream)?,
@@ -57,14 +62,21 @@ impl Gemma4ClippedLinear {
     ) -> Result<Array, Exception> {
         let x = clip(x, (&*self.input_min, &*self.input_max), stream)?;
         let mut partial = self.linear.forward(&x, stream)?;
-        if let Some(bias) = self.linear.bias.as_ref() {
+        if let Some(bias) = maybe_quantized_linear_bias(&self.linear) {
             partial = partial.subtract(bias, stream)?;
         }
         let mut output = safemlx::distributed::all_sum(&partial, group, stream)?;
-        if let Some(bias) = self.linear.bias.as_ref() {
+        if let Some(bias) = maybe_quantized_linear_bias(&self.linear) {
             output = output.add(bias, stream)?;
         }
         clip(output, (&*self.output_min, &*self.output_max), stream)
+    }
+}
+
+pub(crate) fn maybe_quantized_linear_bias(linear: &MaybeQuantized<nn::Linear>) -> Option<&Array> {
+    match linear {
+        MaybeQuantized::Original(linear) => linear.bias.as_ref().as_ref(),
+        MaybeQuantized::Quantized(linear) => linear.inner.bias.as_ref().as_ref(),
     }
 }
 

@@ -294,6 +294,10 @@ impl FixtureFamily {
             Self::InklingMultimodal | Self::Qwen35Multimodal | Self::Qwen35MoeMultimodal
         )
     }
+
+    const fn has_streamed_media_unit(self) -> bool {
+        matches!(self, Self::Qwen35Multimodal | Self::Qwen35MoeMultimodal)
+    }
 }
 
 #[test]
@@ -503,8 +507,8 @@ fn pipeline_ring_worker() {
     }
     if dense_stream {
         let report = model.dense_stream_report().unwrap().unwrap();
-        let expected_units =
-            expected_range.len() + usize::from(family.is_multimodal() && pipeline_rank == 0);
+        let expected_units = expected_range.len()
+            + usize::from(family.has_streamed_media_unit() && pipeline_rank == 0);
         assert_eq!(report.planned_layer_count(), expected_units);
         assert!(report
             .residency()
@@ -532,8 +536,8 @@ fn pipeline_ring_worker() {
         assert!(model.dense_stream_report().unwrap().is_none());
         let report = model.parameter_residency_report().unwrap().unwrap();
         assert!(report.initialized());
-        let expected_units =
-            expected_range.len() + usize::from(family.is_multimodal() && pipeline_rank == 0);
+        let expected_units = expected_range.len()
+            + usize::from(family.has_streamed_media_unit() && pipeline_rank == 0);
         assert_eq!(report.units().len(), expected_units);
         assert!(report
             .units()

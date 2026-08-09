@@ -1505,6 +1505,16 @@ every execution group, while pinned static modules retain only their planned
 local partitions. Scalars, routers, expert identities, and convolution stems
 without a valid feature-local decomposition remain replicated deliberately.
 
+Load-time affine and MXFP4 materialization also covers aligned Qwen3-VL vision
+attention, MLP, merger, and DeepStack projections; Gemma 4 vision/audio
+attention, feed-forward, relative-position, subsampling, output, and bridge
+projections; Inkling hMLP projections and its dMel embedding. The semantic
+adapters select these matrices before residency planning, so fully resident,
+host-layerwise, dense-streamed, and Cartesian policies budget only their packed
+weights and companions. Convolution kernels, normalization vectors, position
+tables, and geometrically unaligned patch projections stay dense because they
+are not coherent grouped-matrix quantization targets.
+
 Llama/Mistral, dense Qwen, Inkling, Kimi Linear, LFM2 attention, Nemotron-H
 attention, GPT-OSS, and Gemma 4 text/vision/audio projections are sharded. RoPE, attention,
 activations, and gated products remain local; only attention output and MLP
@@ -1808,12 +1818,12 @@ and draft caches, so acceptance lengths and EOS positions may diverge safely.
 | LFM2/LFM2.5 and LFM2-MoE | yes | MLX affine/MXFP4 and packed GGUF affine | yes / yes | `LoadedModel` | Alternating short-convolution/attention cache; MoE uses sigmoid top-k routing and packed expert-major SwiGLU execution |
 | Kimi Linear | yes | MLX affine/MXFP4 and packed GGUF affine/IQ/MXFP4-MoE | yes / yes | `LoadedModel` | Hybrid KDA/no-RoPE MLA cache; packed routed experts and one shared expert; norms, transition parameters, biases, and convolution weights remain dense |
 | Qwen3 | yes | MLX affine/MXFP4 | yes / yes | `LoadedModel` | Linear, embedding, tied/untied head targets |
-| Qwen3-VL | yes | MLX affine/MXFP4 | yes / yes | `LoadedModel` | Language-model targets are quantized; the vision tower remains dense |
-| Qwen3-VL-MoE | yes | MLX affine/MXFP4 | yes / yes | `LoadedModel` | Reuses Qwen3-VL DeepStack/MRoPE and Qwen3 packed expert-major SwiGLU execution; the vision tower remains dense |
-| Gemma 4 dense / MoE | yes | MLX affine/MXFP4 and packed GGUF affine | yes / yes | `LoadedModel` | Dense plus routed gated-GELU branches share resident, layerwise, and external-MTP execution; specialized vision/audio components remain dense |
+| Qwen3-VL | yes | MLX affine/MXFP4 | yes / yes | `LoadedModel` | Language targets plus aligned vision attention, MLP, merger, and DeepStack projections share the bounded packed overlay; patch convolution, position embeddings, and norms stay dense |
+| Qwen3-VL-MoE | yes | MLX affine/MXFP4 | yes / yes | `LoadedModel` | Reuses Qwen3-VL packed DeepStack/MRoPE vision execution and Qwen3 packed expert-major SwiGLU execution across standalone and Cartesian residency |
+| Gemma 4 dense / MoE | yes | MLX affine/MXFP4 and packed GGUF affine | yes / yes | `LoadedModel` | Text, routed experts, bridges, and aligned vision/audio projections share resident, layerwise, streamed, and Cartesian materialization; convolution, position, and normalization state stays dense |
 | Gemma 4 assistant | yes | MLX affine/MXFP4 and uniform packed GGUF affine | yes / yes | `LoadedDrafter` with `ModelLoadOptions` | Transformer/projection/head targets; ordered masked-embedding heads return a capability error |
 | GPT-OSS | dense attention, MXFP4 experts | checkpoint-native MXFP4 experts plus `gpt-oss` GGUF | no / yes | `LoadedModel` | Canonical GGUF type-39 experts stay packed; mixed dense projections use their exact GGUF formats |
-| Inkling | yes | packed GGUF affine/IQ/MXFP4 | yes / yes | `LoadedModel` | `inkling` text GGUF plus sibling combined hMLP/dMel mmproj; hMLP/dMel stay dense while every eligible text projection and complete shared/routed expert bank uses the packed overlay across fully resident, bounded nonresident, independent-cache, and Cartesian execution |
+| Inkling | yes | packed GGUF affine/IQ/MXFP4 | yes / yes | `LoadedModel` | `inkling` text GGUF plus sibling combined hMLP/dMel mmproj; aligned hMLP projections, the dMel embedding, eligible text projections, and complete shared/routed expert banks use one packed overlay across fully resident, bounded nonresident, independent-cache, and Cartesian execution |
 | Nemotron-H | yes | MLX affine/MXFP4 and checkpoint-native packed GGUF affine/IQ | yes / yes | `LoadedModel` | ReLU2 routed experts execute through the shared packed grouped rank-3 primitive; complete expert banks and ordinary targets use the affine/MXFP4 overlay across fully resident, bounded nonresident, independent-cache, and Cartesian execution |
 | Qwen3.5/3.6-MoE | yes | block FP8, MLX affine/MXFP4 | yes / yes, from dense checkpoints | `LoadedModel` | Rank-3 expert banks are quantized row-wise and executed with routed `gather_qmm`; native FP8 checkpoints are never implicitly transcoded |
 | Qwen3-Next | yes | native block FP8, MLX affine/MXFP4 | yes / yes, from dense checkpoints | `LoadedModel` | Official dynamic E4M3 128 x 128 checkpoints work with resident, layerwise, sparse expert-cache, and expert-parallel policies; fused weights/scales are split while streaming and native FP8 is never implicitly transcoded |
