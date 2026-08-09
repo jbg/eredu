@@ -3,20 +3,24 @@
 //! These helpers keep checkpoint-name expansion, shape validation, byte
 //! accounting, and resident-lease assignment independent of model families.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
-use safemlx::{module::ModuleParameters, transforms::eval, Array, Stream};
+use safemlx::{module::ModuleParameters, Array, Stream};
 
 use crate::{
     error::Error,
-    runtime::checkpoint::recipe::{DerivedWeightRecipe, RecipeDtype},
-    runtime::checkpoint::store::{TensorSelection, WeightReadPolicy, WeightStore},
+    runtime::checkpoint::recipe::{DerivedWeightRecipe, RecipeDtype, WeightRecipeError},
+    runtime::checkpoint::store::{
+        TensorSelection, WeightMaterialization, WeightReadPolicy, WeightStore, WeightStoreError,
+    },
     runtime::checkpoint::{
         load::{load_array_quantized_strict, StrictLoadConfig, StrictLoadReport},
         quantization::WeightQuantization,
     },
     runtime::residency::manager::{ResidentUnitLease, WeightBinding},
 };
+
+const MODEL_LOAD_MATERIALIZATION_BUFFERS: usize = 2;
 
 /// Converts a module parameter name to its canonical checkpoint spelling.
 ///
@@ -103,8 +107,10 @@ pub fn build_module_bindings_with_recipes(
 ///
 /// This is useful for loaders that keep one parameter class resident while a
 /// separate cache owns another class from the same type-erased checkpoint
-/// store. Recipe outputs are evaluated before their source mappings are
-/// released, and copied to the execution stream when the streams differ.
+/// store. Direct and recipe outputs share a fixed two-completion window;
+/// source mappings remain retained through their exact event, and outputs are
+/// copied to the execution stream when the streams differ. Mapping-capacity
+/// pressure drains the oldest completion before retrying.
 pub(crate) fn materialize_module_bindings(
     store: &dyn WeightStore,
     bindings: &[WeightBinding],
@@ -112,37 +118,88 @@ pub(crate) fn materialize_module_bindings(
     execution_stream: &Stream,
 ) -> Result<BTreeMap<String, Array>, ModuleBindingError> {
     let mut arrays = BTreeMap::new();
+    let mut pending = VecDeque::with_capacity(MODEL_LOAD_MATERIALIZATION_BUFFERS);
     for binding in bindings {
-        let value = if let Some(recipe) = binding.recipe() {
-            let source = recipe.materialize(store, source_stream)?;
-            if source_stream == execution_stream {
-                source
-            } else {
-                let value = source
-                    .copy(execution_stream)
-                    .map_err(crate::runtime::checkpoint::recipe::WeightRecipeError::from)?;
-                eval([&value])
-                    .map_err(crate::runtime::checkpoint::recipe::WeightRecipeError::from)?;
-                value
+        let materialization = loop {
+            match submit_module_binding(store, binding, source_stream, execution_stream) {
+                Ok(materialization) => break materialization,
+                Err(error) if !pending.is_empty() && is_mapping_capacity_error(&error) => {
+                    finish_module_binding(&mut pending, &mut arrays)?;
+                }
+                Err(error) => return Err(error),
             }
-        } else {
-            store
-                .acquire_with_policy(
-                    binding.checkpoint_key(),
-                    binding.selection().clone(),
-                    WeightReadPolicy::RequireBounded,
-                )?
-                .materialize(source_stream, execution_stream)?
         };
-        if arrays.insert(binding.name().to_string(), value).is_some() {
-            return Err(ModuleBindingError::DuplicateCheckpointBinding {
-                checkpoint_key: binding.checkpoint_key().to_string(),
-                first: binding.name().to_string(),
-                second: binding.name().to_string(),
-            });
+        pending.push_back((
+            binding.name().to_string(),
+            binding.checkpoint_key().to_string(),
+            materialization,
+        ));
+        if pending.len() == MODEL_LOAD_MATERIALIZATION_BUFFERS {
+            finish_module_binding(&mut pending, &mut arrays)?;
         }
     }
+    while !pending.is_empty() {
+        finish_module_binding(&mut pending, &mut arrays)?;
+    }
     Ok(arrays)
+}
+
+fn submit_module_binding(
+    store: &dyn WeightStore,
+    binding: &WeightBinding,
+    source_stream: &Stream,
+    execution_stream: &Stream,
+) -> Result<WeightMaterialization, ModuleBindingError> {
+    if let Some(recipe) = binding.recipe() {
+        let pending = recipe.prepare_materialization(store, source_stream)?;
+        let (source, sources) = pending.into_parts();
+        let output = if source_stream == execution_stream {
+            source
+        } else {
+            source
+                .copy(execution_stream)
+                .map_err(WeightRecipeError::from)?
+        };
+        Ok(WeightMaterialization::submit_retained(output, sources)?)
+    } else {
+        Ok(store
+            .acquire_with_policy(
+                binding.checkpoint_key(),
+                binding.selection().clone(),
+                WeightReadPolicy::RequireBounded,
+            )?
+            .materialize(source_stream, execution_stream)?)
+    }
+}
+
+type PendingModuleBinding = (String, String, WeightMaterialization);
+
+fn finish_module_binding(
+    pending: &mut VecDeque<PendingModuleBinding>,
+    arrays: &mut BTreeMap<String, Array>,
+) -> Result<(), ModuleBindingError> {
+    let (name, checkpoint_key, materialization) = pending
+        .pop_front()
+        .expect("non-empty model-loading window has a front");
+    let value = materialization.synchronize()?;
+    if arrays.insert(name.clone(), value).is_some() {
+        return Err(ModuleBindingError::DuplicateCheckpointBinding {
+            checkpoint_key,
+            first: name.clone(),
+            second: name,
+        });
+    }
+    Ok(())
+}
+
+fn is_mapping_capacity_error(error: &ModuleBindingError) -> bool {
+    matches!(
+        error,
+        ModuleBindingError::WeightStore(WeightStoreError::CapacityExhausted { .. })
+            | ModuleBindingError::WeightRecipe(WeightRecipeError::WeightStore(
+                WeightStoreError::CapacityExhausted { .. }
+            ))
+    )
 }
 
 /// Populates an unloaded module from materialized local-name bindings while
@@ -551,6 +608,8 @@ pub enum ModuleBindingError {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
     use safemlx::{
         module::ModuleParameters, nn, Array, Device, DeviceType, Dtype, ExecutionContext,
     };
@@ -634,6 +693,47 @@ mod tests {
         assert!(keys.contains("proj.scales"));
         assert!(keys.contains("proj.biases"));
         assert!(keys.contains("proj.bias"));
+    }
+
+    #[test]
+    fn model_loading_window_drains_at_a_one_shard_mapping_bound() {
+        let context = cpu();
+        let linear = nn::Linear::unloaded(2, 3, true, Dtype::Float32, context.stream()).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let weight = Array::from_slice(&[0.1f32; 6], &[3, 2]);
+        let bias = Array::from_slice(&[0.2f32; 3], &[3]);
+        Array::save_safetensors(
+            [("proj.weight", &weight)],
+            None,
+            dir.path().join("weight.safetensors"),
+        )
+        .unwrap();
+        Array::save_safetensors(
+            [("proj.bias", &bias)],
+            None,
+            dir.path().join("bias.safetensors"),
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("model.safetensors.index.json"),
+            r#"{"weight_map":{"proj.bias":"bias.safetensors","proj.weight":"weight.safetensors"}}"#,
+        )
+        .unwrap();
+        let store = SafetensorsWeightStore::open_with_max_mapped_shards(dir.path(), 1).unwrap();
+        let bindings = build_module_bindings(&linear, "proj", &store).unwrap();
+
+        let arrays =
+            materialize_module_bindings(&store, &bindings, context.stream(), context.stream())
+                .unwrap();
+        assert_eq!(
+            arrays["weight"].evaluated().unwrap().as_slice::<f32>(),
+            &[0.1; 6]
+        );
+        assert_eq!(
+            arrays["bias"].evaluated().unwrap().as_slice::<f32>(),
+            &[0.2; 3]
+        );
+        assert_eq!(store.diagnostics().unwrap().currently_mapped_shards, 1);
     }
 
     #[test]

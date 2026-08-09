@@ -8,7 +8,7 @@ use std::collections::BTreeSet;
 
 use safemlx::{
     ops::{concatenate_axis, stack_axis},
-    transforms::eval,
+    transforms::async_eval_with_event,
     Array, Dtype, Stream,
 };
 
@@ -1464,7 +1464,7 @@ impl PendingWeightRecipe {
     }
 
     fn finish(self) -> Result<Array, WeightRecipeError> {
-        eval([&self.output])?;
+        async_eval_with_event([&self.output])?.synchronize()?;
         for source in self.sources {
             source.complete();
         }
@@ -1488,7 +1488,7 @@ fn materialize_inputs(
             match input.materialize_inner(store, stream, &mut input_sources, borrow_sources) {
                 Ok(array) => {
                     if detach_remaining && !input_sources.is_empty() {
-                        eval([&array])?;
+                        async_eval_with_event([&array])?.synchronize()?;
                         for source in input_sources.drain(..) {
                             source.complete();
                         }
@@ -1515,7 +1515,7 @@ fn materialize_inputs(
                         if child_sources.is_empty() {
                             continue;
                         }
-                        eval([&*array])?;
+                        async_eval_with_event([&*array])?.synchronize()?;
                         for source in child_sources.drain(..) {
                             source.complete();
                         }

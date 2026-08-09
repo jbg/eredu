@@ -1423,7 +1423,9 @@ pub fn load_partition_from_store_on_streams(
         };
         let lease =
             store.acquire_with_policy(&source, selection, WeightReadPolicy::RequireBounded)?;
-        let value = lease.materialize(source_stream, execution_stream)?;
+        let value = lease
+            .materialize(source_stream, execution_stream)?
+            .synchronize()?;
         opened_shards.insert(lease.backing_shard().to_path_buf());
         report.loaded.insert(target.clone());
         if tensors.insert(target.clone(), value).is_some() {

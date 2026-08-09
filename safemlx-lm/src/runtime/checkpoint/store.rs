@@ -1,10 +1,10 @@
 //! Persistent, lazy checkpoint tensor storage.
 //!
 //! A [`crate::runtime::checkpoint::store::WeightLease`] pins the bytes backing a safetensors
-//! view. Materialization
-//! never exposes that view as an MLX array: selection, copying, evaluation, and
-//! conservative stream synchronization all finish before an owned array is
-//! returned to the caller.
+//! view. Materialization returns an owning completion guard that retains the
+//! view through asynchronous MLX evaluation. Callers may order a compatible
+//! consumer stream without blocking the host, or synchronize the exact
+//! materialization before taking its independently owned output.
 
 use std::{
     any::Any,
@@ -24,8 +24,8 @@ use safemlx::{
         GgufLogicalDtype, GgufMaterializer, GgufTensor, GgufTensorDescriptor, GgufTensorSelection,
         GgufTensorSelectionPlan,
     },
-    transforms::eval,
-    Array, Stream,
+    transforms::async_eval_with_event,
+    Array, Event, Stream,
 };
 use safetensors::{
     tensor::{Dtype, Metadata, TensorInfo, TensorView},
@@ -320,17 +320,6 @@ pub enum WeightStoreError {
         key: String,
         /// Operation being performed.
         operation: &'static str,
-        /// MLX exception.
-        #[source]
-        source: safemlx::error::Exception,
-    },
-    /// Conservative stream synchronization failed.
-    #[error("stream synchronization failed for tensor {key:?} on {stream}: {source}")]
-    Synchronization {
-        /// Tensor key.
-        key: String,
-        /// Stream role.
-        stream: &'static str,
         /// MLX exception.
         #[source]
         source: safemlx::error::Exception,
@@ -1672,20 +1661,21 @@ impl WeightLease {
         }
     }
 
-    /// Safely materializes the selected tensor onto `execution_stream`.
+    /// Submits the selected tensor for materialization onto `execution_stream`.
     ///
-    /// The returned copy is explicitly evaluated while this lease and its
-    /// mmap-derived source array remain live. Batched residency callers use
-    /// `prepare_materialization` internally evaluates several outputs together.
-    /// An incomplete pending value synchronizes conservatively during drop.
+    /// The returned guard owns this lease, every mmap-derived source, and the
+    /// exact completion event. Call [`WeightMaterialization::wait_on`] before
+    /// evaluating a dependent graph on another compatible stream, or call
+    /// [`WeightMaterialization::synchronize`] to block for and take the output.
+    /// MLX graph construction alone does not consume the materialization.
     pub fn materialize(
         &self,
         source_stream: &Stream,
         execution_stream: &Stream,
-    ) -> Result<Array, WeightStoreError> {
+    ) -> Result<WeightMaterialization, WeightStoreError> {
         self.clone()
             .prepare_materialization(source_stream, execution_stream)?
-            .finish()
+            .submit()
     }
 
     /// Schedules materialization while retaining every mmap-backed dependency.
@@ -2273,33 +2263,161 @@ impl PendingWeightMaterialization {
         &self.output
     }
 
-    /// Evaluates this output and releases its source dependencies.
-    pub(crate) fn finish(mut self) -> Result<Array, WeightStoreError> {
-        let output = if self.borrowed_source {
-            self.output.copy(&self.source_stream).map_err(|source| {
-                self.lease
-                    .as_ref()
-                    .expect("pending materialization retains its lease")
-                    .mlx_error("borrowed source copy", source)
-            })?
-        } else {
-            self.output.clone()
-        };
-        eval([&output]).map_err(|source| {
+    #[cfg(test)]
+    fn finish(self) -> Result<Array, WeightStoreError> {
+        self.submit()?.synchronize()
+    }
+
+    fn submit(mut self) -> Result<WeightMaterialization, WeightStoreError> {
+        self.prepare_owned_output()?;
+        let output = self.output.clone();
+        WeightMaterialization::submit_retained(output, vec![self])
+    }
+
+    fn prepare_owned_output(&mut self) -> Result<(), WeightStoreError> {
+        if !self.borrowed_source {
+            return Ok(());
+        }
+        let output = self.output.copy(&self.source_stream).map_err(|source| {
             self.lease
                 .as_ref()
                 .expect("pending materialization retains its lease")
-                .mlx_error("evaluation", source)
+                .mlx_error("borrowed source copy", source)
         })?;
+        self.output = output;
+        self.borrowed_source = false;
+        Ok(())
+    }
+
+    fn complete_in_place(&mut self) {
         self.completed = true;
         self.lease.take();
-        Ok(output)
     }
 
     /// Marks a batch member complete after a containing output was evaluated.
     pub(crate) fn complete(mut self) {
         self.completed = true;
         self.lease.take();
+    }
+}
+
+/// Owning completion for one checkpoint tensor materialization.
+///
+/// This single-shot guard retains checkpoint mappings and source arrays until
+/// its exact MLX completion finishes. It may order multiple compatible
+/// consumers. Dropping an unfinished guard blocks only for this event, never
+/// for an entire stream. Asynchronous backend errors are returned by query or
+/// synchronization. The type is intentionally neither `Send` nor `Sync`
+/// because it owns SafeMLX's thread-affine [`Event`].
+#[must_use = "checkpoint mappings remain retained until this completion is consumed or dropped"]
+pub struct WeightMaterialization {
+    output: Array,
+    sources: Vec<PendingWeightMaterialization>,
+    event: Option<Event>,
+}
+
+impl WeightMaterialization {
+    pub(crate) fn submit_retained(
+        output: Array,
+        sources: Vec<PendingWeightMaterialization>,
+    ) -> Result<Self, WeightStoreError> {
+        let key = sources
+            .first()
+            .and_then(|pending| pending.lease.as_ref())
+            .map(|lease| lease.key.clone())
+            .unwrap_or_else(|| "<derived checkpoint materialization>".into());
+        let event = async_eval_with_event([&output]).map_err(|source| WeightStoreError::Mlx {
+            key,
+            operation: "evaluation submission",
+            source,
+        })?;
+        Ok(Self {
+            output,
+            sources,
+            event: Some(event),
+        })
+    }
+
+    /// Returns the materialized output while this guard retains its sources.
+    pub fn output(&self) -> &Array {
+        &self.output
+    }
+
+    /// Orders subsequently submitted work on `stream` after this completion.
+    ///
+    /// This does not block the host. The stream must be backend/device
+    /// compatible, and the consumer graph must be evaluated after this call.
+    pub fn wait_on(&self, stream: &Stream) -> Result<(), WeightStoreError> {
+        self.event
+            .as_ref()
+            .expect("unfinished materialization retains its event")
+            .wait_on(stream)
+            .map_err(|source| self.mlx_error("consumer stream wait", source))
+    }
+
+    /// Returns whether the exact materialization has completed without blocking.
+    pub fn is_complete(&self) -> Result<bool, WeightStoreError> {
+        self.event
+            .as_ref()
+            .expect("unfinished materialization retains its event")
+            .is_complete()
+            .map_err(|source| self.mlx_error("completion query", source))
+    }
+
+    /// Blocks for the exact completion and returns the independently owned output.
+    pub fn synchronize(mut self) -> Result<Array, WeightStoreError> {
+        let output = self.output().clone();
+        self.finish(true)?;
+        Ok(output)
+    }
+
+    fn finish(&mut self, report_error: bool) -> Result<(), WeightStoreError> {
+        let Some(event) = self.event.take() else {
+            return Ok(());
+        };
+        let key = self
+            .sources
+            .first()
+            .and_then(|pending| pending.lease.as_ref())
+            .map(|lease| lease.key.clone())
+            .unwrap_or_else(|| "<completed checkpoint materialization>".into());
+        let result = event.synchronize();
+        for mut pending in self.sources.drain(..) {
+            pending.complete_in_place();
+        }
+        match result {
+            Ok(()) => Ok(()),
+            Err(source) if report_error => Err(WeightStoreError::Mlx {
+                key,
+                operation: "completion",
+                source,
+            }),
+            Err(_) => Ok(()),
+        }
+    }
+
+    fn mlx_error(
+        &self,
+        operation: &'static str,
+        source: safemlx::error::Exception,
+    ) -> WeightStoreError {
+        let key = self
+            .sources
+            .first()
+            .and_then(|pending| pending.lease.as_ref())
+            .map(|lease| lease.key.clone())
+            .unwrap_or_else(|| "<completed checkpoint materialization>".into());
+        WeightStoreError::Mlx {
+            key,
+            operation,
+            source,
+        }
+    }
+}
+
+impl Drop for WeightMaterialization {
+    fn drop(&mut self) {
+        let _ = self.finish(false);
     }
 }
 
@@ -2873,7 +2991,10 @@ fn safetensors_dtype_alignment(dtype: Dtype) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use safemlx::{Device, DeviceType, Dtype as MlxDtype};
+    use safemlx::{
+        transforms::{async_eval, async_eval_with_event},
+        Device, DeviceType, Dtype as MlxDtype,
+    };
     use safemlx_gguf::{GgmlType, TensorInput, Writer};
     use safetensors::tensor::{serialize_to_file, TensorView};
 
@@ -2924,6 +3045,8 @@ mod tests {
             lease
                 .materialize(&stream, &stream)
                 .unwrap()
+                .synchronize()
+                .unwrap()
                 .evaluated()
                 .unwrap()
                 .as_slice::<f32>(),
@@ -2932,6 +3055,80 @@ mod tests {
         let diagnostics = store.diagnostics().unwrap();
         assert_eq!(diagnostics.backend, WeightStoreBackend::Memory);
         assert_eq!(diagnostics.physical_reads, 0);
+    }
+
+    #[test]
+    fn weight_materialization_event_orders_multiple_cpu_consumers() {
+        let source_stream = cpu_stream();
+        let execution_stream = cpu_stream();
+        let consumer_a = cpu_stream();
+        let consumer_b = cpu_stream();
+        let source = Array::ones::<f32>(&[1024, 1024], &source_stream).unwrap();
+        let store = MemoryWeightStore::new([("matrix".to_string(), source)]).unwrap();
+
+        let blocker_lhs = Array::ones::<f32>(&[1024, 1024], &execution_stream).unwrap();
+        let blocker_rhs = Array::ones::<f32>(&[1024, 1024], &execution_stream).unwrap();
+        let blocker = blocker_lhs.matmul(&blocker_rhs, &execution_stream).unwrap();
+        async_eval([&blocker]).unwrap();
+
+        let materialization = store
+            .acquire(
+                "matrix",
+                TensorSelection::Range {
+                    axis: 0,
+                    start: 0,
+                    end: 1,
+                },
+            )
+            .unwrap()
+            .materialize(&source_stream, &execution_stream)
+            .unwrap();
+        assert!(!materialization.is_complete().unwrap());
+        materialization.wait_on(&consumer_a).unwrap();
+        materialization.wait_on(&consumer_b).unwrap();
+        let consumed_a = materialization.output().square(&consumer_a).unwrap();
+        let consumed_b = materialization.output().square(&consumer_b).unwrap();
+        let completion_a = async_eval_with_event([&consumed_a]).unwrap();
+        let completion_b = async_eval_with_event([&consumed_b]).unwrap();
+
+        let output = materialization.synchronize().unwrap();
+        assert_eq!(output.shape(), [1, 1024]);
+        completion_a.synchronize().unwrap();
+        completion_b.synchronize().unwrap();
+    }
+
+    #[test]
+    #[ignore = "explicit Metal checkpoint materialization test; run on a Metal host"]
+    fn weight_materialization_metal_handoff_does_not_block_the_host() {
+        let source_stream = cpu_stream();
+        let transfer_stream = Stream::new_with_device(&Device::new(DeviceType::Gpu, 0));
+        let consumer_stream = Stream::new_with_device(&Device::new(DeviceType::Gpu, 0));
+        let source = Array::ones::<f32>(&[1024, 1024], &source_stream).unwrap();
+        let store = MemoryWeightStore::new([("matrix".to_string(), source)]).unwrap();
+
+        let blocker_lhs = Array::ones::<f32>(&[4096, 4096], &transfer_stream).unwrap();
+        let blocker_rhs = Array::ones::<f32>(&[4096, 4096], &transfer_stream).unwrap();
+        let blocker = blocker_lhs.matmul(&blocker_rhs, &transfer_stream).unwrap();
+        async_eval([&blocker]).unwrap();
+        let materialization = store
+            .acquire(
+                "matrix",
+                TensorSelection::Range {
+                    axis: 0,
+                    start: 0,
+                    end: 1,
+                },
+            )
+            .unwrap()
+            .materialize(&source_stream, &transfer_stream)
+            .unwrap();
+        assert!(!materialization.is_complete().unwrap());
+        materialization.wait_on(&consumer_stream).unwrap();
+        assert!(!materialization.is_complete().unwrap());
+        let consumed = materialization.output().square(&consumer_stream).unwrap();
+        let completion = async_eval_with_event([&consumed]).unwrap();
+        drop(materialization);
+        completion.synchronize().unwrap();
     }
 
     fn safetensors_shard(lease: &WeightLease) -> &Arc<MappedShard> {
@@ -3145,7 +3342,11 @@ mod tests {
         ));
 
         let stream = cpu_stream();
-        let selected = lease.materialize(&stream, &stream).unwrap();
+        let selected = lease
+            .materialize(&stream, &stream)
+            .unwrap()
+            .synchronize()
+            .unwrap();
         assert_eq!(selected.shape(), [1, 2, 4]);
         assert_eq!(
             selected.evaluated().unwrap().as_slice::<f32>(),
@@ -3320,6 +3521,8 @@ mod tests {
             )
             .unwrap()
             .materialize(&stream, &stream)
+            .unwrap()
+            .synchronize()
             .unwrap();
         assert_eq!(value.shape(), [2, 4]);
         let diagnostics = store.diagnostics().unwrap();
@@ -3537,7 +3740,11 @@ mod tests {
         ));
         assert_eq!(one.metadata().shape, [1]);
         let stream = cpu_stream();
-        let pinned_value = one.materialize(&stream, &stream).unwrap();
+        let pinned_value = one
+            .materialize(&stream, &stream)
+            .unwrap()
+            .synchronize()
+            .unwrap();
         assert_eq!(pinned_value.evaluated().unwrap().as_slice::<i32>(), &[1]);
         drop(one);
 
@@ -3561,6 +3768,8 @@ mod tests {
             .acquire("matrix", TensorSelection::Full)
             .unwrap()
             .materialize(&stream, &stream)
+            .unwrap()
+            .synchronize()
             .unwrap();
         let outer = store
             .acquire(
@@ -3573,6 +3782,8 @@ mod tests {
             )
             .unwrap()
             .materialize(&stream, &stream)
+            .unwrap()
+            .synchronize()
             .unwrap();
         let inner = store
             .acquire(
@@ -3585,6 +3796,8 @@ mod tests {
             )
             .unwrap()
             .materialize(&stream, &stream)
+            .unwrap()
+            .synchronize()
             .unwrap();
         let indexed = store
             .acquire(
@@ -3596,6 +3809,8 @@ mod tests {
             )
             .unwrap()
             .materialize(&stream, &stream)
+            .unwrap()
+            .synchronize()
             .unwrap();
 
         assert_eq!(
@@ -3753,16 +3968,22 @@ mod tests {
             .acquire("f16", TensorSelection::Full)
             .unwrap()
             .materialize(&stream, &stream)
+            .unwrap()
+            .synchronize()
             .unwrap();
         let bf16 = store
             .acquire("bf16", TensorSelection::Full)
             .unwrap()
             .materialize(&stream, &stream)
+            .unwrap()
+            .synchronize()
             .unwrap();
         let fp8 = store
             .acquire("fp8", TensorSelection::Full)
             .unwrap()
             .materialize(&stream, &stream)
+            .unwrap()
+            .synchronize()
             .unwrap();
         assert_eq!(f16.dtype(), MlxDtype::Float16);
         assert_eq!(bf16.dtype(), MlxDtype::Bfloat16);
@@ -3835,6 +4056,8 @@ mod tests {
             .acquire("weight", TensorSelection::Full)
             .unwrap()
             .materialize(&stream, &stream)
+            .unwrap()
+            .synchronize()
             .unwrap();
         let value = materialized.evaluated().unwrap();
         assert_eq!(value.as_slice::<i32>(), &[7]);
@@ -3871,7 +4094,11 @@ mod tests {
         let value = {
             let store = SafetensorsWeightStore::open(dir.path()).unwrap();
             let lease = store.acquire("weight", TensorSelection::Full).unwrap();
-            lease.materialize(&stream, &stream).unwrap()
+            lease
+                .materialize(&stream, &stream)
+                .unwrap()
+                .synchronize()
+                .unwrap()
         };
         assert_eq!(value.evaluated().unwrap().as_slice::<i32>(), &[7, 8, 9]);
     }
@@ -3893,6 +4120,8 @@ mod tests {
             .acquire("weight", TensorSelection::Full)
             .unwrap()
             .materialize(&source, &execution)
+            .unwrap()
+            .synchronize()
             .unwrap();
         assert_eq!(value.evaluated().unwrap().as_slice::<i32>(), &[10, 20, 30]);
     }

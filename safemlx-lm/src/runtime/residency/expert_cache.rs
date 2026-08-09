@@ -1635,6 +1635,7 @@ mod tests {
                 admitted_working_set_bytes: 320,
                 transformed_weights: 4,
                 source_tiles: 8,
+                peak_in_flight_tiles: 1,
                 source_bytes_read: 2_048,
                 output_bytes: 320,
                 peak_planned_working_set_bytes: 296,

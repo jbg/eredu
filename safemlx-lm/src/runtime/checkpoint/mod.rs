@@ -1,4 +1,5 @@
-//! Checkpoint loading, storage, binding, and conversion.
+//! Checkpoint loading, event-owned materialization, binding, and bounded
+//! double-buffered conversion.
 
 /// Stable identities for loaded checkpoint artifacts.
 pub(crate) mod artifact;

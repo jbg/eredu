@@ -8,7 +8,7 @@ use memmap2::MmapOptions;
 use safemlx::{
     module::{FlattenedModuleParamMut, ModuleParameters},
     ops::{concatenate_axis, stack_axis, GgufCheckpoint, GgufMetadataValue, GgufTensor},
-    transforms::eval,
+    transforms::async_eval_with_event,
     Array, Stream,
 };
 use safetensors::SafeTensors;
@@ -694,8 +694,7 @@ pub(crate) fn load_array_quantized_strict(
             if let Some(biases) = &quantized.biases {
                 arrays.push(biases);
             }
-            eval(arrays)?;
-            quantization_stream.synchronize()?;
+            async_eval_with_event(arrays)?.synchronize()?;
             load_array_strict(params, weight_key, quantized.weight, config, report);
             load_array_strict(params, scales_key, quantized.scales, config, report);
             if let Some(biases) = quantized.biases {
@@ -1079,7 +1078,7 @@ fn pack_split_swiglu_expert_prefix(
     }
     let gate_up_proj = stack_axis(&gate_up, 0, stream)?;
     let down_proj = stack_axis(&down, 0, stream)?;
-    eval([&gate_up_proj, &down_proj])?;
+    async_eval_with_event([&gate_up_proj, &down_proj])?.synchronize()?;
     Ok(HashMap::from([
         (format!("{prefix}.gate_up_proj"), gate_up_proj),
         (format!("{prefix}.down_proj"), down_proj),
@@ -1240,7 +1239,7 @@ fn pack_split_relu2_expert_prefix(
 
     let up_proj = stack_axis(&up, 0, stream)?;
     let down_proj = stack_axis(&down, 0, stream)?;
-    eval([&up_proj, &down_proj])?;
+    async_eval_with_event([&up_proj, &down_proj])?.synchronize()?;
     Ok(HashMap::from([
         (format!("{prefix}.up_proj"), up_proj),
         (format!("{prefix}.down_proj"), down_proj),

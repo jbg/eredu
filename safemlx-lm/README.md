@@ -38,9 +38,15 @@ readers are opened lazily and retained under the same bounded shard control.
 
 An acquired `WeightLease` pins its mapped bytes. Full tensors, contiguous axis
 ranges, and ordered axis indices are selected before the result is copied to a
-caller-provided execution stream. Materialization evaluates and conservatively
-synchronizes its source and execution streams before returning, so the result
-cannot retain a lazy dependency on mmap storage after the lease is dropped.
+caller-provided execution stream. `WeightLease::materialize` submits that exact
+copy and returns an owning `WeightMaterialization`. The guard exposes
+nonblocking query and compatible-stream wait operations, retains mappings and
+source arrays through completion, and can be synchronized to take the owned
+array. Dropping an unfinished guard waits only for its event, never a whole
+stream. Constructing a lazy consumer graph is not enough: insert its stream
+wait before evaluating the consumer. Model binding loads retain at most two
+submitted materializations and complete the oldest first; a one-shard mapping
+bound drains that window before retrying rather than exceeding capacity.
 The deterministic mapped-shard cache has a configurable nonzero per-store bound. A live
 lease pins its cache entry; if every entry at the bound is leased, acquisition
 returns a structured capacity error instead of exceeding the limit.
@@ -52,7 +58,7 @@ faults are not reported as known physical disk transfers because logical
 materialization and storage I/O are different measurements.
 
 `runtime::checkpoint::bounded_quantization` provides the shared out-of-core
-materialisation path for load-time affine and MXFP4 conversion. A
+materialization path for load-time affine and MXFP4 conversion. A
 `BoundedQuantizationPlan` names semantic source recipes and an explicit maximum
 conversion working set. Each source is read in bounded row tiles on a CPU
 stream, quantized immediately, and written directly into a temporary indexed
@@ -60,14 +66,18 @@ SafeTensors store. The store overlays only the final packed `weight`, `scales`,
 and optional `biases` tensors; untransformed keys continue to use the original
 SafeTensors or GGUF store. A complete dense source tensor and a complete packed
 destination tensor are therefore not required in active memory at the same
-time.
+time. When the working-set ceiling can admit two minimum row tiles, conversion
+uses two CPU streams and retains a fixed current-plus-next event window: the
+next tile quantizes while the host completes and writes the prior tile. Smaller
+ceilings fall back to one tile without exceeding the configured bound.
 
 Admission counts the conservative peak of the selected semantic recipe plus
 the packed outputs for that tile. It fails before payload materialization when
 even one row does not fit, when the source cannot perform the requested bounded
 selection, or when packed geometry and alignment are illegal. Conversion
-telemetry reports selected dense bytes, packed output bytes, tile count, and
-the largest admitted source, output, and combined working sets. Downstream
+telemetry reports selected dense bytes, packed output bytes, tile count, peak
+in-flight tile count, and the largest admitted source, output, and combined
+double-buffered working sets. Downstream
 residency planning reads metadata from the packed overlay, so host and device
 budgets count the quantized bytes rather than the original dense bytes.
 
@@ -253,13 +263,13 @@ pinned static weights plus the largest permitted consecutive layer window.
 Residency reports account for parameter copies only; activations, KV state,
 kernels, and allocator cache can make MLX peak memory larger.
 
-Transfers are synchronous because the pinned MLX API exposes whole-stream
-synchronization but no public events. Registered GGUF checkpoints and bounded
-load-time affine/MXFP4 conversion from unquantized SafeTensors or
+Checkpoint materialization and promotion use exact MLX completion events;
+ordinary layerwise execution keeps its bounded two-layer transfer window.
+Registered GGUF checkpoints and bounded load-time affine/MXFP4 conversion from unquantized SafeTensors or
 F32/F16/BF16 GGUF sources use the same layerwise residency plan; matching
 checkpoint-native packed GGUF tensors load directly and are never implicitly
-transcoded. Pinned host buffers, KV-cache offload, and asynchronous transfer or
-compute overlap are not supported by this policy. The opt-in
+transcoded. Pinned host buffers and KV-cache offload are not supported by this
+policy. The opt-in
 `llama_residency` example accepts a real checkpoint directory and reports
 latency, throughput, logical residency, transfer telemetry, allocator samples,
 and mapped-shard diagnostics.
@@ -2082,9 +2092,11 @@ under persistent checkpoint storage. Its conversion budget can be set to the
 final quantized model footprint: for example, the deterministic tests convert
 a 2,048-byte F32 matrix under a 320-byte working-set ceiling, equal to that
 matrix's complete affine 4-bit weight, scale, and bias representation. The
-result then enters `ResidencyManager` as a 320-byte unit. Conversion uses a CPU
-stream and clears released MLX allocator cache entries between tiles, so source
-tiles do not accumulate in device or host allocator residency.
+result then enters `ResidencyManager` as a 320-byte unit. Conversion uses
+explicit CPU streams and clears released MLX allocator cache entries as
+completed tiles are written. Its fixed two-tile event window remains inside
+the admitted combined working set; budgets that cannot hold two minimum tiles
+use one slot.
 
 The generic checkpoint converter quantizes eligible two-dimensional
 `*.weight` tensors one at a time, writes bounded-size safetensors shards, and
