@@ -1977,10 +1977,34 @@ pub(super) fn load_gguf_model_data(
                 };
                 (model, loaded.eos_token_ids)
             }
-            GgufArchitecture::Inkling
-            | GgufArchitecture::NemotronH
-            | GgufArchitecture::NemotronHMoe => {
-                unreachable!("load policy rejects unsupported load-time transformations")
+            GgufArchitecture::Inkling => {
+                let mmproj = inkling::open_sibling_mmproj(gguf_file)?;
+                #[cfg(feature = "media-processing")]
+                if mmproj.is_some() {
+                    processor = Some(ModelProcessor::load_inkling_gguf(&metadata)?);
+                }
+                let (loaded, eos_token_ids) =
+                    crate::architectures::inkling::layerwise::load_inkling_gguf_layerwise_model(
+                        &checkpoint,
+                        &metadata,
+                        mmproj.as_ref(),
+                        options.weight_residency,
+                        Some(quantization),
+                        stream,
+                        weights_stream,
+                    )?;
+                (Model::Inkling(loaded), eos_token_ids)
+            }
+            GgufArchitecture::NemotronH | GgufArchitecture::NemotronHMoe => {
+                let (loaded, eos_token_ids) = crate::architectures::nemotron_h::layerwise::load_nemotron_h_gguf_layerwise_model(
+                    &checkpoint,
+                    &metadata,
+                    options.weight_residency,
+                    Some(quantization),
+                    stream,
+                    weights_stream,
+                )?;
+                (Model::NemotronH(loaded), eos_token_ids)
             }
         }
     } else {
@@ -2033,6 +2057,7 @@ pub(super) fn load_gguf_model_data(
                         &metadata,
                         mmproj.as_ref(),
                         options.weight_residency,
+                        options.quantization,
                         stream,
                         weights_stream,
                     )?;
@@ -2089,6 +2114,7 @@ pub(super) fn load_gguf_model_data(
                     &checkpoint,
                     &metadata,
                     options.weight_residency,
+                    options.quantization,
                     stream,
                     weights_stream,
                 )?;

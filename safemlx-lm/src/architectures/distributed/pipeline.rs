@@ -87,8 +87,8 @@ use crate::{
     runtime::execution::layerwise::{
         open_safetensors_weight_store, quantize_pipeline_stage_store, shard_layer_bindings,
         ArchitectureAdapter, DenseDiskStreamReport, DenseStreamController, LayerWeightResidency,
-        LayerwiseLoadOptions, PipelineStageQuantizationSelection, SharedWeightStore,
-        StaticUnitBindings,
+        LayerwiseLoadOptions, LoadTimeQuantizableAdapter, PipelineStageQuantizationSelection,
+        SharedWeightStore, StaticUnitBindings,
     },
     runtime::generation::sampler::Sampler,
     runtime::media::{PreparedModelInput, PreparedModelInputIdentity},
@@ -11740,24 +11740,20 @@ fn load_nemotron_h_pipeline(
             stage.lm_head.is_some() || stage.parallel_lm_head.is_some(),
         ),
     ]);
-    let (store, materialization) = if dense_stream.is_some() {
-        match requested {
-            Some(quantization) => {
-                let (store, report) = quantize_pipeline_stage_store(
-                    store,
-                    &binding_adapter,
-                    &target_binding_adapter,
-                    PipelineStageQuantizationSelection::new(&static_roles, 0, stage.range.clone()),
-                    quantization,
-                    stream,
-                    weights_stream,
-                )?;
-                (store, Some(report))
-            }
-            None => (store, None),
+    let (store, materialization) = match requested {
+        Some(quantization) => {
+            let (store, report) = quantize_pipeline_stage_store(
+                store,
+                &binding_adapter,
+                &target_binding_adapter,
+                PipelineStageQuantizationSelection::new(&static_roles, 0, stage.range.clone()),
+                quantization,
+                stream,
+                weights_stream,
+            )?;
+            (store, Some(report))
         }
-    } else {
-        (store, None)
+        None => (store, None),
     };
     let requested = materialization.is_none().then_some(requested).flatten();
     let binding_adapter = if materialization.is_some() {
@@ -15385,18 +15381,31 @@ fn load_inkling_pipeline(
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<PipelineModel, Error> {
-    if requested_quantization.is_some() {
-        return Err(Error::Quantization(
-            "Inkling pipeline load-time requantization is unsupported; use checkpoint-native encodings"
-                .into(),
-        ));
-    }
-    let binding_adapter = if expert_cache_options.is_some() {
+    let source_binding_adapter = if expert_cache_options.is_some() {
         InklingLayerwiseAdapter::new_external_experts(args.clone(), stream)?
     } else {
         InklingLayerwiseAdapter::new(args.clone(), stream)?
     };
-    let expert_assignment = binding_adapter.expert_parallel_assignment(topology)?;
+    let quantize_on_load = requested_quantization
+        .map(|requested| {
+            crate::runtime::checkpoint::quantization::should_quantize_on_load(
+                "Inkling pipeline",
+                args.text_config.weight_quantization,
+                requested,
+            )
+            .map(|required| required.then_some(requested))
+        })
+        .transpose()?
+        .flatten();
+    let target_binding_adapter = match quantize_on_load {
+        Some(quantization) => source_binding_adapter.load_time_quantized(quantization, stream)?,
+        None if expert_cache_options.is_some() => {
+            InklingLayerwiseAdapter::new_external_experts(args.clone(), stream)?
+        }
+        None => InklingLayerwiseAdapter::new(args.clone(), stream)?,
+    };
+    let target_args = target_binding_adapter.args().clone();
+    let expert_assignment = source_binding_adapter.expert_parallel_assignment(topology)?;
     topology.preflight(
         Some(args.text_config.num_hidden_layers as usize),
         expert_assignment
@@ -15411,7 +15420,7 @@ fn load_inkling_pipeline(
         args.text_config.hidden_size,
     );
     let mut stage = InklingStage::new(
-        args.clone(),
+        target_args.clone(),
         range,
         &info,
         expert_cache_options.is_some(),
@@ -15442,11 +15451,12 @@ fn load_inkling_pipeline(
             .is_first
             .then(|| {
                 crate::nn::parallel::VocabParallelEmbedding::unloaded_with_dtype(
-                    args.text_config.vocab_size as usize,
-                    args.text_config.hidden_size,
-                    args.text_config
+                    target_args.text_config.vocab_size as usize,
+                    target_args.text_config.hidden_size,
+                    target_args
+                        .text_config
                         .weight_quantization_for("model.embed_tokens.weight"),
-                    args.text_config.weight_dtype(),
+                    target_args.text_config.weight_dtype(),
                     build,
                     stream,
                 )
@@ -15456,10 +15466,12 @@ fn load_inkling_pipeline(
             .is_last
             .then(|| {
                 crate::nn::parallel::VocabParallelLmHead::unloaded_with_dtype(
-                    args.text_config.hidden_size,
-                    args.text_config.vocab_size as usize,
-                    args.text_config.weight_quantization_for("lm_head.weight"),
-                    args.text_config.weight_dtype(),
+                    target_args.text_config.hidden_size,
+                    target_args.text_config.vocab_size as usize,
+                    target_args
+                        .text_config
+                        .weight_quantization_for("lm_head.weight"),
+                    target_args.text_config.weight_dtype(),
                     build,
                     stream,
                 )
@@ -15497,29 +15509,58 @@ fn load_inkling_pipeline(
             })
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let static_units = pipeline_binding_units(
-        &binding_adapter,
-        store.as_ref(),
-        &selected_pipeline_static_roles([
-            (
-                "embedding",
-                stage.embedding.is_some()
-                    || stage.parallel_embedding.is_some()
-                    || (info.is_first && stage.has_multimodal_ingress),
-            ),
-            (
-                "embed_norm",
-                stage.embed_norm.is_some() || (info.is_first && stage.has_multimodal_ingress),
-            ),
-            ("norm", stage.norm.is_some()),
-            (
-                "output",
-                stage.lm_head.is_some() || stage.parallel_lm_head.is_some(),
-            ),
-            ("audio", info.is_first && args.audio_config.is_some()),
-            ("vision_norm", info.is_first && args.vision_config.is_some()),
-        ]),
-    )?;
+    let static_roles = selected_pipeline_static_roles([
+        (
+            "embedding",
+            stage.embedding.is_some()
+                || stage.parallel_embedding.is_some()
+                || (info.is_first && stage.has_multimodal_ingress),
+        ),
+        (
+            "embed_norm",
+            stage.embed_norm.is_some() || (info.is_first && stage.has_multimodal_ingress),
+        ),
+        ("norm", stage.norm.is_some()),
+        (
+            "output",
+            stage.lm_head.is_some() || stage.parallel_lm_head.is_some(),
+        ),
+        ("audio", info.is_first && target_args.audio_config.is_some()),
+        (
+            "vision_norm",
+            info.is_first && target_args.vision_config.is_some(),
+        ),
+    ]);
+    let (store, materialization) = match quantize_on_load {
+        Some(quantization) => {
+            let (store, report) = quantize_pipeline_stage_store(
+                store,
+                &source_binding_adapter,
+                &target_binding_adapter,
+                PipelineStageQuantizationSelection::new(
+                    &static_roles,
+                    text_group,
+                    stage.range.clone(),
+                ),
+                quantization,
+                stream,
+                weights_stream,
+            )?;
+            (store, Some(report))
+        }
+        None => (store, None),
+    };
+    let requested = materialization
+        .is_none()
+        .then_some(quantize_on_load)
+        .flatten();
+    let binding_adapter = if materialization.is_some() {
+        &target_binding_adapter
+    } else {
+        &source_binding_adapter
+    };
+    info.materialization = materialization;
+    let static_units = pipeline_binding_units(binding_adapter, store.as_ref(), &static_roles)?;
     let mut loaded = PipelineLoadAccumulator::new("Inkling");
     if let Some(module) = &mut stage.parallel_embedding {
         let bindings = shard_layer_bindings(
@@ -15532,7 +15573,7 @@ fn load_inkling_pipeline(
             module.inner_mut(),
             store.as_ref(),
             &bindings,
-            None,
+            requested,
             weights_stream,
             stream,
         )?;
@@ -15541,7 +15582,7 @@ fn load_inkling_pipeline(
             module,
             store.as_ref(),
             pipeline_static_bindings(&static_units, "embedding")?,
-            None,
+            requested,
             weights_stream,
             stream,
         )?;
@@ -15551,7 +15592,7 @@ fn load_inkling_pipeline(
             module,
             store.as_ref(),
             pipeline_static_bindings(&static_units, "embed_norm")?,
-            None,
+            requested,
             weights_stream,
             stream,
         )?;
@@ -15561,7 +15602,7 @@ fn load_inkling_pipeline(
             module,
             store.as_ref(),
             pipeline_static_bindings(&static_units, "norm")?,
-            None,
+            requested,
             weights_stream,
             stream,
         )?;
@@ -15577,7 +15618,7 @@ fn load_inkling_pipeline(
             module.inner_mut(),
             store.as_ref(),
             &bindings,
-            None,
+            requested,
             weights_stream,
             stream,
         )?;
@@ -15586,7 +15627,7 @@ fn load_inkling_pipeline(
             module,
             store.as_ref(),
             pipeline_static_bindings(&static_units, "output")?,
-            None,
+            requested,
             weights_stream,
             stream,
         )?;
@@ -15663,7 +15704,7 @@ fn load_inkling_pipeline(
                     layer,
                     store.as_ref(),
                     &bindings,
-                    None,
+                    requested,
                     weights_stream,
                     stream,
                     &|name| name.starts_with("moe.experts."),
@@ -15673,14 +15714,15 @@ fn load_inkling_pipeline(
                     layer,
                     store.as_ref(),
                     &bindings,
-                    None,
+                    requested,
                     weights_stream,
                     stream,
                 )?;
             }
         }
     }
-    let static_bytes = loaded.finish_with_default(&mut info, args.text_config.weight_dtype())?;
+    let static_bytes =
+        loaded.finish_with_default(&mut info, target_args.text_config.weight_dtype())?;
     let checkpoint_diagnostics = store.diagnostics()?;
     let materialized_shards = checkpoint_diagnostics.touched_shard_paths.clone();
     if let Some(options) = dense_stream {
@@ -15776,7 +15818,7 @@ fn load_inkling_pipeline(
                 Arc::clone(&store),
                 entries,
                 Some(options),
-                None,
+                quantize_on_load,
                 weights_stream,
                 stream,
             )?;

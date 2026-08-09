@@ -4787,21 +4787,19 @@ fn load_tokenizer_accepts_top_level_qwen3_5_moe_metadata() {
 }
 
 #[test]
-fn load_options_report_unintegrated_nemotron_packed_materialization() {
-    let context = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+fn load_policy_admits_fully_resident_inkling_and_nemotron_materialization() {
     let options = ModelLoadOptions::with_quantization(AffineQuantization::default());
-    let dir = temp_model_dir(r#"{"model_type":"nemotron_h"}"#);
-    let error = load_model_with_options(&dir, options, context.stream(), context.stream())
-        .err()
-        .expect("affine loading should be rejected before weight loading");
-    assert!(matches!(error, Error::Quantization(_)));
-    assert!(
-        error
-            .to_string()
-            .contains("shared packed materialization overlay"),
-        "{error}"
-    );
-    fs::remove_dir_all(dir).unwrap();
+    for kind in [
+        super::config::ModelKind::Inkling,
+        super::config::ModelKind::NemotronH,
+    ] {
+        super::config::validate_load_policy(
+            kind,
+            super::config::ArtifactLoadKind::Safetensors,
+            options,
+        )
+        .unwrap();
+    }
 }
 
 #[test]

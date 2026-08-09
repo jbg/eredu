@@ -1100,13 +1100,16 @@ The remaining global limitations are:
   rank-local expert catalog rather than rebuilding topology arithmetic: EP
   ownership, TP projection ranges, and the conversion row tile compose into
   one bounded source span. The conversion budget is capped by the final packed
-  local semantic recipes. Ordinary residency plans are constructed only after
-  the packed overlay exists, so pinned static bytes, layerwise-host budgets,
-  dense-stream host/device windows, and expert-cache budgets all count packed
-  bindings. `LayerwiseModelMetadata::materialization`,
+  local semantic recipes, or by one unavoidable aligned semantic row when a
+  synthetic model's entire packed stage is smaller than one quantization row;
+  executing that projection already requires at least the corresponding row
+  workspace. Ordinary residency plans are constructed only after the packed
+  overlay exists, so pinned static bytes, layerwise-host budgets, dense-stream
+  host/device windows, and expert-cache budgets all count packed bindings.
+  `LayerwiseModelMetadata::materialization`,
   `PipelineStageInfo::materialization`, `ResidencyReport::materialization`, and
   `ExpertCacheReport::materialization` expose selected source bytes, output
-  bytes, tile counts, and the peak admitted working set.
+  bytes, tile counts, the admitted ceiling, and the peak planned working set.
 - Fixed-width F32/F16/BF16 GGUF tensors support bounded row/range, indexed, and
   reshaped contiguous-span reads. EP ownership, TP row placement, and
   conversion tiles may therefore compose over a fused dense bank without
@@ -1118,9 +1121,17 @@ The remaining global limitations are:
   encodings, and quantizing an already quantized checkpoint is intentionally
   unsupported. Inkling and Nemotron-H now share the affine grouped rank-3
   expert primitive with the other MoE implementations. Their packed semantic
-  adapters are complete; load-time conversion remains unavailable until load
-  dispatch and independent expert-cache construction use the shared packed
-  materialization overlay.
+  adapters, high-level load dispatch, independent expert-cache construction,
+  and pipeline-stage construction use the shared packed materialization
+  overlay. SafeTensors and dense GGUF conversion compose with standalone EP,
+  PP, PP+EP, and TP+PP+EP ownership; route-empty ranks participate without
+  materializing experts, and cache reports expose the selected packed format.
+  Complete rank-3 routed and shared banks are visited one matrix and bounded
+  row tile at a time while their expert-major output geometry is retained, so
+  fully resident conversion no longer requires an independent expert cache.
+  Inkling supports affine and MXFP4 conversion for every eligible text target;
+  Nemotron-H conversion remains affine-only because its ReLU2 grouped-expert
+  kernel has no MXFP4 target representation.
 
 TP+PP+EP is executable for DeepSeek-V3/R1, Qwen3-MoE, Qwen3-VL-MoE, Kimi
 Linear, Inkling, GPT-OSS, Gemma 4 MoE, LFM2-MoE, Nemotron-H-MoE, and
@@ -1777,8 +1788,8 @@ weights.
 | Gemma 4 dense / MoE | yes | MLX affine/MXFP4 and packed GGUF affine | yes / yes | `LoadedModel` | Dense plus routed gated-GELU branches share resident, layerwise, and external-MTP execution; specialized vision/audio components remain dense |
 | Gemma 4 assistant | yes | MLX affine/MXFP4 and uniform packed GGUF affine | yes / yes | `LoadedDrafter` with `ModelLoadOptions` | Transformer/projection/head targets; ordered masked-embedding heads return a capability error |
 | GPT-OSS | dense attention, MXFP4 experts | checkpoint-native MXFP4 experts plus `gpt-oss` GGUF | no / yes | `LoadedModel` | Canonical GGUF type-39 experts stay packed; mixed dense projections use their exact GGUF formats |
-| Inkling | yes | packed GGUF affine/IQ/MXFP4 | load-time conversion pending loader integration | `LoadedModel` | `inkling` text GGUF plus sibling combined hMLP/dMel mmproj; its packed semantic adapter keeps hMLP/dMel dense while text projections are packed, and routed plus shared experts work across resident and streamed policies |
-| Nemotron-H | yes | checkpoint-native packed GGUF affine/IQ | load-time conversion pending loader integration | `LoadedModel` (dense) | ReLU2 routed experts execute through the shared affine grouped rank-3 primitive and expose a packed semantic adapter; load dispatch and independent cache construction still need bounded packed-overlay integration |
+| Inkling | yes | packed GGUF affine/IQ/MXFP4 | yes / yes | `LoadedModel` | `inkling` text GGUF plus sibling combined hMLP/dMel mmproj; hMLP/dMel stay dense while every eligible text projection and complete shared/routed expert bank uses the packed overlay across fully resident, bounded nonresident, independent-cache, and Cartesian execution |
+| Nemotron-H | yes | checkpoint-native packed GGUF affine/IQ | yes / no | `LoadedModel` | ReLU2 routed experts execute through the shared affine grouped rank-3 primitive; complete expert banks and ordinary targets use the affine packed overlay across fully resident, bounded nonresident, independent-cache, and Cartesian execution |
 | Qwen3.5/3.6-MoE | yes | block FP8, MLX affine/MXFP4 | yes / yes, from dense checkpoints | `LoadedModel` | Rank-3 expert banks are quantized row-wise and executed with routed `gather_qmm`; native FP8 checkpoints are never implicitly transcoded |
 | Qwen3-Next | yes | native block FP8, MLX affine/MXFP4 | yes / yes, from dense checkpoints | `LoadedModel` | Official dynamic E4M3 128 x 128 checkpoints work with resident, layerwise, sparse expert-cache, and expert-parallel policies; fused weights/scales are split while streaming and native FP8 is never implicitly transcoded |
 | Moshi | yes | MLX affine/MXFP4 | yes / yes | realtime loader | Temporal/depth projections and embeddings; no codec dependency |

@@ -43,6 +43,7 @@ use crate::{
 pub struct BoundedQuantizationTarget {
     weight_name: String,
     source: DerivedWeightRecipe,
+    affine_companion_dtype: RecipeDtype,
 }
 
 impl BoundedQuantizationTarget {
@@ -68,7 +69,22 @@ impl BoundedQuantizationTarget {
         Ok(Self {
             weight_name,
             source,
+            affine_companion_dtype: RecipeDtype::F32,
         })
+    }
+
+    /// Selects the runtime dtype required for affine scales and biases.
+    pub fn with_affine_companion_dtype(mut self, dtype: RecipeDtype) -> Result<Self, Error> {
+        if !matches!(
+            dtype,
+            RecipeDtype::F16 | RecipeDtype::BF16 | RecipeDtype::F32
+        ) {
+            return Err(quantization_error(format!(
+                "bounded affine companions require F16, BF16, or F32, got {dtype:?}"
+            )));
+        }
+        self.affine_companion_dtype = dtype;
+        Ok(self)
     }
 
     /// Returns the packed weight's canonical logical name.
@@ -79,6 +95,15 @@ impl BoundedQuantizationTarget {
     /// Returns the semantic source recipe.
     pub fn source(&self) -> &DerivedWeightRecipe {
         &self.source
+    }
+
+    /// Returns the scalar width selected for affine scale and bias outputs.
+    pub(crate) fn affine_companion_bytes(&self) -> u64 {
+        match self.affine_companion_dtype {
+            RecipeDtype::F16 | RecipeDtype::BF16 => 2,
+            RecipeDtype::F32 => 4,
+            _ => unreachable!("validated bounded affine companion dtype"),
+        }
     }
 
     /// Returns the packed scale tensor name derived from this target.
@@ -166,6 +191,10 @@ impl BoundedQuantizationPlan {
 /// Deterministic telemetry from one bounded transformation pass.
 #[derive(Debug, Clone, Default, Eq, PartialEq)]
 pub struct BoundedQuantizationReport {
+    /// Planner ceiling for simultaneously live conversion data. This is the
+    /// larger of the final packed output and the smallest legal semantic row
+    /// tile when a synthetic fixture is smaller than one quantization row.
+    pub admitted_working_set_bytes: u64,
     /// Number of dense semantic matrices transformed.
     pub transformed_weights: usize,
     /// Number of independently evaluated source row tiles.
@@ -191,6 +220,7 @@ pub struct BoundedQuantizedWeightStore {
     source: Arc<dyn WeightStore + Send + Sync>,
     transformed: SafetensorsWeightStore,
     transformed_keys: BTreeSet<String>,
+    materialized_source_keys: BTreeSet<String>,
     report: BoundedQuantizationReport,
     _directory: TempDir,
 }
@@ -229,11 +259,20 @@ impl BoundedQuantizedWeightStore {
         }
 
         preflight_source_collisions(source.as_ref(), &plan)?;
+        let materialized_source_keys = plan
+            .targets
+            .iter()
+            .flat_map(|target| target.source.source_keys())
+            .map(ToString::to_string)
+            .collect();
         let directory = tempfile::Builder::new()
             .prefix("safemlx-bounded-quantization-")
             .tempdir()?;
         let mut index = BTreeMap::<String, String>::new();
-        let mut report = BoundedQuantizationReport::default();
+        let mut report = BoundedQuantizationReport {
+            admitted_working_set_bytes: plan.max_working_set_bytes,
+            ..BoundedQuantizationReport::default()
+        };
 
         for (ordinal, target) in plan.targets.iter().enumerate() {
             let shard_name = format!("quantized-{ordinal:05}.safetensors");
@@ -260,6 +299,7 @@ impl BoundedQuantizedWeightStore {
             source,
             transformed,
             transformed_keys,
+            materialized_source_keys,
             report,
             _directory: directory,
         })
@@ -290,6 +330,16 @@ impl WeightStore for BoundedQuantizedWeightStore {
             .keys()
             .into_iter()
             .chain(self.transformed_keys.iter().cloned())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect()
+    }
+
+    fn materialized_source_keys(&self) -> Vec<String> {
+        self.source
+            .materialized_source_keys()
+            .into_iter()
+            .chain(self.materialized_source_keys.iter().cloned())
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect()
@@ -381,10 +431,10 @@ fn transform_target(
     }
     let row_axis = metadata.shape().len() - 2;
     let leading = checked_product(&metadata.shape()[..row_axis], "leading target dimensions")?;
-    if leading != 1 {
+    if leading == 0 {
         return Err(quantization_error(format!(
-            "bounded quantization target {:?} has {} leading matrices; its semantic recipe must select one owned matrix and reshape it before conversion",
-            target.weight_name, leading
+            "bounded quantization target {:?} must contain at least one leading matrix",
+            target.weight_name
         )));
     }
     let rows = metadata.shape()[row_axis];
@@ -419,20 +469,21 @@ fn transform_target(
             .checked_add(layout.row_bytes)
             .ok_or_else(|| quantization_error("quantized output row size overflow"))
     })?;
-    let one_row = target.source.select_bounded(
-        source,
-        TensorSelection::Range {
-            axis: row_axis,
-            start: 0,
-            end: 1,
-        },
-    )?;
-    one_row.preflight_bounded(source)?;
-    let one_row_source_bytes = one_row.infer(source)?.byte_len();
-    let one_row_peak = one_row
-        .peak_materialization_bytes(source)?
-        .checked_add(output_row_bytes)
-        .ok_or_else(|| quantization_error("one-row conversion working-set overflow"))?;
+    let mut one_row_source_bytes = 0u64;
+    let mut one_row_peak = 0u64;
+    for matrix in 0..leading {
+        let one_row = target
+            .source
+            .select_bounded_matrix_rows(source, matrix, 0, 1)?;
+        one_row.preflight_bounded(source)?;
+        one_row_source_bytes = one_row_source_bytes.max(one_row.infer(source)?.byte_len());
+        one_row_peak = one_row_peak.max(
+            one_row
+                .peak_materialization_bytes(source)?
+                .checked_add(output_row_bytes)
+                .ok_or_else(|| quantization_error("one-row conversion working-set overflow"))?,
+        );
+    }
     if one_row_peak > plan.max_working_set_bytes {
         return Err(quantization_error(format!(
             "bounded quantization target {:?} requires at least {} working-set bytes for one row, but the plan permits {}",
@@ -441,95 +492,113 @@ fn transform_target(
     }
     let payload_offset = create_shard(path, &layouts)?;
     let mut file = OpenOptions::new().write(true).open(path)?;
-    let mut start = 0usize;
-    while start < rows {
-        // TP segmented placements can have discontinuities in their compact
-        // row space. Admit each tile at its actual start so no tile crosses a
-        // semantic segment boundary with a larger peak than the first tile.
-        let mut end = start + 1;
-        let mut rejected_end = rows.saturating_add(1);
-        while end + 1 < rejected_end {
-            let candidate_end = end + (rejected_end - end) / 2;
-            let candidate = target.source.select_bounded(
-                source,
-                TensorSelection::Range {
-                    axis: row_axis,
+    for matrix in 0..leading {
+        let mut start = 0usize;
+        while start < rows {
+            // TP segmented placements can have discontinuities in their compact
+            // row space. Admit each tile at its actual start so no tile crosses a
+            // semantic segment boundary with a larger peak than the first tile.
+            let mut end = start + 1;
+            let mut rejected_end = rows.saturating_add(1);
+            while end + 1 < rejected_end {
+                let candidate_end = end + (rejected_end - end) / 2;
+                let candidate = target.source.select_bounded_matrix_rows(
+                    source,
+                    matrix,
                     start,
-                    end: candidate_end,
-                },
-            )?;
-            candidate.preflight_bounded(source)?;
-            let candidate_rows = candidate_end - start;
-            let output_bytes = output_row_bytes
-                .checked_mul(candidate_rows as u64)
-                .ok_or_else(|| quantization_error("candidate tile output size overflow"))?;
-            let peak = candidate
-                .peak_materialization_bytes(source)?
-                .checked_add(output_bytes)
-                .ok_or_else(|| quantization_error("candidate tile working-set overflow"))?;
-            if peak <= plan.max_working_set_bytes {
-                end = candidate_end;
-            } else {
-                rejected_end = candidate_end;
+                    candidate_end,
+                )?;
+                candidate.preflight_bounded(source)?;
+                let candidate_rows = candidate_end - start;
+                let output_bytes = output_row_bytes
+                    .checked_mul(candidate_rows as u64)
+                    .ok_or_else(|| quantization_error("candidate tile output size overflow"))?;
+                let peak = candidate
+                    .peak_materialization_bytes(source)?
+                    .checked_add(output_bytes)
+                    .ok_or_else(|| quantization_error("candidate tile working-set overflow"))?;
+                if peak <= plan.max_working_set_bytes {
+                    end = candidate_end;
+                } else {
+                    rejected_end = candidate_end;
+                }
             }
-        }
-        let tile_rows = end - start;
-        let tile_recipe = target.source.select_bounded(
-            source,
-            TensorSelection::Range {
-                axis: row_axis,
-                start,
-                end,
-            },
-        )?;
-        tile_recipe.preflight_bounded(source)?;
-        let tile_metadata = tile_recipe.infer(source)?;
-        let tile_output_bytes = output_row_bytes
-            .checked_mul(tile_rows as u64)
-            .ok_or_else(|| quantization_error("quantized tile output size overflow"))?;
-        let tile_peak = tile_recipe
-            .peak_materialization_bytes(source)?
-            .checked_add(tile_output_bytes)
-            .ok_or_else(|| quantization_error("conversion tile working-set overflow"))?;
-        if tile_peak > plan.max_working_set_bytes {
-            return Err(quantization_error(format!(
-                "bounded quantization planner admitted {} rows for {:?}, but their {}-byte working set exceeds the {}-byte bound",
-                tile_rows, target.weight_name, tile_peak, plan.max_working_set_bytes
-            )));
-        }
+            let tile_rows = end - start;
+            let tile_recipe = target
+                .source
+                .select_bounded_matrix_rows(source, matrix, start, end)?;
+            tile_recipe.preflight_bounded(source)?;
+            let tile_metadata = tile_recipe.infer(source)?;
+            let tile_output_bytes = output_row_bytes
+                .checked_mul(tile_rows as u64)
+                .ok_or_else(|| quantization_error("quantized tile output size overflow"))?;
+            let tile_peak = tile_recipe
+                .peak_materialization_bytes(source)?
+                .checked_add(tile_output_bytes)
+                .ok_or_else(|| quantization_error("conversion tile working-set overflow"))?;
+            if tile_peak > plan.max_working_set_bytes {
+                return Err(quantization_error(format!(
+                    "bounded quantization planner admitted {} rows for {:?}, but their {}-byte working set exceeds the {}-byte bound",
+                    tile_rows, target.weight_name, tile_peak, plan.max_working_set_bytes
+                )));
+            }
 
-        let pending = tile_recipe.prepare_borrowed_materialization(source, source_stream)?;
-        let (dense, source_mappings) = pending.into_parts();
-        let quantized = quantize_tensor(&dense, plan.quantization, source_stream)?;
-        let mut outputs = vec![quantized.weight, quantized.scales];
-        if let Some(biases) = quantized.biases {
-            outputs.push(biases);
-        }
-        eval(outputs.iter())?;
-        source_stream.synchronize()?;
-        for (layout, output) in layouts.iter().zip(&outputs) {
-            write_tile(&mut file, payload_offset, layout, start, tile_rows, output)?;
-        }
-        for mapping in source_mappings {
-            mapping.complete();
-        }
+            let pending = tile_recipe.prepare_borrowed_materialization(source, source_stream)?;
+            let (dense, source_mappings) = pending.into_parts();
+            let quantized = quantize_tensor(&dense, plan.quantization, source_stream)?;
+            let companion_dtype = match target.affine_companion_dtype {
+                RecipeDtype::F16 => Dtype::Float16,
+                RecipeDtype::BF16 => Dtype::Bfloat16,
+                RecipeDtype::F32 => Dtype::Float32,
+                _ => unreachable!("validated bounded companion dtype"),
+            };
+            let scales = if matches!(plan.quantization, WeightQuantization::MxFp4) {
+                quantized.scales
+            } else {
+                quantized.scales.as_dtype(companion_dtype, source_stream)?
+            };
+            let mut outputs = vec![quantized.weight, scales];
+            if let Some(biases) = quantized.biases {
+                outputs.push(biases.as_dtype(companion_dtype, source_stream)?);
+            }
+            eval(outputs.iter())?;
+            source_stream.synchronize()?;
+            let output_start = matrix
+                .checked_mul(rows)
+                .and_then(|offset| offset.checked_add(start))
+                .ok_or_else(|| quantization_error("quantized output row offset overflow"))?;
+            for (layout, output) in layouts.iter().zip(&outputs) {
+                write_tile(
+                    &mut file,
+                    payload_offset,
+                    layout,
+                    output_start,
+                    tile_rows,
+                    output,
+                )?;
+            }
+            for mapping in source_mappings {
+                mapping.complete();
+            }
 
-        report.source_tiles = report.source_tiles.saturating_add(1);
-        report.source_bytes_read = report
-            .source_bytes_read
-            .checked_add(tile_metadata.byte_len())
-            .ok_or_else(|| quantization_error("source-read telemetry overflow"))?;
-        report.peak_planned_working_set_bytes =
-            report.peak_planned_working_set_bytes.max(tile_peak);
-        report.largest_source_tile_bytes = report
-            .largest_source_tile_bytes
-            .max(tile_metadata.byte_len());
-        report.largest_output_tile_bytes = report.largest_output_tile_bytes.max(tile_output_bytes);
+            report.source_tiles = report.source_tiles.saturating_add(1);
+            report.source_bytes_read = report
+                .source_bytes_read
+                .checked_add(tile_metadata.byte_len())
+                .ok_or_else(|| quantization_error("source-read telemetry overflow"))?;
+            report.peak_planned_working_set_bytes =
+                report.peak_planned_working_set_bytes.max(tile_peak);
+            report.largest_source_tile_bytes = report
+                .largest_source_tile_bytes
+                .max(tile_metadata.byte_len());
+            report.largest_output_tile_bytes =
+                report.largest_output_tile_bytes.max(tile_output_bytes);
 
-        drop(outputs);
-        drop(dense);
-        memory::clear_cache()?;
-        start = end;
+            drop(outputs);
+            drop(dense);
+            memory::clear_cache()?;
+            start = end;
+        }
     }
     file.flush()?;
     file.sync_data()?;
@@ -546,7 +615,12 @@ fn transform_target(
         .ok_or_else(|| quantization_error("quantized output telemetry overflow"))?;
     debug_assert_eq!(
         metadata.byte_len(),
-        report_source_bytes(rows, one_row_source_bytes)?
+        report_source_bytes(
+            leading
+                .checked_mul(rows)
+                .ok_or_else(|| quantization_error("source row count overflow"))?,
+            one_row_source_bytes
+        )?
     );
     Ok(())
 }
@@ -571,6 +645,17 @@ fn output_layouts(
     prefix.push(rows);
 
     let mut layouts = Vec::with_capacity(if quantization.has_biases() { 3 } else { 2 });
+    let (affine_dtype, affine_scalar_bytes) = match target.affine_companion_dtype {
+        RecipeDtype::F16 => (SafeDtype::F16, 2),
+        RecipeDtype::BF16 => (SafeDtype::BF16, 2),
+        RecipeDtype::F32 => (SafeDtype::F32, 4),
+        _ => {
+            return Err(quantization_error(format!(
+                "bounded affine companion output has invalid dtype {:?}",
+                target.affine_companion_dtype
+            )))
+        }
+    };
     layouts.push(layout(
         target.weight_name.clone(),
         SafeDtype::U32,
@@ -583,23 +668,23 @@ fn output_layouts(
         if matches!(quantization, WeightQuantization::MxFp4) {
             SafeDtype::U8
         } else {
-            SafeDtype::F32
+            affine_dtype
         },
         prefix.clone(),
         scale_columns,
         if matches!(quantization, WeightQuantization::MxFp4) {
             1
         } else {
-            4
+            affine_scalar_bytes
         },
     )?);
     if quantization.has_biases() {
         layouts.push(layout(
             biases_name,
-            SafeDtype::F32,
+            affine_dtype,
             prefix,
             scale_columns,
-            4,
+            affine_scalar_bytes,
         )?);
     }
 
@@ -717,6 +802,8 @@ fn write_tile(
     let evaluated = output.evaluated()?;
     match output.dtype() {
         Dtype::Uint32 => write_native_slice(file, evaluated.as_slice::<u32>())?,
+        Dtype::Float16 => write_native_slice(file, evaluated.as_slice::<half::f16>())?,
+        Dtype::Bfloat16 => write_native_slice(file, evaluated.as_slice::<half::bf16>())?,
         Dtype::Float32 => write_native_slice(file, evaluated.as_slice::<f32>())?,
         Dtype::Uint8 => file.write_all(evaluated.as_slice::<u8>())?,
         dtype => {
@@ -908,6 +995,7 @@ mod tests {
         assert_eq!(
             transformed.report(),
             &BoundedQuantizationReport {
+                admitted_working_set_bytes: 320,
                 transformed_weights: 1,
                 source_tiles: 8,
                 source_bytes_read: 2_048,
@@ -1079,6 +1167,52 @@ mod tests {
     }
 
     #[test]
+    fn complete_rank_three_expert_bank_is_tiled_without_flattening_its_output() {
+        let directory = tempfile::tempdir().unwrap();
+        let values = matrix_values(2, 4, 64);
+        let bytes = float_bytes(&values);
+        serialize_to_file(
+            [(
+                "model.experts.weight",
+                TensorView::new(SafeDtype::F32, vec![2, 4, 64], &bytes).unwrap(),
+            )],
+            None,
+            &directory.path().join("model.safetensors"),
+        )
+        .unwrap();
+        let source = Arc::new(SafetensorsWeightStore::open(directory.path()).unwrap());
+        let context = cpu_context();
+        let plan = BoundedQuantizationPlan::new(
+            AffineQuantization::default(),
+            296,
+            [BoundedQuantizationTarget::direct("model.experts.weight").unwrap()],
+        )
+        .unwrap();
+        let transformed =
+            BoundedQuantizedWeightStore::create(source, plan, context.stream()).unwrap();
+
+        assert_eq!(transformed.report().source_tiles, 8);
+        assert_eq!(transformed.report().source_bytes_read, 2_048);
+        assert_eq!(transformed.report().output_bytes, 320);
+        assert_eq!(
+            transformed.metadata("model.experts.weight").unwrap().shape,
+            vec![2, 4, 8]
+        );
+        let expected = quantize_tensor(
+            &Array::from_slice(&values, &[2, 4, 64]),
+            AffineQuantization::default(),
+            context.stream(),
+        )
+        .unwrap();
+        let actual = materialize(&transformed, "model.experts.weight", context.stream());
+        assert_eq!(actual.shape(), &[2, 4, 8]);
+        assert_eq!(
+            actual.evaluated().unwrap().as_slice::<u32>(),
+            expected.weight.evaluated().unwrap().as_slice::<u32>()
+        );
+    }
+
+    #[test]
     fn dense_gguf_expert_and_row_selections_compose_without_full_bank_reads() {
         let values = matrix_values(2, 4, 64);
         let dense = Array::from_slice(&values, &[2, 4, 64]);
@@ -1131,6 +1265,49 @@ mod tests {
         .unwrap();
         let actual = materialize(&transformed, "rank.expert.weight", context.stream());
         assert_eq!(actual.shape(), &[1, 2, 8]);
+        assert_eq!(
+            actual.evaluated().unwrap().as_slice::<u32>(),
+            expected.weight.evaluated().unwrap().as_slice::<u32>()
+        );
+    }
+
+    #[test]
+    fn complete_rank_three_dense_gguf_bank_is_read_one_matrix_row_at_a_time() {
+        let values = matrix_values(2, 4, 64);
+        let dense = Array::from_slice(&values, &[2, 4, 64]);
+        let fixture = SyntheticGguf::dense(
+            &HashMap::from([("model.experts.weight".to_string(), dense.clone())]),
+            &HashMap::new(),
+        );
+        let source = Arc::new(
+            GgufWeightStore::new(GgufCheckpoint::open(fixture.path()).unwrap(), |name| {
+                name.to_string()
+            })
+            .unwrap(),
+        );
+        let context = cpu_context();
+        let plan = BoundedQuantizationPlan::new(
+            AffineQuantization::default(),
+            296,
+            [BoundedQuantizationTarget::direct("model.experts.weight").unwrap()],
+        )
+        .unwrap();
+        let transformed =
+            BoundedQuantizedWeightStore::create(source.clone(), plan, context.stream()).unwrap();
+
+        assert_eq!(transformed.report().source_tiles, 8);
+        assert_eq!(transformed.report().source_bytes_read, 2_048);
+        assert_eq!(transformed.report().output_bytes, 320);
+        let diagnostics = source.diagnostics().unwrap();
+        assert_eq!(diagnostics.physical_reads, 8);
+        assert_eq!(diagnostics.physical_read_bytes, 2_048);
+        assert_eq!(
+            transformed.metadata("model.experts.weight").unwrap().shape,
+            vec![2, 4, 8]
+        );
+        let expected =
+            quantize_tensor(&dense, AffineQuantization::default(), context.stream()).unwrap();
+        let actual = materialize(&transformed, "model.experts.weight", context.stream());
         assert_eq!(
             actual.evaluated().unwrap().as_slice::<u32>(),
             expected.weight.evaluated().unwrap().as_slice::<u32>()

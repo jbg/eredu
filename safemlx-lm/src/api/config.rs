@@ -404,14 +404,6 @@ pub(crate) fn validate_load_policy(
         )));
     }
 
-    if options.quantization.is_some() && matches!(kind, ModelKind::Inkling | ModelKind::NemotronH) {
-        return Err(Error::Quantization(match kind {
-            ModelKind::Inkling => "Inkling's packed semantic adapter is ready, but load dispatch and independent expert-cache construction are not yet connected to the shared packed materialization overlay".into(),
-            ModelKind::NemotronH => "Nemotron-H's packed semantic adapter is ready, but load dispatch and independent expert-cache construction are not yet connected to the shared packed materialization overlay".into(),
-            _ => unreachable!("matched above"),
-        }));
-    }
-
     let sparse = options.weight_residency.expert_cache().is_some();
     if artifact == ArtifactLoadKind::Safetensors
         && sparse

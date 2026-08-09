@@ -248,7 +248,16 @@ impl DerivedWeightRecipe {
         let metadata = self.infer(store)?;
         let selection = normalize_selection(selection, &metadata.shape)?;
         let expected_shape = selected_shape(metadata.shape.clone(), &selection)?;
-        let rewritten = push_selection(self, store, selection)?;
+        // Expand strided source indices before pushing an independent leading
+        // selection. This lets each physical row range combine with (for
+        // example) one expert coordinate into a contiguous scalar span. If
+        // expansion happens afterwards, the leading range remains wrapped
+        // around an indexed source and the store cannot bound either axis.
+        let expanded = expand_indexed_sources(self.clone());
+        let rewritten = normalize_bounded_source_ranges(
+            expand_indexed_sources(push_selection(&expanded, store, selection)?),
+            store,
+        )?;
         let actual = rewritten.infer(store)?;
         if actual.shape != expected_shape || actual.dtype != metadata.dtype {
             return Err(WeightRecipeError::SelectionPushdownUnsupported {
@@ -260,6 +269,66 @@ impl DerivedWeightRecipe {
             });
         }
         Ok(rewritten)
+    }
+
+    /// Selects rows from one matrix in a rank-two-or-higher tensor recipe.
+    ///
+    /// Leading dimensions are retained as singleton dimensions. This lets a
+    /// bounded writer visit an expert-major bank one matrix at a time without
+    /// flattening away the runtime bank geometry or reading adjacent experts.
+    pub(crate) fn select_bounded_matrix_rows(
+        &self,
+        store: &dyn WeightStore,
+        leading_index: usize,
+        start: usize,
+        end: usize,
+    ) -> Result<Self, WeightRecipeError> {
+        let metadata = self.infer(store)?;
+        if metadata.shape.len() < 2 {
+            return Err(WeightRecipeError::SelectionPushdownUnsupported {
+                operation: "matrix row selection",
+                reason: format!("rank {} has no matrix row axis", metadata.shape.len()),
+            });
+        }
+        let row_axis = metadata.shape.len() - 2;
+        let leading = usize::try_from(element_count(
+            &metadata.shape[..row_axis],
+            "leading matrix dimensions",
+        )?)
+        .map_err(|_| WeightRecipeError::ArithmeticOverflow("leading matrix dimensions"))?;
+        if leading_index >= leading {
+            return Err(WeightRecipeError::InvalidIndices {
+                axis: 0,
+                dimension: leading,
+            });
+        }
+
+        let mut coordinates = vec![0usize; row_axis];
+        let mut remainder = leading_index;
+        for axis in (0..row_axis).rev() {
+            let dimension = metadata.shape[axis];
+            coordinates[axis] = remainder % dimension;
+            remainder /= dimension;
+        }
+        let mut selected = self.clone();
+        for (axis, coordinate) in coordinates.into_iter().enumerate() {
+            selected = selected.select_bounded(
+                store,
+                TensorSelection::Range {
+                    axis,
+                    start: coordinate,
+                    end: coordinate + 1,
+                },
+            )?;
+        }
+        selected.select_bounded(
+            store,
+            TensorSelection::Range {
+                axis: row_axis,
+                start,
+                end,
+            },
+        )
     }
 
     /// Validates that every checkpoint source can be acquired without a
@@ -613,6 +682,168 @@ impl DerivedWeightRecipe {
             }
         }
     }
+}
+
+fn expand_indexed_sources(recipe: DerivedWeightRecipe) -> DerivedWeightRecipe {
+    match recipe {
+        DerivedWeightRecipe::Source {
+            key,
+            selection: TensorSelection::Indices { axis, indices },
+        } => {
+            let mut runs = Vec::<(usize, usize)>::new();
+            for index in indices {
+                if let Some((_, end)) = runs.last_mut() {
+                    if *end == index {
+                        *end += 1;
+                        continue;
+                    }
+                }
+                runs.push((index, index + 1));
+            }
+            let mut inputs = runs
+                .into_iter()
+                .map(|(start, end)| {
+                    DerivedWeightRecipe::source(
+                        key.clone(),
+                        TensorSelection::Range { axis, start, end },
+                    )
+                })
+                .collect::<Vec<_>>();
+            if inputs.len() == 1 {
+                inputs.pop().unwrap()
+            } else {
+                DerivedWeightRecipe::Concatenate { axis, inputs }
+            }
+        }
+        DerivedWeightRecipe::Source { .. } => recipe,
+        DerivedWeightRecipe::Select { input, selection } => DerivedWeightRecipe::Select {
+            input: Box::new(expand_indexed_sources(*input)),
+            selection,
+        },
+        DerivedWeightRecipe::Concatenate { axis, inputs } => DerivedWeightRecipe::Concatenate {
+            axis,
+            inputs: inputs.into_iter().map(expand_indexed_sources).collect(),
+        },
+        DerivedWeightRecipe::Stack { axis, inputs } => DerivedWeightRecipe::Stack {
+            axis,
+            inputs: inputs.into_iter().map(expand_indexed_sources).collect(),
+        },
+        DerivedWeightRecipe::Reshape { input, shape } => DerivedWeightRecipe::Reshape {
+            input: Box::new(expand_indexed_sources(*input)),
+            shape,
+        },
+        DerivedWeightRecipe::Transpose { input, axes } => DerivedWeightRecipe::Transpose {
+            input: Box::new(expand_indexed_sources(*input)),
+            axes,
+        },
+        DerivedWeightRecipe::Cast { input, dtype } => DerivedWeightRecipe::Cast {
+            input: Box::new(expand_indexed_sources(*input)),
+            dtype,
+        },
+        DerivedWeightRecipe::View {
+            input,
+            dtype,
+            shape,
+        } => DerivedWeightRecipe::View {
+            input: Box::new(expand_indexed_sources(*input)),
+            dtype,
+            shape,
+        },
+        DerivedWeightRecipe::NegLog { input } => DerivedWeightRecipe::NegLog {
+            input: Box::new(expand_indexed_sources(*input)),
+        },
+        DerivedWeightRecipe::SubtractOne { input } => DerivedWeightRecipe::SubtractOne {
+            input: Box::new(expand_indexed_sources(*input)),
+        },
+    }
+}
+
+fn normalize_bounded_source_ranges(
+    recipe: DerivedWeightRecipe,
+    store: &dyn WeightStore,
+) -> Result<DerivedWeightRecipe, WeightRecipeError> {
+    Ok(match recipe {
+        DerivedWeightRecipe::Source {
+            key,
+            selection: TensorSelection::Range { axis, start, end },
+        } if axis > 0 => {
+            let shape = store.metadata(&key)?.shape;
+            if shape[..axis].iter().product::<usize>() == 1 {
+                let trailing = shape[axis + 1..]
+                    .iter()
+                    .try_fold(1usize, |count, dimension| {
+                        count
+                            .checked_mul(*dimension)
+                            .ok_or(WeightRecipeError::ArithmeticOverflow(
+                                "bounded source range trailing span",
+                            ))
+                    })?;
+                let offset_elements =
+                    start
+                        .checked_mul(trailing)
+                        .ok_or(WeightRecipeError::ArithmeticOverflow(
+                            "bounded source range offset",
+                        ))?;
+                let mut selected_shape = shape;
+                selected_shape[axis] = end - start;
+                DerivedWeightRecipe::source(
+                    key,
+                    TensorSelection::Contiguous {
+                        offset_elements,
+                        shape: selected_shape,
+                    },
+                )
+            } else {
+                DerivedWeightRecipe::source(key, TensorSelection::Range { axis, start, end })
+            }
+        }
+        DerivedWeightRecipe::Source { .. } => recipe,
+        DerivedWeightRecipe::Select { input, selection } => DerivedWeightRecipe::Select {
+            input: Box::new(normalize_bounded_source_ranges(*input, store)?),
+            selection,
+        },
+        DerivedWeightRecipe::Concatenate { axis, inputs } => DerivedWeightRecipe::Concatenate {
+            axis,
+            inputs: inputs
+                .into_iter()
+                .map(|input| normalize_bounded_source_ranges(input, store))
+                .collect::<Result<Vec<_>, _>>()?,
+        },
+        DerivedWeightRecipe::Stack { axis, inputs } => DerivedWeightRecipe::Stack {
+            axis,
+            inputs: inputs
+                .into_iter()
+                .map(|input| normalize_bounded_source_ranges(input, store))
+                .collect::<Result<Vec<_>, _>>()?,
+        },
+        DerivedWeightRecipe::Reshape { input, shape } => DerivedWeightRecipe::Reshape {
+            input: Box::new(normalize_bounded_source_ranges(*input, store)?),
+            shape,
+        },
+        DerivedWeightRecipe::Transpose { input, axes } => DerivedWeightRecipe::Transpose {
+            input: Box::new(normalize_bounded_source_ranges(*input, store)?),
+            axes,
+        },
+        DerivedWeightRecipe::Cast { input, dtype } => DerivedWeightRecipe::Cast {
+            input: Box::new(normalize_bounded_source_ranges(*input, store)?),
+            dtype,
+        },
+        DerivedWeightRecipe::View {
+            input,
+            dtype,
+            shape,
+        } => DerivedWeightRecipe::View {
+            input: Box::new(normalize_bounded_source_ranges(*input, store)?),
+            dtype,
+            shape,
+        },
+        DerivedWeightRecipe::NegLog { input } => DerivedWeightRecipe::NegLog {
+            input: Box::new(normalize_bounded_source_ranges(*input, store)?),
+        },
+        DerivedWeightRecipe::SubtractOne { input } => DerivedWeightRecipe::SubtractOne {
+            input: Box::new(normalize_bounded_source_ranges(*input, store)?),
+        },
+    })
 }
 
 fn push_selection(
@@ -1845,9 +2076,10 @@ mod tests {
             rewritten,
             DerivedWeightRecipe::source(
                 "left",
-                TensorSelection::Indices {
+                TensorSelection::Range {
                     axis: 0,
-                    indices: vec![1],
+                    start: 1,
+                    end: 2,
                 }
             )
         );

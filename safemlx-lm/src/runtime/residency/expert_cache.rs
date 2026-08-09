@@ -433,6 +433,8 @@ pub struct ExpertPassStatistics {
 
 /// Point-in-time expert residency and execution report.
 pub struct ExpertCacheReport {
+    /// Packed encoding used by load-time transformed expert bindings.
+    pub weight_quantization: Option<WeightQuantization>,
     /// Owned logical expert count.
     pub owned_experts: usize,
     /// Owned logical expert bytes, including cold checkpoint-only experts.
@@ -1118,6 +1120,7 @@ impl ExpertCache {
             .lock()
             .map_err(|_| ExpertCacheError::StatisticsPoisoned)?;
         Ok(ExpertCacheReport {
+            weight_quantization: self.weight_quantization,
             owned_experts: self.catalog.len(),
             owned_bytes: self.catalog.values().copied().sum(),
             host_resident_experts,
@@ -1631,6 +1634,7 @@ mod tests {
         assert_eq!(
             report.materialization,
             Some(BoundedQuantizationReport {
+                admitted_working_set_bytes: 320,
                 transformed_weights: 4,
                 source_tiles: 8,
                 source_bytes_read: 2_048,

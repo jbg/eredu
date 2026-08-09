@@ -362,6 +362,11 @@ pub trait WeightStore: Any {
     /// Returns all catalog keys in deterministic order.
     fn keys(&self) -> Vec<String>;
 
+    /// Returns source keys consumed to synthesize overlay bindings.
+    fn materialized_source_keys(&self) -> Vec<String> {
+        Vec::new()
+    }
+
     /// Returns metadata, loading only the required backend metadata if needed.
     fn metadata(&self, key: &str) -> Result<WeightMetadata, WeightStoreError>;
 

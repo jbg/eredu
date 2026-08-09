@@ -39,13 +39,17 @@ use crate::{
     },
     runtime::cache::KeyValueCache,
     runtime::checkpoint::binding::{
-        build_module_bindings_with_recipes, populate_module_from_lease,
+        build_module_bindings_with_recipes, build_module_bindings_with_recipes_excluding,
+        packed_companion_checkpoint_name, populate_module_from_lease,
         populate_module_from_lease_excluding,
     },
     runtime::checkpoint::store::{GgufWeightStore, TensorSelection, WeightStore},
-    runtime::checkpoint::{quantization::WeightQuantization, recipe::DerivedWeightRecipe},
+    runtime::checkpoint::{
+        quantization::{should_quantize_on_load, WeightQuantization},
+        recipe::DerivedWeightRecipe,
+    },
     runtime::execution::layerwise::{
-        load_layerwise_model, load_safetensors_layerwise_model,
+        load_layerwise_model, load_layerwise_model_with_quantization,
         load_tensor_parallel_layerwise_model, open_safetensors_weight_store, ArchitectureAdapter,
         ExecutionGroupDag, LayerWeightResidency, LayerwiseForwardState, LayerwiseModel,
         LoadTimeQuantizableAdapter, StaticUnitBindings, WeightResidency,
@@ -364,24 +368,42 @@ impl CausalLm<Cache> for InklingLayerwiseModel {
 pub fn load_inkling_layerwise_model(
     model_dir: impl AsRef<Path>,
     options: impl Into<LayerWeightResidency>,
+    quantization: Option<WeightQuantization>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<InklingLayerwiseModel, Error> {
     let model_dir = model_dir.as_ref();
     let options = options.into();
     let residency = options.weight_residency();
+    let load_options = quantization
+        .map(crate::api::ModelLoadOptions::with_quantization)
+        .unwrap_or_default()
+        .with_weight_residency(residency);
     crate::api::structural::validate_safetensors_load_path(
         crate::api::ModelKind::Inkling,
         model_dir,
-        crate::api::ModelLoadOptions::default().with_weight_residency(residency),
+        load_options,
     )?;
     let args = resident::get_model_args(model_dir)?;
+    let quantize_on_load = quantization
+        .map(|requested| {
+            should_quantize_on_load(
+                "Inkling layerwise model",
+                args.text_config.weight_quantization,
+                requested,
+            )
+            .map(|required| required.then_some(requested))
+        })
+        .transpose()?
+        .flatten();
     let adapter = InklingLayerwiseAdapter::new(args, stream)?;
+    let store = open_safetensors_weight_store(model_dir, options.max_mapped_shards())?;
     Ok(InklingLayerwiseModel {
-        execution: load_safetensors_layerwise_model(
-            model_dir,
+        execution: load_layerwise_model_with_quantization(
+            store,
             adapter,
             options,
+            quantize_on_load,
             stream,
             weights_stream,
         )?,
@@ -471,14 +493,19 @@ pub(crate) fn load_inkling_gguf_layerwise_model(
     metadata: &HashMap<String, GgufMetadataValue>,
     mmproj: Option<&resident::InklingMmprojGguf>,
     residency: WeightResidency,
+    quantization: Option<WeightQuantization>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<(InklingLayerwiseModel, Vec<u32>), Error> {
+    let load_options = quantization
+        .map(crate::api::ModelLoadOptions::with_quantization)
+        .unwrap_or_default()
+        .with_weight_residency(residency);
     crate::api::structural::validate_gguf(
         crate::api::GgufArchitecture::Inkling,
         checkpoint,
         metadata,
-        crate::api::ModelLoadOptions::default().with_weight_residency(residency),
+        load_options,
     )
     .into_loader_result()?;
     let prepared = resident::prepare_gguf_checkpoint_with_mmproj(checkpoint, metadata, mmproj)?;
@@ -491,16 +518,18 @@ pub(crate) fn load_inkling_gguf_layerwise_model(
                 args,
                 expert_options,
                 residency.layers(),
+                quantization,
                 stream,
                 weights_stream,
             )?,
             prepared.eos_token_ids,
         ));
     }
-    let execution = load_layerwise_model(
+    let execution = load_layerwise_model_with_quantization(
         store,
         InklingLayerwiseAdapter::new(args, stream)?,
         residency.layers(),
+        quantization,
         stream,
         weights_stream,
     )?;
@@ -529,21 +558,39 @@ fn load_inkling_gguf_sparse_with_store(
     args: ModelArgs,
     options: ExpertCacheLoadOptions,
     non_expert: impl Into<LayerWeightResidency>,
+    quantization: Option<WeightQuantization>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<InklingLayerwiseModel, Error> {
     let mut adapter = InklingLayerwiseAdapter::new(args.clone(), stream)?;
     adapter.sparse_expert_cache = true;
-    let mut execution = load_layerwise_model(store, adapter, non_expert, stream, weights_stream)?;
+    let mut execution = load_layerwise_model_with_quantization(
+        store,
+        adapter,
+        non_expert,
+        quantization,
+        stream,
+        weights_stream,
+    )?;
     let checkpoint_store = execution.checkpoint_store_arc();
     let entries = inkling_expert_catalog(&args, checkpoint_store.as_ref())?;
-    execution.adapter_mut().expert_cache = Some(ExpertCache::new_shared(
-        checkpoint_store,
-        entries,
-        options,
-        weights_stream.clone(),
-        stream.clone(),
-    )?);
+    execution.adapter_mut().expert_cache = Some(match quantization {
+        Some(quantization) => ExpertCache::new_quantized_shared(
+            checkpoint_store,
+            entries,
+            options,
+            quantization,
+            weights_stream.clone(),
+            stream.clone(),
+        )?,
+        None => ExpertCache::new_shared(
+            checkpoint_store,
+            entries,
+            options,
+            weights_stream.clone(),
+            stream.clone(),
+        )?,
+    });
     Ok(InklingLayerwiseModel { execution })
 }
 
@@ -552,6 +599,7 @@ pub fn load_inkling_expert_cache_model(
     model_dir: impl AsRef<Path>,
     non_expert: crate::NonExpertWeightResidency,
     options: ExpertCacheLoadOptions,
+    quantization: Option<WeightQuantization>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<InklingLayerwiseModel, Error> {
@@ -574,19 +622,47 @@ pub fn load_inkling_expert_cache_model(
             "sparse expert caching requires an Inkling checkpoint with routed MoE layers".into(),
         ));
     }
+    let quantize_on_load = quantization
+        .map(|requested| {
+            should_quantize_on_load(
+                "Inkling independent expert cache",
+                args.text_config.weight_quantization,
+                requested,
+            )
+            .map(|required| required.then_some(requested))
+        })
+        .transpose()?
+        .flatten();
     let mut adapter = InklingLayerwiseAdapter::new(args.clone(), stream)?;
     adapter.sparse_expert_cache = true;
-    let mut execution =
-        load_safetensors_layerwise_model(model_dir, adapter, non_expert, stream, weights_stream)?;
+    let store = open_safetensors_weight_store(model_dir, non_expert.layers().max_mapped_shards())?;
+    let mut execution = load_layerwise_model_with_quantization(
+        store,
+        adapter,
+        non_expert,
+        quantize_on_load,
+        stream,
+        weights_stream,
+    )?;
     let store = execution.checkpoint_store_arc();
     let entries = inkling_expert_catalog(&args, store.as_ref())?;
-    execution.adapter_mut().expert_cache = Some(ExpertCache::new_shared(
-        store,
-        entries,
-        options,
-        weights_stream.clone(),
-        stream.clone(),
-    )?);
+    execution.adapter_mut().expert_cache = Some(match quantize_on_load {
+        Some(quantization) => ExpertCache::new_quantized_shared(
+            store,
+            entries,
+            options,
+            quantization,
+            weights_stream.clone(),
+            stream.clone(),
+        )?,
+        None => ExpertCache::new_shared(
+            store,
+            entries,
+            options,
+            weights_stream.clone(),
+            stream.clone(),
+        )?,
+    });
     Ok(InklingLayerwiseModel { execution })
 }
 
@@ -794,7 +870,20 @@ impl InklingLayerwiseAdapter {
         let mut recipes = BTreeMap::new();
         let parameters = module.parameters().flatten();
         for (local_name, parameter) in &parameters {
+            if self.sparse_expert_cache && local_name.starts_with("moe.experts.") {
+                continue;
+            }
             let destination = format!("{prefix}.{local_name}");
+            if parameter.dtype() == Dtype::Uint32 {
+                let packed_weight = format!("{destination}.weight");
+                if direct.contains(&packed_weight) {
+                    recipes.insert(
+                        local_name.to_string(),
+                        DerivedWeightRecipe::source(packed_weight, TensorSelection::Full),
+                    );
+                    continue;
+                }
+            }
             if let Some(inner) = destination.strip_suffix(".inner.weight") {
                 let checkpoint_name = format!("{inner}.weight");
                 if direct.contains(&checkpoint_name) {
@@ -824,6 +913,15 @@ impl InklingLayerwiseAdapter {
                         },
                     );
                 }
+                continue;
+            }
+            if let Some(companion) = packed_companion_checkpoint_name(&destination)
+                .filter(|companion| direct.contains(companion))
+            {
+                recipes.insert(
+                    local_name.to_string(),
+                    DerivedWeightRecipe::source(companion, TensorSelection::Full),
+                );
                 continue;
             }
             if destination.ends_with(".dense_global_scale")
@@ -2329,22 +2427,33 @@ impl ArchitectureAdapter for InklingLayerwiseAdapter {
         store: &dyn WeightStore,
     ) -> Result<Vec<WeightBinding>, Error> {
         let prefix = self.layer_checkpoint_prefix(group, index);
-        let bindings = build_module_bindings_with_recipes(
-            layer,
-            &prefix,
-            store,
-            self.recipes_for_module(layer, &prefix, store)?,
-        )?;
-        Ok(
-            if self.sparse_expert_cache && self.execution_group_name(group)? == "text_decoder" {
-                bindings
-                    .into_iter()
-                    .filter(|binding| !binding.name().starts_with("moe.experts."))
-                    .collect()
-            } else {
-                bindings
-            },
-        )
+        let recipes = self.recipes_for_module(layer, &prefix, store)?;
+        let bindings = if self.sparse_expert_cache
+            && self.execution_group_name(group)? == "text_decoder"
+        {
+            build_module_bindings_with_recipes_excluding(layer, &prefix, store, recipes, |name| {
+                name.starts_with("moe.experts.")
+            })?
+        } else {
+            build_module_bindings_with_recipes(layer, &prefix, store, recipes)?
+        };
+        bindings
+            .into_iter()
+            .map(|binding| {
+                if matches!(
+                    binding.name(),
+                    "moe.experts.gate_up_proj"
+                        | "moe.experts.down_proj"
+                        | "moe.shared_experts.gate_up_proj"
+                        | "moe.shared_experts.down_proj"
+                ) {
+                    let target = format!("{prefix}.{}.weight", binding.name());
+                    binding.with_logical_target(target).map_err(Error::from)
+                } else {
+                    Ok(binding)
+                }
+            })
+            .collect()
     }
 
     fn parallel_layer_bindings(
@@ -2892,7 +3001,7 @@ mod tests {
     use safemlx::{
         distributed::{Backend, Group},
         module::ModuleParameters,
-        ops::{indexing::TryIndexOp, ones_dtype, stack_axis},
+        ops::{indexing::TryIndexOp, ones_dtype, stack_axis, zeros_dtype},
         Array, Device, DeviceType, Dtype, ExecutionContext, Stream,
     };
 
@@ -2906,7 +3015,10 @@ mod tests {
             inkling::{self as resident, Model, ModelArgs},
             input as runtime_input,
         },
-        runtime::cache::KeyValueCache,
+        runtime::cache::{
+            residency::{CacheResidencyPolicy, PromptCacheDescriptor, PromptCacheOptions},
+            KeyValueCache,
+        },
         runtime::checkpoint::quantization::{AffineQuantization, WeightQuantization},
         runtime::distributed::{
             parallel::{ParallelBuildContext, ShardingPolicy},
@@ -2917,7 +3029,7 @@ mod tests {
             LoadTimeQuantizableAdapter,
         },
         runtime::residency::dense_stream::DenseDiskStreamLoadOptions,
-        runtime::residency::expert_cache::ExpertCacheLoadOptions,
+        runtime::residency::expert_cache::{ExpertCacheLoadOptions, ExpertPass, ExpertRouteBatch},
         runtime::residency::policy::{OffloadConfig, ResidencyPolicy},
         PagedCacheOptions,
     };
@@ -2969,6 +3081,24 @@ mod tests {
 
     fn args() -> ModelArgs {
         resident::model_args_from_config_value(&config()).unwrap()
+    }
+
+    fn quantizable_config() -> serde_json::Value {
+        let mut value = config();
+        value["text_config"]["hidden_size"] = 32.into();
+        value["text_config"]["vocab_size"] = 64.into();
+        value["text_config"]["num_attention_heads"] = 4.into();
+        value["text_config"]["num_key_value_heads"] = 2.into();
+        value["text_config"]["head_dim"] = 8.into();
+        value["text_config"]["swa_num_attention_heads"] = 4.into();
+        value["text_config"]["swa_num_key_value_heads"] = 2.into();
+        value["text_config"]["swa_head_dim"] = 8.into();
+        value["text_config"]["d_rel"] = 32.into();
+        value["text_config"]["rel_extent"] = 32.into();
+        value["text_config"]["intermediate_size"] = 32.into();
+        value["text_config"]["dense_intermediate_size"] = 32.into();
+        value["text_config"]["moe_intermediate_size"] = 32.into();
+        value
     }
 
     #[test]
@@ -3067,6 +3197,77 @@ mod tests {
             .flatten()
             .values()
             .any(|parameter| parameter.dtype() == Dtype::Uint32));
+    }
+
+    #[test]
+    #[ignore = "requires an MLX Metal device"]
+    fn inkling_fully_resident_load_time_quantization_packs_complete_expert_banks() {
+        let gpu = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
+        let cpu = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        let config = quantizable_config();
+        let args = resident::model_args_from_config_value(&config).unwrap();
+        let mut fixture = Model::new(args, gpu.stream()).unwrap();
+        initialize(&mut fixture, gpu.stream());
+        let dir = tempfile::tempdir().unwrap();
+        write_fixture_with_config(dir.path(), &fixture, &config, gpu.stream());
+
+        for quantization in [
+            WeightQuantization::Affine(AffineQuantization::new(32, 4).unwrap()),
+            WeightQuantization::MxFp4,
+        ] {
+            let expert_options = ExpertCacheLoadOptions::new(
+                OffloadConfig::new(Some(1 << 20), Some(1 << 20), 1).unwrap(),
+                1 << 16,
+                1 << 16,
+            )
+            .unwrap();
+            let mut cached = load_inkling_expert_cache_model(
+                dir.path(),
+                crate::NonExpertWeightResidency::FullyResident,
+                expert_options,
+                Some(quantization),
+                gpu.stream(),
+                cpu.stream(),
+            )
+            .unwrap();
+            let loaded = crate::api::load_model_with_options(
+                dir.path(),
+                crate::api::ModelLoadOptions::with_quantization(quantization),
+                gpu.stream(),
+                cpu.stream(),
+            )
+            .unwrap();
+            let crate::api::Model::Inkling(mut quantized) = loaded else {
+                panic!("high-level dispatch did not return an Inkling model")
+            };
+            assert_eq!(
+                quantized.args().text_config.weight_quantization,
+                Some(quantization)
+            );
+            assert!(quantized.expert_cache_report().unwrap().is_none());
+            let report = quantized.residency_report().unwrap();
+            assert!(report.initialized());
+            assert!(report.units().iter().all(|unit| unit.device_resident()));
+            let materialization = report.materialization().unwrap();
+            assert!(materialization.transformed_weights > 0);
+            assert!(materialization.source_bytes_read > materialization.output_bytes);
+            assert!(materialization.peak_planned_working_set_bytes <= materialization.output_bytes);
+
+            let mut cached_cache = cached.new_cache();
+            let mut quantized_cache = quantized.new_cache();
+            for tokens in [
+                Array::from_slice(&[1u32, 2, 3], &[1, 3]),
+                Array::from_slice(&[4u32], &[1, 1]),
+            ] {
+                let expected = cached
+                    .forward(&tokens, &mut cached_cache, gpu.stream())
+                    .unwrap();
+                let actual = quantized
+                    .forward(&tokens, &mut quantized_cache, gpu.stream())
+                    .unwrap();
+                assert_close(&actual, &expected, gpu.stream());
+            }
+        }
     }
 
     #[test]
@@ -3434,7 +3635,12 @@ mod tests {
         stacked.reshape(&shape, stream).unwrap()
     }
 
-    fn write_fixture(dir: &Path, model: &Model, stream: &Stream) {
+    fn write_fixture_with_config(
+        dir: &Path,
+        model: &Model,
+        config: &serde_json::Value,
+        stream: &Stream,
+    ) {
         let parameters = model.parameters().flatten();
         let mut arrays = Vec::<(String, Array)>::new();
         for (name, value) in &parameters {
@@ -3499,11 +3705,11 @@ mod tests {
             dir.join("model.safetensors"),
         )
         .unwrap();
-        fs::write(
-            dir.join("config.json"),
-            serde_json::to_vec(&config()).unwrap(),
-        )
-        .unwrap();
+        fs::write(dir.join("config.json"), serde_json::to_vec(config).unwrap()).unwrap();
+    }
+
+    fn write_fixture(dir: &Path, model: &Model, stream: &Stream) {
+        write_fixture_with_config(dir, model, &config(), stream);
     }
 
     fn assert_close(left: &Array, right: &Array, stream: &Stream) {
@@ -3528,7 +3734,8 @@ mod tests {
         let mut resident = resident::load_model(dir.path(), gpu.stream(), cpu.stream()).unwrap();
         let options = LayerwiseLoadOptions::new(OffloadConfig::new(None, None, depth).unwrap());
         let mut layerwise =
-            load_inkling_layerwise_model(dir.path(), options, gpu.stream(), cpu.stream()).unwrap();
+            load_inkling_layerwise_model(dir.path(), options, None, gpu.stream(), cpu.stream())
+                .unwrap();
         let mut resident_cache = resident.new_cache();
         let mut layerwise_cache = resident::Cache { layers: Vec::new() };
         for tokens in [
@@ -3711,6 +3918,7 @@ mod tests {
                 OffloadConfig::new(None, None, 1).unwrap(),
             )),
             options,
+            None,
             gpu.stream(),
             cpu.stream(),
         )
@@ -3751,6 +3959,166 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires an MLX Metal device"]
+    fn inkling_quantized_expert_cache_is_bounded_empty_route_safe_and_persistent() {
+        let gpu = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
+        let cpu = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        let config = quantizable_config();
+        let args = resident::model_args_from_config_value(&config).unwrap();
+        let mut fixture = Model::new(args, gpu.stream()).unwrap();
+        initialize(&mut fixture, gpu.stream());
+        let dir = tempfile::tempdir().unwrap();
+        write_fixture_with_config(dir.path(), &fixture, &config, gpu.stream());
+        let mut resident = resident::load_model(dir.path(), gpu.stream(), cpu.stream()).unwrap();
+        let expert_options = ExpertCacheLoadOptions::new(
+            OffloadConfig::new(Some(1 << 20), Some(1 << 20), 1).unwrap(),
+            1 << 16,
+            1 << 16,
+        )
+        .unwrap();
+        let quantization: WeightQuantization = AffineQuantization::new(32, 4).unwrap().into();
+        let mut cached = load_inkling_expert_cache_model(
+            dir.path(),
+            crate::NonExpertWeightResidency::LayerwiseHost(LayerwiseLoadOptions::new(
+                OffloadConfig::new(Some(1 << 20), Some(1 << 20), 1).unwrap(),
+            )),
+            expert_options,
+            Some(quantization),
+            gpu.stream(),
+            cpu.stream(),
+        )
+        .unwrap();
+
+        let mut resident_cache = resident.new_cache();
+        let mut cached_cache = cached.new_cache();
+        for tokens in [
+            Array::from_slice(&[1u32, 2, 3], &[1, 3]),
+            Array::from_slice(&[4u32], &[1, 1]),
+        ] {
+            let expected = resident
+                .forward_logits(
+                    &tokens,
+                    None,
+                    Some(&mut resident_cache),
+                    false,
+                    gpu.stream(),
+                )
+                .unwrap();
+            let actual = cached
+                .forward(&tokens, &mut cached_cache, gpu.stream())
+                .unwrap();
+            assert_close(&actual, &expected, gpu.stream());
+        }
+
+        let ordinary = cached.residency_report().unwrap();
+        let ordinary_materialization = ordinary.materialization().unwrap();
+        assert!(ordinary_materialization.transformed_weights > 0);
+        assert!(ordinary_materialization.source_bytes_read > ordinary_materialization.output_bytes);
+        let report = cached.expert_cache_report().unwrap().unwrap();
+        assert_eq!(report.weight_quantization, Some(quantization));
+        let expert_materialization = report.materialization.as_ref().unwrap();
+        assert!(expert_materialization.transformed_weights > 0);
+        assert!(expert_materialization.source_bytes_read > expert_materialization.output_bytes);
+        assert!(
+            expert_materialization.peak_planned_working_set_bytes
+                <= expert_options.compact_bank_scratch_bytes
+        );
+        assert!(report.owned_bytes < expert_materialization.source_bytes_read);
+
+        let empty_hidden = zeros_dtype(&[0, 32], Dtype::Float32, gpu.stream()).unwrap();
+        let empty_ids = zeros_dtype(&[0, 1], Dtype::Int32, gpu.stream()).unwrap();
+        let empty_weights = zeros_dtype(&[0, 1], Dtype::Float32, gpu.stream()).unwrap();
+        let sparse_layer = cached
+            .args()
+            .text_config
+            .layer_schedule
+            .iter()
+            .position(|policy| policy.feed_forward == resident::FeedForwardPolicy::SparseMoe)
+            .unwrap();
+        let empty = cached
+            .execution
+            .adapter()
+            .expert_cache
+            .as_ref()
+            .unwrap()
+            .execute_routes_bounded(
+                ExpertRouteBatch::new(
+                    sparse_layer,
+                    &empty_hidden,
+                    &empty_ids,
+                    &empty_weights,
+                    ExpertPass::Decode,
+                ),
+                gpu.stream(),
+                |hidden, acquired, _, _| {
+                    assert!(acquired.identities().is_empty());
+                    Ok(hidden.clone())
+                },
+            )
+            .unwrap();
+        assert_eq!(empty.shape(), &[0, 32]);
+
+        let paged = PagedCacheOptions::new(2, 1 << 20, 1 << 20, 1)
+            .unwrap()
+            .with_full_attention(true);
+        let mut original = cached
+            .new_cache_with_options(CacheResidencyPolicy::Paged(paged.clone()))
+            .unwrap();
+        let prefix = [1_u32, 2, 3];
+        cached
+            .forward(
+                &Array::from_slice(&prefix, &[1, prefix.len() as i32]),
+                &mut original,
+                gpu.stream(),
+            )
+            .unwrap();
+        let identity = cached.prompt_cache_model_identity().unwrap();
+        let descriptor = PromptCacheDescriptor {
+            model_family: identity.model_family,
+            effective_model_type: identity.effective_model_type,
+            checkpoint_fingerprint: "inkling-quantized-expert-cache".into(),
+            prefix_content_fingerprint: "tokens:1,2,3".into(),
+            architecture_fingerprint: identity.architecture_fingerprint,
+            layer_count: identity.layer_count,
+            global_layer_start: identity.global_layer_start,
+            global_layer_end: identity.global_layer_end,
+            batch_size: 1,
+            layer_layout: identity.layer_layout,
+            sink_tokens: identity.sink_tokens,
+            topology: identity.topology,
+        };
+        let persisted = tempfile::tempdir().unwrap();
+        let destination = persisted.path().join("prompt-cache");
+        cached
+            .save_prompt_cache(
+                &mut original,
+                &destination,
+                descriptor.clone(),
+                &prefix,
+                &PromptCacheOptions::default(),
+                gpu.stream(),
+            )
+            .unwrap();
+        let (mut restored, _) = cached
+            .load_prompt_cache(&destination, &descriptor, &prefix, paged, gpu.stream())
+            .unwrap();
+        let next = Array::from_slice(&[4u32], &[1, 1]);
+        let expected = cached.forward(&next, &mut original, gpu.stream()).unwrap();
+        let actual = cached.forward(&next, &mut restored, gpu.stream()).unwrap();
+        assert_close(&actual, &expected, gpu.stream());
+
+        crate::architectures::distributed::expert::assert_rank_owned_quantized_sparse_ep_load(
+            dir.path(),
+            expert_options,
+            quantization,
+            crate::api::ModelKind::Inkling,
+            report.owned_experts / 2,
+            gpu.stream(),
+            cpu.stream(),
+        );
+    }
+
+    #[test]
     fn inkling_audio_and_text_layerwise_parity() {
         let gpu = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
         let cpu = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
@@ -3783,6 +4151,7 @@ mod tests {
         let mut layerwise = load_inkling_layerwise_model(
             dir.path(),
             LayerwiseLoadOptions::new(OffloadConfig::new(None, None, 1).unwrap()),
+            None,
             gpu.stream(),
             cpu.stream(),
         )

@@ -41,11 +41,15 @@ use crate::{
         KeyValueCache,
     },
     runtime::checkpoint::binding::{
-        build_module_bindings_with_recipes, canonical_checkpoint_name, populate_module_from_lease,
+        build_module_bindings_with_recipes, build_module_bindings_with_recipes_excluding,
+        canonical_checkpoint_name, packed_companion_checkpoint_name, populate_module_from_lease,
         populate_module_from_lease_excluding,
     },
     runtime::checkpoint::store::{GgufWeightStore, TensorSelection, WeightStore},
-    runtime::checkpoint::{quantization::WeightQuantization, recipe::DerivedWeightRecipe},
+    runtime::checkpoint::{
+        quantization::{should_quantize_on_load, WeightQuantization},
+        recipe::DerivedWeightRecipe,
+    },
     runtime::distributed::parallel::{
         aligned_partition_units, array_parameter_member, partitioned_projection_members,
         register_partitioned_projection_group, register_replicated_module, MemberSharding,
@@ -53,7 +57,7 @@ use crate::{
         ProjectionSharding,
     },
     runtime::execution::layerwise::{
-        load_layerwise_model, load_safetensors_layerwise_model,
+        load_layerwise_model, load_layerwise_model_with_quantization,
         load_tensor_parallel_layerwise_model, open_safetensors_weight_store, ArchitectureAdapter,
         LayerWeightResidency, LayerwiseForwardState, LayerwiseModel, LoadTimeQuantizableAdapter,
         StaticUnitBindings, WeightResidency,
@@ -571,24 +575,42 @@ impl CausalLm<Cache> for NemotronHLayerwiseModel {
 pub fn load_nemotron_h_layerwise_model(
     model_dir: impl AsRef<Path>,
     options: impl Into<LayerWeightResidency>,
+    quantization: Option<WeightQuantization>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<NemotronHLayerwiseModel, Error> {
     let model_dir = model_dir.as_ref();
     let options = options.into();
     let residency = options.weight_residency();
+    let load_options = quantization
+        .map(crate::api::ModelLoadOptions::with_quantization)
+        .unwrap_or_default()
+        .with_weight_residency(residency);
     crate::api::structural::validate_safetensors_load_path(
         crate::api::ModelKind::NemotronH,
         model_dir,
-        crate::api::ModelLoadOptions::default().with_weight_residency(residency),
+        load_options,
     )?;
     let args = resident::get_nemotron_h_model_args(model_dir)?;
+    let quantize_on_load = quantization
+        .map(|requested| {
+            should_quantize_on_load(
+                "Nemotron-H layerwise model",
+                args.quantization.map(WeightQuantization::Affine),
+                requested,
+            )
+            .map(|required| required.then_some(requested))
+        })
+        .transpose()?
+        .flatten();
     let adapter = NemotronHLayerwiseAdapter::new(args, stream)?;
+    let store = open_safetensors_weight_store(model_dir, options.max_mapped_shards())?;
     Ok(NemotronHLayerwiseModel {
-        execution: load_safetensors_layerwise_model(
-            model_dir,
+        execution: load_layerwise_model_with_quantization(
+            store,
             adapter,
             options,
+            quantize_on_load,
             stream,
             weights_stream,
         )?,
@@ -678,6 +700,7 @@ pub(crate) fn load_nemotron_h_gguf_layerwise_model(
     checkpoint: &GgufCheckpoint,
     metadata: &HashMap<String, GgufMetadataValue>,
     residency: WeightResidency,
+    quantization: Option<WeightQuantization>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<(NemotronHLayerwiseModel, Vec<u32>), Error> {
@@ -704,13 +727,12 @@ pub(crate) fn load_nemotron_h_gguf_layerwise_model(
             ));
         }
     };
-    crate::api::structural::validate_gguf(
-        architecture,
-        checkpoint,
-        metadata,
-        crate::api::ModelLoadOptions::default().with_weight_residency(residency),
-    )
-    .into_loader_result()?;
+    let load_options = quantization
+        .map(crate::api::ModelLoadOptions::with_quantization)
+        .unwrap_or_default()
+        .with_weight_residency(residency);
+    crate::api::structural::validate_gguf(architecture, checkpoint, metadata, load_options)
+        .into_loader_result()?;
     let prepared =
         resident::prepare_nemotron_h_gguf_checkpoint(checkpoint, metadata, weights_stream)?;
     let args = prepared.args;
@@ -727,16 +749,18 @@ pub(crate) fn load_nemotron_h_gguf_layerwise_model(
                 args,
                 expert_options,
                 residency.layers(),
+                quantization,
                 stream,
                 weights_stream,
             )?,
             prepared.eos_token_ids,
         ));
     }
-    let execution = load_layerwise_model(
+    let execution = load_layerwise_model_with_quantization(
         store,
         NemotronHLayerwiseAdapter::new(args, stream)?,
         residency.layers(),
+        quantization,
         stream,
         weights_stream,
     )?;
@@ -751,6 +775,7 @@ fn load_nemotron_h_gguf_sparse_with_store(
     args: ModelArgs,
     options: ExpertCacheLoadOptions,
     non_expert: impl Into<LayerWeightResidency>,
+    quantization: Option<WeightQuantization>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<NemotronHLayerwiseModel, Error> {
@@ -765,16 +790,33 @@ fn load_nemotron_h_gguf_sparse_with_store(
     }
     let mut adapter = NemotronHLayerwiseAdapter::new(args.clone(), stream)?;
     adapter.sparse_expert_cache = true;
-    let mut execution = load_layerwise_model(store, adapter, non_expert, stream, weights_stream)?;
+    let mut execution = load_layerwise_model_with_quantization(
+        store,
+        adapter,
+        non_expert,
+        quantization,
+        stream,
+        weights_stream,
+    )?;
     let checkpoint_store = execution.checkpoint_store_arc();
     let entries = nemotron_h_expert_catalog(&args, checkpoint_store.as_ref())?;
-    execution.adapter_mut().expert_cache = Some(ExpertCache::new_shared(
-        checkpoint_store,
-        entries,
-        options,
-        weights_stream.clone(),
-        stream.clone(),
-    )?);
+    execution.adapter_mut().expert_cache = Some(match quantization {
+        Some(quantization) => ExpertCache::new_quantized_shared(
+            checkpoint_store,
+            entries,
+            options,
+            quantization,
+            weights_stream.clone(),
+            stream.clone(),
+        )?,
+        None => ExpertCache::new_shared(
+            checkpoint_store,
+            entries,
+            options,
+            weights_stream.clone(),
+            stream.clone(),
+        )?,
+    });
     Ok(NemotronHLayerwiseModel { execution })
 }
 
@@ -819,6 +861,7 @@ pub fn load_nemotron_h_expert_cache_model(
     model_dir: impl AsRef<Path>,
     non_expert: crate::NonExpertWeightResidency,
     options: ExpertCacheLoadOptions,
+    quantization: Option<WeightQuantization>,
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<NemotronHLayerwiseModel, Error> {
@@ -839,19 +882,47 @@ pub fn load_nemotron_h_expert_cache_model(
             "sparse expert caching requires a Nemotron-H MoE checkpoint".into(),
         ));
     }
+    let quantize_on_load = quantization
+        .map(|requested| {
+            should_quantize_on_load(
+                "Nemotron-H independent expert cache",
+                args.quantization.map(WeightQuantization::Affine),
+                requested,
+            )
+            .map(|required| required.then_some(requested))
+        })
+        .transpose()?
+        .flatten();
     let mut adapter = NemotronHLayerwiseAdapter::new(args.clone(), stream)?;
     adapter.sparse_expert_cache = true;
-    let mut execution =
-        load_safetensors_layerwise_model(model_dir, adapter, non_expert, stream, weights_stream)?;
+    let store = open_safetensors_weight_store(model_dir, non_expert.layers().max_mapped_shards())?;
+    let mut execution = load_layerwise_model_with_quantization(
+        store,
+        adapter,
+        non_expert,
+        quantize_on_load,
+        stream,
+        weights_stream,
+    )?;
     let store = execution.checkpoint_store_arc();
     let entries = nemotron_h_expert_catalog(&args, store.as_ref())?;
-    execution.adapter_mut().expert_cache = Some(ExpertCache::new_shared(
-        store,
-        entries,
-        options,
-        weights_stream.clone(),
-        stream.clone(),
-    )?);
+    execution.adapter_mut().expert_cache = Some(match quantize_on_load {
+        Some(quantization) => ExpertCache::new_quantized_shared(
+            store,
+            entries,
+            options,
+            quantization,
+            weights_stream.clone(),
+            stream.clone(),
+        )?,
+        None => ExpertCache::new_shared(
+            store,
+            entries,
+            options,
+            weights_stream.clone(),
+            stream.clone(),
+        )?,
+    });
     Ok(NemotronHLayerwiseModel { execution })
 }
 
@@ -950,8 +1021,12 @@ impl NemotronHLayerwiseAdapter {
             .filter(|index| self.args.layer_schedule.get(*index) == Some(&LayerPolicy::SparseMoe))
         {
             let packed_prefix = format!("model.layers.{index}.moe.experts");
-            if !keys.contains(&format!("{packed_prefix}.up_proj"))
-                && !normalized.contains_key(&format!("{packed_prefix}.up_proj"))
+            let complete_up = format!("{packed_prefix}.up_proj");
+            let packed_up = format!("{complete_up}.weight");
+            if !keys.contains(&complete_up)
+                && !normalized.contains_key(&complete_up)
+                && !keys.contains(&packed_up)
+                && !normalized.contains_key(&packed_up)
             {
                 let mut up = Vec::with_capacity(self.args.n_routed_experts as usize);
                 let mut down = Vec::with_capacity(self.args.n_routed_experts as usize);
@@ -1020,7 +1095,11 @@ impl NemotronHLayerwiseAdapter {
             }
         }
 
-        for local_name in module.parameters().flatten().keys() {
+        let parameters = module.parameters().flatten();
+        for (local_name, parameter) in &parameters {
+            if self.sparse_expert_cache && local_name.starts_with("moe.experts.") {
+                continue;
+            }
             if recipes.contains_key(local_name.as_ref()) {
                 continue;
             }
@@ -1031,6 +1110,23 @@ impl NemotronHLayerwiseAdapter {
             };
             let canonical = canonical_checkpoint_name(&destination);
             if keys.contains(&destination) || keys.contains(&canonical) {
+                continue;
+            }
+            let packed_weight = format!("{canonical}.weight");
+            if parameter.dtype() == Dtype::Uint32 && keys.contains(&packed_weight) {
+                recipes.insert(
+                    local_name.to_string(),
+                    DerivedWeightRecipe::source(packed_weight, TensorSelection::Full),
+                );
+                continue;
+            }
+            if let Some(companion) = packed_companion_checkpoint_name(&canonical)
+                .filter(|companion| keys.contains(companion))
+            {
+                recipes.insert(
+                    local_name.to_string(),
+                    DerivedWeightRecipe::source(companion, TensorSelection::Full),
+                );
                 continue;
             }
             let raw = normalized
@@ -1680,20 +1776,28 @@ impl ArchitectureAdapter for NemotronHLayerwiseAdapter {
         store: &dyn WeightStore,
     ) -> Result<Vec<WeightBinding>, Error> {
         let prefix = format!("model.layers.{index}");
-        let bindings = build_module_bindings_with_recipes(
-            layer,
-            &prefix,
-            store,
-            self.recipes_for_module(layer, &prefix, store, Some(index))?,
-        )?;
-        Ok(if self.sparse_expert_cache {
-            bindings
-                .into_iter()
-                .filter(|binding| !binding.name().starts_with("moe.experts."))
-                .collect()
+        let recipes = self.recipes_for_module(layer, &prefix, store, Some(index))?;
+        let bindings = if self.sparse_expert_cache {
+            build_module_bindings_with_recipes_excluding(layer, &prefix, store, recipes, |name| {
+                name.starts_with("moe.experts.")
+            })?
         } else {
-            bindings
-        })
+            build_module_bindings_with_recipes(layer, &prefix, store, recipes)?
+        };
+        bindings
+            .into_iter()
+            .map(|binding| {
+                if matches!(
+                    binding.name(),
+                    "moe.experts.up_proj" | "moe.experts.down_proj"
+                ) {
+                    let target = format!("{prefix}.{}.weight", binding.name());
+                    binding.with_logical_target(target).map_err(Error::from)
+                } else {
+                    Ok(binding)
+                }
+            })
+            .collect()
     }
     fn parallel_layer_bindings(
         &self,
@@ -2048,7 +2152,10 @@ mod tests {
         architectures::nemotron_h::model::{
             self as resident, Cache, LayerCache, LayerPolicy, Model, ModelArgs, ModelInput,
         },
-        runtime::residency::expert_cache::ExpertCacheLoadOptions,
+        runtime::cache::residency::{
+            CacheResidencyPolicy, PagedCacheOptions, PromptCacheDescriptor, PromptCacheOptions,
+        },
+        runtime::residency::expert_cache::{ExpertCacheLoadOptions, ExpertPass, ExpertRouteBatch},
         runtime::residency::policy::{OffloadConfig, ResidencyPolicy},
         runtime::{
             cache::KeyValueCache,
@@ -2092,6 +2199,22 @@ mod tests {
 
     fn args() -> ModelArgs {
         resident::model_args_from_config_value(&config()).unwrap()
+    }
+
+    fn quantizable_config() -> serde_json::Value {
+        let mut value = config();
+        value["vocab_size"] = 64.into();
+        value["hidden_size"] = 32.into();
+        value["intermediate_size"] = 32.into();
+        value["num_attention_heads"] = 4.into();
+        value["num_key_value_heads"] = 2.into();
+        value["head_dim"] = 8.into();
+        value["mamba_num_heads"] = 4.into();
+        value["mamba_head_dim"] = 8.into();
+        value["n_groups"] = 2.into();
+        value["moe_intermediate_size"] = 32.into();
+        value["moe_shared_expert_intermediate_size"] = 32.into();
+        value
     }
 
     #[test]
@@ -2149,6 +2272,73 @@ mod tests {
             error.to_string().contains("routed ReLU2 experts"),
             "{error}"
         );
+    }
+
+    #[test]
+    #[ignore = "requires an MLX Metal device"]
+    fn nemotron_h_fully_resident_load_time_quantization_packs_complete_expert_banks() {
+        let gpu = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
+        let cpu = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        let config = quantizable_config();
+        let args = resident::model_args_from_config_value(&config).unwrap();
+        let mut fixture = Model::new(args, gpu.stream()).unwrap();
+        initialize(&mut fixture, gpu.stream());
+        let dir = tempfile::tempdir().unwrap();
+        write_fixture_with_config(dir.path(), &fixture, &config, gpu.stream());
+        let quantization: WeightQuantization = AffineQuantization::new(32, 4).unwrap().into();
+        let expert_options = ExpertCacheLoadOptions::new(
+            OffloadConfig::new(Some(1 << 20), Some(1 << 20), 1).unwrap(),
+            1 << 16,
+            1 << 16,
+        )
+        .unwrap();
+        let mut cached = load_nemotron_h_expert_cache_model(
+            dir.path(),
+            crate::NonExpertWeightResidency::FullyResident,
+            expert_options,
+            Some(quantization),
+            gpu.stream(),
+            cpu.stream(),
+        )
+        .unwrap();
+        let loaded = crate::api::load_model_with_options(
+            dir.path(),
+            crate::api::ModelLoadOptions::with_quantization(quantization),
+            gpu.stream(),
+            cpu.stream(),
+        )
+        .unwrap();
+        let crate::api::Model::NemotronH(mut quantized) = loaded else {
+            panic!("high-level dispatch did not return a Nemotron-H model")
+        };
+
+        assert_eq!(
+            quantized.args().quantization.map(Into::into),
+            Some(quantization)
+        );
+        assert!(quantized.expert_cache_report().unwrap().is_none());
+        let report = quantized.residency_report().unwrap();
+        assert!(report.initialized());
+        assert!(report.units().iter().all(|unit| unit.device_resident()));
+        let materialization = report.materialization().unwrap();
+        assert!(materialization.transformed_weights > 0);
+        assert!(materialization.source_bytes_read > materialization.output_bytes);
+        assert!(materialization.peak_planned_working_set_bytes <= materialization.output_bytes);
+
+        let mut cached_cache = cached.new_cache();
+        let mut quantized_cache = quantized.new_cache();
+        for tokens in [
+            Array::from_slice(&[1u32, 2], &[1, 2]),
+            Array::from_slice(&[3u32], &[1, 1]),
+        ] {
+            let expected = cached
+                .forward(&tokens, &mut cached_cache, gpu.stream())
+                .unwrap();
+            let actual = quantized
+                .forward(&tokens, &mut quantized_cache, gpu.stream())
+                .unwrap();
+            assert_close(&actual, &expected);
+        }
     }
 
     fn output_width_for_test(
@@ -2508,7 +2698,12 @@ mod tests {
         runtime.to_string()
     }
 
-    fn write_fixture(dir: &Path, model: &Model, stream: &Stream) {
+    fn write_fixture_with_config(
+        dir: &Path,
+        model: &Model,
+        config: &serde_json::Value,
+        stream: &Stream,
+    ) {
         let params = model.parameters().flatten();
         let mut arrays = Vec::<(String, Array)>::new();
         for (name, value) in params {
@@ -2539,11 +2734,11 @@ mod tests {
             dir.join("model.safetensors"),
         )
         .unwrap();
-        fs::write(
-            dir.join("config.json"),
-            serde_json::to_vec(&config()).unwrap(),
-        )
-        .unwrap();
+        fs::write(dir.join("config.json"), serde_json::to_vec(config).unwrap()).unwrap();
+    }
+
+    fn write_fixture(dir: &Path, model: &Model, stream: &Stream) {
+        write_fixture_with_config(dir, model, &config(), stream);
     }
 
     fn assert_close(left: &Array, right: &Array) {
@@ -2568,6 +2763,7 @@ mod tests {
         let mut layerwise = load_nemotron_h_layerwise_model(
             dir.path(),
             LayerwiseLoadOptions::new(OffloadConfig::new(None, None, depth).unwrap()),
+            None,
             gpu.stream(),
             cpu.stream(),
         )
@@ -2669,6 +2865,7 @@ mod tests {
                 OffloadConfig::new(None, None, 1).unwrap(),
             )),
             options,
+            None,
             gpu.stream(),
             cpu.stream(),
         )
@@ -2703,6 +2900,166 @@ mod tests {
         crate::architectures::distributed::expert::assert_rank_owned_sparse_ep_load(
             dir.path(),
             options,
+            crate::api::ModelKind::NemotronH,
+            report.owned_experts / 2,
+            gpu.stream(),
+            cpu.stream(),
+        );
+    }
+
+    #[test]
+    #[ignore = "requires an MLX Metal device"]
+    fn nemotron_h_quantized_expert_cache_is_bounded_empty_route_safe_and_persistent() {
+        let gpu = ExecutionContext::new(Device::new(DeviceType::Gpu, 0));
+        let cpu = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        let config = quantizable_config();
+        let args = resident::model_args_from_config_value(&config).unwrap();
+        let mut fixture = Model::new(args, gpu.stream()).unwrap();
+        initialize(&mut fixture, gpu.stream());
+        let dir = tempfile::tempdir().unwrap();
+        write_fixture_with_config(dir.path(), &fixture, &config, gpu.stream());
+        let mut resident =
+            resident::load_nemotron_h_model(dir.path(), gpu.stream(), cpu.stream()).unwrap();
+        let expert_options = ExpertCacheLoadOptions::new(
+            OffloadConfig::new(Some(1 << 20), Some(1 << 20), 1).unwrap(),
+            1 << 16,
+            1 << 16,
+        )
+        .unwrap();
+        let quantization: WeightQuantization = AffineQuantization::new(32, 4).unwrap().into();
+        let mut cached = load_nemotron_h_expert_cache_model(
+            dir.path(),
+            crate::NonExpertWeightResidency::LayerwiseHost(LayerwiseLoadOptions::new(
+                OffloadConfig::new(Some(1 << 20), Some(1 << 20), 1).unwrap(),
+            )),
+            expert_options,
+            Some(quantization),
+            gpu.stream(),
+            cpu.stream(),
+        )
+        .unwrap();
+
+        let mut resident_cache = resident.new_cache();
+        let mut cached_cache = cached.new_cache();
+        for tokens in [
+            Array::from_slice(&[1u32, 2], &[1, 2]),
+            Array::from_slice(&[3u32], &[1, 1]),
+        ] {
+            let expected = resident
+                .forward_logits(
+                    ModelInput {
+                        inputs: &tokens,
+                        mask: None,
+                        cache: Some(&mut resident_cache),
+                    },
+                    false,
+                    gpu.stream(),
+                )
+                .unwrap();
+            let actual = cached
+                .forward(&tokens, &mut cached_cache, gpu.stream())
+                .unwrap();
+            assert_close(&actual, &expected);
+        }
+
+        let ordinary = cached.residency_report().unwrap();
+        let ordinary_materialization = ordinary.materialization().unwrap();
+        assert!(ordinary_materialization.transformed_weights > 0);
+        assert!(ordinary_materialization.source_bytes_read > ordinary_materialization.output_bytes);
+        let report = cached.expert_cache_report().unwrap().unwrap();
+        assert_eq!(report.weight_quantization, Some(quantization));
+        let expert_materialization = report.materialization.as_ref().unwrap();
+        assert!(expert_materialization.transformed_weights > 0);
+        assert!(expert_materialization.source_bytes_read > expert_materialization.output_bytes);
+        assert!(
+            expert_materialization.peak_planned_working_set_bytes
+                <= expert_options.compact_bank_scratch_bytes
+        );
+        assert!(report.owned_bytes < expert_materialization.source_bytes_read);
+
+        let sparse_layer = cached
+            .args()
+            .layer_schedule
+            .iter()
+            .position(|policy| *policy == LayerPolicy::SparseMoe)
+            .unwrap();
+        let empty_hidden = zeros_dtype(&[0, 32], Dtype::Float32, gpu.stream()).unwrap();
+        let empty_ids = zeros_dtype(&[0, 2], Dtype::Int32, gpu.stream()).unwrap();
+        let empty_weights = zeros_dtype(&[0, 2], Dtype::Float32, gpu.stream()).unwrap();
+        let empty = cached
+            .execution
+            .adapter()
+            .expert_cache
+            .as_ref()
+            .unwrap()
+            .execute_routes_bounded(
+                ExpertRouteBatch::new(
+                    sparse_layer,
+                    &empty_hidden,
+                    &empty_ids,
+                    &empty_weights,
+                    ExpertPass::Decode,
+                ),
+                gpu.stream(),
+                |hidden, acquired, _, _| {
+                    assert!(acquired.identities().is_empty());
+                    Ok(hidden.clone())
+                },
+            )
+            .unwrap();
+        assert_eq!(empty.shape(), &[0, 32]);
+
+        let paged = PagedCacheOptions::new(2, 1 << 20, 1 << 20, 1).unwrap();
+        let mut original = cached
+            .new_cache_with_options(CacheResidencyPolicy::Paged(paged.clone()))
+            .unwrap();
+        let prefix = [1_u32, 2];
+        cached
+            .forward(
+                &Array::from_slice(&prefix, &[1, prefix.len() as i32]),
+                &mut original,
+                gpu.stream(),
+            )
+            .unwrap();
+        let identity = cached.execution.prompt_cache_model_identity().unwrap();
+        let descriptor = PromptCacheDescriptor {
+            model_family: identity.model_family,
+            effective_model_type: identity.effective_model_type,
+            checkpoint_fingerprint: "nemotron-h-quantized-expert-cache".into(),
+            prefix_content_fingerprint: "tokens:1,2".into(),
+            architecture_fingerprint: identity.architecture_fingerprint,
+            layer_count: identity.layer_count,
+            global_layer_start: identity.global_layer_start,
+            global_layer_end: identity.global_layer_end,
+            batch_size: 1,
+            layer_layout: identity.layer_layout,
+            sink_tokens: identity.sink_tokens,
+            topology: identity.topology,
+        };
+        let persisted = tempfile::tempdir().unwrap();
+        let destination = persisted.path().join("prompt-cache");
+        cached
+            .save_prompt_cache(
+                &mut original,
+                &destination,
+                descriptor.clone(),
+                &prefix,
+                &PromptCacheOptions::default(),
+                gpu.stream(),
+            )
+            .unwrap();
+        let (mut restored, _) = cached
+            .load_prompt_cache(&destination, &descriptor, &prefix, paged, gpu.stream())
+            .unwrap();
+        let next = Array::from_slice(&[3u32], &[1, 1]);
+        let expected = cached.forward(&next, &mut original, gpu.stream()).unwrap();
+        let actual = cached.forward(&next, &mut restored, gpu.stream()).unwrap();
+        assert_close(&actual, &expected);
+
+        crate::architectures::distributed::expert::assert_rank_owned_quantized_sparse_ep_load(
+            dir.path(),
+            expert_options,
+            quantization,
             crate::api::ModelKind::NemotronH,
             report.owned_experts / 2,
             gpu.stream(),

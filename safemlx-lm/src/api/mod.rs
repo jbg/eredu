@@ -352,7 +352,7 @@ fn load_model_for_kind(
             )),
             ModelKind::Inkling => Ok(Model::Inkling(
                 crate::architectures::inkling::layerwise::load_inkling_expert_cache_model(
-                    model_dir, non_expert, expert_cache, stream, weights_stream,
+                    model_dir, non_expert, expert_cache, options.quantization, stream, weights_stream,
                 )?,
             )),
             ModelKind::Lfm2 => Ok(Model::Lfm2(
@@ -362,7 +362,7 @@ fn load_model_for_kind(
             )),
             ModelKind::NemotronH => Ok(Model::NemotronH(
                 crate::architectures::nemotron_h::layerwise::load_nemotron_h_expert_cache_model(
-                    model_dir, non_expert, expert_cache, stream, weights_stream,
+                    model_dir, non_expert, expert_cache, options.quantization, stream, weights_stream,
                 )?,
             )),
             ModelKind::Qwen2 => Err(Error::UnsupportedArchitecture(
@@ -413,6 +413,15 @@ fn load_model_for_kind(
                     weights_stream,
                 )?,
             ))),
+            ModelKind::Inkling => Ok(Model::Inkling(
+                crate::architectures::inkling::layerwise::load_inkling_layerwise_model(
+                    model_dir,
+                    execution,
+                    Some(quantization),
+                    stream,
+                    weights_stream,
+                )?,
+            )),
             ModelKind::GptOss => Ok(Model::GptOss(
                 crate::architectures::gpt_oss::layerwise::execute_transformed_gpt_oss_model(
                     gpt_oss::load_model_quantized(model_dir, quantization, stream, weights_stream)?,
@@ -437,6 +446,15 @@ fn load_model_for_kind(
             ModelKind::Lfm2 => Ok(Model::Lfm2(
                 crate::architectures::lfm2::layerwise::execute_transformed_lfm2_model(
                     lfm2::load_model_quantized(model_dir, quantization, stream, weights_stream)?,
+                    stream,
+                    weights_stream,
+                )?,
+            )),
+            ModelKind::NemotronH => Ok(Model::NemotronH(
+                crate::architectures::nemotron_h::layerwise::load_nemotron_h_layerwise_model(
+                    model_dir,
+                    execution,
+                    Some(quantization),
                     stream,
                     weights_stream,
                 )?,
@@ -480,7 +498,7 @@ fn load_model_for_kind(
                     weights_stream,
                 )?,
             )),
-            ModelKind::Inkling | ModelKind::NemotronH | ModelKind::PersonaPlex => {
+            ModelKind::PersonaPlex => {
                 unreachable!("load policy rejects unsupported load-time transformations")
             }
         };
@@ -506,6 +524,7 @@ fn load_model_for_kind(
             crate::architectures::inkling::layerwise::load_inkling_layerwise_model(
                 model_dir,
                 execution,
+                None,
                 stream,
                 weights_stream,
             )?,
@@ -556,6 +575,7 @@ fn load_model_for_kind(
             crate::architectures::nemotron_h::layerwise::load_nemotron_h_layerwise_model(
                 model_dir,
                 execution,
+                None,
                 stream,
                 weights_stream,
             )?,

@@ -2676,6 +2676,7 @@ dependencies = [
  "anyhow",
  "base64 0.22.1",
  "clap",
+ "half",
  "idna_adapter",
  "image",
  "lazy_static",

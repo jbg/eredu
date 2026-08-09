@@ -3220,6 +3220,26 @@ where
 /// module is populated. The target adapter is therefore free to expose packed
 /// parameter trees, while every residency budget is computed from the packed
 /// store metadata seen by [`load_layerwise_model`].
+fn packed_weight_companion_dtypes(module: &impl ModuleParameters) -> BTreeMap<String, RecipeDtype> {
+    let parameters = module.parameters().flatten();
+    parameters
+        .iter()
+        .filter(|(_, parameter)| parameter.dtype() == safemlx::Dtype::Uint32)
+        .map(|(name, _)| {
+            let canonical = crate::runtime::checkpoint::binding::canonical_checkpoint_name(name);
+            let scales = canonical
+                .strip_suffix(".weight")
+                .map(|prefix| format!("{prefix}.scales"))
+                .unwrap_or_else(|| format!("{canonical}_scales"));
+            let dtype = parameters
+                .get(scales.as_str())
+                .map(|parameter| RecipeDtype::from(parameter.dtype()))
+                .unwrap_or(RecipeDtype::F32);
+            (canonical, dtype)
+        })
+        .collect()
+}
+
 pub(crate) fn load_layerwise_model_quantized<A, O>(
     store: SharedWeightStore,
     source_adapter: A,
@@ -3234,50 +3254,62 @@ where
     O: Into<LayerWeightResidency>,
 {
     let mut recipes = BTreeMap::new();
-    let mut collect = |bindings: &[crate::runtime::residency::manager::WeightBinding],
-                       selected_local_weights: Option<&BTreeSet<String>>| {
-        for binding in bindings {
-            let recipe = binding.source_recipe();
-            let metadata = recipe.infer(store.as_ref())?;
-            if !matches!(
-                metadata.dtype(),
-                RecipeDtype::F16 | RecipeDtype::BF16 | RecipeDtype::F32
-            ) || metadata.shape().len() != 2
-            {
-                continue;
-            }
-            let target = binding.logical_target().unwrap_or(binding.checkpoint_key());
-            if !target.ends_with(".weight") {
-                continue;
-            }
-            let canonical_local =
-                crate::runtime::checkpoint::binding::canonical_checkpoint_name(binding.name());
-            if selected_local_weights.is_some_and(|selected| !selected.contains(&canonical_local)) {
-                continue;
-            }
-            match recipes.entry(target.to_string()) {
-                std::collections::btree_map::Entry::Vacant(entry) => {
-                    entry.insert(recipe);
+    let mut collect =
+        |bindings: &[crate::runtime::residency::manager::WeightBinding],
+         selected_local_weights: Option<&BTreeMap<String, RecipeDtype>>| {
+            for binding in bindings {
+                let recipe = binding.source_recipe();
+                let metadata = recipe.infer(store.as_ref())?;
+                if !matches!(
+                    metadata.dtype(),
+                    RecipeDtype::F16 | RecipeDtype::BF16 | RecipeDtype::F32
+                ) || metadata.shape().len() < 2
+                {
+                    continue;
                 }
-                std::collections::btree_map::Entry::Occupied(entry) if entry.get() != &recipe => {
-                    return Err(Error::Quantization(format!(
+                let target = binding.logical_target().unwrap_or(binding.checkpoint_key());
+                if !target.ends_with(".weight") {
+                    continue;
+                }
+                let canonical_local =
+                    crate::runtime::checkpoint::binding::canonical_checkpoint_name(binding.name());
+                if selected_local_weights
+                    .is_some_and(|selected| !selected.contains_key(&canonical_local))
+                {
+                    continue;
+                }
+                let companion_dtype = selected_local_weights
+                    .and_then(|selected| selected.get(&canonical_local))
+                    .cloned()
+                    .unwrap_or(RecipeDtype::F32);
+                match recipes.entry(target.to_string()) {
+                    std::collections::btree_map::Entry::Vacant(entry) => {
+                        entry.insert((recipe, companion_dtype));
+                    }
+                    std::collections::btree_map::Entry::Occupied(entry)
+                        if entry.get() != &(recipe, companion_dtype) =>
+                    {
+                        return Err(Error::Quantization(format!(
                         "load-time quantization target {target:?} has conflicting semantic recipes"
                     )));
+                    }
+                    std::collections::btree_map::Entry::Occupied(_) => {}
                 }
-                std::collections::btree_map::Entry::Occupied(_) => {}
             }
-        }
-        Ok::<(), Error>(())
-    };
+            Ok::<(), Error>(())
+        };
     for unit in source_adapter.static_units(store.as_ref())? {
         let selected = unit
             .bindings()
             .iter()
             .filter(|binding| target_adapter.quantizes_static_binding(binding))
             .map(|binding| {
-                crate::runtime::checkpoint::binding::canonical_checkpoint_name(binding.name())
+                (
+                    crate::runtime::checkpoint::binding::canonical_checkpoint_name(binding.name()),
+                    RecipeDtype::F32,
+                )
             })
-            .collect::<BTreeSet<_>>();
+            .collect::<BTreeMap<_, _>>();
         collect(unit.bindings(), Some(&selected))?;
     }
     let graph = source_adapter.execution_graph()?;
@@ -3285,13 +3317,7 @@ where
         for index in 0..source_adapter.layer_count(group)? {
             let layer = source_adapter.new_layer(group, index, stream)?;
             let target_layer = target_adapter.new_layer(group, index, stream)?;
-            let selected = target_layer
-                .parameters()
-                .flatten()
-                .keys()
-                .filter(|name| name.contains(".inner.weight") || name.as_ref() == "inner.weight")
-                .map(|name| crate::runtime::checkpoint::binding::canonical_checkpoint_name(name))
-                .collect::<BTreeSet<_>>();
+            let selected = packed_weight_companion_dtypes(&target_layer);
             collect(
                 &source_adapter.layer_bindings(group, index, &layer, store.as_ref())?,
                 Some(&selected),
@@ -3306,7 +3332,18 @@ where
     }
     let targets = recipes
         .into_iter()
-        .map(|(target, recipe)| BoundedQuantizationTarget::from_recipe(target, recipe))
+        .map(|(target, (recipe, companion_dtype))| {
+            let target = BoundedQuantizationTarget::from_recipe(target, recipe)?;
+            match quantization {
+                WeightQuantization::Affine(_) => {
+                    target.with_affine_companion_dtype(companion_dtype)
+                }
+                WeightQuantization::MxFp4 => Ok(target),
+                WeightQuantization::GgufIQuant { .. } => unreachable!(
+                    "load-time materialization rejects checkpoint-native GGUF encodings"
+                ),
+            }
+        })
         .collect::<Result<Vec<_>, _>>()?;
     let working_set_bytes =
         bounded_quantization_working_set(store.as_ref(), &targets, quantization)?;
@@ -3363,8 +3400,9 @@ where
 ///
 /// The source adapter contributes semantic recipes for only the stage-owned
 /// static roles and decoder range. The target adapter identifies projections
-/// whose runtime parameter tree is packed. Routed rank-3 expert banks remain
-/// outside this overlay and continue through the independent expert store.
+/// whose runtime parameter tree is packed. Complete or rank-selected expert
+/// banks use the same matrix-row tiler as ordinary projections; an independent
+/// expert store is only involved when that residency policy was requested.
 pub(crate) struct PipelineStageQuantizationSelection<'a> {
     static_roles: &'a [&'a str],
     layer_group: usize,
@@ -3398,41 +3436,50 @@ where
     A: ArchitectureAdapter,
 {
     let mut recipes = BTreeMap::new();
-    let mut collect = |bindings: &[crate::runtime::residency::manager::WeightBinding],
-                       selected_local_weights: Option<&BTreeSet<String>>| {
-        for binding in bindings {
-            let recipe = binding.source_recipe();
-            let metadata = recipe.infer(store.as_ref())?;
-            if !matches!(
-                metadata.dtype(),
-                RecipeDtype::F16 | RecipeDtype::BF16 | RecipeDtype::F32
-            ) || metadata.shape().len() != 2
-            {
-                continue;
-            }
-            let target = binding.logical_target().unwrap_or(binding.checkpoint_key());
-            if !target.ends_with(".weight") {
-                continue;
-            }
-            let canonical_local =
-                crate::runtime::checkpoint::binding::canonical_checkpoint_name(binding.name());
-            if selected_local_weights.is_some_and(|selected| !selected.contains(&canonical_local)) {
-                continue;
-            }
-            match recipes.entry(target.to_string()) {
-                std::collections::btree_map::Entry::Vacant(entry) => {
-                    entry.insert(recipe);
+    let mut collect =
+        |bindings: &[crate::runtime::residency::manager::WeightBinding],
+         selected_local_weights: Option<&BTreeMap<String, RecipeDtype>>| {
+            for binding in bindings {
+                let recipe = binding.source_recipe();
+                let metadata = recipe.infer(store.as_ref())?;
+                if !matches!(
+                    metadata.dtype(),
+                    RecipeDtype::F16 | RecipeDtype::BF16 | RecipeDtype::F32
+                ) || metadata.shape().len() < 2
+                {
+                    continue;
                 }
-                std::collections::btree_map::Entry::Occupied(entry) if entry.get() != &recipe => {
-                    return Err(Error::Quantization(format!(
+                let target = binding.logical_target().unwrap_or(binding.checkpoint_key());
+                if !target.ends_with(".weight") {
+                    continue;
+                }
+                let canonical_local =
+                    crate::runtime::checkpoint::binding::canonical_checkpoint_name(binding.name());
+                if selected_local_weights
+                    .is_some_and(|selected| !selected.contains_key(&canonical_local))
+                {
+                    continue;
+                }
+                let companion_dtype = selected_local_weights
+                    .and_then(|selected| selected.get(&canonical_local))
+                    .cloned()
+                    .unwrap_or(RecipeDtype::F32);
+                match recipes.entry(target.to_string()) {
+                    std::collections::btree_map::Entry::Vacant(entry) => {
+                        entry.insert((recipe, companion_dtype));
+                    }
+                    std::collections::btree_map::Entry::Occupied(entry)
+                        if entry.get() != &(recipe, companion_dtype) =>
+                    {
+                        return Err(Error::Quantization(format!(
                         "pipeline load-time quantization target {target:?} has conflicting semantic recipes"
                     )));
+                    }
+                    std::collections::btree_map::Entry::Occupied(_) => {}
                 }
-                std::collections::btree_map::Entry::Occupied(_) => {}
             }
-        }
-        Ok::<(), Error>(())
-    };
+            Ok::<(), Error>(())
+        };
 
     for unit in source_adapter.static_units(store.as_ref())? {
         if !selection
@@ -3447,22 +3494,19 @@ where
             .iter()
             .filter(|binding| target_adapter.quantizes_static_binding(binding))
             .map(|binding| {
-                crate::runtime::checkpoint::binding::canonical_checkpoint_name(binding.name())
+                (
+                    crate::runtime::checkpoint::binding::canonical_checkpoint_name(binding.name()),
+                    RecipeDtype::F32,
+                )
             })
-            .collect::<BTreeSet<_>>();
+            .collect::<BTreeMap<_, _>>();
         collect(unit.bindings(), Some(&selected))?;
     }
 
     for index in selection.layer_range {
         let source_layer = source_adapter.new_layer(selection.layer_group, index, stream)?;
         let target_layer = target_adapter.new_layer(selection.layer_group, index, stream)?;
-        let selected = target_layer
-            .parameters()
-            .flatten()
-            .keys()
-            .filter(|name| name.contains(".inner.weight") || name.as_ref() == "inner.weight")
-            .map(|name| crate::runtime::checkpoint::binding::canonical_checkpoint_name(name))
-            .collect::<BTreeSet<_>>();
+        let selected = packed_weight_companion_dtypes(&target_layer);
         collect(
             &source_adapter.layer_bindings(
                 selection.layer_group,
@@ -3482,7 +3526,18 @@ where
     }
     let targets = recipes
         .into_iter()
-        .map(|(target, recipe)| BoundedQuantizationTarget::from_recipe(target, recipe))
+        .map(|(target, (recipe, companion_dtype))| {
+            let target = BoundedQuantizationTarget::from_recipe(target, recipe)?;
+            match quantization {
+                WeightQuantization::Affine(_) => {
+                    target.with_affine_companion_dtype(companion_dtype)
+                }
+                WeightQuantization::MxFp4 => Ok(target),
+                WeightQuantization::GgufIQuant { .. } => unreachable!(
+                    "load-time materialization rejects checkpoint-native GGUF encodings"
+                ),
+            }
+        })
         .collect::<Result<Vec<_>, _>>()?;
     let working_set_bytes =
         bounded_quantization_working_set(store.as_ref(), &targets, quantization)?;
@@ -3501,15 +3556,33 @@ fn bounded_quantization_working_set(
     targets: &[BoundedQuantizationTarget],
     quantization: WeightQuantization,
 ) -> Result<u64, Error> {
-    use crate::runtime::checkpoint::store::TensorSelection;
-
     let mut output_bytes = 0u64;
     let mut minimum_tile_bytes = 0u64;
     for target in targets {
         let metadata = target.source().infer(store)?;
         let shape = metadata.shape();
-        let rows = shape[0] as u64;
-        let columns = shape[1];
+        if shape.len() < 2 {
+            return Err(Error::Quantization(format!(
+                "load-time quantization target {:?} must be a matrix or matrix bank, got shape {shape:?}",
+                target.weight_name()
+            )));
+        }
+        let row_axis = shape.len() - 2;
+        let leading = shape[..row_axis]
+            .iter()
+            .try_fold(1usize, |count, dimension| count.checked_mul(*dimension))
+            .ok_or_else(|| Error::Quantization("leading matrix count overflowed".into()))?;
+        if leading == 0 || shape[row_axis] == 0 {
+            return Err(Error::Quantization(format!(
+                "load-time quantization target {:?} must contain at least one matrix row",
+                target.weight_name()
+            )));
+        }
+        let rows = leading
+            .checked_mul(shape[row_axis])
+            .ok_or_else(|| Error::Quantization("matrix-bank row count overflowed".into()))?
+            as u64;
+        let columns = shape[row_axis + 1];
         let group_size = usize::try_from(quantization.group_size())
             .map_err(|_| Error::Quantization("quantization group size is invalid".into()))?;
         if columns % group_size != 0 || columns % 32 != 0 {
@@ -3527,12 +3600,12 @@ fn bounded_quantization_working_set(
             groups
         } else {
             groups
-                .checked_mul(4)
+                .checked_mul(target.affine_companion_bytes())
                 .ok_or_else(|| Error::Quantization("packed scale row size overflowed".into()))?
         };
         let bias_row = if quantization.has_biases() {
             groups
-                .checked_mul(4)
+                .checked_mul(target.affine_companion_bytes())
                 .ok_or_else(|| Error::Quantization("packed bias row size overflowed".into()))?
         } else {
             0
@@ -3547,21 +3620,18 @@ fn bounded_quantization_working_set(
                     .ok_or_else(|| Error::Quantization("packed target size overflowed".into()))?,
             )
             .ok_or_else(|| Error::Quantization("packed model size overflowed".into()))?;
-        let one_row = target.source().select_bounded(
-            store,
-            TensorSelection::Range {
-                axis: 0,
-                start: 0,
-                end: 1,
-            },
-        )?;
-        one_row.preflight_bounded(store)?;
-        minimum_tile_bytes = minimum_tile_bytes.max(
-            one_row
-                .peak_materialization_bytes(store)?
-                .checked_add(output_row)
-                .ok_or_else(|| Error::Quantization("conversion tile size overflowed".into()))?,
-        );
+        for matrix in 0..leading {
+            let one_row = target
+                .source()
+                .select_bounded_matrix_rows(store, matrix, 0, 1)?;
+            one_row.preflight_bounded(store)?;
+            minimum_tile_bytes = minimum_tile_bytes.max(
+                one_row
+                    .peak_materialization_bytes(store)?
+                    .checked_add(output_row)
+                    .ok_or_else(|| Error::Quantization("conversion tile size overflowed".into()))?,
+            );
+        }
     }
     Ok(output_bytes.max(minimum_tile_bytes))
 }
@@ -3691,6 +3761,7 @@ where
         )?);
     }
 
+    consumed.extend(store.materialized_source_keys());
     consumed.extend(adapter.additional_consumed_checkpoint_keys(store.as_ref()));
 
     validate_unused(store.as_ref(), &consumed, options.strict_loading(), |key| {
@@ -3929,6 +4000,7 @@ where
             depth,
         )?);
     }
+    consumed.extend(store.materialized_source_keys());
     consumed.extend(adapter.additional_consumed_checkpoint_keys(store.as_ref()));
     validate_unused(store.as_ref(), &consumed, options.strict_loading(), |key| {
         adapter.ignores_checkpoint_key(key)

@@ -470,7 +470,8 @@ fn pipeline_ring_worker() {
         for layer in 0..family.layer_count() {
             assert_eq!(
                 opened.contains(&format!("layer-{layer}.safetensors")),
-                ((!dense_stream && !layerwise_host)
+                (requantize
+                    || (!dense_stream && !layerwise_host)
                     || (expert_cache
                         && !matches!(
                             family,
@@ -538,6 +539,27 @@ fn pipeline_ring_worker() {
             );
         }
     }
+    if requantize && !dense_stream && !layerwise_host && !expert_cache {
+        let materialization = info
+            .materialization
+            .as_ref()
+            .expect("fully resident requantization must report its packed overlay");
+        assert!(materialization.transformed_weights > 0);
+        assert!(materialization.source_tiles > 0);
+        assert!(materialization.output_bytes < materialization.source_bytes_read);
+        assert!(
+            materialization.peak_planned_working_set_bytes
+                <= materialization.admitted_working_set_bytes,
+            "rank {expected_rank} exceeded its admitted conversion bound: {materialization:?}"
+        );
+        assert_eq!(
+            materialization.admitted_working_set_bytes,
+            materialization
+                .output_bytes
+                .max(materialization.peak_planned_working_set_bytes),
+            "rank {expected_rank} admitted slack beyond its packed stage or smallest legal row tile"
+        );
+    }
     if expert_cache {
         let report = model.expert_cache_report().unwrap();
         let expected_experts =
@@ -547,6 +569,16 @@ fn pipeline_ring_worker() {
             assert_eq!(report.owned_experts, expected_experts);
             assert!(report.owned_bytes > 0);
             assert_eq!(report.device_resident_experts, 0);
+            if requantize {
+                assert_eq!(
+                    report.weight_quantization,
+                    Some(AffineQuantization::new(32, 4).unwrap().into())
+                );
+                let materialization = report.materialization.as_ref().unwrap();
+                assert!(materialization.transformed_weights > 0);
+                assert!(materialization.source_tiles > 0);
+                assert!(materialization.output_bytes < materialization.source_bytes_read);
+            }
         }
     }
     if family == FixtureFamily::Llama {
@@ -2422,6 +2454,22 @@ fn nemotron_config() -> serde_json::Value {
     })
 }
 
+fn nemotron_quantizable_config() -> serde_json::Value {
+    let mut value = nemotron_config();
+    value["vocab_size"] = 64.into();
+    value["hidden_size"] = 32.into();
+    value["intermediate_size"] = 32.into();
+    value["num_attention_heads"] = 4.into();
+    value["num_key_value_heads"] = 2.into();
+    value["head_dim"] = 8.into();
+    value["mamba_num_heads"] = 4.into();
+    value["mamba_head_dim"] = 8.into();
+    value["n_groups"] = 2.into();
+    value["moe_intermediate_size"] = 32.into();
+    value["moe_shared_expert_intermediate_size"] = 32.into();
+    value
+}
+
 fn nemotron_public_name(runtime: &str, args: &nemotron_model::ModelArgs) -> String {
     if let Some(rest) = runtime.strip_prefix("model.embeddings.") {
         return format!("backbone.embeddings.{rest}");
@@ -2450,7 +2498,14 @@ fn nemotron_public_name(runtime: &str, args: &nemotron_model::ModelArgs) -> Stri
 }
 
 fn write_nemotron_fixture(directory: &Path) {
-    let config = nemotron_config();
+    write_nemotron_fixture_with_config(directory, nemotron_config());
+}
+
+fn write_nemotron_quantizable_fixture(directory: &Path) {
+    write_nemotron_fixture_with_config(directory, nemotron_quantizable_config());
+}
+
+fn write_nemotron_fixture_with_config(directory: &Path, config: serde_json::Value) {
     let execution = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
     let stream = execution.stream();
     let args = nemotron_model::model_args_from_config_value(&config).unwrap();
@@ -2758,6 +2813,24 @@ fn inkling_config() -> serde_json::Value {
     })
 }
 
+fn inkling_quantizable_config() -> serde_json::Value {
+    let mut value = inkling_config();
+    value["text_config"]["hidden_size"] = 32.into();
+    value["text_config"]["vocab_size"] = 64.into();
+    value["text_config"]["num_attention_heads"] = 4.into();
+    value["text_config"]["num_key_value_heads"] = 2.into();
+    value["text_config"]["head_dim"] = 8.into();
+    value["text_config"]["swa_num_attention_heads"] = 4.into();
+    value["text_config"]["swa_num_key_value_heads"] = 2.into();
+    value["text_config"]["swa_head_dim"] = 8.into();
+    value["text_config"]["d_rel"] = 32.into();
+    value["text_config"]["rel_extent"] = 32.into();
+    value["text_config"]["intermediate_size"] = 32.into();
+    value["text_config"]["dense_intermediate_size"] = 32.into();
+    value["text_config"]["moe_intermediate_size"] = 32.into();
+    value
+}
+
 fn inkling_multimodal_config() -> serde_json::Value {
     let mut config = inkling_config();
     config["audio_config"] = serde_json::json!({
@@ -2823,6 +2896,10 @@ fn interleave(gate: &Array, up: &Array, axis: i32, stream: &Stream) -> Array {
 
 fn write_inkling_fixture(directory: &Path) {
     write_inkling_fixture_with_config(directory, inkling_config());
+}
+
+fn write_inkling_quantizable_fixture(directory: &Path) {
+    write_inkling_fixture_with_config(directory, inkling_quantizable_config());
 }
 
 fn write_inkling_multimodal_fixture(directory: &Path) {
@@ -4081,6 +4158,32 @@ fn ring_four_process_nemotron_h_moe_pipeline_expert_cache_mismatch_consensus() {
     );
 }
 
+/// Proves bounded affine materialization feeds stage-local Nemotron-H expert
+/// caches under PP+EP, including persistence and synchronized decode.
+#[test]
+#[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
+fn ring_four_process_nemotron_h_quantized_pipeline_expert_cache() {
+    run_ring_cartesian_pipeline_mode(
+        true,
+        FixtureFamily::NemotronH,
+        "pp-ep",
+        WorkerMode::ExpertCacheRequantize,
+    );
+}
+
+/// Proves a PP+EP stage can bounded-quantize and pin its complete rank-local
+/// Nemotron-H expert banks without introducing an independent expert cache.
+#[test]
+#[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
+fn ring_four_process_nemotron_h_fully_resident_load_time_quantization() {
+    run_ring_cartesian_pipeline_mode(
+        false,
+        FixtureFamily::NemotronH,
+        "pp-ep",
+        WorkerMode::Requantize,
+    );
+}
+
 /// Verifies Qwen3-Next linear and full-attention state through distributed
 /// prefill, decode, persistence, and bounded streaming.
 #[test]
@@ -4483,6 +4586,32 @@ fn ring_four_process_inkling_expert_cache_mismatch_consensus() {
     );
 }
 
+/// Proves bounded affine materialization feeds stage-local Inkling expert
+/// caches under PP+EP, including persistence and synchronized decode.
+#[test]
+#[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
+fn ring_four_process_inkling_quantized_pipeline_expert_cache() {
+    run_ring_cartesian_pipeline_mode(
+        true,
+        FixtureFamily::Inkling,
+        "pp-ep",
+        WorkerMode::ExpertCacheRequantize,
+    );
+}
+
+/// Proves a PP+EP stage can bounded-quantize and pin its complete rank-local
+/// Inkling routed/shared banks without introducing an independent expert cache.
+#[test]
+#[ignore = "spawns local processes and opens loopback sockets; run explicitly"]
+fn ring_four_process_inkling_fully_resident_load_time_quantization() {
+    run_ring_cartesian_pipeline_mode(
+        false,
+        FixtureFamily::Inkling,
+        "pp-ep",
+        WorkerMode::Requantize,
+    );
+}
+
 /// Runs scheduled Inkling audio/image ingress through TP-sharded stage zero,
 /// matching-TP pipeline transport, persistence, decode, and generation.
 #[test]
@@ -4589,6 +4718,14 @@ fn run_ring_cartesian_pipeline_mode(
             FixtureFamily::Lfm2 => write_lfm2_pipeline_fixture(checkpoint.path(), false),
             FixtureFamily::Lfm2Moe => write_lfm2_pipeline_fixture(checkpoint.path(), true),
             FixtureFamily::KimiLinear => write_kimi_linear_fixture(checkpoint.path()),
+            FixtureFamily::NemotronH
+                if matches!(
+                    mode,
+                    WorkerMode::ExpertCacheRequantize | WorkerMode::Requantize
+                ) =>
+            {
+                write_nemotron_quantizable_fixture(checkpoint.path())
+            }
             FixtureFamily::NemotronH => write_nemotron_fixture(checkpoint.path()),
             FixtureFamily::Qwen3Next => write_qwen_hybrid_fixture(checkpoint.path(), "qwen3_next"),
             FixtureFamily::Qwen3NextMoe => {
@@ -4603,6 +4740,14 @@ fn run_ring_cartesian_pipeline_mode(
             }
             FixtureFamily::Qwen35MoeMultimodal => {
                 write_qwen35_multimodal_fixture(checkpoint.path(), true)
+            }
+            FixtureFamily::Inkling
+                if matches!(
+                    mode,
+                    WorkerMode::ExpertCacheRequantize | WorkerMode::Requantize
+                ) =>
+            {
+                write_inkling_quantizable_fixture(checkpoint.path())
             }
             FixtureFamily::Inkling => write_inkling_fixture(checkpoint.path()),
             FixtureFamily::InklingMultimodal => write_inkling_multimodal_fixture(checkpoint.path()),
@@ -4680,6 +4825,7 @@ fn run_ring_layerwise_host_cartesian_pipeline_mode(
 enum WorkerMode {
     Standard,
     ExpertCache,
+    ExpertCacheRequantize,
     ExpertCacheScheduleMismatch,
     Microbatch,
     ScheduleMismatch,
@@ -4844,6 +4990,10 @@ fn run_ring_pipeline_processes(
             WorkerMode::Standard => {}
             WorkerMode::ExpertCache => {
                 command.env(EXPERT_CACHE, "1");
+            }
+            WorkerMode::ExpertCacheRequantize => {
+                command.env(EXPERT_CACHE, "1");
+                command.env(REQUANTIZE, "1");
             }
             WorkerMode::ExpertCacheScheduleMismatch => {
                 command.env(EXPERT_CACHE, "1");

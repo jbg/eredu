@@ -5723,6 +5723,50 @@ pub(crate) fn assert_rank_owned_sparse_ep_load(
 }
 
 #[cfg(test)]
+pub(crate) fn assert_rank_owned_quantized_sparse_ep_load(
+    model_dir: &Path,
+    expert_options: ExpertCacheLoadOptions,
+    quantization: WeightQuantization,
+    expected_kind: ModelKind,
+    expected_owned_experts: usize,
+    stream: &Stream,
+    weights_stream: &Stream,
+) {
+    use crate::runtime::distributed::topology::DeviceAssignment;
+    use safemlx::DeviceType;
+
+    let topology =
+        ParallelTopology::from_rank(2, 1, 1, 1, 2, DeviceAssignment::new(DeviceType::Gpu, 0))
+            .unwrap();
+    let model = load_expert_parallel_model_with_options(
+        model_dir,
+        ModelLoadOptions::with_quantization(quantization)
+            .with_parallel_topology(topology)
+            .with_weight_residency(WeightResidency::with_expert_cache(
+                crate::NonExpertWeightResidency::LayerwiseHost(Default::default()),
+                expert_options,
+            )),
+        stream,
+        weights_stream,
+    )
+    .unwrap();
+    assert_eq!(model.info().model_kind, expected_kind);
+    assert_eq!(model.info().expert_parallel_rank, 1);
+    assert_eq!(model.info().expert_parallel_size, 2);
+    assert_eq!(model.info().routed_expert_bytes, 0);
+    let report = model.expert_cache_report().unwrap().unwrap();
+    assert_eq!(report.owned_experts, expected_owned_experts);
+    assert_eq!(report.weight_quantization, Some(quantization));
+    let materialization = report.materialization.unwrap();
+    assert!(materialization.transformed_weights > 0);
+    assert!(materialization.source_tiles > 0);
+    assert!(materialization.source_bytes_read > materialization.output_bytes);
+    assert!(
+        materialization.peak_planned_working_set_bytes <= expert_options.compact_bank_scratch_bytes
+    );
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::runtime::distributed::topology::DeviceAssignment;

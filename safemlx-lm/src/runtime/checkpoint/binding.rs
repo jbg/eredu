@@ -30,6 +30,17 @@ pub fn canonical_checkpoint_name(parameter_name: &str) -> String {
         .replace(".inner.bias", ".bias")
 }
 
+/// Maps custom packed-bank companion fields onto the canonical overlay name.
+pub(crate) fn packed_companion_checkpoint_name(parameter_name: &str) -> Option<String> {
+    [("_scales", "scales"), ("_biases", "biases")]
+        .into_iter()
+        .find_map(|(runtime_suffix, checkpoint_component)| {
+            parameter_name
+                .strip_suffix(runtime_suffix)
+                .map(|prefix| format!("{prefix}.{checkpoint_component}"))
+        })
+}
+
 /// Returns the full parameter names exposed by `module` under `prefix`.
 pub fn full_parameter_names(module: &impl ModuleParameters, prefix: &str) -> Vec<String> {
     let mut names = module
@@ -212,7 +223,7 @@ where
     report.finish_excluding(module, &config, excluded)
 }
 
-fn build_module_bindings_with_recipes_excluding<F>(
+pub(crate) fn build_module_bindings_with_recipes_excluding<F>(
     module: &impl ModuleParameters,
     prefix: &str,
     store: &dyn WeightStore,
@@ -222,6 +233,7 @@ fn build_module_bindings_with_recipes_excluding<F>(
 where
     F: Fn(&str) -> bool,
 {
+    recipes.retain(|name, _| !exclude(name));
     let keys = store.keys().into_iter().collect::<BTreeSet<_>>();
     let params = module.parameters().flatten();
     let mut local_names = params
