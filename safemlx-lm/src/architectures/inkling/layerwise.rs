@@ -91,6 +91,45 @@ struct InklingMtpModule {
     policies: Vec<crate::AttentionPolicy>,
 }
 
+fn inkling_mtp_text_args(
+    args: &ModelArgs,
+    config: &resident::InklingMtpConfig,
+    attention: crate::AttentionPolicy,
+) -> Result<resident::TextArgs, Error> {
+    let mut text = args.text_config.clone();
+    text.num_attention_heads = config
+        .num_attention_heads
+        .unwrap_or(text.num_attention_heads);
+    text.num_key_value_heads = config
+        .num_key_value_heads
+        .unwrap_or(text.num_key_value_heads);
+    text.head_dim = config.head_dim.unwrap_or(text.head_dim);
+    text.swa_num_attention_heads = config
+        .swa_num_attention_heads
+        .or(text.swa_num_attention_heads);
+    text.swa_num_key_value_heads = config
+        .swa_num_key_value_heads
+        .or(text.swa_num_key_value_heads);
+    text.swa_head_dim = config.swa_head_dim.or(text.swa_head_dim);
+    text.dense_intermediate_size = config
+        .dense_intermediate_size
+        .or(text.dense_intermediate_size);
+    text.intermediate_size = config.intermediate_size.unwrap_or(text.intermediate_size);
+    text.sconv_kernel_size = config.sconv_kernel_size.unwrap_or(text.sconv_kernel_size);
+    text.rel_extent = config.rel_extent.unwrap_or(text.rel_extent);
+    text.d_rel = config.d_rel.unwrap_or(text.d_rel);
+    text.layer_schedule = crate::LayerSchedule::new(
+        1,
+        vec![resident::LayerPolicy {
+            attention,
+            feed_forward: resident::FeedForwardPolicy::Dense,
+        }],
+    )
+    .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
+    text.num_hidden_layers = 1;
+    Ok(text)
+}
+
 impl InklingMtpModule {
     fn new(args: &ModelArgs, stream: &Stream) -> Result<Option<Self>, Error> {
         let Some(config) = args.mtp_config.as_ref() else {
@@ -126,37 +165,7 @@ impl InklingMtpModule {
             .iter()
             .copied()
             .map(|attention| {
-                let mut text = args.text_config.clone();
-                text.num_attention_heads = config
-                    .num_attention_heads
-                    .unwrap_or(text.num_attention_heads);
-                text.num_key_value_heads = config
-                    .num_key_value_heads
-                    .unwrap_or(text.num_key_value_heads);
-                text.head_dim = config.head_dim.unwrap_or(text.head_dim);
-                text.swa_num_attention_heads = config
-                    .swa_num_attention_heads
-                    .or(text.swa_num_attention_heads);
-                text.swa_num_key_value_heads = config
-                    .swa_num_key_value_heads
-                    .or(text.swa_num_key_value_heads);
-                text.swa_head_dim = config.swa_head_dim.or(text.swa_head_dim);
-                text.dense_intermediate_size = config
-                    .dense_intermediate_size
-                    .or(text.dense_intermediate_size);
-                text.intermediate_size = config.intermediate_size.unwrap_or(text.intermediate_size);
-                text.sconv_kernel_size = config.sconv_kernel_size.unwrap_or(text.sconv_kernel_size);
-                text.rel_extent = config.rel_extent.unwrap_or(text.rel_extent);
-                text.d_rel = config.d_rel.unwrap_or(text.d_rel);
-                text.layer_schedule = crate::LayerSchedule::new(
-                    1,
-                    vec![resident::LayerPolicy {
-                        attention,
-                        feed_forward: resident::FeedForwardPolicy::Dense,
-                    }],
-                )
-                .map_err(|error| Error::UnsupportedArchitecture(error.to_string()))?;
-                text.num_hidden_layers = 1;
+                let text = inkling_mtp_text_args(args, config, attention)?;
                 Ok(InklingMtpDepth {
                     hidden_norm: nn::RmsNorm::unloaded(
                         text.hidden_size,
@@ -204,6 +213,7 @@ impl InklingMtpModule {
         self.layers.len()
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn forward_step(
         &mut self,
         hidden: &Array,
@@ -211,6 +221,7 @@ impl InklingMtpModule {
         tokens: &Array,
         depth: usize,
         cache: &mut [resident::LayerCache],
+        execution: Option<&crate::runtime::distributed::parallel::ParallelExecutionContext<'_>>,
         stream: &Stream,
     ) -> Result<crate::runtime::generation::embedded_mtp::EmbeddedMtpOutput, Exception> {
         if self.layers.is_empty() || cache.len() != self.layers.len() {
@@ -224,10 +235,19 @@ impl InklingMtpModule {
         let embeddings = layer.embed_norm.forward(embeddings, stream)?;
         let combined = concatenate_axis(&[&hidden, &embeddings], -1, stream)?;
         let fused = layer.input_proj.forward(&combined, stream)?;
-        let mut hidden =
-            layer
+        let mut hidden = match execution.filter(|execution| execution.is_tensor_parallel()) {
+            Some(execution) => layer.transformer_block.forward_tensor_parallel(
+                &fused,
+                Some(&mut cache[depth]),
+                execution.group().ok_or_else(|| {
+                    Exception::custom("Inkling MTP TP execution is missing its group")
+                })?,
+                stream,
+            )?,
+            None => layer
                 .transformer_block
-                .forward(&fused, Some(&mut cache[depth]), stream)?;
+                .forward(&fused, Some(&mut cache[depth]), stream)?,
+        };
         if let Some(norm) = &mut self.chain_norm {
             hidden = norm.forward(&hidden, stream)?;
         }
@@ -244,6 +264,20 @@ impl InklingMtpModule {
 /// Inkling multimodal model using bounded residency for hMLP and decoder blocks.
 pub struct InklingLayerwiseModel {
     execution: LayerwiseModel<InklingLayerwiseAdapter>,
+}
+
+pub(crate) struct InklingTensorMtpTarget<'a> {
+    model: &'a mut InklingLayerwiseModel,
+    group: &'a safemlx::distributed::Group,
+}
+
+impl<'a> InklingTensorMtpTarget<'a> {
+    pub(crate) fn new(
+        model: &'a mut InklingLayerwiseModel,
+        group: &'a safemlx::distributed::Group,
+    ) -> Self {
+        Self { model, group }
+    }
 }
 
 impl InklingLayerwiseModel {
@@ -317,7 +351,7 @@ impl InklingLayerwiseModel {
             .mtp
             .as_mut()
             .ok_or_else(|| Exception::custom("Inkling checkpoint does not contain MTP layers"))?
-            .forward_step(hidden, &embeddings, tokens, depth, cache, stream)?;
+            .forward_step(hidden, &embeddings, tokens, depth, cache, None, stream)?;
         output.logits = resident::project_text_logits(
             &output.hidden,
             &adapter.args.text_config,
@@ -325,6 +359,87 @@ impl InklingLayerwiseModel {
             stream,
             |hidden, stream| adapter.lm_head.forward(hidden, stream),
         )?;
+        Ok(output)
+    }
+
+    fn forward_mtp_target_tensor(
+        &mut self,
+        input: InklingInput<'_>,
+        cache: &mut Cache,
+        group: &safemlx::distributed::Group,
+        stream: &Stream,
+    ) -> Result<crate::runtime::generation::embedded_mtp::EmbeddedMtpOutput, Exception> {
+        let (logits, context) = self
+            .execution
+            .forward_tensor_parallel_with_context(
+                InklingExecutionInput {
+                    input,
+                    last_token_only: false,
+                },
+                cache,
+                group,
+                stream,
+            )
+            .map_err(|error| Exception::custom(error.to_string()))?;
+        Ok(
+            crate::runtime::generation::embedded_mtp::EmbeddedMtpOutput {
+                logits,
+                hidden: context.draft_hidden.ok_or_else(|| {
+                    Exception::custom("Inkling tensor pass did not retain MTP hidden state")
+                })?,
+                tokens: context.draft_tokens.ok_or_else(|| {
+                    Exception::custom("Inkling tensor pass did not retain MTP token identity")
+                })?,
+            },
+        )
+    }
+
+    fn forward_mtp_draft_tensor(
+        &mut self,
+        hidden: &Array,
+        tokens: &Array,
+        depth: usize,
+        cache: &mut [resident::LayerCache],
+        group: &safemlx::distributed::Group,
+        stream: &Stream,
+    ) -> Result<crate::runtime::generation::embedded_mtp::EmbeddedMtpOutput, Exception> {
+        let topology = self
+            .parallel_info()
+            .ok_or_else(|| Exception::custom("Inkling MTP target has no parallel topology"))?
+            .topology();
+        let execution =
+            crate::runtime::distributed::parallel::ParallelExecutionContext::tensor_parallel(
+                topology, group, stream,
+            )
+            .map_err(|error| Exception::custom(error.to_string()))?;
+        let adapter = self.execution.adapter_mut();
+        let embeddings = adapter
+            .parallel_embedding
+            .as_mut()
+            .ok_or_else(|| Exception::custom("Inkling MTP has no TP embedding shard"))?
+            .forward(tokens, &execution)
+            .map_err(|error| Exception::custom(error.to_string()))?;
+        let embeddings = adapter.embed_norm.forward(&embeddings, stream)?;
+        let mut output = adapter
+            .mtp
+            .as_mut()
+            .ok_or_else(|| Exception::custom("Inkling checkpoint does not contain MTP layers"))?
+            .forward_step(
+                hidden,
+                &embeddings,
+                tokens,
+                depth,
+                cache,
+                Some(&execution),
+                stream,
+            )?;
+        output.logits = adapter
+            .parallel_lm_head
+            .as_mut()
+            .ok_or_else(|| Exception::custom("Inkling MTP has no TP output-head shard"))?
+            .forward(&output.hidden, &execution)
+            .and_then(|output| output.all_gather(&execution))
+            .map_err(|error| Exception::custom(error.to_string()))?;
         Ok(output)
     }
 
@@ -564,6 +679,142 @@ impl InklingLayerwiseModel {
         )
     }
 
+    pub(crate) fn forward_mtp_target_with_expert_executor<F>(
+        &mut self,
+        tokens: &Array,
+        cache: &mut Cache,
+        tensor_group: Option<&safemlx::distributed::Group>,
+        mut execute: F,
+        stream: &Stream,
+    ) -> Result<crate::runtime::generation::embedded_mtp::EmbeddedMtpOutput, Exception>
+    where
+        F: FnMut(usize, &Array, &Array, &Array, &Stream) -> Result<Array, Exception>,
+    {
+        let input = InklingExecutionInput {
+            input: InklingInput::Decode(tokens),
+            last_token_only: false,
+        };
+        let (logits, context) = match tensor_group {
+            Some(tensor_group) => self
+                .execution
+                .forward_tensor_parallel_with_layer_executor_and_context(
+                    input,
+                    cache,
+                    tensor_group,
+                    stream,
+                    |_adapter, _group, index, layer, hidden, cache, _context, execution| match layer
+                    {
+                        InklingLayer::Vision(_) => Err(Error::Parallel(
+                            "Inkling TP+EP MTP text target received a vision unit".into(),
+                        )),
+                        InklingLayer::Text(layer) => Ok(layer
+                            .forward_tensor_with_expert_executor(
+                                hidden,
+                                Some(&mut cache.layers[index]),
+                                execution.group().ok_or_else(|| {
+                                    Error::Parallel(
+                                        "Inkling TP+EP MTP target is missing its TP group".into(),
+                                    )
+                                })?,
+                                execution.stream(),
+                                |hidden, ids, weights, stream| {
+                                    execute(index, hidden, ids, weights, stream)
+                                },
+                            )?),
+                    },
+                ),
+            None => self.execution.forward_with_layer_executor_and_context(
+                input,
+                cache,
+                stream,
+                |_adapter, _group, index, layer, hidden, cache, context, stream| match layer {
+                    InklingLayer::Vision(layer) => {
+                        for job in &mut context.vision_jobs {
+                            job.hidden = layer.forward(&job.hidden, stream)?;
+                        }
+                        Ok(context.vision_jobs[0].hidden.clone())
+                    }
+                    InklingLayer::Text(layer) => Ok(layer.forward_with_expert_executor(
+                        hidden,
+                        Some(&mut cache.layers[index]),
+                        stream,
+                        |hidden, ids, weights, stream| execute(index, hidden, ids, weights, stream),
+                    )?),
+                },
+            ),
+        }
+        .map_err(|error| Exception::custom(error.to_string()))?;
+        Ok(
+            crate::runtime::generation::embedded_mtp::EmbeddedMtpOutput {
+                logits,
+                hidden: context.draft_hidden.ok_or_else(|| {
+                    Exception::custom("Inkling EP pass did not retain MTP hidden state")
+                })?,
+                tokens: context.draft_tokens.ok_or_else(|| {
+                    Exception::custom("Inkling EP pass did not retain MTP token identity")
+                })?,
+            },
+        )
+    }
+
+    pub(crate) fn forward_mtp_draft_cartesian(
+        &mut self,
+        hidden: &Array,
+        tokens: &Array,
+        depth: usize,
+        cache: &mut [resident::LayerCache],
+        tensor_group: Option<&safemlx::distributed::Group>,
+        stream: &Stream,
+    ) -> Result<crate::runtime::generation::embedded_mtp::EmbeddedMtpOutput, Exception> {
+        let topology = self
+            .parallel_info()
+            .ok_or_else(|| Exception::custom("Inkling EP MTP target has no topology"))?
+            .topology();
+        let execution = tensor_group
+            .map(|group| {
+                crate::runtime::distributed::parallel::ParallelExecutionContext::tensor_parallel(
+                    topology, group, stream,
+                )
+            })
+            .transpose()
+            .map_err(|error| Exception::custom(error.to_string()))?;
+        let adapter = self.execution.adapter_mut();
+        let embeddings = match execution.as_ref() {
+            Some(execution) => adapter
+                .parallel_embedding
+                .as_mut()
+                .ok_or_else(|| Exception::custom("Inkling MTP has no TP embedding shard"))?
+                .forward(tokens, execution)
+                .map_err(|error| Exception::custom(error.to_string()))?,
+            None => adapter.embedding.forward(tokens, stream)?,
+        };
+        let embeddings = adapter.embed_norm.forward(&embeddings, stream)?;
+        let mut output = adapter
+            .mtp
+            .as_mut()
+            .ok_or_else(|| Exception::custom("Inkling checkpoint does not contain MTP layers"))?
+            .forward_step(
+                hidden,
+                &embeddings,
+                tokens,
+                depth,
+                cache,
+                execution.as_ref(),
+                stream,
+            )?;
+        output.logits = match execution.as_ref() {
+            Some(execution) => adapter
+                .parallel_lm_head
+                .as_mut()
+                .ok_or_else(|| Exception::custom("Inkling MTP has no TP output shard"))?
+                .forward(&output.hidden, execution)
+                .and_then(|output| output.all_gather(execution))
+                .map_err(|error| Exception::custom(error.to_string()))?,
+            None => adapter.lm_head.forward(&output.hidden, stream)?,
+        };
+        Ok(output)
+    }
+
     /// Clears temporary vision and decoder blocks from the execution device.
     pub fn clear_device_layer_window(&self) -> Result<(), Error> {
         self.execution.clear_all_device_groups()
@@ -691,6 +942,123 @@ impl crate::runtime::generation::embedded_mtp::EmbeddedMtpTarget for InklingLaye
     }
     fn max_draft_tokens(&self) -> usize {
         self.mtp_len()
+    }
+}
+
+impl crate::runtime::generation::embedded_mtp::EmbeddedMtpTarget for InklingTensorMtpTarget<'_> {
+    type Cache = Cache;
+    type DraftCache = Vec<resident::LayerCache>;
+
+    fn prefill_target(
+        &mut self,
+        input: input::ModelInput<'_>,
+        cache: &mut Cache,
+        stream: &Stream,
+    ) -> Result<crate::runtime::generation::embedded_mtp::EmbeddedMtpOutput, Exception> {
+        cache.reset()?;
+        self.model.forward_mtp_target_tensor(
+            InklingInput::Prefill(input),
+            cache,
+            self.group,
+            stream,
+        )
+    }
+
+    fn verify_target(
+        &mut self,
+        tokens: &Array,
+        cache: &mut Cache,
+        stream: &Stream,
+    ) -> Result<crate::runtime::generation::embedded_mtp::EmbeddedMtpOutput, Exception> {
+        self.model.forward_mtp_target_tensor(
+            InklingInput::Decode(tokens),
+            cache,
+            self.group,
+            stream,
+        )
+    }
+
+    fn prefill_draft_cache(
+        &mut self,
+        output: &crate::runtime::generation::embedded_mtp::EmbeddedMtpOutput,
+        tokens: &Array,
+        cache: &mut Cache,
+        stream: &Stream,
+    ) -> Result<(), Exception> {
+        let sequence = tokens.dim(1);
+        if sequence <= 1 {
+            return Ok(());
+        }
+        let hidden = output
+            .hidden
+            .try_index_device((.., ..sequence - 1, ..), stream)?;
+        let next = tokens.try_index_device((.., 1..), stream)?;
+        for depth in 0..cache.mtp_layers.len() {
+            let _ = self.model.forward_mtp_draft_tensor(
+                &hidden,
+                &next,
+                depth,
+                &mut cache.mtp_layers,
+                self.group,
+                stream,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn draft_cache(cache: &Cache) -> Self::DraftCache {
+        cache.mtp_layers.clone()
+    }
+
+    fn commit_draft_cache(cache: &mut Cache, draft: &Self::DraftCache) {
+        cache.mtp_layers.clone_from(draft);
+    }
+
+    fn restore_target_checkpoint(
+        cache: &mut Cache,
+        checkpoint: &Cache,
+        stream: &Stream,
+    ) -> Result<(), Exception> {
+        cache.restore_target_checkpoint(checkpoint, stream)
+    }
+
+    fn draft_logits(
+        &mut self,
+        hidden: &Array,
+        last_token: u32,
+        draft_index: usize,
+        cache: &mut Self::DraftCache,
+        stream: &Stream,
+    ) -> Result<(Array, Array), Exception> {
+        let token = Array::from_slice(&[last_token], &[1, 1]);
+        let output = self.model.forward_mtp_draft_tensor(
+            hidden,
+            &token,
+            draft_index,
+            cache,
+            self.group,
+            stream,
+        )?;
+        Ok((output.logits, output.hidden))
+    }
+
+    fn advance_draft_cache(
+        &mut self,
+        hidden: &Array,
+        tokens: &Array,
+        cache: &mut Self::DraftCache,
+        stream: &Stream,
+    ) -> Result<(), Exception> {
+        for depth in 0..cache.len() {
+            let _ = self
+                .model
+                .forward_mtp_draft_tensor(hidden, tokens, depth, cache, self.group, stream)?;
+        }
+        Ok(())
+    }
+
+    fn max_draft_tokens(&self) -> usize {
+        self.model.mtp_len()
     }
 }
 
@@ -1524,6 +1892,15 @@ impl InklingLayerwiseAdapter {
                 }
             }
             "embed_norm" => Some(&mut self.embed_norm),
+            "output" => self
+                .parallel_lm_head
+                .as_mut()
+                .map(|module| module.inner_mut() as &mut dyn ModuleParameters)
+                .or(Some(&mut self.lm_head)),
+            "mtp" => self
+                .mtp
+                .as_mut()
+                .map(|module| module as &mut dyn ModuleParameters),
             "audio" => self
                 .audio
                 .as_mut()
@@ -1534,6 +1911,51 @@ impl InklingLayerwiseAdapter {
                 .map(|module| module as &mut dyn ModuleParameters),
             _ => None,
         }
+    }
+
+    pub(crate) fn embedded_mtp_len(&self) -> usize {
+        self.mtp.as_ref().map_or(0, InklingMtpModule::len)
+    }
+
+    pub(crate) fn embedded_mtp_cache(&self) -> Vec<resident::LayerCache> {
+        self.new_cache().mtp_layers
+    }
+
+    pub(crate) fn forward_pipeline_mtp(
+        &mut self,
+        hidden: &Array,
+        tokens: &Array,
+        depth: usize,
+        cache: &mut [resident::LayerCache],
+        execution: Option<&crate::runtime::distributed::parallel::ParallelExecutionContext<'_>>,
+        stream: &Stream,
+    ) -> Result<crate::runtime::generation::embedded_mtp::EmbeddedMtpOutput, Exception> {
+        let embeddings = match execution.filter(|execution| execution.is_tensor_parallel()) {
+            Some(execution) => self
+                .parallel_embedding
+                .as_mut()
+                .ok_or_else(|| Exception::custom("Inkling pipeline MTP has no TP embedding shard"))?
+                .forward(tokens, execution)
+                .map_err(|error| Exception::custom(error.to_string()))?,
+            None => self.embedding.forward(tokens, stream)?,
+        };
+        let embeddings = self.embed_norm.forward(&embeddings, stream)?;
+        let mut output = self
+            .mtp
+            .as_mut()
+            .ok_or_else(|| Exception::custom("Inkling checkpoint does not contain MTP layers"))?
+            .forward_step(hidden, &embeddings, tokens, depth, cache, execution, stream)?;
+        output.logits = match execution.filter(|execution| execution.is_tensor_parallel()) {
+            Some(execution) => self
+                .parallel_lm_head
+                .as_mut()
+                .ok_or_else(|| Exception::custom("Inkling pipeline MTP has no TP output shard"))?
+                .forward(&output.hidden, execution)
+                .and_then(|output| output.all_gather(execution))
+                .map_err(|error| Exception::custom(error.to_string()))?,
+            None => self.lm_head.forward(&output.hidden, stream)?,
+        };
+        Ok(output)
     }
 
     /// Starts typed pipeline ingress through the same adapter lifecycle used
@@ -2741,6 +3163,33 @@ impl ArchitectureAdapter for InklingLayerwiseAdapter {
             context,
             stream,
         )?);
+        if let (Some(mtp), Some(config)) = (&mut self.mtp, self.args.mtp_config.as_ref()) {
+            for (index, layer) in mtp.layers.iter_mut().enumerate() {
+                let prefix = format!("mtp.layers.{index}.transformer_block");
+                let mtp_text = inkling_mtp_text_args(&self.args, config, mtp.policies[index])?;
+                let sliding = mtp.policies[index].window().is_some();
+                let head_dim = mtp_text.attention_head_dim(sliding);
+                let query_width = projection_dimension(&format!("{prefix}.self_attn.q_proj"), 0)?;
+                let kv_width = projection_dimension(&format!("{prefix}.self_attn.k_proj"), 0)?;
+                if head_dim <= 0 || query_width % head_dim != 0 || kv_width % head_dim != 0 {
+                    return Err(Error::Parallel(format!(
+                        "Inkling MTP layer {index} local attention widths ({query_width}, {kv_width}) do not contain integral heads of width {head_dim}"
+                    )));
+                }
+                let geometry = resident::ParallelLayerGeometry {
+                    query_heads: query_width / head_dim,
+                    kv_heads: kv_width / head_dim,
+                    feed_forward: resident::ParallelFeedForwardGeometry::Dense {
+                        intermediate: projection_dimension(
+                            &format!("{prefix}.dense.gate_proj"),
+                            0,
+                        )?,
+                    },
+                };
+                layer.transformer_block =
+                    DecoderLayer::new_parallel_layerwise(&mtp_text, 0, geometry, stream)?;
+            }
+        }
         if let Some(audio) = &self.args.audio_config {
             self.audio = Some(AudioModel::new_tensor_parallel(
                 audio,
@@ -2764,6 +3213,40 @@ impl ArchitectureAdapter for InklingLayerwiseAdapter {
         for index in 0..self.args.text_config.num_hidden_layers as usize {
             let layer = DecoderLayer::new(&self.args.text_config, index as i32, stream)?;
             layer.register_tensor_parallel_parameters(planner, &format!("model.layers.{index}"))?;
+        }
+        if let Some(mtp) = &self.mtp {
+            for (index, layer) in mtp.layers.iter().enumerate() {
+                let prefix = format!("mtp.layers.{index}");
+                crate::runtime::distributed::parallel::register_replicated_module(
+                    planner,
+                    &layer.hidden_norm,
+                    &format!("{prefix}.hidden_norm"),
+                )?;
+                crate::runtime::distributed::parallel::register_replicated_module(
+                    planner,
+                    &layer.embed_norm,
+                    &format!("{prefix}.embed_norm"),
+                )?;
+                crate::runtime::distributed::parallel::register_projection_module(
+                    planner,
+                    &layer.input_proj,
+                    &format!("{prefix}.input_proj"),
+                    crate::runtime::distributed::parallel::ProjectionSharding::Replicated,
+                )?;
+                layer
+                    .transformer_block
+                    .register_tensor_parallel_parameters(
+                        planner,
+                        &format!("{prefix}.transformer_block"),
+                    )?;
+            }
+            if let Some(chain_norm) = &mtp.chain_norm {
+                crate::runtime::distributed::parallel::register_replicated_module(
+                    planner,
+                    chain_norm,
+                    "mtp.chain_norm",
+                )?;
+            }
         }
         if let Some(audio) = &self.audio {
             audio.register_tensor_parallel_parameters(planner, "audio")?;

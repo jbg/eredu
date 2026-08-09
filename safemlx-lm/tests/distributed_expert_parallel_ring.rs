@@ -181,6 +181,8 @@ fn expert_parallel_model_ring_worker() {
     } else {
         num_layers
     };
+    let predictor_moe_layers = config["mtp_num_hidden_layers"].as_u64().unwrap_or(0) as usize;
+    let routed_layer_count = moe_layers + predictor_moe_layers;
     let group = distributed::init(true, Backend::Ring).unwrap();
     let topology = ParallelTopology::from_group(
         &group,
@@ -262,7 +264,8 @@ fn expert_parallel_model_ring_worker() {
             RoutedExpertResidency::FullyResident
         }
     );
-    let dense_routed_bytes = 2 * moe_layers * 3 * moe_intermediate_size * hidden_size as usize * 4;
+    let dense_routed_bytes =
+        2 * routed_layer_count * 3 * moe_intermediate_size * hidden_size as usize * 4;
     if sparse_cached {
         assert_eq!(info.routed_expert_bytes, 0);
         assert!(info.owned_expert_bytes > 0);
@@ -291,12 +294,12 @@ fn expert_parallel_model_ring_worker() {
         assert_eq!(dense.device_layers().current_layer_count(), 0);
         assert_eq!(
             model.expert_cache_report().unwrap().unwrap().owned_experts,
-            2 * moe_layers
+            2 * routed_layer_count
         );
     }
     if residency == "tensor-expert-resident" {
         let experts = model.expert_cache_report().unwrap().unwrap();
-        assert_eq!(experts.owned_experts, 2 * moe_layers);
+        assert_eq!(experts.owned_experts, 2 * routed_layer_count);
         assert_eq!(experts.device_resident_experts, experts.owned_experts);
         assert_eq!(experts.device_resident_bytes, experts.owned_bytes);
         assert_eq!(experts.prefill.device.misses, 0);
@@ -679,7 +682,7 @@ fn expert_parallel_model_ring_worker() {
         assert!(model.new_qwen3_sliding_cache(2, paging).is_err());
     }
 
-    if config["mtp_num_hidden_layers"].as_u64().unwrap_or(0) > 0 && !tensor_expert {
+    if config["mtp_num_hidden_layers"].as_u64().unwrap_or(0) > 0 {
         assert_eq!(
             model.mtp_capability(),
             MtpCapability::Ready {
@@ -691,8 +694,23 @@ fn expert_parallel_model_ring_worker() {
         let input_parts = [runtime_input::InputPart::text_token_ids(&mtp_prompt)];
         let mtp_input = runtime_input::ModelInput::new(&input_parts);
         let mut committed = Vec::new();
-        let (tokens, stats) = model
-            .generate_embedded_mtp_input_with_sampler_callback(
+        let (tokens, stats) = if let Some(execution) = execution.as_ref() {
+            model.generate_embedded_mtp_cartesian(
+                &mut mtp_cache,
+                mtp_input,
+                &MtpConfig {
+                    max_tokens: 4,
+                    max_draft_tokens: 1,
+                    temperature: 0.0,
+                    eos_token_ids: Vec::new(),
+                },
+                None,
+                &mut sampler,
+                execution,
+                stream,
+            )
+        } else {
+            model.generate_embedded_mtp_input_with_sampler_callback(
                 &mut mtp_cache,
                 mtp_input,
                 &MtpConfig {
@@ -711,12 +729,15 @@ fn expert_parallel_model_ring_worker() {
                     Ok(())
                 },
             )
-            .unwrap();
+        }
+        .unwrap();
         assert_eq!(tokens, vec![0, 0, 0, 0]);
         assert_eq!(stats.emitted_tokens, 4);
         assert!(stats.draft_tokens > 0);
         assert_eq!(stats.accepted_tokens, stats.draft_tokens);
-        if expected_rank == 1 {
+        if tensor_expert {
+            assert!(committed.is_empty());
+        } else if expected_rank == 1 {
             assert_eq!(committed, tokens);
         } else {
             assert!(committed.is_empty());
@@ -2481,7 +2502,7 @@ fn write_qwen_hybrid_tp_ep_fixture(root: &Path, next: bool) -> PathBuf {
     let config = serde_json::json!({
         "model_type": if next { "qwen3_next" } else { "qwen3_5_moe_text" },
         "vocab_size": 32, "hidden_size": 16, "num_hidden_layers": 2,
-        "mtp_num_hidden_layers": 0, "test_moe_layers": 2,
+        "mtp_num_hidden_layers": 1, "test_moe_layers": 2,
         "num_attention_heads": 2, "num_key_value_heads": 2,
         "head_dim": 8, "max_position_embeddings": 64, "rms_norm_eps": 1e-5,
         "tie_word_embeddings": false, "linear_conv_kernel_dim": 3,

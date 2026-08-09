@@ -40,7 +40,8 @@ use crate::{
         PromptCacheManifest, PromptCacheModelIdentity, PromptCacheOptions, PromptCacheTopology,
     },
     runtime::checkpoint::binding::{
-        build_module_bindings_with_recipes, canonical_checkpoint_name, populate_module_from_lease,
+        build_module_bindings_with_recipes, build_module_bindings_with_recipes_excluding,
+        canonical_checkpoint_name, populate_module_from_lease,
         populate_module_from_lease_excluding,
     },
     runtime::checkpoint::store::{
@@ -135,6 +136,15 @@ fn register_qwen_hybrid_layer_parallel_plan(
     args: &ModelArgs,
 ) -> Result<(), Error> {
     let prefix = format!("model.layers.{index}");
+    register_qwen_hybrid_layer_parallel_plan_at(planner, layer, &prefix, args)
+}
+
+fn register_qwen_hybrid_layer_parallel_plan_at(
+    planner: &mut ParallelPlanBuilder,
+    layer: &TransformerBlock,
+    prefix: &str,
+    args: &ModelArgs,
+) -> Result<(), Error> {
     if let Some(attention) = &layer.self_attn {
         let query_width = usize::try_from(attention.n_heads * attention.head_dim)
             .map_err(|_| Error::Parallel("Qwen hybrid query width exceeds usize".into()))?;
@@ -431,6 +441,20 @@ pub struct QwenHybridLayerwiseModel {
     execution: LayerwiseModel<QwenHybridLayerwiseAdapter>,
 }
 
+pub(crate) struct QwenHybridTensorMtpTarget<'a> {
+    model: &'a mut QwenHybridLayerwiseModel,
+    group: &'a safemlx::distributed::Group,
+}
+
+impl<'a> QwenHybridTensorMtpTarget<'a> {
+    pub(crate) fn new(
+        model: &'a mut QwenHybridLayerwiseModel,
+        group: &'a safemlx::distributed::Group,
+    ) -> Self {
+        Self { model, group }
+    }
+}
+
 impl QwenHybridLayerwiseModel {
     /// Returns normalized text-model arguments.
     pub fn args(&self) -> &ModelArgs {
@@ -707,15 +731,46 @@ impl QwenHybridLayerwiseModel {
         &mut self,
         inputs: &Array,
         cache: &mut Cache,
+        tensor_group: Option<&safemlx::distributed::Group>,
         mut execute: F,
         stream: &Stream,
     ) -> Result<QwenMtpStepOutput, Exception>
     where
         F: FnMut(usize, &Array, &Array, &Array, &Stream) -> Result<Array, Exception>,
     {
-        let (logits, context) = self
-            .execution
-            .forward_with_layer_executor_and_context(
+        let (logits, context) = match tensor_group {
+            Some(tensor_group) => self
+                .execution
+                .forward_tensor_parallel_with_layer_executor_and_context(
+                    QwenHybridInput::Decode(inputs),
+                    cache,
+                    tensor_group,
+                    stream,
+                    |_adapter, _group, index, layer, hidden, cache, context, execution| match layer
+                    {
+                        QwenHybridLayer::Vision(_) => Err(Error::Parallel(
+                            "Qwen TP+EP MTP text target received a vision unit".into(),
+                        )),
+                        QwenHybridLayer::Text(block) => Ok(block
+                            .forward_tensor_with_expert_executor(
+                                BlockInput {
+                                    x: hidden,
+                                    mask: context.mask.as_ref(),
+                                    cache: Some(&mut cache.layers[index]),
+                                },
+                                execution.group().ok_or_else(|| {
+                                    Error::Parallel(
+                                        "Qwen TP+EP MTP target is missing its TP group".into(),
+                                    )
+                                })?,
+                                execution.stream(),
+                                |hidden, ids, weights, stream| {
+                                    execute(index, hidden, ids, weights, stream)
+                                },
+                            )?),
+                    },
+                ),
+            None => self.execution.forward_with_layer_executor_and_context(
                 QwenHybridInput::Decode(inputs),
                 cache,
                 stream,
@@ -744,8 +799,9 @@ impl QwenHybridLayerwiseModel {
                         |hidden, ids, weights, stream| execute(index, hidden, ids, weights, stream),
                     )?),
                 },
-            )
-            .map_err(|error| Exception::custom(error.to_string()))?;
+            ),
+        }
+        .map_err(|error| Exception::custom(error.to_string()))?;
         let hidden = context.draft_hidden.ok_or_else(|| {
             Exception::custom("Qwen layerwise pass did not retain MTP hidden state")
         })?;
@@ -799,6 +855,110 @@ impl QwenHybridLayerwiseModel {
             .forward_mtp_head(hidden, tokens, cache, stream)
     }
 
+    fn forward_mtp_tensor(
+        &mut self,
+        input: QwenHybridInput<'_>,
+        cache: &mut Cache,
+        group: &safemlx::distributed::Group,
+        stream: &Stream,
+    ) -> Result<QwenMtpStepOutput, Exception> {
+        let (logits, context) = self
+            .execution
+            .forward_tensor_parallel_with_context(input, cache, group, stream)
+            .map_err(|error| Exception::custom(error.to_string()))?;
+        let hidden = context
+            .draft_hidden
+            .ok_or_else(|| Exception::custom("Qwen tensor pass did not retain MTP hidden state"))?;
+        Ok(QwenMtpStepOutput { logits, hidden })
+    }
+
+    pub(crate) fn forward_mtp_head_tensor(
+        &mut self,
+        hidden: &Array,
+        tokens: &Array,
+        cache: &mut [LayerCache],
+        group: &safemlx::distributed::Group,
+        stream: &Stream,
+    ) -> Result<Array, Exception> {
+        let topology = self
+            .parallel_info()
+            .ok_or_else(|| Exception::custom("Qwen MTP target has no parallel topology"))?
+            .topology();
+        let execution =
+            crate::runtime::distributed::parallel::ParallelExecutionContext::tensor_parallel(
+                topology, group, stream,
+            )
+            .map_err(|error| Exception::custom(error.to_string()))?;
+        let adapter = self.execution.adapter_mut();
+        let embeddings = adapter
+            .parallel_embedding
+            .as_mut()
+            .ok_or_else(|| Exception::custom("Qwen MTP has no TP embedding shard"))?
+            .forward(tokens, &execution)
+            .map_err(|error| Exception::custom(error.to_string()))?;
+        let hidden = adapter
+            .mtp
+            .as_mut()
+            .ok_or_else(|| Exception::custom("Qwen checkpoint does not contain MTP layers"))?
+            .forward_tensor_parallel(hidden, &embeddings, cache, group, stream)?;
+        match (
+            adapter.parallel_lm_head.as_mut(),
+            adapter.parallel_embedding.as_mut(),
+        ) {
+            (Some(head), _) => head
+                .forward(&hidden, &execution)
+                .and_then(|output| output.all_gather(&execution)),
+            (None, Some(embedding)) => embedding
+                .project_logits(&hidden, &execution)
+                .and_then(|output| output.all_gather(&execution)),
+            (None, None) => Err(Error::Parallel(
+                "Qwen MTP has no TP output projection".into(),
+            )),
+        }
+        .map_err(|error| Exception::custom(error.to_string()))
+    }
+
+    pub(crate) fn forward_mtp_head_with_expert_executor<F>(
+        &mut self,
+        hidden: &Array,
+        tokens: &Array,
+        cache: &mut [LayerCache],
+        tensor_group: Option<&safemlx::distributed::Group>,
+        execute: &mut F,
+        stream: &Stream,
+    ) -> Result<Array, Exception>
+    where
+        F: FnMut(usize, &Array, &Array, &Array, &Stream) -> Result<Array, Exception>,
+    {
+        let topology = tensor_group
+            .map(|_| {
+                self.parallel_info()
+                    .map(|info| info.topology())
+                    .ok_or_else(|| Exception::custom("Qwen MTP target has no parallel topology"))
+            })
+            .transpose()?;
+        let execution = match (topology, tensor_group) {
+            (Some(topology), Some(group)) => Some(
+                crate::runtime::distributed::parallel::ParallelExecutionContext::tensor_parallel(
+                    topology, group, stream,
+                )
+                .map_err(|error| Exception::custom(error.to_string()))?,
+            ),
+            _ => None,
+        };
+        self.execution
+            .adapter_mut()
+            .forward_pipeline_mtp(
+                hidden,
+                tokens,
+                cache,
+                execution.as_ref(),
+                Some(execute),
+                stream,
+            )
+            .map(|output| output.logits)
+    }
+
     pub(crate) fn mtp_len(&self) -> usize {
         self.execution
             .adapter()
@@ -835,6 +995,44 @@ impl CausalLm<Cache> for QwenHybridLayerwiseModel {
         self.forward(input_tokens, cache, stream)
             .map_err(|error| Exception::custom(error.to_string()))?
             .try_index_device((.., -1, ..), stream)
+    }
+}
+
+impl crate::architectures::qwen::hybrid::mtp::QwenMtpTarget for QwenHybridTensorMtpTarget<'_> {
+    fn prefill_mtp_target(
+        &mut self,
+        input: input::ModelInput<'_>,
+        cache: &mut Cache,
+        stream: &Stream,
+    ) -> Result<QwenMtpStepOutput, Exception> {
+        cache.reset()?;
+        self.model
+            .forward_mtp_tensor(QwenHybridInput::Prefill(input), cache, self.group, stream)
+    }
+
+    fn verify_mtp_target(
+        &mut self,
+        tokens: &Array,
+        cache: &mut Cache,
+        stream: &Stream,
+    ) -> Result<QwenMtpStepOutput, Exception> {
+        self.model
+            .forward_mtp_tensor(QwenHybridInput::Decode(tokens), cache, self.group, stream)
+    }
+
+    fn forward_mtp_drafter(
+        &mut self,
+        hidden: &Array,
+        tokens: &Array,
+        cache: &mut [LayerCache],
+        stream: &Stream,
+    ) -> Result<Array, Exception> {
+        self.model
+            .forward_mtp_head_tensor(hidden, tokens, cache, self.group, stream)
+    }
+
+    fn mtp_layer_count(&self) -> usize {
+        self.model.mtp_len()
     }
 }
 
@@ -1046,11 +1244,6 @@ fn load_qwen_hybrid_tensor_parallel_model(
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<QwenHybridLayerwiseModel, Error> {
-    if args.mtp_num_hidden_layers > 0 {
-        return Err(Error::Parallel(
-            "the token-only Qwen hybrid TP loader does not execute embedded MTP layers".into(),
-        ));
-    }
     let adapter = QwenHybridLayerwiseAdapter::new(args, family, None, None, None, stream)?;
     Ok(QwenHybridLayerwiseModel {
         execution: load_tensor_parallel_layerwise_model(
@@ -1090,11 +1283,6 @@ pub(crate) fn load_qwen_hybrid_gguf_tensor_parallel_model(
     } else {
         QwenHybridFamily::Qwen35
     };
-    if prepared.args.mtp_num_hidden_layers > 0 {
-        return Err(Error::Parallel(
-            "the token-only Qwen hybrid TP loader does not execute embedded MTP layers".into(),
-        ));
-    }
     let store = qwen_hybrid_gguf_store(
         checkpoint,
         mmproj,
@@ -1728,8 +1916,102 @@ impl QwenHybridLayerwiseAdapter {
                 .vision
                 .as_mut()
                 .map(|module| module as &mut dyn ModuleParameters),
+            "output" => self
+                .parallel_lm_head
+                .as_mut()
+                .map(|module| module.inner_mut() as &mut dyn ModuleParameters)
+                .or_else(|| {
+                    self.lm_head
+                        .as_mut()
+                        .map(|module| module as &mut dyn ModuleParameters)
+                }),
+            "mtp" => self
+                .mtp
+                .as_mut()
+                .map(|module| module as &mut dyn ModuleParameters),
             _ => None,
         }
+    }
+
+    pub(crate) fn embedded_mtp_len(&self) -> usize {
+        self.mtp.as_ref().map_or(0, MtpModule::len)
+    }
+
+    pub(crate) fn embedded_mtp_cache(&self) -> Vec<LayerCache> {
+        self.new_cache().mtp_layers
+    }
+
+    pub(crate) fn forward_pipeline_mtp<F>(
+        &mut self,
+        hidden: &Array,
+        tokens: &Array,
+        cache: &mut [LayerCache],
+        execution: Option<&crate::runtime::distributed::parallel::ParallelExecutionContext<'_>>,
+        execute: Option<&mut F>,
+        stream: &Stream,
+    ) -> Result<QwenMtpStepOutput, Exception>
+    where
+        F: FnMut(usize, &Array, &Array, &Array, &Stream) -> Result<Array, Exception>,
+    {
+        let embeddings = match execution.filter(|execution| execution.is_tensor_parallel()) {
+            Some(execution) => self
+                .parallel_embedding
+                .as_mut()
+                .ok_or_else(|| Exception::custom("Qwen pipeline MTP has no TP embedding shard"))?
+                .forward(tokens, execution)
+                .map_err(|error| Exception::custom(error.to_string()))?,
+            None => self.embedding.forward(tokens, stream)?,
+        };
+        let tensor_group = execution
+            .filter(|execution| execution.is_tensor_parallel())
+            .and_then(crate::runtime::distributed::parallel::ParallelExecutionContext::group);
+        let mtp = self
+            .mtp
+            .as_mut()
+            .ok_or_else(|| Exception::custom("Qwen checkpoint does not contain MTP layers"))?;
+        let hidden = match execute {
+            Some(execute) => {
+                let layer = self.args.num_hidden_layers as usize;
+                mtp.forward_with_expert_executor(
+                    hidden,
+                    &embeddings,
+                    cache,
+                    tensor_group,
+                    |hidden, ids, weights, stream| execute(layer, hidden, ids, weights, stream),
+                    stream,
+                )?
+            }
+            None => match tensor_group {
+                Some(group) => {
+                    mtp.forward_tensor_parallel(hidden, &embeddings, cache, group, stream)?
+                }
+                None => mtp.forward(hidden, &embeddings, cache, stream)?,
+            },
+        };
+        let logits = match execution.filter(|execution| execution.is_tensor_parallel()) {
+            Some(execution) => match (
+                self.parallel_lm_head.as_mut(),
+                self.parallel_embedding.as_mut(),
+            ) {
+                (Some(head), _) => head
+                    .forward(&hidden, execution)
+                    .and_then(|output| output.all_gather(execution)),
+                (None, Some(embedding)) => embedding
+                    .project_logits(&hidden, execution)
+                    .and_then(|output| output.all_gather(execution)),
+                (None, None) => Err(Error::Parallel(
+                    "Qwen pipeline MTP has no TP output projection".into(),
+                )),
+            }
+            .map_err(|error| Exception::custom(error.to_string())),
+            None => project_logits_maybe_quantized(
+                &mut self.lm_head,
+                &mut self.embedding,
+                &hidden,
+                stream,
+            ),
+        }?;
+        Ok(QwenMtpStepOutput { logits, hidden })
     }
 
     fn execution_group_name(&self, group: usize) -> Result<&'static str, Error> {
@@ -2344,18 +2626,47 @@ pub(crate) fn qwen_hybrid_expert_catalog(
     args: &ModelArgs,
     store: &dyn WeightStore,
 ) -> Result<Vec<ExpertCatalogEntry>, Error> {
-    qwen_hybrid_expert_catalog_for_layers(args, store, 0..args.num_hidden_layers as usize)
+    let mut prefixes = (0..args.num_hidden_layers as usize)
+        .map(|layer| (layer, format!("model.layers.{layer}.mlp.experts")))
+        .collect::<Vec<_>>();
+    prefixes.extend((0..args.mtp_num_hidden_layers as usize).map(|index| {
+        (
+            args.num_hidden_layers as usize + index,
+            format!("mtp.layers.{index}.mlp.experts"),
+        )
+    }));
+    qwen_hybrid_expert_catalog_for_prefixes(args, store, prefixes)
 }
 
-pub(crate) fn qwen_hybrid_expert_catalog_for_layers(
+pub(crate) fn qwen_hybrid_pipeline_expert_catalog(
     args: &ModelArgs,
     store: &dyn WeightStore,
     layers: impl IntoIterator<Item = usize>,
+    include_mtp: bool,
+) -> Result<Vec<ExpertCatalogEntry>, Error> {
+    let mut prefixes = layers
+        .into_iter()
+        .map(|layer| (layer, format!("model.layers.{layer}.mlp.experts")))
+        .collect::<Vec<_>>();
+    if include_mtp {
+        prefixes.extend((0..args.mtp_num_hidden_layers as usize).map(|index| {
+            (
+                args.num_hidden_layers as usize + index,
+                format!("mtp.layers.{index}.mlp.experts"),
+            )
+        }));
+    }
+    qwen_hybrid_expert_catalog_for_prefixes(args, store, prefixes)
+}
+
+fn qwen_hybrid_expert_catalog_for_prefixes(
+    args: &ModelArgs,
+    store: &dyn WeightStore,
+    prefixes: impl IntoIterator<Item = (usize, String)>,
 ) -> Result<Vec<ExpertCatalogEntry>, Error> {
     let normalized = normalized_checkpoint_keys(store);
     let mut entries = Vec::new();
-    for layer in layers {
-        let prefix = format!("model.layers.{layer}.mlp.experts");
+    for (layer, prefix) in prefixes {
         let packed = normalized.contains_key(&format!("{prefix}.gate_up_proj"));
         let split_banks = normalized.contains_key(&format!("{prefix}.gate_proj"))
             && normalized.contains_key(&format!("{prefix}.up_proj"))
@@ -3021,11 +3332,12 @@ impl ArchitectureAdapter for QwenHybridLayerwiseAdapter {
             if let Some(mtp) = &self.mtp {
                 units.push(StaticUnitBindings::new(
                     MTP_STATIC_UNIT,
-                    build_module_bindings_with_recipes(
+                    build_module_bindings_with_recipes_excluding(
                         mtp,
                         "mtp",
                         store,
                         self.mtp_recipes(store)?,
+                        |name| self.sparse_expert_cache && name.contains(".mlp.experts."),
                     )?,
                 )?);
             }
@@ -3072,7 +3384,13 @@ impl ArchitectureAdapter for QwenHybridLayerwiseAdapter {
             index += 1;
         }
         if let Some(mtp) = &mut self.mtp {
-            populate_module_from_lease(mtp, &leases[index])?;
+            if self.sparse_expert_cache {
+                populate_module_from_lease_excluding(mtp, &leases[index], |name| {
+                    name.contains(".mlp.experts.")
+                })?;
+            } else {
+                populate_module_from_lease(mtp, &leases[index])?;
+            }
             index += 1;
         }
         if let Some(vision) = &mut self.vision {
@@ -3434,11 +3752,6 @@ impl ArchitectureAdapter for QwenHybridLayerwiseAdapter {
         planner: &mut crate::runtime::distributed::parallel::ParallelPlanBuilder,
         stream: &Stream,
     ) -> Result<(), Error> {
-        if self.mtp.is_some() {
-            return Err(Error::Parallel(
-                "Qwen hybrid TP requires MTP execution groups to be absent".into(),
-            ));
-        }
         planner.register(crate::nn::parallel::vocab_embedding_parameter_group(
             &self.embedding,
             "model.embed_tokens",
@@ -3463,6 +3776,24 @@ impl ArchitectureAdapter for QwenHybridLayerwiseAdapter {
         for index in 0..self.args.num_hidden_layers as usize {
             let layer = TransformerBlock::new(&self.args, index, stream)?;
             register_qwen_hybrid_layer_parallel_plan(planner, &layer, index, &self.args)?;
+        }
+        if let Some(mtp) = &self.mtp {
+            register_replicated_module(planner, &mtp.pre_fc_norm_hidden, "mtp.pre_fc_norm_hidden")?;
+            register_replicated_module(
+                planner,
+                &mtp.pre_fc_norm_embedding,
+                "mtp.pre_fc_norm_embedding",
+            )?;
+            register_replicated_module(planner, &mtp.fc, "mtp.fc")?;
+            register_replicated_module(planner, &mtp.norm, "mtp.norm")?;
+            for (index, layer) in mtp.layers.iter().enumerate() {
+                register_qwen_hybrid_layer_parallel_plan_at(
+                    planner,
+                    layer,
+                    &format!("mtp.layers.{index}"),
+                    &self.args,
+                )?;
+            }
         }
         if let Some(vision) = &self.vision {
             for group in vision_parallel_parameter_groups(&vision.config, "visual", stream)? {
@@ -3550,6 +3881,44 @@ impl ArchitectureAdapter for QwenHybridLayerwiseAdapter {
                 attention,
                 feed_forward,
             });
+        }
+        if let Some(mtp) = &mut self.mtp {
+            for index in 0..mtp.layers.len() {
+                let prefix = format!("mtp.layers.{index}");
+                let query = format!("{prefix}.self_attn.q_proj.weight");
+                let attention = resident::ParallelAttentionGeometry::Full {
+                    query_heads: local_semantic(&query, self.args.num_attention_heads)?,
+                    kv_heads: local_semantic(&query, self.args.num_key_value_heads)?,
+                };
+                let feed_forward = if self.args.is_moe() {
+                    let routed = format!("{prefix}.mlp.experts.gate_up_proj");
+                    let shared = format!("{prefix}.mlp.shared_expert.gate_proj.weight");
+                    resident::ParallelFeedForwardGeometry::Moe {
+                        routed_intermediate: local_semantic(
+                            &routed,
+                            self.args.moe_intermediate_size,
+                        )?,
+                        shared_intermediate: local_semantic(
+                            &shared,
+                            self.args.shared_expert_intermediate_size,
+                        )?,
+                    }
+                } else {
+                    let dense = format!("{prefix}.mlp.gate_proj.weight");
+                    resident::ParallelFeedForwardGeometry::Dense {
+                        intermediate: local_semantic(&dense, self.args.intermediate_size)?,
+                    }
+                };
+                mtp.layers[index] = TransformerBlock::new_mtp_parallel_layerwise(
+                    &self.args,
+                    index,
+                    resident::ParallelLayerGeometry {
+                        attention,
+                        feed_forward,
+                    },
+                    stream,
+                )?;
+            }
         }
         self.parallel_geometry = Some(geometry);
         self.parallel_embedding = Some(VocabParallelEmbedding::unloaded(
@@ -4163,8 +4532,7 @@ mod tests {
     #[test]
     fn tensor_parallel_plan_preserves_recurrent_and_packed_moe_geometry() {
         let execution = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
-        let mut model_args = args(false, true);
-        model_args.mtp_num_hidden_layers = 0;
+        let model_args = args(false, true);
         let adapter = QwenHybridLayerwiseAdapter::new(
             model_args,
             QwenHybridFamily::Qwen35,
@@ -4208,6 +4576,27 @@ mod tests {
         assert_eq!(
             layout
                 .tensor("model.layers.0.mlp.experts.down_proj")
+                .unwrap()
+                .local_shape(),
+            &[2, 16, 4]
+        );
+        assert_eq!(
+            layout
+                .tensor("mtp.layers.0.self_attn.q_proj.weight")
+                .unwrap()
+                .local_shape(),
+            &[16, 16]
+        );
+        assert_eq!(
+            layout
+                .tensor("mtp.layers.0.mlp.experts.gate_up_proj")
+                .unwrap()
+                .local_shape(),
+            &[2, 8, 16]
+        );
+        assert_eq!(
+            layout
+                .tensor("mtp.layers.0.mlp.experts.down_proj")
                 .unwrap()
                 .local_shape(),
             &[2, 16, 4]
@@ -4685,7 +5074,7 @@ mod tests {
             assert_close(&actual, &expected);
         }
         let report = cached.expert_cache_report().unwrap().unwrap();
-        assert_eq!(report.owned_experts, 4);
+        assert_eq!(report.owned_experts, 6);
         assert!(report.prefill.requested_routes > 0);
         assert!(report.decode.requested_routes > 0);
         assert!(report.prefill.compact_banks > 1);

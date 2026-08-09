@@ -57,27 +57,21 @@ impl Model {
             Self::Gemma4(_) => MtpCapability::Ready {
                 checkpoint: MtpCheckpointKind::Separate,
             },
-            Self::DeepSeekV3(model) if model.mtp_len() > 0 && model.parallel_info().is_none() => {
-                MtpCapability::Ready {
-                    checkpoint: MtpCheckpointKind::Embedded,
-                }
-            }
-            Self::Inkling(model) if model.mtp_len() > 0 && model.parallel_info().is_none() => {
-                MtpCapability::Ready {
-                    checkpoint: MtpCheckpointKind::Embedded,
-                }
-            }
+            Self::DeepSeekV3(model) if model.mtp_len() > 0 => MtpCapability::Ready {
+                checkpoint: MtpCheckpointKind::Embedded,
+            },
+            Self::Inkling(model) if model.mtp_len() > 0 => MtpCapability::Ready {
+                checkpoint: MtpCheckpointKind::Embedded,
+            },
             Self::Qwen3Next(model) if model.mtp_len() > 0 => MtpCapability::Ready {
                 checkpoint: MtpCheckpointKind::Embedded,
             },
             Self::Qwen35(model) if model.mtp_len() > 0 => MtpCapability::Ready {
                 checkpoint: MtpCheckpointKind::Embedded,
             },
-            Self::NemotronH(model) if model.mtp_len() > 0 && model.parallel_info().is_none() => {
-                MtpCapability::Ready {
-                    checkpoint: MtpCheckpointKind::Embedded,
-                }
-            }
+            Self::NemotronH(model) if model.mtp_len() > 0 => MtpCapability::Ready {
+                checkpoint: MtpCheckpointKind::Embedded,
+            },
             _ => MtpCapability::Unavailable,
         }
     }
@@ -261,6 +255,132 @@ impl Model {
             &mut DefaultSampler,
             stream,
         )
+    }
+
+    /// Generates through embedded predictor layers on a non-pipeline
+    /// Cartesian model. TP collectives and rank-synchronized sampling are
+    /// derived from `execution`; EP and PP models use their architecture-erased
+    /// distributed model containers.
+    #[allow(clippy::too_many_arguments)]
+    pub fn generate_embedded_mtp_cartesian<S: SpeculativeSampler + Clone>(
+        &mut self,
+        cache: &mut ModelCache,
+        input: input::ModelInput<'_>,
+        config: &MtpConfig,
+        prng_key: Option<Array>,
+        sampler: &mut S,
+        execution: &crate::CartesianExecution<'_>,
+        stream: &Stream,
+    ) -> Result<(Vec<u32>, MtpStats), Exception> {
+        let topology = execution.topology();
+        if topology.pipeline_parallel_size != 1 || topology.expert_parallel_size != 1 {
+            return Err(Exception::custom(
+                "architecture-erased Cartesian MTP requires a non-pipeline, non-EP model; use PipelineModel or ExpertParallelModel for active PP/EP axes",
+            ));
+        }
+        if self.parallel_info().map(|info| info.topology()) != Some(topology) {
+            return Err(Exception::custom(
+                "embedded MTP model topology does not match Cartesian execution",
+            ));
+        }
+        let tensor = execution
+            .tensor_context(stream)
+            .map_err(|error| Exception::custom(error.to_string()))?;
+        let tensor_group = tensor.group().ok_or_else(|| {
+            Exception::custom("Cartesian embedded MTP requires an active TP subgroup")
+        })?;
+        let sampling_rank = topology
+            .global_rank_for(crate::ParallelCoordinates {
+                tensor: 0,
+                pipeline: 0,
+                expert: 0,
+            })
+            .map_err(|error| Exception::custom(error.to_string()))?;
+        let mut synchronized =
+            crate::runtime::generation::embedded_mtp::DistributedEmbeddedMtpSampler::new(
+                sampler.clone(),
+                sampling_rank,
+                execution.world(),
+            )
+            .map_err(|error| Exception::custom(error.to_string()))?;
+        let result = match (self, cache) {
+            (Self::DeepSeekV3(model), ModelCache::DeepSeekV3(cache)) => {
+                let mut target =
+                    crate::architectures::deepseek_v3::layerwise::DeepSeekTensorMtpTarget::new(
+                        model,
+                        tensor_group,
+                    );
+                crate::runtime::generation::embedded_mtp::generate_with_callback(
+                    &mut target,
+                    cache,
+                    input,
+                    config,
+                    prng_key,
+                    &mut synchronized,
+                    stream,
+                    |_| Ok(()),
+                )
+            }
+            (Self::Inkling(model), ModelCache::Inkling(cache)) => {
+                let mut target =
+                    crate::architectures::inkling::layerwise::InklingTensorMtpTarget::new(
+                        model,
+                        tensor_group,
+                    );
+                crate::runtime::generation::embedded_mtp::generate_with_callback(
+                    &mut target,
+                    cache,
+                    input,
+                    config,
+                    prng_key,
+                    &mut synchronized,
+                    stream,
+                    |_| Ok(()),
+                )
+            }
+            (Self::NemotronH(model), ModelCache::NemotronH(cache)) => {
+                let mut target =
+                    crate::architectures::nemotron_h::layerwise::NemotronHTensorMtpTarget::new(
+                        model,
+                        tensor_group,
+                    );
+                crate::runtime::generation::embedded_mtp::generate_with_callback(
+                    &mut target,
+                    cache,
+                    input,
+                    config,
+                    prng_key,
+                    &mut synchronized,
+                    stream,
+                    |_| Ok(()),
+                )
+            }
+            (Self::Qwen3Next(model), ModelCache::Qwen3Next(cache))
+            | (Self::Qwen35(model), ModelCache::Qwen35(cache)) => {
+                let mut target =
+                    crate::architectures::qwen::hybrid::layerwise::QwenHybridTensorMtpTarget::new(
+                        model,
+                        tensor_group,
+                    );
+                crate::architectures::qwen::hybrid::mtp::generate_with_callback(
+                    &mut target,
+                    cache,
+                    input,
+                    config,
+                    prng_key,
+                    &mut synchronized,
+                    stream,
+                    |_| Ok(()),
+                )
+            }
+            (model, _) => Err(Exception::custom(format!(
+                "Cartesian embedded MTP runtime adapter is unavailable for model type {} ({:?})",
+                model.model_type(),
+                model.mtp_capability()
+            ))),
+        };
+        *sampler = synchronized.into_inner();
+        result
     }
 
     /// Generates with embedded MTP weights and a caller-provided sampler.

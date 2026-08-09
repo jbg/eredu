@@ -90,7 +90,11 @@ use crate::{
         LayerwiseLoadOptions, LoadTimeQuantizableAdapter, PipelineStageQuantizationSelection,
         SharedWeightStore, StaticUnitBindings,
     },
-    runtime::generation::sampler::Sampler,
+    runtime::generation::{
+        embedded_mtp::{DistributedEmbeddedMtpSampler, EmbeddedMtpOutput, EmbeddedMtpTarget},
+        sampler::{Sampler, SpeculativeSampler},
+        speculative::{MtpCapability, MtpCheckpointKind, MtpConfig, MtpStats},
+    },
     runtime::media::{PreparedModelInput, PreparedModelInputIdentity},
     runtime::residency::expert_cache::{
         ExpertCache, ExpertCacheLoadOptions, ExpertCacheReport, ExpertCatalogEntry, ExpertPass,
@@ -167,6 +171,10 @@ pub struct PipelineStageInfo {
     pub is_first: bool,
     /// Whether this stage performs final normalization and projection.
     pub is_last: bool,
+    /// Whether this rank owns the checkpoint-embedded prediction module.
+    pub owns_embedded_mtp: bool,
+    /// Number of predictor layers owned by this rank.
+    pub embedded_mtp_layers: usize,
     /// Global decoder-layer indices owned by this stage.
     pub global_layer_range: Range<usize>,
     /// Total routed experts in global model geometry, when applicable.
@@ -478,6 +486,15 @@ pub enum PipelineStageOutput {
     Hidden(PipelinePayload),
     /// Vocabulary logits produced only by the final stage.
     Logits(Array),
+    /// Final-stage logits plus the pre-normalization hidden state consumed by
+    /// an embedded predictor. Ordinary pipeline callers still receive only
+    /// `logits`; the Cartesian MTP target retains `hidden` for drafting.
+    EmbeddedMtpLogits {
+        /// Full vocabulary logits gathered on the final stage.
+        logits: Array,
+        /// Decoder hidden state before final normalization.
+        hidden: Array,
+    },
 }
 
 /// Storage representation for one ordinary key/value cache.
@@ -563,6 +580,17 @@ pub struct PipelineCache {
     model_kind: ModelKind,
     layers: Vec<PipelineLayerCache>,
     residency_manager: Option<CacheResidencyManager>,
+    mtp: PipelineMtpCache,
+}
+
+#[derive(Debug, Clone, Default)]
+enum PipelineMtpCache {
+    #[default]
+    None,
+    DeepSeek(Vec<CompressedLatentCache>),
+    Inkling(Vec<inkling::LayerCache>),
+    NemotronH(Vec<nemotron_h::LayerCache>),
+    QwenHybrid(Vec<qwen_hybrid::LayerCache>),
 }
 
 impl PipelineCache {
@@ -572,6 +600,7 @@ impl PipelineCache {
             model_kind,
             layers,
             residency_manager: None,
+            mtp: PipelineMtpCache::None,
         }
     }
 
@@ -584,6 +613,7 @@ impl PipelineCache {
             model_kind,
             layers,
             residency_manager: Some(residency_manager),
+            mtp: PipelineMtpCache::None,
         }
     }
 
@@ -638,6 +668,7 @@ impl PipelineCache {
                 }
             }
         }
+        self.mtp = PipelineMtpCache::None;
         Ok(())
     }
 }
@@ -1388,6 +1419,20 @@ trait PipelineStageAdapter {
     fn checkpoint_diagnostics(&self) -> Result<Option<WeightStoreDiagnostics>, Error>;
     fn expert_cache_report(&self) -> Result<Option<ExpertCacheReport>, Error>;
 
+    fn embedded_mtp_len(&self) -> usize;
+    fn new_embedded_mtp_cache(&self) -> Result<PipelineMtpCache, Error>;
+    #[allow(clippy::too_many_arguments)]
+    fn forward_embedded_mtp_draft(
+        &mut self,
+        hidden: &Array,
+        tokens: &Array,
+        depth: usize,
+        cache: &mut PipelineMtpCache,
+        execution: Option<&ParallelExecutionContext<'_>>,
+        expert_group: Option<&Group>,
+        stream: &Stream,
+    ) -> Result<crate::runtime::generation::embedded_mtp::EmbeddedMtpOutput, Error>;
+
     /// Returns the exact cache identity and local semantic state schedule.
     fn prompt_cache_model_identity(
         &self,
@@ -1436,6 +1481,28 @@ trait PipelineStageSemantics {
     fn dense_layers(&self) -> Option<&PipelineLayerStorage>;
     fn expert_cache(&self) -> Option<&ExpertCache> {
         None
+    }
+    fn embedded_mtp_len(&self) -> usize {
+        0
+    }
+    fn new_embedded_mtp_cache(&self) -> Result<PipelineMtpCache, Error> {
+        Ok(PipelineMtpCache::None)
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn forward_embedded_mtp_draft(
+        &mut self,
+        _hidden: &Array,
+        _tokens: &Array,
+        _depth: usize,
+        _cache: &mut PipelineMtpCache,
+        _execution: Option<&ParallelExecutionContext<'_>>,
+        _expert_group: Option<&Group>,
+        _stream: &Stream,
+    ) -> Result<crate::runtime::generation::embedded_mtp::EmbeddedMtpOutput, Error> {
+        Err(Error::UnsupportedArchitecture(format!(
+            "pipeline architecture {:?} has no embedded MTP predictor",
+            self.model_kind()
+        )))
     }
     fn prompt_cache_model_identity(
         &self,
@@ -1544,6 +1611,35 @@ impl<S: PipelineStageSemantics> PipelineStageAdapter for PipelineStage<S> {
             .map(ExpertCache::report)
             .transpose()
             .map_err(Error::from)
+    }
+
+    fn embedded_mtp_len(&self) -> usize {
+        self.0.embedded_mtp_len()
+    }
+
+    fn new_embedded_mtp_cache(&self) -> Result<PipelineMtpCache, Error> {
+        self.0.new_embedded_mtp_cache()
+    }
+
+    fn forward_embedded_mtp_draft(
+        &mut self,
+        hidden: &Array,
+        tokens: &Array,
+        depth: usize,
+        cache: &mut PipelineMtpCache,
+        execution: Option<&ParallelExecutionContext<'_>>,
+        expert_group: Option<&Group>,
+        stream: &Stream,
+    ) -> Result<crate::runtime::generation::embedded_mtp::EmbeddedMtpOutput, Error> {
+        self.0.forward_embedded_mtp_draft(
+            hidden,
+            tokens,
+            depth,
+            cache,
+            execution,
+            expert_group,
+            stream,
+        )
     }
 
     fn prompt_cache_model_identity(
@@ -2229,6 +2325,78 @@ impl PipelineStageSemantics for DeepSeekStage {
 
     fn expert_cache(&self) -> Option<&ExpertCache> {
         self.expert_storage.cache()
+    }
+
+    fn embedded_mtp_len(&self) -> usize {
+        self.layer_adapter.embedded_mtp_len()
+    }
+
+    fn new_embedded_mtp_cache(&self) -> Result<PipelineMtpCache, Error> {
+        Ok(PipelineMtpCache::DeepSeek(
+            self.layer_adapter.embedded_mtp_cache(),
+        ))
+    }
+
+    fn forward_embedded_mtp_draft(
+        &mut self,
+        hidden: &Array,
+        tokens: &Array,
+        depth: usize,
+        cache: &mut PipelineMtpCache,
+        execution: Option<&ParallelExecutionContext<'_>>,
+        expert_group: Option<&Group>,
+        stream: &Stream,
+    ) -> Result<crate::runtime::generation::embedded_mtp::EmbeddedMtpOutput, Error> {
+        let PipelineMtpCache::DeepSeek(cache) = cache else {
+            return Err(Error::Parallel(
+                "DeepSeek pipeline MTP cache mismatch".into(),
+            ));
+        };
+        if let Some(expert_cache) = self.expert_storage.cache() {
+            let assignment = self.expert_assignment.as_ref().ok_or_else(|| {
+                Error::Parallel("DeepSeek pipeline MTP expert cache has no assignment".into())
+            })?;
+            let args = self.args.clone();
+            let mut execute =
+                |layer, hidden: &Array, ids: &Array, weights: &Array, stream: &Stream| {
+                    execute_pipeline_cached_deepseek(
+                        &args,
+                        layer,
+                        hidden,
+                        ids,
+                        weights,
+                        ExpertPass::Decode,
+                        expert_cache,
+                        assignment,
+                        expert_group,
+                        &mut self.routing_statistics,
+                        stream,
+                    )
+                    .map_err(|error| Exception::custom(error.to_string()))
+                };
+            return self
+                .layer_adapter
+                .forward_pipeline_mtp(
+                    hidden,
+                    tokens,
+                    depth,
+                    cache,
+                    execution,
+                    Some(&mut execute),
+                    stream,
+                )
+                .map_err(Into::into);
+        }
+        if expert_group.is_some() {
+            return Err(Error::Parallel(
+                "DeepSeek pipeline MTP with EP requires rank-owned expert residency".into(),
+            ));
+        }
+        self.layer_adapter
+            .forward_pipeline_mtp::<
+                fn(usize, &Array, &Array, &Array, &Stream) -> Result<Array, Exception>,
+            >(hidden, tokens, depth, cache, execution, None, stream)
+            .map_err(Into::into)
     }
 
     fn prompt_cache_model_identity(
@@ -3339,6 +3507,78 @@ impl PipelineStageSemantics for NemotronHStage {
         self.expert_storage.cache()
     }
 
+    fn embedded_mtp_len(&self) -> usize {
+        self.layer_adapter.embedded_mtp_len()
+    }
+
+    fn new_embedded_mtp_cache(&self) -> Result<PipelineMtpCache, Error> {
+        Ok(PipelineMtpCache::NemotronH(
+            self.layer_adapter.embedded_mtp_cache(),
+        ))
+    }
+
+    fn forward_embedded_mtp_draft(
+        &mut self,
+        hidden: &Array,
+        tokens: &Array,
+        depth: usize,
+        cache: &mut PipelineMtpCache,
+        execution: Option<&ParallelExecutionContext<'_>>,
+        expert_group: Option<&Group>,
+        stream: &Stream,
+    ) -> Result<crate::runtime::generation::embedded_mtp::EmbeddedMtpOutput, Error> {
+        let PipelineMtpCache::NemotronH(cache) = cache else {
+            return Err(Error::Parallel(
+                "Nemotron-H pipeline MTP cache mismatch".into(),
+            ));
+        };
+        if let Some(expert_cache) = self.expert_storage.cache() {
+            let assignment = self.expert_assignment.as_ref().ok_or_else(|| {
+                Error::Parallel("Nemotron-H pipeline MTP expert cache has no assignment".into())
+            })?;
+            let args = self.args.clone();
+            let mut execute =
+                |layer, hidden: &Array, ids: &Array, weights: &Array, stream: &Stream| {
+                    execute_pipeline_cached_nemotron_h(
+                        &args,
+                        layer,
+                        hidden,
+                        ids,
+                        weights,
+                        ExpertPass::Decode,
+                        expert_cache,
+                        assignment,
+                        expert_group,
+                        &mut self.routing_statistics,
+                        stream,
+                    )
+                    .map_err(|error| Exception::custom(error.to_string()))
+                };
+            return self
+                .layer_adapter
+                .forward_pipeline_mtp(
+                    hidden,
+                    tokens,
+                    depth,
+                    cache,
+                    execution,
+                    Some(&mut execute),
+                    stream,
+                )
+                .map_err(Into::into);
+        }
+        if expert_group.is_some() {
+            return Err(Error::Parallel(
+                "Nemotron-H pipeline MTP with EP requires rank-owned expert residency".into(),
+            ));
+        }
+        self.layer_adapter
+            .forward_pipeline_mtp::<
+                fn(usize, &Array, &Array, &Array, &Stream) -> Result<Array, Exception>,
+            >(hidden, tokens, depth, cache, execution, None, stream)
+            .map_err(Into::into)
+    }
+
     fn prompt_cache_model_identity(
         &self,
         topology: ParallelTopology,
@@ -3440,6 +3680,74 @@ impl PipelineStageSemantics for QwenHybridStage {
 
     fn expert_cache(&self) -> Option<&ExpertCache> {
         self.expert_storage.cache()
+    }
+
+    fn embedded_mtp_len(&self) -> usize {
+        self.layer_adapter.embedded_mtp_len()
+    }
+
+    fn new_embedded_mtp_cache(&self) -> Result<PipelineMtpCache, Error> {
+        Ok(PipelineMtpCache::QwenHybrid(
+            self.layer_adapter.embedded_mtp_cache(),
+        ))
+    }
+
+    fn forward_embedded_mtp_draft(
+        &mut self,
+        hidden: &Array,
+        tokens: &Array,
+        _depth: usize,
+        cache: &mut PipelineMtpCache,
+        execution: Option<&ParallelExecutionContext<'_>>,
+        expert_group: Option<&Group>,
+        stream: &Stream,
+    ) -> Result<crate::runtime::generation::embedded_mtp::EmbeddedMtpOutput, Error> {
+        let PipelineMtpCache::QwenHybrid(cache) = cache else {
+            return Err(Error::Parallel("Qwen pipeline MTP cache mismatch".into()));
+        };
+        let output = if let Some(expert_cache) = self.expert_storage.cache() {
+            let assignment = self.expert_assignment.as_ref().ok_or_else(|| {
+                Error::Parallel("Qwen pipeline MTP expert cache has no assignment".into())
+            })?;
+            let args = self.args.clone();
+            let mut execute =
+                |layer, hidden: &Array, ids: &Array, weights: &Array, stream: &Stream| {
+                    execute_pipeline_cached_qwen_hybrid(
+                        &args,
+                        layer,
+                        hidden,
+                        ids,
+                        weights,
+                        ExpertPass::Decode,
+                        expert_cache,
+                        assignment,
+                        expert_group,
+                        &mut self.routing_statistics,
+                        stream,
+                    )
+                    .map_err(|error| Exception::custom(error.to_string()))
+                };
+            self.layer_adapter.forward_pipeline_mtp(
+                hidden,
+                tokens,
+                cache,
+                execution,
+                Some(&mut execute),
+                stream,
+            )
+        } else {
+            self.layer_adapter.forward_pipeline_mtp::<
+                fn(usize, &Array, &Array, &Array, &Stream) -> Result<Array, Exception>,
+            >(hidden, tokens, cache, execution, None, stream)
+        }
+        .map_err(Error::from)?;
+        Ok(
+            crate::runtime::generation::embedded_mtp::EmbeddedMtpOutput {
+                logits: output.logits,
+                hidden: output.hidden,
+                tokens: tokens.clone(),
+            },
+        )
     }
 
     fn prompt_cache_model_identity(
@@ -3670,6 +3978,36 @@ impl PipelineStageSemantics for InklingStage {
         self.expert_storage.cache()
     }
 
+    fn embedded_mtp_len(&self) -> usize {
+        self.layer_adapter.embedded_mtp_len()
+    }
+
+    fn new_embedded_mtp_cache(&self) -> Result<PipelineMtpCache, Error> {
+        Ok(PipelineMtpCache::Inkling(
+            self.layer_adapter.embedded_mtp_cache(),
+        ))
+    }
+
+    fn forward_embedded_mtp_draft(
+        &mut self,
+        hidden: &Array,
+        tokens: &Array,
+        depth: usize,
+        cache: &mut PipelineMtpCache,
+        execution: Option<&ParallelExecutionContext<'_>>,
+        _expert_group: Option<&Group>,
+        stream: &Stream,
+    ) -> Result<crate::runtime::generation::embedded_mtp::EmbeddedMtpOutput, Error> {
+        let PipelineMtpCache::Inkling(cache) = cache else {
+            return Err(Error::Parallel(
+                "Inkling pipeline MTP cache mismatch".into(),
+            ));
+        };
+        self.layer_adapter
+            .forward_pipeline_mtp(hidden, tokens, depth, cache, execution, stream)
+            .map_err(Into::into)
+    }
+
     fn prompt_cache_model_identity(
         &self,
         topology: ParallelTopology,
@@ -3792,6 +4130,40 @@ pub struct PipelineModel {
     info: PipelineStageInfo,
     stage: Box<dyn PipelineStageAdapter>,
     cache_identity: PromptCacheModelIdentity,
+    last_mtp_hidden: Option<Array>,
+}
+
+struct PipelineEmbeddedMtpTarget<'a> {
+    model: &'a mut PipelineModel,
+    execution: &'a crate::CartesianExecution<'a>,
+}
+
+fn pipeline_mtp_token_identity(
+    input: crate::api::input::ModelInput<'_>,
+    stream: &Stream,
+) -> Result<Array, Exception> {
+    crate::api::input::validate(input)?;
+    let tokens = input
+        .parts
+        .iter()
+        .filter_map(|part| match (part.modality, part.payload) {
+            (
+                crate::api::input::Modality::Text,
+                crate::api::input::InputPayload::TokenIds(tokens),
+            ) => Some(Ok(tokens.clone())),
+            (crate::api::input::Modality::Text, _) => Some(Err(Exception::custom(
+                "pipeline embedded MTP requires token-id text ingress",
+            ))),
+            _ => None,
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if tokens.is_empty() {
+        return Err(Exception::custom(
+            "pipeline embedded MTP input contains no text token identity",
+        ));
+    }
+    let refs = tokens.iter().collect::<Vec<_>>();
+    safemlx::ops::concatenate_axis(&refs, 1, stream)
 }
 
 impl std::fmt::Debug for PipelineModel {
@@ -3836,6 +4208,7 @@ impl PipelineModel {
             info,
             stage: Box::new(stage),
             cache_identity,
+            last_mtp_hidden: None,
         })
     }
 
@@ -3877,10 +4250,14 @@ impl PipelineModel {
     /// and materialized without architecture dispatch. Fixed state uses
     /// semantic slots rather than architecture-specific cache variants.
     pub fn new_cache(&self) -> Result<PipelineCache, Error> {
-        Ok(PipelineCache::new(
+        let mut cache = PipelineCache::new(
             self.info.model_kind,
             materialize_pipeline_cache_layers(&self.cache_identity, None)?,
-        ))
+        );
+        if self.info.is_last {
+            cache.mtp = self.stage.new_embedded_mtp_cache()?;
+        }
+        Ok(cache)
     }
 
     /// Allocates stage-local cache state under an explicit cache policy.
@@ -3904,11 +4281,12 @@ impl PipelineModel {
                     &self.cache_identity,
                     Some((manager.clone(), rank)),
                 )?;
-                Ok(PipelineCache::with_residency_manager(
-                    self.info.model_kind,
-                    layers,
-                    manager,
-                ))
+                let mut cache =
+                    PipelineCache::with_residency_manager(self.info.model_kind, layers, manager);
+                if self.info.is_last {
+                    cache.mtp = self.stage.new_embedded_mtp_cache()?;
+                }
+                Ok(cache)
             }
         }
     }
@@ -4342,6 +4720,142 @@ impl PipelineModel {
         Ok(output)
     }
 
+    /// Reports whether this pipeline stage participates in checkpoint-embedded
+    /// multi-token prediction. Predictor weights are owned by the final PP
+    /// coordinate and sharded by its active TP/EP subgroups.
+    pub fn mtp_capability(&self) -> MtpCapability {
+        if self.stage.embedded_mtp_len() > 0 {
+            MtpCapability::Ready {
+                checkpoint: MtpCheckpointKind::Embedded,
+            }
+        } else {
+            MtpCapability::Unavailable
+        }
+    }
+
+    fn ensure_embedded_mtp_cache(&self, cache: &mut PipelineCache) -> Result<(), Error> {
+        if self.info.is_last && matches!(cache.mtp, PipelineMtpCache::None) {
+            cache.mtp = self.stage.new_embedded_mtp_cache()?;
+        }
+        Ok(())
+    }
+
+    fn synchronize_embedded_mtp_output(
+        &self,
+        local_logits: Option<Array>,
+        local_hidden: Option<Array>,
+        tokens: Array,
+        execution: &crate::CartesianExecution<'_>,
+        stream: &Stream,
+    ) -> Result<EmbeddedMtpOutput, Exception> {
+        let owner = self
+            .topology
+            .global_rank_for(ParallelCoordinates {
+                tensor: 0,
+                pipeline: self.topology.pipeline_parallel_size - 1,
+                expert: 0,
+            })
+            .map_err(|error| Exception::custom(error.to_string()))?;
+        let is_owner = self.topology.global_rank == owner;
+        let vocabulary = Array::from_int(if is_owner {
+            local_logits.as_ref().map_or(0, |logits| logits.dim(-1))
+        } else {
+            0
+        });
+        let vocabulary = distributed::all_sum(&vocabulary, execution.world(), stream)?;
+        eval([&vocabulary])?;
+        stream.synchronize()?;
+        let vocabulary = vocabulary.try_item::<i32>(stream)?;
+        if vocabulary <= 0 {
+            return Err(Exception::custom(
+                "pipeline embedded MTP owner did not publish a vocabulary width",
+            ));
+        }
+        let shape = [tokens.dim(0), tokens.dim(1), vocabulary];
+        let logits = if is_owner {
+            local_logits
+                .ok_or_else(|| Exception::custom("pipeline embedded MTP owner produced no logits"))?
+                .as_dtype(Dtype::Float32, stream)?
+        } else {
+            safemlx::ops::zeros_dtype(&shape, Dtype::Float32, stream)?
+        };
+        let hidden_shape = [tokens.dim(0), tokens.dim(1), self.info.hidden_size];
+        let hidden = if is_owner {
+            local_hidden.ok_or_else(|| {
+                Exception::custom("pipeline embedded MTP owner retained no hidden state")
+            })?
+        } else {
+            safemlx::ops::zeros_dtype(&hidden_shape, self.info.activation_dtype, stream)?
+        };
+        let logits = distributed::all_sum(&logits, execution.world(), stream)?;
+        let hidden = distributed::all_sum(&hidden, execution.world(), stream)?;
+        eval([&logits, &hidden])?;
+        stream.synchronize()?;
+        Ok(EmbeddedMtpOutput {
+            logits,
+            hidden,
+            tokens,
+        })
+    }
+
+    /// Generates through final-stage-owned embedded predictor layers while the
+    /// target continues to execute over the ordinary Cartesian pipeline.
+    #[allow(clippy::too_many_arguments)]
+    pub fn generate_embedded_mtp_cartesian<S: SpeculativeSampler + Clone>(
+        &mut self,
+        cache: &mut PipelineCache,
+        input: crate::api::input::ModelInput<'_>,
+        config: &MtpConfig,
+        prng_key: Option<Array>,
+        sampler: &mut S,
+        execution: &crate::CartesianExecution<'_>,
+        stream: &Stream,
+    ) -> Result<(Vec<u32>, MtpStats), Exception> {
+        if execution.topology() != self.topology {
+            return Err(Exception::custom(
+                "pipeline embedded MTP topology does not match Cartesian execution",
+            ));
+        }
+        if !matches!(
+            self.mtp_capability(),
+            MtpCapability::Ready {
+                checkpoint: MtpCheckpointKind::Embedded
+            }
+        ) {
+            return Err(Exception::custom(format!(
+                "embedded MTP is unavailable for pipeline model {:?}",
+                self.info.model_kind
+            )));
+        }
+        let sampling_rank = self
+            .topology
+            .global_rank_for(ParallelCoordinates {
+                tensor: 0,
+                pipeline: self.topology.pipeline_parallel_size - 1,
+                expert: 0,
+            })
+            .map_err(|error| Exception::custom(error.to_string()))?;
+        let mut synchronized =
+            DistributedEmbeddedMtpSampler::new(sampler.clone(), sampling_rank, execution.world())
+                .map_err(|error| Exception::custom(error.to_string()))?;
+        let mut target = PipelineEmbeddedMtpTarget {
+            model: self,
+            execution,
+        };
+        let result = crate::runtime::generation::embedded_mtp::generate_with_callback(
+            &mut target,
+            cache,
+            input,
+            config,
+            prng_key,
+            &mut synchronized,
+            stream,
+            |_| Ok(()),
+        );
+        *sampler = synchronized.into_inner();
+        result
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn forward_pipeline_on_group(
         &mut self,
@@ -4506,7 +5020,14 @@ impl PipelineModel {
                 stream.synchronize()?;
                 Ok(None)
             }
-            PipelineStageOutput::Logits(logits) => Ok(Some(logits)),
+            PipelineStageOutput::Logits(logits) => {
+                self.last_mtp_hidden = None;
+                Ok(Some(logits))
+            }
+            PipelineStageOutput::EmbeddedMtpLogits { logits, hidden } => {
+                self.last_mtp_hidden = Some(hidden);
+                Ok(Some(logits))
+            }
         }
     }
 
@@ -4559,6 +5080,213 @@ impl PipelineModel {
             )));
         }
         Ok(())
+    }
+}
+
+impl EmbeddedMtpTarget for PipelineEmbeddedMtpTarget<'_> {
+    type Cache = PipelineCache;
+    type DraftCache = PipelineMtpCache;
+
+    fn prefill_target(
+        &mut self,
+        input: crate::api::input::ModelInput<'_>,
+        cache: &mut Self::Cache,
+        stream: &Stream,
+    ) -> Result<EmbeddedMtpOutput, Exception> {
+        let tokens = pipeline_mtp_token_identity(input, stream)?;
+        let multimodal = input
+            .parts
+            .iter()
+            .any(|part| part.modality != crate::api::input::Modality::Text);
+        cache
+            .reset()
+            .map_err(|error| Exception::custom(error.to_string()))?;
+        self.model
+            .ensure_embedded_mtp_cache(cache)
+            .map_err(|error| Exception::custom(error.to_string()))?;
+        let step = PipelineStep::new(tokens.dim(0), tokens.dim(1))
+            .map_err(|error| Exception::custom(error.to_string()))?;
+        let local = if multimodal {
+            self.model.prefill_cartesian(
+                self.model.info.is_first.then_some(input),
+                step,
+                None,
+                cache,
+                self.execution,
+                stream,
+            )
+        } else {
+            self.model.forward_cartesian(
+                self.model.info.is_first.then_some(&tokens),
+                step,
+                None,
+                cache,
+                self.execution,
+                stream,
+            )
+        };
+        let (failed, _) = self
+            .execution
+            .operation_consensus(local.is_err(), false, stream)
+            .map_err(|error| Exception::custom(error.to_string()))?;
+        if failed {
+            return Err(local.map_or_else(
+                |error| Exception::custom(error.to_string()),
+                |_| Exception::custom("a peer failed pipeline embedded MTP prefill"),
+            ));
+        }
+        let logits = local.map_err(|error| Exception::custom(error.to_string()))?;
+        let hidden = self.model.last_mtp_hidden.take();
+        self.model
+            .synchronize_embedded_mtp_output(logits, hidden, tokens, self.execution, stream)
+    }
+
+    fn verify_target(
+        &mut self,
+        tokens: &Array,
+        cache: &mut Self::Cache,
+        stream: &Stream,
+    ) -> Result<EmbeddedMtpOutput, Exception> {
+        let step = PipelineStep::new(tokens.dim(0), tokens.dim(1))
+            .map_err(|error| Exception::custom(error.to_string()))?;
+        let local = self.model.forward_cartesian(
+            self.model.info.is_first.then_some(tokens),
+            step,
+            None,
+            cache,
+            self.execution,
+            stream,
+        );
+        let (failed, _) = self
+            .execution
+            .operation_consensus(local.is_err(), false, stream)
+            .map_err(|error| Exception::custom(error.to_string()))?;
+        if failed {
+            return Err(local.map_or_else(
+                |error| Exception::custom(error.to_string()),
+                |_| Exception::custom("a peer failed pipeline embedded MTP verification"),
+            ));
+        }
+        let logits = local.map_err(|error| Exception::custom(error.to_string()))?;
+        let hidden = self.model.last_mtp_hidden.take();
+        self.model.synchronize_embedded_mtp_output(
+            logits,
+            hidden,
+            tokens.clone(),
+            self.execution,
+            stream,
+        )
+    }
+
+    fn prefill_draft_cache(
+        &mut self,
+        output: &EmbeddedMtpOutput,
+        tokens: &Array,
+        cache: &mut Self::Cache,
+        stream: &Stream,
+    ) -> Result<(), Exception> {
+        let sequence = tokens.dim(1);
+        if sequence <= 1 {
+            return Ok(());
+        }
+        let hidden = output
+            .hidden
+            .try_index_device((.., ..sequence - 1, ..), stream)?;
+        let next = tokens.try_index_device((.., 1..), stream)?;
+        let mut draft = cache.mtp.clone();
+        for depth in 0..self.max_draft_tokens() {
+            let _ = self.forward_draft(&hidden, &next, depth, &mut draft, stream)?;
+        }
+        cache.mtp = draft;
+        Ok(())
+    }
+
+    fn draft_cache(cache: &Self::Cache) -> Self::DraftCache {
+        cache.mtp.clone()
+    }
+
+    fn commit_draft_cache(cache: &mut Self::Cache, draft: &Self::DraftCache) {
+        cache.mtp.clone_from(draft);
+    }
+
+    fn draft_logits(
+        &mut self,
+        hidden: &Array,
+        last_token: u32,
+        draft_index: usize,
+        cache: &mut Self::DraftCache,
+        stream: &Stream,
+    ) -> Result<(Array, Array), Exception> {
+        let tokens = Array::from_slice(&[last_token], &[1, 1]);
+        let output = self.forward_draft(hidden, &tokens, draft_index, cache, stream)?;
+        Ok((output.logits, output.hidden))
+    }
+
+    fn advance_draft_cache(
+        &mut self,
+        hidden: &Array,
+        tokens: &Array,
+        cache: &mut Self::DraftCache,
+        stream: &Stream,
+    ) -> Result<(), Exception> {
+        for depth in 0..self.max_draft_tokens() {
+            let _ = self.forward_draft(hidden, tokens, depth, cache, stream)?;
+        }
+        Ok(())
+    }
+
+    fn max_draft_tokens(&self) -> usize {
+        self.model.stage.embedded_mtp_len()
+    }
+}
+
+impl PipelineEmbeddedMtpTarget<'_> {
+    fn forward_draft(
+        &mut self,
+        hidden: &Array,
+        tokens: &Array,
+        depth: usize,
+        cache: &mut PipelineMtpCache,
+        stream: &Stream,
+    ) -> Result<EmbeddedMtpOutput, Exception> {
+        let local = if self.model.info.is_last {
+            let tensor = self
+                .execution
+                .tensor_context(stream)
+                .map_err(|error| Exception::custom(error.to_string()))?;
+            self.model
+                .stage
+                .forward_embedded_mtp_draft(
+                    hidden,
+                    tokens,
+                    depth,
+                    cache,
+                    Some(&tensor),
+                    self.execution.expert_group(),
+                    stream,
+                )
+                .map(Some)
+        } else {
+            Ok(None)
+        };
+        let (failed, _) = self
+            .execution
+            .operation_consensus(local.is_err(), false, stream)
+            .map_err(|error| Exception::custom(error.to_string()))?;
+        if failed {
+            return Err(local.map_or_else(
+                |error| Exception::custom(error.to_string()),
+                |_| Exception::custom("a peer failed pipeline embedded MTP drafting"),
+            ));
+        }
+        let local = local.map_err(|error| Exception::custom(error.to_string()))?;
+        self.model.synchronize_embedded_mtp_output(
+            local.as_ref().map(|output| output.logits.clone()),
+            local.map(|output| output.hidden),
+            tokens.clone(),
+            self.execution,
+            stream,
+        )
     }
 }
 
@@ -4681,6 +5409,8 @@ fn base_info(
         pipeline_stages: topology.pipeline_parallel_size,
         is_first: stage == 0,
         is_last: stage == last,
+        owns_embedded_mtp: false,
+        embedded_mtp_layers: 0,
         global_layer_range: range,
         global_expert_count: None,
         local_expert_ids: Vec::new(),
@@ -5016,7 +5746,7 @@ impl PipelineLoadAccumulator {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn load_excluding<M: ModuleParameters>(
+    fn load_excluding<M: ModuleParameters + ?Sized>(
         &mut self,
         module: &mut M,
         store: &dyn WeightStore,
@@ -6927,6 +7657,7 @@ impl DeepSeekStage {
             },
         )?;
         if let Some(norm) = &mut self.norm {
+            let mtp_hidden = hidden.clone();
             hidden = norm.forward(&hidden, stream)?;
             let sharded = self
                 .parallel_lm_head
@@ -6935,7 +7666,10 @@ impl DeepSeekStage {
                     Error::Parallel("last DeepSeek TP+PP stage has no head shard".into())
                 })?
                 .forward(&hidden, execution)?;
-            Ok(PipelineStageOutput::Logits(sharded.all_gather(execution)?))
+            Ok(PipelineStageOutput::EmbeddedMtpLogits {
+                logits: sharded.all_gather(execution)?,
+                hidden: mtp_hidden,
+            })
         } else {
             Ok(PipelineStageOutput::Hidden(PipelinePayload {
                 hidden,
@@ -7079,13 +7813,16 @@ impl DeepSeekStage {
             },
         )?;
         if let Some(norm) = &mut self.norm {
+            let mtp_hidden = hidden.clone();
             hidden = norm.forward(&hidden, stream)?;
-            Ok(PipelineStageOutput::Logits(
-                self.lm_head
+            Ok(PipelineStageOutput::EmbeddedMtpLogits {
+                logits: self
+                    .lm_head
                     .as_mut()
                     .expect("last DeepSeek PP+EP stage head")
                     .forward(&hidden, stream)?,
-            ))
+                hidden: mtp_hidden,
+            })
         } else {
             Ok(PipelineStageOutput::Hidden(PipelinePayload {
                 hidden,
@@ -11576,7 +12313,8 @@ fn load_nemotron_h_pipeline(
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<PipelineModel, Error> {
-    let mut binding_adapter = if expert_cache_options.is_some() {
+    let external_experts = topology.expert_parallel_size > 1 || expert_cache_options.is_some();
+    let mut binding_adapter = if external_experts {
         NemotronHLayerwiseAdapter::new_external_experts(source_args.clone(), stream)?
     } else {
         NemotronHLayerwiseAdapter::new(source_args.clone(), stream)?
@@ -11607,7 +12345,7 @@ fn load_nemotron_h_pipeline(
         target_args.quantized_weight_configs = None;
     }
     let expert_quantization = quantize_on_load;
-    let mut target_binding_adapter = if expert_cache_options.is_some() {
+    let mut target_binding_adapter = if external_experts {
         NemotronHLayerwiseAdapter::new_external_experts(target_args.clone(), stream)?
     } else {
         NemotronHLayerwiseAdapter::new(target_args.clone(), stream)?
@@ -11619,13 +12357,8 @@ fn load_nemotron_h_pipeline(
         ModelKind::NemotronH,
         source_args.hidden_size,
     );
-    let mut stage = NemotronHStage::new(
-        target_args.clone(),
-        range,
-        &info,
-        expert_cache_options.is_some(),
-        stream,
-    )?;
+    let mut stage =
+        NemotronHStage::new(target_args.clone(), range, &info, external_experts, stream)?;
     stage.expert_assignment = expert_assignment;
     if let Some(assignment) = stage.expert_assignment.as_ref() {
         info.global_expert_count = Some(assignment.global_expert_count());
@@ -11702,6 +12435,13 @@ fn load_nemotron_h_pipeline(
             )
         })
         .collect::<Result<Vec<_>, _>>()?;
+    let owns_mtp = info.is_last && stage.layer_adapter.embedded_mtp_len() > 0;
+    info.owns_embedded_mtp = owns_mtp;
+    info.embedded_mtp_layers = if owns_mtp {
+        stage.layer_adapter.embedded_mtp_len()
+    } else {
+        0
+    };
     let requested = quantize_on_load;
     let static_roles = selected_pipeline_static_roles([
         (
@@ -11709,13 +12449,15 @@ fn load_nemotron_h_pipeline(
             stage.embedding.is_some()
                 || stage.output_embedding.is_some()
                 || stage.parallel_embedding.is_some()
-                || stage.parallel_output_embedding.is_some(),
+                || stage.parallel_output_embedding.is_some()
+                || owns_mtp,
         ),
         ("norm", stage.norm.is_some()),
         (
             "output",
-            stage.lm_head.is_some() || stage.parallel_lm_head.is_some(),
+            stage.lm_head.is_some() || stage.parallel_lm_head.is_some() || owns_mtp,
         ),
+        ("mtp", owns_mtp),
     ]);
     let (store, materialization) = match requested {
         Some(quantization) => {
@@ -11741,6 +12483,43 @@ fn load_nemotron_h_pipeline(
     info.materialization = materialization;
     let static_units = pipeline_binding_units(binding_adapter, store.as_ref(), &static_roles)?;
     let mut loaded = PipelineLoadAccumulator::new("Nemotron-H");
+    if owns_mtp {
+        for role in ["embedding", "output", "mtp"] {
+            if stage.layer_adapter.pipeline_static_mut(role).is_none() {
+                continue;
+            }
+            let bindings = pipeline_cartesian_static_bindings(
+                &static_units,
+                role,
+                store.as_ref(),
+                parallel_layout.as_ref(),
+            )?;
+            let target = stage
+                .layer_adapter
+                .pipeline_static_mut(role)
+                .expect("selected Nemotron-H MTP static target");
+            if external_experts && role == "mtp" {
+                loaded.load_excluding(
+                    target,
+                    store.as_ref(),
+                    &bindings,
+                    requested,
+                    weights_stream,
+                    stream,
+                    &|name| name.contains(".moe.experts."),
+                )?;
+            } else {
+                loaded.load(
+                    target,
+                    store.as_ref(),
+                    &bindings,
+                    requested,
+                    weights_stream,
+                    stream,
+                )?;
+            }
+        }
+    }
     if let Some(module) = &mut stage.parallel_embedding {
         let bindings = shard_layer_bindings(
             pipeline_static_bindings(&static_units, "embedding")?.to_vec(),
@@ -11837,7 +12616,7 @@ fn load_nemotron_h_pipeline(
                 stage.expert_assignment.as_ref(),
                 stream,
             )?;
-            if expert_cache_options.is_some() {
+            if external_experts {
                 loaded.load_excluding(
                     layer,
                     store.as_ref(),
@@ -11893,7 +12672,7 @@ fn load_nemotron_h_pipeline(
                 )
             },
         )?);
-        if expert_cache_options.is_some() {
+        if external_experts {
             stage.dense_layers = stage
                 .dense_layers
                 .take()
@@ -11907,12 +12686,13 @@ fn load_nemotron_h_pipeline(
     } else {
         info.planned_owned_parameter_bytes = static_bytes;
     }
-    if let Some(options) = expert_cache_options {
+    if external_experts {
         let entries =
-            crate::architectures::nemotron_h::layerwise::nemotron_h_expert_catalog_for_layers(
+            crate::architectures::nemotron_h::layerwise::nemotron_h_pipeline_expert_catalog(
                 &source_args,
                 store.as_ref(),
                 stage.range.clone(),
+                info.is_last,
             )?
             .into_iter()
             .filter(|entry| {
@@ -11925,7 +12705,7 @@ fn load_nemotron_h_pipeline(
             let cache = build_pipeline_expert_cache(
                 Arc::clone(&store),
                 entries,
-                Some(options),
+                expert_cache_options,
                 expert_quantization,
                 weights_stream,
                 stream,
@@ -12481,6 +13261,7 @@ impl NemotronHStage {
             },
         )?;
         let output = if let Some(norm) = &mut self.norm {
+            let mtp_hidden = hidden.clone();
             hidden = norm.forward(&hidden, stream)?;
             let logits = if let Some(head) = &mut self.lm_head {
                 head.forward(&hidden, stream)?
@@ -12495,7 +13276,10 @@ impl NemotronHStage {
                     stream,
                 )?
             };
-            PipelineStageOutput::Logits(logits)
+            PipelineStageOutput::EmbeddedMtpLogits {
+                logits,
+                hidden: mtp_hidden,
+            }
         } else {
             PipelineStageOutput::Hidden(PipelinePayload { hidden, auxiliary })
         };
@@ -12647,6 +13431,7 @@ impl NemotronHStage {
             },
         )?;
         if let Some(norm) = &mut self.norm {
+            let mtp_hidden = hidden.clone();
             hidden = norm.forward(&hidden, stream)?;
             let sharded = if let Some(head) = &mut self.parallel_lm_head {
                 head.forward(&hidden, execution)?
@@ -12661,7 +13446,10 @@ impl NemotronHStage {
                     })?
                     .project_logits(&hidden, execution)?
             };
-            Ok(PipelineStageOutput::Logits(sharded.all_gather(execution)?))
+            Ok(PipelineStageOutput::EmbeddedMtpLogits {
+                logits: sharded.all_gather(execution)?,
+                hidden: mtp_hidden,
+            })
         } else {
             Ok(PipelineStageOutput::Hidden(PipelinePayload {
                 hidden,
@@ -12777,6 +13565,7 @@ impl NemotronHStage {
             },
         )?;
         if let Some(norm) = &mut self.norm {
+            let mtp_hidden = hidden.clone();
             hidden = norm.forward(&hidden, stream)?;
             let logits = if let Some(head) = &mut self.lm_head {
                 head.forward(&hidden, stream)?
@@ -12791,7 +13580,10 @@ impl NemotronHStage {
                     stream,
                 )?
             };
-            Ok(PipelineStageOutput::Logits(logits))
+            Ok(PipelineStageOutput::EmbeddedMtpLogits {
+                logits,
+                hidden: mtp_hidden,
+            })
         } else {
             Ok(PipelineStageOutput::Hidden(PipelinePayload {
                 hidden,
@@ -12815,16 +13607,17 @@ fn load_qwen_hybrid_pipeline(
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<PipelineModel, Error> {
+    let external_experts = topology.expert_parallel_size > 1 || expert_cache_options.is_some();
     let binding_adapter = if vision_config.is_some() {
         QwenHybridLayerwiseAdapter::new_pipeline(
             source_args.clone(),
             image_token_id,
             video_token_id,
             vision_config.clone(),
-            expert_cache_options.is_some(),
+            external_experts,
             stream,
         )?
-    } else if expert_cache_options.is_some() {
+    } else if external_experts {
         QwenHybridLayerwiseAdapter::new_text_external_experts(source_args.clone(), stream)?
     } else {
         QwenHybridLayerwiseAdapter::new_text(source_args.clone(), stream)?
@@ -12864,10 +13657,10 @@ fn load_qwen_hybrid_pipeline(
             image_token_id,
             video_token_id,
             vision_config.clone(),
-            expert_cache_options.is_some(),
+            external_experts,
             stream,
         )?
-    } else if expert_cache_options.is_some() {
+    } else if external_experts {
         QwenHybridLayerwiseAdapter::new_text_external_experts(target_args.clone(), stream)?
     } else {
         QwenHybridLayerwiseAdapter::new_text(target_args.clone(), stream)?
@@ -12886,7 +13679,7 @@ fn load_qwen_hybrid_pipeline(
         vision_config,
         range,
         &info,
-        expert_cache_options.is_some(),
+        external_experts,
         stream,
     )?;
     stage.expert_assignment = expert_assignment;
@@ -12965,6 +13758,13 @@ fn load_qwen_hybrid_pipeline(
             }
         })
         .collect::<Result<Vec<_>, _>>()?;
+    let owns_mtp = info.is_last && stage.layer_adapter.embedded_mtp_len() > 0;
+    info.owns_embedded_mtp = owns_mtp;
+    info.embedded_mtp_layers = if owns_mtp {
+        stage.layer_adapter.embedded_mtp_len()
+    } else {
+        0
+    };
     let has_vision_static =
         info.is_first && stage.layer_adapter.pipeline_static_mut("vision").is_some();
     let static_roles = selected_pipeline_static_roles([
@@ -12974,13 +13774,15 @@ fn load_qwen_hybrid_pipeline(
                 || stage.output_embedding.is_some()
                 || stage.parallel_embedding.is_some()
                 || stage.parallel_output_embedding.is_some()
-                || (info.is_first && stage.has_multimodal_ingress),
+                || (info.is_first && stage.has_multimodal_ingress)
+                || owns_mtp,
         ),
         ("norm", stage.norm.is_some()),
         (
             "output",
-            stage.lm_head.is_some() || stage.parallel_lm_head.is_some(),
+            stage.lm_head.is_some() || stage.parallel_lm_head.is_some() || owns_mtp,
         ),
+        ("mtp", owns_mtp),
         ("vision", has_vision_static),
     ]);
     let (store, materialization) = match quantize_on_load {
@@ -13015,6 +13817,43 @@ fn load_qwen_hybrid_pipeline(
     info.materialization = materialization;
     let static_units = pipeline_binding_units(binding_adapter, store.as_ref(), &static_roles)?;
     let mut loaded = PipelineLoadAccumulator::new("Qwen hybrid");
+    if owns_mtp {
+        for role in ["embedding", "output", "mtp"] {
+            if stage.layer_adapter.pipeline_static_mut(role).is_none() {
+                continue;
+            }
+            let bindings = pipeline_cartesian_static_bindings(
+                &static_units,
+                role,
+                store.as_ref(),
+                parallel_layout.as_ref(),
+            )?;
+            let target = stage
+                .layer_adapter
+                .pipeline_static_mut(role)
+                .expect("selected Qwen MTP static target");
+            if external_experts && role == "mtp" {
+                loaded.load_excluding(
+                    target,
+                    store.as_ref(),
+                    &bindings,
+                    quantize_on_load,
+                    weights_stream,
+                    stream,
+                    &|name| name.contains(".mlp.experts."),
+                )?;
+            } else {
+                loaded.load(
+                    target,
+                    store.as_ref(),
+                    &bindings,
+                    quantize_on_load,
+                    weights_stream,
+                    stream,
+                )?;
+            }
+        }
+    }
     if info.is_first && stage.has_multimodal_ingress {
         let bindings = pipeline_cartesian_static_bindings(
             &static_units,
@@ -13176,7 +14015,7 @@ fn load_qwen_hybrid_pipeline(
                 stage.expert_assignment.as_ref(),
                 stream,
             )?;
-            if expert_cache_options.is_some() {
+            if external_experts {
                 loaded.load_excluding(
                     layer,
                     store.as_ref(),
@@ -13261,7 +14100,7 @@ fn load_qwen_hybrid_pipeline(
             )?
             .with_execution_offset(media_count)?,
         );
-        if expert_cache_options.is_some() {
+        if external_experts {
             stage.dense_layers = stage
                 .dense_layers
                 .take()
@@ -13275,12 +14114,13 @@ fn load_qwen_hybrid_pipeline(
     } else {
         info.planned_owned_parameter_bytes = static_bytes;
     }
-    if let Some(options) = expert_cache_options {
+    if external_experts {
         let entries =
-            crate::architectures::qwen::hybrid::layerwise::qwen_hybrid_expert_catalog_for_layers(
+            crate::architectures::qwen::hybrid::layerwise::qwen_hybrid_pipeline_expert_catalog(
                 &source_args,
                 store.as_ref(),
                 stage.range.clone(),
+                info.is_last,
             )?
             .into_iter()
             .filter(|entry| {
@@ -13293,7 +14133,7 @@ fn load_qwen_hybrid_pipeline(
             let cache = build_pipeline_expert_cache(
                 Arc::clone(&store),
                 entries,
-                Some(options),
+                expert_cache_options,
                 expert_quantization,
                 weights_stream,
                 stream,
@@ -13917,6 +14757,7 @@ impl QwenHybridStage {
             },
         )?;
         let output = if let Some(norm) = &mut self.norm {
+            let mtp_hidden = hidden.clone();
             hidden = norm.forward(&hidden, stream)?;
             let logits = if let Some(head) = &mut self.lm_head {
                 head.forward(&hidden, stream)?
@@ -13931,7 +14772,10 @@ impl QwenHybridStage {
                     stream,
                 )?
             };
-            PipelineStageOutput::Logits(logits)
+            PipelineStageOutput::EmbeddedMtpLogits {
+                logits,
+                hidden: mtp_hidden,
+            }
         } else {
             PipelineStageOutput::Hidden(PipelinePayload { hidden, auxiliary })
         };
@@ -14087,6 +14931,7 @@ impl QwenHybridStage {
             },
         )?;
         if let Some(norm) = &mut self.norm {
+            let mtp_hidden = hidden.clone();
             hidden = norm.forward(&hidden, stream)?;
             let sharded = if let Some(head) = &mut self.parallel_lm_head {
                 head.forward(&hidden, execution)?
@@ -14101,7 +14946,10 @@ impl QwenHybridStage {
                     })?
                     .project_logits(&hidden, execution)?
             };
-            Ok(PipelineStageOutput::Logits(sharded.all_gather(execution)?))
+            Ok(PipelineStageOutput::EmbeddedMtpLogits {
+                logits: sharded.all_gather(execution)?,
+                hidden: mtp_hidden,
+            })
         } else {
             Ok(PipelineStageOutput::Hidden(PipelinePayload {
                 hidden,
@@ -14225,6 +15073,7 @@ impl QwenHybridStage {
             },
         )?;
         if let Some(norm) = &mut self.norm {
+            let mtp_hidden = hidden.clone();
             hidden = norm.forward(&hidden, stream)?;
             let logits = if let Some(head) = &mut self.lm_head {
                 head.forward(&hidden, stream)?
@@ -14239,7 +15088,10 @@ impl QwenHybridStage {
                     stream,
                 )?
             };
-            Ok(PipelineStageOutput::Logits(logits))
+            Ok(PipelineStageOutput::EmbeddedMtpLogits {
+                logits,
+                hidden: mtp_hidden,
+            })
         } else {
             Ok(PipelineStageOutput::Hidden(PipelinePayload {
                 hidden,
@@ -15478,22 +16330,33 @@ fn load_inkling_pipeline(
             })
         })
         .collect::<Result<Vec<_>, _>>()?;
+    let owns_mtp = info.is_last && stage.layer_adapter.embedded_mtp_len() > 0;
+    info.owns_embedded_mtp = owns_mtp;
+    info.embedded_mtp_layers = if owns_mtp {
+        stage.layer_adapter.embedded_mtp_len()
+    } else {
+        0
+    };
     let static_roles = selected_pipeline_static_roles([
         (
             "embedding",
             stage.embedding.is_some()
                 || stage.parallel_embedding.is_some()
-                || (info.is_first && stage.has_multimodal_ingress),
+                || (info.is_first && stage.has_multimodal_ingress)
+                || owns_mtp,
         ),
         (
             "embed_norm",
-            stage.embed_norm.is_some() || (info.is_first && stage.has_multimodal_ingress),
+            stage.embed_norm.is_some()
+                || (info.is_first && stage.has_multimodal_ingress)
+                || owns_mtp,
         ),
         ("norm", stage.norm.is_some()),
         (
             "output",
-            stage.lm_head.is_some() || stage.parallel_lm_head.is_some(),
+            stage.lm_head.is_some() || stage.parallel_lm_head.is_some() || owns_mtp,
         ),
+        ("mtp", owns_mtp),
         ("audio", info.is_first && target_args.audio_config.is_some()),
         (
             "vision_norm",
@@ -15531,6 +16394,27 @@ fn load_inkling_pipeline(
     info.materialization = materialization;
     let static_units = pipeline_binding_units(binding_adapter, store.as_ref(), &static_roles)?;
     let mut loaded = PipelineLoadAccumulator::new("Inkling");
+    if owns_mtp {
+        for role in ["embedding", "embed_norm", "output", "mtp"] {
+            let bindings = pipeline_cartesian_static_bindings(
+                &static_units,
+                role,
+                store.as_ref(),
+                parallel_layout.as_ref(),
+            )?;
+            loaded.load(
+                stage
+                    .layer_adapter
+                    .pipeline_static_mut(role)
+                    .expect("selected Inkling MTP static target"),
+                store.as_ref(),
+                &bindings,
+                requested,
+                weights_stream,
+                stream,
+            )?;
+        }
+    }
     if let Some(module) = &mut stage.parallel_embedding {
         let bindings = shard_layer_bindings(
             pipeline_static_bindings(&static_units, "embedding")?.to_vec(),
@@ -16290,6 +17174,7 @@ impl InklingStage {
             },
         )?;
         let output = if let Some(norm) = &mut self.norm {
+            let mtp_hidden = hidden.clone();
             hidden = norm.forward(&hidden, stream)?;
             let logits = inkling::project_text_logits(
                 &hidden,
@@ -16303,7 +17188,10 @@ impl InklingStage {
                         .forward(hidden, stream)
                 },
             )?;
-            PipelineStageOutput::Logits(logits)
+            PipelineStageOutput::EmbeddedMtpLogits {
+                logits,
+                hidden: mtp_hidden,
+            }
         } else {
             PipelineStageOutput::Hidden(PipelinePayload { hidden, auxiliary })
         };
@@ -16458,6 +17346,7 @@ impl InklingStage {
             },
         )?;
         if let Some(norm) = &mut self.norm {
+            let mtp_hidden = hidden.clone();
             hidden = norm.forward(&hidden, stream)?;
             let logits = inkling::project_text_logits(
                 &hidden,
@@ -16475,7 +17364,10 @@ impl InklingStage {
                     sharded.all_gather(execution)
                 },
             )?;
-            Ok(PipelineStageOutput::Logits(logits))
+            Ok(PipelineStageOutput::EmbeddedMtpLogits {
+                logits,
+                hidden: mtp_hidden,
+            })
         } else {
             Ok(PipelineStageOutput::Hidden(PipelinePayload {
                 hidden,
@@ -16618,6 +17510,7 @@ impl InklingStage {
             },
         )?;
         if let Some(norm) = &mut self.norm {
+            let mtp_hidden = hidden.clone();
             hidden = norm.forward(&hidden, stream)?;
             let logits = inkling::project_text_logits(
                 &hidden,
@@ -16631,7 +17524,10 @@ impl InklingStage {
                         .forward(hidden, stream)
                 },
             )?;
-            Ok(PipelineStageOutput::Logits(logits))
+            Ok(PipelineStageOutput::EmbeddedMtpLogits {
+                logits,
+                hidden: mtp_hidden,
+            })
         } else {
             Ok(PipelineStageOutput::Hidden(PipelinePayload {
                 hidden,
@@ -18085,7 +18981,8 @@ fn load_deepseek_pipeline(
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<PipelineModel, Error> {
-    let binding_adapter = if expert_cache_options.is_some() {
+    let external_experts = topology.expert_parallel_size > 1 || expert_cache_options.is_some();
+    let mut binding_adapter = if external_experts {
         crate::architectures::deepseek_v3::layerwise::DeepSeekV3LayerwiseAdapter::new_external_experts(
             source_args.clone(),
             stream,
@@ -18124,7 +19021,7 @@ fn load_deepseek_pipeline(
         target_args.quantization_config = None;
         target_args.quantization = Some(quantization);
     }
-    let target_binding_adapter = if expert_cache_options.is_some() {
+    let mut target_binding_adapter = if external_experts {
         crate::architectures::deepseek_v3::layerwise::DeepSeekV3LayerwiseAdapter::new_external_experts(
             target_args.clone(),
             stream,
@@ -18142,13 +19039,8 @@ fn load_deepseek_pipeline(
         ModelKind::DeepSeekV3,
         source_args.hidden_size,
     );
-    let mut stage = DeepSeekStage::new(
-        target_args.clone(),
-        range,
-        &info,
-        expert_cache_options.is_some(),
-        stream,
-    )?;
+    let mut stage =
+        DeepSeekStage::new(target_args.clone(), range, &info, external_experts, stream)?;
     stage.expert_assignment = expert_assignment;
     if let Some(assignment) = stage.expert_assignment.as_ref() {
         info.global_expert_count = Some(assignment.global_expert_count());
@@ -18163,6 +19055,11 @@ fn load_deepseek_pipeline(
         let mut planner = build.planner();
         binding_adapter.register_parallel_parameters(build, &mut planner, stream)?;
         let (_, layout) = planner.finish()?;
+        binding_adapter.configure_cartesian_layout(build, &layout, stream)?;
+        target_binding_adapter.configure_cartesian_layout(build, &layout, stream)?;
+        stage
+            .layer_adapter
+            .configure_cartesian_layout(build, &layout, stream)?;
         stage.parallel_embedding = info
             .is_first
             .then(|| {
@@ -18207,16 +19104,24 @@ fn load_deepseek_pipeline(
             )
         })
         .collect::<Result<Vec<_>, _>>()?;
+    let owns_mtp = info.is_last && stage.layer_adapter.embedded_mtp_len() > 0;
+    info.owns_embedded_mtp = owns_mtp;
+    info.embedded_mtp_layers = if owns_mtp {
+        stage.layer_adapter.embedded_mtp_len()
+    } else {
+        0
+    };
     let static_roles = selected_pipeline_static_roles([
         (
             "embedding",
-            stage.embedding.is_some() || stage.parallel_embedding.is_some(),
+            stage.embedding.is_some() || stage.parallel_embedding.is_some() || owns_mtp,
         ),
         ("norm", stage.norm.is_some()),
         (
             "output",
             stage.lm_head.is_some() || stage.parallel_lm_head.is_some(),
         ),
+        ("mtp", owns_mtp),
     ]);
     let (store, materialization) = match quantize_on_load {
         Some(quantization) => {
@@ -18246,6 +19151,40 @@ fn load_deepseek_pipeline(
     info.materialization = materialization;
     let static_units = pipeline_binding_units(binding_adapter, store.as_ref(), &static_roles)?;
     let mut loaded = PipelineLoadAccumulator::new("DeepSeek");
+    if owns_mtp {
+        for role in ["embedding", "mtp"] {
+            let bindings = pipeline_cartesian_static_bindings(
+                &static_units,
+                role,
+                store.as_ref(),
+                parallel_layout.as_ref(),
+            )?;
+            let target = stage
+                .layer_adapter
+                .pipeline_static_mut(role)
+                .expect("selected DeepSeek MTP static target");
+            if external_experts && role == "mtp" {
+                loaded.load_excluding(
+                    target,
+                    store.as_ref(),
+                    &bindings,
+                    quantize_on_load,
+                    weights_stream,
+                    stream,
+                    &|name| name.contains(".decoder.mlp.experts."),
+                )?;
+            } else {
+                loaded.load(
+                    target,
+                    store.as_ref(),
+                    &bindings,
+                    quantize_on_load,
+                    weights_stream,
+                    stream,
+                )?;
+            }
+        }
+    }
     if let Some(module) = &mut stage.parallel_embedding {
         let bindings = shard_layer_bindings(
             pipeline_static_bindings(&static_units, "embedding")?.to_vec(),
@@ -18317,7 +19256,7 @@ fn load_deepseek_pipeline(
                 stage.expert_assignment.as_ref(),
                 stream,
             )?;
-            if expert_cache_options.is_some() {
+            if external_experts {
                 loaded.load_excluding(
                     layer,
                     store.as_ref(),
@@ -18375,7 +19314,7 @@ fn load_deepseek_pipeline(
                 )
             },
         )?);
-        if expert_cache_options.is_some() {
+        if external_experts {
             stage.dense_layers = stage
                 .dense_layers
                 .take()
@@ -18390,24 +19329,26 @@ fn load_deepseek_pipeline(
     } else {
         info.planned_owned_parameter_bytes = static_device_bytes;
     }
-    if let Some(options) = expert_cache_options {
-        let entries = crate::architectures::deepseek_v3::layerwise::deepseek_expert_catalog(
-            &source_args,
-            store.as_ref(),
-        )?
-        .into_iter()
-        .filter(|entry| stage.range.contains(&entry.identity().layer))
-        .filter(|entry| {
-            stage.expert_assignment.as_ref().is_none_or(|assignment| {
-                assignment.owner(entry.identity().global_expert) == Some(assignment.rank())
+    if external_experts {
+        let entries =
+            crate::architectures::deepseek_v3::layerwise::deepseek_pipeline_expert_catalog(
+                &source_args,
+                store.as_ref(),
+                stage.range.clone(),
+                info.is_last,
+            )?
+            .into_iter()
+            .filter(|entry| {
+                stage.expert_assignment.as_ref().is_none_or(|assignment| {
+                    assignment.owner(entry.identity().global_expert) == Some(assignment.rank())
+                })
             })
-        })
-        .collect::<Vec<_>>();
+            .collect::<Vec<_>>();
         if !entries.is_empty() {
             let cache = build_pipeline_expert_cache(
                 Arc::clone(&store),
                 entries,
-                Some(options),
+                expert_cache_options,
                 expert_quantization,
                 weights_stream,
                 stream,
@@ -18573,13 +19514,17 @@ impl DeepSeekStage {
             },
         )?;
         let output = if let Some(norm) = &mut self.norm {
+            let mtp_hidden = hidden.clone();
             hidden = norm.forward(&hidden, stream)?;
             let logits = self
                 .lm_head
                 .as_mut()
                 .expect("last stage head")
                 .forward(&hidden, stream)?;
-            PipelineStageOutput::Logits(logits)
+            PipelineStageOutput::EmbeddedMtpLogits {
+                logits,
+                hidden: mtp_hidden,
+            }
         } else {
             PipelineStageOutput::Hidden(PipelinePayload { hidden, auxiliary })
         };
@@ -18749,6 +19694,9 @@ pub fn forward_stage_with_observer(
             &hidden.hidden,
         )?,
         PipelineStageOutput::Logits(logits) => observer.observe("lm_head.logits", logits)?,
+        PipelineStageOutput::EmbeddedMtpLogits { logits, .. } => {
+            observer.observe("lm_head.logits", logits)?
+        }
     }
     Ok(output)
 }
@@ -19414,6 +20362,9 @@ mod tests {
             {
                 PipelineStageOutput::Hidden(hidden) => hidden,
                 PipelineStageOutput::Logits(_) => panic!("first stage produced logits"),
+                PipelineStageOutput::EmbeddedMtpLogits { .. } => {
+                    panic!("first stage produced MTP logits")
+                }
             };
             let logits = match last
                 .forward_stage(
@@ -19426,6 +20377,7 @@ mod tests {
                 .unwrap()
             {
                 PipelineStageOutput::Logits(logits) => logits,
+                PipelineStageOutput::EmbeddedMtpLogits { logits, .. } => logits,
                 PipelineStageOutput::Hidden(_) => panic!("last stage produced hidden state"),
             };
             eval([&logits]).unwrap();
@@ -21119,7 +22071,8 @@ mod tests {
             .unwrap();
         match output {
             PipelineStageOutput::Hidden(payload) => payload.hidden,
-            PipelineStageOutput::Logits(logits) => logits,
+            PipelineStageOutput::Logits(logits)
+            | PipelineStageOutput::EmbeddedMtpLogits { logits, .. } => logits,
         }
     }
 
@@ -22300,6 +23253,9 @@ mod tests {
             {
                 PipelineStageOutput::Hidden(payload) => payload,
                 PipelineStageOutput::Logits(_) => panic!("first stage produced logits"),
+                PipelineStageOutput::EmbeddedMtpLogits { .. } => {
+                    panic!("first stage produced MTP logits")
+                }
             };
             assert_eq!(payload.auxiliary.tensors().len(), 1);
             assert_eq!(
@@ -22317,6 +23273,7 @@ mod tests {
                 .unwrap()
             {
                 PipelineStageOutput::Logits(logits) => logits,
+                PipelineStageOutput::EmbeddedMtpLogits { logits, .. } => logits,
                 PipelineStageOutput::Hidden(_) => panic!("last stage produced hidden state"),
             };
             assert_close(&actual, &expected);
@@ -22448,6 +23405,9 @@ mod tests {
         {
             PipelineStageOutput::Hidden(payload) => payload,
             PipelineStageOutput::Logits(_) => panic!("first stage produced logits"),
+            PipelineStageOutput::EmbeddedMtpLogits { .. } => {
+                panic!("first stage produced MTP logits")
+            }
         };
         let mut last_cache = last.new_cache().unwrap();
         let actual = match last
@@ -22461,6 +23421,7 @@ mod tests {
             .unwrap()
         {
             PipelineStageOutput::Logits(logits) => logits,
+            PipelineStageOutput::EmbeddedMtpLogits { logits, .. } => logits,
             PipelineStageOutput::Hidden(_) => panic!("last stage produced hidden state"),
         };
         assert_close(&actual, &expected);
@@ -22535,6 +23496,9 @@ mod tests {
             {
                 PipelineStageOutput::Hidden(payload) => payload,
                 PipelineStageOutput::Logits(_) => panic!("first stage produced logits"),
+                PipelineStageOutput::EmbeddedMtpLogits { .. } => {
+                    panic!("first stage produced MTP logits")
+                }
             };
             match last
                 .forward_stage(
@@ -22547,6 +23511,7 @@ mod tests {
                 .unwrap()
             {
                 PipelineStageOutput::Logits(logits) => logits,
+                PipelineStageOutput::EmbeddedMtpLogits { logits, .. } => logits,
                 PipelineStageOutput::Hidden(_) => panic!("last stage produced hidden state"),
             }
         };
@@ -22617,6 +23582,9 @@ mod tests {
                     {
                         PipelineStageOutput::Hidden(payload) => payload,
                         PipelineStageOutput::Logits(_) => panic!("first stage produced logits"),
+                        PipelineStageOutput::EmbeddedMtpLogits { .. } => {
+                            panic!("first stage produced MTP logits")
+                        }
                     };
                     let logits = match last
                         .forward_stage(
@@ -22629,6 +23597,7 @@ mod tests {
                         .unwrap()
                     {
                         PipelineStageOutput::Logits(logits) => logits,
+                        PipelineStageOutput::EmbeddedMtpLogits { logits, .. } => logits,
                         PipelineStageOutput::Hidden(_) => panic!("last stage produced hidden"),
                     };
                     eval([&logits]).unwrap();
@@ -22815,6 +23784,9 @@ mod tests {
             {
                 PipelineStageOutput::Hidden(payload) => payload,
                 PipelineStageOutput::Logits(_) => panic!("first stage produced logits"),
+                PipelineStageOutput::EmbeddedMtpLogits { .. } => {
+                    panic!("first stage produced MTP logits")
+                }
             };
             match last
                 .forward_stage(
@@ -22827,6 +23799,7 @@ mod tests {
                 .unwrap()
             {
                 PipelineStageOutput::Logits(logits) => logits,
+                PipelineStageOutput::EmbeddedMtpLogits { logits, .. } => logits,
                 PipelineStageOutput::Hidden(_) => panic!("last stage produced hidden"),
             }
         };
@@ -23046,6 +24019,9 @@ mod tests {
             {
                 PipelineStageOutput::Hidden(hidden) => hidden,
                 PipelineStageOutput::Logits(_) => panic!("first stage produced logits"),
+                PipelineStageOutput::EmbeddedMtpLogits { .. } => {
+                    panic!("first stage produced MTP logits")
+                }
             };
             let actual = match last
                 .forward_stage(
@@ -23058,6 +24034,7 @@ mod tests {
                 .unwrap()
             {
                 PipelineStageOutput::Logits(logits) => logits,
+                PipelineStageOutput::EmbeddedMtpLogits { logits, .. } => logits,
                 PipelineStageOutput::Hidden(_) => panic!("last stage produced hidden state"),
             };
             assert_close(&actual, &expected);
@@ -23333,6 +24310,9 @@ mod tests {
             {
                 PipelineStageOutput::Hidden(hidden) => hidden,
                 PipelineStageOutput::Logits(_) => panic!("first stage produced logits"),
+                PipelineStageOutput::EmbeddedMtpLogits { .. } => {
+                    panic!("first stage produced MTP logits")
+                }
             };
             let actual = match last
                 .forward_stage(
@@ -23345,6 +24325,7 @@ mod tests {
                 .unwrap()
             {
                 PipelineStageOutput::Logits(logits) => logits,
+                PipelineStageOutput::EmbeddedMtpLogits { logits, .. } => logits,
                 PipelineStageOutput::Hidden(_) => panic!("last stage produced hidden state"),
             };
             assert_close(&actual, &expected);
@@ -23689,6 +24670,9 @@ mod tests {
                 {
                     PipelineStageOutput::Hidden(hidden) => hidden,
                     PipelineStageOutput::Logits(_) => panic!("first stage produced logits"),
+                    PipelineStageOutput::EmbeddedMtpLogits { .. } => {
+                        panic!("first stage produced MTP logits")
+                    }
                 };
                 let pipeline_logits = match last
                     .forward_stage(
@@ -23701,6 +24685,7 @@ mod tests {
                     .unwrap()
                 {
                     PipelineStageOutput::Logits(logits) => logits,
+                    PipelineStageOutput::EmbeddedMtpLogits { logits, .. } => logits,
                     PipelineStageOutput::Hidden(_) => panic!("last stage produced hidden state"),
                 };
                 assert_close(&pipeline_logits, &reference_logits);
@@ -23931,6 +24916,9 @@ mod tests {
             {
                 PipelineStageOutput::Hidden(hidden) => hidden,
                 PipelineStageOutput::Logits(_) => panic!("first stage produced logits"),
+                PipelineStageOutput::EmbeddedMtpLogits { .. } => {
+                    panic!("first stage produced MTP logits")
+                }
             };
             let actual = match last
                 .forward_stage(
@@ -23943,6 +24931,7 @@ mod tests {
                 .unwrap()
             {
                 PipelineStageOutput::Logits(logits) => logits,
+                PipelineStageOutput::EmbeddedMtpLogits { logits, .. } => logits,
                 PipelineStageOutput::Hidden(_) => panic!("last stage produced hidden state"),
             };
             assert_close(&actual, &expected);
@@ -24041,6 +25030,9 @@ mod tests {
             {
                 PipelineStageOutput::Hidden(hidden) => hidden,
                 PipelineStageOutput::Logits(_) => panic!("first stage produced logits"),
+                PipelineStageOutput::EmbeddedMtpLogits { .. } => {
+                    panic!("first stage produced MTP logits")
+                }
             };
             let pipeline_logits = match last
                 .forward_stage(
@@ -24053,6 +25045,7 @@ mod tests {
                 .unwrap()
             {
                 PipelineStageOutput::Logits(logits) => logits,
+                PipelineStageOutput::EmbeddedMtpLogits { logits, .. } => logits,
                 PipelineStageOutput::Hidden(_) => panic!("last stage produced hidden state"),
             };
             assert_close(&pipeline_logits, &reference_logits);

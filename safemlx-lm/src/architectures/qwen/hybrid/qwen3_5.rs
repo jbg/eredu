@@ -3637,6 +3637,22 @@ impl TransformerBlock {
         Self::new(&local, layer_idx, stream).map_err(Into::into)
     }
 
+    pub(crate) fn new_mtp_parallel_layerwise(
+        args: &ModelArgs,
+        layer_idx: usize,
+        geometry: ParallelLayerGeometry,
+        stream: &Stream,
+    ) -> Result<Self, Error> {
+        let local = geometry.local_args(args);
+        Self::new_mtp_with_format(
+            &local,
+            layer_idx,
+            QwenWeightFormat::for_text(&local, None),
+            stream,
+        )
+        .map_err(Into::into)
+    }
+
     fn new_with_format(
         args: &ModelArgs,
         layer_idx: usize,
@@ -4474,15 +4490,15 @@ impl TransformerBlock {
 /// Embedded Qwen multi-token-prediction head.
 pub(crate) struct MtpModule {
     #[param]
-    pre_fc_norm_hidden: Qwen3NextRmsNorm,
+    pub(crate) pre_fc_norm_hidden: Qwen3NextRmsNorm,
     #[param]
-    pre_fc_norm_embedding: Qwen3NextRmsNorm,
+    pub(crate) pre_fc_norm_embedding: Qwen3NextRmsNorm,
     #[param]
-    fc: QwenLinear,
+    pub(crate) fc: QwenLinear,
     #[param]
-    layers: Vec<TransformerBlock>,
+    pub(crate) layers: Vec<TransformerBlock>,
     #[param]
-    norm: Qwen3NextRmsNorm,
+    pub(crate) norm: Qwen3NextRmsNorm,
 }
 
 impl MtpModule {
@@ -4572,6 +4588,118 @@ impl MtpModule {
             },
             stream,
         )?;
+        self.norm.forward(&fused, stream)
+    }
+
+    pub(crate) fn forward_tensor_parallel(
+        &mut self,
+        hidden: &Array,
+        embeddings: &Array,
+        cache: &mut [LayerCache],
+        group: &safemlx::distributed::Group,
+        stream: &Stream,
+    ) -> Result<Array, Exception> {
+        if cache.len() != self.layers.len() {
+            return Err(Exception::custom(format!(
+                "Qwen MTP cache has {} layers, expected {}",
+                cache.len(),
+                self.layers.len()
+            )));
+        }
+        let layer = self
+            .layers
+            .first_mut()
+            .ok_or_else(|| Exception::custom("Qwen checkpoint does not contain MTP layers"))?;
+        let layer_cache = cache
+            .first_mut()
+            .ok_or_else(|| Exception::custom("Qwen MTP cache is empty"))?;
+        let embeddings = self.pre_fc_norm_embedding.forward(embeddings, stream)?;
+        let hidden = self.pre_fc_norm_hidden.forward(hidden, stream)?;
+        let fused = concatenate_axis(&[&embeddings, &hidden], -1, stream)?;
+        let fused = self.fc.forward(&fused, stream)?;
+        let mask = if fused.dim(1) > 1 {
+            let offset = match &*layer_cache {
+                LayerCache::FullAttention(cache) => cache.offset(),
+                LayerCache::LinearAttention(_) => 0,
+            };
+            match create_attention_mask(&fused, &offset_cache(offset), Some(true), stream)? {
+                Some(AttentionMask::Array(mask)) => Some(mask),
+                Some(AttentionMask::Causal) => {
+                    return Err(Exception::custom("Qwen MTP requires an array causal mask"));
+                }
+                None => None,
+            }
+        } else {
+            None
+        };
+        let fused = layer.forward_tensor_parallel(
+            BlockInput {
+                x: &fused,
+                mask: mask.as_ref(),
+                cache: Some(layer_cache),
+            },
+            group,
+            stream,
+        )?;
+        self.norm.forward(&fused, stream)
+    }
+
+    pub(crate) fn forward_with_expert_executor<F>(
+        &mut self,
+        hidden: &Array,
+        embeddings: &Array,
+        cache: &mut [LayerCache],
+        tensor_group: Option<&safemlx::distributed::Group>,
+        execute: F,
+        stream: &Stream,
+    ) -> Result<Array, Exception>
+    where
+        F: FnOnce(&Array, &Array, &Array, &Stream) -> Result<Array, Exception>,
+    {
+        if cache.len() != self.layers.len() {
+            return Err(Exception::custom(format!(
+                "Qwen MTP cache has {} layers, expected {}",
+                cache.len(),
+                self.layers.len()
+            )));
+        }
+        let layer = self
+            .layers
+            .first_mut()
+            .ok_or_else(|| Exception::custom("Qwen checkpoint does not contain MTP layers"))?;
+        let layer_cache = cache
+            .first_mut()
+            .ok_or_else(|| Exception::custom("Qwen MTP cache is empty"))?;
+        let embeddings = self.pre_fc_norm_embedding.forward(embeddings, stream)?;
+        let hidden = self.pre_fc_norm_hidden.forward(hidden, stream)?;
+        let fused = concatenate_axis(&[&embeddings, &hidden], -1, stream)?;
+        let fused = self.fc.forward(&fused, stream)?;
+        let mask = if fused.dim(1) > 1 {
+            let offset = match &*layer_cache {
+                LayerCache::FullAttention(cache) => cache.offset(),
+                LayerCache::LinearAttention(_) => 0,
+            };
+            match create_attention_mask(&fused, &offset_cache(offset), Some(true), stream)? {
+                Some(AttentionMask::Array(mask)) => Some(mask),
+                Some(AttentionMask::Causal) => {
+                    return Err(Exception::custom("Qwen MTP requires an array causal mask"));
+                }
+                None => None,
+            }
+        } else {
+            None
+        };
+        let input = BlockInput {
+            x: &fused,
+            mask: mask.as_ref(),
+            cache: Some(layer_cache),
+        };
+        let fused = match tensor_group {
+            Some(group) => {
+                layer.forward_tensor_with_expert_executor(input, group, stream, execute)?
+            }
+            None => layer.forward_sparse_experts(input, stream, execute)?,
+        };
         self.norm.forward(&fused, stream)
     }
 

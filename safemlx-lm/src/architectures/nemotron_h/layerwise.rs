@@ -53,9 +53,9 @@ use crate::{
     },
     runtime::distributed::parallel::{
         aligned_partition_units, array_parameter_member, partitioned_projection_members,
-        register_partitioned_projection_group, register_replicated_module, MemberSharding,
-        ParallelPlanBuilder, ParameterGroupSpec, ParameterMemberSpec, ParameterRole,
-        ProjectionSharding,
+        register_partitioned_projection_group, register_projection_module,
+        register_replicated_module, MemberSharding, ParallelPlanBuilder, ParameterGroupSpec,
+        ParameterMemberSpec, ParameterRole, ProjectionSharding,
     },
     runtime::execution::layerwise::{
         load_layerwise_model, load_layerwise_model_with_quantization,
@@ -74,6 +74,9 @@ const EMBEDDING_UNIT: &str = "nemotron_h.static.embedding";
 const NORM_UNIT: &str = "nemotron_h.static.norm";
 const HEAD_UNIT: &str = "nemotron_h.static.output";
 const MTP_UNIT: &str = "nemotron_h.static.mtp";
+
+type NemotronMtpExpertExecutor<'a> =
+    dyn FnMut(usize, &Array, &Array, &Array, &Stream) -> Result<Array, Exception> + 'a;
 
 #[derive(Debug, Clone, ModuleParameters)]
 struct NemotronMtpModule {
@@ -179,7 +182,9 @@ impl NemotronMtpModule {
         depth: usize,
         cache: &mut [LayerCache],
         expert_cache: Option<&ExpertCache>,
+        mut external_expert: Option<&mut NemotronMtpExpertExecutor<'_>>,
         args: &ModelArgs,
+        execution: Option<&crate::runtime::distributed::parallel::ParallelExecutionContext<'_>>,
         stream: &Stream,
     ) -> Result<Array, Exception> {
         if cache.len() != self.blocks.len() || depth >= self.steps {
@@ -223,34 +228,68 @@ impl NemotronMtpModule {
                 cache: Some(layer_cache),
             };
             hidden = if self.policies[index] == LayerPolicy::SparseMoe {
-                if let Some(expert_cache) = expert_cache {
+                if expert_cache.is_some() || external_expert.is_some() {
                     let global = args.num_hidden_layers as usize + index;
                     let pass = if hidden.dim(1) > 1 {
                         ExpertPass::Prefill
                     } else {
                         ExpertPass::Decode
                     };
-                    block.forward_sparse_experts(
-                        input,
-                        stream,
-                        |flat, indices, weights, stream| {
-                            execute_cached_nemotron_experts(
-                                args,
-                                expert_cache,
-                                global,
-                                flat,
-                                indices,
-                                weights,
-                                pass,
-                                stream,
-                            )
-                        },
-                    )?
+                    let execute =
+                        |flat: &Array, indices: &Array, weights: &Array, stream: &Stream| {
+                            if let Some(execute) = external_expert.as_deref_mut() {
+                                execute(global, flat, indices, weights, stream)
+                            } else {
+                                execute_cached_nemotron_experts(
+                                    args,
+                                    expert_cache.expect("checked Nemotron-H MTP expert source"),
+                                    global,
+                                    flat,
+                                    indices,
+                                    weights,
+                                    pass,
+                                    stream,
+                                )
+                            }
+                        };
+                    match execution.filter(|execution| execution.is_tensor_parallel()) {
+                        Some(execution) => block.forward_tensor_with_expert_executor(
+                            input,
+                            execution.group().ok_or_else(|| {
+                                Exception::custom(
+                                    "Nemotron-H MTP TP execution is missing its group",
+                                )
+                            })?,
+                            stream,
+                            execute,
+                        )?,
+                        None => block.forward_sparse_experts(input, stream, execute)?,
+                    }
                 } else {
-                    block.forward(input, stream)?
+                    match execution.filter(|execution| execution.is_tensor_parallel()) {
+                        Some(execution) => block.forward_tensor_parallel(
+                            input,
+                            execution.group().ok_or_else(|| {
+                                Exception::custom(
+                                    "Nemotron-H MTP TP execution is missing its group",
+                                )
+                            })?,
+                            stream,
+                        )?,
+                        None => block.forward(input, stream)?,
+                    }
                 }
             } else {
-                block.forward(input, stream)?
+                match execution.filter(|execution| execution.is_tensor_parallel()) {
+                    Some(execution) => block.forward_tensor_parallel(
+                        input,
+                        execution.group().ok_or_else(|| {
+                            Exception::custom("Nemotron-H MTP TP execution is missing its group")
+                        })?,
+                        stream,
+                    )?,
+                    None => block.forward(input, stream)?,
+                }
             };
         }
         self.final_norms[depth].forward(&hidden, stream)
@@ -263,7 +302,22 @@ fn register_nemotron_layer_parallel_plan(
     args: &ModelArgs,
     index: usize,
 ) -> Result<(), Error> {
-    let prefix = format!("model.layers.{index}");
+    register_nemotron_layer_parallel_plan_at(
+        planner,
+        layer,
+        args,
+        index,
+        &format!("model.layers.{index}"),
+    )
+}
+
+fn register_nemotron_layer_parallel_plan_at(
+    planner: &mut ParallelPlanBuilder,
+    layer: &TransformerBlock,
+    args: &ModelArgs,
+    index: usize,
+    prefix: &str,
+) -> Result<(), Error> {
     register_replicated_module(planner, &layer.norm, &format!("{prefix}.norm"))?;
     match layer.policy {
         LayerPolicy::Mamba => {
@@ -527,6 +581,20 @@ pub struct NemotronHLayerwiseModel {
     execution: LayerwiseModel<NemotronHLayerwiseAdapter>,
 }
 
+pub(crate) struct NemotronHTensorMtpTarget<'a> {
+    model: &'a mut NemotronHLayerwiseModel,
+    group: &'a safemlx::distributed::Group,
+}
+
+impl<'a> NemotronHTensorMtpTarget<'a> {
+    pub(crate) fn new(
+        model: &'a mut NemotronHLayerwiseModel,
+        group: &'a safemlx::distributed::Group,
+    ) -> Self {
+        Self { model, group }
+    }
+}
+
 impl NemotronHLayerwiseModel {
     /// Returns validated model arguments.
     pub fn args(&self) -> &ModelArgs {
@@ -594,7 +662,9 @@ impl NemotronHLayerwiseModel {
                 depth,
                 cache,
                 expert_cache,
+                None,
                 args,
+                None,
                 stream,
             )?;
         let logits = project_logits_maybe_quantized(
@@ -603,6 +673,94 @@ impl NemotronHLayerwiseModel {
             &hidden,
             stream,
         )?;
+        Ok(
+            crate::runtime::generation::embedded_mtp::EmbeddedMtpOutput {
+                logits,
+                hidden,
+                tokens: tokens.clone(),
+            },
+        )
+    }
+
+    fn forward_mtp_target_tensor(
+        &mut self,
+        tokens: &Array,
+        cache: &mut Cache,
+        group: &safemlx::distributed::Group,
+        stream: &Stream,
+    ) -> Result<crate::runtime::generation::embedded_mtp::EmbeddedMtpOutput, Exception> {
+        let (logits, context) = self
+            .execution
+            .forward_tensor_parallel_with_context(tokens, cache, group, stream)
+            .map_err(|error| Exception::custom(error.to_string()))?;
+        Ok(
+            crate::runtime::generation::embedded_mtp::EmbeddedMtpOutput {
+                logits,
+                hidden: context.draft_hidden.ok_or_else(|| {
+                    Exception::custom("Nemotron-H tensor pass did not retain MTP hidden state")
+                })?,
+                tokens: tokens.clone(),
+            },
+        )
+    }
+
+    fn forward_mtp_draft_tensor(
+        &mut self,
+        hidden: &Array,
+        tokens: &Array,
+        depth: usize,
+        cache: &mut [LayerCache],
+        group: &safemlx::distributed::Group,
+        stream: &Stream,
+    ) -> Result<crate::runtime::generation::embedded_mtp::EmbeddedMtpOutput, Exception> {
+        let topology = self
+            .parallel_info()
+            .ok_or_else(|| Exception::custom("Nemotron-H MTP target has no parallel topology"))?
+            .topology();
+        let execution =
+            crate::runtime::distributed::parallel::ParallelExecutionContext::tensor_parallel(
+                topology, group, stream,
+            )
+            .map_err(|error| Exception::custom(error.to_string()))?;
+        let adapter = self.execution.adapter_mut();
+        let embeddings = adapter
+            .parallel_embedding
+            .as_mut()
+            .ok_or_else(|| Exception::custom("Nemotron-H MTP has no TP embedding shard"))?
+            .forward(tokens, &execution)
+            .map_err(|error| Exception::custom(error.to_string()))?;
+        let expert_cache = adapter.expert_cache.as_ref();
+        let args = &adapter.args;
+        let hidden = adapter
+            .mtp
+            .as_mut()
+            .ok_or_else(|| Exception::custom("Nemotron-H checkpoint does not contain MTP layers"))?
+            .forward_step(
+                hidden,
+                &embeddings,
+                depth,
+                cache,
+                expert_cache,
+                None,
+                args,
+                Some(&execution),
+                stream,
+            )?;
+        let logits = match (
+            adapter.parallel_lm_head.as_mut(),
+            adapter.parallel_embedding.as_mut(),
+        ) {
+            (Some(head), _) => head
+                .forward(&hidden, &execution)
+                .and_then(|output| output.all_gather(&execution)),
+            (None, Some(embedding)) => embedding
+                .project_logits(&hidden, &execution)
+                .and_then(|output| output.all_gather(&execution)),
+            (None, None) => Err(Error::Parallel(
+                "Nemotron-H MTP has no TP output projection".into(),
+            )),
+        }
+        .map_err(|error| Exception::custom(error.to_string()))?;
         Ok(
             crate::runtime::generation::embedded_mtp::EmbeddedMtpOutput {
                 logits,
@@ -797,6 +955,157 @@ impl NemotronHLayerwiseModel {
         )
     }
 
+    pub(crate) fn forward_mtp_target_with_expert_executor<F>(
+        &mut self,
+        inputs: &Array,
+        cache: &mut Cache,
+        tensor_group: Option<&safemlx::distributed::Group>,
+        mut execute: F,
+        stream: &Stream,
+    ) -> Result<crate::runtime::generation::embedded_mtp::EmbeddedMtpOutput, Exception>
+    where
+        F: FnMut(usize, &Array, &Array, &Array, &Stream) -> Result<Array, Exception>,
+    {
+        let (logits, context) = match tensor_group {
+            Some(tensor_group) => self
+                .execution
+                .forward_tensor_parallel_with_layer_executor_and_context(
+                    inputs,
+                    cache,
+                    tensor_group,
+                    stream,
+                    |_adapter, _group, index, layer, hidden, cache, context, execution| {
+                        Ok(layer.forward_tensor_with_expert_executor(
+                            BlockInput {
+                                x: hidden,
+                                mask: context.mask.as_ref(),
+                                cache: Some(&mut cache.layers[index]),
+                            },
+                            execution.group().ok_or_else(|| {
+                                Error::Parallel(
+                                    "Nemotron-H TP+EP MTP target is missing its TP group".into(),
+                                )
+                            })?,
+                            execution.stream(),
+                            |hidden, ids, weights, stream| {
+                                execute(index, hidden, ids, weights, stream)
+                            },
+                        )?)
+                    },
+                ),
+            None => self.execution.forward_with_layer_executor_and_context(
+                inputs,
+                cache,
+                stream,
+                |_adapter, _group, index, layer, hidden, cache, context, stream| {
+                    Ok(layer.forward_sparse_experts(
+                        BlockInput {
+                            x: hidden,
+                            mask: context.mask.as_ref(),
+                            cache: Some(&mut cache.layers[index]),
+                        },
+                        stream,
+                        |hidden, ids, weights, stream| execute(index, hidden, ids, weights, stream),
+                    )?)
+                },
+            ),
+        }
+        .map_err(|error| Exception::custom(error.to_string()))?;
+        Ok(
+            crate::runtime::generation::embedded_mtp::EmbeddedMtpOutput {
+                logits,
+                hidden: context.draft_hidden.ok_or_else(|| {
+                    Exception::custom("Nemotron-H EP pass did not retain MTP hidden state")
+                })?,
+                tokens: inputs.clone(),
+            },
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn forward_mtp_draft_with_expert_executor<F>(
+        &mut self,
+        hidden: &Array,
+        tokens: &Array,
+        depth: usize,
+        cache: &mut [LayerCache],
+        tensor_group: Option<&safemlx::distributed::Group>,
+        mut execute: F,
+        stream: &Stream,
+    ) -> Result<crate::runtime::generation::embedded_mtp::EmbeddedMtpOutput, Exception>
+    where
+        F: FnMut(usize, &Array, &Array, &Array, &Stream) -> Result<Array, Exception>,
+    {
+        let topology = self
+            .parallel_info()
+            .ok_or_else(|| Exception::custom("Nemotron-H EP MTP target has no topology"))?
+            .topology();
+        let execution = tensor_group
+            .map(|group| {
+                crate::runtime::distributed::parallel::ParallelExecutionContext::tensor_parallel(
+                    topology, group, stream,
+                )
+            })
+            .transpose()
+            .map_err(|error| Exception::custom(error.to_string()))?;
+        let adapter = self.execution.adapter_mut();
+        let embeddings = match execution.as_ref() {
+            Some(execution) => adapter
+                .parallel_embedding
+                .as_mut()
+                .ok_or_else(|| Exception::custom("Nemotron-H MTP has no TP embedding shard"))?
+                .forward(tokens, execution)
+                .map_err(|error| Exception::custom(error.to_string()))?,
+            None => adapter.embeddings.forward(tokens, stream)?,
+        };
+        let args = &adapter.args;
+        let hidden = adapter
+            .mtp
+            .as_mut()
+            .ok_or_else(|| Exception::custom("Nemotron-H checkpoint does not contain MTP layers"))?
+            .forward_step(
+                hidden,
+                &embeddings,
+                depth,
+                cache,
+                None,
+                Some(&mut execute),
+                args,
+                execution.as_ref(),
+                stream,
+            )?;
+        let logits = match execution.as_ref() {
+            Some(execution) => match (
+                adapter.parallel_lm_head.as_mut(),
+                adapter.parallel_embedding.as_mut(),
+            ) {
+                (Some(head), _) => head
+                    .forward(&hidden, execution)
+                    .and_then(|output| output.all_gather(execution)),
+                (None, Some(embedding)) => embedding
+                    .project_logits(&hidden, execution)
+                    .and_then(|output| output.all_gather(execution)),
+                (None, None) => Err(Error::Parallel(
+                    "Nemotron-H MTP has no TP output projection".into(),
+                )),
+            }
+            .map_err(|error| Exception::custom(error.to_string()))?,
+            None => project_logits_maybe_quantized(
+                &mut adapter.lm_head,
+                &mut adapter.embeddings,
+                &hidden,
+                stream,
+            )?,
+        };
+        Ok(
+            crate::runtime::generation::embedded_mtp::EmbeddedMtpOutput {
+                logits,
+                hidden,
+                tokens: tokens.clone(),
+            },
+        )
+    }
+
     /// Clears temporary hybrid blocks from the execution device.
     pub fn clear_device_layer_window(&self) -> Result<(), Error> {
         self.execution.clear_device_group("text_decoder")
@@ -909,6 +1218,116 @@ impl crate::runtime::generation::embedded_mtp::EmbeddedMtpTarget for NemotronHLa
     }
     fn max_draft_tokens(&self) -> usize {
         self.mtp_len()
+    }
+}
+
+impl crate::runtime::generation::embedded_mtp::EmbeddedMtpTarget for NemotronHTensorMtpTarget<'_> {
+    type Cache = Cache;
+    type DraftCache = Vec<LayerCache>;
+
+    fn prefill_target(
+        &mut self,
+        input: input::ModelInput<'_>,
+        cache: &mut Cache,
+        stream: &Stream,
+    ) -> Result<crate::runtime::generation::embedded_mtp::EmbeddedMtpOutput, Exception> {
+        let tokens = input::text_token_ids(input, stream)?;
+        cache.reset()?;
+        self.model
+            .forward_mtp_target_tensor(&tokens, cache, self.group, stream)
+    }
+
+    fn verify_target(
+        &mut self,
+        tokens: &Array,
+        cache: &mut Cache,
+        stream: &Stream,
+    ) -> Result<crate::runtime::generation::embedded_mtp::EmbeddedMtpOutput, Exception> {
+        self.model
+            .forward_mtp_target_tensor(tokens, cache, self.group, stream)
+    }
+
+    fn prefill_draft_cache(
+        &mut self,
+        output: &crate::runtime::generation::embedded_mtp::EmbeddedMtpOutput,
+        tokens: &Array,
+        cache: &mut Cache,
+        stream: &Stream,
+    ) -> Result<(), Exception> {
+        let sequence = tokens.dim(1);
+        if sequence <= 1 {
+            return Ok(());
+        }
+        let hidden = output
+            .hidden
+            .try_index_device((.., ..sequence - 1, ..), stream)?;
+        let next = tokens.try_index_device((.., 1..), stream)?;
+        for depth in 0..self.model.mtp_len() {
+            let _ = self.model.forward_mtp_draft_tensor(
+                &hidden,
+                &next,
+                depth,
+                &mut cache.mtp_layers,
+                self.group,
+                stream,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn draft_cache(cache: &Cache) -> Self::DraftCache {
+        cache.mtp_layers.clone()
+    }
+
+    fn commit_draft_cache(cache: &mut Cache, draft: &Self::DraftCache) {
+        cache.mtp_layers.clone_from(draft);
+    }
+
+    fn restore_target_checkpoint(
+        cache: &mut Cache,
+        checkpoint: &Cache,
+        stream: &Stream,
+    ) -> Result<(), Exception> {
+        cache.restore_target_checkpoint(checkpoint, stream)
+    }
+
+    fn draft_logits(
+        &mut self,
+        hidden: &Array,
+        last_token: u32,
+        draft_index: usize,
+        cache: &mut Self::DraftCache,
+        stream: &Stream,
+    ) -> Result<(Array, Array), Exception> {
+        let token = Array::from_slice(&[last_token], &[1, 1]);
+        let output = self.model.forward_mtp_draft_tensor(
+            hidden,
+            &token,
+            draft_index,
+            cache,
+            self.group,
+            stream,
+        )?;
+        Ok((output.logits, output.hidden))
+    }
+
+    fn advance_draft_cache(
+        &mut self,
+        hidden: &Array,
+        tokens: &Array,
+        cache: &mut Self::DraftCache,
+        stream: &Stream,
+    ) -> Result<(), Exception> {
+        for depth in 0..self.model.mtp_len() {
+            let _ = self
+                .model
+                .forward_mtp_draft_tensor(hidden, tokens, depth, cache, self.group, stream)?;
+        }
+        Ok(())
+    }
+
+    fn max_draft_tokens(&self) -> usize {
+        self.model.mtp_len()
     }
 }
 
@@ -1340,6 +1759,113 @@ impl NemotronHLayerwiseAdapter {
     /// Returns the configured rank-local hybrid operator geometry.
     pub(crate) fn parallel_geometry(&self) -> Option<&[resident::ParallelLayerGeometry]> {
         self.parallel_geometry.as_deref()
+    }
+
+    pub(crate) fn pipeline_static_mut(&mut self, role: &str) -> Option<&mut dyn ModuleParameters> {
+        match role {
+            "embedding" => {
+                if let Some(module) = &mut self.parallel_embedding {
+                    Some(module.inner_mut())
+                } else {
+                    Some(&mut self.embeddings)
+                }
+            }
+            "output" => self
+                .parallel_lm_head
+                .as_mut()
+                .map(|module| module.inner_mut() as &mut dyn ModuleParameters)
+                .or_else(|| {
+                    self.lm_head
+                        .as_mut()
+                        .map(|module| module as &mut dyn ModuleParameters)
+                }),
+            "mtp" => self
+                .mtp
+                .as_mut()
+                .map(|module| module as &mut dyn ModuleParameters),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn embedded_mtp_len(&self) -> usize {
+        self.mtp.as_ref().map_or(0, NemotronMtpModule::len)
+    }
+
+    pub(crate) fn embedded_mtp_cache(&self) -> Vec<LayerCache> {
+        self.new_cache().mtp_layers
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn forward_pipeline_mtp<F>(
+        &mut self,
+        hidden: &Array,
+        tokens: &Array,
+        depth: usize,
+        cache: &mut [LayerCache],
+        execution: Option<&crate::runtime::distributed::parallel::ParallelExecutionContext<'_>>,
+        external_expert: Option<&mut F>,
+        stream: &Stream,
+    ) -> Result<crate::runtime::generation::embedded_mtp::EmbeddedMtpOutput, Exception>
+    where
+        F: FnMut(usize, &Array, &Array, &Array, &Stream) -> Result<Array, Exception>,
+    {
+        let embeddings = match execution.filter(|execution| execution.is_tensor_parallel()) {
+            Some(execution) => self
+                .parallel_embedding
+                .as_mut()
+                .ok_or_else(|| {
+                    Exception::custom("Nemotron-H pipeline MTP has no TP embedding shard")
+                })?
+                .forward(tokens, execution)
+                .map_err(|error| Exception::custom(error.to_string()))?,
+            None => self.embeddings.forward(tokens, stream)?,
+        };
+        let expert_cache = self.expert_cache.as_ref();
+        let hidden = self
+            .mtp
+            .as_mut()
+            .ok_or_else(|| Exception::custom("Nemotron-H checkpoint does not contain MTP layers"))?
+            .forward_step(
+                hidden,
+                &embeddings,
+                depth,
+                cache,
+                expert_cache,
+                external_expert.map(|execute| execute as &mut NemotronMtpExpertExecutor<'_>),
+                &self.args,
+                execution,
+                stream,
+            )?;
+        let logits = match execution.filter(|execution| execution.is_tensor_parallel()) {
+            Some(execution) => match (
+                self.parallel_lm_head.as_mut(),
+                self.parallel_embedding.as_mut(),
+            ) {
+                (Some(head), _) => head
+                    .forward(&hidden, execution)
+                    .and_then(|output| output.all_gather(execution)),
+                (None, Some(embedding)) => embedding
+                    .project_logits(&hidden, execution)
+                    .and_then(|output| output.all_gather(execution)),
+                (None, None) => Err(Error::Parallel(
+                    "Nemotron-H pipeline MTP has no TP output projection".into(),
+                )),
+            }
+            .map_err(|error| Exception::custom(error.to_string()))?,
+            None => project_logits_maybe_quantized(
+                &mut self.lm_head,
+                &mut self.embeddings,
+                &hidden,
+                stream,
+            )?,
+        };
+        Ok(
+            crate::runtime::generation::embedded_mtp::EmbeddedMtpOutput {
+                logits,
+                hidden,
+                tokens: tokens.clone(),
+            },
+        )
     }
 
     fn new_cache(&self) -> Cache {
@@ -1878,7 +2404,13 @@ impl ArchitectureAdapter for NemotronHLayerwiseAdapter {
             if let Some(mtp) = &self.mtp {
                 units.push(StaticUnitBindings::new(
                     MTP_UNIT,
-                    build_module_bindings_with_recipes(mtp, "", store, self.mtp_recipes(store)?)?,
+                    build_module_bindings_with_recipes_excluding(
+                        mtp,
+                        "",
+                        store,
+                        self.mtp_recipes(store)?,
+                        |name| self.sparse_expert_cache && name.contains(".moe.experts."),
+                    )?,
                 )?);
             }
         }
@@ -1908,7 +2440,13 @@ impl ArchitectureAdapter for NemotronHLayerwiseAdapter {
             index += 1;
         }
         if let Some(mtp) = &mut self.mtp {
-            populate_module_from_lease(mtp, &leases[index])?;
+            if self.sparse_expert_cache {
+                populate_module_from_lease_excluding(mtp, &leases[index], |name| {
+                    name.contains(".moe.experts.")
+                })?;
+            } else {
+                populate_module_from_lease(mtp, &leases[index])?;
+            }
         }
         Ok(())
     }
@@ -2155,6 +2693,37 @@ impl ArchitectureAdapter for NemotronHLayerwiseAdapter {
             let layer = TransformerBlock::new(&self.args, index, stream)?;
             register_nemotron_layer_parallel_plan(planner, &layer, &self.args, index)?;
         }
+        if let Some(mtp) = &self.mtp {
+            for step in 0..mtp.steps {
+                for (name, module) in [
+                    (format!("enorm.{step}"), &mtp.enorm[step]),
+                    (format!("hnorm.{step}"), &mtp.hnorm[step]),
+                    (format!("final_norms.{step}"), &mtp.final_norms[step]),
+                ] {
+                    register_replicated_module(planner, module, &name)?;
+                }
+                register_projection_module(
+                    planner,
+                    &mtp.eh_proj[step],
+                    &format!("eh_proj.{step}"),
+                    ProjectionSharding::Replicated,
+                )?;
+            }
+            let mut extended = self.args.clone();
+            let mut policies = self.args.layer_schedule.iter().copied().collect::<Vec<_>>();
+            policies.extend(mtp.policies.iter().copied());
+            extended.layer_schedule = crate::LayerSchedule::new(policies.len(), policies)
+                .map_err(|error| Error::Parallel(error.to_string()))?;
+            for (index, block) in mtp.blocks.iter().enumerate() {
+                register_nemotron_layer_parallel_plan_at(
+                    planner,
+                    block,
+                    &extended,
+                    self.args.num_hidden_layers as usize + index,
+                    &format!("blocks.{index}"),
+                )?;
+            }
+        }
         Ok(())
     }
     fn configure_parallel_static(
@@ -2185,16 +2754,17 @@ impl ArchitectureAdapter for NemotronHLayerwiseAdapter {
                 "missing Nemotron-H TP projection layout for {prefix}"
             )))
         };
-        let mut geometry = Vec::with_capacity(self.args.layer_schedule.len());
-        for (index, policy) in self.args.layer_schedule.iter().enumerate() {
-            let prefix = format!("model.layers.{index}");
-            geometry.push(match policy {
+        let geometry_for = |policy: LayerPolicy,
+                            prefix: &str|
+         -> Result<resident::ParallelLayerGeometry, Error> {
+            Ok(match policy {
                 LayerPolicy::Mamba => {
                     let heads = local_dimension(&format!("{prefix}.mamba.dt_bias"), 0)?;
                     let conv = local_dimension(&format!("{prefix}.mamba.conv1d.weight"), 0)?;
-                    let intermediate = heads.checked_mul(self.args.mamba_head_dim).ok_or_else(|| {
-                        Error::Parallel("Nemotron-H local Mamba width overflowed".into())
-                    })?;
+                    let intermediate =
+                        heads.checked_mul(self.args.mamba_head_dim).ok_or_else(|| {
+                            Error::Parallel("Nemotron-H local Mamba width overflowed".into())
+                        })?;
                     let grouped = conv.checked_sub(intermediate).ok_or_else(|| {
                         Error::Parallel("Nemotron-H local convolution width is inconsistent".into())
                     })?;
@@ -2230,7 +2800,12 @@ impl ArchitectureAdapter for NemotronHLayerwiseAdapter {
                         0,
                     )?,
                 },
-            });
+            })
+        };
+        let mut geometry = Vec::with_capacity(self.args.layer_schedule.len());
+        for (index, policy) in self.args.layer_schedule.iter().enumerate() {
+            let prefix = format!("model.layers.{index}");
+            geometry.push(geometry_for(*policy, &prefix)?);
         }
         self.parallel_geometry = Some(geometry);
         self.parallel_embedding = Some(VocabParallelEmbedding::unloaded(
@@ -2248,6 +2823,23 @@ impl ArchitectureAdapter for NemotronHLayerwiseAdapter {
                 context,
                 stream,
             )?);
+        }
+        if let Some(mtp) = &mut self.mtp {
+            let mut extended = self.args.clone();
+            let mut policies = self.args.layer_schedule.iter().copied().collect::<Vec<_>>();
+            policies.extend(mtp.policies.iter().copied());
+            extended.layer_schedule = crate::LayerSchedule::new(policies.len(), policies)
+                .map_err(|error| Error::Parallel(error.to_string()))?;
+            for (index, block) in mtp.blocks.iter_mut().enumerate() {
+                let prefix = format!("blocks.{index}");
+                let geometry = geometry_for(mtp.policies[index], &prefix)?;
+                *block = TransformerBlock::new_parallel_layerwise(
+                    &extended,
+                    self.args.num_hidden_layers as usize + index,
+                    geometry,
+                    stream,
+                )?;
+            }
         }
         Ok(())
     }
@@ -2552,6 +3144,31 @@ pub(crate) fn nemotron_h_expert_catalog(
             global,
             &format!("mtp.layers.{physical}.moe.experts"),
         )?);
+    }
+    Ok(entries)
+}
+
+pub(crate) fn nemotron_h_pipeline_expert_catalog(
+    args: &ModelArgs,
+    store: &dyn WeightStore,
+    layers: impl IntoIterator<Item = usize>,
+    include_mtp: bool,
+) -> Result<Vec<ExpertCatalogEntry>, Error> {
+    let mut entries = nemotron_h_expert_catalog_for_layers(args, store, layers)?;
+    if include_mtp {
+        let normalized = normalized_checkpoint_keys(store, args)?;
+        for (physical, policy) in args.mtp_policies()?.into_iter().enumerate() {
+            if policy != LayerPolicy::SparseMoe {
+                continue;
+            }
+            entries.extend(nemotron_expert_entries(
+                args,
+                &normalized,
+                store,
+                args.num_hidden_layers as usize + physical,
+                &format!("mtp.layers.{physical}.moe.experts"),
+            )?);
+        }
     }
     Ok(entries)
 }

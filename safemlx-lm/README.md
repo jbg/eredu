@@ -454,6 +454,8 @@ block-FP8 checkpoints. Appended multi-token-prediction non-expert weights are a
 pinned static unit with independent compressed caches and execute through the
 shared embedded-MTP scheduler; under independent expert residency their routed
 banks use the same bounded catalog and route executor as backbone MoE layers.
+That catalog identity extends past the backbone layer range and is also the
+authoritative EP ownership map for pipeline and triple-axis prediction.
 
 Dense/MoE topology is represented only by
 `LayerSchedule<architectures::deepseek_v3::model::LayerPolicy>`, whose entries
@@ -1094,11 +1096,6 @@ formats. Dense families have no EP migration.
 | Moshi/PersonaPlex | TP | Not applicable | Its temporal/depth runtime has no PP or EP constituent axis |
 
 The remaining global limitations are:
-
-- Embedded MTP is currently exposed by single-model execution. Parallel model
-  instances fail capability dispatch before generation until prediction-layer
-  TP sharding, EP exchange, and pipeline ownership are registered in the
-  Cartesian planner; target-model TP/PP/EP inference itself is unaffected.
 
 - The shared bounded materialisation store supports out-of-core affine and
   MXFP4 conversion from row-bounded SafeTensors or dense GGUF semantic recipes.
@@ -1786,7 +1783,16 @@ Qwen3-Next, and Qwen3.5/3.6 safetensors checkpoints execute their native heads
 through `generate_embedded_mtp_input`; resident and bounded-layer loading are
 supported, attention-bearing draft caches participate in live paging, and
 DeepSeek/Nemotron routed prediction experts participate in independent bounded
-expert residency.
+expert residency. The same semantic predictor adapters execute through
+`generate_embedded_mtp_cartesian` for TP, PP, EP, every pairwise combination,
+and TP+PP+EP. Predictor projections use planner-derived TP geometry, routed
+predictor experts use the topology-derived EP subgroup and rank-owned expert
+catalog, and only the final PP coordinate owns predictor static weights and
+draft state. Target verification, predictor output publication, sampling,
+failure, and cancellation are synchronized over the Cartesian world while PP
+transport remains lane-local to matching non-PP coordinates. Pipeline stage
+reports expose `owns_embedded_mtp` and `embedded_mtp_layers` alongside the full
+topology coordinates.
 Inkling preserves per-depth full/sliding attention and optional chain
 normalization; Nemotron-H repeats its configured physical MTP pattern without
 assuming a particular number of steps. Text batches use independent backbone

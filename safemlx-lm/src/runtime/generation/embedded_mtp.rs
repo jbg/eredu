@@ -1,6 +1,14 @@
 //! Shared speculative backend for checkpoint-embedded prediction heads.
 
-use safemlx::{error::Exception, ops::indexing::TryIndexOp, Array, Stream};
+use safemlx::{
+    distributed::{self, Group},
+    error::Exception,
+    module::{Module, ModuleParamMut, ModuleParamRef, ModuleParameters},
+    nn,
+    ops::indexing::TryIndexOp,
+    quantization::MaybeQuantized,
+    Array, Stream,
+};
 
 use crate::{
     api::input::ModelInput,
@@ -13,6 +21,236 @@ use crate::{
         streaming::{FinishReason, GenerationCancellationToken, SemanticEvent},
     },
 };
+
+/// Sampler wrapper that keeps PRNG and grammar state identical on every rank
+/// while selecting one topology-owned sampling coordinate.
+#[derive(Clone)]
+pub(crate) struct DistributedEmbeddedMtpSampler<'a, S> {
+    sampler: S,
+    sampling_rank: usize,
+    group: &'a Group,
+}
+
+impl<'a, S> DistributedEmbeddedMtpSampler<'a, S> {
+    pub(crate) fn new(sampler: S, sampling_rank: usize, group: &'a Group) -> Result<Self, Error> {
+        if sampling_rank >= group.size() {
+            return Err(Error::Parallel(format!(
+                "embedded MTP sampling rank {sampling_rank} is outside world size {}",
+                group.size()
+            )));
+        }
+        Ok(Self {
+            sampler,
+            sampling_rank,
+            group,
+        })
+    }
+
+    pub(crate) fn into_inner(self) -> S {
+        self.sampler
+    }
+}
+
+impl<S: SpeculativeSampler> SpeculativeSampler for DistributedEmbeddedMtpSampler<'_, S> {
+    fn supports_exact_optimistic_promotion(&self) -> bool {
+        false
+    }
+
+    fn grammar_is_complete(&mut self) -> Result<bool, Exception> {
+        self.sampler.grammar_is_complete()
+    }
+
+    fn prefix_is_complete(&self, history: &[u32]) -> Result<bool, Exception> {
+        self.sampler.prefix_is_complete(history)
+    }
+
+    fn process_logits(
+        &mut self,
+        logits: &Array,
+        temperature: f32,
+        history: &[u32],
+        stream: &Stream,
+    ) -> Result<Array, Exception> {
+        self.sampler
+            .process_logits(logits, temperature, history, stream)
+    }
+
+    fn sample_processed(
+        &self,
+        logits: &Array,
+        temperature: f32,
+        prng_state: Option<&mut safemlx::random::RandomState>,
+        stream: &Stream,
+    ) -> Result<Array, Exception> {
+        let sampled = self
+            .sampler
+            .sample_processed(logits, temperature, prng_state, stream)?;
+        let selected = if self.group.rank() == self.sampling_rank {
+            sampled
+        } else {
+            safemlx::ops::zeros_dtype(sampled.shape(), sampled.dtype(), stream)?
+        };
+        distributed::all_sum(&selected, self.group, stream)
+    }
+
+    fn commit_token(
+        &mut self,
+        processed_logits: &Array,
+        token: u32,
+        stream: &Stream,
+    ) -> Result<(), Exception> {
+        self.sampler.commit_token(processed_logits, token, stream)
+    }
+}
+
+use crate::{
+    error::Error,
+    nn::parallel::VocabParallelLmHead,
+    runtime::{
+        checkpoint::quantization::WeightQuantization,
+        distributed::parallel::{ParallelBuildContext, ParallelExecutionContext},
+    },
+};
+
+/// One vocabulary projection whose parameter tree stays stable when TP turns
+/// the physical storage into rank-local rows.
+///
+/// Keeping the active representation behind one module boundary means static
+/// residency, bounded conversion, and pipeline loading continue to address the
+/// same semantic parameter names in replicated and distributed execution.
+#[derive(Debug, Clone)]
+pub(crate) struct EmbeddedMtpVocabHead {
+    ordinary: MaybeQuantized<nn::Linear>,
+    parallel: Option<VocabParallelLmHead>,
+    input_dims: i32,
+    vocabulary: usize,
+    quantization: Option<WeightQuantization>,
+}
+
+impl EmbeddedMtpVocabHead {
+    pub(crate) fn new(
+        input_dims: i32,
+        vocabulary: usize,
+        quantization: Option<WeightQuantization>,
+        stream: &Stream,
+    ) -> Result<Self, Error> {
+        Ok(Self {
+            ordinary: crate::api::common::linear::unloaded_maybe_quantized_linear(
+                input_dims,
+                i32::try_from(vocabulary)
+                    .map_err(|_| Error::Parallel("MTP vocabulary exceeds i32".into()))?,
+                false,
+                quantization,
+                stream,
+            )?,
+            parallel: None,
+            input_dims,
+            vocabulary,
+            quantization,
+        })
+    }
+
+    pub(crate) fn configure_parallel(
+        &mut self,
+        context: ParallelBuildContext,
+        stream: &Stream,
+    ) -> Result<(), Error> {
+        self.parallel = Some(VocabParallelLmHead::unloaded(
+            self.input_dims,
+            self.vocabulary,
+            self.quantization,
+            context,
+            stream,
+        )?);
+        Ok(())
+    }
+
+    pub(crate) fn register(
+        &self,
+        planner: &mut crate::runtime::distributed::parallel::ParallelPlanBuilder,
+        prefix: &str,
+    ) -> Result<(), Error> {
+        planner.register(crate::nn::parallel::vocab_lm_head_parameter_group(
+            &self.ordinary,
+            prefix,
+            self.input_dims,
+            self.vocabulary,
+            false,
+        )?)
+    }
+
+    pub(crate) fn forward(
+        &mut self,
+        hidden: &Array,
+        execution: Option<&ParallelExecutionContext<'_>>,
+        stream: &Stream,
+    ) -> Result<Array, Exception> {
+        match (self.parallel.as_mut(), execution) {
+            (Some(head), Some(execution)) if execution.is_tensor_parallel() => head
+                .forward(hidden, execution)
+                .and_then(|output| output.all_gather(execution))
+                .map_err(|error| Exception::custom(error.to_string())),
+            (None, None) => self.ordinary.forward(hidden, stream),
+            (Some(_), None) => Err(Exception::custom(
+                "TP-sharded embedded MTP head requires a tensor execution context",
+            )),
+            (None, Some(execution)) if execution.is_tensor_parallel() => Err(Exception::custom(
+                "embedded MTP head was not configured for tensor parallelism",
+            )),
+            (None, Some(_)) => self.ordinary.forward(hidden, stream),
+            (Some(head), Some(execution)) => head
+                .forward(hidden, execution)
+                .and_then(|output| output.all_gather(execution))
+                .map_err(|error| Exception::custom(error.to_string())),
+        }
+    }
+
+    fn active(&self) -> &dyn ModuleParameters {
+        self.parallel
+            .as_ref()
+            .map_or(&self.ordinary as &dyn ModuleParameters, |head| head)
+    }
+
+    fn active_mut(&mut self) -> &mut dyn ModuleParameters {
+        self.parallel
+            .as_mut()
+            .map_or(&mut self.ordinary as &mut dyn ModuleParameters, |head| head)
+    }
+}
+
+impl ModuleParameters for EmbeddedMtpVocabHead {
+    fn num_parameters(&self) -> usize {
+        self.active().num_parameters()
+    }
+
+    fn parameters(&self) -> ModuleParamRef<'_> {
+        self.active().parameters()
+    }
+
+    fn parameters_mut(&mut self) -> ModuleParamMut<'_> {
+        self.active_mut().parameters_mut()
+    }
+
+    fn trainable_parameters(&self) -> ModuleParamRef<'_> {
+        self.active().trainable_parameters()
+    }
+
+    fn freeze_parameters(&mut self, recursive: bool) {
+        self.active_mut().freeze_parameters(recursive);
+    }
+
+    fn unfreeze_parameters(&mut self, recursive: bool) {
+        self.active_mut().unfreeze_parameters(recursive);
+    }
+
+    fn all_frozen(&self) -> Option<bool> {
+        self.active().all_frozen()
+    }
+
+    fn any_frozen(&self) -> Option<bool> {
+        self.active().any_frozen()
+    }
+}
 
 pub(crate) struct EmbeddedMtpOutput {
     pub(crate) logits: Array,

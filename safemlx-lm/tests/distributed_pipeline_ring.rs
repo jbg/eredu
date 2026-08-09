@@ -32,6 +32,7 @@ use safemlx_lm::{
         qwen::{dense as dense_qwen, hybrid::qwen3_5 as qwen_hybrid},
     },
     runtime::generation::sampler::DefaultSampler,
+    runtime::generation::speculative::{MtpCapability, MtpCheckpointKind, MtpConfig},
     runtime::{
         checkpoint::binding::canonical_checkpoint_name,
         checkpoint::quantization::{AffineQuantization, WeightQuantization},
@@ -485,9 +486,18 @@ fn pipeline_ring_worker() {
                             FixtureFamily::KimiLinear
                                 | FixtureFamily::Inkling
                                 | FixtureFamily::InklingMultimodal
-                        )))
+                        ))
+                    || matches!(
+                        family,
+                        FixtureFamily::Qwen3Next
+                            | FixtureFamily::Qwen3NextMoe
+                            | FixtureFamily::Qwen35
+                            | FixtureFamily::Qwen35Moe
+                            | FixtureFamily::Qwen35Multimodal
+                            | FixtureFamily::Qwen35MoeMultimodal
+                    ))
                     && expected_range.contains(&layer),
-                "rank {expected_rank} opened the wrong SafeTensors layer shard for {family:?}"
+                "rank {expected_rank} opened the wrong SafeTensors layer shard {layer} for {family:?}: {opened:?}"
             );
         }
     }
@@ -569,8 +579,18 @@ fn pipeline_ring_worker() {
     }
     if expert_cache {
         let report = model.expert_cache_report().unwrap();
-        let expected_experts =
-            family.expert_layer_count(expected_range.clone()) * info.local_expert_ids.len();
+        let predictor_expert_layers = usize::from(
+            info.is_last
+                && matches!(
+                    family,
+                    FixtureFamily::Qwen3NextMoe
+                        | FixtureFamily::Qwen35Moe
+                        | FixtureFamily::Qwen35MoeMultimodal
+                ),
+        ) * info.embedded_mtp_layers;
+        let expected_experts = (family.expert_layer_count(expected_range.clone())
+            + predictor_expert_layers)
+            * info.local_expert_ids.len();
         assert_eq!(report.is_some(), expected_experts > 0);
         if let Some(report) = report {
             assert_eq!(report.owned_experts, expected_experts);
@@ -812,6 +832,60 @@ fn pipeline_ring_worker() {
                 assert_eq!(report.device_resident_experts, 0);
             }
         }
+    }
+
+    if matches!(
+        family,
+        FixtureFamily::Qwen3Next
+            | FixtureFamily::Qwen3NextMoe
+            | FixtureFamily::Qwen35
+            | FixtureFamily::Qwen35Moe
+            | FixtureFamily::Qwen35Multimodal
+            | FixtureFamily::Qwen35MoeMultimodal
+    ) {
+        assert_eq!(
+            model.mtp_capability(),
+            MtpCapability::Ready {
+                checkpoint: MtpCheckpointKind::Embedded
+            }
+        );
+        assert_eq!(model.stage_info().owns_embedded_mtp, pipeline_rank == 1);
+        assert_eq!(
+            model.stage_info().embedded_mtp_layers,
+            usize::from(pipeline_rank == 1)
+        );
+        let owned_execution;
+        let execution = match cartesian.as_ref() {
+            Some(execution) => execution,
+            None => {
+                owned_execution =
+                    CartesianExecution::new(topology, Some(family.layer_count()), None, &group)
+                        .unwrap();
+                &owned_execution
+            }
+        };
+        let prompt = Array::from_slice(&[1u32, 2], &[1, 2]);
+        let parts = [safemlx_lm::runtime::media::input::InputPart::text_token_ids(&prompt)];
+        let mut mtp_cache = model.new_cache().unwrap();
+        let (generated, stats) = model
+            .generate_embedded_mtp_cartesian(
+                &mut mtp_cache,
+                safemlx_lm::runtime::media::input::ModelInput::new(&parts),
+                &MtpConfig {
+                    max_tokens: 3,
+                    max_draft_tokens: 1,
+                    temperature: 0.0,
+                    eos_token_ids: Vec::new(),
+                },
+                None,
+                &mut DefaultSampler,
+                execution,
+                &stream,
+            )
+            .unwrap();
+        assert_eq!(generated.len(), 3);
+        assert_eq!(stats.emitted_tokens, 3);
+        assert!(stats.draft_tokens > 0);
     }
 }
 
@@ -2685,7 +2759,7 @@ fn qwen_hybrid_config(model_type: &str) -> serde_json::Value {
         "vocab_size": 32,
         "hidden_size": 16,
         "num_hidden_layers": 2,
-        "mtp_num_hidden_layers": 0,
+        "mtp_num_hidden_layers": 1,
         "num_attention_heads": 2,
         "num_key_value_heads": 2,
         "head_dim": 8,

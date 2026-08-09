@@ -15,10 +15,10 @@ use std::{
 };
 
 use safemlx::{
-    distributed::{self, Group},
+    distributed::Group,
     error::Exception,
     module::{ModuleParameters, Param},
-    ops::{indexing::TryIndexOp, zeros_dtype, GgufCheckpoint, GgufMetadataValue},
+    ops::{indexing::TryIndexOp, GgufCheckpoint, GgufMetadataValue},
     transforms::eval,
     Array, Stream,
 };
@@ -49,6 +49,9 @@ use crate::{
         load_partition_from_store_on_streams, ParallelTopology, PlacementPlan, TensorPlacement,
     },
     runtime::execution::inspection::ActivationObserver,
+    runtime::generation::embedded_mtp::{
+        DistributedEmbeddedMtpSampler, EmbeddedMtpOutput, EmbeddedMtpTarget,
+    },
     runtime::generation::sampler::{DefaultSampler, Sampler, SpeculativeSampler},
     runtime::generation::speculative::{MtpCapability, MtpCheckpointKind, MtpConfig, MtpStats},
     runtime::residency::expert_cache::{
@@ -331,68 +334,21 @@ pub struct ExpertParallelModel {
 
 struct ExpertParallelQwenMtpTarget<'a> {
     model: &'a mut ExpertParallelModel,
+    tensor_group: Option<&'a Group>,
     group: &'a Group,
 }
 
 #[derive(Clone)]
-struct ExpertParallelSpeculativeSampler<'a, S> {
-    sampler: S,
-    sampling_rank: usize,
-    group: &'a Group,
+enum ExpertParallelMtpDraftCache {
+    DeepSeek(Vec<crate::runtime::cache::CompressedLatentCache>),
+    Inkling(Vec<inkling::LayerCache>),
+    NemotronH(Vec<nemotron_h::LayerCache>),
 }
 
-impl<S: SpeculativeSampler> SpeculativeSampler for ExpertParallelSpeculativeSampler<'_, S> {
-    fn supports_exact_optimistic_promotion(&self) -> bool {
-        false
-    }
-
-    fn grammar_is_complete(&mut self) -> Result<bool, Exception> {
-        self.sampler.grammar_is_complete()
-    }
-
-    fn prefix_is_complete(&self, history: &[u32]) -> Result<bool, Exception> {
-        self.sampler.prefix_is_complete(history)
-    }
-
-    fn process_logits(
-        &mut self,
-        logits: &Array,
-        temperature: f32,
-        history: &[u32],
-        stream: &Stream,
-    ) -> Result<Array, Exception> {
-        self.sampler
-            .process_logits(logits, temperature, history, stream)
-    }
-
-    fn sample_processed(
-        &self,
-        logits: &Array,
-        temperature: f32,
-        prng_state: Option<&mut safemlx::random::RandomState>,
-        stream: &Stream,
-    ) -> Result<Array, Exception> {
-        // Sample on every rank so identical PRNG states remain aligned, then
-        // retain only the designated rank's choice before synchronizing it.
-        let sampled = self
-            .sampler
-            .sample_processed(logits, temperature, prng_state, stream)?;
-        let selected = if self.group.rank() == self.sampling_rank {
-            sampled
-        } else {
-            zeros_dtype(sampled.shape(), sampled.dtype(), stream)?
-        };
-        distributed::all_sum(&selected, self.group, stream)
-    }
-
-    fn commit_token(
-        &mut self,
-        processed_logits: &Array,
-        token: u32,
-        stream: &Stream,
-    ) -> Result<(), Exception> {
-        self.sampler.commit_token(processed_logits, token, stream)
-    }
+struct ExpertParallelEmbeddedMtpTarget<'a> {
+    model: &'a mut ExpertParallelModel,
+    tensor_group: Option<&'a Group>,
+    expert_group: &'a Group,
 }
 
 impl std::fmt::Debug for ExpertParallelModel {
@@ -414,7 +370,7 @@ impl crate::architectures::qwen::hybrid::mtp::QwenMtpTarget for ExpertParallelQw
         let tokens = runtime_input::text_token_ids(input, stream)?;
         cache.reset()?;
         self.model
-            .forward_qwen_mtp_target(&tokens, cache, self.group, stream)
+            .forward_qwen_mtp_target(&tokens, cache, self.tensor_group, self.group, stream)
             .map_err(|error| Exception::custom(error.to_string()))
     }
 
@@ -425,7 +381,7 @@ impl crate::architectures::qwen::hybrid::mtp::QwenMtpTarget for ExpertParallelQw
         stream: &Stream,
     ) -> Result<qwen3_5::QwenMtpStepOutput, Exception> {
         self.model
-            .forward_qwen_mtp_target(tokens, cache, self.group, stream)
+            .forward_qwen_mtp_target(tokens, cache, self.tensor_group, self.group, stream)
             .map_err(|error| Exception::custom(error.to_string()))
     }
 
@@ -441,7 +397,47 @@ impl crate::architectures::qwen::hybrid::mtp::QwenMtpTarget for ExpertParallelQw
                 model.forward_mtp_head(hidden, tokens, cache, stream)
             }
             ExpertArchitecture::QwenHybridLayerwise(model) => {
-                model.forward_mtp_head(hidden, tokens, cache, stream)
+                let expert_cache = self.model.expert_cache.as_ref().ok_or_else(|| {
+                    Exception::custom("distributed Qwen MTP requires rank-owned expert residency")
+                })?;
+                let assignment = &self.model.info.assignment;
+                let args = model.args().clone();
+                let mut statistics = RoutingStatistics::default();
+                let output = model.forward_mtp_head_with_expert_executor(
+                    hidden,
+                    tokens,
+                    cache,
+                    self.tensor_group,
+                    &mut |layer, hidden, ids, weights, stream| {
+                        let returned = dispatch_replicated_with(
+                            hidden,
+                            ids,
+                            weights,
+                            assignment,
+                            self.group,
+                            stream,
+                            |routes, stream| {
+                                execute_cached_qwen_hybrid(
+                                    &args,
+                                    layer,
+                                    routes,
+                                    ExpertPass::Decode,
+                                    expert_cache,
+                                    stream,
+                                )
+                            },
+                        )
+                        .map_err(|error| Exception::custom(error.to_string()))?;
+                        statistics.accumulate(&returned.statistics);
+                        Ok(returned.reduced_output)
+                    },
+                    stream,
+                );
+                self.model.latest_statistics = statistics;
+                self.model
+                    .cumulative_statistics
+                    .accumulate(&self.model.latest_statistics);
+                output
             }
             _ => Err(Exception::custom(
                 "embedded Qwen MTP requires a Qwen3-Next or Qwen3.5 EP model",
@@ -458,6 +454,159 @@ impl crate::architectures::qwen::hybrid::mtp::QwenMtpTarget for ExpertParallelQw
     }
 }
 
+impl EmbeddedMtpTarget for ExpertParallelEmbeddedMtpTarget<'_> {
+    type Cache = ExpertParallelCache;
+    type DraftCache = ExpertParallelMtpDraftCache;
+
+    fn prefill_target(
+        &mut self,
+        input: runtime_input::ModelInput<'_>,
+        cache: &mut Self::Cache,
+        stream: &Stream,
+    ) -> Result<EmbeddedMtpOutput, Exception> {
+        let tokens = runtime_input::text_token_ids(input, stream)?;
+        cache
+            .reset()
+            .map_err(|error| Exception::custom(error.to_string()))?;
+        self.model.forward_embedded_mtp_target(
+            &tokens,
+            cache,
+            self.tensor_group,
+            self.expert_group,
+            stream,
+        )
+    }
+
+    fn verify_target(
+        &mut self,
+        tokens: &Array,
+        cache: &mut Self::Cache,
+        stream: &Stream,
+    ) -> Result<EmbeddedMtpOutput, Exception> {
+        self.model.forward_embedded_mtp_target(
+            tokens,
+            cache,
+            self.tensor_group,
+            self.expert_group,
+            stream,
+        )
+    }
+
+    fn prefill_draft_cache(
+        &mut self,
+        output: &EmbeddedMtpOutput,
+        tokens: &Array,
+        cache: &mut Self::Cache,
+        stream: &Stream,
+    ) -> Result<(), Exception> {
+        let sequence = tokens.dim(1);
+        if sequence <= 1 {
+            return Ok(());
+        }
+        let hidden = output
+            .hidden
+            .try_index_device((.., ..sequence - 1, ..), stream)?;
+        let next = tokens.try_index_device((.., 1..), stream)?;
+        let mut draft = Self::draft_cache(cache);
+        for depth in 0..self.max_draft_tokens() {
+            let _ = self.model.forward_embedded_mtp_draft(
+                &hidden,
+                &next,
+                depth,
+                &mut draft,
+                self.tensor_group,
+                self.expert_group,
+                stream,
+            )?;
+        }
+        Self::commit_draft_cache(cache, &draft);
+        Ok(())
+    }
+
+    fn draft_cache(cache: &Self::Cache) -> Self::DraftCache {
+        match cache {
+            ExpertParallelCache::DeepSeek(cache) => {
+                ExpertParallelMtpDraftCache::DeepSeek(cache.mtp_layers.clone())
+            }
+            ExpertParallelCache::Inkling(cache) => {
+                ExpertParallelMtpDraftCache::Inkling(cache.mtp_layers.clone())
+            }
+            ExpertParallelCache::NemotronH(cache) => {
+                ExpertParallelMtpDraftCache::NemotronH(cache.mtp_layers.clone())
+            }
+            _ => unreachable!("capability preflight rejects non-shared embedded MTP caches"),
+        }
+    }
+
+    fn commit_draft_cache(cache: &mut Self::Cache, draft: &Self::DraftCache) {
+        match (cache, draft) {
+            (
+                ExpertParallelCache::DeepSeek(cache),
+                ExpertParallelMtpDraftCache::DeepSeek(draft),
+            ) => cache.mtp_layers.clone_from(draft),
+            (ExpertParallelCache::Inkling(cache), ExpertParallelMtpDraftCache::Inkling(draft)) => {
+                cache.mtp_layers.clone_from(draft)
+            }
+            (
+                ExpertParallelCache::NemotronH(cache),
+                ExpertParallelMtpDraftCache::NemotronH(draft),
+            ) => cache.mtp_layers.clone_from(draft),
+            _ => unreachable!("embedded MTP draft-cache type changed after preflight"),
+        }
+    }
+
+    fn draft_logits(
+        &mut self,
+        hidden: &Array,
+        last_token: u32,
+        draft_index: usize,
+        cache: &mut Self::DraftCache,
+        stream: &Stream,
+    ) -> Result<(Array, Array), Exception> {
+        let token = Array::from_slice(&[last_token], &[1, 1]);
+        let output = self.model.forward_embedded_mtp_draft(
+            hidden,
+            &token,
+            draft_index,
+            cache,
+            self.tensor_group,
+            self.expert_group,
+            stream,
+        )?;
+        Ok((output.logits, output.hidden))
+    }
+
+    fn advance_draft_cache(
+        &mut self,
+        hidden: &Array,
+        tokens: &Array,
+        cache: &mut Self::DraftCache,
+        stream: &Stream,
+    ) -> Result<(), Exception> {
+        for depth in 0..self.max_draft_tokens() {
+            let _ = self.model.forward_embedded_mtp_draft(
+                hidden,
+                tokens,
+                depth,
+                cache,
+                self.tensor_group,
+                self.expert_group,
+                stream,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn max_draft_tokens(&self) -> usize {
+        match &self.model.architecture {
+            ExpertArchitecture::DeepSeekLayerwise(model) => model.mtp_len(),
+            ExpertArchitecture::InklingLayerwise(model) => model.mtp_len(),
+            ExpertArchitecture::NemotronHLayerwise(model) => model.mtp_len(),
+            _ => 0,
+        }
+    }
+}
+
 impl ExpertParallelModel {
     /// Returns placement, assignment, and memory diagnostics.
     pub fn info(&self) -> &ExpertParallelInfo {
@@ -467,6 +616,21 @@ impl ExpertParallelModel {
     /// Reports whether this EP target can perform embedded MTP generation.
     pub fn mtp_capability(&self) -> MtpCapability {
         match &self.architecture {
+            ExpertArchitecture::DeepSeekLayerwise(model) if model.mtp_len() > 0 => {
+                MtpCapability::Ready {
+                    checkpoint: MtpCheckpointKind::Embedded,
+                }
+            }
+            ExpertArchitecture::InklingLayerwise(model) if model.mtp_len() > 0 => {
+                MtpCapability::Ready {
+                    checkpoint: MtpCheckpointKind::Embedded,
+                }
+            }
+            ExpertArchitecture::NemotronHLayerwise(model) if model.mtp_len() > 0 => {
+                MtpCapability::Ready {
+                    checkpoint: MtpCheckpointKind::Embedded,
+                }
+            }
             ExpertArchitecture::QwenHybrid(model) if model.mtp_len() > 0 => MtpCapability::Ready {
                 checkpoint: MtpCheckpointKind::Embedded,
             },
@@ -2376,15 +2540,271 @@ impl ExpertParallelModel {
         Ok(logits)
     }
 
+    fn forward_embedded_mtp_target(
+        &mut self,
+        tokens: &Array,
+        cache: &mut ExpertParallelCache,
+        tensor_group: Option<&Group>,
+        expert_group: &Group,
+        stream: &Stream,
+    ) -> Result<EmbeddedMtpOutput, Exception> {
+        self.validate_expert_group(expert_group)
+            .map_err(|error| Exception::custom(error.to_string()))?;
+        self.topology
+            .validate_execution_stream(stream)
+            .map_err(|error| Exception::custom(error.to_string()))?;
+        let expert_cache = self.expert_cache.as_ref().ok_or_else(|| {
+            Exception::custom("distributed embedded MTP requires rank-owned expert residency")
+        })?;
+        let pass = if tokens.dim(1) > 1 {
+            ExpertPass::Prefill
+        } else {
+            ExpertPass::Decode
+        };
+        let assignment = &self.info.assignment;
+        let mut statistics = RoutingStatistics::default();
+        let output = match (&mut self.architecture, cache) {
+            (
+                ExpertArchitecture::DeepSeekLayerwise(model),
+                ExpertParallelCache::DeepSeek(cache),
+            ) => {
+                let args = model.args().clone();
+                model.forward_mtp_target_with_expert_executor(
+                    tokens,
+                    cache,
+                    tensor_group,
+                    |layer, hidden, ids, weights, stream| {
+                        let returned = dispatch_replicated_with(
+                            hidden,
+                            ids,
+                            weights,
+                            assignment,
+                            expert_group,
+                            stream,
+                            |routes, stream| {
+                                execute_cached_deepseek(
+                                    &args,
+                                    layer,
+                                    routes,
+                                    pass,
+                                    expert_cache,
+                                    stream,
+                                )
+                            },
+                        )
+                        .map_err(|error| Exception::custom(error.to_string()))?;
+                        statistics.accumulate(&returned.statistics);
+                        Ok(returned.reduced_output)
+                    },
+                    stream,
+                )?
+            }
+            (ExpertArchitecture::InklingLayerwise(model), ExpertParallelCache::Inkling(cache)) => {
+                let args = model.args().clone();
+                model.forward_mtp_target_with_expert_executor(
+                    tokens,
+                    cache,
+                    tensor_group,
+                    |layer, hidden, ids, weights, stream| {
+                        let returned = dispatch_replicated_with(
+                            hidden,
+                            ids,
+                            weights,
+                            assignment,
+                            expert_group,
+                            stream,
+                            |routes, stream| {
+                                execute_cached_inkling(
+                                    &args,
+                                    layer,
+                                    routes,
+                                    pass,
+                                    expert_cache,
+                                    stream,
+                                )
+                            },
+                        )
+                        .map_err(|error| Exception::custom(error.to_string()))?;
+                        statistics.accumulate(&returned.statistics);
+                        Ok(returned.reduced_output)
+                    },
+                    stream,
+                )?
+            }
+            (
+                ExpertArchitecture::NemotronHLayerwise(model),
+                ExpertParallelCache::NemotronH(cache),
+            ) => {
+                let args = model.args().clone();
+                model.forward_mtp_target_with_expert_executor(
+                    tokens,
+                    cache,
+                    tensor_group,
+                    |layer, hidden, ids, weights, stream| {
+                        let returned = dispatch_replicated_with(
+                            hidden,
+                            ids,
+                            weights,
+                            assignment,
+                            expert_group,
+                            stream,
+                            |routes, stream| {
+                                execute_cached_nemotron_h(
+                                    &args,
+                                    layer,
+                                    routes,
+                                    pass,
+                                    expert_cache,
+                                    stream,
+                                )
+                            },
+                        )
+                        .map_err(|error| Exception::custom(error.to_string()))?;
+                        statistics.accumulate(&returned.statistics);
+                        Ok(returned.reduced_output)
+                    },
+                    stream,
+                )?
+            }
+            _ => {
+                return Err(Exception::custom(
+                    "embedded MTP architecture/cache mismatch for EP execution",
+                ))
+            }
+        };
+        materialize_timing_phase([&output.logits])
+            .map_err(|error| Exception::custom(error.to_string()))?;
+        self.latest_statistics = statistics;
+        self.cumulative_statistics
+            .accumulate(&self.latest_statistics);
+        Ok(output)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn forward_embedded_mtp_draft(
+        &mut self,
+        hidden: &Array,
+        tokens: &Array,
+        depth: usize,
+        cache: &mut ExpertParallelMtpDraftCache,
+        tensor_group: Option<&Group>,
+        expert_group: &Group,
+        stream: &Stream,
+    ) -> Result<EmbeddedMtpOutput, Exception> {
+        let expert_cache = self.expert_cache.as_ref().ok_or_else(|| {
+            Exception::custom("distributed embedded MTP requires rank-owned expert residency")
+        })?;
+        let assignment = &self.info.assignment;
+        let pass = ExpertPass::Decode;
+        let mut statistics = RoutingStatistics::default();
+        let output = match (&mut self.architecture, cache) {
+            (
+                ExpertArchitecture::DeepSeekLayerwise(model),
+                ExpertParallelMtpDraftCache::DeepSeek(cache),
+            ) => {
+                let args = model.args().clone();
+                model.forward_mtp_draft_with_expert_executor(
+                    hidden,
+                    tokens,
+                    depth,
+                    cache,
+                    tensor_group,
+                    |layer, hidden, ids, weights, stream| {
+                        let returned = dispatch_replicated_with(
+                            hidden,
+                            ids,
+                            weights,
+                            assignment,
+                            expert_group,
+                            stream,
+                            |routes, stream| {
+                                execute_cached_deepseek(
+                                    &args,
+                                    layer,
+                                    routes,
+                                    pass,
+                                    expert_cache,
+                                    stream,
+                                )
+                            },
+                        )
+                        .map_err(|error| Exception::custom(error.to_string()))?;
+                        statistics.accumulate(&returned.statistics);
+                        Ok(returned.reduced_output)
+                    },
+                    stream,
+                )?
+            }
+            (
+                ExpertArchitecture::InklingLayerwise(model),
+                ExpertParallelMtpDraftCache::Inkling(cache),
+            ) => model.forward_mtp_draft_cartesian(
+                hidden,
+                tokens,
+                depth,
+                cache,
+                tensor_group,
+                stream,
+            )?,
+            (
+                ExpertArchitecture::NemotronHLayerwise(model),
+                ExpertParallelMtpDraftCache::NemotronH(cache),
+            ) => {
+                let args = model.args().clone();
+                model.forward_mtp_draft_with_expert_executor(
+                    hidden,
+                    tokens,
+                    depth,
+                    cache,
+                    tensor_group,
+                    |layer, hidden, ids, weights, stream| {
+                        let returned = dispatch_replicated_with(
+                            hidden,
+                            ids,
+                            weights,
+                            assignment,
+                            expert_group,
+                            stream,
+                            |routes, stream| {
+                                execute_cached_nemotron_h(
+                                    &args,
+                                    layer,
+                                    routes,
+                                    pass,
+                                    expert_cache,
+                                    stream,
+                                )
+                            },
+                        )
+                        .map_err(|error| Exception::custom(error.to_string()))?;
+                        statistics.accumulate(&returned.statistics);
+                        Ok(returned.reduced_output)
+                    },
+                    stream,
+                )?
+            }
+            _ => {
+                return Err(Exception::custom(
+                    "embedded MTP draft-cache architecture mismatch for EP execution",
+                ))
+            }
+        };
+        self.latest_statistics = statistics;
+        self.cumulative_statistics
+            .accumulate(&self.latest_statistics);
+        Ok(output)
+    }
+
     fn forward_qwen_mtp_target(
         &mut self,
         tokens: &Array,
         cache: &mut qwen3_5::Cache,
+        tensor_group: Option<&Group>,
         group: &Group,
         stream: &Stream,
     ) -> Result<qwen3_5::QwenMtpStepOutput, Error> {
         let total_started = Instant::now();
-        self.validate_group(group)?;
+        self.validate_expert_group(group)?;
         self.topology.validate_execution_stream(stream)?;
         if tokens.ndim() != 2 {
             return Err(Error::Parallel(format!(
@@ -2394,7 +2814,7 @@ impl ExpertParallelModel {
         }
         let expert_cache = self.expert_cache.as_ref().ok_or_else(|| {
             Error::UnsupportedArchitecture(
-                "Qwen embedded MTP currently requires sparse expert-cached EP loading".into(),
+                "Qwen embedded MTP EP execution has no rank-owned expert catalog".into(),
             )
         })?;
         let pass = if tokens.dim(1) > 1 {
@@ -2441,6 +2861,7 @@ impl ExpertParallelModel {
                 model.forward_mtp_with_expert_executor(
                     tokens,
                     cache,
+                    tensor_group,
                     |layer, hidden, ids, weights, stream| {
                         let returned = dispatch_replicated_with(
                             hidden,
@@ -2479,6 +2900,101 @@ impl ExpertParallelModel {
         self.cumulative_statistics
             .accumulate(&self.latest_statistics);
         Ok(output)
+    }
+
+    /// Generates with Cartesian TP+EP predictor ownership and synchronized
+    /// sampling. Predictor TP collectives and expert exchanges are scoped to
+    /// the topology-derived subgroups supplied by `execution`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn generate_embedded_mtp_cartesian<S: SpeculativeSampler + Clone>(
+        &mut self,
+        cache: &mut ExpertParallelCache,
+        input: runtime_input::ModelInput<'_>,
+        config: &MtpConfig,
+        prng_key: Option<Array>,
+        sampler: &mut S,
+        execution: &crate::CartesianExecution<'_>,
+        stream: &Stream,
+    ) -> Result<(Vec<u32>, MtpStats), Exception> {
+        let topology = execution.topology();
+        if topology != self.topology {
+            return Err(Exception::custom(
+                "embedded MTP model topology does not match Cartesian execution",
+            ));
+        }
+        if topology.pipeline_parallel_size != 1 {
+            return Err(Exception::custom(
+                "ExpertParallelModel embedded MTP cannot own a pipeline axis; use PipelineModel",
+            ));
+        }
+        let expert_group = execution.expert_group().ok_or_else(|| {
+            Exception::custom("Cartesian embedded MTP requires an active EP subgroup")
+        })?;
+        let tensor = execution
+            .tensor_context(stream)
+            .map_err(|error| Exception::custom(error.to_string()))?;
+        let tensor_group = tensor.group();
+        let sampling_rank = topology
+            .global_rank_for(crate::ParallelCoordinates {
+                tensor: 0,
+                pipeline: 0,
+                expert: 0,
+            })
+            .map_err(|error| Exception::custom(error.to_string()))?;
+        let mut synchronized =
+            DistributedEmbeddedMtpSampler::new(sampler.clone(), sampling_rank, execution.world())
+                .map_err(|error| Exception::custom(error.to_string()))?;
+        if !matches!(
+            self.mtp_capability(),
+            MtpCapability::Ready {
+                checkpoint: MtpCheckpointKind::Embedded
+            }
+        ) {
+            return Err(Exception::custom(format!(
+                "embedded MTP runtime adapter is unavailable for Cartesian EP model type {} ({:?})",
+                self.info.model_kind.model_type_name(),
+                self.mtp_capability()
+            )));
+        }
+        if matches!(cache, ExpertParallelCache::QwenHybrid(_)) {
+            let ExpertParallelCache::QwenHybrid(cache) = cache else {
+                unreachable!()
+            };
+            let mut target = ExpertParallelQwenMtpTarget {
+                model: self,
+                tensor_group,
+                group: expert_group,
+            };
+            let result = crate::architectures::qwen::hybrid::mtp::generate_with_callback(
+                &mut target,
+                cache,
+                input,
+                config,
+                prng_key,
+                &mut synchronized,
+                stream,
+                |_| Ok(()),
+            );
+            *sampler = synchronized.into_inner();
+            return result;
+        }
+        let mut target = ExpertParallelEmbeddedMtpTarget {
+            model: self,
+            tensor_group,
+            expert_group,
+        };
+        let result = crate::runtime::generation::embedded_mtp::generate_with_callback(
+            &mut target,
+            cache,
+            input,
+            config,
+            prng_key,
+            &mut synchronized,
+            stream,
+            |_| Ok(()),
+        );
+        *sampler = synchronized.into_inner();
+        result
     }
 
     /// Generates with replicated Qwen MTP weights and EP target verification.
@@ -2579,13 +3095,15 @@ impl ExpertParallelModel {
                 "embedded Qwen MTP requires a Qwen hybrid EP cache",
             ));
         };
-        let mut synchronized_sampler = ExpertParallelSpeculativeSampler {
-            sampler: sampler.clone(),
-            sampling_rank,
+        let mut synchronized_sampler =
+            DistributedEmbeddedMtpSampler::new(sampler.clone(), sampling_rank, group)
+                .map_err(|error| Exception::custom(error.to_string()))?;
+        let emit_callbacks = group.rank() == sampling_rank;
+        let mut target = ExpertParallelQwenMtpTarget {
+            model: self,
+            tensor_group: None,
             group,
         };
-        let emit_callbacks = group.rank() == sampling_rank;
-        let mut target = ExpertParallelQwenMtpTarget { model: self, group };
         let result = crate::architectures::qwen::hybrid::mtp::generate_with_callback(
             &mut target,
             cache,
@@ -2602,7 +3120,7 @@ impl ExpertParallelModel {
                 }
             },
         );
-        *sampler = synchronized_sampler.sampler;
+        *sampler = synchronized_sampler.into_inner();
         result
     }
 

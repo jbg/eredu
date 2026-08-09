@@ -68,6 +68,9 @@ const NORM_UNIT: &str = "deepseek_v3.static.norm";
 const HEAD_UNIT: &str = "deepseek_v3.static.output";
 const MTP_UNIT: &str = "deepseek_v3.static.mtp";
 
+type DeepSeekMtpExpertExecutor<'a> =
+    dyn FnMut(usize, &Array, &Array, &Array, &Stream) -> Result<Array, Exception> + 'a;
+
 #[derive(Debug, Clone, ModuleParameters)]
 struct DeepSeekMtpLayer {
     #[param]
@@ -81,7 +84,7 @@ struct DeepSeekMtpLayer {
     #[param]
     shared_norm: nn::RmsNorm,
     #[param]
-    shared_head: MaybeQuantized<nn::Linear>,
+    shared_head: crate::runtime::generation::embedded_mtp::EmbeddedMtpVocabHead,
 }
 
 #[derive(Debug, Clone, ModuleParameters)]
@@ -135,15 +138,15 @@ impl DeepSeekMtpModule {
                         Dtype::Float32,
                         stream,
                     )?,
-                    shared_head: common::linear::unloaded_maybe_quantized_linear(
-                        args.hidden_size,
-                        args.vocab_size,
-                        false,
-                        args.weight_quantization_for(&format!(
-                            "model.layers.{global}.shared_head.head.weight"
-                        )),
-                        stream,
-                    )?,
+                    shared_head:
+                        crate::runtime::generation::embedded_mtp::EmbeddedMtpVocabHead::new(
+                            args.hidden_size,
+                            args.vocab_size as usize,
+                            args.weight_quantization_for(&format!(
+                                "model.layers.{global}.shared_head.head.weight"
+                            )),
+                            stream,
+                        )?,
                 })
             })
             .collect::<Result<Vec<_>, Error>>()?;
@@ -163,7 +166,9 @@ impl DeepSeekMtpModule {
         depth: usize,
         cache: &mut [crate::runtime::cache::CompressedLatentCache],
         expert_cache: Option<&ExpertCache>,
+        mut external_expert: Option<&mut DeepSeekMtpExpertExecutor<'_>>,
         args: &ModelArgs,
+        execution: Option<&crate::runtime::distributed::parallel::ParallelExecutionContext<'_>>,
         stream: &Stream,
     ) -> Result<crate::runtime::generation::embedded_mtp::EmbeddedMtpOutput, Exception> {
         let layer_count = self.layers.len();
@@ -182,22 +187,20 @@ impl DeepSeekMtpModule {
         let mask = (fused.dim(1) > 1)
             .then(|| create_causal_mask(fused.dim(1), Some(cache.offset()), None, None, stream))
             .transpose()?;
-        let hidden = if let Some(expert_cache) = expert_cache {
+        let hidden = if expert_cache.is_some() || external_expert.is_some() {
             let global = args.num_hidden_layers as usize + depth % layer_count;
             let pass = if fused.dim(1) > 1 {
                 ExpertPass::Prefill
             } else {
                 ExpertPass::Decode
             };
-            layer.decoder.forward_sparse_experts(
-                &fused,
-                mask.as_ref(),
-                Some(cache),
-                stream,
-                |flat, indices, weights, stream| {
+            let execute = |flat: &Array, indices: &Array, weights: &Array, stream: &Stream| {
+                if let Some(execute) = external_expert.as_deref_mut() {
+                    execute(global, flat, indices, weights, stream)
+                } else {
                     execute_cached_deepseek_experts(
                         args,
-                        expert_cache,
+                        expert_cache.expect("checked DeepSeek MTP expert source"),
                         global,
                         flat,
                         indices,
@@ -205,15 +208,45 @@ impl DeepSeekMtpModule {
                         pass,
                         stream,
                     )
-                },
-            )?
+                }
+            };
+            match execution.filter(|execution| execution.is_tensor_parallel()) {
+                Some(execution) => layer.decoder.forward_tensor_with_expert_executor(
+                    &fused,
+                    mask.as_ref(),
+                    Some(cache),
+                    execution.group().ok_or_else(|| {
+                        Exception::custom("DeepSeek MTP TP execution is missing its group")
+                    })?,
+                    stream,
+                    execute,
+                )?,
+                None => layer.decoder.forward_sparse_experts(
+                    &fused,
+                    mask.as_ref(),
+                    Some(cache),
+                    stream,
+                    execute,
+                )?,
+            }
         } else {
-            layer
-                .decoder
-                .forward_stage(&fused, mask.as_ref(), Some(cache), stream)?
+            match execution.filter(|execution| execution.is_tensor_parallel()) {
+                Some(execution) => layer.decoder.forward_tensor_parallel(
+                    &fused,
+                    mask.as_ref(),
+                    Some(cache),
+                    execution.group().ok_or_else(|| {
+                        Exception::custom("DeepSeek MTP TP execution is missing its group")
+                    })?,
+                    stream,
+                )?,
+                None => layer
+                    .decoder
+                    .forward_stage(&fused, mask.as_ref(), Some(cache), stream)?,
+            }
         };
         let normalized = layer.shared_norm.forward(&hidden, stream)?;
-        let logits = layer.shared_head.forward(&normalized, stream)?;
+        let logits = layer.shared_head.forward(&normalized, execution, stream)?;
         Ok(
             crate::runtime::generation::embedded_mtp::EmbeddedMtpOutput {
                 logits,
@@ -227,6 +260,20 @@ impl DeepSeekMtpModule {
 /// DeepSeek-V3/R1 causal LM using bounded residency for decoder blocks.
 pub struct DeepSeekV3LayerwiseModel {
     execution: LayerwiseModel<DeepSeekV3LayerwiseAdapter>,
+}
+
+pub(crate) struct DeepSeekTensorMtpTarget<'a> {
+    model: &'a mut DeepSeekV3LayerwiseModel,
+    group: &'a safemlx::distributed::Group,
+}
+
+impl<'a> DeepSeekTensorMtpTarget<'a> {
+    pub(crate) fn new(
+        model: &'a mut DeepSeekV3LayerwiseModel,
+        group: &'a safemlx::distributed::Group,
+    ) -> Self {
+        Self { model, group }
+    }
 }
 
 impl DeepSeekV3LayerwiseModel {
@@ -316,7 +363,77 @@ impl DeepSeekV3LayerwiseModel {
                 depth,
                 cache,
                 expert_cache,
+                None,
                 args,
+                None,
+                stream,
+            )
+    }
+
+    fn forward_mtp_target_tensor(
+        &mut self,
+        tokens: &Array,
+        cache: &mut Cache,
+        group: &safemlx::distributed::Group,
+        stream: &Stream,
+    ) -> Result<crate::runtime::generation::embedded_mtp::EmbeddedMtpOutput, Exception> {
+        let (logits, context) = self
+            .execution
+            .forward_tensor_parallel_with_context(tokens, cache, group, stream)
+            .map_err(|error| Exception::custom(error.to_string()))?;
+        let hidden = context.draft_hidden.ok_or_else(|| {
+            Exception::custom("DeepSeek tensor pass did not retain MTP hidden state")
+        })?;
+        Ok(
+            crate::runtime::generation::embedded_mtp::EmbeddedMtpOutput {
+                logits,
+                hidden,
+                tokens: tokens.clone(),
+            },
+        )
+    }
+
+    fn forward_mtp_draft_tensor(
+        &mut self,
+        hidden: &Array,
+        tokens: &Array,
+        depth: usize,
+        cache: &mut [crate::runtime::cache::CompressedLatentCache],
+        group: &safemlx::distributed::Group,
+        stream: &Stream,
+    ) -> Result<crate::runtime::generation::embedded_mtp::EmbeddedMtpOutput, Exception> {
+        let topology = self
+            .parallel_info()
+            .ok_or_else(|| Exception::custom("DeepSeek MTP target has no parallel topology"))?
+            .topology();
+        let execution =
+            crate::runtime::distributed::parallel::ParallelExecutionContext::tensor_parallel(
+                topology, group, stream,
+            )
+            .map_err(|error| Exception::custom(error.to_string()))?;
+        let adapter = self.execution.adapter_mut();
+        let embeddings = adapter
+            .parallel_embedding
+            .as_mut()
+            .ok_or_else(|| Exception::custom("DeepSeek MTP has no TP embedding shard"))?
+            .forward(tokens, &execution)
+            .map_err(|error| Exception::custom(error.to_string()))?;
+        let expert_cache = adapter.expert_cache.as_ref();
+        let args = &adapter.args;
+        adapter
+            .mtp
+            .as_mut()
+            .ok_or_else(|| Exception::custom("DeepSeek checkpoint does not contain MTP layers"))?
+            .forward_step(
+                hidden,
+                &embeddings,
+                tokens,
+                depth,
+                cache,
+                expert_cache,
+                None,
+                args,
+                Some(&execution),
                 stream,
             )
     }
@@ -525,6 +642,124 @@ impl DeepSeekV3LayerwiseModel {
         )
     }
 
+    pub(crate) fn forward_mtp_target_with_expert_executor<F>(
+        &mut self,
+        inputs: &Array,
+        cache: &mut Cache,
+        tensor_group: Option<&safemlx::distributed::Group>,
+        mut execute: F,
+        stream: &Stream,
+    ) -> Result<crate::runtime::generation::embedded_mtp::EmbeddedMtpOutput, Exception>
+    where
+        F: FnMut(usize, &Array, &Array, &Array, &Stream) -> Result<Array, Exception>,
+    {
+        let (logits, context) = match tensor_group {
+            Some(tensor_group) => self
+                .execution
+                .forward_tensor_parallel_with_layer_executor_and_context(
+                    inputs,
+                    cache,
+                    tensor_group,
+                    stream,
+                    |_adapter, _group, index, layer, hidden, cache, context, execution| {
+                        Ok(layer.forward_tensor_with_expert_executor(
+                            hidden,
+                            context.mask.as_ref(),
+                            Some(&mut cache.layers[index]),
+                            execution.group().ok_or_else(|| {
+                                Error::Parallel(
+                                    "DeepSeek TP+EP MTP target is missing its TP group".into(),
+                                )
+                            })?,
+                            execution.stream(),
+                            |hidden, ids, weights, stream| {
+                                execute(index, hidden, ids, weights, stream)
+                            },
+                        )?)
+                    },
+                ),
+            None => self.execution.forward_with_layer_executor_and_context(
+                inputs,
+                cache,
+                stream,
+                |_adapter, _group, index, layer, hidden, cache, context, stream| {
+                    Ok(layer.forward_sparse_experts(
+                        hidden,
+                        context.mask.as_ref(),
+                        Some(&mut cache.layers[index]),
+                        stream,
+                        |hidden, ids, weights, stream| execute(index, hidden, ids, weights, stream),
+                    )?)
+                },
+            ),
+        }
+        .map_err(|error| Exception::custom(error.to_string()))?;
+        Ok(
+            crate::runtime::generation::embedded_mtp::EmbeddedMtpOutput {
+                logits,
+                hidden: context.draft_hidden.ok_or_else(|| {
+                    Exception::custom("DeepSeek EP pass did not retain MTP hidden state")
+                })?,
+                tokens: inputs.clone(),
+            },
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn forward_mtp_draft_with_expert_executor<F>(
+        &mut self,
+        hidden: &Array,
+        tokens: &Array,
+        depth: usize,
+        cache: &mut [crate::runtime::cache::CompressedLatentCache],
+        tensor_group: Option<&safemlx::distributed::Group>,
+        mut execute: F,
+        stream: &Stream,
+    ) -> Result<crate::runtime::generation::embedded_mtp::EmbeddedMtpOutput, Exception>
+    where
+        F: FnMut(usize, &Array, &Array, &Array, &Stream) -> Result<Array, Exception>,
+    {
+        let topology = self
+            .parallel_info()
+            .ok_or_else(|| Exception::custom("DeepSeek EP MTP target has no topology"))?
+            .topology();
+        let execution = tensor_group
+            .map(|group| {
+                crate::runtime::distributed::parallel::ParallelExecutionContext::tensor_parallel(
+                    topology, group, stream,
+                )
+            })
+            .transpose()
+            .map_err(|error| Exception::custom(error.to_string()))?;
+        let adapter = self.execution.adapter_mut();
+        let embeddings = match execution.as_ref() {
+            Some(execution) => adapter
+                .parallel_embedding
+                .as_mut()
+                .ok_or_else(|| Exception::custom("DeepSeek MTP has no TP embedding shard"))?
+                .forward(tokens, execution)
+                .map_err(|error| Exception::custom(error.to_string()))?,
+            None => adapter.embedding.forward(tokens, stream)?,
+        };
+        let args = &adapter.args;
+        adapter
+            .mtp
+            .as_mut()
+            .ok_or_else(|| Exception::custom("DeepSeek checkpoint does not contain MTP layers"))?
+            .forward_step(
+                hidden,
+                &embeddings,
+                tokens,
+                depth,
+                cache,
+                None,
+                Some(&mut execute),
+                args,
+                execution.as_ref(),
+                stream,
+            )
+    }
+
     /// Clears temporary decoder blocks from the execution device.
     pub fn clear_device_layer_window(&self) -> Result<(), Error> {
         self.execution.clear_device_group("text_decoder")
@@ -646,6 +881,116 @@ impl crate::runtime::generation::embedded_mtp::EmbeddedMtpTarget for DeepSeekV3L
 
     fn max_draft_tokens(&self) -> usize {
         self.mtp_len()
+    }
+}
+
+impl crate::runtime::generation::embedded_mtp::EmbeddedMtpTarget for DeepSeekTensorMtpTarget<'_> {
+    type Cache = Cache;
+    type DraftCache = Vec<crate::runtime::cache::CompressedLatentCache>;
+
+    fn prefill_target(
+        &mut self,
+        input: input::ModelInput<'_>,
+        cache: &mut Cache,
+        stream: &Stream,
+    ) -> Result<crate::runtime::generation::embedded_mtp::EmbeddedMtpOutput, Exception> {
+        let tokens = input::text_token_ids(input, stream)?;
+        cache.reset()?;
+        self.model
+            .forward_mtp_target_tensor(&tokens, cache, self.group, stream)
+    }
+
+    fn verify_target(
+        &mut self,
+        tokens: &Array,
+        cache: &mut Cache,
+        stream: &Stream,
+    ) -> Result<crate::runtime::generation::embedded_mtp::EmbeddedMtpOutput, Exception> {
+        self.model
+            .forward_mtp_target_tensor(tokens, cache, self.group, stream)
+    }
+
+    fn prefill_draft_cache(
+        &mut self,
+        output: &crate::runtime::generation::embedded_mtp::EmbeddedMtpOutput,
+        tokens: &Array,
+        cache: &mut Cache,
+        stream: &Stream,
+    ) -> Result<(), Exception> {
+        let sequence = tokens.dim(1);
+        if sequence <= 1 {
+            return Ok(());
+        }
+        let hidden = output
+            .hidden
+            .try_index_device((.., ..sequence - 1, ..), stream)?;
+        let next = tokens.try_index_device((.., 1..), stream)?;
+        for depth in 0..cache.mtp_layers.len() {
+            let _ = self.model.forward_mtp_draft_tensor(
+                &hidden,
+                &next,
+                depth,
+                &mut cache.mtp_layers,
+                self.group,
+                stream,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn draft_cache(cache: &Cache) -> Self::DraftCache {
+        cache.mtp_layers.clone()
+    }
+
+    fn commit_draft_cache(cache: &mut Cache, draft: &Self::DraftCache) {
+        cache.mtp_layers.clone_from(draft);
+    }
+
+    fn restore_target_checkpoint(
+        cache: &mut Cache,
+        checkpoint: &Cache,
+        stream: &Stream,
+    ) -> Result<(), Exception> {
+        cache.restore_target_checkpoint(checkpoint, stream)
+    }
+
+    fn draft_logits(
+        &mut self,
+        hidden: &Array,
+        last_token: u32,
+        draft_index: usize,
+        cache: &mut Self::DraftCache,
+        stream: &Stream,
+    ) -> Result<(Array, Array), Exception> {
+        let token = Array::from_slice(&[last_token], &[1, 1]);
+        let output = self.model.forward_mtp_draft_tensor(
+            hidden,
+            &token,
+            draft_index,
+            cache,
+            self.group,
+            stream,
+        )?;
+        Ok((output.logits, output.hidden))
+    }
+
+    fn advance_draft_cache(
+        &mut self,
+        hidden: &Array,
+        tokens: &Array,
+        cache: &mut Self::DraftCache,
+        stream: &Stream,
+    ) -> Result<(), Exception> {
+        for depth in 0..cache.len() {
+            let _ = self
+                .model
+                .forward_mtp_draft_tensor(hidden, tokens, depth, cache, self.group, stream)?;
+        }
+        Ok(())
+    }
+
+    fn max_draft_tokens(&self) -> usize {
+        self.model.mtp_len()
     }
 }
 
@@ -1030,6 +1375,83 @@ impl DeepSeekV3LayerwiseAdapter {
         &self.args
     }
 
+    pub(crate) fn configure_cartesian_layout(
+        &mut self,
+        build: crate::runtime::distributed::parallel::ParallelBuildContext,
+        layout: &crate::runtime::distributed::parallel::LocalModelLayout,
+        stream: &Stream,
+    ) -> Result<(), Error> {
+        self.configure_parallel_static(build, layout, stream)
+    }
+
+    pub(crate) fn pipeline_static_mut(&mut self, role: &str) -> Option<&mut dyn ModuleParameters> {
+        match role {
+            "embedding" => self
+                .parallel_embedding
+                .as_mut()
+                .map(|module| module.inner_mut() as &mut dyn ModuleParameters)
+                .or(Some(&mut self.embedding)),
+            "mtp" => self
+                .mtp
+                .as_mut()
+                .map(|module| module as &mut dyn ModuleParameters),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn embedded_mtp_len(&self) -> usize {
+        self.mtp.as_ref().map_or(0, DeepSeekMtpModule::len)
+    }
+
+    pub(crate) fn embedded_mtp_cache(&self) -> Vec<crate::runtime::cache::CompressedLatentCache> {
+        (0..self.embedded_mtp_len())
+            .map(|_| crate::runtime::cache::CompressedLatentCache::new())
+            .collect()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn forward_pipeline_mtp<F>(
+        &mut self,
+        hidden: &Array,
+        tokens: &Array,
+        depth: usize,
+        cache: &mut [crate::runtime::cache::CompressedLatentCache],
+        execution: Option<&crate::runtime::distributed::parallel::ParallelExecutionContext<'_>>,
+        external_expert: Option<&mut F>,
+        stream: &Stream,
+    ) -> Result<crate::runtime::generation::embedded_mtp::EmbeddedMtpOutput, Exception>
+    where
+        F: FnMut(usize, &Array, &Array, &Array, &Stream) -> Result<Array, Exception>,
+    {
+        let embeddings = match execution.filter(|execution| execution.is_tensor_parallel()) {
+            Some(execution) => self
+                .parallel_embedding
+                .as_mut()
+                .ok_or_else(|| {
+                    Exception::custom("DeepSeek pipeline MTP has no TP embedding shard")
+                })?
+                .forward(tokens, execution)
+                .map_err(|error| Exception::custom(error.to_string()))?,
+            None => self.embedding.forward(tokens, stream)?,
+        };
+        let expert_cache = self.expert_cache.as_ref();
+        self.mtp
+            .as_mut()
+            .ok_or_else(|| Exception::custom("DeepSeek checkpoint does not contain MTP layers"))?
+            .forward_step(
+                hidden,
+                &embeddings,
+                tokens,
+                depth,
+                cache,
+                expert_cache,
+                external_expert.map(|execute| execute as &mut DeepSeekMtpExpertExecutor<'_>),
+                &self.args,
+                execution,
+                stream,
+            )
+    }
+
     fn new_cache(&self) -> Cache {
         Cache::new(&self.args.layer_schedule)
             .with_mtp_layers(self.mtp.as_ref().map_or(0, DeepSeekMtpModule::len))
@@ -1245,7 +1667,20 @@ fn register_deepseek_layer_parallel_plan(
     layer: &DecoderLayer,
     index: usize,
 ) -> Result<(), Error> {
-    let prefix = format!("model.layers.{index}");
+    register_deepseek_layer_parallel_plan_at(
+        planner,
+        layer,
+        index,
+        &format!("model.layers.{index}"),
+    )
+}
+
+fn register_deepseek_layer_parallel_plan_at(
+    planner: &mut ParallelPlanBuilder,
+    layer: &DecoderLayer,
+    _index: usize,
+    prefix: &str,
+) -> Result<(), Error> {
     let attention = &layer.self_attn;
     let attention_prefix = format!("{prefix}.self_attn");
     let mut projection_names = Vec::new();
@@ -1847,13 +2282,40 @@ impl ArchitectureAdapter for DeepSeekV3LayerwiseAdapter {
             let layer = DecoderLayer::new_layerwise(&self.args, index as i32, stream)?;
             register_deepseek_layer_parallel_plan(planner, &layer, index)?;
         }
+        if let Some(mtp) = &self.mtp {
+            for (index, layer) in mtp.layers.iter().enumerate() {
+                let prefix = format!("layers.{index}");
+                register_replicated_module(planner, &layer.enorm, &format!("{prefix}.enorm"))?;
+                register_replicated_module(planner, &layer.hnorm, &format!("{prefix}.hnorm"))?;
+                register_projection_module(
+                    planner,
+                    &layer.eh_proj,
+                    &format!("{prefix}.eh_proj"),
+                    ProjectionSharding::Replicated,
+                )?;
+                register_deepseek_layer_parallel_plan_at(
+                    planner,
+                    &layer.decoder,
+                    self.args.num_hidden_layers as usize + index,
+                    &format!("{prefix}.decoder"),
+                )?;
+                register_replicated_module(
+                    planner,
+                    &layer.shared_norm,
+                    &format!("{prefix}.shared_norm"),
+                )?;
+                layer
+                    .shared_head
+                    .register(planner, &format!("{prefix}.shared_head"))?;
+            }
+        }
         Ok(())
     }
 
     fn configure_parallel_static(
         &mut self,
         context: crate::runtime::distributed::parallel::ParallelBuildContext,
-        _layout: &crate::runtime::distributed::parallel::LocalModelLayout,
+        layout: &crate::runtime::distributed::parallel::LocalModelLayout,
         stream: &Stream,
     ) -> Result<(), Error> {
         self.parallel_embedding = Some(VocabParallelEmbedding::unloaded(
@@ -1871,6 +2333,83 @@ impl ArchitectureAdapter for DeepSeekV3LayerwiseAdapter {
             context,
             stream,
         )?);
+        if let Some(mtp) = &mut self.mtp {
+            let count = mtp.layers.len();
+            let mut policies = self.args.layer_schedule.iter().cloned().collect::<Vec<_>>();
+            policies.extend(std::iter::repeat_n(LayerPolicy::SparseMoe, count));
+            let mut mtp_args = self.args.clone();
+            mtp_args.layer_schedule = crate::LayerSchedule::new(policies.len(), policies)
+                .map_err(|error| Error::Parallel(error.to_string()))?;
+            for (index, layer) in mtp.layers.iter_mut().enumerate() {
+                let prefix = format!("layers.{index}.decoder");
+                let tensor = |suffix: &str| {
+                    layout
+                        .tensor(&format!("{prefix}.{suffix}.weight"))
+                        .or_else(|| layout.tensor(&format!("{prefix}.{suffix}.inner.weight")))
+                };
+                let attention = tensor("self_attn.q_proj")
+                    .or_else(|| tensor("self_attn.q_b_proj"))
+                    .ok_or_else(|| {
+                        Error::Parallel(format!("missing TP layout for {prefix} MLA query"))
+                    })?;
+                let local_heads = i32::try_from(attention.local_shape()[0])
+                    .map_err(|_| Error::Parallel("DeepSeek MTP query width exceeds i32".into()))?
+                    / (self.args.qk_nope_head_dim + self.args.qk_rope_head_dim);
+                let local_width = |suffix: &str,
+                                   axis: usize,
+                                   fallback: i32|
+                 -> Result<i32, Error> {
+                    tensor(suffix)
+                            .map(|value| {
+                                value
+                                    .local_shape()
+                                    .get(axis)
+                                    .copied()
+                                    .ok_or_else(|| {
+                                        Error::Parallel(format!(
+                                            "DeepSeek TP layout for {prefix}.{suffix} has no axis {axis}"
+                                        ))
+                                    })
+                                    .and_then(|width| {
+                                        i32::try_from(width).map_err(|_| {
+                                            Error::Parallel(format!(
+                                                "DeepSeek local width for {prefix}.{suffix} exceeds i32"
+                                            ))
+                                        })
+                                    })
+                            })
+                            .transpose()
+                            .map(|value| value.unwrap_or(fallback))
+                };
+                let dense_intermediate =
+                    local_width("mlp.gate_proj", 0, self.args.intermediate_size)?;
+                let routed_intermediate = layout
+                    .tensor(&format!("{prefix}.mlp.experts.gate_proj"))
+                    .map(|value| {
+                        i32::try_from(value.local_shape()[1]).map_err(|_| {
+                            Error::Parallel("DeepSeek MTP routed width exceeds i32".into())
+                        })
+                    })
+                    .transpose()?
+                    .unwrap_or(self.args.moe_intermediate_size);
+                let shared_intermediate = local_width(
+                    "mlp.shared_experts.gate_proj",
+                    0,
+                    self.args.moe_intermediate_size * self.args.n_shared_experts,
+                )?;
+                let global = self.args.num_hidden_layers as usize + index;
+                layer.decoder = DecoderLayer::new_parallel_layerwise(
+                    &mtp_args,
+                    global as i32,
+                    local_heads,
+                    dense_intermediate,
+                    routed_intermediate,
+                    shared_intermediate,
+                    stream,
+                )?;
+                layer.shared_head.configure_parallel(context, stream)?;
+            }
+        }
         Ok(())
     }
 
@@ -2216,8 +2755,6 @@ pub(crate) fn deepseek_expert_catalog(
     args: &ModelArgs,
     store: &dyn WeightStore,
 ) -> Result<Vec<ExpertCatalogEntry>, Error> {
-    let normalized = normalized_checkpoint_keys(store);
-    let mut entries = Vec::new();
     let mut expert_layers = args
         .layer_schedule
         .iter()
@@ -2228,6 +2765,35 @@ pub(crate) fn deepseek_expert_catalog(
         (0..args.num_nextn_predict_layers as usize)
             .map(|index| args.num_hidden_layers as usize + index),
     );
+    deepseek_expert_catalog_for_layers(args, store, expert_layers)
+}
+
+pub(crate) fn deepseek_pipeline_expert_catalog(
+    args: &ModelArgs,
+    store: &dyn WeightStore,
+    layers: impl IntoIterator<Item = usize>,
+    include_mtp: bool,
+) -> Result<Vec<ExpertCatalogEntry>, Error> {
+    let mut expert_layers = layers
+        .into_iter()
+        .filter(|layer| args.layer_schedule.get(*layer) == Some(&LayerPolicy::SparseMoe))
+        .collect::<Vec<_>>();
+    if include_mtp {
+        expert_layers.extend(
+            (0..args.num_nextn_predict_layers as usize)
+                .map(|index| args.num_hidden_layers as usize + index),
+        );
+    }
+    deepseek_expert_catalog_for_layers(args, store, expert_layers)
+}
+
+fn deepseek_expert_catalog_for_layers(
+    args: &ModelArgs,
+    store: &dyn WeightStore,
+    expert_layers: impl IntoIterator<Item = usize>,
+) -> Result<Vec<ExpertCatalogEntry>, Error> {
+    let normalized = normalized_checkpoint_keys(store);
+    let mut entries = Vec::new();
     for layer in expert_layers {
         let prefix = format!("model.layers.{layer}.mlp.experts");
         for expert in 0..usize::try_from(args.n_routed_experts).map_err(|_| {
@@ -2341,7 +2907,9 @@ mod tests {
             parallel::{ParallelBuildContext, ShardingPolicy},
             topology::{DeviceAssignment, ParallelTopology},
         },
-        runtime::execution::layerwise::{load_safetensors_layerwise_model, LayerwiseLoadOptions},
+        runtime::execution::layerwise::{
+            load_safetensors_layerwise_model, ArchitectureAdapter, LayerwiseLoadOptions,
+        },
         runtime::residency::expert_cache::ExpertCacheLoadOptions,
         runtime::residency::policy::{OffloadConfig, ResidencyPolicy},
         CacheResidencyPolicy, PagedCacheOptions,
@@ -2483,6 +3051,38 @@ mod tests {
         let adapter = DeepSeekV3LayerwiseAdapter::new(args, execution.stream()).unwrap();
         assert_eq!(adapter.mtp.as_ref().unwrap().len(), 2);
         assert_eq!(adapter.new_cache().mtp_layers.len(), 2);
+    }
+
+    #[test]
+    fn embedded_mtp_parameters_share_the_tensor_parallel_plan() {
+        let execution = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
+        let mut args = args(false);
+        args.num_nextn_predict_layers = 1;
+        let adapter = DeepSeekV3LayerwiseAdapter::new(args, execution.stream()).unwrap();
+        let context = ParallelBuildContext::new(
+            ParallelTopology::from_rank(2, 0, 2, 1, 1, DeviceAssignment::new(DeviceType::Cpu, 0))
+                .unwrap(),
+            ShardingPolicy::Require,
+        );
+        let mut planner = context.planner();
+        adapter
+            .register_parallel_parameters(context, &mut planner, execution.stream())
+            .unwrap();
+        let (_, layout) = planner.finish().unwrap();
+        assert_eq!(
+            layout
+                .tensor("layers.0.decoder.mlp.experts.gate_proj")
+                .unwrap()
+                .local_shape(),
+            &[4, 2, 8]
+        );
+        assert_eq!(
+            layout
+                .tensor("layers.0.shared_head.weight")
+                .unwrap()
+                .local_shape(),
+            &[16, 8]
+        );
     }
 
     fn initialize(model: &mut Model, stream: &Stream) {

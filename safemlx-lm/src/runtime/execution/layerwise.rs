@@ -2694,6 +2694,62 @@ impl<A: ArchitectureAdapter> LayerwiseModel<A> {
         .map(|(output, _)| output)
     }
 
+    /// Runs TP execution with the architecture's ordinary layer semantics and
+    /// returns the forward context retained by the pass.
+    ///
+    /// Embedded prediction heads consume the final decoder hidden state, so
+    /// distributed callers need the same context that replicated execution
+    /// exposes without replacing any layer operation.
+    pub(crate) fn forward_tensor_parallel_with_context<'a>(
+        &mut self,
+        input: A::Input<'a>,
+        cache: &mut A::Cache,
+        group: &safemlx::distributed::Group,
+        stream: &Stream,
+    ) -> Result<(Array, A::ForwardContext), Error> {
+        self.forward_tensor_parallel_with_hooks(
+            input,
+            cache,
+            group,
+            stream,
+            |adapter, group, index, layer, hidden, cache, context, execution| {
+                adapter.forward_layer_with_execution(
+                    group, index, layer, hidden, cache, context, execution,
+                )
+            },
+            |_, _, _| Ok(()),
+        )
+    }
+
+    /// Runs TP execution with a caller-provided layer operation and returns
+    /// the architecture context retained by the pass. This is the TP+EP
+    /// counterpart of [`Self::forward_with_layer_executor_and_context`].
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn forward_tensor_parallel_with_layer_executor_and_context<'a, F>(
+        &mut self,
+        input: A::Input<'a>,
+        cache: &mut A::Cache,
+        group: &safemlx::distributed::Group,
+        stream: &Stream,
+        executor: F,
+    ) -> Result<(Array, A::ForwardContext), Error>
+    where
+        F: FnMut(
+            &mut A,
+            usize,
+            usize,
+            &mut A::Layer,
+            &Array,
+            &mut A::Cache,
+            &mut A::ForwardContext,
+            &crate::runtime::distributed::parallel::ParallelExecutionContext<'_>,
+        ) -> Result<Array, Error>,
+    {
+        self.forward_tensor_parallel_with_hooks(input, cache, group, stream, executor, |_, _, _| {
+            Ok(())
+        })
+    }
+
     #[allow(clippy::too_many_arguments, clippy::type_complexity)]
     fn forward_tensor_parallel_with_hooks<'a, F, H>(
         &mut self,
