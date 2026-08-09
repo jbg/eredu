@@ -14,6 +14,13 @@ endif()
 option(BUILD_SHARED_LIBS "Build mlx C as a shared library" OFF)
 option(MLX_C_BUILD_EXAMPLES "Build examples for mlx C" ON)
 option(MLX_C_USE_SYSTEM_MLX "Use system MLX" OFF)
+option(MLX_C_BUILD_PATCH_TESTS
+       "Build opt-in tests carried by SafeMLX's vendored MLX patches" OFF)
+
+if(MLX_C_BUILD_PATCH_TESTS AND MLX_C_USE_SYSTEM_MLX)
+  message(FATAL_ERROR
+          "MLX_C_BUILD_PATCH_TESTS requires SafeMLX's vendored patched MLX")
+endif()
 
 # ----------------------------- mlx -----------------------------
 
@@ -24,7 +31,7 @@ if(POLICY CMP0135)
 endif()
 
 # mlx
-set(MLX_BUILD_TESTS OFF)
+set(MLX_BUILD_TESTS ${MLX_C_BUILD_PATCH_TESTS})
 set(MLX_BUILD_EXAMPLES OFF)
 set(MLX_BUILD_BENCHMARKS OFF)
 set(MLX_BUILD_PYTHON_BINDINGS OFF)
@@ -51,6 +58,24 @@ else()
       -DPATCH_FILE=${CMAKE_CURRENT_LIST_DIR}/patches/mlx-completion-events.patch
       -P ${CMAKE_CURRENT_LIST_DIR}/patches/apply-idempotent.cmake)
   FetchContent_MakeAvailable(mlx)
+endif()
+
+if(MLX_C_BUILD_PATCH_TESTS)
+  add_executable(
+    mlx-completion-patch-test-binary
+    ${mlx_SOURCE_DIR}/tests/tests.cpp
+    ${mlx_SOURCE_DIR}/tests/completion_tests.cpp)
+  target_link_libraries(mlx-completion-patch-test-binary PRIVATE mlx doctest)
+
+  add_custom_target(
+    mlx-completion-patch-tests
+    COMMAND
+      ${CMAKE_COMMAND} -E env DEVICE=cpu
+      $<TARGET_FILE:mlx-completion-patch-test-binary>
+      "--test-case=*completion*,*failed CPU event*"
+    DEPENDS mlx-completion-patch-test-binary
+    USES_TERMINAL
+    COMMENT "Running vendored MLX completion-event tests")
 endif()
 
 # When MLX is a FetchContent dependency its own install rules are not included

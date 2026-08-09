@@ -653,15 +653,6 @@ pub enum ResidencyError {
         #[source]
         source: safemlx::error::Exception,
     },
-    /// Explicit stream synchronization failed.
-    #[error("stream synchronization failed for residency unit {id}: {source}")]
-    Synchronization {
-        /// Unit identifier.
-        id: OffloadUnitId,
-        /// MLX exception.
-        #[source]
-        source: safemlx::error::Exception,
-    },
     /// Serialized manager state was poisoned by a prior panic.
     #[error("residency manager state is poisoned")]
     StatePoisoned,

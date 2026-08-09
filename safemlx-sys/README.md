@@ -20,9 +20,23 @@ SAFEMLX_SYS_GENERATE_BINDINGS=1 \
   cargo check -p safemlx-sys --features generate-bindings
 ```
 
-CPU-only builds exercise the no-GPU event implementation. Metal runtime tests
-are explicit and opt-in; CUDA builds are expected to compile in Linux/Windows
-CUDA CI, with runtime event tests on optional GPU runners.
+Linux CPU CI executes the no-GPU event implementation. macOS CI compiles the
+Metal event integration tests, and Linux/Windows CUDA CI compiles the same
+integration target with the CUDA-specific handoff test enabled. Metal and CUDA
+runtime handoff tests remain explicit and ignored because no GPU runners are
+currently configured.
+
+MLX's direct completion tests, including deterministic asynchronous failure
+retention and consumer-stream poisoning, are deliberately separate from normal
+Cargo builds. Run their opt-in CMake target through:
+
+```console
+bash safemlx-sys/scripts/test-mlx-completion-patch.sh
+```
+
+The dedicated CI workflow is path-scoped to the vendored patch, its CMake
+harness, and this script, so unrelated builds do not compile or run upstream
+MLX's test suite.
 
 ## Linux and CUDA
 

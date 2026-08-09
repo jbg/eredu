@@ -50,7 +50,9 @@ jobs:
       - name: Test the pure-Rust GGUF backend
         run: cargo test -p safemlx-gguf
       - name: Build and final-link safemlx tests
-        run: cargo test -p safemlx --lib --no-run --no-default-features
+        run: |
+          cargo test -p safemlx --lib --no-run --no-default-features
+          cargo test -p safemlx --test events --no-run --no-default-features
       - name: Run Windows file-format tests, including Unicode Rust GGUF paths
         run: cargo test -p safemlx --lib --no-default-features ops::io::tests -- --test-threads=1
       - name: Build a linked safemlx executable
@@ -128,7 +130,9 @@ jobs:
           Get-Command cl
           nvcc --version
       - name: Build and final-link safemlx CUDA tests
-        run: cargo test -j 1 -p safemlx --features cuda --lib --no-run --no-default-features
+        run: |
+          cargo test -j 1 -p safemlx --features cuda --lib --no-run --no-default-features
+          cargo test -j 1 -p safemlx --features cuda --test events --no-run --no-default-features
       - name: Build the linked CUDA smoke executable
         run: cargo build -j 1 -p safemlx --features cuda --example cuda_smoke --no-default-features
       - name: Build and final-link safemlx-lm configurations

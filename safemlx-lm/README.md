@@ -213,8 +213,10 @@ validated from metadata, keep all source leases alive through evaluation, and
 materialize the transformed runtime representation on the host before device
 promotion. Direct `WeightBinding` construction remains compatible.
 
-CUDA behavior is verified by CI; local verification in this workspace does not
-make discrete-memory capacity or performance claims.
+CUDA compilation and linkage, including the event integration test target, are
+verified by CI. CUDA runtime behavior is not currently exercised because no GPU
+runner is configured; local verification in this workspace does not make
+discrete-memory capacity or performance claims.
 
 The `safemlx::memory` controls affect process-global MLX-managed allocations.
 They do not directly constrain process RSS, checkpoint mappings, or unrelated

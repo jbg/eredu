@@ -1,0 +1,33 @@
+name: Vendored MLX patch tests
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/mlx-patch-tests.yml"
+      - "safemlx-sys/scripts/test-mlx-completion-patch.sh"
+      - "safemlx-sys/src/mlx-c/CMakeLists.txt"
+      - "safemlx-sys/src/mlx-c/patches/**"
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/mlx-patch-tests.yml"
+      - "safemlx-sys/scripts/test-mlx-completion-patch.sh"
+      - "safemlx-sys/src/mlx-c/CMakeLists.txt"
+      - "safemlx-sys/src/mlx-c/patches/**"
+  workflow_dispatch:
+
+jobs:
+  completion-events:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install MLX CPU build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libblas-dev liblapack-dev liblapacke-dev
+          python3 -m pip install --user "cmake>=3.25"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - name: Build and run the patched MLX completion tests
+        run: |
+          bash safemlx-sys/scripts/test-mlx-completion-patch.sh \
+            "$RUNNER_TEMP/mlx-completion-patch-tests"

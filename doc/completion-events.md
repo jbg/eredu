@@ -53,9 +53,16 @@ event; both possible streams must finish before its mmap lease can be released.
 Benchmark timing barriers intentionally continue to drain their measured
 streams, because the whole-stream boundary is the quantity being timed.
 
-CUDA compilation is expected in Linux and Windows CUDA CI. Runtime tests remain
-opt-in and require a CUDA-capable runner. The explicit Metal two-stream test is
-ignored in the ordinary suite and must be run on a Metal host with:
+The deterministic MLX C++ tests for CPU error retention and poisoned consumer
+streams are built only through the opt-in `mlx-completion-patch-tests` CMake
+target. The path-scoped `mlx-patch-tests.yml` workflow runs that target when the
+vendored patch or harness changes; ordinary MLX/Cargo builds keep
+`MLX_C_BUILD_PATCH_TESTS=OFF` and do not build upstream tests.
+
+Linux and Windows CUDA CI compile and link the event integration test with its
+CUDA-specific handoff enabled. Metal and CUDA runtime tests remain ignored and
+manual because no GPU runners are currently configured. The explicit Metal
+two-stream test must be run on a Metal host with:
 
 ```console
 cargo test -p safemlx --test events \

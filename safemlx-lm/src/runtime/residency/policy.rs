@@ -6,11 +6,13 @@
 //! explicit plans and records observations. The architecture-independent
 //! executor lives in [`crate::runtime::residency::manager`].
 //!
-//! The vendored MLX C API does not expose stream events or fences. Residency
-//! execution therefore uses conservative
-//! [`safemlx::Stream::synchronize`] boundaries. The transfer telemetry is
-//! independent of that implementation so event-backed coordination can be
-//! introduced later without changing this public API.
+//! SafeMLX's patched MLX API exposes backend-independent completion events.
+//! Residency execution returns caller-owned
+//! [`crate::runtime::residency::manager::ResidentTransfer`] values which retain
+//! source arrays and mapping leases until exact completion. Compatible consumer
+//! streams use backend-ordered event waits; host observations wait on the exact
+//! transfer event rather than draining either entire stream. Transfer telemetry
+//! remains independent of the synchronization mechanism.
 
 use std::{fmt, time::Duration};
 
