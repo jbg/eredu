@@ -239,10 +239,11 @@ cargo run --release -p safemlx-lm-cli -- \
 `--verbose` also prints logical current/peak host and device parameter bytes,
 synchronous transfer counts, and backend-tagged shard/reader diagnostics. Apple
 CPU and GPU tiers share unified physical memory, so these logical tiers do not
-increase total capacity. Dense Qwen SafeTensors can combine load-time
-quantization with bounded ordinary-layer residency; nonresident GGUF and KV
-cache offload are not supported by this path, while checkpoint-native GGUF
-quantization is.
+increase total capacity. Registered SafeTensors and unquantized F32/F16/BF16
+GGUF sources can combine bounded load-time affine/MXFP4 conversion with
+ordinary-layer residency. Checkpoint-native packed GGUF tensors load directly
+and are never implicitly requantized or transcoded. KV-cache offload is not
+supported by this path.
 
 Stream dense layers from either backend with finite tier controls:
 

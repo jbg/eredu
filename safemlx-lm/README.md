@@ -250,8 +250,11 @@ Residency reports account for parameter copies only; activations, KV state,
 kernels, and allocator cache can make MLX peak memory larger.
 
 Transfers are synchronous because the pinned MLX API exposes whole-stream
-synchronization but no events. GGUF, load-time quantization, pinned host
-buffers, KV-cache offload, and asynchronous transfer or
+synchronization but no public events. Registered GGUF checkpoints and bounded
+load-time affine/MXFP4 conversion from unquantized SafeTensors or
+F32/F16/BF16 GGUF sources use the same layerwise residency plan; matching
+checkpoint-native packed GGUF tensors load directly and are never implicitly
+transcoded. Pinned host buffers, KV-cache offload, and asynchronous transfer or
 compute overlap are not supported by this policy. The opt-in
 `llama_residency` example accepts a real checkpoint directory and reports
 latency, throughput, logical residency, transfer telemetry, allocator samples,
@@ -545,8 +548,12 @@ schema. Tensor parallelism covers the text decoder, dMel vocabulary, and hMLP
 folded inputs. Pure text pipeline stages support SafeTensors and canonical
 `inkling` GGUF through the shared KV-plus-fixed-state cache descriptor, with
 fully resident, host-layerwise, or dense disk-streamed local layers. Image/audio
-ingress must be folded before decoder pipeline execution. Expert parallelism
-derives sparse layers and cache policies from the same schedule.
+ingress may be direct or scheduler-owned: collective consensus includes its
+modality and shape identity, stage zero owns dMel/hMLP preparation, and pipeline
+transport connects matching non-PP coordinates. The same semantic bindings
+support bounded affine/MXFP4 materialization before resident, host-layerwise,
+dense-streamed, independent-expert-cache, and Cartesian execution. Expert
+parallelism derives sparse layers and cache policies from the same schedule.
 
 ## Nemotron-H weight residency
 
@@ -1096,6 +1103,18 @@ formats. Dense families have no EP migration.
 | Moshi/PersonaPlex | TP | Not applicable | Its temporal/depth runtime has no PP or EP constituent axis |
 
 The remaining global limitations are:
+
+- Host-to-device promotion and route inspection remain synchronous. The pinned
+  MLX 0.32.0 C surface exposes whole-stream synchronization and asynchronous
+  evaluation, but no public completion event that can be recorded on one
+  stream and awaited by another. Background disk-to-host warming is bounded;
+  device promotion cannot yet overlap computation through GPU-ordered
+  residency leases.
+- Load-time affine/MXFP4 conversion applies to semantically eligible grouped
+  matrix projections. Convolution kernels, normalization vectors, position
+  tables, and projection geometries that do not meet the selected group and
+  packed-kernel alignment remain dense; they are not silently padded or
+  rewritten into a different operator.
 
 - The shared bounded materialisation store supports out-of-core affine and
   MXFP4 conversion from row-bounded SafeTensors or dense GGUF semantic recipes.

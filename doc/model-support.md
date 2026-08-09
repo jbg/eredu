@@ -601,15 +601,20 @@ the architecture fingerprint. Persisted Inkling prompt caches store rank-local
 attention state and all four short-convolution histories through the
 heterogeneous-state schema. Tensor-parallel preflight, execution, and cache
 creation use the exact schedule. Pure text pipeline stages support exact
-SafeTensors and canonical `inkling` GGUF checkpoints with fully resident or
-dense disk-streamed local blocks. Every layer uses the shared
+SafeTensors and canonical `inkling` GGUF checkpoints with fully resident,
+host-layerwise, or dense disk-streamed local blocks. Every layer uses the shared
 `KeyValueWithFixedState` descriptor: ordinary or paged KV and all four
 convolution histories are persisted atomically by global layer and semantic
-role. Multimodal image/audio ingress must be folded before the decoder
-pipeline, and pipeline load-time requantization remains unsupported.
-Inkling's bounded multimodal path declares `vision_encoder -> text_decoder` in
-the same execution-group DAG and performs projection normalization and folded
-token assembly only when the text node becomes ready.
+role. Direct and scheduler-owned multimodal image/audio ingress carry one
+prepared payload whose modality and shape identity participate in collective
+consensus; stage zero consumes it through the shared model-input path and
+pipeline transport preserves matching TP/EP coordinates. Inkling's bounded
+multimodal path declares `vision_encoder -> text_decoder` in the same
+execution-group DAG and performs projection normalization and folded token
+assembly only when the text node becomes ready. Pipeline and Cartesian
+load-time affine/MXFP4 conversion use the same rank-local semantic recipes,
+including aligned hMLP projections, the dMel embedding, and routed/shared
+expert banks.
 
 JSON callers use
 `architectures::inkling::model::model_args_from_config_value`, then query
