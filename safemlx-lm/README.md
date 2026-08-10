@@ -301,7 +301,7 @@ context-growing and group bounded layers by exact window.
 
 JSON callers use `model_args_from_config_value`, and execution callers inspect
 `attention_schedule`.
-Prompt-cache schema v4 persists the complete ordered schedule, exact per-layer
+Prompt-cache schema v5 persists the complete ordered schedule, exact per-layer
 windows, tensor geometry, and retained token intervals. Save/reload therefore
 supports non-uniform and distinct-window schedules without weakening cache
 identity validation.
@@ -342,7 +342,7 @@ full. Enabled layers without a window, invalid windows, length mismatches, and
 non-Boolean encodings fail during the shared inspection/load parser.
 
 Callers construct or query `attention_schedule` directly. Ordered policies are included in architecture and prompt-cache
-fingerprints. Normal and paged caches support every schedule; schema-v4
+fingerprints. Normal and paged caches support every schedule; schema-v5
 persisted prompt caches preserve arbitrary ordered full/sliding policies,
 distinct per-layer windows, and each layer's retained token interval. Qwen2
 SafeTensors and GGUF tensor parallelism use the generalized family adapter.
@@ -371,7 +371,7 @@ Resident, layerwise-host, dense-streamed, ordinary-cache, paged-cache,
 generation, structural, expert-parallel, fingerprint, and runtime-state paths
 all consume the canonical schedule. Arbitrary ordering and internally distinct
 windows are supported; state reports group sliding layers by exact window and
-full layers grow with context. Prompt-cache schema v4 persists the complete
+full layers grow with context. Prompt-cache schema v5 persists the complete
 ordered schedule, exact per-layer windows, tensor geometry, and retained token
 intervals. JSON callers use `model_args_from_config_value`.
 
@@ -834,7 +834,7 @@ order. Alternating and discontiguous patterns are supported. A declared window
 without a pattern applies globally. Pattern/type/window conflicts and
 attention-affecting unsupported YaRN metadata are rejected during the same
 catalog inspection used by loading. Fully resident dense-Qwen models support
-normal, paged, and schema-v4 persisted prompt caches for full or mixed
+normal, paged, and schema-v5 persisted prompt caches for full or mixed
 Qwen2/Qwen2.5 schedules. The normalized schedule can carry distinct windows,
 and all-full Qwen3 uses the same persistence route. Qwen SafeTensors and GGUF
 tensor parallelism use the generalized family adapter. Pure dense-Qwen
@@ -1693,14 +1693,15 @@ parity and bounded rank-selective reads.
 
 Resident caches work for all of these text models. Kimi and Nemotron-H also
 support heterogeneous live paging: growing MLA blocks and Nemotron attention
-KV blocks use the shared paging manager, while bounded KDA or Mamba
-convolution/recurrent tensors remain device resident. The same per-layer
-descriptors persist fixed state and lazily reopen paged blocks with exact
-rank-local topology. LFM2 and Qwen hybrid TP adapters use the same manager for
-their attention state while retaining bounded convolution and recurrent state
-locally. Embedded attention-bearing draft caches join that manager. LFM2
-supports rank-aware persisted prompt-cache snapshots and restores them into its
-heterogeneous resident cache.
+KV blocks are `SealablePaged`; small KDA, Mamba, Qwen, LFM2, and Inkling
+convolution histories are `AlwaysDeviceMutable`; and the large KDA, Mamba, and
+Qwen linear-attention matrices are `LayerScopedOffloadable`. Fixed-state policy
+uses a narrower sum type without a paged variant, preventing mutable state from
+being constructed as sealed attention storage. The same schema-v5 per-layer
+descriptors persist these behaviors and lazily reopen paged blocks with exact
+rank-local topology. Embedded attention-bearing draft caches join the manager.
+LFM2 supports rank-aware persisted prompt-cache snapshots and restores them
+into its heterogeneous resident cache.
 
 Embedding and output rows use balanced contiguous vocabulary ranges, including
 uneven vocabulary sizes. Embedding masks out non-local ids then all-sums hidden
@@ -2531,7 +2532,7 @@ Licensed under either Apache-2.0 or MIT.
 Paged attention-cache residency and reusable prompt-cache persistence are
 opt-in. Device-resident caches remain the default. See
 [`CACHE_RESIDENCY.md`](CACHE_RESIDENCY.md) for configuration, compatibility,
-cost, and safety details. Prompt-cache schema v4 records exact ordered per-layer
+cost, and safety details. Prompt-cache schema v5 records exact ordered per-layer
 attention plus convolution, recurrent, compressed-MLA, and multimodal prefix
 state, including distinct sliding windows. Prompt-cache loading accepts schema
 v4. LFM2 causal-convolution state and Nemotron-H Mamba state use the same

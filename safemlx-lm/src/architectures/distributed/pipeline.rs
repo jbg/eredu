@@ -20138,6 +20138,7 @@ mod tests {
                         role: crate::runtime::cache::residency::StateTensorRole::Recurrent,
                         shape: vec![crate::runtime::cache::residency::StateTensorDimension::Scalar],
                         dtype: crate::runtime::cache::residency::StateTensorDtype::Float32,
+                        residency: crate::MutableStateResidency::LayerScopedOffloadable,
                         required: true,
                     }],
                 }],
@@ -20168,6 +20169,7 @@ mod tests {
             StateTensorRole::Recurrent,
             vec![crate::runtime::cache::residency::StateTensorDimension::Scalar],
             crate::runtime::cache::residency::StateTensorDtype::Float32,
+            crate::MutableStateResidency::LayerScopedOffloadable,
         )
         .unwrap();
         let mut first = PipelineStateSlot::empty(policy.clone());
@@ -20211,6 +20213,10 @@ mod tests {
         use crate::runtime::cache::residency::{StateTensorDimension, StateTensorDtype};
 
         let tensor = |role| {
+            let residency = match role {
+                StateTensorRole::Recurrent => crate::MutableStateResidency::LayerScopedOffloadable,
+                _ => crate::MutableStateResidency::AlwaysDeviceMutable,
+            };
             StateTensorPolicy::new(
                 role,
                 vec![
@@ -20218,6 +20224,7 @@ mod tests {
                     StateTensorDimension::fixed(1).unwrap(),
                 ],
                 StateTensorDtype::Float32,
+                residency,
             )
             .unwrap()
         };

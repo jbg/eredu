@@ -35,7 +35,7 @@ use crate::runtime::{
     residency::policy::CacheEvictionPolicy,
 };
 
-const PROMPT_CACHE_SCHEMA_VERSION: u32 = 4;
+const PROMPT_CACHE_SCHEMA_VERSION: u32 = 5;
 const MAX_PROMPT_CACHE_SHARD_HEADER_BYTES: u64 = 1024 * 1024;
 const PROMPT_CACHE_GENERATIONS_DIRECTORY: &str = ".generations";
 const PROMPT_CACHE_CURRENT_FILE: &str = "CURRENT";
@@ -3603,6 +3603,46 @@ pub enum StateTensorRole {
     PositionDelta,
 }
 
+/// Runtime ownership behavior for live model state.
+///
+/// The variants describe mutually exclusive physical lifecycles instead of a
+/// tier plus independent flags. Mutable rolling state cannot accidentally be
+/// admitted to the sealed pager, and layer-scoped state has an explicit
+/// promotion/demotion boundary.
+#[derive(Debug, Clone, Copy, Eq, Hash, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StateResidencyClass {
+    /// Small mutable state that remains on the execution device for its lifetime.
+    AlwaysDeviceMutable,
+    /// Append-only state that becomes immutable blocks before paging.
+    SealablePaged,
+    /// Mutable state used by one layer at a time and eligible for host offload
+    /// between layer executions.
+    LayerScopedOffloadable,
+}
+
+/// Residency behaviors valid for mutable fixed-state tensors.
+///
+/// `SealablePaged` is deliberately absent: fixed mutable state cannot be
+/// constructed as an append-only paged payload.
+#[derive(Debug, Clone, Copy, Eq, Hash, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MutableStateResidency {
+    /// Small mutable state that remains on the execution device.
+    AlwaysDeviceMutable,
+    /// Mutable state promoted only for its owning layer.
+    LayerScopedOffloadable,
+}
+
+impl From<MutableStateResidency> for StateResidencyClass {
+    fn from(value: MutableStateResidency) -> Self {
+        match value {
+            MutableStateResidency::AlwaysDeviceMutable => Self::AlwaysDeviceMutable,
+            MutableStateResidency::LayerScopedOffloadable => Self::LayerScopedOffloadable,
+        }
+    }
+}
+
 /// One dimension in a persisted fixed-state tensor.
 #[derive(Debug, Clone, Copy, Eq, Hash, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -3640,11 +3680,23 @@ pub struct StateTensorPolicy {
     pub shape: Vec<StateTensorDimension>,
     /// Accepted dtype family.
     pub dtype: StateTensorDtype,
+    /// Authoritative live-state residency behavior.
+    pub residency: MutableStateResidency,
     /// Whether every persisted cache must materialize this tensor.
     pub required: bool,
 }
 
 impl LayerCachePolicy {
+    /// Returns the residency behavior of this layer's attention payload.
+    pub const fn attention_residency_class(&self) -> Option<StateResidencyClass> {
+        match self {
+            Self::NoState | Self::FixedState { .. } => None,
+            Self::KeyValue { .. }
+            | Self::CompressedLatentRotary { .. }
+            | Self::KeyValueWithFixedState { .. } => Some(StateResidencyClass::SealablePaged),
+        }
+    }
+
     /// Constructs validated ordinary key/value state geometry.
     pub fn key_value(
         attention: AttentionPolicy,
@@ -3727,11 +3779,13 @@ impl StateTensorPolicy {
         role: StateTensorRole,
         shape: Vec<StateTensorDimension>,
         dtype: StateTensorDtype,
+        residency: MutableStateResidency,
     ) -> Result<Self, CacheResidencyError> {
         let policy = Self {
             role,
             shape,
             dtype,
+            residency,
             required: true,
         };
         validate_state_tensor_policies(std::slice::from_ref(&policy))?;
@@ -3742,6 +3796,11 @@ impl StateTensorPolicy {
     pub const fn optional(mut self) -> Self {
         self.required = false;
         self
+    }
+
+    /// Returns the unified residency classification for this fixed state.
+    pub fn residency_class(&self) -> StateResidencyClass {
+        self.residency.into()
     }
 }
 
@@ -3860,6 +3919,18 @@ fn validate_state_tensor_policies(
             return Err(CacheResidencyError::InvalidOptions(format!(
                 "invalid fixed-state tensor shape for role {:?}",
                 tensor.role
+            )));
+        }
+        let expected = match tensor.role {
+            StateTensorRole::Recurrent => MutableStateResidency::LayerScopedOffloadable,
+            StateTensorRole::Convolution { .. }
+            | StateTensorRole::PrefixEmbedding
+            | StateTensorRole::PositionDelta => MutableStateResidency::AlwaysDeviceMutable,
+        };
+        if tensor.residency != expected {
+            return Err(CacheResidencyError::InvalidOptions(format!(
+                "fixed-state tensor role {:?} requires {:?} residency, got {:?}",
+                tensor.role, expected, tensor.residency
             )));
         }
     }
@@ -6557,8 +6628,8 @@ mod tests {
         DiskCacheReadState, DiskLocation, DiskOperationKey, DiskOperationKind, DiskResult,
         DiskTask, DiskWorker, DiskWriteCommit, HostCacheBlock, HostCachePersistence,
         HostDemotionCompletion, HostDemotionTicket, HostWriteReservation, LayerCachePolicy,
-        LayerSchedule, PagedCacheOptions, PendingDiskOperation, PromptCacheBlock,
-        PromptCacheDescriptor, PromptCacheManifest, PromptCacheModelIdentity,
+        LayerSchedule, MutableStateResidency, PagedCacheOptions, PendingDiskOperation,
+        PromptCacheBlock, PromptCacheDescriptor, PromptCacheManifest, PromptCacheModelIdentity,
         PromptCacheStateTensor, PromptCacheTopology, StateTensorDimension, StateTensorDtype,
         StateTensorOwner, StateTensorPolicy, StateTensorRole, TemporaryFileGuard,
         CACHE_RESIDENCY_LAYER_REPORT_LIMIT, MAX_PROMPT_CACHE_SHARD_HEADER_BYTES,
@@ -6865,7 +6936,17 @@ mod tests {
     }
 
     #[test]
-    fn v4_fixed_state_layout_round_trips_and_changes_identity() {
+    fn v5_behavioral_state_layout_round_trips_and_changes_identity() {
+        let incoherent = StateTensorPolicy::new(
+            StateTensorRole::Recurrent,
+            vec![StateTensorDimension::Scalar],
+            StateTensorDtype::Float32,
+            MutableStateResidency::AlwaysDeviceMutable,
+        )
+        .expect_err("large recurrent state cannot use the rolling-state lifecycle");
+        assert!(incoherent
+            .to_string()
+            .contains("requires LayerScopedOffloadable"));
         let convolution = StateTensorPolicy::new(
             StateTensorRole::Convolution { slot: 0 },
             vec![
@@ -6874,6 +6955,7 @@ mod tests {
                 StateTensorDimension::fixed(4).unwrap(),
             ],
             StateTensorDtype::Floating,
+            MutableStateResidency::AlwaysDeviceMutable,
         )
         .unwrap();
         let recurrent = StateTensorPolicy::new(
@@ -6883,6 +6965,7 @@ mod tests {
                 StateTensorDimension::fixed(4).unwrap(),
             ],
             StateTensorDtype::Float32,
+            MutableStateResidency::LayerScopedOffloadable,
         )
         .unwrap();
         let layouts = [
@@ -6919,6 +7002,18 @@ mod tests {
             })
             .collect::<std::collections::BTreeSet<_>>();
         assert_eq!(hashes.len(), layouts.len());
+        assert_eq!(
+            convolution.residency_class(),
+            super::StateResidencyClass::AlwaysDeviceMutable
+        );
+        assert_eq!(
+            recurrent.residency_class(),
+            super::StateResidencyClass::LayerScopedOffloadable
+        );
+        assert_eq!(
+            layouts[2].get(0).unwrap().attention_residency_class(),
+            Some(super::StateResidencyClass::SealablePaged)
+        );
     }
 
     fn write_fixed_state_fixture(root: &Path) -> PromptCacheManifest {
@@ -6937,6 +7032,7 @@ mod tests {
                 StateTensorDimension::fixed(4).unwrap(),
             ],
             StateTensorDtype::Floating,
+            MutableStateResidency::AlwaysDeviceMutable,
         )
         .unwrap();
         let manifest = PromptCacheManifest {

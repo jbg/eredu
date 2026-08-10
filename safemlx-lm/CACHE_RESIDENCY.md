@@ -45,18 +45,20 @@ LFM2/LFM2-MoE and Qwen hybrid models can use paged attention through the
 pipeline runtime. Their high-level and tensor-parallel model entry points reject
 paged residency explicitly.
 
-Recurrent linear-attention, Mamba, and convolution state are not block-paged;
-they remain device resident while supported attention KV uses the paged block
-manager. Inkling uses this split because its attention KV can be paged
-independently from its four bounded convolution histories.
-Kimi Linear likewise uses a heterogeneous cache: KDA layers retain three
-bounded convolution histories plus an F32 recurrent state, while MLA layers
-retain compressed no-RoPE latents. That cache supports resident and
-weight-layerwise execution. Schema-v4 prompt snapshots persist both state kinds;
-KDA itself is not represented as paged KV.
-Nemotron-H uses the same split at a different layer granularity: Mamba layers
-retain bounded convolution/SSM state, attention layers page ordinary KV with
-their exact full or sliding policy, and MLP/MoE layers remain stateless.
+Live state has one authoritative behavioral classification. `SealablePaged`
+belongs to append-only KV and compressed-latent payloads; `AlwaysDeviceMutable`
+belongs to small rolling convolution histories and scalar/prefix metadata; and
+`LayerScopedOffloadable` belongs to large recurrent matrices used by only one
+decoder layer at a time. Fixed-state descriptors use the narrower
+`MutableStateResidency` sum type, which deliberately has no `SealablePaged`
+variant, so mutable state cannot be constructed as a paged payload.
+
+Kimi KDA, Qwen hybrid linear attention, and Nemotron-H Mamba recurrent matrices
+are `LayerScopedOffloadable`. Their convolution histories remain
+`AlwaysDeviceMutable`. Inkling and LFM2 contain only the latter class. Attention
+KV and Kimi MLA state remain `SealablePaged`; MLP/MoE-only layers are stateless.
+Schema-v5 prompt snapshots persist the classification with each exact tensor
+descriptor, and reload rejects a behavior mismatch before materialization.
 
 ## Sliding and full attention
 
@@ -224,7 +226,7 @@ scheduler as an aggregate pool; deployments bound aggregate exposure with
 `max_active_requests` and choose per-request `PagedCacheOptions` accordingly.
 No arrays are shared between request identities. EOS and cancellation drop the
 state and cache, while `release_request_cache` hands an idle decoder cache back
-to the caller for explicit schema-v4 persistence.
+to the caller for explicit schema-v5 persistence.
 
 `AttentionPolicy::Sliding { window: N }` includes the current token in the `N`
 positions. Ordinary live state therefore needs at most `N - 1` past positions

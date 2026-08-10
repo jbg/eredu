@@ -655,6 +655,7 @@ pub(crate) fn prompt_cache_layer_layout_with_geometry(
                         fixed(conv_dim)?,
                     ],
                     StateTensorDtype::Floating,
+                    crate::MutableStateResidency::AlwaysDeviceMutable,
                 )
                 .map_err(cache_error)?,
             );
@@ -669,6 +670,7 @@ pub(crate) fn prompt_cache_layer_layout_with_geometry(
                     fixed(args.ssm_state_size)?,
                 ],
                 StateTensorDtype::Float32,
+                crate::MutableStateResidency::LayerScopedOffloadable,
             )
             .map_err(cache_error)?,
         );

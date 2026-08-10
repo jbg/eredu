@@ -724,6 +724,7 @@ pub(crate) fn prompt_cache_layer_layout_with_geometry(
                         fixed(projection)?,
                     ],
                     StateTensorDtype::Floating,
+                    crate::MutableStateResidency::AlwaysDeviceMutable,
                 )
                 .map_err(cache_error)?,
             );
@@ -738,6 +739,7 @@ pub(crate) fn prompt_cache_layer_layout_with_geometry(
                     fixed(head_dim)?,
                 ],
                 StateTensorDtype::Float32,
+                crate::MutableStateResidency::LayerScopedOffloadable,
             )
             .map_err(cache_error)?,
         );

@@ -351,8 +351,9 @@ routed intermediates under every parameter residency policy. A matching GGUF
 fixture verifies exact name translation, two-rank numerical parity, and bounded
 rank-selective reads. Both routes exercise heterogeneous live paging and
 rank-aware prompt-cache reload: growing MLA blocks page through the shared
-manager while bounded KDA convolution/recurrent state remains resident and is
-persisted as fixed state.
+manager. Its convolution histories are explicitly `AlwaysDeviceMutable`, while
+the substantially larger recurrent matrix is `LayerScopedOffloadable`; both are
+persisted as fixed state with their behavior recorded in schema v5.
 Inkling assigns complete GQA KV groups together with their query/relative
 heads, output columns, and K/V short-convolution channels. Dense, routed, and
 shared-expert intermediates use planner-derived balanced or
@@ -429,7 +430,7 @@ full/sliding order and distinct positive windows. Each ordinary or paged cache
 receives its layer's exact policy; an `N`-position sliding window includes the
 current token and retains at most `N - 1` past positions between calls. Memory
 reports count context-growing full layers and group bounded layers by exact
-window. Prompt-cache schema v4 persists the complete order, exact per-layer
+window. Prompt-cache schema v5 persists the complete order, exact per-layer
 windows and tensor layouts, and each layer's retained token interval.
 
 JSON configuration is parsed with
@@ -459,7 +460,7 @@ the high-level `load_model_with_options` API; architecture-level execution uses
 the generalized `architectures::qwen::dense::layerwise` loader. Every schedule supports resident,
 layerwise-host, dense-streamed, ordinary-cache, and paged-cache execution. The
 complete ordered schedule participates in architecture and prompt-cache
-fingerprints. Resident models support schema-v4 persisted prompt caches for arbitrary ordered Qwen2
+fingerprints. Resident models support schema-v5 persisted prompt caches for arbitrary ordered Qwen2
 full/sliding patterns and exact per-layer windows; all-full Qwen3 uses the same
 route. Qwen2 Q/K/V biases are applied in every execution policy. Tensor and
 pipeline parallel Qwen use the generalized dense-Qwen adapter. Pure pipeline
@@ -489,13 +490,13 @@ parser before weights are materialized.
 The schedule is the sole source for resident, layerwise-host, dense-streamed,
 ordinary-cache, paged-cache, generation, structural, expert-parallel,
 fingerprint, and runtime-state paths. Internally constructed schedules may use
-arbitrary ordering and distinct windows. Prompt-cache schema v4 persists the
+arbitrary ordering and distinct windows. Prompt-cache schema v5 persists the
 complete ordered schedule, exact per-layer windows and tensor layouts, and each
 layer's retained token interval. JSON callers use
 `architectures::gpt_oss::model::model_args_from_config_value`.
 Pure GPT-OSS pipeline execution uses the same binding and schedule plans for
 SafeTensors and canonical `gpt-oss` GGUF. It supports fully resident and dense
-disk-streamed local layers, ordinary/paged/schema-v4 persisted caches, and
+disk-streamed local layers, ordinary/paged/schema-v5 persisted caches, and
 rank-synchronized generation. Native MXFP4 expert banks remain packed;
 eligible dense matrices may be MXFP4-quantized before resident,
 host-layerwise, or dense-streamed stage planning, while affine and packed-input
@@ -806,7 +807,7 @@ granularity for sparse-cache and expert-parallel execution.
 
 Important boundaries:
 
-- Prompt-cache persistence accepts schema v4. Its ordered
+- Prompt-cache persistence accepts schema v5. Its ordered
   architecture-neutral layout preserves full/sliding order, each
   positive window, ordinary KV, DeepSeek compressed MLA, fixed convolution and
   recurrent tensors, multimodal prefix state, tensor geometry, and global
@@ -839,17 +840,18 @@ Important boundaries:
   allocator caches, checkpoint mappings, or every temporary buffer.
 - Kimi KDA and Qwen linear-attention state are persisted as fixed-state tensors,
   not misrepresented as paged KV. Inkling may page attention while keeping its
-  convolution histories resident, and schema-v4 publication atomically records
+  convolution histories resident, and schema-v5 publication atomically records
   both parts before reload into an exact resident continuation cache.
 - LFM2 persists ordered causal-convolution history and full-attention KV.
   Pure LFM2/LFM2-MoE pipeline stages use the same descriptor-backed live and
   persisted state, including fixed-state-only ranks.
-  Nemotron-H keeps bounded Mamba convolution/recurrent state resident while
-  paging attention KV, and persists both while explicitly representing
+  Nemotron-H classifies its small Mamba convolution history as
+  `AlwaysDeviceMutable`, its recurrent matrix as `LayerScopedOffloadable`, and
+  its attention KV as `SealablePaged`, and persists all state while explicitly representing
   MLP/MoE-only layers as empty `StateSlots`. Its tensor- and pure expert-parallel routes
   use the same live-paged representation with exact rank topology.
 - Realtime Moshi/PersonaPlex temporal/depth session state remains outside schema
-  v4. The realtime adapter owns that state in the canonical scheduler and can
+  v5. The realtime adapter owns that state in the canonical scheduler and can
   release it for application-level handoff, but persisted timing/depth state is
   not represented by the decoder prompt-cache schema.
 - SafeTensors mapping and logical-transfer counters cannot report exact

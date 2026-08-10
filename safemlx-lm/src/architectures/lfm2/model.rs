@@ -574,6 +574,7 @@ pub(crate) fn prompt_cache_layer_layout_with_geometry(
                             fixed(channels)?,
                         ],
                         StateTensorDtype::Floating,
+                        crate::MutableStateResidency::AlwaysDeviceMutable,
                     )
                     .map_err(cache_error)?])
                     .map_err(cache_error)

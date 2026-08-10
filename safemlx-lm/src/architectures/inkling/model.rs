@@ -418,6 +418,7 @@ pub(crate) fn prompt_cache_layer_layout_with_geometry(
                         StateTensorRole::Convolution { slot: slot as u32 },
                         vec![StateTensorDimension::Batch, fixed(history)?, fixed(width)?],
                         StateTensorDtype::Floating,
+                        crate::MutableStateResidency::AlwaysDeviceMutable,
                     )
                     .map_err(cache_error)
                 })

@@ -233,6 +233,7 @@ pub(crate) fn prompt_cache_layer_layout_with_kv_heads(
                         StateTensorRole::PositionDelta,
                         vec![StateTensorDimension::Scalar],
                         StateTensorDtype::Int32,
+                        crate::MutableStateResidency::AlwaysDeviceMutable,
                     )
                     .map_err(cache_error)?],
                 )

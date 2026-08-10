@@ -1109,6 +1109,7 @@ pub(crate) fn prompt_cache_layer_layout_with_geometry(
                             StateTensorDimension::fixed(args.hidden_size).map_err(cache_error)?,
                         ],
                         StateTensorDtype::Floating,
+                        crate::MutableStateResidency::AlwaysDeviceMutable,
                     )
                     .map_err(cache_error)?
                     .optional()],
