@@ -246,9 +246,41 @@ pub struct PlacedExecutionDag {
     pipeline_stages: usize,
     groups: Vec<ExecutionGroupPlacement>,
     routes: Vec<PlacementRoute>,
-    encoder_rank_path: Vec<usize>,
-    execution_order: Vec<usize>,
+    semantic: ExecutionGroupDag,
     output: usize,
+}
+
+/// Runtime reason that two graph-ready groups cannot overlap.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub enum PlacedGroupSerialReason {
+    /// The backend does not permit independent streams on a shared PP owner.
+    SharedRankBackend {
+        /// Conflicting PP coordinates.
+        pp_ranks: Vec<usize>,
+    },
+    /// Both groups would use one bounded rank-local residency window.
+    SharedResidencyWindow {
+        /// Conflicting PP coordinates.
+        pp_ranks: Vec<usize>,
+    },
+    /// TP/EP collective submission order must remain identical on shared owners.
+    CollectiveOrdering {
+        /// Conflicting PP coordinates.
+        pp_ranks: Vec<usize>,
+    },
+}
+
+/// Runtime resources which determine whether graph-ready groups may overlap.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct PlacedGroupConcurrencyPolicy {
+    /// The local backend supports distinct execution streams.
+    pub rank_local_streams: bool,
+    /// Rank-local media units share one bounded residency controller/window.
+    pub shared_residency_window: bool,
+    /// Active tensor-parallel degree.
+    pub tensor_parallel_size: usize,
+    /// Active expert-parallel degree.
+    pub expert_parallel_size: usize,
 }
 
 impl PlacedExecutionDag {
@@ -361,7 +393,6 @@ impl PlacedExecutionDag {
                 });
             }
         }
-        let encoder_rank_path = ordered_encoder_rank_path(&groups)?;
         validate_segment_graph(&groups, &routes)?;
         let output = groups
             .iter()
@@ -371,8 +402,7 @@ impl PlacedExecutionDag {
             pipeline_stages,
             groups,
             routes,
-            encoder_rank_path,
-            execution_order: semantic.execution_order().to_vec(),
+            semantic,
             output,
         })
     }
@@ -389,17 +419,13 @@ impl PlacedExecutionDag {
     pub fn routes(&self) -> &[PlacementRoute] {
         &self.routes
     }
-    /// Returns the dependency-safe serial path through every encoder owner.
-    ///
-    /// Independent ready roots share this deterministic path. A PP coordinate
-    /// appears at most once; projector and finalization routes may return the
-    /// payload to an earlier coordinate after the terminal encoder owner.
-    pub fn encoder_rank_path(&self) -> &[usize] {
-        &self.encoder_rank_path
-    }
     /// Returns stable topological group order.
     pub fn execution_order(&self) -> &[usize] {
-        &self.execution_order
+        self.semantic.execution_order()
+    }
+    /// Returns the shared semantic DAG used by the ready-set scheduler.
+    pub(crate) const fn semantic(&self) -> &ExecutionGroupDag {
+        &self.semantic
     }
     /// Returns the authoritative output group.
     pub fn output(&self) -> &ExecutionGroupPlacement {
@@ -408,6 +434,59 @@ impl PlacedExecutionDag {
     /// Resolves a group by identity.
     pub fn group(&self, id: &str) -> Option<&ExecutionGroupPlacement> {
         self.groups.iter().find(|group| group.id == id)
+    }
+    /// Resolves a stable architecture slot by group identity.
+    pub fn group_index(&self, id: &str) -> Option<usize> {
+        self.groups.iter().position(|group| group.id == id)
+    }
+    /// Returns dependency slots in declaration/schema order.
+    pub fn dependency_indices(&self, group: usize) -> Option<&[usize]> {
+        self.semantic.dependencies(group)
+    }
+    /// Returns the route for one producer/consumer boundary.
+    pub fn dependency_route(
+        &self,
+        producer: &str,
+        consumer: &str,
+    ) -> Option<(usize, &PlacementRoute)> {
+        self.routes
+            .iter()
+            .enumerate()
+            .find(|(_, route)| route.from_group == producer && route.to_group == consumer)
+    }
+    /// Determines whether two ready groups may submit rank-local compute in
+    /// parallel. Transport remains ordered separately in stable group order.
+    pub fn concurrency_compatibility(
+        &self,
+        left: usize,
+        right: usize,
+        policy: PlacedGroupConcurrencyPolicy,
+    ) -> Result<(), PlacedGroupSerialReason> {
+        let left = &self.groups[left];
+        let right = &self.groups[right];
+        let left_ranks = group_ranks(left).into_iter().collect::<BTreeSet<_>>();
+        let right_ranks = group_ranks(right).into_iter().collect::<BTreeSet<_>>();
+        let shared = left_ranks
+            .intersection(&right_ranks)
+            .copied()
+            .collect::<Vec<_>>();
+        if shared.is_empty() {
+            return Ok(());
+        }
+        if !policy.rank_local_streams {
+            return Err(PlacedGroupSerialReason::SharedRankBackend { pp_ranks: shared });
+        }
+        if policy.shared_residency_window {
+            return Err(PlacedGroupSerialReason::SharedResidencyWindow { pp_ranks: shared });
+        }
+        let tensor_collective = policy.tensor_parallel_size > 1
+            && (left.active_subgroup.tensor_parallel || right.active_subgroup.tensor_parallel);
+        let expert_collective = policy.expert_parallel_size > 1
+            && (left.active_subgroup.expert_parallel || right.active_subgroup.expert_parallel);
+        if tensor_collective || expert_collective {
+            return Err(PlacedGroupSerialReason::CollectiveOrdering { pp_ranks: shared });
+        }
+        Ok(())
     }
     /// Iterates rank-local group intervals.
     pub fn local_groups(
@@ -418,55 +497,6 @@ impl PlacedExecutionDag {
             .iter()
             .filter_map(move |group| group.local_units(pp_rank).map(|range| (group, range)))
     }
-}
-
-fn ordered_encoder_rank_path(groups: &[ExecutionGroupPlacement]) -> Result<Vec<usize>, Error> {
-    let encoders = groups.iter().filter(|group| {
-        matches!(
-            group.kind,
-            ExecutionGroupKind::VisionEncoder | ExecutionGroupKind::AudioEncoder
-        )
-    });
-    let mut ranks = BTreeSet::new();
-    let mut edges = BTreeMap::<usize, BTreeSet<usize>>::new();
-    let mut indegree = BTreeMap::<usize, usize>::new();
-    for group in encoders {
-        for owner in &group.owners {
-            ranks.insert(owner.pp_rank);
-            indegree.entry(owner.pp_rank).or_default();
-        }
-        for owners in group.owners.windows(2) {
-            let from = owners[0].pp_rank;
-            let to = owners[1].pp_rank;
-            if edges.entry(from).or_default().insert(to) {
-                *indegree.entry(to).or_default() += 1;
-            }
-        }
-    }
-    let mut ready = ranks
-        .iter()
-        .copied()
-        .filter(|rank| indegree.get(rank).copied().unwrap_or_default() == 0)
-        .collect::<BTreeSet<_>>();
-    let mut path = Vec::with_capacity(ranks.len());
-    while let Some(rank) = ready.pop_first() {
-        path.push(rank);
-        for &dependent in edges.get(&rank).into_iter().flatten() {
-            let degree = indegree
-                .get_mut(&dependent)
-                .expect("encoder owner has indegree");
-            *degree -= 1;
-            if *degree == 0 {
-                ready.insert(dependent);
-            }
-        }
-    }
-    if path.len() != ranks.len() {
-        return Err(Error::Parallel(
-            "encoder PP owner paths contain a rank-level cycle".into(),
-        ));
-    }
-    Ok(path)
 }
 
 fn validate_rank_path(id: &str, stages: usize, ranks: &[usize]) -> Result<(), Error> {
@@ -753,7 +783,6 @@ mod tests {
                 },
             ]
         );
-        assert_eq!(graph.encoder_rank_path(), [0, 1, 2]);
         assert!(graph.routes().iter().any(|route| {
             route.from_group == "vision" && route.to_group == "vision" && route.pp_path == [0, 1]
         }));
@@ -763,7 +792,7 @@ mod tests {
     }
 
     #[test]
-    fn encoder_path_excludes_unowned_ranks_and_preserves_non_adjacent_owners() {
+    fn routes_exclude_unowned_ranks_and_preserve_non_adjacent_owners() {
         let single = PlacedExecutionDag::plan(
             4,
             vec![request(
@@ -778,7 +807,6 @@ mod tests {
             "vision",
         )
         .unwrap();
-        assert_eq!(single.encoder_rank_path(), [0]);
         assert!(single.routes().is_empty());
 
         let non_adjacent = PlacedExecutionDag::plan(
@@ -795,12 +823,11 @@ mod tests {
             "vision",
         )
         .unwrap();
-        assert_eq!(non_adjacent.encoder_rank_path(), [0, 2]);
         assert_eq!(non_adjacent.routes()[0].pp_path, [0, 2]);
     }
 
     #[test]
-    fn rejects_incompatible_encoder_rank_paths() {
+    fn differently_ordered_encoder_paths_do_not_form_a_synthetic_rank_cycle() {
         let conflicting = vec![
             request(
                 "vision",
@@ -830,10 +857,76 @@ mod tests {
                 "media",
             ),
         ];
-        let error = PlacedExecutionDag::plan(2, conflicting, "merge").unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("encoder PP owner paths contain a rank-level cycle"));
+        let graph = PlacedExecutionDag::plan(2, conflicting, "merge").unwrap();
+        assert_eq!(graph.group("vision").unwrap().owners[0].pp_rank, 0);
+        assert_eq!(graph.group("audio").unwrap().owners[0].pp_rank, 1);
+    }
+
+    #[test]
+    fn compatibility_explicitly_serializes_collectives_and_shared_windows() {
+        let graph = PlacedExecutionDag::plan(
+            2,
+            vec![
+                request(
+                    "vision",
+                    &[],
+                    ExecutionGroupKind::VisionEncoder,
+                    2,
+                    &[0, 1],
+                    "media",
+                    "encoded",
+                ),
+                request(
+                    "audio",
+                    &[],
+                    ExecutionGroupKind::AudioEncoder,
+                    2,
+                    &[0, 1],
+                    "media",
+                    "encoded",
+                ),
+                request(
+                    "merge",
+                    &["vision", "audio"],
+                    ExecutionGroupKind::Merger,
+                    1,
+                    &[0],
+                    "encoded",
+                    "encoded",
+                ),
+            ],
+            "merge",
+        )
+        .unwrap();
+        let resident_pp = PlacedGroupConcurrencyPolicy {
+            rank_local_streams: true,
+            shared_residency_window: false,
+            tensor_parallel_size: 1,
+            expert_parallel_size: 1,
+        };
+        assert_eq!(graph.concurrency_compatibility(0, 1, resident_pp), Ok(()));
+        assert!(matches!(
+            graph.concurrency_compatibility(
+                0,
+                1,
+                PlacedGroupConcurrencyPolicy {
+                    shared_residency_window: true,
+                    ..resident_pp
+                }
+            ),
+            Err(PlacedGroupSerialReason::SharedResidencyWindow { .. })
+        ));
+        assert!(matches!(
+            graph.concurrency_compatibility(
+                0,
+                1,
+                PlacedGroupConcurrencyPolicy {
+                    tensor_parallel_size: 2,
+                    ..resident_pp
+                }
+            ),
+            Err(PlacedGroupSerialReason::CollectiveOrdering { .. })
+        ));
     }
 
     #[test]

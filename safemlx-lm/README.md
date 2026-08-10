@@ -1055,6 +1055,25 @@ explicit routes when an encoder tail, projector, finalizer, and decoder ingress
 are not adjacent. It rejects cycles, disconnected groups, ambiguous ownership,
 schema mismatches, and impossible routes before weight loading.
 
+The same DAG is the runtime ready set. Each root retains its own group slot,
+owner path, rank-local unit range, payload envelope, completion event, and
+outgoing routes; there is no synthesized encoder-rank chain. A stable greedy
+batch admits every mutually compatible ready group. Fully resident pure-PP
+Gemma image and audio roots submit on distinct rank-local streams and may both
+remain in flight. Groups sharing a bounded host-layerwise or dense-stream
+window run serially, as do shared-rank TP/EP collectives and backends without
+safe independent streams. These fallbacks use declaration order, so collective
+submission is identical on every rank. Point-to-point transfers are then
+issued in stable route order even when producer compute overlapped.
+
+Every transfer carries its placement-route identity and schema. Receivers keep
+payloads keyed by `(consumer, producer)` and reject duplicate, missing,
+misrouted, empty-required, or wrong-schema envelopes. A merger reads dependency
+slots in declaration order, not completion order, so simultaneous Gemma vision
+and audio roots assemble identically when audio finishes first. Non-adjacent
+and differently shaped owner paths use their explicit intra-group routes;
+stages outside a root path neither receive nor forward that root payload.
+
 Qwen3-VL and Qwen3.5 route evolving vision activations and DeepStack state
 between rank-local TP-sharded block ranges, then route projector output to text
 ingress. Gemma 4 independently schedules simultaneous vision and audio roots
@@ -1082,7 +1101,12 @@ weights from planned non-resident layer bytes.
 placement, transfer, eviction, and active-window telemetry for either
 non-resident policy; `dense_stream_report` adds disk-stream pass and cache
 statistics only when that policy is active. `PipelineStageInfo` carries the
-same report's global rank and TP/PP/EP coordinates and stage ownership.
+same report's global rank and TP/PP/EP coordinates, global encoder geometry,
+rank-local group ownership, all touching routes, and conservative versus
+observed concurrent-residency peaks. `PipelineModel::placed_ingress_schedule_report`
+adds the last run's ready batches, maximum in-flight group count, observed
+routes, and every serial-fallback pair with its backend, residency, or
+collective-ordering reason.
 DeepSeek-V3/R1, Qwen3-MoE, Qwen3-VL-MoE, Kimi Linear, Inkling, GPT-OSS,
 LFM2-MoE, Nemotron-H-MoE, Gemma 4 MoE, and Qwen3-Next/Qwen3.5-MoE also compose all
 three axes in this runtime. TP

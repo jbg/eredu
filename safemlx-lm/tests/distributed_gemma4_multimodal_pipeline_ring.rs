@@ -772,6 +772,25 @@ fn gemma4_multimodal_pipeline_ring_worker() {
             .unwrap(),
         None => scheduler.run_queued(&mut model, &group, &stream).unwrap(),
     };
+    let schedule = model.placed_ingress_schedule_report();
+    let bounded =
+        std::env::var_os(DENSE_STREAM).is_some() || std::env::var_os(LAYERWISE_HOST).is_some();
+    if bounded || tp > 1 {
+        assert_eq!(schedule.maximum_in_flight_groups, 1);
+        assert!(!schedule.serial_fallbacks.is_empty());
+    } else {
+        assert_eq!(schedule.maximum_in_flight_groups, 2);
+        assert!(schedule.ready_batches.iter().any(|batch| {
+            batch == &["vision_encoder".to_string(), "audio_encoder".to_string()]
+        }));
+    }
+    if topology.pipeline_parallel_rank == 0 {
+        assert!(!schedule.routed_transfers.is_empty());
+    } else {
+        assert!(schedule.routed_transfers.iter().all(|route| {
+            route.from_group != "vision_encoder" && route.from_group != "audio_encoder"
+        }));
+    }
     let logits = completed.pop().unwrap().into_logits().unwrap();
     let mut cache = scheduler.release_request_cache(request).unwrap();
     assert_eq!(logits.is_some(), topology.pipeline_parallel_rank == 1);

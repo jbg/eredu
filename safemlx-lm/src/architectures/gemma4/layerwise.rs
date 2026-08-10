@@ -1441,23 +1441,31 @@ pub struct Gemma4LayerwiseAdapter {
 }
 
 impl Gemma4LayerwiseAdapter {
-    /// Exports all independent image/audio job activations for the next PP owner.
-    pub(crate) fn pipeline_ingress_arrays(&self, state: &Gemma4PipelineIngressState) -> Vec<Array> {
-        state
-            .forward
-            .context
-            .vision_jobs
-            .iter()
-            .map(|job| job.hidden.clone())
-            .chain(
-                state
-                    .forward
-                    .context
-                    .audio_jobs
-                    .iter()
-                    .map(|job| job.hidden.clone()),
-            )
-            .collect()
+    /// Exports only one execution group's payload, preserving job order.
+    pub(crate) fn pipeline_group_ingress_arrays(
+        &self,
+        group: &str,
+        state: &Gemma4PipelineIngressState,
+    ) -> Result<Vec<Array>, Error> {
+        match group {
+            "vision_encoder" => Ok(state
+                .forward
+                .context
+                .vision_jobs
+                .iter()
+                .map(|job| job.hidden.clone())
+                .collect()),
+            "audio_encoder" => Ok(state
+                .forward
+                .context
+                .audio_jobs
+                .iter()
+                .map(|job| job.hidden.clone())
+                .collect()),
+            _ => Err(Error::Parallel(format!(
+                "Gemma has no routed media payload for execution group {group:?}"
+            ))),
+        }
     }
 
     /// Imports independent image/audio job activations from the previous PP owner.
@@ -1498,6 +1506,64 @@ impl Gemma4LayerwiseAdapter {
             .first()
             .or_else(|| audio_arrays.first())
             .cloned()
+            .unwrap_or_else(|| state.forward.hidden.clone());
+        Ok(())
+    }
+
+    /// Imports only one execution group's payload without disturbing an
+    /// independently in-flight sibling root.
+    pub(crate) fn replace_pipeline_group_ingress_arrays(
+        &self,
+        group: &str,
+        state: &mut Gemma4PipelineIngressState,
+        arrays: Vec<Array>,
+    ) -> Result<(), Error> {
+        match group {
+            "vision_encoder" => {
+                if arrays.len() != state.forward.context.vision_jobs.len() {
+                    return Err(Error::Parallel(format!(
+                        "Gemma vision payload has {} jobs, expected {}",
+                        arrays.len(),
+                        state.forward.context.vision_jobs.len()
+                    )));
+                }
+                for (job, hidden) in state.forward.context.vision_jobs.iter_mut().zip(arrays) {
+                    job.state.working_dtype = hidden.dtype();
+                    job.hidden = hidden;
+                }
+            }
+            "audio_encoder" => {
+                if arrays.len() != state.forward.context.audio_jobs.len() {
+                    return Err(Error::Parallel(format!(
+                        "Gemma audio payload has {} jobs, expected {}",
+                        arrays.len(),
+                        state.forward.context.audio_jobs.len()
+                    )));
+                }
+                for (job, hidden) in state.forward.context.audio_jobs.iter_mut().zip(arrays) {
+                    job.hidden = hidden;
+                }
+            }
+            _ => {
+                return Err(Error::Parallel(format!(
+                    "Gemma has no routed media payload for execution group {group:?}"
+                )))
+            }
+        }
+        state.forward.hidden = state
+            .forward
+            .context
+            .vision_jobs
+            .first()
+            .map(|job| job.hidden.clone())
+            .or_else(|| {
+                state
+                    .forward
+                    .context
+                    .audio_jobs
+                    .first()
+                    .map(|job| job.hidden.clone())
+            })
             .unwrap_or_else(|| state.forward.hidden.clone());
         Ok(())
     }
@@ -2155,7 +2221,7 @@ pub(crate) struct Gemma4PipelineIngressOutput {
 }
 
 impl Gemma4LayerwiseAdapter {
-    fn execution_group_name(&self, group: usize) -> Result<&'static str, Error> {
+    pub(crate) fn execution_group_name(&self, group: usize) -> Result<&'static str, Error> {
         let mut index = 0;
         if self.vision_depth > 0 {
             if group == index {

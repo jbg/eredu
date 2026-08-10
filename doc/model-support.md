@@ -551,17 +551,25 @@ fused GGUF expert gate/up banks, use the same authoritative binding plan before
 quantization. Host-layerwise and dense disk-streamed stages create their packed
 overlay before residency planning, and matching checkpoint-native encodings
 load directly. Implicit transcoding between packed encodings fails closed.
-Gemma image and audio encoders are not pipeline capabilities.
+Gemma image and audio encoders use the common placed pipeline DAG. Vision,
+audio, their projectors, modality merge/finalization, and the decoder retain
+separate global geometry, ordered PP owner paths, active TP/EP subgroups,
+static roles, checkpoint/residency bindings, payload schemas, and routes. The
+runtime derives readiness from this graph directly. Fully resident pure-PP
+vision and audio roots submit on independent streams and can remain in flight
+together; a shared bounded residency window, overlapping TP/EP collectives, or
+a backend stream restriction selects deterministic declaration-order serial
+fallback. Transport remains route-ordered on every rank.
 
-Resident, layerwise-host, and tensor-parallel Gemma multimodal execution uses
-the common validated execution-group DAG: vision and audio are independent
-roots, and the text decoder explicitly depends on both. A root may be skipped
-when its modality is absent, but both dependency outputs are resolved before
-the adapter performs exact token/embedding and mask assembly at the text
-boundary. Execution-group dependencies do not require numeric adjacency, and
-ready roots are submitted on independent same-thread MLX streams. Exact
-completion events order only declared dependency edges; media encoders can
-therefore remain in flight concurrently before text assembly.
+Payload envelopes carry the exact route and schema, are stored by producer and
+consumer group, and are merged in dependency declaration order regardless of
+completion order. Missing, duplicate, misrouted, and wrong-schema payloads fail
+closed. Non-adjacent and differently shaped root paths do not enlist unowned PP
+stages. Requests without media skip optional tower execution and transfers;
+cached decode performs no tower work. `PipelineStageInfo` reports global and
+rank-local group geometry, routes, and conservative/observed concurrent
+residency, while `placed_ingress_schedule_report` reports ready batches,
+in-flight width, route observations, and fallback reasons.
 
 `ModelArgs::layer_schedule` and `ModelArgs::layer_policy` are the normalized
 layer APIs. JSON callers use `model_args_from_config_value` and

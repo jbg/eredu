@@ -15,7 +15,8 @@ mod placement;
 pub use placement::{
     ActiveParallelSubgroup, CheckpointBinding, ExecutionGroupKind, ExecutionGroupPlacement,
     ExecutionGroupPlacementRequest, PayloadField, PayloadSchema, PlacedExecutionDag,
-    PlacedUnitRange, PlacementRoute, ResidencyBinding, StaticTensorOwnership,
+    PlacedGroupConcurrencyPolicy, PlacedGroupSerialReason, PlacedUnitRange, PlacementRoute,
+    ResidencyBinding, StaticTensorOwnership,
 };
 
 use std::{
@@ -96,8 +97,9 @@ use crate::{
     runtime::execution::layerwise::{
         open_safetensors_weight_store, quantize_pipeline_stage_store, shard_layer_bindings,
         ArchitectureAdapter, DenseDiskStreamReport, DenseStreamController, DenseTransferWindow,
-        LayerWeightResidency, LayerwiseLoadOptions, LoadTimeQuantizableAdapter,
-        PipelineStageQuantizationSelection, SharedWeightStore, StaticUnitBindings,
+        ExecutionGroupReadySet, LayerWeightResidency, LayerwiseLoadOptions,
+        LoadTimeQuantizableAdapter, PipelineStageQuantizationSelection, SharedWeightStore,
+        StaticUnitBindings,
     },
     runtime::generation::{
         embedded_mtp::{DistributedEmbeddedMtpSampler, EmbeddedMtpOutput, EmbeddedMtpTarget},
@@ -194,10 +196,18 @@ pub struct PipelineStageInfo {
     pub global_encoder_units: usize,
     /// Encoder/projector/merge/finalization units owned by this PP coordinate.
     pub local_encoder_units: usize,
+    /// Exact group/unit intervals and static roles owned by this PP coordinate.
+    pub local_execution_groups: Vec<LocalPlacedGroupOwnership>,
     /// Explicit encoder and merge routes touching this PP coordinate.
     pub encoder_routes: Vec<PlacementRoute>,
+    /// Root group pairs eligible to overlap under this rank's runtime policy.
+    pub overlap_eligible_groups: Vec<[String; 2]>,
+    /// Root group pairs forced into deterministic serial fallback at preflight.
+    pub planned_serial_fallbacks: Vec<PlacedSerialFallbackReport>,
     /// Conservative concurrent rank-local parameter residency peak.
     pub concurrent_residency_peak_bytes: u64,
+    /// Peak concurrent rank-local residency observed by placed-DAG execution.
+    pub observed_concurrent_residency_peak_bytes: u64,
     /// Total routed experts in global model geometry, when applicable.
     pub global_expert_count: Option<usize>,
     /// Checkpoint-global expert ids owned by this stage rank.
@@ -229,6 +239,41 @@ pub struct PipelineStageInfo {
     /// Bounded stage-local load-time materialization telemetry, when dense
     /// semantic weights were converted into a packed overlay.
     pub materialization: Option<BoundedQuantizationReport>,
+}
+
+/// Rank-local ownership projected from the authoritative placed DAG.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct LocalPlacedGroupOwnership {
+    /// Stable execution-group identity.
+    pub group: String,
+    /// Group-global repeated units owned locally, or `0..0` for static-only roles.
+    pub global_units: Range<usize>,
+    /// Static tensor roles uniquely owned by this PP coordinate.
+    pub static_roles: Vec<String>,
+}
+
+/// One deterministic reason a pair of ready groups used serial fallback.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct PlacedSerialFallbackReport {
+    /// Earlier group in stable architecture order.
+    pub left: String,
+    /// Later group in stable architecture order.
+    pub right: String,
+    /// Resource or collective constraint which prevented overlap.
+    pub reason: PlacedGroupSerialReason,
+}
+
+/// Instrumentation from the most recent placed-ingress DAG execution.
+#[derive(Debug, Clone, Default, Eq, PartialEq)]
+pub struct PlacedIngressScheduleReport {
+    /// Ready groups admitted together, in stable declaration order.
+    pub ready_batches: Vec<Vec<String>>,
+    /// Largest number of active groups simultaneously submitted.
+    pub maximum_in_flight_groups: usize,
+    /// Per-route transfers observed on this PP coordinate.
+    pub routed_transfers: Vec<PlacementRoute>,
+    /// Ready pairs forced into deterministic serial fallback.
+    pub serial_fallbacks: Vec<PlacedSerialFallbackReport>,
 }
 
 /// Shape metadata shared by every rank for one pipeline operation.
@@ -315,49 +360,120 @@ enum PreparedPipelineIngress {
     Identity(PreparedModelInputIdentity),
 }
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-struct PlacedIngressRankRoute {
-    encoder_predecessor: Option<usize>,
-    encoder_successor: Option<usize>,
-    finalizer_destination: Option<usize>,
-    finalizer_source: Option<usize>,
-    executes_encoder: bool,
-    finalizes: bool,
+const PLACED_PAYLOAD_WIRE_MAGIC: i32 = 0x534d_4c58;
+
+#[derive(Debug, Clone)]
+struct PlacedGroupPayload {
+    producer: usize,
+    schema: String,
+    arrays: Vec<Array>,
 }
 
-fn placed_ingress_rank_route(
-    placement: &PlacedExecutionDag,
-    pp_rank: usize,
-) -> Result<PlacedIngressRankRoute, Error> {
-    let path = placement.encoder_rank_path();
-    let terminal = path.last().copied().ok_or_else(|| {
-        Error::Parallel("multimodal placement omitted an encoder owner path".into())
-    })?;
-    let finalizer = placement
-        .group("modality_finalization")
-        .and_then(ExecutionGroupPlacement::first_owner)
-        .ok_or_else(|| {
-            Error::Parallel("multimodal placement omitted a finalization owner".into())
-        })?;
-    let position = path.iter().position(|rank| *rank == pp_rank);
-    Ok(PlacedIngressRankRoute {
-        encoder_predecessor: position
-            .and_then(|position| position.checked_sub(1).map(|index| path[index])),
-        encoder_successor: position.and_then(|position| path.get(position + 1).copied()),
-        finalizer_destination: (pp_rank == terminal && terminal != finalizer).then_some(finalizer),
-        finalizer_source: (pp_rank == finalizer && terminal != finalizer).then_some(terminal),
-        executes_encoder: position.is_some(),
-        finalizes: pp_rank == finalizer,
-    })
+impl PlacedGroupPayload {
+    fn validate_for(
+        &self,
+        placement: &PlacedExecutionDag,
+        producer: usize,
+        schema: &PayloadSchema,
+        active: bool,
+    ) -> Result<(), Error> {
+        if self.producer != producer {
+            return Err(Error::Parallel(format!(
+                "placed payload producer slot {} does not match expected slot {producer}",
+                self.producer
+            )));
+        }
+        if self.schema != schema.id {
+            return Err(Error::Parallel(format!(
+                "placed payload from {:?} has schema {:?}, expected {:?}",
+                placement.groups()[producer].id,
+                self.schema,
+                schema.id
+            )));
+        }
+        let required = schema.fields.iter().filter(|field| !field.optional).count();
+        if active && self.arrays.len() < required {
+            return Err(Error::Parallel(format!(
+                "placed payload from {:?} has {} tensors, schema {:?} requires at least {required}",
+                placement.groups()[producer].id,
+                self.arrays.len(),
+                schema.id
+            )));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Default)]
+struct PlacedPayloadStore {
+    incoming: BTreeMap<(usize, usize), PlacedGroupPayload>,
+}
+
+impl PlacedPayloadStore {
+    fn insert(&mut self, consumer: usize, payload: PlacedGroupPayload) -> Result<(), Error> {
+        let key = (consumer, payload.producer);
+        if self.incoming.insert(key, payload).is_some() {
+            return Err(Error::Parallel(format!(
+                "duplicate placed payload for consumer slot {consumer} from producer slot {}",
+                key.1
+            )));
+        }
+        Ok(())
+    }
+
+    fn ordered_dependencies(
+        &mut self,
+        placement: &PlacedExecutionDag,
+        consumer: usize,
+        active: &[bool],
+    ) -> Result<Vec<PlacedGroupPayload>, Error> {
+        placement
+            .dependency_indices(consumer)
+            .unwrap_or_default()
+            .iter()
+            .map(|&producer| {
+                let payload = self.incoming.remove(&(consumer, producer)).ok_or_else(|| {
+                    Error::Parallel(format!(
+                        "missing placed payload for {:?} from {:?}",
+                        placement.groups()[consumer].id,
+                        placement.groups()[producer].id
+                    ))
+                })?;
+                payload.validate_for(
+                    placement,
+                    producer,
+                    &placement.groups()[consumer].input_schema,
+                    active[producer],
+                )?;
+                Ok(payload)
+            })
+            .collect()
+    }
+
+    fn ensure_empty(&self) -> Result<(), Error> {
+        if self.incoming.is_empty() {
+            Ok(())
+        } else {
+            Err(Error::Parallel(format!(
+                "placed ingress completed with {} unconsumed payloads",
+                self.incoming.len()
+            )))
+        }
+    }
 }
 
 fn send_array_bundle(
     arrays: &[Array],
+    route_tag: usize,
     peer: usize,
     group: &Group,
     stream: &Stream,
 ) -> Result<Vec<Array>, Error> {
-    let count = Array::from_slice(&[arrays.len() as i32], &[1]);
+    let route_tag = i32::try_from(route_tag)
+        .map_err(|_| Error::Parallel("placed route index exceeds i32".into()))?;
+    let count = i32::try_from(arrays.len())
+        .map_err(|_| Error::Parallel("placed payload tensor count exceeds i32".into()))?;
+    let count = Array::from_slice(&[PLACED_PAYLOAD_WIRE_MAGIC, route_tag, count], &[3]);
     let sent_count = distributed::send(&count, peer, group, stream)?;
     synchronize_outputs([&sent_count])?;
     let mut retained = vec![sent_count];
@@ -383,10 +499,27 @@ fn send_array_bundle(
     Ok(retained)
 }
 
-fn recv_array_bundle(peer: usize, group: &Group, stream: &Stream) -> Result<Vec<Array>, Error> {
-    let count = distributed::recv(&[1], Dtype::Int32, peer, group, stream)?;
+fn recv_array_bundle(
+    peer: usize,
+    expected_route_tag: usize,
+    group: &Group,
+    stream: &Stream,
+) -> Result<Vec<Array>, Error> {
+    let count = distributed::recv(&[3], Dtype::Int32, peer, group, stream)?;
     synchronize_outputs([&count])?;
-    let count = usize::try_from(count.try_item::<i32>(stream)?)
+    let evaluated_count = count.evaluated()?;
+    let header = evaluated_count.try_as_slice::<i32>().map_err(|error| {
+        Error::Parallel(format!("placed payload envelope is not readable: {error}"))
+    })?;
+    if header[0] != PLACED_PAYLOAD_WIRE_MAGIC
+        || usize::try_from(header[1]).ok() != Some(expected_route_tag)
+    {
+        return Err(Error::Parallel(format!(
+            "placed payload route tag {:?} does not match expected route {expected_route_tag}",
+            header.get(1)
+        )));
+    }
+    let count = usize::try_from(header[2])
         .map_err(|_| Error::Parallel("placed payload advertised a negative tensor count".into()))?;
     let mut arrays = Vec::with_capacity(count);
     for _ in 0..count {
@@ -730,6 +863,27 @@ pub struct PipelinePayload {
     pub hidden: Array,
     /// Immutable tensors relayed unchanged through the remaining stages.
     pub auxiliary: PipelineAuxiliaryState,
+}
+
+impl PipelinePayload {
+    fn into_arrays(self) -> Vec<Array> {
+        std::iter::once(self.hidden)
+            .chain(self.auxiliary.tensors)
+            .collect()
+    }
+
+    fn from_arrays(mut arrays: Vec<Array>) -> Result<Self, Error> {
+        if arrays.is_empty() {
+            return Err(Error::Parallel(
+                "placed modality finalization produced an empty decoder payload".into(),
+            ));
+        }
+        let hidden = arrays.remove(0);
+        Ok(Self {
+            hidden,
+            auxiliary: PipelineAuxiliaryState::new(arrays),
+        })
+    }
 }
 
 /// Explicit input to stage-local execution.
@@ -1765,6 +1919,7 @@ trait PipelineStageAdapter {
     fn parameter_residency_report(&self) -> Result<Option<ResidencyReport>, Error>;
     fn checkpoint_diagnostics(&self) -> Result<Option<WeightStoreDiagnostics>, Error>;
     fn expert_cache_report(&self) -> Result<Option<ExpertCacheReport>, Error>;
+    fn placed_ingress_shared_residency_window(&self) -> bool;
 
     fn begin_placed_ingress(
         &mut self,
@@ -1778,15 +1933,22 @@ trait PipelineStageAdapter {
         execution: Option<&ParallelExecutionContext<'_>>,
         stream: &Stream,
     ) -> Result<Option<Box<dyn Any>>, Error>;
-    fn placed_ingress_active(&self, state: &dyn Any) -> Result<bool, Error>;
-    fn placed_ingress_arrays(&self, state: &dyn Any) -> Result<Vec<Array>, Error>;
+    fn placed_ingress_active(&self, group: &str, state: &dyn Any) -> Result<bool, Error>;
+    fn placed_ingress_arrays(&self, group: &str, state: &dyn Any) -> Result<Vec<Array>, Error>;
     fn replace_placed_ingress_arrays(
+        &self,
+        group: &str,
+        state: &mut dyn Any,
+        arrays: Vec<Array>,
+    ) -> Result<(), Error>;
+    fn merge_placed_ingress_arrays(
         &self,
         state: &mut dyn Any,
         arrays: Vec<Array>,
     ) -> Result<(), Error>;
     fn execute_placed_ingress(
         &mut self,
+        group: &str,
         state: &mut dyn Any,
         step: PipelineStep,
         execution: Option<&ParallelExecutionContext<'_>>,
@@ -1878,14 +2040,15 @@ trait PipelineStageSemantics {
     ) -> Result<Option<Box<dyn Any>>, Error> {
         self.begin_placed_ingress(input, execution, stream)
     }
-    fn placed_ingress_active(&self, _state: &dyn Any) -> Result<bool, Error> {
+    fn placed_ingress_active(&self, _group: &str, _state: &dyn Any) -> Result<bool, Error> {
         Ok(false)
     }
-    fn placed_ingress_arrays(&self, _state: &dyn Any) -> Result<Vec<Array>, Error> {
+    fn placed_ingress_arrays(&self, _group: &str, _state: &dyn Any) -> Result<Vec<Array>, Error> {
         Ok(Vec::new())
     }
     fn replace_placed_ingress_arrays(
         &self,
+        _group: &str,
         _state: &mut dyn Any,
         arrays: Vec<Array>,
     ) -> Result<(), Error> {
@@ -1897,8 +2060,22 @@ trait PipelineStageSemantics {
             ))
         }
     }
+    fn merge_placed_ingress_arrays(
+        &self,
+        _state: &mut dyn Any,
+        arrays: Vec<Array>,
+    ) -> Result<(), Error> {
+        if arrays.is_empty() {
+            Ok(())
+        } else {
+            Err(Error::Parallel(
+                "text-only stage received merged placed encoder payload".into(),
+            ))
+        }
+    }
     fn execute_placed_ingress(
         &mut self,
+        _group: &str,
         _state: &mut dyn Any,
         _step: PipelineStep,
         _execution: Option<&ParallelExecutionContext<'_>>,
@@ -2047,6 +2224,10 @@ impl<S: PipelineStageSemantics> PipelineStageAdapter for PipelineStage<S> {
             .map_err(Error::from)
     }
 
+    fn placed_ingress_shared_residency_window(&self) -> bool {
+        self.0.dense_layers().is_some()
+    }
+
     fn begin_placed_ingress(
         &mut self,
         input: crate::api::input::ModelInput<'_>,
@@ -2066,31 +2247,41 @@ impl<S: PipelineStageSemantics> PipelineStageAdapter for PipelineStage<S> {
             .begin_placed_ingress_continuation(input, execution, stream)
     }
 
-    fn placed_ingress_active(&self, state: &dyn Any) -> Result<bool, Error> {
-        self.0.placed_ingress_active(state)
+    fn placed_ingress_active(&self, group: &str, state: &dyn Any) -> Result<bool, Error> {
+        self.0.placed_ingress_active(group, state)
     }
 
-    fn placed_ingress_arrays(&self, state: &dyn Any) -> Result<Vec<Array>, Error> {
-        self.0.placed_ingress_arrays(state)
+    fn placed_ingress_arrays(&self, group: &str, state: &dyn Any) -> Result<Vec<Array>, Error> {
+        self.0.placed_ingress_arrays(group, state)
     }
 
     fn replace_placed_ingress_arrays(
         &self,
+        group: &str,
         state: &mut dyn Any,
         arrays: Vec<Array>,
     ) -> Result<(), Error> {
-        self.0.replace_placed_ingress_arrays(state, arrays)
+        self.0.replace_placed_ingress_arrays(group, state, arrays)
+    }
+
+    fn merge_placed_ingress_arrays(
+        &self,
+        state: &mut dyn Any,
+        arrays: Vec<Array>,
+    ) -> Result<(), Error> {
+        self.0.merge_placed_ingress_arrays(state, arrays)
     }
 
     fn execute_placed_ingress(
         &mut self,
+        group: &str,
         state: &mut dyn Any,
         step: PipelineStep,
         execution: Option<&ParallelExecutionContext<'_>>,
         stream: &Stream,
     ) -> Result<(), Error> {
         self.0
-            .execute_placed_ingress(state, step, execution, stream)
+            .execute_placed_ingress(group, state, step, execution, stream)
     }
 
     fn finish_placed_ingress(
@@ -3028,21 +3219,38 @@ impl PipelineStageSemantics for GemmaStage {
             .transpose()
     }
 
-    fn placed_ingress_active(&self, state: &dyn Any) -> Result<bool, Error> {
+    fn placed_ingress_active(&self, group: &str, state: &dyn Any) -> Result<bool, Error> {
         let state = state
             .downcast_ref::<crate::architectures::gemma4::layerwise::Gemma4PipelineIngressState>()
             .ok_or_else(|| Error::Parallel("Gemma placed ingress state type mismatch".into()))?;
-        Ok(!self.layer_adapter.pipeline_ingress_arrays(state).is_empty())
+        Ok(!self
+            .layer_adapter
+            .pipeline_group_ingress_arrays(group, state)?
+            .is_empty())
     }
 
-    fn placed_ingress_arrays(&self, state: &dyn Any) -> Result<Vec<Array>, Error> {
+    fn placed_ingress_arrays(&self, group: &str, state: &dyn Any) -> Result<Vec<Array>, Error> {
         let state = state
             .downcast_ref::<crate::architectures::gemma4::layerwise::Gemma4PipelineIngressState>()
             .ok_or_else(|| Error::Parallel("Gemma placed ingress state type mismatch".into()))?;
-        Ok(self.layer_adapter.pipeline_ingress_arrays(state))
+        self.layer_adapter
+            .pipeline_group_ingress_arrays(group, state)
     }
 
     fn replace_placed_ingress_arrays(
+        &self,
+        group: &str,
+        state: &mut dyn Any,
+        arrays: Vec<Array>,
+    ) -> Result<(), Error> {
+        let state = state
+            .downcast_mut::<crate::architectures::gemma4::layerwise::Gemma4PipelineIngressState>()
+            .ok_or_else(|| Error::Parallel("Gemma placed ingress state type mismatch".into()))?;
+        self.layer_adapter
+            .replace_pipeline_group_ingress_arrays(group, state, arrays)
+    }
+
+    fn merge_placed_ingress_arrays(
         &self,
         state: &mut dyn Any,
         arrays: Vec<Array>,
@@ -3056,6 +3264,7 @@ impl PipelineStageSemantics for GemmaStage {
 
     fn execute_placed_ingress(
         &mut self,
+        group: &str,
         state: &mut dyn Any,
         step: PipelineStep,
         execution: Option<&ParallelExecutionContext<'_>>,
@@ -3064,7 +3273,7 @@ impl PipelineStageSemantics for GemmaStage {
         let state = state
             .downcast_mut::<crate::architectures::gemma4::layerwise::Gemma4PipelineIngressState>()
             .ok_or_else(|| Error::Parallel("Gemma placed ingress state type mismatch".into()))?;
-        self.execute_placed_media_state(state, step, execution, stream)
+        self.execute_placed_media_state(group, state, step, execution, stream)
     }
 
     fn finish_placed_ingress(
@@ -3350,7 +3559,7 @@ impl PipelineStageSemantics for Qwen3VlStage {
             .map(|state| Some(Box::new(state) as Box<dyn Any>))
     }
 
-    fn placed_ingress_active(&self, state: &dyn Any) -> Result<bool, Error> {
+    fn placed_ingress_active(&self, _group: &str, state: &dyn Any) -> Result<bool, Error> {
         let state = state
             .downcast_ref::<crate::architectures::qwen::vl::layerwise::Qwen3VlPipelineIngressState>(
             )
@@ -3358,7 +3567,7 @@ impl PipelineStageSemantics for Qwen3VlStage {
         Ok(self.layer_adapter.pipeline_ingress_active(state))
     }
 
-    fn placed_ingress_arrays(&self, state: &dyn Any) -> Result<Vec<Array>, Error> {
+    fn placed_ingress_arrays(&self, _group: &str, state: &dyn Any) -> Result<Vec<Array>, Error> {
         let state = state
             .downcast_ref::<crate::architectures::qwen::vl::layerwise::Qwen3VlPipelineIngressState>(
             )
@@ -3367,6 +3576,20 @@ impl PipelineStageSemantics for Qwen3VlStage {
     }
 
     fn replace_placed_ingress_arrays(
+        &self,
+        _group: &str,
+        state: &mut dyn Any,
+        arrays: Vec<Array>,
+    ) -> Result<(), Error> {
+        let state = state
+            .downcast_mut::<crate::architectures::qwen::vl::layerwise::Qwen3VlPipelineIngressState>(
+            )
+            .ok_or_else(|| Error::Parallel("Qwen3-VL placed ingress state type mismatch".into()))?;
+        self.layer_adapter
+            .replace_pipeline_ingress_arrays(state, arrays)
+    }
+
+    fn merge_placed_ingress_arrays(
         &self,
         state: &mut dyn Any,
         arrays: Vec<Array>,
@@ -3381,6 +3604,7 @@ impl PipelineStageSemantics for Qwen3VlStage {
 
     fn execute_placed_ingress(
         &mut self,
+        _group: &str,
         state: &mut dyn Any,
         _step: PipelineStep,
         execution: Option<&ParallelExecutionContext<'_>>,
@@ -4461,7 +4685,7 @@ impl PipelineStageSemantics for QwenHybridStage {
             .transpose()
     }
 
-    fn placed_ingress_active(&self, state: &dyn Any) -> Result<bool, Error> {
+    fn placed_ingress_active(&self, _group: &str, state: &dyn Any) -> Result<bool, Error> {
         let state = state
             .downcast_ref::<crate::architectures::qwen::hybrid::layerwise::QwenHybridPipelineIngressState>()
             .ok_or_else(|| Error::Parallel("Qwen3.5 placed ingress state type mismatch".into()))?;
@@ -4475,7 +4699,7 @@ impl PipelineStageSemantics for QwenHybridStage {
             }))
     }
 
-    fn placed_ingress_arrays(&self, state: &dyn Any) -> Result<Vec<Array>, Error> {
+    fn placed_ingress_arrays(&self, _group: &str, state: &dyn Any) -> Result<Vec<Array>, Error> {
         let state = state
             .downcast_ref::<crate::architectures::qwen::hybrid::layerwise::QwenHybridPipelineIngressState>()
             .ok_or_else(|| Error::Parallel("Qwen3.5 placed ingress state type mismatch".into()))?;
@@ -4483,6 +4707,19 @@ impl PipelineStageSemantics for QwenHybridStage {
     }
 
     fn replace_placed_ingress_arrays(
+        &self,
+        _group: &str,
+        state: &mut dyn Any,
+        arrays: Vec<Array>,
+    ) -> Result<(), Error> {
+        let state = state
+            .downcast_mut::<crate::architectures::qwen::hybrid::layerwise::QwenHybridPipelineIngressState>()
+            .ok_or_else(|| Error::Parallel("Qwen3.5 placed ingress state type mismatch".into()))?;
+        self.layer_adapter
+            .replace_pipeline_ingress_arrays(state, arrays)
+    }
+
+    fn merge_placed_ingress_arrays(
         &self,
         state: &mut dyn Any,
         arrays: Vec<Array>,
@@ -4496,6 +4733,7 @@ impl PipelineStageSemantics for QwenHybridStage {
 
     fn execute_placed_ingress(
         &mut self,
+        _group: &str,
         state: &mut dyn Any,
         step: PipelineStep,
         execution: Option<&ParallelExecutionContext<'_>>,
@@ -4850,21 +5088,47 @@ impl PipelineStageSemantics for InklingStage {
             .transpose()
     }
 
-    fn placed_ingress_active(&self, state: &dyn Any) -> Result<bool, Error> {
+    fn placed_ingress_active(&self, group: &str, state: &dyn Any) -> Result<bool, Error> {
         let state = state
             .downcast_ref::<crate::architectures::inkling::layerwise::InklingPipelineIngressState>()
             .ok_or_else(|| Error::Parallel("Inkling placed ingress state type mismatch".into()))?;
-        Ok(!self.layer_adapter.pipeline_ingress_arrays(state).is_empty())
+        match group {
+            "vision_encoder" => Ok(!self.layer_adapter.pipeline_ingress_arrays(state).is_empty()),
+            // dMel is an unsplittable static ingress role, not a repeated tower.
+            "audio_encoder" => Ok(false),
+            _ => Err(Error::Parallel(format!(
+                "Inkling has no placed media root {group:?}"
+            ))),
+        }
     }
 
-    fn placed_ingress_arrays(&self, state: &dyn Any) -> Result<Vec<Array>, Error> {
+    fn placed_ingress_arrays(&self, group: &str, state: &dyn Any) -> Result<Vec<Array>, Error> {
         let state = state
             .downcast_ref::<crate::architectures::inkling::layerwise::InklingPipelineIngressState>()
             .ok_or_else(|| Error::Parallel("Inkling placed ingress state type mismatch".into()))?;
-        Ok(self.layer_adapter.pipeline_ingress_arrays(state))
+        match group {
+            "vision_encoder" => Ok(self.layer_adapter.pipeline_ingress_arrays(state)),
+            "audio_encoder" => Ok(Vec::new()),
+            _ => Err(Error::Parallel(format!(
+                "Inkling has no placed media root {group:?}"
+            ))),
+        }
     }
 
     fn replace_placed_ingress_arrays(
+        &self,
+        _group: &str,
+        state: &mut dyn Any,
+        arrays: Vec<Array>,
+    ) -> Result<(), Error> {
+        let state = state
+            .downcast_mut::<crate::architectures::inkling::layerwise::InklingPipelineIngressState>()
+            .ok_or_else(|| Error::Parallel("Inkling placed ingress state type mismatch".into()))?;
+        self.layer_adapter
+            .replace_pipeline_ingress_arrays(state, arrays)
+    }
+
+    fn merge_placed_ingress_arrays(
         &self,
         state: &mut dyn Any,
         arrays: Vec<Array>,
@@ -4878,11 +5142,15 @@ impl PipelineStageSemantics for InklingStage {
 
     fn execute_placed_ingress(
         &mut self,
+        group: &str,
         state: &mut dyn Any,
         step: PipelineStep,
         execution: Option<&ParallelExecutionContext<'_>>,
         stream: &Stream,
     ) -> Result<(), Error> {
+        if group != "vision_encoder" {
+            return Ok(());
+        }
         let state = state
             .downcast_mut::<crate::architectures::inkling::layerwise::InklingPipelineIngressState>()
             .ok_or_else(|| Error::Parallel("Inkling placed ingress state type mismatch".into()))?;
@@ -5071,6 +5339,7 @@ pub struct PipelineModel {
     stage: Box<dyn PipelineStageAdapter>,
     cache_identity: PromptCacheModelIdentity,
     last_mtp_hidden: Option<Array>,
+    last_placed_ingress_schedule: PlacedIngressScheduleReport,
 }
 
 struct PipelineEmbeddedMtpTarget<'a> {
@@ -5134,6 +5403,25 @@ impl PipelineModel {
             .filter(|(group, _)| group.kind != ExecutionGroupKind::Decoder)
             .map(|(_, range)| range.len())
             .sum();
+        info.local_execution_groups = info
+            .placement
+            .groups()
+            .iter()
+            .filter_map(|group| {
+                let units = group.local_units(info.pipeline_stage);
+                let static_roles = group
+                    .static_tensors
+                    .iter()
+                    .filter(|owner| owner.pp_rank == info.pipeline_stage)
+                    .map(|owner| owner.role.clone())
+                    .collect::<Vec<_>>();
+                (units.is_some() || !static_roles.is_empty()).then(|| LocalPlacedGroupOwnership {
+                    group: group.id.clone(),
+                    global_units: units.unwrap_or(0..0),
+                    static_roles,
+                })
+            })
+            .collect();
         info.encoder_routes = info
             .placement
             .routes()
@@ -5143,7 +5431,44 @@ impl PipelineModel {
             })
             .cloned()
             .collect();
+        let concurrency_policy = PlacedGroupConcurrencyPolicy {
+            rank_local_streams: true,
+            shared_residency_window: stage.placed_ingress_shared_residency_window(),
+            tensor_parallel_size: topology.tensor_parallel_size,
+            expert_parallel_size: topology.expert_parallel_size,
+        };
+        let roots = info
+            .placement
+            .groups()
+            .iter()
+            .enumerate()
+            .filter(|(_, group)| {
+                group.dependencies.is_empty() && group.kind != ExecutionGroupKind::Decoder
+            })
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        for (position, &left) in roots.iter().enumerate() {
+            for &right in &roots[position + 1..] {
+                match info
+                    .placement
+                    .concurrency_compatibility(left, right, concurrency_policy)
+                {
+                    Ok(()) => info.overlap_eligible_groups.push([
+                        info.placement.groups()[left].id.clone(),
+                        info.placement.groups()[right].id.clone(),
+                    ]),
+                    Err(reason) => info
+                        .planned_serial_fallbacks
+                        .push(PlacedSerialFallbackReport {
+                            left: info.placement.groups()[left].id.clone(),
+                            right: info.placement.groups()[right].id.clone(),
+                            reason,
+                        }),
+                }
+            }
+        }
         info.concurrent_residency_peak_bytes = info.planned_owned_parameter_bytes;
+        info.observed_concurrent_residency_peak_bytes = info.local_parameter_bytes as u64;
         if stage.model_kind() != info.model_kind {
             return Err(Error::Parallel(format!(
                 "pipeline adapter architecture {:?} does not match stage architecture {:?}",
@@ -5172,6 +5497,7 @@ impl PipelineModel {
             stage: Box::new(stage),
             cache_identity,
             last_mtp_hidden: None,
+            last_placed_ingress_schedule: PlacedIngressScheduleReport::default(),
         })
     }
 
@@ -5182,6 +5508,12 @@ impl PipelineModel {
     /// Returns the immutable stage description.
     pub fn stage_info(&self) -> &PipelineStageInfo {
         &self.info
+    }
+
+    /// Returns deterministic scheduling instrumentation for the latest typed
+    /// placed-ingress execution on this rank.
+    pub const fn placed_ingress_schedule_report(&self) -> &PlacedIngressScheduleReport {
+        &self.last_placed_ingress_schedule
     }
 
     /// Returns stage-local disk-stream observations when enabled.
@@ -5771,6 +6103,343 @@ impl PipelineModel {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn execute_placed_ingress_dag(
+        &mut self,
+        input: crate::api::input::ModelInput<'_>,
+        step: PipelineStep,
+        group: &Group,
+        tensor: Option<&ParallelExecutionContext<'_>>,
+        stream: &Stream,
+        retained: &mut Vec<Array>,
+    ) -> Result<Option<PipelinePayload>, Error> {
+        let placement = Arc::clone(&self.info.placement);
+        let mut state = Some(
+            if self.info.pipeline_stage == 0 {
+                self.stage.begin_placed_ingress(input, tensor, stream)?
+            } else {
+                self.stage
+                    .begin_placed_ingress_continuation(input, tensor, stream)?
+            }
+            .ok_or_else(|| {
+                Error::Parallel(format!(
+                    "pipeline architecture {:?} has multimodal placement but no placed ingress state",
+                    self.info.model_kind
+                ))
+            })?,
+        );
+        let mut active = vec![false; placement.groups().len()];
+        for &index in placement.execution_order() {
+            let placed = &placement.groups()[index];
+            active[index] = match placed.kind {
+                ExecutionGroupKind::VisionEncoder | ExecutionGroupKind::AudioEncoder => {
+                    self.stage.placed_ingress_active(
+                        &placed.id,
+                        state.as_deref().expect("placed ingress state"),
+                    )?
+                }
+                ExecutionGroupKind::Projector | ExecutionGroupKind::Merger => placement
+                    .dependency_indices(index)
+                    .unwrap_or_default()
+                    .iter()
+                    .any(|dependency| active[*dependency]),
+                ExecutionGroupKind::ModalityFinalization | ExecutionGroupKind::Decoder => true,
+            };
+        }
+
+        let policy = PlacedGroupConcurrencyPolicy {
+            rank_local_streams: true,
+            shared_residency_window: self.stage.placed_ingress_shared_residency_window(),
+            tensor_parallel_size: self.topology.tensor_parallel_size,
+            expert_parallel_size: self.topology.expert_parallel_size,
+        };
+        let device = stream.get_device()?;
+        let streams = placement
+            .groups()
+            .iter()
+            .map(|_| Stream::new_with_device(&device))
+            .collect::<Vec<_>>();
+        let mut ready = ExecutionGroupReadySet::new(placement.semantic());
+        let mut payloads = PlacedPayloadStore::default();
+        let mut working = BTreeMap::<usize, Vec<Array>>::new();
+        let mut decoder_payload = None;
+        let mut completed = 0usize;
+        let mut schedule = PlacedIngressScheduleReport::default();
+
+        while completed < placement.groups().len() {
+            let ready_slots = ready.ready_groups().collect::<Vec<_>>();
+            for (position, &left) in ready_slots.iter().enumerate() {
+                for &right in &ready_slots[position + 1..] {
+                    if let Err(reason) = placement.concurrency_compatibility(left, right, policy) {
+                        let fallback = PlacedSerialFallbackReport {
+                            left: placement.groups()[left].id.clone(),
+                            right: placement.groups()[right].id.clone(),
+                            reason,
+                        };
+                        if !schedule.serial_fallbacks.contains(&fallback) {
+                            schedule.serial_fallbacks.push(fallback);
+                        }
+                    }
+                }
+            }
+            let batch = ready.compatible_batch(|left, right| {
+                placement
+                    .concurrency_compatibility(left, right, policy)
+                    .is_ok()
+            });
+            if batch.is_empty() {
+                return Err(Error::Parallel(
+                    "placed execution-group ready set made no progress".into(),
+                ));
+            }
+            let batch_names = batch
+                .iter()
+                .filter(|index| active[**index])
+                .map(|index| placement.groups()[*index].id.clone())
+                .collect::<Vec<_>>();
+            schedule.maximum_in_flight_groups =
+                schedule.maximum_in_flight_groups.max(batch_names.len());
+            schedule.ready_batches.push(batch_names);
+
+            for &index in &batch {
+                let placed = &placement.groups()[index];
+                if placed.dependencies.is_empty() {
+                    continue;
+                }
+                if placed.first_owner() == Some(self.info.pipeline_stage) {
+                    let dependencies = payloads.ordered_dependencies(&placement, index, &active)?;
+                    let arrays = dependencies
+                        .into_iter()
+                        .flat_map(|payload| payload.arrays)
+                        .collect::<Vec<_>>();
+                    working.insert(index, arrays);
+                }
+            }
+
+            let waves = batch
+                .iter()
+                .map(|index| {
+                    let group = &placement.groups()[*index];
+                    if group.kind == ExecutionGroupKind::Decoder {
+                        1
+                    } else {
+                        group.owners.len().max(1)
+                    }
+                })
+                .max()
+                .unwrap_or(1);
+            for wave in 0..waves {
+                let mut submissions = BTreeMap::new();
+                for &index in &batch {
+                    let placed = &placement.groups()[index];
+                    let owner = if placed.kind == ExecutionGroupKind::Decoder {
+                        (wave == 0)
+                            .then(|| placed.first_owner().unwrap_or(placed.merge_destination))
+                    } else {
+                        placed
+                            .owners
+                            .get(wave)
+                            .map(|owner| owner.pp_rank)
+                            .or_else(|| (wave == 0).then_some(placed.merge_destination))
+                    };
+                    if owner != Some(self.info.pipeline_stage) {
+                        continue;
+                    }
+                    let execution_stream = if tensor.is_none() {
+                        &streams[index]
+                    } else {
+                        stream
+                    };
+                    let arrays = match placed.kind {
+                        ExecutionGroupKind::VisionEncoder | ExecutionGroupKind::AudioEncoder => {
+                            if active[index] {
+                                self.stage.execute_placed_ingress(
+                                    &placed.id,
+                                    state.as_deref_mut().expect("placed ingress state"),
+                                    step,
+                                    tensor,
+                                    execution_stream,
+                                )?;
+                                self.stage.placed_ingress_arrays(
+                                    &placed.id,
+                                    state.as_deref().expect("placed ingress state"),
+                                )?
+                            } else {
+                                Vec::new()
+                            }
+                        }
+                        ExecutionGroupKind::ModalityFinalization => {
+                            let arrays = working.remove(&index).unwrap_or_default();
+                            self.stage.merge_placed_ingress_arrays(
+                                state.as_deref_mut().expect("placed ingress state"),
+                                arrays,
+                            )?;
+                            self.stage
+                                .finish_placed_ingress(
+                                    state.take().expect("placed ingress finalization state"),
+                                    tensor,
+                                    execution_stream,
+                                )?
+                                .into_arrays()
+                        }
+                        ExecutionGroupKind::Decoder => {
+                            let arrays = working.remove(&index).unwrap_or_default();
+                            decoder_payload = Some(PipelinePayload::from_arrays(arrays.clone())?);
+                            arrays
+                        }
+                        ExecutionGroupKind::Projector | ExecutionGroupKind::Merger => {
+                            working.remove(&index).unwrap_or_default()
+                        }
+                    };
+                    let completion = DistributedCompletion::submit((), arrays.iter())?;
+                    submissions.insert(index, (arrays.clone(), completion));
+                    working.insert(index, arrays);
+                }
+
+                for &index in &batch {
+                    let placed = &placement.groups()[index];
+                    if !active[index] || placed.kind == ExecutionGroupKind::Decoder {
+                        continue;
+                    }
+                    let Some(owners) = placed.owners.get(wave..wave.saturating_add(2)) else {
+                        continue;
+                    };
+                    if owners.len() != 2 {
+                        continue;
+                    }
+                    let route = placement
+                        .routes()
+                        .iter()
+                        .enumerate()
+                        .find(|(_, route)| {
+                            route.from_group == placed.id
+                                && route.to_group == placed.id
+                                && route.from_pp_rank == owners[0].pp_rank
+                                && route.to_pp_rank == owners[1].pp_rank
+                        })
+                        .ok_or_else(|| {
+                            Error::Parallel(format!(
+                                "placed group {:?} is missing its owner route {} -> {}",
+                                placed.id, owners[0].pp_rank, owners[1].pp_rank
+                            ))
+                        })?;
+                    let (route_tag, route) = route;
+                    if self.info.pipeline_stage == route.from_pp_rank {
+                        let (arrays, completion) = submissions.get(&index).ok_or_else(|| {
+                            Error::Parallel(format!(
+                                "placed group {:?} produced no local payload",
+                                placed.id
+                            ))
+                        })?;
+                        completion.wait_on(stream)?;
+                        retained.extend(send_array_bundle(
+                            arrays,
+                            route_tag,
+                            route.to_pp_rank,
+                            group,
+                            stream,
+                        )?);
+                        if active[index] && !schedule.routed_transfers.contains(route) {
+                            schedule.routed_transfers.push(route.clone());
+                        }
+                    } else if self.info.pipeline_stage == route.to_pp_rank {
+                        let arrays =
+                            recv_array_bundle(route.from_pp_rank, route_tag, group, stream)?;
+                        if !schedule.routed_transfers.contains(route) {
+                            schedule.routed_transfers.push(route.clone());
+                        }
+                        self.stage.replace_placed_ingress_arrays(
+                            &placed.id,
+                            state.as_deref_mut().expect("placed ingress state"),
+                            arrays.clone(),
+                        )?;
+                        working.insert(index, arrays);
+                    }
+                }
+            }
+
+            for &index in &batch {
+                let placed = &placement.groups()[index];
+                let outgoing = placement
+                    .routes()
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, route)| {
+                        route.from_group == placed.id && route.to_group != placed.id
+                    })
+                    .collect::<Vec<_>>();
+                for (route_tag, route) in outgoing {
+                    let consumer = placement.group_index(&route.to_group).ok_or_else(|| {
+                        Error::Parallel("placed route references an unknown consumer".into())
+                    })?;
+                    let arrays = if !active[index] {
+                        Vec::new()
+                    } else if route.from_pp_rank == route.to_pp_rank
+                        && self.info.pipeline_stage == route.from_pp_rank
+                    {
+                        working.get(&index).cloned().unwrap_or_default()
+                    } else if self.info.pipeline_stage == route.from_pp_rank {
+                        let arrays = working.get(&index).cloned().unwrap_or_default();
+                        retained.extend(send_array_bundle(
+                            &arrays,
+                            route_tag,
+                            route.to_pp_rank,
+                            group,
+                            stream,
+                        )?);
+                        if !schedule.routed_transfers.contains(route) {
+                            schedule.routed_transfers.push(route.clone());
+                        }
+                        Vec::new()
+                    } else if self.info.pipeline_stage == route.to_pp_rank {
+                        let arrays =
+                            recv_array_bundle(route.from_pp_rank, route_tag, group, stream)?;
+                        if !schedule.routed_transfers.contains(route) {
+                            schedule.routed_transfers.push(route.clone());
+                        }
+                        arrays
+                    } else {
+                        Vec::new()
+                    };
+                    if self.info.pipeline_stage == route.to_pp_rank {
+                        let payload = PlacedGroupPayload {
+                            producer: index,
+                            schema: route.payload_schema.id.clone(),
+                            arrays,
+                        };
+                        payload.validate_for(
+                            &placement,
+                            index,
+                            &route.payload_schema,
+                            active[index],
+                        )?;
+                        payloads.insert(consumer, payload)?;
+                        if active[index] && !schedule.routed_transfers.contains(route) {
+                            schedule.routed_transfers.push(route.clone());
+                        }
+                    }
+                }
+                working.remove(&index);
+                ready.ordered(index);
+                completed += 1;
+            }
+        }
+        payloads.ensure_empty()?;
+        if self.info.is_first && decoder_payload.is_none() {
+            return Err(Error::Parallel(
+                "placed execution DAG did not produce decoder ingress on stage zero".into(),
+            ));
+        }
+        if schedule.maximum_in_flight_groups > 1 {
+            self.info.observed_concurrent_residency_peak_bytes = self
+                .info
+                .observed_concurrent_residency_peak_bytes
+                .max(self.info.planned_owned_parameter_bytes);
+        }
+        self.last_placed_ingress_schedule = schedule;
+        Ok(decoder_payload)
+    }
+
     /// Generates through final-stage-owned embedded predictor layers while the
     /// target continues to execute over the ordinary Cartesian pipeline.
     #[allow(clippy::too_many_arguments)]
@@ -5844,6 +6513,9 @@ impl PipelineModel {
         typed_ingress: bool,
         stream: &Stream,
     ) -> Result<PendingPipelineStageCompletion, Error> {
+        if typed_ingress {
+            self.last_placed_ingress_schedule = PlacedIngressScheduleReport::default();
+        }
         let mut placed_retained = Vec::new();
         let routed_prepared = if typed_ingress && self.info.placement.groups().len() > 1 {
             if self.info.pipeline_stage == 0 {
@@ -5870,85 +6542,30 @@ impl PipelineModel {
             .or(ingress);
         let mut placed_payload = None;
         if let Some(PipelineIngress::ModelInput(input)) = ingress {
-            let has_media_tensor = input.parts.iter().any(|part| {
-                part.modality != crate::api::input::Modality::Text
-                    && matches!(part.payload, crate::api::input::InputPayload::Tensor(_))
-            });
-            if self.info.placement.groups().len() > 1 && (has_media_tensor || self.info.is_first) {
-                let mut state = if self.info.pipeline_stage == 0 {
-                        self.stage.begin_placed_ingress(input, tensor, stream)?
-                    } else {
-                        self.stage
-                            .begin_placed_ingress_continuation(input, tensor, stream)?
-                    }
+            if self.info.placement.groups().len() > 1 {
+                let has_media_tensor = input.parts.iter().any(|part| {
+                    part.modality != crate::api::input::Modality::Text
+                        && matches!(part.payload, crate::api::input::InputPayload::Tensor(_))
+                });
+                if has_media_tensor {
+                    placed_payload = self.execute_placed_ingress_dag(
+                        input,
+                        step,
+                        group,
+                        tensor,
+                        stream,
+                        &mut placed_retained,
+                    )?;
+                } else if self.info.is_first {
+                    let state = self
+                        .stage
+                        .begin_placed_ingress(input, tensor, stream)?
                         .ok_or_else(|| {
                             Error::Parallel(format!(
                                 "pipeline architecture {:?} has multimodal placement but no placed ingress state",
                                 self.info.model_kind
                             ))
                         })?;
-                let active = self.stage.placed_ingress_active(state.as_ref())?;
-                if active {
-                    let route = placed_ingress_rank_route(
-                        self.info.placement.as_ref(),
-                        self.info.pipeline_stage,
-                    )?;
-                    if let Some(predecessor) = route.encoder_predecessor {
-                        let arrays = recv_array_bundle(predecessor, group, stream)?;
-                        self.stage
-                            .replace_placed_ingress_arrays(state.as_mut(), arrays)?;
-                    }
-                    if route.executes_encoder {
-                        self.stage
-                            .execute_placed_ingress(state.as_mut(), step, tensor, stream)?;
-                    }
-                    if let Some(successor) = route.encoder_successor {
-                        let arrays = self.stage.placed_ingress_arrays(state.as_ref())?;
-                        placed_retained
-                            .extend(send_array_bundle(&arrays, successor, group, stream)?);
-                    } else if let Some(finalizer) = route.finalizer_destination {
-                        let arrays = self.stage.placed_ingress_arrays(state.as_ref())?;
-                        placed_retained
-                            .extend(send_array_bundle(&arrays, finalizer, group, stream)?);
-                    }
-
-                    if route.finalizes {
-                        if let Some(source) = route.finalizer_source {
-                            let arrays = recv_array_bundle(source, group, stream)?;
-                            self.stage
-                                .replace_placed_ingress_arrays(state.as_mut(), arrays)?;
-                        }
-                        let payload = self.stage.finish_placed_ingress(state, tensor, stream)?;
-                        if self.info.pipeline_stage == 0 {
-                            placed_payload = Some(payload);
-                        } else {
-                            let arrays = std::iter::once(payload.hidden)
-                                .chain(payload.auxiliary.tensors)
-                                .collect::<Vec<_>>();
-                            placed_retained.extend(send_array_bundle(&arrays, 0, group, stream)?);
-                        }
-                    }
-                    if self.info.pipeline_stage == 0 && !route.finalizes {
-                        let finalizer = self
-                            .info
-                            .placement
-                            .group("modality_finalization")
-                            .and_then(ExecutionGroupPlacement::first_owner)
-                            .expect("validated placed ingress finalizer");
-                        let mut arrays = recv_array_bundle(finalizer, group, stream)?;
-                        if arrays.is_empty() {
-                            return Err(Error::Parallel(
-                                "placed modality finalization produced an empty decoder payload"
-                                    .into(),
-                            ));
-                        }
-                        let hidden = arrays.remove(0);
-                        placed_payload = Some(PipelinePayload {
-                            hidden,
-                            auxiliary: PipelineAuxiliaryState::new(arrays),
-                        });
-                    }
-                } else if self.info.is_first {
                     placed_payload = Some(self.stage.finish_placed_ingress(state, tensor, stream)?);
                 }
             }
@@ -6524,8 +7141,12 @@ fn base_info(
         global_layer_range: range,
         global_encoder_units: 0,
         local_encoder_units: 0,
+        local_execution_groups: Vec::new(),
         encoder_routes: Vec::new(),
+        overlap_eligible_groups: Vec::new(),
+        planned_serial_fallbacks: Vec::new(),
         concurrent_residency_peak_bytes: 0,
+        observed_concurrent_residency_peak_bytes: 0,
         global_expert_count: None,
         local_expert_ids: Vec::new(),
         predecessor_rank: topology
@@ -20279,6 +20900,7 @@ impl GemmaStage {
 
     fn execute_placed_media_state(
         &mut self,
+        group: &str,
         state: &mut crate::architectures::gemma4::layerwise::Gemma4PipelineIngressState,
         step: PipelineStep,
         execution: Option<&ParallelExecutionContext<'_>>,
@@ -20289,9 +20911,11 @@ impl GemmaStage {
             .iter()
             .enumerate()
             .filter_map(|(ordinal, unit)| {
-                self.layer_adapter
-                    .should_execute_pipeline_group(unit.group, state)
-                    .then_some(ordinal)
+                (self.layer_adapter.execution_group_name(unit.group).ok() == Some(group)
+                    && self
+                        .layer_adapter
+                        .should_execute_pipeline_group(unit.group, state))
+                .then_some(ordinal)
             })
             .collect::<Vec<_>>();
         let prefill = step.sequence_length > 1;
@@ -20322,7 +20946,7 @@ impl GemmaStage {
             .flatten();
         for ordinal in active {
             let unit = self.media_units[ordinal];
-            let retained = if let Some(storage) = self.dense_layers.as_ref() {
+            if let Some(storage) = self.dense_layers.as_ref() {
                 let transfer = window
                     .as_mut()
                     .map(|window| window.next(stream))
@@ -20358,7 +20982,6 @@ impl GemmaStage {
                 } else {
                     storage.trim_after_absolute(ordinal)?;
                 }
-                retained
             } else {
                 let layer = self.media_layers.get_mut(ordinal).ok_or_else(|| {
                     Error::Parallel(format!(
@@ -20367,10 +20990,7 @@ impl GemmaStage {
                 })?;
                 self.layer_adapter.forward_pipeline_media_layer(
                     unit.group, unit.index, layer, state, execution, stream,
-                )?
-            };
-            if self.dense_layers.is_none() {
-                eval(retained.iter())?;
+                )?;
             }
         }
         if let Some(storage) = self.dense_layers.as_ref() {
@@ -21660,31 +22280,123 @@ mod tests {
     }
 
     #[test]
-    fn placed_ingress_route_leaves_unowned_pipeline_stages_idle() {
-        let placement = multimodal_placement(3, 3, Some(1), None).unwrap();
-        assert_eq!(placement.encoder_rank_path(), [0]);
+    fn placed_ready_roots_overlap_while_unowned_stages_remain_idle() {
+        let placement = multimodal_placement(3, 3, Some(1), Some(1)).unwrap();
+        let vision = placement.group_index("vision_encoder").unwrap();
+        let audio = placement.group_index("audio_encoder").unwrap();
+        let mut ready = ExecutionGroupReadySet::new(placement.semantic());
+        assert_eq!(ready.ready_groups().collect::<Vec<_>>(), [vision, audio]);
+        let policy = PlacedGroupConcurrencyPolicy {
+            rank_local_streams: true,
+            shared_residency_window: false,
+            tensor_parallel_size: 1,
+            expert_parallel_size: 1,
+        };
+        assert_eq!(
+            ready.compatible_batch(|left, right| placement
+                .concurrency_compatibility(left, right, policy)
+                .is_ok()),
+            [vision, audio]
+        );
+        ready.ordered(audio);
+        ready.ordered(vision);
+        assert!(placement.local_groups(1).all(|(group, _)| !matches!(
+            group.kind,
+            ExecutionGroupKind::VisionEncoder | ExecutionGroupKind::AudioEncoder
+        )));
+    }
 
-        let owner = placed_ingress_rank_route(&placement, 0).unwrap();
-        assert!(owner.executes_encoder);
-        assert!(owner.finalizes);
-        assert_eq!(owner.encoder_predecessor, None);
-        assert_eq!(owner.encoder_successor, None);
-        assert_eq!(owner.finalizer_destination, None);
-        assert_eq!(owner.finalizer_source, None);
-
-        for rank in [1, 2] {
-            assert_eq!(
-                placed_ingress_rank_route(&placement, rank).unwrap(),
-                PlacedIngressRankRoute {
-                    encoder_predecessor: None,
-                    encoder_successor: None,
-                    finalizer_destination: None,
-                    finalizer_source: None,
-                    executes_encoder: false,
-                    finalizes: false,
-                }
-            );
+    #[test]
+    fn placed_payload_store_preserves_dependency_order_and_rejects_bad_envelopes() {
+        let placement = multimodal_placement(2, 3, Some(1), Some(1)).unwrap();
+        for (producer, consumer) in [
+            ("vision_encoder", "vision_projector"),
+            ("audio_encoder", "audio_projector"),
+            ("vision_projector", "modality_merger"),
+            ("audio_projector", "modality_merger"),
+            ("modality_merger", "modality_finalization"),
+            ("modality_finalization", "text_decoder"),
+        ] {
+            assert!(placement.dependency_route(producer, consumer).is_some());
         }
+        let vision = placement.group_index("vision_projector").unwrap();
+        let audio = placement.group_index("audio_projector").unwrap();
+        let merger = placement.group_index("modality_merger").unwrap();
+        let schema = placement.groups()[vision].output_schema.id.clone();
+        let mut store = PlacedPayloadStore::default();
+        store
+            .insert(
+                merger,
+                PlacedGroupPayload {
+                    producer: audio,
+                    schema: schema.clone(),
+                    arrays: Vec::new(),
+                },
+            )
+            .unwrap();
+        store
+            .insert(
+                merger,
+                PlacedGroupPayload {
+                    producer: vision,
+                    schema: schema.clone(),
+                    arrays: Vec::new(),
+                },
+            )
+            .unwrap();
+        let ordered = store
+            .ordered_dependencies(&placement, merger, &vec![false; placement.groups().len()])
+            .unwrap();
+        assert_eq!(
+            ordered
+                .iter()
+                .map(|payload| payload.producer)
+                .collect::<Vec<_>>(),
+            [vision, audio]
+        );
+
+        let duplicate = PlacedGroupPayload {
+            producer: vision,
+            schema: schema.clone(),
+            arrays: Vec::new(),
+        };
+        let mut duplicates = PlacedPayloadStore::default();
+        duplicates.insert(merger, duplicate.clone()).unwrap();
+        assert!(duplicates.insert(merger, duplicate).is_err());
+
+        let missing = PlacedPayloadStore::default()
+            .ordered_dependencies(&placement, merger, &vec![true; placement.groups().len()])
+            .unwrap_err();
+        assert!(missing.to_string().contains("missing placed payload"));
+
+        let wrong_schema = PlacedGroupPayload {
+            producer: vision,
+            schema: "wrong-schema".into(),
+            arrays: Vec::new(),
+        }
+        .validate_for(
+            &placement,
+            vision,
+            &placement.groups()[merger].input_schema,
+            true,
+        )
+        .unwrap_err();
+        assert!(wrong_schema.to_string().contains("has schema"));
+    }
+
+    #[test]
+    fn placed_root_failure_or_cancellation_leaves_independent_peer_ready() {
+        let placement = multimodal_placement(2, 3, Some(1), Some(1)).unwrap();
+        let vision = placement.group_index("vision_encoder").unwrap();
+        let audio = placement.group_index("audio_encoder").unwrap();
+
+        let mut failed = ExecutionGroupReadySet::new(placement.semantic());
+        failed.fail(vision);
+        assert_eq!(failed.ready_groups().collect::<Vec<_>>(), [audio]);
+
+        let mut cancelled = ExecutionGroupReadySet::new(placement.semantic());
+        cancelled.cancel(audio);
+        assert_eq!(cancelled.ready_groups().collect::<Vec<_>>(), [vision]);
     }
 
     #[test]

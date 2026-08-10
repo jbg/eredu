@@ -1802,7 +1802,7 @@ enum ReadyGroupState {
 /// not imply a host synchronization. Failures and cancellation close the affected
 /// subgraph before any newly ready dependent can be submitted.
 #[derive(Debug)]
-struct ExecutionGroupReadySet<'a> {
+pub(crate) struct ExecutionGroupReadySet<'a> {
     graph: &'a ExecutionGroupDag,
     remaining_dependencies: Vec<usize>,
     states: Vec<ReadyGroupState>,
@@ -1810,7 +1810,7 @@ struct ExecutionGroupReadySet<'a> {
 }
 
 impl<'a> ExecutionGroupReadySet<'a> {
-    fn new(graph: &'a ExecutionGroupDag) -> Self {
+    pub(crate) fn new(graph: &'a ExecutionGroupDag) -> Self {
         let remaining_dependencies = graph.dependencies.iter().map(Vec::len).collect::<Vec<_>>();
         let ready = remaining_dependencies
             .iter()
@@ -1825,11 +1825,11 @@ impl<'a> ExecutionGroupReadySet<'a> {
         }
     }
 
-    fn ready_groups(&self) -> impl Iterator<Item = usize> + '_ {
+    pub(crate) fn ready_groups(&self) -> impl Iterator<Item = usize> + '_ {
         self.ready.iter().copied()
     }
 
-    fn ordered(&mut self, group: usize) {
+    pub(crate) fn ordered(&mut self, group: usize) {
         debug_assert_eq!(self.states[group], ReadyGroupState::Pending);
         self.ready.remove(&group);
         self.states[group] = ReadyGroupState::Ordered;
@@ -1844,12 +1844,12 @@ impl<'a> ExecutionGroupReadySet<'a> {
         }
     }
 
-    fn fail(&mut self, group: usize) {
+    pub(crate) fn fail(&mut self, group: usize) {
         self.close_subgraph(group, ReadyGroupState::Failed);
     }
 
     #[cfg(test)]
-    fn cancel(&mut self, group: usize) {
+    pub(crate) fn cancel(&mut self, group: usize) {
         self.close_subgraph(group, ReadyGroupState::Cancelled);
     }
 
@@ -1865,6 +1865,28 @@ impl<'a> ExecutionGroupReadySet<'a> {
             self.states[dependent] = ReadyGroupState::Blocked;
             pending.extend(self.graph.dependents[dependent].iter().copied());
         }
+    }
+
+    /// Selects a deterministic maximal compatible subset of the current ready set.
+    ///
+    /// The stable greedy order is shared by local layerwise execution and placed
+    /// distributed execution. Callers supply only resource/collective policy;
+    /// dependency readiness and failure closure remain centralized here.
+    pub(crate) fn compatible_batch(
+        &self,
+        mut compatible: impl FnMut(usize, usize) -> bool,
+    ) -> Vec<usize> {
+        let mut selected = Vec::new();
+        for candidate in self.ready_groups() {
+            if selected
+                .iter()
+                .copied()
+                .all(|group| compatible(group, candidate))
+            {
+                selected.push(candidate);
+            }
+        }
+        selected
     }
 }
 

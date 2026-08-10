@@ -247,14 +247,17 @@ state, while encoded and forced prompt frames are work items. The two programs
 share lifecycle and queueing without conflating their execution semantics.
 Realtime session handoff is bound to exact checkpoint-file content plus the
 normalized execution and quantization identity, rather than model geometry.
-The resident/layerwise runtime likewise uses a validated execution-group DAG
-rather than a flat architecture-specific sequence. Gemma vision and audio are
-independent ingress roots feeding text; Qwen-VL, multimodal Qwen3.5, and
-Inkling declare vision-to-text dependencies. Media assembly happens at the
-text-node boundary, and invalid, cyclic, disconnected, or unmerged graphs fail
-before execution. Independent ready roots use separate same-thread MLX streams;
-declared edges are ordered with exact completion events rather than host
-synchronization.
+Resident/layerwise and placed distributed multimodal execution use the same
+validated ready-set DAG model rather than a flat architecture-specific
+sequence. Gemma vision and audio are independent ingress roots feeding explicit
+projector, merge, finalization, and decoder groups; Qwen-VL, multimodal Qwen3.5,
+and Inkling use the same group/routing contract. Compatible resident pure-PP
+roots use separate streams. Shared bounded residency windows, overlapping
+TP/EP collectives, and backend stream restrictions select deterministic serial
+fallback. Payloads carry route/schema identity and merge in dependency order,
+so non-adjacent owner paths and opposite producer completion order cannot alter
+assembly. Invalid, cyclic, disconnected, duplicate, missing, misrouted, or
+wrong-schema graphs/payloads fail closed.
 Llama and Mistral normalize Hugging Face and GGUF scalar metadata into
 `LayerSchedule<AttentionPolicy>`; resident, bounded, paged, tensor,
 pipeline, cache-identity, and memory paths then use the exact policy at each
