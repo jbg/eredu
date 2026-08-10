@@ -91,6 +91,41 @@ handle is safe after a wait is queued because MLX retains the backend event.
 Asynchronous failures are retained and returned by host observation or later
 consumer synchronization.
 
+## Host transfer buffers
+
+`HostTransferBuffer` is a typed allocation for explicit host/device transfers,
+separate from ordinary MLX arrays. `HostTransferPolicy::Transfer` selects
+ordinary CPU storage, Metal shared storage, or CUDA page-locked host storage;
+`HostTransferPolicy::Managed` is a distinct CUDA-only policy and fails on other
+backends. The physical selection is available through `storage_kind()`.
+
+Transfers return pending values which retain their storage and completion
+event. Array-to-host bytes are unavailable until `synchronize()` succeeds.
+Host-to-array submission consumes the host buffer and returns it with the
+completed array, preventing safe Rust from mutating source bytes while DMA is
+in flight.
+
+```rust
+use safemlx::{
+    Array, Device, DeviceType, HostTransferBuffer, HostTransferPolicy, Stream,
+};
+
+let stream = Stream::new_with_device(&Device::new(DeviceType::Cpu, 0));
+let source = Array::from_slice(&[1.0f32, 2.0], &[2]);
+let host = HostTransferBuffer::copy_from_array(
+    &source,
+    HostTransferPolicy::Transfer,
+    &stream,
+)?.synchronize()?;
+let (restored, host) = host.copy_to_array(&stream)?.synchronize()?;
+# let _ = (restored, host);
+# Ok::<(), safemlx::error::Exception>(())
+```
+
+The language-model residency managers do not yet use this storage class; the
+API intentionally lands independently so residency can adopt it without
+changing its backend contract.
+
 ## Distributed MLX
 
 The `distributed` module wraps MLX groups, collectives, and point-to-point

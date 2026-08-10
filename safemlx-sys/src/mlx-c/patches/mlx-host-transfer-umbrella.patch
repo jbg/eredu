@@ -1,0 +1,12 @@
+diff --git a/mlx/mlx.h b/mlx/mlx.h
+index 5dcd3514d..fdf6b45e0 100644
+--- a/mlx/mlx.h
++++ b/mlx/mlx.h
+@@ -13,6 +13,7 @@
+ #include "mlx/export.h"
+ #include "mlx/fast.h"
+ #include "mlx/fft.h"
++#include "mlx/host_transfer.h"
+ #include "mlx/io.h"
+ #include "mlx/linalg.h"
+ #include "mlx/memory.h"

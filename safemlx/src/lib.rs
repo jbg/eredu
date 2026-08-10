@@ -311,6 +311,7 @@ pub mod error;
 mod event;
 pub mod fast;
 pub mod fft;
+mod host_transfer;
 pub mod linalg;
 pub mod losses;
 pub mod memory;
@@ -332,6 +333,7 @@ pub use array::*;
 pub use device::*;
 pub use dtype::*;
 pub use event::*;
+pub use host_transfer::*;
 pub use stream::*;
 
 #[cfg(test)]

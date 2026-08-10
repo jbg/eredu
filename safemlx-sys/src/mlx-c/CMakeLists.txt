@@ -59,6 +59,12 @@ else()
       -P ${CMAKE_CURRENT_LIST_DIR}/patches/apply-idempotent.cmake
       COMMAND ${CMAKE_COMMAND}
       -DPATCH_FILE=${CMAKE_CURRENT_LIST_DIR}/patches/mlx-variable-all-to-all.patch
+      -P ${CMAKE_CURRENT_LIST_DIR}/patches/apply-idempotent.cmake
+      COMMAND ${CMAKE_COMMAND}
+      -DPATCH_FILE=${CMAKE_CURRENT_LIST_DIR}/patches/mlx-host-transfer-buffer.patch
+      -P ${CMAKE_CURRENT_LIST_DIR}/patches/apply-idempotent.cmake
+      COMMAND ${CMAKE_COMMAND}
+      -DPATCH_FILE=${CMAKE_CURRENT_LIST_DIR}/patches/mlx-host-transfer-umbrella.patch
       -P ${CMAKE_CURRENT_LIST_DIR}/patches/apply-idempotent.cmake)
   FetchContent_MakeAvailable(mlx)
 endif()
@@ -68,7 +74,8 @@ if(MLX_C_BUILD_PATCH_TESTS)
     mlx-patch-test-binary
     ${mlx_SOURCE_DIR}/tests/tests.cpp
     ${mlx_SOURCE_DIR}/tests/completion_tests.cpp
-    ${mlx_SOURCE_DIR}/tests/distributed_all_to_all_v_tests.cpp)
+    ${mlx_SOURCE_DIR}/tests/distributed_all_to_all_v_tests.cpp
+    ${mlx_SOURCE_DIR}/tests/host_transfer_tests.cpp)
   target_link_libraries(mlx-patch-test-binary PRIVATE mlx doctest)
 
   add_custom_target(
@@ -76,7 +83,7 @@ if(MLX_C_BUILD_PATCH_TESTS)
     COMMAND
       ${CMAKE_COMMAND} -E env DEVICE=cpu
       $<TARGET_FILE:mlx-patch-test-binary>
-      "--test-case=*completion*,*failed CPU event*,*all_to_all_v*"
+      "--test-case=*completion*,*failed CPU event*,*all_to_all_v*,*host transfer*"
     DEPENDS mlx-patch-test-binary
     USES_TERMINAL
     COMMENT "Running tests carried by SafeMLX's vendored MLX patches")
@@ -108,6 +115,7 @@ set(mlxc-src
     ${CMAKE_CURRENT_LIST_DIR}/mlx/c/fast.cpp
     ${CMAKE_CURRENT_LIST_DIR}/mlx/c/fft.cpp
     ${CMAKE_CURRENT_LIST_DIR}/mlx/c/graph_utils.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/mlx/c/host_transfer.cpp
     ${CMAKE_CURRENT_LIST_DIR}/mlx/c/io.cpp
     ${CMAKE_CURRENT_LIST_DIR}/mlx/c/io_types.cpp
     ${CMAKE_CURRENT_LIST_DIR}/mlx/c/linalg.cpp

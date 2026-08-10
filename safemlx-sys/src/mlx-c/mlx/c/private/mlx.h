@@ -9,6 +9,7 @@
 #include "mlx/c/private/export.h"
 #include "mlx/c/private/event.h"
 #include "mlx/c/private/graph_utils.h"
+#include "mlx/c/private/host_transfer.h"
 #include "mlx/c/private/io.h"
 #include "mlx/c/private/map.h"
 #include "mlx/c/private/stream.h"

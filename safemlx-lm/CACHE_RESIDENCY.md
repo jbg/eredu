@@ -88,7 +88,10 @@ tiers and requested transfer bytes. They do not claim physical disk bytes:
 mapped pages may be served by the operating-system cache. SafeMLX's immutable
 weight residency manager, expert cache, and paged attention cache use MLX
 completion events to retain transfer sources and order compatible execution
-streams. Paged host-to-device promotion runs on a dedicated same-device
+streams. The core SafeMLX API now exposes typed CPU, Metal-shared, CUDA-pinned,
+and CUDA-managed host-transfer storage, but these residency managers still use
+MLX arrays for host blocks; adopting the new buffer type is separate follow-up
+work. Paged host-to-device promotion runs on a dedicated same-device
 transfer stream. Blockwise key/value and compressed-MLA attention keep a fixed
 two-block window (current plus next), submit each completed recurrence before
 waiting on the next block, and thereby permit the next promotion to overlap

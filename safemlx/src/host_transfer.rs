@@ -1,0 +1,305 @@
+use std::ffi::c_void;
+
+use crate::{
+    error::Result,
+    utils::{guard::Guarded, runtime_lock, SUCCESS},
+    Array, Dtype, Event, Stream,
+};
+
+/// Requested semantics for an MLX host transfer allocation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostTransferPolicy {
+    /// Select transfer-ready storage for the active backend.
+    ///
+    /// This is ordinary owned CPU memory on CPU-only builds, shared Metal
+    /// storage on Metal, and explicitly page-locked host memory on CUDA.
+    Transfer,
+    /// Select CUDA managed memory.
+    ///
+    /// This policy is distinct from [`Self::Transfer`] and is rejected by CPU
+    /// and Metal backends instead of silently changing its semantics.
+    Managed,
+}
+
+impl HostTransferPolicy {
+    fn as_raw(self) -> safemlx_sys::mlx_host_transfer_policy {
+        match self {
+            Self::Transfer => {
+                safemlx_sys::mlx_host_transfer_policy__MLX_HOST_TRANSFER_POLICY_TRANSFER
+            }
+            Self::Managed => {
+                safemlx_sys::mlx_host_transfer_policy__MLX_HOST_TRANSFER_POLICY_MANAGED
+            }
+        }
+    }
+}
+
+/// Physical storage selected for a host transfer allocation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostTransferStorageKind {
+    /// Ordinary CPU-owned storage.
+    Cpu,
+    /// A shared Metal allocation in Apple unified memory.
+    MetalShared,
+    /// Explicitly page-locked CUDA host storage.
+    CudaPinned,
+    /// CUDA managed storage selected through [`HostTransferPolicy::Managed`].
+    CudaManaged,
+}
+
+/// An owned, typed, host-addressable transfer allocation.
+///
+/// The buffer is not an MLX array and cannot accidentally enter an ordinary
+/// compute graph. Its shape and dtype travel with the allocation, and its
+/// backend-selected physical storage kind is inspectable.
+pub struct HostTransferBuffer {
+    pub(crate) raw: safemlx_sys::mlx_host_transfer_buffer,
+}
+
+impl HostTransferBuffer {
+    /// Allocate an uninitialized transfer buffer.
+    #[track_caller]
+    pub fn new(shape: &[i32], dtype: Dtype, policy: HostTransferPolicy) -> Result<Self> {
+        let _guard = runtime_lock::enter();
+        let dim = i32::try_from(shape.len()).map_err(|_| crate::error::Exception {
+            what: "Host transfer buffer rank exceeds i32::MAX".to_string(),
+            location: std::panic::Location::caller(),
+        })?;
+        Self::try_from_op(|buffer| unsafe {
+            safemlx_sys::mlx_host_transfer_buffer_new(
+                buffer,
+                shape.as_ptr(),
+                dim,
+                dtype.into(),
+                policy.as_raw(),
+            )
+        })
+    }
+
+    /// Submit an array-to-host copy on `stream`.
+    ///
+    /// Host data is only exposed after [`PendingHostTransfer::synchronize`]
+    /// succeeds.
+    pub fn copy_from_array(
+        source: &Array,
+        policy: HostTransferPolicy,
+        stream: impl AsRef<Stream>,
+    ) -> Result<PendingHostTransfer> {
+        let _guard = runtime_lock::enter();
+        let (buffer, completion) = <(Self, Event)>::try_from_op(|(buffer, event)| unsafe {
+            safemlx_sys::mlx_copy_to_host(
+                buffer,
+                event,
+                source.as_ptr(),
+                policy.as_raw(),
+                stream.as_ref().as_ptr(),
+            )
+        })?;
+        Ok(PendingHostTransfer { buffer, completion })
+    }
+
+    /// Submit a host-to-array copy on `stream`.
+    pub fn copy_to_array(self, stream: impl AsRef<Stream>) -> Result<PendingDeviceTransfer> {
+        let _guard = runtime_lock::enter();
+        let (value, completion) = <(Array, Event)>::try_from_op(|(array, event)| unsafe {
+            safemlx_sys::mlx_copy_from_host(array, event, self.raw, stream.as_ref().as_ptr())
+        })?;
+        Ok(PendingDeviceTransfer {
+            source: self,
+            value,
+            completion,
+        })
+    }
+
+    /// Shape recorded by the allocation.
+    pub fn shape(&self) -> Result<Vec<i32>> {
+        let _guard = runtime_lock::enter();
+        let ndim = usize::try_from_op(|output| unsafe {
+            safemlx_sys::mlx_host_transfer_buffer_ndim(output, self.raw)
+        })?;
+        let mut shape = std::ptr::null();
+        let status = unsafe { safemlx_sys::mlx_host_transfer_buffer_shape(&mut shape, self.raw) };
+        if status != SUCCESS {
+            return <() as Guarded>::try_from_op(|_| status).map(|_| Vec::new());
+        }
+        if ndim == 0 {
+            return Ok(Vec::new());
+        }
+        debug_assert!(!shape.is_null());
+        Ok(unsafe { std::slice::from_raw_parts(shape, ndim) }.to_vec())
+    }
+
+    /// Element dtype recorded by the allocation.
+    pub fn dtype(&self) -> Result<Dtype> {
+        let _guard = runtime_lock::enter();
+        let raw = u32::try_from_op(|output| unsafe {
+            safemlx_sys::mlx_host_transfer_buffer_dtype(output.cast(), self.raw)
+        })?;
+        Ok(Dtype::try_from(raw).expect("MLX returned an unknown dtype"))
+    }
+
+    /// Number of logical elements.
+    pub fn len(&self) -> Result<usize> {
+        let _guard = runtime_lock::enter();
+        usize::try_from_op(|output| unsafe {
+            safemlx_sys::mlx_host_transfer_buffer_size(output, self.raw)
+        })
+    }
+
+    /// Whether the typed allocation contains no logical elements.
+    pub fn is_empty(&self) -> Result<bool> {
+        self.len().map(|len| len == 0)
+    }
+
+    /// Logical byte length.
+    pub fn nbytes(&self) -> Result<usize> {
+        let _guard = runtime_lock::enter();
+        usize::try_from_op(|output| unsafe {
+            safemlx_sys::mlx_host_transfer_buffer_nbytes(output, self.raw)
+        })
+    }
+
+    /// Physical allocation capacity in bytes.
+    pub fn capacity(&self) -> Result<usize> {
+        let _guard = runtime_lock::enter();
+        usize::try_from_op(|output| unsafe {
+            safemlx_sys::mlx_host_transfer_buffer_capacity(output, self.raw)
+        })
+    }
+
+    /// Requested allocation policy.
+    pub fn policy(&self) -> Result<HostTransferPolicy> {
+        let _guard = runtime_lock::enter();
+        let raw = u32::try_from_op(|output| unsafe {
+            safemlx_sys::mlx_host_transfer_buffer_policy(output.cast(), self.raw)
+        })?;
+        match raw {
+            safemlx_sys::mlx_host_transfer_policy__MLX_HOST_TRANSFER_POLICY_TRANSFER => {
+                Ok(HostTransferPolicy::Transfer)
+            }
+            safemlx_sys::mlx_host_transfer_policy__MLX_HOST_TRANSFER_POLICY_MANAGED => {
+                Ok(HostTransferPolicy::Managed)
+            }
+            _ => unreachable!("MLX returned an unknown host transfer policy"),
+        }
+    }
+
+    /// Backend-selected physical storage kind.
+    pub fn storage_kind(&self) -> Result<HostTransferStorageKind> {
+        let _guard = runtime_lock::enter();
+        let raw = u32::try_from_op(|output| unsafe {
+            safemlx_sys::mlx_host_transfer_buffer_storage_kind(output.cast(), self.raw)
+        })?;
+        match raw {
+            safemlx_sys::mlx_host_transfer_storage_kind__MLX_HOST_TRANSFER_STORAGE_CPU => {
+                Ok(HostTransferStorageKind::Cpu)
+            }
+            safemlx_sys::mlx_host_transfer_storage_kind__MLX_HOST_TRANSFER_STORAGE_METAL_SHARED => {
+                Ok(HostTransferStorageKind::MetalShared)
+            }
+            safemlx_sys::mlx_host_transfer_storage_kind__MLX_HOST_TRANSFER_STORAGE_CUDA_PINNED => {
+                Ok(HostTransferStorageKind::CudaPinned)
+            }
+            safemlx_sys::mlx_host_transfer_storage_kind__MLX_HOST_TRANSFER_STORAGE_CUDA_MANAGED => {
+                Ok(HostTransferStorageKind::CudaManaged)
+            }
+            _ => unreachable!("MLX returned an unknown host transfer storage kind"),
+        }
+    }
+
+    /// Read the initialized bytes in this buffer.
+    pub fn as_bytes(&self) -> Result<&[u8]> {
+        let _guard = runtime_lock::enter();
+        let len = self.nbytes()?;
+        let mut pointer: *const c_void = std::ptr::null();
+        let status = unsafe { safemlx_sys::mlx_host_transfer_buffer_data(&mut pointer, self.raw) };
+        if status != SUCCESS {
+            return <() as Guarded>::try_from_op(|_| status).map(|_| &[][..]);
+        }
+        if len == 0 {
+            return Ok(&[]);
+        }
+        debug_assert!(!pointer.is_null());
+        Ok(unsafe { std::slice::from_raw_parts(pointer.cast(), len) })
+    }
+
+    /// Mutably access the bytes in an unshared, completed buffer.
+    pub fn as_bytes_mut(&mut self) -> Result<&mut [u8]> {
+        let _guard = runtime_lock::enter();
+        let len = self.nbytes()?;
+        let mut pointer: *mut c_void = std::ptr::null_mut();
+        let status =
+            unsafe { safemlx_sys::mlx_host_transfer_buffer_data_mut(&mut pointer, self.raw) };
+        if status != SUCCESS {
+            return <() as Guarded>::try_from_op(|_| status).map(|_| &mut [][..]);
+        }
+        if len == 0 {
+            return Ok(&mut []);
+        }
+        debug_assert!(!pointer.is_null());
+        Ok(unsafe { std::slice::from_raw_parts_mut(pointer.cast(), len) })
+    }
+}
+
+impl Drop for HostTransferBuffer {
+    fn drop(&mut self) {
+        let _guard = runtime_lock::enter();
+        let status = unsafe { safemlx_sys::mlx_host_transfer_buffer_free(self.raw) };
+        debug_assert_eq!(status, SUCCESS);
+    }
+}
+
+impl std::fmt::Debug for HostTransferBuffer {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("HostTransferBuffer")
+            .field("shape", &self.shape())
+            .field("dtype", &self.dtype())
+            .field("nbytes", &self.nbytes())
+            .field("capacity", &self.capacity())
+            .field("policy", &self.policy())
+            .field("storage_kind", &self.storage_kind())
+            .finish()
+    }
+}
+
+/// An array-to-host transfer whose buffer cannot be accessed before completion.
+#[derive(Debug)]
+pub struct PendingHostTransfer {
+    buffer: HostTransferBuffer,
+    completion: Event,
+}
+
+impl PendingHostTransfer {
+    /// Completion token for nonblocking observation or stream ordering.
+    pub fn completion(&self) -> &Event {
+        &self.completion
+    }
+
+    /// Wait for the transfer and expose the initialized host buffer.
+    pub fn synchronize(self) -> Result<HostTransferBuffer> {
+        self.completion.synchronize()?;
+        Ok(self.buffer)
+    }
+}
+
+/// A host-to-array transfer whose array cannot be accessed before completion.
+#[derive(Debug)]
+pub struct PendingDeviceTransfer {
+    source: HostTransferBuffer,
+    value: Array,
+    completion: Event,
+}
+
+impl PendingDeviceTransfer {
+    /// Completion token for nonblocking observation or stream ordering.
+    pub fn completion(&self) -> &Event {
+        &self.completion
+    }
+
+    /// Wait for the transfer and return the array with its reusable source.
+    pub fn synchronize(self) -> Result<(Array, HostTransferBuffer)> {
+        self.completion.synchronize()?;
+        Ok((self.value, self.source))
+    }
+}

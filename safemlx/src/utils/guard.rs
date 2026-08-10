@@ -382,6 +382,100 @@ impl Guarded for crate::Event {
     type Guard = MaybeUninitEvent;
 }
 
+pub(crate) struct MaybeUninitHostTransferBuffer {
+    pub(crate) ptr: safemlx_sys::mlx_host_transfer_buffer,
+    pub(crate) init_success: bool,
+}
+
+impl Default for MaybeUninitHostTransferBuffer {
+    fn default() -> Self {
+        Self {
+            ptr: safemlx_sys::mlx_host_transfer_buffer {
+                ctx: std::ptr::null_mut(),
+            },
+            init_success: false,
+        }
+    }
+}
+
+impl Drop for MaybeUninitHostTransferBuffer {
+    fn drop(&mut self) {
+        if !self.init_success && !self.ptr.ctx.is_null() {
+            unsafe {
+                safemlx_sys::mlx_host_transfer_buffer_free(self.ptr);
+            }
+        }
+    }
+}
+
+impl Guard<crate::HostTransferBuffer> for MaybeUninitHostTransferBuffer {
+    type MutRawPtr = *mut safemlx_sys::mlx_host_transfer_buffer;
+
+    fn as_mut_raw_ptr(&mut self) -> Self::MutRawPtr {
+        &mut self.ptr
+    }
+
+    fn set_init_success(&mut self, success: bool) {
+        self.init_success = success;
+    }
+
+    fn try_into_guarded(self) -> Result<crate::HostTransferBuffer, Exception> {
+        debug_assert!(self.init_success);
+        Ok(crate::HostTransferBuffer { raw: self.ptr })
+    }
+}
+
+impl Guarded for crate::HostTransferBuffer {
+    type Guard = MaybeUninitHostTransferBuffer;
+}
+
+impl Guard<(crate::HostTransferBuffer, crate::Event)>
+    for (MaybeUninitHostTransferBuffer, MaybeUninitEvent)
+{
+    type MutRawPtr = (
+        *mut safemlx_sys::mlx_host_transfer_buffer,
+        *mut safemlx_sys::mlx_event,
+    );
+
+    fn as_mut_raw_ptr(&mut self) -> Self::MutRawPtr {
+        (self.0.as_mut_raw_ptr(), self.1.as_mut_raw_ptr())
+    }
+
+    fn set_init_success(&mut self, success: bool) {
+        self.0.set_init_success(success);
+        self.1.set_init_success(success);
+    }
+
+    fn try_into_guarded(self) -> Result<(crate::HostTransferBuffer, crate::Event), Exception> {
+        Ok((self.0.try_into_guarded()?, self.1.try_into_guarded()?))
+    }
+}
+
+impl Guarded for (crate::HostTransferBuffer, crate::Event) {
+    type Guard = (MaybeUninitHostTransferBuffer, MaybeUninitEvent);
+}
+
+impl Guard<(crate::Array, crate::Event)> for (MaybeUninitArray, MaybeUninitEvent) {
+    type MutRawPtr = (*mut mlx_array, *mut safemlx_sys::mlx_event);
+
+    fn as_mut_raw_ptr(&mut self) -> Self::MutRawPtr {
+        (self.0.as_mut_raw_ptr(), self.1.as_mut_raw_ptr())
+    }
+
+    fn set_init_success(&mut self, success: bool) {
+        self.0.set_init_success(success);
+        self.1.set_init_success(success);
+    }
+
+    fn try_into_guarded(self) -> Result<(crate::Array, crate::Event), Exception> {
+        Ok((self.0.try_into_guarded()?, self.1.try_into_guarded()?))
+    }
+}
+
+impl Guarded for (crate::Array, crate::Event) {
+    type Guard = (MaybeUninitArray, MaybeUninitEvent);
+}
+
 pub(crate) struct MaybeUninitStream {
     pub(crate) ptr: safemlx_sys::mlx_stream,
     pub(crate) init_success: bool,
@@ -691,7 +785,21 @@ macro_rules! impl_guarded_for_primitive {
     };
 }
 
-impl_guarded_for_primitive!(bool, u8, u16, u32, u64, i8, i16, i32, i64, f32, f64, ());
+impl_guarded_for_primitive!(
+    bool,
+    u8,
+    u16,
+    u32,
+    u64,
+    usize,
+    i8,
+    i16,
+    i32,
+    i64,
+    f32,
+    f64,
+    ()
+);
 
 impl Guarded for f16 {
     type Guard = float16_t;

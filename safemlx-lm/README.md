@@ -270,8 +270,9 @@ ordinary layerwise execution keeps its bounded two-layer transfer window.
 Registered GGUF checkpoints and bounded load-time affine/MXFP4 conversion from unquantized SafeTensors or
 F32/F16/BF16 GGUF sources use the same layerwise residency plan; matching
 checkpoint-native packed GGUF tensors load directly and are never implicitly
-transcoded. Pinned host buffers and KV-cache offload are not supported by this
-policy. The opt-in
+transcoded. Selecting this weight policy does not enable KV-cache offload, and
+the residency implementation has not yet adopted SafeMLX's typed host-transfer
+buffers. The opt-in
 `llama_residency` example accepts a real checkpoint directory and reports
 latency, throughput, logical residency, transfer telemetry, allocator samples,
 and mapped-shard diagnostics.

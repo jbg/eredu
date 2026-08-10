@@ -1,0 +1,800 @@
+diff --git a/mlx/CMakeLists.txt b/mlx/CMakeLists.txt
+index 0df4f4234..d2d459718 100644
+--- a/mlx/CMakeLists.txt
++++ b/mlx/CMakeLists.txt
+@@ -11,6 +11,7 @@ target_sources(
+           ${CMAKE_CURRENT_SOURCE_DIR}/fft.cpp
+           ${CMAKE_CURRENT_SOURCE_DIR}/ops.cpp
+           ${CMAKE_CURRENT_SOURCE_DIR}/graph_utils.cpp
++          ${CMAKE_CURRENT_SOURCE_DIR}/host_transfer.cpp
+           ${CMAKE_CURRENT_SOURCE_DIR}/primitives.cpp
+           ${CMAKE_CURRENT_SOURCE_DIR}/random.cpp
+           ${CMAKE_CURRENT_SOURCE_DIR}/scheduler.cpp
+diff --git a/mlx/allocator.h b/mlx/allocator.h
+index c831b7247..1855dd2d4 100644
+--- a/mlx/allocator.h
++++ b/mlx/allocator.h
+@@ -3,11 +3,24 @@
+ #pragma once
+ 
+ #include <cstdlib>
++#include <stdexcept>
+ 
+ #include "mlx/api.h"
+ 
+ namespace mlx::core::allocator {
+ 
++enum class HostTransferPolicy {
++  transfer,
++  managed,
++};
++
++enum class HostTransferStorageKind {
++  cpu,
++  metal_shared,
++  cuda_pinned,
++  cuda_managed,
++};
++
+ // Simple wrapper around buffer pointers
+ // WARNING: Only Buffer objects constructed from and those that wrap
+ //          raw pointers from mlx::allocator are supported.
+@@ -41,6 +54,28 @@ class MLX_API Allocator {
+   };
+   virtual void release(Buffer buffer) {}
+ 
++  /** Allocate host-addressable storage suitable for backend transfers. */
++  virtual Buffer malloc_host_transfer(
++      size_t size,
++      HostTransferPolicy policy) {
++    if (policy == HostTransferPolicy::managed) {
++      throw std::invalid_argument(
++          "Managed host transfer storage is not supported by this backend.");
++    }
++    return malloc(size);
++  }
++
++  /** Free a buffer returned by malloc_host_transfer. */
++  virtual void free_host_transfer(Buffer buffer, HostTransferPolicy) {
++    free(buffer);
++  }
++
++  /** Report the physical storage selected for a host transfer policy. */
++  virtual HostTransferStorageKind host_transfer_storage_kind(
++      HostTransferPolicy) const {
++    return HostTransferStorageKind::cpu;
++  }
++
+   Allocator() = default;
+   Allocator(const Allocator& other) = delete;
+   Allocator(Allocator&& other) = delete;
+diff --git a/mlx/backend/common/common.cpp b/mlx/backend/common/common.cpp
+index cbc90ed27..b26076acd 100644
+--- a/mlx/backend/common/common.cpp
++++ b/mlx/backend/common/common.cpp
+@@ -4,6 +4,7 @@
+ #include "mlx/backend/common/broadcasting.h"
+ #include "mlx/backend/common/utils.h"
+ #include "mlx/primitives.h"
++#include "mlx/backend/cpu/copy.h"
+ 
+ namespace mlx::core {
+ 
+@@ -57,6 +58,21 @@ void Copy::eval(const std::vector<array>& inputs, array& out) {
+   out.copy_shared_buffer(inputs[0]);
+ }
+ 
++void CopyToHostTransfer::eval_cpu(
++    const std::vector<array>& inputs,
++    array& out) {
++  assert(inputs.size() == 1);
++  buffer_.attach(out);
++  copy_cpu_inplace(inputs[0], out, CopyType::General, stream());
++}
++
++void CopyFromHostTransfer::eval_cpu(
++    const std::vector<array>& inputs,
++    array& out) {
++  assert(inputs.size() == 1);
++  copy_cpu(inputs[0], out, CopyType::General, stream());
++}
++
+ void CustomTransforms::eval(
+     const std::vector<array>& inputs,
+     std::vector<array>& outputs) {
+diff --git a/mlx/backend/cuda/CMakeLists.txt b/mlx/backend/cuda/CMakeLists.txt
+index 065220e24..064e1ef08 100644
+--- a/mlx/backend/cuda/CMakeLists.txt
++++ b/mlx/backend/cuda/CMakeLists.txt
+@@ -34,6 +34,7 @@ target_sources(
+           ${CMAKE_CURRENT_SOURCE_DIR}/gemms/gather_gemm.cu
+           ${CMAKE_CURRENT_SOURCE_DIR}/gemms/grouped_gemm_unaligned.cu
+           ${CMAKE_CURRENT_SOURCE_DIR}/hadamard.cu
++          ${CMAKE_CURRENT_SOURCE_DIR}/host_transfer.cpp
+           ${CMAKE_CURRENT_SOURCE_DIR}/jit_module.cpp
+           ${CMAKE_CURRENT_SOURCE_DIR}/indexing.cpp
+           ${CMAKE_CURRENT_SOURCE_DIR}/kernel_utils.cu
+diff --git a/mlx/backend/cuda/allocator.cpp b/mlx/backend/cuda/allocator.cpp
+index b04d72da0..10017d100 100644
+--- a/mlx/backend/cuda/allocator.cpp
++++ b/mlx/backend/cuda/allocator.cpp
+@@ -253,6 +253,45 @@ Buffer CudaAllocator::malloc(size_t size) {
+   return malloc_async(size, -1, nullptr);
+ }
+ 
++Buffer CudaAllocator::malloc_host_transfer(
++    size_t size,
++    allocator::HostTransferPolicy policy) {
++  if (size == 0) {
++    return Buffer{new CudaBuffer{nullptr, 0, -1}};
++  }
++  void* data = nullptr;
++  if (policy == allocator::HostTransferPolicy::managed) {
++    CHECK_CUDA_ERROR(cudaMallocManaged(&data, size));
++  } else {
++    CHECK_CUDA_ERROR(cudaMallocHost(&data, size));
++  }
++  return Buffer{new CudaBuffer{data, size, -1}};
++}
++
++void CudaAllocator::free_host_transfer(
++    Buffer buffer,
++    allocator::HostTransferPolicy policy) {
++  auto* cuda_buffer = static_cast<CudaBuffer*>(buffer.ptr());
++  if (!cuda_buffer) {
++    return;
++  }
++  if (cuda_buffer->data) {
++    if (policy == allocator::HostTransferPolicy::managed) {
++      CHECK_CUDA_ERROR(cudaFree(cuda_buffer->data));
++    } else {
++      CHECK_CUDA_ERROR(cudaFreeHost(cuda_buffer->data));
++    }
++  }
++  delete cuda_buffer;
++}
++
++allocator::HostTransferStorageKind CudaAllocator::host_transfer_storage_kind(
++    allocator::HostTransferPolicy policy) const {
++  return policy == allocator::HostTransferPolicy::managed
++      ? allocator::HostTransferStorageKind::cuda_managed
++      : allocator::HostTransferStorageKind::cuda_pinned;
++}
++
+ void CudaAllocator::free(Buffer buffer) {
+   auto* buf = static_cast<CudaBuffer*>(buffer.ptr());
+   if (!buf) {
+diff --git a/mlx/backend/cuda/allocator.h b/mlx/backend/cuda/allocator.h
+index af76ad905..5ebe77989 100644
+--- a/mlx/backend/cuda/allocator.h
++++ b/mlx/backend/cuda/allocator.h
+@@ -53,6 +53,14 @@ class CudaAllocator : public allocator::Allocator {
+   Buffer malloc_async(size_t size, int device, cudaStream_t stream);
+   void free(Buffer buffer) override;
+   size_t size(Buffer buffer) const override;
++  Buffer malloc_host_transfer(
++      size_t size,
++      allocator::HostTransferPolicy policy) override;
++  void free_host_transfer(
++      Buffer buffer,
++      allocator::HostTransferPolicy policy) override;
++  allocator::HostTransferStorageKind host_transfer_storage_kind(
++      allocator::HostTransferPolicy policy) const override;
+ 
+   // Replace the memory of |buf| with unified memory (managed memory or pinned
+   // host memory), and copy the data over. Pass |stream| to copy asynchronously.
+diff --git a/mlx/backend/cuda/device.cpp b/mlx/backend/cuda/device.cpp
+index 0ce58211b..ffa63e32c 100644
+--- a/mlx/backend/cuda/device.cpp
++++ b/mlx/backend/cuda/device.cpp
+@@ -287,6 +287,24 @@ void CommandEncoder::add_kernel_node_raw(
+   }
+ }
+ 
++void CommandEncoder::add_memcpy_node(
++    void* destination,
++    const void* source,
++    size_t size,
++    cudaMemcpyKind kind) {
++  if (!use_cuda_graphs()) {
++    node_count_++;
++    CHECK_CUDA_ERROR(
++        cudaMemcpyAsync(destination, source, size, kind, stream()));
++    return;
++  }
++
++  cudaGraphNode_t node;
++  CHECK_CUDA_ERROR(cudaGraphAddMemcpyNode1D(
++      &node, graph_, nullptr, 0, destination, source, size, kind));
++  insert_graph_dependencies(GraphNode{node, "M"});
++}
++
+ void CommandEncoder::add_kernel_node_raw(
+     CUfunction func,
+     dim3 grid_dim,
+diff --git a/mlx/backend/cuda/device.h b/mlx/backend/cuda/device.h
+index 15d75082e..2929794fc 100644
+--- a/mlx/backend/cuda/device.h
++++ b/mlx/backend/cuda/device.h
+@@ -91,6 +91,12 @@ class CommandEncoder {
+       uint32_t smem_bytes,
+       void** params);
+ 
++  void add_memcpy_node(
++      void* destination,
++      const void* source,
++      size_t size,
++      cudaMemcpyKind kind);
++
+   void add_kernel_node_raw(
+       CUfunction func,
+       dim3 grid_dim,
+diff --git a/mlx/backend/cuda/host_transfer.cpp b/mlx/backend/cuda/host_transfer.cpp
+new file mode 100644
+index 000000000..a61b22190
+--- /dev/null
++++ b/mlx/backend/cuda/host_transfer.cpp
+@@ -0,0 +1,36 @@
++// Copyright © 2026 Apple Inc.
++
++#include "mlx/backend/gpu/host_transfer.h"
++
++#include "mlx/backend/cuda/allocator.h"
++#include "mlx/backend/cuda/device.h"
++#include "mlx/backend/cuda/utils.h"
++
++namespace mlx::core {
++
++namespace {
++
++void copy_bytes(const array& input, array& output, const Stream& stream) {
++  auto& encoder = cu::get_command_encoder(stream);
++  encoder.set_input_array(input);
++  encoder.set_output_array(output);
++  encoder.add_memcpy_node(
++      gpu_ptr<void>(output),
++      gpu_ptr<void>(input),
++      input.nbytes(),
++      cudaMemcpyDefault);
++}
++
++} // namespace
++
++void copy_gpu_to_host(const array& input, array& output, const Stream& stream) {
++  copy_bytes(input, output, stream);
++}
++
++void copy_host_to_gpu(const array& input, array& output, const Stream& stream) {
++  auto& encoder = cu::get_command_encoder(stream);
++  output.set_data(cu::malloc_async(output.nbytes(), encoder));
++  copy_bytes(input, output, stream);
++}
++
++} // namespace mlx::core
+diff --git a/mlx/backend/gpu/host_transfer.h b/mlx/backend/gpu/host_transfer.h
+new file mode 100644
+index 000000000..3c581eb25
+--- /dev/null
++++ b/mlx/backend/gpu/host_transfer.h
+@@ -0,0 +1,12 @@
++// Copyright © 2026 Apple Inc.
++#pragma once
++
++#include "mlx/array.h"
++#include "mlx/stream.h"
++
++namespace mlx::core {
++
++void copy_gpu_to_host(const array& input, array& output, const Stream& stream);
++void copy_host_to_gpu(const array& input, array& output, const Stream& stream);
++
++} // namespace mlx::core
+diff --git a/mlx/backend/gpu/primitives.cpp b/mlx/backend/gpu/primitives.cpp
+index 268d6290b..15ebd468a 100644
+--- a/mlx/backend/gpu/primitives.cpp
++++ b/mlx/backend/gpu/primitives.cpp
+@@ -4,6 +4,7 @@
+ #include "mlx/backend/common/slicing.h"
+ #include "mlx/backend/common/utils.h"
+ #include "mlx/backend/gpu/copy.h"
++#include "mlx/backend/gpu/host_transfer.h"
+ #include "mlx/backend/gpu/slicing.h"
+ 
+ #if defined(MLX_USE_CUDA)
+@@ -66,6 +67,23 @@ void Copy::eval_gpu(const std::vector<array>& inputs, array& out) {
+   eval(inputs, out);
+ }
+ 
++void CopyToHostTransfer::eval_gpu(
++    const std::vector<array>& inputs,
++    array& out) {
++  MLX_PROFILER_RANGE("CopyToHostTransfer::eval_gpu");
++  assert(inputs.size() == 1);
++  buffer_.attach(out);
++  copy_gpu_to_host(inputs[0], out, stream());
++}
++
++void CopyFromHostTransfer::eval_gpu(
++    const std::vector<array>& inputs,
++    array& out) {
++  MLX_PROFILER_RANGE("CopyFromHostTransfer::eval_gpu");
++  assert(inputs.size() == 1);
++  copy_host_to_gpu(inputs[0], out, stream());
++}
++
+ void CustomTransforms::eval_gpu(
+     const std::vector<array>& inputs,
+     std::vector<array>& outputs) {
+diff --git a/mlx/backend/metal/CMakeLists.txt b/mlx/backend/metal/CMakeLists.txt
+index a1b908dbd..31cb53584 100644
+--- a/mlx/backend/metal/CMakeLists.txt
++++ b/mlx/backend/metal/CMakeLists.txt
+@@ -151,6 +151,7 @@ target_sources(
+           ${CMAKE_CURRENT_SOURCE_DIR}/fence.cpp
+           ${CMAKE_CURRENT_SOURCE_DIR}/fft.cpp
+           ${CMAKE_CURRENT_SOURCE_DIR}/hadamard.cpp
++          ${CMAKE_CURRENT_SOURCE_DIR}/host_transfer.cpp
+           ${CMAKE_CURRENT_SOURCE_DIR}/indexing.cpp
+           ${CMAKE_CURRENT_SOURCE_DIR}/logsumexp.cpp
+           ${CMAKE_CURRENT_SOURCE_DIR}/matmul.cpp
+diff --git a/mlx/backend/metal/allocator.h b/mlx/backend/metal/allocator.h
+index 4cbbfb0ad..7a51fec8c 100644
+--- a/mlx/backend/metal/allocator.h
++++ b/mlx/backend/metal/allocator.h
+@@ -22,6 +22,14 @@ class MetalAllocator : public allocator::Allocator {
+   virtual size_t size(Buffer buffer) const override;
+   virtual Buffer make_buffer(void* ptr, size_t size) override;
+   virtual void release(Buffer buffer) override;
++  allocator::HostTransferStorageKind host_transfer_storage_kind(
++      allocator::HostTransferPolicy policy) const override {
++    if (policy == allocator::HostTransferPolicy::managed) {
++      throw std::invalid_argument(
++          "Managed host transfer storage is not supported by Metal.");
++    }
++    return allocator::HostTransferStorageKind::metal_shared;
++  }
+ 
+   size_t get_active_memory() {
+     return active_memory_;
+diff --git a/mlx/backend/metal/host_transfer.cpp b/mlx/backend/metal/host_transfer.cpp
+new file mode 100644
+index 000000000..458a89cf6
+--- /dev/null
++++ b/mlx/backend/metal/host_transfer.cpp
+@@ -0,0 +1,18 @@
++// Copyright © 2026 Apple Inc.
++
++#include "mlx/backend/gpu/host_transfer.h"
++
++#include "mlx/backend/common/copy.h"
++#include "mlx/backend/gpu/copy.h"
++
++namespace mlx::core {
++
++void copy_gpu_to_host(const array& input, array& output, const Stream& stream) {
++  copy_gpu_inplace(input, output, CopyType::Vector, stream);
++}
++
++void copy_host_to_gpu(const array& input, array& output, const Stream& stream) {
++  copy_gpu(input, output, CopyType::General, stream);
++}
++
++} // namespace mlx::core
+diff --git a/mlx/backend/no_cpu/primitives.cpp b/mlx/backend/no_cpu/primitives.cpp
+index 751572c99..2f16210ab 100644
+--- a/mlx/backend/no_cpu/primitives.cpp
++++ b/mlx/backend/no_cpu/primitives.cpp
+@@ -45,6 +45,8 @@ NO_CPU(Conjugate)
+ NO_CPU(Contiguous)
+ NO_CPU(Convolution)
+ NO_CPU(Copy)
++NO_CPU(CopyToHostTransfer)
++NO_CPU(CopyFromHostTransfer)
+ NO_CPU(Cos)
+ NO_CPU(Cosh)
+ NO_CPU_MULTI(CustomTransforms)
+diff --git a/mlx/backend/no_gpu/primitives.cpp b/mlx/backend/no_gpu/primitives.cpp
+index 2c685b72a..dfb6a5391 100644
+--- a/mlx/backend/no_gpu/primitives.cpp
++++ b/mlx/backend/no_gpu/primitives.cpp
+@@ -74,6 +74,8 @@ NO_GPU(Conjugate)
+ NO_GPU(Contiguous)
+ NO_GPU(Convolution)
+ NO_GPU(Copy)
++NO_GPU(CopyToHostTransfer)
++NO_GPU(CopyFromHostTransfer)
+ NO_GPU(Cos)
+ NO_GPU(Cosh)
+ NO_GPU_MULTI(CustomTransforms)
+diff --git a/mlx/host_transfer.cpp b/mlx/host_transfer.cpp
+new file mode 100644
+index 000000000..40e92a758
+--- /dev/null
++++ b/mlx/host_transfer.cpp
+@@ -0,0 +1,169 @@
++// Copyright © 2026 Apple Inc.
++
++#include "mlx/host_transfer.h"
++
++#include <limits>
++#include <stdexcept>
++
++#include "mlx/primitives.h"
++#include "mlx/ops.h"
++#include "mlx/transforms.h"
++
++namespace mlx::core {
++
++class HostTransferStorage {
++ public:
++  HostTransferStorage(size_t size, HostTransferPolicy policy)
++      : buffer_(allocator::allocator().malloc_host_transfer(size, policy)),
++        capacity_(allocator::allocator().size(buffer_)),
++        policy_(policy),
++        storage_kind_(
++            allocator::allocator().host_transfer_storage_kind(policy)) {}
++
++  ~HostTransferStorage() {
++    allocator::allocator().free_host_transfer(buffer_, policy_);
++  }
++
++  HostTransferStorage(const HostTransferStorage&) = delete;
++  HostTransferStorage& operator=(const HostTransferStorage&) = delete;
++
++  allocator::Buffer buffer() const {
++    return buffer_;
++  }
++  size_t capacity() const {
++    return capacity_;
++  }
++  HostTransferPolicy policy() const {
++    return policy_;
++  }
++  HostTransferStorageKind storage_kind() const {
++    return storage_kind_;
++  }
++
++ private:
++  allocator::Buffer buffer_;
++  size_t capacity_;
++  HostTransferPolicy policy_;
++  HostTransferStorageKind storage_kind_;
++};
++
++HostTransferBuffer::HostTransferBuffer(
++    Shape shape,
++    Dtype dtype,
++    HostTransferPolicy policy)
++    : shape_(std::move(shape)), dtype_(dtype) {
++  size_t elements = 1;
++  for (auto dimension : shape_) {
++    if (dimension < 0) {
++      throw std::invalid_argument(
++          "[HostTransferBuffer] Negative dimensions are not allowed.");
++    }
++    if (dimension != 0 &&
++        elements > std::numeric_limits<size_t>::max() /
++            static_cast<size_t>(dimension)) {
++      throw std::overflow_error("[HostTransferBuffer] Shape is too large.");
++    }
++    elements *= static_cast<size_t>(dimension);
++  }
++  if (elements > std::numeric_limits<size_t>::max() / size_of(dtype_)) {
++    throw std::overflow_error("[HostTransferBuffer] Byte size overflow.");
++  }
++  storage_ = std::make_shared<HostTransferStorage>(
++      elements * size_of(dtype_), policy);
++}
++
++void* HostTransferBuffer::data() {
++  if (!storage_) {
++    throw std::runtime_error("[HostTransferBuffer::data] Empty buffer.");
++  }
++  return storage_->buffer().raw_ptr();
++}
++
++const void* HostTransferBuffer::data() const {
++  return const_cast<HostTransferBuffer*>(this)->data();
++}
++
++const Shape& HostTransferBuffer::shape() const {
++  return shape_;
++}
++
++Dtype HostTransferBuffer::dtype() const {
++  return dtype_;
++}
++
++size_t HostTransferBuffer::size() const {
++  size_t count = 1;
++  for (auto dimension : shape_) {
++    count *= dimension;
++  }
++  return count;
++}
++
++size_t HostTransferBuffer::nbytes() const {
++  return size() * size_of(dtype_);
++}
++
++size_t HostTransferBuffer::capacity() const {
++  return storage_ ? storage_->capacity() : 0;
++}
++
++HostTransferPolicy HostTransferBuffer::policy() const {
++  if (!storage_) {
++    throw std::runtime_error("[HostTransferBuffer::policy] Empty buffer.");
++  }
++  return storage_->policy();
++}
++
++HostTransferStorageKind HostTransferBuffer::storage_kind() const {
++  if (!storage_) {
++    throw std::runtime_error(
++        "[HostTransferBuffer::storage_kind] Empty buffer.");
++  }
++  return storage_->storage_kind();
++}
++
++void HostTransferBuffer::attach(array& destination) const {
++  if (!storage_) {
++    throw std::runtime_error("[HostTransferBuffer::attach] Empty buffer.");
++  }
++  auto owner = storage_;
++  destination.set_data(
++      storage_->buffer(),
++      [owner = std::move(owner)](allocator::Buffer) mutable { owner.reset(); });
++}
++
++HostTransfer copy_to_host(
++    array source,
++    HostTransferPolicy policy,
++    StreamOrDevice stream) {
++  HostTransferBuffer buffer(source.shape(), source.dtype(), policy);
++  auto output = array(
++      source.shape(),
++      source.dtype(),
++      std::make_shared<CopyToHostTransfer>(to_stream(stream), buffer),
++      {contiguous(source, false, stream)});
++  auto completion = async_eval_with_completion({output});
++  return {std::move(buffer), std::move(completion)};
++}
++
++DeviceTransfer copy_from_host(
++    const HostTransferBuffer& source,
++    StreamOrDevice stream) {
++  if (!source) {
++    throw std::invalid_argument("[copy_from_host] Empty source buffer.");
++  }
++  auto input = array(
++      source.storage_->buffer(),
++      source.shape(),
++      source.dtype(),
++      [owner = source.storage_](allocator::Buffer) mutable { owner.reset(); });
++  auto output = array(
++      source.shape(),
++      source.dtype(),
++      std::make_shared<CopyFromHostTransfer>(to_stream(stream)),
++      {std::move(input)});
++  auto completion = async_eval_with_completion({output});
++  return {std::move(output), std::move(completion)};
++}
++
++} // namespace mlx::core
+diff --git a/mlx/host_transfer.h b/mlx/host_transfer.h
+new file mode 100644
+index 000000000..2caaa0dd5
+--- /dev/null
++++ b/mlx/host_transfer.h
+@@ -0,0 +1,91 @@
++// Copyright © 2026 Apple Inc.
++#pragma once
++
++#include <memory>
++
++#include "mlx/allocator.h"
++#include "mlx/array.h"
++#include "mlx/completion.h"
++#include "mlx/dtype.h"
++#include "mlx/stream.h"
++#include "mlx/utils.h"
++
++namespace mlx::core {
++
++using HostTransferPolicy = allocator::HostTransferPolicy;
++using HostTransferStorageKind = allocator::HostTransferStorageKind;
++
++class HostTransferStorage;
++struct DeviceTransfer;
++
++/**
++ * Owned, host-addressable storage prepared for asynchronous backend transfers.
++ *
++ * The selected storage is backend-specific but its semantics are not:
++ * `transfer` selects CPU memory on CPU-only builds, shared Metal storage on
++ * Metal, and page-locked host storage on CUDA. `managed` is a separately named
++ * CUDA policy and is rejected by backends which cannot provide it.
++ *
++ * Copies share the allocation. The allocation remains alive while a submitted
++ * transfer or any copy of this object retains it.
++ */
++class MLX_API HostTransferBuffer {
++ public:
++  HostTransferBuffer() = default;
++  HostTransferBuffer(
++      Shape shape,
++      Dtype dtype,
++      HostTransferPolicy policy = HostTransferPolicy::transfer);
++
++  /** Host pointer. Do not access it until the producing completion finishes. */
++  void* data();
++  const void* data() const;
++
++  const Shape& shape() const;
++  Dtype dtype() const;
++  size_t size() const;
++  size_t nbytes() const;
++  size_t capacity() const;
++  HostTransferPolicy policy() const;
++  HostTransferStorageKind storage_kind() const;
++
++  explicit operator bool() const {
++    return storage_ != nullptr;
++  }
++
++ private:
++  void attach(array& destination) const;
++
++  std::shared_ptr<HostTransferStorage> storage_;
++  Shape shape_;
++  Dtype dtype_{float32};
++
++  friend class CopyToHostTransfer;
++  friend class CopyFromHostTransfer;
++  friend DeviceTransfer copy_from_host(
++      const HostTransferBuffer& source,
++      StreamOrDevice stream);
++};
++
++struct MLX_API HostTransfer {
++  HostTransferBuffer buffer;
++  Completion completion;
++};
++
++struct MLX_API DeviceTransfer {
++  array value;
++  Completion completion;
++};
++
++/** Allocate a transfer buffer and asynchronously copy `source` into it. */
++MLX_API HostTransfer copy_to_host(
++    array source,
++    HostTransferPolicy policy = HostTransferPolicy::transfer,
++    StreamOrDevice stream = {});
++
++/** Asynchronously copy a host transfer buffer into a new MLX array. */
++MLX_API DeviceTransfer copy_from_host(
++    const HostTransferBuffer& source,
++    StreamOrDevice stream = {});
++
++} // namespace mlx::core
+diff --git a/mlx/primitives.h b/mlx/primitives.h
+index 5b8517c56..753a11d69 100644
+--- a/mlx/primitives.h
++++ b/mlx/primitives.h
+@@ -8,6 +8,7 @@
+ #include "mlx/array.h"
+ #include "mlx/device.h"
+ #include "mlx/io/load.h"
++#include "mlx/host_transfer.h"
+ #include "mlx/stream.h"
+ 
+ #define DEFINE_VMAP()                                                 \
+@@ -804,6 +805,32 @@ class Copy : public UnaryPrimitive {
+   void eval(const std::vector<array>& inputs, array& out);
+ };
+ 
++class CopyToHostTransfer : public UnaryPrimitive {
++ public:
++  CopyToHostTransfer(Stream stream, HostTransferBuffer buffer)
++      : UnaryPrimitive(stream), buffer_(std::move(buffer)) {}
++
++  void eval_cpu(const std::vector<array>& inputs, array& out) override;
++  void eval_gpu(const std::vector<array>& inputs, array& out) override;
++
++  DEFINE_NAME(CopyToHostTransfer)
++  DEFINE_INPUT_OUTPUT_SHAPE()
++
++ private:
++  HostTransferBuffer buffer_;
++};
++
++class CopyFromHostTransfer : public UnaryPrimitive {
++ public:
++  explicit CopyFromHostTransfer(Stream stream) : UnaryPrimitive(stream) {}
++
++  void eval_cpu(const std::vector<array>& inputs, array& out) override;
++  void eval_gpu(const std::vector<array>& inputs, array& out) override;
++
++  DEFINE_NAME(CopyFromHostTransfer)
++  DEFINE_INPUT_OUTPUT_SHAPE()
++};
++
+ class Cos : public UnaryPrimitive {
+  public:
+   explicit Cos(Stream stream) : UnaryPrimitive(stream) {}
+diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
+index b8f000e7b..05ed0de8a 100644
+--- a/tests/CMakeLists.txt
++++ b/tests/CMakeLists.txt
+@@ -29,6 +29,7 @@ target_sources(
+           export_import_tests.cpp
+           eval_tests.cpp
+           fft_tests.cpp
++          host_transfer_tests.cpp
+           load_tests.cpp
+           ops_tests.cpp
+           random_tests.cpp
+diff --git a/tests/host_transfer_tests.cpp b/tests/host_transfer_tests.cpp
+new file mode 100644
+index 000000000..736d9a79e
+--- /dev/null
++++ b/tests/host_transfer_tests.cpp
+@@ -0,0 +1,57 @@
++// Copyright © 2026 Apple Inc.
++
++#include "doctest/doctest.h"
++
++#include "mlx/host_transfer.h"
++#include "mlx/mlx.h"
++
++using namespace mlx::core;
++
++TEST_CASE("test CPU host transfer round trip") {
++  auto stream = new_thread_unsafe_stream(Device::cpu);
++  auto source = array({1.0f, 2.0f, 3.0f, 4.0f}, Shape{2, 2});
++
++  auto to_host = copy_to_host(source, HostTransferPolicy::transfer, stream);
++  CHECK(to_host.buffer.shape() == Shape{2, 2});
++  CHECK(to_host.buffer.dtype() == float32);
++  CHECK(to_host.buffer.size() == 4);
++  CHECK(to_host.buffer.nbytes() == 4 * sizeof(float));
++  CHECK(to_host.buffer.capacity() >= to_host.buffer.nbytes());
++  CHECK(to_host.buffer.policy() == HostTransferPolicy::transfer);
++  auto kind = to_host.buffer.storage_kind();
++  const bool is_transfer_storage =
++      kind == HostTransferStorageKind::cpu ||
++      kind == HostTransferStorageKind::metal_shared ||
++      kind == HostTransferStorageKind::cuda_pinned;
++  CHECK(is_transfer_storage);
++
++  to_host.completion.wait();
++  auto* values = static_cast<const float*>(to_host.buffer.data());
++  CHECK(values[0] == 1.0f);
++  CHECK(values[3] == 4.0f);
++
++  auto to_device = copy_from_host(to_host.buffer, stream);
++  to_device.completion.wait();
++  CHECK(to_device.value.shape() == Shape{2, 2});
++  auto* round_trip = to_device.value.data<float>();
++  CHECK(round_trip[0] == 1.0f);
++  CHECK(round_trip[1] == 2.0f);
++  CHECK(round_trip[2] == 3.0f);
++  CHECK(round_trip[3] == 4.0f);
++}
++
++TEST_CASE("test CPU host transfer policy and shape validation") {
++  try {
++    auto managed =
++        HostTransferBuffer(Shape{4}, float32, HostTransferPolicy::managed);
++    CHECK(managed.storage_kind() == HostTransferStorageKind::cuda_managed);
++  } catch (const std::invalid_argument& error) {
++    CHECK(
++        std::string(error.what()) ==
++        "Managed host transfer storage is not supported by this backend.");
++  }
++  CHECK_THROWS_WITH_AS(
++      HostTransferBuffer(Shape{-1}, float32),
++      "[HostTransferBuffer] Negative dimensions are not allowed.",
++      std::invalid_argument);
++}

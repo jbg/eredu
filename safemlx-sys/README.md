@@ -7,7 +7,8 @@ Rust bindings to the mlx-c API. Generated using bindgen.
 The vendored MLX-C build pins MLX 0.32.0 and applies the reviewable patches in
 `src/mlx-c/patches/` idempotently. The inventory covers Apple mobile platforms,
 CUDA command-encoder lifetime, group-16 affine quantization, completion events,
-and variable-count all-to-all. No generated FetchContent source is edited.
+typed host-transfer storage, and variable-count all-to-all. No generated
+FetchContent source is edited.
 
 `mlx-completion-events.patch` exposes a move-only C++ `Completion`
 around MLX's existing internal `Event`; it does not introduce a SafeMLX-side
@@ -25,6 +26,14 @@ physical hop bytes can exceed useful logical bytes. Counts, byte layout,
 backend integer limits, noncontiguous copies, autodiff, vmap, empty routes, and
 singleton identity are handled in the MLX layer.
 
+`mlx-host-transfer-buffer.patch` adds a typed C++ `HostTransferBuffer` and
+completion-returning array-to-host and host-to-array operations. CPU builds use
+owned CPU storage, Metal uses shared buffers, and CUDA's transfer policy uses
+explicit `cudaMallocHost` storage with stream- or CUDA-graph-ordered memcpy
+nodes. CUDA managed memory is a separately named policy rather than an implicit
+fallback. Shape, dtype, capacity, policy, physical storage identity, ownership,
+and completion lifetime pass through MLX-C and the checked-in Rust bindings.
+
 The MLX-C headers expose opaque `mlx_event` ownership, async evaluation with an
 event, stream wait, host synchronize, query, and identity accessors. The
 checked-in `src/bindings.rs` is regenerated from those headers with:
@@ -40,8 +49,9 @@ integration target with the CUDA-specific handoff test enabled. Metal and CUDA
 runtime handoff tests remain explicit and ignored because no GPU runners are
 currently configured.
 
-MLX's direct completion and all-to-all-v tests are deliberately separate from
-normal Cargo builds. Run the generalized opt-in CMake target through:
+MLX's direct completion, host-transfer, and all-to-all-v tests are deliberately
+separate from normal Cargo builds. Run the generalized opt-in CMake target
+through:
 
 ```console
 bash safemlx-sys/scripts/test-mlx-patches.sh

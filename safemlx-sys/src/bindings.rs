@@ -1634,6 +1634,127 @@ extern "C" {
         event: mlx_event,
     ) -> ::std::os::raw::c_int;
 }
+#[doc = " An owning, host-addressable transfer allocation."]
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct mlx_host_transfer_buffer_ {
+    pub ctx: *mut ::std::os::raw::c_void,
+}
+#[doc = " An owning, host-addressable transfer allocation."]
+pub type mlx_host_transfer_buffer = mlx_host_transfer_buffer_;
+pub const mlx_host_transfer_policy__MLX_HOST_TRANSFER_POLICY_TRANSFER: mlx_host_transfer_policy_ =
+    0;
+pub const mlx_host_transfer_policy__MLX_HOST_TRANSFER_POLICY_MANAGED: mlx_host_transfer_policy_ = 1;
+#[doc = " Requested semantics for host transfer storage."]
+pub type mlx_host_transfer_policy_ = ::std::os::raw::c_uint;
+#[doc = " Requested semantics for host transfer storage."]
+pub use self::mlx_host_transfer_policy_ as mlx_host_transfer_policy;
+pub const mlx_host_transfer_storage_kind__MLX_HOST_TRANSFER_STORAGE_CPU:
+    mlx_host_transfer_storage_kind_ = 0;
+pub const mlx_host_transfer_storage_kind__MLX_HOST_TRANSFER_STORAGE_METAL_SHARED:
+    mlx_host_transfer_storage_kind_ = 1;
+pub const mlx_host_transfer_storage_kind__MLX_HOST_TRANSFER_STORAGE_CUDA_PINNED:
+    mlx_host_transfer_storage_kind_ = 2;
+pub const mlx_host_transfer_storage_kind__MLX_HOST_TRANSFER_STORAGE_CUDA_MANAGED:
+    mlx_host_transfer_storage_kind_ = 3;
+#[doc = " Physical storage selected by the active MLX backend."]
+pub type mlx_host_transfer_storage_kind_ = ::std::os::raw::c_uint;
+#[doc = " Physical storage selected by the active MLX backend."]
+pub use self::mlx_host_transfer_storage_kind_ as mlx_host_transfer_storage_kind;
+extern "C" {
+    #[doc = " Allocate an uninitialized typed host transfer buffer."]
+    pub fn mlx_host_transfer_buffer_new(
+        buffer: *mut mlx_host_transfer_buffer,
+        shape: *const ::std::os::raw::c_int,
+        dim: ::std::os::raw::c_int,
+        dtype: mlx_dtype,
+        policy: mlx_host_transfer_policy,
+    ) -> ::std::os::raw::c_int;
+}
+extern "C" {
+    #[doc = " Free a host transfer buffer. Submitted work retains its allocation."]
+    pub fn mlx_host_transfer_buffer_free(buffer: mlx_host_transfer_buffer)
+        -> ::std::os::raw::c_int;
+}
+extern "C" {
+    #[doc = " Allocate a host transfer buffer and asynchronously copy `source` into it.\n\n `event` covers the complete copy. The buffer must not be read until the\n event completes."]
+    pub fn mlx_copy_to_host(
+        buffer: *mut mlx_host_transfer_buffer,
+        event: *mut mlx_event,
+        source: mlx_array,
+        policy: mlx_host_transfer_policy,
+        stream: mlx_stream,
+    ) -> ::std::os::raw::c_int;
+}
+extern "C" {
+    #[doc = " Asynchronously copy a host transfer buffer into a new array on `stream`.\n `event` covers the complete copy."]
+    pub fn mlx_copy_from_host(
+        array: *mut mlx_array,
+        event: *mut mlx_event,
+        source: mlx_host_transfer_buffer,
+        stream: mlx_stream,
+    ) -> ::std::os::raw::c_int;
+}
+extern "C" {
+    pub fn mlx_host_transfer_buffer_data(
+        data: *mut *const ::std::os::raw::c_void,
+        buffer: mlx_host_transfer_buffer,
+    ) -> ::std::os::raw::c_int;
+}
+extern "C" {
+    pub fn mlx_host_transfer_buffer_data_mut(
+        data: *mut *mut ::std::os::raw::c_void,
+        buffer: mlx_host_transfer_buffer,
+    ) -> ::std::os::raw::c_int;
+}
+extern "C" {
+    pub fn mlx_host_transfer_buffer_shape(
+        shape: *mut *const ::std::os::raw::c_int,
+        buffer: mlx_host_transfer_buffer,
+    ) -> ::std::os::raw::c_int;
+}
+extern "C" {
+    pub fn mlx_host_transfer_buffer_ndim(
+        ndim: *mut usize,
+        buffer: mlx_host_transfer_buffer,
+    ) -> ::std::os::raw::c_int;
+}
+extern "C" {
+    pub fn mlx_host_transfer_buffer_size(
+        size: *mut usize,
+        buffer: mlx_host_transfer_buffer,
+    ) -> ::std::os::raw::c_int;
+}
+extern "C" {
+    pub fn mlx_host_transfer_buffer_nbytes(
+        nbytes: *mut usize,
+        buffer: mlx_host_transfer_buffer,
+    ) -> ::std::os::raw::c_int;
+}
+extern "C" {
+    pub fn mlx_host_transfer_buffer_capacity(
+        capacity: *mut usize,
+        buffer: mlx_host_transfer_buffer,
+    ) -> ::std::os::raw::c_int;
+}
+extern "C" {
+    pub fn mlx_host_transfer_buffer_dtype(
+        dtype: *mut mlx_dtype,
+        buffer: mlx_host_transfer_buffer,
+    ) -> ::std::os::raw::c_int;
+}
+extern "C" {
+    pub fn mlx_host_transfer_buffer_policy(
+        policy: *mut mlx_host_transfer_policy,
+        buffer: mlx_host_transfer_buffer,
+    ) -> ::std::os::raw::c_int;
+}
+extern "C" {
+    pub fn mlx_host_transfer_buffer_storage_kind(
+        kind: *mut mlx_host_transfer_storage_kind,
+        buffer: mlx_host_transfer_buffer,
+    ) -> ::std::os::raw::c_int;
+}
 extern "C" {
     #[doc = " \\defgroup export Function serialization\n/\n/**@{"]
     pub fn mlx_export_function(

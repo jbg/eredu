@@ -32,6 +32,7 @@ bindings to MLX.
    array
    device
    event
+   host_transfer
    stream
    string
    vector

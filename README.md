@@ -20,6 +20,10 @@ SafeMLX is independent of Apple and is not an official MLX project.
   asynchronous evaluation, including host query/wait and backend-ordered
   same-device stream dependencies. See the [ordering contract and current
   adoption state](doc/completion-events.md).
+- Typed host-transfer buffers with completion-scoped asynchronous copies:
+  ordinary CPU storage, Metal shared storage, explicitly pinned CUDA host
+  storage, and a separately selected CUDA managed-memory policy. See the
+  [storage and lifetime contract](doc/host-transfer-buffers.md).
 - Compact variable-count all-to-all across MLX MPI, TCP Ring, JACCL, and NCCL,
   with topology-routed logical Cartesian subgroups and no padded payload
   all-gather.
