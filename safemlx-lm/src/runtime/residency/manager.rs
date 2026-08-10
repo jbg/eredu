@@ -2,8 +2,9 @@
 //!
 //! A [`crate::runtime::residency::manager::ResidencyManager`] moves caller-defined groups of
 //! checkpoint selections from a [`crate::runtime::checkpoint::store::WeightStore`] into
-//! evaluated host or execution-stream arrays. The manager accounts for logical
-//! host and device copies independently, even on unified-memory systems.
+//! immutable typed host-transfer buffers or execution-stream arrays. The
+//! manager accounts for logical host and device copies independently, even on
+//! unified-memory systems.
 //! Missing units can be reserved and submitted as one batch. Caller-owned
 //! [`crate::runtime::residency::manager::ResidentTransfer`] values retain
 //! source mappings until MLX reports exact completion of the submitted
@@ -17,7 +18,8 @@ use std::{
 
 use safemlx::{
     transforms::{async_eval_with_event, eval},
-    Array, DeviceType, Event, Stream,
+    Array, DeviceType, Event, HostTransferBuffer, HostTransferPolicy, ImmutableHostTransferBuffer,
+    Stream,
 };
 
 use crate::{
@@ -250,8 +252,13 @@ impl OffloadUnit {
 pub struct ResidentUnitLease {
     id: OffloadUnitId,
     tier: MemoryTier,
-    arrays: Arc<ResidentArrays>,
+    storage: ResidentLeaseStorage,
     manager: Weak<ManagerInner>,
+}
+
+enum ResidentLeaseStorage {
+    Host(Arc<ResidentHostBuffers>),
+    Device(Arc<ResidentArrays>),
 }
 
 impl ResidentUnitLease {
@@ -271,18 +278,56 @@ impl ResidentUnitLease {
     /// residency accounting is expected to remain authoritative. Arbitrary
     /// external array clones cannot be tracked by the manager.
     pub fn array(&self, name: &str) -> Result<&Array, ResidencyError> {
-        self.arrays
-            .arrays
-            .get(name)
-            .ok_or_else(|| ResidencyError::UnknownBinding {
+        match &self.storage {
+            ResidentLeaseStorage::Device(arrays) => {
+                arrays
+                    .arrays
+                    .get(name)
+                    .ok_or_else(|| ResidencyError::UnknownBinding {
+                        id: self.id.clone(),
+                        name: name.to_string(),
+                    })
+            }
+            ResidentLeaseStorage::Host(_) => Err(ResidencyError::HostBindingIsNotArray {
                 id: self.id.clone(),
                 name: name.to_string(),
-            })
+            }),
+        }
+    }
+
+    /// Looks up an immutable typed host-transfer buffer by stable binding name.
+    ///
+    /// Host-resident weights are deliberately not MLX arrays. Device leases
+    /// reject this accessor so physical storage and execution residency cannot
+    /// be confused by callers.
+    pub fn host_buffer(&self, name: &str) -> Result<&ImmutableHostTransferBuffer, ResidencyError> {
+        match &self.storage {
+            ResidentLeaseStorage::Host(buffers) => {
+                buffers
+                    .buffers
+                    .get(name)
+                    .ok_or_else(|| ResidencyError::UnknownBinding {
+                        id: self.id.clone(),
+                        name: name.to_string(),
+                    })
+            }
+            ResidentLeaseStorage::Device(_) => Err(ResidencyError::DeviceBindingIsNotHostBuffer {
+                id: self.id.clone(),
+                name: name.to_string(),
+            }),
+        }
     }
 
     /// Returns binding names in stable order.
-    pub fn binding_names(&self) -> impl Iterator<Item = &str> {
-        self.arrays.arrays.keys().map(String::as_str)
+    pub fn binding_names(&self) -> Box<dyn Iterator<Item = &str> + '_> {
+        match &self.storage {
+            ResidentLeaseStorage::Host(buffers) => {
+                Box::new(buffers.buffers.keys().map(String::as_str))
+            }
+            ResidentLeaseStorage::Device(arrays) => {
+                Box::new(arrays.arrays.keys().map(String::as_str))
+            }
+        }
     }
 }
 
@@ -309,8 +354,8 @@ impl Drop for ResidentUnitLease {
 /// unit leases and the transfer completion, so pins cannot be released before
 /// the submitted copy is safe. Its unit leases may be used to construct
 /// dependent work after [`Self::wait_on`] orders the consumer stream. The guard
-/// retains mmap leases, source arrays, and promoted host arrays until the event
-/// completes. Dropping an unfinished guard waits for that exact event; it never
+/// retains mmap leases, source arrays, host buffers, and their copy events until
+/// the aggregate event completes. Dropping an unfinished guard waits for that exact event; it never
 /// synchronizes an entire MLX stream.
 ///
 /// `ResidentTransfer` is intentionally neither `Send` nor `Sync`, matching the
@@ -384,6 +429,7 @@ impl ResidentTransfer {
                 }
                 drop(resources.retained_arrays);
                 drop(resources.retained_host);
+                drop(resources.retained_events);
             } else {
                 // Preserve PendingWeightMaterialization's conservative failure
                 // cleanup: it synchronizes the involved streams and retains a
@@ -599,6 +645,26 @@ pub enum ResidencyError {
         /// Unknown local name.
         name: String,
     },
+    /// A caller requested an executable array from typed host storage.
+    #[error(
+        "host-resident binding {name:?} in unit {id} is a typed transfer buffer, not an MLX array"
+    )]
+    HostBindingIsNotArray {
+        /// Unit identifier.
+        id: OffloadUnitId,
+        /// Requested binding name.
+        name: String,
+    },
+    /// A caller requested typed host storage from a device-resident copy.
+    #[error(
+        "device-resident binding {name:?} in unit {id} is an MLX array, not a host-transfer buffer"
+    )]
+    DeviceBindingIsNotHostBuffer {
+        /// Unit identifier.
+        id: OffloadUnitId,
+        /// Requested binding name.
+        name: String,
+    },
     /// A finite tier budget could not accommodate a unit.
     #[error("cannot make {required_bytes} bytes resident for {requested} in {tier:?}: budget {budget_bytes}, currently resident {resident_bytes}, blockers {blocking_units:?}")]
     BudgetExhausted {
@@ -689,7 +755,7 @@ impl UnitResidencyReport {
     pub const fn expected_bytes(&self) -> u64 {
         self.expected_bytes
     }
-    /// Returns whether evaluated host arrays are resident.
+    /// Returns whether immutable typed host-transfer buffers are resident.
     pub const fn host_resident(&self) -> bool {
         self.host_resident
     }
@@ -1328,10 +1394,27 @@ impl ResidencyManager {
                     })?;
                 copy.last_used = tick;
                 copy.frequency = copy.frequency.saturating_add(*demand);
+                let storage = match tier {
+                    MemoryTier::Host => ResidentLeaseStorage::Host(Arc::clone(
+                        &unit
+                            .host
+                            .as_ref()
+                            .ok_or(ResidencyError::StatePoisoned)?
+                            .storage,
+                    )),
+                    MemoryTier::Device => ResidentLeaseStorage::Device(Arc::clone(
+                        &unit
+                            .device
+                            .as_ref()
+                            .ok_or(ResidencyError::StatePoisoned)?
+                            .storage,
+                    )),
+                    MemoryTier::Disk => unreachable!("validated above"),
+                };
                 Ok(ResidentUnitLease {
                     id: id.clone(),
                     tier,
-                    arrays: Arc::clone(&copy.arrays),
+                    storage,
                     manager: Arc::downgrade(&self.inner),
                 })
             })
@@ -1570,8 +1653,8 @@ impl ResidencyManager {
                 expected_bytes: unit.spec.bytes(),
                 host_resident: unit.host.is_some(),
                 device_resident: unit.device.is_some(),
-                host_pins: unit.host.as_ref().map_or(0, |copy| copy.pins),
-                device_pins: unit.device.as_ref().map_or(0, |copy| copy.pins),
+                host_pins: unit.host.as_ref().map_or(0, |copy| copy.state.pins),
+                device_pins: unit.device.as_ref().map_or(0, |copy| copy.state.pins),
                 active_window: active.contains(unit.spec.id()),
             })
             .collect();
@@ -1620,23 +1703,23 @@ unsafe impl Send for ManagerState {}
 struct UnitRecord {
     definition: OffloadUnit,
     spec: OffloadUnitSpec,
-    host: Option<ResidentCopy>,
-    device: Option<ResidentCopy>,
+    host: Option<ResidentCopy<ResidentHostBuffers>>,
+    device: Option<ResidentCopy<ResidentArrays>>,
 }
 
 impl UnitRecord {
-    fn copy(&self, tier: MemoryTier) -> Option<&ResidentCopy> {
+    fn copy(&self, tier: MemoryTier) -> Option<&ResidentCopyState> {
         match tier {
-            MemoryTier::Host => self.host.as_ref(),
-            MemoryTier::Device => self.device.as_ref(),
+            MemoryTier::Host => self.host.as_ref().map(|copy| &copy.state),
+            MemoryTier::Device => self.device.as_ref().map(|copy| &copy.state),
             MemoryTier::Disk => None,
         }
     }
 
-    fn copy_mut(&mut self, tier: MemoryTier) -> Option<&mut ResidentCopy> {
+    fn copy_mut(&mut self, tier: MemoryTier) -> Option<&mut ResidentCopyState> {
         match tier {
-            MemoryTier::Host => self.host.as_mut(),
-            MemoryTier::Device => self.device.as_mut(),
+            MemoryTier::Host => self.host.as_mut().map(|copy| &mut copy.state),
+            MemoryTier::Device => self.device.as_mut().map(|copy| &mut copy.state),
             MemoryTier::Disk => None,
         }
     }
@@ -1646,8 +1729,12 @@ impl UnitRecord {
     }
 }
 
-struct ResidentCopy {
-    arrays: Arc<ResidentArrays>,
+struct ResidentCopy<T> {
+    storage: Arc<T>,
+    state: ResidentCopyState,
+}
+
+struct ResidentCopyState {
     in_flight: Option<u64>,
     bytes: u64,
     pins: u64,
@@ -1659,10 +1746,15 @@ struct ResidentArrays {
     arrays: BTreeMap<String, Array>,
 }
 
+struct ResidentHostBuffers {
+    buffers: BTreeMap<String, ImmutableHostTransferBuffer>,
+}
+
 struct ResidentTransferResources {
     sources: Vec<PendingWeightMaterialization>,
     retained_arrays: Vec<Array>,
-    retained_host: Vec<Arc<ResidentArrays>>,
+    retained_host: Vec<Arc<ResidentHostBuffers>>,
+    retained_events: Vec<Event>,
 }
 
 struct SubmittedResidentTransfer {
@@ -1855,6 +1947,63 @@ fn ensure_many_resident(
             reserved = next_reserved;
         }
 
+        if tier == MemoryTier::Host {
+            let mut prepared = Vec::new();
+            for (id, is_missing) in ids.iter().zip(&created) {
+                if !is_missing {
+                    continue;
+                }
+                let bindings = state.units[id].definition.bindings.clone();
+                let buffers = materialize_host_buffers(id, store, &bindings, &state.source_stream)?;
+                let actual = host_buffers_nbytes(&buffers)?;
+                let required = state.units[id].spec.bytes();
+                if actual != required {
+                    return Err(ResidencyError::UnitByteMismatch {
+                        id: id.clone(),
+                        planned_bytes: required,
+                        actual_bytes: actual,
+                    });
+                }
+                prepared.push((id.clone(), buffers, actual));
+            }
+            for (id, buffers, actual) in prepared {
+                let tick = next_tick(state)?;
+                let copy = ResidentCopy {
+                    storage: Arc::new(buffers),
+                    state: ResidentCopyState {
+                        in_flight: None,
+                        bytes: actual,
+                        pins: 0,
+                        last_used: tick,
+                        frequency: 0,
+                    },
+                };
+                state
+                    .units
+                    .get_mut(&id)
+                    .ok_or_else(|| ResidencyError::UnknownUnit { id: id.clone() })?
+                    .host = Some(copy);
+                state.telemetry.record_transfer(
+                    TransferDirection::DiskToHost,
+                    actual,
+                    started.elapsed(),
+                );
+            }
+            for (id, is_missing) in ids.iter().zip(&created) {
+                if !is_missing {
+                    let tick = next_tick(state)?;
+                    state
+                        .units
+                        .get_mut(id)
+                        .and_then(|unit| unit.copy_mut(tier))
+                        .ok_or(ResidencyError::StatePoisoned)?
+                        .last_used = tick;
+                }
+            }
+            update_resident_telemetry(state, tier);
+            return Ok((created.clone(), None));
+        }
+
         let mut prepared = Vec::new();
         for (id, is_missing) in ids.iter().zip(&created) {
             if !is_missing {
@@ -1863,18 +2012,11 @@ fn ensure_many_resident(
             let bindings = state.units[id].definition.bindings.clone();
             let item = loop {
                 let item = match tier {
-                    MemoryTier::Host => prepare_from_disk(
-                        store,
-                        &bindings,
-                        &state.source_stream,
-                        &state.source_stream,
-                        TransferDirection::DiskToHost,
-                    ),
                     MemoryTier::Device => {
                         if let Some(host) = state.units[id]
                             .host
                             .as_ref()
-                            .map(|copy| Arc::clone(&copy.arrays))
+                            .map(|copy| Arc::clone(&copy.storage))
                         {
                             prepare_copy_to_device(id, host, &state.device_stream)
                         } else {
@@ -1887,7 +2029,7 @@ fn ensure_many_resident(
                             )
                         }
                     }
-                    MemoryTier::Disk => unreachable!("validated above"),
+                    MemoryTier::Host | MemoryTier::Disk => unreachable!("validated above"),
                 };
                 match item {
                     Ok(item) => break item,
@@ -1916,6 +2058,7 @@ fn ensure_many_resident(
                             }
                             item.retained_arrays.clear();
                             item.retained_host = None;
+                            item.retained_events.clear();
                         }
                     }
                     Err(error) => return Err(error),
@@ -1959,6 +2102,7 @@ fn ensure_many_resident(
                 }
                 item.retained_arrays.clear();
                 item.retained_host = None;
+                item.retained_events.clear();
             }
             completion.map_err(|source| ResidencyError::Mlx {
                 id: internal_id(),
@@ -1976,6 +2120,7 @@ fn ensure_many_resident(
             sources: Vec::new(),
             retained_arrays: Vec::new(),
             retained_host: Vec::new(),
+            retained_events: Vec::new(),
         };
 
         for (id, mut item) in prepared {
@@ -1985,27 +2130,29 @@ fn ensure_many_resident(
                 if let Some(host) = item.retained_host.take() {
                     retained.retained_host.push(host);
                 }
+                retained.retained_events.append(&mut item.retained_events);
             }
             let actual = arrays_nbytes(&item.arrays)?;
             let tick = next_tick(state)?;
             let copy = ResidentCopy {
-                arrays: Arc::new(ResidentArrays {
+                storage: Arc::new(ResidentArrays {
                     arrays: item.arrays,
                 }),
-                in_flight: return_transfer.then_some(generation),
-                bytes: actual,
-                pins: 0,
-                last_used: tick,
-                frequency: 0,
+                state: ResidentCopyState {
+                    in_flight: return_transfer.then_some(generation),
+                    bytes: actual,
+                    pins: 0,
+                    last_used: tick,
+                    frequency: 0,
+                },
             };
             let unit = state
                 .units
                 .get_mut(&id)
                 .ok_or_else(|| ResidencyError::UnknownUnit { id: id.clone() })?;
             match tier {
-                MemoryTier::Host => unit.host = Some(copy),
                 MemoryTier::Device => unit.device = Some(copy),
-                MemoryTier::Disk => unreachable!("validated above"),
+                MemoryTier::Host | MemoryTier::Disk => unreachable!("validated above"),
             }
             state
                 .telemetry
@@ -2049,8 +2196,77 @@ struct PreparedResidentArrays {
     arrays: BTreeMap<String, Array>,
     pending_sources: Vec<PendingWeightMaterialization>,
     retained_arrays: Vec<Array>,
-    retained_host: Option<Arc<ResidentArrays>>,
+    retained_host: Option<Arc<ResidentHostBuffers>>,
+    retained_events: Vec<Event>,
     direction: TransferDirection,
+}
+
+fn materialize_host_buffers(
+    id: &OffloadUnitId,
+    store: &dyn WeightStore,
+    bindings: &[WeightBinding],
+    source_stream: &Stream,
+) -> Result<ResidentHostBuffers, ResidencyError> {
+    let mut buffers = BTreeMap::new();
+    for binding in bindings {
+        let (array, sources) = match &binding.recipe {
+            Some(recipe) => {
+                let pending = recipe
+                    .prepare_materialization(store, source_stream)
+                    .map_err(|source| ResidencyError::Recipe {
+                        binding: binding.name.clone(),
+                        source,
+                    })?;
+                pending.into_parts()
+            }
+            None => {
+                let lease = store.acquire_with_policy(
+                    &binding.checkpoint_key,
+                    binding.selection.clone(),
+                    WeightReadPolicy::RequireBounded,
+                )?;
+                let pending = lease.prepare_materialization(source_stream, source_stream)?;
+                (pending.output().clone(), vec![pending])
+            }
+        };
+        let buffer = HostTransferBuffer::copy_from_array(
+            &array,
+            HostTransferPolicy::Transfer,
+            source_stream,
+        )
+        .map_err(|source| ResidencyError::Mlx {
+            id: id.clone(),
+            operation: "weight array-to-host-buffer submission",
+            source,
+        })?
+        .synchronize()
+        .map_err(|source| ResidencyError::Mlx {
+            id: id.clone(),
+            operation: "weight array-to-host-buffer completion",
+            source,
+        })?;
+        for source in sources {
+            source.complete();
+        }
+        let actual = u64::try_from(buffer.nbytes().map_err(|source| ResidencyError::Mlx {
+            id: id.clone(),
+            operation: "host-buffer byte inspection",
+            source,
+        })?)
+        .map_err(|_| ResidencyError::ArithmeticOverflow {
+            context: "host-buffer byte conversion",
+        })?;
+        if actual != binding.expected_bytes {
+            return Err(ResidencyError::BindingByteMismatch {
+                id: id.clone(),
+                binding: binding.name.clone(),
+                expected_bytes: binding.expected_bytes,
+                actual_bytes: actual,
+            });
+        }
+        buffers.insert(binding.name.clone(), buffer.freeze());
+    }
+    Ok(ResidentHostBuffers { buffers })
 }
 
 fn prepare_from_disk(
@@ -2130,6 +2346,7 @@ fn prepare_from_disk(
         pending_sources,
         retained_arrays,
         retained_host: None,
+        retained_events: Vec::new(),
         direction,
     })
 }
@@ -2147,28 +2364,30 @@ fn is_mapping_capacity_error(error: &ResidencyError) -> bool {
 
 fn prepare_copy_to_device(
     id: &OffloadUnitId,
-    host: Arc<ResidentArrays>,
+    host: Arc<ResidentHostBuffers>,
     device_stream: &Stream,
 ) -> Result<PreparedResidentArrays, ResidencyError> {
-    let arrays = host
-        .arrays
-        .iter()
-        .map(|(name, array)| {
-            array
-                .copy(device_stream)
-                .map(|copy| (name.clone(), copy))
+    let mut arrays = BTreeMap::new();
+    let mut retained_events = Vec::new();
+    for (name, buffer) in &host.buffers {
+        let submitted =
+            buffer
+                .copy_to_array(device_stream)
                 .map_err(|source| ResidencyError::Mlx {
                     id: id.clone(),
-                    operation: "host-to-device copy",
+                    operation: "host-buffer-to-device copy",
                     source,
-                })
-        })
-        .collect::<Result<BTreeMap<_, _>, _>>()?;
+                })?;
+        let (array, completion) = submitted.into_parts();
+        arrays.insert(name.clone(), array);
+        retained_events.push(completion);
+    }
     Ok(PreparedResidentArrays {
         arrays,
         pending_sources: Vec::new(),
         retained_arrays: Vec::new(),
         retained_host: Some(host),
+        retained_events,
         direction: TransferDirection::HostToDevice,
     })
 }
@@ -2183,6 +2402,24 @@ fn arrays_nbytes(arrays: &BTreeMap<String, Array>) -> Result<u64, ResidencyError
             .checked_add(bytes)
             .ok_or(ResidencyError::ArithmeticOverflow {
                 context: "resident array byte total",
+            })
+    })
+}
+
+fn host_buffers_nbytes(buffers: &ResidentHostBuffers) -> Result<u64, ResidencyError> {
+    buffers.buffers.values().try_fold(0u64, |total, buffer| {
+        let bytes = u64::try_from(buffer.nbytes().map_err(|source| ResidencyError::Mlx {
+            id: internal_id(),
+            operation: "host-buffer byte inspection",
+            source,
+        })?)
+        .map_err(|_| ResidencyError::ArithmeticOverflow {
+            context: "host-buffer byte conversion",
+        })?;
+        total
+            .checked_add(bytes)
+            .ok_or(ResidencyError::ArithmeticOverflow {
+                context: "resident host-buffer byte total",
             })
     })
 }
@@ -2301,17 +2538,29 @@ fn remove_copy_impl(
     let total = tier_bytes(state, tier)
         .checked_sub(bytes)
         .ok_or(ResidencyError::StatePoisoned)?;
-    let copy = match tier {
-        MemoryTier::Host => state.units.get_mut(id).and_then(|unit| unit.host.take()),
-        MemoryTier::Device => state.units.get_mut(id).and_then(|unit| unit.device.take()),
-        MemoryTier::Disk => None,
+    match tier {
+        MemoryTier::Host => {
+            let copy = state
+                .units
+                .get_mut(id)
+                .and_then(|unit| unit.host.take())
+                .ok_or(ResidencyError::StatePoisoned)?;
+            debug_assert_eq!(copy.state.bytes, bytes);
+        }
+        MemoryTier::Device => {
+            let copy = state
+                .units
+                .get_mut(id)
+                .and_then(|unit| unit.device.take())
+                .ok_or(ResidencyError::StatePoisoned)?;
+            debug_assert_eq!(copy.state.bytes, bytes);
+        }
+        MemoryTier::Disk => return Err(ResidencyError::StatePoisoned),
     }
-    .ok_or(ResidencyError::StatePoisoned)?;
-    debug_assert_eq!(copy.bytes, bytes);
     set_tier_bytes(state, tier, total);
     update_resident_telemetry(state, tier);
     if record_eviction {
-        state.telemetry.record_tier_eviction(tier, copy.bytes);
+        state.telemetry.record_tier_eviction(tier, bytes);
     }
     Ok(())
 }
@@ -2347,10 +2596,10 @@ fn next_tick(state: &mut ManagerState) -> Result<u64, ResidencyError> {
     if state.tick == u64::MAX {
         for unit in state.units.values_mut() {
             if let Some(copy) = unit.host.as_mut() {
-                copy.last_used /= 2;
+                copy.state.last_used /= 2;
             }
             if let Some(copy) = unit.device.as_mut() {
-                copy.last_used /= 2;
+                copy.state.last_used /= 2;
             }
         }
         state.tick /= 2;
@@ -2366,7 +2615,7 @@ mod tests {
         time::Duration,
     };
 
-    use safemlx::{Device, DeviceType};
+    use safemlx::{Device, DeviceType, HostTransferStorageKind};
     use safetensors::tensor::{serialize_to_file, Dtype, TensorView};
 
     use super::*;
@@ -2488,6 +2737,17 @@ mod tests {
         unit(name, [binding("weight", key, TensorSelection::Full, 8)])
     }
 
+    fn host_i32(lease: &ResidentUnitLease, name: &str) -> Vec<i32> {
+        lease
+            .host_buffer(name)
+            .unwrap()
+            .as_bytes()
+            .unwrap()
+            .chunks_exact(size_of::<i32>())
+            .map(|bytes| i32::from_ne_bytes(bytes.try_into().unwrap()))
+            .collect()
+    }
+
     #[test]
     fn named_execution_groups_keep_independent_windows_and_clear_in_isolation() {
         let (_dir, store) = fixture_store();
@@ -2578,24 +2838,8 @@ mod tests {
             .acquire_many_with_demand(&[(id("left"), 1), (id("right"), 1)], MemoryTier::Host)
             .unwrap();
 
-        assert_eq!(
-            leases[0]
-                .array("weight")
-                .unwrap()
-                .evaluated()
-                .unwrap()
-                .as_slice::<i32>(),
-            &[1, 2]
-        );
-        assert_eq!(
-            leases[1]
-                .array("weight")
-                .unwrap()
-                .evaluated()
-                .unwrap()
-                .as_slice::<i32>(),
-            &[3, 4]
-        );
+        assert_eq!(host_i32(&leases[0], "weight"), [1, 2]);
+        assert_eq!(host_i32(&leases[1], "weight"), [3, 4]);
         let diagnostics = store.diagnostics().unwrap();
         assert_eq!(diagnostics.currently_mapped_shards, 1);
         assert!(diagnostics.evictions >= 1);
@@ -2619,8 +2863,8 @@ mod tests {
         {
             let state = manager.lock().unwrap();
             let copy = state.units[&id("a")].device.as_ref().unwrap();
-            assert_eq!(copy.pins, 1);
-            assert!(copy.in_flight.is_some());
+            assert_eq!(copy.state.pins, 1);
+            assert!(copy.state.in_flight.is_some());
         }
 
         let consumer = cpu_stream();
@@ -2635,7 +2879,7 @@ mod tests {
         {
             let state = manager.lock().unwrap();
             let copy = state.units[&id("a")].device.as_ref().unwrap();
-            assert!(copy.in_flight.is_none());
+            assert!(copy.state.in_flight.is_none());
         }
         let ready = manager
             .acquire_many_with_transfer(&[(id("a"), 1)], MemoryTier::Device)
@@ -2693,6 +2937,7 @@ mod tests {
             .device
             .as_ref()
             .unwrap()
+            .state
             .in_flight
             .is_none());
         assert_eq!(dependent.evaluated().unwrap().as_slice::<i32>(), &[2, 3]);
@@ -2951,17 +3196,20 @@ mod tests {
             host.binding_names().collect::<Vec<_>>(),
             ["scales", "weight"]
         );
-        assert_eq!(
-            host.array("weight")
-                .unwrap()
-                .evaluated()
-                .unwrap()
-                .as_slice::<i32>(),
-            &[1, 2]
-        );
+        assert_eq!(host_i32(&host, "weight"), [1, 2]);
         assert!(matches!(
-            host.array("unknown"),
+            host.array("weight"),
+            Err(ResidencyError::HostBindingIsNotArray { .. })
+        ));
+        assert!(matches!(
+            host.host_buffer("unknown"),
             Err(ResidencyError::UnknownBinding { .. })
+        ));
+        assert!(matches!(
+            host.host_buffer("weight").unwrap().storage_kind().unwrap(),
+            HostTransferStorageKind::Cpu
+                | HostTransferStorageKind::MetalShared
+                | HostTransferStorageKind::CudaPinned
         ));
         drop(host);
         assert_eq!(
@@ -2974,6 +3222,10 @@ mod tests {
             .acquire(&id("quantized"), MemoryTier::Device)
             .unwrap();
         assert_eq!(device.array("scales").unwrap().shape(), &[2]);
+        assert!(matches!(
+            device.host_buffer("scales"),
+            Err(ResidencyError::DeviceBindingIsNotHostBuffer { .. })
+        ));
         let report = manager.report().unwrap();
         assert!(state(&report, "quantized").host_resident());
         assert!(state(&report, "quantized").device_resident());
@@ -3081,6 +3333,7 @@ mod tests {
                 .host
                 .as_mut()
                 .unwrap()
+                .state
                 .last_used = 10;
             state
                 .units
@@ -3089,6 +3342,7 @@ mod tests {
                 .host
                 .as_mut()
                 .unwrap()
+                .state
                 .last_used = 10;
         }
         manager.prefetch(&id("c"), MemoryTier::Host).unwrap();
@@ -3315,26 +3569,10 @@ mod tests {
         );
         manager.initialize().unwrap();
         let range = manager.acquire(&id("range"), MemoryTier::Host).unwrap();
-        assert_eq!(
-            range
-                .array("weight")
-                .unwrap()
-                .evaluated()
-                .unwrap()
-                .as_slice::<i32>(),
-            &[12, 13]
-        );
+        assert_eq!(host_i32(&range, "weight"), [12, 13]);
         drop(range);
         let indices = manager.acquire(&id("indices"), MemoryTier::Host).unwrap();
-        assert_eq!(
-            indices
-                .array("weight")
-                .unwrap()
-                .evaluated()
-                .unwrap()
-                .as_slice::<i32>(),
-            &[14, 15]
-        );
+        assert_eq!(host_i32(&indices, "weight"), [14, 15]);
         let report = manager.report().unwrap();
         assert_eq!(report.offload().prefetch().stalls(), 2);
         assert_eq!(report.offload().resident_bytes().get(MemoryTier::Host), 16);
@@ -3387,7 +3625,7 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn promotes_host_arrays_to_a_real_metal_stream() {
+    fn promotes_host_buffers_to_a_real_metal_stream() {
         let (_dir, store) = fixture_store();
         let plan = OffloadPlan::new(
             OffloadConfig::new(Some(8), Some(8), 1).unwrap(),

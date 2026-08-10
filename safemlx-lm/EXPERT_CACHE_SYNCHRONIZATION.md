@@ -11,11 +11,13 @@ weights.
 Cold and warm acquisitions are processed as one residency batch. Capacity for
 every missing unit is reserved before materialization, requested units are
 temporarily protected from eviction, and mmap leases plus source arrays remain
-owned by a caller-owned `ResidentTransfer`. MLX submits all missing copies with
-one backend-independent completion event. The execution stream waits on that
-event before compact-bank construction, without synchronizing the host. The
-transfer retains mmap leases, source arrays, and promoted host arrays until
-exact event completion; dropping it early waits for that event rather than
+owned by a caller-owned `ResidentTransfer`. Cached host bindings are immutable
+typed host-transfer buffers, not MLX arrays. Promotion submits one backend copy
+per binding and publishes one aggregate backend-independent completion event.
+The execution stream waits on that aggregate event before compact-bank
+construction, without synchronizing the host. The transfer retains mmap
+leases, source arrays, host buffers, and their per-binding events until exact
+aggregate completion; dropping it early waits for that event rather than
 synchronizing either entire stream.
 
 The shared residency state records only an in-flight generation, not an MLX

@@ -108,8 +108,9 @@ streams. Paged attention host blocks use immutable typed host-transfer storage:
 ordinary owned CPU memory, Metal-shared memory, or CUDA-pinned memory. A sealed
 block is represented as exactly one physical variant—device arrays, typed host
 buffers, or disk backing—so incoherent tier/payload combinations cannot be
-constructed. Weight residency and independent expert caching still use MLX
-arrays for their host-planned parameters. Paged host-to-device promotion runs
+constructed. Immutable weight residency and independent expert caching also
+store host-planned bindings as typed buffers, while their executable device
+copies remain MLX arrays. Paged host-to-device promotion runs
 on a dedicated same-device transfer stream. Blockwise key/value and
 compressed-MLA attention keep a fixed
 two-block window (current plus next), submit each completed recurrence before

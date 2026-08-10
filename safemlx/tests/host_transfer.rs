@@ -165,6 +165,31 @@ fn metal_transfer_uses_shared_storage_and_metal_completion() {
     );
 }
 
+#[cfg(feature = "metal")]
+#[test]
+#[ignore = "explicit Metal host-transfer test; run with --ignored on a Metal host"]
+fn metal_transfer_promotes_multidimensional_contiguous_buffers() {
+    let _guard = runtime_test_guard();
+
+    let stream = Stream::new_with_device(&Device::new(DeviceType::Gpu, 0));
+    let values = (0..(3 * 5 * 7))
+        .map(|value| value as f32 + 0.25)
+        .collect::<Vec<_>>();
+    let source = Array::from_slice(&values, &[3, 5, 7]);
+    let host = HostTransferBuffer::copy_from_array(&source, HostTransferPolicy::Transfer, &stream)
+        .unwrap()
+        .synchronize()
+        .unwrap()
+        .freeze();
+
+    let promoted = host.copy_to_array(&stream).unwrap().synchronize().unwrap();
+    assert_eq!(promoted.shape(), &[3, 5, 7]);
+    assert_eq!(
+        promoted.evaluated().unwrap().try_as_slice::<f32>().unwrap(),
+        values
+    );
+}
+
 fn assert_transfer_peak_is_bounded(
     device: Device,
     backend: EventBackend,

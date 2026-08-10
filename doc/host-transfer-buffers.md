@@ -64,6 +64,9 @@ retains the device arrays and pending typed destinations through both completion
 events. Residency accounting charges those bytes to device and host budgets
 simultaneously until immutable host ownership is published.
 
-Immutable weight residency and independent expert caching still represent
-their host-planned parameters as MLX arrays. Moving those stores to typed
-buffers is separate adoption work; it does not require another backend API.
+Immutable weight residency and independent expert caching use the same typed
+host-transfer storage for every host-planned parameter binding. Host leases
+expose immutable buffers rather than executable arrays; device promotion
+submits one buffer-to-array copy per binding and retains the host owners and
+their events through the manager's aggregate completion. Device-resident
+bindings remain ordinary MLX arrays.

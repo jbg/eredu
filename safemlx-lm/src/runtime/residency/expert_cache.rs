@@ -1451,7 +1451,7 @@ pub enum ExpertCacheError {
 mod tests {
     use std::sync::Arc;
 
-    use safemlx::{Device, DeviceType};
+    use safemlx::{Device, DeviceType, HostTransferStorageKind};
     use safetensors::tensor::{serialize_to_file, Dtype as StoredDtype, TensorView};
 
     use super::*;
@@ -1683,6 +1683,22 @@ mod tests {
             &[1, 0, 1, 0]
         );
         drop(first);
+
+        let host = cache
+            .manager
+            .acquire(&ExpertIdentity::new(2, 0).unit_id(), MemoryTier::Host)
+            .unwrap();
+        assert!(matches!(
+            host.host_buffer("weight").unwrap().storage_kind().unwrap(),
+            HostTransferStorageKind::Cpu
+                | HostTransferStorageKind::MetalShared
+                | HostTransferStorageKind::CudaPinned
+        ));
+        assert!(matches!(
+            host.array("weight"),
+            Err(ResidencyError::HostBindingIsNotArray { .. })
+        ));
+        drop(host);
 
         let second = cache
             .acquire_route_slice(2, &[0, 2], &[1, 2], ExpertPass::Decode, &stream())

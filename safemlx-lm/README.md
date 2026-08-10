@@ -114,20 +114,21 @@ caller-defined logical units. Each `OffloadUnit` groups one or more named
 checkpoint selections, including companion tensors that must become visible
 atomically.
 
-`ResidencyManager` starts disk-planned units without arrays, materializes
-host-planned units on an explicit CPU stream, and materializes device-planned
-units on an explicit execution stream. A unit may hold both host and device
-copies. Dropping a host copy leaves the checkpoint as its canonical disk-backed
-source; dropping a device copy falls back to an existing host copy or the
-checkpoint. Host and device copies consume their finite logical budgets
-independently.
+`ResidencyManager` starts disk-planned units without allocations, materializes
+host-planned bindings into immutable typed host-transfer buffers, and
+materializes device-planned bindings as MLX arrays on an explicit execution
+stream. A unit may hold both host and device copies. Dropping a host copy leaves
+the checkpoint as its canonical disk-backed source; dropping a device copy
+falls back to an existing host copy or the checkpoint. Host and device copies
+consume their finite logical budgets independently.
 
 Pinned units cannot be evicted. Windowed units are protected in the active
 execution window and preferred for eviction after departure. Cacheable units
 remain opportunistically and are evicted by deterministic LRU order, with unit
 identifiers breaking ties. RAII `ResidentUnitLease` values explicitly pin the
-requested tier while in use. Callers should not retain cloned MLX arrays beyond
-a lease when authoritative residency accounting is required.
+requested tier while in use. Host leases expose `host_buffer`; device leases
+expose `array`. Callers should not retain cloned MLX arrays beyond a device
+lease when authoritative residency accounting is required.
 
 Ordinary `LayerwiseHost` prefetch and execution-window lookahead honor
 `OffloadConfig::prefetch_depth`, but run synchronously. Experimental dense disk
@@ -270,10 +271,10 @@ ordinary layerwise execution keeps its bounded two-layer transfer window.
 Registered GGUF checkpoints and bounded load-time affine/MXFP4 conversion from unquantized SafeTensors or
 F32/F16/BF16 GGUF sources use the same layerwise residency plan; matching
 checkpoint-native packed GGUF tensors load directly and are never implicitly
-transcoded. Selecting this weight policy does not enable KV-cache offload, and
-weight residency still represents host-planned parameters as MLX arrays. Paged
-KV-cache residency independently uses typed host-transfer buffers for its host
-tier. Independently owned request caches can share a `CacheResidencyPool`, which
+transcoded. Selecting this weight policy does not enable KV-cache offload.
+Weight residency, independent expert caching, and paged KV-cache residency all
+use typed host-transfer buffers for their host tiers. Independently owned
+request caches can share a `CacheResidencyPool`, which
 enforces aggregate device, host, transfer-in-flight, and live-disk limits while
 retaining tighter per-request limits. The opt-in
 `llama_residency` example accepts a real checkpoint directory and reports

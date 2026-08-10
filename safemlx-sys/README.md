@@ -31,8 +31,10 @@ completion-returning array-to-host and host-to-array operations. CPU builds use
 owned CPU storage, Metal uses shared buffers, and CUDA's transfer policy uses
 explicit `cudaMallocHost` storage with stream- or CUDA-graph-ordered memcpy
 nodes. CUDA managed memory is a separately named policy rather than an implicit
-fallback. Shape, dtype, capacity, policy, physical storage identity, ownership,
-and completion lifetime pass through MLX-C and the checked-in Rust bindings.
+fallback. Metal promotions use the contiguous vector-copy primitive because a
+typed host-transfer buffer preserves the source's contiguous logical layout.
+Shape, dtype, capacity, policy, physical storage identity, ownership, and
+completion lifetime pass through MLX-C and the checked-in Rust bindings.
 
 The MLX-C headers expose opaque `mlx_event` ownership, async evaluation with an
 event, stream wait, host synchronize, query, and identity accessors. The

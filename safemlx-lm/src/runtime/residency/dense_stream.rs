@@ -681,7 +681,7 @@ mod tests {
         prefetch.submit(&id).unwrap();
         prefetch.submit(&id).unwrap();
         let lease = prefetch.acquire(&id).unwrap();
-        assert_eq!(lease.array("weight").unwrap().shape(), &[2]);
+        assert_eq!(lease.host_buffer("weight").unwrap().shape().unwrap(), [2]);
         let report = prefetch.report().unwrap();
         assert_eq!(report.submitted, 1);
         assert!(report.coalesced >= 1);
@@ -720,7 +720,7 @@ mod tests {
         prefetch.wait_idle().unwrap();
 
         let lease = prefetch.acquire(&ids[2]).unwrap();
-        assert_eq!(lease.array("weight").unwrap().shape(), &[2]);
+        assert_eq!(lease.host_buffer("weight").unwrap().shape().unwrap(), [2]);
         let report = prefetch.report().unwrap();
         assert_eq!(report.queue_capacity, 1);
         assert_eq!(report.peak_queue_occupancy, 1);

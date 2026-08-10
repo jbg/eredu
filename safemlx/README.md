@@ -142,8 +142,8 @@ cargo test -p safemlx --features cuda --no-default-features \
 ```
 
 The language-model paged live-cache manager uses frozen buffers for host-tier
-key/value and compressed-MLA blocks. Weight residency and independent expert
-caching have not yet adopted this storage class.
+key/value and compressed-MLA blocks. Immutable weight residency and independent
+expert caching use the same storage class for host-planned parameter bindings.
 
 ## Distributed MLX
 

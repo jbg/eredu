@@ -376,7 +376,7 @@ index 000000000..458a89cf6
 +}
 +
 +void copy_host_to_gpu(const array& input, array& output, const Stream& stream) {
-+  copy_gpu(input, output, CopyType::General, stream);
++  copy_gpu(input, output, CopyType::Vector, stream);
 +}
 +
 +} // namespace mlx::core

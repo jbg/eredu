@@ -1631,7 +1631,7 @@ mod tests {
         let lease = manager.acquire(&id, MemoryTier::Host).unwrap();
         let resident_bytes = lease
             .binding_names()
-            .map(|name| lease.array(name).unwrap().nbytes())
+            .map(|name| lease.host_buffer(name).unwrap().nbytes().unwrap())
             .sum::<usize>();
         assert_eq!(resident_bytes, 320);
     }
