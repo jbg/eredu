@@ -17,6 +17,7 @@ use std::{
 };
 
 use safemlx::{
+    host_transfer_capacity_upper_bound,
     transforms::{async_eval_with_event, eval},
     Array, DeviceType, Event, HostTransferBuffer, HostTransferPolicy, ImmutableHostTransferBuffer,
     Stream,
@@ -168,7 +169,6 @@ impl WeightBinding {
     pub const fn expected_bytes(&self) -> u64 {
         self.expected_bytes
     }
-
     /// Pushes an output selection through this binding's direct source or
     /// derived recipe before residency initialization.
     pub(crate) fn select_bounded_output(
@@ -665,6 +665,18 @@ pub enum ResidencyError {
         /// Requested binding name.
         name: String,
     },
+    /// A backend allocated beyond its advertised pre-allocation capacity bound.
+    #[error(
+        "host-transfer allocation for residency unit {id} used {actual_bytes} bytes, exceeding reserved upper bound {reserved_bytes}"
+    )]
+    HostCapacityBoundExceeded {
+        /// Unit identifier.
+        id: OffloadUnitId,
+        /// Capacity reserved before materialization.
+        reserved_bytes: u64,
+        /// Exact allocated capacity.
+        actual_bytes: u64,
+    },
     /// A finite tier budget could not accommodate a unit.
     #[error("cannot make {required_bytes} bytes resident for {requested} in {tier:?}: budget {budget_bytes}, currently resident {resident_bytes}, blockers {blocking_units:?}")]
     BudgetExhausted {
@@ -731,6 +743,8 @@ pub struct UnitResidencyReport {
     planned_tier: MemoryTier,
     policy: ResidencyPolicy,
     expected_bytes: u64,
+    host_allocated_bytes: u64,
+    device_allocated_bytes: u64,
     host_resident: bool,
     device_resident: bool,
     host_pins: u64,
@@ -754,6 +768,14 @@ impl UnitResidencyReport {
     /// Returns the validated unit size.
     pub const fn expected_bytes(&self) -> u64 {
         self.expected_bytes
+    }
+    /// Returns exact physical capacity charged for host-transfer storage.
+    pub const fn host_allocated_bytes(&self) -> u64 {
+        self.host_allocated_bytes
+    }
+    /// Returns exact device-array bytes charged for this unit.
+    pub const fn device_allocated_bytes(&self) -> u64 {
+        self.device_allocated_bytes
     }
     /// Returns whether immutable typed host-transfer buffers are resident.
     pub const fn host_resident(&self) -> bool {
@@ -928,18 +950,18 @@ impl ResidentLayerGroup {
         let mut device_units = 0usize;
         for unit in report.units().iter().filter(|unit| ids.contains(unit.id())) {
             if unit.host_resident() {
-                host_bytes = host_bytes.checked_add(unit.expected_bytes()).ok_or(
+                host_bytes = host_bytes.checked_add(unit.host_allocated_bytes()).ok_or(
                     ResidencyError::ArithmeticOverflow {
                         context: "execution group host bytes",
                     },
                 )?;
             }
             if unit.device_resident() {
-                device_bytes = device_bytes.checked_add(unit.expected_bytes()).ok_or(
-                    ResidencyError::ArithmeticOverflow {
+                device_bytes = device_bytes
+                    .checked_add(unit.device_allocated_bytes())
+                    .ok_or(ResidencyError::ArithmeticOverflow {
                         context: "execution group device bytes",
-                    },
-                )?;
+                    })?;
                 device_units += 1;
             }
         }
@@ -978,7 +1000,7 @@ impl ResidentLayerGroupReport {
     pub const fn window_depth(&self) -> usize {
         self.window_depth
     }
-    /// Returns current host-resident bytes for group units.
+    /// Returns current physical host allocation capacity for group units.
     pub const fn host_bytes(&self) -> u64 {
         self.host_bytes
     }
@@ -1651,6 +1673,8 @@ impl ResidencyManager {
                 planned_tier: unit.spec.tier(),
                 policy: unit.spec.policy(),
                 expected_bytes: unit.spec.bytes(),
+                host_allocated_bytes: unit.host.as_ref().map_or(0, |copy| copy.state.bytes),
+                device_allocated_bytes: unit.device.as_ref().map_or(0, |copy| copy.state.bytes),
                 host_resident: unit.host.is_some(),
                 device_resident: unit.device.is_some(),
                 host_pins: unit.host.as_ref().map_or(0, |copy| copy.state.pins),
@@ -1930,7 +1954,7 @@ fn ensure_many_resident(
             if !is_missing {
                 continue;
             }
-            let required = state.units[id].spec.bytes();
+            let required = resident_capacity_requirement(&state.units[id], tier)?;
             reserve_capacity(state, id, tier, required)?;
             let total = tier_bytes(state, tier).checked_add(required).ok_or(
                 ResidencyError::ArithmeticOverflow {
@@ -1955,24 +1979,59 @@ fn ensure_many_resident(
                 }
                 let bindings = state.units[id].definition.bindings.clone();
                 let buffers = materialize_host_buffers(id, store, &bindings, &state.source_stream)?;
-                let actual = host_buffers_nbytes(&buffers)?;
-                let required = state.units[id].spec.bytes();
-                if actual != required {
+                let logical = host_buffers_nbytes(&buffers)?;
+                let planned = state.units[id].spec.bytes();
+                if logical != planned {
                     return Err(ResidencyError::UnitByteMismatch {
                         id: id.clone(),
-                        planned_bytes: required,
-                        actual_bytes: actual,
+                        planned_bytes: planned,
+                        actual_bytes: logical,
                     });
                 }
-                prepared.push((id.clone(), buffers, actual));
+                let capacity = host_buffers_capacity(&buffers)?;
+                let reserved_capacity = resident_capacity_requirement(&state.units[id], tier)?;
+                if capacity > reserved_capacity {
+                    return Err(ResidencyError::HostCapacityBoundExceeded {
+                        id: id.clone(),
+                        reserved_bytes: reserved_capacity,
+                        actual_bytes: capacity,
+                    });
+                }
+                prepared.push((id.clone(), buffers, logical, capacity, reserved_capacity));
             }
-            for (id, buffers, actual) in prepared {
+            let actual_capacity =
+                prepared
+                    .iter()
+                    .try_fold(0u64, |total, (_, _, _, capacity, _)| {
+                        total
+                            .checked_add(*capacity)
+                            .ok_or(ResidencyError::ArithmeticOverflow {
+                                context: "resident host capacity total",
+                            })
+                    })?;
+            let reserved_capacity =
+                prepared
+                    .iter()
+                    .try_fold(0u64, |total, (_, _, _, _, capacity)| {
+                        total
+                            .checked_add(*capacity)
+                            .ok_or(ResidencyError::ArithmeticOverflow {
+                                context: "reserved host capacity total",
+                            })
+                    })?;
+            let charged = tier_bytes(state, tier)
+                .checked_sub(reserved_capacity)
+                .and_then(|total| total.checked_add(actual_capacity))
+                .ok_or(ResidencyError::StatePoisoned)?;
+            set_tier_bytes(state, tier, charged);
+            reserved = actual_capacity;
+            for (id, buffers, logical, capacity, _) in prepared {
                 let tick = next_tick(state)?;
                 let copy = ResidentCopy {
                     storage: Arc::new(buffers),
                     state: ResidentCopyState {
                         in_flight: None,
-                        bytes: actual,
+                        bytes: capacity,
                         pins: 0,
                         last_used: tick,
                         frequency: 0,
@@ -1985,7 +2044,7 @@ fn ensure_many_resident(
                     .host = Some(copy);
                 state.telemetry.record_transfer(
                     TransferDirection::DiskToHost,
-                    actual,
+                    logical,
                     started.elapsed(),
                 );
             }
@@ -2406,6 +2465,42 @@ fn arrays_nbytes(arrays: &BTreeMap<String, Array>) -> Result<u64, ResidencyError
     })
 }
 
+fn resident_capacity_requirement(
+    unit: &UnitRecord,
+    tier: MemoryTier,
+) -> Result<u64, ResidencyError> {
+    if tier != MemoryTier::Host {
+        return Ok(unit.spec.bytes());
+    }
+    unit.definition
+        .bindings
+        .iter()
+        .try_fold(0u64, |total, binding| {
+            let logical = usize::try_from(binding.expected_bytes).map_err(|_| {
+                ResidencyError::ArithmeticOverflow {
+                    context: "host capacity-bound input conversion",
+                }
+            })?;
+            let capacity =
+                host_transfer_capacity_upper_bound(logical, HostTransferPolicy::Transfer).map_err(
+                    |source| ResidencyError::Mlx {
+                        id: unit.spec.id().clone(),
+                        operation: "host-transfer capacity-bound query",
+                        source,
+                    },
+                )?;
+            let capacity =
+                u64::try_from(capacity).map_err(|_| ResidencyError::ArithmeticOverflow {
+                    context: "host capacity-bound output conversion",
+                })?;
+            total
+                .checked_add(capacity)
+                .ok_or(ResidencyError::ArithmeticOverflow {
+                    context: "host unit capacity bound",
+                })
+        })
+}
+
 fn host_buffers_nbytes(buffers: &ResidentHostBuffers) -> Result<u64, ResidencyError> {
     buffers.buffers.values().try_fold(0u64, |total, buffer| {
         let bytes = u64::try_from(buffer.nbytes().map_err(|source| ResidencyError::Mlx {
@@ -2420,6 +2515,24 @@ fn host_buffers_nbytes(buffers: &ResidentHostBuffers) -> Result<u64, ResidencyEr
             .checked_add(bytes)
             .ok_or(ResidencyError::ArithmeticOverflow {
                 context: "resident host-buffer byte total",
+            })
+    })
+}
+
+fn host_buffers_capacity(buffers: &ResidentHostBuffers) -> Result<u64, ResidencyError> {
+    buffers.buffers.values().try_fold(0u64, |total, buffer| {
+        let bytes = u64::try_from(buffer.capacity().map_err(|source| ResidencyError::Mlx {
+            id: internal_id(),
+            operation: "host-buffer capacity inspection",
+            source,
+        })?)
+        .map_err(|_| ResidencyError::ArithmeticOverflow {
+            context: "host-buffer capacity conversion",
+        })?;
+        total
+            .checked_add(bytes)
+            .ok_or(ResidencyError::ArithmeticOverflow {
+                context: "resident host-buffer capacity total",
             })
     })
 }
@@ -3110,6 +3223,52 @@ mod tests {
             manager.evict(&id("host"), MemoryTier::Host),
             Err(ResidencyError::PinnedEviction { .. })
         ));
+    }
+
+    #[test]
+    fn host_residency_charges_physical_allocation_capacity() {
+        let dir = tempfile::tempdir().unwrap();
+        let values = (0..5000u32)
+            .flat_map(|value| (value as f32).to_le_bytes())
+            .collect::<Vec<_>>();
+        serialize_to_file(
+            [(
+                "weight",
+                TensorView::new(Dtype::F32, vec![5000], &values).unwrap(),
+            )],
+            None,
+            &dir.path().join("model.safetensors"),
+        )
+        .unwrap();
+        let store = Arc::new(SafetensorsWeightStore::open(dir.path()).unwrap());
+        let logical = u64::try_from(values.len()).unwrap();
+        let capacity =
+            safemlx::host_transfer_capacity_upper_bound(values.len(), HostTransferPolicy::Transfer)
+                .map(|capacity| u64::try_from(capacity).unwrap())
+                .unwrap();
+        let manager = manager(
+            store,
+            OffloadConfig::new(None, Some(capacity), 1).unwrap(),
+            [spec(
+                "host",
+                logical,
+                ResidencyPolicy::Pinned,
+                MemoryTier::Host,
+            )],
+            [unit(
+                "host",
+                [binding("weight", "weight", TensorSelection::Full, logical)],
+            )],
+        );
+        manager.initialize().unwrap();
+        let report = manager.report().unwrap();
+        let unit = state(&report, "host");
+        assert_eq!(unit.expected_bytes(), logical);
+        assert_eq!(unit.host_allocated_bytes(), capacity);
+        assert_eq!(
+            report.offload().resident_bytes().get(MemoryTier::Host),
+            capacity
+        );
     }
 
     #[test]

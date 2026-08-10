@@ -22,7 +22,7 @@ use safemlx_lm::{
 
 let pool = CacheResidencyPool::new(CachePoolLimits::new(
     2 << 30,  // aggregate device-cache bytes
-    8 << 30,  // aggregate host-cache bytes
+    8 << 30,  // aggregate physical host allocation capacity
     1 << 30,  // aggregate bytes retained by active transfers
     0,        // aggregate live-disk bytes; zero disables the tier
 )?);
@@ -30,7 +30,7 @@ let pool = CacheResidencyPool::new(CachePoolLimits::new(
 let options = PagedCacheOptions::new(
     128,          // tokens per block
     512 << 20,    // finite logical device-cache bytes
-    2 << 30,      // finite logical host-cache bytes
+    2 << 30,      // finite physical host allocation capacity
     1,            // recent device blocks protected per layer
 )?
 .with_full_attention(true)
@@ -98,9 +98,10 @@ latents reduce stored bytes, but attention still consumes every historical
 latent block and reconstructs head-specific contributions one block at a time.
 No throughput improvement is promised.
 
-Apple unified memory means logical host/device placement does not create
-additional physical capacity. Residency reports describe the runtime's logical
-tiers and requested transfer bytes. They do not claim physical disk bytes:
+Apple unified memory means host/device placement does not create additional
+system capacity. Residency reports count logical device/disk payload bytes and
+the exact physical capacity of typed host-transfer allocations. They do not
+claim physical disk bytes:
 mapped pages may be served by the operating-system cache. SafeMLX's immutable
 weight residency manager, expert cache, and paged attention cache use MLX
 completion events to retain transfer sources and order compatible execution
@@ -121,8 +122,9 @@ is submitted to a dedicated worker which owns a task-local stream on the cache's
 bound execution device and both completion events. The initiating thread does
 not wait merely to establish host ownership. While the copy is in flight, the
 physical state retains the device
-arrays, reserves the typed host destination, and charges the block's bytes to
-both finite budgets. A capacity-changing operation waits for completion only
+arrays, reserves the typed host destination, and charges logical device bytes
+plus physical host allocation capacity to their finite budgets. A
+capacity-changing operation waits for completion only
 when releasing the device source is necessary to admit that operation. The
 worker then publishes immutable host buffers without creating CPU MLX arrays.
 `in_flight_host_demotion_blocks`, `in_flight_host_demotion_bytes`, and
@@ -144,6 +146,9 @@ but wait for each canceled disk write or host demotion to release its arrays
 and buffers before returning, so a new generation cannot reuse capacity that is
 still physically occupied. A retirement reservation keeps both tier charges
 visible after the old catalog entry is removed and until that wait completes.
+Disk-to-host reads likewise reserve the backend's advertised allocation bound
+before the worker allocates and retain it through cancellation. Completed host
+ownership is charged by the buffers' exact `capacity()`, not logical `nbytes()`.
 Asynchronous write failures are returned by the next
 residency-changing cache operation. Live shard names include a process-unique
 namespace, write identity, representation, and pipeline/tensor/expert rank.

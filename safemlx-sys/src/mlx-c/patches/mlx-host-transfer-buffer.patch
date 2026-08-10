@@ -18,6 +18,7 @@ index c831b7247..1855dd2d4 100644
  #pragma once
  
  #include <cstdlib>
++#include <limits>
 +#include <stdexcept>
  
  #include "mlx/api.h"
@@ -63,6 +64,19 @@ index c831b7247..1855dd2d4 100644
 +  virtual HostTransferStorageKind host_transfer_storage_kind(
 +      HostTransferPolicy) const {
 +    return HostTransferStorageKind::cpu;
++  }
++
++  /** Conservative physical capacity reserved before host allocation. */
++  virtual size_t host_transfer_capacity_upper_bound(
++      size_t size,
++      HostTransferPolicy policy) const {
++    if (policy == HostTransferPolicy::managed) {
++      throw std::invalid_argument(
++          "Managed host transfer storage is not supported by this backend.");
++    }
++    return size > std::numeric_limits<size_t>::max() / 2
++        ? std::numeric_limits<size_t>::max()
++        : 2 * size;
 +  }
 +
    Allocator() = default;
@@ -161,6 +175,12 @@ index b04d72da0..10017d100 100644
 +      : allocator::HostTransferStorageKind::cuda_pinned;
 +}
 +
++size_t CudaAllocator::host_transfer_capacity_upper_bound(
++    size_t size,
++    allocator::HostTransferPolicy) const {
++  return size;
++}
++
  void CudaAllocator::free(Buffer buffer) {
    auto* buf = static_cast<CudaBuffer*>(buffer.ptr());
    if (!buf) {
@@ -179,6 +199,9 @@ index af76ad905..5ebe77989 100644
 +      Buffer buffer,
 +      allocator::HostTransferPolicy policy) override;
 +  allocator::HostTransferStorageKind host_transfer_storage_kind(
++      allocator::HostTransferPolicy policy) const override;
++  size_t host_transfer_capacity_upper_bound(
++      size_t size,
 +      allocator::HostTransferPolicy policy) const override;
  
    // Replace the memory of |buf| with unified memory (managed memory or pinned
@@ -341,10 +364,16 @@ diff --git a/mlx/backend/metal/allocator.h b/mlx/backend/metal/allocator.h
 index 4cbbfb0ad..7a51fec8c 100644
 --- a/mlx/backend/metal/allocator.h
 +++ b/mlx/backend/metal/allocator.h
-@@ -22,6 +22,14 @@ class MetalAllocator : public allocator::Allocator {
+@@ -22,6 +22,20 @@ class MetalAllocator : public allocator::Allocator {
    virtual size_t size(Buffer buffer) const override;
    virtual Buffer make_buffer(void* ptr, size_t size) override;
    virtual void release(Buffer buffer) override;
++  Buffer malloc_host_transfer(
++      size_t size,
++      allocator::HostTransferPolicy policy) override;
++  void free_host_transfer(
++      Buffer buffer,
++      allocator::HostTransferPolicy policy) override;
 +  allocator::HostTransferStorageKind host_transfer_storage_kind(
 +      allocator::HostTransferPolicy policy) const override {
 +    if (policy == allocator::HostTransferPolicy::managed) {
@@ -353,9 +382,108 @@ index 4cbbfb0ad..7a51fec8c 100644
 +    }
 +    return allocator::HostTransferStorageKind::metal_shared;
 +  }
++  size_t host_transfer_capacity_upper_bound(
++      size_t size,
++      allocator::HostTransferPolicy policy) const override;
  
    size_t get_active_memory() {
      return active_memory_;
+diff --git a/mlx/backend/metal/allocator.cpp b/mlx/backend/metal/allocator.cpp
+index 03cd6bf7c..ed4d7eb42 100644
+--- a/mlx/backend/metal/allocator.cpp
++++ b/mlx/backend/metal/allocator.cpp
+@@ -7,6 +7,8 @@
+ 
+ #include <mach/vm_page_size.h>
+ #include <unistd.h>
++#include <algorithm>
++#include <limits>
+ #include <cassert>
+ #include <cstdlib>
+ 
+@@ -203,6 +205,73 @@ size_t MetalAllocator::size(Buffer buffer) const {
+   return static_cast<MTL::Buffer*>(buffer.ptr())->length();
+ }
+ 
++Buffer MetalAllocator::malloc_host_transfer(
++    size_t size,
++    allocator::HostTransferPolicy policy) {
++  if (policy == allocator::HostTransferPolicy::managed) {
++    throw std::invalid_argument(
++        "Managed host transfer storage is not supported by Metal.");
++  }
++  if (size == 0) {
++    return Buffer{nullptr};
++  }
++  if (size > device_->maxBufferLength()) {
++    std::ostringstream msg;
++    msg << "[metal::malloc_host_transfer] Attempting to allocate " << size
++        << " bytes which is greater than the maximum allowed buffer size of "
++        << device_->maxBufferLength() << " bytes.";
++    throw std::runtime_error(msg.str());
++  }
++  if (size > vm_page_size) {
++    size = vm_page_size * ((size + vm_page_size - 1) / vm_page_size);
++  }
++
++  std::unique_lock lk(mutex_);
++  const size_t mem_required = get_active_memory() + get_cache_memory() + size;
++  if (mem_required >= gc_limit_ || num_resources_ >= resource_limit_) {
++    const size_t reclaim =
++        mem_required > gc_limit_ ? mem_required - gc_limit_ : 0;
++    num_resources_ -= buffer_cache_.release_cached_buffers(reclaim);
++  }
++  if (num_resources_ >= resource_limit_) {
++    std::ostringstream msg;
++    msg << "[metal::malloc_host_transfer] Resource limit ("
++        << resource_limit_ << ") exceeded.";
++    throw std::runtime_error(msg.str());
++  }
++  lk.unlock();
++  auto* buf = device_->newBuffer(size, resource_options);
++  if (!buf) {
++    std::ostringstream msg;
++    msg << "[metal::malloc_host_transfer] Unable to allocate " << size
++        << " bytes.";
++    throw std::runtime_error(msg.str());
++  }
++  lk.lock();
++  num_resources_++;
++  residency_set_.insert(buf);
++  active_memory_ += buf->length();
++  peak_memory_ = std::max(peak_memory_, active_memory_);
++  return Buffer{static_cast<void*>(buf)};
++}
++
++void MetalAllocator::free_host_transfer(
++    Buffer buffer,
++    allocator::HostTransferPolicy policy) {
++  if (policy == allocator::HostTransferPolicy::managed) {
++    throw std::invalid_argument(
++        "Managed host transfer storage is not supported by Metal.");
++  }
++  release(buffer);
++}
++
++size_t MetalAllocator::host_transfer_capacity_upper_bound(
++    size_t size,
++    allocator::HostTransferPolicy policy) const {
++  if (policy == allocator::HostTransferPolicy::managed) {
++    throw std::invalid_argument(
++        "Managed host transfer storage is not supported by Metal.");
++  }
++  if (size > vm_page_size) {
++    if (size > std::numeric_limits<size_t>::max() - (vm_page_size - 1)) {
++      return std::numeric_limits<size_t>::max();
++    }
++    size = vm_page_size * ((size + vm_page_size - 1) / vm_page_size);
++  }
++  return size;
++}
++
+ Buffer MetalAllocator::make_buffer(void* ptr, size_t size) {
+   auto buf = device_->newBuffer(ptr, size, resource_options, nullptr);
+   if (!buf) {
 diff --git a/mlx/backend/metal/host_transfer.cpp b/mlx/backend/metal/host_transfer.cpp
 new file mode 100644
 index 000000000..458a89cf6
@@ -393,6 +521,88 @@ index 751572c99..2f16210ab 100644
  NO_CPU(Cos)
  NO_CPU(Cosh)
  NO_CPU_MULTI(CustomTransforms)
+diff --git a/mlx/backend/no_gpu/allocator.cpp b/mlx/backend/no_gpu/allocator.cpp
+index 0443a9e6d..728c72ee8 100644
+--- a/mlx/backend/no_gpu/allocator.cpp
++++ b/mlx/backend/no_gpu/allocator.cpp
+@@ -2,6 +2,7 @@
+ 
+ #include <algorithm>
+ #include <mutex>
++#include <new>
+ 
+ #include "mlx/allocator.h"
+ #include "mlx/backend/common/buffer_cache.h"
+@@ -37,6 +37,14 @@ class CommonAllocator : public Allocator {
+  public:
+   virtual Buffer malloc(size_t size) override;
+   virtual void free(Buffer buffer) override;
+   virtual size_t size(Buffer buffer) const override;
++  Buffer malloc_host_transfer(
++      size_t size,
++      HostTransferPolicy policy) override;
++  void free_host_transfer(
++      Buffer buffer,
++      HostTransferPolicy policy) override;
++  size_t host_transfer_capacity_upper_bound(
++      size_t size, HostTransferPolicy policy) const override;
+ 
+   size_t get_active_memory() const {
+     return active_memory_;
+@@ -95,6 +103,53 @@ Buffer CommonAllocator::malloc(size_t size) {
+   return Buffer{ptr};
+ }
+ 
++Buffer CommonAllocator::malloc_host_transfer(
++    size_t size,
++    HostTransferPolicy policy) {
++  if (policy == HostTransferPolicy::managed) {
++    throw std::invalid_argument(
++        "Managed host transfer storage is not supported by this backend.");
++  }
++  if (size > std::numeric_limits<size_t>::max() - sizeof(size_t)) {
++    throw std::overflow_error(
++        "Host transfer allocation size exceeds the addressable range.");
++  }
++  void* ptr = std::malloc(size + sizeof(size_t));
++  if (ptr == nullptr) {
++    throw std::bad_alloc();
++  }
++  *static_cast<size_t*>(ptr) = size;
++  std::unique_lock lk(mutex_);
++  active_memory_ += size;
++  peak_memory_ = std::max(active_memory_, peak_memory_);
++  return Buffer{ptr};
++}
++
++void CommonAllocator::free_host_transfer(
++    Buffer buffer,
++    HostTransferPolicy policy) {
++  if (policy == HostTransferPolicy::managed) {
++    throw std::invalid_argument(
++        "Managed host transfer storage is not supported by this backend.");
++  }
++  const auto bytes = size(buffer);
++  {
++    std::unique_lock lk(mutex_);
++    active_memory_ -= bytes;
++  }
++  std::free(buffer.ptr());
++}
++
++size_t CommonAllocator::host_transfer_capacity_upper_bound(
++    size_t size,
++    HostTransferPolicy policy) const {
++  if (policy == HostTransferPolicy::managed) {
++    throw std::invalid_argument(
++        "Managed host transfer storage is not supported by this backend.");
++  }
++  return size;
++}
++
+ void CommonAllocator::free(Buffer buffer) {
+   auto sz = size(buffer);
+   std::unique_lock lk(mutex_);
 diff --git a/mlx/backend/no_gpu/primitives.cpp b/mlx/backend/no_gpu/primitives.cpp
 index 2c685b72a..dfb6a5391 100644
 --- a/mlx/backend/no_gpu/primitives.cpp
@@ -416,6 +626,8 @@ index 000000000..40e92a758
 +
 +#include "mlx/host_transfer.h"
 +
++#include <array>
++#include <atomic>
 +#include <limits>
 +#include <stdexcept>
 +
@@ -424,18 +636,78 @@ index 000000000..40e92a758
 +#include "mlx/transforms.h"
 +
 +namespace mlx::core {
++namespace {
++
++struct HostTransferCounters {
++  std::atomic<size_t> active_bytes{0};
++  std::atomic<size_t> peak_bytes{0};
++  std::atomic<size_t> active_allocations{0};
++  std::atomic<size_t> peak_allocations{0};
++};
++
++std::array<HostTransferCounters, 4> host_transfer_counters;
++
++size_t storage_kind_index(HostTransferStorageKind kind) {
++  switch (kind) {
++    case HostTransferStorageKind::cpu:
++      return 0;
++    case HostTransferStorageKind::metal_shared:
++      return 1;
++    case HostTransferStorageKind::cuda_pinned:
++      return 2;
++    case HostTransferStorageKind::cuda_managed:
++      return 3;
++  }
++  throw std::invalid_argument("Unknown HostTransferStorageKind value.");
++}
++
++void update_peak(std::atomic<size_t>& peak, size_t value) {
++  auto observed = peak.load(std::memory_order_relaxed);
++  while (observed < value &&
++         !peak.compare_exchange_weak(
++             observed,
++             value,
++             std::memory_order_relaxed,
++             std::memory_order_relaxed)) {}
++}
++
++void record_host_transfer_allocation(
++    HostTransferStorageKind kind,
++    size_t capacity) {
++  auto& counters = host_transfer_counters[storage_kind_index(kind)];
++  const auto bytes =
++      counters.active_bytes.fetch_add(capacity, std::memory_order_relaxed) +
++      capacity;
++  const auto allocations =
++      counters.active_allocations.fetch_add(1, std::memory_order_relaxed) + 1;
++  update_peak(counters.peak_bytes, bytes);
++  update_peak(counters.peak_allocations, allocations);
++}
++
++void record_host_transfer_free(
++    HostTransferStorageKind kind,
++    size_t capacity) {
++  auto& counters = host_transfer_counters[storage_kind_index(kind)];
++  counters.active_bytes.fetch_sub(capacity, std::memory_order_relaxed);
++  counters.active_allocations.fetch_sub(1, std::memory_order_relaxed);
++}
++
++} // namespace
 +
 +class HostTransferStorage {
 + public:
 +  HostTransferStorage(size_t size, HostTransferPolicy policy)
 +      : buffer_(allocator::allocator().malloc_host_transfer(size, policy)),
-+        capacity_(allocator::allocator().size(buffer_)),
++        capacity_(size == 0 ? 0 : allocator::allocator().size(buffer_)),
 +        policy_(policy),
 +        storage_kind_(
-+            allocator::allocator().host_transfer_storage_kind(policy)) {}
++            allocator::allocator().host_transfer_storage_kind(policy)) {
++    record_host_transfer_allocation(storage_kind_, capacity_);
++  }
 +
 +  ~HostTransferStorage() {
 +    allocator::allocator().free_host_transfer(buffer_, policy_);
++    record_host_transfer_free(storage_kind_, capacity_);
 +  }
 +
 +  HostTransferStorage(const HostTransferStorage&) = delete;
@@ -460,6 +732,35 @@ index 000000000..40e92a758
 +  HostTransferPolicy policy_;
 +  HostTransferStorageKind storage_kind_;
 +};
++
++HostTransferMemoryStats host_transfer_memory_stats(
++    HostTransferStorageKind kind) {
++  auto& counters = host_transfer_counters[storage_kind_index(kind)];
++  return {
++      counters.active_bytes.load(std::memory_order_relaxed),
++      counters.peak_bytes.load(std::memory_order_relaxed),
++      counters.active_allocations.load(std::memory_order_relaxed),
++      counters.peak_allocations.load(std::memory_order_relaxed)};
++}
++
++void reset_host_transfer_peak_memory(HostTransferStorageKind kind) {
++  auto& counters = host_transfer_counters[storage_kind_index(kind)];
++  counters.peak_bytes.store(0, std::memory_order_relaxed);
++  counters.peak_allocations.store(0, std::memory_order_relaxed);
++  update_peak(
++      counters.peak_bytes,
++      counters.active_bytes.load(std::memory_order_relaxed));
++  update_peak(
++      counters.peak_allocations,
++      counters.active_allocations.load(std::memory_order_relaxed));
++}
++
++size_t host_transfer_capacity_upper_bound(
++    size_t nbytes,
++    HostTransferPolicy policy) {
++  return allocator::allocator().host_transfer_capacity_upper_bound(
++      nbytes, policy);
++}
 +
 +HostTransferBuffer::HostTransferBuffer(
 +    Shape shape,
@@ -606,6 +907,25 @@ index 000000000..2caaa0dd5
 +
 +class HostTransferStorage;
 +struct DeviceTransfer;
++
++struct MLX_API HostTransferMemoryStats {
++  size_t active_bytes;
++  size_t peak_bytes;
++  size_t active_allocations;
++  size_t peak_allocations;
++};
++
++/** Process-wide physical storage owned by host-transfer buffers of one kind. */
++MLX_API HostTransferMemoryStats host_transfer_memory_stats(
++    HostTransferStorageKind kind);
++
++/** Reset one storage kind's high-water marks to its current occupancy. */
++MLX_API void reset_host_transfer_peak_memory(HostTransferStorageKind kind);
++
++/** Conservative capacity to reserve before allocating a logical payload. */
++MLX_API size_t host_transfer_capacity_upper_bound(
++    size_t nbytes,
++    HostTransferPolicy policy = HostTransferPolicy::transfer);
 +
 +/**
 + * Owned, host-addressable storage prepared for asynchronous backend transfers.
@@ -797,4 +1117,30 @@ index 000000000..736d9a79e
 +      HostTransferBuffer(Shape{-1}, float32),
 +      "[HostTransferBuffer] Negative dimensions are not allowed.",
 +      std::invalid_argument);
++}
++
++TEST_CASE("test host transfer physical telemetry and capacity bound") {
++  const auto kind = HostTransferBuffer(
++      Shape{1}, float32, HostTransferPolicy::transfer).storage_kind();
++  reset_host_transfer_peak_memory(kind);
++  const auto baseline = host_transfer_memory_stats(kind);
++  size_t capacity = 0;
++  {
++    HostTransferBuffer buffer(
++        Shape{1025}, float32, HostTransferPolicy::transfer);
++    capacity = buffer.capacity();
++    CHECK(
++        host_transfer_capacity_upper_bound(
++            buffer.nbytes(), HostTransferPolicy::transfer) == capacity);
++    const auto live = host_transfer_memory_stats(kind);
++    CHECK(live.active_bytes == baseline.active_bytes + capacity);
++    CHECK(live.active_allocations == baseline.active_allocations + 1);
++    CHECK(live.peak_bytes >= live.active_bytes);
++    CHECK(live.peak_allocations >= live.active_allocations);
++  }
++  const auto released = host_transfer_memory_stats(kind);
++  CHECK(released.active_bytes == baseline.active_bytes);
++  CHECK(released.active_allocations == baseline.active_allocations);
++  CHECK(released.peak_bytes >= baseline.active_bytes + capacity);
++  CHECK(released.peak_allocations >= baseline.active_allocations + 1);
 +}

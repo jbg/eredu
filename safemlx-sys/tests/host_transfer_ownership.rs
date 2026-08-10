@@ -34,6 +34,38 @@ fn host_transfer_handles_obey_c_ownership_contract() {
             0
         );
         assert_eq!(bytes, 4 * size_of::<f32>());
+        let mut capacity = 0;
+        assert_eq!(
+            safemlx_sys::mlx_host_transfer_buffer_capacity(&mut capacity, buffer),
+            0
+        );
+        let mut bound = 0;
+        assert_eq!(
+            safemlx_sys::mlx_host_transfer_capacity_upper_bound(
+                &mut bound,
+                bytes,
+                safemlx_sys::mlx_host_transfer_policy__MLX_HOST_TRANSFER_POLICY_TRANSFER,
+            ),
+            0
+        );
+        assert_eq!(capacity, bound);
+        let mut kind = 0;
+        assert_eq!(
+            safemlx_sys::mlx_host_transfer_buffer_storage_kind(&mut kind, buffer),
+            0
+        );
+        let mut live = safemlx_sys::mlx_host_transfer_memory_stats {
+            active_bytes: 0,
+            peak_bytes: 0,
+            active_allocations: 0,
+            peak_allocations: 0,
+        };
+        assert_eq!(
+            safemlx_sys::mlx_host_transfer_memory_stats_get(&mut live, kind),
+            0
+        );
+        assert!(live.active_bytes >= capacity);
+        assert!(live.active_allocations >= 1);
         let mut data = std::ptr::null();
         assert_eq!(
             safemlx_sys::mlx_host_transfer_buffer_data(&mut data, buffer),
@@ -55,6 +87,18 @@ fn host_transfer_handles_obey_c_ownership_contract() {
         assert_eq!(safemlx_sys::mlx_array_free(round_trip), 0);
         assert_eq!(safemlx_sys::mlx_event_free(round_trip_event), 0);
         assert_eq!(safemlx_sys::mlx_host_transfer_buffer_free(buffer), 0);
+        let mut released = safemlx_sys::mlx_host_transfer_memory_stats {
+            active_bytes: 0,
+            peak_bytes: 0,
+            active_allocations: 0,
+            peak_allocations: 0,
+        };
+        assert_eq!(
+            safemlx_sys::mlx_host_transfer_memory_stats_get(&mut released, kind),
+            0
+        );
+        assert_eq!(released.active_bytes, live.active_bytes - capacity);
+        assert_eq!(released.active_allocations, live.active_allocations - 1);
         assert_eq!(safemlx_sys::mlx_event_free(event), 0);
         assert_eq!(safemlx_sys::mlx_array_free(source), 0);
         assert_eq!(safemlx_sys::mlx_stream_free(stream), 0);

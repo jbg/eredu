@@ -22,6 +22,7 @@ use std::{
 
 use memmap2::{Mmap, MmapOptions};
 use safemlx::{
+    host_transfer_capacity_upper_bound,
     transforms::{async_eval_with_event, eval},
     Array, Device, DeviceType, Dtype, Event, HostTransferBuffer, HostTransferPolicy,
     ImmutableHostTransferBuffer, Stream,
@@ -103,7 +104,7 @@ impl CachePoolLimits {
         self.device_bytes
     }
 
-    /// Aggregate host-cache capacity.
+    /// Aggregate physical host-transfer allocation capacity.
     pub const fn host_bytes(self) -> u64 {
         self.host_bytes
     }
@@ -162,9 +163,9 @@ pub struct CachePoolReport {
     pub current_device_bytes: u64,
     /// Peak aggregate device bytes successfully admitted.
     pub peak_device_bytes: u64,
-    /// Current aggregate host bytes.
+    /// Current aggregate physical host-transfer allocation capacity.
     pub current_host_bytes: u64,
-    /// Peak aggregate host bytes successfully admitted.
+    /// Peak aggregate physical host-transfer capacity successfully admitted.
     pub peak_host_bytes: u64,
     /// Current bytes retained by in-flight transfers.
     pub current_transfer_in_flight_bytes: u64,
@@ -607,7 +608,7 @@ impl PagedCacheOptions {
         self.device_budget_bytes
     }
 
-    /// Returns the finite logical host-cache budget.
+    /// Returns the finite physical host-transfer allocation budget.
     pub const fn host_budget_bytes(&self) -> u64 {
         self.host_budget_bytes
     }
@@ -763,6 +764,70 @@ impl CacheBlockArrays {
     }
 }
 
+fn host_cache_capacity_upper_bound(arrays: &CacheBlockArrays) -> Result<u64, CacheResidencyError> {
+    arrays.arrays().into_iter().try_fold(0u64, |total, array| {
+        let capacity =
+            host_transfer_capacity_upper_bound(array.nbytes(), HostTransferPolicy::Transfer)
+                .map_err(|source| transfer_error("query host cache capacity bound", source))?;
+        let capacity = u64::try_from(capacity).map_err(|_| {
+            CacheResidencyError::Runtime(
+                "host cache capacity bound exceeds the u64 accounting range".into(),
+            )
+        })?;
+        total.checked_add(capacity).ok_or_else(|| {
+            CacheResidencyError::Runtime("host cache capacity bound overflowed".into())
+        })
+    })
+}
+
+fn host_cache_layout_capacity_upper_bound(
+    shapes: &[Vec<i32>; 2],
+    dtypes: &[String; 2],
+) -> Result<u64, CacheResidencyError> {
+    shapes
+        .iter()
+        .zip(dtypes)
+        .try_fold(0u64, |total, (shape, dtype)| {
+            let element_bytes = match dtype.as_str() {
+                "Bool" | "Uint8" | "Int8" => 1u64,
+                "Uint16" | "Int16" | "Float16" | "Bfloat16" => 2,
+                "Uint32" | "Int32" | "Float32" => 4,
+                "Uint64" | "Int64" | "Float64" | "Complex64" => 8,
+                other => {
+                    return Err(CacheResidencyError::Runtime(format!(
+                        "unsupported host cache dtype {other} in capacity admission"
+                    )))
+                }
+            };
+            let logical_bytes = shape.iter().try_fold(element_bytes, |bytes, dimension| {
+                let dimension = u64::try_from(*dimension).map_err(|_| {
+                    CacheResidencyError::Runtime(
+                        "host cache shape contains a negative dimension".into(),
+                    )
+                })?;
+                bytes.checked_mul(dimension).ok_or_else(|| {
+                    CacheResidencyError::Runtime("host cache logical byte length overflowed".into())
+                })
+            })?;
+            let logical_bytes = usize::try_from(logical_bytes).map_err(|_| {
+                CacheResidencyError::Runtime(
+                    "host cache logical byte length exceeds the addressable range".into(),
+                )
+            })?;
+            let capacity =
+                host_transfer_capacity_upper_bound(logical_bytes, HostTransferPolicy::Transfer)
+                    .map_err(|source| transfer_error("query host cache capacity bound", source))?;
+            let capacity = u64::try_from(capacity).map_err(|_| {
+                CacheResidencyError::Runtime(
+                    "host cache capacity bound exceeds the u64 accounting range".into(),
+                )
+            })?;
+            total.checked_add(capacity).ok_or_else(|| {
+                CacheResidencyError::Runtime("host cache capacity bound overflowed".into())
+            })
+        })
+}
+
 #[derive(Debug, Clone)]
 enum HostCacheBlock {
     KeyValue {
@@ -889,6 +954,22 @@ impl HostCacheBlock {
         })
     }
 
+    fn capacity(&self) -> Result<u64, CacheResidencyError> {
+        self.buffers().into_iter().try_fold(0u64, |total, buffer| {
+            let capacity = buffer
+                .capacity()
+                .map_err(|source| transfer_error("inspect host cache capacity", source))?;
+            let capacity = u64::try_from(capacity).map_err(|_| {
+                CacheResidencyError::Runtime(
+                    "host cache capacity exceeds the u64 accounting range".into(),
+                )
+            })?;
+            total.checked_add(capacity).ok_or_else(|| {
+                CacheResidencyError::Runtime("host cache capacity total overflowed".into())
+            })
+        })
+    }
+
     fn copy_to_device(
         &self,
         stream: &Stream,
@@ -954,6 +1035,7 @@ impl HostDemotionCompletion {
 struct HostDemotionTicket {
     operation_id: u64,
     id: CacheBlockId,
+    reserved_host_bytes: u64,
     completion: Arc<HostDemotionCompletion>,
 }
 
@@ -1055,11 +1137,13 @@ impl HostDemotionWorker {
         id: &CacheBlockId,
         arrays: CacheBlockArrays,
         device: CacheTransferDevice,
+        reserved_host_bytes: u64,
     ) -> Result<HostDemotionTicket, CacheResidencyError> {
         let completion = Arc::new(HostDemotionCompletion::default());
         let ticket = HostDemotionTicket {
             operation_id: NEXT_HOST_DEMOTION_ID.fetch_add(1, Ordering::Relaxed),
             id: id.clone(),
+            reserved_host_bytes,
             completion: Arc::clone(&completion),
         };
         self.sender
@@ -1122,7 +1206,10 @@ enum HostCachePersistence {
 #[derive(Debug, Clone)]
 enum DiskCacheReadState {
     Ready,
-    Reading(PendingDiskOperation),
+    Reading {
+        pending: PendingDiskOperation,
+        reserved_host_bytes: u64,
+    },
 }
 
 impl CacheBlockPhysicalState {
@@ -1157,7 +1244,7 @@ impl CacheBlockPhysicalState {
                 ..
             }
             | Self::Disk {
-                read: DiskCacheReadState::Reading(pending),
+                read: DiskCacheReadState::Reading { pending, .. },
                 ..
             } => Some(pending),
             Self::Device { .. }
@@ -1188,7 +1275,7 @@ impl CacheBlockPhysicalState {
             }
             Self::Disk {
                 location,
-                read: DiskCacheReadState::Reading(pending),
+                read: DiskCacheReadState::Reading { pending, .. },
             } if pending.ticket.key == *key => {
                 *self = Self::Disk {
                     location,
@@ -1278,14 +1365,16 @@ struct DiskWriteCommit {
 struct HostWriteReservation {
     reservation_id: u64,
     global_layer: usize,
-    bytes: u64,
+    logical_bytes: u64,
+    host_capacity: u64,
     ticket: DiskTicket,
 }
 
 #[derive(Debug, Clone)]
 struct RetiringHostDemotion {
     id: CacheBlockId,
-    bytes: u64,
+    device_bytes: u64,
+    host_bytes: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -1972,7 +2061,7 @@ pub struct CacheLayerResidencyStats {
     pub disk_blocks: u64,
     /// Current logical device bytes, including mutable tails.
     pub current_device_bytes: u64,
-    /// Current logical host bytes, including buffers retained by in-flight writes.
+    /// Current physical host allocation capacity, including in-flight ownership.
     pub current_host_bytes: u64,
     /// Current logical disk bytes.
     pub current_disk_bytes: u64,
@@ -1980,11 +2069,11 @@ pub struct CacheLayerResidencyStats {
     pub mutable_tail_bytes: u64,
     /// Blocks whose host buffers are owned by background disk writes.
     pub in_flight_write_blocks: u64,
-    /// Logical bytes owned by background disk writes.
+    /// Physical host allocation capacity owned by background disk writes.
     pub in_flight_write_bytes: u64,
     /// Blocks retaining both device and host allocations during demotion.
     pub in_flight_host_demotion_blocks: u64,
-    /// Logical bytes charged to both device and host during demotion.
+    /// Physical host allocation capacity charged during device demotion.
     pub in_flight_host_demotion_bytes: u64,
     /// Recent device blocks protected from demotion.
     pub protected_recent_blocks: u64,
@@ -2096,7 +2185,7 @@ pub struct CacheLayerResidencyReport {
     pub stats: CacheLayerResidencyStats,
 }
 
-/// Aggregated logical residency and transfer observations.
+/// Aggregated logical device/disk and physical host residency observations.
 #[derive(Debug, Clone, Default, Eq, PartialEq)]
 pub struct CacheResidencyReport {
     /// Absolute token count represented by the longest layer.
@@ -2115,9 +2204,9 @@ pub struct CacheResidencyReport {
     pub current_device_bytes: u64,
     /// Peak successfully admitted logical device bytes.
     pub peak_device_bytes: u64,
-    /// Current logical host bytes, including buffers retained by in-flight writes.
+    /// Current physical host allocation capacity, including in-flight ownership.
     pub current_host_bytes: u64,
-    /// Peak successfully admitted logical host bytes.
+    /// Peak successfully admitted physical host allocation capacity.
     pub peak_host_bytes: u64,
     /// Current logical disk bytes.
     pub current_disk_bytes: u64,
@@ -2125,15 +2214,15 @@ pub struct CacheResidencyReport {
     pub peak_disk_bytes: u64,
     /// Blocks whose host buffers are owned by background disk writes.
     pub in_flight_write_blocks: u64,
-    /// Logical bytes owned by background disk writes (included in current host bytes).
+    /// Physical host capacity owned by disk writes (included in current host bytes).
     pub in_flight_write_bytes: u64,
-    /// Peak logical bytes owned by background disk writes.
+    /// Peak physical host capacity owned by background disk writes.
     pub peak_in_flight_write_bytes: u64,
     /// Blocks retaining both device and host allocations during demotion.
     pub in_flight_host_demotion_blocks: u64,
-    /// Logical bytes charged to both device and host during demotion.
+    /// Physical host capacity charged during device demotion.
     pub in_flight_host_demotion_bytes: u64,
-    /// Peak logical bytes simultaneously charged to both tiers by demotion.
+    /// Peak physical host capacity charged during device demotion.
     pub peak_in_flight_host_demotion_bytes: u64,
     /// Current bytes in mutable tails.
     pub mutable_tail_bytes: u64,
@@ -2227,6 +2316,7 @@ struct CacheManagerState {
     tails: HashMap<usize, (u64, i64)>,
     host_write_reservations: HashMap<DiskOperationKey, HostWriteReservation>,
     retiring_host_demotions: HashMap<u64, RetiringHostDemotion>,
+    retiring_disk_reads: HashMap<DiskOperationKey, (usize, u64)>,
     transfer_device: Option<CacheTransferDevice>,
     layer_activity: BTreeMap<usize, CacheLayerActivityCounters>,
     layer_activity_overflow: CacheLayerActivityCounters,
@@ -2329,6 +2419,7 @@ impl CacheResidencyManager {
                     tails: HashMap::new(),
                     host_write_reservations: HashMap::new(),
                     retiring_host_demotions: HashMap::new(),
+                    retiring_disk_reads: HashMap::new(),
                     transfer_device: None,
                     layer_activity: BTreeMap::new(),
                     layer_activity_overflow: CacheLayerActivityCounters::default(),
@@ -2702,35 +2793,90 @@ impl CacheResidencyManager {
                     let worker = self.inner.disk_worker.as_ref().ok_or_else(|| {
                         CacheResidencyError::Runtime("cache disk worker is unavailable".into())
                     })?;
-                    let (ticket, submission, joined, _transfer_reservation) = match read {
-                        DiskCacheReadState::Reading(pending) => (pending.ticket, None, true, None),
-                        DiskCacheReadState::Ready => {
-                            let bytes = state
-                                .blocks
-                                .get(id)
-                                .ok_or_else(|| CacheResidencyError::MissingBlock(id.clone()))?
-                                .bytes;
-                            let transfer_reservation = Some(state.pool.reserve_transfer(bytes)?);
-                            let submission = worker.prepare_read(
-                                generation,
-                                id,
-                                &location,
-                                id.representation,
-                            )?;
-                            let ticket = submission.ticket.clone();
-                            let record = state
-                                .blocks
-                                .get_mut(id)
-                                .ok_or_else(|| CacheResidencyError::MissingBlock(id.clone()))?;
-                            record.physical = CacheBlockPhysicalState::Disk {
-                                location: location.clone(),
-                                read: DiskCacheReadState::Reading(PendingDiskOperation {
-                                    ticket: ticket.clone(),
-                                }),
-                            };
-                            (ticket, Some(submission), false, transfer_reservation)
-                        }
-                    };
+                    let (ticket, submission, joined, _transfer_reservation, reserved_host_bytes) =
+                        match read {
+                            DiskCacheReadState::Reading {
+                                pending,
+                                reserved_host_bytes,
+                            } => (pending.ticket, None, true, None, reserved_host_bytes),
+                            DiskCacheReadState::Ready => {
+                                let record = state
+                                    .blocks
+                                    .get(id)
+                                    .ok_or_else(|| CacheResidencyError::MissingBlock(id.clone()))?;
+                                let bytes = record.bytes;
+                                let reserved_host_bytes = host_cache_layout_capacity_upper_bound(
+                                    &record.shapes,
+                                    &record.dtypes,
+                                )?;
+                                let required_host_bytes = state
+                                    .counters
+                                    .report
+                                    .current_host_bytes
+                                    .saturating_add(reserved_host_bytes);
+                                if required_host_bytes > self.options().host_budget_bytes {
+                                    let candidate = eviction_candidate(
+                                        &state,
+                                        CacheTier::Host,
+                                        Some(id),
+                                        0,
+                                        self.options().eviction_policy,
+                                    );
+                                    drop(state);
+                                    if let Some(candidate) = candidate {
+                                        match self.begin_host_demotion(&candidate)? {
+                                            HostDemotionProgress::Retry
+                                            | HostDemotionProgress::Freed => continue,
+                                            HostDemotionProgress::Pending(ticket) => {
+                                                self.wait_for_host_release(&ticket)?;
+                                                continue;
+                                            }
+                                        }
+                                    }
+                                    return Err(CacheResidencyError::BudgetExceeded {
+                                        tier: CacheTier::Host,
+                                        required: required_host_bytes,
+                                        budget: self.options().host_budget_bytes,
+                                    });
+                                }
+                                let host_admission =
+                                    state.pool.reserve_additional(CachePoolUsage {
+                                        host_bytes: reserved_host_bytes,
+                                        ..CachePoolUsage::default()
+                                    })?;
+                                let transfer_reservation =
+                                    Some(state.pool.reserve_transfer(bytes)?);
+                                let submission = worker.prepare_read(
+                                    generation,
+                                    id,
+                                    &location,
+                                    id.representation,
+                                )?;
+                                let ticket = submission.ticket.clone();
+                                let record = state
+                                    .blocks
+                                    .get_mut(id)
+                                    .ok_or_else(|| CacheResidencyError::MissingBlock(id.clone()))?;
+                                record.physical = CacheBlockPhysicalState::Disk {
+                                    location: location.clone(),
+                                    read: DiskCacheReadState::Reading {
+                                        pending: PendingDiskOperation {
+                                            ticket: ticket.clone(),
+                                        },
+                                        reserved_host_bytes,
+                                    },
+                                };
+                                update_report_totals(&mut state);
+                                drop(host_admission);
+                                (
+                                    ticket,
+                                    Some(submission),
+                                    false,
+                                    transfer_reservation,
+                                    reserved_host_bytes,
+                                )
+                            }
+                        };
                     drop(state);
 
                     let outcome = match submission {
@@ -2757,6 +2903,7 @@ impl CacheResidencyManager {
                             let shapes = block.shapes()?;
                             let dtypes = block.dtypes()?;
                             let bytes = block.bytes()?;
+                            let capacity = block.capacity()?;
                             let record = state
                                 .blocks
                                 .get_mut(id)
@@ -2774,6 +2921,14 @@ impl CacheResidencyManager {
                                         .into(),
                                 });
                             }
+                            if capacity > reserved_host_bytes {
+                                record.physical.clear_pending(&ticket.key);
+                                drop(state);
+                                worker.retire(&ticket);
+                                return Err(CacheResidencyError::Runtime(format!(
+                                    "host cache allocation capacity {capacity} exceeded its pre-admitted bound {reserved_host_bytes}"
+                                )));
+                            }
                             if record.physical.pending_matches(&ticket.key) {
                                 record.physical = CacheBlockPhysicalState::Host {
                                     block,
@@ -2781,6 +2936,7 @@ impl CacheResidencyManager {
                                 };
                             }
                             loaded_from_disk = true;
+                            update_report_totals(&mut state);
                         }
                         Ok(DiskResult::Read(_))
                         | Err(CacheResidencyError::DiskOperationCancelled { .. })
@@ -2823,12 +2979,7 @@ impl CacheResidencyManager {
                             continue;
                         }
                     };
-                    let bytes = state
-                        .blocks
-                        .get(id)
-                        .ok_or_else(|| CacheResidencyError::MissingBlock(id.clone()))?
-                        .bytes;
-                    let transfer_reservation = state.pool.reserve_transfer(bytes)?;
+                    let transfer_reservation = state.pool.reserve_transfer(block.capacity()?)?;
                     let (device_arrays, completions) = block.copy_to_device(transfer_stream)?;
                     if state.generation != generation {
                         return Err(CacheResidencyError::DiskOperationCancelled { generation });
@@ -3034,15 +3185,23 @@ impl CacheResidencyManager {
         let mut first_error = None;
         for ticket in tickets {
             match ticket {
-                PendingCacheOperation::Disk(ticket) => match ticket.wait_for_task_resources() {
-                    Ok(()) => {
+                PendingCacheOperation::Disk(ticket) => {
+                    let result = ticket.wait_for_task_resources();
+                    if result.is_ok() {
                         if let Some(worker) = &self.inner.disk_worker {
                             worker.retire(ticket);
                         }
                     }
-                    Err(error) if first_error.is_none() => first_error = Some(error),
-                    Err(_) => {}
-                },
+                    let mut state = self.lock()?;
+                    state.retiring_disk_reads.remove(&ticket.key);
+                    update_report_totals(&mut state);
+                    drop(state);
+                    if let Err(error) = result {
+                        if first_error.is_none() {
+                            first_error = Some(error);
+                        }
+                    }
+                }
                 PendingCacheOperation::HostDemotion(ticket) => {
                     let result = self.finish_device_demotion(ticket);
                     let mut state = self.lock()?;
@@ -3170,7 +3329,7 @@ impl CacheResidencyManager {
                             record.disk().is_some_and(|location| !location.persistent)
                         })
                     })
-                    .map(|(_, reservation)| reservation.bytes)
+                    .map(|(_, reservation)| reservation.logical_bytes)
                     .sum(),
             );
         let projected = live_disk_bytes.saturating_add(record.bytes);
@@ -3183,15 +3342,16 @@ impl CacheResidencyManager {
                 budget: budget_bytes,
             });
         }
-        let pool_admission = state.pool.reserve_additional(CachePoolUsage {
-            transfer_in_flight_bytes: record.bytes,
-            disk_bytes: record.bytes,
-            ..CachePoolUsage::default()
-        })?;
         let block = record
             .host_block()
             .ok_or_else(|| CacheResidencyError::MissingResidentArrays(id.clone()))?
             .clone();
+        let host_capacity = block.capacity()?;
+        let pool_admission = state.pool.reserve_additional(CachePoolUsage {
+            transfer_in_flight_bytes: host_capacity,
+            disk_bytes: record.bytes,
+            ..CachePoolUsage::default()
+        })?;
         let submission = worker.prepare_write(
             state.generation,
             &directory,
@@ -3207,7 +3367,8 @@ impl CacheResidencyManager {
                 HostWriteReservation {
                     reservation_id,
                     global_layer: id.global_layer,
-                    bytes: record_bytes,
+                    logical_bytes: record_bytes,
+                    host_capacity,
                     ticket: ticket.clone(),
                 },
             );
@@ -3314,11 +3475,12 @@ impl CacheResidencyManager {
                 return Err(CacheResidencyError::MissingResidentArrays(id.clone()));
             }
         };
+        let reserved_host_bytes = host_cache_capacity_upper_bound(&arrays)?;
         let required_host_bytes = state
             .counters
             .report
             .current_host_bytes
-            .saturating_add(record.bytes);
+            .saturating_add(reserved_host_bytes);
         if required_host_bytes > self.options().host_budget_bytes {
             return Err(CacheResidencyError::BudgetExceeded {
                 tier: CacheTier::Host,
@@ -3327,15 +3489,17 @@ impl CacheResidencyManager {
             });
         }
         let pool_admission = state.pool.reserve_additional(CachePoolUsage {
-            host_bytes: record.bytes,
-            transfer_in_flight_bytes: record.bytes,
+            host_bytes: reserved_host_bytes,
+            transfer_in_flight_bytes: reserved_host_bytes,
             ..CachePoolUsage::default()
         })?;
         let device = state.transfer_device.unwrap_or(CacheTransferDevice::CPU);
-        let ticket = self
-            .inner
-            .host_demotion_worker
-            .submit(id, arrays.clone(), device)?;
+        let ticket = self.inner.host_demotion_worker.submit(
+            id,
+            arrays.clone(),
+            device,
+            reserved_host_bytes,
+        )?;
         let record = state.blocks.get_mut(id).expect("demotion block exists");
         record.physical = CacheBlockPhysicalState::Demoting {
             arrays,
@@ -3369,6 +3533,27 @@ impl CacheResidencyManager {
         activity.transfer_wait += elapsed;
         match result {
             Ok(block) => {
+                let capacity = block.capacity()?;
+                if capacity > ticket.reserved_host_bytes {
+                    let record = state
+                        .blocks
+                        .get_mut(&ticket.id)
+                        .expect("demotion block exists");
+                    let CacheBlockPhysicalState::Demoting { arrays, .. } = &record.physical else {
+                        unreachable!("matching host demotion changed while cache state was locked");
+                    };
+                    record.physical = CacheBlockPhysicalState::Device {
+                        arrays: arrays.clone(),
+                        disk: None,
+                    };
+                    state.counters.report.failures += 1;
+                    state.layer_activity_mut(ticket.id.global_layer).failures += 1;
+                    update_report_totals(&mut state);
+                    return Err(CacheResidencyError::Runtime(format!(
+                        "host cache allocation used {capacity} bytes, exceeding reserved upper bound {}",
+                        ticket.reserved_host_bytes
+                    )));
+                }
                 let bytes = state
                     .blocks
                     .get(&ticket.id)
@@ -3497,19 +3682,25 @@ impl CacheResidencyManager {
                     state.layer_activity_mut(id.global_layer).disk_demotions += 1;
                     continue;
                 }
-                let candidate_bytes = state.blocks.get(&id).expect("candidate exists").bytes;
+                let candidate_host_bytes =
+                    match &state.blocks.get(&id).expect("candidate exists").physical {
+                        CacheBlockPhysicalState::Device { arrays, .. } => {
+                            host_cache_capacity_upper_bound(arrays)?
+                        }
+                        _ => return Err(CacheResidencyError::MissingResidentArrays(id.clone())),
+                    };
                 let required_host_bytes = state
                     .counters
                     .report
                     .current_host_bytes
-                    .saturating_add(candidate_bytes);
+                    .saturating_add(candidate_host_bytes);
                 if required_host_bytes > self.options().host_budget_bytes {
-                    if candidate_bytes > self.options().host_budget_bytes {
+                    if candidate_host_bytes > self.options().host_budget_bytes {
                         state.counters.report.failures += 1;
                         state.layer_activity_mut(id.global_layer).failures += 1;
                         return Err(CacheResidencyError::BudgetExceeded {
                             tier: CacheTier::Host,
-                            required: candidate_bytes,
+                            required: candidate_host_bytes,
                             budget: self.options().host_budget_bytes,
                         });
                     }
@@ -5916,13 +6107,15 @@ fn advance_generation_locked(state: &mut CacheManagerState) -> Vec<PendingCacheO
     state.background_disk_error = None;
     let mut tickets = Vec::new();
     let mut demotion_reservations = Vec::new();
+    let mut read_reservations = Vec::new();
     for record in state.blocks.values_mut() {
         if let Some(ticket) = record.host_demotion_ticket().cloned() {
             demotion_reservations.push((
                 ticket.operation_id,
                 RetiringHostDemotion {
                     id: record.id.clone(),
-                    bytes: record.bytes,
+                    device_bytes: record.bytes,
+                    host_bytes: ticket.reserved_host_bytes,
                 },
             ));
             tickets.push(PendingCacheOperation::HostDemotion(ticket));
@@ -5933,11 +6126,26 @@ fn advance_generation_locked(state: &mut CacheManagerState) -> Vec<PendingCacheO
             }
             tickets.push(PendingCacheOperation::Disk(pending.ticket.clone()));
             if pending.ticket.key.kind != DiskOperationKind::Write {
+                if let CacheBlockPhysicalState::Disk {
+                    read:
+                        DiskCacheReadState::Reading {
+                            reserved_host_bytes,
+                            ..
+                        },
+                    ..
+                } = &record.physical
+                {
+                    read_reservations.push((
+                        pending.ticket.key.clone(),
+                        (record.id.global_layer, *reserved_host_bytes),
+                    ));
+                }
                 record.physical.clear_pending(&pending.ticket.key);
             }
         }
     }
     state.retiring_host_demotions.extend(demotion_reservations);
+    state.retiring_disk_reads.extend(read_reservations);
     tickets
 }
 
@@ -5960,7 +6168,7 @@ fn update_report_totals(state: &mut CacheManagerState) {
                         record.disk().is_some_and(|location| !location.persistent)
                     })
                 })
-                .map(|(_, reservation)| reservation.bytes)
+                .map(|(_, reservation)| reservation.logical_bytes)
                 .sum(),
         );
     let report = &mut state.counters.report;
@@ -6013,14 +6221,14 @@ fn update_report_totals(state: &mut CacheManagerState) {
                 .contains_key(&pending.ticket.key)
         });
         if pending_write && !pending_write_is_reserved {
+            let host_capacity = record
+                .host_block()
+                .and_then(|block| block.capacity().ok())
+                .expect("pending cache write retains inspectable host-transfer storage");
             report.in_flight_write_blocks += 1;
-            report.in_flight_write_bytes += record.bytes;
+            report.in_flight_write_bytes += host_capacity;
             layer_report.in_flight_write_blocks += 1;
-            layer_report.in_flight_write_bytes += record.bytes;
-            if record.tier() != CacheTier::Host {
-                report.current_host_bytes += record.bytes;
-                layer_report.current_host_bytes += record.bytes;
-            }
+            layer_report.in_flight_write_bytes += host_capacity;
         }
         match &record.physical {
             CacheBlockPhysicalState::Device { .. } => {
@@ -6029,31 +6237,43 @@ fn update_report_totals(state: &mut CacheManagerState) {
                 layer_report.device_blocks += 1;
                 layer_report.current_device_bytes += record.bytes;
             }
-            CacheBlockPhysicalState::Demoting { .. } => {
+            CacheBlockPhysicalState::Demoting { ticket, .. } => {
+                let host_bytes = ticket.reserved_host_bytes;
                 report.device_blocks += 1;
                 report.host_blocks += 1;
                 report.current_device_bytes += record.bytes;
-                report.current_host_bytes += record.bytes;
+                report.current_host_bytes += host_bytes;
                 report.in_flight_host_demotion_blocks += 1;
-                report.in_flight_host_demotion_bytes += record.bytes;
+                report.in_flight_host_demotion_bytes += host_bytes;
                 layer_report.device_blocks += 1;
                 layer_report.host_blocks += 1;
                 layer_report.current_device_bytes += record.bytes;
-                layer_report.current_host_bytes += record.bytes;
+                layer_report.current_host_bytes += host_bytes;
                 layer_report.in_flight_host_demotion_blocks += 1;
-                layer_report.in_flight_host_demotion_bytes += record.bytes;
+                layer_report.in_flight_host_demotion_bytes += host_bytes;
             }
-            CacheBlockPhysicalState::Host { .. } => {
+            CacheBlockPhysicalState::Host { block, .. } => {
+                let host_bytes = block
+                    .capacity()
+                    .expect("validated host cache block has inspectable capacity");
                 report.host_blocks += 1;
-                report.current_host_bytes += record.bytes;
+                report.current_host_bytes += host_bytes;
                 layer_report.host_blocks += 1;
-                layer_report.current_host_bytes += record.bytes;
+                layer_report.current_host_bytes += host_bytes;
             }
-            CacheBlockPhysicalState::Disk { .. } => {
+            CacheBlockPhysicalState::Disk { read, .. } => {
                 report.disk_blocks += 1;
                 report.current_disk_bytes += record.bytes;
                 layer_report.disk_blocks += 1;
                 layer_report.current_disk_bytes += record.bytes;
+                if let DiskCacheReadState::Reading {
+                    reserved_host_bytes,
+                    ..
+                } = read
+                {
+                    report.current_host_bytes += reserved_host_bytes;
+                    layer_report.current_host_bytes += reserved_host_bytes;
+                }
             }
         }
         if record.protected_prefix {
@@ -6079,24 +6299,24 @@ fn update_report_totals(state: &mut CacheManagerState) {
         }
         report.device_blocks += 1;
         report.host_blocks += 1;
-        report.current_device_bytes += reservation.bytes;
-        report.current_host_bytes += reservation.bytes;
+        report.current_device_bytes += reservation.device_bytes;
+        report.current_host_bytes += reservation.host_bytes;
         report.in_flight_host_demotion_blocks += 1;
-        report.in_flight_host_demotion_bytes += reservation.bytes;
+        report.in_flight_host_demotion_bytes += reservation.host_bytes;
         let layer_report = per_layer.entry(reservation.id.global_layer).or_default();
         layer_report.device_blocks += 1;
         layer_report.host_blocks += 1;
-        layer_report.current_device_bytes += reservation.bytes;
-        layer_report.current_host_bytes += reservation.bytes;
+        layer_report.current_device_bytes += reservation.device_bytes;
+        layer_report.current_host_bytes += reservation.host_bytes;
         layer_report.in_flight_host_demotion_blocks += 1;
-        layer_report.in_flight_host_demotion_bytes += reservation.bytes;
+        layer_report.in_flight_host_demotion_bytes += reservation.host_bytes;
     }
     for (key, reservation) in &state.host_write_reservations {
         report.in_flight_write_blocks += 1;
-        report.in_flight_write_bytes += reservation.bytes;
+        report.in_flight_write_bytes += reservation.host_capacity;
         let layer_report = per_layer.entry(reservation.global_layer).or_default();
         layer_report.in_flight_write_blocks += 1;
-        layer_report.in_flight_write_bytes += reservation.bytes;
+        layer_report.in_flight_write_bytes += reservation.host_capacity;
         let covered_by_host_record = state.blocks.get(&key.id).is_some_and(|record| {
             record.tier() == CacheTier::Host
                 && record
@@ -6104,8 +6324,26 @@ fn update_report_totals(state: &mut CacheManagerState) {
                     .is_some_and(|pending| pending.ticket.key == *key)
         });
         if !covered_by_host_record {
-            report.current_host_bytes += reservation.bytes;
-            layer_report.current_host_bytes += reservation.bytes;
+            report.current_host_bytes += reservation.host_capacity;
+            layer_report.current_host_bytes += reservation.host_capacity;
+        }
+    }
+    for (key, (global_layer, reserved_host_bytes)) in &state.retiring_disk_reads {
+        let covered_by_pending_record = state.blocks.get(&key.id).is_some_and(|record| {
+            matches!(
+                &record.physical,
+                CacheBlockPhysicalState::Disk {
+                    read: DiskCacheReadState::Reading { pending, .. },
+                    ..
+                } if pending.ticket.key == *key
+            )
+        });
+        if !covered_by_pending_record {
+            report.current_host_bytes += reserved_host_bytes;
+            per_layer
+                .entry(*global_layer)
+                .or_default()
+                .current_host_bytes += reserved_host_bytes;
         }
     }
     let mut device_starts = HashMap::<usize, Vec<i64>>::new();
@@ -7087,7 +7325,7 @@ pub enum CacheResidencyError {
     BudgetExceeded {
         /// Tier that could not admit required state.
         tier: CacheTier,
-        /// Logical bytes required by the operation.
+        /// Bytes required by the operation (physical capacity for the host tier).
         required: u64,
         /// Configured finite tier budget.
         budget: u64,
@@ -7109,7 +7347,7 @@ pub enum CacheResidencyError {
         "host cache requires {required} bytes but budget is {budget}; enable live disk backing or use a larger finite budget"
     )]
     LiveDiskRequired {
-        /// Logical host bytes required by retained history.
+        /// Physical host allocation capacity required by retained history.
         required: u64,
         /// Configured finite host budget.
         budget: u64,
@@ -7180,7 +7418,8 @@ pub enum CacheResidencyError {
 #[cfg(test)]
 mod tests {
     use super::{
-        durable_rename, hash_shard_payload, hash_token_ids, inspect_prompt_cache, live_block_paths,
+        cpu_stream, durable_rename, hash_shard_payload, hash_token_ids,
+        host_cache_capacity_upper_bound, inspect_prompt_cache, live_block_paths,
         map_prompt_cache_shard, open_prompt_cache, publish_live_block_file,
         publish_prompt_cache_generation, safe_shard_path, validate_prompt_cache_model_identity,
         verify_disk_payload, AttentionPolicy, CacheBlockArrays, CacheBlockId,
@@ -8621,7 +8860,8 @@ mod tests {
                 HostWriteReservation {
                     reservation_id: 7,
                     global_layer: id.global_layer,
-                    bytes: 16,
+                    logical_bytes: 16,
+                    host_capacity: 8,
                     ticket: ticket.clone(),
                 },
             );
@@ -8648,12 +8888,12 @@ mod tests {
         }
 
         let report = manager.report().unwrap();
-        assert_eq!(report.current_host_bytes, 16);
-        assert_eq!(report.in_flight_write_bytes, 16);
+        assert_eq!(report.current_host_bytes, 8);
+        assert_eq!(report.in_flight_write_bytes, 8);
         assert_eq!(report.host_blocks, 1);
         let aggregate = pool.report().unwrap();
-        assert_eq!(aggregate.current_host_bytes, 16);
-        assert_eq!(aggregate.current_transfer_in_flight_bytes, 16);
+        assert_eq!(aggregate.current_host_bytes, 8);
+        assert_eq!(aggregate.current_transfer_in_flight_bytes, 8);
         assert_eq!(aggregate.current_disk_bytes, 16);
 
         // A pending host write is encoded only by the Host variant. Promotion
@@ -8683,11 +8923,11 @@ mod tests {
         let report = manager.report().unwrap();
         assert_eq!(report.cancellations, 1);
         assert_eq!(report.host_blocks, 0);
-        assert_eq!(report.current_host_bytes, 16);
-        assert_eq!(report.in_flight_write_bytes, 16);
+        assert_eq!(report.current_host_bytes, 8);
+        assert_eq!(report.in_flight_write_bytes, 8);
         let aggregate = pool.report().unwrap();
-        assert_eq!(aggregate.current_host_bytes, 16);
-        assert_eq!(aggregate.current_transfer_in_flight_bytes, 16);
+        assert_eq!(aggregate.current_host_bytes, 8);
+        assert_eq!(aggregate.current_transfer_in_flight_bytes, 8);
         assert_eq!(aggregate.current_disk_bytes, 16);
         release_tx.send(()).unwrap();
         cleared_rx
@@ -9468,6 +9708,7 @@ mod tests {
         let ticket = HostDemotionTicket {
             operation_id: 71,
             id: id.clone(),
+            reserved_host_bytes: 8,
             completion,
         };
         manager.lock().unwrap().blocks.insert(
@@ -9513,6 +9754,7 @@ mod tests {
         let ticket = HostDemotionTicket {
             operation_id: 72,
             id: id.clone(),
+            reserved_host_bytes: 8,
             completion: Arc::clone(&completion),
         };
         manager.lock().unwrap().blocks.insert(
@@ -9618,6 +9860,36 @@ mod tests {
     }
 
     #[test]
+    fn cache_pool_charges_physical_host_allocation_capacity() {
+        let stream = cpu_stream();
+        let arrays = CacheBlockArrays::KeyValue {
+            keys: Array::zeros::<f32>(&[1, 1, 1, 5000], &stream).unwrap(),
+            values: Array::zeros::<f32>(&[1, 1, 1, 5000], &stream).unwrap(),
+        };
+        let logical = arrays.bytes();
+        let capacity = host_cache_capacity_upper_bound(&arrays).unwrap();
+        let manager =
+            CacheResidencyManager::new(PagedCacheOptions::new(1, logical, capacity, 1).unwrap())
+                .unwrap();
+        manager.bind_transfer_device(&stream).unwrap();
+        let id = manager.seal_block(0, 0, 1, None, arrays, false).unwrap();
+        let ticket = manager.begin_device_demotion(&id).unwrap();
+        manager.finish_device_demotion(&ticket).unwrap();
+
+        let report = manager.report().unwrap();
+        assert_eq!(report.current_host_bytes, capacity);
+        assert_eq!(report.peak_host_bytes, capacity);
+        assert_eq!(
+            manager.pool().report().unwrap().current_host_bytes,
+            capacity
+        );
+        let state = manager.lock().unwrap();
+        let block = state.blocks.get(&id).unwrap().host_block().unwrap();
+        assert_eq!(block.bytes().unwrap(), logical);
+        assert_eq!(block.capacity().unwrap(), capacity);
+    }
+
+    #[test]
     #[ignore = "requires MLX runtime execution"]
     fn clear_waits_for_asynchronous_host_demotion_resources() {
         let stream = Stream::new_with_device(&Device::new(DeviceType::Gpu, 0));
@@ -9644,12 +9916,12 @@ mod tests {
     fn host_demotion_uses_typed_buffers_and_promotion_rebuilds_device_arrays() {
         let stream = Stream::new_with_device(&Device::new(DeviceType::Gpu, 0));
         // Two 16-byte blocks fit on the device. A third block forces the oldest
-        // one to a distinct CPU allocation while retaining one recent block.
+        // one into backend-selected host-transfer storage while retaining one
+        // recent block.
         let options = PagedCacheOptions::new(2, 32, 16, 1).unwrap();
         let manager = CacheResidencyManager::new(options).unwrap();
         manager.bind_transfer_device(&stream).unwrap();
         let first_arrays = execution_key_value_block(&stream);
-        let first_device_pointers = f32_storage_pointers(&first_arrays);
         let first = manager
             .seal_block(0, 0, 2, None, first_arrays, false)
             .unwrap();
@@ -9660,18 +9932,15 @@ mod tests {
             .seal_block(0, 4, 6, None, execution_key_value_block(&stream), false)
             .unwrap();
 
-        let first_host_pointers = {
+        let first_host_capacity = {
             let state = manager.lock().unwrap();
             let record = state.blocks.get(&first).unwrap();
             assert_eq!(record.tier(), CacheTier::Host);
             let block = record.host_block().unwrap();
             let [first, second] = block.buffers();
-            [
-                first.as_bytes().unwrap().as_ptr() as usize,
-                second.as_bytes().unwrap().as_ptr() as usize,
-            ]
+            first.capacity().unwrap() + second.capacity().unwrap()
         };
-        assert_ne!(first_host_pointers, first_device_pointers);
+        assert!(first_host_capacity >= 16);
         let report = manager.report().unwrap();
         assert_eq!(report.device_blocks, 2);
         assert_eq!(report.host_blocks, 1);
@@ -9680,7 +9949,10 @@ mod tests {
 
         let lease = manager.lease_block(&first, &stream).unwrap();
         let promoted_pointers = f32_storage_pointers(lease.arrays());
-        assert_ne!(promoted_pointers, first_host_pointers);
+        // A demoted allocation may reuse the virtual address of its released
+        // source on unified-memory systems, so pointer inequality is not a
+        // storage-identity invariant. The typed buffer capacity is verified
+        // above; promotion is verified by values and the live device record.
         match lease.arrays() {
             CacheBlockArrays::KeyValue { keys, values } => {
                 assert_eq!(keys.evaluated().unwrap().as_slice::<f32>(), &[0.0, 0.0]);

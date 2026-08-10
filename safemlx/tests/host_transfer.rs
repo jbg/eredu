@@ -1,7 +1,8 @@
 use safemlx::{
-    memory, transforms::async_eval_with_event, Array, Device, DeviceType, Dtype, EventBackend,
-    HostTransferBuffer, HostTransferPolicy, HostTransferStorageKind, ImmutableHostTransferBuffer,
-    Stream,
+    host_transfer_capacity_upper_bound, host_transfer_memory_stats, memory,
+    reset_host_transfer_peak_memory, transforms::async_eval_with_event, Array, Device, DeviceType,
+    Dtype, EventBackend, HostTransferBuffer, HostTransferPolicy, HostTransferStorageKind,
+    ImmutableHostTransferBuffer, Stream,
 };
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
@@ -33,7 +34,9 @@ fn host_transfer_round_trip_preserves_metadata_and_values() {
     assert_eq!(host.policy().unwrap(), HostTransferPolicy::Transfer);
     assert!(matches!(
         host.storage_kind().unwrap(),
-        HostTransferStorageKind::Cpu | HostTransferStorageKind::MetalShared
+        HostTransferStorageKind::Cpu
+            | HostTransferStorageKind::MetalShared
+            | HostTransferStorageKind::CudaPinned
     ));
 
     let values = host
@@ -66,6 +69,38 @@ fn uninitialized_transfer_buffer_is_typed_and_mutable() {
     assert_eq!(buffer.shape().unwrap(), vec![2]);
     assert_eq!(buffer.dtype().unwrap(), Dtype::Uint32);
     assert!(!buffer.is_empty().unwrap());
+}
+
+#[test]
+fn physical_capacity_bound_and_native_high_water_track_allocation_lifetime() {
+    let _guard = runtime_test_guard();
+    let probe =
+        HostTransferBuffer::new(&[1], Dtype::Float32, HostTransferPolicy::Transfer).unwrap();
+    let kind = probe.storage_kind().unwrap();
+    drop(probe);
+
+    reset_host_transfer_peak_memory(kind).unwrap();
+    let baseline = host_transfer_memory_stats(kind).unwrap();
+    let buffer =
+        HostTransferBuffer::new(&[5000], Dtype::Float32, HostTransferPolicy::Transfer).unwrap();
+    let capacity = buffer.capacity().unwrap();
+    assert_eq!(
+        host_transfer_capacity_upper_bound(buffer.nbytes().unwrap(), HostTransferPolicy::Transfer)
+            .unwrap(),
+        capacity
+    );
+    let live = host_transfer_memory_stats(kind).unwrap();
+    assert_eq!(live.active_bytes, baseline.active_bytes + capacity);
+    assert_eq!(live.active_allocations, baseline.active_allocations + 1);
+    assert!(live.peak_bytes >= live.active_bytes);
+    assert!(live.peak_allocations >= live.active_allocations);
+    drop(buffer);
+
+    let released = host_transfer_memory_stats(kind).unwrap();
+    assert_eq!(released.active_bytes, baseline.active_bytes);
+    assert_eq!(released.active_allocations, baseline.active_allocations);
+    assert!(released.peak_bytes >= baseline.active_bytes + capacity);
+    assert!(released.peak_allocations > baseline.active_allocations);
 }
 
 #[test]
@@ -331,4 +366,10 @@ fn cuda_managed_and_transfer_policies_have_distinct_storage_identity() {
         managed.storage_kind().unwrap(),
         HostTransferStorageKind::CudaManaged
     );
+    let pinned = host_transfer_memory_stats(HostTransferStorageKind::CudaPinned).unwrap();
+    assert!(pinned.active_bytes >= transfer.capacity().unwrap());
+    assert!(pinned.peak_bytes >= pinned.active_bytes);
+    let managed_stats = host_transfer_memory_stats(HostTransferStorageKind::CudaManaged).unwrap();
+    assert!(managed_stats.active_bytes >= managed.capacity().unwrap());
+    assert!(managed_stats.peak_bytes >= managed_stats.active_bytes);
 }

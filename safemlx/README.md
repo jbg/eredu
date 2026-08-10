@@ -98,6 +98,11 @@ separate from ordinary MLX arrays. `HostTransferPolicy::Transfer` selects
 ordinary CPU storage, Metal shared storage, or CUDA page-locked host storage;
 `HostTransferPolicy::Managed` is a distinct CUDA-only policy and fails on other
 backends. The physical selection is available through `storage_kind()`.
+`host_transfer_capacity_upper_bound()` supports admission before allocation,
+while `host_transfer_memory_stats()` and `reset_host_transfer_peak_memory()`
+report process-wide active and peak physical bytes/allocation counts per
+storage kind. These counters include CUDA pinned allocations even though MLX's
+device allocator does not.
 
 Transfers return pending values which retain their storage and completion
 event. Array-to-host bytes are unavailable until `synchronize()` succeeds.
@@ -126,13 +131,15 @@ let (restored, host) = host.copy_to_array(&stream)?.synchronize()?;
 
 Backend verification lives in `tests/host_transfer.rs`. CPU-only tests assert
 exact `Cpu` storage, numerical round-trip parity, and allocator high-water
-bounds. Explicit Metal tests assert `MetalShared` storage, Metal completion
+bounds. Explicit Metal tests assert `MetalShared` storage, native physical
+high-water accounting, Metal completion
 events, cross-stream ordering, and that device-to-host or host-to-device copies
 do not add another payload-sized MLX staging allocation. CUDA-gated tests make
 the corresponding assertions for `CudaPinned` storage and separately verify
-that the managed policy reports `CudaManaged`; pinned host bytes are outside
-the MLX device allocator counter, so any payload-sized device-counter increase
-during device-to-host copying is treated as hidden staging.
+that the managed policy reports `CudaManaged`. They measure pinned/managed
+physical high water through the host-transfer counter; any payload-sized MLX
+device-counter increase during device-to-host copying is independently treated
+as hidden staging.
 
 ```sh
 cargo test -p safemlx --no-default-features --test host_transfer

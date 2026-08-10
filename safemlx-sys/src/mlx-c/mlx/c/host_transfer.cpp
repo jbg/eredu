@@ -43,7 +43,72 @@ mlx_host_transfer_storage_kind storage_kind_from_cpp(
   throw std::invalid_argument("Unknown HostTransferStorageKind value.");
 }
 
+mlx::core::HostTransferStorageKind storage_kind_to_cpp(
+    mlx_host_transfer_storage_kind kind) {
+  switch (kind) {
+    case MLX_HOST_TRANSFER_STORAGE_CPU:
+      return mlx::core::HostTransferStorageKind::cpu;
+    case MLX_HOST_TRANSFER_STORAGE_METAL_SHARED:
+      return mlx::core::HostTransferStorageKind::metal_shared;
+    case MLX_HOST_TRANSFER_STORAGE_CUDA_PINNED:
+      return mlx::core::HostTransferStorageKind::cuda_pinned;
+    case MLX_HOST_TRANSFER_STORAGE_CUDA_MANAGED:
+      return mlx::core::HostTransferStorageKind::cuda_managed;
+  }
+  throw std::invalid_argument("Unknown mlx_host_transfer_storage_kind value.");
+}
+
 } // namespace
+
+extern "C" int mlx_host_transfer_memory_stats_get(
+    mlx_host_transfer_memory_stats* stats,
+    mlx_host_transfer_storage_kind kind) {
+  try {
+    if (!stats) {
+      throw std::invalid_argument("Host transfer stats output must be non-null.");
+    }
+    const auto cpp_stats =
+        mlx::core::host_transfer_memory_stats(storage_kind_to_cpp(kind));
+    *stats = {
+        cpp_stats.active_bytes,
+        cpp_stats.peak_bytes,
+        cpp_stats.active_allocations,
+        cpp_stats.peak_allocations};
+    return 0;
+  } catch (std::exception& e) {
+    mlx_error(e.what());
+    return 1;
+  }
+}
+
+extern "C" int mlx_host_transfer_memory_stats_reset_peak(
+    mlx_host_transfer_storage_kind kind) {
+  try {
+    mlx::core::reset_host_transfer_peak_memory(storage_kind_to_cpp(kind));
+    return 0;
+  } catch (std::exception& e) {
+    mlx_error(e.what());
+    return 1;
+  }
+}
+
+extern "C" int mlx_host_transfer_capacity_upper_bound(
+    size_t* capacity,
+    size_t nbytes,
+    mlx_host_transfer_policy policy) {
+  try {
+    if (!capacity) {
+      throw std::invalid_argument(
+          "Host transfer capacity output must be non-null.");
+    }
+    *capacity = mlx::core::host_transfer_capacity_upper_bound(
+        nbytes, policy_to_cpp(policy));
+    return 0;
+  } catch (std::exception& e) {
+    mlx_error(e.what());
+    return 1;
+  }
+}
 
 extern "C" int mlx_host_transfer_buffer_new(
     mlx_host_transfer_buffer* buffer,

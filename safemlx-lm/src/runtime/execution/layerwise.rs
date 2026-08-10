@@ -933,7 +933,7 @@ impl DenseStreamController {
         let host_bytes = group_units
             .iter()
             .filter(|unit| unit.host_resident())
-            .map(|unit| unit.expected_bytes())
+            .map(|unit| unit.host_allocated_bytes())
             .sum();
         let device_layers = group_units
             .iter()
@@ -942,7 +942,7 @@ impl DenseStreamController {
         let device_bytes = group_units
             .iter()
             .filter(|unit| unit.device_resident())
-            .map(|unit| unit.expected_bytes())
+            .map(|unit| unit.device_allocated_bytes())
             .sum();
         let mut activity = self.group_activity.lock().map_err(|_| {
             crate::runtime::residency::dense_stream::DenseStreamError::StatePoisoned
@@ -972,7 +972,7 @@ impl DenseStreamController {
         let host_bytes = streamed_units
             .iter()
             .filter(|unit| unit.host_resident())
-            .map(|unit| unit.expected_bytes())
+            .map(|unit| unit.host_allocated_bytes())
             .sum();
         let device_layers = streamed_units
             .iter()
@@ -981,7 +981,7 @@ impl DenseStreamController {
         let device_bytes = streamed_units
             .iter()
             .filter(|unit| unit.device_resident())
-            .map(|unit| unit.expected_bytes())
+            .map(|unit| unit.device_allocated_bytes())
             .sum();
         let mut pass = self.pass.lock().map_err(|_| {
             crate::runtime::residency::dense_stream::DenseStreamError::StatePoisoned
@@ -1123,7 +1123,7 @@ impl DenseStreamController {
             .units()
             .iter()
             .filter(|unit| unit.policy() == ResidencyPolicy::Pinned && unit.device_resident())
-            .map(|unit| unit.expected_bytes())
+            .map(|unit| unit.device_allocated_bytes())
             .sum::<u64>();
         let pinned_device_count = residency
             .units()
@@ -1153,7 +1153,14 @@ impl DenseStreamController {
                     .peak_resident_units()
                     .get(tier)
                     .saturating_sub(pinned_count),
-                current_layer_bytes: current.iter().map(|unit| unit.expected_bytes()).sum(),
+                current_layer_bytes: current
+                    .iter()
+                    .map(|unit| match tier {
+                        MemoryTier::Host => unit.host_allocated_bytes(),
+                        MemoryTier::Device => unit.device_allocated_bytes(),
+                        MemoryTier::Disk => 0,
+                    })
+                    .sum(),
                 peak_layer_bytes: residency
                     .offload()
                     .peak_resident_bytes()
@@ -1187,7 +1194,7 @@ impl DenseStreamController {
                     host_bytes: group_units
                         .iter()
                         .filter(|unit| unit.host_resident())
-                        .map(|unit| unit.expected_bytes())
+                        .map(|unit| unit.host_allocated_bytes())
                         .sum(),
                     peak_host_layers: observed.peak_host_layers,
                     peak_host_bytes: observed.peak_host_bytes,
@@ -1198,7 +1205,7 @@ impl DenseStreamController {
                     device_bytes: group_units
                         .iter()
                         .filter(|unit| unit.device_resident())
-                        .map(|unit| unit.expected_bytes())
+                        .map(|unit| unit.device_allocated_bytes())
                         .sum(),
                     peak_device_layers: observed.peak_device_layers,
                     peak_device_bytes: observed.peak_device_bytes,

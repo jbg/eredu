@@ -126,7 +126,7 @@ impl OffloadConfig {
         self.device_budget_bytes
     }
 
-    /// Returns the finite host-tier budget, if configured.
+    /// Returns the finite physical host-allocation budget, if configured.
     pub const fn host_budget_bytes(self) -> Option<u64> {
         self.host_budget_bytes
     }

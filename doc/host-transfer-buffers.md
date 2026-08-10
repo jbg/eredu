@@ -20,6 +20,24 @@ Metal reject it rather than silently mapping it to a different allocation. A
 buffer reports its actual `HostTransferStorageKind`, shape, dtype, logical byte
 length, and allocation capacity.
 
+Transfer storage has a dedicated allocation path instead of borrowing a
+possibly larger entry from MLX's ordinary buffer cache. CPU capacity is the
+requested payload size, CUDA pinned/managed capacity is the requested size,
+and Metal capacity is the page-rounded shared-buffer length. The backend
+publishes that exact pre-allocation upper bound, so a residency manager can
+reserve capacity before allocating and replace the reservation with the
+buffer's reported capacity without a transient overcommit.
+
+`host_transfer_memory_stats` reports process-wide active and peak physical
+bytes and allocation counts independently for CPU, Metal shared, CUDA pinned,
+and CUDA managed storage. Resetting a peak is race-safe with concurrent
+allocation. This includes every allocation owned by this primitive, including
+CUDA memory returned by `cudaMallocHost`, even though pinned bytes are outside
+MLX's device allocator counters. It intentionally does not claim visibility
+into opaque memory owned internally by a platform driver; the direct
+`cudaMemcpyAsync` path has no MLX-owned payload staging allocation, and backend
+tests check the device allocator independently for accidental staging.
+
 CUDA copies use `cudaMemcpyAsync` on the MLX command encoder. When CUDA graphs
 are enabled, the encoder records a dependency-tracked memcpy node. Metal uses
 its existing GPU copy path into a distinct shared allocation. CPU copies are
@@ -61,8 +79,10 @@ typed host bytes directly, and promotion creates device arrays only on demand.
 Device demotion is a fourth, explicitly transitional variant: a dedicated
 worker creates a task-local stream on the cache's bound execution device and
 retains the device arrays and pending typed destinations through both completion
-events. Residency accounting charges those bytes to device and host budgets
-simultaneously until immutable host ownership is published.
+events. Residency accounting charges logical device bytes and the destination's
+physical host capacity simultaneously until immutable host ownership is
+published. Disk reads reserve their host capacity before the worker allocates
+and retain that charge through cancellation and resource retirement.
 
 Immutable weight residency and independent expert caching use the same typed
 host-transfer storage for every host-planned parameter binding. Host leases

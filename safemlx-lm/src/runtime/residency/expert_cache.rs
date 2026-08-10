@@ -443,11 +443,11 @@ pub struct ExpertCacheReport {
     pub host_resident_experts: usize,
     /// Current device-resident expert count.
     pub device_resident_experts: usize,
-    /// Current host-resident expert bytes.
+    /// Current physical capacity of host-resident expert allocations.
     pub host_resident_bytes: u64,
     /// Current device-resident expert bytes.
     pub device_resident_bytes: u64,
-    /// Peak host-resident expert bytes.
+    /// Peak physical capacity of host-resident expert allocations.
     pub peak_host_resident_bytes: u64,
     /// Peak device-resident expert bytes.
     pub peak_device_resident_bytes: u64,
@@ -1112,11 +1112,13 @@ impl ExpertCache {
         for unit in residency.units() {
             if unit.host_resident() {
                 host_resident_experts += 1;
-                host_resident_bytes = host_resident_bytes.saturating_add(unit.expected_bytes());
+                host_resident_bytes =
+                    host_resident_bytes.saturating_add(unit.host_allocated_bytes());
             }
             if unit.device_resident() {
                 device_resident_experts += 1;
-                device_resident_bytes = device_resident_bytes.saturating_add(unit.expected_bytes());
+                device_resident_bytes =
+                    device_resident_bytes.saturating_add(unit.device_allocated_bytes());
             }
         }
         let statistics = self
@@ -1153,13 +1155,13 @@ impl ExpertCache {
                 .units()
                 .iter()
                 .filter(|unit| unit.host_resident())
-                .map(|unit| (unit.id().clone(), unit.expected_bytes()))
+                .map(|unit| (unit.id().clone(), unit.host_allocated_bytes()))
                 .collect(),
             device: report
                 .units()
                 .iter()
                 .filter(|unit| unit.device_resident())
-                .map(|unit| (unit.id().clone(), unit.expected_bytes()))
+                .map(|unit| (unit.id().clone(), unit.device_allocated_bytes()))
                 .collect(),
         })
     }

@@ -178,8 +178,9 @@ throughput improvement.
 Dense disk streaming is mainly appropriate for capacity-first experiments,
 large prefill or offline batches, quantized checkpoints, fast local storage,
 and workloads that benefit from OS page-cache retention. On Apple silicon, CPU
-and GPU arrays share physical unified memory, so logical host/device tiers do
-not create additional physical capacity. Pinned embeddings, final norms and
+and GPU arrays share physical unified memory, so host/device tiers do not
+create additional physical capacity even though host reports charge exact
+typed-buffer capacity. Pinned embeddings, final norms and
 output projections, activations, KV or recurrent state, kernels, allocator
 caches, and temporary compact expert banks are outside streamed-layer totals.
 Exact physical disk I/O is not observable from mmap telemetry: logical misses,
@@ -261,10 +262,14 @@ dropped after the output and updated cache have been evaluated and the stream
 has synchronized. Packed weights, scales, and biases move unchanged; they are
 not dequantized or repacked.
 
-Host budgets must contain all decoder weights. Device budgets must contain
-pinned static weights plus the largest permitted consecutive layer window.
-Residency reports account for parameter copies only; activations, KV state,
-kernels, and allocator cache can make MLX peak memory larger.
+Host budgets must contain the physical allocation capacity of all decoder
+weights. Admission reserves the backend's exact capacity bound before
+materialization and reports exact typed-buffer capacity after allocation;
+logical checkpoint payload bytes remain separately available as
+`expected_bytes`. Device budgets must contain pinned static weights plus the
+largest permitted consecutive layer window. Residency reports account for
+parameter copies only; activations, KV state, kernels, and allocator cache can
+make MLX peak memory larger.
 
 Checkpoint materialization and promotion use exact MLX completion events;
 ordinary layerwise execution keeps its bounded two-layer transfer window.
@@ -733,10 +738,11 @@ cache, driver allocations, and unrelated application memory. Applications
 should retain a safety reserve for those backend and process effects; the MLX
 active/cache counters are observational signals, not a request-memory total.
 
-`static_memory()` keeps logical checkpoint/residency accounting separate from
-the process-global MLX active and allocator-cache counters. On Apple silicon,
-host and device residency are logical tiers over one unified physical
-capacity. `available_memory()` uses `hw.memsize` and
+`static_memory()` keeps checkpoint/residency accounting separate from the
+process-global MLX active and allocator-cache counters. Host-resident parameter
+and cache reports charge typed host-transfer buffer capacity; device and disk
+payload figures remain logical. On Apple silicon, the host and device tiers use
+one unified physical capacity. `available_memory()` uses `hw.memsize` and
 `os_proc_available_memory` on macOS, and `MemTotal`/`MemAvailable` on Linux;
 Windows uses `GlobalMemoryStatusEx`. Unsupported values are reported as
 `Unavailable`, never zero. SafeMLX does not currently expose a trustworthy

@@ -38,6 +38,29 @@ typedef enum mlx_host_transfer_storage_kind_ {
   MLX_HOST_TRANSFER_STORAGE_CUDA_MANAGED,
 } mlx_host_transfer_storage_kind;
 
+/** Process-wide physical allocation telemetry for one storage kind. */
+typedef struct mlx_host_transfer_memory_stats_ {
+  size_t active_bytes;
+  size_t peak_bytes;
+  size_t active_allocations;
+  size_t peak_allocations;
+} mlx_host_transfer_memory_stats;
+
+/** Read current and peak physical host-transfer allocation telemetry. */
+int mlx_host_transfer_memory_stats_get(
+    mlx_host_transfer_memory_stats* stats,
+    mlx_host_transfer_storage_kind kind);
+
+/** Reset one storage kind's peaks to its current occupancy. */
+int mlx_host_transfer_memory_stats_reset_peak(
+    mlx_host_transfer_storage_kind kind);
+
+/** Return a conservative capacity bound for pre-allocation admission. */
+int mlx_host_transfer_capacity_upper_bound(
+    size_t* capacity,
+    size_t nbytes,
+    mlx_host_transfer_policy policy);
+
 /** Allocate an uninitialized typed host transfer buffer. */
 int mlx_host_transfer_buffer_new(
     mlx_host_transfer_buffer* buffer,

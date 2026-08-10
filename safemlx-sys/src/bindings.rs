@@ -1661,6 +1661,38 @@ pub const mlx_host_transfer_storage_kind__MLX_HOST_TRANSFER_STORAGE_CUDA_MANAGED
 pub type mlx_host_transfer_storage_kind_ = ::std::os::raw::c_uint;
 #[doc = " Physical storage selected by the active MLX backend."]
 pub use self::mlx_host_transfer_storage_kind_ as mlx_host_transfer_storage_kind;
+#[doc = " Process-wide physical allocation telemetry for one storage kind."]
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct mlx_host_transfer_memory_stats_ {
+    pub active_bytes: usize,
+    pub peak_bytes: usize,
+    pub active_allocations: usize,
+    pub peak_allocations: usize,
+}
+#[doc = " Process-wide physical allocation telemetry for one storage kind."]
+pub type mlx_host_transfer_memory_stats = mlx_host_transfer_memory_stats_;
+extern "C" {
+    #[doc = " Read current and peak physical host-transfer allocation telemetry."]
+    pub fn mlx_host_transfer_memory_stats_get(
+        stats: *mut mlx_host_transfer_memory_stats,
+        kind: mlx_host_transfer_storage_kind,
+    ) -> ::std::os::raw::c_int;
+}
+extern "C" {
+    #[doc = " Reset one storage kind's peaks to its current occupancy."]
+    pub fn mlx_host_transfer_memory_stats_reset_peak(
+        kind: mlx_host_transfer_storage_kind,
+    ) -> ::std::os::raw::c_int;
+}
+extern "C" {
+    #[doc = " Return a conservative capacity bound for pre-allocation admission."]
+    pub fn mlx_host_transfer_capacity_upper_bound(
+        capacity: *mut usize,
+        nbytes: usize,
+        policy: mlx_host_transfer_policy,
+    ) -> ::std::os::raw::c_int;
+}
 extern "C" {
     #[doc = " Allocate an uninitialized typed host transfer buffer."]
     pub fn mlx_host_transfer_buffer_new(

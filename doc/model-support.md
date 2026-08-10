@@ -834,8 +834,10 @@ Important boundaries:
   route metadata remains an inherently synchronous decision boundary, but its
   readback waits only for the arrays that produce that metadata rather than
   draining an entire stream.
-- On Apple silicon, reported host and device residency are logical tiers over
-  the same physical unified memory. They do not create additional capacity.
+- On Apple silicon, host and device residency use the same physical unified
+  memory and do not create additional capacity. Host residency budgets/reports
+  charge typed-buffer allocation capacity; device and disk payload figures are
+  logical.
 - Parameter budgets do not include activations, KV or recurrent state, kernels,
   allocator caches, checkpoint mappings, or every temporary buffer.
 - Kimi KDA and Qwen linear-attention state are persisted as fixed-state tensors,

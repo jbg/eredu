@@ -34,7 +34,10 @@ nodes. CUDA managed memory is a separately named policy rather than an implicit
 fallback. Metal promotions use the contiguous vector-copy primitive because a
 typed host-transfer buffer preserves the source's contiguous logical layout.
 Shape, dtype, capacity, policy, physical storage identity, ownership, and
-completion lifetime pass through MLX-C and the checked-in Rust bindings.
+completion lifetime pass through MLX-C and the checked-in Rust bindings. The
+patch also exposes an exact backend allocation-capacity bound and process-wide
+active/peak physical byte and allocation counters for each host-transfer
+storage kind, including CUDA pinned storage outside the device allocator.
 
 The MLX-C headers expose opaque `mlx_event` ownership, async evaluation with an
 event, stream wait, host synchronize, query, and identity accessors. The

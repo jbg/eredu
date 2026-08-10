@@ -1,7 +1,7 @@
 use std::ffi::c_void;
 
 use crate::{
-    error::Result,
+    error::{self, Result},
     utils::{guard::Guarded, runtime_lock, SUCCESS},
     Array, Dtype, Event, Stream,
 };
@@ -45,6 +45,94 @@ pub enum HostTransferStorageKind {
     CudaPinned,
     /// CUDA managed storage selected through [`HostTransferPolicy::Managed`].
     CudaManaged,
+}
+
+impl HostTransferStorageKind {
+    fn as_raw(self) -> safemlx_sys::mlx_host_transfer_storage_kind {
+        match self {
+            Self::Cpu => safemlx_sys::mlx_host_transfer_storage_kind__MLX_HOST_TRANSFER_STORAGE_CPU,
+            Self::MetalShared => {
+                safemlx_sys::mlx_host_transfer_storage_kind__MLX_HOST_TRANSFER_STORAGE_METAL_SHARED
+            }
+            Self::CudaPinned => {
+                safemlx_sys::mlx_host_transfer_storage_kind__MLX_HOST_TRANSFER_STORAGE_CUDA_PINNED
+            }
+            Self::CudaManaged => {
+                safemlx_sys::mlx_host_transfer_storage_kind__MLX_HOST_TRANSFER_STORAGE_CUDA_MANAGED
+            }
+        }
+    }
+}
+
+/// Process-wide physical allocations owned by host-transfer buffers of one kind.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct HostTransferMemoryStats {
+    /// Bytes currently owned by live buffers and submitted operations.
+    pub active_bytes: usize,
+    /// Maximum active bytes observed since the last reset.
+    pub peak_bytes: usize,
+    /// Number of currently live physical allocations.
+    pub active_allocations: usize,
+    /// Maximum allocation count observed since the last reset.
+    pub peak_allocations: usize,
+}
+
+fn check_status(status: i32) -> Result<()> {
+    if status == SUCCESS {
+        Ok(())
+    } else {
+        Err(error::get_and_clear_last_mlx_error()
+            .expect("MLX host-transfer operation failed but no error was set")
+            .into())
+    }
+}
+
+/// Returns native physical-allocation telemetry for one storage kind.
+pub fn host_transfer_memory_stats(
+    kind: HostTransferStorageKind,
+) -> Result<HostTransferMemoryStats> {
+    let _guard = runtime_lock::enter();
+    error::ensure_mlx_error_handler();
+    let mut stats = safemlx_sys::mlx_host_transfer_memory_stats {
+        active_bytes: 0,
+        peak_bytes: 0,
+        active_allocations: 0,
+        peak_allocations: 0,
+    };
+    check_status(unsafe {
+        safemlx_sys::mlx_host_transfer_memory_stats_get(&mut stats, kind.as_raw())
+    })?;
+    Ok(HostTransferMemoryStats {
+        active_bytes: stats.active_bytes,
+        peak_bytes: stats.peak_bytes,
+        active_allocations: stats.active_allocations,
+        peak_allocations: stats.peak_allocations,
+    })
+}
+
+/// Resets one storage kind's physical high-water marks to current occupancy.
+pub fn reset_host_transfer_peak_memory(kind: HostTransferStorageKind) -> Result<()> {
+    let _guard = runtime_lock::enter();
+    error::ensure_mlx_error_handler();
+    check_status(unsafe { safemlx_sys::mlx_host_transfer_memory_stats_reset_peak(kind.as_raw()) })
+}
+
+/// Returns a conservative physical capacity to reserve before allocation.
+///
+/// CPU, Metal, and CUDA return the exact capacity of their dedicated
+/// host-transfer allocation path. A future backend may conservatively return a
+/// larger value, but an allocation must never exceed it.
+pub fn host_transfer_capacity_upper_bound(
+    nbytes: usize,
+    policy: HostTransferPolicy,
+) -> Result<usize> {
+    let _guard = runtime_lock::enter();
+    error::ensure_mlx_error_handler();
+    let mut capacity = 0;
+    check_status(unsafe {
+        safemlx_sys::mlx_host_transfer_capacity_upper_bound(&mut capacity, nbytes, policy.as_raw())
+    })?;
+    Ok(capacity)
 }
 
 /// An owned, typed, host-addressable transfer allocation.
